@@ -1,0 +1,8 @@
+Model: QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+HF_DIRECTORY: /mnt/raid/hf_models
+HF_HOME: /mnt/raid/hf_models
+---------------------------------
+Downloading model: QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ...
+Model download complete! Saved to: /mnt/raid/hf_models/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+Download took 132.87 seconds.
+Average download speed: 14489.55 MiB/s

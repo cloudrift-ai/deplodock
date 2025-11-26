@@ -1,0 +1,8 @@
+Model: cpatonn/GLM-4.5-Air-AWQ-4bit
+HF_DIRECTORY: /mnt/raid/hf_models
+HF_HOME: /mnt/raid/hf_models
+---------------------------------
+Downloading model: cpatonn/GLM-4.5-Air-AWQ-4bit...
+Model download complete! Saved to: /mnt/raid/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+Download took 43.64 seconds.
+Average download speed: 11089.05 MiB/s
