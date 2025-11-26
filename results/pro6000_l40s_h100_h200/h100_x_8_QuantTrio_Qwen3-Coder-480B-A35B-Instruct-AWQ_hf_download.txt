@@ -1,0 +1,8 @@
+Model: QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+HF_DIRECTORY: /media/cloudrift/hf_models
+HF_HOME: /media/cloudrift/hf_models
+---------------------------------
+Downloading model: QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ...
+Model download complete! Saved to: /media/cloudrift/hf_models/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+Download took 194.81 seconds.
+Average download speed: 9882.51 MiB/s

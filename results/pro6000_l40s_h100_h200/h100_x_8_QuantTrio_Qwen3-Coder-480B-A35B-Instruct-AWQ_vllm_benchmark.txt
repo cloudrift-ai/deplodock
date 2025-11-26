@@ -1,0 +1,131 @@
+============ Serving Benchmark Result ============
+Successful requests:                     1024      
+Failed requests:                         0         
+Maximum request concurrency:             256       
+Benchmark duration (s):                  346.57    
+Total input tokens:                      1024000   
+Total generated tokens:                  1024000   
+Request throughput (req/s):              2.95      
+Output token throughput (tok/s):         2954.67   
+Peak output token throughput (tok/s):    4646.00   
+Peak concurrent requests:                274.00    
+Total Token throughput (tok/s):          5909.34   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          16242.94  
+Median TTFT (ms):                        8047.44   
+P99 TTFT (ms):                           75033.05  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          64.65     
+Median TPOT (ms):                        61.03     
+P99 TPOT (ms):                           115.43    
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           64.59     
+Median ITL (ms):                         48.12     
+P99 ITL (ms):                            425.49    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          80829.00  
+Median E2EL (ms):                        77522.47  
+P99 E2EL (ms):                           137795.27 
+==================================================
+
+============ Docker Compose Configuration ============
+services:
+  vllm_0:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1', '2', '3']
+              capabilities: [gpu]
+    volumes:
+      - /media/cloudrift/hf_models:/media/cloudrift/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/media/cloudrift/hf_models
+    ports:
+      - "8000:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 4
+      --pipeline-parallel-size 1
+      --model /media/cloudrift/hf_models/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+      --served-model-name QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+      --max-num-seqs 512 --max-model-len 8192 --enable-expert-parallel
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_1:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['4', '5', '6', '7']
+              capabilities: [gpu]
+    volumes:
+      - /media/cloudrift/hf_models:/media/cloudrift/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/media/cloudrift/hf_models
+    ports:
+      - "8001:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 4
+      --pipeline-parallel-size 1
+      --model /media/cloudrift/hf_models/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+      --served-model-name QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+      --max-num-seqs 512 --max-model-len 8192 --enable-expert-parallel
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx_lb
+    ports:
+      - "8080:8080"
+    volumes:
+      - /home/dikobraz/server-benchmark/nginx.vllm.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - vllm_0
+      - vllm_1
+
+  benchmark:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_client
+    volumes:
+      - /media/cloudrift/hf_models:/media/cloudrift/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/media/cloudrift/hf_models
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["sleep infinity"]
+    profiles:
+      - tools
+
+============ Benchmark Command ============
+vllm bench serve     --model QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ     --dataset-name random     --random-input-len 1000     --random-output-len 1000     --max-concurrency 256     --num-prompts 1024     --ignore-eos     --backend openai-chat     --endpoint /v1/chat/completions     --percentile-metrics ttft,tpot,itl,e2el     --base-url http://nginx_lb:8080
+==================================================
