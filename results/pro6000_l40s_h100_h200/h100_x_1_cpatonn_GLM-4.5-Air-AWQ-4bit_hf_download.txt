@@ -1,0 +1,8 @@
+Model: cpatonn/GLM-4.5-Air-AWQ-4bit
+HF_DIRECTORY: /media/cloudrift/hf_models
+HF_HOME: /media/cloudrift/hf_models
+---------------------------------
+Downloading model: cpatonn/GLM-4.5-Air-AWQ-4bit...
+Model download complete! Saved to: /media/cloudrift/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+Download took 0.18 seconds.
+Average download speed: 2729974.55 MiB/s

@@ -1,0 +1,518 @@
+================================
+SYSTEM INFORMATION
+Collected: Wed Nov 26 23:28:43 UTC 2025
+================================
+
+=== HOSTNAME ===
+h100-benchmark.us-central1-a.c.faircompute.internal
+
+=== OPERATING SYSTEM ===
+PRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.3 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+
+=== KERNEL VERSION ===
+6.14.0-1020-gcp
+
+=== CPU INFORMATION ===
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 57 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  208
+On-line CPU(s) list:                     0-207
+Vendor ID:                               GenuineIntel
+Model name:                              Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz
+CPU family:                              6
+Model:                                   143
+Thread(s) per core:                      2
+Core(s) per socket:                      52
+Socket(s):                               2
+Stepping:                                8
+BogoMIPS:                                5399.99
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 arat avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq la57 rdpid cldemote movdiri movdir64b fsrm md_clear serialize tsxldtrk amx_bf16 avx512_fp16 amx_tile amx_int8 arch_capabilities
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               4.9 MiB (104 instances)
+L1i cache:                               3.3 MiB (104 instances)
+L2 cache:                                208 MiB (104 instances)
+L3 cache:                                210 MiB (2 instances)
+NUMA node(s):                            2
+NUMA node0 CPU(s):                       0-51,104-155
+NUMA node1 CPU(s):                       52-103,156-207
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Mitigation; Aligned branch/return thunks
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+
+=== CPU COUNT ===
+Physical CPUs: 2
+CPU Cores: 52
+Logical CPUs (threads): 208
+
+=== MEMORY INFORMATION ===
+               total        used        free      shared  buff/cache   available
+Mem:           1.8Ti        29Gi        68Gi       2.4Mi       1.7Ti       1.8Ti
+Swap:             0B          0B          0B
+
+=== DETAILED MEMORY ===
+	Error Correction Type: Multi-bit ECC
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+	Size: 16 GB
+	Type: RAM
+
+=== GPU INFORMATION ===
+index, name, driver_version, memory.total [MiB], compute_cap
+0, NVIDIA H100 80GB HBM3, 580.95.05, 81559 MiB, 9.0
+1, NVIDIA H100 80GB HBM3, 580.95.05, 81559 MiB, 9.0
+2, NVIDIA H100 80GB HBM3, 580.95.05, 81559 MiB, 9.0
+3, NVIDIA H100 80GB HBM3, 580.95.05, 81559 MiB, 9.0
+4, NVIDIA H100 80GB HBM3, 580.95.05, 81559 MiB, 9.0
+5, NVIDIA H100 80GB HBM3, 580.95.05, 81559 MiB, 9.0
+6, NVIDIA H100 80GB HBM3, 580.95.05, 81559 MiB, 9.0
+7, NVIDIA H100 80GB HBM3, 580.95.05, 81559 MiB, 9.0
+
+=== NVIDIA-SMI FULL OUTPUT ===
+Wed Nov 26 23:28:43 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:04:00.0 Off |                    0 |
+| N/A   36C    P0             77W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:05:00.0 Off |                    0 |
+| N/A   33C    P0             69W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:0A:00.0 Off |                    0 |
+| N/A   35C    P0             69W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:0B:00.0 Off |                    0 |
+| N/A   33C    P0             70W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:84:00.0 Off |                    0 |
+| N/A   35C    P0             73W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:85:00.0 Off |                    0 |
+| N/A   33C    P0             71W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:8A:00.0 Off |                    0 |
+| N/A   35C    P0             71W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:8B:00.0 Off |                    0 |
+| N/A   34C    P0             69W /  700W |       0MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+=== DISK INFORMATION ===
+Filesystem       Size  Used Avail Use% Mounted on
+/dev/root        774G  675G  100G  88% /
+tmpfs            922G  192K  922G   1% /dev/shm
+tmpfs            369G  2.3M  369G   1% /run
+tmpfs            5.0M     0  5.0M   0% /run/lock
+efivarfs          56K   24K   27K  48% /sys/firmware/efi/efivars
+/dev/nvme1n1p16  881M   81M  739M  10% /boot
+/dev/nvme1n1p15  105M  6.2M   99M   6% /boot/efi
+/dev/md0         5.9T  1.3T  4.3T  23% /mnt/raid
+tmpfs            185G   12K  185G   1% /run/user/1001
+
+=== DISK DETAILS ===
+NAME           SIZE TYPE  MOUNTPOINT                 FSTYPE            MODEL
+loop0           74M loop  /snap/core22/2163          squashfs          
+loop1        453.2M loop  /snap/google-cloud-cli/402 squashfs          
+loop2         50.9M loop  /snap/snapd/25577          squashfs          
+nvme9n1        375G disk                             linux_raid_member nvme_card2
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme3n1        375G disk                             linux_raid_member nvme_card1
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme10n1       375G disk                             linux_raid_member nvme_card3
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme1n1        800G disk                                               nvme_card-pd
+├─nvme1n1p1    799G part  /                          ext4              
+├─nvme1n1p14     4M part                                               
+├─nvme1n1p15   106M part  /boot/efi                  vfat              
+└─nvme1n1p16   913M part  /boot                      ext4              
+nvme2n1        375G disk                             linux_raid_member nvme_card0
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme6n1        375G disk                             linux_raid_member nvme_card11
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme4n1        375G disk                             linux_raid_member nvme_card9
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme0n1        375G disk                             linux_raid_member nvme_card8
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme7n1        375G disk                             linux_raid_member nvme_card12
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme8n1        375G disk                             linux_raid_member nvme_card13
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme14n1       375G disk                             linux_raid_member nvme_card15
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme15n1       375G disk                             linux_raid_member nvme_card6
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme5n1        375G disk                             linux_raid_member nvme_card10
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme12n1       375G disk                             linux_raid_member nvme_card14
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme11n1       375G disk                             linux_raid_member nvme_card4
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme13n1       375G disk                             linux_raid_member nvme_card5
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+nvme16n1       375G disk                             linux_raid_member nvme_card7
+└─md0          5.9T raid0 /mnt/raid                  ext4              
+
+=== NETWORK INTERFACES ===
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    inet 127.0.0.1/8 scope host lo
+2: enp0s12: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1460 qdisc mq state UP group default qlen 1000
+    inet 10.128.0.34/32 metric 100 scope global dynamic enp0s12
+3: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN group default 
+    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+125: br-e730dd0fac15: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default 
+    inet 172.18.0.1/16 brd 172.18.255.255 scope global br-e730dd0fac15
+219: veth69b7bc8@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br-e730dd0fac15 state UP group default 
+
+=== PCI DEVICES ===
+00:00.0 Host bridge: Intel Corporation 440FX - 82441FX PMC [Natoma] (rev 02)
+00:01.0 ISA bridge: Intel Corporation 82371AB/EB/MB PIIX4 ISA (rev 03)
+00:01.3 Bridge: Intel Corporation 82371AB/EB/MB PIIX4 ACPI (rev 03)
+00:03.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:04.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:05.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:06.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:07.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:08.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:09.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:0a.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:0b.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+00:0c.0 Ethernet controller: Google, Inc. Compute Engine Virtual Ethernet [gVNIC]
+00:0d.0 Unclassified device [00ff]: Red Hat, Inc. Virtio RNG
+01:00.0 PCI bridge: Google, Inc. Device a010
+02:00.0 PCI bridge: PLX Technology, Inc. Device 8796
+03:00.0 PCI bridge: PLX Technology, Inc. Device 8796
+03:01.0 PCI bridge: PLX Technology, Inc. Device 8796
+03:02.0 PCI bridge: PLX Technology, Inc. Device 8796
+04:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)
+05:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)
+07:00.0 PCI bridge: Google, Inc. Device a010
+08:00.0 PCI bridge: PLX Technology, Inc. Device 8796
+09:00.0 PCI bridge: PLX Technology, Inc. Device 8796
+09:01.0 PCI bridge: PLX Technology, Inc. Device 8796
+09:02.0 PCI bridge: PLX Technology, Inc. Device 8796
+0a:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)
+0b:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)
+80:00.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+80:01.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+80:02.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+80:03.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+80:04.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+80:05.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+80:06.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+80:07.0 Non-Volatile memory controller: Google, Inc. NVMe device (rev 01)
+81:00.0 PCI bridge: Google, Inc. Device a010
+82:00.0 PCI bridge: PLX Technology, Inc. Device 8796
+83:00.0 PCI bridge: PLX Technology, Inc. Device 8796
+83:01.0 PCI bridge: PLX Technology, Inc. Device 8796
+83:02.0 PCI bridge: PLX Technology, Inc. Device 8796
+84:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)
+85:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)
+87:00.0 PCI bridge: Google, Inc. Device a010
+88:00.0 PCI bridge: PLX Technology, Inc. Device 8796
+89:00.0 PCI bridge: PLX Technology, Inc. Device 8796
+89:01.0 PCI bridge: PLX Technology, Inc. Device 8796
+89:02.0 PCI bridge: PLX Technology, Inc. Device 8796
+8a:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)
+8b:00.0 3D controller: NVIDIA Corporation GH100 [H100 SXM5 80GB] (rev a1)
+
+=== SYSTEM UPTIME ===
+ 23:28:44 up 21:10,  1 user,  load average: 0.19, 0.06, 0.02
+
+=== LOAD AVERAGE ===
+0.19 0.06 0.02 4/2184 360877
+
+=== DOCKER VERSION ===
+Docker version 29.0.4, build 3247a5a
+
+Docker Info:
+ Server Version: 29.0.4
+ Storage Driver: overlayfs
+ Operating System: Ubuntu 24.04.3 LTS
+ CPUs: 208
+ Total Memory: 1.799TiB
+ Docker Root Dir: /var/lib/docker
+
+================================
+System information collected successfully!
+Saved to: system_info.txt
+================================
