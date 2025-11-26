@@ -135,7 +135,7 @@ def generate_benchmark_service(hf_directory: str, hf_token: str) -> str:
     environment:
       - HUGGING_FACE_HUB_TOKEN={hf_token}
       - HF_HOME={hf_directory}
-      - CUDA_VISIBLE_DEVICES="0"
+      - CUDA_VISIBLE_DEVICES='""'
     entrypoint: ["/bin/bash", "-c"]
     command: ["sleep infinity"]
     profiles:
