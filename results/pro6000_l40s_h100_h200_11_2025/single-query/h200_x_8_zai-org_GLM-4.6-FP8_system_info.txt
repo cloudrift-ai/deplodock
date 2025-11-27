@@ -1,0 +1,1079 @@
+================================
+SYSTEM INFORMATION
+Collected: Thu Nov 27 01:46:15 AM UTC 2025
+================================
+
+=== HOSTNAME ===
+hcg-srv-cn003
+
+=== OPERATING SYSTEM ===
+PRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.3 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+
+=== KERNEL VERSION ===
+6.8.0-83-generic
+
+=== CPU INFORMATION ===
+Architecture:                         x86_64
+CPU op-mode(s):                       32-bit, 64-bit
+Address sizes:                        46 bits physical, 57 bits virtual
+Byte Order:                           Little Endian
+CPU(s):                               112
+On-line CPU(s) list:                  0-111
+Vendor ID:                            GenuineIntel
+Model name:                           Intel(R) Xeon(R) Platinum 8480+
+CPU family:                           6
+Model:                                143
+Thread(s) per core:                   1
+Core(s) per socket:                   56
+Socket(s):                            2
+Stepping:                             8
+CPU(s) scaling MHz:                   30%
+CPU max MHz:                          3800.0000
+CPU min MHz:                          800.0000
+BogoMIPS:                             4000.00
+Flags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cat_l2 cdp_l3 cdp_l2 ssbd mba ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb intel_pt avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local split_lock_detect user_shstk avx_vnni avx512_bf16 wbnoinvd dtherm ida arat pln pts vnmi avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq la57 rdpid bus_lock_detect cldemote movdiri movdir64b enqcmd fsrm md_clear serialize tsxldtrk pconfig arch_lbr ibt amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities
+Virtualization:                       VT-x
+L1d cache:                            5.3 MiB (112 instances)
+L1i cache:                            3.5 MiB (112 instances)
+L2 cache:                             224 MiB (112 instances)
+L3 cache:                             210 MiB (2 instances)
+NUMA node(s):                         2
+NUMA node0 CPU(s):                    0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,100,102,104,106,108,110
+NUMA node1 CPU(s):                    1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,47,49,51,53,55,57,59,61,63,65,67,69,71,73,75,77,79,81,83,85,87,89,91,93,95,97,99,101,103,105,107,109,111
+Vulnerability Gather data sampling:   Not affected
+Vulnerability Itlb multihit:          Not affected
+Vulnerability L1tf:                   Not affected
+Vulnerability Mds:                    Not affected
+Vulnerability Meltdown:               Not affected
+Vulnerability Mmio stale data:        Not affected
+Vulnerability Reg file data sampling: Not affected
+Vulnerability Retbleed:               Not affected
+Vulnerability Spec rstack overflow:   Not affected
+Vulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:             Mitigation; Enhanced / Automatic IBRS; IBPB conditional; RSB filling; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S
+Vulnerability Srbds:                  Not affected
+Vulnerability Tsx async abort:        Not affected
+
+=== CPU COUNT ===
+Physical CPUs: 2
+CPU Cores: 56
+Logical CPUs (threads): 112
+
+=== MEMORY INFORMATION ===
+               total        used        free      shared  buff/cache   available
+Mem:           2.0Ti        39Gi       1.6Ti        15Mi       342Gi       1.9Ti
+Swap:             0B          0B          0B
+
+=== DETAILED MEMORY ===
+	Error Correction Type: Multi-bit ECC
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+	Size: 64 GB
+	Type: DDR5
+	Speed: 5600 MT/s
+	Manufacturer: 00CE069D00CE
+	Configured Memory Speed: 4400 MT/s
+	Non-Volatile Size: None
+	Volatile Size: 64 GB
+	Cache Size: None
+	Logical Size: None
+
+=== GPU INFORMATION ===
+index, name, driver_version, memory.total [MiB], compute_cap
+0, NVIDIA H200, 580.95.05, 143771 MiB, 9.0
+1, NVIDIA H200, 580.95.05, 143771 MiB, 9.0
+2, NVIDIA H200, 580.95.05, 143771 MiB, 9.0
+3, NVIDIA H200, 580.95.05, 143771 MiB, 9.0
+4, NVIDIA H200, 580.95.05, 143771 MiB, 9.0
+5, NVIDIA H200, 580.95.05, 143771 MiB, 9.0
+6, NVIDIA H200, 580.95.05, 143771 MiB, 9.0
+7, NVIDIA H200, 580.95.05, 143771 MiB, 9.0
+
+=== NVIDIA-SMI FULL OUTPUT ===
+Thu Nov 27 01:46:15 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H200                    Off |   00000000:19:00.0 Off |                    0 |
+| N/A   26C    P0             81W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H200                    Off |   00000000:3B:00.0 Off |                    0 |
+| N/A   24C    P0             77W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H200                    Off |   00000000:4C:00.0 Off |                    0 |
+| N/A   23C    P0             76W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H200                    Off |   00000000:5D:00.0 Off |                    0 |
+| N/A   26C    P0             78W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H200                    Off |   00000000:9B:00.0 Off |                    0 |
+| N/A   26C    P0             76W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H200                    Off |   00000000:BB:00.0 Off |                    0 |
+| N/A   25C    P0             75W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H200                    Off |   00000000:CB:00.0 Off |                    0 |
+| N/A   26C    P0             75W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H200                    Off |   00000000:DB:00.0 Off |                    0 |
+| N/A   23C    P0             76W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+=== DISK INFORMATION ===
+Filesystem                                                                                                                        Size  Used Avail Use% Mounted on
+tmpfs                                                                                                                             202G  9.7M  202G   1% /run
+efivarfs                                                                                                                          304K  225K   75K  76% /sys/firmware/efi/efivars
+/dev/mapper/ubuntu--vg-ubuntu--lv                                                                                                 877G  194G  647G  23% /
+tmpfs                                                                                                                            1008G     0 1008G   0% /dev/shm
+tmpfs                                                                                                                             5.0M     0  5.0M   0% /run/lock
+tmpfs                                                                                                                            1008G     0 1008G   0% /run/qemu
+/dev/nvme4n1p2                                                                                                                    2.0G  200M  1.6G  11% /boot
+/dev/nvme4n1p1                                                                                                                    1.1G  6.2M  1.1G   1% /boot/efi
+/dev/md0                                                                                                                           25T  337G   23T   2% /media/cloudrift
+10.3.0.201@tcp,10.3.0.202@tcp:10.3.0.205@tcp,10.3.0.206@tcp:10.3.0.207@tcp,10.3.0.208@tcp:10.3.0.203@tcp,10.3.0.204@tcp:/ddnaifs  259T  309G  256T   1% /exa
+tmpfs                                                                                                                             202G   20K  202G   1% /run/user/1000
+
+=== DISK DETAILS ===
+NAME                        SIZE TYPE  MOUNTPOINT       FSTYPE            MODEL
+nvme4n1                   894.2G disk                                     Dell BOSS-N1
+├─nvme4n1p1                   1G part  /boot/efi        vfat              
+├─nvme4n1p2                   2G part  /boot            ext4              
+└─nvme4n1p3               891.1G part                   LVM2_member       
+  └─ubuntu--vg-ubuntu--lv 891.1G lvm   /                ext4              
+nvme2n1                     3.5T disk                   linux_raid_member Dell DC NVMe ISE PE8110 RI U.2 3840GB
+└─md0                      24.5T raid5 /media/cloudrift ext4              
+nvme1n1                     3.5T disk                   linux_raid_member Dell DC NVMe ISE PE8110 RI U.2 3840GB
+└─md0                      24.5T raid5 /media/cloudrift ext4              
+nvme0n1                     3.5T disk                   linux_raid_member Dell DC NVMe ISE PE8110 RI U.2 3840GB
+└─md0                      24.5T raid5 /media/cloudrift ext4              
+nvme3n1                     3.5T disk                   linux_raid_member Dell DC NVMe ISE PE8110 RI U.2 3840GB
+└─md0                      24.5T raid5 /media/cloudrift ext4              
+nvme6n1                     3.5T disk                   linux_raid_member Dell DC NVMe ISE PE8110 RI U.2 3840GB
+└─md0                      24.5T raid5 /media/cloudrift ext4              
+nvme7n1                     3.5T disk                   linux_raid_member Dell DC NVMe ISE PE8110 RI U.2 3840GB
+└─md0                      24.5T raid5 /media/cloudrift ext4              
+nvme5n1                     3.5T disk                   linux_raid_member Dell DC NVMe ISE PE8110 RI U.2 3840GB
+└─md0                      24.5T raid5 /media/cloudrift ext4              
+nvme8n1                     3.5T disk                   linux_raid_member Dell DC NVMe ISE PE8110 RI U.2 3840GB
+└─md0                      24.5T raid5 /media/cloudrift ext4              
+
+=== NETWORK INTERFACES ===
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    inet 127.0.0.1/8 scope host lo
+2: eno12399np0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc mq state DOWN group default qlen 1000
+3: eno8303: <BROADCAST,MULTICAST,SLAVE,UP,LOWER_UP> mtu 1500 qdisc mq master bond0 state UP group default qlen 1000
+4: eno8403: <BROADCAST,MULTICAST,SLAVE,UP,LOWER_UP> mtu 1500 qdisc mq master bond0 state UP group default qlen 1000
+5: eno12409np1: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc mq state DOWN group default qlen 1000
+6: eno12419np2: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc mq state DOWN group default qlen 1000
+7: eno12429np3: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc mq state DOWN group default qlen 1000
+8: enp27s0f0np0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc mq state DOWN group default qlen 1000
+9: enp27s0f1np1: <BROADCAST,MULTICAST,SLAVE,UP,LOWER_UP> mtu 9000 qdisc mq master bond1 state UP group default qlen 1000
+10: enp157s0f0np0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc mq state DOWN group default qlen 1000
+11: enp157s0f1np1: <BROADCAST,MULTICAST,SLAVE,UP,LOWER_UP> mtu 9000 qdisc mq master bond1 state UP group default qlen 1000
+12: ibp26s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 2044 qdisc mq state UP group default qlen 1000
+    inet 10.0.0.27/24 brd 10.0.0.255 scope global ibp26s0
+13: ibp60s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 2044 qdisc mq state UP group default qlen 1000
+    inet 10.0.0.28/24 brd 10.0.0.255 scope global ibp60s0
+14: ibp77s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 2044 qdisc mq state UP group default qlen 1000
+    inet 10.0.0.29/24 brd 10.0.0.255 scope global ibp77s0
+15: ibp94s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 2044 qdisc mq state UP group default qlen 1000
+    inet 10.0.0.30/24 brd 10.0.0.255 scope global ibp94s0
+16: ibp156s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 2044 qdisc mq state UP group default qlen 1000
+    inet 10.0.0.31/24 brd 10.0.0.255 scope global ibp156s0
+17: ibp188s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 2044 qdisc mq state UP group default qlen 1000
+    inet 10.0.0.32/24 brd 10.0.0.255 scope global ibp188s0
+18: ibp204s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 2044 qdisc mq state UP group default qlen 1000
+    inet 10.0.0.33/24 brd 10.0.0.255 scope global ibp204s0
+19: ibp220s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 2044 qdisc mq state UP group default qlen 1000
+    inet 10.0.0.34/24 brd 10.0.0.255 scope global ibp220s0
+20: bond0: <BROADCAST,MULTICAST,MASTER,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default qlen 1000
+    inet 10.4.0.13/24 brd 10.4.0.255 scope global bond0
+21: bond1: <BROADCAST,MULTICAST,MASTER,UP,LOWER_UP> mtu 9000 qdisc noqueue state UP group default qlen 1000
+    inet 10.3.0.13/24 brd 10.3.0.255 scope global bond1
+22: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN group default 
+    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+23: virbr0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN group default qlen 1000
+    inet 192.168.122.1/24 brd 192.168.122.255 scope global virbr0
+24: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UNKNOWN group default 
+    inet 10.244.7.0/32 scope global flannel.1
+25: cni0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UP group default qlen 1000
+    inet 10.244.7.1/24 brd 10.244.7.255 scope global cni0
+26: vethfaaf1d86@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+27: vethc37303fb@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+28: veth11c072d2@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+29: vethb08cee83@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+30: vethbb092ee7@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+31: veth4a27748f@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+32: veth5dbb7b41@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+33: veth9af52438@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+34: veth8120a86d@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+35: vethc2e343a3@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+36: veth3b7fd404@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+37: vethdf94d8e5@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+38: veth3d2fa342@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+39: veth3f9de208@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+40: veth53ed1b29@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+41: veth9e458dce@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+42: vethf4939e05@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+43: veth4a9d833c@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+44: veth57b1308f@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+46: veth82a4777f@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP group default qlen 1000
+58: br-da5d169492a7: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default 
+    inet 172.18.0.1/16 brd 172.18.255.255 scope global br-da5d169492a7
+60: vethfa29b1b@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br-da5d169492a7 state UP group default 
+
+=== PCI DEVICES ===
+00:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+00:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+00:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+00:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+00:0a.0 PCI bridge: Intel Corporation Device 1bba (rev 11)
+00:0c.0 PCI bridge: Intel Corporation Device 1bbc (rev 11)
+00:0e.0 PCI bridge: Intel Corporation Device 1bbe (rev 11)
+00:14.0 USB controller: Intel Corporation Emmitsburg (C740 Family) USB 3.2 Gen 1 xHCI Controller (rev 11)
+00:14.2 RAM memory: Intel Corporation Device 1bce (rev 11)
+00:14.4 Host bridge: Intel Corporation Device 1bfe (rev 11)
+00:15.0 System peripheral: Intel Corporation Device 1bff (rev 11)
+00:16.0 Communication controller: Intel Corporation Device 1be0 (rev 11)
+00:18.0 SATA controller: Intel Corporation Sapphire Rapids SATA AHCI Controller (rev 11)
+00:19.0 SATA controller: Intel Corporation Sapphire Rapids SATA AHCI Controller (rev 11)
+00:1f.0 ISA bridge: Intel Corporation Device 1b81 (rev 11)
+00:1f.4 SMBus: Intel Corporation Device 1bc9 (rev 11)
+00:1f.5 Serial bus controller: Intel Corporation Device 1bca (rev 11)
+01:00.0 Non-Volatile memory controller: Marvell Technology Group Ltd. 88NR2241 Non-Volatile memory controller (rev 20)
+02:00.0 Ethernet controller: Broadcom Inc. and subsidiaries NetXtreme BCM5720 Gigabit Ethernet PCIe
+02:00.1 Ethernet controller: Broadcom Inc. and subsidiaries NetXtreme BCM5720 Gigabit Ethernet PCIe
+03:00.0 PCI bridge: PLDA PCI Express Bridge (rev 02)
+04:00.0 VGA compatible controller: Matrox Electronics Systems Ltd. Integrated Matrox G200eW3 Graphics Controller (rev 04)
+15:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+15:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+15:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+15:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+15:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+16:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+17:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+17:01.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+17:02.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+17:03.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+17:1f.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+18:00.0 Non-Volatile memory controller: SK hynix PE81x0 U.2/3 NVMe Solid State Drive (rev 21)
+19:00.0 3D controller: NVIDIA Corporation GH100 [H200 SXM 141GB] (rev a1)
+1a:00.0 Infiniband controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+1b:00.0 Ethernet controller: Mellanox Technologies MT2892 Family [ConnectX-6 Dx]
+1b:00.1 Ethernet controller: Mellanox Technologies MT2892 Family [ConnectX-6 Dx]
+1c:00.0 Serial Attached SCSI controller: Broadcom / LSI PCIe Switch management endpoint (rev b0)
+26:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+26:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+26:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+26:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+26:05.0 PCI bridge: Intel Corporation Device 352c (rev 04)
+27:00.0 Ethernet controller: Intel Corporation Ethernet Controller X710 for 10GBASE-T (rev 02)
+27:00.1 Ethernet controller: Intel Corporation Ethernet Controller X710 for 10GBASE-T (rev 02)
+27:00.2 Ethernet controller: Intel Corporation Ethernet Controller X710 for 10GBASE-T (rev 02)
+27:00.3 Ethernet controller: Intel Corporation Ethernet Controller X710 for 10GBASE-T (rev 02)
+37:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+37:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+37:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+37:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+37:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+38:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+39:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+39:01.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+39:02.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+3a:00.0 Non-Volatile memory controller: SK hynix PE81x0 U.2/3 NVMe Solid State Drive (rev 21)
+3b:00.0 3D controller: NVIDIA Corporation GH100 [H200 SXM 141GB] (rev a1)
+3c:00.0 Infiniband controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+48:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+48:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+48:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+48:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+48:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+49:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+4a:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+4a:01.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+4a:02.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+4b:00.0 Non-Volatile memory controller: SK hynix PE81x0 U.2/3 NVMe Solid State Drive (rev 21)
+4c:00.0 3D controller: NVIDIA Corporation GH100 [H200 SXM 141GB] (rev a1)
+4d:00.0 Infiniband controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+59:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+59:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+59:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+59:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+59:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+5a:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+5b:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+5b:01.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+5b:02.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+5b:1f.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+5c:00.0 Non-Volatile memory controller: SK hynix PE81x0 U.2/3 NVMe Solid State Drive (rev 21)
+5d:00.0 3D controller: NVIDIA Corporation GH100 [H200 SXM 141GB] (rev a1)
+5e:00.0 Infiniband controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+5f:00.0 Serial Attached SCSI controller: Broadcom / LSI PCIe Switch management endpoint (rev b0)
+6a:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+6a:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+6a:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+6a:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+6a:01.0 System peripheral: Intel Corporation Device 0b25
+6a:02.0 System peripheral: Intel Corporation Device 0cfe
+6a:03.0 System peripheral: Intel Corporation Ice Lake MSM
+6a:03.1 System peripheral: Intel Corporation Ice Lake PMON MSM
+6b:00.0 Co-processor: Intel Corporation 4xxx Series QAT (rev 40)
+6d:00.0 Co-processor: Intel Corporation Device 2710
+6f:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+6f:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+6f:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+6f:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+74:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+74:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+74:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+74:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+79:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+79:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+79:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+79:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+7e:00.0 System peripheral: Intel Corporation Device 3250
+7e:00.1 System peripheral: Intel Corporation Device 3251
+7e:00.2 System peripheral: Intel Corporation Device 3252
+7e:00.3 Host bridge: Intel Corporation Ice Lake IEH
+7e:00.5 System peripheral: Intel Corporation Device 3255
+7e:01.0 System peripheral: Intel Corporation Device 3240
+7e:01.1 System peripheral: Intel Corporation Device 3241
+7e:01.2 System peripheral: Intel Corporation Device 3242
+7e:02.0 System peripheral: Intel Corporation Device 3240
+7e:02.1 System peripheral: Intel Corporation Device 3241
+7e:02.2 System peripheral: Intel Corporation Device 3242
+7e:03.0 System peripheral: Intel Corporation Device 3240
+7e:03.1 System peripheral: Intel Corporation Device 3241
+7e:03.2 System peripheral: Intel Corporation Device 3242
+7e:04.0 System peripheral: Intel Corporation Device 3240
+7e:04.1 System peripheral: Intel Corporation Device 3241
+7e:04.2 System peripheral: Intel Corporation Device 3242
+7e:05.0 System peripheral: Intel Corporation Device 3245
+7e:05.1 System peripheral: Intel Corporation Device 3246
+7e:05.2 System peripheral: Intel Corporation Device 3247
+7e:06.0 System peripheral: Intel Corporation Device 3245
+7e:06.1 System peripheral: Intel Corporation Device 3246
+7e:06.2 System peripheral: Intel Corporation Device 3247
+7e:07.0 System peripheral: Intel Corporation Device 3245
+7e:07.1 System peripheral: Intel Corporation Device 3246
+7e:07.2 System peripheral: Intel Corporation Device 3247
+7e:08.0 System peripheral: Intel Corporation Device 3245
+7e:08.1 System peripheral: Intel Corporation Device 3246
+7e:08.2 System peripheral: Intel Corporation Device 3247
+7e:0c.0 Performance counters: Intel Corporation Device 324a
+7e:0d.0 Performance counters: Intel Corporation Device 324a
+7e:0e.0 Performance counters: Intel Corporation Device 324a
+7e:0f.0 Performance counters: Intel Corporation Device 324a
+7e:1a.0 Performance counters: Intel Corporation Device 2880
+7e:1b.0 Performance counters: Intel Corporation Device 2880
+7e:1c.0 Performance counters: Intel Corporation Device 2880
+7e:1d.0 Performance counters: Intel Corporation Device 2880
+7f:00.0 System peripheral: Intel Corporation Device 324c
+7f:00.1 System peripheral: Intel Corporation Device 324c
+7f:00.2 System peripheral: Intel Corporation Device 324c
+7f:00.3 System peripheral: Intel Corporation Device 324c
+7f:00.4 System peripheral: Intel Corporation Device 324c
+7f:00.5 System peripheral: Intel Corporation Device 324c
+7f:00.6 System peripheral: Intel Corporation Device 324c
+7f:00.7 System peripheral: Intel Corporation Device 324c
+7f:01.0 System peripheral: Intel Corporation Device 324c
+7f:01.1 System peripheral: Intel Corporation Device 324c
+7f:01.2 System peripheral: Intel Corporation Device 324c
+7f:01.3 System peripheral: Intel Corporation Device 324c
+7f:01.4 System peripheral: Intel Corporation Device 324c
+7f:01.5 System peripheral: Intel Corporation Device 324c
+7f:01.6 System peripheral: Intel Corporation Device 324c
+7f:01.7 System peripheral: Intel Corporation Device 324c
+7f:02.0 System peripheral: Intel Corporation Device 324c
+7f:02.1 System peripheral: Intel Corporation Device 324c
+7f:02.2 System peripheral: Intel Corporation Device 324c
+7f:02.3 System peripheral: Intel Corporation Device 324c
+7f:02.4 System peripheral: Intel Corporation Device 324c
+7f:02.5 System peripheral: Intel Corporation Device 324c
+7f:02.6 System peripheral: Intel Corporation Device 324c
+7f:02.7 System peripheral: Intel Corporation Device 324c
+7f:03.0 System peripheral: Intel Corporation Device 324c
+7f:03.1 System peripheral: Intel Corporation Device 324c
+7f:03.2 System peripheral: Intel Corporation Device 324c
+7f:03.3 System peripheral: Intel Corporation Device 324c
+7f:03.4 System peripheral: Intel Corporation Device 324c
+7f:03.5 System peripheral: Intel Corporation Device 324c
+7f:03.6 System peripheral: Intel Corporation Device 324c
+7f:03.7 System peripheral: Intel Corporation Device 324c
+7f:04.0 System peripheral: Intel Corporation Device 324c
+7f:04.1 System peripheral: Intel Corporation Device 324c
+7f:04.2 System peripheral: Intel Corporation Device 324c
+7f:04.3 System peripheral: Intel Corporation Device 324c
+7f:04.4 System peripheral: Intel Corporation Device 324c
+7f:04.5 System peripheral: Intel Corporation Device 324c
+7f:04.6 System peripheral: Intel Corporation Device 324c
+7f:04.7 System peripheral: Intel Corporation Device 324c
+7f:05.0 System peripheral: Intel Corporation Device 324c
+7f:05.1 System peripheral: Intel Corporation Device 324c
+7f:05.2 System peripheral: Intel Corporation Device 324c
+7f:05.3 System peripheral: Intel Corporation Device 324c
+7f:05.4 System peripheral: Intel Corporation Device 324c
+7f:05.5 System peripheral: Intel Corporation Device 324c
+7f:05.6 System peripheral: Intel Corporation Device 324c
+7f:05.7 System peripheral: Intel Corporation Device 324c
+7f:06.0 System peripheral: Intel Corporation Device 324c
+7f:06.1 System peripheral: Intel Corporation Device 324c
+7f:06.2 System peripheral: Intel Corporation Device 324c
+7f:06.3 System peripheral: Intel Corporation Device 324c
+7f:06.4 System peripheral: Intel Corporation Device 324c
+7f:06.5 System peripheral: Intel Corporation Device 324c
+7f:06.6 System peripheral: Intel Corporation Device 324c
+7f:06.7 System peripheral: Intel Corporation Device 324c
+7f:0a.0 System peripheral: Intel Corporation Device 324d
+7f:0a.1 System peripheral: Intel Corporation Device 324d
+7f:0a.2 System peripheral: Intel Corporation Device 324d
+7f:0a.3 System peripheral: Intel Corporation Device 324d
+7f:0a.4 System peripheral: Intel Corporation Device 324d
+7f:0a.5 System peripheral: Intel Corporation Device 324d
+7f:0a.6 System peripheral: Intel Corporation Device 324d
+7f:0a.7 System peripheral: Intel Corporation Device 324d
+7f:0b.0 System peripheral: Intel Corporation Device 324d
+7f:0b.1 System peripheral: Intel Corporation Device 324d
+7f:0b.2 System peripheral: Intel Corporation Device 324d
+7f:0b.3 System peripheral: Intel Corporation Device 324d
+7f:0b.4 System peripheral: Intel Corporation Device 324d
+7f:0b.5 System peripheral: Intel Corporation Device 324d
+7f:0b.6 System peripheral: Intel Corporation Device 324d
+7f:0b.7 System peripheral: Intel Corporation Device 324d
+7f:0c.0 System peripheral: Intel Corporation Device 324d
+7f:0c.1 System peripheral: Intel Corporation Device 324d
+7f:0c.2 System peripheral: Intel Corporation Device 324d
+7f:0c.3 System peripheral: Intel Corporation Device 324d
+7f:0c.4 System peripheral: Intel Corporation Device 324d
+7f:0c.5 System peripheral: Intel Corporation Device 324d
+7f:0c.6 System peripheral: Intel Corporation Device 324d
+7f:0c.7 System peripheral: Intel Corporation Device 324d
+7f:0d.0 System peripheral: Intel Corporation Device 324d
+7f:0d.1 System peripheral: Intel Corporation Device 324d
+7f:0d.2 System peripheral: Intel Corporation Device 324d
+7f:0d.3 System peripheral: Intel Corporation Device 324d
+7f:0d.4 System peripheral: Intel Corporation Device 324d
+7f:0d.5 System peripheral: Intel Corporation Device 324d
+7f:0d.6 System peripheral: Intel Corporation Device 324d
+7f:0d.7 System peripheral: Intel Corporation Device 324d
+7f:0e.0 System peripheral: Intel Corporation Device 324d
+7f:0e.1 System peripheral: Intel Corporation Device 324d
+7f:0e.2 System peripheral: Intel Corporation Device 324d
+7f:0e.3 System peripheral: Intel Corporation Device 324d
+7f:0e.4 System peripheral: Intel Corporation Device 324d
+7f:0e.5 System peripheral: Intel Corporation Device 324d
+7f:0e.6 System peripheral: Intel Corporation Device 324d
+7f:0e.7 System peripheral: Intel Corporation Device 324d
+7f:0f.0 System peripheral: Intel Corporation Device 324d
+7f:0f.1 System peripheral: Intel Corporation Device 324d
+7f:0f.2 System peripheral: Intel Corporation Device 324d
+7f:0f.3 System peripheral: Intel Corporation Device 324d
+7f:0f.4 System peripheral: Intel Corporation Device 324d
+7f:0f.5 System peripheral: Intel Corporation Device 324d
+7f:0f.6 System peripheral: Intel Corporation Device 324d
+7f:0f.7 System peripheral: Intel Corporation Device 324d
+7f:10.0 System peripheral: Intel Corporation Device 324d
+7f:10.1 System peripheral: Intel Corporation Device 324d
+7f:10.2 System peripheral: Intel Corporation Device 324d
+7f:10.3 System peripheral: Intel Corporation Device 324d
+7f:10.4 System peripheral: Intel Corporation Device 324d
+7f:10.5 System peripheral: Intel Corporation Device 324d
+7f:10.6 System peripheral: Intel Corporation Device 324d
+7f:10.7 System peripheral: Intel Corporation Device 324d
+7f:1d.0 System peripheral: Intel Corporation Device 344f
+7f:1d.1 System peripheral: Intel Corporation Device 3457
+7f:1e.0 System peripheral: Intel Corporation Device 3258 (rev 08)
+7f:1e.1 System peripheral: Intel Corporation Device 3259 (rev 08)
+7f:1e.2 System peripheral: Intel Corporation Device 325a (rev 08)
+7f:1e.3 System peripheral: Intel Corporation Device 325b (rev 08)
+7f:1e.4 System peripheral: Intel Corporation Device 325c (rev 08)
+7f:1e.5 System peripheral: Intel Corporation Device 325d (rev 08)
+7f:1e.6 System peripheral: Intel Corporation Device 325e (rev 08)
+7f:1e.7 System peripheral: Intel Corporation Device 325f (rev 08)
+80:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+80:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+80:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+80:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+80:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+81:00.0 PCI bridge: PMC-Sierra Inc. Device 4128
+81:00.1 Memory controller: PMC-Sierra Inc. Device 4128
+82:00.0 PCI bridge: PMC-Sierra Inc. Device 4128
+82:01.0 PCI bridge: PMC-Sierra Inc. Device 4128
+82:02.0 PCI bridge: PMC-Sierra Inc. Device 4128
+82:03.0 PCI bridge: PMC-Sierra Inc. Device 4128
+83:00.0 Bridge: NVIDIA Corporation GH100 [H100 NVSwitch] (rev a1)
+84:00.0 Bridge: NVIDIA Corporation GH100 [H100 NVSwitch] (rev a1)
+85:00.0 Bridge: NVIDIA Corporation GH100 [H100 NVSwitch] (rev a1)
+86:00.0 Bridge: NVIDIA Corporation GH100 [H100 NVSwitch] (rev a1)
+97:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+97:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+97:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+97:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+97:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+98:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+99:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+99:01.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+99:02.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+99:03.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+99:1f.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+9a:00.0 Non-Volatile memory controller: SK hynix PE81x0 U.2/3 NVMe Solid State Drive (rev 21)
+9b:00.0 3D controller: NVIDIA Corporation GH100 [H200 SXM 141GB] (rev a1)
+9c:00.0 Infiniband controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+9d:00.0 Ethernet controller: Mellanox Technologies MT2892 Family [ConnectX-6 Dx]
+9d:00.1 Ethernet controller: Mellanox Technologies MT2892 Family [ConnectX-6 Dx]
+9e:00.0 Serial Attached SCSI controller: Broadcom / LSI PCIe Switch management endpoint (rev b0)
+a7:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+a7:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+a7:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+a7:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+b7:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+b7:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+b7:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+b7:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+b7:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+b8:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+b9:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+b9:01.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+b9:02.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+ba:00.0 Non-Volatile memory controller: SK hynix PE81x0 U.2/3 NVMe Solid State Drive (rev 21)
+bb:00.0 3D controller: NVIDIA Corporation GH100 [H200 SXM 141GB] (rev a1)
+bc:00.0 Infiniband controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+c7:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+c7:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+c7:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+c7:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+c7:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+c8:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+c9:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+c9:01.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+c9:02.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+c9:1f.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+ca:00.0 Non-Volatile memory controller: SK hynix PE81x0 U.2/3 NVMe Solid State Drive (rev 21)
+cb:00.0 3D controller: NVIDIA Corporation GH100 [H200 SXM 141GB] (rev a1)
+cc:00.0 Infiniband controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+cd:00.0 Serial Attached SCSI controller: Broadcom / LSI PCIe Switch management endpoint (rev b0)
+d7:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+d7:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+d7:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+d7:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+d7:01.0 PCI bridge: Intel Corporation Device 352a (rev 04)
+d8:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+d9:00.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+d9:01.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+d9:02.0 PCI bridge: Broadcom / LSI PEX890xx PCIe Gen 5 Switch (rev b0)
+da:00.0 Non-Volatile memory controller: SK hynix PE81x0 U.2/3 NVMe Solid State Drive (rev 21)
+db:00.0 3D controller: NVIDIA Corporation GH100 [H200 SXM 141GB] (rev a1)
+dc:00.0 Infiniband controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+e7:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+e7:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+e7:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+e7:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+e7:01.0 System peripheral: Intel Corporation Device 0b25
+e7:02.0 System peripheral: Intel Corporation Device 0cfe
+e7:03.0 System peripheral: Intel Corporation Ice Lake MSM
+e7:03.1 System peripheral: Intel Corporation Ice Lake PMON MSM
+e8:00.0 Co-processor: Intel Corporation 4xxx Series QAT (rev 40)
+ea:00.0 Co-processor: Intel Corporation Device 2710
+ec:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+ec:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+ec:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+ec:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+f1:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+f1:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+f1:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+f1:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+f6:00.0 System peripheral: Intel Corporation Ice Lake Memory Map/VT-d (rev 20)
+f6:00.1 System peripheral: Intel Corporation Ice Lake Mesh 2 PCIe (rev 20)
+f6:00.2 System peripheral: Intel Corporation Ice Lake RAS (rev 20)
+f6:00.4 Generic system peripheral [0807]: Intel Corporation Device 0b23
+fe:00.0 System peripheral: Intel Corporation Device 3250
+fe:00.1 System peripheral: Intel Corporation Device 3251
+fe:00.2 System peripheral: Intel Corporation Device 3252
+fe:00.3 Host bridge: Intel Corporation Ice Lake IEH
+fe:00.5 System peripheral: Intel Corporation Device 3255
+fe:01.0 System peripheral: Intel Corporation Device 3240
+fe:01.1 System peripheral: Intel Corporation Device 3241
+fe:01.2 System peripheral: Intel Corporation Device 3242
+fe:02.0 System peripheral: Intel Corporation Device 3240
+fe:02.1 System peripheral: Intel Corporation Device 3241
+fe:02.2 System peripheral: Intel Corporation Device 3242
+fe:03.0 System peripheral: Intel Corporation Device 3240
+fe:03.1 System peripheral: Intel Corporation Device 3241
+fe:03.2 System peripheral: Intel Corporation Device 3242
+fe:04.0 System peripheral: Intel Corporation Device 3240
+fe:04.1 System peripheral: Intel Corporation Device 3241
+fe:04.2 System peripheral: Intel Corporation Device 3242
+fe:05.0 System peripheral: Intel Corporation Device 3245
+fe:05.1 System peripheral: Intel Corporation Device 3246
+fe:05.2 System peripheral: Intel Corporation Device 3247
+fe:06.0 System peripheral: Intel Corporation Device 3245
+fe:06.1 System peripheral: Intel Corporation Device 3246
+fe:06.2 System peripheral: Intel Corporation Device 3247
+fe:07.0 System peripheral: Intel Corporation Device 3245
+fe:07.1 System peripheral: Intel Corporation Device 3246
+fe:07.2 System peripheral: Intel Corporation Device 3247
+fe:08.0 System peripheral: Intel Corporation Device 3245
+fe:08.1 System peripheral: Intel Corporation Device 3246
+fe:08.2 System peripheral: Intel Corporation Device 3247
+fe:0c.0 Performance counters: Intel Corporation Device 324a
+fe:0d.0 Performance counters: Intel Corporation Device 324a
+fe:0e.0 Performance counters: Intel Corporation Device 324a
+fe:0f.0 Performance counters: Intel Corporation Device 324a
+fe:1a.0 Performance counters: Intel Corporation Device 2880
+fe:1b.0 Performance counters: Intel Corporation Device 2880
+fe:1c.0 Performance counters: Intel Corporation Device 2880
+fe:1d.0 Performance counters: Intel Corporation Device 2880
+ff:00.0 System peripheral: Intel Corporation Device 324c
+ff:00.1 System peripheral: Intel Corporation Device 324c
+ff:00.2 System peripheral: Intel Corporation Device 324c
+ff:00.3 System peripheral: Intel Corporation Device 324c
+ff:00.4 System peripheral: Intel Corporation Device 324c
+ff:00.5 System peripheral: Intel Corporation Device 324c
+ff:00.6 System peripheral: Intel Corporation Device 324c
+ff:00.7 System peripheral: Intel Corporation Device 324c
+ff:01.0 System peripheral: Intel Corporation Device 324c
+ff:01.1 System peripheral: Intel Corporation Device 324c
+ff:01.2 System peripheral: Intel Corporation Device 324c
+ff:01.3 System peripheral: Intel Corporation Device 324c
+ff:01.4 System peripheral: Intel Corporation Device 324c
+ff:01.5 System peripheral: Intel Corporation Device 324c
+ff:01.6 System peripheral: Intel Corporation Device 324c
+ff:01.7 System peripheral: Intel Corporation Device 324c
+ff:02.0 System peripheral: Intel Corporation Device 324c
+ff:02.1 System peripheral: Intel Corporation Device 324c
+ff:02.2 System peripheral: Intel Corporation Device 324c
+ff:02.3 System peripheral: Intel Corporation Device 324c
+ff:02.4 System peripheral: Intel Corporation Device 324c
+ff:02.5 System peripheral: Intel Corporation Device 324c
+ff:02.6 System peripheral: Intel Corporation Device 324c
+ff:02.7 System peripheral: Intel Corporation Device 324c
+ff:03.0 System peripheral: Intel Corporation Device 324c
+ff:03.1 System peripheral: Intel Corporation Device 324c
+ff:03.2 System peripheral: Intel Corporation Device 324c
+ff:03.3 System peripheral: Intel Corporation Device 324c
+ff:03.4 System peripheral: Intel Corporation Device 324c
+ff:03.5 System peripheral: Intel Corporation Device 324c
+ff:03.6 System peripheral: Intel Corporation Device 324c
+ff:03.7 System peripheral: Intel Corporation Device 324c
+ff:04.0 System peripheral: Intel Corporation Device 324c
+ff:04.1 System peripheral: Intel Corporation Device 324c
+ff:04.2 System peripheral: Intel Corporation Device 324c
+ff:04.3 System peripheral: Intel Corporation Device 324c
+ff:04.4 System peripheral: Intel Corporation Device 324c
+ff:04.5 System peripheral: Intel Corporation Device 324c
+ff:04.6 System peripheral: Intel Corporation Device 324c
+ff:04.7 System peripheral: Intel Corporation Device 324c
+ff:05.0 System peripheral: Intel Corporation Device 324c
+ff:05.1 System peripheral: Intel Corporation Device 324c
+ff:05.2 System peripheral: Intel Corporation Device 324c
+ff:05.3 System peripheral: Intel Corporation Device 324c
+ff:05.4 System peripheral: Intel Corporation Device 324c
+ff:05.5 System peripheral: Intel Corporation Device 324c
+ff:05.6 System peripheral: Intel Corporation Device 324c
+ff:05.7 System peripheral: Intel Corporation Device 324c
+ff:06.0 System peripheral: Intel Corporation Device 324c
+ff:06.1 System peripheral: Intel Corporation Device 324c
+ff:06.2 System peripheral: Intel Corporation Device 324c
+ff:06.3 System peripheral: Intel Corporation Device 324c
+ff:06.4 System peripheral: Intel Corporation Device 324c
+ff:06.5 System peripheral: Intel Corporation Device 324c
+ff:06.6 System peripheral: Intel Corporation Device 324c
+ff:06.7 System peripheral: Intel Corporation Device 324c
+ff:0a.0 System peripheral: Intel Corporation Device 324d
+ff:0a.1 System peripheral: Intel Corporation Device 324d
+ff:0a.2 System peripheral: Intel Corporation Device 324d
+ff:0a.3 System peripheral: Intel Corporation Device 324d
+ff:0a.4 System peripheral: Intel Corporation Device 324d
+ff:0a.5 System peripheral: Intel Corporation Device 324d
+ff:0a.6 System peripheral: Intel Corporation Device 324d
+ff:0a.7 System peripheral: Intel Corporation Device 324d
+ff:0b.0 System peripheral: Intel Corporation Device 324d
+ff:0b.1 System peripheral: Intel Corporation Device 324d
+ff:0b.2 System peripheral: Intel Corporation Device 324d
+ff:0b.3 System peripheral: Intel Corporation Device 324d
+ff:0b.4 System peripheral: Intel Corporation Device 324d
+ff:0b.5 System peripheral: Intel Corporation Device 324d
+ff:0b.6 System peripheral: Intel Corporation Device 324d
+ff:0b.7 System peripheral: Intel Corporation Device 324d
+ff:0c.0 System peripheral: Intel Corporation Device 324d
+ff:0c.1 System peripheral: Intel Corporation Device 324d
+ff:0c.2 System peripheral: Intel Corporation Device 324d
+ff:0c.3 System peripheral: Intel Corporation Device 324d
+ff:0c.4 System peripheral: Intel Corporation Device 324d
+ff:0c.5 System peripheral: Intel Corporation Device 324d
+ff:0c.6 System peripheral: Intel Corporation Device 324d
+ff:0c.7 System peripheral: Intel Corporation Device 324d
+ff:0d.0 System peripheral: Intel Corporation Device 324d
+ff:0d.1 System peripheral: Intel Corporation Device 324d
+ff:0d.2 System peripheral: Intel Corporation Device 324d
+ff:0d.3 System peripheral: Intel Corporation Device 324d
+ff:0d.4 System peripheral: Intel Corporation Device 324d
+ff:0d.5 System peripheral: Intel Corporation Device 324d
+ff:0d.6 System peripheral: Intel Corporation Device 324d
+ff:0d.7 System peripheral: Intel Corporation Device 324d
+ff:0e.0 System peripheral: Intel Corporation Device 324d
+ff:0e.1 System peripheral: Intel Corporation Device 324d
+ff:0e.2 System peripheral: Intel Corporation Device 324d
+ff:0e.3 System peripheral: Intel Corporation Device 324d
+ff:0e.4 System peripheral: Intel Corporation Device 324d
+ff:0e.5 System peripheral: Intel Corporation Device 324d
+ff:0e.6 System peripheral: Intel Corporation Device 324d
+ff:0e.7 System peripheral: Intel Corporation Device 324d
+ff:0f.0 System peripheral: Intel Corporation Device 324d
+ff:0f.1 System peripheral: Intel Corporation Device 324d
+ff:0f.2 System peripheral: Intel Corporation Device 324d
+ff:0f.3 System peripheral: Intel Corporation Device 324d
+ff:0f.4 System peripheral: Intel Corporation Device 324d
+ff:0f.5 System peripheral: Intel Corporation Device 324d
+ff:0f.6 System peripheral: Intel Corporation Device 324d
+ff:0f.7 System peripheral: Intel Corporation Device 324d
+ff:10.0 System peripheral: Intel Corporation Device 324d
+ff:10.1 System peripheral: Intel Corporation Device 324d
+ff:10.2 System peripheral: Intel Corporation Device 324d
+ff:10.3 System peripheral: Intel Corporation Device 324d
+ff:10.4 System peripheral: Intel Corporation Device 324d
+ff:10.5 System peripheral: Intel Corporation Device 324d
+ff:10.6 System peripheral: Intel Corporation Device 324d
+ff:10.7 System peripheral: Intel Corporation Device 324d
+ff:1d.0 System peripheral: Intel Corporation Device 344f
+ff:1d.1 System peripheral: Intel Corporation Device 3457
+ff:1e.0 System peripheral: Intel Corporation Device 3258 (rev 08)
+ff:1e.1 System peripheral: Intel Corporation Device 3259 (rev 08)
+ff:1e.2 System peripheral: Intel Corporation Device 325a (rev 08)
+ff:1e.3 System peripheral: Intel Corporation Device 325b (rev 08)
+ff:1e.4 System peripheral: Intel Corporation Device 325c (rev 08)
+ff:1e.5 System peripheral: Intel Corporation Device 325d (rev 08)
+ff:1e.6 System peripheral: Intel Corporation Device 325e (rev 08)
+ff:1e.7 System peripheral: Intel Corporation Device 325f (rev 08)
+
+=== SYSTEM UPTIME ===
+ 01:46:16 up 40 min,  2 users,  load average: 0.31, 3.03, 4.76
+
+=== LOAD AVERAGE ===
+0.31 3.03 4.76 1/3365 52624
+
+=== DOCKER VERSION ===
+Docker version 29.0.4, build 3247a5a
+
+Docker Info:
+ Server Version: 29.0.4
+ Storage Driver: overlay2
+ Operating System: Ubuntu 24.04.3 LTS
+ CPUs: 112
+ Total Memory: 1.968TiB
+ Docker Root Dir: /var/lib/docker
+
+================================
+System information collected successfully!
+Saved to: system_info.txt
+================================
