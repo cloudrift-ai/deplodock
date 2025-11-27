@@ -1,4 +1,4 @@
-.PHONY: help setup clean bench bench-force logs clean-logs test-compose report
+.PHONY: help setup clean bench bench-force logs clean-logs test-compose report report-nov2025
 
 help:
 	@echo "Server Benchmark Makefile"
@@ -8,6 +8,7 @@ help:
 	@echo "  bench          - Run benchmarks in parallel"
 	@echo "  bench-force    - Run benchmarks in parallel (force re-run, skip cached results)"
 	@echo "  report         - Generate Excel report from benchmark results"
+	@echo "  report-nov2025 - Generate Excel report from Nov 2025 results (pro6000_l40s_h100_h200_11_2025)"
 	@echo "  logs           - Show the latest benchmark log"
 	@echo "  clean-logs     - Remove all log files"
 	@echo "  clean          - Remove virtual environment and generated files"
@@ -37,6 +38,18 @@ report: setup
 	@echo "Generating Excel report from benchmark results..."
 	./venv/bin/python generate_benchmark_report.py
 	@echo "✅ Report generated: benchmark_report.xlsx"
+
+report-nov2025: setup
+	@echo "Generating Excel report from Nov 2025 benchmark results..."
+	./venv/bin/python generate_benchmark_report.py \
+		--results-dir results/pro6000_l40s_h100_h200_11_2025 \
+		--output results/pro6000_l40s_h100_h200_11_2025/benchmark_report.xlsx
+	./venv/bin/python generate_benchmark_report.py \
+		--results-dir results/pro6000_l40s_h100_h200_11_2025/single-query \
+		--output results/pro6000_l40s_h100_h200_11_2025/single-query/benchmark_report.xlsx
+	./venv/bin/python generate_benchmark_report.py \
+		--results-dir results/pro6000_l40s_h100_h200_11_2025/single-gpu \
+		--output results/pro6000_l40s_h100_h200_11_2025/single-gpu/benchmark_report.xlsx
 
 logs:
 	@if [ ! -d "logs" ]; then \
