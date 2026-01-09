@@ -3,14 +3,14 @@
 # Global benchmark settings
 benchmark:
   local_results_dir: "results"           # Local directory to store results
-  huggingface_cache_dir: "/hf_models"    # Directory on remote servers to store HuggingFace models and cache
+  huggingface_cache_dir: "/mnt/localssd/hf_models"    # Directory on remote servers to store HuggingFace models and cache
 
 # Benchmark parameters (required)
 benchmark_params:
-  max_concurrency: 1         # Maximum concurrent requests
-  num_prompts: 100           # Number of prompts to benchmark
-  random_input_len: 1000     # Random input length for benchmark
-  random_output_len: 1000    # Random output length for benchmark
+  max_concurrency: 64         # Maximum concurrent requests
+  num_prompts: 128           # Number of prompts to benchmark
+  random_input_len: 8000     # Random input length for benchmark
+  random_output_len: 8000    # Random output length for benchmark
 
 # GPU Pricing ($ per hour per GPU)
 pricing:
@@ -27,14 +27,68 @@ servers:
 #    models:
 #      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
 #        extra_args: "--max-model-len 8192"
+#
+#  - name: "H200_2g35gb"
+#    address: "riftuser@91.201.219.162"
+#    ssh_key: "~/.ssh/mig_instance"
+#    port: 22
+#    models:
+#      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+#        extra_args: "--max-model-len 8192"
 
-  - name: "H200_2g35gb"
-    address: "riftuser@91.201.219.162"
-    ssh_key: "~/.ssh/mig_instance"
+
+#  - name: "RTXPro6000"
+#    address: "neural@74.81.65.151"
+#    ssh_key: "~/.ssh/nr_rtx6000_1"
+#    port: 22
+#    models:
+##      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
+##        num_instances: 8
+##        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 256 --kv-cache-dtype fp8"
+##      - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
+##        tensor_parallel_size: 4
+##        num_instances: 2
+##        extra_args: "--max-num-seqs 256 --max-model-len 8192"
+#      - name: "zai-org/GLM-4.6-FP8"
+#        num_instances: 1
+#        tensor_parallel_size: 8
+#        extra_args: "--max-num-seqs 256 --max-model-len 8192 --kv-cache-dtype fp8  --max-num-batched-tokens 16384"
+#        # --enable-expert-parallel
+
+  - name: "gcloud_RTXPro6000"
+    address: "natalia@35.224.102.221"
+    ssh_key: "~/.ssh/google_compute_engine"
     port: 22
     models:
-      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-        extra_args: "--max-model-len 8192"
+      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
+        num_instances: 8
+        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8"
+      - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
+        tensor_parallel_size: 4
+        num_instances: 2
+        extra_args: "--max-num-seqs 256 --max-model-len 16384"
+      - name: "zai-org/GLM-4.6-FP8"
+        num_instances: 1
+        tensor_parallel_size: 8
+        extra_args: "--max-num-seqs 256 --max-model-len 16384 --kv-cache-dtype fp8"
+        # --enable-expert-parallel
+
+#  - name: "h100_x_8"
+#    address: "34.56.144.130"
+#    ssh_key: "/Users/natalia/.ssh/google_compute_engine"
+#    port: 22
+#    models:
+#      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
+#        num_instances: 8
+#        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 128 --enable-expert-parallel --kv-cache-dtype fp8"
+#      - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
+#        tensor_parallel_size: 4
+#        num_instances: 2
+#        extra_args: "--max-num-seqs 128 --max-model-len 16384 --enable-expert-parallel"
+##      - name: "zai-org/GLM-4.6-FP8"
+##        tensor_parallel_size: 8
+##        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-num-seqs 256 --max-model-len 16384 --kv-cache-dtype fp8"
+
 
 #  - name: "rtx4090_x_4"
 #    address: "riftuser@142.214.185.239"
@@ -125,7 +179,7 @@ servers:
 
 #  - name: "h200_x_8"
 #    address: "hc-h200-1"
-#    ssh_key: "~/.ssh/hc_h200_1"
+#    ssh_key: "/Users/natalia/.ssh/google_compute_engine"
 #    port: 22
 #    models:
 #      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
