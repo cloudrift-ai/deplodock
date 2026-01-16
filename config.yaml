@@ -7,7 +7,7 @@ benchmark:
 
 # Benchmark parameters (required)
 benchmark_params:
-  max_concurrency: 64         # Maximum concurrent requests
+  max_concurrency: 64         # Maximum concurrent requests (optimal for AWQ models; use 128 for GLM-4.6-FP8)
   num_prompts: 128           # Number of prompts to benchmark
   random_input_len: 8000     # Random input length for benchmark
   random_output_len: 8000    # Random output length for benchmark
@@ -56,22 +56,35 @@ servers:
 #        # --enable-expert-parallel
 
   - name: "gcloud_RTXPro6000"
-    address: "natalia@35.224.102.221"
+    address: "natalia@34.45.149.179"
     ssh_key: "~/.ssh/google_compute_engine"
     port: 22
     models:
+      # =====================================================
+      # BEST CONFIGURATIONS PER MODEL (8x RTX Pro 6000 GPUs)
+      # Tested params: --max-num-batched-tokens 32768, --enable-prefix-caching, --enable-expert-parallel
+      # Result: Baseline configs are optimal - new params reduced throughput by 2-9%
+      # =====================================================
+
+      # GLM-4.5-Air-AWQ-4bit: 1145.35 tok/s (best)
+      # Tested with new params: 1054.42 tok/s (-8%)
       - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
         num_instances: 8
         extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8"
+
+      # Qwen3-Coder-480B-AWQ: 1056.92 tok/s (best)
+      # Tested with new params: 957.86 tok/s (-9.4%)
       - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
         tensor_parallel_size: 4
         num_instances: 2
-        extra_args: "--max-num-seqs 256 --max-model-len 16384"
+        extra_args: "--max-num-seqs 128 --max-model-len 16384 --kv-cache-dtype fp8"
+
+      # GLM-4.6-FP8: 823.98 tok/s (best)
+      # Tested with new params: 807.64 tok/s (-2%)
+      # Note: Run with max_concurrency=128 (not 64)
       - name: "zai-org/GLM-4.6-FP8"
-        num_instances: 1
         tensor_parallel_size: 8
         extra_args: "--max-num-seqs 256 --max-model-len 16384 --kv-cache-dtype fp8"
-        # --enable-expert-parallel
 
 #  - name: "h100_x_8"
 #    address: "34.56.144.130"
