@@ -51,6 +51,14 @@ report-nov2025: setup
 		--results-dir results/pro6000_l40s_h100_h200_11_2025/single-gpu \
 		--output results/pro6000_l40s_h100_h200_11_2025/single-gpu/benchmark_report.xlsx
 
+report-jan2026: setup
+	@echo "Generating Excel report from Jan 2026 benchmark results..."
+	./venv/bin/python generate_benchmark_report.py \
+		--results-dir results/claude/summary \
+		--output results/pro6000_h100_h200_b200_01_2026/benchmark_report.xlsx
+
+
+
 logs:
 	@if [ ! -d "logs" ]; then \
 		echo "❌ No logs directory found."; \
