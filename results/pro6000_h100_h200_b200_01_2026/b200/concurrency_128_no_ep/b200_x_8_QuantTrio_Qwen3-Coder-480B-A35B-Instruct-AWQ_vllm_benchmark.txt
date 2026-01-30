@@ -1,0 +1,131 @@
+============ Serving Benchmark Result ============
+Successful requests:                     256       
+Failed requests:                         0         
+Maximum request concurrency:             128       
+Benchmark duration (s):                  751.58    
+Total input tokens:                      2048000   
+Total generated tokens:                  2048000   
+Request throughput (req/s):              0.34      
+Output token throughput (tok/s):         2724.91   
+Peak output token throughput (tok/s):    3878.00   
+Peak concurrent requests:                139.00    
+Total token throughput (tok/s):          5449.82   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          14417.88  
+Median TTFT (ms):                        10794.02  
+P99 TTFT (ms):                           51255.56  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          38.62     
+Median TPOT (ms):                        39.35     
+P99 TPOT (ms):                           51.31     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           38.61     
+Median ITL (ms):                         37.29     
+P99 ITL (ms):                            50.49     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          323326.01 
+Median E2EL (ms):                        329802.30 
+P99 E2EL (ms):                           427991.21 
+==================================================
+
+============ Docker Compose Configuration ============
+services:
+  vllm_0:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1', '2', '3']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8000:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 4
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+      --served-model-name QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+      --max-num-seqs 512 --max-model-len 16384
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_1:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['4', '5', '6', '7']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8001:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 4
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+      --served-model-name QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ
+      --max-num-seqs 512 --max-model-len 16384
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx_lb
+    ports:
+      - "8080:8080"
+    volumes:
+      - /home/natalia/server-benchmark/nginx.vllm.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - vllm_0
+      - vllm_1
+
+  benchmark:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_client
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["sleep infinity"]
+    profiles:
+      - tools
+
+============ Benchmark Command ============
+vllm bench serve     --model QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ     --dataset-name random     --random-input-len 8000     --random-output-len 8000     --max-concurrency 128     --num-prompts 256     --ignore-eos     --backend openai-chat     --endpoint /v1/chat/completions     --percentile-metrics ttft,tpot,itl,e2el     --base-url http://nginx_lb:8080
+==================================================

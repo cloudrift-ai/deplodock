@@ -1,0 +1,5 @@
+Hardware,Total Throughput (tok/s),Output Token Throughput (tok/s),Expert Parallelism,Max Concurrency
+Pro6000,1602.96,801.48,off,64
+H100,2328.63,1164.31,off,64
+H200,4262.88,2131.44,on,128
+B200,5738.97,2869.48,on,256
