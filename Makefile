@@ -54,7 +54,7 @@ report-nov2025: setup
 report-jan2026: setup
 	@echo "Generating Excel report from Jan 2026 benchmark results..."
 	./venv/bin/python generate_benchmark_report.py \
-		--results-dir results/claude/summary \
+		--results-dir results/pro6000_h100_h200_b200_01_2026/summary \
 		--output results/pro6000_h100_h200_b200_01_2026/benchmark_report.xlsx
 
 
