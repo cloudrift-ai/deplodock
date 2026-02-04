@@ -1,0 +1,353 @@
+============ Serving Benchmark Result ============
+Successful requests:                     128       
+Failed requests:                         0         
+Maximum request concurrency:             64        
+Benchmark duration (s):                  561.79    
+Total input tokens:                      1024000   
+Total generated tokens:                  1024000   
+Request throughput (req/s):              0.23      
+Output token throughput (tok/s):         1822.75   
+Peak output token throughput (tok/s):    2403.00   
+Peak concurrent requests:                83.00     
+Total token throughput (tok/s):          3645.49   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          9624.71   
+Median TTFT (ms):                        7169.85   
+P99 TTFT (ms):                           34335.77  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          30.16     
+Median TPOT (ms):                        31.86     
+P99 TPOT (ms):                           46.10     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           30.19     
+Median ITL (ms):                         30.56     
+P99 ITL (ms):                            48.75     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          250903.02 
+Median E2EL (ms):                        264271.28 
+P99 E2EL (ms):                           371901.41 
+==================================================
+
+============ Docker Compose Configuration ============
+services:
+  vllm_0:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8000:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+      --served-model-name cpatonn/GLM-4.5-Air-AWQ-4bit
+      --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_1:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8001:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+      --served-model-name cpatonn/GLM-4.5-Air-AWQ-4bit
+      --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_2:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['2']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8002:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+      --served-model-name cpatonn/GLM-4.5-Air-AWQ-4bit
+      --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_3:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['3']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8003:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+      --served-model-name cpatonn/GLM-4.5-Air-AWQ-4bit
+      --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_4:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['4']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8004:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+      --served-model-name cpatonn/GLM-4.5-Air-AWQ-4bit
+      --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_5:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_5
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['5']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8005:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+      --served-model-name cpatonn/GLM-4.5-Air-AWQ-4bit
+      --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_6:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_6
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['6']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8006:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+      --served-model-name cpatonn/GLM-4.5-Air-AWQ-4bit
+      --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  vllm_7:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_container_7
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['7']
+              capabilities: [gpu]
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    ports:
+      - "8007:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model /mnt/localssd/hf_models/cpatonn/GLM-4.5-Air-AWQ-4bit
+      --served-model-name cpatonn/GLM-4.5-Air-AWQ-4bit
+      --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health && curl -f http://localhost:8000/v1/models | grep -q 'object.*list'"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx_lb
+    ports:
+      - "8080:8080"
+    volumes:
+      - /home/natalia/server-benchmark/nginx.vllm.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - vllm_0
+      - vllm_1
+      - vllm_2
+      - vllm_3
+      - vllm_4
+      - vllm_5
+      - vllm_6
+      - vllm_7
+
+  benchmark:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_benchmark_client
+    volumes:
+      - /mnt/localssd/hf_models:/mnt/localssd/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=
+      - HF_HOME=/mnt/localssd/hf_models
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["sleep infinity"]
+    profiles:
+      - tools
+
+============ Benchmark Command ============
+vllm bench serve     --model cpatonn/GLM-4.5-Air-AWQ-4bit     --dataset-name random     --random-input-len 8000     --random-output-len 8000     --max-concurrency 64     --num-prompts 128     --ignore-eos     --backend openai-chat     --endpoint /v1/chat/completions     --percentile-metrics ttft,tpot,itl,e2el     --base-url http://nginx_lb:8080
+==================================================

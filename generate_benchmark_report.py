@@ -55,7 +55,7 @@ def parse_benchmark_result(result_file: Path) -> Tuple[float, Dict]:
 
     # Extract total token throughput (tok/s)
     # Look for pattern like: "Total Token throughput (tok/s):       1332.32"
-    total_match = re.search(r'Total Token throughput \(tok/s\):\s+([\d.]+)', content)
+    total_match = re.search(r'Total [Tt]oken throughput \(tok/s\):\s+([\d.]+)', content)
     if not total_match:
         return None, {}
 
@@ -155,13 +155,20 @@ def generate_report(config: dict, results_dir: str, output_file: str):
 
         # Split server and model
         # Format: server_name_model_name
+        # Supports: h100_x_8_model or gcloud_RTXPro6000_model
         match = re.match(r'([^_]+_x_\d+)_(.+)', parts)
-        if not match:
-            print(f"Warning: Could not parse filename: {result_file.name}")
-            continue
-
-        server_name = match.group(1)
-        model_name = match.group(2).replace('_', '/')
+        if match:
+            server_name = match.group(1)
+            model_name = match.group(2).replace('_', '/')
+        else:
+            # Try alternative format: gcloud_GPUType_model
+            match = re.match(r'(gcloud_[^_]+)_(.+)', parts)
+            if match:
+                server_name = match.group(1)
+                model_name = match.group(2).replace('_', '/')
+            else:
+                print(f"Warning: Could not parse filename: {result_file.name}")
+                continue
 
         # Parse benchmark results
         total_throughput, metrics = parse_benchmark_result(result_file)
