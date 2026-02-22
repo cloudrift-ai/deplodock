@@ -133,6 +133,38 @@ python main.py deploy ssh --recipe <path> --server user@host [--variant <name>] 
 | `--ssh-key` | No | `~/.ssh/id_ed25519` | SSH key path |
 | `--ssh-port` | No | 22 | SSH port |
 
+## VM Management
+
+The `vm` command manages cloud GPU VM lifecycles. Currently supports GCP flex-start (which can take hours to provision capacity).
+
+### Start a VM
+
+```bash
+deplodock vm start gcp-flex-start --instance my-gpu-vm --zone us-central1-a
+deplodock vm start gcp-flex-start --instance my-gpu-vm --zone us-central1-a --wait-ssh
+deplodock vm start gcp-flex-start --instance my-gpu-vm --zone us-central1-a --timeout 7200 --dry-run
+```
+
+### Stop a VM
+
+```bash
+deplodock vm stop gcp-flex-start --instance my-gpu-vm --zone us-central1-a
+deplodock vm stop gcp-flex-start --instance my-gpu-vm --zone us-central1-a --dry-run
+```
+
+### VM Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--instance` | (required) | GCP instance name |
+| `--zone` | (required) | GCP zone (e.g. us-central1-a) |
+| `--timeout` | 14400 (start) / 300 (stop) | Timeout in seconds |
+| `--dry-run` | false | Print commands without executing |
+| `--wait-ssh` | false | Wait for SSH connectivity after start |
+| `--wait-ssh-timeout` | 300 | SSH wait timeout in seconds |
+
+GCP project is inferred from `gcloud` config (no `--project` flag needed).
+
 ## Running Tests
 
 ```bash
@@ -214,8 +246,11 @@ deplodock/
 │       │   └── ssh.py               # SSH target
 │       ├── bench/
 │       │   └── __init__.py          # Benchmark runner
-│       └── report/
-│           └── __init__.py          # Report generator
+│       ├── report/
+│       │   └── __init__.py          # Report generator
+│       └── vm/
+│           ├── __init__.py          # VM command registration
+│           └── gcp_flex_start.py    # GCP flex-start provider
 ├── recipes/                         # Model deploy recipes
 │   ├── GLM-4.6-FP8/
 │   ├── GLM-4.6/
