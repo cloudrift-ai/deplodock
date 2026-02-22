@@ -44,8 +44,8 @@ pytest tests/test_recipe.py -v
 ## Contribution Instructions
 
 1. Create a feature branch from `main` (e.g. `feature/my-new-feature`)
-2. Write code following guidelines here, in `STYLE.md` and in `README.md`
-3. Add tests if reasonable (in `tests/`)
-4. Update `STYLE.md`, `README.md` and `CLAUDE.md` if necessary
+2. Write code following guidelines here, in `STYLE.md`, `README.md` and `ARCHITECTURE.md` files in respective folders
+3. Add tests if reasonable (in `tests/` following `tests/ARCHITECTURE.md` guidelines)
+4. Update `STYLE.md`, `README.md`, `CLAUDE.md` and respective `ARCHITECTURE.md` files if necessary
 5. Run tests: `pytest tests/ -v`
 6. Push and open a PR
