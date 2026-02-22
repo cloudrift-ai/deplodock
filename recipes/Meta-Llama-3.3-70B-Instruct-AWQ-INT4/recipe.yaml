@@ -16,7 +16,7 @@ variants:
     backend:
       vllm:
         pipeline_parallel_size: 1
-  RTXPro6000:
+  Pro6000:
     backend:
       vllm:
         pipeline_parallel_size: 1

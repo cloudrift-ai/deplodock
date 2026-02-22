@@ -237,8 +237,9 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, variant=N
         f" -e HUGGING_FACE_HUB_TOKEN={hf_token}"
         f" -e HF_HOME={model_dir}"
         f" -v {model_dir}:{model_dir}"
+        f" --entrypoint bash"
         f" {image}"
-        f" bash -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
+        f" -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
     )
     rc, _ = run_cmd(dl_cmd)
     if rc != 0:
@@ -280,6 +281,33 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, variant=N
     print(f"Model: {model_name}")
     print(f"Instances: {num_instances}")
     print(f"Status: {status}")
+
+    # Step 7: Smoke test inference
+    if not dry_run:
+        print("\nRunning smoke test...")
+        smoke_cmd = (
+            f"curl -sf http://localhost:{port}/v1/chat/completions"
+            f" -H 'Content-Type: application/json'"
+            f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"Say hello"}}],"max_tokens":16}}' '''
+        )
+        rc, _ = run_cmd(smoke_cmd, stream=False)
+        if rc == 0:
+            print("Smoke test passed.")
+        else:
+            print("WARNING: Smoke test failed. The endpoint may not be ready yet.", file=sys.stderr)
+
+    # Print curl example
+    print(f"\nExample curl:")
+    print(
+        f"  curl http://{host}:{port}/v1/chat/completions \\\n"
+        f"    -H 'Content-Type: application/json' \\\n"
+        f"    -d '{{\n"
+        f'      "model": "{model_name}",\n'
+        f'      "messages": [{{"role": "user", "content": "Hello"}}],\n'
+        f'      "max_tokens": 64\n'
+        f"    }}'"
+    )
+
     return True
 
 

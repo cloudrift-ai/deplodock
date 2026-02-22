@@ -38,7 +38,7 @@ servers:
 #        extra_args: "--max-model-len 8192"
 
 
-#  - name: "RTXPro6000"
+#  - name: "Pro6000"
 #    address: "neural@74.81.65.151"
 #    ssh_key: "~/.ssh/nr_rtx6000_1"
 #    port: 22
@@ -56,7 +56,7 @@ servers:
 #        extra_args: "--max-num-seqs 256 --max-model-len 8192 --kv-cache-dtype fp8  --max-num-batched-tokens 16384"
 #        # --enable-expert-parallel
 #
-#  - name: "gcloud_RTXPro6000"
+#  - name: "gcloud_Pro6000"
 #    address: "natalia@34.45.149.179"
 #    ssh_key: "~/.ssh/google_compute_engine"
 #    port: 22

@@ -155,7 +155,7 @@ def generate_report(config: dict, results_dir: str, output_file: str):
 
         # Split server and model
         # Format: server_name_model_name
-        # Supports: h100_x_8_model or gcloud_RTXPro6000_model
+        # Supports: h100_x_8_model or gcloud_Pro6000_model
         match = re.match(r'([^_]+_x_\d+)_(.+)', parts)
         if match:
             server_name = match.group(1)
