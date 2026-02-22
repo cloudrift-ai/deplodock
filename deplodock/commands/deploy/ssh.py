@@ -42,7 +42,6 @@ def _make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
         try:
             result = subprocess.run(
                 ssh_args,
-                capture_output=not stream,
                 text=True,
                 stdout=None if stream else subprocess.PIPE,
                 stderr=None if stream else subprocess.PIPE,
