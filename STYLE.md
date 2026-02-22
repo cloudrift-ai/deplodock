@@ -1,0 +1,83 @@
+# Style Guide
+
+## Python Code Style
+
+### Naming
+
+- `snake_case` for functions, variables, and modules.
+- `PascalCase` for classes.
+- `UPPER_SNAKE_CASE` for module-level constants.
+- Prefix private/internal helpers with underscore (e.g., `_ssh_base_args`).
+
+### Error Handling
+
+Print errors to stderr and exit for CLI-facing failures:
+
+```python
+print(f"Failed to pull images", file=sys.stderr)
+return False
+```
+
+Raise exceptions for programming errors and invalid internal state:
+
+```python
+raise ValueError(f"Model config must have 'name' field: {model}")
+```
+
+### Docstrings
+
+Use triple-quote docstrings for modules and public functions. Keep them
+to one line when the purpose is obvious:
+
+```python
+def load_recipe(recipe_dir, variant=None):
+    """Load recipe.yaml from recipe_dir, optionally deep-merging a variant."""
+```
+
+Use `Args:` / `Returns:` sections only when parameters or return values
+are non-obvious.
+
+### Imports
+
+Group imports in this order, separated by blank lines:
+
+1. Standard library (`os`, `sys`, `subprocess`, etc.)
+2. Third-party packages (`yaml`, `pandas`, `pytest`)
+3. Local imports (`from commands.deploy import ...`)
+
+### Formatting
+
+- 4 spaces for indentation.
+- Keep lines under ~100 characters where practical.
+- Double quotes for strings.
+
+### Dependency Injection for Testability
+
+Shared logic accepts callable parameters (`run_cmd`, `write_file`) so
+that local and SSH targets can provide their own implementations and
+tests can use dry-run or mock versions:
+
+```python
+def run_deploy(run_cmd, write_file, config, model_dir, ...):
+```
+
+## Commit Messages
+
+- Keep the subject line short (under ~72 characters).
+- Use imperative mood: "Add feature", not "Added feature".
+- No multi-line descriptions unless truly necessary — if the change needs
+  explanation, put it in the PR description.
+
+Good:
+```
+Add CLI deploy tool with local and SSH targets
+Fix variant resolution for single-GPU models
+Remove unused benchmark script
+```
+
+Bad:
+```
+This commit adds a new CLI deploy tool that supports both local and SSH
+deployment targets with dry-run mode and variant resolution for different
+GPU configurations.
+```
