@@ -31,7 +31,7 @@ pytest tests/test_recipe.py -v
 
 - `deplodock deploy local ...` — deploy locally via docker compose
 - `deplodock deploy ssh ...` — deploy to remote server via SSH
-- `deplodock bench ...` — run benchmarks on remote servers
+- `deplodock bench ...` — deploy + benchmark + teardown on remote servers (uses deploy infrastructure)
 - `deplodock report ...` — generate Excel reports from benchmark results
 
 ## Key Make Targets
