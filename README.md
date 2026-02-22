@@ -172,16 +172,6 @@ deplodock report --results-dir results/custom --output results/custom/report.xls
 | `--results-dir` | `results` | Directory containing benchmark results |
 | `--output` | `results/benchmark_report.xlsx` | Output Excel file path |
 
-### Make Targets
-
-```bash
-make bench        # Run benchmarks in parallel
-make report       # Generate Excel report
-make bench-force  # Force re-run
-```
-
-See `config.yaml` for server and model configuration. Benchmark scripts in `benchmarks/` are auto-discovered by naming convention (`<step>_<name>.sh`).
-
 ## Project Structure
 
 ```
