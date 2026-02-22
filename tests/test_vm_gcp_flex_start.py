@@ -85,3 +85,14 @@ def test_gcloud_ssh_check_cmd():
         "--ssh-flag=-o", "--ssh-flag=ConnectTimeout=5",
         "--ssh-flag=-o", "--ssh-flag=StrictHostKeyChecking=no",
     ]
+
+
+def test_gcloud_ssh_check_cmd_with_gateway():
+    cmd = _gcloud_ssh_check_cmd("my-vm", "us-central1-a", ssh_gateway="gcp-ssh-gateway")
+    assert cmd == [
+        "gcloud", "compute", "ssh", "my-vm",
+        "--zone", "us-central1-a", "--command", "true",
+        "--ssh-flag=-o", "--ssh-flag=ConnectTimeout=5",
+        "--ssh-flag=-o", "--ssh-flag=StrictHostKeyChecking=no",
+        "--ssh-flag=-o", "--ssh-flag=ProxyJump=gcp-ssh-gateway",
+    ]

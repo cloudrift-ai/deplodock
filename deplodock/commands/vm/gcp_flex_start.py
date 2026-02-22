@@ -62,14 +62,17 @@ def _gcloud_external_ip_cmd(instance, zone):
     ]
 
 
-def _gcloud_ssh_check_cmd(instance, zone):
+def _gcloud_ssh_check_cmd(instance, zone, ssh_gateway=None):
     """Build gcloud command to check SSH connectivity."""
-    return [
+    cmd = [
         "gcloud", "compute", "ssh", instance,
         "--zone", zone, "--command", "true",
         "--ssh-flag=-o", "--ssh-flag=ConnectTimeout=5",
         "--ssh-flag=-o", "--ssh-flag=StrictHostKeyChecking=no",
     ]
+    if ssh_gateway:
+        cmd.extend(["--ssh-flag=-o", f"--ssh-flag=ProxyJump={ssh_gateway}"])
+    return cmd
 
 
 # ── Core logic ─────────────────────────────────────────────────────
@@ -99,20 +102,20 @@ def wait_for_status(instance, zone, target_status, timeout, interval=10, dry_run
     return False
 
 
-def wait_for_ssh(instance, zone, timeout=300, interval=10, dry_run=False):
+def wait_for_ssh(instance, zone, timeout=300, interval=10, ssh_gateway=None, dry_run=False):
     """Poll SSH connectivity until success or timeout.
 
     Returns:
         True if SSH connected, False on timeout.
     """
     if dry_run:
-        cmd = _gcloud_ssh_check_cmd(instance, zone)
+        cmd = _gcloud_ssh_check_cmd(instance, zone, ssh_gateway=ssh_gateway)
         print(f"[dry-run] Poll SSH every {interval}s (up to {timeout}s): {' '.join(cmd)}")
         return True
 
     elapsed = 0
     while elapsed < timeout:
-        rc, _, _ = run_shell_cmd(_gcloud_ssh_check_cmd(instance, zone))
+        rc, _, _ = run_shell_cmd(_gcloud_ssh_check_cmd(instance, zone, ssh_gateway=ssh_gateway))
         if rc == 0:
             return True
         time.sleep(interval)
@@ -135,6 +138,7 @@ def create_instance(
     timeout=14400,
     wait_ssh=False,
     wait_ssh_timeout=300,
+    ssh_gateway=None,
     dry_run=False,
 ):
     """Create a GCP flex-start instance and optionally wait for SSH.
@@ -177,7 +181,7 @@ def create_instance(
 
     if wait_ssh:
         print(f"Waiting for SSH connectivity (timeout: {wait_ssh_timeout}s)...")
-        if not wait_for_ssh(instance, zone, timeout=wait_ssh_timeout, dry_run=dry_run):
+        if not wait_for_ssh(instance, zone, timeout=wait_ssh_timeout, ssh_gateway=ssh_gateway, dry_run=dry_run):
             return False
         print("SSH is ready.")
 
@@ -218,6 +222,7 @@ def handle_create(args):
         timeout=args.timeout,
         wait_ssh=args.wait_ssh,
         wait_ssh_timeout=args.wait_ssh_timeout,
+        ssh_gateway=args.ssh_gateway,
         dry_run=args.dry_run,
     )
     if not success:
@@ -253,6 +258,7 @@ def register_create_target(subparsers):
     parser.add_argument("--timeout", type=int, default=14400, help="How long to poll for RUNNING status in seconds (default: 14400)")
     parser.add_argument("--wait-ssh", action="store_true", help="Wait for SSH connectivity after VM is RUNNING")
     parser.add_argument("--wait-ssh-timeout", type=int, default=300, help="SSH wait timeout in seconds (default: 300)")
+    parser.add_argument("--ssh-gateway", default=None, help="SSH gateway host for ProxyJump (e.g. gcp-ssh-gateway)")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.set_defaults(func=handle_create)
 

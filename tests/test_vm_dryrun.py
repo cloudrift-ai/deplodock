@@ -51,6 +51,20 @@ def test_vm_create_dry_run_with_gcloud_args(run_cli):
     assert "--no-scopes" in stdout
 
 
+def test_vm_create_dry_run_with_ssh_gateway(run_cli):
+    rc, stdout, _ = run_cli(
+        "vm", "create", "gcp-flex-start",
+        "--instance", "my-gpu-vm",
+        "--zone", "us-central1-a",
+        "--machine-type", "e2-micro",
+        "--wait-ssh",
+        "--ssh-gateway", "gcp-ssh-gateway",
+        "--dry-run",
+    )
+    assert rc == 0
+    assert "ProxyJump=gcp-ssh-gateway" in stdout
+
+
 def test_vm_delete_dry_run(run_cli):
     rc, stdout, _ = run_cli(
         "vm", "delete", "gcp-flex-start",
@@ -126,6 +140,7 @@ def test_vm_create_gcp_flex_start_help(run_cli):
     assert "--wait-ssh-timeout" in stdout
     assert "--max-run-duration" in stdout
     assert "--gcloud-args" in stdout
+    assert "--ssh-gateway" in stdout
 
 
 def test_vm_delete_gcp_flex_start_help(run_cli):
