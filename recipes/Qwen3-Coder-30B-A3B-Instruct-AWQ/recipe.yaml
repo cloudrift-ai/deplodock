@@ -12,5 +12,5 @@ backend:
 variants:
   RTX4090: {}
   RTX5090: {}
-  RTXPro6000: {}
+  Pro6000: {}
   L40S: {}

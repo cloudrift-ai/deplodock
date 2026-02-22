@@ -19,7 +19,7 @@ variants:
     backend:
       vllm:
         extra_args: "--max-num-seqs 256 --max-model-len 8192 --kv-cache-dtype fp8"
-  8xRTXPro6000:
+  8xPro6000:
     backend:
       vllm:
         extra_args: "--max-num-seqs 256 --max-model-len 8192 --kv-cache-dtype fp8"
