@@ -2,270 +2,30 @@
 
 # Global benchmark settings
 benchmark:
-  local_results_dir: "results"           # Local directory to store results
-  huggingface_cache_dir: "/mnt/localssd/hf_models"    # Directory on remote servers to store HuggingFace models and cache
+  local_results_dir: "results"
+  model_dir: "/hf_models"
 
 # Benchmark parameters (required)
 benchmark_params:
-  max_concurrency: 128        # Maximum concurrent requests (testing higher concurrency)
-  num_prompts: 256           # Number of prompts to benchmark
-  random_input_len: 8000     # Random input length for benchmark
-  random_output_len: 8000    # Random output length for benchmark
+  max_concurrency: 128
+  num_prompts: 256
+  random_input_len: 8000
+  random_output_len: 8000
 
 # GPU Pricing ($ per hour per GPU)
 pricing:
-  pro6000: 0.93     # RTX 6000 / Pro 6000 price per GPU per hour
+  pro6000: 0.93
   h100: 1.91
   h200: 2.06
   b200: 2.68
 
-# Define servers with their models to benchmark
+# Define servers with their recipes to benchmark
 servers:
-#  - name: "rtx4090_x_1"
-#    address: "riftuser@142.214.185.238"
-#    ssh_key: "~/.ssh/id_ed25519"
-#    port: 22
-#    models:
-#      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-#        extra_args: "--max-model-len 8192"
-#
-#  - name: "H200_2g35gb"
-#    address: "riftuser@91.201.219.162"
-#    ssh_key: "~/.ssh/mig_instance"
-#    port: 22
-#    models:
-#      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-#        extra_args: "--max-model-len 8192"
-
-
-#  - name: "Pro6000"
-#    address: "neural@74.81.65.151"
-#    ssh_key: "~/.ssh/nr_rtx6000_1"
-#    port: 22
-#    models:
-##      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-##        num_instances: 8
-##        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 256 --kv-cache-dtype fp8"
-##      - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
-##        tensor_parallel_size: 4
-##        num_instances: 2
-##        extra_args: "--max-num-seqs 256 --max-model-len 8192"
-#      - name: "zai-org/GLM-4.6-FP8"
-#        num_instances: 1
-#        tensor_parallel_size: 8
-#        extra_args: "--max-num-seqs 256 --max-model-len 8192 --kv-cache-dtype fp8  --max-num-batched-tokens 16384"
-#        # --enable-expert-parallel
-#
-#  - name: "gcloud_Pro6000"
-#    address: "natalia@34.45.149.179"
-#    ssh_key: "~/.ssh/google_compute_engine"
-#    port: 22
-#    models:
-#      # =====================================================
-#      # BEST CONFIGURATIONS PER MODEL (8x RTX Pro 6000 GPUs)
-#      # Tested params: --max-num-batched-tokens 32768, --enable-prefix-caching, --enable-expert-parallel
-#      # Result: Baseline configs are optimal - new params reduced throughput by 2-9%
-#      # =====================================================
-#
-#      # GLM-4.5-Air-AWQ-4bit: 1145.35 tok/s (best)
-#      # Tested with new params: 1054.42 tok/s (-8%)
-#      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-#        num_instances: 8
-#        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8"
-#
-#      # Qwen3-Coder-480B-AWQ: 1056.92 tok/s (best)
-#      # Tested with new params: 957.86 tok/s (-9.4%)
-#      - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
-#        tensor_parallel_size: 4
-#        num_instances: 2
-#        extra_args: "--max-num-seqs 128 --max-model-len 16384 --kv-cache-dtype fp8"
-#
-#      # GLM-4.6-FP8: 823.98 tok/s (best)
-#      # Tested with new params: 807.64 tok/s (-2%)
-#      # Note: Run with max_concurrency=128 (not 64)
-#      - name: "zai-org/GLM-4.6-FP8"
-##        tensor_parallel_size: 8
-##        extra_args: "--max-num-seqs 256 --max-model-len 16384 --kv-cache-dtype fp8"
-#
-#  - name: "h100_x_8"
-#    address: "35.188.97.79"
-#    ssh_key: "/Users/natalia/.ssh/google_compute_engine"
-#    port: 22
-#    models:
-#      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-#        num_instances: 8
-#        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 128 --kv-cache-dtype fp8"
-#      - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
-#        tensor_parallel_size: 4
-#        num_instances: 2
-#        extra_args: "--max-num-seqs 128 --max-model-len 16384"
-#      - name: "zai-org/GLM-4.6-FP8"
-#        tensor_parallel_size: 8
-#        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-num-seqs 256 --max-model-len 16384 --kv-cache-dtype fp8"
-
-#
-##  - name: "rtx4090_x_4"
-##    address: "riftuser@142.214.185.239"
-##    ssh_key: "~/.ssh/id_ed25519"
-##    port: 22
-##    models:
-##      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-##        num_instances: 4
-##        extra_args: "--max-model-len 8192"
-##      - name: "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
-##        pipeline_parallel_size: 2
-##        num_instances: 2
-##        extra_args: "--max-model-len 8192 --kv-cache-dtype fp8"
-##      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-##        pipeline_parallel_size: 4
-##        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --enable-expert-parallel --kv-cache-dtype fp8"
-#
-##  - name: "rtx5090_x_1"
-##    address: "riftuser@217.138.104.165"
-##    ssh_key: "~/.ssh/id_ed25519"
-##    port: 22
-##    models:
-##      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-##        extra_args: "--max-model-len 8192"
-#
-##  - name: "rtx5090_x_2"
-##    address: "riftuser@217.138.104.153"
-##    ssh_key: "~/.ssh/id_ed25519"
-##    port: 22
-##    models:
-##      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-##        num_instances: 2
-##        extra_args: "--max-model-len 8192"
-##      - name: "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
-##        pipeline_parallel_size: 2
-##        extra_args: "--max-model-len 8192 --kv-cache-dtype fp8"
-#
-##  - name: "rtx5090_x_4"
-##    address: "riftuser@217.138.104.164"
-##    ssh_key: "~/.ssh/id_ed25519"
-##    port: 22
-##    models:
-##      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-##        num_instances: 4
-##        extra_args: "--max-model-len 8192"
-##      - name: "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
-##        pipeline_parallel_size: 2
-##        num_instances: 2
-##        extra_args: "--max-model-len 8192 --kv-cache-dtype fp8"
-##      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-##        tensor_parallel_size: 4
-##        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 128 --enable-expert-parallel --kv-cache-dtype fp8"
-#
-##  - name: "pro6000_x_1"
-##    address: "riftuser@74.81.65.42"
-##    ssh_key: "~/.ssh/id_ed25519"
-##    port: 22
-##    models:
-##      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-##        extra_args: "--max-model-len 8192"
-##      - name: "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
-##        extra_args: "--max-model-len 8192 --kv-cache-dtype fp8"
-##      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-##        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 256 --enable-expert-parallel --kv-cache-dtype fp8"
-#
-##  - name: "l40s_x_2"
-##    address: "riftuser@91.201.219.165"
-##    ssh_key: "~/.ssh/id_ed25519"
-##    port: 22
-##    models:
-##      - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-##        num_instances: 2
-##        extra_args: "--max-model-len 8192"
-##      - name: "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
-##        num_instances: 2
-##        extra_args: "--max-model-len 8192 --kv-cache-dtype fp8"
-##      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-##        pipeline_parallel_size: 2
-##        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --enable-expert-parallel --kv-cache-dtype fp8"
-#
-##  - name: "h200_x_1"
-##    address: "riftuser@91.201.219.161"
-##    ssh_key: "~/.ssh/id_ed25519"
-##    port: 22
-##    models:
-##      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-##        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 256 --enable-expert-parallel --kv-cache-dtype fp8"
-#
-#  - name: "h200_x_8"
-#    address: "natalia@34.66.90.99"
-#    ssh_key: "/Users/natalia/.ssh/google_compute_engine"
-#    port: 22
-#    models:
-#      # =====================================================
-#      # BEST CONFIGURATIONS PER MODEL (8x NVIDIA H200 GPUs)
-#      # Benchmark: random input/output 8000 tokens, 128 prompts
-#      # =====================================================
-#
-#      # =====================================================
-#      # FINAL BEST CONFIGURATIONS (8x NVIDIA H200 GPUs)
-#      # =====================================================
-#
-#      # GLM-4.6-FP8: 2792.59 tok/s (BEST)
-#      # Run with: max_concurrency=256, num_prompts=256
-#      # Higher concurrency gives +24% vs baseline (2252 tok/s with 128 concurrency)
-#      # Note: --enable-expert-parallel has NO additional benefit (2789.10 tok/s)
-#      - name: "zai-org/GLM-4.6-FP8"
-#        tensor_parallel_size: 8
-#        extra_args: "--max-num-seqs 512 --max-model-len 16384 --kv-cache-dtype fp8  --enable-expert-parallel"
-
-#      # GLM-4.5-Air-AWQ-4bit: 1822.75 tok/s
-#      # Run with: max_concurrency=64 (256 concurrency causes failures and -25% throughput)
-#      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-#        num_instances: 8
-#        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8 --enable-expert-parallel"
-#
-#      # Qwen3-Coder-480B-AWQ: 2018.66 tok/s with 256 concurrency (+20% vs baseline)
-#      # Run with: max_concurrency=256, num_prompts=256
-#      # Note: 24 failed requests at 256 concurrency
-#      - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
-#        tensor_parallel_size: 4
-#        num_instances: 2
-#        extra_args: "--max-num-seqs 512 --max-model-len 16384 --enable-expert-parallel"
-
-
-  - name: "b200_x_8"
-    address: "natalia@35.197.159.39"
-    ssh_key: "/Users/natalia/.ssh/google_compute_engine"
+  - name: "rtx4090_x_1"
+    address: "riftuser@142.214.185.165"
+    ssh_key: "~/.ssh/id_ed25519"
     port: 22
-    models:
-      # =====================================================
-      # BEST CONFIGURATIONS PER MODEL (8x NVIDIA H200 GPUs)
-      # Benchmark: random input/output 8000 tokens, 128 prompts
-      # =====================================================
+    recipes:
+      - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+        variant: "RTX4090"
 
-      # =====================================================
-      # FINAL BEST CONFIGURATIONS (8x NVIDIA H200 GPUs)
-      # =====================================================
-
-      # GLM-4.6-FP8: 2792.59 tok/s (BEST)
-      # Run with: max_concurrency=256, num_prompts=256
-      # Higher concurrency gives +24% vs baseline (2252 tok/s with 128 concurrency)
-      # Note: --enable-expert-parallel has NO additional benefit (2789.10 tok/s)
-      - name: "zai-org/GLM-4.6-FP8"
-        tensor_parallel_size: 8
-        extra_args: "--max-num-seqs 512 --max-model-len 16384 --kv-cache-dtype fp8"
-
-      # GLM-4.5-Air-AWQ-4bit: 1822.75 tok/s
-      # Run with: max_concurrency=64 (256 concurrency causes failures and -25% throughput)
-      - name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
-        num_instances: 8
-        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8"
-
-      # Qwen3-Coder-480B-AWQ: 2018.66 tok/s with 256 concurrency (+20% vs baseline)
-      # Run with: max_concurrency=256, num_prompts=256
-      # Note: 24 failed requests at 256 concurrency
-      - name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
-        tensor_parallel_size: 4
-        num_instances: 2
-        extra_args: "--max-num-seqs 512 --max-model-len 16384"
-
-# Results will be saved with flat structure using prefixes:
-#   {local_results_dir}/{server_name}_{model_name}_system_info.txt
-#   {local_results_dir}/{server_name}_{model_name}_hf_download.txt
-#   {local_results_dir}/{server_name}_{model_name}_vllm_benchmark.txt
-#   {local_results_dir}/{server_name}_{model_name}_yabs.txt

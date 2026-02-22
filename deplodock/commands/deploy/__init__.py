@@ -51,7 +51,7 @@ def _parse_variant_gpus(variant):
     return 1
 
 
-def _calculate_num_instances(config, variant):
+def calculate_num_instances(config, variant):
     """Calculate number of instances from config and variant GPU count."""
     vllm = config["backend"]["vllm"]
     tp = vllm.get("tensor_parallel_size", 1)
@@ -206,7 +206,7 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, variant=N
         variant: variant name for instance calculation
         dry_run: if True, skip sleep in health polling
     """
-    num_instances = _calculate_num_instances(config, variant)
+    num_instances = calculate_num_instances(config, variant)
     config["_num_instances"] = num_instances
 
     model_name = config["model"]["name"]

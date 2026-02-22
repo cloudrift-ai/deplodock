@@ -141,13 +141,41 @@ pytest tests/ -v
 
 ## Benchmarking
 
+The `bench` command reuses the deploy infrastructure — it loads a recipe, deploys the model via SSH, runs `vllm bench serve`, captures results, and tears down. No repo cloning needed.
+
+### Configuration
+
+`config.yaml` references recipe paths instead of inline model definitions:
+
+```yaml
+benchmark:
+  local_results_dir: "results"
+  model_dir: "/hf_models"
+
+benchmark_params:
+  max_concurrency: 128
+  num_prompts: 256
+  random_input_len: 8000
+  random_output_len: 8000
+
+servers:
+  - name: "rtx4090_x_1"
+    address: "riftuser@142.214.185.165"
+    ssh_key: "~/.ssh/id_ed25519"
+    port: 22
+    recipes:
+      - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+        variant: "RTX4090"
+```
+
 ### Run Benchmarks
 
 ```bash
-deplodock bench --parallel            # Run benchmarks in parallel
-deplodock bench --server my_server    # Run for specific server
-deplodock bench --model org/model     # Run for specific model
-deplodock bench --parallel --force    # Force re-run, skip cached results
+deplodock bench --dry-run                                         # Preview commands
+deplodock bench --parallel                                        # Run benchmarks in parallel
+deplodock bench --server my_server                                # Run for specific server
+deplodock bench --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ  # Run for specific recipe
+deplodock bench --parallel --force                                # Force re-run, skip cached results
 ```
 
 | Flag | Default | Description |
@@ -155,9 +183,10 @@ deplodock bench --parallel --force    # Force re-run, skip cached results
 | `--config` | `config.yaml` | Path to configuration file |
 | `--force` | false | Force re-run even if results exist |
 | `--server` | - | Run only for a specific server |
-| `--model` | - | Run only for a specific model |
+| `--recipe` | - | Run only for a specific recipe path |
 | `--parallel` | false | Run servers in parallel |
 | `--max-workers` | num servers | Max parallel server benchmarks |
+| `--dry-run` | false | Print commands without executing |
 
 ### Generate Reports
 
@@ -195,8 +224,6 @@ deplodock/
 │   ├── Qwen3-Coder-30B-A3B-Instruct-AWQ/
 │   └── Meta-Llama-3.3-70B-Instruct-AWQ-INT4/
 ├── tests/                           # pytest tests
-├── benchmarks/                      # Benchmark scripts
-├── utils/                           # Utilities
 ├── config.yaml                      # Benchmark configuration
 └── Makefile                         # Build automation
 ```
