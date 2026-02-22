@@ -1,0 +1,10 @@
+model:
+  name: "zai-org/GLM-4.6"
+
+backend:
+  vllm:
+    image: "vllm/vllm-openai:latest"
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    extra_args: "--max-num-seqs 512 --max-model-len 8192"

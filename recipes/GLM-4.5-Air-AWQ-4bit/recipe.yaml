@@ -1,0 +1,37 @@
+model:
+  name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
+
+backend:
+  vllm:
+    image: "vllm/vllm-openai:latest"
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8"
+
+variants:
+  B200: {}
+  H200: {}
+  H100:
+    backend:
+      vllm:
+        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 256 --enable-expert-parallel --kv-cache-dtype fp8"
+  RTXPro6000:
+    backend:
+      vllm:
+        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 256 --enable-expert-parallel --kv-cache-dtype fp8"
+  4xRTX5090:
+    backend:
+      vllm:
+        pipeline_parallel_size: 4
+        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --enable-expert-parallel --kv-cache-dtype fp8"
+  4xRTX4090:
+    backend:
+      vllm:
+        pipeline_parallel_size: 4
+        extra_args: "--dtype float16 --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --enable-expert-parallel"
+  2xL40S:
+    backend:
+      vllm:
+        pipeline_parallel_size: 2
+        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --enable-expert-parallel --kv-cache-dtype fp8"

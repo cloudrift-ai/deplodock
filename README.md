@@ -1,111 +1,177 @@
-## Benchmark LLM Inference
+# Server Benchmark
 
-This tool is designed to test a server performance for llm inference
+Tools for deploying and benchmarking LLM inference on GPU servers.
 
-## How to Run
+## Quick Start
 
-Clone the repository:
+### Install
+
 ```bash
 git clone https://github.com/cloudrift-ai/server-benchmark.git
 cd server-benchmark
-```
-
-Install dependencies:
-```bash
 make setup
 ```
 
-Run benchmarks automatically via SSH on remote servers:
+### Deploy a Model
+
 ```bash
-make bench
+python main.py deploy ssh \
+  --recipe recipes/GLM-4.6-FP8 \
+  --variant 8xH200 \
+  --server user@host
 ```
 
-For more commands, run `make help`
+### Deploy Locally
 
-## Benchmark Naming Convention
-
-Benchmark scripts follow the naming convention: `<step_index>_<benchmark_name>.sh`
-- The script automatically discovers and runs benchmarks in order
-- Result files are named: `<benchmark_name>.txt`
-
-### Adding a new benchmark:
-1. Create a script: `benchmarks/5_my_benchmark.sh`
-2. Ensure it outputs to: `my_benchmark.txt`
-3. The script will be automatically discovered and run
-
-### Disabling a benchmark:
-To temporarily disable a benchmark, prefix the filename with an underscore:
 ```bash
-mv benchmarks/4_yabs.sh benchmarks/_4_yabs.sh
-```
-The script will skip any files not matching the `[0-9]*_*.sh` pattern.
-
-### Re-enabling a benchmark:
-```bash
-mv benchmarks/_4_yabs.sh benchmarks/4_yabs.sh
+python main.py deploy local \
+  --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ \
+  --variant RTX5090
 ```
 
-## Model Configuration
+### Teardown
 
-Models in `config.yaml` support the following parameters:
+```bash
+python main.py deploy ssh \
+  --recipe recipes/GLM-4.6-FP8 \
+  --server user@host \
+  --teardown
+```
 
-### Single-Instance Configuration
+### Dry Run
+
+Preview commands without executing:
+
+```bash
+python main.py deploy ssh \
+  --recipe recipes/GLM-4.6-FP8 \
+  --variant 8xH200 \
+  --server user@host \
+  --dry-run
+```
+
+## Recipes
+
+Recipes are declarative YAML configs in `recipes/<model>/recipe.yaml`. Each recipe defines a model, backend settings, and hardware variants.
+
+### Format
+
 ```yaml
-models:
-  - name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-    tensor_parallel_size: 1  # Number of GPUs per instance (default: 1)
+model:
+  name: "org/model-name"
+
+backend:
+  vllm:
+    image: "vllm/vllm-openai:latest"
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    extra_args: "--max-num-seqs 512 --max-model-len 16384"
+
+variants:
+  8xH200: {}                    # Uses defaults
+  8xH100:
+    backend:
+      vllm:
+        extra_args: "--max-model-len 8192"  # Override for this hardware
 ```
 
-### Multi-Instance Configuration
-For servers with multiple GPUs, you can run multiple vLLM instances in parallel to maximize throughput:
+### Variant Naming
 
-```yaml
-models:
-  - name: "Qwen/Qwen2.5-72B-Instruct-AWQ"
-    tensor_parallel_size: 2  # GPUs per instance
-    num_instances: 2         # Number of parallel instances (optional, default: 1)
+Variants use hardware-descriptive names for per-instance GPU setup:
+- `H200` — 1 GPU
+- `8xH200` — 8 GPUs (tensor parallel)
+- `4xH100` — 4 GPUs
+
+Format: `[<gpus>x]<GPU_TYPE>`. Multi-instance deployment is automatic when variant GPUs exceed per-instance needs.
+
+### Available Recipes
+
+| Recipe | Model | GPU Config |
+|--------|-------|-----------|
+| `GLM-4.6-FP8` | zai-org/GLM-4.6-FP8 | TP=8, dense FP8 |
+| `GLM-4.6` | zai-org/GLM-4.6 | TP=8, dense FP16 |
+| `GLM-4.5-Air-AWQ-4bit` | cpatonn/GLM-4.5-Air-AWQ-4bit | TP=1, MoE |
+| `Qwen3-Coder-480B-A35B-Instruct-AWQ` | QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ | TP=4, large MoE |
+| `Qwen3-Coder-30B-A3B-Instruct-AWQ` | QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ | TP=1, small MoE |
+| `Meta-Llama-3.3-70B-Instruct-AWQ-INT4` | ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4 | PP=2, dense |
+
+## Deploy Targets
+
+### Local
+
+Runs docker compose directly on the current machine.
+
+```bash
+python main.py deploy local --recipe <path> [--variant <name>] [--dry-run]
 ```
 
-**Example: 4-GPU Server Configuration**
-- `tensor_parallel_size: 2` + `num_instances: 2` = 2 instances using GPU pairs (0-1, 2-3)
-- This effectively doubles throughput compared to a single instance with `tensor_parallel_size: 4`
+### SSH
 
-**Benefits of Multi-Instance Setup:**
-- Lower inter-GPU communication overhead
-- Better latency per request
-- Aggregate throughput = sum of all instance throughputs
-- Ideal for models that fit comfortably on fewer GPUs than available
+Deploys to a remote server via SSH + SCP.
 
-**GPU Assignment:**
-- Instance 0: GPUs 0 to (tensor_parallel_size - 1)
-- Instance 1: GPUs tensor_parallel_size to (2 × tensor_parallel_size - 1)
-- And so on...
+```bash
+python main.py deploy ssh --recipe <path> --server user@host [--variant <name>] [--dry-run]
+```
 
-**Benchmark Behavior:**
-- For multi-instance setups, an nginx load balancer is automatically deployed
-- Nginx uses round-robin to distribute requests across all instances
-- All instances process requests concurrently from a single benchmark run
-- Results reflect true aggregate throughput of the multi-instance setup
+### Common Flags
 
-**Implementation Details:**
-- Uses Docker Compose for orchestrating multiple vLLM containers + nginx
-- Nginx container provides production-grade load balancing
-- GPU assignment handled via Docker Compose device reservations
-- Health checks ensure all instances are ready before benchmarking begins
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--recipe` | Yes | - | Path to recipe directory |
+| `--variant` | No | - | Hardware variant (e.g. 8xH200) |
+| `--hf-token` | No | `$HF_TOKEN` | HuggingFace token |
+| `--model-dir` | No | `/mnt/models` | Model cache dir |
+| `--teardown` | No | false | Stop containers instead of deploying |
+| `--dry-run` | No | false | Print commands without executing |
+
+### SSH-only Flags
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--server` | Yes | - | SSH address (user@host) |
+| `--ssh-key` | No | `~/.ssh/id_ed25519` | SSH key path |
+| `--ssh-port` | No | 22 | SSH port |
+
+## Running Tests
+
+```bash
+pytest tests/ -v
+```
+
+## Benchmarking
+
+For automated benchmarking across multiple servers:
+
+```bash
+make bench        # Run benchmarks
+make report       # Generate Excel report
+make bench-force  # Force re-run
+```
+
+See `config.yaml` for server and model configuration. Benchmark scripts in `benchmarks/` are auto-discovered by naming convention (`<step>_<name>.sh`).
 
 ## Project Structure
 
 ```
 server-benchmark/
-├── benchmarks/           # Benchmark scripts (auto-discovered by naming convention)
-│   ├── 1_system_info.sh
-│   ├── 2_hf_download.sh
-│   ├── 3_vllm_benchmark.sh
-│   └── _4_yabs.sh       # Disabled (underscore prefix)
-├── utils/               # Helper utilities
-│   ├── download_model.py        # HuggingFace model downloader
-│   └── generate_compose.py      # Docker Compose generator
-├── config.yaml          # Server and model configuration
-├── Makefile            # Build automation and helper commands
-└── run_remote_benchmark.py  # Main orchestration script
+├── main.py                          # CLI entrypoint
+├── commands/
+│   └── deploy/
+│       ├── __init__.py              # Shared: recipe, compose, orchestration
+│       ├── local.py                 # Local target
+│       └── ssh.py                   # SSH target
+├── recipes/                         # Model deploy recipes
+│   ├── GLM-4.6-FP8/
+│   ├── GLM-4.6/
+│   ├── GLM-4.5-Air-AWQ-4bit/
+│   ├── Qwen3-Coder-480B-A35B-Instruct-AWQ/
+│   ├── Qwen3-Coder-30B-A3B-Instruct-AWQ/
+│   └── Meta-Llama-3.3-70B-Instruct-AWQ-INT4/
+├── tests/                           # pytest tests
+├── benchmarks/                      # Benchmark scripts
+├── utils/                           # Utilities
+├── config.yaml                      # Benchmark configuration
+├── Makefile                         # Build automation
+└── run_remote_benchmark.py          # Benchmark orchestration
 ```

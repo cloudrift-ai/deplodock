@@ -1,0 +1,23 @@
+model:
+  name: "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
+
+backend:
+  vllm:
+    image: "vllm/vllm-openai:latest"
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 2
+    gpu_memory_utilization: 0.9
+    extra_args: "--max-model-len 8192 --kv-cache-dtype fp8"
+
+variants:
+  2xRTX4090: {}
+  2xRTX5090: {}
+  2xL40S:
+    backend:
+      vllm:
+        pipeline_parallel_size: 1
+  RTXPro6000:
+    backend:
+      vllm:
+        pipeline_parallel_size: 1
+        extra_args: "--max-model-len 2048"

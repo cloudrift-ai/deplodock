@@ -1,0 +1,25 @@
+model:
+  name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
+
+backend:
+  vllm:
+    image: "vllm/vllm-openai:latest"
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    extra_args: "--max-num-seqs 512 --max-model-len 16384 --enable-expert-parallel"
+
+variants:
+  4xH200: {}
+  4xB200:
+    backend:
+      vllm:
+        extra_args: "--max-num-seqs 512 --max-model-len 16384"
+  4xH100:
+    backend:
+      vllm:
+        extra_args: "--max-num-seqs 512 --max-model-len 8192 --enable-expert-parallel"
+  4xRTXPro6000:
+    backend:
+      vllm:
+        extra_args: "--max-num-seqs 256 --max-model-len 8192 --enable-expert-parallel"

@@ -1,0 +1,25 @@
+model:
+  name: "zai-org/GLM-4.6-FP8"
+
+backend:
+  vllm:
+    image: "vllm/vllm-openai:latest"
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    extra_args: "--max-num-seqs 512 --max-model-len 16384 --kv-cache-dtype fp8"
+
+variants:
+  8xH200: {}
+  8xB200:
+    backend:
+      vllm:
+        extra_args: "--max-num-seqs 512 --max-model-len 16384 --kv-cache-dtype fp8 --enable-expert-parallel"
+  8xH100:
+    backend:
+      vllm:
+        extra_args: "--max-num-seqs 256 --max-model-len 8192 --kv-cache-dtype fp8"
+  8xRTXPro6000:
+    backend:
+      vllm:
+        extra_args: "--max-num-seqs 256 --max-model-len 8192 --kv-cache-dtype fp8"
