@@ -281,7 +281,8 @@ def setup_remote_repo(server: dict, logger: logging.Logger) -> bool:
         return False
 
 
-def run_benchmark_step(server: dict, model_config: dict, config: dict, step_name: str, script_name: str, result_file: str, force: bool = False, logger: logging.Logger = None) -> bool:
+def run_benchmark_step(server: dict, model_config: dict, config: dict, step_name: str, script_name: str,
+                       result_file: str, force: bool = False, logger: logging.Logger = None) -> bool:
     """Run a single benchmark step if result doesn't exist, then download the result.
 
     Args:
@@ -549,8 +550,6 @@ def download_single_file(server: dict, model_name: str, config: dict, remote_fil
     except subprocess.CalledProcessError as e:
         print(f"⚠️  Warning: Failed to download {local_prefix}: {e}")
         return False
-
-
 
 
 def normalize_model_config(model) -> dict:

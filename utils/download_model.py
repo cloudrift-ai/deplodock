@@ -68,7 +68,7 @@ def download_and_track(repo_id, local_dir=None):
 
     if total_size > 0:
         average_speed_bps = total_size / elapsed_time
-        average_speed_mbps = average_speed_bps / (1024 * 1024)*8  # Bytes per second to MiB per second
+        average_speed_mbps = average_speed_bps / (1024 * 1024) * 8  # Bytes per second to MiB per second
         print(f"Average download speed: {average_speed_mbps:.2f} MiB/s")
     else:
         print("Could not determine total size for average speed calculation.")
