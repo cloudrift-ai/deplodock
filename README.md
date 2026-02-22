@@ -133,6 +133,53 @@ python main.py deploy ssh --recipe <path> --server user@host [--variant <name>] 
 | `--ssh-key` | No | `~/.ssh/id_ed25519` | SSH key path |
 | `--ssh-port` | No | 22 | SSH port |
 
+## VM Management
+
+The `vm` command manages cloud GPU VM lifecycles. Currently supports GCP flex-start, which provisions new GPU capacity using `--provisioning-model=FLEX_START` (can take hours). Instances are ephemeral — `delete` removes them entirely.
+
+### Create a VM
+
+```bash
+deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type a2-highgpu-1g
+deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --wait-ssh
+deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --gcloud-args "--no-service-account --no-scopes" --dry-run
+```
+
+### Delete a VM
+
+```bash
+deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a
+deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a --dry-run
+```
+
+### Create Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--instance` | (required) | GCP instance name |
+| `--zone` | (required) | GCP zone (e.g. us-central1-a) |
+| `--machine-type` | (required) | Machine type (e.g. a2-highgpu-1g) |
+| `--max-run-duration` | `7d` | Max VM run time (10m–7d) |
+| `--request-valid-for-duration` | `2h` | How long to wait for capacity |
+| `--termination-action` | `DELETE` | Action when max-run-duration expires (`STOP` or `DELETE`) |
+| `--image-family` | `debian-12` | Boot disk image family |
+| `--image-project` | `debian-cloud` | Boot disk image project |
+| `--gcloud-args` | - | Extra args passed to `gcloud compute instances create` |
+| `--timeout` | `14400` | How long to poll for RUNNING status (seconds) |
+| `--wait-ssh` | false | Wait for SSH after VM is RUNNING |
+| `--wait-ssh-timeout` | `300` | SSH wait timeout in seconds |
+| `--dry-run` | false | Print commands without executing |
+
+### Delete Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--instance` | (required) | GCP instance name |
+| `--zone` | (required) | GCP zone (e.g. us-central1-a) |
+| `--dry-run` | false | Print commands without executing |
+
+GCP project is inferred from `gcloud` config (no `--project` flag needed).
+
 ## Running Tests
 
 ```bash
@@ -214,8 +261,11 @@ deplodock/
 │       │   └── ssh.py               # SSH target
 │       ├── bench/
 │       │   └── __init__.py          # Benchmark runner
-│       └── report/
-│           └── __init__.py          # Report generator
+│       ├── report/
+│       │   └── __init__.py          # Report generator
+│       └── vm/
+│           ├── __init__.py          # VM command registration
+│           └── gcp_flex_start.py    # GCP flex-start provider
 ├── recipes/                         # Model deploy recipes
 │   ├── GLM-4.6-FP8/
 │   ├── GLM-4.6/

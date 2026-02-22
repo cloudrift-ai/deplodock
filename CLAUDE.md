@@ -33,6 +33,8 @@ pytest tests/test_recipe.py -v
 - `deplodock deploy ssh ...` — deploy to remote server via SSH
 - `deplodock bench ...` — deploy + benchmark + teardown on remote servers (uses deploy infrastructure)
 - `deplodock report ...` — generate Excel reports from benchmark results
+- `deplodock vm create gcp-flex-start ...` — create a GCP flex-start GPU VM
+- `deplodock vm delete gcp-flex-start ...` — delete a GCP flex-start GPU VM
 
 ## Key Make Targets
 
