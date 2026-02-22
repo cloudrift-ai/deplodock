@@ -19,7 +19,7 @@ setup:
 		echo "Creating virtual environment..."; \
 		python3 -m venv venv; \
 		echo "Installing Python dependencies..."; \
-		./venv/bin/pip install -e .; \
+		./venv/bin/pip install -e ".[test]"; \
 		echo "✅ Setup complete!"; \
 	fi
 

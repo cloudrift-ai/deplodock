@@ -237,8 +237,9 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, variant=N
         f" -e HUGGING_FACE_HUB_TOKEN={hf_token}"
         f" -e HF_HOME={model_dir}"
         f" -v {model_dir}:{model_dir}"
+        f" --entrypoint bash"
         f" {image}"
-        f" bash -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
+        f" -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
     )
     rc, _ = run_cmd(dl_cmd)
     if rc != 0:
