@@ -16,9 +16,6 @@ help:
 
 setup:
 	@if [ ! -d "venv" ]; then \
-		echo "Installing system dependencies..."; \
-		sudo apt update; \
-		sudo apt install -y make python3-venv; \
 		echo "Creating virtual environment..."; \
 		python3 -m venv venv; \
 		echo "Installing Python dependencies..."; \

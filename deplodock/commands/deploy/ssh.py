@@ -26,7 +26,12 @@ def _make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
     """Create a run_cmd callable for SSH execution."""
 
     def run_cmd(command, stream=True):
-        full_cmd = f"cd {REMOTE_DEPLOY_DIR} && {command}"
+        # Use sg to run docker commands under the docker group
+        if command.strip().startswith("docker"):
+            escaped = command.replace('"', '\\"')
+            full_cmd = f'sg docker -c "cd {REMOTE_DEPLOY_DIR} && {escaped}"'
+        else:
+            full_cmd = f"cd {REMOTE_DEPLOY_DIR} && {command}"
         if dry_run:
             print(f"[dry-run] ssh {server}: {full_cmd}")
             return 0, ""
@@ -103,13 +108,17 @@ def handle_ssh(args):
     run_cmd = _make_run_cmd(server, ssh_key, ssh_port, dry_run=dry_run)
     write_file = _make_write_file(server, ssh_key, ssh_port, dry_run=dry_run)
 
-    # Ensure remote deploy directory exists
+    # Ensure remote deploy directory exists and user is in docker group
     if not dry_run:
         ssh_args = _ssh_base_args(server, ssh_key, ssh_port)
-        ssh_args.append(f"mkdir -p {REMOTE_DEPLOY_DIR}")
+        ssh_args.append(
+            f"mkdir -p {REMOTE_DEPLOY_DIR}"
+            " && (groups | grep -q docker || sudo usermod -aG docker $(whoami))"
+        )
         subprocess.run(ssh_args, capture_output=True)
     else:
-        print(f"[dry-run] ssh {server}: mkdir -p {REMOTE_DEPLOY_DIR}")
+        print(f"[dry-run] ssh {server}: mkdir -p {REMOTE_DEPLOY_DIR}"
+              " && add user to docker group")
 
     if teardown:
         return run_teardown(run_cmd)
