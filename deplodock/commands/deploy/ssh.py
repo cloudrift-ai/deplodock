@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 
-from commands.deploy import load_recipe, run_deploy, run_teardown
+from deplodock.commands.deploy import load_recipe, run_deploy, run_teardown
 
 
 REMOTE_DEPLOY_DIR = "~/deploy"

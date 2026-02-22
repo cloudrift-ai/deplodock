@@ -4,8 +4,8 @@
 import argparse
 import sys
 
-from commands.deploy.local import register_local_target
-from commands.deploy.ssh import register_ssh_target
+from deplodock.commands.deploy.local import register_local_target
+from deplodock.commands.deploy.ssh import register_ssh_target
 
 
 def main():

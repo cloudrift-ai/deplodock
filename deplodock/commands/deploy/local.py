@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-from commands.deploy import load_recipe, run_deploy, run_teardown
+from deplodock.commands.deploy import load_recipe, run_deploy, run_teardown
 
 
 def _make_run_cmd(deploy_dir, dry_run=False):

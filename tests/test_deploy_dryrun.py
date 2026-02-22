@@ -7,17 +7,17 @@ import os
 import pytest
 
 
-MAIN_PY = os.path.join(os.path.dirname(__file__), "..", "main.py")
-RECIPES_DIR = os.path.join(os.path.dirname(__file__), "..", "recipes")
+PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
+RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
 
 
 def run_cli(*args):
-    """Run main.py with given args and return (returncode, stdout, stderr)."""
+    """Run deplodock CLI with given args and return (returncode, stdout, stderr)."""
     result = subprocess.run(
-        [sys.executable, MAIN_PY, *args],
+        [sys.executable, "-m", "deplodock.deplodock", *args],
         capture_output=True,
         text=True,
-        cwd=os.path.dirname(MAIN_PY),
+        cwd=PROJECT_ROOT,
     )
     return result.returncode, result.stdout, result.stderr
 
