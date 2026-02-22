@@ -1,5 +1,6 @@
-"""GCP flex-start provider: start/stop GPU VMs using gcloud compute."""
+"""GCP flex-start provider: create/delete GPU VMs using gcloud compute."""
 
+import shlex
 import sys
 import time
 
@@ -9,14 +10,40 @@ from deplodock.commands.vm import run_shell_cmd
 # ── Command builders ───────────────────────────────────────────────
 
 
-def _gcloud_start_cmd(instance, zone):
-    """Build gcloud command to start an instance."""
-    return ["gcloud", "compute", "instances", "start", instance, "--zone", zone]
+def _gcloud_create_cmd(
+    instance,
+    zone,
+    machine_type,
+    max_run_duration="7d",
+    request_valid_for_duration="2h",
+    termination_action="DELETE",
+    image_family="debian-12",
+    image_project="debian-cloud",
+    extra_gcloud_args=None,
+):
+    """Build gcloud command to create a flex-start instance."""
+    cmd = [
+        "gcloud", "compute", "instances", "create", instance,
+        "--zone", zone,
+        "--machine-type", machine_type,
+        "--provisioning-model=FLEX_START",
+        "--maintenance-policy=TERMINATE",
+        "--reservation-affinity=none",
+        "--max-run-duration", max_run_duration,
+        f"--instance-termination-action={termination_action}",
+        "--image-family", image_family,
+        "--image-project", image_project,
+    ]
+    if request_valid_for_duration:
+        cmd.extend(["--request-valid-for-duration", request_valid_for_duration])
+    if extra_gcloud_args:
+        cmd.extend(shlex.split(extra_gcloud_args))
+    return cmd
 
 
-def _gcloud_stop_cmd(instance, zone):
-    """Build gcloud command to stop an instance."""
-    return ["gcloud", "compute", "instances", "stop", instance, "--zone", zone]
+def _gcloud_delete_cmd(instance, zone):
+    """Build gcloud command to delete an instance."""
+    return ["gcloud", "compute", "instances", "delete", instance, "--zone", zone, "--quiet"]
 
 
 def _gcloud_status_cmd(instance, zone):
@@ -95,20 +122,43 @@ def wait_for_ssh(instance, zone, timeout=300, interval=10, dry_run=False):
     return False
 
 
-def start_instance(instance, zone, timeout=14400, wait_ssh=False, wait_ssh_timeout=300, dry_run=False):
-    """Start a GCP instance and optionally wait for SSH.
+def create_instance(
+    instance,
+    zone,
+    machine_type,
+    max_run_duration="7d",
+    request_valid_for_duration="2h",
+    termination_action="DELETE",
+    image_family="debian-12",
+    image_project="debian-cloud",
+    extra_gcloud_args=None,
+    timeout=14400,
+    wait_ssh=False,
+    wait_ssh_timeout=300,
+    dry_run=False,
+):
+    """Create a GCP flex-start instance and optionally wait for SSH.
 
     Steps:
-        1. Issue gcloud compute instances start
+        1. Issue gcloud compute instances create with flex-start flags
         2. Wait for RUNNING status (up to timeout)
         3. Print external IP
         4. Optionally wait for SSH connectivity
     """
-    print(f"Starting instance '{instance}' in zone '{zone}'...")
+    print(f"Creating flex-start instance '{instance}' in zone '{zone}'...")
 
-    rc, stdout, stderr = run_shell_cmd(_gcloud_start_cmd(instance, zone), dry_run=dry_run)
+    cmd = _gcloud_create_cmd(
+        instance, zone, machine_type,
+        max_run_duration=max_run_duration,
+        request_valid_for_duration=request_valid_for_duration,
+        termination_action=termination_action,
+        image_family=image_family,
+        image_project=image_project,
+        extra_gcloud_args=extra_gcloud_args,
+    )
+    rc, stdout, stderr = run_shell_cmd(cmd, dry_run=dry_run)
     if rc != 0:
-        print(f"Failed to start instance: {stderr.strip()}", file=sys.stderr)
+        print(f"Failed to create instance: {stderr.strip()}", file=sys.stderr)
         return False
 
     print(f"Waiting for instance to reach RUNNING status (timeout: {timeout}s)...")
@@ -134,36 +184,37 @@ def start_instance(instance, zone, timeout=14400, wait_ssh=False, wait_ssh_timeo
     return True
 
 
-def stop_instance(instance, zone, timeout=300, dry_run=False):
-    """Stop a GCP instance and wait for TERMINATED status.
+def delete_instance(instance, zone, dry_run=False):
+    """Delete a GCP instance.
 
-    Steps:
-        1. Issue gcloud compute instances stop
-        2. Wait for TERMINATED status (up to timeout)
+    Uses gcloud compute instances delete --quiet (blocks until complete).
     """
-    print(f"Stopping instance '{instance}' in zone '{zone}'...")
+    print(f"Deleting instance '{instance}' in zone '{zone}'...")
 
-    rc, stdout, stderr = run_shell_cmd(_gcloud_stop_cmd(instance, zone), dry_run=dry_run)
+    rc, stdout, stderr = run_shell_cmd(_gcloud_delete_cmd(instance, zone), dry_run=dry_run)
     if rc != 0:
-        print(f"Failed to stop instance: {stderr.strip()}", file=sys.stderr)
+        print(f"Failed to delete instance: {stderr.strip()}", file=sys.stderr)
         return False
 
-    print(f"Waiting for instance to reach TERMINATED status (timeout: {timeout}s)...")
-    if not wait_for_status(instance, zone, "TERMINATED", timeout, dry_run=dry_run):
-        return False
-    print("Instance is TERMINATED.")
-
+    print("Instance deleted.")
     return True
 
 
 # ── CLI handlers ───────────────────────────────────────────────────
 
 
-def handle_start(args):
-    """CLI handler for 'vm start gcp-flex-start'."""
-    success = start_instance(
+def handle_create(args):
+    """CLI handler for 'vm create gcp-flex-start'."""
+    success = create_instance(
         instance=args.instance,
         zone=args.zone,
+        machine_type=args.machine_type,
+        max_run_duration=args.max_run_duration,
+        request_valid_for_duration=args.request_valid_for_duration,
+        termination_action=args.termination_action,
+        image_family=args.image_family,
+        image_project=args.image_project,
+        extra_gcloud_args=args.gcloud_args,
         timeout=args.timeout,
         wait_ssh=args.wait_ssh,
         wait_ssh_timeout=args.wait_ssh_timeout,
@@ -173,12 +224,11 @@ def handle_start(args):
         sys.exit(1)
 
 
-def handle_stop(args):
-    """CLI handler for 'vm stop gcp-flex-start'."""
-    success = stop_instance(
+def handle_delete(args):
+    """CLI handler for 'vm delete gcp-flex-start'."""
+    success = delete_instance(
         instance=args.instance,
         zone=args.zone,
-        timeout=args.timeout,
         dry_run=args.dry_run,
     )
     if not success:
@@ -188,27 +238,29 @@ def handle_stop(args):
 # ── Registration ───────────────────────────────────────────────────
 
 
-def _add_common_args(parser):
-    """Add arguments shared by start and stop."""
+def register_create_target(subparsers):
+    """Register the gcp-flex-start provider under 'vm create'."""
+    parser = subparsers.add_parser("gcp-flex-start", help="Create a GCP flex-start GPU VM")
+    parser.add_argument("--instance", required=True, help="GCP instance name")
+    parser.add_argument("--zone", required=True, help="GCP zone (e.g. us-central1-a)")
+    parser.add_argument("--machine-type", required=True, help="Machine type (e.g. a2-highgpu-1g)")
+    parser.add_argument("--max-run-duration", default="7d", help="Max VM run time (default: 7d)")
+    parser.add_argument("--request-valid-for-duration", default="2h", help="How long to wait for capacity (default: 2h)")
+    parser.add_argument("--termination-action", default="DELETE", choices=["STOP", "DELETE"], help="Action when max-run-duration expires (default: DELETE)")
+    parser.add_argument("--image-family", default="debian-12", help="Boot disk image family (default: debian-12)")
+    parser.add_argument("--image-project", default="debian-cloud", help="Boot disk image project (default: debian-cloud)")
+    parser.add_argument("--gcloud-args", default=None, help="Extra args passed to gcloud compute instances create")
+    parser.add_argument("--timeout", type=int, default=14400, help="How long to poll for RUNNING status in seconds (default: 14400)")
+    parser.add_argument("--wait-ssh", action="store_true", help="Wait for SSH connectivity after VM is RUNNING")
+    parser.add_argument("--wait-ssh-timeout", type=int, default=300, help="SSH wait timeout in seconds (default: 300)")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    parser.set_defaults(func=handle_create)
+
+
+def register_delete_target(subparsers):
+    """Register the gcp-flex-start provider under 'vm delete'."""
+    parser = subparsers.add_parser("gcp-flex-start", help="Delete a GCP flex-start GPU VM")
     parser.add_argument("--instance", required=True, help="GCP instance name")
     parser.add_argument("--zone", required=True, help="GCP zone (e.g. us-central1-a)")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
-    parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-
-
-def register_start_target(subparsers):
-    """Register the gcp-flex-start provider under 'vm start'."""
-    parser = subparsers.add_parser("gcp-flex-start", help="Start a GCP flex-start GPU VM")
-    _add_common_args(parser)
-    parser.set_defaults(timeout=14400)
-    parser.add_argument("--wait-ssh", action="store_true", help="Wait for SSH connectivity after start")
-    parser.add_argument("--wait-ssh-timeout", type=int, default=300, help="SSH wait timeout in seconds (default: 300)")
-    parser.set_defaults(func=handle_start)
-
-
-def register_stop_target(subparsers):
-    """Register the gcp-flex-start provider under 'vm stop'."""
-    parser = subparsers.add_parser("gcp-flex-start", help="Stop a GCP flex-start GPU VM")
-    _add_common_args(parser)
-    parser.set_defaults(timeout=300)
-    parser.set_defaults(func=handle_stop)
+    parser.set_defaults(func=handle_delete)

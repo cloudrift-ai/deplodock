@@ -1,4 +1,4 @@
-"""VM lifecycle management: start/stop cloud GPU instances."""
+"""VM lifecycle management: create/delete cloud GPU instances."""
 
 import subprocess
 import sys
@@ -27,19 +27,19 @@ def run_shell_cmd(command, dry_run=False):
 
 
 def register_vm_command(subparsers):
-    """Register the 'vm' command with start/stop action subparsers."""
-    from deplodock.commands.vm.gcp_flex_start import register_start_target, register_stop_target
+    """Register the 'vm' command with create/delete action subparsers."""
+    from deplodock.commands.vm.gcp_flex_start import register_create_target, register_delete_target
 
     vm_parser = subparsers.add_parser("vm", help="Manage cloud VM instances")
 
     action_subparsers = vm_parser.add_subparsers(dest="action", required=True)
 
-    # start action
-    start_parser = action_subparsers.add_parser("start", help="Start a VM instance")
-    start_subparsers = start_parser.add_subparsers(dest="provider", required=True)
-    register_start_target(start_subparsers)
+    # create action
+    create_parser = action_subparsers.add_parser("create", help="Create a VM instance")
+    create_subparsers = create_parser.add_subparsers(dest="provider", required=True)
+    register_create_target(create_subparsers)
 
-    # stop action
-    stop_parser = action_subparsers.add_parser("stop", help="Stop a VM instance")
-    stop_subparsers = stop_parser.add_subparsers(dest="provider", required=True)
-    register_stop_target(stop_subparsers)
+    # delete action
+    delete_parser = action_subparsers.add_parser("delete", help="Delete a VM instance")
+    delete_subparsers = delete_parser.add_subparsers(dest="provider", required=True)
+    register_delete_target(delete_subparsers)

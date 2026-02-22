@@ -135,33 +135,48 @@ python main.py deploy ssh --recipe <path> --server user@host [--variant <name>] 
 
 ## VM Management
 
-The `vm` command manages cloud GPU VM lifecycles. Currently supports GCP flex-start (which can take hours to provision capacity).
+The `vm` command manages cloud GPU VM lifecycles. Currently supports GCP flex-start, which provisions new GPU capacity using `--provisioning-model=FLEX_START` (can take hours). Instances are ephemeral — `delete` removes them entirely.
 
-### Start a VM
-
-```bash
-deplodock vm start gcp-flex-start --instance my-gpu-vm --zone us-central1-a
-deplodock vm start gcp-flex-start --instance my-gpu-vm --zone us-central1-a --wait-ssh
-deplodock vm start gcp-flex-start --instance my-gpu-vm --zone us-central1-a --timeout 7200 --dry-run
-```
-
-### Stop a VM
+### Create a VM
 
 ```bash
-deplodock vm stop gcp-flex-start --instance my-gpu-vm --zone us-central1-a
-deplodock vm stop gcp-flex-start --instance my-gpu-vm --zone us-central1-a --dry-run
+deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type a2-highgpu-1g
+deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --wait-ssh
+deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --gcloud-args "--no-service-account --no-scopes" --dry-run
 ```
 
-### VM Flags
+### Delete a VM
+
+```bash
+deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a
+deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a --dry-run
+```
+
+### Create Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--instance` | (required) | GCP instance name |
 | `--zone` | (required) | GCP zone (e.g. us-central1-a) |
-| `--timeout` | 14400 (start) / 300 (stop) | Timeout in seconds |
+| `--machine-type` | (required) | Machine type (e.g. a2-highgpu-1g) |
+| `--max-run-duration` | `7d` | Max VM run time (10m–7d) |
+| `--request-valid-for-duration` | `2h` | How long to wait for capacity |
+| `--termination-action` | `DELETE` | Action when max-run-duration expires (`STOP` or `DELETE`) |
+| `--image-family` | `debian-12` | Boot disk image family |
+| `--image-project` | `debian-cloud` | Boot disk image project |
+| `--gcloud-args` | - | Extra args passed to `gcloud compute instances create` |
+| `--timeout` | `14400` | How long to poll for RUNNING status (seconds) |
+| `--wait-ssh` | false | Wait for SSH after VM is RUNNING |
+| `--wait-ssh-timeout` | `300` | SSH wait timeout in seconds |
 | `--dry-run` | false | Print commands without executing |
-| `--wait-ssh` | false | Wait for SSH connectivity after start |
-| `--wait-ssh-timeout` | 300 | SSH wait timeout in seconds |
+
+### Delete Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--instance` | (required) | GCP instance name |
+| `--zone` | (required) | GCP zone (e.g. us-central1-a) |
+| `--dry-run` | false | Print commands without executing |
 
 GCP project is inferred from `gcloud` config (no `--project` flag needed).
 

@@ -25,8 +25,8 @@ Test the full CLI pipeline end-to-end by invoking `deplodock` as a subprocess wi
 |------|--------|
 | `test_deploy_dryrun.py` | `deploy ssh`, `deploy local` — dry-run output, command sequence, variant resolution, teardown, CLI help |
 | `test_bench_dryrun.py` | `bench` — dry-run output, deploy→benchmark→teardown sequence, server/recipe filtering, CLI help |
-| `test_vm_gcp_flex_start.py` | `_gcloud_*_cmd()` — GCP flex-start command builder functions |
-| `test_vm_dryrun.py` | `vm start/stop gcp-flex-start` — dry-run output, argparse validation, CLI help |
+| `test_vm_gcp_flex_start.py` | `_gcloud_*_cmd()` — GCP flex-start command builder functions (create, delete, status, IP, SSH) |
+| `test_vm_dryrun.py` | `vm create/delete gcp-flex-start` — dry-run output, argparse validation, CLI help |
 
 CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench_config`** (a factory for temporary `config.yaml` files). Both are defined in `conftest.py`.
 
