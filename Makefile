@@ -22,7 +22,7 @@ setup:
 		echo "Creating virtual environment..."; \
 		python3 -m venv venv; \
 		echo "Installing Python dependencies..."; \
-		./venv/bin/pip install -r requirements.txt; \
+		./venv/bin/pip install -e .; \
 		echo "✅ Setup complete!"; \
 	fi
 

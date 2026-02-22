@@ -3,7 +3,7 @@
 import yaml
 import pytest
 
-from commands.deploy import generate_compose, generate_nginx_conf
+from deplodock.commands.deploy import generate_compose, generate_nginx_conf
 
 
 class TestGenerateCompose:

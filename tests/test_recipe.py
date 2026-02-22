@@ -4,7 +4,7 @@ import os
 import pytest
 import yaml
 
-from commands.deploy import load_recipe, deep_merge
+from deplodock.commands.deploy import load_recipe, deep_merge
 
 
 class TestDeepMerge:
