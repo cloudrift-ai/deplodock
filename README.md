@@ -141,26 +141,52 @@ pytest tests/ -v
 
 ## Benchmarking
 
-For automated benchmarking across multiple servers:
+### Run Benchmarks
 
 ```bash
-make bench        # Run benchmarks
-make report       # Generate Excel report
-make bench-force  # Force re-run
+deplodock bench --parallel            # Run benchmarks in parallel
+deplodock bench --server my_server    # Run for specific server
+deplodock bench --model org/model     # Run for specific model
+deplodock bench --parallel --force    # Force re-run, skip cached results
 ```
 
-See `config.yaml` for server and model configuration. Benchmark scripts in `benchmarks/` are auto-discovered by naming convention (`<step>_<name>.sh`).
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | `config.yaml` | Path to configuration file |
+| `--force` | false | Force re-run even if results exist |
+| `--server` | - | Run only for a specific server |
+| `--model` | - | Run only for a specific model |
+| `--parallel` | false | Run servers in parallel |
+| `--max-workers` | num servers | Max parallel server benchmarks |
+
+### Generate Reports
+
+```bash
+deplodock report                                      # Default: results/ -> results/benchmark_report.xlsx
+deplodock report --results-dir results/custom --output results/custom/report.xlsx
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | `config.yaml` | Path to configuration file |
+| `--results-dir` | `results` | Directory containing benchmark results |
+| `--output` | `results/benchmark_report.xlsx` | Output Excel file path |
 
 ## Project Structure
 
 ```
-server-benchmark/
-├── main.py                          # CLI entrypoint
-├── commands/
-│   └── deploy/
-│       ├── __init__.py              # Shared: recipe, compose, orchestration
-│       ├── local.py                 # Local target
-│       └── ssh.py                   # SSH target
+deplodock/
+├── deplodock/
+│   ├── deplodock.py                 # CLI entrypoint
+│   └── commands/
+│       ├── deploy/
+│       │   ├── __init__.py          # Shared: recipe, compose, orchestration
+│       │   ├── local.py             # Local target
+│       │   └── ssh.py               # SSH target
+│       ├── bench/
+│       │   └── __init__.py          # Benchmark runner
+│       └── report/
+│           └── __init__.py          # Report generator
 ├── recipes/                         # Model deploy recipes
 │   ├── GLM-4.6-FP8/
 │   ├── GLM-4.6/
@@ -172,6 +198,5 @@ server-benchmark/
 ├── benchmarks/                      # Benchmark scripts
 ├── utils/                           # Utilities
 ├── config.yaml                      # Benchmark configuration
-├── Makefile                         # Build automation
-└── run_remote_benchmark.py          # Benchmark orchestration
+└── Makefile                         # Build automation
 ```

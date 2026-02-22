@@ -27,16 +27,25 @@ Or for a specific test file:
 pytest tests/test_recipe.py -v
 ```
 
+## CLI Commands
+
+- `deplodock deploy local ...` — deploy locally via docker compose
+- `deplodock deploy ssh ...` — deploy to remote server via SSH
+- `deplodock bench ...` — run benchmarks on remote servers
+- `deplodock report ...` — generate Excel reports from benchmark results
+
 ## Key Make Targets
 
 - `make setup` — create venv and install dependencies
-- `make bench` — run benchmarks in parallel across configured servers
-- `make report` — generate Excel report from benchmark results
+- `make bench` — run benchmarks in parallel (`deplodock bench --parallel`)
+- `make report` — generate Excel report (`deplodock report`)
 - `make clean` — remove venv and generated files
 
-## PR Procedure
+## Contribution Instructions
 
-1. Write code following `STYLE.md`
-2. Add tests if reasonable (in `tests/`)
-3. Run tests: `pytest tests/ -v`
-4. Push and open a PR
+1. Create a feature branch from `main` (e.g. `feature/my-new-feature`)
+2. Write code following guidelines here, in `STYLE.md` and in `README.md`
+3. Add tests if reasonable (in `tests/`)
+4. Update `STYLE.md`, `README.md` and `CLAUDE.md` if necessary
+5. Run tests: `pytest tests/ -v`
+6. Push and open a PR
