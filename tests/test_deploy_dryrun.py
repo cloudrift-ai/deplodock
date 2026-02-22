@@ -184,3 +184,27 @@ class TestCLIHelp:
         assert "--server" in stdout
         assert "--ssh-key" in stdout
         assert "--ssh-port" in stdout
+
+    def test_bench_help(self):
+        rc, stdout, _ = run_cli("bench", "--help")
+        assert rc == 0
+        assert "--config" in stdout
+        assert "--force" in stdout
+        assert "--server" in stdout
+        assert "--model" in stdout
+        assert "--parallel" in stdout
+        assert "--max-workers" in stdout
+
+    def test_report_help(self):
+        rc, stdout, _ = run_cli("report", "--help")
+        assert rc == 0
+        assert "--config" in stdout
+        assert "--results-dir" in stdout
+        assert "--output" in stdout
+
+    def test_top_level_help(self):
+        rc, stdout, _ = run_cli("--help")
+        assert rc == 0
+        assert "deploy" in stdout
+        assert "bench" in stdout
+        assert "report" in stdout

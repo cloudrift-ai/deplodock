@@ -9,6 +9,8 @@ description = "Deploy and benchmark LLM inference on GPU servers using vLLM"
 requires-python = ">=3.13"
 dependencies = [
     "huggingface_hub[cli,hf_transfer]",
+    "openpyxl",
+    "pandas",
     "pyyaml",
 ]
 
