@@ -1,8 +1,91 @@
-"""Shared fixtures for deploy tests."""
+"""Shared pytest fixtures for all test modules."""
 
 import os
+import subprocess
+import sys
+
 import pytest
 import yaml
+
+
+PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
+
+
+@pytest.fixture(scope="session")
+def project_root():
+    """Absolute path to the project root directory."""
+    return PROJECT_ROOT
+
+
+@pytest.fixture(scope="session")
+def recipes_dir():
+    """Absolute path to the recipes/ directory."""
+    return RECIPES_DIR
+
+
+@pytest.fixture(scope="session")
+def run_cli(project_root):
+    """Return a callable that invokes the deplodock CLI as a subprocess."""
+
+    def _run(*args):
+        result = subprocess.run(
+            [sys.executable, "-m", "deplodock.deplodock", *args],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    return _run
+
+
+@pytest.fixture
+def make_bench_config(recipes_dir):
+    """Return a factory that writes a temporary bench config.yaml."""
+
+    def _make(tmp_dir, servers=None):
+        if servers is None:
+            servers = [
+                {
+                    "name": "test_server",
+                    "address": "user@1.2.3.4",
+                    "ssh_key": "~/.ssh/id_ed25519",
+                    "port": 22,
+                    "recipes": [
+                        {
+                            "recipe": os.path.join(
+                                recipes_dir,
+                                "Qwen3-Coder-30B-A3B-Instruct-AWQ",
+                            ),
+                            "variant": "RTX4090",
+                        }
+                    ],
+                }
+            ]
+
+        config = {
+            "benchmark": {
+                "local_results_dir": os.path.join(str(tmp_dir), "results"),
+                "model_dir": "/hf_models",
+            },
+            "benchmark_params": {
+                "max_concurrency": 128,
+                "num_prompts": 256,
+                "random_input_len": 8000,
+                "random_output_len": 8000,
+            },
+            "servers": servers,
+        }
+        config_path = os.path.join(str(tmp_dir), "config.yaml")
+        with open(config_path, "w") as f:
+            yaml.dump(config, f)
+        return config_path
+
+    return _make
+
+
+# ── Unit-test fixtures ──────────────────────────────────────────────
 
 
 @pytest.fixture

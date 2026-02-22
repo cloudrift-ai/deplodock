@@ -223,7 +223,7 @@ deplodock/
 │   ├── Qwen3-Coder-480B-A35B-Instruct-AWQ/
 │   ├── Qwen3-Coder-30B-A3B-Instruct-AWQ/
 │   └── Meta-Llama-3.3-70B-Instruct-AWQ-INT4/
-├── tests/                           # pytest tests
+├── tests/                           # pytest tests (see [tests/ARCHITECTURE.md](tests/ARCHITECTURE.md))
 ├── config.yaml                      # Benchmark configuration
 └── Makefile                         # Build automation
 ```
