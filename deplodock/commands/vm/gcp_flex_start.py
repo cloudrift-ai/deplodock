@@ -5,6 +5,7 @@ import sys
 import time
 
 from deplodock.commands.vm import run_shell_cmd
+from deplodock.commands.vm.types import VMConnectionInfo
 
 
 # ── Command builders ───────────────────────────────────────────────
@@ -14,6 +15,7 @@ def _gcloud_create_cmd(
     instance,
     zone,
     machine_type,
+    provisioning_model="FLEX_START",
     max_run_duration="7d",
     request_valid_for_duration="2h",
     termination_action="DELETE",
@@ -21,21 +23,27 @@ def _gcloud_create_cmd(
     image_project="debian-cloud",
     extra_gcloud_args=None,
 ):
-    """Build gcloud command to create a flex-start instance."""
+    """Build gcloud command to create a GPU instance.
+
+    Args:
+        provisioning_model: FLEX_START, SPOT, or STANDARD.
+    """
     cmd = [
         "gcloud", "compute", "instances", "create", instance,
         "--zone", zone,
         "--machine-type", machine_type,
-        "--provisioning-model=FLEX_START",
+        f"--provisioning-model={provisioning_model}",
         "--maintenance-policy=TERMINATE",
         "--reservation-affinity=none",
-        "--max-run-duration", max_run_duration,
-        f"--instance-termination-action={termination_action}",
         "--image-family", image_family,
         "--image-project", image_project,
     ]
-    if request_valid_for_duration:
-        cmd.extend(["--request-valid-for-duration", request_valid_for_duration])
+    # Duration and termination flags are only valid for FLEX_START
+    if provisioning_model == "FLEX_START":
+        cmd.extend(["--max-run-duration", max_run_duration])
+        cmd.append(f"--instance-termination-action={termination_action}")
+        if request_valid_for_duration:
+            cmd.extend(["--request-valid-for-duration", request_valid_for_duration])
     if extra_gcloud_args:
         cmd.extend(shlex.split(extra_gcloud_args))
     return cmd
@@ -129,6 +137,7 @@ def create_instance(
     instance,
     zone,
     machine_type,
+    provisioning_model="FLEX_START",
     max_run_duration="7d",
     request_valid_for_duration="2h",
     termination_action="DELETE",
@@ -141,18 +150,26 @@ def create_instance(
     ssh_gateway=None,
     dry_run=False,
 ):
-    """Create a GCP flex-start instance and optionally wait for SSH.
+    """Create a GCP GPU instance and optionally wait for SSH.
 
     Steps:
-        1. Issue gcloud compute instances create with flex-start flags
+        1. Issue gcloud compute instances create
         2. Wait for RUNNING status (up to timeout)
-        3. Print external IP
+        3. Get external IP
         4. Optionally wait for SSH connectivity
+
+    Args:
+        provisioning_model: FLEX_START, SPOT, or STANDARD.
+
+    Returns:
+        VMConnectionInfo on success, None on failure.
+        In dry-run mode, returns a VMConnectionInfo with placeholder values.
     """
-    print(f"Creating flex-start instance '{instance}' in zone '{zone}'...")
+    print(f"Creating instance '{instance}' in zone '{zone}' (provisioning: {provisioning_model})...")
 
     cmd = _gcloud_create_cmd(
         instance, zone, machine_type,
+        provisioning_model=provisioning_model,
         max_run_duration=max_run_duration,
         request_valid_for_duration=request_valid_for_duration,
         termination_action=termination_action,
@@ -163,29 +180,35 @@ def create_instance(
     rc, stdout, stderr = run_shell_cmd(cmd, dry_run=dry_run)
     if rc != 0:
         print(f"Failed to create instance: {stderr.strip()}", file=sys.stderr)
-        return False
+        return None
 
     print(f"Waiting for instance to reach RUNNING status (timeout: {timeout}s)...")
     if not wait_for_status(instance, zone, "RUNNING", timeout, dry_run=dry_run):
-        return False
+        return None
     print("Instance is RUNNING.")
 
-    # Get and print external IP
+    # Get external IP
     rc, stdout, _ = run_shell_cmd(_gcloud_external_ip_cmd(instance, zone), dry_run=dry_run)
-    if rc == 0:
-        ip = stdout.strip()
-        if ip:
-            print(f"External IP: {ip}")
-        elif not dry_run:
+    external_ip = stdout.strip() if rc == 0 else ""
+
+    if not dry_run:
+        if not external_ip:
             print("Warning: No external IP found.")
+        else:
+            print(f"External IP: {external_ip}")
 
     if wait_ssh:
         print(f"Waiting for SSH connectivity (timeout: {wait_ssh_timeout}s)...")
         if not wait_for_ssh(instance, zone, timeout=wait_ssh_timeout, ssh_gateway=ssh_gateway, dry_run=dry_run):
-            return False
+            return None
         print("SSH is ready.")
 
-    return True
+    return VMConnectionInfo(
+        host=external_ip or "dry-run-gcp-host",
+        username="",
+        ssh_port=22,
+        delete_info=("gcp", instance, zone),
+    )
 
 
 def delete_instance(instance, zone, dry_run=False):
@@ -209,10 +232,11 @@ def delete_instance(instance, zone, dry_run=False):
 
 def handle_create(args):
     """CLI handler for 'vm create gcp-flex-start'."""
-    success = create_instance(
+    conn = create_instance(
         instance=args.instance,
         zone=args.zone,
         machine_type=args.machine_type,
+        provisioning_model=args.provisioning_model,
         max_run_duration=args.max_run_duration,
         request_valid_for_duration=args.request_valid_for_duration,
         termination_action=args.termination_action,
@@ -225,7 +249,7 @@ def handle_create(args):
         ssh_gateway=args.ssh_gateway,
         dry_run=args.dry_run,
     )
-    if not success:
+    if conn is None:
         sys.exit(1)
 
 
@@ -245,10 +269,11 @@ def handle_delete(args):
 
 def register_create_target(subparsers):
     """Register the gcp-flex-start provider under 'vm create'."""
-    parser = subparsers.add_parser("gcp-flex-start", help="Create a GCP flex-start GPU VM")
+    parser = subparsers.add_parser("gcp-flex-start", help="Create a GCP GPU VM")
     parser.add_argument("--instance", required=True, help="GCP instance name")
     parser.add_argument("--zone", required=True, help="GCP zone (e.g. us-central1-a)")
     parser.add_argument("--machine-type", required=True, help="Machine type (e.g. a2-highgpu-1g)")
+    parser.add_argument("--provisioning-model", default="FLEX_START", choices=["FLEX_START", "SPOT", "STANDARD"], help="Provisioning model (default: FLEX_START)")
     parser.add_argument("--max-run-duration", default="7d", help="Max VM run time (default: 7d)")
     parser.add_argument("--request-valid-for-duration", default="2h", help="How long to wait for capacity (default: 2h)")
     parser.add_argument("--termination-action", default="DELETE", choices=["STOP", "DELETE"], help="Action when max-run-duration expires (default: DELETE)")

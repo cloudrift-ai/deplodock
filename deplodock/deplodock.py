@@ -5,6 +5,7 @@ import argparse
 import sys
 
 from deplodock.commands.bench import register_bench_command
+from deplodock.commands.deploy.cloud import register_cloud_target
 from deplodock.commands.deploy.local import register_local_target
 from deplodock.commands.deploy.ssh import register_ssh_target
 from deplodock.commands.report import register_report_command
@@ -21,6 +22,7 @@ def main():
 
     register_local_target(deploy_subparsers)
     register_ssh_target(deploy_subparsers)
+    register_cloud_target(deploy_subparsers)
 
     # bench and report subcommands
     register_bench_command(subparsers)

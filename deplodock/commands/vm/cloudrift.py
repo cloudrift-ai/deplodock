@@ -7,6 +7,8 @@ import time
 
 import requests
 
+from deplodock.commands.vm.types import VMConnectionInfo
+
 
 DEFAULT_API_URL = "https://api.cloudrift.ai"
 DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
@@ -134,6 +136,8 @@ def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=Fals
         The SSH key ID (str), or "dry-run-key-id" in dry-run mode.
     """
     ssh_key_path = os.path.expanduser(ssh_key_path)
+    if dry_run and not os.path.exists(ssh_key_path):
+        return "dry-run-key-id"
     with open(ssh_key_path) as f:
         public_key = f.read().strip()
 
@@ -156,16 +160,21 @@ def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=Fals
 
 
 def wait_for_status(api_key, instance_id, target_status, timeout,
-                    api_url=DEFAULT_API_URL, interval=10, dry_run=False):
+                    api_url=DEFAULT_API_URL, interval=10, dry_run=False,
+                    fail_statuses=None):
     """Poll instance status until it matches *target_status* or timeout.
 
+    Args:
+        fail_statuses: optional set of status strings that trigger immediate failure.
+
     Returns:
-        The instance dict if target status reached, None on timeout.
+        The instance dict if target status reached, None on timeout or fail status.
     """
     if dry_run:
         print(f"[dry-run] Poll every {interval}s (up to {timeout}s) for status '{target_status}'")
         return {"status": target_status}
 
+    fail_statuses = fail_statuses or set()
     elapsed = 0
     status = None
     while elapsed < timeout:
@@ -178,11 +187,47 @@ def wait_for_status(api_key, instance_id, target_status, timeout,
         status = info.get("status")
         if status == target_status:
             return info
+        if status in fail_statuses:
+            print(f"Instance {instance_id} reached fail status '{status}'", file=sys.stderr)
+            return None
         time.sleep(interval)
         elapsed += interval
 
     print(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')", file=sys.stderr)
     return None
+
+
+def _extract_connection_info(instance, delete_info=()):
+    """Extract connection info from an instance dict into a VMConnectionInfo.
+
+    VMs provide login credentials in virtual_machines[].login_info.
+    Port mappings are [internal_port, external_port] tuples.
+    """
+    host = instance.get("host_address", "")
+    port_mappings = instance.get("port_mappings", [])
+
+    # Extract login credentials from VM info
+    username = "user"
+    vms = instance.get("virtual_machines", [])
+    if vms:
+        login_info = vms[0].get("login_info", {})
+        creds = login_info.get("UsernameAndPassword", {})
+        username = creds.get("username", username)
+
+    # Find SSH port mapping: each mapping is [internal_port, external_port]
+    ssh_port = 22
+    for mapping in port_mappings:
+        if mapping[0] == 22:
+            ssh_port = mapping[1]
+            break
+
+    return VMConnectionInfo(
+        host=host,
+        username=username,
+        ssh_port=ssh_port,
+        port_mappings=[(m[0], m[1]) for m in port_mappings],
+        delete_info=delete_info,
+    )
 
 
 def _print_connection_info(instance):
@@ -230,44 +275,62 @@ def _print_connection_info(instance):
 
 
 def create_instance(api_key, instance_type, ssh_key_path, image_url=DEFAULT_IMAGE_URL,
-                    ports=None, timeout=600, api_url=DEFAULT_API_URL, dry_run=False):
+                    ports=None, timeout=600, api_url=DEFAULT_API_URL, dry_run=False,
+                    fail_statuses=None, wait_ssh=False, ssh_private_key_path=None):
     """Create a CloudRift VM instance.
 
     Args:
         ssh_key_path: path to the SSH **public** key file.
+        fail_statuses: optional set of statuses that trigger immediate failure
+            (e.g. {"Inactive"}).
+        wait_ssh: if True, wait for SSH connectivity after Active status.
+        ssh_private_key_path: path to the SSH private key (needed for wait_ssh).
 
-    Steps:
-        1. Read SSH public key
-        2. Rent instance
-        3. Wait for Active status
-        4. Print connection info
+    Returns:
+        VMConnectionInfo on success, None on failure.
+        In dry-run mode, returns a VMConnectionInfo with placeholder values.
     """
+    from deplodock.commands.vm import wait_for_ssh as _wait_for_ssh
+
     print(f"Creating CloudRift instance (type={instance_type})...")
 
     ssh_key_path = os.path.expanduser(ssh_key_path)
-    with open(ssh_key_path) as f:
-        public_key = f.read().strip()
+    if dry_run and not os.path.exists(ssh_key_path):
+        public_key = "dry-run-placeholder"
+    else:
+        with open(ssh_key_path) as f:
+            public_key = f.read().strip()
 
     result = _rent_instance(api_key, instance_type, [public_key], image_url=image_url,
                             ports=ports, api_url=api_url, dry_run=dry_run)
     if dry_run:
         print("[dry-run] Would wait for Active status, then print connection info.")
-        return True
+        return VMConnectionInfo(
+            host="dry-run-host", username="riftuser", ssh_port=22222,
+            delete_info=("cloudrift", "dry-run-id"),
+        )
 
     instance_ids = result.get("instance_ids", [])
     if not instance_ids:
         print("Error: no instance ID returned from rent API.", file=sys.stderr)
-        return False
+        return None
     instance_id = instance_ids[0]
     print(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
 
-    info = wait_for_status(api_key, instance_id, "Active", timeout, api_url)
+    info = wait_for_status(api_key, instance_id, "Active", timeout, api_url,
+                           fail_statuses=fail_statuses)
     if info is None:
-        return False
+        return None
 
     print("Instance is Active.")
+    conn = _extract_connection_info(info, delete_info=("cloudrift", instance_id))
     _print_connection_info(info)
-    return True
+
+    if wait_ssh and ssh_private_key_path:
+        print(f"Waiting for SSH connectivity...")
+        _wait_for_ssh(conn.host, conn.username, conn.ssh_port, ssh_private_key_path)
+
+    return conn
 
 
 def delete_instance(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
@@ -288,7 +351,7 @@ def handle_create(args):
     """CLI handler for 'vm create cloudrift'."""
     api_key = _resolve_api_key(args.api_key)
     ports = [int(p) for p in args.ports.split(",")] if args.ports else None
-    success = create_instance(
+    conn = create_instance(
         api_key=api_key,
         instance_type=args.instance_type,
         ssh_key_path=args.ssh_key,
@@ -298,7 +361,7 @@ def handle_create(args):
         api_url=args.api_url,
         dry_run=args.dry_run,
     )
-    if not success:
+    if conn is None:
         sys.exit(1)
 
 

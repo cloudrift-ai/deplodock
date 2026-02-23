@@ -4,12 +4,9 @@ Uses the deploy infrastructure (recipe loading, SSH deploy/teardown) instead of
 cloning a repo on the remote server.
 """
 
-import json
 import logging
 import os
-import subprocess
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -18,18 +15,17 @@ from typing import List, Optional
 import yaml
 
 from deplodock.commands.deploy import (
+    DeployParams,
     calculate_num_instances,
-    load_recipe,
-    run_deploy,
-    run_teardown,
+    deploy as deploy_entry,
+    teardown as teardown_entry,
 )
-from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
-from deplodock.commands.deploy.ssh import (
-    REMOTE_DEPLOY_DIR,
-    make_run_cmd,
-    make_write_file,
-    provision_remote,
+from deplodock.commands.deploy.cloud import (
+    delete_cloud_vm,
+    provision_cloud_vm,
+    resolve_vm_spec,
 )
+from deplodock.commands.deploy.ssh import make_run_cmd, provision_remote
 
 
 # Global log file path
@@ -178,225 +174,6 @@ def run_benchmark_workload(run_cmd, config, recipe_config, dry_run=False):
     return rc == 0, output
 
 
-def _resolve_vm_spec(recipe_entries, server_name):
-    """Resolve GPU type and count from recipe entries for VM provisioning.
-
-    All recipes in a server entry must target the same GPU. Uses the max
-    gpu_count across all entries.
-
-    Returns:
-        (gpu_name, gpu_count, loaded_configs) where loaded_configs is a list
-        of (entry, recipe_config) tuples.
-    """
-    gpu_name = None
-    max_gpu_count = 0
-    loaded = []
-
-    for entry in recipe_entries:
-        recipe_path = entry['recipe']
-        variant = entry.get('variant')
-        recipe_config = load_recipe(recipe_path, variant=variant)
-
-        entry_gpu = recipe_config.get('gpu')
-        entry_gpu_count = recipe_config.get('gpu_count', 1)
-
-        if entry_gpu is None:
-            raise ValueError(
-                f"Recipe '{recipe_path}' variant '{variant}' is missing 'gpu' field"
-            )
-
-        if gpu_name is None:
-            gpu_name = entry_gpu
-        elif entry_gpu != gpu_name:
-            raise ValueError(
-                f"Server '{server_name}': mixed GPUs ({gpu_name} vs {entry_gpu}). "
-                "All recipes in a server entry must target the same GPU."
-            )
-
-        max_gpu_count = max(max_gpu_count, entry_gpu_count)
-        loaded.append((entry, recipe_config))
-
-    return gpu_name, max_gpu_count, loaded
-
-
-def _provision_vm(provider, instance_type, ssh_key, server_name, providers_config, dry_run):
-    """Create a VM and return (address, ssh_port, vm_delete_info).
-
-    vm_delete_info is whatever is needed to delete the VM later.
-    """
-    from deplodock.commands.vm import cloudrift as cr_provider
-    from deplodock.commands.vm import gcp_flex_start as gcp_provider
-
-    if provider == "cloudrift":
-        api_key = os.environ.get("CLOUDRIFT_API_KEY")
-        if not api_key and not dry_run:
-            raise RuntimeError("CLOUDRIFT_API_KEY env var required for CloudRift provisioning")
-
-        pub_key_path = f"{ssh_key}.pub"
-        logger = logging.getLogger("cloudrift")
-
-        if dry_run:
-            logger.info(f"[dry-run] create instance type={instance_type} ssh_key={pub_key_path}")
-            return "riftuser@dry-run-host", 22222, ("cloudrift", "dry-run-id")
-
-        # Read public key
-        api_key = api_key or ""
-        with open(pub_key_path) as f:
-            public_key = f.read().strip()
-        logger.info(f"SSH public key loaded from {pub_key_path}")
-
-        # Rent instance
-        rent_payload = {
-            "selector": {"ByInstanceTypeAndLocation": {"instance_type": instance_type}},
-            "config": {"VirtualMachine": {
-                "ssh_key": {"PublicKeys": [public_key]},
-                "image_url": cr_provider.DEFAULT_IMAGE_URL,
-                "cloudinit_url": cr_provider.DEFAULT_CLOUDINIT_URL,
-            }},
-            "with_public_ip": True,
-            "ports": ["22", "8000", "8080"],
-        }
-        logger.info(f"Rent request: {json.dumps(rent_payload, indent=2)}")
-        result = cr_provider._rent_instance(
-            api_key, instance_type, [public_key], ports=[22, 8000, 8080],
-        )
-        logger.info(f"Rent response: {json.dumps(result, indent=2)}")
-
-        instance_ids = result.get("instance_ids", [])
-        if not instance_ids:
-            raise RuntimeError("CloudRift: no instance ID returned from rent API")
-        instance_id = instance_ids[0]
-        logger.info(f"Instance rented (id={instance_id}). Waiting for Active status...")
-
-        # Poll with Inactive detection and per-iteration logging
-        timeout = 600
-        interval = 10
-        elapsed = 0
-        info = None
-        while elapsed < timeout:
-            info = cr_provider._get_instance_info(api_key, instance_id)
-            if info is None:
-                logger.warning(f"Instance {instance_id} not found (elapsed={elapsed}s)")
-            else:
-                status = info.get("status")
-                node_mode = info.get("node_mode")
-                logger.info(f"Poll: status={status} node_mode={node_mode} (elapsed={elapsed}s)")
-                if status == "Active":
-                    break
-                if status == "Inactive":
-                    logger.error(f"Instance went Inactive — provisioning failed")
-                    logger.error(f"Full instance info: {json.dumps(info, indent=2)}")
-                    raise RuntimeError(
-                        f"CloudRift instance {instance_id} went Inactive (provisioning failed)"
-                    )
-            time.sleep(interval)
-            elapsed += interval
-        else:
-            raise RuntimeError(
-                f"CloudRift instance {instance_id} did not reach Active within {timeout}s"
-            )
-
-        logger.info("Instance is Active")
-
-        # Extract SSH connection info
-        host = info.get("host_address")
-        port_mappings = info.get("port_mappings", [])
-        vms = info.get("virtual_machines", [])
-        username = "user"
-        if vms:
-            login_info = vms[0].get("login_info", {})
-            creds = login_info.get("UsernameAndPassword", {})
-            username = creds.get("username", username)
-
-        ssh_ext_port = 22
-        for mapping in port_mappings:
-            if mapping[0] == 22:
-                ssh_ext_port = mapping[1]
-                break
-
-        address = f"{username}@{host}"
-        logger.info(f"VM ready: {address} port {ssh_ext_port}")
-        logger.info(f"Port mappings: {port_mappings}")
-
-        # Wait for SSH to become reachable
-        ssh_timeout = 120
-        ssh_interval = 5
-        ssh_elapsed = 0
-        logger.info(f"Waiting for SSH to become reachable (up to {ssh_timeout}s)...")
-        while ssh_elapsed < ssh_timeout:
-            rc = subprocess.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes",
-                 "-o", "ConnectTimeout=5",
-                 "-i", ssh_key, "-p", str(ssh_ext_port),
-                 address, "true"],
-                capture_output=True,
-            ).returncode
-            if rc == 0:
-                logger.info(f"SSH reachable after {ssh_elapsed}s")
-                break
-            time.sleep(ssh_interval)
-            ssh_elapsed += ssh_interval
-        else:
-            logger.warning(f"SSH not reachable after {ssh_timeout}s, proceeding anyway")
-
-        return address, ssh_ext_port, ("cloudrift", instance_id)
-
-    elif provider == "gcp":
-        gcp_config = (providers_config or {}).get("gcp", {})
-        zone = gcp_config.get("zone", "us-central1-b")
-        logger = logging.getLogger("gcp")
-
-        instance_name = f"bench-{server_name}"
-
-        if dry_run:
-            logger.info(f"[dry-run] create instance={instance_name} zone={zone} type={instance_type}")
-            return "user@dry-run-gcp-host", 22, ("gcp", instance_name, zone)
-
-        success = gcp_provider.create_instance(
-            instance=instance_name,
-            zone=zone,
-            machine_type=instance_type,
-            wait_ssh=True,
-        )
-        if not success:
-            raise RuntimeError(f"GCP: failed to create instance {instance_name}")
-
-        # Get external IP
-        from deplodock.commands.vm import run_shell_cmd
-        rc, stdout, _ = run_shell_cmd(gcp_provider._gcloud_external_ip_cmd(instance_name, zone))
-        if rc != 0 or not stdout.strip():
-            raise RuntimeError(f"GCP: failed to get external IP for {instance_name}")
-
-        external_ip = stdout.strip()
-        address = external_ip
-        logger.info(f"VM ready: {address} port 22")
-        return address, 22, ("gcp", instance_name, zone)
-
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-
-def _delete_vm(vm_delete_info, dry_run):
-    """Delete a VM using the info returned by _provision_vm."""
-    from deplodock.commands.vm import cloudrift as cr_provider
-    from deplodock.commands.vm import gcp_flex_start as gcp_provider
-
-    provider = vm_delete_info[0]
-
-    if provider == "cloudrift":
-        instance_id = vm_delete_info[1]
-        if dry_run:
-            print(f"[dry-run] cloudrift: terminate instance {instance_id}")
-            return
-        api_key = os.environ.get("CLOUDRIFT_API_KEY", "")
-        cr_provider.delete_instance(api_key, instance_id)
-
-    elif provider == "gcp":
-        instance_name = vm_delete_info[1]
-        zone = vm_delete_info[2]
-        gcp_provider.delete_instance(instance_name, zone, dry_run=dry_run)
-
-
 def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict,
                           force: bool = False, dry_run: bool = False) -> List[tuple]:
     """Run all benchmarks for a single server.
@@ -417,35 +194,30 @@ def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict
 
     # Resolve GPU requirements from recipes
     try:
-        gpu_name, gpu_count, loaded_configs = _resolve_vm_spec(recipe_entries, server_name)
+        gpu_name, gpu_count, loaded_configs = resolve_vm_spec(recipe_entries, server_name)
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"Failed to resolve VM spec: {e}")
         for entry in recipe_entries:
             results.append((server_name, entry['recipe'], False))
         return results
 
-    # Look up provider and instance type
-    gpu_entries = GPU_INSTANCE_TYPES.get(gpu_name)
-    if not gpu_entries:
-        logger.error(f"Unknown GPU '{gpu_name}' — not in hardware table")
-        for entry in recipe_entries:
-            results.append((server_name, entry['recipe'], False))
-        return results
-
-    provider, base_type = gpu_entries[0]
-    instance_type = resolve_instance_type(provider, base_type, gpu_count)
-    logger.info(f"GPU: {gpu_name} x{gpu_count} -> {provider} {instance_type}")
-
-    # Provision VM
-    vm_delete_info = None
+    # Provision VM via deploy/cloud layer
+    conn = None
     try:
-        address, ssh_port, vm_delete_info = _provision_vm(
-            provider, instance_type, ssh_key, server_name, providers_config, dry_run,
+        conn = provision_cloud_vm(
+            gpu_name, gpu_count, ssh_key, providers_config,
+            server_name=server_name, dry_run=dry_run, logger=logger,
         )
-        logger.info(f"VM provisioned: {address}:{ssh_port}")
+        if conn is None:
+            logger.error("VM provisioning failed")
+            for entry in recipe_entries:
+                results.append((server_name, entry['recipe'], False))
+            return results
+
+        logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
 
         # Provision the remote server (install Docker, NVIDIA toolkit, etc.)
-        provision_remote(address, ssh_key, ssh_port, dry_run=dry_run)
+        provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
 
         for entry, recipe_config in loaded_configs:
             recipe_path = entry['recipe']
@@ -465,32 +237,27 @@ def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict
                 results.append((server_name, model_name, True))
                 continue
 
-            # Create run_cmd / write_file for this server
-            run_cmd = make_run_cmd(address, ssh_key, ssh_port, dry_run=dry_run)
-            write_file = make_write_file(address, ssh_key, ssh_port, dry_run=dry_run)
-
-            # Extract host from server address
-            host = address.split("@")[-1] if "@" in address else address
-
-            # Deploy model
-            recipe_logger.info("Deploying model...")
-            success = run_deploy(
-                run_cmd=run_cmd,
-                write_file=write_file,
-                config=recipe_config,
+            # Deploy model via shared entry point
+            params = DeployParams(
+                server=conn.address,
+                ssh_key=ssh_key,
+                ssh_port=conn.ssh_port,
+                recipe_config=recipe_config,
                 model_dir=model_dir,
                 hf_token=hf_token,
-                host=host,
                 dry_run=dry_run,
             )
+            recipe_logger.info("Deploying model...")
+            success = deploy_entry(params)
 
             if not success:
                 recipe_logger.error("Deploy failed, skipping benchmark")
                 results.append((server_name, model_name, False))
                 continue
 
-            # Run benchmark
+            # Run benchmark (needs run_cmd for remote command execution)
             recipe_logger.info("Running benchmark...")
+            run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
             bench_success, output = run_benchmark_workload(
                 run_cmd, config, recipe_config, dry_run=dry_run,
             )
@@ -508,16 +275,16 @@ def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict
                 recipe_logger.error("Benchmark failed")
                 results.append((server_name, model_name, False))
 
-            # Teardown containers
+            # Teardown containers via shared entry point
             recipe_logger.info("Tearing down...")
-            run_teardown(run_cmd)
+            teardown_entry(params)
 
     finally:
         # Always delete the VM
-        if vm_delete_info is not None:
+        if conn is not None and conn.delete_info:
             logger.info("Deleting VM...")
             try:
-                _delete_vm(vm_delete_info, dry_run)
+                delete_cloud_vm(conn.delete_info, dry_run)
                 logger.info("VM deleted.")
             except Exception as e:
                 logger.error(f"Failed to delete VM: {e}")

@@ -23,6 +23,12 @@ pricing:
 providers:
   gcp:
     zone: "us-central1-b"
+    provisioning_model: "SPOT"
+    image_family: "common-cu128-ubuntu-2204-nvidia-570"
+    image_project: "deeplearning-platform-release"
+    boot_disk_size: "2000GB"
+    tags: "ssh"
+    # service_account: defaults to $GCP_SERVICE_ACCOUNT env var
   # cloudrift: uses CLOUDRIFT_API_KEY env var
 
 # Define servers with their recipes to benchmark
