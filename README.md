@@ -114,6 +114,14 @@ Deploys to a remote server via SSH + SCP.
 python main.py deploy ssh --recipe <path> --server user@host [--variant <name>] [--dry-run]
 ```
 
+### Cloud
+
+Provisions a cloud VM based on recipe GPU requirements, then deploys via SSH.
+
+```bash
+deplodock deploy cloud --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ --variant RTX5090 --dry-run
+```
+
 ### Common Flags
 
 | Flag | Required | Default | Description |
@@ -256,15 +264,18 @@ deplodock/
 │   ├── deplodock.py                 # CLI entrypoint
 │   └── commands/
 │       ├── deploy/
-│       │   ├── __init__.py          # Shared: recipe, compose, orchestration
+│       │   ├── __init__.py          # Shared: recipe, compose, orchestration, DeployParams
 │       │   ├── local.py             # Local target
-│       │   └── ssh.py               # SSH target
+│       │   ├── ssh.py               # SSH target
+│       │   └── cloud.py             # Cloud target (provision VM + deploy)
 │       ├── bench/
 │       │   └── __init__.py          # Benchmark runner
 │       ├── report/
 │       │   └── __init__.py          # Report generator
 │       └── vm/
-│           ├── __init__.py          # VM command registration
+│           ├── __init__.py          # VM command registration, shared helpers
+│           ├── types.py             # VMConnectionInfo dataclass
+│           ├── cloudrift.py         # CloudRift API provider
 │           └── gcp_flex_start.py    # GCP flex-start provider
 ├── recipes/                         # Model deploy recipes
 │   ├── GLM-4.6-FP8/

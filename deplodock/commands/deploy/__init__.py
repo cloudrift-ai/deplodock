@@ -3,8 +3,22 @@
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 
 import yaml
+
+
+@dataclass
+class DeployParams:
+    """All parameters needed for a single deployment. Serializable for future API use."""
+
+    server: str                             # user@host or IP
+    ssh_key: str                            # path to SSH private key
+    ssh_port: int = 22
+    recipe_config: dict = field(default_factory=dict)  # pre-loaded recipe
+    model_dir: str = "/hf_models"
+    hf_token: str = ""
+    dry_run: bool = False
 
 
 def deep_merge(base, override):
@@ -308,3 +322,22 @@ def run_teardown(run_cmd):
     else:
         print("Teardown failed.", file=sys.stderr)
     return rc == 0
+
+
+def deploy(params: DeployParams) -> bool:
+    """Deploy a recipe to a server via SSH. Single entry point."""
+    from deplodock.commands.deploy.ssh import make_run_cmd, make_write_file
+
+    run_cmd = make_run_cmd(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    write_file = make_write_file(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    host = params.server.split("@")[-1] if "@" in params.server else params.server
+    return run_deploy(run_cmd, write_file, params.recipe_config,
+                      params.model_dir, params.hf_token, host, params.dry_run)
+
+
+def teardown(params: DeployParams) -> bool:
+    """Teardown containers on a server."""
+    from deplodock.commands.deploy.ssh import make_run_cmd
+
+    run_cmd = make_run_cmd(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    return run_teardown(run_cmd)
