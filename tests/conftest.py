@@ -67,12 +67,6 @@ def make_bench_config(recipes_dir):
                 "local_results_dir": os.path.join(str(tmp_dir), "results"),
                 "model_dir": "/hf_models",
             },
-            "benchmark_params": {
-                "max_concurrency": 128,
-                "num_prompts": 256,
-                "random_input_len": 8000,
-                "random_output_len": 8000,
-            },
             "servers": servers,
         }
         config_path = os.path.join(str(tmp_dir), "config.yaml")
@@ -100,6 +94,12 @@ def tmp_recipe_dir(tmp_path):
                 "extra_args": "--max-model-len 8192",
             }
         },
+        "benchmark": {
+            "max_concurrency": 128,
+            "num_prompts": 256,
+            "random_input_len": 4000,
+            "random_output_len": 4000,
+        },
         "variants": {
             "RTX5090": {
                 "gpu": "NVIDIA GeForce RTX 5090",
@@ -113,6 +113,10 @@ def tmp_recipe_dir(tmp_path):
                         "tensor_parallel_size": 8,
                         "extra_args": "--max-model-len 16384 --kv-cache-dtype fp8",
                     }
+                },
+                "benchmark": {
+                    "random_input_len": 8000,
+                    "random_output_len": 8000,
                 },
             },
             "4xH100": {
@@ -148,6 +152,12 @@ def sample_config():
                 "gpu_memory_utilization": 0.9,
                 "extra_args": "--max-model-len 8192",
             }
+        },
+        "benchmark": {
+            "max_concurrency": 128,
+            "num_prompts": 256,
+            "random_input_len": 4000,
+            "random_output_len": 4000,
         },
     }
 

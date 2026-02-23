@@ -19,8 +19,10 @@ def test_bench_dry_run_deploy_then_benchmark(run_cli, make_bench_config, tmp_pat
     assert "docker compose pull" in stdout
     assert "docker compose up" in stdout
 
-    # Verify benchmark step appears
+    # Verify benchmark step appears with recipe params
     assert "vllm bench serve" in stdout
+    assert "--random-input-len 4000" in stdout
+    assert "--random-output-len 4000" in stdout
 
     # Verify teardown appears
     assert "docker compose down" in stdout

@@ -5,13 +5,6 @@ benchmark:
   local_results_dir: "results"
   model_dir: "/hf_models"
 
-# Benchmark parameters (required)
-benchmark_params:
-  max_concurrency: 128
-  num_prompts: 256
-  random_input_len: 8000
-  random_output_len: 8000
-
 # GPU Pricing ($ per hour per GPU)
 pricing:
   pro6000: 0.93
@@ -39,3 +32,8 @@ servers:
     recipes:
       - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
         variant: "RTX5090"
+  - name: "pro6000_x_1"
+    ssh_key: "~/.ssh/id_ed25519"
+    recipes:
+      - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+        variant: "Pro6000"

@@ -140,17 +140,40 @@ def extract_benchmark_results(output: str) -> str:
     return output[idx:]
 
 
-def run_benchmark_workload(run_cmd, config, recipe_config, dry_run=False):
+def _parse_max_model_len(extra_args: str) -> Optional[int]:
+    """Extract --max-model-len value from extra_args string."""
+    parts = extra_args.split()
+    for i, part in enumerate(parts):
+        if part == "--max-model-len" and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def run_benchmark_workload(run_cmd, recipe_config, dry_run=False):
     """Run vllm bench serve on the remote server and return output.
 
     Returns:
         (success: bool, output: str)
     """
-    benchmark_params = config.get('benchmark_params', {})
+    benchmark_params = recipe_config.get('benchmark', {})
     max_concurrency = benchmark_params.get('max_concurrency', 128)
     num_prompts = benchmark_params.get('num_prompts', 256)
     random_input_len = benchmark_params.get('random_input_len', 8000)
     random_output_len = benchmark_params.get('random_output_len', 8000)
+
+    # Warn if input + output lengths risk exceeding max-model-len
+    extra_args = recipe_config.get('backend', {}).get('vllm', {}).get('extra_args', '')
+    max_model_len = _parse_max_model_len(extra_args)
+    if max_model_len is not None and random_input_len + random_output_len >= max_model_len:
+        logging.getLogger().warning(
+            f"benchmark random_input_len ({random_input_len}) + "
+            f"random_output_len ({random_output_len}) = "
+            f"{random_input_len + random_output_len} >= "
+            f"max-model-len ({max_model_len})"
+        )
 
     model_name = recipe_config['model']['name']
     image = recipe_config['backend']['vllm'].get('image', 'vllm/vllm-openai:latest')
@@ -259,7 +282,7 @@ def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict
             recipe_logger.info("Running benchmark...")
             run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
             bench_success, output = run_benchmark_workload(
-                run_cmd, config, recipe_config, dry_run=dry_run,
+                run_cmd, recipe_config, dry_run=dry_run,
             )
 
             if bench_success or dry_run:
