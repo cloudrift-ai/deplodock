@@ -35,25 +35,21 @@ def test_bench_server_filter(run_cli, make_bench_config, recipes_dir, tmp_path):
     servers = [
         {
             "name": "server_a",
-            "address": "user@1.2.3.4",
             "ssh_key": "~/.ssh/id_ed25519",
-            "port": 22,
             "recipes": [
                 {
                     "recipe": os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-                    "variant": "RTX4090",
+                    "variant": "RTX5090",
                 }
             ],
         },
         {
             "name": "server_b",
-            "address": "user@5.6.7.8",
             "ssh_key": "~/.ssh/id_ed25519",
-            "port": 22,
             "recipes": [
                 {
                     "recipe": os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-                    "variant": "RTX4090",
+                    "variant": "RTX5090",
                 }
             ],
         },
@@ -64,7 +60,7 @@ def test_bench_server_filter(run_cli, make_bench_config, recipes_dir, tmp_path):
     )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
     assert "server_a" in stdout
-    assert "5.6.7.8" not in stdout
+    assert "server_b" not in stdout
 
 
 def test_bench_recipe_filter(run_cli, make_bench_config, recipes_dir, tmp_path):
@@ -72,11 +68,9 @@ def test_bench_recipe_filter(run_cli, make_bench_config, recipes_dir, tmp_path):
     servers = [
         {
             "name": "test_server",
-            "address": "user@1.2.3.4",
             "ssh_key": "~/.ssh/id_ed25519",
-            "port": 22,
             "recipes": [
-                {"recipe": recipe_path, "variant": "RTX4090"},
+                {"recipe": recipe_path, "variant": "RTX5090"},
                 {"recipe": os.path.join(recipes_dir, "GLM-4.6-FP8"), "variant": "8xH200"},
             ],
         },

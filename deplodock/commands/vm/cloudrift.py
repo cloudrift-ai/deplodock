@@ -9,7 +9,8 @@ import requests
 
 
 DEFAULT_API_URL = "https://api.cloudrift.ai"
-DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/ubuntu/24.04/noble-server-cloudimg-amd64.img"
+DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
+DEFAULT_CLOUDINIT_URL = "https://storage.googleapis.com/cloudrift-vm-disks/cloudinit/ubuntu-base.cloudinit"
 API_VERSION = "~upcoming"
 
 
@@ -38,11 +39,15 @@ def _api_request(method, path, data, api_key, api_url=DEFAULT_API_URL, dry_run=F
     return resp.json().get("data", resp.json())
 
 
-def _rent_instance(api_key, instance_type, ssh_key_ids, image_url=DEFAULT_IMAGE_URL,
+def _rent_instance(api_key, instance_type, ssh_public_keys,
+                   image_url=DEFAULT_IMAGE_URL, cloudinit_url=DEFAULT_CLOUDINIT_URL,
                    ports=None, api_url=DEFAULT_API_URL, dry_run=False):
     """Rent a new CloudRift VM instance.
 
     POST /api/v1/instances/rent
+
+    Args:
+        ssh_public_keys: list of public key strings (e.g. ["ssh-ed25519 AAAA..."])
     """
     data = {
         "selector": {
@@ -52,8 +57,9 @@ def _rent_instance(api_key, instance_type, ssh_key_ids, image_url=DEFAULT_IMAGE_
         },
         "config": {
             "VirtualMachine": {
-                "ssh_key_ids": ssh_key_ids,
+                "ssh_key": {"PublicKeys": ssh_public_keys},
                 "image_url": image_url,
+                "cloudinit_url": cloudinit_url,
             },
         },
         "with_public_ip": True,
@@ -227,17 +233,22 @@ def create_instance(api_key, instance_type, ssh_key_path, image_url=DEFAULT_IMAG
                     ports=None, timeout=600, api_url=DEFAULT_API_URL, dry_run=False):
     """Create a CloudRift VM instance.
 
+    Args:
+        ssh_key_path: path to the SSH **public** key file.
+
     Steps:
-        1. Ensure SSH key is registered
+        1. Read SSH public key
         2. Rent instance
         3. Wait for Active status
         4. Print connection info
     """
     print(f"Creating CloudRift instance (type={instance_type})...")
 
-    ssh_key_id = _ensure_ssh_key(api_key, ssh_key_path, api_url, dry_run)
+    ssh_key_path = os.path.expanduser(ssh_key_path)
+    with open(ssh_key_path) as f:
+        public_key = f.read().strip()
 
-    result = _rent_instance(api_key, instance_type, [ssh_key_id], image_url=image_url,
+    result = _rent_instance(api_key, instance_type, [public_key], image_url=image_url,
                             ports=ports, api_url=api_url, dry_run=dry_run)
     if dry_run:
         print("[dry-run] Would wait for Active status, then print connection info.")

@@ -10,27 +10,41 @@ backend:
     extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 16384 --max-num-seqs 256 --kv-cache-dtype fp8"
 
 variants:
-  B200: {}
-  H200: {}
+  B200:
+    gpu: "NVIDIA B200"
+    gpu_count: 1
+  H200:
+    gpu: "NVIDIA H200 141GB"
+    gpu_count: 1
   H100:
+    gpu: "NVIDIA H100 80GB"
+    gpu_count: 1
     backend:
       vllm:
         extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 256 --enable-expert-parallel --kv-cache-dtype fp8"
   Pro6000:
+    gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
+    gpu_count: 1
     backend:
       vllm:
         extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --max-num-seqs 256 --enable-expert-parallel --kv-cache-dtype fp8"
   4xRTX5090:
+    gpu: "NVIDIA GeForce RTX 5090"
+    gpu_count: 4
     backend:
       vllm:
         pipeline_parallel_size: 4
         extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --enable-expert-parallel --kv-cache-dtype fp8"
   4xRTX4090:
+    gpu: "NVIDIA GeForce RTX 4090"
+    gpu_count: 4
     backend:
       vllm:
         pipeline_parallel_size: 4
         extra_args: "--dtype float16 --tool-call-parser glm45 --reasoning-parser glm45 --max-model-len 8192 --enable-expert-parallel"
   2xL40S:
+    gpu: "NVIDIA L40S"
+    gpu_count: 2
     backend:
       vllm:
         pipeline_parallel_size: 2

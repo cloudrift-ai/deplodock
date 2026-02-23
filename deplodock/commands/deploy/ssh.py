@@ -13,7 +13,7 @@ REMOTE_DEPLOY_DIR = "~/deploy"
 
 def ssh_base_args(server, ssh_key, ssh_port):
     """Build base SSH arguments."""
-    args = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes"]
+    args = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
     if ssh_key:
         args += ["-i", ssh_key]
     if ssh_port and ssh_port != 22:
@@ -57,7 +57,7 @@ def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
 
 def scp_file(local_path, server, ssh_key, ssh_port, remote_path):
     """Copy a file to the remote server via SCP."""
-    scp_args = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes"]
+    scp_args = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
     if ssh_key:
         scp_args += ["-i", ssh_key]
     if ssh_port and ssh_port != 22:
@@ -182,7 +182,6 @@ def handle_ssh(args):
         model_dir=model_dir,
         hf_token=hf_token,
         host=host,
-        variant=variant,
         dry_run=dry_run,
     )
 

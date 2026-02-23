@@ -131,7 +131,10 @@ def test_multi_instance_variant(run_cli, tmp_path):
             "gpu_memory_utilization": 0.9,
             "extra_args": "--max-model-len 8192",
         }},
-        "variants": {"4xH100": {}},
+        "variants": {"4xH100": {
+            "gpu": "NVIDIA H100 80GB",
+            "gpu_count": 4,
+        }},
     }
     with open(tmp_path / "recipe.yaml", "w") as f:
         yaml.dump(recipe, f)

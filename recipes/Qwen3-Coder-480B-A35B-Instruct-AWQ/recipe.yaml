@@ -10,16 +10,24 @@ backend:
     extra_args: "--max-num-seqs 512 --max-model-len 16384 --enable-expert-parallel"
 
 variants:
-  4xH200: {}
+  4xH200:
+    gpu: "NVIDIA H200 141GB"
+    gpu_count: 4
   4xB200:
+    gpu: "NVIDIA B200"
+    gpu_count: 4
     backend:
       vllm:
         extra_args: "--max-num-seqs 512 --max-model-len 16384"
   4xH100:
+    gpu: "NVIDIA H100 80GB"
+    gpu_count: 4
     backend:
       vllm:
         extra_args: "--max-num-seqs 512 --max-model-len 8192 --enable-expert-parallel"
   4xPro6000:
+    gpu: "NVIDIA RTX PRO 6000 Server Edition"
+    gpu_count: 4
     backend:
       vllm:
         extra_args: "--max-num-seqs 256 --max-model-len 8192 --enable-expert-parallel"

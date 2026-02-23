@@ -10,13 +10,21 @@ backend:
     extra_args: "--max-model-len 8192 --kv-cache-dtype fp8"
 
 variants:
-  2xRTX4090: {}
-  2xRTX5090: {}
+  2xRTX4090:
+    gpu: "NVIDIA GeForce RTX 4090"
+    gpu_count: 2
+  2xRTX5090:
+    gpu: "NVIDIA GeForce RTX 5090"
+    gpu_count: 2
   2xL40S:
+    gpu: "NVIDIA L40S"
+    gpu_count: 2
     backend:
       vllm:
         pipeline_parallel_size: 1
   Pro6000:
+    gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
+    gpu_count: 1
     backend:
       vllm:
         pipeline_parallel_size: 1
