@@ -12,6 +12,7 @@ dependencies = [
     "openpyxl",
     "pandas",
     "pyyaml",
+    "requests",
 ]
 
 [project.optional-dependencies]

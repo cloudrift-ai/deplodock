@@ -155,3 +155,69 @@ def test_top_level_help_includes_vm(run_cli):
     rc, stdout, _ = run_cli("--help")
     assert rc == 0
     assert "vm" in stdout
+
+
+# ── CloudRift dry-run create/delete ───────────────────────────────
+
+
+def test_vm_create_cloudrift_dry_run(run_cli, tmp_path):
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    rc, stdout, _ = run_cli(
+        "vm", "create", "cloudrift",
+        "--instance-type", "rtx4090.1",
+        "--ssh-key", str(key_file),
+        "--api-key", "test-key",
+        "--dry-run",
+    )
+    assert rc == 0
+    assert "[dry-run]" in stdout
+    assert "POST" in stdout
+    assert "ssh-keys" in stdout
+    assert "instances/rent" in stdout
+
+
+def test_vm_delete_cloudrift_dry_run(run_cli):
+    rc, stdout, _ = run_cli(
+        "vm", "delete", "cloudrift",
+        "--instance-id", "inst-123",
+        "--api-key", "test-key",
+        "--dry-run",
+    )
+    assert rc == 0
+    assert "[dry-run]" in stdout
+    assert "POST" in stdout
+    assert "instances/terminate" in stdout
+    assert "inst-123" in stdout
+
+
+# ── CloudRift CLI help ────────────────────────────────────────────
+
+
+def test_vm_create_cloudrift_help(run_cli):
+    rc, stdout, _ = run_cli("vm", "create", "cloudrift", "--help")
+    assert rc == 0
+    assert "--instance-type" in stdout
+    assert "--ssh-key" in stdout
+    assert "--api-key" in stdout
+    assert "--image-url" in stdout
+    assert "--ports" in stdout
+    assert "--timeout" in stdout
+    assert "--dry-run" in stdout
+    assert "--api-url" in stdout
+
+
+def test_vm_delete_cloudrift_help(run_cli):
+    rc, stdout, _ = run_cli("vm", "delete", "cloudrift", "--help")
+    assert rc == 0
+    assert "--instance-id" in stdout
+    assert "--api-key" in stdout
+    assert "--dry-run" in stdout
+    assert "--api-url" in stdout
+
+
+def test_vm_create_help_includes_cloudrift(run_cli):
+    rc, stdout, _ = run_cli("vm", "create", "--help")
+    assert rc == 0
+    assert "cloudrift" in stdout
