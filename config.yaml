@@ -19,13 +19,17 @@ pricing:
   h200: 2.06
   b200: 2.68
 
+# Provider-specific configuration
+providers:
+  gcp:
+    zone: "us-central1-b"
+  # cloudrift: uses CLOUDRIFT_API_KEY env var
+
 # Define servers with their recipes to benchmark
+# VMs are auto-provisioned based on GPU requirements in recipes
 servers:
-  - name: "rtx4090_x_1"
-    address: "riftuser@142.214.185.165"
+  - name: "rtx5090_x_1"
     ssh_key: "~/.ssh/id_ed25519"
-    port: 22
     recipes:
       - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-        variant: "RTX4090"
-
+        variant: "RTX5090"

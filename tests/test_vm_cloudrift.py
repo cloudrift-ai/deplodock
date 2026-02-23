@@ -17,6 +17,7 @@ from deplodock.commands.vm.cloudrift import (
     _print_connection_info,
     API_VERSION,
     DEFAULT_IMAGE_URL,
+    DEFAULT_CLOUDINIT_URL,
 )
 
 
@@ -132,15 +133,16 @@ def test_api_request_dry_run(capsys):
 def test_rent_instance_payload(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    result = _rent_instance(API_KEY, "rtx49-7c-kn.1", ["key-456"],
+    result = _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"],
                             ports=[22, 8000], api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert call_data["selector"] == {"ByInstanceTypeAndLocation": {"instance_type": "rtx49-7c-kn.1"}}
     assert call_data["config"] == {
         "VirtualMachine": {
-            "ssh_key_ids": ["key-456"],
+            "ssh_key": {"PublicKeys": ["ssh-ed25519 AAAA user@host"]},
             "image_url": DEFAULT_IMAGE_URL,
+            "cloudinit_url": DEFAULT_CLOUDINIT_URL,
         }
     }
     assert call_data["with_public_ip"] is True
@@ -152,7 +154,7 @@ def test_rent_instance_payload(mock_api):
 def test_rent_instance_no_ports(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    _rent_instance(API_KEY, "rtx49-7c-kn.1", ["key-456"], api_url=API_URL)
+    _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert "ports" not in call_data

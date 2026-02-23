@@ -49,16 +49,14 @@ def make_bench_config(recipes_dir):
             servers = [
                 {
                     "name": "test_server",
-                    "address": "user@1.2.3.4",
                     "ssh_key": "~/.ssh/id_ed25519",
-                    "port": 22,
                     "recipes": [
                         {
                             "recipe": os.path.join(
                                 recipes_dir,
                                 "Qwen3-Coder-30B-A3B-Instruct-AWQ",
                             ),
-                            "variant": "RTX4090",
+                            "variant": "RTX5090",
                         }
                     ],
                 }
@@ -103,22 +101,29 @@ def tmp_recipe_dir(tmp_path):
             }
         },
         "variants": {
-            "RTX5090": {},
+            "RTX5090": {
+                "gpu": "NVIDIA GeForce RTX 5090",
+                "gpu_count": 1,
+            },
             "8xH200": {
+                "gpu": "NVIDIA H200 141GB",
+                "gpu_count": 8,
                 "backend": {
                     "vllm": {
                         "tensor_parallel_size": 8,
                         "extra_args": "--max-model-len 16384 --kv-cache-dtype fp8",
                     }
-                }
+                },
             },
             "4xH100": {
+                "gpu": "NVIDIA H100 80GB",
+                "gpu_count": 4,
                 "backend": {
                     "vllm": {
                         "tensor_parallel_size": 4,
                         "extra_args": "--max-model-len 8192 --kv-cache-dtype fp8",
                     }
-                }
+                },
             },
         },
     }

@@ -76,7 +76,6 @@ def handle_local(args):
         model_dir=model_dir,
         hf_token=hf_token,
         host="localhost",
-        variant=variant,
         dry_run=dry_run,
     )
 

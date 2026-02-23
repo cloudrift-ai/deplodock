@@ -174,7 +174,7 @@ def test_vm_create_cloudrift_dry_run(run_cli, tmp_path):
     assert rc == 0
     assert "[dry-run]" in stdout
     assert "POST" in stdout
-    assert "ssh-keys" in stdout
+    assert "PublicKeys" in stdout
     assert "instances/rent" in stdout
 
 

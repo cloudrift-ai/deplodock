@@ -1,7 +1,6 @@
 """Shared deploy logic: recipe loading, compose generation, deploy orchestration."""
 
 import os
-import re
 import sys
 import time
 
@@ -41,28 +40,18 @@ def load_recipe(recipe_dir, variant=None):
     return config
 
 
-def _parse_variant_gpus(variant):
-    """Parse GPU count from variant name like '8xH200' -> 8, 'RTX5090' -> 1."""
-    if variant is None:
-        return None
-    match = re.match(r"^(\d+)x", variant)
-    if match:
-        return int(match.group(1))
-    return 1
-
-
-def calculate_num_instances(config, variant):
-    """Calculate number of instances from config and variant GPU count."""
+def calculate_num_instances(config):
+    """Calculate number of instances from config gpu_count and parallelism."""
     vllm = config["backend"]["vllm"]
     tp = vllm.get("tensor_parallel_size", 1)
     pp = vllm.get("pipeline_parallel_size", 1)
     gpus_per_instance = tp * pp
 
-    variant_gpus = _parse_variant_gpus(variant)
-    if variant_gpus is None:
+    gpu_count = config.get("gpu_count")
+    if gpu_count is None:
         return 1
 
-    return max(1, variant_gpus // gpus_per_instance)
+    return max(1, gpu_count // gpus_per_instance)
 
 
 def generate_compose(config, model_dir, hf_token):
@@ -193,7 +182,7 @@ http {{
 """
 
 
-def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, variant=None, dry_run=False):
+def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=False):
     """Shared deploy orchestration.
 
     Args:
@@ -203,10 +192,9 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, variant=N
         model_dir: model cache directory path
         hf_token: HuggingFace token
         host: hostname/IP for endpoint display
-        variant: variant name for instance calculation
         dry_run: if True, skip sleep in health polling
     """
-    num_instances = calculate_num_instances(config, variant)
+    num_instances = calculate_num_instances(config)
     config["_num_instances"] = num_instances
 
     model_name = config["model"]["name"]

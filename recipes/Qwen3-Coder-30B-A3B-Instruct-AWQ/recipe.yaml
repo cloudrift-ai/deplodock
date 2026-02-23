@@ -10,7 +10,15 @@ backend:
     extra_args: "--max-model-len 8192"
 
 variants:
-  RTX4090: {}
-  RTX5090: {}
-  Pro6000: {}
-  L40S: {}
+#  RTX4090:
+#    gpu: "NVIDIA GeForce RTX 4090"
+#    gpu_count: 1
+  RTX5090:
+    gpu: "NVIDIA GeForce RTX 5090"
+    gpu_count: 1
+#  Pro6000:
+#    gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
+#    gpu_count: 1
+#  L40S:
+#    gpu: "NVIDIA L40S"
+#    gpu_count: 1
