@@ -32,3 +32,8 @@ servers:
     recipes:
       - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
         variant: "RTX5090"
+  - name: "pro6000_x_1"
+    ssh_key: "~/.ssh/id_ed25519"
+    recipes:
+      - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+        variant: "Pro6000"

@@ -19,6 +19,9 @@ variants:
   4xH200:
     gpu: "NVIDIA H200 141GB"
     gpu_count: 4
+    benchmark:
+      max_concurrency: 256
+      num_prompts: 512
   4xB200:
     gpu: "NVIDIA B200"
     gpu_count: 4
@@ -34,3 +37,6 @@ variants:
     backend:
       vllm:
         extra_args: "--max-num-seqs 256 --max-model-len 16384 --enable-expert-parallel"
+    benchmark:
+      max_concurrency: 64
+      num_prompts: 128

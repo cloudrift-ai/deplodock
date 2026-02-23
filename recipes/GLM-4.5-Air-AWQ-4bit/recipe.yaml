@@ -19,9 +19,15 @@ variants:
   B200:
     gpu: "NVIDIA B200"
     gpu_count: 1
+    benchmark:
+      max_concurrency: 256
+      num_prompts: 512
   H200:
     gpu: "NVIDIA H200 141GB"
     gpu_count: 1
+    benchmark:
+      max_concurrency: 256
+      num_prompts: 512
   H100:
     gpu: "NVIDIA H100 80GB"
     gpu_count: 1

@@ -16,15 +16,15 @@ benchmark:
   random_output_len: 4000
 
 variants:
-#  RTX4090:
-#    gpu: "NVIDIA GeForce RTX 4090"
-#    gpu_count: 1
+  RTX4090:
+    gpu: "NVIDIA GeForce RTX 4090"
+    gpu_count: 1
   RTX5090:
     gpu: "NVIDIA GeForce RTX 5090"
     gpu_count: 1
   Pro6000:
-    gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
+    gpu: "NVIDIA RTX PRO 6000 Server Edition"
     gpu_count: 1
-#  L40S:
-#    gpu: "NVIDIA L40S"
-#    gpu_count: 1
+  L40S:
+    gpu: "NVIDIA L40S"
+    gpu_count: 1
