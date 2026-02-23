@@ -117,17 +117,41 @@ def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None,
         if dry_run:
             logger.info(f"[dry-run] create instance={instance_name} zone={zone} type={instance_type}")
 
+        image_family = gcp_config.get("image_family", "debian-12")
+        image_project = gcp_config.get("image_project", "debian-cloud")
+
+        # Build extra gcloud args from config properties and env vars
+        extra_parts = []
+
+        service_account = gcp_config.get(
+            "service_account", os.environ.get("GCP_SERVICE_ACCOUNT", ""),
+        )
+        if service_account:
+            extra_parts.append(f"--service-account={service_account}")
+            extra_parts.append("--scopes=https://www.googleapis.com/auth/cloud-platform")
+
+        boot_disk_size = gcp_config.get("boot_disk_size")
+        if boot_disk_size:
+            extra_parts.append(f"--boot-disk-size={boot_disk_size}")
+
+        tags = gcp_config.get("tags")
+        if tags:
+            extra_parts.append(f"--tags={tags}")
+
         # Inject SSH public key into VM metadata for direct SSH access
-        extra_gcloud_args = gcp_config.get("extra_gcloud_args", "")
         pub_key_path = f"{ssh_key}.pub"
         if os.path.exists(pub_key_path) and not dry_run:
             with open(pub_key_path) as f:
                 pub_key = f.read().strip()
             metadata_arg = f'--metadata=ssh-keys={ssh_user}:{pub_key}'
-            extra_gcloud_args += f' {shlex.quote(metadata_arg)}'
+            extra_parts.append(shlex.quote(metadata_arg))
 
-        image_family = gcp_config.get("image_family", "debian-12")
-        image_project = gcp_config.get("image_project", "debian-cloud")
+        # Append any raw extra_gcloud_args from config
+        raw_extra = gcp_config.get("extra_gcloud_args", "")
+        if raw_extra:
+            extra_parts.append(raw_extra)
+
+        extra_gcloud_args = " ".join(extra_parts) if extra_parts else None
 
         conn = gcp_provider.create_instance(
             instance=instance_name,
@@ -136,7 +160,7 @@ def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None,
             provisioning_model=provisioning_model,
             image_family=image_family,
             image_project=image_project,
-            extra_gcloud_args=extra_gcloud_args or None,
+            extra_gcloud_args=extra_gcloud_args,
             wait_ssh=True,
             dry_run=dry_run,
         )
