@@ -80,3 +80,34 @@ def test_load_recipe_variants_stripped(tmp_recipe_dir):
 def test_load_recipe_variants_stripped_no_variant(tmp_recipe_dir):
     config = load_recipe(tmp_recipe_dir)
     assert "variants" not in config
+
+
+# ── benchmark section ──────────────────────────────────────────────
+
+
+def test_load_recipe_benchmark_defaults(tmp_recipe_dir):
+    config = load_recipe(tmp_recipe_dir)
+    assert config["benchmark"]["max_concurrency"] == 128
+    assert config["benchmark"]["num_prompts"] == 256
+    assert config["benchmark"]["random_input_len"] == 4000
+    assert config["benchmark"]["random_output_len"] == 4000
+
+
+def test_load_recipe_benchmark_preserved_with_variant(tmp_recipe_dir):
+    config = load_recipe(tmp_recipe_dir, variant="RTX5090")
+    assert config["benchmark"]["max_concurrency"] == 128
+    assert config["benchmark"]["random_input_len"] == 4000
+
+
+def test_load_recipe_benchmark_variant_override(tmp_recipe_dir):
+    config = load_recipe(tmp_recipe_dir, variant="8xH200")
+    assert config["benchmark"]["max_concurrency"] == 128  # from base
+    assert config["benchmark"]["random_input_len"] == 8000  # overridden
+    assert config["benchmark"]["random_output_len"] == 8000  # overridden
+    assert config["benchmark"]["num_prompts"] == 256  # from base
+
+
+def test_load_recipe_benchmark_no_override_variant(tmp_recipe_dir):
+    config = load_recipe(tmp_recipe_dir, variant="4xH100")
+    assert config["benchmark"]["random_input_len"] == 4000  # base preserved
+    assert config["benchmark"]["random_output_len"] == 4000  # base preserved

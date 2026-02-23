@@ -68,12 +68,20 @@ backend:
     gpu_memory_utilization: 0.9
     extra_args: "--max-num-seqs 512 --max-model-len 16384"
 
+benchmark:
+  max_concurrency: 128
+  num_prompts: 256
+  random_input_len: 8000
+  random_output_len: 8000
+
 variants:
   8xH200: {}                    # Uses defaults
   8xH100:
     backend:
       vllm:
         extra_args: "--max-model-len 8192"  # Override for this hardware
+    benchmark:                              # Per-variant benchmark override
+      max_concurrency: 64
 ```
 
 ### Variant Naming
@@ -207,21 +215,15 @@ benchmark:
   local_results_dir: "results"
   model_dir: "/hf_models"
 
-benchmark_params:
-  max_concurrency: 128
-  num_prompts: 256
-  random_input_len: 8000
-  random_output_len: 8000
-
 servers:
   - name: "rtx4090_x_1"
-    address: "riftuser@142.214.185.165"
     ssh_key: "~/.ssh/id_ed25519"
-    port: 22
     recipes:
       - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
         variant: "RTX4090"
 ```
+
+Benchmark parameters (`max_concurrency`, `num_prompts`, `random_input_len`, `random_output_len`) are defined per-recipe in the recipe's `benchmark` section, not in `config.yaml`.
 
 ### Run Benchmarks
 

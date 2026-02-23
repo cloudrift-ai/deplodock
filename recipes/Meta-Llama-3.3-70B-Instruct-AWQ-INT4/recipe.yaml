@@ -9,6 +9,12 @@ backend:
     gpu_memory_utilization: 0.9
     extra_args: "--max-model-len 8192 --kv-cache-dtype fp8"
 
+benchmark:
+  max_concurrency: 128
+  num_prompts: 256
+  random_input_len: 4000
+  random_output_len: 4000
+
 variants:
   2xRTX4090:
     gpu: "NVIDIA GeForce RTX 4090"
@@ -28,4 +34,3 @@ variants:
     backend:
       vllm:
         pipeline_parallel_size: 1
-        extra_args: "--max-model-len 2048"
