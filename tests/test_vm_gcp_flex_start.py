@@ -21,12 +21,21 @@ def test_gcloud_create_cmd():
         "--provisioning-model=FLEX_START",
         "--maintenance-policy=TERMINATE",
         "--reservation-affinity=none",
-        "--max-run-duration", "7d",
-        "--instance-termination-action=DELETE",
         "--image-family", "debian-12",
         "--image-project", "debian-cloud",
+        "--max-run-duration", "7d",
+        "--instance-termination-action=DELETE",
         "--request-valid-for-duration", "2h",
     ]
+
+
+def test_gcloud_create_cmd_spot_no_duration_flags():
+    """SPOT provisioning should not include duration or termination flags."""
+    cmd = _gcloud_create_cmd("my-vm", "us-central1-a", "g4-standard-48", provisioning_model="SPOT")
+    assert "--provisioning-model=SPOT" in cmd
+    assert "--max-run-duration" not in cmd
+    assert "--instance-termination-action=DELETE" not in cmd
+    assert "--request-valid-for-duration" not in cmd
 
 
 def test_gcloud_create_cmd_with_gcloud_args():

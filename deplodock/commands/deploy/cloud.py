@@ -6,6 +6,7 @@ bench and deploy CLI goes through this module.
 
 import logging
 import os
+import shlex
 import sys
 
 from deplodock.commands.deploy import (
@@ -108,18 +109,39 @@ def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None,
     elif provider == "gcp":
         gcp_config = (providers_config or {}).get("gcp", {})
         zone = gcp_config.get("zone", "us-central1-b")
-        instance_name = f"bench-{server_name}" if server_name else "bench-vm"
+        provisioning_model = gcp_config.get("provisioning_model", "FLEX_START")
+        ssh_user = gcp_config.get("ssh_user", os.environ.get("USER", "deploy"))
+        raw_name = f"bench-{server_name}" if server_name else "bench-vm"
+        instance_name = raw_name.lower().replace("_", "-")
 
         if dry_run:
             logger.info(f"[dry-run] create instance={instance_name} zone={zone} type={instance_type}")
+
+        # Inject SSH public key into VM metadata for direct SSH access
+        extra_gcloud_args = gcp_config.get("extra_gcloud_args", "")
+        pub_key_path = f"{ssh_key}.pub"
+        if os.path.exists(pub_key_path) and not dry_run:
+            with open(pub_key_path) as f:
+                pub_key = f.read().strip()
+            metadata_arg = f'--metadata=ssh-keys={ssh_user}:{pub_key}'
+            extra_gcloud_args += f' {shlex.quote(metadata_arg)}'
+
+        image_family = gcp_config.get("image_family", "debian-12")
+        image_project = gcp_config.get("image_project", "debian-cloud")
 
         conn = gcp_provider.create_instance(
             instance=instance_name,
             zone=zone,
             machine_type=instance_type,
+            provisioning_model=provisioning_model,
+            image_family=image_family,
+            image_project=image_project,
+            extra_gcloud_args=extra_gcloud_args or None,
             wait_ssh=True,
             dry_run=dry_run,
         )
+        if conn and conn.username == "":
+            conn.username = ssh_user
         return conn
 
     else:
