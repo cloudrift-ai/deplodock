@@ -1,0 +1,331 @@
+"""CloudRift provider: create/delete GPU VMs via the CloudRift REST API."""
+
+import json
+import os
+import sys
+import time
+
+import requests
+
+
+DEFAULT_API_URL = "https://api.cloudrift.ai"
+DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/ubuntu/24.04/noble-server-cloudimg-amd64.img"
+API_VERSION = "~upcoming"
+
+
+# ── API helpers ───────────────────────────────────────────────────
+
+
+def _api_request(method, path, data, api_key, api_url=DEFAULT_API_URL, dry_run=False):
+    """Make an authenticated CloudRift API request.
+
+    Wraps *data* in the versioned envelope ``{"version": ..., "data": ...}``.
+
+    Returns:
+        Parsed JSON response ``data`` dict, or ``None`` in dry-run mode.
+    """
+    url = f"{api_url}{path}"
+    payload = {"version": API_VERSION, "data": data}
+
+    if dry_run:
+        print(f"[dry-run] {method} {url}")
+        print(f"[dry-run] payload: {json.dumps(payload, indent=2)}")
+        return None
+
+    headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+    resp = requests.request(method, url, json=payload, headers=headers)
+    resp.raise_for_status()
+    return resp.json().get("data", resp.json())
+
+
+def _rent_instance(api_key, instance_type, ssh_key_ids, image_url=DEFAULT_IMAGE_URL,
+                   ports=None, api_url=DEFAULT_API_URL, dry_run=False):
+    """Rent a new CloudRift VM instance.
+
+    POST /api/v1/instances/rent
+    """
+    data = {
+        "selector": {
+            "ByInstanceTypeAndLocation": {
+                "instance_type": instance_type,
+            },
+        },
+        "config": {
+            "VirtualMachine": {
+                "ssh_key_ids": ssh_key_ids,
+                "image_url": image_url,
+            },
+        },
+        "with_public_ip": True,
+    }
+    if ports:
+        data["ports"] = [str(p) for p in ports]
+    return _api_request("POST", "/api/v1/instances/rent", data, api_key, api_url, dry_run)
+
+
+def _terminate_instance(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
+    """Terminate a CloudRift instance.
+
+    POST /api/v1/instances/terminate with ById selector.
+    """
+    data = {"selector": {"ById": [instance_id]}}
+    return _api_request("POST", "/api/v1/instances/terminate", data, api_key, api_url, dry_run)
+
+
+def _get_instance_info(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
+    """Get info for a single instance by ID.
+
+    POST /api/v1/instances/list with ById selector.
+    Returns the instance dict or None.
+    """
+    data = {"selector": {"ById": [instance_id]}}
+    result = _api_request("POST", "/api/v1/instances/list", data, api_key, api_url, dry_run)
+    if result is None:  # dry-run
+        return None
+    instances = result.get("instances", [])
+    return instances[0] if instances else None
+
+
+def _list_ssh_keys(api_key, api_url=DEFAULT_API_URL, dry_run=False):
+    """List registered SSH keys.
+
+    POST /api/v1/ssh-keys/list
+    """
+    return _api_request("POST", "/api/v1/ssh-keys/list", {}, api_key, api_url, dry_run)
+
+
+def _add_ssh_key(api_key, name, public_key, api_url=DEFAULT_API_URL, dry_run=False):
+    """Register a new SSH key.
+
+    POST /api/v1/ssh-keys/add
+    """
+    data = {"name": name, "public_key": public_key}
+    return _api_request("POST", "/api/v1/ssh-keys/add", data, api_key, api_url, dry_run)
+
+
+# ── Core logic ─────────────────────────────────────────────────────
+
+
+def _resolve_api_key(args_api_key):
+    """Return the API key from the CLI flag or CLOUDRIFT_API_KEY env var.
+
+    Raises SystemExit if neither is set.
+    """
+    api_key = args_api_key or os.environ.get("CLOUDRIFT_API_KEY")
+    if not api_key:
+        print("Error: CloudRift API key required. Use --api-key or set CLOUDRIFT_API_KEY.", file=sys.stderr)
+        sys.exit(1)
+    return api_key
+
+
+def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=False):
+    """Ensure the SSH public key is registered on CloudRift.
+
+    Reads the public key file, checks existing keys by content match,
+    and registers if not found.
+
+    Returns:
+        The SSH key ID (str), or "dry-run-key-id" in dry-run mode.
+    """
+    ssh_key_path = os.path.expanduser(ssh_key_path)
+    with open(ssh_key_path) as f:
+        public_key = f.read().strip()
+
+    result = _list_ssh_keys(api_key, api_url, dry_run)
+    if result is not None:
+        for key in result.get("keys", []):
+            if key.get("public_key", "").strip() == public_key:
+                print(f"SSH key already registered (id={key['id']}).")
+                return key["id"]
+
+    # Register new key
+    key_name = os.path.basename(ssh_key_path)
+    print(f"Registering SSH key '{key_name}' on CloudRift...")
+    add_result = _add_ssh_key(api_key, key_name, public_key, api_url, dry_run)
+    if dry_run:
+        return "dry-run-key-id"
+    key_id = add_result["ssh_key"]["id"]
+    print(f"SSH key registered (id={key_id}).")
+    return key_id
+
+
+def wait_for_status(api_key, instance_id, target_status, timeout,
+                    api_url=DEFAULT_API_URL, interval=10, dry_run=False):
+    """Poll instance status until it matches *target_status* or timeout.
+
+    Returns:
+        The instance dict if target status reached, None on timeout.
+    """
+    if dry_run:
+        print(f"[dry-run] Poll every {interval}s (up to {timeout}s) for status '{target_status}'")
+        return {"status": target_status}
+
+    elapsed = 0
+    status = None
+    while elapsed < timeout:
+        info = _get_instance_info(api_key, instance_id, api_url)
+        if info is None:
+            print(f"Warning: instance {instance_id} not found.", file=sys.stderr)
+            time.sleep(interval)
+            elapsed += interval
+            continue
+        status = info.get("status")
+        if status == target_status:
+            return info
+        time.sleep(interval)
+        elapsed += interval
+
+    print(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')", file=sys.stderr)
+    return None
+
+
+def _print_connection_info(instance):
+    """Print SSH connection info based on instance networking.
+
+    VMs provide login credentials in virtual_machines[].login_info.
+    Port mappings are [internal_port, external_port] tuples.
+    """
+    host = instance.get("host_address")
+    port_mappings = instance.get("port_mappings", [])
+
+    # Extract login credentials from VM info
+    username = "user"
+    password = None
+    vms = instance.get("virtual_machines", [])
+    if vms:
+        login_info = vms[0].get("login_info", {})
+        creds = login_info.get("UsernameAndPassword", {})
+        username = creds.get("username", username)
+        password = creds.get("password")
+
+    # Find SSH port mapping: each mapping is [internal_port, external_port]
+    ssh_ext_port = None
+    for mapping in port_mappings:
+        if mapping[0] == 22:
+            ssh_ext_port = mapping[1]
+            break
+
+    if ssh_ext_port and host:
+        print(f"Host:     {host}")
+        print(f"User:     {username}")
+        if password:
+            print(f"Password: {password}")
+        print(f"Connect:  ssh -p {ssh_ext_port} {username}@{host}")
+        for internal, external in port_mappings:
+            print(f"  Port {internal} -> {host}:{external}")
+    elif host:
+        print(f"Host:     {host}")
+        print(f"User:     {username}")
+        if password:
+            print(f"Password: {password}")
+        print(f"Connect:  ssh {username}@{host}")
+    else:
+        print("Warning: no host address found in instance info.")
+
+
+def create_instance(api_key, instance_type, ssh_key_path, image_url=DEFAULT_IMAGE_URL,
+                    ports=None, timeout=600, api_url=DEFAULT_API_URL, dry_run=False):
+    """Create a CloudRift VM instance.
+
+    Steps:
+        1. Ensure SSH key is registered
+        2. Rent instance
+        3. Wait for Active status
+        4. Print connection info
+    """
+    print(f"Creating CloudRift instance (type={instance_type})...")
+
+    ssh_key_id = _ensure_ssh_key(api_key, ssh_key_path, api_url, dry_run)
+
+    result = _rent_instance(api_key, instance_type, [ssh_key_id], image_url=image_url,
+                            ports=ports, api_url=api_url, dry_run=dry_run)
+    if dry_run:
+        print("[dry-run] Would wait for Active status, then print connection info.")
+        return True
+
+    instance_ids = result.get("instance_ids", [])
+    if not instance_ids:
+        print("Error: no instance ID returned from rent API.", file=sys.stderr)
+        return False
+    instance_id = instance_ids[0]
+    print(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
+
+    info = wait_for_status(api_key, instance_id, "Active", timeout, api_url)
+    if info is None:
+        return False
+
+    print("Instance is Active.")
+    _print_connection_info(info)
+    return True
+
+
+def delete_instance(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
+    """Terminate a CloudRift instance."""
+    print(f"Terminating CloudRift instance '{instance_id}'...")
+
+    _terminate_instance(api_key, instance_id, api_url, dry_run)
+
+    if not dry_run:
+        print("Instance terminated.")
+    return True
+
+
+# ── CLI handlers ───────────────────────────────────────────────────
+
+
+def handle_create(args):
+    """CLI handler for 'vm create cloudrift'."""
+    api_key = _resolve_api_key(args.api_key)
+    ports = [int(p) for p in args.ports.split(",")] if args.ports else None
+    success = create_instance(
+        api_key=api_key,
+        instance_type=args.instance_type,
+        ssh_key_path=args.ssh_key,
+        image_url=args.image_url,
+        ports=ports,
+        timeout=args.timeout,
+        api_url=args.api_url,
+        dry_run=args.dry_run,
+    )
+    if not success:
+        sys.exit(1)
+
+
+def handle_delete(args):
+    """CLI handler for 'vm delete cloudrift'."""
+    api_key = _resolve_api_key(args.api_key)
+    success = delete_instance(
+        api_key=api_key,
+        instance_id=args.instance_id,
+        api_url=args.api_url,
+        dry_run=args.dry_run,
+    )
+    if not success:
+        sys.exit(1)
+
+
+# ── Registration ───────────────────────────────────────────────────
+
+
+def register_create_target(subparsers):
+    """Register the cloudrift provider under 'vm create'."""
+    parser = subparsers.add_parser("cloudrift", help="Create a CloudRift GPU VM")
+    parser.add_argument("--instance-type", required=True, help="Instance type (e.g. rtx4090.1)")
+    parser.add_argument("--ssh-key", required=True, help="Path to SSH public key file")
+    parser.add_argument("--api-key", default=None, help="CloudRift API key (fallback: CLOUDRIFT_API_KEY env var)")
+    parser.add_argument("--image-url", default=DEFAULT_IMAGE_URL, help="VM image URL (default: Ubuntu 24.04)")
+    parser.add_argument("--ports", default="22,8000", help="Comma-separated ports to open (default: 22,8000)")
+    parser.add_argument("--api-url", default=DEFAULT_API_URL, help=f"API base URL (default: {DEFAULT_API_URL})")
+    parser.add_argument("--timeout", type=int, default=600, help="Seconds to wait for Active status (default: 600)")
+    parser.add_argument("--dry-run", action="store_true", help="Print requests without executing")
+    parser.set_defaults(func=handle_create)
+
+
+def register_delete_target(subparsers):
+    """Register the cloudrift provider under 'vm delete'."""
+    parser = subparsers.add_parser("cloudrift", help="Delete a CloudRift GPU VM")
+    parser.add_argument("--instance-id", required=True, help="CloudRift instance ID")
+    parser.add_argument("--api-key", default=None, help="CloudRift API key (fallback: CLOUDRIFT_API_KEY env var)")
+    parser.add_argument("--api-url", default=DEFAULT_API_URL, help=f"API base URL (default: {DEFAULT_API_URL})")
+    parser.add_argument("--dry-run", action="store_true", help="Print requests without executing")
+    parser.set_defaults(func=handle_delete)
