@@ -136,6 +136,8 @@ def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=Fals
         The SSH key ID (str), or "dry-run-key-id" in dry-run mode.
     """
     ssh_key_path = os.path.expanduser(ssh_key_path)
+    if dry_run and not os.path.exists(ssh_key_path):
+        return "dry-run-key-id"
     with open(ssh_key_path) as f:
         public_key = f.read().strip()
 
@@ -293,8 +295,11 @@ def create_instance(api_key, instance_type, ssh_key_path, image_url=DEFAULT_IMAG
     print(f"Creating CloudRift instance (type={instance_type})...")
 
     ssh_key_path = os.path.expanduser(ssh_key_path)
-    with open(ssh_key_path) as f:
-        public_key = f.read().strip()
+    if dry_run and not os.path.exists(ssh_key_path):
+        public_key = "dry-run-placeholder"
+    else:
+        with open(ssh_key_path) as f:
+            public_key = f.read().strip()
 
     result = _rent_instance(api_key, instance_type, [public_key], image_url=image_url,
                             ports=ports, api_url=api_url, dry_run=dry_run)
