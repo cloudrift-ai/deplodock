@@ -5,7 +5,14 @@ import subprocess
 import sys
 import tempfile
 
-from deplodock.commands.deploy import load_recipe, run_deploy, run_teardown
+from deplodock.commands.deploy import (
+    DeployParams,
+    deploy as deploy_entry,
+    load_recipe,
+    run_deploy,
+    run_teardown,
+    teardown as teardown_entry,
+)
 
 
 REMOTE_DEPLOY_DIR = "~/deploy"
@@ -152,40 +159,22 @@ def provision_remote(server, ssh_key, ssh_port, dry_run=False):
 
 def handle_ssh(args):
     """Handle the SSH deploy target."""
-    recipe_dir = args.recipe
-    variant = args.variant
-    hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
-    model_dir = args.model_dir
-    dry_run = args.dry_run
-    teardown = args.teardown
-    server = args.server
-    ssh_key = args.ssh_key
-    ssh_port = args.ssh_port
-
-    run_cmd = make_run_cmd(server, ssh_key, ssh_port, dry_run=dry_run)
-    write_file = make_write_file(server, ssh_key, ssh_port, dry_run=dry_run)
-
-    provision_remote(server, ssh_key, ssh_port, dry_run=dry_run)
-
-    if teardown:
-        return run_teardown(run_cmd)
-
-    config = load_recipe(recipe_dir, variant=variant)
-
-    # Extract host from server address (user@host -> host)
-    host = server.split("@")[-1] if "@" in server else server
-
-    success = run_deploy(
-        run_cmd=run_cmd,
-        write_file=write_file,
-        config=config,
-        model_dir=model_dir,
-        hf_token=hf_token,
-        host=host,
-        dry_run=dry_run,
+    config = load_recipe(args.recipe, variant=args.variant)
+    params = DeployParams(
+        server=args.server,
+        ssh_key=args.ssh_key,
+        ssh_port=args.ssh_port,
+        recipe_config=config,
+        model_dir=args.model_dir,
+        hf_token=args.hf_token or os.environ.get("HF_TOKEN", ""),
+        dry_run=args.dry_run,
     )
+    provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
 
-    if not success:
+    if args.teardown:
+        return teardown_entry(params)
+
+    if not deploy_entry(params):
         sys.exit(1)
 
 

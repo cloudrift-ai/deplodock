@@ -5,6 +5,7 @@ import sys
 import time
 
 from deplodock.commands.vm import run_shell_cmd
+from deplodock.commands.vm.types import VMConnectionInfo
 
 
 # ── Command builders ───────────────────────────────────────────────
@@ -146,8 +147,12 @@ def create_instance(
     Steps:
         1. Issue gcloud compute instances create with flex-start flags
         2. Wait for RUNNING status (up to timeout)
-        3. Print external IP
+        3. Get external IP
         4. Optionally wait for SSH connectivity
+
+    Returns:
+        VMConnectionInfo on success, None on failure.
+        In dry-run mode, returns a VMConnectionInfo with placeholder values.
     """
     print(f"Creating flex-start instance '{instance}' in zone '{zone}'...")
 
@@ -163,29 +168,35 @@ def create_instance(
     rc, stdout, stderr = run_shell_cmd(cmd, dry_run=dry_run)
     if rc != 0:
         print(f"Failed to create instance: {stderr.strip()}", file=sys.stderr)
-        return False
+        return None
 
     print(f"Waiting for instance to reach RUNNING status (timeout: {timeout}s)...")
     if not wait_for_status(instance, zone, "RUNNING", timeout, dry_run=dry_run):
-        return False
+        return None
     print("Instance is RUNNING.")
 
-    # Get and print external IP
+    # Get external IP
     rc, stdout, _ = run_shell_cmd(_gcloud_external_ip_cmd(instance, zone), dry_run=dry_run)
-    if rc == 0:
-        ip = stdout.strip()
-        if ip:
-            print(f"External IP: {ip}")
-        elif not dry_run:
+    external_ip = stdout.strip() if rc == 0 else ""
+
+    if not dry_run:
+        if not external_ip:
             print("Warning: No external IP found.")
+        else:
+            print(f"External IP: {external_ip}")
 
     if wait_ssh:
         print(f"Waiting for SSH connectivity (timeout: {wait_ssh_timeout}s)...")
         if not wait_for_ssh(instance, zone, timeout=wait_ssh_timeout, ssh_gateway=ssh_gateway, dry_run=dry_run):
-            return False
+            return None
         print("SSH is ready.")
 
-    return True
+    return VMConnectionInfo(
+        host=external_ip or "dry-run-gcp-host",
+        username="",
+        ssh_port=22,
+        delete_info=("gcp", instance, zone),
+    )
 
 
 def delete_instance(instance, zone, dry_run=False):
@@ -209,7 +220,7 @@ def delete_instance(instance, zone, dry_run=False):
 
 def handle_create(args):
     """CLI handler for 'vm create gcp-flex-start'."""
-    success = create_instance(
+    conn = create_instance(
         instance=args.instance,
         zone=args.zone,
         machine_type=args.machine_type,
@@ -225,7 +236,7 @@ def handle_create(args):
         ssh_gateway=args.ssh_gateway,
         dry_run=args.dry_run,
     )
-    if not success:
+    if conn is None:
         sys.exit(1)
 
 
