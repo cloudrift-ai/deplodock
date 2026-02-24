@@ -36,6 +36,7 @@ variants:
       llm:
         sglang:
           image: "lmsysorg/sglang:latest"
+          extra_args: "--quantization moe_wna16"
   L40S_sglang:
     gpu: "NVIDIA L40S"
     gpu_count: 1
@@ -43,3 +44,4 @@ variants:
       llm:
         sglang:
           image: "lmsysorg/sglang:latest"
+          extra_args: "--quantization moe_wna16"
