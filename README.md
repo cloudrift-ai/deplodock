@@ -1,21 +1,43 @@
-# Server Benchmark
+# Deplodock
 
 Tools for deploying and benchmarking LLM inference on GPU servers.
+
+## Project Structure
+
+- [deplodock/](deplodock/) — Python package
+  - [deplodock.py](deplodock/deplodock.py) — CLI entrypoint
+  - [hardware.py](deplodock/hardware.py) — GPU specs and instance type mapping
+  - [commands/](deplodock/commands/) — CLI layer (thin argparse handlers, see [ARCHITECTURE.md](deplodock/commands/ARCHITECTURE.md))
+    - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
+    - [bench/](deplodock/commands/bench/) — `bench` command
+    - [report/](deplodock/commands/report/) — `report` command
+    - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP flex-start, CloudRift)
+  - [deploy/](deplodock/deploy/) — Deploy library (recipe loading, compose generation, orchestration)
+  - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
+  - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
+  - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
+  - [report/](deplodock/report/) — Excel report generation from benchmark results
+- [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
+- [tests/](tests/) — pytest tests (see [ARCHITECTURE.md](tests/ARCHITECTURE.md))
+- [utils/](utils/) — Standalone utility scripts
+- [config.yaml](config.yaml) — Benchmark configuration
+- [Makefile](Makefile) — Build automation
+- [pyproject.toml](pyproject.toml) — Package metadata and tool config
 
 ## Quick Start
 
 ### Install
 
 ```bash
-git clone https://github.com/cloudrift-ai/server-benchmark.git
-cd server-benchmark
+git clone https://github.com/cloudrift-ai/deplodock.git
+cd deplodock
 make setup
 ```
 
 ### Deploy a Model
 
 ```bash
-python main.py deploy ssh \
+deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
   --variant 8xH200 \
   --server user@host
@@ -24,7 +46,7 @@ python main.py deploy ssh \
 ### Deploy Locally
 
 ```bash
-python main.py deploy local \
+deplodock deploy local \
   --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ \
   --variant RTX5090
 ```
@@ -32,7 +54,7 @@ python main.py deploy local \
 ### Teardown
 
 ```bash
-python main.py deploy ssh \
+deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
   --server user@host \
   --teardown
@@ -43,7 +65,7 @@ python main.py deploy ssh \
 Preview commands without executing:
 
 ```bash
-python main.py deploy ssh \
+deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
   --variant 8xH200 \
   --server user@host \
@@ -95,10 +117,9 @@ Format: `[<gpus>x]<GPU_TYPE>`. Multi-instance deployment is automatic when varia
 
 ### Available Recipes
 
-| Recipe | Model | GPU Config |
-|--------|-------|-----------|
+| Recipe | Model | Config |
+|--------|-------|--------|
 | `GLM-4.6-FP8` | zai-org/GLM-4.6-FP8 | TP=8, dense FP8 |
-| `GLM-4.6` | zai-org/GLM-4.6 | TP=8, dense FP16 |
 | `GLM-4.5-Air-AWQ-4bit` | cpatonn/GLM-4.5-Air-AWQ-4bit | TP=1, MoE |
 | `Qwen3-Coder-480B-A35B-Instruct-AWQ` | QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ | TP=4, large MoE |
 | `Qwen3-Coder-30B-A3B-Instruct-AWQ` | QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ | TP=1, small MoE |
@@ -111,7 +132,7 @@ Format: `[<gpus>x]<GPU_TYPE>`. Multi-instance deployment is automatic when varia
 Runs docker compose directly on the current machine.
 
 ```bash
-python main.py deploy local --recipe <path> [--variant <name>] [--dry-run]
+deplodock deploy local --recipe <path> [--variant <name>] [--dry-run]
 ```
 
 ### SSH
@@ -119,7 +140,7 @@ python main.py deploy local --recipe <path> [--variant <name>] [--dry-run]
 Deploys to a remote server via SSH + SCP.
 
 ```bash
-python main.py deploy ssh --recipe <path> --server user@host [--variant <name>] [--dry-run]
+deplodock deploy ssh --recipe <path> --server user@host [--variant <name>] [--dry-run]
 ```
 
 ### Cloud
@@ -127,7 +148,7 @@ python main.py deploy ssh --recipe <path> --server user@host [--variant <name>] 
 Provisions a cloud VM based on recipe GPU requirements, then deploys via SSH.
 
 ```bash
-deplodock deploy cloud --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ --variant RTX5090 --dry-run
+deplodock deploy cloud --recipe <path> --variant <name> [--name <vm-name>] [--dry-run]
 ```
 
 ### Common Flags
@@ -149,32 +170,34 @@ deplodock deploy cloud --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ --varia
 | `--ssh-key` | No | `~/.ssh/id_ed25519` | SSH key path |
 | `--ssh-port` | No | 22 | SSH port |
 
+### Cloud-only Flags
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--name` | No | `cloud-deploy` | VM name prefix |
+| `--ssh-key` | No | `~/.ssh/id_ed25519` | SSH private key path |
+
 ## VM Management
 
-The `vm` command manages cloud GPU VM lifecycles. Currently supports GCP flex-start, which provisions new GPU capacity using `--provisioning-model=FLEX_START` (can take hours). Instances are ephemeral — `delete` removes them entirely.
+The `vm` command manages cloud GPU VM lifecycles. Supports GCP flex-start and CloudRift providers. Instances are ephemeral — `delete` removes them entirely.
 
-### Create a VM
+### GCP Flex-Start
 
 ```bash
 deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type a2-highgpu-1g
 deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --wait-ssh
 deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --gcloud-args "--no-service-account --no-scopes" --dry-run
-```
-
-### Delete a VM
-
-```bash
 deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a
-deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a --dry-run
 ```
 
-### Create Flags
+#### GCP Create Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--instance` | (required) | GCP instance name |
 | `--zone` | (required) | GCP zone (e.g. us-central1-a) |
 | `--machine-type` | (required) | Machine type (e.g. a2-highgpu-1g) |
+| `--provisioning-model` | `FLEX_START` | Provisioning model (`FLEX_START`, `SPOT`, or `STANDARD`) |
 | `--max-run-duration` | `7d` | Max VM run time (10m–7d) |
 | `--request-valid-for-duration` | `2h` | How long to wait for capacity |
 | `--termination-action` | `DELETE` | Action when max-run-duration expires (`STOP` or `DELETE`) |
@@ -184,9 +207,10 @@ deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a --d
 | `--timeout` | `14400` | How long to poll for RUNNING status (seconds) |
 | `--wait-ssh` | false | Wait for SSH after VM is RUNNING |
 | `--wait-ssh-timeout` | `300` | SSH wait timeout in seconds |
+| `--ssh-gateway` | - | SSH gateway host for ProxyJump (e.g. gcp-ssh-gateway) |
 | `--dry-run` | false | Print commands without executing |
 
-### Delete Flags
+#### GCP Delete Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -196,40 +220,56 @@ deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a --d
 
 GCP project is inferred from `gcloud` config (no `--project` flag needed).
 
-## Running Tests
+### CloudRift
 
 ```bash
-pytest tests/ -v
+deplodock vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
+deplodock vm delete cloudrift --instance-id <id>
 ```
 
-## Linting & Formatting
+#### CloudRift Create Flags
 
-The project uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting. Configuration is in `pyproject.toml`.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--instance-type` | (required) | Instance type (e.g. rtx4090.1) |
+| `--ssh-key` | (required) | Path to SSH public key file |
+| `--api-key` | `$CLOUDRIFT_API_KEY` | CloudRift API key |
+| `--image-url` | Ubuntu 24.04 | VM image URL |
+| `--ports` | `22,8000` | Comma-separated ports to open |
+| `--timeout` | `600` | Seconds to wait for Active status |
+| `--dry-run` | false | Print requests without executing |
 
-```bash
-make lint      # check for lint errors and formatting issues
-make format    # auto-fix formatting and lint violations
-```
+#### CloudRift Delete Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--instance-id` | (required) | CloudRift instance ID |
+| `--api-key` | `$CLOUDRIFT_API_KEY` | CloudRift API key |
+| `--dry-run` | false | Print requests without executing |
 
 ## Benchmarking
 
-The `bench` command reuses the deploy infrastructure — it loads a recipe, deploys the model via SSH, runs `vllm bench serve`, captures results, and tears down. No repo cloning needed.
+The `bench` command accepts recipe directories as positional arguments. It loads each recipe, provisions cloud VMs, deploys the model, runs `vllm bench serve`, captures results, and tears down. Recipes sharing the same model and GPU type are grouped onto the same VM.
 
 ### Configuration
 
-`config.yaml` references recipe paths instead of inline model definitions:
+`config.yaml` defines global benchmark settings and provider config:
 
 ```yaml
 benchmark:
   local_results_dir: "results"
   model_dir: "/hf_models"
 
-servers:
-  - name: "rtx4090_x_1"
-    ssh_key: "~/.ssh/id_ed25519"
-    recipes:
-      - recipe: "recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-        variant: "RTX4090"
+pricing:
+  h100: 1.91
+  h200: 2.06
+
+providers:
+  gcp:
+    zone: "us-central1-b"
+    provisioning_model: "SPOT"
+    image_family: "common-cu128-ubuntu-2204-nvidia-570"
+    image_project: "deeplearning-platform-release"
 ```
 
 Benchmark parameters (`max_concurrency`, `num_prompts`, `random_input_len`, `random_output_len`) are defined per-recipe in the recipe's `benchmark` section, not in `config.yaml`.
@@ -237,21 +277,20 @@ Benchmark parameters (`max_concurrency`, `num_prompts`, `random_input_len`, `ran
 ### Run Benchmarks
 
 ```bash
-deplodock bench --dry-run                                         # Preview commands
-deplodock bench --parallel                                        # Run benchmarks in parallel
-deplodock bench --server my_server                                # Run for specific server
-deplodock bench --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ  # Run for specific recipe
-deplodock bench --parallel --force                                # Force re-run, skip cached results
+deplodock bench recipes/*                                    # Run all recipes
+deplodock bench recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ    # Run a specific recipe
+deplodock bench recipes/* --variants RTX5090 H200            # Run specific variants only
+deplodock bench recipes/* --max-workers 2                    # Limit parallel execution groups
+deplodock bench recipes/* --dry-run                          # Preview commands
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `recipes` | (required) | Recipe directories (positional args) |
+| `--variants` | all | Variant names to run (space-separated) |
+| `--ssh-key` | `~/.ssh/id_ed25519` | SSH private key path |
 | `--config` | `config.yaml` | Path to configuration file |
-| `--force` | false | Force re-run even if results exist |
-| `--server` | - | Run only for a specific server |
-| `--recipe` | - | Run only for a specific recipe path |
-| `--parallel` | false | Run servers in parallel |
-| `--max-workers` | num servers | Max parallel server benchmarks |
+| `--max-workers` | num groups | Max parallel execution groups |
 | `--dry-run` | false | Print commands without executing |
 
 ### Generate Reports
@@ -267,35 +306,17 @@ deplodock report --results-dir results/custom --output results/custom/report.xls
 | `--results-dir` | `results` | Directory containing benchmark results |
 | `--output` | `results/benchmark_report.xlsx` | Output Excel file path |
 
-## Project Structure
+## Running Tests
 
+```bash
+pytest tests/ -v
 ```
-deplodock/
-├── deplodock/
-│   ├── deplodock.py                 # CLI entrypoint
-│   └── commands/
-│       ├── deploy/
-│       │   ├── __init__.py          # Shared: recipe, compose, orchestration, DeployParams
-│       │   ├── local.py             # Local target
-│       │   ├── ssh.py               # SSH target
-│       │   └── cloud.py             # Cloud target (provision VM + deploy)
-│       ├── bench/
-│       │   └── __init__.py          # Benchmark runner
-│       ├── report/
-│       │   └── __init__.py          # Report generator
-│       └── vm/
-│           ├── __init__.py          # VM command registration, shared helpers
-│           ├── types.py             # VMConnectionInfo dataclass
-│           ├── cloudrift.py         # CloudRift API provider
-│           └── gcp_flex_start.py    # GCP flex-start provider
-├── recipes/                         # Model deploy recipes
-│   ├── GLM-4.6-FP8/
-│   ├── GLM-4.6/
-│   ├── GLM-4.5-Air-AWQ-4bit/
-│   ├── Qwen3-Coder-480B-A35B-Instruct-AWQ/
-│   ├── Qwen3-Coder-30B-A3B-Instruct-AWQ/
-│   └── Meta-Llama-3.3-70B-Instruct-AWQ-INT4/
-├── tests/                           # pytest tests (see [tests/ARCHITECTURE.md](tests/ARCHITECTURE.md))
-├── config.yaml                      # Benchmark configuration
-└── Makefile                         # Build automation
+
+## Linting & Formatting
+
+The project uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting. Configuration is in `pyproject.toml`.
+
+```bash
+make lint      # check for lint errors and formatting issues
+make format    # auto-fix formatting and lint violations
 ```

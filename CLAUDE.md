@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Server Benchmark is a Python tool for deploying and benchmarking LLM inference on GPU servers using vLLM. It provides a CLI for local and remote (SSH) deployment of models via Docker Compose, plus automated benchmarking across multiple servers.
+Deplodock is a Python tool for deploying and benchmarking LLM inference on GPU servers using vLLM. It provides a CLI for local and remote (SSH) deployment of models via Docker Compose, plus automated benchmarking across multiple servers.
 
 See `README.md` for full project structure, recipe format, and CLI usage.
 
 ## Prerequisites
 
-- Python 3.13+ with `venv`
+- Python 3.12+ with `venv`
 - `make setup` to create the virtual environment and install dependencies
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
@@ -50,14 +50,25 @@ pytest tests/test_recipe.py -v
 
 ## Contribution Instructions
 
-1. Create a feature branch from `main` (e.g. `feature/my-new-feature`)
-2. Write code following guidelines here, in `STYLE.md`, `README.md` and `ARCHITECTURE.md` files in respective folders
+IMPORTANT: You MUST follow ALL of these steps for EVERY code change. Do NOT skip any step.
+
+### Writing code
+
+1. Create a feature branch from `main` (e.g. `feature/my-new-feature`) — NEVER commit directly to `main`
+2. Write code following guidelines in `STYLE.md`, `README.md` and `ARCHITECTURE.md` files in respective folders
 3. Add tests if reasonable (in `tests/` following `tests/ARCHITECTURE.md` guidelines)
-4. Check if style changes were introduced and update `STYLE.md` if necessary
-5. Check if project setup, structure or usage patterns have changes and update `README.md` if necessary
-6. Check if general instructions in `CLAUDE.md` are still accurate and update if necessary
-7. Check for `ARCHITECTURE.md` files in directories that were updated and update them if necessary
-8. Run tests: `pytest tests/ -v`
-9. Run linter and format check: `make lint`
-10. Auto-fix formatting: `make format`
-11. Push and open a PR
+
+### Before committing (MANDATORY — do NOT skip these)
+
+You MUST complete ALL of the following checks before every commit. These are not optional:
+
+4. **Update `STYLE.md`** if any style changes were introduced — READ the current `STYLE.md` and compare
+5. **Update `README.md`** if project setup, structure, or usage patterns changed — READ the current `README.md` and compare
+6. **Update `CLAUDE.md`** if general instructions are no longer accurate — READ this file and compare
+7. **Update `ARCHITECTURE.md`** files in every directory that was modified — READ each relevant `ARCHITECTURE.md` and compare
+8. **Run tests**: `pytest tests/ -v` — fix any failures before proceeding
+9. **Run linter**: `make lint` — if it fails, run `make format` and re-check
+
+### Submitting
+
+10. Push and open a PR
