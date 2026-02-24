@@ -1,8 +1,8 @@
-"""GCP flex-start provider CLI handlers."""
+"""GCP provider CLI handlers."""
 
 import sys
 
-from deplodock.provisioning.gcp_flex_start import (
+from deplodock.provisioning.gcp import (
     # Re-export business logic for backward compatibility
     create_instance,
     delete_instance,
@@ -12,7 +12,7 @@ from deplodock.provisioning.gcp_flex_start import (
 
 
 def handle_create(args):
-    """CLI handler for 'vm create gcp-flex-start'."""
+    """CLI handler for 'vm create gcp'."""
     conn = create_instance(
         instance=args.instance,
         zone=args.zone,
@@ -35,7 +35,7 @@ def handle_create(args):
 
 
 def handle_delete(args):
-    """CLI handler for 'vm delete gcp-flex-start'."""
+    """CLI handler for 'vm delete gcp'."""
     success = delete_instance(
         instance=args.instance,
         zone=args.zone,
@@ -49,8 +49,8 @@ def handle_delete(args):
 
 
 def register_create_target(subparsers):
-    """Register the gcp-flex-start provider under 'vm create'."""
-    parser = subparsers.add_parser("gcp-flex-start", help="Create a GCP GPU VM")
+    """Register the gcp provider under 'vm create'."""
+    parser = subparsers.add_parser("gcp", help="Create a GCP GPU VM")
     parser.add_argument("--instance", required=True, help="GCP instance name")
     parser.add_argument("--zone", required=True, help="GCP zone (e.g. us-central1-a)")
     parser.add_argument("--machine-type", required=True, help="Machine type (e.g. a2-highgpu-1g)")
@@ -80,8 +80,8 @@ def register_create_target(subparsers):
 
 
 def register_delete_target(subparsers):
-    """Register the gcp-flex-start provider under 'vm delete'."""
-    parser = subparsers.add_parser("gcp-flex-start", help="Delete a GCP flex-start GPU VM")
+    """Register the gcp provider under 'vm delete'."""
+    parser = subparsers.add_parser("gcp", help="Delete a GCP GPU VM")
     parser.add_argument("--instance", required=True, help="GCP instance name")
     parser.add_argument("--zone", required=True, help="GCP zone (e.g. us-central1-a)")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")

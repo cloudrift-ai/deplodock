@@ -9,7 +9,7 @@ def register_vm_command(subparsers):
     from deplodock.commands.vm.cloudrift import (
         register_delete_target as register_cloudrift_delete,
     )
-    from deplodock.commands.vm.gcp_flex_start import register_create_target, register_delete_target
+    from deplodock.commands.vm.gcp import register_create_target, register_delete_target
 
     vm_parser = subparsers.add_parser("vm", help="Manage cloud VM instances")
 

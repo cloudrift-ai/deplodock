@@ -1,4 +1,4 @@
-"""GCP flex-start provider: create/delete GPU VMs using gcloud compute."""
+"""GCP provider: create/delete GPU VMs using gcloud compute."""
 
 import shlex
 import sys

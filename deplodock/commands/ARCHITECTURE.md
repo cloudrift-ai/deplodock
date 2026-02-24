@@ -44,7 +44,7 @@ VM lifecycle management and cloud provisioning.
 - `remote.py` — `provision_remote()` (install Docker, NVIDIA toolkit)
 - `cloud.py` — `resolve_vm_spec()`, `provision_cloud_vm()`, `delete_cloud_vm()`
 - `cloudrift.py` — CloudRift REST API provider
-- `gcp_flex_start.py` — GCP flex-start gcloud provider
+- `gcp.py` — GCP gcloud provider
 
 ### `deplodock/benchmark/` — Benchmark Library
 
@@ -133,10 +133,10 @@ deplodock
 +-- report       -- generate Excel reports from benchmark results
 +-- vm
     +-- create
-    |   +-- gcp-flex-start
+    |   +-- gcp
     |   +-- cloudrift
     +-- delete
-        +-- gcp-flex-start
+        +-- gcp
         +-- cloudrift
 ```
 
