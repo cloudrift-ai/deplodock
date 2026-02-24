@@ -42,6 +42,7 @@ pytest tests/test_recipe.py -v
 ## Key Make Targets
 
 - `make setup` — create venv and install dependencies (includes ruff)
+- `make test` — run `pytest` using the venv
 - `make lint` — run `ruff check` and `ruff format --check`
 - `make format` — auto-format code and fix lint violations
 - `make bench` — run benchmarks (`deplodock bench recipes/*`)
@@ -66,7 +67,7 @@ You MUST complete ALL of the following checks before every commit. These are not
 5. **Update `README.md`** if project setup, structure, or usage patterns changed — READ the current `README.md` and compare
 6. **Update `CLAUDE.md`** if general instructions are no longer accurate — READ this file and compare
 7. **Update `ARCHITECTURE.md`** files in every directory that was modified — READ each relevant `ARCHITECTURE.md` and compare
-8. **Run tests**: `pytest tests/ -v` — fix any failures before proceeding
+8. **Run tests**: `make test` — fix any failures before proceeding
 9. **Run linter**: `make lint` — if it fails, run `make format` and re-check
 
 ### Submitting
