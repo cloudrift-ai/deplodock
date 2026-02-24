@@ -8,7 +8,7 @@ def test_vm_create_dry_run(run_cli):
     rc, stdout, _ = run_cli(
         "vm",
         "create",
-        "gcp-flex-start",
+        "gcp",
         "--instance",
         "my-gpu-vm",
         "--zone",
@@ -30,7 +30,7 @@ def test_vm_create_dry_run_with_wait_ssh(run_cli):
     rc, stdout, _ = run_cli(
         "vm",
         "create",
-        "gcp-flex-start",
+        "gcp",
         "--instance",
         "my-gpu-vm",
         "--zone",
@@ -51,7 +51,7 @@ def test_vm_create_dry_run_with_gcloud_args(run_cli):
     rc, stdout, _ = run_cli(
         "vm",
         "create",
-        "gcp-flex-start",
+        "gcp",
         "--instance",
         "my-gpu-vm",
         "--zone",
@@ -71,7 +71,7 @@ def test_vm_create_dry_run_with_ssh_gateway(run_cli):
     rc, stdout, _ = run_cli(
         "vm",
         "create",
-        "gcp-flex-start",
+        "gcp",
         "--instance",
         "my-gpu-vm",
         "--zone",
@@ -91,7 +91,7 @@ def test_vm_delete_dry_run(run_cli):
     rc, stdout, _ = run_cli(
         "vm",
         "delete",
-        "gcp-flex-start",
+        "gcp",
         "--instance",
         "my-gpu-vm",
         "--zone",
@@ -112,7 +112,7 @@ def test_vm_create_missing_instance(run_cli):
     rc, _, stderr = run_cli(
         "vm",
         "create",
-        "gcp-flex-start",
+        "gcp",
         "--zone",
         "us-central1-a",
         "--machine-type",
@@ -126,7 +126,7 @@ def test_vm_create_missing_zone(run_cli):
     rc, _, stderr = run_cli(
         "vm",
         "create",
-        "gcp-flex-start",
+        "gcp",
         "--instance",
         "my-gpu-vm",
         "--machine-type",
@@ -140,7 +140,7 @@ def test_vm_create_missing_machine_type(run_cli):
     rc, _, stderr = run_cli(
         "vm",
         "create",
-        "gcp-flex-start",
+        "gcp",
         "--instance",
         "my-gpu-vm",
         "--zone",
@@ -163,11 +163,11 @@ def test_vm_help(run_cli):
 def test_vm_create_help(run_cli):
     rc, stdout, _ = run_cli("vm", "create", "--help")
     assert rc == 0
-    assert "gcp-flex-start" in stdout
+    assert "gcp" in stdout
 
 
-def test_vm_create_gcp_flex_start_help(run_cli):
-    rc, stdout, _ = run_cli("vm", "create", "gcp-flex-start", "--help")
+def test_vm_create_gcp_help(run_cli):
+    rc, stdout, _ = run_cli("vm", "create", "gcp", "--help")
     assert rc == 0
     assert "--instance" in stdout
     assert "--zone" in stdout
@@ -181,8 +181,8 @@ def test_vm_create_gcp_flex_start_help(run_cli):
     assert "--ssh-gateway" in stdout
 
 
-def test_vm_delete_gcp_flex_start_help(run_cli):
-    rc, stdout, _ = run_cli("vm", "delete", "gcp-flex-start", "--help")
+def test_vm_delete_gcp_help(run_cli):
+    rc, stdout, _ = run_cli("vm", "delete", "gcp", "--help")
     assert rc == 0
     assert "--instance" in stdout
     assert "--zone" in stdout

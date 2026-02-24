@@ -34,9 +34,9 @@ pytest tests/test_recipe.py -v
 - `deplodock deploy cloud ...` — provision a cloud VM and deploy via SSH
 - `deplodock bench recipes/* ...` — deploy + benchmark + teardown on cloud VMs (recipe dirs as positional args)
 - `deplodock report ...` — generate Excel reports from benchmark results
-- `deplodock vm create gcp-flex-start ...` — create a GCP flex-start GPU VM
+- `deplodock vm create gcp ...` — create a GCP GPU VM
 - `deplodock vm create cloudrift ...` — create a CloudRift GPU VM
-- `deplodock vm delete gcp-flex-start ...` — delete a GCP flex-start GPU VM
+- `deplodock vm delete gcp ...` — delete a GCP GPU VM
 - `deplodock vm delete cloudrift ...` — delete a CloudRift GPU VM
 
 ## Key Make Targets

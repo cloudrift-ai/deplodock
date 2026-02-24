@@ -1,6 +1,6 @@
-"""Unit tests for GCP flex-start command builders."""
+"""Unit tests for GCP command builders."""
 
-from deplodock.provisioning.gcp_flex_start import (
+from deplodock.provisioning.gcp import (
     _gcloud_create_cmd,
     _gcloud_delete_cmd,
     _gcloud_external_ip_cmd,

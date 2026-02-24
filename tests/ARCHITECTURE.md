@@ -25,7 +25,7 @@ tests/
 ├── provisioning/
 │   ├── test_cloud.py        # resolve_vm_spec(), delete_cloud_vm(), VMConnectionInfo
 │   ├── test_cloudrift.py    # CloudRift API helpers
-│   ├── test_gcp_flex_start.py  # GCP command builders
+│   ├── test_gcp.py             # GCP command builders
 │   └── test_vm_dryrun.py    # vm create/delete CLI dry-run
 └── report/
     └── test_report.py       # collect_tasks_from_manifests(), parse_benchmark_result()
@@ -49,7 +49,7 @@ Test individual functions in isolation with synthetic inputs.
 | `benchmark/test_manifest.py` | `deplodock.benchmark.write_manifest()`, `read_manifest()` — round-trip serialization |
 | `report/test_report.py` | `deplodock.report.collect_tasks_from_manifests()`, `parse_benchmark_result()` — manifest-based report data collection |
 | `provisioning/test_cloudrift.py` | `deplodock.provisioning.cloudrift._api_request()`, `_rent_instance()`, etc. — CloudRift API helpers |
-| `provisioning/test_gcp_flex_start.py` | `deplodock.provisioning.gcp_flex_start._gcloud_*_cmd()` — GCP command builders |
+| `provisioning/test_gcp.py` | `deplodock.provisioning.gcp._gcloud_*_cmd()` — GCP command builders |
 
 Unit tests use **fixtures from `conftest.py`** (`tmp_recipe_dir`, `sample_config`, `sample_config_multi`) to supply pre-built recipe directories and config dicts.
 
@@ -62,7 +62,7 @@ Test the full CLI pipeline end-to-end by invoking `deplodock` as a subprocess wi
 | `deploy/test_deploy_dryrun.py` | `deploy ssh`, `deploy local` — dry-run output, command sequence, variant resolution, teardown, CLI help |
 | `deploy/test_deploy_cloud_dryrun.py` | `deploy cloud` — dry-run output, deploy steps, error handling, CLI help |
 | `benchmark/test_bench_dryrun.py` | `bench` — dry-run output, deploy->benchmark->teardown sequence, variant filtering, CLI help |
-| `provisioning/test_vm_dryrun.py` | `vm create/delete gcp-flex-start`, `vm create/delete cloudrift` — dry-run output, argparse validation, CLI help |
+| `provisioning/test_vm_dryrun.py` | `vm create/delete gcp`, `vm create/delete cloudrift` — dry-run output, argparse validation, CLI help |
 
 CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench_config`** (a factory for temporary `config.yaml` files). Both are defined in `conftest.py`.
 

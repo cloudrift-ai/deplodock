@@ -11,7 +11,7 @@ Tools for deploying and benchmarking LLM inference on GPU servers.
     - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
     - [bench/](deplodock/commands/bench/) — `bench` command
     - [report/](deplodock/commands/report/) — `report` command
-    - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP flex-start, CloudRift)
+    - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
   - [deploy/](deplodock/deploy/) — Deploy library (recipe loading, compose generation, orchestration)
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
   - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
@@ -179,15 +179,15 @@ deplodock deploy cloud --recipe <path> --variant <name> [--name <vm-name>] [--dr
 
 ## VM Management
 
-The `vm` command manages cloud GPU VM lifecycles. Supports GCP flex-start and CloudRift providers. Instances are ephemeral — `delete` removes them entirely.
+The `vm` command manages cloud GPU VM lifecycles. Supports GCP and CloudRift providers. Instances are ephemeral — `delete` removes them entirely.
 
-### GCP Flex-Start
+### GCP
 
 ```bash
-deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type a2-highgpu-1g
-deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --wait-ssh
-deplodock vm create gcp-flex-start --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --gcloud-args "--no-service-account --no-scopes" --dry-run
-deplodock vm delete gcp-flex-start --instance my-gpu-vm --zone us-central1-a
+deplodock vm create gcp --instance my-gpu-vm --zone us-central1-a --machine-type a2-highgpu-1g
+deplodock vm create gcp --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --wait-ssh
+deplodock vm create gcp --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --gcloud-args "--no-service-account --no-scopes" --dry-run
+deplodock vm delete gcp --instance my-gpu-vm --zone us-central1-a
 ```
 
 #### GCP Create Flags

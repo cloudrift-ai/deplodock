@@ -10,7 +10,7 @@ import shlex
 
 from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
 from deplodock.provisioning import cloudrift as cr_provider
-from deplodock.provisioning import gcp_flex_start as gcp_provider
+from deplodock.provisioning import gcp as gcp_provider
 
 
 def resolve_vm_spec(loaded_configs, server_name=None):

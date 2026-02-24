@@ -19,7 +19,7 @@ help:
 setup:
 	@if [ ! -d "venv" ]; then \
 		echo "Creating virtual environment..."; \
-		python3 -m venv venv; \
+		python3.12 -m venv venv; \
 		echo "Installing Python dependencies..."; \
 		./venv/bin/pip install -e ".[dev]"; \
 		echo "✅ Setup complete!"; \
