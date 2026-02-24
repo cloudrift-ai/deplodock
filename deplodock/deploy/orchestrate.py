@@ -74,6 +74,8 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
     rc, _, _ = run_cmd("docker compose up -d --wait --wait-timeout 1800")
     if rc != 0:
         print("Failed to start services", file=sys.stderr)
+        print("Container logs:", file=sys.stderr)
+        run_cmd("docker compose logs --tail=100")
         return False
 
     # Step 5: Poll health
