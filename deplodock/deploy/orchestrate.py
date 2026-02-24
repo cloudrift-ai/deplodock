@@ -9,14 +9,14 @@ from deplodock.deploy.compose import (
     generate_nginx_conf,
 )
 from deplodock.deploy.params import DeployParams
-from deplodock.deploy.ssh import make_run_cmd, make_write_file
+from deplodock.provisioning.ssh_transport import make_run_cmd, make_write_file
 
 
 def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=False):
     """Shared deploy orchestration.
 
     Args:
-        run_cmd: callable(command, stream=True) -> (returncode, stdout)
+        run_cmd: callable(command, stream=True) -> (returncode, stdout, stderr)
         write_file: callable(path, content) -> None - writes file to target
         config: resolved recipe config dict
         model_dir: model cache directory path
@@ -43,7 +43,7 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=F
 
     # Step 1: Pull images
     print("Pulling images...")
-    rc, _ = run_cmd("docker compose pull")
+    rc, _, _ = run_cmd("docker compose pull")
     if rc != 0:
         print("Failed to pull images", file=sys.stderr)
         return False
@@ -59,7 +59,7 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=F
         f" {image}"
         f" -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
     )
-    rc, _ = run_cmd(dl_cmd)
+    rc, _, _ = run_cmd(dl_cmd)
     if rc != 0:
         print("Failed to download model", file=sys.stderr)
         return False
@@ -70,7 +70,7 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=F
 
     # Step 4: Start services
     print("Starting services...")
-    rc, _ = run_cmd("docker compose up -d --wait --wait-timeout 1800")
+    rc, _, _ = run_cmd("docker compose up -d --wait --wait-timeout 1800")
     if rc != 0:
         print("Failed to start services", file=sys.stderr)
         return False
@@ -82,7 +82,7 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=F
     interval = 10
     elapsed = 0
     while elapsed < timeout:
-        rc, _ = run_cmd(f"curl -sf {health_url}", stream=False)
+        rc, _, _ = run_cmd(f"curl -sf {health_url}", stream=False)
         if rc == 0:
             break
         if dry_run:
@@ -108,7 +108,7 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=F
             f" -H 'Content-Type: application/json'"
             f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"Say hello"}}],"max_tokens":16}}' '''
         )
-        rc, _ = run_cmd(smoke_cmd, stream=False)
+        rc, _, _ = run_cmd(smoke_cmd, stream=False)
         if rc == 0:
             print("Smoke test passed.")
         else:
@@ -132,7 +132,7 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=F
 def run_teardown(run_cmd):
     """Tear down: docker compose down."""
     print("Tearing down...")
-    rc, _ = run_cmd("docker compose down")
+    rc, _, _ = run_cmd("docker compose down")
     if rc == 0:
         print("Teardown complete.")
     else:

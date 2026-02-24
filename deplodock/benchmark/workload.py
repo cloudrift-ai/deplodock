@@ -68,5 +68,5 @@ def run_benchmark_workload(run_cmd, recipe_config, dry_run=False):
         f"'"
     )
 
-    rc, output = run_cmd(bench_cmd, stream=False)
+    rc, output, _ = run_cmd(bench_cmd, stream=False)
     return rc == 0, output

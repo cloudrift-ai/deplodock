@@ -11,7 +11,7 @@ def make_run_cmd(deploy_dir, dry_run=False):
     def run_cmd(command, stream=True):
         if dry_run:
             print(f"[dry-run] {command}")
-            return 0, ""
+            return 0, "", ""
 
         try:
             result = subprocess.run(
@@ -24,10 +24,11 @@ def make_run_cmd(deploy_dir, dry_run=False):
                 stderr=None if stream else subprocess.PIPE,
             )
             stdout = "" if stream else (result.stdout or "")
-            return result.returncode, stdout
+            stderr = "" if stream else (result.stderr or "")
+            return result.returncode, stdout, stderr
         except Exception as e:
             print(f"Error running command: {e}", file=sys.stderr)
-            return 1, ""
+            return 1, "", ""
 
     return run_cmd
 

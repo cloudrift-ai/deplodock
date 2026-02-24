@@ -2,16 +2,7 @@
 
 import subprocess
 
-
-def ssh_base_args(server, ssh_key, ssh_port):
-    """Build base SSH arguments."""
-    args = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
-    if ssh_key:
-        args += ["-i", ssh_key]
-    if ssh_port and ssh_port != 22:
-        args += ["-p", str(ssh_port)]
-    args.append(server)
-    return args
+from deplodock.provisioning.ssh_transport import ssh_base_args
 
 
 def provision_remote(server, ssh_key, ssh_port, dry_run=False):

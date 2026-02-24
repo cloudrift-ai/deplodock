@@ -1,8 +1,9 @@
 """Provider-agnostic SSH readiness polling."""
 
-import subprocess
 import sys
 import time
+
+from deplodock.provisioning.ssh_transport import ssh_base_args
 
 
 def wait_for_ssh(host, username, ssh_port, ssh_key_path, timeout=120, interval=5):
@@ -13,16 +14,17 @@ def wait_for_ssh(host, username, ssh_port, ssh_key_path, timeout=120, interval=5
     Returns:
         True if SSH connected, False on timeout.
     """
+    import subprocess
+
     address = f"{username}@{host}" if username else host
     elapsed = 0
     while elapsed < timeout:
-        rc = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-             "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-             "-i", ssh_key_path, "-p", str(ssh_port),
-             address, "true"],
-            capture_output=True,
-        ).returncode
+        args = ssh_base_args(address, ssh_key_path, ssh_port)
+        # Add ConnectTimeout for fast failure during polling
+        args.insert(-1, "-o")
+        args.insert(-1, "ConnectTimeout=5")
+        args.append("true")
+        rc = subprocess.run(args, capture_output=True).returncode
         if rc == 0:
             return True
         time.sleep(interval)
