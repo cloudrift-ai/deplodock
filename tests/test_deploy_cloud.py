@@ -5,8 +5,8 @@ import os
 import pytest
 import yaml
 
-from deplodock.commands.deploy.cloud import resolve_vm_spec, delete_cloud_vm
-from deplodock.commands.vm.types import VMConnectionInfo
+from deplodock.provisioning.cloud import resolve_vm_spec, delete_cloud_vm
+from deplodock.provisioning.types import VMConnectionInfo
 
 
 # ── resolve_vm_spec ──────────────────────────────────────────────

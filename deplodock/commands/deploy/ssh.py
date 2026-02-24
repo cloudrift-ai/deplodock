@@ -1,160 +1,16 @@
-"""SSH deploy target: runs commands via SSH + SCP."""
+"""SSH deploy target CLI handler."""
 
 import os
-import subprocess
 import sys
-import tempfile
 
-from deplodock.commands.deploy import (
+from deplodock.deploy import (
     DeployParams,
     deploy as deploy_entry,
     load_recipe,
-    run_deploy,
-    run_teardown,
     teardown as teardown_entry,
 )
-
-
-REMOTE_DEPLOY_DIR = "~/deploy"
-
-
-def ssh_base_args(server, ssh_key, ssh_port):
-    """Build base SSH arguments."""
-    args = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
-    if ssh_key:
-        args += ["-i", ssh_key]
-    if ssh_port and ssh_port != 22:
-        args += ["-p", str(ssh_port)]
-    args.append(server)
-    return args
-
-
-def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
-    """Create a run_cmd callable for SSH execution."""
-
-    def run_cmd(command, stream=True):
-        # Use sg to run docker commands under the docker group
-        if command.strip().startswith("docker"):
-            escaped = command.replace('"', '\\"')
-            full_cmd = f'sg docker -c "cd {REMOTE_DEPLOY_DIR} && {escaped}"'
-        else:
-            full_cmd = f"cd {REMOTE_DEPLOY_DIR} && {command}"
-        if dry_run:
-            print(f"[dry-run] ssh {server}: {full_cmd}")
-            return 0, ""
-
-        ssh_args = ssh_base_args(server, ssh_key, ssh_port)
-        ssh_args.append(full_cmd)
-
-        try:
-            result = subprocess.run(
-                ssh_args,
-                text=True,
-                stdout=None if stream else subprocess.PIPE,
-                stderr=None if stream else subprocess.PIPE,
-            )
-            stdout = "" if stream else (result.stdout or "")
-            return result.returncode, stdout
-        except Exception as e:
-            print(f"Error running SSH command: {e}", file=sys.stderr)
-            return 1, ""
-
-    return run_cmd
-
-
-def scp_file(local_path, server, ssh_key, ssh_port, remote_path):
-    """Copy a file to the remote server via SCP."""
-    scp_args = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
-    if ssh_key:
-        scp_args += ["-i", ssh_key]
-    if ssh_port and ssh_port != 22:
-        scp_args += ["-P", str(ssh_port)]
-    scp_args += [local_path, f"{server}:{remote_path}"]
-
-    result = subprocess.run(scp_args, capture_output=True, text=True)
-    return result.returncode
-
-
-def make_write_file(server, ssh_key, ssh_port, dry_run=False):
-    """Create a write_file callable that SCPs files to the remote server."""
-
-    def write_file(path, content):
-        remote_path = f"{REMOTE_DEPLOY_DIR}/{path}"
-        if dry_run:
-            print(f"[dry-run] scp {path} -> {server}:{remote_path}")
-            return
-
-        # Write to a temp file locally, then SCP
-        with tempfile.NamedTemporaryFile(mode="w", suffix=f"_{path}", delete=False) as f:
-            f.write(content)
-            tmp_path = f.name
-
-        try:
-            rc = scp_file(tmp_path, server, ssh_key, ssh_port, remote_path)
-            if rc != 0:
-                print(f"Failed to SCP {path} to {server}:{remote_path}", file=sys.stderr)
-        finally:
-            os.unlink(tmp_path)
-
-    return write_file
-
-
-def provision_remote(server, ssh_key, ssh_port, dry_run=False):
-    """Ensure the remote server is ready for deployment.
-
-    Steps (each checks before installing):
-    1. Create ~/deploy directory
-    2. Install Docker if not found
-    3. Install NVIDIA Container Toolkit if not found
-    4. Add user to docker group
-    """
-    def _run_ssh(command, capture=False):
-        args = ssh_base_args(server, ssh_key, ssh_port)
-        args.append(command)
-        result = subprocess.run(args, capture_output=True, text=True)
-        if capture:
-            return result.returncode, result.stdout.strip()
-        return result.returncode, ""
-
-    # 1. Create deploy directory
-    if dry_run:
-        print(f"[dry-run] ssh {server}: mkdir -p {REMOTE_DEPLOY_DIR}")
-    else:
-        _run_ssh(f"mkdir -p {REMOTE_DEPLOY_DIR}")
-
-    # 2. Install Docker if not found
-    if dry_run:
-        print(f"[dry-run] ssh {server}: install docker (if not present)")
-    else:
-        rc, _ = _run_ssh("command -v docker", capture=True)
-        if rc != 0:
-            print("Installing Docker...")
-            _run_ssh("curl -fsSL https://get.docker.com | sudo sh")
-
-    # 3. Install NVIDIA Container Toolkit if not found
-    if dry_run:
-        print(f"[dry-run] ssh {server}: install nvidia-container-toolkit (if not present)")
-    else:
-        rc, _ = _run_ssh("command -v nvidia-ctk", capture=True)
-        if rc != 0:
-            print("Installing NVIDIA Container Toolkit...")
-            _run_ssh(
-                "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey"
-                " | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
-                " && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list"
-                " | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g'"
-                " | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"
-                " && sudo apt-get update"
-                " && sudo apt-get install -y nvidia-container-toolkit"
-                " && sudo nvidia-ctk runtime configure --runtime=docker"
-                " && sudo systemctl restart docker"
-            )
-
-    # 4. Add user to docker group
-    if dry_run:
-        print(f"[dry-run] ssh {server}: add user to docker group")
-    else:
-        _run_ssh("groups | grep -q docker || sudo usermod -aG docker $(whoami)")
+from deplodock.deploy.ssh import make_run_cmd, make_write_file, scp_file, ssh_base_args, REMOTE_DEPLOY_DIR
+from deplodock.provisioning.remote import provision_remote
 
 
 def handle_ssh(args):

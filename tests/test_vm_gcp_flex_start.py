@@ -1,6 +1,6 @@
 """Unit tests for GCP flex-start command builders."""
 
-from deplodock.commands.vm.gcp_flex_start import (
+from deplodock.provisioning.gcp_flex_start import (
     _gcloud_create_cmd,
     _gcloud_delete_cmd,
     _gcloud_status_cmd,

@@ -37,13 +37,19 @@ def load_recipe(recipe_dir, variant=None):
 Use `Args:` / `Returns:` sections only when parameters or return values
 are non-obvious.
 
+### Module Structure
+
+- `__init__.py` files contain only re-exports. No classes, functions, or business logic.
+- Business logic goes in named modules (e.g., `recipe.py`, `compose.py`).
+- `commands/` layer: CLI code only (argparse registration + `handle_*` handlers). Reusable logic lives in top-level domain packages (`deplodock/deploy/`, `deplodock/provisioning/`, `deplodock/benchmark/`, `deplodock/report/`).
+
 ### Imports
 
 Group imports in this order, separated by blank lines:
 
 1. Standard library (`os`, `sys`, `subprocess`, etc.)
 2. Third-party packages (`yaml`, `pandas`, `pytest`)
-3. Local imports (`from commands.deploy import ...`)
+3. Local imports (`from deplodock.deploy import ...`)
 
 ### Formatting
 

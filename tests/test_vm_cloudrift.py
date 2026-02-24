@@ -6,7 +6,7 @@ Response fixtures are captured from real CloudRift API calls.
 import json
 from unittest.mock import patch, MagicMock
 
-from deplodock.commands.vm.cloudrift import (
+from deplodock.provisioning.cloudrift import (
     _api_request,
     _rent_instance,
     _terminate_instance,
@@ -98,7 +98,7 @@ TERMINATE_RESPONSE = {
 # ── _api_request ──────────────────────────────────────────────────
 
 
-@patch("deplodock.commands.vm.cloudrift.requests.request")
+@patch("deplodock.provisioning.cloudrift.requests.request")
 def test_api_request_sends_correct_payload(mock_req):
     mock_resp = MagicMock()
     mock_resp.json.return_value = {"version": "2025-02-10", "data": {"ok": True}}
@@ -129,7 +129,7 @@ def test_api_request_dry_run(capsys):
 # ── _rent_instance ────────────────────────────────────────────────
 
 
-@patch("deplodock.commands.vm.cloudrift._api_request")
+@patch("deplodock.provisioning.cloudrift._api_request")
 def test_rent_instance_payload(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
@@ -150,7 +150,7 @@ def test_rent_instance_payload(mock_api):
     assert result["instance_ids"] == ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]
 
 
-@patch("deplodock.commands.vm.cloudrift._api_request")
+@patch("deplodock.provisioning.cloudrift._api_request")
 def test_rent_instance_no_ports(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
@@ -164,7 +164,7 @@ def test_rent_instance_no_ports(mock_api):
 # ── _terminate_instance ───────────────────────────────────────────
 
 
-@patch("deplodock.commands.vm.cloudrift._api_request")
+@patch("deplodock.provisioning.cloudrift._api_request")
 def test_terminate_instance_payload(mock_api):
     mock_api.return_value = TERMINATE_RESPONSE
 
@@ -180,7 +180,7 @@ def test_terminate_instance_payload(mock_api):
 # ── _get_instance_info ────────────────────────────────────────────
 
 
-@patch("deplodock.commands.vm.cloudrift._api_request")
+@patch("deplodock.provisioning.cloudrift._api_request")
 def test_get_instance_info_found(mock_api):
     mock_api.return_value = INSTANCE_ACTIVE_RESPONSE
 
@@ -192,7 +192,7 @@ def test_get_instance_info_found(mock_api):
     assert call_data == {"selector": {"ById": ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]}}
 
 
-@patch("deplodock.commands.vm.cloudrift._api_request")
+@patch("deplodock.provisioning.cloudrift._api_request")
 def test_get_instance_info_not_found(mock_api):
     mock_api.return_value = {"instances": []}
 
@@ -203,7 +203,7 @@ def test_get_instance_info_not_found(mock_api):
 # ── _list_ssh_keys / _add_ssh_key ─────────────────────────────────
 
 
-@patch("deplodock.commands.vm.cloudrift._api_request")
+@patch("deplodock.provisioning.cloudrift._api_request")
 def test_list_ssh_keys(mock_api):
     mock_api.return_value = SSH_KEYS_LIST_RESPONSE
 
@@ -213,7 +213,7 @@ def test_list_ssh_keys(mock_api):
     assert len(result["keys"]) == 2
 
 
-@patch("deplodock.commands.vm.cloudrift._api_request")
+@patch("deplodock.provisioning.cloudrift._api_request")
 def test_add_ssh_key(mock_api):
     mock_api.return_value = {"ssh_key": {"id": "key-new"}}
 
@@ -230,8 +230,8 @@ def test_add_ssh_key(mock_api):
 # ── _ensure_ssh_key ───────────────────────────────────────────────
 
 
-@patch("deplodock.commands.vm.cloudrift._add_ssh_key")
-@patch("deplodock.commands.vm.cloudrift._list_ssh_keys")
+@patch("deplodock.provisioning.cloudrift._add_ssh_key")
+@patch("deplodock.provisioning.cloudrift._list_ssh_keys")
 def test_ensure_ssh_key_already_registered(mock_list, mock_add, tmp_path):
     key_file = tmp_path / "id_ed25519.pub"
     key_file.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID37 user@example.com\n")
@@ -244,8 +244,8 @@ def test_ensure_ssh_key_already_registered(mock_list, mock_add, tmp_path):
     mock_add.assert_not_called()
 
 
-@patch("deplodock.commands.vm.cloudrift._add_ssh_key")
-@patch("deplodock.commands.vm.cloudrift._list_ssh_keys")
+@patch("deplodock.provisioning.cloudrift._add_ssh_key")
+@patch("deplodock.provisioning.cloudrift._list_ssh_keys")
 def test_ensure_ssh_key_registers_new(mock_list, mock_add, tmp_path):
     key_file = tmp_path / "id_ed25519.pub"
     key_file.write_text("ssh-ed25519 BBBB test@host\n")

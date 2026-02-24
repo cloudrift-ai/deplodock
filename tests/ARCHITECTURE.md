@@ -12,15 +12,17 @@ Test individual functions in isolation with synthetic inputs.
 
 | File | Covers |
 |------|--------|
-| `test_recipe.py` | `load_recipe()`, `deep_merge()` — recipe loading, variant resolution, YAML parsing |
-| `test_compose.py` | `generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `_gpu_device_ids` support |
-| `test_deploy_cloud.py` | `resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud deploy bridge unit tests |
+| `test_recipe.py` | `deplodock.deploy.load_recipe()`, `deep_merge()` — recipe loading, variant resolution, YAML parsing |
+| `test_compose.py` | `deplodock.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `_gpu_device_ids` support |
+| `test_deploy_cloud.py` | `deplodock.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud provisioning unit tests |
 | `test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`), grouping logic, sorting |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
-| `benchmark/test_code_hash.py` | `compute_code_hash()` — determinism, hex format |
-| `benchmark/test_run_dir.py` | `create_run_dir()` — directory creation, naming format |
-| `benchmark/test_manifest.py` | `write_manifest()`, `read_manifest()` — round-trip serialization |
-| `report/test_report.py` | `_collect_tasks_from_manifests()`, `parse_benchmark_result()` — manifest-based report data collection |
+| `benchmark/test_code_hash.py` | `deplodock.benchmark.compute_code_hash()` — determinism, hex format |
+| `benchmark/test_run_dir.py` | `deplodock.benchmark.create_run_dir()` — directory creation, naming format |
+| `benchmark/test_manifest.py` | `deplodock.benchmark.write_manifest()`, `read_manifest()` — round-trip serialization |
+| `report/test_report.py` | `deplodock.report.collect_tasks_from_manifests()`, `parse_benchmark_result()` — manifest-based report data collection |
+| `test_vm_cloudrift.py` | `deplodock.provisioning.cloudrift._api_request()`, `_rent_instance()`, etc. — CloudRift API helpers |
+| `test_vm_gcp_flex_start.py` | `deplodock.provisioning.gcp_flex_start._gcloud_*_cmd()` — GCP command builders |
 
 Unit tests use **fixtures from `conftest.py`** (`tmp_recipe_dir`, `sample_config`, `sample_config_multi`) to supply pre-built recipe directories and config dicts.
 
@@ -32,8 +34,7 @@ Test the full CLI pipeline end-to-end by invoking `deplodock` as a subprocess wi
 |------|--------|
 | `test_deploy_dryrun.py` | `deploy ssh`, `deploy local` — dry-run output, command sequence, variant resolution, teardown, CLI help |
 | `test_deploy_cloud_dryrun.py` | `deploy cloud` — dry-run output, deploy steps, error handling, CLI help |
-| `test_bench_dryrun.py` | `bench` — dry-run output, deploy→benchmark→teardown sequence, variant filtering, CLI help |
-| `test_vm_gcp_flex_start.py` | `_gcloud_*_cmd()` — GCP flex-start command builder functions (create, delete, status, IP, SSH) |
+| `test_bench_dryrun.py` | `bench` — dry-run output, deploy->benchmark->teardown sequence, variant filtering, CLI help |
 | `test_vm_dryrun.py` | `vm create/delete gcp-flex-start`, `vm create/delete cloudrift` — dry-run output, argparse validation, CLI help |
 
 CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench_config`** (a factory for temporary `config.yaml` files). Both are defined in `conftest.py`.
