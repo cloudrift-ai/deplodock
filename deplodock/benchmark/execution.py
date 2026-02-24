@@ -30,7 +30,7 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str, run_d
     """Run all benchmark tasks for one execution group.
 
     Provisions a VM with group.gpu_count GPUs, then runs each task.
-    Tasks with fewer GPUs than the group get _gpu_device_ids set.
+    Tasks with fewer GPUs than the group get gpu_device_ids set.
 
     Returns a list of task metadata dicts for manifest assembly.
     """
@@ -65,7 +65,7 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str, run_d
         provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
 
         for task in group.tasks:
-            recipe_config = task.recipe_config
+            recipe = task.recipe
             model_name = task.model_name
             result_path = task.result_path(run_dir)
 
@@ -76,18 +76,17 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str, run_d
             task_logger.info(f"Recipe: {task.recipe_dir} (variant: {task.variant})")
 
             # Set GPU device IDs if task needs fewer GPUs than group
-            if task.gpu_count < group.gpu_count:
-                recipe_config = dict(recipe_config)
-                recipe_config["_gpu_device_ids"] = list(range(task.gpu_count))
+            gpu_device_ids = list(range(task.gpu_count)) if task.gpu_count < group.gpu_count else None
 
             params = DeployParams(
                 server=conn.address,
                 ssh_key=ssh_key,
                 ssh_port=conn.ssh_port,
-                recipe_config=recipe_config,
+                recipe=recipe,
                 model_dir=model_dir,
                 hf_token=hf_token,
                 dry_run=dry_run,
+                gpu_device_ids=gpu_device_ids,
             )
             task_logger.info("Deploying model...")
             success = deploy_entry(params)
@@ -101,7 +100,7 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str, run_d
             run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
             bench_success, output = run_benchmark_workload(
                 run_cmd,
-                recipe_config,
+                recipe,
                 dry_run=dry_run,
             )
 

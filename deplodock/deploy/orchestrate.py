@@ -10,28 +10,29 @@ from deplodock.deploy.compose import (
 )
 from deplodock.deploy.params import DeployParams
 from deplodock.provisioning.ssh_transport import make_run_cmd, make_write_file
+from deplodock.recipe.types import Recipe
 
 
-def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=False):
+def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, dry_run=False, gpu_device_ids=None):
     """Shared deploy orchestration.
 
     Args:
         run_cmd: callable(command, stream=True) -> (returncode, stdout, stderr)
         write_file: callable(path, content) -> None - writes file to target
-        config: resolved recipe config dict
+        recipe: resolved Recipe dataclass
         model_dir: model cache directory path
         hf_token: HuggingFace token
         host: hostname/IP for endpoint display
         dry_run: if True, skip sleep in health polling
+        gpu_device_ids: optional list of GPU device IDs to restrict visibility
     """
-    num_instances = calculate_num_instances(config)
-    config["_num_instances"] = num_instances
+    num_instances = calculate_num_instances(recipe)
 
-    model_name = config["model"]["name"]
-    image = config["backend"]["vllm"].get("image", "vllm/vllm-openai:latest")
+    model_name = recipe.model_name
+    image = recipe.engine.llm.image
 
     # Generate and write compose file
-    compose_content = generate_compose(config, model_dir, hf_token)
+    compose_content = generate_compose(recipe, model_dir, hf_token, num_instances=num_instances, gpu_device_ids=gpu_device_ids)
     write_file("docker-compose.yaml", compose_content)
 
     # Generate and write nginx config if multi-instance
@@ -145,7 +146,16 @@ def deploy(params: DeployParams) -> bool:
     run_cmd = make_run_cmd(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
     write_file = make_write_file(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
     host = params.server.split("@")[-1] if "@" in params.server else params.server
-    return run_deploy(run_cmd, write_file, params.recipe_config, params.model_dir, params.hf_token, host, params.dry_run)
+    return run_deploy(
+        run_cmd,
+        write_file,
+        params.recipe,
+        params.model_dir,
+        params.hf_token,
+        host,
+        params.dry_run,
+        gpu_device_ids=params.gpu_device_ids,
+    )
 
 
 def teardown(params: DeployParams) -> bool:

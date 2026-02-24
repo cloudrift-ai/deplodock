@@ -1,28 +1,11 @@
-"""Deploy command layer — re-exports from deplodock.deploy for backward compatibility."""
+"""Deploy command layer — registers deploy subcommands."""
 
-from deplodock.deploy.compose import (
-    calculate_num_instances,
-    generate_compose,
-    generate_nginx_conf,
-)
-from deplodock.deploy.orchestrate import (
-    deploy,
-    run_deploy,
-    run_teardown,
-    teardown,
-)
-from deplodock.deploy.params import DeployParams
-from deplodock.deploy.recipe import deep_merge, load_recipe
+from deplodock.commands.deploy.cloud import register_cloud_target
+from deplodock.commands.deploy.local import register_local_target
+from deplodock.commands.deploy.ssh import register_ssh_target
 
 __all__ = [
-    "DeployParams",
-    "deep_merge",
-    "load_recipe",
-    "calculate_num_instances",
-    "generate_compose",
-    "generate_nginx_conf",
-    "run_deploy",
-    "run_teardown",
-    "deploy",
-    "teardown",
+    "register_cloud_target",
+    "register_local_target",
+    "register_ssh_target",
 ]

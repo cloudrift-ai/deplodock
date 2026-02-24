@@ -3,8 +3,9 @@
 import os
 import sys
 
-from deplodock.deploy import load_recipe, run_deploy, run_teardown
+from deplodock.deploy import run_deploy, run_teardown
 from deplodock.deploy.local import make_run_cmd, make_write_file
+from deplodock.recipe import load_recipe
 
 
 def handle_local(args):
@@ -25,12 +26,12 @@ def handle_local(args):
     if teardown:
         return run_teardown(run_cmd)
 
-    config = load_recipe(recipe_dir, variant=variant)
+    recipe = load_recipe(recipe_dir, variant=variant)
 
     success = run_deploy(
         run_cmd=run_cmd,
         write_file=write_file,
-        config=config,
+        recipe=recipe,
         model_dir=model_dir,
         hf_token=hf_token,
         host="localhost",

@@ -1,14 +1,15 @@
 model:
-  name: "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
+  huggingface: "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
 
-backend:
-  vllm:
-    image: "vllm/vllm-openai:latest"
+engine:
+  llm:
     tensor_parallel_size: 1
     pipeline_parallel_size: 2
     gpu_memory_utilization: 0.9
     context_length: 8192
-    extra_args: "--kv-cache-dtype fp8"
+    vllm:
+      image: "vllm/vllm-openai:latest"
+      extra_args: "--kv-cache-dtype fp8"
 
 benchmark:
   max_concurrency: 128
@@ -26,12 +27,12 @@ variants:
   2xL40S:
     gpu: "NVIDIA L40S"
     gpu_count: 2
-    backend:
-      vllm:
+    engine:
+      llm:
         pipeline_parallel_size: 1
   Pro6000:
     gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
     gpu_count: 1
-    backend:
-      vllm:
+    engine:
+      llm:
         pipeline_parallel_size: 1

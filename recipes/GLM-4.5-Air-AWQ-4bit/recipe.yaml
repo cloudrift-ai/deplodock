@@ -1,15 +1,16 @@
 model:
-  name: "cpatonn/GLM-4.5-Air-AWQ-4bit"
+  huggingface: "cpatonn/GLM-4.5-Air-AWQ-4bit"
 
-backend:
-  vllm:
-    image: "vllm/vllm-openai:latest"
+engine:
+  llm:
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     context_length: 16384
     max_concurrent_requests: 256
-    extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --kv-cache-dtype fp8"
+    vllm:
+      image: "vllm/vllm-openai:latest"
+      extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --kv-cache-dtype fp8"
 
 benchmark:
   max_concurrency: 128
@@ -33,33 +34,38 @@ variants:
   H100:
     gpu: "NVIDIA H100 80GB"
     gpu_count: 1
-    backend:
-      vllm:
-        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
+    engine:
+      llm:
+        vllm:
+          extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
   Pro6000:
     gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
     gpu_count: 1
-    backend:
-      vllm:
-        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
+    engine:
+      llm:
+        vllm:
+          extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
   4xRTX5090:
     gpu: "NVIDIA GeForce RTX 5090"
     gpu_count: 4
-    backend:
-      vllm:
+    engine:
+      llm:
         pipeline_parallel_size: 4
-        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
+        vllm:
+          extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
   4xRTX4090:
     gpu: "NVIDIA GeForce RTX 4090"
     gpu_count: 4
-    backend:
-      vllm:
+    engine:
+      llm:
         pipeline_parallel_size: 4
-        extra_args: "--dtype float16 --tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel"
+        vllm:
+          extra_args: "--dtype float16 --tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel"
   2xL40S:
     gpu: "NVIDIA L40S"
     gpu_count: 2
-    backend:
-      vllm:
+    engine:
+      llm:
         pipeline_parallel_size: 2
-        extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
+        vllm:
+          extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"

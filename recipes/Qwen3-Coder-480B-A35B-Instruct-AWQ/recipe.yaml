@@ -1,15 +1,16 @@
 model:
-  name: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
+  huggingface: "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ"
 
-backend:
-  vllm:
-    image: "vllm/vllm-openai:latest"
+engine:
+  llm:
     tensor_parallel_size: 4
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     context_length: 16384
     max_concurrent_requests: 512
-    extra_args: "--enable-expert-parallel"
+    vllm:
+      image: "vllm/vllm-openai:latest"
+      extra_args: "--enable-expert-parallel"
 
 benchmark:
   max_concurrency: 128
@@ -33,10 +34,11 @@ variants:
   4xPro6000:
     gpu: "NVIDIA RTX PRO 6000 Server Edition"
     gpu_count: 4
-    backend:
-      vllm:
+    engine:
+      llm:
         max_concurrent_requests: 256
-        extra_args: "--enable-expert-parallel"
+        vllm:
+          extra_args: "--enable-expert-parallel"
     benchmark:
       max_concurrency: 64
       num_prompts: 128

@@ -65,14 +65,16 @@ def make_bench_config(recipes_dir):
 def tmp_recipe_dir(tmp_path):
     """Create a temp directory with a sample recipe.yaml."""
     recipe = {
-        "model": {"name": "test-org/test-model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
                 "context_length": 8192,
+                "vllm": {
+                    "image": "vllm/vllm-openai:latest",
+                },
             }
         },
         "benchmark": {
@@ -89,11 +91,13 @@ def tmp_recipe_dir(tmp_path):
             "8xH200": {
                 "gpu": "NVIDIA H200 141GB",
                 "gpu_count": 8,
-                "backend": {
-                    "vllm": {
+                "engine": {
+                    "llm": {
                         "tensor_parallel_size": 8,
                         "context_length": 16384,
-                        "extra_args": "--kv-cache-dtype fp8",
+                        "vllm": {
+                            "extra_args": "--kv-cache-dtype fp8",
+                        },
                     }
                 },
                 "benchmark": {
@@ -104,10 +108,12 @@ def tmp_recipe_dir(tmp_path):
             "4xH100": {
                 "gpu": "NVIDIA H100 80GB",
                 "gpu_count": 4,
-                "backend": {
-                    "vllm": {
+                "engine": {
+                    "llm": {
                         "tensor_parallel_size": 4,
-                        "extra_args": "--kv-cache-dtype fp8",
+                        "vllm": {
+                            "extra_args": "--kv-cache-dtype fp8",
+                        },
                     }
                 },
             },
@@ -125,14 +131,16 @@ def tmp_recipe_dir(tmp_path):
 def sample_config():
     """Return a resolved config dict for testing compose generation."""
     return {
-        "model": {"name": "test-org/test-model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
                 "context_length": 8192,
+                "vllm": {
+                    "image": "vllm/vllm-openai:latest",
+                },
             }
         },
         "benchmark": {
@@ -148,14 +156,16 @@ def sample_config():
 def sample_config_multi():
     """Return a resolved config dict for multi-instance testing."""
     return {
-        "model": {"name": "test-org/test-model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
                 "tensor_parallel_size": 4,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
                 "context_length": 16384,
+                "vllm": {
+                    "image": "vllm/vllm-openai:latest",
+                },
             }
         },
         "_num_instances": 2,

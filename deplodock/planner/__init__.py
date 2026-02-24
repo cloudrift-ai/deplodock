@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from deplodock.recipe.types import Recipe
+
 
 @dataclass
 class BenchmarkTask:
@@ -12,13 +14,13 @@ class BenchmarkTask:
 
     recipe_dir: str
     variant: str
-    recipe_config: dict
+    recipe: Recipe
     gpu_name: str
     gpu_count: int
 
     @property
     def model_name(self) -> str:
-        return self.recipe_config["model"]["name"]
+        return self.recipe.model_name
 
     @property
     def recipe_name(self) -> str:

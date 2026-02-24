@@ -3,10 +3,7 @@
 import os
 import sys
 
-from deplodock.deploy import (
-    DeployParams,
-    load_recipe,
-)
+from deplodock.deploy import DeployParams
 from deplodock.deploy import (
     deploy as deploy_entry,
 )
@@ -14,16 +11,17 @@ from deplodock.deploy import (
     teardown as teardown_entry,
 )
 from deplodock.provisioning.remote import provision_remote
+from deplodock.recipe import load_recipe
 
 
 def handle_ssh(args):
     """Handle the SSH deploy target."""
-    config = load_recipe(args.recipe, variant=args.variant)
+    recipe = load_recipe(args.recipe, variant=args.variant)
     params = DeployParams(
         server=args.server,
         ssh_key=args.ssh_key,
         ssh_port=args.ssh_port,
-        recipe_config=config,
+        recipe=recipe,
         model_dir=args.model_dir,
         hf_token=args.hf_token or os.environ.get("HF_TOKEN", ""),
         dry_run=args.dry_run,

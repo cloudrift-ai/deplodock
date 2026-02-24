@@ -4,6 +4,7 @@ from pathlib import Path
 
 from deplodock.planner import BenchmarkTask
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
+from deplodock.recipe import ModelConfig, Recipe
 
 
 def _make_task(model="org/model-a", gpu="NVIDIA GeForce RTX 5090", gpu_count=1, recipe_dir="/r"):
@@ -11,7 +12,7 @@ def _make_task(model="org/model-a", gpu="NVIDIA GeForce RTX 5090", gpu_count=1, 
     return BenchmarkTask(
         recipe_dir=recipe_dir,
         variant="V1",
-        recipe_config={"model": {"name": model}},
+        recipe=Recipe(model=ModelConfig(huggingface=model)),
         gpu_name=gpu,
         gpu_count=gpu_count,
     )
@@ -37,11 +38,10 @@ def test_task_recipe_name_trailing_slash():
 
 
 def test_task_result_path():
-    _make_task(recipe_dir="/recipes/MyModel", gpu="NVIDIA GeForce RTX 5090", gpu_count=1)
     task_obj = BenchmarkTask(
         recipe_dir="/recipes/MyModel",
         variant="RTX5090",
-        recipe_config={"model": {"name": "org/my-model"}},
+        recipe=Recipe(model=ModelConfig(huggingface="org/my-model")),
         gpu_name="NVIDIA GeForce RTX 5090",
         gpu_count=1,
     )

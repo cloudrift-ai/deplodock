@@ -3,13 +3,14 @@
 import yaml
 
 from deplodock.deploy import generate_compose, generate_nginx_conf
+from deplodock.recipe import Recipe
 
 # ── generate_compose ────────────────────────────────────────────────
 
 
 def test_compose_single_instance(sample_config):
-    sample_config["_num_instances"] = 1
-    result = generate_compose(sample_config, "/mnt/models", "test-token")
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "test-token", num_instances=1)
 
     assert "vllm_0:" in result
     assert "vllm_1:" not in result
@@ -26,33 +27,36 @@ def test_compose_single_instance(sample_config):
 
 
 def test_compose_context_length_and_max_concurrent(sample_config):
-    sample_config["_num_instances"] = 1
-    sample_config["backend"]["vllm"]["max_concurrent_requests"] = 256
-    result = generate_compose(sample_config, "/mnt/models", "token")
+    sample_config["engine"]["llm"]["max_concurrent_requests"] = 256
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
     assert "--max-model-len 8192" in result
     assert "--max-num-seqs 256" in result
 
 
 def test_compose_omits_unset_named_fields():
     config = {
-        "model": {"name": "test-org/test-model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
+                "vllm": {
+                    "image": "vllm/vllm-openai:latest",
+                },
             }
         },
-        "_num_instances": 1,
     }
-    result = generate_compose(config, "/mnt/models", "token")
+    recipe = Recipe.from_dict(config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
     assert "--max-model-len" not in result
     assert "--max-num-seqs" not in result
 
 
 def test_compose_multi_instance(sample_config_multi):
-    result = generate_compose(sample_config_multi, "/mnt/models", "test-token")
+    recipe = Recipe.from_dict(sample_config_multi)
+    result = generate_compose(recipe, "/mnt/models", "test-token", num_instances=2)
 
     # Two vLLM services
     assert "vllm_0:" in result
@@ -75,15 +79,16 @@ def test_compose_multi_instance(sample_config_multi):
 
 
 def test_compose_parses_as_valid_yaml(sample_config):
-    sample_config["_num_instances"] = 1
-    result = generate_compose(sample_config, "/mnt/models", "test-token")
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "test-token", num_instances=1)
     parsed = yaml.safe_load(result)
     assert "services" in parsed
     assert "vllm_0" in parsed["services"]
 
 
 def test_compose_multi_gpu_allocation(sample_config_multi):
-    result = generate_compose(sample_config_multi, "/mnt/models", "test-token")
+    recipe = Recipe.from_dict(sample_config_multi)
+    result = generate_compose(recipe, "/mnt/models", "test-token", num_instances=2)
     parsed = yaml.safe_load(result)
 
     # Instance 0 should get GPUs 0-3, instance 1 gets GPUs 4-7
@@ -98,17 +103,16 @@ def test_compose_multi_gpu_allocation(sample_config_multi):
 
 
 def test_compose_image_from_config(sample_config):
-    sample_config["_num_instances"] = 1
-    sample_config["backend"]["vllm"]["image"] = "custom/image:v2"
-    result = generate_compose(sample_config, "/mnt/models", "token")
+    sample_config["engine"]["llm"]["vllm"]["image"] = "custom/image:v2"
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
     assert "custom/image:v2" in result
 
 
 def test_compose_gpu_device_ids_override(sample_config):
-    """_gpu_device_ids restricts GPU visibility in single-instance mode."""
-    sample_config["_num_instances"] = 1
-    sample_config["_gpu_device_ids"] = [0, 1]
-    result = generate_compose(sample_config, "/mnt/models", "token")
+    """gpu_device_ids restricts GPU visibility in single-instance mode."""
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1, gpu_device_ids=[0, 1])
     assert "device_ids:" in result
     assert "'0'" in result
     assert "'1'" in result
@@ -116,9 +120,9 @@ def test_compose_gpu_device_ids_override(sample_config):
 
 
 def test_compose_no_gpu_device_ids_uses_count_all(sample_config):
-    """Without _gpu_device_ids, single-instance uses count: all."""
-    sample_config["_num_instances"] = 1
-    result = generate_compose(sample_config, "/mnt/models", "token")
+    """Without gpu_device_ids, single-instance uses count: all."""
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
     assert "count: all" in result
     assert "device_ids:" not in result
 

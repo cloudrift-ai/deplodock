@@ -1,13 +1,14 @@
 model:
-  name: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+  huggingface: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
 
-backend:
-  vllm:
-    image: "vllm/vllm-openai:latest"
+engine:
+  llm:
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     context_length: 8192
+    vllm:
+      image: "vllm/vllm-openai:latest"
 
 benchmark:
   max_concurrency: 128

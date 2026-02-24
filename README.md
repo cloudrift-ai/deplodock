@@ -12,7 +12,8 @@ Tools for deploying and benchmarking LLM inference on GPU servers.
     - [bench/](deplodock/commands/bench/) — `bench` command
     - [report/](deplodock/commands/report/) — `report` command
     - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
-  - [deploy/](deplodock/deploy/) — Deploy library (recipe loading, compose generation, orchestration)
+  - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping
+  - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
   - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
   - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
@@ -74,23 +75,24 @@ deplodock deploy ssh \
 
 ## Recipes
 
-Recipes are declarative YAML configs in `recipes/<model>/recipe.yaml`. Each recipe defines a model, backend settings, and hardware variants.
+Recipes are declarative YAML configs in `recipes/<model>/recipe.yaml`. Each recipe defines a model, engine settings, and hardware variants.
 
 ### Format
 
 ```yaml
 model:
-  name: "org/model-name"
+  huggingface: "org/model-name"
 
-backend:
-  vllm:
-    image: "vllm/vllm-openai:latest"
+engine:
+  llm:
     tensor_parallel_size: 8
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     context_length: 16384
     max_concurrent_requests: 512
-    extra_args: "--kv-cache-dtype fp8"      # Flags not covered by named fields
+    vllm:
+      image: "vllm/vllm-openai:latest"
+      extra_args: "--kv-cache-dtype fp8"    # Flags not covered by named fields
 
 benchmark:
   max_concurrency: 128
@@ -101,22 +103,24 @@ benchmark:
 variants:
   8xH200: {}                    # Uses defaults
   8xH100:
-    backend:
-      vllm:
+    engine:
+      llm:
         max_concurrent_requests: 256        # Override for this hardware
     benchmark:                              # Per-variant benchmark override
       max_concurrency: 64
 ```
 
-### Named vLLM Fields
+Engine-agnostic fields (`tensor_parallel_size`, `context_length`, etc.) live at `engine.llm`. Engine-specific fields (`image`, `extra_args`) nest under `engine.llm.vllm` or `engine.llm.sglang`.
 
-| Recipe YAML key | vLLM CLI flag |
-|---|---|
-| `tensor_parallel_size` | `--tensor-parallel-size` |
-| `pipeline_parallel_size` | `--pipeline-parallel-size` |
-| `gpu_memory_utilization` | `--gpu-memory-utilization` |
-| `context_length` | `--max-model-len` |
-| `max_concurrent_requests` | `--max-num-seqs` |
+### Named Fields → CLI Flags
+
+| Recipe YAML key | vLLM CLI flag | SGLang CLI flag |
+|---|---|---|
+| `tensor_parallel_size` | `--tensor-parallel-size` | `--tp` |
+| `pipeline_parallel_size` | `--pipeline-parallel-size` | `--dp` |
+| `gpu_memory_utilization` | `--gpu-memory-utilization` | `--mem-fraction-static` |
+| `context_length` | `--max-model-len` | `--context-length` |
+| `max_concurrent_requests` | `--max-num-seqs` | `--max-running-requests` |
 
 These flags must **not** appear in `extra_args` — `load_recipe()` validates this and raises an error on duplicates.
 
