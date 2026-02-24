@@ -137,34 +137,15 @@ For AWQ-quantized MoE models on SGLang, `--quantization moe_wna16` is required i
 
 ### Named Fields → CLI Flags
 
-| Recipe YAML key | vLLM CLI flag | SGLang CLI flag |
-|---|---|---|
-| `tensor_parallel_size` | `--tensor-parallel-size` | `--tp` |
-| `pipeline_parallel_size` | `--pipeline-parallel-size` | `--dp` |
-| `gpu_memory_utilization` | `--gpu-memory-utilization` | `--mem-fraction-static` |
-| `context_length` | `--max-model-len` | `--context-length` |
-| `max_concurrent_requests` | `--max-num-seqs` | `--max-running-requests` |
+| Recipe YAML key           | vLLM CLI flag              | SGLang CLI flag          |
+|---------------------------|----------------------------|--------------------------|
+| `tensor_parallel_size`    | `--tensor-parallel-size`   | `--tp`                   |
+| `pipeline_parallel_size`  | `--pipeline-parallel-size` | `--dp`                   |
+| `gpu_memory_utilization`  | `--gpu-memory-utilization` | `--mem-fraction-static`  |
+| `context_length`          | `--max-model-len`          | `--context-length`       |
+| `max_concurrent_requests` | `--max-num-seqs`           | `--max-running-requests` |
 
 These flags must **not** appear in `extra_args` — `load_recipe()` validates this and raises an error on duplicates.
-
-### Variant Naming
-
-Variants use hardware-descriptive names for per-instance GPU setup:
-- `H200` — 1 GPU
-- `8xH200` — 8 GPUs (tensor parallel)
-- `4xH100` — 4 GPUs
-
-Format: `[<gpus>x]<GPU_TYPE>`. Multi-instance deployment is automatic when variant GPUs exceed per-instance needs.
-
-### Available Recipes
-
-| Recipe | Model | Config |
-|--------|-------|--------|
-| `GLM-4.6-FP8` | zai-org/GLM-4.6-FP8 | TP=8, dense FP8 |
-| `GLM-4.5-Air-AWQ-4bit` | cpatonn/GLM-4.5-Air-AWQ-4bit | TP=1, MoE |
-| `Qwen3-Coder-480B-A35B-Instruct-AWQ` | QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ | TP=4, large MoE |
-| `Qwen3-Coder-30B-A3B-Instruct-AWQ` | QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ | TP=1, small MoE |
-| `Meta-Llama-3.3-70B-Instruct-AWQ-INT4` | ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4 | PP=2, dense |
 
 ## Deploy Targets
 
@@ -194,29 +175,29 @@ deplodock deploy cloud --recipe <path> --variant <name> [--name <vm-name>] [--dr
 
 ### Common Flags
 
-| Flag | Required | Default | Description |
-|------|----------|---------|-------------|
-| `--recipe` | Yes | - | Path to recipe directory |
-| `--variant` | No | - | Hardware variant (e.g. 8xH200) |
-| `--hf-token` | No | `$HF_TOKEN` | HuggingFace token |
-| `--model-dir` | No | `/mnt/models` | Model cache dir |
-| `--teardown` | No | false | Stop containers instead of deploying |
-| `--dry-run` | No | false | Print commands without executing |
+| Flag          | Required  | Default       | Description                          |
+|---------------|-----------|---------------|--------------------------------------|
+| `--recipe`    | Yes       | -             | Path to recipe directory             |
+| `--variant`   | No        | -             | Hardware variant (e.g. 8xH200)       |
+| `--hf-token`  | No        | `$HF_TOKEN`   | HuggingFace token                    |
+| `--model-dir` | No        | `/mnt/models` | Model cache dir                      |
+| `--teardown`  | No        | false         | Stop containers instead of deploying |
+| `--dry-run`   | No        | false         | Print commands without executing     |
 
 ### SSH-only Flags
 
-| Flag | Required | Default | Description |
-|------|----------|---------|-------------|
-| `--server` | Yes | - | SSH address (user@host) |
-| `--ssh-key` | No | `~/.ssh/id_ed25519` | SSH key path |
-| `--ssh-port` | No | 22 | SSH port |
+| Flag         | Required  | Default             | Description             |
+|--------------|-----------|---------------------|-------------------------|
+| `--server`   | Yes       | -                   | SSH address (user@host) |
+| `--ssh-key`  | No        | `~/.ssh/id_ed25519` | SSH key path            |
+| `--ssh-port` | No        | 22                  | SSH port                |
 
 ### Cloud-only Flags
 
-| Flag | Required | Default | Description |
-|------|----------|---------|-------------|
-| `--name` | No | `cloud-deploy` | VM name prefix |
-| `--ssh-key` | No | `~/.ssh/id_ed25519` | SSH private key path |
+| Flag        | Required  | Default             | Description          |
+|-------------|-----------|---------------------|----------------------|
+| `--name`    | No        | `cloud-deploy`      | VM name prefix       |
+| `--ssh-key` | No        | `~/.ssh/id_ed25519` | SSH private key path |
 
 ## VM Management
 
@@ -233,31 +214,31 @@ deplodock vm delete gcp --instance my-gpu-vm --zone us-central1-a
 
 #### GCP Create Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--instance` | (required) | GCP instance name |
-| `--zone` | (required) | GCP zone (e.g. us-central1-a) |
-| `--machine-type` | (required) | Machine type (e.g. a2-highgpu-1g) |
-| `--provisioning-model` | `FLEX_START` | Provisioning model (`FLEX_START`, `SPOT`, or `STANDARD`) |
-| `--max-run-duration` | `7d` | Max VM run time (10m–7d) |
-| `--request-valid-for-duration` | `2h` | How long to wait for capacity |
-| `--termination-action` | `DELETE` | Action when max-run-duration expires (`STOP` or `DELETE`) |
-| `--image-family` | `debian-12` | Boot disk image family |
-| `--image-project` | `debian-cloud` | Boot disk image project |
-| `--gcloud-args` | - | Extra args passed to `gcloud compute instances create` |
-| `--timeout` | `14400` | How long to poll for RUNNING status (seconds) |
-| `--wait-ssh` | false | Wait for SSH after VM is RUNNING |
-| `--wait-ssh-timeout` | `300` | SSH wait timeout in seconds |
-| `--ssh-gateway` | - | SSH gateway host for ProxyJump (e.g. gcp-ssh-gateway) |
-| `--dry-run` | false | Print commands without executing |
+| Flag                           | Default        | Description                                               |
+|--------------------------------|----------------|-----------------------------------------------------------|
+| `--instance`                   | (required)     | GCP instance name                                         |
+| `--zone`                       | (required)     | GCP zone (e.g. us-central1-a)                             |
+| `--machine-type`               | (required)     | Machine type (e.g. a2-highgpu-1g)                         |
+| `--provisioning-model`         | `FLEX_START`   | Provisioning model (`FLEX_START`, `SPOT`, or `STANDARD`)  |
+| `--max-run-duration`           | `7d`           | Max VM run time (10m–7d)                                  |
+| `--request-valid-for-duration` | `2h`           | How long to wait for capacity                             |
+| `--termination-action`         | `DELETE`       | Action when max-run-duration expires (`STOP` or `DELETE`) |
+| `--image-family`               | `debian-12`    | Boot disk image family                                    |
+| `--image-project`              | `debian-cloud` | Boot disk image project                                   |
+| `--gcloud-args`                | -              | Extra args passed to `gcloud compute instances create`    |
+| `--timeout`                    | `14400`        | How long to poll for RUNNING status (seconds)             |
+| `--wait-ssh`                   | false          | Wait for SSH after VM is RUNNING                          |
+| `--wait-ssh-timeout`           | `300`          | SSH wait timeout in seconds                               |
+| `--ssh-gateway`                | -              | SSH gateway host for ProxyJump (e.g. gcp-ssh-gateway)     |
+| `--dry-run`                    | false          | Print commands without executing                          |
 
 #### GCP Delete Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--instance` | (required) | GCP instance name |
-| `--zone` | (required) | GCP zone (e.g. us-central1-a) |
-| `--dry-run` | false | Print commands without executing |
+| Flag         | Default    | Description                      |
+|--------------|------------|----------------------------------|
+| `--instance` | (required) | GCP instance name                |
+| `--zone`     | (required) | GCP zone (e.g. us-central1-a)    |
+| `--dry-run`  | false      | Print commands without executing |
 
 GCP project is inferred from `gcloud` config (no `--project` flag needed).
 
@@ -270,23 +251,23 @@ deplodock vm delete cloudrift --instance-id <id>
 
 #### CloudRift Create Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--instance-type` | (required) | Instance type (e.g. rtx4090.1) |
-| `--ssh-key` | (required) | Path to SSH public key file |
-| `--api-key` | `$CLOUDRIFT_API_KEY` | CloudRift API key |
-| `--image-url` | Ubuntu 24.04 | VM image URL |
-| `--ports` | `22,8000` | Comma-separated ports to open |
-| `--timeout` | `600` | Seconds to wait for Active status |
-| `--dry-run` | false | Print requests without executing |
+| Flag              | Default              | Description                       |
+|-------------------|----------------------|-----------------------------------|
+| `--instance-type` | (required)           | Instance type (e.g. rtx4090.1)    |
+| `--ssh-key`       | (required)           | Path to SSH public key file       |
+| `--api-key`       | `$CLOUDRIFT_API_KEY` | CloudRift API key                 |
+| `--image-url`     | Ubuntu 24.04         | VM image URL                      |
+| `--ports`         | `22,8000`            | Comma-separated ports to open     |
+| `--timeout`       | `600`                | Seconds to wait for Active status |
+| `--dry-run`       | false                | Print requests without executing  |
 
 #### CloudRift Delete Flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--instance-id` | (required) | CloudRift instance ID |
-| `--api-key` | `$CLOUDRIFT_API_KEY` | CloudRift API key |
-| `--dry-run` | false | Print requests without executing |
+| Flag            | Default              | Description                      |
+|-----------------|----------------------|----------------------------------|
+| `--instance-id` | (required)           | CloudRift instance ID            |
+| `--api-key`     | `$CLOUDRIFT_API_KEY` | CloudRift API key                |
+| `--dry-run`     | false                | Print requests without executing |
 
 ## Benchmarking
 
@@ -325,14 +306,14 @@ deplodock bench recipes/* --max-workers 2                    # Limit parallel ex
 deplodock bench recipes/* --dry-run                          # Preview commands
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `recipes` | (required) | Recipe directories (positional args) |
-| `--variants` | all | Variant names to run (space-separated) |
-| `--ssh-key` | `~/.ssh/id_ed25519` | SSH private key path |
-| `--config` | `config.yaml` | Path to configuration file |
-| `--max-workers` | num groups | Max parallel execution groups |
-| `--dry-run` | false | Print commands without executing |
+| Flag            | Default             | Description                            |
+|-----------------|---------------------|----------------------------------------|
+| `recipes`       | (required)          | Recipe directories (positional args)   |
+| `--variants`    | all                 | Variant names to run (space-separated) |
+| `--ssh-key`     | `~/.ssh/id_ed25519` | SSH private key path                   |
+| `--config`      | `config.yaml`       | Path to configuration file             |
+| `--max-workers` | num groups          | Max parallel execution groups          |
+| `--dry-run`     | false               | Print commands without executing       |
 
 ### Generate Reports
 
@@ -341,16 +322,16 @@ deplodock report                                      # Default: results/ -> res
 deplodock report --results-dir results/custom --output results/custom/report.xlsx
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--config` | `config.yaml` | Path to configuration file |
-| `--results-dir` | `results` | Directory containing benchmark results |
-| `--output` | `results/benchmark_report.xlsx` | Output Excel file path |
+| Flag            | Default                         | Description                            |
+|-----------------|---------------------------------|----------------------------------------|
+| `--config`      | `config.yaml`                   | Path to configuration file             |
+| `--results-dir` | `results`                       | Directory containing benchmark results |
+| `--output`      | `results/benchmark_report.xlsx` | Output Excel file path                 |
 
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+make test
 ```
 
 ## Linting & Formatting

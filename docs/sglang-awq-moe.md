@@ -19,11 +19,11 @@ The key indicator is `mem usage=30.28 GB` — the model weights are not quantize
 
 ## Quantization Flags That Do NOT Work for MoE
 
-| Flag | Result |
-|------|--------|
-| `--quantization awq` | `ValueError: torch.bfloat16 is not supported for quantization method awq` |
-| `--quantization awq_marlin` | Loads at full bf16 precision, OOM |
-| `--quantization awq_marlin --dtype float16` | Loads at full fp16 precision, OOM |
+| Flag                                        | Result                                                                    |
+|---------------------------------------------|---------------------------------------------------------------------------|
+| `--quantization awq`                        | `ValueError: torch.bfloat16 is not supported for quantization method awq` |
+| `--quantization awq_marlin`                 | Loads at full bf16 precision, OOM                                         |
+| `--quantization awq_marlin --dtype float16` | Loads at full fp16 precision, OOM                                         |
 
 These methods handle dense (non-MoE) model quantization but do not apply to expert weights in MoE architectures.
 

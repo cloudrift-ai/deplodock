@@ -18,13 +18,13 @@ See `README.md` for full project structure, recipe format, and CLI usage.
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+make test
 ```
 
 Or for a specific test file:
 
 ```bash
-pytest tests/test_recipe.py -v
+./venv/bin/pytest tests/test_recipe.py -v
 ```
 
 ## CLI Commands
