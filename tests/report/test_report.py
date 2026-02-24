@@ -2,7 +2,7 @@
 
 import json
 
-from deplodock.commands.report import _collect_tasks_from_manifests, parse_benchmark_result
+from deplodock.report import collect_tasks_from_manifests, parse_benchmark_result
 
 
 SAMPLE_BENCHMARK = """\
@@ -51,7 +51,7 @@ def test_collect_tasks_from_manifests(tmp_path):
     ]
     _write_run(tmp_path, "2026-02-23_14-30-00_abc12345", tasks)
 
-    collected = list(_collect_tasks_from_manifests(tmp_path))
+    collected = list(collect_tasks_from_manifests(tmp_path))
     assert len(collected) == 1
     meta, path = collected[0]
     assert meta["gpu_short"] == "rtx5090"
@@ -73,7 +73,7 @@ def test_collect_skips_failed_tasks(tmp_path):
     ]
     _write_run(tmp_path, "2026-02-23_14-30-00_abc12345", tasks)
 
-    collected = list(_collect_tasks_from_manifests(tmp_path))
+    collected = list(collect_tasks_from_manifests(tmp_path))
     assert len(collected) == 0
 
 
@@ -97,7 +97,7 @@ def test_collect_multiple_runs(tmp_path):
     _write_run(tmp_path, "run1", tasks1)
     _write_run(tmp_path, "run2", tasks2)
 
-    collected = list(_collect_tasks_from_manifests(tmp_path))
+    collected = list(collect_tasks_from_manifests(tmp_path))
     assert len(collected) == 2
 
 

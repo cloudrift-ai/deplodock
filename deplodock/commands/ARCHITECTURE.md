@@ -3,16 +3,70 @@
 ## Layered Design
 
 ```
-bench ──────► planner (task grouping)       # group tasks into VMs
-bench ──────► deploy(DeployParams)          # single entry point
-bench ──────► deploy/cloud (VM lifecycle)   # provision/delete
-deploy CLI ─► deploy(DeployParams)          # same entry point
-deploy/cloud ► vm providers                 # clean interface
+commands/bench ──► benchmark (config, tasks, execution)
+commands/bench ──► deploy (DeployParams, deploy/teardown)
+commands/bench ──► provisioning (cloud VM lifecycle)
+commands/deploy ─► deploy (DeployParams, deploy/teardown)
+commands/deploy ─► provisioning (remote setup, cloud VMs)
+commands/vm ────► provisioning (create/delete instances)
 ```
 
-**Dependency rule:** `bench` never imports from `vm` directly — it goes through `deploy/cloud`.
+**Dependency rule:** `commands/` is the CLI-only layer. All reusable business logic lives in top-level library packages:
+- `deplodock/deploy/` — recipe loading, compose generation, deploy orchestration
+- `deplodock/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
+- `deplodock/benchmark/` — tracking, config, logging, workload, tasks, execution
+- `deplodock/report/` — parsing, pricing, collection, report generation
 
 ## Layers
+
+### `deplodock/deploy/` — Deploy Library
+
+The central orchestration layer. Provides a single entry point for deploying recipes to servers.
+
+**Modules:**
+- `params.py` — `DeployParams` dataclass
+- `recipe.py` — `deep_merge()`, `load_recipe()`
+- `compose.py` — `calculate_num_instances()`, `generate_compose()`, `generate_nginx_conf()`
+- `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`
+- `ssh.py` — `ssh_base_args()`, `make_run_cmd()`, `scp_file()`, `make_write_file()`
+- `local.py` — `make_run_cmd()`, `make_write_file()` (local subprocess transport)
+
+**GPU visibility:** `generate_compose()` supports `_gpu_device_ids` in the config dict to restrict GPU visibility via `device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
+
+### `deplodock/provisioning/` — Provisioning Library
+
+VM lifecycle management and cloud provisioning.
+
+**Modules:**
+- `types.py` — `VMConnectionInfo` dataclass
+- `ssh.py` — `wait_for_ssh()` (provider-agnostic SSH polling)
+- `shell.py` — `run_shell_cmd()`
+- `remote.py` — `provision_remote()` (install Docker, NVIDIA toolkit)
+- `cloud.py` — `resolve_vm_spec()`, `provision_cloud_vm()`, `delete_cloud_vm()`
+- `cloudrift.py` — CloudRift REST API provider
+- `gcp_flex_start.py` — GCP flex-start gcloud provider
+
+### `deplodock/benchmark/` — Benchmark Library
+
+Benchmark tracking, configuration, task enumeration, and execution.
+
+**Modules:**
+- `tracking.py` — `compute_code_hash()`, `create_run_dir()`, `write_manifest()`, `read_manifest()`
+- `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
+- `bench_logging.py` — `setup_logging()`, `_get_group_logger()`
+- `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
+- `tasks.py` — `enumerate_tasks()`, `_task_meta()`
+- `execution.py` — `run_execution_group()`, `_run_groups()`
+
+### `deplodock/report/` — Report Library
+
+Excel report generation from benchmark results.
+
+**Modules:**
+- `parser.py` — `parse_benchmark_result()`
+- `pricing.py` — `get_gpu_price()`
+- `collector.py` — `load_config()`, `collect_tasks_from_manifests()`
+- `generator.py` — `generate_report()`
 
 ### `planner/` — Planner Layer
 
@@ -26,85 +80,44 @@ Groups benchmark tasks into execution groups for VM allocation.
 **Implementations:**
 - `planner/group_by_model_and_gpu.py` — `GroupByModelAndGpuPlanner`: groups by (model_name, gpu_name) tuple. Same model on same GPU shares a VM to reuse cached weights. Max gpu_count determines VM size; tasks sorted descending.
 
-### `deploy/` — Deploy Layer
+### `commands/` — CLI Layer (thin handlers only)
 
-The central orchestration layer. Provides a single entry point for deploying recipes to servers.
+Each command module contains only argparse registration and `handle_*` functions that delegate to library packages.
 
-**Public API (`deploy/__init__.py`):**
-- `DeployParams` — dataclass with all parameters for a deployment
-- `deploy(params: DeployParams) -> bool` — deploy a recipe via SSH
-- `teardown(params: DeployParams) -> bool` — teardown containers
-- `load_recipe(recipe_dir, variant)` — load and resolve a recipe config
-- `run_deploy(run_cmd, write_file, config, ...)` — low-level orchestration (used by `deploy()` and `local`)
-- `run_teardown(run_cmd)` — low-level teardown
-
-**GPU visibility:** `generate_compose()` supports `_gpu_device_ids` in the config dict to restrict GPU visibility via `device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
-
-**Targets:**
-- `deploy/ssh.py` — SSH target, uses `deploy()` / `teardown()`
-- `deploy/local.py` — local target, uses `run_deploy()` / `run_teardown()` directly
-- `deploy/cloud.py` — cloud target, provisions VM then uses `deploy()`
-
-### `deploy/cloud.py` — Cloud Bridge
-
-Bridge between deploy and vm layers. Handles VM lifecycle for both `deploy cloud` CLI and `bench`.
-
-**Public API:**
-- `resolve_vm_spec(recipe_entries, server_name)` — resolve GPU requirements from recipes
-- `provision_cloud_vm(gpu_name, gpu_count, ssh_key, ...)` → `VMConnectionInfo | None`
-- `delete_cloud_vm(delete_info, dry_run)` — delete a cloud VM
-
-### `vm/` — VM Provider Layer
-
-Low-level VM lifecycle management. Each provider implements `create_instance()` and `delete_instance()`.
-
-**Shared types (`vm/types.py`):**
-- `VMConnectionInfo` — structured return from `create_instance()` with host, username, ssh_port, port_mappings, delete_info
-
-**Shared helpers (`vm/__init__.py`):**
-- `wait_for_ssh(host, username, ssh_port, ssh_key_path, ...)` — provider-agnostic SSH readiness check
-- `run_shell_cmd(command, dry_run)` — shell command runner
-
-**Providers:**
-- `vm/cloudrift.py` — CloudRift REST API
-- `vm/gcp_flex_start.py` — GCP flex-start via gcloud CLI
-
-### `bench/` — Benchmark Layer
-
-Orchestrates deploy + benchmark + teardown on cloud VMs. Accepts recipe directories as positional args. Uses the Planner to group tasks into ExecutionGroups, then runs groups in parallel via `asyncio`.
-
-**Data flow:**
-1. `enumerate_tasks(recipe_dirs, variants_filter)` → list of `BenchmarkTask`
-2. `GroupByModelAndGpuPlanner().plan(tasks)` → list of `ExecutionGroup`
-3. `asyncio.run(_run_groups(...))` → concurrent execution via `asyncio.to_thread()`
-4. Each group: provision VM → for each task: deploy → benchmark → teardown → delete VM
+**Command modules:**
+- `commands/bench/` — `handle_bench()`, `register_bench_command()`
+- `commands/deploy/ssh.py` — `handle_ssh()`, `register_ssh_target()`
+- `commands/deploy/local.py` — `handle_local()`, `register_local_target()`
+- `commands/deploy/cloud.py` — `handle_cloud()`, `register_cloud_target()`
+- `commands/report/` — `handle_report()`, `register_report_command()`
+- `commands/vm/` — `register_vm_command()`, CLI handlers for each provider
 
 ## Data Flow
 
 ```
 Recipe dirs (positional args)
-    │
-    ▼
-enumerate_tasks() ─► list[BenchmarkTask]
-    │
-    ▼
-GroupByModelAndGpuPlanner.plan() ─► list[ExecutionGroup]
-    │
-    ▼
-asyncio.gather(*groups)  ── each group runs in a thread:
-    │
-    ▼
-provision_cloud_vm() ─► VMConnectionInfo
-    │
-    ▼
+    |
+    v
+enumerate_tasks() -> list[BenchmarkTask]
+    |
+    v
+GroupByModelAndGpuPlanner.plan() -> list[ExecutionGroup]
+    |
+    v
+asyncio.gather(*groups)  -- each group runs in a thread:
+    |
+    v
+provision_cloud_vm() -> VMConnectionInfo
+    |
+    v
 For each task in group:
-    ├── set _gpu_device_ids if task.gpu_count < group.gpu_count
-    ├── deploy(DeployParams) ─► compose up
-    ├── run_benchmark_workload()
-    ├── save results
-    └── teardown()
-    │
-    ▼
+    +-- set _gpu_device_ids if task.gpu_count < group.gpu_count
+    +-- deploy(DeployParams) -> compose up
+    +-- run_benchmark_workload()
+    +-- save results
+    +-- teardown()
+    |
+    v
 delete_cloud_vm(conn.delete_info)
 ```
 
@@ -112,24 +125,25 @@ delete_cloud_vm(conn.delete_info)
 
 ```
 deplodock
-├── deploy
-│   ├── local    — deploy locally via docker compose
-│   ├── ssh      — deploy to remote server via SSH
-│   └── cloud    — provision cloud VM + deploy via SSH
-├── bench        — deploy + benchmark + teardown on cloud VMs
-├── report       — generate Excel reports from benchmark results
-└── vm
-    ├── create
-    │   ├── gcp-flex-start
-    │   └── cloudrift
-    └── delete
-        ├── gcp-flex-start
-        └── cloudrift
++-- deploy
+|   +-- local    -- deploy locally via docker compose
+|   +-- ssh      -- deploy to remote server via SSH
+|   +-- cloud    -- provision cloud VM + deploy via SSH
++-- bench        -- deploy + benchmark + teardown on cloud VMs
++-- report       -- generate Excel reports from benchmark results
++-- vm
+    +-- create
+    |   +-- gcp-flex-start
+    |   +-- cloudrift
+    +-- delete
+        +-- gcp-flex-start
+        +-- cloudrift
 ```
 
 ## Adding a New VM Provider
 
-1. Create `vm/<provider>.py` with `create_instance()` → `VMConnectionInfo | None` and `delete_instance()`
-2. Register CLI handlers in `vm/__init__.py`
-3. Add entries to `hardware.py` GPU_INSTANCE_TYPES table
-4. Add provider dispatch in `deploy/cloud.py` `provision_cloud_vm()` and `delete_cloud_vm()`
+1. Create `provisioning/<provider>.py` with `create_instance()` -> `VMConnectionInfo | None` and `delete_instance()`
+2. Add CLI handlers in `commands/vm/<provider>.py`
+3. Register CLI in `commands/vm/__init__.py`
+4. Add entries to `hardware.py` GPU_INSTANCE_TYPES table
+5. Add provider dispatch in `provisioning/cloud.py` `provision_cloud_vm()` and `delete_cloud_vm()`

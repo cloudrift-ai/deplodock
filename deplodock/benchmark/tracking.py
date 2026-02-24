@@ -12,7 +12,7 @@ def compute_code_hash() -> str:
     Concatenates '{relative_path}\n{content}\n' per file.
     Returns full hex digest.
     """
-    pkg_dir = Path(__file__).parent
+    pkg_dir = Path(__file__).parent.parent
     hasher = hashlib.sha256()
     for py_file in sorted(pkg_dir.rglob("*.py")):
         rel = py_file.relative_to(pkg_dir)

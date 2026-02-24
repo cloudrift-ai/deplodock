@@ -1,4 +1,4 @@
-"""Deploy command layer — re-exports from deplodock.deploy for backward compatibility."""
+"""Deploy library: recipe loading, compose generation, deploy orchestration."""
 
 from deplodock.deploy.params import DeployParams
 from deplodock.deploy.recipe import deep_merge, load_recipe

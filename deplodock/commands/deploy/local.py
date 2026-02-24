@@ -1,52 +1,10 @@
-"""Local deploy target: runs docker compose directly via subprocess."""
+"""Local deploy target CLI handler."""
 
 import os
-import subprocess
 import sys
 
-from deplodock.commands.deploy import load_recipe, run_deploy, run_teardown
-
-
-def _make_run_cmd(deploy_dir, dry_run=False):
-    """Create a run_cmd callable for local execution."""
-
-    def run_cmd(command, stream=True):
-        if dry_run:
-            print(f"[dry-run] {command}")
-            return 0, ""
-
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=deploy_dir,
-                capture_output=not stream,
-                text=True,
-                stdout=None if stream else subprocess.PIPE,
-                stderr=None if stream else subprocess.PIPE,
-            )
-            stdout = "" if stream else (result.stdout or "")
-            return result.returncode, stdout
-        except Exception as e:
-            print(f"Error running command: {e}", file=sys.stderr)
-            return 1, ""
-
-    return run_cmd
-
-
-def _make_write_file(deploy_dir, dry_run=False):
-    """Create a write_file callable for local file writes."""
-
-    def write_file(path, content):
-        full_path = os.path.join(deploy_dir, path)
-        if dry_run:
-            print(f"[dry-run] write {full_path}")
-            return
-        os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
-        with open(full_path, "w") as f:
-            f.write(content)
-
-    return write_file
+from deplodock.deploy import load_recipe, run_deploy, run_teardown
+from deplodock.deploy.local import make_run_cmd, make_write_file
 
 
 def handle_local(args):
@@ -61,8 +19,8 @@ def handle_local(args):
     # Deploy directory is the recipe directory itself
     deploy_dir = os.path.abspath(recipe_dir)
 
-    run_cmd = _make_run_cmd(deploy_dir, dry_run=dry_run)
-    write_file = _make_write_file(deploy_dir, dry_run=dry_run)
+    run_cmd = make_run_cmd(deploy_dir, dry_run=dry_run)
+    write_file = make_write_file(deploy_dir, dry_run=dry_run)
 
     if teardown:
         return run_teardown(run_cmd)
