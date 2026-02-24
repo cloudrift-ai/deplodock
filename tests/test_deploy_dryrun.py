@@ -191,7 +191,6 @@ def test_bench_help(run_cli):
     rc, stdout, _ = run_cli("bench", "--help")
     assert rc == 0
     assert "--config" in stdout
-    assert "--force" in stdout
     assert "--variants" in stdout
     assert "--ssh-key" in stdout
     assert "--dry-run" in stdout

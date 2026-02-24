@@ -72,5 +72,4 @@ def test_bench_help(run_cli):
     assert "--ssh-key" in stdout
     assert "--dry-run" in stdout
     assert "--config" in stdout
-    assert "--force" in stdout
     assert "--max-workers" in stdout

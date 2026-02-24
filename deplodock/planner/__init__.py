@@ -1,10 +1,10 @@
 """Planner: group benchmark tasks into execution groups for VM allocation."""
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List
-
-from deplodock.hardware import gpu_short_name
 
 
 @dataclass
@@ -22,11 +22,13 @@ class BenchmarkTask:
         return self.recipe_config["model"]["name"]
 
     @property
-    def result_filename(self) -> str:
-        """Result filename: {gpu_short}_{gpu_count}x_{model_safe}_vllm_benchmark.txt"""
-        short = gpu_short_name(self.gpu_name)
-        model_safe = self.model_name.replace("/", "_")
-        return f"{short}_{self.gpu_count}x_{model_safe}_vllm_benchmark.txt"
+    def recipe_name(self) -> str:
+        """Basename of the recipe directory (e.g. 'Qwen3-Coder-30B-A3B-Instruct-AWQ')."""
+        return os.path.basename(self.recipe_dir)
+
+    def result_path(self, run_dir) -> Path:
+        """Full result path: run_dir / recipe_name / {variant}_vllm_benchmark.txt."""
+        return Path(run_dir) / self.recipe_name / f"{self.variant}_vllm_benchmark.txt"
 
 
 @dataclass

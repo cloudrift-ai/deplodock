@@ -7,6 +7,7 @@ ExecutionGroups that share VMs; groups run in parallel via asyncio.
 import asyncio
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import List, Optional
 
 import yaml
 
+from deplodock.benchmark import compute_code_hash, create_run_dir, write_manifest
 from deplodock.commands.deploy import (
     DeployParams,
     calculate_num_instances,
@@ -252,16 +254,17 @@ def enumerate_tasks(recipe_dirs, variants_filter=None):
 
 
 def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
-                        force: bool = False, dry_run: bool = False) -> List[tuple]:
+                        run_dir: Path, dry_run: bool = False) -> List[dict]:
     """Run all benchmark tasks for one execution group.
 
     Provisions a VM with group.gpu_count GPUs, then runs each task.
     Tasks with fewer GPUs than the group get _gpu_device_ids set.
+
+    Returns a list of task metadata dicts for manifest assembly.
     """
-    results = []
+    task_results = []
     model_dir = config["benchmark"].get("model_dir", "/hf_models")
     hf_token = os.environ.get("HF_TOKEN", "")
-    local_results_dir = Path(_expand_path(config["benchmark"]["local_results_dir"]))
     providers_config = config.get("providers", {})
 
     short = gpu_short_name(group.gpu_name)
@@ -278,8 +281,8 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
         if conn is None:
             logger.error("VM provisioning failed")
             for task in group.tasks:
-                results.append((task.result_filename, task.model_name, False))
-            return results
+                task_results.append(_task_meta(task, run_dir, status="failed"))
+            return task_results
 
         logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
         provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
@@ -287,17 +290,13 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
         for task in group.tasks:
             recipe_config = task.recipe_config
             model_name = task.model_name
-            result_filename = task.result_filename
-            result_path = local_results_dir / result_filename
+            result_path = task.result_path(run_dir)
+
+            # Ensure recipe subdir exists
+            result_path.parent.mkdir(parents=True, exist_ok=True)
 
             task_logger = _get_group_logger(group, model_name)
             task_logger.info(f"Recipe: {task.recipe_dir} (variant: {task.variant})")
-
-            # Check if result already exists
-            if not force and result_path.exists():
-                task_logger.info(f"Result already exists: {result_path}, skipping (use --force to re-run)")
-                results.append((result_filename, model_name, True))
-                continue
 
             # Set GPU device IDs if task needs fewer GPUs than group
             if task.gpu_count < group.gpu_count:
@@ -318,7 +317,7 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
 
             if not success:
                 task_logger.error("Deploy failed, skipping benchmark")
-                results.append((result_filename, model_name, False))
+                task_results.append(_task_meta(task, run_dir, status="failed"))
                 continue
 
             task_logger.info("Running benchmark...")
@@ -330,15 +329,14 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
             if bench_success or dry_run:
                 if not dry_run:
                     benchmark_results = extract_benchmark_results(output)
-                    local_results_dir.mkdir(parents=True, exist_ok=True)
                     result_path.write_text(benchmark_results)
                     task_logger.info(f"Results saved to: {result_path}")
                 else:
                     task_logger.info(f"[dry-run] Would save results to: {result_path}")
-                results.append((result_filename, model_name, True))
+                task_results.append(_task_meta(task, run_dir, status="completed"))
             else:
                 task_logger.error("Benchmark failed")
-                results.append((result_filename, model_name, False))
+                task_results.append(_task_meta(task, run_dir, status="failed"))
 
             task_logger.info("Tearing down...")
             teardown_entry(params)
@@ -353,20 +351,34 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
                 logger.error(f"Failed to delete VM: {e}")
 
     logger.info(f"Completed group: {group_label}")
-    return results
+    return task_results
+
+
+def _task_meta(task: BenchmarkTask, run_dir: Path, status: str) -> dict:
+    """Build a task metadata dict for the manifest."""
+    return {
+        "recipe": task.recipe_name,
+        "variant": task.variant,
+        "gpu_name": task.gpu_name,
+        "gpu_short": gpu_short_name(task.gpu_name),
+        "gpu_count": task.gpu_count,
+        "model_name": task.model_name,
+        "result_file": str(task.result_path(run_dir).relative_to(run_dir)),
+        "status": status,
+    }
 
 
 # ── Async orchestration ───────────────────────────────────────────
 
 
-async def _run_groups(groups, config, ssh_key, force, dry_run, max_workers):
+async def _run_groups(groups, config, ssh_key, run_dir, dry_run, max_workers):
     """Run execution groups concurrently with a semaphore."""
     sem = asyncio.Semaphore(max_workers or len(groups))
 
     async def _run_with_semaphore(group):
         async with sem:
             return await asyncio.to_thread(
-                run_execution_group, group, config, ssh_key, force, dry_run,
+                run_execution_group, group, config, ssh_key, run_dir, dry_run,
             )
 
     results = await asyncio.gather(
@@ -395,6 +407,23 @@ def handle_bench(args):
         root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
 
+    # Create run directory
+    local_results_dir = _expand_path(config["benchmark"]["local_results_dir"])
+    run_dir = create_run_dir(local_results_dir)
+    root_logger.info(f"Run directory: {run_dir}")
+
+    # Copy recipe files into run directory
+    seen_recipes = set()
+    for task in tasks:
+        rname = task.recipe_name
+        if rname not in seen_recipes:
+            seen_recipes.add(rname)
+            recipe_subdir = run_dir / rname
+            recipe_subdir.mkdir(parents=True, exist_ok=True)
+            src = Path(task.recipe_dir) / "recipe.yaml"
+            if src.exists():
+                shutil.copy2(str(src), str(recipe_subdir / "recipe.yaml"))
+
     # Plan execution groups
     planner = GroupByModelAndGpuPlanner()
     groups = planner.plan(tasks)
@@ -409,35 +438,42 @@ def handle_bench(args):
 
     # Run groups
     raw_results = asyncio.run(
-        _run_groups(groups, config, ssh_key, args.force, dry_run, args.max_workers)
+        _run_groups(groups, config, ssh_key, run_dir, dry_run, args.max_workers)
     )
 
     # Flatten results, handling exceptions
-    results = []
+    all_task_meta = []
     for i, r in enumerate(raw_results):
         if isinstance(r, Exception):
             root_logger.error(f"Group {i} generated an exception: {r}")
             for task in groups[i].tasks:
-                results.append((task.result_filename, task.model_name, False))
+                all_task_meta.append(_task_meta(task, run_dir, status="failed"))
         else:
-            results.extend(r)
+            all_task_meta.extend(r)
+
+    # Write manifest
+    code_hash = compute_code_hash()
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    write_manifest(run_dir, timestamp, code_hash, sorted(seen_recipes), all_task_meta)
+    root_logger.info(f"Manifest written to: {run_dir / 'manifest.json'}")
 
     # Print summary
+    root_logger.info("")
     root_logger.info("SUMMARY")
 
-    successful = [r for r in results if r[2]]
-    failed = [r for r in results if not r[2]]
+    successful = [t for t in all_task_meta if t["status"] == "completed"]
+    failed = [t for t in all_task_meta if t["status"] != "completed"]
 
-    root_logger.info(f"Successful: {len(successful)}/{len(results)}")
+    root_logger.info(f"Successful: {len(successful)}/{len(all_task_meta)}")
     if successful:
-        for name, model, _ in successful:
-            root_logger.info(f"   - {name}")
+        for t in successful:
+            root_logger.info(f"   - {t['result_file']}")
 
     if failed:
         root_logger.info("")
-        root_logger.info(f"Failed: {len(failed)}/{len(results)}")
-        for name, model, _ in failed:
-            root_logger.info(f"   - {name}")
+        root_logger.info(f"Failed: {len(failed)}/{len(all_task_meta)}")
+        for t in failed:
+            root_logger.info(f"   - {t['result_file']}")
 
     root_logger.info("")
     root_logger.info("All done!")
@@ -470,11 +506,6 @@ def register_bench_command(subparsers):
         "--config",
         default="config.yaml",
         help="Path to configuration file (default: config.yaml)",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Force benchmark even if results already exist",
     )
     parser.add_argument(
         "--max-workers",

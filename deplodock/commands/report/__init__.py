@@ -1,9 +1,10 @@
 """Report command: generate Excel reports from vLLM benchmark results."""
 
+import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 import yaml
 
@@ -12,51 +13,6 @@ def load_config(config_file: str) -> dict:
     """Load configuration from YAML file."""
     with open(config_file, 'r') as f:
         return yaml.safe_load(f)
-
-
-def extract_gpu_type(server_name: str) -> str:
-    """Extract GPU type from server name.
-
-    Supports both old format (rtx5090_x_1) and new format (rtx5090_1x).
-
-    Examples:
-        rtx4090_x_1 -> rtx4090
-        rtx5090_x_4 -> rtx5090
-        pro6000_x_1 -> pro6000
-        rtx5090_1x  -> rtx5090
-        pro6000_4x  -> pro6000
-    """
-    # New format: {gpu_short}_{count}x
-    match = re.match(r'([a-z0-9]+)_\d+x', server_name.lower())
-    if match:
-        return match.group(1)
-    # Old format: {gpu_short}_x_{count}
-    match = re.match(r'([a-z0-9]+)_x_\d+', server_name.lower())
-    if match:
-        return match.group(1)
-    return server_name
-
-
-def extract_gpu_count(server_name: str) -> int:
-    """Extract GPU count from server name.
-
-    Supports both old format (rtx5090_x_1) and new format (rtx5090_1x).
-
-    Examples:
-        rtx4090_x_1 -> 1
-        rtx5090_x_4 -> 4
-        rtx5090_1x  -> 1
-        pro6000_4x  -> 4
-    """
-    # New format: {gpu_short}_{count}x
-    match = re.search(r'_(\d+)x', server_name)
-    if match:
-        return int(match.group(1))
-    # Old format: {gpu_short}_x_{count}
-    match = re.search(r'_x_(\d+)', server_name)
-    if match:
-        return int(match.group(1))
-    return 1
 
 
 def parse_benchmark_result(result_file: Path) -> Tuple[float, Dict]:
@@ -118,6 +74,25 @@ def get_gpu_price(config: dict, gpu_type: str, gpu_count: int) -> float:
     return 0.0
 
 
+def _collect_tasks_from_manifests(results_path: Path):
+    """Scan results_dir for run subdirectories containing manifest.json.
+
+    Yields (task_meta, result_file_path) tuples for each completed task.
+    """
+    for run_dir in sorted(results_path.iterdir()):
+        manifest_path = run_dir / "manifest.json"
+        if not run_dir.is_dir() or not manifest_path.exists():
+            continue
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        for task in manifest.get("tasks", []):
+            if task.get("status") != "completed":
+                continue
+            result_file = run_dir / task["result_file"]
+            if result_file.exists():
+                yield task, result_file
+
+
 def generate_report(config: dict, results_dir: str, output_file: str):
     """Generate Excel report from benchmark results."""
     import pandas as pd
@@ -128,53 +103,24 @@ def generate_report(config: dict, results_dir: str, output_file: str):
         print(f"Error: Results directory not found: {results_dir}")
         return
 
-    benchmark_files = list(results_path.glob("*_vllm_benchmark.txt"))
-
-    if not benchmark_files:
-        print(f"Error: No benchmark result files found in {results_dir}")
-        return
-
-    print(f"Found {len(benchmark_files)} benchmark result files")
-
     data_by_model = {}
     all_data = []
 
-    for result_file in benchmark_files:
-        filename = result_file.stem
-        parts = filename.rsplit('_vllm_benchmark', 1)[0]
-
-        # New format: {gpu_short}_{count}x_{model_safe}
-        match = re.match(r'([a-z0-9]+_\d+x)_(.+)', parts)
-        if match:
-            server_name = match.group(1)
-            model_name = match.group(2).replace('_', '/')
-        else:
-            # Old format: {server}_x_{count}_{model_safe}
-            match = re.match(r'([^_]+_x_\d+)_(.+)', parts)
-            if match:
-                server_name = match.group(1)
-                model_name = match.group(2).replace('_', '/')
-            else:
-                match = re.match(r'(gcloud_[^_]+)_(.+)', parts)
-                if match:
-                    server_name = match.group(1)
-                    model_name = match.group(2).replace('_', '/')
-                else:
-                    print(f"Warning: Could not parse filename: {result_file.name}")
-                    continue
+    for task_meta, result_file in _collect_tasks_from_manifests(results_path):
+        gpu_type = task_meta["gpu_short"]
+        gpu_count = task_meta["gpu_count"]
+        model_name = task_meta["model_name"]
 
         total_throughput, metrics = parse_benchmark_result(result_file)
 
         if total_throughput is None:
-            print(f"Warning: Could not extract throughput from {result_file.name}")
+            print(f"Warning: Could not extract throughput from {result_file}")
             continue
 
-        gpu_type = extract_gpu_type(server_name)
-        gpu_count = extract_gpu_count(server_name)
         price = get_gpu_price(config, gpu_type, gpu_count)
 
-        gpu_short_name = gpu_type.upper().replace('RTX', '').replace('PRO', '')
-        machine_name = f"{gpu_count}x{gpu_short_name}"
+        gpu_display = gpu_type.upper().replace('RTX', '').replace('PRO', '')
+        machine_name = f"{gpu_count}x{gpu_display}"
 
         price_per_mtok = (price / (total_throughput * 3600)) * 1_000_000 if total_throughput > 0 else 0
 
@@ -194,6 +140,8 @@ def generate_report(config: dict, results_dir: str, output_file: str):
     if not all_data:
         print("Error: No valid benchmark data found")
         return
+
+    print(f"Found {len(all_data)} benchmark results across run directories")
 
     df = pd.DataFrame(all_data)
     df = df.sort_values('Machine')
