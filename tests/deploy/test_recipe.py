@@ -166,33 +166,3 @@ def test_load_recipe_rejects_banned_extra_args(tmp_path):
 
     with pytest.raises(ValueError, match="--max-model-len"):
         load_recipe(str(tmp_path))
-
-
-# ── legacy migration ──────────────────────────────────────────────
-
-
-def test_load_recipe_legacy_format(tmp_path):
-    """load_recipe() migrates old backend.vllm format to engine.llm format."""
-    import yaml
-
-    recipe = {
-        "model": {"name": "test-org/test-model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
-                "tensor_parallel_size": 2,
-                "context_length": 4096,
-                "extra_args": "--kv-cache-dtype fp8",
-            }
-        },
-    }
-    with open(tmp_path / "recipe.yaml", "w") as f:
-        yaml.dump(recipe, f)
-
-    result = load_recipe(str(tmp_path))
-    assert isinstance(result, Recipe)
-    assert result.model.huggingface == "test-org/test-model"
-    assert result.engine.llm.tensor_parallel_size == 2
-    assert result.engine.llm.context_length == 4096
-    assert result.engine.llm.vllm.image == "vllm/vllm-openai:latest"
-    assert result.engine.llm.vllm.extra_args == "--kv-cache-dtype fp8"

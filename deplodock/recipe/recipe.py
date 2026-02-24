@@ -1,4 +1,4 @@
-"""Recipe loading, deep merge, and legacy migration."""
+"""Recipe loading and deep merge."""
 
 import os
 
@@ -17,52 +17,6 @@ def deep_merge(base, override):
         else:
             result[key] = value
     return result
-
-
-def _migrate_legacy_format(d):
-    """Convert old backend.vllm.* format to new engine.llm.* + engine.llm.vllm.* format.
-
-    Also converts model.name → model.huggingface.
-    """
-    # Migrate model.name → model.huggingface
-    model = d.get("model", {})
-    if "name" in model and "huggingface" not in model:
-        model["huggingface"] = model.pop("name")
-        d["model"] = model
-
-    # Migrate backend.vllm.* → engine.llm.* + engine.llm.vllm.*
-    backend = d.get("backend")
-    if backend is not None:
-        vllm_old = backend.get("vllm", {})
-
-        # Fields that belong at engine.llm level (engine-agnostic)
-        LLM_FIELDS = {
-            "tensor_parallel_size",
-            "pipeline_parallel_size",
-            "gpu_memory_utilization",
-            "context_length",
-            "max_concurrent_requests",
-        }
-        # Fields that belong at engine.llm.vllm level (engine-specific)
-        VLLM_FIELDS = {"image", "extra_args"}
-
-        llm = d.get("engine", {}).get("llm", {})
-        vllm_new = llm.get("vllm", {})
-
-        for key, value in vllm_old.items():
-            if key in LLM_FIELDS:
-                llm[key] = value
-            elif key in VLLM_FIELDS:
-                vllm_new[key] = value
-
-        if vllm_new:
-            llm["vllm"] = vllm_new
-        if llm:
-            d.setdefault("engine", {})["llm"] = llm
-
-        del d["backend"]
-
-    return d
 
 
 def validate_extra_args(extra_args, engine="vllm"):
@@ -100,9 +54,6 @@ def load_recipe(recipe_dir, variant=None):
             available = ", ".join(sorted(variants.keys())) if variants else "none"
             raise ValueError(f"Unknown variant '{variant}'. Available variants: {available}")
         config = deep_merge(config, variants[variant])
-
-    # Migrate legacy format if needed
-    config = _migrate_legacy_format(config)
 
     # Determine engine and validate extra_args
     llm_dict = config.get("engine", {}).get("llm", {})

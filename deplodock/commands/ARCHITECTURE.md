@@ -26,7 +26,7 @@ Recipe loading, configuration dataclasses, and engine flag mapping.
 
 **Modules:**
 - `types.py` — `Recipe`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig` dataclasses
-- `recipe.py` — `deep_merge()`, `load_recipe()`, `validate_extra_args()`, `_migrate_legacy_format()`
+- `recipe.py` — `deep_merge()`, `load_recipe()`, `validate_extra_args()`
 - `engines.py` — `VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`, `banned_extra_arg_flags()`, `build_engine_args()`
 
 `load_recipe()` returns a `Recipe` dataclass. All consumers use attribute access (e.g. `recipe.engine.llm.tensor_parallel_size`).

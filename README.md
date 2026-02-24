@@ -12,7 +12,7 @@ Tools for deploying and benchmarking LLM inference on GPU servers.
     - [bench/](deplodock/commands/bench/) — `bench` command
     - [report/](deplodock/commands/report/) — `report` command
     - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
-  - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping
+  - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
   - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
   - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution

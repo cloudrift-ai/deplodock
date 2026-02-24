@@ -44,7 +44,7 @@ Test individual functions in isolation with synthetic inputs.
 |------|--------|
 | `recipe/test_types.py` | `Recipe.from_dict()`, `LLMConfig` properties (`engine_name`, `gpus_per_instance`, `image`, `extra_args`), dataclass defaults |
 | `recipe/test_engines.py` | `build_engine_args()`, `banned_extra_arg_flags()` — engine flag mapping, CLI argument building for vLLM and SGLang |
-| `deploy/test_recipe.py` | `deplodock.recipe.load_recipe()`, `deep_merge()`, `validate_extra_args()` — recipe loading, variant resolution, YAML parsing, extra_args validation, legacy migration |
+| `deploy/test_recipe.py` | `deplodock.recipe.load_recipe()`, `deep_merge()`, `validate_extra_args()` — recipe loading, variant resolution, YAML parsing, extra_args validation |
 | `deploy/test_compose.py` | `deplodock.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `gpu_device_ids` support |
 | `provisioning/test_cloud.py` | `deplodock.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud provisioning unit tests |
 | `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`), grouping logic, sorting |
