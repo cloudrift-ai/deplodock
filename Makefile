@@ -24,12 +24,12 @@ setup:
 	fi
 
 bench: setup
-	@echo "Running benchmarks in parallel..."
-	./venv/bin/deplodock bench --parallel
+	@echo "Running benchmarks..."
+	./venv/bin/deplodock bench recipes/*
 
 bench-force: setup
-	@echo "Running benchmarks in parallel (force mode)..."
-	./venv/bin/deplodock bench --parallel --force
+	@echo "Running benchmarks (force mode)..."
+	./venv/bin/deplodock bench recipes/* --force
 
 report: setup
 	@echo "Generating Excel report from benchmark results..."

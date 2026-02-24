@@ -1,6 +1,6 @@
 """Unit tests for hardware lookup tables."""
 
-from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
+from deplodock.hardware import GPU_INSTANCE_TYPES, GPU_SHORT_NAMES, gpu_short_name, resolve_instance_type
 
 
 # ── resolve_instance_type ────────────────────────────────────────
@@ -43,3 +43,23 @@ def test_known_gpu_lookup():
 def test_gcp_gpu_lookup():
     entries = GPU_INSTANCE_TYPES["NVIDIA H100 80GB"]
     assert entries[0] == ("gcp", "a3-highgpu")
+
+
+# ── gpu_short_name ────────────────────────────────────────────────
+
+
+def test_gpu_short_name_known():
+    assert gpu_short_name("NVIDIA GeForce RTX 5090") == "rtx5090"
+    assert gpu_short_name("NVIDIA H200 141GB") == "h200"
+    assert gpu_short_name("NVIDIA RTX PRO 6000 Server Edition") == "pro6000"
+
+
+def test_gpu_short_name_unknown_fallback():
+    result = gpu_short_name("Some Unknown GPU 9000")
+    assert result == "someunknowngpu9000"
+
+
+def test_gpu_short_names_covers_all_instance_types():
+    """Every GPU in GPU_INSTANCE_TYPES has a short name."""
+    for gpu_name in GPU_INSTANCE_TYPES:
+        assert gpu_name in GPU_SHORT_NAMES, f"GPU '{gpu_name}' missing from GPU_SHORT_NAMES"

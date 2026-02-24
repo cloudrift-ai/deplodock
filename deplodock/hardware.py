@@ -51,6 +51,33 @@ GPU_INSTANCE_TYPES = {
 }
 
 
+# Full GPU name -> short name for result filenames.
+GPU_SHORT_NAMES = {
+    "NVIDIA GeForce RTX 4090": "rtx4090",
+    "NVIDIA GeForce RTX 5090": "rtx5090",
+    "NVIDIA RTX PRO 6000 Workstation Edition": "pro6000",
+    "NVIDIA RTX PRO 6000 Server Edition": "pro6000",
+    "NVIDIA L40S": "l40s",
+    "NVIDIA H100 80GB": "h100",
+    "NVIDIA H200 141GB": "h200",
+    "NVIDIA B200": "b200",
+    "NVIDIA A100 40GB": "a100",
+    "NVIDIA A100 80GB": "a100",
+    "AMD Instinct MI350X": "mi350x",
+}
+
+
+def gpu_short_name(full_name):
+    """Map a full GPU name to a short name for filenames.
+
+    Falls back to lowercased alphanumeric if not in the lookup table.
+    """
+    if full_name in GPU_SHORT_NAMES:
+        return GPU_SHORT_NAMES[full_name]
+    import re
+    return re.sub(r"[^a-z0-9]", "", full_name.lower())
+
+
 def resolve_instance_type(provider, base, gpu_count):
     """Derive full instance type name from base name and GPU count."""
     if provider == "cloudrift":

@@ -1,13 +1,13 @@
-"""Bench command: run LLM benchmarks on remote servers via SSH.
+"""Bench command: deploy + benchmark + teardown on cloud VMs.
 
-Uses the deploy infrastructure (recipe loading, SSH deploy/teardown) instead of
-cloning a repo on the remote server.
+Accepts recipe directories as positional args. A Planner groups tasks into
+ExecutionGroups that share VMs; groups run in parallel via asyncio.
 """
 
+import asyncio
 import logging
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -18,14 +18,17 @@ from deplodock.commands.deploy import (
     DeployParams,
     calculate_num_instances,
     deploy as deploy_entry,
+    load_recipe,
     teardown as teardown_entry,
 )
 from deplodock.commands.deploy.cloud import (
     delete_cloud_vm,
     provision_cloud_vm,
-    resolve_vm_spec,
 )
 from deplodock.commands.deploy.ssh import make_run_cmd, provision_remote
+from deplodock.hardware import gpu_short_name
+from deplodock.planner import BenchmarkTask, ExecutionGroup
+from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
 
 # Global log file path
@@ -50,10 +53,10 @@ def setup_logging() -> str:
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
 
-    file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
     file_formatter = logging.Formatter(
-        '[%(asctime)s] [%(name)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        "[%(asctime)s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
@@ -62,32 +65,32 @@ def setup_logging() -> str:
 
     class CustomConsoleFormatter(logging.Formatter):
         def format(self, record):
-            if '.' in record.name:
-                server, model = record.name.split('.', 1)
+            if "." in record.name:
+                server, model = record.name.split(".", 1)
                 record.name = f"{server}] [{model}"
             return super().format(record)
 
-    console_formatter = CustomConsoleFormatter('[%(name)s] %(message)s')
+    console_formatter = CustomConsoleFormatter("[%(name)s] %(message)s")
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
 
     return str(LOG_FILE)
 
 
-def get_server_logger(server_name: str, model_name: Optional[str] = None) -> logging.Logger:
-    """Get or create a logger for a specific server and model."""
+def _get_group_logger(group: ExecutionGroup, model_name: Optional[str] = None) -> logging.Logger:
+    """Get a logger for an execution group."""
+    short = gpu_short_name(group.gpu_name)
+    group_label = f"{short}_x_{group.gpu_count}"
     if model_name:
-        short_model = model_name.split('/')[-1] if '/' in model_name else model_name
-        logger_name = f"{server_name}.{short_model}"
-    else:
-        logger_name = server_name
-    return logging.getLogger(logger_name)
+        short_model = model_name.split("/")[-1] if "/" in model_name else model_name
+        return logging.getLogger(f"{group_label}.{short_model}")
+    return logging.getLogger(group_label)
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
     """Load configuration from YAML file."""
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, "r") as f:
             config = yaml.safe_load(f)
         return config
     except FileNotFoundError:
@@ -100,33 +103,18 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 def validate_config(config: dict) -> None:
     """Validate that required configuration fields are present."""
-    if 'benchmark' not in config:
+    if "benchmark" not in config:
         print("Error: Missing 'benchmark' section in config.")
         sys.exit(1)
 
-    if 'servers' not in config or not config['servers']:
-        print("Error: Missing 'servers' section or empty servers list in config.")
-        sys.exit(1)
-
-    required_benchmark_fields = ['local_results_dir']
+    required_benchmark_fields = ["local_results_dir"]
     for field in required_benchmark_fields:
-        if field not in config['benchmark']:
+        if field not in config["benchmark"]:
             print(f"Error: Missing '{field}' in 'benchmark' section.")
             sys.exit(1)
 
-    required_server_fields = ['name', 'ssh_key', 'recipes']
-    for idx, server in enumerate(config['servers']):
-        for field in required_server_fields:
-            if field not in server:
-                print(f"Error: Missing '{field}' in server entry {idx} ({server.get('name', 'unnamed')}).")
-                sys.exit(1)
 
-        if not server['recipes'] or not isinstance(server['recipes'], list):
-            print(f"Error: Server '{server['name']}' must have a non-empty 'recipes' list.")
-            sys.exit(1)
-
-
-def expand_path(path: str) -> str:
+def _expand_path(path: str) -> str:
     """Expand user home directory and environment variables in path."""
     return os.path.expanduser(os.path.expandvars(path))
 
@@ -158,14 +146,14 @@ def run_benchmark_workload(run_cmd, recipe_config, dry_run=False):
     Returns:
         (success: bool, output: str)
     """
-    benchmark_params = recipe_config.get('benchmark', {})
-    max_concurrency = benchmark_params.get('max_concurrency', 128)
-    num_prompts = benchmark_params.get('num_prompts', 256)
-    random_input_len = benchmark_params.get('random_input_len', 8000)
-    random_output_len = benchmark_params.get('random_output_len', 8000)
+    benchmark_params = recipe_config.get("benchmark", {})
+    max_concurrency = benchmark_params.get("max_concurrency", 128)
+    num_prompts = benchmark_params.get("num_prompts", 256)
+    random_input_len = benchmark_params.get("random_input_len", 8000)
+    random_output_len = benchmark_params.get("random_output_len", 8000)
 
     # Warn if input + output lengths risk exceeding max-model-len
-    extra_args = recipe_config.get('backend', {}).get('vllm', {}).get('extra_args', '')
+    extra_args = recipe_config.get("backend", {}).get("vllm", {}).get("extra_args", "")
     max_model_len = _parse_max_model_len(extra_args)
     if max_model_len is not None and random_input_len + random_output_len >= max_model_len:
         logging.getLogger().warning(
@@ -175,8 +163,8 @@ def run_benchmark_workload(run_cmd, recipe_config, dry_run=False):
             f"max-model-len ({max_model_len})"
         )
 
-    model_name = recipe_config['model']['name']
-    image = recipe_config['backend']['vllm'].get('image', 'vllm/vllm-openai:latest')
+    model_name = recipe_config["model"]["name"]
+    image = recipe_config["backend"]["vllm"].get("image", "vllm/vllm-openai:latest")
 
     num_instances = calculate_num_instances(recipe_config)
     port = 8080 if num_instances > 1 else 8000
@@ -197,70 +185,125 @@ def run_benchmark_workload(run_cmd, recipe_config, dry_run=False):
     return rc == 0, output
 
 
-def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict,
-                          force: bool = False, dry_run: bool = False) -> List[tuple]:
-    """Run all benchmarks for a single server.
+# ── Task enumeration ──────────────────────────────────────────────
 
-    Auto-provisions a VM based on the GPU requirements in the recipes,
-    runs benchmarks, and deletes the VM afterwards.
+
+def enumerate_tasks(recipe_dirs, variants_filter=None):
+    """Build BenchmarkTask list from recipe dirs and optional variant filter.
+
+    For each recipe dir, reads the raw variants from recipe.yaml. If
+    variants_filter is given, only matching variants are kept (with a
+    warning for missing ones). Each selected variant is loaded and
+    turned into a BenchmarkTask.
+    """
+    tasks = []
+    for recipe_dir in recipe_dirs:
+        recipe_path = os.path.join(recipe_dir, "recipe.yaml")
+        if not os.path.isfile(recipe_path):
+            print(f"Warning: No recipe.yaml in {recipe_dir}, skipping.", file=sys.stderr)
+            continue
+
+        with open(recipe_path) as f:
+            raw = yaml.safe_load(f)
+
+        available_variants = list((raw.get("variants") or {}).keys())
+        if not available_variants:
+            print(f"Warning: No variants in {recipe_dir}, skipping.", file=sys.stderr)
+            continue
+
+        if variants_filter is not None:
+            selected = []
+            for v in variants_filter:
+                if v in available_variants:
+                    selected.append(v)
+                else:
+                    print(
+                        f"Warning: variant '{v}' not in {recipe_dir} "
+                        f"(available: {', '.join(available_variants)}), skipping.",
+                        file=sys.stderr,
+                    )
+            variants_to_run = selected
+        else:
+            variants_to_run = available_variants
+
+        for variant in variants_to_run:
+            config = load_recipe(recipe_dir, variant=variant)
+            gpu_name = config.get("gpu")
+            gpu_count = config.get("gpu_count", 1)
+            if gpu_name is None:
+                print(
+                    f"Warning: variant '{variant}' in {recipe_dir} missing 'gpu', skipping.",
+                    file=sys.stderr,
+                )
+                continue
+
+            tasks.append(BenchmarkTask(
+                recipe_dir=recipe_dir,
+                variant=variant,
+                recipe_config=config,
+                gpu_name=gpu_name,
+                gpu_count=gpu_count,
+            ))
+
+    return tasks
+
+
+# ── Execution ─────────────────────────────────────────────────────
+
+
+def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
+                        force: bool = False, dry_run: bool = False) -> List[tuple]:
+    """Run all benchmark tasks for one execution group.
+
+    Provisions a VM with group.gpu_count GPUs, then runs each task.
+    Tasks with fewer GPUs than the group get _gpu_device_ids set.
     """
     results = []
-    server_name = server['name']
-    ssh_key = expand_path(server['ssh_key'])
-    model_dir = config['benchmark'].get('model_dir', '/hf_models')
-    hf_token = os.environ.get('HF_TOKEN', '')
-    local_results_dir = Path(expand_path(config['benchmark']['local_results_dir']))
-    providers_config = config.get('providers', {})
+    model_dir = config["benchmark"].get("model_dir", "/hf_models")
+    hf_token = os.environ.get("HF_TOKEN", "")
+    local_results_dir = Path(_expand_path(config["benchmark"]["local_results_dir"]))
+    providers_config = config.get("providers", {})
 
-    logger = get_server_logger(server_name)
-    logger.info(f"Starting benchmarks for server: {server_name}")
+    short = gpu_short_name(group.gpu_name)
+    group_label = f"{short}_x_{group.gpu_count}"
+    logger = _get_group_logger(group)
+    logger.info(f"Starting group: {group.gpu_name} x{group.gpu_count} ({len(group.tasks)} tasks)")
 
-    # Resolve GPU requirements from recipes
-    try:
-        gpu_name, gpu_count, loaded_configs = resolve_vm_spec(recipe_entries, server_name)
-    except (FileNotFoundError, ValueError) as e:
-        logger.error(f"Failed to resolve VM spec: {e}")
-        for entry in recipe_entries:
-            results.append((server_name, entry['recipe'], False))
-        return results
-
-    # Provision VM via deploy/cloud layer
     conn = None
     try:
         conn = provision_cloud_vm(
-            gpu_name, gpu_count, ssh_key, providers_config,
-            server_name=server_name, dry_run=dry_run, logger=logger,
+            group.gpu_name, group.gpu_count, ssh_key, providers_config,
+            server_name=group_label, dry_run=dry_run, logger=logger,
         )
         if conn is None:
             logger.error("VM provisioning failed")
-            for entry in recipe_entries:
-                results.append((server_name, entry['recipe'], False))
+            for task in group.tasks:
+                results.append((task.result_filename, task.model_name, False))
             return results
 
         logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
-
-        # Provision the remote server (install Docker, NVIDIA toolkit, etc.)
         provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
 
-        for entry, recipe_config in loaded_configs:
-            recipe_path = entry['recipe']
-            variant = entry.get('variant')
-
-            model_name = recipe_config['model']['name']
-            model_name_safe = model_name.replace('/', '_')
-            result_filename = f"{server_name}_{model_name_safe}_vllm_benchmark.txt"
+        for task in group.tasks:
+            recipe_config = task.recipe_config
+            model_name = task.model_name
+            result_filename = task.result_filename
             result_path = local_results_dir / result_filename
 
-            recipe_logger = get_server_logger(server_name, model_name)
-            recipe_logger.info(f"Recipe: {recipe_path} (variant: {variant})")
+            task_logger = _get_group_logger(group, model_name)
+            task_logger.info(f"Recipe: {task.recipe_dir} (variant: {task.variant})")
 
             # Check if result already exists
             if not force and result_path.exists():
-                recipe_logger.info(f"Result already exists: {result_path}, skipping (use --force to re-run)")
-                results.append((server_name, model_name, True))
+                task_logger.info(f"Result already exists: {result_path}, skipping (use --force to re-run)")
+                results.append((result_filename, model_name, True))
                 continue
 
-            # Deploy model via shared entry point
+            # Set GPU device IDs if task needs fewer GPUs than group
+            if task.gpu_count < group.gpu_count:
+                recipe_config = dict(recipe_config)
+                recipe_config["_gpu_device_ids"] = list(range(task.gpu_count))
+
             params = DeployParams(
                 server=conn.address,
                 ssh_key=ssh_key,
@@ -270,16 +313,15 @@ def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict
                 hf_token=hf_token,
                 dry_run=dry_run,
             )
-            recipe_logger.info("Deploying model...")
+            task_logger.info("Deploying model...")
             success = deploy_entry(params)
 
             if not success:
-                recipe_logger.error("Deploy failed, skipping benchmark")
-                results.append((server_name, model_name, False))
+                task_logger.error("Deploy failed, skipping benchmark")
+                results.append((result_filename, model_name, False))
                 continue
 
-            # Run benchmark (needs run_cmd for remote command execution)
-            recipe_logger.info("Running benchmark...")
+            task_logger.info("Running benchmark...")
             run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
             bench_success, output = run_benchmark_workload(
                 run_cmd, recipe_config, dry_run=dry_run,
@@ -290,20 +332,18 @@ def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict
                     benchmark_results = extract_benchmark_results(output)
                     local_results_dir.mkdir(parents=True, exist_ok=True)
                     result_path.write_text(benchmark_results)
-                    recipe_logger.info(f"Results saved to: {result_path}")
+                    task_logger.info(f"Results saved to: {result_path}")
                 else:
-                    recipe_logger.info(f"[dry-run] Would save results to: {result_path}")
-                results.append((server_name, model_name, True))
+                    task_logger.info(f"[dry-run] Would save results to: {result_path}")
+                results.append((result_filename, model_name, True))
             else:
-                recipe_logger.error("Benchmark failed")
-                results.append((server_name, model_name, False))
+                task_logger.error("Benchmark failed")
+                results.append((result_filename, model_name, False))
 
-            # Teardown containers via shared entry point
-            recipe_logger.info("Tearing down...")
+            task_logger.info("Tearing down...")
             teardown_entry(params)
 
     finally:
-        # Always delete the VM
         if conn is not None and conn.delete_info:
             logger.info("Deleting VM...")
             try:
@@ -312,7 +352,27 @@ def run_server_benchmarks(server: dict, recipe_entries: List[dict], config: dict
             except Exception as e:
                 logger.error(f"Failed to delete VM: {e}")
 
-    logger.info(f"Completed benchmarks for server: {server_name}")
+    logger.info(f"Completed group: {group_label}")
+    return results
+
+
+# ── Async orchestration ───────────────────────────────────────────
+
+
+async def _run_groups(groups, config, ssh_key, force, dry_run, max_workers):
+    """Run execution groups concurrently with a semaphore."""
+    sem = asyncio.Semaphore(max_workers or len(groups))
+
+    async def _run_with_semaphore(group):
+        async with sem:
+            return await asyncio.to_thread(
+                run_execution_group, group, config, ssh_key, force, dry_run,
+            )
+
+    results = await asyncio.gather(
+        *(_run_with_semaphore(g) for g in groups),
+        return_exceptions=True,
+    )
     return results
 
 
@@ -326,81 +386,41 @@ def handle_bench(args):
     config = load_config(args.config)
     validate_config(config)
 
-    servers = config['servers']
+    ssh_key = _expand_path(args.ssh_key)
     dry_run = args.dry_run
 
-    if args.server:
-        servers = [s for s in servers if s['name'] == args.server]
-        if not servers:
-            root_logger.error(f"Error: Server '{args.server}' not found in config.")
-            sys.exit(1)
-
-    # Build list of (server, recipe_entries) tuples
-    server_tasks = []
-    total_combinations = 0
-
-    for server in servers:
-        recipes = server['recipes']
-
-        if args.recipe:
-            recipes = [r for r in recipes if r['recipe'] == args.recipe]
-            if not recipes:
-                root_logger.warning(
-                    f"Warning: Recipe '{args.recipe}' not found in server '{server['name']}'. "
-                    "Skipping this server."
-                )
-                continue
-
-        server_tasks.append((server, recipes))
-        total_combinations += len(recipes)
-
-    if not server_tasks:
-        root_logger.error("Error: No server-recipe combinations to benchmark.")
+    # Enumerate tasks from recipe dirs
+    tasks = enumerate_tasks(args.recipes, variants_filter=args.variants)
+    if not tasks:
+        root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
 
+    # Plan execution groups
+    planner = GroupByModelAndGpuPlanner()
+    groups = planner.plan(tasks)
+
     root_logger.info(
-        f"Running benchmarks for {total_combinations} server-recipe combination(s) "
-        f"across {len(server_tasks)} server(s)"
+        f"Running {len(tasks)} benchmark task(s) in {len(groups)} execution group(s)"
     )
-    if args.parallel:
-        root_logger.info(
-            f"Parallel mode: Servers will run in parallel "
-            f"(max workers: {args.max_workers or len(server_tasks)})"
-        )
-    else:
-        root_logger.info("Sequential mode: Servers will run one at a time")
+    root_logger.info(
+        f"Parallel mode (max workers: {args.max_workers or len(groups)})"
+    )
     root_logger.info("")
 
+    # Run groups
+    raw_results = asyncio.run(
+        _run_groups(groups, config, ssh_key, args.force, dry_run, args.max_workers)
+    )
+
+    # Flatten results, handling exceptions
     results = []
-
-    if args.parallel:
-        max_workers = args.max_workers or len(server_tasks)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_server = {
-                executor.submit(
-                    run_server_benchmarks, server, recipes, config,
-                    args.force, dry_run,
-                ): server['name']
-                for server, recipes in server_tasks
-            }
-
-            for future in as_completed(future_to_server):
-                server_name = future_to_server[future]
-                try:
-                    server_results = future.result()
-                    results.extend(server_results)
-                except Exception as exc:
-                    root_logger.error(f"Server {server_name} generated an exception: {exc}")
-                    for server, recipes in server_tasks:
-                        if server['name'] == server_name:
-                            for entry in recipes:
-                                results.append((server_name, entry['recipe'], False))
-    else:
-        for server, recipes in server_tasks:
-            server_results = run_server_benchmarks(
-                server, recipes, config, args.force, dry_run,
-            )
-            results.extend(server_results)
+    for i, r in enumerate(raw_results):
+        if isinstance(r, Exception):
+            root_logger.error(f"Group {i} generated an exception: {r}")
+            for task in groups[i].tasks:
+                results.append((task.result_filename, task.model_name, False))
+        else:
+            results.extend(r)
 
     # Print summary
     root_logger.info("SUMMARY")
@@ -410,14 +430,14 @@ def handle_bench(args):
 
     root_logger.info(f"Successful: {len(successful)}/{len(results)}")
     if successful:
-        for server_name, model, _ in successful:
-            root_logger.info(f"   - {server_name} x {model}")
+        for name, model, _ in successful:
+            root_logger.info(f"   - {name}")
 
     if failed:
         root_logger.info("")
         root_logger.info(f"Failed: {len(failed)}/{len(results)}")
-        for server_name, model, _ in failed:
-            root_logger.info(f"   - {server_name} x {model}")
+        for name, model, _ in failed:
+            root_logger.info(f"   - {name}")
 
     root_logger.info("")
     root_logger.info("All done!")
@@ -428,40 +448,43 @@ def register_bench_command(subparsers):
     """Register the bench subcommand."""
     parser = subparsers.add_parser(
         "bench",
-        help="Run LLM benchmarks on remote servers via SSH",
+        help="Run LLM benchmarks on cloud VMs",
     )
     parser.add_argument(
-        '--config',
-        default='config.yaml',
-        help='Path to configuration file (default: config.yaml)',
+        "recipes",
+        nargs="+",
+        help="Recipe directories to benchmark",
     )
     parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Force benchmark even if results already exist',
+        "--variants",
+        nargs="+",
+        default=None,
+        help="Variant names to run (default: all variants in each recipe)",
     )
     parser.add_argument(
-        '--server',
-        help='Run benchmarks only for a specific server (by name)',
+        "--ssh-key",
+        default="~/.ssh/id_ed25519",
+        help="SSH private key path (default: ~/.ssh/id_ed25519)",
     )
     parser.add_argument(
-        '--recipe',
-        help='Run benchmarks only for a specific recipe path',
+        "--config",
+        default="config.yaml",
+        help="Path to configuration file (default: config.yaml)",
     )
     parser.add_argument(
-        '--parallel',
-        action='store_true',
-        help='Run benchmarks on different servers in parallel',
+        "--force",
+        action="store_true",
+        help="Force benchmark even if results already exist",
     )
     parser.add_argument(
-        '--max-workers',
+        "--max-workers",
         type=int,
         default=None,
-        help='Maximum number of parallel server benchmarks (default: number of servers)',
+        help="Maximum number of parallel execution groups (default: number of groups)",
     )
     parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Print commands without executing',
+        "--dry-run",
+        action="store_true",
+        help="Print commands without executing",
     )
     parser.set_defaults(func=handle_bench)

@@ -32,7 +32,7 @@ pytest tests/test_recipe.py -v
 - `deplodock deploy local ...` — deploy locally via docker compose
 - `deplodock deploy ssh ...` — deploy to remote server via SSH
 - `deplodock deploy cloud ...` — provision a cloud VM and deploy via SSH
-- `deplodock bench ...` — deploy + benchmark + teardown on remote servers (uses deploy infrastructure)
+- `deplodock bench recipes/* ...` — deploy + benchmark + teardown on cloud VMs (recipe dirs as positional args)
 - `deplodock report ...` — generate Excel reports from benchmark results
 - `deplodock vm create gcp-flex-start ...` — create a GCP flex-start GPU VM
 - `deplodock vm create cloudrift ...` — create a CloudRift GPU VM
@@ -42,7 +42,7 @@ pytest tests/test_recipe.py -v
 ## Key Make Targets
 
 - `make setup` — create venv and install dependencies
-- `make bench` — run benchmarks in parallel (`deplodock bench --parallel`)
+- `make bench` — run benchmarks (`deplodock bench recipes/*`)
 - `make report` — generate Excel report (`deplodock report`)
 - `make clean` — remove venv and generated files
 
