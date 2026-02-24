@@ -4,7 +4,6 @@ import yaml
 
 from deplodock.deploy import generate_compose, generate_nginx_conf
 
-
 # ── generate_compose ────────────────────────────────────────────────
 
 

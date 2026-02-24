@@ -75,6 +75,7 @@ def gpu_short_name(full_name):
     if full_name in GPU_SHORT_NAMES:
         return GPU_SHORT_NAMES[full_name]
     import re
+
     return re.sub(r"[^a-z0-9]", "", full_name.lower())
 
 

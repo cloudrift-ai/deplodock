@@ -54,8 +54,12 @@ Group imports in this order, separated by blank lines:
 ### Formatting
 
 - 4 spaces for indentation.
-- Keep lines under ~100 characters where practical.
+- Keep lines under ~140 characters (enforced by Ruff).
 - Double quotes for strings.
+
+### Tooling
+
+Style rules are enforced by [Ruff](https://docs.astral.sh/ruff/), configured in `pyproject.toml`. Run `make lint` to check and `make format` to auto-fix. Enabled rule sets: `E` (pycodestyle), `F` (pyflakes), `W` (warnings), `I` (isort), `UP` (pyupgrade), `B` (bugbear).
 
 ### Dependency Injection for Testability
 

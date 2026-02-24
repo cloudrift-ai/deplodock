@@ -6,21 +6,8 @@ import sys
 from deplodock.provisioning.cloudrift import (
     DEFAULT_API_URL,
     DEFAULT_IMAGE_URL,
-    # Re-export business logic for backward compatibility
-    _api_request,
-    _rent_instance,
-    _terminate_instance,
-    _get_instance_info,
-    _list_ssh_keys,
-    _add_ssh_key,
-    _ensure_ssh_key,
-    _extract_connection_info,
-    _print_connection_info,
-    wait_for_status,
     create_instance,
     delete_instance,
-    API_VERSION,
-    DEFAULT_CLOUDINIT_URL,
 )
 
 

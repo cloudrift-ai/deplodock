@@ -2,15 +2,17 @@
 
 import os
 
-
 # ── deploy cloud dry-run ─────────────────────────────────────────
 
 
 def test_deploy_cloud_dry_run(run_cli, recipes_dir):
     rc, stdout, stderr = run_cli(
-        "deploy", "cloud",
-        "--recipe", os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--variant", "RTX5090",
+        "deploy",
+        "cloud",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--variant",
+        "RTX5090",
         "--dry-run",
     )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
@@ -19,9 +21,12 @@ def test_deploy_cloud_dry_run(run_cli, recipes_dir):
 
 def test_deploy_cloud_dry_run_deploy_steps(run_cli, recipes_dir):
     rc, stdout, stderr = run_cli(
-        "deploy", "cloud",
-        "--recipe", os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--variant", "RTX5090",
+        "deploy",
+        "cloud",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--variant",
+        "RTX5090",
         "--dry-run",
     )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
@@ -36,8 +41,10 @@ def test_deploy_cloud_dry_run_deploy_steps(run_cli, recipes_dir):
 def test_deploy_cloud_no_variant_fails(run_cli, recipes_dir):
     """Without a variant, no gpu field -> error."""
     rc, stdout, stderr = run_cli(
-        "deploy", "cloud",
-        "--recipe", os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "deploy",
+        "cloud",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
         "--dry-run",
     )
     assert rc != 0

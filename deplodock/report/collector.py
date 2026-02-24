@@ -8,7 +8,7 @@ import yaml
 
 def load_config(config_file: str) -> dict:
     """Load configuration from YAML file."""
-    with open(config_file, 'r') as f:
+    with open(config_file) as f:
         return yaml.safe_load(f)
 
 

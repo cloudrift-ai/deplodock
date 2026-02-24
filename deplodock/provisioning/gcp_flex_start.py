@@ -7,7 +7,6 @@ import time
 from deplodock.provisioning.shell import run_shell_cmd
 from deplodock.provisioning.types import VMConnectionInfo
 
-
 # ── Command builders ───────────────────────────────────────────────
 
 
@@ -29,14 +28,22 @@ def _gcloud_create_cmd(
         provisioning_model: FLEX_START, SPOT, or STANDARD.
     """
     cmd = [
-        "gcloud", "compute", "instances", "create", instance,
-        "--zone", zone,
-        "--machine-type", machine_type,
+        "gcloud",
+        "compute",
+        "instances",
+        "create",
+        instance,
+        "--zone",
+        zone,
+        "--machine-type",
+        machine_type,
         f"--provisioning-model={provisioning_model}",
         "--maintenance-policy=TERMINATE",
         "--reservation-affinity=none",
-        "--image-family", image_family,
-        "--image-project", image_project,
+        "--image-family",
+        image_family,
+        "--image-project",
+        image_project,
     ]
     # Duration and termination flags are only valid for FLEX_START
     if provisioning_model == "FLEX_START":
@@ -57,26 +64,48 @@ def _gcloud_delete_cmd(instance, zone):
 def _gcloud_status_cmd(instance, zone):
     """Build gcloud command to get instance status."""
     return [
-        "gcloud", "compute", "instances", "describe", instance,
-        "--zone", zone, "--format", "value(status)",
+        "gcloud",
+        "compute",
+        "instances",
+        "describe",
+        instance,
+        "--zone",
+        zone,
+        "--format",
+        "value(status)",
     ]
 
 
 def _gcloud_external_ip_cmd(instance, zone):
     """Build gcloud command to get external IP."""
     return [
-        "gcloud", "compute", "instances", "describe", instance,
-        "--zone", zone, "--format", "value(networkInterfaces[0].accessConfigs[0].natIP)",
+        "gcloud",
+        "compute",
+        "instances",
+        "describe",
+        instance,
+        "--zone",
+        zone,
+        "--format",
+        "value(networkInterfaces[0].accessConfigs[0].natIP)",
     ]
 
 
 def _gcloud_ssh_check_cmd(instance, zone, ssh_gateway=None):
     """Build gcloud command to check SSH connectivity."""
     cmd = [
-        "gcloud", "compute", "ssh", instance,
-        "--zone", zone, "--command", "true",
-        "--ssh-flag=-o", "--ssh-flag=ConnectTimeout=5",
-        "--ssh-flag=-o", "--ssh-flag=StrictHostKeyChecking=no",
+        "gcloud",
+        "compute",
+        "ssh",
+        instance,
+        "--zone",
+        zone,
+        "--command",
+        "true",
+        "--ssh-flag=-o",
+        "--ssh-flag=ConnectTimeout=5",
+        "--ssh-flag=-o",
+        "--ssh-flag=StrictHostKeyChecking=no",
     ]
     if ssh_gateway:
         cmd.extend(["--ssh-flag=-o", f"--ssh-flag=ProxyJump={ssh_gateway}"])
@@ -168,7 +197,9 @@ def create_instance(
     print(f"Creating instance '{instance}' in zone '{zone}' (provisioning: {provisioning_model})...")
 
     cmd = _gcloud_create_cmd(
-        instance, zone, machine_type,
+        instance,
+        zone,
+        machine_type,
         provisioning_model=provisioning_model,
         max_run_duration=max_run_duration,
         request_valid_for_duration=request_valid_for_duration,

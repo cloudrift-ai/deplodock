@@ -1,7 +1,6 @@
 """Benchmark workload execution."""
 
 import logging
-from typing import Optional
 
 from deplodock.deploy.compose import calculate_num_instances
 
@@ -15,7 +14,7 @@ def extract_benchmark_results(output: str) -> str:
     return output[idx:]
 
 
-def _parse_max_model_len(extra_args: str) -> Optional[int]:
+def _parse_max_model_len(extra_args: str) -> int | None:
     """Extract --max-model-len value from extra_args string."""
     parts = extra_args.split()
     for i, part in enumerate(parts):

@@ -5,7 +5,6 @@ import subprocess
 import sys
 import tempfile
 
-
 REMOTE_DEPLOY_DIR = "~/deploy"
 
 

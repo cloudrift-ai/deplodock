@@ -1,16 +1,15 @@
 """VM lifecycle management: create/delete cloud GPU instances."""
 
-from deplodock.provisioning.ssh import wait_for_ssh
-from deplodock.provisioning.shell import run_shell_cmd
-
 
 def register_vm_command(subparsers):
     """Register the 'vm' command with create/delete action subparsers."""
-    from deplodock.commands.vm.gcp_flex_start import register_create_target, register_delete_target
     from deplodock.commands.vm.cloudrift import (
         register_create_target as register_cloudrift_create,
+    )
+    from deplodock.commands.vm.cloudrift import (
         register_delete_target as register_cloudrift_delete,
     )
+    from deplodock.commands.vm.gcp_flex_start import register_create_target, register_delete_target
 
     vm_parser = subparsers.add_parser("vm", help="Manage cloud VM instances")
 

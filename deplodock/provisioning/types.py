@@ -1,7 +1,6 @@
 """Shared data types for VM providers."""
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
 
 
 @dataclass
@@ -11,7 +10,7 @@ class VMConnectionInfo:
     host: str
     username: str
     ssh_port: int = 22
-    port_mappings: List[Tuple[int, int]] = field(default_factory=list)
+    port_mappings: list[tuple[int, int]] = field(default_factory=list)
     delete_info: tuple = ()
 
     @property

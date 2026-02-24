@@ -3,17 +3,19 @@
 import asyncio
 import os
 from pathlib import Path
-from typing import List
 
 from deplodock.benchmark.bench_logging import _get_group_logger
 from deplodock.benchmark.tasks import _task_meta
 from deplodock.benchmark.workload import extract_benchmark_results, run_benchmark_workload
 from deplodock.deploy import (
     DeployParams,
+)
+from deplodock.deploy import (
     deploy as deploy_entry,
+)
+from deplodock.deploy import (
     teardown as teardown_entry,
 )
-from deplodock.provisioning.ssh_transport import make_run_cmd
 from deplodock.hardware import gpu_short_name
 from deplodock.planner import ExecutionGroup
 from deplodock.provisioning.cloud import (
@@ -21,10 +23,10 @@ from deplodock.provisioning.cloud import (
     provision_cloud_vm,
 )
 from deplodock.provisioning.remote import provision_remote
+from deplodock.provisioning.ssh_transport import make_run_cmd
 
 
-def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
-                        run_dir: Path, dry_run: bool = False) -> List[dict]:
+def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str, run_dir: Path, dry_run: bool = False) -> list[dict]:
     """Run all benchmark tasks for one execution group.
 
     Provisions a VM with group.gpu_count GPUs, then runs each task.
@@ -45,8 +47,13 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
     conn = None
     try:
         conn = provision_cloud_vm(
-            group.gpu_name, group.gpu_count, ssh_key, providers_config,
-            server_name=group_label, dry_run=dry_run, logger=logger,
+            group.gpu_name,
+            group.gpu_count,
+            ssh_key,
+            providers_config,
+            server_name=group_label,
+            dry_run=dry_run,
+            logger=logger,
         )
         if conn is None:
             logger.error("VM provisioning failed")
@@ -93,7 +100,9 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str,
             task_logger.info("Running benchmark...")
             run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
             bench_success, output = run_benchmark_workload(
-                run_cmd, recipe_config, dry_run=dry_run,
+                run_cmd,
+                recipe_config,
+                dry_run=dry_run,
             )
 
             if bench_success or dry_run:
@@ -131,7 +140,12 @@ async def _run_groups(groups, config, ssh_key, run_dir, dry_run, max_workers):
     async def _run_with_semaphore(group):
         async with sem:
             return await asyncio.to_thread(
-                run_execution_group, group, config, ssh_key, run_dir, dry_run,
+                run_execution_group,
+                group,
+                config,
+                ssh_key,
+                run_dir,
+                dry_run,
             )
 
     results = await asyncio.gather(

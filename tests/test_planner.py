@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from deplodock.planner import BenchmarkTask, ExecutionGroup
+from deplodock.planner import BenchmarkTask
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
 
@@ -33,11 +33,11 @@ def test_task_recipe_name():
 def test_task_recipe_name_trailing_slash():
     task = _make_task(recipe_dir="/recipes/Qwen3-Coder-30B/")
     # os.path.basename strips trailing slash correctly
-    assert task.recipe_name == ""  or task.recipe_name == "Qwen3-Coder-30B"
+    assert task.recipe_name == "" or task.recipe_name == "Qwen3-Coder-30B"
 
 
 def test_task_result_path():
-    task = _make_task(recipe_dir="/recipes/MyModel", gpu="NVIDIA GeForce RTX 5090", gpu_count=1)
+    _make_task(recipe_dir="/recipes/MyModel", gpu="NVIDIA GeForce RTX 5090", gpu_count=1)
     task_obj = BenchmarkTask(
         recipe_dir="/recipes/MyModel",
         variant="RTX5090",

@@ -41,7 +41,9 @@ pytest tests/test_recipe.py -v
 
 ## Key Make Targets
 
-- `make setup` — create venv and install dependencies
+- `make setup` — create venv and install dependencies (includes ruff)
+- `make lint` — run `ruff check` and `ruff format --check`
+- `make format` — auto-format code and fix lint violations
 - `make bench` — run benchmarks (`deplodock bench recipes/*`)
 - `make report` — generate Excel report (`deplodock report`)
 - `make clean` — remove venv and generated files
@@ -51,6 +53,11 @@ pytest tests/test_recipe.py -v
 1. Create a feature branch from `main` (e.g. `feature/my-new-feature`)
 2. Write code following guidelines here, in `STYLE.md`, `README.md` and `ARCHITECTURE.md` files in respective folders
 3. Add tests if reasonable (in `tests/` following `tests/ARCHITECTURE.md` guidelines)
-4. Update `STYLE.md`, `README.md`, `CLAUDE.md` and respective `ARCHITECTURE.md` files if necessary
-5. Run tests: `pytest tests/ -v`
-6. Push and open a PR
+4. Check if style changes were introduced and update `STYLE.md` if necessary
+5. Check if project setup, structure or usage patterns have changes and update `README.md` if necessary
+6. Check if general instructions in `CLAUDE.md` are still accurate and update if necessary
+7. Check for `ARCHITECTURE.md` files in directories that were updated and update them if necessary
+8. Run tests: `pytest tests/ -v`
+9. Run linter and format check: `make lint`
+10. Auto-fix formatting: `make format`
+11. Push and open a PR

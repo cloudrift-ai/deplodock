@@ -4,17 +4,9 @@ import sys
 
 from deplodock.provisioning.gcp_flex_start import (
     # Re-export business logic for backward compatibility
-    _gcloud_create_cmd,
-    _gcloud_delete_cmd,
-    _gcloud_status_cmd,
-    _gcloud_external_ip_cmd,
-    _gcloud_ssh_check_cmd,
-    wait_for_status,
-    wait_for_ssh,
     create_instance,
     delete_instance,
 )
-
 
 # ── CLI handlers ───────────────────────────────────────────────────
 
@@ -62,10 +54,20 @@ def register_create_target(subparsers):
     parser.add_argument("--instance", required=True, help="GCP instance name")
     parser.add_argument("--zone", required=True, help="GCP zone (e.g. us-central1-a)")
     parser.add_argument("--machine-type", required=True, help="Machine type (e.g. a2-highgpu-1g)")
-    parser.add_argument("--provisioning-model", default="FLEX_START", choices=["FLEX_START", "SPOT", "STANDARD"], help="Provisioning model (default: FLEX_START)")
+    parser.add_argument(
+        "--provisioning-model",
+        default="FLEX_START",
+        choices=["FLEX_START", "SPOT", "STANDARD"],
+        help="Provisioning model (default: FLEX_START)",
+    )
     parser.add_argument("--max-run-duration", default="7d", help="Max VM run time (default: 7d)")
     parser.add_argument("--request-valid-for-duration", default="2h", help="How long to wait for capacity (default: 2h)")
-    parser.add_argument("--termination-action", default="DELETE", choices=["STOP", "DELETE"], help="Action when max-run-duration expires (default: DELETE)")
+    parser.add_argument(
+        "--termination-action",
+        default="DELETE",
+        choices=["STOP", "DELETE"],
+        help="Action when max-run-duration expires (default: DELETE)",
+    )
     parser.add_argument("--image-family", default="debian-12", help="Boot disk image family (default: debian-12)")
     parser.add_argument("--image-project", default="debian-cloud", help="Boot disk image project (default: debian-cloud)")
     parser.add_argument("--gcloud-args", default=None, help="Extra args passed to gcloud compute instances create")

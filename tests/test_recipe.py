@@ -2,8 +2,7 @@
 
 import pytest
 
-from deplodock.deploy import load_recipe, deep_merge
-
+from deplodock.deploy import deep_merge, load_recipe
 
 # ── deep_merge ──────────────────────────────────────────────────────
 

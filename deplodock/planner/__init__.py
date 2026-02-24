@@ -4,7 +4,6 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
 
 
 @dataclass
@@ -37,13 +36,13 @@ class ExecutionGroup:
 
     gpu_name: str
     gpu_count: int
-    tasks: List[BenchmarkTask] = field(default_factory=list)
+    tasks: list[BenchmarkTask] = field(default_factory=list)
 
 
 class BenchmarkPlanner(ABC):
     """Abstract base for grouping benchmark tasks into execution groups."""
 
     @abstractmethod
-    def plan(self, tasks: List[BenchmarkTask]) -> List[ExecutionGroup]:
+    def plan(self, tasks: list[BenchmarkTask]) -> list[ExecutionGroup]:
         """Group benchmark tasks into execution groups."""
         ...

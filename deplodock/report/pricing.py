@@ -3,10 +3,10 @@
 
 def get_gpu_price(config: dict, gpu_type: str, gpu_count: int) -> float:
     """Get GPU price from config."""
-    if 'pricing' not in config:
+    if "pricing" not in config:
         return 0.0
 
-    pricing = config['pricing']
+    pricing = config["pricing"]
     gpu_type_normalized = gpu_type.lower()
 
     if gpu_type_normalized in pricing:
@@ -14,9 +14,9 @@ def get_gpu_price(config: dict, gpu_type: str, gpu_count: int) -> float:
         return price_per_gpu * gpu_count
 
     variations = {
-        'rtx4090': ['4090', 'rtx_4090'],
-        'rtx5090': ['5090', 'rtx_5090'],
-        'pro6000': ['6000', 'rtx_6000', 'rtx6000', 'quadro_rtx_6000']
+        "rtx4090": ["4090", "rtx_4090"],
+        "rtx5090": ["5090", "rtx_5090"],
+        "pro6000": ["6000", "rtx_6000", "rtx6000", "quadro_rtx_6000"],
     }
 
     for base_name, alternatives in variations.items():

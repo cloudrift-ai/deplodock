@@ -5,7 +5,7 @@ across different GPU-count benchmarks. Different models on the same GPU
 type get separate VMs.
 """
 
-from deplodock.planner import BenchmarkPlanner, BenchmarkTask, ExecutionGroup
+from deplodock.planner import BenchmarkPlanner, ExecutionGroup
 
 
 class GroupByModelAndGpuPlanner(BenchmarkPlanner):
@@ -18,10 +18,14 @@ class GroupByModelAndGpuPlanner(BenchmarkPlanner):
             groups.setdefault(key, []).append(task)
 
         result = []
-        for (model, gpu), group_tasks in groups.items():
+        for (_model, gpu), group_tasks in groups.items():
             group_tasks.sort(key=lambda t: t.gpu_count, reverse=True)
             max_count = max(t.gpu_count for t in group_tasks)
-            result.append(ExecutionGroup(
-                gpu_name=gpu, gpu_count=max_count, tasks=group_tasks,
-            ))
+            result.append(
+                ExecutionGroup(
+                    gpu_name=gpu,
+                    gpu_count=max_count,
+                    tasks=group_tasks,
+                )
+            )
         return result

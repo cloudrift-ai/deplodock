@@ -1,10 +1,12 @@
-.PHONY: help setup clean bench bench-force logs clean-logs test-compose report report-nov2025
+.PHONY: help setup clean bench bench-force logs clean-logs test-compose report report-nov2025 lint format
 
 help:
 	@echo "Server Benchmark Makefile"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  setup          - Install system dependencies, create venv, and install Python packages"
+	@echo "  lint           - Run linter and format checks"
+	@echo "  format         - Auto-format code and fix lint violations"
 	@echo "  bench          - Run benchmarks in parallel"
 	@echo "  bench-force    - Run benchmarks in parallel (force re-run, skip cached results)"
 	@echo "  report         - Generate Excel report from benchmark results"
@@ -19,9 +21,17 @@ setup:
 		echo "Creating virtual environment..."; \
 		python3 -m venv venv; \
 		echo "Installing Python dependencies..."; \
-		./venv/bin/pip install -e ".[test]"; \
+		./venv/bin/pip install -e ".[dev]"; \
 		echo "✅ Setup complete!"; \
 	fi
+
+lint: setup
+	./venv/bin/ruff check
+	./venv/bin/ruff format --check
+
+format: setup
+	./venv/bin/ruff format
+	./venv/bin/ruff check --fix
 
 bench: setup
 	@echo "Running benchmarks..."

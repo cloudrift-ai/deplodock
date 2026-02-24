@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from deplodock.deploy.recipe import load_recipe
-from deplodock.provisioning.cloud import resolve_vm_spec, delete_cloud_vm
+from deplodock.provisioning.cloud import delete_cloud_vm, resolve_vm_spec
 from deplodock.provisioning.types import VMConnectionInfo
 
 
@@ -14,7 +14,7 @@ def _load_entries(entries):
     """Pre-load recipe configs from raw entries for resolve_vm_spec."""
     loaded = []
     for entry in entries:
-        config = load_recipe(entry['recipe'], variant=entry.get('variant'))
+        config = load_recipe(entry["recipe"], variant=entry.get("variant"))
         loaded.append((entry, config))
     return loaded
 
@@ -33,8 +33,15 @@ def test_resolve_vm_spec_max_gpu_count(tmp_path):
     """Uses max gpu_count across all entries."""
     recipe = {
         "model": {"name": "test/model"},
-        "backend": {"vllm": {"image": "vllm/vllm-openai:latest", "tensor_parallel_size": 1,
-                              "pipeline_parallel_size": 1, "gpu_memory_utilization": 0.9, "extra_args": ""}},
+        "backend": {
+            "vllm": {
+                "image": "vllm/vllm-openai:latest",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "gpu_memory_utilization": 0.9,
+                "extra_args": "",
+            }
+        },
         "variants": {
             "1x": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
             "2x": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 2},
@@ -56,8 +63,15 @@ def test_resolve_vm_spec_mixed_gpus_raises(tmp_path):
     """Raises ValueError when recipes target different GPUs."""
     recipe = {
         "model": {"name": "test/model"},
-        "backend": {"vllm": {"image": "vllm/vllm-openai:latest", "tensor_parallel_size": 1,
-                              "pipeline_parallel_size": 1, "gpu_memory_utilization": 0.9, "extra_args": ""}},
+        "backend": {
+            "vllm": {
+                "image": "vllm/vllm-openai:latest",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "gpu_memory_utilization": 0.9,
+                "extra_args": "",
+            }
+        },
         "variants": {
             "rtx": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
             "h100": {"gpu": "NVIDIA H100 80GB", "gpu_count": 1},
@@ -78,8 +92,15 @@ def test_resolve_vm_spec_missing_gpu_raises(tmp_path):
     """Raises ValueError when recipe has no gpu field."""
     recipe = {
         "model": {"name": "test/model"},
-        "backend": {"vllm": {"image": "vllm/vllm-openai:latest", "tensor_parallel_size": 1,
-                              "pipeline_parallel_size": 1, "gpu_memory_utilization": 0.9, "extra_args": ""}},
+        "backend": {
+            "vllm": {
+                "image": "vllm/vllm-openai:latest",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "gpu_memory_utilization": 0.9,
+                "extra_args": "",
+            }
+        },
     }
     with open(tmp_path / "recipe.yaml", "w") as f:
         yaml.dump(recipe, f)

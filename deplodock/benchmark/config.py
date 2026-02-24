@@ -9,7 +9,7 @@ import yaml
 def load_config(config_path: str = "config.yaml") -> dict:
     """Load configuration from YAML file."""
     try:
-        with open(config_path, "r") as f:
+        with open(config_path) as f:
             config = yaml.safe_load(f)
         return config
     except FileNotFoundError:
