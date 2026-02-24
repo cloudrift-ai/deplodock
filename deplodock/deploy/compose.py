@@ -24,6 +24,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
     model_name = recipe.model_name
     image = llm.image
     engine = llm.engine_name
+    entrypoint = llm.entrypoint
     gpus_per_instance = llm.gpus_per_instance
 
     engine_args = build_engine_args(llm, model_name)
@@ -46,10 +47,11 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
             gpu_config = f"device_ids: [{gpu_ids_yaml}]"
             port = 8000 + i
 
+        entrypoint_line = f"\n    entrypoint: {entrypoint}" if entrypoint else ""
         services += f"""
   {engine}_{i}:
     image: {image}
-    container_name: {engine}_{i}
+    container_name: {engine}_{i}{entrypoint_line}
     deploy:
       resources:
         reservations:

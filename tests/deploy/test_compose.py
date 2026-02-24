@@ -174,12 +174,20 @@ def test_compose_sglang_single_instance(sample_config_sglang):
     assert "sglang_0:" in result
     assert "vllm_0:" not in result
     assert "lmsysorg/sglang:latest" in result
+    assert "entrypoint: python3 -m sglang.launch_server" in result
     assert "--model-path test-org/test-model" in result
     assert "--model test-org/test-model" not in result
     assert "--tp 1" in result
     assert "--dp 1" in result
     assert "--mem-fraction-static 0.9" in result
     assert "--context-length 8192" in result
+
+
+def test_compose_vllm_no_entrypoint(sample_config):
+    """vLLM compose should not have an entrypoint override."""
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "test-token", num_instances=1)
+    assert "entrypoint:" not in result
 
 
 def test_compose_sglang_parses_as_valid_yaml(sample_config_sglang):

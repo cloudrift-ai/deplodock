@@ -53,6 +53,17 @@ class LLMConfig:
         return VllmConfig().image
 
     @property
+    def entrypoint(self) -> str | None:
+        """Docker entrypoint override for the active engine.
+
+        vLLM images have a built-in entrypoint; SGLang images do not,
+        so we must provide one explicitly.
+        """
+        if self.sglang is not None:
+            return "python3 -m sglang.launch_server"
+        return None
+
+    @property
     def extra_args(self) -> str:
         """Extra CLI flags for the active engine."""
         if self.sglang is not None:
