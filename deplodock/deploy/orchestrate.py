@@ -115,7 +115,7 @@ def run_deploy(run_cmd, write_file, config, model_dir, hf_token, host, dry_run=F
             print("WARNING: Smoke test failed. The endpoint may not be ready yet.", file=sys.stderr)
 
     # Print curl example
-    print(f"\nExample curl:")
+    print("\nExample curl:")
     print(
         f"  curl http://{host}:{port}/v1/chat/completions \\\n"
         f"    -H 'Content-Type: application/json' \\\n"
@@ -145,8 +145,7 @@ def deploy(params: DeployParams) -> bool:
     run_cmd = make_run_cmd(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
     write_file = make_write_file(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
     host = params.server.split("@")[-1] if "@" in params.server else params.server
-    return run_deploy(run_cmd, write_file, params.recipe_config,
-                      params.model_dir, params.hf_token, host, params.dry_run)
+    return run_deploy(run_cmd, write_file, params.recipe_config, params.model_dir, params.hf_token, host, params.dry_run)
 
 
 def teardown(params: DeployParams) -> bool:

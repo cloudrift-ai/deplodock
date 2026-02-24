@@ -6,10 +6,15 @@
 
 def test_vm_create_dry_run(run_cli):
     rc, stdout, _ = run_cli(
-        "vm", "create", "gcp-flex-start",
-        "--instance", "my-gpu-vm",
-        "--zone", "us-central1-a",
-        "--machine-type", "a2-highgpu-1g",
+        "vm",
+        "create",
+        "gcp-flex-start",
+        "--instance",
+        "my-gpu-vm",
+        "--zone",
+        "us-central1-a",
+        "--machine-type",
+        "a2-highgpu-1g",
         "--dry-run",
     )
     assert rc == 0
@@ -23,10 +28,15 @@ def test_vm_create_dry_run(run_cli):
 
 def test_vm_create_dry_run_with_wait_ssh(run_cli):
     rc, stdout, _ = run_cli(
-        "vm", "create", "gcp-flex-start",
-        "--instance", "my-gpu-vm",
-        "--zone", "us-central1-a",
-        "--machine-type", "e2-micro",
+        "vm",
+        "create",
+        "gcp-flex-start",
+        "--instance",
+        "my-gpu-vm",
+        "--zone",
+        "us-central1-a",
+        "--machine-type",
+        "e2-micro",
         "--wait-ssh",
         "--dry-run",
     )
@@ -39,11 +49,17 @@ def test_vm_create_dry_run_with_wait_ssh(run_cli):
 
 def test_vm_create_dry_run_with_gcloud_args(run_cli):
     rc, stdout, _ = run_cli(
-        "vm", "create", "gcp-flex-start",
-        "--instance", "my-gpu-vm",
-        "--zone", "us-central1-a",
-        "--machine-type", "e2-micro",
-        "--gcloud-args", "--no-service-account --no-scopes",
+        "vm",
+        "create",
+        "gcp-flex-start",
+        "--instance",
+        "my-gpu-vm",
+        "--zone",
+        "us-central1-a",
+        "--machine-type",
+        "e2-micro",
+        "--gcloud-args",
+        "--no-service-account --no-scopes",
         "--dry-run",
     )
     assert rc == 0
@@ -53,12 +69,18 @@ def test_vm_create_dry_run_with_gcloud_args(run_cli):
 
 def test_vm_create_dry_run_with_ssh_gateway(run_cli):
     rc, stdout, _ = run_cli(
-        "vm", "create", "gcp-flex-start",
-        "--instance", "my-gpu-vm",
-        "--zone", "us-central1-a",
-        "--machine-type", "e2-micro",
+        "vm",
+        "create",
+        "gcp-flex-start",
+        "--instance",
+        "my-gpu-vm",
+        "--zone",
+        "us-central1-a",
+        "--machine-type",
+        "e2-micro",
         "--wait-ssh",
-        "--ssh-gateway", "gcp-ssh-gateway",
+        "--ssh-gateway",
+        "gcp-ssh-gateway",
         "--dry-run",
     )
     assert rc == 0
@@ -67,9 +89,13 @@ def test_vm_create_dry_run_with_ssh_gateway(run_cli):
 
 def test_vm_delete_dry_run(run_cli):
     rc, stdout, _ = run_cli(
-        "vm", "delete", "gcp-flex-start",
-        "--instance", "my-gpu-vm",
-        "--zone", "us-central1-a",
+        "vm",
+        "delete",
+        "gcp-flex-start",
+        "--instance",
+        "my-gpu-vm",
+        "--zone",
+        "us-central1-a",
         "--dry-run",
     )
     assert rc == 0
@@ -84,9 +110,13 @@ def test_vm_delete_dry_run(run_cli):
 
 def test_vm_create_missing_instance(run_cli):
     rc, _, stderr = run_cli(
-        "vm", "create", "gcp-flex-start",
-        "--zone", "us-central1-a",
-        "--machine-type", "e2-micro",
+        "vm",
+        "create",
+        "gcp-flex-start",
+        "--zone",
+        "us-central1-a",
+        "--machine-type",
+        "e2-micro",
     )
     assert rc != 0
     assert "--instance" in stderr
@@ -94,9 +124,13 @@ def test_vm_create_missing_instance(run_cli):
 
 def test_vm_create_missing_zone(run_cli):
     rc, _, stderr = run_cli(
-        "vm", "create", "gcp-flex-start",
-        "--instance", "my-gpu-vm",
-        "--machine-type", "e2-micro",
+        "vm",
+        "create",
+        "gcp-flex-start",
+        "--instance",
+        "my-gpu-vm",
+        "--machine-type",
+        "e2-micro",
     )
     assert rc != 0
     assert "--zone" in stderr
@@ -104,9 +138,13 @@ def test_vm_create_missing_zone(run_cli):
 
 def test_vm_create_missing_machine_type(run_cli):
     rc, _, stderr = run_cli(
-        "vm", "create", "gcp-flex-start",
-        "--instance", "my-gpu-vm",
-        "--zone", "us-central1-a",
+        "vm",
+        "create",
+        "gcp-flex-start",
+        "--instance",
+        "my-gpu-vm",
+        "--zone",
+        "us-central1-a",
     )
     assert rc != 0
     assert "--machine-type" in stderr
@@ -165,10 +203,15 @@ def test_vm_create_cloudrift_dry_run(run_cli, tmp_path):
     key_file.write_text("ssh-ed25519 AAAA test@host\n")
 
     rc, stdout, _ = run_cli(
-        "vm", "create", "cloudrift",
-        "--instance-type", "rtx4090.1",
-        "--ssh-key", str(key_file),
-        "--api-key", "test-key",
+        "vm",
+        "create",
+        "cloudrift",
+        "--instance-type",
+        "rtx4090.1",
+        "--ssh-key",
+        str(key_file),
+        "--api-key",
+        "test-key",
         "--dry-run",
     )
     assert rc == 0
@@ -180,9 +223,13 @@ def test_vm_create_cloudrift_dry_run(run_cli, tmp_path):
 
 def test_vm_delete_cloudrift_dry_run(run_cli):
     rc, stdout, _ = run_cli(
-        "vm", "delete", "cloudrift",
-        "--instance-id", "inst-123",
-        "--api-key", "test-key",
+        "vm",
+        "delete",
+        "cloudrift",
+        "--instance-id",
+        "inst-123",
+        "--api-key",
+        "test-key",
         "--dry-run",
     )
     assert rc == 0

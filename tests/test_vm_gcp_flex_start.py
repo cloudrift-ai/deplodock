@@ -3,11 +3,10 @@
 from deplodock.provisioning.gcp_flex_start import (
     _gcloud_create_cmd,
     _gcloud_delete_cmd,
-    _gcloud_status_cmd,
     _gcloud_external_ip_cmd,
     _gcloud_ssh_check_cmd,
+    _gcloud_status_cmd,
 )
-
 
 # ── Command builder tests ─────────────────────────────────────────
 
@@ -15,17 +14,27 @@ from deplodock.provisioning.gcp_flex_start import (
 def test_gcloud_create_cmd():
     cmd = _gcloud_create_cmd("my-vm", "us-central1-a", "a2-highgpu-1g")
     assert cmd == [
-        "gcloud", "compute", "instances", "create", "my-vm",
-        "--zone", "us-central1-a",
-        "--machine-type", "a2-highgpu-1g",
+        "gcloud",
+        "compute",
+        "instances",
+        "create",
+        "my-vm",
+        "--zone",
+        "us-central1-a",
+        "--machine-type",
+        "a2-highgpu-1g",
         "--provisioning-model=FLEX_START",
         "--maintenance-policy=TERMINATE",
         "--reservation-affinity=none",
-        "--image-family", "debian-12",
-        "--image-project", "debian-cloud",
-        "--max-run-duration", "7d",
+        "--image-family",
+        "debian-12",
+        "--image-project",
+        "debian-cloud",
+        "--max-run-duration",
+        "7d",
         "--instance-termination-action=DELETE",
-        "--request-valid-for-duration", "2h",
+        "--request-valid-for-duration",
+        "2h",
     ]
 
 
@@ -40,7 +49,9 @@ def test_gcloud_create_cmd_spot_no_duration_flags():
 
 def test_gcloud_create_cmd_with_gcloud_args():
     cmd = _gcloud_create_cmd(
-        "my-vm", "us-central1-a", "e2-micro",
+        "my-vm",
+        "us-central1-a",
+        "e2-micro",
         extra_gcloud_args="--no-service-account --no-scopes",
     )
     assert cmd[-2:] == ["--no-service-account", "--no-scopes"]
@@ -48,7 +59,9 @@ def test_gcloud_create_cmd_with_gcloud_args():
 
 def test_gcloud_create_cmd_custom_options():
     cmd = _gcloud_create_cmd(
-        "my-vm", "us-central1-a", "e2-micro",
+        "my-vm",
+        "us-central1-a",
+        "e2-micro",
         max_run_duration="1h",
         termination_action="STOP",
         image_family="ubuntu-2204-lts",
@@ -72,36 +85,66 @@ def test_gcloud_delete_cmd():
 def test_gcloud_status_cmd():
     cmd = _gcloud_status_cmd("my-vm", "us-central1-a")
     assert cmd == [
-        "gcloud", "compute", "instances", "describe", "my-vm",
-        "--zone", "us-central1-a", "--format", "value(status)",
+        "gcloud",
+        "compute",
+        "instances",
+        "describe",
+        "my-vm",
+        "--zone",
+        "us-central1-a",
+        "--format",
+        "value(status)",
     ]
 
 
 def test_gcloud_external_ip_cmd():
     cmd = _gcloud_external_ip_cmd("my-vm", "us-central1-a")
     assert cmd == [
-        "gcloud", "compute", "instances", "describe", "my-vm",
-        "--zone", "us-central1-a",
-        "--format", "value(networkInterfaces[0].accessConfigs[0].natIP)",
+        "gcloud",
+        "compute",
+        "instances",
+        "describe",
+        "my-vm",
+        "--zone",
+        "us-central1-a",
+        "--format",
+        "value(networkInterfaces[0].accessConfigs[0].natIP)",
     ]
 
 
 def test_gcloud_ssh_check_cmd():
     cmd = _gcloud_ssh_check_cmd("my-vm", "us-central1-a")
     assert cmd == [
-        "gcloud", "compute", "ssh", "my-vm",
-        "--zone", "us-central1-a", "--command", "true",
-        "--ssh-flag=-o", "--ssh-flag=ConnectTimeout=5",
-        "--ssh-flag=-o", "--ssh-flag=StrictHostKeyChecking=no",
+        "gcloud",
+        "compute",
+        "ssh",
+        "my-vm",
+        "--zone",
+        "us-central1-a",
+        "--command",
+        "true",
+        "--ssh-flag=-o",
+        "--ssh-flag=ConnectTimeout=5",
+        "--ssh-flag=-o",
+        "--ssh-flag=StrictHostKeyChecking=no",
     ]
 
 
 def test_gcloud_ssh_check_cmd_with_gateway():
     cmd = _gcloud_ssh_check_cmd("my-vm", "us-central1-a", ssh_gateway="gcp-ssh-gateway")
     assert cmd == [
-        "gcloud", "compute", "ssh", "my-vm",
-        "--zone", "us-central1-a", "--command", "true",
-        "--ssh-flag=-o", "--ssh-flag=ConnectTimeout=5",
-        "--ssh-flag=-o", "--ssh-flag=StrictHostKeyChecking=no",
-        "--ssh-flag=-o", "--ssh-flag=ProxyJump=gcp-ssh-gateway",
+        "gcloud",
+        "compute",
+        "ssh",
+        "my-vm",
+        "--zone",
+        "us-central1-a",
+        "--command",
+        "true",
+        "--ssh-flag=-o",
+        "--ssh-flag=ConnectTimeout=5",
+        "--ssh-flag=-o",
+        "--ssh-flag=StrictHostKeyChecking=no",
+        "--ssh-flag=-o",
+        "--ssh-flag=ProxyJump=gcp-ssh-gateway",
     ]

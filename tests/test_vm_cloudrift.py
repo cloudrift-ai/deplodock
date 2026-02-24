@@ -3,23 +3,21 @@
 Response fixtures are captured from real CloudRift API calls.
 """
 
-import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from deplodock.provisioning.cloudrift import (
+    API_VERSION,
+    DEFAULT_CLOUDINIT_URL,
+    DEFAULT_IMAGE_URL,
+    _add_ssh_key,
     _api_request,
-    _rent_instance,
-    _terminate_instance,
+    _ensure_ssh_key,
     _get_instance_info,
     _list_ssh_keys,
-    _add_ssh_key,
-    _ensure_ssh_key,
     _print_connection_info,
-    API_VERSION,
-    DEFAULT_IMAGE_URL,
-    DEFAULT_CLOUDINIT_URL,
+    _rent_instance,
+    _terminate_instance,
 )
-
 
 API_KEY = "test-api-key"
 API_URL = "https://api.test.cloudrift.ai"
@@ -42,9 +40,7 @@ SSH_KEYS_LIST_RESPONSE = {
     ]
 }
 
-RENT_RESPONSE = {
-    "instance_ids": ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]
-}
+RENT_RESPONSE = {"instance_ids": ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]}
 
 INSTANCE_ACTIVE_RESPONSE = {
     "instances": [
@@ -133,8 +129,7 @@ def test_api_request_dry_run(capsys):
 def test_rent_instance_payload(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    result = _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"],
-                            ports=[22, 8000], api_url=API_URL)
+    result = _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], ports=[22, 8000], api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert call_data["selector"] == {"ByInstanceTypeAndLocation": {"instance_type": "rtx49-7c-kn.1"}}
@@ -171,9 +166,12 @@ def test_terminate_instance_payload(mock_api):
     _terminate_instance(API_KEY, "inst-123", api_url=API_URL)
 
     mock_api.assert_called_once_with(
-        "POST", "/api/v1/instances/terminate",
+        "POST",
+        "/api/v1/instances/terminate",
         {"selector": {"ById": ["inst-123"]}},
-        API_KEY, API_URL, False,
+        API_KEY,
+        API_URL,
+        False,
     )
 
 
@@ -220,9 +218,12 @@ def test_add_ssh_key(mock_api):
     result = _add_ssh_key(API_KEY, "my-key", "ssh-ed25519 AAAA", api_url=API_URL)
 
     mock_api.assert_called_once_with(
-        "POST", "/api/v1/ssh-keys/add",
+        "POST",
+        "/api/v1/ssh-keys/add",
         {"name": "my-key", "public_key": "ssh-ed25519 AAAA"},
-        API_KEY, API_URL, False,
+        API_KEY,
+        API_URL,
+        False,
     )
     assert result["ssh_key"]["id"] == "key-new"
 

@@ -2,7 +2,6 @@
 """Server benchmark tools — CLI entrypoint."""
 
 import argparse
-import sys
 
 from deplodock.commands.bench import register_bench_command
 from deplodock.commands.deploy.cloud import register_cloud_target

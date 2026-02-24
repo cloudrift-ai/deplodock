@@ -29,12 +29,26 @@ def test_manifest_round_trip(tmp_path):
 
 def test_manifest_multiple_tasks(tmp_path):
     tasks = [
-        {"recipe": "A", "variant": "V1", "status": "completed",
-         "gpu_name": "G", "gpu_short": "g", "gpu_count": 1,
-         "model_name": "m", "result_file": "A/V1_vllm_benchmark.txt"},
-        {"recipe": "B", "variant": "V2", "status": "failed",
-         "gpu_name": "G", "gpu_short": "g", "gpu_count": 2,
-         "model_name": "m", "result_file": "B/V2_vllm_benchmark.txt"},
+        {
+            "recipe": "A",
+            "variant": "V1",
+            "status": "completed",
+            "gpu_name": "G",
+            "gpu_short": "g",
+            "gpu_count": 1,
+            "model_name": "m",
+            "result_file": "A/V1_vllm_benchmark.txt",
+        },
+        {
+            "recipe": "B",
+            "variant": "V2",
+            "status": "failed",
+            "gpu_name": "G",
+            "gpu_short": "g",
+            "gpu_count": 2,
+            "model_name": "m",
+            "result_file": "B/V2_vllm_benchmark.txt",
+        },
     ]
     write_manifest(tmp_path, "2026-01-01T00:00:00", "def456", ["A", "B"], tasks)
 

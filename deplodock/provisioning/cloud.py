@@ -8,9 +8,9 @@ import logging
 import os
 import shlex
 
+from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
 from deplodock.provisioning import cloudrift as cr_provider
 from deplodock.provisioning import gcp_flex_start as gcp_provider
-from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
 
 
 def resolve_vm_spec(loaded_configs, server_name=None):
@@ -32,23 +32,20 @@ def resolve_vm_spec(loaded_configs, server_name=None):
     max_gpu_count = 0
 
     for entry, recipe_config in loaded_configs:
-        recipe_path = entry['recipe']
-        variant = entry.get('variant')
+        recipe_path = entry["recipe"]
+        variant = entry.get("variant")
 
-        entry_gpu = recipe_config.get('gpu')
-        entry_gpu_count = recipe_config.get('gpu_count', 1)
+        entry_gpu = recipe_config.get("gpu")
+        entry_gpu_count = recipe_config.get("gpu_count", 1)
 
         if entry_gpu is None:
-            raise ValueError(
-                f"Recipe '{recipe_path}' variant '{variant}' is missing 'gpu' field"
-            )
+            raise ValueError(f"Recipe '{recipe_path}' variant '{variant}' is missing 'gpu' field")
 
         if gpu_name is None:
             gpu_name = entry_gpu
         elif entry_gpu != gpu_name:
             raise ValueError(
-                f"Server '{server_name}': mixed GPUs ({gpu_name} vs {entry_gpu}). "
-                "All recipes in a server entry must target the same GPU."
+                f"Server '{server_name}': mixed GPUs ({gpu_name} vs {entry_gpu}). All recipes in a server entry must target the same GPU."
             )
 
         max_gpu_count = max(max_gpu_count, entry_gpu_count)
@@ -56,8 +53,7 @@ def resolve_vm_spec(loaded_configs, server_name=None):
     return gpu_name, max_gpu_count
 
 
-def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None,
-                       server_name=None, dry_run=False, logger=None):
+def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None, server_name=None, dry_run=False, logger=None):
     """Provision a cloud VM for the given GPU requirements.
 
     Looks up the provider from the hardware table and dispatches to the
@@ -118,7 +114,8 @@ def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None,
         extra_parts = []
 
         service_account = gcp_config.get(
-            "service_account", os.environ.get("GCP_SERVICE_ACCOUNT", ""),
+            "service_account",
+            os.environ.get("GCP_SERVICE_ACCOUNT", ""),
         )
         if service_account:
             extra_parts.append(f"--service-account={service_account}")
@@ -137,7 +134,7 @@ def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None,
         if os.path.exists(pub_key_path) and not dry_run:
             with open(pub_key_path) as f:
                 pub_key = f.read().strip()
-            metadata_arg = f'--metadata=ssh-keys={ssh_user}:{pub_key}'
+            metadata_arg = f"--metadata=ssh-keys={ssh_user}:{pub_key}"
             extra_parts.append(shlex.quote(metadata_arg))
 
         # Append any raw extra_gcloud_args from config

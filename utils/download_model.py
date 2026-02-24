@@ -1,8 +1,8 @@
 import os
 import time
-from huggingface_hub import snapshot_download
 from argparse import ArgumentParser
-from tqdm.auto import tqdm
+
+from huggingface_hub import snapshot_download
 
 
 def download_and_track(repo_id, local_dir=None):
@@ -77,10 +77,8 @@ def download_and_track(repo_id, local_dir=None):
 # Example usage:
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument('--model-name', default="meta-llama/Llama-3.1-8B-Instruct",
-                        help='HuggingFace model repository ID')
-    parser.add_argument("--hg-dir", default="../models",
-                        help='Directory to download the model to')
+    parser.add_argument("--model-name", default="meta-llama/Llama-3.1-8B-Instruct", help="HuggingFace model repository ID")
+    parser.add_argument("--hg-dir", default="../models", help="Directory to download the model to")
     args = parser.parse_args()
 
     download_and_track(args.model_name, local_dir=args.hg_dir)

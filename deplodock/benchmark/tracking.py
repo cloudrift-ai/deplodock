@@ -17,7 +17,7 @@ def compute_code_hash() -> str:
     for py_file in sorted(pkg_dir.rglob("*.py")):
         rel = py_file.relative_to(pkg_dir)
         content = py_file.read_text(encoding="utf-8")
-        hasher.update(f"{rel}\n{content}\n".encode("utf-8"))
+        hasher.update(f"{rel}\n{content}\n".encode())
     return hasher.hexdigest()
 
 

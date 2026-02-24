@@ -30,9 +30,7 @@ def load_recipe(recipe_dir, variant=None):
     if variant is not None:
         if variant not in variants:
             available = ", ".join(sorted(variants.keys())) if variants else "none"
-            raise ValueError(
-                f"Unknown variant '{variant}'. Available variants: {available}"
-            )
+            raise ValueError(f"Unknown variant '{variant}'. Available variants: {available}")
         config = deep_merge(config, variants[variant])
 
     return config

@@ -33,16 +33,16 @@ def generate_report(config: dict, results_dir: str, output_file: str):
 
         price = get_gpu_price(config, gpu_type, gpu_count)
 
-        gpu_display = gpu_type.upper().replace('RTX', '').replace('PRO', '')
+        gpu_display = gpu_type.upper().replace("RTX", "").replace("PRO", "")
         machine_name = f"{gpu_count}x{gpu_display}"
 
         price_per_mtok = (price / (total_throughput * 3600)) * 1_000_000 if total_throughput > 0 else 0
 
         row_data = {
-            'Machine': machine_name,
-            'Throughput (tok/s)': total_throughput,
-            'GPU Price ($/hour)': price,
-            'Token Price ($/mtok)': price_per_mtok,
+            "Machine": machine_name,
+            "Throughput (tok/s)": total_throughput,
+            "GPU Price ($/hour)": price,
+            "Token Price ($/mtok)": price_per_mtok,
         }
 
         all_data.append(row_data)
@@ -58,14 +58,14 @@ def generate_report(config: dict, results_dir: str, output_file: str):
     print(f"Found {len(all_data)} benchmark results across run directories")
 
     df = pd.DataFrame(all_data)
-    df = df.sort_values('Machine')
+    df = df.sort_values("Machine")
 
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Benchmark Results', index=False)
-        worksheet = writer.sheets['Benchmark Results']
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Benchmark Results", index=False)
+        worksheet = writer.sheets["Benchmark Results"]
 
         for column in worksheet.columns:
             max_length = 0
@@ -74,7 +74,7 @@ def generate_report(config: dict, results_dir: str, output_file: str):
                 try:
                     if len(str(cell.value)) > max_length:
                         max_length = len(str(cell.value))
-                except:
+                except Exception:
                     pass
             adjusted_width = min(max_length + 2, 50)
             worksheet.column_dimensions[column_letter].width = adjusted_width
@@ -84,15 +84,15 @@ def generate_report(config: dict, results_dir: str, output_file: str):
 
     output_dir = output_path.parent
     for model_name, model_data in data_by_model.items():
-        safe_model_name = model_name.replace('/', '_').replace(' ', '_')
+        safe_model_name = model_name.replace("/", "_").replace(" ", "_")
         model_output_path = output_dir / f"benchmark_report_{safe_model_name}.xlsx"
 
         df_model = pd.DataFrame(model_data)
-        df_model = df_model.sort_values('Machine')
+        df_model = df_model.sort_values("Machine")
 
-        with pd.ExcelWriter(model_output_path, engine='openpyxl') as writer:
-            df_model.to_excel(writer, sheet_name='Benchmark Results', index=False)
-            worksheet = writer.sheets['Benchmark Results']
+        with pd.ExcelWriter(model_output_path, engine="openpyxl") as writer:
+            df_model.to_excel(writer, sheet_name="Benchmark Results", index=False)
+            worksheet = writer.sheets["Benchmark Results"]
 
             for column in worksheet.columns:
                 max_length = 0
@@ -101,7 +101,7 @@ def generate_report(config: dict, results_dir: str, output_file: str):
                     try:
                         if len(str(cell.value)) > max_length:
                             max_length = len(str(cell.value))
-                    except:
+                    except Exception:
                         pass
                 adjusted_width = min(max_length + 2, 50)
                 worksheet.column_dimensions[column_letter].width = adjusted_width

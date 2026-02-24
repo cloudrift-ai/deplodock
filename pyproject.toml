@@ -17,9 +17,21 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]
 include = ["deplodock*"]
 
 [project.scripts]
 deplodock = "deplodock.deplodock:main"
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

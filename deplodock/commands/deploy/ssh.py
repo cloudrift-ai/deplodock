@@ -5,11 +5,14 @@ import sys
 
 from deplodock.deploy import (
     DeployParams,
-    deploy as deploy_entry,
     load_recipe,
+)
+from deplodock.deploy import (
+    deploy as deploy_entry,
+)
+from deplodock.deploy import (
     teardown as teardown_entry,
 )
-from deplodock.provisioning.ssh_transport import make_run_cmd, make_write_file, scp_file, ssh_base_args, REMOTE_DEPLOY_DIR
 from deplodock.provisioning.remote import provision_remote
 
 

@@ -40,8 +40,7 @@ def enumerate_tasks(recipe_dirs, variants_filter=None):
                     selected.append(v)
                 else:
                     print(
-                        f"Warning: variant '{v}' not in {recipe_dir} "
-                        f"(available: {', '.join(available_variants)}), skipping.",
+                        f"Warning: variant '{v}' not in {recipe_dir} (available: {', '.join(available_variants)}), skipping.",
                         file=sys.stderr,
                     )
             variants_to_run = selected
@@ -59,13 +58,15 @@ def enumerate_tasks(recipe_dirs, variants_filter=None):
                 )
                 continue
 
-            tasks.append(BenchmarkTask(
-                recipe_dir=recipe_dir,
-                variant=variant,
-                recipe_config=config,
-                gpu_name=gpu_name,
-                gpu_count=gpu_count,
-            ))
+            tasks.append(
+                BenchmarkTask(
+                    recipe_dir=recipe_dir,
+                    variant=variant,
+                    recipe_config=config,
+                    gpu_name=gpu_name,
+                    gpu_count=gpu_count,
+                )
+            )
 
     return tasks
 

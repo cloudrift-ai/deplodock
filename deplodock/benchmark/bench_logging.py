@@ -4,11 +4,9 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from deplodock.hardware import gpu_short_name
 from deplodock.planner import ExecutionGroup
-
 
 # Global log file path
 LOG_FILE = None
@@ -56,7 +54,7 @@ def setup_logging() -> str:
     return str(LOG_FILE)
 
 
-def _get_group_logger(group: ExecutionGroup, model_name: Optional[str] = None) -> logging.Logger:
+def _get_group_logger(group: ExecutionGroup, model_name: str | None = None) -> logging.Logger:
     """Get a logger for an execution group."""
     short = gpu_short_name(group.gpu_name)
     group_label = f"{short}_x_{group.gpu_count}"

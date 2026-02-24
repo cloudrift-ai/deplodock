@@ -7,7 +7,6 @@ import sys
 import pytest
 import yaml
 
-
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
 

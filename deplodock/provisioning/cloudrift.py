@@ -6,9 +6,8 @@ import time
 
 import requests
 
-from deplodock.provisioning.types import VMConnectionInfo
 from deplodock.provisioning.ssh import wait_for_ssh
-
+from deplodock.provisioning.types import VMConnectionInfo
 
 DEFAULT_API_URL = "https://api.cloudrift.ai"
 DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
@@ -41,9 +40,16 @@ def _api_request(method, path, data, api_key, api_url=DEFAULT_API_URL, dry_run=F
     return resp.json().get("data", resp.json())
 
 
-def _rent_instance(api_key, instance_type, ssh_public_keys,
-                   image_url=DEFAULT_IMAGE_URL, cloudinit_url=DEFAULT_CLOUDINIT_URL,
-                   ports=None, api_url=DEFAULT_API_URL, dry_run=False):
+def _rent_instance(
+    api_key,
+    instance_type,
+    ssh_public_keys,
+    image_url=DEFAULT_IMAGE_URL,
+    cloudinit_url=DEFAULT_CLOUDINIT_URL,
+    ports=None,
+    api_url=DEFAULT_API_URL,
+    dry_run=False,
+):
     """Rent a new CloudRift VM instance.
 
     POST /api/v1/instances/rent
@@ -147,9 +153,7 @@ def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=Fals
     return key_id
 
 
-def wait_for_status(api_key, instance_id, target_status, timeout,
-                    api_url=DEFAULT_API_URL, interval=10, dry_run=False,
-                    fail_statuses=None):
+def wait_for_status(api_key, instance_id, target_status, timeout, api_url=DEFAULT_API_URL, interval=10, dry_run=False, fail_statuses=None):
     """Poll instance status until it matches *target_status* or timeout.
 
     Args:
@@ -262,9 +266,19 @@ def _print_connection_info(instance):
         print("Warning: no host address found in instance info.")
 
 
-def create_instance(api_key, instance_type, ssh_key_path, image_url=DEFAULT_IMAGE_URL,
-                    ports=None, timeout=600, api_url=DEFAULT_API_URL, dry_run=False,
-                    fail_statuses=None, wait_ssh=False, ssh_private_key_path=None):
+def create_instance(
+    api_key,
+    instance_type,
+    ssh_key_path,
+    image_url=DEFAULT_IMAGE_URL,
+    ports=None,
+    timeout=600,
+    api_url=DEFAULT_API_URL,
+    dry_run=False,
+    fail_statuses=None,
+    wait_ssh=False,
+    ssh_private_key_path=None,
+):
     """Create a CloudRift VM instance.
 
     Args:
@@ -287,12 +301,13 @@ def create_instance(api_key, instance_type, ssh_key_path, image_url=DEFAULT_IMAG
         with open(ssh_key_path) as f:
             public_key = f.read().strip()
 
-    result = _rent_instance(api_key, instance_type, [public_key], image_url=image_url,
-                            ports=ports, api_url=api_url, dry_run=dry_run)
+    result = _rent_instance(api_key, instance_type, [public_key], image_url=image_url, ports=ports, api_url=api_url, dry_run=dry_run)
     if dry_run:
         print("[dry-run] Would wait for Active status, then print connection info.")
         return VMConnectionInfo(
-            host="dry-run-host", username="riftuser", ssh_port=22222,
+            host="dry-run-host",
+            username="riftuser",
+            ssh_port=22222,
             delete_info=("cloudrift", "dry-run-id"),
         )
 
@@ -303,8 +318,7 @@ def create_instance(api_key, instance_type, ssh_key_path, image_url=DEFAULT_IMAG
     instance_id = instance_ids[0]
     print(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
 
-    info = wait_for_status(api_key, instance_id, "Active", timeout, api_url,
-                           fail_statuses=fail_statuses)
+    info = wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
     if info is None:
         return None
 
@@ -313,7 +327,7 @@ def create_instance(api_key, instance_type, ssh_key_path, image_url=DEFAULT_IMAG
     _print_connection_info(info)
 
     if wait_ssh and ssh_private_key_path:
-        print(f"Waiting for SSH connectivity...")
+        print("Waiting for SSH connectivity...")
         wait_for_ssh(conn.host, conn.username, conn.ssh_port, ssh_private_key_path)
 
     return conn

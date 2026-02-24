@@ -12,16 +12,16 @@ from datetime import datetime
 from pathlib import Path
 
 from deplodock.benchmark import (
+    _expand_path,
+    _run_groups,
+    _task_meta,
     compute_code_hash,
     create_run_dir,
-    write_manifest,
-    setup_logging,
-    load_config,
-    validate_config,
-    _expand_path,
     enumerate_tasks,
-    _task_meta,
-    _run_groups,
+    load_config,
+    setup_logging,
+    validate_config,
+    write_manifest,
 )
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
@@ -66,18 +66,12 @@ def handle_bench(args):
     planner = GroupByModelAndGpuPlanner()
     groups = planner.plan(tasks)
 
-    root_logger.info(
-        f"Running {len(tasks)} benchmark task(s) in {len(groups)} execution group(s)"
-    )
-    root_logger.info(
-        f"Parallel mode (max workers: {args.max_workers or len(groups)})"
-    )
+    root_logger.info(f"Running {len(tasks)} benchmark task(s) in {len(groups)} execution group(s)")
+    root_logger.info(f"Parallel mode (max workers: {args.max_workers or len(groups)})")
     root_logger.info("")
 
     # Run groups
-    raw_results = asyncio.run(
-        _run_groups(groups, config, ssh_key, run_dir, dry_run, args.max_workers)
-    )
+    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, run_dir, dry_run, args.max_workers))
 
     # Flatten results, handling exceptions
     all_task_meta = []

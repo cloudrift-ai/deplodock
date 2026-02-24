@@ -4,16 +4,19 @@ import os
 
 import yaml
 
-
 # ── SSH deploy ──────────────────────────────────────────────────────
 
 
 def test_ssh_deploy(run_cli, recipes_dir):
     rc, stdout, stderr = run_cli(
-        "deploy", "ssh",
-        "--recipe", os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant", "8xH200",
-        "--server", "user@1.2.3.4",
+        "deploy",
+        "ssh",
+        "--recipe",
+        os.path.join(recipes_dir, "GLM-4.6-FP8"),
+        "--variant",
+        "8xH200",
+        "--server",
+        "user@1.2.3.4",
         "--dry-run",
     )
     assert rc == 0
@@ -25,30 +28,37 @@ def test_ssh_deploy(run_cli, recipes_dir):
 
 def test_ssh_deploy_command_sequence(run_cli, recipes_dir):
     rc, stdout, _ = run_cli(
-        "deploy", "ssh",
-        "--recipe", os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant", "8xH200",
-        "--server", "user@1.2.3.4",
+        "deploy",
+        "ssh",
+        "--recipe",
+        os.path.join(recipes_dir, "GLM-4.6-FP8"),
+        "--variant",
+        "8xH200",
+        "--server",
+        "user@1.2.3.4",
         "--dry-run",
     )
     assert rc == 0
     lines = stdout.strip().split("\n")
-    dry_run_lines = [l for l in lines if l.startswith("[dry-run]")]
+    dry_run_lines = [line for line in lines if line.startswith("[dry-run]")]
 
     # Verify correct sequence: mkdir, scp compose, scp nginx, pull, download, down, up, health
-    assert any("mkdir" in l for l in dry_run_lines)
-    assert any("docker-compose.yaml" in l for l in dry_run_lines)
-    assert any("docker compose pull" in l for l in dry_run_lines)
-    assert any("huggingface-cli download" in l for l in dry_run_lines)
-    assert any("docker compose down" in l for l in dry_run_lines)
-    assert any("docker compose up" in l for l in dry_run_lines)
+    assert any("mkdir" in line for line in dry_run_lines)
+    assert any("docker-compose.yaml" in line for line in dry_run_lines)
+    assert any("docker compose pull" in line for line in dry_run_lines)
+    assert any("huggingface-cli download" in line for line in dry_run_lines)
+    assert any("docker compose down" in line for line in dry_run_lines)
+    assert any("docker compose up" in line for line in dry_run_lines)
 
 
 def test_ssh_teardown(run_cli, recipes_dir):
     rc, stdout, _ = run_cli(
-        "deploy", "ssh",
-        "--recipe", os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--server", "user@1.2.3.4",
+        "deploy",
+        "ssh",
+        "--recipe",
+        os.path.join(recipes_dir, "GLM-4.6-FP8"),
+        "--server",
+        "user@1.2.3.4",
         "--dry-run",
         "--teardown",
     )
@@ -62,9 +72,12 @@ def test_ssh_teardown(run_cli, recipes_dir):
 
 def test_local_deploy(run_cli, recipes_dir):
     rc, stdout, _ = run_cli(
-        "deploy", "local",
-        "--recipe", os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--variant", "RTX5090",
+        "deploy",
+        "local",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--variant",
+        "RTX5090",
         "--dry-run",
     )
     assert rc == 0
@@ -75,8 +88,10 @@ def test_local_deploy(run_cli, recipes_dir):
 
 def test_local_teardown(run_cli, recipes_dir):
     rc, stdout, _ = run_cli(
-        "deploy", "local",
-        "--recipe", os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "deploy",
+        "local",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
         "--dry-run",
         "--teardown",
     )
@@ -90,15 +105,21 @@ def test_local_teardown(run_cli, recipes_dir):
 def test_different_variants_produce_different_compose(run_cli, recipes_dir):
     """Different variants should produce different compose configurations."""
     rc1, stdout1, _ = run_cli(
-        "deploy", "local",
-        "--recipe", os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant", "8xH200",
+        "deploy",
+        "local",
+        "--recipe",
+        os.path.join(recipes_dir, "GLM-4.6-FP8"),
+        "--variant",
+        "8xH200",
         "--dry-run",
     )
     rc2, stdout2, _ = run_cli(
-        "deploy", "local",
-        "--recipe", os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant", "8xH100",
+        "deploy",
+        "local",
+        "--recipe",
+        os.path.join(recipes_dir, "GLM-4.6-FP8"),
+        "--variant",
+        "8xH100",
         "--dry-run",
     )
     assert rc1 == 0
@@ -110,9 +131,12 @@ def test_different_variants_produce_different_compose(run_cli, recipes_dir):
 
 def test_single_gpu_variant(run_cli, recipes_dir):
     rc, stdout, _ = run_cli(
-        "deploy", "local",
-        "--recipe", os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--variant", "RTX5090",
+        "deploy",
+        "local",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--variant",
+        "RTX5090",
         "--dry-run",
     )
     assert rc == 0
@@ -124,26 +148,34 @@ def test_multi_instance_variant(run_cli, tmp_path):
     """A single-GPU model on a 4-GPU variant produces 4 instances with nginx."""
     recipe = {
         "model": {"name": "test/model"},
-        "backend": {"vllm": {
-            "image": "vllm/vllm-openai:latest",
-            "tensor_parallel_size": 1,
-            "pipeline_parallel_size": 1,
-            "gpu_memory_utilization": 0.9,
-            "extra_args": "--max-model-len 8192",
-        }},
-        "variants": {"4xH100": {
-            "gpu": "NVIDIA H100 80GB",
-            "gpu_count": 4,
-        }},
+        "backend": {
+            "vllm": {
+                "image": "vllm/vllm-openai:latest",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "gpu_memory_utilization": 0.9,
+                "extra_args": "--max-model-len 8192",
+            }
+        },
+        "variants": {
+            "4xH100": {
+                "gpu": "NVIDIA H100 80GB",
+                "gpu_count": 4,
+            }
+        },
     }
     with open(tmp_path / "recipe.yaml", "w") as f:
         yaml.dump(recipe, f)
 
     rc, stdout, _ = run_cli(
-        "deploy", "ssh",
-        "--recipe", str(tmp_path),
-        "--variant", "4xH100",
-        "--server", "user@host",
+        "deploy",
+        "ssh",
+        "--recipe",
+        str(tmp_path),
+        "--variant",
+        "4xH100",
+        "--server",
+        "user@host",
         "--dry-run",
     )
     assert rc == 0
@@ -153,9 +185,12 @@ def test_multi_instance_variant(run_cli, tmp_path):
 
 def test_unknown_variant_fails(run_cli, recipes_dir):
     rc, _, stderr = run_cli(
-        "deploy", "local",
-        "--recipe", os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant", "nonexistent",
+        "deploy",
+        "local",
+        "--recipe",
+        os.path.join(recipes_dir, "GLM-4.6-FP8"),
+        "--variant",
+        "nonexistent",
         "--dry-run",
     )
     assert rc != 0

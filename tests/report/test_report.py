@@ -4,7 +4,6 @@ import json
 
 from deplodock.report import collect_tasks_from_manifests, parse_benchmark_result
 
-
 SAMPLE_BENCHMARK = """\
 ============ Serving Benchmark Result ============
 Request throughput (req/s):                     12.50
@@ -80,17 +79,25 @@ def test_collect_skips_failed_tasks(tmp_path):
 def test_collect_multiple_runs(tmp_path):
     tasks1 = [
         {
-            "recipe": "A", "variant": "V1",
-            "gpu_name": "G", "gpu_short": "g", "gpu_count": 1,
-            "model_name": "m/A", "result_file": "A/V1_vllm_benchmark.txt",
+            "recipe": "A",
+            "variant": "V1",
+            "gpu_name": "G",
+            "gpu_short": "g",
+            "gpu_count": 1,
+            "model_name": "m/A",
+            "result_file": "A/V1_vllm_benchmark.txt",
             "status": "completed",
         },
     ]
     tasks2 = [
         {
-            "recipe": "B", "variant": "V2",
-            "gpu_name": "G", "gpu_short": "g", "gpu_count": 2,
-            "model_name": "m/B", "result_file": "B/V2_vllm_benchmark.txt",
+            "recipe": "B",
+            "variant": "V2",
+            "gpu_name": "G",
+            "gpu_short": "g",
+            "gpu_count": 2,
+            "model_name": "m/B",
+            "result_file": "B/V2_vllm_benchmark.txt",
             "status": "completed",
         },
     ]

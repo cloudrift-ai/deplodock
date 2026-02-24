@@ -111,9 +111,7 @@ def generate_compose(config, model_dir, hf_token):
 
 def generate_nginx_conf(num_instances):
     """Generate nginx config with least_conn upstream."""
-    upstream_servers = "\n".join(
-        f"        server vllm_{i}:8000;" for i in range(num_instances)
-    )
+    upstream_servers = "\n".join(f"        server vllm_{i}:8000;" for i in range(num_instances))
 
     return f"""worker_processes auto;
 

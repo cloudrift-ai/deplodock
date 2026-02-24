@@ -5,15 +5,15 @@ import sys
 
 from deplodock.deploy import (
     DeployParams,
-    deploy as deploy_entry,
     load_recipe,
+)
+from deplodock.deploy import (
+    deploy as deploy_entry,
 )
 from deplodock.provisioning.cloud import (
     provision_cloud_vm,
-    delete_cloud_vm,
 )
 from deplodock.provisioning.remote import provision_remote
-
 
 # ── CLI handler ────────────────────────────────────────────────────
 
@@ -22,8 +22,8 @@ def handle_cloud(args):
     """CLI handler for 'deploy cloud'."""
     config = load_recipe(args.recipe, variant=args.variant)
 
-    gpu_name = config.get('gpu')
-    gpu_count = config.get('gpu_count', 1)
+    gpu_name = config.get("gpu")
+    gpu_count = config.get("gpu_count", 1)
     if not gpu_name:
         print("Error: recipe must have a 'gpu' field (use a variant with GPU info).", file=sys.stderr)
         sys.exit(1)

@@ -202,6 +202,15 @@ GCP project is inferred from `gcloud` config (no `--project` flag needed).
 pytest tests/ -v
 ```
 
+## Linting & Formatting
+
+The project uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting. Configuration is in `pyproject.toml`.
+
+```bash
+make lint      # check for lint errors and formatting issues
+make format    # auto-fix formatting and lint violations
+```
+
 ## Benchmarking
 
 The `bench` command reuses the deploy infrastructure — it loads a recipe, deploys the model via SSH, runs `vllm bench serve`, captures results, and tears down. No repo cloning needed.
