@@ -3,6 +3,7 @@
 import logging
 
 from deplodock.deploy.compose import calculate_num_instances
+from deplodock.recipe.types import Recipe
 
 
 def extract_benchmark_results(output: str) -> str:
@@ -14,45 +15,32 @@ def extract_benchmark_results(output: str) -> str:
     return output[idx:]
 
 
-def _parse_max_model_len(extra_args: str) -> int | None:
-    """Extract --max-model-len value from extra_args string."""
-    parts = extra_args.split()
-    for i, part in enumerate(parts):
-        if part == "--max-model-len" and i + 1 < len(parts):
-            try:
-                return int(parts[i + 1])
-            except ValueError:
-                return None
-    return None
-
-
-def run_benchmark_workload(run_cmd, recipe_config, dry_run=False):
+def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     """Run vllm bench serve on the remote server and return output.
 
     Returns:
         (success: bool, output: str)
     """
-    benchmark_params = recipe_config.get("benchmark", {})
-    max_concurrency = benchmark_params.get("max_concurrency", 128)
-    num_prompts = benchmark_params.get("num_prompts", 256)
-    random_input_len = benchmark_params.get("random_input_len", 8000)
-    random_output_len = benchmark_params.get("random_output_len", 8000)
+    bench = recipe.benchmark
+    max_concurrency = bench.max_concurrency
+    num_prompts = bench.num_prompts
+    random_input_len = bench.random_input_len
+    random_output_len = bench.random_output_len
 
-    # Warn if input + output lengths risk exceeding max-model-len
-    extra_args = recipe_config.get("backend", {}).get("vllm", {}).get("extra_args", "")
-    max_model_len = _parse_max_model_len(extra_args)
-    if max_model_len is not None and random_input_len + random_output_len >= max_model_len:
+    # Warn if input + output lengths risk exceeding context_length
+    context_length = recipe.engine.llm.context_length
+    if context_length is not None and random_input_len + random_output_len >= context_length:
         logging.getLogger().warning(
             f"benchmark random_input_len ({random_input_len}) + "
             f"random_output_len ({random_output_len}) = "
             f"{random_input_len + random_output_len} >= "
-            f"max-model-len ({max_model_len})"
+            f"context_length ({context_length})"
         )
 
-    model_name = recipe_config["model"]["name"]
-    image = recipe_config["backend"]["vllm"].get("image", "vllm/vllm-openai:latest")
+    model_name = recipe.model_name
+    image = recipe.engine.llm.image
 
-    num_instances = calculate_num_instances(recipe_config)
+    num_instances = calculate_num_instances(recipe)
     port = 8080 if num_instances > 1 else 8000
 
     bench_cmd = (

@@ -12,26 +12,37 @@ commands/vm ────► provisioning (create/delete instances)
 ```
 
 **Dependency rule:** `commands/` is the CLI-only layer. All reusable business logic lives in top-level library packages:
-- `deplodock/deploy/` — recipe loading, compose generation, deploy orchestration
+- `deplodock/recipe/` — recipe loading, dataclass types (`Recipe`, `LLMConfig`, etc.), engine flag mapping
+- `deplodock/deploy/` — compose generation, deploy orchestration
 - `deplodock/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
 - `deplodock/benchmark/` — tracking, config, logging, workload, tasks, execution
 - `deplodock/report/` — parsing, pricing, collection, report generation
 
 ## Layers
 
+### `deplodock/recipe/` — Recipe Library
+
+Recipe loading, configuration dataclasses, and engine flag mapping.
+
+**Modules:**
+- `types.py` — `Recipe`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig` dataclasses
+- `recipe.py` — `deep_merge()`, `load_recipe()`, `validate_extra_args()`
+- `engines.py` — `VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`, `banned_extra_arg_flags()`, `build_engine_args()`
+
+`load_recipe()` returns a `Recipe` dataclass. All consumers use attribute access (e.g. `recipe.engine.llm.tensor_parallel_size`).
+
 ### `deplodock/deploy/` — Deploy Library
 
 The central orchestration layer. Provides a single entry point for deploying recipes to servers.
 
 **Modules:**
-- `params.py` — `DeployParams` dataclass
-- `recipe.py` — `deep_merge()`, `load_recipe()`
+- `params.py` — `DeployParams` dataclass (holds `recipe: Recipe`, `gpu_device_ids`, etc.)
 - `compose.py` — `calculate_num_instances()`, `generate_compose()`, `generate_nginx_conf()`
 - `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`
 - `ssh.py` — `ssh_base_args()`, `make_run_cmd()`, `scp_file()`, `make_write_file()`
 - `local.py` — `make_run_cmd()`, `make_write_file()` (local subprocess transport)
 
-**GPU visibility:** `generate_compose()` supports `_gpu_device_ids` in the config dict to restrict GPU visibility via `device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
+**GPU visibility:** `generate_compose()` accepts a `gpu_device_ids` parameter to restrict GPU visibility via `device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
 
 ### `deplodock/provisioning/` — Provisioning Library
 
@@ -73,7 +84,7 @@ Excel report generation from benchmark results.
 Groups benchmark tasks into execution groups for VM allocation.
 
 **Abstract interface (`planner/__init__.py`):**
-- `BenchmarkTask` — one recipe+variant combination (recipe_dir, variant, recipe_config, gpu_name, gpu_count)
+- `BenchmarkTask` — one recipe+variant combination (recipe_dir, variant, recipe, gpu_name, gpu_count)
 - `ExecutionGroup` — group of tasks sharing one VM (gpu_name, gpu_count, tasks)
 - `BenchmarkPlanner` — ABC with `plan(tasks) -> list[ExecutionGroup]`
 
@@ -111,7 +122,7 @@ provision_cloud_vm() -> VMConnectionInfo
     |
     v
 For each task in group:
-    +-- set _gpu_device_ids if task.gpu_count < group.gpu_count
+    +-- set gpu_device_ids if task.gpu_count < group.gpu_count
     +-- deploy(DeployParams) -> compose up
     +-- run_benchmark_workload()
     +-- save results

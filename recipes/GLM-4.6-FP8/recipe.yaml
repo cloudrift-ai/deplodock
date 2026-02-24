@@ -1,13 +1,16 @@
 model:
-  name: "zai-org/GLM-4.6-FP8"
+  huggingface: "zai-org/GLM-4.6-FP8"
 
-backend:
-  vllm:
-    image: "vllm/vllm-openai:latest"
+engine:
+  llm:
     tensor_parallel_size: 8
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
-    extra_args: "--max-num-seqs 512 --max-model-len 16384 --kv-cache-dtype fp8"
+    context_length: 16384
+    max_concurrent_requests: 512
+    vllm:
+      image: "vllm/vllm-openai:latest"
+      extra_args: "--kv-cache-dtype fp8"
 
 benchmark:
   max_concurrency: 128
@@ -25,24 +28,29 @@ variants:
   8xB200:
     gpu: "NVIDIA B200"
     gpu_count: 8
-    backend:
-      vllm:
-        extra_args: "--max-num-seqs 512 --max-model-len 16384 --kv-cache-dtype fp8 --enable-expert-parallel"
+    engine:
+      llm:
+        vllm:
+          extra_args: "--kv-cache-dtype fp8 --enable-expert-parallel"
     benchmark:
       max_concurrency: 256
       num_prompts: 512
   8xH100:
     gpu: "NVIDIA H100 80GB"
     gpu_count: 8
-    backend:
-      vllm:
-        extra_args: "--max-num-seqs 256 --max-model-len 16384 --kv-cache-dtype fp8"
+    engine:
+      llm:
+        max_concurrent_requests: 256
+        vllm:
+          extra_args: "--kv-cache-dtype fp8"
   8xPro6000:
     gpu: "NVIDIA RTX PRO 6000 Server Edition"
     gpu_count: 8
-    backend:
-      vllm:
-        extra_args: "--max-num-seqs 256 --max-model-len 16384 --kv-cache-dtype fp8"
+    engine:
+      llm:
+        max_concurrent_requests: 256
+        vllm:
+          extra_args: "--kv-cache-dtype fp8"
     benchmark:
       max_concurrency: 64
       num_prompts: 128

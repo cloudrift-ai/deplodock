@@ -1,47 +1,39 @@
 """Docker Compose and nginx config generation."""
 
+from deplodock.recipe.engines import build_engine_args
+from deplodock.recipe.types import Recipe
 
-def calculate_num_instances(config):
-    """Calculate number of instances from config gpu_count and parallelism."""
-    vllm = config["backend"]["vllm"]
-    tp = vllm.get("tensor_parallel_size", 1)
-    pp = vllm.get("pipeline_parallel_size", 1)
-    gpus_per_instance = tp * pp
 
-    gpu_count = config.get("gpu_count")
-    if gpu_count is None:
+def calculate_num_instances(recipe: Recipe) -> int:
+    """Calculate number of instances from recipe gpu_count and parallelism."""
+    gpus_per_instance = recipe.engine.llm.gpus_per_instance
+
+    if recipe.gpu_count is None or recipe.gpu is None:
         return 1
 
-    return max(1, gpu_count // gpus_per_instance)
+    return max(1, recipe.gpu_count // gpus_per_instance)
 
 
-def generate_compose(config, model_dir, hf_token):
-    """Build docker-compose.yaml string from resolved config.
+def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_device_ids=None):
+    """Build docker-compose.yaml string from resolved Recipe.
 
     Single instance: 1 vllm service, count: all GPUs, port 8000.
     Multi-instance: N vllm services with device IDs + nginx on 8080.
     """
-    vllm = config["backend"]["vllm"]
-    model_name = config["model"]["name"]
-    image = vllm.get("image", "vllm/vllm-openai:latest")
-    tp = vllm.get("tensor_parallel_size", 1)
-    pp = vllm.get("pipeline_parallel_size", 1)
-    gpu_mem = vllm.get("gpu_memory_utilization", 0.9)
-    extra_args = vllm.get("extra_args", "")
-    gpus_per_instance = tp * pp
+    llm = recipe.engine.llm
+    model_name = recipe.model_name
+    image = llm.image
+    gpus_per_instance = llm.gpus_per_instance
 
-    # Determine number of instances from config metadata
-    num_instances = config.get("_num_instances", 1)
+    engine_args = build_engine_args(llm, model_name)
+    command_str = "\n      ".join(engine_args)
 
     services = "services:\n"
 
-    # Optional: restrict GPU visibility to specific device IDs
-    device_ids_override = config.get("_gpu_device_ids")
-
     for i in range(num_instances):
         if num_instances == 1:
-            if device_ids_override is not None:
-                gpu_ids_yaml = ", ".join(f"'{g}'" for g in device_ids_override)
+            if gpu_device_ids is not None:
+                gpu_ids_yaml = ", ".join(f"'{g}'" for g in gpu_device_ids)
                 gpu_config = f"device_ids: [{gpu_ids_yaml}]"
             else:
                 gpu_config = "count: all"
@@ -52,8 +44,6 @@ def generate_compose(config, model_dir, hf_token):
             gpu_ids_yaml = ", ".join(f"'{g}'" for g in gpu_ids)
             gpu_config = f"device_ids: [{gpu_ids_yaml}]"
             port = 8000 + i
-
-        extra_args_line = f"\n      {extra_args}" if extra_args.strip() else ""
 
         services += f"""
   vllm_{i}:
@@ -76,14 +66,7 @@ def generate_compose(config, model_dir, hf_token):
     shm_size: '16gb'
     ipc: host
     command: >
-      --trust-remote-code
-      --gpu-memory-utilization={gpu_mem}
-      --host 0.0.0.0
-      --port 8000
-      --tensor-parallel-size {tp}
-      --pipeline-parallel-size {pp}
-      --model {model_name}
-      --served-model-name {model_name}{extra_args_line}
+      {command_str}
     healthcheck:
       test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health"]
       interval: 10s

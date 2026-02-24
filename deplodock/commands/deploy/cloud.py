@@ -3,10 +3,7 @@
 import os
 import sys
 
-from deplodock.deploy import (
-    DeployParams,
-    load_recipe,
-)
+from deplodock.deploy import DeployParams
 from deplodock.deploy import (
     deploy as deploy_entry,
 )
@@ -14,17 +11,16 @@ from deplodock.provisioning.cloud import (
     provision_cloud_vm,
 )
 from deplodock.provisioning.remote import provision_remote
+from deplodock.recipe import load_recipe
 
 # ── CLI handler ────────────────────────────────────────────────────
 
 
 def handle_cloud(args):
     """CLI handler for 'deploy cloud'."""
-    config = load_recipe(args.recipe, variant=args.variant)
+    recipe = load_recipe(args.recipe, variant=args.variant)
 
-    gpu_name = config.get("gpu")
-    gpu_count = config.get("gpu_count", 1)
-    if not gpu_name:
+    if not recipe.gpu:
         print("Error: recipe must have a 'gpu' field (use a variant with GPU info).", file=sys.stderr)
         sys.exit(1)
 
@@ -32,8 +28,8 @@ def handle_cloud(args):
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
 
     conn = provision_cloud_vm(
-        gpu_name=gpu_name,
-        gpu_count=gpu_count,
+        gpu_name=recipe.gpu,
+        gpu_count=recipe.gpu_count,
         ssh_key=ssh_key,
         server_name=args.name,
         dry_run=args.dry_run,
@@ -46,7 +42,7 @@ def handle_cloud(args):
         server=conn.address,
         ssh_key=ssh_key,
         ssh_port=conn.ssh_port,
-        recipe_config=config,
+        recipe=recipe,
         model_dir=args.model_dir,
         hf_token=hf_token,
         dry_run=args.dry_run,

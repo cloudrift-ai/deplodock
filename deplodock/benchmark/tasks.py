@@ -5,9 +5,9 @@ import sys
 
 import yaml
 
-from deplodock.deploy.recipe import load_recipe
 from deplodock.hardware import gpu_short_name
 from deplodock.planner import BenchmarkTask
+from deplodock.recipe import load_recipe
 
 
 def enumerate_tasks(recipe_dirs, variants_filter=None):
@@ -48,10 +48,8 @@ def enumerate_tasks(recipe_dirs, variants_filter=None):
             variants_to_run = available_variants
 
         for variant in variants_to_run:
-            config = load_recipe(recipe_dir, variant=variant)
-            gpu_name = config.get("gpu")
-            gpu_count = config.get("gpu_count", 1)
-            if gpu_name is None:
+            recipe = load_recipe(recipe_dir, variant=variant)
+            if recipe.gpu is None:
                 print(
                     f"Warning: variant '{variant}' in {recipe_dir} missing 'gpu', skipping.",
                     file=sys.stderr,
@@ -62,9 +60,9 @@ def enumerate_tasks(recipe_dirs, variants_filter=None):
                 BenchmarkTask(
                     recipe_dir=recipe_dir,
                     variant=variant,
-                    recipe_config=config,
-                    gpu_name=gpu_name,
-                    gpu_count=gpu_count,
+                    recipe=recipe,
+                    gpu_name=recipe.gpu,
+                    gpu_count=recipe.gpu_count,
                 )
             )
 

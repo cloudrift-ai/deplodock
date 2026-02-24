@@ -15,11 +15,14 @@ tests/
 │   ├── test_code_hash.py    # compute_code_hash()
 │   ├── test_manifest.py     # write_manifest(), read_manifest()
 │   └── test_run_dir.py      # create_run_dir()
+├── recipe/
+│   ├── test_types.py        # Recipe.from_dict(), LLMConfig properties, dataclass defaults
+│   └── test_engines.py      # build_engine_args(), banned_extra_arg_flags()
 ├── deploy/
 │   ├── test_compose.py      # generate_compose(), generate_nginx_conf()
 │   ├── test_deploy_cloud_dryrun.py  # deploy cloud CLI dry-run
 │   ├── test_deploy_dryrun.py        # deploy ssh/local CLI dry-run
-│   └── test_recipe.py       # load_recipe(), deep_merge()
+│   └── test_recipe.py       # load_recipe(), deep_merge(), validate_extra_args()
 ├── planner/
 │   └── test_planner.py      # BenchmarkTask, GroupByModelAndGpuPlanner
 ├── provisioning/
@@ -39,8 +42,10 @@ Test individual functions in isolation with synthetic inputs.
 
 | File | Covers |
 |------|--------|
-| `deploy/test_recipe.py` | `deplodock.deploy.load_recipe()`, `deep_merge()` — recipe loading, variant resolution, YAML parsing |
-| `deploy/test_compose.py` | `deplodock.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `_gpu_device_ids` support |
+| `recipe/test_types.py` | `Recipe.from_dict()`, `LLMConfig` properties (`engine_name`, `gpus_per_instance`, `image`, `extra_args`), dataclass defaults |
+| `recipe/test_engines.py` | `build_engine_args()`, `banned_extra_arg_flags()` — engine flag mapping, CLI argument building for vLLM and SGLang |
+| `deploy/test_recipe.py` | `deplodock.recipe.load_recipe()`, `deep_merge()`, `validate_extra_args()` — recipe loading, variant resolution, YAML parsing, extra_args validation |
+| `deploy/test_compose.py` | `deplodock.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `gpu_device_ids` support |
 | `provisioning/test_cloud.py` | `deplodock.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud provisioning unit tests |
 | `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`), grouping logic, sorting |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |

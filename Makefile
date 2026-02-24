@@ -33,6 +33,9 @@ format: setup
 	./venv/bin/ruff format
 	./venv/bin/ruff check --fix
 
+test: setup
+	./venv/bin/pytest tests/ -v
+
 bench: setup
 	@echo "Running benchmarks..."
 	./venv/bin/deplodock bench recipes/*

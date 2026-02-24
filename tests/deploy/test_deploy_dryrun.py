@@ -147,14 +147,16 @@ def test_single_gpu_variant(run_cli, recipes_dir):
 def test_multi_instance_variant(run_cli, tmp_path):
     """A single-GPU model on a 4-GPU variant produces 4 instances with nginx."""
     recipe = {
-        "model": {"name": "test/model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
+        "model": {"huggingface": "test/model"},
+        "engine": {
+            "llm": {
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
-                "extra_args": "--max-model-len 8192",
+                "context_length": 8192,
+                "vllm": {
+                    "image": "vllm/vllm-openai:latest",
+                },
             }
         },
         "variants": {

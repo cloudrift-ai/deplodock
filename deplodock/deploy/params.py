@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 
+from deplodock.recipe.types import Recipe
+
 
 @dataclass
 class DeployParams:
@@ -10,7 +12,8 @@ class DeployParams:
     server: str  # user@host or IP
     ssh_key: str  # path to SSH private key
     ssh_port: int = 22
-    recipe_config: dict = field(default_factory=dict)  # pre-loaded recipe
+    recipe: Recipe = field(default_factory=Recipe)
     model_dir: str = "/hf_models"
     hf_token: str = ""
     dry_run: bool = False
+    gpu_device_ids: list[int] | None = None

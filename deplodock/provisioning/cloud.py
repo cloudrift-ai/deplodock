@@ -20,9 +20,9 @@ def resolve_vm_spec(loaded_configs, server_name=None):
     gpu_count across all entries.
 
     Args:
-        loaded_configs: list of (entry, recipe_config) tuples where each entry
-            is a dict with 'recipe'/'variant' keys and recipe_config is the
-            already-loaded recipe dict.
+        loaded_configs: list of (entry, recipe) tuples where each entry
+            is a dict with 'recipe'/'variant' keys and recipe is the
+            already-loaded Recipe object.
         server_name: optional server name for error messages.
 
     Returns:
@@ -31,12 +31,12 @@ def resolve_vm_spec(loaded_configs, server_name=None):
     gpu_name = None
     max_gpu_count = 0
 
-    for entry, recipe_config in loaded_configs:
+    for entry, recipe in loaded_configs:
         recipe_path = entry["recipe"]
         variant = entry.get("variant")
 
-        entry_gpu = recipe_config.get("gpu")
-        entry_gpu_count = recipe_config.get("gpu_count", 1)
+        entry_gpu = recipe.gpu
+        entry_gpu_count = recipe.gpu_count
 
         if entry_gpu is None:
             raise ValueError(f"Recipe '{recipe_path}' variant '{variant}' is missing 'gpu' field")

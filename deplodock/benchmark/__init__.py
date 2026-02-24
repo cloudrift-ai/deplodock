@@ -11,7 +11,6 @@ from deplodock.benchmark.tracking import (
     write_manifest,
 )
 from deplodock.benchmark.workload import (
-    _parse_max_model_len,
     extract_benchmark_results,
     run_benchmark_workload,
 )
@@ -27,7 +26,6 @@ __all__ = [
     "setup_logging",
     "_get_group_logger",
     "extract_benchmark_results",
-    "_parse_max_model_len",
     "run_benchmark_workload",
     "enumerate_tasks",
     "_task_meta",

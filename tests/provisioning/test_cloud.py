@@ -5,9 +5,9 @@ import os
 import pytest
 import yaml
 
-from deplodock.deploy.recipe import load_recipe
 from deplodock.provisioning.cloud import delete_cloud_vm, resolve_vm_spec
 from deplodock.provisioning.types import VMConnectionInfo
+from deplodock.recipe import load_recipe
 
 
 def _load_entries(entries):
@@ -32,14 +32,16 @@ def test_resolve_vm_spec_single_recipe(recipes_dir):
 def test_resolve_vm_spec_max_gpu_count(tmp_path):
     """Uses max gpu_count across all entries."""
     recipe = {
-        "model": {"name": "test/model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
+        "model": {"huggingface": "test/model"},
+        "engine": {
+            "llm": {
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
-                "extra_args": "",
+                "vllm": {
+                    "image": "vllm/vllm-openai:latest",
+                    "extra_args": "",
+                },
             }
         },
         "variants": {
@@ -62,14 +64,16 @@ def test_resolve_vm_spec_max_gpu_count(tmp_path):
 def test_resolve_vm_spec_mixed_gpus_raises(tmp_path):
     """Raises ValueError when recipes target different GPUs."""
     recipe = {
-        "model": {"name": "test/model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
+        "model": {"huggingface": "test/model"},
+        "engine": {
+            "llm": {
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
-                "extra_args": "",
+                "vllm": {
+                    "image": "vllm/vllm-openai:latest",
+                    "extra_args": "",
+                },
             }
         },
         "variants": {
@@ -91,14 +95,16 @@ def test_resolve_vm_spec_mixed_gpus_raises(tmp_path):
 def test_resolve_vm_spec_missing_gpu_raises(tmp_path):
     """Raises ValueError when recipe has no gpu field."""
     recipe = {
-        "model": {"name": "test/model"},
-        "backend": {
-            "vllm": {
-                "image": "vllm/vllm-openai:latest",
+        "model": {"huggingface": "test/model"},
+        "engine": {
+            "llm": {
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
-                "extra_args": "",
+                "vllm": {
+                    "image": "vllm/vllm-openai:latest",
+                    "extra_args": "",
+                },
             }
         },
     }

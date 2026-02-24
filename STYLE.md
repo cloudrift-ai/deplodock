@@ -68,7 +68,7 @@ that local and SSH targets can provide their own implementations and
 tests can use dry-run or mock versions:
 
 ```python
-def run_deploy(run_cmd, write_file, config, model_dir, ...):
+def run_deploy(run_cmd, write_file, recipe, model_dir, ...):
 ```
 
 ### Concurrency
