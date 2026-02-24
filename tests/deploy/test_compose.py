@@ -25,6 +25,32 @@ def test_compose_single_instance(sample_config):
     assert "/mnt/models:/mnt/models" in result
 
 
+def test_compose_context_length_and_max_concurrent(sample_config):
+    sample_config["_num_instances"] = 1
+    sample_config["backend"]["vllm"]["max_concurrent_requests"] = 256
+    result = generate_compose(sample_config, "/mnt/models", "token")
+    assert "--max-model-len 8192" in result
+    assert "--max-num-seqs 256" in result
+
+
+def test_compose_omits_unset_named_fields():
+    config = {
+        "model": {"name": "test-org/test-model"},
+        "backend": {
+            "vllm": {
+                "image": "vllm/vllm-openai:latest",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "gpu_memory_utilization": 0.9,
+            }
+        },
+        "_num_instances": 1,
+    }
+    result = generate_compose(config, "/mnt/models", "token")
+    assert "--max-model-len" not in result
+    assert "--max-num-seqs" not in result
+
+
 def test_compose_multi_instance(sample_config_multi):
     result = generate_compose(sample_config_multi, "/mnt/models", "test-token")
 

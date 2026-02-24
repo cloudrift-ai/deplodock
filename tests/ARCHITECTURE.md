@@ -39,7 +39,7 @@ Test individual functions in isolation with synthetic inputs.
 
 | File | Covers |
 |------|--------|
-| `deploy/test_recipe.py` | `deplodock.deploy.load_recipe()`, `deep_merge()` — recipe loading, variant resolution, YAML parsing |
+| `deploy/test_recipe.py` | `deplodock.deploy.load_recipe()`, `deep_merge()`, `validate_extra_args()` — recipe loading, variant resolution, YAML parsing, extra_args validation |
 | `deploy/test_compose.py` | `deplodock.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `_gpu_device_ids` support |
 | `provisioning/test_cloud.py` | `deplodock.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud provisioning unit tests |
 | `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`), grouping logic, sorting |

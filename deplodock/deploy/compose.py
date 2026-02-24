@@ -27,6 +27,8 @@ def generate_compose(config, model_dir, hf_token):
     tp = vllm.get("tensor_parallel_size", 1)
     pp = vllm.get("pipeline_parallel_size", 1)
     gpu_mem = vllm.get("gpu_memory_utilization", 0.9)
+    context_length = vllm.get("context_length")
+    max_concurrent = vllm.get("max_concurrent_requests")
     extra_args = vllm.get("extra_args", "")
     gpus_per_instance = tp * pp
 
@@ -53,6 +55,8 @@ def generate_compose(config, model_dir, hf_token):
             gpu_config = f"device_ids: [{gpu_ids_yaml}]"
             port = 8000 + i
 
+        context_length_line = f"\n      --max-model-len {context_length}" if context_length is not None else ""
+        max_concurrent_line = f"\n      --max-num-seqs {max_concurrent}" if max_concurrent is not None else ""
         extra_args_line = f"\n      {extra_args}" if extra_args.strip() else ""
 
         services += f"""
@@ -83,7 +87,7 @@ def generate_compose(config, model_dir, hf_token):
       --tensor-parallel-size {tp}
       --pipeline-parallel-size {pp}
       --model {model_name}
-      --served-model-name {model_name}{extra_args_line}
+      --served-model-name {model_name}{context_length_line}{max_concurrent_line}{extra_args_line}
     healthcheck:
       test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health"]
       interval: 10s

@@ -4,6 +4,21 @@ import os
 
 import yaml
 
+# CLI flags already emitted by generate_compose() from named fields or hardcoded values.
+# These must not appear in extra_args to avoid duplication.
+BANNED_EXTRA_ARG_FLAGS = {
+    "--tensor-parallel-size",
+    "--pipeline-parallel-size",
+    "--gpu-memory-utilization",
+    "--max-model-len",
+    "--max-num-seqs",
+    "--trust-remote-code",
+    "--host",
+    "--port",
+    "--model",
+    "--served-model-name",
+}
+
 
 def deep_merge(base, override):
     """Recursive dict merge. Override wins for scalars."""
@@ -14,6 +29,21 @@ def deep_merge(base, override):
         else:
             result[key] = value
     return result
+
+
+def validate_extra_args(extra_args):
+    """Raise ValueError if extra_args contains flags managed by named recipe fields."""
+    tokens = extra_args.split()
+    found = []
+    for token in tokens:
+        flag = token.split("=")[0]
+        if flag in BANNED_EXTRA_ARG_FLAGS:
+            found.append(flag)
+    if found:
+        raise ValueError(
+            f"extra_args contains flags managed by named fields: {', '.join(sorted(found))}. "
+            f"Use the corresponding recipe YAML keys instead."
+        )
 
 
 def load_recipe(recipe_dir, variant=None):
@@ -32,5 +62,8 @@ def load_recipe(recipe_dir, variant=None):
             available = ", ".join(sorted(variants.keys())) if variants else "none"
             raise ValueError(f"Unknown variant '{variant}'. Available variants: {available}")
         config = deep_merge(config, variants[variant])
+
+    extra_args = config.get("backend", {}).get("vllm", {}).get("extra_args", "")
+    validate_extra_args(extra_args)
 
     return config

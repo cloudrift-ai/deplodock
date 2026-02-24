@@ -7,7 +7,9 @@ backend:
     tensor_parallel_size: 4
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
-    extra_args: "--max-num-seqs 512 --max-model-len 16384 --enable-expert-parallel"
+    context_length: 16384
+    max_concurrent_requests: 512
+    extra_args: "--enable-expert-parallel"
 
 benchmark:
   max_concurrency: 128
@@ -25,9 +27,6 @@ variants:
   4xB200:
     gpu: "NVIDIA B200"
     gpu_count: 4
-    backend:
-      vllm:
-        extra_args: "--max-num-seqs 512 --max-model-len 16384"
   4xH100:
     gpu: "NVIDIA H100 80GB"
     gpu_count: 4
@@ -36,7 +35,8 @@ variants:
     gpu_count: 4
     backend:
       vllm:
-        extra_args: "--max-num-seqs 256 --max-model-len 16384 --enable-expert-parallel"
+        max_concurrent_requests: 256
+        extra_args: "--enable-expert-parallel"
     benchmark:
       max_concurrency: 64
       num_prompts: 128

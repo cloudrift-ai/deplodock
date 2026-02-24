@@ -88,7 +88,9 @@ backend:
     tensor_parallel_size: 8
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
-    extra_args: "--max-num-seqs 512 --max-model-len 16384"
+    context_length: 16384
+    max_concurrent_requests: 512
+    extra_args: "--kv-cache-dtype fp8"      # Flags not covered by named fields
 
 benchmark:
   max_concurrency: 128
@@ -101,10 +103,22 @@ variants:
   8xH100:
     backend:
       vllm:
-        extra_args: "--max-model-len 8192"  # Override for this hardware
+        max_concurrent_requests: 256        # Override for this hardware
     benchmark:                              # Per-variant benchmark override
       max_concurrency: 64
 ```
+
+### Named vLLM Fields
+
+| Recipe YAML key | vLLM CLI flag |
+|---|---|
+| `tensor_parallel_size` | `--tensor-parallel-size` |
+| `pipeline_parallel_size` | `--pipeline-parallel-size` |
+| `gpu_memory_utilization` | `--gpu-memory-utilization` |
+| `context_length` | `--max-model-len` |
+| `max_concurrent_requests` | `--max-num-seqs` |
+
+These flags must **not** appear in `extra_args` — `load_recipe()` validates this and raises an error on duplicates.
 
 ### Variant Naming
 

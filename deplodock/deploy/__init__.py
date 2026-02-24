@@ -12,12 +12,13 @@ from deplodock.deploy.orchestrate import (
     teardown,
 )
 from deplodock.deploy.params import DeployParams
-from deplodock.deploy.recipe import deep_merge, load_recipe
+from deplodock.deploy.recipe import deep_merge, load_recipe, validate_extra_args
 
 __all__ = [
     "DeployParams",
     "deep_merge",
     "load_recipe",
+    "validate_extra_args",
     "calculate_num_instances",
     "generate_compose",
     "generate_nginx_conf",

@@ -25,7 +25,7 @@ The central orchestration layer. Provides a single entry point for deploying rec
 
 **Modules:**
 - `params.py` — `DeployParams` dataclass
-- `recipe.py` — `deep_merge()`, `load_recipe()`
+- `recipe.py` — `deep_merge()`, `load_recipe()`, `validate_extra_args()`
 - `compose.py` — `calculate_num_instances()`, `generate_compose()`, `generate_nginx_conf()`
 - `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`
 - `ssh.py` — `ssh_base_args()`, `make_run_cmd()`, `scp_file()`, `make_write_file()`

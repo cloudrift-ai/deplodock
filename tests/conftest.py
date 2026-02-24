@@ -72,7 +72,7 @@ def tmp_recipe_dir(tmp_path):
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
-                "extra_args": "--max-model-len 8192",
+                "context_length": 8192,
             }
         },
         "benchmark": {
@@ -92,7 +92,8 @@ def tmp_recipe_dir(tmp_path):
                 "backend": {
                     "vllm": {
                         "tensor_parallel_size": 8,
-                        "extra_args": "--max-model-len 16384 --kv-cache-dtype fp8",
+                        "context_length": 16384,
+                        "extra_args": "--kv-cache-dtype fp8",
                     }
                 },
                 "benchmark": {
@@ -106,7 +107,7 @@ def tmp_recipe_dir(tmp_path):
                 "backend": {
                     "vllm": {
                         "tensor_parallel_size": 4,
-                        "extra_args": "--max-model-len 8192 --kv-cache-dtype fp8",
+                        "extra_args": "--kv-cache-dtype fp8",
                     }
                 },
             },
@@ -131,7 +132,7 @@ def sample_config():
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
-                "extra_args": "--max-model-len 8192",
+                "context_length": 8192,
             }
         },
         "benchmark": {
@@ -154,7 +155,7 @@ def sample_config_multi():
                 "tensor_parallel_size": 4,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
-                "extra_args": "--max-model-len 16384",
+                "context_length": 16384,
             }
         },
         "_num_instances": 2,

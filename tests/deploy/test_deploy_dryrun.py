@@ -154,7 +154,7 @@ def test_multi_instance_variant(run_cli, tmp_path):
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
-                "extra_args": "--max-model-len 8192",
+                "context_length": 8192,
             }
         },
         "variants": {
