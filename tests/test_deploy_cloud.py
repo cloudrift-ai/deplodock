@@ -5,8 +5,18 @@ import os
 import pytest
 import yaml
 
+from deplodock.deploy.recipe import load_recipe
 from deplodock.provisioning.cloud import resolve_vm_spec, delete_cloud_vm
 from deplodock.provisioning.types import VMConnectionInfo
+
+
+def _load_entries(entries):
+    """Pre-load recipe configs from raw entries for resolve_vm_spec."""
+    loaded = []
+    for entry in entries:
+        config = load_recipe(entry['recipe'], variant=entry.get('variant'))
+        loaded.append((entry, config))
+    return loaded
 
 
 # ── resolve_vm_spec ──────────────────────────────────────────────
@@ -14,10 +24,9 @@ from deplodock.provisioning.types import VMConnectionInfo
 
 def test_resolve_vm_spec_single_recipe(recipes_dir):
     entries = [{"recipe": os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"), "variant": "RTX5090"}]
-    gpu_name, gpu_count, loaded = resolve_vm_spec(entries)
+    gpu_name, gpu_count = resolve_vm_spec(_load_entries(entries))
     assert gpu_name == "NVIDIA GeForce RTX 5090"
     assert gpu_count == 1
-    assert len(loaded) == 1
 
 
 def test_resolve_vm_spec_max_gpu_count(tmp_path):
@@ -38,10 +47,9 @@ def test_resolve_vm_spec_max_gpu_count(tmp_path):
         {"recipe": str(tmp_path), "variant": "1x"},
         {"recipe": str(tmp_path), "variant": "2x"},
     ]
-    gpu_name, gpu_count, loaded = resolve_vm_spec(entries)
+    gpu_name, gpu_count = resolve_vm_spec(_load_entries(entries))
     assert gpu_name == "NVIDIA GeForce RTX 5090"
     assert gpu_count == 2
-    assert len(loaded) == 2
 
 
 def test_resolve_vm_spec_mixed_gpus_raises(tmp_path):
@@ -63,7 +71,7 @@ def test_resolve_vm_spec_mixed_gpus_raises(tmp_path):
         {"recipe": str(tmp_path), "variant": "h100"},
     ]
     with pytest.raises(ValueError, match="mixed GPUs"):
-        resolve_vm_spec(entries, server_name="test")
+        resolve_vm_spec(_load_entries(entries), server_name="test")
 
 
 def test_resolve_vm_spec_missing_gpu_raises(tmp_path):
@@ -78,7 +86,7 @@ def test_resolve_vm_spec_missing_gpu_raises(tmp_path):
 
     entries = [{"recipe": str(tmp_path)}]
     with pytest.raises(ValueError, match="missing 'gpu' field"):
-        resolve_vm_spec(entries)
+        resolve_vm_spec(_load_entries(entries))
 
 
 # ── delete_cloud_vm ──────────────────────────────────────────────

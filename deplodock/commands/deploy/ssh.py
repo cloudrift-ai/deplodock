@@ -9,7 +9,7 @@ from deplodock.deploy import (
     load_recipe,
     teardown as teardown_entry,
 )
-from deplodock.deploy.ssh import make_run_cmd, make_write_file, scp_file, ssh_base_args, REMOTE_DEPLOY_DIR
+from deplodock.provisioning.ssh_transport import make_run_cmd, make_write_file, scp_file, ssh_base_args, REMOTE_DEPLOY_DIR
 from deplodock.provisioning.remote import provision_remote
 
 

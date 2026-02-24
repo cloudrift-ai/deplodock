@@ -9,7 +9,6 @@ from deplodock.deploy import (
     load_recipe,
 )
 from deplodock.provisioning.cloud import (
-    resolve_vm_spec,
     provision_cloud_vm,
     delete_cloud_vm,
 )

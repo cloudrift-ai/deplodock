@@ -13,26 +13,27 @@ from deplodock.provisioning import gcp_flex_start as gcp_provider
 from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
 
 
-def resolve_vm_spec(recipe_entries, server_name=None):
-    """Resolve GPU type and count from recipe entries for VM provisioning.
+def resolve_vm_spec(loaded_configs, server_name=None):
+    """Resolve GPU type and count from pre-loaded recipe configs for VM provisioning.
 
     All recipes in a server entry must target the same GPU. Uses the max
     gpu_count across all entries.
 
-    Returns:
-        (gpu_name, gpu_count, loaded_configs) where loaded_configs is a list
-        of (entry, recipe_config) tuples.
-    """
-    from deplodock.deploy.recipe import load_recipe
+    Args:
+        loaded_configs: list of (entry, recipe_config) tuples where each entry
+            is a dict with 'recipe'/'variant' keys and recipe_config is the
+            already-loaded recipe dict.
+        server_name: optional server name for error messages.
 
+    Returns:
+        (gpu_name, gpu_count) tuple.
+    """
     gpu_name = None
     max_gpu_count = 0
-    loaded = []
 
-    for entry in recipe_entries:
+    for entry, recipe_config in loaded_configs:
         recipe_path = entry['recipe']
         variant = entry.get('variant')
-        recipe_config = load_recipe(recipe_path, variant=variant)
 
         entry_gpu = recipe_config.get('gpu')
         entry_gpu_count = recipe_config.get('gpu_count', 1)
@@ -51,9 +52,8 @@ def resolve_vm_spec(recipe_entries, server_name=None):
             )
 
         max_gpu_count = max(max_gpu_count, entry_gpu_count)
-        loaded.append((entry, recipe_config))
 
-    return gpu_name, max_gpu_count, loaded
+    return gpu_name, max_gpu_count
 
 
 def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None,

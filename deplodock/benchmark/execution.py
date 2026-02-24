@@ -13,7 +13,7 @@ from deplodock.deploy import (
     deploy as deploy_entry,
     teardown as teardown_entry,
 )
-from deplodock.deploy.ssh import make_run_cmd
+from deplodock.provisioning.ssh_transport import make_run_cmd
 from deplodock.hardware import gpu_short_name
 from deplodock.planner import ExecutionGroup
 from deplodock.provisioning.cloud import (

@@ -32,7 +32,7 @@ def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
             full_cmd = f"cd {REMOTE_DEPLOY_DIR} && {command}"
         if dry_run:
             print(f"[dry-run] ssh {server}: {full_cmd}")
-            return 0, ""
+            return 0, "", ""
 
         ssh_args = ssh_base_args(server, ssh_key, ssh_port)
         ssh_args.append(full_cmd)
@@ -45,10 +45,11 @@ def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
                 stderr=None if stream else subprocess.PIPE,
             )
             stdout = "" if stream else (result.stdout or "")
-            return result.returncode, stdout
+            stderr = "" if stream else (result.stderr or "")
+            return result.returncode, stdout, stderr
         except Exception as e:
             print(f"Error running SSH command: {e}", file=sys.stderr)
-            return 1, ""
+            return 1, "", ""
 
     return run_cmd
 
