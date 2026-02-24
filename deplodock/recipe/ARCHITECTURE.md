@@ -78,6 +78,10 @@ Both `--model` and `--model-path` are in the hardcoded banned set, so they canno
 
 Engine-specific config (`image`, `extra_args`) nests under `engine.llm.vllm` or `engine.llm.sglang`, while engine-agnostic config lives at `engine.llm`. `LLMConfig.engine_name` is determined by which sub-config is present (SGLang takes priority if both exist). The `image` and `extra_args` properties delegate to the active engine's config.
 
+### SGLang Quantization for AWQ MoE Models
+
+SGLang does not automatically detect AWQ quantization for MoE architectures. For AWQ-quantized MoE models, `--quantization moe_wna16` must be passed via `extra_args`. See [/docs/sglang-awq-moe.md](/docs/sglang-awq-moe.md) for full details and tested configurations.
+
 ## Data Flow
 
 ```

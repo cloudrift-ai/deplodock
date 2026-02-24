@@ -1,6 +1,6 @@
 # Deplodock
 
-Tools for deploying and benchmarking LLM inference on GPU servers.
+Tools for deploying and benchmarking LLM inference on GPU servers. Supports **vLLM** and **SGLang** engines.
 
 ## Project Structure
 
@@ -19,6 +19,8 @@ Tools for deploying and benchmarking LLM inference on GPU servers.
   - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
   - [report/](deplodock/report/) — Excel report generation from benchmark results
 - [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
+- [docs/](docs/) — Technical notes and engine-specific guides
+  - [sglang-awq-moe.md](docs/sglang-awq-moe.md) — SGLang quantization for AWQ MoE models
 - [tests/](tests/) — pytest tests (see [ARCHITECTURE.md](tests/ARCHITECTURE.md))
 - [utils/](utils/) — Standalone utility scripts
 - [config.yaml](config.yaml) — Benchmark configuration
@@ -111,6 +113,27 @@ variants:
 ```
 
 Engine-agnostic fields (`tensor_parallel_size`, `context_length`, etc.) live at `engine.llm`. Engine-specific fields (`image`, `extra_args`) nest under `engine.llm.vllm` or `engine.llm.sglang`.
+
+### SGLang Variant Example
+
+To add an SGLang variant alongside vLLM variants, add a `sglang` key under `engine.llm` in the variant:
+
+```yaml
+variants:
+  RTX5090:
+    gpu: "NVIDIA GeForce RTX 5090"
+    gpu_count: 1
+  RTX5090_sglang:
+    gpu: "NVIDIA GeForce RTX 5090"
+    gpu_count: 1
+    engine:
+      llm:
+        sglang:
+          image: "lmsysorg/sglang:latest"
+          extra_args: "--quantization moe_wna16"  # Required for AWQ MoE models
+```
+
+For AWQ-quantized MoE models on SGLang, `--quantization moe_wna16` is required in `extra_args`. See [docs/sglang-awq-moe.md](docs/sglang-awq-moe.md) for details.
 
 ### Named Fields → CLI Flags
 
