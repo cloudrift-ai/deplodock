@@ -15,8 +15,12 @@ Test individual functions in isolation with synthetic inputs.
 | `test_recipe.py` | `load_recipe()`, `deep_merge()` — recipe loading, variant resolution, YAML parsing |
 | `test_compose.py` | `generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `_gpu_device_ids` support |
 | `test_deploy_cloud.py` | `resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud deploy bridge unit tests |
-| `test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties, grouping logic, sorting |
+| `test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`), grouping logic, sorting |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
+| `benchmark/test_code_hash.py` | `compute_code_hash()` — determinism, hex format |
+| `benchmark/test_run_dir.py` | `create_run_dir()` — directory creation, naming format |
+| `benchmark/test_manifest.py` | `write_manifest()`, `read_manifest()` — round-trip serialization |
+| `report/test_report.py` | `_collect_tasks_from_manifests()`, `parse_benchmark_result()` — manifest-based report data collection |
 
 Unit tests use **fixtures from `conftest.py`** (`tmp_recipe_dir`, `sample_config`, `sample_config_multi`) to supply pre-built recipe directories and config dicts.
 
