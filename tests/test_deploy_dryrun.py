@@ -192,11 +192,11 @@ def test_bench_help(run_cli):
     assert rc == 0
     assert "--config" in stdout
     assert "--force" in stdout
-    assert "--server" in stdout
-    assert "--recipe" in stdout
+    assert "--variants" in stdout
+    assert "--ssh-key" in stdout
     assert "--dry-run" in stdout
-    assert "--parallel" in stdout
     assert "--max-workers" in stdout
+    assert "recipes" in stdout
 
 
 def test_report_help(run_cli):

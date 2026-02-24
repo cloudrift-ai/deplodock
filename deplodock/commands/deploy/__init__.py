@@ -88,9 +88,16 @@ def generate_compose(config, model_dir, hf_token):
 
     services = "services:\n"
 
+    # Optional: restrict GPU visibility to specific device IDs
+    device_ids_override = config.get("_gpu_device_ids")
+
     for i in range(num_instances):
         if num_instances == 1:
-            gpu_config = "count: all"
+            if device_ids_override is not None:
+                gpu_ids_yaml = ", ".join(f"'{g}'" for g in device_ids_override)
+                gpu_config = f"device_ids: [{gpu_ids_yaml}]"
+            else:
+                gpu_config = "count: all"
             port = 8000
         else:
             start = i * gpus_per_instance

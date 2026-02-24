@@ -3,16 +3,24 @@
 import os
 
 
-def test_bench_dry_run_basic(run_cli, make_bench_config, tmp_path):
+def test_bench_dry_run_basic(run_cli, make_bench_config, recipes_dir, tmp_path):
     config_path = make_bench_config(tmp_path)
-    rc, stdout, stderr = run_cli("bench", "--config", config_path, "--dry-run")
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench", recipe, "--variants", "RTX5090",
+        "--config", config_path, "--dry-run",
+    )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
     assert "[dry-run]" in stdout
 
 
-def test_bench_dry_run_deploy_then_benchmark(run_cli, make_bench_config, tmp_path):
+def test_bench_dry_run_deploy_then_benchmark(run_cli, make_bench_config, recipes_dir, tmp_path):
     config_path = make_bench_config(tmp_path)
-    rc, stdout, stderr = run_cli("bench", "--config", config_path, "--dry-run")
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench", recipe, "--variants", "RTX5090",
+        "--config", config_path, "--dry-run",
+    )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
 
     # Verify deploy steps appear
@@ -33,68 +41,36 @@ def test_bench_dry_run_deploy_then_benchmark(run_cli, make_bench_config, tmp_pat
     assert pull_idx < bench_idx
 
 
-def test_bench_server_filter(run_cli, make_bench_config, recipes_dir, tmp_path):
-    servers = [
-        {
-            "name": "server_a",
-            "ssh_key": "~/.ssh/id_ed25519",
-            "recipes": [
-                {
-                    "recipe": os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-                    "variant": "RTX5090",
-                }
-            ],
-        },
-        {
-            "name": "server_b",
-            "ssh_key": "~/.ssh/id_ed25519",
-            "recipes": [
-                {
-                    "recipe": os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-                    "variant": "RTX5090",
-                }
-            ],
-        },
-    ]
-    config_path = make_bench_config(tmp_path, servers=servers)
+def test_bench_variant_filter(run_cli, make_bench_config, recipes_dir, tmp_path):
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
     rc, stdout, stderr = run_cli(
-        "bench", "--config", config_path, "--dry-run", "--server", "server_a"
+        "bench", recipe, "--variants", "RTX5090",
+        "--config", config_path, "--dry-run",
     )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
-    assert "server_a" in stdout
-    assert "server_b" not in stdout
+    assert "RTX5090" in stdout
 
 
-def test_bench_recipe_filter(run_cli, make_bench_config, recipes_dir, tmp_path):
-    recipe_path = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
-    servers = [
-        {
-            "name": "test_server",
-            "ssh_key": "~/.ssh/id_ed25519",
-            "recipes": [
-                {"recipe": recipe_path, "variant": "RTX5090"},
-                {"recipe": os.path.join(recipes_dir, "GLM-4.6-FP8"), "variant": "8xH200"},
-            ],
-        },
-    ]
-    config_path = make_bench_config(tmp_path, servers=servers)
+def test_bench_multiple_recipes(run_cli, make_bench_config, recipes_dir, tmp_path):
+    config_path = make_bench_config(tmp_path)
+    recipe1 = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    recipe2 = os.path.join(recipes_dir, "GLM-4.6-FP8")
     rc, stdout, stderr = run_cli(
-        "bench", "--config", config_path, "--dry-run",
-        "--recipe", recipe_path,
+        "bench", recipe1, recipe2, "--variants", "RTX5090",
+        "--config", config_path, "--dry-run",
     )
+    # Should succeed even if some variants are missing (warned on stderr)
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
-    assert "Qwen3-Coder-30B" in stdout
-    # GLM recipe should not be deployed
-    assert "GLM-4.6-FP8" not in stdout
 
 
 def test_bench_help(run_cli):
     rc, stdout, _ = run_cli("bench", "--help")
     assert rc == 0
-    assert "--recipe" in stdout
+    assert "recipes" in stdout
+    assert "--variants" in stdout
+    assert "--ssh-key" in stdout
     assert "--dry-run" in stdout
     assert "--config" in stdout
     assert "--force" in stdout
-    assert "--server" in stdout
-    assert "--parallel" in stdout
     assert "--max-workers" in stdout

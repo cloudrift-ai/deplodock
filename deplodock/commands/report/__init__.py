@@ -17,11 +17,20 @@ def load_config(config_file: str) -> dict:
 def extract_gpu_type(server_name: str) -> str:
     """Extract GPU type from server name.
 
+    Supports both old format (rtx5090_x_1) and new format (rtx5090_1x).
+
     Examples:
         rtx4090_x_1 -> rtx4090
         rtx5090_x_4 -> rtx5090
         pro6000_x_1 -> pro6000
+        rtx5090_1x  -> rtx5090
+        pro6000_4x  -> pro6000
     """
+    # New format: {gpu_short}_{count}x
+    match = re.match(r'([a-z0-9]+)_\d+x', server_name.lower())
+    if match:
+        return match.group(1)
+    # Old format: {gpu_short}_x_{count}
     match = re.match(r'([a-z0-9]+)_x_\d+', server_name.lower())
     if match:
         return match.group(1)
@@ -31,10 +40,19 @@ def extract_gpu_type(server_name: str) -> str:
 def extract_gpu_count(server_name: str) -> int:
     """Extract GPU count from server name.
 
+    Supports both old format (rtx5090_x_1) and new format (rtx5090_1x).
+
     Examples:
         rtx4090_x_1 -> 1
         rtx5090_x_4 -> 4
+        rtx5090_1x  -> 1
+        pro6000_4x  -> 4
     """
+    # New format: {gpu_short}_{count}x
+    match = re.search(r'_(\d+)x', server_name)
+    if match:
+        return int(match.group(1))
+    # Old format: {gpu_short}_x_{count}
     match = re.search(r'_x_(\d+)', server_name)
     if match:
         return int(match.group(1))
@@ -125,18 +143,25 @@ def generate_report(config: dict, results_dir: str, output_file: str):
         filename = result_file.stem
         parts = filename.rsplit('_vllm_benchmark', 1)[0]
 
-        match = re.match(r'([^_]+_x_\d+)_(.+)', parts)
+        # New format: {gpu_short}_{count}x_{model_safe}
+        match = re.match(r'([a-z0-9]+_\d+x)_(.+)', parts)
         if match:
             server_name = match.group(1)
             model_name = match.group(2).replace('_', '/')
         else:
-            match = re.match(r'(gcloud_[^_]+)_(.+)', parts)
+            # Old format: {server}_x_{count}_{model_safe}
+            match = re.match(r'([^_]+_x_\d+)_(.+)', parts)
             if match:
                 server_name = match.group(1)
                 model_name = match.group(2).replace('_', '/')
             else:
-                print(f"Warning: Could not parse filename: {result_file.name}")
-                continue
+                match = re.match(r'(gcloud_[^_]+)_(.+)', parts)
+                if match:
+                    server_name = match.group(1)
+                    model_name = match.group(2).replace('_', '/')
+                else:
+                    print(f"Warning: Could not parse filename: {result_file.name}")
+                    continue
 
         total_throughput, metrics = parse_benchmark_result(result_file)
 

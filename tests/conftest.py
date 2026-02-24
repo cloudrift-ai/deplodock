@@ -44,30 +44,12 @@ def run_cli(project_root):
 def make_bench_config(recipes_dir):
     """Return a factory that writes a temporary bench config.yaml."""
 
-    def _make(tmp_dir, servers=None):
-        if servers is None:
-            servers = [
-                {
-                    "name": "test_server",
-                    "ssh_key": "~/.ssh/id_ed25519",
-                    "recipes": [
-                        {
-                            "recipe": os.path.join(
-                                recipes_dir,
-                                "Qwen3-Coder-30B-A3B-Instruct-AWQ",
-                            ),
-                            "variant": "RTX5090",
-                        }
-                    ],
-                }
-            ]
-
+    def _make(tmp_dir):
         config = {
             "benchmark": {
                 "local_results_dir": os.path.join(str(tmp_dir), "results"),
                 "model_dir": "/hf_models",
             },
-            "servers": servers,
         }
         config_path = os.path.join(str(tmp_dir), "config.yaml")
         with open(config_path, "w") as f:

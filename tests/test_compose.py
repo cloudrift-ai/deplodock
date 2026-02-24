@@ -79,6 +79,25 @@ def test_compose_image_from_config(sample_config):
     assert "custom/image:v2" in result
 
 
+def test_compose_gpu_device_ids_override(sample_config):
+    """_gpu_device_ids restricts GPU visibility in single-instance mode."""
+    sample_config["_num_instances"] = 1
+    sample_config["_gpu_device_ids"] = [0, 1]
+    result = generate_compose(sample_config, "/mnt/models", "token")
+    assert "device_ids:" in result
+    assert "'0'" in result
+    assert "'1'" in result
+    assert "count: all" not in result
+
+
+def test_compose_no_gpu_device_ids_uses_count_all(sample_config):
+    """Without _gpu_device_ids, single-instance uses count: all."""
+    sample_config["_num_instances"] = 1
+    result = generate_compose(sample_config, "/mnt/models", "token")
+    assert "count: all" in result
+    assert "device_ids:" not in result
+
+
 # ── generate_nginx_conf ─────────────────────────────────────────────
 
 

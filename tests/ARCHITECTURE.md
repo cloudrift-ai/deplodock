@@ -13,8 +13,10 @@ Test individual functions in isolation with synthetic inputs.
 | File | Covers |
 |------|--------|
 | `test_recipe.py` | `load_recipe()`, `deep_merge()` — recipe loading, variant resolution, YAML parsing |
-| `test_compose.py` | `generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation |
+| `test_compose.py` | `generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `_gpu_device_ids` support |
 | `test_deploy_cloud.py` | `resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud deploy bridge unit tests |
+| `test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties, grouping logic, sorting |
+| `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
 
 Unit tests use **fixtures from `conftest.py`** (`tmp_recipe_dir`, `sample_config`, `sample_config_multi`) to supply pre-built recipe directories and config dicts.
 
@@ -26,7 +28,7 @@ Test the full CLI pipeline end-to-end by invoking `deplodock` as a subprocess wi
 |------|--------|
 | `test_deploy_dryrun.py` | `deploy ssh`, `deploy local` — dry-run output, command sequence, variant resolution, teardown, CLI help |
 | `test_deploy_cloud_dryrun.py` | `deploy cloud` — dry-run output, deploy steps, error handling, CLI help |
-| `test_bench_dryrun.py` | `bench` — dry-run output, deploy→benchmark→teardown sequence, server/recipe filtering, CLI help |
+| `test_bench_dryrun.py` | `bench` — dry-run output, deploy→benchmark→teardown sequence, variant filtering, CLI help |
 | `test_vm_gcp_flex_start.py` | `_gcloud_*_cmd()` — GCP flex-start command builder functions (create, delete, status, IP, SSH) |
 | `test_vm_dryrun.py` | `vm create/delete gcp-flex-start`, `vm create/delete cloudrift` — dry-run output, argparse validation, CLI help |
 
@@ -39,7 +41,7 @@ CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench
 | `project_root` | session | Absolute path to repo root |
 | `recipes_dir` | session | Absolute path to `recipes/` |
 | `run_cli` | session | Callable that invokes `python -m deplodock.deplodock` as a subprocess |
-| `make_bench_config` | function | Factory that writes a temp `config.yaml` for bench tests |
+| `make_bench_config` | function | Factory that writes a temp `config.yaml` for bench tests (benchmark section only) |
 | `tmp_recipe_dir` | function | Temp directory with a sample `recipe.yaml` for unit tests |
 | `sample_config` | function | Single-instance config dict for compose tests |
 | `sample_config_multi` | function | Multi-instance config dict for compose tests |

@@ -3,6 +3,7 @@
 ## Layered Design
 
 ```
+bench ──────► planner (task grouping)       # group tasks into VMs
 bench ──────► deploy(DeployParams)          # single entry point
 bench ──────► deploy/cloud (VM lifecycle)   # provision/delete
 deploy CLI ─► deploy(DeployParams)          # same entry point
@@ -12,6 +13,18 @@ deploy/cloud ► vm providers                 # clean interface
 **Dependency rule:** `bench` never imports from `vm` directly — it goes through `deploy/cloud`.
 
 ## Layers
+
+### `planner/` — Planner Layer
+
+Groups benchmark tasks into execution groups for VM allocation.
+
+**Abstract interface (`planner/__init__.py`):**
+- `BenchmarkTask` — one recipe+variant combination (recipe_dir, variant, recipe_config, gpu_name, gpu_count)
+- `ExecutionGroup` — group of tasks sharing one VM (gpu_name, gpu_count, tasks)
+- `BenchmarkPlanner` — ABC with `plan(tasks) -> list[ExecutionGroup]`
+
+**Implementations:**
+- `planner/group_by_model_and_gpu.py` — `GroupByModelAndGpuPlanner`: groups by (model_name, gpu_name) tuple. Same model on same GPU shares a VM to reuse cached weights. Max gpu_count determines VM size; tasks sorted descending.
 
 ### `deploy/` — Deploy Layer
 
@@ -24,6 +37,8 @@ The central orchestration layer. Provides a single entry point for deploying rec
 - `load_recipe(recipe_dir, variant)` — load and resolve a recipe config
 - `run_deploy(run_cmd, write_file, config, ...)` — low-level orchestration (used by `deploy()` and `local`)
 - `run_teardown(run_cmd)` — low-level teardown
+
+**GPU visibility:** `generate_compose()` supports `_gpu_device_ids` in the config dict to restrict GPU visibility via `device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
 
 **Targets:**
 - `deploy/ssh.py` — SSH target, uses `deploy()` / `teardown()`
@@ -56,28 +71,38 @@ Low-level VM lifecycle management. Each provider implements `create_instance()` 
 
 ### `bench/` — Benchmark Layer
 
-Orchestrates deploy + benchmark + teardown across servers. Uses `deploy()` and `deploy/cloud` — never reaches into vm providers directly.
+Orchestrates deploy + benchmark + teardown on cloud VMs. Accepts recipe directories as positional args. Uses the Planner to group tasks into ExecutionGroups, then runs groups in parallel via `asyncio`.
+
+**Data flow:**
+1. `enumerate_tasks(recipe_dirs, variants_filter)` → list of `BenchmarkTask`
+2. `GroupByModelAndGpuPlanner().plan(tasks)` → list of `ExecutionGroup`
+3. `asyncio.run(_run_groups(...))` → concurrent execution via `asyncio.to_thread()`
+4. Each group: provision VM → for each task: deploy → benchmark → teardown → delete VM
 
 ## Data Flow
 
 ```
-Recipe entries
+Recipe dirs (positional args)
     │
     ▼
-resolve_vm_spec() ─► (gpu_name, gpu_count, loaded_configs)
+enumerate_tasks() ─► list[BenchmarkTask]
+    │
+    ▼
+GroupByModelAndGpuPlanner.plan() ─► list[ExecutionGroup]
+    │
+    ▼
+asyncio.gather(*groups)  ── each group runs in a thread:
     │
     ▼
 provision_cloud_vm() ─► VMConnectionInfo
-    │                      ├── host, username, ssh_port
-    │                      └── delete_info (for cleanup)
-    ▼
-DeployParams(server=conn.address, ssh_key=..., recipe_config=...)
     │
     ▼
-deploy(params) ─► run_deploy() ─► compose up + health check
-    │
-    ▼
-teardown(params) ─► run_teardown() ─► compose down
+For each task in group:
+    ├── set _gpu_device_ids if task.gpu_count < group.gpu_count
+    ├── deploy(DeployParams) ─► compose up
+    ├── run_benchmark_workload()
+    ├── save results
+    └── teardown()
     │
     ▼
 delete_cloud_vm(conn.delete_info)
@@ -91,7 +116,7 @@ deplodock
 │   ├── local    — deploy locally via docker compose
 │   ├── ssh      — deploy to remote server via SSH
 │   └── cloud    — provision cloud VM + deploy via SSH
-├── bench        — deploy + benchmark + teardown on remote servers
+├── bench        — deploy + benchmark + teardown on cloud VMs
 ├── report       — generate Excel reports from benchmark results
 └── vm
     ├── create

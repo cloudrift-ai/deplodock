@@ -61,6 +61,21 @@ tests can use dry-run or mock versions:
 def run_deploy(run_cmd, write_file, config, model_dir, ...):
 ```
 
+### Concurrency
+
+Use `asyncio` for concurrent execution. Wrap blocking (subprocess/IO)
+calls with `asyncio.to_thread()`. Use `asyncio.Semaphore` to limit
+concurrency. Entry point uses `asyncio.run()`:
+
+```python
+async def _run_groups(groups):
+    sem = asyncio.Semaphore(max_workers)
+    async def _run(group):
+        async with sem:
+            return await asyncio.to_thread(blocking_fn, group)
+    await asyncio.gather(*(_run(g) for g in groups))
+```
+
 ## Commit Messages
 
 - Keep the subject line short (under ~72 characters).
