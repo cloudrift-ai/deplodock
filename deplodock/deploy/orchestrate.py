@@ -37,7 +37,7 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
 
     # Generate and write nginx config if multi-instance
     if num_instances > 1:
-        nginx_content = generate_nginx_conf(num_instances)
+        nginx_content = generate_nginx_conf(num_instances, engine=recipe.engine.llm.engine_name)
         write_file("nginx.conf", nginx_content)
 
     port = 8080 if num_instances > 1 else 8000

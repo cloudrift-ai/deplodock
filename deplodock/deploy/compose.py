@@ -23,6 +23,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
     llm = recipe.engine.llm
     model_name = recipe.model_name
     image = llm.image
+    engine = llm.engine_name
     gpus_per_instance = llm.gpus_per_instance
 
     engine_args = build_engine_args(llm, model_name)
@@ -46,9 +47,9 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
             port = 8000 + i
 
         services += f"""
-  vllm_{i}:
+  {engine}_{i}:
     image: {image}
-    container_name: vllm_{i}
+    container_name: {engine}_{i}
     deploy:
       resources:
         reservations:
@@ -76,7 +77,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
 """
 
     if num_instances > 1:
-        depends = "\n".join(f"      vllm_{i}:\n        condition: service_healthy" for i in range(num_instances))
+        depends = "\n".join(f"      {engine}_{i}:\n        condition: service_healthy" for i in range(num_instances))
         services += f"""
   nginx:
     image: nginx:alpine
@@ -92,9 +93,9 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
     return services
 
 
-def generate_nginx_conf(num_instances):
+def generate_nginx_conf(num_instances, engine="vllm"):
     """Generate nginx config with least_conn upstream."""
-    upstream_servers = "\n".join(f"        server vllm_{i}:8000;" for i in range(num_instances))
+    upstream_servers = "\n".join(f"        server {engine}_{i}:8000;" for i in range(num_instances))
 
     return f"""worker_processes auto;
 
@@ -103,7 +104,7 @@ events {{
 }}
 
 http {{
-    upstream vllm_backend {{
+    upstream llm_backend {{
         least_conn;
 {upstream_servers}
     }}
@@ -112,7 +113,7 @@ http {{
         listen 8080;
 
         location / {{
-            proxy_pass http://vllm_backend;
+            proxy_pass http://llm_backend;
             proxy_http_version 1.1;
             proxy_set_header Connection "";
             proxy_set_header Host $host;

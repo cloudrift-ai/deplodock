@@ -137,6 +137,7 @@ def test_nginx_basic_structure():
     assert "vllm_1:8000" in result
     assert "proxy_buffering off" in result
     assert "listen 8080" in result
+    assert "llm_backend" in result
 
 
 def test_nginx_server_count():
@@ -153,3 +154,37 @@ def test_nginx_proxy_timeouts():
     assert "proxy_connect_timeout 600s" in result
     assert "proxy_send_timeout 600s" in result
     assert "proxy_read_timeout 600s" in result
+
+
+def test_nginx_sglang_engine():
+    result = generate_nginx_conf(2, engine="sglang")
+    assert "sglang_0:8000" in result
+    assert "sglang_1:8000" in result
+    assert "vllm_0" not in result
+    assert "llm_backend" in result
+
+
+# ── SGLang compose ─────────────────────────────────────────────────
+
+
+def test_compose_sglang_single_instance(sample_config_sglang):
+    recipe = Recipe.from_dict(sample_config_sglang)
+    result = generate_compose(recipe, "/mnt/models", "test-token", num_instances=1)
+
+    assert "sglang_0:" in result
+    assert "vllm_0:" not in result
+    assert "lmsysorg/sglang:latest" in result
+    assert "--model-path test-org/test-model" in result
+    assert "--model test-org/test-model" not in result
+    assert "--tp 1" in result
+    assert "--dp 1" in result
+    assert "--mem-fraction-static 0.9" in result
+    assert "--context-length 8192" in result
+
+
+def test_compose_sglang_parses_as_valid_yaml(sample_config_sglang):
+    recipe = Recipe.from_dict(sample_config_sglang)
+    result = generate_compose(recipe, "/mnt/models", "test-token", num_instances=1)
+    parsed = yaml.safe_load(result)
+    assert "services" in parsed
+    assert "sglang_0" in parsed["services"]

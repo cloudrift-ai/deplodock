@@ -119,6 +119,20 @@ def test_build_args_sglang_basic():
     assert "--trust-remote-code" in args
 
 
+def test_build_args_sglang_uses_model_path():
+    llm = LLMConfig(sglang=SglangConfig())
+    args = build_engine_args(llm, "org/model")
+    assert "--model-path org/model" in args
+    assert "--model org/model" not in args
+
+
+def test_build_args_vllm_uses_model_not_model_path():
+    llm = LLMConfig(vllm=VllmConfig())
+    args = build_engine_args(llm, "org/model")
+    assert "--model org/model" in args
+    assert "--model-path org/model" not in args
+
+
 def test_build_args_sglang_context_length():
     llm = LLMConfig(context_length=8192, sglang=SglangConfig())
     args = build_engine_args(llm, "org/model")
@@ -129,3 +143,9 @@ def test_build_args_sglang_max_concurrent():
     llm = LLMConfig(max_concurrent_requests=128, sglang=SglangConfig())
     args = build_engine_args(llm, "org/model")
     assert "--max-running-requests 128" in args
+
+
+def test_banned_flags_include_model_path():
+    """--model-path must be banned for both engines."""
+    assert "--model-path" in banned_extra_arg_flags("vllm")
+    assert "--model-path" in banned_extra_arg_flags("sglang")

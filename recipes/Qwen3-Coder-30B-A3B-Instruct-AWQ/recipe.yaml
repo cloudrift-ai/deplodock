@@ -29,3 +29,17 @@ variants:
   L40S:
     gpu: "NVIDIA L40S"
     gpu_count: 1
+  RTX5090_sglang:
+    gpu: "NVIDIA GeForce RTX 5090"
+    gpu_count: 1
+    engine:
+      llm:
+        sglang:
+          image: "lmsysorg/sglang:latest"
+  L40S_sglang:
+    gpu: "NVIDIA L40S"
+    gpu_count: 1
+    engine:
+      llm:
+        sglang:
+          image: "lmsysorg/sglang:latest"
