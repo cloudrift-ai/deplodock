@@ -13,6 +13,12 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Python egg-info
+deplodock.egg-info/
+
 # Docker Compose generated files
 docker-compose.vllm.yml
 nginx.vllm.conf
+
+# PyCharm
+.idea/
