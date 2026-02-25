@@ -9,21 +9,24 @@ description = "Deploy and benchmark LLM inference on GPU servers using vLLM"
 requires-python = ">=3.12"
 dependencies = [
     "huggingface_hub[cli,hf_transfer]",
+    "httpx",
     "openpyxl",
     "pandas",
     "pyyaml",
-    "requests",
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
-dev = ["pytest", "ruff"]
+test = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "ruff"]
 
 [tool.setuptools.packages.find]
 include = ["deplodock*"]
 
 [project.scripts]
 deplodock = "deplodock.deplodock:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 140

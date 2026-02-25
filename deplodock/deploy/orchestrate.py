@@ -1,7 +1,7 @@
 """Deploy orchestration: run_deploy, run_teardown, deploy, teardown."""
 
+import asyncio
 import logging
-import time
 
 from deplodock.deploy.compose import (
     calculate_num_instances,
@@ -15,12 +15,12 @@ from deplodock.recipe.types import Recipe
 logger = logging.getLogger(__name__)
 
 
-def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, dry_run=False, gpu_device_ids=None):
+async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, dry_run=False, gpu_device_ids=None):
     """Shared deploy orchestration.
 
     Args:
-        run_cmd: callable(command, stream=True) -> (returncode, stdout, stderr)
-        write_file: callable(path, content) -> None - writes file to target
+        run_cmd: async callable(command, stream=True, timeout=600) -> (returncode, stdout, stderr)
+        write_file: async callable(path, content) -> None - writes file to target
         recipe: resolved Recipe dataclass
         model_dir: model cache directory path
         hf_token: HuggingFace token
@@ -35,18 +35,18 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
 
     # Generate and write compose file
     compose_content = generate_compose(recipe, model_dir, hf_token, num_instances=num_instances, gpu_device_ids=gpu_device_ids)
-    write_file("docker-compose.yaml", compose_content)
+    await write_file("docker-compose.yaml", compose_content)
 
     # Generate and write nginx config if multi-instance
     if num_instances > 1:
         nginx_content = generate_nginx_conf(num_instances, engine=recipe.engine.llm.engine_name)
-        write_file("nginx.conf", nginx_content)
+        await write_file("nginx.conf", nginx_content)
 
     port = 8080 if num_instances > 1 else 8000
 
     # Step 1: Pull images
     logger.info("Pulling images...")
-    rc, _, _ = run_cmd("docker compose pull")
+    rc, _, _ = await run_cmd("docker compose pull", timeout=1800)
     if rc != 0:
         logger.error("Failed to pull images")
         return False
@@ -62,22 +62,22 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
         f" {image}"
         f" -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
     )
-    rc, _, _ = run_cmd(dl_cmd)
+    rc, _, _ = await run_cmd(dl_cmd, timeout=3600)
     if rc != 0:
         logger.error("Failed to download model")
         return False
 
     # Step 3: Clean up old containers
     logger.info("Cleaning up old containers...")
-    run_cmd("docker compose down")
+    await run_cmd("docker compose down", timeout=300)
 
     # Step 4: Start services
     logger.info("Starting services...")
-    rc, _, _ = run_cmd("docker compose up -d --wait --wait-timeout 1800")
+    rc, _, _ = await run_cmd("docker compose up -d --wait --wait-timeout 1800", timeout=1800)
     if rc != 0:
         logger.error("Failed to start services")
         logger.error("Container logs:")
-        run_cmd("docker compose logs --tail=100")
+        await run_cmd("docker compose logs --tail=100", timeout=60)
         return False
 
     # Step 5: Poll health
@@ -87,12 +87,12 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
     interval = 10
     elapsed = 0
     while elapsed < timeout:
-        rc, _, _ = run_cmd(f"curl -sf {health_url}", stream=False)
+        rc, _, _ = await run_cmd(f"curl -sf {health_url}", stream=False, timeout=30)
         if rc == 0:
             break
         if dry_run:
             break
-        time.sleep(interval)
+        await asyncio.sleep(interval)
         elapsed += interval
     else:
         logger.error(f"Health check timed out after {timeout}s")
@@ -113,7 +113,7 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
             f" -H 'Content-Type: application/json'"
             f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"Say hello"}}],"max_tokens":16}}' '''
         )
-        rc, _, _ = run_cmd(smoke_cmd, stream=False)
+        rc, _, _ = await run_cmd(smoke_cmd, stream=False, timeout=60)
         if rc == 0:
             logger.info("Smoke test passed.")
         else:
@@ -134,10 +134,10 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
     return True
 
 
-def run_teardown(run_cmd):
+async def run_teardown(run_cmd):
     """Tear down: docker compose down."""
     logger.info("Tearing down...")
-    rc, _, _ = run_cmd("docker compose down")
+    rc, _, _ = await run_cmd("docker compose down", timeout=300)
     if rc == 0:
         logger.info("Teardown complete.")
     else:
@@ -145,12 +145,12 @@ def run_teardown(run_cmd):
     return rc == 0
 
 
-def deploy(params: DeployParams) -> bool:
+async def deploy(params: DeployParams) -> bool:
     """Deploy a recipe to a server via SSH. Single entry point."""
     run_cmd = make_run_cmd(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
     write_file = make_write_file(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
     host = params.server.split("@")[-1] if "@" in params.server else params.server
-    return run_deploy(
+    return await run_deploy(
         run_cmd,
         write_file,
         params.recipe,
@@ -162,7 +162,7 @@ def deploy(params: DeployParams) -> bool:
     )
 
 
-def teardown(params: DeployParams) -> bool:
+async def teardown(params: DeployParams) -> bool:
     """Teardown containers on a server."""
     run_cmd = make_run_cmd(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
-    return run_teardown(run_cmd)
+    return await run_teardown(run_cmd)

@@ -1,9 +1,9 @@
 """GCP provider CLI handlers."""
 
+import asyncio
 import sys
 
 from deplodock.provisioning.gcp import (
-    # Re-export business logic for backward compatibility
     create_instance,
     delete_instance,
 )
@@ -13,7 +13,11 @@ from deplodock.provisioning.gcp import (
 
 def handle_create(args):
     """CLI handler for 'vm create gcp'."""
-    conn = create_instance(
+    asyncio.run(_handle_create(args))
+
+
+async def _handle_create(args):
+    conn = await create_instance(
         instance=args.instance,
         zone=args.zone,
         machine_type=args.machine_type,
@@ -36,7 +40,11 @@ def handle_create(args):
 
 def handle_delete(args):
     """CLI handler for 'vm delete gcp'."""
-    success = delete_instance(
+    asyncio.run(_handle_delete(args))
+
+
+async def _handle_delete(args):
+    success = await delete_instance(
         instance=args.instance,
         zone=args.zone,
         dry_run=args.dry_run,

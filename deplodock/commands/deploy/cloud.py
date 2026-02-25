@@ -1,5 +1,6 @@
 """Cloud deploy target CLI handler."""
 
+import asyncio
 import logging
 import os
 import sys
@@ -21,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 def handle_cloud(args):
     """CLI handler for 'deploy cloud'."""
+    asyncio.run(_handle_cloud(args))
+
+
+async def _handle_cloud(args):
     recipe = load_recipe(args.recipe)
 
     if not recipe.deploy.gpu:
@@ -30,7 +35,7 @@ def handle_cloud(args):
     ssh_key = os.path.expanduser(args.ssh_key)
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
 
-    conn = provision_cloud_vm(
+    conn = await provision_cloud_vm(
         gpu_name=recipe.deploy.gpu,
         gpu_count=recipe.deploy.gpu_count,
         ssh_key=ssh_key,
@@ -50,9 +55,9 @@ def handle_cloud(args):
         hf_token=hf_token,
         dry_run=args.dry_run,
     )
-    provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    await provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
 
-    if not deploy_entry(params):
+    if not await deploy_entry(params):
         sys.exit(1)
 
 

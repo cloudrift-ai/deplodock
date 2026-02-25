@@ -2,7 +2,7 @@
 
 ## Overview
 
-All tests use **pytest** and live in the `tests/` directory, organized into subdirectories that mirror the `deplodock/` source tree. Tests are designed to run without GPU hardware, Docker, or network access — every external interaction is avoided via dry-run mode or by testing pure functions directly.
+All tests use **pytest** with **pytest-asyncio** (`asyncio_mode = "auto"` in `pyproject.toml`) and live in the `tests/` directory, organized into subdirectories that mirror the `deplodock/` source tree. Tests are designed to run without GPU hardware, Docker, or network access — every external interaction is avoided via dry-run mode or by testing pure functions directly.
 
 ## Directory Structure
 
@@ -86,6 +86,7 @@ CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench
 
 ## Conventions
 
+- **Async tests** — tests for async functions are plain `async def` (no decorator needed; `asyncio_mode = "auto"` handles it). Mock async callables with `AsyncMock`.
 - **No mocking** — dry-run mode is the primary strategy for testing command orchestration without side effects.
 - **Real recipes** — CLI dry-run tests use recipes from the `recipes/` directory to catch config drift.
 - **Temp recipes** — unit tests and multi-instance edge cases create throwaway recipes via `tmp_path`.

@@ -94,7 +94,15 @@ Groups benchmark tasks into execution groups for VM allocation.
 
 ### `commands/` — CLI Layer (thin handlers only)
 
-Each command module contains only argparse registration and `handle_*` functions that delegate to library packages.
+Each command module contains only argparse registration and `handle_*` functions that delegate to library packages. CLI handlers use `asyncio.run()` to bridge sync argparse entry points into async internals:
+
+```python
+def handle_foo(args):
+    asyncio.run(_handle_foo(args))
+
+async def _handle_foo(args):
+    await ...
+```
 
 **Command modules:**
 - `commands/bench/` — `handle_bench()`, `register_bench_command()`
@@ -122,7 +130,7 @@ Create per-recipe run directories:
 GroupByModelAndGpuPlanner.plan() -> list[ExecutionGroup]
     |
     v
-asyncio.gather(*groups)  -- each group runs in a thread:
+asyncio.gather(*groups)  -- each group runs as async task:
     |
     v
 provision_cloud_vm() -> VMConnectionInfo

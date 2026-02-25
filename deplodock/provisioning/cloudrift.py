@@ -1,11 +1,11 @@
 """CloudRift provider: create/delete GPU VMs via the CloudRift REST API."""
 
+import asyncio
 import json
 import logging
 import os
-import time
 
-import requests
+import httpx
 
 from deplodock.provisioning.ssh import wait_for_ssh
 from deplodock.provisioning.types import VMConnectionInfo
@@ -21,7 +21,7 @@ API_VERSION = "~upcoming"
 # ── API helpers ───────────────────────────────────────────────────
 
 
-def _api_request(method, path, data, api_key, api_url=DEFAULT_API_URL, dry_run=False):
+async def _api_request(method, path, data, api_key, api_url=DEFAULT_API_URL, dry_run=False):
     """Make an authenticated CloudRift API request.
 
     Wraps *data* in the versioned envelope ``{"version": ..., "data": ...}``.
@@ -38,12 +38,13 @@ def _api_request(method, path, data, api_key, api_url=DEFAULT_API_URL, dry_run=F
         return None
 
     headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
-    resp = requests.request(method, url, json=payload, headers=headers)
+    async with httpx.AsyncClient() as client:
+        resp = await client.request(method, url, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
     return resp.json().get("data", resp.json())
 
 
-def _rent_instance(
+async def _rent_instance(
     api_key,
     instance_type,
     ssh_public_keys,
@@ -77,53 +78,53 @@ def _rent_instance(
     }
     if ports:
         data["ports"] = [str(p) for p in ports]
-    return _api_request("POST", "/api/v1/instances/rent", data, api_key, api_url, dry_run)
+    return await _api_request("POST", "/api/v1/instances/rent", data, api_key, api_url, dry_run)
 
 
-def _terminate_instance(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
+async def _terminate_instance(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
     """Terminate a CloudRift instance.
 
     POST /api/v1/instances/terminate with ById selector.
     """
     data = {"selector": {"ById": [instance_id]}}
-    return _api_request("POST", "/api/v1/instances/terminate", data, api_key, api_url, dry_run)
+    return await _api_request("POST", "/api/v1/instances/terminate", data, api_key, api_url, dry_run)
 
 
-def _get_instance_info(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
+async def _get_instance_info(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
     """Get info for a single instance by ID.
 
     POST /api/v1/instances/list with ById selector.
     Returns the instance dict or None.
     """
     data = {"selector": {"ById": [instance_id]}}
-    result = _api_request("POST", "/api/v1/instances/list", data, api_key, api_url, dry_run)
+    result = await _api_request("POST", "/api/v1/instances/list", data, api_key, api_url, dry_run)
     if result is None:  # dry-run
         return None
     instances = result.get("instances", [])
     return instances[0] if instances else None
 
 
-def _list_ssh_keys(api_key, api_url=DEFAULT_API_URL, dry_run=False):
+async def _list_ssh_keys(api_key, api_url=DEFAULT_API_URL, dry_run=False):
     """List registered SSH keys.
 
     POST /api/v1/ssh-keys/list
     """
-    return _api_request("POST", "/api/v1/ssh-keys/list", {}, api_key, api_url, dry_run)
+    return await _api_request("POST", "/api/v1/ssh-keys/list", {}, api_key, api_url, dry_run)
 
 
-def _add_ssh_key(api_key, name, public_key, api_url=DEFAULT_API_URL, dry_run=False):
+async def _add_ssh_key(api_key, name, public_key, api_url=DEFAULT_API_URL, dry_run=False):
     """Register a new SSH key.
 
     POST /api/v1/ssh-keys/add
     """
     data = {"name": name, "public_key": public_key}
-    return _api_request("POST", "/api/v1/ssh-keys/add", data, api_key, api_url, dry_run)
+    return await _api_request("POST", "/api/v1/ssh-keys/add", data, api_key, api_url, dry_run)
 
 
 # ── Core logic ─────────────────────────────────────────────────────
 
 
-def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=False):
+async def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=False):
     """Ensure the SSH public key is registered on CloudRift.
 
     Reads the public key file, checks existing keys by content match,
@@ -138,7 +139,7 @@ def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=Fals
     with open(ssh_key_path) as f:
         public_key = f.read().strip()
 
-    result = _list_ssh_keys(api_key, api_url, dry_run)
+    result = await _list_ssh_keys(api_key, api_url, dry_run)
     if result is not None:
         for key in result.get("keys", []):
             if key.get("public_key", "").strip() == public_key:
@@ -148,7 +149,7 @@ def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=Fals
     # Register new key
     key_name = os.path.basename(ssh_key_path)
     logger.info(f"Registering SSH key '{key_name}' on CloudRift...")
-    add_result = _add_ssh_key(api_key, key_name, public_key, api_url, dry_run)
+    add_result = await _add_ssh_key(api_key, key_name, public_key, api_url, dry_run)
     if dry_run:
         return "dry-run-key-id"
     key_id = add_result["ssh_key"]["id"]
@@ -156,7 +157,9 @@ def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=Fals
     return key_id
 
 
-def wait_for_status(api_key, instance_id, target_status, timeout, api_url=DEFAULT_API_URL, interval=10, dry_run=False, fail_statuses=None):
+async def wait_for_status(
+    api_key, instance_id, target_status, timeout, api_url=DEFAULT_API_URL, interval=10, dry_run=False, fail_statuses=None
+):
     """Poll instance status until it matches *target_status* or timeout.
 
     Args:
@@ -173,10 +176,10 @@ def wait_for_status(api_key, instance_id, target_status, timeout, api_url=DEFAUL
     elapsed = 0
     status = None
     while elapsed < timeout:
-        info = _get_instance_info(api_key, instance_id, api_url)
+        info = await _get_instance_info(api_key, instance_id, api_url)
         if info is None:
             logger.warning(f"Warning: instance {instance_id} not found.")
-            time.sleep(interval)
+            await asyncio.sleep(interval)
             elapsed += interval
             continue
         status = info.get("status")
@@ -185,7 +188,7 @@ def wait_for_status(api_key, instance_id, target_status, timeout, api_url=DEFAUL
         if status in fail_statuses:
             logger.error(f"Instance {instance_id} reached fail status '{status}'")
             return None
-        time.sleep(interval)
+        await asyncio.sleep(interval)
         elapsed += interval
 
     logger.error(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')")
@@ -269,7 +272,7 @@ def _log_connection_info(instance):
         logger.warning("Warning: no host address found in instance info.")
 
 
-def create_instance(
+async def create_instance(
     api_key,
     instance_type,
     ssh_key_path,
@@ -304,7 +307,7 @@ def create_instance(
         with open(ssh_key_path) as f:
             public_key = f.read().strip()
 
-    result = _rent_instance(api_key, instance_type, [public_key], image_url=image_url, ports=ports, api_url=api_url, dry_run=dry_run)
+    result = await _rent_instance(api_key, instance_type, [public_key], image_url=image_url, ports=ports, api_url=api_url, dry_run=dry_run)
     if dry_run:
         logger.info("[dry-run] Would wait for Active status, then print connection info.")
         return VMConnectionInfo(
@@ -321,7 +324,7 @@ def create_instance(
     instance_id = instance_ids[0]
     logger.info(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
 
-    info = wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
+    info = await wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
     if info is None:
         return None
 
@@ -331,16 +334,16 @@ def create_instance(
 
     if wait_ssh and ssh_private_key_path:
         logger.info("Waiting for SSH connectivity...")
-        wait_for_ssh(conn.host, conn.username, conn.ssh_port, ssh_private_key_path)
+        await wait_for_ssh(conn.host, conn.username, conn.ssh_port, ssh_private_key_path)
 
     return conn
 
 
-def delete_instance(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
+async def delete_instance(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
     """Terminate a CloudRift instance."""
     logger.info(f"Terminating CloudRift instance '{instance_id}'...")
 
-    _terminate_instance(api_key, instance_id, api_url, dry_run)
+    await _terminate_instance(api_key, instance_id, api_url, dry_run)
 
     if not dry_run:
         logger.info("Instance terminated.")

@@ -1,5 +1,6 @@
 """Teardown command: clean up VMs left running by --no-teardown."""
 
+import asyncio
 import json
 import logging
 import sys
@@ -14,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 def handle_teardown(args):
     """Handle the teardown command."""
+    asyncio.run(_handle_teardown(args))
+
+
+async def _handle_teardown(args):
     run_dir = Path(args.run_dir)
     instances_path = run_dir / "instances.json"
     ssh_key = args.ssh_key
@@ -44,7 +49,7 @@ def handle_teardown(args):
         if address:
             logger.info(f"  Stopping containers on {address}...")
             run_cmd = make_run_cmd(address, ssh_key, ssh_port)
-            run_teardown(run_cmd)
+            await run_teardown(run_cmd)
 
         # Delete VM
         if provider and instance_id:
@@ -59,7 +64,7 @@ def handle_teardown(args):
                     delete_info = (provider, instance_id, zone)
                 else:
                     delete_info = (provider, instance_id)
-                delete_cloud_vm(delete_info)
+                await delete_cloud_vm(delete_info)
                 logger.info("  VM deleted.")
             except Exception as e:
                 logger.error(f"  ERROR deleting VM: {e}")

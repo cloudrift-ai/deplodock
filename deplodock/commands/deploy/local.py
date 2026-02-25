@@ -1,5 +1,6 @@
 """Local deploy target CLI handler."""
 
+import asyncio
 import os
 import sys
 
@@ -10,6 +11,10 @@ from deplodock.recipe import load_recipe
 
 def handle_local(args):
     """Handle the local deploy target."""
+    asyncio.run(_handle_local(args))
+
+
+async def _handle_local(args):
     recipe_dir = args.recipe
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
     model_dir = args.model_dir
@@ -23,11 +28,11 @@ def handle_local(args):
     write_file = make_write_file(deploy_dir, dry_run=dry_run)
 
     if teardown:
-        return run_teardown(run_cmd)
+        return await run_teardown(run_cmd)
 
     recipe = load_recipe(recipe_dir)
 
-    success = run_deploy(
+    success = await run_deploy(
         run_cmd=run_cmd,
         write_file=write_file,
         recipe=recipe,

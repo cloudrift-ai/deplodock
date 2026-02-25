@@ -1,5 +1,6 @@
 """SSH deploy target CLI handler."""
 
+import asyncio
 import os
 import sys
 
@@ -16,6 +17,10 @@ from deplodock.recipe import load_recipe
 
 def handle_ssh(args):
     """Handle the SSH deploy target."""
+    asyncio.run(_handle_ssh(args))
+
+
+async def _handle_ssh(args):
     recipe = load_recipe(args.recipe)
     params = DeployParams(
         server=args.server,
@@ -26,12 +31,12 @@ def handle_ssh(args):
         hf_token=args.hf_token or os.environ.get("HF_TOKEN", ""),
         dry_run=args.dry_run,
     )
-    provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    await provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
 
     if args.teardown:
-        return teardown_entry(params)
+        return await teardown_entry(params)
 
-    if not deploy_entry(params):
+    if not await deploy_entry(params):
         sys.exit(1)
 
 
