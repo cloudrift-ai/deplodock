@@ -72,10 +72,13 @@ def handle_bench(args):
     root_logger.info("")
 
     # Plan execution groups
-    planner = GroupByModelAndGpuPlanner()
+    gpu_concurrency = args.gpu_concurrency
+    planner = GroupByModelAndGpuPlanner(gpu_concurrency=gpu_concurrency)
     groups = planner.plan(tasks)
 
     root_logger.info(f"Running {len(tasks)} benchmark task(s) in {len(groups)} execution group(s)")
+    if gpu_concurrency > 1:
+        root_logger.info(f"GPU concurrency: {gpu_concurrency} (groups split across multiple VMs)")
     root_logger.info(f"Parallel mode (max workers: {args.max_workers or len(groups)})")
     root_logger.info("")
 
@@ -162,6 +165,12 @@ def register_bench_command(subparsers):
         type=int,
         default=None,
         help="Maximum number of parallel execution groups (default: number of groups)",
+    )
+    parser.add_argument(
+        "--gpu-concurrency",
+        type=int,
+        default=1,
+        help="Split each (model, GPU) group across up to N VMs (default: 1)",
     )
     parser.add_argument(
         "--dry-run",

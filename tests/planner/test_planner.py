@@ -131,3 +131,75 @@ def test_cross_recipe_grouping():
     groups = planner.plan(tasks)
     assert len(groups) == 1
     assert len(groups[0].tasks) == 2
+
+
+# ── GPU concurrency splitting ────────────────────────────────────
+
+
+def test_gpu_concurrency_default_no_splitting():
+    """gpu_concurrency=1 (default) produces the same result as before."""
+    planner = GroupByModelAndGpuPlanner(gpu_concurrency=1)
+    tasks = [
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=1),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=2),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=4),
+    ]
+    groups = planner.plan(tasks)
+    assert len(groups) == 1
+    assert len(groups[0].tasks) == 3
+
+
+def test_gpu_concurrency_splits_into_subgroups():
+    """gpu_concurrency=2 with 4 tasks produces 2 groups of 2."""
+    planner = GroupByModelAndGpuPlanner(gpu_concurrency=2)
+    tasks = [
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=1),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=2),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=4),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=8),
+    ]
+    groups = planner.plan(tasks)
+    assert len(groups) == 2
+    assert len(groups[0].tasks) == 2
+    assert len(groups[1].tasks) == 2
+
+
+def test_gpu_concurrency_capped_at_task_count():
+    """gpu_concurrency > len(tasks) is capped at len(tasks) groups."""
+    planner = GroupByModelAndGpuPlanner(gpu_concurrency=10)
+    tasks = [
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=1),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=2),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=4),
+    ]
+    groups = planner.plan(tasks)
+    assert len(groups) == 3
+    for g in groups:
+        assert len(g.tasks) == 1
+
+
+def test_gpu_concurrency_single_task():
+    """Single task always produces 1 group regardless of concurrency."""
+    planner = GroupByModelAndGpuPlanner(gpu_concurrency=4)
+    tasks = [_make_task(model="org/m", gpu="GPU_A", gpu_count=2)]
+    groups = planner.plan(tasks)
+    assert len(groups) == 1
+    assert len(groups[0].tasks) == 1
+    assert groups[0].gpu_count == 2
+
+
+def test_gpu_concurrency_subgroup_gpu_count():
+    """Each sub-group has gpu_count = max of its respective tasks."""
+    planner = GroupByModelAndGpuPlanner(gpu_concurrency=2)
+    # After sorting desc: [8, 4, 2, 1]
+    # Round-robin: group0=[8, 2], group1=[4, 1]
+    tasks = [
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=1),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=2),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=4),
+        _make_task(model="org/m", gpu="GPU_A", gpu_count=8),
+    ]
+    groups = planner.plan(tasks)
+    assert len(groups) == 2
+    assert groups[0].gpu_count == 8
+    assert groups[1].gpu_count == 4

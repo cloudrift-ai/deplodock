@@ -17,8 +17,20 @@ from pathlib import Path
 def parse_explicit_paths(comment: str) -> list[str]:
     """Extract experiment paths from the comment text after /run-experiment."""
     parts = comment.strip().split()
-    # First token is /run-experiment, rest are paths
+    # First token is /run-experiment, rest are paths (skip flags and their values)
     return [p for p in parts[1:] if p.startswith("experiments/")]
+
+
+def parse_gpu_concurrency(comment: str) -> int:
+    """Extract --gpu-concurrency N from the comment, defaulting to 1."""
+    parts = comment.strip().split()
+    for i, token in enumerate(parts):
+        if token == "--gpu-concurrency" and i + 1 < len(parts):
+            try:
+                return max(1, int(parts[i + 1]))
+            except ValueError:
+                pass
+    return 1
 
 
 def detect_from_diff(base: str, head: str) -> list[str]:
@@ -79,18 +91,24 @@ def main():
         print(f"Error: No experiments found ({mode} mode)", file=sys.stderr)
         sys.exit(1)
 
+    gpu_concurrency = parse_gpu_concurrency(args.comment)
+
     print(f"Detected experiments ({mode}):")
     for exp in experiments:
         print(f"  - {exp}")
+    if gpu_concurrency > 1:
+        print(f"GPU concurrency: {gpu_concurrency}")
 
     # Write to GITHUB_OUTPUT
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a") as f:
             f.write(f"experiments={json.dumps(experiments)}\n")
+            f.write(f"gpu_concurrency={gpu_concurrency}\n")
     else:
         # Running locally — just print the JSON
         print(json.dumps(experiments))
+        print(f"gpu_concurrency={gpu_concurrency}")
 
 
 if __name__ == "__main__":

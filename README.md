@@ -202,8 +202,9 @@ External developers can submit experiments via pull requests. A maintainer trigg
 ### Trigger Modes
 
 ```
-/run-experiment                                          # Auto-detect: benchmarks all experiments changed in the PR
-/run-experiment experiments/MyModel/my_experiment         # Explicit: benchmark specific experiment(s)
+/run-experiment                                                        # Auto-detect: benchmarks all experiments changed in the PR
+/run-experiment experiments/MyModel/my_experiment                       # Explicit: benchmark specific experiment(s)
+/run-experiment experiments/MyModel/my_experiment --gpu-concurrency 2   # Split groups across 2 VMs each
 ```
 
 Only users with **write** or **admin** access to the repository can trigger benchmarks.
@@ -382,14 +383,15 @@ deplodock bench recipes/* --max-workers 2                    # Limit parallel ex
 deplodock bench recipes/* --dry-run                          # Preview commands
 ```
 
-| Flag            | Default             | Description                            |
-|-----------------|---------------------|----------------------------------------|
-| `recipes`       | (required)          | Recipe directories (positional args)   |
-| `--ssh-key`     | `~/.ssh/id_ed25519` | SSH private key path                   |
-| `--config`      | `config.yaml`       | Path to configuration file             |
-| `--max-workers` | num groups          | Max parallel execution groups          |
-| `--dry-run`     | false               | Print commands without executing       |
-| `--no-teardown` | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
+| Flag                 | Default             | Description                            |
+|----------------------|---------------------|----------------------------------------|
+| `recipes`            | (required)          | Recipe directories (positional args)   |
+| `--ssh-key`          | `~/.ssh/id_ed25519` | SSH private key path                   |
+| `--config`           | `config.yaml`       | Path to configuration file             |
+| `--max-workers`      | num groups          | Max parallel execution groups          |
+| `--gpu-concurrency`  | 1                   | Split each (model, GPU) group across up to N VMs |
+| `--dry-run`          | false               | Print commands without executing       |
+| `--no-teardown`      | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
 
 Results are always stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
 
