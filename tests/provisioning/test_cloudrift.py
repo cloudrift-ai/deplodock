@@ -275,7 +275,7 @@ def test_log_connection_info_with_port_mappings(caplog):
         _log_connection_info(instance)
     assert "211.21.50.85" in caplog.text
     assert "riftuser" in caplog.text
-    assert "9W93nSnhWvPqUPwx" in caplog.text
+    assert "9W93nSnhWvPqUPwx" not in caplog.text  # password must not be logged
     assert "ssh -p 57011 riftuser@211.21.50.85" in caplog.text
     assert "Port 22 -> 211.21.50.85:57011" in caplog.text
     assert "Port 8080 -> 211.21.50.85:57001" in caplog.text
@@ -300,4 +300,4 @@ def test_log_connection_info_no_port_mappings(caplog):
     with caplog.at_level("INFO", logger="deplodock.provisioning.cloudrift"):
         _log_connection_info(instance)
     assert "ssh riftuser@1.2.3.4" in caplog.text
-    assert "abc123" in caplog.text
+    assert "abc123" not in caplog.text  # password must not be logged
