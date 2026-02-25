@@ -4,8 +4,9 @@ import asyncio
 import os
 
 from deplodock.benchmark.bench_logging import _get_group_logger, active_run_dir
+from deplodock.benchmark.system_info import collect_system_info
 from deplodock.benchmark.tasks import _task_meta
-from deplodock.benchmark.workload import extract_benchmark_results, run_benchmark_workload
+from deplodock.benchmark.workload import compose_result, extract_benchmark_results, run_benchmark_workload
 from deplodock.deploy import (
     DeployParams,
 )
@@ -15,6 +16,7 @@ from deplodock.deploy import (
 from deplodock.deploy import (
     teardown as teardown_entry,
 )
+from deplodock.deploy.compose import generate_compose
 from deplodock.hardware import gpu_short_name
 from deplodock.planner import ExecutionGroup
 from deplodock.provisioning.cloud import (
@@ -93,6 +95,10 @@ def run_execution_group(
         logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
         provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
 
+        # Collect system info once per execution group
+        sysinfo_run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+        system_info = collect_system_info(sysinfo_run_cmd)
+
         for task in group.tasks:
             active_run_dir.set(task.run_dir)
             recipe = task.recipe
@@ -128,7 +134,7 @@ def run_execution_group(
 
             task_logger.info("Running benchmark...")
             run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
-            bench_success, output = run_benchmark_workload(
+            bench_success, output, bench_command = run_benchmark_workload(
                 run_cmd,
                 recipe,
                 dry_run=dry_run,
@@ -136,8 +142,10 @@ def run_execution_group(
 
             if bench_success or dry_run:
                 if not dry_run:
-                    benchmark_results = extract_benchmark_results(output)
-                    result_path.write_text(benchmark_results)
+                    benchmark_output = extract_benchmark_results(output)
+                    compose_content = generate_compose(recipe, model_dir, hf_token, gpu_device_ids=gpu_device_ids)
+                    full_result = compose_result(task, benchmark_output, compose_content, bench_command, system_info)
+                    result_path.write_text(full_result)
                     task_logger.info(f"Results saved to: {result_path}")
                 else:
                     task_logger.info(f"[dry-run] Would save results to: {result_path}")
