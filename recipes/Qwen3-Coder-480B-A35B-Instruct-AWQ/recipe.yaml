@@ -18,27 +18,18 @@ benchmark:
   random_input_len: 8000
   random_output_len: 8000
 
-variants:
-  4xH200:
-    gpu: "NVIDIA H200 141GB"
-    gpu_count: 4
-    benchmark:
-      max_concurrency: 256
-      num_prompts: 512
-  4xB200:
-    gpu: "NVIDIA B200"
-    gpu_count: 4
-  4xH100:
-    gpu: "NVIDIA H100 80GB"
-    gpu_count: 4
-  4xPro6000:
-    gpu: "NVIDIA RTX PRO 6000 Server Edition"
-    gpu_count: 4
-    engine:
-      llm:
-        max_concurrent_requests: 256
-        vllm:
-          extra_args: "--enable-expert-parallel"
-    benchmark:
-      max_concurrency: 64
-      num_prompts: 128
+matrices:
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 4
+    benchmark.max_concurrency: 256
+    benchmark.num_prompts: 512
+  - deploy.gpu: "NVIDIA B200"
+    deploy.gpu_count: 4
+  - deploy.gpu: "NVIDIA H100 80GB"
+    deploy.gpu_count: 4
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Server Edition"
+    deploy.gpu_count: 4
+    engine.llm.max_concurrent_requests: 256
+    engine.llm.vllm.extra_args: "--enable-expert-parallel"
+    benchmark.max_concurrency: 64
+    benchmark.num_prompts: 128

@@ -11,7 +11,6 @@ from deplodock.recipe import load_recipe
 def handle_local(args):
     """Handle the local deploy target."""
     recipe_dir = args.recipe
-    variant = args.variant
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
     model_dir = args.model_dir
     dry_run = args.dry_run
@@ -26,7 +25,7 @@ def handle_local(args):
     if teardown:
         return run_teardown(run_cmd)
 
-    recipe = load_recipe(recipe_dir, variant=variant)
+    recipe = load_recipe(recipe_dir)
 
     success = run_deploy(
         run_cmd=run_cmd,
@@ -46,7 +45,6 @@ def register_local_target(subparsers):
     """Register the local deploy target."""
     parser = subparsers.add_parser("local", help="Deploy locally via docker compose")
     parser.add_argument("--recipe", required=True, help="Path to recipe directory")
-    parser.add_argument("--variant", default=None, help="Hardware variant (e.g. 8xH200)")
     parser.add_argument("--hf-token", default=None, help="HuggingFace token (default: $HF_TOKEN)")
     parser.add_argument("--model-dir", default="/mnt/models", help="Model cache directory")
     parser.add_argument("--teardown", action="store_true", help="Stop containers instead of deploying")

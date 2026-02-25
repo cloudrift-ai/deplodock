@@ -98,14 +98,21 @@ class BenchmarkConfig:
 
 
 @dataclass
+class DeployConfig:
+    """Optional deploy section — GPU info for cloud provisioning."""
+
+    gpu: str | None = None
+    gpu_count: int = 1
+
+
+@dataclass
 class Recipe:
     """Complete recipe configuration."""
 
     model: ModelConfig = field(default_factory=ModelConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
-    gpu: str | None = None
-    gpu_count: int = 1
+    deploy: DeployConfig = field(default_factory=DeployConfig)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Recipe":
@@ -140,12 +147,17 @@ class Recipe:
             random_output_len=bench_dict.get("random_output_len", 8000),
         )
 
+        deploy_dict = d.get("deploy", {})
+        deploy = DeployConfig(
+            gpu=deploy_dict.get("gpu"),
+            gpu_count=deploy_dict.get("gpu_count", 1),
+        )
+
         return cls(
             model=model,
             engine=EngineConfig(llm=llm),
             benchmark=benchmark,
-            gpu=d.get("gpu"),
-            gpu_count=d.get("gpu_count", 1),
+            deploy=deploy,
         )
 
     @property

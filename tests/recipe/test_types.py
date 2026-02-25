@@ -1,6 +1,7 @@
 """Unit tests for recipe dataclass types."""
 
 from deplodock.recipe import (
+    DeployConfig,
     LLMConfig,
     Recipe,
     SglangConfig,
@@ -81,6 +82,21 @@ def test_llm_optional_fields_default_none():
     assert llm.max_concurrent_requests is None
 
 
+# ── DeployConfig ──────────────────────────────────────────────────
+
+
+def test_deploy_config_defaults():
+    cfg = DeployConfig()
+    assert cfg.gpu is None
+    assert cfg.gpu_count == 1
+
+
+def test_deploy_config_custom():
+    cfg = DeployConfig(gpu="NVIDIA H200", gpu_count=8)
+    assert cfg.gpu == "NVIDIA H200"
+    assert cfg.gpu_count == 8
+
+
 # ── Recipe.from_dict ──────────────────────────────────────────────
 
 
@@ -90,8 +106,8 @@ def test_from_dict_minimal():
     assert recipe.model.huggingface == "org/model"
     assert recipe.model_name == "org/model"
     assert recipe.engine.llm.tensor_parallel_size == 1
-    assert recipe.gpu is None
-    assert recipe.gpu_count == 1
+    assert recipe.deploy.gpu is None
+    assert recipe.deploy.gpu_count == 1
 
 
 def test_from_dict_full():
@@ -116,8 +132,10 @@ def test_from_dict_full():
             "random_input_len": 2000,
             "random_output_len": 3000,
         },
-        "gpu": "NVIDIA H200",
-        "gpu_count": 8,
+        "deploy": {
+            "gpu": "NVIDIA H200",
+            "gpu_count": 8,
+        },
     }
     recipe = Recipe.from_dict(d)
     assert recipe.engine.llm.tensor_parallel_size == 8
@@ -128,8 +146,8 @@ def test_from_dict_full():
     assert recipe.engine.llm.vllm.extra_args == "--kv-cache-dtype fp8"
     assert recipe.benchmark.max_concurrency == 64
     assert recipe.benchmark.num_prompts == 128
-    assert recipe.gpu == "NVIDIA H200"
-    assert recipe.gpu_count == 8
+    assert recipe.deploy.gpu == "NVIDIA H200"
+    assert recipe.deploy.gpu_count == 8
 
 
 def test_from_dict_sglang():

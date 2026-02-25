@@ -1,6 +1,7 @@
 """Unit tests for recipe loading and deep merge."""
 
 import pytest
+import yaml
 
 from deplodock.recipe import Recipe, deep_merge, load_recipe, validate_extra_args
 
@@ -51,25 +52,11 @@ def test_load_recipe_defaults(tmp_recipe_dir):
     assert recipe.engine.llm.extra_args == ""
 
 
-def test_load_recipe_empty_variant(tmp_recipe_dir):
-    recipe = load_recipe(tmp_recipe_dir, variant="RTX5090")
+def test_load_recipe_strips_matrices(tmp_recipe_dir):
+    """load_recipe returns base config without matrix overrides."""
+    recipe = load_recipe(tmp_recipe_dir)
     assert recipe.engine.llm.tensor_parallel_size == 1
     assert recipe.engine.llm.context_length == 8192
-
-
-def test_load_recipe_variant_deep_merge(tmp_recipe_dir):
-    recipe = load_recipe(tmp_recipe_dir, variant="8xH200")
-    assert recipe.engine.llm.tensor_parallel_size == 8
-    assert recipe.engine.llm.context_length == 16384
-    assert recipe.engine.llm.vllm.extra_args == "--kv-cache-dtype fp8"
-    # Preserved from base
-    assert recipe.engine.llm.vllm.image == "vllm/vllm-openai:latest"
-    assert recipe.engine.llm.gpu_memory_utilization == 0.9
-
-
-def test_load_recipe_unknown_variant_raises(tmp_recipe_dir):
-    with pytest.raises(ValueError, match="Unknown variant 'nonexistent'"):
-        load_recipe(tmp_recipe_dir, variant="nonexistent")
 
 
 def test_load_recipe_missing_file_raises(tmp_path):
@@ -77,15 +64,10 @@ def test_load_recipe_missing_file_raises(tmp_path):
         load_recipe(str(tmp_path / "does_not_exist"))
 
 
-def test_load_recipe_variant_gpu_info(tmp_recipe_dir):
-    recipe = load_recipe(tmp_recipe_dir, variant="RTX5090")
-    assert recipe.gpu == "NVIDIA GeForce RTX 5090"
-    assert recipe.gpu_count == 1
-
-
-def test_load_recipe_no_variant_no_gpu(tmp_recipe_dir):
+def test_load_recipe_no_deploy_gpu(tmp_recipe_dir):
+    """Base recipe has no deploy.gpu (it comes from matrices)."""
     recipe = load_recipe(tmp_recipe_dir)
-    assert recipe.gpu is None
+    assert recipe.deploy.gpu is None
 
 
 # ── benchmark section ──────────────────────────────────────────────
@@ -97,26 +79,6 @@ def test_load_recipe_benchmark_defaults(tmp_recipe_dir):
     assert recipe.benchmark.num_prompts == 256
     assert recipe.benchmark.random_input_len == 4000
     assert recipe.benchmark.random_output_len == 4000
-
-
-def test_load_recipe_benchmark_preserved_with_variant(tmp_recipe_dir):
-    recipe = load_recipe(tmp_recipe_dir, variant="RTX5090")
-    assert recipe.benchmark.max_concurrency == 128
-    assert recipe.benchmark.random_input_len == 4000
-
-
-def test_load_recipe_benchmark_variant_override(tmp_recipe_dir):
-    recipe = load_recipe(tmp_recipe_dir, variant="8xH200")
-    assert recipe.benchmark.max_concurrency == 128  # from base
-    assert recipe.benchmark.random_input_len == 8000  # overridden
-    assert recipe.benchmark.random_output_len == 8000  # overridden
-    assert recipe.benchmark.num_prompts == 256  # from base
-
-
-def test_load_recipe_benchmark_no_override_variant(tmp_recipe_dir):
-    recipe = load_recipe(tmp_recipe_dir, variant="4xH100")
-    assert recipe.benchmark.random_input_len == 4000  # base preserved
-    assert recipe.benchmark.random_output_len == 4000  # base preserved
 
 
 # ── validate_extra_args ────────────────────────────────────────────
@@ -147,8 +109,6 @@ def test_validate_extra_args_multiple_banned():
 
 def test_load_recipe_rejects_banned_extra_args(tmp_path):
     """load_recipe() raises when extra_args contains banned flags."""
-    import yaml
-
     recipe = {
         "model": {"huggingface": "test-org/test-model"},
         "engine": {

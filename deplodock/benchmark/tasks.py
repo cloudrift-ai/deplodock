@@ -7,16 +7,25 @@ import yaml
 
 from deplodock.hardware import gpu_short_name
 from deplodock.planner import BenchmarkTask
-from deplodock.recipe import load_recipe
+from deplodock.recipe.matrix import build_override, expand_matrix_entry, matrix_label
+from deplodock.recipe.recipe import _validate_and_build, deep_merge
 
 
-def enumerate_tasks(recipe_dirs, variants_filter=None):
-    """Build BenchmarkTask list from recipe dirs and optional variant filter.
+def _build_variant_name(gpu_name, combination, variable_keys):
+    """Build auto-generated run identifier from GPU name and matrix combination."""
+    short = gpu_short_name(gpu_name)
+    label = matrix_label(combination, variable_keys)
+    if label:
+        return f"{short}_{label}"
+    return short
 
-    For each recipe dir, reads the raw variants from recipe.yaml. If
-    variants_filter is given, only matching variants are kept (with a
-    warning for missing ones). Each selected variant is loaded and
-    turned into a BenchmarkTask.
+
+def enumerate_tasks(recipe_dirs):
+    """Build BenchmarkTask list from recipe dirs using matrices.
+
+    For each recipe dir, reads the raw YAML, extracts matrices entries,
+    expands each entry via broadcast + zip, and builds a BenchmarkTask
+    per combination.
     """
     tasks = []
     for recipe_dir in recipe_dirs:
@@ -28,43 +37,41 @@ def enumerate_tasks(recipe_dirs, variants_filter=None):
         with open(recipe_path) as f:
             raw = yaml.safe_load(f)
 
-        available_variants = list((raw.get("variants") or {}).keys())
-        if not available_variants:
-            print(f"Warning: No variants in {recipe_dir}, skipping.", file=sys.stderr)
+        matrices = raw.get("matrices", [])
+        if not matrices:
+            print(f"Warning: No matrices in {recipe_dir}, skipping.", file=sys.stderr)
             continue
 
-        if variants_filter is not None:
-            selected = []
-            for v in variants_filter:
-                if v in available_variants:
-                    selected.append(v)
-                else:
+        base_config = {k: v for k, v in raw.items() if k != "matrices"}
+
+        for entry in matrices:
+            combinations = expand_matrix_entry(entry)
+
+            # Determine which keys were lists (variable keys) for labeling
+            variable_keys = {k for k, v in entry.items() if isinstance(v, list)}
+
+            for combo in combinations:
+                override = build_override(combo)
+                merged = deep_merge(base_config, override)
+                recipe = _validate_and_build(merged)
+
+                if recipe.deploy.gpu is None:
                     print(
-                        f"Warning: variant '{v}' not in {recipe_dir} (available: {', '.join(available_variants)}), skipping.",
+                        f"Warning: matrix entry in {recipe_dir} missing 'deploy.gpu', skipping.",
                         file=sys.stderr,
                     )
-            variants_to_run = selected
-        else:
-            variants_to_run = available_variants
+                    continue
 
-        for variant in variants_to_run:
-            recipe = load_recipe(recipe_dir, variant=variant)
-            if recipe.gpu is None:
-                print(
-                    f"Warning: variant '{variant}' in {recipe_dir} missing 'gpu', skipping.",
-                    file=sys.stderr,
+                variant_name = _build_variant_name(recipe.deploy.gpu, combo, variable_keys)
+                tasks.append(
+                    BenchmarkTask(
+                        recipe_dir=recipe_dir,
+                        variant=variant_name,
+                        recipe=recipe,
+                        gpu_name=recipe.deploy.gpu,
+                        gpu_count=recipe.deploy.gpu_count,
+                    )
                 )
-                continue
-
-            tasks.append(
-                BenchmarkTask(
-                    recipe_dir=recipe_dir,
-                    variant=variant,
-                    recipe=recipe,
-                    gpu_name=recipe.gpu,
-                    gpu_count=recipe.gpu_count,
-                )
-            )
 
     return tasks
 

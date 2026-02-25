@@ -7,11 +7,11 @@ from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 from deplodock.recipe import ModelConfig, Recipe
 
 
-def _make_task(model="org/model-a", gpu="NVIDIA GeForce RTX 5090", gpu_count=1, recipe_dir="/r"):
+def _make_task(model="org/model-a", gpu="NVIDIA GeForce RTX 5090", gpu_count=1, recipe_dir="/r", variant="rtx5090"):
     """Helper to build a BenchmarkTask with minimal config."""
     return BenchmarkTask(
         recipe_dir=recipe_dir,
-        variant="V1",
+        variant=variant,
         recipe=Recipe(model=ModelConfig(huggingface=model)),
         gpu_name=gpu,
         gpu_count=gpu_count,
@@ -40,13 +40,25 @@ def test_task_recipe_name_trailing_slash():
 def test_task_result_path():
     task_obj = BenchmarkTask(
         recipe_dir="/recipes/MyModel",
-        variant="RTX5090",
+        variant="rtx5090",
         recipe=Recipe(model=ModelConfig(huggingface="org/my-model")),
         gpu_name="NVIDIA GeForce RTX 5090",
         gpu_count=1,
     )
     result = task_obj.result_path(Path("/run/123"))
-    assert result == Path("/run/123/MyModel/RTX5090_vllm_benchmark.txt")
+    assert result == Path("/run/123/MyModel/rtx5090_vllm_benchmark.txt")
+
+
+def test_task_result_path_with_matrix_label():
+    task_obj = BenchmarkTask(
+        recipe_dir="/recipes/MyModel",
+        variant="rtx5090_c128",
+        recipe=Recipe(model=ModelConfig(huggingface="org/my-model")),
+        gpu_name="NVIDIA GeForce RTX 5090",
+        gpu_count=1,
+    )
+    result = task_obj.result_path(Path("/run/123"))
+    assert result == Path("/run/123/MyModel/rtx5090_c128_vllm_benchmark.txt")
 
 
 # ── GroupByModelAndGpuPlanner ─────────────────────────────────────

@@ -12,9 +12,7 @@ def test_ssh_deploy(run_cli, recipes_dir):
         "deploy",
         "ssh",
         "--recipe",
-        os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant",
-        "8xH200",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
         "--server",
         "user@1.2.3.4",
         "--dry-run",
@@ -31,9 +29,7 @@ def test_ssh_deploy_command_sequence(run_cli, recipes_dir):
         "deploy",
         "ssh",
         "--recipe",
-        os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant",
-        "8xH200",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
         "--server",
         "user@1.2.3.4",
         "--dry-run",
@@ -42,7 +38,7 @@ def test_ssh_deploy_command_sequence(run_cli, recipes_dir):
     lines = stdout.strip().split("\n")
     dry_run_lines = [line for line in lines if line.startswith("[dry-run]")]
 
-    # Verify correct sequence: mkdir, scp compose, scp nginx, pull, download, down, up, health
+    # Verify correct sequence: mkdir, scp compose, pull, download, down, up
     assert any("mkdir" in line for line in dry_run_lines)
     assert any("docker-compose.yaml" in line for line in dry_run_lines)
     assert any("docker compose pull" in line for line in dry_run_lines)
@@ -56,7 +52,7 @@ def test_ssh_teardown(run_cli, recipes_dir):
         "deploy",
         "ssh",
         "--recipe",
-        os.path.join(recipes_dir, "GLM-4.6-FP8"),
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
         "--server",
         "user@1.2.3.4",
         "--dry-run",
@@ -76,8 +72,6 @@ def test_local_deploy(run_cli, recipes_dir):
         "local",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--variant",
-        "RTX5090",
         "--dry-run",
     )
     assert rc == 0
@@ -99,44 +93,15 @@ def test_local_teardown(run_cli, recipes_dir):
     assert "docker compose down" in stdout
 
 
-# ── Variant resolution ──────────────────────────────────────────────
+# ── Deploy configuration ───────────────────────────────────────────
 
 
-def test_different_variants_produce_different_compose(run_cli, recipes_dir):
-    """Different variants should produce different compose configurations."""
-    rc1, stdout1, _ = run_cli(
-        "deploy",
-        "local",
-        "--recipe",
-        os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant",
-        "8xH200",
-        "--dry-run",
-    )
-    rc2, stdout2, _ = run_cli(
-        "deploy",
-        "local",
-        "--recipe",
-        os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant",
-        "8xH100",
-        "--dry-run",
-    )
-    assert rc1 == 0
-    assert rc2 == 0
-    # Both should succeed but produce different output
-    assert "zai-org/GLM-4.6-FP8" in stdout1
-    assert "zai-org/GLM-4.6-FP8" in stdout2
-
-
-def test_single_gpu_variant(run_cli, recipes_dir):
+def test_single_gpu_recipe(run_cli, recipes_dir):
     rc, stdout, _ = run_cli(
         "deploy",
         "local",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--variant",
-        "RTX5090",
         "--dry-run",
     )
     assert rc == 0
@@ -144,8 +109,8 @@ def test_single_gpu_variant(run_cli, recipes_dir):
     assert "nginx" not in stdout
 
 
-def test_multi_instance_variant(run_cli, tmp_path):
-    """A single-GPU model on a 4-GPU variant produces 4 instances with nginx."""
+def test_multi_instance_deploy(run_cli, tmp_path):
+    """A single-GPU model with deploy.gpu_count=4 produces 4 instances with nginx."""
     recipe = {
         "model": {"huggingface": "test/model"},
         "engine": {
@@ -159,11 +124,9 @@ def test_multi_instance_variant(run_cli, tmp_path):
                 },
             }
         },
-        "variants": {
-            "4xH100": {
-                "gpu": "NVIDIA H100 80GB",
-                "gpu_count": 4,
-            }
+        "deploy": {
+            "gpu": "NVIDIA H100 80GB",
+            "gpu_count": 4,
         },
     }
     with open(tmp_path / "recipe.yaml", "w") as f:
@@ -174,8 +137,6 @@ def test_multi_instance_variant(run_cli, tmp_path):
         "ssh",
         "--recipe",
         str(tmp_path),
-        "--variant",
-        "4xH100",
         "--server",
         "user@host",
         "--dry-run",
@@ -183,19 +144,6 @@ def test_multi_instance_variant(run_cli, tmp_path):
     assert rc == 0
     assert "nginx.conf" in stdout
     assert "Instances: 4" in stdout
-
-
-def test_unknown_variant_fails(run_cli, recipes_dir):
-    rc, _, stderr = run_cli(
-        "deploy",
-        "local",
-        "--recipe",
-        os.path.join(recipes_dir, "GLM-4.6-FP8"),
-        "--variant",
-        "nonexistent",
-        "--dry-run",
-    )
-    assert rc != 0
 
 
 # ── CLI help ────────────────────────────────────────────────────────
@@ -212,7 +160,6 @@ def test_local_help(run_cli):
     rc, stdout, _ = run_cli("deploy", "local", "--help")
     assert rc == 0
     assert "--recipe" in stdout
-    assert "--variant" in stdout
     assert "--dry-run" in stdout
 
 
@@ -228,7 +175,6 @@ def test_bench_help(run_cli):
     rc, stdout, _ = run_cli("bench", "--help")
     assert rc == 0
     assert "--config" in stdout
-    assert "--variants" in stdout
     assert "--ssh-key" in stdout
     assert "--dry-run" in stdout
     assert "--max-workers" in stdout

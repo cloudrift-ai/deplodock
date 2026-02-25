@@ -17,22 +17,14 @@ benchmark:
   random_input_len: 4000
   random_output_len: 4000
 
-variants:
-  2xRTX4090:
-    gpu: "NVIDIA GeForce RTX 4090"
-    gpu_count: 2
-  2xRTX5090:
-    gpu: "NVIDIA GeForce RTX 5090"
-    gpu_count: 2
-  2xL40S:
-    gpu: "NVIDIA L40S"
-    gpu_count: 2
-    engine:
-      llm:
-        pipeline_parallel_size: 1
-  Pro6000:
-    gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
-    gpu_count: 1
-    engine:
-      llm:
-        pipeline_parallel_size: 1
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 4090"
+    deploy.gpu_count: 2
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 2
+  - deploy.gpu: "NVIDIA L40S"
+    deploy.gpu_count: 2
+    engine.llm.pipeline_parallel_size: 1
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
+    deploy.gpu_count: 1
+    engine.llm.pipeline_parallel_size: 1

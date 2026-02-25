@@ -5,13 +5,13 @@ from deplodock.recipe.types import Recipe
 
 
 def calculate_num_instances(recipe: Recipe) -> int:
-    """Calculate number of instances from recipe gpu_count and parallelism."""
+    """Calculate number of instances from recipe deploy.gpu_count and parallelism."""
     gpus_per_instance = recipe.engine.llm.gpus_per_instance
 
-    if recipe.gpu_count is None or recipe.gpu is None:
+    if recipe.deploy.gpu_count is None or recipe.deploy.gpu is None:
         return 1
 
-    return max(1, recipe.gpu_count // gpus_per_instance)
+    return max(1, recipe.deploy.gpu_count // gpus_per_instance)
 
 
 def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_device_ids=None):

@@ -16,7 +16,7 @@ from deplodock.recipe import load_recipe
 
 def handle_ssh(args):
     """Handle the SSH deploy target."""
-    recipe = load_recipe(args.recipe, variant=args.variant)
+    recipe = load_recipe(args.recipe)
     params = DeployParams(
         server=args.server,
         ssh_key=args.ssh_key,
@@ -39,7 +39,6 @@ def register_ssh_target(subparsers):
     """Register the SSH deploy target."""
     parser = subparsers.add_parser("ssh", help="Deploy via SSH to a remote server")
     parser.add_argument("--recipe", required=True, help="Path to recipe directory")
-    parser.add_argument("--variant", default=None, help="Hardware variant (e.g. 8xH200)")
     parser.add_argument("--hf-token", default=None, help="HuggingFace token (default: $HF_TOKEN)")
     parser.add_argument("--model-dir", default="/mnt/models", help="Model cache directory")
     parser.add_argument("--teardown", action="store_true", help="Stop containers instead of deploying")

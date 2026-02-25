@@ -63,7 +63,7 @@ def make_bench_config(recipes_dir):
 
 @pytest.fixture
 def tmp_recipe_dir(tmp_path):
-    """Create a temp directory with a sample recipe.yaml."""
+    """Create a temp directory with a sample recipe.yaml using matrices format."""
     recipe = {
         "model": {"huggingface": "test-org/test-model"},
         "engine": {
@@ -83,41 +83,27 @@ def tmp_recipe_dir(tmp_path):
             "random_input_len": 4000,
             "random_output_len": 4000,
         },
-        "variants": {
-            "RTX5090": {
-                "gpu": "NVIDIA GeForce RTX 5090",
-                "gpu_count": 1,
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA GeForce RTX 5090",
+                "deploy.gpu_count": 1,
             },
-            "8xH200": {
-                "gpu": "NVIDIA H200 141GB",
-                "gpu_count": 8,
-                "engine": {
-                    "llm": {
-                        "tensor_parallel_size": 8,
-                        "context_length": 16384,
-                        "vllm": {
-                            "extra_args": "--kv-cache-dtype fp8",
-                        },
-                    }
-                },
-                "benchmark": {
-                    "random_input_len": 8000,
-                    "random_output_len": 8000,
-                },
+            {
+                "deploy.gpu": "NVIDIA H200 141GB",
+                "deploy.gpu_count": 8,
+                "engine.llm.tensor_parallel_size": 8,
+                "engine.llm.context_length": 16384,
+                "engine.llm.vllm.extra_args": "--kv-cache-dtype fp8",
+                "benchmark.random_input_len": 8000,
+                "benchmark.random_output_len": 8000,
             },
-            "4xH100": {
-                "gpu": "NVIDIA H100 80GB",
-                "gpu_count": 4,
-                "engine": {
-                    "llm": {
-                        "tensor_parallel_size": 4,
-                        "vllm": {
-                            "extra_args": "--kv-cache-dtype fp8",
-                        },
-                    }
-                },
+            {
+                "deploy.gpu": "NVIDIA H100 80GB",
+                "deploy.gpu_count": 4,
+                "engine.llm.tensor_parallel_size": 4,
+                "engine.llm.vllm.extra_args": "--kv-cache-dtype fp8",
             },
-        },
+        ],
     }
 
     recipe_path = tmp_path / "recipe.yaml"
