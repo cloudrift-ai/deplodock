@@ -1,0 +1,92 @@
+[2026-02-25 13:49:50] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9
+[2026-02-25 13:49:50] [root] 
+[2026-02-25 13:49:50] [root] Running 2 benchmark task(s) in 1 execution group(s)
+[2026-02-25 13:49:50] [root] Parallel mode (max workers: 1)
+[2026-02-25 13:49:50] [root] 
+[2026-02-25 13:49:50] [rtx5090_x_1] Starting group: NVIDIA GeForce RTX 5090 x1 (2 tasks)
+[2026-02-25 13:49:50] [rtx5090_x_1] GPU: NVIDIA GeForce RTX 5090 x1 -> cloudrift rtx59-7-50-400-ec.1
+[2026-02-25 13:49:50] [cloudrift] Creating CloudRift instance (type=rtx59-7-50-400-ec.1)...
+[2026-02-25 13:50:00] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/rent "HTTP/1.1 200 OK"
+[2026-02-25 13:50:00] [cloudrift] Instance rented (id=c96ae84a-127a-11f1-bf6a-972f1d64f0e7). Waiting for Active status (timeout: 600s)...
+[2026-02-25 13:50:00] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/list "HTTP/1.1 200 OK"
+[2026-02-25 13:50:11] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/list "HTTP/1.1 200 OK"
+[2026-02-25 13:50:11] [cloudrift] Instance is Active.
+[2026-02-25 13:50:11] [cloudrift] Host:     217.138.104.160
+[2026-02-25 13:50:11] [cloudrift] User:     riftuser
+[2026-02-25 13:50:11] [cloudrift] Password: hWDh7YxxdvdNP4ck
+[2026-02-25 13:50:11] [cloudrift] Connect:  ssh riftuser@217.138.104.160
+[2026-02-25 13:50:11] [cloudrift] Waiting for SSH connectivity...
+[2026-02-25 13:50:32] [rtx5090_x_1] VM provisioned: riftuser@217.138.104.160:22
+[2026-02-25 13:50:49] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Recipe: experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090 (variant: rtx5090)
+[2026-02-25 13:50:49] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploying model...
+[2026-02-25 13:50:54] [orchestrate] Pulling images...
+[2026-02-25 13:53:48] [orchestrate] Downloading model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ...
+[2026-02-25 13:55:20] [orchestrate] Cleaning up old containers...
+[2026-02-25 13:55:23] [orchestrate] Starting services...
+[2026-02-25 14:00:50] [orchestrate] Waiting for health check...
+[2026-02-25 14:00:53] [orchestrate] 
+Endpoint: http://217.138.104.160:8000/v1
+[2026-02-25 14:00:53] [orchestrate] Model: QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+[2026-02-25 14:00:53] [orchestrate] Instances: 1
+[2026-02-25 14:00:53] [orchestrate] Status: deployed
+[2026-02-25 14:00:53] [orchestrate] 
+Running smoke test...
+[2026-02-25 14:01:55] [orchestrate] Smoke test passed.
+[2026-02-25 14:01:55] [orchestrate] 
+Example curl:
+[2026-02-25 14:01:55] [orchestrate]   curl http://217.138.104.160:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-25 14:01:55] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
+[2026-02-25 14:04:01] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/rtx5090_vllm_benchmark.txt
+[2026-02-25 14:04:01] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
+[2026-02-25 14:04:01] [orchestrate] Tearing down...
+[2026-02-25 14:04:06] [orchestrate] Teardown complete.
+[2026-02-25 14:04:06] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Recipe: experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090 (variant: rtx5090)
+[2026-02-25 14:04:06] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploying model...
+[2026-02-25 14:04:11] [orchestrate] Pulling images...
+[2026-02-25 14:11:18] [orchestrate] Downloading model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ...
+[2026-02-25 14:11:31] [orchestrate] Cleaning up old containers...
+[2026-02-25 14:11:33] [orchestrate] Starting services...
+[2026-02-25 14:13:18] [orchestrate] Waiting for health check...
+[2026-02-25 14:13:22] [orchestrate] 
+Endpoint: http://217.138.104.160:8000/v1
+[2026-02-25 14:13:22] [orchestrate] Model: QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+[2026-02-25 14:13:22] [orchestrate] Instances: 1
+[2026-02-25 14:13:22] [orchestrate] Status: deployed
+[2026-02-25 14:13:22] [orchestrate] 
+Running smoke test...
+[2026-02-25 14:13:25] [orchestrate] Smoke test passed.
+[2026-02-25 14:13:25] [orchestrate] 
+Example curl:
+[2026-02-25 14:13:25] [orchestrate]   curl http://217.138.104.160:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-25 14:13:25] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
+[2026-02-25 14:19:03] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/rtx5090_sglang_benchmark.txt
+[2026-02-25 14:19:03] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
+[2026-02-25 14:19:03] [orchestrate] Tearing down...
+[2026-02-25 14:19:13] [orchestrate] Teardown complete.
+[2026-02-25 14:19:13] [rtx5090_x_1] Deleting VM...
+[2026-02-25 14:19:13] [cloudrift] Terminating CloudRift instance 'c96ae84a-127a-11f1-bf6a-972f1d64f0e7'...
+[2026-02-25 14:19:14] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-02-25 14:19:14] [cloudrift] Instance terminated.
+[2026-02-25 14:19:14] [rtx5090_x_1] VM deleted.
+[2026-02-25 14:19:14] [rtx5090_x_1] Completed group: rtx5090_x_1
+[2026-02-25 14:19:14] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/manifest.json
+[2026-02-25 14:19:14] [root] 
+[2026-02-25 14:19:14] [root] SUMMARY
+[2026-02-25 14:19:14] [root] Successful: 2/2
+[2026-02-25 14:19:14] [root]    - rtx5090_vllm_benchmark.txt
+[2026-02-25 14:19:14] [root]    - rtx5090_sglang_benchmark.txt
+[2026-02-25 14:19:14] [root] 
+[2026-02-25 14:19:14] [root] All done!
+[2026-02-25 14:19:14] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/benchmark.log

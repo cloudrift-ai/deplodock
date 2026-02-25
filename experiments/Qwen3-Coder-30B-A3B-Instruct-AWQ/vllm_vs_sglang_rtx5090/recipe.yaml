@@ -7,11 +7,11 @@ engine:
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     context_length: 8192
-    max_concurrent_requests: 32
+    max_concurrent_requests: 16
 
 benchmark:
   max_concurrency: 16
-  num_prompts: 64
+  num_prompts: 32
   random_input_len: 4000
   random_output_len: 4000
 

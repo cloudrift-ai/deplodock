@@ -9,17 +9,17 @@ recipe:
   engine:
     llm:
       context_length: 8192
-      max_concurrent_requests: 32
+      max_concurrent_requests: 16
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.9
-      vllm:
-        image: vllm/vllm-openai:latest
-        extra_args: ''
-      sglang: null
+      vllm: null
+      sglang:
+        image: lmsysorg/sglang:latest
+        extra_args: --quantization moe_wna16
   benchmark:
     max_concurrency: 16
-    num_prompts: 64
+    num_prompts: 32
     random_input_len: 4000
     random_output_len: 4000
   deploy:
@@ -28,37 +28,38 @@ recipe:
 ==================================================
 
 ============ Serving Benchmark Result ============
-Successful requests:                     64        
+Successful requests:                     32        
 Failed requests:                         0         
 Maximum request concurrency:             16        
-Benchmark duration (s):                  214.27    
-Total input tokens:                      256000    
-Total generated tokens:                  256000    
-Request throughput (req/s):              0.30      
-Output token throughput (tok/s):         1194.74   
-Peak output token throughput (tok/s):    1520.00   
-Peak concurrent requests:                21.00     
-Total token throughput (tok/s):          2389.48   
+Benchmark duration (s):                  315.92    
+Total input tokens:                      128000    
+Total generated tokens:                  128000    
+Request throughput (req/s):              0.10      
+Output token throughput (tok/s):         405.16    
+Peak output token throughput (tok/s):    553.00    
+Peak concurrent requests:                32.00     
+Total token throughput (tok/s):          810.33    
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          1106.62   
-Median TTFT (ms):                        948.74    
-P99 TTFT (ms):                           3254.33   
+Mean TTFT (ms):                          3608.25   
+Median TTFT (ms):                        3605.40   
+P99 TTFT (ms):                           6765.87   
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          13.11     
-Median TPOT (ms):                        13.04     
-P99 TPOT (ms):                           13.71     
+Mean TPOT (ms):                          38.60     
+Median TPOT (ms):                        38.60     
+P99 TPOT (ms):                           39.75     
 ---------------Inter-token Latency----------------
-Mean ITL (ms):                           13.11     
-Median ITL (ms):                         12.54     
-P99 ITL (ms):                            15.34     
+Mean ITL (ms):                           38.60     
+Median ITL (ms):                         38.80     
+P99 ITL (ms):                            43.39     
 ==================================================
 
 ============ Docker Compose Configuration ============
 services:
 
-  vllm_0:
-    image: vllm/vllm-openai:latest
-    container_name: vllm_0
+  sglang_0:
+    image: lmsysorg/sglang:latest
+    container_name: sglang_0
+    entrypoint: python3 -m sglang.launch_server
     deploy:
       resources:
         reservations:
@@ -77,15 +78,16 @@ services:
     ipc: host
     command: >
       --trust-remote-code
-      --gpu-memory-utilization=0.9
+      --mem-fraction-static 0.9
       --host 0.0.0.0
       --port 8000
-      --tensor-parallel-size 1
-      --pipeline-parallel-size 1
-      --model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+      --tp 1
+      --dp 1
+      --model-path QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
       --served-model-name QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
-      --max-model-len 8192
-      --max-num-seqs 32
+      --context-length 8192
+      --max-running-requests 16
+      --quantization moe_wna16
     healthcheck:
       test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health"]
       interval: 10s
@@ -98,7 +100,7 @@ services:
 vllm bench serve
     --model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
     --max-concurrency 16
-    --num-prompts 64
+    --num-prompts 32
     --random-input-len 4000
     --random-output-len 4000
     --base-url http://localhost:8000
@@ -172,14 +174,14 @@ Vulnerability Tsx async abort:        Not affected
 
 === MEMORY ===
                total        used        free      shared  buff/cache   available
-Mem:            49Gi       884Mi        47Gi       3.0Mi       791Mi        48Gi
+Mem:            49Gi       914Mi        47Gi       3.0Mi       793Mi        48Gi
 Swap:             0B          0B          0B
 
 === GPU INFORMATION ===
-NVIDIA GeForce RTX 5090, 32607 MiB, 580.65.06, P0, 42, 2 %
+NVIDIA GeForce RTX 5090, 32607 MiB, 580.65.06, P0, 35, 2 %
 
 === GPU DETAILS ===
-Wed Feb 25 15:11:00 2026       
+Wed Feb 25 18:50:48 2026       
 +-----------------------------------------------------------------------------------------+
 | NVIDIA-SMI 580.65.06              Driver Version: 580.65.06      CUDA Version: 13.0     |
 +-----------------------------------------+------------------------+----------------------+
@@ -188,7 +190,7 @@ Wed Feb 25 15:11:00 2026
 |                                         |                        |               MIG M. |
 |=========================================+========================+======================|
 |   0  NVIDIA GeForce RTX 5090        Off |   00000000:00:10.0 Off |                  N/A |
-| 42%   42C    P0             45W /  575W |       0MiB /  32607MiB |      7%      Default |
+| 41%   35C    P0             60W /  575W |       0MiB /  32607MiB |      3%      Default |
 |                                         |                        |                  N/A |
 +-----------------------------------------+------------------------+----------------------+
 
@@ -221,7 +223,7 @@ vda     253:0    0  400G  0 disk
 └─vda16 259:0    0  913M  0 part /boot
 
 === UPTIME ===
- 15:11:00 up 0 min,  1 user,  load average: 0.70, 0.19, 0.06
+ 18:50:49 up 0 min,  1 user,  load average: 2.23, 0.63, 0.21
 
 === DOCKER VERSION ===
 Docker version 28.5.1, build e180ab8
