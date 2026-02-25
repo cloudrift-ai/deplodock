@@ -1,0 +1,240 @@
+name: Run Experiment
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: experiment-pr-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/run-experiment')
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.pr-meta.outputs.pr_number }}
+      pr_head_ref: ${{ steps.pr-meta.outputs.pr_head_ref }}
+      pr_head_repo: ${{ steps.pr-meta.outputs.pr_head_repo }}
+      is_fork: ${{ steps.pr-meta.outputs.is_fork }}
+      experiments: ${{ steps.detect.outputs.experiments }}
+    steps:
+      - name: Check permissions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.payload.comment.user.login,
+            });
+            const allowed = ['admin', 'write'];
+            if (!allowed.includes(data.permission)) {
+              core.setFailed(`User ${context.payload.comment.user.login} does not have write access (has: ${data.permission})`);
+            }
+
+      - name: Extract PR metadata
+        id: pr-meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            core.setOutput('pr_number', pr.number);
+            core.setOutput('pr_head_ref', pr.head.ref);
+            core.setOutput('pr_head_repo', pr.head.repo.full_name);
+            core.setOutput('is_fork', pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`);
+
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.EXPERIMENT_APP_ID }}
+          private-key: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: ${{ steps.pr-meta.outputs.pr_head_repo }}
+          ref: ${{ steps.pr-meta.outputs.pr_head_ref }}
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.event.repository.default_branch }}
+
+      - name: Detect experiments
+        id: detect
+        run: |
+          python .github/scripts/detect-experiments.py \
+            --comment "${{ github.event.comment.body }}" \
+            --base "origin/${{ github.event.repository.default_branch }}" \
+            --head "HEAD"
+
+      - name: Add reaction to trigger comment
+        uses: actions/github-script@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket',
+            });
+
+      - name: Post acknowledgement comment
+        uses: actions/github-script@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const experiments = JSON.parse('${{ steps.detect.outputs.experiments }}');
+            const list = experiments.map(e => `- \`${e}\``).join('\n');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `### Experiment benchmark started\n\n` +
+              `**Experiments:**\n${list}\n\n` +
+              `**Triggered by:** @${context.payload.comment.user.login}\n` +
+              `**Workflow run:** [View logs](${runUrl})`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+  benchmark:
+    needs: gate
+    if: needs.gate.outputs.experiments != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.EXPERIMENT_APP_ID }}
+          private-key: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: ${{ needs.gate.outputs.pr_head_repo }}
+          ref: ${{ needs.gate.outputs.pr_head_ref }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: make setup
+
+      - name: Generate ephemeral SSH key
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+          echo "SSH_PUB_KEY=$(cat ~/.ssh/id_ed25519.pub)" >> "$GITHUB_ENV"
+
+      - name: Setup GCP credentials
+        if: secrets.GCP_SERVICE_ACCOUNT_KEY != ''
+        run: |
+          echo '${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}' > /tmp/gcp-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-key.json" >> "$GITHUB_ENV"
+          echo "GCP_SERVICE_ACCOUNT=${{ secrets.GCP_SERVICE_ACCOUNT }}" >> "$GITHUB_ENV"
+
+      - name: Run benchmarks
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          CLOUDRIFT_API_KEY: ${{ secrets.CLOUDRIFT_API_KEY }}
+        run: |
+          experiments='${{ needs.gate.outputs.experiments }}'
+          dirs=$(echo "$experiments" | python -c "import sys, json; print(' '.join(json.load(sys.stdin)))")
+          ./venv/bin/deplodock bench $dirs
+
+      - name: Collect and commit results
+        if: always()
+        run: |
+          experiments='${{ needs.gate.outputs.experiments }}'
+          dirs=$(echo "$experiments" | python -c "import sys, json; print(' '.join(json.load(sys.stdin)))")
+
+          # Find new run directories (timestamped dirs with manifest.json)
+          result_files=""
+          for dir in $dirs; do
+            for run_dir in "$dir"/[0-9][0-9][0-9][0-9]-*/; do
+              if [ -f "$run_dir/manifest.json" ]; then
+                result_files="$result_files $run_dir"
+              fi
+            done
+          done
+
+          if [ -z "$result_files" ]; then
+            echo "No result directories found"
+            exit 0
+          fi
+
+          # Force-add results (gitignored by default)
+          git add --force $result_files
+          if git diff --cached --quiet; then
+            echo "No new results to commit"
+            exit 0
+          fi
+
+          git config user.name "deplodock-experiment-bot"
+          git config user.email "deplodock-experiment-bot[bot]@users.noreply.github.com"
+          git commit -m "Add experiment benchmark results
+
+          Triggered by /run-experiment in PR #${{ needs.gate.outputs.pr_number }}"
+          git push || echo "::warning::Failed to push results to PR branch (fork may not allow edits from maintainers)"
+
+      - name: Format result comment
+        id: format
+        if: always()
+        run: |
+          experiments='${{ needs.gate.outputs.experiments }}'
+          python .github/scripts/format-results.py \
+            --experiments "$experiments" \
+            --output /tmp/benchmark-comment.md
+
+      - name: Upload results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiment-results
+          path: |
+            experiments/**/[0-9][0-9][0-9][0-9]-*/
+          if-no-files-found: warn
+
+      - name: Post result comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            let body;
+            try {
+              body = fs.readFileSync('/tmp/benchmark-comment.md', 'utf8');
+            } catch {
+              body = '### Experiment benchmark results\n\n' +
+                '> **Error:** Could not generate result summary. ' +
+                'Check the [workflow run](' +
+                `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}` +
+                ') for details.';
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.gate.outputs.pr_number }},
+              body,
+            });
+
+      - name: Cleanup GCP credentials
+        if: always()
+        run: rm -f /tmp/gcp-key.json
