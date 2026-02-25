@@ -26,15 +26,45 @@ from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_transport import make_run_cmd
 
 
-def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str, run_dir: Path, dry_run: bool = False) -> list[dict]:
+def _build_instance_info(group: ExecutionGroup, group_label: str, conn) -> dict:
+    """Build instance info dict from a VM connection for instances.json."""
+    info = {
+        "group_label": group_label,
+        "gpu_name": group.gpu_name,
+        "gpu_count": group.gpu_count,
+        "address": conn.address,
+        "ssh_port": conn.ssh_port,
+    }
+
+    if conn.delete_info:
+        provider = conn.delete_info[0]
+        info["provider"] = provider
+        info["instance_id"] = conn.delete_info[1]
+        if provider == "gcp" and len(conn.delete_info) > 2:
+            info["zone"] = conn.delete_info[2]
+
+    return info
+
+
+def run_execution_group(
+    group: ExecutionGroup,
+    config: dict,
+    ssh_key: str,
+    run_dir: Path,
+    dry_run: bool = False,
+    no_teardown: bool = False,
+) -> tuple[list[dict], dict | None]:
     """Run all benchmark tasks for one execution group.
 
     Provisions a VM with group.gpu_count GPUs, then runs each task.
     Tasks with fewer GPUs than the group get gpu_device_ids set.
 
-    Returns a list of task metadata dicts for manifest assembly.
+    Returns:
+        A tuple of (task_metadata_list, instance_info). instance_info is
+        non-None only when no_teardown is set and the VM was kept alive.
     """
     task_results = []
+    instance_info = None
     model_dir = config["benchmark"].get("model_dir", "/hf_models")
     hf_token = os.environ.get("HF_TOKEN", "")
     providers_config = config.get("providers", {})
@@ -59,7 +89,7 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str, run_d
             logger.error("VM provisioning failed")
             for task in group.tasks:
                 task_results.append(_task_meta(task, run_dir, status="failed"))
-            return task_results
+            return task_results, None
 
         logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
         provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
@@ -116,23 +146,28 @@ def run_execution_group(group: ExecutionGroup, config: dict, ssh_key: str, run_d
                 task_logger.error("Benchmark failed")
                 task_results.append(_task_meta(task, run_dir, status="failed"))
 
-            task_logger.info("Tearing down...")
-            teardown_entry(params)
+            if not no_teardown:
+                task_logger.info("Tearing down...")
+                teardown_entry(params)
 
     finally:
         if conn is not None and conn.delete_info:
-            logger.info("Deleting VM...")
-            try:
-                delete_cloud_vm(conn.delete_info, dry_run)
-                logger.info("VM deleted.")
-            except Exception as e:
-                logger.error(f"Failed to delete VM: {e}")
+            if no_teardown:
+                instance_info = _build_instance_info(group, group_label, conn)
+                logger.info(f"Skipping VM deletion (--no-teardown): {conn.address}")
+            else:
+                logger.info("Deleting VM...")
+                try:
+                    delete_cloud_vm(conn.delete_info, dry_run)
+                    logger.info("VM deleted.")
+                except Exception as e:
+                    logger.error(f"Failed to delete VM: {e}")
 
     logger.info(f"Completed group: {group_label}")
-    return task_results
+    return task_results, instance_info
 
 
-async def _run_groups(groups, config, ssh_key, run_dir, dry_run, max_workers):
+async def _run_groups(groups, config, ssh_key, run_dir, dry_run, max_workers, no_teardown=False):
     """Run execution groups concurrently with a semaphore."""
     sem = asyncio.Semaphore(max_workers or len(groups))
 
@@ -145,6 +180,7 @@ async def _run_groups(groups, config, ssh_key, run_dir, dry_run, max_workers):
                 ssh_key,
                 run_dir,
                 dry_run,
+                no_teardown,
             )
 
     results = await asyncio.gather(

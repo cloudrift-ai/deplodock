@@ -33,6 +33,7 @@ Or for a specific test file:
 - `deplodock deploy ssh ...` — deploy to remote server via SSH
 - `deplodock deploy cloud ...` — provision a cloud VM and deploy via SSH
 - `deplodock bench recipes/* ...` — deploy + benchmark + teardown on cloud VMs (recipe dirs as positional args)
+- `deplodock teardown <run_dir>` — clean up VMs left running by `bench --no-teardown`
 - `deplodock report ...` — generate Excel reports from benchmark results
 - `deplodock vm create gcp ...` — create a GCP GPU VM
 - `deplodock vm create cloudrift ...` — create a CloudRift GPU VM

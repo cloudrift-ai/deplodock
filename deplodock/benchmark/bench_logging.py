@@ -2,41 +2,21 @@
 
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from deplodock.hardware import gpu_short_name
 from deplodock.planner import ExecutionGroup
 
-# Global log file path
-LOG_FILE = None
 
+def setup_logging():
+    """Setup logging with console output only.
 
-def setup_logging() -> str:
-    """Setup logging with timestamped log file and console output.
-
-    Returns:
-        Path to the log file
+    Call add_file_handler() after the run directory is created to attach
+    a file handler that writes directly into the run directory.
     """
-    global LOG_FILE
-
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    LOG_FILE = log_dir / f"benchmark_{timestamp}.log"
-
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
-
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    file_formatter = logging.Formatter(
-        "[%(asctime)s] [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    file_handler.setFormatter(file_formatter)
-    root_logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler(sys.stdout)
 
@@ -51,7 +31,24 @@ def setup_logging() -> str:
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
 
-    return str(LOG_FILE)
+
+def add_file_handler(run_dir: Path) -> str:
+    """Add a file handler that writes to {run_dir}/benchmark.log.
+
+    Returns:
+        Path to the log file.
+    """
+    log_file = run_dir / "benchmark.log"
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_formatter = logging.Formatter(
+        "[%(asctime)s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler.setFormatter(file_formatter)
+    logging.getLogger().addHandler(file_handler)
+
+    return str(log_file)
 
 
 def _get_group_logger(group: ExecutionGroup, model_name: str | None = None) -> logging.Logger:

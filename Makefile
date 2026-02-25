@@ -1,4 +1,4 @@
-.PHONY: help setup clean bench bench-force logs clean-logs test-compose report report-nov2025 lint format
+.PHONY: help setup clean bench bench-force test-compose report report-nov2025 lint format
 
 help:
 	@echo "Server Benchmark Makefile"
@@ -11,8 +11,6 @@ help:
 	@echo "  bench-force    - Run benchmarks in parallel (force re-run, skip cached results)"
 	@echo "  report         - Generate Excel report from benchmark results"
 	@echo "  report-nov2025 - Generate Excel report from Nov 2025 results (pro6000_l40s_h100_h200_11_2025)"
-	@echo "  logs           - Show the latest benchmark log"
-	@echo "  clean-logs     - Remove all log files"
 	@echo "  clean          - Remove virtual environment and generated files"
 	@echo "  test-compose   - Test docker-compose generation with sample config"
 
@@ -68,25 +66,6 @@ report-jan2026: setup
 		--output results/pro6000_h100_h200_b200_01_2026/benchmark_report.xlsx
 
 
-
-logs:
-	@if [ ! -d "logs" ]; then \
-		echo "❌ No logs directory found."; \
-		exit 1; \
-	fi
-	@LATEST_LOG=$$(ls -t logs/benchmark_*.log 2>/dev/null | head -1); \
-	if [ -z "$$LATEST_LOG" ]; then \
-		echo "❌ No log files found."; \
-		exit 1; \
-	fi; \
-	echo "📝 Showing: $$LATEST_LOG"; \
-	echo ""; \
-	cat "$$LATEST_LOG"
-
-clean-logs:
-	@echo "Removing log files..."
-	rm -rf logs/
-	@echo "✅ Logs cleaned!"
 
 clean:
 	@echo "Removing virtual environment and generated files..."

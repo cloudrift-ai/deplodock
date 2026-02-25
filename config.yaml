@@ -2,7 +2,7 @@
 
 # Global benchmark settings
 benchmark:
-  local_results_dir: "results"
+  local_results_dir: "results/intermediate"
   model_dir: "/hf_models"
 
 # GPU Pricing ($ per hour per GPU)

@@ -10,6 +10,7 @@ Tools for deploying and benchmarking LLM inference on GPU servers. Supports **vL
   - [commands/](deplodock/commands/) — CLI layer (thin argparse handlers, see [ARCHITECTURE.md](deplodock/commands/ARCHITECTURE.md))
     - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
     - [bench/](deplodock/commands/bench/) — `bench` command
+    - [teardown.py](deplodock/commands/teardown.py) — `teardown` command
     - [report/](deplodock/commands/report/) — `report` command
     - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
   - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
@@ -279,7 +280,7 @@ The `bench` command accepts recipe directories as positional arguments. It loads
 
 ```yaml
 benchmark:
-  local_results_dir: "results"
+  local_results_dir: "results/intermediate"
   model_dir: "/hf_models"
 
 pricing:
@@ -314,6 +315,21 @@ deplodock bench recipes/* --dry-run                          # Preview commands
 | `--config`      | `config.yaml`       | Path to configuration file             |
 | `--max-workers` | num groups          | Max parallel execution groups          |
 | `--dry-run`     | false               | Print commands without executing       |
+| `--no-teardown` | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
+
+### Teardown
+
+Clean up VMs left running by `bench --no-teardown`:
+
+```bash
+deplodock teardown results/intermediate/2026-02-24_12-00-00_abc12345
+deplodock teardown results/intermediate/2026-02-24_12-00-00_abc12345 --ssh-key ~/.ssh/id_ed25519
+```
+
+| Flag       | Default             | Description                       |
+|------------|---------------------|-----------------------------------|
+| `run_dir`  | (required)          | Run directory with `instances.json` (positional arg) |
+| `--ssh-key`| `~/.ssh/id_ed25519` | SSH private key path              |
 
 ### Generate Reports
 

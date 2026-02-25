@@ -85,6 +85,27 @@ def test_bench_multiple_recipes(run_cli, make_bench_config, recipes_dir, tmp_pat
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
 
 
+def test_bench_no_teardown_dry_run(run_cli, make_bench_config, recipes_dir, tmp_path):
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--variants",
+        "RTX5090",
+        "--config",
+        config_path,
+        "--dry-run",
+        "--no-teardown",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+
+    # With --no-teardown, per-task teardown should be skipped
+    assert "vllm bench serve" in stdout
+    assert "Tearing down..." not in stdout
+    assert "Skipping VM deletion (--no-teardown)" in stdout
+
+
 def test_bench_help(run_cli):
     rc, stdout, _ = run_cli("bench", "--help")
     assert rc == 0
@@ -94,3 +115,11 @@ def test_bench_help(run_cli):
     assert "--dry-run" in stdout
     assert "--config" in stdout
     assert "--max-workers" in stdout
+    assert "--no-teardown" in stdout
+
+
+def test_teardown_help(run_cli):
+    rc, stdout, _ = run_cli("teardown", "--help")
+    assert rc == 0
+    assert "run_dir" in stdout
+    assert "--ssh-key" in stdout

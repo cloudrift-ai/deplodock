@@ -64,7 +64,7 @@ Benchmark tracking, configuration, task enumeration, and execution.
 **Modules:**
 - `tracking.py` — `compute_code_hash()`, `create_run_dir()`, `write_manifest()`, `read_manifest()`
 - `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
-- `bench_logging.py` — `setup_logging()`, `_get_group_logger()`
+- `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `_get_group_logger()`
 - `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
 - `tasks.py` — `enumerate_tasks()`, `_task_meta()`
 - `execution.py` — `run_execution_group()`, `_run_groups()`
@@ -101,6 +101,7 @@ Each command module contains only argparse registration and `handle_*` functions
 - `commands/deploy/local.py` — `handle_local()`, `register_local_target()`
 - `commands/deploy/cloud.py` — `handle_cloud()`, `register_cloud_target()`
 - `commands/report/` — `handle_report()`, `register_report_command()`
+- `commands/teardown.py` — `handle_teardown()`, `register_teardown_command()`
 - `commands/vm/` — `register_vm_command()`, CLI handlers for each provider
 
 ## Data Flow
@@ -126,10 +127,10 @@ For each task in group:
     +-- deploy(DeployParams) -> compose up
     +-- run_benchmark_workload()
     +-- save results
-    +-- teardown()
+    +-- teardown() (skipped with --no-teardown)
     |
     v
-delete_cloud_vm(conn.delete_info)
+delete_cloud_vm(conn.delete_info) (skipped with --no-teardown; writes instances.json)
 ```
 
 ## CLI Command Tree
@@ -141,6 +142,7 @@ deplodock
 |   +-- ssh      -- deploy to remote server via SSH
 |   +-- cloud    -- provision cloud VM + deploy via SSH
 +-- bench        -- deploy + benchmark + teardown on cloud VMs
++-- teardown     -- clean up VMs left by bench --no-teardown
 +-- report       -- generate Excel reports from benchmark results
 +-- vm
     +-- create
