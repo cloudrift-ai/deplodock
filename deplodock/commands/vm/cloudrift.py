@@ -1,5 +1,6 @@
 """CloudRift provider CLI handlers."""
 
+import asyncio
 import logging
 import os
 import sys
@@ -31,9 +32,13 @@ def _resolve_api_key(args_api_key):
 
 def handle_create(args):
     """CLI handler for 'vm create cloudrift'."""
+    asyncio.run(_handle_create(args))
+
+
+async def _handle_create(args):
     api_key = _resolve_api_key(args.api_key)
     ports = [int(p) for p in args.ports.split(",")] if args.ports else None
-    conn = create_instance(
+    conn = await create_instance(
         api_key=api_key,
         instance_type=args.instance_type,
         ssh_key_path=args.ssh_key,
@@ -49,8 +54,12 @@ def handle_create(args):
 
 def handle_delete(args):
     """CLI handler for 'vm delete cloudrift'."""
+    asyncio.run(_handle_delete(args))
+
+
+async def _handle_delete(args):
     api_key = _resolve_api_key(args.api_key)
-    success = delete_instance(
+    success = await delete_instance(
         api_key=api_key,
         instance_id=args.instance_id,
         api_url=args.api_url,

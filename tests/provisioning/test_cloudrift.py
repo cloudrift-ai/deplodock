@@ -3,7 +3,7 @@
 Response fixtures are captured from real CloudRift API calls.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from deplodock.provisioning.cloudrift import (
     API_VERSION,
@@ -94,27 +94,32 @@ TERMINATE_RESPONSE = {
 # ── _api_request ──────────────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift.requests.request")
-def test_api_request_sends_correct_payload(mock_req):
+async def test_api_request_sends_correct_payload():
     mock_resp = MagicMock()
     mock_resp.json.return_value = {"version": "2025-02-10", "data": {"ok": True}}
     mock_resp.raise_for_status = MagicMock()
-    mock_req.return_value = mock_resp
 
-    result = _api_request("POST", "/api/v1/test", {"foo": "bar"}, API_KEY, API_URL)
+    mock_client_instance = AsyncMock()
+    mock_client_instance.request.return_value = mock_resp
+    mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+    mock_client_instance.__aexit__ = AsyncMock(return_value=False)
 
-    mock_req.assert_called_once_with(
+    with patch("deplodock.provisioning.cloudrift.httpx.AsyncClient", return_value=mock_client_instance):
+        result = await _api_request("POST", "/api/v1/test", {"foo": "bar"}, API_KEY, API_URL)
+
+    mock_client_instance.request.assert_called_once_with(
         "POST",
         f"{API_URL}/api/v1/test",
         json={"version": API_VERSION, "data": {"foo": "bar"}},
         headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
+        timeout=60,
     )
     assert result == {"ok": True}
 
 
-def test_api_request_dry_run(caplog):
+async def test_api_request_dry_run(caplog):
     with caplog.at_level("INFO", logger="deplodock.provisioning.cloudrift"):
-        result = _api_request("POST", "/api/v1/test", {"foo": "bar"}, API_KEY, API_URL, dry_run=True)
+        result = await _api_request("POST", "/api/v1/test", {"foo": "bar"}, API_KEY, API_URL, dry_run=True)
 
     assert result is None
     assert "[dry-run] POST" in caplog.text
@@ -125,11 +130,11 @@ def test_api_request_dry_run(caplog):
 # ── _rent_instance ────────────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._api_request")
-def test_rent_instance_payload(mock_api):
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_rent_instance_payload(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    result = _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], ports=[22, 8000], api_url=API_URL)
+    result = await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], ports=[22, 8000], api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert call_data["selector"] == {"ByInstanceTypeAndLocation": {"instance_type": "rtx49-7c-kn.1"}}
@@ -145,11 +150,11 @@ def test_rent_instance_payload(mock_api):
     assert result["instance_ids"] == ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]
 
 
-@patch("deplodock.provisioning.cloudrift._api_request")
-def test_rent_instance_no_ports(mock_api):
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_rent_instance_no_ports(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL)
+    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert "ports" not in call_data
@@ -159,11 +164,11 @@ def test_rent_instance_no_ports(mock_api):
 # ── _terminate_instance ───────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._api_request")
-def test_terminate_instance_payload(mock_api):
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_terminate_instance_payload(mock_api):
     mock_api.return_value = TERMINATE_RESPONSE
 
-    _terminate_instance(API_KEY, "inst-123", api_url=API_URL)
+    await _terminate_instance(API_KEY, "inst-123", api_url=API_URL)
 
     mock_api.assert_called_once_with(
         "POST",
@@ -178,11 +183,11 @@ def test_terminate_instance_payload(mock_api):
 # ── _get_instance_info ────────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._api_request")
-def test_get_instance_info_found(mock_api):
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_get_instance_info_found(mock_api):
     mock_api.return_value = INSTANCE_ACTIVE_RESPONSE
 
-    info = _get_instance_info(API_KEY, "c4bf5e16-1063-11f1-9096-5f6ae8f8983f", api_url=API_URL)
+    info = await _get_instance_info(API_KEY, "c4bf5e16-1063-11f1-9096-5f6ae8f8983f", api_url=API_URL)
 
     assert info["id"] == "c4bf5e16-1063-11f1-9096-5f6ae8f8983f"
     assert info["status"] == "Active"
@@ -190,32 +195,32 @@ def test_get_instance_info_found(mock_api):
     assert call_data == {"selector": {"ById": ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]}}
 
 
-@patch("deplodock.provisioning.cloudrift._api_request")
-def test_get_instance_info_not_found(mock_api):
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_get_instance_info_not_found(mock_api):
     mock_api.return_value = {"instances": []}
 
-    info = _get_instance_info(API_KEY, "inst-999", api_url=API_URL)
+    info = await _get_instance_info(API_KEY, "inst-999", api_url=API_URL)
     assert info is None
 
 
 # ── _list_ssh_keys / _add_ssh_key ─────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._api_request")
-def test_list_ssh_keys(mock_api):
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_list_ssh_keys(mock_api):
     mock_api.return_value = SSH_KEYS_LIST_RESPONSE
 
-    result = _list_ssh_keys(API_KEY, api_url=API_URL)
+    result = await _list_ssh_keys(API_KEY, api_url=API_URL)
 
     mock_api.assert_called_once_with("POST", "/api/v1/ssh-keys/list", {}, API_KEY, API_URL, False)
     assert len(result["keys"]) == 2
 
 
-@patch("deplodock.provisioning.cloudrift._api_request")
-def test_add_ssh_key(mock_api):
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_add_ssh_key(mock_api):
     mock_api.return_value = {"ssh_key": {"id": "key-new"}}
 
-    result = _add_ssh_key(API_KEY, "my-key", "ssh-ed25519 AAAA", api_url=API_URL)
+    result = await _add_ssh_key(API_KEY, "my-key", "ssh-ed25519 AAAA", api_url=API_URL)
 
     mock_api.assert_called_once_with(
         "POST",
@@ -231,30 +236,30 @@ def test_add_ssh_key(mock_api):
 # ── _ensure_ssh_key ───────────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._add_ssh_key")
-@patch("deplodock.provisioning.cloudrift._list_ssh_keys")
-def test_ensure_ssh_key_already_registered(mock_list, mock_add, tmp_path):
+@patch("deplodock.provisioning.cloudrift._add_ssh_key", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._list_ssh_keys", new_callable=AsyncMock)
+async def test_ensure_ssh_key_already_registered(mock_list, mock_add, tmp_path):
     key_file = tmp_path / "id_ed25519.pub"
     key_file.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID37 user@example.com\n")
 
     mock_list.return_value = SSH_KEYS_LIST_RESPONSE
 
-    key_id = _ensure_ssh_key(API_KEY, str(key_file), api_url=API_URL)
+    key_id = await _ensure_ssh_key(API_KEY, str(key_file), api_url=API_URL)
 
     assert key_id == "5eb89e22-2a98-11f0-9c02-771633991431"
     mock_add.assert_not_called()
 
 
-@patch("deplodock.provisioning.cloudrift._add_ssh_key")
-@patch("deplodock.provisioning.cloudrift._list_ssh_keys")
-def test_ensure_ssh_key_registers_new(mock_list, mock_add, tmp_path):
+@patch("deplodock.provisioning.cloudrift._add_ssh_key", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._list_ssh_keys", new_callable=AsyncMock)
+async def test_ensure_ssh_key_registers_new(mock_list, mock_add, tmp_path):
     key_file = tmp_path / "id_ed25519.pub"
     key_file.write_text("ssh-ed25519 BBBB test@host\n")
 
     mock_list.return_value = SSH_KEYS_LIST_RESPONSE
     mock_add.return_value = {"ssh_key": {"id": "key-new"}}
 
-    key_id = _ensure_ssh_key(API_KEY, str(key_file), api_url=API_URL)
+    key_id = await _ensure_ssh_key(API_KEY, str(key_file), api_url=API_URL)
 
     assert key_id == "key-new"
     mock_add.assert_called_once()

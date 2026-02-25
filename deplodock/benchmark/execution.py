@@ -47,7 +47,7 @@ def _build_instance_info(group: ExecutionGroup, group_label: str, conn) -> dict:
     return info
 
 
-def run_execution_group(
+async def run_execution_group(
     group: ExecutionGroup,
     config: dict,
     ssh_key: str,
@@ -77,7 +77,7 @@ def run_execution_group(
 
     conn = None
     try:
-        conn = provision_cloud_vm(
+        conn = await provision_cloud_vm(
             group.gpu_name,
             group.gpu_count,
             ssh_key,
@@ -93,11 +93,11 @@ def run_execution_group(
             return task_results, None
 
         logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
-        provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+        await provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
 
         # Collect system info once per execution group
         sysinfo_run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
-        system_info = collect_system_info(sysinfo_run_cmd)
+        system_info = await collect_system_info(sysinfo_run_cmd)
 
         for task in group.tasks:
             active_run_dir.set(task.run_dir)
@@ -125,7 +125,7 @@ def run_execution_group(
                 gpu_device_ids=gpu_device_ids,
             )
             task_logger.info("Deploying model...")
-            success = deploy_entry(params)
+            success = await deploy_entry(params)
 
             if not success:
                 task_logger.error("Deploy failed, skipping benchmark")
@@ -134,7 +134,7 @@ def run_execution_group(
 
             task_logger.info("Running benchmark...")
             run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
-            bench_success, output, bench_command = run_benchmark_workload(
+            bench_success, output, bench_command = await run_benchmark_workload(
                 run_cmd,
                 recipe,
                 dry_run=dry_run,
@@ -156,7 +156,7 @@ def run_execution_group(
 
             if not no_teardown:
                 task_logger.info("Tearing down...")
-                teardown_entry(params)
+                await teardown_entry(params)
 
     finally:
         active_run_dir.set(None)
@@ -167,7 +167,7 @@ def run_execution_group(
             else:
                 logger.info("Deleting VM...")
                 try:
-                    delete_cloud_vm(conn.delete_info, dry_run)
+                    await delete_cloud_vm(conn.delete_info, dry_run)
                     logger.info("VM deleted.")
                 except Exception as e:
                     logger.error(f"Failed to delete VM: {e}")
@@ -182,8 +182,7 @@ async def _run_groups(groups, config, ssh_key, dry_run, max_workers, no_teardown
 
     async def _run_with_semaphore(group):
         async with sem:
-            return await asyncio.to_thread(
-                run_execution_group,
+            return await run_execution_group(
                 group,
                 config,
                 ssh_key,

@@ -61,12 +61,12 @@ docker info --format \
 """
 
 
-def collect_system_info(run_cmd) -> str:
+async def collect_system_info(run_cmd) -> str:
     """Collect system information from a remote server via SSH.
 
     Returns the output wrapped in section delimiters, or empty string on failure.
     """
-    rc, output, _ = run_cmd(SYSTEM_INFO_CMD, stream=False)
+    rc, output, _ = await run_cmd(SYSTEM_INFO_CMD, stream=False, timeout=120)
     if rc != 0:
         logger.warning("Failed to collect system info")
         return ""

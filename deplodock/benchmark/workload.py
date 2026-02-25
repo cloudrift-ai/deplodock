@@ -82,7 +82,7 @@ def compose_result(
     return "\n\n".join(sections) + "\n"
 
 
-def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
+async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     """Run vllm bench serve on the remote server and return output.
 
     Returns:
@@ -123,5 +123,5 @@ def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     )
 
     bench_command_str = build_bench_command(recipe)
-    rc, output, _ = run_cmd(bench_cmd, stream=False)
+    rc, output, _ = await run_cmd(bench_cmd, stream=False, timeout=3600)
     return rc == 0, output, bench_command_str

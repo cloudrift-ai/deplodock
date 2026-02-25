@@ -100,18 +100,29 @@ def run_deploy(run_cmd, write_file, recipe, model_dir, ...):
 
 ### Concurrency
 
-Use `asyncio` for concurrent execution. Wrap blocking (subprocess/IO)
-calls with `asyncio.to_thread()`. Use `asyncio.Semaphore` to limit
-concurrency. Entry point uses `asyncio.run()`:
+The codebase is fully async. All subprocess and network I/O uses native
+`asyncio` APIs (`asyncio.create_subprocess_exec/shell`, `httpx.AsyncClient`).
+Use `asyncio.Semaphore` to limit concurrency. CLI entry points use
+`asyncio.run()`:
 
 ```python
-async def _run_groups(groups):
-    sem = asyncio.Semaphore(max_workers)
-    async def _run(group):
-        async with sem:
-            return await asyncio.to_thread(blocking_fn, group)
-    await asyncio.gather(*(_run(g) for g in groups))
+def handle_foo(args):
+    asyncio.run(_handle_foo(args))
+
+async def _handle_foo(args):
+    await ...
 ```
+
+All `run_cmd` callables are `async def` with a `timeout` parameter.
+Timeouts use `asyncio.wait_for()` around `proc.communicate()`:
+
+```python
+async def run_cmd(command, stream=True, timeout=600):
+    proc = await asyncio.create_subprocess_shell(command, ...)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+```
+
+On `TimeoutError`: kill the process, await termination, log, return `(1, "", "")`.
 
 ## Commit Messages
 

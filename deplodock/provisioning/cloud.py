@@ -55,7 +55,7 @@ def resolve_vm_spec(loaded_configs, server_name=None):
     return gpu_name, max_gpu_count
 
 
-def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None, server_name=None, dry_run=False, logger=None):
+async def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None, server_name=None, dry_run=False, logger=None):
     """Provision a cloud VM for the given GPU requirements.
 
     Looks up the provider from the hardware table and dispatches to the
@@ -85,7 +85,7 @@ def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None, serv
         if dry_run:
             logger.info(f"[dry-run] create instance type={instance_type} ssh_key={pub_key_path}")
 
-        conn = cr_provider.create_instance(
+        conn = await cr_provider.create_instance(
             api_key=api_key or "",
             instance_type=instance_type,
             ssh_key_path=pub_key_path,
@@ -146,7 +146,7 @@ def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None, serv
 
         extra_gcloud_args = " ".join(extra_parts) if extra_parts else None
 
-        conn = gcp_provider.create_instance(
+        conn = await gcp_provider.create_instance(
             instance=instance_name,
             zone=zone,
             machine_type=instance_type,
@@ -165,7 +165,7 @@ def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None, serv
         raise ValueError(f"Unknown provider: {provider}")
 
 
-def delete_cloud_vm(delete_info, dry_run=False):
+async def delete_cloud_vm(delete_info, dry_run=False):
     """Delete a cloud VM using the info from VMConnectionInfo.delete_info."""
     provider = delete_info[0]
 
@@ -175,9 +175,9 @@ def delete_cloud_vm(delete_info, dry_run=False):
             logger.info(f"[dry-run] cloudrift: terminate instance {instance_id}")
             return
         api_key = os.environ.get("CLOUDRIFT_API_KEY", "")
-        cr_provider.delete_instance(api_key, instance_id)
+        await cr_provider.delete_instance(api_key, instance_id)
 
     elif provider == "gcp":
         instance_name = delete_info[1]
         zone = delete_info[2]
-        gcp_provider.delete_instance(instance_name, zone, dry_run=dry_run)
+        await gcp_provider.delete_instance(instance_name, zone, dry_run=dry_run)
