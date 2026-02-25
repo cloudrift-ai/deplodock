@@ -17,6 +17,7 @@ class BenchmarkTask:
     recipe: Recipe
     gpu_name: str
     gpu_count: int
+    run_dir: Path | None = None
 
     @property
     def model_name(self) -> str:
@@ -27,10 +28,10 @@ class BenchmarkTask:
         """Basename of the recipe directory (e.g. 'Qwen3-Coder-30B-A3B-Instruct-AWQ')."""
         return os.path.basename(self.recipe_dir)
 
-    def result_path(self, run_dir) -> Path:
-        """Full result path: run_dir / recipe_name / {variant}_{engine}_benchmark.txt."""
+    def result_path(self) -> Path:
+        """Full result path: run_dir / {variant}_{engine}_benchmark.txt."""
         engine = self.recipe.engine.llm.engine_name
-        return Path(run_dir) / self.recipe_name / f"{self.variant}_{engine}_benchmark.txt"
+        return self.run_dir / f"{self.variant}_{engine}_benchmark.txt"
 
 
 @dataclass

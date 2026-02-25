@@ -46,32 +46,30 @@ def handle_bench(args):
         root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
 
-    # Create run directory
-    if args.output_dir:
-        local_results_dir = _expand_path(args.output_dir)
-    elif len(args.recipes) == 1:
-        local_results_dir = str(Path(args.recipes[0]).resolve())
-    else:
-        local_results_dir = _expand_path(config["benchmark"]["local_results_dir"])
-    run_dir = create_run_dir(local_results_dir)
+    # Create per-recipe run directories
+    recipe_run_dirs = {}
+    for recipe_dir in args.recipes:
+        resolved = str(Path(recipe_dir).resolve())
+        if resolved not in recipe_run_dirs:
+            recipe_run_dirs[resolved] = create_run_dir(resolved)
 
-    # Attach file handler now that run_dir exists
-    log_file_path = add_file_handler(run_dir)
-    root_logger.info(f"Logging to: {log_file_path}")
-    root_logger.info(f"Run directory: {run_dir}")
-    root_logger.info("")
-
-    # Copy recipe files into run directory
-    seen_recipes = set()
+    # Assign run_dir to each task and copy recipe files
     for task in tasks:
-        rname = task.recipe_name
-        if rname not in seen_recipes:
-            seen_recipes.add(rname)
-            recipe_subdir = run_dir / rname
-            recipe_subdir.mkdir(parents=True, exist_ok=True)
-            src = Path(task.recipe_dir) / "recipe.yaml"
-            if src.exists():
-                shutil.copy2(str(src), str(recipe_subdir / "recipe.yaml"))
+        resolved = str(Path(task.recipe_dir).resolve())
+        task.run_dir = recipe_run_dirs[resolved]
+        src = Path(task.recipe_dir) / "recipe.yaml"
+        dest = task.run_dir / "recipe.yaml"
+        if src.exists() and not dest.exists():
+            shutil.copy2(str(src), str(dest))
+
+    # Attach file handlers for each run directory
+    log_file_paths = []
+    for run_dir in recipe_run_dirs.values():
+        log_file_paths.append(add_file_handler(run_dir))
+
+    for run_dir in recipe_run_dirs.values():
+        root_logger.info(f"Run directory: {run_dir}")
+    root_logger.info("")
 
     # Plan execution groups
     planner = GroupByModelAndGpuPlanner()
@@ -82,7 +80,7 @@ def handle_bench(args):
     root_logger.info("")
 
     # Run groups
-    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, run_dir, dry_run, args.max_workers, no_teardown))
+    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown))
 
     # Flatten results, handling exceptions
     all_task_meta = []
@@ -91,25 +89,28 @@ def handle_bench(args):
         if isinstance(r, Exception):
             root_logger.error(f"Group {i} generated an exception: {r}")
             for task in groups[i].tasks:
-                all_task_meta.append(_task_meta(task, run_dir, status="failed"))
+                all_task_meta.append(_task_meta(task, status="failed"))
         else:
             task_meta_list, instance_info = r
             all_task_meta.extend(task_meta_list)
             if instance_info is not None:
                 all_instance_infos.append(instance_info)
 
-    # Write instances.json if any VMs were kept alive
-    if all_instance_infos:
-        instances_path = run_dir / "instances.json"
-        instances_path.write_text(json.dumps(all_instance_infos, indent=2))
-        root_logger.info(f"Instance info saved to: {instances_path}")
-        root_logger.info("Run 'deplodock teardown <run_dir>' to clean up.")
-
-    # Write manifest
+    # Write per-recipe manifests and instances.json
     code_hash = compute_code_hash()
     timestamp = datetime.now().isoformat(timespec="seconds")
-    write_manifest(run_dir, timestamp, code_hash, sorted(seen_recipes), all_task_meta)
-    root_logger.info(f"Manifest written to: {run_dir / 'manifest.json'}")
+
+    for resolved, run_dir in recipe_run_dirs.items():
+        recipe_name = Path(resolved).name
+        recipe_tasks = [t for t in all_task_meta if t["recipe"] == recipe_name]
+        write_manifest(run_dir, timestamp, code_hash, [recipe_name], recipe_tasks)
+        root_logger.info(f"Manifest written to: {run_dir / 'manifest.json'}")
+
+        if all_instance_infos:
+            instances_path = run_dir / "instances.json"
+            instances_path.write_text(json.dumps(all_instance_infos, indent=2))
+            root_logger.info(f"Instance info saved to: {instances_path}")
+            root_logger.info("Run 'deplodock teardown <run_dir>' to clean up.")
 
     # Print summary
     root_logger.info("")
@@ -131,7 +132,8 @@ def handle_bench(args):
 
     root_logger.info("")
     root_logger.info("All done!")
-    root_logger.info(f"Full logs saved to: {log_file_path}")
+    for p in log_file_paths:
+        root_logger.info(f"Full logs saved to: {p}")
 
 
 def register_bench_command(subparsers):
@@ -154,11 +156,6 @@ def register_bench_command(subparsers):
         "--config",
         default="config.yaml",
         help="Path to configuration file (default: config.yaml)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Output directory for results (default: {recipe_dir} for single recipe, config local_results_dir for multiple)",
     )
     parser.add_argument(
         "--max-workers",

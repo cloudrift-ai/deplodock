@@ -66,7 +66,7 @@ Test the full CLI pipeline end-to-end by invoking `deplodock` as a subprocess wi
 |------|--------|
 | `deploy/test_deploy_dryrun.py` | `deploy ssh`, `deploy local` — dry-run output, command sequence, variant resolution, teardown, CLI help |
 | `deploy/test_deploy_cloud_dryrun.py` | `deploy cloud` — dry-run output, deploy steps, error handling, CLI help |
-| `benchmark/test_bench_dryrun.py` | `bench` — dry-run output, deploy->benchmark->teardown sequence, variant filtering, `--no-teardown` flag, `--output-dir` flag, single-recipe output dir resolution, experiment recipe dry-run, CLI help; `teardown` — CLI help |
+| `benchmark/test_bench_dryrun.py` | `bench` — dry-run output, deploy->benchmark->teardown sequence, variant filtering, `--no-teardown` flag, per-recipe result directories, experiment recipe dry-run, CLI help; `teardown` — CLI help |
 | `provisioning/test_vm_dryrun.py` | `vm create/delete gcp`, `vm create/delete cloudrift` — dry-run output, argparse validation, CLI help |
 
 CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench_config`** (a factory for temporary `config.yaml` files). Both are defined in `conftest.py`.

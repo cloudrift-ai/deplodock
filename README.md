@@ -338,24 +338,22 @@ Benchmark parameters (`max_concurrency`, `num_prompts`, `random_input_len`, `ran
 ### Run Benchmarks
 
 ```bash
-deplodock bench recipes/*                                    # Run all recipes (uses config local_results_dir)
-deplodock bench experiments/.../optimal_mcr_rtx5090          # Single experiment (results alongside recipe)
-deplodock bench recipes/* --output-dir results/intermediate  # Explicit output directory
+deplodock bench recipes/*                                    # Run all recipes (results in each recipe dir)
+deplodock bench experiments/.../optimal_mcr_rtx5090          # Run an experiment
 deplodock bench recipes/* --max-workers 2                    # Limit parallel execution groups
 deplodock bench recipes/* --dry-run                          # Preview commands
 ```
 
-| Flag            | Default                      | Description                            |
-|-----------------|------------------------------|----------------------------------------|
-| `recipes`       | (required)                   | Recipe directories (positional args)   |
-| `--ssh-key`     | `~/.ssh/id_ed25519`          | SSH private key path                   |
-| `--config`      | `config.yaml`                | Path to configuration file             |
-| `--output-dir`  | `{recipe_dir}` or config     | Output directory for results           |
-| `--max-workers` | num groups                   | Max parallel execution groups          |
-| `--dry-run`     | false                        | Print commands without executing       |
-| `--no-teardown` | false                        | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
+| Flag            | Default             | Description                            |
+|-----------------|---------------------|----------------------------------------|
+| `recipes`       | (required)          | Recipe directories (positional args)   |
+| `--ssh-key`     | `~/.ssh/id_ed25519` | SSH private key path                   |
+| `--config`      | `config.yaml`       | Path to configuration file             |
+| `--max-workers` | num groups          | Max parallel execution groups          |
+| `--dry-run`     | false               | Print commands without executing       |
+| `--no-teardown` | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
 
-**Output directory resolution:** When a single recipe is passed, results are stored directly in `{recipe_dir}/` by default. When multiple recipes are passed, the `local_results_dir` from `config.yaml` is used. Use `--output-dir` to override either default.
+Results are always stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
 
 ### Teardown
 

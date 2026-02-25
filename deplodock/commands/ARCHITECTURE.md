@@ -113,13 +113,9 @@ Recipe dirs (positional args)
 enumerate_tasks() -> list[BenchmarkTask]
     |
     v
-Resolve output directory:
-    +-- --output-dir flag? -> use it
-    +-- single recipe? -> {recipe_dir}/
-    +-- multiple recipes? -> config local_results_dir
-    |
-    v
-create_run_dir(output_dir) -> timestamped run dir
+Create per-recipe run directories:
+    +-- for each recipe_dir: create_run_dir(recipe_dir)
+    +-- assign task.run_dir per task
     |
     v
 GroupByModelAndGpuPlanner.plan() -> list[ExecutionGroup]
