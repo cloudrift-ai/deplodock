@@ -5,6 +5,7 @@ ExecutionGroups that share VMs; groups run in parallel via asyncio.
 """
 
 import asyncio
+import json
 import logging
 import shutil
 import sys
@@ -15,6 +16,7 @@ from deplodock.benchmark import (
     _expand_path,
     _run_groups,
     _task_meta,
+    add_file_handler,
     compute_code_hash,
     create_run_dir,
     enumerate_tasks,
@@ -28,16 +30,15 @@ from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
 def handle_bench(args):
     """Handle the bench command."""
-    log_file_path = setup_logging()
+    setup_logging()
     root_logger = logging.getLogger()
-    root_logger.info(f"Logging to: {log_file_path}")
-    root_logger.info("")
 
     config = load_config(args.config)
     validate_config(config)
 
     ssh_key = _expand_path(args.ssh_key)
     dry_run = args.dry_run
+    no_teardown = args.no_teardown
 
     # Enumerate tasks from recipe dirs
     tasks = enumerate_tasks(args.recipes, variants_filter=args.variants)
@@ -48,7 +49,12 @@ def handle_bench(args):
     # Create run directory
     local_results_dir = _expand_path(config["benchmark"]["local_results_dir"])
     run_dir = create_run_dir(local_results_dir)
+
+    # Attach file handler now that run_dir exists
+    log_file_path = add_file_handler(run_dir)
+    root_logger.info(f"Logging to: {log_file_path}")
     root_logger.info(f"Run directory: {run_dir}")
+    root_logger.info("")
 
     # Copy recipe files into run directory
     seen_recipes = set()
@@ -71,17 +77,28 @@ def handle_bench(args):
     root_logger.info("")
 
     # Run groups
-    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, run_dir, dry_run, args.max_workers))
+    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, run_dir, dry_run, args.max_workers, no_teardown))
 
     # Flatten results, handling exceptions
     all_task_meta = []
+    all_instance_infos = []
     for i, r in enumerate(raw_results):
         if isinstance(r, Exception):
             root_logger.error(f"Group {i} generated an exception: {r}")
             for task in groups[i].tasks:
                 all_task_meta.append(_task_meta(task, run_dir, status="failed"))
         else:
-            all_task_meta.extend(r)
+            task_meta_list, instance_info = r
+            all_task_meta.extend(task_meta_list)
+            if instance_info is not None:
+                all_instance_infos.append(instance_info)
+
+    # Write instances.json if any VMs were kept alive
+    if all_instance_infos:
+        instances_path = run_dir / "instances.json"
+        instances_path.write_text(json.dumps(all_instance_infos, indent=2))
+        root_logger.info(f"Instance info saved to: {instances_path}")
+        root_logger.info("Run 'deplodock teardown <run_dir>' to clean up.")
 
     # Write manifest
     code_hash = compute_code_hash()
@@ -149,5 +166,10 @@ def register_bench_command(subparsers):
         "--dry-run",
         action="store_true",
         help="Print commands without executing",
+    )
+    parser.add_argument(
+        "--no-teardown",
+        action="store_true",
+        help="Skip teardown and VM deletion after benchmarks (save instance info for later cleanup)",
     )
     parser.set_defaults(func=handle_bench)
