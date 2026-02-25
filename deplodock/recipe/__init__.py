@@ -1,9 +1,23 @@
 """Recipe loading and configuration."""
 
 from deplodock.recipe.engines import banned_extra_arg_flags, build_engine_args
-from deplodock.recipe.recipe import deep_merge, load_recipe, validate_extra_args
+from deplodock.recipe.matrix import (
+    PARAM_ABBREVIATIONS,
+    build_override,
+    dot_to_nested,
+    expand_matrix_entry,
+    matrix_label,
+)
+from deplodock.recipe.recipe import (
+    _load_raw_config,
+    _validate_and_build,
+    deep_merge,
+    load_recipe,
+    validate_extra_args,
+)
 from deplodock.recipe.types import (
     BenchmarkConfig,
+    DeployConfig,
     EngineConfig,
     LLMConfig,
     ModelConfig,
@@ -14,15 +28,23 @@ from deplodock.recipe.types import (
 
 __all__ = [
     "BenchmarkConfig",
+    "DeployConfig",
     "EngineConfig",
     "LLMConfig",
     "ModelConfig",
+    "PARAM_ABBREVIATIONS",
     "Recipe",
     "SglangConfig",
     "VllmConfig",
+    "_load_raw_config",
+    "_validate_and_build",
     "banned_extra_arg_flags",
     "build_engine_args",
+    "build_override",
     "deep_merge",
+    "dot_to_nested",
+    "expand_matrix_entry",
     "load_recipe",
+    "matrix_label",
     "validate_extra_args",
 ]

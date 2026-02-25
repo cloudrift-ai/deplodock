@@ -43,7 +43,6 @@ make setup
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --variant 8xH200 \
   --server user@host
 ```
 
@@ -51,8 +50,7 @@ deplodock deploy ssh \
 
 ```bash
 deplodock deploy local \
-  --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ \
-  --variant RTX5090
+  --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ
 ```
 
 ### Teardown
@@ -71,14 +69,13 @@ Preview commands without executing:
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --variant 8xH200 \
   --server user@host \
   --dry-run
 ```
 
 ## Recipes
 
-Recipes are declarative YAML configs in `recipes/<model>/recipe.yaml`. Each recipe defines a model, engine settings, and hardware variants.
+Recipes are declarative YAML configs in `recipes/<model>/recipe.yaml`. Each recipe defines a model, engine settings, and a `matrices` section for benchmark configurations.
 
 ### Format
 
@@ -103,38 +100,56 @@ benchmark:
   random_input_len: 8000
   random_output_len: 8000
 
-variants:
-  8xH200: {}                    # Uses defaults
-  8xH100:
-    engine:
-      llm:
-        max_concurrent_requests: 256        # Override for this hardware
-    benchmark:                              # Per-variant benchmark override
-      max_concurrency: 64
+matrices:
+  # Simple single-point entry
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 8
+
+  # Override engine and benchmark settings
+  - deploy.gpu: "NVIDIA H100 80GB"
+    deploy.gpu_count: 8
+    engine.llm.max_concurrent_requests: 256
+    benchmark.max_concurrency: 64
+
+  # Concurrency sweep (8 runs from one entry)
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    benchmark.max_concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
+
+  # Correlated engine+bench sweep (3 zip runs)
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    engine.llm.max_concurrent_requests: [128, 256, 512]
+    benchmark.max_concurrency: [128, 256, 512]
 ```
+
+Matrix entries use **dot-notation** for all parameter paths. Scalars are broadcast; lists are zipped (all lists in one entry must have the same length). `deploy.gpu` is required in each entry.
 
 Engine-agnostic fields (`tensor_parallel_size`, `context_length`, etc.) live at `engine.llm`. Engine-specific fields (`image`, `extra_args`) nest under `engine.llm.vllm` or `engine.llm.sglang`.
 
-### SGLang Variant Example
+### SGLang Matrix Entry Example
 
-To add an SGLang variant alongside vLLM variants, add a `sglang` key under `engine.llm` in the variant:
+To benchmark with SGLang alongside vLLM, add a matrix entry with `engine.llm.sglang.*` overrides:
 
 ```yaml
-variants:
-  RTX5090:
-    gpu: "NVIDIA GeForce RTX 5090"
-    gpu_count: 1
-  RTX5090_sglang:
-    gpu: "NVIDIA GeForce RTX 5090"
-    gpu_count: 1
-    engine:
-      llm:
-        sglang:
-          image: "lmsysorg/sglang:latest"
-          extra_args: "--quantization moe_wna16"  # Required for AWQ MoE models
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    engine.llm.sglang.image: "lmsysorg/sglang:latest"
+    engine.llm.sglang.extra_args: "--quantization moe_wna16"  # Required for AWQ MoE models
 ```
 
 For AWQ-quantized MoE models on SGLang, `--quantization moe_wna16` is required in `extra_args`. See [docs/sglang-awq-moe.md](docs/sglang-awq-moe.md) for details.
+
+### Optional Deploy Section
+
+For `deploy cloud` (which needs GPU info without matrix expansion), add a `deploy` section to the base recipe:
+
+```yaml
+deploy:
+  gpu: "NVIDIA GeForce RTX 5090"
+  gpu_count: 1
+```
 
 ### Named Fields → CLI Flags
 
@@ -155,7 +170,7 @@ These flags must **not** appear in `extra_args` — `load_recipe()` validates th
 Runs docker compose directly on the current machine.
 
 ```bash
-deplodock deploy local --recipe <path> [--variant <name>] [--dry-run]
+deplodock deploy local --recipe <path> [--dry-run]
 ```
 
 ### SSH
@@ -163,15 +178,15 @@ deplodock deploy local --recipe <path> [--variant <name>] [--dry-run]
 Deploys to a remote server via SSH + SCP.
 
 ```bash
-deplodock deploy ssh --recipe <path> --server user@host [--variant <name>] [--dry-run]
+deplodock deploy ssh --recipe <path> --server user@host [--dry-run]
 ```
 
 ### Cloud
 
-Provisions a cloud VM based on recipe GPU requirements, then deploys via SSH.
+Provisions a cloud VM based on recipe GPU requirements (from the `deploy` section), then deploys via SSH.
 
 ```bash
-deplodock deploy cloud --recipe <path> --variant <name> [--name <vm-name>] [--dry-run]
+deplodock deploy cloud --recipe <path> [--name <vm-name>] [--dry-run]
 ```
 
 ### Common Flags
@@ -179,7 +194,6 @@ deplodock deploy cloud --recipe <path> --variant <name> [--name <vm-name>] [--dr
 | Flag          | Required  | Default       | Description                          |
 |---------------|-----------|---------------|--------------------------------------|
 | `--recipe`    | Yes       | -             | Path to recipe directory             |
-| `--variant`   | No        | -             | Hardware variant (e.g. 8xH200)       |
 | `--hf-token`  | No        | `$HF_TOKEN`   | HuggingFace token                    |
 | `--model-dir` | No        | `/mnt/models` | Model cache dir                      |
 | `--teardown`  | No        | false         | Stop containers instead of deploying |
@@ -302,7 +316,6 @@ Benchmark parameters (`max_concurrency`, `num_prompts`, `random_input_len`, `ran
 ```bash
 deplodock bench recipes/*                                    # Run all recipes
 deplodock bench recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ    # Run a specific recipe
-deplodock bench recipes/* --variants RTX5090 H200            # Run specific variants only
 deplodock bench recipes/* --max-workers 2                    # Limit parallel execution groups
 deplodock bench recipes/* --dry-run                          # Preview commands
 ```
@@ -310,7 +323,6 @@ deplodock bench recipes/* --dry-run                          # Preview commands
 | Flag            | Default             | Description                            |
 |-----------------|---------------------|----------------------------------------|
 | `recipes`       | (required)          | Recipe directories (positional args)   |
-| `--variants`    | all                 | Variant names to run (space-separated) |
 | `--ssh-key`     | `~/.ssh/id_ed25519` | SSH private key path                   |
 | `--config`      | `config.yaml`       | Path to configuration file             |
 | `--max-workers` | num groups          | Max parallel execution groups          |

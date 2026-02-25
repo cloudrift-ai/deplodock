@@ -18,54 +18,30 @@ benchmark:
   random_input_len: 8000
   random_output_len: 8000
 
-variants:
-  B200:
-    gpu: "NVIDIA B200"
-    gpu_count: 1
-    benchmark:
-      max_concurrency: 256
-      num_prompts: 512
-  H200:
-    gpu: "NVIDIA H200 141GB"
-    gpu_count: 1
-    benchmark:
-      max_concurrency: 256
-      num_prompts: 512
-  H100:
-    gpu: "NVIDIA H100 80GB"
-    gpu_count: 1
-    engine:
-      llm:
-        vllm:
-          extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
-  Pro6000:
-    gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
-    gpu_count: 1
-    engine:
-      llm:
-        vllm:
-          extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
-  4xRTX5090:
-    gpu: "NVIDIA GeForce RTX 5090"
-    gpu_count: 4
-    engine:
-      llm:
-        pipeline_parallel_size: 4
-        vllm:
-          extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
-  4xRTX4090:
-    gpu: "NVIDIA GeForce RTX 4090"
-    gpu_count: 4
-    engine:
-      llm:
-        pipeline_parallel_size: 4
-        vllm:
-          extra_args: "--dtype float16 --tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel"
-  2xL40S:
-    gpu: "NVIDIA L40S"
-    gpu_count: 2
-    engine:
-      llm:
-        pipeline_parallel_size: 2
-        vllm:
-          extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
+matrices:
+  - deploy.gpu: "NVIDIA B200"
+    deploy.gpu_count: 1
+    benchmark.max_concurrency: 256
+    benchmark.num_prompts: 512
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 1
+    benchmark.max_concurrency: 256
+    benchmark.num_prompts: 512
+  - deploy.gpu: "NVIDIA H100 80GB"
+    deploy.gpu_count: 1
+    engine.llm.vllm.extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
+    deploy.gpu_count: 1
+    engine.llm.vllm.extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 4
+    engine.llm.pipeline_parallel_size: 4
+    engine.llm.vllm.extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"
+  - deploy.gpu: "NVIDIA GeForce RTX 4090"
+    deploy.gpu_count: 4
+    engine.llm.pipeline_parallel_size: 4
+    engine.llm.vllm.extra_args: "--dtype float16 --tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel"
+  - deploy.gpu: "NVIDIA L40S"
+    deploy.gpu_count: 2
+    engine.llm.pipeline_parallel_size: 2
+    engine.llm.vllm.extra_args: "--tool-call-parser glm45 --reasoning-parser glm45 --enable-expert-parallel --kv-cache-dtype fp8"

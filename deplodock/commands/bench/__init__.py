@@ -41,7 +41,7 @@ def handle_bench(args):
     no_teardown = args.no_teardown
 
     # Enumerate tasks from recipe dirs
-    tasks = enumerate_tasks(args.recipes, variants_filter=args.variants)
+    tasks = enumerate_tasks(args.recipes)
     if not tasks:
         root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
@@ -139,12 +139,6 @@ def register_bench_command(subparsers):
         "recipes",
         nargs="+",
         help="Recipe directories to benchmark",
-    )
-    parser.add_argument(
-        "--variants",
-        nargs="+",
-        default=None,
-        help="Variant names to run (default: all variants in each recipe)",
     )
     parser.add_argument(
         "--ssh-key",

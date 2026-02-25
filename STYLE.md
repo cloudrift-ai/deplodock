@@ -30,8 +30,8 @@ Use triple-quote docstrings for modules and public functions. Keep them
 to one line when the purpose is obvious:
 
 ```python
-def load_recipe(recipe_dir, variant=None):
-    """Load recipe.yaml from recipe_dir, optionally deep-merging a variant."""
+def load_recipe(recipe_dir):
+    """Load recipe.yaml and return base Recipe (no matrix expansion)."""
 ```
 
 Use `Args:` / `Returns:` sections only when parameters or return values

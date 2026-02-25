@@ -33,13 +33,13 @@ def resolve_vm_spec(loaded_configs, server_name=None):
 
     for entry, recipe in loaded_configs:
         recipe_path = entry["recipe"]
-        variant = entry.get("variant")
+        variant = entry.get("variant", "")
 
-        entry_gpu = recipe.gpu
-        entry_gpu_count = recipe.gpu_count
+        entry_gpu = recipe.deploy.gpu
+        entry_gpu_count = recipe.deploy.gpu_count
 
         if entry_gpu is None:
-            raise ValueError(f"Recipe '{recipe_path}' variant '{variant}' is missing 'gpu' field")
+            raise ValueError(f"Recipe '{recipe_path}' variant '{variant}' is missing 'deploy.gpu' field")
 
         if gpu_name is None:
             gpu_name = entry_gpu

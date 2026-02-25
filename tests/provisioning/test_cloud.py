@@ -1,7 +1,5 @@
 """Unit tests for deploy/cloud module: resolve_vm_spec, provision_cloud_vm, delete_cloud_vm."""
 
-import os
-
 import pytest
 import yaml
 
@@ -14,7 +12,7 @@ def _load_entries(entries):
     """Pre-load recipe configs from raw entries for resolve_vm_spec."""
     loaded = []
     for entry in entries:
-        config = load_recipe(entry["recipe"], variant=entry.get("variant"))
+        config = load_recipe(entry["recipe"])
         loaded.append((entry, config))
     return loaded
 
@@ -22,8 +20,24 @@ def _load_entries(entries):
 # ── resolve_vm_spec ──────────────────────────────────────────────
 
 
-def test_resolve_vm_spec_single_recipe(recipes_dir):
-    entries = [{"recipe": os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"), "variant": "RTX5090"}]
+def test_resolve_vm_spec_single_recipe(tmp_path):
+    recipe = {
+        "model": {"huggingface": "test/model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 1,
+                "vllm": {"image": "vllm/vllm-openai:latest"},
+            }
+        },
+        "deploy": {
+            "gpu": "NVIDIA GeForce RTX 5090",
+            "gpu_count": 1,
+        },
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+
+    entries = [{"recipe": str(tmp_path)}]
     gpu_name, gpu_count = resolve_vm_spec(_load_entries(entries))
     assert gpu_name == "NVIDIA GeForce RTX 5090"
     assert gpu_count == 1
@@ -31,30 +45,29 @@ def test_resolve_vm_spec_single_recipe(recipes_dir):
 
 def test_resolve_vm_spec_max_gpu_count(tmp_path):
     """Uses max gpu_count across all entries."""
-    recipe = {
+    r1 = tmp_path / "r1"
+    r1.mkdir()
+    recipe1 = {
         "model": {"huggingface": "test/model"},
-        "engine": {
-            "llm": {
-                "tensor_parallel_size": 1,
-                "pipeline_parallel_size": 1,
-                "gpu_memory_utilization": 0.9,
-                "vllm": {
-                    "image": "vllm/vllm-openai:latest",
-                    "extra_args": "",
-                },
-            }
-        },
-        "variants": {
-            "1x": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
-            "2x": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 2},
-        },
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:latest"}}},
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
     }
-    with open(tmp_path / "recipe.yaml", "w") as f:
-        yaml.dump(recipe, f)
+    with open(r1 / "recipe.yaml", "w") as f:
+        yaml.dump(recipe1, f)
+
+    r2 = tmp_path / "r2"
+    r2.mkdir()
+    recipe2 = {
+        "model": {"huggingface": "test/model"},
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:latest"}}},
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 2},
+    }
+    with open(r2 / "recipe.yaml", "w") as f:
+        yaml.dump(recipe2, f)
 
     entries = [
-        {"recipe": str(tmp_path), "variant": "1x"},
-        {"recipe": str(tmp_path), "variant": "2x"},
+        {"recipe": str(r1)},
+        {"recipe": str(r2)},
     ]
     gpu_name, gpu_count = resolve_vm_spec(_load_entries(entries))
     assert gpu_name == "NVIDIA GeForce RTX 5090"
@@ -63,48 +76,42 @@ def test_resolve_vm_spec_max_gpu_count(tmp_path):
 
 def test_resolve_vm_spec_mixed_gpus_raises(tmp_path):
     """Raises ValueError when recipes target different GPUs."""
-    recipe = {
+    r1 = tmp_path / "r1"
+    r1.mkdir()
+    recipe1 = {
         "model": {"huggingface": "test/model"},
-        "engine": {
-            "llm": {
-                "tensor_parallel_size": 1,
-                "pipeline_parallel_size": 1,
-                "gpu_memory_utilization": 0.9,
-                "vllm": {
-                    "image": "vllm/vllm-openai:latest",
-                    "extra_args": "",
-                },
-            }
-        },
-        "variants": {
-            "rtx": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
-            "h100": {"gpu": "NVIDIA H100 80GB", "gpu_count": 1},
-        },
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:latest"}}},
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
     }
-    with open(tmp_path / "recipe.yaml", "w") as f:
-        yaml.dump(recipe, f)
+    with open(r1 / "recipe.yaml", "w") as f:
+        yaml.dump(recipe1, f)
+
+    r2 = tmp_path / "r2"
+    r2.mkdir()
+    recipe2 = {
+        "model": {"huggingface": "test/model"},
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:latest"}}},
+        "deploy": {"gpu": "NVIDIA H100 80GB", "gpu_count": 1},
+    }
+    with open(r2 / "recipe.yaml", "w") as f:
+        yaml.dump(recipe2, f)
 
     entries = [
-        {"recipe": str(tmp_path), "variant": "rtx"},
-        {"recipe": str(tmp_path), "variant": "h100"},
+        {"recipe": str(r1)},
+        {"recipe": str(r2)},
     ]
     with pytest.raises(ValueError, match="mixed GPUs"):
         resolve_vm_spec(_load_entries(entries), server_name="test")
 
 
 def test_resolve_vm_spec_missing_gpu_raises(tmp_path):
-    """Raises ValueError when recipe has no gpu field."""
+    """Raises ValueError when recipe has no deploy.gpu field."""
     recipe = {
         "model": {"huggingface": "test/model"},
         "engine": {
             "llm": {
                 "tensor_parallel_size": 1,
-                "pipeline_parallel_size": 1,
-                "gpu_memory_utilization": 0.9,
-                "vllm": {
-                    "image": "vllm/vllm-openai:latest",
-                    "extra_args": "",
-                },
+                "vllm": {"image": "vllm/vllm-openai:latest"},
             }
         },
     }
@@ -112,7 +119,7 @@ def test_resolve_vm_spec_missing_gpu_raises(tmp_path):
         yaml.dump(recipe, f)
 
     entries = [{"recipe": str(tmp_path)}]
-    with pytest.raises(ValueError, match="missing 'gpu' field"):
+    with pytest.raises(ValueError, match="missing 'deploy.gpu' field"):
         resolve_vm_spec(_load_entries(entries))
 
 

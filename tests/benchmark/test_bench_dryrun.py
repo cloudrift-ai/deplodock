@@ -9,8 +9,6 @@ def test_bench_dry_run_basic(run_cli, make_bench_config, recipes_dir, tmp_path):
     rc, stdout, stderr = run_cli(
         "bench",
         recipe,
-        "--variants",
-        "RTX5090",
         "--config",
         config_path,
         "--dry-run",
@@ -25,8 +23,6 @@ def test_bench_dry_run_deploy_then_benchmark(run_cli, make_bench_config, recipes
     rc, stdout, stderr = run_cli(
         "bench",
         recipe,
-        "--variants",
-        "RTX5090",
         "--config",
         config_path,
         "--dry-run",
@@ -38,7 +34,7 @@ def test_bench_dry_run_deploy_then_benchmark(run_cli, make_bench_config, recipes
     assert "docker compose up" in stdout
 
     # Verify benchmark step appears with recipe params
-    assert "vllm bench serve" in stdout
+    assert "bench serve" in stdout
     assert "--random-input-len 4000" in stdout
     assert "--random-output-len 4000" in stdout
 
@@ -47,24 +43,8 @@ def test_bench_dry_run_deploy_then_benchmark(run_cli, make_bench_config, recipes
 
     # Verify order: pull before bench, bench before teardown
     pull_idx = stdout.index("docker compose pull")
-    bench_idx = stdout.index("vllm bench serve")
+    bench_idx = stdout.index("bench serve")
     assert pull_idx < bench_idx
-
-
-def test_bench_variant_filter(run_cli, make_bench_config, recipes_dir, tmp_path):
-    config_path = make_bench_config(tmp_path)
-    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
-    rc, stdout, stderr = run_cli(
-        "bench",
-        recipe,
-        "--variants",
-        "RTX5090",
-        "--config",
-        config_path,
-        "--dry-run",
-    )
-    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
-    assert "RTX5090" in stdout
 
 
 def test_bench_multiple_recipes(run_cli, make_bench_config, recipes_dir, tmp_path):
@@ -75,13 +55,10 @@ def test_bench_multiple_recipes(run_cli, make_bench_config, recipes_dir, tmp_pat
         "bench",
         recipe1,
         recipe2,
-        "--variants",
-        "RTX5090",
         "--config",
         config_path,
         "--dry-run",
     )
-    # Should succeed even if some variants are missing (warned on stderr)
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
 
 
@@ -91,8 +68,6 @@ def test_bench_no_teardown_dry_run(run_cli, make_bench_config, recipes_dir, tmp_
     rc, stdout, stderr = run_cli(
         "bench",
         recipe,
-        "--variants",
-        "RTX5090",
         "--config",
         config_path,
         "--dry-run",
@@ -101,7 +76,7 @@ def test_bench_no_teardown_dry_run(run_cli, make_bench_config, recipes_dir, tmp_
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
 
     # With --no-teardown, per-task teardown should be skipped
-    assert "vllm bench serve" in stdout
+    assert "bench serve" in stdout
     assert "Tearing down..." not in stdout
     assert "Skipping VM deletion (--no-teardown)" in stdout
 
@@ -110,7 +85,6 @@ def test_bench_help(run_cli):
     rc, stdout, _ = run_cli("bench", "--help")
     assert rc == 0
     assert "recipes" in stdout
-    assert "--variants" in stdout
     assert "--ssh-key" in stdout
     assert "--dry-run" in stdout
     assert "--config" in stdout
