@@ -113,6 +113,11 @@ Recipe dirs (positional args)
 enumerate_tasks() -> list[BenchmarkTask]
     |
     v
+Create per-recipe run directories:
+    +-- for each recipe_dir: create_run_dir(recipe_dir)
+    +-- assign task.run_dir per task
+    |
+    v
 GroupByModelAndGpuPlanner.plan() -> list[ExecutionGroup]
     |
     v

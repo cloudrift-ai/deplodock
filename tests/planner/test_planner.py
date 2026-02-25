@@ -44,9 +44,10 @@ def test_task_result_path():
         recipe=Recipe(model=ModelConfig(huggingface="org/my-model")),
         gpu_name="NVIDIA GeForce RTX 5090",
         gpu_count=1,
+        run_dir=Path("/run/123"),
     )
-    result = task_obj.result_path(Path("/run/123"))
-    assert result == Path("/run/123/MyModel/rtx5090_vllm_benchmark.txt")
+    result = task_obj.result_path()
+    assert result == Path("/run/123/rtx5090_vllm_benchmark.txt")
 
 
 def test_task_result_path_with_matrix_label():
@@ -56,9 +57,10 @@ def test_task_result_path_with_matrix_label():
         recipe=Recipe(model=ModelConfig(huggingface="org/my-model")),
         gpu_name="NVIDIA GeForce RTX 5090",
         gpu_count=1,
+        run_dir=Path("/run/123"),
     )
-    result = task_obj.result_path(Path("/run/123"))
-    assert result == Path("/run/123/MyModel/rtx5090_c128_vllm_benchmark.txt")
+    result = task_obj.result_path()
+    assert result == Path("/run/123/rtx5090_c128_vllm_benchmark.txt")
 
 
 # ── GroupByModelAndGpuPlanner ─────────────────────────────────────
