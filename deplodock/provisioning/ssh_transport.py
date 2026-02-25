@@ -1,9 +1,11 @@
 """SSH transport: run commands and write files on remote servers via SSH/SCP."""
 
+import logging
 import os
 import subprocess
-import sys
 import tempfile
+
+logger = logging.getLogger(__name__)
 
 REMOTE_DEPLOY_DIR = "~/deploy"
 
@@ -30,7 +32,7 @@ def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
         else:
             full_cmd = f"cd {REMOTE_DEPLOY_DIR} && {command}"
         if dry_run:
-            print(f"[dry-run] ssh {server}: {full_cmd}")
+            logger.info(f"[dry-run] ssh {server}: {full_cmd}")
             return 0, "", ""
 
         ssh_args = ssh_base_args(server, ssh_key, ssh_port)
@@ -47,7 +49,7 @@ def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
             stderr = "" if stream else (result.stderr or "")
             return result.returncode, stdout, stderr
         except Exception as e:
-            print(f"Error running SSH command: {e}", file=sys.stderr)
+            logger.error(f"Error running SSH command: {e}")
             return 1, "", ""
 
     return run_cmd
@@ -72,7 +74,7 @@ def make_write_file(server, ssh_key, ssh_port, dry_run=False):
     def write_file(path, content):
         remote_path = f"{REMOTE_DEPLOY_DIR}/{path}"
         if dry_run:
-            print(f"[dry-run] scp {path} -> {server}:{remote_path}")
+            logger.info(f"[dry-run] scp {path} -> {server}:{remote_path}")
             return
 
         # Write to a temp file locally, then SCP
@@ -83,7 +85,7 @@ def make_write_file(server, ssh_key, ssh_port, dry_run=False):
         try:
             rc, stderr = scp_file(tmp_path, server, ssh_key, ssh_port, remote_path)
             if rc != 0:
-                print(f"Failed to SCP {path} to {server}:{remote_path}: {stderr}", file=sys.stderr)
+                logger.error(f"Failed to SCP {path} to {server}:{remote_path}: {stderr}")
         finally:
             os.unlink(tmp_path)
 

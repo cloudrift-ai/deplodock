@@ -6,6 +6,7 @@ Tools for deploying and benchmarking LLM inference on GPU servers. Supports **vL
 
 - [deplodock/](deplodock/) — Python package
   - [deplodock.py](deplodock/deplodock.py) — CLI entrypoint
+  - [logging_setup.py](deplodock/logging_setup.py) — CLI logging configuration
   - [hardware.py](deplodock/hardware.py) — GPU specs and instance type mapping
   - [commands/](deplodock/commands/) — CLI layer (thin argparse handlers, see [ARCHITECTURE.md](deplodock/commands/ARCHITECTURE.md))
     - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands

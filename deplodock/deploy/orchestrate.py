@@ -1,6 +1,6 @@
 """Deploy orchestration: run_deploy, run_teardown, deploy, teardown."""
 
-import sys
+import logging
 import time
 
 from deplodock.deploy.compose import (
@@ -11,6 +11,8 @@ from deplodock.deploy.compose import (
 from deplodock.deploy.params import DeployParams
 from deplodock.provisioning.ssh_transport import make_run_cmd, make_write_file
 from deplodock.recipe.types import Recipe
+
+logger = logging.getLogger(__name__)
 
 
 def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, dry_run=False, gpu_device_ids=None):
@@ -43,14 +45,14 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
     port = 8080 if num_instances > 1 else 8000
 
     # Step 1: Pull images
-    print("Pulling images...")
+    logger.info("Pulling images...")
     rc, _, _ = run_cmd("docker compose pull")
     if rc != 0:
-        print("Failed to pull images", file=sys.stderr)
+        logger.error("Failed to pull images")
         return False
 
     # Step 2: Download model via huggingface-cli in container
-    print(f"Downloading model {model_name}...")
+    logger.info(f"Downloading model {model_name}...")
     dl_cmd = (
         f"docker run --rm"
         f" -e HUGGING_FACE_HUB_TOKEN={hf_token}"
@@ -62,24 +64,24 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
     )
     rc, _, _ = run_cmd(dl_cmd)
     if rc != 0:
-        print("Failed to download model", file=sys.stderr)
+        logger.error("Failed to download model")
         return False
 
     # Step 3: Clean up old containers
-    print("Cleaning up old containers...")
+    logger.info("Cleaning up old containers...")
     run_cmd("docker compose down")
 
     # Step 4: Start services
-    print("Starting services...")
+    logger.info("Starting services...")
     rc, _, _ = run_cmd("docker compose up -d --wait --wait-timeout 1800")
     if rc != 0:
-        print("Failed to start services", file=sys.stderr)
-        print("Container logs:", file=sys.stderr)
+        logger.error("Failed to start services")
+        logger.error("Container logs:")
         run_cmd("docker compose logs --tail=100")
         return False
 
     # Step 5: Poll health
-    print("Waiting for health check...")
+    logger.info("Waiting for health check...")
     health_url = f"http://localhost:{port}/health"
     timeout = 1800  # 30 minutes
     interval = 10
@@ -93,19 +95,19 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
         time.sleep(interval)
         elapsed += interval
     else:
-        print(f"Health check timed out after {timeout}s", file=sys.stderr)
+        logger.error(f"Health check timed out after {timeout}s")
         return False
 
     # Step 6: Print endpoint info
     status = "dry-run (not deployed)" if dry_run else "deployed"
-    print(f"\nEndpoint: http://{host}:{port}/v1")
-    print(f"Model: {model_name}")
-    print(f"Instances: {num_instances}")
-    print(f"Status: {status}")
+    logger.info(f"\nEndpoint: http://{host}:{port}/v1")
+    logger.info(f"Model: {model_name}")
+    logger.info(f"Instances: {num_instances}")
+    logger.info(f"Status: {status}")
 
     # Step 7: Smoke test inference
     if not dry_run:
-        print("\nRunning smoke test...")
+        logger.info("\nRunning smoke test...")
         smoke_cmd = (
             f"curl -sf http://localhost:{port}/v1/chat/completions"
             f" -H 'Content-Type: application/json'"
@@ -113,13 +115,13 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
         )
         rc, _, _ = run_cmd(smoke_cmd, stream=False)
         if rc == 0:
-            print("Smoke test passed.")
+            logger.info("Smoke test passed.")
         else:
-            print("WARNING: Smoke test failed. The endpoint may not be ready yet.", file=sys.stderr)
+            logger.warning("WARNING: Smoke test failed. The endpoint may not be ready yet.")
 
     # Print curl example
-    print("\nExample curl:")
-    print(
+    logger.info("\nExample curl:")
+    logger.info(
         f"  curl http://{host}:{port}/v1/chat/completions \\\n"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\n"
@@ -134,12 +136,12 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
 
 def run_teardown(run_cmd):
     """Tear down: docker compose down."""
-    print("Tearing down...")
+    logger.info("Tearing down...")
     rc, _, _ = run_cmd("docker compose down")
     if rc == 0:
-        print("Teardown complete.")
+        logger.info("Teardown complete.")
     else:
-        print("Teardown failed.", file=sys.stderr)
+        logger.error("Teardown failed.")
     return rc == 0
 
 

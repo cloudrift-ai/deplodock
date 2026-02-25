@@ -9,12 +9,39 @@
 - `UPPER_SNAKE_CASE` for module-level constants.
 - Prefix private/internal helpers with underscore (e.g., `_ssh_base_args`).
 
-### Error Handling
+### Logging
 
-Print errors to stderr and exit for CLI-facing failures:
+All output goes through Python's `logging` module — never use `print()`.
+
+Each module gets a module-level logger:
 
 ```python
-print(f"Failed to pull images", file=sys.stderr)
+import logging
+
+logger = logging.getLogger(__name__)
+```
+
+Level mapping:
+
+| Pattern | Level |
+|---|---|
+| Normal output | `logger.info(...)` |
+| Warnings | `logger.warning(...)` |
+| Errors | `logger.error(...)` |
+
+Two logging configurations:
+
+- **Standalone CLI** (`setup_cli_logging()` in `logging_setup.py`): `%(message)s` format — output identical to `print()`.
+- **Bench** (`setup_logging()` in `bench_logging.py`): `[%(name)s] %(message)s` — prefixed output with module/group names.
+
+The bench formatter shows short module names for library loggers (`deplodock.deploy.orchestrate` → `[orchestrate]`) and split group loggers (`rtx5090_x_1.ModelName` → `[rtx5090_x_1] [ModelName]`).
+
+### Error Handling
+
+Log errors and return failure for operational errors:
+
+```python
+logger.error("Failed to pull images")
 return False
 ```
 

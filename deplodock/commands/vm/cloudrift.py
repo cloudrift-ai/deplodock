@@ -1,5 +1,6 @@
 """CloudRift provider CLI handlers."""
 
+import logging
 import os
 import sys
 
@@ -10,6 +11,8 @@ from deplodock.provisioning.cloudrift import (
     delete_instance,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _resolve_api_key(args_api_key):
     """Return the API key from the CLI flag or CLOUDRIFT_API_KEY env var.
@@ -18,7 +21,7 @@ def _resolve_api_key(args_api_key):
     """
     api_key = args_api_key or os.environ.get("CLOUDRIFT_API_KEY")
     if not api_key:
-        print("Error: CloudRift API key required. Use --api-key or set CLOUDRIFT_API_KEY.", file=sys.stderr)
+        logger.error("Error: CloudRift API key required. Use --api-key or set CLOUDRIFT_API_KEY.")
         sys.exit(1)
     return api_key
 

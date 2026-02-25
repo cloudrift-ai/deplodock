@@ -10,6 +10,7 @@ from deplodock.commands.deploy.ssh import register_ssh_target
 from deplodock.commands.report import register_report_command
 from deplodock.commands.teardown import register_teardown_command
 from deplodock.commands.vm import register_vm_command
+from deplodock.logging_setup import setup_cli_logging
 
 
 def main():
@@ -31,6 +32,7 @@ def main():
     register_vm_command(subparsers)
 
     args = parser.parse_args()
+    setup_cli_logging()
     args.func(args)
 
 

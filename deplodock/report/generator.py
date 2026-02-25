@@ -1,10 +1,13 @@
 """Report generation: Excel reports from benchmark results."""
 
+import logging
 from pathlib import Path
 
 from deplodock.report.collector import collect_tasks_from_manifests
 from deplodock.report.parser import parse_benchmark_result
 from deplodock.report.pricing import get_gpu_price
+
+logger = logging.getLogger(__name__)
 
 
 def generate_report(config: dict, results_dir: str, output_file: str):
@@ -14,7 +17,7 @@ def generate_report(config: dict, results_dir: str, output_file: str):
     results_path = Path(results_dir)
 
     if not results_path.exists():
-        print(f"Error: Results directory not found: {results_dir}")
+        logger.error(f"Error: Results directory not found: {results_dir}")
         return
 
     data_by_model = {}
@@ -28,7 +31,7 @@ def generate_report(config: dict, results_dir: str, output_file: str):
         total_throughput, metrics = parse_benchmark_result(result_file)
 
         if total_throughput is None:
-            print(f"Warning: Could not extract throughput from {result_file}")
+            logger.warning(f"Warning: Could not extract throughput from {result_file}")
             continue
 
         price = get_gpu_price(config, gpu_type, gpu_count)
@@ -52,10 +55,10 @@ def generate_report(config: dict, results_dir: str, output_file: str):
         data_by_model[model_name].append(row_data)
 
     if not all_data:
-        print("Error: No valid benchmark data found")
+        logger.error("Error: No valid benchmark data found")
         return
 
-    print(f"Found {len(all_data)} benchmark results across run directories")
+    logger.info(f"Found {len(all_data)} benchmark results across run directories")
 
     df = pd.DataFrame(all_data)
     df = df.sort_values("Machine")
@@ -79,8 +82,8 @@ def generate_report(config: dict, results_dir: str, output_file: str):
             adjusted_width = min(max_length + 2, 50)
             worksheet.column_dimensions[column_letter].width = adjusted_width
 
-    print(f"Combined report generated: {output_path}")
-    print(f"   - {len(df)} benchmark results")
+    logger.info(f"Combined report generated: {output_path}")
+    logger.info(f"   - {len(df)} benchmark results")
 
     output_dir = output_path.parent
     for model_name, model_data in data_by_model.items():
@@ -106,5 +109,5 @@ def generate_report(config: dict, results_dir: str, output_file: str):
                 adjusted_width = min(max_length + 2, 50)
                 worksheet.column_dimensions[column_letter].width = adjusted_width
 
-        print(f"Model report generated: {model_output_path}")
-        print(f"   - {len(df_model)} results for {model_name}")
+        logger.info(f"Model report generated: {model_output_path}")
+        logger.info(f"   - {len(df_model)} results for {model_name}")

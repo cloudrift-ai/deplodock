@@ -1,7 +1,7 @@
 """Benchmark task enumeration."""
 
+import logging
 import os
-import sys
 
 import yaml
 
@@ -9,6 +9,8 @@ from deplodock.hardware import gpu_short_name
 from deplodock.planner import BenchmarkTask
 from deplodock.recipe.matrix import build_override, expand_matrix_entry, matrix_label
 from deplodock.recipe.recipe import _validate_and_build, deep_merge
+
+logger = logging.getLogger(__name__)
 
 
 def _build_variant_name(gpu_name, combination, variable_keys):
@@ -31,7 +33,7 @@ def enumerate_tasks(recipe_dirs):
     for recipe_dir in recipe_dirs:
         recipe_path = os.path.join(recipe_dir, "recipe.yaml")
         if not os.path.isfile(recipe_path):
-            print(f"Warning: No recipe.yaml in {recipe_dir}, skipping.", file=sys.stderr)
+            logger.warning(f"Warning: No recipe.yaml in {recipe_dir}, skipping.")
             continue
 
         with open(recipe_path) as f:
@@ -39,7 +41,7 @@ def enumerate_tasks(recipe_dirs):
 
         matrices = raw.get("matrices", [])
         if not matrices:
-            print(f"Warning: No matrices in {recipe_dir}, skipping.", file=sys.stderr)
+            logger.warning(f"Warning: No matrices in {recipe_dir}, skipping.")
             continue
 
         base_config = {k: v for k, v in raw.items() if k != "matrices"}
@@ -56,9 +58,8 @@ def enumerate_tasks(recipe_dirs):
                 recipe = _validate_and_build(merged)
 
                 if recipe.deploy.gpu is None:
-                    print(
+                    logger.warning(
                         f"Warning: matrix entry in {recipe_dir} missing 'deploy.gpu', skipping.",
-                        file=sys.stderr,
                     )
                     continue
 

@@ -1,12 +1,15 @@
 """Teardown command: clean up VMs left running by --no-teardown."""
 
 import json
+import logging
 import sys
 from pathlib import Path
 
 from deplodock.deploy.orchestrate import run_teardown
 from deplodock.provisioning.cloud import delete_cloud_vm
 from deplodock.provisioning.ssh_transport import make_run_cmd
+
+logger = logging.getLogger(__name__)
 
 
 def handle_teardown(args):
@@ -16,16 +19,16 @@ def handle_teardown(args):
     ssh_key = args.ssh_key
 
     if not instances_path.exists():
-        print(f"No instances.json found in {run_dir}", file=sys.stderr)
+        logger.error(f"No instances.json found in {run_dir}")
         sys.exit(1)
 
     instances = json.loads(instances_path.read_text())
     if not instances:
-        print("instances.json is empty — nothing to tear down.")
+        logger.info("instances.json is empty — nothing to tear down.")
         return
 
-    print(f"Tearing down {len(instances)} instance(s) from {run_dir}")
-    print()
+    logger.info(f"Tearing down {len(instances)} instance(s) from {run_dir}")
+    logger.info("")
 
     errors = []
     for inst in instances:
@@ -35,40 +38,40 @@ def handle_teardown(args):
         provider = inst.get("provider")
         instance_id = inst.get("instance_id")
 
-        print(f"[{label}] {address} ({provider}: {instance_id})")
+        logger.info(f"[{label}] {address} ({provider}: {instance_id})")
 
         # Docker compose down
         if address:
-            print(f"  Stopping containers on {address}...")
+            logger.info(f"  Stopping containers on {address}...")
             run_cmd = make_run_cmd(address, ssh_key, ssh_port)
             run_teardown(run_cmd)
 
         # Delete VM
         if provider and instance_id:
-            print(f"  Deleting VM ({provider}: {instance_id})...")
+            logger.info(f"  Deleting VM ({provider}: {instance_id})...")
             try:
                 if provider == "gcp":
                     zone = inst.get("zone")
                     if not zone:
-                        print(f"  WARNING: missing zone for GCP instance {instance_id}", file=sys.stderr)
+                        logger.error(f"  WARNING: missing zone for GCP instance {instance_id}")
                         errors.append(label)
                         continue
                     delete_info = (provider, instance_id, zone)
                 else:
                     delete_info = (provider, instance_id)
                 delete_cloud_vm(delete_info)
-                print("  VM deleted.")
+                logger.info("  VM deleted.")
             except Exception as e:
-                print(f"  ERROR deleting VM: {e}", file=sys.stderr)
+                logger.error(f"  ERROR deleting VM: {e}")
                 errors.append(label)
                 continue
 
     if errors:
-        print(f"\nFailed to clean up {len(errors)} instance(s): {', '.join(errors)}")
+        logger.info(f"\nFailed to clean up {len(errors)} instance(s): {', '.join(errors)}")
         sys.exit(1)
     else:
         instances_path.unlink()
-        print(f"\nAll instances cleaned up. Removed {instances_path}")
+        logger.info(f"\nAll instances cleaned up. Removed {instances_path}")
 
 
 def register_teardown_command(subparsers):

@@ -1,7 +1,9 @@
 """Shell command execution helper."""
 
+import logging
 import subprocess
-import sys
+
+logger = logging.getLogger(__name__)
 
 
 def run_shell_cmd(command, dry_run=False):
@@ -15,12 +17,12 @@ def run_shell_cmd(command, dry_run=False):
         (returncode, stdout, stderr) tuple
     """
     if dry_run:
-        print(f"[dry-run] {' '.join(command)}")
+        logger.info(f"[dry-run] {' '.join(command)}")
         return 0, "", ""
 
     try:
         result = subprocess.run(command, capture_output=True, text=True)
         return result.returncode, result.stdout, result.stderr
     except FileNotFoundError:
-        print(f"Error: '{command[0]}' not found. Is it installed and on PATH?", file=sys.stderr)
+        logger.error(f"Error: '{command[0]}' not found. Is it installed and on PATH?")
         return 1, "", f"'{command[0]}' not found"

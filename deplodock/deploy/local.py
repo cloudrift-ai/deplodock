@@ -1,8 +1,10 @@
 """Local transport: run commands and write files locally."""
 
+import logging
 import os
 import subprocess
-import sys
+
+logger = logging.getLogger(__name__)
 
 
 def make_run_cmd(deploy_dir, dry_run=False):
@@ -10,7 +12,7 @@ def make_run_cmd(deploy_dir, dry_run=False):
 
     def run_cmd(command, stream=True):
         if dry_run:
-            print(f"[dry-run] {command}")
+            logger.info(f"[dry-run] {command}")
             return 0, "", ""
 
         try:
@@ -27,7 +29,7 @@ def make_run_cmd(deploy_dir, dry_run=False):
             stderr = "" if stream else (result.stderr or "")
             return result.returncode, stdout, stderr
         except Exception as e:
-            print(f"Error running command: {e}", file=sys.stderr)
+            logger.error(f"Error running command: {e}")
             return 1, "", ""
 
     return run_cmd
@@ -39,7 +41,7 @@ def make_write_file(deploy_dir, dry_run=False):
     def write_file(path, content):
         full_path = os.path.join(deploy_dir, path)
         if dry_run:
-            print(f"[dry-run] write {full_path}")
+            logger.info(f"[dry-run] write {full_path}")
             return
         os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
         with open(full_path, "w") as f:
