@@ -4,6 +4,7 @@ Bridge between the deploy layer and VM providers. All VM-related logic for
 bench and deploy CLI goes through this module.
 """
 
+import asyncio
 import logging
 import os
 import shlex
@@ -11,6 +12,9 @@ import shlex
 from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
 from deplodock.provisioning import cloudrift as cr_provider
 from deplodock.provisioning import gcp as gcp_provider
+
+DEFAULT_PROVISION_RETRIES = 3
+PROVISION_RETRY_DELAY = 10  # seconds
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +59,12 @@ def resolve_vm_spec(loaded_configs, server_name=None):
     return gpu_name, max_gpu_count
 
 
-async def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None, server_name=None, dry_run=False, logger=None):
+async def provision_cloud_vm(
+    gpu_name, gpu_count, ssh_key, providers_config=None, server_name=None, dry_run=False, logger=None, max_retries=DEFAULT_PROVISION_RETRIES
+):
     """Provision a cloud VM for the given GPU requirements.
 
+    Retries up to max_retries times on failure (e.g. transient provider issues).
     Looks up the provider from the hardware table and dispatches to the
     provider's create_instance().
 
@@ -75,6 +82,22 @@ async def provision_cloud_vm(gpu_name, gpu_count, ssh_key, providers_config=None
     instance_type = resolve_instance_type(provider, base_type, gpu_count)
     logger.info(f"GPU: {gpu_name} x{gpu_count} -> {provider} {instance_type}")
 
+    for attempt in range(1, max_retries + 1):
+        conn = await _provision_once(provider, instance_type, gpu_count, ssh_key, providers_config, server_name, dry_run, logger)
+        if conn is not None or dry_run:
+            return conn
+
+        if attempt < max_retries:
+            logger.warning(f"Provisioning attempt {attempt}/{max_retries} failed, retrying in {PROVISION_RETRY_DELAY}s...")
+            await asyncio.sleep(PROVISION_RETRY_DELAY)
+        else:
+            logger.error(f"Provisioning failed after {max_retries} attempts")
+
+    return None
+
+
+async def _provision_once(provider, instance_type, gpu_count, ssh_key, providers_config, server_name, dry_run, logger):
+    """Single provisioning attempt for a cloud VM. Returns VMConnectionInfo or None."""
     if provider == "cloudrift":
         api_key = os.environ.get("CLOUDRIFT_API_KEY")
         if not api_key and not dry_run:

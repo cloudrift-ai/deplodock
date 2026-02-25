@@ -239,13 +239,11 @@ def _log_connection_info(instance):
 
     # Extract login credentials from VM info
     username = "user"
-    password = None
     vms = instance.get("virtual_machines", [])
     if vms:
         login_info = vms[0].get("login_info", {})
         creds = login_info.get("UsernameAndPassword", {})
         username = creds.get("username", username)
-        password = creds.get("password")
 
     # Find SSH port mapping: each mapping is [internal_port, external_port]
     ssh_ext_port = None
@@ -257,16 +255,12 @@ def _log_connection_info(instance):
     if ssh_ext_port and host:
         logger.info(f"Host:     {host}")
         logger.info(f"User:     {username}")
-        if password:
-            logger.info(f"Password: {password}")
         logger.info(f"Connect:  ssh -p {ssh_ext_port} {username}@{host}")
         for internal, external in port_mappings:
             logger.info(f"  Port {internal} -> {host}:{external}")
     elif host:
         logger.info(f"Host:     {host}")
         logger.info(f"User:     {username}")
-        if password:
-            logger.info(f"Password: {password}")
         logger.info(f"Connect:  ssh {username}@{host}")
     else:
         logger.warning("Warning: no host address found in instance info.")
