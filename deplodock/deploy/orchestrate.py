@@ -105,7 +105,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
     logger.info(f"Instances: {num_instances}")
     logger.info(f"Status: {status}")
 
-    # Step 7: Smoke test inference
+    # Step 7: Smoke test inference (retry — first request may be slow due to warmup)
     if not dry_run:
         logger.info("\nRunning smoke test...")
         smoke_cmd = (
@@ -113,11 +113,18 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
             f" -H 'Content-Type: application/json'"
             f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"Say hello"}}],"max_tokens":16}}' '''
         )
-        rc, _, _ = await run_cmd(smoke_cmd, stream=False, timeout=60)
-        if rc == 0:
-            logger.info("Smoke test passed.")
+        smoke_timeout = 600
+        smoke_interval = 10
+        deadline = asyncio.get_event_loop().time() + smoke_timeout
+        while asyncio.get_event_loop().time() < deadline:
+            rc, _, _ = await run_cmd(smoke_cmd, stream=False, timeout=180)
+            if rc == 0:
+                logger.info("Smoke test passed.")
+                break
+            await asyncio.sleep(smoke_interval)
         else:
-            logger.warning("WARNING: Smoke test failed. The endpoint may not be ready yet.")
+            logger.error(f"Smoke test failed after {smoke_timeout}s. The endpoint is not ready.")
+            return False
 
     # Print curl example
     logger.info("\nExample curl:")
