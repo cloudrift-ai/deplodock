@@ -1,5 +1,5 @@
 model:
-  huggingface: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+  huggingface: "Qwen/Qwen3-Coder-Next-FP8"
 
 engine:
   llm:
@@ -15,7 +15,7 @@ benchmark:
   random_output_len: 4000
 
 matrices:
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
     deploy.gpu_count: 1
     engine.llm.max_concurrent_requests: [8, 12, 16, 20, 24, 28, 32, 36, 40]
     benchmark.max_concurrency: [8, 12, 16, 20, 24, 28, 32, 36, 40]

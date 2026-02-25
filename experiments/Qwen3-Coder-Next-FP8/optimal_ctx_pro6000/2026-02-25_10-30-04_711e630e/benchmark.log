@@ -1,0 +1,201 @@
+[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e
+[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e
+[2026-02-25 10:30:04] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e
+[2026-02-25 10:30:04] [root] 
+[2026-02-25 10:30:04] [root] Running 16 benchmark task(s) in 1 execution group(s)
+[2026-02-25 10:30:04] [root] Parallel mode (max workers: 1)
+[2026-02-25 10:30:04] [root] 
+[2026-02-25 10:30:04] [pro6000_x_1] Starting group: NVIDIA RTX PRO 6000 Workstation Edition x1 (16 tasks)
+[2026-02-25 10:30:04] [pro6000_x_1] GPU: NVIDIA RTX PRO 6000 Workstation Edition x1 -> cloudrift rtxpro6000-12-100-1500-nr.1
+[2026-02-25 10:30:04] [cloudrift] Creating CloudRift instance (type=rtxpro6000-12-100-1500-nr.1)...
+[2026-02-25 10:30:05] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/rent "HTTP/1.1 200 OK"
+[2026-02-25 10:30:05] [cloudrift] Instance rented (id=dc00f326-125e-11f1-962f-37c2b82bb4ee). Waiting for Active status (timeout: 600s)...
+[2026-02-25 10:30:06] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/list "HTTP/1.1 200 OK"
+[2026-02-25 10:30:16] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/list "HTTP/1.1 200 OK"
+[2026-02-25 10:30:16] [cloudrift] Instance is Active.
+[2026-02-25 10:30:16] [cloudrift] Host:     8.12.12.227
+[2026-02-25 10:30:16] [cloudrift] User:     riftuser
+[2026-02-25 10:30:16] [cloudrift] Password: aAftTwn8WynRmMJe
+[2026-02-25 10:30:16] [cloudrift] Connect:  ssh riftuser@8.12.12.227
+[2026-02-25 10:30:16] [cloudrift] Waiting for SSH connectivity...
+[2026-02-25 10:31:51] [pro6000_x_1] VM provisioned: riftuser@8.12.12.227:22
+[2026-02-25 10:31:58] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Recipe: ./experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000 (variant: pro6000_ctx8192)
+[2026-02-25 10:31:58] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploying model...
+[2026-02-25 10:31:59] [orchestrate] Pulling images...
+[2026-02-25 10:35:23] [orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-02-25 10:38:09] [orchestrate] Cleaning up old containers...
+[2026-02-25 10:38:10] [orchestrate] Starting services...
+[2026-02-25 10:42:09] [orchestrate] Waiting for health check...
+[2026-02-25 10:42:10] [orchestrate] 
+Endpoint: http://8.12.12.227:8000/v1
+[2026-02-25 10:42:10] [orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-02-25 10:42:10] [orchestrate] Instances: 1
+[2026-02-25 10:42:10] [orchestrate] Status: deployed
+[2026-02-25 10:42:10] [orchestrate] 
+Running smoke test...
+[2026-02-25 10:43:34] [orchestrate] Smoke test passed.
+[2026-02-25 10:43:34] [orchestrate] 
+Example curl:
+[2026-02-25 10:43:34] [orchestrate]   curl http://8.12.12.227:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-25 10:43:34] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-02-25 10:48:57] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/pro6000_ctx8192_vllm_benchmark.txt
+[2026-02-25 10:48:57] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-25 10:48:57] [orchestrate] Tearing down...
+[2026-02-25 10:49:01] [orchestrate] Teardown complete.
+[2026-02-25 10:49:01] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Recipe: ./experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000 (variant: pro6000_ctx16384)
+[2026-02-25 10:49:01] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploying model...
+[2026-02-25 10:49:01] [orchestrate] Pulling images...
+[2026-02-25 10:49:03] [orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-02-25 10:49:06] [orchestrate] Cleaning up old containers...
+[2026-02-25 10:49:06] [orchestrate] Starting services...
+[2026-02-25 10:53:00] [orchestrate] Waiting for health check...
+[2026-02-25 10:53:01] [orchestrate] 
+Endpoint: http://8.12.12.227:8000/v1
+[2026-02-25 10:53:01] [orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-02-25 10:53:01] [orchestrate] Instances: 1
+[2026-02-25 10:53:01] [orchestrate] Status: deployed
+[2026-02-25 10:53:01] [orchestrate] 
+Running smoke test...
+[2026-02-25 10:54:24] [orchestrate] Smoke test passed.
+[2026-02-25 10:54:24] [orchestrate] 
+Example curl:
+[2026-02-25 10:54:24] [orchestrate]   curl http://8.12.12.227:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-25 10:54:24] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-02-25 10:59:42] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/pro6000_ctx16384_vllm_benchmark.txt
+[2026-02-25 10:59:43] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-25 10:59:43] [orchestrate] Tearing down...
+[2026-02-25 10:59:46] [orchestrate] Teardown complete.
+[2026-02-25 10:59:46] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Recipe: ./experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000 (variant: pro6000_ctx32768)
+[2026-02-25 10:59:46] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploying model...
+[2026-02-25 10:59:46] [orchestrate] Pulling images...
+[2026-02-25 10:59:47] [orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-02-25 10:59:50] [orchestrate] Cleaning up old containers...
+[2026-02-25 10:59:51] [orchestrate] Starting services...
+[2026-02-25 11:04:05] [orchestrate] Waiting for health check...
+[2026-02-25 11:04:06] [orchestrate] 
+Endpoint: http://8.12.12.227:8000/v1
+[2026-02-25 11:04:06] [orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-02-25 11:04:06] [orchestrate] Instances: 1
+[2026-02-25 11:04:06] [orchestrate] Status: deployed
+[2026-02-25 11:04:06] [orchestrate] 
+Running smoke test...
+[2026-02-25 11:05:28] [orchestrate] Smoke test passed.
+[2026-02-25 11:05:28] [orchestrate] 
+Example curl:
+[2026-02-25 11:05:28] [orchestrate]   curl http://8.12.12.227:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-25 11:05:28] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-02-25 11:10:51] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/pro6000_ctx32768_vllm_benchmark.txt
+[2026-02-25 11:10:51] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-25 11:10:51] [orchestrate] Tearing down...
+[2026-02-25 11:10:54] [orchestrate] Teardown complete.
+[2026-02-25 11:10:54] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Recipe: ./experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000 (variant: pro6000_ctx65536)
+[2026-02-25 11:10:54] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploying model...
+[2026-02-25 11:10:55] [orchestrate] Pulling images...
+[2026-02-25 11:10:56] [orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-02-25 11:10:59] [orchestrate] Cleaning up old containers...
+[2026-02-25 11:11:00] [orchestrate] Starting services...
+[2026-02-25 11:14:55] [orchestrate] Waiting for health check...
+[2026-02-25 11:14:56] [orchestrate] 
+Endpoint: http://8.12.12.227:8000/v1
+[2026-02-25 11:14:56] [orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-02-25 11:14:56] [orchestrate] Instances: 1
+[2026-02-25 11:14:56] [orchestrate] Status: deployed
+[2026-02-25 11:14:56] [orchestrate] 
+Running smoke test...
+[2026-02-25 11:16:20] [orchestrate] Smoke test passed.
+[2026-02-25 11:16:20] [orchestrate] 
+Example curl:
+[2026-02-25 11:16:20] [orchestrate]   curl http://8.12.12.227:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-25 11:16:20] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-02-25 11:21:45] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/pro6000_ctx65536_vllm_benchmark.txt
+[2026-02-25 11:21:45] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-25 11:21:45] [orchestrate] Tearing down...
+[2026-02-25 11:21:49] [orchestrate] Teardown complete.
+[2026-02-25 11:21:49] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Recipe: ./experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000 (variant: pro6000_ctx131072)
+[2026-02-25 11:21:49] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploying model...
+[2026-02-25 11:21:50] [orchestrate] Pulling images...
+[2026-02-25 11:21:51] [orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-02-25 11:21:53] [orchestrate] Cleaning up old containers...
+[2026-02-25 11:21:54] [orchestrate] Starting services...
+[2026-02-25 11:25:49] [orchestrate] Waiting for health check...
+[2026-02-25 11:25:50] [orchestrate] 
+Endpoint: http://8.12.12.227:8000/v1
+[2026-02-25 11:25:50] [orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-02-25 11:25:50] [orchestrate] Instances: 1
+[2026-02-25 11:25:50] [orchestrate] Status: deployed
+[2026-02-25 11:25:50] [orchestrate] 
+Running smoke test...
+[2026-02-25 11:27:14] [orchestrate] Smoke test passed.
+[2026-02-25 11:27:14] [orchestrate] 
+Example curl:
+[2026-02-25 11:27:14] [orchestrate]   curl http://8.12.12.227:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-25 11:27:14] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-02-25 11:32:32] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/pro6000_ctx131072_vllm_benchmark.txt
+[2026-02-25 11:32:32] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-25 11:32:32] [orchestrate] Tearing down...
+[2026-02-25 11:32:36] [orchestrate] Teardown complete.
+[2026-02-25 14:30:50] [pro6000_x_1] Deleting VM...
+[2026-02-25 14:30:50] [cloudrift] Terminating CloudRift instance 'dc00f326-125e-11f1-962f-37c2b82bb4ee'...
+[2026-02-25 14:30:51] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-02-25 14:30:51] [cloudrift] Instance terminated.
+[2026-02-25 14:30:51] [pro6000_x_1] VM deleted.
+[2026-02-25 14:30:51] [pro6000_x_1] Completed group: pro6000_x_1
+[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
+[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
+[2026-02-25 14:30:51] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e/manifest.json
+[2026-02-25 14:30:51] [root] 
+[2026-02-25 14:30:51] [root] SUMMARY
+[2026-02-25 14:30:51] [root] Successful: 14/16
+[2026-02-25 14:30:51] [root]    - pro6000_ctx8192_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_ctx16384_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_ctx32768_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_ctx65536_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_ctx131072_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_c8_mcr8_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_c12_mcr12_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_c16_mcr16_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_c20_mcr20_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_c28_mcr28_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_c32_mcr32_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_c36_mcr36_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_c40_mcr40_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root] 
+[2026-02-25 14:30:51] [root] Failed: 2/16
+[2026-02-25 14:30:51] [root]    - pro6000_c24_mcr24_vllm_benchmark.txt
+[2026-02-25 14:30:51] [root]    - pro6000_sglang_benchmark.txt
+[2026-02-25 14:30:51] [root] 
+[2026-02-25 14:30:51] [root] All done!
+[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log
+[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log
+[2026-02-25 14:30:51] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-02-25_10-30-04_711e630e/benchmark.log

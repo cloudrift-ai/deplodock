@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-02-25T14:19:14",
+  "code_hash": "6299d5b9bfb1f3445b9f5787d39d7bce17ed780e9cc801763f602ac885e6a63c",
+  "recipes": [
+    "vllm_vs_sglang_rtx5090"
+  ],
+  "tasks": [
+    {
+      "recipe": "vllm_vs_sglang_rtx5090",
+      "variant": "rtx5090",
+      "gpu_name": "NVIDIA GeForce RTX 5090",
+      "gpu_short": "rtx5090",
+      "gpu_count": 1,
+      "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "result_file": "rtx5090_vllm_benchmark.txt",
+      "status": "completed"
+    },
+    {
+      "recipe": "vllm_vs_sglang_rtx5090",
+      "variant": "rtx5090",
+      "gpu_name": "NVIDIA GeForce RTX 5090",
+      "gpu_short": "rtx5090",
+      "gpu_count": 1,
+      "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "result_file": "rtx5090_sglang_benchmark.txt",
+      "status": "completed"
+    }
+  ]
+}

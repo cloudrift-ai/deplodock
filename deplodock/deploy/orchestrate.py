@@ -46,7 +46,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
 
     # Step 1: Pull images
     logger.info("Pulling images...")
-    rc, _, _ = await run_cmd("docker compose pull", timeout=1800)
+    rc, _, _ = await run_cmd("docker compose pull", timeout=1800, log_output=True)
     if rc != 0:
         logger.error("Failed to pull images")
         return False
@@ -62,22 +62,22 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
         f" {image}"
         f" -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
     )
-    rc, _, _ = await run_cmd(dl_cmd, timeout=3600)
+    rc, _, _ = await run_cmd(dl_cmd, timeout=3600, log_output=True)
     if rc != 0:
         logger.error("Failed to download model")
         return False
 
     # Step 3: Clean up old containers
     logger.info("Cleaning up old containers...")
-    await run_cmd("docker compose down", timeout=300)
+    await run_cmd("docker compose down", timeout=300, log_output=True)
 
     # Step 4: Start services
     logger.info("Starting services...")
-    rc, _, _ = await run_cmd("docker compose up -d --wait --wait-timeout 1800", timeout=1800)
+    rc, _, _ = await run_cmd("docker compose up -d --wait --wait-timeout 1800", timeout=1800, log_output=True)
     if rc != 0:
         logger.error("Failed to start services")
         logger.error("Container logs:")
-        await run_cmd("docker compose logs --tail=100", timeout=60)
+        await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
         return False
 
     # Step 5: Poll health
@@ -87,7 +87,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
     interval = 10
     elapsed = 0
     while elapsed < timeout:
-        rc, _, _ = await run_cmd(f"curl -sf {health_url}", stream=False, timeout=30)
+        rc, _, _ = await run_cmd(f"curl -sf {health_url}", stream=False, timeout=30, log_output=True)
         if rc == 0:
             break
         if dry_run:
@@ -105,7 +105,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
     logger.info(f"Instances: {num_instances}")
     logger.info(f"Status: {status}")
 
-    # Step 7: Smoke test inference
+    # Step 7: Smoke test inference (retry — first request may be slow due to warmup)
     if not dry_run:
         logger.info("\nRunning smoke test...")
         smoke_cmd = (
@@ -113,11 +113,18 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
             f" -H 'Content-Type: application/json'"
             f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"Say hello"}}],"max_tokens":16}}' '''
         )
-        rc, _, _ = await run_cmd(smoke_cmd, stream=False, timeout=60)
-        if rc == 0:
-            logger.info("Smoke test passed.")
+        smoke_timeout = 600
+        smoke_interval = 10
+        deadline = asyncio.get_event_loop().time() + smoke_timeout
+        while asyncio.get_event_loop().time() < deadline:
+            rc, _, _ = await run_cmd(smoke_cmd, stream=False, timeout=180, log_output=True)
+            if rc == 0:
+                logger.info("Smoke test passed.")
+                break
+            await asyncio.sleep(smoke_interval)
         else:
-            logger.warning("WARNING: Smoke test failed. The endpoint may not be ready yet.")
+            logger.error(f"Smoke test failed after {smoke_timeout}s. The endpoint is not ready.")
+            return False
 
     # Print curl example
     logger.info("\nExample curl:")
@@ -137,7 +144,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
 async def run_teardown(run_cmd):
     """Tear down: docker compose down."""
     logger.info("Tearing down...")
-    rc, _, _ = await run_cmd("docker compose down", timeout=300)
+    rc, _, _ = await run_cmd("docker compose down", timeout=300, log_output=True)
     if rc == 0:
         logger.info("Teardown complete.")
     else:

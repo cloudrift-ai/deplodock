@@ -123,5 +123,5 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     )
 
     bench_command_str = build_bench_command(recipe)
-    rc, output, _ = await run_cmd(bench_cmd, stream=False, timeout=3600)
+    rc, output, _ = await run_cmd(bench_cmd, stream=False, timeout=10800)
     return rc == 0, output, bench_command_str
