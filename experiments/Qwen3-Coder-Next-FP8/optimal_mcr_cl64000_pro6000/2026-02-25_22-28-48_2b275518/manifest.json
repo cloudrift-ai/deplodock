@@ -1,0 +1,49 @@
+{
+  "timestamp": "2026-02-25T22:29:01",
+  "code_hash": "2b2755182580909fbc5bb9e73fb633bd38e8f759d3d91b7636ab50acd61fbc4f",
+  "recipes": [
+    "optimal_mcr_cl64000_pro6000"
+  ],
+  "tasks": [
+    {
+      "recipe": "optimal_mcr_cl64000_pro6000",
+      "variant": "pro6000_in8000_out8000",
+      "gpu_name": "NVIDIA RTX PRO 6000 Workstation Edition",
+      "gpu_short": "pro6000",
+      "gpu_count": 1,
+      "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+      "result_file": "pro6000_in8000_out8000_vllm_benchmark.txt",
+      "status": "failed"
+    },
+    {
+      "recipe": "optimal_mcr_cl64000_pro6000",
+      "variant": "pro6000_in16000_out8000",
+      "gpu_name": "NVIDIA RTX PRO 6000 Workstation Edition",
+      "gpu_short": "pro6000",
+      "gpu_count": 1,
+      "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+      "result_file": "pro6000_in16000_out8000_vllm_benchmark.txt",
+      "status": "failed"
+    },
+    {
+      "recipe": "optimal_mcr_cl64000_pro6000",
+      "variant": "pro6000_in32000_out8000",
+      "gpu_name": "NVIDIA RTX PRO 6000 Workstation Edition",
+      "gpu_short": "pro6000",
+      "gpu_count": 1,
+      "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+      "result_file": "pro6000_in32000_out8000_vllm_benchmark.txt",
+      "status": "failed"
+    },
+    {
+      "recipe": "optimal_mcr_cl64000_pro6000",
+      "variant": "pro6000_in64000_out8000",
+      "gpu_name": "NVIDIA RTX PRO 6000 Workstation Edition",
+      "gpu_short": "pro6000",
+      "gpu_count": 1,
+      "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+      "result_file": "pro6000_in64000_out8000_vllm_benchmark.txt",
+      "status": "failed"
+    }
+  ]
+}

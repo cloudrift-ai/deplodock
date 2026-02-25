@@ -1,0 +1,36 @@
+[2026-02-25 22:28:48] [root] Run directory: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl64000_pro6000/2026-02-25_22-28-48_2b275518
+[2026-02-25 22:28:48] [root] Run directory: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-25_22-28-48_2b275518
+[2026-02-25 22:28:48] [root] 
+[2026-02-25 22:28:48] [root] Running 10 benchmark task(s) in 1 execution group(s)
+[2026-02-25 22:28:48] [root] Parallel mode (max workers: 1)
+[2026-02-25 22:28:48] [root] 
+[2026-02-25 22:28:48] [pro6000_x_1] Starting group: NVIDIA RTX PRO 6000 Workstation Edition x1 (10 tasks)
+[2026-02-25 22:28:48] [pro6000_x_1] GPU: NVIDIA RTX PRO 6000 Workstation Edition x1 -> cloudrift rtxpro6000-12-100-1500-nr.1
+[2026-02-25 22:28:48] [cloudrift] Creating CloudRift instance (type=rtxpro6000-12-100-1500-nr.1)...
+[2026-02-25 22:28:49] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/rent "HTTP/1.1 200 OK"
+[2026-02-25 22:28:49] [cloudrift] Instance rented (id=5b1d77b2-1299-11f1-94e9-7f5ed3c32a5a). Waiting for Active status (timeout: 600s)...
+[2026-02-25 22:28:50] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/list "HTTP/1.1 200 OK"
+[2026-02-25 22:29:01] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/list "HTTP/1.1 200 OK"
+[2026-02-25 22:29:01] [cloudrift] Instance 5b1d77b2-1299-11f1-94e9-7f5ed3c32a5a reached fail status 'Inactive'
+[2026-02-25 22:29:01] [pro6000_x_1] VM provisioning failed
+[2026-02-25 22:29:01] [root] Manifest written to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl64000_pro6000/2026-02-25_22-28-48_2b275518/manifest.json
+[2026-02-25 22:29:01] [root] Manifest written to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-25_22-28-48_2b275518/manifest.json
+[2026-02-25 22:29:01] [root] 
+[2026-02-25 22:29:01] [root] SUMMARY
+[2026-02-25 22:29:01] [root] Successful: 0/10
+[2026-02-25 22:29:01] [root] 
+[2026-02-25 22:29:01] [root] Failed: 10/10
+[2026-02-25 22:29:01] [root]    - pro6000_in8000_out8000_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_in16000_out8000_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_in32000_out8000_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_in64000_out8000_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_c8_mcr8_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_c16_mcr16_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_c32_mcr32_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_c48_mcr48_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_c64_mcr64_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root]    - pro6000_c80_mcr80_vllm_benchmark.txt
+[2026-02-25 22:29:01] [root] 
+[2026-02-25 22:29:01] [root] All done!
+[2026-02-25 22:29:01] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl64000_pro6000/2026-02-25_22-28-48_2b275518/benchmark.log
+[2026-02-25 22:29:01] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-25_22-28-48_2b275518/benchmark.log
