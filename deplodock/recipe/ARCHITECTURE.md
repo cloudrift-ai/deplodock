@@ -58,7 +58,7 @@ This design provides:
 
 Users must not duplicate named fields in `extra_args`. The `validate_extra_args()` function enforces this by:
 
-1. Building a banned set from the active engine's flag map (`VLLM_FLAG_MAP` or `SGLANG_FLAG_MAP`) plus hardcoded flags (`--trust-remote-code`, `--host`, `--port`, `--model`, `--served-model-name`).
+1. Building a banned set from the active engine's flag map (`VLLM_FLAG_MAP` or `SGLANG_FLAG_MAP`) plus hardcoded flags (`--trust-remote-code`, `--host`, `--port`, `--model`, `--model-path`, `--served-model-name`).
 2. Tokenizing the `extra_args` string and checking each token (handling both `--flag value` and `--flag=value` forms).
 3. Raising `ValueError` listing all offending flags if any are found.
 
@@ -66,9 +66,21 @@ This validation runs inside `load_recipe()` before returning the `Recipe`, so in
 
 `extra_args` is the escape hatch for engine-specific flags that don't have a named field (e.g. `--kv-cache-dtype fp8`, `--enable-expert-parallel`). It is passed through verbatim to `build_engine_args()`.
 
+### Engine-Specific Model Flag
+
+`build_engine_args()` emits the model path using the flag expected by each engine:
+- vLLM: `--model {name}`
+- SGLang: `--model-path {name}`
+
+Both `--model` and `--model-path` are in the hardcoded banned set, so they cannot appear in `extra_args` regardless of which engine is active.
+
 ### Engine-Specific Nesting
 
 Engine-specific config (`image`, `extra_args`) nests under `engine.llm.vllm` or `engine.llm.sglang`, while engine-agnostic config lives at `engine.llm`. `LLMConfig.engine_name` is determined by which sub-config is present (SGLang takes priority if both exist). The `image` and `extra_args` properties delegate to the active engine's config.
+
+### SGLang Quantization for AWQ MoE Models
+
+SGLang does not automatically detect AWQ quantization for MoE architectures. For AWQ-quantized MoE models, `--quantization moe_wna16` must be passed via `extra_args`. See [/docs/sglang-awq-moe.md](/docs/sglang-awq-moe.md) for full details and tested configurations.
 
 ## Data Flow
 

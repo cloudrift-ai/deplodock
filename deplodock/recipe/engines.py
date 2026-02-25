@@ -27,6 +27,7 @@ _HARDCODED_FLAGS = {
     "--host",
     "--port",
     "--model",
+    "--model-path",
     "--served-model-name",
 }
 
@@ -54,7 +55,7 @@ def build_engine_args(llm: LLMConfig, model_name: str) -> list[str]:
         "--port 8000",
         f"{flag_map['tensor_parallel_size']} {llm.tensor_parallel_size}",
         f"{flag_map['pipeline_parallel_size']} {llm.pipeline_parallel_size}",
-        f"--model {model_name}",
+        f"--model-path {model_name}" if llm.engine_name == "sglang" else f"--model {model_name}",
         f"--served-model-name {model_name}",
     ]
 

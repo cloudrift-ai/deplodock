@@ -153,6 +153,31 @@ def sample_config():
 
 
 @pytest.fixture
+def sample_config_sglang():
+    """Return a resolved config dict for SGLang compose generation."""
+    return {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "gpu_memory_utilization": 0.9,
+                "context_length": 8192,
+                "sglang": {
+                    "image": "lmsysorg/sglang:latest",
+                },
+            }
+        },
+        "benchmark": {
+            "max_concurrency": 128,
+            "num_prompts": 256,
+            "random_input_len": 4000,
+            "random_output_len": 4000,
+        },
+    }
+
+
+@pytest.fixture
 def sample_config_multi():
     """Return a resolved config dict for multi-instance testing."""
     return {

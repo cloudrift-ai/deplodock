@@ -38,7 +38,11 @@ def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
         )
 
     model_name = recipe.model_name
+    # vllm bench serve is an HTTP client that works against any OpenAI-compatible
+    # endpoint, so we always use the vLLM image for benchmarking.
     image = recipe.engine.llm.image
+    if recipe.engine.llm.engine_name != "vllm":
+        image = "vllm/vllm-openai:latest"
 
     num_instances = calculate_num_instances(recipe)
     port = 8080 if num_instances > 1 else 8000

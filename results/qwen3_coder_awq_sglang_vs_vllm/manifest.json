@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-02-24T19:13:50",
+  "code_hash": "06eb05ade9c704576462cb843ac96b54ff75c10129d4691e4ac0e5bc414a96f2",
+  "recipes": [
+    "Qwen3-Coder-30B-A3B-Instruct-AWQ"
+  ],
+  "tasks": [
+    {
+      "recipe": "Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "variant": "RTX5090",
+      "gpu_name": "NVIDIA GeForce RTX 5090",
+      "gpu_short": "rtx5090",
+      "gpu_count": 1,
+      "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "result_file": "Qwen3-Coder-30B-A3B-Instruct-AWQ/RTX5090_vllm_benchmark.txt",
+      "status": "completed"
+    },
+    {
+      "recipe": "Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "variant": "RTX5090_sglang",
+      "gpu_name": "NVIDIA GeForce RTX 5090",
+      "gpu_short": "rtx5090",
+      "gpu_count": 1,
+      "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "result_file": "Qwen3-Coder-30B-A3B-Instruct-AWQ/RTX5090_sglang_sglang_benchmark.txt",
+      "status": "completed"
+    }
+  ]
+}

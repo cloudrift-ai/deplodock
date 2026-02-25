@@ -28,8 +28,9 @@ class BenchmarkTask:
         return os.path.basename(self.recipe_dir)
 
     def result_path(self, run_dir) -> Path:
-        """Full result path: run_dir / recipe_name / {variant}_vllm_benchmark.txt."""
-        return Path(run_dir) / self.recipe_name / f"{self.variant}_vllm_benchmark.txt"
+        """Full result path: run_dir / recipe_name / {variant}_{engine}_benchmark.txt."""
+        engine = self.recipe.engine.llm.engine_name
+        return Path(run_dir) / self.recipe_name / f"{self.variant}_{engine}_benchmark.txt"
 
 
 @dataclass

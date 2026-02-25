@@ -80,7 +80,8 @@ CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench
 | `run_cli` | session | Callable that invokes `python -m deplodock.deplodock` as a subprocess |
 | `make_bench_config` | function | Factory that writes a temp `config.yaml` for bench tests (benchmark section only) |
 | `tmp_recipe_dir` | function | Temp directory with a sample `recipe.yaml` for unit tests |
-| `sample_config` | function | Single-instance config dict for compose tests |
+| `sample_config` | function | Single-instance vLLM config dict for compose tests |
+| `sample_config_sglang` | function | Single-instance SGLang config dict for compose tests |
 | `sample_config_multi` | function | Multi-instance config dict for compose tests |
 
 ## Conventions

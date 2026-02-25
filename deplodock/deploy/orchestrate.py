@@ -37,7 +37,7 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
 
     # Generate and write nginx config if multi-instance
     if num_instances > 1:
-        nginx_content = generate_nginx_conf(num_instances)
+        nginx_content = generate_nginx_conf(num_instances, engine=recipe.engine.llm.engine_name)
         write_file("nginx.conf", nginx_content)
 
     port = 8080 if num_instances > 1 else 8000
@@ -74,6 +74,8 @@ def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, d
     rc, _, _ = run_cmd("docker compose up -d --wait --wait-timeout 1800")
     if rc != 0:
         print("Failed to start services", file=sys.stderr)
+        print("Container logs:", file=sys.stderr)
+        run_cmd("docker compose logs --tail=100")
         return False
 
     # Step 5: Poll health
