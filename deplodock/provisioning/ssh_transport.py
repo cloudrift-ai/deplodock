@@ -24,7 +24,7 @@ def ssh_base_args(server, ssh_key, ssh_port):
 def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
     """Create a run_cmd callable for SSH execution."""
 
-    async def run_cmd(command, stream=True, timeout=600):
+    async def run_cmd(command, stream=True, timeout=600, log_output=False):
         # Use sg to run docker commands under the docker group
         if command.strip().startswith("docker"):
             escaped = command.replace('"', '\\"')
@@ -39,15 +39,36 @@ def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
         ssh_args.append(full_cmd)
 
         try:
+            use_pipe = not stream or log_output
             proc = await asyncio.create_subprocess_exec(
                 *ssh_args,
-                stdout=None if stream else asyncio.subprocess.PIPE,
-                stderr=None if stream else asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE if use_pipe else None,
+                stderr=asyncio.subprocess.PIPE if use_pipe else None,
             )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            stdout = "" if stream else (stdout_bytes.decode() if stdout_bytes else "")
-            stderr = "" if stream else (stderr_bytes.decode() if stderr_bytes else "")
-            return proc.returncode, stdout, stderr
+
+            if log_output:
+                stdout_lines, stderr_lines = [], []
+
+                async def _read_stream(pipe, lines, level):
+                    async for raw_line in pipe:
+                        line = raw_line.decode().rstrip("\n")
+                        logger.log(level, line)
+                        lines.append(line)
+
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        _read_stream(proc.stdout, stdout_lines, logging.INFO),
+                        _read_stream(proc.stderr, stderr_lines, logging.ERROR),
+                        proc.wait(),
+                    ),
+                    timeout=timeout,
+                )
+                return proc.returncode, "\n".join(stdout_lines), "\n".join(stderr_lines)
+            else:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                stdout = "" if stream else (stdout_bytes.decode() if stdout_bytes else "")
+                stderr = "" if stream else (stderr_bytes.decode() if stderr_bytes else "")
+                return proc.returncode, stdout, stderr
         except TimeoutError:
             logger.error(f"Command timed out after {timeout}s: {command}")
             proc.kill()

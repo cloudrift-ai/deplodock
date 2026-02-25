@@ -152,6 +152,8 @@ async def run_execution_group(
                 task_results.append(_task_meta(task, status="completed"))
             else:
                 task_logger.error("Benchmark failed")
+                if output:
+                    task_logger.error(output)
                 task_results.append(_task_meta(task, status="failed"))
 
             if not no_teardown:
