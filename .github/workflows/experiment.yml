@@ -143,7 +143,9 @@ jobs:
           echo "SSH_PUB_KEY=$(cat ~/.ssh/id_ed25519.pub)" >> "$GITHUB_ENV"
 
       - name: Setup GCP credentials
-        if: secrets.GCP_SERVICE_ACCOUNT_KEY != ''
+        env:
+          GCP_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        if: env.GCP_KEY != ''
         run: |
           echo '${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}' > /tmp/gcp-key.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-key.json" >> "$GITHUB_ENV"
@@ -238,3 +240,44 @@ jobs:
       - name: Cleanup GCP credentials
         if: always()
         run: rm -f /tmp/gcp-key.json
+
+  notify-failure:
+    needs: [gate, benchmark]
+    if: always() && (needs.gate.result == 'failure' || needs.benchmark.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.EXPERIMENT_APP_ID }}
+          private-key: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Post failure comment
+        uses: actions/github-script@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const gateResult = '${{ needs.gate.result }}';
+            const benchResult = '${{ needs.benchmark.result }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            let detail;
+            if (gateResult === 'failure') {
+              detail = 'The gate job failed (permission check, experiment detection, or workflow setup).';
+            } else {
+              detail = 'The benchmark job failed during execution.';
+            }
+
+            const body = `### Experiment benchmark failed\n\n` +
+              `${detail}\n\n` +
+              `**Gate:** ${gateResult} | **Benchmark:** ${benchResult}\n` +
+              `**Workflow run:** [View logs](${runUrl})`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
