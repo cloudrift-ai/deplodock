@@ -90,7 +90,7 @@ Groups benchmark tasks into execution groups for VM allocation.
 - `BenchmarkPlanner` — ABC with `plan(tasks) -> list[ExecutionGroup]`
 
 **Implementations:**
-- `planner/group_by_model_and_gpu.py` — `GroupByModelAndGpuPlanner`: groups by (model_name, gpu_name) tuple. Same model on same GPU shares a VM to reuse cached weights. Max gpu_count determines VM size; tasks sorted descending.
+- `planner/group_by_model_and_gpu.py` — `GroupByModelAndGpuPlanner(gpu_concurrency=1)`: groups by (model_name, gpu_name) tuple. Same model on same GPU shares a VM to reuse cached weights. Max gpu_count determines VM size; tasks sorted descending. With `gpu_concurrency > 1`, each group is split into up to N sub-groups via round-robin, each provisioning its own VM (trades weight-cache reuse for wall-clock time).
 
 ### `commands/` — CLI Layer (thin handlers only)
 
