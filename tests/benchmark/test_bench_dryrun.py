@@ -1,6 +1,7 @@
 """Dry-run tests for the bench command."""
 
 import os
+from pathlib import Path
 
 
 def test_bench_dry_run_basic(run_cli, make_bench_config, recipes_dir, tmp_path):
@@ -81,6 +82,65 @@ def test_bench_no_teardown_dry_run(run_cli, make_bench_config, recipes_dir, tmp_
     assert "Skipping VM deletion (--no-teardown)" in stdout
 
 
+def test_bench_single_recipe_output_dir(run_cli, make_bench_config, recipes_dir, tmp_path):
+    """Single recipe stores results directly in the recipe dir."""
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--config",
+        config_path,
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    # Run directory should be directly under {recipe_dir}/
+    expected_parent = str(Path(recipe).resolve())
+    assert expected_parent in stdout
+
+
+def test_bench_output_dir_override(run_cli, make_bench_config, recipes_dir, tmp_path):
+    """--output-dir overrides default results directory."""
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    output_dir = str(tmp_path / "custom_output")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--config",
+        config_path,
+        "--output-dir",
+        output_dir,
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    assert output_dir in stdout
+
+
+def test_bench_experiment_dry_run(run_cli, make_bench_config, project_root, tmp_path):
+    """Experiment recipe runs successfully in dry-run mode."""
+    config_path = make_bench_config(tmp_path)
+    experiment = os.path.join(
+        project_root,
+        "experiments",
+        "Qwen3-Coder-30B-A3B-Instruct-AWQ",
+        "optimal_mcr_rtx5090",
+    )
+    rc, stdout, stderr = run_cli(
+        "bench",
+        experiment,
+        "--config",
+        config_path,
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    # Should have multiple benchmark tasks from the sweep
+    assert stdout.count("bench serve") >= 2
+    # Results should go directly into the experiment dir
+    expected_parent = str(Path(experiment).resolve())
+    assert expected_parent in stdout
+
+
 def test_bench_help(run_cli):
     rc, stdout, _ = run_cli("bench", "--help")
     assert rc == 0
@@ -88,6 +148,7 @@ def test_bench_help(run_cli):
     assert "--ssh-key" in stdout
     assert "--dry-run" in stdout
     assert "--config" in stdout
+    assert "--output-dir" in stdout
     assert "--max-workers" in stdout
     assert "--no-teardown" in stdout
 

@@ -20,6 +20,7 @@ Tools for deploying and benchmarking LLM inference on GPU servers. Supports **vL
   - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
   - [report/](deplodock/report/) — Excel report generation from benchmark results
 - [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
+- [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
 - [docs/](docs/) — Technical notes and engine-specific guides
   - [sglang-awq-moe.md](docs/sglang-awq-moe.md) — SGLang quantization for AWQ MoE models
 - [tests/](tests/) — pytest tests (see [ARCHITECTURE.md](tests/ARCHITECTURE.md))
@@ -162,6 +163,29 @@ deploy:
 | `max_concurrent_requests` | `--max-num-seqs`           | `--max-running-requests` |
 
 These flags must **not** appear in `extra_args` — `load_recipe()` validates this and raises an error on duplicates.
+
+## Experiments
+
+Experiments are self-contained parameter sweeps that live in `experiments/`. Each experiment directory contains a `recipe.yaml` and stores its results alongside it. The directory structure follows `experiments/{model_name}/{experiment_name}/`.
+
+### Example: Optimal max_concurrent_requests on RTX 5090
+
+```bash
+deplodock bench experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090
+```
+
+Results are saved directly in the experiment directory:
+```
+experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/
+  recipe.yaml
+  2026-02-24_19-13-50_abc12345/
+    manifest.json
+    optimal_mcr_rtx5090/
+      recipe.yaml
+      RTX5090_mcr8_c8_vllm_benchmark.txt
+      RTX5090_mcr12_c12_vllm_benchmark.txt
+      ...
+```
 
 ## Deploy Targets
 
@@ -314,20 +338,24 @@ Benchmark parameters (`max_concurrency`, `num_prompts`, `random_input_len`, `ran
 ### Run Benchmarks
 
 ```bash
-deplodock bench recipes/*                                    # Run all recipes
-deplodock bench recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ    # Run a specific recipe
+deplodock bench recipes/*                                    # Run all recipes (uses config local_results_dir)
+deplodock bench experiments/.../optimal_mcr_rtx5090          # Single experiment (results alongside recipe)
+deplodock bench recipes/* --output-dir results/intermediate  # Explicit output directory
 deplodock bench recipes/* --max-workers 2                    # Limit parallel execution groups
 deplodock bench recipes/* --dry-run                          # Preview commands
 ```
 
-| Flag            | Default             | Description                            |
-|-----------------|---------------------|----------------------------------------|
-| `recipes`       | (required)          | Recipe directories (positional args)   |
-| `--ssh-key`     | `~/.ssh/id_ed25519` | SSH private key path                   |
-| `--config`      | `config.yaml`       | Path to configuration file             |
-| `--max-workers` | num groups          | Max parallel execution groups          |
-| `--dry-run`     | false               | Print commands without executing       |
-| `--no-teardown` | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
+| Flag            | Default                      | Description                            |
+|-----------------|------------------------------|----------------------------------------|
+| `recipes`       | (required)                   | Recipe directories (positional args)   |
+| `--ssh-key`     | `~/.ssh/id_ed25519`          | SSH private key path                   |
+| `--config`      | `config.yaml`                | Path to configuration file             |
+| `--output-dir`  | `{recipe_dir}` or config     | Output directory for results           |
+| `--max-workers` | num groups                   | Max parallel execution groups          |
+| `--dry-run`     | false                        | Print commands without executing       |
+| `--no-teardown` | false                        | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
+
+**Output directory resolution:** When a single recipe is passed, results are stored directly in `{recipe_dir}/` by default. When multiple recipes are passed, the `local_results_dir` from `config.yaml` is used. Use `--output-dir` to override either default.
 
 ### Teardown
 

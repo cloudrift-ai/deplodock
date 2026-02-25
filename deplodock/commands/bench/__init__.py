@@ -47,7 +47,12 @@ def handle_bench(args):
         sys.exit(1)
 
     # Create run directory
-    local_results_dir = _expand_path(config["benchmark"]["local_results_dir"])
+    if args.output_dir:
+        local_results_dir = _expand_path(args.output_dir)
+    elif len(args.recipes) == 1:
+        local_results_dir = str(Path(args.recipes[0]).resolve())
+    else:
+        local_results_dir = _expand_path(config["benchmark"]["local_results_dir"])
     run_dir = create_run_dir(local_results_dir)
 
     # Attach file handler now that run_dir exists
@@ -149,6 +154,11 @@ def register_bench_command(subparsers):
         "--config",
         default="config.yaml",
         help="Path to configuration file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory for results (default: {recipe_dir} for single recipe, config local_results_dir for multiple)",
     )
     parser.add_argument(
         "--max-workers",
