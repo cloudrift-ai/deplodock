@@ -3,7 +3,7 @@
 import asyncio
 import os
 
-from deplodock.benchmark.bench_logging import _get_group_logger
+from deplodock.benchmark.bench_logging import _get_group_logger, active_run_dir
 from deplodock.benchmark.tasks import _task_meta
 from deplodock.benchmark.workload import extract_benchmark_results, run_benchmark_workload
 from deplodock.deploy import (
@@ -94,6 +94,7 @@ def run_execution_group(
         provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
 
         for task in group.tasks:
+            active_run_dir.set(task.run_dir)
             recipe = task.recipe
             model_name = task.model_name
             result_path = task.result_path()
@@ -150,6 +151,7 @@ def run_execution_group(
                 teardown_entry(params)
 
     finally:
+        active_run_dir.set(None)
         if conn is not None and conn.delete_info:
             if no_teardown:
                 instance_info = _build_instance_info(group, group_label, conn)

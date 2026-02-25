@@ -1,11 +1,13 @@
 """GCP provider: create/delete GPU VMs using gcloud compute."""
 
+import logging
 import shlex
-import sys
 import time
 
 from deplodock.provisioning.shell import run_shell_cmd
 from deplodock.provisioning.types import VMConnectionInfo
+
+logger = logging.getLogger(__name__)
 
 # ── Command builders ───────────────────────────────────────────────
 
@@ -123,7 +125,7 @@ def wait_for_status(instance, zone, target_status, timeout, interval=10, dry_run
     """
     if dry_run:
         cmd = _gcloud_status_cmd(instance, zone)
-        print(f"[dry-run] Poll every {interval}s (up to {timeout}s): {' '.join(cmd)} -> {target_status}")
+        logger.info(f"[dry-run] Poll every {interval}s (up to {timeout}s): {' '.join(cmd)} -> {target_status}")
         return True
 
     elapsed = 0
@@ -135,7 +137,7 @@ def wait_for_status(instance, zone, target_status, timeout, interval=10, dry_run
         time.sleep(interval)
         elapsed += interval
 
-    print(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')", file=sys.stderr)
+    logger.error(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')")
     return False
 
 
@@ -147,7 +149,7 @@ def wait_for_ssh(instance, zone, timeout=300, interval=10, ssh_gateway=None, dry
     """
     if dry_run:
         cmd = _gcloud_ssh_check_cmd(instance, zone, ssh_gateway=ssh_gateway)
-        print(f"[dry-run] Poll SSH every {interval}s (up to {timeout}s): {' '.join(cmd)}")
+        logger.info(f"[dry-run] Poll SSH every {interval}s (up to {timeout}s): {' '.join(cmd)}")
         return True
 
     elapsed = 0
@@ -158,7 +160,7 @@ def wait_for_ssh(instance, zone, timeout=300, interval=10, ssh_gateway=None, dry
         time.sleep(interval)
         elapsed += interval
 
-    print(f"Timeout after {timeout}s waiting for SSH connectivity", file=sys.stderr)
+    logger.error(f"Timeout after {timeout}s waiting for SSH connectivity")
     return False
 
 
@@ -194,7 +196,7 @@ def create_instance(
         VMConnectionInfo on success, None on failure.
         In dry-run mode, returns a VMConnectionInfo with placeholder values.
     """
-    print(f"Creating instance '{instance}' in zone '{zone}' (provisioning: {provisioning_model})...")
+    logger.info(f"Creating instance '{instance}' in zone '{zone}' (provisioning: {provisioning_model})...")
 
     cmd = _gcloud_create_cmd(
         instance,
@@ -210,13 +212,13 @@ def create_instance(
     )
     rc, stdout, stderr = run_shell_cmd(cmd, dry_run=dry_run)
     if rc != 0:
-        print(f"Failed to create instance: {stderr.strip()}", file=sys.stderr)
+        logger.error(f"Failed to create instance: {stderr.strip()}")
         return None
 
-    print(f"Waiting for instance to reach RUNNING status (timeout: {timeout}s)...")
+    logger.info(f"Waiting for instance to reach RUNNING status (timeout: {timeout}s)...")
     if not wait_for_status(instance, zone, "RUNNING", timeout, dry_run=dry_run):
         return None
-    print("Instance is RUNNING.")
+    logger.info("Instance is RUNNING.")
 
     # Get external IP
     rc, stdout, _ = run_shell_cmd(_gcloud_external_ip_cmd(instance, zone), dry_run=dry_run)
@@ -224,15 +226,15 @@ def create_instance(
 
     if not dry_run:
         if not external_ip:
-            print("Warning: No external IP found.")
+            logger.warning("Warning: No external IP found.")
         else:
-            print(f"External IP: {external_ip}")
+            logger.info(f"External IP: {external_ip}")
 
     if wait_ssh:
-        print(f"Waiting for SSH connectivity (timeout: {wait_ssh_timeout}s)...")
+        logger.info(f"Waiting for SSH connectivity (timeout: {wait_ssh_timeout}s)...")
         if not wait_for_ssh(instance, zone, timeout=wait_ssh_timeout, ssh_gateway=ssh_gateway, dry_run=dry_run):
             return None
-        print("SSH is ready.")
+        logger.info("SSH is ready.")
 
     return VMConnectionInfo(
         host=external_ip or "dry-run-gcp-host",
@@ -247,12 +249,12 @@ def delete_instance(instance, zone, dry_run=False):
 
     Uses gcloud compute instances delete --quiet (blocks until complete).
     """
-    print(f"Deleting instance '{instance}' in zone '{zone}'...")
+    logger.info(f"Deleting instance '{instance}' in zone '{zone}'...")
 
     rc, stdout, stderr = run_shell_cmd(_gcloud_delete_cmd(instance, zone), dry_run=dry_run)
     if rc != 0:
-        print(f"Failed to delete instance: {stderr.strip()}", file=sys.stderr)
+        logger.error(f"Failed to delete instance: {stderr.strip()}")
         return False
 
-    print("Instance deleted.")
+    logger.info("Instance deleted.")
     return True

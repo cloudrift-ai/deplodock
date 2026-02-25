@@ -15,6 +15,7 @@ commands/vm ────► provisioning (create/delete instances)
 - `deplodock/recipe/` — recipe loading, dataclass types (`Recipe`, `LLMConfig`, etc.), engine flag mapping
 - `deplodock/deploy/` — compose generation, deploy orchestration
 - `deplodock/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
+- `deplodock/logging_setup.py` — CLI logging setup (`setup_cli_logging()`)
 - `deplodock/benchmark/` — tracking, config, logging, workload, tasks, execution
 - `deplodock/report/` — parsing, pricing, collection, report generation
 
@@ -64,7 +65,7 @@ Benchmark tracking, configuration, task enumeration, and execution.
 **Modules:**
 - `tracking.py` — `compute_code_hash()`, `create_run_dir()`, `write_manifest()`, `read_manifest()`
 - `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
-- `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `_get_group_logger()`
+- `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_BenchConsoleFormatter`
 - `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
 - `tasks.py` — `enumerate_tasks()`, `_task_meta()`
 - `execution.py` — `run_execution_group()`, `_run_groups()`

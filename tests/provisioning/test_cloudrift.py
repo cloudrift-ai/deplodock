@@ -14,7 +14,7 @@ from deplodock.provisioning.cloudrift import (
     _ensure_ssh_key,
     _get_instance_info,
     _list_ssh_keys,
-    _print_connection_info,
+    _log_connection_info,
     _rent_instance,
     _terminate_instance,
 )
@@ -112,14 +112,14 @@ def test_api_request_sends_correct_payload(mock_req):
     assert result == {"ok": True}
 
 
-def test_api_request_dry_run(capsys):
-    result = _api_request("POST", "/api/v1/test", {"foo": "bar"}, API_KEY, API_URL, dry_run=True)
+def test_api_request_dry_run(caplog):
+    with caplog.at_level("INFO", logger="deplodock.provisioning.cloudrift"):
+        result = _api_request("POST", "/api/v1/test", {"foo": "bar"}, API_KEY, API_URL, dry_run=True)
 
     assert result is None
-    output = capsys.readouterr().out
-    assert "[dry-run] POST" in output
-    assert "/api/v1/test" in output
-    assert '"foo": "bar"' in output
+    assert "[dry-run] POST" in caplog.text
+    assert "/api/v1/test" in caplog.text
+    assert '"foo": "bar"' in caplog.text
 
 
 # ── _rent_instance ────────────────────────────────────────────────
@@ -260,23 +260,23 @@ def test_ensure_ssh_key_registers_new(mock_list, mock_add, tmp_path):
     mock_add.assert_called_once()
 
 
-# ── _print_connection_info ────────────────────────────────────────
+# ── _log_connection_info ──────────────────────────────────────────
 
 
-def test_print_connection_info_with_port_mappings(capsys):
+def test_log_connection_info_with_port_mappings(caplog):
     """Test with real response: shared IP + port mappings + VM credentials."""
     instance = INSTANCE_ACTIVE_RESPONSE["instances"][0]
-    _print_connection_info(instance)
-    output = capsys.readouterr().out
-    assert "211.21.50.85" in output
-    assert "riftuser" in output
-    assert "9W93nSnhWvPqUPwx" in output
-    assert "ssh -p 57011 riftuser@211.21.50.85" in output
-    assert "Port 22 -> 211.21.50.85:57011" in output
-    assert "Port 8080 -> 211.21.50.85:57001" in output
+    with caplog.at_level("INFO", logger="deplodock.provisioning.cloudrift"):
+        _log_connection_info(instance)
+    assert "211.21.50.85" in caplog.text
+    assert "riftuser" in caplog.text
+    assert "9W93nSnhWvPqUPwx" in caplog.text
+    assert "ssh -p 57011 riftuser@211.21.50.85" in caplog.text
+    assert "Port 22 -> 211.21.50.85:57011" in caplog.text
+    assert "Port 8080 -> 211.21.50.85:57001" in caplog.text
 
 
-def test_print_connection_info_no_port_mappings(capsys):
+def test_log_connection_info_no_port_mappings(caplog):
     """Test with direct host address, no port mappings."""
     instance = {
         "host_address": "1.2.3.4",
@@ -292,7 +292,7 @@ def test_print_connection_info_no_port_mappings(capsys):
             }
         ],
     }
-    _print_connection_info(instance)
-    output = capsys.readouterr().out
-    assert "ssh riftuser@1.2.3.4" in output
-    assert "abc123" in output
+    with caplog.at_level("INFO", logger="deplodock.provisioning.cloudrift"):
+        _log_connection_info(instance)
+    assert "ssh riftuser@1.2.3.4" in caplog.text
+    assert "abc123" in caplog.text

@@ -1,6 +1,7 @@
 """CloudRift provider: create/delete GPU VMs via the CloudRift REST API."""
 
 import json
+import logging
 import os
 import time
 
@@ -8,6 +9,8 @@ import requests
 
 from deplodock.provisioning.ssh import wait_for_ssh
 from deplodock.provisioning.types import VMConnectionInfo
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "https://api.cloudrift.ai"
 DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
@@ -30,8 +33,8 @@ def _api_request(method, path, data, api_key, api_url=DEFAULT_API_URL, dry_run=F
     payload = {"version": API_VERSION, "data": data}
 
     if dry_run:
-        print(f"[dry-run] {method} {url}")
-        print(f"[dry-run] payload: {json.dumps(payload, indent=2)}")
+        logger.info(f"[dry-run] {method} {url}")
+        logger.info(f"[dry-run] payload: {json.dumps(payload, indent=2)}")
         return None
 
     headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
@@ -139,17 +142,17 @@ def _ensure_ssh_key(api_key, ssh_key_path, api_url=DEFAULT_API_URL, dry_run=Fals
     if result is not None:
         for key in result.get("keys", []):
             if key.get("public_key", "").strip() == public_key:
-                print(f"SSH key already registered (id={key['id']}).")
+                logger.info(f"SSH key already registered (id={key['id']}).")
                 return key["id"]
 
     # Register new key
     key_name = os.path.basename(ssh_key_path)
-    print(f"Registering SSH key '{key_name}' on CloudRift...")
+    logger.info(f"Registering SSH key '{key_name}' on CloudRift...")
     add_result = _add_ssh_key(api_key, key_name, public_key, api_url, dry_run)
     if dry_run:
         return "dry-run-key-id"
     key_id = add_result["ssh_key"]["id"]
-    print(f"SSH key registered (id={key_id}).")
+    logger.info(f"SSH key registered (id={key_id}).")
     return key_id
 
 
@@ -163,7 +166,7 @@ def wait_for_status(api_key, instance_id, target_status, timeout, api_url=DEFAUL
         The instance dict if target status reached, None on timeout or fail status.
     """
     if dry_run:
-        print(f"[dry-run] Poll every {interval}s (up to {timeout}s) for status '{target_status}'")
+        logger.info(f"[dry-run] Poll every {interval}s (up to {timeout}s) for status '{target_status}'")
         return {"status": target_status}
 
     fail_statuses = fail_statuses or set()
@@ -172,7 +175,7 @@ def wait_for_status(api_key, instance_id, target_status, timeout, api_url=DEFAUL
     while elapsed < timeout:
         info = _get_instance_info(api_key, instance_id, api_url)
         if info is None:
-            print(f"Warning: instance {instance_id} not found.", file=__import__("sys").stderr)
+            logger.warning(f"Warning: instance {instance_id} not found.")
             time.sleep(interval)
             elapsed += interval
             continue
@@ -180,12 +183,12 @@ def wait_for_status(api_key, instance_id, target_status, timeout, api_url=DEFAUL
         if status == target_status:
             return info
         if status in fail_statuses:
-            print(f"Instance {instance_id} reached fail status '{status}'", file=__import__("sys").stderr)
+            logger.error(f"Instance {instance_id} reached fail status '{status}'")
             return None
         time.sleep(interval)
         elapsed += interval
 
-    print(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')", file=__import__("sys").stderr)
+    logger.error(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')")
     return None
 
 
@@ -222,8 +225,8 @@ def _extract_connection_info(instance, delete_info=()):
     )
 
 
-def _print_connection_info(instance):
-    """Print SSH connection info based on instance networking.
+def _log_connection_info(instance):
+    """Log SSH connection info based on instance networking.
 
     VMs provide login credentials in virtual_machines[].login_info.
     Port mappings are [internal_port, external_port] tuples.
@@ -249,21 +252,21 @@ def _print_connection_info(instance):
             break
 
     if ssh_ext_port and host:
-        print(f"Host:     {host}")
-        print(f"User:     {username}")
+        logger.info(f"Host:     {host}")
+        logger.info(f"User:     {username}")
         if password:
-            print(f"Password: {password}")
-        print(f"Connect:  ssh -p {ssh_ext_port} {username}@{host}")
+            logger.info(f"Password: {password}")
+        logger.info(f"Connect:  ssh -p {ssh_ext_port} {username}@{host}")
         for internal, external in port_mappings:
-            print(f"  Port {internal} -> {host}:{external}")
+            logger.info(f"  Port {internal} -> {host}:{external}")
     elif host:
-        print(f"Host:     {host}")
-        print(f"User:     {username}")
+        logger.info(f"Host:     {host}")
+        logger.info(f"User:     {username}")
         if password:
-            print(f"Password: {password}")
-        print(f"Connect:  ssh {username}@{host}")
+            logger.info(f"Password: {password}")
+        logger.info(f"Connect:  ssh {username}@{host}")
     else:
-        print("Warning: no host address found in instance info.")
+        logger.warning("Warning: no host address found in instance info.")
 
 
 def create_instance(
@@ -292,7 +295,7 @@ def create_instance(
         VMConnectionInfo on success, None on failure.
         In dry-run mode, returns a VMConnectionInfo with placeholder values.
     """
-    print(f"Creating CloudRift instance (type={instance_type})...")
+    logger.info(f"Creating CloudRift instance (type={instance_type})...")
 
     ssh_key_path = os.path.expanduser(ssh_key_path)
     if dry_run and not os.path.exists(ssh_key_path):
@@ -303,7 +306,7 @@ def create_instance(
 
     result = _rent_instance(api_key, instance_type, [public_key], image_url=image_url, ports=ports, api_url=api_url, dry_run=dry_run)
     if dry_run:
-        print("[dry-run] Would wait for Active status, then print connection info.")
+        logger.info("[dry-run] Would wait for Active status, then print connection info.")
         return VMConnectionInfo(
             host="dry-run-host",
             username="riftuser",
@@ -313,21 +316,21 @@ def create_instance(
 
     instance_ids = result.get("instance_ids", [])
     if not instance_ids:
-        print("Error: no instance ID returned from rent API.", file=__import__("sys").stderr)
+        logger.error("Error: no instance ID returned from rent API.")
         return None
     instance_id = instance_ids[0]
-    print(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
+    logger.info(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
 
     info = wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
     if info is None:
         return None
 
-    print("Instance is Active.")
+    logger.info("Instance is Active.")
     conn = _extract_connection_info(info, delete_info=("cloudrift", instance_id))
-    _print_connection_info(info)
+    _log_connection_info(info)
 
     if wait_ssh and ssh_private_key_path:
-        print("Waiting for SSH connectivity...")
+        logger.info("Waiting for SSH connectivity...")
         wait_for_ssh(conn.host, conn.username, conn.ssh_port, ssh_private_key_path)
 
     return conn
@@ -335,10 +338,10 @@ def create_instance(
 
 def delete_instance(api_key, instance_id, api_url=DEFAULT_API_URL, dry_run=False):
     """Terminate a CloudRift instance."""
-    print(f"Terminating CloudRift instance '{instance_id}'...")
+    logger.info(f"Terminating CloudRift instance '{instance_id}'...")
 
     _terminate_instance(api_key, instance_id, api_url, dry_run)
 
     if not dry_run:
-        print("Instance terminated.")
+        logger.info("Instance terminated.")
     return True

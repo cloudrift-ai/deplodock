@@ -1,9 +1,11 @@
 """Provider-agnostic SSH readiness polling."""
 
-import sys
+import logging
 import time
 
 from deplodock.provisioning.ssh_transport import ssh_base_args
+
+logger = logging.getLogger(__name__)
 
 
 def wait_for_ssh(host, username, ssh_port, ssh_key_path, timeout=120, interval=5):
@@ -30,5 +32,5 @@ def wait_for_ssh(host, username, ssh_port, ssh_key_path, timeout=120, interval=5
         time.sleep(interval)
         elapsed += interval
 
-    print(f"Timeout after {timeout}s waiting for SSH connectivity to {address}:{ssh_port}", file=sys.stderr)
+    logger.error(f"Timeout after {timeout}s waiting for SSH connectivity to {address}:{ssh_port}")
     return False

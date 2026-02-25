@@ -12,6 +12,8 @@ from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
 from deplodock.provisioning import cloudrift as cr_provider
 from deplodock.provisioning import gcp as gcp_provider
 
+logger = logging.getLogger(__name__)
+
 
 def resolve_vm_spec(loaded_configs, server_name=None):
     """Resolve GPU type and count from pre-loaded recipe configs for VM provisioning.
@@ -170,7 +172,7 @@ def delete_cloud_vm(delete_info, dry_run=False):
     if provider == "cloudrift":
         instance_id = delete_info[1]
         if dry_run:
-            print(f"[dry-run] cloudrift: terminate instance {instance_id}")
+            logger.info(f"[dry-run] cloudrift: terminate instance {instance_id}")
             return
         api_key = os.environ.get("CLOUDRIFT_API_KEY", "")
         cr_provider.delete_instance(api_key, instance_id)

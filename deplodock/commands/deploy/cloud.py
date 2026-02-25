@@ -1,5 +1,6 @@
 """Cloud deploy target CLI handler."""
 
+import logging
 import os
 import sys
 
@@ -13,6 +14,8 @@ from deplodock.provisioning.cloud import (
 from deplodock.provisioning.remote import provision_remote
 from deplodock.recipe import load_recipe
 
+logger = logging.getLogger(__name__)
+
 # ── CLI handler ────────────────────────────────────────────────────
 
 
@@ -21,7 +24,7 @@ def handle_cloud(args):
     recipe = load_recipe(args.recipe)
 
     if not recipe.deploy.gpu:
-        print("Error: recipe must have a 'deploy.gpu' field for cloud provisioning.", file=sys.stderr)
+        logger.error("Error: recipe must have a 'deploy.gpu' field for cloud provisioning.")
         sys.exit(1)
 
     ssh_key = os.path.expanduser(args.ssh_key)
@@ -35,7 +38,7 @@ def handle_cloud(args):
         dry_run=args.dry_run,
     )
     if conn is None:
-        print("Error: VM provisioning failed.", file=sys.stderr)
+        logger.error("Error: VM provisioning failed.")
         sys.exit(1)
 
     params = DeployParams(

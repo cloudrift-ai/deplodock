@@ -126,18 +126,18 @@ def test_resolve_vm_spec_missing_gpu_raises(tmp_path):
 # ── delete_cloud_vm ──────────────────────────────────────────────
 
 
-def test_delete_cloud_vm_cloudrift_dry_run(capsys):
-    delete_cloud_vm(("cloudrift", "test-instance-id"), dry_run=True)
-    output = capsys.readouterr().out
-    assert "[dry-run]" in output
-    assert "test-instance-id" in output
+def test_delete_cloud_vm_cloudrift_dry_run(caplog):
+    with caplog.at_level("INFO"):
+        delete_cloud_vm(("cloudrift", "test-instance-id"), dry_run=True)
+    assert "[dry-run]" in caplog.text
+    assert "test-instance-id" in caplog.text
 
 
-def test_delete_cloud_vm_gcp_dry_run(capsys):
-    delete_cloud_vm(("gcp", "bench-test", "us-central1-b"), dry_run=True)
-    output = capsys.readouterr().out
-    assert "[dry-run]" in output
-    assert "bench-test" in output
+def test_delete_cloud_vm_gcp_dry_run(caplog):
+    with caplog.at_level("INFO"):
+        delete_cloud_vm(("gcp", "bench-test", "us-central1-b"), dry_run=True)
+    assert "[dry-run]" in caplog.text
+    assert "bench-test" in caplog.text
 
 
 # ── VMConnectionInfo ─────────────────────────────────────────────
