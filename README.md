@@ -188,6 +188,43 @@ experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/
       ...
 ```
 
+## CI Benchmark Workflow
+
+External developers can submit experiments via pull requests. A maintainer triggers benchmarks by commenting `/run-experiment` on the PR.
+
+### How It Works
+
+1. **Submit a PR** with an experiment definition in `experiments/{model}/{experiment}/recipe.yaml`
+2. **A maintainer reviews** and comments `/run-experiment` on the PR
+3. **CI runs benchmarks** on cloud GPUs, commits results back to the PR branch
+4. **Review results** in the PR comment summary and committed files
+
+### Trigger Modes
+
+```
+/run-experiment                                          # Auto-detect: benchmarks all experiments changed in the PR
+/run-experiment experiments/MyModel/my_experiment         # Explicit: benchmark specific experiment(s)
+```
+
+Only users with **write** or **admin** access to the repository can trigger benchmarks.
+
+### Fork PRs
+
+For the workflow to push results back to a fork's branch, the PR must have **"Allow edits from maintainers"** checked (this is the GitHub default). If unchecked, results are still available as downloadable workflow artifacts.
+
+### Setup
+
+The workflow requires a GitHub App for authentication. See `.github/workflows/experiment.yml` for the full configuration. Required repository secrets:
+
+| Secret | Description |
+|--------|-------------|
+| `EXPERIMENT_APP_ID` | GitHub App ID |
+| `EXPERIMENT_APP_PRIVATE_KEY` | GitHub App private key (.pem) |
+| `HF_TOKEN` | HuggingFace API token |
+| `CLOUDRIFT_API_KEY` | CloudRift API key (if using CloudRift GPUs) |
+| `GCP_SERVICE_ACCOUNT_KEY` | GCP service account JSON key (if using GCP GPUs) |
+| `GCP_SERVICE_ACCOUNT` | GCP service account email (if using GCP GPUs) |
+
 ## Deploy Targets
 
 ### Local
