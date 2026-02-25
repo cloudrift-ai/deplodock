@@ -63,7 +63,7 @@ def scp_file(local_path, server, ssh_key, ssh_port, remote_path):
     scp_args += [local_path, f"{server}:{remote_path}"]
 
     result = subprocess.run(scp_args, capture_output=True, text=True)
-    return result.returncode
+    return result.returncode, result.stderr or ""
 
 
 def make_write_file(server, ssh_key, ssh_port, dry_run=False):
@@ -81,9 +81,9 @@ def make_write_file(server, ssh_key, ssh_port, dry_run=False):
             tmp_path = f.name
 
         try:
-            rc = scp_file(tmp_path, server, ssh_key, ssh_port, remote_path)
+            rc, stderr = scp_file(tmp_path, server, ssh_key, ssh_port, remote_path)
             if rc != 0:
-                print(f"Failed to SCP {path} to {server}:{remote_path}", file=sys.stderr)
+                print(f"Failed to SCP {path} to {server}:{remote_path}: {stderr}", file=sys.stderr)
         finally:
             os.unlink(tmp_path)
 

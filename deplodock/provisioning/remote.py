@@ -1,6 +1,7 @@
 """Remote server provisioning: install Docker, NVIDIA toolkit, etc."""
 
 import subprocess
+import sys
 
 from deplodock.provisioning.ssh_transport import ssh_base_args
 
@@ -20,6 +21,8 @@ def provision_remote(server, ssh_key, ssh_port, dry_run=False):
         args = ssh_base_args(server, ssh_key, ssh_port)
         args.append(command)
         result = subprocess.run(args, capture_output=True, text=True)
+        if result.returncode != 0 and result.stderr:
+            print(f"SSH error ({server}): {result.stderr.strip()}", file=sys.stderr)
         if capture:
             return result.returncode, result.stdout.strip()
         return result.returncode, ""
