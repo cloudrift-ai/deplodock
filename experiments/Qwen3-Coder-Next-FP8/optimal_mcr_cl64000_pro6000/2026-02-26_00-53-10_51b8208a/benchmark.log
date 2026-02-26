@@ -7833,3 +7833,24 @@ Example curl:
     }'
 [2026-02-26 01:08:15] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
 [2026-02-26 01:11:45] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl64000_pro6000/2026-02-26_00-53-10_51b8208a/pro6000_in8000_out8000_vllm_benchmark.txt
+[2026-02-26 01:11:45] [committer] Committed: bench: completed pro6000_in8000_out8000 (Qwen/Qwen3-Coder-Next-FP8)
+[2026-02-26 01:11:45] [committer] Pushed results to remote
+[2026-02-26 01:11:45] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-26 01:11:45] [orchestrate] Tearing down...
+[2026-02-26 01:11:45] [ssh_transport] Warning: Permanently added '8.12.12.230' (ED25519) to the list of known hosts.
+[2026-02-26 01:11:47] [ssh_transport]  Container vllm_0  Stopping
+[2026-02-26 01:11:48] [ssh_transport]  Container vllm_0  Stopped
+[2026-02-26 01:11:48] [ssh_transport]  Container vllm_0  Removing
+[2026-02-26 01:11:49] [ssh_transport]  Container vllm_0  Removed
+[2026-02-26 01:11:49] [ssh_transport]  Network deploy_default  Removing
+[2026-02-26 01:11:49] [ssh_transport]  Network deploy_default  Removed
+[2026-02-26 01:11:49] [orchestrate] Teardown complete.
+[2026-02-26 01:11:49] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Recipe: experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl64000_pro6000 (variant: pro6000_in64000_out8000)
+[2026-02-26 01:11:49] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploying model...
+[2026-02-26 01:11:50] [orchestrate] Pulling images...
+[2026-02-26 01:11:50] [ssh_transport] Warning: Permanently added '8.12.12.230' (ED25519) to the list of known hosts.
+[2026-02-26 01:11:51] [ssh_transport]  vllm_0 Pulling 
+[2026-02-26 01:11:51] [ssh_transport]  vllm_0 Pulled 
+[2026-02-26 01:11:51] [orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-02-26 01:11:52] [ssh_transport] Warning: Permanently added '8.12.12.230' (ED25519) to the list of known hosts.
+[2026-02-26 01:11:52] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl64000_pro6000/2026-02-26_00-53-10_51b8208a/pro6000_in32000_out8000_vllm_benchmark.txt
