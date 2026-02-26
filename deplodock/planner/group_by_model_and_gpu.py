@@ -44,7 +44,7 @@ class GroupByModelAndGpuPlanner(BenchmarkPlanner):
                 for i, task in enumerate(group_tasks):
                     sub_groups[i % n_splits].append(task)
 
-                for sub in sub_groups:
+                for idx, sub in enumerate(sub_groups):
                     if sub:
                         max_count = max(t.gpu_count for t in sub)
                         result.append(
@@ -52,6 +52,7 @@ class GroupByModelAndGpuPlanner(BenchmarkPlanner):
                                 gpu_name=gpu,
                                 gpu_count=max_count,
                                 tasks=sub,
+                                index=idx + 1,
                             )
                         )
         return result

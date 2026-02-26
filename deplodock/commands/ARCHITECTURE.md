@@ -75,7 +75,7 @@ Groups benchmark tasks into execution groups for VM allocation.
 
 **Abstract interface (`planner/__init__.py`):**
 - `BenchmarkTask` — one recipe+variant combination (recipe_dir, variant, recipe, gpu_name, gpu_count); includes `task_id` property, `to_dict()`, `setup_run_dir()`, and static methods for run directory management (`compute_code_hash()`, `create_run_dir()`, `write_tasks_json()`, `read_tasks_json()`)
-- `ExecutionGroup` — group of tasks sharing one VM (gpu_name, gpu_count, tasks)
+- `ExecutionGroup` — group of tasks sharing one VM (gpu_name, gpu_count, tasks, index); `gpu_short` property returns short GPU name, `label` property returns unique label (e.g. `rtx5090_x_8` or `rtx5090_x_8_r01` when index is set)
 - `BenchmarkPlanner` — ABC with `plan(tasks) -> list[ExecutionGroup]`
 
 **Implementations:**

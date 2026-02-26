@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from deplodock.planner import BenchmarkTask
+from deplodock.planner import BenchmarkTask, ExecutionGroup
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 from deplodock.recipe import ModelConfig, Recipe
 
@@ -203,3 +203,37 @@ def test_gpu_concurrency_subgroup_gpu_count():
     assert len(groups) == 2
     assert groups[0].gpu_count == 8
     assert groups[1].gpu_count == 4
+
+
+# ── ExecutionGroup label ─────────────────────────────────────────
+
+
+def test_execution_group_label():
+    """label property returns correct format with and without index."""
+    group = ExecutionGroup(gpu_name="NVIDIA GeForce RTX 5090", gpu_count=8)
+    assert group.label == "rtx5090_x_8"
+
+    group_indexed = ExecutionGroup(gpu_name="NVIDIA GeForce RTX 5090", gpu_count=8, index=1)
+    assert group_indexed.label == "rtx5090_x_8_r01"
+
+    group_indexed_high = ExecutionGroup(gpu_name="NVIDIA GeForce RTX 5090", gpu_count=8, index=12)
+    assert group_indexed_high.label == "rtx5090_x_8_r12"
+
+
+def test_execution_group_gpu_short():
+    """gpu_short property returns the short GPU name."""
+    group = ExecutionGroup(gpu_name="NVIDIA GeForce RTX 5090", gpu_count=1)
+    assert group.gpu_short == "rtx5090"
+
+
+def test_gpu_concurrency_unique_labels():
+    """All groups from a concurrent split have unique labels."""
+    planner = GroupByModelAndGpuPlanner(gpu_concurrency=3)
+    tasks = [
+        _make_task(model="org/m", gpu="NVIDIA GeForce RTX 5090", gpu_count=8),
+        _make_task(model="org/m", gpu="NVIDIA GeForce RTX 5090", gpu_count=4),
+        _make_task(model="org/m", gpu="NVIDIA GeForce RTX 5090", gpu_count=2),
+    ]
+    groups = planner.plan(tasks)
+    labels = [g.label for g in groups]
+    assert len(labels) == len(set(labels)), f"Duplicate labels: {labels}"

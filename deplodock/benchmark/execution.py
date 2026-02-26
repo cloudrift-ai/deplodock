@@ -20,7 +20,6 @@ from deplodock.deploy import (
     teardown as teardown_entry,
 )
 from deplodock.deploy.compose import generate_compose
-from deplodock.hardware import gpu_short_name
 from deplodock.planner import BenchmarkTask, ExecutionGroup
 from deplodock.provisioning.cloud import (
     delete_cloud_vm,
@@ -97,8 +96,7 @@ async def run_execution_group(
     hf_token = os.environ.get("HF_TOKEN", "")
     providers_config = config.get("providers", {})
 
-    short = gpu_short_name(group.gpu_name)
-    group_label = f"{short}_x_{group.gpu_count}"
+    group_label = group.label
     logger = _get_group_logger(group)
 
     # Attach per-group log file if we have a run_dir from the first task

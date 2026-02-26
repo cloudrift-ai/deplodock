@@ -5,7 +5,6 @@ import logging
 import sys
 from pathlib import Path
 
-from deplodock.hardware import gpu_short_name
 from deplodock.planner import ExecutionGroup
 from deplodock.redact import SecretRedactingFilter
 
@@ -135,8 +134,7 @@ def add_group_file_handler(run_dir: Path, group_label: str) -> logging.Handler:
 
 def _get_group_logger(group: ExecutionGroup, model_name: str | None = None) -> logging.Logger:
     """Get a logger for an execution group."""
-    short = gpu_short_name(group.gpu_name)
-    group_label = f"{short}_x_{group.gpu_count}"
+    group_label = group.label
     if model_name:
         short_model = model_name.split("/")[-1] if "/" in model_name else model_name
         return logging.getLogger(f"{group_label}.{short_model}")

@@ -111,6 +111,20 @@ class ExecutionGroup:
     gpu_name: str
     gpu_count: int
     tasks: list[BenchmarkTask] = field(default_factory=list)
+    index: int | None = None
+
+    @property
+    def gpu_short(self) -> str:
+        """Short GPU name (e.g. 'rtx5090')."""
+        return gpu_short_name(self.gpu_name)
+
+    @property
+    def label(self) -> str:
+        """Unique group label (e.g. 'rtx5090_x_8' or 'rtx5090_x_8_r01')."""
+        base = f"{self.gpu_short}_x_{self.gpu_count}"
+        if self.index is not None:
+            return f"{base}_r{self.index:02d}"
+        return base
 
 
 class BenchmarkPlanner(ABC):
