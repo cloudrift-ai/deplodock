@@ -1,9 +1,12 @@
-"""Benchmark run tracking: code hash, run directories, and manifests."""
+"""Benchmark run tracking: code hash, run directories, and task metadata."""
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
+
+import yaml
 
 
 def compute_code_hash() -> str:
@@ -33,27 +36,43 @@ def create_run_dir(base_dir: str) -> Path:
     return run_dir
 
 
-def write_manifest(run_dir, timestamp, code_hash, recipes, tasks_metadata):
-    """Write manifest.json to run_dir.
+def write_tasks_json(run_dir, tasks_meta: list[dict]):
+    """Write tasks.json to run_dir. Called once at run start.
 
     Args:
         run_dir: Path to the run directory.
-        timestamp: ISO-format timestamp string.
-        code_hash: Full SHA256 hex digest.
-        recipes: List of recipe names.
-        tasks_metadata: List of task metadata dicts.
+        tasks_meta: List of task identity dicts (no status field).
     """
-    manifest = {
-        "timestamp": timestamp,
-        "code_hash": code_hash,
-        "recipes": recipes,
-        "tasks": tasks_metadata,
+    tasks_path = Path(run_dir) / "tasks.json"
+    tasks_path.write_text(json.dumps(tasks_meta, indent=2) + "\n")
+
+
+def read_tasks_json(run_dir) -> list[dict]:
+    """Read and return parsed tasks.json from run_dir."""
+    tasks_path = Path(run_dir) / "tasks.json"
+    return json.loads(tasks_path.read_text())
+
+
+_TASK_SECTION_RE = re.compile(
+    r"={3,}\s*Benchmark Task\s*={3,}\s*\n(.*?)\n={3,}",
+    re.DOTALL,
+)
+
+
+def parse_task_from_result(result_file) -> dict | None:
+    """Parse the 'Benchmark Task' YAML section from a result .txt file.
+
+    Returns a dict with variant, gpu_name, gpu_count, model_name,
+    or None if the section is not found.
+    """
+    content = Path(result_file).read_text()
+    m = _TASK_SECTION_RE.search(content)
+    if not m:
+        return None
+    data = yaml.safe_load(m.group(1))
+    return {
+        "variant": data["variant"],
+        "gpu_name": data["gpu_name"],
+        "gpu_count": data["gpu_count"],
+        "model_name": data["recipe"]["model"]["huggingface"],
     }
-    manifest_path = Path(run_dir) / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-
-
-def read_manifest(run_dir) -> dict:
-    """Read and return parsed manifest.json from run_dir."""
-    manifest_path = Path(run_dir) / "manifest.json"
-    return json.loads(manifest_path.read_text())

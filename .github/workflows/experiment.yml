@@ -154,6 +154,11 @@ jobs:
           echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-key.json" >> "$GITHUB_ENV"
           echo "GCP_SERVICE_ACCOUNT=${{ secrets.GCP_SERVICE_ACCOUNT }}" >> "$GITHUB_ENV"
 
+      - name: Configure git for result commits
+        run: |
+          git config user.name "deplodock-experiment-bot"
+          git config user.email "deplodock-experiment-bot[bot]@users.noreply.github.com"
+
       - name: Run benchmarks
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -162,23 +167,23 @@ jobs:
           experiments='${{ needs.gate.outputs.experiments }}'
           gpu_concurrency='${{ needs.gate.outputs.gpu_concurrency }}'
           dirs=$(echo "$experiments" | python -c "import sys, json; print(' '.join(json.load(sys.stdin)))")
-          cmd="./venv/bin/deplodock bench $dirs"
+          cmd="./venv/bin/deplodock bench $dirs --commit-results"
           if [ "$gpu_concurrency" -gt 1 ] 2>/dev/null; then
             cmd="$cmd --gpu-concurrency $gpu_concurrency"
           fi
           $cmd
 
-      - name: Collect and commit results
+      - name: Collect and commit remaining results
         if: always()
         run: |
           experiments='${{ needs.gate.outputs.experiments }}'
           dirs=$(echo "$experiments" | python -c "import sys, json; print(' '.join(json.load(sys.stdin)))")
 
-          # Find new run directories (timestamped dirs with manifest.json)
+          # Find new run directories (timestamped dirs with tasks.json)
           result_files=""
           for dir in $dirs; do
             for run_dir in "$dir"/[0-9][0-9][0-9][0-9]-*/; do
-              if [ -f "$run_dir/manifest.json" ]; then
+              if [ -f "$run_dir/tasks.json" ]; then
                 result_files="$result_files $run_dir"
               fi
             done
@@ -189,16 +194,14 @@ jobs:
             exit 0
           fi
 
-          # Force-add results (gitignored by default)
+          # Force-add any uncommitted results (catch-up for anything missed)
           git add --force $result_files
           if git diff --cached --quiet; then
             echo "No new results to commit"
             exit 0
           fi
 
-          git config user.name "deplodock-experiment-bot"
-          git config user.email "deplodock-experiment-bot[bot]@users.noreply.github.com"
-          git commit -m "Add experiment benchmark results
+          git commit -m "bench: collect remaining results
 
           Triggered by /run-experiment in PR #${{ needs.gate.outputs.pr_number }}"
           git push || echo "::warning::Failed to push results to PR branch (fork may not allow edits from maintainers)"

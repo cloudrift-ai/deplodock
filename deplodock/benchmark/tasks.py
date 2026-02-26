@@ -77,15 +77,21 @@ def enumerate_tasks(recipe_dirs):
     return tasks
 
 
-def _task_meta(task: BenchmarkTask, status: str) -> dict:
-    """Build a task metadata dict for the manifest."""
+def task_identity(task: BenchmarkTask) -> dict:
+    """Build a task identity dict for tasks.json (no status field)."""
     return {
-        "recipe": task.recipe_name,
         "variant": task.variant,
+        "result_file": str(task.result_path().relative_to(task.run_dir)),
         "gpu_name": task.gpu_name,
         "gpu_short": gpu_short_name(task.gpu_name),
         "gpu_count": task.gpu_count,
         "model_name": task.model_name,
-        "result_file": str(task.result_path().relative_to(task.run_dir)),
-        "status": status,
     }
+
+
+def _task_meta(task: BenchmarkTask, status: str) -> dict:
+    """Build a task metadata dict with status for the SUMMARY section."""
+    meta = task_identity(task)
+    meta["recipe"] = task.recipe_name
+    meta["status"] = status
+    return meta

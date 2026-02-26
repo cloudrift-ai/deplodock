@@ -1,7 +1,9 @@
 """Benchmark execution: run execution groups on cloud VMs."""
 
 import asyncio
+import logging
 import os
+from collections.abc import Awaitable, Callable
 
 from deplodock.benchmark.bench_logging import _get_group_logger, active_run_dir
 from deplodock.benchmark.system_info import collect_system_info
@@ -18,13 +20,30 @@ from deplodock.deploy import (
 )
 from deplodock.deploy.compose import generate_compose
 from deplodock.hardware import gpu_short_name
-from deplodock.planner import ExecutionGroup
+from deplodock.planner import BenchmarkTask, ExecutionGroup
 from deplodock.provisioning.cloud import (
     delete_cloud_vm,
     provision_cloud_vm,
 )
 from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_transport import make_run_cmd
+
+OnTaskDone = Callable[[BenchmarkTask, dict], Awaitable[None]]
+
+
+async def _invoke_callback(
+    on_task_done: OnTaskDone | None,
+    task: BenchmarkTask,
+    meta: dict,
+    logger: logging.Logger,
+):
+    """Invoke the on_task_done callback, catching and logging any errors."""
+    if on_task_done is None:
+        return
+    try:
+        await on_task_done(task, meta)
+    except Exception as e:
+        logger.warning(f"on_task_done callback failed: {e}")
 
 
 def _build_instance_info(group: ExecutionGroup, group_label: str, conn) -> dict:
@@ -53,12 +72,18 @@ async def run_execution_group(
     ssh_key: str,
     dry_run: bool = False,
     no_teardown: bool = False,
+    on_task_done: OnTaskDone | None = None,
 ) -> tuple[list[dict], dict | None]:
     """Run all benchmark tasks for one execution group.
 
     Provisions a VM with group.gpu_count GPUs, then runs each task.
     Tasks with fewer GPUs than the group get gpu_device_ids set.
     Each task's run_dir (set before calling) determines where results go.
+
+    Args:
+        on_task_done: Optional async callback invoked after each task completes
+            (success or failure). Receives (task, meta_dict). Exceptions are
+            caught and logged, never propagated.
 
     Returns:
         A tuple of (task_metadata_list, instance_info). instance_info is
@@ -89,7 +114,9 @@ async def run_execution_group(
         if conn is None:
             logger.error("VM provisioning failed")
             for task in group.tasks:
-                task_results.append(_task_meta(task, status="failed"))
+                meta = _task_meta(task, status="failed")
+                task_results.append(meta)
+                await _invoke_callback(on_task_done, task, meta, logger)
             return task_results, None
 
         logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
@@ -129,7 +156,9 @@ async def run_execution_group(
 
             if not success:
                 task_logger.error("Deploy failed, skipping benchmark")
-                task_results.append(_task_meta(task, status="failed"))
+                meta = _task_meta(task, status="failed")
+                task_results.append(meta)
+                await _invoke_callback(on_task_done, task, meta, task_logger)
                 continue
 
             task_logger.info("Running benchmark...")
@@ -149,12 +178,16 @@ async def run_execution_group(
                     task_logger.info(f"Results saved to: {result_path}")
                 else:
                     task_logger.info(f"[dry-run] Would save results to: {result_path}")
-                task_results.append(_task_meta(task, status="completed"))
+                meta = _task_meta(task, status="completed")
+                task_results.append(meta)
+                await _invoke_callback(on_task_done, task, meta, task_logger)
             else:
                 task_logger.error("Benchmark failed")
                 if output:
                     task_logger.error(output)
-                task_results.append(_task_meta(task, status="failed"))
+                meta = _task_meta(task, status="failed")
+                task_results.append(meta)
+                await _invoke_callback(on_task_done, task, meta, task_logger)
 
             if not no_teardown:
                 task_logger.info("Tearing down...")
@@ -178,7 +211,15 @@ async def run_execution_group(
     return task_results, instance_info
 
 
-async def _run_groups(groups, config, ssh_key, dry_run, max_workers, no_teardown=False):
+async def _run_groups(
+    groups,
+    config,
+    ssh_key,
+    dry_run,
+    max_workers,
+    no_teardown=False,
+    on_task_done: OnTaskDone | None = None,
+):
     """Run execution groups concurrently with a semaphore."""
     sem = asyncio.Semaphore(max_workers or len(groups))
 
@@ -190,6 +231,7 @@ async def _run_groups(groups, config, ssh_key, dry_run, max_workers, no_teardown
                 ssh_key,
                 dry_run,
                 no_teardown,
+                on_task_done,
             )
 
     results = await asyncio.gather(

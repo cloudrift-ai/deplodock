@@ -63,12 +63,12 @@ VM lifecycle management and cloud provisioning.
 Benchmark tracking, configuration, task enumeration, and execution.
 
 **Modules:**
-- `tracking.py` — `compute_code_hash()`, `create_run_dir()`, `write_manifest()`, `read_manifest()`
+- `tracking.py` — `compute_code_hash()`, `create_run_dir()`, `write_tasks_json()`, `read_tasks_json()`, `parse_task_from_result()`
 - `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
 - `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_BenchConsoleFormatter`
 - `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
-- `tasks.py` — `enumerate_tasks()`, `_task_meta()`
-- `execution.py` — `run_execution_group()`, `_run_groups()`
+- `tasks.py` — `enumerate_tasks()`, `_task_meta()`, `task_identity()`
+- `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type
 
 ### `deplodock/report/` — Report Library
 
@@ -77,7 +77,7 @@ Excel report generation from benchmark results.
 **Modules:**
 - `parser.py` — `parse_benchmark_result()`
 - `pricing.py` — `get_gpu_price()`
-- `collector.py` — `load_config()`, `collect_tasks_from_manifests()`
+- `collector.py` — `load_config()`, `collect_tasks_from_results()`
 - `generator.py` — `generate_report()`
 
 ### `planner/` — Planner Layer
@@ -105,7 +105,7 @@ async def _handle_foo(args):
 ```
 
 **Command modules:**
-- `commands/bench/` — `handle_bench()`, `register_bench_command()`
+- `commands/bench/` — `handle_bench()`, `register_bench_command()`, `GitCommitter` (incremental result commits)
 - `commands/deploy/ssh.py` — `handle_ssh()`, `register_ssh_target()`
 - `commands/deploy/local.py` — `handle_local()`, `register_local_target()`
 - `commands/deploy/cloud.py` — `handle_cloud()`, `register_cloud_target()`
@@ -125,6 +125,7 @@ enumerate_tasks() -> list[BenchmarkTask]
 Create per-recipe run directories:
     +-- for each recipe_dir: create_run_dir(recipe_dir)
     +-- assign task.run_dir per task
+    +-- write tasks.json per run_dir
     |
     v
 GroupByModelAndGpuPlanner.plan() -> list[ExecutionGroup]
@@ -141,6 +142,7 @@ For each task in group:
     +-- deploy(DeployParams) -> compose up
     +-- run_benchmark_workload()
     +-- save results
+    +-- on_task_done callback (--commit-results: git add + commit + push)
     +-- teardown() (skipped with --no-teardown)
     |
     v

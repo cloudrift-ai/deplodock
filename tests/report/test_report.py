@@ -1,8 +1,8 @@
-"""Tests for manifest-based report generation."""
+"""Tests for tasks.json-based report generation."""
 
 import json
 
-from deplodock.report import collect_tasks_from_manifests, parse_benchmark_result
+from deplodock.report import collect_tasks_from_results, parse_benchmark_result
 
 SAMPLE_BENCHMARK = """\
 ============ Serving Benchmark Result ============
@@ -15,96 +15,91 @@ Mean TPOT (ms):                                 25.00
 
 
 def _write_run(results_dir, run_name, tasks, benchmark_content=SAMPLE_BENCHMARK):
-    """Helper to create a run directory with manifest and result files."""
+    """Helper to create a run directory with tasks.json and result files."""
     run_dir = results_dir / run_name
     run_dir.mkdir(parents=True)
 
-    manifest = {
-        "timestamp": "2026-02-23T14:30:00",
-        "code_hash": "abc123",
-        "recipes": list({t["recipe"] for t in tasks}),
-        "tasks": tasks,
-    }
-    (run_dir / "manifest.json").write_text(json.dumps(manifest))
+    tasks_json = []
+    for task in tasks:
+        tasks_json.append({k: v for k, v in task.items() if k not in ("recipe", "status")})
+
+    (run_dir / "tasks.json").write_text(json.dumps(tasks_json))
 
     for task in tasks:
-        result_path = run_dir / task["result_file"]
-        result_path.parent.mkdir(parents=True, exist_ok=True)
-        result_path.write_text(benchmark_content)
+        if task.get("status") != "failed":
+            result_path = run_dir / task["result_file"]
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(benchmark_content)
 
     return run_dir
 
 
-def test_collect_tasks_from_manifests(tmp_path):
+def test_collect_tasks_from_results(tmp_path):
     tasks = [
         {
-            "recipe": "MyModel",
             "variant": "RTX5090",
             "gpu_name": "NVIDIA GeForce RTX 5090",
             "gpu_short": "rtx5090",
             "gpu_count": 1,
             "model_name": "org/MyModel",
-            "result_file": "MyModel/RTX5090_vllm_benchmark.txt",
+            "result_file": "RTX5090_vllm_benchmark.txt",
             "status": "completed",
         },
     ]
     _write_run(tmp_path, "2026-02-23_14-30-00_abc12345", tasks)
 
-    collected = list(collect_tasks_from_manifests(tmp_path))
+    collected = list(collect_tasks_from_results(tmp_path))
     assert len(collected) == 1
     meta, path = collected[0]
     assert meta["gpu_short"] == "rtx5090"
     assert path.exists()
 
 
-def test_collect_skips_failed_tasks(tmp_path):
+def test_collect_skips_missing_results(tmp_path):
     tasks = [
         {
-            "recipe": "MyModel",
             "variant": "RTX5090",
             "gpu_name": "NVIDIA GeForce RTX 5090",
             "gpu_short": "rtx5090",
             "gpu_count": 1,
             "model_name": "org/MyModel",
-            "result_file": "MyModel/RTX5090_vllm_benchmark.txt",
+            "result_file": "RTX5090_vllm_benchmark.txt",
             "status": "failed",
         },
     ]
     _write_run(tmp_path, "2026-02-23_14-30-00_abc12345", tasks)
 
-    collected = list(collect_tasks_from_manifests(tmp_path))
+    collected = list(collect_tasks_from_results(tmp_path))
     assert len(collected) == 0
 
 
 def test_collect_multiple_runs(tmp_path):
     tasks1 = [
         {
-            "recipe": "A",
             "variant": "V1",
             "gpu_name": "G",
             "gpu_short": "g",
             "gpu_count": 1,
             "model_name": "m/A",
-            "result_file": "A/V1_vllm_benchmark.txt",
+            "result_file": "V1_vllm_benchmark.txt",
             "status": "completed",
         },
     ]
     tasks2 = [
         {
-            "recipe": "B",
             "variant": "V2",
             "gpu_name": "G",
             "gpu_short": "g",
             "gpu_count": 2,
             "model_name": "m/B",
-            "result_file": "B/V2_vllm_benchmark.txt",
+            "result_file": "V2_vllm_benchmark.txt",
             "status": "completed",
         },
     ]
     _write_run(tmp_path, "run1", tasks1)
     _write_run(tmp_path, "run2", tasks2)
 
-    collected = list(collect_tasks_from_manifests(tmp_path))
+    collected = list(collect_tasks_from_results(tmp_path))
     assert len(collected) == 2
 
 
