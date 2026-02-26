@@ -16,7 +16,7 @@ commands/vm ────► provisioning (create/delete instances)
 - `deplodock/deploy/` — compose generation, deploy orchestration
 - `deplodock/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
 - `deplodock/logging_setup.py` — CLI logging setup (`setup_cli_logging()`)
-- `deplodock/benchmark/` — tracking, config, logging, workload, tasks, execution, structured JSON results
+- `deplodock/benchmark/` — config, logging, workload, tasks, execution, structured JSON results
 
 ## Layers
 
@@ -59,14 +59,13 @@ VM lifecycle management and cloud provisioning.
 
 ### `deplodock/benchmark/` — Benchmark Library
 
-Benchmark tracking, configuration, task enumeration, and execution.
+Benchmark configuration, task enumeration, and execution.
 
 **Modules:**
-- `tracking.py` — `compute_code_hash()`, `create_run_dir()`, `write_tasks_json()`, `read_tasks_json()`, `parse_task_from_result()`
 - `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
 - `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_BenchConsoleFormatter`
 - `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
-- `tasks.py` — `enumerate_tasks()`, `_task_meta()`, `task_identity()`
+- `tasks.py` — `enumerate_tasks()`
 - `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type
 - `results.py` — `BenchmarkMetrics`, `SystemInfo` dataclasses, `parse_benchmark_metrics()`, `parse_system_info()`, `compose_json_result()`
 
@@ -75,7 +74,7 @@ Benchmark tracking, configuration, task enumeration, and execution.
 Groups benchmark tasks into execution groups for VM allocation.
 
 **Abstract interface (`planner/__init__.py`):**
-- `BenchmarkTask` — one recipe+variant combination (recipe_dir, variant, recipe, gpu_name, gpu_count)
+- `BenchmarkTask` — one recipe+variant combination (recipe_dir, variant, recipe, gpu_name, gpu_count); includes `task_id` property, `to_dict()`, `setup_run_dir()`, and static methods for run directory management (`compute_code_hash()`, `create_run_dir()`, `write_tasks_json()`, `read_tasks_json()`)
 - `ExecutionGroup` — group of tasks sharing one VM (gpu_name, gpu_count, tasks)
 - `BenchmarkPlanner` — ABC with `plan(tasks) -> list[ExecutionGroup]`
 

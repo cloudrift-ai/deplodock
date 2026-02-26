@@ -22,7 +22,7 @@ def _build_variant_name(gpu_name, combination, variable_keys):
     return short
 
 
-def enumerate_tasks(recipe_dirs):
+def enumerate_tasks(recipe_dirs) -> list[BenchmarkTask]:
     """Build BenchmarkTask list from recipe dirs using matrices.
 
     For each recipe dir, reads the raw YAML, extracts matrices entries,
@@ -75,24 +75,3 @@ def enumerate_tasks(recipe_dirs):
                 )
 
     return tasks
-
-
-def task_identity(task: BenchmarkTask) -> dict:
-    """Build a task identity dict for tasks.json (no status field)."""
-    return {
-        "variant": task.variant,
-        "result_file": str(task.result_path().relative_to(task.run_dir)),
-        "json_result_file": str(task.json_result_path().relative_to(task.run_dir)),
-        "gpu_name": task.gpu_name,
-        "gpu_short": gpu_short_name(task.gpu_name),
-        "gpu_count": task.gpu_count,
-        "model_name": task.model_name,
-    }
-
-
-def _task_meta(task: BenchmarkTask, status: str) -> dict:
-    """Build a task metadata dict with status for the SUMMARY section."""
-    meta = task_identity(task)
-    meta["recipe"] = task.recipe_name
-    meta["status"] = status
-    return meta

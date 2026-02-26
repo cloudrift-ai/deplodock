@@ -7,23 +7,19 @@ ExecutionGroups that share VMs; groups run in parallel via asyncio.
 import asyncio
 import json
 import logging
-import shutil
 import sys
 from pathlib import Path
 
 from deplodock.benchmark import (
     _expand_path,
     _run_groups,
-    _task_meta,
     add_file_handler,
-    create_run_dir,
     enumerate_tasks,
     load_config,
     setup_logging,
-    task_identity,
     validate_config,
-    write_tasks_json,
 )
+from deplodock.planner import BenchmarkTask
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
 
@@ -50,21 +46,17 @@ def handle_bench(args):
     for recipe_dir in args.recipes:
         resolved = str(Path(recipe_dir).resolve())
         if resolved not in recipe_run_dirs:
-            recipe_run_dirs[resolved] = create_run_dir(resolved)
+            recipe_run_dirs[resolved] = BenchmarkTask.create_run_dir(resolved)
 
     # Assign run_dir to each task and copy recipe files
     for task in tasks:
         resolved = str(Path(task.recipe_dir).resolve())
-        task.run_dir = recipe_run_dirs[resolved]
-        src = Path(task.recipe_dir) / "recipe.yaml"
-        dest = task.run_dir / "recipe.yaml"
-        if src.exists() and not dest.exists():
-            shutil.copy2(str(src), str(dest))
+        task.setup_run_dir(recipe_run_dirs[resolved])
 
     # Write tasks.json per run_dir
     for resolved, run_dir in recipe_run_dirs.items():
-        run_tasks = [task_identity(t) for t in tasks if str(Path(t.recipe_dir).resolve()) == resolved]
-        write_tasks_json(run_dir, run_tasks)
+        run_tasks = [t for t in tasks if str(Path(t.recipe_dir).resolve()) == resolved]
+        BenchmarkTask.write_tasks_json(run_dir, run_tasks)
 
     # Attach file handlers for each run directory
     log_file_paths = []
@@ -98,16 +90,15 @@ def handle_bench(args):
     raw_results = asyncio.run(_run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown, on_task_done))
 
     # Flatten results, handling exceptions
-    all_task_meta = []
+    all_results: list[tuple[BenchmarkTask, bool]] = []
     all_instance_infos = []
     for i, r in enumerate(raw_results):
         if isinstance(r, Exception):
             root_logger.error(f"Group {i} generated an exception: {r}")
-            for task in groups[i].tasks:
-                all_task_meta.append(_task_meta(task, status="failed"))
+            all_results.extend((t, False) for t in groups[i].tasks)
         else:
-            task_meta_list, instance_info = r
-            all_task_meta.extend(task_meta_list)
+            task_results, instance_info = r
+            all_results.extend(task_results)
             if instance_info is not None:
                 all_instance_infos.append(instance_info)
 
@@ -123,19 +114,19 @@ def handle_bench(args):
     root_logger.info("")
     root_logger.info("SUMMARY")
 
-    successful = [t for t in all_task_meta if t["status"] == "completed"]
-    failed = [t for t in all_task_meta if t["status"] != "completed"]
+    successful = [t for t, ok in all_results if ok]
+    failed = [t for t, ok in all_results if not ok]
 
-    root_logger.info(f"Successful: {len(successful)}/{len(all_task_meta)}")
+    root_logger.info(f"Successful: {len(successful)}/{len(all_results)}")
     if successful:
         for t in successful:
-            root_logger.info(f"   - {t['result_file']}")
+            root_logger.info(f"   - {t.task_id}")
 
     if failed:
         root_logger.info("")
-        root_logger.info(f"Failed: {len(failed)}/{len(all_task_meta)}")
+        root_logger.info(f"Failed: {len(failed)}/{len(all_results)}")
         for t in failed:
-            root_logger.info(f"   - {t['result_file']}")
+            root_logger.info(f"   - {t.task_id}")
 
     root_logger.info("")
     root_logger.info("All done!")

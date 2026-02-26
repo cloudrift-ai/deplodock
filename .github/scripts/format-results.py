@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Format benchmark results as a markdown PR comment.
 
-Reads tasks.json from experiment run directories and extracts metrics
-from benchmark result files (throughput, TTFT, TPOT).
+Reads tasks.json from experiment run directories and reports
+task_id + pass/fail status based on whether the result file exists.
 """
 
 import argparse
 import json
-import re
 from pathlib import Path
 
 
@@ -21,36 +20,12 @@ def find_latest_run_dir(experiment_dir: str) -> Path | None:
     return None
 
 
-def parse_result_file(filepath: Path) -> dict:
-    """Extract metrics from a benchmark result .txt file."""
-    metrics = {}
-    try:
-        content = filepath.read_text()
-    except FileNotFoundError:
-        return metrics
-
-    patterns = {
-        "total_throughput": r"Total [Tt]oken throughput \(tok/s\):\s+([\d.]+)",
-        "output_throughput": r"Output token throughput \(tok/s\):\s+([\d.]+)",
-        "request_throughput": r"Request throughput \(req/s\):\s+([\d.]+)",
-        "mean_ttft_ms": r"Mean TTFT \(ms\):\s+([\d.]+)",
-        "mean_tpot_ms": r"Mean TPOT \(ms\):\s+([\d.]+)",
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, content)
-        if match:
-            metrics[key] = float(match.group(1))
-
-    return metrics
-
-
 def format_comment(experiments: list[str]) -> str:
     """Build a markdown comment summarizing benchmark results."""
     lines = ["### Experiment benchmark results\n"]
 
     all_succeeded = True
     any_results = False
-    failed_tasks = []
 
     for experiment in experiments:
         exp_name = experiment.rstrip("/")
@@ -69,43 +44,21 @@ def format_comment(experiments: list[str]) -> str:
             lines.append("> No tasks found.\n")
             continue
 
-        # Derive status from whether result file exists
-        completed = []
-        failed = []
+        lines.append(f"#### `{exp_name}`\n")
+        lines.append("| Task | Status |")
+        lines.append("|------|--------|")
+
         for t in tasks:
+            task_id = t.get("task_id", t.get("result_file", "unknown"))
             result_path = run_dir / t["result_file"]
             if result_path.exists():
-                completed.append(t)
+                any_results = True
+                lines.append(f"| `{task_id}` | pass |")
             else:
-                failed.append(t)
+                all_succeeded = False
+                lines.append(f"| `{task_id}` | fail |")
 
-        if failed:
-            all_succeeded = False
-            for t in failed:
-                failed_tasks.append(f"`{exp_name}` — {t.get('result_file', 'unknown')}")
-
-        if completed:
-            any_results = True
-            lines.append(f"#### `{exp_name}`\n")
-            lines.append("| Result | GPU | Throughput (tok/s) | TTFT (ms) | TPOT (ms) |")
-            lines.append("|--------|-----|--------------------|-----------|-----------|")
-
-            for task in completed:
-                result_file = task.get("result_file", "")
-                gpu_short = task.get("gpu_short", "?")
-                gpu_count = task.get("gpu_count", 1)
-                gpu_label = f"{gpu_short} x{gpu_count}" if gpu_count > 1 else gpu_short
-
-                filepath = run_dir / result_file
-
-                metrics = parse_result_file(filepath)
-                throughput = f"{metrics['total_throughput']:.1f}" if "total_throughput" in metrics else "—"
-                ttft = f"{metrics['mean_ttft_ms']:.1f}" if "mean_ttft_ms" in metrics else "—"
-                tpot = f"{metrics['mean_tpot_ms']:.2f}" if "mean_tpot_ms" in metrics else "—"
-
-                lines.append(f"| `{result_file}` | {gpu_label} | {throughput} | {ttft} | {tpot} |")
-
-            lines.append("")
+        lines.append("")
 
     # Status summary
     if all_succeeded and any_results:
@@ -116,13 +69,6 @@ def format_comment(experiments: list[str]) -> str:
         status = "No benchmark results were produced."
 
     lines.insert(1, f"\n{status}\n")
-
-    # Failed tasks section
-    if failed_tasks:
-        lines.append("#### Failed tasks\n")
-        for ft in failed_tasks:
-            lines.append(f"- {ft}")
-        lines.append("")
 
     return "\n".join(lines)
 
