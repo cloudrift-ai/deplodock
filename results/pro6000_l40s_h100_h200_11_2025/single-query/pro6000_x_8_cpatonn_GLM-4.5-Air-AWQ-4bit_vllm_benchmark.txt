@@ -42,7 +42,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8000:8000"
@@ -78,7 +78,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8001:8000"
@@ -114,7 +114,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8002:8000"
@@ -150,7 +150,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8003:8000"
@@ -186,7 +186,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8004:8000"
@@ -222,7 +222,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8005:8000"
@@ -258,7 +258,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8006:8000"
@@ -294,7 +294,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8007:8000"
@@ -347,7 +347,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
       - CUDA_VISIBLE_DEVICES=""
     entrypoint: ["/bin/bash", "-c"]
