@@ -2,8 +2,12 @@
 """Detect experiment directories from a /run-experiment comment or git diff.
 
 Two modes:
-- Explicit: /run-experiment experiments/Foo/bar experiments/Baz/qux
-- Auto-detect: /run-experiment (no args) — finds changed experiments via git diff
+- Explicit: /run-experiment experiments/Foo/bar experiments/Baz/qux [--flags]
+- Auto-detect: /run-experiment (no args) [--flags] — finds changed experiments via git diff
+
+Any --flags in the comment are passed through to `deplodock bench` as-is.
+Outputs a complete bench command that the workflow appends --dry-run or
+--commit-results to.
 """
 
 import argparse
@@ -14,26 +18,25 @@ import sys
 from pathlib import Path
 
 
-def parse_explicit_paths(comment: str) -> list[str]:
-    """Extract experiment paths from the comment text after /run-experiment."""
+def parse_comment(comment):
+    """Split a /run-experiment comment into experiment paths and extra tokens.
+
+    Returns (experiments, extra_tokens) where experiments is a list of experiment
+    directory strings and extra_tokens is a list of remaining tokens (flags and
+    their values, in original order).
+    """
     parts = comment.strip().split()
-    # First token is /run-experiment, rest are paths (skip flags and their values)
-    return [p for p in parts[1:] if p.startswith("experiments/")]
+    experiments = []
+    extra = []
+    for token in parts[1:]:
+        if token.startswith("experiments/"):
+            experiments.append(token)
+        else:
+            extra.append(token)
+    return experiments, extra
 
 
-def parse_gpu_concurrency(comment: str) -> int:
-    """Extract --gpu-concurrency N from the comment, defaulting to 1."""
-    parts = comment.strip().split()
-    for i, token in enumerate(parts):
-        if token == "--gpu-concurrency" and i + 1 < len(parts):
-            try:
-                return max(1, int(parts[i + 1]))
-            except ValueError:
-                pass
-    return 1
-
-
-def detect_from_diff(base: str, head: str) -> list[str]:
+def detect_from_diff(base, head):
     """Find experiment directories with changes between base and head."""
     result = subprocess.run(
         ["git", "diff", "--name-only", f"{base}...{head}"],
@@ -47,7 +50,6 @@ def detect_from_diff(base: str, head: str) -> list[str]:
     for filepath in changed_files:
         if not filepath.startswith("experiments/"):
             continue
-        # Walk up from the changed file to find the directory containing recipe.yaml
         path = Path(filepath)
         for parent in [path.parent, *path.parent.parents]:
             if str(parent) == "experiments" or str(parent) == ".":
@@ -59,17 +61,6 @@ def detect_from_diff(base: str, head: str) -> list[str]:
     return sorted(experiment_dirs)
 
 
-def validate_experiments(dirs: list[str]) -> list[str]:
-    """Filter to directories that contain a recipe.yaml."""
-    valid = []
-    for d in dirs:
-        if Path(d, "recipe.yaml").exists():
-            valid.append(d)
-        else:
-            print(f"Warning: {d} does not contain recipe.yaml, skipping", file=sys.stderr)
-    return valid
-
-
 def main():
     parser = argparse.ArgumentParser(description="Detect experiments for CI benchmark")
     parser.add_argument("--comment", required=True, help="The /run-experiment comment text")
@@ -77,38 +68,35 @@ def main():
     parser.add_argument("--head", required=True, help="Head ref for git diff (e.g. HEAD)")
     args = parser.parse_args()
 
-    # Try explicit paths first
-    explicit = parse_explicit_paths(args.comment)
-    if explicit:
-        experiments = validate_experiments(explicit)
+    experiments, extra_tokens = parse_comment(args.comment)
+
+    if len(experiments) > 0:
         mode = "explicit"
     else:
         experiments = detect_from_diff(args.base, args.head)
-        experiments = validate_experiments(experiments)
         mode = "auto-detect"
 
     if not experiments:
         print(f"Error: No experiments found ({mode} mode)", file=sys.stderr)
         sys.exit(1)
 
-    gpu_concurrency = parse_gpu_concurrency(args.comment)
+    # Build the full bench command: deplodock bench <dirs> [flags]
+    bench_command = " ".join(["deplodock", "bench", *experiments, *extra_tokens])
 
     print(f"Detected experiments ({mode}):")
     for exp in experiments:
         print(f"  - {exp}")
-    if gpu_concurrency > 1:
-        print(f"GPU concurrency: {gpu_concurrency}")
+    print(f"Bench command: {bench_command}")
 
     # Write to GITHUB_OUTPUT
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a") as f:
             f.write(f"experiments={json.dumps(experiments)}\n")
-            f.write(f"gpu_concurrency={gpu_concurrency}\n")
+            f.write(f"bench_command={bench_command}\n")
     else:
-        # Running locally — just print the JSON
         print(json.dumps(experiments))
-        print(f"gpu_concurrency={gpu_concurrency}")
+        print(f"bench_command={bench_command}")
 
 
 if __name__ == "__main__":
