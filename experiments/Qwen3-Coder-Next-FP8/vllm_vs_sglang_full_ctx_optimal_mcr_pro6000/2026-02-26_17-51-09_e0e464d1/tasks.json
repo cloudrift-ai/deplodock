@@ -1,0 +1,20 @@
+[
+  {
+    "variant": "pro6000",
+    "result_file": "pro6000_vllm_benchmark.txt",
+    "json_result_file": "pro6000_vllm_benchmark.json",
+    "gpu_name": "NVIDIA RTX PRO 6000 Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8"
+  },
+  {
+    "variant": "pro6000",
+    "result_file": "pro6000_sglang_benchmark.txt",
+    "json_result_file": "pro6000_sglang_benchmark.json",
+    "gpu_name": "NVIDIA RTX PRO 6000 Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8"
+  }
+]
