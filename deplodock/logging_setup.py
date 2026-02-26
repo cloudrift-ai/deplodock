@@ -3,6 +3,8 @@
 import logging
 import sys
 
+from deplodock.redact import SecretRedactingFilter
+
 
 def setup_cli_logging():
     """Configure root logger with plain message format for CLI commands.
@@ -16,3 +18,4 @@ def setup_cli_logging():
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(message)s"))
     root.addHandler(handler)
+    root.addFilter(SecretRedactingFilter())

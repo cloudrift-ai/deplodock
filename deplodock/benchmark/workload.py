@@ -8,6 +8,7 @@ import yaml
 from deplodock.deploy.compose import calculate_num_instances
 from deplodock.planner import BenchmarkTask
 from deplodock.recipe.types import Recipe
+from deplodock.redact import redact_secrets
 
 SECTION_DELIMITER = "=" * 50
 
@@ -74,7 +75,7 @@ def compose_result(
     sections = [
         _section("Benchmark Task", format_task_yaml(task)),
         benchmark_output.rstrip(),
-        _section("Docker Compose Configuration", compose_content.rstrip()),
+        _section("Docker Compose Configuration", redact_secrets(compose_content.rstrip())),
         _section("Benchmark Command", bench_command),
     ]
     if system_info:

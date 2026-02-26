@@ -10,6 +10,7 @@ All tests use **pytest** with **pytest-asyncio** (`asyncio_mode = "auto"` in `py
 tests/
 ├── conftest.py              # shared fixtures
 ├── test_hardware.py         # deplodock.hardware (top-level module)
+├── test_redact.py           # deplodock.redact (secret redaction)
 ├── benchmark/
 │   ├── test_bench_dryrun.py # bench CLI dry-run
 │   ├── test_code_hash.py    # compute_code_hash()
@@ -49,6 +50,7 @@ Test individual functions in isolation with synthetic inputs.
 | `provisioning/test_cloud.py` | `deplodock.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud provisioning unit tests |
 | `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`), grouping logic, sorting |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
+| `test_redact.py` | `deplodock.redact.redact_secrets()`, `SecretRedactingFilter` — value-based secret redaction for text and log records |
 | `benchmark/test_code_hash.py` | `deplodock.benchmark.compute_code_hash()` — determinism, hex format |
 | `benchmark/test_run_dir.py` | `deplodock.benchmark.create_run_dir()` — directory creation, naming format |
 | `benchmark/test_tasks_json.py` | `deplodock.benchmark.write_tasks_json()`, `read_tasks_json()`, `parse_task_from_result()` — tasks.json round-trip and result file parsing |

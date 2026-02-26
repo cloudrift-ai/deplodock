@@ -7,6 +7,7 @@ from pathlib import Path
 
 from deplodock.hardware import gpu_short_name
 from deplodock.planner import ExecutionGroup
+from deplodock.redact import SecretRedactingFilter
 
 active_run_dir: contextvars.ContextVar[Path | None] = contextvars.ContextVar("active_run_dir", default=None)
 
@@ -60,6 +61,7 @@ def setup_logging():
     console_formatter = _BenchConsoleFormatter("[%(name)s] %(message)s")
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
+    root_logger.addFilter(SecretRedactingFilter())
 
 
 def add_file_handler(run_dir: Path) -> str:
