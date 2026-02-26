@@ -1,6 +1,7 @@
 """Benchmark workload execution."""
 
 import logging
+import re
 from dataclasses import asdict
 
 import yaml
@@ -63,6 +64,19 @@ def format_task_yaml(task: BenchmarkTask) -> str:
     return yaml.dump(data, default_flow_style=False, sort_keys=False).rstrip()
 
 
+_SECRET_PATTERNS = [
+    re.compile(r"(HUGGING_FACE_HUB_TOKEN=)\S+"),
+    re.compile(r"(HF_TOKEN=)\S+"),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace known secret values with <REDACTED>."""
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(r"\g<1><REDACTED>", text)
+    return text
+
+
 def compose_result(
     task: BenchmarkTask,
     benchmark_output: str,
@@ -74,7 +88,7 @@ def compose_result(
     sections = [
         _section("Benchmark Task", format_task_yaml(task)),
         benchmark_output.rstrip(),
-        _section("Docker Compose Configuration", compose_content.rstrip()),
+        _section("Docker Compose Configuration", _redact_secrets(compose_content.rstrip())),
         _section("Benchmark Command", bench_command),
     ]
     if system_info:
