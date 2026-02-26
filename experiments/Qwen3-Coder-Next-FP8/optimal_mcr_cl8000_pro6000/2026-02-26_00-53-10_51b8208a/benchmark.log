@@ -904,3 +904,30 @@
 [2026-02-26 01:13:35] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m  [type=value_error, input_value=ArgsKwargs((), {'model': ...rocessor_plugin': None}), input_type=ArgsKwargs]
 [2026-02-26 01:13:35] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     For further information visit https://errors.pydantic.dev/2.12/v/value_error
 [2026-02-26 01:13:35] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
+[2026-02-26 01:13:35] [committer] Committed: bench: failed pro6000_c80_mcr80 (Qwen/Qwen3-Coder-Next-FP8)
+[2026-02-26 01:13:36] [committer] Pushed results to remote
+[2026-02-26 01:13:36] [pro6000_x_1] Deleting VM...
+[2026-02-26 01:13:36] [cloudrift] Terminating CloudRift instance '873a280e-12ad-11f1-8697-b79fed448d05'...
+[2026-02-26 01:13:36] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-02-26 01:13:36] [cloudrift] Instance terminated.
+[2026-02-26 01:13:36] [pro6000_x_1] VM deleted.
+[2026-02-26 01:13:36] [pro6000_x_1] Completed group: pro6000_x_1
+[2026-02-26 01:13:36] [root] 
+[2026-02-26 01:13:36] [root] SUMMARY
+[2026-02-26 01:13:36] [root] Successful: 3/10
+[2026-02-26 01:13:36] [root]    - pro6000_in8000_out8000_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root]    - pro6000_in16000_out8000_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root]    - pro6000_in32000_out8000_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root] 
+[2026-02-26 01:13:36] [root] Failed: 7/10
+[2026-02-26 01:13:36] [root]    - pro6000_in64000_out8000_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root]    - pro6000_c32_mcr32_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root]    - pro6000_c80_mcr80_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root]    - pro6000_c8_mcr8_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root]    - pro6000_c48_mcr48_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root]    - pro6000_c16_mcr16_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root]    - pro6000_c64_mcr64_vllm_benchmark.txt
+[2026-02-26 01:13:36] [root] 
+[2026-02-26 01:13:36] [root] All done!
+[2026-02-26 01:13:36] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl64000_pro6000/2026-02-26_00-53-10_51b8208a/benchmark.log
+[2026-02-26 01:13:36] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-26_00-53-10_51b8208a/benchmark.log
