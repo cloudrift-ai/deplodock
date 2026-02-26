@@ -1,11 +1,13 @@
 """Benchmark execution: run execution groups on cloud VMs."""
 
 import asyncio
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
 
 from deplodock.benchmark.bench_logging import _get_group_logger, active_run_dir
+from deplodock.benchmark.results import compose_json_result
 from deplodock.benchmark.system_info import collect_system_info
 from deplodock.benchmark.tasks import _task_meta
 from deplodock.benchmark.workload import compose_result, extract_benchmark_results, run_benchmark_workload
@@ -175,6 +177,8 @@ async def run_execution_group(
                     compose_content = generate_compose(recipe, model_dir, hf_token, gpu_device_ids=gpu_device_ids)
                     full_result = compose_result(task, benchmark_output, compose_content, bench_command, system_info)
                     result_path.write_text(full_result)
+                    json_data = compose_json_result(task, benchmark_output, compose_content, bench_command, system_info)
+                    task.json_result_path().write_text(json.dumps(json_data, indent=2) + "\n")
                     task_logger.info(f"Results saved to: {result_path}")
                 else:
                     task_logger.info(f"[dry-run] Would save results to: {result_path}")

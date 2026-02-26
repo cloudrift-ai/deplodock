@@ -33,6 +33,11 @@ class BenchmarkTask:
         engine = self.recipe.engine.llm.engine_name
         return self.run_dir / f"{self.variant}_{engine}_benchmark.txt"
 
+    def json_result_path(self) -> Path:
+        """Full result path: run_dir / {variant}_{engine}_benchmark.json."""
+        engine = self.recipe.engine.llm.engine_name
+        return self.run_dir / f"{self.variant}_{engine}_benchmark.json"
+
 
 @dataclass
 class ExecutionGroup:

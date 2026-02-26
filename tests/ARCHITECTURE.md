@@ -15,7 +15,8 @@ tests/
 │   ├── test_bench_dryrun.py # bench CLI dry-run
 │   ├── test_code_hash.py    # compute_code_hash()
 │   ├── test_tasks_json.py   # write_tasks_json(), read_tasks_json(), parse_task_from_result()
-│   └── test_run_dir.py      # create_run_dir()
+│   ├── test_run_dir.py      # create_run_dir()
+│   └── test_results.py      # parse_benchmark_metrics(), parse_system_info(), compose_json_result()
 ├── recipe/
 │   ├── test_types.py        # Recipe.from_dict(), LLMConfig properties, dataclass defaults
 │   └── test_engines.py      # build_engine_args(), banned_extra_arg_flags()
@@ -31,8 +32,6 @@ tests/
 │   ├── test_cloudrift.py    # CloudRift API helpers
 │   ├── test_gcp.py             # GCP command builders
 │   └── test_vm_dryrun.py    # vm create/delete CLI dry-run
-└── report/
-    └── test_report.py       # collect_tasks_from_results(), parse_benchmark_result()
 ```
 
 ## Test Layers
@@ -54,7 +53,7 @@ Test individual functions in isolation with synthetic inputs.
 | `benchmark/test_code_hash.py` | `deplodock.benchmark.compute_code_hash()` — determinism, hex format |
 | `benchmark/test_run_dir.py` | `deplodock.benchmark.create_run_dir()` — directory creation, naming format |
 | `benchmark/test_tasks_json.py` | `deplodock.benchmark.write_tasks_json()`, `read_tasks_json()`, `parse_task_from_result()` — tasks.json round-trip and result file parsing |
-| `report/test_report.py` | `deplodock.report.collect_tasks_from_results()`, `parse_benchmark_result()` — tasks.json-based report data collection |
+| `benchmark/test_results.py` | `parse_benchmark_metrics()`, `parse_system_info()`, `compose_json_result()` — structured JSON result parsing and composition |
 | `provisioning/test_cloudrift.py` | `deplodock.provisioning.cloudrift._api_request()`, `_rent_instance()`, etc. — CloudRift API helpers |
 | `provisioning/test_gcp.py` | `deplodock.provisioning.gcp._gcloud_*_cmd()` — GCP command builders |
 

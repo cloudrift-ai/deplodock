@@ -1,4 +1,4 @@
-.PHONY: help setup clean bench bench-force test-compose report report-nov2025 lint format
+.PHONY: help setup clean bench bench-force test-compose lint format
 
 help:
 	@echo "Server Benchmark Makefile"
@@ -9,8 +9,6 @@ help:
 	@echo "  format         - Auto-format code and fix lint violations"
 	@echo "  bench          - Run benchmarks in parallel"
 	@echo "  bench-force    - Run benchmarks in parallel (force re-run, skip cached results)"
-	@echo "  report         - Generate Excel report from benchmark results"
-	@echo "  report-nov2025 - Generate Excel report from Nov 2025 results (pro6000_l40s_h100_h200_11_2025)"
 	@echo "  clean          - Remove virtual environment and generated files"
 	@echo "  test-compose   - Test docker-compose generation with sample config"
 
@@ -41,31 +39,6 @@ bench: setup
 bench-force: setup
 	@echo "Running benchmarks (force mode)..."
 	./venv/bin/deplodock bench recipes/* --force
-
-report: setup
-	@echo "Generating Excel report from benchmark results..."
-	./venv/bin/deplodock report
-	@echo "Report generated: benchmark_report.xlsx"
-
-report-nov2025: setup
-	@echo "Generating Excel report from Nov 2025 benchmark results..."
-	./venv/bin/deplodock report \
-		--results-dir results/pro6000_l40s_h100_h200_11_2025 \
-		--output results/pro6000_l40s_h100_h200_11_2025/benchmark_report.xlsx
-	./venv/bin/deplodock report \
-		--results-dir results/pro6000_l40s_h100_h200_11_2025/single-query \
-		--output results/pro6000_l40s_h100_h200_11_2025/single-query/benchmark_report.xlsx
-	./venv/bin/deplodock report \
-		--results-dir results/pro6000_l40s_h100_h200_11_2025/single-gpu \
-		--output results/pro6000_l40s_h100_h200_11_2025/single-gpu/benchmark_report.xlsx
-
-report-jan2026: setup
-	@echo "Generating Excel report from Jan 2026 benchmark results..."
-	./venv/bin/deplodock report \
-		--results-dir results/pro6000_h100_h200_b200_01_2026/summary \
-		--output results/pro6000_h100_h200_b200_01_2026/benchmark_report.xlsx
-
-
 
 clean:
 	@echo "Removing virtual environment and generated files..."

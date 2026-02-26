@@ -12,14 +12,12 @@ Tools for deploying and benchmarking LLM inference on GPU servers. Supports **vL
     - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
     - [bench/](deplodock/commands/bench/) — `bench` command
     - [teardown.py](deplodock/commands/teardown.py) — `teardown` command
-    - [report/](deplodock/commands/report/) — `report` command
     - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
   - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
   - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
   - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
   - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
-  - [report/](deplodock/report/) — Excel report generation from benchmark results
 - [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
 - [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
 - [docs/](docs/) — Technical notes and engine-specific guides
@@ -407,19 +405,6 @@ deplodock teardown results/intermediate/2026-02-24_12-00-00_abc12345 --ssh-key ~
 |------------|---------------------|-----------------------------------|
 | `run_dir`  | (required)          | Run directory with `instances.json` (positional arg) |
 | `--ssh-key`| `~/.ssh/id_ed25519` | SSH private key path              |
-
-### Generate Reports
-
-```bash
-deplodock report                                      # Default: results/ -> results/benchmark_report.xlsx
-deplodock report --results-dir results/custom --output results/custom/report.xlsx
-```
-
-| Flag            | Default                         | Description                            |
-|-----------------|---------------------------------|----------------------------------------|
-| `--config`      | `config.yaml`                   | Path to configuration file             |
-| `--results-dir` | `results`                       | Directory containing benchmark results |
-| `--output`      | `results/benchmark_report.xlsx` | Output Excel file path                 |
 
 ## Running Tests
 

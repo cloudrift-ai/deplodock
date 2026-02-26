@@ -35,7 +35,6 @@ Or for a specific test file:
 - `deplodock bench recipes/* ...` — deploy + benchmark + teardown on cloud VMs (recipe dirs as positional args)
 - `deplodock bench experiments/...` — run an experiment (results stored in the experiment dir)
 - `deplodock teardown <run_dir>` — clean up VMs left running by `bench --no-teardown`
-- `deplodock report ...` — generate Excel reports from benchmark results
 - `deplodock vm create gcp ...` — create a GCP GPU VM
 - `deplodock vm create cloudrift ...` — create a CloudRift GPU VM
 - `deplodock vm delete gcp ...` — delete a GCP GPU VM
@@ -48,7 +47,6 @@ Or for a specific test file:
 - `make lint` — run `ruff check` and `ruff format --check`
 - `make format` — auto-format code and fix lint violations
 - `make bench` — run benchmarks (`deplodock bench recipes/*`)
-- `make report` — generate Excel report (`deplodock report`)
 - `make clean` — remove venv and generated files
 
 ## Contribution Instructions
