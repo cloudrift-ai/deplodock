@@ -5836,3 +5836,527 @@ Example curl:
 [2026-02-26 18:25:50] [ssh_transport]  5848a7534bcc Extracting [==================>                                ]  580.5MB/1.554GB
 [2026-02-26 18:25:50] [ssh_transport]  5848a7534bcc Extracting [==================>                                ]  585.5MB/1.554GB
 [2026-02-26 18:25:50] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_full_ctx_optimal_mcr_pro6000/2026-02-26_17-51-09_e0e464d1/pro6000_vllm_benchmark.txt
+[2026-02-26 18:25:50] [committer] Committed: bench: completed pro6000 (Qwen/Qwen3-Coder-Next-FP8)
+[2026-02-26 18:25:50] [ssh_transport]  5848a7534bcc Extracting [==================>                                ]  589.9MB/1.554GB
+[2026-02-26 18:25:50] [ssh_transport]  5848a7534bcc Extracting [===================>                               ]  593.8MB/1.554GB
+[2026-02-26 18:25:50] [ssh_transport]  5848a7534bcc Extracting [===================>                               ]    596MB/1.554GB
+[2026-02-26 18:25:50] [ssh_transport]  5848a7534bcc Extracting [===================>                               ]  599.9MB/1.554GB
+[2026-02-26 18:25:50] [ssh_transport]  5848a7534bcc Extracting [===================>                               ]    605MB/1.554GB
+[2026-02-26 18:25:50] [ssh_transport]  5848a7534bcc Extracting [===================>                               ]  609.4MB/1.554GB
+[2026-02-26 18:25:51] [ssh_transport]  5848a7534bcc Extracting [===================>                               ]  613.9MB/1.554GB
+[2026-02-26 18:25:51] [ssh_transport]  5848a7534bcc Extracting [===================>                               ]  618.3MB/1.554GB
+[2026-02-26 18:25:51] [committer] Pushed results to remote
+[2026-02-26 18:25:51] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-26 18:25:51] [orchestrate] Tearing down...
+[2026-02-26 18:25:51] [ssh_transport]  5848a7534bcc Extracting [====================>                              ]  623.9MB/1.554GB
+[2026-02-26 18:25:51] [ssh_transport]  5848a7534bcc Extracting [====================>                              ]  628.4MB/1.554GB
+[2026-02-26 18:25:51] [ssh_transport] Warning: Permanently added '8.12.12.230' (ED25519) to the list of known hosts.
+[2026-02-26 18:25:51] [ssh_transport]  5848a7534bcc Extracting [====================>                              ]  634.5MB/1.554GB
+[2026-02-26 18:25:51] [ssh_transport]  5848a7534bcc Extracting [====================>                              ]  639.5MB/1.554GB
+[2026-02-26 18:25:51] [ssh_transport]  5848a7534bcc Extracting [====================>                              ]  645.1MB/1.554GB
+[2026-02-26 18:25:51] [ssh_transport]  5848a7534bcc Extracting [====================>                              ]  651.2MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [=====================>                             ]  657.9MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [=====================>                             ]  663.5MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [=====================>                             ]    669MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [=====================>                             ]  674.6MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [=====================>                             ]  680.2MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [======================>                            ]  686.9MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [======================>                            ]  692.4MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [======================>                            ]  697.4MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  Container vllm_0  Stopping
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [======================>                            ]  701.3MB/1.554GB
+[2026-02-26 18:25:52] [ssh_transport]  5848a7534bcc Extracting [======================>                            ]  706.9MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [======================>                            ]  711.9MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [=======================>                           ]  716.4MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [=======================>                           ]  721.4MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [=======================>                           ]  727.5MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [=======================>                           ]  731.4MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [=======================>                           ]    737MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [=======================>                           ]  744.2MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [========================>                          ]  748.7MB/1.554GB
+[2026-02-26 18:25:53] [ssh_transport]  5848a7534bcc Extracting [========================>                          ]  752.6MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [========================>                          ]  758.2MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [========================>                          ]  762.1MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [========================>                          ]  766.5MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [========================>                          ]  771.5MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [========================>                          ]    776MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [=========================>                         ]    781MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [=========================>                         ]    786MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  Container vllm_0  Stopped
+[2026-02-26 18:25:54] [ssh_transport]  Container vllm_0  Removing
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [=========================>                         ]    791MB/1.554GB
+[2026-02-26 18:25:54] [ssh_transport]  5848a7534bcc Extracting [=========================>                         ]  797.1MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [=========================>                         ]  804.4MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  Container vllm_0  Removed
+[2026-02-26 18:25:55] [ssh_transport]  Network deploy_default  Removing
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [==========================>                        ]  811.1MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  Network deploy_default  Removed
+[2026-02-26 18:25:55] [orchestrate] Teardown complete.
+[2026-02-26 18:25:55] [pro6000_x_1] Deleting VM...
+[2026-02-26 18:25:55] [cloudrift] Terminating CloudRift instance 'bbec1128-133b-11f1-8dd9-aff7a6341ee9'...
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [==========================>                        ]  817.8MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [==========================>                        ]    825MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [==========================>                        ]  831.7MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [==========================>                        ]  838.9MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [===========================>                       ]  846.7MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [===========================>                       ]  855.1MB/1.554GB
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [===========================>                       ]  862.9MB/1.554GB
+[2026-02-26 18:25:55] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-02-26 18:25:55] [cloudrift] Instance terminated.
+[2026-02-26 18:25:55] [pro6000_x_1] VM deleted.
+[2026-02-26 18:25:55] [pro6000_x_1] Completed group: pro6000_x_1
+[2026-02-26 18:25:55] [ssh_transport]  5848a7534bcc Extracting [============================>                      ]  871.2MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [============================>                      ]  880.1MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [============================>                      ]  887.4MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [============================>                      ]  895.2MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [=============================>                     ]  902.4MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [=============================>                     ]  908.6MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [=============================>                     ]  916.4MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [=============================>                     ]    923MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [=============================>                     ]  930.8MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [==============================>                    ]  938.1MB/1.554GB
+[2026-02-26 18:25:56] [ssh_transport]  5848a7534bcc Extracting [==============================>                    ]  944.8MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [==============================>                    ]  951.5MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [==============================>                    ]    957MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [===============================>                   ]  963.7MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [===============================>                   ]  970.9MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [===============================>                   ]  978.7MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [===============================>                   ]  985.4MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [===============================>                   ]  992.7MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [================================>                  ]  999.4MB/1.554GB
+[2026-02-26 18:25:57] [ssh_transport]  5848a7534bcc Extracting [================================>                  ]  1.006GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [================================>                  ]  1.013GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [================================>                  ]  1.021GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [=================================>                 ]  1.027GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [=================================>                 ]  1.032GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [=================================>                 ]  1.039GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [=================================>                 ]  1.045GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [=================================>                 ]  1.051GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [==================================>                ]  1.058GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [==================================>                ]  1.065GB/1.554GB
+[2026-02-26 18:25:58] [ssh_transport]  5848a7534bcc Extracting [==================================>                ]  1.072GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [==================================>                ]   1.08GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [==================================>                ]  1.087GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [===================================>               ]  1.095GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [===================================>               ]  1.102GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [===================================>               ]  1.111GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [===================================>               ]  1.119GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [====================================>              ]  1.127GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [====================================>              ]  1.136GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [====================================>              ]  1.143GB/1.554GB
+[2026-02-26 18:25:59] [ssh_transport]  5848a7534bcc Extracting [=====================================>             ]   1.15GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [=====================================>             ]  1.159GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [=====================================>             ]  1.167GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [=====================================>             ]  1.177GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [======================================>            ]  1.185GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [======================================>            ]  1.191GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [======================================>            ]  1.199GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [======================================>            ]  1.207GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [=======================================>           ]  1.215GB/1.554GB
+[2026-02-26 18:26:00] [ssh_transport]  5848a7534bcc Extracting [=======================================>           ]  1.224GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [=======================================>           ]   1.23GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [=======================================>           ]  1.236GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [========================================>          ]  1.244GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [========================================>          ]  1.253GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [========================================>          ]   1.26GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [========================================>          ]  1.268GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [=========================================>         ]  1.277GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [=========================================>         ]  1.284GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [=========================================>         ]  1.292GB/1.554GB
+[2026-02-26 18:26:01] [ssh_transport]  5848a7534bcc Extracting [=========================================>         ]  1.298GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [==========================================>        ]  1.306GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [==========================================>        ]  1.314GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [==========================================>        ]   1.32GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [==========================================>        ]  1.326GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [==========================================>        ]  1.331GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [===========================================>       ]  1.337GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [===========================================>       ]  1.341GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [===========================================>       ]  1.348GB/1.554GB
+[2026-02-26 18:26:02] [ssh_transport]  5848a7534bcc Extracting [===========================================>       ]  1.355GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [===========================================>       ]  1.361GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [===========================================>       ]  1.367GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [============================================>      ]  1.373GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [============================================>      ]   1.38GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [============================================>      ]  1.385GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [============================================>      ]  1.393GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [=============================================>     ]  1.401GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [=============================================>     ]  1.409GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [=============================================>     ]  1.416GB/1.554GB
+[2026-02-26 18:26:03] [ssh_transport]  5848a7534bcc Extracting [=============================================>     ]  1.423GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [==============================================>    ]  1.432GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [==============================================>    ]  1.439GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [==============================================>    ]  1.447GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [==============================================>    ]  1.452GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [==============================================>    ]  1.456GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [===============================================>   ]  1.462GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [===============================================>   ]  1.467GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [===============================================>   ]  1.472GB/1.554GB
+[2026-02-26 18:26:04] [ssh_transport]  5848a7534bcc Extracting [===============================================>   ]  1.478GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [===============================================>   ]  1.485GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [================================================>  ]  1.492GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [================================================>  ]    1.5GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [================================================>  ]  1.501GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [================================================>  ]  1.509GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [================================================>  ]  1.522GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [=================================================> ]  1.534GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [=================================================> ]  1.545GB/1.554GB
+[2026-02-26 18:26:05] [ssh_transport]  5848a7534bcc Extracting [==================================================>]  1.554GB/1.554GB
+[2026-02-26 18:26:07] [ssh_transport]  5848a7534bcc Pull complete 
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [>                                                  ]  557.1kB/948.4MB
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [>                                                  ]  7.799MB/948.4MB
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [=>                                                 ]  20.05MB/948.4MB
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [=>                                                 ]  32.31MB/948.4MB
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [==>                                                ]  45.68MB/948.4MB
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [===>                                               ]  58.49MB/948.4MB
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [===>                                               ]  72.42MB/948.4MB
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [====>                                              ]  85.23MB/948.4MB
+[2026-02-26 18:26:07] [ssh_transport]  52eba4d754ae Extracting [=====>                                             ]  96.37MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [=====>                                             ]  108.1MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [======>                                            ]  122.6MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [=======>                                           ]  135.4MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [=======>                                           ]  148.2MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [========>                                          ]    161MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [=========>                                         ]  175.5MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [=========>                                         ]  188.8MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [==========>                                        ]  198.9MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [==========>                                        ]  202.8MB/948.4MB
+[2026-02-26 18:26:08] [ssh_transport]  52eba4d754ae Extracting [===========>                                       ]    210MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [===========>                                       ]  216.1MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [============>                                      ]  230.6MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [============>                                      ]    244MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [=============>                                     ]  255.7MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [==============>                                    ]  269.1MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [==============>                                    ]  280.8MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [===============>                                   ]    293MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [================>                                  ]  304.7MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [================>                                  ]  316.4MB/948.4MB
+[2026-02-26 18:26:09] [ssh_transport]  52eba4d754ae Extracting [=================>                                 ]  328.7MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [=================>                                 ]  340.9MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [==================>                                ]  353.7MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [===================>                               ]  366.5MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [====================>                              ]  379.4MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [====================>                              ]  392.2MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [=====================>                             ]  405.5MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [======================>                            ]  418.9MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [======================>                            ]  431.2MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [=======================>                           ]  442.9MB/948.4MB
+[2026-02-26 18:26:10] [ssh_transport]  52eba4d754ae Extracting [=======================>                           ]  455.1MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [========================>                          ]  466.8MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [=========================>                         ]  479.1MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [=========================>                         ]  491.3MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [==========================>                        ]  504.1MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [===========================>                       ]  514.7MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [===========================>                       ]  529.8MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [============================>                      ]  536.4MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [============================>                      ]  545.9MB/948.4MB
+[2026-02-26 18:26:11] [ssh_transport]  52eba4d754ae Extracting [=============================>                     ]  553.7MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [=============================>                     ]  559.3MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [=============================>                     ]  564.9MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [==============================>                    ]  572.1MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [==============================>                    ]  584.4MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [===============================>                   ]  597.2MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [================================>                  ]  610.5MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [================================>                  ]    625MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [=================================>                 ]  639.5MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [==================================>                ]  652.3MB/948.4MB
+[2026-02-26 18:26:12] [ssh_transport]  52eba4d754ae Extracting [===================================>               ]  666.2MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [===================================>               ]  680.7MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [====================================>              ]  695.8MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [=====================================>             ]    713MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [======================================>            ]  729.7MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [=======================================>           ]  746.5MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [========================================>          ]  762.6MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [=========================================>         ]  779.3MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [=========================================>         ]  796.6MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [==========================================>        ]  813.9MB/948.4MB
+[2026-02-26 18:26:13] [ssh_transport]  52eba4d754ae Extracting [===========================================>       ]  830.6MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Extracting [============================================>      ]  848.4MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Extracting [=============================================>     ]  865.7MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Extracting [==============================================>    ]  882.4MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Extracting [===============================================>   ]  898.5MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Extracting [================================================>  ]  915.8MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Extracting [=================================================> ]  932.5MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Extracting [=================================================> ]    947MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Extracting [==================================================>]  948.4MB/948.4MB
+[2026-02-26 18:26:14] [ssh_transport]  52eba4d754ae Pull complete 
+[2026-02-26 18:26:14] [ssh_transport]  d5b20aed72d9 Extracting [>                                                  ]  557.1kB/67.82MB
+[2026-02-26 18:26:14] [ssh_transport]  d5b20aed72d9 Extracting [====>                                              ]  6.685MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [========>                                          ]   11.7MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [==========>                                        ]  14.48MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [=============>                                     ]  18.94MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [===================>                               ]  26.18MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [=======================>                           ]  32.31MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [===========================>                       ]  37.88MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [===============================>                   ]  42.34MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [================================>                  ]  43.45MB/67.82MB
+[2026-02-26 18:26:15] [ssh_transport]  d5b20aed72d9 Extracting [=================================>                 ]  45.68MB/67.82MB
+[2026-02-26 18:26:16] [ssh_transport]  d5b20aed72d9 Extracting [==================================>                ]  46.24MB/67.82MB
+[2026-02-26 18:26:16] [ssh_transport]  d5b20aed72d9 Extracting [==================================>                ]  46.79MB/67.82MB
+[2026-02-26 18:26:16] [ssh_transport]  d5b20aed72d9 Extracting [==================================>                ]  47.35MB/67.82MB
+[2026-02-26 18:26:16] [ssh_transport]  d5b20aed72d9 Extracting [===================================>               ]  47.91MB/67.82MB
+[2026-02-26 18:26:17] [ssh_transport]  d5b20aed72d9 Extracting [===================================>               ]  48.46MB/67.82MB
+[2026-02-26 18:26:17] [ssh_transport]  d5b20aed72d9 Extracting [====================================>              ]  49.02MB/67.82MB
+[2026-02-26 18:26:18] [ssh_transport]  d5b20aed72d9 Extracting [====================================>              ]  49.58MB/67.82MB
+[2026-02-26 18:26:18] [ssh_transport]  d5b20aed72d9 Extracting [=====================================>             ]  51.25MB/67.82MB
+[2026-02-26 18:26:18] [ssh_transport]  d5b20aed72d9 Extracting [=======================================>           ]  53.48MB/67.82MB
+[2026-02-26 18:26:18] [ssh_transport]  d5b20aed72d9 Extracting [=========================================>         ]  56.26MB/67.82MB
+[2026-02-26 18:26:19] [ssh_transport]  d5b20aed72d9 Extracting [===========================================>       ]   59.6MB/67.82MB
+[2026-02-26 18:26:19] [ssh_transport]  d5b20aed72d9 Extracting [============================================>      ]  60.72MB/67.82MB
+[2026-02-26 18:26:19] [ssh_transport]  d5b20aed72d9 Extracting [=============================================>     ]  62.39MB/67.82MB
+[2026-02-26 18:26:19] [ssh_transport]  d5b20aed72d9 Extracting [==============================================>    ]   63.5MB/67.82MB
+[2026-02-26 18:26:19] [ssh_transport]  d5b20aed72d9 Extracting [================================================>  ]  66.29MB/67.82MB
+[2026-02-26 18:26:19] [ssh_transport]  d5b20aed72d9 Extracting [=================================================> ]   67.4MB/67.82MB
+[2026-02-26 18:26:19] [ssh_transport]  d5b20aed72d9 Extracting [==================================================>]  67.82MB/67.82MB
+[2026-02-26 18:26:20] [ssh_transport]  d5b20aed72d9 Pull complete 
+[2026-02-26 18:26:20] [ssh_transport]  56935418d10e Extracting [>                                                  ]  557.1kB/209.6MB
+[2026-02-26 18:26:20] [ssh_transport]  56935418d10e Extracting [==>                                                ]  11.14MB/209.6MB
+[2026-02-26 18:26:20] [ssh_transport]  56935418d10e Extracting [=====>                                             ]  21.17MB/209.6MB
+[2026-02-26 18:26:20] [ssh_transport]  56935418d10e Extracting [======>                                            ]  27.85MB/209.6MB
+[2026-02-26 18:26:20] [ssh_transport]  56935418d10e Extracting [========>                                          ]  33.98MB/209.6MB
+[2026-02-26 18:26:20] [ssh_transport]  56935418d10e Extracting [=========>                                         ]  40.67MB/209.6MB
+[2026-02-26 18:26:20] [ssh_transport]  56935418d10e Extracting [===========>                                       ]  47.35MB/209.6MB
+[2026-02-26 18:26:20] [ssh_transport]  56935418d10e Extracting [============>                                      ]  54.03MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [==============>                                    ]   59.6MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [===============>                                   ]  65.73MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [=================>                                 ]  72.42MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [==================>                                ]   79.1MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [====================>                              ]  86.34MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [=====================>                             ]  91.91MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [=======================>                           ]  97.48MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [========================>                          ]  103.6MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [==========================>                        ]  109.7MB/209.6MB
+[2026-02-26 18:26:21] [ssh_transport]  56935418d10e Extracting [===========================>                       ]  115.3MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [============================>                      ]  118.7MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [=============================>                     ]  123.7MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [==============================>                    ]  129.8MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [================================>                  ]    137MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [==================================>                ]  146.5MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [====================================>              ]  153.2MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [======================================>            ]  160.4MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [=======================================>           ]  165.4MB/209.6MB
+[2026-02-26 18:26:22] [ssh_transport]  56935418d10e Extracting [=========================================>         ]  172.1MB/209.6MB
+[2026-02-26 18:26:23] [ssh_transport]  56935418d10e Extracting [==========================================>        ]  178.8MB/209.6MB
+[2026-02-26 18:26:23] [ssh_transport]  56935418d10e Extracting [============================================>      ]  186.1MB/209.6MB
+[2026-02-26 18:26:23] [ssh_transport]  56935418d10e Extracting [=============================================>     ]    190MB/209.6MB
+[2026-02-26 18:26:23] [ssh_transport]  56935418d10e Extracting [==============================================>    ]  193.3MB/209.6MB
+[2026-02-26 18:26:23] [ssh_transport]  56935418d10e Extracting [==============================================>    ]    195MB/209.6MB
+[2026-02-26 18:26:23] [ssh_transport]  56935418d10e Extracting [==============================================>    ]  196.6MB/209.6MB
+[2026-02-26 18:26:23] [ssh_transport]  56935418d10e Extracting [===============================================>   ]  197.8MB/209.6MB
+[2026-02-26 18:26:23] [ssh_transport]  56935418d10e Extracting [===============================================>   ]    200MB/209.6MB
+[2026-02-26 18:26:24] [ssh_transport]  56935418d10e Extracting [================================================>  ]    205MB/209.6MB
+[2026-02-26 18:26:24] [ssh_transport]  56935418d10e Extracting [=================================================> ]  209.5MB/209.6MB
+[2026-02-26 18:26:24] [ssh_transport]  56935418d10e Extracting [==================================================>]  209.6MB/209.6MB
+[2026-02-26 18:26:25] [ssh_transport]  56935418d10e Pull complete 
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [>                                                  ]  229.4kB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [=====>                                             ]  2.294MB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [==========>                                        ]  4.358MB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [==============>                                    ]  5.964MB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [====================>                              ]  8.487MB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [==========================>                        ]  11.24MB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [=================================>                 ]  14.22MB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [============================================>      ]  18.81MB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [================================================>  ]  20.41MB/21.06MB
+[2026-02-26 18:26:25] [ssh_transport]  985e1d15a239 Extracting [==================================================>]  21.06MB/21.06MB
+[2026-02-26 18:26:26] [ssh_transport]  985e1d15a239 Pull complete 
+[2026-02-26 18:26:26] [ssh_transport]  0ecfd804e3b2 Extracting [==================================================>]  13.43kB/13.43kB
+[2026-02-26 18:26:26] [ssh_transport]  0ecfd804e3b2 Extracting [==================================================>]  13.43kB/13.43kB
+[2026-02-26 18:26:26] [ssh_transport]  0ecfd804e3b2 Pull complete 
+[2026-02-26 18:26:26] [ssh_transport]  7813b1adac9a Extracting [>                                                  ]  32.77kB/1.787MB
+[2026-02-26 18:26:26] [ssh_transport]  7813b1adac9a Extracting [==================================================>]  1.787MB/1.787MB
+[2026-02-26 18:26:26] [ssh_transport]  7813b1adac9a Pull complete 
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Extracting [>                                                  ]  557.1kB/85.91MB
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Extracting [===>                                               ]  6.685MB/85.91MB
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Extracting [========>                                          ]  13.93MB/85.91MB
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Extracting [============>                                      ]  21.17MB/85.91MB
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Extracting [=======================>                           ]  40.11MB/85.91MB
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Extracting [======================================>            ]  66.29MB/85.91MB
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Extracting [=================================================> ]  85.79MB/85.91MB
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Extracting [==================================================>]  85.91MB/85.91MB
+[2026-02-26 18:26:26] [ssh_transport]  413a2088ff67 Pull complete 
+[2026-02-26 18:26:26] [ssh_transport]  291f5b2946fc Extracting [>                                                  ]  491.5kB/46.58MB
+[2026-02-26 18:26:26] [ssh_transport]  291f5b2946fc Extracting [==========>                                        ]   9.83MB/46.58MB
+[2026-02-26 18:26:27] [ssh_transport]  291f5b2946fc Extracting [====================>                              ]  19.17MB/46.58MB
+[2026-02-26 18:26:27] [ssh_transport]  291f5b2946fc Extracting [==============================>                    ]  28.51MB/46.58MB
+[2026-02-26 18:26:27] [ssh_transport]  291f5b2946fc Extracting [=======================================>           ]  36.86MB/46.58MB
+[2026-02-26 18:26:27] [ssh_transport]  291f5b2946fc Extracting [================================================>  ]  44.73MB/46.58MB
+[2026-02-26 18:26:27] [ssh_transport]  291f5b2946fc Extracting [================================================>  ]  45.22MB/46.58MB
+[2026-02-26 18:26:28] [ssh_transport]  291f5b2946fc Extracting [=================================================> ]  45.71MB/46.58MB
+[2026-02-26 18:26:28] [ssh_transport]  291f5b2946fc Extracting [=================================================> ]   46.2MB/46.58MB
+[2026-02-26 18:26:28] [ssh_transport]  291f5b2946fc Extracting [==================================================>]  46.58MB/46.58MB
+[2026-02-26 18:26:28] [ssh_transport]  291f5b2946fc Pull complete 
+[2026-02-26 18:26:28] [ssh_transport]  974c5ade61c7 Extracting [>                                                  ]  32.77kB/1.99MB
+[2026-02-26 18:26:28] [ssh_transport]  974c5ade61c7 Extracting [==================================================>]   1.99MB/1.99MB
+[2026-02-26 18:26:28] [ssh_transport]  974c5ade61c7 Extracting [==================================================>]   1.99MB/1.99MB
+[2026-02-26 18:26:28] [ssh_transport]  974c5ade61c7 Pull complete 
+[2026-02-26 18:26:28] [ssh_transport]  3de728818149 Extracting [==================================================>]     444B/444B
+[2026-02-26 18:26:28] [ssh_transport]  3de728818149 Extracting [==================================================>]     444B/444B
+[2026-02-26 18:26:28] [ssh_transport]  3de728818149 Pull complete 
+[2026-02-26 18:26:28] [ssh_transport]  f4464875a947 Extracting [>                                                  ]   98.3kB/7.331MB
+[2026-02-26 18:26:28] [ssh_transport]  f4464875a947 Extracting [===========================>                       ]   4.03MB/7.331MB
+[2026-02-26 18:26:28] [ssh_transport]  f4464875a947 Extracting [=============================>                     ]  4.325MB/7.331MB
+[2026-02-26 18:26:28] [ssh_transport]  f4464875a947 Extracting [================================>                  ]  4.719MB/7.331MB
+[2026-02-26 18:26:29] [ssh_transport]  f4464875a947 Extracting [==================================>                ]  5.112MB/7.331MB
+[2026-02-26 18:26:29] [ssh_transport]  f4464875a947 Extracting [==================================================>]  7.331MB/7.331MB
+[2026-02-26 18:26:29] [ssh_transport]  f4464875a947 Pull complete 
+[2026-02-26 18:26:29] [ssh_transport]  e6cfa3af5058 Extracting [==================================================>]     722B/722B
+[2026-02-26 18:26:29] [ssh_transport]  e6cfa3af5058 Extracting [==================================================>]     722B/722B
+[2026-02-26 18:26:29] [ssh_transport]  e6cfa3af5058 Pull complete 
+[2026-02-26 18:26:29] [ssh_transport]  66e6c9775334 Extracting [==================================================>]     508B/508B
+[2026-02-26 18:26:29] [ssh_transport]  66e6c9775334 Extracting [==================================================>]     508B/508B
+[2026-02-26 18:26:29] [ssh_transport]  66e6c9775334 Pull complete 
+[2026-02-26 18:26:29] [ssh_transport]  9ab374f77e01 Extracting [==================================================>]     519B/519B
+[2026-02-26 18:26:29] [ssh_transport]  9ab374f77e01 Extracting [==================================================>]     519B/519B
+[2026-02-26 18:26:29] [ssh_transport]  9ab374f77e01 Pull complete 
+[2026-02-26 18:26:29] [ssh_transport]  13a150f192ca Extracting [==================================================>]     393B/393B
+[2026-02-26 18:26:29] [ssh_transport]  13a150f192ca Extracting [==================================================>]     393B/393B
+[2026-02-26 18:26:29] [ssh_transport]  13a150f192ca Pull complete 
+[2026-02-26 18:26:29] [ssh_transport]  f0a55a48a234 Extracting [==================================================>]   27.1kB/27.1kB
+[2026-02-26 18:26:29] [ssh_transport]  f0a55a48a234 Extracting [==================================================>]   27.1kB/27.1kB
+[2026-02-26 18:26:29] [ssh_transport]  f0a55a48a234 Pull complete 
+[2026-02-26 18:26:29] [ssh_transport]  sglang_0 Pulled 
+[2026-02-26 18:26:29] [orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-02-26 18:26:29] [ssh_transport] Warning: Permanently added '8.12.12.221' (ED25519) to the list of known hosts.
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: huggingface_hub[cli,hf_transfer] in /usr/local/lib/python3.12/dist-packages (0.36.2)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (3.24.3)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2025.10.0)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: hf-xet<2.0.0,>=1.1.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (1.2.0)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: packaging>=20.9 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (26.0)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: pyyaml>=5.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (6.0.1)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: requests in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2.32.5)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: tqdm>=4.42.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.67.3)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: typing-extensions>=3.7.4.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.15.0)
+[2026-02-26 18:26:39] [ssh_transport] Collecting InquirerPy==0.3.4 (from huggingface_hub[cli,hf_transfer])
+[2026-02-26 18:26:39] [ssh_transport]   Downloading InquirerPy-0.3.4-py3-none-any.whl.metadata (8.1 kB)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: hf_transfer>=0.1.4 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (0.1.9)
+[2026-02-26 18:26:39] [ssh_transport] Collecting pfzy<0.4.0,>=0.3.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-26 18:26:39] [ssh_transport]   Downloading pfzy-0.3.4-py3-none-any.whl.metadata (4.9 kB)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: prompt-toolkit<4.0.0,>=3.0.1 in /usr/local/lib/python3.12/dist-packages (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer]) (3.0.52)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: wcwidth in /usr/local/lib/python3.12/dist-packages (from prompt-toolkit<4.0.0,>=3.0.1->InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer]) (0.6.0)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.4.4)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.11)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2.6.3)
+[2026-02-26 18:26:39] [ssh_transport] Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2026.1.4)
+[2026-02-26 18:26:39] [ssh_transport] Downloading InquirerPy-0.3.4-py3-none-any.whl (67 kB)
+[2026-02-26 18:26:39] [ssh_transport] Downloading pfzy-0.3.4-py3-none-any.whl (8.5 kB)
+[2026-02-26 18:26:39] [ssh_transport] Installing collected packages: pfzy, InquirerPy
+[2026-02-26 18:26:39] [ssh_transport] 
+[2026-02-26 18:26:39] [ssh_transport] Successfully installed InquirerPy-0.3.4 pfzy-0.3.4
+[2026-02-26 18:26:39] [ssh_transport] WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[2026-02-26 18:26:40] [ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-02-26 18:26:40] [ssh_transport] /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/snapshots/da6e2ed27304dd39abadd9c82ef50e8de67bdd4c
+[2026-02-26 18:26:40] [orchestrate] Cleaning up old containers...
+[2026-02-26 18:26:40] [ssh_transport] Warning: Permanently added '8.12.12.221' (ED25519) to the list of known hosts.
+[2026-02-26 18:26:41] [orchestrate] Starting services...
+[2026-02-26 18:26:42] [ssh_transport] Warning: Permanently added '8.12.12.221' (ED25519) to the list of known hosts.
+[2026-02-26 18:26:43] [ssh_transport]  Network deploy_default  Creating
+[2026-02-26 18:26:43] [ssh_transport]  Network deploy_default  Created
+[2026-02-26 18:26:43] [ssh_transport]  Container sglang_0  Creating
+[2026-02-26 18:26:43] [ssh_transport]  Container sglang_0  Created
+[2026-02-26 18:26:43] [ssh_transport]  Container sglang_0  Starting
+[2026-02-26 18:26:47] [ssh_transport]  Container sglang_0  Started
+[2026-02-26 18:26:47] [ssh_transport]  Container sglang_0  Waiting
+[2026-02-26 18:28:28] [ssh_transport] container sglang_0 exited (0)
+[2026-02-26 18:28:28] [orchestrate] Failed to start services
+[2026-02-26 18:28:28] [orchestrate] Container logs:
+[2026-02-26 18:28:28] [ssh_transport] Warning: Permanently added '8.12.12.221' (ED25519) to the list of known hosts.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:26:55] DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:26:55] Using default HuggingFace chat template with detected content format: string
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:01] DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:01] Mamba selective_state_update backend initialized: triton
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:01] DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:01] Init torch distributed begin.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:02] Init torch distributed ends. elapsed=0.16 s, mem usage=0.09 GB
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:02] Ignore import error when loading sglang.srt.models.glm_ocr: No module named 'transformers.models.glm_ocr'
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:02] Ignore import error when loading sglang.srt.models.glm_ocr_nextn: No module named 'transformers.models.glm_ocr'
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:02] Ignore import error when loading sglang.srt.models.glmasr: cannot import name 'GlmAsrConfig' from 'transformers' (/usr/local/lib/python3.12/dist-packages/transformers/__init__.py)
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:03] Load weight begin. avail mem=94.17 GB
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:03] Detected fp8 checkpoint.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | `torch_dtype` is deprecated! Use `dtype` instead!
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:03] using attn output gate!
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:27:03] Found local HF snapshot for Qwen/Qwen3-Coder-Next-FP8 at /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/snapshots/da6e2ed27304dd39abadd9c82ef50e8de67bdd4c; skipping download.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:   0% Completed | 0/40 [00:00<?, ?it/s]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:   2% Completed | 1/40 [00:00<00:26,  1.47it/s]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:   5% Completed | 2/40 [00:05<01:56,  3.06s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:   8% Completed | 3/40 [00:09<02:07,  3.44s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  10% Completed | 4/40 [00:10<01:25,  2.37s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  12% Completed | 5/40 [00:10<01:02,  1.78s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  15% Completed | 6/40 [00:11<00:47,  1.41s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  18% Completed | 7/40 [00:12<00:39,  1.20s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  20% Completed | 8/40 [00:12<00:33,  1.04s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  22% Completed | 9/40 [00:13<00:29,  1.06it/s]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  25% Completed | 10/40 [00:14<00:25,  1.16it/s]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  28% Completed | 11/40 [00:15<00:23,  1.23it/s]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  30% Completed | 12/40 [00:18<00:47,  1.71s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  32% Completed | 13/40 [00:23<01:09,  2.58s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  35% Completed | 14/40 [00:24<00:52,  2.03s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  38% Completed | 15/40 [00:28<01:05,  2.60s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  40% Completed | 16/40 [00:32<01:15,  3.16s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  42% Completed | 17/40 [00:36<01:17,  3.35s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  45% Completed | 18/40 [00:37<00:56,  2.56s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  48% Completed | 19/40 [00:40<01:01,  2.92s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  50% Completed | 20/40 [00:41<00:45,  2.26s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  52% Completed | 21/40 [00:42<00:34,  1.79s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  55% Completed | 22/40 [00:46<00:43,  2.39s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  57% Completed | 23/40 [00:46<00:32,  1.90s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  60% Completed | 24/40 [00:50<00:37,  2.35s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  62% Completed | 25/40 [00:50<00:27,  1.86s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  65% Completed | 26/40 [00:51<00:21,  1.51s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  68% Completed | 27/40 [00:52<00:16,  1.26s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  70% Completed | 28/40 [00:52<00:13,  1.09s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  72% Completed | 29/40 [00:53<00:10,  1.02it/s]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  75% Completed | 30/40 [00:54<00:08,  1.13it/s]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  78% Completed | 31/40 [00:55<00:07,  1.19it/s]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  80% Completed | 32/40 [00:58<00:13,  1.69s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  82% Completed | 33/40 [01:02<00:15,  2.25s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  85% Completed | 34/40 [01:06<00:16,  2.69s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  88% Completed | 35/40 [01:06<00:10,  2.07s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  90% Completed | 36/40 [01:08<00:07,  1.98s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  92% Completed | 37/40 [01:09<00:05,  1.85s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  95% Completed | 38/40 [01:13<00:04,  2.38s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards:  98% Completed | 39/40 [01:16<00:02,  2.57s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards: 100% Completed | 40/40 [01:17<00:00,  2.02s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | Loading safetensors checkpoint shards: 100% Completed | 40/40 [01:17<00:00,  1.93s/it]
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | 
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:28:25] Load weight end. elapsed=81.72 s, type=Qwen3NextForCausalLM, dtype=torch.bfloat16, avail mem=19.01 GB, mem usage=75.16 GB.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:28:25] Using KV cache dtype: torch.bfloat16
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:28:25] Mamba Cache is allocated. max_mamba_cache_size: 63, conv_state size: 0.11GB, ssm_state size: 4.50GB 
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:28:25] KV Cache is allocated. #tokens: 220545, K size: 2.52 GB, V size: 2.52 GB
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:28:25] Memory pool end. avail mem=9.35 GB
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:28:25] Scheduler hit an exception: Traceback (most recent call last):
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py", line 3130, in run_scheduler_process
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     scheduler = Scheduler(
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |                 ^^^^^^^^^^
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py", line 368, in __init__
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     self.init_model_worker()
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py", line 564, in init_model_worker
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     self.init_tp_model_worker()
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py", line 522, in init_tp_model_worker
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     self.tp_worker = TpModelWorker(
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |                      ^^^^^^^^^^^^^^
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/managers/tp_worker.py", line 247, in __init__
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     self._init_model_runner()
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/managers/tp_worker.py", line 330, in _init_model_runner
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     self._model_runner = ModelRunner(
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |                          ^^^^^^^^^^^^
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py", line 413, in __init__
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     self.initialize(min_per_gpu_memory)
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py", line 607, in initialize
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     self.init_attention_backend()
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py", line 1737, in init_attention_backend
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     self.attn_backend = self._get_attention_backend()
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py", line 1781, in _get_attention_backend
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     attn_backend = self._get_attention_backend_from_str(
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py", line 1799, in _get_attention_backend_from_str
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     return attn_backend_wrapper(self, full_attention_backend)
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |   File "/sgl-workspace/sglang/python/sglang/srt/layers/attention/attention_registry.py", line 204, in attn_backend_wrapper
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  |     runner.server_args.attention_backend == "triton"
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | AssertionError: triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend.
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | 
+[2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:28:25] Received sigquit from a child process. It usually means the child failed.
+[2026-02-26 18:28:29] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
