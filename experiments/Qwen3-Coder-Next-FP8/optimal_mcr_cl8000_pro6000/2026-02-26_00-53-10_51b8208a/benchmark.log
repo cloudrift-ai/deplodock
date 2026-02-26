@@ -411,3 +411,175 @@
 [2026-02-26 01:12:36] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m  [type=value_error, input_value=ArgsKwargs((), {'model': ...rocessor_plugin': None}), input_type=ArgsKwargs]
 [2026-02-26 01:12:36] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     For further information visit https://errors.pydantic.dev/2.12/v/value_error
 [2026-02-26 01:12:36] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
+[2026-02-26 01:12:36] [ssh_transport] Downloading pfzy-0.3.4-py3-none-any.whl (8.5 kB)
+[2026-02-26 01:12:36] [committer] Committed: bench: failed pro6000_c8_mcr8 (Qwen/Qwen3-Coder-Next-FP8)
+[2026-02-26 01:12:36] [ssh_transport] Downloading prompt_toolkit-3.0.52-py3-none-any.whl (391 kB)
+[2026-02-26 01:12:36] [ssh_transport] Downloading wcwidth-0.6.0-py3-none-any.whl (94 kB)
+[2026-02-26 01:12:37] [ssh_transport] Installing collected packages: wcwidth, pfzy, prompt-toolkit, InquirerPy
+[2026-02-26 01:12:37] [ssh_transport] 
+[2026-02-26 01:12:37] [ssh_transport] Successfully installed InquirerPy-0.3.4 pfzy-0.3.4 prompt-toolkit-3.0.52 wcwidth-0.6.0
+[2026-02-26 01:12:37] [ssh_transport] WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[2026-02-26 01:12:37] [committer] Pushed results to remote
+[2026-02-26 01:12:37] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Recipe: experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000 (variant: pro6000_c48_mcr48)
+[2026-02-26 01:12:37] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploying model...
+[2026-02-26 01:12:37] [ssh_transport] 
+[2026-02-26 01:12:37] [ssh_transport] [notice] A new release of pip is available: 26.0 -> 26.0.1
+[2026-02-26 01:12:37] [ssh_transport] [notice] To update, run: python3.12 -m pip install --upgrade pip
+[2026-02-26 01:12:37] [ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-02-26 01:12:37] [ssh_transport] /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/snapshots/da6e2ed27304dd39abadd9c82ef50e8de67bdd4c
+[2026-02-26 01:12:38] [orchestrate] Cleaning up old containers...
+[2026-02-26 01:12:38] [ssh_transport] Warning: Permanently added '8.12.12.231' (ED25519) to the list of known hosts.
+[2026-02-26 01:12:38] [orchestrate] Pulling images...
+[2026-02-26 01:12:38] [ssh_transport] Warning: Permanently added '8.12.12.226' (ED25519) to the list of known hosts.
+[2026-02-26 01:12:39] [ssh_transport]  Container vllm_0  Stopping
+[2026-02-26 01:12:39] [ssh_transport]  Container vllm_0  Stopped
+[2026-02-26 01:12:39] [ssh_transport]  Container vllm_0  Removing
+[2026-02-26 01:12:39] [ssh_transport]  Container vllm_0  Removed
+[2026-02-26 01:12:39] [ssh_transport]  Network deploy_default  Removing
+[2026-02-26 01:12:39] [ssh_transport]  Network deploy_default  Removed
+[2026-02-26 01:12:39] [orchestrate] Starting services...
+[2026-02-26 01:12:39] [ssh_transport]  vllm_0 Pulling 
+[2026-02-26 01:12:39] [ssh_transport] Warning: Permanently added '8.12.12.231' (ED25519) to the list of known hosts.
+[2026-02-26 01:12:39] [ssh_transport]  vllm_0 Pulled 
+[2026-02-26 01:12:39] [orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-02-26 01:12:40] [ssh_transport] Warning: Permanently added '8.12.12.226' (ED25519) to the list of known hosts.
+[2026-02-26 01:12:40] [ssh_transport]  Network deploy_default  Creating
+[2026-02-26 01:12:40] [ssh_transport]  Network deploy_default  Created
+[2026-02-26 01:12:40] [ssh_transport]  Container vllm_0  Creating
+[2026-02-26 01:12:40] [ssh_transport]  Container vllm_0  Created
+[2026-02-26 01:12:40] [ssh_transport]  Container vllm_0  Starting
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: huggingface_hub[cli,hf_transfer] in /usr/local/lib/python3.12/dist-packages (0.36.1)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (3.20.3)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2026.1.0)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: hf-xet<2.0.0,>=1.1.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (1.2.0)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: packaging>=20.9 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (26.0)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: pyyaml>=5.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (6.0.3)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: requests in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2.32.5)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: tqdm>=4.42.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.67.3)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: typing-extensions>=3.7.4.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.15.0)
+[2026-02-26 01:12:41] [ssh_transport] Collecting InquirerPy==0.3.4 (from huggingface_hub[cli,hf_transfer])
+[2026-02-26 01:12:41] [ssh_transport]   Downloading InquirerPy-0.3.4-py3-none-any.whl.metadata (8.1 kB)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: hf_transfer>=0.1.4 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (0.1.9)
+[2026-02-26 01:12:41] [ssh_transport] Collecting pfzy<0.4.0,>=0.3.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-26 01:12:41] [ssh_transport]   Downloading pfzy-0.3.4-py3-none-any.whl.metadata (4.9 kB)
+[2026-02-26 01:12:41] [ssh_transport] Collecting prompt-toolkit<4.0.0,>=3.0.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-26 01:12:41] [ssh_transport]   Downloading prompt_toolkit-3.0.52-py3-none-any.whl.metadata (6.4 kB)
+[2026-02-26 01:12:41] [ssh_transport] Collecting wcwidth (from prompt-toolkit<4.0.0,>=3.0.1->InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-26 01:12:41] [ssh_transport]   Downloading wcwidth-0.6.0-py3-none-any.whl.metadata (30 kB)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.4.4)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.11)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2.6.3)
+[2026-02-26 01:12:41] [ssh_transport] Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2026.1.4)
+[2026-02-26 01:12:41] [ssh_transport] Downloading InquirerPy-0.3.4-py3-none-any.whl (67 kB)
+[2026-02-26 01:12:41] [ssh_transport] Downloading pfzy-0.3.4-py3-none-any.whl (8.5 kB)
+[2026-02-26 01:12:41] [ssh_transport] Downloading prompt_toolkit-3.0.52-py3-none-any.whl (391 kB)
+[2026-02-26 01:12:41] [ssh_transport] Downloading wcwidth-0.6.0-py3-none-any.whl (94 kB)
+[2026-02-26 01:12:41] [ssh_transport] Installing collected packages: wcwidth, pfzy, prompt-toolkit, InquirerPy
+[2026-02-26 01:12:42] [ssh_transport] 
+[2026-02-26 01:12:42] [ssh_transport] Successfully installed InquirerPy-0.3.4 pfzy-0.3.4 prompt-toolkit-3.0.52 wcwidth-0.6.0
+[2026-02-26 01:12:42] [ssh_transport] WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[2026-02-26 01:12:42] [ssh_transport] 
+[2026-02-26 01:12:42] [ssh_transport] [notice] A new release of pip is available: 26.0 -> 26.0.1
+[2026-02-26 01:12:42] [ssh_transport] [notice] To update, run: python3.12 -m pip install --upgrade pip
+[2026-02-26 01:12:42] [ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-02-26 01:12:42] [ssh_transport] /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/snapshots/da6e2ed27304dd39abadd9c82ef50e8de67bdd4c
+[2026-02-26 01:12:42] [orchestrate] Cleaning up old containers...
+[2026-02-26 01:12:43] [ssh_transport] Warning: Permanently added '8.12.12.226' (ED25519) to the list of known hosts.
+[2026-02-26 01:12:43] [ssh_transport]  Container vllm_0  Stopping
+[2026-02-26 01:12:43] [ssh_transport]  Container vllm_0  Stopped
+[2026-02-26 01:12:43] [ssh_transport]  Container vllm_0  Removing
+[2026-02-26 01:12:43] [ssh_transport]  Container vllm_0  Removed
+[2026-02-26 01:12:43] [ssh_transport]  Network deploy_default  Removing
+[2026-02-26 01:12:44] [ssh_transport]  Network deploy_default  Removed
+[2026-02-26 01:12:44] [orchestrate] Starting services...
+[2026-02-26 01:12:44] [ssh_transport]  Container vllm_0  Started
+[2026-02-26 01:12:44] [ssh_transport]  Container vllm_0  Waiting
+[2026-02-26 01:12:44] [ssh_transport] Warning: Permanently added '8.12.12.226' (ED25519) to the list of known hosts.
+[2026-02-26 01:12:45] [ssh_transport]  Network deploy_default  Creating
+[2026-02-26 01:12:45] [ssh_transport]  Network deploy_default  Created
+[2026-02-26 01:12:45] [ssh_transport]  Container vllm_0  Creating
+[2026-02-26 01:12:45] [ssh_transport]  Container vllm_0  Created
+[2026-02-26 01:12:45] [ssh_transport]  Container vllm_0  Starting
+[2026-02-26 01:12:49] [ssh_transport]  Container vllm_0  Started
+[2026-02-26 01:12:49] [ssh_transport]  Container vllm_0  Waiting
+[2026-02-26 01:12:58] [ssh_transport] container vllm_0 exited (1)
+[2026-02-26 01:12:58] [orchestrate] Failed to start services
+[2026-02-26 01:12:58] [orchestrate] Container logs:
+[2026-02-26 01:12:58] [ssh_transport] Warning: Permanently added '8.12.12.230' (ED25519) to the list of known hosts.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | WARNING 02-25 17:12:54 [argparse_utils.py:195] With `vllm serve`, you should provide the model as a positional argument or in a config file instead of via the `--model` option. The `--model` option will be removed in v0.13.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:12:54 [utils.py:325] 
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:12:54 [utils.py:325]        █     █     █▄   ▄█
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:12:54 [utils.py:325]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.15.1
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:12:54 [utils.py:325]   █▄█▀ █     █     █     █  model   Qwen/Qwen3-Coder-Next-FP8
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:12:54 [utils.py:325]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:12:54 [utils.py:325] 
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:12:54 [utils.py:261] non-default args: {'model_tag': 'Qwen/Qwen3-Coder-Next-FP8', 'api_server_count': 1, 'host': '0.0.0.0', 'model': 'Qwen/Qwen3-Coder-Next-FP8', 'trust_remote_code': True, 'max_model_len': 16384, 'served_model_name': ['Qwen/Qwen3-Coder-Next-FP8'], 'max_num_seqs': 32}
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:54 [repo_utils.py:47] Error retrieving file list: 401 Client Error. (Request ID: Root=1-699f9e16-1e0e5d61096e07793cd62c78;51002105-24ff-4409-9d6d-1f58bb1be46a)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:54 [repo_utils.py:47] 
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:54 [repo_utils.py:47] Repository Not Found for url: https://huggingface.co/api/models/Qwen/Qwen3-Coder-Next-FP8/tree/main?recursive=True&expand=False.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:54 [repo_utils.py:47] Please make sure you specified the correct `repo_id` and `repo_type`.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:54 [repo_utils.py:47] If you are trying to access a private or gated repo, make sure you are authenticated. For more details, see https://huggingface.co/docs/huggingface_hub/authentication
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:54 [repo_utils.py:47] User Access Token "Deplodock" is expired, retrying 1 of 2
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:56 [repo_utils.py:45] Error retrieving file list: 401 Client Error. (Request ID: Root=1-699f9e18-10d0976d6cfe9e996137b819;8cf7cd62-01b6-4153-a6b0-a3037aea2720)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:56 [repo_utils.py:45] 
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:56 [repo_utils.py:45] Repository Not Found for url: https://huggingface.co/api/models/Qwen/Qwen3-Coder-Next-FP8/tree/main?recursive=True&expand=False.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:56 [repo_utils.py:45] Please make sure you specified the correct `repo_id` and `repo_type`.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:56 [repo_utils.py:45] If you are trying to access a private or gated repo, make sure you are authenticated. For more details, see https://huggingface.co/docs/huggingface_hub/authentication
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:12:56 [repo_utils.py:45] User Access Token "Deplodock" is expired
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m Traceback (most recent call last):
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/bin/vllm", line 10, in <module>
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     sys.exit(main())
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m              ^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/main.py", line 73, in main
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     args.dispatch_function(args)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/serve.py", line 111, in cmd
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     uvloop.run(run_server(args))
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/uvloop/__init__.py", line 96, in run
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return __asyncio.run(
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/lib/python3.12/asyncio/runners.py", line 195, in run
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return runner.run(main)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return self._loop.run_until_complete(task)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/uvloop/__init__.py", line 48, in wrapper
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return await main
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 919, in run_server
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 938, in run_server_worker
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     async with build_async_engine_client(
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return await anext(self.gen)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 147, in build_async_engine_client
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     async with build_async_engine_client_from_engine_args(
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return await anext(self.gen)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 173, in build_async_engine_client_from_engine_args
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py", line 1374, in create_engine_config
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     model_config = self.create_model_config()
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m                    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py", line 1228, in create_model_config
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return ModelConfig(
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   Value error, Invalid repository ID or local directory specified: 'Qwen/Qwen3-Coder-Next-FP8'.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m Please verify the following requirements:
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m 1. Provide a valid Hugging Face repository ID.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m 2. Specify a local directory that contains a recognized configuration file.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m    - For Hugging Face models: ensure the presence of a 'config.json'.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m    - For Mistral models: ensure the presence of a 'params.json'.
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m  [type=value_error, input_value=ArgsKwargs((), {'model': ...rocessor_plugin': None}), input_type=ArgsKwargs]
+[2026-02-26 01:12:59] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     For further information visit https://errors.pydantic.dev/2.12/v/value_error
+[2026-02-26 01:12:59] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
