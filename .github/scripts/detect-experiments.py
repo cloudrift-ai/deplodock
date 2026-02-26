@@ -6,6 +6,8 @@ Two modes:
 - Auto-detect: /run-experiment (no args) — finds changed experiments via git diff
 
 Any --flags in the comment are passed through to `deplodock bench` as-is.
+Outputs a complete bench command that the workflow appends --dry-run or
+--commit-results to.
 """
 
 import argparse
@@ -17,21 +19,21 @@ from pathlib import Path
 
 
 def parse_comment(comment):
-    """Split a /run-experiment comment into experiment paths and bench flags.
+    """Split a /run-experiment comment into experiment paths and extra tokens.
 
-    Returns (paths, bench_args) where paths is a list of experiment directory
-    strings and bench_args is the remaining tokens joined as a string.
+    Returns (paths, extra_tokens) where paths is a list of experiment directory
+    strings and extra_tokens is a list of remaining tokens (flags and values).
     """
     parts = comment.strip().split()
     # First token is /run-experiment
     paths = []
-    flags = []
+    extra = []
     for token in parts[1:]:
         if token.startswith("experiments/"):
             paths.append(token)
         else:
-            flags.append(token)
-    return paths, " ".join(flags)
+            extra.append(token)
+    return paths, extra
 
 
 def detect_from_diff(base, head):
@@ -77,7 +79,7 @@ def main():
     parser.add_argument("--head", required=True, help="Head ref for git diff (e.g. HEAD)")
     args = parser.parse_args()
 
-    explicit, bench_args = parse_comment(args.comment)
+    explicit, extra_tokens = parse_comment(args.comment)
 
     if explicit:
         experiments = validate_experiments(explicit)
@@ -91,21 +93,23 @@ def main():
         print(f"Error: No experiments found ({mode} mode)", file=sys.stderr)
         sys.exit(1)
 
+    # Build the full bench command: deplodock bench <dirs> [flags]
+    bench_command = " ".join(["deplodock", "bench", *experiments, *extra_tokens])
+
     print(f"Detected experiments ({mode}):")
     for exp in experiments:
         print(f"  - {exp}")
-    if bench_args:
-        print(f"Bench args: {bench_args}")
+    print(f"Bench command: {bench_command}")
 
     # Write to GITHUB_OUTPUT
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a") as f:
             f.write(f"experiments={json.dumps(experiments)}\n")
-            f.write(f"bench_args={bench_args}\n")
+            f.write(f"bench_command={bench_command}\n")
     else:
         print(json.dumps(experiments))
-        print(f"bench_args={bench_args}")
+        print(f"bench_command={bench_command}")
 
 
 if __name__ == "__main__":
