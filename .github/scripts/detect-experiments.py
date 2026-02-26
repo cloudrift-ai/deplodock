@@ -2,8 +2,8 @@
 """Detect experiment directories from a /run-experiment comment or git diff.
 
 Two modes:
-- Explicit: /run-experiment experiments/Foo/bar experiments/Baz/qux
-- Auto-detect: /run-experiment (no args) — finds changed experiments via git diff
+- Explicit: /run-experiment experiments/Foo/bar experiments/Baz/qux [--flags]
+- Auto-detect: /run-experiment (no args) [--flags] — finds changed experiments via git diff
 
 Any --flags in the comment are passed through to `deplodock bench` as-is.
 Outputs a complete bench command that the workflow appends --dry-run or
@@ -21,19 +21,19 @@ from pathlib import Path
 def parse_comment(comment):
     """Split a /run-experiment comment into experiment paths and extra tokens.
 
-    Returns (paths, extra_tokens) where paths is a list of experiment directory
-    strings and extra_tokens is a list of remaining tokens (flags and values).
+    Returns (experiments, extra_tokens) where experiments is a list of experiment
+    directory strings and extra_tokens is a list of remaining tokens (flags and
+    their values, in original order).
     """
     parts = comment.strip().split()
-    # First token is /run-experiment
-    paths = []
+    experiments = []
     extra = []
     for token in parts[1:]:
         if token.startswith("experiments/"):
-            paths.append(token)
+            experiments.append(token)
         else:
             extra.append(token)
-    return paths, extra
+    return experiments, extra
 
 
 def detect_from_diff(base, head):
@@ -61,17 +61,6 @@ def detect_from_diff(base, head):
     return sorted(experiment_dirs)
 
 
-def validate_experiments(dirs):
-    """Filter to directories that contain a recipe.yaml."""
-    valid = []
-    for d in dirs:
-        if Path(d, "recipe.yaml").exists():
-            valid.append(d)
-        else:
-            print(f"Warning: {d} does not contain recipe.yaml, skipping", file=sys.stderr)
-    return valid
-
-
 def main():
     parser = argparse.ArgumentParser(description="Detect experiments for CI benchmark")
     parser.add_argument("--comment", required=True, help="The /run-experiment comment text")
@@ -79,14 +68,12 @@ def main():
     parser.add_argument("--head", required=True, help="Head ref for git diff (e.g. HEAD)")
     args = parser.parse_args()
 
-    explicit, extra_tokens = parse_comment(args.comment)
+    experiments, extra_tokens = parse_comment(args.comment)
 
-    if explicit:
-        experiments = validate_experiments(explicit)
+    if len(experiments) > 0:
         mode = "explicit"
     else:
         experiments = detect_from_diff(args.base, args.head)
-        experiments = validate_experiments(experiments)
         mode = "auto-detect"
 
     if not experiments:
