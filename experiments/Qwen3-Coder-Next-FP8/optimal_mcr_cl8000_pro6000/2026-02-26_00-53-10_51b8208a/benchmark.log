@@ -724,3 +724,94 @@
 [2026-02-26 01:13:08] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m  [type=value_error, input_value=ArgsKwargs((), {'model': ...rocessor_plugin': None}), input_type=ArgsKwargs]
 [2026-02-26 01:13:08] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     For further information visit https://errors.pydantic.dev/2.12/v/value_error
 [2026-02-26 01:13:08] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
+[2026-02-26 01:13:08] [committer] Committed: bench: failed pro6000_c64_mcr64 (Qwen/Qwen3-Coder-Next-FP8)
+[2026-02-26 01:13:09] [committer] Pushed results to remote
+[2026-02-26 01:13:09] [pro6000_x_1] Deleting VM...
+[2026-02-26 01:13:09] [cloudrift] Terminating CloudRift instance '85ca297e-12ad-11f1-8540-9383ff004189'...
+[2026-02-26 01:13:09] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-02-26 01:13:09] [cloudrift] Instance terminated.
+[2026-02-26 01:13:09] [pro6000_x_1] VM deleted.
+[2026-02-26 01:13:09] [pro6000_x_1] Completed group: pro6000_x_1
+[2026-02-26 01:13:11] [ssh_transport] container vllm_0 exited (1)
+[2026-02-26 01:13:11] [orchestrate] Failed to start services
+[2026-02-26 01:13:11] [orchestrate] Container logs:
+[2026-02-26 01:13:12] [ssh_transport] Warning: Permanently added '8.12.12.226' (ED25519) to the list of known hosts.
+[2026-02-26 01:13:12] [ssh_transport]  Container vllm_0  Started
+[2026-02-26 01:13:12] [ssh_transport]  Container vllm_0  Waiting
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | WARNING 02-25 17:13:07 [argparse_utils.py:195] With `vllm serve`, you should provide the model as a positional argument or in a config file instead of via the `--model` option. The `--model` option will be removed in v0.13.
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:13:07 [utils.py:325] 
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:13:07 [utils.py:325]        █     █     █▄   ▄█
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:13:07 [utils.py:325]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.15.1
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:13:07 [utils.py:325]   █▄█▀ █     █     █     █  model   Qwen/Qwen3-Coder-Next-FP8
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:13:07 [utils.py:325]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:13:07 [utils.py:325] 
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m INFO 02-25 17:13:07 [utils.py:261] non-default args: {'model_tag': 'Qwen/Qwen3-Coder-Next-FP8', 'api_server_count': 1, 'host': '0.0.0.0', 'model': 'Qwen/Qwen3-Coder-Next-FP8', 'trust_remote_code': True, 'max_model_len': 16384, 'served_model_name': ['Qwen/Qwen3-Coder-Next-FP8'], 'max_num_seqs': 48}
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:07 [repo_utils.py:47] Error retrieving file list: 401 Client Error. (Request ID: Root=1-699f9e23-2e6954e8269753a526d9b062;62bf6fc9-2c54-4fc6-b4ab-8956f81d4ee5)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:07 [repo_utils.py:47] 
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:07 [repo_utils.py:47] Repository Not Found for url: https://huggingface.co/api/models/Qwen/Qwen3-Coder-Next-FP8/tree/main?recursive=True&expand=False.
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:07 [repo_utils.py:47] Please make sure you specified the correct `repo_id` and `repo_type`.
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:07 [repo_utils.py:47] If you are trying to access a private or gated repo, make sure you are authenticated. For more details, see https://huggingface.co/docs/huggingface_hub/authentication
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:07 [repo_utils.py:47] User Access Token "Deplodock" is expired, retrying 1 of 2
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:09 [repo_utils.py:45] Error retrieving file list: 401 Client Error. (Request ID: Root=1-699f9e25-01ac6d2844b0369063578c40;23c43e7c-77a1-46ab-8a5a-1ae3cb934bb8)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:09 [repo_utils.py:45] 
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:09 [repo_utils.py:45] Repository Not Found for url: https://huggingface.co/api/models/Qwen/Qwen3-Coder-Next-FP8/tree/main?recursive=True&expand=False.
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:09 [repo_utils.py:45] Please make sure you specified the correct `repo_id` and `repo_type`.
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:09 [repo_utils.py:45] If you are trying to access a private or gated repo, make sure you are authenticated. For more details, see https://huggingface.co/docs/huggingface_hub/authentication
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m ERROR 02-25 17:13:09 [repo_utils.py:45] User Access Token "Deplodock" is expired
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m Traceback (most recent call last):
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/bin/vllm", line 10, in <module>
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     sys.exit(main())
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m              ^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/main.py", line 73, in main
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     args.dispatch_function(args)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/serve.py", line 111, in cmd
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     uvloop.run(run_server(args))
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/uvloop/__init__.py", line 96, in run
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return __asyncio.run(
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/lib/python3.12/asyncio/runners.py", line 195, in run
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return runner.run(main)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return self._loop.run_until_complete(task)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/uvloop/__init__.py", line 48, in wrapper
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return await main
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 919, in run_server
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 938, in run_server_worker
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     async with build_async_engine_client(
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return await anext(self.gen)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 147, in build_async_engine_client
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     async with build_async_engine_client_from_engine_args(
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return await anext(self.gen)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 173, in build_async_engine_client_from_engine_args
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py", line 1374, in create_engine_config
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     model_config = self.create_model_config()
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m                    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py", line 1228, in create_model_config
+[2026-02-26 01:13:12] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     return ModelConfig(
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m            ^^^^^^^^^^^^
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   File "/usr/local/lib/python3.12/dist-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m   Value error, Invalid repository ID or local directory specified: 'Qwen/Qwen3-Coder-Next-FP8'.
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m Please verify the following requirements:
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m 1. Provide a valid Hugging Face repository ID.
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m 2. Specify a local directory that contains a recognized configuration file.
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m    - For Hugging Face models: ensure the presence of a 'config.json'.
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m    - For Mistral models: ensure the presence of a 'params.json'.
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m  [type=value_error, input_value=ArgsKwargs((), {'model': ...rocessor_plugin': None}), input_type=ArgsKwargs]
+[2026-02-26 01:13:13] [ssh_transport] vllm_0  | [0;36m(APIServer pid=1)[0;0m     For further information visit https://errors.pydantic.dev/2.12/v/value_error
+[2026-02-26 01:13:13] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
