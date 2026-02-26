@@ -6913,3 +6913,42 @@ Example curl:
     }'
 [2026-02-26 18:16:53] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
 [2026-02-26 18:19:53] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-26_17-51-09_e0e464d1/pro6000_c16_mcr16_vllm_benchmark.txt
+[2026-02-26 18:19:53] [committer] Committed: bench: completed pro6000_c16_mcr16 (Qwen/Qwen3-Coder-Next-FP8)
+[2026-02-26 18:19:53] [committer] Pushed results to remote
+[2026-02-26 18:19:54] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-26 18:19:54] [orchestrate] Tearing down...
+[2026-02-26 18:19:54] [ssh_transport] Warning: Permanently added '8.12.12.221' (ED25519) to the list of known hosts.
+[2026-02-26 18:19:55] [ssh_transport]  Container vllm_0  Stopping
+[2026-02-26 18:19:57] [ssh_transport]  Container vllm_0  Stopped
+[2026-02-26 18:19:57] [ssh_transport]  Container vllm_0  Removing
+[2026-02-26 18:19:57] [ssh_transport]  Container vllm_0  Removed
+[2026-02-26 18:19:57] [ssh_transport]  Network deploy_default  Removing
+[2026-02-26 18:19:57] [ssh_transport]  Network deploy_default  Removed
+[2026-02-26 18:19:57] [orchestrate] Teardown complete.
+[2026-02-26 18:25:55] [pro6000_x_1] Deleting VM...
+[2026-02-26 18:25:55] [cloudrift] Terminating CloudRift instance 'bbec1128-133b-11f1-8dd9-aff7a6341ee9'...
+[2026-02-26 18:25:55] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-02-26 18:25:55] [cloudrift] Instance terminated.
+[2026-02-26 18:25:55] [pro6000_x_1] VM deleted.
+[2026-02-26 18:25:55] [pro6000_x_1] Completed group: pro6000_x_1
+[2026-02-26 18:28:30] [pro6000_x_1] Deleting VM...
+[2026-02-26 18:28:30] [cloudrift] Terminating CloudRift instance 'bc8088ee-133b-11f1-927d-1f613eaa6493'...
+[2026-02-26 18:28:31] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-02-26 18:28:31] [cloudrift] Instance terminated.
+[2026-02-26 18:28:31] [pro6000_x_1] VM deleted.
+[2026-02-26 18:28:31] [pro6000_x_1] Completed group: pro6000_x_1
+[2026-02-26 18:28:31] [root] 
+[2026-02-26 18:28:31] [root] SUMMARY
+[2026-02-26 18:28:31] [root] Successful: 4/6
+[2026-02-26 18:28:31] [root]    - pro6000_c12_mcr12_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root]    - pro6000_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root]    - pro6000_c8_mcr8_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root]    - pro6000_c16_mcr16_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root] 
+[2026-02-26 18:28:31] [root] Failed: 2/6
+[2026-02-26 18:28:31] [root]    - pro6000_c4_mcr4_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root]    - pro6000_sglang_benchmark.txt
+[2026-02-26 18:28:31] [root] 
+[2026-02-26 18:28:31] [root] All done!
+[2026-02-26 18:28:31] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-26_17-51-09_e0e464d1/benchmark.log
+[2026-02-26 18:28:31] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_full_ctx_optimal_mcr_pro6000/2026-02-26_17-51-09_e0e464d1/benchmark.log

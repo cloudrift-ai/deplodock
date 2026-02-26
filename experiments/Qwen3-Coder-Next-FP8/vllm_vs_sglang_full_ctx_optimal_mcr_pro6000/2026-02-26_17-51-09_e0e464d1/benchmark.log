@@ -6360,3 +6360,26 @@ Example curl:
 [2026-02-26 18:28:29] [ssh_transport] sglang_0  | 
 [2026-02-26 18:28:29] [ssh_transport] sglang_0  | [2026-02-26 18:28:25] Received sigquit from a child process. It usually means the child failed.
 [2026-02-26 18:28:29] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
+[2026-02-26 18:28:30] [committer] Committed: bench: failed pro6000 (Qwen/Qwen3-Coder-Next-FP8)
+[2026-02-26 18:28:30] [committer] Pushed results to remote
+[2026-02-26 18:28:30] [pro6000_x_1] Deleting VM...
+[2026-02-26 18:28:30] [cloudrift] Terminating CloudRift instance 'bc8088ee-133b-11f1-927d-1f613eaa6493'...
+[2026-02-26 18:28:31] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-02-26 18:28:31] [cloudrift] Instance terminated.
+[2026-02-26 18:28:31] [pro6000_x_1] VM deleted.
+[2026-02-26 18:28:31] [pro6000_x_1] Completed group: pro6000_x_1
+[2026-02-26 18:28:31] [root] 
+[2026-02-26 18:28:31] [root] SUMMARY
+[2026-02-26 18:28:31] [root] Successful: 4/6
+[2026-02-26 18:28:31] [root]    - pro6000_c12_mcr12_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root]    - pro6000_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root]    - pro6000_c8_mcr8_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root]    - pro6000_c16_mcr16_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root] 
+[2026-02-26 18:28:31] [root] Failed: 2/6
+[2026-02-26 18:28:31] [root]    - pro6000_c4_mcr4_vllm_benchmark.txt
+[2026-02-26 18:28:31] [root]    - pro6000_sglang_benchmark.txt
+[2026-02-26 18:28:31] [root] 
+[2026-02-26 18:28:31] [root] All done!
+[2026-02-26 18:28:31] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-26_17-51-09_e0e464d1/benchmark.log
+[2026-02-26 18:28:31] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_full_ctx_optimal_mcr_pro6000/2026-02-26_17-51-09_e0e464d1/benchmark.log
