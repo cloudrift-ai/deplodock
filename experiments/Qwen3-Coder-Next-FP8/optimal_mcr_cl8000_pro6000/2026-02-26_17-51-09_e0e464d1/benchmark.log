@@ -6888,3 +6888,28 @@ Endpoint: http://8.12.12.221:8000/v1
 Running smoke test...
 [2026-02-26 18:15:24] [ssh_transport] Warning: Permanently added '8.12.12.221' (ED25519) to the list of known hosts.
 [2026-02-26 18:16:41] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-26_17-51-09_e0e464d1/pro6000_c12_mcr12_vllm_benchmark.txt
+[2026-02-26 18:16:41] [committer] Committed: bench: completed pro6000_c12_mcr12 (Qwen/Qwen3-Coder-Next-FP8)
+[2026-02-26 18:16:42] [committer] Pushed results to remote
+[2026-02-26 18:16:42] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Tearing down...
+[2026-02-26 18:16:42] [orchestrate] Tearing down...
+[2026-02-26 18:16:42] [ssh_transport] Warning: Permanently added '8.12.12.230' (ED25519) to the list of known hosts.
+[2026-02-26 18:16:44] [ssh_transport]  Container vllm_0  Stopping
+[2026-02-26 18:16:45] [ssh_transport]  Container vllm_0  Stopped
+[2026-02-26 18:16:45] [ssh_transport]  Container vllm_0  Removing
+[2026-02-26 18:16:46] [ssh_transport]  Container vllm_0  Removed
+[2026-02-26 18:16:46] [ssh_transport]  Network deploy_default  Removing
+[2026-02-26 18:16:46] [ssh_transport]  Network deploy_default  Removed
+[2026-02-26 18:16:46] [orchestrate] Teardown complete.
+[2026-02-26 18:16:53] [ssh_transport] {"id":"chatcmpl-a8236abc3fe6da17","object":"chat.completion","created":1772129725,"model":"Qwen/Qwen3-Coder-Next-FP8","choices":[{"index":0,"message":{"role":"assistant","content":"Hello! 😊 How can I help you today?","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":[],"reasoning":null},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null}],"service_tier":null,"system_fingerprint":null,"usage":{"prompt_tokens":10,"total_tokens":22,"completion_tokens":12,"prompt_tokens_details":null},"prompt_logprobs":null,"prompt_token_ids":null,"kv_transfer_params":null}
+[2026-02-26 18:16:53] [orchestrate] Smoke test passed.
+[2026-02-26 18:16:53] [orchestrate] 
+Example curl:
+[2026-02-26 18:16:53] [orchestrate]   curl http://8.12.12.221:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-26 18:16:53] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-02-26 18:19:53] [pro6000_x_1] [Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_cl8000_pro6000/2026-02-26_17-51-09_e0e464d1/pro6000_c16_mcr16_vllm_benchmark.txt
