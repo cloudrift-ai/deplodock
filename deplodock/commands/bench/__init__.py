@@ -9,7 +9,6 @@ import json
 import logging
 import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from deplodock.benchmark import (
@@ -17,13 +16,13 @@ from deplodock.benchmark import (
     _run_groups,
     _task_meta,
     add_file_handler,
-    compute_code_hash,
     create_run_dir,
     enumerate_tasks,
     load_config,
     setup_logging,
+    task_identity,
     validate_config,
-    write_manifest,
+    write_tasks_json,
 )
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
@@ -62,6 +61,11 @@ def handle_bench(args):
         if src.exists() and not dest.exists():
             shutil.copy2(str(src), str(dest))
 
+    # Write tasks.json per run_dir
+    for resolved, run_dir in recipe_run_dirs.items():
+        run_tasks = [task_identity(t) for t in tasks if str(Path(t.recipe_dir).resolve()) == resolved]
+        write_tasks_json(run_dir, run_tasks)
+
     # Attach file handlers for each run directory
     log_file_paths = []
     for run_dir in recipe_run_dirs.values():
@@ -82,8 +86,16 @@ def handle_bench(args):
     root_logger.info(f"Parallel mode (max workers: {args.max_workers or len(groups)})")
     root_logger.info("")
 
+    # Set up commit callback if requested
+    on_task_done = None
+    if args.commit_results:
+        from deplodock.commands.bench.committer import GitCommitter
+
+        root_logger.info("Commit mode enabled: results will be committed after each task")
+        on_task_done = GitCommitter(asyncio.Lock())
+
     # Run groups
-    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown))
+    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown, on_task_done))
 
     # Flatten results, handling exceptions
     all_task_meta = []
@@ -99,17 +111,9 @@ def handle_bench(args):
             if instance_info is not None:
                 all_instance_infos.append(instance_info)
 
-    # Write per-recipe manifests and instances.json
-    code_hash = compute_code_hash()
-    timestamp = datetime.now().isoformat(timespec="seconds")
-
-    for resolved, run_dir in recipe_run_dirs.items():
-        recipe_name = Path(resolved).name
-        recipe_tasks = [t for t in all_task_meta if t["recipe"] == recipe_name]
-        write_manifest(run_dir, timestamp, code_hash, [recipe_name], recipe_tasks)
-        root_logger.info(f"Manifest written to: {run_dir / 'manifest.json'}")
-
-        if all_instance_infos:
+    # Write instances.json for --no-teardown
+    if all_instance_infos:
+        for run_dir in recipe_run_dirs.values():
             instances_path = run_dir / "instances.json"
             instances_path.write_text(json.dumps(all_instance_infos, indent=2))
             root_logger.info(f"Instance info saved to: {instances_path}")
@@ -181,5 +185,10 @@ def register_bench_command(subparsers):
         "--no-teardown",
         action="store_true",
         help="Skip teardown and VM deletion after benchmarks (save instance info for later cleanup)",
+    )
+    parser.add_argument(
+        "--commit-results",
+        action="store_true",
+        help="Git commit and push result files after each task completes",
     )
     parser.set_defaults(func=handle_bench)

@@ -180,12 +180,11 @@ Results are saved directly in the experiment directory:
 experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/
   recipe.yaml
   2026-02-24_19-13-50_abc12345/
-    manifest.json
-    optimal_mcr_rtx5090/
-      recipe.yaml
-      RTX5090_mcr8_c8_vllm_benchmark.txt
-      RTX5090_mcr12_c12_vllm_benchmark.txt
-      ...
+    tasks.json
+    recipe.yaml
+    RTX5090_mcr8_c8_vllm_benchmark.txt
+    RTX5090_mcr12_c12_vllm_benchmark.txt
+    ...
 ```
 
 ## CI Benchmark Workflow

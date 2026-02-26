@@ -3,7 +3,7 @@
 import logging
 from pathlib import Path
 
-from deplodock.report.collector import collect_tasks_from_manifests
+from deplodock.report.collector import collect_tasks_from_results
 from deplodock.report.parser import parse_benchmark_result
 from deplodock.report.pricing import get_gpu_price
 
@@ -23,7 +23,7 @@ def generate_report(config: dict, results_dir: str, output_file: str):
     data_by_model = {}
     all_data = []
 
-    for task_meta, result_file in collect_tasks_from_manifests(results_path):
+    for task_meta, result_file in collect_tasks_from_results(results_path):
         gpu_type = task_meta["gpu_short"]
         gpu_count = task_meta["gpu_count"]
         model_name = task_meta["model_name"]

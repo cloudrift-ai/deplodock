@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Format benchmark results as a markdown PR comment.
 
-Reads manifest.json from experiment run directories and extracts metrics
+Reads tasks.json from experiment run directories and extracts metrics
 from benchmark result files (throughput, TTFT, TPOT).
 """
 
@@ -16,7 +16,7 @@ def find_latest_run_dir(experiment_dir: str) -> Path | None:
     exp_path = Path(experiment_dir)
     run_dirs = sorted(exp_path.glob("[0-9][0-9][0-9][0-9]-*/"), reverse=True)
     for run_dir in run_dirs:
-        if (run_dir / "manifest.json").exists():
+        if (run_dir / "tasks.json").exists():
             return run_dir
     return None
 
@@ -62,21 +62,27 @@ def format_comment(experiments: list[str]) -> str:
             all_succeeded = False
             continue
 
-        manifest = json.loads((run_dir / "manifest.json").read_text())
-        tasks = manifest.get("tasks", [])
+        tasks = json.loads((run_dir / "tasks.json").read_text())
 
         if not tasks:
             lines.append(f"#### `{exp_name}`\n")
-            lines.append("> No tasks in manifest.\n")
+            lines.append("> No tasks found.\n")
             continue
 
-        completed = [t for t in tasks if t.get("status") == "completed"]
-        failed = [t for t in tasks if t.get("status") != "completed"]
+        # Derive status from whether result file exists
+        completed = []
+        failed = []
+        for t in tasks:
+            result_path = run_dir / t["result_file"]
+            if result_path.exists():
+                completed.append(t)
+            else:
+                failed.append(t)
 
         if failed:
             all_succeeded = False
             for t in failed:
-                failed_tasks.append(f"`{exp_name}` — {t.get('result_file', 'unknown')} ({t.get('status', 'unknown')})")
+                failed_tasks.append(f"`{exp_name}` — {t.get('result_file', 'unknown')}")
 
         if completed:
             any_results = True
@@ -90,12 +96,7 @@ def format_comment(experiments: list[str]) -> str:
                 gpu_count = task.get("gpu_count", 1)
                 gpu_label = f"{gpu_short} x{gpu_count}" if gpu_count > 1 else gpu_short
 
-                # Result file is relative to the recipe subdir inside the run dir
-                # Try both: directly in run_dir, and in recipe subdir
                 filepath = run_dir / result_file
-                if not filepath.exists():
-                    recipe_name = task.get("recipe", "")
-                    filepath = run_dir / recipe_name / result_file
 
                 metrics = parse_result_file(filepath)
                 throughput = f"{metrics['total_throughput']:.1f}" if "total_throughput" in metrics else "—"
