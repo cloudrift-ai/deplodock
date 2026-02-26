@@ -21,9 +21,9 @@ jobs:
       is_fork: ${{ steps.pr-meta.outputs.is_fork }}
       experiments: ${{ steps.detect.outputs.experiments }}
       gpu_concurrency: ${{ steps.detect.outputs.gpu_concurrency }}
-      total_tasks: ${{ steps.detect.outputs.total_tasks }}
-      task_summary: ${{ steps.detect.outputs.task_summary }}
       warnings: ${{ steps.detect.outputs.warnings }}
+      total_tasks: ${{ steps.summarize.outputs.total_tasks }}
+      task_summary: ${{ steps.summarize.outputs.task_summary }}
     steps:
       - name: Check permissions
         uses: actions/github-script@v7
@@ -73,9 +73,6 @@ jobs:
       - name: Fetch base branch
         run: git fetch origin ${{ github.event.repository.default_branch }}
 
-      - name: Install detect script dependencies
-        run: pip install pyyaml
-
       - name: Detect experiments
         id: detect
         run: |
@@ -83,6 +80,79 @@ jobs:
             --comment "${{ github.event.comment.body }}" \
             --base "origin/${{ github.event.repository.default_branch }}" \
             --head "HEAD"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: make setup
+
+      - name: Dry run benchmarks
+        run: |
+          experiments='${{ steps.detect.outputs.experiments }}'
+          gpu_concurrency='${{ steps.detect.outputs.gpu_concurrency }}'
+          dirs=$(echo "$experiments" | python -c "import sys, json; print(' '.join(json.load(sys.stdin)))")
+          cmd="./venv/bin/deplodock bench $dirs --dry-run"
+          if [ "$gpu_concurrency" -gt 1 ] 2>/dev/null; then
+            cmd="$cmd --gpu-concurrency $gpu_concurrency"
+          fi
+          $cmd
+
+      - name: Summarize tasks from dry run
+        id: summarize
+        run: |
+          python3 -c "
+          import json, os, sys, uuid
+
+          experiments = json.loads(sys.argv[1])
+          all_tasks = []
+          for exp_dir in experiments:
+              exp_name = os.path.basename(exp_dir)
+              # Find the most recent run dir (just created by dry-run)
+              try:
+                  entries = sorted(os.listdir(exp_dir), reverse=True)
+              except FileNotFoundError:
+                  continue
+              for entry in entries:
+                  tasks_path = os.path.join(exp_dir, entry, 'tasks.json')
+                  if os.path.isfile(tasks_path):
+                      with open(tasks_path) as f:
+                          tasks = json.load(f)
+                      for t in tasks:
+                          t['experiment'] = exp_name
+                      all_tasks.extend(tasks)
+                      break
+
+          total = len(all_tasks)
+
+          # Format summary grouped by gpu_short
+          groups = {}
+          for t in all_tasks:
+              groups.setdefault(t['gpu_short'], []).append(t)
+
+          lines = []
+          for gpu in sorted(groups):
+              lines.append(f'**{gpu}:**')
+              for t in groups[gpu]:
+                  lines.append(f'- \`{t[\"experiment\"]}\` — \`{t[\"result_file\"]}\`')
+              lines.append('')
+          summary = chr(10).join(lines).rstrip()
+
+          # Write to GITHUB_OUTPUT
+          out = os.environ.get('GITHUB_OUTPUT')
+          if out:
+              delim = f'ghadelim_{uuid.uuid4().hex[:8]}'
+              with open(out, 'a') as f:
+                  f.write(f'total_tasks={total}\n')
+                  f.write(f'task_summary<<{delim}\n')
+                  f.write(summary + '\n')
+                  f.write(f'{delim}\n')
+          else:
+              print(f'total_tasks={total}')
+              print(summary)
+          " '${{ steps.detect.outputs.experiments }}'
 
       - name: Add reaction to trigger comment
         uses: actions/github-script@v7
@@ -101,9 +171,9 @@ jobs:
         env:
           DETECT_EXPERIMENTS: ${{ steps.detect.outputs.experiments }}
           DETECT_GPU_CONCURRENCY: ${{ steps.detect.outputs.gpu_concurrency }}
-          DETECT_TOTAL_TASKS: ${{ steps.detect.outputs.total_tasks }}
-          DETECT_TASK_SUMMARY: ${{ steps.detect.outputs.task_summary }}
           DETECT_WARNINGS: ${{ steps.detect.outputs.warnings }}
+          DETECT_TOTAL_TASKS: ${{ steps.summarize.outputs.total_tasks }}
+          DETECT_TASK_SUMMARY: ${{ steps.summarize.outputs.task_summary }}
         with:
           token: ${{ steps.app-token.outputs.token }}
           script: |
