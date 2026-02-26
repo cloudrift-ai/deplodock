@@ -13,9 +13,9 @@ tests/
 ├── test_redact.py           # deplodock.redact (secret redaction)
 ├── benchmark/
 │   ├── test_bench_dryrun.py # bench CLI dry-run
-│   ├── test_code_hash.py    # compute_code_hash()
-│   ├── test_tasks_json.py   # write_tasks_json(), read_tasks_json(), parse_task_from_result()
-│   ├── test_run_dir.py      # create_run_dir()
+│   ├── test_code_hash.py    # BenchmarkTask.compute_code_hash()
+│   ├── test_tasks_json.py   # BenchmarkTask.write_tasks_json(), read_tasks_json()
+│   ├── test_run_dir.py      # BenchmarkTask.create_run_dir()
 │   └── test_results.py      # parse_benchmark_metrics(), parse_system_info(), compose_json_result()
 ├── recipe/
 │   ├── test_types.py        # Recipe.from_dict(), LLMConfig properties, dataclass defaults
@@ -50,9 +50,9 @@ Test individual functions in isolation with synthetic inputs.
 | `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`), grouping logic, sorting |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
 | `test_redact.py` | `deplodock.redact.redact_secrets()`, `SecretRedactingFilter` — value-based secret redaction for text and log records |
-| `benchmark/test_code_hash.py` | `deplodock.benchmark.compute_code_hash()` — determinism, hex format |
-| `benchmark/test_run_dir.py` | `deplodock.benchmark.create_run_dir()` — directory creation, naming format |
-| `benchmark/test_tasks_json.py` | `deplodock.benchmark.write_tasks_json()`, `read_tasks_json()`, `parse_task_from_result()` — tasks.json round-trip and result file parsing |
+| `benchmark/test_code_hash.py` | `BenchmarkTask.compute_code_hash()` — determinism, hex format |
+| `benchmark/test_run_dir.py` | `BenchmarkTask.create_run_dir()` — directory creation, naming format |
+| `benchmark/test_tasks_json.py` | `BenchmarkTask.write_tasks_json()`, `read_tasks_json()` — tasks.json round-trip |
 | `benchmark/test_results.py` | `parse_benchmark_metrics()`, `parse_system_info()`, `compose_json_result()` — structured JSON result parsing and composition |
 | `provisioning/test_cloudrift.py` | `deplodock.provisioning.cloudrift._api_request()`, `_rent_instance()`, etc. — CloudRift API helpers |
 | `provisioning/test_gcp.py` | `deplodock.provisioning.gcp._gcloud_*_cmd()` — GCP command builders |

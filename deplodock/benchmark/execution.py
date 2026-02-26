@@ -9,7 +9,6 @@ from collections.abc import Awaitable, Callable
 from deplodock.benchmark.bench_logging import _get_group_logger, active_run_dir
 from deplodock.benchmark.results import compose_json_result
 from deplodock.benchmark.system_info import collect_system_info
-from deplodock.benchmark.tasks import _task_meta
 from deplodock.benchmark.workload import compose_result, extract_benchmark_results, run_benchmark_workload
 from deplodock.deploy import (
     DeployParams,
@@ -30,20 +29,20 @@ from deplodock.provisioning.cloud import (
 from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_transport import make_run_cmd
 
-OnTaskDone = Callable[[BenchmarkTask, dict], Awaitable[None]]
+OnTaskDone = Callable[[BenchmarkTask, bool], Awaitable[None]]
 
 
 async def _invoke_callback(
     on_task_done: OnTaskDone | None,
     task: BenchmarkTask,
-    meta: dict,
+    success: bool,
     logger: logging.Logger,
 ):
     """Invoke the on_task_done callback, catching and logging any errors."""
     if on_task_done is None:
         return
     try:
-        await on_task_done(task, meta)
+        await on_task_done(task, success)
     except Exception as e:
         logger.warning(f"on_task_done callback failed: {e}")
 
@@ -75,7 +74,7 @@ async def run_execution_group(
     dry_run: bool = False,
     no_teardown: bool = False,
     on_task_done: OnTaskDone | None = None,
-) -> tuple[list[dict], dict | None]:
+) -> tuple[list[tuple[BenchmarkTask, bool]], dict | None]:
     """Run all benchmark tasks for one execution group.
 
     Provisions a VM with group.gpu_count GPUs, then runs each task.
@@ -84,14 +83,15 @@ async def run_execution_group(
 
     Args:
         on_task_done: Optional async callback invoked after each task completes
-            (success or failure). Receives (task, meta_dict). Exceptions are
+            (success or failure). Receives (task, success). Exceptions are
             caught and logged, never propagated.
 
     Returns:
-        A tuple of (task_metadata_list, instance_info). instance_info is
-        non-None only when no_teardown is set and the VM was kept alive.
+        A tuple of (task_results, instance_info). task_results is a list of
+        (BenchmarkTask, bool) pairs. instance_info is non-None only when
+        no_teardown is set and the VM was kept alive.
     """
-    task_results = []
+    task_results: list[tuple[BenchmarkTask, bool]] = []
     instance_info = None
     model_dir = config["benchmark"].get("model_dir", "/hf_models")
     hf_token = os.environ.get("HF_TOKEN", "")
@@ -116,9 +116,8 @@ async def run_execution_group(
         if conn is None:
             logger.error("VM provisioning failed")
             for task in group.tasks:
-                meta = _task_meta(task, status="failed")
-                task_results.append(meta)
-                await _invoke_callback(on_task_done, task, meta, logger)
+                task_results.append((task, False))
+                await _invoke_callback(on_task_done, task, False, logger)
             return task_results, None
 
         logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
@@ -158,9 +157,8 @@ async def run_execution_group(
 
             if not success:
                 task_logger.error("Deploy failed, skipping benchmark")
-                meta = _task_meta(task, status="failed")
-                task_results.append(meta)
-                await _invoke_callback(on_task_done, task, meta, task_logger)
+                task_results.append((task, False))
+                await _invoke_callback(on_task_done, task, False, task_logger)
                 continue
 
             task_logger.info("Running benchmark...")
@@ -182,16 +180,14 @@ async def run_execution_group(
                     task_logger.info(f"Results saved to: {result_path}")
                 else:
                     task_logger.info(f"[dry-run] Would save results to: {result_path}")
-                meta = _task_meta(task, status="completed")
-                task_results.append(meta)
-                await _invoke_callback(on_task_done, task, meta, task_logger)
+                task_results.append((task, True))
+                await _invoke_callback(on_task_done, task, True, task_logger)
             else:
                 task_logger.error("Benchmark failed")
                 if output:
                     task_logger.error(output)
-                meta = _task_meta(task, status="failed")
-                task_results.append(meta)
-                await _invoke_callback(on_task_done, task, meta, task_logger)
+                task_results.append((task, False))
+                await _invoke_callback(on_task_done, task, False, task_logger)
 
             if not no_teardown:
                 task_logger.info("Tearing down...")

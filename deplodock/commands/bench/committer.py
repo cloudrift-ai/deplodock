@@ -19,27 +19,12 @@ class GitCommitter:
     def __init__(self, lock: asyncio.Lock):
         self._lock = lock
 
-    async def __call__(self, task: BenchmarkTask, task_meta: dict) -> None:
+    async def __call__(self, task: BenchmarkTask, success: bool) -> None:
         async with self._lock:
-            status = task_meta.get("status", "unknown")
-            variant = task_meta.get("variant", "unknown")
-            model = task_meta.get("model_name", "unknown")
+            status = "pass" if success else "fail"
 
-            # Only commit if there's a result file to add
-            result_path = task.result_path()
-            tasks_json_path = task.run_dir / "tasks.json"
-
-            files_to_add = [str(tasks_json_path)]
-            if result_path.exists():
-                files_to_add.append(str(result_path))
-
-            # Also add the log file if it exists
-            log_path = task.run_dir / "benchmark.log"
-            if log_path.exists():
-                files_to_add.append(str(log_path))
-
-            # git add --force (results may be gitignored)
-            rc, _, stderr = await run_shell_cmd(["git", "add", "--force", *files_to_add])
+            # git add --force the entire run_dir (results may be gitignored)
+            rc, _, stderr = await run_shell_cmd(["git", "add", "--force", str(task.run_dir)])
             if rc != 0:
                 logger.warning(f"git add failed: {stderr}")
                 return
@@ -47,11 +32,11 @@ class GitCommitter:
             # Check if there are staged changes
             rc, _, _ = await run_shell_cmd(["git", "diff", "--cached", "--quiet"])
             if rc == 0:
-                logger.info(f"No changes to commit for {variant}")
+                logger.info(f"No changes to commit for {task.task_id}")
                 return
 
             # Commit
-            message = f"bench: {status} {variant} ({model})"
+            message = f"bench: {status} {task.task_id}"
             rc, _, stderr = await run_shell_cmd(["git", "commit", "-m", message])
             if rc != 0:
                 logger.warning(f"git commit failed: {stderr}")

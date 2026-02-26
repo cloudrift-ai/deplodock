@@ -82,15 +82,16 @@ def format_comment(experiments: list[str]) -> str:
         if failed:
             all_succeeded = False
             for t in failed:
-                failed_tasks.append(f"`{exp_name}` — {t.get('result_file', 'unknown')}")
+                failed_tasks.append(f"`{exp_name}` — {t.get('task_id', t.get('result_file', 'unknown'))}")
 
         if completed:
             any_results = True
             lines.append(f"#### `{exp_name}`\n")
-            lines.append("| Result | GPU | Throughput (tok/s) | TTFT (ms) | TPOT (ms) |")
-            lines.append("|--------|-----|--------------------|-----------|-----------|")
+            lines.append("| Task | GPU | Throughput (tok/s) | TTFT (ms) | TPOT (ms) |")
+            lines.append("|------|-----|--------------------|-----------|-----------|")
 
             for task in completed:
+                task_id = task.get("task_id", task.get("result_file", ""))
                 result_file = task.get("result_file", "")
                 gpu_short = task.get("gpu_short", "?")
                 gpu_count = task.get("gpu_count", 1)
@@ -103,7 +104,7 @@ def format_comment(experiments: list[str]) -> str:
                 ttft = f"{metrics['mean_ttft_ms']:.1f}" if "mean_ttft_ms" in metrics else "—"
                 tpot = f"{metrics['mean_tpot_ms']:.2f}" if "mean_tpot_ms" in metrics else "—"
 
-                lines.append(f"| `{result_file}` | {gpu_label} | {throughput} | {ttft} | {tpot} |")
+                lines.append(f"| `{task_id}` | {gpu_label} | {throughput} | {ttft} | {tpot} |")
 
             lines.append("")
 
