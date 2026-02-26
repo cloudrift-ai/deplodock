@@ -15,7 +15,7 @@
 [2026-02-25 10:30:16] [cloudrift] Instance is Active.
 [2026-02-25 10:30:16] [cloudrift] Host:     8.12.12.227
 [2026-02-25 10:30:16] [cloudrift] User:     riftuser
-[2026-02-25 10:30:16] [cloudrift] Password: aAftTwn8WynRmMJe
+[2026-02-25 10:30:16] [cloudrift] Password: <REDACTED>
 [2026-02-25 10:30:16] [cloudrift] Connect:  ssh riftuser@8.12.12.227
 [2026-02-25 10:30:16] [cloudrift] Waiting for SSH connectivity...
 [2026-02-25 10:31:51] [pro6000_x_1] VM provisioned: riftuser@8.12.12.227:22

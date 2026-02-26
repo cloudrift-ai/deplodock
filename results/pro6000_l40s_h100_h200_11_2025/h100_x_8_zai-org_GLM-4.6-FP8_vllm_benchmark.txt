@@ -43,7 +43,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     ports:
       - "8000:8000"
@@ -72,7 +72,7 @@ services:
     volumes:
       - /media/cloudrift/hf_models:/media/cloudrift/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/media/cloudrift/hf_models
     entrypoint: ["/bin/bash", "-c"]
     command: ["sleep infinity"]

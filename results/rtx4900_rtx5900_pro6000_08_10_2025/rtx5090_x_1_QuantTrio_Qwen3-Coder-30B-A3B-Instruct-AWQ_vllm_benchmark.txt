@@ -42,7 +42,7 @@ services:
     volumes:
       - /hf_models:/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - CUDA_VISIBLE_DEVICES=0
     ports:
       - "8000:8000"
@@ -77,7 +77,7 @@ services:
     volumes:
       - /hf_models:/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - CUDA_VISIBLE_DEVICES=""
     entrypoint: ["/bin/bash", "-c"]
     command: ["sleep infinity"]

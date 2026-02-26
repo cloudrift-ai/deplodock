@@ -69,7 +69,7 @@ services:
     volumes:
       - /hf_models:/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/hf_models
     ports:
       - "8000:8000"

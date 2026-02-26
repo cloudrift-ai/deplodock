@@ -43,7 +43,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     ports:
       - "8000:8000"
@@ -79,7 +79,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     ports:
       - "8001:8000"
@@ -115,7 +115,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     ports:
       - "8002:8000"
@@ -151,7 +151,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     ports:
       - "8003:8000"
@@ -187,7 +187,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     ports:
       - "8004:8000"
@@ -223,7 +223,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     ports:
       - "8005:8000"
@@ -259,7 +259,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     ports:
       - "8006:8000"
@@ -295,7 +295,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     ports:
       - "8007:8000"
@@ -341,7 +341,7 @@ services:
     volumes:
       - /mnt/localssd/hf_models:/mnt/localssd/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - HF_HOME=/mnt/localssd/hf_models
     entrypoint: ["/bin/bash", "-c"]
     command: ["sleep infinity"]

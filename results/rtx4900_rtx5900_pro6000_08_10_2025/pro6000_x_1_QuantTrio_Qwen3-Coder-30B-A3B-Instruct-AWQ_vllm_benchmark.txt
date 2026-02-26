@@ -42,7 +42,7 @@ services:
     volumes:
       - /hf_models:/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - OMP_NUM_THREADS=16
       - CUDA_VISIBLE_DEVICES=0
@@ -79,7 +79,7 @@ services:
     volumes:
       - /hf_models:/hf_models
     environment:
-      - HUGGING_FACE_HUB_TOKEN=
+      - HUGGING_FACE_HUB_TOKEN=<REDACTED>
       - CUDA_VISIBLE_DEVICES=""
     entrypoint: ["/bin/bash", "-c"]
     command: ["sleep infinity"]
