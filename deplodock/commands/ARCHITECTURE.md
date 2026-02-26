@@ -16,8 +16,7 @@ commands/vm ────► provisioning (create/delete instances)
 - `deplodock/deploy/` — compose generation, deploy orchestration
 - `deplodock/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
 - `deplodock/logging_setup.py` — CLI logging setup (`setup_cli_logging()`)
-- `deplodock/benchmark/` — tracking, config, logging, workload, tasks, execution
-- `deplodock/report/` — parsing, pricing, collection, report generation
+- `deplodock/benchmark/` — tracking, config, logging, workload, tasks, execution, structured JSON results
 
 ## Layers
 
@@ -69,16 +68,7 @@ Benchmark tracking, configuration, task enumeration, and execution.
 - `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
 - `tasks.py` — `enumerate_tasks()`, `_task_meta()`, `task_identity()`
 - `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type
-
-### `deplodock/report/` — Report Library
-
-Excel report generation from benchmark results.
-
-**Modules:**
-- `parser.py` — `parse_benchmark_result()`
-- `pricing.py` — `get_gpu_price()`
-- `collector.py` — `load_config()`, `collect_tasks_from_results()`
-- `generator.py` — `generate_report()`
+- `results.py` — `BenchmarkMetrics`, `SystemInfo` dataclasses, `parse_benchmark_metrics()`, `parse_system_info()`, `compose_json_result()`
 
 ### `planner/` — Planner Layer
 
@@ -109,7 +99,6 @@ async def _handle_foo(args):
 - `commands/deploy/ssh.py` — `handle_ssh()`, `register_ssh_target()`
 - `commands/deploy/local.py` — `handle_local()`, `register_local_target()`
 - `commands/deploy/cloud.py` — `handle_cloud()`, `register_cloud_target()`
-- `commands/report/` — `handle_report()`, `register_report_command()`
 - `commands/teardown.py` — `handle_teardown()`, `register_teardown_command()`
 - `commands/vm/` — `register_vm_command()`, CLI handlers for each provider
 
@@ -159,7 +148,6 @@ deplodock
 |   +-- cloud    -- provision cloud VM + deploy via SSH
 +-- bench        -- deploy + benchmark + teardown on cloud VMs
 +-- teardown     -- clean up VMs left by bench --no-teardown
-+-- report       -- generate Excel reports from benchmark results
 +-- vm
     +-- create
     |   +-- gcp

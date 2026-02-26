@@ -68,7 +68,7 @@ are non-obvious.
 
 - `__init__.py` files contain only re-exports. No classes, functions, or business logic.
 - Business logic goes in named modules (e.g., `recipe.py`, `compose.py`).
-- `commands/` layer: CLI code only (argparse registration + `handle_*` handlers). Reusable logic lives in top-level domain packages (`deplodock/deploy/`, `deplodock/provisioning/`, `deplodock/benchmark/`, `deplodock/report/`).
+- `commands/` layer: CLI code only (argparse registration + `handle_*` handlers). Reusable logic lives in top-level domain packages (`deplodock/deploy/`, `deplodock/provisioning/`, `deplodock/benchmark/`).
 
 ### Imports
 

@@ -10,8 +10,6 @@ requires-python = ">=3.12"
 dependencies = [
     "huggingface_hub[cli,hf_transfer]",
     "httpx",
-    "openpyxl",
-    "pandas",
     "pyyaml",
 ]
 

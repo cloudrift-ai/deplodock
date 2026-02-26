@@ -82,6 +82,7 @@ def task_identity(task: BenchmarkTask) -> dict:
     return {
         "variant": task.variant,
         "result_file": str(task.result_path().relative_to(task.run_dir)),
+        "json_result_file": str(task.json_result_path().relative_to(task.run_dir)),
         "gpu_name": task.gpu_name,
         "gpu_short": gpu_short_name(task.gpu_name),
         "gpu_count": task.gpu_count,
