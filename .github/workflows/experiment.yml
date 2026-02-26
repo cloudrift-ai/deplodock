@@ -93,7 +93,7 @@ jobs:
       - name: Summarize tasks from dry run
         id: summarize
         run: |
-          python3 -c "
+          ./venv/bin/python3 -c "
           import json, os, sys, uuid
           import yaml
 
