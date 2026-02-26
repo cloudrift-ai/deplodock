@@ -1,6 +1,11 @@
 """Benchmark library: config, logging, workload, tasks, execution."""
 
-from deplodock.benchmark.bench_logging import _get_group_logger, add_file_handler, setup_logging
+from deplodock.benchmark.bench_logging import (
+    _get_group_logger,
+    add_file_handler,
+    add_group_file_handler,
+    setup_logging,
+)
 from deplodock.benchmark.config import _expand_path, load_config, validate_config
 from deplodock.benchmark.execution import _run_groups, run_execution_group
 from deplodock.benchmark.results import (
@@ -31,6 +36,7 @@ __all__ = [
     "_expand_path",
     "setup_logging",
     "add_file_handler",
+    "add_group_file_handler",
     "_get_group_logger",
     "collect_system_info",
     "build_bench_command",

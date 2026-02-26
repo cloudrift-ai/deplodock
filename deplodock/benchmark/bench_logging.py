@@ -87,6 +87,52 @@ def add_file_handler(run_dir: Path) -> str:
     return str(log_file)
 
 
+class _GroupNameFilter(logging.Filter):
+    """Only pass records from loggers matching a specific execution group.
+
+    Accepts records where:
+    - record.name starts with group_label (group logger and its children)
+    - record.name starts with "deplodock." AND active_run_dir matches run_dir
+      (so deploy/provisioning logs for this group are included)
+    """
+
+    def __init__(self, group_label: str, run_dir: Path):
+        self.group_label = group_label
+        self.run_dir = run_dir
+
+    def filter(self, record):
+        if record.name.startswith(self.group_label):
+            return True
+        if record.name.startswith("deplodock."):
+            current = active_run_dir.get()
+            return current == self.run_dir
+        return False
+
+
+def add_group_file_handler(run_dir: Path, group_label: str) -> logging.Handler:
+    """Add a file handler for a specific execution group.
+
+    Writes to {run_dir}/benchmark_{group_label}.log, capturing only
+    log records from loggers whose name starts with group_label
+    or from deplodock.* loggers when active_run_dir matches.
+
+    Returns:
+        The handler, so the caller can remove it later.
+    """
+    log_file = run_dir / f"benchmark_{group_label}.log"
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_formatter = logging.Formatter(
+        "[%(asctime)s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler.setFormatter(file_formatter)
+    file_handler.addFilter(_GroupNameFilter(group_label, run_dir))
+    logging.getLogger().addHandler(file_handler)
+
+    return file_handler
+
+
 def _get_group_logger(group: ExecutionGroup, model_name: str | None = None) -> logging.Logger:
     """Get a logger for an execution group."""
     short = gpu_short_name(group.gpu_name)

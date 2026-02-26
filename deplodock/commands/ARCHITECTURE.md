@@ -63,7 +63,7 @@ Benchmark configuration, task enumeration, and execution.
 
 **Modules:**
 - `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
-- `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_BenchConsoleFormatter`
+- `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `add_group_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_GroupNameFilter`, `_BenchConsoleFormatter`
 - `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
 - `tasks.py` — `enumerate_tasks()`
 - `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type
