@@ -10029,3 +10029,15 @@ Example curl:
     }'
 [2026-02-27 04:54:49] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
 [2026-02-27 04:57:23] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-27_04-30-28_8c8e44e2/rtx5090x1_ivllm-vllm-oai-latest_vllm_benchmark.txt
+[2026-02-27 04:57:23] [deplodock.commands.bench.committer] Committed: bench: pass vllm_vs_sglang_rtx5090/rtx5090x1_ivllm-vllm-oai-latest
+[2026-02-27 04:57:24] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-02-27 04:57:24] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
+[2026-02-27 04:57:24] [deplodock.deploy.orchestrate] Tearing down...
+[2026-02-27 04:57:25] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.170' (ED25519) to the list of known hosts.
+[2026-02-27 04:57:27] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopping
+[2026-02-27 04:57:30] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopped
+[2026-02-27 04:57:30] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removing
+[2026-02-27 04:57:30] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removed
+[2026-02-27 04:57:30] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removing
+[2026-02-27 04:57:31] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removed
+[2026-02-27 04:57:31] [deplodock.deploy.orchestrate] Teardown complete.
