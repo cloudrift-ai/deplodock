@@ -5969,3 +5969,63 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-27 02:43:25] [rtx5090_x_1_r02.Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
+[2026-02-27 02:47:32] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_rtx5090/rtx5090x1_mc16_np80_mcr16
+[2026-02-27 02:47:33] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-02-27 02:47:33] [deplodock.deploy.orchestrate] Tearing down...
+[2026-02-27 02:47:33] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.163' (ED25519) to the list of known hosts.
+[2026-02-27 02:47:34] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopping
+[2026-02-27 02:47:36] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopped
+[2026-02-27 02:47:36] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removing
+[2026-02-27 02:47:36] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removed
+[2026-02-27 02:47:36] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removing
+[2026-02-27 02:47:37] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removed
+[2026-02-27 02:47:37] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-02-27 02:47:39] [deplodock.deploy.orchestrate] Pulling images...
+[2026-02-27 02:47:39] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.163' (ED25519) to the list of known hosts.
+[2026-02-27 02:47:41] [deplodock.provisioning.ssh_transport]  vllm_0 Pulling 
+[2026-02-27 02:47:41] [deplodock.provisioning.ssh_transport]  vllm_0 Pulled 
+[2026-02-27 02:47:41] [deplodock.deploy.orchestrate] Downloading model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ...
+[2026-02-27 02:47:42] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.163' (ED25519) to the list of known hosts.
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: huggingface_hub[cli,hf_transfer] in /usr/local/lib/python3.12/dist-packages (0.36.2)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (3.24.3)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2026.2.0)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: hf-xet<2.0.0,>=1.1.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (1.3.1)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: packaging>=20.9 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (26.0)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: pyyaml>=5.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (6.0.3)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: requests in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2.32.5)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: tqdm>=4.42.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.67.3)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: typing-extensions>=3.7.4.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.15.0)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Collecting InquirerPy==0.3.4 (from huggingface_hub[cli,hf_transfer])
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport]   Downloading InquirerPy-0.3.4-py3-none-any.whl.metadata (8.1 kB)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: hf_transfer>=0.1.4 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (0.1.9)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Collecting pfzy<0.4.0,>=0.3.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport]   Downloading pfzy-0.3.4-py3-none-any.whl.metadata (4.9 kB)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Collecting prompt-toolkit<4.0.0,>=3.0.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport]   Downloading prompt_toolkit-3.0.52-py3-none-any.whl.metadata (6.4 kB)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Collecting wcwidth (from prompt-toolkit<4.0.0,>=3.0.1->InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport]   Downloading wcwidth-0.6.0-py3-none-any.whl.metadata (30 kB)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.4.4)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.11)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2.6.3)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2026.2.25)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Downloading InquirerPy-0.3.4-py3-none-any.whl (67 kB)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Downloading pfzy-0.3.4-py3-none-any.whl (8.5 kB)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Downloading prompt_toolkit-3.0.52-py3-none-any.whl (391 kB)
+[2026-02-27 02:47:44] [deplodock.provisioning.ssh_transport] Downloading wcwidth-0.6.0-py3-none-any.whl (94 kB)
+[2026-02-27 02:47:45] [deplodock.provisioning.ssh_transport] Installing collected packages: wcwidth, pfzy, prompt-toolkit, InquirerPy
+[2026-02-27 02:47:45] [deplodock.provisioning.ssh_transport] 
+[2026-02-27 02:47:45] [deplodock.provisioning.ssh_transport] Successfully installed InquirerPy-0.3.4 pfzy-0.3.4 prompt-toolkit-3.0.52 wcwidth-0.6.0
+[2026-02-27 02:47:45] [deplodock.provisioning.ssh_transport] WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[2026-02-27 02:47:46] [deplodock.provisioning.ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-02-27 02:47:46] [deplodock.provisioning.ssh_transport] /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/snapshots/c58857a7f41c0920f73d1b56678640f9c02017d7
+[2026-02-27 02:47:46] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-02-27 02:47:47] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.163' (ED25519) to the list of known hosts.
+[2026-02-27 02:47:48] [deplodock.deploy.orchestrate] Starting services...
+[2026-02-27 02:47:48] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.163' (ED25519) to the list of known hosts.
+[2026-02-27 02:47:49] [deplodock.provisioning.ssh_transport]  Network deploy_default  Creating
+[2026-02-27 02:47:49] [deplodock.provisioning.ssh_transport]  Network deploy_default  Created
+[2026-02-27 02:47:49] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-02-27 02:47:50] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-02-27 02:47:50] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-02-27 02:47:53] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-02-27 02:47:53] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
