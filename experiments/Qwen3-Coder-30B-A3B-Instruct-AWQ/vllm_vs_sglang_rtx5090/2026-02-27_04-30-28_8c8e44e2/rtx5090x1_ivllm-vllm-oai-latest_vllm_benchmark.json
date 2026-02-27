@@ -1,0 +1,80 @@
+{
+  "task": {
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090",
+    "variant": "rtx5090x1_ivllm-vllm-oai-latest",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1
+  },
+  "recipe": {
+    "model": {
+      "huggingface": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+    },
+    "engine": {
+      "llm": {
+        "context_length": 8192,
+        "max_concurrent_requests": 16,
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "gpu_memory_utilization": 0.9,
+        "vllm": {
+          "image": "vllm/vllm-openai:latest",
+          "extra_args": ""
+        },
+        "sglang": null
+      }
+    },
+    "benchmark": {
+      "max_concurrency": 16,
+      "num_prompts": 32,
+      "random_input_len": 4000,
+      "random_output_len": 4000
+    },
+    "deploy": {
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "gpu_count": 1
+    }
+  },
+  "metrics": {
+    "successful_requests": 32,
+    "failed_requests": 0,
+    "max_request_concurrency": 16,
+    "benchmark_duration_s": 108.4,
+    "total_input_tokens": 128000,
+    "total_generated_tokens": 128000,
+    "request_throughput": 0.3,
+    "output_token_throughput": 1180.81,
+    "peak_output_token_throughput": 1520.0,
+    "peak_concurrent_requests": 24.0,
+    "total_token_throughput": 2361.62,
+    "mean_ttft_ms": 1735.33,
+    "median_ttft_ms": 1470.26,
+    "p99_ttft_ms": 3803.11,
+    "mean_tpot_ms": 13.09,
+    "median_tpot_ms": 13.26,
+    "p99_tpot_ms": 13.59,
+    "mean_itl_ms": 13.1,
+    "median_itl_ms": 12.67,
+    "p99_itl_ms": 16.24,
+    "mean_e2el_ms": null,
+    "median_e2el_ms": null,
+    "p99_e2el_ms": null
+  },
+  "system": {
+    "hostname": "riftvm",
+    "os": "Ubuntu 24.04.1 LTS",
+    "kernel": "6.8.0-51-generic",
+    "cpu_model": "AMD EPYC 7702 64-Core Processor",
+    "cpu_count": 7,
+    "cpu_arch": "x86_64",
+    "memory_total_gib": 49.0,
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_memory_mib": 32607,
+    "gpu_driver": "580.65.06",
+    "cuda_version": "13.0",
+    "gpu_count": 1,
+    "docker_version": "28.5.1"
+  },
+  "compose": "services:\n\n  vllm_0:\n    image: vllm/vllm-openai:latest\n    container_name: vllm_0\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              count: all\n              capabilities: [gpu]\n    volumes:\n      - /hf_models:/hf_models\n    environment:\n      - HUGGING_FACE_HUB_TOKEN=***\n      - HF_HOME=/hf_models\n    ports:\n      - \"8000:8000\"\n    shm_size: '16gb'\n    ipc: host\n    command: >\n      --trust-remote-code\n      --gpu-memory-utilization=0.9\n      --host 0.0.0.0\n      --port 8000\n      --tensor-parallel-size 1\n      --pipeline-parallel-size 1\n      --model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ\n      --served-model-name QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ\n      --max-model-len 8192\n      --max-num-seqs 16\n    healthcheck:\n      test: [\"CMD\", \"bash\", \"-c\", \"curl -f http://localhost:8000/health\"]\n      interval: 10s\n      timeout: 10s\n      retries: 180\n      start_period: 600s\n",
+  "bench_command": "vllm bench serve\n    --model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ\n    --max-concurrency 16\n    --num-prompts 32\n    --random-input-len 4000\n    --random-output-len 4000\n    --base-url http://localhost:8000"
+}

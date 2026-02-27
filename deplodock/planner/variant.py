@@ -1,8 +1,56 @@
 """Variant: typed benchmark variant with raw matrix params."""
 
+import re
 from dataclasses import dataclass
 
 from deplodock.hardware import gpu_short_name
+
+_KNOWN_ABBREVIATIONS: dict[str, str] = {
+    "cache": "cache",
+    "dtype": "dtype",
+    "expert": "exp",
+    "kv": "kv",
+    "latest": "latest",
+    "lmsysorg": "lms",
+    "moe": "moe",
+    "openai": "oai",
+    "parallel": "par",
+    "quantization": "quant",
+    "reasoning": "reas",
+    "sglang": "sglang",
+    "vllm": "vllm",
+}
+
+
+def _compact_segment(segment: str) -> str:
+    """Abbreviate a single segment of a compound value.
+
+    Lookup in known abbreviations first, then keep segments with digits intact,
+    otherwise take the first character.
+    """
+    low = segment.lower()
+    if low in _KNOWN_ABBREVIATIONS:
+        return _KNOWN_ABBREVIATIONS[low]
+    if any(c.isdigit() for c in segment):
+        return segment
+    return segment[0]
+
+
+def _compact_value(value: object) -> str:
+    """Sanitize and abbreviate a parameter value for use in filesystem paths.
+
+    1. Replace filesystem-unsafe characters with dashes and collapse runs.
+    2. If the result is compound (has dashes/underscores), abbreviate each
+       segment via _compact_segment and join with dashes.
+    """
+    s = str(value)
+    s = re.sub(r"[^\w.-]", "-", s)
+    s = re.sub(r"-{2,}", "-", s)
+    # Only abbreviate compound values (plain numbers like "128" pass through).
+    if not re.search(r"[-_]", s):
+        return s
+    parts = [p for p in re.split(r"[-_]+", s) if p]
+    return "-".join(_compact_segment(p) for p in parts)
 
 
 def _abbreviate(snake_case_name: str) -> str:
@@ -42,7 +90,7 @@ class Variant:
         for key in sorted(non_deploy):
             last_segment = key.rsplit(".", 1)[-1]
             abbrev = _abbreviate(last_segment)
-            parts.append(f"{abbrev}{non_deploy[key]}")
+            parts.append(f"{abbrev}{_compact_value(non_deploy[key])}")
         return f"{gpu_part}_{'_'.join(parts)}"
 
     def __eq__(self, other):
