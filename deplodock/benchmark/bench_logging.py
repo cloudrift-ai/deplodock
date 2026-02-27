@@ -36,6 +36,7 @@ class _BenchConsoleFormatter(logging.Formatter):
     """
 
     def format(self, record):
+        saved_name = record.name
         if record.name.startswith("deplodock."):
             # Library logger: show last segment only
             record.name = record.name.rsplit(".", 1)[-1]
@@ -43,7 +44,9 @@ class _BenchConsoleFormatter(logging.Formatter):
             # Bench group logger: split into [server] [model]
             server, model = record.name.split(".", 1)
             record.name = f"{server}] [{model}"
-        return super().format(record)
+        result = super().format(record)
+        record.name = saved_name
+        return result
 
 
 def setup_logging():

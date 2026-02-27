@@ -108,6 +108,10 @@ async def run_execution_group(
 
     logger.info(f"Starting group: {group.gpu_name} x{group.gpu_count} ({len(group.tasks)} tasks)")
 
+    # Set active_run_dir early so provisioning logs are captured by the group handler
+    if group.tasks and group.tasks[0].run_dir is not None:
+        active_run_dir.set(group.tasks[0].run_dir)
+
     conn = None
     try:
         conn = await provision_cloud_vm(
