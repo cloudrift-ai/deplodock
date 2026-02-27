@@ -18,6 +18,5 @@ matrices:
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
     engine.llm.max_concurrent_requests: [8, 12, 16, 20, 24, 28, 32, 36, 40]
-    benchmark.num_prompts: 64
     benchmark.max_concurrency: [8, 12, 16, 20, 24, 28, 32, 36, 40]
-    benchmark.num_prompts: [8, 12, 16, 20, 24, 28, 32, 36, 40]
+    benchmark.num_prompts: 80

@@ -1,0 +1,231 @@
+============ Benchmark Task ============
+recipe_dir: experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090
+variant: rtx5090x1_mc8_np80_mcr8
+gpu_name: NVIDIA GeForce RTX 5090
+gpu_count: 1
+recipe:
+  model:
+    huggingface: QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+  engine:
+    llm:
+      context_length: 8192
+      max_concurrent_requests: 8
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.9
+      vllm:
+        image: vllm/vllm-openai:latest
+        extra_args: ''
+      sglang: null
+  benchmark:
+    max_concurrency: 8
+    num_prompts: 80
+    random_input_len: 4000
+    random_output_len: 4000
+  deploy:
+    gpu: NVIDIA GeForce RTX 5090
+    gpu_count: 1
+==================================================
+
+============ Serving Benchmark Result ============
+Successful requests:                     80        
+Failed requests:                         0         
+Maximum request concurrency:             8         
+Benchmark duration (s):                  365.34    
+Total input tokens:                      320000    
+Total generated tokens:                  320000    
+Request throughput (req/s):              0.22      
+Output token throughput (tok/s):         875.90    
+Peak output token throughput (tok/s):    1136.00   
+Peak concurrent requests:                16.00     
+Total token throughput (tok/s):          1751.80   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          782.69    
+Median TTFT (ms):                        874.48    
+P99 TTFT (ms):                           1482.58   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.94      
+Median TPOT (ms):                        8.96      
+P99 TPOT (ms):                           9.73      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           8.94      
+Median ITL (ms):                         8.72      
+P99 ITL (ms):                            11.02     
+==================================================
+
+============ Docker Compose Configuration ============
+services:
+
+  vllm_0:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - /hf_models:/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=***
+      - HF_HOME=/hf_models
+    ports:
+      - "8000:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+      --served-model-name QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+      --max-model-len 8192
+      --max-num-seqs 8
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+==================================================
+
+============ Benchmark Command ============
+vllm bench serve
+    --model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+    --max-concurrency 8
+    --num-prompts 80
+    --random-input-len 4000
+    --random-output-len 4000
+    --base-url http://localhost:8000
+==================================================
+
+============ System Information ============
+=== HOSTNAME ===
+riftvm
+
+=== OS ===
+PRETTY_NAME="Ubuntu 24.04.1 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.1 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+
+=== KERNEL ===
+6.8.0-51-generic
+
+=== CPU INFORMATION ===
+Architecture:                         x86_64
+CPU op-mode(s):                       32-bit, 64-bit
+Address sizes:                        48 bits physical, 48 bits virtual
+Byte Order:                           Little Endian
+CPU(s):                               7
+On-line CPU(s) list:                  0-6
+Vendor ID:                            AuthenticAMD
+Model name:                           AMD EPYC 7702 64-Core Processor
+CPU family:                           23
+Model:                                49
+Thread(s) per core:                   1
+Core(s) per socket:                   1
+Socket(s):                            7
+Stepping:                             0
+BogoMIPS:                             3999.99
+Flags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm rep_good nopl cpuid extd_apicid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw perfctr_core ssbd ibrs ibpb stibp vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif umip rdpid arch_capabilities
+Virtualization:                       AMD-V
+Hypervisor vendor:                    KVM
+Virtualization type:                  full
+L1d cache:                            448 KiB (7 instances)
+L1i cache:                            448 KiB (7 instances)
+L2 cache:                             3.5 MiB (7 instances)
+L3 cache:                             112 MiB (7 instances)
+NUMA node(s):                         1
+NUMA node0 CPU(s):                    0-6
+Vulnerability Gather data sampling:   Not affected
+Vulnerability Itlb multihit:          Not affected
+Vulnerability L1tf:                   Not affected
+Vulnerability Mds:                    Not affected
+Vulnerability Meltdown:               Not affected
+Vulnerability Mmio stale data:        Not affected
+Vulnerability Reg file data sampling: Not affected
+Vulnerability Retbleed:               Mitigation; untrained return thunk; SMT disabled
+Vulnerability Spec rstack overflow:   Mitigation; SMT disabled
+Vulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:             Mitigation; Retpolines; IBPB conditional; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                  Not affected
+Vulnerability Tsx async abort:        Not affected
+
+=== CPU COUNT ===
+7
+
+=== MEMORY ===
+               total        used        free      shared  buff/cache   available
+Mem:            49Gi       896Mi        47Gi       3.0Mi       788Mi        48Gi
+Swap:             0B          0B          0B
+
+=== GPU INFORMATION ===
+NVIDIA GeForce RTX 5090, 32607 MiB, 580.65.06, P0, 34, 7 %
+
+=== GPU DETAILS ===
+Fri Feb 27 02:27:32 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.65.06              Driver Version: 580.65.06      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 5090        Off |   00000000:00:10.0 Off |                  N/A |
+| 44%   34C    P0             48W /  575W |       0MiB /  32607MiB |      7%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+=== DISK USAGE ===
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           5.0G  1.2M  4.9G   1% /run
+efivarfs        256K   17K  234K   7% /sys/firmware/efi/efivars
+/dev/vda1       387G   14G  374G   4% /
+tmpfs            25G     0   25G   0% /dev/shm
+tmpfs           5.0M     0  5.0M   0% /run/lock
+/dev/vda16      881M   62M  758M   8% /boot
+/dev/vda15      105M  8.4M   97M   8% /boot/efi
+tmpfs           5.0G   20K  5.0G   1% /run/user/1000
+
+=== BLOCK DEVICES ===
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+sr0      11:0    1  368K  0 rom  
+vda     253:0    0  400G  0 disk 
+├─vda1  253:1    0  399G  0 part /
+├─vda14 253:14   0    4M  0 part 
+├─vda15 253:15   0  106M  0 part /boot/efi
+└─vda16 259:0    0  913M  0 part /boot
+
+=== UPTIME ===
+ 02:27:32 up 0 min,  1 user,  load average: 1.30, 0.36, 0.12
+
+=== DOCKER VERSION ===
+Docker version 28.5.1, build e180ab8
+
+=== DOCKER INFO ===
+28.5.1 | OS: Ubuntu 24.04.1 LTS | Containers: 0 | Images: 0
+==================================================
