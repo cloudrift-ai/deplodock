@@ -3,7 +3,6 @@
 import re
 from dataclasses import asdict, dataclass
 
-from deplodock.hardware import gpu_short_name
 from deplodock.redact import redact_secrets
 
 
@@ -204,9 +203,9 @@ def compose_json_result(
     return {
         "task": {
             "recipe_dir": task.recipe_dir,
-            "variant": task.variant,
+            "variant": str(task.variant),
             "gpu_name": task.gpu_name,
-            "gpu_short": gpu_short_name(task.gpu_name),
+            "gpu_short": task.gpu_short,
             "gpu_count": task.gpu_count,
         },
         "recipe": asdict(task.recipe),

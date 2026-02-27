@@ -8,7 +8,7 @@ The `recipe` package owns all recipe-related logic: YAML loading, matrix expansi
 
 - `types.py` — dataclasses: `Recipe`, `DeployConfig`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig`
 - `recipe.py` — `deep_merge()`, `load_recipe()`, `validate_extra_args()`, `_load_raw_config()`, `_validate_and_build()`
-- `matrix.py` — `expand_matrix_entry()`, `dot_to_nested()`, `matrix_label()`, `build_override()`, `PARAM_ABBREVIATIONS`
+- `matrix.py` — `expand_matrix_entry()`, `dot_to_nested()`, `build_override()`
 - `engines.py` — `VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`, `banned_extra_arg_flags()`, `build_engine_args()`
 
 ## Key Design Decisions
@@ -62,13 +62,15 @@ matrices:
 
 The merged result keeps `tensor_parallel_size: 8`, `context_length: 16384`, and the vllm block from the base, while adding `max_concurrent_requests: 256` from the matrix entry.
 
-### Auto-Generated Run Identifiers
+### Auto-Generated Run Identifiers (Variant)
 
-Each matrix combination gets an auto-generated identifier: `{gpu_short_name}` + `_{matrix_label}` (if any list params).
+Variant naming is handled by `Variant` in `deplodock.planner.variant`. Each matrix combination produces a `Variant(params=combo)` that derives its string representation from the raw params dict:
 
-Matrix labels use abbreviations: `max_concurrency` → `c`, `num_prompts` → `n`, `random_input_len` → `in`, `random_output_len` → `out`, `max_concurrent_requests` → `mcr`, `context_length` → `ctx`. Unknown keys use the last path segment.
+- GPU part: `{gpu_short}x{gpu_count}` (e.g. `rtx5090x1`, `h100x8`)
+- Non-deploy params: abbreviated via first-letter-of-each-word heuristic (`max_concurrency` → `mc`, `num_prompts` → `np`, `max_concurrent_requests` → `mcr`), sorted alphabetically, appended with `_`
+- All params appear in the label, not just the variable ones
 
-Examples: `rtx5090_c1_vllm_benchmark.txt`, `rtx5090_c128_vllm_benchmark.txt`, `rtx5090_vllm_benchmark.txt` (single-point entry).
+Examples: `rtx5090x1_mc8_mcr8_np80_vllm_benchmark.txt`, `rtx5090x1_vllm_benchmark.txt` (deploy-only params).
 
 ### DeployConfig
 
@@ -143,6 +145,7 @@ _load_raw_config(recipe_dir) -> raw dict
     |
     +-- enumerate_tasks(): reads matrices, expands each entry:
             |-- expand_matrix_entry() -> list of combinations
+            |-- Variant(params=combo) -> typed variant
             |-- build_override() -> nested override dict
             |-- deep_merge(base, override) -> merged config
             |-- _validate_and_build() -> Recipe per combination
