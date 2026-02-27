@@ -6032,3 +6032,16 @@ Example curl:
 [2026-02-27 02:47:50] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
 [2026-02-27 02:47:53] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
 [2026-02-27 02:47:53] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-02-27 02:49:31] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_rtx5090/rtx5090x1_mc8_np80_mcr8
+[2026-02-27 02:49:32] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-02-27 02:49:32] [deplodock.deploy.orchestrate] Tearing down...
+[2026-02-27 02:49:32] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.162' (ED25519) to the list of known hosts.
+[2026-02-27 02:49:34] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopping
+[2026-02-27 02:49:36] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopped
+[2026-02-27 02:49:36] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removing
+[2026-02-27 02:49:36] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removed
+[2026-02-27 02:49:36] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removing
+[2026-02-27 02:49:36] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removed
+[2026-02-27 02:49:36] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-02-27 02:49:38] [deplodock.deploy.orchestrate] Pulling images...
+[2026-02-27 02:49:39] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.162' (ED25519) to the list of known hosts.
