@@ -12,7 +12,19 @@ REMOTE_DEPLOY_DIR = "~/deploy"
 
 def ssh_base_args(server, ssh_key, ssh_port):
     """Build base SSH arguments."""
-    args = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
+    args = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=60",
+        "-o",
+        "ServerAliveCountMax=5",
+    ]
     if ssh_key:
         args += ["-i", ssh_key]
     if ssh_port and ssh_port != 22:
@@ -83,7 +95,19 @@ def make_run_cmd(server, ssh_key, ssh_port, dry_run=False):
 
 async def scp_file(local_path, server, ssh_key, ssh_port, remote_path, timeout=300):
     """Copy a file to the remote server via SCP."""
-    scp_args = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
+    scp_args = [
+        "scp",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=60",
+        "-o",
+        "ServerAliveCountMax=5",
+    ]
     if ssh_key:
         scp_args += ["-i", ssh_key]
     if ssh_port and ssh_port != 22:
