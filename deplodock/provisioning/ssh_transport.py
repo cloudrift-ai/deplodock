@@ -14,11 +14,16 @@ def ssh_base_args(server, ssh_key, ssh_port):
     """Build base SSH arguments."""
     args = [
         "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "BatchMode=yes",
-        "-o", "ServerAliveInterval=60",
-        "-o", "ServerAliveCountMax=5",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=60",
+        "-o",
+        "ServerAliveCountMax=5",
     ]
     if ssh_key:
         args += ["-i", ssh_key]
@@ -92,11 +97,16 @@ async def scp_file(local_path, server, ssh_key, ssh_port, remote_path, timeout=3
     """Copy a file to the remote server via SCP."""
     scp_args = [
         "scp",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "BatchMode=yes",
-        "-o", "ServerAliveInterval=60",
-        "-o", "ServerAliveCountMax=5",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=60",
+        "-o",
+        "ServerAliveCountMax=5",
     ]
     if ssh_key:
         scp_args += ["-i", ssh_key]
