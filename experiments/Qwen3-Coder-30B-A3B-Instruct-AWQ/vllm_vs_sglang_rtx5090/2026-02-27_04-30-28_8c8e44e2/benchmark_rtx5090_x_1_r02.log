@@ -10006,3 +10006,15 @@ Endpoint: http://217.138.104.170:8000/v1
 Running smoke test...
 [2026-02-27 04:52:17] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.170' (ED25519) to the list of known hosts.
 [2026-02-27 04:54:10] [rtx5090_x_1_r02.Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-27_04-30-28_8c8e44e2/rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest_sglang_benchmark.txt
+[2026-02-27 04:54:10] [deplodock.commands.bench.committer] Committed: bench: pass vllm_vs_sglang_rtx5090/rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest
+[2026-02-27 04:54:11] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-02-27 04:54:11] [rtx5090_x_1_r02.Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
+[2026-02-27 04:54:11] [deplodock.deploy.orchestrate] Tearing down...
+[2026-02-27 04:54:12] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.171' (ED25519) to the list of known hosts.
+[2026-02-27 04:54:14] [deplodock.provisioning.ssh_transport]  Container sglang_0  Stopping
+[2026-02-27 04:54:15] [deplodock.provisioning.ssh_transport]  Container sglang_0  Stopped
+[2026-02-27 04:54:15] [deplodock.provisioning.ssh_transport]  Container sglang_0  Removing
+[2026-02-27 04:54:15] [deplodock.provisioning.ssh_transport]  Container sglang_0  Removed
+[2026-02-27 04:54:15] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removing
+[2026-02-27 04:54:15] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removed
+[2026-02-27 04:54:15] [deplodock.deploy.orchestrate] Teardown complete.
