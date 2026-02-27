@@ -5,21 +5,12 @@ import os
 
 import yaml
 
-from deplodock.hardware import gpu_short_name
 from deplodock.planner import BenchmarkTask
-from deplodock.recipe.matrix import build_override, expand_matrix_entry, matrix_label
+from deplodock.planner.variant import Variant
+from deplodock.recipe.matrix import build_override, expand_matrix_entry
 from deplodock.recipe.recipe import _validate_and_build, deep_merge
 
 logger = logging.getLogger(__name__)
-
-
-def _build_variant_name(gpu_name, combination, variable_keys):
-    """Build auto-generated run identifier from GPU name and matrix combination."""
-    short = gpu_short_name(gpu_name)
-    label = matrix_label(combination, variable_keys)
-    if label:
-        return f"{short}_{label}"
-    return short
 
 
 def enumerate_tasks(recipe_dirs) -> list[BenchmarkTask]:
@@ -49,9 +40,6 @@ def enumerate_tasks(recipe_dirs) -> list[BenchmarkTask]:
         for entry in matrices:
             combinations = expand_matrix_entry(entry)
 
-            # Determine which keys were lists (variable keys) for labeling
-            variable_keys = {k for k, v in entry.items() if isinstance(v, list)}
-
             for combo in combinations:
                 override = build_override(combo)
                 merged = deep_merge(base_config, override)
@@ -63,14 +51,12 @@ def enumerate_tasks(recipe_dirs) -> list[BenchmarkTask]:
                     )
                     continue
 
-                variant_name = _build_variant_name(recipe.deploy.gpu, combo, variable_keys)
+                variant = Variant(params=combo)
                 tasks.append(
                     BenchmarkTask(
                         recipe_dir=recipe_dir,
-                        variant=variant_name,
+                        variant=variant,
                         recipe=recipe,
-                        gpu_name=recipe.deploy.gpu,
-                        gpu_count=recipe.deploy.gpu_count,
                     )
                 )
 

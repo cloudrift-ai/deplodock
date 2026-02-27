@@ -56,7 +56,7 @@ def format_task_yaml(task: BenchmarkTask) -> str:
     """
     data = {
         "recipe_dir": task.recipe_dir,
-        "variant": task.variant,
+        "variant": str(task.variant),
         "gpu_name": task.gpu_name,
         "gpu_count": task.gpu_count,
         "recipe": asdict(task.recipe),

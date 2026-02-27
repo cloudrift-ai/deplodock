@@ -2,11 +2,9 @@
 
 from deplodock.recipe.engines import banned_extra_arg_flags, build_engine_args
 from deplodock.recipe.matrix import (
-    PARAM_ABBREVIATIONS,
     build_override,
     dot_to_nested,
     expand_matrix_entry,
-    matrix_label,
 )
 from deplodock.recipe.recipe import (
     _load_raw_config,
@@ -32,7 +30,6 @@ __all__ = [
     "EngineConfig",
     "LLMConfig",
     "ModelConfig",
-    "PARAM_ABBREVIATIONS",
     "Recipe",
     "SglangConfig",
     "VllmConfig",
@@ -45,6 +42,5 @@ __all__ = [
     "dot_to_nested",
     "expand_matrix_entry",
     "load_recipe",
-    "matrix_label",
     "validate_extra_args",
 ]

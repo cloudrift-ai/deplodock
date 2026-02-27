@@ -1,15 +1,5 @@
 """Matrix expansion: broadcast + zip semantics for benchmark parameter sweeps."""
 
-# Abbreviations for common parameter names in auto-generated run identifiers.
-PARAM_ABBREVIATIONS = {
-    "max_concurrency": "c",
-    "num_prompts": "n",
-    "random_input_len": "in",
-    "random_output_len": "out",
-    "max_concurrent_requests": "mcr",
-    "context_length": "ctx",
-}
-
 
 def dot_to_nested(key: str, value) -> dict:
     """Convert a dot-notation key + value into a nested dict.
@@ -61,26 +51,6 @@ def expand_matrix_entry(entry: dict) -> list[dict]:
         combinations.append(combo)
 
     return combinations
-
-
-def matrix_label(combination: dict, variable_keys: set) -> str:
-    """Generate a filename-safe label from the variable (list) params of a combination.
-
-    Only variable keys (those that came from lists) contribute to the label.
-    Returns empty string for single-point entries (all scalars).
-    """
-    if not variable_keys:
-        return ""
-
-    parts = []
-    for key in sorted(variable_keys):
-        value = combination[key]
-        # Use last path segment for abbreviation lookup
-        last_segment = key.rsplit(".", 1)[-1]
-        abbrev = PARAM_ABBREVIATIONS.get(last_segment, last_segment)
-        parts.append(f"{abbrev}{value}")
-
-    return "_".join(parts)
 
 
 def build_override(combination: dict) -> dict:

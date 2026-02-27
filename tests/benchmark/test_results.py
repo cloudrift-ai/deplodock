@@ -10,6 +10,7 @@ from deplodock.benchmark.results import (
     parse_system_info,
 )
 from deplodock.planner import BenchmarkTask
+from deplodock.planner.variant import Variant
 from deplodock.recipe.types import Recipe
 
 # ── Sample benchmark output (from real vLLM bench serve) ──────────
@@ -186,12 +187,17 @@ def _make_task(tmp_path: Path) -> BenchmarkTask:
             "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
         }
     )
+    variant = Variant(
+        params={
+            "deploy.gpu": "NVIDIA GeForce RTX 5090",
+            "deploy.gpu_count": 1,
+            "benchmark.max_concurrency": 8,
+        }
+    )
     return BenchmarkTask(
         recipe_dir="experiments/TestModel/test_experiment",
-        variant="rtx5090_c8",
+        variant=variant,
         recipe=recipe,
-        gpu_name="NVIDIA GeForce RTX 5090",
-        gpu_count=1,
         run_dir=tmp_path,
     )
 
@@ -210,7 +216,7 @@ def test_compose_json_result(tmp_path):
 
     # task section
     assert result["task"]["recipe_dir"] == "experiments/TestModel/test_experiment"
-    assert result["task"]["variant"] == "rtx5090_c8"
+    assert result["task"]["variant"] == "rtx5090x1_mc8"
     assert result["task"]["gpu_name"] == "NVIDIA GeForce RTX 5090"
     assert result["task"]["gpu_short"] == "rtx5090"
     assert result["task"]["gpu_count"] == 1

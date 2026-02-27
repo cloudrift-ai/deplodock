@@ -26,7 +26,8 @@ tests/
 │   ├── test_deploy_dryrun.py        # deploy ssh/local CLI dry-run
 │   └── test_recipe.py       # load_recipe(), deep_merge(), validate_extra_args()
 ├── planner/
-│   └── test_planner.py      # BenchmarkTask, GroupByModelAndGpuPlanner
+│   ├── test_planner.py      # BenchmarkTask, GroupByModelAndGpuPlanner
+│   └── test_variant.py      # Variant class, _abbreviate()
 ├── provisioning/
 │   ├── test_cloud.py        # resolve_vm_spec(), delete_cloud_vm(), VMConnectionInfo
 │   ├── test_cloudrift.py    # CloudRift API helpers
@@ -47,7 +48,8 @@ Test individual functions in isolation with synthetic inputs.
 | `deploy/test_recipe.py` | `deplodock.recipe.load_recipe()`, `deep_merge()`, `validate_extra_args()` — recipe loading, variant resolution, YAML parsing, extra_args validation |
 | `deploy/test_compose.py` | `deplodock.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `gpu_device_ids` support |
 | `provisioning/test_cloud.py` | `deplodock.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud provisioning unit tests |
-| `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`), grouping logic, sorting |
+| `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`, `gpu_name`, `gpu_count`, `gpu_short`), grouping logic, sorting |
+| `planner/test_variant.py` | `Variant` — `__str__`, `gpu_short`, `gpu_count`, `__eq__`, `__hash__`, `_abbreviate()` |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
 | `test_redact.py` | `deplodock.redact.redact_secrets()`, `SecretRedactingFilter` — value-based secret redaction for text and log records |
 | `benchmark/test_code_hash.py` | `BenchmarkTask.compute_code_hash()` — determinism, hex format |

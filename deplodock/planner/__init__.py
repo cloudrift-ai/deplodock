@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from deplodock.hardware import gpu_short_name
+from deplodock.planner.variant import Variant
 from deplodock.recipe.types import Recipe
 
 
@@ -18,11 +19,24 @@ class BenchmarkTask:
     """One recipe+variant combination to benchmark."""
 
     recipe_dir: str
-    variant: str
+    variant: Variant
     recipe: Recipe
-    gpu_name: str
-    gpu_count: int
     run_dir: Path | None = None
+
+    @property
+    def gpu_name(self) -> str:
+        """Full GPU name from recipe deploy config."""
+        return self.recipe.deploy.gpu
+
+    @property
+    def gpu_count(self) -> int:
+        """GPU count from recipe deploy config."""
+        return self.recipe.deploy.gpu_count
+
+    @property
+    def gpu_short(self) -> str:
+        """Short GPU name from variant."""
+        return self.variant.gpu_short
 
     @property
     def task_id(self) -> str:
@@ -53,10 +67,10 @@ class BenchmarkTask:
         return {
             "task_id": self.task_id,
             "recipe_dir": self.recipe_dir,
-            "variant": self.variant,
+            "variant": str(self.variant),
             "recipe_name": self.recipe_name,
             "gpu_name": self.gpu_name,
-            "gpu_short": gpu_short_name(self.gpu_name),
+            "gpu_short": self.gpu_short,
             "gpu_count": self.gpu_count,
             "model_name": self.model_name,
             "result_file": str(self.result_path().relative_to(self.run_dir)),
