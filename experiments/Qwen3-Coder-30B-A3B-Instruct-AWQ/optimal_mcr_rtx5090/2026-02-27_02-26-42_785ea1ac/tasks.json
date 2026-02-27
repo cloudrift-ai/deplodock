@@ -1,0 +1,110 @@
+[
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc8_np80_mcr8",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc8_np80_mcr8",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc8_np80_mcr8_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc8_np80_mcr8_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc12_np80_mcr12",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc12_np80_mcr12",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc12_np80_mcr12_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc12_np80_mcr12_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc16_np80_mcr16",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc16_np80_mcr16",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc16_np80_mcr16_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc16_np80_mcr16_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc20_np80_mcr20",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc20_np80_mcr20",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc20_np80_mcr20_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc20_np80_mcr20_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc24_np80_mcr24",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc24_np80_mcr24",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc24_np80_mcr24_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc24_np80_mcr24_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc28_np80_mcr28",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc28_np80_mcr28",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc28_np80_mcr28_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc28_np80_mcr28_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc32_np80_mcr32",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc32_np80_mcr32",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc32_np80_mcr32_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc32_np80_mcr32_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc36_np80_mcr36",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc36_np80_mcr36",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc36_np80_mcr36_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc36_np80_mcr36_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_rtx5090/rtx5090x1_mc40_np80_mcr40",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090",
+    "variant": "rtx5090x1_mc40_np80_mcr40",
+    "recipe_name": "optimal_mcr_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_mc40_np80_mcr40_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_mc40_np80_mcr40_vllm_benchmark.json"
+  }
+]
