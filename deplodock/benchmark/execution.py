@@ -6,7 +6,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 
-from deplodock.benchmark.bench_logging import _get_group_logger, active_run_dir
+from deplodock.benchmark.bench_logging import _get_group_logger, active_run_dir, add_group_file_handler
 from deplodock.benchmark.results import compose_json_result
 from deplodock.benchmark.system_info import collect_system_info
 from deplodock.benchmark.workload import compose_result, extract_benchmark_results, run_benchmark_workload
@@ -20,7 +20,6 @@ from deplodock.deploy import (
     teardown as teardown_entry,
 )
 from deplodock.deploy.compose import generate_compose
-from deplodock.hardware import gpu_short_name
 from deplodock.planner import BenchmarkTask, ExecutionGroup
 from deplodock.provisioning.cloud import (
     delete_cloud_vm,
@@ -97,9 +96,16 @@ async def run_execution_group(
     hf_token = os.environ.get("HF_TOKEN", "")
     providers_config = config.get("providers", {})
 
-    short = gpu_short_name(group.gpu_name)
-    group_label = f"{short}_x_{group.gpu_count}"
+    group_label = group.label
     logger = _get_group_logger(group)
+
+    # Attach per-group log file if we have a run_dir from the first task
+    group_handler = None
+    if group.tasks:
+        run_dir = group.tasks[0].run_dir
+        if run_dir is not None:
+            group_handler = add_group_file_handler(run_dir, group_label)
+
     logger.info(f"Starting group: {group.gpu_name} x{group.gpu_count} ({len(group.tasks)} tasks)")
 
     conn = None
@@ -195,6 +201,9 @@ async def run_execution_group(
 
     finally:
         active_run_dir.set(None)
+        if group_handler is not None:
+            logging.getLogger().removeHandler(group_handler)
+            group_handler.close()
         if conn is not None and conn.delete_info:
             if no_teardown:
                 instance_info = _build_instance_info(group, group_label, conn)
