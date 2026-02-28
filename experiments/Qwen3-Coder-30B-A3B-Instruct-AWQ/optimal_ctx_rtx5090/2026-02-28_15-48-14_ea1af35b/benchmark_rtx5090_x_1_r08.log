@@ -25502,3 +25502,140 @@ scp: Connection closed
 [2026-02-28 16:26:17] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
 [2026-02-28 16:27:02] [deplodock.provisioning.ssh_transport] ssh: connect to host 217.138.104.168 port 22: Connection timed out
 [2026-02-28 16:27:02] [deplodock.deploy.orchestrate] Failed to pull images
+[2026-02-28 16:27:02] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl204800
+[2026-02-28 16:27:03] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-02-28 16:29:19] [deplodock.provisioning.ssh_transport]  Container vllm_0  Healthy
+[2026-02-28 16:29:19] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-02-28 16:29:20] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.169' (ED25519) to the list of known hosts.
+[2026-02-28 16:29:21] [deplodock.deploy.orchestrate] 
+Endpoint: http://217.138.104.169:8000/v1
+[2026-02-28 16:29:21] [deplodock.deploy.orchestrate] Model: QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+[2026-02-28 16:29:21] [deplodock.deploy.orchestrate] Instances: 1
+[2026-02-28 16:29:21] [deplodock.deploy.orchestrate] Status: deployed
+[2026-02-28 16:29:21] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-02-28 16:30:29] [deplodock.provisioning.ssh_transport]  Container vllm_0  Healthy
+[2026-02-28 16:30:29] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-02-28 16:30:29] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.173' (ED25519) to the list of known hosts.
+[2026-02-28 16:30:31] [deplodock.deploy.orchestrate] 
+Endpoint: http://217.138.104.173:8000/v1
+[2026-02-28 16:30:31] [deplodock.deploy.orchestrate] Model: QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+[2026-02-28 16:30:31] [deplodock.deploy.orchestrate] Instances: 1
+[2026-02-28 16:30:31] [deplodock.deploy.orchestrate] Status: deployed
+[2026-02-28 16:30:31] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-02-28 16:31:54] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-02-28 16:31:54] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-02-28 16:31:54] [deplodock.deploy.orchestrate]   curl http://217.138.104.169:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-28 16:32:59] [deplodock.provisioning.ssh_transport] container vllm_0 exited (1)
+[2026-02-28 16:32:59] [deplodock.deploy.orchestrate] Failed to start services
+[2026-02-28 16:32:59] [deplodock.deploy.orchestrate] Container logs:
+[2026-02-28 16:32:59] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.167' (ED25519) to the list of known hosts.
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006] Traceback (most recent call last):
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 996, in run_engine_core
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 740, in __init__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]     super().__init__(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 113, in __init__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]     num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 259, in _initialize_kv_caches
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]     kv_cache_configs = get_kv_cache_configs(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]                        ^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py", line 1516, in get_kv_cache_configs
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]     _check_enough_kv_cache_memory(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py", line 634, in _check_enough_kv_cache_memory
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006]     raise ValueError(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ERROR 02-28 16:32:51 [core.py:1006] ValueError: To serve at least one request with the models's max seq len (196608), (18.0 GiB KV cache is needed, which is larger than the available KV cache memory (11.81 GiB). Based on the available memory, the estimated maximum model length is 128992. Try increasing `gpu_memory_utilization` or decreasing `max_model_len` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) Traceback (most recent call last):
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     self.run()
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     self._target(*self._args, **self._kwargs)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 1010, in run_engine_core
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     raise e
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 996, in run_engine_core
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 740, in __init__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     super().__init__(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 113, in __init__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 259, in _initialize_kv_caches
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     kv_cache_configs = get_kv_cache_configs(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)                        ^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py", line 1516, in get_kv_cache_configs
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     _check_enough_kv_cache_memory(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py", line 634, in _check_enough_kv_cache_memory
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104)     raise ValueError(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (EngineCore_DP0 pid=104) ValueError: To serve at least one request with the models's max seq len (196608), (18.0 GiB KV cache is needed, which is larger than the available KV cache memory (11.81 GiB). Based on the available memory, the estimated maximum model length is 128992. Try increasing `gpu_memory_utilization` or decreasing `max_model_len` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | [rank0]:[W228 16:32:53.423220395 ProcessGroupNCCL.cpp:1524] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1) Traceback (most recent call last):
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/bin/vllm", line 10, in <module>
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     sys.exit(main())
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)              ^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/main.py", line 73, in main
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     args.dispatch_function(args)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/serve.py", line 111, in cmd
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     uvloop.run(run_server(args))
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/uvloop/__init__.py", line 96, in run
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     return __asyncio.run(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)            ^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/lib/python3.12/asyncio/runners.py", line 195, in run
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     return runner.run(main)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)            ^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     return self._loop.run_until_complete(task)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/uvloop/__init__.py", line 48, in wrapper
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     return await main
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)            ^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 457, in run_server
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 476, in run_server_worker
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     async with build_async_engine_client(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     return await anext(self.gen)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)            ^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 96, in build_async_engine_client
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     async with build_async_engine_client_from_engine_args(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     return await anext(self.gen)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)            ^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/api_server.py", line 137, in build_async_engine_client_from_engine_args
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     async_llm = AsyncLLM.from_vllm_config(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/async_llm.py", line 222, in from_vllm_config
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     return cls(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)            ^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/async_llm.py", line 148, in __init__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     self.engine_core = EngineCoreClient.make_async_mp_client(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core_client.py", line 124, in make_async_mp_client
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     return AsyncMPClient(*client_args)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core_client.py", line 835, in __init__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     super().__init__(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core_client.py", line 490, in __init__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     with launch_core_engines(vllm_config, executor_class, log_stats) as (
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/lib/python3.12/contextlib.py", line 144, in __exit__
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     next(self.gen)
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/utils.py", line 925, in launch_core_engines
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     wait_for_engine_startup(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/utils.py", line 984, in wait_for_engine_startup
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     raise RuntimeError(
+[2026-02-28 16:33:01] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+[2026-02-28 16:33:01] [rtx5090_x_1_r08.Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploy failed, skipping benchmark

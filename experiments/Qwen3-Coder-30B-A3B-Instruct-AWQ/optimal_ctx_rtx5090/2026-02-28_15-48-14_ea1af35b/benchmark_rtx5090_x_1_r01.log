@@ -25511,3 +25511,5 @@ scp: Connection closed
 [2026-02-28 16:27:02] [deplodock.provisioning.ssh_transport] ssh: connect to host 217.138.104.168 port 22: Connection timed out
 [2026-02-28 16:27:02] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-02-28 16:27:02] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploy failed, skipping benchmark
+[2026-02-28 16:27:02] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl204800
+[2026-02-28 16:27:03] [deplodock.commands.bench.committer] Pushed results to remote
