@@ -21,9 +21,11 @@ def ssh_base_args(server, ssh_key, ssh_port):
         "-o",
         "BatchMode=yes",
         "-o",
-        "ServerAliveInterval=60",
+        "ServerAliveInterval=30",
         "-o",
-        "ServerAliveCountMax=5",
+        "ServerAliveCountMax=20",
+        "-o",
+        "TCPKeepAlive=no",
     ]
     if ssh_key:
         args += ["-i", ssh_key]
@@ -104,9 +106,11 @@ async def scp_file(local_path, server, ssh_key, ssh_port, remote_path, timeout=3
         "-o",
         "BatchMode=yes",
         "-o",
-        "ServerAliveInterval=60",
+        "ServerAliveInterval=30",
         "-o",
-        "ServerAliveCountMax=5",
+        "ServerAliveCountMax=20",
+        "-o",
+        "TCPKeepAlive=no",
     ]
     if ssh_key:
         scp_args += ["-i", ssh_key]

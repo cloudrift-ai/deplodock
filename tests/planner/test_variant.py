@@ -1,6 +1,6 @@
 """Unit tests for the Variant class."""
 
-from deplodock.planner.variant import Variant, _abbreviate
+from deplodock.planner.variant import Variant, _abbreviate, _compact_value
 
 # ── _abbreviate ──────────────────────────────────────────────────
 
@@ -27,6 +27,43 @@ def test_abbreviate_random_input_len():
 
 def test_abbreviate_context_length():
     assert _abbreviate("context_length") == "cl"
+
+
+# ── _compact_value ───────────────────────────────────────────────
+
+
+def test_compact_value_plain_number():
+    assert _compact_value(128) == "128"
+
+
+def test_compact_value_docker_image():
+    assert _compact_value("lmsysorg/sglang:latest") == "lms-sglang-latest"
+
+
+def test_compact_value_cli_flags():
+    assert _compact_value("--quantization moe_wna16") == "quant-moe-wna16"
+
+
+def test_compact_value_preserves_version():
+    assert _compact_value("v0.6.5") == "v0.6.5"
+
+
+def test_compact_value_keeps_digit_segments():
+    """Segments containing digits are kept intact."""
+    assert _compact_value("foo-bar16-baz") == "f-bar16-b"
+
+
+def test_compact_value_known_abbreviations():
+    """Known words use their dictionary abbreviation."""
+    assert _compact_value("vllm/vllm-openai:latest") == "vllm-vllm-oai-latest"
+
+
+def test_compact_value_kv_cache_dtype():
+    assert _compact_value("--kv-cache-dtype fp8") == "kv-cache-dtype-fp8"
+
+
+def test_compact_value_expert_parallel():
+    assert _compact_value("--kv-cache-dtype fp8 --enable-expert-parallel") == "kv-cache-dtype-fp8-e-exp-par"
 
 
 # ── Variant.__str__ ──────────────────────────────────────────────
@@ -87,6 +124,37 @@ def test_str_default_gpu_count():
     """gpu_count defaults to 1 when not in params."""
     v = Variant(params={"deploy.gpu": "NVIDIA GeForce RTX 5090"})
     assert str(v) == "rtx5090x1"
+
+
+def test_str_compacts_slashes_and_spaces():
+    """Values with / and spaces are compacted to short filesystem-safe labels."""
+    v = Variant(
+        params={
+            "deploy.gpu": "NVIDIA GeForce RTX 5090",
+            "deploy.gpu_count": 1,
+            "engine.llm.sglang.image": "lmsysorg/sglang:latest",
+            "engine.llm.sglang.extra_args": "--quantization moe_wna16",
+        }
+    )
+    result = str(v)
+    assert "/" not in result
+    assert " " not in result
+    assert ":" not in result
+    assert result == "rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest"
+
+
+def test_str_compacts_docker_image():
+    """Docker image refs like vllm/vllm-openai:latest are compacted."""
+    v = Variant(
+        params={
+            "deploy.gpu": "NVIDIA GeForce RTX 5090",
+            "deploy.gpu_count": 1,
+            "engine.llm.vllm.image": "vllm/vllm-openai:latest",
+        }
+    )
+    result = str(v)
+    assert "/" not in result
+    assert result == "rtx5090x1_ivllm-vllm-oai-latest"
 
 
 # ── Variant.gpu_short ────────────────────────────────────────────
