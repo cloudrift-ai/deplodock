@@ -26171,3 +26171,5 @@ Example curl:
 [2026-02-28 16:40:11] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     raise RuntimeError(
 [2026-02-28 16:40:11] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
 [2026-02-28 16:40:11] [rtx5090_x_1_r08.Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploy failed, skipping benchmark
+[2026-02-28 16:40:11] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl262144
+[2026-02-28 16:40:12] [deplodock.commands.bench.committer] Pushed results to remote
