@@ -24903,3 +24903,5 @@ scp: Connection closed
 [2026-02-28 16:15:53] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/utils.py", line 984, in wait_for_engine_startup
 [2026-02-28 16:15:53] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     raise RuntimeError(
 [2026-02-28 16:15:53] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+[2026-02-28 16:15:53] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl253952
+[2026-02-28 16:15:54] [deplodock.commands.bench.committer] Pushed results to remote
