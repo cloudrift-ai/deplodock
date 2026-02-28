@@ -25220,3 +25220,8 @@ Example curl:
 [2026-02-28 16:18:01] [deplodock.provisioning.ssh_transport] ssh: connect to host 217.138.104.168 port 22: Connection timed out
 [2026-02-28 16:18:01] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-02-28 16:18:01] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploy failed, skipping benchmark
+[2026-02-28 16:18:02] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl73728
+[2026-02-28 16:18:03] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-02-28 16:18:03] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Recipe: experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_ctx_rtx5090 (variant: rtx5090x1_cl139264)
+[2026-02-28 16:18:03] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploying model...
+[2026-02-28 16:18:43] [rtx5090_x_1_r08.Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_ctx_rtx5090/2026-02-28_15-48-14_ea1af35b/rtx5090x1_cl65536_vllm_benchmark.txt

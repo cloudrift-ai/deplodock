@@ -25059,3 +25059,5 @@ Example curl:
     }'
 [2026-02-28 16:18:01] [deplodock.provisioning.ssh_transport] ssh: connect to host 217.138.104.168 port 22: Connection timed out
 [2026-02-28 16:18:01] [deplodock.deploy.orchestrate] Failed to pull images
+[2026-02-28 16:18:02] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl73728
+[2026-02-28 16:18:03] [deplodock.commands.bench.committer] Pushed results to remote
