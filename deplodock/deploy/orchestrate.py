@@ -1,6 +1,7 @@
 """Deploy orchestration: run_deploy, run_teardown, deploy, teardown."""
 
 import asyncio
+import json
 import logging
 
 from deplodock.deploy.compose import (
@@ -106,24 +107,44 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
     logger.info(f"Status: {status}")
 
     # Step 7: Smoke test inference (retry — first request may be slow due to warmup)
+    # Asks a trivial factual question and checks the answer to detect broken models
+    # (e.g. wrong quantization producing garbage output).
     if not dry_run:
         logger.info("\nRunning smoke test...")
+        prompt = "What is 2+2? Answer with just the number."
         smoke_cmd = (
-            f"curl -sf http://localhost:{port}/v1/chat/completions"
+            f"curl -s http://localhost:{port}/v1/chat/completions"
             f" -H 'Content-Type: application/json'"
-            f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"Say hello"}}],"max_tokens":16}}' '''
+            f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":16}}' '''
         )
         smoke_timeout = 600
         smoke_interval = 10
         deadline = asyncio.get_event_loop().time() + smoke_timeout
         while asyncio.get_event_loop().time() < deadline:
-            rc, _, _ = await run_cmd(smoke_cmd, stream=False, timeout=180, log_output=True)
-            if rc == 0:
+            rc, stdout, _ = await run_cmd(smoke_cmd, stream=False, timeout=180)
+            if rc != 0 or not stdout.strip():
+                # Server not ready yet, keep retrying
+                await asyncio.sleep(smoke_interval)
+                continue
+            try:
+                body = json.loads(stdout)
+                answer = body["choices"][0]["message"]["content"]
+            except (json.JSONDecodeError, KeyError, IndexError):
+                # Malformed response, server may still be starting
+                await asyncio.sleep(smoke_interval)
+                continue
+            if "4" in answer:
                 logger.info("Smoke test passed.")
                 break
-            await asyncio.sleep(smoke_interval)
+            # Model returned a valid response but wrong answer — broken model
+            logger.error(f"Smoke test failed: model returned wrong answer: {answer!r}")
+            logger.error("Container logs:")
+            await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
+            return False
         else:
-            logger.error(f"Smoke test failed after {smoke_timeout}s. The endpoint is not ready.")
+            logger.error(f"Smoke test timed out after {smoke_timeout}s. The endpoint is not ready.")
+            logger.error("Container logs:")
+            await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
             return False
 
     # Print curl example
