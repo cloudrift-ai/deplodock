@@ -24285,3 +24285,219 @@ Example curl:
 [2026-02-28 16:00:59] [deplodock.provisioning.ssh_transport] Downloading 'model-00004-of-00006.safetensors' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/c0a75553f408cdacefbedcc875930ce67d7ea9f6ed6546b0f25037195a6c7e95.incomplete'
 [2026-02-28 16:01:20] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/c0a75553f408cdacefbedcc875930ce67d7ea9f6ed6546b0f25037195a6c7e95
 [2026-02-28 16:01:20] [deplodock.provisioning.ssh_transport] Downloading 'model-00005-of-00006.safetensors' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/2b036efba3962a1cebd0e4b5a5a5d20fdadf1b72a15e625818c9d8031a17c781.incomplete'
+[2026-02-28 16:01:30] [deplodock.commands.bench.committer] Committed: bench: pass optimal_ctx_rtx5090/rtx5090x1_cl57344
+[2026-02-28 16:01:31] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-02-28 16:01:31] [deplodock.deploy.orchestrate] Tearing down...
+[2026-02-28 16:01:31] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.161' (ED25519) to the list of known hosts.
+[2026-02-28 16:01:33] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopping
+[2026-02-28 16:01:35] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopped
+[2026-02-28 16:01:35] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removing
+[2026-02-28 16:01:35] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removed
+[2026-02-28 16:01:35] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removing
+[2026-02-28 16:01:35] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removed
+[2026-02-28 16:01:35] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-02-28 16:01:37] [deplodock.deploy.orchestrate] Pulling images...
+[2026-02-28 16:01:37] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.161' (ED25519) to the list of known hosts.
+[2026-02-28 16:01:38] [deplodock.provisioning.ssh_transport]  vllm_0 Pulling 
+[2026-02-28 16:01:39] [deplodock.provisioning.ssh_transport]  vllm_0 Pulled 
+[2026-02-28 16:01:39] [deplodock.deploy.orchestrate] Downloading model QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ...
+[2026-02-28 16:01:39] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-02-28 16:01:39] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.161' (ED25519) to the list of known hosts.
+[2026-02-28 16:01:40] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.167' (ED25519) to the list of known hosts.
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: huggingface_hub[cli,hf_transfer] in /usr/local/lib/python3.12/dist-packages (0.36.2)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (3.24.3)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2026.2.0)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: hf-xet<2.0.0,>=1.1.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (1.3.1)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: packaging>=20.9 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (26.0)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: pyyaml>=5.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (6.0.3)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: requests in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2.32.5)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: tqdm>=4.42.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.67.3)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: typing-extensions>=3.7.4.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.15.0)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Collecting InquirerPy==0.3.4 (from huggingface_hub[cli,hf_transfer])
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport]   Downloading InquirerPy-0.3.4-py3-none-any.whl.metadata (8.1 kB)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: hf_transfer>=0.1.4 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (0.1.9)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Collecting pfzy<0.4.0,>=0.3.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport]   Downloading pfzy-0.3.4-py3-none-any.whl.metadata (4.9 kB)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Collecting prompt-toolkit<4.0.0,>=3.0.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport]   Downloading prompt_toolkit-3.0.52-py3-none-any.whl.metadata (6.4 kB)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Collecting wcwidth (from prompt-toolkit<4.0.0,>=3.0.1->InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport]   Downloading wcwidth-0.6.0-py3-none-any.whl.metadata (30 kB)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.4.4)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.11)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2.6.3)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2026.2.25)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Downloading InquirerPy-0.3.4-py3-none-any.whl (67 kB)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Downloading pfzy-0.3.4-py3-none-any.whl (8.5 kB)
+[2026-02-28 16:01:41] [deplodock.provisioning.ssh_transport] Downloading prompt_toolkit-3.0.52-py3-none-any.whl (391 kB)
+[2026-02-28 16:01:42] [deplodock.provisioning.ssh_transport] Downloading wcwidth-0.6.0-py3-none-any.whl (94 kB)
+[2026-02-28 16:01:42] [deplodock.deploy.orchestrate] Starting services...
+[2026-02-28 16:01:42] [deplodock.provisioning.ssh_transport] Installing collected packages: wcwidth, pfzy, prompt-toolkit, InquirerPy
+[2026-02-28 16:01:42] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.167' (ED25519) to the list of known hosts.
+[2026-02-28 16:01:42] [deplodock.provisioning.ssh_transport] 
+[2026-02-28 16:01:42] [deplodock.provisioning.ssh_transport] Successfully installed InquirerPy-0.3.4 pfzy-0.3.4 prompt-toolkit-3.0.52 wcwidth-0.6.0
+[2026-02-28 16:01:42] [deplodock.provisioning.ssh_transport] WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[2026-02-28 16:01:43] [deplodock.provisioning.ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-02-28 16:01:43] [deplodock.provisioning.ssh_transport] /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/snapshots/c58857a7f41c0920f73d1b56678640f9c02017d7
+[2026-02-28 16:01:43] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-02-28 16:01:43] [deplodock.provisioning.ssh_transport]  Network deploy_default  Creating
+[2026-02-28 16:01:44] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.161' (ED25519) to the list of known hosts.
+[2026-02-28 16:01:44] [deplodock.deploy.orchestrate] Starting services...
+[2026-02-28 16:01:45] [deplodock.provisioning.ssh_transport]  Network deploy_default  Created
+[2026-02-28 16:01:45] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-02-28 16:01:45] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.161' (ED25519) to the list of known hosts.
+[2026-02-28 16:01:45] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-02-28 16:01:45] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-02-28 16:01:46] [deplodock.provisioning.ssh_transport]  Network deploy_default  Creating
+[2026-02-28 16:01:46] [deplodock.provisioning.ssh_transport]  Network deploy_default  Created
+[2026-02-28 16:01:46] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-02-28 16:01:46] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-02-28 16:01:46] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-02-28 16:01:49] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-02-28 16:01:49] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-02-28 16:01:52] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/c0a75553f408cdacefbedcc875930ce67d7ea9f6ed6546b0f25037195a6c7e95
+[2026-02-28 16:01:52] [deplodock.provisioning.ssh_transport] Downloading 'model-00005-of-00006.safetensors' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/2b036efba3962a1cebd0e4b5a5a5d20fdadf1b72a15e625818c9d8031a17c781.incomplete'
+[2026-02-28 16:01:55] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-02-28 16:01:55] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-02-28 16:02:11] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/2b036efba3962a1cebd0e4b5a5a5d20fdadf1b72a15e625818c9d8031a17c781
+[2026-02-28 16:02:11] [deplodock.provisioning.ssh_transport] Downloading 'model-00006-of-00006.safetensors' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/3eef55ae738a8357ec441a3c03e1ecfe0bd71742f1ec6ab2aa3ef0251226f0d2.incomplete'
+[2026-02-28 16:02:13] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-02-28 16:02:13] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.170' (ED25519) to the list of known hosts.
+[2026-02-28 16:02:15] [deplodock.deploy.orchestrate] Starting services...
+[2026-02-28 16:02:16] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.170' (ED25519) to the list of known hosts.
+[2026-02-28 16:02:17] [deplodock.provisioning.ssh_transport]  Network deploy_default  Creating
+[2026-02-28 16:02:17] [deplodock.provisioning.ssh_transport]  Network deploy_default  Created
+[2026-02-28 16:02:17] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-02-28 16:02:17] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-02-28 16:02:17] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-02-28 16:02:22] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-02-28 16:02:22] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-02-28 16:02:31] [deplodock.provisioning.remote] SSH error (riftuser@217.138.104.168): ssh: connect to host 217.138.104.168 port 22: Connection timed out
+[2026-02-28 16:02:31] [deplodock.provisioning.remote] Installing NVIDIA Container Toolkit...
+[2026-02-28 16:02:32] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/2b036efba3962a1cebd0e4b5a5a5d20fdadf1b72a15e625818c9d8031a17c781
+[2026-02-28 16:02:32] [deplodock.provisioning.ssh_transport] Downloading 'model-00006-of-00006.safetensors' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/3eef55ae738a8357ec441a3c03e1ecfe0bd71742f1ec6ab2aa3ef0251226f0d2.incomplete'
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/3eef55ae738a8357ec441a3c03e1ecfe0bd71742f1ec6ab2aa3ef0251226f0d2
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Downloading 'model.safetensors.index.json' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/9298a0e08a9b90210d68085e1ce127c991ed9672.incomplete'
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/9298a0e08a9b90210d68085e1ce127c991ed9672
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Downloading 'qwen3coder_tool_parser.py' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/774f4bbf588d764cd190b4b0ca339b7eefb0daa2.incomplete'
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/774f4bbf588d764cd190b4b0ca339b7eefb0daa2
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Downloading 'tokenizer.json' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/90c73275ae7b61cd2b6c4f263018057d516f0c95.incomplete'
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/90c73275ae7b61cd2b6c4f263018057d516f0c95
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Downloading 'tokenizer_config.json' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/96a0ffe4df2fb46178d26181db2d64d2c3337161.incomplete'
+[2026-02-28 16:02:33] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/96a0ffe4df2fb46178d26181db2d64d2c3337161
+[2026-02-28 16:02:34] [deplodock.provisioning.ssh_transport] Downloading 'vocab.json' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/4783fe10ac3adce15ac8f358ef5462739852c569.incomplete'
+[2026-02-28 16:02:34] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/4783fe10ac3adce15ac8f358ef5462739852c569
+[2026-02-28 16:02:34] [deplodock.provisioning.ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-02-28 16:02:34] [deplodock.provisioning.ssh_transport] /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/snapshots/c58857a7f41c0920f73d1b56678640f9c02017d7
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/3eef55ae738a8357ec441a3c03e1ecfe0bd71742f1ec6ab2aa3ef0251226f0d2
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Downloading 'model.safetensors.index.json' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/9298a0e08a9b90210d68085e1ce127c991ed9672.incomplete'
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/9298a0e08a9b90210d68085e1ce127c991ed9672
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Downloading 'qwen3coder_tool_parser.py' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/774f4bbf588d764cd190b4b0ca339b7eefb0daa2.incomplete'
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/774f4bbf588d764cd190b4b0ca339b7eefb0daa2
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Downloading 'tokenizer.json' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/90c73275ae7b61cd2b6c4f263018057d516f0c95.incomplete'
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/90c73275ae7b61cd2b6c4f263018057d516f0c95
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Downloading 'tokenizer_config.json' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/96a0ffe4df2fb46178d26181db2d64d2c3337161.incomplete'
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/96a0ffe4df2fb46178d26181db2d64d2c3337161
+[2026-02-28 16:02:50] [deplodock.provisioning.ssh_transport] Downloading 'vocab.json' to '/hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/4783fe10ac3adce15ac8f358ef5462739852c569.incomplete'
+[2026-02-28 16:02:51] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/blobs/4783fe10ac3adce15ac8f358ef5462739852c569
+[2026-02-28 16:02:51] [deplodock.provisioning.ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-02-28 16:02:51] [deplodock.provisioning.ssh_transport] /hf_models/hub/models--QuantTrio--Qwen3-Coder-30B-A3B-Instruct-AWQ/snapshots/c58857a7f41c0920f73d1b56678640f9c02017d7
+[2026-02-28 16:04:14] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-02-28 16:04:14] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.174' (ED25519) to the list of known hosts.
+[2026-02-28 16:04:16] [deplodock.deploy.orchestrate] Starting services...
+[2026-02-28 16:04:17] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.174' (ED25519) to the list of known hosts.
+[2026-02-28 16:04:18] [deplodock.provisioning.ssh_transport]  Network deploy_default  Creating
+[2026-02-28 16:04:18] [deplodock.provisioning.ssh_transport]  Network deploy_default  Created
+[2026-02-28 16:04:18] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-02-28 16:04:19] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-02-28 16:04:19] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-02-28 16:04:19] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-02-28 16:04:20] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.171' (ED25519) to the list of known hosts.
+[2026-02-28 16:04:22] [deplodock.deploy.orchestrate] Starting services...
+[2026-02-28 16:04:22] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.171' (ED25519) to the list of known hosts.
+[2026-02-28 16:04:23] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-02-28 16:04:23] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-02-28 16:04:23] [deplodock.provisioning.ssh_transport]  Network deploy_default  Creating
+[2026-02-28 16:04:24] [deplodock.provisioning.ssh_transport]  Network deploy_default  Created
+[2026-02-28 16:04:24] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-02-28 16:04:24] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-02-28 16:04:24] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-02-28 16:04:28] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-02-28 16:04:28] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-02-28 16:04:47] [deplodock.provisioning.remote] SSH error (riftuser@217.138.104.168): ssh: connect to host 217.138.104.168 port 22: Connection timed out
+[2026-02-28 16:07:02] [deplodock.provisioning.remote] SSH error (riftuser@217.138.104.168): ssh: connect to host 217.138.104.168 port 22: Connection timed out
+[2026-02-28 16:07:10] [deplodock.provisioning.ssh_transport]  Container vllm_0  Healthy
+[2026-02-28 16:07:10] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-02-28 16:07:10] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.161' (ED25519) to the list of known hosts.
+[2026-02-28 16:07:11] [deplodock.deploy.orchestrate] 
+Endpoint: http://217.138.104.161:8000/v1
+[2026-02-28 16:07:11] [deplodock.deploy.orchestrate] Model: QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+[2026-02-28 16:07:11] [deplodock.deploy.orchestrate] Instances: 1
+[2026-02-28 16:07:11] [deplodock.deploy.orchestrate] Status: deployed
+[2026-02-28 16:07:11] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-02-28 16:08:13] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-02-28 16:08:13] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-02-28 16:08:13] [deplodock.deploy.orchestrate]   curl http://217.138.104.161:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-02-28 16:09:02] [deplodock.provisioning.ssh_transport] Command timed out after 120s: 
+echo "=== HOSTNAME ==="
+hostname
+
+echo ""
+echo "=== OS ==="
+cat /etc/os-release 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== KERNEL ==="
+uname -r
+
+echo ""
+echo "=== CPU INFORMATION ==="
+lscpu 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== CPU COUNT ==="
+nproc 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== MEMORY ==="
+free -h 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== GPU INFORMATION ==="
+nvidia-smi --query-gpu=name,memory.total,driver_version,pstate,temperature.gpu,utilization.gpu \
+  --format=csv,noheader 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== GPU DETAILS ==="
+nvidia-smi 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== DISK USAGE ==="
+df -h 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== BLOCK DEVICES ==="
+lsblk 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== UPTIME ==="
+uptime 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== DOCKER VERSION ==="
+docker --version 2>/dev/null || echo "N/A"
+
+echo ""
+echo "=== DOCKER INFO ==="
+docker info --format \
+  '{{.ServerVersion}} | OS: {{.OperatingSystem}} | Containers: {{.Containers}} | Images: {{.Images}}' \
+  2>/dev/null || echo "N/A"
+
+[2026-02-28 16:09:02] [deplodock.benchmark.system_info] Failed to collect system info
