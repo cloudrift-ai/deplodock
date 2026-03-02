@@ -323,6 +323,7 @@ async def create_instance(
         return None
 
     logger.info("Instance is Active.")
+    logger.info(f"Instance details: {json.dumps(info, indent=2)}")
     conn = _extract_connection_info(info, delete_info=("cloudrift", instance_id))
     _log_connection_info(info)
 
