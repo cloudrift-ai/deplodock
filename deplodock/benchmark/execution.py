@@ -130,7 +130,8 @@ async def run_execution_group(
                 await _invoke_callback(on_task_done, task, False, logger)
             return task_results, None
 
-        logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}")
+        instance_id_str = f" (instance_id={conn.delete_info[1]})" if conn.delete_info else ""
+        logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}{instance_id_str}")
         await provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
 
         # Collect system info once per execution group
