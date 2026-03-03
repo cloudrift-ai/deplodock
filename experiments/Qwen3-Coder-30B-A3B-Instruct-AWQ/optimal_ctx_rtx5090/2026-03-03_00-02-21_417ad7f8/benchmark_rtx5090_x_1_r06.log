@@ -26255,3 +26255,27 @@ Example curl:
 [2026-03-03 00:40:53] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/utils.py", line 984, in wait_for_engine_startup
 [2026-03-03 00:40:53] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     raise RuntimeError(
 [2026-03-03 00:40:53] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+[2026-03-03 00:40:53] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl229376
+[2026-03-03 00:40:54] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-03 00:41:40] [deplodock.provisioning.ssh_transport]  Container vllm_0  Healthy
+[2026-03-03 00:41:40] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-03 00:41:41] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.171' (ED25519) to the list of known hosts.
+[2026-03-03 00:41:43] [deplodock.deploy.orchestrate] 
+Endpoint: http://217.138.104.171:8000/v1
+[2026-03-03 00:41:43] [deplodock.deploy.orchestrate] Model: QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+[2026-03-03 00:41:43] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-03 00:41:43] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-03 00:41:43] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-03-03 00:44:16] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-03 00:44:16] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-03 00:44:16] [deplodock.deploy.orchestrate]   curl http://217.138.104.171:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-03 00:44:16] [rtx5090_x_1_r06.Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
+[2026-03-03 00:45:56] [rtx5090_x_1_r06.Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_ctx_rtx5090/2026-03-03_00-02-21_417ad7f8/rtx5090x1_cl114688_vllm_benchmark.txt
