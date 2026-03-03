@@ -23482,3 +23482,7 @@ Endpoint: http://217.138.104.171:8000/v1
 [2026-03-03 00:24:11] [deplodock.deploy.orchestrate] Status: deployed
 [2026-03-03 00:24:11] [deplodock.deploy.orchestrate] 
 Running smoke test...
+[2026-03-03 00:24:11] [deplodock.commands.bench.committer] Committed: bench: pass optimal_ctx_rtx5090/rtx5090x1_cl40960
+[2026-03-03 00:24:13] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-03 00:24:13] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-03 00:24:13] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.162' (ED25519) to the list of known hosts.
