@@ -6991,3 +6991,22 @@ Example curl:
     }'
 [2026-03-03 01:43:22] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
 [2026-03-03 01:44:41] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-03-03_01-29-37_417ad7f8/rtx5090x1_ivllm-vllm-oai-latest_vllm_benchmark.txt
+[2026-03-03 01:44:41] [deplodock.commands.bench.committer] Committed: bench: pass vllm_vs_sglang_rtx5090/rtx5090x1_ivllm-vllm-oai-latest
+[2026-03-03 01:44:41] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-03 01:44:41] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
+[2026-03-03 01:44:41] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-03 01:44:42] [deplodock.provisioning.ssh_transport] Warning: Permanently added '217.138.104.164' (ED25519) to the list of known hosts.
+[2026-03-03 01:44:43] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopping
+[2026-03-03 01:44:45] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopped
+[2026-03-03 01:44:45] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removing
+[2026-03-03 01:44:45] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removed
+[2026-03-03 01:44:45] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removing
+[2026-03-03 01:44:45] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removed
+[2026-03-03 01:44:45] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-03 01:44:45] [rtx5090_x_1_r01] Deleting VM...
+[2026-03-03 01:44:45] [deplodock.provisioning.cloudrift] Terminating CloudRift instance '71a9f400-16a0-11f1-b1a0-63744ca0e23b'...
+[2026-03-03 01:44:46] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-03-03 01:44:46] [deplodock.provisioning.cloudrift] Instance terminated.
+[2026-03-03 01:44:46] [rtx5090_x_1_r01] VM deleted.
+[2026-03-03 01:44:46] [rtx5090_x_1_r01] Completed group: rtx5090_x_1_r01
+[2026-03-03 01:47:53] [rtx5090_x_1_r02.Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-03-03_01-29-37_417ad7f8/rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest_sglang_benchmark.txt
