@@ -1,0 +1,26 @@
+[
+  {
+    "task_id": "vllm_vs_sglang_rtx5090/rtx5090x1_ivllm-vllm-oai-latest",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090",
+    "variant": "rtx5090x1_ivllm-vllm-oai-latest",
+    "recipe_name": "vllm_vs_sglang_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_ivllm-vllm-oai-latest_vllm_benchmark.txt",
+    "json_result_file": "rtx5090x1_ivllm-vllm-oai-latest_vllm_benchmark.json"
+  },
+  {
+    "task_id": "vllm_vs_sglang_rtx5090/rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest",
+    "recipe_dir": "experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090",
+    "variant": "rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest",
+    "recipe_name": "vllm_vs_sglang_rtx5090",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ",
+    "result_file": "rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest_sglang_benchmark.txt",
+    "json_result_file": "rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest_sglang_benchmark.json"
+  }
+]
