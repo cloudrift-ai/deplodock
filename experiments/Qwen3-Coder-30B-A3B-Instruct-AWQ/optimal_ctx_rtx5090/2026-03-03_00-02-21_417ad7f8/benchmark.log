@@ -25026,3 +25026,12 @@ Example curl:
 [2026-03-03 00:33:42] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     raise RuntimeError(
 [2026-03-03 00:33:42] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
 [2026-03-03 00:33:42] [rtx5090_x_1_r01.Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploy failed, skipping benchmark
+[2026-03-03 00:33:43] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl204800
+[2026-03-03 00:33:44] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-03 00:33:44] [rtx5090_x_1_r01] Deleting VM...
+[2026-03-03 00:33:44] [deplodock.provisioning.cloudrift] Terminating CloudRift instance '4104f586-1694-11f1-9a22-cf7eee129e27'...
+[2026-03-03 00:33:45] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-03-03 00:33:45] [deplodock.provisioning.cloudrift] Instance terminated.
+[2026-03-03 00:33:45] [rtx5090_x_1_r01] VM deleted.
+[2026-03-03 00:33:45] [rtx5090_x_1_r01] Completed group: rtx5090_x_1_r01
+[2026-03-03 00:34:16] [rtx5090_x_1_r04.Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_ctx_rtx5090/2026-03-03_00-02-21_417ad7f8/rtx5090x1_cl98304_vllm_benchmark.txt
