@@ -26837,3 +26837,51 @@ Example curl:
 [2026-03-03 01:00:37] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1)     raise RuntimeError(
 [2026-03-03 01:00:37] [deplodock.provisioning.ssh_transport] vllm_0  | (APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
 [2026-03-03 01:00:37] [rtx5090_x_1_r06.Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploy failed, skipping benchmark
+[2026-03-03 01:00:37] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_rtx5090/rtx5090x1_cl245760
+[2026-03-03 01:00:38] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-03 01:00:38] [rtx5090_x_1_r06] Deleting VM...
+[2026-03-03 01:00:38] [deplodock.provisioning.cloudrift] Terminating CloudRift instance '472a7dfa-1694-11f1-a3ed-43df64cdb8d8'...
+[2026-03-03 01:00:38] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-03-03 01:00:38] [deplodock.provisioning.cloudrift] Instance terminated.
+[2026-03-03 01:00:38] [rtx5090_x_1_r06] VM deleted.
+[2026-03-03 01:00:38] [rtx5090_x_1_r06] Completed group: rtx5090_x_1_r06
+[2026-03-03 01:00:38] [root] 
+[2026-03-03 01:00:38] [root] SUMMARY
+[2026-03-03 01:00:38] [root] Successful: 15/32
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl8192
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl73728
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl16384
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl81920
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl24576
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl90112
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl32768
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl98304
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl40960
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl106496
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl49152
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl114688
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl57344
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl122880
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl65536
+[2026-03-03 01:00:38] [root] 
+[2026-03-03 01:00:38] [root] Failed: 17/32
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl139264
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl204800
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl147456
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl212992
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl155648
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl221184
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl163840
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl229376
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl172032
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl237568
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl180224
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl245760
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl188416
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl253952
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl131072
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl196608
+[2026-03-03 01:00:38] [root]    - optimal_ctx_rtx5090/rtx5090x1_cl262144
+[2026-03-03 01:00:38] [root] 
+[2026-03-03 01:00:38] [root] All done!
+[2026-03-03 01:00:38] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_ctx_rtx5090/2026-03-03_00-02-21_417ad7f8/benchmark.log
