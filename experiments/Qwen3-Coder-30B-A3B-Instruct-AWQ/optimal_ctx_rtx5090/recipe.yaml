@@ -1,0 +1,22 @@
+model:
+  huggingface: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
+
+engine:
+  llm:
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_concurrent_requests: 4
+    vllm:
+      image: "vllm/vllm-openai:latest"
+
+benchmark:
+  max_concurrency: 4
+  num_prompts: 8
+  random_input_len: 4000
+  random_output_len: 4000
+
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    engine.llm.context_length: [8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536, 73728, 81920, 90112, 98304, 106496, 114688, 122880, 131072, 139264, 147456, 155648, 163840, 172032, 180224, 188416, 196608, 204800, 212992, 221184, 229376, 237568, 245760, 253952, 262144]
