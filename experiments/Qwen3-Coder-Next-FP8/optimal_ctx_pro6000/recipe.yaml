@@ -22,4 +22,4 @@ benchmark:
 matrices:
   - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
-    engine.llm.context_length: [8192, 16384, 32768, 65536, 131072]
+    engine.llm.context_length: [8192, 16384, 32768, 65536, 131072, 262144]

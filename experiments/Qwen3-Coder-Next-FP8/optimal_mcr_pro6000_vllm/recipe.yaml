@@ -6,7 +6,7 @@ engine:
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
-    context_length: 131072
+    context_length: 262144
     vllm:
       image: "vllm/vllm-openai:latest"
 
