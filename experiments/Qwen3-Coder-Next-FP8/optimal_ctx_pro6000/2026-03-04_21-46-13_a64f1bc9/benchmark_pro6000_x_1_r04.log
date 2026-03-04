@@ -10704,3 +10704,39 @@ Example curl:
 [2026-03-04 21:57:33] [pro6000_x_1_r04.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-03-04_21-46-13_a64f1bc9/pro6000x1_cl65536_sglang_benchmark.txt
 [2026-03-04 21:57:34] [deplodock.commands.bench.committer] Pushed results to remote
 [2026-03-04 21:57:34] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 21:57:34] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.16.17.186' (ED25519) to the list of known hosts.
+[2026-03-04 21:57:34] [deplodock.commands.bench.committer] Committed: bench: pass optimal_ctx_pro6000/pro6000x1_cl65536
+[2026-03-04 21:57:34] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopping 
+[2026-03-04 21:57:35] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 21:57:35] [pro6000_x_1_r04.Qwen3-Coder-Next-FP8] Tearing down...
+[2026-03-04 21:57:35] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 21:57:35] [deplodock.provisioning.ssh_transport] Warning: Permanently added '35.193.61.94' (ED25519) to the list of known hosts.
+[2026-03-04 21:57:35] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopping 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopped 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removing 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removed 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-04 21:57:36] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopped 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removing 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removed 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-04 21:57:36] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-04 21:57:36] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-04 21:57:37] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 21:57:37] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.16.17.186' (ED25519) to the list of known hosts.
+[2026-03-04 21:57:37] [deplodock.provisioning.ssh_transport]  Image lmsysorg/sglang:dev-cu13 Pulling 
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport]  Image lmsysorg/sglang:dev-cu13 Pulled 
+[2026-03-04 21:57:38] [deplodock.deploy.orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.16.17.186' (ED25519) to the list of known hosts.
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: huggingface_hub[cli,hf_transfer] in /usr/local/lib/python3.12/dist-packages (0.36.2)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (3.25.0)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2026.2.0)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: hf-xet<2.0.0,>=1.1.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (1.3.2)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: packaging>=20.9 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (26.0)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: pyyaml>=5.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (6.0.1)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: requests in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2.32.5)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: tqdm>=4.42.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.67.3)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Requirement already satisfied: typing-extensions>=3.7.4.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.15.0)
+[2026-03-04 21:57:38] [deplodock.provisioning.ssh_transport] Collecting InquirerPy==0.3.4 (from huggingface_hub[cli,hf_transfer])
