@@ -247,3 +247,12 @@ Example curl:
 [2026-03-04 22:38:12] [deplodock.provisioning.ssh_transport] ssh: connect to host 34.46.39.196 port 22: Connection timed out
 [2026-03-04 22:38:12] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-03-04 22:38:12] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
+[2026-03-04 22:38:12] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000_vllm/pro6000x1_mc24_np80_mcr24
+[2026-03-04 22:38:14] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 22:38:14] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Recipe: experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm (variant: pro6000x1_mc40_np80_mcr40)
+[2026-03-04 22:38:14] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploying model...
+[2026-03-04 22:40:28] [deplodock.provisioning.ssh_transport] Failed to SCP docker-compose.yaml to runner@34.46.39.196:~/deploy/docker-compose.yaml: ssh: connect to host 34.46.39.196 port 22: Connection timed out
+scp: Connection closed
+
+[2026-03-04 22:40:28] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 22:41:06] [pro6000_x_1_r04.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm/2026-03-04_21-46-13_a64f1bc9/pro6000x1_mc16_np80_mcr16_vllm_benchmark.txt
