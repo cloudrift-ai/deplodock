@@ -19,15 +19,15 @@ GPU_INSTANCE_TYPES = {
         ("cloudrift", "rtx59-16c-nr"),
         ("cloudrift", "rtx59-11-56-850-1lg"),
     ],
-    "NVIDIA RTX PRO 6000 Workstation Edition": [
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": [
         ("cloudrift", "rtxpro6000-12-100-1500-nr"),
         ("cloudrift", "rtxpro6000-4-100-1000-ti"),
         ("cloudrift", "rtxpro6000-11-50-500-1l"),
     ],
-    "RTX PRO 6000 Blackwell Max-Q Workstation Edition": [
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": [
         ("cloudrift", "rtxpro6000-11-50-500-1l"),
     ],
-    "RTX PRO 6000 Blackwell Server Edition": [
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": [
         ("gcp", "g4-standard"),
     ],
     "NVIDIA L40S": [
@@ -58,8 +58,9 @@ GPU_INSTANCE_TYPES = {
 GPU_SHORT_NAMES = {
     "NVIDIA GeForce RTX 4090": "rtx4090",
     "NVIDIA GeForce RTX 5090": "rtx5090",
-    "NVIDIA RTX PRO 6000 Workstation Edition": "pro6000",
-    "NVIDIA RTX PRO 6000 Server Edition": "pro6000",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": "pro6000",
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": "pro6000",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": "pro6000",
     "NVIDIA L40S": "l40s",
     "NVIDIA H100 80GB": "h100",
     "NVIDIA H200 141GB": "h200",

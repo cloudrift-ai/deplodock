@@ -50,7 +50,7 @@ def test_gcp_gpu_lookup():
 def test_gpu_short_name_known():
     assert gpu_short_name("NVIDIA GeForce RTX 5090") == "rtx5090"
     assert gpu_short_name("NVIDIA H200 141GB") == "h200"
-    assert gpu_short_name("NVIDIA RTX PRO 6000 Server Edition") == "pro6000"
+    assert gpu_short_name("NVIDIA RTX PRO 6000 Blackwell Server Edition") == "pro6000"
 
 
 def test_gpu_short_name_unknown_fallback():
