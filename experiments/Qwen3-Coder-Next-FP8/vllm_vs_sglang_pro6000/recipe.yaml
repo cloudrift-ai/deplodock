@@ -16,14 +16,14 @@ benchmark:
   random_output_len: 4000
 
 matrices:
-  - deploy.gpu: "RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+  - deploy.gpu: "RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
     engine.llm.vllm.image: "vllm/vllm-openai:latest"
-  - deploy.gpu: "RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+  - deploy.gpu: "RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
     engine.llm.sglang.image: "lmsysorg/sglang:latest"
     engine.llm.sglang.extra_args: "--attention-backend triton --disable-deep-gemm"
-  - deploy.gpu: "RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+  - deploy.gpu: "RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
     engine.llm.sglang.image: "lmsysorg/sglang:latest"
     engine.llm.sglang.extra_args: "--attention-backend trtllm_mha --disable-deep-gemm"
