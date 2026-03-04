@@ -96,8 +96,8 @@ def main():
     parser.add_argument("results_dir", type=Path, help="Path to experiment results directory")
     parser.add_argument(
         "--engine",
-        default="vLLM",
-        help="Engine name for plot title (default: vLLM)",
+        default=None,
+        help="Engine name for plot title (default: auto-detect from results)",
     )
     parser.add_argument(
         "--model",
@@ -136,9 +136,15 @@ def main():
 
     model = args.model or first_data["recipe"]["model"]["huggingface"].split("/")[-1]
     gpu = args.gpu or first_data["task"].get("gpu_name", "GPU")
+    if args.engine:
+        engine = args.engine
+    elif first_data["recipe"]["engine"]["llm"].get("sglang"):
+        engine = "SGLang"
+    else:
+        engine = "vLLM"
     output_path = args.output or args.results_dir / "mcr_sweep.png"
 
-    plot_mcr_sweep(results, args.engine, model, gpu, output_path)
+    plot_mcr_sweep(results, engine, model, gpu, output_path)
 
 
 if __name__ == "__main__":
