@@ -5482,3 +5482,19 @@ Example curl:
 [2026-03-04 16:30:49] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000_vllm/pro6000x1_mc40_np80_mcr40
 [2026-03-04 16:30:50] [deplodock.commands.bench.committer] Pushed results to remote
 [2026-03-04 16:30:50] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 16:30:58] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000_vllm/pro6000x1_mc36_np80_mcr36
+[2026-03-04 16:31:00] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 16:31:00] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 16:33:03] [deplodock.provisioning.ssh_transport] ssh: connect to host 35.194.19.204 port 22: Connection timed out
+[2026-03-04 16:33:03] [deplodock.deploy.orchestrate] Teardown failed.
+[2026-03-04 16:33:16] [deplodock.provisioning.ssh_transport] ssh: connect to host 136.114.222.27 port 22: Connection timed out
+[2026-03-04 16:33:16] [deplodock.deploy.orchestrate] Teardown failed.
+[2026-03-04 16:35:19] [deplodock.provisioning.ssh_transport] Failed to SCP docker-compose.yaml to runner@35.194.19.204:~/deploy/docker-compose.yaml: ssh: connect to host 35.194.19.204 port 22: Connection timed out
+scp: Connection closed
+
+[2026-03-04 16:35:19] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 16:35:31] [deplodock.provisioning.ssh_transport] Failed to SCP docker-compose.yaml to runner@136.114.222.27:~/deploy/docker-compose.yaml: ssh: connect to host 136.114.222.27 port 22: Connection timed out
+scp: Connection closed
+
+[2026-03-04 16:35:31] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 16:35:32] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm/2026-03-04_15-45-06_a64f1bc9/pro6000x1_mc44_np80_mcr44_vllm_benchmark.txt
