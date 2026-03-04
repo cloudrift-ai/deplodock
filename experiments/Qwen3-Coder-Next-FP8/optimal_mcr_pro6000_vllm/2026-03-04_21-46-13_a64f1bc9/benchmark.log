@@ -183,3 +183,67 @@ Running smoke test...
 [2026-03-04 22:33:42] [deplodock.provisioning.ssh_transport] ssh: connect to host 34.46.39.196 port 22: Connection timed out
 [2026-03-04 22:33:42] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-03-04 22:33:42] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
+[2026-03-04 22:33:42] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000_vllm/pro6000x1_mc8_np80_mcr8
+[2026-03-04 22:33:43] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 22:33:43] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Recipe: experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm (variant: pro6000x1_mc24_np80_mcr24)
+[2026-03-04 22:33:43] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploying model...
+[2026-03-04 22:33:46] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-04 22:33:46] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-04 22:33:46] [deplodock.deploy.orchestrate]   curl http://35.193.61.94:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-04 22:33:46] [pro6000_x_1_r04.Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-03-04 22:34:28] [deplodock.provisioning.ssh_transport]  Container vllm_0 Healthy 
+[2026-03-04 22:34:28] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-04 22:34:29] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.16.17.186' (ED25519) to the list of known hosts.
+[2026-03-04 22:34:29] [deplodock.deploy.orchestrate] 
+Endpoint: http://34.16.17.186:8000/v1
+[2026-03-04 22:34:29] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-03-04 22:34:29] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-04 22:34:29] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-04 22:34:29] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-03-04 22:35:17] [deplodock.provisioning.ssh_transport]  Container vllm_0 Healthy 
+[2026-03-04 22:35:17] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-04 22:35:17] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.44.150.55' (ED25519) to the list of known hosts.
+[2026-03-04 22:35:17] [deplodock.deploy.orchestrate] 
+Endpoint: http://34.44.150.55:8000/v1
+[2026-03-04 22:35:17] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-03-04 22:35:17] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-04 22:35:17] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-04 22:35:17] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-03-04 22:35:30] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-04 22:35:30] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-04 22:35:30] [deplodock.deploy.orchestrate]   curl http://34.16.17.186:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-04 22:35:30] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-03-04 22:35:57] [deplodock.provisioning.ssh_transport] Failed to SCP docker-compose.yaml to runner@34.46.39.196:~/deploy/docker-compose.yaml: ssh: connect to host 34.46.39.196 port 22: Connection timed out
+scp: Connection closed
+
+[2026-03-04 22:35:57] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 22:36:19] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-04 22:36:19] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-04 22:36:19] [deplodock.deploy.orchestrate]   curl http://34.44.150.55:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-04 22:36:19] [pro6000_x_1_r03.Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-03-04 22:38:12] [deplodock.provisioning.ssh_transport] ssh: connect to host 34.46.39.196 port 22: Connection timed out
+[2026-03-04 22:38:12] [deplodock.deploy.orchestrate] Failed to pull images
+[2026-03-04 22:38:12] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
