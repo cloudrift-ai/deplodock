@@ -5479,3 +5479,6 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-03-04 16:30:28] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-03-04 16:30:49] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000_vllm/pro6000x1_mc40_np80_mcr40
+[2026-03-04 16:30:50] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 16:30:50] [deplodock.deploy.orchestrate] Tearing down...

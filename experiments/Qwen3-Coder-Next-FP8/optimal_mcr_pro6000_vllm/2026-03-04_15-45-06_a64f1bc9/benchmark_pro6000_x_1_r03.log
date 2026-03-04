@@ -5486,3 +5486,7 @@ Traffic request rate: inf
 Burstiness factor: 1.0 (Poisson process)
 Maximum request concurrency: 40
 
+[2026-03-04 16:30:49] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000_vllm/pro6000x1_mc40_np80_mcr40
+[2026-03-04 16:30:50] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 16:30:50] [pro6000_x_1_r03.Qwen3-Coder-Next-FP8] Tearing down...
+[2026-03-04 16:30:50] [deplodock.deploy.orchestrate] Tearing down...
