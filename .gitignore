@@ -16,6 +16,10 @@ __pycache__/
 # Python egg-info
 deplodock.egg-info/
 
+# Build artifacts
+dist/
+build/
+
 # Docker Compose generated files
 docker-compose.vllm.yml
 nginx.vllm.conf

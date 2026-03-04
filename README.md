@@ -1,4 +1,12 @@
-# Deplodock
+<p align="center">
+  <img src="logo.png" alt="DeploDock" width="300">
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/deplodock/"><img src="https://img.shields.io/pypi/v/deplodock" alt="PyPI"></a>
+  <a href="https://github.com/cloudrift-ai/deplodock/actions/workflows/tests.yml"><img src="https://github.com/cloudrift-ai/deplodock/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://discord.gg/cloudrift"><img src="https://img.shields.io/discord/1150997934113030174?label=Discord" alt="Discord"></a>
+</p>
 
 Tools for deploying and benchmarking LLM inference on GPU servers. Supports **vLLM** and **SGLang** engines.
 
@@ -137,19 +145,6 @@ matrices:
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
     engine.llm.sglang.image: "lmsysorg/sglang:latest"
-    engine.llm.sglang.extra_args: "--quantization moe_wna16"  # Required for AWQ MoE models
-```
-
-For AWQ-quantized MoE models on SGLang, `--quantization moe_wna16` is required in `extra_args`. See [docs/sglang-awq-moe.md](docs/sglang-awq-moe.md) for details.
-
-### Optional Deploy Section
-
-For `deploy cloud` (which needs GPU info without matrix expansion), add a `deploy` section to the base recipe:
-
-```yaml
-deploy:
-  gpu: "NVIDIA GeForce RTX 5090"
-  gpu_count: 1
 ```
 
 ### Named Fields → CLI Flags
@@ -210,19 +205,6 @@ Only users with **write** or **admin** access to the repository can trigger benc
 ### Fork PRs
 
 For the workflow to push results back to a fork's branch, the PR must have **"Allow edits from maintainers"** checked (this is the GitHub default). If unchecked, results are still available as downloadable workflow artifacts.
-
-### Setup
-
-The workflow requires a GitHub App for authentication. See `.github/workflows/experiment.yml` for the full configuration. Required repository secrets:
-
-| Secret | Description |
-|--------|-------------|
-| `EXPERIMENT_APP_ID` | GitHub App ID |
-| `EXPERIMENT_APP_PRIVATE_KEY` | GitHub App private key (.pem) |
-| `HF_TOKEN` | HuggingFace API token |
-| `CLOUDRIFT_API_KEY` | CloudRift API key (if using CloudRift GPUs) |
-| `GCP_SERVICE_ACCOUNT_KEY` | GCP service account JSON key (if using GCP GPUs) |
-| `GCP_SERVICE_ACCOUNT` | GCP service account email (if using GCP GPUs) |
 
 ## Deploy Targets
 
@@ -349,46 +331,23 @@ deplodock vm delete cloudrift --instance-id <id>
 
 The `bench` command accepts recipe directories as positional arguments. It loads each recipe, provisions cloud VMs, deploys the model, runs `vllm bench serve`, captures results, and tears down. Recipes sharing the same model and GPU type are grouped onto the same VM.
 
-### Configuration
-
-`config.yaml` defines global benchmark settings and provider config:
-
-```yaml
-benchmark:
-  local_results_dir: "results/intermediate"
-  model_dir: "/hf_models"
-
-pricing:
-  h100: 1.91
-  h200: 2.06
-
-providers:
-  gcp:
-    zone: "us-central1-b"
-    provisioning_model: "SPOT"
-    image_family: "common-cu128-ubuntu-2204-nvidia-570"
-    image_project: "deeplearning-platform-release"
-```
-
-Benchmark parameters (`max_concurrency`, `num_prompts`, `random_input_len`, `random_output_len`) are defined per-recipe in the recipe's `benchmark` section, not in `config.yaml`.
-
 ### Run Benchmarks
 
 ```bash
 deplodock bench recipes/*                                    # Run all recipes (results in each recipe dir)
 deplodock bench experiments/.../optimal_mcr_rtx5090          # Run an experiment
-deplodock bench recipes/* --max-workers 2                    # Limit parallel execution groups
+deplodock bench recipes/* --gpu-concurrency 4                # Number of VMs per GPU type to spin up
 deplodock bench recipes/* --dry-run                          # Preview commands
 ```
 
-| Flag                 | Default             | Description                            |
-|----------------------|---------------------|----------------------------------------|
-| `recipes`            | (required)          | Recipe directories (positional args)   |
-| `--ssh-key`          | `~/.ssh/id_ed25519` | SSH private key path                   |
-| `--config`           | `config.yaml`       | Path to configuration file             |
-| `--max-workers`      | num groups          | Max parallel execution groups          |
-| `--gpu-concurrency`  | 1                   | Split each (model, GPU) group across up to N VMs |
-| `--dry-run`          | false               | Print commands without executing       |
+| Flag                 | Default             | Description                                                              |
+|----------------------|---------------------|--------------------------------------------------------------------------|
+| `recipes`            | (required)          | Recipe directories (positional args)                                     |
+| `--ssh-key`          | `~/.ssh/id_ed25519` | SSH private key path                                                     |
+| `--config`           | `config.yaml`       | Path to configuration file                                               |
+| `--max-workers`      | num groups          | Max parallel execution groups                                            |
+| `--gpu-concurrency`  | 1                   | Split each (model, GPU) group across up to N VMs                         |
+| `--dry-run`          | false               | Print commands without executing                                         |
 | `--no-teardown`      | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
 
 Results are always stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
@@ -402,10 +361,10 @@ deplodock teardown results/intermediate/2026-02-24_12-00-00_abc12345
 deplodock teardown results/intermediate/2026-02-24_12-00-00_abc12345 --ssh-key ~/.ssh/id_ed25519
 ```
 
-| Flag       | Default             | Description                       |
-|------------|---------------------|-----------------------------------|
-| `run_dir`  | (required)          | Run directory with `instances.json` (positional arg) |
-| `--ssh-key`| `~/.ssh/id_ed25519` | SSH private key path              |
+| Flag        | Default              | Description                                          |
+|-------------|----------------------|------------------------------------------------------|
+| `run_dir`   | (required)           | Run directory with `instances.json` (positional arg) |
+| `--ssh-key` | `~/.ssh/id_ed25519`  | SSH private key path                                 |
 
 ## Running Tests
 
