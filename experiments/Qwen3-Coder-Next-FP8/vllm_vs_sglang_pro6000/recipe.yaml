@@ -22,8 +22,8 @@ matrices:
   - deploy.gpu: "RTX PRO 6000 Blackwell Max-Q Workstation Edition"
     deploy.gpu_count: 1
     engine.llm.sglang.image: "lmsysorg/sglang:latest"
-    engine.llm.sglang.extra_args: "--attention-backend triton"
+    engine.llm.sglang.extra_args: "--attention-backend triton --disable-deep-gemm"
   - deploy.gpu: "RTX PRO 6000 Blackwell Max-Q Workstation Edition"
     deploy.gpu_count: 1
     engine.llm.sglang.image: "lmsysorg/sglang:latest"
-    engine.llm.sglang.extra_args: "--attention-backend trtllm_mha"
+    engine.llm.sglang.extra_args: "--attention-backend trtllm_mha --disable-deep-gemm"
