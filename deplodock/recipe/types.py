@@ -9,6 +9,7 @@ class VllmConfig:
 
     image: str = "vllm/vllm-openai:latest"
     extra_args: str = ""
+    extra_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -17,6 +18,7 @@ class SglangConfig:
 
     image: str = "lmsysorg/sglang:latest"
     extra_args: str = ""
+    extra_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -71,6 +73,15 @@ class LLMConfig:
         if self.vllm is not None:
             return self.vllm.extra_args
         return ""
+
+    @property
+    def extra_env(self) -> dict[str, str]:
+        """Extra environment variables for the active engine."""
+        if self.sglang is not None:
+            return self.sglang.extra_env
+        if self.vllm is not None:
+            return self.vllm.extra_env
+        return {}
 
 
 @dataclass
