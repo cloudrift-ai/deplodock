@@ -1,0 +1,38 @@
+[
+  {
+    "task_id": "vllm_vs_sglang_pro6000/pro6000x1_ivllm-vllm-oai-latest",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000",
+    "variant": "pro6000x1_ivllm-vllm-oai-latest",
+    "recipe_name": "vllm_vs_sglang_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_ivllm-vllm-oai-latest_vllm_benchmark.txt",
+    "json_result_file": "pro6000x1_ivllm-vllm-oai-latest_vllm_benchmark.json"
+  },
+  {
+    "task_id": "vllm_vs_sglang_pro6000/pro6000x1_eafp8-g-b-t-a-b-t-d-c-g-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000",
+    "variant": "pro6000x1_eafp8-g-b-t-a-b-t-d-c-g-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13",
+    "recipe_name": "vllm_vs_sglang_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_eafp8-g-b-t-a-b-t-d-c-g-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13_sglang_benchmark.txt",
+    "json_result_file": "pro6000x1_eafp8-g-b-t-a-b-t-d-c-g-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13_sglang_benchmark.json"
+  },
+  {
+    "task_id": "vllm_vs_sglang_pro6000/pro6000x1_eafp8-g-b-t-a-b-t-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000",
+    "variant": "pro6000x1_eafp8-g-b-t-a-b-t-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13",
+    "recipe_name": "vllm_vs_sglang_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_eafp8-g-b-t-a-b-t-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13_sglang_benchmark.txt",
+    "json_result_file": "pro6000x1_eafp8-g-b-t-a-b-t-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13_sglang_benchmark.json"
+  }
+]
