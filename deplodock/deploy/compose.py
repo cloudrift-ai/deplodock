@@ -29,6 +29,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
 
     engine_args = build_engine_args(llm, model_name)
     command_str = "\n      ".join(engine_args)
+    extra_env_lines = "".join(f"\n      - {k}={v}" for k, v in llm.extra_env.items())
 
     services = "services:\n"
 
@@ -63,7 +64,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
       - {model_dir}:{model_dir}
     environment:
       - HUGGING_FACE_HUB_TOKEN={hf_token}
-      - HF_HOME={model_dir}
+      - HF_HOME={model_dir}{extra_env_lines}
     ports:
       - "{port}:8000"
     shm_size: '16gb'

@@ -196,3 +196,34 @@ def test_compose_sglang_parses_as_valid_yaml(sample_config_sglang):
     parsed = yaml.safe_load(result)
     assert "services" in parsed
     assert "sglang_0" in parsed["services"]
+
+
+# ── extra_env compose ──────────────────────────────────────────────
+
+
+def test_compose_extra_env_appears_in_environment(sample_config):
+    sample_config["engine"]["llm"]["vllm"]["extra_env"] = {
+        "VLLM_ATTENTION_BACKEND": "FLASHINFER",
+        "CUDA_LAUNCH_BLOCKING": "1",
+    }
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
+    assert "VLLM_ATTENTION_BACKEND=FLASHINFER" in result
+    assert "CUDA_LAUNCH_BLOCKING=1" in result
+
+
+def test_compose_empty_extra_env_produces_no_extra_lines(sample_config):
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
+    parsed = yaml.safe_load(result)
+    env = parsed["services"]["vllm_0"]["environment"]
+    assert len(env) == 2  # HUGGING_FACE_HUB_TOKEN and HF_HOME only
+
+
+def test_compose_with_extra_env_parses_as_valid_yaml(sample_config):
+    sample_config["engine"]["llm"]["vllm"]["extra_env"] = {"MY_VAR": "hello"}
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
+    parsed = yaml.safe_load(result)
+    env = parsed["services"]["vllm_0"]["environment"]
+    assert "MY_VAR=hello" in env

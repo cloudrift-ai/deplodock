@@ -15,12 +15,14 @@ def test_vllm_config_defaults():
     cfg = VllmConfig()
     assert cfg.image == "vllm/vllm-openai:latest"
     assert cfg.extra_args == ""
+    assert cfg.extra_env == {}
 
 
 def test_sglang_config_defaults():
     cfg = SglangConfig()
     assert cfg.image == "lmsysorg/sglang:latest"
     assert cfg.extra_args == ""
+    assert cfg.extra_env == {}
 
 
 # ── LLMConfig properties ─────────────────────────────────────────
@@ -74,6 +76,21 @@ def test_llm_extra_args_sglang():
 def test_llm_extra_args_empty_default():
     llm = LLMConfig()
     assert llm.extra_args == ""
+
+
+def test_llm_extra_env_vllm():
+    llm = LLMConfig(vllm=VllmConfig(extra_env={"VLLM_ATTENTION_BACKEND": "FLASHINFER"}))
+    assert llm.extra_env == {"VLLM_ATTENTION_BACKEND": "FLASHINFER"}
+
+
+def test_llm_extra_env_sglang():
+    llm = LLMConfig(sglang=SglangConfig(extra_env={"SGL_DEBUG": "1"}))
+    assert llm.extra_env == {"SGL_DEBUG": "1"}
+
+
+def test_llm_extra_env_empty_default():
+    llm = LLMConfig()
+    assert llm.extra_env == {}
 
 
 def test_llm_optional_fields_default_none():
@@ -184,3 +201,18 @@ def test_from_dict_benchmark_defaults():
     assert recipe.benchmark.num_prompts == 256
     assert recipe.benchmark.random_input_len == 8000
     assert recipe.benchmark.random_output_len == 8000
+
+
+def test_from_dict_with_extra_env():
+    d = {
+        "model": {"huggingface": "org/model"},
+        "engine": {
+            "llm": {
+                "vllm": {
+                    "extra_env": {"VLLM_ATTENTION_BACKEND": "FLASHINFER", "CUDA_VISIBLE_DEVICES": "0,1"},
+                },
+            }
+        },
+    }
+    recipe = Recipe.from_dict(d)
+    assert recipe.engine.llm.extra_env == {"VLLM_ATTENTION_BACKEND": "FLASHINFER", "CUDA_VISIBLE_DEVICES": "0,1"}

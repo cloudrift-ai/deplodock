@@ -126,7 +126,22 @@ Both `--model` and `--model-path` are in the hardcoded banned set, so they canno
 
 ### Engine-Specific Nesting
 
-Engine-specific config (`image`, `extra_args`) nests under `engine.llm.vllm` or `engine.llm.sglang`, while engine-agnostic config lives at `engine.llm`. `LLMConfig.engine_name` is determined by which sub-config is present (SGLang takes priority if both exist). The `image` and `extra_args` properties delegate to the active engine's config.
+Engine-specific config (`image`, `extra_args`, `extra_env`) nests under `engine.llm.vllm` or `engine.llm.sglang`, while engine-agnostic config lives at `engine.llm`. `LLMConfig.engine_name` is determined by which sub-config is present (SGLang takes priority if both exist). The `image`, `extra_args`, and `extra_env` properties delegate to the active engine's config.
+
+### Extra Environment Variables
+
+`extra_env` is a `dict[str, str]` on `VllmConfig` / `SglangConfig` that injects arbitrary environment variables into the Docker Compose container. It defaults to an empty dict. `LLMConfig.extra_env` delegates to the active engine's config, mirroring the pattern used by `extra_args`.
+
+```yaml
+engine:
+  llm:
+    vllm:
+      extra_env:
+        VLLM_ATTENTION_BACKEND: FLASHINFER
+        CUDA_LAUNCH_BLOCKING: "1"
+```
+
+Each key-value pair is rendered as a `- KEY=VALUE` line in the `environment` section of the generated Docker Compose file.
 
 ### SGLang Quantization for AWQ MoE Models
 
