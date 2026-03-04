@@ -1052,3 +1052,6 @@ scp: Connection closed
 [2026-03-04 22:29:12] [deplodock.provisioning.ssh_transport] ssh: connect to host 34.46.39.196 port 22: Connection timed out
 [2026-03-04 22:29:12] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-03-04 22:29:12] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
+[2026-03-04 22:29:12] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000/pro6000x1_mc52_np80_mcr52
+[2026-03-04 22:29:13] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 22:29:55] [pro6000_x_1_r04.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-03-04_21-46-13_a64f1bc9/pro6000x1_mc60_np80_mcr60_sglang_benchmark.txt
