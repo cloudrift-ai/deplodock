@@ -24,7 +24,10 @@ GPU_INSTANCE_TYPES = {
         ("cloudrift", "rtxpro6000-4-100-1000-ti"),
         ("cloudrift", "rtxpro6000-11-50-500-1l"),
     ],
-    "NVIDIA RTX PRO 6000 Server Edition": [
+    "RTX PRO 6000 Blackwell Max-Q Workstation Edition": [
+        ("cloudrift", "rtxpro6000-11-50-500-1l"),
+    ],
+    "RTX PRO 6000 Blackwell Server Edition": [
         ("gcp", "g4-standard"),
     ],
     "NVIDIA L40S": [
