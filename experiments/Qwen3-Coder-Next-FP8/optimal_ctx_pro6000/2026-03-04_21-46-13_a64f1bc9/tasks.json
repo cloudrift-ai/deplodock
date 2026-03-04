@@ -1,0 +1,74 @@
+[
+  {
+    "task_id": "optimal_ctx_pro6000/pro6000x1_cl8192",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000",
+    "variant": "pro6000x1_cl8192",
+    "recipe_name": "optimal_ctx_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_cl8192_sglang_benchmark.txt",
+    "json_result_file": "pro6000x1_cl8192_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_pro6000/pro6000x1_cl16384",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000",
+    "variant": "pro6000x1_cl16384",
+    "recipe_name": "optimal_ctx_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_cl16384_sglang_benchmark.txt",
+    "json_result_file": "pro6000x1_cl16384_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_pro6000/pro6000x1_cl32768",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000",
+    "variant": "pro6000x1_cl32768",
+    "recipe_name": "optimal_ctx_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_cl32768_sglang_benchmark.txt",
+    "json_result_file": "pro6000x1_cl32768_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_pro6000/pro6000x1_cl65536",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000",
+    "variant": "pro6000x1_cl65536",
+    "recipe_name": "optimal_ctx_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_cl65536_sglang_benchmark.txt",
+    "json_result_file": "pro6000x1_cl65536_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_pro6000/pro6000x1_cl131072",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000",
+    "variant": "pro6000x1_cl131072",
+    "recipe_name": "optimal_ctx_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_cl131072_sglang_benchmark.txt",
+    "json_result_file": "pro6000x1_cl131072_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_pro6000/pro6000x1_cl262144",
+    "recipe_dir": "experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000",
+    "variant": "pro6000x1_cl262144",
+    "recipe_name": "optimal_ctx_pro6000",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 1,
+    "model_name": "Qwen/Qwen3-Coder-Next-FP8",
+    "result_file": "pro6000x1_cl262144_sglang_benchmark.txt",
+    "json_result_file": "pro6000x1_cl262144_sglang_benchmark.json"
+  }
+]
