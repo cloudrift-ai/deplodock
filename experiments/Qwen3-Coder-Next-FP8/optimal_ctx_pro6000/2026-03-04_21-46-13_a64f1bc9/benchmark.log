@@ -10914,3 +10914,16 @@ Example curl:
     }'
 [2026-03-04 21:58:48] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Running benchmark...
 [2026-03-04 22:00:26] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-03-04_21-46-13_a64f1bc9/pro6000x1_cl131072_sglang_benchmark.txt
+[2026-03-04 22:00:26] [deplodock.commands.bench.committer] Committed: bench: pass optimal_ctx_pro6000/pro6000x1_cl131072
+[2026-03-04 22:00:27] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 22:00:27] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Tearing down...
+[2026-03-04 22:00:27] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 22:00:27] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.16.17.186' (ED25519) to the list of known hosts.
+[2026-03-04 22:00:28] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopping 
+[2026-03-04 22:00:31] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopped 
+[2026-03-04 22:00:31] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removing 
+[2026-03-04 22:00:31] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removed 
+[2026-03-04 22:00:31] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-04 22:00:31] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-04 22:00:31] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-04 22:00:34] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-03-04_21-46-13_a64f1bc9/pro6000x1_cl262144_sglang_benchmark.txt
