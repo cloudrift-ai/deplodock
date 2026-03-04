@@ -10704,3 +10704,7 @@ Example curl:
 [2026-03-04 21:57:30] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.44.150.55' (ED25519) to the list of known hosts.
 [2026-03-04 21:57:31] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopping 
 [2026-03-04 21:57:32] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_ctx_pro6000/2026-03-04_21-46-13_a64f1bc9/pro6000x1_cl8192_sglang_benchmark.txt
+[2026-03-04 21:57:32] [deplodock.commands.bench.committer] Committed: bench: pass optimal_ctx_pro6000/pro6000x1_cl8192
+[2026-03-04 21:57:34] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 21:57:34] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Tearing down...
+[2026-03-04 21:57:34] [deplodock.deploy.orchestrate] Tearing down...
