@@ -7046,3 +7046,15 @@ Example curl:
 [2026-03-04 04:43:11] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
 [2026-03-04 04:43:12] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
 [2026-03-04 04:43:12] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-04 04:44:03] [deplodock.commands.bench.committer] Committed: bench: pass vllm_vs_sglang_pro6000/pro6000x1_ivllm-vllm-oai-latest
+[2026-03-04 04:44:04] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 04:44:04] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 04:44:04] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.44.179.95' (ED25519) to the list of known hosts.
+[2026-03-04 04:44:05] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-04 04:44:05] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-04 04:44:05] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-04 04:44:06] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-04 04:44:06] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-04 04:44:06] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-04 04:44:06] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-04 04:48:16] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/vllm_vs_sglang_pro6000/2026-03-04_04-31-54_a64f1bc9/pro6000x1_eafp8-g-b-t-a-b-t-d-c-g-d-r-cache-kv-cache-dtype-bf16_eesglang-E-J-D-0_ilms-sglang-d-cu13_sglang_benchmark.txt
