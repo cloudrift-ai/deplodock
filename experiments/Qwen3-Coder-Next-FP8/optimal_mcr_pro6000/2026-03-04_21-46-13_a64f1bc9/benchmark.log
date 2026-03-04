@@ -762,3 +762,37 @@ Traffic request rate: inf
 Burstiness factor: 1.0 (Poisson process)
 Maximum request concurrency: 20
 
+[2026-03-04 22:17:54] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000/pro6000x1_mc20_np80_mcr20
+[2026-03-04 22:17:55] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 22:17:55] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Tearing down...
+[2026-03-04 22:17:55] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 22:18:33] [deplodock.provisioning.ssh_transport]  Container sglang_0 Healthy 
+[2026-03-04 22:18:33] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-04 22:18:33] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.44.150.55' (ED25519) to the list of known hosts.
+[2026-03-04 22:18:34] [deplodock.deploy.orchestrate] 
+Endpoint: http://34.44.150.55:8000/v1
+[2026-03-04 22:18:34] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-03-04 22:18:34] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-04 22:18:34] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-04 22:18:34] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-03-04 22:18:35] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-04 22:18:35] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-04 22:18:35] [deplodock.deploy.orchestrate]   curl http://34.44.150.55:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-04 22:18:35] [pro6000_x_1_r03.Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-03-04 22:20:11] [deplodock.provisioning.ssh_transport] ssh: connect to host 34.46.39.196 port 22: Connection timed out
+[2026-03-04 22:20:11] [deplodock.deploy.orchestrate] Teardown failed.
+[2026-03-04 22:20:11] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Recipe: experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000 (variant: pro6000x1_mc36_np80_mcr36)
+[2026-03-04 22:20:11] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploying model...
+[2026-03-04 22:22:26] [deplodock.provisioning.ssh_transport] Failed to SCP docker-compose.yaml to runner@34.46.39.196:~/deploy/docker-compose.yaml: ssh: connect to host 34.46.39.196 port 22: Connection timed out
+scp: Connection closed
+
+[2026-03-04 22:22:26] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 22:22:26] [pro6000_x_1_r04.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-03-04_21-46-13_a64f1bc9/pro6000x1_mc44_np80_mcr44_sglang_benchmark.txt
