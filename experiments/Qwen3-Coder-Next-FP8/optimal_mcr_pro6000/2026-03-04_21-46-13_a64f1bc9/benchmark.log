@@ -1055,3 +1055,16 @@ scp: Connection closed
 [2026-03-04 22:29:12] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000/pro6000x1_mc52_np80_mcr52
 [2026-03-04 22:29:13] [deplodock.commands.bench.committer] Pushed results to remote
 [2026-03-04 22:29:55] [pro6000_x_1_r04.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-03-04_21-46-13_a64f1bc9/pro6000x1_mc60_np80_mcr60_sglang_benchmark.txt
+[2026-03-04 22:29:55] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_pro6000/pro6000x1_mc60_np80_mcr60
+[2026-03-04 22:29:56] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 22:29:56] [pro6000_x_1_r04.Qwen3-Coder-Next-FP8] Tearing down...
+[2026-03-04 22:29:56] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 22:29:56] [deplodock.provisioning.ssh_transport] Warning: Permanently added '35.193.61.94' (ED25519) to the list of known hosts.
+[2026-03-04 22:29:57] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopping 
+[2026-03-04 22:30:03] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopped 
+[2026-03-04 22:30:03] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removing 
+[2026-03-04 22:30:03] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removed 
+[2026-03-04 22:30:03] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-04 22:30:04] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-04 22:30:04] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-04 22:31:42] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000/2026-03-04_21-46-13_a64f1bc9/pro6000x1_mc64_np80_mcr64_sglang_benchmark.txt
