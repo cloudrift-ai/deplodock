@@ -6012,3 +6012,12 @@ Example curl:
     }'
 [2026-03-04 18:17:43] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Running benchmark...
 [2026-03-04 18:20:18] [pro6000_x_1_r03.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm/2026-03-04_17-31-44_a64f1bc9/pro6000x1_mc28_np80_mcr28_vllm_benchmark.txt
+[2026-03-04 18:20:18] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_pro6000_vllm/pro6000x1_mc28_np80_mcr28
+[2026-03-04 18:20:19] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 18:20:19] [pro6000_x_1_r03.Qwen3-Coder-Next-FP8] Tearing down...
+[2026-03-04 18:20:19] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 18:20:19] [deplodock.provisioning.ssh_transport] Warning: Permanently added '35.224.18.152' (ED25519) to the list of known hosts.
+[2026-03-04 18:20:20] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-04 18:20:21] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-04 18:20:21] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-04 18:20:21] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm/2026-03-04_17-31-44_a64f1bc9/pro6000x1_mc48_np80_mcr48_vllm_benchmark.txt
