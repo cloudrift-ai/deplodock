@@ -22,3 +22,8 @@ matrices:
   - deploy.gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
     deploy.gpu_count: 1
     engine.llm.sglang.image: "lmsysorg/sglang:latest"
+    engine.llm.sglang.extra_args: "--attention-backend triton"
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Workstation Edition"
+    deploy.gpu_count: 1
+    engine.llm.sglang.image: "lmsysorg/sglang:latest"
+    engine.llm.sglang.extra_args: "--attention-backend trtllm_mha"
