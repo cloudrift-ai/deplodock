@@ -322,3 +322,8 @@ scp: Connection closed
 [2026-03-04 22:42:43] [deplodock.provisioning.ssh_transport] ssh: connect to host 34.46.39.196 port 22: Connection timed out
 [2026-03-04 22:42:43] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-03-04 22:42:43] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
+[2026-03-04 22:42:43] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000_vllm/pro6000x1_mc40_np80_mcr40
+[2026-03-04 22:42:44] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 22:42:44] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Recipe: experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm (variant: pro6000x1_mc56_np80_mcr56)
+[2026-03-04 22:42:44] [pro6000_x_1_r02.Qwen3-Coder-Next-FP8] Deploying model...
+[2026-03-04 22:42:46] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm/2026-03-04_21-46-13_a64f1bc9/pro6000x1_mc20_np80_mcr20_vllm_benchmark.txt
