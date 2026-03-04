@@ -1,0 +1,25 @@
+model:
+  huggingface: "Qwen/Qwen3-Coder-Next-FP8"
+
+engine:
+  llm:
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_concurrent_requests: 4
+    sglang:
+      image: "lmsysorg/sglang:dev-cu13"
+      extra_args: "--fp8-gemm-backend triton --attention-backend triton --disable-radix-cache --kv-cache-dtype bf16"
+      extra_env:
+        SGLANG_ENABLE_JIT_DEEPGEMM: 0
+
+benchmark:
+  max_concurrency: 4
+  num_prompts: 8
+  random_input_len: 4000
+  random_output_len: 4000
+
+matrices:
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+    deploy.gpu_count: 1
+    engine.llm.context_length: [8192, 16384, 32768, 65536, 131072]
