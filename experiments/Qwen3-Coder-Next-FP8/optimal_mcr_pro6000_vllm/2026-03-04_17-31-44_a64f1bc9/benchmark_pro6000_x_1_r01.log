@@ -5356,3 +5356,199 @@ Example curl:
 [2026-03-04 17:52:58] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/7a94ef41eabb382b138e781ac0f6054e649ee6e9583298e0b84a0dd75f4d4f97
 [2026-03-04 17:52:58] [deplodock.provisioning.ssh_transport] Downloading 'model-00012-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/185b7d1bfc64adfa9076918c56b77391d589e99d254c84b281fd79c8a2b8b98d.incomplete'
 [2026-03-04 17:53:26] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm/2026-03-04_17-31-44_a64f1bc9/pro6000x1_mc8_np80_mcr8_vllm_benchmark.txt
+[2026-03-04 17:53:26] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_pro6000_vllm/pro6000x1_mc8_np80_mcr8
+[2026-03-04 17:53:27] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 17:53:27] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Tearing down...
+[2026-03-04 17:53:27] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-04 17:53:27] [deplodock.provisioning.ssh_transport] Warning: Permanently added '136.116.88.80' (ED25519) to the list of known hosts.
+[2026-03-04 17:53:28] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-04 17:53:29] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-04 17:53:29] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-04 17:53:29] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-04 17:53:29] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-04 17:53:29] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-04 17:53:29] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-04 17:53:29] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Recipe: experiments/Qwen3-Coder-Next-FP8/optimal_mcr_pro6000_vllm (variant: pro6000x1_mc20_np80_mcr20)
+[2026-03-04 17:53:29] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Deploying model...
+[2026-03-04 17:53:30] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 17:53:30] [deplodock.provisioning.ssh_transport] Warning: Permanently added '136.116.88.80' (ED25519) to the list of known hosts.
+[2026-03-04 17:53:31] [deplodock.provisioning.ssh_transport]  Image vllm/vllm-openai:latest Pulling 
+[2026-03-04 17:53:31] [deplodock.provisioning.ssh_transport]  Image vllm/vllm-openai:latest Pulled 
+[2026-03-04 17:53:31] [deplodock.deploy.orchestrate] Downloading model Qwen/Qwen3-Coder-Next-FP8...
+[2026-03-04 17:53:31] [deplodock.provisioning.ssh_transport] Warning: Permanently added '136.116.88.80' (ED25519) to the list of known hosts.
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: huggingface_hub[cli,hf_transfer] in /usr/local/lib/python3.12/dist-packages (0.36.2)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (3.24.3)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2026.2.0)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: hf-xet<2.0.0,>=1.1.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (1.3.1)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: packaging>=20.9 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (26.0)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: pyyaml>=5.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (6.0.3)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: requests in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2.32.5)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: tqdm>=4.42.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.67.3)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: typing-extensions>=3.7.4.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.15.0)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Collecting InquirerPy==0.3.4 (from huggingface_hub[cli,hf_transfer])
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport]   Downloading InquirerPy-0.3.4-py3-none-any.whl.metadata (8.1 kB)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: hf_transfer>=0.1.4 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (0.1.9)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Collecting pfzy<0.4.0,>=0.3.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport]   Downloading pfzy-0.3.4-py3-none-any.whl.metadata (4.9 kB)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Collecting prompt-toolkit<4.0.0,>=3.0.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport]   Downloading prompt_toolkit-3.0.52-py3-none-any.whl.metadata (6.4 kB)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Collecting wcwidth (from prompt-toolkit<4.0.0,>=3.0.1->InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport]   Downloading wcwidth-0.6.0-py3-none-any.whl.metadata (30 kB)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.4.4)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.11)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2.6.3)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2026.2.25)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Downloading InquirerPy-0.3.4-py3-none-any.whl (67 kB)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Downloading pfzy-0.3.4-py3-none-any.whl (8.5 kB)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Downloading prompt_toolkit-3.0.52-py3-none-any.whl (391 kB)
+[2026-03-04 17:53:32] [deplodock.provisioning.ssh_transport] Downloading wcwidth-0.6.0-py3-none-any.whl (94 kB)
+[2026-03-04 17:53:33] [deplodock.provisioning.ssh_transport] Installing collected packages: wcwidth, pfzy, prompt-toolkit, InquirerPy
+[2026-03-04 17:53:33] [deplodock.provisioning.ssh_transport] 
+[2026-03-04 17:53:33] [deplodock.provisioning.ssh_transport] Successfully installed InquirerPy-0.3.4 pfzy-0.3.4 prompt-toolkit-3.0.52 wcwidth-0.6.0
+[2026-03-04 17:53:33] [deplodock.provisioning.ssh_transport] WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[2026-03-04 17:53:33] [deplodock.provisioning.ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-03-04 17:53:33] [deplodock.provisioning.ssh_transport] /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/snapshots/da6e2ed27304dd39abadd9c82ef50e8de67bdd4c
+[2026-03-04 17:53:33] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-03-04 17:53:34] [deplodock.provisioning.ssh_transport] Warning: Permanently added '136.116.88.80' (ED25519) to the list of known hosts.
+[2026-03-04 17:53:34] [deplodock.deploy.orchestrate] Starting services...
+[2026-03-04 17:53:34] [deplodock.provisioning.ssh_transport] Warning: Permanently added '136.116.88.80' (ED25519) to the list of known hosts.
+[2026-03-04 17:53:35] [deplodock.provisioning.ssh_transport]  Network deploy_default Creating 
+[2026-03-04 17:53:35] [deplodock.provisioning.ssh_transport]  Network deploy_default Created 
+[2026-03-04 17:53:35] [deplodock.provisioning.ssh_transport]  Container vllm_0 Creating 
+[2026-03-04 17:53:35] [deplodock.provisioning.ssh_transport]  Container vllm_0 Created 
+[2026-03-04 17:53:35] [deplodock.provisioning.ssh_transport]  Container vllm_0 Starting 
+[2026-03-04 17:53:35] [deplodock.provisioning.ssh_transport]  Container vllm_0 Started 
+[2026-03-04 17:53:35] [deplodock.provisioning.ssh_transport]  Container vllm_0 Waiting 
+[2026-03-04 17:54:41] [deplodock.provisioning.ssh_transport]  Container vllm_0 Healthy 
+[2026-03-04 17:54:41] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-04 17:54:42] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.122.127.247' (ED25519) to the list of known hosts.
+[2026-03-04 17:54:42] [deplodock.deploy.orchestrate] 
+Endpoint: http://34.122.127.247:8000/v1
+[2026-03-04 17:54:42] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-03-04 17:54:42] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-04 17:54:42] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-04 17:54:42] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-03-04 17:54:59] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/185b7d1bfc64adfa9076918c56b77391d589e99d254c84b281fd79c8a2b8b98d
+[2026-03-04 17:54:59] [deplodock.provisioning.ssh_transport] Downloading 'model-00013-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/f2a2457629e7b1c5264aa0a3b9304aab17e5fc9781d7267677ec7aa19273dc9d.incomplete'
+[2026-03-04 17:55:44] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-04 17:55:44] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-04 17:55:44] [deplodock.deploy.orchestrate]   curl http://34.122.127.247:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-04 17:56:10] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/f2a2457629e7b1c5264aa0a3b9304aab17e5fc9781d7267677ec7aa19273dc9d
+[2026-03-04 17:56:10] [deplodock.provisioning.ssh_transport] Downloading 'model-00014-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/88fd3310606c521c8553ee83ad84c0b82eec892818029e1db6d99ba45a300478.incomplete'
+[2026-03-04 17:56:11] [deplodock.provisioning.ssh_transport]  Container vllm_0 Healthy 
+[2026-03-04 17:56:11] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-04 17:56:11] [deplodock.provisioning.ssh_transport] Warning: Permanently added '136.116.88.80' (ED25519) to the list of known hosts.
+[2026-03-04 17:56:12] [deplodock.deploy.orchestrate] 
+Endpoint: http://136.116.88.80:8000/v1
+[2026-03-04 17:56:12] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-03-04 17:56:12] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-04 17:56:12] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-04 17:56:12] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-03-04 17:56:15] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/88fd3310606c521c8553ee83ad84c0b82eec892818029e1db6d99ba45a300478
+[2026-03-04 17:56:15] [deplodock.provisioning.ssh_transport] Downloading 'model-00015-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/c98a491d0e3295f39a0bca7bdf9833255c544e9302b4d3d15d1146d90c024aad.incomplete'
+[2026-03-04 17:56:20] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/c98a491d0e3295f39a0bca7bdf9833255c544e9302b4d3d15d1146d90c024aad
+[2026-03-04 17:56:20] [deplodock.provisioning.ssh_transport] Downloading 'model-00016-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/ddfb0d48974186fd19a54c4ae5cc354151d8346528adb5184b8fa2b26bade09b.incomplete'
+[2026-03-04 17:56:37] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/ddfb0d48974186fd19a54c4ae5cc354151d8346528adb5184b8fa2b26bade09b
+[2026-03-04 17:56:37] [deplodock.provisioning.ssh_transport] Downloading 'model-00017-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/87963822288f82be220324a4bf3a0f93b60ae5b0ffec858bf443589fae11118e.incomplete'
+[2026-03-04 17:56:43] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/87963822288f82be220324a4bf3a0f93b60ae5b0ffec858bf443589fae11118e
+[2026-03-04 17:56:43] [deplodock.provisioning.ssh_transport] Downloading 'model-00018-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/f81bca32c73a477483552e472fb05ebff3f47a32c23f6ffbb46f8b5a9d40074d.incomplete'
+[2026-03-04 17:56:47] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/f81bca32c73a477483552e472fb05ebff3f47a32c23f6ffbb46f8b5a9d40074d
+[2026-03-04 17:56:47] [deplodock.provisioning.ssh_transport] Downloading 'model-00019-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/0f9a7b626201b4a3f3a6273d1355b6af0b01039c185302421f3be2ceac3011a7.incomplete'
+[2026-03-04 17:56:54] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/0f9a7b626201b4a3f3a6273d1355b6af0b01039c185302421f3be2ceac3011a7
+[2026-03-04 17:56:54] [deplodock.provisioning.ssh_transport] Downloading 'model-00020-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/20b837e2920bd389b1f4da9a147691bd87daea509e6b19514000b43fe9543bfc.incomplete'
+[2026-03-04 17:57:01] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/20b837e2920bd389b1f4da9a147691bd87daea509e6b19514000b43fe9543bfc
+[2026-03-04 17:57:01] [deplodock.provisioning.ssh_transport] Downloading 'model-00021-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/e5ae0ae4f8a7d4df1b091d0042bfe3eb30cf6fbdbdf214597e830d8791031b4e.incomplete'
+[2026-03-04 17:57:07] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/e5ae0ae4f8a7d4df1b091d0042bfe3eb30cf6fbdbdf214597e830d8791031b4e
+[2026-03-04 17:57:07] [deplodock.provisioning.ssh_transport] Downloading 'model-00022-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/b141f2a16a1216c332cb2efdf842a9512fd190b4dccf7223c93bc1a2c44bcb87.incomplete'
+[2026-03-04 17:57:14] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-04 17:57:14] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-04 17:57:14] [deplodock.deploy.orchestrate]   curl http://136.116.88.80:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-04 17:57:14] [pro6000_x_1_r01.Qwen3-Coder-Next-FP8] Running benchmark...
+[2026-03-04 17:57:14] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/b141f2a16a1216c332cb2efdf842a9512fd190b4dccf7223c93bc1a2c44bcb87
+[2026-03-04 17:57:15] [deplodock.provisioning.ssh_transport] Downloading 'model-00023-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/a27074531ffc6f64232a473a523f65d8de1a6172b4de09c0578a9ad08717171c.incomplete'
+[2026-03-04 17:57:20] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/a27074531ffc6f64232a473a523f65d8de1a6172b4de09c0578a9ad08717171c
+[2026-03-04 17:57:20] [deplodock.provisioning.ssh_transport] Downloading 'model-00024-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/24a04b08e9c736a14b13a2929d49ec48d13b1946ea997101cde853764a94eb21.incomplete'
+[2026-03-04 17:57:43] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/24a04b08e9c736a14b13a2929d49ec48d13b1946ea997101cde853764a94eb21
+[2026-03-04 17:57:43] [deplodock.provisioning.ssh_transport] Downloading 'model-00025-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/50ed4184a0f85b89ce4b4f7ec0f5062c1ef281c0eda3f00f1f48e4707d567b98.incomplete'
+[2026-03-04 17:57:49] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/50ed4184a0f85b89ce4b4f7ec0f5062c1ef281c0eda3f00f1f48e4707d567b98
+[2026-03-04 17:57:49] [deplodock.provisioning.ssh_transport] Downloading 'model-00026-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/95f5114fe6e7e3bc997c13d913c67b45adec715fc6ae6e4fe6fcabca743686f5.incomplete'
+[2026-03-04 17:57:58] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/95f5114fe6e7e3bc997c13d913c67b45adec715fc6ae6e4fe6fcabca743686f5
+[2026-03-04 17:57:58] [deplodock.provisioning.ssh_transport] Downloading 'model-00027-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/1d403f9008dfec3c99d45e3bc5a75630b68c50a5b701d3e7016cd678b7f16e11.incomplete'
+[2026-03-04 17:58:05] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/1d403f9008dfec3c99d45e3bc5a75630b68c50a5b701d3e7016cd678b7f16e11
+[2026-03-04 17:58:05] [deplodock.provisioning.ssh_transport] Downloading 'model-00028-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/35a968fef6f36d50cab8a43ee4d824023466a992a025a4d6ab1d48ce17dd22de.incomplete'
+[2026-03-04 17:58:10] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/35a968fef6f36d50cab8a43ee4d824023466a992a025a4d6ab1d48ce17dd22de
+[2026-03-04 17:58:10] [deplodock.provisioning.ssh_transport] Downloading 'model-00029-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/82f9a8ae7e2936360a0b114bdfb01469fd466287749c8ea404aede06384f459f.incomplete'
+[2026-03-04 17:58:15] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/82f9a8ae7e2936360a0b114bdfb01469fd466287749c8ea404aede06384f459f
+[2026-03-04 17:58:15] [deplodock.provisioning.ssh_transport] Downloading 'model-00030-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/ce9c6ca2e0c57f86b4ec98a2725f6f38d5886af94d4951fce282ce0b3b3c1dec.incomplete'
+[2026-03-04 17:58:19] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/ce9c6ca2e0c57f86b4ec98a2725f6f38d5886af94d4951fce282ce0b3b3c1dec
+[2026-03-04 17:58:19] [deplodock.provisioning.ssh_transport] Downloading 'model-00031-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/69e0054fffd16d7f7ef743d6db5a50efcdb3981092229c81ad0f44bd16183704.incomplete'
+[2026-03-04 17:58:26] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/69e0054fffd16d7f7ef743d6db5a50efcdb3981092229c81ad0f44bd16183704
+[2026-03-04 17:58:26] [deplodock.provisioning.ssh_transport] Downloading 'model-00032-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/b59cc011d44011b7814ad764470ea7dc54846ec4404751ed3421f3155503154c.incomplete'
+[2026-03-04 17:58:31] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/b59cc011d44011b7814ad764470ea7dc54846ec4404751ed3421f3155503154c
+[2026-03-04 17:58:31] [deplodock.provisioning.ssh_transport] Downloading 'model-00033-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/dfdac2e0770457ed5b49b7e9cf498c91a784c61ba13646f92e7dade7a6a3c636.incomplete'
+[2026-03-04 17:58:42] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/dfdac2e0770457ed5b49b7e9cf498c91a784c61ba13646f92e7dade7a6a3c636
+[2026-03-04 17:58:42] [deplodock.provisioning.ssh_transport] Downloading 'model-00034-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/3dc60cb85567bf1d1f1e7e6f5e5a34e42d5e4e5e4983ac12d1aee1b899b84e69.incomplete'
+[2026-03-04 17:58:48] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/3dc60cb85567bf1d1f1e7e6f5e5a34e42d5e4e5e4983ac12d1aee1b899b84e69
+[2026-03-04 17:58:48] [deplodock.provisioning.ssh_transport] Downloading 'model-00035-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/6a302b467f63f704626f7ca5cb528e395002fc64718d8d77c65a1d197f9b2275.incomplete'
+[2026-03-04 17:58:52] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/6a302b467f63f704626f7ca5cb528e395002fc64718d8d77c65a1d197f9b2275
+[2026-03-04 17:58:52] [deplodock.provisioning.ssh_transport] Downloading 'model-00036-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/093fb4c1cc509039c693d60f0c73ef32756f15769dad7d5f9b0a94796b64263b.incomplete'
+[2026-03-04 17:58:57] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/093fb4c1cc509039c693d60f0c73ef32756f15769dad7d5f9b0a94796b64263b
+[2026-03-04 17:58:57] [deplodock.provisioning.ssh_transport] Downloading 'model-00037-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/859ba58bd90503512f9d4c9bbc7765b6de69774d8337daf70edf43ebba69dbc5.incomplete'
+[2026-03-04 17:59:02] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/859ba58bd90503512f9d4c9bbc7765b6de69774d8337daf70edf43ebba69dbc5
+[2026-03-04 17:59:02] [deplodock.provisioning.ssh_transport] Downloading 'model-00038-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/8ab001453b89e4312ea0ee5191e0da4012f9e770946fb7884788cec5b98428a9.incomplete'
+[2026-03-04 17:59:07] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/8ab001453b89e4312ea0ee5191e0da4012f9e770946fb7884788cec5b98428a9
+[2026-03-04 17:59:07] [deplodock.provisioning.ssh_transport] Downloading 'model-00039-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/4beb85e677e9e2982b7e5b1371151a31ef679ecc715257897c88982441692cad.incomplete'
+[2026-03-04 17:59:12] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/4beb85e677e9e2982b7e5b1371151a31ef679ecc715257897c88982441692cad
+[2026-03-04 17:59:12] [deplodock.provisioning.ssh_transport] Downloading 'model-00040-of-00040.safetensors' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/9db4ee4a0f2aa63f3fdb981bdccd7f933ae5ce4305257e4755fd4a097a12afb8.incomplete'
+[2026-03-04 17:59:16] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/9db4ee4a0f2aa63f3fdb981bdccd7f933ae5ce4305257e4755fd4a097a12afb8
+[2026-03-04 17:59:16] [deplodock.provisioning.ssh_transport] Downloading 'model.safetensors.index.json' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/0ac9834aa1e30eb60d921d25e1755f97e92dfd47cf74ac2613e474243adcc4cf.incomplete'
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/0ac9834aa1e30eb60d921d25e1755f97e92dfd47cf74ac2613e474243adcc4cf
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Downloading 'qwen3_coder_detector_sgl.py' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/9dd77903d429ba0e6a32cd6df5f916b793cacec6.incomplete'
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/9dd77903d429ba0e6a32cd6df5f916b793cacec6
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Downloading 'qwen3coder_tool_parser_vllm.py' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/9914977e5d80ba4d94b78c248b5f5005d4916d74.incomplete'
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/9914977e5d80ba4d94b78c248b5f5005d4916d74
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Downloading 'tokenizer.json' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/90c73275ae7b61cd2b6c4f263018057d516f0c95.incomplete'
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/90c73275ae7b61cd2b6c4f263018057d516f0c95
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Downloading 'tokenizer_config.json' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/46884e3ddb4376bd1319321ac71a0a442d4258d0.incomplete'
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/46884e3ddb4376bd1319321ac71a0a442d4258d0
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Downloading 'vocab.json' to '/hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/4783fe10ac3adce15ac8f358ef5462739852c569.incomplete'
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] Download complete. Moving file to /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/blobs/4783fe10ac3adce15ac8f358ef5462739852c569
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-03-04 17:59:17] [deplodock.provisioning.ssh_transport] /hf_models/hub/models--Qwen--Qwen3-Coder-Next-FP8/snapshots/da6e2ed27304dd39abadd9c82ef50e8de67bdd4c
+[2026-03-04 17:59:25] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-03-04 17:59:25] [deplodock.provisioning.ssh_transport] Warning: Permanently added '35.224.18.152' (ED25519) to the list of known hosts.
+[2026-03-04 17:59:26] [deplodock.deploy.orchestrate] Starting services...
+[2026-03-04 17:59:26] [deplodock.provisioning.ssh_transport] Warning: Permanently added '35.224.18.152' (ED25519) to the list of known hosts.
+[2026-03-04 17:59:26] [deplodock.provisioning.ssh_transport]  Network deploy_default Creating 
+[2026-03-04 17:59:26] [deplodock.provisioning.ssh_transport]  Network deploy_default Created 
+[2026-03-04 17:59:26] [deplodock.provisioning.ssh_transport]  Container vllm_0 Creating 
+[2026-03-04 17:59:27] [deplodock.provisioning.ssh_transport]  Container vllm_0 Created 
+[2026-03-04 17:59:27] [deplodock.provisioning.ssh_transport]  Container vllm_0 Starting 
+[2026-03-04 17:59:27] [deplodock.provisioning.ssh_transport]  Container vllm_0 Started 
+[2026-03-04 17:59:27] [deplodock.provisioning.ssh_transport]  Container vllm_0 Waiting 
+[2026-03-04 18:02:08] [deplodock.provisioning.ssh_transport]  Container vllm_0 Healthy 
+[2026-03-04 18:02:08] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-04 18:02:08] [deplodock.provisioning.ssh_transport] Warning: Permanently added '35.224.18.152' (ED25519) to the list of known hosts.
+[2026-03-04 18:02:09] [deplodock.deploy.orchestrate] 
+Endpoint: http://35.224.18.152:8000/v1
+[2026-03-04 18:02:09] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-03-04 18:02:09] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-04 18:02:09] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-04 18:02:09] [deplodock.deploy.orchestrate] 
+Running smoke test...
