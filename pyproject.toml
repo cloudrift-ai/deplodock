@@ -15,7 +15,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
-dev = ["pytest", "pytest-asyncio", "ruff"]
+plot = ["matplotlib"]
+dev = ["pytest", "pytest-asyncio", "ruff", "matplotlib"]
 
 [tool.setuptools.packages.find]
 include = ["deplodock*"]

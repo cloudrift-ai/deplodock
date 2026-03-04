@@ -23,6 +23,7 @@ Tools for deploying and benchmarking LLM inference on GPU servers. Supports **vL
 - [docs/](docs/) — Technical notes and engine-specific guides
   - [sglang-awq-moe.md](docs/sglang-awq-moe.md) — SGLang quantization for AWQ MoE models
 - [tests/](tests/) — pytest tests (see [ARCHITECTURE.md](tests/ARCHITECTURE.md))
+- [scripts/](scripts/) — Analysis and visualization scripts
 - [utils/](utils/) — Standalone utility scripts
 - [config.yaml](config.yaml) — Benchmark configuration
 - [Makefile](Makefile) — Build automation

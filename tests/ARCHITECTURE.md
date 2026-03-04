@@ -33,6 +33,8 @@ tests/
 │   ├── test_cloudrift.py    # CloudRift API helpers
 │   ├── test_gcp.py             # GCP command builders
 │   └── test_vm_dryrun.py    # vm create/delete CLI dry-run
+├── scripts/
+│   └── test_plot_mcr_sweep.py  # load_results() from scripts/plot_mcr_sweep.py
 ```
 
 ## Test Layers
@@ -58,6 +60,7 @@ Test individual functions in isolation with synthetic inputs.
 | `benchmark/test_results.py` | `parse_benchmark_metrics()`, `parse_system_info()`, `compose_json_result()` — structured JSON result parsing and composition |
 | `provisioning/test_cloudrift.py` | `deplodock.provisioning.cloudrift._api_request()`, `_rent_instance()`, etc. — CloudRift API helpers |
 | `provisioning/test_gcp.py` | `deplodock.provisioning.gcp._gcloud_*_cmd()` — GCP command builders |
+| `scripts/test_plot_mcr_sweep.py` | `load_results()` — benchmark JSON loading and sorting from `scripts/plot_mcr_sweep.py` |
 
 Unit tests use **fixtures from `conftest.py`** (`tmp_recipe_dir`, `sample_config`, `sample_config_multi`) to supply pre-built recipe directories and config dicts.
 
