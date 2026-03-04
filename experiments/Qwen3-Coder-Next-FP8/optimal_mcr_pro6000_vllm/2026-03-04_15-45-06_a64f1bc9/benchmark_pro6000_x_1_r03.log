@@ -5576,3 +5576,36 @@ scp: Connection closed
 [2026-03-04 16:37:35] [pro6000_x_1_r03.Qwen3-Coder-Next-FP8] Deploying model...
 [2026-03-04 16:37:46] [deplodock.provisioning.ssh_transport] ssh: connect to host 136.114.222.27 port 22: Connection timed out
 [2026-03-04 16:37:46] [deplodock.deploy.orchestrate] Failed to pull images
+[2026-03-04 16:37:46] [deplodock.commands.bench.committer] Committed: bench: fail optimal_mcr_pro6000_vllm/pro6000x1_mc48_np80_mcr48
+[2026-03-04 16:37:47] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-04 16:38:17] [deplodock.provisioning.ssh_transport]  Container vllm_0 Healthy 
+[2026-03-04 16:38:17] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-04 16:38:18] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.59.248.64' (ED25519) to the list of known hosts.
+[2026-03-04 16:38:18] [deplodock.deploy.orchestrate] 
+Endpoint: http://34.59.248.64:8000/v1
+[2026-03-04 16:38:18] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3-Coder-Next-FP8
+[2026-03-04 16:38:18] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-04 16:38:18] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-04 16:38:18] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-03-04 16:39:19] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-04 16:39:19] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-04 16:39:19] [deplodock.deploy.orchestrate]   curl http://34.59.248.64:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3-Coder-Next-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-04 16:39:49] [deplodock.provisioning.ssh_transport] Failed to SCP docker-compose.yaml to runner@35.194.19.204:~/deploy/docker-compose.yaml: ssh: connect to host 35.194.19.204 port 22: Connection timed out
+scp: Connection closed
+
+[2026-03-04 16:39:49] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 16:40:01] [deplodock.provisioning.ssh_transport] Failed to SCP docker-compose.yaml to runner@136.114.222.27:~/deploy/docker-compose.yaml: ssh: connect to host 136.114.222.27 port 22: Connection timed out
+scp: Connection closed
+
+[2026-03-04 16:40:01] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-04 16:42:04] [deplodock.provisioning.ssh_transport] ssh: connect to host 35.194.19.204 port 22: Connection timed out
+[2026-03-04 16:42:04] [deplodock.deploy.orchestrate] Failed to pull images
+[2026-03-04 16:42:04] [pro6000_x_1_r03.Qwen3-Coder-Next-FP8] Deploy failed, skipping benchmark
