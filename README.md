@@ -8,7 +8,7 @@
   <a href="https://discord.gg/cloudrift"><img src="https://img.shields.io/discord/1150997934113030174?label=Discord" alt="Discord"></a>
 </p>
 
-Tools for deploying and benchmarking LLM inference on GPU servers. Supports **vLLM** and **SGLang** engines.
+Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLang**. Chose from a list of optimized recipes for popular models or create your own with custom configurations. Run benchmarks across different GPU types and configurations, track results, and share experiments with the community.
 
 ## Project Structure
 
