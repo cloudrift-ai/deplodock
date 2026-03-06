@@ -7,7 +7,20 @@ task_id + pass/fail status based on whether the result file exists.
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
+
+
+def _is_tracked_in_git(path: Path) -> bool:
+    """Check if a file is tracked (committed) in git."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(path)],
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
 
 
 def find_latest_run_dir(experiment_dir: str) -> Path | None:
@@ -51,9 +64,14 @@ def format_comment(experiments: list[str]) -> str:
         for t in tasks:
             task_id = t.get("task_id", t.get("result_file", "unknown"))
             result_path = run_dir / t["result_file"]
-            if result_path.exists():
+            in_git = _is_tracked_in_git(result_path)
+            if in_git:
                 any_results = True
                 lines.append(f"| `{task_id}` | pass |")
+            elif result_path.exists():
+                any_results = True
+                all_succeeded = False
+                lines.append(f"| `{task_id}` | pass (uncommitted) |")
             else:
                 all_succeeded = False
                 lines.append(f"| `{task_id}` | fail |")

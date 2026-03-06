@@ -44,6 +44,12 @@ class GitCommitter:
 
             logger.info(f"Committed: {message}")
 
+            # Pull --rebase before push to handle concurrent updates
+            rc, _, stderr = await run_shell_cmd(["git", "pull", "--rebase"], timeout=60)
+            if rc != 0:
+                logger.warning(f"git pull --rebase failed: {stderr}")
+                return
+
             # Push (warn on failure, never raise)
             rc, _, stderr = await run_shell_cmd(["git", "push"], timeout=60)
             if rc != 0:
