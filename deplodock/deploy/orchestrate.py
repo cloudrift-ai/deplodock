@@ -63,7 +63,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
         f" {image}"
         f" -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
     )
-    rc, _, _ = await run_cmd(dl_cmd, timeout=3600, log_output=True)
+    rc, _, _ = await run_cmd(dl_cmd, timeout=7200, log_output=True)
     if rc != 0:
         logger.error("Failed to download model")
         return False
@@ -115,7 +115,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
         smoke_cmd = (
             f"curl -s http://localhost:{port}/v1/chat/completions"
             f" -H 'Content-Type: application/json'"
-            f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":16}}' '''
+            f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":128}}' '''
         )
         smoke_timeout = 600
         smoke_interval = 10
@@ -128,9 +128,13 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
                 continue
             try:
                 body = json.loads(stdout)
-                answer = body["choices"][0]["message"]["content"]
-            except (json.JSONDecodeError, KeyError, IndexError):
+                message = body["choices"][0]["message"]
+                answer = message.get("content") or message.get("reasoning_content") or message.get("reasoning") or ""
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                 # Malformed response, server may still be starting
+                await asyncio.sleep(smoke_interval)
+                continue
+            if not answer:
                 await asyncio.sleep(smoke_interval)
                 continue
             if "4" in answer:

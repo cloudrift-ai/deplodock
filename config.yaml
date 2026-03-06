@@ -15,11 +15,14 @@ pricing:
 # Provider-specific configuration
 providers:
   gcp:
-    zone: "us-central1-b"
-    provisioning_model: "SPOT"
+    create_timeout_spot: 600
+    create_timeout_flex_start: 14400
     image_family: "common-cu128-ubuntu-2204-nvidia-570"
     image_project: "deeplearning-platform-release"
     boot_disk_size: "2000GB"
     tags: "ssh"
     # service_account: defaults to $GCP_SERVICE_ACCOUNT env var
-  # cloudrift: uses CLOUDRIFT_API_KEY env var
+  cloudrift:
+    # API key: defaults to $CLOUDRIFT_API_KEY env var
+    image_url_nvidia: "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
+    image_url_amd: "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-rocm-64-20260220-025112.img"
