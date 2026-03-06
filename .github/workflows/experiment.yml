@@ -245,14 +245,13 @@ jobs:
 
           # Force-add any uncommitted results (catch-up for anything missed)
           git add --force $result_files
-          if git diff --cached --quiet; then
-            echo "No new results to commit"
-            exit 0
-          fi
-
-          git commit -m "bench: collect remaining results
+          if ! git diff --cached --quiet; then
+            git commit -m "bench: collect remaining results
 
           Triggered by /run-experiment in PR #${{ needs.gate.outputs.pr_number }}"
+          fi
+
+          # Always push — catches any unpushed per-task commits
           git push || echo "::warning::Failed to push results to PR branch (fork may not allow edits from maintainers)"
 
       - name: Format result comment
