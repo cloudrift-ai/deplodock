@@ -2471,3 +2471,27 @@ Example curl:
     }'
 [2026-03-06 19:17:25] [b200_x_4.Kimi-K2.5-NVFP4] Running benchmark...
 [2026-03-06 19:21:17] [b200_x_4.Kimi-K2.5-NVFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-NVFP4/baseline/2026-03-06_18-47-45_bbafd46d/b200x4_vllm_benchmark.txt
+[2026-03-06 19:21:17] [deplodock.commands.bench.committer] Committed: bench: pass baseline/b200x4
+[2026-03-06 19:21:19] [deplodock.commands.bench.committer] Pushed results to remote
+[2026-03-06 19:21:19] [b200_x_4.Kimi-K2.5-NVFP4] Tearing down...
+[2026-03-06 19:21:19] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-06 19:21:20] [deplodock.provisioning.ssh_transport] Warning: Permanently added '136.110.47.62' (ED25519) to the list of known hosts.
+[2026-03-06 19:21:21] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-06 19:21:27] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-06 19:21:27] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-06 19:21:27] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-06 19:21:27] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-06 19:21:27] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-06 19:21:27] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-06 19:21:27] [b200_x_4] Deleting VM...
+[2026-03-06 19:21:27] [deplodock.provisioning.gcp] Deleting instance 'bench-b200-x-4' in zone 'asia-southeast1-b'...
+[2026-03-06 19:23:36] [deplodock.provisioning.gcp] Instance deleted.
+[2026-03-06 19:23:36] [b200_x_4] VM deleted.
+[2026-03-06 19:23:36] [b200_x_4] Completed group: b200_x_4
+[2026-03-06 19:23:36] [root] 
+[2026-03-06 19:23:36] [root] SUMMARY
+[2026-03-06 19:23:36] [root] Successful: 1/1
+[2026-03-06 19:23:36] [root]    - baseline/b200x4
+[2026-03-06 19:23:36] [root] 
+[2026-03-06 19:23:36] [root] All done!
+[2026-03-06 19:23:36] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-NVFP4/baseline/2026-03-06_18-47-45_bbafd46d/benchmark.log
