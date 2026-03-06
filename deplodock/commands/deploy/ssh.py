@@ -54,4 +54,5 @@ def register_ssh_target(subparsers):
     parser.add_argument("--server", required=True, help="SSH address (user@host)")
     parser.add_argument("--ssh-key", default="~/.ssh/id_ed25519", help="SSH key path")
     parser.add_argument("--ssh-port", type=int, default=22, help="SSH port")
+    parser.add_argument("--gpu", default=None, help="Override recipe GPU type")
     parser.set_defaults(func=handle_ssh)

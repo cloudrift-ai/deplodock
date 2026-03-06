@@ -9,7 +9,14 @@ import logging
 import os
 import shlex
 
-from deplodock.hardware import DEFAULT_GCP_PROVISIONING_MODEL, DEFAULT_GCP_ZONE, GPU_GCP_PROVISIONING_MODEL, GPU_GCP_ZONES, GPU_INSTANCE_TYPES, resolve_instance_type
+from deplodock.hardware import (
+    DEFAULT_GCP_PROVISIONING_MODEL,
+    DEFAULT_GCP_ZONE,
+    GPU_GCP_PROVISIONING_MODEL,
+    GPU_GCP_ZONES,
+    GPU_INSTANCE_TYPES,
+    resolve_instance_type,
+)
 from deplodock.provisioning import cloudrift as cr_provider
 from deplodock.provisioning import gcp as gcp_provider
 

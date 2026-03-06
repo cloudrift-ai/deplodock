@@ -54,12 +54,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
 
         if is_amd:
             gpu_section = (
-                "    devices:\n"
-                "      - /dev/kfd:/dev/kfd\n"
-                "      - /dev/dri:/dev/dri\n"
-                "    group_add:\n"
-                "      - video\n"
-                "      - render"
+                "    devices:\n      - /dev/kfd:/dev/kfd\n      - /dev/dri:/dev/dri\n    group_add:\n      - video\n      - render"
             )
         else:
             gpu_section = (
