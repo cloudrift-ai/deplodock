@@ -210,7 +210,7 @@ async def create_instance(
         image_project=image_project,
         extra_gcloud_args=extra_gcloud_args,
     )
-    rc, stdout, stderr = await run_shell_cmd(cmd, dry_run=dry_run)
+    rc, stdout, stderr = await run_shell_cmd(cmd, dry_run=dry_run, timeout=timeout)
     if rc != 0:
         logger.error(f"Failed to create instance: {stderr.strip()}")
         return None

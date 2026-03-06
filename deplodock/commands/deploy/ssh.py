@@ -22,6 +22,8 @@ def handle_ssh(args):
 
 async def _handle_ssh(args):
     recipe = load_recipe(args.recipe)
+    if args.gpu:
+        recipe.deploy.gpu = args.gpu
     params = DeployParams(
         server=args.server,
         ssh_key=args.ssh_key,
@@ -31,7 +33,8 @@ async def _handle_ssh(args):
         hf_token=args.hf_token or os.environ.get("HF_TOKEN", ""),
         dry_run=args.dry_run,
     )
-    await provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    skip_nvidia = recipe.deploy.gpu is not None and recipe.deploy.gpu.startswith("AMD")
+    await provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run, skip_nvidia=skip_nvidia)
 
     if args.teardown:
         return await teardown_entry(params)

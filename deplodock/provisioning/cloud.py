@@ -9,7 +9,7 @@ import logging
 import os
 import shlex
 
-from deplodock.hardware import GPU_INSTANCE_TYPES, resolve_instance_type
+from deplodock.hardware import DEFAULT_GCP_PROVISIONING_MODEL, DEFAULT_GCP_ZONE, GPU_GCP_PROVISIONING_MODEL, GPU_GCP_ZONES, GPU_INSTANCE_TYPES, resolve_instance_type
 from deplodock.provisioning import cloudrift as cr_provider
 from deplodock.provisioning import gcp as gcp_provider
 
@@ -83,7 +83,7 @@ async def provision_cloud_vm(
     logger.info(f"GPU: {gpu_name} x{gpu_count} -> {provider} {instance_type}")
 
     for attempt in range(1, max_retries + 1):
-        conn = await _provision_once(provider, instance_type, gpu_count, ssh_key, providers_config, server_name, dry_run, logger)
+        conn = await _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key, providers_config, server_name, dry_run, logger)
         if conn is not None or dry_run:
             return conn
 
@@ -96,7 +96,7 @@ async def provision_cloud_vm(
     return None
 
 
-async def _provision_once(provider, instance_type, gpu_count, ssh_key, providers_config, server_name, dry_run, logger):
+async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key, providers_config, server_name, dry_run, logger):
     """Single provisioning attempt for a cloud VM. Returns VMConnectionInfo or None."""
     if provider == "cloudrift":
         api_key = os.environ.get("CLOUDRIFT_API_KEY")
@@ -108,6 +108,11 @@ async def _provision_once(provider, instance_type, gpu_count, ssh_key, providers
         if dry_run:
             logger.info(f"[dry-run] create instance type={instance_type} ssh_key={pub_key_path}")
 
+        cr_config = (providers_config or {}).get("cloudrift", {})
+        is_amd = gpu_name.startswith("AMD")
+        image_url = cr_config.get("image_url_amd") if is_amd else cr_config.get("image_url_nvidia")
+        image_kwargs = {"image_url": image_url} if image_url else {}
+
         conn = await cr_provider.create_instance(
             api_key=api_key or "",
             instance_type=instance_type,
@@ -118,13 +123,15 @@ async def _provision_once(provider, instance_type, gpu_count, ssh_key, providers
             fail_statuses={"Inactive"},
             wait_ssh=True,
             ssh_private_key_path=ssh_key,
+            **image_kwargs,
         )
         return conn
 
     elif provider == "gcp":
         gcp_config = (providers_config or {}).get("gcp", {})
-        zone = gcp_config.get("zone", "us-central1-b")
-        provisioning_model = gcp_config.get("provisioning_model", "FLEX_START")
+        gpu_zones = GPU_GCP_ZONES.get(gpu_name)
+        zone = gpu_zones[0] if gpu_zones else DEFAULT_GCP_ZONE
+        provisioning_model = GPU_GCP_PROVISIONING_MODEL.get(gpu_name, DEFAULT_GCP_PROVISIONING_MODEL)
         ssh_user = gcp_config.get("ssh_user", os.environ.get("USER", "deploy"))
         raw_name = f"bench-{server_name}" if server_name else "bench-vm"
         instance_name = raw_name.lower().replace("_", "-")
@@ -169,6 +176,11 @@ async def _provision_once(provider, instance_type, gpu_count, ssh_key, providers
 
         extra_gcloud_args = " ".join(extra_parts) if extra_parts else None
 
+        if provisioning_model == "FLEX_START":
+            create_timeout = gcp_config.get("create_timeout_flex_start", 14400)
+        else:
+            create_timeout = gcp_config.get("create_timeout_spot", 600)
+
         conn = await gcp_provider.create_instance(
             instance=instance_name,
             zone=zone,
@@ -177,6 +189,7 @@ async def _provision_once(provider, instance_type, gpu_count, ssh_key, providers
             image_family=image_family,
             image_project=image_project,
             extra_gcloud_args=extra_gcloud_args,
+            timeout=create_timeout,
             wait_ssh=True,
             dry_run=dry_run,
         )

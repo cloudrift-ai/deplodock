@@ -31,6 +31,8 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
     command_str = "\n      ".join(engine_args)
     extra_env_lines = "".join(f"\n      - {k}={v}" for k, v in llm.extra_env.items())
 
+    is_amd = recipe.deploy.gpu is not None and recipe.deploy.gpu.startswith("AMD")
+
     services = "services:\n"
 
     for i in range(num_instances):
@@ -49,17 +51,32 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
             port = 8000 + i
 
         entrypoint_line = f"\n    entrypoint: {entrypoint}" if entrypoint else ""
+
+        if is_amd:
+            gpu_section = (
+                "    devices:\n"
+                "      - /dev/kfd:/dev/kfd\n"
+                "      - /dev/dri:/dev/dri\n"
+                "    group_add:\n"
+                "      - video\n"
+                "      - render"
+            )
+        else:
+            gpu_section = (
+                "    deploy:\n"
+                "      resources:\n"
+                "        reservations:\n"
+                "          devices:\n"
+                f"            - driver: nvidia\n"
+                f"              {gpu_config}\n"
+                "              capabilities: [gpu]"
+            )
+
         services += f"""
   {engine}_{i}:
     image: {image}
     container_name: {engine}_{i}{entrypoint_line}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              {gpu_config}
-              capabilities: [gpu]
+{gpu_section}
     volumes:
       - {model_dir}:{model_dir}
     environment:

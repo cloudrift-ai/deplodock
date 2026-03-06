@@ -71,6 +71,21 @@ GPU_SHORT_NAMES = {
 }
 
 
+# GCP zones per GPU, tried in order. Falls back to config default.
+DEFAULT_GCP_ZONE = "us-central1-b"
+GPU_GCP_ZONES = {
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": ["us-central1-b"],
+    "NVIDIA H200 141GB": ["europe-west1-b", "europe-west4-a"],
+    "NVIDIA B200": ["asia-southeast1-b", "asia-northeast1-b"],
+}
+
+# GCP provisioning model per GPU. Default is FLEX_START.
+DEFAULT_GCP_PROVISIONING_MODEL = "FLEX_START"
+GPU_GCP_PROVISIONING_MODEL = {
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": "SPOT",
+}
+
+
 def gpu_short_name(full_name):
     """Map a full GPU name to a short name for filenames.
 
@@ -83,10 +98,25 @@ def gpu_short_name(full_name):
     return re.sub(r"[^a-z0-9]", "", full_name.lower())
 
 
+# GCP base type -> sorted list of available GPU counts.
+# Used to find the smallest instance that fits the requested gpu_count.
+GCP_AVAILABLE_GPU_COUNTS = {
+    "a4-highgpu": [8],
+}
+
+
 def resolve_instance_type(provider, base, gpu_count):
-    """Derive full instance type name from base name and GPU count."""
+    """Derive full instance type name from base name and GPU count.
+
+    For GCP, if the exact gpu_count is not available for the base type,
+    uses the smallest available count that is >= gpu_count.
+    """
     if provider == "cloudrift":
         return f"{base}.{gpu_count}"
     if base == "g4-standard":
         return f"g4-standard-{gpu_count * 48}"
+    available = GCP_AVAILABLE_GPU_COUNTS.get(base)
+    if available:
+        actual = next((c for c in available if c >= gpu_count), available[-1])
+        return f"{base}-{actual}g"
     return f"{base}-{gpu_count}g"
