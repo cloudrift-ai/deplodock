@@ -228,10 +228,10 @@ deplodock deploy ssh --recipe <path> --server user@host [--dry-run]
 
 ### Cloud
 
-Provisions a cloud VM based on recipe GPU requirements (from the `deploy` section), then deploys via SSH.
+Provisions a cloud VM and deploys via SSH. Requires `--gpu` and `--gpu-count` to select the matching matrix entry from the recipe.
 
 ```bash
-deplodock deploy cloud --recipe <path> [--name <vm-name>] [--dry-run]
+deplodock deploy cloud --recipe <path> --gpu "NVIDIA GeForce RTX 5090" --gpu-count 1 [--dry-run]
 ```
 
 ### Hardware-Aware Deploy
@@ -261,10 +261,12 @@ When deploying locally or via SSH, deplodock auto-detects the target GPU by scan
 
 ### Cloud-only Flags
 
-| Flag        | Required  | Default             | Description          |
-|-------------|-----------|---------------------|----------------------|
-| `--name`    | No        | `cloud-deploy`      | VM name prefix       |
-| `--ssh-key` | No        | `~/.ssh/id_ed25519` | SSH private key path |
+| Flag          | Required  | Default             | Description                            |
+|---------------|-----------|---------------------|----------------------------------------|
+| `--gpu`       | Yes       | -                   | GPU name (selects matching matrix entry)|
+| `--gpu-count` | Yes       | -                   | GPU count (selects matching matrix entry)|
+| `--name`      | No        | `cloud-deploy`      | VM name prefix                         |
+| `--ssh-key`   | No        | `~/.ssh/id_ed25519` | SSH private key path                   |
 
 ## VM Management
 
