@@ -73,7 +73,7 @@ def tmp_recipe_dir(tmp_path):
                 "gpu_memory_utilization": 0.9,
                 "context_length": 8192,
                 "vllm": {
-                    "image": "vllm/vllm-openai:latest",
+                    "image": "vllm/vllm-openai:v0.17.0",
                 },
             }
         },
@@ -125,7 +125,7 @@ def sample_config():
                 "gpu_memory_utilization": 0.9,
                 "context_length": 8192,
                 "vllm": {
-                    "image": "vllm/vllm-openai:latest",
+                    "image": "vllm/vllm-openai:v0.17.0",
                 },
             }
         },
@@ -150,7 +150,7 @@ def sample_config_sglang():
                 "gpu_memory_utilization": 0.9,
                 "context_length": 8192,
                 "sglang": {
-                    "image": "lmsysorg/sglang:latest",
+                    "image": "lmsysorg/sglang:v0.5.9",
                 },
             }
         },
@@ -175,7 +175,7 @@ def sample_config_multi():
                 "gpu_memory_utilization": 0.9,
                 "context_length": 16384,
                 "vllm": {
-                    "image": "vllm/vllm-openai:latest",
+                    "image": "vllm/vllm-openai:v0.17.0",
                 },
             }
         },

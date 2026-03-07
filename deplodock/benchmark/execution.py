@@ -174,7 +174,7 @@ async def run_execution_group(
 
             task_logger.info("Running benchmark...")
             run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
-            bench_success, output, bench_command = await run_benchmark_workload(
+            bench_success, output, stderr, bench_command = await run_benchmark_workload(
                 run_cmd,
                 recipe,
                 dry_run=dry_run,
@@ -197,6 +197,8 @@ async def run_execution_group(
                 task_logger.error("Benchmark failed")
                 if output:
                     task_logger.error(output)
+                if stderr:
+                    task_logger.error(stderr)
                 task_results.append((task, False))
                 await _invoke_callback(on_task_done, task, False, task_logger)
 

@@ -37,7 +37,7 @@ def test_compact_value_plain_number():
 
 
 def test_compact_value_docker_image():
-    assert _compact_value("lmsysorg/sglang:latest") == "lms-sglang-latest"
+    assert _compact_value("lmsysorg/sglang:v0.5.9") == "lms-sglang-v0.5.9"
 
 
 def test_compact_value_cli_flags():
@@ -55,7 +55,7 @@ def test_compact_value_keeps_digit_segments():
 
 def test_compact_value_known_abbreviations():
     """Known words use their dictionary abbreviation."""
-    assert _compact_value("vllm/vllm-openai:latest") == "vllm-vllm-oai-latest"
+    assert _compact_value("vllm/vllm-openai:v0.17.0") == "vllm-vllm-oai-v0.17.0"
 
 
 def test_compact_value_kv_cache_dtype():
@@ -132,7 +132,7 @@ def test_str_compacts_slashes_and_spaces():
         params={
             "deploy.gpu": "NVIDIA GeForce RTX 5090",
             "deploy.gpu_count": 1,
-            "engine.llm.sglang.image": "lmsysorg/sglang:latest",
+            "engine.llm.sglang.image": "lmsysorg/sglang:v0.5.9",
             "engine.llm.sglang.extra_args": "--quantization moe_wna16",
         }
     )
@@ -140,7 +140,7 @@ def test_str_compacts_slashes_and_spaces():
     assert "/" not in result
     assert " " not in result
     assert ":" not in result
-    assert result == "rtx5090x1_eaquant-moe-wna16_ilms-sglang-latest"
+    assert result == "rtx5090x1_eaquant-moe-wna16_ilms-sglang-v0.5.9"
 
 
 def test_str_compacts_docker_image():
@@ -149,12 +149,12 @@ def test_str_compacts_docker_image():
         params={
             "deploy.gpu": "NVIDIA GeForce RTX 5090",
             "deploy.gpu_count": 1,
-            "engine.llm.vllm.image": "vllm/vllm-openai:latest",
+            "engine.llm.vllm.image": "vllm/vllm-openai:v0.17.0",
         }
     )
     result = str(v)
     assert "/" not in result
-    assert result == "rtx5090x1_ivllm-vllm-oai-latest"
+    assert result == "rtx5090x1_ivllm-vllm-oai-v0.17.0"
 
 
 # ── Variant.gpu_short ────────────────────────────────────────────

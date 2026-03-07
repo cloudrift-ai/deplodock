@@ -18,7 +18,7 @@ benchmark:
 matrices:
   - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
-    engine.llm.vllm.image: "vllm/vllm-openai:latest"
+    engine.llm.vllm.image: "vllm/vllm-openai:v0.17.0"
   - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
     engine.llm.sglang.image: "lmsysorg/sglang:dev-cu13"

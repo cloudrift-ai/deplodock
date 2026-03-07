@@ -43,7 +43,7 @@ def test_compose_omits_unset_named_fields():
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
                 "vllm": {
-                    "image": "vllm/vllm-openai:latest",
+                    "image": "vllm/vllm-openai:v0.17.0",
                 },
             }
         },
@@ -173,7 +173,7 @@ def test_compose_sglang_single_instance(sample_config_sglang):
 
     assert "sglang_0:" in result
     assert "vllm_0:" not in result
-    assert "lmsysorg/sglang:latest" in result
+    assert "lmsysorg/sglang:v0.5.9" in result
     assert "entrypoint: python3 -m sglang.launch_server" in result
     assert "--model-path test-org/test-model" in result
     assert "--model test-org/test-model" not in result

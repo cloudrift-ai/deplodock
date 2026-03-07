@@ -180,7 +180,7 @@ def _make_task(tmp_path: Path) -> BenchmarkTask:
             "engine": {
                 "llm": {
                     "context_length": 8192,
-                    "vllm": {"image": "vllm/vllm-openai:latest"},
+                    "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
                 }
             },
             "benchmark": {"max_concurrency": 8, "num_prompts": 80},
@@ -207,7 +207,7 @@ def test_compose_json_result(tmp_path):
     result = compose_json_result(
         task,
         benchmark_output=BENCHMARK_OUTPUT_FULL,
-        compose_content="services:\n  vllm_0:\n    image: vllm/vllm-openai:latest",
+        compose_content="services:\n  vllm_0:\n    image: vllm/vllm-openai:v0.17.0",
         bench_command="vllm bench serve --model test-org/test-model",
         system_info_raw=SYSTEM_INFO_RAW,
     )

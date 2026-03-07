@@ -14,7 +14,7 @@ def test_deploy_cloud_dry_run(run_cli, tmp_path):
         "engine": {
             "llm": {
                 "tensor_parallel_size": 1,
-                "vllm": {"image": "vllm/vllm-openai:latest"},
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
             }
         },
         "deploy": {
@@ -42,7 +42,7 @@ def test_deploy_cloud_dry_run_deploy_steps(run_cli, tmp_path):
         "engine": {
             "llm": {
                 "tensor_parallel_size": 1,
-                "vllm": {"image": "vllm/vllm-openai:latest"},
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
             }
         },
         "deploy": {

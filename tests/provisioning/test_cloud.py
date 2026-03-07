@@ -26,7 +26,7 @@ def test_resolve_vm_spec_single_recipe(tmp_path):
         "engine": {
             "llm": {
                 "tensor_parallel_size": 1,
-                "vllm": {"image": "vllm/vllm-openai:latest"},
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
             }
         },
         "deploy": {
@@ -49,7 +49,7 @@ def test_resolve_vm_spec_max_gpu_count(tmp_path):
     r1.mkdir()
     recipe1 = {
         "model": {"huggingface": "test/model"},
-        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:latest"}}},
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
         "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
     }
     with open(r1 / "recipe.yaml", "w") as f:
@@ -59,7 +59,7 @@ def test_resolve_vm_spec_max_gpu_count(tmp_path):
     r2.mkdir()
     recipe2 = {
         "model": {"huggingface": "test/model"},
-        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:latest"}}},
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
         "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 2},
     }
     with open(r2 / "recipe.yaml", "w") as f:
@@ -80,7 +80,7 @@ def test_resolve_vm_spec_mixed_gpus_raises(tmp_path):
     r1.mkdir()
     recipe1 = {
         "model": {"huggingface": "test/model"},
-        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:latest"}}},
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
         "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
     }
     with open(r1 / "recipe.yaml", "w") as f:
@@ -90,7 +90,7 @@ def test_resolve_vm_spec_mixed_gpus_raises(tmp_path):
     r2.mkdir()
     recipe2 = {
         "model": {"huggingface": "test/model"},
-        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:latest"}}},
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
         "deploy": {"gpu": "NVIDIA H100 80GB", "gpu_count": 1},
     }
     with open(r2 / "recipe.yaml", "w") as f:
@@ -111,7 +111,7 @@ def test_resolve_vm_spec_missing_gpu_raises(tmp_path):
         "engine": {
             "llm": {
                 "tensor_parallel_size": 1,
-                "vllm": {"image": "vllm/vllm-openai:latest"},
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
             }
         },
     }

@@ -13,14 +13,14 @@ from deplodock.recipe import (
 
 def test_vllm_config_defaults():
     cfg = VllmConfig()
-    assert cfg.image == "vllm/vllm-openai:latest"
+    assert cfg.image == "vllm/vllm-openai:v0.17.0"
     assert cfg.extra_args == ""
     assert cfg.extra_env == {}
 
 
 def test_sglang_config_defaults():
     cfg = SglangConfig()
-    assert cfg.image == "lmsysorg/sglang:latest"
+    assert cfg.image == "lmsysorg/sglang:v0.5.9"
     assert cfg.extra_args == ""
     assert cfg.extra_env == {}
 
@@ -60,7 +60,7 @@ def test_llm_image_sglang():
 
 def test_llm_image_fallback():
     llm = LLMConfig()
-    assert llm.image == "vllm/vllm-openai:latest"
+    assert llm.image == "vllm/vllm-openai:v0.17.0"
 
 
 def test_llm_extra_args_vllm():
@@ -191,7 +191,7 @@ def test_from_dict_no_engine_section():
     recipe = Recipe.from_dict(d)
     assert recipe.engine.llm.engine_name == "vllm"
     assert recipe.engine.llm.vllm is None
-    assert recipe.engine.llm.image == "vllm/vllm-openai:latest"
+    assert recipe.engine.llm.image == "vllm/vllm-openai:v0.17.0"
 
 
 def test_from_dict_benchmark_defaults():
