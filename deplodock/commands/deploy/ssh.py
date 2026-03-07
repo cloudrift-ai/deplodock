@@ -33,7 +33,7 @@ async def _handle_ssh(args):
     logger.info(f"GPU: {gpu_count}x {gpu_name}")
 
     # Matrix resolution
-    recipe = resolve_for_hardware(args.recipe, gpu_name)
+    recipe = resolve_for_hardware(args.recipe, gpu_name, gpu_count)
 
     # Scale-out
     strategy_cls = STRATEGIES[args.scale_out_strategy]

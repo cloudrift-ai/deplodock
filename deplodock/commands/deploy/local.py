@@ -42,7 +42,7 @@ async def _handle_local(args):
     logger.info(f"GPU: {gpu_count}x {gpu_name}")
 
     # Matrix resolution
-    recipe = resolve_for_hardware(recipe_dir, gpu_name)
+    recipe = resolve_for_hardware(recipe_dir, gpu_name, gpu_count)
 
     # Scale-out
     strategy_cls = STRATEGIES[args.scale_out_strategy]

@@ -110,14 +110,75 @@ def test_validate_extra_args_multiple_banned():
 # ── resolve_for_hardware ──────────────────────────────────────────
 
 
-def test_resolve_for_hardware_exact_match(tmp_recipe_dir):
-    """Resolves the H200 matrix entry with correct overrides."""
+def test_resolve_for_hardware_name_only(tmp_recipe_dir):
+    """Without gpu_count, resolves first name match (H200 entry)."""
     recipe = resolve_for_hardware(tmp_recipe_dir, "NVIDIA H200 141GB")
     assert recipe.deploy.gpu == "NVIDIA H200 141GB"
     assert recipe.deploy.gpu_count == 8
     assert recipe.engine.llm.tensor_parallel_size == 8
     assert recipe.engine.llm.context_length == 16384
     assert recipe.engine.llm.extra_args == "--kv-cache-dtype fp8"
+
+
+def test_resolve_for_hardware_exact_count_match(tmp_recipe_dir):
+    """Exact name + count match selects the right entry."""
+    recipe = resolve_for_hardware(tmp_recipe_dir, "NVIDIA H100 80GB", 4)
+    assert recipe.deploy.gpu == "NVIDIA H100 80GB"
+    assert recipe.deploy.gpu_count == 4
+    assert recipe.engine.llm.tensor_parallel_size == 4
+
+
+def test_resolve_for_hardware_divisible_count(tmp_recipe_dir):
+    """gpu_count=8 with entry count=4 (8 % 4 == 0) selects divisible match."""
+    # tmp_recipe_dir has H100 entry with gpu_count=4
+    recipe = resolve_for_hardware(tmp_recipe_dir, "NVIDIA H100 80GB", 8)
+    assert recipe.deploy.gpu == "NVIDIA H100 80GB"
+    assert recipe.deploy.gpu_count == 4
+    assert recipe.engine.llm.tensor_parallel_size == 4
+
+
+def test_resolve_for_hardware_divisible_picks_largest(tmp_path):
+    """When multiple entries divide evenly, picks the largest entry count."""
+    recipe_data = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 1,
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+            }
+        },
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA H100 80GB",
+                "deploy.gpu_count": 1,
+            },
+            {
+                "deploy.gpu": "NVIDIA H100 80GB",
+                "deploy.gpu_count": 2,
+                "engine.llm.tensor_parallel_size": 2,
+            },
+            {
+                "deploy.gpu": "NVIDIA H100 80GB",
+                "deploy.gpu_count": 4,
+                "engine.llm.tensor_parallel_size": 4,
+            },
+        ],
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe_data, f)
+
+    # gpu_count=8 divides by 1, 2, and 4 — should pick 4 (largest)
+    recipe = resolve_for_hardware(str(tmp_path), "NVIDIA H100 80GB", 8)
+    assert recipe.deploy.gpu_count == 4
+    assert recipe.engine.llm.tensor_parallel_size == 4
+
+
+def test_resolve_for_hardware_count_no_match(tmp_recipe_dir):
+    """Raises ValueError when gpu_count doesn't match any entry."""
+    # RTX 5090 entry has gpu_count=1, and 3 % 1 == 0 so it would match.
+    # H100 has gpu_count=4, and 3 % 4 != 0.
+    with pytest.raises(ValueError, match="Available counts"):
+        resolve_for_hardware(tmp_recipe_dir, "NVIDIA H100 80GB", 3)
 
 
 def test_resolve_for_hardware_no_match(tmp_recipe_dir):
