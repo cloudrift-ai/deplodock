@@ -179,7 +179,7 @@ def test_compose_sglang_single_instance(sample_config_sglang):
     assert "--model-path test-org/test-model" in result
     assert "--model test-org/test-model" not in result
     assert "--tp 1" in result
-    assert "--pp 1" in result
+    assert "--pp-size 1" in result
     assert "--dp 1" in result
     assert "--mem-fraction-static 0.9" in result
     assert "--context-length 8192" in result

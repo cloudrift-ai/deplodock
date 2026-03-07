@@ -15,7 +15,7 @@ VLLM_FLAG_MAP = {
 
 SGLANG_FLAG_MAP = {
     "tensor_parallel_size": "--tp",
-    "pipeline_parallel_size": "--pp",
+    "pipeline_parallel_size": "--pp-size",
     "data_parallel_size": "--dp",
     "gpu_memory_utilization": "--mem-fraction-static",
     "context_length": "--context-length",
