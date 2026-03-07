@@ -9,7 +9,7 @@ engine:
     context_length: 262144
     max_concurrent_requests: 32
     vllm:
-      image: "vllm/vllm-openai:latest"
+      image: "vllm/vllm-openai:v0.17.0"
       extra_args: "--tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
 
 benchmark:
