@@ -74,7 +74,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
 
     # Step 4: Start services
     logger.info("Starting services...")
-    rc, _, _ = await run_cmd("docker compose up -d --wait --wait-timeout 1800", timeout=1800, log_output=True)
+    rc, _, _ = await run_cmd("docker compose up -d --wait --wait-timeout 3600", timeout=3600, log_output=True)
     if rc != 0:
         logger.error("Failed to start services")
         logger.error("Container logs:")
@@ -84,7 +84,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
     # Step 5: Poll health
     logger.info("Waiting for health check...")
     health_url = f"http://localhost:{port}/health"
-    timeout = 1800  # 30 minutes
+    timeout = 3600  # 60 minutes
     interval = 10
     elapsed = 0
     while elapsed < timeout:
