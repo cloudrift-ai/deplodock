@@ -28,6 +28,7 @@ Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLa
   - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
 - [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
 - [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
+- [docker/](docker/) — Custom Docker images (e.g., vLLM ROCm for MI350X)
 - [docs/](docs/) — Technical notes and engine-specific guides
   - [sglang-awq-moe.md](docs/sglang-awq-moe.md) — SGLang quantization for AWQ MoE models
 - [tests/](tests/) — pytest tests (see [ARCHITECTURE.md](tests/ARCHITECTURE.md))
