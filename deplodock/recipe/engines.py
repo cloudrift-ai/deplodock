@@ -7,6 +7,7 @@ from deplodock.recipe.types import LLMConfig
 VLLM_FLAG_MAP = {
     "tensor_parallel_size": "--tensor-parallel-size",
     "pipeline_parallel_size": "--pipeline-parallel-size",
+    "data_parallel_size": "--data-parallel-size",
     "gpu_memory_utilization": "--gpu-memory-utilization",
     "context_length": "--max-model-len",
     "max_concurrent_requests": "--max-num-seqs",
@@ -14,7 +15,8 @@ VLLM_FLAG_MAP = {
 
 SGLANG_FLAG_MAP = {
     "tensor_parallel_size": "--tp",
-    "pipeline_parallel_size": "--dp",
+    "pipeline_parallel_size": "--pp",
+    "data_parallel_size": "--dp",
     "gpu_memory_utilization": "--mem-fraction-static",
     "context_length": "--context-length",
     "max_concurrent_requests": "--max-running-requests",
@@ -55,6 +57,7 @@ def build_engine_args(llm: LLMConfig, model_name: str) -> list[str]:
         "--port 8000",
         f"{flag_map['tensor_parallel_size']} {llm.tensor_parallel_size}",
         f"{flag_map['pipeline_parallel_size']} {llm.pipeline_parallel_size}",
+        f"{flag_map['data_parallel_size']} {llm.data_parallel_size}",
         f"--model-path {model_name}" if llm.engine_name == "sglang" else f"--model {model_name}",
         f"--served-model-name {model_name}",
     ]

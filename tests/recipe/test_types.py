@@ -39,8 +39,8 @@ def test_llm_engine_name_sglang():
 
 
 def test_llm_gpus_per_instance():
-    llm = LLMConfig(tensor_parallel_size=4, pipeline_parallel_size=2)
-    assert llm.gpus_per_instance == 8
+    llm = LLMConfig(tensor_parallel_size=4, pipeline_parallel_size=2, data_parallel_size=3)
+    assert llm.gpus_per_instance == 24
 
 
 def test_llm_gpus_per_instance_defaults():
@@ -134,6 +134,7 @@ def test_from_dict_full():
             "llm": {
                 "tensor_parallel_size": 8,
                 "pipeline_parallel_size": 1,
+                "data_parallel_size": 2,
                 "gpu_memory_utilization": 0.95,
                 "context_length": 16384,
                 "max_concurrent_requests": 512,
@@ -156,6 +157,7 @@ def test_from_dict_full():
     }
     recipe = Recipe.from_dict(d)
     assert recipe.engine.llm.tensor_parallel_size == 8
+    assert recipe.engine.llm.data_parallel_size == 2
     assert recipe.engine.llm.gpu_memory_utilization == 0.95
     assert recipe.engine.llm.context_length == 16384
     assert recipe.engine.llm.max_concurrent_requests == 512

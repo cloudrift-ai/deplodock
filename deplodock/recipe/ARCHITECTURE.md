@@ -92,7 +92,8 @@ Engine-agnostic serving parameters are promoted to first-class named fields on `
 | Field | vLLM flag | SGLang flag |
 |---|---|---|
 | `tensor_parallel_size` | `--tensor-parallel-size` | `--tp` |
-| `pipeline_parallel_size` | `--pipeline-parallel-size` | `--dp` |
+| `pipeline_parallel_size` | `--pipeline-parallel-size` | `--pp` |
+| `data_parallel_size` | `--data-parallel-size` | `--dp` |
 | `gpu_memory_utilization` | `--gpu-memory-utilization` | `--mem-fraction-static` |
 | `context_length` | `--max-model-len` | `--context-length` |
 | `max_concurrent_requests` | `--max-num-seqs` | `--max-running-requests` |
@@ -101,7 +102,7 @@ This design provides:
 
 1. **Type safety** — numeric values are validated at parse time, not when Docker fails.
 2. **Engine portability** — the same recipe field maps to different CLI flags per engine via `VLLM_FLAG_MAP` / `SGLANG_FLAG_MAP` in `engines.py`.
-3. **Computed properties** — `LLMConfig.gpus_per_instance` derives from `tensor_parallel_size * pipeline_parallel_size` without parsing strings.
+3. **Computed properties** — `LLMConfig.gpus_per_instance` derives from `tensor_parallel_size * pipeline_parallel_size * data_parallel_size` without parsing strings.
 4. **Deep merge support** — named fields participate in matrix merging naturally. An `extra_args` string cannot be partially overridden.
 
 ### Extra Args Ban Enforcement

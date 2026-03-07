@@ -29,6 +29,7 @@ class LLMConfig:
     max_concurrent_requests: int | None = None
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
+    data_parallel_size: int = 1
     gpu_memory_utilization: float = 0.9
     vllm: VllmConfig | None = None
     sglang: SglangConfig | None = None
@@ -36,7 +37,7 @@ class LLMConfig:
     @property
     def gpus_per_instance(self) -> int:
         """Number of GPUs consumed by one model instance."""
-        return self.tensor_parallel_size * self.pipeline_parallel_size
+        return self.tensor_parallel_size * self.pipeline_parallel_size * self.data_parallel_size
 
     @property
     def engine_name(self) -> str:
@@ -145,6 +146,7 @@ class Recipe:
             max_concurrent_requests=llm_dict.get("max_concurrent_requests"),
             tensor_parallel_size=llm_dict.get("tensor_parallel_size", 1),
             pipeline_parallel_size=llm_dict.get("pipeline_parallel_size", 1),
+            data_parallel_size=llm_dict.get("data_parallel_size", 1),
             gpu_memory_utilization=llm_dict.get("gpu_memory_utilization", 0.9),
             vllm=vllm,
             sglang=sglang,

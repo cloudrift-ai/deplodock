@@ -47,6 +47,7 @@ def test_build_args_vllm_basic():
     llm = LLMConfig(
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
+        data_parallel_size=3,
         gpu_memory_utilization=0.9,
         vllm=VllmConfig(),
     )
@@ -56,6 +57,7 @@ def test_build_args_vllm_basic():
     assert "--port 8000" in args
     assert "--tensor-parallel-size 2" in args
     assert "--pipeline-parallel-size 1" in args
+    assert "--data-parallel-size 3" in args
     assert "--model org/model" in args
     assert "--served-model-name org/model" in args
 
@@ -109,12 +111,14 @@ def test_build_args_sglang_basic():
     llm = LLMConfig(
         tensor_parallel_size=4,
         pipeline_parallel_size=2,
+        data_parallel_size=3,
         gpu_memory_utilization=0.85,
         sglang=SglangConfig(),
     )
     args = build_engine_args(llm, "org/model")
     assert "--tp 4" in args
-    assert "--dp 2" in args
+    assert "--pp 2" in args
+    assert "--dp 3" in args
     assert "--mem-fraction-static 0.85" in args
     assert "--trust-remote-code" in args
 
