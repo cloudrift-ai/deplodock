@@ -11,7 +11,7 @@ engine:
 
 benchmark:
   max_concurrency: 4
-  num_prompts: 8
+  num_prompts: 4
   random_input_len: 4000
   random_output_len: 4000
 
