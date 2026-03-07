@@ -16,8 +16,15 @@ WORKDIR /vllm
 RUN pip install -r requirements/rocm.txt \
     && pip install --no-build-isolation .
 
+# Remove source tree so Python imports the installed package (with compiled .so)
+# instead of the source tree at /vllm/vllm/ which lacks C extensions.
+RUN rm -rf /vllm
+
 # Install amd-quark for MXFP4 support
 RUN pip install amd-quark
+
+# Ensure render group exists so docker compose group_add: [render] works
+RUN groupadd -f render
 
 ENV SAFETENSORS_FAST_GPU=1
 ENV HIP_FORCE_DEV_KERNARG=1
