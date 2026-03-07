@@ -7,7 +7,7 @@ import yaml
 
 from deplodock.deploy.compose import calculate_num_instances
 from deplodock.planner import BenchmarkTask
-from deplodock.recipe.types import Recipe
+from deplodock.recipe.types import Recipe, VllmConfig
 from deplodock.redact import redact_secrets
 
 SECTION_DELIMITER = "=" * 50
@@ -87,7 +87,7 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     """Run vllm bench serve on the remote server and return output.
 
     Returns:
-        (success: bool, output: str, bench_command: str)
+        (success: bool, output: str, stderr: str, bench_command: str)
     """
     bench = recipe.benchmark
 
@@ -106,7 +106,7 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     # endpoint, so we always use the vLLM image for benchmarking.
     image = recipe.engine.llm.image
     if recipe.engine.llm.engine_name != "vllm":
-        image = "vllm/vllm-openai:latest"
+        image = VllmConfig().image
 
     num_instances = calculate_num_instances(recipe)
     port = 8080 if num_instances > 1 else 8000
@@ -124,5 +124,5 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     )
 
     bench_command_str = build_bench_command(recipe)
-    rc, output, _ = await run_cmd(bench_cmd, stream=False, timeout=10800)
-    return rc == 0, output, bench_command_str
+    rc, output, stderr = await run_cmd(bench_cmd, stream=False, timeout=10800)
+    return rc == 0, output, stderr, bench_command_str

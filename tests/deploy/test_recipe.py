@@ -115,7 +115,7 @@ def test_load_recipe_rejects_banned_extra_args(tmp_path):
             "llm": {
                 "tensor_parallel_size": 1,
                 "vllm": {
-                    "image": "vllm/vllm-openai:latest",
+                    "image": "vllm/vllm-openai:v0.17.0",
                     "extra_args": "--max-model-len 8192",
                 },
             }

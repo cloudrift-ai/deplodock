@@ -141,7 +141,7 @@ def test_bench_group_log_captures_provisioning(run_cli, make_bench_config, tmp_p
                 "pipeline_parallel_size": 1,
                 "gpu_memory_utilization": 0.9,
                 "context_length": 8192,
-                "vllm": {"image": "vllm/vllm-openai:latest"},
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
             }
         },
         "benchmark": {

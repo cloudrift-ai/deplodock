@@ -100,7 +100,7 @@ engine:
     context_length: 16384
     max_concurrent_requests: 512
     vllm:
-      image: "vllm/vllm-openai:latest"
+      image: "vllm/vllm-openai:v0.17.0"
       extra_args: "--kv-cache-dtype fp8"    # Flags not covered by named fields
 
 benchmark:
@@ -144,7 +144,7 @@ matrices:
     deploy.gpu_count: 1
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
-    engine.llm.sglang.image: "lmsysorg/sglang:latest"
+    engine.llm.sglang.image: "lmsysorg/sglang:v0.5.9"
 ```
 
 ### Named Fields → CLI Flags

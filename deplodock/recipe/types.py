@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 class VllmConfig:
     """vLLM engine-specific configuration."""
 
-    image: str = "vllm/vllm-openai:latest"
+    image: str = "vllm/vllm-openai:v0.17.0"
     extra_args: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
 
@@ -16,7 +16,7 @@ class VllmConfig:
 class SglangConfig:
     """SGLang engine-specific configuration."""
 
-    image: str = "lmsysorg/sglang:latest"
+    image: str = "lmsysorg/sglang:v0.5.9"
     extra_args: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
 

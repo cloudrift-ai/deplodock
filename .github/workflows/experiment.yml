@@ -222,9 +222,23 @@ jobs:
           CLOUDRIFT_API_KEY: ${{ secrets.CLOUDRIFT_API_KEY }}
         run: ./venv/bin/${{ needs.gate.outputs.bench_command }} --commit-results
 
+      - name: Refresh app token for result push
+        if: always()
+        id: app-token-refresh
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.EXPERIMENT_APP_ID }}
+          private-key: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Collect and commit remaining results
         if: always()
+        env:
+          TOKEN: ${{ steps.app-token-refresh.outputs.token }}
+          REPO: ${{ needs.gate.outputs.pr_head_repo }}
         run: |
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+
           experiments='${{ needs.gate.outputs.experiments }}'
           dirs=$(echo "$experiments" | python -c "import sys, json; print(' '.join(json.load(sys.stdin)))")
 
@@ -276,7 +290,7 @@ jobs:
         if: always()
         uses: actions/github-script@v7
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token-refresh.outputs.token }}
           script: |
             const fs = require('fs');
             let body;

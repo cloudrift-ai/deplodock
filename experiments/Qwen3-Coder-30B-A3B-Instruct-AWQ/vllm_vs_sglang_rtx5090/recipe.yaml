@@ -18,8 +18,8 @@ benchmark:
 matrices:
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
-    engine.llm.vllm.image: "vllm/vllm-openai:latest"
+    engine.llm.vllm.image: "vllm/vllm-openai:v0.17.0"
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
-    engine.llm.sglang.image: "lmsysorg/sglang:latest"
+    engine.llm.sglang.image: "lmsysorg/sglang:v0.5.9"
     engine.llm.sglang.extra_args: "--quantization moe_wna16"
