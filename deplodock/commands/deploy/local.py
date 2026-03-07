@@ -1,12 +1,16 @@
 """Local deploy target CLI handler."""
 
 import asyncio
+import logging
 import os
 import sys
 
-from deplodock.deploy import run_deploy, run_teardown
+from deplodock.deploy import DEFAULT_STRATEGY, STRATEGIES, run_deploy, run_teardown
 from deplodock.deploy.local import make_run_cmd, make_write_file
-from deplodock.recipe import load_recipe
+from deplodock.detect import detect_local_gpus
+from deplodock.recipe import resolve_for_hardware
+
+logger = logging.getLogger(__name__)
 
 
 def handle_local(args):
@@ -30,7 +34,19 @@ async def _handle_local(args):
     if teardown:
         return await run_teardown(run_cmd)
 
-    recipe = load_recipe(recipe_dir)
+    # GPU detection (overridable via CLI flags)
+    if not args.gpu or not args.gpu_count:
+        detected_name, detected_count = detect_local_gpus()
+    gpu_name = args.gpu or detected_name
+    gpu_count = args.gpu_count or detected_count
+    logger.info(f"GPU: {gpu_count}x {gpu_name}")
+
+    # Matrix resolution
+    recipe = resolve_for_hardware(recipe_dir, gpu_name)
+
+    # Scale-out
+    strategy_cls = STRATEGIES[args.scale_out_strategy]
+    recipe = strategy_cls().apply(recipe, gpu_count)
 
     success = await run_deploy(
         run_cmd=run_cmd,
@@ -54,4 +70,12 @@ def register_local_target(subparsers):
     parser.add_argument("--model-dir", default="/mnt/models", help="Model cache directory")
     parser.add_argument("--teardown", action="store_true", help="Stop containers instead of deploying")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    parser.add_argument("--gpu", default=None, help="Override GPU name (skips detection)")
+    parser.add_argument("--gpu-count", type=int, default=None, help="Override GPU count (skips count detection)")
+    parser.add_argument(
+        "--scale-out-strategy",
+        choices=list(STRATEGIES.keys()),
+        default=DEFAULT_STRATEGY,
+        help=f"Scale-out strategy (default: {DEFAULT_STRATEGY})",
+    )
     parser.set_defaults(func=handle_local)

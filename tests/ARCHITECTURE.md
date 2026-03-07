@@ -9,6 +9,7 @@ All tests use **pytest** with **pytest-asyncio** (`asyncio_mode = "auto"` in `py
 ```
 tests/
 ├── conftest.py              # shared fixtures
+├── test_detect.py               # deplodock.detect (GPU detection via PCI sysfs)
 ├── test_hardware.py         # deplodock.hardware (top-level module)
 ├── test_redact.py           # deplodock.redact (secret redaction)
 ├── benchmark/
@@ -24,7 +25,8 @@ tests/
 │   ├── test_compose.py      # generate_compose(), generate_nginx_conf()
 │   ├── test_deploy_cloud_dryrun.py  # deploy cloud CLI dry-run
 │   ├── test_deploy_dryrun.py        # deploy ssh/local CLI dry-run
-│   └── test_recipe.py       # load_recipe(), deep_merge(), validate_extra_args()
+│   ├── test_recipe.py       # load_recipe(), deep_merge(), validate_extra_args(), resolve_for_hardware()
+│   └── test_scale_out.py    # DataParallelismScaleOutStrategy, ReplicaParallelismScaleOutStrategy
 ├── planner/
 │   ├── test_planner.py      # BenchmarkTask, GroupByModelAndGpuPlanner
 │   └── test_variant.py      # Variant class, _abbreviate()
@@ -47,11 +49,13 @@ Test individual functions in isolation with synthetic inputs.
 |------|--------|
 | `recipe/test_types.py` | `Recipe.from_dict()`, `LLMConfig` properties (`engine_name`, `gpus_per_instance`, `image`, `extra_args`, `extra_env`), dataclass defaults |
 | `recipe/test_engines.py` | `build_engine_args()`, `banned_extra_arg_flags()` — engine flag mapping, CLI argument building for vLLM and SGLang |
-| `deploy/test_recipe.py` | `deplodock.recipe.load_recipe()`, `deep_merge()`, `validate_extra_args()` — recipe loading, variant resolution, YAML parsing, extra_args validation |
+| `deploy/test_recipe.py` | `deplodock.recipe.load_recipe()`, `deep_merge()`, `validate_extra_args()`, `resolve_for_hardware()` — recipe loading, variant resolution, YAML parsing, extra_args validation, hardware-aware matrix resolution |
+| `deploy/test_scale_out.py` | `DataParallelismScaleOutStrategy`, `ReplicaParallelismScaleOutStrategy` — scale-out strategy application, GPU count validation, immutability |
 | `deploy/test_compose.py` | `deplodock.deploy.generate_compose()`, `generate_nginx_conf()` — Docker Compose and nginx config generation, `gpu_device_ids` support |
 | `provisioning/test_cloud.py` | `deplodock.provisioning.cloud.resolve_vm_spec()`, `delete_cloud_vm()`, `VMConnectionInfo` — cloud provisioning unit tests |
 | `planner/test_planner.py` | `BenchmarkTask`, `GroupByModelAndGpuPlanner` — task properties (`recipe_name`, `result_path`, `gpu_name`, `gpu_count`, `gpu_short`), grouping logic, sorting |
 | `planner/test_variant.py` | `Variant` — `__str__`, `gpu_short`, `gpu_count`, `__eq__`, `__hash__`, `_abbreviate()` |
+| `test_detect.py` | `_parse_sysfs_output()`, `detect_local_gpus()`, `detect_remote_gpus()` — PCI sysfs GPU detection, mixed GPU errors, mock SSH |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
 | `test_redact.py` | `deplodock.redact.redact_secrets()`, `SecretRedactingFilter` — value-based secret redaction for text and log records |
 | `benchmark/test_code_hash.py` | `BenchmarkTask.compute_code_hash()` — determinism, hex format |

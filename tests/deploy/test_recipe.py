@@ -3,7 +3,7 @@
 import pytest
 import yaml
 
-from deplodock.recipe import Recipe, deep_merge, load_recipe, validate_extra_args
+from deplodock.recipe import Recipe, deep_merge, load_recipe, resolve_for_hardware, validate_extra_args
 
 # ── deep_merge ──────────────────────────────────────────────────────
 
@@ -105,6 +105,76 @@ def test_validate_extra_args_banned_flag_equals_style():
 def test_validate_extra_args_multiple_banned():
     with pytest.raises(ValueError, match="--max-model-len.*--max-num-seqs|--max-num-seqs.*--max-model-len"):
         validate_extra_args("--max-model-len 8192 --max-num-seqs 256")
+
+
+# ── resolve_for_hardware ──────────────────────────────────────────
+
+
+def test_resolve_for_hardware_exact_match(tmp_recipe_dir):
+    """Resolves the H200 matrix entry with correct overrides."""
+    recipe = resolve_for_hardware(tmp_recipe_dir, "NVIDIA H200 141GB")
+    assert recipe.deploy.gpu == "NVIDIA H200 141GB"
+    assert recipe.deploy.gpu_count == 8
+    assert recipe.engine.llm.tensor_parallel_size == 8
+    assert recipe.engine.llm.context_length == 16384
+    assert recipe.engine.llm.extra_args == "--kv-cache-dtype fp8"
+
+
+def test_resolve_for_hardware_no_match(tmp_recipe_dir):
+    """Raises ValueError for unknown GPU."""
+    with pytest.raises(ValueError, match="No matrix entry matches GPU"):
+        resolve_for_hardware(tmp_recipe_dir, "NVIDIA A100 40GB")
+
+
+def test_resolve_for_hardware_no_matrices(tmp_path):
+    """Returns base recipe when no matrices section exists."""
+    recipe_data = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 2,
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+            }
+        },
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe_data, f)
+
+    recipe = resolve_for_hardware(str(tmp_path), "Any GPU")
+    assert recipe.engine.llm.tensor_parallel_size == 2
+    assert recipe.deploy.gpu is None
+
+
+def test_resolve_for_hardware_skips_sweeps(tmp_path):
+    """Skips matrix entries that contain list values (sweeps)."""
+    recipe_data = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 1,
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+            }
+        },
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA GeForce RTX 5090",
+                "benchmark.max_concurrency": [1, 2, 4],
+            },
+            {
+                "deploy.gpu": "NVIDIA GeForce RTX 5090",
+                "deploy.gpu_count": 1,
+            },
+        ],
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe_data, f)
+
+    recipe = resolve_for_hardware(str(tmp_path), "NVIDIA GeForce RTX 5090")
+    assert recipe.deploy.gpu == "NVIDIA GeForce RTX 5090"
+    assert recipe.deploy.gpu_count == 1
+
+
+# ── validate_extra_args ────────────────────────────────────────────
 
 
 def test_load_recipe_rejects_banned_extra_args(tmp_path):

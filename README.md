@@ -16,6 +16,7 @@ Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLa
   - [deplodock.py](deplodock/deplodock.py) — CLI entrypoint
   - [logging_setup.py](deplodock/logging_setup.py) — CLI logging configuration
   - [hardware.py](deplodock/hardware.py) — GPU specs and instance type mapping
+  - [detect.py](deplodock/detect.py) — GPU detection via PCI sysfs (local and remote)
   - [commands/](deplodock/commands/) — CLI layer (thin argparse handlers, see [ARCHITECTURE.md](deplodock/commands/ARCHITECTURE.md))
     - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
     - [bench/](deplodock/commands/bench/) — `bench` command
@@ -233,15 +234,22 @@ Provisions a cloud VM based on recipe GPU requirements (from the `deploy` sectio
 deplodock deploy cloud --recipe <path> [--name <vm-name>] [--dry-run]
 ```
 
+### Hardware-Aware Deploy
+
+When deploying locally or via SSH, deplodock auto-detects the target GPU by scanning PCI sysfs device IDs and selects the matching `matrices` entry from the recipe. If more GPUs are available than the recipe's base configuration needs, a scale-out strategy is applied.
+
 ### Common Flags
 
-| Flag          | Required  | Default       | Description                          |
-|---------------|-----------|---------------|--------------------------------------|
-| `--recipe`    | Yes       | -             | Path to recipe directory             |
-| `--hf-token`  | No        | `$HF_TOKEN`   | HuggingFace token                    |
-| `--model-dir` | No        | `/mnt/models` | Model cache dir                      |
-| `--teardown`  | No        | false         | Stop containers instead of deploying |
-| `--dry-run`   | No        | false         | Print commands without executing     |
+| Flag                    | Required  | Default             | Description                                                  |
+|-------------------------|-----------|---------------------|--------------------------------------------------------------|
+| `--recipe`              | Yes       | -                   | Path to recipe directory                                     |
+| `--hf-token`            | No        | `$HF_TOKEN`         | HuggingFace token                                            |
+| `--model-dir`           | No        | `/mnt/models`       | Model cache dir                                              |
+| `--teardown`            | No        | false               | Stop containers instead of deploying                         |
+| `--dry-run`             | No        | false               | Print commands without executing                             |
+| `--gpu`                 | No        | auto-detect         | Override GPU name (skips detection)                          |
+| `--gpu-count`           | No        | auto-detect         | Override GPU count (skips count detection)                   |
+| `--scale-out-strategy`  | No        | `data-parallelism`  | Scale-out: `data-parallelism` or `replica-parallelism`       |
 
 ### SSH-only Flags
 

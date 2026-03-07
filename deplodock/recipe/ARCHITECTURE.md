@@ -7,7 +7,7 @@ The `recipe` package owns all recipe-related logic: YAML loading, matrix expansi
 ## Modules
 
 - `types.py` — dataclasses: `Recipe`, `DeployConfig`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig`
-- `recipe.py` — `deep_merge()`, `load_recipe()`, `validate_extra_args()`, `_load_raw_config()`, `_validate_and_build()`
+- `recipe.py` — `deep_merge()`, `load_recipe()`, `resolve_for_hardware()`, `validate_extra_args()`, `_load_raw_config()`, `_validate_and_build()`
 - `matrix.py` — `expand_matrix_entry()`, `dot_to_nested()`, `build_override()`
 - `engines.py` — `VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`, `banned_extra_arg_flags()`, `build_engine_args()`
 
@@ -157,7 +157,11 @@ recipe.yaml
 _load_raw_config(recipe_dir) -> raw dict
     |
     +-- load_recipe(): strips matrices, calls _validate_and_build()
-    |       -> base Recipe (for deploy commands)
+    |       -> base Recipe (for bench/cloud commands that don't need matrix resolution)
+    |
+    +-- resolve_for_hardware(recipe_dir, gpu_name): finds first scalar matrix
+    |       entry matching gpu_name, deep_merges with base, calls _validate_and_build()
+    |       -> hardware-resolved Recipe (for deploy local/ssh commands)
     |
     +-- enumerate_tasks(): reads matrices, expands each entry:
             |-- expand_matrix_entry() -> list of combinations

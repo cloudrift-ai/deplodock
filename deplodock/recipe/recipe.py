@@ -67,3 +67,35 @@ def load_recipe(recipe_dir):
     config = _load_raw_config(recipe_dir)
     config.pop("matrices", None)
     return _validate_and_build(config)
+
+
+def resolve_for_hardware(recipe_dir: str, gpu_name: str) -> "Recipe":
+    """Load recipe and resolve matrix entry matching the given GPU.
+
+    Finds the first matrix entry where deploy.gpu matches gpu_name and all
+    values are scalars (skipping sweep entries with lists). If no matrices
+    section exists, returns the base recipe. Raises ValueError if no match.
+    """
+    from deplodock.recipe.matrix import build_override
+
+    config = _load_raw_config(recipe_dir)
+    matrices = config.pop("matrices", None)
+
+    if not matrices:
+        return _validate_and_build(config)
+
+    available_gpus = set()
+    for entry in matrices:
+        gpu = entry.get("deploy.gpu")
+        if gpu is not None:
+            available_gpus.add(gpu)
+        if gpu != gpu_name:
+            continue
+        # Skip sweep entries (any value is a list)
+        if any(isinstance(v, list) for v in entry.values()):
+            continue
+        override = build_override(entry)
+        merged = deep_merge(config, override)
+        return _validate_and_build(merged)
+
+    raise ValueError(f"No matrix entry matches GPU '{gpu_name}'. Available GPUs: {', '.join(sorted(available_gpus))}")
