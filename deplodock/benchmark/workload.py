@@ -40,6 +40,7 @@ def build_bench_command(recipe: Recipe) -> str:
     return (
         f"vllm bench serve\n"
         f"    --model {model_name}\n"
+        f"    --trust-remote-code\n"
         f"    --max-concurrency {bench.max_concurrency}\n"
         f"    --num-prompts {bench.num_prompts}\n"
         f"    --random-input-len {bench.random_input_len}\n"
@@ -115,6 +116,7 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
         f"docker run --rm --network host --entrypoint bash {image} -c '"
         f"vllm bench serve "
         f"--model {model_name} "
+        f"--trust-remote-code "
         f"--base-url http://localhost:{port} "
         f"--max-concurrency {bench.max_concurrency} "
         f"--num-prompts {bench.num_prompts} "
