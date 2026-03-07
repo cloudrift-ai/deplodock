@@ -237,6 +237,7 @@ jobs:
           TOKEN: ${{ steps.app-token-refresh.outputs.token }}
           REPO: ${{ needs.gate.outputs.pr_head_repo }}
         run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
 
           experiments='${{ needs.gate.outputs.experiments }}'
