@@ -15,6 +15,10 @@ def test_ssh_deploy(run_cli, recipes_dir):
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
         "--server",
         "user@1.2.3.4",
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
         "--dry-run",
     )
     assert rc == 0
@@ -32,6 +36,10 @@ def test_ssh_deploy_command_sequence(run_cli, recipes_dir):
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
         "--server",
         "user@1.2.3.4",
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
         "--dry-run",
     )
     assert rc == 0
@@ -55,6 +63,10 @@ def test_ssh_teardown(run_cli, recipes_dir):
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
         "--server",
         "user@1.2.3.4",
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
         "--dry-run",
         "--teardown",
     )
@@ -72,6 +84,10 @@ def test_local_deploy(run_cli, recipes_dir):
         "local",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
         "--dry-run",
     )
     assert rc == 0
@@ -102,6 +118,10 @@ def test_single_gpu_recipe(run_cli, recipes_dir):
         "local",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
         "--dry-run",
     )
     assert rc == 0
@@ -139,6 +159,12 @@ def test_multi_instance_deploy(run_cli, tmp_path):
         str(tmp_path),
         "--server",
         "user@host",
+        "--gpu",
+        "NVIDIA H100 80GB",
+        "--gpu-count",
+        "4",
+        "--scale-out-strategy",
+        "replica-parallelism",
         "--dry-run",
     )
     assert rc == 0

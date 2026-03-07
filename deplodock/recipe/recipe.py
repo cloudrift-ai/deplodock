@@ -67,3 +67,73 @@ def load_recipe(recipe_dir):
     config = _load_raw_config(recipe_dir)
     config.pop("matrices", None)
     return _validate_and_build(config)
+
+
+def resolve_for_hardware(recipe_dir: str, gpu_name: str, gpu_count: int | None = None) -> "Recipe":
+    """Load recipe and resolve the best matrix entry for the given hardware.
+
+    Matching priority (scalar entries only, sweeps with lists are skipped):
+    1. Exact match: deploy.gpu == gpu_name AND deploy.gpu_count == gpu_count
+    2. Divisible match: deploy.gpu == gpu_name AND gpu_count is a multiple of
+       the entry's deploy.gpu_count (for scale-out). Picks the largest entry
+       gpu_count that divides evenly.
+    3. Name-only match: deploy.gpu == gpu_name (when gpu_count is None)
+
+    If no matrices section exists, returns the base recipe.
+    Raises ValueError if no match is found.
+    """
+    from deplodock.recipe.matrix import build_override
+
+    config = _load_raw_config(recipe_dir)
+    matrices = config.pop("matrices", None)
+
+    if not matrices:
+        return _validate_and_build(config)
+
+    # Collect scalar entries matching gpu_name
+    available_gpus = set()
+    candidates = []
+    for entry in matrices:
+        gpu = entry.get("deploy.gpu")
+        if gpu is not None:
+            available_gpus.add(gpu)
+        if gpu != gpu_name:
+            continue
+        if any(isinstance(v, list) for v in entry.values()):
+            continue
+        candidates.append(entry)
+
+    if not candidates:
+        raise ValueError(f"No matrix entry matches GPU '{gpu_name}'. Available GPUs: {', '.join(sorted(available_gpus))}")
+
+    # If no gpu_count specified, return first name match
+    if gpu_count is None:
+        override = build_override(candidates[0])
+        merged = deep_merge(config, override)
+        return _validate_and_build(merged)
+
+    # Try exact count match first
+    for entry in candidates:
+        entry_count = entry.get("deploy.gpu_count", 1)
+        if entry_count == gpu_count:
+            override = build_override(entry)
+            merged = deep_merge(config, override)
+            return _validate_and_build(merged)
+
+    # Try divisible match: gpu_count is a multiple of entry's count.
+    # Pick largest entry count that divides evenly.
+    best = None
+    best_count = 0
+    for entry in candidates:
+        entry_count = entry.get("deploy.gpu_count", 1)
+        if gpu_count % entry_count == 0 and entry_count > best_count:
+            best = entry
+            best_count = entry_count
+
+    if best is not None:
+        override = build_override(best)
+        merged = deep_merge(config, override)
+        return _validate_and_build(merged)
+
+    entry_counts = sorted({e.get("deploy.gpu_count", 1) for e in candidates})
+    raise ValueError(f"No matrix entry for GPU '{gpu_name}' matches gpu_count={gpu_count}. Available counts: {entry_counts}")

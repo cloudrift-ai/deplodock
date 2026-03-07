@@ -1,18 +1,22 @@
 """SSH deploy target CLI handler."""
 
 import asyncio
+import logging
 import os
 import sys
 
-from deplodock.deploy import DeployParams
+from deplodock.deploy import DEFAULT_STRATEGY, STRATEGIES, DeployParams
 from deplodock.deploy import (
     deploy as deploy_entry,
 )
 from deplodock.deploy import (
     teardown as teardown_entry,
 )
+from deplodock.detect import detect_remote_gpus
 from deplodock.provisioning.remote import provision_remote
-from deplodock.recipe import load_recipe
+from deplodock.recipe import resolve_for_hardware
+
+logger = logging.getLogger(__name__)
 
 
 def handle_ssh(args):
@@ -21,9 +25,20 @@ def handle_ssh(args):
 
 
 async def _handle_ssh(args):
-    recipe = load_recipe(args.recipe)
-    if args.gpu:
-        recipe.deploy.gpu = args.gpu
+    # GPU detection (overridable via CLI flags)
+    if not args.gpu or not args.gpu_count:
+        detected_name, detected_count = await detect_remote_gpus(args.server, args.ssh_key, args.ssh_port)
+    gpu_name = args.gpu or detected_name
+    gpu_count = args.gpu_count or detected_count
+    logger.info(f"GPU: {gpu_count}x {gpu_name}")
+
+    # Matrix resolution
+    recipe = resolve_for_hardware(args.recipe, gpu_name, gpu_count)
+
+    # Scale-out
+    strategy_cls = STRATEGIES[args.scale_out_strategy]
+    recipe = strategy_cls().apply(recipe, gpu_count)
+
     params = DeployParams(
         server=args.server,
         ssh_key=args.ssh_key,
@@ -54,5 +69,12 @@ def register_ssh_target(subparsers):
     parser.add_argument("--server", required=True, help="SSH address (user@host)")
     parser.add_argument("--ssh-key", default="~/.ssh/id_ed25519", help="SSH key path")
     parser.add_argument("--ssh-port", type=int, default=22, help="SSH port")
-    parser.add_argument("--gpu", default=None, help="Override recipe GPU type")
+    parser.add_argument("--gpu", default=None, help="Override GPU name (skips detection)")
+    parser.add_argument("--gpu-count", type=int, default=None, help="Override GPU count (skips count detection)")
+    parser.add_argument(
+        "--scale-out-strategy",
+        choices=list(STRATEGIES.keys()),
+        default=DEFAULT_STRATEGY,
+        help=f"Scale-out strategy (default: {DEFAULT_STRATEGY})",
+    )
     parser.set_defaults(func=handle_ssh)
