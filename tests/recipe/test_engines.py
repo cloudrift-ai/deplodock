@@ -117,7 +117,7 @@ def test_build_args_sglang_basic():
     )
     args = build_engine_args(llm, "org/model")
     assert "--tp 4" in args
-    assert "--pp 2" in args
+    assert "--pp-size 2" in args
     assert "--dp 3" in args
     assert "--mem-fraction-static 0.85" in args
     assert "--trust-remote-code" in args
