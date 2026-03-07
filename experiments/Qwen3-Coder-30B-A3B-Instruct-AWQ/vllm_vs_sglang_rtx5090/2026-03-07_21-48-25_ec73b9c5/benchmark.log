@@ -9166,3 +9166,20 @@ Example curl:
 [2026-03-07 22:19:19] [deplodock.provisioning.ssh_transport] sglang_0  |                         [--forward-hooks FORWARD_HOOKS]
 [2026-03-07 22:19:19] [deplodock.provisioning.ssh_transport] sglang_0  | launch_server.py: error: ambiguous option: --pp could match --pp-size, --pp-max-micro-batch-size, --pp-async-batch-depth
 [2026-03-07 22:19:19] [rtx5090_x_1.Qwen3-Coder-30B-A3B-Instruct-AWQ] Deploy failed, skipping benchmark
+[2026-03-07 22:19:19] [deplodock.commands.bench.committer] Committed: bench: fail vllm_vs_sglang_rtx5090/rtx5090x1_eaquant-moe-wna16_ilms-sglang-v0.5.9
+[2026-03-07 22:19:19] [rtx5090_x_1] Deleting VM...
+[2026-03-07 22:19:19] [deplodock.provisioning.cloudrift] Terminating CloudRift instance '5ed58614-1a6f-11f1-ab47-1b10be4bf107'...
+[2026-03-07 22:19:19] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-03-07 22:19:19] [deplodock.provisioning.cloudrift] Instance terminated.
+[2026-03-07 22:19:19] [rtx5090_x_1] VM deleted.
+[2026-03-07 22:19:19] [rtx5090_x_1] Completed group: rtx5090_x_1
+[2026-03-07 22:19:19] [root] 
+[2026-03-07 22:19:19] [root] SUMMARY
+[2026-03-07 22:19:19] [root] Successful: 1/2
+[2026-03-07 22:19:19] [root]    - vllm_vs_sglang_rtx5090/rtx5090x1_ivllm-vllm-oai-v0.17.0
+[2026-03-07 22:19:19] [root] 
+[2026-03-07 22:19:19] [root] Failed: 1/2
+[2026-03-07 22:19:19] [root]    - vllm_vs_sglang_rtx5090/rtx5090x1_eaquant-moe-wna16_ilms-sglang-v0.5.9
+[2026-03-07 22:19:19] [root] 
+[2026-03-07 22:19:19] [root] All done!
+[2026-03-07 22:19:19] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-03-07_21-48-25_ec73b9c5/benchmark.log
