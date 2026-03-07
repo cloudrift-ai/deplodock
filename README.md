@@ -152,7 +152,8 @@ matrices:
 | Recipe YAML key           | vLLM CLI flag              | SGLang CLI flag          |
 |---------------------------|----------------------------|--------------------------|
 | `tensor_parallel_size`    | `--tensor-parallel-size`   | `--tp`                   |
-| `pipeline_parallel_size`  | `--pipeline-parallel-size` | `--dp`                   |
+| `pipeline_parallel_size`  | `--pipeline-parallel-size` | `--pp`                   |
+| `data_parallel_size`      | `--data-parallel-size`     | `--dp`                   |
 | `gpu_memory_utilization`  | `--gpu-memory-utilization` | `--mem-fraction-static`  |
 | `context_length`          | `--max-model-len`          | `--context-length`       |
 | `max_concurrent_requests` | `--max-num-seqs`           | `--max-running-requests` |
