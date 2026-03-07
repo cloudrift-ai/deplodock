@@ -88,7 +88,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
       interval: 10s
       timeout: 10s
       retries: 180
-      start_period: 600s
+      start_period: 1200s
 """
 
     if num_instances > 1:
