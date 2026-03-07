@@ -1,0 +1,23 @@
+model:
+  huggingface: "amd/Kimi-K2.5-MXFP4"
+
+engine:
+  llm:
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    context_length: 262144
+    max_concurrent_requests: 32
+    vllm:
+      image: "cloudriftai/vllm-rocm:latest"
+      extra_args: "--enforce-eager --mm-encoder-tp-mode data --tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
+
+benchmark:
+  max_concurrency: 32
+  num_prompts: 80
+  random_input_len: 4000
+  random_output_len: 4000
+
+matrices:
+  - deploy.gpu: "AMD Instinct MI350X"
+    deploy.gpu_count: 4
