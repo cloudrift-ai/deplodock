@@ -39,7 +39,7 @@ GPU_PCI_DEVICE_IDS: dict[str, str] = {
     "20b2": "NVIDIA A100 80GB",
     "20b5": "NVIDIA A100 80GB",
     # AMD Instinct MI350X
-    "74a0": "AMD Instinct MI350X",
+    "75b0": "AMD Instinct MI350X",
 }
 
 _SYSFS_SCAN_CMD = (

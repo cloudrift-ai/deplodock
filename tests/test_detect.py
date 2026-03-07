@@ -33,7 +33,7 @@ def test_detect_local_gpus_no_gpus():
 
 def test_detect_local_gpus_amd():
     """Parse sysfs output with AMD GPU."""
-    output = "0x1002 0x74a0\n"
+    output = "0x1002 0x75b0\n"
     name, count = _parse_sysfs_output(output)
     assert name == "AMD Instinct MI350X"
     assert count == 1
