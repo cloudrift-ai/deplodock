@@ -150,8 +150,10 @@ async def run_execution_group(
             task_logger = _get_group_logger(group, model_name)
             task_logger.info(f"Recipe: {task.recipe_dir} (variant: {task.variant})")
 
-            # Set GPU device IDs if task needs fewer GPUs than group
-            gpu_device_ids = list(range(task.gpu_count)) if task.gpu_count < group.gpu_count else None
+            # Always set explicit GPU device IDs so the container only sees
+            # the GPUs the task needs — the provisioned VM may have more GPUs
+            # than requested (e.g. B200 only available as 8-GPU instances).
+            gpu_device_ids = list(range(task.gpu_count))
 
             params = DeployParams(
                 server=conn.address,
