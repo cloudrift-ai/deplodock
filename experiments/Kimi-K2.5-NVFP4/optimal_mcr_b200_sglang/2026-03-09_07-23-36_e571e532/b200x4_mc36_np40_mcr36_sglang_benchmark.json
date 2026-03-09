@@ -1,0 +1,82 @@
+{
+  "task": {
+    "recipe_dir": "experiments/Kimi-K2.5-NVFP4/optimal_mcr_b200_sglang",
+    "variant": "b200x4_mc36_np40_mcr36",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 4
+  },
+  "recipe": {
+    "model": {
+      "huggingface": "nvidia/Kimi-K2.5-NVFP4"
+    },
+    "engine": {
+      "llm": {
+        "context_length": 262144,
+        "max_concurrent_requests": 36,
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 1,
+        "gpu_memory_utilization": 0.9,
+        "vllm": null,
+        "sglang": {
+          "image": "lmsysorg/sglang:v0.5.9",
+          "extra_args": "--quantization modelopt --tool-call-parser kimi_k2 --reasoning-parser kimi_k2",
+          "extra_env": {}
+        }
+      }
+    },
+    "benchmark": {
+      "max_concurrency": 36,
+      "num_prompts": 40,
+      "random_input_len": 8000,
+      "random_output_len": 8000
+    },
+    "deploy": {
+      "gpu": "NVIDIA B200",
+      "gpu_count": 4
+    }
+  },
+  "metrics": {
+    "successful_requests": 40,
+    "failed_requests": 0,
+    "max_request_concurrency": 36,
+    "benchmark_duration_s": 467.75,
+    "total_input_tokens": 320000,
+    "total_generated_tokens": 320000,
+    "request_throughput": 0.09,
+    "output_token_throughput": 684.12,
+    "peak_output_token_throughput": 1224.0,
+    "peak_concurrent_requests": 40.0,
+    "total_token_throughput": 1368.25,
+    "mean_ttft_ms": 7348.88,
+    "median_ttft_ms": 7364.13,
+    "p99_ttft_ms": 12760.21,
+    "mean_tpot_ms": 38.15,
+    "median_tpot_ms": 38.43,
+    "p99_tpot_ms": 49.57,
+    "mean_itl_ms": 38.15,
+    "median_itl_ms": 37.28,
+    "p99_itl_ms": 39.72,
+    "mean_e2el_ms": null,
+    "median_e2el_ms": null,
+    "p99_e2el_ms": null
+  },
+  "system": {
+    "hostname": "bench-b200-x-4-0309-0723-6883",
+    "os": "Ubuntu 22.04.5 LTS",
+    "kernel": "6.8.0-1048-gcp",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.10GHz",
+    "cpu_count": 224,
+    "cpu_arch": "x86_64",
+    "memory_total_gib": 3891.2,
+    "gpu_name": "NVIDIA B200",
+    "gpu_memory_mib": 183359,
+    "gpu_driver": "570.211.01",
+    "cuda_version": "12.8",
+    "gpu_count": 8,
+    "docker_version": "29.3.0"
+  },
+  "compose": "services:\n\n  sglang_0:\n    image: lmsysorg/sglang:v0.5.9\n    container_name: sglang_0\n    entrypoint: python3 -m sglang.launch_server\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              device_ids: ['0', '1', '2', '3']\n              capabilities: [gpu]\n    volumes:\n      - /hf_models:/hf_models\n    environment:\n      - HUGGING_FACE_HUB_TOKEN=***\n      - HF_HOME=/hf_models\n    ports:\n      - \"8000:8000\"\n    shm_size: '16gb'\n    ipc: host\n    command: >\n      --trust-remote-code\n      --mem-fraction-static 0.9\n      --host 0.0.0.0\n      --port 8000\n      --tp 4\n      --pp-size 1\n      --dp 1\n      --model-path nvidia/Kimi-K2.5-NVFP4\n      --served-model-name nvidia/Kimi-K2.5-NVFP4\n      --context-length 262144\n      --max-running-requests 36\n      --quantization modelopt --tool-call-parser kimi_k2 --reasoning-parser kimi_k2\n    healthcheck:\n      test: [\"CMD\", \"bash\", \"-c\", \"curl -f http://localhost:8000/health\"]\n      interval: 10s\n      timeout: 10s\n      retries: 180\n      start_period: 600s\n",
+  "bench_command": "vllm bench serve\n    --model nvidia/Kimi-K2.5-NVFP4\n    --trust-remote-code\n    --max-concurrency 36\n    --num-prompts 40\n    --random-input-len 8000\n    --random-output-len 8000\n    --base-url http://localhost:8000"
+}
