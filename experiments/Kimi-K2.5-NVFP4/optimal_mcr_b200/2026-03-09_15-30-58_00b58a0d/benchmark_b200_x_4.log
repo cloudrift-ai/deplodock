@@ -3737,3 +3737,14 @@ Example curl:
     }'
 [2026-03-09 17:42:21] [b200_x_4.Kimi-K2.5-NVFP4] Running benchmark...
 [2026-03-09 17:46:16] [b200_x_4.Kimi-K2.5-NVFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-NVFP4/optimal_mcr_b200/2026-03-09_15-30-58_00b58a0d/b200x4_mc64_np40_mcr64_vllm_benchmark.txt
+[2026-03-09 17:46:16] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_b200/b200x4_mc64_np40_mcr64
+[2026-03-09 17:46:16] [b200_x_4.Kimi-K2.5-NVFP4] Tearing down...
+[2026-03-09 17:46:16] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-09 17:46:17] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.87.18.202' (ED25519) to the list of known hosts.
+[2026-03-09 17:46:18] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-09 17:46:24] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-09 17:46:24] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-09 17:46:24] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-09 17:46:24] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-09 17:46:24] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-09 17:46:24] [deplodock.deploy.orchestrate] Teardown complete.
