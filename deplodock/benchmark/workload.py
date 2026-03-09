@@ -112,8 +112,13 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     num_instances = calculate_num_instances(recipe)
     port = 8080 if num_instances > 1 else 8000
 
+    # The ROCm vLLM image crashes on import without GPU devices, even for
+    # the pure-HTTP benchmark client.  Pass device flags so it can start.
+    is_amd = recipe.deploy.gpu is not None and recipe.deploy.gpu.startswith("AMD")
+    device_flags = " --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri" if is_amd else ""
+
     bench_cmd = (
-        f"docker run --rm --network host --entrypoint bash {image} -c '"
+        f"docker run --rm --network host{device_flags} --entrypoint bash {image} -c '"
         f"vllm bench serve "
         f"--model {model_name} "
         f"--trust-remote-code "
