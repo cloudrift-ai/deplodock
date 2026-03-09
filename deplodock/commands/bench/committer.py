@@ -43,3 +43,11 @@ class GitCommitter:
                 return
 
             logger.info(f"Committed: {message}")
+
+            # Push to remote
+            rc, _, stderr = await run_shell_cmd(["git", "push"])
+            if rc != 0:
+                logger.warning(f"git push failed: {stderr}")
+                return
+
+            logger.info("Pushed to remote")
