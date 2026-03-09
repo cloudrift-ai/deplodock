@@ -2324,3 +2324,34 @@ Example curl:
     }'
 [2026-03-09 07:20:50] [b200_x_4.Kimi-K2.5-NVFP4] Running benchmark...
 [2026-03-09 07:24:45] [b200_x_4.Kimi-K2.5-NVFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-NVFP4/optimal_mcr_b200/2026-03-09_05-32-26_00b58a0d/b200x4_mc40_np40_mcr40_vllm_benchmark.txt
+[2026-03-09 07:24:45] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_b200/b200x4_mc40_np40_mcr40
+[2026-03-09 07:24:45] [b200_x_4.Kimi-K2.5-NVFP4] Tearing down...
+[2026-03-09 07:24:45] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-09 07:24:45] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.87.165.83' (ED25519) to the list of known hosts.
+[2026-03-09 07:24:47] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-09 07:24:52] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-09 07:24:52] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-09 07:24:53] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-09 07:24:53] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-09 07:24:53] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-09 07:24:53] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-09 07:24:53] [b200_x_4] Deleting VM...
+[2026-03-09 07:24:53] [deplodock.provisioning.gcp] Deleting instance 'bench-b200-x-4' in zone 'asia-southeast1-b'...
+[2026-03-09 07:26:57] [deplodock.provisioning.gcp] Instance deleted.
+[2026-03-09 07:26:57] [b200_x_4] VM deleted.
+[2026-03-09 07:26:57] [b200_x_4] Completed group: b200_x_4
+[2026-03-09 07:26:57] [root] 
+[2026-03-09 07:26:57] [root] SUMMARY
+[2026-03-09 07:26:57] [root] Successful: 9/9
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc8_np40_mcr8
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc12_np40_mcr12
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc16_np40_mcr16
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc20_np40_mcr20
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc24_np40_mcr24
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc28_np40_mcr28
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc32_np40_mcr32
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc36_np40_mcr36
+[2026-03-09 07:26:57] [root]    - optimal_mcr_b200/b200x4_mc40_np40_mcr40
+[2026-03-09 07:26:57] [root] 
+[2026-03-09 07:26:57] [root] All done!
+[2026-03-09 07:26:57] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-NVFP4/optimal_mcr_b200/2026-03-09_05-32-26_00b58a0d/benchmark.log
