@@ -1,0 +1,307 @@
+============ Benchmark Task ============
+recipe_dir: experiments/Kimi-K2.5-NVFP4/optimal_mcr_b200
+variant: b200x4_mc36_np40_mcr36
+gpu_name: NVIDIA B200
+gpu_count: 4
+recipe:
+  model:
+    huggingface: nvidia/Kimi-K2.5-NVFP4
+  engine:
+    llm:
+      context_length: 262144
+      max_concurrent_requests: 36
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      gpu_memory_utilization: 0.9
+      vllm:
+        image: vllm/vllm-openai:v0.17.0
+        extra_args: --tool-call-parser kimi_k2 --reasoning-parser kimi_k2
+        extra_env: {}
+      sglang: null
+  benchmark:
+    max_concurrency: 36
+    num_prompts: 40
+    random_input_len: 8000
+    random_output_len: 8000
+  deploy:
+    gpu: NVIDIA B200
+    gpu_count: 4
+==================================================
+
+============ Serving Benchmark Result ============
+Successful requests:                     40        
+Failed requests:                         0         
+Maximum request concurrency:             36        
+Benchmark duration (s):                  259.04    
+Total input tokens:                      320000    
+Total generated tokens:                  320000    
+Request throughput (req/s):              0.15      
+Output token throughput (tok/s):         1235.31   
+Peak output token throughput (tok/s):    1836.00   
+Peak concurrent requests:                40.00     
+Total token throughput (tok/s):          2470.63   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          3696.94   
+Median TTFT (ms):                        3421.57   
+P99 TTFT (ms):                           7354.93   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          21.38     
+Median TPOT (ms):                        22.61     
+P99 TPOT (ms):                           24.79     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           21.38     
+Median ITL (ms):                         21.96     
+P99 ITL (ms):                            23.28     
+==================================================
+
+============ Docker Compose Configuration ============
+services:
+
+  vllm_0:
+    image: vllm/vllm-openai:v0.17.0
+    container_name: vllm_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1', '2', '3']
+              capabilities: [gpu]
+    volumes:
+      - /hf_models:/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=***
+      - HF_HOME=/hf_models
+    ports:
+      - "8000:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 4
+      --pipeline-parallel-size 1
+      --data-parallel-size 1
+      --model nvidia/Kimi-K2.5-NVFP4
+      --served-model-name nvidia/Kimi-K2.5-NVFP4
+      --max-model-len 262144
+      --max-num-seqs 36
+      --tool-call-parser kimi_k2 --reasoning-parser kimi_k2
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 600s
+==================================================
+
+============ Benchmark Command ============
+vllm bench serve
+    --model nvidia/Kimi-K2.5-NVFP4
+    --trust-remote-code
+    --max-concurrency 36
+    --num-prompts 40
+    --random-input-len 8000
+    --random-output-len 8000
+    --base-url http://localhost:8000
+==================================================
+
+============ System Information ============
+=== HOSTNAME ===
+bench-b200-x-4
+
+=== OS ===
+PRETTY_NAME="Ubuntu 22.04.5 LTS"
+NAME="Ubuntu"
+VERSION_ID="22.04"
+VERSION="22.04.5 LTS (Jammy Jellyfish)"
+VERSION_CODENAME=jammy
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=jammy
+
+=== KERNEL ===
+6.8.0-1048-gcp
+
+=== CPU INFORMATION ===
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 57 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  224
+On-line CPU(s) list:                     0-223
+Vendor ID:                               GenuineIntel
+Model name:                              INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.10GHz
+CPU family:                              6
+Model:                                   207
+Thread(s) per core:                      2
+Core(s) per socket:                      56
+Socket(s):                               2
+Stepping:                                2
+BogoMIPS:                                4200.00
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd arat avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq la57 rdpid cldemote movdiri movdir64b fsrm md_clear serialize tsxldtrk amx_bf16 avx512_fp16 amx_tile amx_int8 arch_capabilities
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               5.3 MiB (112 instances)
+L1i cache:                               3.5 MiB (112 instances)
+L2 cache:                                224 MiB (112 instances)
+L3 cache:                                520 MiB (2 instances)
+NUMA node(s):                            2
+NUMA node0 CPU(s):                       0-55,112-167
+NUMA node1 CPU(s):                       56-111,168-223
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Vulnerable
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+
+=== CPU COUNT ===
+224
+
+=== MEMORY ===
+               total        used        free      shared  buff/cache   available
+Mem:           3.8Ti       3.9Gi       3.8Ti       2.0Mi       1.8Gi       3.8Ti
+Swap:             0B          0B          0B
+
+=== GPU INFORMATION ===
+NVIDIA B200, 183359 MiB, 570.211.01, P0, 36, 0 %
+NVIDIA B200, 183359 MiB, 570.211.01, P0, 40, 0 %
+NVIDIA B200, 183359 MiB, 570.211.01, P0, 35, 0 %
+NVIDIA B200, 183359 MiB, 570.211.01, P0, 39, 0 %
+NVIDIA B200, 183359 MiB, 570.211.01, P0, 36, 0 %
+NVIDIA B200, 183359 MiB, 570.211.01, P0, 39, 0 %
+NVIDIA B200, 183359 MiB, 570.211.01, P0, 36, 0 %
+NVIDIA B200, 183359 MiB, 570.211.01, P0, 40, 0 %
+
+=== GPU DETAILS ===
+Mon Mar  9 15:36:14 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.211.01             Driver Version: 570.211.01     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA B200                    On  |   00000000:8F:00.0 Off |                    0 |
+| N/A   36C    P0            192W / 1000W |       0MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA B200                    On  |   00000000:90:00.0 Off |                    0 |
+| N/A   40C    P0            193W / 1000W |       0MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA B200                    On  |   00000000:96:00.0 Off |                    0 |
+| N/A   35C    P0            192W / 1000W |       0MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA B200                    On  |   00000000:97:00.0 Off |                    0 |
+| N/A   39C    P0            195W / 1000W |       0MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA B200                    On  |   00000000:C4:00.0 Off |                    0 |
+| N/A   36C    P0            197W / 1000W |       0MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA B200                    On  |   00000000:C5:00.0 Off |                    0 |
+| N/A   39C    P0            195W / 1000W |       0MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA B200                    On  |   00000000:CB:00.0 Off |                    0 |
+| N/A   36C    P0            193W / 1000W |       0MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA B200                    On  |   00000000:CC:00.0 Off |                    0 |
+| N/A   40C    P0            196W / 1000W |       0MiB / 183359MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+=== DISK USAGE ===
+Filesystem        Size  Used Avail Use% Mounted on
+/dev/root         1.9T   17G  1.9T   1% /
+tmpfs             2.0T     0  2.0T   0% /dev/shm
+tmpfs             782G  3.0M  782G   1% /run
+tmpfs             5.0M     0  5.0M   0% /run/lock
+efivarfs           56K   24K   27K  48% /sys/firmware/efi/efivars
+/dev/nvme25n1p15  105M  6.1M   99M   6% /boot/efi
+tmpfs             391G  4.0K  391G   1% /run/user/1003
+
+=== BLOCK DEVICES ===
+NAME          MAJ:MIN RM   SIZE RO TYPE MOUNTPOINTS
+loop0           7:0    0  63.8M  1 loop /snap/core20/2717
+loop1           7:1    0    74M  1 loop /snap/core22/2292
+loop2           7:2    0 434.9M  1 loop /snap/google-cloud-cli/431
+loop3           7:3    0  91.4M  1 loop /snap/lxd/36918
+loop4           7:4    0  48.1M  1 loop /snap/snapd/25935
+nvme2n1       259:0    0   375G  0 disk 
+nvme4n1       259:1    0   375G  0 disk 
+nvme5n1       259:2    0   375G  0 disk 
+nvme1n1       259:3    0   375G  0 disk 
+nvme3n1       259:4    0   375G  0 disk 
+nvme8n1       259:5    0   375G  0 disk 
+nvme10n1      259:6    0   375G  0 disk 
+nvme6n1       259:7    0   375G  0 disk 
+nvme12n1      259:8    0   375G  0 disk 
+nvme21n1      259:9    0   375G  0 disk 
+nvme0n1       259:10   0   375G  0 disk 
+nvme13n1      259:11   0   375G  0 disk 
+nvme7n1       259:12   0   375G  0 disk 
+nvme11n1      259:13   0   375G  0 disk 
+nvme19n1      259:14   0   375G  0 disk 
+nvme17n1      259:15   0   375G  0 disk 
+nvme14n1      259:16   0   375G  0 disk 
+nvme9n1       259:17   0   375G  0 disk 
+nvme24n1      259:18   0   375G  0 disk 
+nvme20n1      259:19   0   375G  0 disk 
+nvme22n1      259:20   0   375G  0 disk 
+nvme15n1      259:21   0   375G  0 disk 
+nvme27n1      259:22   0   375G  0 disk 
+nvme18n1      259:23   0   375G  0 disk 
+nvme26n1      259:24   0   375G  0 disk 
+nvme23n1      259:25   0   375G  0 disk 
+nvme25n1      259:26   0     2T  0 disk 
+├─nvme25n1p1  259:31   0     2T  0 part /
+├─nvme25n1p14 259:32   0     4M  0 part 
+└─nvme25n1p15 259:33   0   106M  0 part /boot/efi
+nvme30n1      259:27   0   375G  0 disk 
+nvme16n1      259:28   0   375G  0 disk 
+nvme28n1      259:29   0   375G  0 disk 
+nvme31n1      259:30   0   375G  0 disk 
+nvme29n1      259:34   0   375G  0 disk 
+nvme32n1      259:35   0   375G  0 disk 
+
+=== UPTIME ===
+ 15:36:15 up 1 min,  0 users,  load average: 3.94, 1.58, 0.58
+
+=== DOCKER VERSION ===
+Docker version 29.3.0, build 5927d80
+
+=== DOCKER INFO ===
+29.3.0 | OS: Ubuntu 22.04.5 LTS | Containers: 0 | Images: 0
+==================================================
