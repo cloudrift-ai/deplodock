@@ -19,6 +19,6 @@ benchmark:
 matrices:
   - deploy.gpu: "NVIDIA B200"
     deploy.gpu_count: 4
-    engine.llm.max_concurrent_requests: [32, 48, 64, 80, 96, 112, 128, 144, 160]
-    benchmark.max_concurrency: [32, 48, 64, 80, 96, 112, 128, 144, 160]
-    benchmark.num_prompts: 160
+    engine.llm.max_concurrent_requests: [32, 40, 48, 56, 64, 72, 80]
+    benchmark.max_concurrency: [32, 40, 48, 56, 64, 72, 80]
+    benchmark.num_prompts: 80
