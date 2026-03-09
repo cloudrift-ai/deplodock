@@ -3402,3 +3402,27 @@ Example curl:
     }'
 [2026-03-09 20:53:12] [mi350x_x_4.Kimi-K2.5-MXFP4] Running benchmark...
 [2026-03-09 21:13:12] [mi350x_x_4.Kimi-K2.5-MXFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-MXFP4/baseline/2026-03-09_19-12-04_50930703/mi350xx4_eevllm-R-U-A-1_vllm_benchmark.txt
+[2026-03-09 21:13:12] [deplodock.commands.bench.committer] Committed: bench: pass baseline/mi350xx4_eevllm-R-U-A-1
+[2026-03-09 21:13:12] [mi350x_x_4.Kimi-K2.5-MXFP4] Tearing down...
+[2026-03-09 21:13:12] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-09 21:13:13] [deplodock.provisioning.ssh_transport] Warning: Permanently added '37.206.67.140' (ED25519) to the list of known hosts.
+[2026-03-09 21:13:14] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-09 21:13:20] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-09 21:13:20] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-09 21:13:20] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-09 21:13:20] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-09 21:13:20] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-09 21:13:20] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-09 21:13:20] [mi350x_x_4] Deleting VM...
+[2026-03-09 21:13:20] [deplodock.provisioning.cloudrift] Terminating CloudRift instance 'dc283b66-1beb-11f1-b7e1-6b7a98a58a50'...
+[2026-03-09 21:13:21] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-03-09 21:13:21] [deplodock.provisioning.cloudrift] Instance terminated.
+[2026-03-09 21:13:21] [mi350x_x_4] VM deleted.
+[2026-03-09 21:13:21] [mi350x_x_4] Completed group: mi350x_x_4
+[2026-03-09 21:13:21] [root] 
+[2026-03-09 21:13:21] [root] SUMMARY
+[2026-03-09 21:13:21] [root] Successful: 1/1
+[2026-03-09 21:13:21] [root]    - baseline/mi350xx4_eevllm-R-U-A-1
+[2026-03-09 21:13:21] [root] 
+[2026-03-09 21:13:21] [root] All done!
+[2026-03-09 21:13:21] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-MXFP4/baseline/2026-03-09_19-12-04_50930703/benchmark.log
