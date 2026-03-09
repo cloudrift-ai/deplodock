@@ -7,7 +7,9 @@ bench and deploy CLI goes through this module.
 import asyncio
 import logging
 import os
+import secrets
 import shlex
+from datetime import datetime
 
 from deplodock.hardware import (
     DEFAULT_GCP_PROVISIONING_MODEL,
@@ -140,7 +142,9 @@ async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key,
         zone = gpu_zones[0] if gpu_zones else DEFAULT_GCP_ZONE
         provisioning_model = GPU_GCP_PROVISIONING_MODEL.get(gpu_name, DEFAULT_GCP_PROVISIONING_MODEL)
         ssh_user = gcp_config.get("ssh_user", os.environ.get("USER", "deploy"))
-        raw_name = f"bench-{server_name}" if server_name else "bench-vm"
+        ts = datetime.now().strftime("%m%d-%H%M")
+        suffix = secrets.token_hex(2)
+        raw_name = f"bench-{server_name}-{ts}-{suffix}" if server_name else f"bench-vm-{ts}-{suffix}"
         instance_name = raw_name.lower().replace("_", "-")
 
         if dry_run:
