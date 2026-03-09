@@ -4407,3 +4407,26 @@ Example curl:
     }'
 [2026-03-09 07:01:42] [b200_x_4.Kimi-K2.5-NVFP4] Running benchmark...
 [2026-03-09 07:10:42] [b200_x_4.Kimi-K2.5-NVFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-NVFP4/baseline_sglang/2026-03-09_06-38-55_e571e532/b200x4_sglang_benchmark.txt
+[2026-03-09 07:10:42] [deplodock.commands.bench.committer] Committed: bench: pass baseline_sglang/b200x4
+[2026-03-09 07:10:42] [b200_x_4.Kimi-K2.5-NVFP4] Tearing down...
+[2026-03-09 07:10:42] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-09 07:10:43] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.124.162.235' (ED25519) to the list of known hosts.
+[2026-03-09 07:10:45] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopping 
+[2026-03-09 07:10:52] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopped 
+[2026-03-09 07:10:52] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removing 
+[2026-03-09 07:10:52] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removed 
+[2026-03-09 07:10:52] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-09 07:10:52] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-09 07:10:52] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-09 07:10:52] [b200_x_4] Deleting VM...
+[2026-03-09 07:10:52] [deplodock.provisioning.gcp] Deleting instance 'bench-b200-x-4-0309-0638-5e0f' in zone 'asia-southeast1-b'...
+[2026-03-09 07:13:11] [deplodock.provisioning.gcp] Instance deleted.
+[2026-03-09 07:13:11] [b200_x_4] VM deleted.
+[2026-03-09 07:13:11] [b200_x_4] Completed group: b200_x_4
+[2026-03-09 07:13:11] [root] 
+[2026-03-09 07:13:11] [root] SUMMARY
+[2026-03-09 07:13:11] [root] Successful: 1/1
+[2026-03-09 07:13:11] [root]    - baseline_sglang/b200x4
+[2026-03-09 07:13:11] [root] 
+[2026-03-09 07:13:11] [root] All done!
+[2026-03-09 07:13:11] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-NVFP4/baseline_sglang/2026-03-09_06-38-55_e571e532/benchmark.log
