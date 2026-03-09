@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "baseline/b200x4",
+    "recipe_dir": "experiments/Kimi-K2.5-NVFP4/baseline",
+    "variant": "b200x4",
+    "recipe_name": "baseline",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 4,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x4_vllm_benchmark.txt",
+    "json_result_file": "b200x4_vllm_benchmark.json"
+  }
+]
