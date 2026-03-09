@@ -9,7 +9,7 @@ engine:
     context_length: 262144
     max_concurrent_requests: 32
     vllm:
-      image: "vllm/vllm-openai-rocm:v0.16.0"
+      image: "vllm/vllm-openai-rocm:v0.17.0"
       extra_args: "--enforce-eager --mm-encoder-tp-mode data --tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
 
 benchmark:
@@ -21,3 +21,5 @@ benchmark:
 matrices:
   - deploy.gpu: "AMD Instinct MI350X"
     deploy.gpu_count: 4
+    engine.llm.vllm.extra_env:
+      VLLM_ROCM_USE_AITER: 1
