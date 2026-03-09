@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "baseline/mi350xx4_eevllm-R-U-A-1",
+    "recipe_dir": "experiments/Kimi-K2.5-MXFP4/baseline",
+    "variant": "mi350xx4_eevllm-R-U-A-1",
+    "recipe_name": "baseline",
+    "gpu_name": "AMD Instinct MI350X",
+    "gpu_short": "mi350x",
+    "gpu_count": 4,
+    "model_name": "amd/Kimi-K2.5-MXFP4",
+    "result_file": "mi350xx4_eevllm-R-U-A-1_vllm_benchmark.txt",
+    "json_result_file": "mi350xx4_eevllm-R-U-A-1_vllm_benchmark.json"
+  }
+]
