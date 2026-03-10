@@ -212,9 +212,14 @@ jobs:
           echo "GCP_SERVICE_ACCOUNT=${{ secrets.GCP_SERVICE_ACCOUNT }}" >> "$GITHUB_ENV"
 
       - name: Configure git for result commits
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ needs.gate.outputs.pr_head_repo }}
         run: |
           git config user.name "deplodock-experiment-bot"
           git config user.email "deplodock-experiment-bot[bot]@users.noreply.github.com"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
 
       - name: Run benchmarks
         env:
