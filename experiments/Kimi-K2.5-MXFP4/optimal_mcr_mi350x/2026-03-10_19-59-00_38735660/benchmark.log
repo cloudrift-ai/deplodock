@@ -3560,3 +3560,93 @@ Example curl:
     }'
 [2026-03-10 21:33:13] [mi350x_x_4.Kimi-K2.5-MXFP4] Running benchmark...
 [2026-03-10 22:15:52] [mi350x_x_4.Kimi-K2.5-MXFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-MXFP4/optimal_mcr_mi350x/2026-03-10_19-59-00_38735660/mi350xx4_mc16_np80_mcr16_vllm_benchmark.txt
+[2026-03-10 22:15:53] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_mi350x/mi350xx4_mc16_np80_mcr16
+[2026-03-10 22:15:53] [deplodock.commands.bench.committer] git push failed: remote: Invalid username or token. Password authentication is not supported for Git operations.
+fatal: Authentication failed for 'https://github.com/cloudrift-ai/deplodock.git/'
+
+[2026-03-10 22:15:53] [mi350x_x_4.Kimi-K2.5-MXFP4] Tearing down...
+[2026-03-10 22:15:53] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-10 22:15:53] [deplodock.provisioning.ssh_transport] Warning: Permanently added '37.206.67.140' (ED25519) to the list of known hosts.
+[2026-03-10 22:15:55] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-10 22:16:02] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-10 22:16:02] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-10 22:16:03] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-10 22:16:03] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-10 22:16:03] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-10 22:16:03] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-10 22:16:03] [mi350x_x_4.Kimi-K2.5-MXFP4] Recipe: experiments/Kimi-K2.5-MXFP4/optimal_mcr_mi350x (variant: mi350xx4_mc20_np80_mcr20)
+[2026-03-10 22:16:03] [mi350x_x_4.Kimi-K2.5-MXFP4] Deploying model...
+[2026-03-10 22:16:05] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-10 22:16:06] [deplodock.provisioning.ssh_transport] Warning: Permanently added '37.206.67.140' (ED25519) to the list of known hosts.
+[2026-03-10 22:16:07] [deplodock.provisioning.ssh_transport]  Image vllm/vllm-openai-rocm:v0.17.0 Pulling 
+[2026-03-10 22:16:08] [deplodock.provisioning.ssh_transport]  Image vllm/vllm-openai-rocm:v0.17.0 Pulled 
+[2026-03-10 22:16:08] [deplodock.deploy.orchestrate] Downloading model amd/Kimi-K2.5-MXFP4...
+[2026-03-10 22:16:09] [deplodock.provisioning.ssh_transport] Warning: Permanently added '37.206.67.140' (ED25519) to the list of known hosts.
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: huggingface_hub[cli,hf_transfer] in /usr/local/lib/python3.12/dist-packages (0.36.2)
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (3.25.0)
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2026.2.0)
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: hf-xet<2.0.0,>=1.1.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (1.3.2)
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: packaging>=20.9 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (26.0)
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: pyyaml>=5.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (6.0.3)
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: requests in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (2.32.5)
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: tqdm>=4.42.1 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.67.3)
+[2026-03-10 22:16:10] [deplodock.provisioning.ssh_transport] Requirement already satisfied: typing-extensions>=3.7.4.3 in /usr/local/lib/python3.12/dist-packages (from huggingface_hub[cli,hf_transfer]) (4.15.0)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Collecting InquirerPy==0.3.4 (from huggingface_hub[cli,hf_transfer])
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport]   Downloading InquirerPy-0.3.4-py3-none-any.whl.metadata (8.1 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Collecting hf_transfer>=0.1.4 (from huggingface_hub[cli,hf_transfer])
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport]   Downloading hf_transfer-0.1.9-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (1.7 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Collecting pfzy<0.4.0,>=0.3.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport]   Downloading pfzy-0.3.4-py3-none-any.whl.metadata (4.9 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Collecting prompt-toolkit<4.0.0,>=3.0.1 (from InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport]   Downloading prompt_toolkit-3.0.52-py3-none-any.whl.metadata (6.4 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Collecting wcwidth (from prompt-toolkit<4.0.0,>=3.0.1->InquirerPy==0.3.4->huggingface_hub[cli,hf_transfer])
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport]   Downloading wcwidth-0.6.0-py3-none-any.whl.metadata (30 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.4.5)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Requirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (3.11)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Requirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2.6.3)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Requirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.12/dist-packages (from requests->huggingface_hub[cli,hf_transfer]) (2026.2.25)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Downloading InquirerPy-0.3.4-py3-none-any.whl (67 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Downloading pfzy-0.3.4-py3-none-any.whl (8.5 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Downloading prompt_toolkit-3.0.52-py3-none-any.whl (391 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Downloading hf_transfer-0.1.9-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (3.6 MB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport]    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.6/3.6 MB 44.5 MB/s  0:00:00
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Downloading wcwidth-0.6.0-py3-none-any.whl (94 kB)
+[2026-03-10 22:16:11] [deplodock.provisioning.ssh_transport] Installing collected packages: wcwidth, pfzy, hf_transfer, prompt-toolkit, InquirerPy
+[2026-03-10 22:16:12] [deplodock.provisioning.ssh_transport] 
+[2026-03-10 22:16:12] [deplodock.provisioning.ssh_transport] Successfully installed InquirerPy-0.3.4 hf_transfer-0.1.9 pfzy-0.3.4 prompt-toolkit-3.0.52 wcwidth-0.6.0
+[2026-03-10 22:16:12] [deplodock.provisioning.ssh_transport] WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[2026-03-10 22:16:12] [deplodock.provisioning.ssh_transport] [33m⚠️  Warning: 'huggingface-cli download' is deprecated. Use 'hf download' instead.[0m
+[2026-03-10 22:16:12] [deplodock.provisioning.ssh_transport] /hf_models/hub/models--amd--Kimi-K2.5-MXFP4/snapshots/d06f28df501ab1dbf6e857d1fd9a99397e02e535
+[2026-03-10 22:16:13] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-03-10 22:16:13] [deplodock.provisioning.ssh_transport] Warning: Permanently added '37.206.67.140' (ED25519) to the list of known hosts.
+[2026-03-10 22:16:14] [deplodock.deploy.orchestrate] Starting services...
+[2026-03-10 22:16:15] [deplodock.provisioning.ssh_transport] Warning: Permanently added '37.206.67.140' (ED25519) to the list of known hosts.
+[2026-03-10 22:16:16] [deplodock.provisioning.ssh_transport]  Network deploy_default Creating 
+[2026-03-10 22:16:16] [deplodock.provisioning.ssh_transport]  Network deploy_default Created 
+[2026-03-10 22:16:16] [deplodock.provisioning.ssh_transport]  Container vllm_0 Creating 
+[2026-03-10 22:16:16] [deplodock.provisioning.ssh_transport]  Container vllm_0 Created 
+[2026-03-10 22:16:16] [deplodock.provisioning.ssh_transport]  Container vllm_0 Starting 
+[2026-03-10 22:16:17] [deplodock.provisioning.ssh_transport]  Container vllm_0 Started 
+[2026-03-10 22:16:17] [deplodock.provisioning.ssh_transport]  Container vllm_0 Waiting 
+[2026-03-10 22:24:21] [deplodock.provisioning.ssh_transport]  Container vllm_0 Healthy 
+[2026-03-10 22:24:21] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-03-10 22:24:21] [deplodock.provisioning.ssh_transport] Warning: Permanently added '37.206.67.140' (ED25519) to the list of known hosts.
+[2026-03-10 22:24:22] [deplodock.deploy.orchestrate] 
+Endpoint: http://37.206.67.140:8000/v1
+[2026-03-10 22:24:22] [deplodock.deploy.orchestrate] Model: amd/Kimi-K2.5-MXFP4
+[2026-03-10 22:24:22] [deplodock.deploy.orchestrate] Instances: 1
+[2026-03-10 22:24:22] [deplodock.deploy.orchestrate] Status: deployed
+[2026-03-10 22:24:22] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-03-10 22:24:27] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-03-10 22:24:27] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-03-10 22:24:27] [deplodock.deploy.orchestrate]   curl http://37.206.67.140:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "amd/Kimi-K2.5-MXFP4",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-03-10 22:24:27] [mi350x_x_4.Kimi-K2.5-MXFP4] Running benchmark...
+[2026-03-10 23:00:35] [mi350x_x_4.Kimi-K2.5-MXFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5-MXFP4/optimal_mcr_mi350x/2026-03-10_19-59-00_38735660/mi350xx4_mc20_np80_mcr20_vllm_benchmark.txt
