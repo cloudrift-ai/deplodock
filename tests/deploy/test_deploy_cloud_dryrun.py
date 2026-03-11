@@ -8,7 +8,7 @@ import yaml
 
 
 def test_deploy_cloud_dry_run(run_cli, tmp_path):
-    """Cloud deploy works with a recipe that has deploy.gpu in base config."""
+    """Cloud deploy resolves matrix entry from --gpu and --gpu-count."""
     recipe = {
         "model": {"huggingface": "test-org/test-model"},
         "engine": {
@@ -17,10 +17,12 @@ def test_deploy_cloud_dry_run(run_cli, tmp_path):
                 "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
             }
         },
-        "deploy": {
-            "gpu": "NVIDIA GeForce RTX 5090",
-            "gpu_count": 1,
-        },
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA GeForce RTX 5090",
+                "deploy.gpu_count": 1,
+            },
+        ],
     }
     with open(tmp_path / "recipe.yaml", "w") as f:
         yaml.dump(recipe, f)
@@ -30,6 +32,10 @@ def test_deploy_cloud_dry_run(run_cli, tmp_path):
         "cloud",
         "--recipe",
         str(tmp_path),
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
         "--dry-run",
     )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
@@ -45,10 +51,12 @@ def test_deploy_cloud_dry_run_deploy_steps(run_cli, tmp_path):
                 "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
             }
         },
-        "deploy": {
-            "gpu": "NVIDIA GeForce RTX 5090",
-            "gpu_count": 1,
-        },
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA GeForce RTX 5090",
+                "deploy.gpu_count": 1,
+            },
+        ],
     }
     with open(tmp_path / "recipe.yaml", "w") as f:
         yaml.dump(recipe, f)
@@ -58,6 +66,10 @@ def test_deploy_cloud_dry_run_deploy_steps(run_cli, tmp_path):
         "cloud",
         "--recipe",
         str(tmp_path),
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
         "--dry-run",
     )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
@@ -69,8 +81,8 @@ def test_deploy_cloud_dry_run_deploy_steps(run_cli, tmp_path):
     assert "dry-run (not deployed)" in stdout
 
 
-def test_deploy_cloud_no_gpu_fails(run_cli, recipes_dir):
-    """Without deploy.gpu in base config, cloud deploy fails."""
+def test_deploy_cloud_missing_gpu_flag_fails(run_cli, recipes_dir):
+    """Without --gpu and --gpu-count, cloud deploy fails (required args)."""
     rc, stdout, stderr = run_cli(
         "deploy",
         "cloud",
@@ -79,7 +91,7 @@ def test_deploy_cloud_no_gpu_fails(run_cli, recipes_dir):
         "--dry-run",
     )
     assert rc != 0
-    assert "gpu" in stderr.lower() or "gpu" in stdout.lower()
+    assert "gpu" in stderr.lower()
 
 
 # ── CLI help ─────────────────────────────────────────────────────

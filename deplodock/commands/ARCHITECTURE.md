@@ -26,7 +26,7 @@ Recipe loading, configuration dataclasses, and engine flag mapping.
 
 **Modules:**
 - `types.py` — `Recipe`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig` dataclasses
-- `recipe.py` — `deep_merge()`, `load_recipe()`, `validate_extra_args()`
+- `recipe.py` — `deep_merge()`, `load_recipe()`, `resolve_for_hardware()`, `validate_extra_args()`
 - `engines.py` — `VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`, `banned_extra_arg_flags()`, `build_engine_args()`
 
 `load_recipe()` returns a `Recipe` dataclass. All consumers use attribute access (e.g. `recipe.engine.llm.tensor_parallel_size`).
@@ -40,6 +40,7 @@ The central orchestration layer. Provides a single entry point for deploying rec
 - `compose.py` — `calculate_num_instances()`, `generate_compose()`, `generate_nginx_conf()`
 - `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`
 - `ssh.py` — `ssh_base_args()`, `make_run_cmd()`, `scp_file()`, `make_write_file()`
+- `scale_out.py` — `ScaleOutStrategy` ABC, `DataParallelismScaleOutStrategy`, `ReplicaParallelismScaleOutStrategy`, `STRATEGIES`, `DEFAULT_STRATEGY`
 - `local.py` — `make_run_cmd()`, `make_write_file()` (local subprocess transport)
 
 **GPU visibility:** `generate_compose()` accepts a `gpu_device_ids` parameter to restrict GPU visibility via `device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
@@ -95,9 +96,9 @@ async def _handle_foo(args):
 
 **Command modules:**
 - `commands/bench/` — `handle_bench()`, `register_bench_command()`, `GitCommitter` (incremental result commits)
-- `commands/deploy/ssh.py` — `handle_ssh()`, `register_ssh_target()`
-- `commands/deploy/local.py` — `handle_local()`, `register_local_target()`
-- `commands/deploy/cloud.py` — `handle_cloud()`, `register_cloud_target()`
+- `commands/deploy/ssh.py` — `handle_ssh()`, `register_ssh_target()` — auto-detects remote GPU via SSH, resolves matrix, applies scale-out strategy
+- `commands/deploy/local.py` — `handle_local()`, `register_local_target()` — auto-detects local GPU via PCI sysfs, resolves matrix, applies scale-out strategy
+- `commands/deploy/cloud.py` — `handle_cloud()`, `register_cloud_target()` — uses recipe's `deploy.gpu` for matrix resolution
 - `commands/teardown.py` — `handle_teardown()`, `register_teardown_command()`
 - `commands/vm/` — `register_vm_command()`, CLI handlers for each provider
 

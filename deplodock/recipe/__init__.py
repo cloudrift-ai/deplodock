@@ -11,6 +11,7 @@ from deplodock.recipe.recipe import (
     _validate_and_build,
     deep_merge,
     load_recipe,
+    resolve_for_hardware,
     validate_extra_args,
 )
 from deplodock.recipe.types import (
@@ -42,5 +43,6 @@ __all__ = [
     "dot_to_nested",
     "expand_matrix_entry",
     "load_recipe",
+    "resolve_for_hardware",
     "validate_extra_args",
 ]

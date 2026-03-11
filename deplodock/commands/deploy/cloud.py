@@ -13,7 +13,7 @@ from deplodock.provisioning.cloud import (
     provision_cloud_vm,
 )
 from deplodock.provisioning.remote import provision_remote
-from deplodock.recipe import load_recipe
+from deplodock.recipe import resolve_for_hardware
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,8 @@ def handle_cloud(args):
 
 
 async def _handle_cloud(args):
-    recipe = load_recipe(args.recipe)
-
-    if not recipe.deploy.gpu:
-        logger.error("Error: recipe must have a 'deploy.gpu' field for cloud provisioning.")
-        sys.exit(1)
+    recipe = resolve_for_hardware(args.recipe, args.gpu, args.gpu_count)
+    logger.info(f"GPU: {recipe.deploy.gpu_count}x {recipe.deploy.gpu}")
 
     ssh_key = os.path.expanduser(args.ssh_key)
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
@@ -70,4 +67,6 @@ def register_cloud_target(subparsers):
     parser.add_argument("--hf-token", default=None, help="HuggingFace token (default: $HF_TOKEN)")
     parser.add_argument("--model-dir", default="/hf_models", help="Model cache directory")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    parser.add_argument("--gpu", required=True, help="GPU name (selects matching matrix entry)")
+    parser.add_argument("--gpu-count", type=int, required=True, help="GPU count (selects matching matrix entry)")
     parser.set_defaults(func=handle_cloud)
