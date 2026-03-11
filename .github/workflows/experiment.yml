@@ -213,13 +213,21 @@ jobs:
 
       - name: Configure git for result commits
         env:
-          TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO: ${{ needs.gate.outputs.pr_head_repo }}
+          APP_PRIVATE_KEY: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
         run: |
           git config user.name "deplodock-experiment-bot"
           git config user.email "deplodock-experiment-bot[bot]@users.noreply.github.com"
+
+          # Store app key for credential helper
+          echo "$APP_PRIVATE_KEY" > /tmp/app-key.pem
+          chmod 600 /tmp/app-key.pem
+
+          # Replace the static token (set by actions/checkout) with a credential
+          # helper that generates a fresh GitHub App token on every push.
           git config --local --unset-all http.https://github.com/.extraheader || true
-          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git config --local credential.helper ""
+          git config --local --add credential.helper \
+            "!APP_ID=${{ secrets.EXPERIMENT_APP_ID }} APP_KEY_FILE=/tmp/app-key.pem ${GITHUB_WORKSPACE}/.github/scripts/git-credential-github-app.sh"
 
       - name: Run benchmarks
         env:
@@ -238,13 +246,7 @@ jobs:
 
       - name: Collect and commit remaining results
         if: always()
-        env:
-          TOKEN: ${{ steps.app-token-refresh.outputs.token }}
-          REPO: ${{ needs.gate.outputs.pr_head_repo }}
         run: |
-          git config --local --unset-all http.https://github.com/.extraheader || true
-          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
-
           experiments='${{ needs.gate.outputs.experiments }}'
           dirs=$(echo "$experiments" | python -c "import sys, json; print(' '.join(json.load(sys.stdin)))")
 
@@ -316,9 +318,9 @@ jobs:
               body,
             });
 
-      - name: Cleanup GCP credentials
+      - name: Cleanup credentials
         if: always()
-        run: rm -f /tmp/gcp-key.json
+        run: rm -f /tmp/gcp-key.json /tmp/app-key.pem
 
   notify-failure:
     needs: [gate, benchmark]
