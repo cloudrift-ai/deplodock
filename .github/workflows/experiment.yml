@@ -222,12 +222,39 @@ jobs:
           echo "$APP_PRIVATE_KEY" > /tmp/app-key.pem
           chmod 600 /tmp/app-key.pem
 
-          # Replace the static token (set by actions/checkout) with a credential
-          # helper that generates a fresh GitHub App token on every push.
+          # Write credential helper that generates a fresh GitHub App token
+          # on every git push (avoids 1-hour token expiry during long runs).
+          cat > /tmp/git-credential-github-app.sh << 'CREDEOF'
+          #!/bin/bash
+          set -euo pipefail
+          [ "${1:-}" = "get" ] || exit 0
+          HOST=""
+          while IFS='=' read -r key value; do
+            case "$key" in host) HOST="$value" ;; esac
+          done
+          [ "$HOST" = "github.com" ] || exit 0
+          NOW=$(date +%s)
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+          PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((NOW-60))" "$((NOW+600))" "$APP_ID" | b64url)
+          SIG=$(printf '%s.%s' "$HEADER" "$PAYLOAD" | openssl dgst -sha256 -sign "$APP_KEY_FILE" -binary | b64url)
+          JWT="${HEADER}.${PAYLOAD}.${SIG}"
+          INSTALL_ID=$(curl -sf -H "Authorization: Bearer $JWT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/installation" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          TOKEN=$(curl -sf -X POST -H "Authorization: Bearer $JWT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+          echo "protocol=https"
+          echo "host=github.com"
+          echo "username=x-access-token"
+          echo "password=${TOKEN}"
+          CREDEOF
+          chmod +x /tmp/git-credential-github-app.sh
+
+          # Replace the static token (set by actions/checkout) with the credential helper
           git config --local --unset-all http.https://github.com/.extraheader || true
           git config --local credential.helper ""
           git config --local --add credential.helper \
-            "!APP_ID=${{ secrets.EXPERIMENT_APP_ID }} APP_KEY_FILE=/tmp/app-key.pem bash ${GITHUB_WORKSPACE}/.github/scripts/git-credential-github-app.sh"
+            "!APP_ID=${{ secrets.EXPERIMENT_APP_ID }} APP_KEY_FILE=/tmp/app-key.pem /tmp/git-credential-github-app.sh"
 
       - name: Run benchmarks
         env:
@@ -320,7 +347,7 @@ jobs:
 
       - name: Cleanup credentials
         if: always()
-        run: rm -f /tmp/gcp-key.json /tmp/app-key.pem
+        run: rm -f /tmp/gcp-key.json /tmp/app-key.pem /tmp/git-credential-github-app.sh
 
   notify-failure:
     needs: [gate, benchmark]
