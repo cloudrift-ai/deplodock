@@ -227,7 +227,7 @@ jobs:
           git config --local --unset-all http.https://github.com/.extraheader || true
           git config --local credential.helper ""
           git config --local --add credential.helper \
-            "!APP_ID=${{ secrets.EXPERIMENT_APP_ID }} APP_KEY_FILE=/tmp/app-key.pem ${GITHUB_WORKSPACE}/.github/scripts/git-credential-github-app.sh"
+            "!APP_ID=${{ secrets.EXPERIMENT_APP_ID }} APP_KEY_FILE=/tmp/app-key.pem bash ${GITHUB_WORKSPACE}/.github/scripts/git-credential-github-app.sh"
 
       - name: Run benchmarks
         env:
