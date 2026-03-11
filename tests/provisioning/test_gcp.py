@@ -35,6 +35,8 @@ def test_gcloud_create_cmd():
         "--instance-termination-action=DELETE",
         "--request-valid-for-duration",
         "2h",
+        "--timeout",
+        "7500",
     ]
 
 

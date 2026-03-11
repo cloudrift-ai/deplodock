@@ -170,7 +170,7 @@ jobs:
     needs: gate
     if: needs.gate.outputs.experiments != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 1440
+    timeout-minutes: 360
     steps:
       - name: Generate app token
         id: app-token
