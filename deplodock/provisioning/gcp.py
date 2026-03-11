@@ -63,10 +63,10 @@ def _gcloud_create_cmd(
         cmd.append(f"--instance-termination-action={termination_action}")
         if request_valid_for_duration:
             cmd.extend(["--request-valid-for-duration", request_valid_for_duration])
-            # Tell gcloud to wait longer than the FLEX_START deadline so it
-            # doesn't give up at its default 1800s while GCP is still trying.
-            gcloud_timeout = _duration_to_seconds(request_valid_for_duration) + 300
-            cmd.extend(["--timeout", str(gcloud_timeout)])
+        # Return immediately; we poll for RUNNING status ourselves.
+        # Without --async, gcloud waits up to 1800s internally which is
+        # shorter than typical FLEX_START provisioning windows.
+        cmd.append("--async")
     if extra_gcloud_args:
         cmd.extend(shlex.split(extra_gcloud_args))
     return cmd
@@ -231,6 +231,8 @@ async def create_instance(
 
     logger.info(f"Waiting for instance to reach RUNNING status (timeout: {timeout}s)...")
     if not await wait_for_status(instance, zone, "RUNNING", timeout, dry_run=dry_run):
+        logger.warning(f"Deleting instance '{instance}' after provisioning timeout...")
+        await run_shell_cmd(_gcloud_delete_cmd(instance, zone), dry_run=dry_run)
         return None
     logger.info("Instance is RUNNING.")
 
