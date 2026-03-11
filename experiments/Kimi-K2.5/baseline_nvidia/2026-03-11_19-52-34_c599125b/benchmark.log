@@ -6605,3 +6605,28 @@ Example curl:
     }'
 [2026-03-11 20:30:42] [b200_x_8.Kimi-K2.5-NVFP4] Running benchmark...
 [2026-03-11 20:35:36] [b200_x_8.Kimi-K2.5-NVFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/baseline_nvidia/2026-03-11_19-52-34_c599125b/b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2_sglang_benchmark.txt
+[2026-03-11 20:35:36] [deplodock.commands.bench.committer] Committed: bench: pass baseline_nvidia/b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2
+[2026-03-11 20:35:37] [deplodock.commands.bench.committer] Pushed to remote
+[2026-03-11 20:35:37] [b200_x_8.Kimi-K2.5-NVFP4] Tearing down...
+[2026-03-11 20:35:37] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-11 20:35:38] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.143.185.48' (ED25519) to the list of known hosts.
+[2026-03-11 20:35:40] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopping 
+[2026-03-11 20:35:50] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopped 
+[2026-03-11 20:35:50] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removing 
+[2026-03-11 20:35:50] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removed 
+[2026-03-11 20:35:50] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-11 20:35:50] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-11 20:35:50] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-11 20:35:50] [b200_x_8] Deleting VM...
+[2026-03-11 20:35:50] [deplodock.provisioning.gcp] Deleting instance 'bench-b200-x-8-0311-1952-8135' in zone 'asia-southeast1-b'...
+[2026-03-11 20:38:03] [deplodock.provisioning.gcp] Instance deleted.
+[2026-03-11 20:38:03] [b200_x_8] VM deleted.
+[2026-03-11 20:38:03] [b200_x_8] Completed group: b200_x_8
+[2026-03-11 20:38:03] [root] 
+[2026-03-11 20:38:03] [root] SUMMARY
+[2026-03-11 20:38:03] [root] Successful: 2/2
+[2026-03-11 20:38:03] [root]    - baseline_nvidia/b200x8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2
+[2026-03-11 20:38:03] [root]    - baseline_nvidia/b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2
+[2026-03-11 20:38:03] [root] 
+[2026-03-11 20:38:03] [root] All done!
+[2026-03-11 20:38:03] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/baseline_nvidia/2026-03-11_19-52-34_c599125b/benchmark.log
