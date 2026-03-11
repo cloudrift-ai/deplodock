@@ -10,6 +10,8 @@ engine:
     vllm:
       image: "vllm/vllm-openai-rocm:v0.17.0"
       extra_args: "--mm-encoder-tp-mode data --tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
+      extra_env:
+        VLLM_ROCM_USE_AITER: 1
 
 benchmark:
   random_input_len: 8000

@@ -11,6 +11,8 @@ engine:
     vllm:
       image: "vllm/vllm-openai-rocm:v0.17.0"
       extra_args: "--enforce-eager --mm-encoder-tp-mode data --tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
+      extra_env:
+        VLLM_ROCM_USE_AITER: 1
 
 benchmark:
   max_concurrency: 8
@@ -21,5 +23,3 @@ benchmark:
 matrices:
   - deploy.gpu: "AMD Instinct MI350X"
     deploy.gpu_count: 4
-    engine.llm.vllm.extra_env:
-      VLLM_ROCM_USE_AITER: 1
