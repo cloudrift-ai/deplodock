@@ -9,6 +9,16 @@ from deplodock.provisioning.types import VMConnectionInfo
 
 logger = logging.getLogger(__name__)
 
+
+def _duration_to_seconds(duration: str) -> int:
+    """Convert a GCP duration string (e.g. '2h', '30m', '1800s') to seconds."""
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    suffix = duration[-1]
+    if suffix in units:
+        return int(duration[:-1]) * units[suffix]
+    return int(duration)
+
+
 # ── Command builders ───────────────────────────────────────────────
 
 
@@ -53,6 +63,10 @@ def _gcloud_create_cmd(
         cmd.append(f"--instance-termination-action={termination_action}")
         if request_valid_for_duration:
             cmd.extend(["--request-valid-for-duration", request_valid_for_duration])
+            # Tell gcloud to wait longer than the FLEX_START deadline so it
+            # doesn't give up at its default 1800s while GCP is still trying.
+            gcloud_timeout = _duration_to_seconds(request_valid_for_duration) + 300
+            cmd.extend(["--timeout", str(gcloud_timeout)])
     if extra_gcloud_args:
         cmd.extend(shlex.split(extra_gcloud_args))
     return cmd
