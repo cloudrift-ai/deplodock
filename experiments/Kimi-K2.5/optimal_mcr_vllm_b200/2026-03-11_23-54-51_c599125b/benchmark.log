@@ -3235,3 +3235,42 @@ Example curl:
     }'
 [2026-03-12 01:42:30] [b200_x_8.Kimi-K2.5-NVFP4] Running benchmark...
 [2026-03-12 01:46:25] [b200_x_8.Kimi-K2.5-NVFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/optimal_mcr_vllm_b200/2026-03-11_23-54-51_c599125b/b200x8_mc80_np80_mcr80_vllm_benchmark.txt
+[2026-03-12 01:46:25] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_vllm_b200/b200x8_mc80_np80_mcr80
+[2026-03-12 01:46:26] [deplodock.commands.bench.committer] git push failed: remote: Internal Server Error        
+remote: Request ID AC10:1D8B10:237D17:3036F3:69B21AF1        
+remote: Time 2026-03-12T01:46:26Z
+To https://github.com/cloudrift-ai/deplodock
+ ! [remote rejected] experiment/kimi-k2.5-default -> experiment/kimi-k2.5-default (Internal Server Error)
+error: failed to push some refs to 'https://github.com/cloudrift-ai/deplodock'
+
+[2026-03-12 01:46:26] [b200_x_8.Kimi-K2.5-NVFP4] Tearing down...
+[2026-03-12 01:46:26] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-12 01:46:27] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.142.243.134' (ED25519) to the list of known hosts.
+[2026-03-12 01:46:29] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-12 01:46:36] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-12 01:46:36] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-12 01:46:37] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-12 01:46:37] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-12 01:46:37] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-12 01:46:37] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-12 01:46:37] [b200_x_8] Deleting VM...
+[2026-03-12 01:46:37] [deplodock.provisioning.gcp] Deleting instance 'bench-b200-x-8-0311-2354-ca6f' in zone 'asia-southeast1-b'...
+[2026-03-12 01:48:47] [deplodock.provisioning.gcp] Instance deleted.
+[2026-03-12 01:48:47] [b200_x_8] VM deleted.
+[2026-03-12 01:48:47] [b200_x_8] Completed group: b200_x_8
+[2026-03-12 01:48:47] [root] 
+[2026-03-12 01:48:47] [root] SUMMARY
+[2026-03-12 01:48:47] [root] Successful: 10/10
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc44_np80_mcr44
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc48_np80_mcr48
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc52_np80_mcr52
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc56_np80_mcr56
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc60_np80_mcr60
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc64_np80_mcr64
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc68_np80_mcr68
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc72_np80_mcr72
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc76_np80_mcr76
+[2026-03-12 01:48:47] [root]    - optimal_mcr_vllm_b200/b200x8_mc80_np80_mcr80
+[2026-03-12 01:48:47] [root] 
+[2026-03-12 01:48:47] [root] All done!
+[2026-03-12 01:48:47] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/optimal_mcr_vllm_b200/2026-03-11_23-54-51_c599125b/benchmark.log

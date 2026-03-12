@@ -3229,3 +3229,21 @@ Example curl:
     }'
 [2026-03-12 01:42:30] [b200_x_8.Kimi-K2.5-NVFP4] Running benchmark...
 [2026-03-12 01:46:25] [b200_x_8.Kimi-K2.5-NVFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/optimal_mcr_vllm_b200/2026-03-11_23-54-51_c599125b/b200x8_mc80_np80_mcr80_vllm_benchmark.txt
+[2026-03-12 01:46:25] [deplodock.commands.bench.committer] Committed: bench: pass optimal_mcr_vllm_b200/b200x8_mc80_np80_mcr80
+[2026-03-12 01:46:26] [deplodock.commands.bench.committer] git push failed: remote: Internal Server Error        
+remote: Request ID AC10:1D8B10:237D17:3036F3:69B21AF1        
+remote: Time 2026-03-12T01:46:26Z
+To https://github.com/cloudrift-ai/deplodock
+ ! [remote rejected] experiment/kimi-k2.5-default -> experiment/kimi-k2.5-default (Internal Server Error)
+error: failed to push some refs to 'https://github.com/cloudrift-ai/deplodock'
+
+[2026-03-12 01:46:26] [b200_x_8.Kimi-K2.5-NVFP4] Tearing down...
+[2026-03-12 01:46:26] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-12 01:46:27] [deplodock.provisioning.ssh_transport] Warning: Permanently added '34.142.243.134' (ED25519) to the list of known hosts.
+[2026-03-12 01:46:29] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopping 
+[2026-03-12 01:46:36] [deplodock.provisioning.ssh_transport]  Container vllm_0 Stopped 
+[2026-03-12 01:46:36] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removing 
+[2026-03-12 01:46:37] [deplodock.provisioning.ssh_transport]  Container vllm_0 Removed 
+[2026-03-12 01:46:37] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-12 01:46:37] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-12 01:46:37] [deplodock.deploy.orchestrate] Teardown complete.
