@@ -6855,3 +6855,28 @@ Example curl:
     }'
 [2026-03-14 01:01:23] [b200_x_8.Kimi-K2.5-NVFP4] Running benchmark...
 [2026-03-14 01:08:02] [b200_x_8.Kimi-K2.5-NVFP4] Results saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/baseline_b200/2026-03-13_19-40-32_c599125b/b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2_sglang_benchmark.txt
+[2026-03-14 01:08:02] [deplodock.commands.bench.committer] Committed: bench: pass baseline_b200/b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2
+[2026-03-14 01:08:04] [deplodock.commands.bench.committer] Pushed to remote
+[2026-03-14 01:08:04] [b200_x_8.Kimi-K2.5-NVFP4] Tearing down...
+[2026-03-14 01:08:04] [deplodock.deploy.orchestrate] Tearing down...
+[2026-03-14 01:08:05] [deplodock.provisioning.ssh_transport] Warning: Permanently added '136.110.62.167' (ED25519) to the list of known hosts.
+[2026-03-14 01:08:07] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopping 
+[2026-03-14 01:08:14] [deplodock.provisioning.ssh_transport]  Container sglang_0 Stopped 
+[2026-03-14 01:08:14] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removing 
+[2026-03-14 01:08:14] [deplodock.provisioning.ssh_transport]  Container sglang_0 Removed 
+[2026-03-14 01:08:14] [deplodock.provisioning.ssh_transport]  Network deploy_default Removing 
+[2026-03-14 01:08:14] [deplodock.provisioning.ssh_transport]  Network deploy_default Removed 
+[2026-03-14 01:08:14] [deplodock.deploy.orchestrate] Teardown complete.
+[2026-03-14 01:08:14] [b200_x_8] Deleting VM...
+[2026-03-14 01:08:14] [deplodock.provisioning.gcp] Deleting instance 'bench-b200-x-8-0314-0022-d91d' in zone 'asia-southeast1-b'...
+[2026-03-14 01:10:33] [deplodock.provisioning.gcp] Instance deleted.
+[2026-03-14 01:10:33] [b200_x_8] VM deleted.
+[2026-03-14 01:10:33] [b200_x_8] Completed group: b200_x_8
+[2026-03-14 01:10:33] [root] 
+[2026-03-14 01:10:33] [root] SUMMARY
+[2026-03-14 01:10:33] [root] Successful: 2/2
+[2026-03-14 01:10:33] [root]    - baseline_b200/b200x8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2
+[2026-03-14 01:10:33] [root]    - baseline_b200/b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2
+[2026-03-14 01:10:33] [root] 
+[2026-03-14 01:10:33] [root] All done!
+[2026-03-14 01:10:33] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/baseline_b200/2026-03-13_19-40-32_c599125b/benchmark.log
