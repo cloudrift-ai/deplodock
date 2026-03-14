@@ -1,0 +1,26 @@
+[
+  {
+    "task_id": "baseline_b200/b200x8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2",
+    "recipe_dir": "experiments/Kimi-K2.5/baseline_b200",
+    "variant": "b200x8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2",
+    "recipe_name": "baseline_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2_vllm_benchmark.txt",
+    "json_result_file": "b200x8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2_vllm_benchmark.json"
+  },
+  {
+    "task_id": "baseline_b200/b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2",
+    "recipe_dir": "experiments/Kimi-K2.5/baseline_b200",
+    "variant": "b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2",
+    "recipe_name": "baseline_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2_sglang_benchmark.txt",
+    "json_result_file": "b200x8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2_sglang_benchmark.json"
+  }
+]
