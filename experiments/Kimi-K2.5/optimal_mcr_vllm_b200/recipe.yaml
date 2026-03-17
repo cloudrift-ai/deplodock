@@ -1,5 +1,5 @@
 model:
-  huggingface: "nvidia/Kimi-K2.5
+  huggingface: "nvidia/Kimi-K2.5"
 
 engine:
   llm:
@@ -18,6 +18,6 @@ benchmark:
 matrices:
   - deploy.gpu: "NVIDIA B200"
     deploy.gpu_count: 8
-    engine.llm.max_concurrent_requests: [16, 20, 24, 28, 32, 36, 40, 44, 48]
-    benchmark.max_concurrency: [16, 20, 24, 28, 32, 36, 40, 44, 48]
+    engine.llm.max_concurrent_requests: [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]
+    benchmark.max_concurrency: [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]
     benchmark.num_prompts: 48
