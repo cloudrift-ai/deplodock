@@ -1,5 +1,5 @@
 model:
-  huggingface: "nvidia/Kimi-K2.5-NVFP4"
+  huggingface: "nvidia/Kimi-K2.5"
 
 engine:
   llm:
