@@ -1,0 +1,3 @@
+[2026-03-17 19:47:41] [amdmi350x_x_8] Starting group: AMD MI350X x8 (2 tasks)
+[2026-03-17 19:47:41] [amdmi350x_x_8] Unknown GPU 'AMD MI350X' — not in hardware table
+[2026-03-17 19:47:41] [amdmi350x_x_8] VM provisioning failed
