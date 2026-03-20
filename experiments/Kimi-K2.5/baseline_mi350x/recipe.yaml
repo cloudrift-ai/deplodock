@@ -1,5 +1,5 @@
 model:
-  huggingface: "nvidia/Kimi-K2.5"
+  huggingface: "moonshotai/Kimi-K2.5"
 
 engine:
   llm:
