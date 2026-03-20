@@ -18,10 +18,10 @@ matrices:
   - deploy.gpu: "AMD Instinct MI350X"
     deploy.gpu_count: 8
     engine.llm.vllm:
-      image: "vllm/vllm-openai:v0.17.0"
+      image: "vllm/vllm-openai-rocm:v0.17.1"
       extra_args: "--tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
   - deploy.gpu: "AMD Instinct MI350X"
     deploy.gpu_count: 8
     engine.llm.sglang:
-      image: "lmsysorg/sglang:v0.5.9"
+      image: "lmsysorg/sglang:v0.5.9-rocm720-mi35x"
       extra_args: "--tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
