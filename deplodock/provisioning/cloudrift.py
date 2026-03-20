@@ -329,7 +329,8 @@ async def create_instance(
 
     if wait_ssh and ssh_private_key_path:
         logger.info("Waiting for SSH connectivity...")
-        await wait_for_ssh(conn.host, conn.username, conn.ssh_port, ssh_private_key_path)
+        if not await wait_for_ssh(conn.host, conn.username, conn.ssh_port, ssh_private_key_path):
+            return None
 
     return conn
 
