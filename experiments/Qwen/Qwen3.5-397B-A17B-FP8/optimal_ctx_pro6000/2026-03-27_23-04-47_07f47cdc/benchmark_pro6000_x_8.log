@@ -3914,3 +3914,5 @@
 [2026-03-27 23:10:36] [deplodock.provisioning.ssh_transport] bash: line 1: huggingface-cli: command not found
 [2026-03-27 23:10:36] [deplodock.deploy.orchestrate] Failed to download model
 [2026-03-27 23:10:36] [pro6000_x_8.Qwen3.5-397B-A17B-FP8] Deploy failed, skipping benchmark
+[2026-03-27 23:10:36] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_pro6000/pro6000x8_cl262144
+[2026-03-27 23:10:37] [deplodock.commands.bench.committer] Pushed to remote

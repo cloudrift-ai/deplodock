@@ -3925,3 +3925,25 @@
 [2026-03-27 23:10:36] [deplodock.provisioning.ssh_transport] bash: line 1: huggingface-cli: command not found
 [2026-03-27 23:10:36] [deplodock.deploy.orchestrate] Failed to download model
 [2026-03-27 23:10:36] [pro6000_x_8.Qwen3.5-397B-A17B-FP8] Deploy failed, skipping benchmark
+[2026-03-27 23:10:36] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_pro6000/pro6000x8_cl262144
+[2026-03-27 23:10:37] [deplodock.commands.bench.committer] Pushed to remote
+[2026-03-27 23:10:37] [pro6000_x_8] Deleting VM...
+[2026-03-27 23:10:37] [deplodock.provisioning.cloudrift] Terminating CloudRift instance '5a8c9a30-2a31-11f1-85c9-df92a2200a9e'...
+[2026-03-27 23:10:38] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-03-27 23:10:38] [deplodock.provisioning.cloudrift] Instance terminated.
+[2026-03-27 23:10:38] [pro6000_x_8] VM deleted.
+[2026-03-27 23:10:38] [pro6000_x_8] Completed group: pro6000_x_8
+[2026-03-27 23:10:38] [root] 
+[2026-03-27 23:10:38] [root] SUMMARY
+[2026-03-27 23:10:38] [root] Successful: 0/6
+[2026-03-27 23:10:38] [root] 
+[2026-03-27 23:10:38] [root] Failed: 6/6
+[2026-03-27 23:10:38] [root]    - optimal_ctx_pro6000/pro6000x8_cl8192
+[2026-03-27 23:10:38] [root]    - optimal_ctx_pro6000/pro6000x8_cl16384
+[2026-03-27 23:10:38] [root]    - optimal_ctx_pro6000/pro6000x8_cl32768
+[2026-03-27 23:10:38] [root]    - optimal_ctx_pro6000/pro6000x8_cl65536
+[2026-03-27 23:10:38] [root]    - optimal_ctx_pro6000/pro6000x8_cl131072
+[2026-03-27 23:10:38] [root]    - optimal_ctx_pro6000/pro6000x8_cl262144
+[2026-03-27 23:10:38] [root] 
+[2026-03-27 23:10:38] [root] All done!
+[2026-03-27 23:10:38] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen/Qwen3.5-397B-A17B-FP8/optimal_ctx_pro6000/2026-03-27_23-04-47_07f47cdc/benchmark.log
