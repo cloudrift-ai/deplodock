@@ -162,6 +162,25 @@ matrices:
 
 These flags must **not** appear in `extra_args` — `load_recipe()` validates this and raises an error on duplicates.
 
+### Supported GPUs
+
+The `deploy.gpu` value must match one of the entries in the hardware table ([hardware.py](deplodock/hardware.py)):
+
+| `deploy.gpu` value                                         | Provider   |
+|------------------------------------------------------------|------------|
+| `NVIDIA GeForce RTX 4090`                                  | CloudRift  |
+| `NVIDIA GeForce RTX 5090`                                  | CloudRift  |
+| `NVIDIA RTX PRO 6000 Blackwell Workstation Edition`        | CloudRift  |
+| `NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition`  | CloudRift  |
+| `NVIDIA RTX PRO 6000 Blackwell Server Edition`             | GCP        |
+| `NVIDIA L40S`                                              | CloudRift  |
+| `NVIDIA H100 80GB`                                         | GCP        |
+| `NVIDIA H200 141GB`                                        | GCP        |
+| `NVIDIA B200`                                              | GCP        |
+| `NVIDIA A100 40GB`                                         | GCP        |
+| `NVIDIA A100 80GB`                                         | GCP        |
+| `AMD Instinct MI350X`                                      | CloudRift  |
+
 ## Experiments
 
 Experiments are self-contained parameter sweeps that live in `experiments/`. Each experiment directory contains a `recipe.yaml` and stores its results alongside it. The directory structure follows `experiments/{model_name}/{experiment_name}/`.
