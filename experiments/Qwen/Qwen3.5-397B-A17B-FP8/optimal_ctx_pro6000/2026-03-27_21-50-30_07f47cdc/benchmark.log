@@ -236,3 +236,14 @@ scp: Connection closed
 [2026-03-27 21:53:06] [deplodock.provisioning.ssh_transport] ssh: connect to host 38.108.83.78 port 60034: Connection refused
 [2026-03-27 21:53:06] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-03-27 21:53:06] [pro6000_x_8.Qwen3.5-397B-A17B-FP8] Deploy failed, skipping benchmark
+[2026-03-27 21:53:06] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_pro6000/pro6000x8_cl16384
+[2026-03-27 21:53:08] [deplodock.commands.bench.committer] Pushed to remote
+[2026-03-27 21:53:08] [pro6000_x_8.Qwen3.5-397B-A17B-FP8] Recipe: experiments/Qwen/Qwen3.5-397B-A17B-FP8/optimal_ctx_pro6000 (variant: pro6000x8_cl32768)
+[2026-03-27 21:53:08] [pro6000_x_8.Qwen3.5-397B-A17B-FP8] Deploying model...
+[2026-03-27 21:53:08] [deplodock.provisioning.ssh_transport] Failed to SCP docker-compose.yaml to riftuser@38.108.83.78:~/deploy/docker-compose.yaml: ssh: connect to host 38.108.83.78 port 60034: Connection refused
+scp: Connection closed
+
+[2026-03-27 21:53:08] [deplodock.deploy.orchestrate] Pulling images...
+[2026-03-27 21:53:08] [deplodock.provisioning.ssh_transport] ssh: connect to host 38.108.83.78 port 60034: Connection refused
+[2026-03-27 21:53:08] [deplodock.deploy.orchestrate] Failed to pull images
+[2026-03-27 21:53:08] [pro6000_x_8.Qwen3.5-397B-A17B-FP8] Deploy failed, skipping benchmark
