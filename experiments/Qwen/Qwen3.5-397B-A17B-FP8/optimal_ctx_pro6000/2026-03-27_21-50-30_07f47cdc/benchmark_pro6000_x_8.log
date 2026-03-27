@@ -269,3 +269,5 @@ scp: Connection closed
 [2026-03-27 21:53:13] [deplodock.provisioning.ssh_transport] ssh: connect to host 38.108.83.78 port 60034: Connection refused
 [2026-03-27 21:53:13] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-03-27 21:53:13] [pro6000_x_8.Qwen3.5-397B-A17B-FP8] Deploy failed, skipping benchmark
+[2026-03-27 21:53:13] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_pro6000/pro6000x8_cl262144
+[2026-03-27 21:53:15] [deplodock.commands.bench.committer] Pushed to remote

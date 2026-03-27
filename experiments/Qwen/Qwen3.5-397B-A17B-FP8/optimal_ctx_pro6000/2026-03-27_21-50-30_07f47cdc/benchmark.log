@@ -280,3 +280,25 @@ scp: Connection closed
 [2026-03-27 21:53:13] [deplodock.provisioning.ssh_transport] ssh: connect to host 38.108.83.78 port 60034: Connection refused
 [2026-03-27 21:53:13] [deplodock.deploy.orchestrate] Failed to pull images
 [2026-03-27 21:53:13] [pro6000_x_8.Qwen3.5-397B-A17B-FP8] Deploy failed, skipping benchmark
+[2026-03-27 21:53:13] [deplodock.commands.bench.committer] Committed: bench: fail optimal_ctx_pro6000/pro6000x8_cl262144
+[2026-03-27 21:53:15] [deplodock.commands.bench.committer] Pushed to remote
+[2026-03-27 21:53:15] [pro6000_x_8] Deleting VM...
+[2026-03-27 21:53:15] [deplodock.provisioning.cloudrift] Terminating CloudRift instance 'f9b6ebb6-2a26-11f1-856c-e305785dbc76'...
+[2026-03-27 21:53:15] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/terminate "HTTP/1.1 200 OK"
+[2026-03-27 21:53:15] [deplodock.provisioning.cloudrift] Instance terminated.
+[2026-03-27 21:53:15] [pro6000_x_8] VM deleted.
+[2026-03-27 21:53:15] [pro6000_x_8] Completed group: pro6000_x_8
+[2026-03-27 21:53:15] [root] 
+[2026-03-27 21:53:15] [root] SUMMARY
+[2026-03-27 21:53:15] [root] Successful: 0/6
+[2026-03-27 21:53:15] [root] 
+[2026-03-27 21:53:15] [root] Failed: 6/6
+[2026-03-27 21:53:15] [root]    - optimal_ctx_pro6000/pro6000x8_cl8192
+[2026-03-27 21:53:15] [root]    - optimal_ctx_pro6000/pro6000x8_cl16384
+[2026-03-27 21:53:15] [root]    - optimal_ctx_pro6000/pro6000x8_cl32768
+[2026-03-27 21:53:15] [root]    - optimal_ctx_pro6000/pro6000x8_cl65536
+[2026-03-27 21:53:15] [root]    - optimal_ctx_pro6000/pro6000x8_cl131072
+[2026-03-27 21:53:15] [root]    - optimal_ctx_pro6000/pro6000x8_cl262144
+[2026-03-27 21:53:15] [root] 
+[2026-03-27 21:53:15] [root] All done!
+[2026-03-27 21:53:15] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen/Qwen3.5-397B-A17B-FP8/optimal_ctx_pro6000/2026-03-27_21-50-30_07f47cdc/benchmark.log
