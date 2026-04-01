@@ -23,4 +23,6 @@ benchmark:
 matrices:
   - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
     deploy.gpu_count: 8
-    engine.llm.context_length: [8192, 16384, 32768, 65536, 131072, 262144]
+    engine.llm.max_concurrent_requests: [ 8, 12, 16, 20, 24, 28, 32, 36, 40 ]
+    benchmark.max_concurrency: [ 8, 12, 16, 20, 24, 28, 32, 36, 40 ]
+    engine.llm.context_length: 262144
