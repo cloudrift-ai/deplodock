@@ -21,6 +21,6 @@ benchmark:
   random_output_len: 4000
 
 matrices:
-  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+  - deploy.gpu: "NVIDIA GeForce RTX 4090"
     deploy.gpu_count: 8
     engine.llm.context_length: [8192, 16384, 32768, 65536, 131072, 262144]
