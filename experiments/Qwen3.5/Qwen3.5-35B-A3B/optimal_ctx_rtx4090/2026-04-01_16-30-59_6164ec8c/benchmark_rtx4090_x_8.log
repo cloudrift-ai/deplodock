@@ -1,0 +1,3 @@
+[2026-04-01 16:30:59] [rtx4090_x_8] Starting group: NVIDIA GeForce RTX 4090 x8 (6 tasks)
+[2026-04-01 16:30:59] [rtx4090_x_8] GPU: NVIDIA GeForce RTX 4090 x8 -> cloudrift rtx49-10c-kn.8
+[2026-04-01 16:30:59] [deplodock.provisioning.cloudrift] Creating CloudRift instance (type=rtx49-10c-kn.8)...
