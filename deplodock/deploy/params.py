@@ -17,3 +17,4 @@ class DeployParams:
     hf_token: str = ""
     dry_run: bool = False
     gpu_device_ids: list[int] | None = None
+    port_mappings: list[tuple[int, int]] = field(default_factory=list)

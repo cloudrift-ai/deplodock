@@ -143,10 +143,10 @@ async def test_rent_instance_payload(mock_api):
             "ssh_key": {"PublicKeys": ["ssh-ed25519 AAAA user@host"]},
             "image_url": DEFAULT_IMAGE_URL,
             "cloudinit_url": DEFAULT_CLOUDINIT_URL,
+            "ports": ["22", "8000"],
         }
     }
     assert call_data["with_public_ip"] is True
-    assert call_data["ports"] == ["22", "8000"]
     assert result["instance_ids"] == ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]
 
 

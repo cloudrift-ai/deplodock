@@ -1,0 +1,26 @@
+[2026-04-01 16:30:59] [root] Run directory: /home/runner/work/deplodock/deplodock/experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090/2026-04-01_16-30-59_6164ec8c
+[2026-04-01 16:30:59] [root] 
+[2026-04-01 16:30:59] [root] Running 6 benchmark task(s) in 1 execution group(s)
+[2026-04-01 16:30:59] [root] Parallel mode (max workers: 1)
+[2026-04-01 16:30:59] [root] 
+[2026-04-01 16:30:59] [root] Commit mode enabled: results will be committed after each task
+[2026-04-01 16:30:59] [rtx4090_x_8] Starting group: NVIDIA GeForce RTX 4090 x8 (6 tasks)
+[2026-04-01 16:30:59] [rtx4090_x_8] GPU: NVIDIA GeForce RTX 4090 x8 -> cloudrift rtx49-10c-kn.8
+[2026-04-01 16:30:59] [deplodock.provisioning.cloudrift] Creating CloudRift instance (type=rtx49-10c-kn.8)...
+[2026-04-01 16:30:59] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/rent "HTTP/1.1 503 Service Unavailable"
+[2026-04-01 16:30:59] [root] Group 0 generated an exception: Server error '503 Service Unavailable' for url 'https://api.cloudrift.ai/api/v1/instances/rent'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/503
+[2026-04-01 16:30:59] [root] 
+[2026-04-01 16:30:59] [root] SUMMARY
+[2026-04-01 16:30:59] [root] Successful: 0/6
+[2026-04-01 16:30:59] [root] 
+[2026-04-01 16:30:59] [root] Failed: 6/6
+[2026-04-01 16:30:59] [root]    - optimal_ctx_rtx4090/rtx4090x8_cl8192
+[2026-04-01 16:30:59] [root]    - optimal_ctx_rtx4090/rtx4090x8_cl16384
+[2026-04-01 16:30:59] [root]    - optimal_ctx_rtx4090/rtx4090x8_cl32768
+[2026-04-01 16:30:59] [root]    - optimal_ctx_rtx4090/rtx4090x8_cl65536
+[2026-04-01 16:30:59] [root]    - optimal_ctx_rtx4090/rtx4090x8_cl131072
+[2026-04-01 16:30:59] [root]    - optimal_ctx_rtx4090/rtx4090x8_cl262144
+[2026-04-01 16:30:59] [root] 
+[2026-04-01 16:30:59] [root] All done!
+[2026-04-01 16:30:59] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090/2026-04-01_16-30-59_6164ec8c/benchmark.log

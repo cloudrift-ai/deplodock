@@ -1,0 +1,74 @@
+[
+  {
+    "task_id": "optimal_ctx_rtx4090/pro6000x8_cl8192",
+    "recipe_dir": "experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090",
+    "variant": "pro6000x8_cl8192",
+    "recipe_name": "optimal_ctx_rtx4090",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 8,
+    "model_name": "Qwen/Qwen3.5-35B-A3B",
+    "result_file": "pro6000x8_cl8192_sglang_benchmark.txt",
+    "json_result_file": "pro6000x8_cl8192_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_rtx4090/pro6000x8_cl16384",
+    "recipe_dir": "experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090",
+    "variant": "pro6000x8_cl16384",
+    "recipe_name": "optimal_ctx_rtx4090",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 8,
+    "model_name": "Qwen/Qwen3.5-35B-A3B",
+    "result_file": "pro6000x8_cl16384_sglang_benchmark.txt",
+    "json_result_file": "pro6000x8_cl16384_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_rtx4090/pro6000x8_cl32768",
+    "recipe_dir": "experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090",
+    "variant": "pro6000x8_cl32768",
+    "recipe_name": "optimal_ctx_rtx4090",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 8,
+    "model_name": "Qwen/Qwen3.5-35B-A3B",
+    "result_file": "pro6000x8_cl32768_sglang_benchmark.txt",
+    "json_result_file": "pro6000x8_cl32768_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_rtx4090/pro6000x8_cl65536",
+    "recipe_dir": "experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090",
+    "variant": "pro6000x8_cl65536",
+    "recipe_name": "optimal_ctx_rtx4090",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 8,
+    "model_name": "Qwen/Qwen3.5-35B-A3B",
+    "result_file": "pro6000x8_cl65536_sglang_benchmark.txt",
+    "json_result_file": "pro6000x8_cl65536_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_rtx4090/pro6000x8_cl131072",
+    "recipe_dir": "experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090",
+    "variant": "pro6000x8_cl131072",
+    "recipe_name": "optimal_ctx_rtx4090",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 8,
+    "model_name": "Qwen/Qwen3.5-35B-A3B",
+    "result_file": "pro6000x8_cl131072_sglang_benchmark.txt",
+    "json_result_file": "pro6000x8_cl131072_sglang_benchmark.json"
+  },
+  {
+    "task_id": "optimal_ctx_rtx4090/pro6000x8_cl262144",
+    "recipe_dir": "experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090",
+    "variant": "pro6000x8_cl262144",
+    "recipe_name": "optimal_ctx_rtx4090",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 8,
+    "model_name": "Qwen/Qwen3.5-35B-A3B",
+    "result_file": "pro6000x8_cl262144_sglang_benchmark.txt",
+    "json_result_file": "pro6000x8_cl262144_sglang_benchmark.json"
+  }
+]

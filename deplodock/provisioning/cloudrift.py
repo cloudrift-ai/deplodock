@@ -61,6 +61,13 @@ async def _rent_instance(
     Args:
         ssh_public_keys: list of public key strings (e.g. ["ssh-ed25519 AAAA..."])
     """
+    vm_config = {
+        "ssh_key": {"PublicKeys": ssh_public_keys},
+        "image_url": image_url,
+        "cloudinit_url": cloudinit_url,
+    }
+    if ports:
+        vm_config["ports"] = [str(p) for p in ports]
     data = {
         "selector": {
             "ByInstanceTypeAndLocation": {
@@ -68,16 +75,10 @@ async def _rent_instance(
             },
         },
         "config": {
-            "VirtualMachine": {
-                "ssh_key": {"PublicKeys": ssh_public_keys},
-                "image_url": image_url,
-                "cloudinit_url": cloudinit_url,
-            },
+            "VirtualMachine": vm_config,
         },
         "with_public_ip": True,
     }
-    if ports:
-        data["ports"] = [str(p) for p in ports]
     return await _api_request("POST", "/api/v1/instances/rent", data, api_key, api_url, dry_run)
 
 
