@@ -1,7 +1,23 @@
 """Docker Compose and nginx config generation."""
 
+from typing import Any
+
+import yaml
+
 from deplodock.recipe.engines import build_engine_args
 from deplodock.recipe.types import Recipe
+
+
+def _render_docker_options(docker_options: dict[str, Any]) -> str:
+    """Render docker_options dict as indented YAML lines for a compose service."""
+    if not docker_options:
+        return ""
+    lines = []
+    for key, value in docker_options.items():
+        fragment = yaml.dump({key: value}, default_flow_style=False).rstrip("\n")
+        indented = "\n".join("    " + line for line in fragment.splitlines())
+        lines.append(indented)
+    return "\n" + "\n".join(lines)
 
 
 def calculate_num_instances(recipe: Recipe) -> int:
@@ -30,6 +46,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
     engine_args = build_engine_args(llm, model_name)
     command_str = "\n      ".join(engine_args)
     extra_env_lines = "".join(f"\n      - {k}={v}" for k, v in llm.extra_env.items())
+    docker_options_lines = _render_docker_options(llm.docker_options)
 
     is_amd = recipe.deploy.gpu is not None and recipe.deploy.gpu.startswith("AMD")
 
@@ -80,7 +97,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
     ports:
       - "{port}:8000"
     shm_size: '16gb'
-    ipc: host
+    ipc: host{docker_options_lines}
     command: >
       {command_str}
     healthcheck:

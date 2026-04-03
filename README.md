@@ -136,6 +136,22 @@ Matrix entries use **dot-notation** for all parameter paths. Scalars are broadca
 
 Engine-agnostic fields (`tensor_parallel_size`, `context_length`, etc.) live at `engine.llm`. Engine-specific fields (`image`, `extra_args`) nest under `engine.llm.vllm` or `engine.llm.sglang`.
 
+#### Docker Options
+
+Arbitrary docker-compose service keys can be injected via `engine.llm.docker_options`. This is useful for GPU-specific container settings like ROCm's security options:
+
+```yaml
+engine:
+  llm:
+    docker_options:
+      security_opt:
+        - seccomp=unconfined
+      cap_add:
+        - SYS_PTRACE
+```
+
+Keys already managed by the compose template (`image`, `volumes`, `ports`, `healthcheck`, etc.) are rejected at load time.
+
 ### SGLang Matrix Entry Example
 
 To benchmark with SGLang alongside vLLM, add a matrix entry with `engine.llm.sglang.*` overrides:
