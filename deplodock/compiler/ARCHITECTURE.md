@@ -13,6 +13,8 @@ compiler/
 ├── pattern.py    # Pattern AST + text parser for matching rules
 ├── matcher.py    # Graph pattern matching engine
 ├── rewriter.py   # Pass/Rule/Rewriter — rule loading and application
+├── trace.py      # CompilerTrace — structured JSON trace for AI-in-the-loop
+├── pipeline.py   # compile_and_run() — end-to-end pipeline with tracing
 ├── rules/        # Ordered rule files organized by pass
 │   ├── fusion/   # Fuse ops to avoid intermediates
 │   └── tiling/   # Tile loops for memory hierarchy
@@ -66,4 +68,31 @@ Two-level IR design:
 
 Lowering translates fused graph ops into CUDA kernels. Currently supports matmul (FusedReduceElementwiseOp with sum/mul). Each thread computes one output element with a K-loop accumulator.
 
-The runner generates a complete `.cu` program (kernel + host wrapper), compiles with nvcc, executes, and parses stdout.
+The runner generates a complete `.cu` program (kernel + host wrapper with CUDA event timing), compiles with nvcc, executes, and parses stdout for output data and `KERNEL_TIME_MS`.
+
+## Structured Trace & Pipeline
+
+`pipeline.compile_and_run()` orchestrates the full cycle and produces a `CompilerTrace` (JSON-serializable):
+
+```json
+{
+  "input_graph": { "nodes": {...}, "inputs": [...], "outputs": [...] },
+  "passes": [{
+    "pass": "fusion",
+    "rules_applied": [{"rule": "001_fuse_reduce_elementwise", "matched_at": "red", ...}],
+    "graph_before": {...},
+    "graph_after": {...}
+  }],
+  "cuda_kernel": "__global__ void fused_matmul(...) { ... }",
+  "execution": {
+    "output": [22.0, 28.0, ...],
+    "expected": [22.0, 28.0, ...],
+    "correct": true,
+    "max_error": 0.0,
+    "kernel_time_ms": 0.042,
+    "dimensions": {"M": 4, "N": 2, "K": 3}
+  }
+}
+```
+
+Designed for an AI-in-the-loop optimization cycle: AI reads trace → modifies rules/IR → runs pipeline → evaluates performance → iterates.

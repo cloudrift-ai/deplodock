@@ -10,6 +10,7 @@ from pathlib import Path
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.matcher import match_pattern
 from deplodock.compiler.pattern import Pattern, parse_pattern
+from deplodock.compiler.trace import PassTrace, RuleApplication
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +64,10 @@ class Pass:
         rules = [Rule.from_file(f) for f in rule_files]
         return Pass(name=path.name, rules=rules)
 
-    def apply(self, graph: Graph) -> Graph:
+    def apply(self, graph: Graph, trace: PassTrace | None = None) -> Graph:
         """Apply rules in order with restart-on-match until fixed point."""
+        if trace is not None:
+            trace.graph_before = graph.to_dict()
         changed = True
         while changed:
             changed = False
@@ -73,9 +76,20 @@ class Pass:
                 if matches:
                     for match in matches:
                         logger.debug("Rule %s matched at %s", rule.name, match.root_node_id)
+                        if trace is not None:
+                            trace.rules_applied.append(
+                                RuleApplication(
+                                    rule_name=rule.name,
+                                    matched_at=match.root_node_id,
+                                    bindings=dict(match.bindings),
+                                    captured_constraints=dict(match.captured_constraints),
+                                )
+                            )
                         graph = rule.rewrite(graph, match)
                     changed = True
                     break  # restart from first rule
+        if trace is not None:
+            trace.graph_after = graph.to_dict()
         return graph
 
 
@@ -92,9 +106,13 @@ class Rewriter:
         passes = [Pass.from_directory(d) for d in pass_dirs if any(d.glob("*.py"))]
         return Rewriter(passes=passes)
 
-    def apply(self, graph: Graph) -> Graph:
+    def apply(self, graph: Graph, pass_traces: list[PassTrace] | None = None) -> Graph:
         """Apply all passes in order."""
         for p in self.passes:
             logger.debug("Running pass: %s", p.name)
-            graph = p.apply(graph)
+            trace = None
+            if pass_traces is not None:
+                trace = PassTrace(name=p.name)
+                pass_traces.append(trace)
+            graph = p.apply(graph, trace=trace)
         return graph

@@ -189,9 +189,11 @@ def test_matmul_end_to_end():
 
     # Verify against Python reference.
     expected = _python_matmul(a_data, b_data, M, K, N)
-    assert len(result) == len(expected)
-    for got, exp in zip(result, expected, strict=True):
+    assert len(result.output) == len(expected)
+    for got, exp in zip(result.output, expected, strict=True):
         assert abs(got - exp) < 1e-4, f"Mismatch: got {got}, expected {exp}"
+    assert result.kernel_time_ms is not None
+    assert result.kernel_time_ms >= 0
 
 
 @requires_cuda
@@ -217,5 +219,5 @@ def test_matmul_larger():
         dim_args={"M": M, "N": N, "K": K},
     )
 
-    for i, val in enumerate(result):
+    for i, val in enumerate(result.output):
         assert abs(val - K) < 1e-4, f"C[{i}] = {val}, expected {K}"

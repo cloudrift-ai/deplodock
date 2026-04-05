@@ -120,3 +120,23 @@ class Graph:
         g.inputs = list(self.inputs)
         g.outputs = list(self.outputs)
         return g
+
+    def to_dict(self) -> dict:
+        """Serialize graph to a JSON-compatible dict."""
+        return {
+            "inputs": self.inputs,
+            "outputs": self.outputs,
+            "nodes": {
+                nid: {
+                    "op": type(node.op).__name__,
+                    "op_fields": {k: v for k, v in node.op.__dict__.items() if not k.startswith("_")},
+                    "inputs": node.inputs,
+                    "output": {
+                        "name": node.output.name,
+                        "shape": list(node.output.shape),
+                        "dtype": node.output.dtype,
+                    },
+                }
+                for nid, node in self.nodes.items()
+            },
+        }

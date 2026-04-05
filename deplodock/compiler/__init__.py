@@ -13,9 +13,12 @@ from deplodock.compiler.ops import (
     ScatterOp,
 )
 from deplodock.compiler.pattern import PatternNode, PatternVar, PatternWildcard, parse_pattern
+from deplodock.compiler.pipeline import compile_and_run
 from deplodock.compiler.rewriter import Pass, Rewriter, Rule
+from deplodock.compiler.trace import CompilerTrace, ExecutionResult, PassTrace, RuleApplication
 
 __all__ = [
+    "CompilerTrace",
     "ElementwiseOp",
     "FusedReduceElementwiseOp",
     "GatherOp",
@@ -34,6 +37,10 @@ __all__ = [
     "ScanOp",
     "ScatterOp",
     "Tensor",
+    "compile_and_run",
+    "ExecutionResult",
     "match_pattern",
     "parse_pattern",
+    "PassTrace",
+    "RuleApplication",
 ]

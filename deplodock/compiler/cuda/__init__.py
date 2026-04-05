@@ -18,7 +18,7 @@ from deplodock.compiler.cuda.ir import (
     VarDecl,
 )
 from deplodock.compiler.cuda.lower import lower_graph
-from deplodock.compiler.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
+from deplodock.compiler.cuda.runner import KernelResult, has_cuda_gpu, has_nvcc, run_kernel
 
 __all__ = [
     "ArrayAccess",
@@ -36,6 +36,7 @@ __all__ = [
     "Var",
     "VarDecl",
     "emit_kernel",
+    "KernelResult",
     "has_cuda_gpu",
     "has_nvcc",
     "lower_graph",

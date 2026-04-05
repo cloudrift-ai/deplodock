@@ -6,6 +6,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from deplodock.compiler.cuda.ir import KernelDef
@@ -102,19 +103,42 @@ def generate_host_program(
             raise ValueError(f"No value for kernel param {p.name!r}")
 
     args_str = ", ".join(launch_args)
+
+    # CUDA event timing.
+    lines.append("    cudaEvent_t start, stop;")
+    lines.append("    cudaEventCreate(&start);")
+    lines.append("    cudaEventCreate(&stop);")
+    lines.append("")
+
+    # Warmup launch.
     lines.append(f"    {kernel.name}<<<grid, block>>>({args_str});")
     lines.append("    cudaDeviceSynchronize();")
+    lines.append("")
+
+    # Timed launch.
+    lines.append("    cudaEventRecord(start);")
+    lines.append(f"    {kernel.name}<<<grid, block>>>({args_str});")
+    lines.append("    cudaEventRecord(stop);")
+    lines.append("    cudaEventSynchronize(stop);")
+    lines.append("")
+
+    lines.append("    float elapsed_ms = 0.0f;")
+    lines.append("    cudaEventElapsedTime(&elapsed_ms, start, stop);")
     lines.append("")
 
     # Copy result back.
     lines.append(f"    cudaMemcpy(h_{output_name}, d_{output_name}, {output_size} * sizeof(float), cudaMemcpyDeviceToHost);")
     lines.append("")
 
-    # Print result.
+    # Print result line, then timing line (separate lines for easy parsing).
     lines.append(f"    for (int i = 0; i < {output_size}; i++) {{")
     lines.append(f'        printf("%.6f ", h_{output_name}[i]);')
     lines.append("    }")
     lines.append('    printf("\\n");')
+    lines.append('    printf("KERNEL_TIME_MS=%.6f\\n", elapsed_ms);')
+    lines.append("")
+    lines.append("    cudaEventDestroy(start);")
+    lines.append("    cudaEventDestroy(stop);")
     lines.append("")
 
     # Cleanup.
@@ -127,6 +151,14 @@ def generate_host_program(
     return "\n".join(lines)
 
 
+@dataclass
+class KernelResult:
+    """Result of a kernel execution."""
+
+    output: list[float]
+    kernel_time_ms: float | None = None
+
+
 def run_kernel(
     kernel: KernelDef,
     kernel_source: str,
@@ -134,8 +166,8 @@ def run_kernel(
     output_name: str,
     output_size: int,
     dim_args: dict[str, int],
-) -> list[float]:
-    """Compile and run a CUDA kernel, return output as flat float list.
+) -> KernelResult:
+    """Compile and run a CUDA kernel, return output and timing.
 
     Args:
         kernel: KernelDef for metadata (block size, params).
@@ -146,7 +178,7 @@ def run_kernel(
         dim_args: Mapping of dimension param name → int value.
 
     Returns:
-        Flat list of output floats.
+        KernelResult with output floats and optional GPU timing.
     """
     program = generate_host_program(kernel_source, kernel, inputs, output_name, output_size, dim_args)
 
@@ -177,6 +209,11 @@ def run_kernel(
         if run_result.returncode != 0:
             raise RuntimeError(f"Kernel execution failed:\n{run_result.stderr}")
 
-        # Parse output.
-        output_line = run_result.stdout.strip()
-        return [float(x) for x in output_line.split()]
+        # Parse output: first line = data, second line = timing.
+        lines = run_result.stdout.strip().splitlines()
+        output = [float(x) for x in lines[0].split()]
+        kernel_time_ms = None
+        for line in lines[1:]:
+            if line.startswith("KERNEL_TIME_MS="):
+                kernel_time_ms = float(line.split("=", 1)[1])
+        return KernelResult(output=output, kernel_time_ms=kernel_time_ms)
