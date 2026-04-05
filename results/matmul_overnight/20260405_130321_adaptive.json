@@ -1,0 +1,179 @@
+{
+  "timestamp": "20260405_130321",
+  "strategy": "adaptive",
+  "config": {
+    "strategy_map": [
+      [
+        256,
+        {
+          "strategy": "flat_scalar",
+          "block_m": 16,
+          "block_n": 128,
+          "block_k": 16,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1
+        }
+      ],
+      [
+        512,
+        {
+          "strategy": "hybrid_smem_f4",
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 256,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 2,
+          "coarsen_cols": 4
+        }
+      ],
+      [
+        4096,
+        {
+          "strategy": "hybrid_smem_f4",
+          "block_m": 4,
+          "block_n": 32,
+          "block_k": 128,
+          "thread_m": 12,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 12,
+          "coarsen_cols": 4
+        }
+      ],
+      [
+        99999,
+        {
+          "strategy": "hybrid_smem_f4",
+          "block_m": 4,
+          "block_n": 32,
+          "block_k": 64,
+          "thread_m": 12,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 12,
+          "coarsen_cols": 4
+        }
+      ]
+    ]
+  },
+  "description": "FINAL adaptive BK=64-for-large (30 iter)",
+  "cuda_kernel": "__global__\n__launch_bounds__(128) void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int row_base = (blockIdx.y * blockDim.y + threadIdx.y) * 12;\n    int col_base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;\n    __shared__ float As[3120];\n    int sr0 = threadIdx.y * 12;\n    int sr1 = sr0 + 1;\n    int sr2 = sr0 + 2;\n    int sr3 = sr0 + 3;\n    int sr4 = sr0 + 4;\n    int sr5 = sr0 + 5;\n    int sr6 = sr0 + 6;\n    int sr7 = sr0 + 7;\n    int sr8 = sr0 + 8;\n    int sr9 = sr0 + 9;\n    int sr10 = sr0 + 10;\n    int sr11 = sr0 + 11;\n    float acc00 = 0.0f;\n    float acc01 = 0.0f;\n    float acc02 = 0.0f;\n    float acc03 = 0.0f;\n    float acc10 = 0.0f;\n    float acc11 = 0.0f;\n    float acc12 = 0.0f;\n    float acc13 = 0.0f;\n    float acc20 = 0.0f;\n    float acc21 = 0.0f;\n    float acc22 = 0.0f;\n    float acc23 = 0.0f;\n    float acc30 = 0.0f;\n    float acc31 = 0.0f;\n    float acc32 = 0.0f;\n    float acc33 = 0.0f;\n    float acc40 = 0.0f;\n    float acc41 = 0.0f;\n    float acc42 = 0.0f;\n    float acc43 = 0.0f;\n    float acc50 = 0.0f;\n    float acc51 = 0.0f;\n    float acc52 = 0.0f;\n    float acc53 = 0.0f;\n    float acc60 = 0.0f;\n    float acc61 = 0.0f;\n    float acc62 = 0.0f;\n    float acc63 = 0.0f;\n    float acc70 = 0.0f;\n    float acc71 = 0.0f;\n    float acc72 = 0.0f;\n    float acc73 = 0.0f;\n    float acc80 = 0.0f;\n    float acc81 = 0.0f;\n    float acc82 = 0.0f;\n    float acc83 = 0.0f;\n    float acc90 = 0.0f;\n    float acc91 = 0.0f;\n    float acc92 = 0.0f;\n    float acc93 = 0.0f;\n    float acc100 = 0.0f;\n    float acc101 = 0.0f;\n    float acc102 = 0.0f;\n    float acc103 = 0.0f;\n    float acc110 = 0.0f;\n    float acc111 = 0.0f;\n    float acc112 = 0.0f;\n    float acc113 = 0.0f;\n    for (int tile_k = 0; tile_k < K; tile_k += 64) {\n        for (int a_s = threadIdx.x; a_s < 64; a_s += 32) {\n            As[sr0 * 65 + a_s] = ((row_base + 0 < M && tile_k + a_s < K) ? (A[(row_base + 0) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr1 * 65 + a_s] = ((row_base + 1 < M && tile_k + a_s < K) ? (A[(row_base + 1) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr2 * 65 + a_s] = ((row_base + 2 < M && tile_k + a_s < K) ? (A[(row_base + 2) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr3 * 65 + a_s] = ((row_base + 3 < M && tile_k + a_s < K) ? (A[(row_base + 3) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr4 * 65 + a_s] = ((row_base + 4 < M && tile_k + a_s < K) ? (A[(row_base + 4) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr5 * 65 + a_s] = ((row_base + 5 < M && tile_k + a_s < K) ? (A[(row_base + 5) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr6 * 65 + a_s] = ((row_base + 6 < M && tile_k + a_s < K) ? (A[(row_base + 6) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr7 * 65 + a_s] = ((row_base + 7 < M && tile_k + a_s < K) ? (A[(row_base + 7) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr8 * 65 + a_s] = ((row_base + 8 < M && tile_k + a_s < K) ? (A[(row_base + 8) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr9 * 65 + a_s] = ((row_base + 9 < M && tile_k + a_s < K) ? (A[(row_base + 9) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr10 * 65 + a_s] = ((row_base + 10 < M && tile_k + a_s < K) ? (A[(row_base + 10) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr11 * 65 + a_s] = ((row_base + 11 < M && tile_k + a_s < K) ? (A[(row_base + 11) * K + (tile_k + a_s)]) : (0.0f));\n        }\n        __syncthreads();\n        if (col_base + 3 < N && N % 4 == 0) {\n            #pragma unroll\n            for (int kk = 0; kk < 64; kk++) {\n                float a0 = As[sr0 * 65 + kk];\n                float a1 = As[sr1 * 65 + kk];\n                float a2 = As[sr2 * 65 + kk];\n                float a3 = As[sr3 * 65 + kk];\n                float a4 = As[sr4 * 65 + kk];\n                float a5 = As[sr5 * 65 + kk];\n                float a6 = As[sr6 * 65 + kk];\n                float a7 = As[sr7 * 65 + kk];\n                float a8 = As[sr8 * 65 + kk];\n                float a9 = As[sr9 * 65 + kk];\n                float a10 = As[sr10 * 65 + kk];\n                float a11 = As[sr11 * 65 + kk];\n                float4 b4 = *reinterpret_cast<float4*>(&B[(tile_k + kk) * N + col_base]);\n                acc00 += a0 * b4.x;\n                acc01 += a0 * b4.y;\n                acc02 += a0 * b4.z;\n                acc03 += a0 * b4.w;\n                acc10 += a1 * b4.x;\n                acc11 += a1 * b4.y;\n                acc12 += a1 * b4.z;\n                acc13 += a1 * b4.w;\n                acc20 += a2 * b4.x;\n                acc21 += a2 * b4.y;\n                acc22 += a2 * b4.z;\n                acc23 += a2 * b4.w;\n                acc30 += a3 * b4.x;\n                acc31 += a3 * b4.y;\n                acc32 += a3 * b4.z;\n                acc33 += a3 * b4.w;\n                acc40 += a4 * b4.x;\n                acc41 += a4 * b4.y;\n                acc42 += a4 * b4.z;\n                acc43 += a4 * b4.w;\n                acc50 += a5 * b4.x;\n                acc51 += a5 * b4.y;\n                acc52 += a5 * b4.z;\n                acc53 += a5 * b4.w;\n                acc60 += a6 * b4.x;\n                acc61 += a6 * b4.y;\n                acc62 += a6 * b4.z;\n                acc63 += a6 * b4.w;\n                acc70 += a7 * b4.x;\n                acc71 += a7 * b4.y;\n                acc72 += a7 * b4.z;\n                acc73 += a7 * b4.w;\n                acc80 += a8 * b4.x;\n                acc81 += a8 * b4.y;\n                acc82 += a8 * b4.z;\n                acc83 += a8 * b4.w;\n                acc90 += a9 * b4.x;\n                acc91 += a9 * b4.y;\n                acc92 += a9 * b4.z;\n                acc93 += a9 * b4.w;\n                acc100 += a10 * b4.x;\n                acc101 += a10 * b4.y;\n                acc102 += a10 * b4.z;\n                acc103 += a10 * b4.w;\n                acc110 += a11 * b4.x;\n                acc111 += a11 * b4.y;\n                acc112 += a11 * b4.z;\n                acc113 += a11 * b4.w;\n            }\n        } else {\n            if (col_base < N) {\n                for (int kk = 0; kk < 64; kk++) {\n                    float a0 = As[sr0 * 65 + kk];\n                    float a1 = As[sr1 * 65 + kk];\n                    float a2 = As[sr2 * 65 + kk];\n                    float a3 = As[sr3 * 65 + kk];\n                    float a4 = As[sr4 * 65 + kk];\n                    float a5 = As[sr5 * 65 + kk];\n                    float a6 = As[sr6 * 65 + kk];\n                    float a7 = As[sr7 * 65 + kk];\n                    float a8 = As[sr8 * 65 + kk];\n                    float a9 = As[sr9 * 65 + kk];\n                    float a10 = As[sr10 * 65 + kk];\n                    float a11 = As[sr11 * 65 + kk];\n                    if (col_base + 0 < N) {\n                        float bv0 = B[(tile_k + kk) * N + (col_base + 0)];\n                        acc00 += a0 * bv0;\n                        acc10 += a1 * bv0;\n                        acc20 += a2 * bv0;\n                        acc30 += a3 * bv0;\n                        acc40 += a4 * bv0;\n                        acc50 += a5 * bv0;\n                        acc60 += a6 * bv0;\n                        acc70 += a7 * bv0;\n                        acc80 += a8 * bv0;\n                        acc90 += a9 * bv0;\n                        acc100 += a10 * bv0;\n                        acc110 += a11 * bv0;\n                    }\n                    if (col_base + 1 < N) {\n                        float bv1 = B[(tile_k + kk) * N + (col_base + 1)];\n                        acc01 += a0 * bv1;\n                        acc11 += a1 * bv1;\n                        acc21 += a2 * bv1;\n                        acc31 += a3 * bv1;\n                        acc41 += a4 * bv1;\n                        acc51 += a5 * bv1;\n                        acc61 += a6 * bv1;\n                        acc71 += a7 * bv1;\n                        acc81 += a8 * bv1;\n                        acc91 += a9 * bv1;\n                        acc101 += a10 * bv1;\n                        acc111 += a11 * bv1;\n                    }\n                    if (col_base + 2 < N) {\n                        float bv2 = B[(tile_k + kk) * N + (col_base + 2)];\n                        acc02 += a0 * bv2;\n                        acc12 += a1 * bv2;\n                        acc22 += a2 * bv2;\n                        acc32 += a3 * bv2;\n                        acc42 += a4 * bv2;\n                        acc52 += a5 * bv2;\n                        acc62 += a6 * bv2;\n                        acc72 += a7 * bv2;\n                        acc82 += a8 * bv2;\n                        acc92 += a9 * bv2;\n                        acc102 += a10 * bv2;\n                        acc112 += a11 * bv2;\n                    }\n                    if (col_base + 3 < N) {\n                        float bv3 = B[(tile_k + kk) * N + (col_base + 3)];\n                        acc03 += a0 * bv3;\n                        acc13 += a1 * bv3;\n                        acc23 += a2 * bv3;\n                        acc33 += a3 * bv3;\n                        acc43 += a4 * bv3;\n                        acc53 += a5 * bv3;\n                        acc63 += a6 * bv3;\n                        acc73 += a7 * bv3;\n                        acc83 += a8 * bv3;\n                        acc93 += a9 * bv3;\n                        acc103 += a10 * bv3;\n                        acc113 += a11 * bv3;\n                    }\n                }\n            }\n        }\n        __syncthreads();\n    }\n    if (row_base + 0 < M && col_base + 0 < N) {\n        C[(row_base + 0) * N + (col_base + 0)] = acc00;\n    }\n    if (row_base + 0 < M && col_base + 1 < N) {\n        C[(row_base + 0) * N + (col_base + 1)] = acc01;\n    }\n    if (row_base + 0 < M && col_base + 2 < N) {\n        C[(row_base + 0) * N + (col_base + 2)] = acc02;\n    }\n    if (row_base + 0 < M && col_base + 3 < N) {\n        C[(row_base + 0) * N + (col_base + 3)] = acc03;\n    }\n    if (row_base + 1 < M && col_base + 0 < N) {\n        C[(row_base + 1) * N + (col_base + 0)] = acc10;\n    }\n    if (row_base + 1 < M && col_base + 1 < N) {\n        C[(row_base + 1) * N + (col_base + 1)] = acc11;\n    }\n    if (row_base + 1 < M && col_base + 2 < N) {\n        C[(row_base + 1) * N + (col_base + 2)] = acc12;\n    }\n    if (row_base + 1 < M && col_base + 3 < N) {\n        C[(row_base + 1) * N + (col_base + 3)] = acc13;\n    }\n    if (row_base + 2 < M && col_base + 0 < N) {\n        C[(row_base + 2) * N + (col_base + 0)] = acc20;\n    }\n    if (row_base + 2 < M && col_base + 1 < N) {\n        C[(row_base + 2) * N + (col_base + 1)] = acc21;\n    }\n    if (row_base + 2 < M && col_base + 2 < N) {\n        C[(row_base + 2) * N + (col_base + 2)] = acc22;\n    }\n    if (row_base + 2 < M && col_base + 3 < N) {\n        C[(row_base + 2) * N + (col_base + 3)] = acc23;\n    }\n    if (row_base + 3 < M && col_base + 0 < N) {\n        C[(row_base + 3) * N + (col_base + 0)] = acc30;\n    }\n    if (row_base + 3 < M && col_base + 1 < N) {\n        C[(row_base + 3) * N + (col_base + 1)] = acc31;\n    }\n    if (row_base + 3 < M && col_base + 2 < N) {\n        C[(row_base + 3) * N + (col_base + 2)] = acc32;\n    }\n    if (row_base + 3 < M && col_base + 3 < N) {\n        C[(row_base + 3) * N + (col_base + 3)] = acc33;\n    }\n    if (row_base + 4 < M && col_base + 0 < N) {\n        C[(row_base + 4) * N + (col_base + 0)] = acc40;\n    }\n    if (row_base + 4 < M && col_base + 1 < N) {\n        C[(row_base + 4) * N + (col_base + 1)] = acc41;\n    }\n    if (row_base + 4 < M && col_base + 2 < N) {\n        C[(row_base + 4) * N + (col_base + 2)] = acc42;\n    }\n    if (row_base + 4 < M && col_base + 3 < N) {\n        C[(row_base + 4) * N + (col_base + 3)] = acc43;\n    }\n    if (row_base + 5 < M && col_base + 0 < N) {\n        C[(row_base + 5) * N + (col_base + 0)] = acc50;\n    }\n    if (row_base + 5 < M && col_base + 1 < N) {\n        C[(row_base + 5) * N + (col_base + 1)] = acc51;\n    }\n    if (row_base + 5 < M && col_base + 2 < N) {\n        C[(row_base + 5) * N + (col_base + 2)] = acc52;\n    }\n    if (row_base + 5 < M && col_base + 3 < N) {\n        C[(row_base + 5) * N + (col_base + 3)] = acc53;\n    }\n    if (row_base + 6 < M && col_base + 0 < N) {\n        C[(row_base + 6) * N + (col_base + 0)] = acc60;\n    }\n    if (row_base + 6 < M && col_base + 1 < N) {\n        C[(row_base + 6) * N + (col_base + 1)] = acc61;\n    }\n    if (row_base + 6 < M && col_base + 2 < N) {\n        C[(row_base + 6) * N + (col_base + 2)] = acc62;\n    }\n    if (row_base + 6 < M && col_base + 3 < N) {\n        C[(row_base + 6) * N + (col_base + 3)] = acc63;\n    }\n    if (row_base + 7 < M && col_base + 0 < N) {\n        C[(row_base + 7) * N + (col_base + 0)] = acc70;\n    }\n    if (row_base + 7 < M && col_base + 1 < N) {\n        C[(row_base + 7) * N + (col_base + 1)] = acc71;\n    }\n    if (row_base + 7 < M && col_base + 2 < N) {\n        C[(row_base + 7) * N + (col_base + 2)] = acc72;\n    }\n    if (row_base + 7 < M && col_base + 3 < N) {\n        C[(row_base + 7) * N + (col_base + 3)] = acc73;\n    }\n    if (row_base + 8 < M && col_base + 0 < N) {\n        C[(row_base + 8) * N + (col_base + 0)] = acc80;\n    }\n    if (row_base + 8 < M && col_base + 1 < N) {\n        C[(row_base + 8) * N + (col_base + 1)] = acc81;\n    }\n    if (row_base + 8 < M && col_base + 2 < N) {\n        C[(row_base + 8) * N + (col_base + 2)] = acc82;\n    }\n    if (row_base + 8 < M && col_base + 3 < N) {\n        C[(row_base + 8) * N + (col_base + 3)] = acc83;\n    }\n    if (row_base + 9 < M && col_base + 0 < N) {\n        C[(row_base + 9) * N + (col_base + 0)] = acc90;\n    }\n    if (row_base + 9 < M && col_base + 1 < N) {\n        C[(row_base + 9) * N + (col_base + 1)] = acc91;\n    }\n    if (row_base + 9 < M && col_base + 2 < N) {\n        C[(row_base + 9) * N + (col_base + 2)] = acc92;\n    }\n    if (row_base + 9 < M && col_base + 3 < N) {\n        C[(row_base + 9) * N + (col_base + 3)] = acc93;\n    }\n    if (row_base + 10 < M && col_base + 0 < N) {\n        C[(row_base + 10) * N + (col_base + 0)] = acc100;\n    }\n    if (row_base + 10 < M && col_base + 1 < N) {\n        C[(row_base + 10) * N + (col_base + 1)] = acc101;\n    }\n    if (row_base + 10 < M && col_base + 2 < N) {\n        C[(row_base + 10) * N + (col_base + 2)] = acc102;\n    }\n    if (row_base + 10 < M && col_base + 3 < N) {\n        C[(row_base + 10) * N + (col_base + 3)] = acc103;\n    }\n    if (row_base + 11 < M && col_base + 0 < N) {\n        C[(row_base + 11) * N + (col_base + 0)] = acc110;\n    }\n    if (row_base + 11 < M && col_base + 1 < N) {\n        C[(row_base + 11) * N + (col_base + 1)] = acc111;\n    }\n    if (row_base + 11 < M && col_base + 2 < N) {\n        C[(row_base + 11) * N + (col_base + 2)] = acc112;\n    }\n    if (row_base + 11 < M && col_base + 3 < N) {\n        C[(row_base + 11) * N + (col_base + 3)] = acc113;\n    }\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.008832,
+      "kernel_min_ms": 0.008224,
+      "kernel_max_ms": 0.013952,
+      "cublas_time_ms": 0.012224,
+      "gflops": 3799.1884057971015,
+      "cublas_gflops": 2744.9633507853405,
+      "efficiency_pct": 138.40579710144928,
+      "dimensions": {
+        "M": 256,
+        "N": 256,
+        "K": 256
+      }
+    },
+    {
+      "kernel_time_ms": 0.023072,
+      "kernel_min_ms": 0.022176,
+      "kernel_max_ms": 0.024416,
+      "cublas_time_ms": 0.023136,
+      "gflops": 11634.685159500694,
+      "cublas_gflops": 11602.500691562931,
+      "efficiency_pct": 100.27739251040224,
+      "dimensions": {
+        "M": 512,
+        "N": 512,
+        "K": 512
+      }
+    },
+    {
+      "kernel_time_ms": 0.063968,
+      "kernel_min_ms": 0.062144,
+      "kernel_max_ms": 0.069184,
+      "cublas_time_ms": 0.104352,
+      "gflops": 33571.21760880441,
+      "cublas_gflops": 20579.228457528363,
+      "efficiency_pct": 163.1315657828915,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 0.309792,
+      "kernel_min_ms": 0.307456,
+      "kernel_max_ms": 0.314592,
+      "cublas_time_ms": 0.727936,
+      "gflops": 55456.142134077054,
+      "cublas_gflops": 23600.7962018639,
+      "efficiency_pct": 234.97572564817682,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 2.449312,
+      "kernel_min_ms": 2.245856,
+      "kernel_max_ms": 2.87616,
+      "cublas_time_ms": 6.394304,
+      "gflops": 56113.28955723077,
+      "cublas_gflops": 21493.966109837755,
+      "efficiency_pct": 261.0653114017324,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    },
+    {
+      "kernel_time_ms": 22.76288,
+      "kernel_min_ms": 20.238272,
+      "kernel_max_ms": 23.060801,
+      "cublas_time_ms": 50.809696,
+      "gflops": 48302.834605111486,
+      "cublas_gflops": 21639.799375615235,
+      "efficiency_pct": 223.21295020665227,
+      "dimensions": {
+        "M": 8192,
+        "N": 8192,
+        "K": 8192
+      }
+    },
+    {
+      "kernel_time_ms": 179.748581,
+      "kernel_min_ms": 178.01207,
+      "kernel_max_ms": 181.607391,
+      "cublas_time_ms": 405.23761,
+      "gflops": 48935.53525303212,
+      "cublas_gflops": 21706.013472461254,
+      "efficiency_pct": 225.44690352798943,
+      "dimensions": {
+        "M": 16384,
+        "N": 16384,
+        "K": 16384
+      }
+    }
+  ],
+  "error": null
+}
