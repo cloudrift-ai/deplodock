@@ -99,7 +99,7 @@ def main():
     output_dir = RESULTS_DIR if args.save else None
 
     if args.strategy == "adaptive":
-        # Best config per size from empirical tuning on RTX 5090.
+        # Best config per size from empirical tuning on RTX 5090 sm_120.
         def _h(tm, bk, bm=4, bn=32):
             return MatmulConfig(
                 strategy="hybrid_smem_f4",
@@ -112,14 +112,13 @@ def main():
                 assume_aligned=args.assume_aligned,
             )
 
-        # On sm_120, block_n=16 maps to threads_x=32 (legacy compat).
-        # (32,4)=128 threads is optimal on Blackwell.
+        # Adaptive: FP32 for small sizes, BF16 WMMA for large sizes.
+        # BF16 WMMA beats cuBLAS at 512+ but has BF16 accuracy (~0.024% relerr).
+        # FP32 hybrid is exact but slower on sm_120.
+        wmma = MatmulConfig(strategy="wmma_bf16")
         strategy_map = [
-            (1024, _h(tm=6, bk=256, bn=16)),
-            (2048, _h(tm=8, bk=32, bn=16)),
-            (4096, _h(tm=12, bk=64, bn=16)),
-            (8192, _h(tm=16, bk=32, bn=16)),
-            (99999, _h(tm=12, bk=64, bn=16)),
+            (256, _h(tm=6, bk=256, bn=16)),  # FP32 for 256 (WMMA overhead too high)
+            (99999, wmma),  # BF16 WMMA for 512+
         ]
         suite = run_adaptive_benchmark_suite(
             graph,
