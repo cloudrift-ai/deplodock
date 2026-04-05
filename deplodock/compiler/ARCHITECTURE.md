@@ -89,16 +89,15 @@ Lowering is controlled by `MatmulConfig(strategy=...)`. Available strategies:
 
 `hybrid_smem_f4` supports configurable rows per thread via `thread_m`. The 12-row variant (12r x 4c = 48 elements/thread) with `__launch_bounds__` reaches 58+ TFLOPS on RTX 5090.
 
-| Size | Best Strategy | thread_m | BK | Efficiency vs cuBLAS | TFLOPS |
-|------|--------------|----------|-----|---------------------|--------|
-| 256  | flat_scalar  | 1        | N/A | 140%  | 3.9  |
-| 512  | hybrid_smem_f4 | 2      | 256 | 101%  | 11.6 |
-| 1024 | hybrid_smem_f4 | 12     | 128 | 163%  | 33.9 |
-| 2048 | hybrid_smem_f4 | 12     | 128 | 234%  | 55.5 |
-| 3000 | hybrid_smem_f4 | 12     | 128 | **277%** | **58.8** |
-| 4096 | hybrid_smem_f4 | 12     | 128 | 235%  | 51.3 |
-| 8192 | hybrid_smem_f4 | 12     | 128 | 226%  | 49.1 |
-| 16384| hybrid_smem_f4 | 12     | 128 | 206%  | 44.8 |
+| Size | Best Strategy | thread_m | BK | Block | Eff vs cuBLAS | TFLOPS |
+|------|--------------|----------|-----|-------|--------------|--------|
+| 256  | flat_scalar  | 1        | N/A | 128x1 | 140%  | 3.9  |
+| 512  | hybrid_smem_f4 | 6      | 256 | 16x4  | **149%** | 17.8 |
+| 1024 | hybrid_smem_f4 | 6      | 256 | 16x4  | **203%** | 41.8 |
+| 2048 | hybrid_smem_f4 | 12     | 128 | 32x4  | **236%** | **55.8** |
+| 4096 | hybrid_smem_f4 | 12     | 128 | 32x4  | **242%** | 52.8 |
+| 8192 | hybrid_smem_f4 | 12     | 64  | 32x4  | **223%** | 48.4 |
+| 16384| hybrid_smem_f4 | 12     | 64  | 32x4  | **225%** | 48.9 |
 
 The `run_adaptive_benchmark_suite()` function uses a threshold-based strategy map to pick the best config per size.
 
