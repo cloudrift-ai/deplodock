@@ -87,17 +87,17 @@ Lowering is controlled by `MatmulConfig(strategy=...)`. Available strategies:
 
 ### Size-Adaptive Strategy Selection
 
-Different strategies and BK (tile dimension) values are optimal for different sizes:
+`hybrid_smem_f4` supports configurable rows per thread via `thread_m`. The 8-row variant (8r x 4c = 32 elements/thread) reaches 53+ TFLOPS on RTX 5090.
 
-| Size | Best Strategy | BK | Efficiency vs cuBLAS |
-|------|--------------|-----|---------------------|
-| 256  | flat_scalar  | N/A | 138-140% |
-| 512  | hybrid_smem_f4 | 256 | 97% |
-| 1024 | hybrid_smem_f4 | 32  | 146% |
-| 2048 | hybrid_smem_f4 | 32  | 151% |
-| 4096 | hybrid_smem_f4 | 32  | 132% |
-| 8192 | hybrid_smem_f4 | 256 | 127% |
-| 16384| hybrid_smem_f4 | 256 | 118% |
+| Size | Best Strategy | thread_m | BK | Efficiency vs cuBLAS | TFLOPS |
+|------|--------------|----------|-----|---------------------|--------|
+| 256  | flat_scalar  | 1        | N/A | 137%  | 3.8  |
+| 512  | hybrid_smem_f4 | 2      | 256 | 97%   | 11.6 |
+| 1024 | hybrid_smem_f4 | 8      | 128 | 168%  | 34.6 |
+| 2048 | hybrid_smem_f4 | 8      | 128 | 226%  | 53.4 |
+| 4096 | hybrid_smem_f4 | 8      | 64  | 237%  | 50.6 |
+| 8192 | hybrid_smem_f4 | 8      | 128 | 210%  | 45.6 |
+| 16384| hybrid_smem_f4 | 8      | 128 | 209%  | 45.4 |
 
 The `run_adaptive_benchmark_suite()` function uses a threshold-based strategy map to pick the best config per size.
 
