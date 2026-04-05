@@ -108,7 +108,7 @@ def run_benchmark_suite(
         coarsen_rows = 1
         if config.strategy == "coarsened_f4":
             coarsen_cols = 4
-        elif config.strategy == "coarsened_2r4c":
+        elif config.strategy in ("coarsened_2r4c", "hybrid_smem_f4"):
             coarsen_cols = 4
             coarsen_rows = 2
 
