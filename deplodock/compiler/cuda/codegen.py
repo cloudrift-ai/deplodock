@@ -46,12 +46,15 @@ _PRECEDENCE: dict[str, int] = {
 
 def emit_kernel(kernel: KernelDef) -> str:
     """Emit complete CUDA C source for a __global__ kernel."""
+    preamble = ""
+    if kernel.includes:
+        preamble = "\n".join(f"#include <{h}>" for h in kernel.includes) + "\nusing namespace nvcuda;\n\n"
     params = ", ".join(f"{p.dtype} {p.name}" for p in kernel.params)
     body = "\n".join(_emit_stmt(s, indent=1) for s in kernel.body)
     bx, by, bz = kernel.block_size
     max_threads = bx * by * bz
     launch_bounds = f"\n__launch_bounds__({max_threads})" if max_threads <= 256 else ""
-    return f"__global__{launch_bounds} void {kernel.name}({params}) {{\n{body}\n}}\n"
+    return f"{preamble}__global__{launch_bounds} void {kernel.name}({params}) {{\n{body}\n}}\n"
 
 
 def _emit_expr(expr: Expr, parent_prec: int = 0) -> str:

@@ -200,3 +200,6 @@ class KernelDef:
     params: list[KernelParam]
     body: list[Stmt]
     block_size: tuple[int, int, int] = (16, 16, 1)
+    includes: list[str] | None = None  # Extra #include headers
+    tile_m: int | None = None  # Output tile rows per block (overrides grid computation)
+    tile_n: int | None = None  # Output tile cols per block

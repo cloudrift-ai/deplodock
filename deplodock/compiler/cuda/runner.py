@@ -302,10 +302,14 @@ def generate_benchmark_program(
     k = dim_args.get("K", 1)
 
     bx, by, _bz = kernel.block_size
-    effective_n = f"(({n} + {coarsen_cols - 1}) / {coarsen_cols})"
-    effective_m = f"(({m} + {coarsen_rows - 1}) / {coarsen_rows})"
-    grid_x = f"({effective_n} + {bx - 1}) / {bx}"
-    grid_y = f"({effective_m} + {by - 1}) / {by}"
+    if kernel.tile_m and kernel.tile_n:
+        grid_x = f"({n} + {kernel.tile_n - 1}) / {kernel.tile_n}"
+        grid_y = f"({m} + {kernel.tile_m - 1}) / {kernel.tile_m}"
+    else:
+        effective_n = f"(({n} + {coarsen_cols - 1}) / {coarsen_cols})"
+        effective_m = f"(({m} + {coarsen_rows - 1}) / {coarsen_rows})"
+        grid_x = f"({effective_n} + {bx - 1}) / {bx}"
+        grid_y = f"({effective_m} + {by - 1}) / {by}"
 
     launch_args = []
     for p in kernel.params:
@@ -485,6 +489,8 @@ def run_benchmark(
         nvcc_cmd.extend(["-arch", arch])
     if maxrregcount is not None:
         nvcc_cmd.extend(["--maxrregcount", str(maxrregcount)])
+    if "#include <mma.h>" in program or "wmma::" in program:
+        nvcc_cmd.extend(["--std=c++17"])
     if compare_cublas:
         nvcc_cmd.extend(["-lcublas", "-lcurand"])
     else:
