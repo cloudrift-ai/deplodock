@@ -739,10 +739,10 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     from deplodock.compiler.cuda.ir import FieldAccess, Ternary, VectorLoad
 
     body: list = []
-    rows_per_thread = 2
+    rows_per_thread = config.thread_m if config.thread_m > 1 else 2
     cols_per_thread = 4
-    threads_y = 8
-    threads_x = 32
+    threads_y = config.block_m if config.block_m != 16 else 8
+    threads_x = config.block_n if config.block_n != 16 else 32
     smem_rows = threads_y * rows_per_thread  # 16
     smem_stride = bk + 1  # padding to avoid bank conflicts
 
@@ -773,9 +773,10 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     # Shared memory for A.
     body.append(ArrayDecl("__shared__ float", "As", [smem_rows * smem_stride]))
 
-    # Shared memory row indices for this thread's 2 output rows.
+    # Shared memory row indices for this thread's output rows.
     body.append(VarDecl("int", "sr0", BinOp("*", CudaBuiltin("threadIdx.y"), Literal(rows_per_thread, "int"))))
-    body.append(VarDecl("int", "sr1", BinOp("+", Var("sr0"), Literal(1, "int"))))
+    for r in range(1, rows_per_thread):
+        body.append(VarDecl("int", f"sr{r}", BinOp("+", Var("sr0"), Literal(r, "int"))))
 
     # Accumulators.
     for r in range(rows_per_thread):
@@ -788,10 +789,11 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     # Load A into shared memory.
     # BK <= 32: each thread loads at most 1 element (guard if BK < 32).
     # BK > 32: strided loop so each thread loads BK/32 elements.
+    sr_pairs = [(f"sr{r}", r) for r in range(rows_per_thread)]
     if bk <= threads_x:
         a_col_expr = BinOp("+", Var("tile_k"), CudaBuiltin("threadIdx.x"))
         a_load_stmts: list = []
-        for sr_name, row_off in [("sr0", 0), ("sr1", 1)]:
+        for sr_name, row_off in sr_pairs:
             g_row = BinOp("+", Var("row_base"), Literal(row_off, "int"))
             a_global = BinOp("+", BinOp("*", g_row, Var("K")), a_col_expr)
             a_bounds = BinOp("&&", BinOp("<", g_row, Var("M")), BinOp("<", a_col_expr, Var("K")))
@@ -805,7 +807,7 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
         # BK > 32: strided loop for (int a_s = threadIdx.x; a_s < BK; a_s += 32)
         a_col_strided = BinOp("+", Var("tile_k"), Var("a_s"))
         stride_body: list = []
-        for sr_name, row_off in [("sr0", 0), ("sr1", 1)]:
+        for sr_name, row_off in sr_pairs:
             g_row = BinOp("+", Var("row_base"), Literal(row_off, "int"))
             a_global = BinOp("+", BinOp("*", g_row, Var("K")), a_col_strided)
             a_bounds = BinOp("&&", BinOp("<", g_row, Var("M")), BinOp("<", a_col_strided, Var("K")))
@@ -816,37 +818,33 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     tile_body.append(SyncThreads())
 
     # Inner k-loop: float4 fast path + scalar fallback for edge columns.
-    a0_read = VarDecl("float", "a0", ArrayAccess("As", BinOp("+", BinOp("*", Var("sr0"), Literal(smem_stride, "int")), Var("kk"))))
-    a1_read = VarDecl("float", "a1", ArrayAccess("As", BinOp("+", BinOp("*", Var("sr1"), Literal(smem_stride, "int")), Var("kk"))))
+    a_reads = []
+    for r in range(rows_per_thread):
+        a_reads.append(
+            VarDecl("float", f"a{r}", ArrayAccess("As", BinOp("+", BinOp("*", Var(f"sr{r}"), Literal(smem_stride, "int")), Var("kk"))))
+        )
 
-    # Float4 path (col_base + 3 < N).
-    k_body_f4: list = [a0_read, a1_read]
+    # Float4 path (col_base + 3 < N and N%4==0).
+    k_body_f4: list = list(a_reads)
     k_body_f4.append(
         VarDecl(
             "float4", "b4", VectorLoad(b_name, BinOp("+", BinOp("*", BinOp("+", Var("tile_k"), Var("kk")), Var("N")), Var("col_base")), 4)
         )
     )
-    for c, field in enumerate(["x", "y", "z", "w"]):
-        k_body_f4.append(AugAssign(f"acc0{c}", "+=", BinOp("*", Var("a0"), FieldAccess(Var("b4"), field))))
-    for c, field in enumerate(["x", "y", "z", "w"]):
-        k_body_f4.append(AugAssign(f"acc1{c}", "+=", BinOp("*", Var("a1"), FieldAccess(Var("b4"), field))))
+    for r in range(rows_per_thread):
+        for c, field in enumerate(["x", "y", "z", "w"]):
+            k_body_f4.append(AugAssign(f"acc{r}{c}", "+=", BinOp("*", Var(f"a{r}"), FieldAccess(Var("b4"), field))))
 
     # Scalar path (edge columns where float4 would go out of bounds).
-    k_body_scalar: list = [a0_read, a1_read]
+    k_body_scalar: list = list(a_reads)
     b_row_expr = BinOp("*", BinOp("+", Var("tile_k"), Var("kk")), Var("N"))
     for c in range(cols_per_thread):
         col_c = BinOp("+", Var("col_base"), Literal(c, "int"))
         b_scalar = ArrayAccess(b_name, BinOp("+", b_row_expr, col_c))
-        k_body_scalar.append(
-            IfStmt(
-                cond=BinOp("<", col_c, Var("N")),
-                body=[
-                    VarDecl("float", f"bv{c}", b_scalar),
-                    AugAssign(f"acc0{c}", "+=", BinOp("*", Var("a0"), Var(f"bv{c}"))),
-                    AugAssign(f"acc1{c}", "+=", BinOp("*", Var("a1"), Var(f"bv{c}"))),
-                ],
-            )
-        )
+        scalar_fmas = [VarDecl("float", f"bv{c}", b_scalar)]
+        for r in range(rows_per_thread):
+            scalar_fmas.append(AugAssign(f"acc{r}{c}", "+=", BinOp("*", Var(f"a{r}"), Var(f"bv{c}"))))
+        k_body_scalar.append(IfStmt(cond=BinOp("<", col_c, Var("N")), body=scalar_fmas))
 
     n_aligned = BinOp("==", BinOp("%", Var("N"), Literal(4, "int")), Literal(0, "int"))
     col_ok = BinOp("&&", BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")), n_aligned)

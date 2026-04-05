@@ -69,6 +69,7 @@ def main():
     parser.add_argument("--bk", type=int, default=32, help="Block K dimension")
     parser.add_argument("--block-m", type=int, default=8, help="Block M (threads_y)")
     parser.add_argument("--block-n", type=int, default=32, help="Block N (threads_x)")
+    parser.add_argument("--thread-m", type=int, default=1, help="Rows per thread (thread_m)")
     parser.add_argument("--iterations", type=int, default=10, help="Benchmark iterations")
     parser.add_argument("--sizes", type=str, default=None, help="Comma-separated sizes")
     parser.add_argument("--extended", action="store_true", help="Include non-standard sizes")
@@ -114,13 +115,15 @@ def main():
         if args.strategy == "coarsened_f4":
             coarsen_cols = 4
         elif args.strategy in ("coarsened_2r4c", "hybrid_smem_f4"):
-            coarsen_rows, coarsen_cols = 2, 4
+            thread_m = args.thread_m if args.thread_m > 1 else 2
+            coarsen_rows, coarsen_cols = thread_m, 4
 
         config = MatmulConfig(
             strategy=args.strategy,
             block_k=args.bk,
             block_m=args.block_m,
             block_n=args.block_n,
+            thread_m=args.thread_m,
             coarsen_rows=coarsen_rows,
             coarsen_cols=coarsen_cols,
         )
