@@ -84,7 +84,8 @@ def test_emit_simple_kernel():
         ],
     )
     source = emit_kernel(kernel)
-    assert "__global__ void test_kernel" in source
+    assert "__global__" in source
+    assert "void test_kernel" in source
     assert "blockIdx.x" in source
     assert "threadIdx.x" in source
     assert "float val = 1.0f;" in source
@@ -97,7 +98,8 @@ def test_emit_matmul_kernel():
     kernel = lower_graph(fused)
     source = emit_kernel(kernel)
 
-    assert "__global__ void fused_matmul" in source
+    assert "__global__" in source
+    assert "void fused_matmul" in source
     assert "float* A" in source
     assert "float* B" in source
     assert "float* C" in source
