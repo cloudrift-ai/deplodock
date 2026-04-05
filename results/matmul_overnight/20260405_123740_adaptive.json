@@ -1,0 +1,196 @@
+{
+  "timestamp": "20260405_123740",
+  "strategy": "adaptive",
+  "config": {
+    "strategy_map": [
+      [
+        256,
+        {
+          "strategy": "flat_scalar",
+          "block_m": 16,
+          "block_n": 128,
+          "block_k": 16,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1
+        }
+      ],
+      [
+        512,
+        {
+          "strategy": "hybrid_smem_f4",
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 256,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 2,
+          "coarsen_cols": 4
+        }
+      ],
+      [
+        2048,
+        {
+          "strategy": "hybrid_smem_f4",
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 32,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 2,
+          "coarsen_cols": 4
+        }
+      ],
+      [
+        4096,
+        {
+          "strategy": "hybrid_smem_f4",
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 64,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 2,
+          "coarsen_cols": 4
+        }
+      ],
+      [
+        99999,
+        {
+          "strategy": "hybrid_smem_f4",
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 256,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 2,
+          "coarsen_cols": 4
+        }
+      ]
+    ]
+  },
+  "description": "FINAL adaptive sweep (30 iter, BK tuned)",
+  "cuda_kernel": "__global__ void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int row_base = (blockIdx.y * blockDim.y + threadIdx.y) * 2;\n    int col_base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;\n    __shared__ float As[4112];\n    int sr0 = threadIdx.y * 2;\n    int sr1 = sr0 + 1;\n    float acc00 = 0.0f;\n    float acc01 = 0.0f;\n    float acc02 = 0.0f;\n    float acc03 = 0.0f;\n    float acc10 = 0.0f;\n    float acc11 = 0.0f;\n    float acc12 = 0.0f;\n    float acc13 = 0.0f;\n    for (int tile_k = 0; tile_k < K; tile_k += 256) {\n        for (int a_s = threadIdx.x; a_s < 256; a_s += 32) {\n            As[sr0 * 257 + a_s] = ((row_base + 0 < M && tile_k + a_s < K) ? (A[(row_base + 0) * K + (tile_k + a_s)]) : (0.0f));\n            As[sr1 * 257 + a_s] = ((row_base + 1 < M && tile_k + a_s < K) ? (A[(row_base + 1) * K + (tile_k + a_s)]) : (0.0f));\n        }\n        __syncthreads();\n        if (col_base + 3 < N && N % 4 == 0) {\n            #pragma unroll\n            for (int kk = 0; kk < 256; kk++) {\n                float a0 = As[sr0 * 257 + kk];\n                float a1 = As[sr1 * 257 + kk];\n                float4 b4 = *reinterpret_cast<float4*>(&B[(tile_k + kk) * N + col_base]);\n                acc00 += a0 * b4.x;\n                acc01 += a0 * b4.y;\n                acc02 += a0 * b4.z;\n                acc03 += a0 * b4.w;\n                acc10 += a1 * b4.x;\n                acc11 += a1 * b4.y;\n                acc12 += a1 * b4.z;\n                acc13 += a1 * b4.w;\n            }\n        } else {\n            if (col_base < N) {\n                for (int kk = 0; kk < 256; kk++) {\n                    float a0 = As[sr0 * 257 + kk];\n                    float a1 = As[sr1 * 257 + kk];\n                    if (col_base + 0 < N) {\n                        float bv0 = B[(tile_k + kk) * N + (col_base + 0)];\n                        acc00 += a0 * bv0;\n                        acc10 += a1 * bv0;\n                    }\n                    if (col_base + 1 < N) {\n                        float bv1 = B[(tile_k + kk) * N + (col_base + 1)];\n                        acc01 += a0 * bv1;\n                        acc11 += a1 * bv1;\n                    }\n                    if (col_base + 2 < N) {\n                        float bv2 = B[(tile_k + kk) * N + (col_base + 2)];\n                        acc02 += a0 * bv2;\n                        acc12 += a1 * bv2;\n                    }\n                    if (col_base + 3 < N) {\n                        float bv3 = B[(tile_k + kk) * N + (col_base + 3)];\n                        acc03 += a0 * bv3;\n                        acc13 += a1 * bv3;\n                    }\n                }\n            }\n        }\n        __syncthreads();\n    }\n    if (row_base + 0 < M && col_base + 0 < N) {\n        C[(row_base + 0) * N + (col_base + 0)] = acc00;\n    }\n    if (row_base + 0 < M && col_base + 1 < N) {\n        C[(row_base + 0) * N + (col_base + 1)] = acc01;\n    }\n    if (row_base + 0 < M && col_base + 2 < N) {\n        C[(row_base + 0) * N + (col_base + 2)] = acc02;\n    }\n    if (row_base + 0 < M && col_base + 3 < N) {\n        C[(row_base + 0) * N + (col_base + 3)] = acc03;\n    }\n    if (row_base + 1 < M && col_base + 0 < N) {\n        C[(row_base + 1) * N + (col_base + 0)] = acc10;\n    }\n    if (row_base + 1 < M && col_base + 1 < N) {\n        C[(row_base + 1) * N + (col_base + 1)] = acc11;\n    }\n    if (row_base + 1 < M && col_base + 2 < N) {\n        C[(row_base + 1) * N + (col_base + 2)] = acc12;\n    }\n    if (row_base + 1 < M && col_base + 3 < N) {\n        C[(row_base + 1) * N + (col_base + 3)] = acc13;\n    }\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.008768,
+      "kernel_min_ms": 0.008096,
+      "kernel_max_ms": 0.016128,
+      "cublas_time_ms": 0.012192,
+      "gflops": 3826.9197080291974,
+      "cublas_gflops": 2752.167979002625,
+      "efficiency_pct": 139.05109489051094,
+      "dimensions": {
+        "M": 256,
+        "N": 256,
+        "K": 256
+      }
+    },
+    {
+      "kernel_time_ms": 0.023104,
+      "kernel_min_ms": 0.02224,
+      "kernel_max_ms": 0.024128,
+      "cublas_time_ms": 0.022496,
+      "gflops": 11618.570637119114,
+      "cublas_gflops": 11932.586059743955,
+      "efficiency_pct": 97.36842105263158,
+      "dimensions": {
+        "M": 512,
+        "N": 512,
+        "K": 512
+      }
+    },
+    {
+      "kernel_time_ms": 0.071872,
+      "kernel_min_ms": 0.06992,
+      "kernel_max_ms": 0.075264,
+      "cublas_time_ms": 0.10496,
+      "gflops": 29879.280498664288,
+      "cublas_gflops": 20460.019512195122,
+      "efficiency_pct": 146.03739982190558,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 0.484,
+      "kernel_min_ms": 0.478688,
+      "kernel_max_ms": 0.488064,
+      "cublas_time_ms": 0.730048,
+      "gflops": 35495.59748760331,
+      "cublas_gflops": 23532.520031559565,
+      "efficiency_pct": 150.83636363636367,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 4.913088,
+      "kernel_min_ms": 3.775872,
+      "kernel_max_ms": 5.334496,
+      "cublas_time_ms": 6.474048,
+      "gflops": 27974.046764885952,
+      "cublas_gflops": 21229.214468598322,
+      "efficiency_pct": 131.77146430106683,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    },
+    {
+      "kernel_time_ms": 39.799263,
+      "kernel_min_ms": 33.743103,
+      "kernel_max_ms": 40.034016,
+      "cublas_time_ms": 50.621662,
+      "gflops": 27626.431870761022,
+      "cublas_gflops": 21720.180340503237,
+      "efficiency_pct": 127.1924608252168,
+      "dimensions": {
+        "M": 8192,
+        "N": 8192,
+        "K": 8192
+      }
+    },
+    {
+      "kernel_time_ms": 342.188965,
+      "kernel_min_ms": 335.620056,
+      "kernel_max_ms": 412.053284,
+      "cublas_time_ms": 405.323273,
+      "gflops": 25705.367273336826,
+      "cublas_gflops": 21701.426017567956,
+      "efficiency_pct": 118.45012974044913,
+      "dimensions": {
+        "M": 16384,
+        "N": 16384,
+        "K": 16384
+      }
+    }
+  ],
+  "error": null
+}

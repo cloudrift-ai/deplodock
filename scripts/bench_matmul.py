@@ -91,11 +91,12 @@ def main():
     output_dir = RESULTS_DIR if args.save else None
 
     if args.strategy == "adaptive":
-        # Best config per size from empirical tuning.
+        # Best config per size from empirical tuning on RTX 5090.
         strategy_map = [
             (256, MatmulConfig(strategy="flat_scalar", block_n=128, coarsen_rows=1, coarsen_cols=1)),
             (512, MatmulConfig(strategy="hybrid_smem_f4", block_k=256, coarsen_rows=2, coarsen_cols=4)),
-            (4096, MatmulConfig(strategy="hybrid_smem_f4", block_k=32, coarsen_rows=2, coarsen_cols=4)),
+            (2048, MatmulConfig(strategy="hybrid_smem_f4", block_k=32, coarsen_rows=2, coarsen_cols=4)),
+            (4096, MatmulConfig(strategy="hybrid_smem_f4", block_k=64, coarsen_rows=2, coarsen_cols=4)),
             (99999, MatmulConfig(strategy="hybrid_smem_f4", block_k=256, coarsen_rows=2, coarsen_cols=4)),
         ]
         suite = run_adaptive_benchmark_suite(
