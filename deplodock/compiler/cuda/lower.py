@@ -781,6 +781,10 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     for r in range(1, rows_per_thread):
         body.append(VarDecl("int", f"sr{r}", BinOp("+", Var("sr0"), Literal(r, "int"))))
 
+    # Pre-computed smem base addresses for A reads (avoids multiply in inner loop).
+    for r in range(rows_per_thread):
+        body.append(VarDecl("int", f"ab{r}", BinOp("*", Var(f"sr{r}"), Literal(smem_stride, "int"))))
+
     # Accumulators.
     for r in range(rows_per_thread):
         for c in range(cols_per_thread):
@@ -829,9 +833,7 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     # Inner k-loop: float4 fast path + scalar fallback for edge columns.
     a_reads = []
     for r in range(rows_per_thread):
-        a_reads.append(
-            VarDecl("float", f"a{r}", ArrayAccess("As", BinOp("+", BinOp("*", Var(f"sr{r}"), Literal(smem_stride, "int")), Var("kk"))))
-        )
+        a_reads.append(VarDecl("float", f"a{r}", ArrayAccess("As", BinOp("+", Var(f"ab{r}"), Var("kk")))))
 
     # Float4 path (col_base + 3 < N and N%4==0).
     k_body_f4: list = list(a_reads)
