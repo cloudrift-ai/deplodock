@@ -105,8 +105,12 @@ def run_benchmark_suite(
 
         # Determine coarsening factor from config.
         coarsen_cols = 1
+        coarsen_rows = 1
         if config.strategy == "coarsened_f4":
             coarsen_cols = 4
+        elif config.strategy == "coarsened_2r4c":
+            coarsen_cols = 4
+            coarsen_rows = 2
 
         # Benchmark each size.
         for dim_args in sizes:
@@ -119,6 +123,7 @@ def run_benchmark_suite(
                     dim_args=dim_args,
                     num_iterations=num_iterations,
                     coarsen_cols=coarsen_cols,
+                    coarsen_rows=coarsen_rows,
                 )
                 suite.results.append(result)
                 logger.info(
