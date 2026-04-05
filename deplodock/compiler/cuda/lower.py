@@ -1321,7 +1321,8 @@ def _lower_matmul_wmma_bf16(graph, out_node, config):
 
     from deplodock.compiler.cuda.ir import RawCode
 
-    bm, bn, bk = 64, 64, 16
+    bm, bn = 64, 64
+    bk = config.block_k if config.block_k >= 16 else 16
     num_threads = 128
     a_loads = (bm * bk) // num_threads  # 8
     b_loads = (bk * bn) // num_threads  # 8
@@ -1361,18 +1362,30 @@ def _lower_matmul_wmma_bf16(graph, out_node, config):
     kernel_code += f"        Bs[r * {bn} + c] = __float2bfloat16((gr < K && gc < N) ? {b_name}[gr * N + gc] : 0.0f);\n"
     kernel_code += "    }\n"
     kernel_code += "    __syncthreads();\n"
-    # WMMA compute: 2x2 tiles per warp
+    # WMMA compute: 2x2 tiles per warp, with K-stepping for BK > 16
+    wmma_k = 16  # BF16 WMMA K dimension
+    k_steps = bk // wmma_k
     kernel_code += "    int wm = warp_m * 32, wn = warp_n * 32;\n"
     kernel_code += (
         "    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;\n"
         "    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bf;\n"
     )
-    for wi, wj, cfrag in [(0, 0, "c00"), (0, 1, "c01"), (1, 0, "c10"), (1, 1, "c11")]:
-        kernel_code += (
-            f"    wmma::load_matrix_sync(af, &As[(wm+{wi * 16})*{bk}], {bk});\n"
-            f"    wmma::load_matrix_sync(bf, &Bs[wn+{wj * 16}], {bn});\n"
-            f"    wmma::mma_sync({cfrag}, af, bf, {cfrag});\n"
-        )
+    if k_steps > 1:
+        kernel_code += f"    #pragma unroll\n    for (int wk = 0; wk < {bk}; wk += {wmma_k}) {{\n"
+        for wi, wj, cfrag in [(0, 0, "c00"), (0, 1, "c01"), (1, 0, "c10"), (1, 1, "c11")]:
+            kernel_code += (
+                f"    wmma::load_matrix_sync(af, &As[(wm+{wi * 16})*{bk}+wk], {bk});\n"
+                f"    wmma::load_matrix_sync(bf, &Bs[wk*{bn}+wn+{wj * 16}], {bn});\n"
+                f"    wmma::mma_sync({cfrag}, af, bf, {cfrag});\n"
+            )
+        kernel_code += "    }\n"
+    else:
+        for wi, wj, cfrag in [(0, 0, "c00"), (0, 1, "c01"), (1, 0, "c10"), (1, 1, "c11")]:
+            kernel_code += (
+                f"    wmma::load_matrix_sync(af, &As[(wm+{wi * 16})*{bk}], {bk});\n"
+                f"    wmma::load_matrix_sync(bf, &Bs[wn+{wj * 16}], {bn});\n"
+                f"    wmma::mma_sync({cfrag}, af, bf, {cfrag});\n"
+            )
     kernel_code += "    __syncthreads();\n"
     kernel_code += "}\n"
     # Store results
