@@ -1322,11 +1322,13 @@ def _lower_matmul_wmma_bf16(graph, out_node, config):
     from deplodock.compiler.cuda.ir import RawCode
 
     bm, bn = 64, 64
-    bk = config.block_k if config.block_k >= 16 else 16
+    bk_raw = config.block_k if config.block_k >= 16 else 16
+    # BK must be power of 2 for shift-based loading
+    bk = 1 << (bk_raw.bit_length() - 1) if bk_raw & (bk_raw - 1) else bk_raw
     num_threads = 128
     a_loads = (bm * bk) // num_threads  # 8
     b_loads = (bk * bn) // num_threads  # 8
-    a_shift = 4  # log2(BK=16)
+    a_shift = bk.bit_length() - 1  # log2(BK)
     a_mask = bk - 1
     b_shift = 6  # log2(BN=64)
     b_mask = bn - 1
