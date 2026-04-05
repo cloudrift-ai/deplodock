@@ -465,6 +465,7 @@ def run_benchmark(
     coarsen_cols: int = 1,
     coarsen_rows: int = 1,
     cublas_math_mode: str = "default",
+    maxrregcount: int | None = None,
 ) -> BenchmarkResult:
     """Run a benchmark: compile and execute, return timing results."""
     program = generate_benchmark_program(
@@ -482,6 +483,8 @@ def run_benchmark(
     nvcc_cmd = ["nvcc", "-O3", "--use_fast_math"]
     if arch:
         nvcc_cmd.extend(["-arch", arch])
+    if maxrregcount is not None:
+        nvcc_cmd.extend(["--maxrregcount", str(maxrregcount)])
     if compare_cublas:
         nvcc_cmd.extend(["-lcublas", "-lcurand"])
     else:
