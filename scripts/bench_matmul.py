@@ -75,6 +75,7 @@ def main():
     parser.add_argument("--extended", action="store_true", help="Include non-standard sizes")
     parser.add_argument("--description", type=str, default="", help="Description for trace")
     parser.add_argument("--save", action="store_true", help="Save trace to results dir")
+    parser.add_argument("--assume-aligned", action="store_true", help="Skip bounds checks (for pow2 sizes)")
     parser.add_argument(
         "--cublas-math",
         default="default",
@@ -108,6 +109,7 @@ def main():
                 block_k=bk,
                 coarsen_rows=tm,
                 coarsen_cols=4,
+                assume_aligned=args.assume_aligned,
             )
 
         # On sm_120, block_n=16 maps to threads_x=32 (legacy compat).
@@ -146,6 +148,7 @@ def main():
             thread_m=args.thread_m,
             coarsen_rows=coarsen_rows,
             coarsen_cols=coarsen_cols,
+            assume_aligned=args.assume_aligned,
         )
         suite = run_benchmark_suite(
             graph,

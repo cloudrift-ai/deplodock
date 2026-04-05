@@ -41,6 +41,7 @@ class MatmulConfig:
     smem_pad: int = 1
     coarsen_rows: int = 1
     coarsen_cols: int = 1
+    assume_aligned: bool = False
 
 
 def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
@@ -792,29 +793,35 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     # BK <= 32: each thread loads at most 1 element (guard if BK < 32).
     # BK > 32: strided loop so each thread loads BK/32 elements.
     sr_pairs = [(f"sr{r}", r) for r in range(rows_per_thread)]
+    aligned = config.assume_aligned
     if bk <= threads_x:
         a_col_expr = BinOp("+", Var("tile_k"), CudaBuiltin("threadIdx.x"))
         a_load_stmts: list = []
         for sr_name, row_off in sr_pairs:
             g_row = BinOp("+", Var("row_base"), Literal(row_off, "int"))
             a_global = BinOp("+", BinOp("*", g_row, Var("K")), a_col_expr)
-            a_bounds = BinOp("&&", BinOp("<", g_row, Var("M")), BinOp("<", a_col_expr, Var("K")))
             smem_idx = BinOp("+", BinOp("*", Var(sr_name), Literal(smem_stride, "int")), CudaBuiltin("threadIdx.x"))
-            a_load_stmts.append(Assign(ArrayAccess("As", smem_idx), Ternary(a_bounds, ArrayAccess(a_name, a_global), Literal(0.0))))
+            if aligned:
+                a_load_stmts.append(Assign(ArrayAccess("As", smem_idx), ArrayAccess(a_name, a_global)))
+            else:
+                a_bounds = BinOp("&&", BinOp("<", g_row, Var("M")), BinOp("<", a_col_expr, Var("K")))
+                a_load_stmts.append(Assign(ArrayAccess("As", smem_idx), Ternary(a_bounds, ArrayAccess(a_name, a_global), Literal(0.0))))
         if bk < threads_x:
             tile_body.append(IfStmt(cond=BinOp("<", CudaBuiltin("threadIdx.x"), Literal(bk, "int")), body=a_load_stmts))
         else:
             tile_body.extend(a_load_stmts)
     else:
-        # BK > 32: strided loop for (int a_s = threadIdx.x; a_s < BK; a_s += 32)
         a_col_strided = BinOp("+", Var("tile_k"), Var("a_s"))
         stride_body: list = []
         for sr_name, row_off in sr_pairs:
             g_row = BinOp("+", Var("row_base"), Literal(row_off, "int"))
             a_global = BinOp("+", BinOp("*", g_row, Var("K")), a_col_strided)
-            a_bounds = BinOp("&&", BinOp("<", g_row, Var("M")), BinOp("<", a_col_strided, Var("K")))
             smem_idx = BinOp("+", BinOp("*", Var(sr_name), Literal(smem_stride, "int")), Var("a_s"))
-            stride_body.append(Assign(ArrayAccess("As", smem_idx), Ternary(a_bounds, ArrayAccess(a_name, a_global), Literal(0.0))))
+            if aligned:
+                stride_body.append(Assign(ArrayAccess("As", smem_idx), ArrayAccess(a_name, a_global)))
+            else:
+                a_bounds = BinOp("&&", BinOp("<", g_row, Var("M")), BinOp("<", a_col_strided, Var("K")))
+                stride_body.append(Assign(ArrayAccess("As", smem_idx), Ternary(a_bounds, ArrayAccess(a_name, a_global), Literal(0.0))))
         tile_body.append(ForLoop("a_s", CudaBuiltin("threadIdx.x"), Literal(bk, "int"), stride_body, step=Literal(threads_x, "int")))
 
     tile_body.append(SyncThreads())
@@ -848,24 +855,23 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
             scalar_fmas.append(AugAssign(f"acc{r}{c}", "+=", BinOp("*", Var(f"a{r}"), Var(f"bv{c}"))))
         k_body_scalar.append(IfStmt(cond=BinOp("<", col_c, Var("N")), body=scalar_fmas))
 
-    n_aligned = BinOp("==", BinOp("%", Var("N"), Literal(4, "int")), Literal(0, "int"))
-    col_ok = BinOp("&&", BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")), n_aligned)
-    col_any = BinOp("<", Var("col_base"), Var("N"))
-    tile_body.append(
-        IfStmt(
-            cond=col_ok,
-            body=[
-                PragmaUnroll(),
-                ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_f4),
-            ],
-            else_body=[
-                IfStmt(
-                    cond=col_any,
-                    body=[ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_scalar)],
-                ),
-            ],
+    if aligned:
+        # Skip all bounds checks — assume M, N, K are multiples of tile dims.
+        tile_body.append(PragmaUnroll())
+        tile_body.append(ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_f4))
+    else:
+        n_aligned = BinOp("==", BinOp("%", Var("N"), Literal(4, "int")), Literal(0, "int"))
+        col_ok = BinOp("&&", BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")), n_aligned)
+        col_any = BinOp("<", Var("col_base"), Var("N"))
+        tile_body.append(
+            IfStmt(
+                cond=col_ok,
+                body=[PragmaUnroll(), ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_f4)],
+                else_body=[
+                    IfStmt(cond=col_any, body=[ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_scalar)]),
+                ],
+            )
         )
-    )
     tile_body.append(SyncThreads())
 
     body.append(ForLoop("tile_k", Literal(0, "int"), Var("K"), tile_body, step=Literal(bk, "int")))
@@ -876,12 +882,15 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
             row_r = BinOp("+", Var("row_base"), Literal(r, "int"))
             col_c = BinOp("+", Var("col_base"), Literal(c, "int"))
             c_idx = BinOp("+", BinOp("*", row_r, Var("N")), col_c)
-            body.append(
-                IfStmt(
-                    cond=BinOp("&&", BinOp("<", row_r, Var("M")), BinOp("<", col_c, Var("N"))),
-                    body=[Assign(ArrayAccess(c_name, c_idx), Var(f"acc{r}{c}"))],
+            if aligned:
+                body.append(Assign(ArrayAccess(c_name, c_idx), Var(f"acc{r}{c}")))
+            else:
+                body.append(
+                    IfStmt(
+                        cond=BinOp("&&", BinOp("<", row_r, Var("M")), BinOp("<", col_c, Var("N"))),
+                        body=[Assign(ArrayAccess(c_name, c_idx), Var(f"acc{r}{c}"))],
+                    )
                 )
-            )
 
     return KernelDef(
         name="fused_matmul",
