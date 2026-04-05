@@ -1,0 +1,165 @@
+{
+  "timestamp": "20260405_233624",
+  "strategy": "adaptive",
+  "config": {
+    "strategy_map": [
+      [
+        256,
+        {
+          "strategy": "hybrid_smem_f4",
+          "block_m": 4,
+          "block_n": 16,
+          "block_k": 256,
+          "thread_m": 6,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 6,
+          "coarsen_cols": 4,
+          "assume_aligned": false
+        }
+      ],
+      [
+        4096,
+        {
+          "strategy": "wmma_bf16",
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 16,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false
+        }
+      ],
+      [
+        99999,
+        {
+          "strategy": "wmma_bf16",
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 32,
+          "thread_m": 1,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false
+        }
+      ]
+    ]
+  },
+  "description": "sm_120 adaptive FP32+WMMA BK-tuned (30 iter)",
+  "cuda_kernel": "#include <cuda_bf16.h>\n#include <mma.h>\nusing namespace nvcuda;\n\n__global__\n__launch_bounds__(128) void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int warp_id = threadIdx.x / 32;\n    int warp_m = warp_id / 2, warp_n = warp_id % 2;\n    int block_m = blockIdx.y * 64, block_n = blockIdx.x * 64;\n    int tid = threadIdx.x;\n    __shared__ __nv_bfloat16 As[2048];\n    __shared__ __nv_bfloat16 Bs[2048];\n    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c00, c01, c10, c11;\n    wmma::fill_fragment(c00, 0.0f);\n    wmma::fill_fragment(c01, 0.0f);\n    wmma::fill_fragment(c10, 0.0f);\n    wmma::fill_fragment(c11, 0.0f);\n    for (int tile_k = 0; tile_k < K; tile_k += 32) {\n        #pragma unroll\n        for (int p = 0; p < 16; p++) {\n            int idx = tid + p * 128;\n            int r = idx >> 4, c = idx & 31;\n            int gr = block_m + r, gc = tile_k + c;\n            As[r * 32 + c] = __float2bfloat16((gr < M && gc < K) ? A[gr * K + gc] : 0.0f);\n        }\n        #pragma unroll\n        for (int p = 0; p < 16; p++) {\n            int idx = tid + p * 128;\n            int r = idx >> 6, c = idx & 63;\n            int gr = tile_k + r, gc = block_n + c;\n            Bs[r * 64 + c] = __float2bfloat16((gr < K && gc < N) ? B[gr * N + gc] : 0.0f);\n        }\n        __syncthreads();\n        int wm = warp_m * 32, wn = warp_n * 32;\n        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;\n        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bf;\n        #pragma unroll\n        for (int wk = 0; wk < 32; wk += 16) {\n        wmma::load_matrix_sync(af, &As[(wm+0)*32+wk], 32);\n        wmma::load_matrix_sync(bf, &Bs[wk*64+wn+0], 64);\n        wmma::mma_sync(c00, af, bf, c00);\n        wmma::load_matrix_sync(af, &As[(wm+0)*32+wk], 32);\n        wmma::load_matrix_sync(bf, &Bs[wk*64+wn+16], 64);\n        wmma::mma_sync(c01, af, bf, c01);\n        wmma::load_matrix_sync(af, &As[(wm+16)*32+wk], 32);\n        wmma::load_matrix_sync(bf, &Bs[wk*64+wn+0], 64);\n        wmma::mma_sync(c10, af, bf, c10);\n        wmma::load_matrix_sync(af, &As[(wm+16)*32+wk], 32);\n        wmma::load_matrix_sync(bf, &Bs[wk*64+wn+16], 64);\n        wmma::mma_sync(c11, af, bf, c11);\n        }\n        __syncthreads();\n    }\n    int wm = warp_m * 32, wn = warp_n * 32;\n    if (block_m+wm+0+16 <= M && block_n+wn+0+16 <= N)\n        wmma::store_matrix_sync(&C[(block_m+wm+0)*N + block_n+wn+0], c00, N, wmma::mem_row_major);\n    if (block_m+wm+0+16 <= M && block_n+wn+16+16 <= N)\n        wmma::store_matrix_sync(&C[(block_m+wm+0)*N + block_n+wn+16], c01, N, wmma::mem_row_major);\n    if (block_m+wm+16+16 <= M && block_n+wn+0+16 <= N)\n        wmma::store_matrix_sync(&C[(block_m+wm+16)*N + block_n+wn+0], c10, N, wmma::mem_row_major);\n    if (block_m+wm+16+16 <= M && block_n+wn+16+16 <= N)\n        wmma::store_matrix_sync(&C[(block_m+wm+16)*N + block_n+wn+16], c11, N, wmma::mem_row_major);\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.008992,
+      "kernel_min_ms": 0.008448,
+      "kernel_max_ms": 0.016704,
+      "cublas_time_ms": 0.009472,
+      "gflops": 3731.5871886120995,
+      "cublas_gflops": 3542.4864864864862,
+      "efficiency_pct": 105.33807829181494,
+      "dimensions": {
+        "M": 256,
+        "N": 256,
+        "K": 256
+      }
+    },
+    {
+      "kernel_time_ms": 0.017504,
+      "kernel_min_ms": 0.017024,
+      "kernel_max_ms": 0.024608,
+      "cublas_time_ms": 0.027744,
+      "gflops": 15335.663619744058,
+      "cublas_gflops": 9675.441753171857,
+      "efficiency_pct": 158.50091407678244,
+      "dimensions": {
+        "M": 512,
+        "N": 512,
+        "K": 512
+      }
+    },
+    {
+      "kernel_time_ms": 0.04368,
+      "kernel_min_ms": 0.043232,
+      "kernel_max_ms": 0.048,
+      "cublas_time_ms": 0.046016,
+      "gflops": 49164.00293040294,
+      "cublas_gflops": 46668.19471488178,
+      "efficiency_pct": 105.34798534798537,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 0.246304,
+      "kernel_min_ms": 0.24432,
+      "kernel_max_ms": 0.254112,
+      "cublas_time_ms": 0.245728,
+      "gflops": 69750.67065090295,
+      "cublas_gflops": 69914.17007422842,
+      "efficiency_pct": 99.76614265298169,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 1.682048,
+      "kernel_min_ms": 1.67792,
+      "kernel_max_ms": 1.696768,
+      "cublas_time_ms": 1.922688,
+      "gflops": 81709.29335666996,
+      "cublas_gflops": 71482.71246920977,
+      "efficiency_pct": 114.30636937828172,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    },
+    {
+      "kernel_time_ms": 16.816671,
+      "kernel_min_ms": 15.239872,
+      "kernel_max_ms": 19.263071,
+      "cublas_time_ms": 16.306208,
+      "gflops": 65382.24050265359,
+      "cublas_gflops": 67429.02014839991,
+      "efficiency_pct": 96.96454191201103,
+      "dimensions": {
+        "M": 8192,
+        "N": 8192,
+        "K": 8192
+      }
+    },
+    {
+      "kernel_time_ms": 155.971619,
+      "kernel_min_ms": 153.095581,
+      "kernel_max_ms": 160.588409,
+      "cublas_time_ms": 130.334778,
+      "gflops": 56395.47168006251,
+      "cublas_gflops": 67488.45670499397,
+      "efficiency_pct": 83.56313721408509,
+      "dimensions": {
+        "M": 16384,
+        "N": 16384,
+        "K": 16384
+      }
+    }
+  ],
+  "error": null
+}

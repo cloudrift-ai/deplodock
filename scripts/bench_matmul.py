@@ -115,10 +115,12 @@ def main():
         # Adaptive: FP32 for small sizes, BF16 WMMA for large sizes.
         # BF16 WMMA beats cuBLAS at 512+ but has BF16 accuracy (~0.024% relerr).
         # FP32 hybrid is exact but slower on sm_120.
-        wmma = MatmulConfig(strategy="wmma_bf16")
+        wmma16 = MatmulConfig(strategy="wmma_bf16", block_k=16)
+        wmma32 = MatmulConfig(strategy="wmma_bf16", block_k=32)
         strategy_map = [
             (256, _h(tm=6, bk=256, bn=16)),  # FP32 for 256 (WMMA overhead too high)
-            (99999, wmma),  # BF16 WMMA for 512+
+            (4096, wmma16),  # BF16 WMMA BK=16 for 512-4096
+            (99999, wmma32),  # BF16 WMMA BK=32 for 8K+ (fewer tile iterations)
         ]
         suite = run_adaptive_benchmark_suite(
             graph,

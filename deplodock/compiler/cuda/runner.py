@@ -373,11 +373,15 @@ def generate_benchmark_program(
     cudaMemcpy(h_ours, d_C, {m * n} * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ref, d_C_ref, {m * n} * sizeof(float), cudaMemcpyDeviceToHost);
     float max_err = 0.0f;
+    float max_rel_err = 0.0f;
     for (int i = 0; i < {m * n}; i++) {{
         float err = fabsf(h_ours[i] - h_ref[i]);
         if (err > max_err) max_err = err;
+        float rel = err / fmaxf(fabsf(h_ref[i]), 1e-6f);
+        if (rel > max_rel_err) max_rel_err = rel;
     }}
     printf("MAX_ERROR=%.6f\\n", max_err);
+    printf("MAX_REL_ERROR=%.6f\\n", max_rel_err);
     printf("CORRECT=%d\\n", max_err < 1e-2 ? 1 : 0);
     free(h_ours);
     free(h_ref);
