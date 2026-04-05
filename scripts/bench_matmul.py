@@ -75,6 +75,12 @@ def main():
     parser.add_argument("--extended", action="store_true", help="Include non-standard sizes")
     parser.add_argument("--description", type=str, default="", help="Description for trace")
     parser.add_argument("--save", action="store_true", help="Save trace to results dir")
+    parser.add_argument(
+        "--cublas-math",
+        default="default",
+        choices=["default", "pedantic"],
+        help="cuBLAS math mode: default (tensor cores) or pedantic (pure FP32)",
+    )
     args = parser.parse_args()
 
     graph = make_matmul_graph()
@@ -117,6 +123,7 @@ def main():
             output_dir=output_dir,
             description=args.description or "Adaptive benchmark",
             num_iterations=args.iterations,
+            cublas_math_mode=args.cublas_math,
         )
     else:
         # Determine coarsening from strategy.
@@ -144,6 +151,7 @@ def main():
             output_dir=output_dir,
             description=args.description or f"{args.strategy} BK={args.bk}",
             num_iterations=args.iterations,
+            cublas_math_mode=args.cublas_math,
         )
 
     print()

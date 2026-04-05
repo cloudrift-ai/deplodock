@@ -289,6 +289,7 @@ def generate_benchmark_program(
     compare_cublas: bool = True,
     coarsen_cols: int = 1,
     coarsen_rows: int = 1,
+    cublas_math_mode: str = "default",
 ) -> str:
     """Generate a .cu benchmark program with random data and cuBLAS comparison.
 
@@ -323,6 +324,7 @@ def generate_benchmark_program(
     // cuBLAS comparison
     cublasHandle_t handle;
     cublasCreate(&handle);
+    {"cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);" if cublas_math_mode == "pedantic" else "// default math mode"}
     float *d_C_ref;
     cudaMalloc(&d_C_ref, {m * n} * sizeof(float));
     float alpha = 1.0f, beta = 0.0f;
@@ -462,6 +464,7 @@ def run_benchmark(
     compare_cublas: bool = True,
     coarsen_cols: int = 1,
     coarsen_rows: int = 1,
+    cublas_math_mode: str = "default",
 ) -> BenchmarkResult:
     """Run a benchmark: compile and execute, return timing results."""
     program = generate_benchmark_program(
@@ -472,6 +475,7 @@ def run_benchmark(
         compare_cublas,
         coarsen_cols=coarsen_cols,
         coarsen_rows=coarsen_rows,
+        cublas_math_mode=cublas_math_mode,
     )
 
     arch = _detect_arch()

@@ -91,6 +91,7 @@ def run_benchmark_suite(
     output_dir: Path | None = None,
     description: str = "",
     num_iterations: int = 10,
+    cublas_math_mode: str = "default",
 ) -> BenchmarkSuite:
     """Benchmark a matmul config across multiple matrix sizes.
 
@@ -135,6 +136,7 @@ def run_benchmark_suite(
                     num_iterations=num_iterations,
                     coarsen_cols=coarsen_cols,
                     coarsen_rows=coarsen_rows,
+                    cublas_math_mode=cublas_math_mode,
                 )
                 suite.results.append(result)
                 logger.info(
@@ -173,6 +175,7 @@ def run_adaptive_benchmark_suite(
     output_dir: Path | None = None,
     description: str = "",
     num_iterations: int = 10,
+    cublas_math_mode: str = "default",
 ) -> BenchmarkSuite:
     """Benchmark with size-adaptive strategy selection.
 
@@ -225,6 +228,7 @@ def run_adaptive_benchmark_suite(
                     num_iterations=num_iterations,
                     coarsen_cols=cfg.coarsen_cols,
                     coarsen_rows=cfg.coarsen_rows,
+                    cublas_math_mode=cublas_math_mode,
                 )
                 suite.results.append(result)
                 logger.info(
