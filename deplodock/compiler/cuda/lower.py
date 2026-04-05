@@ -39,6 +39,8 @@ class MatmulConfig:
     unroll_k: bool = False
     double_buffer: bool = False
     smem_pad: int = 1
+    coarsen_rows: int = 1
+    coarsen_cols: int = 1
 
 
 def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
@@ -75,6 +77,12 @@ def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
             return _lower_matmul_coarsened_2r4c(graph, out_node, config)
         case "hybrid_smem_f4":
             return _lower_matmul_hybrid_smem_f4(graph, out_node, config)
+        case "flat_scalar":
+            return _lower_matmul_flat_scalar(graph, out_node, config)
+        case "flat_f4":
+            return _lower_matmul_flat_f4(graph, out_node, config)
+        case "hybrid_1r_f4":
+            return _lower_matmul_hybrid_1r_f4(graph, out_node, config)
         case _:
             raise ValueError(f"Unknown strategy: {config.strategy}")
 
@@ -520,25 +528,46 @@ def _lower_matmul_coarsened_f4(graph, out_node, config):
         AugAssign("acc3", "+=", BinOp("*", Var("a_val"), FieldAccess(Var("b4"), "w"))),
     ]
 
-    # Bounds-checked k-loop.
-    k_loop = IfStmt(
-        cond=BinOp("&&", BinOp("<", Var("row"), Var("M")), BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N"))),
-        body=[ForLoop("k", Literal(0, "int"), Var("K"), k_body)],
-    )
-    body.append(k_loop)
+    # Scalar fallback k-loop for edge columns.
+    k_body_scalar: list = [VarDecl("float", "a_val", a_load)]
+    b_row_s = BinOp("*", Var("k"), Var("N"))
+    for i in range(4):
+        col_i = BinOp("+", Var("col_base"), Literal(i, "int"))
+        k_body_scalar.append(
+            IfStmt(
+                cond=BinOp("<", col_i, Var("N")),
+                body=[AugAssign(f"acc{i}", "+=", BinOp("*", Var("a_val"), ArrayAccess(b_name, BinOp("+", b_row_s, col_i))))],
+            )
+        )
 
-    # Write results.
-    write_body: list = []
-    for i, acc in enumerate(["acc0", "acc1", "acc2", "acc3"]):
-        c_idx = BinOp("+", BinOp("*", Var("row"), Var("N")), BinOp("+", Var("col_base"), Literal(i, "int")))
-        write_body.append(Assign(ArrayAccess(c_name, c_idx), Var(acc)))
-
+    # Bounds-checked k-loop with float4 fast path and scalar fallback.
+    row_ok = BinOp("<", Var("row"), Var("M"))
+    n_aligned = BinOp("==", BinOp("%", Var("N"), Literal(4, "int")), Literal(0, "int"))
+    col_f4_ok = BinOp("&&", BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")), n_aligned)
+    col_any_ok = BinOp("<", Var("col_base"), Var("N"))
     body.append(
         IfStmt(
-            cond=BinOp("&&", BinOp("<", Var("row"), Var("M")), BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N"))),
-            body=write_body,
+            cond=BinOp("&&", row_ok, col_f4_ok),
+            body=[ForLoop("k", Literal(0, "int"), Var("K"), k_body)],
+            else_body=[
+                IfStmt(
+                    cond=BinOp("&&", row_ok, col_any_ok),
+                    body=[ForLoop("k", Literal(0, "int"), Var("K"), k_body_scalar)],
+                ),
+            ],
         )
     )
+
+    # Write results with per-element bounds.
+    for i, acc in enumerate(["acc0", "acc1", "acc2", "acc3"]):
+        col_i = BinOp("+", Var("col_base"), Literal(i, "int"))
+        c_idx = BinOp("+", BinOp("*", Var("row"), Var("N")), col_i)
+        body.append(
+            IfStmt(
+                cond=BinOp("&&", BinOp("<", Var("row"), Var("M")), BinOp("<", col_i, Var("N"))),
+                body=[Assign(ArrayAccess(c_name, c_idx), Var(acc))],
+            )
+        )
 
     return KernelDef(
         name="fused_matmul",
@@ -551,7 +580,7 @@ def _lower_matmul_coarsened_f4(graph, out_node, config):
             KernelParam("int", "K"),
         ],
         body=body,
-        block_size=(32, 8, 1),
+        block_size=(config.block_n, config.block_m, 1),
     )
 
 
@@ -620,23 +649,61 @@ def _lower_matmul_coarsened_2r4c(graph, out_node, config):
     for c, field in enumerate(["x", "y", "z", "w"]):
         k_body.append(AugAssign(f"acc1{c}", "+=", BinOp("*", Var("a1"), FieldAccess(Var("b4"), field))))
 
-    # Bounds-checked k-loop.
-    bounds_cond = BinOp(
+    # Scalar fallback k-loop for edge columns/rows.
+    k_body_scalar: list = []
+    # Load A values with bounds checks.
+    a0_load = ArrayAccess(a_name, BinOp("+", BinOp("*", Var("row_base"), Var("K")), Var("k")))
+    a1_load = ArrayAccess(a_name, BinOp("+", BinOp("*", BinOp("+", Var("row_base"), Literal(1, "int")), Var("K")), Var("k")))
+    k_body_scalar.append(VarDecl("float", "a0", a0_load))
+    k_body_scalar.append(VarDecl("float", "a1", a1_load))
+    b_row_s = BinOp("*", Var("k"), Var("N"))
+    for c in range(4):
+        col_c = BinOp("+", Var("col_base"), Literal(c, "int"))
+        b_scalar = ArrayAccess(b_name, BinOp("+", b_row_s, col_c))
+        scalar_fma: list = [VarDecl("float", f"bv{c}", b_scalar)]
+        for r in range(2):
+            row_r = BinOp("+", Var("row_base"), Literal(r, "int"))
+            scalar_fma.append(
+                IfStmt(
+                    cond=BinOp("<", row_r, Var("M")),
+                    body=[AugAssign(f"acc{r}{c}", "+=", BinOp("*", Var(f"a{r}"), Var(f"bv{c}")))],
+                )
+            )
+        k_body_scalar.append(IfStmt(cond=BinOp("<", col_c, Var("N")), body=scalar_fma))
+
+    # Bounds-checked k-loop: float4 fast path + scalar fallback.
+    f4_cond = BinOp(
         "&&",
         BinOp("<", BinOp("+", Var("row_base"), Literal(1, "int")), Var("M")),
         BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")),
     )
-    body.append(IfStmt(cond=bounds_cond, body=[ForLoop("k", Literal(0, "int"), Var("K"), k_body)]))
+    any_cond = BinOp(
+        "&&",
+        BinOp("<", Var("row_base"), Var("M")),
+        BinOp("<", Var("col_base"), Var("N")),
+    )
+    body.append(
+        IfStmt(
+            cond=f4_cond,
+            body=[ForLoop("k", Literal(0, "int"), Var("K"), k_body)],
+            else_body=[
+                IfStmt(cond=any_cond, body=[ForLoop("k", Literal(0, "int"), Var("K"), k_body_scalar)]),
+            ],
+        )
+    )
 
-    # Write results.
-    write_body: list = []
+    # Write results with per-element bounds.
     for r in range(2):
         for c in range(4):
-            c_idx = BinOp(
-                "+", BinOp("*", BinOp("+", Var("row_base"), Literal(r, "int")), Var("N")), BinOp("+", Var("col_base"), Literal(c, "int"))
+            row_r = BinOp("+", Var("row_base"), Literal(r, "int"))
+            col_c = BinOp("+", Var("col_base"), Literal(c, "int"))
+            c_idx = BinOp("+", BinOp("*", row_r, Var("N")), col_c)
+            body.append(
+                IfStmt(
+                    cond=BinOp("&&", BinOp("<", row_r, Var("M")), BinOp("<", col_c, Var("N"))),
+                    body=[Assign(ArrayAccess(c_name, c_idx), Var(f"acc{r}{c}"))],
+                )
             )
-            write_body.append(Assign(ArrayAccess(c_name, c_idx), Var(f"acc{r}{c}")))
-    body.append(IfStmt(cond=bounds_cond, body=write_body))
 
     return KernelDef(
         name="fused_matmul",
@@ -748,27 +815,54 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
 
     tile_body.append(SyncThreads())
 
-    # Inner k-loop.
-    k_body: list = []
-    k_body.append(VarDecl("float", "a0", ArrayAccess("As", BinOp("+", BinOp("*", Var("sr0"), Literal(smem_stride, "int")), Var("kk")))))
-    k_body.append(VarDecl("float", "a1", ArrayAccess("As", BinOp("+", BinOp("*", Var("sr1"), Literal(smem_stride, "int")), Var("kk")))))
-    k_body.append(
+    # Inner k-loop: float4 fast path + scalar fallback for edge columns.
+    a0_read = VarDecl("float", "a0", ArrayAccess("As", BinOp("+", BinOp("*", Var("sr0"), Literal(smem_stride, "int")), Var("kk"))))
+    a1_read = VarDecl("float", "a1", ArrayAccess("As", BinOp("+", BinOp("*", Var("sr1"), Literal(smem_stride, "int")), Var("kk"))))
+
+    # Float4 path (col_base + 3 < N).
+    k_body_f4: list = [a0_read, a1_read]
+    k_body_f4.append(
         VarDecl(
             "float4", "b4", VectorLoad(b_name, BinOp("+", BinOp("*", BinOp("+", Var("tile_k"), Var("kk")), Var("N")), Var("col_base")), 4)
         )
     )
     for c, field in enumerate(["x", "y", "z", "w"]):
-        k_body.append(AugAssign(f"acc0{c}", "+=", BinOp("*", Var("a0"), FieldAccess(Var("b4"), field))))
+        k_body_f4.append(AugAssign(f"acc0{c}", "+=", BinOp("*", Var("a0"), FieldAccess(Var("b4"), field))))
     for c, field in enumerate(["x", "y", "z", "w"]):
-        k_body.append(AugAssign(f"acc1{c}", "+=", BinOp("*", Var("a1"), FieldAccess(Var("b4"), field))))
+        k_body_f4.append(AugAssign(f"acc1{c}", "+=", BinOp("*", Var("a1"), FieldAccess(Var("b4"), field))))
 
-    col_ok = BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N"))
+    # Scalar path (edge columns where float4 would go out of bounds).
+    k_body_scalar: list = [a0_read, a1_read]
+    b_row_expr = BinOp("*", BinOp("+", Var("tile_k"), Var("kk")), Var("N"))
+    for c in range(cols_per_thread):
+        col_c = BinOp("+", Var("col_base"), Literal(c, "int"))
+        b_scalar = ArrayAccess(b_name, BinOp("+", b_row_expr, col_c))
+        k_body_scalar.append(
+            IfStmt(
+                cond=BinOp("<", col_c, Var("N")),
+                body=[
+                    VarDecl("float", f"bv{c}", b_scalar),
+                    AugAssign(f"acc0{c}", "+=", BinOp("*", Var("a0"), Var(f"bv{c}"))),
+                    AugAssign(f"acc1{c}", "+=", BinOp("*", Var("a1"), Var(f"bv{c}"))),
+                ],
+            )
+        )
+
+    n_aligned = BinOp("==", BinOp("%", Var("N"), Literal(4, "int")), Literal(0, "int"))
+    col_ok = BinOp("&&", BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")), n_aligned)
+    col_any = BinOp("<", Var("col_base"), Var("N"))
     tile_body.append(
         IfStmt(
             cond=col_ok,
             body=[
                 PragmaUnroll(),
-                ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body),
+                ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_f4),
+            ],
+            else_body=[
+                IfStmt(
+                    cond=col_any,
+                    body=[ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_scalar)],
+                ),
             ],
         )
     )
@@ -776,20 +870,323 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
 
     body.append(ForLoop("tile_k", Literal(0, "int"), Var("K"), tile_body, step=Literal(bk, "int")))
 
-    # Write results.
-    bounds_cond = BinOp(
-        "&&",
-        BinOp("<", BinOp("+", Var("row_base"), Literal(1, "int")), Var("M")),
-        BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")),
-    )
-    write_body: list = []
+    # Write results with per-element bounds checking.
     for r in range(rows_per_thread):
         for c in range(cols_per_thread):
-            c_idx = BinOp(
-                "+", BinOp("*", BinOp("+", Var("row_base"), Literal(r, "int")), Var("N")), BinOp("+", Var("col_base"), Literal(c, "int"))
+            row_r = BinOp("+", Var("row_base"), Literal(r, "int"))
+            col_c = BinOp("+", Var("col_base"), Literal(c, "int"))
+            c_idx = BinOp("+", BinOp("*", row_r, Var("N")), col_c)
+            body.append(
+                IfStmt(
+                    cond=BinOp("&&", BinOp("<", row_r, Var("M")), BinOp("<", col_c, Var("N"))),
+                    body=[Assign(ArrayAccess(c_name, c_idx), Var(f"acc{r}{c}"))],
+                )
             )
-            write_body.append(Assign(ArrayAccess(c_name, c_idx), Var(f"acc{r}{c}")))
-    body.append(IfStmt(cond=bounds_cond, body=write_body))
+
+    return KernelDef(
+        name="fused_matmul",
+        params=[
+            KernelParam("float*", a_name),
+            KernelParam("float*", b_name),
+            KernelParam("float*", c_name),
+            KernelParam("int", "M"),
+            KernelParam("int", "N"),
+            KernelParam("int", "K"),
+        ],
+        body=body,
+        block_size=(threads_x, threads_y, 1),
+    )
+
+
+def _lower_matmul_flat_scalar(graph, out_node, config):
+    """Flat 1D scalar kernel for small matrices.
+
+    Maps threads in a 2D grid: row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x.
+    No shared memory, no coarsening. Maximizes block count for SM occupancy.
+    Block: (block_n, 1, 1) where block_n defaults to 128.
+    """
+    input_a = graph.nodes[out_node.inputs[0]]
+    input_b = graph.nodes[out_node.inputs[1]]
+    a_name = input_a.output.name
+    b_name = input_b.output.name
+    c_name = out_node.output.name
+
+    threads_x = config.block_n  # 128 by default
+
+    body: list = []
+
+    # Thread mapping: row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x
+    body.append(VarDecl("int", "row", CudaBuiltin("blockIdx.y")))
+    body.append(
+        VarDecl(
+            "int",
+            "col",
+            BinOp("+", BinOp("*", CudaBuiltin("blockIdx.x"), Literal(threads_x, "int")), CudaBuiltin("threadIdx.x")),
+        )
+    )
+
+    # Accumulator.
+    acc_decl = VarDecl("float", "acc", Literal(0.0))
+
+    # K-loop body: acc += A[row*K+k] * B[k*N+col]
+    a_index = BinOp("+", BinOp("*", Var("row"), Var("K")), Var("k"))
+    b_index = BinOp("+", BinOp("*", Var("k"), Var("N")), Var("col"))
+    k_loop = ForLoop(
+        var="k",
+        start=Literal(0, dtype="int"),
+        end=Var("K"),
+        body=[
+            AugAssign(
+                "acc",
+                "+=",
+                BinOp("*", ArrayAccess(a_name, a_index), ArrayAccess(b_name, b_index)),
+            )
+        ],
+    )
+
+    # Write result: C[row*N+col] = acc
+    c_index = BinOp("+", BinOp("*", Var("row"), Var("N")), Var("col"))
+    write_result = Assign(ArrayAccess(c_name, c_index), Var("acc"))
+
+    # Bounds check.
+    bounds = IfStmt(
+        cond=BinOp("&&", BinOp("<", Var("row"), Var("M")), BinOp("<", Var("col"), Var("N"))),
+        body=[acc_decl, k_loop, write_result],
+    )
+    body.append(bounds)
+
+    return KernelDef(
+        name="fused_matmul",
+        params=[
+            KernelParam("float*", a_name),
+            KernelParam("float*", b_name),
+            KernelParam("float*", c_name),
+            KernelParam("int", "M"),
+            KernelParam("int", "N"),
+            KernelParam("int", "K"),
+        ],
+        body=body,
+        block_size=(threads_x, 1, 1),
+    )
+
+
+def _lower_matmul_flat_f4(graph, out_node, config):
+    """Flat 1D kernel with float4 B loads, 4 cols per thread.
+
+    Maps row = blockIdx.y, col_base = (blockIdx.x * blockDim.x + threadIdx.x) * 4.
+    No shared memory. Float4 vectorized B loads. Scalar fallback for edge columns.
+    Block: (block_n, 1, 1) where block_n defaults to 32.
+    """
+    input_a = graph.nodes[out_node.inputs[0]]
+    input_b = graph.nodes[out_node.inputs[1]]
+    a_name = input_a.output.name
+    b_name = input_b.output.name
+    c_name = out_node.output.name
+
+    from deplodock.compiler.cuda.ir import FieldAccess, VectorLoad
+
+    threads_x = config.block_n  # 32 by default
+
+    body: list = []
+
+    # Thread mapping: row = blockIdx.y, col_base = (blockIdx.x * blockDim.x + threadIdx.x) * 4
+    body.append(VarDecl("int", "row", CudaBuiltin("blockIdx.y")))
+    body.append(
+        VarDecl(
+            "int",
+            "col_base",
+            BinOp(
+                "*",
+                BinOp("+", BinOp("*", CudaBuiltin("blockIdx.x"), Literal(threads_x, "int")), CudaBuiltin("threadIdx.x")),
+                Literal(4, "int"),
+            ),
+        )
+    )
+
+    # 4 accumulators.
+    for i in range(4):
+        body.append(VarDecl("float", f"acc{i}", Literal(0.0)))
+
+    # K-loop with float4 B loads.
+    a_load = ArrayAccess(a_name, BinOp("+", BinOp("*", Var("row"), Var("K")), Var("k")))
+    k_body: list = [
+        VarDecl("float", "a_val", a_load),
+        VarDecl("float4", "b4", VectorLoad(b_name, BinOp("+", BinOp("*", Var("k"), Var("N")), Var("col_base")), 4)),
+        AugAssign("acc0", "+=", BinOp("*", Var("a_val"), FieldAccess(Var("b4"), "x"))),
+        AugAssign("acc1", "+=", BinOp("*", Var("a_val"), FieldAccess(Var("b4"), "y"))),
+        AugAssign("acc2", "+=", BinOp("*", Var("a_val"), FieldAccess(Var("b4"), "z"))),
+        AugAssign("acc3", "+=", BinOp("*", Var("a_val"), FieldAccess(Var("b4"), "w"))),
+    ]
+
+    # Scalar fallback for edge columns.
+    k_body_scalar: list = [VarDecl("float", "a_val", a_load)]
+    b_row_s = BinOp("*", Var("k"), Var("N"))
+    for i in range(4):
+        col_i = BinOp("+", Var("col_base"), Literal(i, "int"))
+        k_body_scalar.append(
+            IfStmt(
+                cond=BinOp("<", col_i, Var("N")),
+                body=[AugAssign(f"acc{i}", "+=", BinOp("*", Var("a_val"), ArrayAccess(b_name, BinOp("+", b_row_s, col_i))))],
+            )
+        )
+
+    row_ok = BinOp("<", Var("row"), Var("M"))
+    n_aligned = BinOp("==", BinOp("%", Var("N"), Literal(4, "int")), Literal(0, "int"))
+    col_f4_ok = BinOp("&&", BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")), n_aligned)
+    col_any_ok = BinOp("<", Var("col_base"), Var("N"))
+    body.append(
+        IfStmt(
+            cond=BinOp("&&", row_ok, col_f4_ok),
+            body=[ForLoop("k", Literal(0, "int"), Var("K"), k_body)],
+            else_body=[
+                IfStmt(
+                    cond=BinOp("&&", row_ok, col_any_ok),
+                    body=[ForLoop("k", Literal(0, "int"), Var("K"), k_body_scalar)],
+                ),
+            ],
+        )
+    )
+
+    # Write results with per-element bounds.
+    for i in range(4):
+        col_i = BinOp("+", Var("col_base"), Literal(i, "int"))
+        c_idx = BinOp("+", BinOp("*", Var("row"), Var("N")), col_i)
+        body.append(
+            IfStmt(
+                cond=BinOp("&&", BinOp("<", Var("row"), Var("M")), BinOp("<", col_i, Var("N"))),
+                body=[Assign(ArrayAccess(c_name, c_idx), Var(f"acc{i}"))],
+            )
+        )
+
+    return KernelDef(
+        name="fused_matmul",
+        params=[
+            KernelParam("float*", a_name),
+            KernelParam("float*", b_name),
+            KernelParam("float*", c_name),
+            KernelParam("int", "M"),
+            KernelParam("int", "N"),
+            KernelParam("int", "K"),
+        ],
+        body=body,
+        block_size=(threads_x, 1, 1),
+    )
+
+
+def _lower_matmul_hybrid_1r_f4(graph, out_node, config):
+    """Hybrid: shared memory A + float4 B + 1-row (no row coarsening).
+
+    Like hybrid_smem_f4 but each thread computes 1 row x 4 cols.
+    Doubles the grid in y compared to 2-row variant, better for medium sizes.
+    Block: (32, threads_y). BK = config.block_k.
+    """
+    input_a = graph.nodes[out_node.inputs[0]]
+    input_b = graph.nodes[out_node.inputs[1]]
+    a_name = input_a.output.name
+    b_name = input_b.output.name
+    c_name = out_node.output.name
+    bk = config.block_k
+
+    from deplodock.compiler.cuda.ir import FieldAccess, Ternary, VectorLoad
+
+    body: list = []
+    cols_per_thread = 4
+    threads_y = config.block_m
+    threads_x = config.block_n
+    smem_rows = threads_y
+    smem_stride = bk + 1
+
+    body.append(
+        VarDecl("int", "row", BinOp("+", BinOp("*", CudaBuiltin("blockIdx.y"), Literal(threads_y, "int")), CudaBuiltin("threadIdx.y")))
+    )
+    body.append(
+        VarDecl(
+            "int",
+            "col_base",
+            BinOp(
+                "*",
+                BinOp("+", BinOp("*", CudaBuiltin("blockIdx.x"), Literal(threads_x, "int")), CudaBuiltin("threadIdx.x")),
+                Literal(cols_per_thread, "int"),
+            ),
+        )
+    )
+
+    body.append(ArrayDecl("__shared__ float", "As", [smem_rows * smem_stride]))
+    body.append(VarDecl("int", "sr", CudaBuiltin("threadIdx.y")))
+
+    for c in range(cols_per_thread):
+        body.append(VarDecl("float", f"acc{c}", Literal(0.0)))
+
+    tile_body: list = []
+
+    if bk <= threads_x:
+        a_col_expr = BinOp("+", Var("tile_k"), CudaBuiltin("threadIdx.x"))
+        a_global = BinOp("+", BinOp("*", Var("row"), Var("K")), a_col_expr)
+        a_bounds = BinOp("&&", BinOp("<", Var("row"), Var("M")), BinOp("<", a_col_expr, Var("K")))
+        smem_idx = BinOp("+", BinOp("*", Var("sr"), Literal(smem_stride, "int")), CudaBuiltin("threadIdx.x"))
+        a_store = Assign(ArrayAccess("As", smem_idx), Ternary(a_bounds, ArrayAccess(a_name, a_global), Literal(0.0)))
+        if bk < threads_x:
+            tile_body.append(IfStmt(cond=BinOp("<", CudaBuiltin("threadIdx.x"), Literal(bk, "int")), body=[a_store]))
+        else:
+            tile_body.append(a_store)
+    else:
+        a_col_strided = BinOp("+", Var("tile_k"), Var("a_s"))
+        a_global = BinOp("+", BinOp("*", Var("row"), Var("K")), a_col_strided)
+        a_bounds = BinOp("&&", BinOp("<", Var("row"), Var("M")), BinOp("<", a_col_strided, Var("K")))
+        smem_idx = BinOp("+", BinOp("*", Var("sr"), Literal(smem_stride, "int")), Var("a_s"))
+        stride_body = [Assign(ArrayAccess("As", smem_idx), Ternary(a_bounds, ArrayAccess(a_name, a_global), Literal(0.0)))]
+        tile_body.append(ForLoop("a_s", CudaBuiltin("threadIdx.x"), Literal(bk, "int"), stride_body, step=Literal(threads_x, "int")))
+
+    tile_body.append(SyncThreads())
+
+    k_body_f4: list = [
+        VarDecl("float", "a_val", ArrayAccess("As", BinOp("+", BinOp("*", Var("sr"), Literal(smem_stride, "int")), Var("kk")))),
+        VarDecl(
+            "float4",
+            "b4",
+            VectorLoad(b_name, BinOp("+", BinOp("*", BinOp("+", Var("tile_k"), Var("kk")), Var("N")), Var("col_base")), 4),
+        ),
+    ]
+    for c, field in enumerate(["x", "y", "z", "w"]):
+        k_body_f4.append(AugAssign(f"acc{c}", "+=", BinOp("*", Var("a_val"), FieldAccess(Var("b4"), field))))
+
+    k_body_scalar: list = [
+        VarDecl("float", "a_val", ArrayAccess("As", BinOp("+", BinOp("*", Var("sr"), Literal(smem_stride, "int")), Var("kk")))),
+    ]
+    b_row_expr = BinOp("*", BinOp("+", Var("tile_k"), Var("kk")), Var("N"))
+    for c in range(cols_per_thread):
+        col_c = BinOp("+", Var("col_base"), Literal(c, "int"))
+        b_load = ArrayAccess(b_name, BinOp("+", b_row_expr, col_c))
+        k_body_scalar.append(
+            IfStmt(
+                cond=BinOp("<", col_c, Var("N")),
+                body=[AugAssign(f"acc{c}", "+=", BinOp("*", Var("a_val"), b_load))],
+            )
+        )
+
+    n_aligned = BinOp("==", BinOp("%", Var("N"), Literal(4, "int")), Literal(0, "int"))
+    col_ok = BinOp("&&", BinOp("<", BinOp("+", Var("col_base"), Literal(3, "int")), Var("N")), n_aligned)
+    col_any = BinOp("<", Var("col_base"), Var("N"))
+    tile_body.append(
+        IfStmt(
+            cond=col_ok,
+            body=[PragmaUnroll(), ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_f4)],
+            else_body=[IfStmt(cond=col_any, body=[ForLoop("kk", Literal(0, "int"), Literal(bk, "int"), k_body_scalar)])],
+        )
+    )
+    tile_body.append(SyncThreads())
+
+    body.append(ForLoop("tile_k", Literal(0, "int"), Var("K"), tile_body, step=Literal(bk, "int")))
+
+    for c in range(cols_per_thread):
+        col_c = BinOp("+", Var("col_base"), Literal(c, "int"))
+        c_idx = BinOp("+", BinOp("*", Var("row"), Var("N")), col_c)
+        body.append(
+            IfStmt(
+                cond=BinOp("&&", BinOp("<", Var("row"), Var("M")), BinOp("<", col_c, Var("N"))),
+                body=[Assign(ArrayAccess(c_name, c_idx), Var(f"acc{c}"))],
+            )
+        )
 
     return KernelDef(
         name="fused_matmul",

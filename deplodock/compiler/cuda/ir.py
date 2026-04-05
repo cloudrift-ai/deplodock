@@ -140,10 +140,11 @@ class ForLoop:
 
 @dataclass
 class IfStmt:
-    """If statement (no else)."""
+    """If statement with optional else."""
 
     cond: Expr
     body: list[Stmt]
+    else_body: list[Stmt] | None = None
 
 
 @dataclass

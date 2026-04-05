@@ -123,6 +123,9 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
     if isinstance(stmt, IfStmt):
         cond = _emit_expr(stmt.cond)
         body = "\n".join(_emit_stmt(s, indent + 1) for s in stmt.body)
+        if stmt.else_body:
+            else_body = "\n".join(_emit_stmt(s, indent + 1) for s in stmt.else_body)
+            return f"{pad}if ({cond}) {{\n{body}\n{pad}}} else {{\n{else_body}\n{pad}}}"
         return f"{pad}if ({cond}) {{\n{body}\n{pad}}}"
 
     if isinstance(stmt, SyncThreads):

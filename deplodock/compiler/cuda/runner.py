@@ -495,7 +495,7 @@ def run_benchmark(
             [*nvcc_cmd, "-o", str(bin_path), str(src_path)],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
         )
         if compile_result.returncode != 0:
             raise RuntimeError(f"nvcc compilation failed:\n{compile_result.stderr}")
@@ -505,7 +505,7 @@ def run_benchmark(
             [str(bin_path)],
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=600,
         )
         if run_result.returncode != 0:
             raise RuntimeError(f"Benchmark execution failed:\n{run_result.stderr}")

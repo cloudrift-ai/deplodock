@@ -1,0 +1,37 @@
+{
+  "timestamp": "20260405_122803",
+  "strategy": "flat_scalar",
+  "config": {
+    "strategy": "flat_scalar",
+    "block_m": 8,
+    "block_n": 128,
+    "block_k": 32,
+    "thread_m": 1,
+    "thread_n": 1,
+    "vectorize": false,
+    "unroll_k": false,
+    "double_buffer": false,
+    "smem_pad": 1,
+    "coarsen_rows": 1,
+    "coarsen_cols": 1
+  },
+  "description": "flat_scalar block=128 at 256 (30 iter)",
+  "cuda_kernel": "__global__ void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int row = blockIdx.y;\n    int col = blockIdx.x * 128 + threadIdx.x;\n    if (row < M && col < N) {\n        float acc = 0.0f;\n        for (int k = 0; k < K; k++) {\n            acc += A[row * K + k] * B[k * N + col];\n        }\n        C[row * N + col] = acc;\n    }\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.008672,
+      "kernel_min_ms": 0.008288,
+      "kernel_max_ms": 0.013856,
+      "cublas_time_ms": 0.01216,
+      "gflops": 3869.2841328413288,
+      "cublas_gflops": 2759.4105263157894,
+      "efficiency_pct": 140.22140221402216,
+      "dimensions": {
+        "M": 256,
+        "N": 256,
+        "K": 256
+      }
+    }
+  ],
+  "error": null
+}

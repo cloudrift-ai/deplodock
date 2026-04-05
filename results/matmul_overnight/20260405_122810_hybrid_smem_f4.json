@@ -1,0 +1,79 @@
+{
+  "timestamp": "20260405_122810",
+  "strategy": "hybrid_smem_f4",
+  "config": {
+    "strategy": "hybrid_smem_f4",
+    "block_m": 8,
+    "block_n": 32,
+    "block_k": 32,
+    "thread_m": 1,
+    "thread_n": 1,
+    "vectorize": false,
+    "unroll_k": false,
+    "double_buffer": false,
+    "smem_pad": 1,
+    "coarsen_rows": 2,
+    "coarsen_cols": 4
+  },
+  "description": "hybrid_smem_f4 BK=32 large sizes (30 iter)",
+  "cuda_kernel": "__global__ void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int row_base = (blockIdx.y * blockDim.y + threadIdx.y) * 2;\n    int col_base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;\n    __shared__ float As[528];\n    int sr0 = threadIdx.y * 2;\n    int sr1 = sr0 + 1;\n    float acc00 = 0.0f;\n    float acc01 = 0.0f;\n    float acc02 = 0.0f;\n    float acc03 = 0.0f;\n    float acc10 = 0.0f;\n    float acc11 = 0.0f;\n    float acc12 = 0.0f;\n    float acc13 = 0.0f;\n    for (int tile_k = 0; tile_k < K; tile_k += 32) {\n        As[sr0 * 33 + threadIdx.x] = ((row_base + 0 < M && tile_k + threadIdx.x < K) ? (A[(row_base + 0) * K + (tile_k + threadIdx.x)]) : (0.0f));\n        As[sr1 * 33 + threadIdx.x] = ((row_base + 1 < M && tile_k + threadIdx.x < K) ? (A[(row_base + 1) * K + (tile_k + threadIdx.x)]) : (0.0f));\n        __syncthreads();\n        if (col_base + 3 < N && N % 4 == 0) {\n            #pragma unroll\n            for (int kk = 0; kk < 32; kk++) {\n                float a0 = As[sr0 * 33 + kk];\n                float a1 = As[sr1 * 33 + kk];\n                float4 b4 = *reinterpret_cast<float4*>(&B[(tile_k + kk) * N + col_base]);\n                acc00 += a0 * b4.x;\n                acc01 += a0 * b4.y;\n                acc02 += a0 * b4.z;\n                acc03 += a0 * b4.w;\n                acc10 += a1 * b4.x;\n                acc11 += a1 * b4.y;\n                acc12 += a1 * b4.z;\n                acc13 += a1 * b4.w;\n            }\n        } else {\n            if (col_base < N) {\n                for (int kk = 0; kk < 32; kk++) {\n                    float a0 = As[sr0 * 33 + kk];\n                    float a1 = As[sr1 * 33 + kk];\n                    if (col_base + 0 < N) {\n                        float bv0 = B[(tile_k + kk) * N + (col_base + 0)];\n                        acc00 += a0 * bv0;\n                        acc10 += a1 * bv0;\n                    }\n                    if (col_base + 1 < N) {\n                        float bv1 = B[(tile_k + kk) * N + (col_base + 1)];\n                        acc01 += a0 * bv1;\n                        acc11 += a1 * bv1;\n                    }\n                    if (col_base + 2 < N) {\n                        float bv2 = B[(tile_k + kk) * N + (col_base + 2)];\n                        acc02 += a0 * bv2;\n                        acc12 += a1 * bv2;\n                    }\n                    if (col_base + 3 < N) {\n                        float bv3 = B[(tile_k + kk) * N + (col_base + 3)];\n                        acc03 += a0 * bv3;\n                        acc13 += a1 * bv3;\n                    }\n                }\n            }\n        }\n        __syncthreads();\n    }\n    if (row_base + 0 < M && col_base + 0 < N) {\n        C[(row_base + 0) * N + (col_base + 0)] = acc00;\n    }\n    if (row_base + 0 < M && col_base + 1 < N) {\n        C[(row_base + 0) * N + (col_base + 1)] = acc01;\n    }\n    if (row_base + 0 < M && col_base + 2 < N) {\n        C[(row_base + 0) * N + (col_base + 2)] = acc02;\n    }\n    if (row_base + 0 < M && col_base + 3 < N) {\n        C[(row_base + 0) * N + (col_base + 3)] = acc03;\n    }\n    if (row_base + 1 < M && col_base + 0 < N) {\n        C[(row_base + 1) * N + (col_base + 0)] = acc10;\n    }\n    if (row_base + 1 < M && col_base + 1 < N) {\n        C[(row_base + 1) * N + (col_base + 1)] = acc11;\n    }\n    if (row_base + 1 < M && col_base + 2 < N) {\n        C[(row_base + 1) * N + (col_base + 2)] = acc12;\n    }\n    if (row_base + 1 < M && col_base + 3 < N) {\n        C[(row_base + 1) * N + (col_base + 3)] = acc13;\n    }\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.073888,
+      "kernel_min_ms": 0.071872,
+      "kernel_max_ms": 0.081792,
+      "cublas_time_ms": 0.104384,
+      "gflops": 29064.038111736685,
+      "cublas_gflops": 20572.91968117719,
+      "efficiency_pct": 141.27327847553056,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 0.541312,
+      "kernel_min_ms": 0.537184,
+      "kernel_max_ms": 0.55184,
+      "cublas_time_ms": 0.737184,
+      "gflops": 31737.462284227946,
+      "cublas_gflops": 23304.723358076135,
+      "efficiency_pct": 136.18467722865927,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 4.818784,
+      "kernel_min_ms": 3.886304,
+      "kernel_max_ms": 4.864,
+      "cublas_time_ms": 6.330304,
+      "gflops": 28521.501165439247,
+      "cublas_gflops": 21711.272234635177,
+      "efficiency_pct": 131.36724949696855,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    },
+    {
+      "kernel_time_ms": 44.601727,
+      "kernel_min_ms": 43.433502,
+      "kernel_max_ms": 44.666943,
+      "cublas_time_ms": 51.118305,
+      "gflops": 24651.772514907323,
+      "cublas_gflops": 21509.15660791178,
+      "efficiency_pct": 114.61059568388463,
+      "dimensions": {
+        "M": 8192,
+        "N": 8192,
+        "K": 8192
+      }
+    }
+  ],
+  "error": null
+}
