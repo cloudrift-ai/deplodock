@@ -1,0 +1,91 @@
+{
+  "timestamp": "20260405_075534",
+  "strategy": "coarsened_f4",
+  "config": {
+    "strategy": "coarsened_f4",
+    "block_m": 16,
+    "block_n": 16,
+    "block_k": 16,
+    "thread_m": 1,
+    "thread_n": 1,
+    "vectorize": false,
+    "unroll_k": false,
+    "double_buffer": false,
+    "smem_pad": 1
+  },
+  "description": "Iteration 7: coarsened_f4 - float4 vectorized B loads, 4 cols per thread",
+  "cuda_kernel": "__global__ void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int row = blockIdx.y * blockDim.y + threadIdx.y;\n    int col_base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;\n    float acc0 = 0.0f;\n    float acc1 = 0.0f;\n    float acc2 = 0.0f;\n    float acc3 = 0.0f;\n    if (row < M && col_base + 3 < N) {\n        for (int k = 0; k < K; k++) {\n            float a_val = A[row * K + k];\n            float4 b4 = *reinterpret_cast<float4*>(&B[k * N + col_base]);\n            acc0 += a_val * b4.x;\n            acc1 += a_val * b4.y;\n            acc2 += a_val * b4.z;\n            acc3 += a_val * b4.w;\n        }\n    }\n    if (row < M && col_base + 3 < N) {\n        C[row * N + (col_base + 0)] = acc0;\n        C[row * N + (col_base + 1)] = acc1;\n        C[row * N + (col_base + 2)] = acc2;\n        C[row * N + (col_base + 3)] = acc3;\n    }\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.013728,
+      "kernel_min_ms": 0.012736,
+      "kernel_max_ms": 0.02,
+      "cublas_time_ms": 0.012992,
+      "gflops": 2444.2331002331002,
+      "cublas_gflops": 2582.6995073891626,
+      "efficiency_pct": 94.63869463869464,
+      "dimensions": {
+        "M": 256,
+        "N": 256,
+        "K": 256
+      }
+    },
+    {
+      "kernel_time_ms": 0.025088,
+      "kernel_min_ms": 0.02448,
+      "kernel_max_ms": 0.0272,
+      "cublas_time_ms": 0.023424,
+      "gflops": 10699.755102040817,
+      "cublas_gflops": 11459.846994535517,
+      "efficiency_pct": 93.36734693877553,
+      "dimensions": {
+        "M": 512,
+        "N": 512,
+        "K": 512
+      }
+    },
+    {
+      "kernel_time_ms": 0.137312,
+      "kernel_min_ms": 0.131168,
+      "kernel_max_ms": 0.144928,
+      "cublas_time_ms": 0.104384,
+      "gflops": 15639.446282917734,
+      "cublas_gflops": 20572.91968117719,
+      "efficiency_pct": 76.01957585644372,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 0.879136,
+      "kernel_min_ms": 0.875968,
+      "kernel_max_ms": 0.88864,
+      "cublas_time_ms": 0.7344,
+      "gflops": 19541.765078440647,
+      "cublas_gflops": 23393.068061002177,
+      "efficiency_pct": 83.53656317111344,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 7.383296,
+      "kernel_min_ms": 6.853824,
+      "kernel_max_ms": 9.541312,
+      "cublas_time_ms": 6.6424,
+      "gflops": 18614.850802676745,
+      "cublas_gflops": 20691.158838973864,
+      "efficiency_pct": 89.96524045629486,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    }
+  ],
+  "error": null
+}

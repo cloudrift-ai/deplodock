@@ -1,0 +1,91 @@
+{
+  "timestamp": "20260405_074138",
+  "strategy": "smem_tiled",
+  "config": {
+    "strategy": "smem_tiled",
+    "block_m": 32,
+    "block_n": 32,
+    "block_k": 16,
+    "thread_m": 1,
+    "thread_n": 1,
+    "vectorize": false,
+    "unroll_k": false,
+    "double_buffer": false,
+    "smem_pad": 1
+  },
+  "description": "Iteration 3: smem_tiled 32x32x16 cooperative loading",
+  "cuda_kernel": "__global__ void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int row = blockIdx.y * 32 + threadIdx.y;\n    int col = blockIdx.x * 32 + threadIdx.x;\n    int tid = threadIdx.y * 32 + threadIdx.x;\n    int block_row = blockIdx.y * 32;\n    int block_col = blockIdx.x * 32;\n    __shared__ float As[544];\n    __shared__ float Bs[528];\n    float acc = 0.0f;\n    for (int tile_k = 0; tile_k < K; tile_k += 16) {\n        for (int i = tid; i < 512; i += 1024) {\n            int a_r = i / 16;\n            int a_c = i % 16;\n            As[a_r * 17 + a_c] = ((block_row + a_r < M && tile_k + a_c < K) ? (A[(block_row + a_r) * K + (tile_k + a_c)]) : (0.0f));\n        }\n        for (int j = tid; j < 512; j += 1024) {\n            int b_r = j / 32;\n            int b_c = j % 32;\n            Bs[b_r * 33 + b_c] = ((tile_k + b_r < K && block_col + b_c < N) ? (B[(tile_k + b_r) * N + (block_col + b_c)]) : (0.0f));\n        }\n        __syncthreads();\n        for (int kk = 0; kk < 16; kk++) {\n            acc += As[threadIdx.y * 17 + kk] * Bs[kk * 33 + threadIdx.x];\n        }\n        __syncthreads();\n    }\n    if (row < M && col < N) {\n        C[row * N + col] = acc;\n    }\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.020992,
+      "kernel_min_ms": 0.02064,
+      "kernel_max_ms": 0.025056,
+      "cublas_time_ms": 0.013056,
+      "gflops": 1598.439024390244,
+      "cublas_gflops": 2570.0392156862745,
+      "efficiency_pct": 62.19512195121951,
+      "dimensions": {
+        "M": 256,
+        "N": 256,
+        "K": 256
+      }
+    },
+    {
+      "kernel_time_ms": 0.078336,
+      "kernel_min_ms": 0.077888,
+      "kernel_max_ms": 0.078624,
+      "cublas_time_ms": 0.02336,
+      "gflops": 3426.7189542483657,
+      "cublas_gflops": 11491.243835616437,
+      "efficiency_pct": 29.820261437908496,
+      "dimensions": {
+        "M": 512,
+        "N": 512,
+        "K": 512
+      }
+    },
+    {
+      "kernel_time_ms": 0.516608,
+      "kernel_min_ms": 0.51648,
+      "kernel_max_ms": 0.522368,
+      "cublas_time_ms": 0.104416,
+      "gflops": 4156.891972249752,
+      "cublas_gflops": 20566.6147716825,
+      "efficiency_pct": 20.211843409316156,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 3.691616,
+      "kernel_min_ms": 3.676192,
+      "kernel_max_ms": 4.809536,
+      "cublas_time_ms": 0.727808,
+      "gflops": 4653.753040402902,
+      "cublas_gflops": 23604.9468870911,
+      "efficiency_pct": 19.715159973301667,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 32.856544,
+      "kernel_min_ms": 30.523872,
+      "kernel_max_ms": 35.291359,
+      "cublas_time_ms": 5.87248,
+      "gflops": 4183.000910625293,
+      "cublas_gflops": 23403.903201373185,
+      "efficiency_pct": 17.873090973901576,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    }
+  ],
+  "error": null
+}

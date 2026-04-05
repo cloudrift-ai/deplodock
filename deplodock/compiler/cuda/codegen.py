@@ -4,19 +4,26 @@ from __future__ import annotations
 
 from deplodock.compiler.cuda.ir import (
     ArrayAccess,
+    ArrayDecl,
     Assign,
     AugAssign,
     BinOp,
+    Cast,
     CudaBuiltin,
     Expr,
+    FieldAccess,
     ForLoop,
+    FuncCall,
     IfStmt,
     KernelDef,
     Literal,
+    PragmaUnroll,
     Stmt,
     SyncThreads,
+    Ternary,
     Var,
     VarDecl,
+    VectorLoad,
 )
 
 # Operator precedence for minimal parenthesization.
@@ -65,6 +72,23 @@ def _emit_expr(expr: Expr, parent_prec: int = 0) -> str:
         return f"{expr.array}[{idx}]"
     if isinstance(expr, CudaBuiltin):
         return expr.name
+    if isinstance(expr, FuncCall):
+        args = ", ".join(_emit_expr(a) for a in expr.args)
+        return f"{expr.name}({args})"
+    if isinstance(expr, Cast):
+        inner = _emit_expr(expr.expr)
+        return f"(({expr.dtype})({inner}))"
+    if isinstance(expr, FieldAccess):
+        inner = _emit_expr(expr.expr)
+        return f"{inner}.{expr.field}"
+    if isinstance(expr, Ternary):
+        cond = _emit_expr(expr.cond)
+        t = _emit_expr(expr.if_true)
+        f = _emit_expr(expr.if_false)
+        return f"(({cond}) ? ({t}) : ({f}))"
+    if isinstance(expr, VectorLoad):
+        idx = _emit_expr(expr.index)
+        return f"*reinterpret_cast<float{expr.width}*>(&{expr.array}[{idx}])"
     raise TypeError(f"Unknown expression type: {type(expr)}")
 
 
@@ -91,6 +115,9 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
         start = _emit_expr(stmt.start)
         end = _emit_expr(stmt.end)
         body = "\n".join(_emit_stmt(s, indent + 1) for s in stmt.body)
+        if stmt.step is not None:
+            step = _emit_expr(stmt.step)
+            return f"{pad}for (int {stmt.var} = {start}; {stmt.var} < {end}; {stmt.var} += {step}) {{\n{body}\n{pad}}}"
         return f"{pad}for (int {stmt.var} = {start}; {stmt.var} < {end}; {stmt.var}++) {{\n{body}\n{pad}}}"
 
     if isinstance(stmt, IfStmt):
@@ -100,5 +127,17 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
 
     if isinstance(stmt, SyncThreads):
         return f"{pad}__syncthreads();"
+
+    if isinstance(stmt, ArrayDecl):
+        dims = "".join(f"[{d}]" for d in stmt.dimensions)
+        if stmt.init is not None:
+            init = _emit_expr(stmt.init)
+            return f"{pad}{stmt.dtype} {stmt.name}{dims} = {init};"
+        return f"{pad}{stmt.dtype} {stmt.name}{dims};"
+
+    if isinstance(stmt, PragmaUnroll):
+        if stmt.factor is not None:
+            return f"{pad}#pragma unroll {stmt.factor}"
+        return f"{pad}#pragma unroll"
 
     raise TypeError(f"Unknown statement type: {type(stmt)}")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from deplodock.compiler.cuda.codegen import emit_kernel
-from deplodock.compiler.cuda.lower import lower_graph
+from deplodock.compiler.cuda.lower import MatmulConfig, lower_graph
 from deplodock.compiler.cuda.runner import run_kernel
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.rewriter import Rewriter
@@ -23,6 +23,7 @@ def compile_and_run(
     dim_args: dict[str, int],
     expected: list[float] | None = None,
     tolerance: float = 1e-4,
+    matmul_config: MatmulConfig | None = None,
 ) -> CompilerTrace:
     """Run the full pipeline: rewrite → lower → codegen → execute → trace.
 
@@ -51,7 +52,7 @@ def compile_and_run(
 
     # --- Lower to CUDA IR ---
     try:
-        kernel = lower_graph(graph)
+        kernel = lower_graph(graph, config=matmul_config)
     except Exception as e:
         trace.error = f"Lowering failed: {e}"
         return trace

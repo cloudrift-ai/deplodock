@@ -1,0 +1,91 @@
+{
+  "timestamp": "20260405_074335",
+  "strategy": "register_blocked",
+  "config": {
+    "strategy": "register_blocked",
+    "block_m": 64,
+    "block_n": 64,
+    "block_k": 16,
+    "thread_m": 4,
+    "thread_n": 4,
+    "vectorize": false,
+    "unroll_k": false,
+    "double_buffer": false,
+    "smem_pad": 1
+  },
+  "description": "Iteration 4: register_blocked 64x64x16 TM=4 TN=4",
+  "cuda_kernel": "__global__ void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int tid = threadIdx.y * 16 + threadIdx.x;\n    int block_row = blockIdx.y * 64;\n    int block_col = blockIdx.x * 64;\n    int thread_row = threadIdx.y * 4;\n    int thread_col = threadIdx.x * 4;\n    __shared__ float As[1088];\n    __shared__ float Bs[1040];\n    float acc[16];\n    for (int i = 0; i < 16; i++) {\n        acc[i] = 0.0f;\n    }\n    float regA[4];\n    float regB[4];\n    for (int tile_k = 0; tile_k < K; tile_k += 16) {\n        for (int li = tid; li < 1024; li += 256) {\n            int a_r = li / 16;\n            int a_c = li % 16;\n            As[a_r * 17 + a_c] = ((block_row + a_r < M && tile_k + a_c < K) ? (A[(block_row + a_r) * K + (tile_k + a_c)]) : (0.0f));\n        }\n        for (int lj = tid; lj < 1024; lj += 256) {\n            int b_r = lj / 64;\n            int b_c = lj % 64;\n            Bs[b_r * 65 + b_c] = ((tile_k + b_r < K && block_col + b_c < N) ? (B[(tile_k + b_r) * N + (block_col + b_c)]) : (0.0f));\n        }\n        __syncthreads();\n        for (int kk = 0; kk < 16; kk++) {\n            for (int m = 0; m < 4; m++) {\n                regA[m] = As[(thread_row + m) * 17 + kk];\n            }\n            for (int n = 0; n < 4; n++) {\n                regB[n] = Bs[kk * 65 + (thread_col + n)];\n            }\n            for (int m = 0; m < 4; m++) {\n                for (int n = 0; n < 4; n++) {\n                    acc[m * 4 + n] = acc[m * 4 + n] + regA[m] * regB[n];\n                }\n            }\n        }\n        __syncthreads();\n    }\n    for (int wm = 0; wm < 4; wm++) {\n        for (int wn = 0; wn < 4; wn++) {\n            if (block_row + thread_row + wm < M && block_col + thread_col + wn < N) {\n                C[(block_row + thread_row + wm) * N + (block_col + thread_col + wn)] = acc[wm * 4 + wn];\n            }\n        }\n    }\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.023264,
+      "kernel_min_ms": 0.022464,
+      "kernel_max_ms": 0.02928,
+      "cublas_time_ms": 0.012832,
+      "gflops": 1442.3328748280605,
+      "cublas_gflops": 2614.9027431421446,
+      "efficiency_pct": 55.15818431911968,
+      "dimensions": {
+        "M": 256,
+        "N": 256,
+        "K": 256
+      }
+    },
+    {
+      "kernel_time_ms": 0.113952,
+      "kernel_min_ms": 0.113088,
+      "kernel_max_ms": 0.122624,
+      "cublas_time_ms": 0.023456,
+      "gflops": 2355.688851446223,
+      "cublas_gflops": 11444.212824010914,
+      "efficiency_pct": 20.58410558831789,
+      "dimensions": {
+        "M": 512,
+        "N": 512,
+        "K": 512
+      }
+    },
+    {
+      "kernel_time_ms": 0.7808,
+      "kernel_min_ms": 0.77856,
+      "kernel_max_ms": 0.787424,
+      "cublas_time_ms": 0.104384,
+      "gflops": 2750.3632786885246,
+      "cublas_gflops": 20572.91968117719,
+      "efficiency_pct": 13.368852459016395,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 6.15056,
+      "kernel_min_ms": 5.945696,
+      "kernel_max_ms": 6.466496,
+      "cublas_time_ms": 0.769824,
+      "gflops": 2793.220322051976,
+      "cublas_gflops": 22316.61936234776,
+      "efficiency_pct": 12.516323716864806,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 51.3592,
+      "kernel_min_ms": 49.715038,
+      "kernel_max_ms": 52.008766,
+      "cublas_time_ms": 6.060896,
+      "gflops": 2676.0337675041665,
+      "cublas_gflops": 22676.34248665544,
+      "efficiency_pct": 11.800993784949918,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    }
+  ],
+  "error": null
+}
