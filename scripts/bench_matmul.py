@@ -93,12 +93,23 @@ def main():
 
     if args.strategy == "adaptive":
         # Best config per size from empirical tuning on RTX 5090.
-        _12r = dict(strategy="hybrid_smem_f4", block_m=4, block_n=32, thread_m=12, coarsen_rows=12, coarsen_cols=4)
+        def _h(tm, bk):
+            return MatmulConfig(
+                strategy="hybrid_smem_f4",
+                block_m=4,
+                block_n=32,
+                thread_m=tm,
+                block_k=bk,
+                coarsen_rows=tm,
+                coarsen_cols=4,
+            )
+
         strategy_map = [
             (256, MatmulConfig(strategy="flat_scalar", block_n=128, coarsen_rows=1, coarsen_cols=1)),
             (512, MatmulConfig(strategy="hybrid_smem_f4", block_k=256, coarsen_rows=2, coarsen_cols=4)),
-            (4096, MatmulConfig(**_12r, block_k=128)),
-            (99999, MatmulConfig(**_12r, block_k=64)),
+            (1024, _h(tm=8, bk=128)),
+            (4096, _h(tm=12, bk=128)),
+            (99999, _h(tm=12, bk=64)),
         ]
         suite = run_adaptive_benchmark_suite(
             graph,
