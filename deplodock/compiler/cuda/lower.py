@@ -719,18 +719,29 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     tile_body: list = []
 
     # Load A into shared memory.
+    # Guard with threadIdx.x < BK when BK < threads_x (32) to avoid out-of-bounds smem writes.
     a_col_expr = BinOp("+", Var("tile_k"), CudaBuiltin("threadIdx.x"))
+    a_load_stmts: list = []
     for sr_name, row_off in [("sr0", 0), ("sr1", 1)]:
         g_row = BinOp("+", Var("row_base"), Literal(row_off, "int"))
         a_global = BinOp("+", BinOp("*", g_row, Var("K")), a_col_expr)
         a_bounds = BinOp("&&", BinOp("<", g_row, Var("M")), BinOp("<", a_col_expr, Var("K")))
         smem_idx = BinOp("+", BinOp("*", Var(sr_name), Literal(smem_stride, "int")), CudaBuiltin("threadIdx.x"))
-        tile_body.append(
+        a_load_stmts.append(
             Assign(
                 ArrayAccess("As", smem_idx),
                 Ternary(a_bounds, ArrayAccess(a_name, a_global), Literal(0.0)),
             )
         )
+    if bk < threads_x:
+        tile_body.append(
+            IfStmt(
+                cond=BinOp("<", CudaBuiltin("threadIdx.x"), Literal(bk, "int")),
+                body=a_load_stmts,
+            )
+        )
+    else:
+        tile_body.extend(a_load_stmts)
 
     tile_body.append(SyncThreads())
 
