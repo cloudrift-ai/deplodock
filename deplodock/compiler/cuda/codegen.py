@@ -146,4 +146,11 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
             return f"{pad}#pragma unroll {stmt.factor}"
         return f"{pad}#pragma unroll"
 
+    from deplodock.compiler.cuda.ir import RawCode
+
+    if isinstance(stmt, RawCode):
+        # Indent each line of the raw code.
+        lines = stmt.code.splitlines()
+        return "\n".join(pad + line for line in lines)
+
     raise TypeError(f"Unknown statement type: {type(stmt)}")

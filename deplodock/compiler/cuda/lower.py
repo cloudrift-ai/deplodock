@@ -83,6 +83,8 @@ def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
             return _lower_matmul_flat_f4(graph, out_node, config)
         case "hybrid_1r_f4":
             return _lower_matmul_hybrid_1r_f4(graph, out_node, config)
+        case "smem_ab_blocked":
+            return _lower_matmul_smem_ab_blocked(graph, out_node, config)
         case _:
             raise ValueError(f"Unknown strategy: {config.strategy}")
 
@@ -1197,5 +1199,95 @@ def _lower_matmul_hybrid_1r_f4(graph, out_node, config):
             KernelParam("int", "K"),
         ],
         body=body,
+        block_size=(threads_x, threads_y, 1),
+    )
+
+
+def _lower_matmul_smem_ab_blocked(graph, out_node, config):
+    """Shared memory A+B with register blocking.
+
+    Classic high-performance GEMM: tile both A and B into shared memory,
+    then each thread computes a TM x (TN*4) register-blocked output tile.
+    BM = block_m * thread_m, BN = block_n * thread_n * 4.
+    """
+    input_a = graph.nodes[out_node.inputs[0]]
+    input_b = graph.nodes[out_node.inputs[1]]
+    a_name = input_a.output.name
+    b_name = input_b.output.name
+    c_name = out_node.output.name
+
+    from deplodock.compiler.cuda.ir import RawCode
+
+    bk = config.block_k
+    tm = config.thread_m
+    tn = config.thread_n
+    threads_x = config.block_n
+    threads_y = config.block_m
+    num_threads = threads_x * threads_y
+    bm = threads_y * tm
+    bn = threads_x * tn * 4
+    pad = 1
+
+    a_stride = bk + pad
+    b_stride = bn + pad
+    cols_per_t = tn * 4
+    a_tile_count = bm * bk
+    b_tile_count = bk * bn
+
+    # Generate scalar accumulator declarations and FMA chains.
+    acc_decls = "\n".join(f"float acc_{r}_{c} = 0.0f;" for r in range(tm) for c in range(cols_per_t))
+    fma_chain = "\n".join(f"        acc_{r}_{c} += regA_{r} * regB_{c};" for r in range(tm) for c in range(cols_per_t))
+    reg_a_loads = "\n".join(f"        float regA_{m} = As[(thread_row + {m}) * {a_stride} + kk];" for m in range(tm))
+    reg_b_loads = "\n".join(f"        float regB_{n} = Bs[kk * {b_stride} + thread_col + {n}];" for n in range(cols_per_t))
+    write_back = "\n".join(
+        f"if (block_row + thread_row + {r} < M && block_col + thread_col + {c} < N)\n"
+        f"    {c_name}[(block_row + thread_row + {r}) * N + block_col + thread_col + {c}] = acc_{r}_{c};"
+        for r in range(tm)
+        for c in range(cols_per_t)
+    )
+
+    kernel_code = (
+        f"int tid = threadIdx.y * {threads_x} + threadIdx.x;\n"
+        f"int block_row = blockIdx.y * {bm};\n"
+        f"int block_col = blockIdx.x * {bn};\n"
+        f"__shared__ float As[{bm * a_stride}];\n"
+        f"__shared__ float Bs[{bk * b_stride}];\n"
+        f"{acc_decls}\n"
+        f"int thread_row = threadIdx.y * {tm};\n"
+        f"int thread_col = threadIdx.x * {cols_per_t};\n"
+        f"for (int tile_k = 0; tile_k < K; tile_k += {bk}) {{\n"
+        f"    for (int i = tid; i < {a_tile_count}; i += {num_threads}) {{\n"
+        f"        int r = i / {bk}, c = i % {bk};\n"
+        f"        int gr = block_row + r, gc = tile_k + c;\n"
+        f"        As[r * {a_stride} + c] = (gr < M && gc < K) ? {a_name}[gr * K + gc] : 0.0f;\n"
+        f"    }}\n"
+        f"    for (int i = tid; i < {b_tile_count}; i += {num_threads}) {{\n"
+        f"        int r = i / {bn}, c = i % {bn};\n"
+        f"        int gr = tile_k + r, gc = block_col + c;\n"
+        f"        Bs[r * {b_stride} + c] = (gr < K && gc < N) ? {b_name}[gr * N + gc] : 0.0f;\n"
+        f"    }}\n"
+        f"    __syncthreads();\n"
+        f"    #pragma unroll\n"
+        f"    for (int kk = 0; kk < {bk}; kk++) {{\n"
+        f"{reg_a_loads}\n"
+        f"{reg_b_loads}\n"
+        f"{fma_chain}\n"
+        f"    }}\n"
+        f"    __syncthreads();\n"
+        f"}}\n"
+        f"{write_back}"
+    )
+
+    return KernelDef(
+        name="fused_matmul",
+        params=[
+            KernelParam("float*", a_name),
+            KernelParam("float*", b_name),
+            KernelParam("float*", c_name),
+            KernelParam("int", "M"),
+            KernelParam("int", "N"),
+            KernelParam("int", "K"),
+        ],
+        body=[RawCode(kernel_code)],
         block_size=(threads_x, threads_y, 1),
     )

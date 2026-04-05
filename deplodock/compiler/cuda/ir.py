@@ -169,7 +169,14 @@ class PragmaUnroll:
     factor: int | None = None  # None = fully unroll
 
 
-Stmt = VarDecl | Assign | AugAssign | ForLoop | IfStmt | SyncThreads | ArrayDecl | PragmaUnroll
+@dataclass
+class RawCode:
+    """Raw C/CUDA code injected verbatim."""
+
+    code: str
+
+
+Stmt = VarDecl | Assign | AugAssign | ForLoop | IfStmt | SyncThreads | ArrayDecl | PragmaUnroll | RawCode
 
 
 # ---------------------------------------------------------------------------
