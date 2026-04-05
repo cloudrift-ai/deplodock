@@ -114,7 +114,8 @@ def main():
         # (32,4)=128 threads is optimal on Blackwell.
         strategy_map = [
             (1024, _h(tm=6, bk=256, bn=16)),
-            (4096, _h(tm=12, bk=128, bn=16)),
+            (4096, _h(tm=12, bk=64, bn=16)),
+            (8192, _h(tm=16, bk=32, bn=16)),
             (99999, _h(tm=12, bk=64, bn=16)),
         ]
         suite = run_adaptive_benchmark_suite(
