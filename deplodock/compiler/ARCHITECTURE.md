@@ -67,7 +67,7 @@ Two-level IR design:
 - **Graph IR** (high-level): declarative tensor ops, pattern-matched and rewritten
 - **CUDA IR** (low-level): imperative AST — expressions, statements, loops, thread mapping
 
-Key CUDA IR expression types include `VectorLoad` (float4 coalesced loads), `FieldAccess` (struct field access for float4.x/.y/.z/.w), `Ternary`, and `FuncCall`. Statement types include `ArrayDecl` (shared memory), `PragmaUnroll`, and `ForLoop` with optional step.
+Key CUDA IR expression types include `VectorLoad` (float4 coalesced loads), `FieldAccess` (struct field access for float4.x/.y/.z/.w), `Ternary`, and `FuncCall`. Statement types include `ArrayDecl` (shared memory), `PragmaUnroll`, `IfStmt` (with optional else_body), and `ForLoop` with optional step.
 
 ### Lowering Strategies
 
@@ -79,10 +79,34 @@ Lowering is controlled by `MatmulConfig(strategy=...)`. Available strategies:
 | `smem_tiled` | Shared memory tiles, cooperative loading | Educational |
 | `register_blocked` | Register blocking with outer product | Large tiles |
 | `coarsened_f4` | float4 vectorized B loads, 4 cols/thread | Medium sizes |
-| `coarsened_2r4c` | 2 rows × 4 cols per thread, float4 B | 1024-4096 |
-| **`hybrid_smem_f4`** | **Shared mem A + float4 B + 2-row coarsening** | **All sizes 1024+** |
+| `coarsened_2r4c` | 2 rows x 4 cols per thread, float4 B | Medium-large |
+| **`hybrid_smem_f4`** | **Shared mem A + float4 B + 2-row coarsening** | **512+** |
+| `hybrid_1r_f4` | Shared mem A + float4 B + 1-row (more parallelism) | 512 |
+| `flat_scalar` | No smem, 1 thread/element, 1D grid | 256 and below |
+| `flat_f4` | No smem, float4 B, 1D grid | Small with N%4==0 |
 
-The `hybrid_smem_f4` strategy is the highest-performing, beating cuBLAS by 38-45% at 1024-4096 sizes on RTX 5090 (up to 33.7 TFLOPS).
+### Size-Adaptive Strategy Selection
+
+Different strategies and BK (tile dimension) values are optimal for different sizes:
+
+| Size | Best Strategy | BK | Efficiency vs cuBLAS |
+|------|--------------|-----|---------------------|
+| 256  | flat_scalar  | N/A | 138-140% |
+| 512  | hybrid_smem_f4 | 256 | 97% |
+| 1024 | hybrid_smem_f4 | 32  | 146% |
+| 2048 | hybrid_smem_f4 | 32  | 151% |
+| 4096 | hybrid_smem_f4 | 32  | 132% |
+| 8192 | hybrid_smem_f4 | 256 | 127% |
+| 16384| hybrid_smem_f4 | 256 | 118% |
+
+The `run_adaptive_benchmark_suite()` function uses a threshold-based strategy map to pick the best config per size.
+
+### Non-Aligned Size Support
+
+All float4 strategies support non-power-of-2 and non-rectangular matrices:
+- **Float4 alignment guard**: `N % 4 == 0` check gates float4 loads; scalar fallback when N is not 4-aligned
+- **Per-element write bounds**: Each output element has individual `row < M && col < N` check
+- **Scalar inner loop fallback**: Edge columns use per-element B loads instead of float4
 
 ### Runner and Benchmarking
 
@@ -90,7 +114,11 @@ The runner generates complete `.cu` programs, compiles with nvcc (`-O3 --use_fas
 - `run_kernel()`: correctness testing with embedded data
 - `run_benchmark()`: performance comparison with curand init and cuBLAS comparison
 
-The `benchmark.py` module provides `run_benchmark_suite()` for testing across multiple matrix sizes with JSON trace output.
+The `benchmark.py` module provides:
+- `run_benchmark_suite()`: single strategy across all sizes
+- `run_adaptive_benchmark_suite()`: per-size strategy selection via threshold map
+- `MATRIX_SIZES`: standard power-of-2 sizes 256-16384
+- `MATRIX_SIZES_EXTENDED`: includes non-rectangular, non-power-of-2, and odd sizes
 
 ## Structured Trace & Pipeline
 
