@@ -1,0 +1,21 @@
+model:
+  huggingface: "nvidia/Qwen3-8B-NVFP4"
+
+engine:
+  llm:
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    context_length: 8192
+    max_concurrent_requests: 8
+    vllm:
+      image: "vllm/vllm-openai:latest"
+
+benchmark:
+  max_concurrency: 8
+  num_prompts: 20
+  random_input_len: 1000
+  random_output_len: 1000
+
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
