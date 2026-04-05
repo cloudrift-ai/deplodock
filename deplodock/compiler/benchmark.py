@@ -193,14 +193,13 @@ def run_adaptive_benchmark_suite(
     try:
         optimized = rewriter.apply(graph.copy())
 
-        # Pre-lower all strategies.
-        kernels: dict[str, tuple] = {}
+        # Pre-lower all unique configs.
+        kernels: dict[int, tuple] = {}
         for _threshold, cfg in strategy_map:
-            key = cfg.strategy
-            if key not in kernels:
-                kernel = lower_graph(optimized, config=cfg)
-                source = emit_kernel(kernel)
-                kernels[key] = (kernel, source, cfg)
+            key = id(cfg)
+            kernel = lower_graph(optimized, config=cfg)
+            source = emit_kernel(kernel)
+            kernels[key] = (kernel, source, cfg)
 
         for dim_args in sizes:
             m = dim_args.get("M", 0)
@@ -214,7 +213,7 @@ def run_adaptive_benchmark_suite(
                     selected = cfg
                     break
 
-            kernel, source, cfg = kernels[selected.strategy]
+            kernel, source, cfg = kernels[id(selected)]
             suite.cuda_kernel = source  # Last kernel used.
 
             logger.info("Benchmarking %dx%d with %s ...", m, n, selected.strategy)
