@@ -105,7 +105,6 @@ def main():
             )
 
         strategy_map = [
-            (256, MatmulConfig(strategy="flat_scalar", block_n=128, coarsen_rows=1, coarsen_cols=1)),
             (1024, _h(tm=6, bk=256, bn=16)),
             (4096, _h(tm=12, bk=128)),
             (99999, _h(tm=12, bk=64)),
