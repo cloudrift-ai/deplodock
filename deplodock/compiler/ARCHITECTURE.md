@@ -87,19 +87,23 @@ Lowering is controlled by `MatmulConfig(strategy=...)`. Available strategies:
 
 ### Size-Adaptive Strategy Selection
 
-`hybrid_smem_f4` supports configurable rows per thread via `thread_m`. The 12-row variant (12r x 4c = 48 elements/thread) with `__launch_bounds__` reaches 58+ TFLOPS on RTX 5090.
+`hybrid_smem_f4` supports configurable rows per thread via `thread_m` and `__launch_bounds__`.
 
-| Size | Best Config | thread_m | BK | Block | Eff vs cuBLAS | TFLOPS |
-|------|-------------|----------|-----|-------|--------------|--------|
-| 256  | hybrid 6r   | 6        | 256 | 16x4  | **138%** | 3.8  |
-| 512  | hybrid 6r   | 6        | 256 | 16x4  | **150%** | 17.9 |
-| 1024 | hybrid 6r   | 6        | 256 | 16x4  | **201%** | 41.8 |
-| 2048 | hybrid 12r  | 12       | 128 | 16x4  | **235%** | **55.5** |
-| 4096 | hybrid 12r  | 12       | 128 | 16x4  | **279%** | **60.8** |
-| 8192 | hybrid 12r  | 12       | 64  | 16x4  | **223%** | 48.3 |
-| 16384| hybrid 12r  | 12       | 64  | 16x4  | **225%** | 48.9 |
+#### sm_120 (Blackwell, CUDA 13.0, cuBLAS 13.1)
 
-All sizes above use `hybrid_smem_f4` with `__launch_bounds__` and block=(16,4).
+cuBLAS on sm_120 uses CUTLASS `simt_sgemm_256x128_8x4` (pure FP32, not tensor cores). ncu profiling shows 65% FMA utilization vs our 54% — the gap is SASS-level instruction scheduling.
+
+| Size | thread_m | BK | Block | Eff vs cuBLAS | TFLOPS |
+|------|----------|-----|-------|--------------|--------|
+| 256  | 6        | 256 | 32x4  | **104%** | 3.0  |
+| 512  | 6        | 256 | 32x4  | **169%** | 14.5 |
+| 1024 | 6        | 256 | 32x4  | 85%  | 34.6 |
+| 2048 | 8        | 32  | 32x4  | 77%  | 47.6 |
+| 4096 | 12       | 64  | 32x4  | 82-86%  | 51-58 |
+| 8192 | 16       | 32  | 32x4  | 76%  | 51.4 |
+| 16384| 12       | 64  | 32x4  | 71%  | 48.9 |
+
+Beats cuBLAS at 256 and 512. At 1024+ the ~15-29% gap is confirmed via ncu profiling to be SASS-level instruction scheduling — cuBLAS achieves 65% FMA pipe utilization vs our 54%.
 
 The `run_adaptive_benchmark_suite()` function uses a threshold-based strategy map to pick the best config per size.
 
