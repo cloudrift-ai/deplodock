@@ -15,14 +15,15 @@ compiler/
 ├── rewriter.py   # Pass/Rule/Rewriter — rule loading and application
 ├── trace.py      # CompilerTrace — structured JSON trace for AI-in-the-loop
 ├── pipeline.py   # compile_and_run() — end-to-end pipeline with tracing
+├── benchmark.py  # Multi-size benchmark harness with cuBLAS comparison
 ├── rules/        # Ordered rule files organized by pass
 │   ├── fusion/   # Fuse ops to avoid intermediates
 │   └── tiling/   # Tile loops for memory hierarchy
 └── cuda/         # CUDA backend
-    ├── ir.py     # Imperative AST (Expr, Stmt, KernelDef)
+    ├── ir.py     # Imperative AST (Expr, Stmt, KernelDef, VectorLoad, etc.)
     ├── codegen.py # CUDA IR → CUDA C source string
-    ├── lower.py  # Graph IR → CUDA IR (matmul lowering)
-    └── runner.py # Compile with nvcc + execute + parse output
+    ├── lower.py  # Graph IR → CUDA IR (MatmulConfig + strategy dispatch)
+    └── runner.py # Compile with nvcc + execute + benchmark + parse output
 ```
 
 ## IR Design
@@ -66,9 +67,30 @@ Two-level IR design:
 - **Graph IR** (high-level): declarative tensor ops, pattern-matched and rewritten
 - **CUDA IR** (low-level): imperative AST — expressions, statements, loops, thread mapping
 
-Lowering translates fused graph ops into CUDA kernels. Currently supports matmul (FusedReduceElementwiseOp with sum/mul). Each thread computes one output element with a K-loop accumulator.
+Key CUDA IR expression types include `VectorLoad` (float4 coalesced loads), `FieldAccess` (struct field access for float4.x/.y/.z/.w), `Ternary`, and `FuncCall`. Statement types include `ArrayDecl` (shared memory), `PragmaUnroll`, and `ForLoop` with optional step.
 
-The runner generates a complete `.cu` program (kernel + host wrapper with CUDA event timing), compiles with nvcc, executes, and parses stdout for output data and `KERNEL_TIME_MS`.
+### Lowering Strategies
+
+Lowering is controlled by `MatmulConfig(strategy=...)`. Available strategies:
+
+| Strategy | Description | Best for |
+|----------|-------------|----------|
+| `naive` | 1 thread per output element, direct global loads | Baseline |
+| `smem_tiled` | Shared memory tiles, cooperative loading | Educational |
+| `register_blocked` | Register blocking with outer product | Large tiles |
+| `coarsened_f4` | float4 vectorized B loads, 4 cols/thread | Medium sizes |
+| `coarsened_2r4c` | 2 rows × 4 cols per thread, float4 B | 1024-4096 |
+| **`hybrid_smem_f4`** | **Shared mem A + float4 B + 2-row coarsening** | **All sizes 1024+** |
+
+The `hybrid_smem_f4` strategy is the highest-performing, beating cuBLAS by 38-45% at 1024-4096 sizes on RTX 5090 (up to 33.7 TFLOPS).
+
+### Runner and Benchmarking
+
+The runner generates complete `.cu` programs, compiles with nvcc (`-O3 --use_fast_math`), and supports two modes:
+- `run_kernel()`: correctness testing with embedded data
+- `run_benchmark()`: performance comparison with curand init and cuBLAS comparison
+
+The `benchmark.py` module provides `run_benchmark_suite()` for testing across multiple matrix sizes with JSON trace output.
 
 ## Structured Trace & Pipeline
 
@@ -77,22 +99,12 @@ The runner generates a complete `.cu` program (kernel + host wrapper with CUDA e
 ```json
 {
   "input_graph": { "nodes": {...}, "inputs": [...], "outputs": [...] },
-  "passes": [{
-    "pass": "fusion",
-    "rules_applied": [{"rule": "001_fuse_reduce_elementwise", "matched_at": "red", ...}],
-    "graph_before": {...},
-    "graph_after": {...}
-  }],
+  "passes": [{ "pass": "fusion", "rules_applied": [...], "graph_before": {...}, "graph_after": {...} }],
   "cuda_kernel": "__global__ void fused_matmul(...) { ... }",
-  "execution": {
-    "output": [22.0, 28.0, ...],
-    "expected": [22.0, 28.0, ...],
-    "correct": true,
-    "max_error": 0.0,
-    "kernel_time_ms": 0.042,
-    "dimensions": {"M": 4, "N": 2, "K": 3}
-  }
+  "execution": { "output": [...], "correct": true, "max_error": 0.0, "kernel_time_ms": 0.042, "dimensions": {"M": 4, "N": 2, "K": 3} }
 }
 ```
 
 Designed for an AI-in-the-loop optimization cycle: AI reads trace → modifies rules/IR → runs pipeline → evaluates performance → iterates.
+
+The `benchmark.py` module provides `BenchmarkSuite` for multi-size benchmarking with cuBLAS comparison. Traces are saved to `results/matmul_overnight/` with timestamps for later inspection.
