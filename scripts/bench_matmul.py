@@ -110,6 +110,8 @@ def main():
                 coarsen_cols=4,
             )
 
+        # On sm_120, block_n=16 maps to threads_x=32 (legacy compat).
+        # (32,4)=128 threads is optimal on Blackwell.
         strategy_map = [
             (1024, _h(tm=6, bk=256, bn=16)),
             (4096, _h(tm=12, bk=128, bn=16)),
