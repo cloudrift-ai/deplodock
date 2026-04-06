@@ -320,78 +320,8 @@ def generate_benchmark_program(
     args_str = ", ".join(launch_args)
 
     cublas_includes = ""
-    cublas_code = ""
-    cublas_cleanup = ""
     if compare_cublas:
         cublas_includes = "#include <cublas_v2.h>\n"
-        cublas_code = f"""
-    // cuBLAS comparison
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-    {"cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);" if cublas_math_mode == "pedantic" else "// default math mode"}
-    float *d_C_ref;
-    cudaMalloc(&d_C_ref, {m * n} * sizeof(float));
-    float alpha = 1.0f, beta = 0.0f;
-
-    // Warmup
-    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                {n}, {m}, {k}, &alpha,
-                d_B, {n}, d_A, {k}, &beta, d_C_ref, {n});
-    cudaDeviceSynchronize();
-
-    cudaEvent_t cb_start, cb_stop;
-    cudaEventCreate(&cb_start);
-    cudaEventCreate(&cb_stop);
-
-    float cublas_times[{num_iterations}];
-    for (int iter = 0; iter < {num_iterations}; iter++) {{
-        cudaEventRecord(cb_start);
-        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                    {n}, {m}, {k}, &alpha,
-                    d_B, {n}, d_A, {k}, &beta, d_C_ref, {n});
-        cudaEventRecord(cb_stop);
-        cudaEventSynchronize(cb_stop);
-        cudaEventElapsedTime(&cublas_times[iter], cb_start, cb_stop);
-    }}
-
-    // Sort cublas times for median
-    for (int i = 0; i < {num_iterations} - 1; i++)
-        for (int j = i + 1; j < {num_iterations}; j++)
-            if (cublas_times[j] < cublas_times[i]) {{
-                float tmp = cublas_times[i];
-                cublas_times[i] = cublas_times[j];
-                cublas_times[j] = tmp;
-            }}
-
-    printf("CUBLAS_MEDIAN_MS=%.6f\\n", cublas_times[{num_iterations}/ 2]);
-    printf("CUBLAS_MIN_MS=%.6f\\n", cublas_times[0]);
-    printf("CUBLAS_MAX_MS=%.6f\\n", cublas_times[{num_iterations} - 1]);
-
-    // Correctness check: compare our kernel vs cuBLAS
-    float *h_ours = (float*)malloc({m * n} * sizeof(float));
-    float *h_ref = (float*)malloc({m * n} * sizeof(float));
-    cudaMemcpy(h_ours, d_C, {m * n} * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ref, d_C_ref, {m * n} * sizeof(float), cudaMemcpyDeviceToHost);
-    float max_err = 0.0f;
-    float max_rel_err = 0.0f;
-    for (int i = 0; i < {m * n}; i++) {{
-        float err = fabsf(h_ours[i] - h_ref[i]);
-        if (err > max_err) max_err = err;
-        float rel = err / fmaxf(fabsf(h_ref[i]), 1e-6f);
-        if (rel > max_rel_err) max_rel_err = rel;
-    }}
-    printf("MAX_ERROR=%.6f\\n", max_err);
-    printf("MAX_REL_ERROR=%.6f\\n", max_rel_err);
-    printf("CORRECT=%d\\n", max_err < 1e-2 ? 1 : 0);
-    free(h_ours);
-    free(h_ref);
-
-    cudaEventDestroy(cb_start);
-    cudaEventDestroy(cb_stop);
-    cudaFree(d_C_ref);
-    cublasDestroy(handle);
-"""
-        cublas_cleanup = ""
 
     return f"""#include <stdio.h>
 #include <stdlib.h>
@@ -420,23 +350,61 @@ int main() {{
     dim3 block({bx}, {by});
     dim3 grid({grid_x}, {grid_y});
 
-    // Warmup
+    // Warmup both kernels
     {kernel.name}<<<grid, block>>>({args_str});
     cudaDeviceSynchronize();
 
-    // Timed iterations
+{
+        f'''    // cuBLAS setup
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    {"cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);" if cublas_math_mode == "pedantic" else "// default math mode"}
+    float *d_C_ref;
+    cudaMalloc(&d_C_ref, {m * n} * sizeof(float));
+    float alpha = 1.0f, beta_val = 0.0f;
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                {n}, {m}, {k}, &alpha,
+                d_B, {n}, d_A, {k}, &beta_val, d_C_ref, {n});
+    cudaDeviceSynchronize();
+'''
+        if compare_cublas
+        else ""
+    }
+    // Timed iterations — INTERLEAVED for thermal fairness
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-
+{
+        '''    cudaEvent_t cb_start, cb_stop;
+    cudaEventCreate(&cb_start);
+    cudaEventCreate(&cb_stop);
+'''
+        if compare_cublas
+        else ""
+    }
     float times[{num_iterations}];
+{f"    float cublas_times[{num_iterations}];" if compare_cublas else ""}
     for (int iter = 0; iter < {num_iterations}; iter++) {{
+        // Our kernel
         cudaEventRecord(start);
         {kernel.name}<<<grid, block>>>({args_str});
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(&times[iter], start, stop);
-    }}
+{
+        f'''
+        // cuBLAS (same thermal state as our kernel)
+        cudaEventRecord(cb_start);
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    {n}, {m}, {k}, &alpha,
+                    d_B, {n}, d_A, {k}, &beta_val, d_C_ref, {n});
+        cudaEventRecord(cb_stop);
+        cudaEventSynchronize(cb_stop);
+        cudaEventElapsedTime(&cublas_times[iter], cb_start, cb_stop);
+'''
+        if compare_cublas
+        else ""
+    }    }}
 
     // Sort for median
     for (int i = 0; i < {num_iterations} - 1; i++)
@@ -451,14 +419,51 @@ int main() {{
     printf("KERNEL_MIN_MS=%.6f\\n", times[0]);
     printf("KERNEL_MAX_MS=%.6f\\n", times[{num_iterations} - 1]);
 
-{cublas_code}
+{
+        f'''    // Sort cublas times
+    for (int i = 0; i < {num_iterations} - 1; i++)
+        for (int j = i + 1; j < {num_iterations}; j++)
+            if (cublas_times[j] < cublas_times[i]) {{
+                float tmp = cublas_times[i];
+                cublas_times[i] = cublas_times[j];
+                cublas_times[j] = tmp;
+            }}
+    printf("CUBLAS_MEDIAN_MS=%.6f\\n", cublas_times[{num_iterations} / 2]);
+    printf("CUBLAS_MIN_MS=%.6f\\n", cublas_times[0]);
+    printf("CUBLAS_MAX_MS=%.6f\\n", cublas_times[{num_iterations} - 1]);
+
+    // Correctness check
+    float *h_ours = (float*)malloc({m * n} * sizeof(float));
+    float *h_ref = (float*)malloc({m * n} * sizeof(float));
+    cudaMemcpy(h_ours, d_C, {m * n} * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ref, d_C_ref, {m * n} * sizeof(float), cudaMemcpyDeviceToHost);
+    float max_err = 0.0f;
+    float max_rel_err = 0.0f;
+    for (int i = 0; i < {m * n}; i++) {{
+        float err = fabsf(h_ours[i] - h_ref[i]);
+        if (err > max_err) max_err = err;
+        float rel = err / fmaxf(fabsf(h_ref[i]), 1e-6f);
+        if (rel > max_rel_err) max_rel_err = rel;
+    }}
+    printf("MAX_ERROR=%.6f\\n", max_err);
+    printf("MAX_REL_ERROR=%.6f\\n", max_rel_err);
+    printf("CORRECT=%d\\n", max_err < 1e-2 ? 1 : 0);
+    free(h_ours);
+    free(h_ref);
+    cudaEventDestroy(cb_start);
+    cudaEventDestroy(cb_stop);
+    cudaFree(d_C_ref);
+    cublasDestroy(handle);
+'''
+        if compare_cublas
+        else ""
+    }
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
-{cublas_cleanup}
     return 0;
 }}
 """
@@ -474,6 +479,7 @@ def run_benchmark(
     coarsen_rows: int = 1,
     cublas_math_mode: str = "default",
     maxrregcount: int | None = None,
+    fast_math: bool = True,
 ) -> BenchmarkResult:
     """Run a benchmark: compile and execute, return timing results."""
     program = generate_benchmark_program(
@@ -488,7 +494,9 @@ def run_benchmark(
     )
 
     arch = _detect_arch()
-    nvcc_cmd = ["nvcc", "-O3", "--use_fast_math"]
+    nvcc_cmd = ["nvcc", "-O3"]
+    if fast_math:
+        nvcc_cmd.append("--use_fast_math")
     if arch:
         nvcc_cmd.extend(["-arch", arch])
     if maxrregcount is not None:
