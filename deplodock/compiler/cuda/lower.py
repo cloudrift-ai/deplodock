@@ -1498,7 +1498,7 @@ int bm=blockIdx.y*{bm},bn=blockIdx.x*{bn};
 if(tid==0){{asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb0),"r"(1));asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));asm volatile("fence.mbarrier_init.release.cluster;");}}
 __syncthreads();
 {acc_decl}
-int bytes=({a_size}+{b_size})*4;
+const int bytes={stage * 4};
 int p0=0,p1=0,nt={nt_expr};
 if(nt>0&&tid==0){{asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as0),"l"(&{a_name}_tma),"r"({first_k}),"r"(bm),"r"(mb0):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs0),"l"(&{b_name}_tma),"r"(bn),"r"({first_k}),"r"(mb0):"memory");}}
 for(int t=0;t<nt;t++){{
@@ -1521,9 +1521,6 @@ for(int t=0;t<nt;t++){{
         KernelParam("float*", a_name),
         KernelParam("float*", b_name),
         KernelParam("float*", c_name),
-        KernelParam("int", "M"),
-        KernelParam("int", "N"),
-        KernelParam("int", "K"),
     ]
     if use_k_splits:
         params.append(KernelParam("int", "k_splits"))

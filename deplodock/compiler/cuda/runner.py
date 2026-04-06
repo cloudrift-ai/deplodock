@@ -388,10 +388,14 @@ def generate_benchmark_program(
 #include <cuda_runtime.h>
 #include <curand.h>
 {tma_includes}{cublas_includes}
+// Compile-time matrix dimensions for kernel optimization
+#define M {m}
+#define N {n}
+#define K {k}
+
 {kernel_source}
 
 int main() {{
-    int M = {m}, N = {n}, K = {k};
 
     float *d_A, *d_B, *d_C;
     cudaMalloc(&d_A, M * K * sizeof(float));

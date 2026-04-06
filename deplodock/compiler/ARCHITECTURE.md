@@ -116,14 +116,16 @@ Key features:
 | Size | TM | BK | K-splits | Eff vs cuBLAS | TFLOPS |
 |------|-----|-----|----------|--------------|--------|
 | 256  | 8  | 32 | 4 | ~95% | 4.1 |
-| 512  | 8  | 32 | 4 | ~94% | 18.8 |
-| **1024** | 8  | 32 | 1 | **101%** | 48.8 |
-| **2048** | 26 | 32 | 1 | **105%** | 71.8 |
-| **4096** | 20 | 32 | 1 | **100.3%** | 66.5 |
-| 8192 | 28 | 32 | 1 | 97% | 60.0 |
-| 16384 | 28 | 32 | 1 | 90% | 57.2 |
+| 512  | 8  | 32 | 4 | ~93% | 19.3 |
+| **1024** | 8  | 32 | 1 | **101%** | 49.0 |
+| **2048** | 26 | 32 | 1 | **106%** | 72.8 |
+| **4096** | 20 | 32 | 1 | **101%** | 67.4 |
+| 8192 | 28 | 32 | 1 | 96% | 60.2 |
+| 16384 | 28 | 32 | 1 | 89% | 56.9 |
 
-Consistently beats cuBLAS at 1024, 2048, and 4096. ncu profiling shows identical occupancy (16.67%) and compute throughput (~78%) to cuBLAS at large sizes — the remaining 3-11% gap is SASS-level instruction scheduling from C code vs cuBLAS's hand-optimized SASS (confirmed: zero bank conflicts in cuBLAS vs 6.4M in ours, but the stall impact is <0.2% of total time).
+Consistently beats cuBLAS at 1024, 2048, and 4096. Key optimizations: M/N/K as compile-time `#define` constants (not kernel params) lets nvcc optimize loop bounds and eliminate dead branches. Combined with compile-time k_splits elimination, the kernel has zero runtime overhead for the common case.
+
+ncu profiling shows identical occupancy (16.67%) and compute throughput (~78%) to cuBLAS at large sizes — the remaining 4-11% gap is SASS-level instruction scheduling from C code vs cuBLAS's hand-optimized SASS.
 
 #### FP32 Hybrid (older approach)
 
