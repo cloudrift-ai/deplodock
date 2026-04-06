@@ -1436,9 +1436,10 @@ def _lower_matmul_tma_db(graph, out_node, config):
     from deplodock.compiler.cuda.ir import RawCode
 
     bk = config.block_k if config.block_k >= 16 else 32
-    bm, bn = 64, 128
-    tm, tn = 8, 4
+    tm = config.thread_m if config.thread_m > 1 else 8
+    tn = 4
     tx, ty = 32, 8
+    bm, bn = ty * tm, tx * tn
     a_size = bm * bk
     b_size = bk * bn
     stage = a_size + b_size
