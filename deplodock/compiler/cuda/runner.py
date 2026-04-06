@@ -353,6 +353,7 @@ def generate_benchmark_program(
 
         tma_setup = f"""
     // TMA descriptor setup
+    // Note: TMA requires K and N to be multiples of 4 (16-byte alignment for FLOAT32)
     CUtensorMap {kernel.tma_params[0]}_desc, {kernel.tma_params[1]}_desc;
     {{
         uint64_t da[2]={{(uint64_t)K,(uint64_t)M}};
