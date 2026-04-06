@@ -48,8 +48,17 @@ def emit_kernel(kernel: KernelDef) -> str:
     """Emit complete CUDA C source for a __global__ kernel."""
     preamble = ""
     if kernel.includes:
-        preamble = "\n".join(f"#include <{h}>" for h in kernel.includes) + "\nusing namespace nvcuda;\n\n"
-    params = ", ".join(f"{p.dtype} {p.name}" for p in kernel.params)
+        preamble = "\n".join(f"#include <{h}>" for h in kernel.includes) + "\n"
+        if "mma.h" in kernel.includes:
+            preamble += "using namespace nvcuda;\n"
+        preamble += "\n"
+    # Build parameter list: TMA descriptors first, then regular params
+    param_parts = []
+    if kernel.tma_params:
+        for tp in kernel.tma_params:
+            param_parts.append(f"const __grid_constant__ CUtensorMap {tp}")
+    param_parts.extend(f"{p.dtype} {p.name}" for p in kernel.params)
+    params = ", ".join(param_parts)
     body = "\n".join(_emit_stmt(s, indent=1) for s in kernel.body)
     bx, by, bz = kernel.block_size
     max_threads = bx * by * bz

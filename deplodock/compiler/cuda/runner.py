@@ -323,12 +323,67 @@ def generate_benchmark_program(
     if compare_cublas:
         cublas_includes = "#include <cublas_v2.h>\n"
 
+    # TMA setup code
+    tma_includes = ""
+    tma_setup = ""
+    tma_launch_prefix = ""
+    tma_smem_attr = ""
+    if kernel.tma_params:
+        tma_includes = "#include <cuda.h>\n"
+        tile_m = kernel.tile_m or 64
+        tile_n = kernel.tile_n or 128
+        bk_val = dim_args.get("K", 1)  # Will be overridden per-strategy
+        # Detect BK from the kernel source (look for "nt=K/" pattern)
+        import re
+
+        # Extract BK from the kernel body (look for "nt=K/" pattern)
+        for stmt in kernel.body:
+            if hasattr(stmt, "code"):
+                m2 = re.search(r"nt=K/(\d+)", stmt.code)
+                if m2:
+                    bk_val = int(m2.group(1))
+                    break
+        a_size = tile_m * bk_val
+        b_size = bk_val * tile_n
+        stage_size = a_size + b_size
+        smem_bytes = 2 * stage_size * 4 + 256
+
+        tma_setup = f"""
+    // TMA descriptor setup
+    CUtensorMap {kernel.tma_params[0]}_desc, {kernel.tma_params[1]}_desc;
+    {{
+        uint64_t da[2]={{(uint64_t)K,(uint64_t)M}};
+        uint64_t sa[1]={{(uint64_t)K*sizeof(float)}};
+        uint32_t ba[2]={{{bk_val},{tile_m}}};
+        uint32_t ea[2]={{1,1}};
+        cuTensorMapEncodeTiled(&{kernel.tma_params[0]}_desc,CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,
+            d_A,da,sa,ba,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    }}
+    {{
+        uint64_t db[2]={{(uint64_t)N,(uint64_t)K}};
+        uint64_t sb[1]={{(uint64_t)N*sizeof(float)}};
+        uint32_t bb[2]={{{tile_n},{bk_val}}};
+        uint32_t ea[2]={{1,1}};
+        cuTensorMapEncodeTiled(&{kernel.tma_params[1]}_desc,CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,
+            d_B,db,sb,bb,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    }}
+    cudaFuncSetAttribute({kernel.name},cudaFuncAttributeMaxDynamicSharedMemorySize,{smem_bytes});
+"""
+        tma_launch_prefix = f"{kernel.tma_params[0]}_desc, {kernel.tma_params[1]}_desc, "
+        tma_smem_attr = f", {smem_bytes}"
+
+    # Build launch args with TMA prefix
+    full_args = f"{tma_launch_prefix}{args_str}"
+    launch_suffix = f"<<<grid, block{tma_smem_attr}>>>"
+
     return f"""#include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <cuda_runtime.h>
 #include <curand.h>
-{cublas_includes}
+{tma_includes}{cublas_includes}
 {kernel_source}
 
 int main() {{
@@ -346,12 +401,12 @@ int main() {{
     curandGenerateUniform(gen, d_A, M * K);
     curandGenerateUniform(gen, d_B, K * N);
     curandDestroyGenerator(gen);
-
+{tma_setup}
     dim3 block({bx}, {by});
     dim3 grid({grid_x}, {grid_y});
 
     // Warmup both kernels
-    {kernel.name}<<<grid, block>>>({args_str});
+    {kernel.name}{launch_suffix}({full_args});
     cudaDeviceSynchronize();
 
 {
@@ -387,7 +442,7 @@ int main() {{
     for (int iter = 0; iter < {num_iterations}; iter++) {{
         // Our kernel
         cudaEventRecord(start);
-        {kernel.name}<<<grid, block>>>({args_str});
+        {kernel.name}{launch_suffix}({full_args});
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(&times[iter], start, stop);
@@ -503,6 +558,8 @@ def run_benchmark(
         nvcc_cmd.extend(["--maxrregcount", str(maxrregcount)])
     if "#include <mma.h>" in program or "wmma::" in program:
         nvcc_cmd.extend(["--std=c++17"])
+    if "CUtensorMap" in program or "cuTensorMapEncodeTiled" in program:
+        nvcc_cmd.append("-lcuda")
     if compare_cublas:
         nvcc_cmd.extend(["-lcublas", "-lcurand"])
     else:
