@@ -1479,16 +1479,26 @@ def _lower_matmul_tma_db(graph, out_node, config):
         nt_expr = f"(k_end-k_start)/{bk}"
         first_k = "k_start"
         next_k = f"k_start+(t+1)*{bk}"
-        write_macro = f"""#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
-if(gc<N)atomicAdd(&Cout[gr*N+gc],v0);if(gc+1<N)atomicAdd(&Cout[gr*N+gc+1],v1);if(gc+2<N)atomicAdd(&Cout[gr*N+gc+2],v2);if(gc+3<N)atomicAdd(&Cout[gr*N+gc+3],v3);}}}}}}}}"""
+        write_macro = f"""#if (M % {bm} == 0 && N % {bn} == 0)
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);int gc=bn+tc;float*Cout={c_ptr}; \
+atomicAdd(&Cout[gr*N+gc],v0);atomicAdd(&Cout[gr*N+gc+1],v1);atomicAdd(&Cout[gr*N+gc+2],v2);atomicAdd(&Cout[gr*N+gc+3],v3);}}}}
+#else
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
+if(gc<N)atomicAdd(&Cout[gr*N+gc],v0);if(gc+1<N)atomicAdd(&Cout[gr*N+gc+1],v1);if(gc+2<N)atomicAdd(&Cout[gr*N+gc+2],v2);if(gc+3<N)atomicAdd(&Cout[gr*N+gc+3],v3);}}}}}}}}
+#endif"""
     else:
         k_range_code = ""
         nt_expr = f"K/{bk}"
         first_k = "0"
         next_k = f"(t+1)*{bk}"
-        # nvcc auto-vectorizes these 4 scalar stores to STG.E.128 (float4)
-        write_macro = f"""#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
-if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}}}}}"""
+        # Bounds checks eliminated at compile time when M/N are tile-aligned
+        write_macro = f"""#if (M % {bm} == 0 && N % {bn} == 0)
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);int gc=bn+tc;float*Cout={c_ptr}; \
+Cout[gr*N+gc]=v0;Cout[gr*N+gc+1]=v1;Cout[gr*N+gc+2]=v2;Cout[gr*N+gc+3]=v3;}}}}
+#else
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
+if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}}}}}
+#endif"""
 
     kernel_code = f"""\
 extern __shared__ __align__(128) char dsmem[];
