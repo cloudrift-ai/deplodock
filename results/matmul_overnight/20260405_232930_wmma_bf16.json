@@ -1,0 +1,108 @@
+{
+  "timestamp": "20260405_232930",
+  "strategy": "wmma_bf16",
+  "config": {
+    "strategy": "wmma_bf16",
+    "block_m": 8,
+    "block_n": 32,
+    "block_k": 32,
+    "thread_m": 1,
+    "thread_n": 1,
+    "vectorize": false,
+    "unroll_k": false,
+    "double_buffer": false,
+    "smem_pad": 1,
+    "coarsen_rows": 1,
+    "coarsen_cols": 1,
+    "assume_aligned": false
+  },
+  "description": "wmma_bf16 integrated sm_120 (30 iter)",
+  "cuda_kernel": "#include <cuda_bf16.h>\n#include <mma.h>\nusing namespace nvcuda;\n\n__global__\n__launch_bounds__(128) void fused_matmul(float* A, float* B, float* C, int M, int N, int K) {\n    int warp_id = threadIdx.x / 32;\n    int warp_m = warp_id / 2, warp_n = warp_id % 2;\n    int block_m = blockIdx.y * 64, block_n = blockIdx.x * 64;\n    int tid = threadIdx.x;\n    __shared__ __nv_bfloat16 As[1024];\n    __shared__ __nv_bfloat16 Bs[1024];\n    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c00, c01, c10, c11;\n    wmma::fill_fragment(c00, 0.0f);\n    wmma::fill_fragment(c01, 0.0f);\n    wmma::fill_fragment(c10, 0.0f);\n    wmma::fill_fragment(c11, 0.0f);\n    for (int tile_k = 0; tile_k < K; tile_k += 16) {\n        #pragma unroll\n        for (int p = 0; p < 8; p++) {\n            int idx = tid + p * 128;\n            int r = idx >> 4, c = idx & 15;\n            int gr = block_m + r, gc = tile_k + c;\n            As[r * 16 + c] = __float2bfloat16((gr < M && gc < K) ? A[gr * K + gc] : 0.0f);\n        }\n        #pragma unroll\n        for (int p = 0; p < 8; p++) {\n            int idx = tid + p * 128;\n            int r = idx >> 6, c = idx & 63;\n            int gr = tile_k + r, gc = block_n + c;\n            Bs[r * 64 + c] = __float2bfloat16((gr < K && gc < N) ? B[gr * N + gc] : 0.0f);\n        }\n        __syncthreads();\n        int wm = warp_m * 32, wn = warp_n * 32;\n        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;\n        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bf;\n        wmma::load_matrix_sync(af, &As[(wm+0)*16], 16);\n        wmma::load_matrix_sync(bf, &Bs[wn+0], 64);\n        wmma::mma_sync(c00, af, bf, c00);\n        wmma::load_matrix_sync(af, &As[(wm+0)*16], 16);\n        wmma::load_matrix_sync(bf, &Bs[wn+16], 64);\n        wmma::mma_sync(c01, af, bf, c01);\n        wmma::load_matrix_sync(af, &As[(wm+16)*16], 16);\n        wmma::load_matrix_sync(bf, &Bs[wn+0], 64);\n        wmma::mma_sync(c10, af, bf, c10);\n        wmma::load_matrix_sync(af, &As[(wm+16)*16], 16);\n        wmma::load_matrix_sync(bf, &Bs[wn+16], 64);\n        wmma::mma_sync(c11, af, bf, c11);\n        __syncthreads();\n    }\n    int wm = warp_m * 32, wn = warp_n * 32;\n    if (block_m+wm+0+16 <= M && block_n+wn+0+16 <= N)\n        wmma::store_matrix_sync(&C[(block_m+wm+0)*N + block_n+wn+0], c00, N, wmma::mem_row_major);\n    if (block_m+wm+0+16 <= M && block_n+wn+16+16 <= N)\n        wmma::store_matrix_sync(&C[(block_m+wm+0)*N + block_n+wn+16], c01, N, wmma::mem_row_major);\n    if (block_m+wm+16+16 <= M && block_n+wn+0+16 <= N)\n        wmma::store_matrix_sync(&C[(block_m+wm+16)*N + block_n+wn+0], c10, N, wmma::mem_row_major);\n    if (block_m+wm+16+16 <= M && block_n+wn+16+16 <= N)\n        wmma::store_matrix_sync(&C[(block_m+wm+16)*N + block_n+wn+16], c11, N, wmma::mem_row_major);\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.019264,
+      "kernel_min_ms": 0.018112,
+      "kernel_max_ms": 0.024064,
+      "cublas_time_ms": 0.01024,
+      "gflops": 1741.8205980066446,
+      "cublas_gflops": 3276.8,
+      "efficiency_pct": 53.156146179401986,
+      "dimensions": {
+        "M": 256,
+        "N": 256,
+        "K": 256
+      }
+    },
+    {
+      "kernel_time_ms": 0.103328,
+      "kernel_min_ms": 0.10288,
+      "kernel_max_ms": 0.104992,
+      "cublas_time_ms": 0.027936,
+      "gflops": 2597.8965624032207,
+      "cublas_gflops": 9608.94387170676,
+      "efficiency_pct": 27.03623412821306,
+      "dimensions": {
+        "M": 512,
+        "N": 512,
+        "K": 512
+      }
+    },
+    {
+      "kernel_time_ms": 0.737888,
+      "kernel_min_ms": 0.735488,
+      "kernel_max_ms": 0.745376,
+      "cublas_time_ms": 0.045312,
+      "gflops": 2910.311114965957,
+      "cublas_gflops": 47393.26553672317,
+      "efficiency_pct": 6.1407693308469575,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 5.757696,
+      "kernel_min_ms": 5.732448,
+      "kernel_max_ms": 6.889056,
+      "cublas_time_ms": 0.2472,
+      "gflops": 2983.809701658441,
+      "cublas_gflops": 69497.85268608415,
+      "efficiency_pct": 4.293384020274775,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 47.934464,
+      "kernel_min_ms": 46.783615,
+      "kernel_max_ms": 49.368031,
+      "cublas_time_ms": 1.935488,
+      "gflops": 2867.226250240328,
+      "cublas_gflops": 71009.97447258778,
+      "efficiency_pct": 4.037779581722246,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    },
+    {
+      "kernel_time_ms": 409.448395,
+      "kernel_min_ms": 403.845032,
+      "kernel_max_ms": 419.253143,
+      "cublas_time_ms": 15.98624,
+      "gflops": 2685.34848640938,
+      "cublas_gflops": 68778.626354665,
+      "efficiency_pct": 3.9043357344214282,
+      "dimensions": {
+        "M": 8192,
+        "N": 8192,
+        "K": 8192
+      }
+    }
+  ],
+  "error": null
+}
