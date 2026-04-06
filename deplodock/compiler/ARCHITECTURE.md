@@ -103,7 +103,23 @@ cuBLAS on sm_120 uses CUTLASS `simt_sgemm_256x128_8x4` (pure FP32, not tensor co
 | 8192 | 16       | 32  | 32x4  | 76%  | 51.4 |
 | 16384| 12       | 64  | 32x4  | 71%  | 48.9 |
 
-Beats cuBLAS at 256 and 512. At 1024+ the ~15-29% gap is confirmed via ncu profiling to be SASS-level instruction scheduling — cuBLAS achieves 65% FMA pipe utilization vs our 54%.
+#### TMA Double-Buffer (FP32-accurate, best at 1024+)
+
+New strategy `tma_db` uses TMA (Tensor Memory Accelerator) for zero-overhead global→shared loading with double-buffer pipelining. TMA loading overlaps with FMA computation on separate hardware.
+
+| Size | BK | Block | Eff vs cuBLAS | TFLOPS |
+|------|-----|-------|--------------|--------|
+| 512  | 64  | 32x8  | **132%** | 13 |
+| **1024** | 64  | 32x8  | **112%** | **54** |
+| 2048 | 32  | 32x8  | 84%  | 57 |
+| **4096** | 32  | 32x8  | **94-97%** | **60-61** |
+| **8192** | 32  | 32x8  | **92-94%** | **55-56** |
+
+Beats cuBLAS at 512 and 1024. Near-parity at 4096-8192. ncu profiling shows TMA eliminated the global memory stall bottleneck (long_scoreboard: 0.29% vs 5.77% for hybrid, matching cuBLAS 0.27%). New bottleneck: shared memory read latency (short_scoreboard: 3.23% vs cuBLAS 0.84%).
+
+#### FP32 Hybrid (older approach)
+
+Beats cuBLAS at 256 and 512. At 1024+ limited to ~91% due to C-level code generation overhead vs cuBLAS's SASS-optimized LDGSTS loading.
 
 The `run_adaptive_benchmark_suite()` function uses a threshold-based strategy map to pick the best config per size.
 
