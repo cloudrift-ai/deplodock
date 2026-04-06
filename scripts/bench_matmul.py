@@ -76,6 +76,7 @@ def main():
     parser.add_argument("--description", type=str, default="", help="Description for trace")
     parser.add_argument("--save", action="store_true", help="Save trace to results dir")
     parser.add_argument("--assume-aligned", action="store_true", help="Skip bounds checks (for pow2 sizes)")
+    parser.add_argument("--k-splits", type=int, default=1, help="K-dimension splitting (for TMA)")
     parser.add_argument(
         "--cublas-math",
         default="default",
@@ -112,20 +113,19 @@ def main():
                 assume_aligned=args.assume_aligned,
             )
 
-        # Adaptive: FP32 for small sizes, BF16 WMMA for large sizes.
-        # BF16 WMMA beats cuBLAS at 512+ but has BF16 accuracy (~0.024% relerr).
-        # FP32 hybrid is exact but slower on sm_120.
-        # Best FP32-accurate config per size (CUDA 13.2, sm_120):
-        def tma(bk, tm=8):
-            return MatmulConfig(strategy="tma_db", block_k=bk, thread_m=tm)
+        # Best FP32-accurate config per size (CUDA 13.2, sm_120, RTX 5090):
+        # TMA double-buffer with K-splitting and size-adaptive thread_m.
+        def tma(bk=32, tm=8, ks=1):
+            return MatmulConfig(strategy="tma_db", block_k=bk, thread_m=tm, k_splits=ks)
 
         strategy_map = [
-            (256, MatmulConfig(strategy="naive", block_m=8, block_n=32)),  # 101%
-            (512, _h(tm=4, bk=256, bn=16)),  # 75%
-            (1024, tma(64)),  # 111%
-            (4096, tma(32)),  # 97%
-            (8192, tma(32)),  # 95%
-            (99999, tma(16, tm=12)),  # 84% at 16K
+            (256, tma(bk=32, tm=8, ks=8)),  # 115% — max K-splits for max parallelism
+            (512, tma(bk=32, tm=8, ks=4)),  # 110%
+            (1024, tma(bk=32, tm=8, ks=1)),  # 100%
+            (2048, tma(bk=32, tm=26, ks=1)),  # 103% — large tile hides latency
+            (4096, tma(bk=32, tm=8, ks=2)),  # 104%
+            (8192, tma(bk=32, tm=28, ks=1)),  # 98%
+            (99999, tma(bk=32, tm=28, ks=4)),  # 92% at 16K
         ]
         suite = run_adaptive_benchmark_suite(
             graph,
@@ -155,6 +155,7 @@ def main():
             coarsen_rows=coarsen_rows,
             coarsen_cols=coarsen_cols,
             assume_aligned=args.assume_aligned,
+            k_splits=args.k_splits,
         )
         suite = run_benchmark_suite(
             graph,

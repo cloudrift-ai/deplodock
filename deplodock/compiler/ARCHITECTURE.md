@@ -103,19 +103,27 @@ cuBLAS on sm_120 uses CUTLASS `simt_sgemm_256x128_8x4` (pure FP32, not tensor co
 | 8192 | 16       | 32  | 32x4  | 76%  | 51.4 |
 | 16384| 12       | 64  | 32x4  | 71%  | 48.9 |
 
-#### TMA Double-Buffer (FP32-accurate, best at 1024+)
+#### TMA Double-Buffer with K-Splitting (FP32-accurate, best overall)
 
-New strategy `tma_db` uses TMA (Tensor Memory Accelerator) for zero-overhead global→shared loading with double-buffer pipelining. TMA loading overlaps with FMA computation on separate hardware.
+Strategy `tma_db` uses TMA (Tensor Memory Accelerator) for zero-overhead global→shared loading with double-buffer pipelining. TMA loading overlaps with FMA computation on separate hardware.
 
-| Size | BK | Block | Eff vs cuBLAS | TFLOPS |
-|------|-----|-------|--------------|--------|
-| 512  | 64  | 32x8  | **132%** | 13 |
-| **1024** | 64  | 32x8  | **112%** | **54** |
-| 2048 | 32  | 32x8  | 84%  | 57 |
-| **4096** | 32  | 32x8  | **94-97%** | **60-61** |
-| **8192** | 32  | 32x8  | **92-94%** | **55-56** |
+Key features:
+- **K-splitting** (`k_splits`): Splits K dimension across gridDim.z for more grid parallelism at small sizes. Split 0 writes directly; subsequent splits use atomicAdd.
+- **Size-adaptive thread_m**: Larger tiles (TM=26-28, giving BM=208-224) for large matrices to increase compute density per thread. Smaller tiles (TM=8, BM=64) with more K-splits for small matrices.
+- **L2 promotion**: CU_TENSOR_MAP_L2_PROMOTION_L2_256B for better cache utilization.
+- **OOB fill**: CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA for correct partial tiles with non-aligned sizes.
 
-Beats cuBLAS at 512 and 1024. Near-parity at 4096-8192. ncu profiling shows TMA eliminated the global memory stall bottleneck (long_scoreboard: 0.29% vs 5.77% for hybrid, matching cuBLAS 0.27%). New bottleneck: shared memory read latency (short_scoreboard: 3.23% vs cuBLAS 0.84%).
+| Size | TM | BK | K-splits | Eff vs cuBLAS | TFLOPS |
+|------|-----|-----|----------|--------------|--------|
+| **256**  | 8  | 32 | 8 | **115%** | 3.3 |
+| **512**  | 8  | 32 | 4 | **108%** | 18.7 |
+| **1024** | 8  | 32 | 1 | **103%** | 42.1 |
+| **2048** | 26 | 32 | 1 | **103%** | 65.8 |
+| **4096** | 8  | 32 | 2 | **100.5%** | 58.0 |
+| 8192 | 28 | 32 | 1 | 97.7% | 62.8 |
+| 16384 | 28 | 32 | 4 | 91.0% | 60.4 |
+
+Beats cuBLAS at 5 of 7 standard sizes (256-4096). ncu profiling shows identical occupancy (16.67%) and compute throughput (~78%) to cuBLAS at large sizes — the remaining 3-9% gap is SASS-level instruction scheduling that can't be closed from C code.
 
 #### FP32 Hybrid (older approach)
 
