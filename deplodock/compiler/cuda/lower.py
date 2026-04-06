@@ -1474,18 +1474,18 @@ const int mb1=(int)__cvta_generic_to_shared(&mbar[1]);
 int tid=threadIdx.y*{tx}+threadIdx.x;
 int tr=threadIdx.y*{tm},tc=threadIdx.x*{tn};
 int bm=blockIdx.y*{bm},bn=blockIdx.x*{bn};
-if(tid==0){{asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb0),"r"(1));asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));asm volatile("fence.mbarrier_init.release.cluster;");}}  # noqa: E501
+if(tid==0){{asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb0),"r"(1));asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));asm volatile("fence.mbarrier_init.release.cluster;");}}
 __syncthreads();
 {acc_decl}
 int bytes=({a_size}+{b_size})*4;
 int p0=0,p1=0,nt=K/{bk};
-if(tid==0){{asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as0),"l"(&{a_name}_tma),"r"(0),"r"(bm),"r"(mb0):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs0),"l"(&{b_name}_tma),"r"(bn),"r"(0),"r"(mb0):"memory");}}  # noqa: E501
+if(tid==0){{asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as0),"l"(&{a_name}_tma),"r"(0),"r"(bm),"r"(mb0):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs0),"l"(&{b_name}_tma),"r"(bn),"r"(0),"r"(mb0):"memory");}}
 for(int t=0;t<nt;t++){{
     int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;
     int nm=s==0?mb1:mb0;int na=s==0?as1:as0;int nb=s==0?bs1:bs0;
-    asm volatile("{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\tmbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}"::"r"(cm),"r"(cp),"r"(0xffffffff));  # noqa: E501
+    asm volatile("{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\tmbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}"::"r"(cm),"r"(cp),"r"(0xffffffff));
     if(s==0)p0^=1;else p1^=1;
-    if(tid==0&&t+1<nt){{int nk=(t+1)*{bk};asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(bytes):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"(&{a_name}_tma),"r"(nk),"r"(bm),"r"(nm):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"(&{b_name}_tma),"r"(bn),"r"(nk),"r"(nm):"memory");}}  # noqa: E501
+    if(tid==0&&t+1<nt){{int nk=(t+1)*{bk};asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(bytes):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"(&{a_name}_tma),"r"(nk),"r"(bm),"r"(nm):"memory");asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"(&{b_name}_tma),"r"(bn),"r"(nk),"r"(nm):"memory");}}
     float*cas=&smem[s*{stage}];float*cbs=&smem[s*{stage}+{a_size}];
     #pragma unroll
     for(int kk=0;kk<{bk};kk++){{
@@ -1493,7 +1493,7 @@ for(int t=0;t<nt;t++){{
     }}
     __syncthreads();
 }}
-#define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);if(gr<M){{int gc=bn+tc;if(gc<N){c_name}[gr*N+gc]=v0;if(gc+1<N){c_name}[gr*N+gc+1]=v1;if(gc+2<N){c_name}[gr*N+gc+2]=v2;if(gc+3<N){c_name}[gr*N+gc+3]=v3;}}}}  # noqa: E501
+#define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);if(gr<M){{int gc=bn+tc;if(gc<N){c_name}[gr*N+gc]=v0;if(gc+1<N){c_name}[gr*N+gc+1]=v1;if(gc+2<N){c_name}[gr*N+gc+2]=v2;if(gc+3<N){c_name}[gr*N+gc+3]=v3;}}}}
 {write_block}"""
 
     return KernelDef(
