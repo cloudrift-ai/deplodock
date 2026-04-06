@@ -1445,12 +1445,11 @@ def _lower_matmul_tma_db(graph, out_node, config):
     b_size = bk * bn
     stage = a_size + b_size
 
-    # Generate FMA block for 8 rows × 4 cols
+    # Generate FMA block: B load first, then interleave A load + FMA per row
     fma_lines = []
-    for i in range(tm):
-        fma_lines.append(f"            float a{i}=cas[(tr+{i})*{bk}+kk];")
     fma_lines.append(f"            float b0=cbs[kk*{bn}+tc],b1=cbs[kk*{bn}+tc+1],b2=cbs[kk*{bn}+tc+2],b3=cbs[kk*{bn}+tc+3];")
     for i in range(tm):
+        fma_lines.append(f"            float a{i}=cas[(tr+{i})*{bk}+kk];")
         fma_lines.append(f"            c{i}0+=a{i}*b0;c{i}1+=a{i}*b1;c{i}2+=a{i}*b2;c{i}3+=a{i}*b3;")
     fma_block = "\n".join(fma_lines)
 
