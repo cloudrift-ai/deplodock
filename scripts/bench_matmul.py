@@ -77,6 +77,7 @@ def main():
     parser.add_argument("--save", action="store_true", help="Save trace to results dir")
     parser.add_argument("--assume-aligned", action="store_true", help="Skip bounds checks (for pow2 sizes)")
     parser.add_argument("--k-splits", type=int, default=1, help="K-dimension splitting (for TMA)")
+    parser.add_argument("--batch", type=int, default=1, help="Batch count for batched GEMM")
     parser.add_argument(
         "--cublas-math",
         default="default",
@@ -156,6 +157,7 @@ def main():
             coarsen_cols=coarsen_cols,
             assume_aligned=args.assume_aligned,
             k_splits=args.k_splits,
+            batch_count=args.batch,
         )
         suite = run_benchmark_suite(
             graph,

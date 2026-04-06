@@ -355,9 +355,39 @@ def generate_benchmark_program(
         stage_size = a_size + b_size
         smem_bytes = 2 * stage_size * 4 + 256
 
-        tma_setup = f"""
+        batch_count = dim_args.get("batch", 1)
+        if kernel.batched and batch_count > 1:
+            # Batched: create per-batch TMA descriptor arrays
+            tma_setup = f"""
+    // Batched TMA descriptor setup ({batch_count} batches)
+    CUtensorMap h_{kernel.tma_params[0]}_descs[{batch_count}], h_{kernel.tma_params[1]}_descs[{batch_count}];
+    for (int b = 0; b < {batch_count}; b++) {{
+        uint64_t da[2]={{(uint64_t)K,(uint64_t)M}};
+        uint64_t sa[1]={{(uint64_t)K*sizeof(float)}};
+        uint32_t ba[2]={{{bk_val},{tile_m}}};
+        uint32_t ea[2]={{1,1}};
+        cuTensorMapEncodeTiled(&h_{kernel.tma_params[0]}_descs[b],CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,
+            d_A+b*M*K,da,sa,ba,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
+        uint64_t db[2]={{(uint64_t)N,(uint64_t)K}};
+        uint64_t sb[1]={{(uint64_t)N*sizeof(float)}};
+        uint32_t bb[2]={{{tile_n},{bk_val}}};
+        cuTensorMapEncodeTiled(&h_{kernel.tma_params[1]}_descs[b],CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,
+            d_B+b*K*N,db,sb,bb,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
+    }}
+    CUtensorMap *d_{kernel.tma_params[0]}_descs, *d_{kernel.tma_params[1]}_descs;
+    cudaMalloc(&d_{kernel.tma_params[0]}_descs, {batch_count}*sizeof(CUtensorMap));
+    cudaMalloc(&d_{kernel.tma_params[1]}_descs, {batch_count}*sizeof(CUtensorMap));
+    cudaMemcpy(d_{kernel.tma_params[0]}_descs, h_{kernel.tma_params[0]}_descs, {batch_count}*sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_{kernel.tma_params[1]}_descs, h_{kernel.tma_params[1]}_descs, {batch_count}*sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    cudaFuncSetAttribute({kernel.name},cudaFuncAttributeMaxDynamicSharedMemorySize,{smem_bytes});
+"""
+            tma_launch_prefix = f"d_{kernel.tma_params[0]}_descs, d_{kernel.tma_params[1]}_descs, "
+        else:
+            # Single: one TMA descriptor per matrix
+            tma_setup = f"""
     // TMA descriptor setup
-    // Note: TMA requires K and N to be multiples of 4 (16-byte alignment for FLOAT32)
     CUtensorMap {kernel.tma_params[0]}_desc, {kernel.tma_params[1]}_desc;
     {{
         uint64_t da[2]={{(uint64_t)K,(uint64_t)M}};
@@ -379,7 +409,7 @@ def generate_benchmark_program(
     }}
     cudaFuncSetAttribute({kernel.name},cudaFuncAttributeMaxDynamicSharedMemorySize,{smem_bytes});
 """
-        tma_launch_prefix = f"{kernel.tma_params[0]}_desc, {kernel.tma_params[1]}_desc, "
+            tma_launch_prefix = f"{kernel.tma_params[0]}_desc, {kernel.tma_params[1]}_desc, "
         tma_smem_attr = f", {smem_bytes}"
 
     # Build launch args with TMA prefix
@@ -400,26 +430,28 @@ def generate_benchmark_program(
 {kernel_source}
 
 int main() {{
+    int BATCH = {dim_args.get("batch", 1)};
 
     float *d_A, *d_B, *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(float));
-    cudaMalloc(&d_B, K * N * sizeof(float));
-    cudaMalloc(&d_C, M * N * sizeof(float));
+    cudaMalloc(&d_A, BATCH * M * K * sizeof(float));
+    cudaMalloc(&d_B, BATCH * K * N * sizeof(float));
+    cudaMalloc(&d_C, BATCH * M * N * sizeof(float));
 
     // Random initialization
     curandGenerator_t gen;
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
     curandSetPseudoRandomGeneratorSeed(gen, 42);
-    curandGenerateUniform(gen, d_A, M * K);
-    curandGenerateUniform(gen, d_B, K * N);
+    curandGenerateUniform(gen, d_A, BATCH * M * K);
+    curandGenerateUniform(gen, d_B, BATCH * K * N);
     curandDestroyGenerator(gen);
 {tma_setup}
     dim3 block({bx}, {by});
     int k_splits_val = {dim_args.get("k_splits", 1)};
-    dim3 grid({grid_x}, {grid_y}, k_splits_val);
+    int grid_z = BATCH > 1 ? BATCH : k_splits_val;
+    dim3 grid({grid_x}, {grid_y}, grid_z);
 
     // Zero output for K-splitting atomicAdd
-    if (k_splits_val > 1) cudaMemset(d_C, 0, M * N * sizeof(float));
+    if (k_splits_val > 1) cudaMemset(d_C, 0, BATCH * M * N * sizeof(float));
 
     // Warmup both kernels
     {kernel.name}{launch_suffix}({full_args});
@@ -431,11 +463,13 @@ int main() {{
     cublasCreate(&handle);
     {"cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);" if cublas_math_mode == "pedantic" else "// default math mode"}
     float *d_C_ref;
-    cudaMalloc(&d_C_ref, {m * n} * sizeof(float));
+    cudaMalloc(&d_C_ref, BATCH * {m * n} * sizeof(float));
     float alpha = 1.0f, beta_val = 0.0f;
-    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+    {"cublasSgemmStridedBatched" if dim_args.get("batch", 1) > 1 else "cublasSgemm"}(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 {n}, {m}, {k}, &alpha,
-                d_B, {n}, d_A, {k}, &beta_val, d_C_ref, {n});
+                d_B, {n}, {"(long long)" + str(k * n) + "," if dim_args.get("batch", 1) > 1 else ""}
+                d_A, {k}, {"(long long)" + str(m * k) + "," if dim_args.get("batch", 1) > 1 else ""}
+                &beta_val, d_C_ref, {n}{",(long long)" + str(m * n) + ",BATCH" if dim_args.get("batch", 1) > 1 else ""});
     cudaDeviceSynchronize();
 '''
         if compare_cublas
@@ -457,7 +491,7 @@ int main() {{
 {f"    float cublas_times[{num_iterations}];" if compare_cublas else ""}
     for (int iter = 0; iter < {num_iterations}; iter++) {{
         // Our kernel
-        if (k_splits_val > 1) cudaMemset(d_C, 0, M * N * sizeof(float));
+        if (k_splits_val > 1) cudaMemset(d_C, 0, BATCH * M * N * sizeof(float));
         cudaEventRecord(start);
         {kernel.name}{launch_suffix}({full_args});
         cudaEventRecord(stop);
@@ -467,9 +501,11 @@ int main() {{
         f'''
         // cuBLAS (same thermal state as our kernel)
         cudaEventRecord(cb_start);
-        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        {"cublasSgemmStridedBatched" if dim_args.get("batch", 1) > 1 else "cublasSgemm"}(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                     {n}, {m}, {k}, &alpha,
-                    d_B, {n}, d_A, {k}, &beta_val, d_C_ref, {n});
+                    d_B, {n}, {"(long long)" + str(k * n) + "," if dim_args.get("batch", 1) > 1 else ""}
+                    d_A, {k}, {"(long long)" + str(m * k) + "," if dim_args.get("batch", 1) > 1 else ""}
+                    &beta_val, d_C_ref, {n}{",(long long)" + str(m * n) + ",BATCH" if dim_args.get("batch", 1) > 1 else ""});
         cudaEventRecord(cb_stop);
         cudaEventSynchronize(cb_stop);
         cudaEventElapsedTime(&cublas_times[iter], cb_start, cb_stop);
@@ -634,7 +670,8 @@ def run_benchmark(
         m = dim_args.get("M", 1)
         n = dim_args.get("N", 1)
         k = dim_args.get("K", 1)
-        flops = 2.0 * m * n * k
+        batch = dim_args.get("batch", 1)
+        flops = 2.0 * m * n * k * batch
         gflops = (flops / (kernel_median * 1e-3)) / 1e9 if kernel_median > 0 else 0.0
         cublas_gflops = None
         efficiency = None

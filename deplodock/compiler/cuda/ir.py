@@ -204,3 +204,4 @@ class KernelDef:
     tile_m: int | None = None  # Output tile rows per block (overrides grid computation)
     tile_n: int | None = None  # Output tile cols per block
     tma_params: list[str] | None = None  # TMA descriptor param names (e.g. ["A_tma", "B_tma"])
+    batched: bool = False  # Batched GEMM: TMA descriptors are per-batch arrays

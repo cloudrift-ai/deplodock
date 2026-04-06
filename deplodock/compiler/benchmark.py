@@ -127,9 +127,11 @@ def run_benchmark_suite(
         # Benchmark each size.
         for dim_args in sizes:
             m, n = dim_args.get("M", 0), dim_args.get("N", 0)
-            # Add k_splits to dim_args if configured
+            # Add k_splits/batch to dim_args if configured
             if config.k_splits > 1:
                 dim_args = {**dim_args, "k_splits": config.k_splits}
+            if config.batch_count > 1:
+                dim_args = {**dim_args, "batch": config.batch_count}
             logger.info("Benchmarking %dx%d ...", m, n)
             try:
                 result = run_benchmark(
@@ -222,10 +224,12 @@ def run_adaptive_benchmark_suite(
             kernel, source, cfg = kernels[id(selected)]
             suite.cuda_kernel = source  # Last kernel used.
 
-            # Add k_splits to dim_args if configured
+            # Add k_splits/batch to dim_args if configured
             run_dim_args = dim_args
             if selected.k_splits > 1:
                 run_dim_args = {**dim_args, "k_splits": selected.k_splits}
+            if selected.batch_count > 1:
+                run_dim_args = {**run_dim_args, "batch": selected.batch_count}
             logger.info("Benchmarking %dx%d with %s ...", m, n, selected.strategy)
             try:
                 result = run_benchmark(

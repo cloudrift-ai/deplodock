@@ -56,7 +56,10 @@ def emit_kernel(kernel: KernelDef) -> str:
     param_parts = []
     if kernel.tma_params:
         for tp in kernel.tma_params:
-            param_parts.append(f"const __grid_constant__ CUtensorMap {tp}")
+            if kernel.batched:
+                param_parts.append(f"const CUtensorMap* {tp}")
+            else:
+                param_parts.append(f"const __grid_constant__ CUtensorMap {tp}")
     param_parts.extend(f"{p.dtype} {p.name}" for p in kernel.params)
     params = ", ".join(param_parts)
     body = "\n".join(_emit_stmt(s, indent=1) for s in kernel.body)
