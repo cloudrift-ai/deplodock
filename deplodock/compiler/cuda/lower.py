@@ -1511,4 +1511,5 @@ for(int t=0;t<nt;t++){{
         includes=["cuda.h"],
         tile_m=bm,
         tile_n=bn,
+        tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
     )
