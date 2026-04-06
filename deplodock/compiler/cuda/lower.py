@@ -1475,16 +1475,7 @@ const int mb0=(int)__cvta_generic_to_shared(&mbar[0]);
 const int mb1=(int)__cvta_generic_to_shared(&mbar[1]);
 int tid=threadIdx.y*{tx}+threadIdx.x;
 int tr=threadIdx.y*{tm},tc=threadIdx.x*{tn};
-int bm,bn;
-// CTA rasterization for L2 reuse at large sizes (>= 8192 blocks)
-if(gridDim.x*gridDim.y>=8192){{
-int ntx=(N+{bn - 1})/{bn};int nty=(M+{bm - 1})/{bm};
-int grp=8;int pid=blockIdx.x+blockIdx.y*gridDim.x;
-int gid=pid/(grp*ntx);int rem=pid%(grp*ntx);
-int by_r=gid*grp+rem%grp;int bx_r=rem/grp;
-if(bx_r>=ntx)bx_r=ntx-1;if(by_r>=nty)by_r=nty-1;
-bm=by_r*{bm};bn=bx_r*{bn};
-}}else{{bm=blockIdx.y*{bm};bn=blockIdx.x*{bn};}}
+int bm=blockIdx.y*{bm},bn=blockIdx.x*{bn};
 int k_per_split=(K/{bk}/k_splits)*{bk};
 int k_start=blockIdx.z*k_per_split;
 int k_end=(blockIdx.z==k_splits-1)?K:k_start+k_per_split;

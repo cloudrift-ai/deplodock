@@ -121,7 +121,7 @@ Key features:
 | **2048** | 26 | 32 | 1 | **105%** | 71.8 |
 | **4096** | 20 | 32 | 1 | **100.3%** | 66.5 |
 | 8192 | 28 | 32 | 1 | 97% | 60.0 |
-| 16384 | 28 | 32 | 1 | 90.5% | 57.0 |
+| 16384 | 28 | 32 | 1 | 90% | 57.2 |
 
 Consistently beats cuBLAS at 1024, 2048, and 4096. ncu profiling shows identical occupancy (16.67%) and compute throughput (~78%) to cuBLAS at large sizes — the remaining 3-11% gap is SASS-level instruction scheduling from C code vs cuBLAS's hand-optimized SASS (confirmed: zero bank conflicts in cuBLAS vs 6.4M in ours, but the stall impact is <0.2% of total time).
 
