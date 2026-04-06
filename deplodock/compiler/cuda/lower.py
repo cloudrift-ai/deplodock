@@ -1493,7 +1493,17 @@ const int mb0=(int)__cvta_generic_to_shared(&mbar[0]);
 const int mb1=(int)__cvta_generic_to_shared(&mbar[1]);
 int tid=threadIdx.y*{tx}+threadIdx.x;
 int tr=threadIdx.y*{tm},tc=threadIdx.x*{tn};
-int bm=blockIdx.y*{bm},bn=blockIdx.x*{bn};
+// CTA swizzle: rasterize in groups of SWIZ row-blocks for L2 A-tile reuse
+const int SWIZ=8;
+int ntx=(N+{bn - 1})/{bn};
+int nty=(M+{bm - 1})/{bm};
+int pid=blockIdx.x+blockIdx.y*gridDim.x;
+int grp=pid/(ntx*SWIZ);
+int rem=pid%(ntx*SWIZ);
+int by_s=grp*SWIZ+rem%SWIZ;
+int bx_s=rem/SWIZ;
+if(by_s>=nty||bx_s>=ntx)return;
+int bm=by_s*{bm},bn=bx_s*{bn};
 {k_range_code}
 if(tid==0){{asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb0),"r"(1));asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));asm volatile("fence.mbarrier_init.release.cluster;");}}
 __syncthreads();

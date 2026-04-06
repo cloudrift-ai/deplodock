@@ -303,8 +303,12 @@ def generate_benchmark_program(
 
     bx, by, _bz = kernel.block_size
     if kernel.tile_m and kernel.tile_n:
-        grid_x = f"({n} + {kernel.tile_n - 1}) / {kernel.tile_n}"
-        grid_y = f"({m} + {kernel.tile_m - 1}) / {kernel.tile_m}"
+        # Linearized grid for CTA swizzle: pad nty to multiple of SWIZ=8
+        # Total blocks = ntx * ceil(nty/8)*8, launched as (total, 1)
+        ntx = f"(({n} + {kernel.tile_n - 1}) / {kernel.tile_n})"
+        nty = f"(({m} + {kernel.tile_m - 1}) / {kernel.tile_m})"
+        grid_x = f"({ntx} * (({nty} + 7) / 8) * 8)"
+        grid_y = "1"
     else:
         effective_n = f"(({n} + {coarsen_cols - 1}) / {coarsen_cols})"
         effective_m = f"(({m} + {coarsen_rows - 1}) / {coarsen_rows})"
