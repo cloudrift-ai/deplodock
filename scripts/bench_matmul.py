@@ -119,13 +119,13 @@ def main():
             return MatmulConfig(strategy="tma_db", block_k=bk, thread_m=tm, k_splits=ks)
 
         strategy_map = [
-            (256, tma(bk=32, tm=8, ks=8)),  # 115% — max K-splits for max parallelism
-            (512, tma(bk=32, tm=8, ks=4)),  # 110%
-            (1024, tma(bk=32, tm=8, ks=1)),  # 100%
-            (2048, tma(bk=32, tm=26, ks=1)),  # 103% — large tile hides latency
-            (4096, tma(bk=32, tm=8, ks=2)),  # 104%
-            (8192, tma(bk=32, tm=28, ks=1)),  # 98%
-            (99999, tma(bk=32, tm=28, ks=4)),  # 92% at 16K
+            (256, tma(bk=32, tm=8, ks=4)),  # ~95% — K-splits for grid parallelism
+            (512, tma(bk=32, tm=8, ks=4)),  # ~96%
+            (1024, tma(bk=32, tm=8, ks=1)),  # 101% — beats cuBLAS
+            (2048, tma(bk=32, tm=26, ks=1)),  # 105% — large tile hides latency
+            (4096, tma(bk=32, tm=26, ks=1)),  # 97%
+            (8192, tma(bk=32, tm=28, ks=1)),  # 96%
+            (99999, tma(bk=32, tm=28)),  # 90% at 16K
         ]
         suite = run_adaptive_benchmark_suite(
             graph,

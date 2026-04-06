@@ -1499,7 +1499,7 @@ for(int t=0;t<nt;t++){{
     __syncthreads();
 }}
 #define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);if(gr<M){{int gc=bn+tc; \
-if(blockIdx.z==0){{if(gc<N){c_name}[gr*N+gc]=v0;if(gc+1<N){c_name}[gr*N+gc+1]=v1;if(gc+2<N){c_name}[gr*N+gc+2]=v2;if(gc+3<N){c_name}[gr*N+gc+3]=v3;}} \
+if(k_splits==1){{if(gc<N){c_name}[gr*N+gc]=v0;if(gc+1<N){c_name}[gr*N+gc+1]=v1;if(gc+2<N){c_name}[gr*N+gc+2]=v2;if(gc+3<N){c_name}[gr*N+gc+3]=v3;}} \
 else{{if(gc<N)atomicAdd(&{c_name}[gr*N+gc],v0);if(gc+1<N)atomicAdd(&{c_name}[gr*N+gc+1],v1);if(gc+2<N)atomicAdd(&{c_name}[gr*N+gc+2],v2);if(gc+3<N)atomicAdd(&{c_name}[gr*N+gc+3],v3);}}}}}}
 {write_block}"""
 
