@@ -123,7 +123,7 @@ def main():
             (512, tma(bk=32, tm=8, ks=4)),  # ~96%
             (1024, tma(bk=32, tm=8, ks=1)),  # 101% — beats cuBLAS
             (2048, tma(bk=32, tm=26, ks=1)),  # 105% — large tile hides latency
-            (4096, tma(bk=32, tm=26, ks=1)),  # 97%
+            (4096, tma(bk=32, tm=20, ks=1)),  # 99% — sweet spot tile size
             (8192, tma(bk=32, tm=28, ks=1)),  # 96%
             (99999, tma(bk=32, tm=28)),  # 90% at 16K
         ]

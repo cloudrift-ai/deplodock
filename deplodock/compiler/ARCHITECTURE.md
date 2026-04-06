@@ -115,15 +115,15 @@ Key features:
 
 | Size | TM | BK | K-splits | Eff vs cuBLAS | TFLOPS |
 |------|-----|-----|----------|--------------|--------|
-| **256**  | 8  | 32 | 8 | **115%** | 3.3 |
-| **512**  | 8  | 32 | 4 | **108%** | 18.7 |
-| **1024** | 8  | 32 | 1 | **103%** | 42.1 |
-| **2048** | 26 | 32 | 1 | **103%** | 65.8 |
-| **4096** | 8  | 32 | 2 | **100.5%** | 58.0 |
-| 8192 | 28 | 32 | 1 | 97.7% | 62.8 |
-| 16384 | 28 | 32 | 4 | 91.0% | 60.4 |
+| 256  | 8  | 32 | 4 | ~95% | 4.1 |
+| 512  | 8  | 32 | 4 | ~94% | 18.7 |
+| **1024** | 8  | 32 | 1 | **101%** | 49.3 |
+| **2048** | 26 | 32 | 1 | **105%** | 72.1 |
+| 4096 | 20 | 32 | 1 | 99-102% | 67.0 |
+| 8192 | 28 | 32 | 1 | 96% | 60.8 |
+| 16384 | 28 | 32 | 1 | 89% | 57.0 |
 
-Beats cuBLAS at 5 of 7 standard sizes (256-4096). ncu profiling shows identical occupancy (16.67%) and compute throughput (~78%) to cuBLAS at large sizes — the remaining 3-9% gap is SASS-level instruction scheduling that can't be closed from C code.
+Consistently beats cuBLAS at 1024 and 2048. Near-parity at 4096 (99-102%). ncu profiling shows identical occupancy (16.67%) and compute throughput (~78%) to cuBLAS at large sizes — the remaining 3-10% gap is SASS-level instruction scheduling from C code vs cuBLAS's hand-optimized SASS.
 
 #### FP32 Hybrid (older approach)
 
