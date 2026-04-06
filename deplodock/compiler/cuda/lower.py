@@ -1486,15 +1486,9 @@ if(gc<N)atomicAdd(&Cout[gr*N+gc],v0);if(gc+1<N)atomicAdd(&Cout[gr*N+gc+1],v1);if
         nt_expr = f"K/{bk}"
         first_k = "0"
         next_k = f"(t+1)*{bk}"
-        # Float4 write when N is 4-aligned (checked at compile time via #if);
-        # scalar fallback for non-aligned N.
-        write_macro = f"""#if (N % 4 == 0)
-#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
-if(gc<N)*reinterpret_cast<float4*>(&Cout[gr*N+gc])=make_float4(v0,v1,v2,v3);}}}}}}}}
-#else
-#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
-if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}}}}}
-#endif"""
+        # nvcc auto-vectorizes these 4 scalar stores to STG.E.128 (float4)
+        write_macro = f"""#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
+if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}}}}}"""
 
     kernel_code = f"""\
 extern __shared__ __align__(128) char dsmem[];
