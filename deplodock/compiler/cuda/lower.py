@@ -1518,8 +1518,6 @@ for(int t=0;t<nt;t++){{
 {write_block}"""
 
     params = [
-        KernelParam("float*", a_name),
-        KernelParam("float*", b_name),
         KernelParam("float*", c_name),
     ]
     if use_k_splits:
