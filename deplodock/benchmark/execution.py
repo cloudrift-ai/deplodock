@@ -76,6 +76,7 @@ async def run_execution_group(
     dry_run: bool = False,
     no_teardown: bool = False,
     on_task_done: OnTaskDone | None = None,
+    preallocated_conn=None,
 ) -> tuple[list[tuple[BenchmarkTask, bool]], dict | None]:
     """Run all benchmark tasks for one execution group.
 
@@ -87,6 +88,10 @@ async def run_execution_group(
         on_task_done: Optional async callback invoked after each task completes
             (success or failure). Receives (task, success). Exceptions are
             caught and logged, never propagated.
+        preallocated_conn: Optional VMConnectionInfo for a pre-existing host.
+            When provided, cloud provisioning and VM deletion are skipped, and
+            remote provisioning (docker install) is also skipped — the host is
+            assumed to be already set up.
 
     Returns:
         A tuple of (task_results, instance_info). task_results is a list of
@@ -117,25 +122,29 @@ async def run_execution_group(
 
     conn = None
     try:
-        conn = await provision_cloud_vm(
-            group.gpu_name,
-            group.gpu_count,
-            ssh_key,
-            providers_config,
-            server_name=group_label,
-            dry_run=dry_run,
-            logger=logger,
-        )
-        if conn is None:
-            logger.error("VM provisioning failed")
-            for task in group.tasks:
-                task_results.append((task, False))
-                await _invoke_callback(on_task_done, task, False, logger)
-            return task_results, None
+        if preallocated_conn is not None:
+            conn = preallocated_conn
+            logger.info(f"Using pre-allocated host: {conn.address}:{conn.ssh_port}")
+        else:
+            conn = await provision_cloud_vm(
+                group.gpu_name,
+                group.gpu_count,
+                ssh_key,
+                providers_config,
+                server_name=group_label,
+                dry_run=dry_run,
+                logger=logger,
+            )
+            if conn is None:
+                logger.error("VM provisioning failed")
+                for task in group.tasks:
+                    task_results.append((task, False))
+                    await _invoke_callback(on_task_done, task, False, logger)
+                return task_results, None
 
-        instance_id_str = f" (instance_id={conn.delete_info[1]})" if conn.delete_info else ""
-        logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}{instance_id_str}")
-        await provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+            instance_id_str = f" (instance_id={conn.delete_info[1]})" if conn.delete_info else ""
+            logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}{instance_id_str}")
+            await provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
 
         # Collect system info once per execution group
         sysinfo_run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
@@ -266,7 +275,9 @@ async def run_execution_group(
         if group_handler is not None:
             logging.getLogger().removeHandler(group_handler)
             group_handler.close()
-        if conn is not None and conn.delete_info:
+        if preallocated_conn is not None:
+            logger.info(f"Leaving pre-allocated host in place: {conn.address}")
+        elif conn is not None and conn.delete_info:
             if no_teardown:
                 instance_info = _build_instance_info(group, group_label, conn)
                 logger.info(f"Skipping VM deletion (--no-teardown): {conn.address}")
@@ -280,6 +291,56 @@ async def run_execution_group(
 
     logger.info(f"Completed group: {group_label}")
     return task_results, instance_info
+
+
+async def _run_groups_on_hosts(
+    groups,
+    hosts: list,
+    config,
+    ssh_key,
+    dry_run,
+    on_task_done: OnTaskDone | None = None,
+):
+    """Run execution groups on a fixed pool of pre-allocated hosts.
+
+    Each group is dispatched to any host whose detected GPU matches the
+    group's (gpu_name, gpu_count) requirement. Hosts run at most one group
+    at a time; groups are queued until a compatible host is free.
+    """
+    # Per-host lock so each host serializes its groups.
+    locks: dict[int, asyncio.Lock] = {id(h): asyncio.Lock() for h in hosts}
+    # Global lock to make host selection atomic.
+    select_lock = asyncio.Lock()
+    in_use: set[int] = set()
+
+    async def _acquire_host(group):
+        while True:
+            async with select_lock:
+                for h in hosts:
+                    if id(h) in in_use:
+                        continue
+                    if dry_run or h.satisfies(group.gpu_name, group.gpu_count):
+                        in_use.add(id(h))
+                        return h
+            await asyncio.sleep(0.05)
+
+    async def _run_one(group):
+        host = await _acquire_host(group)
+        try:
+            async with locks[id(host)]:
+                return await run_execution_group(
+                    group,
+                    config,
+                    ssh_key,
+                    dry_run,
+                    no_teardown=True,  # never delete fixed hosts
+                    on_task_done=on_task_done,
+                    preallocated_conn=host.conn,
+                )
+        finally:
+            in_use.discard(id(host))
+
+    return await asyncio.gather(*(_run_one(g) for g in groups), return_exceptions=True)
 
 
 async def _run_groups(

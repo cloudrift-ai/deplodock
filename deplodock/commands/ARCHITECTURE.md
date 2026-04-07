@@ -138,6 +138,19 @@ For each task in group:
 delete_cloud_vm(conn.delete_info) (skipped with --no-teardown; writes instances.json)
 ```
 
+### Fixed-host mode (`--local` / `--ssh`)
+
+When the user supplies pre-allocated hosts via `--local` and/or `--ssh user@host[:port]`,
+`bench` skips cloud provisioning entirely. `benchmark/fixed_hosts.py` resolves each host
+into an `AllocatedHost(conn, gpu_name, gpu_count)` (GPU detected via PCI sysfs through the
+existing `detect_local_gpus()` / `detect_remote_gpus()` helpers), then validates that every
+planned `ExecutionGroup` can run on at least one supplied host. The dispatcher
+`_run_groups_on_hosts()` routes each group to a compatible idle host (locking per-host so
+each runs at most one group at a time) and calls `run_execution_group(...,
+preallocated_conn=host.conn)` — which skips both `provision_cloud_vm()` and
+`delete_cloud_vm()`, and also skips the docker/NVIDIA-toolkit `provision_remote()` step
+(fixed hosts are assumed to be already set up).
+
 ## CLI Command Tree
 
 ```
