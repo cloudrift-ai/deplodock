@@ -162,6 +162,31 @@ matrices:
 
 These flags must **not** appear in `extra_args` — `load_recipe()` validates this and raises an error on duplicates.
 
+### Command Recipes (Generic Workload)
+
+A recipe may declare a `command` block instead of `engine.llm` to run an arbitrary tool on the provisioned VM (e.g. a microbenchmark, a profiling sweep, or `nvidia-smi`). The harness expands the matrix, renders the command template per variant, runs it on the VM, and pulls back result files.
+
+```yaml
+command:
+  stage: ["scripts"]              # repo paths to ship to the VM; empty = no staging
+  run: |
+    nvidia-smi --query-gpu=name,memory.used --format=csv > $task_dir/result.csv
+    echo "marker,$marker" >> $task_dir/result.csv
+  result_files:                    # filenames or shell globs (expanded on the remote)
+    - result.csv
+    - "*.log"
+  timeout: 60
+
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    marker: [a, b, c]
+```
+
+The `run` template uses `string.Template` `$var` syntax. Substitution variables are the variant params (flattened to leaf names — `deploy.gpu` → `gpu`, `marker` → `marker`) plus harness-injected `$task_dir`, `$gpu_device_ids`, and `$repo_dir` (when staging is configured). `command` and `engine.llm` are mutually exclusive.
+
+Staging uses `git ls-files --cached --others --exclude-standard <paths>` so unversioned edits ride along without a commit, while gitignored files are excluded. Each pulled result file lands in the run directory as `{variant}_{basename}`.
+
 ## Experiments
 
 Experiments are self-contained parameter sweeps that live in `experiments/`. Each experiment directory contains a `recipe.yaml` and stores its results alongside it. The directory structure follows `experiments/{model_name}/{experiment_name}/`.

@@ -257,3 +257,43 @@ def test_load_recipe_rejects_banned_extra_args(tmp_path):
 
     with pytest.raises(ValueError, match="--max-model-len"):
         load_recipe(str(tmp_path))
+
+
+# ── command recipes ────────────────────────────────────────────────
+
+
+def test_load_recipe_command_only(tmp_path):
+    recipe = {
+        "command": {
+            "run": "nvidia-smi > $task_dir/result.csv",
+            "result_files": ["result.csv"],
+        },
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    r = load_recipe(str(tmp_path))
+    assert r.kind == "command"
+    assert r.command.run == "nvidia-smi > $task_dir/result.csv"
+
+
+def test_load_recipe_command_and_engine_mutually_exclusive(tmp_path):
+    recipe = {
+        "command": {"run": "echo hi"},
+        "engine": {"llm": {"vllm": {}}},
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    with pytest.raises(ValueError, match="exactly one"):
+        load_recipe(str(tmp_path))
+
+
+def test_load_recipe_command_skips_extra_args_validation(tmp_path):
+    recipe = {
+        "command": {"run": "echo hi"},
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090"},
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    r = load_recipe(str(tmp_path))
+    assert r.kind == "command"

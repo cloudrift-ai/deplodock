@@ -13,7 +13,13 @@ from deplodock.provisioning.ssh_transport import (
     make_run_cmd,
     make_write_file,
     scp_file,
+    scp_from_remote,
     ssh_base_args,
+)
+from deplodock.provisioning.staging import (
+    build_stage_tar,
+    enumerate_staged_files,
+    stage_to_remote,
 )
 from deplodock.provisioning.types import VMConnectionInfo
 
@@ -26,6 +32,10 @@ __all__ = [
     "make_run_cmd",
     "make_write_file",
     "scp_file",
+    "scp_from_remote",
+    "stage_to_remote",
+    "enumerate_staged_files",
+    "build_stage_tar",
     "REMOTE_DEPLOY_DIR",
     "resolve_vm_spec",
     "provision_cloud_vm",
