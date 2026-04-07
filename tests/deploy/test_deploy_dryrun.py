@@ -195,8 +195,33 @@ def test_ssh_help(run_cli):
     assert "--ssh" in stdout
     assert "--ssh-key" in stdout
     assert "USER@HOST" in stdout
-    assert "--ssh-port" not in stdout
-    assert "--server" not in stdout
+    # Deprecated flags are still listed but marked as such.
+    assert "--server" in stdout
+    assert "--ssh-port" in stdout
+    assert "DEPRECATED" in stdout
+
+
+def test_ssh_deploy_legacy_server_flag(run_cli, recipes_dir):
+    """The deprecated --server / --ssh-port flags still work and warn."""
+    rc, stdout, stderr = run_cli(
+        "deploy",
+        "ssh",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--server",
+        "user@1.2.3.4",
+        "--ssh-port",
+        "2222",
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    combined = stdout + stderr
+    assert "deprecated" in combined.lower()
+    assert "docker compose up -d" in stdout
 
 
 def test_bench_help(run_cli):

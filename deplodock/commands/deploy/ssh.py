@@ -26,8 +26,21 @@ def handle_ssh(args):
 
 
 async def _handle_ssh(args):
-    user, host, port = parse_ssh_target(args.ssh)
-    server = f"{user}@{host}"
+    if args.ssh:
+        if args.server is not None or args.ssh_port is not None:
+            logger.error("--ssh cannot be combined with --server / --ssh-port")
+            sys.exit(2)
+        user, host, port = parse_ssh_target(args.ssh)
+        server = f"{user}@{host}"
+    elif args.server:
+        logger.warning("--server is deprecated; use --ssh USER@HOST[:PORT] instead. This flag will be removed in a future release.")
+        if args.ssh_port is not None:
+            logger.warning("--ssh-port is deprecated; encode the port in --ssh USER@HOST:PORT.")
+        server = args.server
+        port = args.ssh_port if args.ssh_port is not None else 22
+    else:
+        logger.error("--ssh USER@HOST[:PORT] is required")
+        sys.exit(2)
 
     # GPU detection (overridable via CLI flags)
     if not args.gpu or not args.gpu_count:
@@ -72,11 +85,14 @@ def register_ssh_target(subparsers):
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.add_argument(
         "--ssh",
-        required=True,
+        default=None,
         metavar="USER@HOST[:PORT]",
         help="SSH target (e.g. user@host or user@host:2222). Default port: 22",
     )
     parser.add_argument("--ssh-key", default="~/.ssh/id_ed25519", help="SSH key path")
+    # Deprecated — kept for backwards compatibility. Prefer --ssh USER@HOST[:PORT].
+    parser.add_argument("--server", default=None, help="[DEPRECATED] SSH address (user@host); use --ssh instead")
+    parser.add_argument("--ssh-port", type=int, default=None, help="[DEPRECATED] SSH port; encode it in --ssh USER@HOST:PORT")
     parser.add_argument("--gpu", default=None, help="Override GPU name (skips detection)")
     parser.add_argument("--gpu-count", type=int, default=None, help="Override GPU count (skips count detection)")
     parser.add_argument(
