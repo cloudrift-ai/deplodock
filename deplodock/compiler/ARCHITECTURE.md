@@ -133,6 +133,12 @@ Beats cuBLAS at 256 and 512. At 1024+ limited to ~91% due to C-level code genera
 
 The `run_adaptive_benchmark_suite()` function uses a threshold-based strategy map to pick the best config per size.
 
+#### Per-GPU Tuning Profiles
+
+`deplodock/compiler/cuda/tuning.py` holds the empirically-tuned `tma_db` strategy maps and dispatches by GPU name (from `nvidia-smi --query-gpu=name`). Both the RTX 5090 and the RTX PRO 6000 Blackwell report `sm_120` and identical per-SM smem, so compute capability cannot distinguish them — the meaningful differences are SM count, clocks, and how the SASS scheduler reacts to large thread tiles. The largest divergence measured is at 4096 (5090 prefers TM=20, Pro 6000 prefers TM=24, ~7% gap if you pick the wrong one).
+
+Unknown GPUs fall back to the 5090 profile. To add a new GPU, sweep `--strategy tma_db --thread-m N` per size and append a new entry to `_PROFILES` in `tuning.py`.
+
 ### Non-Aligned Size Support
 
 All float4 strategies support non-power-of-2 and non-rectangular matrices:

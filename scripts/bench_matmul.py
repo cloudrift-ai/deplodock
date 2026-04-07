@@ -26,6 +26,7 @@ from deplodock.compiler.benchmark import (
     run_benchmark_suite,
 )
 from deplodock.compiler.cuda.lower import MatmulConfig
+from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp
 from deplodock.compiler.rewriter import Rewriter
@@ -101,33 +102,8 @@ def main():
     output_dir = RESULTS_DIR if args.save else None
 
     if args.strategy == "adaptive":
-        # Best config per size from empirical tuning on RTX 5090 sm_120.
-        def _h(tm, bk, bm=4, bn=32):
-            return MatmulConfig(
-                strategy="hybrid_smem_f4",
-                block_m=bm,
-                block_n=bn,
-                thread_m=tm,
-                block_k=bk,
-                coarsen_rows=tm,
-                coarsen_cols=4,
-                assume_aligned=args.assume_aligned,
-            )
-
-        # Best FP32-accurate config per size (CUDA 13.2, sm_120, RTX 5090):
-        # TMA double-buffer with K-splitting and size-adaptive thread_m.
-        def tma(bk=32, tm=8, ks=1):
-            return MatmulConfig(strategy="tma_db", block_k=bk, thread_m=tm, k_splits=ks)
-
-        strategy_map = [
-            (256, tma(bk=32, tm=8, ks=4)),  # ~95% — K-splits for grid parallelism
-            (512, tma(bk=32, tm=8, ks=4)),  # ~96%
-            (1024, tma(bk=32, tm=8, ks=1)),  # 101% — beats cuBLAS
-            (2048, tma(bk=32, tm=26, ks=1)),  # 105% — large tile hides latency
-            (4096, tma(bk=32, tm=20, ks=1)),  # 99% — sweet spot tile size
-            (8192, tma(bk=32, tm=28, ks=1)),  # 96%
-            (99999, tma(bk=32, tm=28)),  # 90% at 16K
-        ]
+        strategy_map, profile_name = default_matmul_strategy_map()
+        logger.info("Using matmul tuning profile: %s", profile_name)
         suite = run_adaptive_benchmark_suite(
             graph,
             rewriter,
