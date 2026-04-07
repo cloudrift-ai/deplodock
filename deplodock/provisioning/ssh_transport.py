@@ -7,7 +7,7 @@ import tempfile
 
 logger = logging.getLogger(__name__)
 
-REMOTE_DEPLOY_DIR = "~/deploy"
+REMOTE_DEPLOY_DIR = "~/.local/share/deplodock"
 
 
 def ssh_base_args(server, ssh_key, ssh_port):

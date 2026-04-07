@@ -204,7 +204,12 @@ async def run_execution_group(
             # ── Command-recipe dispatch ───────────────────────────────
             if recipe.kind == "command":
                 run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
-                task_dir_remote = f"{REMOTE_DEPLOY_DIR}/{group_label}/{task.variant}"
+                # Per-run suffix so concurrent invocations don't collide and stale
+                # outputs from previous runs aren't pulled back. We reuse the
+                # local run_dir name (a timestamp + short hash) so remote and
+                # local artifacts are easy to correlate when debugging.
+                run_suffix = task.run_dir.name if task.run_dir is not None else "default"
+                task_dir_remote = f"{REMOTE_DEPLOY_DIR}/{group_label}/{task.variant}/{run_suffix}"
                 try:
                     cmd_success, _info = await run_command_workload(
                         task,

@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "sgemm_cublas_vs_tma/rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive",
+    "recipe_dir": "recipes/sgemm_cublas_vs_tma",
+    "variant": "rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive",
+    "recipe_name": "sgemm_cublas_vs_tma",
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "gpu_short": "rtx5090",
+    "gpu_count": 1,
+    "model_name": "",
+    "result_file": "rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive_command.log",
+    "json_result_file": "rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive_command.json"
+  }
+]

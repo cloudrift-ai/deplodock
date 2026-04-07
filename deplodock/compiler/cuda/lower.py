@@ -1465,6 +1465,15 @@ def _lower_matmul_tma_db(graph, out_node, config):
 
     use_k_splits = config.k_splits > 1
     use_batch = config.batch_count > 1
+    if use_k_splits and use_batch:
+        # Both modes consume blockIdx.z, and the runner only dispatches one of
+        # them on grid.z, so combining them silently corrupts results. Batched
+        # GEMM already saturates the grid via the batch dim, so k-splits is
+        # redundant — callers must collapse k_splits to 1 when batching.
+        raise ValueError(
+            f"MatmulConfig: k_splits={config.k_splits} and batch_count={config.batch_count} "
+            "cannot both be > 1 (blockIdx.z collision). Set k_splits=1 for batched GEMM."
+        )
 
     # TMA descriptor reference: indexed by batch when batched
     tma_a_ref = f"&{a_name}_tma[batch]" if use_batch else f"&{a_name}_tma"

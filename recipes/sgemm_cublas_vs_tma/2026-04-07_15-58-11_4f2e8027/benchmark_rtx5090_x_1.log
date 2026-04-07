@@ -1,0 +1,228 @@
+[2026-04-07 15:58:11] [rtx5090_x_1] Starting group: NVIDIA GeForce RTX 5090 x1 (1 tasks)
+[2026-04-07 15:58:11] [rtx5090_x_1] Using pre-allocated host: dikobraz@127.0.0.1:22
+[2026-04-07 15:58:11] [deplodock.provisioning.staging] Staged 128 files to dikobraz@127.0.0.1:~/.local/share/deplodock/rtx5090_x_1/repo
+[2026-04-07 15:58:11] [rtx5090_x_1] Recipe: recipes/sgemm_cublas_vs_tma (variant: rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive)
+[2026-04-07 15:58:12] [deplodock.benchmark.command_workload] Running command for rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive:
+export PATH=/usr/local/cuda/bin:$PATH
+export DEPLODOCK_GIT_REV="feature/mini-gpu-compiler@local"
+cd ~/.local/share/deplodock/rtx5090_x_1/repo
+[ -d venv ] || make setup
+./venv/bin/python scripts/bench_matmul.py \
+  --strategy adaptive \
+  --sizes 256,512,1024,2048,4096,8192 \
+  --batches 1,4,8 \
+  --iterations 10 \
+  --output-dir ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_15-58-11_4f2e8027
+
+[2026-04-07 15:58:12] [deplodock.provisioning.ssh_transport] Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.
+[2026-04-07 15:58:12] [deplodock.provisioning.ssh_transport] Creating virtual environment...
+[2026-04-07 15:58:13] [deplodock.provisioning.ssh_transport] Installing Python dependencies...
+[2026-04-07 15:58:13] [deplodock.provisioning.ssh_transport] Obtaining file:///home/dikobraz/.local/share/deplodock/rtx5090_x_1/repo
+[2026-04-07 15:58:13] [deplodock.provisioning.ssh_transport]   Installing build dependencies: started
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Installing build dependencies: finished with status 'done'
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Checking if build backend supports build_editable: started
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Checking if build backend supports build_editable: finished with status 'done'
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Getting requirements to build editable: started
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Getting requirements to build editable: finished with status 'done'
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Preparing editable metadata (pyproject.toml): started
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Preparing editable metadata (pyproject.toml): finished with status 'done'
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport] Collecting huggingface_hub[cli,hf_transfer] (from deplodock==0.1.0)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Using cached huggingface_hub-1.9.1-py3-none-any.whl.metadata (14 kB)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport] Collecting httpx (from deplodock==0.1.0)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Using cached httpx-0.28.1-py3-none-any.whl.metadata (7.1 kB)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport] Collecting pyyaml (from deplodock==0.1.0)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Using cached pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.4 kB)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport] Collecting pytest (from deplodock==0.1.0)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Using cached pytest-9.0.3-py3-none-any.whl.metadata (7.6 kB)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport] Collecting pytest-asyncio (from deplodock==0.1.0)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Using cached pytest_asyncio-1.3.0-py3-none-any.whl.metadata (4.1 kB)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport] Collecting ruff (from deplodock==0.1.0)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Using cached ruff-0.15.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (26 kB)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport] Collecting matplotlib (from deplodock==0.1.0)
+[2026-04-07 15:58:14] [deplodock.provisioning.ssh_transport]   Using cached matplotlib-3.10.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (52 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting anyio (from httpx->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached anyio-4.13.0-py3-none-any.whl.metadata (4.5 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting certifi (from httpx->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached certifi-2026.2.25-py3-none-any.whl.metadata (2.5 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting httpcore==1.* (from httpx->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached httpcore-1.0.9-py3-none-any.whl.metadata (21 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting idna (from httpx->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached idna-3.11-py3-none-any.whl.metadata (8.4 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting h11>=0.16 (from httpcore==1.*->httpx->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] WARNING: huggingface-hub 1.9.1 does not provide the extra 'cli'
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] WARNING: huggingface-hub 1.9.1 does not provide the extra 'hf-transfer'
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting filelock>=3.10.0 (from huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached filelock-3.25.2-py3-none-any.whl.metadata (2.0 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting fsspec>=2023.5.0 (from huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached fsspec-2026.3.0-py3-none-any.whl.metadata (10 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting hf-xet<2.0.0,>=1.4.3 (from huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached hf_xet-1.4.3-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (4.9 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting packaging>=20.9 (from huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached packaging-26.0-py3-none-any.whl.metadata (3.3 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting tqdm>=4.42.1 (from huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached tqdm-4.67.3-py3-none-any.whl.metadata (57 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting typer (from huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached typer-0.24.1-py3-none-any.whl.metadata (16 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting typing-extensions>=4.1.0 (from huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting contourpy>=1.0.1 (from matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (5.5 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting cycler>=0.10 (from matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached cycler-0.12.1-py3-none-any.whl.metadata (3.8 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting fonttools>=4.22.0 (from matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached fonttools-4.62.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (117 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting kiwisolver>=1.3.1 (from matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached kiwisolver-1.5.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (5.1 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting numpy>=1.23 (from matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached numpy-2.4.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (6.6 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting pillow>=8 (from matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached pillow-12.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (8.8 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting pyparsing>=3 (from matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached pyparsing-3.3.2-py3-none-any.whl.metadata (5.8 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting python-dateutil>=2.7 (from matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting iniconfig>=1.0.1 (from pytest->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached iniconfig-2.3.0-py3-none-any.whl.metadata (2.5 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting pluggy<2,>=1.5 (from pytest->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached pluggy-1.6.0-py3-none-any.whl.metadata (4.8 kB)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport] Collecting pygments>=2.7.2 (from pytest->deplodock==0.1.0)
+[2026-04-07 15:58:15] [deplodock.provisioning.ssh_transport]   Using cached pygments-2.20.0-py3-none-any.whl.metadata (2.5 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Collecting six>=1.5 (from python-dateutil>=2.7->matplotlib->deplodock==0.1.0)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Using cached six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Collecting click>=8.2.1 (from typer->huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Using cached click-8.3.2-py3-none-any.whl.metadata (2.6 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Collecting shellingham>=1.3.0 (from typer->huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Using cached shellingham-1.5.4-py2.py3-none-any.whl.metadata (3.5 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Collecting rich>=12.3.0 (from typer->huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Using cached rich-14.3.3-py3-none-any.whl.metadata (18 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Collecting annotated-doc>=0.0.2 (from typer->huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Using cached annotated_doc-0.0.4-py3-none-any.whl.metadata (6.6 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Collecting markdown-it-py>=2.2.0 (from rich>=12.3.0->typer->huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Using cached markdown_it_py-4.0.0-py3-none-any.whl.metadata (7.3 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Collecting mdurl~=0.1 (from markdown-it-py>=2.2.0->rich>=12.3.0->typer->huggingface_hub[cli,hf_transfer]->deplodock==0.1.0)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Using cached mdurl-0.1.2-py3-none-any.whl.metadata (1.6 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached httpx-0.28.1-py3-none-any.whl (73 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached httpcore-1.0.9-py3-none-any.whl (78 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (807 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached matplotlib-3.10.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (8.7 MB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached pytest-9.0.3-py3-none-any.whl (375 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached pytest_asyncio-1.3.0-py3-none-any.whl (15 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached ruff-0.15.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (11.3 MB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (362 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached cycler-0.12.1-py3-none-any.whl (8.3 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached filelock-3.25.2-py3-none-any.whl (26 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached fonttools-4.62.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (5.0 MB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached fsspec-2026.3.0-py3-none-any.whl (202 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached hf_xet-1.4.3-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (4.2 MB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached iniconfig-2.3.0-py3-none-any.whl (7.5 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached kiwisolver-1.5.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (1.5 MB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached numpy-2.4.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (16.6 MB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached packaging-26.0-py3-none-any.whl (74 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached pillow-12.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (7.1 MB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached pluggy-1.6.0-py3-none-any.whl (20 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached pygments-2.20.0-py3-none-any.whl (1.2 MB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached pyparsing-3.3.2-py3-none-any.whl (122 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl (229 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached tqdm-4.67.3-py3-none-any.whl (78 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached typing_extensions-4.15.0-py3-none-any.whl (44 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached anyio-4.13.0-py3-none-any.whl (114 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached idna-3.11-py3-none-any.whl (71 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached certifi-2026.2.25-py3-none-any.whl (153 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached huggingface_hub-1.9.1-py3-none-any.whl (637 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached typer-0.24.1-py3-none-any.whl (56 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached annotated_doc-0.0.4-py3-none-any.whl (5.3 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached click-8.3.2-py3-none-any.whl (108 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached h11-0.16.0-py3-none-any.whl (37 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached rich-14.3.3-py3-none-any.whl (310 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached shellingham-1.5.4-py2.py3-none-any.whl (9.8 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached six-1.17.0-py2.py3-none-any.whl (11 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached markdown_it_py-4.0.0-py3-none-any.whl (87 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Using cached mdurl-0.1.2-py3-none-any.whl (10.0 kB)
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Checking if build backend supports build_editable: started
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Checking if build backend supports build_editable: finished with status 'done'
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Building wheels for collected packages: deplodock
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Building editable for deplodock (pyproject.toml): started
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Building editable for deplodock (pyproject.toml): finished with status 'done'
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Created wheel for deplodock: filename=deplodock-0.1.0-0.editable-py3-none-any.whl size=3113 sha256=905fc97cab0961e6c32fd2de0510e2d862fd98e3d2df1806b5fdc718fe6534ea
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport]   Stored in directory: /tmp/pip-ephem-wheel-cache-s0fa2656/wheels/0a/a5/9f/768cc5f5bab0ec750469ada30ff4a284ead8e80e7c600ca7f5
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Successfully built deplodock
+[2026-04-07 15:58:16] [deplodock.provisioning.ssh_transport] Installing collected packages: typing-extensions, tqdm, six, shellingham, ruff, pyyaml, pyparsing, pygments, pluggy, pillow, packaging, numpy, mdurl, kiwisolver, iniconfig, idna, hf-xet, h11, fsspec, fonttools, filelock, cycler, click, certifi, annotated-doc, python-dateutil, pytest, markdown-it-py, httpcore, contourpy, anyio, rich, pytest-asyncio, matplotlib, httpx, typer, huggingface_hub, deplodock
+[2026-04-07 15:58:20] [deplodock.provisioning.ssh_transport] Successfully installed annotated-doc-0.0.4 anyio-4.13.0 certifi-2026.2.25 click-8.3.2 contourpy-1.3.3 cycler-0.12.1 deplodock-0.1.0 filelock-3.25.2 fonttools-4.62.1 fsspec-2026.3.0 h11-0.16.0 hf-xet-1.4.3 httpcore-1.0.9 httpx-0.28.1 huggingface_hub-1.9.1 idna-3.11 iniconfig-2.3.0 kiwisolver-1.5.0 markdown-it-py-4.0.0 matplotlib-3.10.8 mdurl-0.1.2 numpy-2.4.4 packaging-26.0 pillow-12.2.0 pluggy-1.6.0 pygments-2.20.0 pyparsing-3.3.2 pytest-9.0.3 pytest-asyncio-1.3.0 python-dateutil-2.9.0.post0 pyyaml-6.0.3 rich-14.3.3 ruff-0.15.9 shellingham-1.5.4 six-1.17.0 tqdm-4.67.3 typer-0.24.1 typing-extensions-4.15.0
+[2026-04-07 15:58:20] [deplodock.provisioning.ssh_transport] ✅ Setup complete!
+[2026-04-07 15:58:20] [deplodock.provisioning.ssh_transport] === Running benchmark with batch=1 ===
+[2026-04-07 15:58:20] [deplodock.provisioning.ssh_transport] Using matmul tuning profile: rtx_5090
+[2026-04-07 15:58:20] [deplodock.provisioning.ssh_transport] Benchmarking 256x256 with tma_db ...
+[2026-04-07 15:58:21] [deplodock.provisioning.ssh_transport]   256x256 [tma_db]: 0.008 ms (cuBLAS: 0.009 ms, eff: 110.5%)
+[2026-04-07 15:58:21] [deplodock.provisioning.ssh_transport] Benchmarking 512x512 with tma_db ...
+[2026-04-07 15:58:22] [deplodock.provisioning.ssh_transport]   512x512 [tma_db]: 0.014 ms (cuBLAS: 0.014 ms, eff: 99.8%)
+[2026-04-07 15:58:22] [deplodock.provisioning.ssh_transport] Benchmarking 1024x1024 with tma_db ...
+[2026-04-07 15:58:24] [deplodock.provisioning.ssh_transport]   1024x1024 [tma_db]: 0.047 ms (cuBLAS: 0.044 ms, eff: 94.5%)
+[2026-04-07 15:58:24] [deplodock.provisioning.ssh_transport] Benchmarking 2048x2048 with tma_db ...
+[2026-04-07 15:58:25] [deplodock.provisioning.ssh_transport]   2048x2048 [tma_db]: 0.234 ms (cuBLAS: 0.247 ms, eff: 105.4%)
+[2026-04-07 15:58:25] [deplodock.provisioning.ssh_transport] Benchmarking 4096x4096 with tma_db ...
+[2026-04-07 15:58:27] [deplodock.provisioning.ssh_transport]   4096x4096 [tma_db]: 1.897 ms (cuBLAS: 1.909 ms, eff: 100.6%)
+[2026-04-07 15:58:27] [deplodock.provisioning.ssh_transport] Benchmarking 8192x8192 with tma_db ...
+[2026-04-07 15:58:29] [deplodock.provisioning.ssh_transport]   8192x8192 [tma_db]: 17.502 ms (cuBLAS: 16.271 ms, eff: 93.0%)
+[2026-04-07 15:58:29] [deplodock.provisioning.ssh_transport] Trace saved to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_15-58-11_4f2e8027/20260407_225820_adaptive.json
+[2026-04-07 15:58:29] [deplodock.provisioning.ssh_transport] === Running benchmark with batch=4 ===
+[2026-04-07 15:58:29] [deplodock.provisioning.ssh_transport] Using matmul tuning profile: rtx_5090
+[2026-04-07 15:58:29] [deplodock.provisioning.ssh_transport] Benchmarking 256x256 with tma_db ...
+[2026-04-07 15:58:30] [deplodock.provisioning.ssh_transport]   256x256 [tma_db]: 0.015 ms (cuBLAS: 0.012 ms, eff: 81.2%)
+[2026-04-07 15:58:30] [deplodock.provisioning.ssh_transport] Benchmarking 512x512 with tma_db ...
+[2026-04-07 15:58:32] [deplodock.provisioning.ssh_transport]   512x512 [tma_db]: 0.028 ms (cuBLAS: 0.033 ms, eff: 119.6%)
+[2026-04-07 15:58:32] [deplodock.provisioning.ssh_transport] Benchmarking 1024x1024 with tma_db ...
+[2026-04-07 15:58:33] [deplodock.provisioning.ssh_transport]   1024x1024 [tma_db]: 0.152 ms (cuBLAS: 0.209 ms, eff: 137.3%)
+[2026-04-07 15:58:33] [deplodock.provisioning.ssh_transport] Benchmarking 2048x2048 with tma_db ...
+[2026-04-07 15:58:34] [deplodock.provisioning.ssh_transport]   2048x2048 [tma_db]: 0.958 ms (cuBLAS: 1.562 ms, eff: 163.1%)
+[2026-04-07 15:58:34] [deplodock.provisioning.ssh_transport] Benchmarking 4096x4096 with tma_db ...
+[2026-04-07 15:58:36] [deplodock.provisioning.ssh_transport]   4096x4096 [tma_db]: 8.732 ms (cuBLAS: 14.205 ms, eff: 162.7%)
+[2026-04-07 15:58:36] [deplodock.provisioning.ssh_transport] Benchmarking 8192x8192 with tma_db ...
+[2026-04-07 15:58:40] [deplodock.provisioning.ssh_transport]   8192x8192 [tma_db]: 72.249 ms (cuBLAS: 112.576 ms, eff: 155.8%)
+[2026-04-07 15:58:40] [deplodock.provisioning.ssh_transport] Trace saved to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_15-58-11_4f2e8027/20260407_225829_adaptive.json
+[2026-04-07 15:58:40] [deplodock.provisioning.ssh_transport] === Running benchmark with batch=8 ===
+[2026-04-07 15:58:40] [deplodock.provisioning.ssh_transport] Using matmul tuning profile: rtx_5090
+[2026-04-07 15:58:40] [deplodock.provisioning.ssh_transport] Benchmarking 256x256 with tma_db ...
+[2026-04-07 15:58:42] [deplodock.provisioning.ssh_transport]   256x256 [tma_db]: 0.016 ms (cuBLAS: 0.012 ms, eff: 79.2%)
+[2026-04-07 15:58:42] [deplodock.provisioning.ssh_transport] Benchmarking 512x512 with tma_db ...
+[2026-04-07 15:58:43] [deplodock.provisioning.ssh_transport]   512x512 [tma_db]: 0.042 ms (cuBLAS: 0.062 ms, eff: 146.5%)
+[2026-04-07 15:58:43] [deplodock.provisioning.ssh_transport] Benchmarking 1024x1024 with tma_db ...
+[2026-04-07 15:58:44] [deplodock.provisioning.ssh_transport]   1024x1024 [tma_db]: 0.277 ms (cuBLAS: 0.394 ms, eff: 142.2%)
+[2026-04-07 15:58:44] [deplodock.provisioning.ssh_transport] Benchmarking 2048x2048 with tma_db ...
+[2026-04-07 15:58:46] [deplodock.provisioning.ssh_transport]   2048x2048 [tma_db]: 2.333 ms (cuBLAS: 3.636 ms, eff: 155.8%)
+[2026-04-07 15:58:46] [deplodock.provisioning.ssh_transport] Benchmarking 4096x4096 with tma_db ...
+[2026-04-07 15:58:48] [deplodock.provisioning.ssh_transport]   4096x4096 [tma_db]: 17.582 ms (cuBLAS: 29.134 ms, eff: 165.7%)
+[2026-04-07 15:58:48] [deplodock.provisioning.ssh_transport] Benchmarking 8192x8192 with tma_db ...
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]   8192x8192 [tma_db]: 145.924 ms (cuBLAS: 223.305 ms, eff: 153.0%)
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] Trace saved to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_15-58-11_4f2e8027/20260407_225840_adaptive.json
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] 
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] Strategy: adaptive | Adaptive benchmark (batch=1)
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]         Size |  Kernel ms |  cuBLAS ms |   GFLOPS |   Eff %
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] -----------------------------------------------------------------
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]      256x256 |      0.008 |      0.009 |   4096.0 |   110.5
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]      512x512 |      0.014 |      0.014 |  18724.6 |    99.8
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    1024x1024 |      0.047 |      0.044 |  45902.1 |    94.5
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    2048x2048 |      0.234 |      0.247 |  73403.2 |   105.4
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    4096x4096 |      1.897 |      1.909 |  72440.0 |   100.6
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    8192x8192 |     17.502 |     16.271 |  62823.7 |    93.0
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] 
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] Strategy: adaptive | Adaptive benchmark (batch=4)
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]         Size |  Kernel ms |  cuBLAS ms |   GFLOPS |   Eff %
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] -----------------------------------------------------------------
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]      256x256 |      0.015 |      0.012 |   8756.4 |    81.2
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]      512x512 |      0.028 |      0.033 |  38971.5 |   119.6
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    1024x1024 |      0.152 |      0.209 |  56417.7 |   137.3
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    2048x2048 |      0.958 |      1.562 |  71735.8 |   163.1
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    4096x4096 |      8.732 |     14.205 |  62962.2 |   162.7
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    8192x8192 |     72.249 |    112.576 |  60873.1 |   155.8
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] 
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] Strategy: adaptive | Adaptive benchmark (batch=8)
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]         Size |  Kernel ms |  cuBLAS ms |   GFLOPS |   Eff %
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] -----------------------------------------------------------------
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]      256x256 |      0.016 |      0.012 |  17296.1 |    79.2
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]      512x512 |      0.042 |      0.062 |  51072.2 |   146.5
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    1024x1024 |      0.277 |      0.394 |  62066.0 |   142.2
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    2048x2048 |      2.333 |      3.636 |  58910.2 |   155.8
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    4096x4096 |     17.582 |     29.134 |  62534.7 |   165.7
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport]    8192x8192 |    145.924 |    223.305 |  60278.7 |   153.0
+[2026-04-07 15:58:54] [deplodock.provisioning.ssh_transport] Markdown report written to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1-4-8_grf-m-g-c-l_i10_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_15-58-11_4f2e8027/report_20260407_225820_adaptive.md

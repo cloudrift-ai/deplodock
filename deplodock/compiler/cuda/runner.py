@@ -167,6 +167,8 @@ class BenchmarkResult:
     kernel_min_ms: float
     kernel_max_ms: float
     cublas_time_ms: float | None = None
+    cublas_min_ms: float | None = None
+    cublas_max_ms: float | None = None
     gflops: float = 0.0
     cublas_gflops: float | None = None
     efficiency_pct: float | None = None
@@ -489,14 +491,18 @@ int main() {{
     }
     float times[{num_iterations}];
 {f"    float cublas_times[{num_iterations}];" if compare_cublas else ""}
-    for (int iter = 0; iter < {num_iterations}; iter++) {{
+    // Run num_iterations+1 iterations; iter 0 is a discarded warmup so the
+    // first sample (which often pays JIT/cache/algo-selection costs) is not
+    // captured for either kernel.
+    for (int iter = 0; iter < {num_iterations + 1}; iter++) {{
         // Our kernel
         if (k_splits_val > 1) cudaMemset(d_C, 0, BATCH * M * N * sizeof(float));
         cudaEventRecord(start);
         {kernel.name}{launch_suffix}({full_args});
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&times[iter], start, stop);
+        float k_t; cudaEventElapsedTime(&k_t, start, stop);
+        if (iter > 0) times[iter - 1] = k_t;
 {
         f'''
         // cuBLAS (same thermal state as our kernel)
@@ -508,7 +514,8 @@ int main() {{
                     &beta_val, d_C_ref, {n}{",(long long)" + str(m * n) + ",BATCH" if dim_args.get("batch", 1) > 1 else ""});
         cudaEventRecord(cb_stop);
         cudaEventSynchronize(cb_stop);
-        cudaEventElapsedTime(&cublas_times[iter], cb_start, cb_stop);
+        float cb_t; cudaEventElapsedTime(&cb_t, cb_start, cb_stop);
+        if (iter > 0) cublas_times[iter - 1] = cb_t;
 '''
         if compare_cublas
         else ""
@@ -685,6 +692,8 @@ def run_benchmark(
             kernel_min_ms=kernel_min,
             kernel_max_ms=kernel_max,
             cublas_time_ms=cublas_median,
+            cublas_min_ms=vals.get("CUBLAS_MIN_MS"),
+            cublas_max_ms=vals.get("CUBLAS_MAX_MS"),
             gflops=gflops,
             cublas_gflops=cublas_gflops,
             efficiency_pct=efficiency,

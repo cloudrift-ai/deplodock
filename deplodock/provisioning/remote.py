@@ -4,10 +4,9 @@ import asyncio
 import logging
 
 from deplodock.provisioning.host import Host
+from deplodock.provisioning.ssh_transport import REMOTE_DEPLOY_DIR
 
 logger = logging.getLogger(__name__)
-
-REMOTE_DEPLOY_DIR = "~/deploy"
 
 
 async def provision_remote(
@@ -20,7 +19,7 @@ async def provision_remote(
     """Ensure ``host`` is ready for deployment.
 
     Steps (each checks before installing):
-    1. Create ~/deploy directory
+    1. Create the deplodock workspace directory
     2. Install Docker if not found
     3. Install NVIDIA driver / CUDA toolkit if requested versions don't match
        (reboots and waits for the host to come back if anything was installed)

@@ -12,7 +12,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
+import dataclasses
 import logging
+import platform
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,6 +40,158 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results" / "matmul_overnight"
+
+
+def _run(cmd: list[str]) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ""
+
+
+def collect_system_info() -> dict[str, str]:
+    """Gather GPU/driver/CUDA/cuBLAS info for the report."""
+    info: dict[str, str] = {"host": platform.node(), "os": platform.platform()}
+
+    smi = _run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total,compute_cap", "--format=csv,noheader"])
+    if smi:
+        first = smi.splitlines()[0]
+        parts = [p.strip() for p in first.split(",")]
+        if len(parts) >= 4:
+            info["gpu"], info["driver"], info["vram"], info["compute_cap"] = parts
+
+    nvcc = _run(["nvcc", "--version"])
+    m = re.search(r"release (\S+),\s*V(\S+)", nvcc)
+    if m:
+        info["cuda"] = m.group(2)
+
+    import os
+
+    env_git = os.environ.get("DEPLODOCK_GIT_REV")
+    if env_git:
+        info["git"] = env_git
+    else:
+        git_dir = Path(__file__).resolve().parent.parent
+        sha = _run(["git", "-C", str(git_dir), "rev-parse", "--short", "HEAD"])
+        branch = _run(["git", "-C", str(git_dir), "rev-parse", "--abbrev-ref", "HEAD"])
+        dirty = _run(["git", "-C", str(git_dir), "status", "--porcelain"])
+        if sha:
+            info["git"] = f"{branch}@{sha}{' (dirty)' if dirty else ''}"
+
+    try:
+        cublas = ctypes.CDLL("libcublas.so")
+        major, minor, patch = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        cublas.cublasGetProperty(0, ctypes.byref(major))
+        cublas.cublasGetProperty(1, ctypes.byref(minor))
+        cublas.cublasGetProperty(2, ctypes.byref(patch))
+        info["cublas"] = f"{major.value}.{minor.value}.{patch.value}"
+    except (OSError, AttributeError):
+        info["cublas"] = "unknown"
+
+    return info
+
+
+def _config_for_size(suite, m: int) -> dict | None:
+    """Pick the strategy_map entry whose threshold covers M (adaptive runs only)."""
+    cfg = suite.config or {}
+    smap = cfg.get("strategy_map")
+    if not smap:
+        return cfg if isinstance(cfg, dict) and "strategy" in cfg else None
+    for threshold, entry in smap:
+        if m <= threshold:
+            return entry
+    return smap[-1][1]
+
+
+def _fmt(v: float | None, spec: str) -> str:
+    return format(v, spec) if v else "—"
+
+
+def _suite_section(suite, batch: int) -> list[str]:
+    lines: list[str] = []
+    title = f"Batch = {batch}" if batch > 1 else "Single GEMM (batch=1)"
+    lines.append(f"### {title}")
+    lines.append("")
+    lines.append(f"_{suite.description}_")
+    lines.append("")
+    lines.append("| Size | TM | BK | K-splits | Kernel ms | Kernel var % | cuBLAS ms | cuBLAS var % | Eff vs cuBLAS | TFLOPS | cuBLAS TFLOPS |")
+    lines.append("|------|----|----|----------|----------:|-------------:|----------:|-------------:|--------------:|-------:|--------------:|")
+    for r in suite.results:
+        dims = r.dimensions or {}
+        m, n = dims.get("M", 0), dims.get("N", 0)
+        size = f"{m}x{n}" + (f"x{batch}" if batch > 1 else "")
+        cfg = _config_for_size(suite, m) or {}
+        tm = cfg.get("thread_m", "—")
+        bk = cfg.get("block_k", "—")
+        ks = cfg.get("k_splits", "—")
+        eff = f"{r.efficiency_pct:.1f}%" if r.efficiency_pct else "—"
+        kvar = (
+            f"{(r.kernel_max_ms - r.kernel_min_ms) / r.kernel_time_ms * 100:.1f}%"
+            if r.kernel_time_ms and r.kernel_min_ms is not None and r.kernel_max_ms is not None
+            else "—"
+        )
+        cvar = (
+            f"{(r.cublas_max_ms - r.cublas_min_ms) / r.cublas_time_ms * 100:.1f}%"
+            if r.cublas_time_ms and r.cublas_min_ms is not None and r.cublas_max_ms is not None
+            else "—"
+        )
+        lines.append(
+            f"| {size} | {tm} | {bk} | {ks} | "
+            f"{r.kernel_time_ms:.3f} | {kvar} | "
+            f"{_fmt(r.cublas_time_ms, '.3f')} | {cvar} | {eff} | "
+            f"{_fmt(r.gflops and r.gflops / 1000, '.1f')} | {_fmt(r.cublas_gflops and r.cublas_gflops / 1000, '.1f')} |"
+        )
+    lines.append("")
+    if suite.error:
+        lines.append(f"**ERROR:** {suite.error}")
+        lines.append("")
+    return lines
+
+
+def render_markdown_report(runs: list[tuple[int, "BenchmarkSuite"]], sysinfo: dict[str, str], args) -> str:
+    lines: list[str] = []
+    first = runs[0][1]
+    lines.append("# Matmul Benchmark Report")
+    lines.append("")
+    lines.append(f"_Generated: {first.timestamp}_")
+    lines.append("")
+
+    lines.append("## System")
+    lines.append("")
+    lines.append("| Field | Value |")
+    lines.append("|---|---|")
+    for k in ("host", "os", "gpu", "compute_cap", "vram", "driver", "cuda", "cublas", "git"):
+        if k in sysinfo:
+            lines.append(f"| {k} | {sysinfo[k]} |")
+    lines.append("")
+
+    lines.append("## Run")
+    lines.append("")
+    lines.append(f"- Strategy: `{first.strategy}`")
+    lines.append(f"- Iterations per measurement: {args.iterations}")
+    lines.append(f"- cuBLAS math mode: `{args.cublas_math}`")
+    lines.append(f"- Batches swept: {', '.join(str(b) for b, _ in runs)}")
+    if first.strategy != "adaptive":
+        lines.append(f"- Config: BK={args.bk}, block={args.block_m}x{args.block_n}, thread_m={args.thread_m}, k_splits={args.k_splits}")
+    lines.append("")
+
+    lines.append("## Results")
+    lines.append("")
+    for batch, suite in runs:
+        lines.extend(_suite_section(suite, batch))
+
+    last_kernel = next((s.cuda_kernel for _, s in reversed(runs) if s.cuda_kernel), "")
+    if last_kernel:
+        lines.append("## Kernel")
+        lines.append("")
+        lines.append("Last CUDA source compiled during this run (representative; per-size kernels differ in `thread_m` / `k_splits` per the strategy map above):")
+        lines.append("")
+        lines.append("```cuda")
+        lines.append(last_kernel.rstrip())
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def make_matmul_graph() -> Graph:
@@ -76,9 +233,11 @@ def main():
     parser.add_argument("--extended", action="store_true", help="Include non-standard sizes")
     parser.add_argument("--description", type=str, default="", help="Description for trace")
     parser.add_argument("--save", action="store_true", help="Save trace to results dir")
+    parser.add_argument("--output-dir", type=str, default=None, help="Override directory for saved trace JSON (implies --save)")
     parser.add_argument("--assume-aligned", action="store_true", help="Skip bounds checks (for pow2 sizes)")
     parser.add_argument("--k-splits", type=int, default=1, help="K-dimension splitting (for TMA)")
     parser.add_argument("--batch", type=int, default=1, help="Batch count for batched GEMM")
+    parser.add_argument("--batches", type=str, default=None, help="Comma-separated batch counts to sweep (e.g. '1,4'). Overrides --batch.")
     parser.add_argument(
         "--cublas-math",
         default="default",
@@ -99,57 +258,89 @@ def main():
     else:
         sizes = MATRIX_SIZES
 
-    output_dir = RESULTS_DIR if args.save else None
-
-    if args.strategy == "adaptive":
-        strategy_map, profile_name = default_matmul_strategy_map()
-        logger.info("Using matmul tuning profile: %s", profile_name)
-        suite = run_adaptive_benchmark_suite(
-            graph,
-            rewriter,
-            strategy_map,
-            sizes=sizes,
-            output_dir=output_dir,
-            description=args.description or "Adaptive benchmark",
-            num_iterations=args.iterations,
-            cublas_math_mode=args.cublas_math,
-        )
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    elif args.save:
+        output_dir = RESULTS_DIR
     else:
-        # Determine coarsening from strategy.
-        coarsen_rows, coarsen_cols = 1, 1
-        if args.strategy == "coarsened_f4":
-            coarsen_cols = 4
-        elif args.strategy in ("coarsened_2r4c", "hybrid_smem_f4"):
-            thread_m = args.thread_m if args.thread_m > 1 else 2
-            coarsen_rows, coarsen_cols = thread_m, 4
+        output_dir = None
 
-        config = MatmulConfig(
-            strategy=args.strategy,
-            block_k=args.bk,
-            block_m=args.block_m,
-            block_n=args.block_n,
-            thread_m=args.thread_m,
-            coarsen_rows=coarsen_rows,
-            coarsen_cols=coarsen_cols,
-            assume_aligned=args.assume_aligned,
-            k_splits=args.k_splits,
-            batch_count=args.batch,
-        )
-        suite = run_benchmark_suite(
-            graph,
-            rewriter,
-            config,
-            sizes=sizes,
-            output_dir=output_dir,
-            description=args.description or f"{args.strategy} BK={args.bk}",
-            num_iterations=args.iterations,
-            cublas_math_mode=args.cublas_math,
-        )
+    if args.batches:
+        batch_counts = [int(b) for b in args.batches.split(",") if b.strip()]
+    else:
+        batch_counts = [args.batch]
 
-    print()
-    print(suite.summary_table())
-    if suite.error:
-        print(f"\nERROR: {suite.error}")
+    runs: list[tuple[int, "BenchmarkSuite"]] = []
+    any_error = False
+
+    for batch in batch_counts:
+        logger.info("=== Running benchmark with batch=%d ===", batch)
+        if args.strategy == "adaptive":
+            strategy_map, profile_name = default_matmul_strategy_map()
+            logger.info("Using matmul tuning profile: %s", profile_name)
+            if batch > 1:
+                # batch>1 already saturates grid.z; k_splits would collide on blockIdx.z.
+                strategy_map = [
+                    (t, dataclasses.replace(c, batch_count=batch, k_splits=1)) for t, c in strategy_map
+                ]
+            suite = run_adaptive_benchmark_suite(
+                graph,
+                rewriter,
+                strategy_map,
+                sizes=sizes,
+                output_dir=output_dir,
+                description=args.description or f"Adaptive benchmark (batch={batch})",
+                num_iterations=args.iterations,
+                cublas_math_mode=args.cublas_math,
+            )
+        else:
+            # Determine coarsening from strategy.
+            coarsen_rows, coarsen_cols = 1, 1
+            if args.strategy == "coarsened_f4":
+                coarsen_cols = 4
+            elif args.strategy in ("coarsened_2r4c", "hybrid_smem_f4"):
+                thread_m = args.thread_m if args.thread_m > 1 else 2
+                coarsen_rows, coarsen_cols = thread_m, 4
+
+            config = MatmulConfig(
+                strategy=args.strategy,
+                block_k=args.bk,
+                block_m=args.block_m,
+                block_n=args.block_n,
+                thread_m=args.thread_m,
+                coarsen_rows=coarsen_rows,
+                coarsen_cols=coarsen_cols,
+                assume_aligned=args.assume_aligned,
+                k_splits=args.k_splits,
+                batch_count=batch,
+            )
+            suite = run_benchmark_suite(
+                graph,
+                rewriter,
+                config,
+                sizes=sizes,
+                output_dir=output_dir,
+                description=args.description or f"{args.strategy} BK={args.bk} batch={batch}",
+                num_iterations=args.iterations,
+                cublas_math_mode=args.cublas_math,
+            )
+
+        print()
+        print(suite.summary_table())
+        runs.append((batch, suite))
+        if suite.error:
+            any_error = True
+
+    if output_dir is not None:
+        sysinfo = collect_system_info()
+        report = render_markdown_report(runs, sysinfo, args)
+        ts = runs[0][1].timestamp
+        report_path = Path(output_dir) / f"report_{ts}_{runs[0][1].strategy}.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(report)
+        logger.info("Markdown report written to %s", report_path)
+
+    if any_error:
         sys.exit(1)
 
 

@@ -1,0 +1,32 @@
+command:
+  stage:
+    - deplodock
+    - scripts
+    - tests
+    - pyproject.toml
+    - requirements.txt
+    - Makefile
+  run: |
+    export PATH=/usr/local/cuda/bin:$$PATH
+    export DEPLODOCK_GIT_REV="$git_rev"
+    cd $repo_dir
+    [ -d venv ] || make setup
+    ./venv/bin/python scripts/bench_matmul.py \
+      --strategy $strategy \
+      --sizes $sizes \
+      --batches $batches \
+      --iterations $iterations \
+      --output-dir $task_dir
+  result_files:
+    - "*.json"
+    - "*.md"
+  timeout: 1800
+
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    strategy: adaptive
+    sizes: "256,512,1024,2048,4096,8192"
+    batches: "1,4,8"
+    iterations: 10
+    git_rev: "feature/mini-gpu-compiler@local"
