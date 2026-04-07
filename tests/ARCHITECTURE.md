@@ -17,7 +17,8 @@ tests/
 │   ├── test_code_hash.py    # BenchmarkTask.compute_code_hash()
 │   ├── test_tasks_json.py   # BenchmarkTask.write_tasks_json(), read_tasks_json()
 │   ├── test_run_dir.py      # BenchmarkTask.create_run_dir()
-│   └── test_results.py      # parse_benchmark_metrics(), parse_system_info(), compose_json_result()
+│   ├── test_results.py      # parse_benchmark_metrics(), parse_system_info(), compose_json_result()
+│   └── test_command_workload.py # build_substitution_map(), render_command()
 ├── recipe/
 │   ├── test_types.py        # Recipe.from_dict(), LLMConfig properties, dataclass defaults
 │   └── test_engines.py      # build_engine_args(), banned_extra_arg_flags()
@@ -34,6 +35,7 @@ tests/
 │   ├── test_cloud.py        # resolve_vm_spec(), delete_cloud_vm(), VMConnectionInfo
 │   ├── test_cloudrift.py    # CloudRift API helpers
 │   ├── test_gcp.py             # GCP command builders
+│   ├── test_staging.py      # enumerate_staged_files(), build_stage_tar()
 │   └── test_vm_dryrun.py    # vm create/delete CLI dry-run
 ├── scripts/
 │   └── test_plot_mcr_sweep.py  # load_results() from scripts/plot_mcr_sweep.py
