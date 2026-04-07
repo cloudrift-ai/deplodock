@@ -44,6 +44,16 @@ def test_render_command_missing_var():
         render_command("echo $missing", {"task_dir": "/tmp"})
 
 
+def test_render_command_passes_through_shell_metachars():
+    """`$(...)`, `${VAR:-default}`, `$1`, and `$$` must survive rendering."""
+    # Note: `$$` is Template's escape for a literal `$`, so it renders as `$`.
+    out = render_command(
+        'echo $marker $(hostname) ${OTHER:-x} "$1" $$',
+        {"marker": "a"},
+    )
+    assert out == 'echo a $(hostname) ${OTHER:-x} "$1" $'
+
+
 def test_render_command_repo_dir_unavailable():
     """When staging is empty, $repo_dir is omitted from subs and triggers a friendly error."""
     v = _variant({"deploy.gpu": "x", "deploy.gpu_count": 1})

@@ -54,7 +54,7 @@ make setup
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host
+  --ssh user@host
 ```
 
 ### Deploy Locally
@@ -69,7 +69,7 @@ deplodock deploy local \
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host \
+  --ssh user@host \
   --teardown
 ```
 
@@ -80,7 +80,7 @@ Preview commands without executing:
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host \
+  --ssh user@host \
   --dry-run
 ```
 
@@ -249,7 +249,7 @@ deplodock deploy local --recipe <path> [--dry-run]
 Deploys to a remote server via SSH + SCP.
 
 ```bash
-deplodock deploy ssh --recipe <path> --server user@host [--dry-run]
+deplodock deploy ssh --recipe <path> --ssh user@host[:port] [--dry-run]
 ```
 
 ### Cloud
@@ -279,11 +279,12 @@ When deploying locally or via SSH, deplodock auto-detects the target GPU by scan
 
 ### SSH-only Flags
 
-| Flag         | Required  | Default             | Description             |
-|--------------|-----------|---------------------|-------------------------|
-| `--server`   | Yes       | -                   | SSH address (user@host) |
-| `--ssh-key`  | No        | `~/.ssh/id_ed25519` | SSH key path            |
-| `--ssh-port` | No        | 22                  | SSH port                |
+| Flag         | Required  | Default             | Description                                          |
+|--------------|-----------|---------------------|------------------------------------------------------|
+| `--ssh`      | Yes       | -                   | SSH target `USER@HOST[:PORT]` (default port 22)      |
+| `--ssh-key`  | No        | `~/.ssh/id_ed25519` | SSH key path                                         |
+
+The same `--ssh USER@HOST[:PORT]` syntax is used by `deplodock bench --ssh ...`.
 
 ### Cloud-only Flags
 
@@ -375,6 +376,8 @@ deplodock bench recipes/*                                    # Run all recipes (
 deplodock bench experiments/.../optimal_mcr_rtx5090          # Run an experiment
 deplodock bench recipes/* --gpu-concurrency 4                # Number of VMs per GPU type to spin up
 deplodock bench recipes/* --dry-run                          # Preview commands
+deplodock bench recipes/* --local                            # Run on the local machine
+deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Run on a fixed pool of pre-allocated hosts
 ```
 
 | Flag                 | Default             | Description                                                              |
@@ -386,6 +389,12 @@ deplodock bench recipes/* --dry-run                          # Preview commands
 | `--gpu-concurrency`  | 1                   | Split each (model, GPU) group across up to N VMs                         |
 | `--dry-run`          | false               | Print commands without executing                                         |
 | `--no-teardown`      | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
+| `--local`            | false               | Run on the local machine via ssh to 127.0.0.1 (skips cloud provisioning) |
+| `--ssh USER@HOST[:PORT]` | none            | Pre-allocated SSH host (repeatable). Skips cloud provisioning            |
+
+When `--local` and/or `--ssh` are supplied, deplodock detects each host's GPU via PCI sysfs and verifies that every planned execution group can run on at least one of the supplied hosts (matching `deploy.gpu` and sufficient `deploy.gpu_count`). If any group is unsatisfied, the run aborts before any work starts. Fixed hosts are assumed to be already provisioned (docker, NVIDIA toolkit, etc.) and are never deleted at the end of the run.
+
+> **Note:** `--local` runs the workload over SSH to `127.0.0.1` (the same code path used for remote hosts). This requires a running SSH server on localhost and that your `--ssh-key` (default `~/.ssh/id_ed25519`) is listed in `~/.ssh/authorized_keys`. Quick check: `ssh -i ~/.ssh/id_ed25519 $USER@127.0.0.1 echo ok`.
 
 Results are always stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
 

@@ -54,12 +54,20 @@ def build_substitution_map(
 
 
 def render_command(template: str, subs: dict[str, str]) -> str:
-    """Render a string.Template command, raising a friendly error on missing vars."""
-    try:
-        return Template(template).substitute(subs)
-    except KeyError as e:
-        missing = e.args[0]
-        raise ValueError(f"command template references undefined variable: ${missing}") from None
+    """Render a string.Template command, raising a friendly error on missing vars.
+
+    Uses ``safe_substitute`` so that shell metacharacters like ``$(...)``,
+    ``$1``, ``$$``, and ``${VAR:-default}`` are passed through to the shell
+    untouched. Missing identifiers referenced by the template (anything that
+    matches Template's idpattern but isn't in ``subs``) still raise a friendly
+    ValueError.
+    """
+    tmpl = Template(template)
+    referenced = {m.group("named") or m.group("braced") for m in tmpl.pattern.finditer(template) if (m.group("named") or m.group("braced"))}
+    missing = sorted(referenced - subs.keys())
+    if missing:
+        raise ValueError(f"command template references undefined variable: ${missing[0]}")
+    return tmpl.safe_substitute(subs)
 
 
 async def _expand_remote_glob(run_cmd, task_dir: str, pattern: str) -> list[str]:
@@ -69,11 +77,10 @@ async def _expand_remote_glob(run_cmd, task_dir: str, pattern: str) -> list[str]
     `|| true` swallows the ls failure).
     """
     safe_pattern = shlex.quote(pattern)
-    # Use printf to get newline-delimited absolute paths.
+    # task_dir may start with `~/`; pass it unquoted so the remote shell
+    # expands tilde. It is internally composed and free of shell metachars.
     cmd = (
-        f"sh -c 'cd {shlex.quote(task_dir)} && "
-        f'for f in {pattern}; do [ -e "$f" ] && printf "%s/%s\\n" {shlex.quote(task_dir)} "$f"; done\' '
-        f"# pattern={safe_pattern}"
+        f'sh -c \'cd {task_dir} && for f in {pattern}; do [ -e "$f" ] && printf "%s/%s\\n" {task_dir} "$f"; done\' # pattern={safe_pattern}'
     )
     rc, stdout, _ = await run_cmd(cmd, stream=False)
     if rc != 0 or not stdout:
@@ -112,8 +119,11 @@ async def run_command_workload(
     else:
         rendered_with_env = rendered
 
-    # Ensure task_dir exists.
-    await run_cmd(f"mkdir -p {shlex.quote(task_dir)}")
+    # Ensure task_dir exists. task_dir is internally composed from
+    # REMOTE_DEPLOY_DIR/group_label/variant and may begin with `~/`, so we
+    # interpolate it unquoted to preserve tilde expansion. Both group_label
+    # and variant come from sanitized internal sources (no shell metachars).
+    await run_cmd(f"mkdir -p {task_dir}")
 
     logger.info(f"Running command for {task.variant}:\n{rendered}")
     rc, _, _ = await run_cmd(rendered_with_env, log_output=True, timeout=cmd_cfg.timeout)
