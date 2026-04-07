@@ -12,6 +12,9 @@ def test_pro6000_dispatch():
     cfg_4096 = next(c for thr, c in smap if thr >= 4096)
     assert cfg_4096.thread_m == 24
     assert cfg_4096.strategy == "tma_db"
+    # 1024 needs k_splits=4 on Pro 6000 (188 SMs) to fill the device.
+    cfg_1024 = next(c for thr, c in smap if thr >= 1024)
+    assert cfg_1024.k_splits == 4
 
 
 def test_5090_dispatch():

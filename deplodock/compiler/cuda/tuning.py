@@ -46,13 +46,16 @@ _PROFILE_5090: list[tuple[int, MatmulConfig]] = [
 ]
 
 _PROFILE_PRO6000: list[tuple[int, MatmulConfig]] = [
+    # Pro 6000 has 188 SMs (vs 5090's 170). Wave quantization matters more:
+    # 1024 needs ks=4 to fill the device (128 blocks / 188 SMs = 0.68 wave),
+    # and 8192 prefers TM=24 over the 5090's TM=28.
     (256, _tma(bk=32, tm=8, ks=4)),
     (512, _tma(bk=32, tm=8, ks=4)),
-    (1024, _tma(bk=32, tm=8, ks=1)),
+    (1024, _tma(bk=32, tm=8, ks=4)),
     (2048, _tma(bk=32, tm=24, ks=1)),
     (4096, _tma(bk=32, tm=24, ks=1)),
-    (8192, _tma(bk=32, tm=28, ks=1)),
-    (99999, _tma(bk=32, tm=28, ks=1)),
+    (8192, _tma(bk=32, tm=24, ks=1)),
+    (99999, _tma(bk=32, tm=24, ks=1)),
 ]
 
 # Match against the GPU name reported by `nvidia-smi --query-gpu=name`.
