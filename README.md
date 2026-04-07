@@ -54,7 +54,7 @@ make setup
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host
+  --ssh user@host
 ```
 
 ### Deploy Locally
@@ -69,7 +69,7 @@ deplodock deploy local \
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host \
+  --ssh user@host \
   --teardown
 ```
 
@@ -80,7 +80,7 @@ Preview commands without executing:
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host \
+  --ssh user@host \
   --dry-run
 ```
 
@@ -249,7 +249,7 @@ deplodock deploy local --recipe <path> [--dry-run]
 Deploys to a remote server via SSH + SCP.
 
 ```bash
-deplodock deploy ssh --recipe <path> --server user@host [--dry-run]
+deplodock deploy ssh --recipe <path> --ssh user@host[:port] [--dry-run]
 ```
 
 ### Cloud
@@ -279,11 +279,12 @@ When deploying locally or via SSH, deplodock auto-detects the target GPU by scan
 
 ### SSH-only Flags
 
-| Flag         | Required  | Default             | Description             |
-|--------------|-----------|---------------------|-------------------------|
-| `--server`   | Yes       | -                   | SSH address (user@host) |
-| `--ssh-key`  | No        | `~/.ssh/id_ed25519` | SSH key path            |
-| `--ssh-port` | No        | 22                  | SSH port                |
+| Flag         | Required  | Default             | Description                                          |
+|--------------|-----------|---------------------|------------------------------------------------------|
+| `--ssh`      | Yes       | -                   | SSH target `USER@HOST[:PORT]` (default port 22)      |
+| `--ssh-key`  | No        | `~/.ssh/id_ed25519` | SSH key path                                         |
+
+The same `--ssh USER@HOST[:PORT]` syntax is used by `deplodock bench --ssh ...`.
 
 ### Cloud-only Flags
 

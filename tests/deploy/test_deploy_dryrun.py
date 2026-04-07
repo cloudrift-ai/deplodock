@@ -13,7 +13,7 @@ def test_ssh_deploy(run_cli, recipes_dir):
         "ssh",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--server",
+        "--ssh",
         "user@1.2.3.4",
         "--gpu",
         "NVIDIA GeForce RTX 5090",
@@ -34,7 +34,7 @@ def test_ssh_deploy_command_sequence(run_cli, recipes_dir):
         "ssh",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--server",
+        "--ssh",
         "user@1.2.3.4",
         "--gpu",
         "NVIDIA GeForce RTX 5090",
@@ -61,7 +61,7 @@ def test_ssh_teardown(run_cli, recipes_dir):
         "ssh",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--server",
+        "--ssh",
         "user@1.2.3.4",
         "--gpu",
         "NVIDIA GeForce RTX 5090",
@@ -157,8 +157,8 @@ def test_multi_instance_deploy(run_cli, tmp_path):
         "ssh",
         "--recipe",
         str(tmp_path),
-        "--server",
-        "user@host",
+        "--ssh",
+        "user@host:2222",
         "--gpu",
         "NVIDIA H100 80GB",
         "--gpu-count",
@@ -192,9 +192,11 @@ def test_local_help(run_cli):
 def test_ssh_help(run_cli):
     rc, stdout, _ = run_cli("deploy", "ssh", "--help")
     assert rc == 0
-    assert "--server" in stdout
+    assert "--ssh" in stdout
     assert "--ssh-key" in stdout
-    assert "--ssh-port" in stdout
+    assert "USER@HOST" in stdout
+    assert "--ssh-port" not in stdout
+    assert "--server" not in stdout
 
 
 def test_bench_help(run_cli):

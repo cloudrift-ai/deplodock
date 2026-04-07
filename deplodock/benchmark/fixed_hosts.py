@@ -10,7 +10,15 @@ import os
 from dataclasses import dataclass
 
 from deplodock.detect import detect_local_gpus, detect_remote_gpus
+from deplodock.provisioning.ssh_target import parse_ssh_target
 from deplodock.provisioning.types import VMConnectionInfo
+
+__all__ = [
+    "AllocatedHost",
+    "parse_ssh_target",
+    "resolve_fixed_hosts",
+    "validate_hosts_cover_groups",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -27,29 +35,6 @@ class AllocatedHost:
         if self.gpu_name is None:
             return False
         return self.gpu_name == required_gpu and self.gpu_count >= required_count
-
-
-def parse_ssh_target(target: str) -> tuple[str, str, int]:
-    """Parse `user@host[:port]` into (user, host, port).
-
-    Raises ValueError on malformed input.
-    """
-    if "@" not in target:
-        raise ValueError(f"--ssh target must be in user@host[:port] form: {target!r}")
-    user, _, rest = target.partition("@")
-    if not user or not rest:
-        raise ValueError(f"--ssh target must be in user@host[:port] form: {target!r}")
-    if ":" in rest:
-        host, _, port_str = rest.partition(":")
-        try:
-            port = int(port_str)
-        except ValueError as e:
-            raise ValueError(f"Invalid port in --ssh target {target!r}: {port_str}") from e
-    else:
-        host, port = rest, 22
-    if not host:
-        raise ValueError(f"--ssh target missing host: {target!r}")
-    return user, host, port
 
 
 async def resolve_fixed_hosts(
