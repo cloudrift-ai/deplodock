@@ -393,6 +393,8 @@ deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Run on a fixed po
 
 When `--local` and/or `--ssh` are supplied, deplodock detects each host's GPU via PCI sysfs and verifies that every planned execution group can run on at least one of the supplied hosts (matching `deploy.gpu` and sufficient `deploy.gpu_count`). If any group is unsatisfied, the run aborts before any work starts. Fixed hosts are assumed to be already provisioned (docker, NVIDIA toolkit, etc.) and are never deleted at the end of the run.
 
+> **Note:** `--local` runs the workload over SSH to `127.0.0.1` (the same code path used for remote hosts). This requires a running SSH server on localhost and that your `--ssh-key` (default `~/.ssh/id_ed25519`) is listed in `~/.ssh/authorized_keys`. Quick check: `ssh -i ~/.ssh/id_ed25519 $USER@127.0.0.1 echo ok`.
+
 Results are always stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
 
 ### Teardown
