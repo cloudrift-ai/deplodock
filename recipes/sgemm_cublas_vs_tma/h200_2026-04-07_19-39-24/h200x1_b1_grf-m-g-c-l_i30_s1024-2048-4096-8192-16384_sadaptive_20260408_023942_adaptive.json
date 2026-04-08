@@ -1,0 +1,253 @@
+{
+  "timestamp": "20260408_023942",
+  "strategy": "adaptive",
+  "config": {
+    "strategy_map": [
+      [
+        256,
+        {
+          "strategy": "tma_db",
+          "threads_y": 8,
+          "threads_x": 32,
+          "block_k": 32,
+          "thread_m": 8,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false,
+          "k_splits": 4,
+          "batch_count": 1
+        }
+      ],
+      [
+        512,
+        {
+          "strategy": "tma_db",
+          "threads_y": 8,
+          "threads_x": 32,
+          "block_k": 32,
+          "thread_m": 8,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false,
+          "k_splits": 4,
+          "batch_count": 1
+        }
+      ],
+      [
+        1024,
+        {
+          "strategy": "tma_db",
+          "threads_y": 8,
+          "threads_x": 32,
+          "block_k": 32,
+          "thread_m": 8,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false,
+          "k_splits": 1,
+          "batch_count": 1
+        }
+      ],
+      [
+        2048,
+        {
+          "strategy": "tma_db",
+          "threads_y": 8,
+          "threads_x": 32,
+          "block_k": 32,
+          "thread_m": 8,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false,
+          "k_splits": 1,
+          "batch_count": 1
+        }
+      ],
+      [
+        4096,
+        {
+          "strategy": "tma_db",
+          "threads_y": 8,
+          "threads_x": 32,
+          "block_k": 32,
+          "thread_m": 8,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false,
+          "k_splits": 1,
+          "batch_count": 1
+        }
+      ],
+      [
+        8192,
+        {
+          "strategy": "tma_db",
+          "threads_y": 8,
+          "threads_x": 32,
+          "block_k": 32,
+          "thread_m": 8,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false,
+          "k_splits": 1,
+          "batch_count": 1
+        }
+      ],
+      [
+        16384,
+        {
+          "strategy": "tma_db",
+          "threads_y": 8,
+          "threads_x": 32,
+          "block_k": 32,
+          "thread_m": 8,
+          "thread_n": 1,
+          "vectorize": false,
+          "unroll_k": false,
+          "double_buffer": false,
+          "smem_pad": 1,
+          "coarsen_rows": 1,
+          "coarsen_cols": 1,
+          "assume_aligned": false,
+          "k_splits": 1,
+          "batch_count": 1
+        }
+      ]
+    ]
+  },
+  "description": "Adaptive benchmark (batch=1)",
+  "cuda_kernel": "#include <cuda.h>\n\n__global__\n__launch_bounds__(256) void fused_matmul(const __grid_constant__ CUtensorMap A_tma, const __grid_constant__ CUtensorMap B_tma, float* C) {\n    extern __shared__ __align__(128) char dsmem[];\n    float*smem=(float*)dsmem;\n    uint64_t*mbar=(uint64_t*)(dsmem+2*6144*4);\n    const int as0=(int)__cvta_generic_to_shared(&smem[0]);\n    const int bs0=(int)__cvta_generic_to_shared(&smem[2048]);\n    const int as1=(int)__cvta_generic_to_shared(&smem[6144]);\n    const int bs1=(int)__cvta_generic_to_shared(&smem[6144+2048]);\n    const int mb0=(int)__cvta_generic_to_shared(&mbar[0]);\n    const int mb1=(int)__cvta_generic_to_shared(&mbar[1]);\n    int tid=threadIdx.y*32+threadIdx.x;\n    int tr=threadIdx.y*8,tc=threadIdx.x*4;\n    // CTA swizzle: rasterize in groups of SWIZ row-blocks for L2 A-tile reuse\n    const int SWIZ=8;\n    int ntx=(N+127)/128;\n    int nty=(M+63)/64;\n    int pid=blockIdx.x+blockIdx.y*gridDim.x;\n    int grp=pid/(ntx*SWIZ);\n    int rem=pid%(ntx*SWIZ);\n    int by_s=grp*SWIZ+rem%SWIZ;\n    int bx_s=rem/SWIZ;\n    if(by_s>=nty||bx_s>=ntx)return;\n    int bm=by_s*64,bn=bx_s*128;\n    \n    if(tid==0){asm volatile(\"mbarrier.init.shared::cta.b64 [%0],%1;\"::\"r\"(mb0),\"r\"(1));asm volatile(\"mbarrier.init.shared::cta.b64 [%0],%1;\"::\"r\"(mb1),\"r\"(1));asm volatile(\"fence.mbarrier_init.release.cluster;\");}\n    __syncthreads();\n    float c00=0,c01=0,c02=0,c03=0,c10=0,c11=0,c12=0,c13=0,c20=0,c21=0,c22=0,c23=0,c30=0,c31=0,c32=0,c33=0,c40=0,c41=0,c42=0,c43=0,c50=0,c51=0,c52=0,c53=0,c60=0,c61=0,c62=0,c63=0,c70=0,c71=0,c72=0,c73=0;\n    const int bytes=24576;\n    int p0=0,p1=0,nt=K/32;\n    if(nt>0&&tid==0){asm volatile(\"mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;\"::\"r\"(mb0),\"r\"(bytes):\"memory\");asm volatile(\"cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{%2,%3}],[%4];\"::\"r\"(as0),\"l\"(&A_tma),\"r\"(0),\"r\"(bm),\"r\"(mb0):\"memory\");asm volatile(\"cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{%2,%3}],[%4];\"::\"r\"(bs0),\"l\"(&B_tma),\"r\"(bn),\"r\"(0),\"r\"(mb0):\"memory\");}\n    for(int t=0;t<nt;t++){\n        int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;\n        int nm=s==0?mb1:mb0;int na=s==0?as1:as0;int nb=s==0?bs1:bs0;\n        asm volatile(\"{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\tmbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}\"::\"r\"(cm),\"r\"(cp),\"r\"(0xffffffff));\n        if(s==0)p0^=1;else p1^=1;\n        if(tid==0&&t+1<nt){int nk=(t+1)*32;asm volatile(\"mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;\"::\"r\"(nm),\"r\"(bytes):\"memory\");asm volatile(\"cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{%2,%3}],[%4];\"::\"r\"(na),\"l\"(&A_tma),\"r\"(nk),\"r\"(bm),\"r\"(nm):\"memory\");asm volatile(\"cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{%2,%3}],[%4];\"::\"r\"(nb),\"l\"(&B_tma),\"r\"(bn),\"r\"(nk),\"r\"(nm):\"memory\");}\n        float*cas=&smem[s*6144];float*cbs=&smem[s*6144+2048];\n        #pragma unroll\n        for(int kk=0;kk<32;kk++){\n                float b0=cbs[kk*128+tc],b1=cbs[kk*128+tc+1],b2=cbs[kk*128+tc+2],b3=cbs[kk*128+tc+3];\n                float a0=cas[(tr+0)*32+kk];\n                c00+=a0*b0;c01+=a0*b1;c02+=a0*b2;c03+=a0*b3;\n                float a1=cas[(tr+1)*32+kk];\n                c10+=a1*b0;c11+=a1*b1;c12+=a1*b2;c13+=a1*b3;\n                float a2=cas[(tr+2)*32+kk];\n                c20+=a2*b0;c21+=a2*b1;c22+=a2*b2;c23+=a2*b3;\n                float a3=cas[(tr+3)*32+kk];\n                c30+=a3*b0;c31+=a3*b1;c32+=a3*b2;c33+=a3*b3;\n                float a4=cas[(tr+4)*32+kk];\n                c40+=a4*b0;c41+=a4*b1;c42+=a4*b2;c43+=a4*b3;\n                float a5=cas[(tr+5)*32+kk];\n                c50+=a5*b0;c51+=a5*b1;c52+=a5*b2;c53+=a5*b3;\n                float a6=cas[(tr+6)*32+kk];\n                c60+=a6*b0;c61+=a6*b1;c62+=a6*b2;c63+=a6*b3;\n                float a7=cas[(tr+7)*32+kk];\n                c70+=a7*b0;c71+=a7*b1;c72+=a7*b2;c73+=a7*b3;\n        }\n        __syncthreads();\n    }\n    #if (M % 64 == 0 && N % 128 == 0)\n    #define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);int gc=bn+tc;float*Cout=C; Cout[gr*N+gc]=v0;Cout[gr*N+gc+1]=v1;Cout[gr*N+gc+2]=v2;Cout[gr*N+gc+3]=v3;}}\n    #else\n    #define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);if(gr<M){{int gc=bn+tc;float*Cout=C; if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}\n    #endif\n        W(0,c00,c01,c02,c03)\n        W(1,c10,c11,c12,c13)\n        W(2,c20,c21,c22,c23)\n        W(3,c30,c31,c32,c33)\n        W(4,c40,c41,c42,c43)\n        W(5,c50,c51,c52,c53)\n        W(6,c60,c61,c62,c63)\n        W(7,c70,c71,c72,c73)\n}\n",
+  "results": [
+    {
+      "kernel_time_ms": 0.064384,
+      "kernel_min_ms": 0.06352,
+      "kernel_max_ms": 0.06576,
+      "cublas_time_ms": 0.065504,
+      "cublas_min_ms": 0.064608,
+      "cublas_max_ms": 0.066496,
+      "sm_clock_mhz_pre": 345,
+      "sm_clock_mhz_post": 1980,
+      "gpu_temp_c_pre": 22,
+      "gpu_temp_c_post": 24,
+      "gflops": 33354.30616302187,
+      "cublas_gflops": 32784.00781631656,
+      "efficiency_pct": 101.7395626242545,
+      "dimensions": {
+        "M": 1024,
+        "N": 1024,
+        "K": 1024
+      }
+    },
+    {
+      "kernel_time_ms": 0.395872,
+      "kernel_min_ms": 0.39504,
+      "kernel_max_ms": 0.39728,
+      "cublas_time_ms": 0.347552,
+      "cublas_min_ms": 0.34656,
+      "cublas_max_ms": 0.348832,
+      "sm_clock_mhz_pre": 345,
+      "sm_clock_mhz_post": 1980,
+      "gpu_temp_c_pre": 23,
+      "gpu_temp_c_post": 24,
+      "gflops": 43397.53552663487,
+      "cublas_gflops": 49431.07559156615,
+      "efficiency_pct": 87.79403443537306,
+      "dimensions": {
+        "M": 2048,
+        "N": 2048,
+        "K": 2048
+      }
+    },
+    {
+      "kernel_time_ms": 3.007968,
+      "kernel_min_ms": 3.006368,
+      "kernel_max_ms": 3.031104,
+      "cublas_time_ms": 2.684512,
+      "cublas_min_ms": 2.680512,
+      "cublas_max_ms": 2.708608,
+      "sm_clock_mhz_pre": 495,
+      "sm_clock_mhz_post": 1980,
+      "gpu_temp_c_pre": 23,
+      "gpu_temp_c_post": 25,
+      "gflops": 45691.62752795242,
+      "cublas_gflops": 51196.997246426916,
+      "efficiency_pct": 89.24669411376715,
+      "dimensions": {
+        "M": 4096,
+        "N": 4096,
+        "K": 4096
+      }
+    },
+    {
+      "kernel_time_ms": 23.4184,
+      "kernel_min_ms": 23.415775,
+      "kernel_max_ms": 23.44256,
+      "cublas_time_ms": 21.438816,
+      "cublas_min_ms": 21.430208,
+      "cublas_max_ms": 21.453184,
+      "sm_clock_mhz_pre": 405,
+      "sm_clock_mhz_post": 1980,
+      "gpu_temp_c_pre": 23,
+      "gpu_temp_c_post": 27,
+      "gflops": 46950.757856044824,
+      "cublas_gflops": 51286.02380728488,
+      "efficiency_pct": 91.5468862091347,
+      "dimensions": {
+        "M": 8192,
+        "N": 8192,
+        "K": 8192
+      }
+    },
+    {
+      "kernel_time_ms": 184.514786,
+      "kernel_min_ms": 184.507172,
+      "kernel_max_ms": 184.522049,
+      "cublas_time_ms": 162.931015,
+      "cublas_min_ms": 162.839386,
+      "cublas_max_ms": 162.991043,
+      "sm_clock_mhz_pre": 390,
+      "sm_clock_mhz_post": 1980,
+      "gpu_temp_c_pre": 24,
+      "gpu_temp_c_post": 31,
+      "gflops": 47671.480497004726,
+      "cublas_gflops": 53986.60913152723,
+      "efficiency_pct": 88.30241658790425,
+      "dimensions": {
+        "M": 16384,
+        "N": 16384,
+        "K": 16384
+      }
+    }
+  ],
+  "error": null
+}
