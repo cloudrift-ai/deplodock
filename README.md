@@ -134,6 +134,8 @@ matrices:
 
 Matrix entries use **dot-notation** for all parameter paths. Scalars are broadcast; lists are zipped (all lists in one entry must have the same length). `deploy.gpu` is required in each entry.
 
+`deploy.driver_version` and `deploy.cuda_version` (optional) request a specific NVIDIA driver / CUDA toolkit on the target host. If the installed version already matches (prefix-match — `"550"` matches `550.127.05`), provisioning is a no-op. On a mismatch, a remote (`ssh`/`cloud`) deploy installs the requested version, reboots the host, and waits for SSH to come back. Local deploys refuse to run privileged commands and will error out instead — these fields are intended for remote machines only.
+
 Engine-agnostic fields (`tensor_parallel_size`, `context_length`, etc.) live at `engine.llm`. Engine-specific fields (`image`, `extra_args`) nest under `engine.llm.vllm` or `engine.llm.sglang`.
 
 ### SGLang Matrix Entry Example

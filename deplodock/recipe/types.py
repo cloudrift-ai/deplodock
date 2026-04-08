@@ -142,6 +142,8 @@ class DeployConfig:
 
     gpu: str | None = None
     gpu_count: int = 1
+    driver_version: str | None = None
+    cuda_version: str | None = None
 
 
 @dataclass
@@ -197,6 +199,8 @@ class Recipe:
         deploy = DeployConfig(
             gpu=deploy_dict.get("gpu"),
             gpu_count=deploy_dict.get("gpu_count", 1),
+            driver_version=deploy_dict.get("driver_version"),
+            cuda_version=deploy_dict.get("cuda_version"),
         )
 
         command = None

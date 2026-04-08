@@ -27,6 +27,7 @@ from deplodock.provisioning.cloud import (
     delete_cloud_vm,
     provision_cloud_vm,
 )
+from deplodock.provisioning.host import RemoteHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_transport import REMOTE_DEPLOY_DIR, make_run_cmd
 from deplodock.provisioning.staging import stage_to_remote
@@ -144,7 +145,13 @@ async def run_execution_group(
 
             instance_id_str = f" (instance_id={conn.delete_info[1]})" if conn.delete_info else ""
             logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}{instance_id_str}")
-            await provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+            first_recipe = group.tasks[0].recipe if group.tasks else None
+            host = RemoteHost(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+            await provision_remote(
+                host,
+                driver_version=first_recipe.deploy.driver_version if first_recipe else None,
+                cuda_version=first_recipe.deploy.cuda_version if first_recipe else None,
+            )
 
         # Collect system info once per execution group
         sysinfo_run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)

@@ -297,3 +297,43 @@ def test_load_recipe_command_skips_extra_args_validation(tmp_path):
         yaml.dump(recipe, f)
     r = load_recipe(str(tmp_path))
     assert r.kind == "command"
+
+
+# ── deploy.driver_version / deploy.cuda_version ─────────────────────
+
+
+def test_load_recipe_parses_driver_and_cuda_version(tmp_path):
+    recipe = {
+        "model": {"huggingface": "x/y"},
+        "engine": {"llm": {"vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
+        "deploy": {
+            "gpu": "NVIDIA H100 80GB",
+            "driver_version": "550",
+            "cuda_version": "12.4",
+        },
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    r = load_recipe(str(tmp_path))
+    assert r.deploy.driver_version == "550"
+    assert r.deploy.cuda_version == "12.4"
+
+
+def test_matrix_expands_driver_version(tmp_path):
+    recipe = {
+        "model": {"huggingface": "x/y"},
+        "engine": {"llm": {"vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA H100 80GB",
+                "deploy.gpu_count": 1,
+                "deploy.driver_version": "560",
+                "deploy.cuda_version": "12.6",
+            },
+        ],
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    r = resolve_for_hardware(str(tmp_path), "NVIDIA H100 80GB", 1)
+    assert r.deploy.driver_version == "560"
+    assert r.deploy.cuda_version == "12.6"
