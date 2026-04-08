@@ -58,7 +58,6 @@ matrices:
     batches: "1"
     iterations: 30
     git_rev: "feature/mini-gpu-compiler@local"
-  # Batched sweep — drops 16384 to stay within 32 GB.
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
     deploy.driver_version: "595.58.03"
@@ -68,9 +67,6 @@ matrices:
     batches: "4,8,16"
     iterations: 20
     git_rev: "feature/mini-gpu-compiler@local"
-  # H200 (Hopper sm_90) — first-gen TMA, kernel does NOT beat cuBLAS here.
-  # Substantiates the article's "What About Hopper?" section. The 141 GB
-  # HBM3e easily fits 16384 single + a generous batched sweep.
   - deploy.gpu: "NVIDIA H200 141GB"
     deploy.gpu_count: 1
     deploy.driver_version: "595.58.03"
@@ -81,6 +77,27 @@ matrices:
     iterations: 30
     git_rev: "feature/mini-gpu-compiler@local"
   - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "256,512,1024,2048,4096,8192"
+    batches: "4,8,16"
+    iterations: 20
+    git_rev: "feature/mini-gpu-compiler@local"
+  # RTX PRO 6000 Blackwell Max-Q (sm_120) — same architecture as 5090 but 188 SMs
+  # vs 170, different wave quantization. Per-GPU tuning profile in tuning.py
+  # picks TM=24 at 4096+ instead of the 5090's TM=20/28.
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "1024,2048,4096,8192,16384"
+    batches: "1"
+    iterations: 30
+    git_rev: "feature/mini-gpu-compiler@local"
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
     deploy.gpu_count: 1
     deploy.driver_version: "595.58.03"
     deploy.cuda_version: "13.2"
