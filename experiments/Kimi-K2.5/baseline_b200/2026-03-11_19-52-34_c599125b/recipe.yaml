@@ -1,0 +1,28 @@
+model:
+  huggingface: "nvidia/Kimi-K2.5-NVFP4"
+
+engine:
+  llm:
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    context_length: 262144
+    max_concurrent_requests: 8
+
+benchmark:
+  max_concurrency: 8
+  num_prompts: 16
+  random_input_len: 8000
+  random_output_len: 8000
+
+matrices:
+  - deploy.gpu: "NVIDIA B200"
+    deploy.gpu_count: 8
+    engine.llm.vllm:
+      image: "vllm/vllm-openai:v0.17.0"
+      extra_args: "--tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
+  - deploy.gpu: "NVIDIA B200"
+    deploy.gpu_count: 8
+    engine.llm.sglang:
+      image: "lmsysorg/sglang:v0.5.9"
+      extra_args: "--tool-call-parser kimi_k2 --reasoning-parser kimi_k2"

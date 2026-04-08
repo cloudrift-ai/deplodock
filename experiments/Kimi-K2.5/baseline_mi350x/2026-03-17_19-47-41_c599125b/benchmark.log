@@ -1,0 +1,13 @@
+[2026-03-17 19:47:41] [root] Run directory: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/baseline_b200/2026-03-17_19-47-41_c599125b
+[2026-03-17 19:47:41] [root] Run directory: /home/runner/work/deplodock/deplodock/experiments/Kimi-K2.5/baseline_mi350x/2026-03-17_19-47-41_c599125b
+[2026-03-17 19:47:41] [root] 
+[2026-03-17 19:47:41] [root] Running 4 benchmark task(s) in 2 execution group(s)
+[2026-03-17 19:47:41] [root] Parallel mode (max workers: 2)
+[2026-03-17 19:47:41] [root] 
+[2026-03-17 19:47:41] [root] Commit mode enabled: results will be committed after each task
+[2026-03-17 19:47:41] [b200_x_8] Starting group: NVIDIA B200 x8 (2 tasks)
+[2026-03-17 19:47:41] [amdmi350x_x_8] Starting group: AMD MI350X x8 (2 tasks)
+[2026-03-17 19:47:41] [amdmi350x_x_8] Unknown GPU 'AMD MI350X' — not in hardware table
+[2026-03-17 19:47:41] [amdmi350x_x_8] VM provisioning failed
+[2026-03-17 19:47:42] [deplodock.commands.bench.committer] Committed: bench: fail baseline_mi350x/amdmi350xx8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2
+[2026-03-17 19:47:44] [deplodock.commands.bench.committer] Pushed to remote
