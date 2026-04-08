@@ -55,6 +55,20 @@ _PROFILE_5090: list[tuple[int, MatmulConfig]] = [
     (16384, _tma(bk=32, tm=28, ks=1)),
 ]
 
+_PROFILE_H200: list[tuple[int, MatmulConfig]] = [
+    # Hopper sm_90. Quick TM sweep on H200 showed TM=8 was optimal at every
+    # size — larger thread tiles regress (likely the first-gen Hopper TMA has
+    # more issue-pressure than Blackwell's refined unit). The kernel does not
+    # beat cuBLAS on H200; see the article's "What About Hopper?" section.
+    (256, _tma(bk=32, tm=8, ks=4)),
+    (512, _tma(bk=32, tm=8, ks=4)),
+    (1024, _tma(bk=32, tm=8, ks=1)),
+    (2048, _tma(bk=32, tm=8, ks=1)),
+    (4096, _tma(bk=32, tm=8, ks=1)),
+    (8192, _tma(bk=32, tm=8, ks=1)),
+    (16384, _tma(bk=32, tm=8, ks=1)),
+]
+
 _PROFILE_PRO6000: list[tuple[int, MatmulConfig]] = [
     # Pro 6000 has 188 SMs (vs 5090's 170). Wave quantization matters more:
     # 1024 needs ks=4 to fill the device (128 blocks / 188 SMs = 0.68 wave),
@@ -73,6 +87,7 @@ _PROFILE_PRO6000: list[tuple[int, MatmulConfig]] = [
 _PROFILES: list[tuple[re.Pattern[str], list[tuple[int, MatmulConfig]], str]] = [
     (re.compile(r"RTX\s*PRO\s*6000", re.IGNORECASE), _PROFILE_PRO6000, "rtx_pro_6000"),
     (re.compile(r"RTX\s*5090", re.IGNORECASE), _PROFILE_5090, "rtx_5090"),
+    (re.compile(r"\bH200\b", re.IGNORECASE), _PROFILE_H200, "h200"),
 ]
 
 _DEFAULT_PROFILE = _PROFILE_5090

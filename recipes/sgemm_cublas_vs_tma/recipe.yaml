@@ -21,7 +21,8 @@ command:
     mkdir -p $task_dir/diagnostics
     bash scripts/diagnostics/dump_cublas_kernels.sh \
         > $task_dir/diagnostics/cublas_kernels.txt 2>&1 || true
-    nvcc -O3 --fmad=true -arch=sm_120 -lcublas -lcurand \
+    arch="sm_$$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')"
+    nvcc -O3 --fmad=true -arch=$$arch -lcublas -lcurand \
         -o /tmp/cublas_loop_vs_strided \
         scripts/diagnostics/cublas_loop_vs_strided.cu 2>/dev/null && {
         for batch in 4 16; do
@@ -59,6 +60,27 @@ matrices:
     git_rev: "feature/mini-gpu-compiler@local"
   # Batched sweep — drops 16384 to stay within 32 GB.
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "256,512,1024,2048,4096,8192"
+    batches: "4,8,16"
+    iterations: 20
+    git_rev: "feature/mini-gpu-compiler@local"
+  # H200 (Hopper sm_90) — first-gen TMA, kernel does NOT beat cuBLAS here.
+  # Substantiates the article's "What About Hopper?" section. The 141 GB
+  # HBM3e easily fits 16384 single + a generous batched sweep.
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "1024,2048,4096,8192,16384"
+    batches: "1"
+    iterations: 30
+    git_rev: "feature/mini-gpu-compiler@local"
+  - deploy.gpu: "NVIDIA H200 141GB"
     deploy.gpu_count: 1
     deploy.driver_version: "595.58.03"
     deploy.cuda_version: "13.2"
