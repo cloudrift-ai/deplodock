@@ -29,6 +29,8 @@ command:
                 > $task_dir/diagnostics/cublas_loop_vs_strided_1024xb$$batch.txt 2>&1 || true
         done
     }
+    ./venv/bin/python scripts/diagnostics/sass_analysis.py 8192 \
+        > $task_dir/diagnostics/sass_analysis_8192.md 2>&1 || true
   result_files:
     - "*.json"
     - "*.md"
