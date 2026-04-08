@@ -53,7 +53,8 @@ VM lifecycle management and cloud provisioning.
 - `types.py` — `VMConnectionInfo` dataclass
 - `ssh.py` — `wait_for_ssh()` (provider-agnostic SSH polling)
 - `shell.py` — `run_shell_cmd()`
-- `remote.py` — `provision_remote()` (install Docker, NVIDIA toolkit)
+- `host.py` — `Host`, `LocalHost`, `RemoteHost` (sudo-gated command runner — `LocalHost.run(sudo=True)` raises so local deploys can't modify the dev box)
+- `remote.py` — `provision_remote()` (install Docker, optional NVIDIA driver/CUDA, NVIDIA container toolkit; reboots and waits for the host on driver/CUDA install)
 - `cloud.py` — `resolve_vm_spec()`, `provision_cloud_vm()`, `delete_cloud_vm()`
 - `cloudrift.py` — CloudRift REST API provider
 - `gcp.py` — GCP gcloud provider

@@ -13,6 +13,7 @@ from deplodock.deploy import (
     teardown as teardown_entry,
 )
 from deplodock.detect import detect_remote_gpus
+from deplodock.provisioning.host import RemoteHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_target import parse_ssh_target
 from deplodock.recipe import resolve_for_hardware
@@ -66,7 +67,13 @@ async def _handle_ssh(args):
         dry_run=args.dry_run,
     )
     skip_nvidia = recipe.deploy.gpu is not None and recipe.deploy.gpu.startswith("AMD")
-    await provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run, skip_nvidia=skip_nvidia)
+    host = RemoteHost(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    await provision_remote(
+        host,
+        skip_nvidia=skip_nvidia,
+        driver_version=recipe.deploy.driver_version,
+        cuda_version=recipe.deploy.cuda_version,
+    )
 
     if args.teardown:
         return await teardown_entry(params)
