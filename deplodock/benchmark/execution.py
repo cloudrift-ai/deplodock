@@ -73,6 +73,9 @@ async def run_execution_group(
     dry_run: bool = False,
     no_teardown: bool = False,
     on_task_done: OnTaskDone | None = None,
+    server: str | None = None,
+    ssh_port: int = 22,
+    skip_deploy: bool = False,
 ) -> tuple[list[tuple[BenchmarkTask, bool]], dict | None]:
     """Run all benchmark tasks for one execution group.
 
@@ -80,10 +83,20 @@ async def run_execution_group(
     Tasks with fewer GPUs than the group get gpu_device_ids set.
     Each task's run_dir (set before calling) determines where results go.
 
+    When ``server`` is provided, VM provisioning and remote setup are
+    skipped — the given address is used directly.  When ``skip_deploy``
+    is also set, model deployment and per-task teardown are skipped too.
+
     Args:
         on_task_done: Optional async callback invoked after each task completes
             (success or failure). Receives (task, success). Exceptions are
             caught and logged, never propagated.
+        server: SSH address of an existing server (user@host).  When set,
+            cloud VM provisioning and remote provisioning are skipped.
+        ssh_port: SSH port for the server (default 22).  Only used when
+            ``server`` is set.
+        skip_deploy: Skip model deployment and teardown.  Only used when
+            ``server`` is set.
 
     Returns:
         A tuple of (task_results, instance_info). task_results is a list of
@@ -114,28 +127,38 @@ async def run_execution_group(
 
     conn = None
     try:
-        conn = await provision_cloud_vm(
-            group.gpu_name,
-            group.gpu_count,
-            ssh_key,
-            providers_config,
-            server_name=group_label,
-            dry_run=dry_run,
-            logger=logger,
-        )
-        if conn is None:
-            logger.error("VM provisioning failed")
-            for task in group.tasks:
-                task_results.append((task, False))
-                await _invoke_callback(on_task_done, task, False, logger)
-            return task_results, None
+        # Resolve server connection — either provision a cloud VM or use the provided server
+        if server:
+            address = server
+            actual_ssh_port = ssh_port
+            port_mappings: list[tuple[int, int]] = []
+            logger.info(f"Using existing server: {address}:{actual_ssh_port}")
+        else:
+            conn = await provision_cloud_vm(
+                group.gpu_name,
+                group.gpu_count,
+                ssh_key,
+                providers_config,
+                server_name=group_label,
+                dry_run=dry_run,
+                logger=logger,
+            )
+            if conn is None:
+                logger.error("VM provisioning failed")
+                for task in group.tasks:
+                    task_results.append((task, False))
+                    await _invoke_callback(on_task_done, task, False, logger)
+                return task_results, None
 
-        instance_id_str = f" (instance_id={conn.delete_info[1]})" if conn.delete_info else ""
-        logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}{instance_id_str}")
-        await provision_remote(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+            address = conn.address
+            actual_ssh_port = conn.ssh_port
+            port_mappings = conn.port_mappings
+            instance_id_str = f" (instance_id={conn.delete_info[1]})" if conn.delete_info else ""
+            logger.info(f"VM provisioned: {address}:{actual_ssh_port}{instance_id_str}")
+            await provision_remote(address, ssh_key, actual_ssh_port, dry_run=dry_run)
 
         # Collect system info once per execution group
-        sysinfo_run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+        sysinfo_run_cmd = make_run_cmd(address, ssh_key, actual_ssh_port, dry_run=dry_run)
         system_info = await collect_system_info(sysinfo_run_cmd)
 
         for task in group.tasks:
@@ -155,28 +178,29 @@ async def run_execution_group(
             # than requested (e.g. B200 only available as 8-GPU instances).
             gpu_device_ids = list(range(task.gpu_count))
 
-            params = DeployParams(
-                server=conn.address,
-                ssh_key=ssh_key,
-                ssh_port=conn.ssh_port,
-                recipe=recipe,
-                model_dir=model_dir,
-                hf_token=hf_token,
-                dry_run=dry_run,
-                gpu_device_ids=gpu_device_ids,
-                port_mappings=conn.port_mappings,
-            )
-            task_logger.info("Deploying model...")
-            success = await deploy_entry(params)
+            if not skip_deploy:
+                params = DeployParams(
+                    server=address,
+                    ssh_key=ssh_key,
+                    ssh_port=actual_ssh_port,
+                    recipe=recipe,
+                    model_dir=model_dir,
+                    hf_token=hf_token,
+                    dry_run=dry_run,
+                    gpu_device_ids=gpu_device_ids,
+                    port_mappings=port_mappings,
+                )
+                task_logger.info("Deploying model...")
+                success = await deploy_entry(params)
 
-            if not success:
-                task_logger.error("Deploy failed, skipping benchmark")
-                task_results.append((task, False))
-                await _invoke_callback(on_task_done, task, False, task_logger)
-                continue
+                if not success:
+                    task_logger.error("Deploy failed, skipping benchmark")
+                    task_results.append((task, False))
+                    await _invoke_callback(on_task_done, task, False, task_logger)
+                    continue
 
             task_logger.info("Running benchmark...")
-            run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+            run_cmd = make_run_cmd(address, ssh_key, actual_ssh_port, dry_run=dry_run)
             bench_success, output, stderr, bench_command = await run_benchmark_workload(
                 run_cmd,
                 recipe,
@@ -186,7 +210,10 @@ async def run_execution_group(
             if bench_success or dry_run:
                 if not dry_run:
                     benchmark_output = extract_benchmark_results(output)
-                    compose_content = generate_compose(recipe, model_dir, hf_token, gpu_device_ids=gpu_device_ids)
+                    if skip_deploy:
+                        compose_content = "N/A (server mode)"
+                    else:
+                        compose_content = generate_compose(recipe, model_dir, hf_token, gpu_device_ids=gpu_device_ids)
                     full_result = compose_result(task, benchmark_output, compose_content, bench_command, system_info)
                     result_path.write_text(full_result)
                     json_data = compose_json_result(task, benchmark_output, compose_content, bench_command, system_info)
@@ -205,7 +232,7 @@ async def run_execution_group(
                 task_results.append((task, False))
                 await _invoke_callback(on_task_done, task, False, task_logger)
 
-            if not no_teardown:
+            if not skip_deploy and not no_teardown:
                 task_logger.info("Tearing down...")
                 await teardown_entry(params)
 
@@ -238,6 +265,9 @@ async def _run_groups(
     max_workers,
     no_teardown=False,
     on_task_done: OnTaskDone | None = None,
+    server: str | None = None,
+    ssh_port: int = 22,
+    skip_deploy: bool = False,
 ):
     """Run execution groups concurrently with a semaphore."""
     sem = asyncio.Semaphore(max_workers or len(groups))
@@ -251,6 +281,9 @@ async def _run_groups(
                 dry_run,
                 no_teardown,
                 on_task_done,
+                server=server,
+                ssh_port=ssh_port,
+                skip_deploy=skip_deploy,
             )
 
     results = await asyncio.gather(

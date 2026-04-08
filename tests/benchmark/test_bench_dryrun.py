@@ -203,11 +203,152 @@ def test_bench_group_log_captures_provisioning(run_cli, make_bench_config, tmp_p
             shutil.rmtree(d)
 
 
+def test_bench_server_dry_run(run_cli, make_bench_config, recipes_dir, tmp_path):
+    """With --server, deploy+benchmark+teardown happen but no VM provisioning."""
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--server",
+        "user@somehost",
+        "--config",
+        config_path,
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+
+    # Deploy and benchmark should still happen
+    assert "docker compose pull" in stdout
+    assert "bench serve" in stdout
+    assert "docker compose down" in stdout
+
+    # No VM provisioning
+    assert "Creating CloudRift instance" not in stdout
+    assert "Using existing server" in stdout
+
+
+def test_bench_server_skip_deploy_dry_run(run_cli, make_bench_config, recipes_dir, tmp_path):
+    """With --server --skip-deploy, only benchmark runs — no deploy or teardown."""
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--server",
+        "user@somehost",
+        "--skip-deploy",
+        "--config",
+        config_path,
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+
+    # Benchmark should run
+    assert "bench serve" in stdout
+
+    # No deploy or teardown
+    assert "docker compose pull" not in stdout
+    assert "Deploying model..." not in stdout
+    assert "Tearing down..." not in stdout
+
+
+def test_bench_server_no_config_required(run_cli, recipes_dir, tmp_path):
+    """--server should work without config.yaml when none exists."""
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    # Run from tmp_path where no config.yaml exists
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--server",
+        "user@somehost",
+        "--skip-deploy",
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    assert "bench serve" in stdout
+
+
+def test_bench_server_gpu_filter(run_cli, make_bench_config, tmp_path):
+    """--gpu filters tasks to matching GPU name only."""
+    import yaml
+
+    # Create a recipe with two GPU variants
+    recipe_dir = tmp_path / "MultiGpuRecipe"
+    recipe_dir.mkdir()
+    recipe = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "gpu_memory_utilization": 0.9,
+                "context_length": 8192,
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+            }
+        },
+        "benchmark": {
+            "max_concurrency": 128,
+            "num_prompts": 256,
+            "random_input_len": 4000,
+            "random_output_len": 4000,
+        },
+        "matrices": [
+            {"deploy.gpu": "NVIDIA GeForce RTX 5090", "deploy.gpu_count": 1},
+            {"deploy.gpu": "NVIDIA H100 80GB", "deploy.gpu_count": 4, "engine.llm.tensor_parallel_size": 4},
+        ],
+    }
+    (recipe_dir / "recipe.yaml").write_text(yaml.dump(recipe))
+    config_path = make_bench_config(tmp_path)
+
+    rc, stdout, stderr = run_cli(
+        "bench",
+        str(recipe_dir),
+        "--server",
+        "user@somehost",
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--skip-deploy",
+        "--config",
+        config_path,
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+
+    # Only the RTX 5090 task should run (1 group)
+    assert "1 benchmark task(s)" in stdout
+    assert "1 execution group(s)" in stdout
+
+
+def test_bench_server_incompatible_gpu_concurrency(run_cli, make_bench_config, recipes_dir, tmp_path):
+    """--server with --gpu-concurrency > 1 should fail."""
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--server",
+        "user@somehost",
+        "--gpu-concurrency",
+        "2",
+        "--config",
+        config_path,
+        "--dry-run",
+    )
+    assert rc != 0
+    combined = stdout + stderr
+    assert "--gpu-concurrency is incompatible with --server" in combined
+
+
 def test_bench_help(run_cli):
     rc, stdout, _ = run_cli("bench", "--help")
     assert rc == 0
     assert "recipes" in stdout
+    assert "--server" in stdout
     assert "--ssh-key" in stdout
+    assert "--ssh-port" in stdout
+    assert "--gpu" in stdout
+    assert "--skip-deploy" in stdout
     assert "--dry-run" in stdout
     assert "--config" in stdout
     assert "--max-workers" in stdout

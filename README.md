@@ -378,6 +378,8 @@ deplodock vm delete cloudrift --instance-id <id>
 
 The `bench` command accepts recipe directories as positional arguments. It loads each recipe, provisions cloud VMs, deploys the model, runs `vllm bench serve`, captures results, and tears down. Recipes sharing the same model and GPU type are grouped onto the same VM.
 
+With `--server`, bench connects to an existing server instead of provisioning a cloud VM. The full deploy→benchmark→teardown cycle still runs unless `--skip-deploy` is also set (for when the model is already running).
+
 ### Run Benchmarks
 
 ```bash
@@ -385,13 +387,20 @@ deplodock bench recipes/*                                    # Run all recipes (
 deplodock bench experiments/.../optimal_mcr_rtx5090          # Run an experiment
 deplodock bench recipes/* --gpu-concurrency 4                # Number of VMs per GPU type to spin up
 deplodock bench recipes/* --dry-run                          # Preview commands
+deplodock bench recipes/MyModel --server user@host           # Use existing server (still deploys)
+deplodock bench recipes/MyModel --server user@host --skip-deploy  # Benchmark only (model already running)
+deplodock bench recipes/MyModel --server user@host --gpu "NVIDIA GeForce RTX 5090"  # Filter to GPU variant
 ```
 
 | Flag                 | Default             | Description                                                              |
 |----------------------|---------------------|--------------------------------------------------------------------------|
 | `recipes`            | (required)          | Recipe directories (positional args)                                     |
+| `--server`           | (none)              | SSH address of existing server (`user@host`). Skips VM provisioning.     |
 | `--ssh-key`          | `~/.ssh/id_ed25519` | SSH private key path                                                     |
-| `--config`           | `config.yaml`       | Path to configuration file                                               |
+| `--ssh-port`         | 22                  | SSH port (only with `--server`)                                          |
+| `--gpu`              | (none)              | Filter tasks to this GPU name (only with `--server`)                     |
+| `--skip-deploy`      | false               | Skip deployment and teardown (only with `--server`)                      |
+| `--config`           | `config.yaml`       | Path to configuration file (optional with `--server`)                    |
 | `--max-workers`      | num groups          | Max parallel execution groups                                            |
 | `--gpu-concurrency`  | 1                   | Split each (model, GPU) group across up to N VMs                         |
 | `--dry-run`          | false               | Print commands without executing                                         |

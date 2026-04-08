@@ -67,7 +67,7 @@ Benchmark configuration, task enumeration, and execution.
 - `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `add_group_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_GroupNameFilter`, `_BenchConsoleFormatter`
 - `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
 - `tasks.py` — `enumerate_tasks()`
-- `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type
+- `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type. `run_execution_group` accepts optional `server`/`ssh_port`/`skip_deploy` parameters to use an existing server instead of provisioning a VM.
 - `results.py` — `BenchmarkMetrics`, `SystemInfo` dataclasses, `parse_benchmark_metrics()`, `parse_system_info()`, `compose_json_result()`
 
 ### `planner/` — Planner Layer
@@ -95,7 +95,7 @@ async def _handle_foo(args):
 ```
 
 **Command modules:**
-- `commands/bench/` — `handle_bench()`, `register_bench_command()`, `GitCommitter` (incremental result commits)
+- `commands/bench/` — `handle_bench()`, `register_bench_command()`, `GitCommitter` (incremental result commits). Supports `--server` to use an existing server instead of provisioning a cloud VM, `--skip-deploy` to skip deployment when the model is already running, and `--gpu` to filter tasks to a specific GPU variant.
 - `commands/deploy/ssh.py` — `handle_ssh()`, `register_ssh_target()` — auto-detects remote GPU via SSH, resolves matrix, applies scale-out strategy
 - `commands/deploy/local.py` — `handle_local()`, `register_local_target()` — auto-detects local GPU via PCI sysfs, resolves matrix, applies scale-out strategy
 - `commands/deploy/cloud.py` — `handle_cloud()`, `register_cloud_target()` — uses recipe's `deploy.gpu` for matrix resolution
@@ -123,19 +123,20 @@ GroupByModelAndGpuPlanner.plan() -> list[ExecutionGroup]
 asyncio.gather(*groups)  -- each group runs as async task:
     |
     v
-provision_cloud_vm() -> VMConnectionInfo
+if --server: use existing server
+else: provision_cloud_vm() -> VMConnectionInfo
     |
     v
 For each task in group:
     +-- set gpu_device_ids if task.gpu_count < group.gpu_count
-    +-- deploy(DeployParams) -> compose up
+    +-- deploy(DeployParams) -> compose up  (skipped with --skip-deploy)
     +-- run_benchmark_workload()
     +-- save results
     +-- on_task_done callback (--commit-results: git add + commit + push)
-    +-- teardown() (skipped with --no-teardown)
+    +-- teardown() (skipped with --no-teardown or --skip-deploy)
     |
     v
-delete_cloud_vm(conn.delete_info) (skipped with --no-teardown; writes instances.json)
+delete_cloud_vm(conn.delete_info) (skipped with --no-teardown or --server; writes instances.json)
 ```
 
 ## CLI Command Tree

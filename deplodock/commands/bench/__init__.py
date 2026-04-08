@@ -2,11 +2,16 @@
 
 Accepts recipe directories as positional args. A Planner groups tasks into
 ExecutionGroups that share VMs; groups run in parallel via asyncio.
+
+When ``--server`` is provided, cloud VM provisioning is skipped and the
+given server is used directly.  ``--skip-deploy`` additionally skips
+model deployment and teardown (assumes the model is already running).
 """
 
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -28,8 +33,31 @@ def handle_bench(args):
     setup_logging()
     root_logger = logging.getLogger()
 
-    config = load_config(args.config)
-    validate_config(config)
+    server = getattr(args, "server", None)
+    skip_deploy = getattr(args, "skip_deploy", False)
+    ssh_port = getattr(args, "ssh_port", 22)
+    gpu_filter = getattr(args, "gpu", None)
+
+    # Validate server-only flags
+    if not server:
+        for flag, name in [(skip_deploy, "--skip-deploy"), (gpu_filter, "--gpu")]:
+            if flag:
+                root_logger.error(f"Error: {name} requires --server.")
+                sys.exit(1)
+        if ssh_port != 22:
+            root_logger.error("Error: --ssh-port requires --server.")
+            sys.exit(1)
+
+    if server and args.gpu_concurrency > 1:
+        root_logger.error("Error: --gpu-concurrency is incompatible with --server.")
+        sys.exit(1)
+
+    # Load config — optional when using --server
+    if server and not os.path.exists(args.config):
+        config = {"benchmark": {"model_dir": "/hf_models"}}
+    else:
+        config = load_config(args.config)
+        validate_config(config)
 
     ssh_key = _expand_path(args.ssh_key)
     dry_run = args.dry_run
@@ -40,6 +68,22 @@ def handle_bench(args):
     if not tasks:
         root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
+
+    # Filter tasks by GPU name when --gpu is set
+    if gpu_filter:
+        tasks = [t for t in tasks if t.gpu_name == gpu_filter]
+        if not tasks:
+            root_logger.error(f"Error: No tasks match --gpu '{gpu_filter}'.")
+            sys.exit(1)
+
+    # Warn if --server targets multiple GPU variants without --gpu
+    if server and not gpu_filter:
+        gpu_names = {t.gpu_name for t in tasks}
+        if len(gpu_names) > 1:
+            root_logger.warning(
+                f"Warning: Tasks span multiple GPUs ({', '.join(sorted(gpu_names))}). "
+                "Consider using --gpu to filter to the target hardware."
+            )
 
     # Create per-recipe run directories
     recipe_run_dirs = {}
@@ -87,7 +131,20 @@ def handle_bench(args):
         on_task_done = GitCommitter(asyncio.Lock())
 
     # Run groups
-    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown, on_task_done))
+    raw_results = asyncio.run(
+        _run_groups(
+            groups,
+            config,
+            ssh_key,
+            dry_run,
+            args.max_workers,
+            no_teardown,
+            on_task_done,
+            server=server,
+            ssh_port=ssh_port,
+            skip_deploy=skip_deploy,
+        )
+    )
 
     # Flatten results, handling exceptions
     all_results: list[tuple[BenchmarkTask, bool]] = []
@@ -146,9 +203,30 @@ def register_bench_command(subparsers):
         help="Recipe directories to benchmark",
     )
     parser.add_argument(
+        "--server",
+        default=None,
+        help="SSH address of an existing server (user@host). Skips VM provisioning.",
+    )
+    parser.add_argument(
         "--ssh-key",
         default="~/.ssh/id_ed25519",
         help="SSH private key path (default: ~/.ssh/id_ed25519)",
+    )
+    parser.add_argument(
+        "--ssh-port",
+        type=int,
+        default=22,
+        help="SSH port (default: 22). Only used with --server.",
+    )
+    parser.add_argument(
+        "--gpu",
+        default=None,
+        help="Filter tasks to this GPU name (e.g. 'NVIDIA GeForce RTX 5090'). Only used with --server.",
+    )
+    parser.add_argument(
+        "--skip-deploy",
+        action="store_true",
+        help="Skip model deployment and teardown (assumes model is already running). Requires --server.",
     )
     parser.add_argument(
         "--config",

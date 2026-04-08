@@ -33,6 +33,8 @@ Or for a specific test file:
 - `deplodock deploy ssh ...` — deploy to remote server via SSH
 - `deplodock deploy cloud ...` — provision a cloud VM and deploy via SSH
 - `deplodock bench recipes/* ...` — deploy + benchmark + teardown on cloud VMs (recipe dirs as positional args)
+- `deplodock bench recipes/* --server user@host` — use existing server instead of provisioning a VM
+- `deplodock bench recipes/* --server user@host --skip-deploy` — benchmark only (model already running)
 - `deplodock bench experiments/...` — run an experiment (results stored in the experiment dir)
 - `deplodock teardown <run_dir>` — clean up VMs left running by `bench --no-teardown`
 - `deplodock vm create gcp ...` — create a GCP GPU VM
