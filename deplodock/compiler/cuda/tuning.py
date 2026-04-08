@@ -72,14 +72,21 @@ _PROFILE_H200: list[tuple[int, MatmulConfig]] = [
 _PROFILE_PRO6000: list[tuple[int, MatmulConfig]] = [
     # Pro 6000 has 188 SMs (vs 5090's 170). Wave quantization matters more:
     # 1024 needs ks=4 to fill the device (128 blocks / 188 SMs = 0.68 wave),
-    # and 8192 prefers TM=24 over the 5090's TM=28.
+    # and 8192 prefers TM=26 over the 5090's TM=28 (TM sweep 18-28 at 4096
+    # and 8192 batch=8 picked TM=26 by 0.2-0.7pp; the surface is very flat
+    # from TM=24 to TM=28). The Pro 6000 batched mode does NOT see the same
+    # TMA win as the 5090: cuBLAS dispatches the LARGE 256x128_8x4 kernel
+    # for batched on Pro 6000 (73% FMA pipe util) instead of the SMALL
+    # 128x32_8x5 kernel it picks on 5090 (41% util). Both GPUs are sm_120
+    # Blackwell — the difference is in cuBLAS's dispatcher heuristic, not
+    # the hardware. So Pro 6000 batched ceiling is ~95% vs 5090's 160%.
     (256, _tma(bk=32, tm=8, ks=4)),
     (512, _tma(bk=32, tm=8, ks=4)),
     (1024, _tma(bk=32, tm=8, ks=4)),
-    (2048, _tma(bk=32, tm=24, ks=1)),
-    (4096, _tma(bk=32, tm=24, ks=1)),
-    (8192, _tma(bk=32, tm=24, ks=1)),
-    (16384, _tma(bk=32, tm=24, ks=1)),
+    (2048, _tma(bk=32, tm=26, ks=1)),
+    (4096, _tma(bk=32, tm=26, ks=1)),
+    (8192, _tma(bk=32, tm=26, ks=1)),
+    (16384, _tma(bk=32, tm=26, ks=1)),
 ]
 
 # Match against the GPU name reported by `nvidia-smi --query-gpu=name`.

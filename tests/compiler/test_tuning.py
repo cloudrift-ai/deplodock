@@ -8,9 +8,10 @@ from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
 def test_pro6000_dispatch():
     smap, name = default_matmul_strategy_map("NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition")
     assert name == "rtx_pro_6000"
-    # 4096 should pick TM=24 (the Pro 6000 sweet spot, vs 5090's TM=20).
+    # 4096 should pick TM=26 (Pro 6000 sweet spot from a TM 18-28 sweep, vs
+    # 5090's TM=20). The surface from TM=24 to TM=28 is very flat (within 1pp).
     cfg_4096 = next(c for thr, c in smap if thr >= 4096)
-    assert cfg_4096.thread_m == 24
+    assert cfg_4096.thread_m == 26
     assert cfg_4096.strategy == "tma_db"
     # 1024 needs k_splits=4 on Pro 6000 (188 SMs) to fill the device.
     cfg_1024 = next(c for thr, c in smap if thr >= 1024)
