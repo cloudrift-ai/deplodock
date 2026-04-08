@@ -27,11 +27,24 @@ from deplodock.compiler.ops import FusedReduceElementwiseOp
 
 @dataclass
 class MatmulConfig:
-    """Tunable parameters for matmul lowering."""
+    """Tunable parameters for matmul lowering.
+
+    `threads_y` / `threads_x` describe the **launched CUDA block dimensions**
+    (blockDim.y, blockDim.x) — they are NOT the tile shape in the M/N
+    directions. For "one thread per output element" strategies (`naive`,
+    `smem_tiled`, `register_blocked`) the tile happens to equal the thread
+    dim because `thread_m = thread_n = 1`; for tile-coarsened strategies the
+    tile is `threads_y * thread_m` × `threads_x * thread_n`.
+
+    The `tma_db` strategy currently hardcodes `(32, 8)` in its kernel template
+    and does not read these fields at lowering time — the `_tma()` factory in
+    `tuning.py` still records `(32, 8)` here so the JSON trace is honest about
+    the launched block.
+    """
 
     strategy: str = "naive"
-    block_m: int = 16
-    block_n: int = 16
+    threads_y: int = 16
+    threads_x: int = 16
     block_k: int = 16
     thread_m: int = 1
     thread_n: int = 1
@@ -165,7 +178,7 @@ def _lower_matmul_naive(graph, out_node, config):
             KernelParam("int", "K"),
         ],
         body=[row_var, col_var, bounds],
-        block_size=(config.block_n, config.block_m, 1),
+        block_size=(config.threads_x, config.threads_y, 1),
     )
 
 
@@ -182,8 +195,8 @@ def _lower_matmul_smem_tiled(graph, out_node, config):
     b_name = input_b.output.name
     c_name = out_node.output.name
 
-    bm = config.block_m
-    bn = config.block_n
+    bm = config.threads_y
+    bn = config.threads_x
     bk = config.block_k
     pad = config.smem_pad
     num_threads = bm * bn
@@ -320,8 +333,8 @@ def _lower_matmul_register_blocked(graph, out_node, config):
     b_name = input_b.output.name
     c_name = out_node.output.name
 
-    bm = config.block_m
-    bn = config.block_n
+    bm = config.threads_y
+    bn = config.threads_x
     bk = config.block_k
     tm = config.thread_m
     tn = config.thread_n
@@ -589,7 +602,7 @@ def _lower_matmul_coarsened_f4(graph, out_node, config):
             KernelParam("int", "K"),
         ],
         body=body,
-        block_size=(config.block_n, config.block_m, 1),
+        block_size=(config.threads_x, config.threads_y, 1),
     )
 
 
@@ -750,8 +763,8 @@ def _lower_matmul_hybrid_smem_f4(graph, out_node, config):
     body: list = []
     rows_per_thread = config.thread_m if config.thread_m > 1 else 2
     cols_per_thread = 4
-    threads_y = config.block_m if config.block_m != 16 else 8
-    threads_x = config.block_n if config.block_n != 16 else 32
+    threads_y = config.threads_y if config.threads_y != 16 else 8
+    threads_x = config.threads_x if config.threads_x != 16 else 32
     smem_rows = threads_y * rows_per_thread  # 16
     smem_stride = bk + 1  # padding to avoid bank conflicts
 
@@ -928,7 +941,7 @@ def _lower_matmul_flat_scalar(graph, out_node, config):
     b_name = input_b.output.name
     c_name = out_node.output.name
 
-    threads_x = config.block_n  # 128 by default
+    threads_x = config.threads_x  # 128 by default
 
     body: list = []
 
@@ -1002,7 +1015,7 @@ def _lower_matmul_flat_f4(graph, out_node, config):
 
     from deplodock.compiler.cuda.ir import FieldAccess, VectorLoad
 
-    threads_x = config.block_n  # 32 by default
+    threads_x = config.threads_x  # 32 by default
 
     body: list = []
 
@@ -1108,8 +1121,8 @@ def _lower_matmul_hybrid_1r_f4(graph, out_node, config):
 
     body: list = []
     cols_per_thread = 4
-    threads_y = config.block_m
-    threads_x = config.block_n
+    threads_y = config.threads_y
+    threads_x = config.threads_x
     smem_rows = threads_y
     smem_stride = bk + 1
 
@@ -1238,8 +1251,8 @@ def _lower_matmul_smem_ab_blocked(graph, out_node, config):
     bk = config.block_k
     tm = config.thread_m
     tn = config.thread_n
-    threads_x = config.block_n
-    threads_y = config.block_m
+    threads_x = config.threads_x
+    threads_y = config.threads_y
     num_threads = threads_x * threads_y
     bm = threads_y * tm
     bn = threads_x * tn * 4

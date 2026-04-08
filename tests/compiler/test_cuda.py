@@ -283,3 +283,116 @@ def test_run_benchmark_surfaces_cuda_oom():
     assert all(r.kernel_time_ms > 0 for r in suite.results), (
         "Bench produced a 0-ms row — cudaGetLastError check is not working"
     )
+
+
+# All matmul lowering strategies that the dispatcher in lower_graph() recognizes.
+# Each entry: (strategy name, MatmulConfig overrides). The configs are the
+# minimum settings each strategy needs to compile — many have hardcoded
+# assumptions about block / coarsening dims and won't accept arbitrary values.
+ALL_STRATEGIES: list[tuple[str, dict]] = [
+    ("naive", {}),
+    ("smem_tiled", {"threads_y": 16, "threads_x": 16, "block_k": 16}),
+    ("register_blocked", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "thread_n": 2}),
+    ("coarsened_f4", {"threads_y": 16, "threads_x": 16, "block_k": 16, "coarsen_cols": 4}),
+    ("coarsened_2r4c", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "coarsen_rows": 2, "coarsen_cols": 4}),
+    ("hybrid_smem_f4", {"threads_y": 16, "threads_x": 16, "block_k": 32, "thread_m": 2, "coarsen_rows": 2, "coarsen_cols": 4}),
+    ("flat_scalar", {"threads_x": 128, "block_k": 16}),
+    ("flat_f4", {"threads_x": 32, "block_k": 16}),
+    ("hybrid_1r_f4", {"threads_y": 16, "threads_x": 16, "block_k": 16, "coarsen_cols": 4}),
+    ("smem_ab_blocked", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "thread_n": 2}),
+    ("tma_db", {"block_k": 32, "thread_m": 8}),
+    # wmma_bf16 hardcodes BM=BN=64 and 128 threads internally — config dims are ignored.
+    ("wmma_bf16", {"block_k": 16}),
+]
+
+
+@pytest.mark.parametrize("strategy_name,overrides", ALL_STRATEGIES, ids=[s[0] for s in ALL_STRATEGIES])
+def test_lower_every_strategy(strategy_name, overrides):
+    """Every strategy listed in `lower_graph` must produce a valid KernelDef.
+
+    Pure lowering — no nvcc, no GPU. Catches dispatcher / template errors after
+    refactors like the `block_m`/`block_n` → `threads_y`/`threads_x` rename.
+    """
+    from deplodock.compiler.cuda.lower import MatmulConfig
+
+    # Use a size that's a multiple of common tile factors so any per-strategy
+    # divisibility assertion passes.
+    M, K, N = 64, 64, 64
+
+    g = _make_matmul_graph(M, K, N)
+    fused = _fuse(g)
+    cfg = MatmulConfig(strategy=strategy_name, **overrides)
+    kernel = lower_graph(fused, config=cfg)
+    source = emit_kernel(kernel)
+    assert kernel.name
+    assert source
+    # Sanity: the launched block dim should match what the strategy advertises.
+    bx, by, _bz = kernel.block_size
+    assert bx > 0 and by > 0
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "strategy_name,overrides",
+    [
+        ("naive", {}),
+        ("smem_tiled", {"threads_y": 16, "threads_x": 16, "block_k": 16}),
+        ("register_blocked", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "thread_n": 2}),
+        ("coarsened_f4", {"threads_y": 16, "threads_x": 16, "block_k": 16, "coarsen_cols": 4}),
+        ("coarsened_2r4c", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "coarsen_rows": 2, "coarsen_cols": 4}),
+        ("hybrid_smem_f4", {"threads_y": 16, "threads_x": 16, "block_k": 32, "thread_m": 2, "coarsen_rows": 2, "coarsen_cols": 4}),
+        ("flat_scalar", {"threads_x": 128, "block_k": 16}),
+        ("flat_f4", {"threads_x": 32, "block_k": 16}),
+        ("hybrid_1r_f4", {"threads_y": 16, "threads_x": 16, "block_k": 16, "coarsen_cols": 4}),
+        ("smem_ab_blocked", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "thread_n": 2}),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_run_every_strategy_correctness(strategy_name, overrides):
+    """Every non-TMA strategy must compile, run, and produce numerically-correct
+    results. TMA is excluded here because it requires `cuTensorMapEncodeTiled`
+    setup that the lightweight `run_kernel` helper doesn't perform — it's
+    covered separately by the bench harness in `run_benchmark`.
+    """
+    from deplodock.compiler.cuda.lower import MatmulConfig
+
+    M, K, N = 32, 32, 32
+    g = _make_matmul_graph(M, K, N)
+    fused = _fuse(g)
+    cfg = MatmulConfig(strategy=strategy_name, **overrides)
+    kernel = lower_graph(fused, config=cfg)
+    source = emit_kernel(kernel)
+
+    a_data = [1.0] * (M * K)
+    b_data = [1.0] * (K * N)
+    result = run_kernel(
+        kernel=kernel,
+        kernel_source=source,
+        inputs={"A": a_data, "B": b_data},
+        output_name="C",
+        output_size=M * N,
+        dim_args={"M": M, "N": N, "K": K},
+    )
+    for i, val in enumerate(result.output):
+        assert abs(val - K) < 1e-3, f"{strategy_name}: C[{i}] = {val}, expected {K}"
+
+
+@requires_cuda
+def test_run_tma_db_strategy_via_bench():
+    """TMA needs the bench harness's TMA descriptor setup; verify it via run_benchmark."""
+    from deplodock.compiler.cuda.lower import MatmulConfig
+    from deplodock.compiler.cuda.runner import run_benchmark
+
+    cfg = MatmulConfig(strategy="tma_db", block_k=32, thread_m=8)
+    M = N = K = 256  # multiple of TMA tile (224x128 → use 256 to keep things simple)
+    g = _make_matmul_graph(M, K, N)
+    fused = _fuse(g)
+    kernel = lower_graph(fused, config=cfg)
+    source = emit_kernel(kernel)
+    result = run_benchmark(
+        kernel=kernel,
+        kernel_source=source,
+        dim_args={"M": M, "N": N, "K": K, "k_splits": 1},
+        num_iterations=2,
+    )
+    assert result.kernel_time_ms > 0

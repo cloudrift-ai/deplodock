@@ -33,8 +33,8 @@ def _tma(bk: int = 32, tm: int = 8, ks: int = 1) -> MatmulConfig:
     return MatmulConfig(
         strategy="tma_db",
         block_k=bk,
-        block_m=8,
-        block_n=32,
+        threads_y=8,
+        threads_x=32,
         thread_m=tm,
         k_splits=ks,
     )

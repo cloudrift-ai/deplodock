@@ -192,7 +192,7 @@ def render_markdown_report(runs: list[tuple[int, "BenchmarkSuite"]], sysinfo: di
     lines.append(f"- cuBLAS math mode: `{args.cublas_math}`")
     lines.append(f"- Batches swept: {', '.join(str(b) for b, _ in runs)}")
     if first.strategy != "adaptive":
-        lines.append(f"- Config: BK={args.bk}, block={args.block_m}x{args.block_n}, thread_m={args.thread_m}, k_splits={args.k_splits}")
+        lines.append(f"- Config: BK={args.bk}, block=({args.threads_x}x{args.threads_y}), thread_m={args.thread_m}, k_splits={args.k_splits}")
     lines.append("")
 
     lines.append("## Results")
@@ -244,9 +244,9 @@ def parse_sizes(sizes_str: str) -> list[dict[str, int]]:
 def main():
     parser = argparse.ArgumentParser(description="Matmul benchmark runner")
     parser.add_argument("--strategy", default="hybrid_smem_f4", help="Kernel strategy")
-    parser.add_argument("--bk", type=int, default=32, help="Block K dimension")
-    parser.add_argument("--block-m", type=int, default=8, help="Block M (threads_y)")
-    parser.add_argument("--block-n", type=int, default=32, help="Block N (threads_x)")
+    parser.add_argument("--bk", type=int, default=32, help="Block K dimension (block_k)")
+    parser.add_argument("--threads-y", type=int, default=8, help="Threads per block, Y dim (blockDim.y)")
+    parser.add_argument("--threads-x", type=int, default=32, help="Threads per block, X dim (blockDim.x)")
     parser.add_argument("--thread-m", type=int, default=1, help="Rows per thread (thread_m)")
     parser.add_argument("--iterations", type=int, default=10, help="Benchmark iterations")
     parser.add_argument("--sizes", type=str, default=None, help="Comma-separated sizes")
@@ -325,8 +325,8 @@ def main():
             config = MatmulConfig(
                 strategy=args.strategy,
                 block_k=args.bk,
-                block_m=args.block_m,
-                block_n=args.block_n,
+                threads_y=args.threads_y,
+                threads_x=args.threads_x,
                 thread_m=args.thread_m,
                 coarsen_rows=coarsen_rows,
                 coarsen_cols=coarsen_cols,
