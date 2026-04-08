@@ -27,7 +27,17 @@ logger = logging.getLogger(__name__)
 
 
 def _tma(bk: int = 32, tm: int = 8, ks: int = 1) -> MatmulConfig:
-    return MatmulConfig(strategy="tma_db", block_k=bk, thread_m=tm, k_splits=ks)
+    # tma_db hardcodes blockDim = (32, 8) inside lower.py — we record those
+    # here so the JSON trace and markdown report show the actual launched
+    # block, not the dataclass defaults that the lowering ignores.
+    return MatmulConfig(
+        strategy="tma_db",
+        block_k=bk,
+        block_m=8,
+        block_n=32,
+        thread_m=tm,
+        k_splits=ks,
+    )
 
 
 # Per-GPU strategy maps. Each entry is `(max_size, config)` — pick the first
@@ -42,7 +52,7 @@ _PROFILE_5090: list[tuple[int, MatmulConfig]] = [
     (2048, _tma(bk=32, tm=26, ks=1)),
     (4096, _tma(bk=32, tm=20, ks=1)),
     (8192, _tma(bk=32, tm=28, ks=1)),
-    (99999, _tma(bk=32, tm=28, ks=1)),
+    (16384, _tma(bk=32, tm=28, ks=1)),
 ]
 
 _PROFILE_PRO6000: list[tuple[int, MatmulConfig]] = [
@@ -55,7 +65,7 @@ _PROFILE_PRO6000: list[tuple[int, MatmulConfig]] = [
     (2048, _tma(bk=32, tm=24, ks=1)),
     (4096, _tma(bk=32, tm=24, ks=1)),
     (8192, _tma(bk=32, tm=24, ks=1)),
-    (99999, _tma(bk=32, tm=24, ks=1)),
+    (16384, _tma(bk=32, tm=24, ks=1)),
 ]
 
 # Match against the GPU name reported by `nvidia-smi --query-gpu=name`.

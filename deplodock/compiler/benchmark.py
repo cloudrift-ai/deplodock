@@ -215,11 +215,22 @@ def run_adaptive_benchmark_suite(
             size = max(m, n)
 
             # Select config for this size.
+            max_tuned_size = strategy_map[-1][0]
             selected = strategy_map[-1][1]
             for threshold, cfg in strategy_map:
                 if size <= threshold:
                     selected = cfg
                     break
+            else:
+                logger.warning(
+                    "Size %d exceeds the largest tuned bucket (%d) — falling back to "
+                    "the last entry (TM=%d, BK=%d, ks=%d). Numbers may be suboptimal.",
+                    size,
+                    max_tuned_size,
+                    selected.thread_m,
+                    selected.block_k,
+                    selected.k_splits,
+                )
 
             kernel, source, cfg = kernels[id(selected)]
             suite.cuda_kernel = source  # Last kernel used.

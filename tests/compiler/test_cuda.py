@@ -223,3 +223,63 @@ def test_matmul_larger():
 
     for i, val in enumerate(result.output):
         assert abs(val - K) < 1e-4, f"C[{i}] = {val}, expected {K}"
+
+
+@requires_cuda
+def test_run_benchmark_surfaces_cuda_oom():
+    """Bench harness must NOT silently report 0.000 ms when the launch fails.
+
+    Regression for the bug where requesting an enormous matmul (here 65536^2 with
+    batch=8 ≈ 100 GB of FP32) would OOM at allocation time, the runner would
+    catch the failure inside the generated bench binary, and the Python wrapper
+    would happily produce a row with kernel_time_ms=0 and infinite GFLOPS.
+
+    With the new `cudaPeekAtLastError()` checks the bench binary exits non-zero
+    and `run_benchmark` raises `RuntimeError`. This test asserts that path.
+    """
+    import pytest as _pytest
+
+    from deplodock.compiler.benchmark import (
+        run_adaptive_benchmark_suite,
+    )
+    from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
+    from deplodock.compiler.ir import Graph as _Graph, Tensor as _Tensor
+    from deplodock.compiler.ops import (
+        FusedReduceElementwiseOp as _FRE,
+        InputOp as _Input,
+    )
+    from deplodock.compiler.rewriter import Rewriter as _Rewriter
+
+    g = _Graph()
+    a = g.add_node(_Input(), [], _Tensor("A", ("M", "K")))
+    b = g.add_node(_Input(), [], _Tensor("B", ("K", "N")))
+    c = g.add_node(_FRE("sum", "mul", 1), [a, b], _Tensor("C", ("M", "N")))
+    g.inputs = [a, b]
+    g.outputs = [c]
+
+    strategy_map, _ = default_matmul_strategy_map()
+    # Pick a size that's guaranteed to OOM on any consumer GPU: 65536^2 FP32
+    # is 16 GB per matrix; ×3 matrices ×8 batches = 384 GB.
+    huge = [{"M": 65536, "N": 65536, "K": 65536}]
+    import dataclasses
+
+    huge_map = [(t, dataclasses.replace(c, batch_count=8, k_splits=1)) for t, c in strategy_map]
+
+    suite = run_adaptive_benchmark_suite(
+        graph=g,
+        rewriter=_Rewriter(),
+        strategy_map=huge_map,
+        sizes=huge,
+        num_iterations=2,
+        description="oom regression",
+    )
+    # The runner should record an error rather than producing a "successful"
+    # 0.000 ms row.
+    assert suite.error is not None, (
+        "Expected the OOM to surface as suite.error, but got results: "
+        f"{[(r.dimensions, r.kernel_time_ms) for r in suite.results]}"
+    )
+    # And no successful row should have been recorded.
+    assert all(r.kernel_time_ms > 0 for r in suite.results), (
+        "Bench produced a 0-ms row — cudaGetLastError check is not working"
+    )

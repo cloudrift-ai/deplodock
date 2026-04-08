@@ -169,6 +169,10 @@ class BenchmarkResult:
     cublas_time_ms: float | None = None
     cublas_min_ms: float | None = None
     cublas_max_ms: float | None = None
+    sm_clock_mhz_pre: int | None = None
+    sm_clock_mhz_post: int | None = None
+    gpu_temp_c_pre: int | None = None
+    gpu_temp_c_post: int | None = None
     gflops: float = 0.0
     cublas_gflops: float | None = None
     efficiency_pct: float | None = None
@@ -455,9 +459,14 @@ int main() {{
     // Zero output for K-splitting atomicAdd
     if (k_splits_val > 1) cudaMemset(d_C, 0, BATCH * M * N * sizeof(float));
 
-    // Warmup both kernels
+    // Warmup our kernel + surface launch errors loudly. cuBLAS gets its
+    // own warmup further down inside the cuBLAS setup block.
     {kernel.name}{launch_suffix}({full_args});
-    cudaDeviceSynchronize();
+    cudaError_t warmup_err = cudaDeviceSynchronize();
+    if (warmup_err != cudaSuccess) {{
+        fprintf(stderr, "CUDA error after warmup launch: %s\\n", cudaGetErrorString(warmup_err));
+        return 2;
+    }}
 
 {
         f'''    // cuBLAS setup
@@ -530,6 +539,11 @@ int main() {{
                 times[j] = tmp;
             }}
 
+    cudaError_t loop_err = cudaGetLastError();
+    if (loop_err != cudaSuccess) {{
+        fprintf(stderr, "CUDA error in timed loop: %s\\n", cudaGetErrorString(loop_err));
+        return 3;
+    }}
     printf("KERNEL_MEDIAN_MS=%.6f\\n", times[{num_iterations} / 2]);
     printf("KERNEL_MIN_MS=%.6f\\n", times[0]);
     printf("KERNEL_MAX_MS=%.6f\\n", times[{num_iterations} - 1]);
@@ -586,6 +600,27 @@ int main() {{
 """
 
 
+def _sample_clock_and_temp() -> tuple[int | None, int | None]:
+    """Snapshot SM clock (MHz) and GPU temp (C) via nvidia-smi. None if unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=clocks.sm,temperature.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None, None
+    if out.returncode != 0:
+        return None, None
+    line = out.stdout.strip().splitlines()[0] if out.stdout else ""
+    parts = [p.strip() for p in line.split(",")]
+    try:
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return None, None
+
+
 def run_benchmark(
     kernel: KernelDef,
     kernel_source: str,
@@ -596,9 +631,16 @@ def run_benchmark(
     coarsen_rows: int = 1,
     cublas_math_mode: str = "default",
     maxrregcount: int | None = None,
-    fast_math: bool = True,
+    fast_math: bool = False,
 ) -> BenchmarkResult:
-    """Run a benchmark: compile and execute, return timing results."""
+    """Run a benchmark: compile and execute, return timing results.
+
+    `fast_math=False` (the default) is the IEEE-clean configuration: we still
+    enable `--fmad=true` so SGEMM gets fused FFMA instructions (without it
+    nvcc emits separate FMUL+FADD and SGEMM throughput halves), but we do
+    NOT pass `--use_fast_math`, which would also enable `--ftz=true` and
+    relaxed div/sqrt — those break "exact FP32" claims for headline numbers.
+    """
     program = generate_benchmark_program(
         kernel_source,
         kernel,
@@ -611,7 +653,7 @@ def run_benchmark(
     )
 
     arch = _detect_arch()
-    nvcc_cmd = ["nvcc", "-O3"]
+    nvcc_cmd = ["nvcc", "-O3", "--fmad=true"]
     if fast_math:
         nvcc_cmd.append("--use_fast_math")
     if arch:
@@ -644,6 +686,9 @@ def run_benchmark(
         if compile_result.returncode != 0:
             raise RuntimeError(f"nvcc compilation failed:\n{compile_result.stderr}")
 
+        # Sample SM clock + temp on either side of the run so the report can
+        # show the thermal/clock context for each measurement.
+        sm_pre, temp_pre = _sample_clock_and_temp()
         # Run.
         run_result = subprocess.run(
             [str(bin_path)],
@@ -651,6 +696,7 @@ def run_benchmark(
             text=True,
             timeout=600,
         )
+        sm_post, temp_post = _sample_clock_and_temp()
         if run_result.returncode != 0:
             raise RuntimeError(f"Benchmark execution failed:\n{run_result.stderr}")
 
@@ -694,6 +740,10 @@ def run_benchmark(
             cublas_time_ms=cublas_median,
             cublas_min_ms=vals.get("CUBLAS_MIN_MS"),
             cublas_max_ms=vals.get("CUBLAS_MAX_MS"),
+            sm_clock_mhz_pre=sm_pre,
+            sm_clock_mhz_post=sm_post,
+            gpu_temp_c_pre=temp_pre,
+            gpu_temp_c_post=temp_post,
             gflops=gflops,
             cublas_gflops=cublas_gflops,
             efficiency_pct=efficiency,

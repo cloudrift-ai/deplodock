@@ -1,0 +1,173 @@
+[2026-04-07 17:05:28] [root] Run directory: /home/dikobraz/Projects/deplodock/recipes/sgemm_cublas_vs_tma/2026-04-07_17-05-28_d34d4822
+[2026-04-07 17:05:28] [root] 
+[2026-04-07 17:05:28] [root] Running 2 benchmark task(s) in 1 execution group(s)
+[2026-04-07 17:05:28] [root] Parallel mode (max workers: 1)
+[2026-04-07 17:05:28] [root] 
+[2026-04-07 17:05:29] [deplodock.benchmark.fixed_hosts] --local: detected NVIDIA GeForce RTX 5090 x1
+[2026-04-07 17:05:29] [root] Fixed-host mode: 1 host(s), running 1 group(s)
+[2026-04-07 17:05:29] [rtx5090_x_1] Starting group: NVIDIA GeForce RTX 5090 x1 (2 tasks)
+[2026-04-07 17:05:29] [rtx5090_x_1] Using pre-allocated host: dikobraz@127.0.0.1:22
+[2026-04-07 17:05:29] [deplodock.provisioning.staging] Staged 88 files to dikobraz@127.0.0.1:~/.local/share/deplodock/rtx5090_x_1/repo
+[2026-04-07 17:05:29] [rtx5090_x_1] Recipe: recipes/sgemm_cublas_vs_tma (variant: rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive)
+[2026-04-07 17:05:29] [deplodock.benchmark.command_workload] Running command for rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive:
+export PATH=/usr/local/cuda/bin:$PATH
+export DEPLODOCK_GIT_REV="feature/mini-gpu-compiler@local"
+cd ~/.local/share/deplodock/rtx5090_x_1/repo
+[ -d venv ] || make setup
+./venv/bin/python scripts/bench_matmul.py \
+  --strategy adaptive \
+  --sizes 1024,2048,4096,8192,16384 \
+  --batches 1 \
+  --iterations 30 \
+  --output-dir ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive/2026-04-07_17-05-28_d34d4822
+# Capture diagnostic dumps so the article's external claims (cuBLAS kernel
+# name, batched dispatch comparison) are reproducible from this run.
+mkdir -p ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive/2026-04-07_17-05-28_d34d4822/diagnostics
+bash scripts/diagnostics/dump_cublas_kernels.sh \
+    > ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive/2026-04-07_17-05-28_d34d4822/diagnostics/cublas_kernels.txt 2>&1 || true
+nvcc -O3 --fmad=true -arch=sm_120 -lcublas -lcurand \
+    -o /tmp/cublas_loop_vs_strided \
+    scripts/diagnostics/cublas_loop_vs_strided.cu 2>/dev/null && {
+    for batch in 4 16; do
+        /tmp/cublas_loop_vs_strided 1024 $batch \
+            > ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive/2026-04-07_17-05-28_d34d4822/diagnostics/cublas_loop_vs_strided_1024xb$batch.txt 2>&1 || true
+    done
+}
+
+[2026-04-07 17:05:29] [deplodock.provisioning.ssh_transport] Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.
+[2026-04-07 17:05:29] [deplodock.provisioning.ssh_transport] === Running benchmark with batch=1 ===
+[2026-04-07 17:05:29] [deplodock.provisioning.ssh_transport] Using matmul tuning profile: rtx_5090
+[2026-04-07 17:05:29] [deplodock.provisioning.ssh_transport] Benchmarking 1024x1024 with tma_db ...
+[2026-04-07 17:05:31] [deplodock.provisioning.ssh_transport]   1024x1024 [tma_db]: 0.047 ms (cuBLAS: 0.044 ms, eff: 93.3%)
+[2026-04-07 17:05:31] [deplodock.provisioning.ssh_transport] Benchmarking 2048x2048 with tma_db ...
+[2026-04-07 17:05:33] [deplodock.provisioning.ssh_transport]   2048x2048 [tma_db]: 0.236 ms (cuBLAS: 0.251 ms, eff: 106.1%)
+[2026-04-07 17:05:33] [deplodock.provisioning.ssh_transport] Benchmarking 4096x4096 with tma_db ...
+[2026-04-07 17:05:34] [deplodock.provisioning.ssh_transport]   4096x4096 [tma_db]: 2.248 ms (cuBLAS: 2.249 ms, eff: 100.1%)
+[2026-04-07 17:05:34] [deplodock.provisioning.ssh_transport] Benchmarking 8192x8192 with tma_db ...
+[2026-04-07 17:05:37] [deplodock.provisioning.ssh_transport]   8192x8192 [tma_db]: 17.938 ms (cuBLAS: 16.803 ms, eff: 93.7%)
+[2026-04-07 17:05:37] [deplodock.provisioning.ssh_transport] Benchmarking 16384x16384 with tma_db ...
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport]   16384x16384 [tma_db]: 148.973 ms (cuBLAS: 133.080 ms, eff: 89.3%)
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport] Trace saved to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive/2026-04-07_17-05-28_d34d4822/20260408_000529_adaptive.json
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport] Markdown report written to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive/2026-04-07_17-05-28_d34d4822/report_20260408_000529_adaptive.md
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport] 
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport] Strategy: adaptive | Adaptive benchmark (batch=1)
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport]         Size |  Kernel ms |  cuBLAS ms |   GFLOPS |   Eff %
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport] -----------------------------------------------------------------
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport]    1024x1024 |      0.047 |      0.044 |  45282.6 |    93.3
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport]    2048x2048 |      0.236 |      0.251 |  72658.1 |   106.1
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport]    4096x4096 |      2.248 |      2.249 |  61148.8 |   100.1
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport]    8192x8192 |     17.938 |     16.803 |  61294.3 |    93.7
+[2026-04-07 17:05:49] [deplodock.provisioning.ssh_transport]  16384x16384 |    148.973 |    133.080 |  59044.8 |    89.3
+[2026-04-07 17:05:56] [rtx5090_x_1] Recipe: recipes/sgemm_cublas_vs_tma (variant: rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive)
+[2026-04-07 17:05:56] [deplodock.benchmark.command_workload] Running command for rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive:
+export PATH=/usr/local/cuda/bin:$PATH
+export DEPLODOCK_GIT_REV="feature/mini-gpu-compiler@local"
+cd ~/.local/share/deplodock/rtx5090_x_1/repo
+[ -d venv ] || make setup
+./venv/bin/python scripts/bench_matmul.py \
+  --strategy adaptive \
+  --sizes 256,512,1024,2048,4096,8192 \
+  --batches 4,8,16 \
+  --iterations 20 \
+  --output-dir ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_17-05-28_d34d4822
+# Capture diagnostic dumps so the article's external claims (cuBLAS kernel
+# name, batched dispatch comparison) are reproducible from this run.
+mkdir -p ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_17-05-28_d34d4822/diagnostics
+bash scripts/diagnostics/dump_cublas_kernels.sh \
+    > ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_17-05-28_d34d4822/diagnostics/cublas_kernels.txt 2>&1 || true
+nvcc -O3 --fmad=true -arch=sm_120 -lcublas -lcurand \
+    -o /tmp/cublas_loop_vs_strided \
+    scripts/diagnostics/cublas_loop_vs_strided.cu 2>/dev/null && {
+    for batch in 4 16; do
+        /tmp/cublas_loop_vs_strided 1024 $batch \
+            > ~/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_17-05-28_d34d4822/diagnostics/cublas_loop_vs_strided_1024xb$batch.txt 2>&1 || true
+    done
+}
+
+[2026-04-07 17:05:56] [deplodock.provisioning.ssh_transport] Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.
+[2026-04-07 17:05:56] [deplodock.provisioning.ssh_transport] === Running benchmark with batch=4 ===
+[2026-04-07 17:05:56] [deplodock.provisioning.ssh_transport] Using matmul tuning profile: rtx_5090
+[2026-04-07 17:05:56] [deplodock.provisioning.ssh_transport] Benchmarking 256x256 with tma_db ...
+[2026-04-07 17:05:58] [deplodock.provisioning.ssh_transport]   256x256 [tma_db]: 0.016 ms (cuBLAS: 0.011 ms, eff: 67.5%)
+[2026-04-07 17:05:58] [deplodock.provisioning.ssh_transport] Benchmarking 512x512 with tma_db ...
+[2026-04-07 17:05:59] [deplodock.provisioning.ssh_transport]   512x512 [tma_db]: 0.027 ms (cuBLAS: 0.034 ms, eff: 123.7%)
+[2026-04-07 17:05:59] [deplodock.provisioning.ssh_transport] Benchmarking 1024x1024 with tma_db ...
+[2026-04-07 17:06:00] [deplodock.provisioning.ssh_transport]   1024x1024 [tma_db]: 0.154 ms (cuBLAS: 0.211 ms, eff: 137.2%)
+[2026-04-07 17:06:00] [deplodock.provisioning.ssh_transport] Benchmarking 2048x2048 with tma_db ...
+[2026-04-07 17:06:02] [deplodock.provisioning.ssh_transport]   2048x2048 [tma_db]: 0.981 ms (cuBLAS: 1.544 ms, eff: 157.4%)
+[2026-04-07 17:06:02] [deplodock.provisioning.ssh_transport] Benchmarking 4096x4096 with tma_db ...
+[2026-04-07 17:06:04] [deplodock.provisioning.ssh_transport]   4096x4096 [tma_db]: 8.969 ms (cuBLAS: 14.243 ms, eff: 158.8%)
+[2026-04-07 17:06:04] [deplodock.provisioning.ssh_transport] Benchmarking 8192x8192 with tma_db ...
+[2026-04-07 17:06:10] [deplodock.provisioning.ssh_transport]   8192x8192 [tma_db]: 72.320 ms (cuBLAS: 113.744 ms, eff: 157.3%)
+[2026-04-07 17:06:10] [deplodock.provisioning.ssh_transport] Trace saved to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_17-05-28_d34d4822/20260408_000556_adaptive.json
+[2026-04-07 17:06:10] [deplodock.provisioning.ssh_transport] === Running benchmark with batch=8 ===
+[2026-04-07 17:06:10] [deplodock.provisioning.ssh_transport] Using matmul tuning profile: rtx_5090
+[2026-04-07 17:06:10] [deplodock.provisioning.ssh_transport] Benchmarking 256x256 with tma_db ...
+[2026-04-07 17:06:11] [deplodock.provisioning.ssh_transport]   256x256 [tma_db]: 0.015 ms (cuBLAS: 0.012 ms, eff: 74.4%)
+[2026-04-07 17:06:11] [deplodock.provisioning.ssh_transport] Benchmarking 512x512 with tma_db ...
+[2026-04-07 17:06:12] [deplodock.provisioning.ssh_transport]   512x512 [tma_db]: 0.043 ms (cuBLAS: 0.062 ms, eff: 144.0%)
+[2026-04-07 17:06:12] [deplodock.provisioning.ssh_transport] Benchmarking 1024x1024 with tma_db ...
+[2026-04-07 17:06:13] [deplodock.provisioning.ssh_transport]   1024x1024 [tma_db]: 0.281 ms (cuBLAS: 0.399 ms, eff: 141.9%)
+[2026-04-07 17:06:13] [deplodock.provisioning.ssh_transport] Benchmarking 2048x2048 with tma_db ...
+[2026-04-07 17:06:15] [deplodock.provisioning.ssh_transport]   2048x2048 [tma_db]: 2.204 ms (cuBLAS: 3.412 ms, eff: 154.8%)
+[2026-04-07 17:06:15] [deplodock.provisioning.ssh_transport] Benchmarking 4096x4096 with tma_db ...
+[2026-04-07 17:06:18] [deplodock.provisioning.ssh_transport]   4096x4096 [tma_db]: 17.556 ms (cuBLAS: 29.236 ms, eff: 166.5%)
+[2026-04-07 17:06:18] [deplodock.provisioning.ssh_transport] Benchmarking 8192x8192 with tma_db ...
+[2026-04-07 17:06:28] [deplodock.provisioning.ssh_transport]   8192x8192 [tma_db]: 147.067 ms (cuBLAS: 223.568 ms, eff: 152.0%)
+[2026-04-07 17:06:28] [deplodock.provisioning.ssh_transport] Trace saved to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_17-05-28_d34d4822/20260408_000610_adaptive.json
+[2026-04-07 17:06:28] [deplodock.provisioning.ssh_transport] === Running benchmark with batch=16 ===
+[2026-04-07 17:06:28] [deplodock.provisioning.ssh_transport] Using matmul tuning profile: rtx_5090
+[2026-04-07 17:06:28] [deplodock.provisioning.ssh_transport] Benchmarking 256x256 with tma_db ...
+[2026-04-07 17:06:29] [deplodock.provisioning.ssh_transport]   256x256 [tma_db]: 0.024 ms (cuBLAS: 0.020 ms, eff: 83.0%)
+[2026-04-07 17:06:29] [deplodock.provisioning.ssh_transport] Benchmarking 512x512 with tma_db ...
+[2026-04-07 17:06:30] [deplodock.provisioning.ssh_transport]   512x512 [tma_db]: 0.079 ms (cuBLAS: 0.107 ms, eff: 135.5%)
+[2026-04-07 17:06:30] [deplodock.provisioning.ssh_transport] Benchmarking 1024x1024 with tma_db ...
+[2026-04-07 17:06:32] [deplodock.provisioning.ssh_transport]   1024x1024 [tma_db]: 0.553 ms (cuBLAS: 0.786 ms, eff: 142.2%)
+[2026-04-07 17:06:32] [deplodock.provisioning.ssh_transport] Benchmarking 2048x2048 with tma_db ...
+[2026-04-07 17:06:34] [deplodock.provisioning.ssh_transport]   2048x2048 [tma_db]: 4.434 ms (cuBLAS: 6.932 ms, eff: 156.3%)
+[2026-04-07 17:06:34] [deplodock.provisioning.ssh_transport] Benchmarking 4096x4096 with tma_db ...
+[2026-04-07 17:06:37] [deplodock.provisioning.ssh_transport]   4096x4096 [tma_db]: 35.396 ms (cuBLAS: 59.664 ms, eff: 168.6%)
+[2026-04-07 17:06:37] [deplodock.provisioning.ssh_transport] Benchmarking 8192x8192 with tma_db ...
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]   8192x8192 [tma_db]: 299.224 ms (cuBLAS: 443.290 ms, eff: 148.1%)
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] Trace saved to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_17-05-28_d34d4822/20260408_000628_adaptive.json
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] Markdown report written to /home/dikobraz/.local/share/deplodock/rtx5090_x_1/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive/2026-04-07_17-05-28_d34d4822/report_20260408_000556_adaptive.md
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] 
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] Strategy: adaptive | Adaptive benchmark (batch=4)
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]         Size |  Kernel ms |  cuBLAS ms |   GFLOPS |   Eff %
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] -----------------------------------------------------------------
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]      256x256 |      0.016 |      0.011 |   8456.3 |    67.5
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]      512x512 |      0.027 |      0.034 |  39153.4 |   123.7
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    1024x1024 |      0.154 |      0.211 |  55912.4 |   137.2
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    2048x2048 |      0.981 |      1.544 |  70053.3 |   157.4
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    4096x4096 |      8.969 |     14.243 |  61296.3 |   158.8
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    8192x8192 |     72.320 |    113.744 |  60814.0 |   157.3
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] 
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] Strategy: adaptive | Adaptive benchmark (batch=8)
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]         Size |  Kernel ms |  cuBLAS ms |   GFLOPS |   Eff %
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] -----------------------------------------------------------------
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]      256x256 |      0.015 |      0.012 |  17331.8 |    74.4
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]      512x512 |      0.043 |      0.062 |  50231.2 |   144.0
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    1024x1024 |      0.281 |      0.399 |  61077.5 |   141.9
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    2048x2048 |      2.204 |      3.412 |  62345.3 |   154.8
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    4096x4096 |     17.556 |     29.236 |  62630.5 |   166.5
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    8192x8192 |    147.067 |    223.568 |  59810.0 |   152.0
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] 
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] Strategy: adaptive | Adaptive benchmark (batch=16)
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]         Size |  Kernel ms |  cuBLAS ms |   GFLOPS |   Eff %
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport] -----------------------------------------------------------------
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]      256x256 |      0.024 |      0.020 |  22764.2 |    83.0
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]      512x512 |      0.079 |      0.107 |  54560.1 |   135.5
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    1024x1024 |      0.553 |      0.786 |  62137.8 |   142.2
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    2048x2048 |      4.434 |      6.932 |  61990.8 |   156.3
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    4096x4096 |     35.396 |     59.664 |  62125.9 |   168.6
+[2026-04-07 17:06:55] [deplodock.provisioning.ssh_transport]    8192x8192 |    299.224 |    443.290 |  58792.7 |   148.1
+[2026-04-07 17:07:02] [rtx5090_x_1] Leaving pre-allocated host in place: dikobraz@127.0.0.1
+[2026-04-07 17:07:02] [rtx5090_x_1] Completed group: rtx5090_x_1
+[2026-04-07 17:07:02] [root] 
+[2026-04-07 17:07:02] [root] SUMMARY
+[2026-04-07 17:07:02] [root] Successful: 2/2
+[2026-04-07 17:07:02] [root]    - sgemm_cublas_vs_tma/rtx5090x1_b1_grf-m-g-c-l_i30_s1024-2048-4096-8192-16384_sadaptive
+[2026-04-07 17:07:02] [root]    - sgemm_cublas_vs_tma/rtx5090x1_b4-8-16_grf-m-g-c-l_i20_s256-512-1024-2048-4096-8192_sadaptive
+[2026-04-07 17:07:02] [root] 
+[2026-04-07 17:07:02] [root] All done!
+[2026-04-07 17:07:02] [root] Full logs saved to: /home/dikobraz/Projects/deplodock/recipes/sgemm_cublas_vs_tma/2026-04-07_17-05-28_d34d4822/benchmark.log

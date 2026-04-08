@@ -64,6 +64,14 @@ def collect_system_info() -> dict[str, str]:
     m = re.search(r"release (\S+),\s*V(\S+)", nvcc)
     if m:
         info["cuda"] = m.group(2)
+    # Full nvcc banner — version, build date, target. Useful for repro when
+    # cuBLAS minor versions drift between driver updates.
+    nvcc_banner = " ".join(line.strip() for line in nvcc.splitlines() if line.strip())
+    if nvcc_banner:
+        info["nvcc"] = nvcc_banner
+    # Compile flags actually used by the runner. Hardcoded mirror of
+    # runner.run_benchmark — keep in sync if that function changes.
+    info["nvcc_flags"] = "-O3 --fmad=true -arch=<auto> -lcuda -lcublas -lcurand"
 
     import os
 
@@ -114,8 +122,8 @@ def _suite_section(suite, batch: int) -> list[str]:
     lines.append("")
     lines.append(f"_{suite.description}_")
     lines.append("")
-    lines.append("| Size | TM | BK | K-splits | Kernel ms | Kernel var % | cuBLAS ms | cuBLAS var % | Eff vs cuBLAS | TFLOPS | cuBLAS TFLOPS |")
-    lines.append("|------|----|----|----------|----------:|-------------:|----------:|-------------:|--------------:|-------:|--------------:|")
+    lines.append("| Size | TM | BK | K-splits | Kernel ms | Kernel var % | cuBLAS ms | cuBLAS var % | Eff vs cuBLAS | TFLOPS | cuBLAS TFLOPS | Clock MHz | Temp °C |")
+    lines.append("|------|----|----|----------|----------:|-------------:|----------:|-------------:|--------------:|-------:|--------------:|----------:|--------:|")
     for r in suite.results:
         dims = r.dimensions or {}
         m, n = dims.get("M", 0), dims.get("N", 0)
@@ -135,11 +143,23 @@ def _suite_section(suite, batch: int) -> list[str]:
             if r.cublas_time_ms and r.cublas_min_ms is not None and r.cublas_max_ms is not None
             else "—"
         )
+        def _range(pre, post):
+            if pre is None and post is None:
+                return "—"
+            if pre is None:
+                return str(post)
+            if post is None:
+                return str(pre)
+            return f"{pre}" if pre == post else f"{pre}→{post}"
+
+        clk = _range(r.sm_clock_mhz_pre, r.sm_clock_mhz_post)
+        tmp = _range(r.gpu_temp_c_pre, r.gpu_temp_c_post)
         lines.append(
             f"| {size} | {tm} | {bk} | {ks} | "
             f"{r.kernel_time_ms:.3f} | {kvar} | "
             f"{_fmt(r.cublas_time_ms, '.3f')} | {cvar} | {eff} | "
-            f"{_fmt(r.gflops and r.gflops / 1000, '.1f')} | {_fmt(r.cublas_gflops and r.cublas_gflops / 1000, '.1f')} |"
+            f"{_fmt(r.gflops and r.gflops / 1000, '.1f')} | {_fmt(r.cublas_gflops and r.cublas_gflops / 1000, '.1f')} | "
+            f"{clk} | {tmp} |"
         )
     lines.append("")
     if suite.error:
@@ -160,7 +180,7 @@ def render_markdown_report(runs: list[tuple[int, "BenchmarkSuite"]], sysinfo: di
     lines.append("")
     lines.append("| Field | Value |")
     lines.append("|---|---|")
-    for k in ("host", "os", "gpu", "compute_cap", "vram", "driver", "cuda", "cublas", "git"):
+    for k in ("host", "os", "gpu", "compute_cap", "vram", "driver", "cuda", "nvcc", "nvcc_flags", "cublas", "git"):
         if k in sysinfo:
             lines.append(f"| {k} | {sysinfo[k]} |")
     lines.append("")
