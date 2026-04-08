@@ -46,6 +46,12 @@ matrices:
   # duration keeps the clock pinned.
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
+    # Pin the toolchain so cloud runs reproduce the article's numbers exactly.
+    # The harness skips reinstall if the requested versions are already on the
+    # host (which is the case for `--local` runs against this dev box), so this
+    # is free for local benchmarking and load-bearing only on fresh cloud VMs.
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
     strategy: adaptive
     sizes: "1024,2048,4096,8192,16384"
     batches: "1"
@@ -54,6 +60,8 @@ matrices:
   # Batched sweep — drops 16384 to stay within 32 GB.
   - deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
     strategy: adaptive
     sizes: "256,512,1024,2048,4096,8192"
     batches: "4,8,16"
