@@ -1,0 +1,23 @@
+model:
+  huggingface: "Qwen/Qwen3.5-122B-A10B-FP8"
+
+engine:
+  llm:
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.8
+    max_concurrent_requests: 64
+    vllm:
+      image: "vllm/vllm-openai"
+      extra_args: "--enable-prefix-caching --language-model-only --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3"
+
+benchmark:
+  max_concurrency: 64
+  num_prompts: 64
+  random_input_len: 4000
+  random_output_len: 4000
+
+matrices:
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+    deploy.gpu_count: 8
+    engine.llm.context_length: 262144

@@ -1,0 +1,64 @@
+[2026-04-03 20:40:41] [root] Run directory: /Users/natalia/Programming/deplodock/experiments/Qwen3.5/Qwen3.5-122B-A10B-FP8/vllm/2026-04-03_20-40-41_7370fb7f
+[2026-04-03 20:40:41] [root] 
+[2026-04-03 20:40:41] [root] Running 1 benchmark task(s) in 1 execution group(s)
+[2026-04-03 20:40:41] [root] Parallel mode (max workers: 1)
+[2026-04-03 20:40:41] [root] 
+[2026-04-03 20:40:41] [pro6000_x_8] Starting group: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition x8 (1 tasks)
+[2026-04-03 20:40:41] [pro6000_x_8] Using existing server: riftuser@38.108.83.78:60027
+[2026-04-03 20:40:59] [pro6000_x_8.Qwen3.5-122B-A10B-FP8] Recipe: experiments/Qwen3.5/Qwen3.5-122B-A10B-FP8/vllm (variant: pro6000x8_cl262144)
+[2026-04-03 20:40:59] [pro6000_x_8.Qwen3.5-122B-A10B-FP8] Deploying model...
+[2026-04-03 20:41:01] [deplodock.deploy.orchestrate] Pulling images...
+[2026-04-03 20:41:02] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-04-03 20:41:02] [deplodock.provisioning.ssh_transport]  vllm_0 Pulling 
+[2026-04-03 20:41:03] [deplodock.provisioning.ssh_transport]  vllm_0 Pulled 
+[2026-04-03 20:41:03] [deplodock.deploy.orchestrate] Downloading model Qwen/Qwen3.5-122B-A10B-FP8...
+[2026-04-03 20:41:03] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-04-03 20:41:05] [deplodock.provisioning.ssh_transport] /hf_models/hub/models--Qwen--Qwen3.5-122B-A10B-FP8/snapshots/fb53b9f3bdaab287c597d4e943783153ec527e06
+[2026-04-03 20:41:05] [deplodock.deploy.orchestrate] Cleaning up old containers...
+[2026-04-03 20:41:05] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-04-03 20:41:06] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopping
+[2026-04-03 20:41:06] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopped
+[2026-04-03 20:41:06] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removing
+[2026-04-03 20:41:07] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removed
+[2026-04-03 20:41:07] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removing
+[2026-04-03 20:41:07] [deplodock.provisioning.ssh_transport]  Network deploy_default  Removed
+[2026-04-03 20:41:07] [deplodock.deploy.orchestrate] Starting services...
+[2026-04-03 20:41:07] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-04-03 20:41:08] [deplodock.provisioning.ssh_transport]  Network deploy_default  Creating
+[2026-04-03 20:41:08] [deplodock.provisioning.ssh_transport]  Network deploy_default  Created
+[2026-04-03 20:41:08] [deplodock.provisioning.ssh_transport] time="2026-04-04T03:41:08Z" level=warning msg="Found orphan containers ([sglang_0]) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up."
+[2026-04-03 20:41:08] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-04-03 20:41:08] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-04-03 20:41:08] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-04-03 20:41:25] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-04-03 20:41:25] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-04-03 20:47:35] [deplodock.provisioning.ssh_transport]  Container vllm_0  Healthy
+[2026-04-03 20:47:35] [deplodock.deploy.orchestrate] Waiting for health check...
+[2026-04-03 20:47:35] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-04-03 20:47:36] [deplodock.deploy.orchestrate] 
+Endpoint: http://38.108.83.78:8000/v1
+[2026-04-03 20:47:36] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3.5-122B-A10B-FP8
+[2026-04-03 20:47:36] [deplodock.deploy.orchestrate] Instances: 1
+[2026-04-03 20:47:36] [deplodock.deploy.orchestrate] Status: deployed
+[2026-04-03 20:47:36] [deplodock.deploy.orchestrate] 
+Running smoke test...
+[2026-04-03 20:48:21] [deplodock.deploy.orchestrate] Smoke test passed.
+[2026-04-03 20:48:21] [deplodock.deploy.orchestrate] 
+Example curl:
+[2026-04-03 20:48:21] [deplodock.deploy.orchestrate]   curl http://38.108.83.78:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model": "Qwen/Qwen3.5-122B-A10B-FP8",
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 64
+    }'
+[2026-04-03 20:48:21] [pro6000_x_8.Qwen3.5-122B-A10B-FP8] Running benchmark...
+[2026-04-03 20:53:06] [pro6000_x_8.Qwen3.5-122B-A10B-FP8] Results saved to: /Users/natalia/Programming/deplodock/experiments/Qwen3.5/Qwen3.5-122B-A10B-FP8/vllm/2026-04-03_20-40-41_7370fb7f/pro6000x8_cl262144_vllm_benchmark.txt
+[2026-04-03 20:53:06] [pro6000_x_8] Completed group: pro6000_x_8
+[2026-04-03 20:53:06] [root] 
+[2026-04-03 20:53:06] [root] SUMMARY
+[2026-04-03 20:53:06] [root] Successful: 1/1
+[2026-04-03 20:53:06] [root]    - vllm/pro6000x8_cl262144
+[2026-04-03 20:53:06] [root] 
+[2026-04-03 20:53:06] [root] All done!
+[2026-04-03 20:53:06] [root] Full logs saved to: /Users/natalia/Programming/deplodock/experiments/Qwen3.5/Qwen3.5-122B-A10B-FP8/vllm/2026-04-03_20-40-41_7370fb7f/benchmark.log

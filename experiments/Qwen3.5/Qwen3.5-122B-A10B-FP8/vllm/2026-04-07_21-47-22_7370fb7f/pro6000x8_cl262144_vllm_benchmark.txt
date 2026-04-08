@@ -1,0 +1,273 @@
+============ Benchmark Task ============
+recipe_dir: experiments/Qwen3.5/Qwen3.5-122B-A10B-FP8/vllm
+variant: pro6000x8_cl262144
+gpu_name: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition
+gpu_count: 8
+recipe:
+  model:
+    huggingface: Qwen/Qwen3.5-122B-A10B-FP8
+  engine:
+    llm:
+      context_length: 262144
+      max_concurrent_requests: 64
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      vllm:
+        image: vllm/vllm-openai
+        extra_args: --enable-prefix-caching --language-model-only --enable-auto-tool-choice
+          --tool-call-parser hermes --reasoning-parser qwen3
+        extra_env: {}
+      sglang: null
+      docker_options: {}
+  benchmark:
+    max_concurrency: 64
+    num_prompts: 64
+    random_input_len: 4000
+    random_output_len: 4000
+  deploy:
+    gpu: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition
+    gpu_count: 8
+==================================================
+
+============ Serving Benchmark Result ============
+Successful requests:                     64        
+Failed requests:                         0         
+Maximum request concurrency:             64        
+Benchmark duration (s):                  138.36    
+Total input tokens:                      256000    
+Total generated tokens:                  256000    
+Request throughput (req/s):              0.46      
+Output token throughput (tok/s):         1850.27   
+Peak output token throughput (tok/s):    2475.00   
+Peak concurrent requests:                64.00     
+Total token throughput (tok/s):          3700.54   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          19962.59  
+Median TTFT (ms):                        20304.14  
+P99 TTFT (ms):                           30056.74  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          29.53     
+Median TPOT (ms):                        29.45     
+P99 TPOT (ms):                           33.69     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           29.53     
+Median ITL (ms):                         27.21     
+P99 ITL (ms):                            30.27     
+==================================================
+
+============ Docker Compose Configuration ============
+services:
+
+  vllm_0:
+    image: vllm/vllm-openai
+    container_name: vllm_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1', '2', '3', '4', '5', '6', '7']
+              capabilities: [gpu]
+    volumes:
+      - /hf_models:/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=***
+      - HF_HOME=/hf_models
+    ports:
+      - "8000:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.8
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 8
+      --pipeline-parallel-size 1
+      --data-parallel-size 1
+      --model Qwen/Qwen3.5-122B-A10B-FP8
+      --served-model-name Qwen/Qwen3.5-122B-A10B-FP8
+      --max-model-len 262144
+      --max-num-seqs 64
+      --enable-prefix-caching --language-model-only --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 1200s
+==================================================
+
+============ Benchmark Command ============
+vllm bench serve
+    --model Qwen/Qwen3.5-122B-A10B-FP8
+    --trust-remote-code
+    --max-concurrency 64
+    --num-prompts 64
+    --random-input-len 4000
+    --random-output-len 4000
+    --base-url http://localhost:8000
+==================================================
+
+============ System Information ============
+=== HOSTNAME ===
+riftvm
+
+=== OS ===
+PRETTY_NAME="Ubuntu 24.04.1 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.1 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+
+=== KERNEL ===
+6.8.0-51-generic
+
+=== CPU INFORMATION ===
+Architecture:                         x86_64
+CPU op-mode(s):                       32-bit, 64-bit
+Address sizes:                        52 bits physical, 57 bits virtual
+Byte Order:                           Little Endian
+CPU(s):                               88
+On-line CPU(s) list:                  0-87
+Vendor ID:                            GenuineIntel
+Model name:                           Intel(R) Xeon(R) Platinum 8468V
+CPU family:                           6
+Model:                                143
+Thread(s) per core:                   1
+Core(s) per socket:                   1
+Socket(s):                            88
+Stepping:                             8
+BogoMIPS:                             4800.00
+Flags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts mmx fxsr sse sse2 ss syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq dtes64 vmx ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd arat vnmi avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq la57 rdpid bus_lock_detect cldemote movdiri movdir64b fsrm md_clear serialize tsxldtrk amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities
+Virtualization:                       VT-x
+Hypervisor vendor:                    KVM
+Virtualization type:                  full
+L1d cache:                            2.8 MiB (88 instances)
+L1i cache:                            2.8 MiB (88 instances)
+L2 cache:                             352 MiB (88 instances)
+L3 cache:                             1.4 GiB (88 instances)
+NUMA node(s):                         1
+NUMA node0 CPU(s):                    0-87
+Vulnerability Gather data sampling:   Not affected
+Vulnerability Itlb multihit:          Not affected
+Vulnerability L1tf:                   Not affected
+Vulnerability Mds:                    Not affected
+Vulnerability Meltdown:               Not affected
+Vulnerability Mmio stale data:        Not affected
+Vulnerability Reg file data sampling: Not affected
+Vulnerability Retbleed:               Not affected
+Vulnerability Spec rstack overflow:   Not affected
+Vulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:             Mitigation; Enhanced / Automatic IBRS; IBPB conditional; RSB filling; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop
+Vulnerability Srbds:                  Not affected
+Vulnerability Tsx async abort:        Mitigation; TSX disabled
+
+=== CPU COUNT ===
+88
+
+=== MEMORY ===
+               total        used        free      shared  buff/cache   available
+Mem:           393Gi        17Gi       131Gi       5.5Mi       248Gi       376Gi
+Swap:             0B          0B          0B
+
+=== GPU INFORMATION ===
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 580.65.06, P0, 36, 0 %
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 580.65.06, P0, 39, 0 %
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 580.65.06, P0, 42, 0 %
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 580.65.06, P0, 41, 0 %
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 580.65.06, P0, 43, 0 %
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 580.65.06, P0, 38, 0 %
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 580.65.06, P0, 35, 0 %
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 97887 MiB, 580.65.06, P0, 40, 0 %
+
+=== GPU DETAILS ===
+Wed Apr  8 04:47:38 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.65.06              Driver Version: 580.65.06      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:00:10.0 Off |                  Off |
+| 30%   36C    P0             64W /  300W |       0MiB /  97887MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:00:11.0 Off |                  Off |
+| 31%   39C    P0             69W /  300W |       0MiB /  97887MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:00:12.0 Off |                  Off |
+| 31%   42C    P0             67W /  300W |       0MiB /  97887MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:00:13.0 Off |                  Off |
+| 31%   41C    P0             72W /  300W |       0MiB /  97887MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:00:14.0 Off |                  Off |
+| 31%   43C    P0             64W /  300W |       0MiB /  97887MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:00:15.0 Off |                  Off |
+| 36%   38C    P0             61W /  300W |       0MiB /  97887MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:00:16.0 Off |                  Off |
+| 31%   35C    P0             72W /  300W |       0MiB /  97887MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA RTX PRO 6000 Blac...    Off |   00000000:00:17.0 Off |                  Off |
+| 31%   40C    P0             69W /  300W |       0MiB /  97887MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+=== DISK USAGE ===
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs            40G  1.6M   40G   1% /run
+efivarfs        256K   20K  232K   8% /sys/firmware/efi/efivars
+/dev/vda1       3.8T  252G  3.6T   7% /
+tmpfs           197G  2.1M  197G   1% /dev/shm
+tmpfs           5.0M     0  5.0M   0% /run/lock
+/dev/vda16      881M   62M  758M   8% /boot
+/dev/vda15      105M  8.4M   97M   8% /boot/efi
+tmpfs            40G   20K   40G   1% /run/user/1000
+
+=== BLOCK DEVICES ===
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+sr0      11:0    1  368K  0 rom  
+vda     253:0    0  3.9T  0 disk 
+|-vda1  253:1    0  3.9T  0 part /
+|-vda14 253:14   0    4M  0 part 
+|-vda15 253:15   0  106M  0 part /boot/efi
+`-vda16 259:0    0  913M  0 part /boot
+
+=== UPTIME ===
+ 04:47:40 up 4 days,  5:07,  2 users,  load average: 1.38, 0.41, 0.24
+
+=== DOCKER VERSION ===
+Docker version 28.5.1, build e180ab8
+
+=== DOCKER INFO ===
+28.5.1 | OS: Ubuntu 24.04.1 LTS | Containers: 2 | Images: 5
+==================================================

@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "vllm/pro6000x8_cl262144",
+    "recipe_dir": "experiments/Qwen3.5/Qwen3.5-122B-A10B-FP8/vllm",
+    "variant": "pro6000x8_cl262144",
+    "recipe_name": "vllm",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 8,
+    "model_name": "Qwen/Qwen3.5-122B-A10B-FP8",
+    "result_file": "pro6000x8_cl262144_vllm_benchmark.txt",
+    "json_result_file": "pro6000x8_cl262144_vllm_benchmark.json"
+  }
+]

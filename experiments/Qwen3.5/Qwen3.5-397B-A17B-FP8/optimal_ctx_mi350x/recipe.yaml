@@ -1,0 +1,29 @@
+model:
+  huggingface: "Qwen/Qwen3.5-397B-A17B-FP8"
+
+engine:
+  llm:
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.8
+    max_concurrent_requests: 4
+    mem_fraction_static: 0.8
+    docker_options:
+      security_opt:
+        - seccomp=unconfined
+    sglang:
+      image: "rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260326"
+      extra_args: "--attention-backend triton --reasoning-parser qwen3 --tool-call-parser qwen3_coder"
+      extra_env:
+        SGLANG_ENABLE_JIT_DEEPGEMM: 0
+
+benchmark:
+  max_concurrency: 4
+  num_prompts: 8
+  random_input_len: 4000
+  random_output_len: 4000
+
+matrices:
+  - deploy.gpu: "AMD Instinct MI350X"
+    deploy.gpu_count: 1
+    engine.llm.context_length: [8192, 65536, 131072, 262144]

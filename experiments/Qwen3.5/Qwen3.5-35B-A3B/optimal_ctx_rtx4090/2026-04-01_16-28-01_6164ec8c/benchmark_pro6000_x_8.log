@@ -1,0 +1,3 @@
+[2026-04-01 16:28:01] [pro6000_x_8] Starting group: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition x8 (6 tasks)
+[2026-04-01 16:28:01] [pro6000_x_8] GPU: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition x8 -> cloudrift rtxpro6000-11-50-500-1l.8
+[2026-04-01 16:28:01] [deplodock.provisioning.cloudrift] Creating CloudRift instance (type=rtxpro6000-11-50-500-1l.8)...
