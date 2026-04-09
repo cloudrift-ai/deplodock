@@ -259,3 +259,36 @@ def test_from_dict_with_extra_env():
     }
     recipe = Recipe.from_dict(d)
     assert recipe.engine.llm.extra_env == {"VLLM_ATTENTION_BACKEND": "FLASHINFER", "CUDA_VISIBLE_DEVICES": "0,1"}
+
+
+# ── docker_options ───────────────────────────────────────────────
+
+
+def test_llm_docker_options_default_empty():
+    llm = LLMConfig()
+    assert llm.docker_options == {}
+
+
+def test_from_dict_with_docker_options():
+    d = {
+        "model": {"huggingface": "org/model"},
+        "engine": {
+            "llm": {
+                "docker_options": {
+                    "security_opt": ["seccomp=unconfined"],
+                    "cap_add": ["SYS_PTRACE"],
+                },
+            }
+        },
+    }
+    recipe = Recipe.from_dict(d)
+    assert recipe.engine.llm.docker_options == {
+        "security_opt": ["seccomp=unconfined"],
+        "cap_add": ["SYS_PTRACE"],
+    }
+
+
+def test_from_dict_without_docker_options():
+    d = {"model": {"huggingface": "org/model"}}
+    recipe = Recipe.from_dict(d)
+    assert recipe.engine.llm.docker_options == {}

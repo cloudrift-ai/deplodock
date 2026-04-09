@@ -170,6 +170,35 @@ The `run` template uses `string.Template` `$var` syntax. Substitution variables 
 
 Command recipes skip `validate_extra_args()` since they don't go through engine flag mapping.
 
+### Docker Options
+
+`docker_options` is a `dict[str, Any]` on `LLMConfig` that injects arbitrary docker-compose service-level keys into the generated container definition. It defaults to an empty dict. Unlike `extra_env` and `extra_args`, which are engine-specific and live on `VllmConfig`/`SglangConfig`, `docker_options` lives directly on `LLMConfig` because Docker container options (security, capabilities, ulimits) are tied to GPU hardware, not the inference engine.
+
+```yaml
+engine:
+  llm:
+    vllm:
+      image: "rocm/vllm:latest"
+    docker_options:
+      security_opt:
+        - seccomp=unconfined
+      cap_add:
+        - SYS_PTRACE
+```
+
+Each key-value pair is rendered as a top-level service key in the generated Docker Compose file, inserted after `ipc: host` and before `command:`. Values are serialized via `yaml.dump()` to handle nested structures (lists, dicts, scalars) correctly.
+
+Keys managed by the compose template (`image`, `container_name`, `entrypoint`, `deploy`, `devices`, `group_add`, `volumes`, `environment`, `ports`, `shm_size`, `ipc`, `command`, `healthcheck`) are rejected at validation time via `validate_docker_options()`, following the same pattern as `validate_extra_args()`.
+
+Matrix overrides work naturally via deep merge:
+```yaml
+matrices:
+  - deploy.gpu: "AMD Instinct MI350X"
+    engine.llm.docker_options:
+      security_opt:
+        - seccomp=unconfined
+```
+
 ### SGLang Quantization for AWQ MoE Models
 
 SGLang does not automatically detect AWQ quantization for MoE architectures. For AWQ-quantized MoE models, `--quantization moe_wna16` must be passed via `extra_args`. See [/docs/sglang-awq-moe.md](/docs/sglang-awq-moe.md) for full details and tested configurations.

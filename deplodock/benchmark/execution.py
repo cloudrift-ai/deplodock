@@ -233,6 +233,7 @@ async def run_execution_group(
                 hf_token=hf_token,
                 dry_run=dry_run,
                 gpu_device_ids=gpu_device_ids,
+                port_mappings=conn.port_mappings,
             )
             task_logger.info("Deploying model...")
             success = await deploy_entry(params)

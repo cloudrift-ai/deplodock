@@ -3,7 +3,7 @@
 import pytest
 import yaml
 
-from deplodock.recipe import Recipe, deep_merge, load_recipe, resolve_for_hardware, validate_extra_args
+from deplodock.recipe import Recipe, deep_merge, load_recipe, resolve_for_hardware, validate_docker_options, validate_extra_args
 
 # ── deep_merge ──────────────────────────────────────────────────────
 
@@ -337,3 +337,41 @@ def test_matrix_expands_driver_version(tmp_path):
     r = resolve_for_hardware(str(tmp_path), "NVIDIA H100 80GB", 1)
     assert r.deploy.driver_version == "560"
     assert r.deploy.cuda_version == "12.6"
+
+
+# ── validate_docker_options ───────────────────────────────────────
+
+
+def test_validate_docker_options_accepts_valid_keys():
+    validate_docker_options({"security_opt": ["seccomp=unconfined"], "cap_add": ["SYS_PTRACE"]})
+
+
+def test_validate_docker_options_accepts_empty():
+    validate_docker_options({})
+
+
+def test_validate_docker_options_rejects_managed_keys():
+    with pytest.raises(ValueError, match="image"):
+        validate_docker_options({"image": "custom:latest"})
+
+
+def test_validate_docker_options_rejects_multiple_managed_keys():
+    with pytest.raises(ValueError, match="volumes"):
+        validate_docker_options({"volumes": ["/a:/b"], "ports": ["8080:8080"]})
+
+
+def test_load_recipe_rejects_conflicting_docker_options(tmp_path):
+    recipe = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+                "docker_options": {"image": "override:latest"},
+            }
+        },
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+
+    with pytest.raises(ValueError, match="image"):
+        load_recipe(str(tmp_path))
