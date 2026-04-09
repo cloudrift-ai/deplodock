@@ -207,3 +207,4 @@ class KernelDef:
     batched: bool = False  # Batched GEMM: TMA descriptors are per-batch arrays
     extra_smem_bytes: int = 0  # Extra dynamic smem beyond standard double-buffer (e.g. for hybrid TF32 split scratch)
     int8_emulation: bool = False  # int8x9 SGEMM emulation: 6 int8 limb buffers + per-input scale instead of FP32 inputs
+    bf16_emulation: bool = False  # bf16x9 SGEMM emulation (fused): FP32 inputs, in-kernel BF16 split, no scale args

@@ -390,6 +390,37 @@ def generate_benchmark_program(
     cudaFuncSetAttribute({kernel.name},cudaFuncAttributeMaxDynamicSharedMemorySize,{smem_bytes});
 """
             tma_launch_prefix = f"d_{kernel.tma_params[0]}_descs, d_{kernel.tma_params[1]}_descs, "
+        elif getattr(kernel, "bf16_emulation", False):
+            # bf16x9 fused: standard 2 FP32 TMA descriptors, no preprocessing.
+            # The kernel reads FP32 from smem and splits it to 3 BF16 limbs
+            # internally; no scales are needed because BF16 carries its own
+            # exponent.
+            (a_tma, b_tma) = kernel.tma_params
+            tma_setup = f"""
+    // BF16x9 fused SGEMM: kernel splits FP32 -> 3 BF16 limbs in smem.
+    // No preprocessing, no scale args — same FP32 in/out interface as cublasSgemm.
+    CUtensorMap {a_tma}_desc, {b_tma}_desc;
+    {{
+        uint64_t da[2]={{(uint64_t)K,(uint64_t)M}};
+        uint64_t sa[1]={{(uint64_t)K*sizeof(float)}};
+        uint32_t ba[2]={{{bk_val},{tile_m}}};
+        uint32_t ea[2]={{1,1}};
+        cuTensorMapEncodeTiled(&{a_tma}_desc,CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,
+            d_A,da,sa,ba,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
+    }}
+    {{
+        uint64_t db[2]={{(uint64_t)N,(uint64_t)K}};
+        uint64_t sb[1]={{(uint64_t)N*sizeof(float)}};
+        uint32_t bb[2]={{{tile_n},{bk_val}}};
+        uint32_t ea[2]={{1,1}};
+        cuTensorMapEncodeTiled(&{b_tma}_desc,CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,
+            d_B,db,sb,bb,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
+    }}
+    cudaFuncSetAttribute({kernel.name},cudaFuncAttributeMaxDynamicSharedMemorySize,{smem_bytes});
+"""
+            tma_launch_prefix = f"{a_tma}_desc, {b_tma}_desc, "
         elif getattr(kernel, "int8_emulation", False) and len(kernel.tma_params) == 2:
             # int8x9 fused: 2 FP32 TMA descriptors. The kernel quantizes inline
             # in shared memory each K-tile, so no INT8 scratch buffers exist.
