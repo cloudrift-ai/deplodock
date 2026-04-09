@@ -45,8 +45,38 @@ def _load_raw_config(recipe_dir) -> dict:
         return yaml.safe_load(f)
 
 
+def validate_docker_options(docker_options: dict) -> None:
+    """Raise ValueError if docker_options contains keys managed by the compose template."""
+    conflicts = set(docker_options) & _MANAGED_COMPOSE_KEYS
+    if conflicts:
+        raise ValueError(
+            f"docker_options contains keys managed by the compose template: "
+            f"{', '.join(sorted(conflicts))}. Remove them from docker_options."
+        )
+
+
+# Keys already rendered by generate_compose() — must not appear in docker_options.
+_MANAGED_COMPOSE_KEYS = frozenset(
+    {
+        "image",
+        "container_name",
+        "entrypoint",
+        "deploy",
+        "devices",
+        "group_add",
+        "volumes",
+        "environment",
+        "ports",
+        "shm_size",
+        "ipc",
+        "command",
+        "healthcheck",
+    }
+)
+
+
 def _validate_and_build(config: dict) -> Recipe:
-    """Validate extra_args and build Recipe from config dict."""
+    """Validate extra_args and docker_options, then build Recipe from config dict."""
     llm_dict = config.get("engine", {}).get("llm", {})
     if "sglang" in llm_dict:
         engine = "sglang"
@@ -55,6 +85,7 @@ def _validate_and_build(config: dict) -> Recipe:
         engine = "vllm"
         extra_args = llm_dict.get("vllm", {}).get("extra_args", "")
     validate_extra_args(extra_args, engine=engine)
+    validate_docker_options(llm_dict.get("docker_options", {}))
 
     return Recipe.from_dict(config)
 

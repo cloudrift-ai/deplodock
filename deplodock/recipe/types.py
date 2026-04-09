@@ -1,6 +1,7 @@
 """Recipe dataclass types."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -33,6 +34,7 @@ class LLMConfig:
     gpu_memory_utilization: float = 0.9
     vllm: VllmConfig | None = None
     sglang: SglangConfig | None = None
+    docker_options: dict[str, Any] = field(default_factory=dict)
 
     @property
     def gpus_per_instance(self) -> int:
@@ -150,6 +152,7 @@ class Recipe:
             gpu_memory_utilization=llm_dict.get("gpu_memory_utilization", 0.9),
             vllm=vllm,
             sglang=sglang,
+            docker_options=llm_dict.get("docker_options", {}),
         )
 
         bench_dict = d.get("benchmark", {})
