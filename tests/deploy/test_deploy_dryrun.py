@@ -50,7 +50,7 @@ def test_ssh_deploy_command_sequence(run_cli, recipes_dir):
     assert any("mkdir" in line for line in dry_run_lines)
     assert any("docker-compose.yaml" in line for line in dry_run_lines)
     assert any("docker compose pull" in line for line in dry_run_lines)
-    assert any("huggingface-cli download" in line for line in dry_run_lines)
+    assert any("hf download" in line for line in dry_run_lines)
     assert any("docker compose down" in line for line in dry_run_lines)
     assert any("docker compose up" in line for line in dry_run_lines)
 

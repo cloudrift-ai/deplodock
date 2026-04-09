@@ -51,6 +51,7 @@ async def _handle_cloud(args):
         model_dir=args.model_dir,
         hf_token=hf_token,
         dry_run=args.dry_run,
+        port_mappings=conn.port_mappings,
     )
     await provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
 

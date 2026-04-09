@@ -16,7 +16,17 @@ from deplodock.recipe.types import Recipe
 logger = logging.getLogger(__name__)
 
 
-async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, host, dry_run=False, gpu_device_ids=None):
+async def run_deploy(
+    run_cmd,
+    write_file,
+    recipe: Recipe,
+    model_dir,
+    hf_token,
+    host,
+    dry_run=False,
+    gpu_device_ids=None,
+    port_mappings=None,
+):
     """Shared deploy orchestration.
 
     Args:
@@ -28,6 +38,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
         host: hostname/IP for endpoint display
         dry_run: if True, skip sleep in health polling
         gpu_device_ids: optional list of GPU device IDs to restrict visibility
+        port_mappings: optional list of (internal, external) port tuples
     """
     num_instances = calculate_num_instances(recipe)
 
@@ -43,7 +54,11 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
         nginx_content = generate_nginx_conf(num_instances, engine=recipe.engine.llm.engine_name)
         await write_file("nginx.conf", nginx_content)
 
-    port = 8080 if num_instances > 1 else 8000
+    internal_port = 8080 if num_instances > 1 else 8000
+
+    # Resolve external port from port mappings (e.g. CloudRift NAT)
+    port_map = dict(port_mappings or [])
+    external_port = port_map.get(internal_port, internal_port)
 
     # Step 1: Pull images
     logger.info("Pulling images...")
@@ -52,7 +67,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
         logger.error("Failed to pull images")
         return False
 
-    # Step 2: Download model via huggingface-cli in container
+    # Step 2: Download model via hf CLI in container
     logger.info(f"Downloading model {model_name}...")
     dl_cmd = (
         f"docker run --rm"
@@ -61,7 +76,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
         f" -v {model_dir}:{model_dir}"
         f" --entrypoint bash"
         f" {image}"
-        f" -c 'pip install huggingface_hub[cli,hf_transfer] && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download {model_name}'"
+        f" -c 'HF_HUB_ENABLE_HF_TRANSFER=1 hf download {model_name}'"
     )
     rc, _, _ = await run_cmd(dl_cmd, timeout=7200, log_output=True)
     if rc != 0:
@@ -83,7 +98,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
 
     # Step 5: Poll health
     logger.info("Waiting for health check...")
-    health_url = f"http://localhost:{port}/health"
+    health_url = f"http://localhost:{internal_port}/health"
     timeout = 3600  # 60 minutes
     interval = 10
     elapsed = 0
@@ -101,7 +116,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
 
     # Step 6: Print endpoint info
     status = "dry-run (not deployed)" if dry_run else "deployed"
-    logger.info(f"\nEndpoint: http://{host}:{port}/v1")
+    logger.info(f"\nEndpoint: http://{host}:{external_port}/v1")
     logger.info(f"Model: {model_name}")
     logger.info(f"Instances: {num_instances}")
     logger.info(f"Status: {status}")
@@ -113,7 +128,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
         logger.info("\nRunning smoke test...")
         prompt = "What is 2+2? Answer with just the number."
         smoke_cmd = (
-            f"curl -s http://localhost:{port}/v1/chat/completions"
+            f"curl -s http://localhost:{internal_port}/v1/chat/completions"
             f" -H 'Content-Type: application/json'"
             f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":128}}' '''
         )
@@ -154,7 +169,7 @@ async def run_deploy(run_cmd, write_file, recipe: Recipe, model_dir, hf_token, h
     # Print curl example
     logger.info("\nExample curl:")
     logger.info(
-        f"  curl http://{host}:{port}/v1/chat/completions \\\n"
+        f"  curl http://{host}:{external_port}/v1/chat/completions \\\n"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\n"
         f'      "model": "{model_name}",\n'
@@ -191,6 +206,7 @@ async def deploy(params: DeployParams) -> bool:
         host,
         params.dry_run,
         gpu_device_ids=params.gpu_device_ids,
+        port_mappings=params.port_mappings,
     )
 
 
