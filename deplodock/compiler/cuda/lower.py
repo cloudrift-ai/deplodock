@@ -1807,9 +1807,16 @@ def _lower_matmul_tma_db_fma_tf32(graph, out_node, config):
     # The smaller per-thread tile (vs the previous tm=28 single-8192-tuned
     # default) generalizes better across grid-saturation regimes — wins in
     # 6/9 of the (size, batch) sweep cases.
+    # ty (warps per CTA) is configurable but the default is the practical
+    # sweet spot. Sweeps showed that going to 10-16 warps causes register
+    # spills (regfile = 64KB / SM forces fewer regs/thread, which forces
+    # smaller per-thread tiles, which reduces FFMA reuse — the loss
+    # outweighs any gain from extra warps for latency hiding).
+    ty = int(_os.environ.get("DEPLODOCK_FMATF32_TY", "8"))
     ffma_warps = int(_os.environ.get("DEPLODOCK_FMATF32_FFMA_WARPS", "4"))
-    tf32_warps = 8 - ffma_warps
-    tx, ty = 32, 8
+    tf32_warps = ty - ffma_warps
+    assert tf32_warps >= 1, f"need at least 1 tf32 warp; got ffma_warps={ffma_warps}, ty={ty}"
+    tx = 32
     tm = int(_os.environ.get("DEPLODOCK_FMATF32_TM", "24"))
     tn = 4
     bk = int(_os.environ.get("DEPLODOCK_FMATF32_BK", "32"))

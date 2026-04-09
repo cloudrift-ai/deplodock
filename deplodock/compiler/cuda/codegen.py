@@ -66,7 +66,7 @@ def emit_kernel(kernel: KernelDef) -> str:
     bx, by, bz = kernel.block_size
     max_threads = bx * by * bz
     min_blocks = getattr(kernel, "min_blocks_per_sm", 0)
-    if max_threads <= 256:
+    if max_threads <= 1024:
         if min_blocks > 0:
             launch_bounds = f"\n__launch_bounds__({max_threads}, {min_blocks})"
         else:
