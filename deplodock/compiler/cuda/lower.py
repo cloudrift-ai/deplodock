@@ -1674,21 +1674,29 @@ def _lower_matmul_tma_db_tf32(graph, out_node, config):
                 inner_lines.append(f"        wmma::mma_sync(hc{ri}_{ci},ha,hb,hc{ri}_{ci});")
     inner_block = "\n".join(inner_lines)
 
+    a_size = bm * bk
+    b_size = bk * bn
+    stage = a_size + b_size  # FP32 floats
+    tma_bytes = stage * 4
+
+    use_batch = config.batch_count > 1
+    tma_a_ref = f"&{a_name}_tma[batch]" if use_batch else f"&{a_name}_tma"
+    tma_b_ref = f"&{b_name}_tma[batch]" if use_batch else f"&{b_name}_tma"
+    batch_setup = "int batch=blockIdx.z;\n" if use_batch else ""
+    c_ptr = f"({c_name}+batch*M*N)" if use_batch else c_name
+
     # Trivial epilogue: one store_matrix_sync per fragment, with edge guards.
+    # Uses c_ptr so batched mode offsets correctly.
     epilogue_lines = []
     for ri in range(frag_rows_per_warp):
         for ci in range(frag_cols_per_warp):
             row_expr = f"(bm+warp_row*{frag_rows_per_warp * wmma_m}+{ri * wmma_m})"
             col_expr = f"(bn+warp_col*{frag_cols_per_warp * wmma_n}+{ci * wmma_n})"
             epilogue_lines.append(
-                f"    if({row_expr}+{wmma_m}<=M&&{col_expr}+{wmma_n}<=N) wmma::store_matrix_sync(&{c_name}[{row_expr}*N+{col_expr}],hc{ri}_{ci},N,wmma::mem_row_major);"
+                f"    if({row_expr}+{wmma_m}<=M&&{col_expr}+{wmma_n}<=N) wmma::store_matrix_sync(&{c_ptr}[{row_expr}*N+{col_expr}],hc{ri}_{ci},N,wmma::mem_row_major);"
             )
     epilogue_block = "\n".join(epilogue_lines)
-
-    a_size = bm * bk
-    b_size = bk * bn
-    stage = a_size + b_size  # FP32 floats
-    tma_bytes = stage * 4
+    epilogue_block_b = epilogue_block
 
     kernel_code = f"""\
 extern __shared__ __align__(128) char dsmem[];
@@ -1704,7 +1712,7 @@ int tid=threadIdx.y*{tx}+threadIdx.x;
 int wid=threadIdx.y;
 int warp_row=wid/{warp_cols};
 int warp_col=wid%{warp_cols};
-const int SWIZ=8;
+{batch_setup}const int SWIZ=8;
 int ntx=(N+{bn - 1})/{bn};
 int nty=(M+{bm - 1})/{bm};
 int pid=blockIdx.x+blockIdx.y*gridDim.x;
@@ -1721,8 +1729,8 @@ const int bytes={tma_bytes};
 int p0=0,p1=0,nt=K/{bk};
 if(nt>0&&tid==0){{
     asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as0),"l"(&{a_name}_tma),"r"(0),"r"(bm),"r"(mb0):"memory");
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs0),"l"(&{b_name}_tma),"r"(bn),"r"(0),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as0),"l"({tma_a_ref}),"r"(0),"r"(bm),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs0),"l"({tma_b_ref}),"r"(bn),"r"(0),"r"(mb0):"memory");
 }}
 for(int t=0;t<nt;t++){{
     int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;
@@ -1732,15 +1740,15 @@ for(int t=0;t<nt;t++){{
     if(tid==0&&t+1<nt){{
         int nk=(t+1)*{bk};
         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(bytes):"memory");
-        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"(&{a_name}_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
-        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"(&{b_name}_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"({tma_a_ref}),"r"(nk),"r"(bm),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"({tma_b_ref}),"r"(bn),"r"(nk),"r"(nm):"memory");
     }}
     float*A_smem=&smem[s*{stage}];
     float*B_smem=&smem[s*{stage}+{a_size}];
 {inner_block}
     __syncthreads();
 }}
-{epilogue_block}"""
+{epilogue_block_b}"""
 
     return KernelDef(
         name="fused_matmul",
@@ -1751,7 +1759,7 @@ for(int t=0;t<nt;t++){{
         tile_m=bm,
         tile_n=bn,
         tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
-        batched=False,
+        batched=use_batch,
         min_blocks_per_sm=int(_os.environ.get("DEPLODOCK_TF32_MIN_BLOCKS", "2")),
         tma_swizzle=_os.environ.get("DEPLODOCK_TF32_SWIZZLE", "NONE"),
     )
@@ -1832,6 +1840,12 @@ def _lower_matmul_tma_db_fma_tf32(graph, out_node, config):
     b_size = bk * bn
     stage = a_size + b_size
 
+    use_batch = config.batch_count > 1
+    tma_a_ref = f"&{a_name}_tma[batch]" if use_batch else f"&{a_name}_tma"
+    tma_b_ref = f"&{b_name}_tma[batch]" if use_batch else f"&{b_name}_tma"
+    batch_setup = "int batch=blockIdx.z;\n" if use_batch else ""
+    c_ptr = f"({c_name}+batch*M*N)" if use_batch else c_name
+
     # FFMA accumulator declarations
     ffma_acc_decl = "float " + ",".join(f"c{i}_{j}=0.0f" for i in range(tm) for j in range(tn)) + ";"
 
@@ -1845,10 +1859,10 @@ def _lower_matmul_tma_db_fma_tf32(graph, out_node, config):
 
     # FFMA epilogue: write top FFMA_BM rows
     write_macro = f"""#if (M % {bm} == 0 && N % {bn} == 0)
-#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);int gc=bn+tc;float*Cout={c_name}; \
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);int gc=bn+tc;float*Cout={c_ptr}; \
 Cout[gr*N+gc]=v0;Cout[gr*N+gc+1]=v1;Cout[gr*N+gc+2]=v2;Cout[gr*N+gc+3]=v3;}}}}
 #else
-#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_name}; \
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
 if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}}}}}
 #endif"""
     ffma_write_lines = [f"        W({i},c{i}_0,c{i}_1,c{i}_2,c{i}_3)" for i in range(tm)]
@@ -1877,18 +1891,20 @@ if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=
                 tf32_inner_lines.append(f"        wmma::mma_sync(hc{ri}_{ci},ha,hb,hc{ri}_{ci});")
     tf32_inner_block = "\n".join(tf32_inner_lines)
 
-    # TF32 epilogue: write bottom rows
+    # TF32 epilogue: write bottom rows (uses c_ptr for batched mode)
     tf32_write_lines = []
     for ri in range(tf32_frag_rows_per_warp):
         for ci in range(tf32_frag_cols_per_warp):
             row_expr = f"(bm+{ffma_bm}+t_warp_row*{tf32_frag_rows_per_warp * wmma_m}+{ri * wmma_m})"
             col_expr = f"(bn+t_warp_col*{tf32_frag_cols_per_warp * wmma_n}+{ci * wmma_n})"
             tf32_write_lines.append(
-                f"        if({row_expr}+{wmma_m}<=M&&{col_expr}+{wmma_n}<=N) wmma::store_matrix_sync(&{c_name}[{row_expr}*N+{col_expr}],hc{ri}_{ci},N,wmma::mem_row_major);"
+                f"        if({row_expr}+{wmma_m}<=M&&{col_expr}+{wmma_n}<=N) wmma::store_matrix_sync(&{c_ptr}[{row_expr}*N+{col_expr}],hc{ri}_{ci},N,wmma::mem_row_major);"
             )
     tf32_write_block = "\n".join(tf32_write_lines)
 
     tma_bytes = stage * 4
+    write_macro_b = write_macro
+    tf32_write_block_b = tf32_write_block
 
     kernel_code = f"""\
 extern __shared__ __align__(128) char dsmem[];
@@ -1911,7 +1927,7 @@ int tc=lane*{tn};
 int t_wid=wid-{ffma_warps};
 int t_warp_row=t_wid/{tf32_warp_cols};
 int t_warp_col=t_wid%{tf32_warp_cols};
-const int SWIZ=8;
+{batch_setup}const int SWIZ=8;
 int ntx=(N+{bn - 1})/{bn};
 int nty=(M+{bm - 1})/{bm};
 int pid=blockIdx.x+blockIdx.y*gridDim.x;
@@ -1929,8 +1945,8 @@ const int bytes={tma_bytes};
 int p0=0,p1=0,nt=K/{bk};
 if(nt>0&&tid==0){{
     asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as0),"l"(&{a_name}_tma),"r"(0),"r"(bm),"r"(mb0):"memory");
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs0),"l"(&{b_name}_tma),"r"(bn),"r"(0),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as0),"l"({tma_a_ref}),"r"(0),"r"(bm),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs0),"l"({tma_b_ref}),"r"(bn),"r"(0),"r"(mb0):"memory");
 }}
 for(int t=0;t<nt;t++){{
     int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;
@@ -1940,8 +1956,8 @@ for(int t=0;t<nt;t++){{
     if(tid==0&&t+1<nt){{
         int nk=(t+1)*{bk};
         asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(bytes):"memory");
-        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"(&{a_name}_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
-        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"(&{b_name}_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"({tma_a_ref}),"r"(nk),"r"(bm),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"({tma_b_ref}),"r"(bn),"r"(nk),"r"(nm):"memory");
     }}
     float*A_smem=&smem[s*{stage}];
     float*B_smem=&smem[s*{stage}+{a_size}];
@@ -1955,11 +1971,11 @@ for(int t=0;t<nt;t++){{
     }}
     __syncthreads();
 }}
-{write_macro}
+{write_macro_b}
 if(!is_tf32){{
 {ffma_write_block}
 }}else{{
-{tf32_write_block}
+{tf32_write_block_b}
 }}"""
 
     return KernelDef(
@@ -1971,7 +1987,7 @@ if(!is_tf32){{
         tile_m=bm,
         tile_n=bn,
         tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
-        batched=False,
+        batched=use_batch,
         min_blocks_per_sm=int(_os.environ.get("DEPLODOCK_FMATF32_MIN_BLOCKS", "0")),
     )
 
@@ -2060,6 +2076,12 @@ def _lower_matmul_tma_db_fma_tf32_ws(graph, out_node, config):
     ffma_tma_bytes = stage_bytes
     tf32_tma_bytes = stage_bytes
 
+    use_batch = config.batch_count > 1
+    tma_a_ref = f"&{a_name}_tma[batch]" if use_batch else f"&{a_name}_tma"
+    tma_b_ref = f"&{b_name}_tma[batch]" if use_batch else f"&{b_name}_tma"
+    batch_setup = "int batch=blockIdx.z;\n" if use_batch else ""
+    c_ptr = f"({c_name}+batch*M*N)" if use_batch else c_name
+
     # FFMA accumulator declarations
     ffma_acc_decl = "float " + ",".join(f"c{i}_{j}=0.0f" for i in range(tm) for j in range(tn)) + ";"
     fma_lines = []
@@ -2070,10 +2092,10 @@ def _lower_matmul_tma_db_fma_tf32_ws(graph, out_node, config):
     fma_block = "\n".join(fma_lines)
 
     write_macro = f"""#if (M % {bm} == 0 && N % {bn} == 0)
-#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);int gc=bn+tc;float*Cout={c_name}; \
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);int gc=bn+tc;float*Cout={c_ptr}; \
 Cout[gr*N+gc]=v0;Cout[gr*N+gc+1]=v1;Cout[gr*N+gc+2]=v2;Cout[gr*N+gc+3]=v3;}}}}
 #else
-#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_name}; \
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_ptr}; \
 if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}}}}}
 #endif"""
     ffma_write_lines = [f"        W({i},c{i}_0,c{i}_1,c{i}_2,c{i}_3)" for i in range(tm)]
@@ -2104,19 +2126,22 @@ if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=
                 tf32_inner_lines.append(f"        wmma::mma_sync(hc{ri}_{ci},ha,hb,hc{ri}_{ci});")
     tf32_inner_block = "\n".join(tf32_inner_lines)
 
-    # TF32 epilogue
+    # TF32 epilogue (uses c_ptr for batched mode)
     tf32_write_lines = []
     for ri in range(tf32_frag_rows_per_warp):
         for ci in range(tf32_frag_cols_per_warp):
             row_expr = f"(bm+{ffma_bm}+t_warp_row*{tf32_frag_rows_per_warp * wmma_m}+{ri * wmma_m})"
             col_expr = f"(bn+t_warp_col*{tf32_frag_cols_per_warp * wmma_n}+{ci * wmma_n})"
             tf32_write_lines.append(
-                f"        if({row_expr}+{wmma_m}<=M&&{col_expr}+{wmma_n}<=N) wmma::store_matrix_sync(&{c_name}[{row_expr}*N+{col_expr}],hc{ri}_{ci},N,wmma::mem_row_major);"
+                f"        if({row_expr}+{wmma_m}<=M&&{col_expr}+{wmma_n}<=N) wmma::store_matrix_sync(&{c_ptr}[{row_expr}*N+{col_expr}],hc{ri}_{ci},N,wmma::mem_row_major);"
             )
     tf32_write_block = "\n".join(tf32_write_lines)
 
     ffma_threads = ffma_warps * 32
     tf32_threads = tf32_warps * 32
+
+    write_macro_b = write_macro
+    tf32_write_block_b = tf32_write_block
 
     kernel_code = f"""\
 extern __shared__ __align__(128) char dsmem[];
@@ -2142,7 +2167,7 @@ int t_warp_row=t_wid/{tf32_warp_cols};
 int t_warp_col=t_wid%{tf32_warp_cols};
 int tr=wid*{tm};
 int tc=lane*{tn};
-const int SWIZ=8;
+{batch_setup}const int SWIZ=8;
 int ntx=(N+{bn - 1})/{bn};
 int nty=(M+{bm - 1})/{bm};
 int pid=blockIdx.x+blockIdx.y*gridDim.x;
@@ -2169,13 +2194,13 @@ int nt=K/{bk};
 // First prefetch: each producer issues TMA for its own group's stage 0
 if(nt>0&&!is_tf32&&wid==0&&lane==0){{
     asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(ffma_mb0),"r"(ffma_bytes):"memory");
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(ffma_as0),"l"(&{a_name}_tma),"r"(0),"r"(bm),"r"(ffma_mb0):"memory");
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(ffma_bs0),"l"(&{b_name}_tma),"r"(bn),"r"(0),"r"(ffma_mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(ffma_as0),"l"({tma_a_ref}),"r"(0),"r"(bm),"r"(ffma_mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(ffma_bs0),"l"({tma_b_ref}),"r"(bn),"r"(0),"r"(ffma_mb0):"memory");
 }}
 if(nt>0&&is_tf32&&wid=={ffma_warps}&&lane==0){{
     asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(tf32_mb0),"r"(tf32_bytes):"memory");
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(tf32_as0),"l"(&{a_name}_tma),"r"(0),"r"(bm),"r"(tf32_mb0):"memory");
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(tf32_bs0),"l"(&{b_name}_tma),"r"(bn),"r"(0),"r"(tf32_mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(tf32_as0),"l"({tma_a_ref}),"r"(0),"r"(bm),"r"(tf32_mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(tf32_bs0),"l"({tma_b_ref}),"r"(bn),"r"(0),"r"(tf32_mb0):"memory");
 }}
 if(!is_tf32){{
     // FFMA group K-loop (independent of TF32 group)
@@ -2188,8 +2213,8 @@ if(!is_tf32){{
         if(wid==0&&lane==0&&t+1<nt){{
             int nk=(t+1)*{bk};
             asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(ffma_bytes):"memory");
-            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"(&{a_name}_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
-            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"(&{b_name}_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"({tma_a_ref}),"r"(nk),"r"(bm),"r"(nm):"memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"({tma_b_ref}),"r"(bn),"r"(nk),"r"(nm):"memory");
         }}
         float*A_smem=(float*)&dsmem[s==0?{ffma_a_off[0]}:{ffma_a_off[1]}];
         float*B_smem=(float*)&dsmem[s==0?{ffma_b_off[0]}:{ffma_b_off[1]}];
@@ -2211,8 +2236,8 @@ if(!is_tf32){{
         if(wid=={ffma_warps}&&lane==0&&t+1<nt){{
             int nk=(t+1)*{bk};
             asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(tf32_bytes):"memory");
-            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"(&{a_name}_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
-            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"(&{b_name}_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"({tma_a_ref}),"r"(nk),"r"(bm),"r"(nm):"memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"({tma_b_ref}),"r"(bn),"r"(nk),"r"(nm):"memory");
         }}
         float*A_smem=(float*)&dsmem[s==0?{tf32_a_off[0]}:{tf32_a_off[1]}];
         float*B_smem=(float*)&dsmem[s==0?{tf32_b_off[0]}:{tf32_b_off[1]}];
@@ -2221,11 +2246,11 @@ if(!is_tf32){{
         asm volatile("bar.sync 2, %0;"::"r"({tf32_threads}));
     }}
 }}
-{write_macro}
+{write_macro_b}
 if(!is_tf32){{
 {ffma_write_block}
 }}else{{
-{tf32_write_block}
+{tf32_write_block_b}
 }}"""
 
     # Compute extra smem beyond the FP32 baseline
@@ -2241,7 +2266,7 @@ if(!is_tf32){{
         tile_m=bm,
         tile_n=bn,
         tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
-        batched=False,
+        batched=use_batch,
         extra_smem_bytes=extra,
         min_blocks_per_sm=int(_os.environ.get("DEPLODOCK_FMATF32WS_MIN_BLOCKS", "0")),
     )
