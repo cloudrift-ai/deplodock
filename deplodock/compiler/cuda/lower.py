@@ -1751,6 +1751,7 @@ for(int t=0;t<nt;t++){{
         tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
         batched=False,
         min_blocks_per_sm=int(_os.environ.get("DEPLODOCK_TF32_MIN_BLOCKS", "2")),
+        tma_swizzle=_os.environ.get("DEPLODOCK_TF32_SWIZZLE", "NONE"),
     )
 
 
