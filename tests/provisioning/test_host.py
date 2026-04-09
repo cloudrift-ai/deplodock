@@ -94,3 +94,101 @@ def test_ensure_nvidia_install_on_mismatch_raises_locally():
     host = FakeHost()
     with pytest.raises(click.ClickException, match="cuda"):
         asyncio.run(_ensure_nvidia_versions(host, driver_version="550", cuda_version=None))
+
+
+def test_ensure_nvidia_install_failure_raises():
+    """Regression: when `apt-get install cuda-drivers-...` exits non-zero
+    (e.g. unmet dependencies on a CloudRift base image), the harness must
+    raise loudly rather than silently proceeding to a half-installed state.
+
+    Before the fix, `_ensure_nvidia_versions` ignored the exit code and
+    returned `installed=True`, the caller rebooted, and the bench produced
+    empty result tables an hour later with no indication why.
+    """
+    from deplodock.provisioning.remote import _ensure_nvidia_versions
+
+    class FailingAptHost(LocalHost):
+        async def run(self, cmd, *, sudo=False, capture=False, timeout=600, **kwargs):
+            self_cmd = cmd
+            if "nvidia-smi" in self_cmd:
+                return 0, "550.54.15"  # mismatched driver triggers install path
+            if "test -d /usr/local/cuda" in self_cmd:
+                return 1, ""  # cuda toolkit not present
+            if "cuda-keyring" in self_cmd or "apt-get update" in self_cmd:
+                return 0, ""
+            if "dpkg --configure" in self_cmd or "fix-broken" in self_cmd:
+                return 0, ""
+            if "apt-get install" in self_cmd and "nvidia-open" in self_cmd:
+                return (
+                    100,
+                    "E: Unmet dependencies. Try 'apt --fix-broken install' with no packages",
+                )
+            return 0, ""
+
+    host = FailingAptHost()
+    with pytest.raises(RuntimeError, match="nvidia-open.*failed"):
+        asyncio.run(_ensure_nvidia_versions(host, driver_version="595", cuda_version=None))
+
+
+def test_ensure_nvidia_cuda_install_silent_failure_raises():
+    """Regression: apt-get install of cuda-toolkit-X-Y can return rc=0 yet not
+    actually create /usr/local/cuda-X.Y (kept-back packages, etc.). The post-
+    install dir check must catch this and raise."""
+    from deplodock.provisioning.remote import _ensure_nvidia_versions
+
+    class SilentlyFailingHost(LocalHost):
+        async def run(self, cmd, *, sudo=False, capture=False, timeout=600, **kwargs):
+            if "nvidia-smi" in cmd:
+                return 0, "595.58.03"
+            if "test -d /usr/local/cuda" in cmd:
+                return 1, ""  # never present, even after install
+            if "cuda-keyring" in cmd or "apt-get update" in cmd:
+                return 0, ""
+            if "dpkg --configure" in cmd or "fix-broken" in cmd:
+                return 0, ""
+            if "apt-get install" in cmd:
+                return 0, ""  # apt lies and exits 0
+            return 0, ""
+
+    host = SilentlyFailingHost()
+    with pytest.raises(RuntimeError, match="reported success but"):
+        asyncio.run(_ensure_nvidia_versions(host, driver_version="595", cuda_version="13.2"))
+
+
+def test_ensure_nvidia_purges_old_packages_first():
+    """Regression: when installing a new driver, the harness must purge any
+    pre-existing nvidia/libnvidia packages first. CloudRift base images ship
+    nvidia-driver-510 from the Ubuntu archive; without a purge step, the
+    cuda repo's libnvidia-* (= 595.58.03-1ubuntu1) cannot unpack over the
+    older files and the install fails."""
+    from deplodock.provisioning.remote import _ensure_nvidia_versions
+
+    class TrackingHost(LocalHost):
+        def __init__(self):
+            super().__init__()
+            self.commands: list[str] = []
+
+        async def run(self, cmd, *, sudo=False, capture=False, timeout=600, **kwargs):
+            self.commands.append(cmd)
+            if "nvidia-smi" in cmd:
+                return 0, "510.47.03"  # old version triggers install
+            if "test -d /usr/local/cuda" in cmd:
+                return 0, ""  # cuda toolkit not requested in this test
+            if "cuda-keyring" in cmd or "apt-get update" in cmd:
+                return 0, ""
+            if "dpkg --configure" in cmd or "fix-broken" in cmd:
+                return 0, ""
+            if "apt-get purge" in cmd:
+                return 0, ""
+            if "apt-get install" in cmd and "nvidia-open" in cmd:
+                return 0, ""
+            return 0, ""
+
+    host = TrackingHost()
+    asyncio.run(_ensure_nvidia_versions(host, driver_version="595", cuda_version=None))
+    # Find the install command and the purge command, ensure purge came first.
+    purge_idx = next((i for i, c in enumerate(host.commands) if "apt-get purge" in c and "nvidia-*" in c), -1)
+    install_idx = next((i for i, c in enumerate(host.commands) if "apt-get install" in c and "nvidia-open" in c), -1)
+    assert purge_idx >= 0, f"purge step never invoked. commands: {host.commands}"
+    assert install_idx >= 0, f"install step never invoked. commands: {host.commands}"
+    assert purge_idx < install_idx, f"purge must run before install (purge at {purge_idx}, install at {install_idx})"

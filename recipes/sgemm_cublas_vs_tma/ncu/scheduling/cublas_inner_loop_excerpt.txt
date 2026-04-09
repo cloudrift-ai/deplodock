@@ -1,0 +1,80 @@
+0x74f2e76f66c0           LDS.128 R132, [R130]                                   
+0x74f2e76f66d0           LDCU.64 UR16, c[0x0][0x3c0]                            
+0x74f2e76f66e0           SHF.R.U32.HI R30, RZ, 0x1, R131                        
+0x74f2e76f66f0           IADD.64 R200, R200, UR4                                
+0x74f2e76f6700           LDS.128 R140, [R130+0x40]                              
+0x74f2e76f6710           LDCU.64 UR14, c[0x0][0x3e0]                            
+0x74f2e76f6720           LOP3.LUT R185, R185, 0xffc, R30, 0xc8, !PT             
+0x74f2e76f6730           IADD.64 R204, R204, UR10                               
+0x74f2e76f6740           LDS.128 R144, [R130+0x80]                              
+0x74f2e76f6750           ISETP.NE.AND P0, PT, R189, RZ, PT                      
+0x74f2e76f6760           MOV R186, RZ                                           
+0x74f2e76f6770           MOV R30, RZ                                            
+0x74f2e76f6780           LDS.128 R148, [R130+0xc0]                              
+0x74f2e76f6790           IADD3 R185, PT, PT, R156, R185, RZ                     
+0x74f2e76f67a0           SEL R188, R188, RZ, P0                                 
+0x74f2e76f67b0           SEL R187, R187, RZ, P0                                 
+0x74f2e76f67c0           LDS.128 R136, [R129]                                   
+0x74f2e76f67d0           UMOV UR9, 0x3000                                       
+0x74f2e76f67e0           LDCU.64 UR12, c[0x0][0x3c8]                            
+0x74f2e76f67f0           LDS.128 R152, [R129+0x80]                              
+0x74f2e76f6800           LDCU.64 UR10, c[0x0][0x3e8]                            
+0x74f2e76f6810           UMOV UR8, 0x6000                                       
+0x74f2e76f6820           UIADD3.64 UR20, UPT, UPT, UR16, UR16, URZ              
+0x74f2e76f6830           UIADD3.64 UR18, UPT, UPT, UR14, UR14, URZ              
+0x74f2e76f6840           UMOV UR7, 0x3                                          
+0x74f2e76f6850           UMOV UR4, 0x1000                                       
+0x74f2e76f6860           LDC.64 R182, c[0x0][0x3c0]                             
+0x74f2e76f6870           LEA R131, R131, R156, 0x2                              
+0x74f2e76f6880           LDC.64 R180, c[0x0][0x3e0]                             
+0x74f2e76f6890           LEA R196, R183, R183, 0x1                              
+0x74f2e76f68a0           LEA R195, R181, R181, 0x1                              
+0x74f2e76f68b0           IMAD R194, R181, 0x5, RZ                               
+0x74f2e76f68c0           IMAD R193, R181, 0x6, RZ                               
+0x74f2e76f68d0           IMAD R183, R181, 0x7, RZ                               
+0x74f2e76f68e0           LDS.128 R156, [R130+0x200]                             
+0x74f2e76f68f0           FFMA R127, R132, R136, R127                            
+0x74f2e76f6900           FFMA R128, R133, R136, R128                            
+0x74f2e76f6910           FFMA R126, R133, R137, R126                            
+0x74f2e76f6920           FFMA R125, R132, R137, R125                            
+0x74f2e76f6930           FFMA R123, R134, R136, R123                            
+0x74f2e76f6940           FFMA R124, R135, R136, R124                            
+0x74f2e76f6950           FFMA R122, R135, R137, R122                            
+0x74f2e76f6960           LDS.128 R160, [R129+0x400]                             
+0x74f2e76f6970           FFMA R121, R134, R137, R121                            
+0x74f2e76f6980           FFMA R119, R140, R136, R119                            
+0x74f2e76f6990           FFMA R120, R141, R136, R120                            
+0x74f2e76f69a0           FFMA R118, R141, R137, R118                            
+0x74f2e76f69b0           FFMA R117, R140, R137, R117                            
+0x74f2e76f69c0           FFMA R115, R142, R136, R115                            
+0x74f2e76f69d0           FFMA R116, R143, R136, R116                            
+0x74f2e76f69e0           LDS.128 R164, [R130+0x240]                             
+0x74f2e76f69f0           FFMA R114, R143, R137, R114                            
+0x74f2e76f6a00           FFMA R113, R142, R137, R113                            
+0x74f2e76f6a10           FFMA R111, R144, R136, R111                            
+0x74f2e76f6a20           FFMA R112, R145, R136, R112                            
+0x74f2e76f6a30           FFMA R110, R145, R137, R110                            
+0x74f2e76f6a40           FFMA R109, R144, R137, R109                            
+0x74f2e76f6a50           FFMA R107, R146, R136, R107                            
+0x74f2e76f6a60           LDS.128 R168, [R130+0x280]                             
+0x74f2e76f6a70           FFMA R108, R147, R136, R108                            
+0x74f2e76f6a80           FFMA R106, R147, R137, R106                            
+0x74f2e76f6a90           FFMA R105, R146, R137, R105                            
+0x74f2e76f6aa0           FFMA R103, R148, R136, R103                            
+0x74f2e76f6ab0           FFMA R104, R149, R136, R104                            
+0x74f2e76f6ac0           FFMA R102, R149, R137, R102                            
+0x74f2e76f6ad0           FFMA R101, R148, R137, R101                            
+0x74f2e76f6ae0           LDS.128 R172, [R130+0x2c0]                             
+0x74f2e76f6af0           FFMA R99, R150, R136, R99                              
+0x74f2e76f6b00           FFMA R100, R151, R136, R100                            
+0x74f2e76f6b10           FFMA R98, R151, R137, R98                              
+0x74f2e76f6b20           FFMA R96, R150, R137, R96                              
+0x74f2e76f6b30           FFMA R97, R150, R138, R97                              
+0x74f2e76f6b40           FFMA R95, R151, R138, R95                              
+0x74f2e76f6b50           FFMA R94, R151, R139, R94                              
+0x74f2e76f6b60           LDS.128 R176, [R129+0x480]                             
+0x74f2e76f6b70           FFMA R93, R150, R139, R93                              
+0x74f2e76f6b80           FFMA R91, R148, R138, R91                              
+0x74f2e76f6b90           FFMA R92, R149, R138, R92                              
+0x74f2e76f6ba0           FFMA R90, R149, R139, R90                              
+0x74f2e76f6bb0           FFMA R89, R148, R139, R89                              

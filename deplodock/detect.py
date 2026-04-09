@@ -20,7 +20,11 @@ GPU_PCI_DEVICE_IDS: dict[str, str] = {
     # NVIDIA RTX PRO 6000 Blackwell Workstation Edition
     "2ba0": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     # NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition
+    # NVIDIA ships multiple PCI device IDs under the same product name —
+    # 2ba2 is the desktop variant, 2bb4 is the variant CloudRift attaches
+    # to its Pro 6000 Max-Q VMs (confirmed via nvidia-smi vs sysfs).
     "2ba2": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "2bb4": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
     # NVIDIA RTX PRO 6000 Blackwell Server Edition
     "2ba4": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
     # NVIDIA L40S

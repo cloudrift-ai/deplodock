@@ -1,0 +1,108 @@
+command:
+  stage:
+    - deplodock
+    - scripts
+    - pyproject.toml
+    - requirements.txt
+    - Makefile
+  run: |
+    export PATH=/usr/local/cuda/bin:$$PATH
+    export DEPLODOCK_GIT_REV="$git_rev"
+    cd $repo_dir
+    [ -d venv ] || make setup
+    ./venv/bin/python scripts/bench_matmul.py \
+      --strategy $strategy \
+      --sizes $sizes \
+      --batches $batches \
+      --iterations $iterations \
+      --output-dir $task_dir
+    # Capture diagnostic dumps so the article's external claims (cuBLAS kernel
+    # name, batched dispatch comparison) are reproducible from this run.
+    mkdir -p $task_dir/diagnostics
+    bash scripts/diagnostics/dump_cublas_kernels.sh \
+        > $task_dir/diagnostics/cublas_kernels.txt 2>&1 || true
+    arch="sm_$$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')"
+    nvcc -O3 --fmad=true -arch=$$arch -lcublas -lcurand \
+        -o /tmp/cublas_loop_vs_strided \
+        scripts/diagnostics/cublas_loop_vs_strided.cu 2>/dev/null && {
+        for batch in 4 16; do
+            /tmp/cublas_loop_vs_strided 1024 $$batch \
+                > $task_dir/diagnostics/cublas_loop_vs_strided_1024xb$$batch.txt 2>&1 || true
+        done
+    }
+    ./venv/bin/python scripts/diagnostics/sass_analysis.py 8192 \
+        > $task_dir/diagnostics/sass_analysis_8192.md 2>&1 || true
+  result_files:
+    - "*.json"
+    - "*.md"
+    - "diagnostics/*"
+  timeout: 1800
+
+matrices:
+  # Single-GEMM sweep. 256 and 512 are excluded: at those sizes the per-call
+  # duration is sub-millisecond, the GPU clock governor never engages boost,
+  # and the SM clock fluctuates between idle (~260 MHz) and steady (~2400 MHz)
+  # within a single benchmark run — the resulting variance dominates any real
+  # signal. They're still measured in batched mode below where the longer
+  # duration keeps the clock pinned.
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    # Pin the toolchain so cloud runs reproduce the article's numbers exactly.
+    # The harness skips reinstall if the requested versions are already on the
+    # host (which is the case for `--local` runs against this dev box), so this
+    # is free for local benchmarking and load-bearing only on fresh cloud VMs.
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "1024,2048,4096,8192,16384"
+    batches: "1"
+    iterations: 30
+    git_rev: "feature/mini-gpu-compiler@local"
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "256,512,1024,2048,4096,8192"
+    batches: "4,8,16"
+    iterations: 20
+    git_rev: "feature/mini-gpu-compiler@local"
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "1024,2048,4096,8192,16384"
+    batches: "1"
+    iterations: 30
+    git_rev: "feature/mini-gpu-compiler@local"
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "256,512,1024,2048,4096,8192"
+    batches: "4,8,16"
+    iterations: 20
+    git_rev: "feature/mini-gpu-compiler@local"
+  # RTX PRO 6000 Blackwell Max-Q (sm_120) — same architecture as 5090 but 188 SMs
+  # vs 170, different wave quantization. Per-GPU tuning profile in tuning.py
+  # picks TM=24 at 4096+ instead of the 5090's TM=20/28.
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "1024,2048,4096,8192,16384"
+    batches: "1"
+    iterations: 30
+    git_rev: "feature/mini-gpu-compiler@local"
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy: adaptive
+    sizes: "256,512,1024,2048,4096,8192"
+    batches: "4,8,16"
+    iterations: 20
+    git_rev: "feature/mini-gpu-compiler@local"

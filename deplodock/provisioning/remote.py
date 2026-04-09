@@ -4,10 +4,9 @@ import asyncio
 import logging
 
 from deplodock.provisioning.host import Host
+from deplodock.provisioning.ssh_transport import REMOTE_DEPLOY_DIR
 
 logger = logging.getLogger(__name__)
-
-REMOTE_DEPLOY_DIR = "~/deploy"
 
 
 async def provision_remote(
@@ -20,7 +19,7 @@ async def provision_remote(
     """Ensure ``host`` is ready for deployment.
 
     Steps (each checks before installing):
-    1. Create ~/deploy directory
+    1. Create the deplodock workspace directory
     2. Install Docker if not found
     3. Install NVIDIA driver / CUDA toolkit if requested versions don't match
        (reboots and waits for the host to come back if anything was installed)
@@ -46,6 +45,11 @@ async def provision_remote(
         installed_anything = await _ensure_nvidia_versions(host, driver_version=driver_version, cuda_version=cuda_version)
         if installed_anything:
             await reboot_and_wait(host)
+            # Post-reboot verification: catch silent install failures (e.g.
+            # CloudRift base images that ship pinned libnvidia-* packages
+            # which conflict with the cuda repo's libnvidia-compute version,
+            # leaving cuda-drivers in `iU` state with no `nvidia-smi` binary).
+            await _verify_nvidia_install(host, driver_version=driver_version, cuda_version=cuda_version)
 
     # 4. Install NVIDIA Container Toolkit if not found
     if not skip_nvidia and dry_run:
@@ -79,7 +83,12 @@ async def _ensure_nvidia_versions(
 ) -> bool:
     """Install requested driver / CUDA toolkit if they don't already match.
 
-    Returns True if anything was installed (caller should reboot).
+    Returns True if anything was installed (caller should reboot + verify).
+
+    Each `apt-get install` exit code is checked and surfaced as a hard error.
+    A previous version of this function silently ignored install failures,
+    which let the harness march on past broken `iU` (unpacked-but-unconfigured)
+    package states and produce empty bench results without flagging the cause.
     """
     installed = False
 
@@ -93,30 +102,157 @@ async def _ensure_nvidia_versions(
 
     if need_driver or need_cuda:
         await _setup_nvidia_cuda_repo(host)
+        # Heal any pre-existing partial dpkg state from the base image so that
+        # the new install isn't blocked by leftover unconfigured packages.
+        await _heal_dpkg(host)
 
     if need_driver:
-        # cuda-drivers-<major> is the canonical NVIDIA-published driver metapackage.
-        # Strip non-numeric suffix and take the first dot component.
+        # CloudRift / GCP / generic cloud images often ship a pre-installed
+        # `nvidia-driver-510` (or similar) from Ubuntu's archive. The cuda repo's
+        # `nvidia-open-595` carries `libnvidia-* (= 595.58.03-1ubuntu1)` which
+        # cannot be unpacked over the older versions — apt's dpkg unpack step
+        # fails on libnvidia-gl, libnvidia-cfg1, libnvidia-compute. We purge the
+        # old nvidia packages first so the new ones can land cleanly.
+        await _purge_existing_nvidia(host)
+        # `nvidia-open-<major>` (NOT `cuda-drivers-<major>`) is the open-kernel-
+        # module variant published by NVIDIA. Blackwell GPUs (sm_120: RTX 5090,
+        # RTX PRO 6000) REQUIRE the open kernel modules — the proprietary
+        # `nvidia.ko` from `cuda-drivers-XYZ` loads but its RmInitAdapter fails
+        # with NVRM error `(0x22:0x56:1017)` on every Blackwell card, leaving
+        # `nvidia-smi` to report "No devices were found". The open driver
+        # supports every GPU from Turing (sm_75) onward, so always preferring
+        # it is the safe default. Strip non-numeric suffix and take the first
+        # dot component.
         major = driver_version.split(".")[0]
-        logger.info(f"{host.name}: installing cuda-drivers-{major} (requested {driver_version})")
-        await host.run(
-            f"DEBIAN_FRONTEND=noninteractive apt-get install -y cuda-drivers-{major}",
+        logger.info(f"{host.name}: installing nvidia-open-{major} (requested {driver_version})")
+        rc, out = await host.run(
+            f"DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-open-{major}",
             sudo=True,
             timeout=1800,
+            capture=True,
         )
+        if rc != 0:
+            tail = "\n".join(out.splitlines()[-20:]) if out else ""
+            raise RuntimeError(f"{host.name}: apt-get install nvidia-open-{major} failed (rc={rc}). Last lines:\n{tail}")
         installed = True
 
     if need_cuda:
         pkg = "cuda-toolkit-" + cuda_version.replace(".", "-")
         logger.info(f"{host.name}: installing {pkg}")
-        await host.run(
+        rc, out = await host.run(
             f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg}",
             sudo=True,
             timeout=1800,
+            capture=True,
         )
+        if rc != 0:
+            tail = "\n".join(out.splitlines()[-20:]) if out else ""
+            raise RuntimeError(f"{host.name}: apt-get install {pkg} failed (rc={rc}). Last lines:\n{tail}")
+        # Sanity-check immediately: did the package actually create the
+        # /usr/local/cuda-X.Y tree? apt occasionally exits 0 even when nothing
+        # got installed (e.g., kept-back packages with --no-install-recommends).
+        if not await _cuda_installed(host, cuda_version):
+            raise RuntimeError(
+                f"{host.name}: apt-get install {pkg} reported success but /usr/local/cuda-{cuda_version} does not exist on the host"
+            )
         installed = True
 
     return installed
+
+
+async def _purge_existing_nvidia(host: Host) -> None:
+    """Purge any pre-installed nvidia / libnvidia packages so the cuda repo's
+    versioned libs can unpack without dpkg conflicts.
+
+    CloudRift's stock Ubuntu image ships nvidia-driver-510 + libnvidia-* from
+    Ubuntu's archive. The NVIDIA cuda repo's cuda-drivers-595 brings strict
+    version dependencies (libnvidia-compute = 595.58.03-1ubuntu1) that cannot
+    be unpacked over the existing 510 files. Purging first is heavy-handed
+    but reliable; the install step right after will pull the requested
+    versions back in.
+    """
+    logger.info(f"{host.name}: purging any existing nvidia/libnvidia packages")
+    rc, out = await host.run(
+        "DEBIAN_FRONTEND=noninteractive apt-get purge -y "
+        "'nvidia-*' 'libnvidia-*' 'cuda-drivers*' 2>&1 || true; "
+        "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true",
+        sudo=True,
+        timeout=600,
+        capture=True,
+    )
+    if rc != 0:
+        tail = "\n".join(out.splitlines()[-10:]) if out else ""
+        logger.warning(f"{host.name}: nvidia purge step exited rc={rc} (continuing). Tail:\n{tail}")
+
+
+async def _heal_dpkg(host: Host) -> None:
+    """Run dpkg --configure -a + apt --fix-broken install before a fresh apt op.
+
+    CloudRift / GCP / generic Ubuntu base images sometimes ship with leftover
+    partially-configured packages (e.g. nvidia-driver in `iU` state from a
+    failed earlier provisioning attempt). Trying to install on top of that
+    state produces 'Unmet dependencies' errors that are very hard to debug
+    after the fact. Healing first is cheap and idempotent.
+    """
+    logger.info(f"{host.name}: healing dpkg state (configure -a + fix-broken install)")
+    rc, out = await host.run(
+        "DEBIAN_FRONTEND=noninteractive dpkg --configure -a && DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-broken",
+        sudo=True,
+        timeout=600,
+        capture=True,
+    )
+    if rc != 0:
+        tail = "\n".join(out.splitlines()[-15:]) if out else ""
+        logger.warning(f"{host.name}: dpkg heal step exited rc={rc} (continuing anyway). Tail:\n{tail}")
+
+
+async def _verify_nvidia_install(
+    host: Host,
+    *,
+    driver_version: str | None,
+    cuda_version: str | None,
+) -> None:
+    """After install + reboot, confirm the box is actually usable.
+
+    Checks (raises RuntimeError on any failure):
+    - `nvidia-smi` exists and exits 0 (with retry — the kernel module takes
+      a few seconds to finish loading after sshd comes back, and probing
+      nvidia-smi too early returns rc=6 / NVML-not-found)
+    - reported driver version matches `driver_version` if requested
+    - `/usr/local/cuda-{cuda_version}` exists if requested
+    """
+    smi_out: str | None = None
+    last_rc = -1
+    for _attempt in range(12):  # ~60s of retries
+        rc, out = await host.run(
+            "nvidia-smi --query-gpu=name,driver_version --format=csv,noheader",
+            capture=True,
+        )
+        if rc == 0 and out:
+            smi_out = out
+            break
+        last_rc = rc
+        await asyncio.sleep(5)
+    if smi_out is None:
+        raise RuntimeError(
+            f"{host.name}: post-install verification failed — nvidia-smi did not "
+            f"return success after 60s of retries (last rc={last_rc}). The driver "
+            f"install likely produced an unconfigured (iU) package state, or the "
+            f"kernel module failed to load. Check `dpkg -l | grep -i nvidia` and "
+            f"`dmesg | grep -i nvidia` on the host."
+        )
+    logger.info(f"{host.name}: post-install nvidia-smi: {smi_out.strip()}")
+
+    if driver_version:
+        current = await _current_driver_version(host)
+        if not _matches(current, driver_version):
+            raise RuntimeError(f"{host.name}: post-install driver version mismatch — requested {driver_version}, got {current}")
+
+    if cuda_version and not await _cuda_installed(host, cuda_version):
+        raise RuntimeError(
+            f"{host.name}: post-install CUDA toolkit /usr/local/cuda-{cuda_version} "
+            f"is missing despite the install command reporting success"
+        )
 
 
 async def _setup_nvidia_cuda_repo(host: Host) -> None:

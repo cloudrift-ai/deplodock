@@ -1,0 +1,46 @@
+command:
+  stage:
+    - deplodock
+    - scripts
+    - tests
+    - pyproject.toml
+    - requirements.txt
+    - Makefile
+  run: |
+    export PATH=/usr/local/cuda/bin:$$PATH
+    export DEPLODOCK_GIT_REV="$git_rev"
+    cd $repo_dir
+    [ -d venv ] || make setup
+    ./venv/bin/python scripts/bench_matmul.py \
+      --strategy $strategy \
+      --sizes $sizes \
+      --batches $batches \
+      --iterations $iterations \
+      --output-dir $task_dir
+  result_files:
+    - "*.json"
+    - "*.md"
+  timeout: 1800
+
+matrices:
+  # Single-GEMM sweep. 256 and 512 are excluded: at those sizes the per-call
+  # duration is sub-millisecond, the GPU clock governor never engages boost,
+  # and the SM clock fluctuates between idle (~260 MHz) and steady (~2400 MHz)
+  # within a single benchmark run — the resulting variance dominates any real
+  # signal. They're still measured in batched mode below where the longer
+  # duration keeps the clock pinned.
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    strategy: adaptive
+    sizes: "1024,2048,4096,8192,16384"
+    batches: "1"
+    iterations: 30
+    git_rev: "feature/mini-gpu-compiler@local"
+  # Batched sweep — drops 16384 to stay within 32 GB.
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    strategy: adaptive
+    sizes: "256,512,1024,2048,4096,8192"
+    batches: "4,8,16"
+    iterations: 20
+    git_rev: "feature/mini-gpu-compiler@local"
