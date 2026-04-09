@@ -19,6 +19,11 @@ from deplodock.benchmark import (
     setup_logging,
     validate_config,
 )
+from deplodock.benchmark.execution import _run_groups_on_hosts
+from deplodock.benchmark.fixed_hosts import (
+    resolve_fixed_hosts,
+    validate_hosts_cover_groups,
+)
 from deplodock.planner import BenchmarkTask
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
@@ -31,9 +36,15 @@ def handle_bench(args):
     config = load_config(args.config)
     validate_config(config)
 
+    if args.billing_exempt:
+        config.setdefault("providers", {}).setdefault("cloudrift", {})["billing_exempt"] = True
+
     ssh_key = _expand_path(args.ssh_key)
     dry_run = args.dry_run
     no_teardown = args.no_teardown
+    use_local = getattr(args, "local", False)
+    ssh_targets = list(getattr(args, "ssh", None) or [])
+    fixed_host_mode = use_local or bool(ssh_targets)
 
     # Enumerate tasks from recipe dirs
     tasks = enumerate_tasks(args.recipes)
@@ -87,7 +98,24 @@ def handle_bench(args):
         on_task_done = GitCommitter(asyncio.Lock())
 
     # Run groups
-    raw_results = asyncio.run(_run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown, on_task_done))
+    if fixed_host_mode:
+        try:
+            allocated = asyncio.run(resolve_fixed_hosts(use_local, ssh_targets, ssh_key, dry_run))
+        except Exception as e:
+            root_logger.error(f"Failed to resolve fixed hosts: {e}")
+            sys.exit(1)
+
+        if not dry_run:
+            try:
+                validate_hosts_cover_groups(allocated, groups)
+            except Exception as e:
+                root_logger.error(str(e))
+                sys.exit(1)
+
+        root_logger.info(f"Fixed-host mode: {len(allocated)} host(s), running {len(groups)} group(s)")
+        raw_results = asyncio.run(_run_groups_on_hosts(groups, allocated, config, ssh_key, dry_run, on_task_done))
+    else:
+        raw_results = asyncio.run(_run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown, on_task_done))
 
     # Flatten results, handling exceptions
     all_results: list[tuple[BenchmarkTask, bool]] = []
@@ -102,8 +130,8 @@ def handle_bench(args):
             if instance_info is not None:
                 all_instance_infos.append(instance_info)
 
-    # Write instances.json for --no-teardown
-    if all_instance_infos:
+    # Write instances.json for --no-teardown (cloud-provisioned VMs only)
+    if all_instance_infos and not fixed_host_mode:
         for run_dir in recipe_run_dirs.values():
             instances_path = run_dir / "instances.json"
             instances_path.write_text(json.dumps(all_instance_infos, indent=2))
@@ -173,6 +201,18 @@ def register_bench_command(subparsers):
         help="Print commands without executing",
     )
     parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Run benchmarks on the local machine (skips cloud provisioning; uses ssh to 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--ssh",
+        action="append",
+        default=None,
+        metavar="USER@HOST[:PORT]",
+        help="Pre-allocated SSH host to run benchmarks on (repeatable). Skips cloud provisioning.",
+    )
+    parser.add_argument(
         "--no-teardown",
         action="store_true",
         help="Skip teardown and VM deletion after benchmarks (save instance info for later cleanup)",
@@ -181,5 +221,10 @@ def register_bench_command(subparsers):
         "--commit-results",
         action="store_true",
         help="Git commit and push result files after each task completes",
+    )
+    parser.add_argument(
+        "--billing-exempt",
+        action="store_true",
+        help="Skip billing for CloudRift instances (admin-only)",
     )
     parser.set_defaults(func=handle_bench)

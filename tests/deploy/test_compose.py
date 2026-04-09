@@ -229,3 +229,49 @@ def test_compose_with_extra_env_parses_as_valid_yaml(sample_config):
     parsed = yaml.safe_load(result)
     env = parsed["services"]["vllm_0"]["environment"]
     assert "MY_VAR=hello" in env
+
+
+# ── docker_options compose ────────────────────────────────────────
+
+
+def test_compose_docker_options_renders_in_service(sample_config):
+    sample_config["engine"]["llm"]["docker_options"] = {
+        "security_opt": ["seccomp=unconfined"],
+        "cap_add": ["SYS_PTRACE"],
+    }
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
+    parsed = yaml.safe_load(result)
+    svc = parsed["services"]["vllm_0"]
+    assert svc["security_opt"] == ["seccomp=unconfined"]
+    assert svc["cap_add"] == ["SYS_PTRACE"]
+
+
+def test_compose_docker_options_valid_yaml(sample_config):
+    sample_config["engine"]["llm"]["docker_options"] = {
+        "security_opt": ["seccomp=unconfined"],
+        "privileged": True,
+    }
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
+    parsed = yaml.safe_load(result)
+    assert "services" in parsed
+    assert "vllm_0" in parsed["services"]
+
+
+def test_compose_empty_docker_options_no_change(sample_config):
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
+    assert "security_opt" not in result
+    assert "cap_add" not in result
+
+
+def test_compose_docker_options_nested_values(sample_config):
+    sample_config["engine"]["llm"]["docker_options"] = {
+        "ulimits": {"memlock": {"soft": -1, "hard": -1}},
+    }
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
+    parsed = yaml.safe_load(result)
+    svc = parsed["services"]["vllm_0"]
+    assert svc["ulimits"] == {"memlock": {"soft": -1, "hard": -1}}

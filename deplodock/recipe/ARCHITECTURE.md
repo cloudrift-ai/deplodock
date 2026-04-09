@@ -6,7 +6,7 @@ The `recipe` package owns all recipe-related logic: YAML loading, matrix expansi
 
 ## Modules
 
-- `types.py` — dataclasses: `Recipe`, `DeployConfig`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig`
+- `types.py` — dataclasses: `Recipe`, `DeployConfig`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig`, `CommandConfig`
 - `recipe.py` — `deep_merge()`, `load_recipe()`, `resolve_for_hardware()`, `validate_extra_args()`, `_load_raw_config()`, `_validate_and_build()`
 - `matrix.py` — `expand_matrix_entry()`, `dot_to_nested()`, `build_override()`
 - `engines.py` — `VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`, `banned_extra_arg_flags()`, `build_engine_args()`
@@ -143,6 +143,61 @@ engine:
 ```
 
 Each key-value pair is rendered as a `- KEY=VALUE` line in the `environment` section of the generated Docker Compose file.
+
+### Command Recipes (Generic Workload)
+
+In addition to inference recipes (`engine.llm` block), a recipe may declare a `command` block to run an arbitrary tool on the provisioned VM. The two are mutually exclusive — `_validate_and_build()` raises if both are set. `Recipe.kind` is `"command"` when `command` is set, else `"inference"`.
+
+```yaml
+command:
+  stage: ["scripts"]              # repo paths to ship to the VM (git ls-files); empty = no staging
+  run: |
+    nvidia-smi --query-gpu=name --format=csv > $task_dir/result.csv
+    echo "marker,$marker" >> $task_dir/result.csv
+  result_files:                    # filenames or shell globs; expanded on the remote
+    - result.csv
+    - "*.log"
+  timeout: 60
+  env: {FOO: bar}                  # optional, prepended as KEY=value to the command
+
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    marker: [a, b, c]
+```
+
+The `run` template uses `string.Template` `$var` syntax. Substitution variables come from variant params (flattened to leaf names: `deploy.gpu` → `gpu`, `marker` → `marker`) plus harness-injected `$task_dir`, `$gpu_device_ids`, and `$repo_dir` (only when `stage` is non-empty). Conflicting leaf names (e.g. two matrix keys flattening to `gpu`) raise at substitution time.
+
+Command recipes skip `validate_extra_args()` since they don't go through engine flag mapping.
+
+### Docker Options
+
+`docker_options` is a `dict[str, Any]` on `LLMConfig` that injects arbitrary docker-compose service-level keys into the generated container definition. It defaults to an empty dict. Unlike `extra_env` and `extra_args`, which are engine-specific and live on `VllmConfig`/`SglangConfig`, `docker_options` lives directly on `LLMConfig` because Docker container options (security, capabilities, ulimits) are tied to GPU hardware, not the inference engine.
+
+```yaml
+engine:
+  llm:
+    vllm:
+      image: "rocm/vllm:latest"
+    docker_options:
+      security_opt:
+        - seccomp=unconfined
+      cap_add:
+        - SYS_PTRACE
+```
+
+Each key-value pair is rendered as a top-level service key in the generated Docker Compose file, inserted after `ipc: host` and before `command:`. Values are serialized via `yaml.dump()` to handle nested structures (lists, dicts, scalars) correctly.
+
+Keys managed by the compose template (`image`, `container_name`, `entrypoint`, `deploy`, `devices`, `group_add`, `volumes`, `environment`, `ports`, `shm_size`, `ipc`, `command`, `healthcheck`) are rejected at validation time via `validate_docker_options()`, following the same pattern as `validate_extra_args()`.
+
+Matrix overrides work naturally via deep merge:
+```yaml
+matrices:
+  - deploy.gpu: "AMD Instinct MI350X"
+    engine.llm.docker_options:
+      security_opt:
+        - seccomp=unconfined
+```
 
 ### SGLang Quantization for AWQ MoE Models
 

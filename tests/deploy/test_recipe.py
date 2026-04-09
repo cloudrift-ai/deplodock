@@ -3,7 +3,7 @@
 import pytest
 import yaml
 
-from deplodock.recipe import Recipe, deep_merge, load_recipe, resolve_for_hardware, validate_extra_args
+from deplodock.recipe import Recipe, deep_merge, load_recipe, resolve_for_hardware, validate_docker_options, validate_extra_args
 
 # ── deep_merge ──────────────────────────────────────────────────────
 
@@ -256,4 +256,122 @@ def test_load_recipe_rejects_banned_extra_args(tmp_path):
         yaml.dump(recipe, f)
 
     with pytest.raises(ValueError, match="--max-model-len"):
+        load_recipe(str(tmp_path))
+
+
+# ── command recipes ────────────────────────────────────────────────
+
+
+def test_load_recipe_command_only(tmp_path):
+    recipe = {
+        "command": {
+            "run": "nvidia-smi > $task_dir/result.csv",
+            "result_files": ["result.csv"],
+        },
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    r = load_recipe(str(tmp_path))
+    assert r.kind == "command"
+    assert r.command.run == "nvidia-smi > $task_dir/result.csv"
+
+
+def test_load_recipe_command_and_engine_mutually_exclusive(tmp_path):
+    recipe = {
+        "command": {"run": "echo hi"},
+        "engine": {"llm": {"vllm": {}}},
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    with pytest.raises(ValueError, match="exactly one"):
+        load_recipe(str(tmp_path))
+
+
+def test_load_recipe_command_skips_extra_args_validation(tmp_path):
+    recipe = {
+        "command": {"run": "echo hi"},
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090"},
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    r = load_recipe(str(tmp_path))
+    assert r.kind == "command"
+
+
+# ── deploy.driver_version / deploy.cuda_version ─────────────────────
+
+
+def test_load_recipe_parses_driver_and_cuda_version(tmp_path):
+    recipe = {
+        "model": {"huggingface": "x/y"},
+        "engine": {"llm": {"vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
+        "deploy": {
+            "gpu": "NVIDIA H100 80GB",
+            "driver_version": "550",
+            "cuda_version": "12.4",
+        },
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    r = load_recipe(str(tmp_path))
+    assert r.deploy.driver_version == "550"
+    assert r.deploy.cuda_version == "12.4"
+
+
+def test_matrix_expands_driver_version(tmp_path):
+    recipe = {
+        "model": {"huggingface": "x/y"},
+        "engine": {"llm": {"vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA H100 80GB",
+                "deploy.gpu_count": 1,
+                "deploy.driver_version": "560",
+                "deploy.cuda_version": "12.6",
+            },
+        ],
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+    r = resolve_for_hardware(str(tmp_path), "NVIDIA H100 80GB", 1)
+    assert r.deploy.driver_version == "560"
+    assert r.deploy.cuda_version == "12.6"
+
+
+# ── validate_docker_options ───────────────────────────────────────
+
+
+def test_validate_docker_options_accepts_valid_keys():
+    validate_docker_options({"security_opt": ["seccomp=unconfined"], "cap_add": ["SYS_PTRACE"]})
+
+
+def test_validate_docker_options_accepts_empty():
+    validate_docker_options({})
+
+
+def test_validate_docker_options_rejects_managed_keys():
+    with pytest.raises(ValueError, match="image"):
+        validate_docker_options({"image": "custom:latest"})
+
+
+def test_validate_docker_options_rejects_multiple_managed_keys():
+    with pytest.raises(ValueError, match="volumes"):
+        validate_docker_options({"volumes": ["/a:/b"], "ports": ["8080:8080"]})
+
+
+def test_load_recipe_rejects_conflicting_docker_options(tmp_path):
+    recipe = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+                "docker_options": {"image": "override:latest"},
+            }
+        },
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+
+    with pytest.raises(ValueError, match="image"):
         load_recipe(str(tmp_path))

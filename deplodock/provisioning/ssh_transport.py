@@ -134,6 +134,45 @@ async def scp_file(local_path, server, ssh_key, ssh_port, remote_path, timeout=3
         return 1, "timeout"
 
 
+async def scp_from_remote(server, ssh_key, ssh_port, remote_path, local_path, timeout=300):
+    """Copy a file FROM the remote server via SCP. Mirror of scp_file()."""
+    scp_args = [
+        "scp",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=20",
+        "-o",
+        "TCPKeepAlive=no",
+    ]
+    if ssh_key:
+        scp_args += ["-i", ssh_key]
+    if ssh_port and ssh_port != 22:
+        scp_args += ["-P", str(ssh_port)]
+    scp_args += [f"{server}:{remote_path}", local_path]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *scp_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stderr = stderr_bytes.decode() if stderr_bytes else ""
+        return proc.returncode, stderr
+    except TimeoutError:
+        logger.error(f"SCP timed out after {timeout}s: {server}:{remote_path} -> {local_path}")
+        proc.kill()
+        await proc.wait()
+        return 1, "timeout"
+
+
 def make_write_file(server, ssh_key, ssh_port, dry_run=False):
     """Create a write_file callable that SCPs files to the remote server."""
 

@@ -12,10 +12,12 @@ from deplodock.recipe.recipe import (
     deep_merge,
     load_recipe,
     resolve_for_hardware,
+    validate_docker_options,
     validate_extra_args,
 )
 from deplodock.recipe.types import (
     BenchmarkConfig,
+    CommandConfig,
     DeployConfig,
     EngineConfig,
     LLMConfig,
@@ -27,6 +29,7 @@ from deplodock.recipe.types import (
 
 __all__ = [
     "BenchmarkConfig",
+    "CommandConfig",
     "DeployConfig",
     "EngineConfig",
     "LLMConfig",
@@ -44,5 +47,6 @@ __all__ = [
     "expand_matrix_entry",
     "load_recipe",
     "resolve_for_hardware",
+    "validate_docker_options",
     "validate_extra_args",
 ]

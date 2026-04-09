@@ -12,6 +12,7 @@ from deplodock.deploy import (
 from deplodock.provisioning.cloud import (
     provision_cloud_vm,
 )
+from deplodock.provisioning.host import RemoteHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.recipe import resolve_for_hardware
 
@@ -32,10 +33,15 @@ async def _handle_cloud(args):
     ssh_key = os.path.expanduser(args.ssh_key)
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
 
+    providers_config = None
+    if args.billing_exempt:
+        providers_config = {"cloudrift": {"billing_exempt": True}}
+
     conn = await provision_cloud_vm(
         gpu_name=recipe.deploy.gpu,
         gpu_count=recipe.deploy.gpu_count,
         ssh_key=ssh_key,
+        providers_config=providers_config,
         server_name=args.name,
         dry_run=args.dry_run,
     )
@@ -51,8 +57,14 @@ async def _handle_cloud(args):
         model_dir=args.model_dir,
         hf_token=hf_token,
         dry_run=args.dry_run,
+        port_mappings=conn.port_mappings,
     )
-    await provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    host = RemoteHost(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    await provision_remote(
+        host,
+        driver_version=recipe.deploy.driver_version,
+        cuda_version=recipe.deploy.cuda_version,
+    )
 
     if not await deploy_entry(params):
         sys.exit(1)
@@ -67,6 +79,7 @@ def register_cloud_target(subparsers):
     parser.add_argument("--hf-token", default=None, help="HuggingFace token (default: $HF_TOKEN)")
     parser.add_argument("--model-dir", default="/hf_models", help="Model cache directory")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    parser.add_argument("--billing-exempt", action="store_true", help="Skip billing for CloudRift (admin-only)")
     parser.add_argument("--gpu", required=True, help="GPU name (selects matching matrix entry)")
     parser.add_argument("--gpu-count", type=int, required=True, help="GPU count (selects matching matrix entry)")
     parser.set_defaults(func=handle_cloud)

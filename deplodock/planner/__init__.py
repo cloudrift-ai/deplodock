@@ -53,12 +53,20 @@ class BenchmarkTask:
         return os.path.basename(self.recipe_dir)
 
     def result_path(self) -> Path:
-        """Full result path: run_dir / {variant}_{engine}_benchmark.txt."""
+        """Full result path: run_dir / {variant}_{engine}_benchmark.txt.
+
+        For command recipes, this is the captured-stdout log path; the
+        actual result files are named by the command workload's scp-back logic.
+        """
+        if self.recipe.kind == "command":
+            return self.run_dir / f"{self.variant}_command.log"
         engine = self.recipe.engine.llm.engine_name
         return self.run_dir / f"{self.variant}_{engine}_benchmark.txt"
 
     def json_result_path(self) -> Path:
         """Full result path: run_dir / {variant}_{engine}_benchmark.json."""
+        if self.recipe.kind == "command":
+            return self.run_dir / f"{self.variant}_command.json"
         engine = self.recipe.engine.llm.engine_name
         return self.run_dir / f"{self.variant}_{engine}_benchmark.json"
 

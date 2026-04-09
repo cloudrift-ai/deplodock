@@ -53,7 +53,8 @@ VM lifecycle management and cloud provisioning.
 - `types.py` — `VMConnectionInfo` dataclass
 - `ssh.py` — `wait_for_ssh()` (provider-agnostic SSH polling)
 - `shell.py` — `run_shell_cmd()`
-- `remote.py` — `provision_remote()` (install Docker, NVIDIA toolkit)
+- `host.py` — `Host`, `LocalHost`, `RemoteHost` (sudo-gated command runner — `LocalHost.run(sudo=True)` raises so local deploys can't modify the dev box)
+- `remote.py` — `provision_remote()` (install Docker, optional NVIDIA driver/CUDA, NVIDIA container toolkit; reboots and waits for the host on driver/CUDA install)
 - `cloud.py` — `resolve_vm_spec()`, `provision_cloud_vm()`, `delete_cloud_vm()`
 - `cloudrift.py` — CloudRift REST API provider
 - `gcp.py` — GCP gcloud provider
@@ -137,6 +138,19 @@ For each task in group:
     v
 delete_cloud_vm(conn.delete_info) (skipped with --no-teardown; writes instances.json)
 ```
+
+### Fixed-host mode (`--local` / `--ssh`)
+
+When the user supplies pre-allocated hosts via `--local` and/or `--ssh user@host[:port]`,
+`bench` skips cloud provisioning entirely. `benchmark/fixed_hosts.py` resolves each host
+into an `AllocatedHost(conn, gpu_name, gpu_count)` (GPU detected via PCI sysfs through the
+existing `detect_local_gpus()` / `detect_remote_gpus()` helpers), then validates that every
+planned `ExecutionGroup` can run on at least one supplied host. The dispatcher
+`_run_groups_on_hosts()` routes each group to a compatible idle host (locking per-host so
+each runs at most one group at a time) and calls `run_execution_group(...,
+preallocated_conn=host.conn)` — which skips both `provision_cloud_vm()` and
+`delete_cloud_vm()`, and also skips the docker/NVIDIA-toolkit `provision_remote()` step
+(fixed hosts are assumed to be already set up).
 
 ## CLI Command Tree
 

@@ -13,7 +13,7 @@ def test_ssh_deploy(run_cli, recipes_dir):
         "ssh",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--server",
+        "--ssh",
         "user@1.2.3.4",
         "--gpu",
         "NVIDIA GeForce RTX 5090",
@@ -34,7 +34,7 @@ def test_ssh_deploy_command_sequence(run_cli, recipes_dir):
         "ssh",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--server",
+        "--ssh",
         "user@1.2.3.4",
         "--gpu",
         "NVIDIA GeForce RTX 5090",
@@ -50,7 +50,7 @@ def test_ssh_deploy_command_sequence(run_cli, recipes_dir):
     assert any("mkdir" in line for line in dry_run_lines)
     assert any("docker-compose.yaml" in line for line in dry_run_lines)
     assert any("docker compose pull" in line for line in dry_run_lines)
-    assert any("huggingface-cli download" in line for line in dry_run_lines)
+    assert any("hf download" in line for line in dry_run_lines)
     assert any("docker compose down" in line for line in dry_run_lines)
     assert any("docker compose up" in line for line in dry_run_lines)
 
@@ -61,7 +61,7 @@ def test_ssh_teardown(run_cli, recipes_dir):
         "ssh",
         "--recipe",
         os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
-        "--server",
+        "--ssh",
         "user@1.2.3.4",
         "--gpu",
         "NVIDIA GeForce RTX 5090",
@@ -157,8 +157,8 @@ def test_multi_instance_deploy(run_cli, tmp_path):
         "ssh",
         "--recipe",
         str(tmp_path),
-        "--server",
-        "user@host",
+        "--ssh",
+        "user@host:2222",
         "--gpu",
         "NVIDIA H100 80GB",
         "--gpu-count",
@@ -192,9 +192,36 @@ def test_local_help(run_cli):
 def test_ssh_help(run_cli):
     rc, stdout, _ = run_cli("deploy", "ssh", "--help")
     assert rc == 0
-    assert "--server" in stdout
+    assert "--ssh" in stdout
     assert "--ssh-key" in stdout
+    assert "USER@HOST" in stdout
+    # Deprecated flags are still listed but marked as such.
+    assert "--server" in stdout
     assert "--ssh-port" in stdout
+    assert "DEPRECATED" in stdout
+
+
+def test_ssh_deploy_legacy_server_flag(run_cli, recipes_dir):
+    """The deprecated --server / --ssh-port flags still work and warn."""
+    rc, stdout, stderr = run_cli(
+        "deploy",
+        "ssh",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--server",
+        "user@1.2.3.4",
+        "--ssh-port",
+        "2222",
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    combined = stdout + stderr
+    assert "deprecated" in combined.lower()
+    assert "docker compose up -d" in stdout
 
 
 def test_bench_help(run_cli):

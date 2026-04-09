@@ -1,12 +1,53 @@
 """Unit tests for recipe dataclass types."""
 
 from deplodock.recipe import (
+    CommandConfig,
     DeployConfig,
     LLMConfig,
     Recipe,
     SglangConfig,
     VllmConfig,
 )
+
+
+def test_command_config_defaults():
+    cfg = CommandConfig()
+    assert cfg.stage == []
+    assert cfg.run == ""
+    assert cfg.result_files == []
+    assert cfg.timeout == 1800
+    assert cfg.env == {}
+
+
+def test_recipe_kind_inference_default():
+    assert Recipe().kind == "inference"
+
+
+def test_recipe_kind_command():
+    r = Recipe(command=CommandConfig(run="echo hi"))
+    assert r.kind == "command"
+
+
+def test_from_dict_command():
+    d = {
+        "command": {
+            "stage": ["scripts"],
+            "run": "echo $marker",
+            "result_files": ["result.csv", "*.log"],
+            "timeout": 60,
+            "env": {"FOO": "bar"},
+        },
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090", "gpu_count": 1},
+    }
+    r = Recipe.from_dict(d)
+    assert r.kind == "command"
+    assert r.command.stage == ["scripts"]
+    assert r.command.run == "echo $marker"
+    assert r.command.result_files == ["result.csv", "*.log"]
+    assert r.command.timeout == 60
+    assert r.command.env == {"FOO": "bar"}
+    assert r.deploy.gpu == "NVIDIA GeForce RTX 5090"
+
 
 # ── VllmConfig / SglangConfig ────────────────────────────────────
 
@@ -218,3 +259,36 @@ def test_from_dict_with_extra_env():
     }
     recipe = Recipe.from_dict(d)
     assert recipe.engine.llm.extra_env == {"VLLM_ATTENTION_BACKEND": "FLASHINFER", "CUDA_VISIBLE_DEVICES": "0,1"}
+
+
+# ── docker_options ───────────────────────────────────────────────
+
+
+def test_llm_docker_options_default_empty():
+    llm = LLMConfig()
+    assert llm.docker_options == {}
+
+
+def test_from_dict_with_docker_options():
+    d = {
+        "model": {"huggingface": "org/model"},
+        "engine": {
+            "llm": {
+                "docker_options": {
+                    "security_opt": ["seccomp=unconfined"],
+                    "cap_add": ["SYS_PTRACE"],
+                },
+            }
+        },
+    }
+    recipe = Recipe.from_dict(d)
+    assert recipe.engine.llm.docker_options == {
+        "security_opt": ["seccomp=unconfined"],
+        "cap_add": ["SYS_PTRACE"],
+    }
+
+
+def test_from_dict_without_docker_options():
+    d = {"model": {"huggingface": "org/model"}}
+    recipe = Recipe.from_dict(d)
+    assert recipe.engine.llm.docker_options == {}

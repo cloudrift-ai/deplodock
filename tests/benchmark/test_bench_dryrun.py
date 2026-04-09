@@ -203,6 +203,47 @@ def test_bench_group_log_captures_provisioning(run_cli, make_bench_config, tmp_p
             shutil.rmtree(d)
 
 
+def test_bench_command_recipe_dry_run(run_cli, make_bench_config, tmp_path):
+    """A command recipe expands its template and dispatches the command path."""
+    import yaml
+
+    recipe_dir = tmp_path / "CmdRecipe"
+    recipe_dir.mkdir()
+    recipe = {
+        "command": {
+            "stage": [],
+            "run": "echo marker=$marker > $task_dir/result.csv\n",
+            "result_files": ["result.csv"],
+            "timeout": 30,
+        },
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA GeForce RTX 5090",
+                "deploy.gpu_count": 1,
+                "marker": ["a", "b", "c"],
+            }
+        ],
+    }
+    (recipe_dir / "recipe.yaml").write_text(yaml.dump(recipe))
+
+    config_path = make_bench_config(tmp_path)
+    rc, stdout, stderr = run_cli(
+        "bench",
+        str(recipe_dir),
+        "--config",
+        config_path,
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    # Each variant's rendered command should appear with $marker substituted.
+    assert "marker=a" in stdout
+    assert "marker=b" in stdout
+    assert "marker=c" in stdout
+    # Inference-path machinery should not be invoked for command recipes.
+    assert "bench serve" not in stdout
+    assert "docker compose pull" not in stdout
+
+
 def test_bench_help(run_cli):
     rc, stdout, _ = run_cli("bench", "--help")
     assert rc == 0

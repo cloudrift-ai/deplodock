@@ -221,6 +221,28 @@ def test_vm_create_cloudrift_dry_run(run_cli, tmp_path):
     assert "instances/rent" in stdout
 
 
+def test_vm_create_cloudrift_billing_exempt_dry_run(run_cli, tmp_path):
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    rc, stdout, _ = run_cli(
+        "vm",
+        "create",
+        "cloudrift",
+        "--instance-type",
+        "rtx4090.1",
+        "--ssh-key",
+        str(key_file),
+        "--api-key",
+        "test-key",
+        "--billing-exempt",
+        "--dry-run",
+    )
+    assert rc == 0
+    assert "[dry-run]" in stdout
+    assert "billing_exempt" in stdout
+
+
 def test_vm_delete_cloudrift_dry_run(run_cli):
     rc, stdout, _ = run_cli(
         "vm",
@@ -253,6 +275,7 @@ def test_vm_create_cloudrift_help(run_cli):
     assert "--timeout" in stdout
     assert "--dry-run" in stdout
     assert "--api-url" in stdout
+    assert "--billing-exempt" in stdout
 
 
 def test_vm_delete_cloudrift_help(run_cli):

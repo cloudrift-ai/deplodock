@@ -26,3 +26,4 @@ providers:
     # API key: defaults to $CLOUDRIFT_API_KEY env var
     image_url_nvidia: "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
     image_url_amd: "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-rocm-64-20260220-025112.img"
+    # billing_exempt: true  # admin-only, skip billing
