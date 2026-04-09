@@ -17,6 +17,7 @@ from deplodock.recipe.recipe import (
 )
 from deplodock.recipe.types import (
     BenchmarkConfig,
+    CommandConfig,
     DeployConfig,
     EngineConfig,
     LLMConfig,
@@ -28,6 +29,7 @@ from deplodock.recipe.types import (
 
 __all__ = [
     "BenchmarkConfig",
+    "CommandConfig",
     "DeployConfig",
     "EngineConfig",
     "LLMConfig",

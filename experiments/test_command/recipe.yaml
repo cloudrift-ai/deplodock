@@ -1,0 +1,15 @@
+command:
+  stage: []
+  run: |
+    nvidia-smi --query-gpu=name,memory.used,temperature.gpu,utilization.gpu \
+      --format=csv > $task_dir/result.csv
+    echo "marker,$marker" >> $task_dir/result.csv
+  result_files:
+    - result.csv
+    - "*.log"
+  timeout: 60
+
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    marker: [a, b, c]

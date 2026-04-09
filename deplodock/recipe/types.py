@@ -112,11 +112,40 @@ class BenchmarkConfig:
 
 
 @dataclass
+class CommandConfig:
+    """Generic command workload configuration.
+
+    Used by command-style recipes that run an arbitrary tool on the
+    provisioned VM (instead of deploying an inference server).
+
+    Fields:
+        stage: Repo paths to stage to the remote VM (via git ls-files +
+            tar). Empty list = no staging; $repo_dir is unavailable.
+        run: Shell command template (string.Template $-syntax). Substituted
+            with variant params (flattened to leaf names) plus injected
+            $task_dir, $repo_dir, $gpu_device_ids.
+        result_files: List of result file names or shell globs (e.g.
+            "result.json", "*.log"). Globs expand on the remote; each
+            matched file is pulled back as {variant}_{basename}.
+        timeout: Per-task command timeout in seconds.
+        env: Extra environment variables to set on the remote command.
+    """
+
+    stage: list[str] = field(default_factory=list)
+    run: str = ""
+    result_files: list[str] = field(default_factory=list)
+    timeout: int = 1800
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class DeployConfig:
     """Optional deploy section — GPU info for cloud provisioning."""
 
     gpu: str | None = None
     gpu_count: int = 1
+    driver_version: str | None = None
+    cuda_version: str | None = None
 
 
 @dataclass
@@ -127,6 +156,12 @@ class Recipe:
     engine: EngineConfig = field(default_factory=EngineConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
     deploy: DeployConfig = field(default_factory=DeployConfig)
+    command: CommandConfig | None = None
+
+    @property
+    def kind(self) -> str:
+        """Recipe kind: 'command' if a command block is set, else 'inference'."""
+        return "command" if self.command is not None else "inference"
 
     @classmethod
     def from_dict(cls, d: dict) -> "Recipe":
@@ -167,13 +202,27 @@ class Recipe:
         deploy = DeployConfig(
             gpu=deploy_dict.get("gpu"),
             gpu_count=deploy_dict.get("gpu_count", 1),
+            driver_version=deploy_dict.get("driver_version"),
+            cuda_version=deploy_dict.get("cuda_version"),
         )
+
+        command = None
+        cmd_dict = d.get("command")
+        if cmd_dict is not None:
+            command = CommandConfig(
+                stage=list(cmd_dict.get("stage", [])),
+                run=cmd_dict.get("run", ""),
+                result_files=list(cmd_dict.get("result_files", [])),
+                timeout=cmd_dict.get("timeout", 1800),
+                env=dict(cmd_dict.get("env", {})),
+            )
 
         return cls(
             model=model,
             engine=EngineConfig(llm=llm),
             benchmark=benchmark,
             deploy=deploy,
+            command=command,
         )
 
     @property

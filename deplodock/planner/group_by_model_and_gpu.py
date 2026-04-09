@@ -21,7 +21,12 @@ class GroupByModelAndGpuPlanner(BenchmarkPlanner):
     def plan(self, tasks):
         groups = {}
         for task in tasks:
-            key = (task.model_name, task.gpu_name)
+            # Command recipes have no model weights to amortize, so group on
+            # GPU only. Inference recipes still group on (model, gpu).
+            if task.recipe.kind == "command":
+                key = ("", task.gpu_name)
+            else:
+                key = (task.model_name, task.gpu_name)
             groups.setdefault(key, []).append(task)
 
         result = []

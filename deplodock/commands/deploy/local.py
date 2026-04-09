@@ -8,6 +8,8 @@ import sys
 from deplodock.deploy import DEFAULT_STRATEGY, STRATEGIES, run_deploy, run_teardown
 from deplodock.deploy.local import make_run_cmd, make_write_file
 from deplodock.detect import detect_local_gpus
+from deplodock.provisioning.host import LocalHost
+from deplodock.provisioning.remote import provision_remote
 from deplodock.recipe import resolve_for_hardware
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,18 @@ async def _handle_local(args):
     # Scale-out
     strategy_cls = STRATEGIES[args.scale_out_strategy]
     recipe = strategy_cls().apply(recipe, gpu_count)
+
+    # Driver/CUDA provisioning. On a LocalHost any sudo step raises a
+    # ClickException, so this is a no-op when the installed versions already
+    # match and an error otherwise.
+    if recipe.deploy.driver_version or recipe.deploy.cuda_version:
+        local_host = LocalHost(dry_run=dry_run)
+        await provision_remote(
+            local_host,
+            skip_nvidia=False,
+            driver_version=recipe.deploy.driver_version,
+            cuda_version=recipe.deploy.cuda_version,
+        )
 
     success = await run_deploy(
         run_cmd=run_cmd,

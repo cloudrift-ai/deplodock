@@ -12,6 +12,7 @@ from deplodock.deploy import (
 from deplodock.provisioning.cloud import (
     provision_cloud_vm,
 )
+from deplodock.provisioning.host import RemoteHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.recipe import resolve_for_hardware
 
@@ -53,7 +54,12 @@ async def _handle_cloud(args):
         dry_run=args.dry_run,
         port_mappings=conn.port_mappings,
     )
-    await provision_remote(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    host = RemoteHost(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
+    await provision_remote(
+        host,
+        driver_version=recipe.deploy.driver_version,
+        cuda_version=recipe.deploy.cuda_version,
+    )
 
     if not await deploy_entry(params):
         sys.exit(1)

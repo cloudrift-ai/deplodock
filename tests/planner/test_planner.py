@@ -6,7 +6,7 @@ from deplodock.planner import BenchmarkTask, ExecutionGroup
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 from deplodock.planner.variant import Variant
 from deplodock.recipe import ModelConfig, Recipe
-from deplodock.recipe.types import DeployConfig
+from deplodock.recipe.types import CommandConfig, DeployConfig
 
 
 def _make_task(model="org/model-a", gpu="NVIDIA GeForce RTX 5090", gpu_count=1, recipe_dir="/r", variant=None):
@@ -78,6 +78,38 @@ def test_task_gpu_properties():
 
 
 # ── GroupByModelAndGpuPlanner ─────────────────────────────────────
+
+
+def _make_command_task(gpu="GPU_A", gpu_count=1, marker="a"):
+    variant = Variant(params={"deploy.gpu": gpu, "deploy.gpu_count": gpu_count, "marker": marker})
+    return BenchmarkTask(
+        recipe_dir="/r",
+        variant=variant,
+        recipe=Recipe(
+            deploy=DeployConfig(gpu=gpu, gpu_count=gpu_count),
+            command=CommandConfig(run="echo hi"),
+        ),
+    )
+
+
+def test_command_tasks_grouped_by_gpu_only():
+    planner = GroupByModelAndGpuPlanner()
+    tasks = [
+        _make_command_task(gpu="GPU_A", marker="a"),
+        _make_command_task(gpu="GPU_A", marker="b"),
+        _make_command_task(gpu="GPU_B", marker="c"),
+    ]
+    groups = planner.plan(tasks)
+    assert len(groups) == 2
+    by_gpu = {g.gpu_name: g for g in groups}
+    assert len(by_gpu["GPU_A"].tasks) == 2
+    assert len(by_gpu["GPU_B"].tasks) == 1
+
+
+def test_command_task_result_path_is_log():
+    t = _make_command_task()
+    t.run_dir = Path("/run/x")
+    assert t.result_path().name.endswith("_command.log")
 
 
 def test_same_model_same_gpu_one_group():

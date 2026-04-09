@@ -54,7 +54,7 @@ make setup
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host
+  --ssh user@host
 ```
 
 ### Deploy Locally
@@ -69,7 +69,7 @@ deplodock deploy local \
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host \
+  --ssh user@host \
   --teardown
 ```
 
@@ -80,7 +80,7 @@ Preview commands without executing:
 ```bash
 deplodock deploy ssh \
   --recipe recipes/GLM-4.6-FP8 \
-  --server user@host \
+  --ssh user@host \
   --dry-run
 ```
 
@@ -134,6 +134,8 @@ matrices:
 
 Matrix entries use **dot-notation** for all parameter paths. Scalars are broadcast; lists are zipped (all lists in one entry must have the same length). `deploy.gpu` is required in each entry.
 
+`deploy.driver_version` and `deploy.cuda_version` (optional) request a specific NVIDIA driver / CUDA toolkit on the target host. If the installed version already matches (prefix-match — `"550"` matches `550.127.05`), provisioning is a no-op. On a mismatch, a remote (`ssh`/`cloud`) deploy installs the requested version, reboots the host, and waits for SSH to come back. Local deploys refuse to run privileged commands and will error out instead — these fields are intended for remote machines only.
+
 Engine-agnostic fields (`tensor_parallel_size`, `context_length`, etc.) live at `engine.llm`. Engine-specific fields (`image`, `extra_args`) nest under `engine.llm.vllm` or `engine.llm.sglang`.
 
 #### Docker Options
@@ -177,6 +179,31 @@ matrices:
 | `max_concurrent_requests` | `--max-num-seqs`           | `--max-running-requests` |
 
 These flags must **not** appear in `extra_args` — `load_recipe()` validates this and raises an error on duplicates.
+
+### Command Recipes (Generic Workload)
+
+A recipe may declare a `command` block instead of `engine.llm` to run an arbitrary tool on the provisioned VM (e.g. a microbenchmark, a profiling sweep, or `nvidia-smi`). The harness expands the matrix, renders the command template per variant, runs it on the VM, and pulls back result files.
+
+```yaml
+command:
+  stage: ["scripts"]              # repo paths to ship to the VM; empty = no staging
+  run: |
+    nvidia-smi --query-gpu=name,memory.used --format=csv > $task_dir/result.csv
+    echo "marker,$marker" >> $task_dir/result.csv
+  result_files:                    # filenames or shell globs (expanded on the remote)
+    - result.csv
+    - "*.log"
+  timeout: 60
+
+matrices:
+  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    marker: [a, b, c]
+```
+
+The `run` template uses `string.Template` `$var` syntax. Substitution variables are the variant params (flattened to leaf names — `deploy.gpu` → `gpu`, `marker` → `marker`) plus harness-injected `$task_dir`, `$gpu_device_ids`, and `$repo_dir` (when staging is configured). `command` and `engine.llm` are mutually exclusive.
+
+Staging uses `git ls-files --cached --others --exclude-standard <paths>` so unversioned edits ride along without a commit, while gitignored files are excluded. Each pulled result file lands in the run directory as `{variant}_{basename}`.
 
 ## Experiments
 
@@ -240,7 +267,7 @@ deplodock deploy local --recipe <path> [--dry-run]
 Deploys to a remote server via SSH + SCP.
 
 ```bash
-deplodock deploy ssh --recipe <path> --server user@host [--dry-run]
+deplodock deploy ssh --recipe <path> --ssh user@host[:port] [--dry-run]
 ```
 
 ### Cloud
@@ -270,11 +297,12 @@ When deploying locally or via SSH, deplodock auto-detects the target GPU by scan
 
 ### SSH-only Flags
 
-| Flag         | Required  | Default             | Description             |
-|--------------|-----------|---------------------|-------------------------|
-| `--server`   | Yes       | -                   | SSH address (user@host) |
-| `--ssh-key`  | No        | `~/.ssh/id_ed25519` | SSH key path            |
-| `--ssh-port` | No        | 22                  | SSH port                |
+| Flag         | Required  | Default             | Description                                          |
+|--------------|-----------|---------------------|------------------------------------------------------|
+| `--ssh`      | Yes       | -                   | SSH target `USER@HOST[:PORT]` (default port 22)      |
+| `--ssh-key`  | No        | `~/.ssh/id_ed25519` | SSH key path                                         |
+
+The same `--ssh USER@HOST[:PORT]` syntax is used by `deplodock bench --ssh ...`.
 
 ### Cloud-only Flags
 
@@ -366,6 +394,8 @@ deplodock bench recipes/*                                    # Run all recipes (
 deplodock bench experiments/.../optimal_mcr_rtx5090          # Run an experiment
 deplodock bench recipes/* --gpu-concurrency 4                # Number of VMs per GPU type to spin up
 deplodock bench recipes/* --dry-run                          # Preview commands
+deplodock bench recipes/* --local                            # Run on the local machine
+deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Run on a fixed pool of pre-allocated hosts
 ```
 
 | Flag                 | Default             | Description                                                              |
@@ -377,6 +407,12 @@ deplodock bench recipes/* --dry-run                          # Preview commands
 | `--gpu-concurrency`  | 1                   | Split each (model, GPU) group across up to N VMs                         |
 | `--dry-run`          | false               | Print commands without executing                                         |
 | `--no-teardown`      | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
+| `--local`            | false               | Run on the local machine via ssh to 127.0.0.1 (skips cloud provisioning) |
+| `--ssh USER@HOST[:PORT]` | none            | Pre-allocated SSH host (repeatable). Skips cloud provisioning            |
+
+When `--local` and/or `--ssh` are supplied, deplodock detects each host's GPU via PCI sysfs and verifies that every planned execution group can run on at least one of the supplied hosts (matching `deploy.gpu` and sufficient `deploy.gpu_count`). If any group is unsatisfied, the run aborts before any work starts. Fixed hosts are assumed to be already provisioned (docker, NVIDIA toolkit, etc.) and are never deleted at the end of the run.
+
+> **Note:** `--local` runs the workload over SSH to `127.0.0.1` (the same code path used for remote hosts). This requires a running SSH server on localhost and that your `--ssh-key` (default `~/.ssh/id_ed25519`) is listed in `~/.ssh/authorized_keys`. Quick check: `ssh -i ~/.ssh/id_ed25519 $USER@127.0.0.1 echo ok`.
 
 Results are always stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
 

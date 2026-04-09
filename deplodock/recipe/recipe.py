@@ -77,6 +77,15 @@ _MANAGED_COMPOSE_KEYS = frozenset(
 
 def _validate_and_build(config: dict) -> Recipe:
     """Validate extra_args and docker_options, then build Recipe from config dict."""
+    has_command = "command" in config and config["command"] is not None
+    has_engine_llm = bool(config.get("engine", {}).get("llm"))
+
+    if has_command and has_engine_llm:
+        raise ValueError("Recipe must specify exactly one of 'engine.llm' or 'command', not both.")
+
+    if has_command:
+        # Command recipes don't go through engine extra_args validation.
+        return Recipe.from_dict(config)
     llm_dict = config.get("engine", {}).get("llm", {})
     if "sglang" in llm_dict:
         engine = "sglang"
