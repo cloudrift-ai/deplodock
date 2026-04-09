@@ -109,6 +109,8 @@ def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
             return _lower_matmul_tma_db_tf32(graph, out_node, config)
         case "tma_db_fma_tf32":
             return _lower_matmul_tma_db_fma_tf32(graph, out_node, config)
+        case "tma_db_fma_tf32_ws":
+            return _lower_matmul_tma_db_fma_tf32_ws(graph, out_node, config)
         case _:
             raise ValueError(f"Unknown strategy: {config.strategy}")
 
@@ -1968,4 +1970,275 @@ if(!is_tf32){{
         tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
         batched=False,
         min_blocks_per_sm=int(_os.environ.get("DEPLODOCK_FMATF32_MIN_BLOCKS", "0")),
+    )
+
+
+def _lower_matmul_tma_db_fma_tf32_ws(graph, out_node, config):
+    """Warp-specialized FMA + TF32 hybrid SGEMM (no cross-group __syncthreads).
+
+    Same compute as tma_db_fma_tf32 but with separate per-group double-buffer
+    stages and per-group mbarriers, so the FFMA and TF32 groups walk K
+    completely independently. Cross-group synchronization is eliminated;
+    only intra-group named barriers (bar.sync 1 for FFMA, bar.sync 2 for
+    TF32) keep each group's own pipeline coherent.
+
+    Smem layout per CTA:
+        ffma_stage[0] = { A_ffma_top (FFMA_BM x BK), B (BK x BN) }
+        ffma_stage[1] = { A_ffma_top, B }
+        tf32_stage[0] = { A_tf32_bot (TF32_BM x BK), B (BK x BN) }
+        tf32_stage[1] = { A_tf32_bot, B }
+        4 mbarriers (one per (group, stage))
+
+    Note that B is *duplicated* per group: each group has its own B copy.
+    Both copies hold the same data; the TMA loads B twice per K-tile, but
+    the second load hits L2 cache so global bandwidth is not doubled. This
+    is the cost of avoiding cross-group sync on B reads.
+
+    Producer threads:
+        - lane 0 of warp 0 issues TMA loads into ffma_stage
+        - lane 0 of warp ffma_warps issues TMA loads into tf32_stage
+        Each producer races ahead independently for its own group.
+
+    Configurable via DEPLODOCK_FMATF32WS_* env vars; defaults match the
+    sync'd variant except this design enables asymmetric warp splits that
+    the sync'd variant couldn't express well.
+    """
+    input_a = graph.nodes[out_node.inputs[0]]
+    input_b = graph.nodes[out_node.inputs[1]]
+    a_name = input_a.output.name
+    b_name = input_b.output.name
+    c_name = out_node.output.name
+
+    import os as _os
+
+    from deplodock.compiler.cuda.ir import RawCode
+
+    ffma_warps = int(_os.environ.get("DEPLODOCK_FMATF32WS_FFMA_WARPS", "4"))
+    tf32_warps = 8 - ffma_warps
+    assert tf32_warps >= 1, f"need at least 1 tf32 warp, got ffma_warps={ffma_warps}"
+    tx, ty = 32, 8
+    tm = int(_os.environ.get("DEPLODOCK_FMATF32WS_TM", "24"))
+    tn = 4
+    bk = int(_os.environ.get("DEPLODOCK_FMATF32WS_BK", "16"))
+    bn = tx * tn  # 128
+    ffma_bm = ffma_warps * tm
+    tf32_warp_rows = int(_os.environ.get("DEPLODOCK_FMATF32WS_TF32_WARP_ROWS", "2"))
+    tf32_warp_cols = tf32_warps // tf32_warp_rows
+    assert tf32_warp_rows * tf32_warp_cols == tf32_warps, f"tf32_warps={tf32_warps} not divisible by tf32_warp_rows={tf32_warp_rows}"
+    wmma_m, wmma_n, wmma_k = 16, 16, 8
+    tf32_frag_cols_per_warp = bn // (tf32_warp_cols * wmma_n)
+    assert tf32_warp_cols * tf32_frag_cols_per_warp * wmma_n == bn
+    tf32_frag_rows_per_warp = int(_os.environ.get("DEPLODOCK_FMATF32WS_TF32_FRAG_ROWS", "2"))
+    tf32_bm = tf32_warp_rows * tf32_frag_rows_per_warp * wmma_m
+    bm = ffma_bm + tf32_bm
+    assert bk % wmma_k == 0
+    n_kchunks = bk // wmma_k
+
+    # Smem layout: each group has its own pair of stages, each stage holds
+    # the FULL A tile (bm × bk) plus a B tile. Both groups load the same
+    # data via the same TMA descriptor — they just write into different smem
+    # destinations. This is simpler than per-group sliced descriptors at the
+    # cost of duplicated A. Each group's compute reads only its own slice
+    # of A from its stage.
+    a_full_floats = bm * bk
+    b_floats = bk * bn
+    stage_floats = a_full_floats + b_floats
+    stage_bytes = stage_floats * 4
+    ffma_a_off = [0, stage_bytes]
+    ffma_b_off = [a_full_floats * 4, stage_bytes + a_full_floats * 4]
+    tf32_base = 2 * stage_bytes
+    tf32_a_off = [tf32_base, tf32_base + stage_bytes]
+    tf32_b_off = [tf32_base + a_full_floats * 4, tf32_base + stage_bytes + a_full_floats * 4]
+    mbar_off = 4 * stage_bytes
+    mbar_off = (mbar_off + 15) & ~15
+    smem_total = mbar_off + 4 * 8  # 4 mbarriers
+
+    # Bytes per TMA prefetch (same for both groups; both load the full tile)
+    ffma_tma_bytes = stage_bytes
+    tf32_tma_bytes = stage_bytes
+
+    # FFMA accumulator declarations
+    ffma_acc_decl = "float " + ",".join(f"c{i}_{j}=0.0f" for i in range(tm) for j in range(tn)) + ";"
+    fma_lines = []
+    fma_lines.append(f"            float b0=B_smem[kk*{bn}+tc],b1=B_smem[kk*{bn}+tc+1],b2=B_smem[kk*{bn}+tc+2],b3=B_smem[kk*{bn}+tc+3];")
+    for i in range(tm):
+        fma_lines.append(f"            float a{i}=A_smem[(tr+{i})*{bk}+kk];")
+        fma_lines.append(f"            c{i}_0+=a{i}*b0;c{i}_1+=a{i}*b1;c{i}_2+=a{i}*b2;c{i}_3+=a{i}*b3;")
+    fma_block = "\n".join(fma_lines)
+
+    write_macro = f"""#if (M % {bm} == 0 && N % {bn} == 0)
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);int gc=bn+tc;float*Cout={c_name}; \
+Cout[gr*N+gc]=v0;Cout[gr*N+gc+1]=v1;Cout[gr*N+gc+2]=v2;Cout[gr*N+gc+3]=v3;}}}}
+#else
+#define W(r,v0,v1,v2,v3) {{{{int gr=bm+tr+(r);if(gr<M){{{{int gc=bn+tc;float*Cout={c_name}; \
+if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}}}}}
+#endif"""
+    ffma_write_lines = [f"        W({i},c{i}_0,c{i}_1,c{i}_2,c{i}_3)" for i in range(tm)]
+    ffma_write_block = "\n".join(ffma_write_lines)
+
+    # TF32 accumulator declarations
+    tf32_acc_lines = []
+    for ri in range(tf32_frag_rows_per_warp):
+        for ci in range(tf32_frag_cols_per_warp):
+            tf32_acc_lines.append(f"wmma::fragment<wmma::accumulator,{wmma_m},{wmma_n},{wmma_k},float> hc{ri}_{ci};")
+            tf32_acc_lines.append(f"wmma::fill_fragment(hc{ri}_{ci},0.0f);")
+    tf32_acc_decl = "\n".join(tf32_acc_lines)
+
+    # TF32 inner loop (reads from A_tf32_smem, B_tf32_smem)
+    # TF32 inner: A_smem holds the FULL bm × bk tile (loaded by TF32 producer
+    # via the same descriptor as FFMA). The TF32 group's output rows are at
+    # offset ffma_bm within that tile, so we add ffma_bm to the A row index.
+    tf32_inner_lines = []
+    tf32_inner_lines.append(f"        wmma::fragment<wmma::matrix_a,{wmma_m},{wmma_n},{wmma_k},wmma::precision::tf32,wmma::row_major> ha;")
+    tf32_inner_lines.append(f"        wmma::fragment<wmma::matrix_b,{wmma_m},{wmma_n},{wmma_k},wmma::precision::tf32,wmma::row_major> hb;")
+    for kc in range(n_kchunks):
+        for ri in range(tf32_frag_rows_per_warp):
+            a_row_offset = f"({ffma_bm}+t_warp_row*{tf32_frag_rows_per_warp * wmma_m}+{ri * wmma_m})"
+            tf32_inner_lines.append(f"        wmma::load_matrix_sync(ha,&A_smem[{a_row_offset}*{bk}+{kc * wmma_k}],{bk});")
+            for ci in range(tf32_frag_cols_per_warp):
+                b_col_offset = f"(t_warp_col*{tf32_frag_cols_per_warp * wmma_n}+{ci * wmma_n})"
+                tf32_inner_lines.append(f"        wmma::load_matrix_sync(hb,&B_smem[{kc * wmma_k}*{bn}+{b_col_offset}],{bn});")
+                tf32_inner_lines.append(f"        wmma::mma_sync(hc{ri}_{ci},ha,hb,hc{ri}_{ci});")
+    tf32_inner_block = "\n".join(tf32_inner_lines)
+
+    # TF32 epilogue
+    tf32_write_lines = []
+    for ri in range(tf32_frag_rows_per_warp):
+        for ci in range(tf32_frag_cols_per_warp):
+            row_expr = f"(bm+{ffma_bm}+t_warp_row*{tf32_frag_rows_per_warp * wmma_m}+{ri * wmma_m})"
+            col_expr = f"(bn+t_warp_col*{tf32_frag_cols_per_warp * wmma_n}+{ci * wmma_n})"
+            tf32_write_lines.append(
+                f"        if({row_expr}+{wmma_m}<=M&&{col_expr}+{wmma_n}<=N) wmma::store_matrix_sync(&{c_name}[{row_expr}*N+{col_expr}],hc{ri}_{ci},N,wmma::mem_row_major);"
+            )
+    tf32_write_block = "\n".join(tf32_write_lines)
+
+    ffma_threads = ffma_warps * 32
+    tf32_threads = tf32_warps * 32
+
+    kernel_code = f"""\
+extern __shared__ __align__(128) char dsmem[];
+uint64_t*mbar=(uint64_t*)(dsmem+{mbar_off});
+const int ffma_as0=(int)__cvta_generic_to_shared(&dsmem[{ffma_a_off[0]}]);
+const int ffma_bs0=(int)__cvta_generic_to_shared(&dsmem[{ffma_b_off[0]}]);
+const int ffma_as1=(int)__cvta_generic_to_shared(&dsmem[{ffma_a_off[1]}]);
+const int ffma_bs1=(int)__cvta_generic_to_shared(&dsmem[{ffma_b_off[1]}]);
+const int tf32_as0=(int)__cvta_generic_to_shared(&dsmem[{tf32_a_off[0]}]);
+const int tf32_bs0=(int)__cvta_generic_to_shared(&dsmem[{tf32_b_off[0]}]);
+const int tf32_as1=(int)__cvta_generic_to_shared(&dsmem[{tf32_a_off[1]}]);
+const int tf32_bs1=(int)__cvta_generic_to_shared(&dsmem[{tf32_b_off[1]}]);
+const int ffma_mb0=(int)__cvta_generic_to_shared(&mbar[0]);
+const int ffma_mb1=(int)__cvta_generic_to_shared(&mbar[1]);
+const int tf32_mb0=(int)__cvta_generic_to_shared(&mbar[2]);
+const int tf32_mb1=(int)__cvta_generic_to_shared(&mbar[3]);
+int tid=threadIdx.y*{tx}+threadIdx.x;
+int wid=threadIdx.y;
+int lane=threadIdx.x;
+bool is_tf32=(wid>={ffma_warps});
+int t_wid=wid-{ffma_warps};
+int t_warp_row=t_wid/{tf32_warp_cols};
+int t_warp_col=t_wid%{tf32_warp_cols};
+int tr=wid*{tm};
+int tc=lane*{tn};
+const int SWIZ=8;
+int ntx=(N+{bn - 1})/{bn};
+int nty=(M+{bm - 1})/{bm};
+int pid=blockIdx.x+blockIdx.y*gridDim.x;
+int grp=pid/(ntx*SWIZ);
+int rem=pid%(ntx*SWIZ);
+int by_s=grp*SWIZ+rem%SWIZ;
+int bx_s=rem/SWIZ;
+if(by_s>=nty||bx_s>=ntx)return;
+int bm=by_s*{bm},bn=bx_s*{bn};
+// Init mbarriers (only one thread does this)
+if(tid==0){{
+    asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(ffma_mb0),"r"(1));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(ffma_mb1),"r"(1));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(tf32_mb0),"r"(1));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(tf32_mb1),"r"(1));
+    asm volatile("fence.mbarrier_init.release.cluster;");
+}}
+__syncthreads();
+{ffma_acc_decl}
+{tf32_acc_decl}
+const int ffma_bytes={ffma_tma_bytes};
+const int tf32_bytes={tf32_tma_bytes};
+int nt=K/{bk};
+// First prefetch: each producer issues TMA for its own group's stage 0
+if(nt>0&&!is_tf32&&wid==0&&lane==0){{
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(ffma_mb0),"r"(ffma_bytes):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(ffma_as0),"l"(&{a_name}_tma),"r"(0),"r"(bm),"r"(ffma_mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(ffma_bs0),"l"(&{b_name}_tma),"r"(bn),"r"(0),"r"(ffma_mb0):"memory");
+}}
+if(nt>0&&is_tf32&&wid=={ffma_warps}&&lane==0){{
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(tf32_mb0),"r"(tf32_bytes):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(tf32_as0),"l"(&{a_name}_tma),"r"(0),"r"(bm),"r"(tf32_mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(tf32_bs0),"l"(&{b_name}_tma),"r"(bn),"r"(0),"r"(tf32_mb0):"memory");
+}}
+if(!is_tf32){{
+    // FFMA group K-loop (independent of TF32 group)
+    int p0=0,p1=0;
+    for(int t=0;t<nt;t++){{
+        int s=t%2;int cm=s==0?ffma_mb0:ffma_mb1;int cp=s==0?p0:p1;
+        int nm=s==0?ffma_mb1:ffma_mb0;int na=s==0?ffma_as1:ffma_as0;int nb=s==0?ffma_bs1:ffma_bs0;
+        asm volatile("{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\tmbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}"::"r"(cm),"r"(cp),"r"(0xffffffff));
+        if(s==0)p0^=1;else p1^=1;
+        if(wid==0&&lane==0&&t+1<nt){{
+            int nk=(t+1)*{bk};
+            asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(ffma_bytes):"memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"(&{a_name}_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"(&{b_name}_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+        }}
+        float*A_smem=(float*)&dsmem[s==0?{ffma_a_off[0]}:{ffma_a_off[1]}];
+        float*B_smem=(float*)&dsmem[s==0?{ffma_b_off[0]}:{ffma_b_off[1]}];
+        #pragma unroll
+        for(int kk=0;kk<{bk};kk++){{
+{fma_block}
+        }}
+        // Sync within FFMA group only (named barrier 1)
+        asm volatile("bar.sync 1, %0;"::"r"({ffma_threads}));
+    }}
+}}else{{
+    // TF32 group K-loop (independent of FFMA group)
+    int p0=0,p1=0;
+    for(int t=0;t<nt;t++){{
+        int s=t%2;int cm=s==0?tf32_mb0:tf32_mb1;int cp=s==0?p0:p1;
+        int nm=s==0?tf32_mb1:tf32_mb0;int na=s==0?tf32_as1:tf32_as0;int nb=s==0?tf32_bs1:tf32_bs0;
+        asm volatile("{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\tmbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}"::"r"(cm),"r"(cp),"r"(0xffffffff));
+        if(s==0)p0^=1;else p1^=1;
+        if(wid=={ffma_warps}&&lane==0&&t+1<nt){{
+            int nk=(t+1)*{bk};
+            asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(tf32_bytes):"memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(na),"l"(&{a_name}_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(nb),"l"(&{b_name}_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+        }}
+        float*A_smem=(float*)&dsmem[s==0?{tf32_a_off[0]}:{tf32_a_off[1]}];
+        float*B_smem=(float*)&dsmem[s==0?{tf32_b_off[0]}:{tf32_b_off[1]}];
+{tf32_inner_block}
+        // Sync within TF32 group only (named barrier 2)
+        asm volatile("bar.sync 2, %0;"::"r"({tf32_threads}));
+    }}
+}}
+{write_macro}
+if(!is_tf32){{
+{ffma_write_block}
+}}else{{
+{tf32_write_block}
+}}"""
+
+    # Compute extra smem beyond the FP32 baseline
+    runner_baseline_smem = 2 * (bm * bk + bk * bn) * 4 + 256
+    extra = max(0, smem_total - runner_baseline_smem) + 256
+
+    return KernelDef(
+        name="fused_matmul",
+        params=[KernelParam("float*", c_name)],
+        body=[RawCode(kernel_code)],
+        block_size=(tx, ty, 1),
+        includes=["cuda.h", "mma.h"],
+        tile_m=bm,
+        tile_n=bn,
+        tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
+        batched=False,
+        extra_smem_bytes=extra,
+        min_blocks_per_sm=int(_os.environ.get("DEPLODOCK_FMATF32WS_MIN_BLOCKS", "0")),
     )
