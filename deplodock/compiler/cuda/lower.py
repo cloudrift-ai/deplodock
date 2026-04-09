@@ -1809,9 +1809,12 @@ def _lower_matmul_tma_db_tf32(graph, out_node, config):
 
     from deplodock.compiler.cuda.ir import RawCode
 
+    # Defaults found by sweep at 8192: 128x64x8 + min_blocks=2 hits ~51.5 TFLOPS
+    # at 96.4% tensor pipe util. Bottleneck is long_scoreboard stalls (62%) =
+    # waiting on operand collector during ldmatrix from row-major smem.
     bm = int(_os.environ.get("DEPLODOCK_TF32_BM", "128"))
-    bn = int(_os.environ.get("DEPLODOCK_TF32_BN", "128"))
-    bk = int(_os.environ.get("DEPLODOCK_TF32_BK", "16"))
+    bn = int(_os.environ.get("DEPLODOCK_TF32_BN", "64"))
+    bk = int(_os.environ.get("DEPLODOCK_TF32_BK", "8"))
     tx, ty = 32, 8
     warp_rows = 4
     warp_cols = 2
@@ -1835,7 +1838,8 @@ def _lower_matmul_tma_db_tf32(graph, out_node, config):
 
     # Inner loop: per K-tile, for each k_chunk in [0, BK/wmma_k), load A frags
     # and B frags via wmma TF32 (auto-truncates from FP32 in smem), then 1 mma
-    # per (row_frag, col_frag).
+    # per (row_frag, col_frag). Interleaved load/mma pattern lets each mma
+    # start as soon as its operands arrive.
     inner_lines = []
     inner_lines.append(f"        wmma::fragment<wmma::matrix_a,{wmma_m},{wmma_n},{wmma_k},wmma::precision::tf32,wmma::row_major> ha;")
     inner_lines.append(f"        wmma::fragment<wmma::matrix_b,{wmma_m},{wmma_n},{wmma_k},wmma::precision::tf32,wmma::row_major> hb;")
@@ -1927,4 +1931,5 @@ for(int t=0;t<nt;t++){{
         tile_n=bn,
         tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
         batched=False,
+        min_blocks_per_sm=int(_os.environ.get("DEPLODOCK_TF32_MIN_BLOCKS", "2")),
     )

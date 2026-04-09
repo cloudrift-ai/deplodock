@@ -206,3 +206,4 @@ class KernelDef:
     tma_params: list[str] | None = None  # TMA descriptor param names (e.g. ["A_tma", "B_tma"])
     batched: bool = False  # Batched GEMM: TMA descriptors are per-batch arrays
     extra_smem_bytes: int = 0  # Extra dynamic smem beyond standard double-buffer (e.g. for hybrid TF32 split scratch)
+    min_blocks_per_sm: int = 0  # If >0, emit __launch_bounds__(threads, min_blocks_per_sm) to force occupancy
