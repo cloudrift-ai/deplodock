@@ -392,10 +392,8 @@ def generate_benchmark_program(
             tma_launch_prefix = f"d_{kernel.tma_params[0]}_descs, d_{kernel.tma_params[1]}_descs, "
         else:
             # Single: one TMA descriptor per matrix
-            swizzle = getattr(kernel, "tma_swizzle", "NONE")
-            swizzle_enum = f"CU_TENSOR_MAP_SWIZZLE_{swizzle}"
             tma_setup = f"""
-    // TMA descriptor setup (swizzle mode: {swizzle})
+    // TMA descriptor setup
     CUtensorMap {kernel.tma_params[0]}_desc, {kernel.tma_params[1]}_desc;
     {{
         uint64_t da[2]={{(uint64_t)K,(uint64_t)M}};
@@ -403,7 +401,7 @@ def generate_benchmark_program(
         uint32_t ba[2]={{{bk_val},{tile_m}}};
         uint32_t ea[2]={{1,1}};
         cuTensorMapEncodeTiled(&{kernel.tma_params[0]}_desc,CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,
-            d_A,da,sa,ba,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,{swizzle_enum},
+            d_A,da,sa,ba,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
             CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
     }}
     {{
@@ -412,7 +410,7 @@ def generate_benchmark_program(
         uint32_t bb[2]={{{tile_n},{bk_val}}};
         uint32_t ea[2]={{1,1}};
         cuTensorMapEncodeTiled(&{kernel.tma_params[1]}_desc,CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,
-            d_B,db,sb,bb,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,{swizzle_enum},
+            d_B,db,sb,bb,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
             CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
     }}
     cudaFuncSetAttribute({kernel.name},cudaFuncAttributeMaxDynamicSharedMemorySize,{smem_bytes});

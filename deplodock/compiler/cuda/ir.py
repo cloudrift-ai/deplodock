@@ -207,4 +207,3 @@ class KernelDef:
     batched: bool = False  # Batched GEMM: TMA descriptors are per-batch arrays
     extra_smem_bytes: int = 0  # Extra dynamic smem beyond standard double-buffer (e.g. for hybrid TF32 split scratch)
     min_blocks_per_sm: int = 0  # If >0, emit __launch_bounds__(threads, min_blocks_per_sm) to force occupancy
-    tma_swizzle: str = "NONE"  # TMA descriptor swizzle: NONE, 32B, 64B, or 128B

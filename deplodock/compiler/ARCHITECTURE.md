@@ -80,18 +80,23 @@ Lowering is controlled by `MatmulConfig(strategy=...)`. Available strategies:
 | `register_blocked` | Register blocking with outer product | Large tiles |
 | `coarsened_f4` | float4 vectorized B loads, 4 cols/thread | Medium sizes |
 | `coarsened_2r4c` | 2 rows x 4 cols per thread, float4 B | Medium-large |
-| **`hybrid_smem_f4`** | **Shared mem A + float4 B + 2-row coarsening** | **512+** |
+| `hybrid_smem_f4` | Shared mem A + float4 B + 2-row coarsening | 512+ |
 | `hybrid_1r_f4` | Shared mem A + float4 B + 1-row (more parallelism) | 512 |
 | `flat_scalar` | No smem, 1 thread/element, 1D grid | 256 and below |
 | `flat_f4` | No smem, float4 B, 1D grid | Small with N%4==0 |
+| **`tma_db`** | **TMA double-buffer, size-adaptive tile selection** | **Production default** |
+| `tma_db_tf32` | Pure TF32 via tensor cores (wmma) | TF32 precision ok |
+| `tma_db_fma_tf32` | Concurrent FMA + TF32 hybrid (both pipes) | Mixed precision ok |
 
 ### Size-Adaptive Strategy Selection
 
-`hybrid_smem_f4` supports configurable rows per thread via `thread_m` and `__launch_bounds__`.
+The production default is `adaptive` (in `bench_matmul.py`) which uses the `tma_db` strategy
+with per-size tile parameters from `tuning.py`. The adaptive map selects the best `thread_m`
+and `block_k` for each matrix size based on empirical benchmarking.
 
-#### sm_120 (Blackwell, CUDA 13.0, cuBLAS 13.1)
+#### sm_120 (Blackwell, CUDA 13.2, cuBLAS 13.3)
 
-cuBLAS on sm_120 uses CUTLASS `simt_sgemm_256x128_8x4` (pure FP32, not tensor cores). ncu profiling shows 65% FMA utilization vs our 54% — the gap is SASS-level instruction scheduling.
+cuBLAS on sm_120 uses CUTLASS `simt_sgemm_256x128_8x4` (pure FP32, not tensor cores). ncu profiling shows 73% FMA utilization vs our 68% — the gap is SASS-level instruction scheduling (warp phase alignment from ptxas's LDS distribution choices).
 
 | Size | thread_m | BK | Block | Eff vs cuBLAS | TFLOPS |
 |------|----------|-----|-------|--------------|--------|
