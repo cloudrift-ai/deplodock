@@ -243,7 +243,7 @@ def parse_sizes(sizes_str: str) -> list[dict[str, int]]:
 
 def main():
     parser = argparse.ArgumentParser(description="Matmul benchmark runner")
-    parser.add_argument("--strategy", default="hybrid_smem_f4", help="Kernel strategy")
+    parser.add_argument("--strategy", default="adaptive", help="Kernel strategy (use 'adaptive' for size-dependent tma_db tuning)")
     parser.add_argument("--bk", type=int, default=32, help="Block K dimension (block_k)")
     parser.add_argument("--threads-y", type=int, default=8, help="Threads per block, Y dim (blockDim.y)")
     parser.add_argument("--threads-x", type=int, default=32, help="Threads per block, X dim (blockDim.x)")
