@@ -7,19 +7,19 @@ engine:
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     context_length: 262144
-    max_concurrent_requests: 8
     vllm:
       image: "vllm/vllm-openai-rocm:v0.17.0"
-      extra_args: "--enforce-eager --mm-encoder-tp-mode data --tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
+      extra_args: "--mm-encoder-tp-mode data --tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
       extra_env:
         VLLM_ROCM_USE_AITER: 1
 
 benchmark:
-  max_concurrency: 8
-  num_prompts: 16
   random_input_len: 8000
   random_output_len: 8000
 
 matrices:
   - deploy.gpu: "AMD Instinct MI350X"
     deploy.gpu_count: 4
+    engine.llm.max_concurrent_requests: [16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80]
+    benchmark.max_concurrency: [16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80]
+    benchmark.num_prompts: 80
