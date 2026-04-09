@@ -1633,6 +1633,17 @@ def _lower_matmul_tma_db_hybrid(graph, out_node, config):
     n_frag_cols = bn // 16  # 8
     n_kchunks = bk // 8  # 4
 
+    # 3xTF32 mode: split both A and B into hi/lo halves, do 3 mmas per fragment.
+    # Recovers FP32 mantissa precision in HMMA-owned rows. Costs extra smem
+    # scratch (sized for current k_chunk only, recomputed each chunk) and 3x
+    # the HMMA work, but the HMMA group was previously latency-bound so the
+    # extra mma's may overlap with existing wait time.
+    use_3xtf32 = _os.environ.get("DEPLODOCK_HYBRID_3XTF32", "0") == "1"
+    a_lo_scratch_size = hmma_bm * 8 if use_3xtf32 else 0  # current k_chunk only
+    b_lo_scratch_size = 8 * bn if use_3xtf32 else 0
+    extra_smem = (a_lo_scratch_size + b_lo_scratch_size) * 4
+    hmma_thread_count = hmma_warps * 32
+
     # FFMA inner-loop block (only ffma warps execute it)
     fma_lines = []
     fma_lines.append(f"            float b0=cbs[kk*{bn}+tc],b1=cbs[kk*{bn}+tc+1],b2=cbs[kk*{bn}+tc+2],b3=cbs[kk*{bn}+tc+3];")
@@ -1659,22 +1670,69 @@ def _lower_matmul_tma_db_hybrid(graph, out_node, config):
     hmma_inner_lines = []
     hmma_inner_lines.append("        wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> ha;")
     hmma_inner_lines.append("        wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> hb;")
+    if use_3xtf32:
+        hmma_inner_lines.append("        wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> ha_lo;")
+        hmma_inner_lines.append("        wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> hb_lo;")
+        hmma_inner_lines.append("        int hmma_tid=h_wid*32+(threadIdx.x&31);")
     for kc in range(n_kchunks):
+        if use_3xtf32:
+            # Cooperatively compute A_lo and B_lo for this k_chunk into scratch.
+            # All HMMA warps participate. Sync via named barrier 1 (hmma_thread_count).
+            n_a_elems = hmma_bm * 8
+            n_b_elems = 8 * bn
+            a_loops = (n_a_elems + hmma_thread_count - 1) // hmma_thread_count
+            b_loops = (n_b_elems + hmma_thread_count - 1) // hmma_thread_count
+            hmma_inner_lines.append(f"        // 3xTF32 split for k_chunk={kc}")
+            hmma_inner_lines.append("        #pragma unroll")
+            hmma_inner_lines.append(f"        for(int _i=0;_i<{a_loops};_i++){{")
+            hmma_inner_lines.append(f"          int _idx=hmma_tid+_i*{hmma_thread_count};")
+            hmma_inner_lines.append(f"          if(_idx<{n_a_elems}){{")
+            hmma_inner_lines.append("            int _r=_idx/8,_c=_idx&7;")
+            hmma_inner_lines.append(f"            float _v=cas[({ffma_bm}+_r)*{bk}+{kc * 8}+_c];")
+            hmma_inner_lines.append("            unsigned _u=__float_as_uint(_v)&0xffffe000u;")
+            hmma_inner_lines.append("            a_lo_scratch[_idx]=_v-__uint_as_float(_u);")
+            hmma_inner_lines.append("          }")
+            hmma_inner_lines.append("        }")
+            hmma_inner_lines.append("        #pragma unroll")
+            hmma_inner_lines.append(f"        for(int _i=0;_i<{b_loops};_i++){{")
+            hmma_inner_lines.append(f"          int _idx=hmma_tid+_i*{hmma_thread_count};")
+            hmma_inner_lines.append(f"          if(_idx<{n_b_elems}){{")
+            hmma_inner_lines.append(f"            int _r=_idx/{bn},_c=_idx%{bn};")
+            hmma_inner_lines.append(f"            float _v=cbs[({kc * 8}+_r)*{bn}+_c];")
+            hmma_inner_lines.append("            unsigned _u=__float_as_uint(_v)&0xffffe000u;")
+            hmma_inner_lines.append("            b_lo_scratch[_idx]=_v-__uint_as_float(_u);")
+            hmma_inner_lines.append("          }")
+            hmma_inner_lines.append("        }")
+            hmma_inner_lines.append(f'        asm volatile("bar.sync 1, {hmma_thread_count};");')
         for ri in range(hmma_frag_rows):
+            # Load a_hi from main smem (auto-truncates to TF32)
             hmma_inner_lines.append(
                 f"        wmma::load_matrix_sync(ha,&cas[({ffma_bm}+(h_wid*{hmma_frag_rows}+{ri})*16)*{bk}+{kc * 8}],{bk});"
             )
+            if use_3xtf32:
+                hmma_inner_lines.append(f"        wmma::load_matrix_sync(ha_lo,&a_lo_scratch[(h_wid*{hmma_frag_rows}+{ri})*16*8],8);")
             for j in range(n_frag_cols):
                 hmma_inner_lines.append(f"        wmma::load_matrix_sync(hb,&cbs[{kc * 8}*{bn}+{j * 16}],{bn});")
-                hmma_inner_lines.append(f"        wmma::mma_sync(hc{ri}_{j},ha,hb,hc{ri}_{j});")
+                if use_3xtf32:
+                    hmma_inner_lines.append(f"        wmma::load_matrix_sync(hb_lo,&b_lo_scratch[{j * 16}],{bn});")
+                    # 3xTF32: c += a_hi*b_hi + a_hi*b_lo + a_lo*b_hi
+                    hmma_inner_lines.append(f"        wmma::mma_sync(hc{ri}_{j},ha,hb,hc{ri}_{j});")
+                    hmma_inner_lines.append(f"        wmma::mma_sync(hc{ri}_{j},ha,hb_lo,hc{ri}_{j});")
+                    hmma_inner_lines.append(f"        wmma::mma_sync(hc{ri}_{j},ha_lo,hb,hc{ri}_{j});")
+                else:
+                    hmma_inner_lines.append(f"        wmma::mma_sync(hc{ri}_{j},ha,hb,hc{ri}_{j});")
+        if use_3xtf32:
+            hmma_inner_lines.append(f'        asm volatile("bar.sync 1, {hmma_thread_count};");')
     hmma_inner = "\n".join(hmma_inner_lines)
 
-    # HMMA epilogue
+    # HMMA epilogue — guarded against M/N tile-overflow at the matrix edge
     hmma_write_lines = []
     for ri in range(hmma_frag_rows):
         for j in range(n_frag_cols):
+            row_expr = f"(bm+{ffma_bm}+(h_wid*{hmma_frag_rows}+{ri})*16)"
+            col_expr = f"(bn+{j * 16})"
             hmma_write_lines.append(
-                f"        wmma::store_matrix_sync(&{c_name}[(bm+{ffma_bm}+(h_wid*{hmma_frag_rows}+{ri})*16)*N+bn+{j * 16}],hc{ri}_{j},N,wmma::mem_row_major);"
+                f"        if({row_expr}+16<=M&&{col_expr}+16<=N) wmma::store_matrix_sync(&{c_name}[{row_expr}*N+{col_expr}],hc{ri}_{j},N,wmma::mem_row_major);"
             )
     hmma_write = "\n".join(hmma_write_lines)
 
@@ -1687,11 +1745,18 @@ Cout[gr*N+gc]=v0;Cout[gr*N+gc+1]=v1;Cout[gr*N+gc+2]=v2;Cout[gr*N+gc+3]=v3;}}}}
 if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}}}}}
 #endif"""
 
+    scratch_decl = ""
+    if use_3xtf32:
+        scratch_decl = (
+            f"float*a_lo_scratch=(float*)(dsmem+2*{stage}*4+16);\n"
+            f"float*b_lo_scratch=(float*)(dsmem+2*{stage}*4+16+{a_lo_scratch_size}*4);\n"
+        )
+
     kernel_code = f"""\
 extern __shared__ __align__(128) char dsmem[];
 float*smem=(float*)dsmem;
 uint64_t*mbar=(uint64_t*)(dsmem+2*{stage}*4);
-const int as0=(int)__cvta_generic_to_shared(&smem[0]);
+{scratch_decl}const int as0=(int)__cvta_generic_to_shared(&smem[0]);
 const int bs0=(int)__cvta_generic_to_shared(&smem[{a_size}]);
 const int as1=(int)__cvta_generic_to_shared(&smem[{stage}]);
 const int bs1=(int)__cvta_generic_to_shared(&smem[{stage}+{a_size}]);
@@ -1754,4 +1819,5 @@ if(!is_hmma){{
         tile_n=bn,
         tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
         batched=False,
+        extra_smem_bytes=extra_smem,
     )

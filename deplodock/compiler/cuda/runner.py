@@ -359,7 +359,7 @@ def generate_benchmark_program(
         a_size = tile_m * bk_val
         b_size = bk_val * tile_n
         stage_size = a_size + b_size
-        smem_bytes = 2 * stage_size * 4 + 256
+        smem_bytes = 2 * stage_size * 4 + 256 + getattr(kernel, "extra_smem_bytes", 0)
 
         batch_count = dim_args.get("batch", 1)
         if kernel.batched and batch_count > 1:
