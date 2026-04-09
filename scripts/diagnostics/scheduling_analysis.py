@@ -42,9 +42,7 @@ from pathlib import Path
 #                                                  /* 0x081fe20000000009 */
 # We want to extract: address (0e50), predicate (none here), mnemonic (FFMA),
 # and the operands so we can identify dst/src registers.
-LINE_RE = re.compile(
-    r"/\*\s*([0-9a-fA-F]+)\s*\*/\s+(@!?P[T0-7]\s+)?([A-Z][A-Z0-9_.]*)\s+(.*?);"
-)
+LINE_RE = re.compile(r"/\*\s*([0-9a-fA-F]+)\s*\*/\s+(@!?P[T0-7]\s+)?([A-Z][A-Z0-9_.]*)\s+(.*?);")
 HEX_RE = re.compile(r"/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 # Register references in SASS: R0..R255 (RZ = R255 = always zero). We only
 # care about general-purpose Rn here, not predicate or uniform regs.
@@ -101,9 +99,17 @@ def parse_dst_src(mnem: str, ops: str) -> tuple[set[int], set[int]]:
     width_suffix = mnem.split(".")[-1] if "." in mnem else ""
 
     if family in {
-        "FFMA", "FADD", "FMUL", "FMNMX",
-        "IMAD", "IADD", "IADD3", "ISUB",
-        "LEA", "SHF", "LOP3",
+        "FFMA",
+        "FADD",
+        "FMUL",
+        "FMNMX",
+        "IMAD",
+        "IADD",
+        "IADD3",
+        "ISUB",
+        "LEA",
+        "SHF",
+        "LOP3",
         "HFMA2",
     }:
         # First reg is dst, rest are sources.
@@ -197,14 +203,16 @@ def lds_to_consumer_distances(insns: list[tuple[int, str, str]]) -> list[dict]:
             # Bail at next BRA (loop boundary) — we don't follow control flow.
             if jmnem.startswith("BRA"):
                 break
-        out.append({
-            "addr": addr,
-            "mnem": mnem,
-            "dst_regs": dst,
-            "ffma_distance": ffma_count if consumer else None,
-            "instr_distance": consumer[1] if consumer else None,
-            "consumer_addr": consumer[0] if consumer else None,
-        })
+        out.append(
+            {
+                "addr": addr,
+                "mnem": mnem,
+                "dst_regs": dst,
+                "ffma_distance": ffma_count if consumer else None,
+                "instr_distance": consumer[1] if consumer else None,
+                "consumer_addr": consumer[0] if consumer else None,
+            }
+        )
     return out
 
 
@@ -241,7 +249,7 @@ def find_inner_loop(insns: list[tuple[int, str, str]]) -> tuple[int, int] | None
     best_start = 0
     best_density = 0.0
     for i in range(0, n - win):
-        d = sum(is_ffma[i:i + win]) / win
+        d = sum(is_ffma[i : i + win]) / win
         if d > best_density:
             best_density = d
             best_start = i
@@ -260,10 +268,8 @@ def find_inner_loop(insns: list[tuple[int, str, str]]) -> tuple[int, int] | None
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("binary", type=Path, help="Compiled binary or .cubin file")
-    p.add_argument("--kernel", default="fused_matmul",
-                   help="Substring of kernel symbol name to analyze")
-    p.add_argument("--inner-loop-lines", type=int, default=40,
-                   help="Number of inner-loop SASS lines to dump")
+    p.add_argument("--kernel", default="fused_matmul", help="Substring of kernel symbol name to analyze")
+    p.add_argument("--inner-loop-lines", type=int, default=40, help="Number of inner-loop SASS lines to dump")
     args = p.parse_args()
 
     print(f"# Scheduling analysis: {args.binary} kernel='{args.kernel}'")
@@ -294,12 +300,16 @@ def main():
     if found:
         ffma_d = [d["ffma_distance"] for d in found]
         instr_d = [d["instr_distance"] for d in found]
-        print(f"- FFMAs between LDS and first consuming FFMA: "
-              f"min={min(ffma_d)}, median={statistics.median(ffma_d):.0f}, "
-              f"mean={statistics.mean(ffma_d):.1f}, max={max(ffma_d)}")
-        print(f"- Total instructions: "
-              f"min={min(instr_d)}, median={statistics.median(instr_d):.0f}, "
-              f"mean={statistics.mean(instr_d):.1f}, max={max(instr_d)}")
+        print(
+            f"- FFMAs between LDS and first consuming FFMA: "
+            f"min={min(ffma_d)}, median={statistics.median(ffma_d):.0f}, "
+            f"mean={statistics.mean(ffma_d):.1f}, max={max(ffma_d)}"
+        )
+        print(
+            f"- Total instructions: "
+            f"min={min(instr_d)}, median={statistics.median(instr_d):.0f}, "
+            f"mean={statistics.mean(instr_d):.1f}, max={max(instr_d)}"
+        )
         # Histogram bucketed
         buckets = [0, 5, 10, 20, 40, 80, 160, 320]
         hist = [0] * (len(buckets) + 1)
@@ -323,8 +333,10 @@ def main():
     no_consumer = [d for d in distances if d["ffma_distance"] is None]
     if no_consumer:
         print()
-        print(f"  ({len(no_consumer)} LDS instructions had no FFMA consumer in the same basic block — "
-              f"either dead loads, loop-carry across iterations, or boundary effects.)")
+        print(
+            f"  ({len(no_consumer)} LDS instructions had no FFMA consumer in the same basic block — "
+            f"either dead loads, loop-carry across iterations, or boundary effects.)"
+        )
     print()
 
     # Tier 1 experiment 2: LDS-to-next-LDS spacing.
@@ -332,8 +344,7 @@ def main():
     print(f"## LDS-to-next-LDS spacing (FFMAs between consecutive LDS, {len(spacing)} pairs)")
     print()
     if spacing:
-        print(f"- min={min(spacing)}, median={statistics.median(spacing):.0f}, "
-              f"mean={statistics.mean(spacing):.1f}, max={max(spacing)}")
+        print(f"- min={min(spacing)}, median={statistics.median(spacing):.0f}, mean={statistics.mean(spacing):.1f}, max={max(spacing)}")
         print()
         # Histogram
         buckets = [0, 1, 2, 4, 8, 16, 32]

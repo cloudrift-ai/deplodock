@@ -127,9 +127,7 @@ def test_ensure_nvidia_install_failure_raises():
 
     host = FailingAptHost()
     with pytest.raises(RuntimeError, match="nvidia-open.*failed"):
-        asyncio.run(
-            _ensure_nvidia_versions(host, driver_version="595", cuda_version=None)
-        )
+        asyncio.run(_ensure_nvidia_versions(host, driver_version="595", cuda_version=None))
 
 
 def test_ensure_nvidia_cuda_install_silent_failure_raises():
@@ -154,11 +152,7 @@ def test_ensure_nvidia_cuda_install_silent_failure_raises():
 
     host = SilentlyFailingHost()
     with pytest.raises(RuntimeError, match="reported success but"):
-        asyncio.run(
-            _ensure_nvidia_versions(
-                host, driver_version="595", cuda_version="13.2"
-            )
-        )
+        asyncio.run(_ensure_nvidia_versions(host, driver_version="595", cuda_version="13.2"))
 
 
 def test_ensure_nvidia_purges_old_packages_first():
@@ -197,6 +191,4 @@ def test_ensure_nvidia_purges_old_packages_first():
     install_idx = next((i for i, c in enumerate(host.commands) if "apt-get install" in c and "nvidia-open" in c), -1)
     assert purge_idx >= 0, f"purge step never invoked. commands: {host.commands}"
     assert install_idx >= 0, f"install step never invoked. commands: {host.commands}"
-    assert purge_idx < install_idx, (
-        f"purge must run before install (purge at {purge_idx}, install at {install_idx})"
-    )
+    assert purge_idx < install_idx, f"purge must run before install (purge at {purge_idx}, install at {install_idx})"

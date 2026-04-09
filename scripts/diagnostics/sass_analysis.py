@@ -30,7 +30,6 @@ from __future__ import annotations
 import collections
 import dataclasses
 import re
-import struct
 import subprocess
 import sys
 import tempfile
@@ -39,13 +38,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO))
 
-from deplodock.compiler.cuda.codegen import emit_kernel
-from deplodock.compiler.cuda.lower import lower_graph
-from deplodock.compiler.cuda.runner import _detect_arch, generate_benchmark_program
-from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp
-from deplodock.compiler.rewriter import Rewriter
+from deplodock.compiler.cuda.codegen import emit_kernel  # noqa: E402
+from deplodock.compiler.cuda.lower import lower_graph  # noqa: E402
+from deplodock.compiler.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
+from deplodock.compiler.cuda.tuning import default_matmul_strategy_map  # noqa: E402
+from deplodock.compiler.ir import Graph, Tensor  # noqa: E402
+from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp  # noqa: E402
+from deplodock.compiler.rewriter import Rewriter  # noqa: E402
 
 # Opcode families we care about for the histogram. The article groups by these.
 # Pattern → display name. Each pattern is matched as a prefix on the SASS
@@ -93,7 +92,9 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
         if size <= thr:
             selected = cfg
             break
-    print(f"# profile: {profile}, config for {size}: TM={selected.thread_m}, BK={selected.block_k}, ks={selected.k_splits}", file=sys.stderr)
+    print(
+        f"# profile: {profile}, config for {size}: TM={selected.thread_m}, BK={selected.block_k}, ks={selected.k_splits}", file=sys.stderr
+    )
 
     g = make_matmul_graph()
     kernel = lower_graph(Rewriter().apply(g.copy()), config=selected)
@@ -103,8 +104,13 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
     if selected.k_splits > 1:
         dim_args["k_splits"] = selected.k_splits
     program = generate_benchmark_program(
-        src, kernel, dim_args, num_iterations=2, compare_cublas=True,
-        coarsen_cols=selected.coarsen_cols, coarsen_rows=selected.coarsen_rows,
+        src,
+        kernel,
+        dim_args,
+        num_iterations=2,
+        compare_cublas=True,
+        coarsen_cols=selected.coarsen_cols,
+        coarsen_rows=selected.coarsen_rows,
         cublas_math_mode="default",
     )
 
@@ -113,8 +119,7 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
     src_path.write_text(program)
 
     arch = _detect_arch() or "sm_120"
-    cmd = ["nvcc", "-O3", "--fmad=true", "-arch", arch, "-lcuda", "-lcublas", "-lcurand",
-           "-o", str(bin_path), str(src_path)]
+    cmd = ["nvcc", "-O3", "--fmad=true", "-arch", arch, "-lcuda", "-lcublas", "-lcurand", "-o", str(bin_path), str(src_path)]
     res = _run(cmd, timeout=300)
     if res.returncode != 0:
         print(res.stderr, file=sys.stderr)
@@ -192,10 +197,11 @@ def family_totals(counts: dict[str, int]) -> list[tuple[str, int]]:
 #                /* 0x000fc40000000a07 */
 # The second hex word is the control. Bits [0:3] = stall, bit [4] = yield.
 
+
 @dataclasses.dataclass
 class StallStats:
-    by_mnemonic: dict[str, list[int]]   # mnemonic → list of stall counts
-    yield_flags: dict[str, int]         # mnemonic → count of yield=1
+    by_mnemonic: dict[str, list[int]]  # mnemonic → list of stall counts
+    yield_flags: dict[str, int]  # mnemonic → count of yield=1
     raw_control_words: list[tuple[str, int]]  # (mnemonic, full 64-bit ctrl word)
 
 
@@ -269,6 +275,7 @@ def parse_stalls(binary: Path, kernel_name: str, work_dir: Path) -> StallStats |
 
 # --- cuBLAS PTX side ---------------------------------------------------------
 
+
 def find_libcublas() -> Path | None:
     for p in [
         Path("/usr/local/cuda/lib64/libcublasLt.so"),
@@ -280,16 +287,16 @@ def find_libcublas() -> Path | None:
 
 
 CUBLAS_PTX_FAMILIES = [
-    ("fma.",        "fma.rn.f32        (FP32 multiply-add)"),
-    ("cp.async",    "cp.async          (LDGSTS cooperative load)"),
-    ("st.shared",   "st.shared         (smem store)"),
-    ("ld.shared",   "ld.shared         (smem load)"),
-    ("ld.global",   "ld.global         (global load)"),
-    ("st.global",   "st.global         (global store)"),
-    ("bar.sync",    "bar.sync          (__syncthreads)"),
-    ("setp.",       "setp.*            (predicate set)"),
-    ("mov.",        "mov.*             (register copies)"),
-    ("add.",        "add.*             (integer + FP add)"),
+    ("fma.", "fma.rn.f32        (FP32 multiply-add)"),
+    ("cp.async", "cp.async          (LDGSTS cooperative load)"),
+    ("st.shared", "st.shared         (smem store)"),
+    ("ld.shared", "ld.shared         (smem load)"),
+    ("ld.global", "ld.global         (global load)"),
+    ("st.global", "st.global         (global store)"),
+    ("bar.sync", "bar.sync          (__syncthreads)"),
+    ("setp.", "setp.*            (predicate set)"),
+    ("mov.", "mov.*             (register copies)"),
+    ("add.", "add.*             (integer + FP add)"),
 ]
 
 
@@ -338,6 +345,7 @@ def cublas_ptx_histogram(ptx: str) -> list[tuple[str, int]]:
 
 
 # --- Top-level driver --------------------------------------------------------
+
 
 def main():
     size = int(sys.argv[1]) if len(sys.argv) > 1 else 8192

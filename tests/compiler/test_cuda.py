@@ -237,15 +237,17 @@ def test_run_benchmark_surfaces_cuda_oom():
     With the new `cudaPeekAtLastError()` checks the bench binary exits non-zero
     and `run_benchmark` raises `RuntimeError`. This test asserts that path.
     """
-    import pytest as _pytest
 
     from deplodock.compiler.benchmark import (
         run_adaptive_benchmark_suite,
     )
     from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
-    from deplodock.compiler.ir import Graph as _Graph, Tensor as _Tensor
+    from deplodock.compiler.ir import Graph as _Graph
+    from deplodock.compiler.ir import Tensor as _Tensor
     from deplodock.compiler.ops import (
         FusedReduceElementwiseOp as _FRE,
+    )
+    from deplodock.compiler.ops import (
         InputOp as _Input,
     )
     from deplodock.compiler.rewriter import Rewriter as _Rewriter
@@ -276,13 +278,10 @@ def test_run_benchmark_surfaces_cuda_oom():
     # The runner should record an error rather than producing a "successful"
     # 0.000 ms row.
     assert suite.error is not None, (
-        "Expected the OOM to surface as suite.error, but got results: "
-        f"{[(r.dimensions, r.kernel_time_ms) for r in suite.results]}"
+        f"Expected the OOM to surface as suite.error, but got results: {[(r.dimensions, r.kernel_time_ms) for r in suite.results]}"
     )
     # And no successful row should have been recorded.
-    assert all(r.kernel_time_ms > 0 for r in suite.results), (
-        "Bench produced a 0-ms row — cudaGetLastError check is not working"
-    )
+    assert all(r.kernel_time_ms > 0 for r in suite.results), "Bench produced a 0-ms row — cudaGetLastError check is not working"
 
 
 # All matmul lowering strategies that the dispatcher in lower_graph() recognizes.

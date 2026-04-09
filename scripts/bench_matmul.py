@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deplodock.compiler.benchmark import (
     MATRIX_SIZES,
     MATRIX_SIZES_EXTENDED,
+    BenchmarkSuite,
     run_adaptive_benchmark_suite,
     run_benchmark_suite,
 )
@@ -122,8 +123,16 @@ def _suite_section(suite, batch: int) -> list[str]:
     lines.append("")
     lines.append(f"_{suite.description}_")
     lines.append("")
-    lines.append("| Size | TM | BK | K-splits | Kernel ms | Kernel var % | cuBLAS ms | cuBLAS var % | Eff vs cuBLAS | TFLOPS | cuBLAS TFLOPS | Clock MHz | Temp °C |")
-    lines.append("|------|----|----|----------|----------:|-------------:|----------:|-------------:|--------------:|-------:|--------------:|----------:|--------:|")
+    lines.append(
+        "| Size | TM | BK | K-splits | Kernel ms | Kernel var %"
+        " | cuBLAS ms | cuBLAS var % | Eff vs cuBLAS"
+        " | TFLOPS | cuBLAS TFLOPS | Clock MHz | Temp °C |"
+    )
+    lines.append(
+        "|------|----|----|----------|----------:|-------------:"
+        "|----------:|-------------:|--------------:"
+        "|-------:|--------------:|----------:|--------:|"
+    )
     for r in suite.results:
         dims = r.dimensions or {}
         m, n = dims.get("M", 0), dims.get("N", 0)
@@ -143,6 +152,7 @@ def _suite_section(suite, batch: int) -> list[str]:
             if r.cublas_time_ms and r.cublas_min_ms is not None and r.cublas_max_ms is not None
             else "—"
         )
+
         def _range(pre, post):
             if pre is None and post is None:
                 return "—"
@@ -168,7 +178,7 @@ def _suite_section(suite, batch: int) -> list[str]:
     return lines
 
 
-def render_markdown_report(runs: list[tuple[int, "BenchmarkSuite"]], sysinfo: dict[str, str], args) -> str:
+def render_markdown_report(runs: list[tuple[int, BenchmarkSuite]], sysinfo: dict[str, str], args) -> str:
     lines: list[str] = []
     first = runs[0][1]
     lines.append("# Matmul Benchmark Report")
@@ -192,7 +202,9 @@ def render_markdown_report(runs: list[tuple[int, "BenchmarkSuite"]], sysinfo: di
     lines.append(f"- cuBLAS math mode: `{args.cublas_math}`")
     lines.append(f"- Batches swept: {', '.join(str(b) for b, _ in runs)}")
     if first.strategy != "adaptive":
-        lines.append(f"- Config: BK={args.bk}, block=({args.threads_x}x{args.threads_y}), thread_m={args.thread_m}, k_splits={args.k_splits}")
+        lines.append(
+            f"- Config: BK={args.bk}, block=({args.threads_x}x{args.threads_y}), thread_m={args.thread_m}, k_splits={args.k_splits}"
+        )
     lines.append("")
 
     lines.append("## Results")
@@ -204,7 +216,11 @@ def render_markdown_report(runs: list[tuple[int, "BenchmarkSuite"]], sysinfo: di
     if last_kernel:
         lines.append("## Kernel")
         lines.append("")
-        lines.append("Last CUDA source compiled during this run (representative; per-size kernels differ in `thread_m` / `k_splits` per the strategy map above):")
+        lines.append(
+            "Last CUDA source compiled during this run (representative;"
+            " per-size kernels differ in `thread_m` / `k_splits`"
+            " per the strategy map above):"
+        )
         lines.append("")
         lines.append("```cuda")
         lines.append(last_kernel.rstrip())
@@ -290,7 +306,7 @@ def main():
     else:
         batch_counts = [args.batch]
 
-    runs: list[tuple[int, "BenchmarkSuite"]] = []
+    runs: list[tuple[int, BenchmarkSuite]] = []
     any_error = False
 
     for batch in batch_counts:
@@ -300,9 +316,7 @@ def main():
             logger.info("Using matmul tuning profile: %s", profile_name)
             if batch > 1:
                 # batch>1 already saturates grid.z; k_splits would collide on blockIdx.z.
-                strategy_map = [
-                    (t, dataclasses.replace(c, batch_count=batch, k_splits=1)) for t, c in strategy_map
-                ]
+                strategy_map = [(t, dataclasses.replace(c, batch_count=batch, k_splits=1)) for t, c in strategy_map]
             suite = run_adaptive_benchmark_suite(
                 graph,
                 rewriter,

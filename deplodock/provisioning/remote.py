@@ -133,9 +133,7 @@ async def _ensure_nvidia_versions(
         )
         if rc != 0:
             tail = "\n".join(out.splitlines()[-20:]) if out else ""
-            raise RuntimeError(
-                f"{host.name}: apt-get install nvidia-open-{major} failed (rc={rc}). Last lines:\n{tail}"
-            )
+            raise RuntimeError(f"{host.name}: apt-get install nvidia-open-{major} failed (rc={rc}). Last lines:\n{tail}")
         installed = True
 
     if need_cuda:
@@ -149,16 +147,13 @@ async def _ensure_nvidia_versions(
         )
         if rc != 0:
             tail = "\n".join(out.splitlines()[-20:]) if out else ""
-            raise RuntimeError(
-                f"{host.name}: apt-get install {pkg} failed (rc={rc}). Last lines:\n{tail}"
-            )
+            raise RuntimeError(f"{host.name}: apt-get install {pkg} failed (rc={rc}). Last lines:\n{tail}")
         # Sanity-check immediately: did the package actually create the
         # /usr/local/cuda-X.Y tree? apt occasionally exits 0 even when nothing
         # got installed (e.g., kept-back packages with --no-install-recommends).
         if not await _cuda_installed(host, cuda_version):
             raise RuntimeError(
-                f"{host.name}: apt-get install {pkg} reported success but "
-                f"/usr/local/cuda-{cuda_version} does not exist on the host"
+                f"{host.name}: apt-get install {pkg} reported success but /usr/local/cuda-{cuda_version} does not exist on the host"
             )
         installed = True
 
@@ -187,9 +182,7 @@ async def _purge_existing_nvidia(host: Host) -> None:
     )
     if rc != 0:
         tail = "\n".join(out.splitlines()[-10:]) if out else ""
-        logger.warning(
-            f"{host.name}: nvidia purge step exited rc={rc} (continuing). Tail:\n{tail}"
-        )
+        logger.warning(f"{host.name}: nvidia purge step exited rc={rc} (continuing). Tail:\n{tail}")
 
 
 async def _heal_dpkg(host: Host) -> None:
@@ -203,17 +196,14 @@ async def _heal_dpkg(host: Host) -> None:
     """
     logger.info(f"{host.name}: healing dpkg state (configure -a + fix-broken install)")
     rc, out = await host.run(
-        "DEBIAN_FRONTEND=noninteractive dpkg --configure -a "
-        "&& DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-broken",
+        "DEBIAN_FRONTEND=noninteractive dpkg --configure -a && DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-broken",
         sudo=True,
         timeout=600,
         capture=True,
     )
     if rc != 0:
         tail = "\n".join(out.splitlines()[-15:]) if out else ""
-        logger.warning(
-            f"{host.name}: dpkg heal step exited rc={rc} (continuing anyway). Tail:\n{tail}"
-        )
+        logger.warning(f"{host.name}: dpkg heal step exited rc={rc} (continuing anyway). Tail:\n{tail}")
 
 
 async def _verify_nvidia_install(
@@ -233,7 +223,7 @@ async def _verify_nvidia_install(
     """
     smi_out: str | None = None
     last_rc = -1
-    for attempt in range(12):  # ~60s of retries
+    for _attempt in range(12):  # ~60s of retries
         rc, out = await host.run(
             "nvidia-smi --query-gpu=name,driver_version --format=csv,noheader",
             capture=True,
@@ -256,10 +246,7 @@ async def _verify_nvidia_install(
     if driver_version:
         current = await _current_driver_version(host)
         if not _matches(current, driver_version):
-            raise RuntimeError(
-                f"{host.name}: post-install driver version mismatch — "
-                f"requested {driver_version}, got {current}"
-            )
+            raise RuntimeError(f"{host.name}: post-install driver version mismatch — requested {driver_version}, got {current}")
 
     if cuda_version and not await _cuda_installed(host, cuda_version):
         raise RuntimeError(
