@@ -161,6 +161,26 @@ async def test_rent_instance_no_ports(mock_api):
     assert call_data["with_public_ip"] is True
 
 
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_rent_instance_billing_exempt(mock_api):
+    mock_api.return_value = RENT_RESPONSE
+
+    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL, billing_exempt=True)
+
+    call_data = mock_api.call_args[0][2]
+    assert call_data["billing_exempt"] is True
+
+
+@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+async def test_rent_instance_no_billing_exempt_by_default(mock_api):
+    mock_api.return_value = RENT_RESPONSE
+
+    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL)
+
+    call_data = mock_api.call_args[0][2]
+    assert "billing_exempt" not in call_data
+
+
 # ── _terminate_instance ───────────────────────────────────────────
 
 

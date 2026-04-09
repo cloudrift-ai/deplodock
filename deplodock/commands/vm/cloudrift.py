@@ -47,6 +47,7 @@ async def _handle_create(args):
         timeout=args.timeout,
         api_url=args.api_url,
         dry_run=args.dry_run,
+        billing_exempt=args.billing_exempt,
     )
     if conn is None:
         sys.exit(1)
@@ -83,6 +84,7 @@ def register_create_target(subparsers):
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help=f"API base URL (default: {DEFAULT_API_URL})")
     parser.add_argument("--timeout", type=int, default=600, help="Seconds to wait for Active status (default: 600)")
     parser.add_argument("--dry-run", action="store_true", help="Print requests without executing")
+    parser.add_argument("--billing-exempt", action="store_true", help="Skip billing (admin-only)")
     parser.set_defaults(func=handle_create)
 
 
