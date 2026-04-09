@@ -36,6 +36,9 @@ def handle_bench(args):
     config = load_config(args.config)
     validate_config(config)
 
+    if args.billing_exempt:
+        config.setdefault("providers", {}).setdefault("cloudrift", {})["billing_exempt"] = True
+
     ssh_key = _expand_path(args.ssh_key)
     dry_run = args.dry_run
     no_teardown = args.no_teardown
@@ -218,5 +221,10 @@ def register_bench_command(subparsers):
         "--commit-results",
         action="store_true",
         help="Git commit and push result files after each task completes",
+    )
+    parser.add_argument(
+        "--billing-exempt",
+        action="store_true",
+        help="Skip billing for CloudRift instances (admin-only)",
     )
     parser.set_defaults(func=handle_bench)

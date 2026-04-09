@@ -121,6 +121,7 @@ async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key,
         is_amd = gpu_name.startswith("AMD")
         image_url = cr_config.get("image_url_amd") if is_amd else cr_config.get("image_url_nvidia")
         image_kwargs = {"image_url": image_url} if image_url else {}
+        billing_exempt = cr_config.get("billing_exempt", False)
 
         conn = await cr_provider.create_instance(
             api_key=api_key or "",
@@ -132,6 +133,7 @@ async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key,
             fail_statuses={"Inactive"},
             wait_ssh=True,
             ssh_private_key_path=ssh_key,
+            billing_exempt=billing_exempt,
             **image_kwargs,
         )
         return conn

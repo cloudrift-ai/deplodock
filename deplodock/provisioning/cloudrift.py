@@ -53,6 +53,7 @@ async def _rent_instance(
     ports=None,
     api_url=DEFAULT_API_URL,
     dry_run=False,
+    billing_exempt=False,
 ):
     """Rent a new CloudRift VM instance.
 
@@ -79,6 +80,8 @@ async def _rent_instance(
         },
         "with_public_ip": True,
     }
+    if billing_exempt:
+        data["billing_exempt"] = True
     return await _api_request("POST", "/api/v1/instances/rent", data, api_key, api_url, dry_run)
 
 
@@ -279,6 +282,7 @@ async def create_instance(
     fail_statuses=None,
     wait_ssh=False,
     ssh_private_key_path=None,
+    billing_exempt=False,
 ):
     """Create a CloudRift VM instance.
 
@@ -302,7 +306,16 @@ async def create_instance(
         with open(ssh_key_path) as f:
             public_key = f.read().strip()
 
-    result = await _rent_instance(api_key, instance_type, [public_key], image_url=image_url, ports=ports, api_url=api_url, dry_run=dry_run)
+    result = await _rent_instance(
+        api_key,
+        instance_type,
+        [public_key],
+        image_url=image_url,
+        ports=ports,
+        api_url=api_url,
+        dry_run=dry_run,
+        billing_exempt=billing_exempt,
+    )
     if dry_run:
         logger.info("[dry-run] Would wait for Active status, then print connection info.")
         return VMConnectionInfo(
