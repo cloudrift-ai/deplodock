@@ -390,6 +390,66 @@ def generate_benchmark_program(
     cudaFuncSetAttribute({kernel.name},cudaFuncAttributeMaxDynamicSharedMemorySize,{smem_bytes});
 """
             tma_launch_prefix = f"d_{kernel.tma_params[0]}_descs, d_{kernel.tma_params[1]}_descs, "
+        elif getattr(kernel, "int8_emulation", False):
+            # int8x9: 6 INT8 limb buffers (3 for A, 3 for B), pre-quantized via
+            # a small helper kernel using a global FP32 scale per matrix.
+            assert len(kernel.tma_params) == 6, "int8x9 expects 6 TMA params"
+            (a_h, a_m, a_l, b_h, b_m, b_l) = kernel.tma_params
+            tma_setup = f"""
+    // INT8x9 SGEMM: pre-quantize A and B to 3 INT8 limb buffers each.
+    // Use a generous fixed scale for the test data range [-0.5, 0.5].
+    int8_t *d_A_h, *d_A_m, *d_A_l, *d_B_h, *d_B_m, *d_B_l;
+    cudaMalloc(&d_A_h, BATCH*M*K); cudaMalloc(&d_A_m, BATCH*M*K); cudaMalloc(&d_A_l, BATCH*M*K);
+    cudaMalloc(&d_B_h, BATCH*K*N); cudaMalloc(&d_B_m, BATCH*K*N); cudaMalloc(&d_B_l, BATCH*K*N);
+    float h_max_a = 1.0f, h_max_b = 1.0f;  // upper bound on |x| in test data
+    float s_A = h_max_a / 127.0f / 65536.0f;
+    float s_B = h_max_b / 127.0f / 65536.0f;
+    float scale_AB = s_A * s_B;
+    {{
+        int qN = M*K;
+        quantize_to_int8x3<<<(qN+255)/256, 256>>>(d_A, d_A_h, d_A_m, d_A_l, qN, 1.0f/s_A);
+        qN = K*N;
+        quantize_to_int8x3<<<(qN+255)/256, 256>>>(d_B, d_B_h, d_B_m, d_B_l, qN, 1.0f/s_B);
+    }}
+    cudaDeviceSynchronize();
+
+    // Six INT8 TMA descriptors
+    CUtensorMap {a_h}_desc, {a_m}_desc, {a_l}_desc, {b_h}_desc, {b_m}_desc, {b_l}_desc;
+    {{
+        uint64_t da[2]={{(uint64_t)K,(uint64_t)M}};
+        uint64_t sa[1]={{(uint64_t)K*sizeof(int8_t)}};
+        uint32_t ba[2]={{{bk_val},{tile_m}}};
+        uint32_t ea[2]={{1,1}};
+        cuTensorMapEncodeTiled(&{a_h}_desc,CU_TENSOR_MAP_DATA_TYPE_UINT8,2,
+            d_A_h,da,sa,ba,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cuTensorMapEncodeTiled(&{a_m}_desc,CU_TENSOR_MAP_DATA_TYPE_UINT8,2,
+            d_A_m,da,sa,ba,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cuTensorMapEncodeTiled(&{a_l}_desc,CU_TENSOR_MAP_DATA_TYPE_UINT8,2,
+            d_A_l,da,sa,ba,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    }}
+    {{
+        uint64_t db[2]={{(uint64_t)N,(uint64_t)K}};
+        uint64_t sb[1]={{(uint64_t)N*sizeof(int8_t)}};
+        uint32_t bb[2]={{{tile_n},{bk_val}}};
+        uint32_t ea[2]={{1,1}};
+        cuTensorMapEncodeTiled(&{b_h}_desc,CU_TENSOR_MAP_DATA_TYPE_UINT8,2,
+            d_B_h,db,sb,bb,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cuTensorMapEncodeTiled(&{b_m}_desc,CU_TENSOR_MAP_DATA_TYPE_UINT8,2,
+            d_B_m,db,sb,bb,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cuTensorMapEncodeTiled(&{b_l}_desc,CU_TENSOR_MAP_DATA_TYPE_UINT8,2,
+            d_B_l,db,sb,bb,ea,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    }}
+    cudaFuncSetAttribute({kernel.name},cudaFuncAttributeMaxDynamicSharedMemorySize,{smem_bytes});
+"""
+            tma_launch_prefix = f"{a_h}_desc, {a_m}_desc, {a_l}_desc, {b_h}_desc, {b_m}_desc, {b_l}_desc, "
+            # Append scale_AB to the user args (the kernel signature has it as the last param)
+            args_str = f"{args_str}, scale_AB" if args_str else "scale_AB"
         else:
             # Single: one TMA descriptor per matrix
             tma_setup = f"""
@@ -422,6 +482,31 @@ def generate_benchmark_program(
     full_args = f"{tma_launch_prefix}{args_str}"
     launch_suffix = f"<<<grid, block{tma_smem_attr}>>>"
 
+    int8_helper = ""
+    if getattr(kernel, "int8_emulation", False):
+        int8_helper = """
+// Pre-quantize an FP32 buffer into 3 INT8 limb buffers using a global scale.
+__global__ void quantize_to_int8x3(const float* x, int8_t* hi, int8_t* mid, int8_t* lo,
+                                    int n, float inv_scale) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int q = (int)rintf(x[i] * inv_scale);
+    if (q > (1<<23)-1) q = (1<<23)-1;
+    if (q < -(1<<23))   q = -(1<<23);
+    int qh = q >> 16;
+    int rem = q - (qh << 16);
+    int qm = rem >> 8;
+    int ql = rem - (qm << 8);
+    if (ql > 127)  { ql -= 256; qm += 1; }
+    if (ql < -128) { ql += 256; qm -= 1; }
+    if (qm > 127)  { qm -= 256; qh += 1; }
+    if (qm < -128) { qm += 256; qh -= 1; }
+    hi[i]  = (int8_t)qh;
+    mid[i] = (int8_t)qm;
+    lo[i]  = (int8_t)ql;
+}
+"""
+
     return f"""#include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -432,7 +517,7 @@ def generate_benchmark_program(
 #define M {m}
 #define N {n}
 #define K {k}
-
+{int8_helper}
 {kernel_source}
 
 int main() {{

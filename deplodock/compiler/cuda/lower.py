@@ -107,6 +107,8 @@ def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
             return _lower_matmul_tma_db(graph, out_node, config)
         case "tma_db_hybrid":
             return _lower_matmul_tma_db_hybrid(graph, out_node, config)
+        case "tma_db_int8x9":
+            return _lower_matmul_tma_db_int8x9(graph, out_node, config)
         case _:
             raise ValueError(f"Unknown strategy: {config.strategy}")
 
@@ -1767,4 +1769,225 @@ if(!is_hmma){{
         tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
         batched=False,
         extra_smem_bytes=extra_smem,
+    )
+
+
+def _lower_matmul_tma_db_int8x9(graph, out_node, config):
+    """INT8x9 emulated FP32 SGEMM with TMA double-buffer loads.
+
+    Each FP32 input is pre-quantized (host-side or in a preprocessing kernel)
+    into 3 INT8 limb buffers per matrix using a global scale. The kernel then
+    runs 9 INT8 wmma::mma_sync calls per output fragment (3 limbs A x 3 limbs B),
+    accumulating into 9 INT32 fragments. After all K-tiles are summed, the 9
+    fragments are combined with appropriate 256^k shifts and the global scale
+    product to recover FP32 precision.
+
+    Layout: BM=64, BN=64, BK=16. 8 warps in a 4 row x 2 col grid. Each warp
+    owns 1 row fragment (16 rows) x 2 column fragments (32 cols), giving 18
+    INT32 accumulator fragments per warp = 144 regs/thread for accumulators
+    alone (tight but fits in the 255-register budget).
+    """
+    input_a = graph.nodes[out_node.inputs[0]]
+    input_b = graph.nodes[out_node.inputs[1]]
+    a_name = input_a.output.name
+    b_name = input_b.output.name
+    c_name = out_node.output.name
+
+    from deplodock.compiler.cuda.ir import RawCode
+
+    # Hard-coded layout for first version
+    bm, bn, bk = 64, 64, 16
+    tx, ty = 32, 8  # 8 warps, 256 threads
+    warp_rows = 4
+    warp_cols = 2
+    assert warp_rows * warp_cols == 8
+    frag_rows_per_warp = bm // (warp_rows * 16)  # 1
+    frag_cols_per_warp = bn // (warp_cols * 16)  # 2
+    a_size = bm * bk  # bytes per limb
+    b_size = bk * bn
+    # Total smem per stage = 3 limbs A + 3 limbs B
+    stage_bytes = 3 * a_size + 3 * b_size  # bytes (int8)
+    # Round to multiple of 16 for mbarrier alignment
+    stage_bytes = (stage_bytes + 15) & ~15
+
+    # Accumulator fragment declarations (per warp, all int32 16x16x16)
+    acc_decl_lines = []
+    for ri in range(frag_rows_per_warp):
+        for ci in range(frag_cols_per_warp):
+            for k_pair in range(9):
+                acc_decl_lines.append(f"wmma::fragment<wmma::accumulator,16,16,16,int> hc{ri}_{ci}_{k_pair};")
+                acc_decl_lines.append(f"wmma::fill_fragment(hc{ri}_{ci}_{k_pair},0);")
+    acc_decl = "\n".join(acc_decl_lines)
+
+    # Inner loop: per K-tile, load A frags (3 limbs) and B frags (3 limbs),
+    # then 9 mma per (row_frag, col_frag) pair.
+    inner_lines = []
+    inner_lines.append("        wmma::fragment<wmma::matrix_a,16,16,16,signed char,wmma::row_major> ha_h,ha_m,ha_l;")
+    inner_lines.append("        wmma::fragment<wmma::matrix_b,16,16,16,signed char,wmma::row_major> hb_h,hb_m,hb_l;")
+    # Each warp's row strip starts at warp_row*16 inside the BM tile
+    for ri in range(frag_rows_per_warp):
+        a_row_offset = f"(warp_row*{frag_rows_per_warp * 16}+{ri * 16})"
+        inner_lines.append(f"        wmma::load_matrix_sync(ha_h,&A_h_smem[{a_row_offset}*{bk}],{bk});")
+        inner_lines.append(f"        wmma::load_matrix_sync(ha_m,&A_m_smem[{a_row_offset}*{bk}],{bk});")
+        inner_lines.append(f"        wmma::load_matrix_sync(ha_l,&A_l_smem[{a_row_offset}*{bk}],{bk});")
+        for ci in range(frag_cols_per_warp):
+            b_col_offset = f"(warp_col*{frag_cols_per_warp * 16}+{ci * 16})"
+            inner_lines.append(f"        wmma::load_matrix_sync(hb_h,&B_h_smem[{b_col_offset}],{bn});")
+            inner_lines.append(f"        wmma::load_matrix_sync(hb_m,&B_m_smem[{b_col_offset}],{bn});")
+            inner_lines.append(f"        wmma::load_matrix_sync(hb_l,&B_l_smem[{b_col_offset}],{bn});")
+            # 9 mmas, ordered to match shift table
+            mmas = [
+                ("ha_h", "hb_h"),  # 0: hi*hi  → 2^32
+                ("ha_h", "hb_m"),  # 1: hi*mid → 2^24
+                ("ha_h", "hb_l"),  # 2: hi*lo  → 2^16
+                ("ha_m", "hb_h"),  # 3: mid*hi → 2^24
+                ("ha_m", "hb_m"),  # 4: mid*mid→ 2^16
+                ("ha_m", "hb_l"),  # 5: mid*lo → 2^8
+                ("ha_l", "hb_h"),  # 6: lo*hi  → 2^16
+                ("ha_l", "hb_m"),  # 7: lo*mid → 2^8
+                ("ha_l", "hb_l"),  # 8: lo*lo  → 1
+            ]
+            for k_pair, (av, bv) in enumerate(mmas):
+                inner_lines.append(f"        wmma::mma_sync(hc{ri}_{ci}_{k_pair},{av},{bv},hc{ri}_{ci}_{k_pair});")
+    inner_block = "\n".join(inner_lines)
+
+    # Reconstruction epilogue: store each int32 frag, scale-and-add into FP32 fp_acc
+    # The 9 shifts (for combining accumulator chunks back into FP32):
+    shifts_init = "    const double sh[9]={4294967296.0,16777216.0,65536.0,16777216.0,65536.0,256.0,65536.0,256.0,1.0};\n"
+    epilogue_lines = []
+    epilogue_lines.append("    __shared__ int scratch[8][16*16];")
+    epilogue_lines.append("    int slot;")
+    for ri in range(frag_rows_per_warp):
+        for ci in range(frag_cols_per_warp):
+            epilogue_lines.append("    {")
+            epilogue_lines.append("        float fp[8]={0,0,0,0,0,0,0,0};")
+            for k_pair in range(9):
+                epilogue_lines.append(f"        wmma::store_matrix_sync(scratch[wid],hc{ri}_{ci}_{k_pair},16,wmma::mem_row_major);")
+                epilogue_lines.append("        __syncwarp();")
+                epilogue_lines.append("        slot=0;")
+                epilogue_lines.append("        #pragma unroll")
+                epilogue_lines.append("        for(int p=lane;p<256;p+=32){")
+                epilogue_lines.append(f"            fp[slot]+=(float)((double)scratch[wid][p]*sh[{k_pair}]*scale_AB);")
+                epilogue_lines.append("            slot++;")
+                epilogue_lines.append("        }")
+                epilogue_lines.append("        __syncwarp();")
+            # Write out
+            epilogue_lines.append("        slot=0;")
+            epilogue_lines.append("        #pragma unroll")
+            epilogue_lines.append("        for(int p=lane;p<256;p+=32){")
+            epilogue_lines.append("            int row=p/16;int col=p%16;")
+            epilogue_lines.append(f"            int gr=bm+warp_row*{frag_rows_per_warp * 16}+{ri * 16}+row;")
+            epilogue_lines.append(f"            int gc=bn+warp_col*{frag_cols_per_warp * 16}+{ci * 16}+col;")
+            epilogue_lines.append(f"            if(gr<M&&gc<N) {c_name}[gr*N+gc]=fp[slot];")
+            epilogue_lines.append("            slot++;")
+            epilogue_lines.append("        }")
+            epilogue_lines.append("    }")
+    epilogue_block = "\n".join(epilogue_lines)
+
+    a_h_off = 0
+    a_m_off = a_size
+    a_l_off = 2 * a_size
+    b_h_off = 3 * a_size
+    b_m_off = 3 * a_size + b_size
+    b_l_off = 3 * a_size + 2 * b_size
+
+    kernel_code = f"""\
+extern __shared__ __align__(128) char dsmem[];
+int8_t*smem=(int8_t*)dsmem;
+uint64_t*mbar=(uint64_t*)(dsmem+2*{stage_bytes});
+const int as_h0=(int)__cvta_generic_to_shared(&smem[{a_h_off}]);
+const int as_m0=(int)__cvta_generic_to_shared(&smem[{a_m_off}]);
+const int as_l0=(int)__cvta_generic_to_shared(&smem[{a_l_off}]);
+const int bs_h0=(int)__cvta_generic_to_shared(&smem[{b_h_off}]);
+const int bs_m0=(int)__cvta_generic_to_shared(&smem[{b_m_off}]);
+const int bs_l0=(int)__cvta_generic_to_shared(&smem[{b_l_off}]);
+const int as_h1=(int)__cvta_generic_to_shared(&smem[{stage_bytes + a_h_off}]);
+const int as_m1=(int)__cvta_generic_to_shared(&smem[{stage_bytes + a_m_off}]);
+const int as_l1=(int)__cvta_generic_to_shared(&smem[{stage_bytes + a_l_off}]);
+const int bs_h1=(int)__cvta_generic_to_shared(&smem[{stage_bytes + b_h_off}]);
+const int bs_m1=(int)__cvta_generic_to_shared(&smem[{stage_bytes + b_m_off}]);
+const int bs_l1=(int)__cvta_generic_to_shared(&smem[{stage_bytes + b_l_off}]);
+const int mb0=(int)__cvta_generic_to_shared(&mbar[0]);
+const int mb1=(int)__cvta_generic_to_shared(&mbar[1]);
+int tid=threadIdx.y*{tx}+threadIdx.x;
+int wid=threadIdx.y;
+int lane=threadIdx.x;
+int warp_row=wid/{warp_cols};
+int warp_col=wid%{warp_cols};
+// CTA swizzle (matches tma_db's 1D grid layout for L2 A-tile reuse)
+const int SWIZ=8;
+int ntx=(N+{bn - 1})/{bn};
+int nty=(M+{bm - 1})/{bm};
+int pid=blockIdx.x+blockIdx.y*gridDim.x;
+int grp=pid/(ntx*SWIZ);
+int rem=pid%(ntx*SWIZ);
+int by_s=grp*SWIZ+rem%SWIZ;
+int bx_s=rem/SWIZ;
+if(by_s>=nty||bx_s>=ntx)return;
+int bm=by_s*{bm},bn=bx_s*{bn};
+if(tid==0){{asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb0),"r"(1));asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));asm volatile("fence.mbarrier_init.release.cluster;");}}
+__syncthreads();
+{acc_decl}
+const int bytes={6 * a_size};
+int p0=0,p1=0,nt=K/{bk};
+if(nt>0&&tid==0){{
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as_h0),"l"(&{a_name}_hi_tma),"r"(0),"r"(bm),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as_m0),"l"(&{a_name}_mid_tma),"r"(0),"r"(bm),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(as_l0),"l"(&{a_name}_lo_tma),"r"(0),"r"(bm),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs_h0),"l"(&{b_name}_hi_tma),"r"(bn),"r"(0),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs_m0),"l"(&{b_name}_mid_tma),"r"(bn),"r"(0),"r"(mb0):"memory");
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(bs_l0),"l"(&{b_name}_lo_tma),"r"(bn),"r"(0),"r"(mb0):"memory");
+}}
+for(int t=0;t<nt;t++){{
+    int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;
+    int nm=s==0?mb1:mb0;
+    int n_as_h=s==0?as_h1:as_h0;int n_as_m=s==0?as_m1:as_m0;int n_as_l=s==0?as_l1:as_l0;
+    int n_bs_h=s==0?bs_h1:bs_h0;int n_bs_m=s==0?bs_m1:bs_m0;int n_bs_l=s==0?bs_l1:bs_l0;
+    asm volatile("{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\tmbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}"::"r"(cm),"r"(cp),"r"(0xffffffff));
+    if(s==0)p0^=1;else p1^=1;
+    if(tid==0&&t+1<nt){{
+        int nk=(t+1)*{bk};
+        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _,[%0],%1;"::"r"(nm),"r"(bytes):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(n_as_h),"l"(&{a_name}_hi_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(n_as_m),"l"(&{a_name}_mid_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(n_as_l),"l"(&{a_name}_lo_tma),"r"(nk),"r"(bm),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(n_bs_h),"l"(&{b_name}_hi_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(n_bs_m),"l"(&{b_name}_mid_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"::"r"(n_bs_l),"l"(&{b_name}_lo_tma),"r"(bn),"r"(nk),"r"(nm):"memory");
+    }}
+    int8_t*A_h_smem=&smem[s*{stage_bytes}+{a_h_off}];
+    int8_t*A_m_smem=&smem[s*{stage_bytes}+{a_m_off}];
+    int8_t*A_l_smem=&smem[s*{stage_bytes}+{a_l_off}];
+    int8_t*B_h_smem=&smem[s*{stage_bytes}+{b_h_off}];
+    int8_t*B_m_smem=&smem[s*{stage_bytes}+{b_m_off}];
+    int8_t*B_l_smem=&smem[s*{stage_bytes}+{b_l_off}];
+{inner_block}
+    __syncthreads();
+}}
+{shifts_init}
+{epilogue_block}"""
+
+    return KernelDef(
+        name="fused_matmul",
+        params=[KernelParam("float*", c_name), KernelParam("float", "scale_AB")],
+        body=[RawCode(kernel_code)],
+        block_size=(tx, ty, 1),
+        includes=["cuda.h", "mma.h"],
+        tile_m=bm,
+        tile_n=bn,
+        tma_params=[
+            f"{a_name}_hi_tma",
+            f"{a_name}_mid_tma",
+            f"{a_name}_lo_tma",
+            f"{b_name}_hi_tma",
+            f"{b_name}_mid_tma",
+            f"{b_name}_lo_tma",
+        ],
+        batched=False,
+        int8_emulation=True,
+        # The runner computes smem assuming FP32 (2*4*(a+b) bytes); we need
+        # 2*stage_bytes (6 int8 limbs) + 8KB scratch for the int32 reduction.
+        # Pad generously — extra smem is harmless.
+        extra_smem_bytes=16384,
     )
