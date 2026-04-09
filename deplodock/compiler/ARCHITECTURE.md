@@ -75,15 +75,7 @@ Lowering is controlled by `MatmulConfig(strategy=...)`. Available strategies:
 
 | Strategy | Description | Best for |
 |----------|-------------|----------|
-| `naive` | 1 thread per output element, direct global loads | Baseline |
-| `smem_tiled` | Shared memory tiles, cooperative loading | Educational |
-| `register_blocked` | Register blocking with outer product | Large tiles |
-| `coarsened_f4` | float4 vectorized B loads, 4 cols/thread | Medium sizes |
-| `coarsened_2r4c` | 2 rows x 4 cols per thread, float4 B | Medium-large |
-| `hybrid_smem_f4` | Shared mem A + float4 B + 2-row coarsening | 512+ |
-| `hybrid_1r_f4` | Shared mem A + float4 B + 1-row (more parallelism) | 512 |
-| `flat_scalar` | No smem, 1 thread/element, 1D grid | 256 and below |
-| `flat_f4` | No smem, float4 B, 1D grid | Small with N%4==0 |
+| `naive` | 1 thread per output element, direct global loads | Test baseline |
 | **`tma_db`** | **TMA double-buffer, size-adaptive tile selection** | **Production default** |
 | `tma_db_tf32` | Pure TF32 via tensor cores (wmma) | TF32 precision ok |
 | `tma_db_fma_tf32` | Concurrent FMA + TF32 hybrid (both pipes) | Mixed precision ok |
@@ -131,12 +123,6 @@ Key features:
 Consistently beats cuBLAS at 1024, 2048, and 4096. Key optimizations: M/N/K as compile-time `#define` constants (not kernel params) lets nvcc optimize loop bounds and eliminate dead branches. Combined with compile-time k_splits elimination, the kernel has zero runtime overhead for the common case.
 
 ncu profiling shows identical occupancy (16.67%) and compute throughput (~78%) to cuBLAS at large sizes — the remaining 4-11% gap is SASS-level instruction scheduling from C code vs cuBLAS's hand-optimized SASS.
-
-#### FP32 Hybrid (older approach)
-
-Beats cuBLAS at 256 and 512. At 1024+ limited to ~91% due to C-level code generation overhead vs cuBLAS's SASS-optimized LDGSTS loading.
-
-The `run_adaptive_benchmark_suite()` function uses a threshold-based strategy map to pick the best config per size.
 
 #### Per-GPU Tuning Profiles
 

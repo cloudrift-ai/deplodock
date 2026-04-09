@@ -328,13 +328,7 @@ def main():
                 cublas_math_mode=args.cublas_math,
             )
         else:
-            # Determine coarsening from strategy.
             coarsen_rows, coarsen_cols = 1, 1
-            if args.strategy == "coarsened_f4":
-                coarsen_cols = 4
-            elif args.strategy in ("coarsened_2r4c", "hybrid_smem_f4"):
-                thread_m = args.thread_m if args.thread_m > 1 else 2
-                coarsen_rows, coarsen_cols = thread_m, 4
 
             config = MatmulConfig(
                 strategy=args.strategy,

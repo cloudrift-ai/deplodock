@@ -290,18 +290,9 @@ def test_run_benchmark_surfaces_cuda_oom():
 # assumptions about block / coarsening dims and won't accept arbitrary values.
 ALL_STRATEGIES: list[tuple[str, dict]] = [
     ("naive", {}),
-    ("smem_tiled", {"threads_y": 16, "threads_x": 16, "block_k": 16}),
-    ("register_blocked", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "thread_n": 2}),
-    ("coarsened_f4", {"threads_y": 16, "threads_x": 16, "block_k": 16, "coarsen_cols": 4}),
-    ("coarsened_2r4c", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "coarsen_rows": 2, "coarsen_cols": 4}),
-    ("hybrid_smem_f4", {"threads_y": 16, "threads_x": 16, "block_k": 32, "thread_m": 2, "coarsen_rows": 2, "coarsen_cols": 4}),
-    ("flat_scalar", {"threads_x": 128, "block_k": 16}),
-    ("flat_f4", {"threads_x": 32, "block_k": 16}),
-    ("hybrid_1r_f4", {"threads_y": 16, "threads_x": 16, "block_k": 16, "coarsen_cols": 4}),
-    ("smem_ab_blocked", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "thread_n": 2}),
     ("tma_db", {"block_k": 32, "thread_m": 8}),
-    # wmma_bf16 hardcodes BM=BN=64 and 128 threads internally — config dims are ignored.
-    ("wmma_bf16", {"block_k": 16}),
+    ("tma_db_tf32", {}),
+    ("tma_db_fma_tf32", {}),
 ]
 
 
@@ -335,15 +326,6 @@ def test_lower_every_strategy(strategy_name, overrides):
     "strategy_name,overrides",
     [
         ("naive", {}),
-        ("smem_tiled", {"threads_y": 16, "threads_x": 16, "block_k": 16}),
-        ("register_blocked", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "thread_n": 2}),
-        ("coarsened_f4", {"threads_y": 16, "threads_x": 16, "block_k": 16, "coarsen_cols": 4}),
-        ("coarsened_2r4c", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "coarsen_rows": 2, "coarsen_cols": 4}),
-        ("hybrid_smem_f4", {"threads_y": 16, "threads_x": 16, "block_k": 32, "thread_m": 2, "coarsen_rows": 2, "coarsen_cols": 4}),
-        ("flat_scalar", {"threads_x": 128, "block_k": 16}),
-        ("flat_f4", {"threads_x": 32, "block_k": 16}),
-        ("hybrid_1r_f4", {"threads_y": 16, "threads_x": 16, "block_k": 16, "coarsen_cols": 4}),
-        ("smem_ab_blocked", {"threads_y": 16, "threads_x": 16, "block_k": 16, "thread_m": 2, "thread_n": 2}),
     ],
     ids=lambda v: v if isinstance(v, str) else "",
 )
