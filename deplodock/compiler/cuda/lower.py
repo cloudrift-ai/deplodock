@@ -1796,15 +1796,18 @@ def _lower_matmul_tma_db_fma_tf32(graph, out_node, config):
     from deplodock.compiler.cuda.ir import RawCode
 
     # Hybrid layout
-    # Defaults found by sweep at 8192: 4 FFMA + 4 TF32 warps, tm=24, bk=16,
-    # tf32_frag_rows=2 hits ~62 TFLOPS at ~39% FMA pipe + ~47% tensor pipe
-    # combined utilization. Beats both pure FFMA (~60) and pure TF32 (~50).
+    # Defaults found by sweep at 8192: 4 FFMA + 4 TF32 warps, tm=28, bk=32,
+    # tf32_frag_rows=1 hits ~65 TFLOPS at ~57% FMA pipe + ~34% tensor pipe.
+    # The 78/22 work split (ffma_bm=112, tf32_bm=32) puts more work on the
+    # faster FMA pipe per cycle than the operand-collector-stalled tensor
+    # pipe, beating both pure FFMA (~60) and pure TF32 (~51) and the older
+    # 60/40 split (~62).
     ffma_warps = int(_os.environ.get("DEPLODOCK_FMATF32_FFMA_WARPS", "4"))
     tf32_warps = 8 - ffma_warps
     tx, ty = 32, 8
-    tm = int(_os.environ.get("DEPLODOCK_FMATF32_TM", "24"))
+    tm = int(_os.environ.get("DEPLODOCK_FMATF32_TM", "28"))
     tn = 4
-    bk = int(_os.environ.get("DEPLODOCK_FMATF32_BK", "16"))
+    bk = int(_os.environ.get("DEPLODOCK_FMATF32_BK", "32"))
     # FFMA group thread layout: ffma_warps row warps × tx=32 col threads
     # FFMA tile = ffma_warps * tm rows × tx * tn = 128 cols
     ffma_bm = ffma_warps * tm  # 4*16 = 64
@@ -1820,7 +1823,7 @@ def _lower_matmul_tma_db_fma_tf32(graph, out_node, config):
         f"BN={bn} not divisible by tf32_warp_cols*wmma_n={tf32_warp_cols * wmma_n}"
     )
     # TF32 BM (bottom rows) = configurable via frag_rows_per_warp
-    tf32_frag_rows_per_warp = int(_os.environ.get("DEPLODOCK_FMATF32_TF32_FRAG_ROWS", "2"))
+    tf32_frag_rows_per_warp = int(_os.environ.get("DEPLODOCK_FMATF32_TF32_FRAG_ROWS", "1"))
     tf32_bm = tf32_warp_rows * tf32_frag_rows_per_warp * wmma_m
     bm = ffma_bm + tf32_bm
     assert bk % wmma_k == 0
