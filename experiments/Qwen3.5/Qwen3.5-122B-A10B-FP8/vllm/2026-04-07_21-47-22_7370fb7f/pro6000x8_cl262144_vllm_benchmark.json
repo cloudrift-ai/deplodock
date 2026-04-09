@@ -1,0 +1,83 @@
+{
+  "task": {
+    "recipe_dir": "experiments/Qwen3.5/Qwen3.5-122B-A10B-FP8/vllm",
+    "variant": "pro6000x8_cl262144",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 8
+  },
+  "recipe": {
+    "model": {
+      "huggingface": "Qwen/Qwen3.5-122B-A10B-FP8"
+    },
+    "engine": {
+      "llm": {
+        "context_length": 262144,
+        "max_concurrent_requests": 64,
+        "tensor_parallel_size": 8,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 1,
+        "gpu_memory_utilization": 0.8,
+        "vllm": {
+          "image": "vllm/vllm-openai",
+          "extra_args": "--enable-prefix-caching --language-model-only --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3",
+          "extra_env": {}
+        },
+        "sglang": null,
+        "docker_options": {}
+      }
+    },
+    "benchmark": {
+      "max_concurrency": 64,
+      "num_prompts": 64,
+      "random_input_len": 4000,
+      "random_output_len": 4000
+    },
+    "deploy": {
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "gpu_count": 8
+    }
+  },
+  "metrics": {
+    "successful_requests": 64,
+    "failed_requests": 0,
+    "max_request_concurrency": 64,
+    "benchmark_duration_s": 138.36,
+    "total_input_tokens": 256000,
+    "total_generated_tokens": 256000,
+    "request_throughput": 0.46,
+    "output_token_throughput": 1850.27,
+    "peak_output_token_throughput": 2475.0,
+    "peak_concurrent_requests": 64.0,
+    "total_token_throughput": 3700.54,
+    "mean_ttft_ms": 19962.59,
+    "median_ttft_ms": 20304.14,
+    "p99_ttft_ms": 30056.74,
+    "mean_tpot_ms": 29.53,
+    "median_tpot_ms": 29.45,
+    "p99_tpot_ms": 33.69,
+    "mean_itl_ms": 29.53,
+    "median_itl_ms": 27.21,
+    "p99_itl_ms": 30.27,
+    "mean_e2el_ms": null,
+    "median_e2el_ms": null,
+    "p99_e2el_ms": null
+  },
+  "system": {
+    "hostname": "riftvm",
+    "os": "Ubuntu 24.04.1 LTS",
+    "kernel": "6.8.0-51-generic",
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8468V",
+    "cpu_count": 88,
+    "cpu_arch": "x86_64",
+    "memory_total_gib": 393.0,
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_memory_mib": 97887,
+    "gpu_driver": "580.65.06",
+    "cuda_version": "13.0",
+    "gpu_count": 8,
+    "docker_version": "28.5.1"
+  },
+  "compose": "services:\n\n  vllm_0:\n    image: vllm/vllm-openai\n    container_name: vllm_0\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              device_ids: ['0', '1', '2', '3', '4', '5', '6', '7']\n              capabilities: [gpu]\n    volumes:\n      - /hf_models:/hf_models\n    environment:\n      - HUGGING_FACE_HUB_TOKEN=***\n      - HF_HOME=/hf_models\n    ports:\n      - \"8000:8000\"\n    shm_size: '16gb'\n    ipc: host\n    command: >\n      --trust-remote-code\n      --gpu-memory-utilization=0.8\n      --host 0.0.0.0\n      --port 8000\n      --tensor-parallel-size 8\n      --pipeline-parallel-size 1\n      --data-parallel-size 1\n      --model Qwen/Qwen3.5-122B-A10B-FP8\n      --served-model-name Qwen/Qwen3.5-122B-A10B-FP8\n      --max-model-len 262144\n      --max-num-seqs 64\n      --enable-prefix-caching --language-model-only --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3\n    healthcheck:\n      test: [\"CMD\", \"bash\", \"-c\", \"curl -f http://localhost:8000/health\"]\n      interval: 10s\n      timeout: 10s\n      retries: 180\n      start_period: 1200s\n",
+  "bench_command": "vllm bench serve\n    --model Qwen/Qwen3.5-122B-A10B-FP8\n    --trust-remote-code\n    --max-concurrency 64\n    --num-prompts 64\n    --random-input-len 4000\n    --random-output-len 4000\n    --base-url http://localhost:8000"
+}
