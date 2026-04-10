@@ -4,11 +4,11 @@ Three GPU-prefixed run directories. Each contains the JSON traces, markdown
 reports, and (where available) `ncu` diagnostic dumps that back the numbers
 in the [companion blog post](https://github.com/cloudrift-ai/deplodock/tree/main/scripts/diagnostics).
 
-| Directory | GPU | Run date | Notes |
-|---|---|---|---|
-| `rtx5090_2026-04-07_16-42-49/` | NVIDIA GeForce RTX 5090 (sm_120, 170 SMs) | 2026-04-07 | Local dev box, driver 595.58.03, CUDA 13.2.51, cuBLAS 13.3.0. Single-mode + batched-mode reports. Numbers in the article's headline 5090 tables match this run exactly. |
+| Directory                      | GPU                                                   | Run date   | Notes                                                                                                                                                                                      |
+|--------------------------------|-------------------------------------------------------|------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `rtx5090_2026-04-07_16-42-49/` | NVIDIA GeForce RTX 5090 (sm_120, 170 SMs)             | 2026-04-07 | Local dev box, driver 595.58.03, CUDA 13.2.51, cuBLAS 13.3.0. Single-mode + batched-mode reports. Numbers in the article's headline 5090 tables match this run exactly.                    |
 | `pro6000_2026-04-07_21-29-59/` | NVIDIA RTX PRO 6000 Blackwell Max-Q (sm_120, 188 SMs) | 2026-04-07 | CloudRift VM, same driver/CUDA/cuBLAS as the 5090 run. Single-mode + batched-mode reports + diagnostics (cuBLAS kernel dump, SASS histogram). Numbers match the article's Pro 6000 tables. |
-| `h200_2026-04-07_19-39-24/` | NVIDIA H200 (sm_90, 132 SMs) | 2026-04-07 | Remote SSH host, same driver/CUDA/cuBLAS. Single-mode + batched-mode reports + diagnostics. Numbers match the article's H200 tables. |
+| `h200_2026-04-07_19-39-24/`    | NVIDIA H200 (sm_90, 132 SMs)                          | 2026-04-07 | Remote SSH host, same driver/CUDA/cuBLAS. Single-mode + batched-mode reports + diagnostics. Numbers match the article's H200 tables.                                                       |
 
 ## What's inside each run directory
 
@@ -32,7 +32,8 @@ ncu data captured by [`scripts/diagnostics/ncu_compare.sh`](../../scripts/diagno
 ## Reproducing
 
 ```bash
-deplodock bench recipes/sgemm_cublas_vs_tma --local        # 5090 (or whatever you have locally)
+deplodock bench recipes/sgemm_cublas_vs_tma --local        # all GPUs in the recipe
+deplodock bench recipes/sgemm_cublas_vs_tma --local --filter "deploy.gpu=*5090*"  # RTX 5090 only
 deplodock bench recipes/sgemm_cublas_vs_tma --ssh user@host  # remote H200 / Pro 6000
 ```
 

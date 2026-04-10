@@ -8,38 +8,53 @@ The `recipe` package owns all recipe-related logic: YAML loading, matrix expansi
 
 - `types.py` — dataclasses: `Recipe`, `DeployConfig`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig`, `CommandConfig`
 - `recipe.py` — `deep_merge()`, `load_recipe()`, `resolve_for_hardware()`, `validate_extra_args()`, `_load_raw_config()`, `_validate_and_build()`
-- `matrix.py` — `expand_matrix_entry()`, `dot_to_nested()`, `build_override()`
+- `matrix.py` — `expand_matrix()`, `_expand_cross()`, `_expand_zip()`, `filter_combinations()`, `dot_to_nested()`, `build_override()`
 - `engines.py` — `VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`, `banned_extra_arg_flags()`, `build_engine_args()`
 
 ## Key Design Decisions
 
 ### Matrix Expansion for Benchmark Sweeps
 
-Recipes use `matrices` — a list of entries that define benchmark configurations with broadcast + zip semantics:
+Recipes use `matrices` — a dict that defines benchmark configurations using `cross` and `zip` combinators:
 
 ```yaml
+# Simple single-point entry (implicit zip, all scalars)
 matrices:
-  # Simple single-point entry (all scalars)
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+  deploy.gpu: "NVIDIA GeForce RTX 5090"
+  deploy.gpu_count: 1
+
+# Cross-product: 3 GPUs × 2 configs = 6 variants
+matrices:
+  cross:
     deploy.gpu_count: 1
+    deploy.gpu:
+      - "NVIDIA GeForce RTX 5090"
+      - "NVIDIA H100 80GB"
+      - "NVIDIA H200 141GB"
+    zip:
+      engine.llm.max_concurrent_requests: [128, 512]
+      benchmark.max_concurrency: [128, 512]
 
-  # Concurrency sweep (8 runs from one entry)
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
-    benchmark.max_concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
-
-  # Correlated sweep (3 zip runs)
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
-    engine.llm.max_concurrent_requests: [128, 256, 512]
-    benchmark.max_concurrency: [128, 256, 512]
+# Concurrency sweep (zip: 8 runs)
+matrices:
+  deploy.gpu: "NVIDIA GeForce RTX 5090"
+  engine.llm.max_concurrent_requests: [1, 2, 4, 8, 16, 32, 64, 128]
+  benchmark.max_concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
 ```
 
 Rules:
-- **Scalars** are broadcast to all runs in the entry
-- **Lists** are zipped together (all lists in one entry must have the same length)
-- **`deploy.gpu`** is required in each matrix entry
+- **`cross` node**: scalars broadcast, lists are independent cross-product axes, nested `zip` dicts are one compound axis
+- **`zip` node**: scalars broadcast, lists are zipped element-wise (must all be the same length), nested `cross` dicts are one zip axis
+- A plain dict (no `cross`/`zip` key) is an implicit `zip`
+- `cross`/`zip` keys are only combinators when their value is a dict
+- **`deploy.gpu`** is required
 - **Dot-notation** is used for all parameter paths (`deploy.gpu`, `engine.llm.max_concurrent_requests`, etc.)
 
-Each combination is converted to a nested override dict via `build_override()` and deep-merged with the base config.
+The entry point is `expand_matrix(matrices)` which dispatches to `_expand_cross()` or `_expand_zip()` recursively. Each resulting combination is converted to a nested override dict via `build_override()` and deep-merged with the base config.
+
+#### Variant Filtering
+
+`filter_combinations(combinations, filters)` applies `--filter KEY=PATTERN` flags (fnmatch glob, AND logic) after expansion, before building Recipe objects. This allows running a subset of variants (e.g. `--filter "deploy.gpu=*5090*"`).
 
 ### Deep Merge
 
@@ -56,8 +71,8 @@ engine:
 
 # matrix entry overrides only what changes
 matrices:
-  - deploy.gpu: "NVIDIA H100 80GB"
-    engine.llm.max_concurrent_requests: 256
+  deploy.gpu: "NVIDIA H100 80GB"
+  engine.llm.max_concurrent_requests: 256
 ```
 
 The merged result keeps `tensor_parallel_size: 8`, `context_length: 16384`, and the vllm block from the base, while adding `max_concurrent_requests: 256` from the matrix entry.
@@ -161,9 +176,9 @@ command:
   env: {FOO: bar}                  # optional, prepended as KEY=value to the command
 
 matrices:
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
-    deploy.gpu_count: 1
-    marker: [a, b, c]
+  deploy.gpu: "NVIDIA GeForce RTX 5090"
+  deploy.gpu_count: 1
+  marker: [a, b, c]
 ```
 
 The `run` template uses `string.Template` `$var` syntax. Substitution variables come from variant params (flattened to leaf names: `deploy.gpu` → `gpu`, `marker` → `marker`) plus harness-injected `$task_dir`, `$gpu_device_ids`, and `$repo_dir` (only when `stage` is non-empty). Conflicting leaf names (e.g. two matrix keys flattening to `gpu`) raise at substitution time.
@@ -193,8 +208,8 @@ Keys managed by the compose template (`image`, `container_name`, `entrypoint`, `
 Matrix overrides work naturally via deep merge:
 ```yaml
 matrices:
-  - deploy.gpu: "AMD Instinct MI350X"
-    engine.llm.docker_options:
+  deploy.gpu: "AMD Instinct MI350X"
+  engine.llm.docker_options:
       security_opt:
         - seccomp=unconfined
 ```
@@ -214,12 +229,14 @@ _load_raw_config(recipe_dir) -> raw dict
     +-- load_recipe(): strips matrices, calls _validate_and_build()
     |       -> base Recipe (for bench/cloud commands that don't need matrix resolution)
     |
-    +-- resolve_for_hardware(recipe_dir, gpu_name): finds first scalar matrix
-    |       entry matching gpu_name, deep_merges with base, calls _validate_and_build()
+    +-- resolve_for_hardware(recipe_dir, gpu_name): expands full matrix,
+    |       finds best combo matching gpu_name, deep_merges with base,
+    |       calls _validate_and_build()
     |       -> hardware-resolved Recipe (for deploy local/ssh commands)
     |
-    +-- enumerate_tasks(): reads matrices, expands each entry:
-            |-- expand_matrix_entry() -> list of combinations
+    +-- enumerate_tasks(): reads matrices, expands via cross/zip:
+            |-- expand_matrix() -> list of combinations
+            |-- filter_combinations() -> filtered list (if --filter flags)
             |-- Variant(params=combo) -> typed variant
             |-- build_override() -> nested override dict
             |-- deep_merge(base, override) -> merged config

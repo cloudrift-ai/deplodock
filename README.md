@@ -111,28 +111,57 @@ benchmark:
   random_input_len: 8000
   random_output_len: 8000
 
+# Simple single-point entry (implicit zip)
 matrices:
-  # Simple single-point entry
-  - deploy.gpu: "NVIDIA H200 141GB"
-    deploy.gpu_count: 8
-
-  # Override engine and benchmark settings
-  - deploy.gpu: "NVIDIA H100 80GB"
-    deploy.gpu_count: 8
-    engine.llm.max_concurrent_requests: 256
-    benchmark.max_concurrency: 64
-
-  # Concurrency sweep (8 runs from one entry)
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
-    benchmark.max_concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
-
-  # Correlated engine+bench sweep (3 zip runs)
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
-    engine.llm.max_concurrent_requests: [128, 256, 512]
-    benchmark.max_concurrency: [128, 256, 512]
+  deploy.gpu: "NVIDIA H200 141GB"
+  deploy.gpu_count: 8
 ```
 
-Matrix entries use **dot-notation** for all parameter paths. Scalars are broadcast; lists are zipped (all lists in one entry must have the same length). `deploy.gpu` is required in each entry.
+#### Cross-Product and Zip Combinators
+
+The `matrices` section supports two combinators for generating benchmark variants:
+
+- **`cross`**: Cartesian product of all list-valued axes. Scalars are broadcast.
+- **`zip`**: Element-wise pairing of equal-length lists. Scalars are broadcast.
+
+A plain `matrices` dict (no `cross`/`zip` key) is an implicit `zip`.
+
+```yaml
+# Cross-product: 3 GPUs × 2 configs = 6 variants
+matrices:
+  cross:
+    deploy.gpu_count: 1                    # scalar → broadcast
+    deploy.gpu:                            # list → cross-product axis
+      - "NVIDIA GeForce RTX 5090"
+      - "NVIDIA H100 80GB"
+      - "NVIDIA H200 141GB"
+    zip:                                   # zip sub-dict → one compound axis
+      engine.llm.max_concurrent_requests: [128, 512]
+      benchmark.max_concurrency: [128, 512]
+```
+
+```yaml
+# Concurrency sweep (zip: 8 runs from one entry)
+matrices:
+  deploy.gpu: "NVIDIA GeForce RTX 5090"
+  engine.llm.max_concurrent_requests: [1, 2, 4, 8, 16, 32, 64, 128]
+  benchmark.max_concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
+```
+
+Within a `cross` node: scalars broadcast, lists are independent axes (cartesian product), nested `zip` dicts bundle their lists into one compound axis. Within a `zip` node: scalars broadcast, lists are zipped element-wise (must all be the same length). `cross`/`zip` keys are only treated as combinators when their value is a dict.
+
+Matrix entries use **dot-notation** for all parameter paths. `deploy.gpu` is required.
+
+#### Variant Filtering
+
+Use `--filter` to run a subset of variants:
+
+```bash
+deplodock bench recipes/my-recipe --filter "deploy.gpu=*5090*"
+deplodock bench recipes/my-recipe --filter "deploy.gpu=*5090*" --filter "batches=1"
+```
+
+Multiple `--filter` flags use AND logic. Values are matched with fnmatch glob patterns against the expanded parameter values.
 
 `deploy.driver_version` and `deploy.cuda_version` (optional) request a specific NVIDIA driver / CUDA toolkit on the target host. If the installed version already matches (prefix-match — `"550"` matches `550.127.05`), provisioning is a no-op. On a mismatch, a remote (`ssh`/`cloud`) deploy installs the requested version, reboots the host, and waits for SSH to come back. Local deploys refuse to run privileged commands and will error out instead — these fields are intended for remote machines only.
 
@@ -156,15 +185,14 @@ Keys already managed by the compose template (`image`, `volumes`, `ports`, `heal
 
 ### SGLang Matrix Entry Example
 
-To benchmark with SGLang alongside vLLM, add a matrix entry with `engine.llm.sglang.*` overrides:
+To benchmark with SGLang alongside vLLM, use a cross-product with the engine image:
 
 ```yaml
 matrices:
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
+  cross:
+    deploy.gpu: "NVIDIA GeForce RTX 5090"
     deploy.gpu_count: 1
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
-    deploy.gpu_count: 1
-    engine.llm.sglang.image: "lmsysorg/sglang:v0.5.9"
+    engine.llm.sglang.image: ["", "lmsysorg/sglang:v0.5.9"]
 ```
 
 ### Named Fields → CLI Flags
@@ -196,9 +224,9 @@ command:
   timeout: 60
 
 matrices:
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
-    deploy.gpu_count: 1
-    marker: [a, b, c]
+  deploy.gpu: "NVIDIA GeForce RTX 5090"
+  deploy.gpu_count: 1
+  marker: [a, b, c]
 ```
 
 The `run` template uses `string.Template` `$var` syntax. Substitution variables are the variant params (flattened to leaf names — `deploy.gpu` → `gpu`, `marker` → `marker`) plus harness-injected `$task_dir`, `$gpu_device_ids`, and `$repo_dir` (when staging is configured). `command` and `engine.llm` are mutually exclusive.

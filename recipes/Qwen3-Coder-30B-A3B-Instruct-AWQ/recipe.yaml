@@ -18,5 +18,5 @@ benchmark:
   random_output_len: 4000
 
 matrices:
-  - deploy.gpu: "NVIDIA GeForce RTX 5090"
-    deploy.gpu_count: 1
+  deploy.gpu: "NVIDIA GeForce RTX 5090"
+  deploy.gpu_count: 1
