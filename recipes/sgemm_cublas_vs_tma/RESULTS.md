@@ -32,9 +32,8 @@ ncu data captured by [`scripts/diagnostics/ncu_compare.sh`](../../scripts/diagno
 ## Reproducing
 
 ```bash
-deplodock bench recipes/sgemm_cublas_vs_tma --local        # all GPUs in the recipe
-deplodock bench recipes/sgemm_cublas_vs_tma --local --filter "deploy.gpu=*5090*"  # RTX 5090 only
-deplodock bench recipes/sgemm_cublas_vs_tma --ssh user@host  # remote H200 / Pro 6000
+deplodock bench recipes/sgemm_cublas_vs_tma --local --filter "deploy.gpu=*5090*"              # RTX 5090 only
+deplodock bench recipes/sgemm_cublas_vs_tma --ssh user@host --filter "deploy.gpu=*PRO 6000*"  # Remote Pro 6000
 ```
 
 The recipe pins driver 595.58.03 and CUDA 13.2 for cloud reproductions.
