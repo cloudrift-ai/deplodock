@@ -22,6 +22,11 @@ Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLa
     - [bench/](deplodock/commands/bench/) — `bench` command
     - [teardown.py](deplodock/commands/teardown.py) — `teardown` command
     - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
+    - [pull.py](deplodock/commands/pull.py) — `pull` command (download HF model)
+    - [trace.py](deplodock/commands/trace.py) — `trace` command (PyTorch → Graph IR)
+    - [compile.py](deplodock/commands/compile.py) — `compile` command (assembly passes)
+    - [inspect_graph.py](deplodock/commands/inspect_graph.py) — `inspect` command (graph summary)
+    - [bench_layer.py](deplodock/commands/bench_layer.py) — `bench-layer` command (layer benchmarking)
   - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
   - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle

@@ -1,5 +1,3 @@
-
-
 # Python virtual environment
 venv/
 
@@ -21,3 +19,9 @@ nginx.vllm.conf
 
 # PyCharm
 .idea/*.cubin
+
+# Recipe artifacts
+/recipes/**
+
+# Experiment artifacts
+/experiments/**

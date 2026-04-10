@@ -2,22 +2,18 @@
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import FusedReduceElementwiseOp
+from deplodock.compiler.ops import MatmulOp
 
-PATTERN = "Reduce{$f, $ax}(Elementwise{$g}($A, $B))"
+PATTERN = "Reduce{sum, $ax}(Elementwise{mul}($A, $B))"
 
 
 def rewrite(graph: Graph, match: Match) -> Graph:
-    """Replace Reduce(Elementwise(A, B)) with a single FusedReduceElementwiseOp."""
+    """Replace Reduce{sum}(Elementwise{mul}(A, B)) with MatmulOp."""
     g = graph.copy()
     root = g.nodes[match.root_node_id]
     ew_node_id = root.inputs[0]
 
-    fused_op = FusedReduceElementwiseOp(
-        reduce_fn=match.captured_constraints["f"],
-        elementwise_fn=match.captured_constraints["g"],
-        axis=match.captured_constraints["ax"],
-    )
+    fused_op = MatmulOp()
 
     # Inputs come from the elementwise node's inputs (the original A, B).
     ew_node = g.nodes[ew_node_id]

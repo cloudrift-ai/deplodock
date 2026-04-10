@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass
 
+from deplodock.compiler import ops as ops_module
 from deplodock.compiler.ops import Op
 
 
@@ -119,6 +120,37 @@ class Graph:
             )
         g.inputs = list(self.inputs)
         g.outputs = list(self.outputs)
+        return g
+
+    @staticmethod
+    def from_dict(data: dict) -> Graph:
+        """Deserialize a graph from a JSON-compatible dict (inverse of to_dict)."""
+        g = Graph()
+        # First pass: create all nodes (inputs first, then in order).
+        for nid, ndata in data["nodes"].items():
+            op_cls_name = ndata["op"]
+            op_cls = getattr(ops_module, op_cls_name, None)
+            if op_cls is None:
+                raise ValueError(f"Unknown op class: {op_cls_name}")
+
+            fields = ndata.get("op_fields", {})
+            # Convert list fields to tuples for dataclass ops that expect tuples.
+            for k, v in fields.items():
+                if isinstance(v, list):
+                    fields[k] = tuple(v)
+
+            op = op_cls(**fields) if fields else op_cls()
+            out = ndata["output"]
+            tensor = Tensor(
+                name=out["name"],
+                shape=tuple(out["shape"]),
+                dtype=out.get("dtype", "f32"),
+            )
+            # Add directly to bypass input validation (nodes may reference later nodes).
+            g.nodes[nid] = Node(id=nid, op=op, inputs=list(ndata["inputs"]), output=tensor)
+
+        g.inputs = list(data["inputs"])
+        g.outputs = list(data["outputs"])
         return g
 
     def to_dict(self) -> dict:

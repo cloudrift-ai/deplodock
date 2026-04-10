@@ -8,29 +8,49 @@ Minimal tensor IR and regex-style graph transformation engine. Represents tensor
 
 ```
 compiler/
-├── ops.py        # Op base class + op types (ElementwiseOp, ReduceOp, etc.)
-├── ir.py         # Tensor, Node, Graph — the compute graph data structure
-├── pattern.py    # Pattern AST + text parser for matching rules
-├── matcher.py    # Graph pattern matching engine
-├── rewriter.py   # Pass/Rule/Rewriter — rule loading and application
-├── trace.py      # CompilerTrace — structured JSON trace for AI-in-the-loop
-├── pipeline.py   # compile_and_run() — end-to-end pipeline with tracing
-├── benchmark.py  # Multi-size benchmark harness with cuBLAS comparison
-├── rules/        # Ordered rule files organized by pass
-│   ├── fusion/   # Fuse ops to avoid intermediates
-│   └── tiling/   # Tile loops for memory hierarchy
-└── cuda/         # CUDA backend
-    ├── ir.py     # Imperative AST (Expr, Stmt, KernelDef, VectorLoad, etc.)
+├── ops.py         # Op base class + all op types (minimal + fused)
+├── ir.py          # Tensor, Node, Graph — the compute graph data structure
+├── pattern.py     # Pattern AST + text parser for matching rules
+├── matcher.py     # Graph pattern matching engine
+├── rewriter.py    # Pass/Rule/Rewriter — rule loading and application
+├── trace.py       # CompilerTrace — structured JSON trace for AI-in-the-loop
+├── pipeline.py    # compile_and_run() + compile_graph() — pipeline entry points
+├── benchmark.py   # Multi-size benchmark harness with cuBLAS comparison
+├── torch_trace.py # PyTorch module → Graph IR conversion (optional torch dep)
+├── rules/         # Ordered rule files organized by pass
+│   ├── fusion/    # Fuse ops: RMSNorm, matmul, softmax, SiLU+mul
+│   └── tiling/    # Tile loops for memory hierarchy
+└── cuda/          # CUDA backend
+    ├── ir.py      # Imperative AST (Expr, Stmt, KernelDef, VectorLoad, etc.)
     ├── codegen.py # CUDA IR → CUDA C source string
-    ├── lower.py  # Graph IR → CUDA IR (MatmulConfig + strategy dispatch)
-    └── runner.py # Compile with nvcc + execute + benchmark + parse output
+    ├── lower.py   # Graph IR → CUDA IR (MatmulConfig + strategy dispatch)
+    └── runner.py  # Compile with nvcc + execute + benchmark + parse output
 ```
 
 ## IR Design
 
-- **Ops** are plain dataclasses inheriting from `Op`. No enum — the class name is the type. New ops (e.g. `FusedReduceElementwiseOp`) are added by subclassing.
+- **Ops** are plain dataclasses inheriting from `Op`. No enum — the class name is the type. New ops are added by subclassing.
 - **Nodes** reference inputs by string ID. Fan-out is natural — multiple nodes can list the same input ID.
-- **Graph** is an ordered dict of nodes with `add_node`, `remove_node`, `replace_node`, `consumers`, and `topological_order`.
+- **Graph** is an ordered dict of nodes with `add_node`, `remove_node`, `replace_node`, `consumers`, `topological_order`, `to_dict`, and `from_dict`.
+
+### Op Categories
+
+**Minimal ops** (for lowering from PyTorch):
+- `InputOp` — dynamic input tensor
+- `ConstantOp(name)` — fixed tensor (weights, RoPE tables, scalars)
+- `ElementwiseOp(fn)` — scalar function per element (mul, add, exp, rsqrt, neg, recip, ...)
+- `ReduceOp(fn, axis)` — collapse dimension (sum, max, prod)
+- `ScanOp(fn, axis)`, `GatherOp(axis)`, `ScatterOp(axis, reduce_fn)` — other primitives
+- `TransposeOp(axes)` — permute dimensions
+- `ReshapeOp(shape)` — reshape without data copy
+
+**Fused ops** (assembly targets):
+- `MatmulOp` — matrix multiply (from `Reduce{sum}(Elementwise{mul})`)
+- `FusedRMSNormOp(eps)` — rsqrt(mean(x²) + eps) * x * weight
+- `FusedSoftmaxOp(axis)` — online softmax
+- `FusedSiLUMulOp` — silu(gate) * up
+- `FusedAttentionOp(num_heads, head_dim, scale)` — flash attention (future)
+- `FusedReduceElementwiseOp(reduce_fn, elementwise_fn, axis)` — generic fused reduce
 
 ## Pattern Language
 
@@ -48,6 +68,25 @@ Reduce{sum, $k}(Elementwise{mul}($A, $B))
 - **Rules**: Python files exporting `PATTERN` string + `rewrite(graph, match)` function
 - **Passes**: Subdirectories of `rules/` (fusion, tiling, etc.), each applied to fixed point
 - **Ordering**: Passes run sequentially; within a pass, rules apply in filename order with restart-on-match
+
+### Fusion Rules (Incremental Assembly)
+
+Rules are numbered to control ordering. Earlier rules match longer chains to prevent shorter rules from consuming their sub-patterns.
+
+| Rule | Pattern | Output |
+|------|---------|--------|
+| `000_fuse_rmsnorm` | `(x * rsqrt(sum(x*x) * inv_n + eps)) * w` | `FusedRMSNormOp` |
+| `001_fuse_reduce_elementwise` | `Reduce{sum}(Elementwise{mul}(A, B))` | `MatmulOp` |
+| `002_fuse_softmax` | `exp(x-max(x)) / sum(exp(x-max(x)))` | `FusedSoftmaxOp` |
+| `003_fuse_silu_mul` | `gate * recip(1 + exp(-gate)) * up` | `FusedSiLUMulOp` |
+
+**Key ordering constraint**: RMSNorm (000) must run before matmul (001) because RMSNorm contains `Reduce{sum}(Elementwise{mul}($x, $x))` which the matmul rule would otherwise consume.
+
+**Future**: `010_fuse_attention` would match `Matmul → Scale → FusedSoftmax → Matmul` and produce `FusedAttentionOp` (flash attention).
+
+## PyTorch Tracer
+
+`torch_trace.py` converts a PyTorch module to our Graph IR via `torch.export`. ATen ops map to our minimal opset; parameters become `ConstantOp` nodes. PyTorch is an optional dependency.
 
 ## Data Flow
 
