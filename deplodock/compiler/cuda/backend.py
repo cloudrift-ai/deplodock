@@ -13,20 +13,6 @@ from deplodock.compiler.cuda.kernels import load_kernel
 from deplodock.compiler.cuda.program import Buffer, Launch, Program, benchmark_program, run_program
 from deplodock.compiler.plan import ExecutionPlan, OpKernel
 
-# Kernel registry: op name → .cu template name.
-_KERNEL_REGISTRY: dict[str, str] = {
-    "rmsnorm": "rmsnorm",
-    "silu_mul": "activation",
-    "rope": "rope",
-    "attention_qk": "attention_qk",
-    "attention_softmax": "attention_softmax",
-    "attention_sv": "attention_sv",
-    "matmul_naive": "matmul_naive",
-    "matmul_residual_add": "matmul_residual_add",
-    "triple_matmul": "matmul_triple",
-    "dual_matmul_silu_mul": "matmul_dual_silu_mul",
-}
-
 # Instance counter for unique kernel names when the same op appears multiple times.
 _name_counters: dict[str, int] = {}
 
