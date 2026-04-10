@@ -13,6 +13,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from deplodock.compiler.backend import BenchmarkResult, ProgramResult
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,24 +49,6 @@ class Program:
     launches: list[Launch]
     defines: dict[str, str] = field(default_factory=dict)
     includes: list[str] = field(default_factory=list)
-
-
-@dataclass
-class ProgramResult:
-    """Result of running a Program."""
-
-    outputs: dict[str, list[float]]
-    time_ms: float | None = None
-
-
-@dataclass
-class BenchmarkResult:
-    """Result of benchmarking a Program."""
-
-    time_ms: float  # median per-iteration
-    min_ms: float | None = None
-    max_ms: float | None = None
-    num_launches: int = 0
 
 
 # ---------------------------------------------------------------------------

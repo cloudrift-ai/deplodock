@@ -8,7 +8,7 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 ┌─────────────────────────────────────────────────────────────────┐
 │  LAYER 1: Frontend (backend-agnostic)                           │
 │                                                                 │
-│  torch_trace.py ─→ Graph IR (ops.py, ir.py)                    │
+│  torch_trace.py ─→ Graph IR (ops.py, ir.py)                     │
 │  PyTorch module        Tensor, Node, Graph                      │
 │                                                                 │
 │  RULE: No GPU, no CUDA, no backend imports.                     │
@@ -25,7 +25,7 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 ├─────────────────────────────────────────────────────────────────┤
 │  LAYER 3: Execution Plan (backend-agnostic)                     │
 │                                                                 │
-│  plan.py:           BufferSpec, OpKernel, ExecutionPlan          │
+│  plan.py:           BufferSpec, OpKernel, ExecutionPlan         │
 │  block_planner.py:  plan_block(BlockConfig) → ExecutionPlan     │
 │  backend.py:        Backend ABC (compile, run, benchmark)       │
 │                                                                 │
@@ -39,8 +39,8 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  cuda/program.py:   Buffer, Launch, Program, compile, run       │
 │  cuda/kernels/*.cu: Kernel templates with __KERNEL_NAME__       │
 │  cuda/lower.py:     Graph → KernelDef (SGEMM strategies)        │
-│  cuda/codegen.py:   KernelDef → CUDA C source                  │
-│  cuda/ir.py:        CUDA imperative AST (Expr, Stmt, KernelDef)│
+│  cuda/codegen.py:   KernelDef → CUDA C source                   │
+│  cuda/ir.py:        CUDA imperative AST (Expr, Stmt, KernelDef) │
 │  cuda/runner.py:    Legacy single-kernel compile + run          │
 │                                                                 │
 │  RULE: All GPU-specific code lives here.                        │
@@ -176,18 +176,18 @@ class ExecutionPlan:
 
 The transformer block plan has 10 ops (7 logical, attention is 3):
 
-| # | OpKernel.op | What it fuses | .cu template |
-|---|-------------|---------------|--------------|
-| 1 | `rmsnorm` | pow→mean→rsqrt→mul→scale | rmsnorm.cu |
-| 2 | `triple_matmul` | Q/K/V projections sharing input | matmul_triple.cu |
-| 3 | `rope` | rotary embeddings for Q and K | rope.cu |
-| 4a | `attention_qk` | QK^T + scale | attention_qk.cu |
-| 4b | `attention_softmax` | row-wise softmax | attention_softmax.cu |
-| 4c | `attention_sv` | scores @ V | attention_sv.cu |
-| 5a | `matmul_residual_add` | Wo matmul + residual | matmul_residual_add.cu |
-| 5b | `rmsnorm` | post-attention norm | rmsnorm.cu |
-| 6 | `dual_matmul_silu_mul` | gate+up matmuls + silu(gate)*up | matmul_dual_silu_mul.cu |
-| 7 | `matmul_residual_add` | Wd matmul + residual | matmul_residual_add.cu |
+| #  | OpKernel.op            | What it fuses                   | .cu template            |
+|----|------------------------|---------------------------------|-------------------------|
+| 1  | `rmsnorm`              | pow→mean→rsqrt→mul→scale        | rmsnorm.cu              |
+| 2  | `triple_matmul`        | Q/K/V projections sharing input | matmul_triple.cu        |
+| 3  | `rope`                 | rotary embeddings for Q and K   | rope.cu                 |
+| 4a | `attention_qk`         | QK^T + scale                    | attention_qk.cu         |
+| 4b | `attention_softmax`    | row-wise softmax                | attention_softmax.cu    |
+| 4c | `attention_sv`         | scores @ V                      | attention_sv.cu         |
+| 5a | `matmul_residual_add`  | Wo matmul + residual            | matmul_residual_add.cu  |
+| 5b | `rmsnorm`              | post-attention norm             | rmsnorm.cu              |
+| 6  | `dual_matmul_silu_mul` | gate+up matmuls + silu(gate)*up | matmul_dual_silu_mul.cu |
+| 7  | `matmul_residual_add`  | Wd matmul + residual            | matmul_residual_add.cu  |
 
 Attention materializes the N×N scores matrix (naive). This is the explicit seam where flash attention would replace it.
 
@@ -210,12 +210,12 @@ Attention materializes the N×N scores matrix (naive). This is the explicit seam
 
 Rules are numbered to control ordering within a pass:
 
-| Rule | Pattern | Output |
-|------|---------|--------|
-| `000_fuse_rmsnorm` | `(x * rsqrt(sum(x*x) * inv_n + eps)) * w` | `FusedRMSNormOp` |
-| `001_fuse_reduce_elementwise` | `Reduce{sum}(Elementwise{mul}(A, B))` | `MatmulOp` |
-| `002_fuse_softmax` | `exp(x-max(x)) / sum(exp(x-max(x)))` | `FusedSoftmaxOp` |
-| `003_fuse_silu_mul` | `gate * recip(1 + exp(-gate)) * up` | `FusedSiLUMulOp` |
+| Rule                          | Pattern                                   | Output           |
+|-------------------------------|-------------------------------------------|------------------|
+| `000_fuse_rmsnorm`            | `(x * rsqrt(sum(x*x) * inv_n + eps)) * w` | `FusedRMSNormOp` |
+| `001_fuse_reduce_elementwise` | `Reduce{sum}(Elementwise{mul}(A, B))`     | `MatmulOp`       |
+| `002_fuse_softmax`            | `exp(x-max(x)) / sum(exp(x-max(x)))`      | `FusedSoftmaxOp` |
+| `003_fuse_silu_mul`           | `gate * recip(1 + exp(-gate)) * up`       | `FusedSiLUMulOp` |
 
 **Key constraint**: RMSNorm (000) runs before matmul (001) to prevent the matmul rule from consuming the `sum(x*x)` sub-pattern.
 
@@ -223,21 +223,21 @@ Rules are numbered to control ordering within a pass:
 
 ### SGEMM Strategies (cuda/lower.py)
 
-| Strategy | Description | Best for |
-|----------|-------------|----------|
-| `naive` | 1 thread per output element | Test baseline |
-| **`tma_db`** | **TMA double-buffer, size-adaptive** | **Production default** |
-| `tma_db_tf32` | TF32 via tensor cores (wmma) | TF32 precision ok |
-| `tma_db_fma_tf32` | Concurrent FMA + TF32 hybrid | Mixed precision ok |
+| Strategy          | Description                          | Best for               |
+|-------------------|--------------------------------------|------------------------|
+| `naive`           | 1 thread per output element          | Test baseline          |
+| **`tma_db`**      | **TMA double-buffer, size-adaptive** | **Production default** |
+| `tma_db_tf32`     | TF32 via tensor cores (wmma)         | TF32 precision ok      |
+| `tma_db_fma_tf32` | Concurrent FMA + TF32 hybrid         | Mixed precision ok     |
 
 ### TMA Performance (RTX 5090, sm_120)
 
-| Size | TM | BK | K-splits | Eff vs cuBLAS | TFLOPS |
-|------|-----|-----|----------|--------------|--------|
-| **1024** | 8  | 32 | 1 | **101%** | 49.0 |
-| **2048** | 26 | 32 | 1 | **106%** | 72.8 |
-| **4096** | 20 | 32 | 1 | **101%** | 67.4 |
-| 8192 | 28 | 32 | 1 | 96% | 60.2 |
+| Size     | TM   | BK   | K-splits  | Eff vs cuBLAS | TFLOPS  |
+|----------|------|------|-----------|---------------|---------|
+| **1024** | 8    | 32   | 1         | **101%**      | 49.0    |
+| **2048** | 26   | 32   | 1         | **106%**      | 72.8    |
+| **4096** | 20   | 32   | 1         | **101%**      | 67.4    |
+| 8192     | 28   | 32   | 1         | 96%           | 60.2    |
 
 ### Kernel Templates (cuda/kernels/)
 

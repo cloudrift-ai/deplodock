@@ -160,8 +160,8 @@ class KernelResult:
 
 
 @dataclass
-class BenchmarkResult:
-    """Result of a benchmark run across iterations."""
+class MatmulBenchmarkResult:
+    """Result of a SGEMM benchmark with cuBLAS comparison."""
 
     kernel_time_ms: float  # median
     kernel_min_ms: float
@@ -632,7 +632,7 @@ def run_benchmark(
     cublas_math_mode: str = "default",
     maxrregcount: int | None = None,
     fast_math: bool = False,
-) -> BenchmarkResult:
+) -> MatmulBenchmarkResult:
     """Run a benchmark: compile and execute, return timing results.
 
     `fast_math=False` (the default) is the IEEE-clean configuration: we still
@@ -733,7 +733,7 @@ def run_benchmark(
             if cublas_gflops > 0:
                 efficiency = (gflops / cublas_gflops) * 100.0
 
-        return BenchmarkResult(
+        return MatmulBenchmarkResult(
             kernel_time_ms=kernel_median,
             kernel_min_ms=kernel_min,
             kernel_max_ms=kernel_max,
