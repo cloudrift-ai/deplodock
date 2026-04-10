@@ -10,12 +10,13 @@ command:
     export DEPLODOCK_GIT_REV="$git_rev"
     cd $repo_dir
     [ -d venv ] || make setup
-    pip install -e ".[compile]"
+    ./venv/bin/pip install -e ".[compile]"
     ./venv/bin/python scripts/bench_block.py \
       --model $hf_model \
       --seq-len $seq_len \
       --batch $batch \
       --iters $iterations \
+      --dtype fp16 \
       --backends $backends \
       2>&1 | tee $task_dir/bench_block.log
   result_files:
