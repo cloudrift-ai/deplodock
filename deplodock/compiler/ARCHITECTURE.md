@@ -119,7 +119,6 @@ compiler/
 ├── backend.py        # [L3] Backend ABC (compile, run, benchmark)
 ├── trace.py          # [L2] CompilerTrace for AI-in-the-loop
 ├── pipeline.py       # [L4*] compile_graph (L2) + compile_and_run (legacy CUDA)
-├── benchmark.py      # [L4*] SGEMM benchmark harness (legacy CUDA)
 └── cuda/             # [L4] CUDA backend
     ├── backend.py    #      CudaBackend implements Backend ABC
     ├── program.py    #      Buffer, Launch, Program — compile + run
@@ -142,7 +141,9 @@ compiler/
     └── tuning.py     #      Per-GPU empirical tuning profiles
 ```
 
-`*` — `pipeline.py` and `benchmark.py` have CUDA imports (legacy). New code should use the Backend ABC instead.
+`*` — `pipeline.py` has CUDA imports (legacy). New code should use the Backend ABC instead.
+
+Benchmark orchestration (multi-size sweeps, result collection, summary tables) lives in `scripts/bench_matmul.py` and `scripts/bench_block.py`, not in the compiler package. The compiler only provides execution primitives.
 
 ## Execution Plan (Layer 3)
 

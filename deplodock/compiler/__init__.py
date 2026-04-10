@@ -1,6 +1,5 @@
 """Minimal tensor IR and graph transformation engine."""
 
-from deplodock.compiler.benchmark import BenchmarkSuite, run_benchmark_suite
 from deplodock.compiler.cuda.lower import MatmulConfig
 from deplodock.compiler.ir import Graph, Node, Tensor
 from deplodock.compiler.matcher import Match, match_pattern
@@ -28,7 +27,6 @@ from deplodock.compiler.rewriter import Pass, Rewriter, Rule
 from deplodock.compiler.trace import CompilerTrace, ExecutionResult, PassTrace, RuleApplication
 
 __all__ = [
-    "BenchmarkSuite",
     "CompilerTrace",
     "ConstantOp",
     "ElementwiseOp",
@@ -63,5 +61,4 @@ __all__ = [
     "compile_and_run",
     "match_pattern",
     "parse_pattern",
-    "run_benchmark_suite",
 ]
