@@ -55,10 +55,6 @@ def naive_attention_sv_source(name: str = "attention_sv") -> str:
     return load_kernel("attention_sv", kernel_name=name)
 
 
-def naive_matmul_source(name: str = "naive_matmul") -> str:
-    return load_kernel("matmul_naive", kernel_name=name)
-
-
 def matmul_residual_add_source(name: str = "matmul_residual_add") -> str:
     return load_kernel("matmul_residual_add", kernel_name=name)
 
@@ -81,6 +77,5 @@ __all__ = [
     "naive_attention_qk_source",
     "naive_attention_softmax_source",
     "naive_attention_sv_source",
-    "naive_matmul_source",
     "triple_matmul_source",
 ]
