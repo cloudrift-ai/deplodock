@@ -36,6 +36,6 @@ matrices:
       - "NVIDIA GeForce RTX 5090"
       - "NVIDIA H200 141GB"
       - "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
-    size: [256, 512, 1024, 2048, 4096, 8192, 16384]
+    size: [256, 512, 1024, 2048, 4096, 8192]
     batch: [1, 4, 8, 16]
     iterations: 30
