@@ -65,7 +65,9 @@ def handle_bench_layer(args):
     results["Eager PyTorch"] = _bench_eager(block, x, pos_emb, args.warmup, args.iters)
 
     # --- torch.compile ---
-    results["torch.compile"] = _bench_compiled(block, x, pos_emb, args.warmup, args.iters)
+    compile_us = _bench_compiled(block, x, pos_emb, args.warmup, args.iters)
+    if compile_us is not None:
+        results["torch.compile"] = compile_us
 
     # --- Deplodock pipeline (our CUDA kernels) ---
     deplodock_us = _bench_deplodock(config, args.seq_len, args.batch, args.warmup, args.iters)
@@ -120,14 +122,13 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
 
     try:
         compiled = torch.compile(block, mode="reduce-overhead")
+        for _ in range(warmup + 5):
+            with torch.no_grad():
+                compiled(x, position_embeddings=pos_emb)
+        torch.cuda.synchronize()
     except Exception as e:
         logger.warning("torch.compile failed: %s", e)
-        return float("inf")
-
-    for _ in range(warmup + 5):
-        with torch.no_grad():
-            compiled(x, position_embeddings=pos_emb)
-    torch.cuda.synchronize()
+        return None
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
