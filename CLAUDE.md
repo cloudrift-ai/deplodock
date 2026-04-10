@@ -44,9 +44,9 @@ Or for a specific test file:
 - `deplodock trace <model> --layer N` — trace a transformer layer to Graph IR (JSON)
 - `deplodock compile <model_or_ir> [--layer N]` — run assembly passes (auto-pulls + traces if given a model ID)
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
-- `deplodock bench-layer <model> --layer N` — benchmark a layer across backends (eager, torch.compile, FlashAttention)
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 7B): `Qwen/Qwen2.5-7B`
+- Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`
 
 ## Key Make Targets
 
