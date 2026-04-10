@@ -26,7 +26,9 @@ Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLa
     - [trace.py](deplodock/commands/trace.py) — `trace` command (PyTorch → Graph IR)
     - [compile.py](deplodock/commands/compile.py) — `compile` command (assembly passes)
     - [inspect_graph.py](deplodock/commands/inspect_graph.py) — `inspect` command (graph summary)
-    - [bench_layer.py](deplodock/commands/bench_layer.py) — `bench-layer` command (layer benchmarking)
+  - [scripts/](scripts/) — Standalone benchmark scripts
+    - [bench_matmul.py](scripts/bench_matmul.py) — single matmul benchmark
+    - [bench_block.py](scripts/bench_block.py) — transformer block benchmark (eager vs torch.compile vs our CUDA pipeline)
   - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
   - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle

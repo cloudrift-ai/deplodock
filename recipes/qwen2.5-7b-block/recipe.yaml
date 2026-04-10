@@ -2,8 +2,8 @@
 # Compares: eager PyTorch, torch.compile, Deplodock CUDA pipeline, FlashAttention
 #
 # Usage:
-#   deplodock bench-layer Qwen/Qwen2.5-7B --layer 0 --seq-len 2048
-#   deplodock bench-layer Qwen/Qwen2.5-7B --layer 0 --seq-len 512 --dtype fp32
+#   python scripts/bench_block.py --model Qwen/Qwen2.5-7B --seq-len 2048
+#   python scripts/bench_block.py --model Qwen/Qwen2.5-7B --seq-len 512 --dtype fp32
 
 model: Qwen/Qwen2.5-7B
 layer: 0
