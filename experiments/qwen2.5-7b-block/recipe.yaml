@@ -9,7 +9,8 @@ command:
     export PATH=/usr/local/cuda/bin:$$PATH
     export DEPLODOCK_GIT_REV="$git_rev"
     cd $repo_dir
-    [ -d venv ] || make setup && ./venv/bin/pip install -e ".[compile]"
+    [ -d venv ] || make setup
+    ./venv/bin/python -c "import torch" 2>/dev/null || ./venv/bin/pip install -e ".[compile]"
     ./venv/bin/python scripts/bench_block.py \
       --model $hf_model \
       --seq-len $seq_len \
