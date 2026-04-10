@@ -172,7 +172,6 @@ def handle_bench(args):
             result = subprocess.run(
                 rendered,
                 shell=True,
-                cwd=str(run_dir),
                 timeout=recipe.aggregate.timeout,
             )
             if result.returncode != 0:
