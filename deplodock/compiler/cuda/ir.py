@@ -207,3 +207,41 @@ class KernelDef:
     batched: bool = False  # Batched GEMM: TMA descriptors are per-batch arrays
     extra_smem_bytes: int = 0  # Extra dynamic smem beyond standard double-buffer (e.g. for hybrid TF32 split scratch)
     min_blocks_per_sm: int = 0  # If >0, emit __launch_bounds__(threads, min_blocks_per_sm) to force occupancy
+
+
+# ---------------------------------------------------------------------------
+# Execution plan — multi-kernel block execution
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BufferAlloc:
+    """GPU buffer allocation for an intermediate tensor."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: str = "f32"
+
+
+@dataclass
+class KernelLaunch:
+    """One kernel invocation in the execution plan."""
+
+    kernel_name: str  # references a KernelDef.name
+    input_buffers: list[str]
+    output_buffers: list[str]
+    grid: tuple[int, int, int]
+    block: tuple[int, int, int]
+    smem_bytes: int = 0
+
+
+@dataclass
+class ExecutionPlan:
+    """Full block execution: kernels + buffers + ordered launches."""
+
+    kernels: list[KernelDef]
+    buffers: list[BufferAlloc]
+    launches: list[KernelLaunch]
+    input_names: list[str]
+    output_names: list[str]
+    constant_names: list[str]
