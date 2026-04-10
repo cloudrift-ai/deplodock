@@ -1,6 +1,7 @@
 """Unit tests for recipe dataclass types."""
 
 from deplodock.recipe import (
+    AggregateConfig,
     CommandConfig,
     DeployConfig,
     LLMConfig,
@@ -292,3 +293,33 @@ def test_from_dict_without_docker_options():
     d = {"model": {"huggingface": "org/model"}}
     recipe = Recipe.from_dict(d)
     assert recipe.engine.llm.docker_options == {}
+
+
+# ── AggregateConfig ──────────────────────────────────────────────
+
+
+def test_aggregate_config_defaults():
+    cfg = AggregateConfig()
+    assert cfg.run == ""
+    assert cfg.timeout == 300
+
+
+def test_from_dict_with_aggregate():
+    d = {
+        "command": {"run": "echo hi", "result_files": ["*.json"]},
+        "deploy": {"gpu": "NVIDIA GeForce RTX 5090"},
+        "aggregate": {
+            "run": "./venv/bin/python scripts/aggregate.py $run_dir",
+            "timeout": 60,
+        },
+    }
+    recipe = Recipe.from_dict(d)
+    assert recipe.aggregate is not None
+    assert "$run_dir" in recipe.aggregate.run
+    assert recipe.aggregate.timeout == 60
+
+
+def test_from_dict_without_aggregate():
+    d = {"model": {"huggingface": "org/model"}}
+    recipe = Recipe.from_dict(d)
+    assert recipe.aggregate is None

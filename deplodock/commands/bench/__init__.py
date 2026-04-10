@@ -7,8 +7,10 @@ ExecutionGroups that share VMs; groups run in parallel via asyncio.
 import asyncio
 import json
 import logging
+import subprocess
 import sys
 from pathlib import Path
+from string import Template
 
 from deplodock.benchmark import (
     _expand_path,
@@ -148,6 +150,35 @@ def handle_bench(args):
             instances_path.write_text(json.dumps(all_instance_infos, indent=2))
             root_logger.info(f"Instance info saved to: {instances_path}")
             root_logger.info("Run 'deplodock teardown <run_dir>' to clean up.")
+
+    # Run aggregate post-processing for recipes that define it
+    for recipe_dir_resolved, run_dir in recipe_run_dirs.items():
+        recipe = next(
+            (t.recipe for t in tasks if str(Path(t.recipe_dir).resolve()) == recipe_dir_resolved),
+            None,
+        )
+        if recipe is None or recipe.aggregate is None:
+            continue
+
+        subs = {"run_dir": str(run_dir)}
+        rendered = Template(recipe.aggregate.run).safe_substitute(subs)
+
+        if dry_run:
+            root_logger.info(f"[dry-run] aggregate: {rendered}")
+            continue
+
+        root_logger.info(f"Running aggregate for {Path(recipe_dir_resolved).name}...")
+        try:
+            result = subprocess.run(
+                rendered,
+                shell=True,
+                cwd=str(run_dir),
+                timeout=recipe.aggregate.timeout,
+            )
+            if result.returncode != 0:
+                root_logger.error(f"Aggregate failed (rc={result.returncode})")
+        except subprocess.TimeoutExpired:
+            root_logger.error(f"Aggregate timed out after {recipe.aggregate.timeout}s")
 
     # Print summary
     root_logger.info("")

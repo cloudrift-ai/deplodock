@@ -17,6 +17,7 @@ from deplodock.recipe.recipe import (
     validate_extra_args,
 )
 from deplodock.recipe.types import (
+    AggregateConfig,
     BenchmarkConfig,
     CommandConfig,
     DeployConfig,
@@ -29,6 +30,7 @@ from deplodock.recipe.types import (
 )
 
 __all__ = [
+    "AggregateConfig",
     "BenchmarkConfig",
     "CommandConfig",
     "DeployConfig",
