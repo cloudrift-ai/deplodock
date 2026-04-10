@@ -4,10 +4,15 @@
 import argparse
 
 from deplodock.commands.bench import register_bench_command
+from deplodock.commands.bench_layer import register_bench_layer_command
+from deplodock.commands.compile import register_compile_command
 from deplodock.commands.deploy.cloud import register_cloud_target
 from deplodock.commands.deploy.local import register_local_target
 from deplodock.commands.deploy.ssh import register_ssh_target
+from deplodock.commands.inspect_graph import register_inspect_command
+from deplodock.commands.pull import register_pull_command
 from deplodock.commands.teardown import register_teardown_command
+from deplodock.commands.trace import register_trace_command
 from deplodock.commands.vm import register_vm_command
 from deplodock.logging_setup import setup_cli_logging
 
@@ -28,6 +33,13 @@ def main():
     register_bench_command(subparsers)
     register_teardown_command(subparsers)
     register_vm_command(subparsers)
+
+    # compiler workflow commands
+    register_pull_command(subparsers)
+    register_trace_command(subparsers)
+    register_compile_command(subparsers)
+    register_inspect_command(subparsers)
+    register_bench_layer_command(subparsers)
 
     args = parser.parse_args()
     setup_cli_logging()

@@ -19,7 +19,7 @@ from deplodock.compiler.cuda.ir import (
     VarDecl,
 )
 from deplodock.compiler.ir import Graph
-from deplodock.compiler.ops import FusedReduceElementwiseOp
+from deplodock.compiler.ops import FusedReduceElementwiseOp, MatmulOp
 
 
 @dataclass
@@ -67,11 +67,13 @@ def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
         raise ValueError(f"Expected exactly 1 output, got {len(graph.outputs)}")
     out_node = graph.nodes[graph.outputs[0]]
 
-    if not isinstance(out_node.op, FusedReduceElementwiseOp):
-        raise ValueError(f"Expected FusedReduceElementwiseOp output, got {type(out_node.op).__name__}")
-
-    if out_node.op.reduce_fn != "sum" or out_node.op.elementwise_fn != "mul":
-        raise ValueError(f"Only sum/mul fusion supported, got {out_node.op.reduce_fn}/{out_node.op.elementwise_fn}")
+    if isinstance(out_node.op, MatmulOp):
+        pass  # MatmulOp is always sum/mul — proceed directly
+    elif isinstance(out_node.op, FusedReduceElementwiseOp):
+        if out_node.op.reduce_fn != "sum" or out_node.op.elementwise_fn != "mul":
+            raise ValueError(f"Only sum/mul fusion supported, got {out_node.op.reduce_fn}/{out_node.op.elementwise_fn}")
+    else:
+        raise ValueError(f"Expected MatmulOp or FusedReduceElementwiseOp output, got {type(out_node.op).__name__}")
 
     if len(out_node.inputs) != 2:
         raise ValueError(f"Expected 2 inputs, got {len(out_node.inputs)}")

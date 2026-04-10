@@ -9,9 +9,20 @@ from deplodock.compiler.cuda.lower import MatmulConfig, lower_graph
 from deplodock.compiler.cuda.runner import run_kernel
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.rewriter import Rewriter
-from deplodock.compiler.trace import CompilerTrace, ExecutionResult
+from deplodock.compiler.trace import CompilerTrace, ExecutionResult, PassTrace
 
 logger = logging.getLogger(__name__)
+
+
+def compile_graph(graph: Graph, rewriter: Rewriter) -> tuple[Graph, list[PassTrace]]:
+    """Run rewrite passes only, return optimized graph + traces.
+
+    This is the primary entry point for graph-level compilation without
+    CUDA lowering — useful for inspecting fusion results.
+    """
+    pass_traces: list[PassTrace] = []
+    graph = rewriter.apply(graph, pass_traces=pass_traces)
+    return graph, pass_traces
 
 
 def compile_and_run(

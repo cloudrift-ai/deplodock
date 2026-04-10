@@ -47,6 +47,14 @@ _OP_CLASS_MAP: dict[str, str] = {
     "Gather": "GatherOp",
     "Scatter": "ScatterOp",
     "FusedReduceElementwise": "FusedReduceElementwiseOp",
+    "Constant": "ConstantOp",
+    "Transpose": "TransposeOp",
+    "Reshape": "ReshapeOp",
+    "Matmul": "MatmulOp",
+    "FusedRMSNorm": "FusedRMSNormOp",
+    "FusedSoftmax": "FusedSoftmaxOp",
+    "FusedSiLUMul": "FusedSiLUMulOp",
+    "FusedAttention": "FusedAttentionOp",
 }
 
 # Field ordering per op class — maps positional constraints to field names.
@@ -57,6 +65,14 @@ _OP_FIELDS: dict[str, list[str]] = {
     "Gather": ["axis"],
     "Scatter": ["axis", "reduce_fn"],
     "FusedReduceElementwise": ["reduce_fn", "elementwise_fn", "axis"],
+    "Constant": ["name"],
+    "Transpose": ["axes"],
+    "Reshape": ["shape"],
+    "Matmul": [],
+    "FusedRMSNorm": ["eps"],
+    "FusedSoftmax": ["axis"],
+    "FusedSiLUMul": [],
+    "FusedAttention": ["num_heads", "head_dim", "scale"],
 }
 
 

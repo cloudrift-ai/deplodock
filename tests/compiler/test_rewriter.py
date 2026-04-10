@@ -3,8 +3,8 @@
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import (
     ElementwiseOp,
-    FusedReduceElementwiseOp,
     InputOp,
+    MatmulOp,
     ReduceOp,
 )
 from deplodock.compiler.pattern import parse_pattern
@@ -54,14 +54,12 @@ def test_fuse_reduce_elementwise():
     op_types = [type(n.op).__name__ for n in result.nodes.values()]
     assert "ElementwiseOp" not in op_types
     assert "ReduceOp" not in op_types
-    assert "FusedReduceElementwiseOp" in op_types
+    assert "MatmulOp" in op_types
 
     # The fused node should consume A and B directly.
-    fused_nodes = [n for n in result.nodes.values() if isinstance(n.op, FusedReduceElementwiseOp)]
+    fused_nodes = [n for n in result.nodes.values() if isinstance(n.op, MatmulOp)]
     assert len(fused_nodes) == 1
     fused = fused_nodes[0]
-    assert fused.op.reduce_fn == "sum"
-    assert fused.op.elementwise_fn == "mul"
     assert set(fused.inputs) == {"A", "B"}
 
 
@@ -74,7 +72,7 @@ def test_fused_graph_output_is_correct():
 
     assert len(result.outputs) == 1
     out_node = result.nodes[result.outputs[0]]
-    assert isinstance(out_node.op, FusedReduceElementwiseOp)
+    assert isinstance(out_node.op, MatmulOp)
 
 
 def test_fixed_point_no_change():

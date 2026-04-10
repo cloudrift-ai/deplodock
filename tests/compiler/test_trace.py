@@ -129,7 +129,7 @@ def test_rewriter_populates_trace():
 
     # graph_after should have the fused op, not the original.
     op_types = {n["op"] for n in pt.graph_after["nodes"].values()}
-    assert "FusedReduceElementwiseOp" in op_types
+    assert "MatmulOp" in op_types
     assert "ReduceOp" not in op_types
 
 

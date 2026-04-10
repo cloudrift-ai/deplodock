@@ -16,6 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
 plot = ["matplotlib"]
+compile = ["torch", "transformers"]
+# flash-attn requires torch at build time, install separately:
+#   pip install flash-attn --no-build-isolation
 dev = ["pytest", "pytest-asyncio", "ruff", "matplotlib"]
 
 [tool.setuptools.packages.find]

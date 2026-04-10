@@ -60,7 +60,7 @@ class Pass:
     @staticmethod
     def from_directory(path: Path) -> Pass:
         """Load all .py rule files from a directory, sorted by filename."""
-        rule_files = sorted(path.glob("*.py"))
+        rule_files = sorted(f for f in path.glob("*.py") if f.name != "__init__.py")
         rules = [Rule.from_file(f) for f in rule_files]
         return Pass(name=path.name, rules=rules)
 

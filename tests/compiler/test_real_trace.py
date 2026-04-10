@@ -1,0 +1,153 @@
+"""Tests against real ATen traces from TinyLlama (fixture-based, no torch needed)."""
+
+import json
+from pathlib import Path
+
+from deplodock.compiler.ir import Graph
+from deplodock.compiler.ops import (
+    ElementwiseOp,
+    ReduceOp,
+)
+from deplodock.compiler.rewriter import Rewriter
+
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
+
+
+def _load_fixture(name: str) -> Graph:
+    with open(FIXTURE_DIR / name) as f:
+        return Graph.from_dict(json.load(f))
+
+
+def _count_ops(graph: Graph) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for n in graph.nodes.values():
+        name = type(n.op).__name__
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _load_rewriter() -> Rewriter:
+    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+    return Rewriter.from_directory(rules_dir)
+
+
+# ---- Structure tests (no compilation) ----
+
+
+def test_tinyllama_fixture_loads():
+    """The TinyLlama layer0 fixture loads as a valid graph."""
+    g = _load_fixture("tinyllama_layer0.json")
+    assert len(g.nodes) > 0
+    assert len(g.inputs) > 0
+    assert len(g.outputs) > 0
+
+
+def test_tinyllama_has_expected_ops():
+    """The traced graph has the expected op types from torch.export."""
+    g = _load_fixture("tinyllama_layer0.json")
+    ops = _count_ops(g)
+
+    # torch.export produces these for a Llama block.
+    assert ops.get("ConstantOp", 0) == 9  # 7 weight matrices + 2 layernorm weights
+    assert ops.get("InputOp", 0) == 3  # hidden_states + cos + sin
+    assert ops.get("ElementwiseOp", 0) > 0
+    assert ops.get("ReduceOp", 0) > 0
+
+
+def test_tinyllama_has_7_linear_patterns():
+    """The graph should have 7 linear projections (Q, K, V, O, gate, up, down).
+
+    Each linear decomposes to Elementwise{mul} + Reduce{sum}, so we expect
+    7 Reduce{sum} ops that sit on top of Elementwise{mul} ops.
+    """
+    g = _load_fixture("tinyllama_layer0.json")
+
+    # Count Reduce{sum} nodes whose input is Elementwise{mul}.
+    matmul_count = 0
+    for n in g.nodes.values():
+        if isinstance(n.op, ReduceOp) and n.op.fn == "sum":
+            inp_node = g.nodes.get(n.inputs[0])
+            if inp_node and isinstance(inp_node.op, ElementwiseOp) and inp_node.op.fn == "mul":
+                matmul_count += 1
+
+    assert matmul_count == 7, f"Expected 7 linear projections, found {matmul_count}"
+
+
+def test_tinyllama_has_sdpa():
+    """torch.export keeps scaled_dot_product_attention as a single op."""
+    g = _load_fixture("tinyllama_layer0.json")
+
+    sdpa_count = sum(1 for n in g.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.fn == "sdpa")
+    assert sdpa_count == 1
+
+
+def test_tinyllama_has_silu():
+    """torch.export keeps silu as a single op (not decomposed)."""
+    g = _load_fixture("tinyllama_layer0.json")
+
+    silu_count = sum(1 for n in g.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.fn == "silu")
+    assert silu_count == 1
+
+
+# ---- Compilation tests ----
+
+
+def test_tinyllama_compile_fuses_matmuls():
+    """Compiling the real trace should fuse 7 linear projections into MatmulOp."""
+    g = _load_fixture("tinyllama_layer0.json")
+    rewriter = _load_rewriter()
+    compiled = rewriter.apply(g)
+
+    ops = _count_ops(compiled)
+    assert ops.get("MatmulOp", 0) == 7, f"Expected 7 MatmulOp, got {ops}"
+
+
+def test_tinyllama_compile_reduces_node_count():
+    """Compilation should reduce the total node count."""
+    g = _load_fixture("tinyllama_layer0.json")
+    initial = len(g.nodes)
+
+    rewriter = _load_rewriter()
+    compiled = rewriter.apply(g)
+
+    assert len(compiled.nodes) < initial, f"Expected fewer nodes: {len(compiled.nodes)} >= {initial}"
+
+
+def test_tinyllama_compile_preserves_io():
+    """Compilation should preserve input/output count."""
+    g = _load_fixture("tinyllama_layer0.json")
+
+    rewriter = _load_rewriter()
+    compiled = rewriter.apply(g)
+
+    assert len(compiled.inputs) == len(g.inputs)
+    assert len(compiled.outputs) == len(g.outputs)
+
+
+def test_tinyllama_compile_no_reduce_sum_left():
+    """After compilation, no Reduce{sum} should remain (all fused into MatmulOp)."""
+    g = _load_fixture("tinyllama_layer0.json")
+    rewriter = _load_rewriter()
+    compiled = rewriter.apply(g)
+
+    reduce_sum_count = sum(1 for n in compiled.nodes.values() if isinstance(n.op, ReduceOp) and n.op.fn == "sum")
+    # The only remaining ReduceOp{sum} should be from mean (RMSNorm), not from matmul.
+    # torch.export decomposes mean as sum+div, but in this trace mean is kept as ReduceOp{sum}.
+    # After matmul fusion: 9 total ReduceOp{sum} - 7 matmuls = 2 remaining (RMSNorm mean).
+    assert reduce_sum_count == 2, f"Expected 2 Reduce{{sum}} (RMSNorm), got {reduce_sum_count}"
+
+
+def test_tinyllama_roundtrip_serialization():
+    """Load fixture → compile → serialize → deserialize → same ops."""
+    g = _load_fixture("tinyllama_layer0.json")
+    rewriter = _load_rewriter()
+    compiled = rewriter.apply(g)
+
+    # Serialize and deserialize.
+    data = compiled.to_dict()
+    reloaded = Graph.from_dict(data)
+
+    assert len(reloaded.nodes) == len(compiled.nodes)
+    assert _count_ops(reloaded) == _count_ops(compiled)
+    assert reloaded.inputs == compiled.inputs
+    assert reloaded.outputs == compiled.outputs

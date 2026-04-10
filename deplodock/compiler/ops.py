@@ -58,3 +58,67 @@ class FusedReduceElementwiseOp(Op):
     reduce_fn: str  # "sum", "max", "prod"
     elementwise_fn: str  # "mul", "add", ...
     axis: int | str
+
+
+# ---------------------------------------------------------------------------
+# Structural ops (for lowering from PyTorch)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConstantOp(Op):
+    """Fixed tensor: weights, RoPE tables, scalars. Not an activation."""
+
+    name: str
+
+
+@dataclass
+class TransposeOp(Op):
+    """Permute dimensions."""
+
+    axes: tuple[int, ...]
+
+
+@dataclass
+class ReshapeOp(Op):
+    """Reshape tensor without changing data."""
+
+    shape: tuple[int | str, ...]
+
+
+# ---------------------------------------------------------------------------
+# Fused ops (assembly targets)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MatmulOp(Op):
+    """Matrix multiply — fused Reduce{sum}(Elementwise{mul})."""
+
+
+@dataclass
+class FusedRMSNormOp(Op):
+    """Fused RMS normalization: rsqrt(mean(x^2) + eps) * x * weight."""
+
+    eps: float
+
+
+@dataclass
+class FusedSoftmaxOp(Op):
+    """Fused online softmax along an axis."""
+
+    axis: int | str
+
+
+@dataclass
+class FusedSiLUMulOp(Op):
+    """Fused SiLU activation with elementwise multiply: silu(gate) * up."""
+
+
+@dataclass
+class FusedAttentionOp(Op):
+    """Flash attention: Q @ K^T -> scale -> softmax -> @ V."""
+
+    num_heads: int
+    head_dim: int
+    scale: float
