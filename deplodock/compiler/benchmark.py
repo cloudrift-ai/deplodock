@@ -26,20 +26,6 @@ MATRIX_SIZES = [
     {"M": 16384, "N": 16384, "K": 16384},
 ]
 
-MATRIX_SIZES_EXTENDED = MATRIX_SIZES + [
-    # Non-rectangular
-    {"M": 1024, "N": 512, "K": 1024},
-    {"M": 2048, "N": 768, "K": 2048},
-    {"M": 512, "N": 2048, "K": 512},
-    # Non-power-of-2
-    {"M": 1000, "N": 1000, "K": 1000},
-    {"M": 1500, "N": 1500, "K": 1500},
-    {"M": 3000, "N": 3000, "K": 3000},
-    # Odd sizes (stress boundary handling)
-    {"M": 1001, "N": 1001, "K": 1001},
-    {"M": 1023, "N": 1023, "K": 1023},
-]
-
 
 @dataclass
 class BenchmarkSuite:
