@@ -15,6 +15,6 @@ engine:
         SGLANG_ENABLE_JIT_DEEPGEMM: 0
 
 matrices:
-  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
-    deploy.gpu_count: 8
-    engine.llm.context_length: 262144
+  deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+  deploy.gpu_count: 8
+  engine.llm.context_length: 262144

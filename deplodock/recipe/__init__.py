@@ -4,7 +4,8 @@ from deplodock.recipe.engines import banned_extra_arg_flags, build_engine_args
 from deplodock.recipe.matrix import (
     build_override,
     dot_to_nested,
-    expand_matrix_entry,
+    expand_matrix,
+    filter_combinations,
 )
 from deplodock.recipe.recipe import (
     _load_raw_config,
@@ -44,7 +45,8 @@ __all__ = [
     "build_override",
     "deep_merge",
     "dot_to_nested",
-    "expand_matrix_entry",
+    "expand_matrix",
+    "filter_combinations",
     "load_recipe",
     "resolve_for_hardware",
     "validate_docker_options",

@@ -1,4 +1,18 @@
-"""Matrix expansion: broadcast + zip semantics for benchmark parameter sweeps."""
+"""Matrix expansion: cross-product and zip combinators for benchmark parameter sweeps.
+
+A matrix spec is a dict that can contain:
+- Scalar values: broadcast to all combinations
+- List values: in cross mode, each is an independent axis (cartesian product);
+  in zip mode, all must be same length and are paired element-wise
+- ``cross`` key (dict value): nested cross-product combinator
+- ``zip`` key (dict value): nested zip combinator
+
+The ``cross``/``zip`` keys are only treated as combinators when their value is
+a dict.  A scalar or list value for those keys is treated as a regular parameter.
+"""
+
+import itertools
+from fnmatch import fnmatch
 
 
 def dot_to_nested(key: str, value) -> dict:
@@ -16,41 +30,113 @@ def dot_to_nested(key: str, value) -> dict:
     return result
 
 
-def expand_matrix_entry(entry: dict) -> list[dict]:
-    """Expand one matrix entry using broadcast + zip semantics.
+def _expand_cross(node: dict) -> list[dict]:
+    """Expand a cross-product node.
 
-    Scalars are broadcast to all runs. Lists are zipped together (all lists
-    in one entry must have the same length). Returns a list of flat dicts
-    mapping dot-notation keys to scalar values (one dict per run).
+    Scalars are broadcast.  Lists become independent axes whose cartesian
+    product is computed.  Nested ``zip``/``cross`` sub-dicts are recursed and
+    their result becomes one axis.
     """
-    scalar_keys = {}
-    list_keys = {}
+    broadcast: dict = {}
+    axes: list[list[dict]] = []
 
-    for key, value in entry.items():
-        if isinstance(value, list):
-            list_keys[key] = value
+    for key, value in node.items():
+        if key == "cross" and isinstance(value, dict):
+            axes.append(_expand_cross(value))
+        elif key == "zip" and isinstance(value, dict):
+            axes.append(_expand_zip(value))
+        elif isinstance(value, list):
+            axes.append([{key: v} for v in value])
         else:
-            scalar_keys[key] = value
+            broadcast[key] = value
 
-    if not list_keys:
-        return [dict(scalar_keys)]
+    if not axes:
+        return [dict(broadcast)]
 
-    # Validate all lists have the same length
-    lengths = {k: len(v) for k, v in list_keys.items()}
-    unique_lengths = set(lengths.values())
-    if len(unique_lengths) != 1:
-        detail = ", ".join(f"{k}={n}" for k, n in lengths.items())
-        raise ValueError(f"All lists in a matrix entry must have the same length, got: {detail}")
+    combinations = []
+    for product_tuple in itertools.product(*axes):
+        combo = dict(broadcast)
+        for d in product_tuple:
+            combo.update(d)
+        combinations.append(combo)
+    return combinations
 
-    n = unique_lengths.pop()
+
+def _expand_zip(node: dict) -> list[dict]:
+    """Expand a zip node.
+
+    Scalars are broadcast.  Lists are zipped element-wise (must all have the
+    same length).  Nested ``cross``/``zip`` sub-dicts are recursed and their
+    result becomes one zip axis.
+    """
+    broadcast: dict = {}
+    axes: list[list[dict]] = []
+
+    for key, value in node.items():
+        if key == "cross" and isinstance(value, dict):
+            axes.append(_expand_cross(value))
+        elif key == "zip" and isinstance(value, dict):
+            axes.append(_expand_zip(value))
+        elif isinstance(value, list):
+            axes.append([{key: v} for v in value])
+        else:
+            broadcast[key] = value
+
+    if not axes:
+        return [dict(broadcast)]
+
+    lengths = [len(a) for a in axes]
+    if len(set(lengths)) != 1:
+        detail = ", ".join(f"axis {i} len={n}" for i, n in enumerate(lengths))
+        raise ValueError(f"All axes in a zip node must have the same length, got: {detail}")
+
+    n = lengths[0]
     combinations = []
     for i in range(n):
-        combo = dict(scalar_keys)
-        for key, values in list_keys.items():
-            combo[key] = values[i]
+        combo = dict(broadcast)
+        for axis in axes:
+            combo.update(axis[i])
         combinations.append(combo)
-
     return combinations
+
+
+def expand_matrix(matrices) -> list[dict]:
+    """Expand a matrices spec into a flat list of parameter combinations.
+
+    Accepts:
+    - A dict with a top-level ``cross`` key (dict value) → cross-product
+    - A dict with a top-level ``zip`` key (dict value) → zip
+    - A plain dict (no cross/zip) → implicit zip
+    - A list of dicts → legacy experiment format (each entry is an implicit
+      zip, results are concatenated)
+    """
+    if isinstance(matrices, list):
+        # Legacy experiment snapshot format
+        result = []
+        for entry in matrices:
+            result.extend(_expand_zip(entry))
+        return result
+
+    if not isinstance(matrices, dict):
+        raise TypeError(f"matrices must be a dict or list, got {type(matrices).__name__}")
+
+    if "cross" in matrices and isinstance(matrices["cross"], dict):
+        return _expand_cross(matrices["cross"])
+    if "zip" in matrices and isinstance(matrices["zip"], dict):
+        return _expand_zip(matrices["zip"])
+    return _expand_zip(matrices)
+
+
+def filter_combinations(
+    combinations: list[dict],
+    filters: list[tuple[str, str]],
+) -> list[dict]:
+    """Filter combinations by key=glob_pattern pairs (AND logic)."""
+    result = []
+    for combo in combinations:
+        if all(fnmatch(str(combo.get(key, "")), pattern) for key, pattern in filters):
+            result.append(combo)
+    return result
 
 
 def build_override(combination: dict) -> dict:

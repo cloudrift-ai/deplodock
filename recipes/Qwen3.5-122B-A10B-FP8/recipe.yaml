@@ -12,6 +12,6 @@ engine:
       extra_args: "--enable-prefix-caching --language-model-only --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3"
 
 matrices:
-  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
-    deploy.gpu_count: 8
-    engine.llm.context_length: 262144
+  deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+  deploy.gpu_count: 8
+  engine.llm.context_length: 262144

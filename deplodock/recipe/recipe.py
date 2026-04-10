@@ -112,7 +112,7 @@ def load_recipe(recipe_dir):
 def resolve_for_hardware(recipe_dir: str, gpu_name: str, gpu_count: int | None = None) -> "Recipe":
     """Load recipe and resolve the best matrix entry for the given hardware.
 
-    Matching priority (scalar entries only, sweeps with lists are skipped):
+    Expands the full matrix (cross/zip), then picks the best match:
     1. Exact match: deploy.gpu == gpu_name AND deploy.gpu_count == gpu_count
     2. Divisible match: deploy.gpu == gpu_name AND gpu_count is a multiple of
        the entry's deploy.gpu_count (for scale-out). Picks the largest entry
@@ -122,7 +122,7 @@ def resolve_for_hardware(recipe_dir: str, gpu_name: str, gpu_count: int | None =
     If no matrices section exists, returns the base recipe.
     Raises ValueError if no match is found.
     """
-    from deplodock.recipe.matrix import build_override
+    from deplodock.recipe.matrix import build_override, expand_matrix
 
     config = _load_raw_config(recipe_dir)
     matrices = config.pop("matrices", None)
@@ -130,18 +130,17 @@ def resolve_for_hardware(recipe_dir: str, gpu_name: str, gpu_count: int | None =
     if not matrices:
         return _validate_and_build(config)
 
-    # Collect scalar entries matching gpu_name
+    combinations = expand_matrix(matrices)
+
+    # Collect combinations matching gpu_name
     available_gpus = set()
     candidates = []
-    for entry in matrices:
-        gpu = entry.get("deploy.gpu")
+    for combo in combinations:
+        gpu = combo.get("deploy.gpu")
         if gpu is not None:
             available_gpus.add(gpu)
-        if gpu != gpu_name:
-            continue
-        if any(isinstance(v, list) for v in entry.values()):
-            continue
-        candidates.append(entry)
+        if gpu == gpu_name:
+            candidates.append(combo)
 
     if not candidates:
         raise ValueError(f"No matrix entry matches GPU '{gpu_name}'. Available GPUs: {', '.join(sorted(available_gpus))}")
@@ -153,10 +152,10 @@ def resolve_for_hardware(recipe_dir: str, gpu_name: str, gpu_count: int | None =
         return _validate_and_build(merged)
 
     # Try exact count match first
-    for entry in candidates:
-        entry_count = entry.get("deploy.gpu_count", 1)
+    for combo in candidates:
+        entry_count = combo.get("deploy.gpu_count", 1)
         if entry_count == gpu_count:
-            override = build_override(entry)
+            override = build_override(combo)
             merged = deep_merge(config, override)
             return _validate_and_build(merged)
 
@@ -164,10 +163,10 @@ def resolve_for_hardware(recipe_dir: str, gpu_name: str, gpu_count: int | None =
     # Pick largest entry count that divides evenly.
     best = None
     best_count = 0
-    for entry in candidates:
-        entry_count = entry.get("deploy.gpu_count", 1)
+    for combo in candidates:
+        entry_count = combo.get("deploy.gpu_count", 1)
         if gpu_count % entry_count == 0 and entry_count > best_count:
-            best = entry
+            best = combo
             best_count = entry_count
 
     if best is not None:
@@ -175,5 +174,5 @@ def resolve_for_hardware(recipe_dir: str, gpu_name: str, gpu_count: int | None =
         merged = deep_merge(config, override)
         return _validate_and_build(merged)
 
-    entry_counts = sorted({e.get("deploy.gpu_count", 1) for e in candidates})
+    entry_counts = sorted({c.get("deploy.gpu_count", 1) for c in candidates})
     raise ValueError(f"No matrix entry for GPU '{gpu_name}' matches gpu_count={gpu_count}. Available counts: {entry_counts}")

@@ -46,8 +46,19 @@ def handle_bench(args):
     ssh_targets = list(getattr(args, "ssh", None) or [])
     fixed_host_mode = use_local or bool(ssh_targets)
 
+    # Parse --filter flags
+    parsed_filters = None
+    if args.filters:
+        parsed_filters = []
+        for f in args.filters:
+            if "=" not in f:
+                root_logger.error(f"Invalid filter format: {f!r} (expected KEY=PATTERN)")
+                sys.exit(1)
+            key, pattern = f.split("=", 1)
+            parsed_filters.append((key, pattern))
+
     # Enumerate tasks from recipe dirs
-    tasks = enumerate_tasks(args.recipes)
+    tasks = enumerate_tasks(args.recipes, filters=parsed_filters)
     if not tasks:
         root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
@@ -226,5 +237,13 @@ def register_bench_command(subparsers):
         "--billing-exempt",
         action="store_true",
         help="Skip billing for CloudRift instances (admin-only)",
+    )
+    parser.add_argument(
+        "--filter",
+        action="append",
+        default=None,
+        dest="filters",
+        metavar="KEY=PATTERN",
+        help="Filter variants by parameter value (fnmatch glob, repeatable, AND logic)",
     )
     parser.set_defaults(func=handle_bench)
