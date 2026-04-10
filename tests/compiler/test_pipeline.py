@@ -79,8 +79,8 @@ def test_pipeline_end_to_end():
     assert len(trace.passes) == 1
     assert trace.passes[0].name == "fusion"
     assert len(trace.passes[0].rules_applied) == 1
-    assert trace.cuda_kernel is not None
-    assert "__global__" in trace.cuda_kernel
+    assert trace.generated_code is not None
+    assert "__global__" in trace.generated_code
 
     # Check execution results.
     assert trace.execution is not None
@@ -94,4 +94,4 @@ def test_pipeline_end_to_end():
     j = trace.to_json()
     parsed = json.loads(j)
     assert parsed["execution"]["correct"] is True
-    assert "cuda_kernel" in parsed
+    assert "generated_code" in parsed

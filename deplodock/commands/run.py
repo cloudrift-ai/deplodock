@@ -81,8 +81,8 @@ def _handle_matmul(args):
 
 
 def _handle_block(args):
-    from deplodock.compiler.cuda.block_lower import BlockConfig, lower_block
-    from deplodock.compiler.cuda.program import benchmark_program, run_program
+    from deplodock.compiler.block_planner import BlockConfig, plan_block
+    from deplodock.compiler.cuda.backend import CudaBackend
 
     num_kv_heads = args.num_kv_heads or args.num_heads
     head_dim = args.head_dim or (args.hidden_dim // args.num_heads)
@@ -98,7 +98,9 @@ def _handle_block(args):
         intermediate_dim=intermediate_dim,
     )
 
-    program = lower_block(cfg)
+    plan = plan_block(cfg)
+    backend = CudaBackend()
+    program = backend.compile(plan)
 
     logger.info(
         "Block: hidden=%d heads=%d kv_heads=%d seq=%d batch=%d",
@@ -110,9 +112,9 @@ def _handle_block(args):
     )
 
     if args.benchmark:
-        result = benchmark_program(program, num_iters=args.iters)
+        result = backend.benchmark(program, num_iters=args.iters)
         logger.info("Time: %.3f ms (%d launches)", result.time_ms, result.num_launches)
     else:
-        result = run_program(program)
+        result = backend.run(program)
         output = result.outputs.get("output", [])
         logger.info("Output: %d elements, first 5: %s", len(output), output[:5])

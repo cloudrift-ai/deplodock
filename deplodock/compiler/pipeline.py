@@ -25,7 +25,7 @@ def compile_graph(graph: Graph, rewriter: Rewriter) -> tuple[Graph, list[PassTra
     return graph, pass_traces
 
 
-def compile_and_run(
+def compile_and_run(  # noqa: D417 — CUDA-specific legacy function
     graph: Graph,
     rewriter: Rewriter,
     inputs: dict[str, list[float]],
@@ -71,7 +71,7 @@ def compile_and_run(
     # --- Codegen ---
     try:
         source = emit_kernel(kernel)
-        trace.cuda_kernel = source
+        trace.generated_code = source
     except Exception as e:
         trace.error = f"Codegen failed: {e}"
         return trace
