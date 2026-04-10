@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.cuda.ir import (
+from deplodock.compiler.backend.cuda.ir import (
     ArrayAccess,
     Assign,
     AugAssign,
@@ -18,7 +18,7 @@ from deplodock.compiler.cuda.ir import (
     Var,
     VarDecl,
 )
-from deplodock.compiler.cuda.program import Buffer, Launch, Program
+from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.ops import FusedReduceElementwiseOp, MatmulOp
 
@@ -108,7 +108,7 @@ def lower_matmul_to_program(
         config: Matmul configuration (strategy, tile sizes, etc.).
         dims: Dimension values (M, N, K) for concrete grid computation.
     """
-    from deplodock.compiler.cuda.codegen import emit_kernel
+    from deplodock.compiler.backend.cuda.codegen import emit_kernel
 
     kernel_def = lower_graph(graph, config)
     kernel_source = emit_kernel(kernel_def)
@@ -258,7 +258,7 @@ def _lower_matmul_tma_db(graph, out_node, config):
     b_name = input_b.output.name
     c_name = out_node.output.name
 
-    from deplodock.compiler.cuda.ir import RawCode
+    from deplodock.compiler.backend.cuda.ir import RawCode
 
     bk = config.block_k if config.block_k >= 16 else 32
     tm = config.thread_m if config.thread_m > 1 else 8
@@ -432,7 +432,7 @@ def _lower_matmul_tma_db_tf32(graph, out_node, config):
 
     import os as _os
 
-    from deplodock.compiler.cuda.ir import RawCode
+    from deplodock.compiler.backend.cuda.ir import RawCode
 
     # Defaults found by sweep at 8192: 128x64x8 + min_blocks=2 hits ~51.5 TFLOPS
     # at 96.4% tensor pipe util. Bottleneck is long_scoreboard stalls (62%) =
@@ -604,7 +604,7 @@ def _lower_matmul_tma_db_fma_tf32(graph, out_node, config):
 
     import os as _os
 
-    from deplodock.compiler.cuda.ir import RawCode
+    from deplodock.compiler.backend.cuda.ir import RawCode
 
     # Hybrid layout. Defaults tuned across the (size, batch) sweep matrix:
     # 4 FFMA + 4 TF32 warps, tm=24, bk=32, tf32_frag_rows=1.

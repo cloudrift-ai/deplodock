@@ -1,6 +1,6 @@
 """Minimal tensor IR and graph transformation engine."""
 
-from deplodock.compiler.cuda.lower import MatmulConfig
+from deplodock.compiler.backend.cuda.lower import MatmulConfig
 from deplodock.compiler.ir import Graph, Node, Tensor
 from deplodock.compiler.matcher import Match, match_pattern
 from deplodock.compiler.ops import (

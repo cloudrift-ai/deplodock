@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from deplodock.compiler.cuda.runner import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 from deplodock.compiler.pipeline import compile_and_run

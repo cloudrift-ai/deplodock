@@ -66,7 +66,8 @@ are non-obvious.
 
 ### Module Structure
 
-- `__init__.py` files contain only re-exports. No classes, functions, or business logic.
+- `__init__.py` files contain only re-exports. No classes, functions, interfaces, or business logic.
+- ABCs and interfaces go in explicitly named files (e.g., `backend/base.py`, not `backend/__init__.py`).
 - Business logic goes in named modules (e.g., `recipe.py`, `compose.py`).
 - `commands/` layer: CLI code only (argparse registration + `handle_*` handlers). Reusable logic lives in top-level domain packages (`deplodock/deploy/`, `deplodock/provisioning/`, `deplodock/benchmark/`).
 

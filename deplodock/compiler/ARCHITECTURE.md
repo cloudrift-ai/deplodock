@@ -116,29 +116,31 @@ compiler/
 │   └── fusion/       #      RMSNorm, matmul, softmax, SiLU+mul
 ├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan
 ├── block_planner.py  # [L3] plan_block(BlockConfig) → ExecutionPlan
-├── backend.py        # [L3] Backend ABC (compile, run, benchmark)
 ├── trace.py          # [L2] CompilerTrace for AI-in-the-loop
 ├── pipeline.py       # [L4*] compile_graph (L2) + compile_and_run (legacy CUDA)
-└── cuda/             # [L4] CUDA backend
-    ├── backend.py    #      CudaBackend implements Backend ABC
-    ├── program.py    #      Buffer, Launch, Program — compile + run
-    ├── kernels/      #      .cu template files + load_kernel()
-    │   ├── __init__.py
-    │   ├── rmsnorm.cu
-    │   ├── activation.cu
-    │   ├── rope.cu
-    │   ├── attention_qk.cu
-    │   ├── attention_softmax.cu
-    │   ├── attention_sv.cu
-    │   ├── matmul_naive.cu
-    │   ├── matmul_residual_add.cu
-    │   ├── matmul_triple.cu
-    │   └── matmul_dual_silu_mul.cu
-    ├── ir.py         #      CUDA imperative AST (KernelDef, Expr, Stmt)
-    ├── codegen.py    #      KernelDef → CUDA C source
-    ├── lower.py      #      Graph → KernelDef (SGEMM strategies + TMA)
-    ├── runner.py     #      Legacy single-kernel compile + run + benchmark
-    └── tuning.py     #      Per-GPU empirical tuning profiles
+├── backend/          # [L3+L4] Backend abstraction + implementations
+│   ├── __init__.py   #      Re-exports from base.py
+│   ├── base.py       # [L3] Backend ABC, ProgramResult, BenchmarkResult
+│   └── cuda/         # [L4] CUDA backend
+│       ├── backend.py    #  CudaBackend implements Backend ABC
+│       ├── program.py    #  Buffer, Launch, Program — compile + run
+│       ├── kernels/      #  .cu template files + load_kernel()
+│       │   ├── __init__.py
+│       │   ├── rmsnorm.cu
+│       │   ├── activation.cu
+│       │   ├── rope.cu
+│       │   ├── attention_qk.cu
+│       │   ├── attention_softmax.cu
+│       │   ├── attention_sv.cu
+│       │   ├── matmul_naive.cu
+│       │   ├── matmul_residual_add.cu
+│       │   ├── matmul_triple.cu
+│       │   └── matmul_dual_silu_mul.cu
+│       ├── ir.py         #  CUDA imperative AST (KernelDef, Expr, Stmt)
+│       ├── codegen.py    #  KernelDef → CUDA C source
+│       ├── lower.py      #  Graph → KernelDef (SGEMM strategies + TMA)
+│       ├── runner.py     #  Legacy single-kernel compile + run + benchmark
+│       └── tuning.py     #  Per-GPU empirical tuning profiles
 ```
 
 `*` — `pipeline.py` has CUDA imports (legacy). New code should use the Backend ABC instead.

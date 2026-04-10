@@ -38,10 +38,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO))
 
-from deplodock.compiler.cuda.codegen import emit_kernel  # noqa: E402
-from deplodock.compiler.cuda.lower import lower_graph  # noqa: E402
-from deplodock.compiler.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
-from deplodock.compiler.cuda.tuning import default_matmul_strategy_map  # noqa: E402
+from deplodock.compiler.backend.cuda.codegen import emit_kernel  # noqa: E402
+from deplodock.compiler.backend.cuda.lower import lower_graph  # noqa: E402
+from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
+from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
 from deplodock.compiler.ir import Graph, Tensor  # noqa: E402
 from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp  # noqa: E402
 from deplodock.compiler.rewriter import Rewriter  # noqa: E402
