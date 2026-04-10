@@ -10,7 +10,7 @@ from pathlib import Path
 
 from deplodock.compiler.cuda.codegen import emit_kernel
 from deplodock.compiler.cuda.lower import MatmulConfig, lower_graph
-from deplodock.compiler.cuda.runner import BenchmarkResult, run_benchmark
+from deplodock.compiler.cuda.runner import MatmulBenchmarkResult, run_benchmark
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.rewriter import Rewriter
 
@@ -34,7 +34,7 @@ class BenchmarkSuite:
     timestamp: str
     strategy: str
     config: dict
-    results: list[BenchmarkResult] = field(default_factory=list)
+    results: list[MatmulBenchmarkResult] = field(default_factory=list)
     generated_code: str = ""
     error: str | None = None
     description: str = ""
