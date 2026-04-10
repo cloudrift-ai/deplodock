@@ -51,7 +51,10 @@ def main():
     backends = [b.strip() for b in args.backends.split(",")]
 
     logger.info("Loading %s...", args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype).to(device)
+    # Load model on CPU first, then move only the target layer to GPU.
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
+    config = model.config
+    hidden_size = config.hidden_size
 
     layers = model.model.layers
     if args.layer >= len(layers):
@@ -59,8 +62,12 @@ def main():
         sys.exit(1)
 
     block = layers[args.layer].to(device)
-    config = model.config
-    hidden_size = config.hidden_size
+    # Build rotary embeddings on CPU, then move to device.
+    rotary_emb = model.model.rotary_emb
+    # Free the rest of the model to save GPU memory.
+    del model.model.layers
+    del model
+    torch.cuda.empty_cache()
 
     logger.info(
         "%s layer %d | seq_len=%d batch=%d dtype=%s | hidden=%d heads=%d",
@@ -76,7 +83,7 @@ def main():
     # Build inputs.
     x = torch.randn(args.batch, args.seq_len, hidden_size, dtype=dtype, device=device)
     position_ids = torch.arange(args.seq_len, device=device).unsqueeze(0)
-    cos, sin = model.model.rotary_emb(x, position_ids)
+    cos, sin = rotary_emb(x.cpu(), position_ids.cpu())
     pos_emb = (cos.to(device), sin.to(device))
 
     results: dict[str, float] = {}
