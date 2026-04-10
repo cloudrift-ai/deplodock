@@ -90,15 +90,34 @@ Rules are numbered to control ordering. Earlier rules match longer chains to pre
 
 ## Data Flow
 
+Single matmul:
 ```
-Graph → matcher.match_pattern(graph, pattern) → list[Match]
-Match → rule.rewrite(graph, match) → Graph (modified)
-Graph → Pass.apply(graph) → Graph (fixed point)
-Graph → Rewriter.apply(graph) → Graph (all passes)
+Graph → Rewriter.apply(graph) → Graph (fused)
 Graph → cuda.lower_graph(graph) → KernelDef
 KernelDef → cuda.emit_kernel(kernel) → CUDA C source
 source → cuda.run_kernel(...) → list[float] output
 ```
+
+Full transformer block (7 fused kernels, 10 launches):
+```
+BlockConfig → block_lower.lower_block(cfg) → ExecutionPlan
+ExecutionPlan → block_runner.generate_block_source(cfg) → .cu file
+.cu → nvcc → binary → run → timing + output
+```
+
+### Block Kernel Inventory
+
+| # | Kernel | What it fuses |
+|---|--------|---------------|
+| 1 | FusedRMSNorm | pow→mean→rsqrt→mul→scale |
+| 2 | TripleMatmul | Q/K/V projections sharing input read |
+| 3 | FusedRoPE | rotary position embeddings for Q and K |
+| 4 | NaiveAttention (3 launches) | QK^T→scale→softmax→scores@V |
+| 5 | MatmulResidualAdd + FusedRMSNorm | Wo matmul + residual + norm |
+| 6 | DualMatmulSiLUMul | gate+up matmuls + silu(gate)*up in registers |
+| 7 | MatmulResidualAdd | Wd matmul + residual add |
+
+Attention materializes the N×N scores matrix (naive). This is the explicit seam where flash attention would replace it.
 
 ## CUDA Backend
 
