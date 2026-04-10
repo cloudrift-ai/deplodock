@@ -1,23 +1,9 @@
-"""Fused RMSNorm kernel: warp-parallel row reduction + rsqrt + scale."""
-
-from __future__ import annotations
-
-
-def fused_rmsnorm_source(name: str = "fused_rmsnorm") -> str:
-    """Generate CUDA source for fused RMSNorm kernel.
-
-    One block per row. Warp-parallel sum of x², warp shuffle for row total,
-    rsqrt(mean + eps), write x[i] * rsqrt_val * weight[i].
-
-    Params: x (input), weight, out, rows, dim, eps.
-    """
-    return f"""
-__global__ void {name}(
+__global__ void __KERNEL_NAME__(
     const float* __restrict__ x,
     const float* __restrict__ weight,
     float* __restrict__ out,
     int rows, int dim, float eps
-) {{
+) {
     int row = blockIdx.x;
     if (row >= rows) return;
 
@@ -26,10 +12,10 @@ __global__ void {name}(
 
     // Phase 1: compute sum of squares (parallel reduction).
     float local_ss = 0.0f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {{
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float v = row_x[i];
         local_ss += v * v;
-    }}
+    }
 
     // Warp-level reduction.
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
@@ -59,5 +45,4 @@ __global__ void {name}(
     // Phase 2: write normalized + scaled output.
     for (int i = threadIdx.x; i < dim; i += blockDim.x)
         row_out[i] = row_x[i] * scale * weight[i];
-}}
-"""
+}
