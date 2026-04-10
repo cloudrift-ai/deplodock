@@ -227,61 +227,38 @@ def test_matmul_larger():
 
 @requires_cuda
 def test_run_benchmark_surfaces_cuda_oom():
-    """Bench harness must NOT silently report 0.000 ms when the launch fails.
+    """run_benchmark raises RuntimeError when the kernel launch OOMs.
 
-    Regression for the bug where requesting an enormous matmul (here 65536^2 with
-    batch=8 ≈ 100 GB of FP32) would OOM at allocation time, the runner would
-    catch the failure inside the generated bench binary, and the Python wrapper
-    would happily produce a row with kernel_time_ms=0 and infinite GFLOPS.
-
-    With the new `cudaPeekAtLastError()` checks the bench binary exits non-zero
-    and `run_benchmark` raises `RuntimeError`. This test asserts that path.
+    Regression: requesting an enormous matmul (65536^2 × batch=8 ≈ 384 GB)
+    OOMs at allocation time. The bench binary must exit non-zero and
+    run_benchmark must raise, not silently report 0 ms.
     """
+    import dataclasses
 
-    from deplodock.compiler.benchmark import (
-        run_adaptive_benchmark_suite,
-    )
+    from deplodock.compiler.cuda.codegen import emit_kernel
+    from deplodock.compiler.cuda.lower import lower_graph
+    from deplodock.compiler.cuda.runner import run_benchmark
     from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
-    from deplodock.compiler.ir import Graph as _Graph
-    from deplodock.compiler.ir import Tensor as _Tensor
-    from deplodock.compiler.ops import (
-        FusedReduceElementwiseOp as _FRE,
-    )
-    from deplodock.compiler.ops import (
-        InputOp as _Input,
-    )
-    from deplodock.compiler.rewriter import Rewriter as _Rewriter
 
-    g = _Graph()
-    a = g.add_node(_Input(), [], _Tensor("A", ("M", "K")))
-    b = g.add_node(_Input(), [], _Tensor("B", ("K", "N")))
-    c = g.add_node(_FRE("sum", "mul", 1), [a, b], _Tensor("C", ("M", "N")))
+    # Build a pre-fused matmul graph (symbolic dims).
+    from deplodock.compiler.ops import FusedReduceElementwiseOp
+
+    g = Graph()
+    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", ("M", "K")), node_id="A")
+    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", ("K", "N")), node_id="B")
     g.inputs = [a, b]
+    c = g.add_node(op=FusedReduceElementwiseOp("sum", "mul", 1), inputs=[a, b], output=Tensor("C", ("M", "N")), node_id="C")
     g.outputs = [c]
 
     strategy_map, _ = default_matmul_strategy_map()
-    # Pick a size that's guaranteed to OOM on any consumer GPU: 65536^2 FP32
-    # is 16 GB per matrix; ×3 matrices ×8 batches = 384 GB.
-    huge = [{"M": 65536, "N": 65536, "K": 65536}]
-    import dataclasses
+    cfg = dataclasses.replace(strategy_map[0][1], batch_count=8, k_splits=1)
+    kernel = lower_graph(g, config=cfg)
+    source = emit_kernel(kernel)
 
-    huge_map = [(t, dataclasses.replace(c, batch_count=8, k_splits=1)) for t, c in strategy_map]
+    huge = {"M": 65536, "N": 65536, "K": 65536, "batch": 8}
 
-    suite = run_adaptive_benchmark_suite(
-        graph=g,
-        rewriter=_Rewriter(),
-        strategy_map=huge_map,
-        sizes=huge,
-        num_iterations=2,
-        description="oom regression",
-    )
-    # The runner should record an error rather than producing a "successful"
-    # 0.000 ms row.
-    assert suite.error is not None, (
-        f"Expected the OOM to surface as suite.error, but got results: {[(r.dimensions, r.kernel_time_ms) for r in suite.results]}"
-    )
-    # And no successful row should have been recorded.
-    assert all(r.kernel_time_ms > 0 for r in suite.results), "Bench produced a 0-ms row — cudaGetLastError check is not working"
+    with pytest.raises(RuntimeError):
+        run_benchmark(kernel=kernel, kernel_source=source, dim_args=huge, num_iterations=2)
 
 
 # All matmul lowering strategies that the dispatcher in lower_graph() recognizes.
