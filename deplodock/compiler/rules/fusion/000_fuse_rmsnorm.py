@@ -1,19 +1,37 @@
-"""Fuse RMSNorm chain: (x * rsqrt(sum(x*x) * inv_n + eps)) * weight → FusedRMSNormOp."""
+"""Fuse RMSNorm chain into FusedRMSNormOp.
+
+Matches two forms:
+  (a) (x * rsqrt(sum(x*x) + eps)) * weight       — torch.export form (mean = sum, no inv_n)
+  (b) (x * rsqrt(sum(x*x) * inv_n + eps)) * weight — hand-built form (explicit inv_n)
+"""
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import Match
 from deplodock.compiler.ops import FusedRMSNormOp
 
+# After decomposition, pow(x,2) becomes mul(x,x).
+# After matmul rule, self-mul(x,x) + reduce_sum becomes FusedReduceElementwise{sum,mul}.
+# Match both orderings of the outer multiply (weight * norm or norm * weight).
 PATTERN = (
+    "Elementwise{mul}("
+    "  $w,"
+    "  Elementwise{mul}("
+    "    $x,"
+    "    Elementwise{rsqrt}("
+    "      Elementwise{add}("
+    "        FusedReduceElementwise{sum, mul, $ax}($x, $x),"
+    "        $eps"
+    "      )"
+    "    )"
+    "  )"
+    ")"
+    " | "
     "Elementwise{mul}("
     "  Elementwise{mul}("
     "    $x,"
     "    Elementwise{rsqrt}("
     "      Elementwise{add}("
-    "        Elementwise{mul}("
-    "          Reduce{sum, $ax}(Elementwise{mul}($x, $x)),"
-    "          $inv_n"
-    "        ),"
+    "        FusedReduceElementwise{sum, mul, $ax}($x, $x),"
     "        $eps"
     "      )"
     "    )"
@@ -43,7 +61,7 @@ def rewrite(graph: Graph, match: Match) -> Graph:
 
     g.replace_node(match.root_node_id, fused_id)
 
-    # Remove consumed nodes (walk the chain, remove if no other consumers).
+    # Remove consumed nodes.
     _remove_chain(g, match.root_node_id, keep={x_id, w_id, match.bindings.get("inv_n", ""), match.bindings.get("eps", "")})
 
     return g
