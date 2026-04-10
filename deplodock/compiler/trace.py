@@ -79,7 +79,7 @@ class CompilerTrace:
 
     input_graph: dict | None = None
     passes: list[PassTrace] = field(default_factory=list)
-    cuda_kernel: str | None = None
+    generated_code: str | None = None
     execution: ExecutionResult | None = None
     error: str | None = None
 
@@ -88,8 +88,8 @@ class CompilerTrace:
         if self.input_graph is not None:
             d["input_graph"] = self.input_graph
         d["passes"] = [p.to_dict() for p in self.passes]
-        if self.cuda_kernel is not None:
-            d["cuda_kernel"] = self.cuda_kernel
+        if self.generated_code is not None:
+            d["generated_code"] = self.generated_code
         if self.execution is not None:
             d["execution"] = self.execution.to_dict()
         if self.error is not None:

@@ -80,7 +80,7 @@ def test_trace_round_trip():
                 graph_after={"nodes": {}},
             )
         ],
-        cuda_kernel="__global__ void test() {}",
+        generated_code="__global__ void test() {}",
         execution=ExecutionResult(
             output=[1.0, 2.0],
             expected=[1.0, 2.0],
@@ -95,7 +95,7 @@ def test_trace_round_trip():
 
     assert parsed["passes"][0]["pass"] == "fusion"
     assert parsed["passes"][0]["rules_applied"][0]["rule"] == "001_fuse"
-    assert parsed["cuda_kernel"] == "__global__ void test() {}"
+    assert parsed["generated_code"] == "__global__ void test() {}"
     assert parsed["execution"]["correct"] is True
     assert parsed["execution"]["kernel_time_ms"] == 0.042
 

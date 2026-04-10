@@ -49,7 +49,7 @@ class BenchmarkSuite:
     strategy: str
     config: dict
     results: list[BenchmarkResult] = field(default_factory=list)
-    cuda_kernel: str = ""
+    generated_code: str = ""
     error: str | None = None
     description: str = ""
     system_info: dict[str, str] = field(default_factory=dict)
@@ -60,7 +60,7 @@ class BenchmarkSuite:
             "strategy": self.strategy,
             "config": self.config,
             "description": self.description,
-            "cuda_kernel": self.cuda_kernel,
+            "generated_code": self.generated_code,
             "results": [asdict(r) for r in self.results],
             "system_info": self.system_info,
             "error": self.error,
@@ -119,7 +119,7 @@ def run_benchmark_suite(
         # Lower to CUDA IR.
         kernel = lower_graph(optimized, config=config)
         source = emit_kernel(kernel)
-        suite.cuda_kernel = source
+        suite.generated_code = source
 
         logger.info("Generated kernel for strategy=%s", config.strategy)
         logger.info("Kernel source:\n%s", source)
@@ -239,7 +239,7 @@ def run_adaptive_benchmark_suite(
                 )
 
             kernel, source, cfg = kernels[id(selected)]
-            suite.cuda_kernel = source  # Last kernel used.
+            suite.generated_code = source  # Last kernel used.
 
             # Add k_splits/batch to dim_args if configured
             run_dim_args = dim_args

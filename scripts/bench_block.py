@@ -168,8 +168,8 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
 
 
 def _bench_deplodock(config, seq_len, batch):
-    from deplodock.compiler.cuda.block_lower import BlockConfig, lower_block
-    from deplodock.compiler.cuda.program import benchmark_program
+    from deplodock.compiler.block_planner import BlockConfig, plan_block
+    from deplodock.compiler.cuda.backend import CudaBackend
 
     try:
         num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
@@ -185,8 +185,10 @@ def _bench_deplodock(config, seq_len, batch):
             head_dim=head_dim,
             intermediate_dim=intermediate,
         )
-        program = lower_block(cfg)
-        result = benchmark_program(program, warmup=3, num_iters=10)
+        plan = plan_block(cfg)
+        backend = CudaBackend()
+        program = backend.compile(plan)
+        result = backend.benchmark(program, warmup=3, num_iters=10)
         return result.time_ms * 1000  # ms → us
     except Exception as e:
         logger.warning("Deplodock pipeline failed: %s", e)
