@@ -2,9 +2,9 @@
 
 import pytest
 
-from deplodock.compiler.cuda.lower import MatmulConfig, lower_matmul_to_program
-from deplodock.compiler.cuda.program import benchmark_program, generate_source, run_program
-from deplodock.compiler.cuda.runner import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_matmul_to_program
+from deplodock.compiler.backend.cuda.program import benchmark_program, generate_source, run_program
+from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 

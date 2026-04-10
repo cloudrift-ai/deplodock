@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
+from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 
 
 def test_pro6000_dispatch():

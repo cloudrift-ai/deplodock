@@ -42,8 +42,8 @@ def _parse_size(size_str: str) -> dict[str, int]:
 
 
 def _handle_matmul(args):
-    from deplodock.compiler.cuda.lower import MatmulConfig, lower_matmul_to_program
-    from deplodock.compiler.cuda.program import benchmark_program, run_program
+    from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_matmul_to_program
+    from deplodock.compiler.backend.cuda.program import benchmark_program, run_program
     from deplodock.compiler.ir import Graph, Tensor
     from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
     from deplodock.compiler.rewriter import Rewriter
@@ -81,8 +81,8 @@ def _handle_matmul(args):
 
 
 def _handle_block(args):
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.block_planner import BlockConfig, plan_block
-    from deplodock.compiler.cuda.backend import CudaBackend
 
     num_kv_heads = args.num_kv_heads or args.num_heads
     head_dim = args.head_dim or (args.hidden_dim // args.num_heads)

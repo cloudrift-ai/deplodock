@@ -25,10 +25,10 @@ from pathlib import Path
 # Add project root to path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deplodock.compiler.cuda.codegen import emit_kernel
-from deplodock.compiler.cuda.lower import MatmulConfig, lower_graph
-from deplodock.compiler.cuda.runner import MatmulBenchmarkResult, run_benchmark
-from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
+from deplodock.compiler.backend.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_graph
+from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_benchmark
+from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp
 from deplodock.compiler.rewriter import Rewriter

@@ -21,7 +21,7 @@ import logging
 import re
 import subprocess
 
-from deplodock.compiler.cuda.lower import MatmulConfig
+from deplodock.compiler.backend.cuda.lower import MatmulConfig
 
 logger = logging.getLogger(__name__)
 

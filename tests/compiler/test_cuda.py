@@ -2,8 +2,8 @@
 
 import pytest
 
-from deplodock.compiler.cuda.codegen import emit_kernel
-from deplodock.compiler.cuda.ir import (
+from deplodock.compiler.backend.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.cuda.ir import (
     AugAssign,
     BinOp,
     CudaBuiltin,
@@ -15,8 +15,8 @@ from deplodock.compiler.cuda.ir import (
     Var,
     VarDecl,
 )
-from deplodock.compiler.cuda.lower import lower_graph
-from deplodock.compiler.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
+from deplodock.compiler.backend.cuda.lower import lower_graph
+from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 from deplodock.compiler.rewriter import Pass, Rule
@@ -235,10 +235,10 @@ def test_run_benchmark_surfaces_cuda_oom():
     """
     import dataclasses
 
-    from deplodock.compiler.cuda.codegen import emit_kernel
-    from deplodock.compiler.cuda.lower import lower_graph
-    from deplodock.compiler.cuda.runner import run_benchmark
-    from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
+    from deplodock.compiler.backend.cuda.codegen import emit_kernel
+    from deplodock.compiler.backend.cuda.lower import lower_graph
+    from deplodock.compiler.backend.cuda.runner import run_benchmark
+    from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 
     # Build a pre-fused matmul graph (symbolic dims).
     from deplodock.compiler.ops import FusedReduceElementwiseOp
@@ -280,7 +280,7 @@ def test_lower_every_strategy(strategy_name, overrides):
     Pure lowering — no nvcc, no GPU. Catches dispatcher / template errors after
     refactors like the `block_m`/`block_n` → `threads_y`/`threads_x` rename.
     """
-    from deplodock.compiler.cuda.lower import MatmulConfig
+    from deplodock.compiler.backend.cuda.lower import MatmulConfig
 
     # Use a size that's a multiple of common tile factors so any per-strategy
     # divisibility assertion passes.
@@ -312,7 +312,7 @@ def test_run_every_strategy_correctness(strategy_name, overrides):
     setup that the lightweight `run_kernel` helper doesn't perform — it's
     covered separately by the bench harness in `run_benchmark`.
     """
-    from deplodock.compiler.cuda.lower import MatmulConfig
+    from deplodock.compiler.backend.cuda.lower import MatmulConfig
 
     M, K, N = 32, 32, 32
     g = _make_matmul_graph(M, K, N)
@@ -338,8 +338,8 @@ def test_run_every_strategy_correctness(strategy_name, overrides):
 @requires_cuda
 def test_run_tma_db_strategy_via_bench():
     """TMA needs the bench harness's TMA descriptor setup; verify it via run_benchmark."""
-    from deplodock.compiler.cuda.lower import MatmulConfig
-    from deplodock.compiler.cuda.runner import run_benchmark
+    from deplodock.compiler.backend.cuda.lower import MatmulConfig
+    from deplodock.compiler.backend.cuda.runner import run_benchmark
 
     cfg = MatmulConfig(strategy="tma_db", block_k=32, thread_m=8)
     M = N = K = 256  # multiple of TMA tile (224x128 → use 256 to keep things simple)

@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from deplodock.compiler.cuda.ir import KernelDef
+from deplodock.compiler.backend.cuda.ir import KernelDef
 
 logger = logging.getLogger(__name__)
 

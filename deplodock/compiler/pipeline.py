@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.cuda.codegen import emit_kernel
-from deplodock.compiler.cuda.lower import MatmulConfig, lower_graph
-from deplodock.compiler.cuda.runner import run_kernel
+from deplodock.compiler.backend.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_graph
+from deplodock.compiler.backend.cuda.runner import run_kernel
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.rewriter import Rewriter
 from deplodock.compiler.trace import CompilerTrace, ExecutionResult, PassTrace

@@ -2,7 +2,7 @@
 
 import pytest
 
-from deplodock.compiler.cuda.program import (
+from deplodock.compiler.backend.cuda.program import (
     Buffer,
     Launch,
     Program,
@@ -10,7 +10,7 @@ from deplodock.compiler.cuda.program import (
     generate_source,
     run_program,
 )
-from deplodock.compiler.cuda.runner import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),

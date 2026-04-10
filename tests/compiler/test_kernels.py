@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from deplodock.compiler.cuda.kernels import (
+from deplodock.compiler.backend.cuda.kernels import (
     dual_matmul_silu_mul_source,
     fused_rmsnorm_source,
     fused_rope_source,
@@ -15,7 +15,7 @@ from deplodock.compiler.cuda.kernels import (
     naive_attention_sv_source,
     triple_matmul_source,
 )
-from deplodock.compiler.cuda.runner import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),

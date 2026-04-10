@@ -9,8 +9,8 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, ProgramResult
-from deplodock.compiler.cuda.kernels import load_kernel
-from deplodock.compiler.cuda.program import Buffer, Launch, Program, benchmark_program, run_program
+from deplodock.compiler.backend.cuda.kernels import load_kernel
+from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program, benchmark_program, run_program
 from deplodock.compiler.plan import ExecutionPlan, OpKernel
 
 # Instance counter for unique kernel names when the same op appears multiple times.

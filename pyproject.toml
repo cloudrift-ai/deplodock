@@ -25,7 +25,7 @@ dev = ["pytest", "pytest-asyncio", "ruff", "matplotlib"]
 include = ["deplodock*"]
 
 [tool.setuptools.package-data]
-"deplodock.compiler.cuda.kernels" = ["*.cu"]
+"deplodock.compiler.backend.cuda.kernels" = ["*.cu"]
 
 [project.scripts]
 deplodock = "deplodock.deplodock:main"
@@ -41,7 +41,7 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-"deplodock/compiler/cuda/lower.py" = ["E501"]  # Generated CUDA code has long inline PTX strings
+"deplodock/compiler/backend/cuda/lower.py" = ["E501"]  # Generated CUDA code has long inline PTX strings
 
 [tool.ruff.format]
 quote-style = "double"

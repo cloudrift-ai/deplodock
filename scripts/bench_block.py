@@ -168,8 +168,8 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
 
 
 def _bench_deplodock(config, seq_len, batch):
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.block_planner import BlockConfig, plan_block
-    from deplodock.compiler.cuda.backend import CudaBackend
 
     try:
         num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
