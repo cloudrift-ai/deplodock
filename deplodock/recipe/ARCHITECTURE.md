@@ -185,6 +185,19 @@ The `run` template uses `string.Template` `$var` syntax. Substitution variables 
 
 Command recipes skip `validate_extra_args()` since they don't go through engine flag mapping.
 
+### Aggregate Post-Processing
+
+A recipe may optionally declare an `aggregate` block that runs **locally on the orchestrator** after all variants complete. This is useful for combining per-variant results into comparison tables or summary reports.
+
+```yaml
+aggregate:
+  run: |
+    ./venv/bin/python scripts/aggregate_sgemm.py $run_dir --output $run_dir/report.md
+  timeout: 60
+```
+
+The `run` template receives `$run_dir` — the local directory containing all pulled-back result files. It runs via `subprocess.run(shell=True)` on the machine executing `deplodock bench`, not on a GPU VM. `AggregateConfig` has two fields: `run` (template) and `timeout` (default 300s).
+
 ### Docker Options
 
 `docker_options` is a `dict[str, Any]` on `LLMConfig` that injects arbitrary docker-compose service-level keys into the generated container definition. It defaults to an empty dict. Unlike `extra_env` and `extra_args`, which are engine-specific and live on `VllmConfig`/`SglangConfig`, `docker_options` lives directly on `LLMConfig` because Docker container options (security, capabilities, ulimits) are tied to GPU hardware, not the inference engine.

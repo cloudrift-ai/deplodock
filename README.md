@@ -233,6 +233,19 @@ The `run` template uses `string.Template` `$var` syntax. Substitution variables 
 
 Staging uses `git ls-files --cached --others --exclude-standard <paths>` so unversioned edits ride along without a commit, while gitignored files are excluded. Each pulled result file lands in the run directory as `{variant}_{basename}`.
 
+### Aggregate Post-Processing
+
+A recipe may optionally declare an `aggregate` block that runs locally after all variants complete. Useful for combining per-variant results into comparison tables.
+
+```yaml
+aggregate:
+  run: |
+    ./venv/bin/python scripts/aggregate.py $run_dir --output $run_dir/report.md
+  timeout: 60
+```
+
+The `run` template receives `$run_dir` (the local directory with all result files). It runs on the orchestrator machine, not on a GPU VM.
+
 ## Experiments
 
 Experiments are self-contained parameter sweeps that live in `experiments/`. Each experiment directory contains a `recipe.yaml` and stores its results alongside it. The directory structure follows `experiments/{model_name}/{experiment_name}/`.

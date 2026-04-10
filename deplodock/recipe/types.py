@@ -139,6 +139,18 @@ class CommandConfig:
 
 
 @dataclass
+class AggregateConfig:
+    """Post-processing step that runs locally after all variants complete.
+
+    The ``run`` template receives ``$run_dir`` (the local directory containing
+    all pulled-back result files). Runs on the orchestrator, not on a GPU VM.
+    """
+
+    run: str = ""
+    timeout: int = 300
+
+
+@dataclass
 class DeployConfig:
     """Optional deploy section — GPU info for cloud provisioning."""
 
@@ -157,6 +169,7 @@ class Recipe:
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
     deploy: DeployConfig = field(default_factory=DeployConfig)
     command: CommandConfig | None = None
+    aggregate: AggregateConfig | None = None
 
     @property
     def kind(self) -> str:
@@ -217,12 +230,21 @@ class Recipe:
                 env=dict(cmd_dict.get("env", {})),
             )
 
+        aggregate = None
+        agg_dict = d.get("aggregate")
+        if agg_dict is not None:
+            aggregate = AggregateConfig(
+                run=agg_dict.get("run", ""),
+                timeout=agg_dict.get("timeout", 300),
+            )
+
         return cls(
             model=model,
             engine=EngineConfig(llm=llm),
             benchmark=benchmark,
             deploy=deploy,
             command=command,
+            aggregate=aggregate,
         )
 
     @property

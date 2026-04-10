@@ -52,6 +52,7 @@ class BenchmarkSuite:
     cuda_kernel: str = ""
     error: str | None = None
     description: str = ""
+    system_info: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -61,6 +62,7 @@ class BenchmarkSuite:
             "description": self.description,
             "cuda_kernel": self.cuda_kernel,
             "results": [asdict(r) for r in self.results],
+            "system_info": self.system_info,
             "error": self.error,
         }
 
@@ -92,6 +94,7 @@ def run_benchmark_suite(
     description: str = "",
     num_iterations: int = 10,
     cublas_math_mode: str = "default",
+    system_info: dict[str, str] | None = None,
 ) -> BenchmarkSuite:
     """Benchmark a matmul config across multiple matrix sizes.
 
@@ -106,6 +109,7 @@ def run_benchmark_suite(
         strategy=config.strategy,
         config=asdict(config) if hasattr(config, "__dataclass_fields__") else {},
         description=description,
+        system_info=system_info or {},
     )
 
     try:
@@ -181,6 +185,7 @@ def run_adaptive_benchmark_suite(
     description: str = "",
     num_iterations: int = 10,
     cublas_math_mode: str = "default",
+    system_info: dict[str, str] | None = None,
 ) -> BenchmarkSuite:
     """Benchmark with size-adaptive strategy selection.
 
@@ -196,6 +201,7 @@ def run_adaptive_benchmark_suite(
         strategy="adaptive",
         config={"strategy_map": [(t, asdict(c)) for t, c in strategy_map]},
         description=description,
+        system_info=system_info or {},
     )
 
     try:

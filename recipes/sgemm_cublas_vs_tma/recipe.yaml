@@ -12,31 +12,18 @@ command:
     [ -d venv ] || make setup
     ./venv/bin/python scripts/bench_matmul.py \
       --strategy $strategy \
-      --sizes $sizes \
-      --batches $batches \
+      --size $size \
+      --batch $batch \
       --iterations $iterations \
       --output-dir $task_dir
-    # Capture diagnostic dumps so the article's external claims (cuBLAS kernel
-    # name, batched dispatch comparison) are reproducible from this run.
-    mkdir -p $task_dir/diagnostics
-    bash scripts/diagnostics/dump_cublas_kernels.sh \
-        > $task_dir/diagnostics/cublas_kernels.txt 2>&1 || true
-    arch="sm_$$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')"
-    nvcc -O3 --fmad=true -arch=$$arch -lcublas -lcurand \
-        -o /tmp/cublas_loop_vs_strided \
-        scripts/diagnostics/cublas_loop_vs_strided.cu 2>/dev/null && {
-        for batch in 4 16; do
-            /tmp/cublas_loop_vs_strided 1024 $$batch \
-                > $task_dir/diagnostics/cublas_loop_vs_strided_1024xb$$batch.txt 2>&1 || true
-        done
-    }
-    ./venv/bin/python scripts/diagnostics/sass_analysis.py 8192 \
-        > $task_dir/diagnostics/sass_analysis_8192.md 2>&1 || true
   result_files:
     - "*.json"
-    - "*.md"
-    - "diagnostics/*"
-  timeout: 1800
+  timeout: 300
+
+aggregate:
+  run: |
+    ./venv/bin/python scripts/aggregate_sgemm.py $run_dir --output $run_dir/report.md
+  timeout: 60
 
 matrices:
   cross:
@@ -49,7 +36,6 @@ matrices:
       - "NVIDIA GeForce RTX 5090"
       - "NVIDIA H200 141GB"
       - "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
-    zip:
-      sizes:      ["1024,2048,4096,8192,16384", "256,512,1024,2048,4096,8192"]
-      batches:    ["1",                          "4,8,16"]
-      iterations: [30,                           20]
+    size: [256, 512, 1024, 2048, 4096, 8192]
+    batch: [1, 4, 8, 16]
+    iterations: 30
