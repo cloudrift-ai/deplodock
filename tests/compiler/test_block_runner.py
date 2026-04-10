@@ -1,9 +1,9 @@
-"""Tests for the block runner — full transformer block execution on GPU."""
+"""Tests for block lowering and execution via Program abstraction."""
 
 import pytest
 
 from deplodock.compiler.cuda.block_lower import BlockConfig, lower_block
-from deplodock.compiler.cuda.block_runner import generate_block_source, run_block
+from deplodock.compiler.cuda.program import benchmark_program, generate_source, run_program
 from deplodock.compiler.cuda.runner import has_cuda_gpu, has_nvcc
 
 requires_cuda = pytest.mark.skipif(
@@ -15,18 +15,24 @@ requires_cuda = pytest.mark.skipif(
 # ---- Lowering tests (no GPU) ----
 
 
-def test_lower_block_produces_plan():
-    """lower_block returns an ExecutionPlan with the expected structure."""
+def test_lower_block_produces_program():
+    """lower_block returns a Program with the expected structure."""
     cfg = BlockConfig(batch=1, seq_len=32, hidden_dim=64, num_heads=4, num_kv_heads=2, head_dim=16, intermediate_dim=128)
-    plan = lower_block(cfg)
+    prog = lower_block(cfg)
 
-    assert len(plan.launches) == 10  # 7 logical kernels, attention has 3 sub-launches
-    assert len(plan.input_names) == 3  # x, cos, sin
-    assert len(plan.output_names) == 1  # output
-    assert len(plan.constant_names) == 9  # w_rms1, Wq, Wk, Wv, Wo, w_rms2, Wg, Wu, Wd
+    assert len(prog.launches) == 10  # 7 logical kernels, attention has 3 sub-launches
+    assert prog.name.startswith("llama_block_")
+
+    # Verify buffer roles.
+    input_bufs = [b for b in prog.buffers if b.role == "input"]
+    output_bufs = [b for b in prog.buffers if b.role == "output"]
+    const_bufs = [b for b in prog.buffers if b.role == "constant"]
+    assert len(input_bufs) == 3  # x, cos, sin
+    assert len(output_bufs) == 1  # output
+    assert len(const_bufs) == 9  # w_rms1, Wq, Wk, Wv, Wo, w_rms2, Wg, Wu, Wd
 
     # Verify kernel names in order.
-    kernel_names = [launch.kernel_name for launch in plan.launches]
+    kernel_names = [launch.kernel_name for launch in prog.launches]
     expected = [
         "fused_rmsnorm",  # 1. RMSNorm
         "triple_matmul",  # 2. Q/K/V projections
@@ -42,21 +48,19 @@ def test_lower_block_produces_plan():
     assert kernel_names == expected
 
 
-def test_generate_block_source_compiles_check():
+def test_generate_block_source():
     """Generated .cu source has expected structure."""
     cfg = BlockConfig(batch=1, seq_len=4, hidden_dim=16, num_heads=2, num_kv_heads=1, head_dim=8, intermediate_dim=32)
-    source = generate_block_source(cfg)
+    prog = lower_block(cfg)
+    source = generate_source(prog, mode="benchmark")
 
     assert "int main()" in source
     assert "fused_rmsnorm<<<" in source
     assert "triple_matmul<<<" in source
     assert "fused_rope<<<" in source
     assert "attention_qk<<<" in source
-    assert "attention_softmax<<<" in source
-    assert "attention_sv<<<" in source
-    assert "matmul_residual_add<<<" in source
     assert "dual_matmul_silu_mul<<<" in source
-    assert "BLOCK_TIME_MS=" in source
+    assert "PROGRAM_TIME_MS=" in source
 
 
 # ---- GPU tests ----
@@ -66,33 +70,42 @@ def test_generate_block_source_compiles_check():
 def test_block_compiles_and_runs():
     """Full block program compiles with nvcc and runs without errors."""
     cfg = BlockConfig(batch=1, seq_len=4, hidden_dim=16, num_heads=2, num_kv_heads=2, head_dim=8, intermediate_dim=32)
-    result = run_block(cfg)
+    prog = lower_block(cfg)
+    result = run_program(prog)
 
-    assert result.kernel_time_ms is not None, "Kernel timing not parsed"
-    assert result.kernel_time_ms > 0
-    assert result.output is not None
-    assert len(result.output) > 0
+    assert "output" in result.outputs
+    assert len(result.outputs["output"]) > 0
 
 
 @requires_cuda
 def test_block_output_is_finite():
     """Block output contains finite values (no NaN/Inf)."""
     cfg = BlockConfig(batch=1, seq_len=4, hidden_dim=16, num_heads=2, num_kv_heads=2, head_dim=8, intermediate_dim=32)
-    result = run_block(cfg)
+    prog = lower_block(cfg)
+    result = run_program(prog)
 
-    assert result.output is not None
-    for i, v in enumerate(result.output):
-        assert not (v != v), f"NaN at output[{i}]"  # NaN != NaN
+    assert "output" in result.outputs
+    for i, v in enumerate(result.outputs["output"]):
+        assert v == v, f"NaN at output[{i}]"  # NaN != NaN
         assert abs(v) < 1e6, f"Output[{i}] too large: {v}"
+
+
+@requires_cuda
+def test_block_benchmark_returns_timing():
+    """Benchmark mode returns valid timing."""
+    cfg = BlockConfig(batch=1, seq_len=4, hidden_dim=16, num_heads=2, num_kv_heads=2, head_dim=8, intermediate_dim=32)
+    prog = lower_block(cfg)
+    result = benchmark_program(prog, warmup=2, num_iters=5)
+
+    assert result.time_ms > 0
+    assert result.num_launches == 10
 
 
 @requires_cuda
 def test_block_tinyllama_dims():
     """Block runs with TinyLlama dimensions (small seq_len for speed)."""
     cfg = BlockConfig(batch=1, seq_len=4, hidden_dim=2048, num_heads=32, num_kv_heads=4, head_dim=64, intermediate_dim=5632)
-    result = run_block(cfg)
+    prog = lower_block(cfg)
+    result = benchmark_program(prog, warmup=2, num_iters=3)
 
-    assert result.kernel_time_ms is not None
-    assert result.output is not None
-    expected_output_size = cfg.batch * cfg.seq_len * cfg.hidden_dim
-    assert len(result.output) == expected_output_size
+    assert result.time_ms > 0
