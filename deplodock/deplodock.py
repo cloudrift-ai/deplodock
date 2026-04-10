@@ -10,6 +10,7 @@ from deplodock.commands.deploy.local import register_local_target
 from deplodock.commands.deploy.ssh import register_ssh_target
 from deplodock.commands.inspect_graph import register_inspect_command
 from deplodock.commands.pull import register_pull_command
+from deplodock.commands.run import register_run_command
 from deplodock.commands.teardown import register_teardown_command
 from deplodock.commands.trace import register_trace_command
 from deplodock.commands.vm import register_vm_command
@@ -38,6 +39,7 @@ def main():
     register_trace_command(subparsers)
     register_compile_command(subparsers)
     register_inspect_command(subparsers)
+    register_run_command(subparsers)
 
     args = parser.parse_args()
     setup_cli_logging()
