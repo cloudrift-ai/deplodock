@@ -113,3 +113,18 @@ class FusedAttentionOp(Op):
     num_heads: int
     head_dim: int
     scale: float
+
+
+@dataclass
+class FusedRegionOp(Op):
+    """A fused region of primitive ops with a generated kernel.
+
+    Produced by auto_fuse(). Contains the original subgraph of primitive
+    ops (for the kernel generator to walk) and the generated CUDA source
+    (filled in after kernel generation).
+    """
+
+    region_ops: list  # [(node_id, op, input_ids), ...] — primitive ops in topo order
+    input_names: list  # external inputs to this region
+    output_names: list  # external outputs from this region
+    kernel_source: str = ""  # generated CUDA source (filled by kernel_gen)
