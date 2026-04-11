@@ -100,13 +100,7 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
         outputs = [out_name]
         params: dict[str, int | float | str] = {}
 
-        if isinstance(op, ops_module.MatmulOp):
-            tag = "matmul"
-            a_shape = graph.nodes[inputs[0]].output.shape if inputs and inputs[0] in graph.nodes else ()
-            params["M"] = _prod(shape[:-1]) if len(shape) > 1 else (shape[0] if shape else 1)
-            params["N"] = shape[-1] if shape else 1
-            params["K"] = a_shape[-1] if a_shape else 1
-        elif isinstance(op, ops_module.ElementwiseOp):
+        if isinstance(op, ops_module.ElementwiseOp):
             tag = f"elementwise_{op.fn}"
         elif isinstance(op, ops_module.ReduceOp):
             tag = f"reduce_{op.fn}"
@@ -125,6 +119,7 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             tag = "fused_region"
             params["kernel_source"] = op.kernel_source
             params["region_ops_count"] = len(op.region_ops)
+            params["_region_ops"] = op.region_ops  # for backend matmul detection
         else:
             tag = op_type.lower()
 

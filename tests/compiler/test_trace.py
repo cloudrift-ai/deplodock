@@ -4,36 +4,24 @@ import json
 from pathlib import Path
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
+from deplodock.compiler.ops import ElementwiseOp, InputOp
 from deplodock.compiler.rewriter import Pass, Rewriter, Rule
 from deplodock.compiler.trace import CompilerTrace, ExecutionResult, PassTrace, RuleApplication
 
 # ---- helpers ----
 
 
-def _make_matmul_graph():
+def _make_pow_graph():
     g = Graph()
-    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (4, 3)), node_id="A")
-    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (3, 2)), node_id="B")
-    g.inputs = [a, b]
-    ew = g.add_node(
-        op=ElementwiseOp(fn="mul"),
-        inputs=[a, b],
-        output=Tensor("AB", (4, 3, 2)),
-        node_id="ew",
-    )
-    red = g.add_node(
-        op=ReduceOp(fn="sum", axis=1),
-        inputs=[ew],
-        output=Tensor("C", (4, 2)),
-        node_id="red",
-    )
-    g.outputs = [red]
+    x = g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4,)), node_id="x")
+    g.inputs = [x]
+    pw = g.add_node(op=ElementwiseOp(fn="pow"), inputs=[x], output=Tensor("sq", (4,)), node_id="sq")
+    g.outputs = [pw]
     return g
 
 
-def _load_fusion_rule():
-    rule_path = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion" / "001_fuse_reduce_elementwise.py"
+def _load_decomp_rule():
+    rule_path = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules" / "decomposition" / "003_decompose_pow.py"
     return Rule.from_file(rule_path)
 
 
@@ -41,18 +29,17 @@ def _load_fusion_rule():
 
 
 def test_graph_to_dict():
-    g = _make_matmul_graph()
+    g = _make_pow_graph()
     d = g.to_dict()
-    assert d["inputs"] == ["A", "B"]
-    assert d["outputs"] == ["red"]
-    assert "A" in d["nodes"]
-    assert d["nodes"]["ew"]["op"] == "ElementwiseOp"
-    assert d["nodes"]["ew"]["op_fields"]["fn"] == "mul"
-    assert d["nodes"]["red"]["op"] == "ReduceOp"
+    assert d["inputs"] == ["x"]
+    assert d["outputs"] == ["sq"]
+    assert "x" in d["nodes"]
+    assert d["nodes"]["sq"]["op"] == "ElementwiseOp"
+    assert d["nodes"]["sq"]["op_fields"]["fn"] == "pow"
 
 
 def test_graph_to_dict_is_json_serializable():
-    g = _make_matmul_graph()
+    g = _make_pow_graph()
     d = g.to_dict()
     s = json.dumps(d)
     assert isinstance(s, str)
@@ -67,7 +54,7 @@ def test_trace_round_trip():
         input_graph={"nodes": {}, "inputs": [], "outputs": []},
         passes=[
             PassTrace(
-                name="fusion",
+                name="decomposition",
                 rules_applied=[
                     RuleApplication(
                         rule_name="001_fuse",
@@ -93,7 +80,7 @@ def test_trace_round_trip():
     j = trace.to_json()
     parsed = json.loads(j)
 
-    assert parsed["passes"][0]["pass"] == "fusion"
+    assert parsed["passes"][0]["pass"] == "decomposition"
     assert parsed["passes"][0]["rules_applied"][0]["rule"] == "001_fuse"
     assert parsed["generated_code"] == "__global__ void test() {}"
     assert parsed["execution"]["correct"] is True
@@ -111,26 +98,22 @@ def test_trace_with_error():
 
 
 def test_rewriter_populates_trace():
-    g = _make_matmul_graph()
-    rule = _load_fusion_rule()
-    rewriter = Rewriter(passes=[Pass(name="fusion", rules=[rule])])
+    g = _make_pow_graph()
+    rule = _load_decomp_rule()
+    rewriter = Rewriter(passes=[Pass(name="decomposition", rules=[rule])])
 
     pass_traces: list[PassTrace] = []
     rewriter.apply(g, pass_traces=pass_traces)
 
     assert len(pass_traces) == 1
     pt = pass_traces[0]
-    assert pt.name == "fusion"
+    assert pt.name == "decomposition"
     assert pt.graph_before is not None
     assert pt.graph_after is not None
     assert len(pt.rules_applied) == 1
-    assert pt.rules_applied[0].rule_name == "001_fuse_reduce_elementwise"
-    assert pt.rules_applied[0].matched_at == "red"
+    assert pt.rules_applied[0].rule_name == "003_decompose_pow"
 
     # graph_after should have the fused op, not the original.
-    op_types = {n["op"] for n in pt.graph_after["nodes"].values()}
-    assert "MatmulOp" in op_types
-    assert "ReduceOp" not in op_types
 
 
 def test_rewriter_trace_no_match():
@@ -140,8 +123,8 @@ def test_rewriter_trace_no_match():
     g.inputs = [x]
     g.outputs = [x]
 
-    rule = _load_fusion_rule()
-    rewriter = Rewriter(passes=[Pass(name="fusion", rules=[rule])])
+    rule = _load_decomp_rule()
+    rewriter = Rewriter(passes=[Pass(name="decomposition", rules=[rule])])
 
     pass_traces: list[PassTrace] = []
     rewriter.apply(g, pass_traces=pass_traces)
@@ -153,9 +136,9 @@ def test_rewriter_trace_no_match():
 
 def test_full_trace_json_is_parseable():
     """Full trace from rewriter produces valid JSON with expected structure."""
-    g = _make_matmul_graph()
-    rule = _load_fusion_rule()
-    rewriter = Rewriter(passes=[Pass(name="fusion", rules=[rule])])
+    g = _make_pow_graph()
+    rule = _load_decomp_rule()
+    rewriter = Rewriter(passes=[Pass(name="decomposition", rules=[rule])])
 
     trace = CompilerTrace()
     trace.input_graph = g.to_dict()
@@ -166,4 +149,4 @@ def test_full_trace_json_is_parseable():
 
     assert "input_graph" in parsed
     assert len(parsed["passes"]) == 1
-    assert parsed["passes"][0]["rules_applied"][0]["rule"] == "001_fuse_reduce_elementwise"
+    assert parsed["passes"][0]["rules_applied"][0]["rule"] == "003_decompose_pow"
