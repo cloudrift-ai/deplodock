@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 
-from deplodock.compiler.block_planner import BlockConfig, plan_block
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.plan import ExecutionPlan, plan_graph
 from deplodock.compiler.rewriter import Rewriter
@@ -19,9 +18,6 @@ def _load_fixture(name: str) -> Graph:
 def _compile(g: Graph) -> Graph:
     rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
     return Rewriter.from_directory(rules_dir).apply(g)
-
-
-# ---- plan_graph tests (graph-driven planning) ----
 
 
 def test_plan_graph_on_fixture():
@@ -92,42 +88,3 @@ def test_plan_graph_is_backend_agnostic():
         assert not hasattr(op, "kernel_source")
         assert not hasattr(op, "grid")
         assert not hasattr(op, "block")
-
-
-# ---- plan_block tests (config-driven, legacy) ----
-
-
-def test_plan_block_structure():
-    """plan_block returns an ExecutionPlan with correct op count and names."""
-    cfg = BlockConfig(batch=1, seq_len=32, hidden_dim=64, num_heads=4, num_kv_heads=2, head_dim=16, intermediate_dim=128)
-    plan = plan_block(cfg)
-
-    assert isinstance(plan, ExecutionPlan)
-    assert len(plan.ops) == 10
-
-    op_names = [op.op for op in plan.ops]
-    assert op_names == [
-        "rmsnorm",
-        "triple_matmul",
-        "rope",
-        "attention_qk",
-        "attention_softmax",
-        "attention_sv",
-        "matmul_residual_add",
-        "rmsnorm",
-        "dual_matmul_silu_mul",
-        "matmul_residual_add",
-    ]
-
-
-def test_plan_block_buffer_roles():
-    """Buffers have correct roles."""
-    cfg = BlockConfig(batch=1, seq_len=4, hidden_dim=16, num_heads=2, num_kv_heads=1, head_dim=8, intermediate_dim=32)
-    plan = plan_block(cfg)
-
-    inputs = [b for b in plan.buffers if b.role == "input"]
-    outputs = [b for b in plan.buffers if b.role == "output"]
-    constants = [b for b in plan.buffers if b.role == "constant"]
-    assert len(inputs) == 3
-    assert len(outputs) == 1
-    assert len(constants) == 9
