@@ -81,7 +81,11 @@ def register_create_target(subparsers):
     parser.add_argument("--api-key", default=None, help="CloudRift API key (fallback: CLOUDRIFT_API_KEY env var)")
     parser.add_argument("--image-url", default=DEFAULT_IMAGE_URL, help="VM image URL (default: Ubuntu 24.04)")
     parser.add_argument("--ports", default="22,8000", help="Comma-separated ports to open (default: 22,8000)")
-    parser.add_argument("--api-url", default=DEFAULT_API_URL, help=f"API base URL (default: {DEFAULT_API_URL})")
+    parser.add_argument(
+        "--api-url",
+        default=DEFAULT_API_URL,
+        help="API base URL (fallback: $CLOUDRIFT_API_URL, default: https://api.cloudrift.ai)",
+    )
     parser.add_argument("--timeout", type=int, default=600, help="Seconds to wait for Active status (default: 600)")
     parser.add_argument("--dry-run", action="store_true", help="Print requests without executing")
     parser.add_argument("--billing-exempt", action="store_true", help="Skip billing (admin-only)")
@@ -93,6 +97,10 @@ def register_delete_target(subparsers):
     parser = subparsers.add_parser("cloudrift", help="Delete a CloudRift GPU VM")
     parser.add_argument("--instance-id", required=True, help="CloudRift instance ID")
     parser.add_argument("--api-key", default=None, help="CloudRift API key (fallback: CLOUDRIFT_API_KEY env var)")
-    parser.add_argument("--api-url", default=DEFAULT_API_URL, help=f"API base URL (default: {DEFAULT_API_URL})")
+    parser.add_argument(
+        "--api-url",
+        default=DEFAULT_API_URL,
+        help="API base URL (fallback: $CLOUDRIFT_API_URL, default: https://api.cloudrift.ai)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print requests without executing")
     parser.set_defaults(func=handle_delete)

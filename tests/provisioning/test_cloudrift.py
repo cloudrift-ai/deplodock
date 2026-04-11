@@ -321,3 +321,32 @@ def test_log_connection_info_no_port_mappings(caplog):
         _log_connection_info(instance)
     assert "ssh riftuser@1.2.3.4" in caplog.text
     assert "abc123" not in caplog.text  # password must not be logged
+
+
+# ── DEFAULT_API_URL env var ──────────────────────────────────────
+
+
+def test_default_api_url_env_var_override(monkeypatch):
+    """DEFAULT_API_URL honors CLOUDRIFT_API_URL env var at import time."""
+    import importlib
+
+    from deplodock.provisioning import cloudrift
+
+    monkeypatch.setenv("CLOUDRIFT_API_URL", "https://api.staging.cloudrift.ai")
+    try:
+        importlib.reload(cloudrift)
+        assert cloudrift.DEFAULT_API_URL == "https://api.staging.cloudrift.ai"
+    finally:
+        monkeypatch.delenv("CLOUDRIFT_API_URL", raising=False)
+        importlib.reload(cloudrift)
+
+
+def test_default_api_url_fallback(monkeypatch):
+    """DEFAULT_API_URL falls back to https://api.cloudrift.ai when env var unset."""
+    import importlib
+
+    from deplodock.provisioning import cloudrift
+
+    monkeypatch.delenv("CLOUDRIFT_API_URL", raising=False)
+    importlib.reload(cloudrift)
+    assert cloudrift.DEFAULT_API_URL == "https://api.cloudrift.ai"
