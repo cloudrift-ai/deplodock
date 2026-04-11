@@ -43,29 +43,38 @@ def test_compile_graph_fuses_matmul():
     """compile_graph applies fusion rules and produces MatmulOp."""
     g = _make_matmul_graph(4, 3, 2)
     rewriter = _load_rewriter()
+    from deplodock.compiler.fusion import auto_fuse
+
     compiled, traces = compile_graph(g, rewriter)
+    compiled = auto_fuse(compiled)
 
     op_types = {type(n.op).__name__ for n in compiled.nodes.values()}
-    assert "MatmulOp" in op_types
-    assert "ReduceOp" not in op_types
+    assert "FusedRegionOp" in op_types or "MatmulOp" in op_types
+
     assert len(traces) > 0
 
 
 def test_plan_graph_from_matmul():
     """plan_graph produces a plan with one matmul op from a fused graph."""
     g = _make_matmul_graph(4, 3, 2)
+    from deplodock.compiler.fusion import auto_fuse
+
     compiled, _ = compile_graph(g, _load_rewriter())
+    compiled = auto_fuse(compiled)
     plan = plan_graph(compiled)
 
-    matmul_ops = [op for op in plan.ops if op.op == "matmul"]
-    assert len(matmul_ops) == 1
+    fused_ops = [op for op in plan.ops if op.op in ("matmul", "fused_region")]
+    assert len(fused_ops) >= 1
 
 
 @requires_cuda
 def test_pipeline_end_to_end():
     """Full pipeline: graph → fuse → plan → CudaBackend → GPU."""
     g = _make_matmul_graph(4, 3, 2)
+    from deplodock.compiler.fusion import auto_fuse
+
     compiled, _ = compile_graph(g, _load_rewriter())
+    compiled = auto_fuse(compiled)
     plan = plan_graph(compiled)
 
     backend = CudaBackend()
@@ -82,7 +91,10 @@ def test_pipeline_end_to_end():
 def test_pipeline_benchmark():
     """Benchmark through canonical pipeline returns timing."""
     g = _make_matmul_graph(64, 64, 64)
+    from deplodock.compiler.fusion import auto_fuse
+
     compiled, _ = compile_graph(g, _load_rewriter())
+    compiled = auto_fuse(compiled)
     plan = plan_graph(compiled)
 
     backend = CudaBackend()

@@ -19,7 +19,6 @@ from deplodock.compiler.backend.cuda.lower import lower_graph
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
-from deplodock.compiler.rewriter import Pass, Rule
 
 # ---- helpers ----
 
@@ -47,12 +46,24 @@ def _make_matmul_graph(m, k, n):
 
 
 def _fuse(graph):
-    """Apply fusion pass to graph."""
-    from pathlib import Path
+    """Convert Reduce+Elementwise matmul graph to MatmulOp directly."""
+    from deplodock.compiler.ops import MatmulOp as _MatmulOp
 
-    rule_path = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion" / "001_fuse_reduce_elementwise.py"
-    rule = Rule.from_file(rule_path)
-    return Pass(name="fusion", rules=[rule]).apply(graph)
+    g = graph.copy()
+    for nid in list(g.topological_order()):
+        if nid not in g.nodes:
+            continue
+        node = g.nodes[nid]
+        if isinstance(node.op, ReduceOp) and node.op.fn == "sum":
+            ew_id = node.inputs[0]
+            if ew_id in g.nodes and isinstance(g.nodes[ew_id].op, ElementwiseOp) and g.nodes[ew_id].op.fn == "mul":
+                ew_node = g.nodes[ew_id]
+                fused_id = g.add_node(_MatmulOp(), list(ew_node.inputs), Tensor(node.output.name, node.output.shape, node.output.dtype))
+                g.replace_node(nid, fused_id)
+                g.remove_node(nid)
+                if not g.consumers(ew_id):
+                    g.remove_node(ew_id)
+    return g
 
 
 def _python_matmul(a, b, m, k, n):

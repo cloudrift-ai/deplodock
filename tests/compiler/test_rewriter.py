@@ -1,102 +1,61 @@
-"""End-to-end tests for the rewrite engine."""
+"""Tests for the rewrite engine."""
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import (
-    ElementwiseOp,
-    InputOp,
-    MatmulOp,
-    ReduceOp,
-)
+from deplodock.compiler.ops import ElementwiseOp, InputOp
 from deplodock.compiler.pattern import parse_pattern
 from deplodock.compiler.rewriter import Pass, Rule
 
-# ---- helpers ----
 
-
-def _make_matmul_graph():
-    """C = reduce_sum(elementwise_mul(A, B))."""
+def _make_silu_graph():
+    """Build graph with silu(x) for decomposition testing."""
     g = Graph()
-    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", ("M", "K")), node_id="A")
-    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", ("K", "N")), node_id="B")
-    g.inputs = [a, b]
-    ew = g.add_node(
-        op=ElementwiseOp(fn="mul"),
-        inputs=[a, b],
-        output=Tensor("AB", ("M", "K", "N")),
-        node_id="ew",
-    )
-    red = g.add_node(
-        op=ReduceOp(fn="sum", axis=1),
-        inputs=[ew],
-        output=Tensor("C", ("M", "N")),
-        node_id="red",
-    )
-    g.outputs = [red]
+    x = g.add_node(op=InputOp(), inputs=[], output=Tensor("x", ("N",)), node_id="x")
+    g.inputs = [x]
+    silu = g.add_node(op=ElementwiseOp(fn="silu"), inputs=[x], output=Tensor("out", ("N",)), node_id="out")
+    g.outputs = [silu]
     return g
 
 
-def _import_rewrite_fn(rule_path: str):
-    """Import a rewrite function from a rule file."""
-    return Rule.from_file(__import__("pathlib").Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules" / rule_path)
+def _load_decomp_rule():
+    from pathlib import Path
+
+    return Rule.from_file(
+        Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules" / "decomposition" / "002_decompose_silu.py"
+    )
 
 
-# ---- tests ----
+def test_decompose_silu():
+    """Decomposition rule replaces silu with primitive ops."""
+    g = _make_silu_graph()
+    result = Pass(name="decomp", rules=[_load_decomp_rule()]).apply(g)
+
+    fns = [n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)]
+    assert "silu" not in fns
+    assert "neg" in fns
+    assert "exp" in fns
 
 
-def test_fuse_reduce_elementwise():
-    """Naive matmul graph → fused node, no intermediate."""
-    g = _make_matmul_graph()
-    rule = _import_rewrite_fn("fusion/001_fuse_reduce_elementwise.py")
-    fusion_pass = Pass(name="fusion", rules=[rule])
-    result = fusion_pass.apply(g)
-
-    # The elementwise and reduce nodes should be gone.
-    op_types = [type(n.op).__name__ for n in result.nodes.values()]
-    assert "ElementwiseOp" not in op_types
-    assert "ReduceOp" not in op_types
-    assert "MatmulOp" in op_types
-
-    # The fused node should consume A and B directly.
-    fused_nodes = [n for n in result.nodes.values() if isinstance(n.op, MatmulOp)]
-    assert len(fused_nodes) == 1
-    fused = fused_nodes[0]
-    assert set(fused.inputs) == {"A", "B"}
-
-
-def test_fused_graph_output_is_correct():
-    """Output of fused graph should point to the fused node."""
-    g = _make_matmul_graph()
-    rule = _import_rewrite_fn("fusion/001_fuse_reduce_elementwise.py")
-    fusion_pass = Pass(name="fusion", rules=[rule])
-    result = fusion_pass.apply(g)
+def test_decomposed_output_is_correct():
+    """Output of decomposed graph points to the last op."""
+    g = _make_silu_graph()
+    result = Pass(name="decomp", rules=[_load_decomp_rule()]).apply(g)
 
     assert len(result.outputs) == 1
-    out_node = result.nodes[result.outputs[0]]
-    assert isinstance(out_node.op, MatmulOp)
+    assert isinstance(result.nodes[result.outputs[0]].op, ElementwiseOp)
 
 
 def test_fixed_point_no_change():
-    """Applying fusion to an already-fused graph produces no change."""
-    g = _make_matmul_graph()
-    rule = _import_rewrite_fn("fusion/001_fuse_reduce_elementwise.py")
-    fusion_pass = Pass(name="fusion", rules=[rule])
-    fused = fusion_pass.apply(g)
-
-    # Apply again — should be a no-op.
-    fused2 = fusion_pass.apply(fused)
-    assert len(fused2.nodes) == len(fused.nodes)
-    assert set(type(n.op).__name__ for n in fused2.nodes.values()) == set(type(n.op).__name__ for n in fused.nodes.values())
+    """Applying decomposition to an already-decomposed graph is a no-op."""
+    g = _make_silu_graph()
+    p = Pass(name="decomp", rules=[_load_decomp_rule()])
+    decomposed = p.apply(g)
+    decomposed2 = p.apply(decomposed)
+    assert len(decomposed2.nodes) == len(decomposed.nodes)
 
 
 def test_pass_with_no_matching_rules():
     """A pass whose rules don't match returns the graph unchanged."""
-    g = _make_matmul_graph()
-    # Use a pattern that won't match anything in this graph.
-    rule = Rule(
-        name="noop",
-        pattern=parse_pattern("Scan{sum, $ax}($x)"),
-        rewrite=lambda graph, match: graph,
-    )
-    p = Pass(name="noop_pass", rules=[rule])
-    result = p.apply(g)
+    g = _make_silu_graph()
+    rule = Rule(name="noop", pattern=parse_pattern("Scan{sum, $ax}($x)"), rewrite=lambda graph, match: graph)
+    result = Pass(name="noop", rules=[rule]).apply(g)
     assert len(result.nodes) == len(g.nodes)
