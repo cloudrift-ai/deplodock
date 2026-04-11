@@ -7,7 +7,6 @@ from deplodock.compiler.ops import (
     ConstantOp,
     ElementwiseOp,
     FusedReduceElementwiseOp,
-    FusedSoftmaxOp,
     InputOp,
     ReduceOp,
     TransposeOp,
@@ -148,24 +147,13 @@ def test_llama_block_full_fusion():
 
     # Verify expected fused ops.
     assert ops_by_type.get("FusedRMSNormOp", 0) == 2, f"Expected 2 FusedRMSNormOp, got {ops_by_type}"
-    # 9 matmuls: Q, K, V, O projections (4) + QK, attn@V (2) + gate, up, down (3)
-    assert ops_by_type.get("MatmulOp", 0) == 9, f"Expected 9 MatmulOp, got {ops_by_type}"
-    assert ops_by_type.get("FusedSoftmaxOp", 0) == 1, f"Expected 1 FusedSoftmaxOp, got {ops_by_type}"
+    # 7 matmuls: Q, K, V, O projections (4) + gate, up, down (3). QK + attn@V consumed by attention.
+    assert ops_by_type.get("MatmulOp", 0) == 7, f"Expected 7 MatmulOp, got {ops_by_type}"
+    assert ops_by_type.get("FusedAttentionOp", 0) == 1, f"Expected 1 FusedAttentionOp, got {ops_by_type}"
     assert ops_by_type.get("FusedSiLUMulOp", 0) == 1, f"Expected 1 FusedSiLUMulOp, got {ops_by_type}"
 
-    # No leftover ReduceOp or unfused elementwise chains.
+    # No leftover ReduceOp.
     assert ops_by_type.get("ReduceOp", 0) == 0, f"Unexpected ReduceOp remaining: {ops_by_type}"
 
     # Node count should be significantly reduced.
     assert len(result.nodes) < initial_count
-
-    # Verify the attention seam: softmax sits between two matmuls.
-    softmax_nodes = [n for n in result.nodes.values() if isinstance(n.op, FusedSoftmaxOp)]
-    assert len(softmax_nodes) == 1
-    softmax_node = softmax_nodes[0]
-
-    # Softmax's input chain should trace back through scale to a MatmulOp (QK).
-    # Softmax's output should feed into a MatmulOp (attn@V).
-    softmax_consumers = result.consumers(softmax_node.id)
-    consumer_ops = [type(result.nodes[c].op).__name__ for c in softmax_consumers]
-    assert "MatmulOp" in consumer_ops, f"Softmax should feed into MatmulOp, got {consumer_ops}"

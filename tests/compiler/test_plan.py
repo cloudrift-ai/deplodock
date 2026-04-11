@@ -56,7 +56,7 @@ def test_plan_graph_op_tags():
 
     op_tags = {op.op for op in plan.ops}
     assert "matmul" in op_tags
-    assert "softmax" in op_tags
+    assert "attention" in op_tags  # FusedAttentionOp (absorbs softmax + 2 matmuls)
     assert "silu_mul" in op_tags
 
 
@@ -79,7 +79,8 @@ def test_plan_graph_matmul_count():
     plan = plan_graph(compiled)
 
     matmul_count = sum(1 for op in plan.ops if op.op == "matmul")
-    assert matmul_count == 9, f"Expected 9 matmul, got {matmul_count}"
+    # 7 projections only. QK + attn@V consumed by FusedAttentionOp.
+    assert matmul_count == 7, f"Expected 7 matmul, got {matmul_count}"
 
 
 def test_plan_graph_is_backend_agnostic():

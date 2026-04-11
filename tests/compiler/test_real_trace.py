@@ -99,8 +99,8 @@ def test_tinyllama_compile_fuses_matmuls():
     compiled = rewriter.apply(g)
 
     ops = _count_ops(compiled)
-    # 9 matmuls: 7 linear projections + QK (from sdpa decomposition) + attn@V
-    assert ops.get("MatmulOp", 0) == 9, f"Expected 9 MatmulOp, got {ops}"
+    # 7 matmuls: projections only. QK + attn@V are consumed by FusedAttentionOp.
+    assert ops.get("MatmulOp", 0) == 7, f"Expected 7 MatmulOp, got {ops}"
 
 
 def test_tinyllama_compile_reduces_node_count():
