@@ -17,19 +17,6 @@ def register_run_command(subparsers):
     matmul_parser.add_argument("--iters", type=int, default=10, help="Benchmark iterations")
     matmul_parser.set_defaults(func=_handle_matmul)
 
-    # deplodock run block --hidden-dim 2048 --num-heads 32 --seq-len 32
-    block_parser = sub.add_parser("block", help="Run a transformer block")
-    block_parser.add_argument("--hidden-dim", type=int, required=True, help="Hidden dimension")
-    block_parser.add_argument("--num-heads", type=int, required=True, help="Number of attention heads")
-    block_parser.add_argument("--num-kv-heads", type=int, default=None, help="Number of KV heads (default: num-heads)")
-    block_parser.add_argument("--head-dim", type=int, default=None, help="Head dimension (default: hidden-dim / num-heads)")
-    block_parser.add_argument("--intermediate-dim", type=int, default=None, help="FFN intermediate dim (default: hidden-dim * 4)")
-    block_parser.add_argument("--seq-len", type=int, default=32, help="Sequence length (default: 32)")
-    block_parser.add_argument("--batch", type=int, default=1, help="Batch size (default: 1)")
-    block_parser.add_argument("--benchmark", action="store_true", help="Run in benchmark mode")
-    block_parser.add_argument("--iters", type=int, default=10, help="Benchmark iterations")
-    block_parser.set_defaults(func=_handle_block)
-
     # deplodock run graph <ir_file>
     graph_parser = sub.add_parser("graph", help="Run a compiled graph IR file")
     graph_parser.add_argument("ir_file", help="Path to compiled .json Graph IR file")
@@ -122,43 +109,3 @@ def _handle_graph(args):
         result = backend.run(program)
         for buf_name, values in result.outputs.items():
             logger.info("Output %s: %d elements, first 5: %s", buf_name, len(values), values[:5])
-
-
-def _handle_block(args):
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.block_planner import BlockConfig, plan_block
-
-    num_kv_heads = args.num_kv_heads or args.num_heads
-    head_dim = args.head_dim or (args.hidden_dim // args.num_heads)
-    intermediate_dim = args.intermediate_dim or (args.hidden_dim * 4)
-
-    cfg = BlockConfig(
-        batch=args.batch,
-        seq_len=args.seq_len,
-        hidden_dim=args.hidden_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        intermediate_dim=intermediate_dim,
-    )
-
-    plan = plan_block(cfg)
-    backend = CudaBackend()
-    program = backend.compile(plan)
-
-    logger.info(
-        "Block: hidden=%d heads=%d kv_heads=%d seq=%d batch=%d",
-        cfg.hidden_dim,
-        cfg.num_heads,
-        cfg.num_kv_heads,
-        cfg.seq_len,
-        cfg.batch,
-    )
-
-    if args.benchmark:
-        result = backend.benchmark(program, num_iters=args.iters)
-        logger.info("Time: %.3f ms (%d launches)", result.time_ms, result.num_launches)
-    else:
-        result = backend.run(program)
-        output = result.outputs.get("output", [])
-        logger.info("Output: %d elements, first 5: %s", len(output), output[:5])
