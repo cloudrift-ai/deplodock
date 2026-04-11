@@ -101,7 +101,7 @@ def main():
 
     # --- Deplodock CUDA pipeline ---
     if "deplodock" in backends:
-        us = _bench_deplodock(config, args.seq_len, args.batch)
+        us = _bench_deplodock(block, x, rotary_emb, pos_emb)
         if us is not None:
             results["Deplodock (naive attn)"] = us
 
@@ -167,28 +167,32 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
     return (start.elapsed_time(end) / iters) * 1000
 
 
-def _bench_deplodock(config, seq_len, batch):
+def _bench_deplodock(block, x, rotary_emb, pos_emb):
+    from pathlib import Path
+
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.block_planner import BlockConfig, plan_block
+    from deplodock.compiler.plan import plan_graph
+    from deplodock.compiler.rewriter import Rewriter
+    from deplodock.compiler.torch_trace import trace_module
 
     try:
-        num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        head_dim = config.hidden_size // config.num_attention_heads
-        intermediate = getattr(config, "intermediate_size", config.hidden_size * 4)
+        # Trace the block through our pipeline.
+        graph = trace_module(block.cpu(), (x.cpu(),), kwargs={"position_embeddings": (pos_emb[0].cpu(), pos_emb[1].cpu())})
 
-        cfg = BlockConfig(
-            batch=batch,
-            seq_len=seq_len,
-            hidden_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            intermediate_dim=intermediate,
-        )
-        plan = plan_block(cfg)
+        # Decompose + fuse.
+        rules_dir = Path(__file__).parent.parent / "deplodock" / "compiler" / "rules"
+        rewriter = Rewriter.from_directory(rules_dir)
+        compiled = rewriter.apply(graph)
+
+        # Plan from graph.
+        plan = plan_graph(compiled)
         backend = CudaBackend()
         program = backend.compile(plan)
         result = backend.benchmark(program, warmup=3, num_iters=10)
+
+        # Move block back to GPU for other benchmarks.
+        block.cuda()
+
         return result.time_ms * 1000  # ms → us
     except Exception as e:
         logger.warning("Deplodock pipeline failed: %s", e)
