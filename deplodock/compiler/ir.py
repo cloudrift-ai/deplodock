@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler import ops as ops_module
+from deplodock.compiler.hints import Hints
 from deplodock.compiler.ops import Op
 
 
@@ -26,6 +27,7 @@ class Node:
     op: Op
     inputs: list[str]  # node ids
     output: Tensor
+    hints: Hints = field(default_factory=Hints)
 
 
 class Graph:
@@ -35,6 +37,7 @@ class Graph:
         self.nodes: dict[str, Node] = {}
         self.inputs: list[str] = []
         self.outputs: list[str] = []
+        self.hints: Hints = Hints()
         self._id_counter = itertools.count()
 
     def _next_id(self) -> str:
@@ -107,6 +110,7 @@ class Graph:
         """Return a deep copy of the graph."""
         g = Graph()
         g._id_counter = itertools.count(next(self._id_counter))
+        g.hints = Hints.from_dict(self.hints.to_dict())
         for nid, node in self.nodes.items():
             g.nodes[nid] = Node(
                 id=node.id,
@@ -117,6 +121,7 @@ class Graph:
                     shape=node.output.shape,
                     dtype=node.output.dtype,
                 ),
+                hints=Hints.from_dict(node.hints.to_dict()),
             )
         g.inputs = list(self.inputs)
         g.outputs = list(self.outputs)
@@ -126,6 +131,7 @@ class Graph:
     def from_dict(data: dict) -> Graph:
         """Deserialize a graph from a JSON-compatible dict (inverse of to_dict)."""
         g = Graph()
+        g.hints = Hints.from_dict(data.get("hints", {}))
         # First pass: create all nodes (inputs first, then in order).
         for nid, ndata in data["nodes"].items():
             op_cls_name = ndata["op"]
@@ -146,8 +152,9 @@ class Graph:
                 shape=tuple(out["shape"]),
                 dtype=out.get("dtype", "f32"),
             )
+            node_hints = Hints.from_dict(ndata.get("hints", {}))
             # Add directly to bypass input validation (nodes may reference later nodes).
-            g.nodes[nid] = Node(id=nid, op=op, inputs=list(ndata["inputs"]), output=tensor)
+            g.nodes[nid] = Node(id=nid, op=op, inputs=list(ndata["inputs"]), output=tensor, hints=node_hints)
 
         g.inputs = list(data["inputs"])
         g.outputs = list(data["outputs"])
@@ -155,20 +162,25 @@ class Graph:
 
     def to_dict(self) -> dict:
         """Serialize graph to a JSON-compatible dict."""
-        return {
+        result: dict = {
             "inputs": self.inputs,
             "outputs": self.outputs,
-            "nodes": {
-                nid: {
-                    "op": type(node.op).__name__,
-                    "op_fields": {k: v for k, v in node.op.__dict__.items() if not k.startswith("_")},
-                    "inputs": node.inputs,
-                    "output": {
-                        "name": node.output.name,
-                        "shape": list(node.output.shape),
-                        "dtype": node.output.dtype,
-                    },
-                }
-                for nid, node in self.nodes.items()
-            },
+            "nodes": {},
         }
+        if self.hints:
+            result["hints"] = self.hints.to_dict()
+        for nid, node in self.nodes.items():
+            entry: dict = {
+                "op": type(node.op).__name__,
+                "op_fields": {k: v for k, v in node.op.__dict__.items() if not k.startswith("_")},
+                "inputs": node.inputs,
+                "output": {
+                    "name": node.output.name,
+                    "shape": list(node.output.shape),
+                    "dtype": node.output.dtype,
+                },
+            }
+            if node.hints:
+                entry["hints"] = node.hints.to_dict()
+            result["nodes"][nid] = entry
+        return result

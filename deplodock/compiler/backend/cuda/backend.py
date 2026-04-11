@@ -89,7 +89,9 @@ def _compile_matmul(op: OpKernel) -> Launch:
     c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", (m, n)), node_id="C")
     g.outputs = [c]
 
-    config = MatmulConfig(strategy="naive")
+    hints = op.params.get("_hints", {})
+    matmul_hints = {k[len("cuda.matmul.") :]: v for k, v in hints.items() if k.startswith("cuda.matmul.")}
+    config = MatmulConfig.from_hints(matmul_hints) if matmul_hints else MatmulConfig()
     kernel_def = lower_graph(g, config=config)
     source = emit_kernel(kernel_def)
 

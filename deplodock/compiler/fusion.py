@@ -236,6 +236,11 @@ def auto_fuse(graph: Graph) -> Graph:
             ),
         )
 
+        # Merge hints from constituent nodes into the fused node.
+        for nid in topo:
+            if nid in graph.nodes:
+                g.nodes[fused_id].hints.merge(graph.nodes[nid].hints)
+
         # Rewire: consumers of the region's outputs now consume the fused node.
         for out_id in external_outputs:
             g.replace_node(out_id, fused_id)
