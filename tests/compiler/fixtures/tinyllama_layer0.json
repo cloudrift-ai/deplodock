@@ -183,6 +183,20 @@
         "dtype": "float16"
       }
     },
+    "pow_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "pow_1_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "pow_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "pow_1": {
       "op": "ElementwiseOp",
       "op_fields": {
@@ -199,6 +213,20 @@
           2048
         ],
         "dtype": "float32"
+      }
+    },
+    "mean_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "mean_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "mean_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
       }
     },
     "mean": {
@@ -220,13 +248,28 @@
         "dtype": "float32"
       }
     },
+    "add_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "add_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "add_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "add": {
       "op": "ElementwiseOp",
       "op_fields": {
         "fn": "add"
       },
       "inputs": [
-        "mean"
+        "mean",
+        "add_c1"
       ],
       "output": {
         "name": "add",
@@ -357,6 +400,34 @@
         "dtype": "float16"
       }
     },
+    "transpose_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_c2"
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "transpose": {
       "op": "TransposeOp",
       "op_fields": {
@@ -440,6 +511,34 @@
           64
         ],
         "dtype": "float16"
+      }
+    },
+    "transpose_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_1_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_1_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_1_c2"
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_1_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
       }
     },
     "transpose_1": {
@@ -527,6 +626,34 @@
         "dtype": "float16"
       }
     },
+    "transpose_2_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_2_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_2_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_2_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_2_c2"
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_2_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "transpose_2": {
       "op": "TransposeOp",
       "op_fields": {
@@ -547,6 +674,20 @@
           64
         ],
         "dtype": "float16"
+      }
+    },
+    "unsqueeze_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "unsqueeze_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "unsqueeze_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
       }
     },
     "unsqueeze": {
@@ -571,6 +712,20 @@
           64
         ],
         "dtype": "float16"
+      }
+    },
+    "unsqueeze_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "unsqueeze_1_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "unsqueeze_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
       }
     },
     "unsqueeze_1": {
@@ -617,6 +772,48 @@
         "dtype": "float16"
       }
     },
+    "slice_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_1_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_1_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_1_c2"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_1_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_1_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_1_c3"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_1_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "slice_1": {
       "op": "ReshapeOp",
       "op_fields": {
@@ -639,6 +836,48 @@
           32
         ],
         "dtype": "float16"
+      }
+    },
+    "slice_2_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_2_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_2_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_2_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_2_c2"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_2_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_2_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_2_c3"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_2_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
       }
     },
     "slice_2": {
@@ -684,12 +923,28 @@
         "dtype": "float16"
       }
     },
+    "cat_c0": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "cat_c0"
+      },
+      "inputs": [],
+      "output": {
+        "name": "cat_c0",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "cat": {
       "op": "ElementwiseOp",
       "op_fields": {
         "fn": "cat"
       },
-      "inputs": [],
+      "inputs": [
+        "cat_c0"
+      ],
       "output": {
         "name": "cat",
         "shape": [
@@ -761,6 +1016,48 @@
         "dtype": "float16"
       }
     },
+    "slice_3_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_3_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_3_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_3_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_3_c2"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_3_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_3_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_3_c3"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_3_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "slice_3": {
       "op": "ReshapeOp",
       "op_fields": {
@@ -783,6 +1080,48 @@
           32
         ],
         "dtype": "float16"
+      }
+    },
+    "slice_4_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_4_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_4_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_4_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_4_c2"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_4_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_4_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_4_c3"
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_4_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
       }
     },
     "slice_4": {
@@ -828,12 +1167,28 @@
         "dtype": "float16"
       }
     },
+    "cat_1_c0": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "cat_1_c0"
+      },
+      "inputs": [],
+      "output": {
+        "name": "cat_1_c0",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "cat_1": {
       "op": "ElementwiseOp",
       "op_fields": {
         "fn": "cat"
       },
-      "inputs": [],
+      "inputs": [
+        "cat_1_c0"
+      ],
       "output": {
         "name": "cat_1",
         "shape": [
@@ -885,6 +1240,34 @@
         "dtype": "float16"
       }
     },
+    "scaled_dot_product_attention_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "scaled_dot_product_attention_c3"
+      },
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "scaled_dot_product_attention_c4": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "scaled_dot_product_attention_c4"
+      },
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_c4",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "scaled_dot_product_attention": {
       "op": "ElementwiseOp",
       "op_fields": {
@@ -904,6 +1287,34 @@
           64
         ],
         "dtype": "float16"
+      }
+    },
+    "transpose_3_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_3_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_3_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_3_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_3_c2"
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_3_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
       }
     },
     "transpose_3": {
@@ -1008,6 +1419,20 @@
         "dtype": "float16"
       }
     },
+    "pow_2_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "pow_2_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "pow_2_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "pow_2": {
       "op": "ElementwiseOp",
       "op_fields": {
@@ -1024,6 +1449,20 @@
           2048
         ],
         "dtype": "float32"
+      }
+    },
+    "mean_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "mean_1_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "mean_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
       }
     },
     "mean_1": {
@@ -1045,13 +1484,28 @@
         "dtype": "float32"
       }
     },
+    "add_4_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "add_4_c1"
+      },
+      "inputs": [],
+      "output": {
+        "name": "add_4_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
     "add_4": {
       "op": "ElementwiseOp",
       "op_fields": {
         "fn": "add"
       },
       "inputs": [
-        "mean_1"
+        "mean_1",
+        "add_4_c1"
       ],
       "output": {
         "name": "add_4",
