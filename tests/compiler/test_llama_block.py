@@ -6,6 +6,7 @@ from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import (
     ConstantOp,
     ElementwiseOp,
+    FusedReduceElementwiseOp,
     FusedSoftmaxOp,
     InputOp,
     ReduceOp,
@@ -41,22 +42,20 @@ def _build_llama_block():
     wg = _const("Wg", ("D", "I"))
     wu = _const("Wu", ("D", "I"))
     wd = _const("Wd", ("I", "D"))
-    inv_n = _const("inv_n", (1,))
     eps = _const("eps", (1,))
     scale = _const("scale", (1,))
     one = _const("one", (1,))
 
     # --- RMSNorm 1 ---
     def _rmsnorm(prefix, inp_id, w_id):
-        sq = g.add_node(
-            op=ElementwiseOp(fn="mul"), inputs=[inp_id, inp_id], output=Tensor(f"{prefix}_sq", ("S", "D")), node_id=f"{prefix}_sq"
-        )
-        red = g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=[sq], output=Tensor(f"{prefix}_sum", ("S",)), node_id=f"{prefix}_sum")
-        mean = g.add_node(
-            op=ElementwiseOp(fn="mul"), inputs=[red, inv_n], output=Tensor(f"{prefix}_mean", ("S",)), node_id=f"{prefix}_mean"
+        sq_norm = g.add_node(
+            op=FusedReduceElementwiseOp(reduce_fn="sum", elementwise_fn="mul", axis=1),
+            inputs=[inp_id, inp_id],
+            output=Tensor(f"{prefix}_sq_norm", ("S",)),
+            node_id=f"{prefix}_sq_norm",
         )
         add_eps = g.add_node(
-            op=ElementwiseOp(fn="add"), inputs=[mean, eps], output=Tensor(f"{prefix}_var", ("S",)), node_id=f"{prefix}_var"
+            op=ElementwiseOp(fn="add"), inputs=[sq_norm, eps], output=Tensor(f"{prefix}_var", ("S",)), node_id=f"{prefix}_var"
         )
         rsqrt = g.add_node(
             op=ElementwiseOp(fn="rsqrt"), inputs=[add_eps], output=Tensor(f"{prefix}_rsqrt", ("S",)), node_id=f"{prefix}_rsqrt"

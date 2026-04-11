@@ -4,6 +4,7 @@ from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import (
     ConstantOp,
     ElementwiseOp,
+    FusedReduceElementwiseOp,
     FusedRMSNormOp,
     FusedSiLUMulOp,
     FusedSoftmaxOp,
@@ -36,18 +37,18 @@ def _make_rmsnorm_graph():
     g = Graph()
     x = g.add_node(op=InputOp(), inputs=[], output=Tensor("x", ("S", "D")), node_id="x")
     w = g.add_node(op=InputOp(), inputs=[], output=Tensor("w", ("D",)), node_id="w")
-    inv_n = g.add_node(op=ConstantOp(name="inv_n"), inputs=[], output=Tensor("inv_n", (1,)), node_id="inv_n")
     eps = g.add_node(op=ConstantOp(name="eps"), inputs=[], output=Tensor("eps", (1,)), node_id="eps")
     g.inputs = [x]
 
-    # x * x (fan-out: same x node used twice)
-    sq = g.add_node(op=ElementwiseOp(fn="mul"), inputs=[x, x], output=Tensor("sq", ("S", "D")), node_id="sq")
-    # sum(x*x)
-    red = g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=[sq], output=Tensor("sum_sq", ("S",)), node_id="red")
-    # sum * inv_n
-    mean = g.add_node(op=ElementwiseOp(fn="mul"), inputs=[red, inv_n], output=Tensor("mean", ("S",)), node_id="mean")
-    # mean + eps
-    add_eps = g.add_node(op=ElementwiseOp(fn="add"), inputs=[mean, eps], output=Tensor("var", ("S",)), node_id="add_eps")
+    # Squared norm: FusedReduceElementwiseOp(sum, mul) — produced by decomposition pass
+    sq_norm = g.add_node(
+        op=FusedReduceElementwiseOp(reduce_fn="sum", elementwise_fn="mul", axis=1),
+        inputs=[x, x],
+        output=Tensor("sq_norm", ("S",)),
+        node_id="sq_norm",
+    )
+    # sq_norm + eps
+    add_eps = g.add_node(op=ElementwiseOp(fn="add"), inputs=[sq_norm, eps], output=Tensor("var", ("S",)), node_id="add_eps")
     # rsqrt(var)
     rsqrt = g.add_node(op=ElementwiseOp(fn="rsqrt"), inputs=[add_eps], output=Tensor("rsqrt", ("S",)), node_id="rsqrt")
     # x * rsqrt (fan-out: same x node)
