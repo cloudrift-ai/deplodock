@@ -99,7 +99,8 @@ def test_tinyllama_compile_fuses_matmuls():
     compiled = rewriter.apply(g)
 
     ops = _count_ops(compiled)
-    assert ops.get("MatmulOp", 0) == 7, f"Expected 7 MatmulOp, got {ops}"
+    # 9 matmuls: 7 linear projections + QK (from sdpa decomposition) + attn@V
+    assert ops.get("MatmulOp", 0) == 9, f"Expected 9 MatmulOp, got {ops}"
 
 
 def test_tinyllama_compile_reduces_node_count():
@@ -131,10 +132,9 @@ def test_tinyllama_compile_no_reduce_sum_left():
     compiled = rewriter.apply(g)
 
     reduce_sum_count = sum(1 for n in compiled.nodes.values() if isinstance(n.op, ReduceOp) and n.op.fn == "sum")
-    # The only remaining ReduceOp{sum} should be from mean (RMSNorm), not from matmul.
-    # torch.export decomposes mean as sum+div, but in this trace mean is kept as ReduceOp{sum}.
-    # After matmul fusion: 9 total ReduceOp{sum} - 7 matmuls = 2 remaining (RMSNorm mean).
-    assert reduce_sum_count == 2, f"Expected 2 Reduce{{sum}} (RMSNorm), got {reduce_sum_count}"
+    # All Reduce{sum} consumed: matmul rule fuses projections + sdpa matmuls,
+    # squared_norm rule fuses RMSNorm squared norms, softmax decomposition uses its own reduce.
+    assert reduce_sum_count == 0, f"Expected 0 Reduce{{sum}}, got {reduce_sum_count}"
 
 
 def test_tinyllama_roundtrip_serialization():
