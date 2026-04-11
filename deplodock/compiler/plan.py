@@ -60,7 +60,12 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
     OpKernel (compute ops). Buffer shapes come from node.output.shape.
     Op types are derived from the Op class name.
     """
+    import math
+
     from deplodock.compiler import ops as ops_module
+
+    def _prod(s: tuple) -> int:
+        return math.prod(x for x in s if isinstance(x, int)) if s else 1
 
     buffers: list[BufferSpec] = []
     op_kernels: list[OpKernel] = []
@@ -97,14 +102,21 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
 
         if isinstance(op, ops_module.MatmulOp):
             tag = "matmul"
+            a_shape = graph.nodes[inputs[0]].output.shape if inputs and inputs[0] in graph.nodes else ()
+            params["M"] = _prod(shape[:-1]) if len(shape) > 1 else (shape[0] if shape else 1)
+            params["N"] = shape[-1] if shape else 1
+            params["K"] = a_shape[-1] if a_shape else 1
         elif isinstance(op, ops_module.FusedRMSNormOp):
             tag = "rmsnorm"
             params["eps"] = op.eps
+            params["rows"] = _prod(shape[:-1]) if len(shape) > 1 else 1
+            params["dim"] = shape[-1] if shape else 1
         elif isinstance(op, ops_module.FusedSoftmaxOp):
             tag = "softmax"
             params["axis"] = op.axis
         elif isinstance(op, ops_module.FusedSiLUMulOp):
             tag = "silu_mul"
+            params["n"] = _prod(shape)
         elif isinstance(op, ops_module.FusedAttentionOp):
             tag = "attention"
             params["num_heads"] = op.num_heads
