@@ -51,15 +51,6 @@ class ScatterOp(Op):
     reduce_fn: str | None = None  # None = overwrite, "sum" = scatter-add
 
 
-@dataclass
-class FusedReduceElementwiseOp(Op):
-    """Fused reduce + elementwise — accumulate without materializing intermediate."""
-
-    reduce_fn: str  # "sum", "max", "prod"
-    elementwise_fn: str  # "mul", "add", ...
-    axis: int | str
-
-
 # ---------------------------------------------------------------------------
 # Structural ops (for lowering from PyTorch)
 # ---------------------------------------------------------------------------

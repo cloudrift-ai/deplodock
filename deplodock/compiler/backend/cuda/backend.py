@@ -185,7 +185,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
     from deplodock.compiler.backend.cuda.codegen import emit_kernel
     from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_graph
     from deplodock.compiler.ir import Graph, Tensor
-    from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp
+    from deplodock.compiler.ops import InputOp, MatmulOp
 
     m = op.params.get("M", 1)
     n = op.params.get("N", 1)
@@ -195,7 +195,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
     g = Graph()
     a = g.add_node(InputOp(), [], Tensor("A", (m, k)), node_id="A")
     b = g.add_node(InputOp(), [], Tensor("B", (k, n)), node_id="B")
-    c = g.add_node(FusedReduceElementwiseOp("sum", "mul", 1), [a, b], Tensor("C", (m, n)), node_id="C")
+    c = g.add_node(MatmulOp(), [a, b], Tensor("C", (m, n)), node_id="C")
     g.inputs = [a, b]
     g.outputs = [c]
 

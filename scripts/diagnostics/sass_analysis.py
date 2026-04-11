@@ -43,7 +43,7 @@ from deplodock.compiler.backend.cuda.lower import lower_graph  # noqa: E402
 from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
 from deplodock.compiler.ir import Graph, Tensor  # noqa: E402
-from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp  # noqa: E402
+from deplodock.compiler.ops import InputOp, MatmulOp  # noqa: E402
 from deplodock.compiler.rewriter import Rewriter  # noqa: E402
 
 # Opcode families we care about for the histogram. The article groups by these.
@@ -78,7 +78,7 @@ def make_matmul_graph() -> Graph:
     g = Graph()
     a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
     b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
-    c = g.add_node(FusedReduceElementwiseOp("sum", "mul", 1), [a, b], Tensor("C", ("M", "N")))
+    c = g.add_node(MatmulOp(), [a, b], Tensor("C", ("M", "N")))
     g.inputs = [a, b]
     g.outputs = [c]
     return g
