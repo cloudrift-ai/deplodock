@@ -120,11 +120,29 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             params["kernel_source"] = op.kernel_source
             params["region_ops_count"] = len(op.region_ops)
             params["_region_ops"] = op.region_ops  # for backend matmul detection
+            # Store input shapes so the backend can infer matmul K dimension.
+            all_shapes = {inp_id: graph.nodes[inp_id].output.shape for inp_id in node.inputs if inp_id in graph.nodes}
+            # Include shapes for intermediate region op nodes (needed by kernel_gen
+            # to determine reduction dimensions).
+            for rid, _, _ in op.region_ops:
+                if rid in graph.nodes:
+                    all_shapes[rid] = graph.nodes[rid].output.shape
+            params["_input_shapes"] = all_shapes
+            # Pass full shapes map (includes intermediates) for kernel generation.
+            params["_shapes"] = dict(op.shapes) if op.shapes else all_shapes
+            # Preserve original input/output names for kernel generation.
+            # The plan uses fused node IDs as buffer names, but the kernel
+            # source must use the original names from the region_ops.
+            params["_output_names"] = list(op.output_names)
+            params["_input_names"] = list(op.input_names)
         else:
             tag = op_type.lower()
 
         # Add shape info to params for the backend.
         params["shape"] = shape
+        # Store input shapes for broadcasting/dimension inference.
+        if "_input_shapes" not in params:
+            params["_input_shapes"] = {inp_id: graph.nodes[inp_id].output.shape for inp_id in node.inputs if inp_id in graph.nodes}
 
         op_kernels.append(OpKernel(op=tag, inputs=inputs, outputs=outputs, params=params))
 

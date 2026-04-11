@@ -34,8 +34,6 @@ def _handle_run(args):
         dump.dump_input_graph(graph)
 
     from deplodock.compiler.fusion import auto_fuse
-    from deplodock.compiler.kernel_gen import generate_kernel
-    from deplodock.compiler.ops import FusedRegionOp
 
     # Apply decomposition + matmul recognition.
     rules_dir = Path(__file__).parent.parent / "compiler" / "rules"
@@ -46,16 +44,8 @@ def _handle_run(args):
     if dump:
         dump.dump_passes(pass_traces)
 
-    # Auto-fuse remaining ops into regions + generate kernels.
+    # Auto-fuse remaining ops into regions.
     compiled = auto_fuse(compiled)
-    shapes = {nid: compiled.nodes[nid].output.shape for nid in compiled.nodes}
-    # Also collect shapes from original graph for region ops.
-    for nid in graph.nodes:
-        shapes[nid] = graph.nodes[nid].output.shape
-    for nid in compiled.nodes:
-        node = compiled.nodes[nid]
-        if isinstance(node.op, FusedRegionOp) and not node.op.kernel_source:
-            node.op.kernel_source = generate_kernel(node.op, f"kernel_{nid}", shapes)
 
     if dump:
         dump.dump_fused_graph(compiled)

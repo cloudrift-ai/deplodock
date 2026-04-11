@@ -17,11 +17,11 @@ from pathlib import Path
 
 import pytest
 
+from deplodock.compiler.backend.cuda.kernel_gen import generate_kernel
 from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program, run_program
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.kernel_gen import generate_kernel
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp, FusedRegionOp, InputOp, ReduceOp
 
 requires_cuda = pytest.mark.skipif(
@@ -417,7 +417,7 @@ def test_kernel_gen_matmul_residual_add():
 
 
 def _compile_and_run(g: Graph, dump=None) -> dict[str, list[float]]:
-    """Full pipeline: auto_fuse → kernel_gen → plan → CudaBackend.run()."""
+    """Full pipeline: auto_fuse → plan → CudaBackend (auto-generates kernels) → run."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.plan import plan_graph
 
@@ -425,15 +425,6 @@ def _compile_and_run(g: Graph, dump=None) -> dict[str, list[float]]:
         dump.dump_input_graph(g)
 
     fused = auto_fuse(g)
-
-    # Generate kernels for all FusedRegionOps.
-    shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
-    for nid in fused.nodes:
-        shapes[nid] = fused.nodes[nid].output.shape
-    for nid in fused.nodes:
-        node = fused.nodes[nid]
-        if isinstance(node.op, FusedRegionOp) and not node.op.kernel_source:
-            node.op.kernel_source = generate_kernel(node.op, f"kernel_{nid}", shapes)
 
     if dump:
         dump.dump_fused_graph(fused)
