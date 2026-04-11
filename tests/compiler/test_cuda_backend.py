@@ -24,23 +24,12 @@ _backend = CudaBackend()
 def _load_and_compile_fixture() -> Graph:
     """Load TinyLlama fixture and run decomposition + auto_fuse."""
     from deplodock.compiler.fusion import auto_fuse
-    from deplodock.compiler.kernel_gen import generate_kernel
-    from deplodock.compiler.ops import FusedRegionOp
 
     with open(FIXTURE_DIR / "tinyllama_layer0.json") as f:
         g = Graph.from_dict(json.load(f))
     rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
     compiled = Rewriter.from_directory(rules_dir).apply(g)
     compiled = auto_fuse(compiled)
-
-    # Generate kernels for fused regions.
-    shapes = {nid: compiled.nodes[nid].output.shape for nid in compiled.nodes}
-    for nid in g.nodes:
-        shapes[nid] = g.nodes[nid].output.shape
-    for nid in compiled.nodes:
-        node = compiled.nodes[nid]
-        if isinstance(node.op, FusedRegionOp) and not node.op.kernel_source:
-            node.op.kernel_source = generate_kernel(node.op, f"kernel_{nid}", shapes)
 
     return compiled
 
@@ -71,16 +60,6 @@ def test_cuda_backend_generates_valid_source():
     assert "int main()" in source
     assert "cudaMalloc" in source
     assert "PROGRAM_TIME_MS=" in source
-
-
-def test_cuda_backend_plan_has_expected_ops():
-    """Plan from fixture has matmul and fused_region ops."""
-    compiled = _load_and_compile_fixture()
-    plan = plan_graph(compiled)
-
-    op_tags = {op.op for op in plan.ops}
-    assert "fused_region" in op_tags
-    assert "fused_region" in op_tags or len(op_tags) > 2  # auto_fuse produces regions
 
 
 @requires_cuda

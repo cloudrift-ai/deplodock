@@ -129,7 +129,6 @@ compiler/
 │   ├── decomposition/ #     Decompose high-level ops → primitives
 │   └── fusion/       #      (empty — auto_fuse handles all fusion)
 ├── fusion.py         # [L2] auto_fuse: automatic fusion region discovery
-├── kernel_gen.py     # [L2] Generate CUDA kernels from FusedRegionOp
 ├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan, plan_graph
 ├── dump.py           # [--] CompilerDump: debug artifact collector (cross-layer)
 ├── pipeline.py       # [L2] compile_graph (graph optimization only)
@@ -153,6 +152,7 @@ compiler/
 │       │   └── matmul_dual_silu_mul.cu
 │       ├── ir.py         #  CUDA imperative AST (KernelDef, Expr, Stmt)
 │       ├── codegen.py    #  KernelDef → CUDA C source
+│       ├── kernel_gen.py  #  FusedRegionOp → CUDA source (pointwise + reduce)
 │       ├── lower.py      #  Graph → KernelDef (SGEMM strategies + TMA)
 │       ├── runner.py     #  Legacy single-kernel compile + run + benchmark
 │       └── tuning.py     #  Per-GPU empirical tuning profiles
@@ -245,7 +245,7 @@ Decomposes high-level ops from `torch.export` into primitives:
 - Structural ops (reshape, transpose) always merge
 - Produces `FusedRegionOp` nodes
 
-`kernel_gen.py` generates CUDA kernels from each `FusedRegionOp` by walking its primitive ops directly — no hand-written templates needed for pointwise or reduction patterns.
+`cuda/kernel_gen.py` generates CUDA kernels from each `FusedRegionOp` by walking its primitive ops directly — no hand-written templates needed for pointwise or reduction patterns. The CUDA backend auto-generates kernels during `compile()` for any `FusedRegionOp` that doesn't have a pre-filled `kernel_source`.
 
 ## CUDA Backend Details
 

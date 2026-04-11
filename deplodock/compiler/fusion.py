@@ -68,7 +68,7 @@ def _is_fusible_op(op) -> bool:
     """Is this a primitive op that can participate in auto-fusion?
 
     Only ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp are fusible.
-    All other ops (MatmulOp, old fused ops, FusedRegionOp) stay standalone.
+    All other ops (FusedRegionOp, etc.) stay standalone.
     """
     from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 
@@ -76,26 +76,52 @@ def _is_fusible_op(op) -> bool:
 
 
 def _can_merge(graph: Graph, uf: UnionFind, a_id: str, b_id: str) -> bool:
-    """Check if merging two regions would create a cycle."""
+    """Check if merging two regions would create a cycle or shape incompatibility."""
     region_a = uf.members(a_id)
     region_b = uf.members(b_id)
     merged = region_a | region_b
 
-    # Check: is there a path from any node in region_b to any node in region_a
-    # that goes OUTSIDE the merged region? If so, merging creates a cycle.
-    for nid in merged:
-        node = graph.nodes[nid]
-        for inp_id in node.inputs:
-            if inp_id in graph.nodes and inp_id not in merged:
-                # External input — check if it depends on something in the merged region.
-                # Simple check: if the external node's region overlaps with merged, skip.
-                inp_root = uf.find(inp_id) if inp_id in uf._parent else None
-                if inp_root and uf.find(inp_id) != uf.find(a_id) and uf.find(inp_id) != uf.find(b_id):
-                    # This external input is in a third region — safe.
-                    pass
+    # Shape compatibility: the kernel generator indexes all 2D+ external inputs with the
+    # same row*cols+j pattern. If those inputs have different total sizes, the
+    # generated kernel will access out of bounds. 1D inputs (weight vectors)
+    # and scalars are OK — they use [j] or [0] indexing respectively.
+    #
+    # Exception: 2-op matmul regions (mul + reduce_sum) are handled by the
+    # backend's SGEMM path, not the kernel generator, so different input sizes are fine.
+    from deplodock.compiler.ops import ElementwiseOp as _Ew
+    from deplodock.compiler.ops import ReduceOp as _Red
 
-    # Stronger cycle check: try the merge, verify topological sort still works on region DAG.
-    # For now, use a simpler heuristic: only merge along single-consumer edges (no fan-out).
+    # Count fusible ops in the merged region.
+    fusible_ops = [(nid, graph.nodes[nid].op) for nid in merged]
+    is_2op_matmul = (
+        len(fusible_ops) == 2
+        and any(isinstance(op, _Ew) and op.fn == "mul" for _, op in fusible_ops)
+        and any(isinstance(op, _Red) and op.fn == "sum" for _, op in fusible_ops)
+    )
+
+    if not is_2op_matmul:
+        sizes_full: set[int] = set()
+        for nid in merged:
+            node = graph.nodes[nid]
+            for inp_id in node.inputs:
+                if inp_id not in merged and inp_id in graph.nodes:
+                    inp_shape = graph.nodes[inp_id].output.shape
+                    inp_size = _tensor_size(inp_shape)
+                    # Skip scalars and per-row scalars (broadcastable).
+                    # A (N,1) shape is a per-row scalar — the kernel generator accesses
+                    # it as a scalar per row, not with row*cols+j.
+                    if inp_size <= 1:
+                        continue
+                    if len(inp_shape) >= 2 and all((isinstance(d, int) and d == 1) for d in inp_shape[1:]):
+                        continue  # shape like (N, 1) or (N, 1, 1) — per-row scalar
+                    if len(inp_shape) >= 2:
+                        sizes_full.add(inp_size)
+
+        # All 2D+ external inputs (that aren't per-row scalars) must have
+        # the same total size — the kernel generator uses one row*cols+j index for all.
+        if len(sizes_full) > 1:
+            return False
+
     return True
 
 
@@ -143,7 +169,8 @@ def auto_fuse(graph: Graph) -> Graph:
     # Build fused regions.
     groups = uf.all_groups()
 
-    # Only fuse groups with more than one op (singletons stay as-is).
+    # Only wrap multi-op groups in FusedRegionOps. Singletons stay as
+    # individual ops — the backend handles them with inline kernels.
     fused_groups = [grp for grp in groups if len(grp) > 1]
 
     # For each fused group, replace with FusedRegionOp.
@@ -184,11 +211,20 @@ def auto_fuse(graph: Graph) -> Graph:
         primary_out = external_outputs[0]
         out_tensor = g.nodes[primary_out].output
 
+        # Collect shapes for all nodes in the region + external inputs.
+        region_shapes: dict[str, tuple] = {}
+        for inp_id in external_inputs:
+            if inp_id in g.nodes:
+                region_shapes[inp_id] = g.nodes[inp_id].output.shape
+        for nid in topo:
+            region_shapes[nid] = g.nodes[nid].output.shape
+
         # Create FusedRegionOp node.
         fused_op = FusedRegionOp(
             region_ops=region_ops,
             input_names=external_inputs,
             output_names=external_outputs,
+            shapes=region_shapes,
         )
         fused_id = g.add_node(
             op=fused_op,

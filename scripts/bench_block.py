@@ -187,8 +187,6 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
             dump.dump_input_graph(graph)
 
         from deplodock.compiler.fusion import auto_fuse
-        from deplodock.compiler.kernel_gen import generate_kernel
-        from deplodock.compiler.ops import FusedRegionOp
 
         # Decompose + matmul recognition + auto-fuse.
         rules_dir = Path(__file__).parent.parent / "deplodock" / "compiler" / "rules"
@@ -200,15 +198,6 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
             dump.dump_passes(pass_traces)
 
         compiled = auto_fuse(compiled)
-
-        # Generate kernels for fused regions.
-        shapes = {nid: compiled.nodes[nid].output.shape for nid in compiled.nodes}
-        for nid in graph.nodes:
-            shapes[nid] = graph.nodes[nid].output.shape
-        for nid in compiled.nodes:
-            node = compiled.nodes[nid]
-            if isinstance(node.op, FusedRegionOp) and not node.op.kernel_source:
-                node.op.kernel_source = generate_kernel(node.op, f"kernel_{nid}", shapes)
 
         if dump:
             dump.dump_fused_graph(compiled)

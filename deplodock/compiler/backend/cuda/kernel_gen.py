@@ -59,9 +59,21 @@ def _gen_pointwise_kernel(region: FusedRegionOp, name: str, shapes: dict[str, tu
     body_lines = ["    int i = blockIdx.x * blockDim.x + threadIdx.x;", "    if (i >= n) return;", ""]
 
     # Map node_id → C variable name.
+    # Determine output size — this is the 'n' that the kernel iterates over.
+    out_shape = shapes.get(region.output_names[0], (1,))
+    out_size = math.prod(d for d in out_shape if isinstance(d, int))
+
     var_map: dict[str, str] = {}
     for inp in region.input_names:
-        var_map[inp] = f"{_safe(inp)}[i]"
+        inp_shape = shapes.get(inp, (1,))
+        inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
+        if inp_size == 1:
+            var_map[inp] = f"{_safe(inp)}[0]"
+        elif inp_size < out_size:
+            # Broadcasting: smaller input repeats along outer dims.
+            var_map[inp] = f"{_safe(inp)}[i % {inp_size}]"
+        else:
+            var_map[inp] = f"{_safe(inp)}[i]"
 
     for node_id, op, input_ids in region.region_ops:
         if isinstance(op, (ReshapeOp, TransposeOp)):
@@ -170,10 +182,14 @@ def _gen_reduce_kernel(region: FusedRegionOp, name: str, shapes: dict[str, tuple
     var_map: dict[str, str] = {}
     for inp in region.input_names:
         inp_shape = shapes.get(inp, (1,))
+        inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
         if len(inp_shape) >= 2:
             var_map[inp] = f"{_safe(inp)}[row * cols + j]"
+        elif inp_size == 1:
+            # Scalar constant (e.g., epsilon with shape (1,)) — always index 0.
+            var_map[inp] = f"{_safe(inp)}[0]"
         elif len(inp_shape) == 1:
-            # 1D input (e.g., weight vector) — index by j.
+            # 1D vector (e.g., weight with shape (D,)) — index by j.
             var_map[inp] = f"{_safe(inp)}[j]"
         else:
             var_map[inp] = f"{_safe(inp)}[0]"
@@ -232,45 +248,89 @@ def _gen_reduce_kernel(region: FusedRegionOp, name: str, shapes: dict[str, tuple
 
     # --- Epilogue: second pass over cols if needed ---
     if epilogue_ops:
-        body_lines.append("    // Epilogue pass")
-        body_lines.append("    for (int j = threadIdx.x; j < cols; j += blockDim.x) {")
-
-        # Re-load inputs that the epilogue needs.
+        # Check if the epilogue needs per-element input (re-reads 2D inputs).
+        # If epilogue only uses reduce results and scalars, it's per-row.
+        epilogue_needs = _needed_by(epilogue_ops) | _needed_by(
+            prologue_ops if any(node_id in _needed_by(epilogue_ops) for node_id, _, _ in prologue_ops) else []
+        )
+        needs_per_element = False
         for inp in region.input_names:
-            inp_shape = shapes.get(inp, (1,))
-            if len(inp_shape) >= 2:
-                var_map[inp] = f"{_safe(inp)}[row * cols + j]"
-            elif len(inp_shape) == 1:
-                var_map[inp] = f"{_safe(inp)}[j]"
+            if inp in epilogue_needs:
+                inp_shape = shapes.get(inp, (1,))
+                inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
+                if inp_size > 1:
+                    needs_per_element = True
+                    break
+        # Also check if any prologue op needed by epilogue reads 2D inputs.
+        if not needs_per_element:
+            for node_id, _, _input_ids in prologue_ops:
+                if node_id in _needed_by(epilogue_ops):
+                    needs_per_element = True
+                    break
 
-        # Re-compute prologue values needed by epilogue.
-        for node_id, op, input_ids in prologue_ops:
-            if isinstance(op, ElementwiseOp) and node_id in _needed_by(epilogue_ops):
-                a = var_map.get(input_ids[0], "0.0f") if input_ids else "0.0f"
-                b = var_map.get(input_ids[1], "0.0f") if len(input_ids) > 1 else "0.0f"
-                expr = _EXPR.get(op.fn, "0.0f").format(a=a, b=b)
-                var = f"p_{_safe(node_id)}"
-                body_lines.append(f"        float {var} = {expr};")
-                var_map[node_id] = var
+        if needs_per_element:
+            body_lines.append("    // Epilogue pass")
+            body_lines.append("    for (int j = threadIdx.x; j < cols; j += blockDim.x) {")
 
-        for node_id, op, input_ids in epilogue_ops:
-            if isinstance(op, (ReshapeOp, TransposeOp)):
-                var_map[node_id] = var_map.get(input_ids[0], "0.0f")
-                continue
-            if isinstance(op, ElementwiseOp):
-                a = var_map.get(input_ids[0], "0.0f") if input_ids else "0.0f"
-                b = var_map.get(input_ids[1], "0.0f") if len(input_ids) > 1 else "0.0f"
-                expr = _EXPR.get(op.fn, "0.0f").format(a=a, b=b)
-                var = f"e_{_safe(node_id)}"
-                body_lines.append(f"        float {var} = {expr};")
-                var_map[node_id] = var
+            # Re-load inputs that the epilogue needs.
+            for inp in region.input_names:
+                inp_shape = shapes.get(inp, (1,))
+                inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
+                if len(inp_shape) >= 2:
+                    var_map[inp] = f"{_safe(inp)}[row * cols + j]"
+                elif inp_size == 1:
+                    var_map[inp] = f"{_safe(inp)}[0]"
+                elif len(inp_shape) == 1:
+                    var_map[inp] = f"{_safe(inp)}[j]"
 
-        # Write outputs.
-        for out_id in region.output_names:
-            val = var_map.get(out_id, "0.0f")
-            body_lines.append(f"        {_safe(out_id)}[row * cols + j] = {val};")
+            # Re-compute prologue values needed by epilogue.
+            for node_id, op, input_ids in prologue_ops:
+                if isinstance(op, ElementwiseOp) and node_id in _needed_by(epilogue_ops):
+                    a = var_map.get(input_ids[0], "0.0f") if input_ids else "0.0f"
+                    b = var_map.get(input_ids[1], "0.0f") if len(input_ids) > 1 else "0.0f"
+                    expr = _EXPR.get(op.fn, "0.0f").format(a=a, b=b)
+                    var = f"p_{_safe(node_id)}"
+                    body_lines.append(f"        float {var} = {expr};")
+                    var_map[node_id] = var
 
-        body_lines.append("    }")
+            for node_id, op, input_ids in epilogue_ops:
+                if isinstance(op, (ReshapeOp, TransposeOp)):
+                    var_map[node_id] = var_map.get(input_ids[0], "0.0f")
+                    continue
+                if isinstance(op, ElementwiseOp):
+                    a = var_map.get(input_ids[0], "0.0f") if input_ids else "0.0f"
+                    b = var_map.get(input_ids[1], "0.0f") if len(input_ids) > 1 else "0.0f"
+                    expr = _EXPR.get(op.fn, "0.0f").format(a=a, b=b)
+                    var = f"e_{_safe(node_id)}"
+                    body_lines.append(f"        float {var} = {expr};")
+                    var_map[node_id] = var
+
+            # Write outputs.
+            for out_id in region.output_names:
+                val = var_map.get(out_id, "0.0f")
+                body_lines.append(f"        {_safe(out_id)}[row * cols + j] = {val};")
+
+            body_lines.append("    }")
+        else:
+            # Per-row epilogue: output is a scalar per row (e.g., rsqrt after reduce).
+            body_lines.append("    // Per-row epilogue (no 2D inputs needed)")
+            for node_id, op, input_ids in epilogue_ops:
+                if isinstance(op, (ReshapeOp, TransposeOp)):
+                    var_map[node_id] = var_map.get(input_ids[0], "0.0f")
+                    continue
+                if isinstance(op, ElementwiseOp):
+                    a = var_map.get(input_ids[0], "0.0f") if input_ids else "0.0f"
+                    b = var_map.get(input_ids[1], "0.0f") if len(input_ids) > 1 else "0.0f"
+                    expr = _EXPR.get(op.fn, "0.0f").format(a=a, b=b)
+                    var = f"e_{_safe(node_id)}"
+                    body_lines.append(f"    float {var} = {expr};")
+                    var_map[node_id] = var
+
+            body_lines.append("    if (threadIdx.x == 0) {")
+            for out_id in region.output_names:
+                val = var_map.get(out_id, "0.0f")
+                body_lines.append(f"        {_safe(out_id)}[row] = {val};")
+            body_lines.append("    }")
     else:
         # No epilogue — output is the reduction result.
         # Write scalar output per row.

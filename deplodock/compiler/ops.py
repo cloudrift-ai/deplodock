@@ -1,6 +1,6 @@
 """Tensor operation types for the minimal IR."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -83,15 +83,6 @@ class ReshapeOp(Op):
 
 
 @dataclass
-class MatmulOp(Op):
-    """Matrix multiply — fused Reduce{sum}(Elementwise{mul}).
-
-    Produced by the matmul recognition rule (rules/fusion/001).
-    Has specialized SGEMM lowering in backend/cuda/lower.py.
-    """
-
-
-@dataclass
 class FusedRegionOp(Op):
     """A fused region of primitive ops with a generated kernel.
 
@@ -103,4 +94,5 @@ class FusedRegionOp(Op):
     region_ops: list  # [(node_id, op, input_ids), ...] — primitive ops in topo order
     input_names: list  # external inputs to this region
     output_names: list  # external outputs from this region
-    kernel_source: str = ""  # generated CUDA source (filled by kernel_gen)
+    kernel_source: str = ""  # generated CUDA source (filled by cuda/kernel_gen)
+    shapes: dict = field(default_factory=dict)  # node_id → shape for all region nodes + inputs
