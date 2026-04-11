@@ -137,6 +137,10 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
         elif isinstance(op, ops_module.ScatterOp):
             tag = "scatter"
             params["axis"] = op.axis
+        elif isinstance(op, ops_module.FusedRegionOp):
+            tag = "fused_region"
+            params["kernel_source"] = op.kernel_source
+            params["region_ops_count"] = len(op.region_ops)
         else:
             tag = op_type.lower()
 
