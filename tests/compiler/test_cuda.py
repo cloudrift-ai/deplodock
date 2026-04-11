@@ -1,5 +1,7 @@
 """Tests for CUDA backend: codegen, lowering, and end-to-end GPU execution."""
 
+from typing import Any
+
 import pytest
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
@@ -15,7 +17,7 @@ from deplodock.compiler.backend.cuda.ir import (
     Var,
     VarDecl,
 )
-from deplodock.compiler.backend.cuda.lower import lower_graph
+from deplodock.compiler.backend.cuda.lower import lower_matmul
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
@@ -23,10 +25,11 @@ from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 # ---- helpers ----
 
 
-def _make_matmul_graph(m=None, k=None, n=None):
+def _make_matmul_graph(m=None, k=None, n=None, **matmul_hints: Any):
     """Build primitive matmul graph: C = Reduce{sum}(Elementwise{mul}(A, B)).
 
     If m/k/n are None, uses symbolic dims ("M", "K", "N").
+    Any extra keyword arguments are set as cuda.matmul.* hints.
     """
     m_dim = m if m is not None else "M"
     k_dim = k if k is not None else "K"
@@ -38,6 +41,8 @@ def _make_matmul_graph(m=None, k=None, n=None):
     ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", (m_dim, k_dim, n_dim)), node_id="ew")
     c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", (m_dim, n_dim)), node_id="C")
     g.outputs = [c]
+    for key, val in matmul_hints.items():
+        g.hints.set(f"cuda.matmul.{key}", val)
     return g
 
 
@@ -79,7 +84,7 @@ def test_emit_simple_kernel():
 
 def test_emit_matmul_kernel():
     """Emit a matmul kernel from lowering and verify structure."""
-    kernel = lower_graph(_make_matmul_graph(4, 3, 2))
+    kernel = lower_matmul(_make_matmul_graph(4, 3, 2))
     source = emit_kernel(kernel)
 
     assert "__global__" in source
@@ -121,9 +126,9 @@ def test_emit_for_loop():
 # ---- lowering unit tests (no GPU needed) ----
 
 
-def test_lower_graph_produces_kernel():
+def test_lower_matmul_produces_kernel():
     """Lower a matmul and check the KernelDef structure."""
-    kernel = lower_graph(_make_matmul_graph())
+    kernel = lower_matmul(_make_matmul_graph())
 
     assert kernel.name == "fused_matmul"
     param_names = [p.name for p in kernel.params]
@@ -149,7 +154,7 @@ def test_matmul_end_to_end():
     """Full pipeline: lower → codegen → compile → run → verify."""
     M, K, N = 4, 3, 2
 
-    kernel = lower_graph(_make_matmul_graph())
+    kernel = lower_matmul(_make_matmul_graph())
     source = emit_kernel(kernel)
 
     # Test data.
@@ -180,7 +185,7 @@ def test_matmul_larger():
     """Test with a larger matrix to exercise multiple thread blocks."""
     M, K, N = 33, 17, 25  # intentionally not multiples of block size (16)
 
-    kernel = lower_graph(_make_matmul_graph())
+    kernel = lower_matmul(_make_matmul_graph())
     source = emit_kernel(kernel)
 
     # Simple test data: A=1s, B=1s → each C[i,j] should equal K.
@@ -208,14 +213,12 @@ def test_run_benchmark_surfaces_cuda_oom():
     OOMs at allocation time. The bench binary must exit non-zero and
     run_benchmark must raise, not silently report 0 ms.
     """
-    import dataclasses
-
     from deplodock.compiler.backend.cuda.runner import run_benchmark
     from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 
     strategy_map, _ = default_matmul_strategy_map()
-    cfg = dataclasses.replace(strategy_map[0][1], batch_count=8, k_splits=1)
-    kernel = lower_graph(_make_matmul_graph(), config=cfg)
+    hints = {**strategy_map[0][1], "batch_count": 8, "k_splits": 1}
+    kernel = lower_matmul(_make_matmul_graph(**hints))
     source = emit_kernel(kernel)
 
     huge = {"M": 65536, "N": 65536, "K": 65536, "batch": 8}
@@ -224,8 +227,8 @@ def test_run_benchmark_surfaces_cuda_oom():
         run_benchmark(kernel=kernel, kernel_source=source, dim_args=huge, num_iterations=2)
 
 
-# All matmul lowering strategies that lower_graph() recognizes.
-# Each entry: (strategy name, MatmulConfig overrides). The configs are the
+# All matmul lowering strategies that lower_matmul() recognizes.
+# Each entry: (strategy name, matmul hint overrides). The hints are the
 # minimum settings each strategy needs to compile — many have hardcoded
 # assumptions about block / coarsening dims and won't accept arbitrary values.
 ALL_STRATEGIES: list[tuple[str, dict]] = [
@@ -238,15 +241,12 @@ ALL_STRATEGIES: list[tuple[str, dict]] = [
 
 @pytest.mark.parametrize("strategy_name,overrides", ALL_STRATEGIES, ids=[s[0] for s in ALL_STRATEGIES])
 def test_lower_every_strategy(strategy_name, overrides):
-    """Every strategy listed in `lower_graph` must produce a valid KernelDef.
+    """Every strategy listed in lower_matmul must produce a valid KernelDef.
 
     Pure lowering — no nvcc, no GPU. Catches dispatcher / template errors after
     refactors like the `block_m`/`block_n` → `threads_y`/`threads_x` rename.
     """
-    from deplodock.compiler.backend.cuda.lower import MatmulConfig
-
-    cfg = MatmulConfig(strategy=strategy_name, **overrides)
-    kernel = lower_graph(_make_matmul_graph(), config=cfg)
+    kernel = lower_matmul(_make_matmul_graph(strategy=strategy_name, **overrides))
     source = emit_kernel(kernel)
     assert kernel.name
     assert source
@@ -269,11 +269,8 @@ def test_run_every_strategy_correctness(strategy_name, overrides):
     setup that the lightweight `run_kernel` helper doesn't perform — it's
     covered separately by the bench harness in `run_benchmark`.
     """
-    from deplodock.compiler.backend.cuda.lower import MatmulConfig
-
     M, K, N = 32, 32, 32
-    cfg = MatmulConfig(strategy=strategy_name, **overrides)
-    kernel = lower_graph(_make_matmul_graph(), config=cfg)
+    kernel = lower_matmul(_make_matmul_graph(strategy=strategy_name, **overrides))
     source = emit_kernel(kernel)
 
     a_data = [1.0] * (M * K)
@@ -293,12 +290,10 @@ def test_run_every_strategy_correctness(strategy_name, overrides):
 @requires_cuda
 def test_run_tma_db_strategy_via_bench():
     """TMA needs the bench harness's TMA descriptor setup; verify it via run_benchmark."""
-    from deplodock.compiler.backend.cuda.lower import MatmulConfig
     from deplodock.compiler.backend.cuda.runner import run_benchmark
 
-    cfg = MatmulConfig(strategy="tma_db", block_k=32, thread_m=8)
     M = N = K = 256  # multiple of TMA tile (224x128 → use 256 to keep things simple)
-    kernel = lower_graph(_make_matmul_graph(), config=cfg)
+    kernel = lower_matmul(_make_matmul_graph(strategy="tma_db", block_k=32, thread_m=8))
     source = emit_kernel(kernel)
     result = run_benchmark(
         kernel=kernel,

@@ -72,11 +72,9 @@ nvcc -O3 -arch="$arch" -lcublas -o "$TMPDIR/cublas_probe" "$TMPDIR/cublas_probe.
 "$REPO_DIR/venv/bin/python" - <<PY > /dev/null
 import sys, pathlib
 sys.path.insert(0, "$REPO_DIR")
-import dataclasses
-from deplodock.compiler.benchmark import run_adaptive_benchmark_suite
 from deplodock.compiler.backend.cuda.runner import generate_benchmark_program, _detect_arch
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
-from deplodock.compiler.backend.cuda.lower import lower_graph
+from deplodock.compiler.backend.cuda.lower import lower_matmul
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
@@ -91,19 +89,21 @@ g.outputs = [c]
 
 strategy_map, _ = default_matmul_strategy_map()
 size = $SIZE; batch = $BATCH
-selected = strategy_map[-1][1]
-for thr, cfg in strategy_map:
-    if size <= thr: selected = cfg; break
+selected = dict(strategy_map[-1][1])
+for thr, hints in strategy_map:
+    if size <= thr: selected = dict(hints); break
 if batch > 1:
-    selected = dataclasses.replace(selected, batch_count=batch, k_splits=1)
-kernel = lower_graph(g, config=selected)
+    selected["batch_count"] = batch; selected["k_splits"] = 1
+for k, v in selected.items():
+    g.hints.set(f"cuda.matmul.{k}", v)
+kernel = lower_matmul(g)
 src = emit_kernel(kernel)
 dim_args = {"M": size, "N": size, "K": size}
-if selected.k_splits > 1: dim_args["k_splits"] = selected.k_splits
-if selected.batch_count > 1: dim_args["batch"] = selected.batch_count
+if selected.get("k_splits", 1) > 1: dim_args["k_splits"] = selected["k_splits"]
+if selected.get("batch_count", 1) > 1: dim_args["batch"] = selected["batch_count"]
 prog = generate_benchmark_program(src, kernel, dim_args, num_iterations=2,
-    compare_cublas=False, coarsen_cols=selected.coarsen_cols, coarsen_rows=selected.coarsen_rows,
-    cublas_math_mode="default")
+    compare_cublas=False, coarsen_cols=selected.get("coarsen_cols", 1),
+    coarsen_rows=selected.get("coarsen_rows", 1), cublas_math_mode="default")
 pathlib.Path("$TMPDIR/fused_probe.cu").write_text(prog)
 PY
 nvcc -O3 --fmad=true -arch="$arch" -lcuda -lcurand -o "$TMPDIR/fused_probe" "$TMPDIR/fused_probe.cu" 2>&1 | tail -3

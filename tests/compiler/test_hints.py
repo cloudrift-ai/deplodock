@@ -153,33 +153,6 @@ def test_graph_copy_preserves_hints():
     assert g.hints.get("x") == 1
 
 
-# --- MatmulConfig.from_hints ---
-
-
-def test_matmul_config_from_hints_partial():
-    from deplodock.compiler.backend.cuda.lower import MatmulConfig
-
-    config = MatmulConfig.from_hints({"strategy": "tma_db", "block_k": 64})
-    assert config.strategy == "tma_db"
-    assert config.block_k == 64
-    assert config.threads_y == 16  # default
-
-
-def test_matmul_config_from_hints_empty():
-    from deplodock.compiler.backend.cuda.lower import MatmulConfig
-
-    config = MatmulConfig.from_hints({})
-    assert config == MatmulConfig()
-
-
-def test_matmul_config_from_hints_ignores_unknown():
-    from deplodock.compiler.backend.cuda.lower import MatmulConfig
-
-    config = MatmulConfig.from_hints({"strategy": "naive", "bogus_key": 999})
-    assert config.strategy == "naive"
-    assert not hasattr(config, "bogus_key")
-
-
 # --- Integration: hints flow through plan_graph ---
 
 

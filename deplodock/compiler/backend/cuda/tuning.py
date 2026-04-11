@@ -1,18 +1,18 @@
-"""GPU-specific default configs for the matmul kernel.
+"""GPU-specific default hint profiles for the matmul kernel.
 
-The best `MatmulConfig` for `tma_db` depends on the GPU's SM count, register
+The best tuning for ``tma_db`` depends on the GPU's SM count, register
 file, and clocks — Blackwell sm_120 cards (5090, RTX PRO 6000) share the same
-compute capability but tune to different `thread_m` values at large sizes.
+compute capability but tune to different ``thread_m`` values at large sizes.
 
-Dispatch is by GPU name (from `nvidia-smi --query-gpu=name`) because both cards
-report `sm_120` and identical per-SM smem, so compute capability cannot
+Dispatch is by GPU name (from ``nvidia-smi --query-gpu=name``) because both
+cards report ``sm_120`` and identical per-SM smem, so compute capability cannot
 distinguish them. Unknown GPUs fall back to the 5090 profile, which is the most
 thoroughly tuned and has been validated to also work reasonably on the Pro 6000
 (within ~5-10% of the per-card optimum).
 
-To add a new GPU: measure the best `(thread_m, block_k, k_splits)` per size with
-`scripts/bench_matmul.py --strategy tma_db --thread-m N --sizes S` and append a
-new entry to `_PROFILES`.
+To add a new GPU: measure the best ``(thread_m, block_k, k_splits)`` per size
+with ``scripts/bench_matmul.py --strategy tma_db --thread-m N --sizes S`` and
+append a new entry to ``_PROFILES``.
 """
 
 from __future__ import annotations
@@ -20,32 +20,35 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-
-from deplodock.compiler.backend.cuda.lower import MatmulConfig
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Type alias for a matmul hint dict (keys are cuda.matmul.* field names
+# without the prefix, e.g. {"strategy": "tma_db", "block_k": 32}).
+MatmulHints = dict[str, Any]
 
-def _tma(bk: int = 32, tm: int = 8, ks: int = 1) -> MatmulConfig:
+
+def _tma(bk: int = 32, tm: int = 8, ks: int = 1) -> MatmulHints:
     # tma_db hardcodes blockDim = (32, 8) inside lower.py — we record those
     # here so the JSON trace and markdown report show the actual launched
     # block, not the dataclass defaults that the lowering ignores.
-    return MatmulConfig(
-        strategy="tma_db",
-        block_k=bk,
-        threads_y=8,
-        threads_x=32,
-        thread_m=tm,
-        k_splits=ks,
-    )
+    return {
+        "strategy": "tma_db",
+        "block_k": bk,
+        "threads_y": 8,
+        "threads_x": 32,
+        "thread_m": tm,
+        "k_splits": ks,
+    }
 
 
-# Per-GPU strategy maps. Each entry is `(max_size, config)` — pick the first
+# Per-GPU strategy maps. Each entry is `(max_size, hints)` — pick the first
 # entry whose threshold is >= the matrix size. Tuned for square FP32 matmul.
 #
 # 5090 numbers come from the blog post (CUDA 13.2, sm_120, RTX 5090).
 # Pro 6000 numbers come from a TM sweep on driver 595 / CUDA 13.2 (April 2026).
-_PROFILE_5090: list[tuple[int, MatmulConfig]] = [
+_PROFILE_5090: list[tuple[int, MatmulHints]] = [
     (256, _tma(bk=32, tm=8, ks=4)),
     (512, _tma(bk=32, tm=8, ks=4)),
     (1024, _tma(bk=32, tm=8, ks=1)),
@@ -55,7 +58,7 @@ _PROFILE_5090: list[tuple[int, MatmulConfig]] = [
     (16384, _tma(bk=32, tm=28, ks=1)),
 ]
 
-_PROFILE_H200: list[tuple[int, MatmulConfig]] = [
+_PROFILE_H200: list[tuple[int, MatmulHints]] = [
     # Hopper sm_90. Quick TM sweep on H200 showed TM=8 was optimal at every
     # size — larger thread tiles regress (likely the first-gen Hopper TMA has
     # more issue-pressure than Blackwell's refined unit). The kernel does not
@@ -69,7 +72,7 @@ _PROFILE_H200: list[tuple[int, MatmulConfig]] = [
     (16384, _tma(bk=32, tm=8, ks=1)),
 ]
 
-_PROFILE_PRO6000: list[tuple[int, MatmulConfig]] = [
+_PROFILE_PRO6000: list[tuple[int, MatmulHints]] = [
     # Pro 6000 has 188 SMs (vs 5090's 170). Wave quantization matters more:
     # 1024 needs ks=4 to fill the device (128 blocks / 188 SMs = 0.68 wave),
     # and 8192 prefers TM=26 over the 5090's TM=28 (TM sweep 18-28 at 4096
@@ -91,7 +94,7 @@ _PROFILE_PRO6000: list[tuple[int, MatmulConfig]] = [
 
 # Match against the GPU name reported by `nvidia-smi --query-gpu=name`.
 # First matching pattern wins.
-_PROFILES: list[tuple[re.Pattern[str], list[tuple[int, MatmulConfig]], str]] = [
+_PROFILES: list[tuple[re.Pattern[str], list[tuple[int, MatmulHints]], str]] = [
     (re.compile(r"RTX\s*PRO\s*6000", re.IGNORECASE), _PROFILE_PRO6000, "rtx_pro_6000"),
     (re.compile(r"RTX\s*5090", re.IGNORECASE), _PROFILE_5090, "rtx_5090"),
     (re.compile(r"\bH200\b", re.IGNORECASE), _PROFILE_H200, "h200"),
@@ -120,14 +123,16 @@ def detect_gpu_name() -> str | None:
 
 def default_matmul_strategy_map(
     gpu_name: str | None = None,
-) -> tuple[list[tuple[int, MatmulConfig]], str]:
-    """Return the best-known `tma_db` strategy map for the given GPU.
+) -> tuple[list[tuple[int, MatmulHints]], str]:
+    """Return the best-known ``tma_db`` hint map for the given GPU.
 
-    If `gpu_name` is None, auto-detects via `nvidia-smi`. Falls back to the
-    5090 profile when the GPU is unknown or detection fails.
+    If ``gpu_name`` is None, auto-detects via ``nvidia-smi``. Falls back to
+    the 5090 profile when the GPU is unknown or detection fails.
 
-    Returns `(strategy_map, profile_name)` so callers can log which profile
-    was selected.
+    Returns ``(strategy_map, profile_name)`` so callers can log which profile
+    was selected. Each entry in the map is ``(max_size, hints_dict)`` where
+    ``hints_dict`` contains matmul hint keys (without the ``cuda.matmul.``
+    prefix).
     """
     if gpu_name is None:
         gpu_name = detect_gpu_name()

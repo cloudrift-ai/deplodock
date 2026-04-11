@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import dataclasses
 import json
 import logging
 import platform
@@ -21,12 +20,13 @@ import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # Add project root to path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
-from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_graph
+from deplodock.compiler.backend.cuda.lower import lower_matmul
 from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_benchmark
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir import Graph, Tensor
@@ -49,6 +49,20 @@ MATRIX_SIZES = [
     {"M": 8192, "N": 8192, "K": 8192},
     {"M": 16384, "N": 16384, "K": 16384},
 ]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Type alias for matmul hints (keys without cuda.matmul. prefix).
+MatmulHints = dict[str, Any]
+
+
+def _set_matmul_hints(graph: Graph, hints: MatmulHints) -> None:
+    """Set cuda.matmul.* hints on a graph from a flat dict."""
+    for k, v in hints.items():
+        graph.hints.set(f"cuda.matmul.{k}", v)
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +116,7 @@ class BenchmarkSuite:
 
 def run_benchmark_suite(
     graph: Graph,
-    config: MatmulConfig,
+    hints: MatmulHints,
     sizes: list[dict[str, int]] | None = None,
     output_dir: Path | None = None,
     description: str = "",
@@ -116,25 +130,29 @@ def run_benchmark_suite(
 
     suite = BenchmarkSuite(
         timestamp=timestamp,
-        strategy=config.strategy,
-        config=asdict(config) if hasattr(config, "__dataclass_fields__") else {},
+        strategy=hints.get("strategy", "naive"),
+        config=dict(hints),
         description=description,
         system_info=system_info or {},
     )
 
     try:
-        kernel = lower_graph(graph, config=config)
+        g = graph.copy()
+        _set_matmul_hints(g, hints)
+        kernel = lower_matmul(g)
         source = emit_kernel(kernel)
         suite.generated_code = source
 
-        logger.info("Generated kernel for strategy=%s", config.strategy)
+        logger.info("Generated kernel for strategy=%s", hints.get("strategy", "naive"))
 
         for dim_args in sizes:
             m, n = dim_args.get("M", 0), dim_args.get("N", 0)
-            if config.k_splits > 1:
-                dim_args = {**dim_args, "k_splits": config.k_splits}
-            if config.batch_count > 1:
-                dim_args = {**dim_args, "batch": config.batch_count}
+            k_splits = hints.get("k_splits", 1)
+            batch_count = hints.get("batch_count", 1)
+            if k_splits > 1:
+                dim_args = {**dim_args, "k_splits": k_splits}
+            if batch_count > 1:
+                dim_args = {**dim_args, "batch": batch_count}
             logger.info("Benchmarking %dx%d ...", m, n)
             try:
                 result = run_benchmark(
@@ -142,8 +160,8 @@ def run_benchmark_suite(
                     kernel_source=source,
                     dim_args=dim_args,
                     num_iterations=num_iterations,
-                    coarsen_cols=config.coarsen_cols,
-                    coarsen_rows=config.coarsen_rows,
+                    coarsen_cols=hints.get("coarsen_cols", 1),
+                    coarsen_rows=hints.get("coarsen_rows", 1),
                     cublas_math_mode=cublas_math_mode,
                 )
                 suite.results.append(result)
@@ -166,7 +184,7 @@ def run_benchmark_suite(
 
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{timestamp}_{config.strategy}.json"
+        filename = f"{timestamp}_{hints.get('strategy', 'naive')}.json"
         trace_path = output_dir / filename
         trace_path.write_text(suite.to_json())
         logger.info("Trace saved to %s", trace_path)
@@ -176,7 +194,7 @@ def run_benchmark_suite(
 
 def run_adaptive_benchmark_suite(
     graph: Graph,
-    strategy_map: list[tuple[int, MatmulConfig]],
+    strategy_map: list[tuple[int, MatmulHints]],
     sizes: list[dict[str, int]] | None = None,
     output_dir: Path | None = None,
     description: str = "",
@@ -191,18 +209,20 @@ def run_adaptive_benchmark_suite(
     suite = BenchmarkSuite(
         timestamp=timestamp,
         strategy="adaptive",
-        config={"strategy_map": [(t, asdict(c)) for t, c in strategy_map]},
+        config={"strategy_map": [(t, dict(h)) for t, h in strategy_map]},
         description=description,
         system_info=system_info or {},
     )
 
     try:
         kernels: dict[int, tuple] = {}
-        for _threshold, cfg in strategy_map:
-            key = id(cfg)
-            kernel = lower_graph(graph, config=cfg)
+        for _threshold, hints in strategy_map:
+            key = id(hints)
+            g = graph.copy()
+            _set_matmul_hints(g, hints)
+            kernel = lower_matmul(g)
             source = emit_kernel(kernel)
-            kernels[key] = (kernel, source, cfg)
+            kernels[key] = (kernel, source, hints)
 
         for dim_args in sizes:
             m = dim_args.get("M", 0)
@@ -211,9 +231,9 @@ def run_adaptive_benchmark_suite(
 
             max_tuned_size = strategy_map[-1][0]
             selected = strategy_map[-1][1]
-            for threshold, cfg in strategy_map:
+            for threshold, hints in strategy_map:
                 if size <= threshold:
-                    selected = cfg
+                    selected = hints
                     break
             else:
                 logger.warning(
@@ -221,28 +241,30 @@ def run_adaptive_benchmark_suite(
                     "the last entry (TM=%d, BK=%d, ks=%d). Numbers may be suboptimal.",
                     size,
                     max_tuned_size,
-                    selected.thread_m,
-                    selected.block_k,
-                    selected.k_splits,
+                    selected.get("thread_m", 1),
+                    selected.get("block_k", 16),
+                    selected.get("k_splits", 1),
                 )
 
-            kernel, source, cfg = kernels[id(selected)]
+            kernel, source, hints = kernels[id(selected)]
             suite.generated_code = source
 
             run_dim_args = dim_args
-            if selected.k_splits > 1:
-                run_dim_args = {**dim_args, "k_splits": selected.k_splits}
-            if selected.batch_count > 1:
-                run_dim_args = {**run_dim_args, "batch": selected.batch_count}
-            logger.info("Benchmarking %dx%d with %s ...", m, n, selected.strategy)
+            k_splits = hints.get("k_splits", 1)
+            batch_count = hints.get("batch_count", 1)
+            if k_splits > 1:
+                run_dim_args = {**dim_args, "k_splits": k_splits}
+            if batch_count > 1:
+                run_dim_args = {**run_dim_args, "batch": batch_count}
+            logger.info("Benchmarking %dx%d with %s ...", m, n, hints.get("strategy", "?"))
             try:
                 result = run_benchmark(
                     kernel=kernel,
                     kernel_source=source,
                     dim_args=run_dim_args,
                     num_iterations=num_iterations,
-                    coarsen_cols=cfg.coarsen_cols,
-                    coarsen_rows=cfg.coarsen_rows,
+                    coarsen_cols=hints.get("coarsen_cols", 1),
+                    coarsen_rows=hints.get("coarsen_rows", 1),
                     cublas_math_mode=cublas_math_mode,
                 )
                 suite.results.append(result)
@@ -250,7 +272,7 @@ def run_adaptive_benchmark_suite(
                     "  %dx%d [%s]: %.3f ms (cuBLAS: %.3f ms, eff: %.1f%%)",
                     m,
                     n,
-                    selected.strategy,
+                    hints.get("strategy", "?"),
                     result.kernel_time_ms,
                     result.cublas_time_ms or 0.0,
                     result.efficiency_pct or 0.0,
@@ -399,7 +421,7 @@ def main():
         strategy_map, profile_name = default_matmul_strategy_map()
         logger.info("Using matmul tuning profile: %s", profile_name)
         if batch > 1:
-            strategy_map = [(t, dataclasses.replace(c, batch_count=batch, k_splits=1)) for t, c in strategy_map]
+            strategy_map = [(t, {**h, "batch_count": batch, "k_splits": 1}) for t, h in strategy_map]
         suite = run_adaptive_benchmark_suite(
             graph,
             strategy_map,
@@ -411,19 +433,19 @@ def main():
             system_info=system_info,
         )
     else:
-        config = MatmulConfig(
-            strategy=args.strategy,
-            block_k=args.bk,
-            threads_y=args.threads_y,
-            threads_x=args.threads_x,
-            thread_m=args.thread_m,
-            assume_aligned=args.assume_aligned,
-            k_splits=args.k_splits,
-            batch_count=batch,
-        )
+        hints: MatmulHints = {
+            "strategy": args.strategy,
+            "block_k": args.bk,
+            "threads_y": args.threads_y,
+            "threads_x": args.threads_x,
+            "thread_m": args.thread_m,
+            "assume_aligned": args.assume_aligned,
+            "k_splits": args.k_splits,
+            "batch_count": batch,
+        }
         suite = run_benchmark_suite(
             graph,
-            config,
+            hints,
             sizes=sizes,
             output_dir=output_dir,
             description=args.description or f"{args.strategy} BK={args.bk} batch={batch}",

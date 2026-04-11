@@ -67,20 +67,26 @@ class MatmulConfig:
         return cls(**{k: v for k, v in hints.items() if k in valid})
 
 
-def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
-    """Lower a primitive graph to a CUDA kernel definition.
+def lower_matmul(graph: Graph) -> KernelDef:
+    """Lower a primitive matmul graph to a CUDA kernel definition.
 
-    Detects the operation pattern from primitives:
-    - Matmul: Reduce{sum}(Elementwise{mul}(A, B)) → SGEMM kernel
-    - Future: other patterns
+    Reads ``cuda.matmul.*`` hints from the graph to configure the lowering
+    strategy (tile sizes, threads, etc.). Missing hints use defaults.
 
-    The graph must have exactly 1 output node.
+    The graph must encode the matmul pattern:
+    ``Reduce{sum}(Elementwise{mul}(A, B))``.
     """
+    matmul_hints = graph.hints.prefix("cuda.matmul")
+    config = MatmulConfig.from_hints(matmul_hints) if matmul_hints else MatmulConfig()
+    return _lower_graph(graph, config)
+
+
+def _lower_graph(graph: Graph, config: MatmulConfig) -> KernelDef:
+    """Internal: lower a primitive graph to a CUDA kernel definition."""
     if len(graph.outputs) != 1:
         raise ValueError(f"Expected exactly 1 output, got {len(graph.outputs)}")
 
     out_node = graph.nodes[graph.outputs[0]]
-    config = config or MatmulConfig()
 
     # Detect matmul pattern: Reduce{sum} consuming Elementwise{mul}
     if isinstance(out_node.op, ReduceOp) and out_node.op.fn == "sum" and len(out_node.inputs) == 1:
