@@ -49,7 +49,6 @@ _OP_CLASS_MAP: dict[str, str] = {
     "Constant": "ConstantOp",
     "Transpose": "TransposeOp",
     "Reshape": "ReshapeOp",
-    "Matmul": "MatmulOp",
 }
 
 # Field ordering per op class — maps positional constraints to field names.

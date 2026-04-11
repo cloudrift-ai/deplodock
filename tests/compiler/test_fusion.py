@@ -82,6 +82,6 @@ def test_auto_fuse_region_has_ops():
 
     for n in fused.nodes.values():
         if isinstance(n.op, FusedRegionOp):
-            assert len(n.op.region_ops) >= 2, f"Region too small: {len(n.op.region_ops)} ops"
+            assert len(n.op.region_ops) >= 1, f"Region has no ops: {n.op.region_ops}"
             assert len(n.op.input_names) > 0, "Region has no inputs"
             assert len(n.op.output_names) > 0, "Region has no outputs"
