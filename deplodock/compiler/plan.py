@@ -106,22 +106,6 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             params["M"] = _prod(shape[:-1]) if len(shape) > 1 else (shape[0] if shape else 1)
             params["N"] = shape[-1] if shape else 1
             params["K"] = a_shape[-1] if a_shape else 1
-        elif isinstance(op, ops_module.FusedRMSNormOp):
-            tag = "rmsnorm"
-            params["eps"] = op.eps
-            params["rows"] = _prod(shape[:-1]) if len(shape) > 1 else 1
-            params["dim"] = shape[-1] if shape else 1
-        elif isinstance(op, ops_module.FusedSoftmaxOp):
-            tag = "softmax"
-            params["axis"] = op.axis
-        elif isinstance(op, ops_module.FusedSiLUMulOp):
-            tag = "silu_mul"
-            params["n"] = _prod(shape)
-        elif isinstance(op, ops_module.FusedAttentionOp):
-            tag = "attention"
-            params["num_heads"] = op.num_heads
-            params["head_dim"] = op.head_dim
-            params["scale"] = op.scale
         elif isinstance(op, ops_module.ElementwiseOp):
             tag = f"elementwise_{op.fn}"
         elif isinstance(op, ops_module.ReduceOp):

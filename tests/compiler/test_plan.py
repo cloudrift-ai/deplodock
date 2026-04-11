@@ -16,8 +16,10 @@ def _load_fixture(name: str) -> Graph:
 
 
 def _compile(g: Graph) -> Graph:
+    from deplodock.compiler.fusion import auto_fuse
+
     rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
-    return Rewriter.from_directory(rules_dir).apply(g)
+    return auto_fuse(Rewriter.from_directory(rules_dir).apply(g))
 
 
 def test_plan_graph_on_fixture():
@@ -52,8 +54,7 @@ def test_plan_graph_op_tags():
 
     op_tags = {op.op for op in plan.ops}
     assert "matmul" in op_tags
-    assert "attention" in op_tags  # FusedAttentionOp (absorbs softmax + 2 matmuls)
-    assert "silu_mul" in op_tags
+    assert "fused_region" in op_tags  # auto_fuse produces FusedRegionOps
 
 
 def test_plan_graph_data_flow():
@@ -75,8 +76,10 @@ def test_plan_graph_matmul_count():
     plan = plan_graph(compiled)
 
     matmul_count = sum(1 for op in plan.ops if op.op == "matmul")
-    # 7 projections only. QK + attn@V consumed by FusedAttentionOp.
-    assert matmul_count == 7, f"Expected 7 matmul, got {matmul_count}"
+    # 9 matmuls: 7 projections + QK + attn@V (squared norms become sum_sq, not matmul).
+    assert matmul_count == 9, f"Expected 9 matmul, got {matmul_count}"
+    fused_count = sum(1 for op in plan.ops if op.op == "fused_region")
+    assert fused_count >= 1, "Expected auto_fuse to produce FusedRegionOps"
 
 
 def test_plan_graph_is_backend_agnostic():
