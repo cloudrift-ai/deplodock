@@ -1,16 +1,15 @@
 """Fuse RMSNorm chain into FusedRMSNormOp.
 
-Matches two forms:
-  (a) (x * rsqrt(sum(x*x) + eps)) * weight       — torch.export form (mean = sum, no inv_n)
-  (b) (x * rsqrt(sum(x*x) * inv_n + eps)) * weight — hand-built form (explicit inv_n)
+Matches: (x * rsqrt(sum(x*x) + eps)) * weight
+The $x fan-out (same node 3 times) ensures only RMSNorm matches.
+
+Must run BEFORE the matmul rule (001) to claim the sum(mul(x,x)) sub-pattern.
 """
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import Match
 from deplodock.compiler.ops import FusedRMSNormOp
 
-# After decomposition, pow(x,2) becomes mul(x,x).
-# After matmul rule, self-mul(x,x) + reduce_sum becomes FusedReduceElementwise{sum,mul}.
 # Match both orderings of the outer multiply (weight * norm or norm * weight).
 PATTERN = (
     "Elementwise{mul}("
@@ -19,7 +18,7 @@ PATTERN = (
     "    $x,"
     "    Elementwise{rsqrt}("
     "      Elementwise{add}("
-    "        FusedReduceElementwise{sum, mul, $ax}($x, $x),"
+    "        Reduce{sum, $ax}(Elementwise{mul}($x, $x)),"
     "        $eps"
     "      )"
     "    )"
@@ -31,7 +30,7 @@ PATTERN = (
     "    $x,"
     "    Elementwise{rsqrt}("
     "      Elementwise{add}("
-    "        FusedReduceElementwise{sum, mul, $ax}($x, $x),"
+    "        Reduce{sum, $ax}(Elementwise{mul}($x, $x)),"
     "        $eps"
     "      )"
     "    )"
@@ -60,15 +59,12 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     )
 
     g.replace_node(match.root_node_id, fused_id)
-
-    # Remove consumed nodes.
-    _remove_chain(g, match.root_node_id, keep={x_id, w_id, match.bindings.get("inv_n", ""), match.bindings.get("eps", "")})
+    _remove_chain(g, match.root_node_id, keep={x_id, w_id, match.bindings.get("eps", "")})
 
     return g
 
 
 def _remove_chain(g: Graph, node_id: str, keep: set[str]) -> None:
-    """Remove a node and its inputs recursively if they have no other consumers."""
     if node_id not in g.nodes or node_id in keep:
         return
     node = g.nodes[node_id]
