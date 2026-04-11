@@ -93,9 +93,24 @@ def _resolve_input(fx_node: Any, node_map: dict[str, str]) -> str | None:
     return None
 
 
-def _resolve_inputs(fx_node: Any, node_map: dict[str, str]) -> list[str]:
-    """Resolve all FX node args that are graph nodes to our node IDs."""
-    return [node_map[a.name] for a in fx_node.args if hasattr(a, "name") and a.name in node_map]
+def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = None) -> list[str]:
+    """Resolve FX node args to our node IDs. Scalars become ConstantOp nodes."""
+    result = []
+    for a in fx_node.args:
+        if hasattr(a, "name") and a.name in node_map:
+            result.append(node_map[a.name])
+        elif isinstance(a, (int, float)) and g is not None:
+            # Create a constant node for scalar args (e.g., eps=1e-5).
+            const_name = f"{fx_node.name}_c{len(result)}"
+            const_id = g.add_node(
+                op=ConstantOp(name=const_name),
+                inputs=[],
+                output=Tensor(const_name, (1,), "f32"),
+                node_id=const_name,
+            )
+            node_map[const_name] = const_id
+            result.append(const_id)
+    return result
 
 
 def _handle_placeholder(
@@ -160,7 +175,7 @@ def _handle_call_function(
     shape = _get_shape(fx_node)
     dtype = _get_dtype(fx_node)
     op_name = _op_name(fx_node.target)
-    input_ids = _resolve_inputs(fx_node, node_map)
+    input_ids = _resolve_inputs(fx_node, node_map, g)
 
     if op_name is None:
         # Skip non-ATen ops (assertions, metadata, etc.)
@@ -372,9 +387,10 @@ def _handle_call_function(
 
     # --- Scaled dot product attention (high-level, not decomposed) ---
     if op_name == "scaled_dot_product_attention":
+        # Only take Q, K, V (first 3 inputs). Extra args (dropout_p, is_causal) are dropped.
         nid = g.add_node(
             op=ElementwiseOp(fn="sdpa"),
-            inputs=input_ids,
+            inputs=input_ids[:3],
             output=Tensor(name, shape, dtype),
             node_id=name,
         )
