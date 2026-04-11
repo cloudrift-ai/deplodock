@@ -8,6 +8,10 @@ A Backend converts an ExecutionPlan into a runnable Program.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from deplodock.compiler.ir import Graph
 
 
 @dataclass
@@ -47,3 +51,89 @@ class ExecutionPlan:
     name: str
     buffers: list[BufferSpec]
     ops: list[OpKernel]
+
+
+def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
+    """Walk a compiled graph and produce a backend-agnostic ExecutionPlan.
+
+    Each graph node becomes either a BufferSpec (inputs/constants) or an
+    OpKernel (compute ops). Buffer shapes come from node.output.shape.
+    Op types are derived from the Op class name.
+    """
+    from deplodock.compiler import ops as ops_module
+
+    buffers: list[BufferSpec] = []
+    op_kernels: list[OpKernel] = []
+    buf_names: set[str] = set()
+
+    for nid in graph.topological_order():
+        node = graph.nodes[nid]
+        op = node.op
+        op_type = type(op).__name__
+        out_name = nid
+        shape = node.output.shape
+        dtype = node.output.dtype
+
+        # InputOp / ConstantOp → buffer only, no kernel.
+        if isinstance(op, ops_module.InputOp):
+            buffers.append(BufferSpec(out_name, shape, dtype, role="input"))
+            buf_names.add(out_name)
+            continue
+
+        if isinstance(op, ops_module.ConstantOp):
+            buffers.append(BufferSpec(out_name, shape, dtype, role="constant"))
+            buf_names.add(out_name)
+            continue
+
+        # Output buffer for this node.
+        role = "output" if nid in graph.outputs else "scratch"
+        buffers.append(BufferSpec(out_name, shape, dtype, role=role))
+        buf_names.add(out_name)
+
+        # Map op type to OpKernel tag + params.
+        inputs = list(node.inputs)
+        outputs = [out_name]
+        params: dict[str, int | float | str] = {}
+
+        if isinstance(op, ops_module.MatmulOp):
+            tag = "matmul"
+        elif isinstance(op, ops_module.FusedRMSNormOp):
+            tag = "rmsnorm"
+            params["eps"] = op.eps
+        elif isinstance(op, ops_module.FusedSoftmaxOp):
+            tag = "softmax"
+            params["axis"] = op.axis
+        elif isinstance(op, ops_module.FusedSiLUMulOp):
+            tag = "silu_mul"
+        elif isinstance(op, ops_module.FusedAttentionOp):
+            tag = "attention"
+            params["num_heads"] = op.num_heads
+            params["head_dim"] = op.head_dim
+            params["scale"] = op.scale
+        elif isinstance(op, ops_module.FusedReduceElementwiseOp):
+            tag = f"fused_{op.reduce_fn}_{op.elementwise_fn}"
+            params["axis"] = op.axis
+        elif isinstance(op, ops_module.ElementwiseOp):
+            tag = f"elementwise_{op.fn}"
+        elif isinstance(op, ops_module.ReduceOp):
+            tag = f"reduce_{op.fn}"
+            params["axis"] = op.axis
+        elif isinstance(op, ops_module.TransposeOp):
+            tag = "transpose"
+        elif isinstance(op, ops_module.ReshapeOp):
+            tag = "reshape"
+        elif isinstance(op, ops_module.GatherOp):
+            tag = "gather"
+            params["axis"] = op.axis
+        elif isinstance(op, ops_module.ScatterOp):
+            tag = "scatter"
+            params["axis"] = op.axis
+        else:
+            tag = op_type.lower()
+
+        # Add shape info to params for the backend.
+        params["shape"] = shape
+
+        op_kernels.append(OpKernel(op=tag, inputs=inputs, outputs=outputs, params=params))
+
+    return ExecutionPlan(name=name, buffers=buffers, ops=op_kernels)
