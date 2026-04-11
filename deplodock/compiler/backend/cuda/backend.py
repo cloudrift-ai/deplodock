@@ -72,7 +72,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
     TMA benchmarking.
     """
     from deplodock.compiler.backend.cuda.codegen import emit_kernel
-    from deplodock.compiler.backend.cuda.lower import lower_matmul
+    from deplodock.compiler.backend.cuda.generators import lower_matmul
     from deplodock.compiler.ir import Graph, Tensor
     from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 
@@ -249,7 +249,7 @@ def _compile_fused_region(op: OpKernel) -> Launch:
 
 def _generate_fused_kernel(op: OpKernel, name: str) -> str:
     """Generate kernel source from region_ops stored in the OpKernel params."""
-    from deplodock.compiler.backend.cuda.kernel_gen import generate_kernel
+    from deplodock.compiler.backend.cuda.generators import generate_kernel
     from deplodock.compiler.ops import FusedRegionOp
 
     region_ops = op.params["_region_ops"]
@@ -277,7 +277,7 @@ def _generate_fused_kernel(op: OpKernel, name: str) -> str:
 
 def _compile_singleton(op: OpKernel) -> Launch:
     """Compile an unfused elementwise/reduce op by wrapping it as a FusedRegionOp."""
-    from deplodock.compiler.backend.cuda.kernel_gen import generate_kernel
+    from deplodock.compiler.backend.cuda.generators import generate_kernel
     from deplodock.compiler.ops import FusedRegionOp
 
     # Reconstruct the op object from the OpKernel tag.

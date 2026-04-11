@@ -1,8 +1,8 @@
-"""Kernel generator: emit CUDA source from a FusedRegionOp's primitive ops.
+"""Fused-region kernel generator: pointwise and reduction kernels.
 
-Walks the ops in topological order and emits C code directly.
-The kernel structure (tiling, reductions) emerges from the ops
-and their dimension analysis — no strategy classification.
+Walks a FusedRegionOp's primitive ops in topological order and emits
+CUDA source directly.  The kernel structure (tiling, reductions) emerges
+from the ops and their dimension analysis — no strategy classification.
 """
 
 from __future__ import annotations

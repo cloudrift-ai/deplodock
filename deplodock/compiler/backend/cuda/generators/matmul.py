@@ -1,4 +1,9 @@
-"""Lower graph IR to CUDA IR (KernelDef)."""
+"""Matmul kernel generator: hand-optimised SGEMM strategies.
+
+Lowers a matmul graph (Reduce{sum}(Elementwise{mul}(A, B))) to a KernelDef
+via one of several strategies: naive, TMA double-buffer, TF32, or hybrid.
+Configuration is read from ``cuda.matmul.*`` hints on the input graph.
+"""
 
 from __future__ import annotations
 

@@ -41,7 +41,7 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-"deplodock/compiler/backend/cuda/lower.py" = ["E501"]  # Generated CUDA code has long inline PTX strings
+"deplodock/compiler/backend/cuda/generators/matmul.py" = ["E501"]  # Generated CUDA code has long inline PTX strings
 
 [tool.ruff.format]
 quote-style = "double"

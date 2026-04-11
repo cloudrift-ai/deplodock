@@ -74,7 +74,7 @@ import sys, pathlib
 sys.path.insert(0, "$REPO_DIR")
 from deplodock.compiler.backend.cuda.runner import generate_benchmark_program, _detect_arch
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
-from deplodock.compiler.backend.cuda.lower import lower_matmul
+from deplodock.compiler.backend.cuda.generators import lower_matmul
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp

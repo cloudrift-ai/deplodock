@@ -26,7 +26,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
-from deplodock.compiler.backend.cuda.lower import lower_matmul
+from deplodock.compiler.backend.cuda.generators import lower_matmul
 from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_benchmark
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir import Graph, Tensor

@@ -39,7 +39,7 @@ REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO))
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel  # noqa: E402
-from deplodock.compiler.backend.cuda.lower import lower_matmul  # noqa: E402
+from deplodock.compiler.backend.cuda.generators import lower_matmul  # noqa: E402
 from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
 from deplodock.compiler.ir import Graph, Tensor  # noqa: E402
