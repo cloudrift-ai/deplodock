@@ -30,7 +30,7 @@ from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_graph
 from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_benchmark
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp
+from deplodock.compiler.ops import InputOp, MatmulOp
 from deplodock.compiler.rewriter import Rewriter
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -348,7 +348,7 @@ def make_matmul_graph() -> Graph:
     g = Graph()
     a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
     b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
-    c = g.add_node(FusedReduceElementwiseOp("sum", "mul", 1), [a, b], Tensor("C", ("M", "N")))
+    c = g.add_node(MatmulOp(), [a, b], Tensor("C", ("M", "N")))
     g.inputs = [a, b]
     g.outputs = [c]
     return g

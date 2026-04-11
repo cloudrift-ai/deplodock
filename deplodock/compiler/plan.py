@@ -122,9 +122,6 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             params["num_heads"] = op.num_heads
             params["head_dim"] = op.head_dim
             params["scale"] = op.scale
-        elif isinstance(op, ops_module.FusedReduceElementwiseOp):
-            tag = f"fused_{op.reduce_fn}_{op.elementwise_fn}"
-            params["axis"] = op.axis
         elif isinstance(op, ops_module.ElementwiseOp):
             tag = f"elementwise_{op.fn}"
         elif isinstance(op, ops_module.ReduceOp):

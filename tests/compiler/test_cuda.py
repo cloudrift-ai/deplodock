@@ -241,13 +241,13 @@ def test_run_benchmark_surfaces_cuda_oom():
     from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 
     # Build a pre-fused matmul graph (symbolic dims).
-    from deplodock.compiler.ops import FusedReduceElementwiseOp
+    from deplodock.compiler.ops import MatmulOp
 
     g = Graph()
     a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", ("M", "K")), node_id="A")
     b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", ("K", "N")), node_id="B")
     g.inputs = [a, b]
-    c = g.add_node(op=FusedReduceElementwiseOp("sum", "mul", 1), inputs=[a, b], output=Tensor("C", ("M", "N")), node_id="C")
+    c = g.add_node(op=MatmulOp(), inputs=[a, b], output=Tensor("C", ("M", "N")), node_id="C")
     g.outputs = [c]
 
     strategy_map, _ = default_matmul_strategy_map()
