@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -56,6 +57,20 @@ def make_bench_config(recipes_dir):
         return config_path
 
     return _make
+
+
+# ── Compiler dump fixture ──────────────────────────────────────────
+
+
+@pytest.fixture
+def dump_dir(request):
+    """Dump compilation artifacts to _test_data/<test_name>/ for manual inspection."""
+    safe_name = request.node.name.replace("[", "_").replace("]", "_").replace("/", "_")
+    dump_path = Path(PROJECT_ROOT) / "_test_data" / safe_name
+
+    from deplodock.compiler.dump import CompilerDump
+
+    return CompilerDump(dir=dump_path)
 
 
 # ── Unit-test fixtures ──────────────────────────────────────────────

@@ -10,9 +10,49 @@ from pathlib import Path
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.matcher import match_pattern
 from deplodock.compiler.pattern import Pattern, parse_pattern
-from deplodock.compiler.trace import PassTrace, RuleApplication
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Trace dataclasses — capture what each pass did for debugging/dump
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RuleApplication:
+    """Record of a single rule firing."""
+
+    rule_name: str
+    matched_at: str  # root node id
+    bindings: dict[str, str]
+    captured_constraints: dict[str, str | int]
+
+    def to_dict(self) -> dict:
+        return {
+            "rule": self.rule_name,
+            "matched_at": self.matched_at,
+            "bindings": self.bindings,
+            "captured_constraints": {k: str(v) for k, v in self.captured_constraints.items()},
+        }
+
+
+@dataclass
+class PassTrace:
+    """Record of a single pass execution."""
+
+    name: str
+    graph_before: dict | None = None
+    graph_after: dict | None = None
+    rules_applied: list[RuleApplication] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "pass": self.name,
+            "rules_applied": [r.to_dict() for r in self.rules_applied],
+            "graph_before": self.graph_before,
+            "graph_after": self.graph_after,
+        }
 
 
 @dataclass

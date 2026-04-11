@@ -133,16 +133,23 @@ def _build_llama_block():
     return g
 
 
-def test_llama_block_full_fusion():
+def test_llama_block_full_fusion(dump_dir):
     """Full Llama block → all expected fused ops after rewriting."""
     g = _build_llama_block()
     initial_count = len(g.nodes)
 
     from deplodock.compiler.fusion import auto_fuse
+    from deplodock.compiler.rewriter import PassTrace
+
+    dump_dir.dump_input_graph(g)
 
     rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
     rewriter = Rewriter.from_directory(rules_dir)
-    result = auto_fuse(rewriter.apply(g))
+    pass_traces: list[PassTrace] = []
+    compiled = rewriter.apply(g, pass_traces=pass_traces)
+    dump_dir.dump_passes(pass_traces)
+    result = auto_fuse(compiled)
+    dump_dir.dump_fused_graph(result)
 
     # Count ops by type.
     ops_by_type = {}
@@ -150,9 +157,7 @@ def test_llama_block_full_fusion():
         name = type(n.op).__name__
         ops_by_type[name] = ops_by_type.get(name, 0) + 1
 
-    # MatmulOps from matmul recognition rule.
-    assert ops_by_type.get("FusedRegionOp", 0) >= 1, f"Expected FusedRegionOps, got {ops_by_type}"
-    # auto_fuse produces FusedRegionOp for remaining patterns.
+    # auto_fuse produces FusedRegionOps from discovered fusion regions.
     assert ops_by_type.get("FusedRegionOp", 0) >= 1, f"Expected FusedRegionOps, got {ops_by_type}"
 
     # Node count should be significantly reduced.

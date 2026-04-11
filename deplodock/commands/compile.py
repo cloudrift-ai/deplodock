@@ -20,12 +20,16 @@ def register_compile_command(subparsers):
     parser.add_argument("--layer", type=int, default=0, help="Layer index (when input is a model ID)")
     parser.add_argument("--output", "-o", help="Output path for compiled IR")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show individual rule applications")
+    parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
     parser.set_defaults(func=handle_compile)
 
 
 def handle_compile(args):
+    from deplodock.compiler.dump import CompilerDump
     from deplodock.compiler.pipeline import compile_graph
     from deplodock.compiler.rewriter import Rewriter
+
+    dump = CompilerDump.resolve(args.dump_dir)
 
     input_path = Path(args.input)
 
@@ -40,12 +44,18 @@ def handle_compile(args):
 
     initial_count = len(graph.nodes)
 
+    if dump:
+        dump.dump_input_graph(graph)
+
     # Load rewriter from rules directory.
     rules_dir = Path(__file__).parent.parent / "compiler" / "rules"
     rewriter = Rewriter.from_directory(rules_dir)
 
     # Compile.
     compiled, pass_traces = compile_graph(graph, rewriter)
+
+    if dump:
+        dump.dump_passes(pass_traces)
 
     # Print summary.
     logger.info("Assembly:")

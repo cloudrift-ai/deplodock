@@ -127,11 +127,11 @@ compiler/
 ├── rewriter.py       # [L2] Pass/Rule/Rewriter
 ├── rules/            # [L2] Ordered rule files by pass
 │   ├── decomposition/ #     Decompose high-level ops → primitives
-│   └── fusion/       #      MatmulOp recognition (Reduce+Mul → MatmulOp)
+│   └── fusion/       #      (empty — auto_fuse handles all fusion)
 ├── fusion.py         # [L2] auto_fuse: automatic fusion region discovery
 ├── kernel_gen.py     # [L2] Generate CUDA kernels from FusedRegionOp
 ├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan, plan_graph
-├── trace.py          # [L2] CompilerTrace for AI-in-the-loop
+├── dump.py           # [--] CompilerDump: debug artifact collector (cross-layer)
 ├── pipeline.py       # [L2] compile_graph (graph optimization only)
 ├── backend/          # [L3+L4] Backend abstraction + implementations
 │   ├── __init__.py   #      Re-exports from base.py
@@ -237,11 +237,7 @@ Decomposes high-level ops from `torch.export` into primitives:
 | `002_decompose_silu` | `silu(x)` | `x * recip(1 + exp(-x))` |
 | `003_decompose_pow` | `pow(x, 2)` | `mul(x, x)` |
 
-### 2. Matmul recognition (rules/fusion/)
-
-One rule: `Reduce{sum}(Elementwise{mul}(A, B))` → `MatmulOp`. This bridges decomposed primitives to the high-performance SGEMM kernel path in `lower.py`.
-
-### 3. Auto-fusion (fusion.py)
+### 2. Auto-fusion (fusion.py)
 
 `auto_fuse(graph)` discovers fusion regions from intermediate tensor sizes:
 - Scores each single-consumer edge by `product(intermediate_shape)`
@@ -280,3 +276,27 @@ source = load_kernel("rmsnorm", kernel_name="fused_rmsnorm")
 ```
 
 Do NOT write kernel source as Python f-strings. Always use `.cu` template files.
+
+## Debug Dump Infrastructure
+
+`dump.py` provides `CompilerDump` — an opt-in artifact collector that writes intermediate compilation results to disk. Activated via:
+
+- **Env var**: `DEPLODOCK_DUMP_DIR=/tmp/dump`
+- **CLI arg**: `--dump-dir /tmp/dump` on `compile` and `run` commands
+- **Test fixture**: `dump_dir` writes to `_test_data/<test_name>/`
+
+The dump directory is cleared on creation. Files are numbered for natural ordering:
+
+```
+00_input_graph.json        # Graph before optimization
+01_pass_<name>_*.json      # Per-pass before/after graphs + rules (01-19)
+20_fused_graph.json        # Graph after auto_fuse
+30_execution_plan.json     # Backend-agnostic plan
+40_program_summary.json    # Program metadata (buffers, launches)
+40_kernel_NN_<name>.cu     # Individual kernel sources
+50_full_program.cu         # Complete generated .cu file
+60_result.json             # Execution outputs
+60_benchmark.json          # Timing results
+```
+
+`CompilerDump` is cross-layer by design — it serializes objects from all layers but does not import GPU-specific code at module level (uses `TYPE_CHECKING` guards). Callers pass it through the pipeline and call `dump.dump_*()` at each stage.
