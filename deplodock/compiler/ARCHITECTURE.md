@@ -54,32 +54,46 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 **Every execution MUST follow this flow.** Do not create shortcuts that bypass layers.
 
 ```
-                     Layer 1                Layer 2
-PyTorch module ──→ Graph IR ──→ Rewriter (fusion rules) ──→ optimized Graph
+                     Layer 1                    Layer 2
+PyTorch module ──→ Graph IR ──→ Decomposition ──→ Fusion ──→ optimized Graph
+                                  (sdpa, silu,     (RMSNorm, matmul,
+                                   pow → prims)     softmax, attention)
                                                                   │
                      Layer 3                                      │
-                     plan_block(cfg) ──→ ExecutionPlan ◄──────────┘
-                     plan_matmul(graph, dims) ──→ ExecutionPlan
-                                                      │
-                     Layer 4                          │
+                     plan_graph(graph) ──→ ExecutionPlan ◄────────┘
+                                                │
+                     Layer 4                    │
                      CudaBackend.compile(plan) ──→ Program
-                                                      │
-                     program.py                       │
+                                                │
+                     program.py                 │
                      generate_source() ──→ .cu ──→ nvcc ──→ GPU
 ```
 
-### Concrete example: transformer block
+### Concrete example: graph-driven (primary path)
 
 ```python
-# Layer 3: plan (backend-agnostic)
-from deplodock.compiler.block_planner import BlockConfig, plan_block
-plan = plan_block(BlockConfig(hidden_dim=2048, num_heads=32, ...))
+# Layer 1-2: trace + optimize
+from deplodock.compiler.torch_trace import trace_module
+graph = trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)})
+graph = Rewriter.from_directory(rules_dir).apply(graph)  # decompose + fuse
+
+# Layer 3: plan from graph (backend-agnostic)
+from deplodock.compiler.plan import plan_graph
+plan = plan_graph(graph)
 
 # Layer 4: backend (CUDA-specific)
-from deplodock.compiler.cuda.backend import CudaBackend
+from deplodock.compiler.backend.cuda.backend import CudaBackend
 backend = CudaBackend()
 program = backend.compile(plan)
 result = backend.benchmark(program)
+```
+
+### Alternative: config-driven (for testing without a model)
+
+```python
+from deplodock.compiler.block_planner import BlockConfig, plan_block
+plan = plan_block(BlockConfig(hidden_dim=2048, num_heads=32, ...))
+# Then same backend.compile(plan) flow.
 ```
 
 ### Concrete example: single matmul
@@ -113,7 +127,8 @@ compiler/
 ├── matcher.py        # [L2] Graph pattern matching engine
 ├── rewriter.py       # [L2] Pass/Rule/Rewriter
 ├── rules/            # [L2] Ordered rule files by pass
-│   └── fusion/       #      RMSNorm, matmul, softmax, SiLU+mul
+│   ├── decomposition/ #     Decompose high-level ops → primitives
+│   └── fusion/       #      Reassemble primitives → fused ops
 ├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan
 ├── block_planner.py  # [L3] plan_block(BlockConfig) → ExecutionPlan
 ├── trace.py          # [L2] CompilerTrace for AI-in-the-loop
@@ -209,18 +224,34 @@ Attention materializes the N×N scores matrix (naive). This is the explicit seam
 3. Map the same `OpKernel.op` tags to `.hip` templates
 4. The planner code (`plan.py`, `block_planner.py`) doesn't change
 
-## Fusion Rules (Layer 2)
+## Graph Transformation Rules (Layer 2)
 
-Rules are numbered to control ordering within a pass:
+Two passes, applied in order:
 
-| Rule                          | Pattern                                   | Output           |
-|-------------------------------|-------------------------------------------|------------------|
-| `000_fuse_rmsnorm`            | `(x * rsqrt(sum(x*x) * inv_n + eps)) * w` | `FusedRMSNormOp` |
-| `001_fuse_reduce_elementwise` | `Reduce{sum}(Elementwise{mul}(A, B))`     | `MatmulOp`       |
-| `002_fuse_softmax`            | `exp(x-max(x)) / sum(exp(x-max(x)))`      | `FusedSoftmaxOp` |
-| `003_fuse_silu_mul`           | `gate * recip(1 + exp(-gate)) * up`       | `FusedSiLUMulOp` |
+### Decomposition pass (runs first)
 
-**Key constraint**: RMSNorm (000) runs before matmul (001) to prevent the matmul rule from consuming the `sum(x*x)` sub-pattern.
+Decomposes high-level ops from `torch.export` into our primitives:
+
+| Rule | Decomposes | Into |
+|------|-----------|------|
+| `001_decompose_sdpa` | `sdpa(Q, K, V)` | QK^T → scale → softmax → @V |
+| `002_decompose_silu` | `silu(x)` | `x * recip(1 + exp(-x))` |
+| `003_decompose_pow` | `pow(x, 2)` | `mul(x, x)` |
+| `004_fuse_squared_norm` | `Reduce{sum}(mul(x, x))` | `FusedReduceElementwiseOp` (prevents matmul rule from consuming) |
+
+### Fusion pass (runs second)
+
+Reassembles primitives into fused ops:
+
+| Rule | Pattern | Output |
+|------|---------|--------|
+| `000_fuse_rmsnorm` | `(x * rsqrt(FusedReduce(x,x) + eps)) * w` | `FusedRMSNormOp` |
+| `001_fuse_reduce_elementwise` | `Reduce{sum}(Elementwise{mul}(A, B))` | `MatmulOp` |
+| `002_fuse_softmax` | `exp(x-max(x)) / sum(exp(x-max(x)))` | `FusedSoftmaxOp` |
+| `003_fuse_silu_mul` | `gate * recip(1 + exp(-gate)) * up` | `FusedSiLUMulOp` |
+| `010_fuse_attention` | `Matmul(Softmax(Scale(Matmul(Q, K^T))), V)` | `FusedAttentionOp` |
+
+**Result on TinyLlama**: 1 FusedAttentionOp, 2 FusedRMSNormOp, 1 FusedSiLUMulOp, 7 MatmulOp.
 
 ## CUDA Backend Details
 
