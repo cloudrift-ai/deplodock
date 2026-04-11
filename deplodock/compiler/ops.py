@@ -84,35 +84,11 @@ class ReshapeOp(Op):
 
 @dataclass
 class MatmulOp(Op):
-    """Matrix multiply — fused Reduce{sum}(Elementwise{mul})."""
+    """Matrix multiply — fused Reduce{sum}(Elementwise{mul}).
 
-
-@dataclass
-class FusedRMSNormOp(Op):
-    """Fused RMS normalization: rsqrt(mean(x^2) + eps) * x * weight."""
-
-    eps: float
-
-
-@dataclass
-class FusedSoftmaxOp(Op):
-    """Fused online softmax along an axis."""
-
-    axis: int | str
-
-
-@dataclass
-class FusedSiLUMulOp(Op):
-    """Fused SiLU activation with elementwise multiply: silu(gate) * up."""
-
-
-@dataclass
-class FusedAttentionOp(Op):
-    """Flash attention: Q @ K^T -> scale -> softmax -> @ V."""
-
-    num_heads: int
-    head_dim: int
-    scale: float
+    Produced by the matmul recognition rule (rules/fusion/001).
+    Has specialized SGEMM lowering in backend/cuda/lower.py.
+    """
 
 
 @dataclass

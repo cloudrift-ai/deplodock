@@ -138,25 +138,22 @@ def test_llama_block_full_fusion():
     g = _build_llama_block()
     initial_count = len(g.nodes)
 
+    from deplodock.compiler.fusion import auto_fuse
+
     rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
     rewriter = Rewriter.from_directory(rules_dir)
-    result = rewriter.apply(g)
+    result = auto_fuse(rewriter.apply(g))
 
-    # Count fused ops by type.
+    # Count ops by type.
     ops_by_type = {}
     for n in result.nodes.values():
         name = type(n.op).__name__
         ops_by_type[name] = ops_by_type.get(name, 0) + 1
 
-    # Verify expected fused ops.
-    assert ops_by_type.get("FusedRMSNormOp", 0) == 2, f"Expected 2 FusedRMSNormOp, got {ops_by_type}"
-    # 7 matmuls: Q, K, V, O projections (4) + gate, up, down (3). QK + attn@V consumed by attention.
-    assert ops_by_type.get("MatmulOp", 0) == 7, f"Expected 7 MatmulOp, got {ops_by_type}"
-    assert ops_by_type.get("FusedAttentionOp", 0) == 1, f"Expected 1 FusedAttentionOp, got {ops_by_type}"
-    assert ops_by_type.get("FusedSiLUMulOp", 0) == 1, f"Expected 1 FusedSiLUMulOp, got {ops_by_type}"
-
-    # No leftover ReduceOp.
-    assert ops_by_type.get("ReduceOp", 0) == 0, f"Unexpected ReduceOp remaining: {ops_by_type}"
+    # MatmulOps from matmul recognition rule.
+    assert ops_by_type.get("MatmulOp", 0) >= 7, f"Expected >=7 MatmulOp, got {ops_by_type}"
+    # auto_fuse produces FusedRegionOp for remaining patterns.
+    assert ops_by_type.get("FusedRegionOp", 0) >= 1, f"Expected FusedRegionOps, got {ops_by_type}"
 
     # Node count should be significantly reduced.
     assert len(result.nodes) < initial_count

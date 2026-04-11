@@ -50,10 +50,6 @@ _OP_CLASS_MAP: dict[str, str] = {
     "Transpose": "TransposeOp",
     "Reshape": "ReshapeOp",
     "Matmul": "MatmulOp",
-    "FusedRMSNorm": "FusedRMSNormOp",
-    "FusedSoftmax": "FusedSoftmaxOp",
-    "FusedSiLUMul": "FusedSiLUMulOp",
-    "FusedAttention": "FusedAttentionOp",
 }
 
 # Field ordering per op class — maps positional constraints to field names.
@@ -67,10 +63,6 @@ _OP_FIELDS: dict[str, list[str]] = {
     "Transpose": ["axes"],
     "Reshape": ["shape"],
     "Matmul": [],
-    "FusedRMSNorm": ["eps"],
-    "FusedSoftmax": ["axis"],
-    "FusedSiLUMul": [],
-    "FusedAttention": ["num_heads", "head_dim", "scale"],
 }
 
 
