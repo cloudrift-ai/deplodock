@@ -6,7 +6,6 @@ from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import (
     ConstantOp,
     ElementwiseOp,
-    FusedReduceElementwiseOp,
     InputOp,
     ReduceOp,
     TransposeOp,
@@ -47,15 +46,19 @@ def _build_llama_block():
 
     # --- RMSNorm 1 ---
     def _rmsnorm(prefix, inp_id, w_id):
-        sq_norm = g.add_node(
-            op=FusedReduceElementwiseOp(reduce_fn="sum", elementwise_fn="mul", axis=1),
+        sq = g.add_node(
+            op=ElementwiseOp(fn="mul"),
             inputs=[inp_id, inp_id],
-            output=Tensor(f"{prefix}_sq_norm", ("S",)),
-            node_id=f"{prefix}_sq_norm",
+            output=Tensor(f"{prefix}_sq", ("S", "D")),
+            node_id=f"{prefix}_sq",
         )
-        add_eps = g.add_node(
-            op=ElementwiseOp(fn="add"), inputs=[sq_norm, eps], output=Tensor(f"{prefix}_var", ("S",)), node_id=f"{prefix}_var"
+        red = g.add_node(
+            op=ReduceOp(fn="sum", axis=1),
+            inputs=[sq],
+            output=Tensor(f"{prefix}_sum", ("S",)),
+            node_id=f"{prefix}_sum",
         )
+        add_eps = g.add_node(op=ElementwiseOp(fn="add"), inputs=[red, eps], output=Tensor(f"{prefix}_var", ("S",)), node_id=f"{prefix}_var")
         rsqrt = g.add_node(
             op=ElementwiseOp(fn="rsqrt"), inputs=[add_eps], output=Tensor(f"{prefix}_rsqrt", ("S",)), node_id=f"{prefix}_rsqrt"
         )
