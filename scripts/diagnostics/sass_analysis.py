@@ -39,7 +39,7 @@ REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO))
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel  # noqa: E402
-from deplodock.compiler.backend.cuda.lower import lower_graph  # noqa: E402
+from deplodock.compiler.backend.cuda.lower import lower_matmul  # noqa: E402
 from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
 from deplodock.compiler.ir import Graph, Tensor  # noqa: E402
@@ -81,9 +81,10 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
         if size <= thr:
             selected = cfg
             break
-    print(
-        f"# profile: {profile}, config for {size}: TM={selected.thread_m}, BK={selected.block_k}, ks={selected.k_splits}", file=sys.stderr
-    )
+    tm = selected.get("thread_m", 1)
+    bk = selected.get("block_k", 16)
+    ks = selected.get("k_splits", 1)
+    print(f"# profile: {profile}, config for {size}: TM={tm}, BK={bk}, ks={ks}", file=sys.stderr)
 
     g = Graph()
     a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
@@ -93,20 +94,22 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
     c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", ("M", "N")))
     g.outputs = [c]
 
-    kernel = lower_graph(g, config=selected)
+    for k, v in selected.items():
+        g.hints.set(f"cuda.matmul.{k}", v)
+    kernel = lower_matmul(g)
     src = emit_kernel(kernel)
 
     dim_args: dict[str, int] = {"M": size, "N": size, "K": size}
-    if selected.k_splits > 1:
-        dim_args["k_splits"] = selected.k_splits
+    if selected.get("k_splits", 1) > 1:
+        dim_args["k_splits"] = selected["k_splits"]
     program = generate_benchmark_program(
         src,
         kernel,
         dim_args,
         num_iterations=2,
         compare_cublas=True,
-        coarsen_cols=selected.coarsen_cols,
-        coarsen_rows=selected.coarsen_rows,
+        coarsen_cols=selected.get("coarsen_cols", 1),
+        coarsen_rows=selected.get("coarsen_rows", 1),
         cublas_math_mode="default",
     )
 

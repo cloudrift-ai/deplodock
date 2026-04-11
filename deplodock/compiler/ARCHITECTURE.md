@@ -37,7 +37,7 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  cuda/backend.py:   CudaBackend (implements Backend ABC)        │
 │  cuda/program.py:   Buffer, Launch, Program, compile, run       │
 │  cuda/kernels/*.cu: Kernel templates with __KERNEL_NAME__       │
-│  cuda/lower.py:     Graph → KernelDef (SGEMM strategies)        │
+│  cuda/lower.py:     lower_matmul(graph) → KernelDef (reads hints)│
 │  cuda/codegen.py:   KernelDef → CUDA C source                   │
 │  cuda/ir.py:        CUDA imperative AST (Expr, Stmt, KernelDef) │
 │  cuda/runner.py:    Legacy single-kernel compile + run          │
@@ -98,14 +98,16 @@ plan = plan_block(BlockConfig(hidden_dim=2048, num_heads=32, ...))
 ### Concrete example: single matmul
 
 ```python
-# Layer 1-2: graph + optimization
+# Layer 1-2: graph + optimization + hints
 graph = build_matmul_graph()
+graph.hints.set("cuda.matmul.strategy", "tma_db")
+graph.hints.set("cuda.matmul.block_k", 32)
 graph = Rewriter.from_directory(rules_dir).apply(graph)
 
-# Layer 3-4: plan + backend
-from deplodock.compiler.cuda.lower import lower_matmul_to_program
-program = lower_matmul_to_program(graph, MatmulConfig(strategy="naive"), dims)
-result = run_program(program)
+# Layer 3-4: plan + backend (hints flow automatically)
+plan = plan_graph(graph)
+program = CudaBackend().compile(plan)
+result = backend.run(program)
 ```
 
 ## What NOT to do
@@ -154,7 +156,7 @@ compiler/
 │       ├── ir.py         #  CUDA imperative AST (KernelDef, Expr, Stmt)
 │       ├── codegen.py    #  KernelDef → CUDA C source
 │       ├── kernel_gen.py  #  FusedRegionOp → CUDA source (pointwise + reduce)
-│       ├── lower.py      #  Graph → KernelDef (SGEMM strategies + TMA)
+│       ├── lower.py      #  lower_matmul(graph) → KernelDef (reads hints)
 │       ├── runner.py     #  Legacy single-kernel compile + run + benchmark
 │       └── tuning.py     #  Per-GPU empirical tuning profiles
 ```
@@ -286,7 +288,7 @@ Hints are advisory metadata attached to `Node` or `Graph` that influence compile
 - **`Graph.hints`**: graph-wide hints (e.g. all matmuls use strategy Y)
 - **`resolve_hints(graph, node_id)`**: merges graph + node hints (node wins on conflict)
 
-Keys use dotted namespaces. The `cuda.matmul.*` namespace maps 1:1 to `MatmulConfig` fields:
+Keys use dotted namespaces. The `cuda.matmul.*` namespace controls matmul lowering:
 
 ```python
 graph.hints.set("cuda.matmul.strategy", "tma_db")
@@ -297,7 +299,7 @@ graph.nodes["n5"].hints.set("cuda.matmul.threads_y", 8)  # per-node override
 Flow through the pipeline:
 1. **Rewriter/Fusion**: read/write hints on graph nodes directly
 2. **plan_graph()**: resolves hints per node → stores in `OpKernel.params["_hints"]`
-3. **CudaBackend**: reads `params["_hints"]`, extracts `cuda.matmul.*`, builds `MatmulConfig.from_hints()`
+3. **CudaBackend**: reads `params["_hints"]`, sets them on the lowering graph, calls `lower_matmul(graph)` which reads hints internally
 
 Hints survive serialization (`to_dict`/`from_dict`) and deep copy. Old graphs without hints deserialize correctly (empty defaults).
 

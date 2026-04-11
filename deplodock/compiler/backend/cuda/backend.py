@@ -72,7 +72,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
     TMA benchmarking.
     """
     from deplodock.compiler.backend.cuda.codegen import emit_kernel
-    from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_graph
+    from deplodock.compiler.backend.cuda.lower import lower_matmul
     from deplodock.compiler.ir import Graph, Tensor
     from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 
@@ -89,10 +89,11 @@ def _compile_matmul(op: OpKernel) -> Launch:
     c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", (m, n)), node_id="C")
     g.outputs = [c]
 
+    # Propagate hints from the OpKernel into the graph for lower_matmul.
     hints = op.params.get("_hints", {})
-    matmul_hints = {k[len("cuda.matmul.") :]: v for k, v in hints.items() if k.startswith("cuda.matmul.")}
-    config = MatmulConfig.from_hints(matmul_hints) if matmul_hints else MatmulConfig()
-    kernel_def = lower_graph(g, config=config)
+    for k, v in hints.items():
+        g.hints.set(k, v)
+    kernel_def = lower_matmul(g)
     source = emit_kernel(kernel_def)
 
     bx, by, bz = kernel_def.block_size
