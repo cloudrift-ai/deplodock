@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.cuda.generators import lower_matmul
 from deplodock.compiler.backend.cuda.ir import (
     AugAssign,
     BinOp,
@@ -17,7 +18,6 @@ from deplodock.compiler.backend.cuda.ir import (
     Var,
     VarDecl,
 )
-from deplodock.compiler.backend.cuda.lower import lower_matmul
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp

@@ -37,7 +37,7 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  cuda/backend.py:   CudaBackend (implements Backend ABC)        │
 │  cuda/program.py:   Buffer, Launch, Program, compile, run       │
 │  cuda/kernels/*.cu: Kernel templates with __KERNEL_NAME__       │
-│  cuda/lower.py:     lower_matmul(graph) → KernelDef (reads hints)│
+│  cuda/generators/:  matmul.py (SGEMM), fused.py (pointwise/reduce)│
 │  cuda/codegen.py:   KernelDef → CUDA C source                   │
 │  cuda/ir.py:        CUDA imperative AST (Expr, Stmt, KernelDef) │
 │  cuda/runner.py:    Legacy single-kernel compile + run          │
@@ -155,8 +155,9 @@ compiler/
 │       │   └── matmul_dual_silu_mul.cu
 │       ├── ir.py         #  CUDA imperative AST (KernelDef, Expr, Stmt)
 │       ├── codegen.py    #  KernelDef → CUDA C source
-│       ├── kernel_gen.py  #  FusedRegionOp → CUDA source (pointwise + reduce)
-│       ├── lower.py      #  lower_matmul(graph) → KernelDef (reads hints)
+│       ├── generators/   #  Kernel generators
+│       │   ├── matmul.py #    Hand-optimised SGEMM (naive, TMA, TF32)
+│       │   └── fused.py  #    Auto pointwise + reduction from FusedRegionOp
 │       ├── runner.py     #  Legacy single-kernel compile + run + benchmark
 │       └── tuning.py     #  Per-GPU empirical tuning profiles
 ```
