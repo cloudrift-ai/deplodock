@@ -74,10 +74,10 @@ import sys, pathlib
 sys.path.insert(0, "$REPO_DIR")
 import dataclasses
 from deplodock.compiler.benchmark import run_adaptive_benchmark_suite
-from deplodock.compiler.cuda.runner import generate_benchmark_program, _detect_arch
-from deplodock.compiler.cuda.tuning import default_matmul_strategy_map
-from deplodock.compiler.cuda.lower import lower_graph
-from deplodock.compiler.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.cuda.runner import generate_benchmark_program, _detect_arch
+from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
+from deplodock.compiler.backend.cuda.lower import lower_graph
+from deplodock.compiler.backend.cuda.codegen import emit_kernel
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp
 from deplodock.compiler.rewriter import Rewriter
