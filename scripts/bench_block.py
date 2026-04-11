@@ -179,10 +179,24 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb):
         # Trace the block through our pipeline.
         graph = trace_module(block.cpu(), (x.cpu(),), kwargs={"position_embeddings": (pos_emb[0].cpu(), pos_emb[1].cpu())})
 
-        # Decompose + fuse.
+        from deplodock.compiler.fusion import auto_fuse
+        from deplodock.compiler.kernel_gen import generate_kernel
+        from deplodock.compiler.ops import FusedRegionOp
+
+        # Decompose + matmul recognition + auto-fuse.
         rules_dir = Path(__file__).parent.parent / "deplodock" / "compiler" / "rules"
         rewriter = Rewriter.from_directory(rules_dir)
         compiled = rewriter.apply(graph)
+        compiled = auto_fuse(compiled)
+
+        # Generate kernels for fused regions.
+        shapes = {nid: compiled.nodes[nid].output.shape for nid in compiled.nodes}
+        for nid in graph.nodes:
+            shapes[nid] = graph.nodes[nid].output.shape
+        for nid in compiled.nodes:
+            node = compiled.nodes[nid]
+            if isinstance(node.op, FusedRegionOp) and not node.op.kernel_source:
+                node.op.kernel_source = generate_kernel(node.op, f"kernel_{nid}", shapes)
 
         # Plan from graph.
         plan = plan_graph(compiled)

@@ -11,9 +11,7 @@ import math
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ops import (
-    ConstantOp,
     FusedRegionOp,
-    InputOp,
     ReshapeOp,
     TransposeOp,
 )
@@ -66,9 +64,15 @@ def _tensor_size(shape: tuple) -> int:
     return math.prod(d for d in shape if isinstance(d, int)) if shape else 1
 
 
-def _is_compute_op(op) -> bool:
-    """Is this a compute op (not input/constant/structural)?"""
-    return not isinstance(op, (InputOp, ConstantOp))
+def _is_fusible_op(op) -> bool:
+    """Is this a primitive op that can participate in auto-fusion?
+
+    Only ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp are fusible.
+    All other ops (MatmulOp, old fused ops, FusedRegionOp) stay standalone.
+    """
+    from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+
+    return isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp))
 
 
 def _can_merge(graph: Graph, uf: UnionFind, a_id: str, b_id: str) -> bool:
@@ -111,33 +115,21 @@ def auto_fuse(graph: Graph) -> Graph:
 
     # Initialize: one region per compute node.
     for nid in g.nodes:
-        if _is_compute_op(g.nodes[nid].op):
+        if _is_fusible_op(g.nodes[nid].op):
             uf.add(nid)
 
     # Score edges: (score, producer_id, consumer_id).
     edges: list[tuple[int, str, str]] = []
     for nid in g.topological_order():
         node = g.nodes[nid]
-        if not _is_compute_op(node.op):
+        if not _is_fusible_op(node.op):
             continue
         consumers = g.consumers(nid)
         if len(consumers) == 1:
             consumer_id = consumers[0]
-            if _is_compute_op(g.nodes[consumer_id].op):
+            if _is_fusible_op(g.nodes[consumer_id].op):
                 score = _tensor_size(node.output.shape)
                 edges.append((score, nid, consumer_id))
-
-    # Also merge structural ops (reshape, transpose) unconditionally.
-    for nid in g.topological_order():
-        node = g.nodes[nid]
-        if isinstance(node.op, (ReshapeOp, TransposeOp)):
-            uf.add(nid)
-            for inp_id in node.inputs:
-                if inp_id in uf._parent:
-                    uf.merge(nid, inp_id)
-            for consumer_id in g.consumers(nid):
-                if consumer_id in uf._parent:
-                    uf.merge(nid, consumer_id)
 
     # Greedy merge: highest score first.
     for _score, producer_id, consumer_id in sorted(edges, reverse=True):
