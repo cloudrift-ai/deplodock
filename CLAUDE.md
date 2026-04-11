@@ -44,8 +44,7 @@ Or for a specific test file:
 - `deplodock trace <model> --layer N` — trace a transformer layer to Graph IR (JSON)
 - `deplodock compile <model_or_ir> [--layer N]` — run assembly passes (auto-pulls + traces if given a model ID)
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
-- `deplodock run matmul --size 1024 [--benchmark]` — run a matmul kernel
-- `deplodock run graph <ir_file> [--benchmark]` — run a compiled graph IR through the full pipeline
+- `deplodock run <ir_file> [--benchmark]` — run a compiled graph IR through the full pipeline
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 7B): `Qwen/Qwen2.5-7B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`
