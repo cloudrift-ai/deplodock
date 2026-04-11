@@ -12,7 +12,7 @@ from deplodock.provisioning.types import VMConnectionInfo
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_URL = "https://api.cloudrift.ai"
+DEFAULT_API_URL = os.environ.get("CLOUDRIFT_API_URL", "https://api.cloudrift.ai")
 DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
 DEFAULT_CLOUDINIT_URL = "https://storage.googleapis.com/cloudrift-vm-disks/cloudinit/ubuntu-base.cloudinit"
 API_VERSION = "~upcoming"

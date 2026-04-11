@@ -411,6 +411,7 @@ deplodock vm delete cloudrift --instance-id <id>
 | `--instance-type` | (required)           | Instance type (e.g. rtx4090.1)    |
 | `--ssh-key`       | (required)           | Path to SSH public key file       |
 | `--api-key`       | `$CLOUDRIFT_API_KEY` | CloudRift API key                 |
+| `--api-url`       | `$CLOUDRIFT_API_URL` or `https://api.cloudrift.ai` | CloudRift API base URL |
 | `--image-url`     | Ubuntu 24.04         | VM image URL                      |
 | `--ports`         | `22,8000`            | Comma-separated ports to open     |
 | `--timeout`       | `600`                | Seconds to wait for Active status |
@@ -422,6 +423,7 @@ deplodock vm delete cloudrift --instance-id <id>
 |-----------------|----------------------|----------------------------------|
 | `--instance-id` | (required)           | CloudRift instance ID            |
 | `--api-key`     | `$CLOUDRIFT_API_KEY` | CloudRift API key                |
+| `--api-url`     | `$CLOUDRIFT_API_URL` or `https://api.cloudrift.ai` | CloudRift API base URL |
 | `--dry-run`     | false                | Print requests without executing |
 
 ## Benchmarking
