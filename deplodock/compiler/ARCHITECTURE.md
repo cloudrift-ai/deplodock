@@ -26,7 +26,6 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  LAYER 3: Execution Plan (backend-agnostic)                     │
 │                                                                 │
 │  plan.py:           BufferSpec, OpKernel, ExecutionPlan         │
-│  block_planner.py:  plan_block(BlockConfig) → ExecutionPlan     │
 │  backend.py:        Backend ABC (compile, run, benchmark)       │
 │                                                                 │
 │  RULE: Describes WHAT to compute, not HOW.                      │
@@ -55,12 +54,13 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 
 ```
                      Layer 1                    Layer 2
-PyTorch module ──→ Graph IR ──→ Decomposition ──→ Fusion ──→ optimized Graph
-                                  (sdpa, silu,     (RMSNorm, matmul,
-                                   pow → prims)     softmax, attention)
-                                                                  │
-                     Layer 3                                      │
-                     plan_graph(graph) ──→ ExecutionPlan ◄────────┘
+PyTorch module ──→ Graph IR ──→ Decomposition ──→ Fusion ──→ auto_fuse ──→ optimized Graph
+                                  (sdpa, silu,     (matmul)    (general fusion:
+                                   pow → prims)                 region discovery +
+                                                                kernel generation)
+                                                                        │
+                     Layer 3                                            │
+                     plan_graph(graph) ──→ ExecutionPlan ◄──────────────┘
                                                 │
                      Layer 4                    │
                      CudaBackend.compile(plan) ──→ Program
@@ -91,7 +91,6 @@ result = backend.benchmark(program)
 ### Alternative: config-driven (for testing without a model)
 
 ```python
-from deplodock.compiler.block_planner import BlockConfig, plan_block
 plan = plan_block(BlockConfig(hidden_dim=2048, num_heads=32, ...))
 # Then same backend.compile(plan) flow.
 ```
@@ -128,11 +127,12 @@ compiler/
 ├── rewriter.py       # [L2] Pass/Rule/Rewriter
 ├── rules/            # [L2] Ordered rule files by pass
 │   ├── decomposition/ #     Decompose high-level ops → primitives
-│   └── fusion/       #      Reassemble primitives → fused ops
-├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan
-├── block_planner.py  # [L3] plan_block(BlockConfig) → ExecutionPlan
+│   └── fusion/       #      MatmulOp recognition (Reduce+Mul → MatmulOp)
+├── fusion.py         # [L2] auto_fuse: automatic fusion region discovery
+├── kernel_gen.py     # [L2] Generate CUDA kernels from FusedRegionOp
+├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan, plan_graph
 ├── trace.py          # [L2] CompilerTrace for AI-in-the-loop
-├── pipeline.py       # [L4*] compile_graph (L2) + compile_and_run (legacy CUDA)
+├── pipeline.py       # [L2] compile_graph (graph optimization only)
 ├── backend/          # [L3+L4] Backend abstraction + implementations
 │   ├── __init__.py   #      Re-exports from base.py
 │   ├── base.py       # [L3] Backend ABC, ProgramResult, BenchmarkResult
@@ -222,36 +222,34 @@ Attention materializes the N×N scores matrix (naive). This is the explicit seam
 1. Create `rocm/` directory alongside `cuda/`
 2. Implement `RocmBackend(Backend)` in `rocm/backend.py`
 3. Map the same `OpKernel.op` tags to `.hip` templates
-4. The planner code (`plan.py`, `block_planner.py`) doesn't change
 
-## Graph Transformation Rules (Layer 2)
+## Graph Transformation (Layer 2)
 
-Two passes, applied in order:
+Three stages:
 
-### Decomposition pass (runs first)
+### 1. Decomposition (rules/decomposition/)
 
-Decomposes high-level ops from `torch.export` into our primitives:
+Decomposes high-level ops from `torch.export` into primitives:
 
 | Rule | Decomposes | Into |
 |------|-----------|------|
 | `001_decompose_sdpa` | `sdpa(Q, K, V)` | QK^T → scale → softmax → @V |
 | `002_decompose_silu` | `silu(x)` | `x * recip(1 + exp(-x))` |
 | `003_decompose_pow` | `pow(x, 2)` | `mul(x, x)` |
-| `004_fuse_squared_norm` | `Reduce{sum}(mul(x, x))` | `FusedReduceElementwiseOp` (prevents matmul rule from consuming) |
 
-### Fusion pass (runs second)
+### 2. Matmul recognition (rules/fusion/)
 
-Reassembles primitives into fused ops:
+One rule: `Reduce{sum}(Elementwise{mul}(A, B))` → `MatmulOp`. This bridges decomposed primitives to the high-performance SGEMM kernel path in `lower.py`.
 
-| Rule | Pattern | Output |
-|------|---------|--------|
-| `000_fuse_rmsnorm` | `(x * rsqrt(FusedReduce(x,x) + eps)) * w` | `FusedRMSNormOp` |
-| `001_fuse_reduce_elementwise` | `Reduce{sum}(Elementwise{mul}(A, B))` | `MatmulOp` |
-| `002_fuse_softmax` | `exp(x-max(x)) / sum(exp(x-max(x)))` | `FusedSoftmaxOp` |
-| `003_fuse_silu_mul` | `gate * recip(1 + exp(-gate)) * up` | `FusedSiLUMulOp` |
-| `010_fuse_attention` | `Matmul(Softmax(Scale(Matmul(Q, K^T))), V)` | `FusedAttentionOp` |
+### 3. Auto-fusion (fusion.py)
 
-**Result on TinyLlama**: 1 FusedAttentionOp, 2 FusedRMSNormOp, 1 FusedSiLUMulOp, 7 MatmulOp.
+`auto_fuse(graph)` discovers fusion regions from intermediate tensor sizes:
+- Scores each single-consumer edge by `product(intermediate_shape)`
+- Greedy merge highest-score-first
+- Structural ops (reshape, transpose) always merge
+- Produces `FusedRegionOp` nodes
+
+`kernel_gen.py` generates CUDA kernels from each `FusedRegionOp` by walking its primitive ops directly — no hand-written templates needed for pointwise or reduction patterns.
 
 ## CUDA Backend Details
 
