@@ -175,15 +175,47 @@ def _compile_dual_matmul_silu_mul(op: OpKernel) -> Launch:
 
 
 def _compile_matmul(op: OpKernel) -> Launch:
+    """Compile a matmul op using the SGEMM kernel from lower.py.
+
+    Uses the naive strategy by default. The TMA strategies require
+    KernelDef metadata (TMA descriptors, tile sizes) that the Program
+    abstraction doesn't support yet — use scripts/bench_matmul.py for
+    TMA benchmarking.
+    """
+    from deplodock.compiler.backend.cuda.codegen import emit_kernel
+    from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_graph
+    from deplodock.compiler.ir import Graph, Tensor
+    from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp
+
     m = op.params.get("M", 1)
     n = op.params.get("N", 1)
     k = op.params.get("K", 1)
-    name = _unique_name("naive_matmul")
+
+    # Build a minimal matmul graph for lowering.
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("A", (m, k)), node_id="A")
+    b = g.add_node(InputOp(), [], Tensor("B", (k, n)), node_id="B")
+    c = g.add_node(FusedReduceElementwiseOp("sum", "mul", 1), [a, b], Tensor("C", (m, n)), node_id="C")
+    g.inputs = [a, b]
+    g.outputs = [c]
+
+    config = MatmulConfig(strategy="naive")
+    kernel_def = lower_graph(g, config=config)
+    source = emit_kernel(kernel_def)
+
+    bx, by, bz = kernel_def.block_size
+    gx = _cd(n, bx)
+    gy = _cd(m, by)
+
+    name = _unique_name("matmul")
+    # Rename the kernel function in the source.
+    source = source.replace(kernel_def.name, name)
+
     return Launch(
-        kernel_source=load_kernel("matmul_naive", kernel_name=name),
+        kernel_source=source,
         kernel_name=name,
-        grid=(_cd(n, 16), _cd(m, 16), 1),
-        block=(16, 16, 1),
+        grid=(gx, gy, 1),
+        block=(bx, by, bz),
         args=[*op.inputs, *op.outputs, str(m), str(n), str(k)],
     )
 

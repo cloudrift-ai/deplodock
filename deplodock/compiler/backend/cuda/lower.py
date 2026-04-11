@@ -18,7 +18,6 @@ from deplodock.compiler.backend.cuda.ir import (
     Var,
     VarDecl,
 )
-from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.ops import FusedReduceElementwiseOp, MatmulOp
 
@@ -91,83 +90,6 @@ def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
             return _lower_matmul_tma_db_fma_tf32(graph, out_node, config)
         case _:
             raise ValueError(f"Unknown strategy: {config.strategy}")
-
-
-def lower_matmul_to_program(
-    graph: Graph,
-    config: MatmulConfig | None = None,
-    dims: dict[str, int] | None = None,
-) -> Program:
-    """Lower a matmul graph to a Program.
-
-    Currently supports the naive strategy. TMA strategies still use the
-    existing lower_graph() + runner.py path.
-
-    Args:
-        graph: Matmul graph (single output, two inputs).
-        config: Matmul configuration (strategy, tile sizes, etc.).
-        dims: Dimension values (M, N, K) for concrete grid computation.
-    """
-    from deplodock.compiler.backend.cuda.codegen import emit_kernel
-
-    kernel_def = lower_graph(graph, config)
-    kernel_source = emit_kernel(kernel_def)
-
-    # Extract buffer names from graph.
-    out_node = graph.nodes[graph.outputs[0]]
-    input_a = graph.nodes[out_node.inputs[0]]
-    input_b = graph.nodes[out_node.inputs[1]]
-    a_name = input_a.output.name
-    b_name = input_b.output.name
-    c_name = out_node.output.name
-
-    dims = dims or {}
-    m = dims.get("M", 1)
-    n = dims.get("N", 1)
-    k = dims.get("K", 1)
-
-    bx, by, _bz = kernel_def.block_size
-
-    buffers = [
-        Buffer(a_name, m * k, role="input"),
-        Buffer(b_name, k * n, role="input"),
-        Buffer(c_name, m * n, role="output"),
-    ]
-
-    # Build args list matching kernel params.
-    args: list[str] = []
-    for param in kernel_def.params:
-        if param.name in (a_name, b_name, c_name):
-            args.append(param.name)
-        elif param.name in dims:
-            args.append(str(dims[param.name]))
-        else:
-            args.append(param.name)
-
-    # Grid computation.
-    if kernel_def.tile_m and kernel_def.tile_n:
-        # TMA-style tiled grid (not fully supported yet — falls back to 2D).
-        gx = (n + kernel_def.tile_n - 1) // kernel_def.tile_n
-        gy = (m + kernel_def.tile_m - 1) // kernel_def.tile_m
-    else:
-        gx = (n + bx - 1) // bx
-        gy = (m + by - 1) // by
-
-    launches = [
-        Launch(
-            kernel_source=kernel_source,
-            kernel_name=kernel_def.name,
-            grid=(gx, gy, 1),
-            block=kernel_def.block_size,
-            args=args,
-        ),
-    ]
-
-    return Program(
-        name=f"matmul_{m}x{n}x{k}",
-        buffers=buffers,
-        launches=launches,
-    )
 
 
 def _lower_matmul_naive(graph, out_node, config):
