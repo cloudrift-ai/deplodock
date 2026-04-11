@@ -24,9 +24,6 @@ dev = ["pytest", "pytest-asyncio", "ruff", "matplotlib"]
 [tool.setuptools.packages.find]
 include = ["deplodock*"]
 
-[tool.setuptools.package-data]
-"deplodock.compiler.backend.cuda.kernels" = ["*.cu"]
-
 [project.scripts]
 deplodock = "deplodock.deplodock:main"
 

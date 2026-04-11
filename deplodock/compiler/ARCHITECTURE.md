@@ -36,7 +36,6 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │                                                                 │
 │  cuda/backend.py:   CudaBackend (implements Backend ABC)        │
 │  cuda/program.py:   Buffer, Launch, Program, compile, run       │
-│  cuda/kernels/*.cu: Kernel templates with __KERNEL_NAME__       │
 │  cuda/generators/:  matmul.py (SGEMM), fused.py (pointwise/reduce)│
 │  cuda/codegen.py:   KernelDef → CUDA C source                   │
 │  cuda/ir.py:        CUDA imperative AST (Expr, Stmt, KernelDef) │
@@ -115,7 +114,7 @@ result = backend.run(program)
 - **Do NOT import from `cuda/` in Layer 1-3 modules.** If you need GPU-specific behavior, add it to `cuda/backend.py`.
 - **Do NOT put kernel source strings in Layer 3.** `OpKernel.op` is a tag; the backend resolves it to actual code.
 - **Do NOT hardcode grid/block/smem in planners.** That's the backend's job.
-- **Do NOT add new kernels as Python f-strings.** Write `.cu` template files in `cuda/kernels/` and use `load_kernel()`.
+- **Do NOT add kernel source as Python f-strings.** Use `generators/fused.py` for auto-generated kernels or `generators/matmul.py` for SGEMM strategies.
 
 ## Module Layout
 
@@ -141,18 +140,6 @@ compiler/
 │   └── cuda/         # [L4] CUDA backend
 │       ├── backend.py    #  CudaBackend implements Backend ABC
 │       ├── program.py    #  Buffer, Launch, Program — compile + run
-│       ├── kernels/      #  .cu template files + load_kernel()
-│       │   ├── __init__.py
-│       │   ├── rmsnorm.cu
-│       │   ├── activation.cu
-│       │   ├── rope.cu
-│       │   ├── attention_qk.cu
-│       │   ├── attention_softmax.cu
-│       │   ├── attention_sv.cu
-│       │   ├── matmul_naive.cu
-│       │   ├── matmul_residual_add.cu
-│       │   ├── matmul_triple.cu
-│       │   └── matmul_dual_silu_mul.cu
 │       ├── ir.py         #  CUDA imperative AST (KernelDef, Expr, Stmt)
 │       ├── codegen.py    #  KernelDef → CUDA C source
 │       ├── generators/   #  Kernel generators
@@ -193,33 +180,6 @@ class ExecutionPlan:
 ```
 
 `OpKernel.op` is a string tag. The CUDA backend maps it to a `.cu` template. A ROCm backend would map the same tag to a `.hip` template. The planner doesn't know or care which backend runs it.
-
-## Block Kernel Inventory
-
-The transformer block plan has 10 ops (7 logical, attention is 3):
-
-| #  | OpKernel.op            | What it fuses                   | .cu template            |
-|----|------------------------|---------------------------------|-------------------------|
-| 1  | `rmsnorm`              | pow→mean→rsqrt→mul→scale        | rmsnorm.cu              |
-| 2  | `triple_matmul`        | Q/K/V projections sharing input | matmul_triple.cu        |
-| 3  | `rope`                 | rotary embeddings for Q and K   | rope.cu                 |
-| 4a | `attention_qk`         | QK^T + scale                    | attention_qk.cu         |
-| 4b | `attention_softmax`    | row-wise softmax                | attention_softmax.cu    |
-| 4c | `attention_sv`         | scores @ V                      | attention_sv.cu         |
-| 5a | `matmul_residual_add`  | Wo matmul + residual            | matmul_residual_add.cu  |
-| 5b | `rmsnorm`              | post-attention norm             | rmsnorm.cu              |
-| 6  | `dual_matmul_silu_mul` | gate+up matmuls + silu(gate)*up | matmul_dual_silu_mul.cu |
-| 7  | `matmul_residual_add`  | Wd matmul + residual            | matmul_residual_add.cu  |
-
-Attention materializes the N×N scores matrix (naive). This is the explicit seam where flash attention would replace it.
-
-## Adding a New Kernel
-
-1. Write the `.cu` file in `cuda/kernels/` with `__KERNEL_NAME__` placeholder
-2. Add a backwards-compatible wrapper in `cuda/kernels/__init__.py`
-3. Add a handler function `_compile_<op>()` in `cuda/backend.py`
-4. Register it in `_OP_HANDLERS` dict in `cuda/backend.py`
-5. Use it in a planner via `OpKernel(op="<name>", ...)`
 
 ## Adding a New Backend
 
@@ -270,16 +230,6 @@ Decomposes high-level ops from `torch.export` into primitives:
 | **2048** | 26   | 32   | 1         | **106%**      | 72.8    |
 | **4096** | 20   | 32   | 1         | **101%**      | 67.4    |
 | 8192     | 28   | 32   | 1         | 96%           | 60.2    |
-
-### Kernel Templates (cuda/kernels/)
-
-Kernels are `.cu` files with `__KERNEL_NAME__` placeholders, loaded via:
-```python
-from deplodock.compiler.cuda.kernels import load_kernel
-source = load_kernel("rmsnorm", kernel_name="fused_rmsnorm")
-```
-
-Do NOT write kernel source as Python f-strings. Always use `.cu` template files.
 
 ## Hints (hints.py)
 
