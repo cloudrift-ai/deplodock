@@ -88,7 +88,13 @@ async def stage_to_remote(
     tar_bytes = build_stage_tar(repo_root, files)
 
     ssh_args = ssh_base_args(server, ssh_key, ssh_port)
-    ssh_args.append(f"mkdir -p {remote_dir} && tar xzf - -C {remote_dir}")
+    # Clean before extract: remove stale files from previous runs,
+    # then extract fresh snapshot. Preserves venv/ (not in the tar).
+    ssh_args.append(
+        f"mkdir -p {remote_dir}"
+        f" && find {remote_dir} -maxdepth 1 -mindepth 1 -not -name venv -exec rm -rf {{}} +"
+        f" && tar xzf - -C {remote_dir}"
+    )
 
     proc = await asyncio.create_subprocess_exec(
         *ssh_args,
