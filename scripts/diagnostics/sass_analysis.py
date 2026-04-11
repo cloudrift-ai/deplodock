@@ -43,8 +43,7 @@ from deplodock.compiler.backend.cuda.lower import lower_graph  # noqa: E402
 from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
 from deplodock.compiler.ir import Graph, Tensor  # noqa: E402
-from deplodock.compiler.ops import InputOp, MatmulOp  # noqa: E402
-from deplodock.compiler.rewriter import Rewriter  # noqa: E402
+from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp  # noqa: E402
 
 # Opcode families we care about for the histogram. The article groups by these.
 # Pattern → display name. Each pattern is matched as a prefix on the SASS
@@ -74,16 +73,6 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def make_matmul_graph() -> Graph:
-    g = Graph()
-    a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
-    b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
-    c = g.add_node(MatmulOp(), [a, b], Tensor("C", ("M", "N")))
-    g.inputs = [a, b]
-    g.outputs = [c]
-    return g
-
-
 def compile_tma_bench(size: int, tmpdir: Path) -> Path:
     """Compile the TMA-DB bench binary at the given square size, return its path."""
     strategy_map, profile = default_matmul_strategy_map()
@@ -96,8 +85,15 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
         f"# profile: {profile}, config for {size}: TM={selected.thread_m}, BK={selected.block_k}, ks={selected.k_splits}", file=sys.stderr
     )
 
-    g = make_matmul_graph()
-    kernel = lower_graph(Rewriter().apply(g.copy()), config=selected)
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
+    b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
+    g.inputs = [a, b]
+    ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", ("M", "K", "N")))
+    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", ("M", "N")))
+    g.outputs = [c]
+
+    kernel = lower_graph(g, config=selected)
     src = emit_kernel(kernel)
 
     dim_args: dict[str, int] = {"M": size, "N": size, "K": size}

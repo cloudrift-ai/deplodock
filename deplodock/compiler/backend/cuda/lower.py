@@ -19,7 +19,7 @@ from deplodock.compiler.backend.cuda.ir import (
     VarDecl,
 )
 from deplodock.compiler.ir import Graph
-from deplodock.compiler.ops import MatmulOp
+from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 
 
 @dataclass
@@ -57,39 +57,62 @@ class MatmulConfig:
 
 
 def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:
-    """Lower a matmul graph to a CUDA kernel definition."""
+    """Lower a primitive graph to a CUDA kernel definition.
+
+    Detects the operation pattern from primitives:
+    - Matmul: Reduce{sum}(Elementwise{mul}(A, B)) → SGEMM kernel
+    - Future: other patterns
+
+    The graph must have exactly 1 output node.
+    """
     if len(graph.outputs) != 1:
         raise ValueError(f"Expected exactly 1 output, got {len(graph.outputs)}")
+
     out_node = graph.nodes[graph.outputs[0]]
-
-    if not isinstance(out_node.op, MatmulOp):
-        raise ValueError(f"Expected MatmulOp output, got {type(out_node.op).__name__}")
-
-    if len(out_node.inputs) != 2:
-        raise ValueError(f"Expected 2 inputs, got {len(out_node.inputs)}")
-
     config = config or MatmulConfig()
+
+    # Detect matmul pattern: Reduce{sum} consuming Elementwise{mul}
+    if isinstance(out_node.op, ReduceOp) and out_node.op.fn == "sum" and len(out_node.inputs) == 1:
+        ew_id = out_node.inputs[0]
+        if ew_id in graph.nodes:
+            ew_node = graph.nodes[ew_id]
+            if isinstance(ew_node.op, ElementwiseOp) and ew_node.op.fn == "mul" and len(ew_node.inputs) == 2:
+                input_a = graph.nodes[ew_node.inputs[0]]
+                input_b = graph.nodes[ew_node.inputs[1]]
+                return _lower_matmul(
+                    input_a.output.name,
+                    input_b.output.name,
+                    out_node.output.name,
+                    config,
+                )
+
+    raise ValueError(
+        f"Unsupported graph pattern: output op is {type(out_node.op).__name__}. "
+        "Currently only matmul (Reduce{{sum}}(Elementwise{{mul}})) is supported."
+    )
+
+
+def _lower_matmul(
+    a_name: str,
+    b_name: str,
+    c_name: str,
+    config: MatmulConfig,
+) -> KernelDef:
+    """Internal: lower a matmul to a CUDA kernel via the configured strategy."""
     match config.strategy:
         case "naive":
-            return _lower_matmul_naive(graph, out_node, config)
+            return _lower_graph_naive(a_name, b_name, c_name, config)
         case "tma_db":
-            return _lower_matmul_tma_db(graph, out_node, config)
+            return _lower_graph_tma_db(a_name, b_name, c_name, config)
         case "tma_db_tf32":
-            return _lower_matmul_tma_db_tf32(graph, out_node, config)
+            return _lower_graph_tma_db_tf32(a_name, b_name, c_name, config)
         case "tma_db_fma_tf32":
-            return _lower_matmul_tma_db_fma_tf32(graph, out_node, config)
+            return _lower_graph_tma_db_fma_tf32(a_name, b_name, c_name, config)
         case _:
             raise ValueError(f"Unknown strategy: {config.strategy}")
 
 
-def _lower_matmul_naive(graph, out_node, config):
-    """Generate a naive matmul kernel: each thread computes one C element."""
-    input_a = graph.nodes[out_node.inputs[0]]
-    input_b = graph.nodes[out_node.inputs[1]]
-
-    a_name = input_a.output.name
-    b_name = input_b.output.name
-    c_name = out_node.output.name
+def _lower_graph_naive(a_name, b_name, c_name, config):
 
     # Thread-to-element mapping.
     row_var = VarDecl(
@@ -155,7 +178,7 @@ def _lower_matmul_naive(graph, out_node, config):
     )
 
 
-def _lower_matmul_tma_db(graph, out_node, config):
+def _lower_graph_tma_db(a_name, b_name, c_name, config):
     """TMA double-buffer FP32 SGEMM with mbarrier pipelining.
 
     Uses cp.async.bulk.tensor.2d for loading A and B tiles.
@@ -164,11 +187,6 @@ def _lower_matmul_tma_db(graph, out_node, config):
     Tile: 64×128, BK=config.block_k (default 32), 256 threads, 8×4 per thread.
     Requires CUtensorMap descriptors passed via __grid_constant__.
     """
-    input_a = graph.nodes[out_node.inputs[0]]
-    input_b = graph.nodes[out_node.inputs[1]]
-    a_name = input_a.output.name
-    b_name = input_b.output.name
-    c_name = out_node.output.name
 
     from deplodock.compiler.backend.cuda.ir import RawCode
 
@@ -309,7 +327,7 @@ for(int t=0;t<nt;t++){{
     )
 
 
-def _lower_matmul_tma_db_tf32(graph, out_node, config):
+def _lower_graph_tma_db_tf32(a_name, b_name, c_name, config):
     """Pure TF32 SGEMM with TMA double-buffer loads.
 
     Same FP32 in/out interface as cublasSgemm. The kernel TMA-loads FP32
@@ -336,11 +354,6 @@ def _lower_matmul_tma_db_tf32(graph, out_node, config):
     less than FP32's ~7 (23 bits). For ML / well-conditioned numerical work
     this is usually fine; for strict bit-equivalence to FP32 it isn't.
     """
-    input_a = graph.nodes[out_node.inputs[0]]
-    input_b = graph.nodes[out_node.inputs[1]]
-    a_name = input_a.output.name
-    b_name = input_b.output.name
-    c_name = out_node.output.name
 
     import os as _os
 
@@ -480,7 +493,7 @@ for(int t=0;t<nt;t++){{
     )
 
 
-def _lower_matmul_tma_db_fma_tf32(graph, out_node, config):
+def _lower_graph_tma_db_fma_tf32(a_name, b_name, c_name, config):
     """FMA + TF32 hybrid SGEMM: native FFMA on top rows, TF32 on bottom rows.
 
     Splits the 8 warps in a CTA into:
@@ -508,11 +521,6 @@ def _lower_matmul_tma_db_fma_tf32(graph, out_node, config):
     TF32 group: 2x2 warp grid × 2 row frags × 4 col frags × 16 → 64×128 (bottom half)
     All configurable via DEPLODOCK_FMATF32_* env vars.
     """
-    input_a = graph.nodes[out_node.inputs[0]]
-    input_b = graph.nodes[out_node.inputs[1]]
-    a_name = input_a.output.name
-    b_name = input_b.output.name
-    c_name = out_node.output.name
 
     import os as _os
 

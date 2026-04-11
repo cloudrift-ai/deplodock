@@ -62,14 +62,15 @@ from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.backend.cuda.lower import lower_graph
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import FusedReduceElementwiseOp, InputOp
-from deplodock.compiler.rewriter import Rewriter
+from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 
 g = Graph()
 a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
 b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
-c = g.add_node(FusedReduceElementwiseOp("sum", "mul", 1), [a, b], Tensor("C", ("M", "N")))
-g.inputs = [a, b]; g.outputs = [c]
+g.inputs = [a, b]
+ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", ("M", "K", "N")))
+c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", ("M", "N")))
+g.outputs = [c]
 
 strategy_map, _ = default_matmul_strategy_map()
 size = $SIZE
@@ -81,7 +82,7 @@ for thr, cfg in strategy_map:
 import dataclasses
 if batch > 1:
     selected = dataclasses.replace(selected, batch_count=batch, k_splits=1)
-kernel = lower_graph(Rewriter().apply(g.copy()), config=selected)
+kernel = lower_graph(g, config=selected)
 src = emit_kernel(kernel)
 dim_args = {"M": size, "N": size, "K": size}
 if selected.k_splits > 1: dim_args["k_splits"] = selected.k_splits

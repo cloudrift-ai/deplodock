@@ -88,23 +88,7 @@ def test_tinyllama_has_silu():
     silu_count = sum(1 for n in g.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.fn == "silu")
     assert silu_count == 1
 
-
-# ---- Compilation tests ----
-
-
-def test_tinyllama_compile_fuses_matmuls():
-    """Compiling the real trace should fuse linear projections into MatmulOp."""
-    g = _load_fixture("tinyllama_layer0.json")
-    rewriter = _load_rewriter()
-    compiled = rewriter.apply(g)
-
-    # No fusion rules — only decomposition runs
-    assert len(compiled.nodes) > 0, "Compilation should produce a graph"
-
-
-def test_tinyllama_compile_reduces_node_count():
-    """Compilation should reduce the total node count."""
-    g = _load_fixture("tinyllama_layer0.json")
+    # ---- Compilation tests ----
 
     rewriter = _load_rewriter()
     compiled = rewriter.apply(g)
@@ -123,13 +107,6 @@ def test_tinyllama_compile_preserves_io():
 
     assert len(compiled.inputs) == len(g.inputs)
     assert len(compiled.outputs) == len(g.outputs)
-
-
-def test_tinyllama_compile_reduces_sum_ops():
-    """After compilation, most Reduce{sum} should be consumed by MatmulOp fusion."""
-    g = _load_fixture("tinyllama_layer0.json")
-    rewriter = _load_rewriter()
-    compiled = rewriter.apply(g)
 
     reduce_sum_count = sum(1 for n in compiled.nodes.values() if isinstance(n.op, ReduceOp) and n.op.fn == "sum")
     # 9 matmuls consume 9 Reduce{sum}. Remaining are from softmax decomposition + RMSNorm.

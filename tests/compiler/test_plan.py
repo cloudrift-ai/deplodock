@@ -46,14 +46,7 @@ def test_plan_graph_buffer_roles():
     assert len(outputs) == 1
     assert len(constants) >= 9
 
-
-def test_plan_graph_op_tags():
-    """plan_graph produces expected op tags for a compiled transformer block."""
-    compiled = _compile(_load_fixture("tinyllama_layer0.json"))
-    plan = plan_graph(compiled)
-
     op_tags = {op.op for op in plan.ops}
-    assert "fused_region" in op_tags
     assert "fused_region" in op_tags  # auto_fuse produces FusedRegionOps
 
 
@@ -75,8 +68,6 @@ def test_plan_graph_matmul_count():
     compiled = _compile(_load_fixture("tinyllama_layer0.json"))
     plan = plan_graph(compiled)
 
-    fused_count = sum(1 for op in plan.ops if op.op == "fused_region")
-    assert fused_count > 0
     fused_count = sum(1 for op in plan.ops if op.op == "fused_region")
     assert fused_count >= 1, "Expected auto_fuse to produce FusedRegionOps"
 

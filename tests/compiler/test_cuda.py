@@ -23,46 +23,21 @@ from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 # ---- helpers ----
 
 
-def _make_matmul_graph(m, k, n):
-    """Build naive matmul graph: C[M,N] = reduce_sum(ew_mul(A[M,K], B[K,N]))."""
+def _make_matmul_graph(m=None, k=None, n=None):
+    """Build primitive matmul graph: C = Reduce{sum}(Elementwise{mul}(A, B)).
+
+    If m/k/n are None, uses symbolic dims ("M", "K", "N").
+    """
+    m_dim = m if m is not None else "M"
+    k_dim = k if k is not None else "K"
+    n_dim = n if n is not None else "N"
     g = Graph()
-    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (m, k)), node_id="A")
-    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (k, n)), node_id="B")
+    a = g.add_node(InputOp(), [], Tensor("A", (m_dim, k_dim)), node_id="A")
+    b = g.add_node(InputOp(), [], Tensor("B", (k_dim, n_dim)), node_id="B")
     g.inputs = [a, b]
-    ew = g.add_node(
-        op=ElementwiseOp(fn="mul"),
-        inputs=[a, b],
-        output=Tensor("AB", (m, k, n)),
-        node_id="ew",
-    )
-    red = g.add_node(
-        op=ReduceOp(fn="sum", axis=1),
-        inputs=[ew],
-        output=Tensor("C", (m, n)),
-        node_id="red",
-    )
-    g.outputs = [red]
-    return g
-
-
-def _fuse(graph):
-    """Convert Reduce+Elementwise matmul graph to MatmulOp directly."""
-    from deplodock.compiler.ops import MatmulOp as _MatmulOp
-
-    g = graph.copy()
-    for nid in list(g.topological_order()):
-        if nid not in g.nodes:
-            continue
-        node = g.nodes[nid]
-        if isinstance(node.op, ReduceOp) and node.op.fn == "sum":
-            ew_id = node.inputs[0]
-            if ew_id in g.nodes and isinstance(g.nodes[ew_id].op, ElementwiseOp) and g.nodes[ew_id].op.fn == "mul":
-                ew_node = g.nodes[ew_id]
-                fused_id = g.add_node(_MatmulOp(), list(ew_node.inputs), Tensor(node.output.name, node.output.shape, node.output.dtype))
-                g.replace_node(nid, fused_id)
-                g.remove_node(nid)
-                if not g.consumers(ew_id):
-                    g.remove_node(ew_id)
+    ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", (m_dim, k_dim, n_dim)), node_id="ew")
+    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", (m_dim, n_dim)), node_id="C")
+    g.outputs = [c]
     return g
 
 
@@ -103,10 +78,8 @@ def test_emit_simple_kernel():
 
 
 def test_emit_matmul_kernel():
-    """Emit a matmul kernel from a lowered graph and verify structure."""
-    g = _make_matmul_graph(4, 3, 2)
-    fused = _fuse(g)
-    kernel = lower_graph(fused)
+    """Emit a matmul kernel from lowering and verify structure."""
+    kernel = lower_graph(_make_matmul_graph(4, 3, 2))
     source = emit_kernel(kernel)
 
     assert "__global__" in source
@@ -148,11 +121,9 @@ def test_emit_for_loop():
 # ---- lowering unit tests (no GPU needed) ----
 
 
-def test_lower_matmul_produces_kernel():
-    """Lower a fused matmul graph and check the KernelDef structure."""
-    g = _make_matmul_graph(4, 3, 2)
-    fused = _fuse(g)
-    kernel = lower_graph(fused)
+def test_lower_graph_produces_kernel():
+    """Lower a matmul and check the KernelDef structure."""
+    kernel = lower_graph(_make_matmul_graph())
 
     assert kernel.name == "fused_matmul"
     param_names = [p.name for p in kernel.params]
@@ -175,15 +146,10 @@ requires_cuda = pytest.mark.skipif(
 
 @requires_cuda
 def test_matmul_end_to_end():
-    """Full pipeline: graph → fuse → lower → codegen → compile → run → verify."""
+    """Full pipeline: lower → codegen → compile → run → verify."""
     M, K, N = 4, 3, 2
 
-    # Build and fuse the graph.
-    g = _make_matmul_graph(M, K, N)
-    fused = _fuse(g)
-
-    # Lower to CUDA IR and generate source.
-    kernel = lower_graph(fused)
+    kernel = lower_graph(_make_matmul_graph())
     source = emit_kernel(kernel)
 
     # Test data.
@@ -214,9 +180,7 @@ def test_matmul_larger():
     """Test with a larger matrix to exercise multiple thread blocks."""
     M, K, N = 33, 17, 25  # intentionally not multiples of block size (16)
 
-    g = _make_matmul_graph(M, K, N)
-    fused = _fuse(g)
-    kernel = lower_graph(fused)
+    kernel = lower_graph(_make_matmul_graph())
     source = emit_kernel(kernel)
 
     # Simple test data: A=1s, B=1s → each C[i,j] should equal K.
@@ -246,24 +210,12 @@ def test_run_benchmark_surfaces_cuda_oom():
     """
     import dataclasses
 
-    from deplodock.compiler.backend.cuda.codegen import emit_kernel
-    from deplodock.compiler.backend.cuda.lower import lower_graph
     from deplodock.compiler.backend.cuda.runner import run_benchmark
     from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 
-    # Build a pre-fused matmul graph (symbolic dims).
-    from deplodock.compiler.ops import MatmulOp
-
-    g = Graph()
-    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", ("M", "K")), node_id="A")
-    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", ("K", "N")), node_id="B")
-    g.inputs = [a, b]
-    c = g.add_node(op=MatmulOp(), inputs=[a, b], output=Tensor("C", ("M", "N")), node_id="C")
-    g.outputs = [c]
-
     strategy_map, _ = default_matmul_strategy_map()
     cfg = dataclasses.replace(strategy_map[0][1], batch_count=8, k_splits=1)
-    kernel = lower_graph(g, config=cfg)
+    kernel = lower_graph(_make_matmul_graph(), config=cfg)
     source = emit_kernel(kernel)
 
     huge = {"M": 65536, "N": 65536, "K": 65536, "batch": 8}
@@ -272,7 +224,7 @@ def test_run_benchmark_surfaces_cuda_oom():
         run_benchmark(kernel=kernel, kernel_source=source, dim_args=huge, num_iterations=2)
 
 
-# All matmul lowering strategies that the dispatcher in lower_graph() recognizes.
+# All matmul lowering strategies that lower_graph() recognizes.
 # Each entry: (strategy name, MatmulConfig overrides). The configs are the
 # minimum settings each strategy needs to compile — many have hardcoded
 # assumptions about block / coarsening dims and won't accept arbitrary values.
@@ -293,14 +245,8 @@ def test_lower_every_strategy(strategy_name, overrides):
     """
     from deplodock.compiler.backend.cuda.lower import MatmulConfig
 
-    # Use a size that's a multiple of common tile factors so any per-strategy
-    # divisibility assertion passes.
-    M, K, N = 64, 64, 64
-
-    g = _make_matmul_graph(M, K, N)
-    fused = _fuse(g)
     cfg = MatmulConfig(strategy=strategy_name, **overrides)
-    kernel = lower_graph(fused, config=cfg)
+    kernel = lower_graph(_make_matmul_graph(), config=cfg)
     source = emit_kernel(kernel)
     assert kernel.name
     assert source
@@ -326,10 +272,8 @@ def test_run_every_strategy_correctness(strategy_name, overrides):
     from deplodock.compiler.backend.cuda.lower import MatmulConfig
 
     M, K, N = 32, 32, 32
-    g = _make_matmul_graph(M, K, N)
-    fused = _fuse(g)
     cfg = MatmulConfig(strategy=strategy_name, **overrides)
-    kernel = lower_graph(fused, config=cfg)
+    kernel = lower_graph(_make_matmul_graph(), config=cfg)
     source = emit_kernel(kernel)
 
     a_data = [1.0] * (M * K)
@@ -354,9 +298,7 @@ def test_run_tma_db_strategy_via_bench():
 
     cfg = MatmulConfig(strategy="tma_db", block_k=32, thread_m=8)
     M = N = K = 256  # multiple of TMA tile (224x128 → use 256 to keep things simple)
-    g = _make_matmul_graph(M, K, N)
-    fused = _fuse(g)
-    kernel = lower_graph(fused, config=cfg)
+    kernel = lower_graph(_make_matmul_graph(), config=cfg)
     source = emit_kernel(kernel)
     result = run_benchmark(
         kernel=kernel,
