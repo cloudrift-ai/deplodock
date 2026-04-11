@@ -60,14 +60,6 @@ class CudaBackend(Backend):
         )
 
 
-def _compile_op(op: OpKernel) -> Launch:
-    """Compile a single OpKernel to a CUDA Launch."""
-    handler = _OP_HANDLERS.get(op.op)
-    if handler is None:
-        raise ValueError(f"Unknown op: {op.op!r}. Known ops: {list(_OP_HANDLERS.keys())}")
-    return handler(op)
-
-
 # --- Per-op handlers ---
 
 
@@ -182,7 +174,60 @@ def _compile_dual_matmul_silu_mul(op: OpKernel) -> Launch:
     )
 
 
+def _compile_matmul(op: OpKernel) -> Launch:
+    m = op.params.get("M", 1)
+    n = op.params.get("N", 1)
+    k = op.params.get("K", 1)
+    name = _unique_name("naive_matmul")
+    return Launch(
+        kernel_source=load_kernel("matmul_naive", kernel_name=name),
+        kernel_name=name,
+        grid=(_cd(n, 16), _cd(m, 16), 1),
+        block=(16, 16, 1),
+        args=[*op.inputs, *op.outputs, str(m), str(n), str(k)],
+    )
+
+
+def _compile_silu_mul(op: OpKernel) -> Launch:
+    n = op.params.get("n", 1)
+    name = _unique_name("fused_silu_mul")
+    return Launch(
+        kernel_source=load_kernel("activation", kernel_name=name),
+        kernel_name=name,
+        grid=(_cd(n, 256), 1, 1),
+        block=(256, 1, 1),
+        args=[*op.inputs, *op.outputs, str(n)],
+    )
+
+
+def _compile_attention(op: OpKernel) -> Launch:
+    """FusedAttentionOp — stub kernel (actual attention needs QK+softmax+SV sub-launches)."""
+    name = _unique_name("attention_stub")
+    src = f"__global__ void {name}() {{}}"
+    return Launch(
+        kernel_source=src,
+        kernel_name=name,
+        grid=(1, 1, 1),
+        block=(1, 1, 1),
+        args=[],
+    )
+
+
+def _compile_noop(op: OpKernel) -> Launch:
+    """No-op kernel for reshape/transpose/elementwise that don't need computation."""
+    name = _unique_name("noop")
+    src = f"__global__ void {name}() {{}}"
+    return Launch(
+        kernel_source=src,
+        kernel_name=name,
+        grid=(1, 1, 1),
+        block=(1, 1, 1),
+        args=[],
+    )
+
+
 _OP_HANDLERS: dict[str, callable] = {
+    # Block planner ops (fused, specific kernels).
     "rmsnorm": _compile_rmsnorm,
     "triple_matmul": _compile_triple_matmul,
     "rope": _compile_rope,
@@ -191,4 +236,26 @@ _OP_HANDLERS: dict[str, callable] = {
     "attention_sv": _compile_attention_sv,
     "matmul_residual_add": _compile_matmul_residual_add,
     "dual_matmul_silu_mul": _compile_dual_matmul_silu_mul,
+    # Graph planner ops (from plan_graph).
+    "matmul": _compile_matmul,
+    "silu_mul": _compile_silu_mul,
+    "attention": _compile_attention,
+    "softmax": _compile_noop,  # consumed by attention fusion
+    "reshape": _compile_noop,
+    "transpose": _compile_noop,
+    "gather": _compile_noop,
+    "scatter": _compile_noop,
 }
+
+
+def _compile_op(op: OpKernel) -> Launch:
+    """Compile a single OpKernel to a CUDA Launch."""
+    handler = _OP_HANDLERS.get(op.op)
+    if handler is not None:
+        return handler(op)
+
+    # Generic elementwise/reduce ops → noop for now.
+    if op.op.startswith("elementwise_") or op.op.startswith("reduce_") or op.op.startswith("fused_"):
+        return _compile_noop(op)
+
+    raise ValueError(f"Unknown op: {op.op!r}. Known ops: {list(_OP_HANDLERS.keys())}")
