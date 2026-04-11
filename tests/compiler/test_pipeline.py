@@ -40,7 +40,7 @@ requires_cuda = pytest.mark.skipif(
 
 
 def test_compile_graph_fuses_matmul():
-    """compile_graph applies fusion rules and produces MatmulOp."""
+    """compile_graph applies fusion rules and produces FusedRegionOp."""
     g = _make_matmul_graph(4, 3, 2)
     rewriter = _load_rewriter()
     from deplodock.compiler.fusion import auto_fuse
@@ -49,7 +49,7 @@ def test_compile_graph_fuses_matmul():
     compiled = auto_fuse(compiled)
 
     op_types = {type(n.op).__name__ for n in compiled.nodes.values()}
-    assert "FusedRegionOp" in op_types or "MatmulOp" in op_types
+    assert "FusedRegionOp" in op_types
 
     assert len(traces) > 0
 
@@ -67,19 +67,46 @@ def test_plan_graph_from_matmul():
     assert len(fused_ops) >= 1
 
 
-@requires_cuda
-def test_pipeline_end_to_end():
-    """Full pipeline: graph → fuse → plan → CudaBackend → GPU."""
-    g = _make_matmul_graph(4, 3, 2)
+def test_matmul_k_dimension_inferred_correctly():
+    """Non-square matmul: K must be inferred from input shapes, not output."""
+    from deplodock.compiler.backend.cuda.backend import _is_matmul_region
     from deplodock.compiler.fusion import auto_fuse
 
+    # A(32, 2048) @ B(2048, 512) → C(32, 512). K=2048, not 32.
+    g = _make_matmul_graph(32, 2048, 512)
     compiled, _ = compile_graph(g, _load_rewriter())
     compiled = auto_fuse(compiled)
     plan = plan_graph(compiled)
 
+    fused_ops = [op for op in plan.ops if op.op == "fused_region"]
+    assert len(fused_ops) == 1
+
+    is_matmul, m, n, k = _is_matmul_region(fused_ops[0])
+    assert is_matmul
+    assert m == 32
+    assert n == 512
+    assert k == 2048, f"K should be 2048 (shared dim), got {k}"
+
+
+@requires_cuda
+def test_pipeline_end_to_end(dump_dir):
+    """Full pipeline: graph → fuse → plan → CudaBackend → GPU."""
+    g = _make_matmul_graph(4, 3, 2)
+    from deplodock.compiler.fusion import auto_fuse
+
+    dump_dir.dump_input_graph(g)
+    compiled, traces = compile_graph(g, _load_rewriter())
+    dump_dir.dump_passes(traces)
+    compiled = auto_fuse(compiled)
+    dump_dir.dump_fused_graph(compiled)
+    plan = plan_graph(compiled)
+    dump_dir.dump_plan(plan)
+
     backend = CudaBackend()
     program = backend.compile(plan)
+    dump_dir.dump_program(program)
     result = backend.run(program)
+    dump_dir.dump_result(result)
 
     # Output should have values (matmul result).
     assert len(result.outputs) == 1
@@ -88,17 +115,23 @@ def test_pipeline_end_to_end():
 
 
 @requires_cuda
-def test_pipeline_benchmark():
+def test_pipeline_benchmark(dump_dir):
     """Benchmark through canonical pipeline returns timing."""
     g = _make_matmul_graph(64, 64, 64)
     from deplodock.compiler.fusion import auto_fuse
 
-    compiled, _ = compile_graph(g, _load_rewriter())
+    dump_dir.dump_input_graph(g)
+    compiled, traces = compile_graph(g, _load_rewriter())
+    dump_dir.dump_passes(traces)
     compiled = auto_fuse(compiled)
+    dump_dir.dump_fused_graph(compiled)
     plan = plan_graph(compiled)
+    dump_dir.dump_plan(plan)
 
     backend = CudaBackend()
     program = backend.compile(plan)
+    dump_dir.dump_program(program)
     result = backend.benchmark(program, warmup=2, num_iters=3)
+    dump_dir.dump_benchmark(result)
 
     assert result.time_ms > 0

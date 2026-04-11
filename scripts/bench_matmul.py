@@ -30,8 +30,7 @@ from deplodock.compiler.backend.cuda.lower import MatmulConfig, lower_graph
 from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_benchmark
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import InputOp, MatmulOp
-from deplodock.compiler.rewriter import Rewriter
+from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -103,7 +102,6 @@ class BenchmarkSuite:
 
 def run_benchmark_suite(
     graph: Graph,
-    rewriter: Rewriter,
     config: MatmulConfig,
     sizes: list[dict[str, int]] | None = None,
     output_dir: Path | None = None,
@@ -125,8 +123,7 @@ def run_benchmark_suite(
     )
 
     try:
-        optimized = rewriter.apply(graph.copy())
-        kernel = lower_graph(optimized, config=config)
+        kernel = lower_graph(graph, config=config)
         source = emit_kernel(kernel)
         suite.generated_code = source
 
@@ -179,7 +176,6 @@ def run_benchmark_suite(
 
 def run_adaptive_benchmark_suite(
     graph: Graph,
-    rewriter: Rewriter,
     strategy_map: list[tuple[int, MatmulConfig]],
     sizes: list[dict[str, int]] | None = None,
     output_dir: Path | None = None,
@@ -201,12 +197,10 @@ def run_adaptive_benchmark_suite(
     )
 
     try:
-        optimized = rewriter.apply(graph.copy())
-
         kernels: dict[int, tuple] = {}
         for _threshold, cfg in strategy_map:
             key = id(cfg)
-            kernel = lower_graph(optimized, config=cfg)
+            kernel = lower_graph(graph, config=cfg)
             source = emit_kernel(kernel)
             kernels[key] = (kernel, source, cfg)
 
@@ -344,12 +338,13 @@ def collect_system_info() -> dict[str, str]:
 
 
 def make_matmul_graph() -> Graph:
-    """Create a simple matmul graph: C = sum(A * B, axis=k)."""
+    """Create a primitive matmul graph: C = Reduce{sum}(Elementwise{mul}(A, B))."""
     g = Graph()
     a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
     b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
-    c = g.add_node(MatmulOp(), [a, b], Tensor("C", ("M", "N")))
     g.inputs = [a, b]
+    ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", ("M", "K", "N")))
+    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", ("M", "N")))
     g.outputs = [c]
     return g
 
@@ -383,6 +378,7 @@ def main():
     parser.add_argument("--k-splits", type=int, default=1, help="K-dimension splitting (non-adaptive only)")
     parser.add_argument("--assume-aligned", action="store_true", help="Skip bounds checks")
     parser.add_argument("--output-dir", type=str, default=None, help="Directory for saved JSON trace")
+    parser.add_argument("--dump-dir", type=str, default=None, help="Directory to dump intermediate compilation artifacts")
     parser.add_argument("--description", type=str, default="", help="Description for trace")
     parser.add_argument(
         "--cublas-math",
@@ -393,7 +389,6 @@ def main():
     args = parser.parse_args()
 
     graph = make_matmul_graph()
-    rewriter = Rewriter()
     sizes = [parse_size(args.size)]
     output_dir = Path(args.output_dir) if args.output_dir else None
     system_info = collect_system_info()
@@ -407,7 +402,6 @@ def main():
             strategy_map = [(t, dataclasses.replace(c, batch_count=batch, k_splits=1)) for t, c in strategy_map]
         suite = run_adaptive_benchmark_suite(
             graph,
-            rewriter,
             strategy_map,
             sizes=sizes,
             output_dir=output_dir,
@@ -429,7 +423,6 @@ def main():
         )
         suite = run_benchmark_suite(
             graph,
-            rewriter,
             config,
             sizes=sizes,
             output_dir=output_dir,
@@ -438,6 +431,12 @@ def main():
             cublas_math_mode=args.cublas_math,
             system_info=system_info,
         )
+
+    from deplodock.compiler.dump import CompilerDump
+
+    dump = CompilerDump.resolve(args.dump_dir)
+    if dump and suite.generated_code:
+        dump.dump_source(suite.generated_code)
 
     print()
     print(suite.summary_table())

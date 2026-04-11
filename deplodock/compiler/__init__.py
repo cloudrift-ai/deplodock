@@ -1,5 +1,6 @@
 """Minimal tensor IR and graph transformation engine."""
 
+from deplodock.compiler.dump import CompilerDump
 from deplodock.compiler.ir import Graph, Node, Tensor
 from deplodock.compiler.matcher import Match, match_pattern
 from deplodock.compiler.ops import (
@@ -7,7 +8,6 @@ from deplodock.compiler.ops import (
     ElementwiseOp,
     GatherOp,
     InputOp,
-    MatmulOp,
     Op,
     ReduceOp,
     ReshapeOp,
@@ -17,20 +17,17 @@ from deplodock.compiler.ops import (
 )
 from deplodock.compiler.pattern import PatternNode, PatternVar, PatternWildcard, parse_pattern
 from deplodock.compiler.plan import ExecutionPlan, OpKernel, plan_graph
-from deplodock.compiler.rewriter import Pass, Rewriter, Rule
-from deplodock.compiler.trace import CompilerTrace, ExecutionResult, PassTrace, RuleApplication
+from deplodock.compiler.rewriter import Pass, PassTrace, Rewriter, Rule, RuleApplication
 
 __all__ = [
-    "CompilerTrace",
+    "CompilerDump",
     "ConstantOp",
     "ElementwiseOp",
     "ExecutionPlan",
-    "ExecutionResult",
     "GatherOp",
     "Graph",
     "InputOp",
     "Match",
-    "MatmulOp",
     "Node",
     "Op",
     "OpKernel",

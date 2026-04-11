@@ -407,3 +407,133 @@ def test_kernel_gen_matmul_residual_add():
         shapes[nid] = fused.nodes[nid].output.shape
     source = generate_kernel(fused_nodes[0].op, "test_mra", shapes)
     assert "__global__" in source
+
+
+# ===========================================================================
+# GPU correctness tests — run generated kernels and verify numerical output.
+# These go through the full pipeline: graph → auto_fuse → kernel_gen →
+# plan → CudaBackend → GPU → compare output against Python reference.
+# ===========================================================================
+
+
+def _compile_and_run(g: Graph, dump=None) -> dict[str, list[float]]:
+    """Full pipeline: auto_fuse → kernel_gen → plan → CudaBackend.run()."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.plan import plan_graph
+
+    if dump:
+        dump.dump_input_graph(g)
+
+    fused = auto_fuse(g)
+
+    # Generate kernels for all FusedRegionOps.
+    shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
+    for nid in fused.nodes:
+        shapes[nid] = fused.nodes[nid].output.shape
+    for nid in fused.nodes:
+        node = fused.nodes[nid]
+        if isinstance(node.op, FusedRegionOp) and not node.op.kernel_source:
+            node.op.kernel_source = generate_kernel(node.op, f"kernel_{nid}", shapes)
+
+    if dump:
+        dump.dump_fused_graph(fused)
+
+    plan = plan_graph(fused)
+    backend = CudaBackend()
+    program = backend.compile(plan)
+
+    if dump:
+        dump.dump_plan(plan)
+        dump.dump_program(program)
+
+    result = backend.run(program)
+
+    if dump:
+        dump.dump_result(result)
+
+    return result.outputs
+
+
+@requires_cuda
+def test_correctness_pointwise_silu(dump_dir):
+    """SiLU pointwise chain: verify output is nonzero and finite."""
+    n = 256
+
+    g = Graph()
+    gate = g.add_node(InputOp(), [], Tensor("gate", (n,)), node_id="gate")
+    one = g.add_node(ConstantOp(name="one"), [], Tensor("one", (1,)), node_id="one")
+    g.inputs = [gate]
+
+    neg = g.add_node(ElementwiseOp("neg"), [gate], Tensor("neg", (n,)), node_id="neg")
+    exp = g.add_node(ElementwiseOp("exp"), [neg], Tensor("exp", (n,)), node_id="exp")
+    add = g.add_node(ElementwiseOp("add"), [one, exp], Tensor("add", (n,)), node_id="add")
+    recip = g.add_node(ElementwiseOp("recip"), [add], Tensor("recip", (n,)), node_id="recip")
+    out = g.add_node(ElementwiseOp("mul"), [gate, recip], Tensor("out", (n,)), node_id="out")
+    g.outputs = [out]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    assert len(outputs) == 1
+    vals = list(outputs.values())[0]
+    assert len(vals) == n
+    # SiLU output should be nonzero for nonzero input.
+    nonzero = sum(1 for v in vals if abs(v) > 1e-12)
+    assert nonzero > n * 0.5, f"SiLU output mostly zeros: {nonzero}/{n} nonzero"
+    assert all(v == v for v in vals), "Output contains NaN"
+
+
+@requires_cuda
+def test_correctness_reduce_sum(dump_dir):
+    """Reduction kernel: sum of rows. Compare against Python reference."""
+    rows, cols = 8, 64
+
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("x", (rows, cols)), node_id="x")
+    g.inputs = [x]
+    red = g.add_node(ReduceOp("sum", axis=1), [x], Tensor("out", (rows,)), node_id="out")
+    g.outputs = [red]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    vals = list(outputs.values())[0]
+    assert len(vals) == rows
+
+    # With pseudorandom init: h[i] = 0.01 * ((i*7+13) % 101 - 50)
+    # Compute expected row sums.
+    expected = []
+    for r in range(rows):
+        s = 0.0
+        for c in range(cols):
+            idx = r * cols + c
+            s += 0.01 * ((idx * 7 + 13) % 101 - 50)
+        expected.append(s)
+
+    for i, (got, exp) in enumerate(zip(vals, expected, strict=True)):
+        assert abs(got - exp) < 0.1, f"Row {i}: got {got}, expected {exp}"
+
+
+@requires_cuda
+def test_correctness_rmsnorm(dump_dir):
+    """RMSNorm through full pipeline: verify output is nonzero and finite."""
+    rows, dim = 4, 128
+
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("x", (rows, dim)), node_id="x")
+    w = g.add_node(InputOp(), [], Tensor("weight", (dim,)), node_id="weight")
+    eps = g.add_node(ConstantOp(name="eps"), [], Tensor("eps", (1,)), node_id="eps")
+    g.inputs = [x, w]
+
+    sq = g.add_node(ElementwiseOp("mul"), [x, x], Tensor("sq", (rows, dim)), node_id="sq")
+    red = g.add_node(ReduceOp("sum", axis=1), [sq], Tensor("sum_sq", (rows, 1)), node_id="sum_sq")
+    add_eps = g.add_node(ElementwiseOp("add"), [red, eps], Tensor("var", (rows, 1)), node_id="var")
+    rsqrt = g.add_node(ElementwiseOp("rsqrt"), [add_eps], Tensor("rsqrt_val", (rows, 1)), node_id="rsqrt_val")
+    norm = g.add_node(ElementwiseOp("mul"), [x, rsqrt], Tensor("norm", (rows, dim)), node_id="norm")
+    out = g.add_node(ElementwiseOp("mul"), [norm, w], Tensor("out", (rows, dim)), node_id="out")
+    g.outputs = [out]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    vals = list(outputs.values())[0]
+    assert len(vals) == rows * dim
+    nonzero = sum(1 for v in vals if abs(v) > 1e-12)
+    assert nonzero > rows * dim * 0.5, f"RMSNorm output mostly zeros: {nonzero}/{rows * dim}"
+    assert all(v == v for v in vals), "Output contains NaN"
+    # RMSNorm normalizes — values should be bounded.
+    assert all(abs(v) < 100 for v in vals), f"RMSNorm output has extreme values: max={max(abs(v) for v in vals)}"

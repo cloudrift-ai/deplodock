@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from deplodock.compiler.ir import Graph
-from deplodock.compiler.rewriter import Rewriter
-from deplodock.compiler.trace import PassTrace
+from deplodock.compiler.rewriter import PassTrace, Rewriter
 
 
 def compile_graph(graph: Graph, rewriter: Rewriter) -> tuple[Graph, list[PassTrace]]:

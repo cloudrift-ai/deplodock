@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations (default: 10)")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations (default: 100)")
     parser.add_argument("--backends", default=",".join(ALL_BACKENDS), help=f"Comma-separated backends (default: {','.join(ALL_BACKENDS)})")
+    parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
     args = parser.parse_args()
 
     try:
@@ -101,7 +102,10 @@ def main():
 
     # --- Deplodock CUDA pipeline ---
     if "deplodock" in backends:
-        us = _bench_deplodock(block, x, rotary_emb, pos_emb)
+        from deplodock.compiler.dump import CompilerDump
+
+        dump = CompilerDump.resolve(args.dump_dir)
+        us = _bench_deplodock(block, x, rotary_emb, pos_emb, dump=dump)
         if us is not None:
             results["Deplodock (naive attn)"] = us
 
@@ -167,17 +171,20 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
     return (start.elapsed_time(end) / iters) * 1000
 
 
-def _bench_deplodock(block, x, rotary_emb, pos_emb):
+def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
     from pathlib import Path
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.plan import plan_graph
-    from deplodock.compiler.rewriter import Rewriter
+    from deplodock.compiler.rewriter import PassTrace, Rewriter
     from deplodock.compiler.torch_trace import trace_module
 
     try:
         # Trace the block through our pipeline.
         graph = trace_module(block.cpu(), (x.cpu(),), kwargs={"position_embeddings": (pos_emb[0].cpu(), pos_emb[1].cpu())})
+
+        if dump:
+            dump.dump_input_graph(graph)
 
         from deplodock.compiler.fusion import auto_fuse
         from deplodock.compiler.kernel_gen import generate_kernel
@@ -186,7 +193,12 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb):
         # Decompose + matmul recognition + auto-fuse.
         rules_dir = Path(__file__).parent.parent / "deplodock" / "compiler" / "rules"
         rewriter = Rewriter.from_directory(rules_dir)
-        compiled = rewriter.apply(graph)
+        pass_traces: list[PassTrace] = []
+        compiled = rewriter.apply(graph, pass_traces=pass_traces)
+
+        if dump:
+            dump.dump_passes(pass_traces)
+
         compiled = auto_fuse(compiled)
 
         # Generate kernels for fused regions.
@@ -198,10 +210,38 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb):
             if isinstance(node.op, FusedRegionOp) and not node.op.kernel_source:
                 node.op.kernel_source = generate_kernel(node.op, f"kernel_{nid}", shapes)
 
+        if dump:
+            dump.dump_fused_graph(compiled)
+
         # Plan from graph.
         plan = plan_graph(compiled)
         backend = CudaBackend()
         program = backend.compile(plan)
+
+        if dump:
+            dump.dump_plan(plan)
+            dump.dump_program(program)
+
+        # Correctness sanity check: run once and verify outputs are non-trivial.
+        run_result = backend.run(program)
+        for buf_name, values in run_result.outputs.items():
+            nonzero = sum(1 for v in values if abs(v) > 1e-12)
+            has_nan = any(v != v for v in values)  # NaN != NaN
+            if has_nan:
+                logger.error("CORRECTNESS FAIL: output %s contains NaN", buf_name)
+                return None
+            if nonzero == 0:
+                logger.error("CORRECTNESS FAIL: output %s is all zeros (noop kernels?)", buf_name)
+                return None
+            logger.info(
+                "Correctness check: %s has %d/%d nonzero values, range [%.4f, %.4f]",
+                buf_name,
+                nonzero,
+                len(values),
+                min(values),
+                max(values),
+            )
+
         result = backend.benchmark(program, warmup=3, num_iters=10)
 
         # Move block back to GPU for other benchmarks.
