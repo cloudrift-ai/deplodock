@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
+from typing import Any
 
 from deplodock.compiler.backend.cuda.ir import (
     ArrayAccess,
@@ -54,6 +56,15 @@ class MatmulConfig:
     assume_aligned: bool = False
     k_splits: int = 1
     batch_count: int = 1
+
+    @classmethod
+    def from_hints(cls, hints: dict[str, Any]) -> MatmulConfig:
+        """Build a MatmulConfig from a hint dict (keys without namespace prefix).
+
+        Unknown keys are silently ignored; missing keys use dataclass defaults.
+        """
+        valid = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in hints.items() if k in valid})
 
 
 def lower_graph(graph: Graph, config: MatmulConfig | None = None) -> KernelDef:

@@ -63,6 +63,7 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
     import math
 
     from deplodock.compiler import ops as ops_module
+    from deplodock.compiler.hints import resolve_hints
 
     def _prod(s: tuple) -> int:
         return math.prod(x for x in s if isinstance(x, int)) if s else 1
@@ -143,6 +144,11 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
         # Store input shapes for broadcasting/dimension inference.
         if "_input_shapes" not in params:
             params["_input_shapes"] = {inp_id: graph.nodes[inp_id].output.shape for inp_id in node.inputs if inp_id in graph.nodes}
+
+        # Propagate resolved hints (graph-level merged with node-level).
+        resolved = resolve_hints(graph, nid)
+        if resolved:
+            params["_hints"] = resolved.to_dict()
 
         op_kernels.append(OpKernel(op=tag, inputs=inputs, outputs=outputs, params=params))
 

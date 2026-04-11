@@ -120,7 +120,8 @@ result = run_program(program)
 ```
 compiler/
 ├── ops.py            # [L1] Op base class + all op types
-├── ir.py             # [L1] Tensor, Node, Graph
+├── ir.py             # [L1] Tensor, Node, Graph (with Hints on Node + Graph)
+├── hints.py          # [L1] Hints metadata bag + resolve_hints()
 ├── torch_trace.py    # [L1] PyTorch → Graph IR (optional torch dep)
 ├── pattern.py        # [L2] Pattern AST + text parser
 ├── matcher.py        # [L2] Graph pattern matching engine
@@ -276,6 +277,29 @@ source = load_kernel("rmsnorm", kernel_name="fused_rmsnorm")
 ```
 
 Do NOT write kernel source as Python f-strings. Always use `.cu` template files.
+
+## Hints (hints.py)
+
+Hints are advisory metadata attached to `Node` or `Graph` that influence compiler decisions without changing computation semantics. Backends may ignore unknown hints.
+
+- **`Node.hints`**: per-node hints (e.g. this matmul uses strategy X)
+- **`Graph.hints`**: graph-wide hints (e.g. all matmuls use strategy Y)
+- **`resolve_hints(graph, node_id)`**: merges graph + node hints (node wins on conflict)
+
+Keys use dotted namespaces. The `cuda.matmul.*` namespace maps 1:1 to `MatmulConfig` fields:
+
+```python
+graph.hints.set("cuda.matmul.strategy", "tma_db")
+graph.hints.set("cuda.matmul.block_k", 32)
+graph.nodes["n5"].hints.set("cuda.matmul.threads_y", 8)  # per-node override
+```
+
+Flow through the pipeline:
+1. **Rewriter/Fusion**: read/write hints on graph nodes directly
+2. **plan_graph()**: resolves hints per node → stores in `OpKernel.params["_hints"]`
+3. **CudaBackend**: reads `params["_hints"]`, extracts `cuda.matmul.*`, builds `MatmulConfig.from_hints()`
+
+Hints survive serialization (`to_dict`/`from_dict`) and deep copy. Old graphs without hints deserialize correctly (empty defaults).
 
 ## Debug Dump Infrastructure
 
