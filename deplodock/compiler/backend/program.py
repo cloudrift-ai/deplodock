@@ -46,3 +46,98 @@ class Program:
     # target's device pointer (no separate allocation). Used for
     # reshape/transpose which are metadata-only ops.
     aliases: dict[str, str] = field(default_factory=dict)
+
+    def pretty_print(self) -> str:
+        """Human-readable program listing: buffers, aliases, launch schedule."""
+        lines: list[str] = []
+        buf_names = {b.name for b in self.buffers}
+        aliased = set(self.aliases.keys())
+
+        # Header.
+        n_real = sum(1 for b in self.buffers if b.name not in aliased)
+        lines.append(f"# Program: {self.name}")
+        lines.append(f"# {n_real} buffers, {len(self.aliases)} aliases, {len(self.launches)} launches")
+        lines.append("")
+
+        # Buffers grouped by role.
+        for role in ("input", "constant", "output", "scratch"):
+            bufs = [b for b in self.buffers if b.role == role and b.name not in aliased]
+            if not bufs:
+                continue
+            for b in bufs:
+                lines.append(f"{b.name} = buffer({b.size}, {b.dtype}, {b.role})")
+            lines.append("")
+
+        # Aliases.
+        if self.aliases:
+            for alias, target in self.aliases.items():
+                lines.append(f"{alias} = alias({target})")
+            lines.append("")
+
+        # Launches.
+        input_bufs_set = {b.name for b in self.buffers if b.role in ("input", "constant")} | aliased
+
+        for launch in self.launches:
+            # Extract kernel parameter names from source signature.
+            import re
+
+            sig_match = re.search(r"void \w+\(([^)]*)\)", launch.kernel_source)
+            if sig_match:
+                param_names = [p.strip().split()[-1].lstrip("*") for p in sig_match.group(1).split(",") if p.strip()]
+            else:
+                param_names = []
+
+            # Build ordered (param_name, value) pairs: TMA descriptors first, then regular args.
+            tma_descs = getattr(launch, "tma_descriptors", [])
+            pairs: list[tuple[str, str]] = []
+            for desc in tma_descs:
+                pairs.append((desc.param_name, f"tma {desc.buffer}"))
+            pi = len(tma_descs)  # param index (TMA params already consumed)
+            for arg in launch.args:
+                pname = param_names[pi] if pi < len(param_names) else arg
+                pairs.append((pname, arg))
+                pi += 1
+
+            # Separate outputs from inputs.
+            outs: list[str] = []
+            rhs_pairs: list[tuple[str, str]] = []
+            for pname, val in pairs:
+                bare = val.removeprefix("tma ")
+                is_buf = bare in buf_names or bare in aliased
+                is_tma = val.startswith("tma ")
+                if is_buf and not is_tma and bare not in input_bufs_set:
+                    outs.append(bare)
+                else:
+                    rhs_pairs.append((pname, val))
+
+            # Format: param=value, eliding param name when it matches the value.
+            rhs_parts = []
+            for pname, val in rhs_pairs:
+                bare = val.removeprefix("tma ")
+                if bare == pname or pname == val:
+                    rhs_parts.append(val)
+                else:
+                    rhs_parts.append(f"{pname}={val}")
+            rhs = ", ".join(rhs_parts)
+
+            # Grid/block.
+            gx, gy, gz = launch.grid
+            bx, by, bz = launch.block
+            grid_str = f"{gx}" if gy == 1 and gz == 1 else f"{gx}x{gy}x{gz}"
+            block_str = f"{bx}" if by == 1 and bz == 1 else f"{bx}x{by}"
+
+            # Annotations.
+            notes: list[str] = []
+            if launch.smem_bytes:
+                notes.append(f"smem={launch.smem_bytes}")
+            if launch.zero_outputs:
+                notes.append(f"zero={','.join(launch.zero_outputs)}")
+            suffix = f"  # {', '.join(notes)}" if notes else ""
+
+            if outs:
+                lhs = ", ".join(outs)
+                lines.append(f"{lhs} = {launch.kernel_name}({rhs})  <<<{grid_str}, {block_str}>>>{suffix}")
+            else:
+                lines.append(f"{launch.kernel_name}({rhs})  <<<{grid_str}, {block_str}>>>{suffix}")
+
+        return "\n".join(lines)
