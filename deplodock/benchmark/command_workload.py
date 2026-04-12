@@ -112,9 +112,11 @@ async def run_command_workload(
     subs = build_substitution_map(task.variant, gpu_device_ids, repo_dir, task_dir)
     rendered = render_command(cmd_cfg.run, subs)
 
-    # Prepend env exports if any.
+    # Prepend env exports if any. Values are template-substituted with the
+    # same map as the run command so $task_dir etc. resolve correctly.
     if cmd_cfg.env:
-        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in cmd_cfg.env.items())
+        resolved_env = {k: Template(v).safe_substitute(subs) for k, v in cmd_cfg.env.items()}
+        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in resolved_env.items())
         rendered_with_env = f"{env_prefix} {rendered}"
     else:
         rendered_with_env = rendered

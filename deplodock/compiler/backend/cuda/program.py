@@ -212,27 +212,15 @@ def _generate_tma_setup(program: Program) -> str:
             lines.append(f"        uint64_t s[1]={{(uint64_t)(({s0})*sizeof(float))}};")
             lines.append(f"        uint32_t b[2]={{{t0},{t1}}};")
             lines.append("        uint32_t e[2]={1,1};")
-            lines.append(
-                f"        cuTensorMapEncodeTiled(&{var},CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,"
-            )
-            lines.append(
-                f"            {buf},d,s,b,e,"
-            )
-            lines.append(
-                "            CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,"
-            )
-            lines.append(
-                "            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,"
-                "CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);"
-            )
+            lines.append(f"        cuTensorMapEncodeTiled(&{var},CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,")
+            lines.append(f"            {buf},d,s,b,e,")
+            lines.append("            CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,")
+            lines.append("            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);")
             lines.append("    }")
 
         # Dynamic shared memory attribute.
         if launch.tma_descriptors and launch.smem_bytes > 0:
-            lines.append(
-                f"    cudaFuncSetAttribute({launch.kernel_name},"
-                f"cudaFuncAttributeMaxDynamicSharedMemorySize,{launch.smem_bytes});"
-            )
+            lines.append(f"    cudaFuncSetAttribute({launch.kernel_name},cudaFuncAttributeMaxDynamicSharedMemorySize,{launch.smem_bytes});")
 
     return "\n".join(lines)
 

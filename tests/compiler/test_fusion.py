@@ -189,7 +189,7 @@ def test_matmul_fuses():
 
 
 def test_matmul_residual_add_fuses():
-    """Matmul + residual add should fuse (add as epilogue)."""
+    """Matmul + residual add should fuse into a single region (add as epilogue)."""
     g = Graph()
     a = g.add_node(InputOp(), [], Tensor("A", (4, 8)), node_id="A")
     b = g.add_node(InputOp(), [], Tensor("B", (8, 6)), node_id="B")
@@ -202,10 +202,41 @@ def test_matmul_residual_add_fuses():
 
     fused = auto_fuse(g)
     regions = _fused_regions(fused)
-    # Matmul (mul+reduce) stays as pure contraction; add is separate.
-    # Fusing epilogue into contraction requires codegen support (future).
-    matmul_regions = [r for r in regions if any("ReduceOp" in t for t in _region_op_types(r))]
-    assert len(matmul_regions) >= 1, f"Expected matmul region, got {len(regions)} regions"
+    # Matmul + epilogue add fuse into a single contraction region.
+    assert len(regions) == 1, f"Expected 1 fused region, got {len(regions)}"
+    ops = _region_op_types(regions[0])
+    assert "ElementwiseOp(mul)" in ops
+    assert "ReduceOp(sum)" in ops
+    assert "ElementwiseOp(add)" in ops
+
+
+# ---------------------------------------------------------------------------
+# Pattern: Matmul + bias add + ReLU — mul → sum → add(bias) → relu
+# All four ops should fuse into a single contraction-with-epilogue region.
+# ---------------------------------------------------------------------------
+
+
+def test_matmul_bias_activation_fuses():
+    """Matmul + bias add + ReLU should fuse into a single region."""
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("A", (4, 8)), node_id="A")
+    b = g.add_node(InputOp(), [], Tensor("B", (8, 6)), node_id="B")
+    bias = g.add_node(InputOp(), [], Tensor("bias", (6,)), node_id="bias")
+    g.inputs = [a, b, bias]
+    ew = g.add_node(ElementwiseOp("mul"), [a, b], Tensor("AB", (4, 8, 6)), node_id="AB")
+    red = g.add_node(ReduceOp("sum", axis=1), [ew], Tensor("mm", (4, 6)), node_id="mm")
+    ba = g.add_node(ElementwiseOp("add"), [red, bias], Tensor("ba", (4, 6)), node_id="ba")
+    out = g.add_node(ElementwiseOp("relu"), [ba], Tensor("out", (4, 6)), node_id="out")
+    g.outputs = [out]
+
+    fused = auto_fuse(g)
+    regions = _fused_regions(fused)
+    assert len(regions) == 1, f"Expected 1 fused region, got {len(regions)}"
+    ops = _region_op_types(regions[0])
+    assert "ElementwiseOp(mul)" in ops
+    assert "ReduceOp(sum)" in ops
+    assert "ElementwiseOp(add)" in ops
+    assert "ElementwiseOp(relu)" in ops
 
 
 # ---------------------------------------------------------------------------

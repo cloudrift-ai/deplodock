@@ -65,6 +65,16 @@ def handle_bench(args):
         root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
 
+    # Inject DEPLODOCK_DUMP_DIR into command tasks when --dump-dir is set.
+    # The env var uses $task_dir which is resolved at runtime by the command
+    # workload runner. Artifacts are pulled back via result_files glob.
+    if args.dump_dir:
+        for task in tasks:
+            if task.recipe.command is not None:
+                task.recipe.command.env["DEPLODOCK_DUMP_DIR"] = "$task_dir/dump"
+                if "dump/*" not in task.recipe.command.result_files:
+                    task.recipe.command.result_files.append("dump/*")
+
     # Create per-recipe run directories
     recipe_run_dirs = {}
     for recipe_dir in args.recipes:
@@ -283,5 +293,11 @@ def register_bench_command(subparsers):
         choices=["gcp", "cloudrift"],
         default=None,
         help="Force cloud provider for all groups (default: first listed for the GPU in the hardware table)",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        action="store_true",
+        default=False,
+        help="Dump compiler artifacts (graphs, kernels, plans) into the results directory",
     )
     parser.set_defaults(func=handle_bench)

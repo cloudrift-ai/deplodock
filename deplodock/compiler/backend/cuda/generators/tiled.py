@@ -56,7 +56,6 @@ def generate_kernel(region: FusedRegionOp, name: str, shapes: dict[str, tuple]) 
     return lower_tiled(region, name, shapes, analysis)
 
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -85,7 +84,74 @@ def _build_expr(fn: str, a: Expr, b: Expr | None = None) -> Expr | None:
         return FuncCall("rsqrtf", [a])
     if fn == "recip":
         return BinOp("/", Literal(1.0), a)
+    if fn == "relu":
+        return FuncCall("fmaxf", [Literal(0.0), a])
     return None
+
+
+def _contraction_epilogue_code(
+    phases,
+    shapes: dict[str, tuple],
+    thread_m: int,
+    thread_n: int,
+) -> str:
+    """Generate epilogue code for contraction kernels.
+
+    After the K-loop, each thread holds c{r}{c} accumulators (the matmul
+    result).  Epilogue ops (bias add, activation, etc.) transform these
+    accumulators in-place before the write macro.
+    """
+    if not phases.epilogue:
+        return ""
+
+    lines: list[str] = []
+    # Track which node_id the accumulators currently represent.
+    prev_id = phases.reduces[0][0]
+
+    for epi_nid, epi_op, epi_inputs in phases.epilogue:
+        fn = epi_op.fn
+        # For binary ops, find the "other" input (not the accumulator chain).
+        other = None
+        if len(epi_inputs) == 2:
+            for inp in epi_inputs:
+                if inp != prev_id:
+                    other = inp
+                    break
+
+        for r in range(thread_m):
+            for c_idx in range(thread_n):
+                acc = f"c{r}{c_idx}"
+                if fn in ("add", "sub", "mul", "div") and other is not None:
+                    safe = _safe(other)
+                    other_shape = shapes.get(other, ())
+                    # Determine indexing for the other operand.
+                    if len(other_shape) <= 1:
+                        # 1D vector (bias) — index by column.
+                        idx = f"bn+tc+{c_idx}"
+                    else:
+                        # 2D — full row*cols indexing.
+                        idx = f"(bm+tr+{r})*N+bn+tc+{c_idx}"
+                    op_str = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[fn]
+                    # Respect operand order: if accumulator is the second input,
+                    # we need to reverse for sub/div.
+                    if epi_inputs[0] == prev_id:
+                        lines.append(f"{acc}{op_str}={safe}[{idx}];")
+                    else:
+                        lines.append(f"{acc}={safe}[{idx}]{op_str}{acc};")
+                elif fn == "relu":
+                    lines.append(f"{acc}=fmaxf(0.0f,{acc});")
+                elif fn == "neg":
+                    lines.append(f"{acc}=-{acc};")
+                elif fn == "exp":
+                    lines.append(f"{acc}=expf({acc});")
+                elif fn == "rsqrt":
+                    lines.append(f"{acc}=rsqrtf({acc});")
+                elif fn == "recip":
+                    lines.append(f"{acc}=1.0f/{acc};")
+
+        prev_id = epi_nid
+
+    return "\n".join(lines)
 
 
 def _reduce_op_expr(fn: str, acc: Expr, val: Expr) -> Expr:
@@ -266,10 +332,7 @@ def _emit_warp_reduce(node_id: str, acc_var: str, fn: str) -> list:
     # The conditional load + fallback init is easier as RawCode
     stmts.pop()  # remove placeholder
     stmts.append(
-        RawCode(
-            f"if (threadIdx.x < blockDim.x / warpSize) {acc_var} = {warp_arr}[threadIdx.x];\n"
-            f"else {acc_var} = {init_val.value:.1f}f;"
-        )
+        RawCode(f"if (threadIdx.x < blockDim.x / warpSize) {acc_var} = {warp_arr}[threadIdx.x];\nelse {acc_var} = {init_val.value:.1f}f;")
     )
 
     # Second shuffle pass (across warps)
@@ -348,19 +411,21 @@ def _lower_naive(
     if is_contraction:
         # CTA-swizzle grid + coarsened 8×4 thread mapping.
         # Shared structure with TMA strategy — only the load phase differs.
-        body.append(RawCode(
-            f"int tr=threadIdx.y*{thread_m},tc=threadIdx.x*{thread_n};\n"
-            f"const int SWIZ=8;\n"
-            f"int ntx=(N+{tile_n - 1})/{tile_n};\n"
-            f"int nty=(M+{tile_m - 1})/{tile_m};\n"
-            f"int pid=blockIdx.x+blockIdx.y*gridDim.x;\n"
-            f"int grp=pid/(ntx*SWIZ);\n"
-            f"int rem=pid%(ntx*SWIZ);\n"
-            f"int by_s=grp*SWIZ+rem%SWIZ;\n"
-            f"int bx_s=rem/SWIZ;\n"
-            f"if(by_s>=nty||bx_s>=ntx)return;\n"
-            f"int bm=by_s*{tile_m},bn=bx_s*{tile_n};"
-        ))
+        body.append(
+            RawCode(
+                f"int tr=threadIdx.y*{thread_m},tc=threadIdx.x*{thread_n};\n"
+                f"const int SWIZ=8;\n"
+                f"int ntx=(N+{tile_n - 1})/{tile_n};\n"
+                f"int nty=(M+{tile_m - 1})/{tile_m};\n"
+                f"int pid=blockIdx.x+blockIdx.y*gridDim.x;\n"
+                f"int grp=pid/(ntx*SWIZ);\n"
+                f"int rem=pid%(ntx*SWIZ);\n"
+                f"int by_s=grp*SWIZ+rem%SWIZ;\n"
+                f"int bx_s=rem/SWIZ;\n"
+                f"if(by_s>=nty||bx_s>=ntx)return;\n"
+                f"int bm=by_s*{tile_m},bn=bx_s*{tile_n};"
+            )
+        )
     elif is_pointwise:
         body.append(VarDecl("int", "i", _thread_idx("blockDim.x", "blockIdx.x", "threadIdx.x")))
         body.append(IfStmt(BinOp(">=", Var("i"), Var("n")), [RawCode("return;")]))
@@ -410,24 +475,16 @@ def _lower_naive(
         stage = a_size + b_size
 
         # --- Shared: accumulator declarations ---
-        acc_decls = ",".join(
-            f"c{r}{c}=0" for r in range(thread_m) for c in range(thread_n)
-        )
+        acc_decls = ",".join(f"c{r}{c}=0" for r in range(thread_m) for c in range(thread_n))
 
         # --- Shared: FMA block (reads from `cas`/`cbs` for TMA, from global for naive) ---
         fma_lines = []
         for r in range(thread_m):
-            fma_lines.append(
-                f"float a{r}=cas[(tr+{r})*{bk}+kk];"
-                + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n))
-            )
+            fma_lines.append(f"float a{r}=cas[(tr+{r})*{bk}+kk];" + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n)))
         fma_block = "\n            ".join(fma_lines)
 
         # --- Shared: W() macro + write calls ---
-        w_calls = "\n    ".join(
-            f"W({r},{','.join(f'c{r}{c}' for c in range(thread_n))})"
-            for r in range(thread_m)
-        )
+        w_calls = "\n    ".join(f"W({r},{','.join(f'c{r}{c}' for c in range(thread_n))})" for r in range(thread_m))
         # W() macro: bounds-checked writes. Uses atomicAdd when k_splits > 1
         # (multiple blocks accumulate partial results into the same output).
         if k_splits > 1:
@@ -438,18 +495,8 @@ def _lower_naive(
                 "if(gc+3<N)atomicAdd(&Cout[gr*N+gc+3],v3);"
             )
         else:
-            w_body = (
-                "if(gc<N)Cout[gr*N+gc]=v0;"
-                "if(gc+1<N)Cout[gr*N+gc+1]=v1;"
-                "if(gc+2<N)Cout[gr*N+gc+2]=v2;"
-                "if(gc+3<N)Cout[gr*N+gc+3]=v3;"
-            )
-        write_macro = (
-            f"#define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);"
-            f"if(gr<M){{int gc=bn+tc;float*Cout={c_name}; "
-            f"{w_body}}}}}\n"
-            f"    {w_calls}"
-        )
+            w_body = "if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;"
+        write_macro = f"#define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);if(gr<M){{int gc=bn+tc;float*Cout={c_name}; {w_body}}}}}\n    {w_calls}"
 
         # --- Strategy-specific: K-loop body ---
         if strategy == "tma_db":
@@ -492,10 +539,10 @@ def _lower_naive(
                 f'asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 '
                 f'_,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");'
                 f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
-                f"::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];\""
+                f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
                 f'::"r"(as0),"l"({tma_a_ref}),"r"({first_k}),"r"(bm),"r"(mb0):"memory");'
                 f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
-                f"::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];\""
+                f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
                 f'::"r"(bs0),"l"({tma_b_ref}),"r"(bn),"r"({first_k}),"r"(mb0):"memory");}}\n'
                 f"for(int t=0;t<nt;t++){{\n"
                 f"    int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;\n"
@@ -508,10 +555,10 @@ def _lower_naive(
                 f'asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 '
                 f'_,[%0],%1;"::"r"(nm),"r"(bytes):"memory");'
                 f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
-                f"::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];\""
+                f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
                 f'::"r"(na),"l"({tma_a_ref}),"r"(nk),"r"(bm),"r"(nm):"memory");'
                 f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
-                f"::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];\""
+                f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
                 f'::"r"(nb),"l"({tma_b_ref}),"r"(bn),"r"(nk),"r"(nm):"memory");}}\n'
                 f"    float*cas=&smem[s*{stage}];float*cbs=&smem[s*{stage}+{a_size}];\n"
                 f"    #pragma unroll\n"
@@ -522,8 +569,11 @@ def _lower_naive(
                 f"    }}\n"
                 f"    __syncthreads();\n"
                 f"}}\n"
-                f"{write_macro}"
             )
+            epi_code = _contraction_epilogue_code(phases, shapes, thread_m, thread_n)
+            if epi_code:
+                tma_code += epi_code + "\n"
+            tma_code += write_macro
             body.append(RawCode(tma_code))
 
             # TMA kernel: only C (output) as regular param.
@@ -534,9 +584,13 @@ def _lower_naive(
                 params.append(KernelParam("int", "k_splits"))
 
             return KernelDef(
-                name=name, params=params, body=body, block_size=block_size,
+                name=name,
+                params=params,
+                body=body,
+                block_size=block_size,
                 includes=["cuda.h"],
-                tile_m=tile_m, tile_n=tile_n,
+                tile_m=tile_m,
+                tile_n=tile_n,
                 tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
             )
         else:
@@ -546,12 +600,11 @@ def _lower_naive(
             naive_a_lines = []
             for r in range(thread_m):
                 naive_a_lines.append(
-                    f"float a{r}=(bm+tr+{r}<M)?{a_name}[(bm+tr+{r})*K+k]:0.0f;"
-                    + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n))
+                    f"float a{r}=(bm+tr+{r}<M)?{a_name}[(bm+tr+{r})*K+k]:0.0f;" + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n))
                 )
             naive_fma_safe = "\n        ".join(naive_a_lines)
 
-            body.append(RawCode(
+            naive_code = (
                 f"float {acc_decls};\n"
                 f"for(int k=0;k<K;k++){{\n"
                 f"    float b0=(bn+tc<N)?{b_name}[k*N+bn+tc]:0.0f,"
@@ -560,11 +613,19 @@ def _lower_naive(
                 f"b3=(bn+tc+3<N)?{b_name}[k*N+bn+tc+3]:0.0f;\n"
                 f"        {naive_fma_safe}\n"
                 f"}}\n"
-                f"{write_macro}"
-            ))
+            )
+            epi_code = _contraction_epilogue_code(phases, shapes, thread_m, thread_n)
+            if epi_code:
+                naive_code += epi_code + "\n"
+            naive_code += write_macro
+            body.append(RawCode(naive_code))
             return KernelDef(
-                name=name, params=params, body=body, block_size=block_size,
-                tile_m=tile_m, tile_n=tile_n,
+                name=name,
+                params=params,
+                body=body,
+                block_size=block_size,
+                tile_m=tile_m,
+                tile_n=tile_n,
             )
 
     # --- Row reduction / reduce+broadcast ---
@@ -581,9 +642,7 @@ def _lower_naive(
         else:
             # max/min: acc = fmaxf(acc, val) — no AugAssign for this
             val_str = _expr_to_str(val)
-            loop_body.append(RawCode(
-                f"{acc_name} = fmaxf({acc_name}, {val_str});"
-            ))
+            loop_body.append(RawCode(f"{acc_name} = fmaxf({acc_name}, {val_str});"))
 
     body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), loop_body, step=CudaBuiltin("blockDim.x")))
 
@@ -680,5 +739,3 @@ def _expr_to_str(expr: Expr) -> str:
     from deplodock.compiler.backend.cuda.codegen import _emit_expr
 
     return _emit_expr(expr)
-
-
