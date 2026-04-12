@@ -54,7 +54,7 @@ class CompilerDump:
         """Create from DEPLODOCK_DUMP_DIR env var, or return None."""
         dump_dir = os.environ.get(ENV_VAR)
         if dump_dir:
-            return cls(dir=Path(dump_dir))
+            return cls(dir=Path(dump_dir).expanduser())
         return None
 
     @classmethod
