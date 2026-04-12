@@ -128,10 +128,14 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
         red_id = region_ops_list[1][0]
         shapes[ew_id] = bp + (m, k, n)
         shapes[red_id] = bp + (m, n)
-        # Epilogue ops preserve matmul output shape.
+        # Epilogue ops: most preserve matmul output shape, but ReduceOps
+        # produce (m, 1) (reduced last dim).
         input_shapes = op.params.get("_input_shapes", {})
-        for rid, _, _ in region_ops_list[2:]:
-            shapes[rid] = bp + (m, n)
+        for rid, rop, _ in region_ops_list[2:]:
+            if isinstance(rop, ReduceOp):
+                shapes[rid] = bp + (m, 1)
+            else:
+                shapes[rid] = bp + (m, n)
         for inp in extra_inputs:
             shapes[inp] = input_shapes.get(inp, (n,))
         shapes[c_buf] = bp + (m, n)

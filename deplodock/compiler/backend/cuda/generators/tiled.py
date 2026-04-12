@@ -154,6 +154,96 @@ def _contraction_epilogue_code(
     return "\n".join(lines)
 
 
+def _contraction_softmax_epilogue_code(
+    phases,
+    shapes: dict[str, tuple],
+    thread_m: int,
+    thread_n: int,
+    n_dim: int,
+) -> str:
+    """Generate fused softmax epilogue after contraction K-loop.
+
+    After the K-loop, accumulators c{r}{c} hold matmul scores. This emits:
+    1. Apply inter_reduce[0] ops (scale) on accumulators
+    2. Row max via warp shuffle across threadIdx.x
+    3. Apply inter_reduce[1] ops (sub, exp) on accumulators
+    4. Row sum via warp shuffle
+    5. Apply epilogue ops (div) on accumulators
+
+    Only valid when N ≤ tile_n (all columns in one CTA).
+    """
+    lines: list[str] = []
+
+    # Phase 0: apply ops between contraction reduce and softmax max (e.g. scale).
+    if phases.inter_reduce:
+        prev_id = phases.reduces[0][0]  # contraction reduce output
+        for nid, op, inputs in phases.inter_reduce[0]:
+            fn = op.fn
+            other = None
+            if len(inputs) == 2:
+                for inp in inputs:
+                    if inp != prev_id:
+                        other = inp
+                        break
+            for r in range(thread_m):
+                for c in range(thread_n):
+                    acc = f"c{r}{c}"
+                    if fn in ("mul", "add", "sub", "div") and other is not None:
+                        safe = _safe(other)
+                        other_shape = shapes.get(other, ())
+                        other_size = 1
+                        for d in other_shape:
+                            if isinstance(d, int):
+                                other_size *= d
+                        if other_size <= 1:
+                            idx = "0"
+                        elif len(other_shape) <= 1:
+                            idx = f"bn+tc+{c}"
+                        else:
+                            idx = f"(bm+tr+{r})*N+bn+tc+{c}"
+                        op_str = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[fn]
+                        if inputs[0] == prev_id:
+                            lines.append(f"{acc}{op_str}={safe}[{idx}];")
+                        else:
+                            lines.append(f"{acc}={safe}[{idx}]{op_str}{acc};")
+                    elif fn == "exp":
+                        lines.append(f"{acc}=expf({acc});")
+            prev_id = nid
+
+    # Phase 1: row max via warp shuffle.
+    for r in range(thread_m):
+        lines.append(f"float rmax{r}=-1e30f;")
+        for c in range(thread_n):
+            lines.append(f"if(bn+tc+{c}<N)rmax{r}=fmaxf(rmax{r},c{r}{c});")
+        lines.append(f"for(int o=16;o>0;o>>=1)rmax{r}=fmaxf(rmax{r},__shfl_xor_sync(0xffffffff,rmax{r},o));")
+
+    # Phase 2: apply inter_reduce[1] ops (sub, exp) + accumulate sum.
+    if len(phases.inter_reduce) > 1:
+        for r in range(thread_m):
+            lines.append(f"float rsum{r}=0.0f;")
+            for c in range(thread_n):
+                acc = f"c{r}{c}"
+                lines.append(f"if(bn+tc+{c}<N){{")
+                # Apply sub and exp from inter_reduce[1]
+                for _nid, op, _inputs in phases.inter_reduce[1]:
+                    if op.fn == "sub":
+                        lines.append(f"  {acc}-=rmax{r};")
+                    elif op.fn == "exp":
+                        lines.append(f"  {acc}=expf({acc});")
+                lines.append(f"  rsum{r}+={acc};")
+                lines.append("}")
+            lines.append(f"for(int o=16;o>0;o>>=1)rsum{r}+=__shfl_xor_sync(0xffffffff,rsum{r},o);")
+
+    # Phase 3: apply epilogue (div).
+    for _epi_nid, epi_op, _inputs in phases.epilogue:
+        if epi_op.fn == "div":
+            for r in range(thread_m):
+                for c in range(thread_n):
+                    lines.append(f"if(bn+tc+{c}<N)c{r}{c}/=rsum{r};")
+
+    return "\n".join(lines)
+
+
 def _reduce_op_expr(fn: str, acc: Expr, val: Expr) -> Expr:
     """Build the accumulation expression for a ReduceOp."""
     if fn == "max":
@@ -724,7 +814,10 @@ def _lower_naive(
                 f"    __syncthreads();\n"
                 f"}}\n"
             )
-            epi_code = _contraction_epilogue_code(phases, shapes, thread_m, thread_n)
+            if len(phases.reduces) > 1 and analysis.cols <= tile_n:
+                epi_code = _contraction_softmax_epilogue_code(phases, shapes, thread_m, thread_n, analysis.cols)
+            else:
+                epi_code = _contraction_epilogue_code(phases, shapes, thread_m, thread_n)
             if epi_code:
                 tma_code += epi_code + "\n"
             tma_code += write_macro
@@ -779,7 +872,11 @@ def _lower_naive(
                 f"        {naive_fma_safe}\n"
                 f"}}\n"
             )
-            epi_code = _contraction_epilogue_code(phases, shapes, thread_m, thread_n)
+            if len(phases.reduces) > 1 and analysis.cols <= tile_n:
+                # Fused contraction + softmax: in-register softmax after K-loop.
+                epi_code = _contraction_softmax_epilogue_code(phases, shapes, thread_m, thread_n, analysis.cols)
+            else:
+                epi_code = _contraction_epilogue_code(phases, shapes, thread_m, thread_n)
             if epi_code:
                 naive_code += epi_code + "\n"
             naive_code += write_macro
