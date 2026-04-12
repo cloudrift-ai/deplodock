@@ -127,9 +127,10 @@ def _compile_matmul(op: OpKernel) -> Launch:
     tile_n = kernel_def.tile_n or 128
 
     # CTA-swizzle grid (shared between naive and TMA).
+    k_splits = int(matmul_hints.get("k_splits", 1))
     ntx = _cd(n, tile_n)
     nty = _cd(m, tile_m)
-    grid = (ntx * _cd(nty, 8) * 8, 1, 1)
+    grid = (ntx * _cd(nty, 8) * 8, 1, k_splits)
 
     # Build TMA metadata if the kernel uses TMA descriptors.
     tma_descs: list[TmaDescriptorSpec] = []
@@ -163,6 +164,8 @@ def _compile_matmul(op: OpKernel) -> Launch:
 
         # TMA: only C is a regular param. A/B come via descriptors.
         args = [*op.outputs]
+        if k_splits > 1:
+            args.append(str(k_splits))
     else:
         # Naive: A, B, C, M, N, K as regular params.
         args = [*op.inputs, *op.outputs, str(m), str(n), str(k)]
@@ -175,6 +178,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
         args=args,
         smem_bytes=smem_bytes,
         tma_descriptors=tma_descs,
+        zero_outputs=list(op.outputs) if k_splits > 1 else [],
     )
 
 

@@ -54,6 +54,7 @@ class Launch:
     args: list[str]  # buffer names and scalar literals in param order
     smem_bytes: int = 0
     tma_descriptors: list[TmaDescriptorSpec] = field(default_factory=list)
+    zero_outputs: list[str] = field(default_factory=list)  # buffers to cudaMemset(0) before launch
 
 
 @dataclass
@@ -239,7 +240,13 @@ def _generate_tma_setup(program: Program) -> str:
 def _generate_launches(program: Program) -> str:
     """Generate the kernel launch statements."""
     lines: list[str] = []
+    buf_sizes = {b.name: b.size for b in program.buffers}
     for launch in program.launches:
+        # Zero output buffers if needed (k_splits atomicAdd).
+        for buf_name in launch.zero_outputs:
+            size = buf_sizes.get(buf_name, 0)
+            lines.append(f"        cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
+
         # TMA descriptors are prepended to the regular args.
         tma_args = [_tma_var(launch, d) for d in launch.tma_descriptors]
         regular_args = [_format_arg(a, program) for a in launch.args]
