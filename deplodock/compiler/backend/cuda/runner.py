@@ -85,12 +85,16 @@ def generate_host_program(
 
     # Compute grid dimensions.
     bx, by, _bz = kernel.block_size
-    if kernel.tile_m and kernel.tile_n:
+    if kernel.tile_m and kernel.tile_n and not kernel.grid_2d:
         # CTA-swizzle linearized grid (same as tiled.py and program.py).
         ntx = f"(({dim_args.get('N', 1)} + {kernel.tile_n - 1}) / {kernel.tile_n})"
         nty = f"(({dim_args.get('M', 1)} + {kernel.tile_m - 1}) / {kernel.tile_m})"
         grid_x = f"({ntx} * (({nty} + 7) / 8) * 8)"
         grid_y = "1"
+    elif kernel.tile_m and kernel.tile_n and kernel.grid_2d:
+        # Standard 2D grid for smem strategy (uses blockIdx.y for rows).
+        grid_x = f"(({dim_args.get('N', 1)} + {kernel.tile_n - 1}) / {kernel.tile_n})"
+        grid_y = f"(({dim_args.get('M', 1)} + {kernel.tile_m - 1}) / {kernel.tile_m})"
     else:
         # Simple 2D grid: grid.x covers N (cols), grid.y covers M (rows).
         grid_x = f"({dim_args.get('N', 1)} + {bx - 1}) / {bx}"
@@ -294,6 +298,13 @@ def _detect_arch() -> str | None:
         return None
 
 
+def _dim_decls(m: int, n: int, k: int, *, use_define: bool) -> str:
+    """Generate M/N/K declarations: #define for TMA, const int for others."""
+    if use_define:
+        return f"#define M {m}\n#define N {n}\n#define K {k}"
+    return f"const int M = {m};\nconst int N = {n};\nconst int K = {k};"
+
+
 def generate_benchmark_program(
     kernel_source: str,
     kernel: KernelDef,
@@ -315,13 +326,16 @@ def generate_benchmark_program(
     k = dim_args.get("K", 1)
 
     bx, by, _bz = kernel.block_size
-    if kernel.tile_m and kernel.tile_n:
+    if kernel.tile_m and kernel.tile_n and not kernel.grid_2d:
         # Linearized grid for CTA swizzle: pad nty to multiple of SWIZ=8
         # Total blocks = ntx * ceil(nty/8)*8, launched as (total, 1)
         ntx = f"(({n} + {kernel.tile_n - 1}) / {kernel.tile_n})"
         nty = f"(({m} + {kernel.tile_m - 1}) / {kernel.tile_m})"
         grid_x = f"({ntx} * (({nty} + 7) / 8) * 8)"
         grid_y = "1"
+    elif kernel.tile_m and kernel.tile_n and kernel.grid_2d:
+        grid_x = f"(({n} + {kernel.tile_n - 1}) / {kernel.tile_n})"
+        grid_y = f"(({m} + {kernel.tile_m - 1}) / {kernel.tile_m})"
     else:
         effective_n = f"(({n} + {coarsen_cols - 1}) / {coarsen_cols})"
         effective_m = f"(({m} + {coarsen_rows - 1}) / {coarsen_rows})"
@@ -435,10 +449,8 @@ def generate_benchmark_program(
 #include <cuda_runtime.h>
 #include <curand.h>
 {tma_includes}{cublas_includes}
-// Compile-time matrix dimensions for kernel optimization
-#define M {m}
-#define N {n}
-#define K {k}
+// Matrix dimensions
+{_dim_decls(m, n, k, use_define=bool(kernel.tma_params))}
 
 {kernel_source}
 

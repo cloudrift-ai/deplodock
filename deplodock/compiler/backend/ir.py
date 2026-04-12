@@ -208,6 +208,7 @@ class KernelDef:
     includes: list[str] | None = None  # Extra #include headers
     tile_m: int | None = None  # Output tile rows per block (overrides grid computation)
     tile_n: int | None = None  # Output tile cols per block
+    grid_2d: bool = False  # Use standard 2D grid (blockIdx.x=cols, blockIdx.y=rows) instead of CTA swizzle
     tma_params: list[str] | None = None  # TMA descriptor param names (e.g. ["A_tma", "B_tma"])
     batched: bool = False  # Batched GEMM: TMA descriptors are per-batch arrays
     extra_smem_bytes: int = 0  # Extra dynamic smem beyond standard double-buffer (e.g. for hybrid TF32 split scratch)

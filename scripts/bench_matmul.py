@@ -283,7 +283,20 @@ def run_adaptive_benchmark_suite(
                     selected.get("k_splits", 1),
                 )
 
-            kernel, source, hints = kernels[id(selected)]
+            # M-aware thread_m: clamp so tile_m (= 8 * thread_m) ≤ M.
+            ty = 8
+            profile_tm = int(selected.get("thread_m", 8))
+            max_tm = max(1, m // ty) if m > 0 else profile_tm
+            if profile_tm > max_tm:
+                # Need a different kernel for this M — generate on the fly.
+                adjusted = {**selected, "thread_m": max_tm}
+                g = _make_matmul_graph()
+                _set_matmul_hints(g, adjusted)
+                kernel = _lower_matmul(g)
+                source = emit_kernel(kernel)
+                hints = adjusted
+            else:
+                kernel, source, hints = kernels[id(selected)]
             suite.generated_code = source
 
             run_dim_args = dim_args
@@ -436,9 +449,18 @@ def main():
 
     batch = args.batch
 
-    if args.strategy == "adaptive":
+    # "adaptive" uses the GPU tuning profile. Any other value (tma_db, smem,
+    # naive) forces that strategy for all sizes while keeping the profile's
+    # thread_m/k_splits tuning — this makes the strategy appear in result
+    # tables for A/B comparisons.
+    use_adaptive = args.strategy == "adaptive" or args.strategy in ("tma_db", "smem", "naive")
+    if use_adaptive:
         strategy_map, profile_name = default_matmul_strategy_map()
         logger.info("Using matmul tuning profile: %s", profile_name)
+        if args.strategy != "adaptive":
+            strategy_map = [(t, {**h, "strategy": args.strategy}) for t, h in strategy_map]
+            profile_name = f"{profile_name} ({args.strategy})"
+            logger.info("Strategy override: %s", args.strategy)
         if batch > 1:
             strategy_map = [(t, {**h, "batch_count": batch, "k_splits": 1}) for t, h in strategy_map]
         suite = run_adaptive_benchmark_suite(

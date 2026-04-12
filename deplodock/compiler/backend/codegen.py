@@ -117,7 +117,7 @@ def _emit_expr(expr: Expr, parent_prec: int = 0) -> str:
         return f"(({cond}) ? ({t}) : ({f}))"
     if isinstance(expr, VectorLoad):
         idx = _emit_expr(expr.index)
-        return f"*reinterpret_cast<float{expr.width}*>(&{expr.array}[{idx}])"
+        return f"*reinterpret_cast<const float{expr.width}*>(&{expr.array}[{idx}])"
     raise TypeError(f"Unknown expression type: {type(expr)}")
 
 

@@ -167,6 +167,19 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
 
     strategy = matmul_hints.get("strategy", "tma_db")
 
+    # M-aware thread_m: clamp so tile_m does not exceed M.
+    if strategy == "smem":
+        ty = 4  # smem uses (32, 4) block
+    else:
+        ty = 8  # TMA/naive use (32, 8) block
+    profile_tm = int(matmul_hints.get("thread_m", 8))
+    max_tm = max(1, m // ty)
+    if profile_tm > max_tm:
+        matmul_hints["thread_m"] = max_tm
+
+    tile_m_val = ty * int(matmul_hints.get("thread_m", 8))
+    tile_n_val = 128  # fixed in tiled.py
+
     # Epilogue ops are incompatible with k_splits > 1 (partial sums
     # from each split cannot have epilogue applied before reduction).
     if has_epilogue:
@@ -176,9 +189,7 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     # has too few blocks to fill the GPU. Increase k_splits to add blocks
     # along the K dimension.
     if not has_epilogue:
-        tile_m_val = 64  # must match tiled.py
-        tile_n_val = 128  # must match tiled.py
-        if m < tile_m_val:
+        if m <= tile_m_val:
             grid_m = _cd(m, tile_m_val)
             grid_n = _cd(n, tile_n_val)
             grid_blocks = grid_m * grid_n
@@ -215,11 +226,16 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     tile_m = kernel_def.tile_m or 64
     tile_n = kernel_def.tile_n or 128
 
-    # CTA-swizzle grid (shared between naive and TMA).
+    # Grid layout depends on strategy.
     k_splits = int(matmul_hints.get("k_splits", 1))
     ntx = _cd(n, tile_n)
     nty = _cd(m, tile_m)
-    grid = (ntx * _cd(nty, 8) * 8, 1, k_splits)
+    if strategy == "smem":
+        # Standard 2D grid (no CTA swizzle).
+        grid = (ntx, nty, k_splits)
+    else:
+        # CTA-swizzle grid (shared between naive and TMA).
+        grid = (ntx * _cd(nty, 8) * 8, 1, k_splits)
 
     # Build TMA metadata if the kernel uses TMA descriptors.
     tma_descs: list[TmaDescriptorSpec] = []
@@ -257,8 +273,10 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
         if k_splits > 1:
             args.append(str(k_splits))
     else:
-        # Naive: A, B, C, M, N, K as regular params.
+        # Naive/smem: A, B, C, M, N, K as regular params.
         args = [*op.inputs, *op.outputs, str(m), str(n), str(k)]
+        if k_splits > 1:
+            args.append(str(k_splits))
 
     return CudaLaunch(
         kernel_source=source,
