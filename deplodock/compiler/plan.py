@@ -91,14 +91,32 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             buf_names.add(out_name)
             continue
 
-        # Output buffer for this node.
-        role = "output" if nid in graph.outputs else "scratch"
-        buffers.append(BufferSpec(out_name, shape, dtype, role=role))
-        buf_names.add(out_name)
+        # Output buffer(s) for this node.
+        # FusedRegionOp may have multiple external outputs — allocate a buffer for each.
+        if isinstance(op, ops_module.FusedRegionOp) and len(op.output_names) > 1:
+            outputs = []
+            for out_id in op.output_names:
+                # Each external output needs its own buffer.
+                # Look up shape from the region's shapes dict.
+                out_shape = op.shapes.get(out_id, shape)
+                out_role = "output" if out_id in graph.outputs else "scratch"
+                if out_id not in buf_names:
+                    buffers.append(BufferSpec(out_id, out_shape, dtype, role=out_role))
+                    buf_names.add(out_id)
+                outputs.append(out_id)
+            # Also allocate the primary node buffer (the fused node itself).
+            role = "output" if nid in graph.outputs else "scratch"
+            if out_name not in buf_names:
+                buffers.append(BufferSpec(out_name, shape, dtype, role=role))
+                buf_names.add(out_name)
+        else:
+            role = "output" if nid in graph.outputs else "scratch"
+            buffers.append(BufferSpec(out_name, shape, dtype, role=role))
+            buf_names.add(out_name)
+            outputs = [out_name]
 
         # Map op type to OpKernel tag + params.
         inputs = list(node.inputs)
-        outputs = [out_name]
         params: dict[str, int | float | str] = {}
 
         if isinstance(op, ops_module.ElementwiseOp):
