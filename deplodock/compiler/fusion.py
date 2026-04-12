@@ -77,18 +77,41 @@ def _is_fusible_op(op, node=None) -> bool:
 
 
 def _is_contraction_op(nid: str, graph) -> bool:
-    """Is this node part of a contraction pattern (matmul mul or reduce)?"""
+    """Is this node part of a contraction pattern (matmul mul or reduce)?
+
+    Detects both symbolic-dim (traced from PyTorch) and concrete-dim patterns.
+    A contraction mul has MORE output dims than any single input (broadcasting).
+    """
     from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 
     node = graph.nodes[nid]
     op = node.op
-    # Contraction mul: ElementwiseOp(mul) with symbolic dims in output.
+
     if isinstance(op, ElementwiseOp) and op.fn == "mul":
+        # Symbolic contraction: output has symbolic dims.
         if any(isinstance(d, str) for d in node.output.shape):
             return True
-    # Contraction reduce: ReduceOp with symbolic axis.
-    if isinstance(op, ReduceOp) and isinstance(op.axis, str):
-        return True
+        # Concrete contraction: output has more dims than ALL inputs
+        # (broadcast mul: A(M,K) × B(K,N) → AB(M,K,N)).
+        # Regular broadcast mul (norm * weight) only exceeds one input's ndim.
+        out_ndim = len(node.output.shape)
+        inp_ndims = [
+            len(graph.nodes[inp_id].output.shape)
+            for inp_id in node.inputs
+            if inp_id in graph.nodes
+        ]
+        if inp_ndims and all(out_ndim > nd for nd in inp_ndims):
+            return True
+
+    if isinstance(op, ReduceOp):
+        # Symbolic axis.
+        if isinstance(op.axis, str):
+            return True
+        # Concrete axis: check if input is a contraction mul.
+        for inp_id in node.inputs:
+            if inp_id in graph.nodes and _is_contraction_op(inp_id, graph):
+                return True
+
     return False
 
 
@@ -176,15 +199,15 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
     if between_fusible:
         return False  # Non-convex — would create a cycle.
 
-    # 2. Contraction isolation: contraction ops (matmul mul + reduce) must only
-    #    merge with each other, not with non-contraction ops.
+    # 2. Contraction isolation: a contraction region (matmul mul + reduce) can
+    #    include elementwise epilogue ops but NOT row reductions or other contractions.
+    from deplodock.compiler.ops import ReduceOp as _ReduceOp
     has_contraction = any(_is_contraction_op(nid, graph) for nid in merged)
-    has_non_contraction = any(
-        not _is_contraction_op(nid, graph) and _is_fusible_op(graph.nodes[nid].op)
-        for nid in merged
-    )
-    if has_contraction and has_non_contraction:
-        return False
+    if has_contraction:
+        for nid in merged:
+            node = graph.nodes[nid]
+            if isinstance(node.op, _ReduceOp) and not _is_contraction_op(nid, graph):
+                return False  # Non-contraction reduce in a contraction region.
 
     # 3. Reduce compatibility: all reduces in the merged region must be compatible.
     reduce_ids = [nid for nid in merged if isinstance(graph.nodes[nid].op, ReduceOp)]
@@ -193,7 +216,29 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
             if not _reduces_compatible(ri, rj, graph):
                 return False
 
-    # 3. Single-output: the merged region must have at most one external output.
+    # 4. Shape compatibility (non-contraction only): all 2D+ external inputs
+    #    must have the same total size (the reduction kernel uses a single
+    #    row*cols+j index for all). Contraction regions use separate A/B
+    #    indexing and are exempt.
+    if not has_contraction:
+        sizes_2d: set[int] = set()
+        for nid in merged:
+            node = graph.nodes[nid]
+            for inp_id in node.inputs:
+                if inp_id not in merged and inp_id in graph.nodes:
+                    inp_shape = graph.nodes[inp_id].output.shape
+                    inp_size = _tensor_size(inp_shape)
+                    if inp_size <= 1:
+                        continue
+                    if len(inp_shape) >= 2 and all((isinstance(d, int) and d == 1) for d in inp_shape[1:]):
+                        continue  # per-row scalar like (N, 1)
+                    if len(inp_shape) == 1:
+                        continue  # 1D vector — uses [j] indexing
+                    sizes_2d.add(inp_size)
+        if len(sizes_2d) > 1:
+            return False
+
+    # 5. Single-output: the merged region must have at most one external output.
     # Multi-output fused regions require infrastructure changes in plan.py/backend.py.
     external_outputs = []
     for nid in merged:
