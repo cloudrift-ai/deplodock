@@ -9,7 +9,8 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, ProgramResult
-from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program, benchmark_program, run_program
+from deplodock.compiler.backend.cuda.program import CudaLaunch, benchmark_program, run_program
+from deplodock.compiler.backend.program import Buffer, Program
 from deplodock.compiler.plan import ExecutionPlan, OpKernel
 
 # Instance counter for unique kernel names when the same op appears multiple times.
@@ -78,7 +79,7 @@ class CudaBackend(Backend):
 # --- Per-op handlers ---
 
 
-def _compile_matmul(op: OpKernel) -> Launch:
+def _compile_matmul(op: OpKernel) -> CudaLaunch:
     """Compile a matmul op through the unified tiled generator.
 
     Defaults to tma_db strategy (TMA double-buffer with mbarrier pipelining).
@@ -259,7 +260,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
         # Naive: A, B, C, M, N, K as regular params.
         args = [*op.inputs, *op.outputs, str(m), str(n), str(k)]
 
-    return Launch(
+    return CudaLaunch(
         kernel_source=source,
         kernel_name=name,
         grid=grid,
@@ -375,7 +376,7 @@ def _build_region_and_shapes(op: OpKernel):
     return region, shapes
 
 
-def _compile_fused_region(op: OpKernel) -> Launch:
+def _compile_fused_region(op: OpKernel) -> CudaLaunch:
     """Compile a FusedRegionOp via the unified analysis → tiled generator path.
 
     For contractions with non-naive hints (TMA strategies), falls back to
@@ -390,7 +391,7 @@ def _compile_fused_region(op: OpKernel) -> Launch:
     if not region_ops:
         name = _unique_name("fused_region")
         src = f"__global__ void {name}() {{}}"
-        return Launch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])
+        return CudaLaunch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])
 
     # 2-op matmul pattern (mul + sum) goes through the dedicated SGEMM path,
     # which handles batched/transposed shapes and TMA strategies.
@@ -461,10 +462,10 @@ def _compile_fused_region(op: OpKernel) -> Launch:
         scalar_args = [str(rows), str(cols)]
 
     args = buffer_args + scalar_args
-    return Launch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args)
+    return CudaLaunch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args)
 
 
-def _compile_fused_region_from_source(op: OpKernel, source: str) -> Launch:
+def _compile_fused_region_from_source(op: OpKernel, source: str) -> CudaLaunch:
     """Compile a fused region from pre-generated kernel source (regex-based path).
 
     Used when kernel_source is already set (e.g., from _compile_singleton).
@@ -531,10 +532,10 @@ def _compile_fused_region_from_source(op: OpKernel, source: str) -> Launch:
         scalar_args = []
 
     args = buffer_args + scalar_args
-    return Launch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args)
+    return CudaLaunch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args)
 
 
-def _compile_singleton(op: OpKernel) -> Launch:
+def _compile_singleton(op: OpKernel) -> CudaLaunch:
     """Compile an unfused elementwise/reduce op by wrapping it as a FusedRegionOp.
 
     Sets up _region_ops, _input_names, _output_names, and _shapes so
@@ -580,7 +581,7 @@ _OP_HANDLERS: dict[str, callable] = {
 }
 
 
-def _compile_op(op: OpKernel) -> Launch:
+def _compile_op(op: OpKernel) -> CudaLaunch:
     """Compile a single OpKernel to a CUDA Launch."""
     handler = _OP_HANDLERS.get(op.op)
     if handler is not None:
