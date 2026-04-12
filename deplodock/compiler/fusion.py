@@ -73,14 +73,23 @@ def _is_fusible_op(op, node=None) -> bool:
 
     if not isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp)):
         return False
-    # The contraction mul (A×B→AB) broadcasts to a higher-dim output
-    # (e.g., A(M,K) × B(K,N) → AB(M,K,N)). Its output has symbolic dims
-    # and is consumed by a reduce. Exclude it from independent fusion —
-    # it must stay with its reduce to form a contraction region.
-    if node and isinstance(op, ElementwiseOp) and op.fn == "mul":
-        if any(isinstance(d, str) for d in node.output.shape):
-            return False
     return True
+
+
+def _is_contraction_op(nid: str, graph) -> bool:
+    """Is this node part of a contraction pattern (matmul mul or reduce)?"""
+    from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+
+    node = graph.nodes[nid]
+    op = node.op
+    # Contraction mul: ElementwiseOp(mul) with symbolic dims in output.
+    if isinstance(op, ElementwiseOp) and op.fn == "mul":
+        if any(isinstance(d, str) for d in node.output.shape):
+            return True
+    # Contraction reduce: ReduceOp with symbolic axis.
+    if isinstance(op, ReduceOp) and isinstance(op.axis, str):
+        return True
+    return False
 
 
 def _reduces_compatible(r1_id: str, r2_id: str, graph) -> bool:
@@ -167,7 +176,17 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
     if between_fusible:
         return False  # Non-convex — would create a cycle.
 
-    # 2. Reduce compatibility: all reduces in the merged region must be compatible.
+    # 2. Contraction isolation: contraction ops (matmul mul + reduce) must only
+    #    merge with each other, not with non-contraction ops.
+    has_contraction = any(_is_contraction_op(nid, graph) for nid in merged)
+    has_non_contraction = any(
+        not _is_contraction_op(nid, graph) and _is_fusible_op(graph.nodes[nid].op)
+        for nid in merged
+    )
+    if has_contraction and has_non_contraction:
+        return False
+
+    # 3. Reduce compatibility: all reduces in the merged region must be compatible.
     reduce_ids = [nid for nid in merged if isinstance(graph.nodes[nid].op, ReduceOp)]
     for i, ri in enumerate(reduce_ids):
         for rj in reduce_ids[i + 1:]:
