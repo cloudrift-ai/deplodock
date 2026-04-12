@@ -71,15 +71,7 @@ def _tensor_size(shape: tuple) -> int:
 def _is_fusible_op(op, node=None) -> bool:
     from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 
-    if not isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp)):
-        return False
-    # Contraction broadcast mul (output has symbolic dims like 'K') must
-    # stay with its reduce — exclude from general fusion. The _is_contraction_op
-    # check and contraction isolation in _can_merge handle pairing.
-    if node and isinstance(op, ElementwiseOp) and op.fn == "mul":
-        if any(isinstance(d, str) for d in node.output.shape):
-            return False
-    return True
+    return isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp))
 
 
 def _is_contraction_op(nid: str, graph) -> bool:
@@ -205,15 +197,14 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
     if between_fusible:
         return False  # Non-convex — would create a cycle.
 
-    # 2. Contraction isolation: a contraction region (matmul mul + reduce) can
-    #    include elementwise epilogue ops but NOT row reductions or other contractions.
-    from deplodock.compiler.ops import ReduceOp as _ReduceOp
+    # 2. Contraction isolation: a contraction region must contain ONLY the
+    #    contraction mul + reduce pair. No other ops allowed — they'd break
+    #    the _is_matmul_region detection which requires exactly 2 ops.
     has_contraction = any(_is_contraction_op(nid, graph) for nid in merged)
     if has_contraction:
-        for nid in merged:
-            node = graph.nodes[nid]
-            if isinstance(node.op, _ReduceOp) and not _is_contraction_op(nid, graph):
-                return False  # Non-contraction reduce in a contraction region.
+        non_contraction = [nid for nid in merged if not _is_contraction_op(nid, graph)]
+        if non_contraction:
+            return False  # Only contraction ops allowed in contraction regions.
 
     # 3. Reduce compatibility: all reduces in the merged region must be compatible.
     reduce_ids = [nid for nid in merged if isinstance(graph.nodes[nid].op, ReduceOp)]
