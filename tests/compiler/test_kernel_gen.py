@@ -871,3 +871,67 @@ def test_correctness_attention_stage1(dump_dir):
     expected = _python_sdpa(q_data, k_data, v_data, scale, batch_heads, seq_len, head_dim)
 
     _assert_close(actual, expected, tol=0.1, label="attention_stage1")
+
+
+# ===========================================================================
+# Stage 2: Multi-reduce (fused softmax) tests
+# ===========================================================================
+
+
+def test_softmax_single_kernel():
+    """Softmax (max→sub→exp→sum→div) fuses into exactly one region."""
+    from deplodock.compiler.backend.codegen import emit_kernel
+    from deplodock.compiler.backend.cuda.generators import generate_kernel
+
+    rows, cols = 4, 8
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("x", (rows, cols)), node_id="x")
+    g.inputs = [x]
+    mx = g.add_node(ReduceOp("max", axis=-1), [x], Tensor("mx", (rows, 1)), node_id="mx")
+    sub = g.add_node(ElementwiseOp("sub"), [x, mx], Tensor("sub", (rows, cols)), node_id="sub")
+    exp = g.add_node(ElementwiseOp("exp"), [sub], Tensor("exp", (rows, cols)), node_id="exp")
+    sm = g.add_node(ReduceOp("sum", axis=-1), [exp], Tensor("sm", (rows, 1)), node_id="sm")
+    div = g.add_node(ElementwiseOp("div"), [exp, sm], Tensor("out", (rows, cols)), node_id="out")
+    g.outputs = [div]
+
+    fused = auto_fuse(g)
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, FusedRegionOp)]
+    assert len(fused_nodes) == 1, f"Expected 1 fused region, got {len(fused_nodes)}"
+    assert len(fused_nodes[0].op.region_ops) == 5  # max, sub, exp, sum, div
+
+    # Verify generated kernel has both fmaxf (max) and expf (exp).
+    shapes = {nid: fused.nodes[nid].output.shape for nid in fused.nodes}
+    source = emit_kernel(generate_kernel(fused_nodes[0].op, "test_softmax", shapes))
+    assert "fmaxf" in source, "Kernel should contain fmaxf for max reduce"
+    assert "expf" in source, "Kernel should contain expf for exp op"
+
+
+@requires_cuda
+def test_correctness_softmax_fused(dump_dir):
+    """Fused softmax produces correct output with multiple shapes."""
+    for rows, cols in [(4, 8), (16, 32), (56, 128)]:
+        g = Graph()
+        x = g.add_node(InputOp(), [], Tensor("x", (rows, cols)), node_id="x")
+        g.inputs = [x]
+        mx = g.add_node(ReduceOp("max", axis=-1), [x], Tensor("mx", (rows, 1)), node_id="mx")
+        sub = g.add_node(ElementwiseOp("sub"), [x, mx], Tensor("sub", (rows, cols)), node_id="sub")
+        exp = g.add_node(ElementwiseOp("exp"), [sub], Tensor("exp", (rows, cols)), node_id="exp")
+        sm = g.add_node(ReduceOp("sum", axis=-1), [exp], Tensor("sm", (rows, 1)), node_id="sm")
+        div = g.add_node(ElementwiseOp("div"), [exp, sm], Tensor("out", (rows, cols)), node_id="out")
+        g.outputs = [div]
+
+        outputs = _compile_and_run(g, dump=dump_dir)
+        actual = list(outputs.values())[0]
+
+        x_data = _pseudo_random(rows * cols)
+        expected = _python_softmax(x_data, rows, cols)
+
+        _assert_close(actual, expected, tol=1e-3, label=f"softmax_{rows}x{cols}")
+
+        # Softmax invariants: non-negative, ≤1.0, row sums ≈ 1.0
+        for i, v in enumerate(actual):
+            assert v >= -1e-6, f"softmax[{i}] = {v} is negative"
+            assert v <= 1.0 + 1e-6, f"softmax[{i}] = {v} exceeds 1.0"
+        for r in range(rows):
+            row_sum = sum(actual[r * cols + c] for c in range(cols))
+            assert abs(row_sum - 1.0) < 1e-3, f"Row {r} sum={row_sum}, expected 1.0"

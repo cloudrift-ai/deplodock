@@ -127,8 +127,8 @@ def test_softmax_4d_fuses():
 
     fused = auto_fuse(g)
     regions = _fused_regions(fused)
-    # max+sub+exp in one region, sum+div in another (single-reduce constraint).
-    assert len(regions) == 2, f"Expected 2 regions for 4D softmax, got {len(regions)}"
+    # Multi-reduce fusion: all softmax ops (max+sub+exp+sum+div) in one region.
+    assert len(regions) == 1, f"Expected 1 region for 4D softmax, got {len(regions)}"
     all_ops = []
     for r in regions:
         all_ops.extend(_region_op_types(r))

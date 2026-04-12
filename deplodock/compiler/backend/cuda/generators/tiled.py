@@ -794,52 +794,74 @@ def _lower_naive(
             )
 
     # --- Row reduction / reduce+broadcast ---
-    # Tile loop over columns
-    loop_body: list = []
-    loop_body.extend(_emit_ops(phases.prologue, var_map, "p_"))
+    if len(phases.reduces) > 1:
+        # Multi-reduce (e.g. softmax: max → sub → exp → sum → div).
+        # Emit one tile loop per reduce pass, then a final epilogue pass.
+        # Each pass re-reads inputs from global memory (L2-cached for small rows).
+        for ri, (node_id, _op, input_ids) in enumerate(phases.reduces):
+            acc_name, fn = reduce_vars[node_id]
+            pass_body: list = []
 
-    # Accumulation
-    for node_id, _op, input_ids in phases.reduces:
-        acc_name, fn = reduce_vars[node_id]
-        val = var_map.get(input_ids[0], Literal(0.0))
-        if fn == "sum":
-            loop_body.append(AugAssign(acc_name, "+=", val))
-        else:
-            # max/min: acc = fmaxf(acc, val) — no AugAssign for this
-            val_str = _expr_to_str(val)
-            loop_body.append(RawCode(f"{acc_name} = fmaxf({acc_name}, {val_str});"))
+            # Re-map inputs for this pass.
+            pass_var_map: dict[str, Expr] = {}
+            for inp in region.input_names:
+                pass_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
+            # Previous reduce results are available as accumulators.
+            for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
+                pass_var_map[prev_nid] = Var(prev_acc)
 
-    body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), loop_body, step=CudaBuiltin("blockDim.x")))
+            # Re-compute prologue ops needed by this reduce or its inter_reduce ops.
+            all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
+            needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
+            for pid, pop, pinp in phases.prologue:
+                if isinstance(pop, ElementwiseOp) and pid in needed:
+                    a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
+                    b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
+                    expr = _build_expr(pop.fn, a, b)
+                    if expr is None:
+                        expr = Literal(0.0)
+                    vn = f"r{ri}p_{_safe(pid)}"
+                    pass_body.append(VarDecl("float", vn, expr))
+                    pass_var_map[pid] = Var(vn)
 
-    # --- Phase 6: Cross-thread warp shuffle ---
-    for node_id, (acc_name, fn) in reduce_vars.items():
-        body.extend(_emit_warp_reduce(node_id, acc_name, fn))
-        var_map[node_id] = Var(acc_name)
+            # Apply inter_reduce ops (e.g. sub, exp between max and sum).
+            if ri > 0 and phases.inter_reduce:
+                pass_body.extend(_emit_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_"))
 
-    # --- Phase 7: Epilogue ---
-    epilogue_ops = phases.epilogue
-    if epilogue_ops:
-        if analysis.epilogue_needs_per_element:
-            # Second pass over columns: re-read inputs, re-compute needed prologue, emit epilogue
+            # Accumulate this reduce.
+            val = pass_var_map.get(input_ids[0], Literal(0.0))
+            if fn == "sum":
+                pass_body.append(AugAssign(acc_name, "+=", val))
+            else:
+                val_str = _expr_to_str(val)
+                pass_body.append(RawCode(f"{acc_name} = fmaxf({acc_name}, {val_str});"))
+
+            body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), pass_body, step=CudaBuiltin("blockDim.x")))
+            # Warp shuffle after this pass.
+            body.extend(_emit_warp_reduce(node_id, acc_name, fn))
+            var_map[node_id] = Var(acc_name)
+
+        # Final epilogue pass: re-read inputs, recompute inter-reduce ops, apply epilogue, write.
+        epilogue_ops = phases.epilogue
+        if epilogue_ops or analysis.epilogue_needs_per_element:
             epi_body: list = []
-
-            # Re-map inputs for the epilogue loop
             epi_var_map: dict[str, Expr] = dict(var_map)
             for inp in region.input_names:
                 epi_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
 
-            # Re-compute prologue ops needed by epilogue
-            needed = _needed_by(epilogue_ops)
-            for node_id, op, input_ids in phases.prologue:
-                if isinstance(op, ElementwiseOp) and node_id in needed:
-                    a = epi_var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
-                    b = epi_var_map.get(input_ids[1], Literal(0.0)) if len(input_ids) > 1 else Literal(0.0)
-                    expr = _build_expr(op.fn, a, b)
+            # Re-compute ALL prologue + inter_reduce ops (epilogue may
+            # transitively depend on any of them via intermediate nodes).
+            all_inter_ops = [op for group in phases.inter_reduce for op in group]
+            for pid, pop, pinp in phases.prologue + all_inter_ops:
+                if isinstance(pop, ElementwiseOp):
+                    a = epi_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
+                    b = epi_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
+                    expr = _build_expr(pop.fn, a, b)
                     if expr is None:
                         expr = Literal(0.0)
-                    vn = f"p_{_safe(node_id)}"
+                    vn = f"ep_{_safe(pid)}"
                     epi_body.append(VarDecl("float", vn, expr))
-                    epi_var_map[node_id] = Var(vn)
+                    epi_var_map[pid] = Var(vn)
 
             epi_body.extend(_emit_ops(epilogue_ops, epi_var_map, "e_"))
 
@@ -850,20 +872,77 @@ def _lower_naive(
 
             body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), epi_body, step=CudaBuiltin("blockDim.x")))
         else:
-            # Per-row epilogue: only thread 0 writes scalar output
-            body.extend(_emit_ops(epilogue_ops, var_map, "e_"))
+            # No epilogue — write last reduce result (thread 0 only).
             write_body = []
             for out_id in region.output_names:
                 val = var_map.get(out_id, Literal(0.0))
                 write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
             body.append(IfStmt(BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")), write_body))
     else:
-        # No epilogue — write reduce result (thread 0 only)
-        write_body = []
-        for out_id in region.output_names:
-            val = var_map.get(out_id, Literal(0.0))
-            write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
-        body.append(IfStmt(BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")), write_body))
+        # Single-reduce path (original).
+        # Tile loop over columns
+        loop_body: list = []
+        loop_body.extend(_emit_ops(phases.prologue, var_map, "p_"))
+
+        # Accumulation
+        for node_id, _op, input_ids in phases.reduces:
+            acc_name, fn = reduce_vars[node_id]
+            val = var_map.get(input_ids[0], Literal(0.0))
+            if fn == "sum":
+                loop_body.append(AugAssign(acc_name, "+=", val))
+            else:
+                val_str = _expr_to_str(val)
+                loop_body.append(RawCode(f"{acc_name} = fmaxf({acc_name}, {val_str});"))
+
+        body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), loop_body, step=CudaBuiltin("blockDim.x")))
+
+        # Cross-thread warp shuffle
+        for node_id, (acc_name, fn) in reduce_vars.items():
+            body.extend(_emit_warp_reduce(node_id, acc_name, fn))
+            var_map[node_id] = Var(acc_name)
+
+        # Epilogue
+        epilogue_ops = phases.epilogue
+        if epilogue_ops:
+            if analysis.epilogue_needs_per_element:
+                epi_body: list = []
+                epi_var_map: dict[str, Expr] = dict(var_map)
+                for inp in region.input_names:
+                    epi_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
+
+                needed = _needed_by(epilogue_ops)
+                for node_id, op, input_ids in phases.prologue:
+                    if isinstance(op, ElementwiseOp) and node_id in needed:
+                        a = epi_var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
+                        b = epi_var_map.get(input_ids[1], Literal(0.0)) if len(input_ids) > 1 else Literal(0.0)
+                        expr = _build_expr(op.fn, a, b)
+                        if expr is None:
+                            expr = Literal(0.0)
+                        vn = f"p_{_safe(node_id)}"
+                        epi_body.append(VarDecl("float", vn, expr))
+                        epi_var_map[node_id] = Var(vn)
+
+                epi_body.extend(_emit_ops(epilogue_ops, epi_var_map, "e_"))
+
+                for out_id in region.output_names:
+                    val = epi_var_map.get(out_id, Literal(0.0))
+                    idx = BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j"))
+                    epi_body.append(Assign(ArrayAccess(_safe(out_id), idx), val))
+
+                body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), epi_body, step=CudaBuiltin("blockDim.x")))
+            else:
+                body.extend(_emit_ops(epilogue_ops, var_map, "e_"))
+                write_body = []
+                for out_id in region.output_names:
+                    val = var_map.get(out_id, Literal(0.0))
+                    write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
+                body.append(IfStmt(BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")), write_body))
+        else:
+            write_body = []
+            for out_id in region.output_names:
+                val = var_map.get(out_id, Literal(0.0))
+                write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
+            body.append(IfStmt(BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")), write_body))
 
     return KernelDef(name=name, params=params, body=body, block_size=block_size)
 

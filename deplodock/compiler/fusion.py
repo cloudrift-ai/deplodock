@@ -238,11 +238,14 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
                             continue  # graph-level input (residual connection)
                     return False  # incompatible external in epilogue — reject
 
-    # 3. Single reduce: the codegen only supports one reduction pass per kernel.
-    #    Multi-reduce patterns (softmax max+sum) need multi-pass codegen (future).
+    # 3. Multi-reduce: allow compatible row reduces (e.g. softmax max+sum).
+    #    Reject if any reduce is a contraction reduce or reduces are incompatible.
     reduce_ids = [nid for nid in merged if isinstance(graph.nodes[nid].op, ReduceOp)]
     if len(reduce_ids) > 1:
-        return False
+        if has_contraction:
+            return False  # Contraction + multi-reduce — not yet supported.
+        if not all(_reduces_compatible(reduce_ids[0], rid, graph) for rid in reduce_ids[1:]):
+            return False
 
     # 4. Shape compatibility: all 2D+ external inputs must have the same total
     #    size (the kernel uses a single row*cols+j index for all).

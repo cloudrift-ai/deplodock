@@ -108,12 +108,13 @@ def test_reduce_broadcast_softmax():
                 shapes[nid] = fused.nodes[nid].output.shape
             analyses.append(analyze(nd.op, shapes))
 
-    # At least one region should be reduce_broadcast with epilogue.
+    # With multi-reduce fusion, softmax is one region with row_reduce pattern
+    # containing both max and sum reduces.
     patterns = [a.pattern for a in analyses]
-    assert "reduce_broadcast" in patterns
+    assert "row_reduce" in patterns or "reduce_broadcast" in patterns
     reduce_analyses = [a for a in analyses if a.pattern in ("reduce_broadcast", "row_reduce")]
     assert len(reduce_analyses) >= 1
-    assert any("max" in a.reduce_fns or "sum" in a.reduce_fns for a in reduce_analyses)
+    assert any("max" in a.reduce_fns and "sum" in a.reduce_fns for a in reduce_analyses)
 
 
 def test_contraction_matmul():
