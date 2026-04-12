@@ -1,4 +1,9 @@
-"""CUDA IR — imperative AST for kernel code generation."""
+"""Kernel IR: imperative AST for GPU kernel code generation.
+
+Backend-agnostic: the AST nodes represent generic C/C++ constructs
+(variables, loops, array accesses, function calls) that can be emitted
+as CUDA, HIP, or any C-like GPU language by a matching codegen printer.
+"""
 
 from __future__ import annotations
 

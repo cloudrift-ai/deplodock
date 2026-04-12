@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by
-from deplodock.compiler.backend.cuda.ir import (
+from deplodock.compiler.backend.ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
@@ -738,6 +738,6 @@ def _build_epilogue_inline(
 
 def _expr_to_str(expr: Expr) -> str:
     """Quick string conversion for an Expr (used in RawCode fallbacks)."""
-    from deplodock.compiler.backend.cuda.codegen import _emit_expr
+    from deplodock.compiler.backend.codegen import _emit_expr
 
     return _emit_expr(expr)

@@ -58,7 +58,7 @@ sys.path.insert(0, "$REPO_DIR")
 from deplodock.compiler.backend.cuda.runner import generate_benchmark_program, _detect_arch
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
-from deplodock.compiler.backend.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
 
 strategy_map, _ = default_matmul_strategy_map()
