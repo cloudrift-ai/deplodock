@@ -91,14 +91,35 @@ def _compile_matmul(op: OpKernel) -> Launch:
     )
     shapes = {a_buf: (m, k), b_buf: (k, n), "ew": (m, k, n), c_buf: (m, n)}
 
-    # Determine strategy.
-    hints = op.params.get("_hints", {})
-    strategy = hints.get("cuda.matmul.strategy", "tma_db")
+    # Determine strategy and tile parameters from hints + tuning profile.
+    explicit_hints = op.params.get("_hints", {})
+
+    # Load tuning profile for this GPU if no explicit hints are set.
+    matmul_hints: dict = {}
+    if not any(k.startswith("cuda.matmul.") for k in explicit_hints):
+        from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
+
+        strategy_map, _profile = default_matmul_strategy_map()
+        # Pick config based on max(M, N) as a size proxy.
+        size = max(m, n)
+        for threshold, cfg in strategy_map:
+            if size <= threshold:
+                matmul_hints = dict(cfg)
+                break
+        else:
+            matmul_hints = dict(strategy_map[-1][1])
+
+    # Explicit hints override tuning defaults.
+    for k, v in explicit_hints.items():
+        if k.startswith("cuda.matmul."):
+            matmul_hints[k[len("cuda.matmul."):]] = v
+
+    strategy = matmul_hints.get("strategy", "tma_db")
 
     # Generate kernel through the unified path.
     name = _unique_name("matmul")
     analysis = analyze(region, shapes)
-    kernel_def = lower_tiled(region, name, shapes, analysis, strategy=strategy)
+    kernel_def = lower_tiled(region, name, shapes, analysis, strategy=strategy, hints=matmul_hints)
     source = emit_kernel(kernel_def)
 
     bx, by, bz = kernel_def.block_size
@@ -118,7 +139,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
         # TMA kernels use M/N/K as compile-time macros in the kernel body.
         source = f"#define M {m}\n#define N {n}\n#define K {k}\n{source}\n#undef M\n#undef N\n#undef K\n"
 
-        bk = 16  # must match tiled.py
+        bk = int(matmul_hints.get("block_k", 32))  # must match tiled.py
         a_tile = tile_m * bk
         b_tile = bk * tile_n
         smem_bytes = 2 * (a_tile + b_tile) * 4 + 256
