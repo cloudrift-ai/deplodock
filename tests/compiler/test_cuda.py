@@ -247,6 +247,7 @@ def test_run_benchmark_surfaces_cuda_oom():
 # assumptions about block / coarsening dims and won't accept arbitrary values.
 ALL_STRATEGIES: list[tuple[str, dict]] = [
     ("naive", {}),
+    ("smem", {"block_k": 32, "thread_m": 4}),
     ("tma_db", {"block_k": 32, "thread_m": 8}),
     ("tma_db_tf32", {}),
     ("tma_db_fma_tf32", {}),
@@ -274,6 +275,7 @@ def test_lower_every_strategy(strategy_name, overrides):
     "strategy_name,overrides",
     [
         ("naive", {}),
+        ("smem", {"block_k": 32, "thread_m": 4}),
     ],
     ids=lambda v: v if isinstance(v, str) else "",
 )
@@ -316,6 +318,38 @@ def test_run_tma_db_strategy_via_bench():
         num_iterations=2,
     )
     assert result.kernel_time_ms > 0
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "strategy_name,overrides",
+    [
+        ("naive", {}),
+        ("smem", {"block_k": 32, "thread_m": 4}),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_rectangular_correctness(strategy_name, overrides):
+    """Non-square matrix (M=4, K=3, N=2), verified element-by-element against reference."""
+    M, K, N = 4, 3, 2
+    kernel = _lower_matmul(strategy=strategy_name, **overrides)
+    source = emit_kernel(kernel)
+
+    a_data = [float(i + 1) for i in range(M * K)]  # 1..12
+    b_data = [float(i + 1) for i in range(K * N)]  # 1..6
+
+    result = run_kernel(
+        kernel=kernel,
+        kernel_source=source,
+        inputs={"A": a_data, "B": b_data},
+        output_name="C",
+        output_size=M * N,
+        dim_args={"M": M, "N": N, "K": K},
+    )
+
+    expected = _python_matmul(a_data, b_data, M, K, N)
+    for idx, (got, exp) in enumerate(zip(result.output, expected, strict=True)):
+        assert abs(got - exp) < 1e-4, f"{strategy_name} [{idx}] got {got}, expected {exp}"
 
 
 # ---- Matmul + epilogue GPU tests ----

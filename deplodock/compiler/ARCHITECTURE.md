@@ -228,23 +228,12 @@ The CUDA backend auto-generates kernels during `compile()` for any `FusedRegionO
 
 ## CUDA Backend Details
 
-### SGEMM Strategies (cuda/generators/tiled.py)
-
-| Strategy          | Description                          | Best for               |
-|-------------------|--------------------------------------|------------------------|
-| `naive`           | 1 thread per output element          | Test baseline          |
-| **`tma_db`**      | **TMA double-buffer, size-adaptive** | **Production default** |
-| `tma_db_tf32`     | TF32 via tensor cores (wmma)         | TF32 precision ok      |
-| `tma_db_fma_tf32` | Concurrent FMA + TF32 hybrid         | Mixed precision ok     |
-
-### TMA Performance (RTX 5090, sm_120)
-
-| Size     | TM   | BK   | K-splits  | Eff vs cuBLAS | TFLOPS  |
-|----------|------|------|-----------|---------------|---------|
-| **1024** | 8    | 32   | 1         | **101%**      | 49.0    |
-| **2048** | 26   | 32   | 1         | **106%**      | 72.8    |
-| **4096** | 20   | 32   | 1         | **101%**      | 67.4    |
-| 8192     | 28   | 32   | 1         | 96%           | 60.2    |
+See [`backend/cuda/ARCHITECTURE.md`](backend/cuda/ARCHITECTURE.md) for full details on:
+- SGEMM strategies (TMA, smem, naive) and when each is selected
+- Per-GPU tuning profiles and M-aware optimizations
+- Performance benchmarks (square, rectangular, end-to-end transformer block)
+- Kernel structure diagrams for TMA and smem strategies
+- Reproducible benchmark experiments
 
 ## Hints (hints.py)
 

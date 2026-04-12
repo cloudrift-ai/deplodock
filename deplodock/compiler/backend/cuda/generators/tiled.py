@@ -169,6 +169,124 @@ def _reduce_init(fn: str) -> Literal:
     return Literal(0.0)
 
 
+def _lower_smem(  # noqa: C901
+    region: FusedRegionOp,
+    name: str,
+    shapes: dict[str, tuple],
+    analysis: TileAnalysis,
+    *,
+    hints: dict,
+) -> KernelDef:
+    """SIMT shared-memory contraction kernel for small M.
+
+    Uses shared memory for A (eliminates redundant global reads) and direct
+    global loads for B. Much lower per-block overhead than TMA — better for
+    small M where TMA setup cost dominates.
+
+    Block: (32, 4) = 128 threads. Each thread computes thread_m × 4 outputs.
+    Supports k_splits via blockIdx.z + atomicAdd for SM utilization.
+    """
+    a_name = _safe(analysis.contraction_a)
+    b_name = _safe(analysis.contraction_b)
+    out_id = region.output_names[0]
+    c_name = _safe(out_id)
+
+    thread_m = int(hints.get("thread_m", 4))
+    thread_n = 4
+    bk = int(hints.get("block_k", 32))
+    k_splits = int(hints.get("k_splits", 1))
+    tx, ty = 32, 4  # 128 threads
+    tile_m = ty * thread_m
+    tile_n = tx * thread_n  # 128
+    smem_stride = bk + 1  # bank conflict padding
+
+    params = []
+    for inp in region.input_names:
+        params.append(KernelParam("const float* __restrict__", _safe(inp)))
+    for out in region.output_names:
+        params.append(KernelParam("float* __restrict__", _safe(out)))
+    params.extend([KernelParam("int", "M"), KernelParam("int", "N"), KernelParam("int", "K")])
+    if k_splits > 1:
+        params.append(KernelParam("int", "k_splits"))
+
+    body: list = []
+
+    # Setup: thread mapping, shared memory, accumulators, K-range.
+    acc_decls = ",".join(f"c{r}{c}=0" for r in range(thread_m) for c in range(thread_n))
+    k_range = (
+        f"int k_per=(K/{bk}/k_splits)*{bk};\nint k_start=blockIdx.z*k_per;\nint k_end=(blockIdx.z==k_splits-1)?K:k_start+k_per;"
+        if k_splits > 1
+        else "int k_start=0,k_end=K;"
+    )
+    body.append(
+        RawCode(
+            f"int row_base=(blockIdx.y*{ty}+threadIdx.y)*{thread_m};\n"
+            f"int col_base=(blockIdx.x*{tx}+threadIdx.x)*{thread_n};\n"
+            f"int sr=threadIdx.y*{thread_m};\n"
+            f"__shared__ float As[{tile_m}][{smem_stride}];\n"
+            f"float {acc_decls};\n"
+            f"{k_range}"
+        )
+    )
+
+    # K-tile loop.
+    a_load = "\n    ".join(
+        f"As[sr+{r}][threadIdx.x]=(row_base+{r}<M&&tk+threadIdx.x<K)?{a_name}[(row_base+{r})*K+tk+threadIdx.x]:0.0f;"
+        for r in range(thread_m)
+    )
+    a_reads = "\n        ".join(f"float a{r}=As[sr+{r}][kk];" for r in range(thread_m))
+    fma = "\n        ".join("".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n)) for r in range(thread_m))
+    # Scalar fallback for edge columns (N not aligned to 4).
+    scalar_b_loads = "\n        ".join(f"float b{c}=(col_base+{c}<N)?{b_name}[(tk+kk)*N+col_base+{c}]:0.0f;" for c in range(thread_n))
+    body.append(
+        RawCode(
+            f"for(int tk=k_start;tk<k_end;tk+={bk}){{\n"
+            f"    {a_load}\n"
+            f"    __syncthreads();\n"
+            f"    if(col_base+3<N){{\n"
+            f"    #pragma unroll\n"
+            f"    for(int kk=0;kk<{bk};kk++){{\n"
+            f"        float b0={b_name}[(tk+kk)*N+col_base],"
+            f"b1={b_name}[(tk+kk)*N+col_base+1],"
+            f"b2={b_name}[(tk+kk)*N+col_base+2],"
+            f"b3={b_name}[(tk+kk)*N+col_base+3];\n"
+            f"        {a_reads}\n"
+            f"        {fma}\n"
+            f"    }}}}else if(col_base<N){{\n"
+            f"    for(int kk=0;kk<{bk};kk++){{\n"
+            f"        {scalar_b_loads}\n"
+            f"        {a_reads}\n"
+            f"        {fma}\n"
+            f"    }}}}\n"
+            f"    __syncthreads();\n"
+            f"}}"
+        )
+    )
+
+    # Write.
+    op = "atomicAdd" if k_splits > 1 else None
+    w_lines = []
+    for r in range(thread_m):
+        for c in range(thread_n):
+            guard = f"if(row_base+{r}<M&&col_base+{c}<N)"
+            idx = f"(row_base+{r})*N+col_base+{c}"
+            if op:
+                w_lines.append(f"{guard}atomicAdd(&{c_name}[{idx}],c{r}{c});")
+            else:
+                w_lines.append(f"{guard}{c_name}[{idx}]=c{r}{c};")
+    body.append(RawCode("\n".join(w_lines)))
+
+    return KernelDef(
+        name=name,
+        params=params,
+        body=body,
+        block_size=(tx, ty, 1),
+        tile_m=tile_m,
+        tile_n=tile_n,
+        grid_2d=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -192,6 +310,8 @@ def lower_tiled(
     For contraction strategies (naive or tma_db), the same code path handles
     grid setup, accumulators, and write.  Only the K-loop body differs.
     """
+    if strategy == "smem" and analysis.pattern == "contraction":
+        return _lower_smem(region, name, shapes, analysis, hints=hints or {})
     return _lower_naive(region, name, shapes, analysis, strategy=strategy, hints=hints or {})
 
 
@@ -390,11 +510,13 @@ def _lower_naive(
 
     if is_contraction:
         params.extend([KernelParam("int", "M"), KernelParam("int", "N"), KernelParam("int", "K")])
-        # Block (32, 8) = 256 threads.  Each thread computes 8×4 = 32 outputs.
-        # Output tile per block: 64 rows × 128 cols (same as TMA strategy).
+        # Block (32, 8) = 256 threads.  thread_m controls rows per thread.
+        # Output tile per block: (ty * thread_m) rows × (tx * thread_n) cols.
+        _hints = hints or {}
         tx, ty = 32, 8
-        thread_m, thread_n = 8, 4  # coarsening per thread
-        tile_m = ty * thread_m  # 64
+        thread_m = int(_hints.get("thread_m", 8))
+        thread_n = 4  # fixed: each thread handles 4 columns
+        tile_m = ty * thread_m
         tile_n = tx * thread_n  # 128
         block_size = (tx, ty, 1)
     elif is_pointwise:
@@ -468,7 +590,6 @@ def _lower_naive(
         b_name = _safe(analysis.contraction_b)
         out_id = region.output_names[0]
         c_name = _safe(out_id)
-        _hints = hints or {}
         default_bk = 32 if strategy == "tma_db" else 16
         bk = int(_hints.get("block_k", default_bk))
         k_splits = int(_hints.get("k_splits", 1))
