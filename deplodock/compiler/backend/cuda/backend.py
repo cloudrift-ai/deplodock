@@ -39,8 +39,20 @@ class CudaBackend(Backend):
 
         buffers = [Buffer(name=b.name, size=_safe_prod(b.shape), dtype="float", role=b.role) for b in plan.buffers]
 
+        # Noop ops (reshape, transpose) become buffer aliases instead of
+        # empty kernel launches. The output buffer shares the input's
+        # device pointer — no allocation, no launch overhead.
+        _NOOP_OPS = {"reshape", "transpose", "gather", "scatter"}
+        aliases: dict[str, str] = {}
         launches = []
         for op in plan.ops:
+            if op.op in _NOOP_OPS and op.inputs and op.outputs:
+                # Resolve transitive aliases (reshape of reshape).
+                target = op.inputs[0]
+                while target in aliases:
+                    target = aliases[target]
+                aliases[op.outputs[0]] = target
+                continue
             launch = _compile_op(op)
             launches.append(launch)
 
@@ -48,6 +60,7 @@ class CudaBackend(Backend):
             name=plan.name,
             buffers=buffers,
             launches=launches,
+            aliases=aliases,
         )
 
     def run(self, program: Program) -> ProgramResult:
@@ -541,7 +554,7 @@ def _compile_singleton(op: OpKernel) -> Launch:
         axis = op.params.get("axis", -1)
         prim_op = ReduceOp(fn=fn, axis=axis)
     else:
-        return _compile_noop(op)
+        raise ValueError(f"_compile_singleton: unsupported op tag {tag!r}")
 
     # Set up params for the unified path in _compile_fused_region.
     op.params["_region_ops"] = [(op.outputs[0], prim_op, list(op.inputs))]
@@ -562,25 +575,8 @@ def _compile_singleton(op: OpKernel) -> Launch:
     return _compile_fused_region(op)
 
 
-def _compile_noop(op: OpKernel) -> Launch:
-    """No-op kernel for reshape/transpose/elementwise that don't need computation."""
-    name = _unique_name("noop")
-    src = f"__global__ void {name}() {{}}"
-    return Launch(
-        kernel_source=src,
-        kernel_name=name,
-        grid=(1, 1, 1),
-        block=(1, 1, 1),
-        args=[],
-    )
-
-
 _OP_HANDLERS: dict[str, callable] = {
     "fused_region": _compile_fused_region,
-    "reshape": _compile_noop,
-    "transpose": _compile_noop,
-    "gather": _compile_noop,
-    "scatter": _compile_noop,
 }
 
 
@@ -593,9 +589,5 @@ def _compile_op(op: OpKernel) -> Launch:
     # Unfused elementwise/reduce ops — wrap in a FusedRegionOp and use kernel_gen.
     if op.op.startswith("elementwise_") or op.op.startswith("reduce_"):
         return _compile_singleton(op)
-
-    # Legacy fused ops — noop stub.
-    if op.op.startswith("fused_"):
-        return _compile_noop(op)
 
     raise ValueError(f"Unknown op: {op.op!r}. Known ops: {list(_OP_HANDLERS.keys())}")

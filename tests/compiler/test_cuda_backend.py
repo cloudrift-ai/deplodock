@@ -84,3 +84,27 @@ def test_cuda_backend_benchmark():
 
     assert result.time_ms >= 0  # may be 0.0 for very fast programs
     assert result.num_launches > 0
+
+
+def test_noop_ops_become_aliases():
+    """Reshape/transpose ops produce buffer aliases, not noop kernel launches."""
+    compiled = _load_and_compile_fixture()
+    plan = plan_graph(compiled)
+
+    # The plan should contain reshape/transpose ops.
+    noop_op_count = sum(1 for op in plan.ops if op.op in ("reshape", "transpose"))
+    assert noop_op_count > 0, "Fixture should have reshape/transpose ops"
+
+    program = _backend.compile(plan)
+
+    # No noop kernels in launches.
+    for launch in program.launches:
+        assert "noop" not in launch.kernel_name, f"Unexpected noop launch: {launch.kernel_name}"
+
+    # Aliases should exist for the reshape/transpose outputs.
+    assert len(program.aliases) == noop_op_count
+
+    # Source should use pointer assignment for aliased buffers, not cudaMalloc.
+    source = generate_source(program, mode="run")
+    for alias_name, target_name in program.aliases.items():
+        assert f"d_{alias_name} = d_{target_name}" in source

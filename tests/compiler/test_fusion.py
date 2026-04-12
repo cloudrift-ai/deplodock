@@ -108,6 +108,38 @@ def test_softmax_fuses_into_one_region():
 
 
 # ---------------------------------------------------------------------------
+# Pattern: Softmax on 4D tensor (attention scores)
+# max → sub → exp → sum → div on (1, 28, 32, 32) — should fuse
+# ---------------------------------------------------------------------------
+
+
+def test_softmax_4d_fuses():
+    """Softmax on 4D attention scores should fuse (>2D dims allowed)."""
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("x", (1, 28, 32, 32)), node_id="x")
+    g.inputs = [x]
+    mx = g.add_node(ReduceOp("max", axis=-1), [x], Tensor("mx", (1, 28, 32, 1)), node_id="mx")
+    sub = g.add_node(ElementwiseOp("sub"), [x, mx], Tensor("sub", (1, 28, 32, 32)), node_id="sub")
+    exp = g.add_node(ElementwiseOp("exp"), [sub], Tensor("exp", (1, 28, 32, 32)), node_id="exp")
+    sm = g.add_node(ReduceOp("sum", axis=-1), [exp], Tensor("sm", (1, 28, 32, 1)), node_id="sm")
+    out = g.add_node(ElementwiseOp("div"), [exp, sm], Tensor("out", (1, 28, 32, 32)), node_id="out")
+    g.outputs = [out]
+
+    fused = auto_fuse(g)
+    regions = _fused_regions(fused)
+    # max+sub+exp in one region, sum+div in another (single-reduce constraint).
+    assert len(regions) == 2, f"Expected 2 regions for 4D softmax, got {len(regions)}"
+    all_ops = []
+    for r in regions:
+        all_ops.extend(_region_op_types(r))
+    assert "ReduceOp(max)" in all_ops
+    assert "ReduceOp(sum)" in all_ops
+    assert "ElementwiseOp(sub)" in all_ops
+    assert "ElementwiseOp(exp)" in all_ops
+    assert "ElementwiseOp(div)" in all_ops
+
+
+# ---------------------------------------------------------------------------
 # Pattern: RMSNorm — mul(x,x) → sum → add(eps) → rsqrt → mul(x) → mul(w)
 # Multi-consumer: x feeds both mul(x,x) and mul(x, rsqrt)
 # ---------------------------------------------------------------------------
