@@ -26,11 +26,11 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
-from deplodock.compiler.backend.cuda.generators import lower_matmul
+from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
 from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_benchmark
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
+from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, InputOp, ReduceOp
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -59,10 +59,49 @@ MATRIX_SIZES = [
 MatmulHints = dict[str, Any]
 
 
+def _make_matmul_graph() -> Graph:
+    """Create a primitive matmul graph: C = Reduce{sum}(Elementwise{mul}(A, B))."""
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
+    b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
+    g.inputs = [a, b]
+    ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", ("M", "K", "N")))
+    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", ("M", "N")))
+    g.outputs = [c]
+    return g
+
+
 def _set_matmul_hints(graph: Graph, hints: MatmulHints) -> None:
     """Set cuda.matmul.* hints on a graph from a flat dict."""
     for k, v in hints.items():
         graph.hints.set(f"cuda.matmul.{k}", v)
+
+
+def _lower_matmul_with_hints(hints: MatmulHints):
+    """Build graph, set hints, lower via the unified analyze → lower_tiled path."""
+    g = _make_matmul_graph()
+    _set_matmul_hints(g, hints)
+    return _lower_matmul(g)
+
+
+def _lower_matmul(graph: Graph):
+    """Lower a matmul graph through analyze → lower_tiled."""
+    out_node = graph.nodes[graph.outputs[0]]
+    ew_node = graph.nodes[out_node.inputs[0]]
+    input_a = graph.nodes[ew_node.inputs[0]]
+    input_b = graph.nodes[ew_node.inputs[1]]
+    a_name, b_name, c_name = input_a.output.name, input_b.output.name, out_node.output.name
+    region = FusedRegionOp(
+        region_ops=[(ew_node.id, ew_node.op, [a_name, b_name]), (out_node.id, out_node.op, [ew_node.id])],
+        input_names=[a_name, b_name],
+        output_names=[c_name],
+    )
+    shapes = {
+        a_name: input_a.output.shape, b_name: input_b.output.shape,
+        ew_node.id: ew_node.output.shape, c_name: out_node.output.shape,
+    }
+    strategy = graph.hints.prefix("cuda.matmul").get("strategy", "naive")
+    return lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +154,6 @@ class BenchmarkSuite:
 
 
 def run_benchmark_suite(
-    graph: Graph,
     hints: MatmulHints,
     sizes: list[dict[str, int]] | None = None,
     output_dir: Path | None = None,
@@ -137,9 +175,7 @@ def run_benchmark_suite(
     )
 
     try:
-        g = graph.copy()
-        _set_matmul_hints(g, hints)
-        kernel = lower_matmul(g)
+        kernel = _lower_matmul_with_hints(hints)
         source = emit_kernel(kernel)
         suite.generated_code = source
 
@@ -193,7 +229,6 @@ def run_benchmark_suite(
 
 
 def run_adaptive_benchmark_suite(
-    graph: Graph,
     strategy_map: list[tuple[int, MatmulHints]],
     sizes: list[dict[str, int]] | None = None,
     output_dir: Path | None = None,
@@ -218,9 +253,9 @@ def run_adaptive_benchmark_suite(
         kernels: dict[int, tuple] = {}
         for _threshold, hints in strategy_map:
             key = id(hints)
-            g = graph.copy()
+            g = _make_matmul_graph()
             _set_matmul_hints(g, hints)
-            kernel = lower_matmul(g)
+            kernel = _lower_matmul(g)
             source = emit_kernel(kernel)
             kernels[key] = (kernel, source, hints)
 
@@ -354,23 +389,6 @@ def collect_system_info() -> dict[str, str]:
     return info
 
 
-# ---------------------------------------------------------------------------
-# Graph helpers
-# ---------------------------------------------------------------------------
-
-
-def make_matmul_graph() -> Graph:
-    """Create a primitive matmul graph: C = Reduce{sum}(Elementwise{mul}(A, B))."""
-    g = Graph()
-    a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
-    b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
-    g.inputs = [a, b]
-    ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", ("M", "K", "N")))
-    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", ("M", "N")))
-    g.outputs = [c]
-    return g
-
-
 def parse_size(size_str: str) -> dict[str, int]:
     """Parse a single size like '4096' or '4096x2048x1024' into a matrix dimension dict."""
     if "x" in size_str:
@@ -410,7 +428,6 @@ def main():
     )
     args = parser.parse_args()
 
-    graph = make_matmul_graph()
     sizes = [parse_size(args.size)]
     output_dir = Path(args.output_dir) if args.output_dir else None
     system_info = collect_system_info()
@@ -423,7 +440,6 @@ def main():
         if batch > 1:
             strategy_map = [(t, {**h, "batch_count": batch, "k_splits": 1}) for t, h in strategy_map]
         suite = run_adaptive_benchmark_suite(
-            graph,
             strategy_map,
             sizes=sizes,
             output_dir=output_dir,
@@ -444,7 +460,6 @@ def main():
             "batch_count": batch,
         }
         suite = run_benchmark_suite(
-            graph,
             hints,
             sizes=sizes,
             output_dir=output_dir,

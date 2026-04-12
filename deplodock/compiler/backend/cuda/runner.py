@@ -85,9 +85,16 @@ def generate_host_program(
 
     # Compute grid dimensions.
     bx, by, _bz = kernel.block_size
-    # For matmul: grid.x covers N (cols), grid.y covers M (rows).
-    grid_x = f"({dim_args.get('N', 1)} + {bx - 1}) / {bx}"
-    grid_y = f"({dim_args.get('M', 1)} + {by - 1}) / {by}"
+    if kernel.tile_m and kernel.tile_n:
+        # CTA-swizzle linearized grid (same as tiled.py and program.py).
+        ntx = f"(({dim_args.get('N', 1)} + {kernel.tile_n - 1}) / {kernel.tile_n})"
+        nty = f"(({dim_args.get('M', 1)} + {kernel.tile_m - 1}) / {kernel.tile_m})"
+        grid_x = f"({ntx} * (({nty} + 7) / 8) * 8)"
+        grid_y = "1"
+    else:
+        # Simple 2D grid: grid.x covers N (cols), grid.y covers M (rows).
+        grid_x = f"({dim_args.get('N', 1)} + {bx - 1}) / {bx}"
+        grid_y = f"({dim_args.get('M', 1)} + {by - 1}) / {by}"
     lines.append(f"    dim3 block({bx}, {by});")
     lines.append(f"    dim3 grid({grid_x}, {grid_y});")
     lines.append("")
@@ -325,7 +332,7 @@ def generate_benchmark_program(
     param_defaults = {"k_splits": 1}
     launch_args = []
     for p in kernel.params:
-        if p.dtype.endswith("*"):
+        if "*" in p.dtype:
             launch_args.append(f"d_{p.name}")
         elif p.name in dim_args:
             launch_args.append(str(dim_args[p.name]))

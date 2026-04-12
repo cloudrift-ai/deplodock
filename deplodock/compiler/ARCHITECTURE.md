@@ -114,7 +114,7 @@ result = backend.run(program)
 - **Do NOT import from `cuda/` in Layer 1-3 modules.** If you need GPU-specific behavior, add it to `cuda/backend.py`.
 - **Do NOT put kernel source strings in Layer 3.** `OpKernel.op` is a tag; the backend resolves it to actual code.
 - **Do NOT hardcode grid/block/smem in planners.** That's the backend's job.
-- **Do NOT add kernel source as Python f-strings.** Use `generators/fused.py` for auto-generated kernels or `generators/matmul.py` for SGEMM strategies.
+- **Do NOT add kernel source as Python f-strings.** Use `generators/tiled.py` for new kernel patterns, `generators/fused.py` for auto-generated kernels, or `generators/matmul.py` for SGEMM strategies.
 
 ## Module Layout
 
@@ -143,6 +143,8 @@ compiler/
 │       ├── ir.py         #  CUDA imperative AST (KernelDef, Expr, Stmt)
 │       ├── codegen.py    #  KernelDef → CUDA C source
 │       ├── generators/   #  Kernel generators
+│       │   ├── analysis.py #  TileAnalysis: classify FusedRegionOp patterns
+│       │   ├── tiled.py  #    Unified tiled generator (analysis → KernelDef)
 │       │   ├── matmul.py #    Hand-optimised SGEMM (naive, TMA, TF32)
 │       │   └── fused.py  #    Auto pointwise + reduction from FusedRegionOp
 │       ├── runner.py     #  Legacy single-kernel compile + run + benchmark

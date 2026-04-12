@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from deplodock.compiler.backend.cuda.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import generate_kernel
 from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program, run_program
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
@@ -58,7 +59,7 @@ def _run_fused_region(region_node, graph: Graph, inputs: dict[str, list[float]])
                 pass
         shapes[out] = region_node.output.shape
 
-    source = generate_kernel(op, "test_kernel", shapes)
+    source = emit_kernel(generate_kernel(op, "test_kernel", shapes))
 
     # Build Program.
     buffers = []
@@ -139,8 +140,8 @@ def test_kernel_gen_matmul():
     for nid in fused.nodes:
         shapes[nid] = fused.nodes[nid].output.shape
 
-    source = generate_kernel(region_node.op, "test_matmul", shapes)
-    assert "__global__ void test_matmul" in source
+    source = emit_kernel(generate_kernel(region_node.op, "test_matmul", shapes))
+    assert "__global__" in source and "void test_matmul" in source
     # Should have accumulation loop (reduction)
     assert "acc_" in source or "+=" in source
 
@@ -185,8 +186,8 @@ def test_kernel_gen_rmsnorm():
     for nid in fused.nodes:
         shapes[nid] = fused.nodes[nid].output.shape
 
-    source = generate_kernel(region_node.op, "test_rmsnorm", shapes)
-    assert "__global__ void test_rmsnorm" in source
+    source = emit_kernel(generate_kernel(region_node.op, "test_rmsnorm", shapes))
+    assert "__global__" in source and "void test_rmsnorm" in source
     assert "rsqrtf" in source
     assert "__shfl_down_sync" in source  # has warp-level reduction
 
@@ -224,8 +225,8 @@ def test_kernel_gen_softmax():
     for nid in fused.nodes:
         shapes[nid] = fused.nodes[nid].output.shape
 
-    source = generate_kernel(region_node.op, "test_softmax", shapes)
-    assert "__global__ void test_softmax" in source
+    source = emit_kernel(generate_kernel(region_node.op, "test_softmax", shapes))
+    assert "__global__" in source and "void test_softmax" in source
     assert "expf" in source
     assert "fmaxf" in source  # has max reduction
 
@@ -271,8 +272,8 @@ def test_kernel_gen_silu_mul():
     for rid, _, _ in region_node.op.region_ops:
         if rid in g.nodes:
             shapes[rid] = g.nodes[rid].output.shape
-    source = generate_kernel(region_node.op, "test_silu_mul", shapes)
-    assert "__global__ void test_silu_mul" in source
+    source = emit_kernel(generate_kernel(region_node.op, "test_silu_mul", shapes))
+    assert "__global__" in source and "void test_silu_mul" in source
     assert "expf" in source
 
 
@@ -339,7 +340,7 @@ def test_kernel_gen_attention():
         shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
         for nid in fused.nodes:
             shapes[nid] = fused.nodes[nid].output.shape
-        source = generate_kernel(nd.op, f"test_attn_{nd.id}", shapes)
+        source = emit_kernel(generate_kernel(nd.op, f"test_attn_{nd.id}", shapes))
         assert "__global__" in source
 
 
@@ -372,7 +373,7 @@ def test_kernel_gen_triple_matmul():
     shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
     for nid in fused.nodes:
         shapes[nid] = fused.nodes[nid].output.shape
-    source = generate_kernel(fused_nodes[0].op, "test_triple", shapes)
+    source = emit_kernel(generate_kernel(fused_nodes[0].op, "test_triple", shapes))
     assert "__global__" in source
 
 
@@ -405,7 +406,7 @@ def test_kernel_gen_matmul_residual_add():
     shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
     for nid in fused.nodes:
         shapes[nid] = fused.nodes[nid].output.shape
-    source = generate_kernel(fused_nodes[0].op, "test_mra", shapes)
+    source = emit_kernel(generate_kernel(fused_nodes[0].op, "test_mra", shapes))
     assert "__global__" in source
 
 
