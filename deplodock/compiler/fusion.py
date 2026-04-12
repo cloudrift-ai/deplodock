@@ -73,6 +73,12 @@ def _is_fusible_op(op, node=None) -> bool:
 
     if not isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp)):
         return False
+    # Contraction broadcast mul (output has symbolic dims like 'K') must
+    # stay with its reduce — exclude from general fusion. The _is_contraction_op
+    # check and contraction isolation in _can_merge handle pairing.
+    if node and isinstance(op, ElementwiseOp) and op.fn == "mul":
+        if any(isinstance(d, str) for d in node.output.shape):
+            return False
     return True
 
 
