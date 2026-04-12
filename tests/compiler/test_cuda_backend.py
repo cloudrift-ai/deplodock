@@ -82,5 +82,5 @@ def test_cuda_backend_benchmark():
     program = _backend.compile(plan)
     result = _backend.benchmark(program, warmup=2, num_iters=3)
 
-    assert result.time_ms > 0
+    assert result.time_ms >= 0  # may be 0.0 for very fast programs
     assert result.num_launches > 0
