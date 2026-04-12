@@ -222,11 +222,34 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
             if not _reduces_compatible(ri, rj, graph):
                 return False
 
-    # 4. Shape compatibility (non-contraction only): all 2D+ external inputs
-    #    must have the same total size (the reduction kernel uses a single
-    #    row*cols+j index for all). Contraction regions use separate A/B
-    #    indexing and are exempt.
-    if not has_contraction:
+    # 4. Shape compatibility: all 2D+ external inputs must have the same total
+    #    size (the kernel uses a single row*cols+j index for all).
+    #    Only exempt PURE 2-op contraction regions (exactly mul + reduce)
+    #    which use dedicated A/B indexing.
+    contraction_ops = sum(1 for nid in merged if _is_contraction_op(nid, graph))
+    is_pure_contraction = has_contraction and contraction_ops == 2
+
+    # 5. Dimensionality: the codegen uses 2D indexing (row*cols+j).
+    #    Ops with >2 non-trivial concrete dims can't be in a fused region
+    #    (except contraction broadcast muls which are handled separately).
+    for nid in merged:
+        shape = graph.nodes[nid].output.shape
+        concrete_dims = [d for d in shape if isinstance(d, int) and d > 1]
+        if len(concrete_dims) > 2:
+            # Allow standard matmul broadcast muls where inputs are ≤2D.
+            # Attention-style broadcasts (4D×4D→5D) are NOT allowed.
+            from deplodock.compiler.ops import ElementwiseOp as _EwOp
+            if isinstance(graph.nodes[nid].op, _EwOp) and graph.nodes[nid].op.fn == "mul":
+                inp_max_dims = 0
+                for inp_id in graph.nodes[nid].inputs:
+                    if inp_id in graph.nodes:
+                        inp_concrete = [d for d in graph.nodes[inp_id].output.shape if isinstance(d, int) and d > 1]
+                        inp_max_dims = max(inp_max_dims, len(inp_concrete))
+                if inp_max_dims <= 2:
+                    continue  # Standard matmul broadcast — OK
+            return False
+
+    if not is_pure_contraction:
         sizes_2d: set[int] = set()
         for nid in merged:
             node = graph.nodes[nid]
