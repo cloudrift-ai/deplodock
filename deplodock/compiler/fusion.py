@@ -93,11 +93,7 @@ def _is_contraction_op(nid: str, graph) -> bool:
         # (broadcast mul: A(M,K) × B(K,N) → AB(M,K,N)).
         # Regular broadcast mul (norm * weight) only exceeds one input's ndim.
         out_ndim = len(node.output.shape)
-        inp_ndims = [
-            len(graph.nodes[inp_id].output.shape)
-            for inp_id in node.inputs
-            if inp_id in graph.nodes
-        ]
+        inp_ndims = [len(graph.nodes[inp_id].output.shape) for inp_id in node.inputs if inp_id in graph.nodes]
         if inp_ndims and all(out_ndim > nd for nd in inp_ndims):
             return True
 
@@ -197,14 +193,50 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
     if between_fusible:
         return False  # Non-convex — would create a cycle.
 
-    # 2. Contraction isolation: a contraction region must contain ONLY the
-    #    contraction mul + reduce pair. No other ops allowed — they'd break
-    #    the _is_matmul_region detection which requires exactly 2 ops.
+    # 2. Contraction isolation: a contraction region must contain the
+    #    contraction mul + reduce pair. Additional ops are allowed only if
+    #    they are pointwise epilogue (ElementwiseOp) consuming the contraction
+    #    output or external scalars/1D vectors (e.g. bias add, activation).
     has_contraction = any(_is_contraction_op(nid, graph) for nid in merged)
     if has_contraction:
-        non_contraction = [nid for nid in merged if not _is_contraction_op(nid, graph)]
+        from deplodock.compiler.ops import ElementwiseOp as _EpiEwOp
+
+        contraction_ids = {nid for nid in merged if _is_contraction_op(nid, graph)}
+        non_contraction = [nid for nid in merged if nid not in contraction_ids]
         if non_contraction:
-            return False  # Only contraction ops allowed in contraction regions.
+            # All non-contraction ops must be pointwise ElementwiseOp.
+            for nid in non_contraction:
+                if not isinstance(graph.nodes[nid].op, _EpiEwOp):
+                    return False
+            # Find contraction output shape (the ReduceOp node's output).
+            contraction_out_shape = None
+            for cid in contraction_ids:
+                if isinstance(graph.nodes[cid].op, ReduceOp):
+                    contraction_out_shape = graph.nodes[cid].output.shape
+                    break
+
+            # Each non-contraction op may only consume: contraction output,
+            # other epilogue ops, or external inputs that are indexable in the
+            # epilogue (scalars, 1D vectors, or 2D tensors matching the
+            # contraction output shape).
+            valid_sources = contraction_ids | set(non_contraction)
+            for nid in non_contraction:
+                for inp_id in graph.nodes[nid].inputs:
+                    if inp_id in valid_sources:
+                        continue
+                    if inp_id not in graph.nodes:
+                        continue  # external input (InputOp) — checked by shape compat
+                    inp_shape = graph.nodes[inp_id].output.shape
+                    inp_size = _tensor_size(inp_shape)
+                    if inp_size <= 1 or len(inp_shape) <= 1:
+                        continue  # scalar or 1D vector (bias)
+                    # Allow 2D inputs matching contraction output shape only
+                    # if they are graph-level inputs (InputOp/ConstantOp), not
+                    # intermediate results from other fused regions.
+                    if contraction_out_shape and inp_shape == contraction_out_shape:
+                        if not _is_fusible_op(graph.nodes[inp_id].op, graph.nodes[inp_id]):
+                            continue  # graph-level input (residual connection)
+                    return False  # incompatible external in epilogue — reject
 
     # 3. Single reduce: the codegen only supports one reduction pass per kernel.
     #    Multi-reduce patterns (softmax max+sum) need multi-pass codegen (future).
@@ -216,8 +248,7 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
     #    size (the kernel uses a single row*cols+j index for all).
     #    Only exempt PURE 2-op contraction regions (exactly mul + reduce)
     #    which use dedicated A/B indexing.
-    contraction_ops = sum(1 for nid in merged if _is_contraction_op(nid, graph))
-    is_pure_contraction = has_contraction and contraction_ops == 2
+    is_pure_contraction = has_contraction
 
     # 5. Dimensionality: the codegen uses 2D indexing (row*cols+j).
     #    Ops with >2 non-trivial concrete dims can't be in a fused region
@@ -229,6 +260,7 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
             # Allow standard matmul broadcast muls where inputs are ≤2D.
             # Attention-style broadcasts (4D×4D→5D) are NOT allowed.
             from deplodock.compiler.ops import ElementwiseOp as _EwOp
+
             if isinstance(graph.nodes[nid].op, _EwOp) and graph.nodes[nid].op.fn == "mul":
                 inp_max_dims = 0
                 for inp_id in graph.nodes[nid].inputs:

@@ -88,7 +88,8 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
     strategy = selected.get("strategy", "tma_db")
     region = FusedRegionOp(
         region_ops=[("ew", ElementwiseOp("mul"), ["A", "B"]), ("C", ReduceOp("sum", axis=1), ["ew"])],
-        input_names=["A", "B"], output_names=["C"],
+        input_names=["A", "B"],
+        output_names=["C"],
     )
     shapes = {"A": ("M", "K"), "B": ("K", "N"), "ew": ("M", "K", "N"), "C": ("M", "N")}
     kernel = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)

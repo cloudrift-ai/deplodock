@@ -1,6 +1,5 @@
 """Tests for CUDA backend: codegen, lowering, and end-to-end GPU execution."""
 
-
 import pytest
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
@@ -51,11 +50,14 @@ def _lower_matmul(m=None, k=None, n=None, **matmul_hints):
     a_name, b_name, c_name = input_a.output.name, input_b.output.name, out_node.output.name
     region = FusedRegionOp(
         region_ops=[(ew_node.id, ew_node.op, [a_name, b_name]), (out_node.id, out_node.op, [ew_node.id])],
-        input_names=[a_name, b_name], output_names=[c_name],
+        input_names=[a_name, b_name],
+        output_names=[c_name],
     )
     shapes = {
-        a_name: input_a.output.shape, b_name: input_b.output.shape,
-        ew_node.id: ew_node.output.shape, c_name: out_node.output.shape,
+        a_name: input_a.output.shape,
+        b_name: input_b.output.shape,
+        ew_node.id: ew_node.output.shape,
+        c_name: out_node.output.shape,
     }
     strategy = matmul_hints.get("strategy", "naive")
     return lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
@@ -314,3 +316,118 @@ def test_run_tma_db_strategy_via_bench():
         num_iterations=2,
     )
     assert result.kernel_time_ms > 0
+
+
+# ---- Matmul + epilogue GPU tests ----
+
+
+def _lower_matmul_with_epilogue(epilogue_ops, extra_inputs, extra_shapes):
+    """Build a contraction region with epilogue ops, lower via naive strategy."""
+    M, K, N = 4, 3, 2
+    region_ops = [
+        ("ew", ElementwiseOp(fn="mul"), ["A", "B"]),
+        ("red", ReduceOp(fn="sum", axis=1), ["ew"]),
+        *epilogue_ops,
+    ]
+    input_names = ["A", "B"] + list(extra_inputs)
+    # Use the last epilogue op's node_id as the output.
+    out_id = epilogue_ops[-1][0]
+    region = FusedRegionOp(
+        region_ops=region_ops,
+        input_names=input_names,
+        output_names=[out_id],
+    )
+    shapes = {
+        "A": (M, K),
+        "B": (K, N),
+        "ew": (M, K, N),
+        "red": (M, N),
+        out_id: (M, N),
+        **extra_shapes,
+    }
+    # Add shapes for intermediate epilogue ops (all (M, N)).
+    for nid, _, _ in epilogue_ops[:-1]:
+        shapes[nid] = (M, N)
+
+    analysis = analyze(region, shapes)
+    return lower_tiled(region, "matmul_epi", shapes, analysis, strategy="naive"), M, K, N
+
+
+@requires_cuda
+def test_matmul_bias_end_to_end():
+    """Matmul + bias add on GPU, verified element-by-element against reference."""
+    M, K, N = 4, 3, 2
+    epilogue_ops = [("ba", ElementwiseOp("add"), ["red", "bias"])]
+    kernel, _, _, _ = _lower_matmul_with_epilogue(
+        epilogue_ops,
+        ["bias"],
+        {"bias": (N,)},
+    )
+    source = emit_kernel(kernel)
+
+    a_data = [float(i + 1) for i in range(M * K)]  # 1..12
+    b_data = [float(i + 1) for i in range(K * N)]  # 1..6
+    bias_data = [10.0, 20.0]
+
+    result = run_kernel(
+        kernel=kernel,
+        kernel_source=source,
+        inputs={"A": a_data, "B": b_data, "bias": bias_data},
+        output_name="ba",
+        output_size=M * N,
+        dim_args={"M": M, "N": N, "K": K},
+    )
+
+    # Reference: C = A @ B + bias
+    expected = _python_matmul(a_data, b_data, M, K, N)
+    for i in range(M):
+        for j in range(N):
+            expected[i * N + j] += bias_data[j]
+
+    assert len(result.output) == len(expected)
+    for idx, (got, exp) in enumerate(zip(result.output, expected, strict=True)):
+        assert abs(got - exp) < 1e-4, f"[{idx}] got {got}, expected {exp}"
+
+
+@requires_cuda
+def test_matmul_bias_relu_end_to_end():
+    """Matmul + bias add + ReLU on GPU, verified element-by-element against reference."""
+    M, K, N = 4, 3, 2
+    epilogue_ops = [
+        ("ba", ElementwiseOp("add"), ["red", "bias"]),
+        ("out", ElementwiseOp("relu"), ["ba"]),
+    ]
+    kernel, _, _, _ = _lower_matmul_with_epilogue(
+        epilogue_ops,
+        ["bias"],
+        {"bias": (N,)},
+    )
+    source = emit_kernel(kernel)
+
+    a_data = [float(i + 1) for i in range(M * K)]  # 1..12
+    b_data = [float(i + 1) for i in range(K * N)]  # 1..6
+    # Large negative bias on col 0 to trigger ReLU clipping.
+    bias_data = [-1000.0, 20.0]
+
+    result = run_kernel(
+        kernel=kernel,
+        kernel_source=source,
+        inputs={"A": a_data, "B": b_data, "bias": bias_data},
+        output_name="out",
+        output_size=M * N,
+        dim_args={"M": M, "N": N, "K": K},
+    )
+
+    # Reference: C = relu(A @ B + bias)
+    expected = _python_matmul(a_data, b_data, M, K, N)
+    for i in range(M):
+        for j in range(N):
+            expected[i * N + j] += bias_data[j]
+            expected[i * N + j] = max(0.0, expected[i * N + j])
+
+    assert len(result.output) == len(expected)
+    for idx, (got, exp) in enumerate(zip(result.output, expected, strict=True)):
+        assert abs(got - exp) < 1e-4, f"[{idx}] got {got}, expected {exp}"
+    # Verify ReLU clipping actually occurred (col 0 should be 0).
+    for i in range(M):
+        assert result.output[i * N + 0] == 0.0, f"Row {i} col 0 should be 0 (ReLU clipped)"

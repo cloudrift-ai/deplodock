@@ -114,14 +114,10 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
 
     # Check for contraction pattern: exactly 2 ops (mul + sum), two 2D inputs
     # sharing a dimension that gets reduced, producing a 2D output.
-    is_contraction, a_name, b_name, m, n, k = _detect_contraction(
-        region, phases, shapes, input_access
-    )
+    is_contraction, a_name, b_name, m, n, k = _detect_contraction(region, phases, shapes, input_access)
 
     if is_contraction:
-        epilogue_per_elem = _epilogue_needs_per_element(
-            region, phases, shapes, input_access
-        )
+        epilogue_per_elem = _epilogue_needs_per_element(region, phases, shapes, input_access)
         return TileAnalysis(
             pattern="contraction",
             op_phases=phases,
@@ -144,9 +140,7 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
         rows = 1
         cols = math.prod(d for d in pre_shape if isinstance(d, int))
 
-    epilogue_per_elem = _epilogue_needs_per_element(
-        region, phases, shapes, input_access
-    )
+    epilogue_per_elem = _epilogue_needs_per_element(region, phases, shapes, input_access)
 
     if epilogue_per_elem:
         pattern = "reduce_broadcast"
@@ -278,9 +272,7 @@ def _epilogue_needs_per_element(
         return False
 
     epilogue_needs = _needed_by(phases.epilogue) | _needed_by(
-        phases.prologue
-        if any(node_id in _needed_by(phases.epilogue) for node_id, _, _ in phases.prologue)
-        else []
+        phases.prologue if any(node_id in _needed_by(phases.epilogue) for node_id, _, _ in phases.prologue) else []
     )
 
     # Check if any external input needed by epilogue is non-scalar.

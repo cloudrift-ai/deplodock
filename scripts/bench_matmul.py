@@ -97,8 +97,10 @@ def _lower_matmul(graph: Graph):
         output_names=[c_name],
     )
     shapes = {
-        a_name: input_a.output.shape, b_name: input_b.output.shape,
-        ew_node.id: ew_node.output.shape, c_name: out_node.output.shape,
+        a_name: input_a.output.shape,
+        b_name: input_b.output.shape,
+        ew_node.id: ew_node.output.shape,
+        c_name: out_node.output.shape,
     }
     strategy = graph.hints.prefix("cuda.matmul").get("strategy", "naive")
     return lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)

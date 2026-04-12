@@ -135,6 +135,35 @@ def test_contraction_matmul():
     assert analysis.contraction_b == "B"
 
 
+def test_contraction_with_epilogue():
+    """Contraction + bias add epilogue is still classified as contraction."""
+    region = FusedRegionOp(
+        region_ops=[
+            ("ew", ElementwiseOp("mul"), ["A", "B"]),
+            ("red", ReduceOp("sum", axis=1), ["ew"]),
+            ("ba", ElementwiseOp("add"), ["red", "bias"]),
+        ],
+        input_names=["A", "B", "bias"],
+        output_names=["ba"],
+    )
+    shapes = {
+        "A": (4, 8),
+        "B": (8, 6),
+        "ew": (4, 8, 6),
+        "red": (4, 6),
+        "bias": (6,),
+        "ba": (4, 6),
+    }
+    analysis = _analyze_manual(region, shapes)
+    assert analysis.pattern == "contraction"
+    assert analysis.rows == 4
+    assert analysis.cols == 6
+    assert analysis.k_dim == 8
+    assert len(analysis.op_phases.epilogue) == 1
+    epi_nid, epi_op, epi_inputs = analysis.op_phases.epilogue[0]
+    assert epi_op.fn == "add"
+
+
 def test_input_access_patterns():
     """Verify AccessPattern classification for different input shapes."""
     g = Graph()

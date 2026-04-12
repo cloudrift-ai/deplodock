@@ -81,18 +81,52 @@ def _compile_matmul(op: OpKernel) -> Launch:
     n = op.params.get("N", 1)
     k = op.params.get("K", 1)
 
-    # Build a FusedRegionOp for the matmul pattern.
+    # Build a FusedRegionOp for the matmul pattern, including epilogue ops.
     a_buf, b_buf = op.inputs[0], op.inputs[1]
     c_buf = op.outputs[0]
-    region = FusedRegionOp(
-        region_ops=[
-            ("ew", ElementwiseOp("mul"), [a_buf, b_buf]),
-            ("red", ReduceOp("sum", axis=1), ["ew"]),
-        ],
-        input_names=[a_buf, b_buf],
-        output_names=[c_buf],
-    )
-    shapes = {a_buf: (m, k), b_buf: (k, n), "ew": (m, k, n), c_buf: (m, n)}
+    all_region_ops = op.params.get("_region_ops", [])
+    has_epilogue = len(all_region_ops) > 2
+
+    if has_epilogue:
+        # Use the full region_ops (contraction core + epilogue).
+        region_ops_list = list(all_region_ops)
+        # Collect extra external inputs from epilogue ops.
+        internal_ids = {rid for rid, _, _ in region_ops_list}
+        extra_inputs = []
+        for _rid, _eop, epi_inputs in region_ops_list[2:]:
+            for inp in epi_inputs:
+                if inp not in internal_ids and inp != a_buf and inp != b_buf and inp not in extra_inputs:
+                    extra_inputs.append(inp)
+        input_names = [a_buf, b_buf] + extra_inputs
+        region = FusedRegionOp(
+            region_ops=region_ops_list,
+            input_names=input_names,
+            output_names=[c_buf],
+        )
+        shapes = {a_buf: (m, k), b_buf: (k, n)}
+        # Contraction intermediate shapes.
+        ew_id = region_ops_list[0][0]
+        red_id = region_ops_list[1][0]
+        shapes[ew_id] = (m, k, n)
+        shapes[red_id] = (m, n)
+        # Epilogue ops preserve matmul output shape.
+        input_shapes = op.params.get("_input_shapes", {})
+        for rid, _, _ in region_ops_list[2:]:
+            shapes[rid] = (m, n)
+        for inp in extra_inputs:
+            shapes[inp] = input_shapes.get(inp, (n,))
+        shapes[c_buf] = (m, n)
+    else:
+        region = FusedRegionOp(
+            region_ops=[
+                ("ew", ElementwiseOp("mul"), [a_buf, b_buf]),
+                ("red", ReduceOp("sum", axis=1), ["ew"]),
+            ],
+            input_names=[a_buf, b_buf],
+            output_names=[c_buf],
+        )
+        shapes = {a_buf: (m, k), b_buf: (k, n), "ew": (m, k, n), c_buf: (m, n)}
+        extra_inputs = []
 
     # Determine strategy and tile parameters from hints + tuning profile.
     explicit_hints = op.params.get("_hints", {})
@@ -115,9 +149,32 @@ def _compile_matmul(op: OpKernel) -> Launch:
     # Explicit hints override tuning defaults.
     for hk, hv in explicit_hints.items():
         if hk.startswith("cuda.matmul."):
-            matmul_hints[hk[len("cuda.matmul."):]] = hv
+            matmul_hints[hk[len("cuda.matmul.") :]] = hv
 
     strategy = matmul_hints.get("strategy", "tma_db")
+
+    # Epilogue ops are incompatible with k_splits > 1 (partial sums
+    # from each split cannot have epilogue applied before reduction).
+    if has_epilogue:
+        matmul_hints["k_splits"] = 1
+
+    # M-aware k_splits: when M is small relative to the tile size, the grid
+    # has too few blocks to fill the GPU. Increase k_splits to add blocks
+    # along the K dimension.
+    if not has_epilogue:
+        tile_m_val = 64  # must match tiled.py
+        tile_n_val = 128  # must match tiled.py
+        if m < tile_m_val:
+            grid_m = _cd(m, tile_m_val)
+            grid_n = _cd(n, tile_n_val)
+            grid_blocks = grid_m * grid_n
+            target_blocks = 170  # approximate SM count
+            bk_est = int(matmul_hints.get("block_k", 32))
+            max_ks = k // bk_est if bk_est > 0 else 1
+            desired_ks = min(target_blocks // max(grid_blocks, 1), max_ks)
+            desired_ks = min(desired_ks, 8)
+            if desired_ks > 1:
+                matmul_hints["k_splits"] = desired_ks
 
     # Validate BK and k_splits against actual K dimension.
     bk_val = int(matmul_hints.get("block_k", 32))
@@ -181,7 +238,8 @@ def _compile_matmul(op: OpKernel) -> Launch:
         ]
 
         # TMA: only C is a regular param. A/B come via descriptors.
-        args = [*op.outputs]
+        # Epilogue external inputs come before the output (matching kernel param order).
+        args = [*extra_inputs, *op.outputs]
         if k_splits > 1:
             args.append(str(k_splits))
     else:
@@ -201,12 +259,13 @@ def _compile_matmul(op: OpKernel) -> Launch:
 
 
 def _is_matmul_region(op: OpKernel) -> tuple[bool, int, int, int]:
-    """Check if a fused region is a 2-op Reduce{sum}(Elementwise{mul}(A, B)).
+    """Check if a fused region has a contraction core: Reduce{sum}(Elementwise{mul}(A, B)).
 
+    Allows optional pointwise epilogue ops after the core (e.g. bias add, activation).
     Returns (is_matmul, M, N, K) where M, N, K are inferred from shapes.
     """
     region_ops = op.params.get("_region_ops", [])
-    if len(region_ops) != 2:
+    if len(region_ops) < 2:
         return False, 0, 0, 0
     _, op0, inputs0 = region_ops[0]
     _, op1, _ = region_ops[1]
@@ -214,6 +273,23 @@ def _is_matmul_region(op: OpKernel) -> tuple[bool, int, int, int]:
 
     if not (isinstance(op0, ElementwiseOp) and op0.fn == "mul" and isinstance(op1, ReduceOp) and op1.fn == "sum"):
         return False, 0, 0, 0
+
+    # The mul must be a broadcast (matmul-style): two distinct inputs whose
+    # shapes produce a higher-dimensional output. Self-multiplies like
+    # mul(x, x) in RMSNorm are NOT contractions.
+    if len(inputs0) != 2 or inputs0[0] == inputs0[1]:
+        return False, 0, 0, 0
+    input_shapes = op.params.get("_input_shapes", {})
+    a_shape = input_shapes.get(inputs0[0])
+    b_shape = input_shapes.get(inputs0[1])
+    if a_shape and b_shape and a_shape == b_shape:
+        return False, 0, 0, 0  # same-shape mul → not a matmul
+
+    # Remaining ops (index 2+) must all be pointwise epilogue.
+    for i in range(2, len(region_ops)):
+        _, epi_op, _ = region_ops[i]
+        if not isinstance(epi_op, ElementwiseOp):
+            return False, 0, 0, 0
 
     # Output shape may be multi-dimensional (batched): (batch, seq_len, N).
     # M = product of all dims except the last, N = last dim.
@@ -456,12 +532,12 @@ def _compile_singleton(op: OpKernel) -> Launch:
     if tag.startswith("elementwise_"):
         from deplodock.compiler.ops import ElementwiseOp
 
-        fn = tag[len("elementwise_"):]
+        fn = tag[len("elementwise_") :]
         prim_op = ElementwiseOp(fn=fn)
     elif tag.startswith("reduce_"):
         from deplodock.compiler.ops import ReduceOp
 
-        fn = tag[len("reduce_"):]
+        fn = tag[len("reduce_") :]
         axis = op.params.get("axis", -1)
         prim_op = ReduceOp(fn=fn, axis=axis)
     else:
