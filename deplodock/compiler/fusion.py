@@ -250,29 +250,29 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
     #    which use dedicated A/B indexing.
     is_pure_contraction = has_contraction
 
-    # 5. Dimensionality: the codegen uses 2D indexing (row*cols+j).
-    #    Ops with >2 non-trivial concrete dims can't be in a fused region
-    #    (except contraction broadcast muls which are handled separately).
+    # 5. Dimensionality: reject ops whose output has MORE non-trivial dims
+    #    than all inputs (broadcast expansion like matmul's A(M,K)×B(K,N)→(M,K,N)).
+    #    Same-rank >2D ops are fine — the codegen flattens leading dims into
+    #    rows and keeps the last dim as cols (e.g. (1,28,32,32) → rows=896, cols=32).
     for nid in merged:
-        shape = graph.nodes[nid].output.shape
+        node = graph.nodes[nid]
+        shape = node.output.shape
         concrete_dims = [d for d in shape if isinstance(d, int) and d > 1]
         if len(concrete_dims) > 2:
-            # Allow standard matmul broadcast muls where inputs are ≤2D.
-            # Attention-style broadcasts (4D×4D→5D) are NOT allowed.
-            from deplodock.compiler.ops import ElementwiseOp as _EwOp
-
-            if isinstance(graph.nodes[nid].op, _EwOp) and graph.nodes[nid].op.fn == "mul":
-                inp_max_dims = 0
-                for inp_id in graph.nodes[nid].inputs:
-                    if inp_id in graph.nodes:
-                        inp_concrete = [d for d in graph.nodes[inp_id].output.shape if isinstance(d, int) and d > 1]
-                        inp_max_dims = max(inp_max_dims, len(inp_concrete))
-                if inp_max_dims <= 2:
-                    continue  # Standard matmul broadcast — OK
-            return False
+            # Check if this op expanded rank beyond its inputs (broadcast).
+            inp_max_concrete = 0
+            for inp_id in node.inputs:
+                if inp_id in graph.nodes:
+                    inp_concrete = [d for d in graph.nodes[inp_id].output.shape if isinstance(d, int) and d > 1]
+                    inp_max_concrete = max(inp_max_concrete, len(inp_concrete))
+            if len(concrete_dims) > inp_max_concrete and inp_max_concrete > 0:
+                # Broadcast expansion — only allow standard 2D matmul broadcasts.
+                if inp_max_concrete <= 2:
+                    continue  # Standard matmul broadcast (2D→3D) — OK
+                return False  # Higher-dim broadcast (4D→5D) — reject
 
     if not is_pure_contraction:
-        sizes_2d: set[int] = set()
+        sizes_full: set[int] = set()
         for nid in merged:
             node = graph.nodes[nid]
             for inp_id in node.inputs:
@@ -281,12 +281,15 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
                     inp_size = _tensor_size(inp_shape)
                     if inp_size <= 1:
                         continue
-                    if len(inp_shape) >= 2 and all((isinstance(d, int) and d == 1) for d in inp_shape[1:]):
-                        continue  # per-row scalar like (N, 1)
                     if len(inp_shape) == 1:
                         continue  # 1D vector — uses [j] indexing
-                    sizes_2d.add(inp_size)
-        if len(sizes_2d) > 1:
+                    # Per-row scalar: last dim is 1 (e.g., (N,1) or (1,28,32,1)).
+                    # These are indexed by row only, not by column.
+                    last_dim = inp_shape[-1] if inp_shape else 1
+                    if isinstance(last_dim, int) and last_dim == 1:
+                        continue
+                    sizes_full.add(inp_size)
+        if len(sizes_full) > 1:
             return False
 
     # 5. Single-output: the merged region must have at most one external output.

@@ -66,6 +66,10 @@ class Program:
     launches: list[Launch]
     defines: dict[str, str] = field(default_factory=dict)
     includes: list[str] = field(default_factory=list)
+    # Buffer aliases: {alias_name: target_name}. The alias shares the
+    # target's device pointer (no separate allocation). Used for
+    # reshape/transpose which are metadata-only ops.
+    aliases: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -115,15 +119,21 @@ def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 
     # Host main.
     parts.append("int main() {")
 
-    # Allocate buffers.
+    # Allocate buffers. Aliased buffers share the target's device pointer.
+    aliased = set(program.aliases.keys())
     for buf in program.buffers:
+        if buf.name in aliased:
+            continue  # will be assigned after all allocations
         parts.append(f"    {buf.dtype}* d_{buf.name};")
         parts.append(f"    cudaMalloc(&d_{buf.name}, {buf.size} * sizeof({buf.dtype}));")
+    for alias_name, target_name in program.aliases.items():
+        buf = next(b for b in program.buffers if b.name == alias_name)
+        parts.append(f"    {buf.dtype}* d_{alias_name} = d_{target_name};")
     parts.append("")
 
     # Initialize inputs and constants with pseudorandom data.
     for buf in program.buffers:
-        if buf.role in ("input", "constant"):
+        if buf.role in ("input", "constant") and buf.name not in aliased:
             parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
             parts.append(f"      for (int i = 0; i < {buf.size}; i++) h[i] = 0.01f * ((i * 7 + 13) % 101 - 50);")
             parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
@@ -180,9 +190,10 @@ def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 
             parts.append("      free(h); }")
     parts.append("")
 
-    # Free.
+    # Free (skip aliases — they share another buffer's allocation).
     for buf in program.buffers:
-        parts.append(f"    cudaFree(d_{buf.name});")
+        if buf.name not in aliased:
+            parts.append(f"    cudaFree(d_{buf.name});")
     parts.append("    return 0;")
     parts.append("}")
 

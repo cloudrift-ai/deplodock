@@ -219,9 +219,11 @@ def _input_expr(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 
             return ArrayAccess(safe, BinOp("%", Var("i"), Literal(acc.size, "int")))
         return ArrayAccess(safe, Var("i"))
 
-    # row_reduce / reduce_broadcast: index by [row * cols + j] or [j] or [0]
+    # row_reduce / reduce_broadcast: index by [row * cols + j] or [j] or [row] or [0]
     if acc.is_2d:
         return ArrayAccess(safe, BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j")))
+    if acc.is_per_row:
+        return ArrayAccess(safe, Var("row"))
     if acc.is_row_vector:
         return ArrayAccess(safe, Var("j"))
     if acc.is_scalar:

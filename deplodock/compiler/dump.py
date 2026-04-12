@@ -106,6 +106,7 @@ class CompilerDump:
         summary = {
             "name": program.name,
             "buffers": [{"name": b.name, "size": b.size, "dtype": b.dtype, "role": b.role} for b in program.buffers],
+            "aliases": program.aliases,
             "launches": [
                 {
                     "kernel_name": launch.kernel_name,

@@ -34,6 +34,7 @@ class AccessPattern:
     is_scalar: bool  # size == 1 (broadcast everywhere)
     is_row_vector: bool  # 1D, indexed by column only
     is_2d: bool  # indexed by both row and column
+    is_per_row: bool = False  # last dim == 1, indexed by row only (e.g., (N,1) or (1,28,32,1))
 
 
 @dataclass
@@ -86,12 +87,18 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
         inp_shape = shapes.get(inp, (1,))
         inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
         has_symbolic = any(isinstance(d, str) for d in inp_shape)
+        # Per-row scalar: last dim is 1 with >1 total elements.
+        # Covers both (N, 1) and (1, 28, 32, 1) — indexed by row only.
+        last_dim = inp_shape[-1] if inp_shape else 1
+        last_dim_is_one = isinstance(last_dim, int) and last_dim == 1
+        is_per_row = last_dim_is_one and inp_size > 1 and len(inp_shape) >= 2
         input_access[inp] = AccessPattern(
             shape=inp_shape,
             size=inp_size,
             is_scalar=(inp_size == 1 and not has_symbolic),
             is_row_vector=(len(inp_shape) == 1 and (inp_size > 1 or has_symbolic)),
-            is_2d=(len(inp_shape) >= 2 and (inp_size > 1 or has_symbolic)),
+            is_2d=(len(inp_shape) >= 2 and (inp_size > 1 or has_symbolic) and not is_per_row),
+            is_per_row=is_per_row,
         )
 
     # No reduces → pointwise.
@@ -275,11 +282,13 @@ def _epilogue_needs_per_element(
         phases.prologue if any(node_id in _needed_by(phases.epilogue) for node_id, _, _ in phases.prologue) else []
     )
 
-    # Check if any external input needed by epilogue is non-scalar.
+    # Check if any external input needed by epilogue requires per-element
+    # access (is_2d). Per-row and scalar inputs are available during the
+    # reduce pass and don't need a second per-element loop.
     for inp in region.input_names:
         if inp in epilogue_needs:
             acc = input_access.get(inp)
-            if acc and acc.size > 1:
+            if acc and acc.is_2d:
                 return True
 
     # Check if any prologue op needed by epilogue (transitive 2D dependency).
