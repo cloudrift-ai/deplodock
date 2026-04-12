@@ -114,10 +114,11 @@ async def run_command_workload(
 
     # Prepend env exports if any. Values are template-substituted with the
     # same map as the run command so $task_dir etc. resolve correctly.
+    # Uses `export K=V;` so vars persist across the multi-line script.
     if cmd_cfg.env:
         resolved_env = {k: Template(v).safe_substitute(subs) for k, v in cmd_cfg.env.items()}
-        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in resolved_env.items())
-        rendered_with_env = f"{env_prefix} {rendered}"
+        env_lines = "\n".join(f"export {k}={shlex.quote(v)}" for k, v in resolved_env.items())
+        rendered_with_env = f"{env_lines}\n{rendered}"
     else:
         rendered_with_env = rendered
 
