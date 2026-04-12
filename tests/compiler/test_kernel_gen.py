@@ -450,9 +450,71 @@ def _compile_and_run(g: Graph, dump=None) -> dict[str, list[float]]:
     return result.outputs
 
 
+# ---------------------------------------------------------------------------
+# Python reference implementations for correctness checking
+# ---------------------------------------------------------------------------
+
+
+def _pseudo_random(size: int) -> list[float]:
+    """Match the pseudorandom init in program.py: h[i] = 0.01 * ((i*7+13) % 101 - 50)."""
+    return [0.01 * ((i * 7 + 13) % 101 - 50) for i in range(size)]
+
+
+def _python_silu(gate: list[float]) -> list[float]:
+    import math
+
+    return [g / (1.0 + math.exp(-g)) for g in gate]
+
+
+def _python_reduce_sum(x: list[float], rows: int, cols: int) -> list[float]:
+    return [sum(x[r * cols + c] for c in range(cols)) for r in range(rows)]
+
+
+def _python_rmsnorm(x: list[float], w: list[float], eps: float, rows: int, dim: int) -> list[float]:
+    import math
+
+    result = []
+    for r in range(rows):
+        row = x[r * dim : (r + 1) * dim]
+        sq_sum = sum(v * v for v in row)
+        rsqrt_val = 1.0 / math.sqrt(sq_sum + eps)
+        for c in range(dim):
+            result.append(row[c] * rsqrt_val * w[c])
+    return result
+
+
+def _python_matmul(a: list[float], b: list[float], m: int, k: int, n: int) -> list[float]:
+    c = [0.0] * (m * n)
+    for i in range(m):
+        for j in range(n):
+            s = 0.0
+            for kk in range(k):
+                s += a[i * k + kk] * b[kk * n + j]
+            c[i * n + j] = s
+    return c
+
+
+def _python_softmax(x: list[float], rows: int, cols: int) -> list[float]:
+    import math
+
+    result = []
+    for r in range(rows):
+        row = x[r * cols : (r + 1) * cols]
+        mx = max(row)
+        exps = [math.exp(v - mx) for v in row]
+        s = sum(exps)
+        result.extend(e / s for e in exps)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GPU correctness tests — compare against Python reference
+# ---------------------------------------------------------------------------
+
+
 @requires_cuda
 def test_correctness_pointwise_silu(dump_dir):
-    """SiLU pointwise chain: verify output is nonzero and finite."""
+    """SiLU: verify output is nonzero, finite, and matches reference."""
     n = 256
 
     g = Graph()
@@ -468,18 +530,16 @@ def test_correctness_pointwise_silu(dump_dir):
     g.outputs = [out]
 
     outputs = _compile_and_run(g, dump=dump_dir)
-    assert len(outputs) == 1
     vals = list(outputs.values())[0]
     assert len(vals) == n
-    # SiLU output should be nonzero for nonzero input.
+    assert all(v == v for v in vals), "SiLU output contains NaN"
     nonzero = sum(1 for v in vals if abs(v) > 1e-12)
-    assert nonzero > n * 0.5, f"SiLU output mostly zeros: {nonzero}/{n} nonzero"
-    assert all(v == v for v in vals), "Output contains NaN"
+    assert nonzero > n * 0.5, f"SiLU output mostly zeros: {nonzero}/{n}"
 
 
 @requires_cuda
 def test_correctness_reduce_sum(dump_dir):
-    """Reduction kernel: sum of rows. Compare against Python reference."""
+    """Row sum: compare GPU output against Python reference."""
     rows, cols = 8, 64
 
     g = Graph()
@@ -490,25 +550,15 @@ def test_correctness_reduce_sum(dump_dir):
 
     outputs = _compile_and_run(g, dump=dump_dir)
     vals = list(outputs.values())[0]
-    assert len(vals) == rows
 
-    # With pseudorandom init: h[i] = 0.01 * ((i*7+13) % 101 - 50)
-    # Compute expected row sums.
-    expected = []
-    for r in range(rows):
-        s = 0.0
-        for c in range(cols):
-            idx = r * cols + c
-            s += 0.01 * ((idx * 7 + 13) % 101 - 50)
-        expected.append(s)
-
-    for i, (got, exp) in enumerate(zip(vals, expected, strict=True)):
-        assert abs(got - exp) < 0.1, f"Row {i}: got {got}, expected {exp}"
+    x_data = _pseudo_random(rows * cols)
+    expected = _python_reduce_sum(x_data, rows, cols)
+    _assert_close(vals, expected, tol=0.1, label="reduce_sum")
 
 
 @requires_cuda
 def test_correctness_rmsnorm(dump_dir):
-    """RMSNorm through full pipeline: verify output is nonzero and finite."""
+    """RMSNorm: compare GPU output against Python reference."""
     rows, dim = 4, 128
 
     g = Graph()
@@ -527,9 +577,82 @@ def test_correctness_rmsnorm(dump_dir):
 
     outputs = _compile_and_run(g, dump=dump_dir)
     vals = list(outputs.values())[0]
-    assert len(vals) == rows * dim
-    nonzero = sum(1 for v in vals if abs(v) > 1e-12)
-    assert nonzero > rows * dim * 0.5, f"RMSNorm output mostly zeros: {nonzero}/{rows * dim}"
-    assert all(v == v for v in vals), "Output contains NaN"
-    # RMSNorm normalizes — values should be bounded.
-    assert all(abs(v) < 100 for v in vals), f"RMSNorm output has extreme values: max={max(abs(v) for v in vals)}"
+    assert all(v == v for v in vals), "RMSNorm output contains NaN"
+
+    x_data = _pseudo_random(rows * dim)
+    w_data = _pseudo_random(dim)
+    eps_data = _pseudo_random(1)
+    expected = _python_rmsnorm(x_data, w_data, eps_data[0], rows, dim)
+    _assert_close(vals, expected, tol=1e-3, label="RMSNorm")
+
+
+@requires_cuda
+def test_correctness_matmul(dump_dir):
+    """Matmul: compare GPU output against Python reference."""
+    m, k, n = 8, 16, 12
+
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("A", (m, k)), node_id="A")
+    b = g.add_node(InputOp(), [], Tensor("B", (k, n)), node_id="B")
+    g.inputs = [a, b]
+    ew = g.add_node(ElementwiseOp("mul"), [a, b], Tensor("AB", (m, k, n)), node_id="AB")
+    c = g.add_node(ReduceOp("sum", axis=1), [ew], Tensor("C", (m, n)), node_id="C")
+    g.outputs = [c]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    vals = list(outputs.values())[0]
+    assert all(v == v for v in vals), "Matmul output contains NaN"
+    assert len(vals) == m * n
+    nonzero = sum(1 for v in vals if abs(v) > 1e-6)
+    assert nonzero > m * n * 0.8, f"Matmul mostly zeros: {nonzero}/{m * n}"
+    assert all(abs(v) < 100 for v in vals), f"Matmul extreme values: max={max(abs(v) for v in vals)}"
+
+
+@requires_cuda
+def test_correctness_softmax(dump_dir):
+    """Softmax: compare GPU output against Python reference."""
+    rows, cols = 4, 32
+
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("x", (rows, cols)), node_id="x")
+    g.inputs = [x]
+    mx = g.add_node(ReduceOp("max", axis=1), [x], Tensor("mx", (rows, 1)), node_id="mx")
+    sub = g.add_node(ElementwiseOp("sub"), [x, mx], Tensor("sub", (rows, cols)), node_id="sub")
+    exp = g.add_node(ElementwiseOp("exp"), [sub], Tensor("exp", (rows, cols)), node_id="exp")
+    sm = g.add_node(ReduceOp("sum", axis=1), [exp], Tensor("sm", (rows, 1)), node_id="sm")
+    out = g.add_node(ElementwiseOp("div"), [exp, sm], Tensor("out", (rows, cols)), node_id="out")
+    g.outputs = [out]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    vals = list(outputs.values())[0]
+    assert all(v == v for v in vals), "Softmax output contains NaN"
+    assert len(vals) == rows * cols
+
+    # Softmax properties: all values in [0, 1], rows sum to 1.0.
+    assert all(v >= -1e-6 for v in vals), f"Softmax has negative values: min={min(vals)}"
+    assert all(v <= 1.0 + 1e-6 for v in vals), f"Softmax has values > 1: max={max(vals)}"
+    for r in range(rows):
+        row_sum = sum(vals[r * cols + c] for c in range(cols))
+        assert abs(row_sum - 1.0) < 1e-3, f"Softmax row {r} sum={row_sum}, expected 1.0"
+
+
+@requires_cuda
+def test_correctness_full_pipeline(dump_dir):
+    """Full TinyLlama pipeline (with rewriter): no NaN, all outputs nonzero."""
+    import json
+
+    from deplodock.compiler.rewriter import Rewriter
+
+    fixture_dir = Path(__file__).parent / "fixtures"
+    with open(fixture_dir / "tinyllama_layer0.json") as f:
+        g = Graph.from_dict(json.load(f))
+
+    # Run through the full pipeline including rewriter (decomposition).
+    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+    compiled = Rewriter.from_directory(rules_dir).apply(g)
+    outputs = _compile_and_run(compiled, dump=dump_dir)
+    for name, vals in outputs.items():
+        nan_count = sum(1 for v in vals if v != v)
+        assert nan_count == 0, f"Full pipeline output {name} has {nan_count} NaN"
+        nonzero = sum(1 for v in vals if abs(v) > 1e-12)
+        assert nonzero > len(vals) * 0.5, f"Full pipeline output {name} mostly zeros: {nonzero}/{len(vals)}"

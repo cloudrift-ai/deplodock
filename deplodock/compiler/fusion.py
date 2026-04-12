@@ -206,12 +206,11 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
         if non_contraction:
             return False  # Only contraction ops allowed in contraction regions.
 
-    # 3. Reduce compatibility: all reduces in the merged region must be compatible.
+    # 3. Single reduce: the codegen only supports one reduction pass per kernel.
+    #    Multi-reduce patterns (softmax max+sum) need multi-pass codegen (future).
     reduce_ids = [nid for nid in merged if isinstance(graph.nodes[nid].op, ReduceOp)]
-    for i, ri in enumerate(reduce_ids):
-        for rj in reduce_ids[i + 1:]:
-            if not _reduces_compatible(ri, rj, graph):
-                return False
+    if len(reduce_ids) > 1:
+        return False
 
     # 4. Shape compatibility: all 2D+ external inputs must have the same total
     #    size (the kernel uses a single row*cols+j index for all).
