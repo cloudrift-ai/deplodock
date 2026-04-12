@@ -16,7 +16,7 @@ command:
       --seq-len $seq_len \
       --batch $batch \
       --iters $iterations \
-      --dtype fp16 \
+      --dtype $dtype \
       --backends $backends \
       2>&1 | tee $task_dir/bench_block.log
   result_files:
@@ -30,6 +30,9 @@ matrices:
       - "NVIDIA GeForce RTX 5090"
     git_rev: "feature/transformer-compiler@local"
     hf_model: "Qwen/Qwen2.5-7B"
+    dtype:
+      - fp32        # Deplodock currently generates FP32 only
+      - fp16        # Real-world comparison (eager/compile use half + tensor cores)
     seq_len: [32, 128, 512]
     batch: 1
     iterations: 20
