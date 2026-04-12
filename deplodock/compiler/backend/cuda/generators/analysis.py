@@ -59,6 +59,9 @@ class TileAnalysis:
     contraction_b: str | None = None
     # Whether the epilogue needs a second per-element pass over inputs.
     epilogue_needs_per_element: bool = False
+    # Batch dimensions for batched contractions (e.g. multi-head attention).
+    batch_dims: tuple[int, ...] = ()
+    batch_size: int = 1
 
 
 def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
@@ -121,7 +124,7 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
 
     # Check for contraction pattern: exactly 2 ops (mul + sum), two 2D inputs
     # sharing a dimension that gets reduced, producing a 2D output.
-    is_contraction, a_name, b_name, m, n, k = _detect_contraction(region, phases, shapes, input_access)
+    is_contraction, a_name, b_name, m, n, k, batch_dims, batch_size = _detect_contraction(region, phases, shapes, input_access)
 
     if is_contraction:
         epilogue_per_elem = _epilogue_needs_per_element(region, phases, shapes, input_access)
@@ -137,6 +140,8 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
             contraction_a=a_name,
             contraction_b=b_name,
             epilogue_needs_per_element=epilogue_per_elem,
+            batch_dims=batch_dims,
+            batch_size=batch_size,
         )
 
     # Row reduction patterns — extract rows/cols from pre-reduction shape.
@@ -198,7 +203,7 @@ def _detect_contraction(
     phases: OpPhases,
     shapes: dict[str, tuple],
     input_access: dict[str, AccessPattern],
-) -> tuple[bool, str | None, str | None, int, int, int]:
+) -> tuple[bool, str | None, str | None, int, int, int, tuple[int, ...], int]:
     """Detect if region is a contraction (matmul-like) pattern.
 
     A contraction requires:
@@ -207,16 +212,16 @@ def _detect_contraction(
     - The two inputs share a dimension (K) that gets reduced
     - Output is 2D (M, N)
 
-    Returns: (is_contraction, a_name, b_name, M, N, K)
+    Returns: (is_contraction, a_name, b_name, M, N, K, batch_dims, batch_size)
     """
     if not phases.reduces:
-        return False, None, None, 0, 0, 0
+        return False, None, None, 0, 0, 0, (), 1
 
     # The first reduce must be sum.
     first_reduce = phases.reduces[0]
     _, reduce_op, _ = first_reduce
     if reduce_op.fn != "sum":
-        return False, None, None, 0, 0, 0
+        return False, None, None, 0, 0, 0, (), 1
 
     # Find the binary mul in prologue that feeds the reduce.
     mul_entry = None
@@ -227,40 +232,58 @@ def _detect_contraction(
             break
 
     if mul_entry is None:
-        return False, None, None, 0, 0, 0
+        return False, None, None, 0, 0, 0, (), 1
 
     _, _, mul_inputs = mul_entry
     a_id, b_id = mul_inputs[0], mul_inputs[1]
 
-    # Both inputs must be external (in region.input_names) and 2D.
+    # Both inputs must be external (in region.input_names) and >=2D.
     if a_id not in input_access or b_id not in input_access:
-        return False, None, None, 0, 0, 0
+        return False, None, None, 0, 0, 0, (), 1
 
     a_acc = input_access[a_id]
     b_acc = input_access[b_id]
 
     if not a_acc.is_2d or not b_acc.is_2d:
-        return False, None, None, 0, 0, 0
+        return False, None, None, 0, 0, 0, (), 1
 
-    # A(M, K) @ B(K, N): A's last dim == B's first dim.
+    # A(M, K) @ B(K, N) or A(B..., M, K) @ B(B..., K, N).
     a_shape = a_acc.shape
     b_shape = b_acc.shape
 
     if len(a_shape) < 2 or len(b_shape) < 2:
-        return False, None, None, 0, 0, 0
+        return False, None, None, 0, 0, 0, (), 1
 
-    a_k = a_shape[-1]
-    b_k = b_shape[0]
+    # Detect batch dimensions: leading dims that match between A and B.
+    batch_dims: tuple[int, ...] = ()
+    batch_size = 1
+    if len(a_shape) > 2 and len(b_shape) > 2:
+        a_batch = a_shape[:-2]
+        b_batch = b_shape[:-2]
+        if a_batch != b_batch:
+            return False, None, None, 0, 0, 0, (), 1
+        batch_dims = a_batch
+        batch_size = math.prod(d for d in batch_dims if isinstance(d, int))
+        # Batched: A(B..., M, K) @ B(B..., K, N)
+        a_k = a_shape[-1]
+        b_k = b_shape[-2]
+    else:
+        # 2D: A(M, K) @ B(K, N)
+        a_k = a_shape[-1]
+        b_k = b_shape[0]
 
     # K dimension must match (both int or both same symbolic string).
     if a_k != b_k:
-        return False, None, None, 0, 0, 0
+        return False, None, None, 0, 0, 0, (), 1
 
-    m = math.prod(d for d in a_shape[:-1] if isinstance(d, int)) if any(isinstance(d, int) for d in a_shape[:-1]) else 1
+    m = a_shape[-2] if isinstance(a_shape[-2], int) else 1
+    if not batch_dims:
+        # 2D: M = product of all dims except last
+        m = math.prod(d for d in a_shape[:-1] if isinstance(d, int)) if any(isinstance(d, int) for d in a_shape[:-1]) else 1
     k = a_k if isinstance(a_k, int) else 1
     n = b_shape[-1] if isinstance(b_shape[-1], int) else 1
 
-    return True, a_id, b_id, m, n, k
+    return True, a_id, b_id, m, n, k, batch_dims, batch_size
 
 
 def _epilogue_needs_per_element(

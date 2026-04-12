@@ -656,3 +656,218 @@ def test_correctness_full_pipeline(dump_dir):
         assert nan_count == 0, f"Full pipeline output {name} has {nan_count} NaN"
         nonzero = sum(1 for v in vals if abs(v) > 1e-12)
         assert nonzero > len(vals) * 0.5, f"Full pipeline output {name} mostly zeros: {nonzero}/{len(vals)}"
+
+
+# ===========================================================================
+# Stage 1: Batched matmul tests
+# ===========================================================================
+
+
+def _python_batched_matmul(a: list[float], b: list[float], batch: int, m: int, k: int, n: int) -> list[float]:
+    """Per-batch matrix multiplication: a(batch, m, k) @ b(batch, k, n)."""
+    c = [0.0] * (batch * m * n)
+    for bi in range(batch):
+        for i in range(m):
+            for j in range(n):
+                s = 0.0
+                for kk in range(k):
+                    s += a[bi * m * k + i * k + kk] * b[bi * k * n + kk * n + j]
+                c[bi * m * n + i * n + j] = s
+    return c
+
+
+def _python_sdpa(
+    q: list[float],
+    k_mat: list[float],
+    v: list[float],
+    scale: float,
+    batch_heads: int,
+    seq_len: int,
+    head_dim: int,
+) -> list[float]:
+    """Full scaled dot-product attention reference."""
+    out = []
+    for b in range(batch_heads):
+        q_off = b * seq_len * head_dim
+        k_off = b * seq_len * head_dim
+        v_off = b * seq_len * head_dim
+        # QK^T: (seq_len, head_dim) @ (head_dim, seq_len)
+        # K^T = transpose K from (seq_len, head_dim) to (head_dim, seq_len)
+        scores = [0.0] * (seq_len * seq_len)
+        for i in range(seq_len):
+            for j in range(seq_len):
+                s = 0.0
+                for d in range(head_dim):
+                    s += q[q_off + i * head_dim + d] * k_mat[k_off + j * head_dim + d]
+                scores[i * seq_len + j] = s * scale
+        # Softmax over last dim
+        attn = _python_softmax(scores, seq_len, seq_len)
+        # attn @ V: (seq_len, seq_len) @ (seq_len, head_dim)
+        for i in range(seq_len):
+            for d in range(head_dim):
+                s = 0.0
+                for j in range(seq_len):
+                    s += attn[i * seq_len + j] * v[v_off + j * head_dim + d]
+                out.append(s)
+    return out
+
+
+def test_batched_matmul_detection():
+    """Batched 3D contraction is detected by auto_fuse and analyze()."""
+    from deplodock.compiler.backend.cuda.generators.analysis import analyze
+
+    batch, m, k, n = 2, 4, 8, 6
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("A", (batch, m, k)), node_id="A")
+    b = g.add_node(InputOp(), [], Tensor("B", (batch, k, n)), node_id="B")
+    g.inputs = [a, b]
+    # Broadcast mul + reduce_sum → contraction pattern
+    ew = g.add_node(ElementwiseOp("mul"), [a, b], Tensor("ew", (batch, m, k, n)), node_id="ew")
+    red = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("out", (batch, m, n)), node_id="out")
+    g.outputs = [red]
+
+    fused = auto_fuse(g)
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, FusedRegionOp)]
+    assert len(fused_nodes) == 1, f"Expected 1 fused region, got {len(fused_nodes)}"
+
+    # Analyze the fused region
+    nd = fused_nodes[0]
+    shapes = {nid: fused.nodes[nid].output.shape for nid in fused.nodes}
+    analysis = analyze(nd.op, shapes)
+    assert analysis.pattern == "contraction"
+    assert analysis.batch_size == batch
+    assert analysis.batch_dims == (batch,)
+    assert analysis.rows == m
+    assert analysis.cols == n
+    assert analysis.k_dim == k
+
+
+@requires_cuda
+def test_correctness_batched_matmul(dump_dir):
+    """Batched matmul: A(2,4,8) @ B(2,8,6) produces correct output."""
+    batch, m, k, n = 2, 4, 8, 6
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("A", (batch, m, k)), node_id="A")
+    b = g.add_node(InputOp(), [], Tensor("B", (batch, k, n)), node_id="B")
+    g.inputs = [a, b]
+    ew = g.add_node(ElementwiseOp("mul"), [a, b], Tensor("ew", (batch, m, k, n)), node_id="ew")
+    red = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("out", (batch, m, n)), node_id="out")
+    g.outputs = [red]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    assert len(outputs) == 1, f"Expected 1 output, got {len(outputs)}"
+    actual = list(outputs.values())[0]
+
+    a_data = _pseudo_random(batch * m * k)
+    b_data = _pseudo_random(batch * k * n)
+    expected = _python_batched_matmul(a_data, b_data, batch, m, k, n)
+
+    _assert_close(actual, expected, tol=1e-3, label="batched_matmul")
+
+
+@requires_cuda
+def test_correctness_attention_stage1(dump_dir):
+    """Full attention: decomposed SDPA through pipeline matches reference.
+
+    Exercises batched QK^T and attn@V as tiled GEMMs plus softmax kernels.
+    """
+    batch_heads, seq_len, head_dim = 2, 8, 4
+    scale = 1.0 / math.sqrt(head_dim)
+
+    g = Graph()
+    q = g.add_node(InputOp(), [], Tensor("Q", (batch_heads, seq_len, head_dim)), node_id="Q")
+    k_in = g.add_node(InputOp(), [], Tensor("K", (batch_heads, seq_len, head_dim)), node_id="K")
+    v = g.add_node(InputOp(), [], Tensor("V", (batch_heads, seq_len, head_dim)), node_id="V")
+    g.inputs = [q, k_in, v]
+
+    # K^T: transpose last two dims
+    from deplodock.compiler.ops import TransposeOp
+
+    kt = g.add_node(
+        TransposeOp(axes=(-2, -1)),
+        [k_in],
+        Tensor("kt", (batch_heads, head_dim, seq_len)),
+        node_id="kt",
+    )
+
+    # QK^T: mul(Q, K^T) → reduce_sum
+    qk_ew = g.add_node(
+        ElementwiseOp("mul"),
+        [q, kt],
+        Tensor("qk_ew", (batch_heads, seq_len, head_dim, seq_len)),
+        node_id="qk_ew",
+    )
+    qk = g.add_node(
+        ReduceOp("sum", axis=-1),
+        [qk_ew],
+        Tensor("qk", (batch_heads, seq_len, seq_len)),
+        node_id="qk",
+    )
+
+    # Scale
+    sc = g.add_node(ConstantOp(name="scale"), [], Tensor("scale", (1,)), node_id="scale")
+    scaled = g.add_node(
+        ElementwiseOp("mul"),
+        [qk, sc],
+        Tensor("scaled", (batch_heads, seq_len, seq_len)),
+        node_id="scaled",
+    )
+
+    # Softmax
+    mx = g.add_node(
+        ReduceOp("max", axis=-1),
+        [scaled],
+        Tensor("mx", (batch_heads, seq_len, 1)),
+        node_id="mx",
+    )
+    sub = g.add_node(
+        ElementwiseOp("sub"),
+        [scaled, mx],
+        Tensor("shifted", (batch_heads, seq_len, seq_len)),
+        node_id="shifted",
+    )
+    exp = g.add_node(
+        ElementwiseOp("exp"),
+        [sub],
+        Tensor("exp_val", (batch_heads, seq_len, seq_len)),
+        node_id="exp_val",
+    )
+    sum_exp = g.add_node(
+        ReduceOp("sum", axis=-1),
+        [exp],
+        Tensor("sum_exp", (batch_heads, seq_len, 1)),
+        node_id="sum_exp",
+    )
+    attn_w = g.add_node(
+        ElementwiseOp("div"),
+        [exp, sum_exp],
+        Tensor("attn_w", (batch_heads, seq_len, seq_len)),
+        node_id="attn_w",
+    )
+
+    # attn @ V: mul(attn_w, V) → reduce_sum
+    sv_ew = g.add_node(
+        ElementwiseOp("mul"),
+        [attn_w, v],
+        Tensor("sv_ew", (batch_heads, seq_len, seq_len, head_dim)),
+        node_id="sv_ew",
+    )
+    out = g.add_node(
+        ReduceOp("sum", axis=-1),
+        [sv_ew],
+        Tensor("out", (batch_heads, seq_len, head_dim)),
+        node_id="out",
+    )
+    g.outputs = [out]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    assert len(outputs) == 1, f"Expected 1 output, got {len(outputs)}"
+    actual = list(outputs.values())[0]
+
+    # Compute expected
+    q_data = _pseudo_random(batch_heads * seq_len * head_dim)
+    k_data = _pseudo_random(batch_heads * seq_len * head_dim)
+    v_data = _pseudo_random(batch_heads * seq_len * head_dim)
+    expected = _python_sdpa(q_data, k_data, v_data, scale, batch_heads, seq_len, head_dim)
+
+    _assert_close(actual, expected, tol=0.1, label="attention_stage1")

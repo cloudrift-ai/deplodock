@@ -190,6 +190,7 @@ def _lower_smem(  # noqa: C901
     b_name = _safe(analysis.contraction_b)
     out_id = region.output_names[0]
     c_name = _safe(out_id)
+    is_batched = analysis.batch_size > 1
 
     thread_m = int(hints.get("thread_m", 4))
     thread_n = 4
@@ -206,7 +207,9 @@ def _lower_smem(  # noqa: C901
     for out in region.output_names:
         params.append(KernelParam("float* __restrict__", _safe(out)))
     params.extend([KernelParam("int", "M"), KernelParam("int", "N"), KernelParam("int", "K")])
-    if k_splits > 1:
+    if is_batched:
+        params.append(KernelParam("int", "batch_count"))
+    elif k_splits > 1:
         params.append(KernelParam("int", "k_splits"))
 
     body: list = []
@@ -218,8 +221,10 @@ def _lower_smem(  # noqa: C901
         if k_splits > 1
         else "int k_start=0,k_end=K;"
     )
+    batch_decl = "int batch=blockIdx.z;\n" if is_batched else ""
     body.append(
         RawCode(
+            f"{batch_decl}"
             f"int row_base=(blockIdx.y*{ty}+threadIdx.y)*{thread_m};\n"
             f"int col_base=(blockIdx.x*{tx}+threadIdx.x)*{thread_n};\n"
             f"int sr=threadIdx.y*{thread_m};\n"
@@ -230,26 +235,34 @@ def _lower_smem(  # noqa: C901
     )
 
     # K-tile loop.
+    if is_batched:
+        a_local = "Ab"
+        b_local = "Bb"
+    else:
+        a_local = a_name
+        b_local = b_name
     a_load = "\n    ".join(
-        f"As[sr+{r}][threadIdx.x]=(row_base+{r}<M&&tk+threadIdx.x<K)?{a_name}[(row_base+{r})*K+tk+threadIdx.x]:0.0f;"
+        f"As[sr+{r}][threadIdx.x]=(row_base+{r}<M&&tk+threadIdx.x<K)?{a_local}[(row_base+{r})*K+tk+threadIdx.x]:0.0f;"
         for r in range(thread_m)
     )
     a_reads = "\n        ".join(f"float a{r}=As[sr+{r}][kk];" for r in range(thread_m))
     fma = "\n        ".join("".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n)) for r in range(thread_m))
     # Scalar fallback for edge columns (N not aligned to 4).
-    scalar_b_loads = "\n        ".join(f"float b{c}=(col_base+{c}<N)?{b_name}[(tk+kk)*N+col_base+{c}]:0.0f;" for c in range(thread_n))
+    scalar_b_loads = "\n        ".join(f"float b{c}=(col_base+{c}<N)?{b_local}[(tk+kk)*N+col_base+{c}]:0.0f;" for c in range(thread_n))
+    batch_ptrs = (f"const float*Ab={a_name}+batch*M*K;\nconst float*Bb={b_name}+batch*K*N;\n") if is_batched else ""
     body.append(
         RawCode(
+            f"{batch_ptrs}"
             f"for(int tk=k_start;tk<k_end;tk+={bk}){{\n"
             f"    {a_load}\n"
             f"    __syncthreads();\n"
             f"    if(col_base+3<N){{\n"
             f"    #pragma unroll\n"
             f"    for(int kk=0;kk<{bk};kk++){{\n"
-            f"        float b0={b_name}[(tk+kk)*N+col_base],"
-            f"b1={b_name}[(tk+kk)*N+col_base+1],"
-            f"b2={b_name}[(tk+kk)*N+col_base+2],"
-            f"b3={b_name}[(tk+kk)*N+col_base+3];\n"
+            f"        float b0={b_local}[(tk+kk)*N+col_base],"
+            f"b1={b_local}[(tk+kk)*N+col_base+1],"
+            f"b2={b_local}[(tk+kk)*N+col_base+2],"
+            f"b3={b_local}[(tk+kk)*N+col_base+3];\n"
             f"        {a_reads}\n"
             f"        {fma}\n"
             f"    }}}}else if(col_base<N){{\n"
@@ -264,16 +277,22 @@ def _lower_smem(  # noqa: C901
     )
 
     # Write.
-    op = "atomicAdd" if k_splits > 1 else None
-    w_lines = []
+    if is_batched:
+        c_local = "Cb"
+        c_ptr_decl = f"float*Cb={c_name}+batch*M*N;\n"
+    else:
+        c_local = c_name
+        c_ptr_decl = ""
+    wr_op = "atomicAdd" if k_splits > 1 else None
+    w_lines = [c_ptr_decl] if c_ptr_decl else []
     for r in range(thread_m):
         for c in range(thread_n):
             guard = f"if(row_base+{r}<M&&col_base+{c}<N)"
             idx = f"(row_base+{r})*N+col_base+{c}"
-            if op:
-                w_lines.append(f"{guard}atomicAdd(&{c_name}[{idx}],c{r}{c});")
+            if wr_op:
+                w_lines.append(f"{guard}atomicAdd(&{c_local}[{idx}],c{r}{c});")
             else:
-                w_lines.append(f"{guard}{c_name}[{idx}]=c{r}{c};")
+                w_lines.append(f"{guard}{c_local}[{idx}]=c{r}{c};")
     body.append(RawCode("\n".join(w_lines)))
 
     return KernelDef(
@@ -510,6 +529,9 @@ def _lower_naive(
 
     if is_contraction:
         params.extend([KernelParam("int", "M"), KernelParam("int", "N"), KernelParam("int", "K")])
+        is_batched = analysis.batch_size > 1
+        if is_batched:
+            params.append(KernelParam("int", "batch_count"))
         # Block (32, 8) = 256 threads.  thread_m controls rows per thread.
         # Output tile per block: (ty * thread_m) rows × (tx * thread_n) cols.
         _hints = hints or {}
@@ -535,8 +557,10 @@ def _lower_naive(
     if is_contraction:
         # CTA-swizzle grid + coarsened 8×4 thread mapping.
         # Shared structure with TMA strategy — only the load phase differs.
+        batch_decl = "int batch=blockIdx.z;\n" if is_batched else ""
         body.append(
             RawCode(
+                f"{batch_decl}"
                 f"int tr=threadIdx.y*{thread_m},tc=threadIdx.x*{thread_n};\n"
                 f"const int SWIZ=8;\n"
                 f"int ntx=(N+{tile_n - 1})/{tile_n};\n"
@@ -610,6 +634,7 @@ def _lower_naive(
         w_calls = "\n    ".join(f"W({r},{','.join(f'c{r}{c}' for c in range(thread_n))})" for r in range(thread_m))
         # W() macro: bounds-checked writes. Uses atomicAdd when k_splits > 1
         # (multiple blocks accumulate partial results into the same output).
+        c_offset = f"{c_name}+batch*M*N" if is_batched else c_name
         if k_splits > 1:
             w_body = (
                 "if(gc<N)atomicAdd(&Cout[gr*N+gc],v0);"
@@ -619,13 +644,19 @@ def _lower_naive(
             )
         else:
             w_body = "if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;if(gc+2<N)Cout[gr*N+gc+2]=v2;if(gc+3<N)Cout[gr*N+gc+3]=v3;"
-        write_macro = f"#define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);if(gr<M){{int gc=bn+tc;float*Cout={c_name}; {w_body}}}}}\n    {w_calls}"
+        write_macro = (
+            f"#define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);if(gr<M){{int gc=bn+tc;float*Cout={c_offset}; {w_body}}}}}\n    {w_calls}"
+        )
 
         # --- Strategy-specific: K-loop body ---
         if strategy == "tma_db":
             # TMA double-buffered K-loop: smem setup + mbarrier pipeline.
-            tma_a_ref = f"&{a_name}_tma"
-            tma_b_ref = f"&{b_name}_tma"
+            if is_batched:
+                tma_a_ref = f"&{a_name}_tma[batch]"
+                tma_b_ref = f"&{b_name}_tma[batch]"
+            else:
+                tma_a_ref = f"&{a_name}_tma"
+                tma_b_ref = f"&{b_name}_tma"
             smem_bytes = stage * 4
             first_k = "k_start" if k_splits > 1 else "0"
             next_k_prefix = "k_start+" if k_splits > 1 else ""
@@ -702,6 +733,8 @@ def _lower_naive(
             # TMA kernel: only C (output) as regular param.
             # A/B come via TMA descriptors; M/N/K come via #define from backend.
             tma_exclude = {a_name, b_name, "M", "N", "K"}
+            if is_batched:
+                tma_exclude.add("batch_count")
             params = [p for p in params if p.name not in tma_exclude]
             if k_splits > 1:
                 params.append(KernelParam("int", "k_splits"))
@@ -711,6 +744,7 @@ def _lower_naive(
                 params=params,
                 body=body,
                 block_size=block_size,
+                batched=is_batched,
                 includes=["cuda.h"],
                 tile_m=tile_m,
                 tile_n=tile_n,
@@ -720,20 +754,28 @@ def _lower_naive(
             # Naive K-loop: load directly from global memory.
             # Bounds-safe B loads: zero for out-of-bounds columns.
             # A loads: zero for out-of-bounds rows.
+            if is_batched:
+                a_local = "Ab"
+                b_local = "Bb"
+            else:
+                a_local = a_name
+                b_local = b_name
             naive_a_lines = []
             for r in range(thread_m):
                 naive_a_lines.append(
-                    f"float a{r}=(bm+tr+{r}<M)?{a_name}[(bm+tr+{r})*K+k]:0.0f;" + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n))
+                    f"float a{r}=(bm+tr+{r}<M)?{a_local}[(bm+tr+{r})*K+k]:0.0f;" + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n))
                 )
             naive_fma_safe = "\n        ".join(naive_a_lines)
 
+            batch_ptrs = (f"const float*Ab={a_name}+batch*M*K;\nconst float*Bb={b_name}+batch*K*N;\n") if is_batched else ""
             naive_code = (
+                f"{batch_ptrs}"
                 f"float {acc_decls};\n"
                 f"for(int k=0;k<K;k++){{\n"
-                f"    float b0=(bn+tc<N)?{b_name}[k*N+bn+tc]:0.0f,"
-                f"b1=(bn+tc+1<N)?{b_name}[k*N+bn+tc+1]:0.0f,"
-                f"b2=(bn+tc+2<N)?{b_name}[k*N+bn+tc+2]:0.0f,"
-                f"b3=(bn+tc+3<N)?{b_name}[k*N+bn+tc+3]:0.0f;\n"
+                f"    float b0=(bn+tc<N)?{b_local}[k*N+bn+tc]:0.0f,"
+                f"b1=(bn+tc+1<N)?{b_local}[k*N+bn+tc+1]:0.0f,"
+                f"b2=(bn+tc+2<N)?{b_local}[k*N+bn+tc+2]:0.0f,"
+                f"b3=(bn+tc+3<N)?{b_local}[k*N+bn+tc+3]:0.0f;\n"
                 f"        {naive_fma_safe}\n"
                 f"}}\n"
             )

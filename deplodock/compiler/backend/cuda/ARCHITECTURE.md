@@ -39,6 +39,10 @@ cuda/
 - **M-aware k_splits**: when `M < tile_m`, increases k_splits to fill the GPU
 - **Epilogue fusion**: contraction + bias/activation/residual add fused in-register
   after K-loop (k_splits forced to 1 when epilogue present)
+- **Batched contraction**: `TileAnalysis.batch_dims` detects >2D matmul operands
+  (e.g. multi-head attention QK^T). Uses `blockIdx.z` for batch loop with pointer
+  offsets (`A+batch*M*K`, `B+batch*K*N`, `C+batch*M*N`). Currently naive-only
+  (TMA batched descriptors in program.py not yet supported).
 
 ### Kernel structure (TMA double-buffer)
 
