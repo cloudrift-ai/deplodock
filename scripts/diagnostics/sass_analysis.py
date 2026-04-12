@@ -39,11 +39,10 @@ REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO))
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel  # noqa: E402
-from deplodock.compiler.backend.cuda.generators import lower_matmul  # noqa: E402
+from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled  # noqa: E402
 from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
-from deplodock.compiler.ir import Graph, Tensor  # noqa: E402
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp  # noqa: E402
+from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp  # noqa: E402
 
 # Opcode families we care about for the histogram. The article groups by these.
 # Pattern → display name. Each pattern is matched as a prefix on the SASS
@@ -86,17 +85,13 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
     ks = selected.get("k_splits", 1)
     print(f"# profile: {profile}, config for {size}: TM={tm}, BK={bk}, ks={ks}", file=sys.stderr)
 
-    g = Graph()
-    a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
-    b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
-    g.inputs = [a, b]
-    ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", ("M", "K", "N")))
-    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", ("M", "N")))
-    g.outputs = [c]
-
-    for k, v in selected.items():
-        g.hints.set(f"cuda.matmul.{k}", v)
-    kernel = lower_matmul(g)
+    strategy = selected.get("strategy", "tma_db")
+    region = FusedRegionOp(
+        region_ops=[("ew", ElementwiseOp("mul"), ["A", "B"]), ("C", ReduceOp("sum", axis=1), ["ew"])],
+        input_names=["A", "B"], output_names=["C"],
+    )
+    shapes = {"A": ("M", "K"), "B": ("K", "N"), "ew": ("M", "K", "N"), "C": ("M", "N")}
+    kernel = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
     src = emit_kernel(kernel)
 
     dim_args: dict[str, int] = {"M": size, "N": size, "K": size}

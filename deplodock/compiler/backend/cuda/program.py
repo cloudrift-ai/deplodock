@@ -29,6 +29,21 @@ class Buffer:
 
 
 @dataclass
+class TmaDescriptorSpec:
+    """Spec for creating a CUtensorMap descriptor at runtime.
+
+    Each spec produces one CUtensorMap via cuTensorMapEncodeTiled().
+    The descriptor is passed to the kernel as a __grid_constant__ param.
+    """
+
+    param_name: str  # kernel parameter name (e.g., "A_tma")
+    buffer: str  # device buffer name (e.g., "mul_1")
+    dims: list[str]  # [dim0, dim1] expressions for tensor dimensions
+    strides: list[str]  # [stride0] expressions for byte strides
+    tile: list[int]  # [tile0, tile1] block tile sizes
+
+
+@dataclass
 class Launch:
     """One kernel invocation."""
 
@@ -38,6 +53,7 @@ class Launch:
     block: tuple[int, int, int]
     args: list[str]  # buffer names and scalar literals in param order
     smem_bytes: int = 0
+    tma_descriptors: list[TmaDescriptorSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -65,6 +81,7 @@ def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 
         num_iters: Number of timed iterations (benchmark mode).
         warmup: Number of warmup iterations.
     """
+    has_tma = any(launch.tma_descriptors for launch in program.launches)
     parts: list[str] = []
 
     # Includes.
@@ -72,6 +89,8 @@ def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 
     parts.append("#include <cstdlib>")
     parts.append("#include <cmath>")
     parts.append("#include <cuda_runtime.h>")
+    if has_tma:
+        parts.append("#include <cuda.h>")
     if mode == "benchmark":
         parts.append("#include <float.h>")
     for inc in program.includes:
@@ -109,6 +128,11 @@ def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 
             parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
             parts.append("      free(h); }")
     parts.append("")
+
+    # TMA descriptor setup (once, before any launches).
+    if has_tma:
+        parts.append(_generate_tma_setup(program))
+        parts.append("")
 
     # Build launch code block.
     launch_code = _generate_launches(program)
@@ -164,11 +188,64 @@ def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 
     return "\n".join(parts)
 
 
+def _tma_var(launch: Launch, desc: TmaDescriptorSpec) -> str:
+    """Unique variable name for a TMA descriptor: kernel_param_desc."""
+    return f"{launch.kernel_name}_{desc.param_name}_desc"
+
+
+def _generate_tma_setup(program: Program) -> str:
+    """Generate CUtensorMap descriptor creation code for all TMA launches."""
+    lines: list[str] = []
+
+    for launch in program.launches:
+        for desc in launch.tma_descriptors:
+            var = _tma_var(launch, desc)
+            buf = _format_arg(desc.buffer, program)
+            d0, d1 = desc.dims
+            s0 = desc.strides[0]
+            t0, t1 = desc.tile
+
+            lines.append(f"    CUtensorMap {var};")
+            lines.append("    {")
+            lines.append(f"        uint64_t d[2]={{(uint64_t)({d0}),(uint64_t)({d1})}};")
+            lines.append(f"        uint64_t s[1]={{(uint64_t)(({s0})*sizeof(float))}};")
+            lines.append(f"        uint32_t b[2]={{{t0},{t1}}};")
+            lines.append("        uint32_t e[2]={1,1};")
+            lines.append(
+                f"        cuTensorMapEncodeTiled(&{var},CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,"
+            )
+            lines.append(
+                f"            {buf},d,s,b,e,"
+            )
+            lines.append(
+                "            CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,"
+            )
+            lines.append(
+                "            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,"
+                "CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);"
+            )
+            lines.append("    }")
+
+        # Dynamic shared memory attribute.
+        if launch.tma_descriptors and launch.smem_bytes > 0:
+            lines.append(
+                f"    cudaFuncSetAttribute({launch.kernel_name},"
+                f"cudaFuncAttributeMaxDynamicSharedMemorySize,{launch.smem_bytes});"
+            )
+
+    return "\n".join(lines)
+
+
 def _generate_launches(program: Program) -> str:
     """Generate the kernel launch statements."""
     lines: list[str] = []
     for launch in program.launches:
-        args_str = ", ".join(_format_arg(a, program) for a in launch.args)
+        # TMA descriptors are prepended to the regular args.
+        tma_args = [_tma_var(launch, d) for d in launch.tma_descriptors]
+        regular_args = [_format_arg(a, program) for a in launch.args]
+        all_args = tma_args + regular_args
+        args_str = ", ".join(all_args)
+
         gx, gy, gz = launch.grid
         bx, by, bz = launch.block
         if gz == 1 and bz == 1:
@@ -213,6 +290,9 @@ def compile_program(source: str, arch: str | None = None) -> Path:
         arch = _detect_arch()
 
     cmd = ["nvcc", "-O2", "--use_fast_math", f"-arch={arch}", str(cu_path), "-o", str(binary)]
+    # Link libcuda when using TMA (CUtensorMap / cuTensorMapEncodeTiled).
+    if "CUtensorMap" in source:
+        cmd.append("-lcuda")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"nvcc compilation failed:\n{result.stderr}")

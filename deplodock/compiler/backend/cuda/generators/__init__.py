@@ -1,13 +1,17 @@
 """Kernel generators for the CUDA backend.
 
-matmul.py — hand-optimised SGEMM strategies (naive, TMA double-buffer, TF32).
-fused.py  — automatic pointwise / reduction kernels from FusedRegionOp.
+tiled.py    — unified generator: TileAnalysis → KernelDef for all patterns
+              (pointwise, row_reduce, reduce_broadcast, contraction).
+              Supports naive and tma_db strategies for contractions.
+analysis.py — TileAnalysis: classify FusedRegionOp patterns.
 """
 
-from deplodock.compiler.backend.cuda.generators.fused import generate_kernel
-from deplodock.compiler.backend.cuda.generators.matmul import lower_matmul
+from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, analyze
+from deplodock.compiler.backend.cuda.generators.tiled import generate_kernel, lower_tiled
 
 __all__ = [
+    "TileAnalysis",
+    "analyze",
     "generate_kernel",
-    "lower_matmul",
+    "lower_tiled",
 ]

@@ -1,11 +1,10 @@
 """Tests for CUDA backend: codegen, lowering, and end-to-end GPU execution."""
 
-from typing import Any
 
 import pytest
 
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
-from deplodock.compiler.backend.cuda.generators import lower_matmul
+from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
 from deplodock.compiler.backend.cuda.ir import (
     AugAssign,
     BinOp,
@@ -20,17 +19,13 @@ from deplodock.compiler.backend.cuda.ir import (
 )
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
+from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, InputOp, ReduceOp
 
 # ---- helpers ----
 
 
-def _make_matmul_graph(m=None, k=None, n=None, **matmul_hints: Any):
-    """Build primitive matmul graph: C = Reduce{sum}(Elementwise{mul}(A, B)).
-
-    If m/k/n are None, uses symbolic dims ("M", "K", "N").
-    Any extra keyword arguments are set as cuda.matmul.* hints.
-    """
+def _make_matmul_graph(m=None, k=None, n=None, **matmul_hints):
+    """Build a matmul graph with optional hints. The general interface."""
     m_dim = m if m is not None else "M"
     k_dim = k if k is not None else "K"
     n_dim = n if n is not None else "N"
@@ -44,6 +39,26 @@ def _make_matmul_graph(m=None, k=None, n=None, **matmul_hints: Any):
     for key, val in matmul_hints.items():
         g.hints.set(f"cuda.matmul.{key}", val)
     return g
+
+
+def _lower_matmul(m=None, k=None, n=None, **matmul_hints):
+    """Build graph, set hints, lower via analyze → lower_tiled."""
+    g = _make_matmul_graph(m, k, n, **matmul_hints)
+    out_node = g.nodes[g.outputs[0]]
+    ew_node = g.nodes[out_node.inputs[0]]
+    input_a = g.nodes[ew_node.inputs[0]]
+    input_b = g.nodes[ew_node.inputs[1]]
+    a_name, b_name, c_name = input_a.output.name, input_b.output.name, out_node.output.name
+    region = FusedRegionOp(
+        region_ops=[(ew_node.id, ew_node.op, [a_name, b_name]), (out_node.id, out_node.op, [ew_node.id])],
+        input_names=[a_name, b_name], output_names=[c_name],
+    )
+    shapes = {
+        a_name: input_a.output.shape, b_name: input_b.output.shape,
+        ew_node.id: ew_node.output.shape, c_name: out_node.output.shape,
+    }
+    strategy = matmul_hints.get("strategy", "naive")
+    return lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
 
 
 def _python_matmul(a, b, m, k, n):
@@ -84,23 +99,20 @@ def test_emit_simple_kernel():
 
 def test_emit_matmul_kernel():
     """Emit a matmul kernel from lowering and verify structure."""
-    kernel = lower_matmul(_make_matmul_graph(4, 3, 2))
+    kernel = _lower_matmul(4, 3, 2)
     source = emit_kernel(kernel)
 
     assert "__global__" in source
     assert "void fused_matmul" in source
-    assert "float* A" in source
-    assert "float* B" in source
-    assert "float* C" in source
+    assert "A" in source and "B" in source and "C" in source
     assert "int M" in source
     assert "int N" in source
     assert "int K" in source
-    assert "float acc = 0.0f;" in source
-    assert "for (int k = 0;" in source
-    assert "acc +=" in source
+    # Coarsened: 8×4 outputs per thread with register accumulators
+    assert "c00" in source  # first accumulator
+    assert "for(int k=0;k<K;k++)" in source
     assert "A[" in source
     assert "B[" in source
-    assert "C[" in source
 
 
 def test_emit_for_loop():
@@ -128,7 +140,7 @@ def test_emit_for_loop():
 
 def test_lower_matmul_produces_kernel():
     """Lower a matmul and check the KernelDef structure."""
-    kernel = lower_matmul(_make_matmul_graph())
+    kernel = _lower_matmul()
 
     assert kernel.name == "fused_matmul"
     param_names = [p.name for p in kernel.params]
@@ -154,7 +166,7 @@ def test_matmul_end_to_end():
     """Full pipeline: lower → codegen → compile → run → verify."""
     M, K, N = 4, 3, 2
 
-    kernel = lower_matmul(_make_matmul_graph())
+    kernel = _lower_matmul()
     source = emit_kernel(kernel)
 
     # Test data.
@@ -185,7 +197,7 @@ def test_matmul_larger():
     """Test with a larger matrix to exercise multiple thread blocks."""
     M, K, N = 33, 17, 25  # intentionally not multiples of block size (16)
 
-    kernel = lower_matmul(_make_matmul_graph())
+    kernel = _lower_matmul()
     source = emit_kernel(kernel)
 
     # Simple test data: A=1s, B=1s → each C[i,j] should equal K.
@@ -218,7 +230,7 @@ def test_run_benchmark_surfaces_cuda_oom():
 
     strategy_map, _ = default_matmul_strategy_map()
     hints = {**strategy_map[0][1], "batch_count": 8, "k_splits": 1}
-    kernel = lower_matmul(_make_matmul_graph(**hints))
+    kernel = _lower_matmul(**hints)
     source = emit_kernel(kernel)
 
     huge = {"M": 65536, "N": 65536, "K": 65536, "batch": 8}
@@ -246,7 +258,7 @@ def test_lower_every_strategy(strategy_name, overrides):
     Pure lowering — no nvcc, no GPU. Catches dispatcher / template errors after
     refactors like the `block_m`/`block_n` → `threads_y`/`threads_x` rename.
     """
-    kernel = lower_matmul(_make_matmul_graph(strategy=strategy_name, **overrides))
+    kernel = _lower_matmul(strategy=strategy_name, **overrides)
     source = emit_kernel(kernel)
     assert kernel.name
     assert source
@@ -270,7 +282,7 @@ def test_run_every_strategy_correctness(strategy_name, overrides):
     covered separately by the bench harness in `run_benchmark`.
     """
     M, K, N = 32, 32, 32
-    kernel = lower_matmul(_make_matmul_graph(strategy=strategy_name, **overrides))
+    kernel = _lower_matmul(strategy=strategy_name, **overrides)
     source = emit_kernel(kernel)
 
     a_data = [1.0] * (M * K)
@@ -293,7 +305,7 @@ def test_run_tma_db_strategy_via_bench():
     from deplodock.compiler.backend.cuda.runner import run_benchmark
 
     M = N = K = 256  # multiple of TMA tile (224x128 → use 256 to keep things simple)
-    kernel = lower_matmul(_make_matmul_graph(strategy="tma_db", block_k=32, thread_m=8))
+    kernel = _lower_matmul(strategy="tma_db", block_k=32, thread_m=8)
     source = emit_kernel(kernel)
     result = run_benchmark(
         kernel=kernel,

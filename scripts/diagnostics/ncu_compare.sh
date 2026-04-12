@@ -57,18 +57,9 @@ import sys, pathlib
 sys.path.insert(0, "$REPO_DIR")
 from deplodock.compiler.backend.cuda.runner import generate_benchmark_program, _detect_arch
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
-from deplodock.compiler.backend.cuda.generators import lower_matmul
+from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
 from deplodock.compiler.backend.cuda.codegen import emit_kernel
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
-
-g = Graph()
-a = g.add_node(InputOp(), [], Tensor("A", ("M", "K")))
-b = g.add_node(InputOp(), [], Tensor("B", ("K", "N")))
-g.inputs = [a, b]
-ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", ("M", "K", "N")))
-c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", ("M", "N")))
-g.outputs = [c]
+from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
 
 strategy_map, _ = default_matmul_strategy_map()
 size = $SIZE
@@ -79,9 +70,13 @@ for thr, hints in strategy_map:
         selected = dict(hints); break
 if batch > 1:
     selected["batch_count"] = batch; selected["k_splits"] = 1
-for k, v in selected.items():
-    g.hints.set(f"cuda.matmul.{k}", v)
-kernel = lower_matmul(g)
+strategy = selected.get("strategy", "tma_db")
+region = FusedRegionOp(
+    region_ops=[("ew", ElementwiseOp("mul"), ["A", "B"]), ("C", ReduceOp("sum", axis=1), ["ew"])],
+    input_names=["A", "B"], output_names=["C"],
+)
+shapes = {"A": ("M", "K"), "B": ("K", "N"), "ew": ("M", "K", "N"), "C": ("M", "N")}
+kernel = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
 src = emit_kernel(kernel)
 dim_args = {"M": size, "N": size, "K": size}
 if selected.get("k_splits", 1) > 1: dim_args["k_splits"] = selected["k_splits"]
