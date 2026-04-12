@@ -25,7 +25,7 @@ from typing import Any
 # Add project root to path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deplodock.compiler.backend.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
 from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_benchmark
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map

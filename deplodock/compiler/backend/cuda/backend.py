@@ -84,7 +84,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
     Defaults to tma_db strategy (TMA double-buffer with mbarrier pipelining).
     Falls back to naive if hints specify it.
     """
-    from deplodock.compiler.backend.cuda.codegen import emit_kernel
+    from deplodock.compiler.backend.codegen import emit_kernel
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
     from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
     from deplodock.compiler.backend.cuda.program import TmaDescriptorSpec
@@ -401,7 +401,7 @@ def _compile_fused_region(op: OpKernel) -> Launch:
         op.params["K"] = k
         return _compile_matmul(op)
 
-    from deplodock.compiler.backend.cuda.codegen import emit_kernel
+    from deplodock.compiler.backend.codegen import emit_kernel
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
     from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
 

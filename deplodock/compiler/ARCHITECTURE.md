@@ -23,27 +23,30 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  RULE: Operates on Graph IR only. No backend imports.           │
 │        Must not reference CUDA, grid, block, or kernel source.  │
 ├─────────────────────────────────────────────────────────────────┤
-│  LAYER 3: Execution Plan (backend-agnostic)                     │
+│  LAYER 3: Execution Plan + Shared Codegen (backend-agnostic)    │
 │                                                                 │
 │  plan.py:           BufferSpec, OpKernel, ExecutionPlan         │
-│  backend.py:        Backend ABC (compile, run, benchmark)       │
+│  backend/base.py:   Backend ABC (compile, run, benchmark)       │
+│  backend/ir.py:     Kernel AST (Expr, Stmt, KernelDef)         │
+│  backend/codegen.py: KernelDef → C source                       │
 │                                                                 │
 │  RULE: Describes WHAT to compute, not HOW.                      │
-│        No kernel source, no grid/block, no GPU API calls.       │
+│        ir.py + codegen.py are generic C/C++ — shared by all     │
+│        backends. No CUDA/HIP-specific API calls.                │
 │        OpKernel.op is a string tag — the backend resolves it.   │
 ├─────────────────────────────────────────────────────────────────┤
 │  LAYER 4: Backend (CUDA, ROCm, ...)                             │
 │                                                                 │
 │  cuda/backend.py:   CudaBackend (implements Backend ABC)        │
 │  cuda/program.py:   Buffer, Launch, Program, compile, run       │
-│  cuda/generators/:  matmul.py (SGEMM), fused.py (pointwise/reduce)│
-│  cuda/codegen.py:   KernelDef → CUDA C source                   │
-│  cuda/ir.py:        CUDA imperative AST (Expr, Stmt, KernelDef) │
-│  cuda/runner.py:    Legacy single-kernel compile + run          │
+│  cuda/generators/:  analysis.py + tiled.py (all kernel patterns)│
+│  cuda/runner.py:    Single-kernel compile + run                 │
+│  cuda/tuning.py:    Per-GPU empirical tuning profiles           │
 │                                                                 │
 │  RULE: All GPU-specific code lives here.                        │
 │        A new backend (e.g., rocm/) implements the same          │
-│        Backend ABC and maps OpKernel tags to .hip templates.    │
+│        Backend ABC, reuses backend/ir.py + backend/codegen.py,  │
+│        and provides its own generators + tuning.                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -114,7 +117,7 @@ result = backend.run(program)
 - **Do NOT import from `cuda/` in Layer 1-3 modules.** If you need GPU-specific behavior, add it to `cuda/backend.py`.
 - **Do NOT put kernel source strings in Layer 3.** `OpKernel.op` is a tag; the backend resolves it to actual code.
 - **Do NOT hardcode grid/block/smem in planners.** That's the backend's job.
-- **Do NOT add kernel source as Python f-strings.** Use `generators/tiled.py` for new kernel patterns, `generators/fused.py` for auto-generated kernels, or `generators/matmul.py` for SGEMM strategies.
+- **Do NOT add kernel source as Python f-strings.** Use `generators/tiled.py` for new kernel patterns (all patterns — pointwise, reduce, contraction — go through the unified tiled generator).
 
 ## Module Layout
 
@@ -137,21 +140,17 @@ compiler/
 ├── backend/          # [L3+L4] Backend abstraction + implementations
 │   ├── __init__.py   #      Re-exports from base.py
 │   ├── base.py       # [L3] Backend ABC, ProgramResult, BenchmarkResult
+│   ├── ir.py         # [L3] Kernel AST (KernelDef, Expr, Stmt) — shared
+│   ├── codegen.py    # [L3] KernelDef → C source — shared
 │   └── cuda/         # [L4] CUDA backend
 │       ├── backend.py    #  CudaBackend implements Backend ABC
 │       ├── program.py    #  Buffer, Launch, Program — compile + run
-│       ├── ir.py         #  CUDA imperative AST (KernelDef, Expr, Stmt)
-│       ├── codegen.py    #  KernelDef → CUDA C source
 │       ├── generators/   #  Kernel generators
 │       │   ├── analysis.py #  TileAnalysis: classify FusedRegionOp patterns
-│       │   ├── tiled.py  #    Unified tiled generator (analysis → KernelDef)
-│       │   ├── matmul.py #    Hand-optimised SGEMM (naive, TMA, TF32)
-│       │   └── fused.py  #    Auto pointwise + reduction from FusedRegionOp
-│       ├── runner.py     #  Legacy single-kernel compile + run + benchmark
+│       │   └── tiled.py  #  Unified tiled generator (analysis → KernelDef)
+│       ├── runner.py     #  Single-kernel compile + run + benchmark
 │       └── tuning.py     #  Per-GPU empirical tuning profiles
 ```
-
-`*` — `pipeline.py` has CUDA imports (legacy). New code should use the Backend ABC instead.
 
 Benchmark orchestration (multi-size sweeps, result collection, summary tables) lives in `scripts/bench_matmul.py` and `scripts/bench_block.py`, not in the compiler package. The compiler only provides execution primitives.
 
@@ -187,7 +186,9 @@ class ExecutionPlan:
 
 1. Create `rocm/` directory alongside `cuda/`
 2. Implement `RocmBackend(Backend)` in `rocm/backend.py`
-3. Map the same `OpKernel.op` tags to `.hip` templates
+3. Reuse `backend/ir.py` (kernel AST) and `backend/codegen.py` (C printer) — they are backend-agnostic
+4. Write ROCm-specific generators (tile sizes, warp size 64, no TMA) and tuning profiles
+5. Map the same `OpKernel.op` tags to `.hip` templates
 
 ## Graph Transformation (Layer 2)
 
@@ -211,11 +212,19 @@ Decomposes high-level ops from `torch.export` into primitives:
 - Structural ops (reshape, transpose) always merge
 - Produces `FusedRegionOp` nodes
 
-`cuda/kernel_gen.py` generates CUDA kernels from each `FusedRegionOp` by walking its primitive ops directly — no hand-written templates needed for pointwise or reduction patterns. The CUDA backend auto-generates kernels during `compile()` for any `FusedRegionOp` that doesn't have a pre-filled `kernel_source`.
+Fusion constraints enforced by `_can_merge()`:
+- **Convexity**: merged region must be a convex subgraph (no external nodes between)
+- **Contraction + epilogue**: contraction core (mul+sum) can fuse with pointwise epilogue ops (bias add, activation, residual add from graph-level inputs)
+- **Single reduce**: one reduction pass per kernel (softmax needs two regions: max+sub+exp and sum+div)
+- **Dimensionality**: >2D tensors are allowed if they don't expand rank beyond inputs (enables 4D softmax, rotary embedding fusion). Broadcast rank expansion (matmul-style 2D→3D) is only allowed for standard contractions.
+- **Shape compatibility**: all full-rank external inputs must have the same total size (scalars, vectors, and per-row tensors are exempt)
+- **Single output**: one external output per region
+
+The CUDA backend auto-generates kernels during `compile()` for any `FusedRegionOp` via `generators/tiled.py`. Reshape/transpose ops become buffer aliases (zero-cost pointer assignment, no kernel launch).
 
 ## CUDA Backend Details
 
-### SGEMM Strategies (cuda/lower.py)
+### SGEMM Strategies (cuda/generators/tiled.py)
 
 | Strategy          | Description                          | Best for               |
 |-------------------|--------------------------------------|------------------------|
@@ -252,7 +261,7 @@ graph.nodes["n5"].hints.set("cuda.matmul.threads_y", 8)  # per-node override
 Flow through the pipeline:
 1. **Rewriter/Fusion**: read/write hints on graph nodes directly
 2. **plan_graph()**: resolves hints per node → stores in `OpKernel.params["_hints"]`
-3. **CudaBackend**: reads `params["_hints"]`, sets them on the lowering graph, calls `lower_matmul(graph)` which reads hints internally
+3. **CudaBackend**: reads `params["_hints"]` in `_compile_matmul()`, merges with tuning profile defaults, passes to `lower_tiled()` as the `hints` dict
 
 Hints survive serialization (`to_dict`/`from_dict`) and deep copy. Old graphs without hints deserialize correctly (empty defaults).
 

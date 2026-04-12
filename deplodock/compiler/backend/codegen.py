@@ -1,8 +1,12 @@
-"""CUDA IR → CUDA C source code generation."""
+"""Kernel IR to C source code generation.
+
+Backend-agnostic printer: walks the AST from ir.py and emits C/C++ text.
+Usable for both CUDA and HIP targets.
+"""
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.cuda.ir import (
+from deplodock.compiler.backend.ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
@@ -168,7 +172,7 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
             return f"{pad}#pragma unroll {stmt.factor}"
         return f"{pad}#pragma unroll"
 
-    from deplodock.compiler.backend.cuda.ir import RawCode
+    from deplodock.compiler.backend.ir import RawCode
 
     if isinstance(stmt, RawCode):
         # Indent each line of the raw code.

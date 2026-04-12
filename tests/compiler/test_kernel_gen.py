@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from deplodock.compiler.backend.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import generate_kernel
 from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program, run_program
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc

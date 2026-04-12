@@ -2,9 +2,10 @@
 
 import pytest
 
-from deplodock.compiler.backend.cuda.codegen import emit_kernel
+from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
-from deplodock.compiler.backend.cuda.ir import (
+from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
+from deplodock.compiler.backend.ir import (
     AugAssign,
     BinOp,
     CudaBuiltin,
@@ -16,7 +17,6 @@ from deplodock.compiler.backend.cuda.ir import (
     Var,
     VarDecl,
 )
-from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, InputOp, ReduceOp
 
