@@ -119,6 +119,7 @@ class CompilerDump:
             ],
         }
         self._write_json("40_program_summary.json", summary)
+        self._write_text("40_program.txt", program.pretty_print())
         for i, launch in enumerate(program.launches):
             self._write_text(f"40_kernel_{i:02d}_{launch.kernel_name}.cu", launch.kernel_source)
 
