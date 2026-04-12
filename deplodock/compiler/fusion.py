@@ -1,8 +1,13 @@
-"""Automatic fusion: discover fusion regions from intermediate tensor sizes.
+"""Automatic fusion: optimal graph partitioning via MILP.
 
-Operates on the decomposed primitive graph. Groups adjacent ops into
-fusion regions by analyzing which intermediates are large and benefit
-from staying in shared memory / registers.
+Partitions a decomposed primitive graph into fusion regions that minimize
+total data movement across region boundaries.  Each region becomes one GPU
+kernel.  Uses scipy.optimize.milp for provably optimal partitioning.
+
+Constraints:
+  1. Convexity — if u and v are in the same region, every node on any
+     path between them must also be in that region.
+  2. Codegen — reduces on incompatible axes cannot share a region.
 """
 
 from __future__ import annotations
@@ -20,165 +25,315 @@ if TYPE_CHECKING:
     from deplodock.compiler.ir import Graph
 
 
-class UnionFind:
-    """Disjoint set for tracking fusion regions."""
-
-    def __init__(self) -> None:
-        self._parent: dict[str, str] = {}
-        self._rank: dict[str, int] = {}
-
-    def add(self, x: str) -> None:
-        if x not in self._parent:
-            self._parent[x] = x
-            self._rank[x] = 0
-
-    def find(self, x: str) -> str:
-        if self._parent[x] != x:
-            self._parent[x] = self.find(self._parent[x])
-        return self._parent[x]
-
-    def merge(self, x: str, y: str) -> None:
-        rx, ry = self.find(x), self.find(y)
-        if rx == ry:
-            return
-        if self._rank[rx] < self._rank[ry]:
-            rx, ry = ry, rx
-        self._parent[ry] = rx
-        if self._rank[rx] == self._rank[ry]:
-            self._rank[rx] += 1
-
-    def members(self, x: str) -> set[str]:
-        root = self.find(x)
-        return {k for k in self._parent if self.find(k) == root}
-
-    def all_groups(self) -> list[set[str]]:
-        groups: dict[str, set[str]] = {}
-        for k in self._parent:
-            root = self.find(k)
-            groups.setdefault(root, set()).add(k)
-        return list(groups.values())
-
-
 def _tensor_size(shape: tuple) -> int:
     """Compute total elements from shape, treating symbolic dims as 1."""
     return math.prod(d for d in shape if isinstance(d, int)) if shape else 1
 
 
 def _is_fusible_op(op) -> bool:
-    """Is this a primitive op that can participate in auto-fusion?
-
-    Only ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp are fusible.
-    All other ops (FusedRegionOp, etc.) stay standalone.
-    """
     from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 
     return isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp))
 
 
-def _can_merge(graph: Graph, uf: UnionFind, a_id: str, b_id: str) -> bool:
-    """Check if merging two regions would create a cycle or shape incompatibility."""
-    region_a = uf.members(a_id)
-    region_b = uf.members(b_id)
-    merged = region_a | region_b
+def _reduces_compatible(r1_id: str, r2_id: str, graph) -> bool:
+    """Can two ReduceOps coexist in one fused region?
 
-    # Shape compatibility: the kernel generator indexes all 2D+ external inputs with the
-    # same row*cols+j pattern. If those inputs have different total sizes, the
-    # generated kernel will access out of bounds. 1D inputs (weight vectors)
-    # and scalars are OK — they use [j] or [0] indexing respectively.
-    #
-    # Exception: 2-op matmul regions (mul + reduce_sum) are handled by the
-    # backend's SGEMM path, not the kernel generator, so different input sizes are fine.
-    from deplodock.compiler.ops import ElementwiseOp as _Ew
-    from deplodock.compiler.ops import ReduceOp as _Red
+    Compatible means the codegen can tile them in the same kernel:
+    - Same axis type (both row or both contraction)
+    - Same pre-reduction shape (same rows/cols dimensions)
+    - Connected by a data path (one feeds into the other)
+    """
+    from deplodock.compiler.ops import ReduceOp
 
-    # Count fusible ops in the merged region.
-    fusible_ops = [(nid, graph.nodes[nid].op) for nid in merged]
-    is_2op_matmul = (
-        len(fusible_ops) == 2
-        and any(isinstance(op, _Ew) and op.fn == "mul" for _, op in fusible_ops)
-        and any(isinstance(op, _Red) and op.fn == "sum" for _, op in fusible_ops)
-    )
+    r1_node, r2_node = graph.nodes[r1_id], graph.nodes[r2_id]
+    r1, r2 = r1_node.op, r2_node.op
+    if not isinstance(r1, ReduceOp) or not isinstance(r2, ReduceOp):
+        return True
 
-    if not is_2op_matmul:
-        sizes_full: set[int] = set()
-        for nid in merged:
-            node = graph.nodes[nid]
-            for inp_id in node.inputs:
-                if inp_id not in merged and inp_id in graph.nodes:
-                    inp_shape = graph.nodes[inp_id].output.shape
-                    inp_size = _tensor_size(inp_shape)
-                    # Skip scalars and per-row scalars (broadcastable).
-                    # A (N,1) shape is a per-row scalar — the kernel generator accesses
-                    # it as a scalar per row, not with row*cols+j.
-                    if inp_size <= 1:
-                        continue
-                    if len(inp_shape) >= 2 and all((isinstance(d, int) and d == 1) for d in inp_shape[1:]):
-                        continue  # shape like (N, 1) or (N, 1, 1) — per-row scalar
-                    if len(inp_shape) >= 2:
-                        sizes_full.add(inp_size)
+    # Normalize axes: positive int axis on the last dim is equivalent to -1.
+    def _is_row_reduce(op, node):
+        if op.axis == -1:
+            return True
+        if isinstance(op.axis, int) and node.inputs:
+            inp = node.inputs[0]
+            if inp in graph.nodes:
+                ndim = len(graph.nodes[inp].output.shape)
+                if ndim > 0 and op.axis == ndim - 1:
+                    return True
+        return False
 
-        # All 2D+ external inputs (that aren't per-row scalars) must have
-        # the same total size — the kernel generator uses one row*cols+j index for all.
-        if len(sizes_full) > 1:
-            return False
+    is_row_1 = _is_row_reduce(r1, r1_node)
+    is_row_2 = _is_row_reduce(r2, r2_node)
 
-    return True
+    # Different axis types → always incompatible.
+    if is_row_1 != is_row_2:
+        return False
+
+    # Contractions (symbolic axis) → always incompatible with each other.
+    if isinstance(r1.axis, str) and isinstance(r2.axis, str):
+        return False
+
+    # Both row reductions: compatible only if their pre-reduction
+    # inputs have the same shape (they'll share the same tiled loop).
+    if is_row_1 and is_row_2:
+        # Compare input shapes. The first input determines the tile dimensions.
+        r1_inp = r1_node.inputs[0] if r1_node.inputs else None
+        r2_inp = r2_node.inputs[0] if r2_node.inputs else None
+        if r1_inp and r2_inp and r1_inp in graph.nodes and r2_inp in graph.nodes:
+            s1 = graph.nodes[r1_inp].output.shape
+            s2 = graph.nodes[r2_inp].output.shape
+            # Same number of dims and same last dim (cols must match for shared tile loop).
+            if len(s1) == len(s2) and s1[-1:] == s2[-1:]:
+                return True
+        return False
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# MILP solver
+# ---------------------------------------------------------------------------
+
+
+def _solve_fusion(graph: Graph) -> dict[str, int]:
+    """Solve optimal fusion via MILP. Returns node_id → region_label."""
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+
+    from deplodock.compiler.ops import ReduceOp
+
+    # Collect fusible nodes.
+    node_list = sorted(nid for nid, n in graph.nodes.items() if _is_fusible_op(n.op))
+    if not node_list:
+        return {}
+    node_idx = {nid: i for i, nid in enumerate(node_list)}
+    n_nodes = len(node_list)
+
+    # Build directed edges between fusible nodes.
+    direct_edges = []  # (u_idx, v_idx, tensor_bytes)
+    for nid in node_list:
+        for inp_id in graph.nodes[nid].inputs:
+            if inp_id in node_idx:
+                u, v = node_idx[inp_id], node_idx[nid]
+                w = _tensor_size(graph.nodes[inp_id].output.shape)
+                direct_edges.append((u, v, w))
+
+    # Adjacency + reachability.
+    children = [[] for _ in range(n_nodes)]
+    for u, v, _ in direct_edges:
+        children[u].append(v)
+
+    # All-pairs reachability via reverse-topo BFS.
+    in_degree = [0] * n_nodes
+    for _u, v, _ in direct_edges:
+        in_degree[v] += 1
+    queue = [i for i in range(n_nodes) if in_degree[i] == 0]
+    topo = []
+    while queue:
+        u = queue.pop(0)
+        topo.append(u)
+        for v in children[u]:
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                queue.append(v)
+
+    reachable = [set() for _ in range(n_nodes)]
+    for u in reversed(topo):
+        reachable[u].add(u)
+        for v in children[u]:
+            reachable[u] |= reachable[v]
+
+    # Identify incompatible reduce pairs.
+    reduce_indices = [i for i, nid in enumerate(node_list) if isinstance(graph.nodes[nid].op, ReduceOp)]
+    incompat_pairs = []
+    for ii, ri in enumerate(reduce_indices):
+        for rj in reduce_indices[ii + 1:]:
+            if not _reduces_compatible(node_list[ri], node_list[rj], graph):
+                incompat_pairs.append((ri, rj))
+
+    # --- Build pair variables ---
+    # We need a binary "same[u,v]" variable for each pair of nodes that
+    # could potentially be in the same region. We need variables for:
+    #   1. All direct edges (these carry the objective weight).
+    #   2. All (u,w) pairs needed for transitivity: u→v→w implies need for (u,w).
+    #   3. All pairs involving incompatible reduces and intermediate nodes.
+
+    pair_to_var = {}  # (min_idx, max_idx) → variable_index
+    var_weights = []  # objective weight for each variable
+
+    def _get_or_create_var(a: int, b: int, weight: int = 0) -> int:
+        key = (min(a, b), max(a, b))
+        if key in pair_to_var:
+            return pair_to_var[key]
+        idx = len(var_weights)
+        pair_to_var[key] = idx
+        var_weights.append(weight)
+        return idx
+
+    # 1. Direct edges — carry the objective weight.
+    for u, v, w in direct_edges:
+        _get_or_create_var(u, v, w)
+    n_direct = len(var_weights)
+
+    # 2. Transitivity triples (u→v→w → need var for (u,w)).
+    transitivity = []
+    for v_node in range(n_nodes):
+        v_parents = [u for u, v, _ in direct_edges if v == v_node]
+        v_children = children[v_node]
+        for u_node in v_parents:
+            for w_node in v_children:
+                i_uv = _get_or_create_var(u_node, v_node)
+                i_vw = _get_or_create_var(v_node, w_node)
+                i_uw = _get_or_create_var(u_node, w_node)
+                transitivity.append((i_uv, i_vw, i_uw))
+
+    # 3. Incompatible reduce pairs + all intermediate nodes.
+    for ri, rj in incompat_pairs:
+        _get_or_create_var(ri, rj)
+        # Every node between ri and rj needs separation constraints.
+        for v in range(n_nodes):
+            if v == ri or v == rj:
+                continue
+            # v is between ri and rj if ri→...→v→...→rj or rj→...→v→...→ri.
+            if (v in reachable[ri] and rj in reachable[v]) or (v in reachable[rj] and ri in reachable[v]):
+                _get_or_create_var(ri, v)
+                _get_or_create_var(v, rj)
+
+    n_vars = len(var_weights)
+    if n_vars == 0:
+        return {nid: i for i, nid in enumerate(node_list)}
+
+    # --- Objective: maximize Σ weight × same (only direct edges have weight) ---
+    c = np.zeros(n_vars)
+    for i in range(n_direct):
+        c[i] = -var_weights[i]  # minimize negative = maximize
+
+    integrality = np.ones(n_vars)
+    lb = np.zeros(n_vars)
+    ub = np.ones(n_vars)
+
+    # --- Constraints ---
+    rows = []
+
+    # 1. Incompatible reduces: same[ri,rj] = 0.
+    for ri, rj in incompat_pairs:
+        var = pair_to_var[(min(ri, rj), max(ri, rj))]
+        ub[var] = 0  # force to 0
+
+        # No node v can bridge ri and rj: same[ri,v] + same[v,rj] <= 1.
+        for v in range(n_nodes):
+            if v == ri or v == rj:
+                continue
+            if (v in reachable[ri] and rj in reachable[v]) or (v in reachable[rj] and ri in reachable[v]):
+                key_iv = (min(ri, v), max(ri, v))
+                key_vj = (min(v, rj), max(v, rj))
+                if key_iv in pair_to_var and key_vj in pair_to_var:
+                    row = np.zeros(n_vars)
+                    row[pair_to_var[key_iv]] = 1
+                    row[pair_to_var[key_vj]] = 1
+                    rows.append((row, 1.0))
+
+    # 2. Transitivity: same[u,v] + same[v,w] - same[u,w] <= 1.
+    for i_uv, i_vw, i_uw in transitivity:
+        row = np.zeros(n_vars)
+        row[i_uv] = 1
+        row[i_vw] = 1
+        row[i_uw] = -1
+        rows.append((row, 1.0))
+
+    # 3. Convexity: for all u,w where u can reach w, and all v between them:
+    #    same[u,w] <= same[u,v] AND same[u,w] <= same[v,w].
+    for u in range(n_nodes):
+        for w in reachable[u]:
+            if u == w:
+                continue
+            key_uw = (min(u, w), max(u, w))
+            if key_uw not in pair_to_var:
+                continue
+            var_uw = pair_to_var[key_uw]
+            for v in reachable[u]:
+                if v == u or v == w or w not in reachable[v]:
+                    continue
+                # v is between u and w.
+                key_uv = (min(u, v), max(u, v))
+                key_vw = (min(v, w), max(v, w))
+                if key_uv in pair_to_var:
+                    row = np.zeros(n_vars)
+                    row[var_uw] = 1
+                    row[pair_to_var[key_uv]] = -1
+                    rows.append((row, 0.0))  # same[u,w] - same[u,v] <= 0
+                if key_vw in pair_to_var:
+                    row = np.zeros(n_vars)
+                    row[var_uw] = 1
+                    row[pair_to_var[key_vw]] = -1
+                    rows.append((row, 0.0))  # same[u,w] - same[v,w] <= 0
+
+    # Solve.
+    if rows:
+        A = np.vstack([r for r, _ in rows])
+        b = np.array([b for _, b in rows])
+        constraints = LinearConstraint(A, ub=b)
+    else:
+        constraints = []
+
+    result = milp(c=c, integrality=integrality, bounds=Bounds(lb=lb, ub=ub), constraints=constraints)
+
+    if not result.success:
+        return {nid: i for i, nid in enumerate(node_list)}
+
+    # --- Convert to region labels via connected components ---
+    from collections import deque
+
+    same = result.x
+    adj = [[] for _ in range(n_nodes)]
+    for (a, b), var_idx in pair_to_var.items():
+        if var_idx < n_direct and same[var_idx] > 0.5:
+            adj[a].append(b)
+            adj[b].append(a)
+
+    region_label = [-1] * n_nodes
+    label = 0
+    for start in range(n_nodes):
+        if region_label[start] >= 0:
+            continue
+        q = deque([start])
+        region_label[start] = label
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if region_label[v] < 0:
+                    region_label[v] = label
+                    q.append(v)
+        label += 1
+
+    return {node_list[i]: region_label[i] for i in range(n_nodes)}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def auto_fuse(graph: Graph) -> Graph:
-    """Discover fusion regions and replace them with FusedRegionOp nodes.
-
-    Algorithm:
-    1. Score each single-consumer edge by intermediate tensor size.
-    2. Greedy merge: highest-score first, merge if no cycle.
-    3. Structural ops (reshape, transpose) always merge with neighbors.
-    4. Replace each multi-op region with a FusedRegionOp node.
-    """
+    """Discover optimal fusion regions via MILP and replace with FusedRegionOp nodes."""
     from deplodock.compiler.ir import Tensor
 
     g = graph.copy()
-    uf = UnionFind()
+    region_labels = _solve_fusion(g)
 
-    # Initialize: one region per compute node.
-    for nid in g.nodes:
-        if _is_fusible_op(g.nodes[nid].op):
-            uf.add(nid)
+    if not region_labels:
+        return g
 
-    # Score edges: (score, producer_id, consumer_id).
-    edges: list[tuple[int, str, str]] = []
-    for nid in g.topological_order():
-        node = g.nodes[nid]
-        if not _is_fusible_op(node.op):
-            continue
-        consumers = g.consumers(nid)
-        if len(consumers) == 1:
-            consumer_id = consumers[0]
-            if _is_fusible_op(g.nodes[consumer_id].op):
-                score = _tensor_size(node.output.shape)
-                edges.append((score, nid, consumer_id))
+    groups: dict[int, set[str]] = {}
+    for nid, label in region_labels.items():
+        groups.setdefault(label, set()).add(nid)
 
-    # Greedy merge: highest score first.
-    for _score, producer_id, consumer_id in sorted(edges, reverse=True):
-        if producer_id not in uf._parent or consumer_id not in uf._parent:
-            continue
-        if uf.find(producer_id) == uf.find(consumer_id):
-            continue
-        if _can_merge(g, uf, producer_id, consumer_id):
-            uf.merge(producer_id, consumer_id)
+    fused_groups = [grp for grp in groups.values() if len(grp) > 1]
 
-    # Build fused regions.
-    groups = uf.all_groups()
-
-    # Only wrap multi-op groups in FusedRegionOps. Singletons stay as
-    # individual ops — the backend handles them with inline kernels.
-    fused_groups = [grp for grp in groups if len(grp) > 1]
-
-    # For each fused group, replace with FusedRegionOp.
     for grp in fused_groups:
-        # Order ops in the group topologically.
         topo = [nid for nid in g.topological_order() if nid in grp]
 
-        # Find external inputs and outputs.
         external_inputs: list[str] = []
         external_outputs: list[str] = []
         seen_inputs: set[str] = set()
@@ -190,7 +345,6 @@ def auto_fuse(graph: Graph) -> Graph:
                     external_inputs.append(inp_id)
                     seen_inputs.add(inp_id)
 
-        # External outputs: group nodes consumed by nodes outside the group, or graph outputs.
         for nid in topo:
             consumers = g.consumers(nid)
             is_graph_output = nid in g.outputs
@@ -199,19 +353,16 @@ def auto_fuse(graph: Graph) -> Graph:
                 external_outputs.append(nid)
 
         if not external_outputs:
-            continue  # Dead region, skip.
+            continue
 
-        # Build region_ops: [(node_id, op, input_ids), ...]
         region_ops = []
         for nid in topo:
             node = g.nodes[nid]
             region_ops.append((nid, node.op, list(node.inputs)))
 
-        # Determine output shape/dtype from the primary external output.
         primary_out = external_outputs[0]
         out_tensor = g.nodes[primary_out].output
 
-        # Collect shapes for all nodes in the region + external inputs.
         region_shapes: dict[str, tuple] = {}
         for inp_id in external_inputs:
             if inp_id in g.nodes:
@@ -219,7 +370,6 @@ def auto_fuse(graph: Graph) -> Graph:
         for nid in topo:
             region_shapes[nid] = g.nodes[nid].output.shape
 
-        # Create FusedRegionOp node.
         fused_op = FusedRegionOp(
             region_ops=region_ops,
             input_names=external_inputs,
@@ -236,16 +386,13 @@ def auto_fuse(graph: Graph) -> Graph:
             ),
         )
 
-        # Merge hints from constituent nodes into the fused node.
         for nid in topo:
             if nid in graph.nodes:
                 g.nodes[fused_id].hints.merge(graph.nodes[nid].hints)
 
-        # Rewire: consumers of the region's outputs now consume the fused node.
         for out_id in external_outputs:
             g.replace_node(out_id, fused_id)
 
-        # Remove internal nodes.
         for nid in reversed(topo):
             if nid in g.nodes and not g.consumers(nid):
                 g.remove_node(nid)
