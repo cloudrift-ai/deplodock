@@ -99,7 +99,7 @@ def _compile_matmul(op: OpKernel) -> Launch:
 
     # Load tuning profile for this GPU if no explicit hints are set.
     matmul_hints: dict = {}
-    if not any(k.startswith("cuda.matmul.") for k in explicit_hints):
+    if not any(hk.startswith("cuda.matmul.") for hk in explicit_hints):
         from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 
         strategy_map, _profile = default_matmul_strategy_map()
@@ -113,11 +113,26 @@ def _compile_matmul(op: OpKernel) -> Launch:
             matmul_hints = dict(strategy_map[-1][1])
 
     # Explicit hints override tuning defaults.
-    for k, v in explicit_hints.items():
-        if k.startswith("cuda.matmul."):
-            matmul_hints[k[len("cuda.matmul."):]] = v
+    for hk, hv in explicit_hints.items():
+        if hk.startswith("cuda.matmul."):
+            matmul_hints[hk[len("cuda.matmul."):]] = hv
 
     strategy = matmul_hints.get("strategy", "tma_db")
+
+    # Validate BK and k_splits against actual K dimension.
+    bk_val = int(matmul_hints.get("block_k", 32))
+    # BK must not exceed K (otherwise TMA K-loop has 0 iterations).
+    if bk_val > k:
+        bk_val = max(1, k)
+        matmul_hints["block_k"] = bk_val
+    # K_per_split = (K / BK / k_splits) * BK must be > 0.
+    ks = int(matmul_hints.get("k_splits", 1))
+    if ks > 1 and k // bk_val < ks:
+        matmul_hints["k_splits"] = max(1, k // bk_val)
+    # Fall back to naive for very small K (TMA overhead not worth it).
+    if k < 32 and strategy == "tma_db":
+        strategy = "naive"
+        matmul_hints["strategy"] = "naive"
 
     # Generate kernel through the unified path.
     name = _unique_name("matmul")
