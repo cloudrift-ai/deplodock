@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult, ProgramResult
-    from deplodock.compiler.backend.cuda.program import Program
+    from deplodock.compiler.backend.program import Program
     from deplodock.compiler.ir import Graph
     from deplodock.compiler.plan import ExecutionPlan
     from deplodock.compiler.rewriter import PassTrace

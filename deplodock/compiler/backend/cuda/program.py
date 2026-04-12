@@ -1,8 +1,7 @@
-"""Unified GPU program abstraction.
+"""CUDA program: source generation, compilation, and execution.
 
-A Program is a self-contained description of a CUDA computation:
-buffers, kernel sources, and an ordered launch sequence. One runner
-generates a .cu file from any Program, compiles it, and executes it.
+Extends the backend-agnostic Program/Launch/Buffer with CUDA-specific
+features (TMA descriptors, nvcc compilation, GPU execution).
 """
 
 from __future__ import annotations
@@ -14,18 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from deplodock.compiler.backend import BenchmarkResult, ProgramResult
+from deplodock.compiler.backend.program import Buffer, Launch, Program  # noqa: F401 — re-export
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class Buffer:
-    """GPU buffer specification."""
-
-    name: str
-    size: int  # total number of elements
-    dtype: str = "float"
-    role: str = "scratch"  # "input" | "output" | "constant" | "scratch"
 
 
 @dataclass
@@ -44,32 +34,10 @@ class TmaDescriptorSpec:
 
 
 @dataclass
-class Launch:
-    """One kernel invocation."""
+class CudaLaunch(Launch):
+    """CUDA kernel launch with optional TMA descriptor metadata."""
 
-    kernel_source: str  # complete __global__ function
-    kernel_name: str
-    grid: tuple[int, int, int]
-    block: tuple[int, int, int]
-    args: list[str]  # buffer names and scalar literals in param order
-    smem_bytes: int = 0
     tma_descriptors: list[TmaDescriptorSpec] = field(default_factory=list)
-    zero_outputs: list[str] = field(default_factory=list)  # buffers to cudaMemset(0) before launch
-
-
-@dataclass
-class Program:
-    """A complete GPU program: buffers + kernels + launch order."""
-
-    name: str
-    buffers: list[Buffer]
-    launches: list[Launch]
-    defines: dict[str, str] = field(default_factory=dict)
-    includes: list[str] = field(default_factory=list)
-    # Buffer aliases: {alias_name: target_name}. The alias shares the
-    # target's device pointer (no separate allocation). Used for
-    # reshape/transpose which are metadata-only ops.
-    aliases: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +54,7 @@ def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 
         num_iters: Number of timed iterations (benchmark mode).
         warmup: Number of warmup iterations.
     """
-    has_tma = any(launch.tma_descriptors for launch in program.launches)
+    has_tma = any(getattr(launch, "tma_descriptors", None) for launch in program.launches)
     parts: list[str] = []
 
     # Includes.
@@ -210,7 +178,8 @@ def _generate_tma_setup(program: Program) -> str:
     lines: list[str] = []
 
     for launch in program.launches:
-        for desc in launch.tma_descriptors:
+        tma_descs = getattr(launch, "tma_descriptors", [])
+        for desc in tma_descs:
             var = _tma_var(launch, desc)
             buf = _format_arg(desc.buffer, program)
             d0, d1 = desc.dims
@@ -230,7 +199,7 @@ def _generate_tma_setup(program: Program) -> str:
             lines.append("    }")
 
         # Dynamic shared memory attribute.
-        if launch.tma_descriptors and launch.smem_bytes > 0:
+        if tma_descs and launch.smem_bytes > 0:
             lines.append(f"    cudaFuncSetAttribute({launch.kernel_name},cudaFuncAttributeMaxDynamicSharedMemorySize,{launch.smem_bytes});")
 
     return "\n".join(lines)
@@ -247,7 +216,8 @@ def _generate_launches(program: Program) -> str:
             lines.append(f"        cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
 
         # TMA descriptors are prepended to the regular args.
-        tma_args = [_tma_var(launch, d) for d in launch.tma_descriptors]
+        tma_descs = getattr(launch, "tma_descriptors", [])
+        tma_args = [_tma_var(launch, d) for d in tma_descs]
         regular_args = [_format_arg(a, program) for a in launch.args]
         all_args = tma_args + regular_args
         args_str = ", ".join(all_args)

@@ -23,29 +23,31 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  RULE: Operates on Graph IR only. No backend imports.           │
 │        Must not reference CUDA, grid, block, or kernel source.  │
 ├─────────────────────────────────────────────────────────────────┤
-│  LAYER 3: Execution Plan + Shared Codegen (backend-agnostic)    │
+│  LAYER 3: Execution Plan + Shared Infrastructure                │
 │                                                                 │
-│  plan.py:           BufferSpec, OpKernel, ExecutionPlan         │
-│  backend/base.py:   Backend ABC (compile, run, benchmark)       │
-│  backend/ir.py:     Kernel AST (Expr, Stmt, KernelDef)         │
+│  plan.py:            BufferSpec, OpKernel, ExecutionPlan        │
+│  backend/base.py:    Backend ABC (compile, run, benchmark)      │
+│  backend/program.py: Buffer, Launch, Program                    │
+│  backend/ir.py:      Kernel AST (Expr, Stmt, KernelDef)        │
 │  backend/codegen.py: KernelDef → C source                       │
 │                                                                 │
 │  RULE: Describes WHAT to compute, not HOW.                      │
-│        ir.py + codegen.py are generic C/C++ — shared by all     │
-│        backends. No CUDA/HIP-specific API calls.                │
+│        program.py, ir.py, codegen.py are backend-agnostic —     │
+│        shared by all backends. No CUDA/HIP-specific API calls.  │
 │        OpKernel.op is a string tag — the backend resolves it.   │
 ├─────────────────────────────────────────────────────────────────┤
 │  LAYER 4: Backend (CUDA, ROCm, ...)                             │
 │                                                                 │
 │  cuda/backend.py:   CudaBackend (implements Backend ABC)        │
-│  cuda/program.py:   Buffer, Launch, Program, compile, run       │
+│  cuda/program.py:   CudaLaunch, TmaDescriptorSpec, source gen   │
 │  cuda/generators/:  analysis.py + tiled.py (all kernel patterns)│
 │  cuda/runner.py:    Single-kernel compile + run                 │
 │  cuda/tuning.py:    Per-GPU empirical tuning profiles           │
 │                                                                 │
 │  RULE: All GPU-specific code lives here.                        │
+│        CudaLaunch extends Launch with TMA descriptor metadata.  │
 │        A new backend (e.g., rocm/) implements the same          │
-│        Backend ABC, reuses backend/ir.py + backend/codegen.py,  │
+│        Backend ABC, reuses backend/{program,ir,codegen}.py,     │
 │        and provides its own generators + tuning.                │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -140,11 +142,12 @@ compiler/
 ├── backend/          # [L3+L4] Backend abstraction + implementations
 │   ├── __init__.py   #      Re-exports from base.py
 │   ├── base.py       # [L3] Backend ABC, ProgramResult, BenchmarkResult
+│   ├── program.py    # [L3] Buffer, Launch, Program — shared across backends
 │   ├── ir.py         # [L3] Kernel AST (KernelDef, Expr, Stmt) — shared
 │   ├── codegen.py    # [L3] KernelDef → C source — shared
 │   └── cuda/         # [L4] CUDA backend
 │       ├── backend.py    #  CudaBackend implements Backend ABC
-│       ├── program.py    #  Buffer, Launch, Program — compile + run
+│       ├── program.py    #  CudaLaunch, TmaDescriptorSpec, source gen, nvcc
 │       ├── generators/   #  Kernel generators
 │       │   ├── analysis.py #  TileAnalysis: classify FusedRegionOp patterns
 │       │   └── tiled.py  #  Unified tiled generator (analysis → KernelDef)
@@ -186,9 +189,10 @@ class ExecutionPlan:
 
 1. Create `rocm/` directory alongside `cuda/`
 2. Implement `RocmBackend(Backend)` in `rocm/backend.py`
-3. Reuse `backend/ir.py` (kernel AST) and `backend/codegen.py` (C printer) — they are backend-agnostic
-4. Write ROCm-specific generators (tile sizes, warp size 64, no TMA) and tuning profiles
-5. Map the same `OpKernel.op` tags to `.hip` templates
+3. Reuse shared Layer 3 modules: `backend/program.py` (Buffer, Launch, Program), `backend/ir.py` (kernel AST), `backend/codegen.py` (C printer)
+4. Optionally subclass `Launch` for backend-specific metadata (like CUDA's `CudaLaunch` adds `tma_descriptors`)
+5. Write ROCm-specific generators (tile sizes, warp size 64, no TMA) and tuning profiles
+6. Map the same `OpKernel.op` tags to `.hip` templates
 
 ## Graph Transformation (Layer 2)
 
