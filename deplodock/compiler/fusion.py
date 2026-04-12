@@ -266,10 +266,12 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
                     inp_concrete = [d for d in graph.nodes[inp_id].output.shape if isinstance(d, int) and d > 1]
                     inp_max_concrete = max(inp_max_concrete, len(inp_concrete))
             if len(concrete_dims) > inp_max_concrete and inp_max_concrete > 0:
-                # Broadcast expansion — only allow standard 2D matmul broadcasts.
-                if inp_max_concrete <= 2:
-                    continue  # Standard matmul broadcast (2D→3D) — OK
-                return False  # Higher-dim broadcast (4D→5D) — reject
+                # Allow matmul broadcasts that expand by exactly one dim.
+                # Standard 2D: (M,K)×(K,N)→(M,K,N) — 2D→3D
+                # Batched: (B,M,K)×(B,K,N)→(B,M,K,N) — 3D→4D
+                if len(concrete_dims) == inp_max_concrete + 1:
+                    continue  # Matmul broadcast (expands by 1 dim) — OK
+                return False  # Multi-dim expansion — reject
 
     if not is_pure_contraction:
         sizes_full: set[int] = set()

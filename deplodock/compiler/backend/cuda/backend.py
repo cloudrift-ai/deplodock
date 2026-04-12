@@ -94,12 +94,17 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     m = op.params.get("M", 1)
     n = op.params.get("N", 1)
     k = op.params.get("K", 1)
+    batch_size = op.params.get("batch_size", 1)
+    batch_dims = op.params.get("batch_dims", ())
 
     # Build a FusedRegionOp for the matmul pattern, including epilogue ops.
     a_buf, b_buf = op.inputs[0], op.inputs[1]
     c_buf = op.outputs[0]
     all_region_ops = op.params.get("_region_ops", [])
     has_epilogue = len(all_region_ops) > 2
+
+    # Shape prefixes for batched contractions: (B..., M, K) @ (B..., K, N).
+    bp = tuple(batch_dims) if batch_size > 1 else ()
 
     if has_epilogue:
         # Use the full region_ops (contraction core + epilogue).
@@ -117,19 +122,19 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
             input_names=input_names,
             output_names=[c_buf],
         )
-        shapes = {a_buf: (m, k), b_buf: (k, n)}
+        shapes = {a_buf: bp + (m, k), b_buf: bp + (k, n)}
         # Contraction intermediate shapes.
         ew_id = region_ops_list[0][0]
         red_id = region_ops_list[1][0]
-        shapes[ew_id] = (m, k, n)
-        shapes[red_id] = (m, n)
+        shapes[ew_id] = bp + (m, k, n)
+        shapes[red_id] = bp + (m, n)
         # Epilogue ops preserve matmul output shape.
         input_shapes = op.params.get("_input_shapes", {})
         for rid, _, _ in region_ops_list[2:]:
-            shapes[rid] = (m, n)
+            shapes[rid] = bp + (m, n)
         for inp in extra_inputs:
             shapes[inp] = input_shapes.get(inp, (n,))
-        shapes[c_buf] = (m, n)
+        shapes[c_buf] = bp + (m, n)
     else:
         region = FusedRegionOp(
             region_ops=[
@@ -139,7 +144,7 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
             input_names=[a_buf, b_buf],
             output_names=[c_buf],
         )
-        shapes = {a_buf: (m, k), b_buf: (k, n), "ew": (m, k, n), c_buf: (m, n)}
+        shapes = {a_buf: bp + (m, k), b_buf: bp + (k, n), "ew": bp + (m, k, n), c_buf: bp + (m, n)}
         extra_inputs = []
 
     # Determine strategy and tile parameters from hints + tuning profile.
@@ -215,6 +220,11 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     if k < 32 and strategy == "tma_db":
         strategy = "naive"
         matmul_hints["strategy"] = "naive"
+    # Fall back to naive for batched matmuls (program.py TMA setup doesn't
+    # support per-batch descriptor arrays yet).
+    if batch_size > 1 and strategy == "tma_db":
+        strategy = "naive"
+        matmul_hints["strategy"] = "naive"
 
     # Generate kernel through the unified path.
     name = _unique_name("matmul")
@@ -226,16 +236,20 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     tile_m = kernel_def.tile_m or 64
     tile_n = kernel_def.tile_n or 128
 
-    # Grid layout depends on strategy.
+    # Grid layout depends on strategy and batching.
     k_splits = int(matmul_hints.get("k_splits", 1))
+    if batch_size > 1:
+        # Batched: blockIdx.z = batch index (k_splits disabled).
+        k_splits = 1
     ntx = _cd(n, tile_n)
     nty = _cd(m, tile_m)
+    grid_z = batch_size if batch_size > 1 else k_splits
     if strategy == "smem":
         # Standard 2D grid (no CTA swizzle).
-        grid = (ntx, nty, k_splits)
+        grid = (ntx, nty, grid_z)
     else:
         # CTA-swizzle grid (shared between naive and TMA).
-        grid = (ntx * _cd(nty, 8) * 8, 1, k_splits)
+        grid = (ntx * _cd(nty, 8) * 8, 1, grid_z)
 
     # Build TMA metadata if the kernel uses TMA descriptors.
     tma_descs: list[TmaDescriptorSpec] = []
@@ -243,7 +257,10 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
 
     if kernel_def.tma_params:
         # TMA kernels use M/N/K as compile-time macros in the kernel body.
-        source = f"#define M {m}\n#define N {n}\n#define K {k}\n{source}\n#undef M\n#undef N\n#undef K\n"
+        batch_defines = f"#define BATCH_COUNT {batch_size}\n" if batch_size > 1 else ""
+        source = f"#define M {m}\n#define N {n}\n#define K {k}\n{batch_defines}{source}\n#undef M\n#undef N\n#undef K\n"
+        if batch_size > 1:
+            source = source.rstrip() + "\n#undef BATCH_COUNT\n"
 
         bk = int(matmul_hints.get("block_k", 32))  # must match tiled.py
         a_tile = tile_m * bk
@@ -275,7 +292,9 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     else:
         # Naive/smem: A, B, C, M, N, K as regular params.
         args = [*op.inputs, *op.outputs, str(m), str(n), str(k)]
-        if k_splits > 1:
+        if batch_size > 1:
+            args.append(str(batch_size))
+        elif k_splits > 1:
             args.append(str(k_splits))
 
     return CudaLaunch(
@@ -413,12 +432,26 @@ def _compile_fused_region(op: OpKernel) -> CudaLaunch:
 
     # 2-op matmul pattern (mul + sum) goes through the dedicated SGEMM path,
     # which handles batched/transposed shapes and TMA strategies.
-    is_matmul, m, n, k = _is_matmul_region(op)
-    if is_matmul:
-        op.params["M"] = m
-        op.params["N"] = n
-        op.params["K"] = k
-        return _compile_matmul(op)
+    # For >2D matmul operands (batched matmul), skip this shortcut — the
+    # analyze path below detects batch dims and passes them to _compile_matmul.
+    from deplodock.compiler.ops import ElementwiseOp as _EwOp
+
+    input_shapes = op.params.get("_input_shapes", {})
+    region_ops = op.params.get("_region_ops", [])
+    has_batched_matmul = False
+    if len(region_ops) >= 2:
+        _, op0, inputs0 = region_ops[0]
+        if isinstance(op0, _EwOp) and op0.fn == "mul" and len(inputs0) == 2:
+            a_shape = input_shapes.get(inputs0[0], ())
+            b_shape = input_shapes.get(inputs0[1], ())
+            has_batched_matmul = len(a_shape) > 2 and len(b_shape) > 2
+    if not has_batched_matmul:
+        is_matmul, m, n, k = _is_matmul_region(op)
+        if is_matmul:
+            op.params["M"] = m
+            op.params["N"] = n
+            op.params["K"] = k
+            return _compile_matmul(op)
 
     from deplodock.compiler.backend.codegen import emit_kernel
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
@@ -432,6 +465,9 @@ def _compile_fused_region(op: OpKernel) -> CudaLaunch:
         op.params["M"] = analysis.rows
         op.params["N"] = analysis.cols
         op.params["K"] = analysis.k_dim
+        if analysis.batch_size > 1:
+            op.params["batch_size"] = analysis.batch_size
+            op.params["batch_dims"] = analysis.batch_dims
         return _compile_matmul(op)
 
     # Unified path: analyze → lower_tiled → emit_kernel.
