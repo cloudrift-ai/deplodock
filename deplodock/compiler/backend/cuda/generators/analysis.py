@@ -8,7 +8,7 @@ reduce_broadcast, or contraction.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
 
@@ -18,11 +18,16 @@ RegionEntry = tuple[str, object, list[str]]
 
 @dataclass
 class OpPhases:
-    """Ops split into prologue (before first reduce), reduces, epilogue (after last reduce)."""
+    """Ops split into prologue (before first reduce), reduces, epilogue (after last reduce).
+
+    For multi-reduce patterns (e.g. softmax max+sum), inter_reduce[i] holds the
+    ops between reduces[i] and reduces[i+1].
+    """
 
     prologue: list[RegionEntry]
     reduces: list[RegionEntry]
     epilogue: list[RegionEntry]
+    inter_reduce: list[list[RegionEntry]] = field(default_factory=list)
 
 
 @dataclass
@@ -173,21 +178,41 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
 
 
 def _split_phases(region_ops: list) -> OpPhases:
-    """Split region ops into prologue, reduces, epilogue."""
-    prologue = []
-    reduces = []
-    epilogue = []
+    """Split region ops into prologue, reduces, inter-reduce ops, and epilogue.
+
+    For multi-reduce (e.g. softmax: max → sub → exp → sum → div):
+      prologue = [] (or scale op)
+      reduces = [max, sum]
+      inter_reduce = [[sub, exp]]  (ops between max and sum)
+      epilogue = [div]
+    """
+    prologue: list[RegionEntry] = []
+    reduces: list[RegionEntry] = []
+    inter_reduce: list[list[RegionEntry]] = []
+    epilogue: list[RegionEntry] = []
+    current_inter: list[RegionEntry] = []
     phase = "prologue"
     for entry in region_ops:
         _, op, _ = entry
         if isinstance(op, ReduceOp):
+            if phase == "epilogue":
+                # Second+ reduce: save inter-reduce ops, start new inter group.
+                inter_reduce.append(current_inter)
+                current_inter = []
             reduces.append(entry)
             phase = "epilogue"
         elif phase == "prologue":
             prologue.append(entry)
         else:
-            epilogue.append(entry)
-    return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue)
+            current_inter.append(entry)
+    # Everything after the last reduce goes into epilogue.
+    epilogue = current_inter
+    return OpPhases(
+        prologue=prologue,
+        reduces=reduces,
+        epilogue=epilogue,
+        inter_reduce=inter_reduce,
+    )
 
 
 def _needed_by(ops: list) -> set[str]:
