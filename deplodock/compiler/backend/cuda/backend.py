@@ -34,7 +34,10 @@ class CudaBackend(Backend):
         """Map OpKernels to .cu templates and build a Program."""
         _name_counters.clear()
 
-        buffers = [Buffer(name=b.name, size=math.prod(b.shape), dtype="float", role=b.role) for b in plan.buffers]
+        def _safe_prod(shape):
+            return math.prod(d for d in shape if isinstance(d, int)) if shape else 1
+
+        buffers = [Buffer(name=b.name, size=_safe_prod(b.shape), dtype="float", role=b.role) for b in plan.buffers]
 
         launches = []
         for op in plan.ops:
@@ -273,8 +276,7 @@ def _compile_fused_region(op: OpKernel) -> Launch:
     region, shapes = _build_region_and_shapes(op)
     analysis = analyze(region, shapes)
 
-    # Contraction patterns with >2 ops (e.g., matmul+residual_add) also
-    # use the dedicated SGEMM path.
+    # ALL contraction patterns go through _compile_matmul (handles TMA, k_splits, tuning).
     if analysis.pattern == "contraction":
         op.params["M"] = analysis.rows
         op.params["N"] = analysis.cols
