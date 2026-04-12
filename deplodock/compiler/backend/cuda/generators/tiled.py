@@ -126,7 +126,7 @@ def lower_tiled(
     For contraction strategies (naive or tma_db), the same code path handles
     grid setup, accumulators, and write.  Only the K-loop body differs.
     """
-    return _lower_naive(region, name, shapes, analysis, strategy=strategy)
+    return _lower_naive(region, name, shapes, analysis, strategy=strategy, hints=hints or {})
 
 
 # ---------------------------------------------------------------------------
@@ -301,11 +301,16 @@ def _lower_naive(
     analysis: TileAnalysis,
     *,
     strategy: str = "naive",
+    hints: dict | None = None,
 ) -> KernelDef:
     """Single generator for all patterns.  For contractions, `strategy`
     selects the K-loop implementation: 'naive' (global loads) or 'tma_db'
     (TMA double-buffered shared memory pipeline).  All other phases
-    (grid, accumulators, write) are shared."""
+    (grid, accumulators, write) are shared.
+
+    Hints (cuda.matmul.* namespace, without prefix):
+        block_k: K-tile size (default 16 for naive, 32 for tma_db)
+    """
     is_contraction = analysis.pattern == "contraction"
     is_pointwise = analysis.pattern == "pointwise"
     has_reduce = bool(analysis.op_phases.reduces)
@@ -396,7 +401,9 @@ def _lower_naive(
         b_name = _safe(analysis.contraction_b)
         out_id = region.output_names[0]
         c_name = _safe(out_id)
-        bk = 16  # K-tile size (shared between naive and TMA)
+        _hints = hints or {}
+        default_bk = 32 if strategy == "tma_db" else 16
+        bk = int(_hints.get("block_k", default_bk))
         a_size = tile_m * bk
         b_size = bk * tile_n
         stage = a_size + b_size
