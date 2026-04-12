@@ -109,6 +109,23 @@ def _is_contraction_op(nid: str, graph) -> bool:
     return False
 
 
+def _is_row_reduce_op(op, node, graph) -> bool:
+    """Check if a ReduceOp reduces along the last axis (row reduce)."""
+    from deplodock.compiler.ops import ReduceOp
+
+    if not isinstance(op, ReduceOp):
+        return False
+    if op.axis == -1:
+        return True
+    if isinstance(op.axis, int) and node.inputs:
+        inp = node.inputs[0]
+        if inp in graph.nodes:
+            ndim = len(graph.nodes[inp].output.shape)
+            if ndim > 0 and op.axis == ndim - 1:
+                return True
+    return False
+
+
 def _reduces_compatible(r1_id: str, r2_id: str, graph) -> bool:
     """Can two ReduceOps coexist in one fused region?"""
     from deplodock.compiler.ops import ReduceOp
@@ -202,11 +219,31 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
         from deplodock.compiler.ops import ElementwiseOp as _EpiEwOp
 
         contraction_ids = {nid for nid in merged if _is_contraction_op(nid, graph)}
+        # Reject if multiple contraction pairs (e.g. QK^T + attn@V).
+        contraction_reduces = [nid for nid in contraction_ids if isinstance(graph.nodes[nid].op, ReduceOp)]
+        if len(contraction_reduces) > 1:
+            return False  # Two+ contraction pairs — can't fuse.
         non_contraction = [nid for nid in merged if nid not in contraction_ids]
         if non_contraction:
-            # All non-contraction ops must be pointwise ElementwiseOp.
-            for nid in non_contraction:
+            # Non-contraction ops must be pointwise ElementwiseOp or
+            # compatible row reduces (for contraction+softmax fusion).
+            # Row reduces are only allowed when they form a compatible pair
+            # (e.g. max+sum for softmax) — reject single non-contraction reduces.
+            nc_reduces = [
+                nid
+                for nid in non_contraction
+                if isinstance(graph.nodes[nid].op, ReduceOp) and _is_row_reduce_op(graph.nodes[nid].op, graph.nodes[nid], graph)
+            ]
+            nc_non_reduce = [nid for nid in non_contraction if nid not in nc_reduces]
+            # All non-reduce, non-contraction ops must be pointwise.
+            for nid in nc_non_reduce:
                 if not isinstance(graph.nodes[nid].op, _EpiEwOp):
+                    return False
+            # Row reduces only allowed as compatible pairs (max+sum for softmax).
+            if len(nc_reduces) == 1:
+                return False  # Single row reduce after contraction — not supported.
+            if len(nc_reduces) > 1:
+                if not all(_reduces_compatible(nc_reduces[0], rid, graph) for rid in nc_reduces[1:]):
                     return False
             # Find contraction output shape (the ReduceOp node's output).
             contraction_out_shape = None
@@ -242,10 +279,11 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
     #    Reject if any reduce is a contraction reduce or reduces are incompatible.
     reduce_ids = [nid for nid in merged if isinstance(graph.nodes[nid].op, ReduceOp)]
     if len(reduce_ids) > 1:
-        if has_contraction:
-            return False  # Contraction + multi-reduce — not yet supported.
-        if not all(_reduces_compatible(reduce_ids[0], rid, graph) for rid in reduce_ids[1:]):
-            return False
+        # Filter out the contraction reduce (it's handled by the matmul K-loop).
+        non_contraction_reduces = [rid for rid in reduce_ids if not _is_contraction_op(rid, graph)]
+        if len(non_contraction_reduces) > 1:
+            if not all(_reduces_compatible(non_contraction_reduces[0], rid, graph) for rid in non_contraction_reduces[1:]):
+                return False
 
     # 4. Shape compatibility: all 2D+ external inputs must have the same total
     #    size (the kernel uses a single row*cols+j index for all).
