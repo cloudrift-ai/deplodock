@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from deplodock.compiler.fusion import UnionFind, auto_fuse
+from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.ops import FusedRegionOp
 from deplodock.compiler.rewriter import Rewriter
@@ -20,30 +20,6 @@ def _load_and_decompose() -> Graph:
     # Run only decomposition pass.
     decomp_pass = [p for p in rewriter.passes if p.name == "decomposition"][0]
     return decomp_pass.apply(g)
-
-
-# ---- UnionFind tests ----
-
-
-def test_union_find_basic():
-    uf = UnionFind()
-    uf.add("a")
-    uf.add("b")
-    uf.add("c")
-    assert uf.find("a") != uf.find("b")
-    uf.merge("a", "b")
-    assert uf.find("a") == uf.find("b")
-    assert uf.members("a") == {"a", "b"}
-
-
-def test_union_find_all_groups():
-    uf = UnionFind()
-    for x in "abcde":
-        uf.add(x)
-    uf.merge("a", "b")
-    uf.merge("c", "d")
-    groups = uf.all_groups()
-    assert len(groups) == 3  # {a,b}, {c,d}, {e}
 
 
 # ---- auto_fuse tests on decomposed TinyLlama ----
