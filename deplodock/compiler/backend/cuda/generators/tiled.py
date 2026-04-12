@@ -404,6 +404,7 @@ def _lower_naive(
         _hints = hints or {}
         default_bk = 32 if strategy == "tma_db" else 16
         bk = int(_hints.get("block_k", default_bk))
+        k_splits = int(_hints.get("k_splits", 1))
         a_size = tile_m * bk
         b_size = bk * tile_n
         stage = a_size + b_size
@@ -427,26 +428,49 @@ def _lower_naive(
             f"W({r},{','.join(f'c{r}{c}' for c in range(thread_n))})"
             for r in range(thread_m)
         )
-        # Always bounds-check: M/N are runtime params (not compile-time #defines),
-        # so the #if optimization can't be used here. TMA kernels get M/N/K as
-        # #defines from the backend and can use the aligned fast path.
+        # W() macro: bounds-checked writes. Uses atomicAdd when k_splits > 1
+        # (multiple blocks accumulate partial results into the same output).
+        if k_splits > 1:
+            w_body = (
+                "if(gc<N)atomicAdd(&Cout[gr*N+gc],v0);"
+                "if(gc+1<N)atomicAdd(&Cout[gr*N+gc+1],v1);"
+                "if(gc+2<N)atomicAdd(&Cout[gr*N+gc+2],v2);"
+                "if(gc+3<N)atomicAdd(&Cout[gr*N+gc+3],v3);"
+            )
+        else:
+            w_body = (
+                "if(gc<N)Cout[gr*N+gc]=v0;"
+                "if(gc+1<N)Cout[gr*N+gc+1]=v1;"
+                "if(gc+2<N)Cout[gr*N+gc+2]=v2;"
+                "if(gc+3<N)Cout[gr*N+gc+3]=v3;"
+            )
         write_macro = (
             f"#define W(r,v0,v1,v2,v3) {{int gr=bm+tr+(r);"
             f"if(gr<M){{int gc=bn+tc;float*Cout={c_name}; "
-            f"if(gc<N)Cout[gr*N+gc]=v0;if(gc+1<N)Cout[gr*N+gc+1]=v1;"
-            f"if(gc+2<N)Cout[gr*N+gc+2]=v2;"
-            f"if(gc+3<N)Cout[gr*N+gc+3]=v3;}}}}\n"
+            f"{w_body}}}}}\n"
             f"    {w_calls}"
         )
 
         # --- Strategy-specific: K-loop body ---
         if strategy == "tma_db":
             # TMA double-buffered K-loop: smem setup + mbarrier pipeline.
-            # The FMA block reads from smem (cas/cbs) filled by TMA.
             tma_a_ref = f"&{a_name}_tma"
             tma_b_ref = f"&{b_name}_tma"
             smem_bytes = stage * 4
-            body.append(RawCode(
+            first_k = "k_start" if k_splits > 1 else "0"
+            next_k_prefix = "k_start+" if k_splits > 1 else ""
+
+            if k_splits > 1:
+                k_range_code = (
+                    f"int k_per_split=(K/{bk}/k_splits)*{bk};\n"
+                    f"int k_start=blockIdx.z*k_per_split;\n"
+                    f"int k_end=(blockIdx.z==k_splits-1)?K:k_start+k_per_split;\n"
+                    f"int p0=0,p1=0,nt=(k_end-k_start)/{bk};\n"
+                )
+            else:
+                k_range_code = f"int p0=0,p1=0,nt=K/{bk};\n"
+
+            tma_code = (
                 f"extern __shared__ __align__(128) char dsmem[];\n"
                 f"float*smem=(float*)dsmem;\n"
                 f"uint64_t*mbar=(uint64_t*)(dsmem+2*{stage}*4);\n"
@@ -457,37 +481,37 @@ def _lower_naive(
                 f"const int mb0=(int)__cvta_generic_to_shared(&mbar[0]);\n"
                 f"const int mb1=(int)__cvta_generic_to_shared(&mbar[1]);\n"
                 f"int tid=threadIdx.y*{tx}+threadIdx.x;\n"
-                f"if(tid==0){{asm volatile(\"mbarrier.init.shared::cta.b64 [%0],%1;\"::\"r\"(mb0),\"r\"(1));"
-                f"asm volatile(\"mbarrier.init.shared::cta.b64 [%0],%1;\"::\"r\"(mb1),\"r\"(1));"
-                f"asm volatile(\"fence.mbarrier_init.release.cluster;\");}}\n"
+                f'if(tid==0){{asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb0),"r"(1));'
+                f'asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));'
+                f'asm volatile("fence.mbarrier_init.release.cluster;");}}\n'
                 f"__syncthreads();\n"
                 f"float {acc_decls};\n"
                 f"const int bytes={smem_bytes};\n"
-                f"int p0=0,p1=0,nt=K/{bk};\n"
+                f"{k_range_code}"
                 f"if(nt>0&&tid==0){{"
                 f'asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 '
                 f'_,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");'
                 f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
-                f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
-                f'::"r"(as0),"l"({tma_a_ref}),"r"(0),"r"(bm),"r"(mb0):"memory");'
+                f"::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];\""
+                f'::"r"(as0),"l"({tma_a_ref}),"r"({first_k}),"r"(bm),"r"(mb0):"memory");'
                 f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
-                f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
-                f'::"r"(bs0),"l"({tma_b_ref}),"r"(bn),"r"(0),"r"(mb0):"memory");}}\n'
+                f"::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];\""
+                f'::"r"(bs0),"l"({tma_b_ref}),"r"(bn),"r"({first_k}),"r"(mb0):"memory");}}\n'
                 f"for(int t=0;t<nt;t++){{\n"
                 f"    int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;\n"
                 f"    int nm=s==0?mb1:mb0;int na=s==0?as1:as0;int nb=s==0?bs1:bs0;\n"
-                f"    asm volatile(\"{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\t"
+                f'    asm volatile("{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\t'
                 f"mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t"
-                f"@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}\"::\"r\"(cm),\"r\"(cp),\"r\"(0xffffffff));\n"
+                f'@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}"::"r"(cm),"r"(cp),"r"(0xffffffff));\n'
                 f"    if(s==0)p0^=1;else p1^=1;\n"
-                f"    if(tid==0&&t+1<nt){{int nk=(t+1)*{bk};"
+                f"    if(tid==0&&t+1<nt){{int nk={next_k_prefix}(t+1)*{bk};"
                 f'asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 '
                 f'_,[%0],%1;"::"r"(nm),"r"(bytes):"memory");'
                 f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
-                f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+                f"::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];\""
                 f'::"r"(na),"l"({tma_a_ref}),"r"(nk),"r"(bm),"r"(nm):"memory");'
                 f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
-                f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+                f"::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];\""
                 f'::"r"(nb),"l"({tma_b_ref}),"r"(bn),"r"(nk),"r"(nm):"memory");}}\n'
                 f"    float*cas=&smem[s*{stage}];float*cbs=&smem[s*{stage}+{a_size}];\n"
                 f"    #pragma unroll\n"
@@ -499,12 +523,15 @@ def _lower_naive(
                 f"    __syncthreads();\n"
                 f"}}\n"
                 f"{write_macro}"
-            ))
+            )
+            body.append(RawCode(tma_code))
 
             # TMA kernel: only C (output) as regular param.
             # A/B come via TMA descriptors; M/N/K come via #define from backend.
             tma_exclude = {a_name, b_name, "M", "N", "K"}
             params = [p for p in params if p.name not in tma_exclude]
+            if k_splits > 1:
+                params.append(KernelParam("int", "k_splits"))
 
             return KernelDef(
                 name=name, params=params, body=body, block_size=block_size,
