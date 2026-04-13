@@ -106,21 +106,40 @@ def _lower_expr(expr: LoopExpr) -> Expr:
 # Op lowering
 # ---------------------------------------------------------------------------
 
-# Map elementwise op names to C/CUDA expression builders.
-_ELEM_OPS: dict[str, object] = {
-    "mul": lambda a, b: BinOp("*", a, b),
-    "add": lambda a, b: BinOp("+", a, b),
-    "sub": lambda a, b: BinOp("-", a, b),
-    "div": lambda a, b: BinOp("/", a, b),
-    "mod": lambda a, b: BinOp("%", a, b),
-    "neg": lambda a, _b: BinOp("-", Literal(0.0), a),
-    "exp": lambda a, _b: FuncCall("expf", [a]),
-    "rsqrt": lambda a, _b: FuncCall("rsqrtf", [a]),
-    "recip": lambda a, _b: BinOp("/", Literal(1.0), a),
-    "relu": lambda a, _b: FuncCall("fmaxf", [Literal(0.0), a]),
-    # Identity-like: just returns the first arg (used for builtin aliases)
-    "builtin": lambda a, _b: a,
+# CUDA C expression templates for elementwise ops.
+# {a} and {b} are placeholders for lowered operand expressions.
+_C_EXPR: dict[str, str] = {
+    "add": "{a} + {b}",
+    "sub": "{a} - {b}",
+    "mul": "{a} * {b}",
+    "div": "{a} / {b}",
+    "mod": "{a} % {b}",
+    "neg": "-{a}",
+    "exp": "expf({a})",
+    "rsqrt": "rsqrtf({a})",
+    "recip": "1.0f / {a}",
+    "relu": "fmaxf(0.0f, {a})",
+    "tanh": "tanhf({a})",
+    "sigmoid": "1.0f / (1.0f + expf(-{a}))",
+    # Identity-like: used for builtin aliases (e.g. batch = blockIdx.z)
+    "builtin": "{a}",
 }
+
+
+def _render_c_expr(op_name: str, a: str, b: str = "0.0f") -> str:
+    """Render a C expression from the template for an elementwise op.
+
+    Binary op arguments are parenthesized to preserve precedence.
+    """
+    from deplodock.compiler.ops import OP_REGISTRY, _DEFAULT_OP_INFO
+
+    tmpl = _C_EXPR.get(op_name)
+    if tmpl is None:
+        return f"/* unknown op: {op_name} */ 0.0f"
+    info = OP_REGISTRY.get(op_name, _DEFAULT_OP_INFO)
+    if info.arity == 2:
+        return tmpl.format(a=f"({a})", b=f"({b})")
+    return tmpl.format(a=a, b=b)
 
 
 def _lower_ops(ops: list[LoopOp]) -> list[Stmt]:
@@ -227,18 +246,13 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         # references dst, emit assignment instead of declaration.
         is_inplace = _refs_name(op.args, op.dst)
         dtype = op.dtype
-        builder = _ELEM_OPS.get(op.op)
-        if builder:
-            args_lowered = [_lower_expr(a) for a in op.args]
-            a = args_lowered[0]
-            b = args_lowered[1] if len(args_lowered) > 1 else Literal(0.0)
-            expr = builder(a, b)
-            if is_inplace:
-                return [VarAssign(op.dst, expr)]
-            return [VarDecl(dtype, op.dst, expr)]
+        args_lowered = [_lower_expr(a) for a in op.args]
+        a_str = _expr_to_c(args_lowered[0]) if args_lowered else "0.0f"
+        b_str = _expr_to_c(args_lowered[1]) if len(args_lowered) > 1 else "0.0f"
+        c_code = _render_c_expr(op.op, a_str, b_str)
         if is_inplace:
-            return [VarAssign(op.dst, Literal(0.0))]
-        return [VarDecl(dtype, op.dst, Literal(0.0))]
+            return [RawCode(f"{op.dst} = {c_code};")]
+        return [RawCode(f"{dtype} {op.dst} = {c_code};")]
 
     if isinstance(op, Accumulate):
         val = _lower_expr(op.value)

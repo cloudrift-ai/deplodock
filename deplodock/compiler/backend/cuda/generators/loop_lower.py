@@ -530,29 +530,6 @@ def _safe(name: str) -> str:
     return name.replace("-", "_").replace(".", "_").replace(" ", "_")
 
 
-def _build_loop_expr(fn: str, a: LoopExpr, b: LoopExpr | None = None) -> LoopExpr | None:
-    """Map an ElementwiseOp function name to a LoopExpr."""
-    if fn == "mul":
-        return LoopBinOp("*", a, b)
-    if fn == "add":
-        return LoopBinOp("+", a, b)
-    if fn == "sub":
-        return LoopBinOp("-", a, b)
-    if fn == "div":
-        return LoopBinOp("/", a, b)
-    if fn == "neg":
-        return LoopBinOp("-", LoopLiteral(0.0), a)
-    if fn == "exp":
-        return LoopFuncCall("expf", [a])
-    if fn == "rsqrt":
-        return LoopFuncCall("rsqrtf", [a])
-    if fn == "recip":
-        return LoopBinOp("/", LoopLiteral(1.0), a)
-    if fn == "relu":
-        return LoopFuncCall("fmaxf", [LoopLiteral(0.0), a])
-    return None
-
-
 def _reduce_init_expr(fn: str) -> LoopLiteral:
     """Initial value for a reduction accumulator."""
     if fn == "sum":
@@ -604,11 +581,9 @@ def _emit_loop_ops(
         if isinstance(op, ElementwiseOp):
             a = var_map.get(input_ids[0], LoopLiteral(0.0)) if input_ids else LoopLiteral(0.0)
             b = var_map.get(input_ids[1], LoopLiteral(0.0)) if len(input_ids) > 1 else LoopLiteral(0.0)
-            expr = _build_loop_expr(op.fn, a, b)
-            if expr is None:
-                expr = LoopLiteral(0.0)
             var_name = f"{prefix}{_safe(node_id)}"
-            body.append(Compute(var_name, op.fn, [a] if len(input_ids) == 1 else [a, b]))
+            args = [a, b] if op.info.arity == 2 and len(input_ids) > 1 else [a]
+            body.append(Compute(var_name, op.fn, args))
             var_map[node_id] = LoopVar(var_name)
 
 
@@ -1070,9 +1045,9 @@ def _apply_ops_on_register_tile(
             continue
         fn = ir_op.fn
 
-        # Find the "other" input (not the accumulator chain).
+        # Find the "other" input (not the accumulator chain) for binary ops.
         other = None
-        if len(inputs) == 2:
+        if ir_op.info.arity == 2 and len(inputs) == 2:
             for inp in inputs:
                 if inp != prev_id:
                     other = inp
