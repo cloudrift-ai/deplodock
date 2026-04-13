@@ -1254,9 +1254,8 @@ def _lower_contraction_naive(
     is_batched = analysis.batch_size > 1
     k_splits = int(hints.get("k_splits", 1))
 
-    A_buf = _safe(analysis.contraction_a)  # noqa: N806
-    B_buf = _safe(analysis.contraction_b)  # noqa: N806
-    A, B = LoopVar(A_buf), LoopVar(B_buf)  # noqa: N806
+    A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
+    B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
     out_id = region.output_names[0]
 
     # Params
@@ -1342,8 +1341,8 @@ def _lower_contraction_tma(
     bk = int(hints.get("block_k", 32))
     phases = analysis.op_phases
 
-    A_buf = _safe(analysis.contraction_a)  # noqa: N806
-    B_buf = _safe(analysis.contraction_b)  # noqa: N806
+    A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
+    B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
     out_id = region.output_names[0]
     a_size = tile_m * bk
     b_size = bk * tile_n
@@ -1351,7 +1350,7 @@ def _lower_contraction_tma(
 
     # TMA params: A/B come via descriptors, only C + epilogue inputs as regular params.
     # M/N/K come via #define from backend.py.
-    tma_exclude = {A_buf, B_buf, "M", "N", "K"}
+    tma_exclude = {A.name, B.name, "M", "N", "K"}
     if is_batched:
         tma_exclude.add("batch_count")
     params = [(dt, nm) for dt, nm in _build_params(region) if nm not in tma_exclude]
@@ -1366,8 +1365,8 @@ def _lower_contraction_tma(
     # TMA double-buffered K-loop (CUDA extension op)
     from deplodock.compiler.backend.cuda.tma_ops import TMAKLoop
 
-    tma_a_ref = f"&{A_buf}_tma[batch]" if is_batched else f"&{A_buf}_tma"
-    tma_b_ref = f"&{B_buf}_tma[batch]" if is_batched else f"&{B_buf}_tma"
+    tma_a_ref = f"&{A.name}_tma[batch]" if is_batched else f"&{A.name}_tma"
+    tma_b_ref = f"&{B.name}_tma[batch]" if is_batched else f"&{B.name}_tma"
 
     body.append(
         TMAKLoop(
@@ -1402,7 +1401,7 @@ def _lower_contraction_tma(
         block_size=(tx, ty, 1),
         tile_m=tile_m,
         tile_n=tile_n,
-        tma_params=[f"{A_buf}_tma", f"{B_buf}_tma"],
+        tma_params=[f"{A.name}_tma", f"{B.name}_tma"],
         batched=is_batched,
         includes=["cuda.h"],
     )
