@@ -18,6 +18,7 @@ from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _n
 from deplodock.compiler.backend.loop_ir import (
     Accumulate,
     Alloc,
+    Barrier,
     Compute,
     Guard,
     Load,
@@ -28,6 +29,7 @@ from deplodock.compiler.backend.loop_ir import (
     LoopLiteral,
     LoopNest,
     LoopProgram,
+    LoopTernary,
     LoopVar,
     ParallelAxis,
     RawLoopOp,
@@ -1255,10 +1257,9 @@ def _lower_contraction_smem(
 ) -> LoopProgram:
     """Lower contraction (smem strategy) to LoopIR.
 
-    Block: (32, 4) = 128 threads. Shared memory for A tile, global loads for B.
-    Grid setup, K-tile loop, and write use RawLoopOp for the smem-specific
-    patterns (bank-conflict padding, float4 fast path). Accumulator decl and
-    write use proper LoopIR with register arrays.
+    Block: (32, 4) = 128 threads. Shared memory for A tile (bank-conflict
+    padded), scalar global loads for B (nvcc auto-vectorizes to float4).
+    Fully expressed in LoopIR — no RawLoopOp.
     """
     a_name = _safe(analysis.contraction_a)
     b_name = _safe(analysis.contraction_b)
@@ -1274,6 +1275,7 @@ def _lower_contraction_smem(
     tile_m = ty * thread_m
     tile_n = tx * thread_n  # 128
     smem_stride = bk + 1  # bank conflict padding
+    I = "int"  # noqa: E741
 
     params = _build_params(region)
     params.extend([("int", "M"), ("int", "N"), ("int", "K")])
@@ -1284,82 +1286,134 @@ def _lower_contraction_smem(
 
     body: list = []
 
-    # Grid setup: thread mapping, shared memory decl, K-range
-    k_range = (
-        f"int k_per=(K/{bk}/k_splits)*{bk};\nint k_start=blockIdx.z*k_per;\nint k_end=(blockIdx.z==k_splits-1)?K:k_start+k_per;"
-        if k_splits > 1
-        else "int k_start=0,k_end=K;"
-    )
-    batch_decl = "int batch=blockIdx.z;\n" if is_batched else ""
+    # Grid setup
+    if is_batched:
+        body.append(Compute("batch", "builtin", [LoopBuiltin("blockIdx.z")], dtype=I))
     body.append(
-        RawLoopOp(
-            f"{batch_decl}"
-            f"int row_base=(blockIdx.y*{ty}+threadIdx.y)*{thread_m};\n"
-            f"int col_base=(blockIdx.x*{tx}+threadIdx.x)*{thread_n};\n"
-            f"int sr=threadIdx.y*{thread_m};\n"
-            f"__shared__ float As[{tile_m}][{smem_stride}];\n"
-            f"{k_range}",
-            "smem grid setup",
+        Compute(
+            "row_base",
+            "mul",
+            [
+                LoopBinOp("+", LoopBinOp("*", LoopBuiltin("blockIdx.y"), LoopLiteral(ty, I)), LoopBuiltin("threadIdx.y")),
+                LoopLiteral(thread_m, I),
+            ],
+            dtype=I,
         )
     )
+    body.append(
+        Compute(
+            "col_base",
+            "mul",
+            [
+                LoopBinOp("+", LoopBinOp("*", LoopBuiltin("blockIdx.x"), LoopLiteral(tx, I)), LoopBuiltin("threadIdx.x")),
+                LoopLiteral(thread_n, I),
+            ],
+            dtype=I,
+        )
+    )
+    body.append(Compute("sr", "mul", [LoopBuiltin("threadIdx.y"), LoopLiteral(thread_m, I)], dtype=I))
+
+    # Shared memory for A tile (bank-conflict padded stride)
+    body.append(Alloc("As", "float", (tile_m * smem_stride,), "smem"))
+
+    # K-range for k_splits
+    if k_splits > 1:
+        body.append(
+            Compute(
+                "k_per",
+                "mul",
+                [LoopBinOp("/", LoopBinOp("/", LoopVar("K"), LoopLiteral(bk, I)), LoopVar("k_splits")), LoopLiteral(bk, I)],
+                dtype=I,
+            )
+        )
+        body.append(Compute("k_start", "mul", [LoopBuiltin("blockIdx.z"), LoopVar("k_per")], dtype=I))
+        body.append(
+            Compute(
+                "k_end",
+                "builtin",
+                [
+                    LoopTernary(
+                        LoopBinOp("==", LoopBuiltin("blockIdx.z"), LoopLiteral(k_splits - 1, I)),
+                        LoopVar("K"),
+                        LoopBinOp("+", LoopVar("k_start"), LoopVar("k_per")),
+                    )
+                ],
+                dtype=I,
+            )
+        )
+    else:
+        body.append(Compute("k_start", "builtin", [LoopLiteral(0, I)], dtype=I))
+        body.append(Compute("k_end", "builtin", [LoopVar("K")], dtype=I))
 
     # Accumulator register array
     body.append(Alloc("c", "float", (thread_m, thread_n), "reg", LoopLiteral(0.0)))
 
-    # K-tile loop (smem for A, global for B, float4 fast path)
-    a_local = "Ab" if is_batched else a_name
-    b_local = "Bb" if is_batched else b_name
-    a_load = "\n    ".join(
-        f"As[sr+{r}][threadIdx.x]=(row_base+{r}<M&&tk+threadIdx.x<K)?{a_local}[(row_base+{r})*K+tk+threadIdx.x]:0.0f;"
-        for r in range(thread_m)
-    )
-    a_reads = "\n        ".join(f"float a{r}=As[sr+{r}][kk];" for r in range(thread_m))
-    fma = "\n        ".join("".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n)) for r in range(thread_m))
-    scalar_b_loads = "\n        ".join(f"float b{c}=(col_base+{c}<N)?{b_local}[(tk+kk)*N+col_base+{c}]:0.0f;" for c in range(thread_n))
-    batch_ptrs = f"const float*Ab={a_name}+batch*M*K;\nconst float*Bb={b_name}+batch*K*N;\n" if is_batched else ""
-    body.append(
-        RawLoopOp(
-            f"{batch_ptrs}"
-            f"for(int tk=k_start;tk<k_end;tk+={bk}){{\n"
-            f"    {a_load}\n"
-            f"    __syncthreads();\n"
-            f"    if(col_base+3<N){{\n"
-            f"    #pragma unroll\n"
-            f"    for(int kk=0;kk<{bk};kk++){{\n"
-            f"        float b0={b_local}[(tk+kk)*N+col_base],"
-            f"b1={b_local}[(tk+kk)*N+col_base+1],"
-            f"b2={b_local}[(tk+kk)*N+col_base+2],"
-            f"b3={b_local}[(tk+kk)*N+col_base+3];\n"
-            f"        {a_reads}\n"
-            f"        {fma}\n"
-            f"    }}}}else if(col_base<N){{\n"
-            f"    for(int kk=0;kk<{bk};kk++){{\n"
-            f"        {scalar_b_loads}\n"
-            f"        {a_reads}\n"
-            f"        {fma}\n"
-            f"    }}}}\n"
-            f"    __syncthreads();\n"
-            f"}}",
-            "smem K-tile loop",
-        )
-    )
+    # Batch pointer aliases
+    if is_batched:
+        batch_mk = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("K")))
+        batch_kn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("K"), LoopVar("N")))
+        body.append(Compute("Ab", "add", [LoopVar(a_name), batch_mk], dtype="const float*"))
+        body.append(Compute("Bb", "add", [LoopVar(b_name), batch_kn], dtype="const float*"))
+    a_src = "Ab" if is_batched else a_name
+    b_src = "Bb" if is_batched else b_name
 
-    # Write — proper LoopIR with register arrays
-    # Uses row_base/col_base instead of bm+tr/bn+tc
+    # K-tile loop
+    tk_body: list = []
+
+    # Load A tile into shared memory (guarded, per-thread_m rows)
+    for r in range(thread_m):
+        row_r = LoopBinOp("+", LoopVar("row_base"), LoopLiteral(r, I))
+        k_col = LoopBinOp("+", LoopVar("tk"), LoopBuiltin("threadIdx.x"))
+        a_guard = LoopBinOp("&&", LoopBinOp("<", row_r, LoopVar("M")), LoopBinOp("<", k_col, LoopVar("K")))
+        a_idx = LoopBinOp("+", LoopBinOp("*", row_r, LoopVar("K")), k_col)
+        ld_name = f"As_ld_{r}"
+        tk_body.append(Load(ld_name, a_src, a_idx, "global", guard=a_guard))
+        smem_idx = LoopBinOp(
+            "+",
+            LoopBinOp("*", LoopBinOp("+", LoopVar("sr"), LoopLiteral(r, I)), LoopLiteral(smem_stride, I)),
+            LoopBuiltin("threadIdx.x"),
+        )
+        tk_body.append(Store("As", smem_idx, LoopVar(ld_name), "smem"))
+
+    tk_body.append(Barrier())
+
+    # Inner kk loop: read A from smem, read B from global (scalar), FMA
+    kk_body: list = []
+    for c in range(thread_n):
+        col_c = LoopBinOp("+", LoopVar("col_base"), LoopLiteral(c, I))
+        b_idx = LoopBinOp("+", LoopBinOp("*", LoopBinOp("+", LoopVar("tk"), LoopVar("kk")), LoopVar("N")), col_c)
+        kk_body.append(Load(f"b{c}", b_src, b_idx, "global", guard=LoopBinOp("<", col_c, LoopVar("N"))))
+
+    for r in range(thread_m):
+        smem_idx = LoopBinOp(
+            "+",
+            LoopBinOp("*", LoopBinOp("+", LoopVar("sr"), LoopLiteral(r, I)), LoopLiteral(smem_stride, I)),
+            LoopVar("kk"),
+        )
+        kk_body.append(Load(f"a{r}", "As", smem_idx, "smem"))
+        for c in range(thread_n):
+            kk_body.append(Accumulate(f"c{r}{c}", "sum", LoopBinOp("*", LoopVar(f"a{r}"), LoopVar(f"b{c}"))))
+
+    tk_body.append(LoopNest("kk", LoopLiteral(0, I), LoopLiteral(bk, I), None, kk_body))
+    tk_body.append(Barrier())
+
+    body.append(LoopNest("tk", LoopVar("k_start"), LoopVar("k_end"), LoopLiteral(bk, I), tk_body))
+
+    # Write
     c_local = "Cb" if is_batched else c_name
     if is_batched:
         batch_mn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("N")))
         body.append(Compute("Cb", "add", [LoopVar(c_name), batch_mn], dtype="float*"))
     for r in range(thread_m):
-        row = LoopBinOp("+", LoopVar("row_base"), LoopLiteral(r, "int"))
+        row = LoopBinOp("+", LoopVar("row_base"), LoopLiteral(r, I))
         row_guard = LoopBinOp("<", row, LoopVar("M"))
         row_body: list = []
         for c in range(thread_n):
-            col = LoopBinOp("+", LoopVar("col_base"), LoopLiteral(c, "int"))
+            col = LoopBinOp("+", LoopVar("col_base"), LoopLiteral(c, I))
             col_guard = LoopBinOp("<", col, LoopVar("N"))
             idx = LoopBinOp("+", LoopBinOp("*", row, LoopVar("N")), col)
             row_body.append(Store(c_local, idx, RegAccess("c", [r, c]), "global", guard=col_guard, atomic=k_splits > 1))
-        body.append(Guard(LoopBinOp("&&", row_guard, LoopLiteral(1, "int")), row_body))
+        body.append(Guard(row_guard, row_body))
 
     return LoopProgram(
         name=name,
