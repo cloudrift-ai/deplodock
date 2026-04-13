@@ -23,7 +23,6 @@ from deplodock.compiler.backend.loop_ir import (
     Guard,
     Let,
     Load,
-    LoopBinOp,
     LoopBuiltin,
     LoopExpr,
     LoopFuncCall,
@@ -144,8 +143,9 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
     if schedule.is_batched and analysis.contraction_a:
         a_name = _safe(analysis.contraction_a)
         b_name = _safe(analysis.contraction_b)
-        batch_mk = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("K")))
-        batch_kn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("K"), LoopVar("N")))
+        batch, M, K, N = LoopVar("batch"), LoopVar("M"), LoopVar("K"), LoopVar("N")  # noqa: N806
+        batch_mk = batch * (M * K)
+        batch_kn = batch * (K * N)
         ops.append(Let("Ab", LoopVar(a_name) + batch_mk, dtype="const float*"))
         ops.append(Let("Bb", LoopVar(b_name) + batch_kn, dtype="const float*"))
 
@@ -201,7 +201,7 @@ def _emit_pointwise_body(
         val = var_map.get(out_id, LoopLiteral(0.0))
         guard_body.append(Store(_safe(out_id), LoopVar("i"), val, "global"))
 
-    return [Guard(LoopBinOp("<", LoopVar("i"), LoopVar("n")), guard_body)]
+    return [Guard(LoopVar("i").lt(LoopVar("n")), guard_body)]
 
 
 def _emit_scalar_reductions(
@@ -283,7 +283,7 @@ def _emit_scalar_reductions(
             guarded.append(WarpReduce(acc_name, fn))
             var_map[node_id] = LoopVar(acc_name)
 
-    return [Guard(LoopBinOp("<", LoopVar("row"), LoopVar("rows")), guarded)]
+    return [Guard(LoopVar("row").lt(LoopVar("rows")), guarded)]
 
 
 def _emit_contraction_k_loop(
@@ -400,7 +400,7 @@ def _emit_scalar_epilogue(
 
         for out_id in region.output_names:
             val = epi_var_map.get(out_id, LoopLiteral(0.0))
-            idx = LoopBinOp("+", LoopBinOp("*", LoopVar("row"), LoopVar("cols")), LoopVar("j"))
+            idx = LoopVar("row") * LoopVar("cols") + LoopVar("j")
             epi_body.append(Store(_safe(out_id), idx, val, "global"))
 
         return [LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), epi_body)]
@@ -454,7 +454,7 @@ def _emit_write(
             val = var_map.get(out_id, LoopLiteral(0.0))
             ops.append(
                 Guard(
-                    LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                    LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
                     [Store(_safe(out_id), LoopVar("row"), val, "global")],
                 )
             )
@@ -470,7 +470,7 @@ def _emit_write(
             val = var_map.get(out_id, LoopLiteral(0.0))
             ops.append(
                 Guard(
-                    LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                    LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
                     [Store(_safe(out_id), LoopVar("row"), val, "global")],
                 )
             )
@@ -482,7 +482,7 @@ def _emit_write(
         val = var_map.get(out_id, LoopLiteral(0.0))
         ops.append(
             Guard(
-                LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
                 [Store(_safe(out_id), LoopVar("row"), val, "global")],
             )
         )
@@ -646,7 +646,7 @@ def _lower_pointwise(
         val = var_map.get(out_id, LoopLiteral(0.0))
         guard_body.append(Store(_safe(out_id), LoopVar("i"), val, "global"))
 
-    body.append(Guard(LoopBinOp("<", LoopVar("i"), LoopVar("n")), guard_body))
+    body.append(Guard(LoopVar("i").lt(LoopVar("n")), guard_body))
 
     return LoopProgram(
         name=name,
@@ -751,7 +751,7 @@ def _lower_single_reduce(
 
             for out_id in region.output_names:
                 val = epi_var_map.get(out_id, LoopLiteral(0.0))
-                idx = LoopBinOp("+", LoopBinOp("*", LoopVar("row"), LoopVar("cols")), LoopVar("j"))
+                idx = LoopVar("row") * LoopVar("cols") + LoopVar("j")
                 epi_body.append(Store(_safe(out_id), idx, val, "global"))
 
             guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), epi_body))
@@ -762,7 +762,7 @@ def _lower_single_reduce(
                 val = var_map.get(out_id, LoopLiteral(0.0))
                 guarded.append(
                     Guard(
-                        LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                        LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
                         [Store(_safe(out_id), LoopVar("row"), val, "global")],
                     )
                 )
@@ -772,12 +772,12 @@ def _lower_single_reduce(
             val = var_map.get(out_id, LoopLiteral(0.0))
             guarded.append(
                 Guard(
-                    LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                    LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
                     [Store(_safe(out_id), LoopVar("row"), val, "global")],
                 )
             )
 
-    body.append(Guard(LoopBinOp("<", LoopVar("row"), LoopVar("rows")), guarded))
+    body.append(Guard(LoopVar("row").lt(LoopVar("rows")), guarded))
 
     return LoopProgram(
         name=name,
@@ -889,7 +889,7 @@ def _lower_multi_reduce(
 
         for out_id in region.output_names:
             val = epi_var_map.get(out_id, LoopLiteral(0.0))
-            idx = LoopBinOp("+", LoopBinOp("*", LoopVar("row"), LoopVar("cols")), LoopVar("j"))
+            idx = LoopVar("row") * LoopVar("cols") + LoopVar("j")
             epi_body.append(Store(_safe(out_id), idx, val, "global"))
 
         guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), epi_body))
@@ -899,12 +899,12 @@ def _lower_multi_reduce(
             val = var_map.get(out_id, LoopLiteral(0.0))
             guarded.append(
                 Guard(
-                    LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                    LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
                     [Store(_safe(out_id), LoopVar("row"), val, "global")],
                 )
             )
 
-    body.append(Guard(LoopBinOp("<", LoopVar("row"), LoopVar("rows")), guarded))
+    body.append(Guard(LoopVar("row").lt(LoopVar("rows")), guarded))
 
     return LoopProgram(
         name=name,
@@ -1058,11 +1058,11 @@ def _apply_ops_on_register_tile(
                     if other_size <= 1:
                         idx = LoopLiteral(0, "int")
                     elif len(other_shape) <= 1:
-                        idx = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                        idx = LoopVar("bn") + LoopVar("tc") + c
                     else:
-                        row_e = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
-                        col_e = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
-                        idx = LoopBinOp("+", LoopBinOp("*", row_e, LoopVar("N")), col_e)
+                        row_e = LoopVar("bm") + LoopVar("tr") + r
+                        col_e = LoopVar("bn") + LoopVar("tc") + c
+                        idx = row_e * LoopVar("N") + col_e
                     ld_name = f"_{prefix}_{safe}_{r}_{c}"
                     ops.append(Load(ld_name, safe, idx, "global"))
                     if inputs[0] == prev_id:
@@ -1108,10 +1108,10 @@ def _contraction_softmax_epilogue_ops(
         rmax = f"rmax{r}"
         ops.append(Alloc(rmax, "float", None, "reg", LoopLiteral(-1e30)))
         for c in range(thread_n):
-            col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+            col_c = LoopVar("bn") + LoopVar("tc") + c
             ops.append(
                 Guard(
-                    LoopBinOp("<", col_c, LoopVar("N")),
+                    col_c.lt(LoopVar("N")),
                     [Compute(rmax, "builtin", [LoopFuncCall("fmaxf", [LoopVar(rmax), RegAccess("c", [r, c])])])],
                 )
             )
@@ -1131,7 +1131,7 @@ def _contraction_softmax_epilogue_ops(
             rmax = f"rmax{r}"
             ops.append(Alloc(rsum, "float", None, "reg", LoopLiteral(0.0)))
             for c in range(thread_n):
-                col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                col_c = LoopVar("bn") + LoopVar("tc") + c
                 guarded: list = []
 
                 # Apply inter_reduce[1] ops generically, with rmax as extra var
@@ -1152,7 +1152,7 @@ def _contraction_softmax_epilogue_ops(
                     guarded.append(tile_op)
 
                 guarded.append(Accumulate(rsum, "sum", RegAccess("c", [r, c])))
-                ops.append(Guard(LoopBinOp("<", col_c, LoopVar("N")), guarded))
+                ops.append(Guard(col_c.lt(LoopVar("N")), guarded))
             ops.append(WarpShuffleXor(rsum, "sum"))
 
     # Phase 3: apply epilogue ops generically.
@@ -1164,7 +1164,7 @@ def _contraction_softmax_epilogue_ops(
         for r in range(thread_m):
             rsum = f"rsum{r}"
             for c in range(thread_n):
-                col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                col_c = LoopVar("bn") + LoopVar("tc") + c
                 epi_ops = _apply_ops_on_register_tile(
                     phases.epilogue,
                     epi_prev,
@@ -1180,7 +1180,7 @@ def _contraction_softmax_epilogue_ops(
                     if isinstance(tile_op, Compute) and tile_op.dst == "c00":
                         tile_op = Compute(f"c{r}{c}", tile_op.op, _fixup_reg_refs(tile_op.args, 0, 0, r, c))
                     fixed.append(tile_op)
-                ops.append(Guard(LoopBinOp("<", col_c, LoopVar("N")), fixed))
+                ops.append(Guard(col_c.lt(LoopVar("N")), fixed))
 
     return ops
 
@@ -1288,18 +1288,17 @@ def _lower_contraction_naive(
     # K-loop with bounds-checked global loads + FMA
     k_body: list = []
     # Load B columns (4 per thread)
+    bn, tc, bm, tr = LoopVar("bn"), LoopVar("tc"), LoopVar("bm"), LoopVar("tr")
+    k, K, N, M = LoopVar("k"), LoopVar("K"), LoopVar("N"), LoopVar("M")  # noqa: N806
     for c in range(thread_n):
-        col = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
-        b_idx = LoopBinOp("+", LoopBinOp("*", LoopVar("k"), LoopVar("N")), col)
-        k_body.append(Load(f"b{c}", b_src, b_idx, "global", guard=LoopBinOp("<", col, LoopVar("N"))))
+        col = bn + tc + c
+        k_body.append(Load(f"b{c}", b_src, k * N + col, "global", guard=col.lt(N)))
     # Load A rows + FMA (unrolled over thread_m)
     for r in range(thread_m):
-        row = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
-        a_idx = LoopBinOp("+", LoopBinOp("*", row, LoopVar("K")), LoopVar("k"))
-        k_body.append(Load(f"a{r}", a_src, a_idx, "global", guard=LoopBinOp("<", row, LoopVar("M"))))
+        row = bm + tr + r
+        k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
         for c in range(thread_n):
-            dst = f"c{r}{c}"
-            k_body.append(Accumulate(dst, "sum", LoopBinOp("*", LoopVar(f"a{r}"), LoopVar(f"b{c}"))))
+            k_body.append(Accumulate(f"c{r}{c}", "sum", LoopVar(f"a{r}") * LoopVar(f"b{c}")))
 
     body.append(LoopNest("k", LoopLiteral(0, "int"), LoopVar("K"), None, k_body))
 
@@ -1490,38 +1489,28 @@ def _lower_contraction_smem(
     tk_body: list = []
 
     # Load A tile into shared memory (guarded, per-thread_m rows)
+    row_base, col_base = LoopVar("row_base"), LoopVar("col_base")
+    sr, tk, kk = LoopVar("sr"), LoopVar("tk"), LoopVar("kk")
+    tidx = LoopBuiltin("threadIdx.x")
+
     for r in range(thread_m):
-        row_r = LoopBinOp("+", LoopVar("row_base"), LoopLiteral(r, I))
-        k_col = LoopBinOp("+", LoopVar("tk"), LoopBuiltin("threadIdx.x"))
-        a_guard = LoopBinOp("&&", LoopBinOp("<", row_r, LoopVar("M")), LoopBinOp("<", k_col, LoopVar("K")))
-        a_idx = LoopBinOp("+", LoopBinOp("*", row_r, LoopVar("K")), k_col)
-        ld_name = f"As_ld_{r}"
-        tk_body.append(Load(ld_name, a_src, a_idx, "global", guard=a_guard))
-        smem_idx = LoopBinOp(
-            "+",
-            LoopBinOp("*", LoopBinOp("+", LoopVar("sr"), LoopLiteral(r, I)), LoopLiteral(smem_stride, I)),
-            LoopBuiltin("threadIdx.x"),
-        )
-        tk_body.append(Store("As", smem_idx, LoopVar(ld_name), "smem"))
+        row_r = row_base + r
+        k_col = tk + tidx
+        tk_body.append(Load(f"As_ld_{r}", a_src, row_r * K + k_col, "global", guard=row_r.lt(M).and_(k_col.lt(K))))
+        tk_body.append(Store("As", (sr + r) * smem_stride + tidx, LoopVar(f"As_ld_{r}"), "smem"))
 
     tk_body.append(Barrier())
 
     # Inner kk loop: read A from smem, read B from global (scalar), FMA
     kk_body: list = []
     for c in range(thread_n):
-        col_c = LoopBinOp("+", LoopVar("col_base"), LoopLiteral(c, I))
-        b_idx = LoopBinOp("+", LoopBinOp("*", LoopBinOp("+", LoopVar("tk"), LoopVar("kk")), LoopVar("N")), col_c)
-        kk_body.append(Load(f"b{c}", b_src, b_idx, "global", guard=LoopBinOp("<", col_c, LoopVar("N"))))
+        col_c = col_base + c
+        kk_body.append(Load(f"b{c}", b_src, (tk + kk) * N + col_c, "global", guard=col_c.lt(N)))
 
     for r in range(thread_m):
-        smem_idx = LoopBinOp(
-            "+",
-            LoopBinOp("*", LoopBinOp("+", LoopVar("sr"), LoopLiteral(r, I)), LoopLiteral(smem_stride, I)),
-            LoopVar("kk"),
-        )
-        kk_body.append(Load(f"a{r}", "As", smem_idx, "smem"))
+        kk_body.append(Load(f"a{r}", "As", (sr + r) * smem_stride + kk, "smem"))
         for c in range(thread_n):
-            kk_body.append(Accumulate(f"c{r}{c}", "sum", LoopBinOp("*", LoopVar(f"a{r}"), LoopVar(f"b{c}"))))
+            kk_body.append(Accumulate(f"c{r}{c}", "sum", LoopVar(f"a{r}") * LoopVar(f"b{c}")))
 
     tk_body.append(LoopNest("kk", LoopLiteral(0, I), LoopLiteral(bk, I), None, kk_body))
     tk_body.append(Barrier())
@@ -1533,15 +1522,13 @@ def _lower_contraction_smem(
     if is_batched:
         body.append(Let("Cb", LoopVar(c_name) + LoopVar("batch") * (M * N), dtype="float*"))
     for r in range(thread_m):
-        row = LoopBinOp("+", LoopVar("row_base"), LoopLiteral(r, I))
-        row_guard = LoopBinOp("<", row, LoopVar("M"))
+        row = row_base + r
         row_body: list = []
         for c in range(thread_n):
-            col = LoopBinOp("+", LoopVar("col_base"), LoopLiteral(c, I))
-            col_guard = LoopBinOp("<", col, LoopVar("N"))
-            idx = LoopBinOp("+", LoopBinOp("*", row, LoopVar("N")), col)
-            row_body.append(Store(c_local, idx, RegAccess("c", [r, c]), "global", guard=col_guard, atomic=k_splits > 1))
-        body.append(Guard(row_guard, row_body))
+            col = col_base + c
+            idx = row * N + col
+            row_body.append(Store(c_local, idx, RegAccess("c", [r, c]), "global", guard=col.lt(N), atomic=k_splits > 1))
+        body.append(Guard(row.lt(M), row_body))
 
     return LoopProgram(
         name=name,
