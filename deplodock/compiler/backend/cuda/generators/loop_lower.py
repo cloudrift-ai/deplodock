@@ -1034,56 +1034,88 @@ def _contraction_epilogue_ops(
 ) -> list:
     """Generate LoopIR ops for contraction epilogue (bias, activation, etc.).
 
-    Operates on the register array ``c[r][c]`` in-place.  Only loads from
-    external inputs (buffers in ``input_names``); internal intermediates
-    are already in the accumulator chain.
+    Operates on the register array ``c[r][c]`` in-place.  Delegates to
+    ``_apply_ops_on_register_tile`` which handles any elementwise op.
     """
     if not phases.epilogue:
         return []
 
-    ops: list = []
     prev_id = phases.reduces[0][0]
     input_set = set(input_names)
+    return _apply_ops_on_register_tile(phases.epilogue, prev_id, shapes, input_set, thread_m, thread_n, "ep")
 
-    for epi_nid, epi_op, epi_inputs in phases.epilogue:
-        fn = epi_op.fn
+
+def _apply_ops_on_register_tile(
+    op_list: list,
+    prev_id: str,
+    shapes: dict[str, tuple],
+    input_set: set[str],
+    thread_m: int,
+    thread_n: int,
+    prefix: str,
+    extra_vars: dict[str, str] | None = None,
+) -> list:
+    """Apply a list of elementwise ops to the register tile c[r][c].
+
+    Walks the op chain generically — any elementwise op is supported.
+    Binary ops where the "other" input is an external buffer get a Load;
+    binary ops where the other is a per-row variable (e.g. rmax, rsum)
+    use ``extra_vars`` mapping.  Unary ops apply directly.
+    """
+    ops: list = []
+    extra = extra_vars or {}
+
+    for nid, ir_op, inputs in op_list:
+        if not isinstance(ir_op, ElementwiseOp):
+            continue
+        fn = ir_op.fn
+
+        # Find the "other" input (not the accumulator chain).
         other = None
-        if len(epi_inputs) == 2:
-            for inp in epi_inputs:
+        if len(inputs) == 2:
+            for inp in inputs:
                 if inp != prev_id:
                     other = inp
                     break
-
-        # Only emit loads for external inputs.  If `other` is an internal
-        # region node (not a kernel parameter), skip — the value is already
-        # in the register tile via the prev_id chain.
-        if other is not None and other not in input_set:
+        if other is not None and other not in input_set and other not in extra:
             other = None
 
         for r in range(thread_m):
-            for c_idx in range(thread_n):
-                acc = RegAccess("c", [r, c_idx])
-                dst = f"c{r}{c_idx}"
+            for c in range(thread_n):
+                acc = RegAccess("c", [r, c])
+                dst = f"c{r}{c}"
 
-                if fn in ("add", "sub", "mul", "div") and other is not None:
-                    other_shape = shapes.get(other, ())
-                    safe = _safe(other)
-                    if len(other_shape) <= 1:
-                        idx = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c_idx, "int"))
-                    else:
-                        row_idx = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
-                        col_idx = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c_idx, "int"))
-                        idx = LoopBinOp("+", LoopBinOp("*", row_idx, LoopVar("N")), col_idx)
-                    other_val = LoopVar(f"_ep_{safe}_{r}_{c_idx}")
-                    ops.append(Load(other_val.name, safe, idx, "global"))
-                    if epi_inputs[0] == prev_id:
+                if other is not None and other in extra:
+                    # Per-row variable (rmax, rsum)
+                    other_val = LoopVar(extra[other].format(r=r))
+                    if inputs[0] == prev_id:
                         ops.append(Compute(dst, fn, [acc, other_val]))
                     else:
                         ops.append(Compute(dst, fn, [other_val, acc]))
-                elif fn in ("relu", "neg", "exp", "rsqrt", "recip"):
+                elif other is not None:
+                    # External buffer input
+                    safe = _safe(other)
+                    other_shape = shapes.get(other, ())
+                    other_size = math.prod(d for d in other_shape if isinstance(d, int))
+                    if other_size <= 1:
+                        idx = LoopLiteral(0, "int")
+                    elif len(other_shape) <= 1:
+                        idx = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                    else:
+                        row_e = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
+                        col_e = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                        idx = LoopBinOp("+", LoopBinOp("*", row_e, LoopVar("N")), col_e)
+                    ld_name = f"_{prefix}_{safe}_{r}_{c}"
+                    ops.append(Load(ld_name, safe, idx, "global"))
+                    if inputs[0] == prev_id:
+                        ops.append(Compute(dst, fn, [acc, LoopVar(ld_name)]))
+                    else:
+                        ops.append(Compute(dst, fn, [LoopVar(ld_name), acc]))
+                else:
+                    # Unary op on accumulator
                     ops.append(Compute(dst, fn, [acc]))
 
-        prev_id = epi_nid
+        prev_id = nid
 
     return ops
 
@@ -1098,10 +1130,10 @@ def _contraction_softmax_epilogue_ops(
     """Generate LoopIR ops for fused contraction+softmax epilogue.
 
     After the K-loop, accumulators c[r][c] hold matmul scores. This emits:
-    1. Apply inter_reduce[0] ops (scale) on register tile
+    1. Apply inter_reduce[0] ops on register tile
     2. Row max via WarpShuffleXor across threadIdx.x
-    3. Apply inter_reduce[1] ops (sub, exp) + row sum via WarpShuffleXor
-    4. Apply epilogue ops (div) on register tile
+    3. Apply inter_reduce[1] ops + row sum via WarpShuffleXor
+    4. Apply epilogue ops on register tile
 
     Only valid when N <= tile_n (all columns in one CTA).
     """
@@ -1111,45 +1143,7 @@ def _contraction_softmax_epilogue_ops(
     # Phase 0: apply inter_reduce[0] ops (e.g. scale) on register tile.
     if phases.inter_reduce:
         prev_id = phases.reduces[0][0]
-        for nid, ir_op, inputs in phases.inter_reduce[0]:
-            fn = ir_op.fn
-            other = None
-            if len(inputs) == 2:
-                for inp in inputs:
-                    if inp != prev_id:
-                        other = inp
-                        break
-            if other is not None and other not in input_set:
-                other = None
-
-            for r in range(thread_m):
-                for c in range(thread_n):
-                    acc = RegAccess("c", [r, c])
-                    dst = f"c{r}{c}"
-                    if fn in ("mul", "add", "sub", "div") and other is not None:
-                        safe = _safe(other)
-                        other_shape = shapes.get(other, ())
-                        other_size = 1
-                        for d in other_shape:
-                            if isinstance(d, int):
-                                other_size *= d
-                        if other_size <= 1:
-                            idx = LoopLiteral(0, "int")
-                        elif len(other_shape) <= 1:
-                            idx = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
-                        else:
-                            row_e = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
-                            col_e = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
-                            idx = LoopBinOp("+", LoopBinOp("*", row_e, LoopVar("N")), col_e)
-                        ld_name = f"_sc_{safe}_{r}_{c}"
-                        ops.append(Load(ld_name, safe, idx, "global"))
-                        if inputs[0] == prev_id:
-                            ops.append(Compute(dst, fn, [acc, LoopVar(ld_name)]))
-                        else:
-                            ops.append(Compute(dst, fn, [LoopVar(ld_name), acc]))
-                    elif fn == "exp":
-                        ops.append(Compute(dst, "exp", [acc]))
-            prev_id = nid
+        ops.extend(_apply_ops_on_register_tile(phases.inter_reduce[0], prev_id, shapes, input_set, thread_m, thread_n, "sc"))
 
     # Phase 1: row max via WarpShuffleXor.
     for r in range(thread_m):
@@ -1157,7 +1151,6 @@ def _contraction_softmax_epilogue_ops(
         ops.append(Alloc(rmax, "float", None, "reg", LoopLiteral(-1e30)))
         for c in range(thread_n):
             col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
-            # rmax = fmaxf(rmax, c[r][c]) guarded by col < N
             ops.append(
                 Guard(
                     LoopBinOp("<", col_c, LoopVar("N")),
@@ -1166,38 +1159,83 @@ def _contraction_softmax_epilogue_ops(
             )
         ops.append(WarpShuffleXor(rmax, "max"))
 
-    # Phase 2: apply inter_reduce[1] (sub, exp) + accumulate row sum.
+    # Phase 2: apply inter_reduce[1] ops + accumulate row sum.
     if len(phases.inter_reduce) > 1:
+        # Build extra_vars: the max reduce result is available as rmax{r}
+        max_id = phases.reduces[1][0]  # the max reduce node_id
+        # The inter_reduce[1] ops reference the max reduce output (prev reduce)
+        # and the scaled scores (inter_reduce[0] output). The "prev_id" for
+        # inter_reduce[1] is the last node of inter_reduce[0] or reduces[0].
+        ir1_prev = phases.inter_reduce[0][-1][0] if phases.inter_reduce[0] else phases.reduces[0][0]
+
         for r in range(thread_m):
             rsum = f"rsum{r}"
             rmax = f"rmax{r}"
             ops.append(Alloc(rsum, "float", None, "reg", LoopLiteral(0.0)))
             for c in range(thread_n):
                 col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
-                acc = RegAccess("c", [r, c])
-                dst = f"c{r}{c}"
                 guarded: list = []
-                for _nid, ir_op, _inputs in phases.inter_reduce[1]:
-                    if ir_op.fn == "sub":
-                        guarded.append(Compute(dst, "sub", [acc, LoopVar(rmax)]))
-                    elif ir_op.fn == "exp":
-                        guarded.append(Compute(dst, "exp", [RegAccess("c", [r, c])]))
+
+                # Apply inter_reduce[1] ops generically, with rmax as extra var
+                tile_ops = _apply_ops_on_register_tile(
+                    phases.inter_reduce[1],
+                    ir1_prev,
+                    shapes,
+                    input_set,
+                    1,  # single row
+                    1,  # single col
+                    f"ir1_{r}_{c}",
+                    extra_vars={max_id: rmax},
+                )
+                # Fixup: the helper emits c00 for (0,0), but we need c{r}{c}
+                for tile_op in tile_ops:
+                    if isinstance(tile_op, Compute) and tile_op.dst == "c00":
+                        tile_op = Compute(f"c{r}{c}", tile_op.op, _fixup_reg_refs(tile_op.args, 0, 0, r, c))
+                    guarded.append(tile_op)
+
                 guarded.append(Accumulate(rsum, "sum", RegAccess("c", [r, c])))
                 ops.append(Guard(LoopBinOp("<", col_c, LoopVar("N")), guarded))
             ops.append(WarpShuffleXor(rsum, "sum"))
 
-    # Phase 3: apply epilogue (div).
-    for _epi_nid, epi_op, _inputs in phases.epilogue:
-        if epi_op.fn == "div":
-            for r in range(thread_m):
-                rsum = f"rsum{r}"
-                for c in range(thread_n):
-                    col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
-                    acc = RegAccess("c", [r, c])
-                    dst = f"c{r}{c}"
-                    ops.append(Guard(LoopBinOp("<", col_c, LoopVar("N")), [Compute(dst, "div", [acc, LoopVar(rsum)])]))
+    # Phase 3: apply epilogue ops generically.
+    # The epilogue references the sum reduce output as per-row rsum{r}.
+    if phases.epilogue:
+        sum_id = phases.reduces[2][0] if len(phases.reduces) > 2 else phases.reduces[-1][0]
+        epi_prev = phases.inter_reduce[-1][-1][0] if phases.inter_reduce and phases.inter_reduce[-1] else phases.reduces[-1][0]
+
+        for r in range(thread_m):
+            rsum = f"rsum{r}"
+            for c in range(thread_n):
+                col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                epi_ops = _apply_ops_on_register_tile(
+                    phases.epilogue,
+                    epi_prev,
+                    shapes,
+                    input_set,
+                    1,
+                    1,
+                    f"ep_{r}_{c}",
+                    extra_vars={sum_id: rsum},
+                )
+                fixed: list = []
+                for tile_op in epi_ops:
+                    if isinstance(tile_op, Compute) and tile_op.dst == "c00":
+                        tile_op = Compute(f"c{r}{c}", tile_op.op, _fixup_reg_refs(tile_op.args, 0, 0, r, c))
+                    fixed.append(tile_op)
+                ops.append(Guard(LoopBinOp("<", col_c, LoopVar("N")), fixed))
 
     return ops
+
+
+def _fixup_reg_refs(args: list, from_r: int, from_c: int, to_r: int, to_c: int) -> list:
+    """Replace RegAccess("c", [from_r, from_c]) with RegAccess("c", [to_r, to_c]) in args."""
+    result = []
+    for a in args:
+        if isinstance(a, RegAccess) and a.name == "c" and a.indices == [from_r, from_c]:
+            result.append(RegAccess("c", [to_r, to_c]))
+        else:
+            result.append(a)
+    return result
 
 
 def _contraction_write_ops(
