@@ -11,7 +11,6 @@ from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
-    AugAssign,
     BinOp,
     Builtin,
     ForLoop,
@@ -134,6 +133,21 @@ _C_EXPR: dict[str, str] = {
     "sigmoid": "1.0f / (1.0f + expf(-{a}))",
     # Identity-like: used for builtin aliases (e.g. batch = blockIdx.z)
     "builtin": "{a}",
+}
+
+# CUDA C templates for reduction fold and warp shuffle.
+# {dst} = accumulator, {val} = value being folded, {offset} = shuffle offset.
+_C_REDUCE_ACCUM: dict[str, str] = {
+    "sum": "{dst} += {val}",
+    "max": "{dst} = fmaxf({dst}, {val})",
+}
+_C_REDUCE_SHFL: dict[str, str] = {
+    "sum": "{dst} += __shfl_down_sync(0xffffffff, {dst}, {offset})",
+    "max": "{dst} = fmaxf({dst}, __shfl_down_sync(0xffffffff, {dst}, {offset}))",
+}
+_C_REDUCE_SHFL_XOR: dict[str, str] = {
+    "sum": "{dst} += __shfl_xor_sync(0xffffffff, {dst}, {offset})",
+    "max": "{dst} = fmaxf({dst}, __shfl_xor_sync(0xffffffff, {dst}, {offset}))",
 }
 
 
@@ -259,12 +273,9 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         return [Assign(ArrayAccess(op.dst, idx), val)]
 
     if isinstance(op, Accumulate):
-        val = _lower_expr(op.value)
-        if op.op == "sum":
-            return [AugAssign(op.dst, "+=", val)]
-        # max
-        val_str = _expr_to_c(val)
-        return [RawCode(f"{op.dst} = fmaxf({op.dst}, {val_str});")]
+        val_str = _expr_to_c(_lower_expr(op.value))
+        tmpl = _C_REDUCE_ACCUM.get(op.op, "{dst} += {val}")
+        return [RawCode(f"{tmpl.format(dst=op.dst, val=val_str)};")]
 
     if isinstance(op, WarpReduce):
         return _emit_warp_reduce(op.var, op.op)
@@ -307,28 +318,23 @@ def _emit_warp_reduce(acc_var: str, fn: str) -> list[Stmt]:
     is the ``for (offset >>= 1)`` loop which has a non-standard step that
     KernelIR's ForLoop can't express.
     """
+    from deplodock.compiler.ops import _DEFAULT_REDUCE_INFO, REDUCE_REGISTRY
+
     acc = Var(acc_var)
-    init_val = Literal(0.0) if fn == "sum" else Literal(-1e30)
-    shfl = FuncCall("__shfl_down_sync", [Literal(0xFFFFFFFF, "int"), acc, Var("offset")])
+    r_info = REDUCE_REGISTRY.get(fn, _DEFAULT_REDUCE_INFO)
+    init_val = Literal(r_info.identity)
     warp_arr = f"warp_{acc_var}"
     s_var = f"s_{acc_var}"
     tid = Builtin("threadIdx.x")
     warp_size = Builtin("warpSize")
     block_dim = Builtin("blockDim.x")
 
-    # Shuffle body: acc += shfl (sum) or acc = fmaxf(acc, shfl) (max)
-    if fn == "sum":
-        shfl_stmt: Stmt = AugAssign(acc_var, "+=", shfl)
-    else:
-        shfl_stmt = VarAssign(acc_var, FuncCall("fmaxf", [acc, shfl]))
+    # Shuffle loop body from template
+    shfl_tmpl = _C_REDUCE_SHFL.get(fn, "{dst} += __shfl_down_sync(0xffffffff, {dst}, {offset})")
 
-    # Shuffle loop: for (int offset = warpSize/2; offset > 0; offset >>= 1)
-    # KernelIR ForLoop can't express >>= step, so this stays as RawCode.
     def _shfl_loop() -> RawCode:
-        body_c = _expr_to_c(shfl_stmt.value) if isinstance(shfl_stmt, VarAssign) else _expr_to_c(shfl)
-        if fn == "sum":
-            return RawCode(f"for (int offset = warpSize / 2; offset > 0; offset >>= 1)\n    {acc_var} += {body_c};")
-        return RawCode(f"for (int offset = warpSize / 2; offset > 0; offset >>= 1)\n    {acc_var} = {body_c};")
+        body = shfl_tmpl.format(dst=acc_var, offset="offset")
+        return RawCode(f"for (int offset = warpSize / 2; offset > 0; offset >>= 1)\n    {body};")
 
     stmts: list[Stmt] = []
 
@@ -474,11 +480,9 @@ def _emit_warp_shuffle_xor(acc_var: str, fn: str) -> list[Stmt]:
     block), this reduces within a warp using XOR lane masks.  Used for
     in-register softmax where each thread holds different columns.
     """
-    if fn == "sum":
-        body = f"{acc_var} += __shfl_xor_sync(0xffffffff, {acc_var}, o);"
-    else:
-        body = f"{acc_var} = fmaxf({acc_var}, __shfl_xor_sync(0xffffffff, {acc_var}, o));"
-    return [RawCode(f"for(int o=16;o>0;o>>=1){body}")]
+    tmpl = _C_REDUCE_SHFL_XOR.get(fn, "{dst} += __shfl_xor_sync(0xffffffff, {dst}, {offset})")
+    body = tmpl.format(dst=acc_var, offset="o")
+    return [RawCode(f"for(int o=16;o>0;o>>=1){body};")]
 
 
 # ---------------------------------------------------------------------------
