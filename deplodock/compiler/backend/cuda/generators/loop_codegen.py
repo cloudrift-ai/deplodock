@@ -131,7 +131,7 @@ def _render_c_expr(op_name: str, a: str, b: str = "0.0f") -> str:
 
     Binary op arguments are parenthesized to preserve precedence.
     """
-    from deplodock.compiler.ops import OP_REGISTRY, _DEFAULT_OP_INFO
+    from deplodock.compiler.ops import _DEFAULT_OP_INFO, OP_REGISTRY
 
     tmpl = _C_EXPR.get(op_name)
     if tmpl is None:

@@ -299,20 +299,21 @@ def _emit_contraction_k_loop(
     a_src = "Ab" if schedule.is_batched else a_name
     b_src = "Bb" if schedule.is_batched else b_name
 
+    bn, tc, bm, tr = LoopVar("bn"), LoopVar("tc"), LoopVar("bm"), LoopVar("tr")
+    k, K, N, M = LoopVar("k"), LoopVar("K"), LoopVar("N"), LoopVar("M")  # noqa: N806
+
     k_body: list = []
     for c in range(thread_n):
-        col = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
-        b_idx = LoopBinOp("+", LoopBinOp("*", LoopVar("k"), LoopVar("N")), col)
-        k_body.append(Load(f"b{c}", b_src, b_idx, "global", guard=LoopBinOp("<", col, LoopVar("N"))))
+        col = bn + tc + c
+        k_body.append(Load(f"b{c}", b_src, k * N + col, "global", guard=col.lt(N)))
 
     for r in range(thread_m):
-        row = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
-        a_idx = LoopBinOp("+", LoopBinOp("*", row, LoopVar("K")), LoopVar("k"))
-        k_body.append(Load(f"a{r}", a_src, a_idx, "global", guard=LoopBinOp("<", row, LoopVar("M"))))
+        row = bm + tr + r
+        k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
         for c in range(thread_n):
-            k_body.append(Accumulate(f"c{r}{c}", "sum", LoopBinOp("*", LoopVar(f"a{r}"), LoopVar(f"b{c}"))))
+            k_body.append(Accumulate(f"c{r}{c}", "sum", LoopVar(f"a{r}") * LoopVar(f"b{c}")))
 
-    return [LoopNest("k", LoopLiteral(0, "int"), LoopVar("K"), None, k_body)]
+    return [LoopNest("k", LoopLiteral(0, "int"), K, None, k_body)]
 
 
 # ---------------------------------------------------------------------------
@@ -542,23 +543,21 @@ def _reduce_init_expr(fn: str) -> LoopLiteral:
 def _input_loop_expr(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> LoopExpr:
     """Build the index expression for reading an input tensor."""
     acc = analysis.input_access[inp]
+    row, cols, j = LoopVar("row"), LoopVar("cols"), LoopVar(idx_var)
 
     if analysis.pattern == "pointwise":
         if acc.is_scalar:
             return LoopLiteral(0, "int")
         if acc.size < out_size:
-            return LoopBinOp("%", LoopVar("i"), LoopLiteral(acc.size, "int"))
+            return LoopVar("i") % acc.size
         return LoopVar("i")
 
-    # row_reduce / reduce_broadcast
     if acc.is_2d:
-        return LoopBinOp("+", LoopBinOp("*", LoopVar("row"), LoopVar("cols")), LoopVar(idx_var))
+        return row * cols + j
     if acc.is_per_row:
-        return LoopVar("row")
+        return row
     if acc.is_row_vector:
-        return LoopVar(idx_var)
-    if acc.is_scalar:
-        return LoopLiteral(0, "int")
+        return j
     return LoopLiteral(0, "int")
 
 
@@ -950,52 +949,33 @@ def _cta_swizzle_grid(
     Produces named variables: tr, tc, bm, bn (and batch if batched).
     """
     ops: list = []
-    I = "int"  # noqa: E741 — shorthand for dtype
+    I = "int"  # noqa: E741
+    N, M = LoopVar("N"), LoopVar("M")  # noqa: N806
+    bidy, bidx, tidy, tidx = LoopBuiltin("blockIdx.y"), LoopBuiltin("blockIdx.x"), LoopBuiltin("threadIdx.y"), LoopBuiltin("threadIdx.x")
+    SWIZ = 8
 
     if is_batched:
         ops.append(Compute("batch", "builtin", [LoopBuiltin("blockIdx.z")], dtype=I))
 
-    # Thread-to-register-tile mapping
-    ops.append(Compute("tr", "mul", [LoopBuiltin("threadIdx.y"), LoopLiteral(thread_m, I)], dtype=I))
-    ops.append(Compute("tc", "mul", [LoopBuiltin("threadIdx.x"), LoopLiteral(thread_n, I)], dtype=I))
+    ops.append(Compute("tr", "mul", [tidy, LoopLiteral(thread_m, I)], dtype=I))
+    ops.append(Compute("tc", "mul", [tidx, LoopLiteral(thread_n, I)], dtype=I))
+    ops.append(Compute("ntx", "div", [N + (tile_n - 1), LoopLiteral(tile_n, I)], dtype=I))
+    ops.append(Compute("nty", "div", [M + (tile_m - 1), LoopLiteral(tile_m, I)], dtype=I))
 
-    # Grid dimensions (ceil-div)
-    ops.append(Compute("ntx", "div", [LoopBinOp("+", LoopVar("N"), LoopLiteral(tile_n - 1, I)), LoopLiteral(tile_n, I)], dtype=I))
-    ops.append(Compute("nty", "div", [LoopBinOp("+", LoopVar("M"), LoopLiteral(tile_m - 1, I)), LoopLiteral(tile_m, I)], dtype=I))
+    ntx, nty = LoopVar("ntx"), LoopVar("nty")
+    pid, grp, rem = LoopVar("pid"), LoopVar("grp"), LoopVar("rem")
+    by_s, bx_s = LoopVar("by_s"), LoopVar("bx_s")
 
-    # Linearized block ID + swizzle decomposition
-    SWIZ = 8
-    ops.append(
-        Compute("pid", "add", [LoopBuiltin("blockIdx.x"), LoopBinOp("*", LoopBuiltin("blockIdx.y"), LoopBuiltin("gridDim.x"))], dtype=I)
-    )
-    ntx_swiz = LoopBinOp("*", LoopVar("ntx"), LoopLiteral(SWIZ, I))
-    ops.append(Compute("grp", "div", [LoopVar("pid"), ntx_swiz], dtype=I))
-    ops.append(Compute("rem", "mod", [LoopVar("pid"), ntx_swiz], dtype=I))
-    ops.append(
-        Compute(
-            "by_s",
-            "add",
-            [LoopBinOp("*", LoopVar("grp"), LoopLiteral(SWIZ, I)), LoopBinOp("%", LoopVar("rem"), LoopLiteral(SWIZ, I))],
-            dtype=I,
-        )
-    )
-    ops.append(Compute("bx_s", "div", [LoopVar("rem"), LoopLiteral(SWIZ, I)], dtype=I))
+    ops.append(Compute("pid", "add", [bidx, bidy * LoopBuiltin("gridDim.x")], dtype=I))
+    ops.append(Compute("grp", "div", [pid, ntx * SWIZ], dtype=I))
+    ops.append(Compute("rem", "mod", [pid, ntx * SWIZ], dtype=I))
+    ops.append(Compute("by_s", "add", [grp * SWIZ, rem % SWIZ], dtype=I))
+    ops.append(Compute("bx_s", "div", [rem, LoopLiteral(SWIZ, I)], dtype=I))
 
-    # Early exit if out of tile grid
-    ops.append(
-        Guard(
-            LoopBinOp(
-                "||",
-                LoopBinOp(">=", LoopVar("by_s"), LoopVar("nty")),
-                LoopBinOp(">=", LoopVar("bx_s"), LoopVar("ntx")),
-            ),
-            [],  # empty body = return (codegen emits early return)
-        )
-    )
+    ops.append(Guard(by_s.ge(nty).or_(bx_s.ge(ntx)), []))
 
-    # Block base coordinates
-    ops.append(Compute("bm", "mul", [LoopVar("by_s"), LoopLiteral(tile_m, I)], dtype=I))
-    ops.append(Compute("bn", "mul", [LoopVar("bx_s"), LoopLiteral(tile_n, I)], dtype=I))
+    ops.append(Compute("bm", "mul", [by_s, LoopLiteral(tile_m, I)], dtype=I))
+    ops.append(Compute("bn", "mul", [bx_s, LoopLiteral(tile_n, I)], dtype=I))
 
     return ops
 
@@ -1226,21 +1206,22 @@ def _contraction_write_ops(
     """
     ops: list = []
     safe_out = _safe(output_name)
+    bm, tr, bn, tc = LoopVar("bm"), LoopVar("tr"), LoopVar("bn"), LoopVar("tc")
+    M, N = LoopVar("M"), LoopVar("N")  # noqa: N806
 
     for r in range(thread_m):
-        row = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
-        row_guard = LoopBinOp("<", row, LoopVar("M"))
+        row = bm + tr + r
+        row_guard = row.lt(M)
         row_body: list = []
 
         for c_idx in range(thread_n):
-            col = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c_idx, "int"))
-            col_guard = LoopBinOp("<", col, LoopVar("N"))
+            col = bn + tc + c_idx
+            col_guard = col.lt(N)
 
             if is_batched:
-                base = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("N")))
-                idx = LoopBinOp("+", base, LoopBinOp("+", LoopBinOp("*", row, LoopVar("N")), col))
+                idx = LoopVar("batch") * (M * N) + row * N + col
             else:
-                idx = LoopBinOp("+", LoopBinOp("*", row, LoopVar("N")), col)
+                idx = row * N + col
 
             row_body.append(Store(safe_out, idx, RegAccess("c", [r, c_idx]), "global", guard=col_guard, atomic=k_splits > 1))
 
