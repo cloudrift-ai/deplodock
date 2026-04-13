@@ -427,7 +427,7 @@ def _emit_write(
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4
         out_id = region.output_names[0]
-        return _contraction_write_ops(out_id, thread_m, thread_n, schedule.is_batched, schedule.k_splits)
+        return _contraction_write_ops(Var(_safe(out_id)), thread_m, thread_n, schedule.is_batched, schedule.k_splits)
 
     # Scalar reduction write
     phases = analysis.op_phases
@@ -500,18 +500,14 @@ def lower_to_loop_ir(
 ) -> LoopProgram:
     """Lower a FusedRegionOp to LoopIR.
 
-    Routes through ``lower_generic()`` for all patterns except TMA and
-    contraction+softmax which use legacy escape hatches.
+    Contractions route to ``_lower_contraction()`` with the strategy.
+    All other patterns go through ``build_schedule()`` + ``lower_generic()``.
     """
+    if analysis.pattern == "contraction":
+        strat = "tma" if strategy == "tma_db" else strategy
+        return _lower_contraction(region, name, shapes, analysis, hints or {}, strategy=strat)
+
     from deplodock.compiler.backend.cuda.schedule import build_schedule
-
-    # Legacy: TMA requires inline asm
-    if strategy == "tma_db" and analysis.pattern == "contraction":
-        return _lower_contraction_tma(region, name, shapes, analysis, hints or {})
-
-    # Legacy: smem strategy still uses _lower_contraction_smem
-    if strategy == "smem" and analysis.pattern == "contraction":
-        return _lower_contraction_smem(region, name, shapes, analysis, hints or {})
 
     schedule = build_schedule(analysis, strategy, hints or {})
     return lower_generic(region, name, shapes, analysis, schedule)
@@ -1150,38 +1146,36 @@ def _fixup_reg_refs_expr(expr: LoopExpr, from_r: int, from_c: int, to_r: int, to
 
 
 def _contraction_write_ops(
-    output_name: str,
+    output: Var,
     thread_m: int,
     thread_n: int,
     is_batched: bool,
     k_splits: int,
+    row_base: LoopExpr | None = None,
+    col_base: LoopExpr | None = None,
 ) -> list:
     """Generate LoopIR ops for the contraction write phase.
 
-    Replaces the W() macro with proper Guard + Store ops.
+    ``row_base`` and ``col_base`` are the base expressions for computing
+    global row/col indices.  Defaults: ``bm + tr`` and ``bn + tc``
+    (CTA-swizzle layout).  Smem uses ``row_base`` and ``col_base`` vars.
     """
     ops: list = []
-    safe_out = _safe(output_name)
-    bm, tr, bn, tc = Var("bm"), Var("tr"), Var("bn"), Var("tc")
     M, N = Var("M"), Var("N")  # noqa: N806
+    rb = row_base if row_base is not None else Var("bm") + Var("tr")
+    cb = col_base if col_base is not None else Var("bn") + Var("tc")
 
     for r in range(thread_m):
-        row = bm + tr + r
-        row_guard = row.lt(M)
+        row = rb + r
         row_body: list = []
-
         for c_idx in range(thread_n):
-            col = bn + tc + c_idx
-            col_guard = col.lt(N)
-
+            col = cb + c_idx
             if is_batched:
                 idx = Var("batch") * (M * N) + row * N + col
             else:
                 idx = row * N + col
-
-            row_body.append(Store(safe_out, idx, RegAccess("c", [r, c_idx]), "global", guard=col_guard, atomic=k_splits > 1))
-
-        ops.append(Guard(row_guard, row_body))
+            row_body.append(Store(output, idx, RegAccess("c", [r, c_idx]), "global", guard=col.lt(N), atomic=k_splits > 1))
+        ops.append(Guard(row.lt(M), row_body))
 
     return ops
 
@@ -1191,77 +1185,72 @@ def _contraction_write_ops(
 # ---------------------------------------------------------------------------
 
 
-def _lower_contraction_naive(
+def _lower_contraction(
     region: FusedRegionOp,
     name: str,
     shapes: dict[str, tuple],
     analysis: TileAnalysis,
     hints: dict,
+    strategy: str = "naive",
 ) -> LoopProgram:
-    """Lower contraction (naive strategy) to LoopIR.
+    """Lower contraction to LoopIR for any strategy (naive, tma, smem).
 
-    Grid setup uses LoopIR, K-loop uses LoopIR.  Accumulator declaration,
-    epilogue, and write phase use proper LoopIR with register arrays.
-
+    Shared structure: params → grid → accumulators → K-loop → epilogue → write.
+    Only the grid setup and K-loop body differ between strategies.
     """
-    dims = _contraction_dims(analysis, hints)
-    thread_m, thread_n = dims["thread_m"], dims["thread_n"]
-    tile_m, tile_n = dims["tile_m"], dims["tile_n"]
-    tx, ty = dims["tx"], dims["ty"]
     is_batched = analysis.batch_size > 1
     k_splits = int(hints.get("k_splits", 1))
+    phases = analysis.op_phases
 
     A = Var(_safe(analysis.contraction_a))  # noqa: N806
     B = Var(_safe(analysis.contraction_b))  # noqa: N806
-    out_id = region.output_names[0]
+    C = Var(_safe(region.output_names[0]))  # noqa: N806
 
-    # Params
-    params = _build_params(region)
-    params.extend([("int", "M"), ("int", "N"), ("int", "K")])
-    if is_batched:
-        params.append(("int", "batch_count"))
-
-    body: list = []
-
-    # Grid setup (CTA-swizzle)
-    body.extend(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
-
-    # Batch pointer aliases
-    M, N, K = Var("M"), Var("N"), Var("K")  # noqa: N806
-    if is_batched:
-        batch = Var("batch")
-        body.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
-        body.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
-        a_src, b_src = Var("Ab"), Var("Bb")
+    # --- Strategy-specific: grid + K-loop + dims ---
+    dims = _contraction_dims(analysis, hints)
+    if strategy == "tma":
+        grid_ops, k_ops, extra = _k_loop_tma(A, B, dims, hints, is_batched, k_splits)
+    elif strategy == "smem":
+        grid_ops, k_ops, extra = _k_loop_smem(A, B, dims, hints, is_batched, k_splits)
     else:
-        a_src, b_src = A, B
+        grid_ops, k_ops, extra = _k_loop_naive(A, B, dims, is_batched, k_splits)
 
-    # Accumulator register array
-    body.append(Alloc("c", "float", (thread_m, thread_n), "reg", Literal(0.0)))
+    # Smem overrides block dims (32,4 vs 32,8)
+    if "dims" in extra:
+        dims = extra["dims"]
+    thread_m, thread_n = dims["thread_m"], dims["thread_n"]
+    tile_m, tile_n = dims["tile_m"], dims["tile_n"]
+    tx, ty = dims["tx"], dims["ty"]
 
-    # K-loop with bounds-checked global loads + FMA
-    k_body: list = []
-    # Load B columns (4 per thread)
-    bn, tc, bm, tr = Var("bn"), Var("tc"), Var("bm"), Var("tr")
-    k, K, N, M = Var("k"), Var("K"), Var("N"), Var("M")  # noqa: N806
-    for c in range(thread_n):
-        col = bn + tc + c
-        k_body.append(Load(f"b{c}", b_src, k * N + col, "global", guard=col.lt(N)))
-    # Load A rows + FMA (unrolled over thread_m)
-    for r in range(thread_m):
-        row = bm + tr + r
-        k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
-        for c in range(thread_n):
-            k_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
+    # --- Shared: params ---
+    if strategy == "tma":
+        tma_exclude = {A.name, B.name, "M", "N", "K"}
+        if is_batched:
+            tma_exclude.add("batch_count")
+        params = [(dt, nm) for dt, nm in _build_params(region) if nm not in tma_exclude]
+        if k_splits > 1:
+            params.append(("int", "k_splits"))
+    else:
+        params = _build_params(region)
+        params.extend([("int", "M"), ("int", "N"), ("int", "K")])
+        if is_batched:
+            params.append(("int", "batch_count"))
+        elif k_splits > 1 and strategy == "smem":
+            params.append(("int", "k_splits"))
 
-    body.append(LoopNest("k", Literal(0, "int"), Var("K"), None, k_body))
+    # --- Shared: assemble body ---
+    body: list = []
+    body.extend(grid_ops)
+    body.extend(k_ops)
 
-    # Epilogue — proper LoopIR with register arrays
-    phases = analysis.op_phases
+    # Epilogue
     body.extend(_contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
 
-    # Write — proper LoopIR with register arrays
-    body.extend(_contraction_write_ops(out_id, thread_m, thread_n, is_batched, k_splits))
+    # Write
+    row_base = extra.get("row_base")
+    col_base = extra.get("col_base")
+    out = extra.get("out_var", C)
+    body.extend(_contraction_write_ops(out, thread_m, thread_n, is_batched, k_splits, row_base=row_base, col_base=col_base))
 
     return LoopProgram(
         name=name,
@@ -1270,59 +1259,68 @@ def _lower_contraction_naive(
         block_size=(tx, ty, 1),
         tile_m=tile_m,
         tile_n=tile_n,
+        grid_2d=extra.get("grid_2d", False),
+        tma_params=extra.get("tma_params"),
+        batched=extra.get("batched", False),
+        includes=extra.get("includes"),
     )
 
 
-def _lower_contraction_tma(
-    region: FusedRegionOp,
-    name: str,
-    shapes: dict[str, tuple],
-    analysis: TileAnalysis,
-    hints: dict,
-) -> LoopProgram:
-    """Lower contraction (TMA double-buffer) to LoopIR.
+# ---------------------------------------------------------------------------
+# Strategy-specific K-loop helpers
+# ---------------------------------------------------------------------------
 
-    CTA-swizzle grid, accumulator alloc, epilogue, and write use proper
-    LoopIR.  The TMA smem setup + mbarrier pipeline + double-buffered
-    K-loop uses TMAKLoop (CUDA extension op for inline PTX asm).
-    """
-    dims = _contraction_dims(analysis, hints)
+
+def _k_loop_naive(A, B, dims, is_batched, k_splits):  # noqa: N803
+    """Naive K-loop: global loads + FMA. Returns (grid_ops, k_ops, extra)."""
     thread_m, thread_n = dims["thread_m"], dims["thread_n"]
     tile_m, tile_n = dims["tile_m"], dims["tile_n"]
-    tx, ty = dims["tx"], dims["ty"]
-    is_batched = analysis.batch_size > 1
-    k_splits = int(hints.get("k_splits", 1))
-    bk = int(hints.get("block_k", 32))
-    phases = analysis.op_phases
+    M, N, K = Var("M"), Var("N"), Var("K")  # noqa: N806
 
-    A = Var(_safe(analysis.contraction_a))  # noqa: N806
-    B = Var(_safe(analysis.contraction_b))  # noqa: N806
-    out_id = region.output_names[0]
-    a_size = tile_m * bk
-    b_size = bk * tile_n
-    stage = a_size + b_size
+    grid_ops = list(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
 
-    # TMA params: A/B come via descriptors, only C + epilogue inputs as regular params.
-    # M/N/K come via #define from backend.py.
-    tma_exclude = {A.name, B.name, "M", "N", "K"}
+    k_ops: list = []
     if is_batched:
-        tma_exclude.add("batch_count")
-    params = [(dt, nm) for dt, nm in _build_params(region) if nm not in tma_exclude]
-    if k_splits > 1:
-        params.append(("int", "k_splits"))
+        batch = Var("batch")
+        k_ops.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
+        k_ops.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
+    a_src = Var("Ab") if is_batched else A
+    b_src = Var("Bb") if is_batched else B
 
-    body: list = []
+    k_ops.append(Alloc("c", "float", (thread_m, thread_n), "reg", Literal(0.0)))
 
-    # Grid setup (CTA-swizzle) — same as naive
-    body.extend(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
+    bn, tc, bm, tr, k = Var("bn"), Var("tc"), Var("bm"), Var("tr"), Var("k")
+    k_body: list = []
+    for c in range(thread_n):
+        col = bn + tc + c
+        k_body.append(Load(f"b{c}", b_src, k * N + col, "global", guard=col.lt(N)))
+    for r in range(thread_m):
+        row = bm + tr + r
+        k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
+        for c in range(thread_n):
+            k_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
+    k_ops.append(LoopNest("k", Literal(0, "int"), K, None, k_body))
 
-    # TMA double-buffered K-loop (CUDA extension op)
+    return grid_ops, k_ops, {}
+
+
+def _k_loop_tma(A, B, dims, hints, is_batched, k_splits):  # noqa: N803
+    """TMA double-buffered K-loop. Returns (grid_ops, k_ops, extra)."""
     from deplodock.compiler.backend.cuda.tma_ops import TMAKLoop
+
+    thread_m, thread_n = dims["thread_m"], dims["thread_n"]
+    tile_m, tile_n = dims["tile_m"], dims["tile_n"]
+    tx = dims["tx"]
+    bk = int(hints.get("block_k", 32))
+    a_size = tile_m * bk
+    stage = a_size + bk * tile_n
+
+    grid_ops = list(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
 
     tma_a_ref = f"&{A.name}_tma[batch]" if is_batched else f"&{A.name}_tma"
     tma_b_ref = f"&{B.name}_tma[batch]" if is_batched else f"&{B.name}_tma"
 
-    body.append(
+    k_ops = [
         TMAKLoop(
             a_tma_ref=tma_a_ref,
             b_tma_ref=tma_b_ref,
@@ -1337,153 +1335,93 @@ def _lower_contraction_tma(
             k_splits=k_splits,
             is_batched=is_batched,
         )
-    )
+    ]
 
-    # Epilogue — proper LoopIR (softmax or standard)
-    body.extend(_contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
-
-    # Write — proper LoopIR with register arrays
-    body.extend(_contraction_write_ops(out_id, thread_m, thread_n, is_batched, k_splits))
-
-    return LoopProgram(
-        name=name,
-        params=params,
-        body=body,
-        block_size=(tx, ty, 1),
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tma_params=[f"{A.name}_tma", f"{B.name}_tma"],
-        batched=is_batched,
-        includes=["cuda.h"],
-    )
+    extra = {
+        "tma_params": [f"{A.name}_tma", f"{B.name}_tma"],
+        "batched": is_batched,
+        "includes": ["cuda.h"],
+    }
+    return grid_ops, k_ops, extra
 
 
-def _lower_contraction_smem(
-    region: FusedRegionOp,
-    name: str,
-    shapes: dict[str, tuple],
-    analysis: TileAnalysis,
-    hints: dict,
-) -> LoopProgram:
-    """Lower contraction (smem strategy) to LoopIR.
-
-    Block: (32, 4) = 128 threads. Shared memory for A tile (bank-conflict
-    padded), scalar global loads for B (nvcc auto-vectorizes to float4).
-    Fully expressed in LoopIR — no RawLoopOp.
-    """
-    A = Var(_safe(analysis.contraction_a))  # noqa: N806
-    B = Var(_safe(analysis.contraction_b))  # noqa: N806
-    out_id = region.output_names[0]
-    C = Var(_safe(out_id))  # noqa: N806
-    is_batched = analysis.batch_size > 1
-
+def _k_loop_smem(A, B, dims, hints, is_batched, k_splits):  # noqa: N803
+    """Smem K-tile loop: shared memory for A, global for B. Returns (grid_ops, k_ops, extra)."""
     thread_m = int(hints.get("thread_m", 4))
     thread_n = 4
     bk = int(hints.get("block_k", 32))
-    k_splits = int(hints.get("k_splits", 1))
     tx, ty = 32, 4
     tile_m = ty * thread_m
-    tile_n = tx * thread_n  # 128
-    smem_stride = bk + 1  # bank conflict padding
+    tile_n = tx * thread_n
+    smem_stride = bk + 1
     I = "int"  # noqa: E741
+    M, N, K = Var("M"), Var("N"), Var("K")  # noqa: N806
 
-    params = _build_params(region)
-    params.extend([("int", "M"), ("int", "N"), ("int", "K")])
-    if is_batched:
-        params.append(("int", "batch_count"))
-    elif k_splits > 1:
-        params.append(("int", "k_splits"))
-
-    body: list = []
-
-    # Grid setup
+    # 2D standard grid
     bidy, bidx = Builtin("blockIdx.y"), Builtin("blockIdx.x")
     tidy, tidx = Builtin("threadIdx.y"), Builtin("threadIdx.x")
-    K = Var("K")  # noqa: N806
 
+    grid_ops: list = []
     if is_batched:
-        body.append(Let("batch", Builtin("blockIdx.z"), dtype=I))
-    body.append(Let("row_base", (bidy * ty + tidy) * thread_m, dtype=I))
-    body.append(Let("col_base", (bidx * tx + tidx) * thread_n, dtype=I))
-    body.append(Let("sr", tidy * thread_m, dtype=I))
+        grid_ops.append(Let("batch", Builtin("blockIdx.z"), dtype=I))
+    grid_ops.append(Let("row_base", (bidy * ty + tidy) * thread_m, dtype=I))
+    grid_ops.append(Let("col_base", (bidx * tx + tidx) * thread_n, dtype=I))
+    grid_ops.append(Let("sr", tidy * thread_m, dtype=I))
 
-    # Shared memory for A tile (bank-conflict padded stride)
-    body.append(Alloc("As", "float", (tile_m * smem_stride,), "smem"))
+    k_ops: list = []
+    k_ops.append(Alloc("As", "float", (tile_m * smem_stride,), "smem"))
 
     # K-range for k_splits
     if k_splits > 1:
         bidz = Builtin("blockIdx.z")
         k_per, k_start = Var("k_per"), Var("k_start")
-        body.append(Let("k_per", K / bk / Var("k_splits") * bk, dtype=I))
-        body.append(Let("k_start", bidz * k_per, dtype=I))
-        body.append(Let("k_end", Ternary(bidz.eq(Literal(k_splits - 1, I)), K, k_start + k_per), dtype=I))
+        k_ops.append(Let("k_per", K / bk / Var("k_splits") * bk, dtype=I))
+        k_ops.append(Let("k_start", bidz * k_per, dtype=I))
+        k_ops.append(Let("k_end", Ternary(bidz.eq(Literal(k_splits - 1, I)), K, k_start + k_per), dtype=I))
     else:
-        body.append(Let("k_start", Literal(0, I), dtype=I))
-        body.append(Let("k_end", K, dtype=I))
+        k_ops.append(Let("k_start", Literal(0, I), dtype=I))
+        k_ops.append(Let("k_end", K, dtype=I))
 
-    # Accumulator register array
-    body.append(Alloc("c", "float", (thread_m, thread_n), "reg", Literal(0.0)))
+    k_ops.append(Alloc("c", "float", (thread_m, thread_n), "reg", Literal(0.0)))
 
     # Batch pointer aliases
-    M, N = Var("M"), Var("N")  # noqa: N806
     if is_batched:
         batch = Var("batch")
-        body.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
-        body.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
+        k_ops.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
+        k_ops.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
     a_src = Var("Ab") if is_batched else A
     b_src = Var("Bb") if is_batched else B
 
-    # K-tile loop
-    tk_body: list = []
-
-    # Load A tile into shared memory (guarded, per-thread_m rows)
+    # K-tile loop body
     row_base, col_base = Var("row_base"), Var("col_base")
     sr, tk, kk = Var("sr"), Var("tk"), Var("kk")
-    tidx = Builtin("threadIdx.x")
+    tidx_v = Builtin("threadIdx.x")
 
+    tk_body: list = []
     for r in range(thread_m):
         row_r = row_base + r
-        k_col = tk + tidx
+        k_col = tk + tidx_v
         tk_body.append(Load(f"As_ld_{r}", a_src, row_r * K + k_col, "global", guard=row_r.lt(M).and_(k_col.lt(K))))
-        tk_body.append(Store("As", (sr + r) * smem_stride + tidx, Var(f"As_ld_{r}"), "smem"))
-
+        tk_body.append(Store("As", (sr + r) * smem_stride + tidx_v, Var(f"As_ld_{r}"), "smem"))
     tk_body.append(Barrier())
 
-    # Inner kk loop: read A from smem, read B from global (scalar), FMA
     kk_body: list = []
     for c in range(thread_n):
         col_c = col_base + c
         kk_body.append(Load(f"b{c}", b_src, (tk + kk) * N + col_c, "global", guard=col_c.lt(N)))
-
     for r in range(thread_m):
         kk_body.append(Load(f"a{r}", "As", (sr + r) * smem_stride + kk, "smem"))
         for c in range(thread_n):
             kk_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
-
     tk_body.append(LoopNest("kk", Literal(0, I), Literal(bk, I), None, kk_body))
     tk_body.append(Barrier())
 
-    body.append(LoopNest("tk", Var("k_start"), Var("k_end"), Literal(bk, I), tk_body))
+    k_ops.append(LoopNest("tk", Var("k_start"), Var("k_end"), Literal(bk, I), tk_body))
 
-    # Write
-    c_local = Var("Cb") if is_batched else C
-    if is_batched:
-        body.append(Let("Cb", C + Var("batch") * (M * N), dtype="float*"))
-    for r in range(thread_m):
-        row = row_base + r
-        row_body: list = []
-        for c in range(thread_n):
-            col = col_base + c
-            idx = row * N + col
-            row_body.append(Store(c_local, idx, RegAccess("c", [r, c]), "global", guard=col.lt(N), atomic=k_splits > 1))
-        body.append(Guard(row.lt(M), row_body))
-
-    return LoopProgram(
-        name=name,
-        params=params,
-        body=body,
-        block_size=(tx, ty, 1),
-        tile_m=tile_m,
-        tile_n=tile_n,
-        grid_2d=True,
-    )
+    extra: dict = {
+        "grid_2d": True,
+        "row_base": row_base,
+        "col_base": col_base,
+        "dims": {"tx": tx, "ty": ty, "thread_m": thread_m, "thread_n": thread_n, "tile_m": tile_m, "tile_n": tile_n},
+    }
+    return grid_ops, k_ops, extra
