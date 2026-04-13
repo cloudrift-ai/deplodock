@@ -53,7 +53,7 @@ def _handle_run(args):
     # Plan from graph.
     plan = plan_graph(compiled, name=ir_path.stem)
     backend = CudaBackend()
-    program = backend.compile(plan)
+    program = backend.compile(plan, dump=dump)
 
     if dump:
         dump.dump_plan(plan)

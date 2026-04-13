@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from deplodock.compiler.backend.ir import KernelDef
+from deplodock.compiler.backend.kernel_ir import KernelDef
 
 logger = logging.getLogger(__name__)
 

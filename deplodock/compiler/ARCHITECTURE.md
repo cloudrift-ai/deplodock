@@ -28,7 +28,7 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  plan.py:            BufferSpec, OpKernel, ExecutionPlan        │
 │  backend/base.py:    Backend ABC (compile, run, benchmark)      │
 │  backend/program.py: Buffer, Launch, Program                    │
-│  backend/ir.py:      Kernel AST (Expr, Stmt, KernelDef)        │
+│  backend/kernel_ir.py:      Kernel AST (Expr, Stmt, KernelDef)        │
 │  backend/loop_ir.py: LoopIR (LoopProgram, LoopOp, LoopExpr)    │
 │  backend/codegen.py: KernelDef → C source                       │
 │                                                                 │
@@ -194,7 +194,7 @@ class ExecutionPlan:
 
 1. Create `rocm/` directory alongside `cuda/`
 2. Implement `RocmBackend(Backend)` in `rocm/backend.py`
-3. Reuse shared Layer 3 modules: `backend/program.py` (Buffer, Launch, Program), `backend/ir.py` (kernel AST), `backend/codegen.py` (C printer)
+3. Reuse shared Layer 3 modules: `backend/program.py` (Buffer, Launch, Program), `backend/kernel_ir.py` (kernel AST), `backend/codegen.py` (C printer)
 4. Optionally subclass `Launch` for backend-specific metadata (like CUDA's `CudaLaunch` adds `tma_descriptors`)
 5. Write ROCm-specific generators (tile sizes, warp size 64, no TMA) and tuning profiles
 6. Map the same `OpKernel.op` tags to `.hip` templates
