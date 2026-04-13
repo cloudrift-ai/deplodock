@@ -19,7 +19,6 @@ from deplodock.compiler.backend.loop_ir import (
     Accumulate,
     Alloc,
     Barrier,
-    Compute,
     Guard,
     Let,
     Load,
@@ -31,8 +30,10 @@ from deplodock.compiler.backend.loop_ir import (
     LoopProgram,
     LoopTernary,
     LoopVar,
+    OpCall,
     ParallelAxis,
     RegAccess,
+    SetVar,
     Store,
     WarpReduce,
     WarpShuffleXor,
@@ -249,7 +250,7 @@ def _emit_scalar_reductions(
                     a = pass_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
                     b = pass_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
                     var_name = f"r{ri}p_{_safe(pid)}"
-                    pass_body.append(Compute(var_name, pop.fn, [a] if len(pinp) == 1 else [a, b]))
+                    pass_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
                     pass_var_map[pid] = LoopVar(var_name)
 
             if ri > 0 and phases.inter_reduce:
@@ -393,7 +394,7 @@ def _emit_scalar_epilogue(
                 a = epi_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
                 b = epi_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
                 var_name = f"ep_{_safe(pid)}"
-                epi_body.append(Compute(var_name, pop.fn, [a] if len(pinp) == 1 else [a, b]))
+                epi_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
                 epi_var_map[pid] = LoopVar(var_name)
 
         _emit_loop_ops(phases.epilogue, epi_var_map, "e_", epi_body)
@@ -568,10 +569,7 @@ def _emit_loop_ops(
     prefix: str,
     body: list,
 ) -> None:
-    """Walk ops and emit Compute nodes, updating var_map.
-
-    Appends to `body` in-place.
-    """
+    """Walk ops and emit Let(name, OpCall(...)) nodes, updating var_map."""
     for node_id, op, input_ids in ops:
         if isinstance(op, (ReshapeOp, TransposeOp)):
             if input_ids and input_ids[0] in var_map:
@@ -583,7 +581,7 @@ def _emit_loop_ops(
             b = var_map.get(input_ids[1], LoopLiteral(0.0)) if len(input_ids) > 1 else LoopLiteral(0.0)
             var_name = f"{prefix}{_safe(node_id)}"
             args = [a, b] if op.info.arity == 2 and len(input_ids) > 1 else [a]
-            body.append(Compute(var_name, op.fn, args))
+            body.append(Let(var_name, OpCall(op.fn, args)))
             var_map[node_id] = LoopVar(var_name)
 
 
@@ -744,7 +742,7 @@ def _lower_single_reduce(
                     a = epi_var_map.get(input_ids[0], LoopLiteral(0.0)) if input_ids else LoopLiteral(0.0)
                     b = epi_var_map.get(input_ids[1], LoopLiteral(0.0)) if len(input_ids) > 1 else LoopLiteral(0.0)
                     var_name = f"p_{_safe(node_id)}"
-                    epi_body.append(Compute(var_name, op.fn, [a] if len(input_ids) == 1 else [a, b]))
+                    epi_body.append(Let(var_name, OpCall(op.fn, [a] if len(input_ids) == 1 else [a, b])))
                     epi_var_map[node_id] = LoopVar(var_name)
 
             _emit_loop_ops(epilogue_ops, epi_var_map, "e_", epi_body)
@@ -846,7 +844,7 @@ def _lower_multi_reduce(
                 a = pass_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
                 b = pass_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
                 var_name = f"r{ri}p_{_safe(pid)}"
-                pass_body.append(Compute(var_name, pop.fn, [a] if len(pinp) == 1 else [a, b]))
+                pass_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
                 pass_var_map[pid] = LoopVar(var_name)
 
         # Apply inter_reduce ops (e.g. sub, exp between max and sum)
@@ -882,7 +880,7 @@ def _lower_multi_reduce(
                 a = epi_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
                 b = epi_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
                 var_name = f"ep_{_safe(pid)}"
-                epi_body.append(Compute(var_name, pop.fn, [a] if len(pinp) == 1 else [a, b]))
+                epi_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
                 epi_var_map[pid] = LoopVar(var_name)
 
         _emit_loop_ops(epilogue_ops, epi_var_map, "e_", epi_body)
@@ -1047,9 +1045,9 @@ def _apply_ops_on_register_tile(
                     # Per-row variable (rmax, rsum)
                     other_val = LoopVar(extra[other].format(r=r))
                     if inputs[0] == prev_id:
-                        ops.append(Compute(dst, fn, [acc, other_val]))
+                        ops.append(SetVar(dst, OpCall(fn, [acc, other_val])))
                     else:
-                        ops.append(Compute(dst, fn, [other_val, acc]))
+                        ops.append(SetVar(dst, OpCall(fn, [other_val, acc])))
                 elif other is not None:
                     # External buffer input
                     safe = _safe(other)
@@ -1066,12 +1064,12 @@ def _apply_ops_on_register_tile(
                     ld_name = f"_{prefix}_{safe}_{r}_{c}"
                     ops.append(Load(ld_name, safe, idx, "global"))
                     if inputs[0] == prev_id:
-                        ops.append(Compute(dst, fn, [acc, LoopVar(ld_name)]))
+                        ops.append(SetVar(dst, OpCall(fn, [acc, LoopVar(ld_name)])))
                     else:
-                        ops.append(Compute(dst, fn, [LoopVar(ld_name), acc]))
+                        ops.append(SetVar(dst, OpCall(fn, [LoopVar(ld_name), acc])))
                 else:
                     # Unary op on accumulator
-                    ops.append(Compute(dst, fn, [acc]))
+                    ops.append(SetVar(dst, OpCall(fn, [acc])))
 
         prev_id = nid
 
@@ -1112,7 +1110,7 @@ def _contraction_softmax_epilogue_ops(
             ops.append(
                 Guard(
                     col_c.lt(LoopVar("N")),
-                    [Compute(rmax, "builtin", [LoopFuncCall("fmaxf", [LoopVar(rmax), RegAccess("c", [r, c])])])],
+                    [SetVar(rmax, LoopFuncCall("fmaxf", [LoopVar(rmax), RegAccess("c", [r, c])]))],
                 )
             )
         ops.append(WarpShuffleXor(rmax, "max"))
@@ -1147,8 +1145,8 @@ def _contraction_softmax_epilogue_ops(
                 )
                 # Fixup: the helper emits c00 for (0,0), but we need c{r}{c}
                 for tile_op in tile_ops:
-                    if isinstance(tile_op, Compute) and tile_op.dst == "c00":
-                        tile_op = Compute(f"c{r}{c}", tile_op.op, _fixup_reg_refs(tile_op.args, 0, 0, r, c))
+                    if isinstance(tile_op, SetVar) and tile_op.name == "c00":
+                        tile_op = SetVar(f"c{r}{c}", _fixup_reg_refs_expr(tile_op.expr, 0, 0, r, c))
                     guarded.append(tile_op)
 
                 guarded.append(Accumulate(rsum, "sum", RegAccess("c", [r, c])))
@@ -1177,23 +1175,23 @@ def _contraction_softmax_epilogue_ops(
                 )
                 fixed: list = []
                 for tile_op in epi_ops:
-                    if isinstance(tile_op, Compute) and tile_op.dst == "c00":
-                        tile_op = Compute(f"c{r}{c}", tile_op.op, _fixup_reg_refs(tile_op.args, 0, 0, r, c))
+                    if isinstance(tile_op, SetVar) and tile_op.name == "c00":
+                        tile_op = SetVar(f"c{r}{c}", _fixup_reg_refs_expr(tile_op.expr, 0, 0, r, c))
                     fixed.append(tile_op)
                 ops.append(Guard(col_c.lt(LoopVar("N")), fixed))
 
     return ops
 
 
-def _fixup_reg_refs(args: list, from_r: int, from_c: int, to_r: int, to_c: int) -> list:
-    """Replace RegAccess("c", [from_r, from_c]) with RegAccess("c", [to_r, to_c]) in args."""
-    result = []
-    for a in args:
-        if isinstance(a, RegAccess) and a.name == "c" and a.indices == [from_r, from_c]:
-            result.append(RegAccess("c", [to_r, to_c]))
-        else:
-            result.append(a)
-    return result
+def _fixup_reg_refs_expr(expr: LoopExpr, from_r: int, from_c: int, to_r: int, to_c: int) -> LoopExpr:
+    """Replace RegAccess("c", [from_r, from_c]) with RegAccess("c", [to_r, to_c]) in an expression tree."""
+    if isinstance(expr, RegAccess) and expr.name == "c" and expr.indices == [from_r, from_c]:
+        return RegAccess("c", [to_r, to_c])
+    if isinstance(expr, OpCall):
+        return OpCall(expr.op, [_fixup_reg_refs_expr(a, from_r, from_c, to_r, to_c) for a in expr.args])
+    if isinstance(expr, LoopFuncCall):
+        return LoopFuncCall(expr.name, [_fixup_reg_refs_expr(a, from_r, from_c, to_r, to_c) for a in expr.args])
+    return expr
 
 
 def _contraction_write_ops(

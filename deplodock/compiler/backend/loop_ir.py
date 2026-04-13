@@ -122,9 +122,22 @@ class LoopBuiltin(_ExprOps):
 
 @dataclass
 class LoopFuncCall(_ExprOps):
-    """Intrinsic / math function call."""
+    """Intrinsic / math function call (C-level: expf, fmaxf, etc.)."""
 
     name: str  # "expf", "rsqrtf", "fmaxf", etc.
+    args: list[LoopExpr]
+
+
+@dataclass
+class OpCall(_ExprOps):
+    """Apply a registered elementwise op by name.
+
+    Unlike ``LoopFuncCall`` (which maps to a literal C function call),
+    ``OpCall`` is rendered by the codegen via the ``_C_EXPR`` template
+    registry.  Example: ``OpCall("relu", [x])`` → ``fmaxf(0.0f, x)``.
+    """
+
+    op: str  # op registry name: "add", "relu", "exp", etc.
     args: list[LoopExpr]
 
 
@@ -150,7 +163,7 @@ class RegAccess(_ExprOps):
     indices: list[int]
 
 
-LoopExpr = LoopVar | LoopLiteral | LoopBinOp | LoopBuiltin | LoopFuncCall | LoopTernary | RegAccess
+LoopExpr = LoopVar | LoopLiteral | LoopBinOp | LoopBuiltin | LoopFuncCall | OpCall | LoopTernary | RegAccess
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +178,14 @@ class Let:
     name: str
     expr: LoopExpr
     dtype: str = "float"
+
+
+@dataclass
+class SetVar:
+    """Reassign an existing variable: ``name = expr;``."""
+
+    name: str
+    expr: LoopExpr
 
 
 @dataclass
@@ -297,7 +318,20 @@ class RawLoopOp:
 
 
 LoopOp = (
-    Let | ParallelAxis | LoopNest | Alloc | Load | Store | Compute | Accumulate | WarpReduce | WarpShuffleXor | Barrier | Guard | RawLoopOp
+    Let
+    | SetVar
+    | ParallelAxis
+    | LoopNest
+    | Alloc
+    | Load
+    | Store
+    | Compute
+    | Accumulate
+    | WarpReduce
+    | WarpShuffleXor
+    | Barrier
+    | Guard
+    | RawLoopOp
 )
 
 
@@ -357,6 +391,9 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
 
     if isinstance(op, Let):
         return [f"{pad}let {op.dtype} {op.name} = {_pp_expr(op.expr)}"]
+
+    if isinstance(op, SetVar):
+        return [f"{pad}{op.name} = {_pp_expr(op.expr)}"]
 
     if isinstance(op, ParallelAxis):
         return [f"{pad}parallel {op.name} = {op.dim}  // bound: {op.bound}"]
@@ -436,6 +473,9 @@ def _pp_expr(expr: LoopExpr) -> str:
     if isinstance(expr, LoopFuncCall):
         args = ", ".join(_pp_expr(a) for a in expr.args)
         return f"{expr.name}({args})"
+    if isinstance(expr, OpCall):
+        args = ", ".join(_pp_expr(a) for a in expr.args)
+        return f"{expr.op}({args})"
     if isinstance(expr, LoopTernary):
         return f"({_pp_expr(expr.cond)} ? {_pp_expr(expr.if_true)} : {_pp_expr(expr.if_false)})"
     if isinstance(expr, RegAccess):
