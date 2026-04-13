@@ -53,6 +53,7 @@ tests/
 │   ├── test_backend_ir.py      # Backend IR AST nodes + codegen emission
 │   ├── test_tile_analysis.py   # TileAnalysis pattern classification
 │   ├── test_kernel_gen.py      # Kernel generation from FusedRegionOps
+│   ├── test_loop_ir.py         # LoopIR dataclasses, pretty-print, structure, round-trip
 │   ├── test_cuda.py            # CUDA codegen, lowering, GPU correctness
 │   ├── test_cuda_backend.py    # CudaBackend compile/run/benchmark
 │   ├── test_program.py         # Program source gen + GPU execution

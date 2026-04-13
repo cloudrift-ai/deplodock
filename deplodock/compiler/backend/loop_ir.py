@@ -1,0 +1,444 @@
+"""LoopIR: loop-nest intermediate representation for GPU kernel generation.
+
+Backend-agnostic: describes a kernel as explicit parallel axes, sequential
+loops, memory operations, and reductions.  Sits between TileAnalysis
+(pattern classification) and KernelDef (imperative C AST), separating
+the "what loops do we need" decision from "how to emit C code".
+
+Backend-specific constructs (e.g. CUDA TMA inline asm) use the RawLoopOp
+escape hatch.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+# ---------------------------------------------------------------------------
+# Expressions
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LoopVar:
+    """Variable reference."""
+
+    name: str
+
+
+@dataclass
+class LoopLiteral:
+    """Numeric constant."""
+
+    value: int | float
+    dtype: str = "float"
+
+
+@dataclass
+class LoopBinOp:
+    """Binary operation."""
+
+    op: str  # "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "&&", "||"
+    left: LoopExpr
+    right: LoopExpr
+
+
+@dataclass
+class LoopBuiltin:
+    """GPU built-in variable (threadIdx.x, blockIdx.y, blockDim.x, etc.)."""
+
+    name: str
+
+
+@dataclass
+class LoopFuncCall:
+    """Intrinsic / math function call."""
+
+    name: str  # "expf", "rsqrtf", "fmaxf", etc.
+    args: list[LoopExpr]
+
+
+@dataclass
+class LoopTernary:
+    """Ternary expression: cond ? if_true : if_false."""
+
+    cond: LoopExpr
+    if_true: LoopExpr
+    if_false: LoopExpr
+
+
+LoopExpr = LoopVar | LoopLiteral | LoopBinOp | LoopBuiltin | LoopFuncCall | LoopTernary
+
+
+# ---------------------------------------------------------------------------
+# Operations
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ParallelAxis:
+    """Maps to a grid dimension.  One block per value in [0, bound).
+
+    The codegen decides how to implement this (e.g. VarDecl + bounds guard).
+    """
+
+    name: str  # "row", "blk", "cta"
+    dim: str  # variable name bound to this axis ("blockIdx.x")
+    bound: str  # parameter name for the upper bound ("rows", "M", "n")
+
+
+@dataclass
+class LoopNest:
+    """Sequential loop over a dimension (K-loop, column scan, epilogue pass)."""
+
+    var: str
+    start: LoopExpr
+    end: LoopExpr
+    step: LoopExpr | None  # None = increment by 1
+    body: list[LoopOp]
+
+
+@dataclass
+class Alloc:
+    """Register or shared-memory allocation.
+
+    For accumulators: shape=None (scalar), space="reg", init=LoopLiteral(0.0).
+    For smem buffers: shape=(64, 64), space="smem".
+    """
+
+    name: str
+    dtype: str  # "float"
+    shape: tuple[int, ...] | None  # None = scalar
+    space: str  # "reg" | "smem"
+    init: LoopExpr | None = None
+
+
+@dataclass
+class Load:
+    """Load from global or shared memory into a register."""
+
+    dst: str
+    src: str  # buffer name
+    indices: LoopExpr
+    space: str  # "global" | "smem"
+    guard: LoopExpr | None = None  # bounds check; zero if false
+
+
+@dataclass
+class Store:
+    """Write to global or shared memory."""
+
+    dst: str  # buffer name
+    indices: LoopExpr
+    value: LoopExpr
+    space: str  # "global" | "smem"
+    guard: LoopExpr | None = None
+    atomic: bool = False  # atomicAdd for split-K
+
+
+@dataclass
+class Compute:
+    """Elementwise computation producing a named result."""
+
+    dst: str
+    op: str  # "mul", "add", "exp", "rsqrt", "relu", etc.
+    args: list[LoopExpr]
+
+
+@dataclass
+class Accumulate:
+    """Reduction body: fold value into accumulator."""
+
+    dst: str
+    op: str  # "sum" | "max"
+    value: LoopExpr
+
+
+@dataclass
+class WarpReduce:
+    """Cross-thread warp shuffle reduction.
+
+    After this op, `var` holds the block-wide reduced value (thread 0
+    for max, all threads for sum via broadcast).
+    """
+
+    var: str
+    op: str  # "sum" | "max"
+
+
+@dataclass
+class Barrier:
+    """Thread synchronization barrier (__syncthreads)."""
+
+
+@dataclass
+class Guard:
+    """Conditional execution (bounds check)."""
+
+    cond: LoopExpr
+    body: list[LoopOp]
+
+
+@dataclass
+class RawLoopOp:
+    """Escape hatch for backend-specific inline code (e.g. TMA asm).
+
+    Should be replaced with proper LoopIR ops over time.
+    """
+
+    code: str
+    comment: str = ""
+
+
+LoopOp = ParallelAxis | LoopNest | Alloc | Load | Store | Compute | Accumulate | WarpReduce | Barrier | Guard | RawLoopOp
+
+
+# ---------------------------------------------------------------------------
+# Top-level program
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LoopProgram:
+    """Complete loop program for one kernel."""
+
+    name: str
+    params: list[tuple[str, str]]  # [(dtype, name), ...] e.g. [("const float*", "A"), ("int", "M")]
+    body: list[LoopOp]
+    block_size: tuple[int, int, int]
+    smem_bytes: int = 0
+    # Metadata carried forward into KernelDef.
+    tile_m: int | None = None
+    tile_n: int | None = None
+    grid_2d: bool = False
+    tma_params: list[str] | None = None
+    batched: bool = False
+    includes: list[str] | None = None
+    extra_smem_bytes: int = 0
+    min_blocks_per_sm: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Pretty printer
+# ---------------------------------------------------------------------------
+
+_INDENT = "  "
+
+
+def pretty_print(program: LoopProgram) -> str:
+    """Human-readable text dump of a LoopProgram."""
+    lines: list[str] = []
+    bx, by, bz = program.block_size
+    params_str = ", ".join(f"{dt} {nm}" for dt, nm in program.params)
+    lines.append(f"loop_program {program.name}({params_str}) {{")
+    lines.append(f"  block_size: ({bx}, {by}, {bz})")
+    if program.smem_bytes:
+        lines.append(f"  smem_bytes: {program.smem_bytes}")
+    if program.tile_m is not None:
+        lines.append(f"  tile: ({program.tile_m}, {program.tile_n})")
+    lines.append("")
+    for op in program.body:
+        lines.extend(_pp_op(op, depth=1))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _pp_op(op: LoopOp, depth: int) -> list[str]:
+    """Pretty-print a single LoopOp at the given indentation depth."""
+    pad = _INDENT * depth
+
+    if isinstance(op, ParallelAxis):
+        return [f"{pad}parallel {op.name} = {op.dim}  // bound: {op.bound}"]
+
+    if isinstance(op, LoopNest):
+        start = _pp_expr(op.start)
+        end = _pp_expr(op.end)
+        step = _pp_expr(op.step) if op.step else "1"
+        lines = [f"{pad}for {op.var} in [{start}, {end}) step {step} {{"]
+        for child in op.body:
+            lines.extend(_pp_op(child, depth + 1))
+        lines.append(f"{pad}}}")
+        return lines
+
+    if isinstance(op, Alloc):
+        shape_str = f"[{', '.join(str(d) for d in op.shape)}]" if op.shape else "scalar"
+        init_str = f" = {_pp_expr(op.init)}" if op.init else ""
+        return [f"{pad}alloc {op.space} {op.dtype} {op.name}{shape_str}{init_str}"]
+
+    if isinstance(op, Load):
+        guard_str = f"  guard({_pp_expr(op.guard)})" if op.guard else ""
+        return [f"{pad}load {op.dst} = {op.src}[{_pp_expr(op.indices)}] ({op.space}){guard_str}"]
+
+    if isinstance(op, Store):
+        guard_str = f"  guard({_pp_expr(op.guard)})" if op.guard else ""
+        atomic_str = " atomic" if op.atomic else ""
+        return [f"{pad}store{atomic_str} {op.dst}[{_pp_expr(op.indices)}] = {_pp_expr(op.value)} ({op.space}){guard_str}"]
+
+    if isinstance(op, Compute):
+        args_str = ", ".join(_pp_expr(a) for a in op.args)
+        return [f"{pad}compute {op.dst} = {op.op}({args_str})"]
+
+    if isinstance(op, Accumulate):
+        return [f"{pad}accumulate {op.dst} {op.op} {_pp_expr(op.value)}"]
+
+    if isinstance(op, WarpReduce):
+        return [f"{pad}warp_reduce {op.var} {op.op}"]
+
+    if isinstance(op, Barrier):
+        return [f"{pad}barrier"]
+
+    if isinstance(op, Guard):
+        lines = [f"{pad}guard ({_pp_expr(op.cond)}) {{"]
+        for child in op.body:
+            lines.extend(_pp_op(child, depth + 1))
+        lines.append(f"{pad}}}")
+        return lines
+
+    if isinstance(op, RawLoopOp):
+        comment = f"  // {op.comment}" if op.comment else ""
+        # Show first line of code + ellipsis if multi-line.
+        first_line = op.code.split("\n")[0]
+        n_lines = op.code.count("\n") + 1
+        if n_lines > 1:
+            return [f"{pad}raw ({n_lines} lines){comment}: {first_line} ..."]
+        return [f"{pad}raw{comment}: {first_line}"]
+
+    return [f"{pad}?? {type(op).__name__}"]
+
+
+def _pp_expr(expr: LoopExpr) -> str:
+    """Pretty-print a LoopExpr as a compact string."""
+    if isinstance(expr, LoopVar):
+        return expr.name
+    if isinstance(expr, LoopLiteral):
+        if isinstance(expr.value, float):
+            return f"{expr.value:g}"
+        return str(expr.value)
+    if isinstance(expr, LoopBinOp):
+        return f"({_pp_expr(expr.left)} {expr.op} {_pp_expr(expr.right)})"
+    if isinstance(expr, LoopBuiltin):
+        return expr.name
+    if isinstance(expr, LoopFuncCall):
+        args = ", ".join(_pp_expr(a) for a in expr.args)
+        return f"{expr.name}({args})"
+    if isinstance(expr, LoopTernary):
+        return f"({_pp_expr(expr.cond)} ? {_pp_expr(expr.if_true)} : {_pp_expr(expr.if_false)})"
+    return "??"
+
+
+# ---------------------------------------------------------------------------
+# Serialization
+# ---------------------------------------------------------------------------
+
+
+def to_dict(program: LoopProgram) -> dict:
+    """JSON-serializable dict for dump-dir artifacts."""
+    return {
+        "name": program.name,
+        "params": [{"dtype": dt, "name": nm} for dt, nm in program.params],
+        "block_size": list(program.block_size),
+        "smem_bytes": program.smem_bytes,
+        "tile_m": program.tile_m,
+        "tile_n": program.tile_n,
+        "body": [_op_to_dict(op) for op in program.body],
+    }
+
+
+def _op_to_dict(op: LoopOp) -> dict:
+    """Serialize a single LoopOp."""
+    if isinstance(op, ParallelAxis):
+        return {"op": "parallel_axis", "name": op.name, "dim": op.dim, "bound": op.bound}
+    if isinstance(op, LoopNest):
+        return {
+            "op": "loop",
+            "var": op.var,
+            "start": _expr_to_dict(op.start),
+            "end": _expr_to_dict(op.end),
+            "step": _expr_to_dict(op.step) if op.step else None,
+            "body": [_op_to_dict(c) for c in op.body],
+        }
+    if isinstance(op, Alloc):
+        return {
+            "op": "alloc",
+            "name": op.name,
+            "dtype": op.dtype,
+            "shape": list(op.shape) if op.shape else None,
+            "space": op.space,
+            "init": _expr_to_dict(op.init) if op.init else None,
+        }
+    if isinstance(op, Load):
+        return {
+            "op": "load",
+            "dst": op.dst,
+            "src": op.src,
+            "indices": _expr_to_dict(op.indices),
+            "space": op.space,
+            "guard": _expr_to_dict(op.guard) if op.guard else None,
+        }
+    if isinstance(op, Store):
+        return {
+            "op": "store",
+            "dst": op.dst,
+            "indices": _expr_to_dict(op.indices),
+            "value": _expr_to_dict(op.value),
+            "space": op.space,
+            "guard": _expr_to_dict(op.guard) if op.guard else None,
+            "atomic": op.atomic,
+        }
+    if isinstance(op, Compute):
+        return {
+            "op": "compute",
+            "dst": op.dst,
+            "fn": op.op,
+            "args": [_expr_to_dict(a) for a in op.args],
+        }
+    if isinstance(op, Accumulate):
+        return {
+            "op": "accumulate",
+            "dst": op.dst,
+            "fn": op.op,
+            "value": _expr_to_dict(op.value),
+        }
+    if isinstance(op, WarpReduce):
+        return {"op": "warp_reduce", "var": op.var, "fn": op.op}
+    if isinstance(op, Barrier):
+        return {"op": "barrier"}
+    if isinstance(op, Guard):
+        return {
+            "op": "guard",
+            "cond": _expr_to_dict(op.cond),
+            "body": [_op_to_dict(c) for c in op.body],
+        }
+    if isinstance(op, RawLoopOp):
+        return {"op": "raw", "code": op.code, "comment": op.comment}
+    return {"op": "unknown", "type": type(op).__name__}
+
+
+def _expr_to_dict(expr: LoopExpr) -> dict:
+    """Serialize a LoopExpr."""
+    if isinstance(expr, LoopVar):
+        return {"expr": "var", "name": expr.name}
+    if isinstance(expr, LoopLiteral):
+        return {"expr": "literal", "value": expr.value, "dtype": expr.dtype}
+    if isinstance(expr, LoopBinOp):
+        return {
+            "expr": "binop",
+            "op": expr.op,
+            "left": _expr_to_dict(expr.left),
+            "right": _expr_to_dict(expr.right),
+        }
+    if isinstance(expr, LoopBuiltin):
+        return {"expr": "builtin", "name": expr.name}
+    if isinstance(expr, LoopFuncCall):
+        return {
+            "expr": "call",
+            "name": expr.name,
+            "args": [_expr_to_dict(a) for a in expr.args],
+        }
+    if isinstance(expr, LoopTernary):
+        return {
+            "expr": "ternary",
+            "cond": _expr_to_dict(expr.cond),
+            "if_true": _expr_to_dict(expr.if_true),
+            "if_false": _expr_to_dict(expr.if_false),
+        }
+    return {"expr": "unknown"}

@@ -412,19 +412,20 @@ def lower_tiled(
     *,
     strategy: str = "naive",
     hints: dict | None = None,
+    dump=None,
 ) -> KernelDef:
     """Generate a KernelDef for a fused region based on its TileAnalysis.
 
-    A single generator handles all pattern classes (pointwise, row_reduce,
-    reduce_broadcast, contraction) through composable phases parameterized
-    by the TileAnalysis.
-
-    For contraction strategies (naive or tma_db), the same code path handles
-    grid setup, accumulators, and write.  Only the K-loop body differs.
+    Routes through LoopIR: lower_to_loop_ir() → loop_ir_to_kernel().
+    Pass a CompilerDump instance as ``dump`` to save the LoopIR artifact.
     """
-    if strategy == "smem" and analysis.pattern == "contraction":
-        return _lower_smem(region, name, shapes, analysis, hints=hints or {})
-    return _lower_naive(region, name, shapes, analysis, strategy=strategy, hints=hints or {})
+    from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
+    from deplodock.compiler.backend.cuda.generators.loop_lower import lower_to_loop_ir
+
+    program = lower_to_loop_ir(region, name, shapes, analysis, strategy=strategy, hints=hints or {})
+    if dump is not None:
+        dump.dump_loop_ir(program, name)
+    return loop_ir_to_kernel(program)
 
 
 # ---------------------------------------------------------------------------
