@@ -343,10 +343,30 @@ def _emit_tma_k_loop(schedule: Schedule, analysis: TileAnalysis) -> list:
 
 
 def _emit_smem_k_loop(schedule: Schedule, analysis: TileAnalysis) -> list:
-    """Emit smem K-tile loop — delegates to shared backend implementation."""
-    from deplodock.compiler.backend.ir.smem import emit_smem_k_loop
+    """Emit smem K-tile loop via SmemPipelineKLoop.expand()."""
+    from deplodock.compiler.backend.ir.loop_ir import SmemPipelineKLoop
 
-    return emit_smem_k_loop(schedule, analysis)
+    A = Var(_safe(analysis.contraction_a))  # noqa: N806
+    B = Var(_safe(analysis.contraction_b))  # noqa: N806
+    a_buf = "Ab" if schedule.is_batched else A.name
+    b_buf = "Bb" if schedule.is_batched else B.name
+
+    pipeline = SmemPipelineKLoop(
+        stages=2,
+        tile_m=schedule.tile_m or 16,
+        tile_n=schedule.tile_n or 128,
+        block_k=schedule.block_k,
+        a_size=(schedule.tile_m or 16) * schedule.block_k,
+        stage_size=(schedule.tile_m or 16) * schedule.block_k + schedule.block_k * (schedule.tile_n or 128),
+        thread_m=schedule.thread_m or 4,
+        thread_n=schedule.thread_n or 4,
+        tx=schedule.grid.block_size[0],
+        k_splits=schedule.k_splits,
+        is_batched=schedule.is_batched,
+        a_buf=a_buf,
+        b_buf=b_buf,
+    )
+    return pipeline.expand()
 
 
 # ---------------------------------------------------------------------------
