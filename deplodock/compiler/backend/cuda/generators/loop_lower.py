@@ -1023,12 +1023,7 @@ def _contraction_epilogue_ops(
             ops.append(Alloc(rvar, "float", None, "reg", init_val))
             for c in range(thread_n):
                 col_c = Var("bn") + Var("tc") + c
-                elem = RegAccess("c", [r, c])
-                if reduce_fn == "max":
-                    fold = SetVar(rvar, FuncCall("fmaxf", [Var(rvar), elem]))
-                else:
-                    fold = SetVar(rvar, Var(rvar) + elem)
-                ops.append(Guard(col_c.lt(Var("N")), [fold]))
+                ops.append(Guard(col_c.lt(Var("N")), [Accumulate(rvar, reduce_fn, RegAccess("c", [r, c]))]))
             ops.append(WarpShuffleXor(rvar, reduce_fn))
 
         reduce_row_vars[reduce_node_id] = f"r{reduce_fn}{{r}}"
