@@ -267,6 +267,12 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
     if isinstance(op, RawLoopOp):
         return [RawCode(op.code)]
 
+    # CUDA-specific extension: TMA ops
+    from deplodock.compiler.backend.cuda.tma_ops import TMAKLoop
+
+    if isinstance(op, TMAKLoop):
+        return [RawCode(_emit_tma_k_loop(op))]
+
     msg = f"Unknown LoopOp type: {type(op)}"
     raise TypeError(msg)
 
@@ -345,6 +351,98 @@ def _emit_warp_reduce(acc_var: str, fn: str) -> list[Stmt]:
     stmts.append(VarAssign(acc_var, Var(s_var)))
 
     return stmts
+
+
+def _emit_tma_k_loop(op) -> str:
+    """Generate the TMA double-buffered K-loop C code from structured TMAKLoop parameters."""
+    bk = op.block_k
+    a_size = op.a_size
+    stage = op.stage
+    tile_n = op.tile_n
+    tx = op.tx
+    thread_m = op.thread_m
+    thread_n = op.thread_n
+    k_splits = op.k_splits
+    smem_bytes = stage * 4
+
+    first_k = "k_start" if k_splits > 1 else "0"
+    next_k_prefix = "k_start+" if k_splits > 1 else ""
+
+    if k_splits > 1:
+        k_range = (
+            f"int k_per_split=(K/{bk}/k_splits)*{bk};\n"
+            f"int k_start=blockIdx.z*k_per_split;\n"
+            f"int k_end=(blockIdx.z==k_splits-1)?K:k_start+k_per_split;\n"
+            f"int p0=0,p1=0,nt=(k_end-k_start)/{bk};"
+        )
+    else:
+        k_range = f"int p0=0,p1=0,nt=K/{bk};"
+
+    # FMA block: unrolled over thread_m x thread_n
+    fma_lines = []
+    for r in range(thread_m):
+        fma_lines.append(f"float a{r}=cas[(tr+{r})*{bk}+kk];" + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n)))
+    fma_block = "\n            ".join(fma_lines)
+
+    # Accumulator declarations (TMA code references them inline)
+    acc_decls = ",".join(f"c{r}{c}=0" for r in range(thread_m) for c in range(thread_n))
+
+    a_ref = op.a_tma_ref
+    b_ref = op.b_tma_ref
+
+    return (
+        f"extern __shared__ __align__(128) char dsmem[];\n"
+        f"float*smem=(float*)dsmem;\n"
+        f"uint64_t*mbar=(uint64_t*)(dsmem+2*{stage}*4);\n"
+        f"const int as0=(int)__cvta_generic_to_shared(&smem[0]);\n"
+        f"const int bs0=(int)__cvta_generic_to_shared(&smem[{a_size}]);\n"
+        f"const int as1=(int)__cvta_generic_to_shared(&smem[{stage}]);\n"
+        f"const int bs1=(int)__cvta_generic_to_shared(&smem[{stage}+{a_size}]);\n"
+        f"const int mb0=(int)__cvta_generic_to_shared(&mbar[0]);\n"
+        f"const int mb1=(int)__cvta_generic_to_shared(&mbar[1]);\n"
+        f"int tid=threadIdx.y*{tx}+threadIdx.x;\n"
+        f'if(tid==0){{asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb0),"r"(1));'
+        f'asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));'
+        f'asm volatile("fence.mbarrier_init.release.cluster;");}}\n'
+        f"__syncthreads();\n"
+        f"float {acc_decls};\n"
+        f"const int bytes={smem_bytes};\n"
+        f"{k_range}\n"
+        f"if(nt>0&&tid==0){{"
+        f'asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 '
+        f'_,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");'
+        f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
+        f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+        f'::"r"(as0),"l"({a_ref}),"r"({first_k}),"r"(bm),"r"(mb0):"memory");'
+        f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
+        f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+        f'::"r"(bs0),"l"({b_ref}),"r"(bn),"r"({first_k}),"r"(mb0):"memory");}}\n'
+        f"for(int t=0;t<nt;t++){{\n"
+        f"    int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;\n"
+        f"    int nm=s==0?mb1:mb0;int na=s==0?as1:as0;int nb=s==0?bs1:bs0;\n"
+        f'    asm volatile("{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\t'
+        f"mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t"
+        f'@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}"::"r"(cm),"r"(cp),"r"(0xffffffff));\n'
+        f"    if(s==0)p0^=1;else p1^=1;\n"
+        f"    if(tid==0&&t+1<nt){{int nk={next_k_prefix}(t+1)*{bk};"
+        f'asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 '
+        f'_,[%0],%1;"::"r"(nm),"r"(bytes):"memory");'
+        f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
+        f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+        f'::"r"(na),"l"({a_ref}),"r"(nk),"r"(bm),"r"(nm):"memory");'
+        f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
+        f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+        f'::"r"(nb),"l"({b_ref}),"r"(bn),"r"(nk),"r"(nm):"memory");}}\n'
+        f"    float*cas=&smem[s*{stage}];float*cbs=&smem[s*{stage}+{a_size}];\n"
+        f"    #pragma unroll\n"
+        f"    for(int kk=0;kk<{bk};kk++){{\n"
+        f"            float b0=cbs[kk*{tile_n}+tc],b1=cbs[kk*{tile_n}+tc+1],"
+        f"b2=cbs[kk*{tile_n}+tc+2],b3=cbs[kk*{tile_n}+tc+3];\n"
+        f"            {fma_block}\n"
+        f"    }}\n"
+        f"    __syncthreads();\n"
+        f"}}"
+    )
 
 
 def _refs_name(exprs: list, name: str) -> bool:

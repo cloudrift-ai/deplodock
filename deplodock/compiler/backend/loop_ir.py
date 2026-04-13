@@ -332,7 +332,8 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
             return [f"{pad}raw ({n_lines} lines){comment}: {first_line} ..."]
         return [f"{pad}raw{comment}: {first_line}"]
 
-    return [f"{pad}?? {type(op).__name__}"]
+    # Extension ops (e.g. TMAKLoop from cuda backend)
+    return [f"{pad}{type(op).__name__}(...)"]
 
 
 def _pp_expr(expr: LoopExpr) -> str:
