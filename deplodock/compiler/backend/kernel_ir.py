@@ -117,9 +117,17 @@ class VarDecl:
 
 @dataclass
 class Assign:
-    """Assignment: target = value."""
+    """Array element assignment: target[index] = value."""
 
     target: ArrayAccess
+    value: Expr
+
+
+@dataclass
+class VarAssign:
+    """Plain variable reassignment: name = value."""
+
+    name: str
     value: Expr
 
 
@@ -181,7 +189,7 @@ class RawCode:
     code: str
 
 
-Stmt = VarDecl | Assign | AugAssign | ForLoop | IfStmt | SyncThreads | ArrayDecl | PragmaUnroll | RawCode
+Stmt = VarDecl | Assign | VarAssign | AugAssign | ForLoop | IfStmt | SyncThreads | ArrayDecl | PragmaUnroll | RawCode
 
 
 # ---------------------------------------------------------------------------

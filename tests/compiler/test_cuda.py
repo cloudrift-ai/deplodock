@@ -113,7 +113,7 @@ def test_emit_matmul_kernel():
     assert "int K" in source
     # Coarsened: 8×4 outputs per thread with register accumulators
     assert "c00" in source  # first accumulator
-    assert "for(int k=0;k<K;k++)" in source
+    assert "for (int k = 0; k < K; k++)" in source
     assert "A[" in source
     assert "B[" in source
 

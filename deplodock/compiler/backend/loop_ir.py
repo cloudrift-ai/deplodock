@@ -153,8 +153,9 @@ class Compute:
     """Elementwise computation producing a named result."""
 
     dst: str
-    op: str  # "mul", "add", "exp", "rsqrt", "relu", etc.
+    op: str  # "mul", "add", "exp", "rsqrt", "relu", "builtin", "ptr_offset", etc.
     args: list[LoopExpr]
+    dtype: str = "float"  # "int" for grid index computations
 
 
 @dataclass

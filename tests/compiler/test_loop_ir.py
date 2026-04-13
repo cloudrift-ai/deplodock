@@ -303,13 +303,16 @@ def test_contraction_structure():
     )
 
     assert prog.block_size == (32, 8, 1)
-    # Grid setup + K-loop are RawLoopOp; accumulators and write are proper LoopIR.
-    raws = _find_ops(prog.body, RawLoopOp, recursive=False)
-    assert len(raws) == 2  # grid setup + K-loop
+    # Grid setup is Compute ops, K-loop is LoopNest, write is Guard+Store.
+    computes = _find_ops(prog.body, Compute, recursive=False)
+    assert any(c.dst == "bm" for c in computes)  # CTA-swizzle output
+    assert any(c.dst == "tr" for c in computes)  # thread row offset
     allocs = _find_ops(prog.body, Alloc, recursive=False)
     assert any(a.name == "c" and a.shape == (8, 4) for a in allocs)  # register array
+    loops = _find_ops(prog.body, LoopNest, recursive=False)
+    assert any(ln.var == "k" for ln in loops)  # K-loop
     guards = _find_ops(prog.body, Guard, recursive=False)
-    assert len(guards) >= 1  # write guards
+    assert len(guards) >= 1  # write guards + early return
     stores = _find_ops(prog.body, Store)
     assert len(stores) >= 1
 

@@ -136,6 +136,12 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
         value = _emit_expr(stmt.value)
         return f"{pad}{target} = {value};"
 
+    from deplodock.compiler.backend.kernel_ir import VarAssign
+
+    if isinstance(stmt, VarAssign):
+        value = _emit_expr(stmt.value)
+        return f"{pad}{stmt.name} = {value};"
+
     if isinstance(stmt, AugAssign):
         value = _emit_expr(stmt.value)
         return f"{pad}{stmt.target} {stmt.op} {value};"
