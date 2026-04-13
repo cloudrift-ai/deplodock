@@ -303,10 +303,12 @@ def test_contraction_structure():
     )
 
     assert prog.block_size == (32, 8, 1)
-    # Grid setup is Compute ops, K-loop is LoopNest, write is Guard+Store.
-    computes = _find_ops(prog.body, Compute, recursive=False)
-    assert any(c.dst == "bm" for c in computes)  # CTA-swizzle output
-    assert any(c.dst == "tr" for c in computes)  # thread row offset
+    # Grid setup uses Let ops, K-loop is LoopNest, write is Guard+Store.
+    from deplodock.compiler.backend.loop_ir import Let
+
+    lets = _find_ops(prog.body, Let, recursive=False)
+    assert any(v.name == "bm" for v in lets)  # CTA-swizzle output
+    assert any(v.name == "tr" for v in lets)  # thread row offset
     allocs = _find_ops(prog.body, Alloc, recursive=False)
     assert any(a.name == "c" and a.shape == (8, 4) for a in allocs)  # register array
     loops = _find_ops(prog.body, LoopNest, recursive=False)

@@ -35,6 +35,7 @@ from deplodock.compiler.backend.loop_ir import (
     Barrier,
     Compute,
     Guard,
+    Let,
     Load,
     LoopBinOp,
     LoopBuiltin,
@@ -152,6 +153,9 @@ def _lower_ops(ops: list[LoopOp]) -> list[Stmt]:
 
 def _lower_op(op: LoopOp) -> list[Stmt]:
     """Lower a single LoopOp to KernelDef statements."""
+
+    if isinstance(op, Let):
+        return [VarDecl(op.dtype, op.name, _lower_expr(op.expr))]
 
     if isinstance(op, ParallelAxis):
         # ParallelAxis("i", "blockIdx.x", "n") →
