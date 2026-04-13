@@ -2,9 +2,9 @@
 
 The CUDA backend maps `OpKernel` tags from the execution plan to CUDA C kernels,
 compiles them via nvcc, and runs them on GPU. It extends the shared backend
-infrastructure (`backend/program.py`, `backend/ir.py`, `backend/codegen.py`)
-with CUDA-specific features: TMA descriptors, nvcc compilation, and GPU-tuned
-kernel generators.
+infrastructure (`backend/program.py`, `backend/ir.py`, `backend/loop_ir.py`,
+`backend/codegen.py`) with CUDA-specific features: TMA descriptors, nvcc
+compilation, and GPU-tuned kernel generators.
 
 ## Module Layout
 
@@ -13,11 +13,33 @@ cuda/
 ├── backend.py        # CudaBackend(Backend): compile plan → Program
 ├── program.py        # CudaLaunch, TmaDescriptorSpec, source gen, nvcc, run
 ├── generators/       # Kernel code generation
-│   ├── analysis.py   # TileAnalysis: classify FusedRegionOp patterns
-│   └── tiled.py      # Unified tiled generator (all strategies)
+│   ├── analysis.py       # TileAnalysis: classify FusedRegionOp patterns
+│   ├── loop_lower.py     # TileAnalysis → LoopIR (loop-nest IR)
+│   ├── loop_codegen.py   # LoopIR → KernelDef (imperative C AST)
+│   └── tiled.py          # Public API: generate_kernel(), lower_tiled()
 ├── runner.py         # Single-kernel compile + run + benchmark harness
 └── tuning.py         # Per-GPU empirical tuning profiles (RTX 5090, H200, Pro 6000)
 ```
+
+## LoopIR Pipeline
+
+Kernel generation goes through two stages via the backend-agnostic LoopIR
+(defined in `backend/loop_ir.py`):
+
+```
+FusedRegionOp → analyze() → TileAnalysis → lower_to_loop_ir() → LoopProgram
+                                                                      ↓
+                        CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel()
+```
+
+**LoopIR** makes the loop structure explicit: `ParallelAxis` (grid mapping),
+`LoopNest` (sequential loops), `Alloc` (accumulators), `Load`/`Store` (memory),
+`Compute` (elementwise), `Accumulate`/`WarpReduce` (reductions), `Guard` (bounds),
+`RawLoopOp` (escape hatch for TMA inline asm).
+
+Pointwise, row-reduce, and multi-reduce patterns are fully expressed in LoopIR.
+Contraction patterns (naive, tma_db, smem) currently wrap the legacy kernel
+body as `RawLoopOp` — decomposing into proper LoopIR ops is a future goal.
 
 ## SGEMM Strategies (generators/tiled.py)
 

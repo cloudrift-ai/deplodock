@@ -29,18 +29,20 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  backend/base.py:    Backend ABC (compile, run, benchmark)      │
 │  backend/program.py: Buffer, Launch, Program                    │
 │  backend/ir.py:      Kernel AST (Expr, Stmt, KernelDef)        │
+│  backend/loop_ir.py: LoopIR (LoopProgram, LoopOp, LoopExpr)    │
 │  backend/codegen.py: KernelDef → C source                       │
 │                                                                 │
 │  RULE: Describes WHAT to compute, not HOW.                      │
-│        program.py, ir.py, codegen.py are backend-agnostic —     │
-│        shared by all backends. No CUDA/HIP-specific API calls.  │
-│        OpKernel.op is a string tag — the backend resolves it.   │
+│        program.py, ir.py, loop_ir.py, codegen.py are backend-   │
+│        agnostic — shared by all backends. No CUDA/HIP-specific  │
+│        API calls. OpKernel.op is a string tag — the backend     │
+│        resolves it.                                              │
 ├─────────────────────────────────────────────────────────────────┤
 │  LAYER 4: Backend (CUDA, ROCm, ...)                             │
 │                                                                 │
 │  cuda/backend.py:   CudaBackend (implements Backend ABC)        │
 │  cuda/program.py:   CudaLaunch, TmaDescriptorSpec, source gen   │
-│  cuda/generators/:  analysis.py + tiled.py (all kernel patterns)│
+│  cuda/generators/:  analysis, loop_lower, loop_codegen, tiled   │
 │  cuda/runner.py:    Single-kernel compile + run                 │
 │  cuda/tuning.py:    Per-GPU empirical tuning profiles           │
 │                                                                 │
@@ -119,7 +121,7 @@ result = backend.run(program)
 - **Do NOT import from `cuda/` in Layer 1-3 modules.** If you need GPU-specific behavior, add it to `cuda/backend.py`.
 - **Do NOT put kernel source strings in Layer 3.** `OpKernel.op` is a tag; the backend resolves it to actual code.
 - **Do NOT hardcode grid/block/smem in planners.** That's the backend's job.
-- **Do NOT add kernel source as Python f-strings.** Use `generators/tiled.py` for new kernel patterns (all patterns — pointwise, reduce, contraction — go through the unified tiled generator).
+- **Do NOT add kernel source as Python f-strings.** Use the LoopIR pipeline (`loop_lower.py` → `loop_codegen.py`) for new kernel patterns — all patterns go through LoopIR.
 
 ## Module Layout
 
@@ -144,13 +146,16 @@ compiler/
 │   ├── base.py       # [L3] Backend ABC, ProgramResult, BenchmarkResult
 │   ├── program.py    # [L3] Buffer, Launch, Program — shared across backends
 │   ├── ir.py         # [L3] Kernel AST (KernelDef, Expr, Stmt) — shared
+│   ├── loop_ir.py    # [L3] LoopIR (LoopProgram, LoopOp, LoopExpr) — shared
 │   ├── codegen.py    # [L3] KernelDef → C source — shared
 │   └── cuda/         # [L4] CUDA backend
 │       ├── backend.py    #  CudaBackend implements Backend ABC
 │       ├── program.py    #  CudaLaunch, TmaDescriptorSpec, source gen, nvcc
 │       ├── generators/   #  Kernel generators
-│       │   ├── analysis.py #  TileAnalysis: classify FusedRegionOp patterns
-│       │   └── tiled.py  #  Unified tiled generator (analysis → KernelDef)
+│       │   ├── analysis.py    #  TileAnalysis: classify FusedRegionOp patterns
+│       │   ├── loop_lower.py  #  TileAnalysis → LoopIR (CUDA lowering)
+│       │   ├── loop_codegen.py #  LoopIR → KernelDef (CUDA codegen)
+│       │   └── tiled.py       #  Public API: generate_kernel(), lower_tiled()
 │       ├── runner.py     #  Single-kernel compile + run + benchmark
 │       └── tuning.py     #  Per-GPU empirical tuning profiles
 ```
@@ -273,6 +278,8 @@ The dump directory is cleared on creation. Files are numbered for natural orderi
 01_pass_<name>_*.json      # Per-pass before/after graphs + rules (01-19)
 20_fused_graph.json        # Graph after auto_fuse
 30_execution_plan.json     # Backend-agnostic plan
+35_loop_ir_<name>.txt      # LoopIR pretty-print (loop nest structure)
+35_loop_ir_<name>.json     # LoopIR serialized
 40_program_summary.json    # Program metadata (buffers, launches)
 40_kernel_NN_<name>.cu     # Individual kernel sources
 50_full_program.cu         # Complete generated .cu file
