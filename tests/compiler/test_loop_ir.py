@@ -2,9 +2,9 @@
 
 import json
 
-from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, build_schedule, lower_generic, lower_to_loop_ir
 from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
+from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
 from deplodock.compiler.backend.ir.loop_ir import (
     Accum,
     AccumInit,
