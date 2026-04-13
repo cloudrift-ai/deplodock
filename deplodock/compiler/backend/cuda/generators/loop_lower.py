@@ -1,13 +1,18 @@
 """Lower FusedRegionOp + TileAnalysis to LoopIR.
 
-Each pattern (pointwise, row_reduce, reduce_broadcast, contraction) has a
-dedicated lowering function that produces a LoopProgram.  Strategy variants
-(naive, tma_db, smem) are handled within contraction lowering.
+``lower_generic()`` is the single entry point: it reads a ``Schedule`` and
+emits LoopIR through five phases (grid → accumulators → reductions →
+epilogue → write).  No pattern-matching — all structural decisions live
+in the Schedule.
+
+Legacy per-pattern functions are kept temporarily for TMA and
+contraction+softmax fallback paths.
 """
 
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by
 from deplodock.compiler.backend.loop_ir import (
@@ -32,6 +37,452 @@ from deplodock.compiler.backend.loop_ir import (
 )
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReshapeOp, TransposeOp
 
+if TYPE_CHECKING:
+    from deplodock.compiler.backend.cuda.schedule import Schedule
+
+
+# ---------------------------------------------------------------------------
+# Generic lowering — single entry point driven by Schedule
+# ---------------------------------------------------------------------------
+
+
+def lower_generic(
+    region: FusedRegionOp,
+    name: str,
+    shapes: dict[str, tuple],
+    analysis: TileAnalysis,
+    schedule: Schedule,
+) -> LoopProgram:
+    """Lower a FusedRegionOp to LoopIR using a Schedule.
+
+    Five phases, each parameterized by the Schedule:
+    1. Grid setup
+    2. Accumulator allocation
+    3. Reduction loops
+    4. Epilogue ops
+    5. Write outputs
+    """
+    params = _build_params(region)
+    params.extend(schedule.dim_params)
+
+    body: list = []
+
+    # Phase 1: Grid setup
+    body.extend(_emit_grid(schedule, analysis))
+
+    # Phase 2: Accumulators
+    body.extend(_emit_accumulators(schedule, analysis))
+
+    # Phase 3: Reduction loops (0 for pointwise, 1+ for reduce/contraction)
+    body.extend(_emit_reductions(schedule, analysis, region, shapes))
+
+    # Phase 4: Epilogue
+    body.extend(_emit_epilogue(schedule, analysis, region, shapes))
+
+    # Phase 5: Write outputs
+    body.extend(_emit_write(schedule, analysis, region))
+
+    return LoopProgram(
+        name=name,
+        params=params,
+        body=body,
+        block_size=schedule.grid.block_size,
+        tile_m=schedule.tile_m,
+        tile_n=schedule.tile_n,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Grid setup
+# ---------------------------------------------------------------------------
+
+
+def _emit_grid(schedule: Schedule, analysis: TileAnalysis) -> list:
+    grid = schedule.grid
+    if grid.type == "1d":
+        axis_name = "i" if schedule.accum.shape is None else "row"
+        return [ParallelAxis(axis_name, "blockIdx.x", grid.bound)]
+    if grid.type == "2d_swizzle":
+        return _cta_swizzle_grid(
+            schedule.thread_m or 8,
+            schedule.thread_n or 4,
+            schedule.tile_m or 64,
+            schedule.tile_n or 128,
+            schedule.is_batched,
+        )
+    # 2d_standard (smem) — handled by smem-specific path
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Accumulators
+# ---------------------------------------------------------------------------
+
+
+def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
+    ops: list = []
+    accum = schedule.accum
+
+    if accum.shape is None:
+        # Pointwise: no accumulators
+        return ops
+
+    if accum.shape == ():
+        # Scalar accumulators (one per reduce op)
+        for node_id, op, _ in analysis.op_phases.reduces:
+            acc_name = f"acc_{_safe(node_id)}"
+            ops.append(Alloc(acc_name, accum.dtype, None, "reg", _reduce_init_expr(op.fn)))
+        return ops
+
+    # 2D register tile (contraction)
+    ops.append(Alloc("c", accum.dtype, accum.shape, "reg", LoopLiteral(0.0)))
+
+    # Batch pointer aliases for contraction
+    if schedule.is_batched and analysis.contraction_a:
+        a_name = _safe(analysis.contraction_a)
+        b_name = _safe(analysis.contraction_b)
+        ops.append(RawLoopOp(f"const float*Ab={a_name}+batch*M*K;"))
+        ops.append(RawLoopOp(f"const float*Bb={b_name}+batch*K*N;"))
+
+    return ops
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Reduction loops
+# ---------------------------------------------------------------------------
+
+
+def _emit_reductions(
+    schedule: Schedule,
+    analysis: TileAnalysis,
+    region: FusedRegionOp,
+    shapes: dict[str, tuple],
+) -> list:
+    accum = schedule.accum
+
+    if accum.shape is None:
+        # Pointwise: no reduction, just inline all ops inside a guard
+        return _emit_pointwise_body(analysis, region, shapes, schedule)
+
+    if accum.shape == ():
+        # Scalar reduction (row_reduce / reduce_broadcast / multi-reduce)
+        return _emit_scalar_reductions(schedule, analysis, region, shapes)
+
+    # 2D register tile contraction: K-loop with FMA
+    return _emit_contraction_k_loop(schedule, analysis, region, shapes)
+
+
+def _emit_pointwise_body(
+    analysis: TileAnalysis,
+    region: FusedRegionOp,
+    shapes: dict[str, tuple],
+    schedule: Schedule,
+) -> list:
+    """Pointwise: load inputs, emit all ops, store outputs inside a guard."""
+    out_shape = shapes.get(region.output_names[0], (1,))
+    out_size = math.prod(d for d in out_shape if isinstance(d, int))
+
+    guard_body: list = []
+    var_map: dict[str, LoopExpr] = {}
+    for inp in region.input_names:
+        idx = _input_loop_expr(inp, analysis, "i", out_size)
+        load_name = f"v_{_safe(inp)}"
+        guard_body.append(Load(load_name, _safe(inp), idx, "global"))
+        var_map[inp] = LoopVar(load_name)
+
+    _emit_loop_ops(region.region_ops, var_map, "v_", guard_body)
+
+    for out_id in region.output_names:
+        val = var_map.get(out_id, LoopLiteral(0.0))
+        guard_body.append(Store(_safe(out_id), LoopVar("i"), val, "global"))
+
+    return [Guard(LoopBinOp("<", LoopVar("i"), LoopVar("n")), guard_body)]
+
+
+def _emit_scalar_reductions(
+    schedule: Schedule,
+    analysis: TileAnalysis,
+    region: FusedRegionOp,
+    shapes: dict[str, tuple],
+) -> list:
+    """Emit scalar reduction loops (single or multi-reduce)."""
+    phases = analysis.op_phases
+    out_shape = shapes.get(region.output_names[0], (1,))
+    out_size = math.prod(d for d in out_shape if isinstance(d, int))
+    has_multi_reduce = len(phases.reduces) > 1
+
+    guarded: list = []
+
+    # Accumulator allocs were already emitted in phase 2; build var tracking.
+    reduce_vars: dict[str, tuple[str, str]] = {}
+    for node_id, op, _ in phases.reduces:
+        acc_name = f"acc_{_safe(node_id)}"
+        reduce_vars[node_id] = (acc_name, op.fn)
+
+    var_map: dict[str, LoopExpr] = {}
+
+    if has_multi_reduce:
+        # Multi-reduce: one tile loop per reduce pass (e.g., softmax max → sum)
+        for ri, (node_id, _op, input_ids) in enumerate(phases.reduces):
+            acc_name, fn = reduce_vars[node_id]
+            pass_body: list = []
+
+            pass_var_map: dict[str, LoopExpr] = {}
+            for inp in region.input_names:
+                idx = _input_loop_expr(inp, analysis, "j", out_size)
+                load_name = f"r{ri}ld_{_safe(inp)}"
+                pass_body.append(Load(load_name, _safe(inp), idx, "global"))
+                pass_var_map[inp] = LoopVar(load_name)
+
+            for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
+                pass_var_map[prev_nid] = LoopVar(prev_acc)
+
+            all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
+            needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
+            for pid, pop, pinp in phases.prologue:
+                if isinstance(pop, ElementwiseOp) and pid in needed:
+                    a = pass_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
+                    b = pass_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
+                    var_name = f"r{ri}p_{_safe(pid)}"
+                    pass_body.append(Compute(var_name, pop.fn, [a] if len(pinp) == 1 else [a, b]))
+                    pass_var_map[pid] = LoopVar(var_name)
+
+            if ri > 0 and phases.inter_reduce:
+                _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body)
+
+            val = pass_var_map.get(input_ids[0], LoopLiteral(0.0))
+            pass_body.append(Accumulate(acc_name, fn, val))
+
+            guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), pass_body))
+            guarded.append(WarpReduce(acc_name, fn))
+            var_map[node_id] = LoopVar(acc_name)
+    else:
+        # Single reduce: one tile loop
+        loop_body: list = []
+        for inp in region.input_names:
+            idx = _input_loop_expr(inp, analysis, "j", out_size)
+            load_name = f"ld_{_safe(inp)}"
+            loop_body.append(Load(load_name, _safe(inp), idx, "global"))
+            var_map[inp] = LoopVar(load_name)
+
+        _emit_loop_ops(phases.prologue, var_map, "p_", loop_body)
+
+        for node_id, _op, input_ids in phases.reduces:
+            acc_name, fn = reduce_vars[node_id]
+            val = var_map.get(input_ids[0], LoopLiteral(0.0))
+            loop_body.append(Accumulate(acc_name, fn, val))
+
+        guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), loop_body))
+
+        for node_id, (acc_name, fn) in reduce_vars.items():
+            guarded.append(WarpReduce(acc_name, fn))
+            var_map[node_id] = LoopVar(acc_name)
+
+    return [Guard(LoopBinOp("<", LoopVar("row"), LoopVar("rows")), guarded)]
+
+
+def _emit_contraction_k_loop(
+    schedule: Schedule,
+    analysis: TileAnalysis,
+    region: FusedRegionOp,
+    shapes: dict[str, tuple],
+) -> list:
+    """Emit the K-loop for contraction (naive global-load strategy)."""
+    thread_m = schedule.thread_m or 8
+    thread_n = schedule.thread_n or 4
+    a_name = _safe(analysis.contraction_a)
+    b_name = _safe(analysis.contraction_b)
+    a_src = "Ab" if schedule.is_batched else a_name
+    b_src = "Bb" if schedule.is_batched else b_name
+
+    k_body: list = []
+    for c in range(thread_n):
+        col = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+        b_idx = LoopBinOp("+", LoopBinOp("*", LoopVar("k"), LoopVar("N")), col)
+        k_body.append(Load(f"b{c}", b_src, b_idx, "global", guard=LoopBinOp("<", col, LoopVar("N"))))
+
+    for r in range(thread_m):
+        row = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
+        a_idx = LoopBinOp("+", LoopBinOp("*", row, LoopVar("K")), LoopVar("k"))
+        k_body.append(Load(f"a{r}", a_src, a_idx, "global", guard=LoopBinOp("<", row, LoopVar("M"))))
+        for c in range(thread_n):
+            k_body.append(Accumulate(f"c{r}{c}", "sum", LoopBinOp("*", LoopVar(f"a{r}"), LoopVar(f"b{c}"))))
+
+    return [LoopNest("k", LoopLiteral(0, "int"), LoopVar("K"), None, k_body)]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Epilogue
+# ---------------------------------------------------------------------------
+
+
+def _emit_epilogue(
+    schedule: Schedule,
+    analysis: TileAnalysis,
+    region: FusedRegionOp,
+    shapes: dict[str, tuple],
+) -> list:
+    accum = schedule.accum
+    phases = analysis.op_phases
+
+    if accum.shape is None:
+        # Pointwise: epilogue was inlined in the pointwise body
+        return []
+
+    if accum.shape != ():
+        # Contraction register tile epilogue
+        thread_m = schedule.thread_m or 8
+        thread_n = schedule.thread_n or 4
+        return _contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n)
+
+    # Scalar reduction epilogue
+    return _emit_scalar_epilogue(schedule, analysis, region, shapes)
+
+
+def _emit_scalar_epilogue(
+    schedule: Schedule,
+    analysis: TileAnalysis,
+    region: FusedRegionOp,
+    shapes: dict[str, tuple],
+) -> list:
+    """Emit epilogue for scalar reductions (inside the row guard)."""
+    phases = analysis.op_phases
+    out_shape = shapes.get(region.output_names[0], (1,))
+    out_size = math.prod(d for d in out_shape if isinstance(d, int))
+
+    if not phases.epilogue and not schedule.epilogue_per_element:
+        return []
+
+    reduce_vars: dict[str, tuple[str, str]] = {}
+    for node_id, op, _ in phases.reduces:
+        reduce_vars[node_id] = (f"acc_{_safe(node_id)}", op.fn)
+
+    var_map: dict[str, LoopExpr] = {}
+    for node_id, (acc_name, _fn) in reduce_vars.items():
+        var_map[node_id] = LoopVar(acc_name)
+
+    has_multi_reduce = len(phases.reduces) > 1
+
+    if has_multi_reduce or schedule.epilogue_per_element:
+        # Per-element epilogue loop
+        epi_body: list = []
+        epi_var_map: dict[str, LoopExpr] = dict(var_map)
+
+        for inp in region.input_names:
+            idx = _input_loop_expr(inp, analysis, "j", out_size)
+            load_name = f"epld_{_safe(inp)}"
+            epi_body.append(Load(load_name, _safe(inp), idx, "global"))
+            epi_var_map[inp] = LoopVar(load_name)
+
+        # Re-compute prologue + inter_reduce ops
+        all_inter_ops = [op for group in phases.inter_reduce for op in group] if has_multi_reduce else []
+        recompute_ops = phases.prologue + all_inter_ops if has_multi_reduce else phases.prologue
+        needed = _needed_by(phases.epilogue)
+        for pid, pop, pinp in recompute_ops:
+            if isinstance(pop, ElementwiseOp) and (pid in needed or has_multi_reduce):
+                a = epi_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
+                b = epi_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
+                var_name = f"ep_{_safe(pid)}"
+                epi_body.append(Compute(var_name, pop.fn, [a] if len(pinp) == 1 else [a, b]))
+                epi_var_map[pid] = LoopVar(var_name)
+
+        _emit_loop_ops(phases.epilogue, epi_var_map, "e_", epi_body)
+
+        for out_id in region.output_names:
+            val = epi_var_map.get(out_id, LoopLiteral(0.0))
+            idx = LoopBinOp("+", LoopBinOp("*", LoopVar("row"), LoopVar("cols")), LoopVar("j"))
+            epi_body.append(Store(_safe(out_id), idx, val, "global"))
+
+        return [LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), epi_body)]
+
+    # Scalar epilogue (no per-element loop needed)
+    ops: list = []
+    _emit_loop_ops(phases.epilogue, var_map, "e_", ops)
+    return ops
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Write outputs
+# ---------------------------------------------------------------------------
+
+
+def _emit_write(
+    schedule: Schedule,
+    analysis: TileAnalysis,
+    region: FusedRegionOp,
+) -> list:
+    accum = schedule.accum
+
+    if accum.shape is None:
+        # Pointwise: writes were already emitted in the guard body
+        return []
+
+    if accum.shape != ():
+        # Contraction register tile write
+        thread_m = schedule.thread_m or 8
+        thread_n = schedule.thread_n or 4
+        out_id = region.output_names[0]
+        return _contraction_write_ops(out_id, thread_m, thread_n, schedule.is_batched, schedule.k_splits)
+
+    # Scalar reduction write
+    phases = analysis.op_phases
+    reduce_vars: dict[str, tuple[str, str]] = {}
+    for node_id, op, _ in phases.reduces:
+        reduce_vars[node_id] = (f"acc_{_safe(node_id)}", op.fn)
+
+    var_map: dict[str, LoopExpr] = {}
+    for node_id, (acc_name, _fn) in reduce_vars.items():
+        var_map[node_id] = LoopVar(acc_name)
+
+    if schedule.epilogue_per_element or len(phases.reduces) > 1:
+        # Per-element writes were already emitted in the epilogue loop
+        if phases.epilogue or schedule.epilogue_per_element:
+            return []
+        # No epilogue — write last reduce result (thread 0 only)
+        ops: list = []
+        for out_id in region.output_names:
+            val = var_map.get(out_id, LoopLiteral(0.0))
+            ops.append(
+                Guard(
+                    LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                    [Store(_safe(out_id), LoopVar("row"), val, "global")],
+                )
+            )
+        return ops
+
+    # Single reduce without per-element epilogue
+    if phases.epilogue:
+        # Scalar epilogue was emitted in phase 4; thread 0 writes
+        ops = []
+        # Re-derive var_map with epilogue results
+        _emit_loop_ops(phases.epilogue, var_map, "e_", [])  # just update var_map
+        for out_id in region.output_names:
+            val = var_map.get(out_id, LoopLiteral(0.0))
+            ops.append(
+                Guard(
+                    LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                    [Store(_safe(out_id), LoopVar("row"), val, "global")],
+                )
+            )
+        return ops
+
+    # No epilogue — write last reduce result (thread 0)
+    ops = []
+    for out_id in region.output_names:
+        val = var_map.get(out_id, LoopLiteral(0.0))
+        ops.append(
+            Guard(
+                LoopBinOp("==", LoopBuiltin("threadIdx.x"), LoopLiteral(0, "int")),
+                [Store(_safe(out_id), LoopVar("row"), val, "global")],
+            )
+        )
+    return ops
+
+
+# ---------------------------------------------------------------------------
+# Legacy dispatch (kept for backward compat during transition)
+# ---------------------------------------------------------------------------
+
 
 def lower_to_loop_ir(
     region: FusedRegionOp,
@@ -42,22 +493,33 @@ def lower_to_loop_ir(
     strategy: str = "naive",
     hints: dict | None = None,
 ) -> LoopProgram:
-    """Lower a FusedRegionOp to LoopIR based on its TileAnalysis."""
-    if analysis.pattern == "pointwise":
-        return _lower_pointwise(region, name, shapes, analysis)
+    """Lower a FusedRegionOp to LoopIR.
 
+    Routes through ``lower_generic()`` for all patterns except TMA and
+    contraction+softmax which use legacy escape hatches.
+    """
+    from deplodock.compiler.backend.cuda.schedule import build_schedule
+
+    # Legacy: TMA requires inline asm
+    if strategy == "tma_db" and analysis.pattern == "contraction":
+        return _lower_contraction_tma(region, name, shapes, analysis, hints or {})
+
+    # Legacy: smem K-tile loop has RawLoopOp for float4 fast path
+    if strategy == "smem" and analysis.pattern == "contraction":
+        return _lower_contraction_smem(region, name, shapes, analysis, hints or {})
+
+    # Legacy: contraction + softmax (multi-reduce on register tile)
     if analysis.pattern == "contraction":
-        if strategy == "smem":
-            return _lower_contraction_smem(region, name, shapes, analysis, hints or {})
-        if strategy == "tma_db":
-            return _lower_contraction_tma(region, name, shapes, analysis, hints or {})
-        return _lower_contraction_naive(region, name, shapes, analysis, hints or {})
+        phases = analysis.op_phases
+        dims = _contraction_dims(analysis, hints or {})
+        if len(phases.reduces) > 1 and analysis.cols <= dims["tile_n"]:
+            from deplodock.compiler.backend.cuda.generators.tiled import _lower_naive
 
-    # row_reduce or reduce_broadcast
-    has_multi_reduce = len(analysis.op_phases.reduces) > 1
-    if has_multi_reduce:
-        return _lower_multi_reduce(region, name, shapes, analysis)
-    return _lower_single_reduce(region, name, shapes, analysis)
+            kernel = _lower_naive(region, name, shapes, analysis, strategy="naive", hints=hints or {})
+            return _kernel_def_to_loop_program(kernel)
+
+    schedule = build_schedule(analysis, strategy, hints or {})
+    return lower_generic(region, name, shapes, analysis, schedule)
 
 
 # ---------------------------------------------------------------------------
