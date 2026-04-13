@@ -226,27 +226,38 @@ class Alloc:
     init: LoopExpr | None = None
 
 
+def _to_name(v: str | LoopVar) -> str:
+    """Extract buffer name from a string or LoopVar."""
+    return v.name if isinstance(v, LoopVar) else v
+
+
 @dataclass
 class Load:
     """Load from global or shared memory into a register."""
 
     dst: str
-    src: str  # buffer name
+    src: str | LoopVar  # buffer name (LoopVar auto-extracted)
     indices: LoopExpr
     space: str  # "global" | "smem"
     guard: LoopExpr | None = None  # bounds check; zero if false
+
+    def __post_init__(self) -> None:
+        self.src = _to_name(self.src)
 
 
 @dataclass
 class Store:
     """Write to global or shared memory."""
 
-    dst: str  # buffer name
+    dst: str | LoopVar  # buffer name (LoopVar auto-extracted)
     indices: LoopExpr
     value: LoopExpr
     space: str  # "global" | "smem"
     guard: LoopExpr | None = None
     atomic: bool = False  # atomicAdd for split-K
+
+    def __post_init__(self) -> None:
+        self.dst = _to_name(self.dst)
 
 
 @dataclass
