@@ -69,7 +69,8 @@ def test_plan_graph_from_matmul():
 
 def test_matmul_k_dimension_inferred_correctly():
     """Non-square matmul: K must be inferred from input shapes, not output."""
-    from deplodock.compiler.backend.cuda.backend import _is_matmul_region
+    from deplodock.compiler.backend.cuda.backend import _build_region_and_shapes
+    from deplodock.compiler.backend.cuda.generators.analysis import analyze
     from deplodock.compiler.fusion import auto_fuse
 
     # A(32, 2048) @ B(2048, 512) → C(32, 512). K=2048, not 32.
@@ -81,11 +82,12 @@ def test_matmul_k_dimension_inferred_correctly():
     fused_ops = [op for op in plan.ops if op.op == "fused_region"]
     assert len(fused_ops) == 1
 
-    is_matmul, m, n, k = _is_matmul_region(fused_ops[0])
-    assert is_matmul
-    assert m == 32
-    assert n == 512
-    assert k == 2048, f"K should be 2048 (shared dim), got {k}"
+    region, shapes = _build_region_and_shapes(fused_ops[0])
+    analysis = analyze(region, shapes)
+    assert analysis.pattern == "contraction"
+    assert analysis.rows == 32
+    assert analysis.cols == 512
+    assert analysis.k_dim == 2048, f"K should be 2048 (shared dim), got {analysis.k_dim}"
 
 
 def test_contraction_softmax_large_n_splits():

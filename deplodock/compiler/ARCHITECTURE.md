@@ -259,7 +259,7 @@ graph.nodes["n5"].hints.set("cuda.matmul.threads_y", 8)  # per-node override
 Flow through the pipeline:
 1. **Rewriter/Fusion**: read/write hints on graph nodes directly
 2. **plan_graph()**: resolves hints per node → stores in `OpKernel.params["_hints"]`
-3. **CudaBackend**: reads `params["_hints"]` in `_compile_matmul()`, merges with tuning profile defaults, passes to `lower_tiled()` as the `hints` dict
+3. **CudaBackend**: reads `params["_hints"]` in `_select_strategy()`, merges with tuning profile defaults, passes to `lower_tiled()` as the `hints` dict
 
 Hints survive serialization (`to_dict`/`from_dict`) and deep copy. Old graphs without hints deserialize correctly (empty defaults).
 

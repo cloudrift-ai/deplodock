@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.cuda.backend import _compile_matmul
+from deplodock.compiler.backend.cuda.backend import _compile_single
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 from deplodock.compiler.plan import OpKernel
@@ -65,7 +65,7 @@ def _make_matmul_op(m, n, k, *, epilogue_ops=None, extra_inputs=None, extra_inpu
 def test_m_aware_k_splits():
     """For M=32 (< tile_m=64), k_splits should be > 1 to fill the GPU."""
     op = _make_matmul_op(32, 3584, 3584)
-    launch = _compile_matmul(op)
+    launch = _compile_single(op)
     # grid.z = k_splits
     assert launch.grid[2] > 1, f"Expected k_splits > 1 for M=32, got grid={launch.grid}"
 
@@ -80,5 +80,5 @@ def test_matmul_epilogue_disables_k_splits():
         extra_inputs=["bias"],
         extra_input_shapes={"bias": (3584,)},
     )
-    launch = _compile_matmul(op)
+    launch = _compile_single(op)
     assert launch.grid[2] == 1, f"k_splits must be 1 with epilogue, got grid={launch.grid}"
