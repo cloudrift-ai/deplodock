@@ -239,6 +239,29 @@ class Guard:
 
 
 @dataclass
+class SmemPipelineKLoop:
+    """Double-buffered K-loop through shared memory.
+
+    Backend-agnostic pipeline schedule.  Describes the structure (stages,
+    tile geometry, thread tile, k_splits) without specifying HOW tiles are
+    loaded or HOW synchronization happens — the backend codegen decides
+    (TMA + mbarrier for CUDA sm_90+, explicit loads + __syncthreads otherwise).
+    """
+
+    stages: int  # 2 = double-buffer, 3 = triple-buffer (future)
+    tile_m: int
+    tile_n: int
+    block_k: int
+    a_size: int  # tile_m * block_k (A tile elements per stage)
+    stage_size: int  # a_size + block_k * tile_n (total per stage)
+    thread_m: int
+    thread_n: int
+    tx: int  # blockDim.x
+    k_splits: int
+    is_batched: bool
+
+
+@dataclass
 class RawLoopOp:
     """Escape hatch for backend-specific inline code (e.g. TMA asm).
 
@@ -250,7 +273,20 @@ class RawLoopOp:
 
 
 LoopOp = (
-    Let | SetVar | ParallelAxis | LoopNest | Alloc | Load | Store | Accumulate | WarpReduce | WarpShuffleXor | Barrier | Guard | RawLoopOp
+    Let
+    | SetVar
+    | ParallelAxis
+    | LoopNest
+    | Alloc
+    | Load
+    | Store
+    | Accumulate
+    | WarpReduce
+    | WarpShuffleXor
+    | SmemPipelineKLoop
+    | Barrier
+    | Guard
+    | RawLoopOp
 )
 
 
@@ -273,6 +309,7 @@ class LoopProgram:
     tile_n: int | None = None
     grid_2d: bool = False
     tma_params: list[str] | None = None
+    tma_config: object | None = None  # TMALoadConfig from cuda backend (if TMA strategy)
     batched: bool = False
     includes: list[str] | None = None
     extra_smem_bytes: int = 0
@@ -352,6 +389,9 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
 
     if isinstance(op, Barrier):
         return [f"{pad}barrier"]
+
+    if isinstance(op, SmemPipelineKLoop):
+        return [f"{pad}smem_pipeline(stages={op.stages}, tile={op.tile_m}x{op.tile_n}, bk={op.block_k}, ks={op.k_splits})"]
 
     if isinstance(op, Guard):
         lines = [f"{pad}guard ({_pp_expr(op.cond)}) {{"]

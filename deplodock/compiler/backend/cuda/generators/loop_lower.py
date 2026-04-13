@@ -1261,6 +1261,7 @@ def _lower_contraction(
         tile_n=tile_n,
         grid_2d=extra.get("grid_2d", False),
         tma_params=extra.get("tma_params"),
+        tma_config=extra.get("tma_config"),
         batched=extra.get("batched", False),
         includes=extra.get("includes"),
     )
@@ -1306,7 +1307,8 @@ def _k_loop_naive(A, B, dims, is_batched, k_splits):  # noqa: N803
 
 def _k_loop_tma(A, B, dims, hints, is_batched, k_splits):  # noqa: N803
     """TMA double-buffered K-loop. Returns (grid_ops, k_ops, extra)."""
-    from deplodock.compiler.backend.cuda.tma_ops import TMAKLoop
+    from deplodock.compiler.backend.cuda.tma_ops import TMALoadConfig
+    from deplodock.compiler.backend.ir.loop_ir import SmemPipelineKLoop
 
     thread_m, thread_n = dims["thread_m"], dims["thread_n"]
     tile_m, tile_n = dims["tile_m"], dims["tile_n"]
@@ -1317,18 +1319,14 @@ def _k_loop_tma(A, B, dims, hints, is_batched, k_splits):  # noqa: N803
 
     grid_ops = list(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
 
-    tma_a_ref = f"&{A.name}_tma[batch]" if is_batched else f"&{A.name}_tma"
-    tma_b_ref = f"&{B.name}_tma[batch]" if is_batched else f"&{B.name}_tma"
-
     k_ops = [
-        TMAKLoop(
-            a_tma_ref=tma_a_ref,
-            b_tma_ref=tma_b_ref,
+        SmemPipelineKLoop(
+            stages=2,
             tile_m=tile_m,
             tile_n=tile_n,
             block_k=bk,
             a_size=a_size,
-            stage=stage,
+            stage_size=stage,
             thread_m=thread_m,
             thread_n=thread_n,
             tx=tx,
@@ -1337,7 +1335,11 @@ def _k_loop_tma(A, B, dims, hints, is_batched, k_splits):  # noqa: N803
         )
     ]
 
+    tma_a_ref = f"&{A.name}_tma[batch]" if is_batched else f"&{A.name}_tma"
+    tma_b_ref = f"&{B.name}_tma[batch]" if is_batched else f"&{B.name}_tma"
+
     extra = {
+        "tma_config": TMALoadConfig(a_tma_ref=tma_a_ref, b_tma_ref=tma_b_ref),
         "tma_params": [f"{A.name}_tma", f"{B.name}_tma"],
         "batched": is_batched,
         "includes": ["cuda.h"],
