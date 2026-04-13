@@ -26,6 +26,7 @@ from deplodock.compiler.backend.kernel_ir import (
     SyncThreads,
     Ternary,
     Var,
+    VarAssign,
     VarDecl,
 )
 from deplodock.compiler.backend.loop_ir import (
@@ -110,11 +111,14 @@ _ELEM_OPS: dict[str, object] = {
     "add": lambda a, b: BinOp("+", a, b),
     "sub": lambda a, b: BinOp("-", a, b),
     "div": lambda a, b: BinOp("/", a, b),
+    "mod": lambda a, b: BinOp("%", a, b),
     "neg": lambda a, _b: BinOp("-", Literal(0.0), a),
     "exp": lambda a, _b: FuncCall("expf", [a]),
     "rsqrt": lambda a, _b: FuncCall("rsqrtf", [a]),
     "recip": lambda a, _b: BinOp("/", Literal(1.0), a),
     "relu": lambda a, _b: FuncCall("fmaxf", [Literal(0.0), a]),
+    # Identity-like: just returns the first arg (used for builtin aliases)
+    "builtin": lambda a, _b: a,
 }
 
 
@@ -222,6 +226,7 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         # if any arg is a RegAccess whose expanded name matches dst, emit
         # assignment instead of declaration.
         is_inplace = any(isinstance(a, RegAccess) and a.name + "".join(str(i) for i in a.indices) == op.dst for a in op.args)
+        dtype = op.dtype
         builder = _ELEM_OPS.get(op.op)
         if builder:
             args_lowered = [_lower_expr(a) for a in op.args]
@@ -229,11 +234,11 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
             b = args_lowered[1] if len(args_lowered) > 1 else Literal(0.0)
             expr = builder(a, b)
             if is_inplace:
-                return [RawCode(f"{op.dst} = {_expr_to_c(expr)};")]
-            return [VarDecl("float", op.dst, expr)]
+                return [VarAssign(op.dst, expr)]
+            return [VarDecl(dtype, op.dst, expr)]
         if is_inplace:
-            return [RawCode(f"{op.dst} = 0.0f;")]
-        return [VarDecl("float", op.dst, Literal(0.0))]
+            return [VarAssign(op.dst, Literal(0.0))]
+        return [VarDecl(dtype, op.dst, Literal(0.0))]
 
     if isinstance(op, Accumulate):
         val = _lower_expr(op.value)
@@ -250,6 +255,9 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         return [SyncThreads()]
 
     if isinstance(op, Guard):
+        if not op.body:
+            # Empty body = early return (used for grid bounds checks)
+            return [IfStmt(_lower_expr(op.cond), [RawCode("return;")])]
         body = _lower_ops(op.body)
         return [IfStmt(_lower_expr(op.cond), body)]
 
@@ -268,50 +276,70 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
 def _emit_warp_reduce(acc_var: str, fn: str) -> list[Stmt]:
     """Emit warp-shuffle + cross-warp shared memory reduction.
 
-    Identical logic to tiled.py::_emit_warp_reduce, producing the same
-    KernelDef AST.
+    Uses KernelIR AST nodes wherever possible.  The only remaining RawCode
+    is the ``for (offset >>= 1)`` loop which has a non-standard step that
+    KernelIR's ForLoop can't express.
     """
-    init_val = 0.0 if fn == "sum" else -1e30
+    acc = Var(acc_var)
+    init_val = Literal(0.0) if fn == "sum" else Literal(-1e30)
+    shfl = FuncCall("__shfl_down_sync", [Literal(0xFFFFFFFF, "int"), acc, Var("offset")])
+    warp_arr = f"warp_{acc_var}"
+    s_var = f"s_{acc_var}"
+    tid = CudaBuiltin("threadIdx.x")
+    warp_size = CudaBuiltin("warpSize")
+    block_dim = CudaBuiltin("blockDim.x")
+
+    # Shuffle body: acc += shfl (sum) or acc = fmaxf(acc, shfl) (max)
+    if fn == "sum":
+        shfl_stmt: Stmt = AugAssign(acc_var, "+=", shfl)
+    else:
+        shfl_stmt = VarAssign(acc_var, FuncCall("fmaxf", [acc, shfl]))
+
+    # Shuffle loop: for (int offset = warpSize/2; offset > 0; offset >>= 1)
+    # KernelIR ForLoop can't express >>= step, so this stays as RawCode.
+    def _shfl_loop() -> RawCode:
+        body_c = _expr_to_c(shfl_stmt.value) if isinstance(shfl_stmt, VarAssign) else _expr_to_c(shfl)
+        if fn == "sum":
+            return RawCode(f"for (int offset = warpSize / 2; offset > 0; offset >>= 1)\n    {acc_var} += {body_c};")
+        return RawCode(f"for (int offset = warpSize / 2; offset > 0; offset >>= 1)\n    {acc_var} = {body_c};")
 
     stmts: list[Stmt] = []
 
-    # Intra-warp shuffle
-    if fn == "sum":
-        shfl_body = f"{acc_var} += __shfl_down_sync(0xffffffff, {acc_var}, offset);"
-    else:
-        shfl_body = f"{acc_var} = fmaxf({acc_var}, __shfl_down_sync(0xffffffff, {acc_var}, offset));"
-    stmts.append(RawCode(f"for (int offset = warpSize / 2; offset > 0; offset >>= 1)\n    {shfl_body}"))
+    # 1. Intra-warp shuffle
+    stmts.append(_shfl_loop())
 
-    # Cross-warp via shared memory
-    warp_arr = f"warp_{acc_var}"
-    s_var = f"s_{acc_var}"
+    # 2. Cross-warp: lane 0 of each warp writes to shared array
     stmts.append(ArrayDecl("__shared__ float", warp_arr, [8]))
     stmts.append(
         IfStmt(
-            BinOp("==", BinOp("%", CudaBuiltin("threadIdx.x"), CudaBuiltin("warpSize")), Literal(0, "int")),
-            [Assign(ArrayAccess(warp_arr, BinOp("/", CudaBuiltin("threadIdx.x"), CudaBuiltin("warpSize"))), Var(acc_var))],
+            BinOp("==", BinOp("%", tid, warp_size), Literal(0, "int")),
+            [Assign(ArrayAccess(warp_arr, BinOp("/", tid, warp_size)), acc)],
         )
     )
     stmts.append(SyncThreads())
 
-    # First warp loads partial results
+    # 3. First warp loads partial results; others get init value
     stmts.append(
-        RawCode(f"if (threadIdx.x < blockDim.x / warpSize) {acc_var} = {warp_arr}[threadIdx.x];\nelse {acc_var} = {init_val:.1f}f;")
+        IfStmt(
+            BinOp("<", tid, BinOp("/", block_dim, warp_size)),
+            [VarAssign(acc_var, ArrayAccess(warp_arr, tid))],
+            else_body=[VarAssign(acc_var, init_val)],
+        )
     )
 
-    # Second shuffle pass
-    stmts.append(RawCode(f"for (int offset = warpSize / 2; offset > 0; offset >>= 1)\n    {shfl_body}"))
+    # 4. Second shuffle pass (across warps)
+    stmts.append(_shfl_loop())
 
-    # Broadcast final result via shared scalar
+    # 5. Broadcast final result to all threads via shared scalar
     stmts.append(VarDecl("__shared__ float", s_var))
     stmts.append(
         IfStmt(
-            BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")),
-            [RawCode(f"{s_var} = {acc_var};")],
+            BinOp("==", tid, Literal(0, "int")),
+            [VarAssign(s_var, acc)],
         )
     )
     stmts.append(SyncThreads())
-    stmts.append(RawCode(f"{acc_var} = {s_var};"))
+    stmts.append(VarAssign(acc_var, Var(s_var)))
 
     return stmts
 

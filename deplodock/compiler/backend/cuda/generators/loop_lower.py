@@ -501,6 +501,70 @@ def _contraction_dims(analysis: TileAnalysis, hints: dict) -> dict:
     }
 
 
+def _cta_swizzle_grid(
+    thread_m: int,
+    thread_n: int,
+    tile_m: int,
+    tile_n: int,
+    is_batched: bool,
+) -> list:
+    """Generate LoopIR ops for CTA-swizzle grid setup.
+
+    Maps a linearized 1D grid (blockIdx.x) to 2D tile coordinates (bm, bn)
+    using an 8-way swizzle for improved memory access patterns.
+    Produces named variables: tr, tc, bm, bn (and batch if batched).
+    """
+    ops: list = []
+    I = "int"  # noqa: E741 — shorthand for dtype
+
+    if is_batched:
+        ops.append(Compute("batch", "builtin", [LoopBuiltin("blockIdx.z")], dtype=I))
+
+    # Thread-to-register-tile mapping
+    ops.append(Compute("tr", "mul", [LoopBuiltin("threadIdx.y"), LoopLiteral(thread_m, I)], dtype=I))
+    ops.append(Compute("tc", "mul", [LoopBuiltin("threadIdx.x"), LoopLiteral(thread_n, I)], dtype=I))
+
+    # Grid dimensions (ceil-div)
+    ops.append(Compute("ntx", "div", [LoopBinOp("+", LoopVar("N"), LoopLiteral(tile_n - 1, I)), LoopLiteral(tile_n, I)], dtype=I))
+    ops.append(Compute("nty", "div", [LoopBinOp("+", LoopVar("M"), LoopLiteral(tile_m - 1, I)), LoopLiteral(tile_m, I)], dtype=I))
+
+    # Linearized block ID + swizzle decomposition
+    SWIZ = 8
+    ops.append(
+        Compute("pid", "add", [LoopBuiltin("blockIdx.x"), LoopBinOp("*", LoopBuiltin("blockIdx.y"), LoopBuiltin("gridDim.x"))], dtype=I)
+    )
+    ntx_swiz = LoopBinOp("*", LoopVar("ntx"), LoopLiteral(SWIZ, I))
+    ops.append(Compute("grp", "div", [LoopVar("pid"), ntx_swiz], dtype=I))
+    ops.append(Compute("rem", "mod", [LoopVar("pid"), ntx_swiz], dtype=I))
+    ops.append(
+        Compute(
+            "by_s",
+            "add",
+            [LoopBinOp("*", LoopVar("grp"), LoopLiteral(SWIZ, I)), LoopBinOp("%", LoopVar("rem"), LoopLiteral(SWIZ, I))],
+            dtype=I,
+        )
+    )
+    ops.append(Compute("bx_s", "div", [LoopVar("rem"), LoopLiteral(SWIZ, I)], dtype=I))
+
+    # Early exit if out of tile grid
+    ops.append(
+        Guard(
+            LoopBinOp(
+                "||",
+                LoopBinOp(">=", LoopVar("by_s"), LoopVar("nty")),
+                LoopBinOp(">=", LoopVar("bx_s"), LoopVar("ntx")),
+            ),
+            [],  # empty body = return (codegen emits early return)
+        )
+    )
+
+    # Block base coordinates
+    ops.append(Compute("bm", "mul", [LoopVar("by_s"), LoopLiteral(tile_m, I)], dtype=I))
+    ops.append(Compute("bn", "mul", [LoopVar("bx_s"), LoopLiteral(tile_n, I)], dtype=I))
+
+    return ops
+
+
 def _contraction_epilogue_ops(
     phases,
     shapes: dict[str, tuple],
@@ -649,52 +713,37 @@ def _lower_contraction_naive(
 
     body: list = []
 
-    # Grid setup (CTA-swizzle) — RawLoopOp for now
-    batch_decl = "int batch=blockIdx.z;\n" if is_batched else ""
-    grid_code = (
-        f"{batch_decl}"
-        f"int tr=threadIdx.y*{thread_m},tc=threadIdx.x*{thread_n};\n"
-        f"const int SWIZ=8;\n"
-        f"int ntx=(N+{tile_n - 1})/{tile_n};\n"
-        f"int nty=(M+{tile_m - 1})/{tile_m};\n"
-        f"int pid=blockIdx.x+blockIdx.y*gridDim.x;\n"
-        f"int grp=pid/(ntx*SWIZ);\n"
-        f"int rem=pid%(ntx*SWIZ);\n"
-        f"int by_s=grp*SWIZ+rem%SWIZ;\n"
-        f"int bx_s=rem/SWIZ;\n"
-        f"if(by_s>=nty||bx_s>=ntx)return;\n"
-        f"int bm=by_s*{tile_m},bn=bx_s*{tile_n};"
-    )
-    body.append(RawLoopOp(grid_code, "CTA-swizzle grid setup"))
+    # Grid setup (CTA-swizzle)
+    body.extend(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
+
+    # Batch pointer aliases (pointer arithmetic doesn't fit Compute)
+    if is_batched:
+        body.append(RawLoopOp(f"const float*Ab={a_name}+batch*M*K;"))
+        body.append(RawLoopOp(f"const float*Bb={b_name}+batch*K*N;"))
+        a_src, b_src = "Ab", "Bb"
+    else:
+        a_src, b_src = a_name, b_name
 
     # Accumulator register array
     body.append(Alloc("c", "float", (thread_m, thread_n), "reg", LoopLiteral(0.0)))
 
-    # K-loop body — RawLoopOp (bounds-checked global loads + FMA)
-    if is_batched:
-        a_local, b_local = "Ab", "Bb"
-        batch_ptrs = f"const float*Ab={a_name}+batch*M*K;\nconst float*Bb={b_name}+batch*K*N;\n"
-    else:
-        a_local, b_local = a_name, b_name
-        batch_ptrs = ""
-
-    naive_a_lines = []
+    # K-loop with bounds-checked global loads + FMA
+    k_body: list = []
+    # Load B columns (4 per thread)
+    for c in range(thread_n):
+        col = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+        b_idx = LoopBinOp("+", LoopBinOp("*", LoopVar("k"), LoopVar("N")), col)
+        k_body.append(Load(f"b{c}", b_src, b_idx, "global", guard=LoopBinOp("<", col, LoopVar("N"))))
+    # Load A rows + FMA (unrolled over thread_m)
     for r in range(thread_m):
-        fma = "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n))
-        naive_a_lines.append(f"float a{r}=(bm+tr+{r}<M)?{a_local}[(bm+tr+{r})*K+k]:0.0f;{fma}")
-    naive_fma = "\n        ".join(naive_a_lines)
+        row = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
+        a_idx = LoopBinOp("+", LoopBinOp("*", row, LoopVar("K")), LoopVar("k"))
+        k_body.append(Load(f"a{r}", a_src, a_idx, "global", guard=LoopBinOp("<", row, LoopVar("M"))))
+        for c in range(thread_n):
+            dst = f"c{r}{c}"
+            k_body.append(Accumulate(dst, "sum", LoopBinOp("*", LoopVar(f"a{r}"), LoopVar(f"b{c}"))))
 
-    k_loop = (
-        f"{batch_ptrs}"
-        f"for(int k=0;k<K;k++){{\n"
-        f"    float b0=(bn+tc<N)?{b_local}[k*N+bn+tc]:0.0f,"
-        f"b1=(bn+tc+1<N)?{b_local}[k*N+bn+tc+1]:0.0f,"
-        f"b2=(bn+tc+2<N)?{b_local}[k*N+bn+tc+2]:0.0f,"
-        f"b3=(bn+tc+3<N)?{b_local}[k*N+bn+tc+3]:0.0f;\n"
-        f"        {naive_fma}\n"
-        f"}}"
-    )
-    body.append(RawLoopOp(k_loop, "naive K-loop"))
+    body.append(LoopNest("k", LoopLiteral(0, "int"), LoopVar("K"), None, k_body))
 
     # Epilogue — proper LoopIR with register arrays
     epi_ops = _contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n)
@@ -738,11 +787,122 @@ def _lower_contraction_smem(
     analysis: TileAnalysis,
     hints: dict,
 ) -> LoopProgram:
-    """Lower contraction (smem strategy) via legacy _lower_smem."""
-    from deplodock.compiler.backend.cuda.generators.tiled import _lower_smem
+    """Lower contraction (smem strategy) to LoopIR.
 
-    kernel = _lower_smem(region, name, shapes, analysis, hints=hints)
-    return _kernel_def_to_loop_program(kernel)
+    Block: (32, 4) = 128 threads. Shared memory for A tile, global loads for B.
+    Grid setup, K-tile loop, and write use RawLoopOp for the smem-specific
+    patterns (bank-conflict padding, float4 fast path). Accumulator decl and
+    write use proper LoopIR with register arrays.
+    """
+    a_name = _safe(analysis.contraction_a)
+    b_name = _safe(analysis.contraction_b)
+    out_id = region.output_names[0]
+    c_name = _safe(out_id)
+    is_batched = analysis.batch_size > 1
+
+    thread_m = int(hints.get("thread_m", 4))
+    thread_n = 4
+    bk = int(hints.get("block_k", 32))
+    k_splits = int(hints.get("k_splits", 1))
+    tx, ty = 32, 4
+    tile_m = ty * thread_m
+    tile_n = tx * thread_n  # 128
+    smem_stride = bk + 1  # bank conflict padding
+
+    params = _build_params(region)
+    params.extend([("int", "M"), ("int", "N"), ("int", "K")])
+    if is_batched:
+        params.append(("int", "batch_count"))
+    elif k_splits > 1:
+        params.append(("int", "k_splits"))
+
+    body: list = []
+
+    # Grid setup: thread mapping, shared memory decl, K-range
+    k_range = (
+        f"int k_per=(K/{bk}/k_splits)*{bk};\nint k_start=blockIdx.z*k_per;\nint k_end=(blockIdx.z==k_splits-1)?K:k_start+k_per;"
+        if k_splits > 1
+        else "int k_start=0,k_end=K;"
+    )
+    batch_decl = "int batch=blockIdx.z;\n" if is_batched else ""
+    body.append(
+        RawLoopOp(
+            f"{batch_decl}"
+            f"int row_base=(blockIdx.y*{ty}+threadIdx.y)*{thread_m};\n"
+            f"int col_base=(blockIdx.x*{tx}+threadIdx.x)*{thread_n};\n"
+            f"int sr=threadIdx.y*{thread_m};\n"
+            f"__shared__ float As[{tile_m}][{smem_stride}];\n"
+            f"{k_range}",
+            "smem grid setup",
+        )
+    )
+
+    # Accumulator register array
+    body.append(Alloc("c", "float", (thread_m, thread_n), "reg", LoopLiteral(0.0)))
+
+    # K-tile loop (smem for A, global for B, float4 fast path)
+    a_local = "Ab" if is_batched else a_name
+    b_local = "Bb" if is_batched else b_name
+    a_load = "\n    ".join(
+        f"As[sr+{r}][threadIdx.x]=(row_base+{r}<M&&tk+threadIdx.x<K)?{a_local}[(row_base+{r})*K+tk+threadIdx.x]:0.0f;"
+        for r in range(thread_m)
+    )
+    a_reads = "\n        ".join(f"float a{r}=As[sr+{r}][kk];" for r in range(thread_m))
+    fma = "\n        ".join("".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n)) for r in range(thread_m))
+    scalar_b_loads = "\n        ".join(f"float b{c}=(col_base+{c}<N)?{b_local}[(tk+kk)*N+col_base+{c}]:0.0f;" for c in range(thread_n))
+    batch_ptrs = f"const float*Ab={a_name}+batch*M*K;\nconst float*Bb={b_name}+batch*K*N;\n" if is_batched else ""
+    body.append(
+        RawLoopOp(
+            f"{batch_ptrs}"
+            f"for(int tk=k_start;tk<k_end;tk+={bk}){{\n"
+            f"    {a_load}\n"
+            f"    __syncthreads();\n"
+            f"    if(col_base+3<N){{\n"
+            f"    #pragma unroll\n"
+            f"    for(int kk=0;kk<{bk};kk++){{\n"
+            f"        float b0={b_local}[(tk+kk)*N+col_base],"
+            f"b1={b_local}[(tk+kk)*N+col_base+1],"
+            f"b2={b_local}[(tk+kk)*N+col_base+2],"
+            f"b3={b_local}[(tk+kk)*N+col_base+3];\n"
+            f"        {a_reads}\n"
+            f"        {fma}\n"
+            f"    }}}}else if(col_base<N){{\n"
+            f"    for(int kk=0;kk<{bk};kk++){{\n"
+            f"        {scalar_b_loads}\n"
+            f"        {a_reads}\n"
+            f"        {fma}\n"
+            f"    }}}}\n"
+            f"    __syncthreads();\n"
+            f"}}",
+            "smem K-tile loop",
+        )
+    )
+
+    # Write — proper LoopIR with register arrays
+    # Uses row_base/col_base instead of bm+tr/bn+tc
+    c_local = "Cb" if is_batched else c_name
+    if is_batched:
+        body.append(RawLoopOp(f"float*Cb={c_name}+batch*M*N;"))
+    for r in range(thread_m):
+        row = LoopBinOp("+", LoopVar("row_base"), LoopLiteral(r, "int"))
+        row_guard = LoopBinOp("<", row, LoopVar("M"))
+        row_body: list = []
+        for c in range(thread_n):
+            col = LoopBinOp("+", LoopVar("col_base"), LoopLiteral(c, "int"))
+            col_guard = LoopBinOp("<", col, LoopVar("N"))
+            idx = LoopBinOp("+", LoopBinOp("*", row, LoopVar("N")), col)
+            row_body.append(Store(c_local, idx, RegAccess("c", [r, c]), "global", guard=col_guard, atomic=k_splits > 1))
+        body.append(Guard(LoopBinOp("&&", row_guard, LoopLiteral(1, "int")), row_body))
+
+    return LoopProgram(
+        name=name,
+        params=params,
+        body=body,
+        block_size=(tx, ty, 1),
+        tile_m=tile_m,
+        tile_n=tile_n,
+        grid_2d=True,
+    )
 
 
 def _kernel_def_to_loop_program(kernel) -> LoopProgram:
