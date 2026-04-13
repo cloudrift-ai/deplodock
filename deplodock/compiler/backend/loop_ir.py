@@ -250,16 +250,6 @@ class Store:
 
 
 @dataclass
-class Compute:
-    """Elementwise computation producing a named result."""
-
-    dst: str
-    op: str  # "mul", "add", "exp", "rsqrt", "relu", "builtin", "ptr_offset", etc.
-    args: list[LoopExpr]
-    dtype: str = "float"  # "int" for grid index computations
-
-
-@dataclass
 class Accumulate:
     """Reduction body: fold value into accumulator."""
 
@@ -318,20 +308,7 @@ class RawLoopOp:
 
 
 LoopOp = (
-    Let
-    | SetVar
-    | ParallelAxis
-    | LoopNest
-    | Alloc
-    | Load
-    | Store
-    | Compute
-    | Accumulate
-    | WarpReduce
-    | WarpShuffleXor
-    | Barrier
-    | Guard
-    | RawLoopOp
+    Let | SetVar | ParallelAxis | LoopNest | Alloc | Load | Store | Accumulate | WarpReduce | WarpShuffleXor | Barrier | Guard | RawLoopOp
 )
 
 
@@ -421,10 +398,6 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
         guard_str = f"  guard({_pp_expr(op.guard)})" if op.guard else ""
         atomic_str = " atomic" if op.atomic else ""
         return [f"{pad}store{atomic_str} {op.dst}[{_pp_expr(op.indices)}] = {_pp_expr(op.value)} ({op.space}){guard_str}"]
-
-    if isinstance(op, Compute):
-        args_str = ", ".join(_pp_expr(a) for a in op.args)
-        return [f"{pad}compute {op.dst} = {op.op}({args_str})"]
 
     if isinstance(op, Accumulate):
         return [f"{pad}accumulate {op.dst} {op.op} {_pp_expr(op.value)}"]
