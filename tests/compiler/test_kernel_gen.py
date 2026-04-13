@@ -17,10 +17,10 @@ from pathlib import Path
 
 import pytest
 
-from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import generate_kernel
 from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program, run_program
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
 from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp, FusedRegionOp, InputOp, ReduceOp
@@ -880,8 +880,8 @@ def test_correctness_attention_stage1(dump_dir):
 
 def test_softmax_single_kernel():
     """Softmax (max→sub→exp→sum→div) fuses into exactly one region."""
-    from deplodock.compiler.backend.codegen import emit_kernel
     from deplodock.compiler.backend.cuda.generators import generate_kernel
+    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
 
     rows, cols = 4, 8
     g = Graph()

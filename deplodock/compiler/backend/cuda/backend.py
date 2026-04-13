@@ -84,10 +84,10 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     Defaults to tma_db strategy (TMA double-buffer with mbarrier pipelining).
     Falls back to naive if hints specify it.
     """
-    from deplodock.compiler.backend.codegen import emit_kernel
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
     from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
     from deplodock.compiler.backend.cuda.program import TmaDescriptorSpec
+    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
     from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
 
     m = op.params.get("M", 1)
@@ -616,9 +616,9 @@ def _compile_fused_region(op: OpKernel) -> list[CudaLaunch]:
 
 def _compile_fused_region_single(op: OpKernel) -> CudaLaunch:
     """Compile a single (non-split) fused region through the unified path."""
-    from deplodock.compiler.backend.codegen import emit_kernel
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
     from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
+    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
 
     region_ops = op.params.get("_region_ops", [])
     if not region_ops:

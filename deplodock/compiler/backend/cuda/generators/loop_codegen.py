@@ -494,6 +494,6 @@ def _emit_shuffle_xor(acc_var: str, fn: str) -> list[Stmt]:
 
 def _expr_to_c(expr: KernelExpr) -> str:
     """Quick-and-dirty Expr to C string for use in RawCode."""
-    from deplodock.compiler.backend.codegen import _emit_expr
+    from deplodock.compiler.backend.ir.kernel_codegen import _emit_expr
 
     return _emit_expr(expr)
