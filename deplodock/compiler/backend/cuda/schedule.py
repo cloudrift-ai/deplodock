@@ -18,6 +18,10 @@ if TYPE_CHECKING:
     from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis
 
 
+def _safe(name: str) -> str:
+    return name.replace("-", "_").replace(".", "_").replace(" ", "_")
+
+
 @dataclass
 class GridSpec:
     """How thread blocks map to output elements."""
@@ -80,6 +84,15 @@ class Schedule:
     # Epilogue
     epilogue_per_element: bool = False
 
+    # TMA-specific (set by build_schedule when strategy is tma)
+    tma_params: list[str] | None = None
+    tma_config: object | None = None
+    includes: list[str] | None = None
+
+    # Write base expressions (smem uses row_base/col_base instead of bm+tr/bn+tc)
+    row_base_var: str | None = None  # "row_base"
+    col_base_var: str | None = None  # "col_base"
+
     # Scalar params to append to kernel signature (dim args)
     dim_params: list[tuple[str, str]] = field(default_factory=list)
 
@@ -107,20 +120,47 @@ def build_schedule(
         )
 
     if pattern == "contraction":
-        tx, ty = 32, 8
-        thread_m = int(hints.get("thread_m", 8))
+        load_strat = {"smem": "smem", "tma": "tma", "tma_db": "tma"}.get(strategy, "global")
+        k_splits = int(hints.get("k_splits", 1))
+
+        if load_strat == "smem":
+            tx, ty = 32, 4
+            thread_m = int(hints.get("thread_m", 4))
+            block_k = int(hints.get("block_k", 32))
+        else:
+            tx, ty = 32, 8
+            thread_m = int(hints.get("thread_m", 8))
+            block_k = int(hints.get("block_k", 16 if load_strat == "global" else 32))
+
         thread_n = 4
         tile_m = ty * thread_m
         tile_n = tx * thread_n  # 128
-        k_splits = int(hints.get("k_splits", 1))
-        block_k = int(hints.get("block_k", 16))
 
         dim_params: list[tuple[str, str]] = [("int", "M"), ("int", "N"), ("int", "K")]
         if is_batched:
             dim_params.append(("int", "batch_count"))
+        elif k_splits > 1:
+            dim_params.append(("int", "k_splits"))
+
+        grid_type = "2d_standard" if load_strat == "smem" else "2d_swizzle"
+
+        # TMA-specific fields
+        tma_params = None
+        tma_config = None
+        includes = None
+        if load_strat == "tma" and analysis.contraction_a:
+            from deplodock.compiler.backend.cuda.tma_ops import TMALoadConfig
+
+            a_name = _safe(analysis.contraction_a)
+            b_name = _safe(analysis.contraction_b)
+            tma_a_ref = f"&{a_name}_tma[batch]" if is_batched else f"&{a_name}_tma"
+            tma_b_ref = f"&{b_name}_tma[batch]" if is_batched else f"&{b_name}_tma"
+            tma_params = [f"{a_name}_tma", f"{b_name}_tma"]
+            tma_config = TMALoadConfig(a_tma_ref=tma_a_ref, b_tma_ref=tma_b_ref)
+            includes = ["cuda.h"]
 
         return Schedule(
-            grid=GridSpec("2d_swizzle", (tx, ty, 1)),
+            grid=GridSpec(grid_type, (tx, ty, 1)),
             accum=AccumulatorSpec((thread_m, thread_n)),
             reductions=[
                 ReductionSpec(
@@ -137,10 +177,15 @@ def build_schedule(
             thread_m=thread_m,
             thread_n=thread_n,
             k_splits=k_splits,
-            load_strategy=strategy if strategy in ("smem", "tma") else "global",
+            load_strategy=load_strat,
             block_k=block_k,
             is_batched=is_batched,
             dim_params=dim_params,
+            tma_params=tma_params,
+            tma_config=tma_config,
+            includes=includes,
+            row_base_var="row_base" if load_strat == "smem" else None,
+            col_base_var="col_base" if load_strat == "smem" else None,
         )
 
     # row_reduce or reduce_broadcast
