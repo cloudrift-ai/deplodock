@@ -49,7 +49,8 @@ __all__ = [
     "Alloc",
     "Load",
     "Store",
-    "Accumulate",
+    "AccumInit",
+    "Accum",
     "WarpReduce",
     "WarpShuffleXor",
     "Barrier",
@@ -192,8 +193,19 @@ class Store:
 
 
 @dataclass
-class Accumulate:
-    """Reduction body: fold value into accumulator."""
+class AccumInit:
+    """Declare a reduction accumulator with the identity value for ``op``.
+
+    The codegen looks up the init value from ``REDUCE_REGISTRY``.
+    """
+
+    name: str
+    op: str  # "sum" | "max" | "prod"
+
+
+@dataclass
+class Accum:
+    """Fold value into accumulator using reduction op."""
 
     dst: str
     op: str  # "sum" | "max"
@@ -280,7 +292,8 @@ LoopOp = (
     | Alloc
     | Load
     | Store
-    | Accumulate
+    | AccumInit
+    | Accum
     | WarpReduce
     | WarpShuffleXor
     | SmemPipelineKLoop
@@ -378,8 +391,11 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
         atomic_str = " atomic" if op.atomic else ""
         return [f"{pad}store{atomic_str} {op.dst}[{_pp_expr(op.indices)}] = {_pp_expr(op.value)} ({op.space}){guard_str}"]
 
-    if isinstance(op, Accumulate):
-        return [f"{pad}accumulate {op.dst} {op.op} {_pp_expr(op.value)}"]
+    if isinstance(op, AccumInit):
+        return [f"{pad}accum_init {op.name} {op.op}"]
+
+    if isinstance(op, Accum):
+        return [f"{pad}accum {op.dst} {op.op} {_pp_expr(op.value)}"]
 
     if isinstance(op, WarpReduce):
         return [f"{pad}warp_reduce {op.var} {op.op}"]

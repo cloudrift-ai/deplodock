@@ -6,7 +6,8 @@ from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, build_schedule, lower_generic, lower_to_loop_ir
 from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
 from deplodock.compiler.backend.ir.loop_ir import (
-    Accumulate,
+    Accum,
+    AccumInit,
     Alloc,
     BinOp,
     Builtin,
@@ -102,7 +103,7 @@ def test_pretty_print_reduce():
                         Builtin("blockDim.x"),
                         [
                             Load("v", "X", BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j")), "global"),
-                            Accumulate("acc", "sum", Var("v")),
+                            Accum("acc", "sum", Var("v")),
                         ],
                     ),
                     WarpReduce("acc", "sum"),
@@ -114,7 +115,7 @@ def test_pretty_print_reduce():
     text = pretty_print(prog)
     assert "alloc reg float acc" in text
     assert "for j" in text
-    assert "accumulate acc sum" in text
+    assert "accum acc sum" in text
     assert "warp_reduce acc sum" in text
 
 
@@ -237,8 +238,8 @@ def test_single_reduce_structure():
     prog = lower_to_loop_ir(region, "test_red", {"x": (rows, cols), "red": (rows,)}, analysis)
 
     assert prog.block_size == (256, 1, 1)
-    allocs = _find_ops(prog.body, Alloc)
-    assert any(a.name.startswith("acc_") for a in allocs)
+    accum_inits = _find_ops(prog.body, AccumInit)
+    assert any(a.name.startswith("acc_") for a in accum_inits)
     loops = _find_ops(prog.body, LoopNest)
     assert len(loops) >= 1
     reduces = _find_ops(prog.body, WarpReduce)
