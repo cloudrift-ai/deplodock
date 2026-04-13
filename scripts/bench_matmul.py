@@ -103,7 +103,8 @@ def _lower_matmul(graph: Graph):
         c_name: out_node.output.shape,
     }
     strategy = graph.hints.prefix("cuda.matmul").get("strategy", "naive")
-    return lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
+    kernel_def, _loop_prog = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
+    return kernel_def
 
 
 # ---------------------------------------------------------------------------

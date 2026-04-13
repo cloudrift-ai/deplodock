@@ -60,7 +60,8 @@ def _lower_matmul(m=None, k=None, n=None, **matmul_hints):
         c_name: out_node.output.shape,
     }
     strategy = matmul_hints.get("strategy", "naive")
-    return lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
+    kernel_def, _loop_prog = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
+    return kernel_def
 
 
 def _python_matmul(a, b, m, k, n):
@@ -384,7 +385,8 @@ def _lower_matmul_with_epilogue(epilogue_ops, extra_inputs, extra_shapes):
         shapes[nid] = (M, N)
 
     analysis = analyze(region, shapes)
-    return lower_tiled(region, "matmul_epi", shapes, analysis, strategy="naive"), M, K, N
+    kernel_def, _loop_prog = lower_tiled(region, "matmul_epi", shapes, analysis, strategy="naive")
+    return kernel_def, M, K, N
 
 
 @requires_cuda

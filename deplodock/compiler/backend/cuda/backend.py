@@ -17,15 +17,6 @@ from deplodock.compiler.plan import ExecutionPlan, OpKernel
 _name_counters: dict[str, int] = {}
 
 
-class _DumpHolder:
-    """Module-scoped holder for the active CompilerDump during compile()."""
-
-    value = None
-
-
-_active_dump = _DumpHolder()
-
-
 def _unique_name(op: str) -> str:
     """Generate a unique kernel function name for an op."""
     count = _name_counters.get(op, 0)
@@ -40,13 +31,9 @@ def _cd(a: int, b: int) -> int:
 class CudaBackend(Backend):
     """CUDA backend: ExecutionPlan → Program → nvcc → GPU."""
 
-    def compile(self, plan: ExecutionPlan, dump=None) -> Program:
-        """Map OpKernels to .cu templates and build a Program.
-
-        Pass a ``CompilerDump`` instance as ``dump`` to save LoopIR artifacts.
-        """
+    def compile(self, plan: ExecutionPlan) -> Program:
+        """Map OpKernels to .cu templates and build a Program."""
         _name_counters.clear()
-        _active_dump.value = dump
 
         def _safe_prod(shape):
             return math.prod(d for d in shape if isinstance(d, int)) if shape else 1
@@ -245,7 +232,7 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     # Generate kernel through the unified path.
     name = _unique_name("matmul")
     analysis = analyze(region, shapes)
-    kernel_def = lower_tiled(region, name, shapes, analysis, strategy=strategy, hints=matmul_hints, dump=_active_dump.value)
+    kernel_def, loop_prog = lower_tiled(region, name, shapes, analysis, strategy=strategy, hints=matmul_hints)
     source = emit_kernel(kernel_def)
 
     bx, by, bz = kernel_def.block_size
@@ -322,6 +309,7 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
         smem_bytes=smem_bytes,
         tma_descriptors=tma_descs,
         zero_outputs=list(op.outputs) if k_splits > 1 else [],
+        loop_ir=loop_prog,
     )
 
 
@@ -669,7 +657,7 @@ def _compile_fused_region_single(op: OpKernel) -> CudaLaunch:
 
     # Unified path: analyze → lower_tiled → emit_kernel.
     name = _unique_name("fused_region")
-    kernel_def = lower_tiled(region, name, shapes, analysis, dump=_active_dump.value)
+    kernel_def, loop_prog = lower_tiled(region, name, shapes, analysis)
     source = emit_kernel(kernel_def)
 
     bx, by, bz = kernel_def.block_size
@@ -687,7 +675,7 @@ def _compile_fused_region_single(op: OpKernel) -> CudaLaunch:
         grid, block, scalar_args = _grid_for_reduce(op, bx)
 
     args = buffer_args + scalar_args
-    return CudaLaunch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args)
+    return CudaLaunch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args, loop_ir=loop_prog)
 
 
 def _compile_fused_region_from_source(op: OpKernel, source: str) -> CudaLaunch:
