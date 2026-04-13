@@ -169,10 +169,23 @@ class Accumulate:
 
 @dataclass
 class WarpReduce:
-    """Cross-thread warp shuffle reduction.
+    """Cross-thread warp shuffle reduction (__shfl_down_sync).
 
     After this op, `var` holds the block-wide reduced value (thread 0
     for max, all threads for sum via broadcast).
+    """
+
+    var: str
+    op: str  # "sum" | "max"
+
+
+@dataclass
+class WarpShuffleXor:
+    """Horizontal warp shuffle reduction (__shfl_xor_sync).
+
+    Reduces ``var`` across threads using XOR lane masks (offsets 16,8,4,2,1).
+    Used for in-register softmax where each thread holds different columns
+    of the same output row.
     """
 
     var: str
@@ -203,7 +216,7 @@ class RawLoopOp:
     comment: str = ""
 
 
-LoopOp = ParallelAxis | LoopNest | Alloc | Load | Store | Compute | Accumulate | WarpReduce | Barrier | Guard | RawLoopOp
+LoopOp = ParallelAxis | LoopNest | Alloc | Load | Store | Compute | Accumulate | WarpReduce | WarpShuffleXor | Barrier | Guard | RawLoopOp
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +309,9 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
 
     if isinstance(op, WarpReduce):
         return [f"{pad}warp_reduce {op.var} {op.op}"]
+
+    if isinstance(op, WarpShuffleXor):
+        return [f"{pad}warp_shuffle_xor {op.var} {op.op}"]
 
     if isinstance(op, Barrier):
         return [f"{pad}barrier"]

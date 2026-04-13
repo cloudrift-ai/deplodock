@@ -51,6 +51,7 @@ from deplodock.compiler.backend.loop_ir import (
     RegAccess,
     Store,
     WarpReduce,
+    WarpShuffleXor,
 )
 
 
@@ -222,10 +223,9 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         return [Assign(ArrayAccess(op.dst, idx), val)]
 
     if isinstance(op, Compute):
-        # Check if this is an in-place update on a register array element:
-        # if any arg is a RegAccess whose expanded name matches dst, emit
-        # assignment instead of declaration.
-        is_inplace = any(isinstance(a, RegAccess) and a.name + "".join(str(i) for i in a.indices) == op.dst for a in op.args)
+        # Check if this is an in-place update: if any arg (recursively)
+        # references dst, emit assignment instead of declaration.
+        is_inplace = _refs_name(op.args, op.dst)
         dtype = op.dtype
         builder = _ELEM_OPS.get(op.op)
         if builder:
@@ -250,6 +250,9 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
 
     if isinstance(op, WarpReduce):
         return _emit_warp_reduce(op.var, op.op)
+
+    if isinstance(op, WarpShuffleXor):
+        return _emit_warp_shuffle_xor(op.var, op.op)
 
     if isinstance(op, Barrier):
         return [SyncThreads()]
@@ -342,6 +345,36 @@ def _emit_warp_reduce(acc_var: str, fn: str) -> list[Stmt]:
     stmts.append(VarAssign(acc_var, Var(s_var)))
 
     return stmts
+
+
+def _refs_name(exprs: list, name: str) -> bool:
+    """Check if any LoopExpr in exprs (recursively) references the given name."""
+    for e in exprs:
+        if isinstance(e, LoopVar) and e.name == name:
+            return True
+        if isinstance(e, RegAccess) and e.name + "".join(str(i) for i in e.indices) == name:
+            return True
+        if isinstance(e, LoopFuncCall) and _refs_name(e.args, name):
+            return True
+        if isinstance(e, LoopBinOp) and _refs_name([e.left, e.right], name):
+            return True
+        if isinstance(e, LoopTernary) and _refs_name([e.cond, e.if_true, e.if_false], name):
+            return True
+    return False
+
+
+def _emit_warp_shuffle_xor(acc_var: str, fn: str) -> list[Stmt]:
+    """Emit horizontal warp shuffle reduction using __shfl_xor_sync.
+
+    Unlike WarpReduce (vertical __shfl_down_sync across all threads in a
+    block), this reduces within a warp using XOR lane masks.  Used for
+    in-register softmax where each thread holds different columns.
+    """
+    if fn == "sum":
+        body = f"{acc_var} += __shfl_xor_sync(0xffffffff, {acc_var}, o);"
+    else:
+        body = f"{acc_var} = fmaxf({acc_var}, __shfl_xor_sync(0xffffffff, {acc_var}, o));"
+    return [RawCode(f"for(int o=16;o>0;o>>=1){body}")]
 
 
 # ---------------------------------------------------------------------------

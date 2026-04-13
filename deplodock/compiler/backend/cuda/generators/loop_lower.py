@@ -36,6 +36,7 @@ from deplodock.compiler.backend.loop_ir import (
     RegAccess,
     Store,
     WarpReduce,
+    WarpShuffleXor,
 )
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReshapeOp, TransposeOp
 
@@ -337,6 +338,10 @@ def _emit_epilogue(
         # Contraction register tile epilogue
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4
+        tile_n = schedule.tile_n or 128
+        # Multi-reduce on register tile (contraction+softmax)
+        if len(phases.reduces) > 1 and analysis.cols <= tile_n:
+            return _contraction_softmax_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n)
         return _contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n)
 
     # Scalar reduction epilogue
@@ -511,16 +516,6 @@ def lower_to_loop_ir(
     # Legacy: smem K-tile loop has RawLoopOp for float4 fast path
     if strategy == "smem" and analysis.pattern == "contraction":
         return _lower_contraction_smem(region, name, shapes, analysis, hints or {})
-
-    # Legacy: contraction + softmax (multi-reduce on register tile)
-    if analysis.pattern == "contraction":
-        phases = analysis.op_phases
-        dims = _contraction_dims(analysis, hints or {})
-        if len(phases.reduces) > 1 and analysis.cols <= dims["tile_n"]:
-            from deplodock.compiler.backend.cuda.generators.tiled import _lower_naive
-
-            kernel = _lower_naive(region, name, shapes, analysis, strategy="naive", hints=hints or {})
-            return _kernel_def_to_loop_program(kernel)
 
     schedule = build_schedule(analysis, strategy, hints or {})
     return lower_generic(region, name, shapes, analysis, schedule)
@@ -1094,6 +1089,118 @@ def _contraction_epilogue_ops(
     return ops
 
 
+def _contraction_softmax_epilogue_ops(
+    phases,
+    shapes: dict[str, tuple],
+    input_names: list[str],
+    thread_m: int,
+    thread_n: int,
+) -> list:
+    """Generate LoopIR ops for fused contraction+softmax epilogue.
+
+    After the K-loop, accumulators c[r][c] hold matmul scores. This emits:
+    1. Apply inter_reduce[0] ops (scale) on register tile
+    2. Row max via WarpShuffleXor across threadIdx.x
+    3. Apply inter_reduce[1] ops (sub, exp) + row sum via WarpShuffleXor
+    4. Apply epilogue ops (div) on register tile
+
+    Only valid when N <= tile_n (all columns in one CTA).
+    """
+    ops: list = []
+    input_set = set(input_names)
+
+    # Phase 0: apply inter_reduce[0] ops (e.g. scale) on register tile.
+    if phases.inter_reduce:
+        prev_id = phases.reduces[0][0]
+        for nid, ir_op, inputs in phases.inter_reduce[0]:
+            fn = ir_op.fn
+            other = None
+            if len(inputs) == 2:
+                for inp in inputs:
+                    if inp != prev_id:
+                        other = inp
+                        break
+            if other is not None and other not in input_set:
+                other = None
+
+            for r in range(thread_m):
+                for c in range(thread_n):
+                    acc = RegAccess("c", [r, c])
+                    dst = f"c{r}{c}"
+                    if fn in ("mul", "add", "sub", "div") and other is not None:
+                        safe = _safe(other)
+                        other_shape = shapes.get(other, ())
+                        other_size = 1
+                        for d in other_shape:
+                            if isinstance(d, int):
+                                other_size *= d
+                        if other_size <= 1:
+                            idx = LoopLiteral(0, "int")
+                        elif len(other_shape) <= 1:
+                            idx = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                        else:
+                            row_e = LoopBinOp("+", LoopBinOp("+", LoopVar("bm"), LoopVar("tr")), LoopLiteral(r, "int"))
+                            col_e = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                            idx = LoopBinOp("+", LoopBinOp("*", row_e, LoopVar("N")), col_e)
+                        ld_name = f"_sc_{safe}_{r}_{c}"
+                        ops.append(Load(ld_name, safe, idx, "global"))
+                        if inputs[0] == prev_id:
+                            ops.append(Compute(dst, fn, [acc, LoopVar(ld_name)]))
+                        else:
+                            ops.append(Compute(dst, fn, [LoopVar(ld_name), acc]))
+                    elif fn == "exp":
+                        ops.append(Compute(dst, "exp", [acc]))
+            prev_id = nid
+
+    # Phase 1: row max via WarpShuffleXor.
+    for r in range(thread_m):
+        rmax = f"rmax{r}"
+        ops.append(Alloc(rmax, "float", None, "reg", LoopLiteral(-1e30)))
+        for c in range(thread_n):
+            col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+            # rmax = fmaxf(rmax, c[r][c]) guarded by col < N
+            ops.append(
+                Guard(
+                    LoopBinOp("<", col_c, LoopVar("N")),
+                    [Compute(rmax, "builtin", [LoopFuncCall("fmaxf", [LoopVar(rmax), RegAccess("c", [r, c])])])],
+                )
+            )
+        ops.append(WarpShuffleXor(rmax, "max"))
+
+    # Phase 2: apply inter_reduce[1] (sub, exp) + accumulate row sum.
+    if len(phases.inter_reduce) > 1:
+        for r in range(thread_m):
+            rsum = f"rsum{r}"
+            rmax = f"rmax{r}"
+            ops.append(Alloc(rsum, "float", None, "reg", LoopLiteral(0.0)))
+            for c in range(thread_n):
+                col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                acc = RegAccess("c", [r, c])
+                dst = f"c{r}{c}"
+                guarded: list = []
+                for _nid, ir_op, _inputs in phases.inter_reduce[1]:
+                    if ir_op.fn == "sub":
+                        guarded.append(Compute(dst, "sub", [acc, LoopVar(rmax)]))
+                    elif ir_op.fn == "exp":
+                        guarded.append(Compute(dst, "exp", [RegAccess("c", [r, c])]))
+                guarded.append(Accumulate(rsum, "sum", RegAccess("c", [r, c])))
+                ops.append(Guard(LoopBinOp("<", col_c, LoopVar("N")), guarded))
+            ops.append(WarpShuffleXor(rsum, "sum"))
+
+    # Phase 3: apply epilogue (div).
+    for _epi_nid, epi_op, _inputs in phases.epilogue:
+        if epi_op.fn == "div":
+            for r in range(thread_m):
+                rsum = f"rsum{r}"
+                for c in range(thread_n):
+                    col_c = LoopBinOp("+", LoopBinOp("+", LoopVar("bn"), LoopVar("tc")), LoopLiteral(c, "int"))
+                    acc = RegAccess("c", [r, c])
+                    dst = f"c{r}{c}"
+                    ops.append(Guard(LoopBinOp("<", col_c, LoopVar("N")), [Compute(dst, "div", [acc, LoopVar(rsum)])]))
+
+    return ops
+
+
 def _contraction_write_ops(
     output_name: str,
     thread_m: int,
@@ -1147,22 +1254,10 @@ def _lower_contraction_naive(
     Grid setup and K-loop body use RawLoopOp.  Accumulator declaration,
     epilogue, and write phase use proper LoopIR with register arrays.
 
-    Falls back to the legacy wrapper for contraction+softmax epilogue
-    (multi-reduce with in-register warp shuffles).
     """
     dims = _contraction_dims(analysis, hints)
     thread_m, thread_n = dims["thread_m"], dims["thread_n"]
     tile_m, tile_n = dims["tile_m"], dims["tile_n"]
-    phases = analysis.op_phases
-
-    # Contraction + softmax (multi-reduce): complex in-register warp shuffles.
-    # Fall back to legacy until softmax epilogue is ported to LoopIR.
-    if len(phases.reduces) > 1 and analysis.cols <= tile_n:
-        from deplodock.compiler.backend.cuda.generators.tiled import _lower_naive
-
-        kernel = _lower_naive(region, name, shapes, analysis, strategy="naive", hints=hints)
-        return _kernel_def_to_loop_program(kernel)
-
     tx, ty = dims["tx"], dims["ty"]
     is_batched = analysis.batch_size > 1
     k_splits = int(hints.get("k_splits", 1))
@@ -1214,8 +1309,11 @@ def _lower_contraction_naive(
     body.append(LoopNest("k", LoopLiteral(0, "int"), LoopVar("K"), None, k_body))
 
     # Epilogue — proper LoopIR with register arrays
-    epi_ops = _contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n)
-    body.extend(epi_ops)
+    phases = analysis.op_phases
+    if len(phases.reduces) > 1 and analysis.cols <= tile_n:
+        body.extend(_contraction_softmax_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
+    else:
+        body.extend(_contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
 
     # Write — proper LoopIR with register arrays
     body.extend(_contraction_write_ops(out_id, thread_m, thread_n, is_batched, k_splits))
@@ -1237,15 +1335,147 @@ def _lower_contraction_tma(
     analysis: TileAnalysis,
     hints: dict,
 ) -> LoopProgram:
-    """Lower contraction (TMA double-buffer) via legacy _lower_naive.
+    """Lower contraction (TMA double-buffer) to LoopIR.
 
-    TMA requires complex inline asm for mbarrier + cp.async.bulk.
-    The entire kernel body stays as RawLoopOp until TMA gets proper LoopIR ops.
+    CTA-swizzle grid, accumulator alloc, epilogue, and write use proper
+    LoopIR.  The TMA smem setup + mbarrier pipeline + double-buffered
+    K-loop use RawLoopOp for inline PTX asm.
     """
-    from deplodock.compiler.backend.cuda.generators.tiled import _lower_naive
+    dims = _contraction_dims(analysis, hints)
+    thread_m, thread_n = dims["thread_m"], dims["thread_n"]
+    tile_m, tile_n = dims["tile_m"], dims["tile_n"]
+    tx, ty = dims["tx"], dims["ty"]
+    is_batched = analysis.batch_size > 1
+    k_splits = int(hints.get("k_splits", 1))
+    bk = int(hints.get("block_k", 32))
+    phases = analysis.op_phases
 
-    kernel = _lower_naive(region, name, shapes, analysis, strategy="tma_db", hints=hints)
-    return _kernel_def_to_loop_program(kernel)
+    a_name = _safe(analysis.contraction_a)
+    b_name = _safe(analysis.contraction_b)
+    out_id = region.output_names[0]
+    a_size = tile_m * bk
+    b_size = bk * tile_n
+    stage = a_size + b_size
+
+    # TMA params: A/B come via descriptors, only C + epilogue inputs as regular params.
+    # M/N/K come via #define from backend.py.
+    tma_exclude = {a_name, b_name, "M", "N", "K"}
+    if is_batched:
+        tma_exclude.add("batch_count")
+    params = [(dt, nm) for dt, nm in _build_params(region) if nm not in tma_exclude]
+    if k_splits > 1:
+        params.append(("int", "k_splits"))
+
+    body: list = []
+
+    # Grid setup (CTA-swizzle) — same as naive
+    body.extend(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
+
+    # TMA smem setup + mbarrier init + double-buffered K-loop (inline PTX asm)
+    if is_batched:
+        tma_a_ref = f"&{a_name}_tma[batch]"
+        tma_b_ref = f"&{b_name}_tma[batch]"
+    else:
+        tma_a_ref = f"&{a_name}_tma"
+        tma_b_ref = f"&{b_name}_tma"
+    smem_bytes = stage * 4
+    first_k = "k_start" if k_splits > 1 else "0"
+    next_k_prefix = "k_start+" if k_splits > 1 else ""
+
+    if k_splits > 1:
+        k_range_code = (
+            f"int k_per_split=(K/{bk}/k_splits)*{bk};\n"
+            f"int k_start=blockIdx.z*k_per_split;\n"
+            f"int k_end=(blockIdx.z==k_splits-1)?K:k_start+k_per_split;\n"
+            f"int p0=0,p1=0,nt=(k_end-k_start)/{bk};\n"
+        )
+    else:
+        k_range_code = f"int p0=0,p1=0,nt=K/{bk};\n"
+
+    # FMA block (same unrolled pattern as naive but reading from smem)
+    fma_lines = []
+    for r in range(thread_m):
+        fma_lines.append(f"float a{r}=cas[(tr+{r})*{bk}+kk];" + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n)))
+    fma_block = "\n            ".join(fma_lines)
+
+    # Accumulator declarations as raw (TMA code references them before LoopIR Alloc would emit)
+    acc_decls = ",".join(f"c{r}{c}=0" for r in range(thread_m) for c in range(thread_n))
+
+    tma_code = (
+        f"extern __shared__ __align__(128) char dsmem[];\n"
+        f"float*smem=(float*)dsmem;\n"
+        f"uint64_t*mbar=(uint64_t*)(dsmem+2*{stage}*4);\n"
+        f"const int as0=(int)__cvta_generic_to_shared(&smem[0]);\n"
+        f"const int bs0=(int)__cvta_generic_to_shared(&smem[{a_size}]);\n"
+        f"const int as1=(int)__cvta_generic_to_shared(&smem[{stage}]);\n"
+        f"const int bs1=(int)__cvta_generic_to_shared(&smem[{stage}+{a_size}]);\n"
+        f"const int mb0=(int)__cvta_generic_to_shared(&mbar[0]);\n"
+        f"const int mb1=(int)__cvta_generic_to_shared(&mbar[1]);\n"
+        f"int tid=threadIdx.y*{tx}+threadIdx.x;\n"
+        f'if(tid==0){{asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb0),"r"(1));'
+        f'asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));'
+        f'asm volatile("fence.mbarrier_init.release.cluster;");}}\n'
+        f"__syncthreads();\n"
+        f"float {acc_decls};\n"
+        f"const int bytes={smem_bytes};\n"
+        f"{k_range_code}"
+        f"if(nt>0&&tid==0){{"
+        f'asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 '
+        f'_,[%0],%1;"::"r"(mb0),"r"(bytes):"memory");'
+        f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
+        f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+        f'::"r"(as0),"l"({tma_a_ref}),"r"({first_k}),"r"(bm),"r"(mb0):"memory");'
+        f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
+        f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+        f'::"r"(bs0),"l"({tma_b_ref}),"r"(bn),"r"({first_k}),"r"(mb0):"memory");}}\n'
+        f"for(int t=0;t<nt;t++){{\n"
+        f"    int s=t%2;int cm=s==0?mb0:mb1;int cp=s==0?p0:p1;\n"
+        f"    int nm=s==0?mb1:mb0;int na=s==0?as1:as0;int nb=s==0?bs1:bs0;\n"
+        f'    asm volatile("{{\\n\\t.reg .pred P1;\\n\\tLW:\\n\\t'
+        f"mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1,[%0],%1,%2;\\n\\t"
+        f'@P1 bra.uni LD;\\n\\tbra.uni LW;\\n\\tLD:\\n\\t}}"::"r"(cm),"r"(cp),"r"(0xffffffff));\n'
+        f"    if(s==0)p0^=1;else p1^=1;\n"
+        f"    if(tid==0&&t+1<nt){{int nk={next_k_prefix}(t+1)*{bk};"
+        f'asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 '
+        f'_,[%0],%1;"::"r"(nm),"r"(bytes):"memory");'
+        f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
+        f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+        f'::"r"(na),"l"({tma_a_ref}),"r"(nk),"r"(bm),"r"(nm):"memory");'
+        f'asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier'
+        f'::complete_tx::bytes [%0],[%1,{{%2,%3}}],[%4];"'
+        f'::"r"(nb),"l"({tma_b_ref}),"r"(bn),"r"(nk),"r"(nm):"memory");}}\n'
+        f"    float*cas=&smem[s*{stage}];float*cbs=&smem[s*{stage}+{a_size}];\n"
+        f"    #pragma unroll\n"
+        f"    for(int kk=0;kk<{bk};kk++){{\n"
+        f"            float b0=cbs[kk*{tile_n}+tc],b1=cbs[kk*{tile_n}+tc+1],"
+        f"b2=cbs[kk*{tile_n}+tc+2],b3=cbs[kk*{tile_n}+tc+3];\n"
+        f"            {fma_block}\n"
+        f"    }}\n"
+        f"    __syncthreads();\n"
+        f"}}"
+    )
+    body.append(RawLoopOp(tma_code, "TMA double-buffered K-loop"))
+
+    # Epilogue — proper LoopIR (softmax or standard)
+    if len(phases.reduces) > 1 and analysis.cols <= tile_n:
+        body.extend(_contraction_softmax_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
+    else:
+        body.extend(_contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
+
+    # Write — proper LoopIR with register arrays
+    body.extend(_contraction_write_ops(out_id, thread_m, thread_n, is_batched, k_splits))
+
+    return LoopProgram(
+        name=name,
+        params=params,
+        body=body,
+        block_size=(tx, ty, 1),
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
+        batched=is_batched,
+        includes=["cuda.h"],
+    )
 
 
 def _lower_contraction_smem(
@@ -1423,29 +1653,4 @@ def _lower_contraction_smem(
         tile_m=tile_m,
         tile_n=tile_n,
         grid_2d=True,
-    )
-
-
-def _kernel_def_to_loop_program(kernel) -> LoopProgram:
-    """Convert a legacy KernelDef to a LoopProgram wrapping the body as RawLoopOp."""
-    from deplodock.compiler.backend.codegen import emit_kernel
-
-    source = emit_kernel(kernel)
-    brace_start = source.index("{") + 1
-    brace_end = source.rindex("}")
-    body_source = source[brace_start:brace_end].strip()
-
-    return LoopProgram(
-        name=kernel.name,
-        params=[(p.dtype, p.name) for p in kernel.params],
-        body=[RawLoopOp(body_source, "legacy contraction kernel body")],
-        block_size=kernel.block_size,
-        tile_m=kernel.tile_m,
-        tile_n=kernel.tile_n,
-        grid_2d=kernel.grid_2d,
-        tma_params=kernel.tma_params,
-        batched=getattr(kernel, "batched", False),
-        includes=kernel.includes,
-        extra_smem_bytes=getattr(kernel, "extra_smem_bytes", 0),
-        min_blocks_per_sm=getattr(kernel, "min_blocks_per_sm", 0),
     )
