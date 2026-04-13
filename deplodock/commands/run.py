@@ -53,11 +53,14 @@ def _handle_run(args):
     # Plan from graph.
     plan = plan_graph(compiled, name=ir_path.stem)
     backend = CudaBackend()
-    program = backend.compile(plan, dump=dump)
+    program = backend.compile(plan)
 
     if dump:
         dump.dump_plan(plan)
         dump.dump_program(program)
+        for launch in program.launches:
+            if hasattr(launch, "loop_ir") and launch.loop_ir is not None:
+                dump.dump_loop_ir(launch.loop_ir, launch.kernel_name)
         from deplodock.compiler.backend.cuda.program import generate_source
 
         mode = "benchmark" if args.benchmark else "run"
