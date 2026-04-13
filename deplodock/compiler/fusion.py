@@ -135,19 +135,8 @@ def _reduces_compatible(r1_id: str, r2_id: str, graph) -> bool:
     if not isinstance(r1, ReduceOp) or not isinstance(r2, ReduceOp):
         return True
 
-    def _is_row_reduce(op, node):
-        if op.axis == -1:
-            return True
-        if isinstance(op.axis, int) and node.inputs:
-            inp = node.inputs[0]
-            if inp in graph.nodes:
-                ndim = len(graph.nodes[inp].output.shape)
-                if ndim > 0 and op.axis == ndim - 1:
-                    return True
-        return False
-
-    is_row_1 = _is_row_reduce(r1, r1_node)
-    is_row_2 = _is_row_reduce(r2, r2_node)
+    is_row_1 = _is_row_reduce_op(r1, r1_node, graph)
+    is_row_2 = _is_row_reduce_op(r2, r2_node, graph)
 
     if is_row_1 != is_row_2:
         return False  # Mixed axes — incompatible.

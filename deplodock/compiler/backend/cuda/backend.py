@@ -417,6 +417,65 @@ def _build_region_and_shapes(op: OpKernel):
     return region, shapes
 
 
+def _dispatch_to_matmul(op: OpKernel) -> CudaLaunch | None:
+    """Try to route a fused region through the dedicated matmul path.
+
+    Returns a CudaLaunch if the region is a matmul (possibly batched),
+    or None if it should go through the general tiled generator.
+    """
+    from deplodock.compiler.ops import ElementwiseOp as _EwOp
+
+    input_shapes = op.params.get("_input_shapes", {})
+    region_ops = op.params.get("_region_ops", [])
+
+    # For >2D matmul operands (batched matmul), skip the 2-op shortcut —
+    # the analyze path detects batch dims and passes them to _compile_matmul.
+    has_batched_matmul = False
+    if len(region_ops) >= 2:
+        _, op0, inputs0 = region_ops[0]
+        if isinstance(op0, _EwOp) and op0.fn == "mul" and len(inputs0) == 2:
+            a_shape = input_shapes.get(inputs0[0], ())
+            b_shape = input_shapes.get(inputs0[1], ())
+            has_batched_matmul = len(a_shape) > 2 and len(b_shape) > 2
+
+    if not has_batched_matmul:
+        is_matmul, m, n, k = _is_matmul_region(op)
+        if is_matmul:
+            op.params["M"] = m
+            op.params["N"] = n
+            op.params["K"] = k
+            return _compile_matmul(op)
+
+    return None
+
+
+def _grid_for_pointwise(analysis, block_x: int) -> tuple[tuple, tuple, list[str]]:
+    """Compute grid, block, and scalar args for a pointwise kernel."""
+    total = math.prod(d for d in analysis.output_shape if isinstance(d, int))
+    return (_cd(total, block_x), 1, 1), (block_x, 1, 1), [str(total)]
+
+
+def _grid_for_reduce(op: OpKernel, block_x: int) -> tuple[tuple, tuple, list[str]]:
+    """Compute grid, block, and scalar args for row_reduce / reduce_broadcast."""
+    out_shape = op.params.get("shape", (1,))
+    total = math.prod(d for d in out_shape if isinstance(d, int))
+    input_shapes = op.params.get("_input_shapes", {})
+    best_shape = out_shape
+    best_size = total
+    for inp_shape in input_shapes.values():
+        inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
+        if inp_size > best_size:
+            best_shape = inp_shape
+            best_size = inp_size
+    if len(best_shape) >= 2:
+        rows = math.prod(d for d in best_shape[:-1] if isinstance(d, int))
+        cols = best_shape[-1] if isinstance(best_shape[-1], int) else 1
+    else:
+        rows = 1
+        cols = total
+    return (rows, 1, 1), (block_x, 1, 1), [str(rows), str(cols)]
+
+
 def _compile_fused_region(op: OpKernel) -> CudaLaunch:
     """Compile a FusedRegionOp via the unified analysis → tiled generator path.
 
@@ -434,28 +493,10 @@ def _compile_fused_region(op: OpKernel) -> CudaLaunch:
         src = f"__global__ void {name}() {{}}"
         return CudaLaunch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])
 
-    # 2-op matmul pattern (mul + sum) goes through the dedicated SGEMM path,
-    # which handles batched/transposed shapes and TMA strategies.
-    # For >2D matmul operands (batched matmul), skip this shortcut — the
-    # analyze path below detects batch dims and passes them to _compile_matmul.
-    from deplodock.compiler.ops import ElementwiseOp as _EwOp
-
-    input_shapes = op.params.get("_input_shapes", {})
-    region_ops = op.params.get("_region_ops", [])
-    has_batched_matmul = False
-    if len(region_ops) >= 2:
-        _, op0, inputs0 = region_ops[0]
-        if isinstance(op0, _EwOp) and op0.fn == "mul" and len(inputs0) == 2:
-            a_shape = input_shapes.get(inputs0[0], ())
-            b_shape = input_shapes.get(inputs0[1], ())
-            has_batched_matmul = len(a_shape) > 2 and len(b_shape) > 2
-    if not has_batched_matmul:
-        is_matmul, m, n, k = _is_matmul_region(op)
-        if is_matmul:
-            op.params["M"] = m
-            op.params["N"] = n
-            op.params["K"] = k
-            return _compile_matmul(op)
+    # Try the dedicated matmul path first (handles TMA, k_splits, tuning).
+    matmul_launch = _dispatch_to_matmul(op)
+    if matmul_launch is not None:
+        return matmul_launch
 
     from deplodock.compiler.backend.codegen import emit_kernel
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
@@ -479,45 +520,13 @@ def _compile_fused_region(op: OpKernel) -> CudaLaunch:
     kernel_def = lower_tiled(region, name, shapes, analysis)
     source = emit_kernel(kernel_def)
 
-    # Build Launch from KernelDef metadata — no regex parsing needed.
     bx, by, bz = kernel_def.block_size
     buffer_args = [*op.inputs, *op.outputs]
 
-    if analysis.pattern == "contraction":
-        # CTA-swizzle grid with coarsened tiles (64×128).
-        c_tile_m, c_tile_n = 64, 128  # must match tiled.py
-        ntx = _cd(analysis.cols, c_tile_n)
-        nty = _cd(analysis.rows, c_tile_m)
-        grid = (ntx * _cd(nty, 8) * 8, 1, 1)
-        block = (bx, by, bz)
-        scalar_args = [str(analysis.rows), str(analysis.cols), str(analysis.k_dim)]
-    elif analysis.pattern == "pointwise":
-        total = math.prod(d for d in analysis.output_shape if isinstance(d, int))
-        grid = (_cd(total, bx), 1, 1)
-        block = (bx, 1, 1)
-        scalar_args = [str(total)]
+    if analysis.pattern == "pointwise":
+        grid, block, scalar_args = _grid_for_pointwise(analysis, bx)
     else:
-        # row_reduce or reduce_broadcast: compute rows/cols from the largest
-        # input shape (matching the old regex-based dispatch behavior).
-        out_shape = op.params.get("shape", (1,))
-        total = math.prod(d for d in out_shape if isinstance(d, int))
-        input_shapes = op.params.get("_input_shapes", {})
-        best_shape = out_shape
-        best_size = total
-        for inp_shape in input_shapes.values():
-            inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
-            if inp_size > best_size:
-                best_shape = inp_shape
-                best_size = inp_size
-        if len(best_shape) >= 2:
-            rows = math.prod(d for d in best_shape[:-1] if isinstance(d, int))
-            cols = best_shape[-1] if isinstance(best_shape[-1], int) else 1
-        else:
-            rows = 1
-            cols = total
-        grid = (rows, 1, 1)
-        block = (bx, 1, 1)
-        scalar_args = [str(rows), str(cols)]
+        grid, block, scalar_args = _grid_for_reduce(op, bx)
 
     args = buffer_args + scalar_args
     return CudaLaunch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args)

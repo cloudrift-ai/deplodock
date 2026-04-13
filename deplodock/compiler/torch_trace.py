@@ -86,13 +86,6 @@ def _get_dtype(fx_node: Any) -> str:
     return "f32"
 
 
-def _resolve_input(fx_node: Any, node_map: dict[str, str]) -> str | None:
-    """Resolve an FX node argument to our node ID."""
-    if hasattr(fx_node, "name") and fx_node.name in node_map:
-        return node_map[fx_node.name]
-    return None
-
-
 def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = None) -> list[str]:
     """Resolve FX node args to our node IDs. Scalars become ConstantOp nodes."""
     result = []

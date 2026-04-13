@@ -174,7 +174,29 @@ def _tma_var(launch: Launch, desc: TmaDescriptorSpec) -> str:
 
 
 def _generate_tma_setup(program: Program) -> str:
-    """Generate CUtensorMap descriptor creation code for all TMA launches."""
+    """Generate CUtensorMap descriptor creation code for all TMA launches.
+
+    Each TMA descriptor encodes a 2D tile view of a global-memory buffer.
+    cuTensorMapEncodeTiled parameters:
+      - d[2]: global tensor dimensions (innermost-first, column-major order).
+      - s[1]: stride between rows, in bytes (only 1 stride for 2D).
+      - b[2]: block (tile) sizes that cp.async.bulk will load per TMA op.
+      - e[2]: element strides (always 1 — no strided access within a tile).
+
+    Flag choices:
+      - INTERLEAVE_NONE: elements are contiguous in memory (no channel
+        interleaving). Required for standard row-major FP32 layouts.
+      - SWIZZLE_NONE: no shared-memory swizzle pattern. Swizzling reduces
+        bank conflicts for certain tile shapes, but the double-buffer
+        strategy already avoids conflicts via staging through registers.
+      - L2_PROMOTION_L2_256B: hint the L2 cache to keep 256B lines for
+        TMA traffic. Improves reuse when multiple CTAs read overlapping
+        K-slices of the same matrix.
+      - FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA: out-of-bounds tile elements
+        are filled with zero for FMA operations (not NaN). Allows the
+        kernel to use uniform tile sizes without explicit boundary checks;
+        OOB elements contribute zero to the accumulator.
+    """
     lines: list[str] = []
 
     for launch in program.launches:
