@@ -168,8 +168,8 @@ def test_loop_ir_json_roundtrip():
     parsed = json.loads(s)
     assert parsed["name"] == "test"
     assert len(parsed["body"]) == 2
-    assert parsed["body"][0]["op"] == "parallel_axis"
-    assert parsed["body"][1]["op"] == "guard"
+    assert parsed["body"][0]["type"] == "parallel_axis"
+    assert parsed["body"][1]["type"] == "guard"
 
 
 # ---------------------------------------------------------------------------

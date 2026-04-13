@@ -329,116 +329,32 @@ def _pp_expr(expr: LoopExpr) -> str:
 # Serialization
 # ---------------------------------------------------------------------------
 
+def _serialize(obj: object) -> object:
+    """Recursively serialize LoopIR dataclasses to JSON-compatible dicts.
+
+    Each dataclass gets a ``"type"`` key with the class name.
+    All other values pass through as-is.
+    """
+    import dataclasses
+
+    if obj is None or isinstance(obj, (int, float, str, bool)):
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return [_serialize(v) for v in obj]
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        # snake_case class name: LoopNest → loop_nest, ParallelAxis → parallel_axis
+        cls_name = type(obj).__name__
+        tag = "".join(f"_{c.lower()}" if c.isupper() else c for c in cls_name).lstrip("_")
+        d: dict = {"type": tag}
+        for f in dataclasses.fields(obj):
+            d[f.name] = _serialize(getattr(obj, f.name))
+        return d
+    return obj
+
 
 def to_dict(program: LoopProgram) -> dict:
     """JSON-serializable dict for dump-dir artifacts."""
-    return {
-        "name": program.name,
-        "params": [{"dtype": dt, "name": nm} for dt, nm in program.params],
-        "block_size": list(program.block_size),
-        "smem_bytes": program.smem_bytes,
-        "tile_m": program.tile_m,
-        "tile_n": program.tile_n,
-        "body": [_op_to_dict(op) for op in program.body],
-    }
-
-
-def _op_to_dict(op: LoopOp) -> dict:
-    """Serialize a single LoopOp."""
-    if isinstance(op, ParallelAxis):
-        return {"op": "parallel_axis", "name": op.name, "dim": op.dim, "bound": op.bound}
-    if isinstance(op, LoopNest):
-        return {
-            "op": "loop",
-            "var": op.var,
-            "start": _expr_to_dict(op.start),
-            "end": _expr_to_dict(op.end),
-            "step": _expr_to_dict(op.step) if op.step else None,
-            "body": [_op_to_dict(c) for c in op.body],
-        }
-    if isinstance(op, Alloc):
-        return {
-            "op": "alloc",
-            "name": op.name,
-            "dtype": op.dtype,
-            "shape": list(op.shape) if op.shape else None,
-            "space": op.space,
-            "init": _expr_to_dict(op.init) if op.init else None,
-        }
-    if isinstance(op, Load):
-        return {
-            "op": "load",
-            "dst": op.dst,
-            "src": op.src,
-            "indices": _expr_to_dict(op.indices),
-            "space": op.space,
-            "guard": _expr_to_dict(op.guard) if op.guard else None,
-        }
-    if isinstance(op, Store):
-        return {
-            "op": "store",
-            "dst": op.dst,
-            "indices": _expr_to_dict(op.indices),
-            "value": _expr_to_dict(op.value),
-            "space": op.space,
-            "guard": _expr_to_dict(op.guard) if op.guard else None,
-            "atomic": op.atomic,
-        }
-    if isinstance(op, Compute):
-        return {
-            "op": "compute",
-            "dst": op.dst,
-            "fn": op.op,
-            "args": [_expr_to_dict(a) for a in op.args],
-        }
-    if isinstance(op, Accumulate):
-        return {
-            "op": "accumulate",
-            "dst": op.dst,
-            "fn": op.op,
-            "value": _expr_to_dict(op.value),
-        }
-    if isinstance(op, WarpReduce):
-        return {"op": "warp_reduce", "var": op.var, "fn": op.op}
-    if isinstance(op, Barrier):
-        return {"op": "barrier"}
-    if isinstance(op, Guard):
-        return {
-            "op": "guard",
-            "cond": _expr_to_dict(op.cond),
-            "body": [_op_to_dict(c) for c in op.body],
-        }
-    if isinstance(op, RawLoopOp):
-        return {"op": "raw", "code": op.code, "comment": op.comment}
-    return {"op": "unknown", "type": type(op).__name__}
-
-
-def _expr_to_dict(expr: LoopExpr) -> dict:
-    """Serialize a LoopExpr."""
-    if isinstance(expr, LoopVar):
-        return {"expr": "var", "name": expr.name}
-    if isinstance(expr, LoopLiteral):
-        return {"expr": "literal", "value": expr.value, "dtype": expr.dtype}
-    if isinstance(expr, LoopBinOp):
-        return {
-            "expr": "binop",
-            "op": expr.op,
-            "left": _expr_to_dict(expr.left),
-            "right": _expr_to_dict(expr.right),
-        }
-    if isinstance(expr, LoopBuiltin):
-        return {"expr": "builtin", "name": expr.name}
-    if isinstance(expr, LoopFuncCall):
-        return {
-            "expr": "call",
-            "name": expr.name,
-            "args": [_expr_to_dict(a) for a in expr.args],
-        }
-    if isinstance(expr, LoopTernary):
-        return {
-            "expr": "ternary",
-            "cond": _expr_to_dict(expr.cond),
-            "if_true": _expr_to_dict(expr.if_true),
-            "if_false": _expr_to_dict(expr.if_false),
-        }
-    return {"expr": "unknown"}
+    d = _serialize(program)
+    # params are tuples serialized as lists; convert to list-of-dicts.
+    d["params"] = [{"dtype": p[0], "name": p[1]} for p in program.params]
+    return d
