@@ -14,19 +14,90 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
+# Expression operator overloading mixin
+# ---------------------------------------------------------------------------
+
+
+class _ExprOps:
+    """Mixin that adds arithmetic and comparison operators to LoopExpr nodes.
+
+    Returns LoopBinOp nodes, enabling::
+
+        Var("row") * Var("cols") + Var("j")   # → LoopBinOp("+", LoopBinOp("*", ...), ...)
+        Var("i") < Var("n")                    # → LoopBinOp("<", ...)
+    """
+
+    def __add__(self, other: LoopExpr) -> LoopBinOp:
+        return LoopBinOp("+", self, _coerce(other))
+
+    def __radd__(self, other: LoopExpr) -> LoopBinOp:
+        return LoopBinOp("+", _coerce(other), self)
+
+    def __sub__(self, other: LoopExpr) -> LoopBinOp:
+        return LoopBinOp("-", self, _coerce(other))
+
+    def __rsub__(self, other: LoopExpr) -> LoopBinOp:
+        return LoopBinOp("-", _coerce(other), self)
+
+    def __mul__(self, other: LoopExpr) -> LoopBinOp:
+        return LoopBinOp("*", self, _coerce(other))
+
+    def __rmul__(self, other: LoopExpr) -> LoopBinOp:
+        return LoopBinOp("*", _coerce(other), self)
+
+    def __truediv__(self, other: LoopExpr) -> LoopBinOp:
+        return LoopBinOp("/", self, _coerce(other))
+
+    def __mod__(self, other: LoopExpr) -> LoopBinOp:
+        return LoopBinOp("%", self, _coerce(other))
+
+    def __neg__(self) -> LoopBinOp:
+        return LoopBinOp("-", LoopLiteral(0, "int"), self)
+
+    def lt(self, other: LoopExpr) -> LoopBinOp:
+        """Less-than (``<``). Named method to avoid __lt__ conflict with dataclass ordering."""
+        return LoopBinOp("<", self, _coerce(other))
+
+    def ge(self, other: LoopExpr) -> LoopBinOp:
+        """Greater-or-equal (``>=``)."""
+        return LoopBinOp(">=", self, _coerce(other))
+
+    def eq(self, other: LoopExpr) -> LoopBinOp:
+        """Equal (``==``). Named method to avoid __eq__ conflict with dataclass equality."""
+        return LoopBinOp("==", self, _coerce(other))
+
+    def and_(self, other: LoopExpr) -> LoopBinOp:
+        """Logical AND (``&&``)."""
+        return LoopBinOp("&&", self, _coerce(other))
+
+    def or_(self, other: LoopExpr) -> LoopBinOp:
+        """Logical OR (``||``)."""
+        return LoopBinOp("||", self, _coerce(other))
+
+
+def _coerce(v: LoopExpr | int | float) -> LoopExpr:
+    """Coerce Python int/float to LoopLiteral for operator overloading."""
+    if isinstance(v, int):
+        return LoopLiteral(v, "int")
+    if isinstance(v, float):
+        return LoopLiteral(v)
+    return v
+
+
+# ---------------------------------------------------------------------------
 # Expressions
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class LoopVar:
+class LoopVar(_ExprOps):
     """Variable reference."""
 
     name: str
 
 
 @dataclass
-class LoopLiteral:
+class LoopLiteral(_ExprOps):
     """Numeric constant."""
 
     value: int | float
@@ -34,7 +105,7 @@ class LoopLiteral:
 
 
 @dataclass
-class LoopBinOp:
+class LoopBinOp(_ExprOps):
     """Binary operation."""
 
     op: str  # "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "&&", "||"
@@ -43,14 +114,14 @@ class LoopBinOp:
 
 
 @dataclass
-class LoopBuiltin:
+class LoopBuiltin(_ExprOps):
     """GPU built-in variable (threadIdx.x, blockIdx.y, blockDim.x, etc.)."""
 
     name: str
 
 
 @dataclass
-class LoopFuncCall:
+class LoopFuncCall(_ExprOps):
     """Intrinsic / math function call."""
 
     name: str  # "expf", "rsqrtf", "fmaxf", etc.
@@ -58,7 +129,7 @@ class LoopFuncCall:
 
 
 @dataclass
-class LoopTernary:
+class LoopTernary(_ExprOps):
     """Ternary expression: cond ? if_true : if_false."""
 
     cond: LoopExpr
@@ -67,7 +138,7 @@ class LoopTernary:
 
 
 @dataclass
-class RegAccess:
+class RegAccess(_ExprOps):
     """Compile-time indexed access into a register array.
 
     The array must have been declared via ``Alloc(name, ..., space="reg",
