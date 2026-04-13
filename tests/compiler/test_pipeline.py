@@ -88,6 +88,58 @@ def test_matmul_k_dimension_inferred_correctly():
     assert k == 2048, f"K should be 2048 (shared dim), got {k}"
 
 
+def test_contraction_softmax_large_n_splits():
+    """Contraction + softmax with N > tile_n (128) produces multiple launches.
+
+    When the attention dimension exceeds the tile width, the backend can't
+    fuse softmax into the matmul epilogue. It should split into separate
+    matmul + softmax kernel launches instead of emitting undefined symbols.
+    """
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.cuda.program import generate_source
+    from deplodock.compiler.fusion import auto_fuse
+    from deplodock.compiler.ops import ConstantOp
+
+    # Build QK^T + softmax: matmul(Q, K^T) → scale → softmax.
+    # N = 512 > tile_n = 128, so the softmax can't be fused in-CTA.
+    seq_len = 512
+    head_dim = 64
+    g = Graph()
+    q = g.add_node(op=InputOp(), inputs=[], output=Tensor("Q", (seq_len, head_dim)), node_id="Q")
+    k = g.add_node(op=InputOp(), inputs=[], output=Tensor("K", (head_dim, seq_len)), node_id="K")
+    g.inputs = [q, k]
+
+    # QK^T: matmul(Q, K) = mul + reduce_sum.
+    ew = g.add_node(op=ElementwiseOp(fn="mul"), inputs=[q, k], output=Tensor("QK_ew", (seq_len, head_dim, seq_len)), node_id="ew")
+    red = g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=[ew], output=Tensor("QK", (seq_len, seq_len)), node_id="red")
+
+    # Scale by constant.
+    scale = g.add_node(op=ConstantOp(name="scale"), inputs=[], output=Tensor("scale", (1,)), node_id="scale")
+    scaled = g.add_node(op=ElementwiseOp(fn="mul"), inputs=[red, scale], output=Tensor("scaled", (seq_len, seq_len)), node_id="scaled")
+
+    # Softmax: max → sub → exp → sum → div.
+    mx = g.add_node(op=ReduceOp(fn="max", axis=-1), inputs=[scaled], output=Tensor("mx", (seq_len, 1)), node_id="mx")
+    sub = g.add_node(op=ElementwiseOp(fn="sub"), inputs=[scaled, mx], output=Tensor("sub", (seq_len, seq_len)), node_id="sub")
+    exp = g.add_node(op=ElementwiseOp(fn="exp"), inputs=[sub], output=Tensor("exp", (seq_len, seq_len)), node_id="exp")
+    sm = g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=[exp], output=Tensor("sm", (seq_len, 1)), node_id="sm")
+    out = g.add_node(op=ElementwiseOp(fn="div"), inputs=[exp, sm], output=Tensor("out", (seq_len, seq_len)), node_id="out")
+    g.outputs = [out]
+
+    # Fuse and compile.
+    fused = auto_fuse(g)
+    plan = plan_graph(fused)
+
+    backend = CudaBackend()
+    program = backend.compile(plan)
+
+    # Should have multiple launches (matmul + softmax, not a single broken kernel).
+    assert len(program.launches) >= 2, f"Expected >= 2 launches (matmul + softmax), got {len(program.launches)}"
+
+    # Generated source should be valid (no undefined identifiers).
+    source = generate_source(program, mode="run")
+    assert "int main()" in source
+
+
 @requires_cuda
 def test_pipeline_end_to_end(dump_dir):
     """Full pipeline: graph → fuse → plan → CudaBackend → GPU."""

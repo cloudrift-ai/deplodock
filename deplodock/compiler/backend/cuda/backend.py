@@ -54,8 +54,7 @@ class CudaBackend(Backend):
                     target = aliases[target]
                 aliases[op.outputs[0]] = target
                 continue
-            launch = _compile_op(op)
-            launches.append(launch)
+            launches.extend(_compile_op(op))
 
         return Program(
             name=plan.name,
@@ -476,16 +475,161 @@ def _grid_for_reduce(op: OpKernel, block_x: int) -> tuple[tuple, tuple, list[str
     return (rows, 1, 1), (block_x, 1, 1), [str(rows), str(cols)]
 
 
-def _compile_fused_region(op: OpKernel) -> CudaLaunch:
+def _split_contraction_softmax(op: OpKernel, analysis) -> list[CudaLaunch] | None:
+    """Split a contraction+softmax region when N > tile_n.
+
+    The fused softmax epilogue only works when all columns fit in one CTA
+    (N <= tile_n = 128). When N exceeds this, split into:
+      1. Matmul kernel (contraction core only, no epilogue)
+      2. Softmax kernel (scale + max + sub + exp + sum + div)
+
+    The matmul writes to the output buffer, and the softmax reads from /
+    writes back to the same buffer (in-place).
+
+    Returns None if the region doesn't need splitting.
+    """
+    phases = analysis.op_phases
+    tile_n = 128
+
+    # Only split when: contraction + multi-reduce + N > tile_n.
+    if len(phases.reduces) <= 1 or analysis.cols <= tile_n:
+        return None
+
+    from deplodock.compiler.ops import ReduceOp
+
+    region_ops = op.params.get("_region_ops", [])
+    if len(region_ops) < 3:
+        return None
+
+    # Find the contraction boundary: first 2 ops are mul + reduce_sum.
+    contraction_reduce_id = region_ops[1][0]
+
+    # --- Launch 1: Matmul core (just mul + reduce_sum) ---
+    matmul_op = OpKernel(
+        op="fused_region",
+        inputs=list(op.inputs[:2]),  # A, B only
+        outputs=list(op.outputs),
+        params={
+            **op.params,
+            "_region_ops": list(region_ops[:2]),
+        },
+    )
+    matmul_launch = _compile_fused_region_single(matmul_op)
+
+    # --- Launch 2: Softmax (remaining ops, in-place on matmul output) ---
+    # Collect remaining ops (everything after the contraction reduce).
+    softmax_ops = list(region_ops[2:])
+    out_buf = op.outputs[0]
+
+    # Remap: replace contraction reduce ID with the output buffer name
+    # so the softmax kernel reads from the actual allocated buffer.
+    remapped_ops = []
+    for nid, sop, inp_ids in softmax_ops:
+        new_inputs = [out_buf if inp == contraction_reduce_id else inp for inp in inp_ids]
+        remapped_ops.append((nid, sop, new_inputs))
+
+    # Collect external inputs for the softmax kernel.
+    internal_ids = {nid for nid, _, _ in remapped_ops}
+    softmax_inputs = [out_buf]
+    for _, _, inp_ids in remapped_ops:
+        for inp in inp_ids:
+            if inp not in internal_ids and inp not in softmax_inputs:
+                softmax_inputs.append(inp)
+
+    # Build shapes for the softmax kernel.
+    input_shapes = op.params.get("_input_shapes", {})
+    out_shape = op.params.get("shape", (1,))
+    softmax_shapes = {out_buf: out_shape}
+    for inp in softmax_inputs:
+        if inp in input_shapes:
+            softmax_shapes[inp] = input_shapes[inp]
+        elif inp == out_buf:
+            softmax_shapes[inp] = out_shape
+
+    # Intermediate shapes from the original region.
+    orig_shapes = op.params.get("_shapes", {})
+    for nid, sop, _ in remapped_ops:
+        if isinstance(sop, ReduceOp):
+            # Row reductions produce (rows, 1) — keep last dim as 1.
+            softmax_shapes[nid] = out_shape[:-1] + (1,)
+        elif nid in orig_shapes:
+            softmax_shapes[nid] = orig_shapes[nid]
+        else:
+            softmax_shapes[nid] = out_shape
+
+    softmax_op = OpKernel(
+        op="fused_region",
+        inputs=softmax_inputs,
+        outputs=[out_buf],
+        params={
+            "_region_ops": remapped_ops,
+            "_input_names": softmax_inputs,
+            "_output_names": [out_buf],
+            "_input_shapes": {inp: softmax_shapes.get(inp, (1,)) for inp in softmax_inputs},
+            "_shapes": softmax_shapes,
+            "shape": out_shape,
+        },
+    )
+    softmax_launch = _compile_fused_region_single(softmax_op)
+
+    return [matmul_launch, softmax_launch]
+
+
+def _compile_fused_region(op: OpKernel) -> list[CudaLaunch]:
     """Compile a FusedRegionOp via the unified analysis → tiled generator path.
 
     For contractions with non-naive hints (TMA strategies), falls back to
     the dedicated matmul path which supports TMA descriptors.
+
+    Returns a list of CudaLaunch objects (usually one, but multi-reduce
+    contractions with N > tile_n are split into matmul + softmax).
     """
     source = op.params.get("kernel_source", "")
     if source:
         # Pre-generated source (from _compile_singleton) — use regex-based path.
-        return _compile_fused_region_from_source(op, source)
+        return [_compile_fused_region_from_source(op, source)]
+
+    region_ops = op.params.get("_region_ops", [])
+    if not region_ops:
+        name = _unique_name("fused_region")
+        src = f"__global__ void {name}() {{}}"
+        return [CudaLaunch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])]
+
+    # Try the dedicated matmul path first (handles TMA, k_splits, tuning).
+    matmul_launch = _dispatch_to_matmul(op)
+    if matmul_launch is not None:
+        return [matmul_launch]
+
+    from deplodock.compiler.backend.cuda.generators.analysis import analyze
+
+    region, shapes = _build_region_and_shapes(op)
+    analysis = analyze(region, shapes)
+
+    # Contraction + multi-reduce (softmax) with N > tile_n: split into
+    # separate matmul + softmax launches since the fused epilogue requires
+    # all columns to fit in one CTA.
+    if analysis.pattern == "contraction":
+        split = _split_contraction_softmax(op, analysis)
+        if split is not None:
+            return split
+
+        # Standard contraction — compile as single matmul kernel.
+        op.params["M"] = analysis.rows
+        op.params["N"] = analysis.cols
+        op.params["K"] = analysis.k_dim
+        if analysis.batch_size > 1:
+            op.params["batch_size"] = analysis.batch_size
+            op.params["batch_dims"] = analysis.batch_dims
+        return [_compile_matmul(op)]
+
+    return [_compile_fused_region_single(op)]
+
+
+def _compile_fused_region_single(op: OpKernel) -> CudaLaunch:
+    """Compile a single (non-split) fused region through the unified path."""
+    from deplodock.compiler.backend.codegen import emit_kernel
+    from deplodock.compiler.backend.cuda.generators.analysis import analyze
+    from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
 
     region_ops = op.params.get("_region_ops", [])
     if not region_ops:
@@ -493,19 +637,14 @@ def _compile_fused_region(op: OpKernel) -> CudaLaunch:
         src = f"__global__ void {name}() {{}}"
         return CudaLaunch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])
 
-    # Try the dedicated matmul path first (handles TMA, k_splits, tuning).
+    # Check for matmul pattern.
     matmul_launch = _dispatch_to_matmul(op)
     if matmul_launch is not None:
         return matmul_launch
 
-    from deplodock.compiler.backend.codegen import emit_kernel
-    from deplodock.compiler.backend.cuda.generators.analysis import analyze
-    from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
-
     region, shapes = _build_region_and_shapes(op)
     analysis = analyze(region, shapes)
 
-    # ALL contraction patterns go through _compile_matmul (handles TMA, k_splits, tuning).
     if analysis.pattern == "contraction":
         op.params["M"] = analysis.rows
         op.params["N"] = analysis.cols
@@ -521,7 +660,13 @@ def _compile_fused_region(op: OpKernel) -> CudaLaunch:
     source = emit_kernel(kernel_def)
 
     bx, by, bz = kernel_def.block_size
-    buffer_args = [*op.inputs, *op.outputs]
+    # Build buffer args matching kernel param order: inputs-not-in-outputs
+    # first, then outputs. This mirrors the param deduplication in tiled.py
+    # where in-place buffers (appearing in both inputs and outputs) are
+    # emitted only as float* (read-write) in the output position.
+    output_set = set(op.outputs)
+    buffer_args = [inp for inp in op.inputs if inp not in output_set]
+    buffer_args.extend(op.outputs)
 
     if analysis.pattern == "pointwise":
         grid, block, scalar_args = _grid_for_pointwise(analysis, bx)
@@ -555,7 +700,13 @@ def _compile_fused_region_from_source(op: OpKernel, source: str) -> CudaLaunch:
     else:
         param_count = 0
 
-    buffer_args = [*op.inputs, *op.outputs]
+    # Build buffer args matching kernel param order: inputs-not-in-outputs
+    # first, then outputs. This mirrors the param deduplication in tiled.py
+    # where in-place buffers (appearing in both inputs and outputs) are
+    # emitted only as float* (read-write) in the output position.
+    output_set = set(op.outputs)
+    buffer_args = [inp for inp in op.inputs if inp not in output_set]
+    buffer_args.extend(op.outputs)
     scalar_count = param_count - len(buffer_args)
 
     out_shape = op.params.get("shape", (1,))
@@ -602,11 +753,11 @@ def _compile_fused_region_from_source(op: OpKernel, source: str) -> CudaLaunch:
     return CudaLaunch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args)
 
 
-def _compile_singleton(op: OpKernel) -> CudaLaunch:
-    """Compile an unfused elementwise/reduce op by wrapping it as a FusedRegionOp.
+def _compile_singleton(op: OpKernel) -> None:
+    """Prepare an unfused elementwise/reduce op for the fused region path.
 
-    Sets up _region_ops, _input_names, _output_names, and _shapes so
-    _compile_fused_region can handle it through the unified path.
+    Sets up _region_ops, _input_names, _output_names, and _shapes on
+    op.params so _compile_fused_region can handle it through the unified path.
     """
     # Reconstruct the op object from the OpKernel tag.
     tag = op.op
@@ -640,22 +791,15 @@ def _compile_singleton(op: OpKernel) -> CudaLaunch:
             shapes[inp] = out_shape
     op.params["_shapes"] = shapes
 
-    return _compile_fused_region(op)
 
+def _compile_op(op: OpKernel) -> list[CudaLaunch]:
+    """Compile a single OpKernel to one or more CUDA launches."""
+    if op.op == "fused_region":
+        return _compile_fused_region(op)
 
-_OP_HANDLERS: dict[str, callable] = {
-    "fused_region": _compile_fused_region,
-}
-
-
-def _compile_op(op: OpKernel) -> CudaLaunch:
-    """Compile a single OpKernel to a CUDA Launch."""
-    handler = _OP_HANDLERS.get(op.op)
-    if handler is not None:
-        return handler(op)
-
-    # Unfused elementwise/reduce ops — wrap in a FusedRegionOp and use kernel_gen.
+    # Unfused elementwise/reduce ops — wrap as a FusedRegionOp first.
     if op.op.startswith("elementwise_") or op.op.startswith("reduce_"):
-        return _compile_singleton(op)
+        _compile_singleton(op)  # sets up _region_ops etc. on op.params
+        return _compile_fused_region(op)
 
-    raise ValueError(f"Unknown op: {op.op!r}. Known ops: {list(_OP_HANDLERS.keys())}")
+    raise ValueError(f"Unknown op: {op.op!r}")
