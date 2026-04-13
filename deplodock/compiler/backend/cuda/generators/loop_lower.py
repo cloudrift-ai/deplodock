@@ -235,8 +235,6 @@ def _emit_scalar_reductions(
     phases = analysis.op_phases
     out_shape = shapes.get(region.output_names[0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
-    has_multi_reduce = len(phases.reduces) > 1
-
     guarded: list = []
 
     # Accumulator allocs were already emitted in phase 2; build var tracking.
@@ -247,62 +245,41 @@ def _emit_scalar_reductions(
 
     var_map: dict[str, LoopExpr] = {}
 
-    if has_multi_reduce:
-        # Multi-reduce: one tile loop per reduce pass (e.g., softmax max → sum)
-        for ri, (node_id, _op, input_ids) in enumerate(phases.reduces):
-            acc_name, fn = reduce_vars[node_id]
-            pass_body: list = []
+    # One tile loop per reduce pass. For single-reduce this is one pass;
+    # for multi-reduce (softmax) it's one per reduce with inter-reduce ops between.
+    for ri, (node_id, _op, input_ids) in enumerate(phases.reduces):
+        acc_name, fn = reduce_vars[node_id]
+        pass_body: list = []
 
-            pass_var_map: dict[str, LoopExpr] = {}
-            for inp in region.input_names:
-                idx = _input_loop_expr(inp, analysis, "j", out_size)
-                load_name = f"r{ri}ld_{_safe(inp)}"
-                pass_body.append(Load(load_name, _safe(inp), idx, "global"))
-                pass_var_map[inp] = Var(load_name)
-
-            for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
-                pass_var_map[prev_nid] = Var(prev_acc)
-
-            all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
-            needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
-            for pid, pop, pinp in phases.prologue:
-                if isinstance(pop, ElementwiseOp) and pid in needed:
-                    a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
-                    b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
-                    var_name = f"r{ri}p_{_safe(pid)}"
-                    pass_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                    pass_var_map[pid] = Var(var_name)
-
-            if ri > 0 and phases.inter_reduce:
-                _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body)
-
-            val = pass_var_map.get(input_ids[0], Literal(0.0))
-            pass_body.append(Accum(acc_name, fn, val))
-
-            guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
-            guarded.append(ShuffleReduce(acc_name, fn))
-            var_map[node_id] = Var(acc_name)
-    else:
-        # Single reduce: one tile loop
-        loop_body: list = []
+        pass_var_map: dict[str, LoopExpr] = {}
         for inp in region.input_names:
             idx = _input_loop_expr(inp, analysis, "j", out_size)
-            load_name = f"ld_{_safe(inp)}"
-            loop_body.append(Load(load_name, _safe(inp), idx, "global"))
-            var_map[inp] = Var(load_name)
+            load_name = f"r{ri}ld_{_safe(inp)}"
+            pass_body.append(Load(load_name, _safe(inp), idx, "global"))
+            pass_var_map[inp] = Var(load_name)
 
-        _emit_loop_ops(phases.prologue, var_map, "p_", loop_body)
+        for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
+            pass_var_map[prev_nid] = Var(prev_acc)
 
-        for node_id, _op, input_ids in phases.reduces:
-            acc_name, fn = reduce_vars[node_id]
-            val = var_map.get(input_ids[0], Literal(0.0))
-            loop_body.append(Accum(acc_name, fn, val))
+        all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
+        needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
+        for pid, pop, pinp in phases.prologue:
+            if isinstance(pop, ElementwiseOp) and pid in needed:
+                a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
+                b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
+                var_name = f"r{ri}p_{_safe(pid)}"
+                pass_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
+                pass_var_map[pid] = Var(var_name)
 
-        guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), loop_body))
+        if ri > 0 and phases.inter_reduce:
+            _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body)
 
-        for node_id, (acc_name, fn) in reduce_vars.items():
-            guarded.append(ShuffleReduce(acc_name, fn))
-            var_map[node_id] = Var(acc_name)
+        val = pass_var_map.get(input_ids[0], Literal(0.0))
+        pass_body.append(Accum(acc_name, fn, val))
+
+        guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
+        guarded.append(ShuffleReduce(acc_name, fn))
+        var_map[node_id] = Var(acc_name)
 
     return [Guard(Var("row").lt(Var("rows")), guarded)]
 
