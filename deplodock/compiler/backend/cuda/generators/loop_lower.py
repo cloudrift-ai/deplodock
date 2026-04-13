@@ -338,10 +338,6 @@ def _emit_epilogue(
         # Contraction register tile epilogue
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4
-        tile_n = schedule.tile_n or 128
-        # Multi-reduce on register tile (contraction+softmax)
-        if len(phases.reduces) > 1 and analysis.cols <= tile_n:
-            return _contraction_softmax_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n)
         return _contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n)
 
     # Scalar reduction epilogue
@@ -986,17 +982,85 @@ def _contraction_epilogue_ops(
     thread_m: int,
     thread_n: int,
 ) -> list:
-    """Generate LoopIR ops for contraction epilogue (bias, activation, etc.).
+    """Generate LoopIR ops for contraction epilogue on the register tile.
 
-    Operates on the register array ``c[r][c]`` in-place.  Delegates to
-    ``_apply_ops_on_register_tile`` which handles any elementwise op.
+    Handles both simple epilogues (bias, activation) and multi-reduce
+    epilogues (softmax: inter_reduce ops + WarpShuffleXor between reduces).
+    Walks phases generically — no pattern-specific checks.
+
+    Structure:
+    1. For each inter_reduce group: apply ops on tile, then per-row
+       WarpShuffleXor for the corresponding reduce
+    2. Apply epilogue ops on tile (referencing reduce results as per-row vars)
     """
-    if not phases.epilogue:
+    ops: list = []
+    input_set = set(input_names)
+    has_inter = bool(phases.inter_reduce)
+
+    if not has_inter and not phases.epilogue:
         return []
 
+    # Track the "previous" node ID through the op chain.
     prev_id = phases.reduces[0][0]
-    input_set = set(input_names)
-    return _apply_ops_on_register_tile(phases.epilogue, prev_id, shapes, input_set, thread_m, thread_n, "ep")
+
+    # Per-row reduce result variables: reduce_node_id → "rXXX{r}" template
+    reduce_row_vars: dict[str, str] = {}
+
+    # Process inter-reduce groups: ops between consecutive reduces.
+    # inter_reduce[i] holds ops between reduces[i] and reduces[i+1].
+    for ri, inter_ops in enumerate(phases.inter_reduce):
+        # The reduce that follows this inter-group (reduces[ri+1])
+        reduce_node_id = phases.reduces[ri + 1][0]
+        reduce_fn = phases.reduces[ri + 1][1].fn
+
+        # Apply inter-reduce ops on the register tile
+        ops.extend(
+            _apply_ops_on_register_tile(inter_ops, prev_id, shapes, input_set, thread_m, thread_n, f"ir{ri}", extra_vars=reduce_row_vars)
+        )
+        prev_id = inter_ops[-1][0] if inter_ops else prev_id
+
+        # Per-row reduce via WarpShuffleXor
+        init_val = Literal(-1e30) if reduce_fn == "max" else Literal(0.0)
+        acc_fn = "fmaxf" if reduce_fn == "max" else None  # sum uses Accumulate
+
+        for r in range(thread_m):
+            rvar = f"r{reduce_fn}{r}"
+            ops.append(Alloc(rvar, "float", None, "reg", init_val))
+            for c in range(thread_n):
+                col_c = Var("bn") + Var("tc") + c
+                if acc_fn:
+                    ops.append(Guard(col_c.lt(Var("N")), [SetVar(rvar, FuncCall(acc_fn, [Var(rvar), RegAccess("c", [r, c])]))]))
+                else:
+                    ops.append(Guard(col_c.lt(Var("N")), [Accumulate(rvar, reduce_fn, RegAccess("c", [r, c]))]))
+            ops.append(WarpShuffleXor(rvar, reduce_fn))
+
+        reduce_row_vars[reduce_node_id] = f"r{reduce_fn}{{r}}"
+
+    # Apply epilogue ops on the register tile.
+    if phases.epilogue:
+        if reduce_row_vars:
+            # Epilogue references reduce results as per-row variables.
+            # Apply per-element with column guard.
+            epi_prev = prev_id
+            for r in range(thread_m):
+                for c in range(thread_n):
+                    col_c = Var("bn") + Var("tc") + c
+                    # Resolve per-row vars for this specific row
+                    row_extra = {k: v.format(r=r) for k, v in reduce_row_vars.items()}
+                    epi_ops = _apply_ops_on_register_tile(
+                        phases.epilogue, epi_prev, shapes, input_set, 1, 1, f"ep_{r}_{c}", extra_vars=row_extra
+                    )
+                    fixed: list = []
+                    for tile_op in epi_ops:
+                        if isinstance(tile_op, SetVar) and tile_op.name == "c00":
+                            tile_op = SetVar(f"c{r}{c}", _fixup_reg_refs_expr(tile_op.expr, 0, 0, r, c))
+                        fixed.append(tile_op)
+                    ops.append(Guard(col_c.lt(Var("N")), fixed))
+        else:
+            # Simple epilogue (no inter-reduces): apply directly on full tile
+            ops.extend(_apply_ops_on_register_tile(phases.epilogue, prev_id, shapes, input_set, thread_m, thread_n, "ep"))
+
+    return ops
 
 
 def _apply_ops_on_register_tile(
@@ -1070,113 +1134,6 @@ def _apply_ops_on_register_tile(
                     ops.append(SetVar(dst, OpCall(fn, [acc])))
 
         prev_id = nid
-
-    return ops
-
-
-def _contraction_softmax_epilogue_ops(
-    phases,
-    shapes: dict[str, tuple],
-    input_names: list[str],
-    thread_m: int,
-    thread_n: int,
-) -> list:
-    """Generate LoopIR ops for fused contraction+softmax epilogue.
-
-    After the K-loop, accumulators c[r][c] hold matmul scores. This emits:
-    1. Apply inter_reduce[0] ops on register tile
-    2. Row max via WarpShuffleXor across threadIdx.x
-    3. Apply inter_reduce[1] ops + row sum via WarpShuffleXor
-    4. Apply epilogue ops on register tile
-
-    Only valid when N <= tile_n (all columns in one CTA).
-    """
-    ops: list = []
-    input_set = set(input_names)
-
-    # Phase 0: apply inter_reduce[0] ops (e.g. scale) on register tile.
-    if phases.inter_reduce:
-        prev_id = phases.reduces[0][0]
-        ops.extend(_apply_ops_on_register_tile(phases.inter_reduce[0], prev_id, shapes, input_set, thread_m, thread_n, "sc"))
-
-    # Phase 1: row max via WarpShuffleXor.
-    for r in range(thread_m):
-        rmax = f"rmax{r}"
-        ops.append(Alloc(rmax, "float", None, "reg", Literal(-1e30)))
-        for c in range(thread_n):
-            col_c = Var("bn") + Var("tc") + c
-            ops.append(
-                Guard(
-                    col_c.lt(Var("N")),
-                    [SetVar(rmax, FuncCall("fmaxf", [Var(rmax), RegAccess("c", [r, c])]))],
-                )
-            )
-        ops.append(WarpShuffleXor(rmax, "max"))
-
-    # Phase 2: apply inter_reduce[1] ops + accumulate row sum.
-    if len(phases.inter_reduce) > 1:
-        # Build extra_vars: the max reduce result is available as rmax{r}
-        max_id = phases.reduces[1][0]  # the max reduce node_id
-        # The inter_reduce[1] ops reference the max reduce output (prev reduce)
-        # and the scaled scores (inter_reduce[0] output). The "prev_id" for
-        # inter_reduce[1] is the last node of inter_reduce[0] or reduces[0].
-        ir1_prev = phases.inter_reduce[0][-1][0] if phases.inter_reduce[0] else phases.reduces[0][0]
-
-        for r in range(thread_m):
-            rsum = f"rsum{r}"
-            rmax = f"rmax{r}"
-            ops.append(Alloc(rsum, "float", None, "reg", Literal(0.0)))
-            for c in range(thread_n):
-                col_c = Var("bn") + Var("tc") + c
-                guarded: list = []
-
-                # Apply inter_reduce[1] ops generically, with rmax as extra var
-                tile_ops = _apply_ops_on_register_tile(
-                    phases.inter_reduce[1],
-                    ir1_prev,
-                    shapes,
-                    input_set,
-                    1,  # single row
-                    1,  # single col
-                    f"ir1_{r}_{c}",
-                    extra_vars={max_id: rmax},
-                )
-                # Fixup: the helper emits c00 for (0,0), but we need c{r}{c}
-                for tile_op in tile_ops:
-                    if isinstance(tile_op, SetVar) and tile_op.name == "c00":
-                        tile_op = SetVar(f"c{r}{c}", _fixup_reg_refs_expr(tile_op.expr, 0, 0, r, c))
-                    guarded.append(tile_op)
-
-                guarded.append(Accumulate(rsum, "sum", RegAccess("c", [r, c])))
-                ops.append(Guard(col_c.lt(Var("N")), guarded))
-            ops.append(WarpShuffleXor(rsum, "sum"))
-
-    # Phase 3: apply epilogue ops generically.
-    # The epilogue references the sum reduce output as per-row rsum{r}.
-    if phases.epilogue:
-        sum_id = phases.reduces[2][0] if len(phases.reduces) > 2 else phases.reduces[-1][0]
-        epi_prev = phases.inter_reduce[-1][-1][0] if phases.inter_reduce and phases.inter_reduce[-1] else phases.reduces[-1][0]
-
-        for r in range(thread_m):
-            rsum = f"rsum{r}"
-            for c in range(thread_n):
-                col_c = Var("bn") + Var("tc") + c
-                epi_ops = _apply_ops_on_register_tile(
-                    phases.epilogue,
-                    epi_prev,
-                    shapes,
-                    input_set,
-                    1,
-                    1,
-                    f"ep_{r}_{c}",
-                    extra_vars={sum_id: rsum},
-                )
-                fixed: list = []
-                for tile_op in epi_ops:
-                    if isinstance(tile_op, SetVar) and tile_op.name == "c00":
-                        tile_op = SetVar(f"c{r}{c}", _fixup_reg_refs_expr(tile_op.expr, 0, 0, r, c))
-                    fixed.append(tile_op)
-                ops.append(Guard(col_c.lt(Var("N")), fixed))
 
     return ops
 
@@ -1301,10 +1258,7 @@ def _lower_contraction_naive(
 
     # Epilogue — proper LoopIR with register arrays
     phases = analysis.op_phases
-    if len(phases.reduces) > 1 and analysis.cols <= tile_n:
-        body.extend(_contraction_softmax_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
-    else:
-        body.extend(_contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
+    body.extend(_contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
 
     # Write — proper LoopIR with register arrays
     body.extend(_contraction_write_ops(out_id, thread_m, thread_n, is_batched, k_splits))
@@ -1386,10 +1340,7 @@ def _lower_contraction_tma(
     )
 
     # Epilogue — proper LoopIR (softmax or standard)
-    if len(phases.reduces) > 1 and analysis.cols <= tile_n:
-        body.extend(_contraction_softmax_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
-    else:
-        body.extend(_contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
+    body.extend(_contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n))
 
     # Write — proper LoopIR with register arrays
     body.extend(_contraction_write_ops(out_id, thread_m, thread_n, is_batched, k_splits))
