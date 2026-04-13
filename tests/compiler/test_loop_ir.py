@@ -20,9 +20,9 @@ from deplodock.compiler.backend.ir.loop_ir import (
     OpCall,
     ParallelAxis,
     RawLoopOp,
+    ShuffleReduce,
     Store,
     Var,
-    WarpReduce,
     pretty_print,
     to_dict,
 )
@@ -86,7 +86,7 @@ def test_pretty_print_pointwise():
 
 
 def test_pretty_print_reduce():
-    """Pretty-print a reduce program with WarpReduce."""
+    """Pretty-print a reduce program with ShuffleReduce."""
     prog = LoopProgram(
         name="sum_kernel",
         params=[("const float*", "X"), ("float*", "Y"), ("int", "rows"), ("int", "cols")],
@@ -106,7 +106,7 @@ def test_pretty_print_reduce():
                             Accum("acc", "sum", Var("v")),
                         ],
                     ),
-                    WarpReduce("acc", "sum"),
+                    ShuffleReduce("acc", "sum"),
                 ],
             ),
         ],
@@ -116,7 +116,7 @@ def test_pretty_print_reduce():
     assert "alloc reg float acc" in text
     assert "for j" in text
     assert "accum acc sum" in text
-    assert "warp_reduce acc sum" in text
+    assert "shuffle_reduce acc sum" in text
 
 
 def test_pretty_print_contraction():
@@ -227,7 +227,7 @@ def test_pointwise_structure():
 
 
 def test_single_reduce_structure():
-    """Row reduce has: ParallelAxis + Alloc + LoopNest + WarpReduce."""
+    """Row reduce has: ParallelAxis + Alloc + LoopNest + ShuffleReduce."""
     rows, cols = 4, 8
     region, analysis = _make_region_and_analysis(
         region_ops=[("red", ReduceOp("sum", axis=1), ["x"])],
@@ -242,13 +242,13 @@ def test_single_reduce_structure():
     assert any(a.name.startswith("acc_") for a in accum_inits)
     loops = _find_ops(prog.body, LoopNest)
     assert len(loops) >= 1
-    reduces = _find_ops(prog.body, WarpReduce)
+    reduces = _find_ops(prog.body, ShuffleReduce)
     assert len(reduces) == 1
     assert reduces[0].op == "sum"
 
 
 def test_multi_reduce_structure():
-    """Multi-reduce (softmax) has multiple WarpReduce passes."""
+    """Multi-reduce (softmax) has multiple ShuffleReduce passes."""
     rows, cols = 4, 8
     region, analysis = _make_region_and_analysis(
         region_ops=[
@@ -276,7 +276,7 @@ def test_multi_reduce_structure():
         analysis,
     )
 
-    reduces = _find_ops(prog.body, WarpReduce)
+    reduces = _find_ops(prog.body, ShuffleReduce)
     assert len(reduces) == 2  # max + sum
     assert reduces[0].op == "max"
     assert reduces[1].op == "sum"

@@ -32,11 +32,10 @@ from deplodock.compiler.backend.ir.loop_ir import (
     ParallelAxis,
     RegAccess,
     SetVar,
+    ShuffleReduce,
     Store,
     Ternary,
     Var,
-    WarpReduce,
-    WarpShuffleXor,
 )
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReshapeOp, TransposeOp
 
@@ -281,7 +280,7 @@ def _emit_scalar_reductions(
             pass_body.append(Accum(acc_name, fn, val))
 
             guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
-            guarded.append(WarpReduce(acc_name, fn))
+            guarded.append(ShuffleReduce(acc_name, fn))
             var_map[node_id] = Var(acc_name)
     else:
         # Single reduce: one tile loop
@@ -302,7 +301,7 @@ def _emit_scalar_reductions(
         guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), loop_body))
 
         for node_id, (acc_name, fn) in reduce_vars.items():
-            guarded.append(WarpReduce(acc_name, fn))
+            guarded.append(ShuffleReduce(acc_name, fn))
             var_map[node_id] = Var(acc_name)
 
     return [Guard(Var("row").lt(Var("rows")), guarded)]
@@ -808,7 +807,7 @@ def _lower_single_reduce(
 
     # Warp reduce
     for node_id, (acc_name, fn) in reduce_vars.items():
-        guarded.append(WarpReduce(acc_name, fn))
+        guarded.append(ShuffleReduce(acc_name, fn))
         var_map[node_id] = Var(acc_name)
 
     # Epilogue
@@ -947,7 +946,7 @@ def _lower_multi_reduce(
         guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
 
         # Warp shuffle after each pass
-        guarded.append(WarpReduce(acc_name, fn))
+        guarded.append(ShuffleReduce(acc_name, fn))
         var_map[node_id] = Var(acc_name)
 
     # Final epilogue pass
@@ -1104,7 +1103,7 @@ def _contraction_epilogue_ops(
             for c in range(thread_n):
                 col_c = Var("bn") + Var("tc") + c
                 ops.append(Guard(col_c.lt(Var("N")), [Accum(rvar, reduce_fn, RegAccess("c", [r, c]))]))
-            ops.append(WarpShuffleXor(rvar, reduce_fn))
+            ops.append(ShuffleReduce(rvar, reduce_fn, kind="warp_xor"))
 
         reduce_row_vars[reduce_node_id] = f"r{reduce_fn}{{r}}"
 
