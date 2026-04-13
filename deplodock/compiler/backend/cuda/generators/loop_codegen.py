@@ -45,14 +45,20 @@ from deplodock.compiler.backend.ir.loop_ir import (
     RawLoopOp,
     RegAccess,
     SetVar,
+    SmemPipelineKLoop,
     Store,
     WarpReduce,
     WarpShuffleXor,
 )
 
+# Module-level context for TMA config, set by loop_ir_to_kernel.
+_active_tma_config = None
+
 
 def loop_ir_to_kernel(program: LoopProgram) -> KernelDef:
     """Translate a LoopProgram into a KernelDef."""
+    global _active_tma_config  # noqa: PLW0603
+    _active_tma_config = program.tma_config
     params = [KernelParam(dtype, name) for dtype, name in program.params]
     body = _lower_ops(program.body)
 
@@ -279,11 +285,11 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
     if isinstance(op, RawLoopOp):
         return [RawCode(op.code)]
 
-    # CUDA-specific extension: TMA ops
-    from deplodock.compiler.backend.cuda.tma_ops import TMAKLoop
-
-    if isinstance(op, TMAKLoop):
-        return [RawCode(_emit_tma_k_loop(op))]
+    if isinstance(op, SmemPipelineKLoop):
+        # CUDA codegen: use TMA + mbarrier if tma_config is available.
+        # The tma_config is passed via _lower_op_context (module-level state
+        # set by loop_ir_to_kernel before lowering).
+        return [RawCode(_emit_tma_pipeline(op, _active_tma_config))]
 
     msg = f"Unknown LoopOp type: {type(op)}"
     raise TypeError(msg)
@@ -365,11 +371,15 @@ def _emit_warp_reduce(acc_var: str, fn: str) -> list[Stmt]:
     return stmts
 
 
-def _emit_tma_k_loop(op) -> str:
-    """Generate the TMA double-buffered K-loop C code from structured TMAKLoop parameters."""
+def _emit_tma_pipeline(op, tma_config) -> str:
+    """Generate the TMA double-buffered K-loop C code.
+
+    ``op`` is a ``SmemPipelineKLoop`` with the schedule parameters.
+    ``tma_config`` is a ``TMALoadConfig`` with the TMA descriptor refs.
+    """
     bk = op.block_k
     a_size = op.a_size
-    stage = op.stage
+    stage = op.stage_size
     tile_n = op.tile_n
     tx = op.tx
     thread_m = op.thread_m
@@ -399,8 +409,8 @@ def _emit_tma_k_loop(op) -> str:
     # Accumulator declarations (TMA code references them inline)
     acc_decls = ",".join(f"c{r}{c}=0" for r in range(thread_m) for c in range(thread_n))
 
-    a_ref = op.a_tma_ref
-    b_ref = op.b_tma_ref
+    a_ref = tma_config.a_tma_ref
+    b_ref = tma_config.b_tma_ref
 
     return (
         f"extern __shared__ __align__(128) char dsmem[];\n"
