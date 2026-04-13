@@ -33,7 +33,6 @@ from deplodock.compiler.backend.loop_ir import (
     Accumulate,
     Alloc,
     Barrier,
-    Compute,
     Guard,
     Let,
     Load,
@@ -258,19 +257,6 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
             return [RawCode(f"atomicAdd(&{op.dst}[{_expr_to_c(idx)}], {val_str});")]
         return [Assign(ArrayAccess(op.dst, idx), val)]
 
-    if isinstance(op, Compute):
-        # Check if this is an in-place update: if any arg (recursively)
-        # references dst, emit assignment instead of declaration.
-        is_inplace = _refs_name(op.args, op.dst)
-        dtype = op.dtype
-        args_lowered = [_lower_expr(a) for a in op.args]
-        a_str = _expr_to_c(args_lowered[0]) if args_lowered else "0.0f"
-        b_str = _expr_to_c(args_lowered[1]) if len(args_lowered) > 1 else "0.0f"
-        c_code = _render_c_expr(op.op, a_str, b_str)
-        if is_inplace:
-            return [RawCode(f"{op.dst} = {c_code};")]
-        return [RawCode(f"{dtype} {op.dst} = {c_code};")]
-
     if isinstance(op, Accumulate):
         val = _lower_expr(op.value)
         if op.op == "sum":
@@ -474,22 +460,6 @@ def _emit_tma_k_loop(op) -> str:
         f"    __syncthreads();\n"
         f"}}"
     )
-
-
-def _refs_name(exprs: list, name: str) -> bool:
-    """Check if any LoopExpr in exprs (recursively) references the given name."""
-    for e in exprs:
-        if isinstance(e, LoopVar) and e.name == name:
-            return True
-        if isinstance(e, RegAccess) and e.name + "".join(str(i) for i in e.indices) == name:
-            return True
-        if isinstance(e, LoopFuncCall) and _refs_name(e.args, name):
-            return True
-        if isinstance(e, LoopBinOp) and _refs_name([e.left, e.right], name):
-            return True
-        if isinstance(e, LoopTernary) and _refs_name([e.cond, e.if_true, e.if_false], name):
-            return True
-    return False
 
 
 def _emit_warp_shuffle_xor(acc_var: str, fn: str) -> list[Stmt]:
