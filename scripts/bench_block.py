@@ -210,6 +210,9 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
         if dump:
             dump.dump_plan(plan)
             dump.dump_program(program)
+            for launch in program.launches:
+                if hasattr(launch, "loop_ir") and launch.loop_ir is not None:
+                    dump.dump_loop_ir(launch.loop_ir, launch.kernel_name)
 
         # Correctness sanity check: run once and verify outputs are non-trivial.
         run_result = backend.run(program)
