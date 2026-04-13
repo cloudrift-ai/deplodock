@@ -141,8 +141,10 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
     if schedule.is_batched and analysis.contraction_a:
         a_name = _safe(analysis.contraction_a)
         b_name = _safe(analysis.contraction_b)
-        ops.append(RawLoopOp(f"const float*Ab={a_name}+batch*M*K;"))
-        ops.append(RawLoopOp(f"const float*Bb={b_name}+batch*K*N;"))
+        batch_mk = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("K")))
+        batch_kn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("K"), LoopVar("N")))
+        ops.append(Compute("Ab", "add", [LoopVar(a_name), batch_mk], dtype="const float*"))
+        ops.append(Compute("Bb", "add", [LoopVar(b_name), batch_kn], dtype="const float*"))
 
     return ops
 
@@ -1178,10 +1180,12 @@ def _lower_contraction_naive(
     # Grid setup (CTA-swizzle)
     body.extend(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
 
-    # Batch pointer aliases (pointer arithmetic doesn't fit Compute)
+    # Batch pointer aliases
     if is_batched:
-        body.append(RawLoopOp(f"const float*Ab={a_name}+batch*M*K;"))
-        body.append(RawLoopOp(f"const float*Bb={b_name}+batch*K*N;"))
+        batch_mk = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("K")))
+        batch_kn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("K"), LoopVar("N")))
+        body.append(Compute("Ab", "add", [LoopVar(a_name), batch_mk], dtype="const float*"))
+        body.append(Compute("Bb", "add", [LoopVar(b_name), batch_kn], dtype="const float*"))
         a_src, b_src = "Ab", "Bb"
     else:
         a_src, b_src = a_name, b_name
@@ -1344,7 +1348,8 @@ def _lower_contraction_smem(
     # Uses row_base/col_base instead of bm+tr/bn+tc
     c_local = "Cb" if is_batched else c_name
     if is_batched:
-        body.append(RawLoopOp(f"float*Cb={c_name}+batch*M*N;"))
+        batch_mn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("N")))
+        body.append(Compute("Cb", "add", [LoopVar(c_name), batch_mn], dtype="float*"))
     for r in range(thread_m):
         row = LoopBinOp("+", LoopVar("row_base"), LoopLiteral(r, "int"))
         row_guard = LoopBinOp("<", row, LoopVar("M"))
