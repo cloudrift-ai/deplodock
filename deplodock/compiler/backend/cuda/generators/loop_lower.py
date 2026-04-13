@@ -21,6 +21,7 @@ from deplodock.compiler.backend.loop_ir import (
     Barrier,
     Compute,
     Guard,
+    Let,
     Load,
     LoopBinOp,
     LoopBuiltin,
@@ -145,8 +146,8 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
         b_name = _safe(analysis.contraction_b)
         batch_mk = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("K")))
         batch_kn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("K"), LoopVar("N")))
-        ops.append(Compute("Ab", "add", [LoopVar(a_name), batch_mk], dtype="const float*"))
-        ops.append(Compute("Bb", "add", [LoopVar(b_name), batch_kn], dtype="const float*"))
+        ops.append(Let("Ab", LoopVar(a_name) + batch_mk, dtype="const float*"))
+        ops.append(Let("Bb", LoopVar(b_name) + batch_kn, dtype="const float*"))
 
     return ops
 
@@ -951,31 +952,33 @@ def _cta_swizzle_grid(
     ops: list = []
     I = "int"  # noqa: E741
     N, M = LoopVar("N"), LoopVar("M")  # noqa: N806
-    bidy, bidx, tidy, tidx = LoopBuiltin("blockIdx.y"), LoopBuiltin("blockIdx.x"), LoopBuiltin("threadIdx.y"), LoopBuiltin("threadIdx.x")
+    bidy, bidx = LoopBuiltin("blockIdx.y"), LoopBuiltin("blockIdx.x")
+    tidy, tidx = LoopBuiltin("threadIdx.y"), LoopBuiltin("threadIdx.x")
+    gdimx = LoopBuiltin("gridDim.x")
     SWIZ = 8
 
     if is_batched:
-        ops.append(Compute("batch", "builtin", [LoopBuiltin("blockIdx.z")], dtype=I))
+        ops.append(Let("batch", LoopBuiltin("blockIdx.z"), dtype=I))
 
-    ops.append(Compute("tr", "mul", [tidy, LoopLiteral(thread_m, I)], dtype=I))
-    ops.append(Compute("tc", "mul", [tidx, LoopLiteral(thread_n, I)], dtype=I))
-    ops.append(Compute("ntx", "div", [N + (tile_n - 1), LoopLiteral(tile_n, I)], dtype=I))
-    ops.append(Compute("nty", "div", [M + (tile_m - 1), LoopLiteral(tile_m, I)], dtype=I))
+    ops.append(Let("tr", tidy * thread_m, dtype=I))
+    ops.append(Let("tc", tidx * thread_n, dtype=I))
+    ops.append(Let("ntx", (N + (tile_n - 1)) / tile_n, dtype=I))
+    ops.append(Let("nty", (M + (tile_m - 1)) / tile_m, dtype=I))
 
     ntx, nty = LoopVar("ntx"), LoopVar("nty")
     pid, grp, rem = LoopVar("pid"), LoopVar("grp"), LoopVar("rem")
     by_s, bx_s = LoopVar("by_s"), LoopVar("bx_s")
 
-    ops.append(Compute("pid", "add", [bidx, bidy * LoopBuiltin("gridDim.x")], dtype=I))
-    ops.append(Compute("grp", "div", [pid, ntx * SWIZ], dtype=I))
-    ops.append(Compute("rem", "mod", [pid, ntx * SWIZ], dtype=I))
-    ops.append(Compute("by_s", "add", [grp * SWIZ, rem % SWIZ], dtype=I))
-    ops.append(Compute("bx_s", "div", [rem, LoopLiteral(SWIZ, I)], dtype=I))
+    ops.append(Let("pid", bidx + bidy * gdimx, dtype=I))
+    ops.append(Let("grp", pid / (ntx * SWIZ), dtype=I))
+    ops.append(Let("rem", pid % (ntx * SWIZ), dtype=I))
+    ops.append(Let("by_s", grp * SWIZ + rem % SWIZ, dtype=I))
+    ops.append(Let("bx_s", rem / SWIZ, dtype=I))
 
     ops.append(Guard(by_s.ge(nty).or_(bx_s.ge(ntx)), []))
 
-    ops.append(Compute("bm", "mul", [by_s, LoopLiteral(tile_m, I)], dtype=I))
-    ops.append(Compute("bn", "mul", [bx_s, LoopLiteral(tile_n, I)], dtype=I))
+    ops.append(Let("bm", by_s * tile_m, dtype=I))
+    ops.append(Let("bn", bx_s * tile_n, dtype=I))
 
     return ops
 
@@ -1272,10 +1275,9 @@ def _lower_contraction_naive(
 
     # Batch pointer aliases
     if is_batched:
-        batch_mk = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("K")))
-        batch_kn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("K"), LoopVar("N")))
-        body.append(Compute("Ab", "add", [LoopVar(a_name), batch_mk], dtype="const float*"))
-        body.append(Compute("Bb", "add", [LoopVar(b_name), batch_kn], dtype="const float*"))
+        batch, M, N, K = LoopVar("batch"), LoopVar("M"), LoopVar("N"), LoopVar("K")  # noqa: N806
+        body.append(Let("Ab", LoopVar(a_name) + batch * (M * K), dtype="const float*"))
+        body.append(Let("Bb", LoopVar(b_name) + batch * (K * N), dtype="const float*"))
         a_src, b_src = "Ab", "Bb"
     else:
         a_src, b_src = a_name, b_name
@@ -1448,73 +1450,39 @@ def _lower_contraction_smem(
     body: list = []
 
     # Grid setup
+    bidy, bidx = LoopBuiltin("blockIdx.y"), LoopBuiltin("blockIdx.x")
+    tidy, tidx = LoopBuiltin("threadIdx.y"), LoopBuiltin("threadIdx.x")
+    K = LoopVar("K")  # noqa: N806
+
     if is_batched:
-        body.append(Compute("batch", "builtin", [LoopBuiltin("blockIdx.z")], dtype=I))
-    body.append(
-        Compute(
-            "row_base",
-            "mul",
-            [
-                LoopBinOp("+", LoopBinOp("*", LoopBuiltin("blockIdx.y"), LoopLiteral(ty, I)), LoopBuiltin("threadIdx.y")),
-                LoopLiteral(thread_m, I),
-            ],
-            dtype=I,
-        )
-    )
-    body.append(
-        Compute(
-            "col_base",
-            "mul",
-            [
-                LoopBinOp("+", LoopBinOp("*", LoopBuiltin("blockIdx.x"), LoopLiteral(tx, I)), LoopBuiltin("threadIdx.x")),
-                LoopLiteral(thread_n, I),
-            ],
-            dtype=I,
-        )
-    )
-    body.append(Compute("sr", "mul", [LoopBuiltin("threadIdx.y"), LoopLiteral(thread_m, I)], dtype=I))
+        body.append(Let("batch", LoopBuiltin("blockIdx.z"), dtype=I))
+    body.append(Let("row_base", (bidy * ty + tidy) * thread_m, dtype=I))
+    body.append(Let("col_base", (bidx * tx + tidx) * thread_n, dtype=I))
+    body.append(Let("sr", tidy * thread_m, dtype=I))
 
     # Shared memory for A tile (bank-conflict padded stride)
     body.append(Alloc("As", "float", (tile_m * smem_stride,), "smem"))
 
     # K-range for k_splits
     if k_splits > 1:
-        body.append(
-            Compute(
-                "k_per",
-                "mul",
-                [LoopBinOp("/", LoopBinOp("/", LoopVar("K"), LoopLiteral(bk, I)), LoopVar("k_splits")), LoopLiteral(bk, I)],
-                dtype=I,
-            )
-        )
-        body.append(Compute("k_start", "mul", [LoopBuiltin("blockIdx.z"), LoopVar("k_per")], dtype=I))
-        body.append(
-            Compute(
-                "k_end",
-                "builtin",
-                [
-                    LoopTernary(
-                        LoopBinOp("==", LoopBuiltin("blockIdx.z"), LoopLiteral(k_splits - 1, I)),
-                        LoopVar("K"),
-                        LoopBinOp("+", LoopVar("k_start"), LoopVar("k_per")),
-                    )
-                ],
-                dtype=I,
-            )
-        )
+        bidz = LoopBuiltin("blockIdx.z")
+        k_per, k_start = LoopVar("k_per"), LoopVar("k_start")
+        body.append(Let("k_per", K / bk / LoopVar("k_splits") * bk, dtype=I))
+        body.append(Let("k_start", bidz * k_per, dtype=I))
+        body.append(Let("k_end", LoopTernary(bidz.eq(LoopLiteral(k_splits - 1, I)), K, k_start + k_per), dtype=I))
     else:
-        body.append(Compute("k_start", "builtin", [LoopLiteral(0, I)], dtype=I))
-        body.append(Compute("k_end", "builtin", [LoopVar("K")], dtype=I))
+        body.append(Let("k_start", LoopLiteral(0, I), dtype=I))
+        body.append(Let("k_end", K, dtype=I))
 
     # Accumulator register array
     body.append(Alloc("c", "float", (thread_m, thread_n), "reg", LoopLiteral(0.0)))
 
     # Batch pointer aliases
+    M, N = LoopVar("M"), LoopVar("N")  # noqa: N806
     if is_batched:
-        batch_mk = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("K")))
-        batch_kn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("K"), LoopVar("N")))
-        body.append(Compute("Ab", "add", [LoopVar(a_name), batch_mk], dtype="const float*"))
-        body.append(Compute("Bb", "add", [LoopVar(b_name), batch_kn], dtype="const float*"))
+        batch = LoopVar("batch")
+        body.append(Let("Ab", LoopVar(a_name) + batch * (M * K), dtype="const float*"))
+        body.append(Let("Bb", LoopVar(b_name) + batch * (K * N), dtype="const float*"))
     a_src = "Ab" if is_batched else a_name
     b_src = "Bb" if is_batched else b_name
 
@@ -1563,8 +1531,7 @@ def _lower_contraction_smem(
     # Write
     c_local = "Cb" if is_batched else c_name
     if is_batched:
-        batch_mn = LoopBinOp("*", LoopVar("batch"), LoopBinOp("*", LoopVar("M"), LoopVar("N")))
-        body.append(Compute("Cb", "add", [LoopVar(c_name), batch_mn], dtype="float*"))
+        body.append(Let("Cb", LoopVar(c_name) + LoopVar("batch") * (M * N), dtype="float*"))
     for r in range(thread_m):
         row = LoopBinOp("+", LoopVar("row_base"), LoopLiteral(r, I))
         row_guard = LoopBinOp("<", row, LoopVar("M"))

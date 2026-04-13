@@ -159,6 +159,15 @@ LoopExpr = LoopVar | LoopLiteral | LoopBinOp | LoopBuiltin | LoopFuncCall | Loop
 
 
 @dataclass
+class Let:
+    """Bind a named variable to an expression: ``dtype name = expr;``."""
+
+    name: str
+    expr: LoopExpr
+    dtype: str = "float"
+
+
+@dataclass
 class ParallelAxis:
     """Maps to a grid dimension.  One block per value in [0, bound).
 
@@ -287,7 +296,9 @@ class RawLoopOp:
     comment: str = ""
 
 
-LoopOp = ParallelAxis | LoopNest | Alloc | Load | Store | Compute | Accumulate | WarpReduce | WarpShuffleXor | Barrier | Guard | RawLoopOp
+LoopOp = (
+    Let | ParallelAxis | LoopNest | Alloc | Load | Store | Compute | Accumulate | WarpReduce | WarpShuffleXor | Barrier | Guard | RawLoopOp
+)
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +354,9 @@ def pretty_print(program: LoopProgram) -> str:
 def _pp_op(op: LoopOp, depth: int) -> list[str]:
     """Pretty-print a single LoopOp at the given indentation depth."""
     pad = _INDENT * depth
+
+    if isinstance(op, Let):
+        return [f"{pad}let {op.dtype} {op.name} = {_pp_expr(op.expr)}"]
 
     if isinstance(op, ParallelAxis):
         return [f"{pad}parallel {op.name} = {op.dim}  // bound: {op.bound}"]
