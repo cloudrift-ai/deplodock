@@ -244,10 +244,9 @@ class Guard:
 class SmemPipelineKLoop:
     """Double-buffered K-loop through shared memory.
 
-    Backend-agnostic pipeline schedule.  Describes the structure (stages,
-    tile geometry, thread tile, k_splits) without specifying HOW tiles are
-    loaded or HOW synchronization happens — the backend codegen decides
-    (TMA + mbarrier for CUDA sm_90+, explicit loads + __syncthreads otherwise).
+    Backend-agnostic pipeline schedule.  For TMA the codegen expands this
+    to inline PTX.  For explicit smem, call ``expand()`` to get primitive
+    LoopIR ops (Alloc, Load, Store, Barrier, LoopNest).
     """
 
     stages: int  # 2 = double-buffer, 3 = triple-buffer (future)
@@ -261,6 +260,63 @@ class SmemPipelineKLoop:
     tx: int  # blockDim.x
     k_splits: int
     is_batched: bool
+    # Buffer names for explicit smem expansion (not used by TMA codegen)
+    a_buf: str = ""
+    b_buf: str = ""
+
+    def expand(self) -> list:
+        """Expand into primitive LoopIR ops for explicit smem K-loop.
+
+        Produces: smem Alloc + k-range + outer tile loop (load A→smem,
+        barrier, inner FMA loop, barrier).  Backend-agnostic.
+        """
+        bk = self.block_k
+        smem_stride = bk + 1
+        I = "int"  # noqa: E741
+        M, N, K = Var("M"), Var("N"), Var("K")  # noqa: N806
+        A, B = Var(self.a_buf), Var(self.b_buf)  # noqa: N806
+
+        ops: list = []
+        ops.append(Alloc("As", "float", (self.tile_m * smem_stride,), "smem"))
+
+        if self.k_splits > 1:
+            bidz = Builtin("blockIdx.z")
+            k_per, k_start = Var("k_per"), Var("k_start")
+            ops.append(Let("k_per", K / bk / Var("k_splits") * bk, dtype=I))
+            ops.append(Let("k_start", bidz * k_per, dtype=I))
+            ops.append(Let("k_end", Ternary(bidz.eq(Literal(self.k_splits - 1, I)), K, k_start + k_per), dtype=I))
+        else:
+            ops.append(Let("k_start", Literal(0, I), dtype=I))
+            ops.append(Let("k_end", K, dtype=I))
+
+        a_src = Var("Ab") if self.is_batched else A
+        b_src = Var("Bb") if self.is_batched else B
+
+        row_base, col_base = Var("row_base"), Var("col_base")
+        sr, tk, kk = Var("sr"), Var("tk"), Var("kk")
+        tidx = Builtin("threadIdx.x")
+
+        tk_body: list = []
+        for r in range(self.thread_m):
+            row_r = row_base + r
+            k_col = tk + tidx
+            tk_body.append(Load(f"As_ld_{r}", a_src, row_r * K + k_col, "global", guard=row_r.lt(M).and_(k_col.lt(K))))
+            tk_body.append(Store("As", (sr + r) * smem_stride + tidx, Var(f"As_ld_{r}"), "smem"))
+        tk_body.append(Barrier())
+
+        kk_body: list = []
+        for c in range(self.thread_n):
+            col_c = col_base + c
+            kk_body.append(Load(f"b{c}", b_src, (tk + kk) * N + col_c, "global", guard=col_c.lt(N)))
+        for r in range(self.thread_m):
+            kk_body.append(Load(f"a{r}", "As", (sr + r) * smem_stride + kk, "smem"))
+            for c in range(self.thread_n):
+                kk_body.append(Accum(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
+        tk_body.append(LoopNest("kk", Literal(0, I), Literal(bk, I), None, kk_body))
+        tk_body.append(Barrier())
+
+        ops.append(LoopNest("tk", Var("k_start"), Var("k_end"), Literal(bk, I), tk_body))
+        return ops
 
 
 @dataclass
