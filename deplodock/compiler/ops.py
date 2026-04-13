@@ -62,12 +62,32 @@ class ElementwiseOp(Op):
         return OP_REGISTRY.get(self.fn, _DEFAULT_OP_INFO)
 
 
+@dataclass(frozen=True)
+class ReduceInfo:
+    """Declarative metadata for a reduction op."""
+
+    identity: float  # identity element: 0 for sum, -inf for max, 1 for prod
+
+
+REDUCE_REGISTRY: dict[str, ReduceInfo] = {
+    "sum": ReduceInfo(0.0),
+    "max": ReduceInfo(-1e30),
+    "prod": ReduceInfo(1.0),
+}
+
+_DEFAULT_REDUCE_INFO = ReduceInfo(0.0)
+
+
 @dataclass
 class ReduceOp(Op):
     """Collapse one or more dimensions via an associative binary op."""
 
     fn: str  # "sum", "max", "prod"
     axis: int | str  # concrete or symbolic
+
+    @property
+    def info(self) -> ReduceInfo:
+        return REDUCE_REGISTRY.get(self.fn, _DEFAULT_REDUCE_INFO)
 
 
 @dataclass

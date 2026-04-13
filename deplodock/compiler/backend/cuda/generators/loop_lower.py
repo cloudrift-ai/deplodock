@@ -525,10 +525,10 @@ def _safe(name: str) -> str:
 
 def _reduce_init_expr(fn: str) -> Literal:
     """Initial value for a reduction accumulator."""
-    if fn == "sum":
-        return Literal(0.0)
-    if fn == "max":
-        return Literal(-1e30)
+    from deplodock.compiler.ops import _DEFAULT_REDUCE_INFO, REDUCE_REGISTRY
+
+    info = REDUCE_REGISTRY.get(fn, _DEFAULT_REDUCE_INFO)
+    return Literal(info.identity)
     return Literal(0.0)
 
 
@@ -1016,7 +1016,7 @@ def _contraction_epilogue_ops(
         prev_id = inter_ops[-1][0] if inter_ops else prev_id
 
         # Per-row reduce via WarpShuffleXor
-        init_val = Literal(-1e30) if reduce_fn == "max" else Literal(0.0)
+        init_val = _reduce_init_expr(reduce_fn)
 
         for r in range(thread_m):
             rvar = f"r{reduce_fn}{r}"
