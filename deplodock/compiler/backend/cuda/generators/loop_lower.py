@@ -142,13 +142,11 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
 
     # Batch pointer aliases for contraction
     if schedule.is_batched and analysis.contraction_a:
-        a_name = _safe(analysis.contraction_a)
-        b_name = _safe(analysis.contraction_b)
+        A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
+        B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
         batch, M, K, N = LoopVar("batch"), LoopVar("M"), LoopVar("K"), LoopVar("N")  # noqa: N806
-        batch_mk = batch * (M * K)
-        batch_kn = batch * (K * N)
-        ops.append(Let("Ab", LoopVar(a_name) + batch_mk, dtype="const float*"))
-        ops.append(Let("Bb", LoopVar(b_name) + batch_kn, dtype="const float*"))
+        ops.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
+        ops.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
 
     return ops
 
@@ -1256,8 +1254,9 @@ def _lower_contraction_naive(
     is_batched = analysis.batch_size > 1
     k_splits = int(hints.get("k_splits", 1))
 
-    a_name = _safe(analysis.contraction_a)
-    b_name = _safe(analysis.contraction_b)
+    A_buf = _safe(analysis.contraction_a)  # noqa: N806
+    B_buf = _safe(analysis.contraction_b)  # noqa: N806
+    A, B = LoopVar(A_buf), LoopVar(B_buf)  # noqa: N806
     out_id = region.output_names[0]
 
     # Params
@@ -1272,13 +1271,14 @@ def _lower_contraction_naive(
     body.extend(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
 
     # Batch pointer aliases
+    M, N, K = LoopVar("M"), LoopVar("N"), LoopVar("K")  # noqa: N806
     if is_batched:
-        batch, M, N, K = LoopVar("batch"), LoopVar("M"), LoopVar("N"), LoopVar("K")  # noqa: N806
-        body.append(Let("Ab", LoopVar(a_name) + batch * (M * K), dtype="const float*"))
-        body.append(Let("Bb", LoopVar(b_name) + batch * (K * N), dtype="const float*"))
+        batch = LoopVar("batch")
+        body.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
+        body.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
         a_src, b_src = "Ab", "Bb"
     else:
-        a_src, b_src = a_name, b_name
+        a_src, b_src = A_buf, B_buf
 
     # Accumulator register array
     body.append(Alloc("c", "float", (thread_m, thread_n), "reg", LoopLiteral(0.0)))
@@ -1342,8 +1342,8 @@ def _lower_contraction_tma(
     bk = int(hints.get("block_k", 32))
     phases = analysis.op_phases
 
-    a_name = _safe(analysis.contraction_a)
-    b_name = _safe(analysis.contraction_b)
+    A_buf = _safe(analysis.contraction_a)  # noqa: N806
+    B_buf = _safe(analysis.contraction_b)  # noqa: N806
     out_id = region.output_names[0]
     a_size = tile_m * bk
     b_size = bk * tile_n
@@ -1351,7 +1351,7 @@ def _lower_contraction_tma(
 
     # TMA params: A/B come via descriptors, only C + epilogue inputs as regular params.
     # M/N/K come via #define from backend.py.
-    tma_exclude = {a_name, b_name, "M", "N", "K"}
+    tma_exclude = {A_buf, B_buf, "M", "N", "K"}
     if is_batched:
         tma_exclude.add("batch_count")
     params = [(dt, nm) for dt, nm in _build_params(region) if nm not in tma_exclude]
@@ -1366,8 +1366,8 @@ def _lower_contraction_tma(
     # TMA double-buffered K-loop (CUDA extension op)
     from deplodock.compiler.backend.cuda.tma_ops import TMAKLoop
 
-    tma_a_ref = f"&{a_name}_tma[batch]" if is_batched else f"&{a_name}_tma"
-    tma_b_ref = f"&{b_name}_tma[batch]" if is_batched else f"&{b_name}_tma"
+    tma_a_ref = f"&{A_buf}_tma[batch]" if is_batched else f"&{A_buf}_tma"
+    tma_b_ref = f"&{B_buf}_tma[batch]" if is_batched else f"&{B_buf}_tma"
 
     body.append(
         TMAKLoop(
@@ -1402,7 +1402,7 @@ def _lower_contraction_tma(
         block_size=(tx, ty, 1),
         tile_m=tile_m,
         tile_n=tile_n,
-        tma_params=[f"{a_name}_tma", f"{b_name}_tma"],
+        tma_params=[f"{A_buf}_tma", f"{B_buf}_tma"],
         batched=is_batched,
         includes=["cuda.h"],
     )
@@ -1421,10 +1421,10 @@ def _lower_contraction_smem(
     padded), scalar global loads for B (nvcc auto-vectorizes to float4).
     Fully expressed in LoopIR — no RawLoopOp.
     """
-    a_name = _safe(analysis.contraction_a)
-    b_name = _safe(analysis.contraction_b)
+    A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
+    B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
     out_id = region.output_names[0]
-    c_name = _safe(out_id)
+    C = LoopVar(_safe(out_id))  # noqa: N806
     is_batched = analysis.batch_size > 1
 
     thread_m = int(hints.get("thread_m", 4))
@@ -1478,10 +1478,10 @@ def _lower_contraction_smem(
     M, N = LoopVar("M"), LoopVar("N")  # noqa: N806
     if is_batched:
         batch = LoopVar("batch")
-        body.append(Let("Ab", LoopVar(a_name) + batch * (M * K), dtype="const float*"))
-        body.append(Let("Bb", LoopVar(b_name) + batch * (K * N), dtype="const float*"))
-    a_src = "Ab" if is_batched else a_name
-    b_src = "Bb" if is_batched else b_name
+        body.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
+        body.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
+    a_src = LoopVar("Ab") if is_batched else A
+    b_src = LoopVar("Bb") if is_batched else B
 
     # K-tile loop
     tk_body: list = []
@@ -1516,9 +1516,9 @@ def _lower_contraction_smem(
     body.append(LoopNest("tk", LoopVar("k_start"), LoopVar("k_end"), LoopLiteral(bk, I), tk_body))
 
     # Write
-    c_local = "Cb" if is_batched else c_name
+    c_local = LoopVar("Cb") if is_batched else C
     if is_batched:
-        body.append(Let("Cb", LoopVar(c_name) + LoopVar("batch") * (M * N), dtype="float*"))
+        body.append(Let("Cb", C + LoopVar("batch") * (M * N), dtype="float*"))
     for r in range(thread_m):
         row = row_base + r
         row_body: list = []
