@@ -1017,17 +1017,18 @@ def _contraction_epilogue_ops(
 
         # Per-row reduce via WarpShuffleXor
         init_val = Literal(-1e30) if reduce_fn == "max" else Literal(0.0)
-        acc_fn = "fmaxf" if reduce_fn == "max" else None  # sum uses Accumulate
 
         for r in range(thread_m):
             rvar = f"r{reduce_fn}{r}"
             ops.append(Alloc(rvar, "float", None, "reg", init_val))
             for c in range(thread_n):
                 col_c = Var("bn") + Var("tc") + c
-                if acc_fn:
-                    ops.append(Guard(col_c.lt(Var("N")), [SetVar(rvar, FuncCall(acc_fn, [Var(rvar), RegAccess("c", [r, c])]))]))
+                elem = RegAccess("c", [r, c])
+                if reduce_fn == "max":
+                    fold = SetVar(rvar, FuncCall("fmaxf", [Var(rvar), elem]))
                 else:
-                    ops.append(Guard(col_c.lt(Var("N")), [Accumulate(rvar, reduce_fn, RegAccess("c", [r, c]))]))
+                    fold = SetVar(rvar, Var(rvar) + elem)
+                ops.append(Guard(col_c.lt(Var("N")), [fold]))
             ops.append(WarpShuffleXor(rvar, reduce_fn))
 
         reduce_row_vars[reduce_node_id] = f"r{reduce_fn}{{r}}"
