@@ -1,5 +1,7 @@
 """Tensor operation types for the minimal IR."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 
@@ -13,11 +15,51 @@ class InputOp(Op):
     """Sentinel for graph input tensors (no computation)."""
 
 
+# ---------------------------------------------------------------------------
+# Op metadata registry
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OpInfo:
+    """Declarative metadata for an elementwise op.
+
+    Backend-agnostic: describes semantic properties only, not how the op
+    maps to C code (that's the codegen's job).
+    """
+
+    arity: int  # 1 (unary) or 2 (binary)
+    commutative: bool = False  # True for add, mul; False for sub, div
+
+
+OP_REGISTRY: dict[str, OpInfo] = {
+    "add": OpInfo(2, commutative=True),
+    "sub": OpInfo(2),
+    "mul": OpInfo(2, commutative=True),
+    "div": OpInfo(2),
+    "mod": OpInfo(2),
+    "neg": OpInfo(1),
+    "exp": OpInfo(1),
+    "rsqrt": OpInfo(1),
+    "recip": OpInfo(1),
+    "relu": OpInfo(1),
+    "tanh": OpInfo(1),
+    "sigmoid": OpInfo(1),
+}
+
+# Default for unknown ops: assume unary, non-commutative.
+_DEFAULT_OP_INFO = OpInfo(1)
+
+
 @dataclass
 class ElementwiseOp(Op):
     """Apply a scalar function independently to each element."""
 
     fn: str  # "mul", "add", "exp", "sub", "div", ...
+
+    @property
+    def info(self) -> OpInfo:
+        return OP_REGISTRY.get(self.fn, _DEFAULT_OP_INFO)
 
 
 @dataclass
