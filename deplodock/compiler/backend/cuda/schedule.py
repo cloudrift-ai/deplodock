@@ -18,6 +18,14 @@ if TYPE_CHECKING:
     from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis
 
 
+@dataclass
+class TMALoadConfig:
+    """TMA descriptor references for async bulk copy."""
+
+    a_tma_ref: str  # "&A_tma" or "&A_tma[batch]"
+    b_tma_ref: str  # "&B_tma" or "&B_tma[batch]"
+
+
 def _safe(name: str) -> str:
     return name.replace("-", "_").replace(".", "_").replace(" ", "_")
 
@@ -149,8 +157,6 @@ def build_schedule(
         tma_config = None
         includes = None
         if load_strat == "tma" and analysis.contraction_a:
-            from deplodock.compiler.backend.cuda.tma_ops import TMALoadConfig
-
             a_name = _safe(analysis.contraction_a)
             b_name = _safe(analysis.contraction_b)
             tma_a_ref = f"&{a_name}_tma[batch]" if is_batched else f"&{a_name}_tma"
