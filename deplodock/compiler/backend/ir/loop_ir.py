@@ -51,8 +51,7 @@ __all__ = [
     "Store",
     "AccumInit",
     "Accum",
-    "WarpReduce",
-    "WarpShuffleXor",
+    "ShuffleReduce",
     "Barrier",
     "Guard",
     "RawLoopOp",
@@ -213,28 +212,19 @@ class Accum:
 
 
 @dataclass
-class WarpReduce:
-    """Cross-thread warp shuffle reduction (__shfl_down_sync).
+class ShuffleReduce:
+    """Warp shuffle reduction.
 
-    After this op, `var` holds the block-wide reduced value (thread 0
-    for max, all threads for sum via broadcast).
+    ``kind`` selects the variant:
+    - ``"block"``: full block-wide reduce using __shfl_down_sync + cross-warp
+      shared memory + broadcast.  After this op, all threads hold the result.
+    - ``"warp_xor"``: intra-warp reduce using __shfl_xor_sync.  Used for
+      in-register softmax where each thread holds different columns.
     """
 
     var: str
     op: str  # "sum" | "max"
-
-
-@dataclass
-class WarpShuffleXor:
-    """Horizontal warp shuffle reduction (__shfl_xor_sync).
-
-    Reduces ``var`` across threads using XOR lane masks (offsets 16,8,4,2,1).
-    Used for in-register softmax where each thread holds different columns
-    of the same output row.
-    """
-
-    var: str
-    op: str  # "sum" | "max"
+    kind: str = "block"  # "block" | "warp_xor"
 
 
 @dataclass
@@ -294,8 +284,7 @@ LoopOp = (
     | Store
     | AccumInit
     | Accum
-    | WarpReduce
-    | WarpShuffleXor
+    | ShuffleReduce
     | SmemPipelineKLoop
     | Barrier
     | Guard
@@ -397,11 +386,8 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
     if isinstance(op, Accum):
         return [f"{pad}accum {op.dst} {op.op} {_pp_expr(op.value)}"]
 
-    if isinstance(op, WarpReduce):
-        return [f"{pad}warp_reduce {op.var} {op.op}"]
-
-    if isinstance(op, WarpShuffleXor):
-        return [f"{pad}warp_shuffle_xor {op.var} {op.op}"]
+    if isinstance(op, ShuffleReduce):
+        return [f"{pad}shuffle_reduce {op.var} {op.op} ({op.kind})"]
 
     if isinstance(op, Barrier):
         return [f"{pad}barrier"]

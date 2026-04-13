@@ -45,10 +45,9 @@ from deplodock.compiler.backend.ir.loop_ir import (
     RawLoopOp,
     RegAccess,
     SetVar,
+    ShuffleReduce,
     SmemPipelineKLoop,
     Store,
-    WarpReduce,
-    WarpShuffleXor,
 )
 
 # Module-level context for TMA config, set by loop_ir_to_kernel.
@@ -285,11 +284,10 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         tmpl = _C_REDUCE_ACCUM.get(op.op, "{dst} += {val}")
         return [RawCode(f"{tmpl.format(dst=op.dst, val=val_str)};")]
 
-    if isinstance(op, WarpReduce):
-        return _emit_warp_reduce(op.var, op.op)
-
-    if isinstance(op, WarpShuffleXor):
-        return _emit_warp_shuffle_xor(op.var, op.op)
+    if isinstance(op, ShuffleReduce):
+        if op.kind == "warp_xor":
+            return _emit_shuffle_xor(op.var, op.op)
+        return _emit_shuffle_block(op.var, op.op)
 
     if isinstance(op, Barrier):
         return [SyncThreads()]
@@ -319,7 +317,7 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
 # ---------------------------------------------------------------------------
 
 
-def _emit_warp_reduce(acc_var: str, fn: str) -> list[Stmt]:
+def _emit_shuffle_block(acc_var: str, fn: str) -> list[Stmt]:
     """Emit warp-shuffle + cross-warp shared memory reduction.
 
     Uses KernelIR AST nodes wherever possible.  The only remaining RawCode
@@ -477,7 +475,7 @@ def _emit_tma_pipeline(op, tma_config) -> str:
     )
 
 
-def _emit_warp_shuffle_xor(acc_var: str, fn: str) -> list[Stmt]:
+def _emit_shuffle_xor(acc_var: str, fn: str) -> list[Stmt]:
     """Emit horizontal warp shuffle reduction using __shfl_xor_sync.
 
     Unlike WarpReduce (vertical __shfl_down_sync across all threads in a
