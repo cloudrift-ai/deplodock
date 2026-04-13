@@ -8,8 +8,8 @@ from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_k
 from deplodock.compiler.backend.loop_ir import (
     Accumulate,
     Alloc,
-    Compute,
     Guard,
+    Let,
     Load,
     LoopBinOp,
     LoopBuiltin,
@@ -17,6 +17,7 @@ from deplodock.compiler.backend.loop_ir import (
     LoopNest,
     LoopProgram,
     LoopVar,
+    OpCall,
     ParallelAxis,
     RawLoopOp,
     Store,
@@ -42,7 +43,7 @@ def test_loop_program_construction():
                 LoopBinOp("<", LoopVar("i"), LoopVar("n")),
                 [
                     Load("v", "X", LoopVar("i"), "global"),
-                    Compute("out", "mul", [LoopVar("v"), LoopLiteral(2.0)]),
+                    Let("out", LoopVar("v") * 2.0),
                     Store("Y", LoopVar("i"), LoopVar("out"), "global"),
                 ],
             ),
@@ -66,7 +67,7 @@ def test_pretty_print_pointwise():
                 LoopBinOp("<", LoopVar("i"), LoopVar("n")),
                 [
                     Load("v", "X", LoopVar("i"), "global"),
-                    Compute("out", "relu", [LoopVar("v")]),
+                    Let("out", OpCall("relu", [LoopVar("v")])),
                     Store("Y", LoopVar("i"), LoopVar("out"), "global"),
                 ],
             ),
@@ -79,7 +80,7 @@ def test_pretty_print_pointwise():
     assert "parallel i" in text
     assert "guard" in text
     assert "load v" in text
-    assert "compute out = relu" in text
+    assert "let float out = relu" in text
     assert "store Y" in text
 
 
@@ -218,9 +219,9 @@ def test_pointwise_structure():
     assert any(isinstance(op, ParallelAxis) for op in prog.body)
     guards = _find_ops(prog.body, Guard, recursive=False)
     assert len(guards) == 1
-    computes = _find_ops(guards[0].body, Compute)
+    lets = _find_ops(guards[0].body, Let)
     stores = _find_ops(guards[0].body, Store)
-    assert len(computes) >= 1
+    assert len(lets) >= 1  # elementwise ops as Let(name, OpCall(...))
     assert len(stores) == 1
 
 
@@ -304,8 +305,6 @@ def test_contraction_structure():
 
     assert prog.block_size == (32, 8, 1)
     # Grid setup uses Let ops, K-loop is LoopNest, write is Guard+Store.
-    from deplodock.compiler.backend.loop_ir import Let
-
     lets = _find_ops(prog.body, Let, recursive=False)
     assert any(v.name == "bm" for v in lets)  # CTA-swizzle output
     assert any(v.name == "tr" for v in lets)  # thread row offset

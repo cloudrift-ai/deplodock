@@ -47,9 +47,11 @@ from deplodock.compiler.backend.loop_ir import (
     LoopProgram,
     LoopTernary,
     LoopVar,
+    OpCall,
     ParallelAxis,
     RawLoopOp,
     RegAccess,
+    SetVar,
     Store,
     WarpReduce,
     WarpShuffleXor,
@@ -99,6 +101,14 @@ def _lower_expr(expr: LoopExpr) -> Expr:
     if isinstance(expr, RegAccess):
         # Expand to scalar variable name: c[3][2] → "c32"
         return Var(expr.name + "".join(str(i) for i in expr.indices))
+    if isinstance(expr, OpCall):
+        # Render via _C_EXPR template
+        args_lowered = [_lower_expr(a) for a in expr.args]
+        a_str = _expr_to_c(args_lowered[0]) if args_lowered else "0.0f"
+        b_str = _expr_to_c(args_lowered[1]) if len(args_lowered) > 1 else "0.0f"
+        # Return as a RawCode-like expression — wrap in a Var with the rendered string.
+        # This is a slight hack but works because Var.name is emitted as-is.
+        return Var(_render_c_expr(expr.op, a_str, b_str))
     msg = f"Unknown LoopExpr type: {type(expr)}"
     raise TypeError(msg)
 
@@ -156,6 +166,9 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
 
     if isinstance(op, Let):
         return [VarDecl(op.dtype, op.name, _lower_expr(op.expr))]
+
+    if isinstance(op, SetVar):
+        return [VarAssign(op.name, _lower_expr(op.expr))]
 
     if isinstance(op, ParallelAxis):
         # ParallelAxis("i", "blockIdx.x", "n") →
