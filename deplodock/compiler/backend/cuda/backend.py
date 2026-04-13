@@ -259,12 +259,6 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
     smem_bytes = 0
 
     if kernel_def.tma_params:
-        # TMA kernels use M/N/K as compile-time macros in the kernel body.
-        batch_defines = f"#define BATCH_COUNT {batch_size}\n" if batch_size > 1 else ""
-        source = f"#define M {m}\n#define N {n}\n#define K {k}\n{batch_defines}{source}\n#undef M\n#undef N\n#undef K\n"
-        if batch_size > 1:
-            source = source.rstrip() + "\n#undef BATCH_COUNT\n"
-
         bk = int(matmul_hints.get("block_k", 32))  # must match tiled.py
         a_tile = tile_m * bk
         b_tile = bk * tile_n
@@ -287,18 +281,12 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
             ),
         ]
 
-        # TMA: only C is a regular param. A/B come via descriptors.
-        # Epilogue external inputs come before the output (matching kernel param order).
-        args = [*extra_inputs, *op.outputs]
-        if k_splits > 1:
-            args.append(str(k_splits))
-    else:
-        # Naive/smem: A, B, C, M, N, K as regular params.
-        args = [*op.inputs, *op.outputs, str(m), str(n), str(k)]
-        if batch_size > 1:
-            args.append(str(batch_size))
-        elif k_splits > 1:
-            args.append(str(k_splits))
+    # Uniform args for all strategies: A, B, epilogue inputs, C, M, N, K, ...
+    args = [*op.inputs, *op.outputs, str(m), str(n), str(k)]
+    if batch_size > 1:
+        args.append(str(batch_size))
+    elif k_splits > 1:
+        args.append(str(k_splits))
 
     return CudaLaunch(
         kernel_source=source,

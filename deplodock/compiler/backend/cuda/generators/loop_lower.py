@@ -1208,21 +1208,13 @@ def _lower_contraction(
     tile_m, tile_n = dims["tile_m"], dims["tile_n"]
     tx, ty = dims["tx"], dims["ty"]
 
-    # --- Shared: params ---
-    if strategy == "tma":
-        tma_exclude = {A.name, B.name, "M", "N", "K"}
-        if is_batched:
-            tma_exclude.add("batch_count")
-        params = [(dt, nm) for dt, nm in _build_params(region) if nm not in tma_exclude]
-        if k_splits > 1:
-            params.append(("int", "k_splits"))
-    else:
-        params = _build_params(region)
-        params.extend([("int", "M"), ("int", "N"), ("int", "K")])
-        if is_batched:
-            params.append(("int", "batch_count"))
-        elif k_splits > 1 and strategy == "smem":
-            params.append(("int", "k_splits"))
+    # --- Shared: params (uniform for all strategies) ---
+    params = _build_params(region)
+    params.extend([("int", "M"), ("int", "N"), ("int", "K")])
+    if is_batched:
+        params.append(("int", "batch_count"))
+    elif k_splits > 1:
+        params.append(("int", "k_splits"))
 
     # --- Shared: assemble body ---
     body: list = []

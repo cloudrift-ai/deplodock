@@ -450,7 +450,7 @@ def generate_benchmark_program(
 #include <curand.h>
 {tma_includes}{cublas_includes}
 // Matrix dimensions
-{_dim_decls(m, n, k, use_define=bool(kernel.tma_params))}
+{_dim_decls(m, n, k, use_define=False)}
 
 {kernel_source}
 
