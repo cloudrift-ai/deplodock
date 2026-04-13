@@ -9,37 +9,58 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from deplodock.compiler.backend.ir.expr import (
+    BinOp,
+    Builtin,
+    Expr,
+    FuncCall,
+    Literal,
+    Ternary,
+    Var,
+    _ExprOps,
+)
+
+# Re-export shared types so existing ``from kernel_ir import Var`` still works.
+__all__ = [
+    # Shared expression types (re-exported)
+    "Var",
+    "Literal",
+    "BinOp",
+    "Builtin",
+    "FuncCall",
+    "Ternary",
+    "Expr",
+    "_ExprOps",
+    # Kernel-specific expression types
+    "ArrayAccess",
+    "Cast",
+    "FieldAccess",
+    "VectorLoad",
+    "KernelExpr",
+    # Statements
+    "VarDecl",
+    "Assign",
+    "VarAssign",
+    "AugAssign",
+    "ForLoop",
+    "IfStmt",
+    "SyncThreads",
+    "ArrayDecl",
+    "PragmaUnroll",
+    "RawCode",
+    "Stmt",
+    # Kernel definition
+    "KernelParam",
+    "KernelDef",
+]
+
 # ---------------------------------------------------------------------------
-# Expressions
+# Kernel-specific expression types
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class Var:
-    """Variable reference."""
-
-    name: str
-
-
-@dataclass
-class Literal:
-    """Numeric constant."""
-
-    value: int | float
-    dtype: str = "float"
-
-
-@dataclass
-class BinOp:
-    """Binary operation."""
-
-    op: str  # "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "&&", "||"
-    left: Expr
-    right: Expr
-
-
-@dataclass
-class ArrayAccess:
+class ArrayAccess(_ExprOps):
     """Array element access: array[index]."""
 
     array: str
@@ -47,22 +68,7 @@ class ArrayAccess:
 
 
 @dataclass
-class CudaBuiltin:
-    """CUDA built-in variable (threadIdx.x, blockIdx.y, blockDim.x, etc.)."""
-
-    name: str
-
-
-@dataclass
-class FuncCall:
-    """Function call expression: name(args)."""
-
-    name: str  # "min", "max", "__ldg", etc.
-    args: list[Expr]
-
-
-@dataclass
-class Cast:
+class Cast(_ExprOps):
     """Type cast: (dtype)(expr)."""
 
     dtype: str  # "float4", "int", etc.
@@ -70,7 +76,7 @@ class Cast:
 
 
 @dataclass
-class FieldAccess:
+class FieldAccess(_ExprOps):
     """Struct field access: expr.field (for float4.x, .y, .z, .w)."""
 
     expr: Expr
@@ -78,16 +84,7 @@ class FieldAccess:
 
 
 @dataclass
-class Ternary:
-    """Ternary expression: cond ? if_true : if_false."""
-
-    cond: Expr
-    if_true: Expr
-    if_false: Expr
-
-
-@dataclass
-class VectorLoad:
+class VectorLoad(_ExprOps):
     """Load N contiguous floats as a vector: *(floatN*)(&array[index]).
 
     Used for coalesced float2/float4 loads from global memory.
@@ -98,7 +95,7 @@ class VectorLoad:
     width: int = 4  # 2 or 4
 
 
-Expr = Var | Literal | BinOp | ArrayAccess | CudaBuiltin | FuncCall | Cast | FieldAccess | Ternary | VectorLoad
+KernelExpr = Expr | ArrayAccess | Cast | FieldAccess | VectorLoad
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +109,7 @@ class VarDecl:
 
     dtype: str
     name: str
-    init: Expr | None = None
+    init: KernelExpr | None = None
 
 
 @dataclass
@@ -120,7 +117,7 @@ class Assign:
     """Array element assignment: target[index] = value."""
 
     target: ArrayAccess
-    value: Expr
+    value: KernelExpr
 
 
 @dataclass
@@ -128,7 +125,7 @@ class VarAssign:
     """Plain variable reassignment: name = value."""
 
     name: str
-    value: Expr
+    value: KernelExpr
 
 
 @dataclass
@@ -137,7 +134,7 @@ class AugAssign:
 
     target: str
     op: str  # "+=", "-=", "*="
-    value: Expr
+    value: KernelExpr
 
 
 @dataclass
@@ -145,17 +142,17 @@ class ForLoop:
     """C-style for loop: for (int var = start; var < end; var += step)."""
 
     var: str
-    start: Expr
-    end: Expr
+    start: KernelExpr
+    end: KernelExpr
     body: list[Stmt]
-    step: Expr | None = None  # None = var++ (increment by 1)
+    step: KernelExpr | None = None  # None = var++ (increment by 1)
 
 
 @dataclass
 class IfStmt:
     """If statement with optional else."""
 
-    cond: Expr
+    cond: KernelExpr
     body: list[Stmt]
     else_body: list[Stmt] | None = None
 
@@ -172,7 +169,7 @@ class ArrayDecl:
     dtype: str  # "__shared__ float", "float", "float4"
     name: str
     dimensions: list[int]  # [64, 64] for 2D, [256] for 1D
-    init: Expr | None = None
+    init: KernelExpr | None = None
 
 
 @dataclass

@@ -3,12 +3,12 @@
 from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, generate_kernel, lower_tiled
 from deplodock.compiler.backend.cuda.runner import KernelResult, has_cuda_gpu, has_nvcc, run_kernel
-from deplodock.compiler.backend.kernel_ir import (
+from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     Assign,
     AugAssign,
     BinOp,
-    CudaBuiltin,
+    Builtin,
     ForLoop,
     IfStmt,
     KernelDef,
@@ -25,7 +25,7 @@ __all__ = [
     "Assign",
     "AugAssign",
     "BinOp",
-    "CudaBuiltin",
+    "Builtin",
     "ForLoop",
     "IfStmt",
     "KernelDef",

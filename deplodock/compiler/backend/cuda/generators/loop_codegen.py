@@ -7,18 +7,18 @@ analysis — all structural decisions were made during lowering.
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.kernel_ir import (
+from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
     AugAssign,
     BinOp,
-    CudaBuiltin,
-    Expr,
+    Builtin,
     ForLoop,
     FuncCall,
     IfStmt,
     KernelDef,
+    KernelExpr,
     KernelParam,
     Literal,
     RawCode,
@@ -29,23 +29,17 @@ from deplodock.compiler.backend.kernel_ir import (
     VarAssign,
     VarDecl,
 )
-from deplodock.compiler.backend.loop_ir import (
+from deplodock.compiler.backend.ir.loop_ir import (
     Accumulate,
     Alloc,
     Barrier,
     Guard,
     Let,
     Load,
-    LoopBinOp,
-    LoopBuiltin,
     LoopExpr,
-    LoopFuncCall,
-    LoopLiteral,
     LoopNest,
     LoopOp,
     LoopProgram,
-    LoopTernary,
-    LoopVar,
     OpCall,
     ParallelAxis,
     RawLoopOp,
@@ -83,19 +77,20 @@ def loop_ir_to_kernel(program: LoopProgram) -> KernelDef:
 # ---------------------------------------------------------------------------
 
 
-def _lower_expr(expr: LoopExpr) -> Expr:
-    """Convert a LoopExpr to a KernelDef Expr."""
-    if isinstance(expr, LoopVar):
-        return Var(expr.name)
-    if isinstance(expr, LoopLiteral):
-        return Literal(expr.value, expr.dtype)
-    if isinstance(expr, LoopBinOp):
+def _lower_expr(expr: LoopExpr) -> KernelExpr:
+    """Convert a LoopExpr to a KernelDef Expr.
+
+    Shared expression types (Var, Literal, BinOp, Builtin, FuncCall, Ternary)
+    pass through as-is since they are the same type in both IRs.
+    Only loop-specific types (RegAccess, OpCall) need conversion.
+    """
+    if isinstance(expr, (Var, Literal, Builtin)):
+        return expr
+    if isinstance(expr, BinOp):
         return BinOp(expr.op, _lower_expr(expr.left), _lower_expr(expr.right))
-    if isinstance(expr, LoopBuiltin):
-        return CudaBuiltin(expr.name)
-    if isinstance(expr, LoopFuncCall):
+    if isinstance(expr, FuncCall):
         return FuncCall(expr.name, [_lower_expr(a) for a in expr.args])
-    if isinstance(expr, LoopTernary):
+    if isinstance(expr, Ternary):
         return Ternary(_lower_expr(expr.cond), _lower_expr(expr.if_true), _lower_expr(expr.if_false))
     if isinstance(expr, RegAccess):
         # Expand to scalar variable name: c[3][2] → "c32"
@@ -186,13 +181,13 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
                     op.name,
                     BinOp(
                         "+",
-                        BinOp("*", CudaBuiltin("blockIdx.x"), CudaBuiltin("blockDim.x")),
-                        CudaBuiltin("threadIdx.x"),
+                        BinOp("*", Builtin("blockIdx.x"), Builtin("blockDim.x")),
+                        Builtin("threadIdx.x"),
                     ),
                 )
             ]
         # Row-parallel: one block per row
-        return [VarDecl("int", op.name, BinOp("*", Literal(1, "int"), CudaBuiltin(op.dim)))]
+        return [VarDecl("int", op.name, BinOp("*", Literal(1, "int"), Builtin(op.dim)))]
 
     if isinstance(op, LoopNest):
         body = _lower_ops(op.body)
@@ -311,9 +306,9 @@ def _emit_warp_reduce(acc_var: str, fn: str) -> list[Stmt]:
     shfl = FuncCall("__shfl_down_sync", [Literal(0xFFFFFFFF, "int"), acc, Var("offset")])
     warp_arr = f"warp_{acc_var}"
     s_var = f"s_{acc_var}"
-    tid = CudaBuiltin("threadIdx.x")
-    warp_size = CudaBuiltin("warpSize")
-    block_dim = CudaBuiltin("blockDim.x")
+    tid = Builtin("threadIdx.x")
+    warp_size = Builtin("warpSize")
+    block_dim = Builtin("blockDim.x")
 
     # Shuffle body: acc += shfl (sum) or acc = fmaxf(acc, shfl) (max)
     if fn == "sum":
@@ -481,7 +476,7 @@ def _emit_warp_shuffle_xor(acc_var: str, fn: str) -> list[Stmt]:
 # ---------------------------------------------------------------------------
 
 
-def _expr_to_c(expr: Expr) -> str:
+def _expr_to_c(expr: KernelExpr) -> str:
     """Quick-and-dirty Expr to C string for use in RawCode."""
     from deplodock.compiler.backend.codegen import _emit_expr
 
