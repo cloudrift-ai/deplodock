@@ -292,7 +292,10 @@ def _lower_smem(  # noqa: C901
     smem_stride = bk + 1  # bank conflict padding
 
     params = []
+    output_set_smem = set(region.output_names)
     for inp in region.input_names:
+        if inp in output_set_smem:
+            continue
         params.append(KernelParam("const float* __restrict__", _safe(inp)))
     for out in region.output_names:
         params.append(KernelParam("float* __restrict__", _safe(out)))
@@ -611,8 +614,14 @@ def _lower_naive(
     phases = analysis.op_phases
 
     # --- Params ---
+    # When a buffer appears in both input_names and output_names (in-place
+    # operation, e.g. softmax split from a contraction), emit a single
+    # read-write float* parameter instead of separate const/non-const params.
     params = []
+    output_set = set(region.output_names)
     for inp in region.input_names:
+        if inp in output_set:
+            continue  # will be emitted as float* (read-write) with outputs
         params.append(KernelParam("const float* __restrict__", _safe(inp)))
     for out in region.output_names:
         params.append(KernelParam("float* __restrict__", _safe(out)))
