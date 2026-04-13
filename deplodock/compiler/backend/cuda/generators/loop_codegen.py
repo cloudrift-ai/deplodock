@@ -420,9 +420,6 @@ def _emit_tma_pipeline(op, tma_config) -> str:
         fma_lines.append(f"float a{r}=cas[(tr+{r})*{bk}+kk];" + "".join(f"c{r}{c}+=a{r}*b{c};" for c in range(thread_n)))
     fma_block = "\n            ".join(fma_lines)
 
-    # Accumulator declarations (TMA code references them inline)
-    acc_decls = ",".join(f"c{r}{c}=0" for r in range(thread_m) for c in range(thread_n))
-
     a_ref = tma_config.a_tma_ref
     b_ref = tma_config.b_tma_ref
 
@@ -441,7 +438,6 @@ def _emit_tma_pipeline(op, tma_config) -> str:
         f'asm volatile("mbarrier.init.shared::cta.b64 [%0],%1;"::"r"(mb1),"r"(1));'
         f'asm volatile("fence.mbarrier_init.release.cluster;");}}\n'
         f"__syncthreads();\n"
-        f"float {acc_decls};\n"
         f"const int bytes={smem_bytes};\n"
         f"{k_range}\n"
         f"if(nt>0&&tid==0){{"
