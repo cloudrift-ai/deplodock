@@ -294,10 +294,10 @@ def _emit_contraction_k_loop(
     """Emit the K-loop for contraction (naive global-load strategy)."""
     thread_m = schedule.thread_m or 8
     thread_n = schedule.thread_n or 4
-    a_name = _safe(analysis.contraction_a)
-    b_name = _safe(analysis.contraction_b)
-    a_src = "Ab" if schedule.is_batched else a_name
-    b_src = "Bb" if schedule.is_batched else b_name
+    A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
+    B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
+    a_src = LoopVar("Ab") if schedule.is_batched else A
+    b_src = LoopVar("Bb") if schedule.is_batched else B
 
     bn, tc, bm, tr = LoopVar("bn"), LoopVar("tc"), LoopVar("bm"), LoopVar("tr")
     k, K, N, M = LoopVar("k"), LoopVar("K"), LoopVar("N"), LoopVar("M")  # noqa: N806
@@ -1276,9 +1276,9 @@ def _lower_contraction_naive(
         batch = LoopVar("batch")
         body.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
         body.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
-        a_src, b_src = "Ab", "Bb"
+        a_src, b_src = LoopVar("Ab"), LoopVar("Bb")
     else:
-        a_src, b_src = A_buf, B_buf
+        a_src, b_src = A, B
 
     # Accumulator register array
     body.append(Alloc("c", "float", (thread_m, thread_n), "reg", LoopLiteral(0.0)))
