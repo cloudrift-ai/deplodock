@@ -5,14 +5,14 @@ emit_kernel / _emit_expr / _emit_stmt produce correct C/CUDA source.
 """
 
 from deplodock.compiler.backend.codegen import emit_kernel
-from deplodock.compiler.backend.kernel_ir import (
+from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
     AugAssign,
     BinOp,
+    Builtin,
     Cast,
-    CudaBuiltin,
     FieldAccess,
     ForLoop,
     FuncCall,
@@ -99,8 +99,8 @@ def test_array_access_complex_index():
 
 
 def test_cuda_builtin():
-    assert _emit_expr(CudaBuiltin("threadIdx.x")) == "threadIdx.x"
-    assert _emit_expr(CudaBuiltin("blockIdx.y")) == "blockIdx.y"
+    assert _emit_expr(Builtin("threadIdx.x")) == "threadIdx.x"
+    assert _emit_expr(Builtin("blockIdx.y")) == "blockIdx.y"
 
 
 def test_func_call_no_args():
@@ -310,7 +310,7 @@ def test_kernel_def_with_params():
             KernelParam("int", "N"),
         ],
         body=[
-            VarDecl("int", "i", CudaBuiltin("threadIdx.x")),
+            VarDecl("int", "i", Builtin("threadIdx.x")),
             IfStmt(
                 cond=BinOp("<", Var("i"), Var("N")),
                 body=[Assign(ArrayAccess("C", Var("i")), BinOp("+", ArrayAccess("A", Var("i")), ArrayAccess("B", Var("i"))))],

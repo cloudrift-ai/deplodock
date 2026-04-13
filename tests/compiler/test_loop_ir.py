@@ -5,22 +5,22 @@ import json
 from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, build_schedule, lower_generic, lower_to_loop_ir
 from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
-from deplodock.compiler.backend.loop_ir import (
+from deplodock.compiler.backend.ir.loop_ir import (
     Accumulate,
     Alloc,
+    BinOp,
+    Builtin,
     Guard,
     Let,
+    Literal,
     Load,
-    LoopBinOp,
-    LoopBuiltin,
-    LoopLiteral,
     LoopNest,
     LoopProgram,
-    LoopVar,
     OpCall,
     ParallelAxis,
     RawLoopOp,
     Store,
+    Var,
     WarpReduce,
     pretty_print,
     to_dict,
@@ -40,11 +40,11 @@ def test_loop_program_construction():
         body=[
             ParallelAxis("i", "blockIdx.x", "n"),
             Guard(
-                LoopBinOp("<", LoopVar("i"), LoopVar("n")),
+                BinOp("<", Var("i"), Var("n")),
                 [
-                    Load("v", "X", LoopVar("i"), "global"),
-                    Let("out", LoopVar("v") * 2.0),
-                    Store("Y", LoopVar("i"), LoopVar("out"), "global"),
+                    Load("v", "X", Var("i"), "global"),
+                    Let("out", Var("v") * 2.0),
+                    Store("Y", Var("i"), Var("out"), "global"),
                 ],
             ),
         ],
@@ -64,11 +64,11 @@ def test_pretty_print_pointwise():
         body=[
             ParallelAxis("i", "blockIdx.x", "n"),
             Guard(
-                LoopBinOp("<", LoopVar("i"), LoopVar("n")),
+                BinOp("<", Var("i"), Var("n")),
                 [
-                    Load("v", "X", LoopVar("i"), "global"),
-                    Let("out", OpCall("relu", [LoopVar("v")])),
-                    Store("Y", LoopVar("i"), LoopVar("out"), "global"),
+                    Load("v", "X", Var("i"), "global"),
+                    Let("out", OpCall("relu", [Var("v")])),
+                    Store("Y", Var("i"), Var("out"), "global"),
                 ],
             ),
         ],
@@ -92,17 +92,17 @@ def test_pretty_print_reduce():
         body=[
             ParallelAxis("row", "blockIdx.x", "rows"),
             Guard(
-                LoopBinOp("<", LoopVar("row"), LoopVar("rows")),
+                BinOp("<", Var("row"), Var("rows")),
                 [
-                    Alloc("acc", "float", None, "reg", LoopLiteral(0.0)),
+                    Alloc("acc", "float", None, "reg", Literal(0.0)),
                     LoopNest(
                         "j",
-                        LoopBuiltin("threadIdx.x"),
-                        LoopVar("cols"),
-                        LoopBuiltin("blockDim.x"),
+                        Builtin("threadIdx.x"),
+                        Var("cols"),
+                        Builtin("blockDim.x"),
                         [
-                            Load("v", "X", LoopBinOp("+", LoopBinOp("*", LoopVar("row"), LoopVar("cols")), LoopVar("j")), "global"),
-                            Accumulate("acc", "sum", LoopVar("v")),
+                            Load("v", "X", BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j")), "global"),
+                            Accumulate("acc", "sum", Var("v")),
                         ],
                     ),
                     WarpReduce("acc", "sum"),
@@ -125,11 +125,11 @@ def test_pretty_print_contraction():
         params=[("float*", "C")],
         body=[
             RawLoopOp("/* CTA swizzle grid setup */", "grid setup"),
-            Alloc("c00", "float", None, "reg", LoopLiteral(0.0)),
+            Alloc("c00", "float", None, "reg", Literal(0.0)),
             LoopNest(
                 "k",
-                LoopLiteral(0, "int"),
-                LoopVar("K"),
+                Literal(0, "int"),
+                Var("K"),
                 None,
                 [RawLoopOp("/* FMA body */", "K-loop body")],
             ),
@@ -157,8 +157,8 @@ def test_loop_ir_json_roundtrip():
         body=[
             ParallelAxis("i", "blockIdx.x", "n"),
             Guard(
-                LoopBinOp("<", LoopVar("i"), LoopVar("n")),
-                [Store("X", LoopVar("i"), LoopLiteral(1.0), "global")],
+                BinOp("<", Var("i"), Var("n")),
+                [Store("X", Var("i"), Literal(1.0), "global")],
             ),
         ],
         block_size=(256, 1, 1),

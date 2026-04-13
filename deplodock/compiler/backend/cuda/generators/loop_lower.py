@@ -15,26 +15,26 @@ import math
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by
-from deplodock.compiler.backend.loop_ir import (
+from deplodock.compiler.backend.ir.loop_ir import (
     Accumulate,
     Alloc,
     Barrier,
+    Builtin,
+    FuncCall,
     Guard,
     Let,
+    Literal,
     Load,
-    LoopBuiltin,
     LoopExpr,
-    LoopFuncCall,
-    LoopLiteral,
     LoopNest,
     LoopProgram,
-    LoopTernary,
-    LoopVar,
     OpCall,
     ParallelAxis,
     RegAccess,
     SetVar,
     Store,
+    Ternary,
+    Var,
     WarpReduce,
     WarpShuffleXor,
 )
@@ -138,13 +138,13 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
         return ops
 
     # 2D register tile (contraction)
-    ops.append(Alloc("c", accum.dtype, accum.shape, "reg", LoopLiteral(0.0)))
+    ops.append(Alloc("c", accum.dtype, accum.shape, "reg", Literal(0.0)))
 
     # Batch pointer aliases for contraction
     if schedule.is_batched and analysis.contraction_a:
-        A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
-        B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
-        batch, M, K, N = LoopVar("batch"), LoopVar("M"), LoopVar("K"), LoopVar("N")  # noqa: N806
+        A = Var(_safe(analysis.contraction_a))  # noqa: N806
+        B = Var(_safe(analysis.contraction_b))  # noqa: N806
+        batch, M, K, N = Var("batch"), Var("M"), Var("K"), Var("N")  # noqa: N806
         ops.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
         ops.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
 
@@ -192,15 +192,15 @@ def _emit_pointwise_body(
         idx = _input_loop_expr(inp, analysis, "i", out_size)
         load_name = f"v_{_safe(inp)}"
         guard_body.append(Load(load_name, _safe(inp), idx, "global"))
-        var_map[inp] = LoopVar(load_name)
+        var_map[inp] = Var(load_name)
 
     _emit_loop_ops(region.region_ops, var_map, "v_", guard_body)
 
     for out_id in region.output_names:
-        val = var_map.get(out_id, LoopLiteral(0.0))
-        guard_body.append(Store(_safe(out_id), LoopVar("i"), val, "global"))
+        val = var_map.get(out_id, Literal(0.0))
+        guard_body.append(Store(_safe(out_id), Var("i"), val, "global"))
 
-    return [Guard(LoopVar("i").lt(LoopVar("n")), guard_body)]
+    return [Guard(Var("i").lt(Var("n")), guard_body)]
 
 
 def _emit_scalar_reductions(
@@ -236,30 +236,30 @@ def _emit_scalar_reductions(
                 idx = _input_loop_expr(inp, analysis, "j", out_size)
                 load_name = f"r{ri}ld_{_safe(inp)}"
                 pass_body.append(Load(load_name, _safe(inp), idx, "global"))
-                pass_var_map[inp] = LoopVar(load_name)
+                pass_var_map[inp] = Var(load_name)
 
             for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
-                pass_var_map[prev_nid] = LoopVar(prev_acc)
+                pass_var_map[prev_nid] = Var(prev_acc)
 
             all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
             needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
             for pid, pop, pinp in phases.prologue:
                 if isinstance(pop, ElementwiseOp) and pid in needed:
-                    a = pass_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
-                    b = pass_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
+                    a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
+                    b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
                     var_name = f"r{ri}p_{_safe(pid)}"
                     pass_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                    pass_var_map[pid] = LoopVar(var_name)
+                    pass_var_map[pid] = Var(var_name)
 
             if ri > 0 and phases.inter_reduce:
                 _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body)
 
-            val = pass_var_map.get(input_ids[0], LoopLiteral(0.0))
+            val = pass_var_map.get(input_ids[0], Literal(0.0))
             pass_body.append(Accumulate(acc_name, fn, val))
 
-            guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), pass_body))
+            guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
             guarded.append(WarpReduce(acc_name, fn))
-            var_map[node_id] = LoopVar(acc_name)
+            var_map[node_id] = Var(acc_name)
     else:
         # Single reduce: one tile loop
         loop_body: list = []
@@ -267,22 +267,22 @@ def _emit_scalar_reductions(
             idx = _input_loop_expr(inp, analysis, "j", out_size)
             load_name = f"ld_{_safe(inp)}"
             loop_body.append(Load(load_name, _safe(inp), idx, "global"))
-            var_map[inp] = LoopVar(load_name)
+            var_map[inp] = Var(load_name)
 
         _emit_loop_ops(phases.prologue, var_map, "p_", loop_body)
 
         for node_id, _op, input_ids in phases.reduces:
             acc_name, fn = reduce_vars[node_id]
-            val = var_map.get(input_ids[0], LoopLiteral(0.0))
+            val = var_map.get(input_ids[0], Literal(0.0))
             loop_body.append(Accumulate(acc_name, fn, val))
 
-        guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), loop_body))
+        guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), loop_body))
 
         for node_id, (acc_name, fn) in reduce_vars.items():
             guarded.append(WarpReduce(acc_name, fn))
-            var_map[node_id] = LoopVar(acc_name)
+            var_map[node_id] = Var(acc_name)
 
-    return [Guard(LoopVar("row").lt(LoopVar("rows")), guarded)]
+    return [Guard(Var("row").lt(Var("rows")), guarded)]
 
 
 def _emit_contraction_k_loop(
@@ -294,13 +294,13 @@ def _emit_contraction_k_loop(
     """Emit the K-loop for contraction (naive global-load strategy)."""
     thread_m = schedule.thread_m or 8
     thread_n = schedule.thread_n or 4
-    A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
-    B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
-    a_src = LoopVar("Ab") if schedule.is_batched else A
-    b_src = LoopVar("Bb") if schedule.is_batched else B
+    A = Var(_safe(analysis.contraction_a))  # noqa: N806
+    B = Var(_safe(analysis.contraction_b))  # noqa: N806
+    a_src = Var("Ab") if schedule.is_batched else A
+    b_src = Var("Bb") if schedule.is_batched else B
 
-    bn, tc, bm, tr = LoopVar("bn"), LoopVar("tc"), LoopVar("bm"), LoopVar("tr")
-    k, K, N, M = LoopVar("k"), LoopVar("K"), LoopVar("N"), LoopVar("M")  # noqa: N806
+    bn, tc, bm, tr = Var("bn"), Var("tc"), Var("bm"), Var("tr")
+    k, K, N, M = Var("k"), Var("K"), Var("N"), Var("M")  # noqa: N806
 
     k_body: list = []
     for c in range(thread_n):
@@ -311,9 +311,9 @@ def _emit_contraction_k_loop(
         row = bm + tr + r
         k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
         for c in range(thread_n):
-            k_body.append(Accumulate(f"c{r}{c}", "sum", LoopVar(f"a{r}") * LoopVar(f"b{c}")))
+            k_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
 
-    return [LoopNest("k", LoopLiteral(0, "int"), K, None, k_body)]
+    return [LoopNest("k", Literal(0, "int"), K, None, k_body)]
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +368,7 @@ def _emit_scalar_epilogue(
 
     var_map: dict[str, LoopExpr] = {}
     for node_id, (acc_name, _fn) in reduce_vars.items():
-        var_map[node_id] = LoopVar(acc_name)
+        var_map[node_id] = Var(acc_name)
 
     has_multi_reduce = len(phases.reduces) > 1
 
@@ -381,7 +381,7 @@ def _emit_scalar_epilogue(
             idx = _input_loop_expr(inp, analysis, "j", out_size)
             load_name = f"epld_{_safe(inp)}"
             epi_body.append(Load(load_name, _safe(inp), idx, "global"))
-            epi_var_map[inp] = LoopVar(load_name)
+            epi_var_map[inp] = Var(load_name)
 
         # Re-compute prologue + inter_reduce ops
         all_inter_ops = [op for group in phases.inter_reduce for op in group] if has_multi_reduce else []
@@ -389,20 +389,20 @@ def _emit_scalar_epilogue(
         needed = _needed_by(phases.epilogue)
         for pid, pop, pinp in recompute_ops:
             if isinstance(pop, ElementwiseOp) and (pid in needed or has_multi_reduce):
-                a = epi_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
-                b = epi_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
+                a = epi_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
+                b = epi_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
                 var_name = f"ep_{_safe(pid)}"
                 epi_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                epi_var_map[pid] = LoopVar(var_name)
+                epi_var_map[pid] = Var(var_name)
 
         _emit_loop_ops(phases.epilogue, epi_var_map, "e_", epi_body)
 
         for out_id in region.output_names:
-            val = epi_var_map.get(out_id, LoopLiteral(0.0))
-            idx = LoopVar("row") * LoopVar("cols") + LoopVar("j")
+            val = epi_var_map.get(out_id, Literal(0.0))
+            idx = Var("row") * Var("cols") + Var("j")
             epi_body.append(Store(_safe(out_id), idx, val, "global"))
 
-        return [LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), epi_body)]
+        return [LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), epi_body)]
 
     # Scalar epilogue (no per-element loop needed)
     ops: list = []
@@ -441,7 +441,7 @@ def _emit_write(
 
     var_map: dict[str, LoopExpr] = {}
     for node_id, (acc_name, _fn) in reduce_vars.items():
-        var_map[node_id] = LoopVar(acc_name)
+        var_map[node_id] = Var(acc_name)
 
     if schedule.epilogue_per_element or len(phases.reduces) > 1:
         # Per-element writes were already emitted in the epilogue loop
@@ -450,11 +450,11 @@ def _emit_write(
         # No epilogue — write last reduce result (thread 0 only)
         ops: list = []
         for out_id in region.output_names:
-            val = var_map.get(out_id, LoopLiteral(0.0))
+            val = var_map.get(out_id, Literal(0.0))
             ops.append(
                 Guard(
-                    LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
-                    [Store(_safe(out_id), LoopVar("row"), val, "global")],
+                    Builtin("threadIdx.x").eq(Literal(0, "int")),
+                    [Store(_safe(out_id), Var("row"), val, "global")],
                 )
             )
         return ops
@@ -466,11 +466,11 @@ def _emit_write(
         # Re-derive var_map with epilogue results
         _emit_loop_ops(phases.epilogue, var_map, "e_", [])  # just update var_map
         for out_id in region.output_names:
-            val = var_map.get(out_id, LoopLiteral(0.0))
+            val = var_map.get(out_id, Literal(0.0))
             ops.append(
                 Guard(
-                    LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
-                    [Store(_safe(out_id), LoopVar("row"), val, "global")],
+                    Builtin("threadIdx.x").eq(Literal(0, "int")),
+                    [Store(_safe(out_id), Var("row"), val, "global")],
                 )
             )
         return ops
@@ -478,11 +478,11 @@ def _emit_write(
     # No epilogue — write last reduce result (thread 0)
     ops = []
     for out_id in region.output_names:
-        val = var_map.get(out_id, LoopLiteral(0.0))
+        val = var_map.get(out_id, Literal(0.0))
         ops.append(
             Guard(
-                LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
-                [Store(_safe(out_id), LoopVar("row"), val, "global")],
+                Builtin("threadIdx.x").eq(Literal(0, "int")),
+                [Store(_safe(out_id), Var("row"), val, "global")],
             )
         )
     return ops
@@ -531,26 +531,26 @@ def _safe(name: str) -> str:
     return name.replace("-", "_").replace(".", "_").replace(" ", "_")
 
 
-def _reduce_init_expr(fn: str) -> LoopLiteral:
+def _reduce_init_expr(fn: str) -> Literal:
     """Initial value for a reduction accumulator."""
     if fn == "sum":
-        return LoopLiteral(0.0)
+        return Literal(0.0)
     if fn == "max":
-        return LoopLiteral(-1e30)
-    return LoopLiteral(0.0)
+        return Literal(-1e30)
+    return Literal(0.0)
 
 
 def _input_loop_expr(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> LoopExpr:
     """Build the index expression for reading an input tensor."""
     acc = analysis.input_access[inp]
-    row, cols, j = LoopVar("row"), LoopVar("cols"), LoopVar(idx_var)
+    row, cols, j = Var("row"), Var("cols"), Var(idx_var)
 
     if analysis.pattern == "pointwise":
         if acc.is_scalar:
-            return LoopLiteral(0, "int")
+            return Literal(0, "int")
         if acc.size < out_size:
-            return LoopVar("i") % acc.size
-        return LoopVar("i")
+            return Var("i") % acc.size
+        return Var("i")
 
     if acc.is_2d:
         return row * cols + j
@@ -558,7 +558,7 @@ def _input_loop_expr(inp: str, analysis: TileAnalysis, idx_var: str, out_size: i
         return row
     if acc.is_row_vector:
         return j
-    return LoopLiteral(0, "int")
+    return Literal(0, "int")
 
 
 def _emit_loop_ops(
@@ -575,12 +575,12 @@ def _emit_loop_ops(
             continue
 
         if isinstance(op, ElementwiseOp):
-            a = var_map.get(input_ids[0], LoopLiteral(0.0)) if input_ids else LoopLiteral(0.0)
-            b = var_map.get(input_ids[1], LoopLiteral(0.0)) if len(input_ids) > 1 else LoopLiteral(0.0)
+            a = var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
+            b = var_map.get(input_ids[1], Literal(0.0)) if len(input_ids) > 1 else Literal(0.0)
             var_name = f"{prefix}{_safe(node_id)}"
             args = [a, b] if op.info.arity == 2 and len(input_ids) > 1 else [a]
             body.append(Let(var_name, OpCall(op.fn, args)))
-            var_map[node_id] = LoopVar(var_name)
+            var_map[node_id] = Var(var_name)
 
 
 def _build_params(region: FusedRegionOp) -> list[tuple[str, str]]:
@@ -632,17 +632,17 @@ def _lower_pointwise(
         idx = _input_loop_expr(inp, analysis, "i", out_size)
         load_name = f"v_{_safe(inp)}"
         guard_body.append(Load(load_name, _safe(inp), idx, "global"))
-        var_map[inp] = LoopVar(load_name)
+        var_map[inp] = Var(load_name)
 
     # Emit all ops
     _emit_loop_ops(region.region_ops, var_map, "v_", guard_body)
 
     # Store outputs
     for out_id in region.output_names:
-        val = var_map.get(out_id, LoopLiteral(0.0))
-        guard_body.append(Store(_safe(out_id), LoopVar("i"), val, "global"))
+        val = var_map.get(out_id, Literal(0.0))
+        guard_body.append(Store(_safe(out_id), Var("i"), val, "global"))
 
-    body.append(Guard(LoopVar("i").lt(LoopVar("n")), guard_body))
+    body.append(Guard(Var("i").lt(Var("n")), guard_body))
 
     return LoopProgram(
         name=name,
@@ -690,7 +690,7 @@ def _lower_single_reduce(
     # Build var_map for inputs
     var_map: dict[str, LoopExpr] = {}
     for inp in region.input_names:
-        var_map[inp] = LoopVar(inp)  # placeholder, actual load inside loop
+        var_map[inp] = Var(inp)  # placeholder, actual load inside loop
 
     # Tile loop over columns
     loop_body: list = []
@@ -701,7 +701,7 @@ def _lower_single_reduce(
         idx = _input_loop_expr(inp, analysis, "j", out_size)
         load_name = f"ld_{_safe(inp)}"
         loop_body.append(Load(load_name, _safe(inp), idx, "global"))
-        var_map[inp] = LoopVar(load_name)
+        var_map[inp] = Var(load_name)
         input_loads[inp] = load_name
 
     # Prologue ops
@@ -710,15 +710,15 @@ def _lower_single_reduce(
     # Accumulation
     for node_id, _op, input_ids in phases.reduces:
         acc_name, fn = reduce_vars[node_id]
-        val = var_map.get(input_ids[0], LoopLiteral(0.0))
+        val = var_map.get(input_ids[0], Literal(0.0))
         loop_body.append(Accumulate(acc_name, fn, val))
 
-    guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), loop_body))
+    guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), loop_body))
 
     # Warp reduce
     for node_id, (acc_name, fn) in reduce_vars.items():
         guarded.append(WarpReduce(acc_name, fn))
-        var_map[node_id] = LoopVar(acc_name)
+        var_map[node_id] = Var(acc_name)
 
     # Epilogue
     epilogue_ops = phases.epilogue
@@ -731,49 +731,49 @@ def _lower_single_reduce(
                 idx = _input_loop_expr(inp, analysis, "j", out_size)
                 load_name = f"eld_{_safe(inp)}"
                 epi_body.append(Load(load_name, _safe(inp), idx, "global"))
-                epi_var_map[inp] = LoopVar(load_name)
+                epi_var_map[inp] = Var(load_name)
 
             # Re-compute prologue ops needed by epilogue
             needed = _needed_by(epilogue_ops)
             for node_id, op, input_ids in phases.prologue:
                 if isinstance(op, ElementwiseOp) and node_id in needed:
-                    a = epi_var_map.get(input_ids[0], LoopLiteral(0.0)) if input_ids else LoopLiteral(0.0)
-                    b = epi_var_map.get(input_ids[1], LoopLiteral(0.0)) if len(input_ids) > 1 else LoopLiteral(0.0)
+                    a = epi_var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
+                    b = epi_var_map.get(input_ids[1], Literal(0.0)) if len(input_ids) > 1 else Literal(0.0)
                     var_name = f"p_{_safe(node_id)}"
                     epi_body.append(Let(var_name, OpCall(op.fn, [a] if len(input_ids) == 1 else [a, b])))
-                    epi_var_map[node_id] = LoopVar(var_name)
+                    epi_var_map[node_id] = Var(var_name)
 
             _emit_loop_ops(epilogue_ops, epi_var_map, "e_", epi_body)
 
             for out_id in region.output_names:
-                val = epi_var_map.get(out_id, LoopLiteral(0.0))
-                idx = LoopVar("row") * LoopVar("cols") + LoopVar("j")
+                val = epi_var_map.get(out_id, Literal(0.0))
+                idx = Var("row") * Var("cols") + Var("j")
                 epi_body.append(Store(_safe(out_id), idx, val, "global"))
 
-            guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), epi_body))
+            guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), epi_body))
         else:
             # Scalar epilogue (thread 0 only)
             _emit_loop_ops(epilogue_ops, var_map, "e_", guarded)
             for out_id in region.output_names:
-                val = var_map.get(out_id, LoopLiteral(0.0))
+                val = var_map.get(out_id, Literal(0.0))
                 guarded.append(
                     Guard(
-                        LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
-                        [Store(_safe(out_id), LoopVar("row"), val, "global")],
+                        Builtin("threadIdx.x").eq(Literal(0, "int")),
+                        [Store(_safe(out_id), Var("row"), val, "global")],
                     )
                 )
     else:
         # No epilogue — write last reduce result (thread 0 only)
         for out_id in region.output_names:
-            val = var_map.get(out_id, LoopLiteral(0.0))
+            val = var_map.get(out_id, Literal(0.0))
             guarded.append(
                 Guard(
-                    LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
-                    [Store(_safe(out_id), LoopVar("row"), val, "global")],
+                    Builtin("threadIdx.x").eq(Literal(0, "int")),
+                    [Store(_safe(out_id), Var("row"), val, "global")],
                 )
             )
 
-    body.append(Guard(LoopVar("row").lt(LoopVar("rows")), guarded))
+    body.append(Guard(Var("row").lt(Var("rows")), guarded))
 
     return LoopProgram(
         name=name,
@@ -828,36 +828,36 @@ def _lower_multi_reduce(
             idx = _input_loop_expr(inp, analysis, "j", out_size)
             load_name = f"r{ri}ld_{_safe(inp)}"
             pass_body.append(Load(load_name, _safe(inp), idx, "global"))
-            pass_var_map[inp] = LoopVar(load_name)
+            pass_var_map[inp] = Var(load_name)
 
         # Previous reduce results are available as accumulators
         for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
-            pass_var_map[prev_nid] = LoopVar(prev_acc)
+            pass_var_map[prev_nid] = Var(prev_acc)
 
         # Re-compute prologue ops needed by this reduce or inter_reduce ops
         all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
         needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
         for pid, pop, pinp in phases.prologue:
             if isinstance(pop, ElementwiseOp) and pid in needed:
-                a = pass_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
-                b = pass_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
+                a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
+                b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
                 var_name = f"r{ri}p_{_safe(pid)}"
                 pass_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                pass_var_map[pid] = LoopVar(var_name)
+                pass_var_map[pid] = Var(var_name)
 
         # Apply inter_reduce ops (e.g. sub, exp between max and sum)
         if ri > 0 and phases.inter_reduce:
             _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body)
 
         # Accumulate
-        val = pass_var_map.get(input_ids[0], LoopLiteral(0.0))
+        val = pass_var_map.get(input_ids[0], Literal(0.0))
         pass_body.append(Accumulate(acc_name, fn, val))
 
-        guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), pass_body))
+        guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
 
         # Warp shuffle after each pass
         guarded.append(WarpReduce(acc_name, fn))
-        var_map[node_id] = LoopVar(acc_name)
+        var_map[node_id] = Var(acc_name)
 
     # Final epilogue pass
     epilogue_ops = phases.epilogue
@@ -869,38 +869,38 @@ def _lower_multi_reduce(
             idx = _input_loop_expr(inp, analysis, "j", out_size)
             load_name = f"epld_{_safe(inp)}"
             epi_body.append(Load(load_name, _safe(inp), idx, "global"))
-            epi_var_map[inp] = LoopVar(load_name)
+            epi_var_map[inp] = Var(load_name)
 
         # Re-compute ALL prologue + inter_reduce ops
         all_inter_ops = [op for group in phases.inter_reduce for op in group]
         for pid, pop, pinp in phases.prologue + all_inter_ops:
             if isinstance(pop, ElementwiseOp):
-                a = epi_var_map.get(pinp[0], LoopLiteral(0.0)) if pinp else LoopLiteral(0.0)
-                b = epi_var_map.get(pinp[1], LoopLiteral(0.0)) if len(pinp) > 1 else LoopLiteral(0.0)
+                a = epi_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
+                b = epi_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
                 var_name = f"ep_{_safe(pid)}"
                 epi_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                epi_var_map[pid] = LoopVar(var_name)
+                epi_var_map[pid] = Var(var_name)
 
         _emit_loop_ops(epilogue_ops, epi_var_map, "e_", epi_body)
 
         for out_id in region.output_names:
-            val = epi_var_map.get(out_id, LoopLiteral(0.0))
-            idx = LoopVar("row") * LoopVar("cols") + LoopVar("j")
+            val = epi_var_map.get(out_id, Literal(0.0))
+            idx = Var("row") * Var("cols") + Var("j")
             epi_body.append(Store(_safe(out_id), idx, val, "global"))
 
-        guarded.append(LoopNest("j", LoopBuiltin("threadIdx.x"), LoopVar("cols"), LoopBuiltin("blockDim.x"), epi_body))
+        guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), epi_body))
     else:
         # No epilogue — write last reduce result (thread 0 only)
         for out_id in region.output_names:
-            val = var_map.get(out_id, LoopLiteral(0.0))
+            val = var_map.get(out_id, Literal(0.0))
             guarded.append(
                 Guard(
-                    LoopBuiltin("threadIdx.x").eq(LoopLiteral(0, "int")),
-                    [Store(_safe(out_id), LoopVar("row"), val, "global")],
+                    Builtin("threadIdx.x").eq(Literal(0, "int")),
+                    [Store(_safe(out_id), Var("row"), val, "global")],
                 )
             )
 
-    body.append(Guard(LoopVar("row").lt(LoopVar("rows")), guarded))
+    body.append(Guard(Var("row").lt(Var("rows")), guarded))
 
     return LoopProgram(
         name=name,
@@ -947,23 +947,23 @@ def _cta_swizzle_grid(
     """
     ops: list = []
     I = "int"  # noqa: E741
-    N, M = LoopVar("N"), LoopVar("M")  # noqa: N806
-    bidy, bidx = LoopBuiltin("blockIdx.y"), LoopBuiltin("blockIdx.x")
-    tidy, tidx = LoopBuiltin("threadIdx.y"), LoopBuiltin("threadIdx.x")
-    gdimx = LoopBuiltin("gridDim.x")
+    N, M = Var("N"), Var("M")  # noqa: N806
+    bidy, bidx = Builtin("blockIdx.y"), Builtin("blockIdx.x")
+    tidy, tidx = Builtin("threadIdx.y"), Builtin("threadIdx.x")
+    gdimx = Builtin("gridDim.x")
     SWIZ = 8
 
     if is_batched:
-        ops.append(Let("batch", LoopBuiltin("blockIdx.z"), dtype=I))
+        ops.append(Let("batch", Builtin("blockIdx.z"), dtype=I))
 
     ops.append(Let("tr", tidy * thread_m, dtype=I))
     ops.append(Let("tc", tidx * thread_n, dtype=I))
     ops.append(Let("ntx", (N + (tile_n - 1)) / tile_n, dtype=I))
     ops.append(Let("nty", (M + (tile_m - 1)) / tile_m, dtype=I))
 
-    ntx, nty = LoopVar("ntx"), LoopVar("nty")
-    pid, grp, rem = LoopVar("pid"), LoopVar("grp"), LoopVar("rem")
-    by_s, bx_s = LoopVar("by_s"), LoopVar("bx_s")
+    ntx, nty = Var("ntx"), Var("nty")
+    pid, grp, rem = Var("pid"), Var("grp"), Var("rem")
+    by_s, bx_s = Var("by_s"), Var("bx_s")
 
     ops.append(Let("pid", bidx + bidy * gdimx, dtype=I))
     ops.append(Let("grp", pid / (ntx * SWIZ), dtype=I))
@@ -1041,7 +1041,7 @@ def _apply_ops_on_register_tile(
 
                 if other is not None and other in extra:
                     # Per-row variable (rmax, rsum)
-                    other_val = LoopVar(extra[other].format(r=r))
+                    other_val = Var(extra[other].format(r=r))
                     if inputs[0] == prev_id:
                         ops.append(SetVar(dst, OpCall(fn, [acc, other_val])))
                     else:
@@ -1052,19 +1052,19 @@ def _apply_ops_on_register_tile(
                     other_shape = shapes.get(other, ())
                     other_size = math.prod(d for d in other_shape if isinstance(d, int))
                     if other_size <= 1:
-                        idx = LoopLiteral(0, "int")
+                        idx = Literal(0, "int")
                     elif len(other_shape) <= 1:
-                        idx = LoopVar("bn") + LoopVar("tc") + c
+                        idx = Var("bn") + Var("tc") + c
                     else:
-                        row_e = LoopVar("bm") + LoopVar("tr") + r
-                        col_e = LoopVar("bn") + LoopVar("tc") + c
-                        idx = row_e * LoopVar("N") + col_e
+                        row_e = Var("bm") + Var("tr") + r
+                        col_e = Var("bn") + Var("tc") + c
+                        idx = row_e * Var("N") + col_e
                     ld_name = f"_{prefix}_{safe}_{r}_{c}"
                     ops.append(Load(ld_name, safe, idx, "global"))
                     if inputs[0] == prev_id:
-                        ops.append(SetVar(dst, OpCall(fn, [acc, LoopVar(ld_name)])))
+                        ops.append(SetVar(dst, OpCall(fn, [acc, Var(ld_name)])))
                     else:
-                        ops.append(SetVar(dst, OpCall(fn, [LoopVar(ld_name), acc])))
+                        ops.append(SetVar(dst, OpCall(fn, [Var(ld_name), acc])))
                 else:
                     # Unary op on accumulator
                     ops.append(SetVar(dst, OpCall(fn, [acc])))
@@ -1102,13 +1102,13 @@ def _contraction_softmax_epilogue_ops(
     # Phase 1: row max via WarpShuffleXor.
     for r in range(thread_m):
         rmax = f"rmax{r}"
-        ops.append(Alloc(rmax, "float", None, "reg", LoopLiteral(-1e30)))
+        ops.append(Alloc(rmax, "float", None, "reg", Literal(-1e30)))
         for c in range(thread_n):
-            col_c = LoopVar("bn") + LoopVar("tc") + c
+            col_c = Var("bn") + Var("tc") + c
             ops.append(
                 Guard(
-                    col_c.lt(LoopVar("N")),
-                    [SetVar(rmax, LoopFuncCall("fmaxf", [LoopVar(rmax), RegAccess("c", [r, c])]))],
+                    col_c.lt(Var("N")),
+                    [SetVar(rmax, FuncCall("fmaxf", [Var(rmax), RegAccess("c", [r, c])]))],
                 )
             )
         ops.append(WarpShuffleXor(rmax, "max"))
@@ -1125,9 +1125,9 @@ def _contraction_softmax_epilogue_ops(
         for r in range(thread_m):
             rsum = f"rsum{r}"
             rmax = f"rmax{r}"
-            ops.append(Alloc(rsum, "float", None, "reg", LoopLiteral(0.0)))
+            ops.append(Alloc(rsum, "float", None, "reg", Literal(0.0)))
             for c in range(thread_n):
-                col_c = LoopVar("bn") + LoopVar("tc") + c
+                col_c = Var("bn") + Var("tc") + c
                 guarded: list = []
 
                 # Apply inter_reduce[1] ops generically, with rmax as extra var
@@ -1148,7 +1148,7 @@ def _contraction_softmax_epilogue_ops(
                     guarded.append(tile_op)
 
                 guarded.append(Accumulate(rsum, "sum", RegAccess("c", [r, c])))
-                ops.append(Guard(col_c.lt(LoopVar("N")), guarded))
+                ops.append(Guard(col_c.lt(Var("N")), guarded))
             ops.append(WarpShuffleXor(rsum, "sum"))
 
     # Phase 3: apply epilogue ops generically.
@@ -1160,7 +1160,7 @@ def _contraction_softmax_epilogue_ops(
         for r in range(thread_m):
             rsum = f"rsum{r}"
             for c in range(thread_n):
-                col_c = LoopVar("bn") + LoopVar("tc") + c
+                col_c = Var("bn") + Var("tc") + c
                 epi_ops = _apply_ops_on_register_tile(
                     phases.epilogue,
                     epi_prev,
@@ -1176,7 +1176,7 @@ def _contraction_softmax_epilogue_ops(
                     if isinstance(tile_op, SetVar) and tile_op.name == "c00":
                         tile_op = SetVar(f"c{r}{c}", _fixup_reg_refs_expr(tile_op.expr, 0, 0, r, c))
                     fixed.append(tile_op)
-                ops.append(Guard(col_c.lt(LoopVar("N")), fixed))
+                ops.append(Guard(col_c.lt(Var("N")), fixed))
 
     return ops
 
@@ -1187,8 +1187,8 @@ def _fixup_reg_refs_expr(expr: LoopExpr, from_r: int, from_c: int, to_r: int, to
         return RegAccess("c", [to_r, to_c])
     if isinstance(expr, OpCall):
         return OpCall(expr.op, [_fixup_reg_refs_expr(a, from_r, from_c, to_r, to_c) for a in expr.args])
-    if isinstance(expr, LoopFuncCall):
-        return LoopFuncCall(expr.name, [_fixup_reg_refs_expr(a, from_r, from_c, to_r, to_c) for a in expr.args])
+    if isinstance(expr, FuncCall):
+        return FuncCall(expr.name, [_fixup_reg_refs_expr(a, from_r, from_c, to_r, to_c) for a in expr.args])
     return expr
 
 
@@ -1205,8 +1205,8 @@ def _contraction_write_ops(
     """
     ops: list = []
     safe_out = _safe(output_name)
-    bm, tr, bn, tc = LoopVar("bm"), LoopVar("tr"), LoopVar("bn"), LoopVar("tc")
-    M, N = LoopVar("M"), LoopVar("N")  # noqa: N806
+    bm, tr, bn, tc = Var("bm"), Var("tr"), Var("bn"), Var("tc")
+    M, N = Var("M"), Var("N")  # noqa: N806
 
     for r in range(thread_m):
         row = bm + tr + r
@@ -1218,7 +1218,7 @@ def _contraction_write_ops(
             col_guard = col.lt(N)
 
             if is_batched:
-                idx = LoopVar("batch") * (M * N) + row * N + col
+                idx = Var("batch") * (M * N) + row * N + col
             else:
                 idx = row * N + col
 
@@ -1254,8 +1254,8 @@ def _lower_contraction_naive(
     is_batched = analysis.batch_size > 1
     k_splits = int(hints.get("k_splits", 1))
 
-    A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
-    B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
+    A = Var(_safe(analysis.contraction_a))  # noqa: N806
+    B = Var(_safe(analysis.contraction_b))  # noqa: N806
     out_id = region.output_names[0]
 
     # Params
@@ -1270,23 +1270,23 @@ def _lower_contraction_naive(
     body.extend(_cta_swizzle_grid(thread_m, thread_n, tile_m, tile_n, is_batched))
 
     # Batch pointer aliases
-    M, N, K = LoopVar("M"), LoopVar("N"), LoopVar("K")  # noqa: N806
+    M, N, K = Var("M"), Var("N"), Var("K")  # noqa: N806
     if is_batched:
-        batch = LoopVar("batch")
+        batch = Var("batch")
         body.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
         body.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
-        a_src, b_src = LoopVar("Ab"), LoopVar("Bb")
+        a_src, b_src = Var("Ab"), Var("Bb")
     else:
         a_src, b_src = A, B
 
     # Accumulator register array
-    body.append(Alloc("c", "float", (thread_m, thread_n), "reg", LoopLiteral(0.0)))
+    body.append(Alloc("c", "float", (thread_m, thread_n), "reg", Literal(0.0)))
 
     # K-loop with bounds-checked global loads + FMA
     k_body: list = []
     # Load B columns (4 per thread)
-    bn, tc, bm, tr = LoopVar("bn"), LoopVar("tc"), LoopVar("bm"), LoopVar("tr")
-    k, K, N, M = LoopVar("k"), LoopVar("K"), LoopVar("N"), LoopVar("M")  # noqa: N806
+    bn, tc, bm, tr = Var("bn"), Var("tc"), Var("bm"), Var("tr")
+    k, K, N, M = Var("k"), Var("K"), Var("N"), Var("M")  # noqa: N806
     for c in range(thread_n):
         col = bn + tc + c
         k_body.append(Load(f"b{c}", b_src, k * N + col, "global", guard=col.lt(N)))
@@ -1295,9 +1295,9 @@ def _lower_contraction_naive(
         row = bm + tr + r
         k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
         for c in range(thread_n):
-            k_body.append(Accumulate(f"c{r}{c}", "sum", LoopVar(f"a{r}") * LoopVar(f"b{c}")))
+            k_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
 
-    body.append(LoopNest("k", LoopLiteral(0, "int"), LoopVar("K"), None, k_body))
+    body.append(LoopNest("k", Literal(0, "int"), Var("K"), None, k_body))
 
     # Epilogue — proper LoopIR with register arrays
     phases = analysis.op_phases
@@ -1341,8 +1341,8 @@ def _lower_contraction_tma(
     bk = int(hints.get("block_k", 32))
     phases = analysis.op_phases
 
-    A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
-    B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
+    A = Var(_safe(analysis.contraction_a))  # noqa: N806
+    B = Var(_safe(analysis.contraction_b))  # noqa: N806
     out_id = region.output_names[0]
     a_size = tile_m * bk
     b_size = bk * tile_n
@@ -1420,10 +1420,10 @@ def _lower_contraction_smem(
     padded), scalar global loads for B (nvcc auto-vectorizes to float4).
     Fully expressed in LoopIR — no RawLoopOp.
     """
-    A = LoopVar(_safe(analysis.contraction_a))  # noqa: N806
-    B = LoopVar(_safe(analysis.contraction_b))  # noqa: N806
+    A = Var(_safe(analysis.contraction_a))  # noqa: N806
+    B = Var(_safe(analysis.contraction_b))  # noqa: N806
     out_id = region.output_names[0]
-    C = LoopVar(_safe(out_id))  # noqa: N806
+    C = Var(_safe(out_id))  # noqa: N806
     is_batched = analysis.batch_size > 1
 
     thread_m = int(hints.get("thread_m", 4))
@@ -1446,12 +1446,12 @@ def _lower_contraction_smem(
     body: list = []
 
     # Grid setup
-    bidy, bidx = LoopBuiltin("blockIdx.y"), LoopBuiltin("blockIdx.x")
-    tidy, tidx = LoopBuiltin("threadIdx.y"), LoopBuiltin("threadIdx.x")
-    K = LoopVar("K")  # noqa: N806
+    bidy, bidx = Builtin("blockIdx.y"), Builtin("blockIdx.x")
+    tidy, tidx = Builtin("threadIdx.y"), Builtin("threadIdx.x")
+    K = Var("K")  # noqa: N806
 
     if is_batched:
-        body.append(Let("batch", LoopBuiltin("blockIdx.z"), dtype=I))
+        body.append(Let("batch", Builtin("blockIdx.z"), dtype=I))
     body.append(Let("row_base", (bidy * ty + tidy) * thread_m, dtype=I))
     body.append(Let("col_base", (bidx * tx + tidx) * thread_n, dtype=I))
     body.append(Let("sr", tidy * thread_m, dtype=I))
@@ -1461,40 +1461,40 @@ def _lower_contraction_smem(
 
     # K-range for k_splits
     if k_splits > 1:
-        bidz = LoopBuiltin("blockIdx.z")
-        k_per, k_start = LoopVar("k_per"), LoopVar("k_start")
-        body.append(Let("k_per", K / bk / LoopVar("k_splits") * bk, dtype=I))
+        bidz = Builtin("blockIdx.z")
+        k_per, k_start = Var("k_per"), Var("k_start")
+        body.append(Let("k_per", K / bk / Var("k_splits") * bk, dtype=I))
         body.append(Let("k_start", bidz * k_per, dtype=I))
-        body.append(Let("k_end", LoopTernary(bidz.eq(LoopLiteral(k_splits - 1, I)), K, k_start + k_per), dtype=I))
+        body.append(Let("k_end", Ternary(bidz.eq(Literal(k_splits - 1, I)), K, k_start + k_per), dtype=I))
     else:
-        body.append(Let("k_start", LoopLiteral(0, I), dtype=I))
+        body.append(Let("k_start", Literal(0, I), dtype=I))
         body.append(Let("k_end", K, dtype=I))
 
     # Accumulator register array
-    body.append(Alloc("c", "float", (thread_m, thread_n), "reg", LoopLiteral(0.0)))
+    body.append(Alloc("c", "float", (thread_m, thread_n), "reg", Literal(0.0)))
 
     # Batch pointer aliases
-    M, N = LoopVar("M"), LoopVar("N")  # noqa: N806
+    M, N = Var("M"), Var("N")  # noqa: N806
     if is_batched:
-        batch = LoopVar("batch")
+        batch = Var("batch")
         body.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
         body.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
-    a_src = LoopVar("Ab") if is_batched else A
-    b_src = LoopVar("Bb") if is_batched else B
+    a_src = Var("Ab") if is_batched else A
+    b_src = Var("Bb") if is_batched else B
 
     # K-tile loop
     tk_body: list = []
 
     # Load A tile into shared memory (guarded, per-thread_m rows)
-    row_base, col_base = LoopVar("row_base"), LoopVar("col_base")
-    sr, tk, kk = LoopVar("sr"), LoopVar("tk"), LoopVar("kk")
-    tidx = LoopBuiltin("threadIdx.x")
+    row_base, col_base = Var("row_base"), Var("col_base")
+    sr, tk, kk = Var("sr"), Var("tk"), Var("kk")
+    tidx = Builtin("threadIdx.x")
 
     for r in range(thread_m):
         row_r = row_base + r
         k_col = tk + tidx
         tk_body.append(Load(f"As_ld_{r}", a_src, row_r * K + k_col, "global", guard=row_r.lt(M).and_(k_col.lt(K))))
-        tk_body.append(Store("As", (sr + r) * smem_stride + tidx, LoopVar(f"As_ld_{r}"), "smem"))
+        tk_body.append(Store("As", (sr + r) * smem_stride + tidx, Var(f"As_ld_{r}"), "smem"))
 
     tk_body.append(Barrier())
 
@@ -1507,17 +1507,17 @@ def _lower_contraction_smem(
     for r in range(thread_m):
         kk_body.append(Load(f"a{r}", "As", (sr + r) * smem_stride + kk, "smem"))
         for c in range(thread_n):
-            kk_body.append(Accumulate(f"c{r}{c}", "sum", LoopVar(f"a{r}") * LoopVar(f"b{c}")))
+            kk_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
 
-    tk_body.append(LoopNest("kk", LoopLiteral(0, I), LoopLiteral(bk, I), None, kk_body))
+    tk_body.append(LoopNest("kk", Literal(0, I), Literal(bk, I), None, kk_body))
     tk_body.append(Barrier())
 
-    body.append(LoopNest("tk", LoopVar("k_start"), LoopVar("k_end"), LoopLiteral(bk, I), tk_body))
+    body.append(LoopNest("tk", Var("k_start"), Var("k_end"), Literal(bk, I), tk_body))
 
     # Write
-    c_local = LoopVar("Cb") if is_batched else C
+    c_local = Var("Cb") if is_batched else C
     if is_batched:
-        body.append(Let("Cb", C + LoopVar("batch") * (M * N), dtype="float*"))
+        body.append(Let("Cb", C + Var("batch") * (M * N), dtype="float*"))
     for r in range(thread_m):
         row = row_base + r
         row_body: list = []

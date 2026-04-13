@@ -13,141 +13,72 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# ---------------------------------------------------------------------------
-# Expression operator overloading mixin
-# ---------------------------------------------------------------------------
+from deplodock.compiler.backend.ir.expr import (
+    BinOp,
+    Builtin,
+    Expr,
+    FuncCall,
+    Literal,
+    Ternary,
+    Var,
+    _coerce,
+    _ExprOps,
+)
 
-
-class _ExprOps:
-    """Mixin that adds arithmetic and comparison operators to LoopExpr nodes.
-
-    Returns LoopBinOp nodes, enabling::
-
-        Var("row") * Var("cols") + Var("j")   # → LoopBinOp("+", LoopBinOp("*", ...), ...)
-        Var("i") < Var("n")                    # → LoopBinOp("<", ...)
-    """
-
-    def __add__(self, other: LoopExpr) -> LoopBinOp:
-        return LoopBinOp("+", self, _coerce(other))
-
-    def __radd__(self, other: LoopExpr) -> LoopBinOp:
-        return LoopBinOp("+", _coerce(other), self)
-
-    def __sub__(self, other: LoopExpr) -> LoopBinOp:
-        return LoopBinOp("-", self, _coerce(other))
-
-    def __rsub__(self, other: LoopExpr) -> LoopBinOp:
-        return LoopBinOp("-", _coerce(other), self)
-
-    def __mul__(self, other: LoopExpr) -> LoopBinOp:
-        return LoopBinOp("*", self, _coerce(other))
-
-    def __rmul__(self, other: LoopExpr) -> LoopBinOp:
-        return LoopBinOp("*", _coerce(other), self)
-
-    def __truediv__(self, other: LoopExpr) -> LoopBinOp:
-        return LoopBinOp("/", self, _coerce(other))
-
-    def __mod__(self, other: LoopExpr) -> LoopBinOp:
-        return LoopBinOp("%", self, _coerce(other))
-
-    def __neg__(self) -> LoopBinOp:
-        return LoopBinOp("-", LoopLiteral(0, "int"), self)
-
-    def lt(self, other: LoopExpr) -> LoopBinOp:
-        """Less-than (``<``). Named method to avoid __lt__ conflict with dataclass ordering."""
-        return LoopBinOp("<", self, _coerce(other))
-
-    def ge(self, other: LoopExpr) -> LoopBinOp:
-        """Greater-or-equal (``>=``)."""
-        return LoopBinOp(">=", self, _coerce(other))
-
-    def eq(self, other: LoopExpr) -> LoopBinOp:
-        """Equal (``==``). Named method to avoid __eq__ conflict with dataclass equality."""
-        return LoopBinOp("==", self, _coerce(other))
-
-    def and_(self, other: LoopExpr) -> LoopBinOp:
-        """Logical AND (``&&``)."""
-        return LoopBinOp("&&", self, _coerce(other))
-
-    def or_(self, other: LoopExpr) -> LoopBinOp:
-        """Logical OR (``||``)."""
-        return LoopBinOp("||", self, _coerce(other))
-
-
-def _coerce(v: LoopExpr | int | float) -> LoopExpr:
-    """Coerce Python int/float to LoopLiteral for operator overloading."""
-    if isinstance(v, int):
-        return LoopLiteral(v, "int")
-    if isinstance(v, float):
-        return LoopLiteral(v)
-    return v
-
+# Re-export shared types so existing ``from loop_ir import Var`` still works.
+__all__ = [
+    # Shared expression types (re-exported)
+    "Var",
+    "Literal",
+    "BinOp",
+    "Builtin",
+    "FuncCall",
+    "Ternary",
+    "Expr",
+    "_ExprOps",
+    "_coerce",
+    # Loop-specific expression types
+    "OpCall",
+    "RegAccess",
+    "LoopExpr",
+    # Operations
+    "Let",
+    "SetVar",
+    "ParallelAxis",
+    "LoopNest",
+    "Alloc",
+    "Load",
+    "Store",
+    "Accumulate",
+    "WarpReduce",
+    "WarpShuffleXor",
+    "Barrier",
+    "Guard",
+    "RawLoopOp",
+    "LoopOp",
+    # Program
+    "LoopProgram",
+    # Utilities
+    "pretty_print",
+    "to_dict",
+]
 
 # ---------------------------------------------------------------------------
-# Expressions
+# Loop-specific expression types
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class LoopVar(_ExprOps):
-    """Variable reference."""
-
-    name: str
-
-
-@dataclass
-class LoopLiteral(_ExprOps):
-    """Numeric constant."""
-
-    value: int | float
-    dtype: str = "float"
-
-
-@dataclass
-class LoopBinOp(_ExprOps):
-    """Binary operation."""
-
-    op: str  # "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "&&", "||"
-    left: LoopExpr
-    right: LoopExpr
-
-
-@dataclass
-class LoopBuiltin(_ExprOps):
-    """GPU built-in variable (threadIdx.x, blockIdx.y, blockDim.x, etc.)."""
-
-    name: str
-
-
-@dataclass
-class LoopFuncCall(_ExprOps):
-    """Intrinsic / math function call (C-level: expf, fmaxf, etc.)."""
-
-    name: str  # "expf", "rsqrtf", "fmaxf", etc.
-    args: list[LoopExpr]
 
 
 @dataclass
 class OpCall(_ExprOps):
     """Apply a registered elementwise op by name.
 
-    Unlike ``LoopFuncCall`` (which maps to a literal C function call),
+    Unlike ``FuncCall`` (which maps to a literal C function call),
     ``OpCall`` is rendered by the codegen via the ``_C_EXPR`` template
     registry.  Example: ``OpCall("relu", [x])`` → ``fmaxf(0.0f, x)``.
     """
 
     op: str  # op registry name: "add", "relu", "exp", etc.
     args: list[LoopExpr]
-
-
-@dataclass
-class LoopTernary(_ExprOps):
-    """Ternary expression: cond ? if_true : if_false."""
-
-    cond: LoopExpr
-    if_true: LoopExpr
-    if_false: LoopExpr
 
 
 @dataclass
@@ -163,7 +94,7 @@ class RegAccess(_ExprOps):
     indices: list[int]
 
 
-LoopExpr = LoopVar | LoopLiteral | LoopBinOp | LoopBuiltin | LoopFuncCall | OpCall | LoopTernary | RegAccess
+LoopExpr = Expr | RegAccess | OpCall
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +146,7 @@ class LoopNest:
 class Alloc:
     """Register or shared-memory allocation.
 
-    For accumulators: shape=None (scalar), space="reg", init=LoopLiteral(0.0).
+    For accumulators: shape=None (scalar), space="reg", init=Literal(0.0).
     For smem buffers: shape=(64, 64), space="smem".
     """
 
@@ -226,9 +157,9 @@ class Alloc:
     init: LoopExpr | None = None
 
 
-def _to_name(v: str | LoopVar) -> str:
-    """Extract buffer name from a string or LoopVar."""
-    return v.name if isinstance(v, LoopVar) else v
+def _to_name(v: str | Var) -> str:
+    """Extract buffer name from a string or Var."""
+    return v.name if isinstance(v, Var) else v
 
 
 @dataclass
@@ -236,7 +167,7 @@ class Load:
     """Load from global or shared memory into a register."""
 
     dst: str
-    src: str | LoopVar  # buffer name (LoopVar auto-extracted)
+    src: str | Var  # buffer name (Var auto-extracted)
     indices: LoopExpr
     space: str  # "global" | "smem"
     guard: LoopExpr | None = None  # bounds check; zero if false
@@ -249,7 +180,7 @@ class Load:
 class Store:
     """Write to global or shared memory."""
 
-    dst: str | LoopVar  # buffer name (LoopVar auto-extracted)
+    dst: str | Var  # buffer name (Var auto-extracted)
     indices: LoopExpr
     value: LoopExpr
     space: str  # "global" | "smem"
@@ -444,23 +375,23 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
 
 def _pp_expr(expr: LoopExpr) -> str:
     """Pretty-print a LoopExpr as a compact string."""
-    if isinstance(expr, LoopVar):
+    if isinstance(expr, Var):
         return expr.name
-    if isinstance(expr, LoopLiteral):
+    if isinstance(expr, Literal):
         if isinstance(expr.value, float):
             return f"{expr.value:g}"
         return str(expr.value)
-    if isinstance(expr, LoopBinOp):
+    if isinstance(expr, BinOp):
         return f"({_pp_expr(expr.left)} {expr.op} {_pp_expr(expr.right)})"
-    if isinstance(expr, LoopBuiltin):
+    if isinstance(expr, Builtin):
         return expr.name
-    if isinstance(expr, LoopFuncCall):
+    if isinstance(expr, FuncCall):
         args = ", ".join(_pp_expr(a) for a in expr.args)
         return f"{expr.name}({args})"
     if isinstance(expr, OpCall):
         args = ", ".join(_pp_expr(a) for a in expr.args)
         return f"{expr.op}({args})"
-    if isinstance(expr, LoopTernary):
+    if isinstance(expr, Ternary):
         return f"({_pp_expr(expr.cond)} ? {_pp_expr(expr.if_true)} : {_pp_expr(expr.if_false)})"
     if isinstance(expr, RegAccess):
         return f"{expr.name}[{','.join(str(i) for i in expr.indices)}]"

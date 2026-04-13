@@ -5,10 +5,10 @@ import pytest
 from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
-from deplodock.compiler.backend.kernel_ir import (
+from deplodock.compiler.backend.ir.kernel_ir import (
     AugAssign,
     BinOp,
-    CudaBuiltin,
+    Builtin,
     ForLoop,
     IfStmt,
     KernelDef,
@@ -85,7 +85,7 @@ def test_emit_simple_kernel():
         name="test_kernel",
         params=[KernelParam("float*", "X"), KernelParam("int", "N")],
         body=[
-            VarDecl("int", "i", BinOp("+", BinOp("*", CudaBuiltin("blockIdx.x"), CudaBuiltin("blockDim.x")), CudaBuiltin("threadIdx.x"))),
+            VarDecl("int", "i", BinOp("+", BinOp("*", Builtin("blockIdx.x"), Builtin("blockDim.x")), Builtin("threadIdx.x"))),
             IfStmt(
                 BinOp("<", Var("i"), Var("N")),
                 [VarDecl("float", "val", Literal(1.0))],

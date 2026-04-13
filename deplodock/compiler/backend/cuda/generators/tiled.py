@@ -19,13 +19,13 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by
-from deplodock.compiler.backend.kernel_ir import (
+from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
     AugAssign,
     BinOp,
-    CudaBuiltin,
+    Builtin,
     Expr,
     ForLoop,
     FuncCall,
@@ -550,8 +550,8 @@ def _emit_warp_reduce(node_id: str, acc_var: str, fn: str) -> list:
     stmts.append(ArrayDecl("__shared__ float", warp_arr, [8]))
     stmts.append(
         IfStmt(
-            BinOp("==", BinOp("%", CudaBuiltin("threadIdx.x"), CudaBuiltin("warpSize")), Literal(0, "int")),
-            [Assign(ArrayAccess(warp_arr, BinOp("/", CudaBuiltin("threadIdx.x"), CudaBuiltin("warpSize"))), acc)],
+            BinOp("==", BinOp("%", Builtin("threadIdx.x"), Builtin("warpSize")), Literal(0, "int")),
+            [Assign(ArrayAccess(warp_arr, BinOp("/", Builtin("threadIdx.x"), Builtin("warpSize"))), acc)],
         )
     )
     stmts.append(SyncThreads())
@@ -559,7 +559,7 @@ def _emit_warp_reduce(node_id: str, acc_var: str, fn: str) -> list:
     # First warp loads partial results
     stmts.append(
         IfStmt(
-            BinOp("<", CudaBuiltin("threadIdx.x"), BinOp("/", CudaBuiltin("blockDim.x"), CudaBuiltin("warpSize"))),
+            BinOp("<", Builtin("threadIdx.x"), BinOp("/", Builtin("blockDim.x"), Builtin("warpSize"))),
             [VarDecl("__placeholder", "", None)],  # placeholder — need conditional assign
         )
     )
@@ -576,7 +576,7 @@ def _emit_warp_reduce(node_id: str, acc_var: str, fn: str) -> list:
     stmts.append(VarDecl("__shared__ float", s_var))
     stmts.append(
         IfStmt(
-            BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")),
+            BinOp("==", Builtin("threadIdx.x"), Literal(0, "int")),
             [RawCode(f"{s_var} = {acc_var};")],
         )
     )
@@ -651,7 +651,7 @@ def _lower_naive(
 
     # --- Phase 1: Grid setup ---
     def _thread_idx(block_dim: str, block_idx: str, thread_idx: str) -> Expr:
-        return BinOp("+", BinOp("*", CudaBuiltin(block_idx), CudaBuiltin(block_dim)), CudaBuiltin(thread_idx))
+        return BinOp("+", BinOp("*", Builtin(block_idx), Builtin(block_dim)), Builtin(thread_idx))
 
     if is_contraction:
         # CTA-swizzle grid + coarsened 8×4 thread mapping.
@@ -677,7 +677,7 @@ def _lower_naive(
         body.append(VarDecl("int", "i", _thread_idx("blockDim.x", "blockIdx.x", "threadIdx.x")))
         body.append(IfStmt(BinOp(">=", Var("i"), Var("n")), [RawCode("return;")]))
     else:
-        body.append(VarDecl("int", "row", BinOp("*", Literal(1, "int"), CudaBuiltin("blockIdx.x"))))
+        body.append(VarDecl("int", "row", BinOp("*", Literal(1, "int"), Builtin("blockIdx.x"))))
         body.append(IfStmt(BinOp(">=", Var("row"), Var("rows")), [RawCode("return;")]))
 
     # --- Build var_map for input access ---
@@ -942,7 +942,7 @@ def _lower_naive(
                 val_str = _expr_to_str(val)
                 pass_body.append(RawCode(f"{acc_name} = fmaxf({acc_name}, {val_str});"))
 
-            body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), pass_body, step=CudaBuiltin("blockDim.x")))
+            body.append(ForLoop("j", Builtin("threadIdx.x"), Var("cols"), pass_body, step=Builtin("blockDim.x")))
             # Warp shuffle after this pass.
             body.extend(_emit_warp_reduce(node_id, acc_name, fn))
             var_map[node_id] = Var(acc_name)
@@ -976,14 +976,14 @@ def _lower_naive(
                 idx = BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j"))
                 epi_body.append(Assign(ArrayAccess(_safe(out_id), idx), val))
 
-            body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), epi_body, step=CudaBuiltin("blockDim.x")))
+            body.append(ForLoop("j", Builtin("threadIdx.x"), Var("cols"), epi_body, step=Builtin("blockDim.x")))
         else:
             # No epilogue — write last reduce result (thread 0 only).
             write_body = []
             for out_id in region.output_names:
                 val = var_map.get(out_id, Literal(0.0))
                 write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
-            body.append(IfStmt(BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")), write_body))
+            body.append(IfStmt(BinOp("==", Builtin("threadIdx.x"), Literal(0, "int")), write_body))
     else:
         # Single-reduce path (original).
         # Tile loop over columns
@@ -1000,7 +1000,7 @@ def _lower_naive(
                 val_str = _expr_to_str(val)
                 loop_body.append(RawCode(f"{acc_name} = fmaxf({acc_name}, {val_str});"))
 
-        body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), loop_body, step=CudaBuiltin("blockDim.x")))
+        body.append(ForLoop("j", Builtin("threadIdx.x"), Var("cols"), loop_body, step=Builtin("blockDim.x")))
 
         # Cross-thread warp shuffle
         for node_id, (acc_name, fn) in reduce_vars.items():
@@ -1035,20 +1035,20 @@ def _lower_naive(
                     idx = BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j"))
                     epi_body.append(Assign(ArrayAccess(_safe(out_id), idx), val))
 
-                body.append(ForLoop("j", CudaBuiltin("threadIdx.x"), Var("cols"), epi_body, step=CudaBuiltin("blockDim.x")))
+                body.append(ForLoop("j", Builtin("threadIdx.x"), Var("cols"), epi_body, step=Builtin("blockDim.x")))
             else:
                 body.extend(_emit_ops(epilogue_ops, var_map, "e_"))
                 write_body = []
                 for out_id in region.output_names:
                     val = var_map.get(out_id, Literal(0.0))
                     write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
-                body.append(IfStmt(BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")), write_body))
+                body.append(IfStmt(BinOp("==", Builtin("threadIdx.x"), Literal(0, "int")), write_body))
         else:
             write_body = []
             for out_id in region.output_names:
                 val = var_map.get(out_id, Literal(0.0))
                 write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
-            body.append(IfStmt(BinOp("==", CudaBuiltin("threadIdx.x"), Literal(0, "int")), write_body))
+            body.append(IfStmt(BinOp("==", Builtin("threadIdx.x"), Literal(0, "int")), write_body))
 
     return KernelDef(name=name, params=params, body=body, block_size=block_size)
 
