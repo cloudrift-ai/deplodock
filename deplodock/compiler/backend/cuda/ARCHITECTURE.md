@@ -12,34 +12,40 @@ compilation, and GPU-tuned kernel generators.
 cuda/
 ├── backend.py        # CudaBackend(Backend): compile plan → Program
 ├── program.py        # CudaLaunch, TmaDescriptorSpec, source gen, nvcc, run
+├── schedule.py       # Schedule: all kernel structure decisions as a dataclass
 ├── generators/       # Kernel code generation
 │   ├── analysis.py       # TileAnalysis: classify FusedRegionOp patterns
-│   ├── loop_lower.py     # TileAnalysis → LoopIR (loop-nest IR)
+│   ├── loop_lower.py     # lower_generic(): Schedule-driven LoopIR emission
 │   ├── loop_codegen.py   # LoopIR → KernelDef (imperative C AST)
 │   └── tiled.py          # Public API: generate_kernel(), lower_tiled()
 ├── runner.py         # Single-kernel compile + run + benchmark harness
 └── tuning.py         # Per-GPU empirical tuning profiles (RTX 5090, H200, Pro 6000)
 ```
 
-## LoopIR Pipeline
+## Schedule + LoopIR Pipeline
 
-Kernel generation goes through two stages via the backend-agnostic LoopIR
-(defined in `backend/loop_ir.py`):
+Kernel generation is driven by a `Schedule` dataclass that encodes all kernel
+structure decisions (grid mapping, accumulator shape, reduction loops, etc.).
+A single `lower_generic()` reads the Schedule and emits LoopIR — no pattern
+matching.
 
 ```
-FusedRegionOp → analyze() → TileAnalysis → lower_to_loop_ir() → LoopProgram
-                                                                      ↓
-                        CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel()
+FusedRegionOp → analyze() → TileAnalysis ──→ build_schedule() → Schedule
+                                                                     ↓
+                         CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel() ← lower_generic()
 ```
 
-**LoopIR** makes the loop structure explicit: `ParallelAxis` (grid mapping),
-`LoopNest` (sequential loops), `Alloc` (accumulators), `Load`/`Store` (memory),
-`Compute` (elementwise), `Accumulate`/`WarpReduce` (reductions), `Guard` (bounds),
-`RawLoopOp` (escape hatch for TMA inline asm).
+**Schedule** (`schedule.py`) contains: `GridSpec` (1d/2d_swizzle/2d_standard),
+`AccumulatorSpec` (None/scalar/register-tile), `ReductionSpec` (loop params +
+warp_reduce flag), plus tile dims, k_splits, load strategy, and batching.
 
-Pointwise, row-reduce, and multi-reduce patterns are fully expressed in LoopIR.
-Contraction patterns (naive, tma_db, smem) currently wrap the legacy kernel
-body as `RawLoopOp` — decomposing into proper LoopIR ops is a future goal.
+**LoopIR** (`backend/loop_ir.py`) makes the loop structure explicit:
+`ParallelAxis`, `LoopNest`, `Alloc`, `Load`/`Store`, `Compute`,
+`Accumulate`/`WarpReduce`, `Guard`, `RegAccess`, `RawLoopOp`.
+
+Pointwise, row-reduce, multi-reduce, and naive contraction are fully expressed
+in LoopIR via `lower_generic()`. TMA and smem contraction strategies use legacy
+escape hatches (RawLoopOp) for inline asm and float4 fast paths.
 
 ## SGEMM Strategies (generators/tiled.py)
 

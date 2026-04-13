@@ -3,7 +3,7 @@
 import json
 
 from deplodock.compiler.backend.codegen import emit_kernel
-from deplodock.compiler.backend.cuda.generators import analyze, lower_to_loop_ir
+from deplodock.compiler.backend.cuda.generators import analyze, build_schedule, lower_generic, lower_to_loop_ir
 from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
 from deplodock.compiler.backend.loop_ir import (
     Accumulate,
@@ -488,3 +488,80 @@ def test_roundtrip_matmul_tma():
     assert "__global__" in source
     assert "void matmul_tma" in source
     assert prog.tma_params is not None
+
+
+# ---------------------------------------------------------------------------
+# Schedule tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_schedule_pointwise():
+    """Pointwise schedule: 1D grid, no accumulators, no reductions."""
+    _, analysis = _make_region_and_analysis(
+        region_ops=[("neg", ElementwiseOp("neg"), ["x"])],
+        input_names=["x"],
+        output_names=["neg"],
+        shapes={"x": (256,), "neg": (256,)},
+    )
+    sched = build_schedule(analysis)
+    assert sched.grid.type == "1d"
+    assert sched.accum.shape is None
+    assert len(sched.reductions) == 0
+
+
+def test_build_schedule_reduce():
+    """Reduce schedule: 1D grid, scalar accum, warp reduce."""
+    _, analysis = _make_region_and_analysis(
+        region_ops=[("red", ReduceOp("sum", axis=1), ["x"])],
+        input_names=["x"],
+        output_names=["red"],
+        shapes={"x": (4, 8), "red": (4,)},
+    )
+    sched = build_schedule(analysis)
+    assert sched.grid.type == "1d"
+    assert sched.grid.bound == "rows"
+    assert sched.accum.shape == ()
+    assert len(sched.reductions) == 1
+    assert sched.reductions[0].warp_reduce_after is True
+
+
+def test_build_schedule_contraction():
+    """Contraction schedule: 2D swizzle grid, register tile accum."""
+    _, analysis = _make_region_and_analysis(
+        region_ops=[
+            ("ew", ElementwiseOp("mul"), ["A", "B"]),
+            ("C", ReduceOp("sum", axis=1), ["ew"]),
+        ],
+        input_names=["A", "B"],
+        output_names=["C"],
+        shapes={"A": (8, 4), "B": (4, 6), "ew": (8, 4, 6), "C": (8, 6)},
+    )
+    sched = build_schedule(analysis, strategy="naive")
+    assert sched.grid.type == "2d_swizzle"
+    assert sched.accum.shape == (8, 4)  # thread_m=8, thread_n=4
+    assert len(sched.reductions) == 1
+    assert sched.reductions[0].warp_reduce_after is False
+    assert sched.tile_m == 64  # ty(8) * thread_m(8)
+    assert sched.tile_n == 128  # tx(32) * thread_n(4)
+
+
+def test_lower_generic_matches_lower_to_loop_ir():
+    """lower_generic via build_schedule produces same structure as lower_to_loop_ir."""
+    region, analysis = _make_region_and_analysis(
+        region_ops=[("red", ReduceOp("sum", axis=1), ["x"])],
+        input_names=["x"],
+        output_names=["red"],
+        shapes={"x": (4, 8), "red": (4,)},
+    )
+    shapes = {"x": (4, 8), "red": (4,)}
+
+    # Via lower_to_loop_ir (routes through lower_generic internally)
+    prog1 = lower_to_loop_ir(region, "test", shapes, analysis)
+    # Via explicit build_schedule + lower_generic
+    sched = build_schedule(analysis)
+    prog2 = lower_generic(region, "test", shapes, analysis, sched)
+
+    # Both should produce the same LoopIR structure
+    assert prog1.block_size == prog2.block_size
+    assert len(prog1.body) == len(prog2.body)
+    assert len(prog1.params) == len(prog2.params)
