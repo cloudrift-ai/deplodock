@@ -66,7 +66,20 @@ class LoopTernary:
     if_false: LoopExpr
 
 
-LoopExpr = LoopVar | LoopLiteral | LoopBinOp | LoopBuiltin | LoopFuncCall | LoopTernary
+@dataclass
+class RegAccess:
+    """Compile-time indexed access into a register array.
+
+    The array must have been declared via ``Alloc(name, ..., space="reg",
+    shape=(M, N))``.  Indices are compile-time integer constants —
+    the codegen expands ``RegAccess("c", [3, 2])`` to the scalar name ``c32``.
+    """
+
+    name: str
+    indices: list[int]
+
+
+LoopExpr = LoopVar | LoopLiteral | LoopBinOp | LoopBuiltin | LoopFuncCall | LoopTernary | RegAccess
 
 
 # ---------------------------------------------------------------------------
@@ -322,12 +335,15 @@ def _pp_expr(expr: LoopExpr) -> str:
         return f"{expr.name}({args})"
     if isinstance(expr, LoopTernary):
         return f"({_pp_expr(expr.cond)} ? {_pp_expr(expr.if_true)} : {_pp_expr(expr.if_false)})"
+    if isinstance(expr, RegAccess):
+        return f"{expr.name}[{','.join(str(i) for i in expr.indices)}]"
     return "??"
 
 
 # ---------------------------------------------------------------------------
 # Serialization
 # ---------------------------------------------------------------------------
+
 
 def _serialize(obj: object) -> object:
     """Recursively serialize LoopIR dataclasses to JSON-compatible dicts.

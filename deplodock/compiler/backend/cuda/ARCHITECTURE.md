@@ -2,7 +2,7 @@
 
 The CUDA backend maps `OpKernel` tags from the execution plan to CUDA C kernels,
 compiles them via nvcc, and runs them on GPU. It extends the shared backend
-infrastructure (`backend/program.py`, `backend/ir.py`, `backend/loop_ir.py`,
+infrastructure (`backend/program.py`, `backend/kernel_ir.py`, `backend/loop_ir.py`,
 `backend/codegen.py`) with CUDA-specific features: TMA descriptors, nvcc
 compilation, and GPU-tuned kernel generators.
 

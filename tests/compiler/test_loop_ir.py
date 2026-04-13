@@ -302,10 +302,16 @@ def test_contraction_structure():
         strategy="naive",
     )
 
-    # Contraction uses legacy wrapper — body is RawLoopOp
-    raws = _find_ops(prog.body, RawLoopOp, recursive=False)
-    assert len(raws) == 1
     assert prog.block_size == (32, 8, 1)
+    # Grid setup + K-loop are RawLoopOp; accumulators and write are proper LoopIR.
+    raws = _find_ops(prog.body, RawLoopOp, recursive=False)
+    assert len(raws) == 2  # grid setup + K-loop
+    allocs = _find_ops(prog.body, Alloc, recursive=False)
+    assert any(a.name == "c" and a.shape == (8, 4) for a in allocs)  # register array
+    guards = _find_ops(prog.body, Guard, recursive=False)
+    assert len(guards) >= 1  # write guards
+    stores = _find_ops(prog.body, Store)
+    assert len(stores) >= 1
 
 
 # ---------------------------------------------------------------------------

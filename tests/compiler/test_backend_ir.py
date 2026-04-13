@@ -5,7 +5,7 @@ emit_kernel / _emit_expr / _emit_stmt produce correct C/CUDA source.
 """
 
 from deplodock.compiler.backend.codegen import emit_kernel
-from deplodock.compiler.backend.ir import (
+from deplodock.compiler.backend.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,

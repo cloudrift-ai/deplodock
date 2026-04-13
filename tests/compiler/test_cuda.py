@@ -5,7 +5,7 @@ import pytest
 from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
-from deplodock.compiler.backend.ir import (
+from deplodock.compiler.backend.kernel_ir import (
     AugAssign,
     BinOp,
     CudaBuiltin,

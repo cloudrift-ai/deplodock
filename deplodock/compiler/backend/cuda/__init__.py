@@ -3,7 +3,7 @@
 from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.backend.cuda.generators import analyze, generate_kernel, lower_tiled
 from deplodock.compiler.backend.cuda.runner import KernelResult, has_cuda_gpu, has_nvcc, run_kernel
-from deplodock.compiler.backend.ir import (
+from deplodock.compiler.backend.kernel_ir import (
     ArrayAccess,
     Assign,
     AugAssign,

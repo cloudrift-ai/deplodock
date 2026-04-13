@@ -6,7 +6,7 @@ Usable for both CUDA and HIP targets.
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.ir import (
+from deplodock.compiler.backend.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
@@ -172,7 +172,7 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
             return f"{pad}#pragma unroll {stmt.factor}"
         return f"{pad}#pragma unroll"
 
-    from deplodock.compiler.backend.ir import RawCode
+    from deplodock.compiler.backend.kernel_ir import RawCode
 
     if isinstance(stmt, RawCode):
         # Indent each line of the raw code.

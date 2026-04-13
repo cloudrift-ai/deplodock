@@ -7,7 +7,7 @@ analysis — all structural decisions were made during lowering.
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.ir import (
+from deplodock.compiler.backend.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
@@ -47,6 +47,7 @@ from deplodock.compiler.backend.loop_ir import (
     LoopVar,
     ParallelAxis,
     RawLoopOp,
+    RegAccess,
     Store,
     WarpReduce,
 )
@@ -92,6 +93,9 @@ def _lower_expr(expr: LoopExpr) -> Expr:
         return FuncCall(expr.name, [_lower_expr(a) for a in expr.args])
     if isinstance(expr, LoopTernary):
         return Ternary(_lower_expr(expr.cond), _lower_expr(expr.if_true), _lower_expr(expr.if_false))
+    if isinstance(expr, RegAccess):
+        # Expand to scalar variable name: c[3][2] → "c32"
+        return Var(expr.name + "".join(str(i) for i in expr.indices))
     msg = f"Unknown LoopExpr type: {type(expr)}"
     raise TypeError(msg)
 
@@ -168,6 +172,16 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
             return [ArrayDecl(f"__shared__ {op.dtype}", op.name, dims)]
         # Register allocation
         init = _lower_expr(op.init) if op.init else None
+        if op.shape:
+            # Register array: Alloc("c", "float", (8, 4), "reg", init=0.0)
+            # → "float c00=0.0f,c01=0.0f,...,c73=0.0f;"
+            import itertools
+
+            indices = list(itertools.product(*(range(d) for d in op.shape)))
+            names = [op.name + "".join(str(i) for i in idx) for idx in indices]
+            init_str = _expr_to_c(init) if init else "0.0f"
+            decl = ",".join(f"{n}={init_str}" for n in names)
+            return [RawCode(f"{op.dtype} {decl};")]
         return [VarDecl(op.dtype, op.name, init)]
 
     if isinstance(op, Load):
@@ -204,14 +218,21 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         return [Assign(ArrayAccess(op.dst, idx), val)]
 
     if isinstance(op, Compute):
-        # Use the elementwise op builder if available
+        # Check if this is an in-place update on a register array element:
+        # if any arg is a RegAccess whose expanded name matches dst, emit
+        # assignment instead of declaration.
+        is_inplace = any(isinstance(a, RegAccess) and a.name + "".join(str(i) for i in a.indices) == op.dst for a in op.args)
         builder = _ELEM_OPS.get(op.op)
         if builder:
             args_lowered = [_lower_expr(a) for a in op.args]
             a = args_lowered[0]
             b = args_lowered[1] if len(args_lowered) > 1 else Literal(0.0)
-            return [VarDecl("float", op.dst, builder(a, b))]
-        # Unknown op — fallback to literal 0
+            expr = builder(a, b)
+            if is_inplace:
+                return [RawCode(f"{op.dst} = {_expr_to_c(expr)};")]
+            return [VarDecl("float", op.dst, expr)]
+        if is_inplace:
+            return [RawCode(f"{op.dst} = 0.0f;")]
         return [VarDecl("float", op.dst, Literal(0.0))]
 
     if isinstance(op, Accumulate):

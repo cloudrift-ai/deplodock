@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by
-from deplodock.compiler.backend.ir import (
+from deplodock.compiler.backend.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,
