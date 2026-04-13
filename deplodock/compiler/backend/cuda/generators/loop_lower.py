@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by
 from deplodock.compiler.backend.ir.loop_ir import (
-    Accumulate,
+    Accum,
+    AccumInit,
     Alloc,
     Barrier,
     Builtin,
@@ -134,7 +135,7 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
         # Scalar accumulators (one per reduce op)
         for node_id, op, _ in analysis.op_phases.reduces:
             acc_name = f"acc_{_safe(node_id)}"
-            ops.append(Alloc(acc_name, accum.dtype, None, "reg", _reduce_init_expr(op.fn)))
+            ops.append(AccumInit(acc_name, op.fn))
         return ops
 
     # 2D register tile (contraction)
@@ -255,7 +256,7 @@ def _emit_scalar_reductions(
                 _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body)
 
             val = pass_var_map.get(input_ids[0], Literal(0.0))
-            pass_body.append(Accumulate(acc_name, fn, val))
+            pass_body.append(Accum(acc_name, fn, val))
 
             guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
             guarded.append(WarpReduce(acc_name, fn))
@@ -274,7 +275,7 @@ def _emit_scalar_reductions(
         for node_id, _op, input_ids in phases.reduces:
             acc_name, fn = reduce_vars[node_id]
             val = var_map.get(input_ids[0], Literal(0.0))
-            loop_body.append(Accumulate(acc_name, fn, val))
+            loop_body.append(Accum(acc_name, fn, val))
 
         guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), loop_body))
 
@@ -311,7 +312,7 @@ def _emit_contraction_k_loop(
         row = bm + tr + r
         k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
         for c in range(thread_n):
-            k_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
+            k_body.append(Accum(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
 
     return [LoopNest("k", Literal(0, "int"), K, None, k_body)]
 
@@ -523,15 +524,6 @@ def _safe(name: str) -> str:
     return name.replace("-", "_").replace(".", "_").replace(" ", "_")
 
 
-def _reduce_init_expr(fn: str) -> Literal:
-    """Initial value for a reduction accumulator."""
-    from deplodock.compiler.ops import _DEFAULT_REDUCE_INFO, REDUCE_REGISTRY
-
-    info = REDUCE_REGISTRY.get(fn, _DEFAULT_REDUCE_INFO)
-    return Literal(info.identity)
-    return Literal(0.0)
-
-
 def _input_loop_expr(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> LoopExpr:
     """Build the index expression for reading an input tensor."""
     acc = analysis.input_access[inp]
@@ -676,7 +668,7 @@ def _lower_single_reduce(
     reduce_vars: dict[str, tuple[str, str]] = {}
     for node_id, op, _ in phases.reduces:
         acc_name = f"acc_{_safe(node_id)}"
-        guarded.append(Alloc(acc_name, "float", None, "reg", _reduce_init_expr(op.fn)))
+        guarded.append(AccumInit(acc_name, op.fn))
         reduce_vars[node_id] = (acc_name, op.fn)
 
     # Build var_map for inputs
@@ -703,7 +695,7 @@ def _lower_single_reduce(
     for node_id, _op, input_ids in phases.reduces:
         acc_name, fn = reduce_vars[node_id]
         val = var_map.get(input_ids[0], Literal(0.0))
-        loop_body.append(Accumulate(acc_name, fn, val))
+        loop_body.append(Accum(acc_name, fn, val))
 
     guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), loop_body))
 
@@ -804,7 +796,7 @@ def _lower_multi_reduce(
     reduce_vars: dict[str, tuple[str, str]] = {}
     for node_id, op, _ in phases.reduces:
         acc_name = f"acc_{_safe(node_id)}"
-        guarded.append(Alloc(acc_name, "float", None, "reg", _reduce_init_expr(op.fn)))
+        guarded.append(AccumInit(acc_name, op.fn))
         reduce_vars[node_id] = (acc_name, op.fn)
 
     var_map: dict[str, LoopExpr] = {}
@@ -843,7 +835,7 @@ def _lower_multi_reduce(
 
         # Accumulate
         val = pass_var_map.get(input_ids[0], Literal(0.0))
-        pass_body.append(Accumulate(acc_name, fn, val))
+        pass_body.append(Accum(acc_name, fn, val))
 
         guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
 
@@ -1016,14 +1008,12 @@ def _contraction_epilogue_ops(
         prev_id = inter_ops[-1][0] if inter_ops else prev_id
 
         # Per-row reduce via WarpShuffleXor
-        init_val = _reduce_init_expr(reduce_fn)
-
         for r in range(thread_m):
             rvar = f"r{reduce_fn}{r}"
-            ops.append(Alloc(rvar, "float", None, "reg", init_val))
+            ops.append(AccumInit(rvar, reduce_fn))
             for c in range(thread_n):
                 col_c = Var("bn") + Var("tc") + c
-                ops.append(Guard(col_c.lt(Var("N")), [Accumulate(rvar, reduce_fn, RegAccess("c", [r, c]))]))
+                ops.append(Guard(col_c.lt(Var("N")), [Accum(rvar, reduce_fn, RegAccess("c", [r, c]))]))
             ops.append(WarpShuffleXor(rvar, reduce_fn))
 
         reduce_row_vars[reduce_node_id] = f"r{reduce_fn}{{r}}"
@@ -1295,7 +1285,7 @@ def _k_loop_naive(A, B, dims, is_batched, k_splits):  # noqa: N803
         row = bm + tr + r
         k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
         for c in range(thread_n):
-            k_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
+            k_body.append(Accum(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
     k_ops.append(LoopNest("k", Literal(0, "int"), K, None, k_body))
 
     return grid_ops, k_ops, {}
@@ -1410,7 +1400,7 @@ def _k_loop_smem(A, B, dims, hints, is_batched, k_splits):  # noqa: N803
     for r in range(thread_m):
         kk_body.append(Load(f"a{r}", "As", (sr + r) * smem_stride + kk, "smem"))
         for c in range(thread_n):
-            kk_body.append(Accumulate(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
+            kk_body.append(Accum(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
     tk_body.append(LoopNest("kk", Literal(0, I), Literal(bk, I), None, kk_body))
     tk_body.append(Barrier())
 

@@ -29,7 +29,8 @@ from deplodock.compiler.backend.ir.kernel_ir import (
     VarDecl,
 )
 from deplodock.compiler.backend.ir.loop_ir import (
-    Accumulate,
+    Accum,
+    AccumInit,
     Alloc,
     Barrier,
     Guard,
@@ -272,7 +273,14 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
             return [RawCode(f"atomicAdd(&{op.dst}[{_expr_to_c(idx)}], {val_str});")]
         return [Assign(ArrayAccess(op.dst, idx), val)]
 
-    if isinstance(op, Accumulate):
+    if isinstance(op, AccumInit):
+        from deplodock.compiler.ops import _DEFAULT_REDUCE_INFO, REDUCE_REGISTRY
+
+        r_info = REDUCE_REGISTRY.get(op.op, _DEFAULT_REDUCE_INFO)
+        init = f"{r_info.identity:.1f}f" if isinstance(r_info.identity, float) else str(r_info.identity)
+        return [VarDecl("float", op.name, Literal(r_info.identity))]
+
+    if isinstance(op, Accum):
         val_str = _expr_to_c(_lower_expr(op.value))
         tmpl = _C_REDUCE_ACCUM.get(op.op, "{dst} += {val}")
         return [RawCode(f"{tmpl.format(dst=op.dst, val=val_str)};")]
