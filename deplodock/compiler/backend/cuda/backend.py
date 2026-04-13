@@ -78,77 +78,70 @@ class CudaBackend(Backend):
 # --- Per-op handlers ---
 
 
-def _compile_matmul(op: OpKernel) -> CudaLaunch:
-    """Compile a matmul op through the unified tiled generator.
+def _build_region_and_shapes(op: OpKernel):
+    """Extract FusedRegionOp and shapes from an OpKernel's params."""
+    from deplodock.compiler.ops import FusedRegionOp
 
-    Defaults to tma_db strategy (TMA double-buffer with mbarrier pipelining).
-    Falls back to naive if hints specify it.
-    """
-    from deplodock.compiler.backend.cuda.generators.analysis import analyze
-    from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
-    from deplodock.compiler.backend.cuda.program import TmaDescriptorSpec
-    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
-    from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
-
-    m = op.params.get("M", 1)
-    n = op.params.get("N", 1)
-    k = op.params.get("K", 1)
-    batch_size = op.params.get("batch_size", 1)
-    batch_dims = op.params.get("batch_dims", ())
-
-    # Build a FusedRegionOp for the matmul pattern, including epilogue ops.
-    a_buf, b_buf = op.inputs[0], op.inputs[1]
-    c_buf = op.outputs[0]
-    all_region_ops = op.params.get("_region_ops", [])
-    has_epilogue = len(all_region_ops) > 2
-
-    # Shape prefixes for batched contractions: (B..., M, K) @ (B..., K, N).
-    bp = tuple(batch_dims) if batch_size > 1 else ()
-
-    if has_epilogue:
-        # Use the full region_ops (contraction core + epilogue).
-        region_ops_list = list(all_region_ops)
-        # Collect extra external inputs from epilogue ops.
-        internal_ids = {rid for rid, _, _ in region_ops_list}
-        extra_inputs = []
-        for _rid, _eop, epi_inputs in region_ops_list[2:]:
-            for inp in epi_inputs:
-                if inp not in internal_ids and inp != a_buf and inp != b_buf and inp not in extra_inputs:
-                    extra_inputs.append(inp)
-        input_names = [a_buf, b_buf] + extra_inputs
-        region = FusedRegionOp(
-            region_ops=region_ops_list,
-            input_names=input_names,
-            output_names=[c_buf],
-        )
-        shapes = {a_buf: bp + (m, k), b_buf: bp + (k, n)}
-        # Contraction intermediate shapes.
-        ew_id = region_ops_list[0][0]
-        red_id = region_ops_list[1][0]
-        shapes[ew_id] = bp + (m, k, n)
-        shapes[red_id] = bp + (m, n)
-        # Epilogue ops: most preserve matmul output shape, but ReduceOps
-        # produce (m, 1) (reduced last dim).
+    region_ops = op.params["_region_ops"]
+    shapes = dict(op.params.get("_shapes", {}))
+    if not shapes:
         input_shapes = op.params.get("_input_shapes", {})
-        for rid, rop, _ in region_ops_list[2:]:
-            if isinstance(rop, ReduceOp):
-                shapes[rid] = bp + (m, 1)
-            else:
-                shapes[rid] = bp + (m, n)
-        for inp in extra_inputs:
-            shapes[inp] = input_shapes.get(inp, (n,))
-        shapes[c_buf] = bp + (m, n)
+        shapes.update(input_shapes)
+        shapes[op.outputs[0]] = op.params.get("shape", (1,))
+
+    # Use plan-level buffer names for the kernel params.
+    # When fusion rewires graph edges, plan-level names (op.inputs) may differ
+    # from original names (_input_names). Remap to keep kernel params aligned
+    # with the buffers that will be passed as launch args.
+    original_input_names = op.params.get("_input_names", list(op.inputs))
+    original_output_names = op.params.get("_output_names", list(op.outputs))
+
+    if original_input_names != list(op.inputs) or original_output_names != list(op.outputs):
+        input_map = dict(zip(original_input_names, op.inputs, strict=False))
+        output_map = dict(zip(original_output_names, op.outputs, strict=False))
+        # Reverse output map: plan_name → original_name (for op node IDs)
+        all_renames = {**input_map, **output_map}
+
+        rewritten_ops = []
+        for rid, rop, inp_ids in region_ops:
+            new_inps = [all_renames.get(i, i) for i in inp_ids]
+            # Also rename the op node_id if it's an output
+            new_rid = all_renames.get(rid, rid)
+            rewritten_ops.append((new_rid, rop, new_inps))
+
+        region = FusedRegionOp(
+            region_ops=rewritten_ops,
+            input_names=list(op.inputs),
+            output_names=list(op.outputs),
+        )
+
+        for orig, plan_name in {**input_map, **output_map}.items():
+            if orig in shapes and plan_name not in shapes:
+                shapes[plan_name] = shapes[orig]
     else:
         region = FusedRegionOp(
-            region_ops=[
-                ("ew", ElementwiseOp("mul"), [a_buf, b_buf]),
-                ("red", ReduceOp("sum", axis=1), ["ew"]),
-            ],
-            input_names=[a_buf, b_buf],
-            output_names=[c_buf],
+            region_ops=region_ops,
+            input_names=original_input_names,
+            output_names=original_output_names,
         )
-        shapes = {a_buf: bp + (m, k), b_buf: bp + (k, n), "ew": bp + (m, k, n), c_buf: bp + (m, n)}
-        extra_inputs = []
+    return region, shapes
+
+
+def _select_strategy(op: OpKernel, analysis) -> tuple[str, dict]:
+    """Select compilation strategy and hints based on analysis pattern.
+
+    For contractions: loads GPU tuning profile, applies hint overrides,
+    clamps thread_m to M, computes k_splits, validates block_k.
+    For other patterns: returns ("naive", {}).
+    """
+    if analysis.pattern != "contraction":
+        return "naive", {}
+
+    m = analysis.rows
+    n = analysis.cols
+    k = analysis.k_dim
+    batch_size = analysis.batch_size if hasattr(analysis, "batch_size") else 1
+    has_epilogue = len(op.params.get("_region_ops", [])) > 2
 
     # Determine strategy and tile parameters from hints + tuning profile.
     explicit_hints = op.params.get("_hints", {})
@@ -229,222 +222,96 @@ def _compile_matmul(op: OpKernel) -> CudaLaunch:
         strategy = "naive"
         matmul_hints["strategy"] = "naive"
 
-    # Generate kernel through the unified path.
-    name = _unique_name("matmul")
-    analysis = analyze(region, shapes)
-    kernel_def, loop_prog = lower_tiled(region, name, shapes, analysis, strategy=strategy, hints=matmul_hints)
-    source = emit_kernel(kernel_def)
+    return strategy, matmul_hints
 
-    bx, by, bz = kernel_def.block_size
-    tile_m = kernel_def.tile_m or 64
-    tile_n = kernel_def.tile_n or 128
 
-    # Grid layout depends on strategy and batching.
-    k_splits = int(matmul_hints.get("k_splits", 1))
-    if batch_size > 1:
-        # Batched: blockIdx.z = batch index (k_splits disabled).
-        k_splits = 1
-    ntx = _cd(n, tile_n)
-    nty = _cd(m, tile_m)
-    grid_z = batch_size if batch_size > 1 else k_splits
-    if strategy == "smem":
-        # Standard 2D grid (no CTA swizzle).
-        grid = (ntx, nty, grid_z)
+def _compute_grid(kernel_def, analysis, params: dict) -> tuple[tuple, int]:
+    """Compute grid dimensions and shared memory bytes for a kernel.
+
+    Returns (grid_tuple, smem_bytes).
+    """
+    if kernel_def.tile_m and kernel_def.tile_n:
+        # Contraction grid.
+        m = params.get("M", analysis.rows)
+        n = params.get("N", analysis.cols)
+        batch_size = params.get("batch_size", 1)
+        k_splits = int(params.get("_k_splits", 1))
+
+        tile_m = kernel_def.tile_m
+        tile_n = kernel_def.tile_n
+        ntx = _cd(n, tile_n)
+        nty = _cd(m, tile_m)
+        grid_z = batch_size if batch_size > 1 else k_splits
+
+        # smem strategy uses (32, 4) block → standard 2D grid.
+        strategy = params.get("_strategy", "")
+        if strategy == "smem":
+            grid = (ntx, nty, grid_z)
+        else:
+            # CTA-swizzle grid (shared between naive and TMA).
+            grid = (ntx * _cd(nty, 8) * 8, 1, grid_z)
+    elif analysis.pattern == "pointwise":
+        total = math.prod(d for d in analysis.output_shape if isinstance(d, int))
+        bx = kernel_def.block_size[0]
+        grid = (_cd(total, bx), 1, 1)
     else:
-        # CTA-swizzle grid (shared between naive and TMA).
-        grid = (ntx * _cd(nty, 8) * 8, 1, grid_z)
+        # Reduce: row-per-block.
+        out_shape = params.get("shape", (1,))
+        total = math.prod(d for d in out_shape if isinstance(d, int))
+        input_shapes = params.get("_input_shapes", {})
+        best_shape = out_shape
+        best_size = total
+        for inp_shape in input_shapes.values():
+            inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
+            if inp_size > best_size:
+                best_shape = inp_shape
+                best_size = inp_size
+        if len(best_shape) >= 2:
+            rows = math.prod(d for d in best_shape[:-1] if isinstance(d, int))
+        else:
+            rows = 1
+        grid = (rows, 1, 1)
 
-    # Build TMA metadata if the kernel uses TMA descriptors.
-    tma_descs: list[TmaDescriptorSpec] = []
+    # Shared memory for TMA kernels.
     smem_bytes = 0
-
     if kernel_def.tma_params:
-        bk = int(matmul_hints.get("block_k", 32))  # must match tiled.py
+        tile_m = kernel_def.tile_m or 64
+        tile_n = kernel_def.tile_n or 128
+        bk = int(params.get("_block_k", 32))
         a_tile = tile_m * bk
         b_tile = bk * tile_n
         smem_bytes = 2 * (a_tile + b_tile) * 4 + 256
 
-        tma_descs = [
-            TmaDescriptorSpec(
-                param_name=kernel_def.tma_params[0],
-                buffer=a_buf,
-                dims=[str(k), str(m)],
-                strides=[str(k)],
-                tile=[bk, tile_m],
-            ),
-            TmaDescriptorSpec(
-                param_name=kernel_def.tma_params[1],
-                buffer=b_buf,
-                dims=[str(n), str(k)],
-                strides=[str(n)],
-                tile=[tile_n, bk],
-            ),
-        ]
-
-    # Uniform args for all strategies: A, B, epilogue inputs, C, M, N, K, ...
-    args = [*op.inputs, *op.outputs, str(m), str(n), str(k)]
-    if batch_size > 1:
-        args.append(str(batch_size))
-    elif k_splits > 1:
-        args.append(str(k_splits))
-
-    return CudaLaunch(
-        kernel_source=source,
-        kernel_name=name,
-        grid=grid,
-        block=(bx, by, bz),
-        args=args,
-        smem_bytes=smem_bytes,
-        tma_descriptors=tma_descs,
-        zero_outputs=list(op.outputs) if k_splits > 1 else [],
-        loop_ir=loop_prog,
-    )
+    return grid, smem_bytes
 
 
-def _is_matmul_region(op: OpKernel) -> tuple[bool, int, int, int]:
-    """Check if a fused region has a contraction core: Reduce{sum}(Elementwise{mul}(A, B)).
+def _build_launch_args(op: OpKernel, analysis) -> list[str]:
+    """Build launch arguments for a kernel based on analysis pattern."""
+    if analysis.pattern == "contraction":
+        # Contraction: inputs + outputs + M, N, K + optional batch/k_splits.
+        m = analysis.rows
+        n = analysis.cols
+        k = analysis.k_dim
+        batch_size = analysis.batch_size if hasattr(analysis, "batch_size") else 1
+        k_splits = int(op.params.get("_k_splits", 1))
 
-    Allows optional pointwise epilogue ops after the core (e.g. bias add, activation).
-    Returns (is_matmul, M, N, K) where M, N, K are inferred from shapes.
-    """
-    region_ops = op.params.get("_region_ops", [])
-    if len(region_ops) < 2:
-        return False, 0, 0, 0
-    _, op0, inputs0 = region_ops[0]
-    _, op1, _ = region_ops[1]
-    from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+        args = [*op.inputs, *op.outputs, str(m), str(n), str(k)]
+        if batch_size > 1:
+            args.append(str(batch_size))
+        elif k_splits > 1:
+            args.append(str(k_splits))
+        return args
 
-    if not (isinstance(op0, ElementwiseOp) and op0.fn == "mul" and isinstance(op1, ReduceOp) and op1.fn == "sum"):
-        return False, 0, 0, 0
+    # Non-contraction: inputs-not-in-outputs first, then outputs.
+    output_set = set(op.outputs)
+    buffer_args = [inp for inp in op.inputs if inp not in output_set]
+    buffer_args.extend(op.outputs)
 
-    # The mul must be a broadcast (matmul-style): two distinct inputs whose
-    # shapes produce a higher-dimensional output. Self-multiplies like
-    # mul(x, x) in RMSNorm are NOT contractions.
-    if len(inputs0) != 2 or inputs0[0] == inputs0[1]:
-        return False, 0, 0, 0
-    input_shapes = op.params.get("_input_shapes", {})
-    a_shape = input_shapes.get(inputs0[0])
-    b_shape = input_shapes.get(inputs0[1])
-    if a_shape and b_shape and a_shape == b_shape:
-        return False, 0, 0, 0  # same-shape mul → not a matmul
+    if analysis.pattern == "pointwise":
+        total = math.prod(d for d in analysis.output_shape if isinstance(d, int))
+        return buffer_args + [str(total)]
 
-    # Remaining ops (index 2+) must all be pointwise epilogue.
-    for i in range(2, len(region_ops)):
-        _, epi_op, _ = region_ops[i]
-        if not isinstance(epi_op, ElementwiseOp):
-            return False, 0, 0, 0
-
-    # Output shape may be multi-dimensional (batched): (batch, seq_len, N).
-    # M = product of all dims except the last, N = last dim.
-    shape = op.params.get("shape", (1,))
-    n = int(shape[-1]) if len(shape) >= 1 and isinstance(shape[-1], int) else 1
-    m = 1
-    for d in shape[:-1]:
-        if isinstance(d, int):
-            m *= d
-    if m == 0:
-        m = 1
-
-    # K = last dim of A (the reduced/shared dimension).
-    input_shapes = op.params.get("_input_shapes", {})
-    k = m  # fallback
-    if len(inputs0) >= 1 and inputs0[0] in input_shapes:
-        a_shape = input_shapes[inputs0[0]]
-        if len(a_shape) >= 2 and isinstance(a_shape[-1], int):
-            k = int(a_shape[-1])
-
-    return True, m, n, k
-
-
-def _build_region_and_shapes(op: OpKernel):
-    """Extract FusedRegionOp and shapes from an OpKernel's params."""
-    from deplodock.compiler.ops import FusedRegionOp
-
-    region_ops = op.params["_region_ops"]
-    shapes = dict(op.params.get("_shapes", {}))
-    if not shapes:
-        input_shapes = op.params.get("_input_shapes", {})
-        shapes.update(input_shapes)
-        shapes[op.outputs[0]] = op.params.get("shape", (1,))
-
-    # Use plan-level buffer names for the kernel params.
-    # When fusion rewires graph edges, plan-level names (op.inputs) may differ
-    # from original names (_input_names). Remap to keep kernel params aligned
-    # with the buffers that will be passed as launch args.
-    original_input_names = op.params.get("_input_names", list(op.inputs))
-    original_output_names = op.params.get("_output_names", list(op.outputs))
-
-    if original_input_names != list(op.inputs) or original_output_names != list(op.outputs):
-        input_map = dict(zip(original_input_names, op.inputs, strict=False))
-        output_map = dict(zip(original_output_names, op.outputs, strict=False))
-        # Reverse output map: plan_name → original_name (for op node IDs)
-        all_renames = {**input_map, **output_map}
-
-        rewritten_ops = []
-        for rid, rop, inp_ids in region_ops:
-            new_inps = [all_renames.get(i, i) for i in inp_ids]
-            # Also rename the op node_id if it's an output
-            new_rid = all_renames.get(rid, rid)
-            rewritten_ops.append((new_rid, rop, new_inps))
-
-        region = FusedRegionOp(
-            region_ops=rewritten_ops,
-            input_names=list(op.inputs),
-            output_names=list(op.outputs),
-        )
-
-        for orig, plan_name in {**input_map, **output_map}.items():
-            if orig in shapes and plan_name not in shapes:
-                shapes[plan_name] = shapes[orig]
-    else:
-        region = FusedRegionOp(
-            region_ops=region_ops,
-            input_names=original_input_names,
-            output_names=original_output_names,
-        )
-    return region, shapes
-
-
-def _dispatch_to_matmul(op: OpKernel) -> CudaLaunch | None:
-    """Try to route a fused region through the dedicated matmul path.
-
-    Returns a CudaLaunch if the region is a matmul (possibly batched),
-    or None if it should go through the general tiled generator.
-    """
-    from deplodock.compiler.ops import ElementwiseOp as _EwOp
-
-    input_shapes = op.params.get("_input_shapes", {})
-    region_ops = op.params.get("_region_ops", [])
-
-    # For >2D matmul operands (batched matmul), skip the 2-op shortcut —
-    # the analyze path detects batch dims and passes them to _compile_matmul.
-    has_batched_matmul = False
-    if len(region_ops) >= 2:
-        _, op0, inputs0 = region_ops[0]
-        if isinstance(op0, _EwOp) and op0.fn == "mul" and len(inputs0) == 2:
-            a_shape = input_shapes.get(inputs0[0], ())
-            b_shape = input_shapes.get(inputs0[1], ())
-            has_batched_matmul = len(a_shape) > 2 and len(b_shape) > 2
-
-    if not has_batched_matmul:
-        is_matmul, m, n, k = _is_matmul_region(op)
-        if is_matmul:
-            op.params["M"] = m
-            op.params["N"] = n
-            op.params["K"] = k
-            return _compile_matmul(op)
-
-    return None
-
-
-def _grid_for_pointwise(analysis, block_x: int) -> tuple[tuple, tuple, list[str]]:
-    """Compute grid, block, and scalar args for a pointwise kernel."""
-    total = math.prod(d for d in analysis.output_shape if isinstance(d, int))
-    return (_cd(total, block_x), 1, 1), (block_x, 1, 1), [str(total)]
-
-
-def _grid_for_reduce(op: OpKernel, block_x: int) -> tuple[tuple, tuple, list[str]]:
-    """Compute grid, block, and scalar args for row_reduce / reduce_broadcast."""
+    # Reduce: rows, cols.
     out_shape = op.params.get("shape", (1,))
     total = math.prod(d for d in out_shape if isinstance(d, int))
     input_shapes = op.params.get("_input_shapes", {})
@@ -461,7 +328,188 @@ def _grid_for_reduce(op: OpKernel, block_x: int) -> tuple[tuple, tuple, list[str
     else:
         rows = 1
         cols = total
-    return (rows, 1, 1), (block_x, 1, 1), [str(rows), str(cols)]
+    return buffer_args + [str(rows), str(cols)]
+
+
+def _build_tma_descs(kernel_def, op: OpKernel, hints: dict) -> list:
+    """Build TMA descriptor specs if the kernel uses TMA."""
+    from deplodock.compiler.backend.cuda.program import TmaDescriptorSpec
+
+    if not kernel_def.tma_params:
+        return []
+
+    m = op.params.get("M", 1)
+    n = op.params.get("N", 1)
+    k = op.params.get("K", 1)
+    a_buf = op.inputs[0]
+    b_buf = op.inputs[1]
+    tile_m = kernel_def.tile_m or 64
+    tile_n = kernel_def.tile_n or 128
+    bk = int(hints.get("block_k", 32))
+
+    return [
+        TmaDescriptorSpec(
+            param_name=kernel_def.tma_params[0],
+            buffer=a_buf,
+            dims=[str(k), str(m)],
+            strides=[str(k)],
+            tile=[bk, tile_m],
+        ),
+        TmaDescriptorSpec(
+            param_name=kernel_def.tma_params[1],
+            buffer=b_buf,
+            dims=[str(n), str(k)],
+            strides=[str(n)],
+            tile=[tile_n, bk],
+        ),
+    ]
+
+
+def _resolve_contraction_shapes(op: OpKernel, region, shapes: dict):
+    """Resolve symbolic shapes for contraction patterns to numeric values.
+
+    Fusion may produce symbolic dims (e.g. 'K') in intermediate shapes.
+    For contraction detection, the analyzer needs all-numeric shapes.
+    When a contraction pattern (mul + reduce_sum) is detected, rebuild
+    shapes with proper numeric M, N, K dims derived from input shapes.
+    """
+    from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+
+    region_ops = op.params.get("_region_ops", [])
+    if len(region_ops) < 2:
+        return region, shapes
+
+    _, op0, inputs0 = region_ops[0]
+    _, op1, _ = region_ops[1]
+
+    # Check for contraction core: mul + reduce_sum with two distinct inputs.
+    if not (isinstance(op0, ElementwiseOp) and op0.fn == "mul" and isinstance(op1, ReduceOp) and op1.fn == "sum"):
+        return region, shapes
+    if len(inputs0) != 2 or inputs0[0] == inputs0[1]:
+        return region, shapes
+
+    # Same-shape mul (e.g. RMSNorm x*x) is not a contraction.
+    input_shapes = op.params.get("_input_shapes", {})
+    a_shape = input_shapes.get(inputs0[0])
+    b_shape = input_shapes.get(inputs0[1])
+    if a_shape and b_shape and a_shape == b_shape:
+        return region, shapes
+
+    # Check if shapes have symbolic dims that need resolution.
+    has_symbolic = any(not isinstance(d, int) for shape in shapes.values() for d in shape)
+    if not has_symbolic:
+        return region, shapes
+
+    # Extract M, N, K from input/output shapes (all numeric).
+    if not a_shape or not b_shape:
+        return region, shapes
+
+    out_shape = op.params.get("shape", (1,))
+    n = int(out_shape[-1]) if len(out_shape) >= 1 and isinstance(out_shape[-1], int) else 1
+    m = 1
+    for d in out_shape[:-1]:
+        if isinstance(d, int):
+            m *= d
+    if m == 0:
+        m = 1
+    k = int(a_shape[-1]) if len(a_shape) >= 2 and isinstance(a_shape[-1], int) else m
+
+    # Rebuild shapes with numeric values (2D — let analyze detect batch dims).
+    a_buf, b_buf = inputs0[0], inputs0[1]
+    c_buf = op.outputs[0]
+    ew_id = region_ops[0][0]
+    red_id = region_ops[1][0]
+
+    new_shapes = dict(shapes)
+    new_shapes[a_buf] = (m, k)
+    new_shapes[b_buf] = (k, n)
+    new_shapes[ew_id] = (m, k, n)
+    new_shapes[red_id] = (m, n)
+    new_shapes[c_buf] = (m, n)
+
+    # Epilogue shapes.
+    for rid, rop, _ in region_ops[2:]:
+        if isinstance(rop, ReduceOp):
+            new_shapes[rid] = (m, 1)
+        else:
+            new_shapes[rid] = (m, n)
+
+    # Extra inputs keep their original shapes.
+    for inp_name, inp_shape in input_shapes.items():
+        if inp_name not in new_shapes:
+            new_shapes[inp_name] = inp_shape
+
+    return region, new_shapes
+
+
+def _compile_single(op: OpKernel) -> CudaLaunch:
+    """Unified compilation: compile any OpKernel to a single CudaLaunch.
+
+    Handles contractions (with tuning, TMA, k_splits), pointwise, and
+    reduce patterns through a single code path.
+    """
+    from deplodock.compiler.backend.cuda.generators.analysis import analyze
+    from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
+    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
+
+    region_ops = op.params.get("_region_ops", [])
+    if not region_ops:
+        name = _unique_name("fused_region")
+        src = f"__global__ void {name}() {{}}"
+        return CudaLaunch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])
+
+    # Build region + analyze.
+    region, shapes = _build_region_and_shapes(op)
+    # Resolve symbolic shapes for contraction patterns.
+    region, shapes = _resolve_contraction_shapes(op, region, shapes)
+    analysis = analyze(region, shapes)
+
+    # For contractions, populate M/N/K/batch params from analysis.
+    if analysis.pattern == "contraction":
+        op.params["M"] = analysis.rows
+        op.params["N"] = analysis.cols
+        op.params["K"] = analysis.k_dim
+        if analysis.batch_size > 1:
+            op.params["batch_size"] = analysis.batch_size
+            op.params["batch_dims"] = analysis.batch_dims
+
+    # Select strategy (contraction → tuning profile; others → naive).
+    strategy, hints = _select_strategy(op, analysis)
+
+    # Lower → kernel.
+    name = _unique_name(analysis.pattern or "fused_region")
+    kernel_def, loop_prog = lower_tiled(region, name, shapes, analysis, strategy=strategy, hints=hints if hints else {})
+    source = emit_kernel(kernel_def)
+
+    # Stash computed values for grid/args computation.
+    k_splits = int(hints.get("k_splits", 1)) if analysis.pattern == "contraction" else 1
+    batch_size = op.params.get("batch_size", 1)
+    if batch_size > 1:
+        k_splits = 1
+    op.params["_k_splits"] = k_splits
+    op.params["_strategy"] = strategy
+    op.params["_block_k"] = int(hints.get("block_k", 32)) if hints else 32
+
+    # Grid dims.
+    grid, smem_bytes = _compute_grid(kernel_def, analysis, op.params)
+
+    # Launch args.
+    args = _build_launch_args(op, analysis)
+
+    # TMA descriptors.
+    tma_descs = _build_tma_descs(kernel_def, op, hints) if kernel_def.tma_params else []
+
+    return CudaLaunch(
+        kernel_source=source,
+        kernel_name=name,
+        grid=grid,
+        block=kernel_def.block_size,
+        args=args,
+        smem_bytes=smem_bytes,
+        tma_descriptors=tma_descs,
+        zero_outputs=list(op.outputs) if k_splits > 1 else [],
+        loop_ir=loop_prog,
+    )
 
 
 def _split_contraction_softmax(op: OpKernel, analysis) -> list[CudaLaunch] | None:
@@ -503,7 +551,7 @@ def _split_contraction_softmax(op: OpKernel, analysis) -> list[CudaLaunch] | Non
             "_region_ops": list(region_ops[:2]),
         },
     )
-    matmul_launch = _compile_fused_region_single(matmul_op)
+    matmul_launch = _compile_single(matmul_op)
 
     # --- Launch 2: Softmax (remaining ops, in-place on matmul output) ---
     # Collect remaining ops (everything after the contraction reduce).
@@ -559,16 +607,13 @@ def _split_contraction_softmax(op: OpKernel, analysis) -> list[CudaLaunch] | Non
             "shape": out_shape,
         },
     )
-    softmax_launch = _compile_fused_region_single(softmax_op)
+    softmax_launch = _compile_single(softmax_op)
 
     return [matmul_launch, softmax_launch]
 
 
 def _compile_fused_region(op: OpKernel) -> list[CudaLaunch]:
     """Compile a FusedRegionOp via the unified analysis → tiled generator path.
-
-    For contractions with non-naive hints (TMA strategies), falls back to
-    the dedicated matmul path which supports TMA descriptors.
 
     Returns a list of CudaLaunch objects (usually one, but multi-reduce
     contractions with N > tile_n are split into matmul + softmax).
@@ -584,86 +629,18 @@ def _compile_fused_region(op: OpKernel) -> list[CudaLaunch]:
         src = f"__global__ void {name}() {{}}"
         return [CudaLaunch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])]
 
-    # Try the dedicated matmul path first (handles TMA, k_splits, tuning).
-    matmul_launch = _dispatch_to_matmul(op)
-    if matmul_launch is not None:
-        return [matmul_launch]
-
+    # Check for softmax split (contraction with N > tile_n).
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
 
     region, shapes = _build_region_and_shapes(op)
+    region, shapes = _resolve_contraction_shapes(op, region, shapes)
     analysis = analyze(region, shapes)
-
-    # Contraction + multi-reduce (softmax) with N > tile_n: split into
-    # separate matmul + softmax launches since the fused epilogue requires
-    # all columns to fit in one CTA.
-    if analysis.pattern == "contraction":
+    if analysis.pattern == "contraction" and len(analysis.op_phases.reduces) > 1:
         split = _split_contraction_softmax(op, analysis)
         if split is not None:
             return split
 
-        # Standard contraction — compile as single matmul kernel.
-        op.params["M"] = analysis.rows
-        op.params["N"] = analysis.cols
-        op.params["K"] = analysis.k_dim
-        if analysis.batch_size > 1:
-            op.params["batch_size"] = analysis.batch_size
-            op.params["batch_dims"] = analysis.batch_dims
-        return [_compile_matmul(op)]
-
-    return [_compile_fused_region_single(op)]
-
-
-def _compile_fused_region_single(op: OpKernel) -> CudaLaunch:
-    """Compile a single (non-split) fused region through the unified path."""
-    from deplodock.compiler.backend.cuda.generators.analysis import analyze
-    from deplodock.compiler.backend.cuda.generators.tiled import lower_tiled
-    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
-
-    region_ops = op.params.get("_region_ops", [])
-    if not region_ops:
-        name = _unique_name("fused_region")
-        src = f"__global__ void {name}() {{}}"
-        return CudaLaunch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])
-
-    # Check for matmul pattern.
-    matmul_launch = _dispatch_to_matmul(op)
-    if matmul_launch is not None:
-        return matmul_launch
-
-    region, shapes = _build_region_and_shapes(op)
-    analysis = analyze(region, shapes)
-
-    if analysis.pattern == "contraction":
-        op.params["M"] = analysis.rows
-        op.params["N"] = analysis.cols
-        op.params["K"] = analysis.k_dim
-        if analysis.batch_size > 1:
-            op.params["batch_size"] = analysis.batch_size
-            op.params["batch_dims"] = analysis.batch_dims
-        return _compile_matmul(op)
-
-    # Unified path: analyze → lower_tiled → emit_kernel.
-    name = _unique_name("fused_region")
-    kernel_def, loop_prog = lower_tiled(region, name, shapes, analysis)
-    source = emit_kernel(kernel_def)
-
-    bx, by, bz = kernel_def.block_size
-    # Build buffer args matching kernel param order: inputs-not-in-outputs
-    # first, then outputs. This mirrors the param deduplication in tiled.py
-    # where in-place buffers (appearing in both inputs and outputs) are
-    # emitted only as float* (read-write) in the output position.
-    output_set = set(op.outputs)
-    buffer_args = [inp for inp in op.inputs if inp not in output_set]
-    buffer_args.extend(op.outputs)
-
-    if analysis.pattern == "pointwise":
-        grid, block, scalar_args = _grid_for_pointwise(analysis, bx)
-    else:
-        grid, block, scalar_args = _grid_for_reduce(op, bx)
-
-    args = buffer_args + scalar_args
-    return CudaLaunch(kernel_source=source, kernel_name=name, grid=grid, block=block, args=args, loop_ir=loop_prog)
+    return [_compile_single(op)]
 
 
 def _compile_fused_region_from_source(op: OpKernel, source: str) -> CudaLaunch:

@@ -57,7 +57,11 @@ escape hatches (RawLoopOp) for inline asm and float4 fast paths.
 | `tma_db_tf32`     | TF32 via tensor cores (wmma)          | TF32 precision ok       |
 | `tma_db_fma_tf32` | Concurrent FMA + TF32 hybrid          | Mixed precision ok      |
 
-### Strategy selection in `_compile_matmul` (backend.py)
+### Strategy selection in `_select_strategy` (backend.py)
+
+All op patterns (contraction, pointwise, reduce) are compiled through a single
+`_compile_single()` entry point. For contractions, `_select_strategy()` loads
+the GPU tuning profile and applies hint overrides:
 
 - **TMA** is always used for the compiler pipeline (best end-to-end despite
   per-kernel cuBLAS gap for small M)
@@ -121,7 +125,7 @@ Per-GPU strategy maps indexed by `max(M, N)`. Each entry: `(threshold, hints_dic
 | 8192 | tma_db | 28 | 32 | 1 |
 | 16384 | tma_db | 28 | 32 | 1 |
 
-When M < tile_m, `_compile_matmul` clamps thread_m to `M // ty` and may
+When M < tile_m, `_select_strategy` clamps thread_m to `M // ty` and may
 increase k_splits to fill the GPU (up to 8).
 
 ## Performance (RTX 5090, sm_120, batch=1)
