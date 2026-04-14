@@ -92,6 +92,11 @@ def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = No
     for a in fx_node.args:
         if hasattr(a, "name") and a.name in node_map:
             result.append(node_map[a.name])
+        elif isinstance(a, (list, tuple)):
+            # List of tensors (e.g., cat([t1, t2], dim=-1)).
+            for item in a:
+                if hasattr(item, "name") and item.name in node_map:
+                    result.append(node_map[item.name])
         elif isinstance(a, (int, float)) and g is not None:
             # Create a constant node for scalar args (e.g., eps=1e-5).
             const_name = f"{fx_node.name}_c{len(result)}"
@@ -355,8 +360,8 @@ def _handle_call_function(
             node_map[name] = input_ids[0]
         return
 
-    # --- Slice / unsqueeze / squeeze / cat: structural ops ---
-    if op_name in ("slice", "unsqueeze", "squeeze", "expand", "permute"):
+    # --- Unsqueeze / squeeze / permute: true reshapes (same data, different view) ---
+    if op_name in ("unsqueeze", "squeeze", "expand", "permute"):
         if input_ids:
             nid = g.add_node(
                 op=ReshapeOp(shape=shape),
@@ -367,10 +372,29 @@ def _handle_call_function(
             node_map[name] = nid
         return
 
+    # --- Slice: extracts a sub-tensor (NOT a reshape — different data) ---
+    if op_name == "slice":
+        if input_ids:
+            # Emit as an elementwise identity copy with the sliced shape.
+            # The slice args (dim, start, end) are captured as ConstantOp inputs.
+            # The backend will generate a copy kernel with offset indexing.
+            from deplodock.compiler.ops import SliceOp
+
+            nid = g.add_node(
+                op=SliceOp(shape=shape),
+                inputs=input_ids,
+                output=Tensor(name, shape, dtype),
+                node_id=name,
+            )
+            node_map[name] = nid
+        return
+
     if op_name == "cat":
-        # Cat with multiple inputs — represent as elementwise for now.
+        # Cat concatenates along a dimension — NOT elementwise.
+        from deplodock.compiler.ops import CatOp
+
         nid = g.add_node(
-            op=ElementwiseOp(fn="cat"),
+            op=CatOp(),
             inputs=input_ids,
             output=Tensor(name, shape, dtype),
             node_id=name,

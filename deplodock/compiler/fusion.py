@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 from deplodock.compiler.ops import (
     FusedRegionOp,
     ReshapeOp,
-    TransposeOp,
 )
 
 if TYPE_CHECKING:
@@ -89,7 +88,9 @@ def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
 def _is_fusible_op(op, node=None) -> bool:
     from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 
-    return isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp, TransposeOp))
+    # TransposeOp is NOT fusible — it swaps dimensions, which the pointwise
+    # codegen can't express.  It stays as a standalone copy kernel.
+    return isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp))
 
 
 def _is_contraction_op(nid: str, graph) -> bool:
