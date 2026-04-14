@@ -232,7 +232,9 @@ so the tracer stays small and the decomposition lives in one place.
 `auto_fuse(graph)` discovers fusion regions from intermediate tensor sizes:
 - Scores each single-consumer edge by `product(intermediate_shape)`
 - Greedy merge highest-score-first
-- Structural ops (reshape, transpose) always merge
+- Only `ElementwiseOp` and `ReduceOp` are fusible — `ReshapeOp` and `TransposeOp` are NOT
+  (reshape would break 1D broadcast indexing of other inputs; transpose can't be
+  expressed in pointwise codegen). Both always become buffer aliases or standalone kernels.
 - Produces `FusedRegionOp` nodes
 
 Fusion constraints enforced by `_can_merge()`:

@@ -613,6 +613,6 @@ def test_e2e_tinyllama_block():
 def test_e2e_qwen_block():
     """Qwen 2.5-7B transformer block: track accuracy vs eager."""
     max_diff, mean_diff, n = _run_block_e2e("Qwen/Qwen2.5-7B", seq_len=8)
-    # Known issue: Qwen has higher error from GQA + 4D attention shapes.
-    # This test tracks the error — it should decrease as we fix issues.
-    assert max_diff < 5.0, f"Qwen max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f} ({n} elements)"
+    # Qwen's larger hidden_size (3584 vs TinyLlama's 2048) means more fp32
+    # accumulation noise, so tolerance is larger than TinyLlama's 0.5.
+    assert max_diff < 1.0, f"Qwen max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f} ({n} elements)"
