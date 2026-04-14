@@ -18,7 +18,7 @@ def rewrite(graph: Graph, match: Match) -> Graph:
 
     # Constant: 1
     one_id = g.add_node(
-        op=ConstantOp(name=f"{name}_one"),
+        op=ConstantOp(name=f"{name}_one", value=1.0),
         inputs=[],
         output=Tensor(f"{name}_one", (1,), dtype),
     )

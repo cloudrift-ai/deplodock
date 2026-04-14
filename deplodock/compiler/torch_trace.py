@@ -96,7 +96,7 @@ def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = No
             # Create a constant node for scalar args (e.g., eps=1e-5).
             const_name = f"{fx_node.name}_c{len(result)}"
             const_id = g.add_node(
-                op=ConstantOp(name=const_name),
+                op=ConstantOp(name=const_name, value=float(a)),
                 inputs=[],
                 output=Tensor(const_name, (1,), "f32"),
                 node_id=const_name,

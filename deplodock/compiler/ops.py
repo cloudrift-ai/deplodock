@@ -123,6 +123,7 @@ class ConstantOp(Op):
     """Fixed tensor: weights, RoPE tables, scalars. Not an activation."""
 
     name: str
+    value: float | None = None  # scalar value captured at trace time
 
 
 @dataclass

@@ -1,5 +1,7 @@
 """Decompose scaled_dot_product_attention into QK^T → scale → softmax → @V."""
 
+import math
+
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import Match
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp, ReduceOp, TransposeOp
@@ -55,9 +57,10 @@ def rewrite(graph: Graph, match: Match) -> Graph:
         output=Tensor(f"{name}_qk", scores_shape, dtype),
     )
 
-    # Scale constant
+    # Scale constant: 1/sqrt(head_dim)
+    scale_value = 1.0 / math.sqrt(head_dim) if isinstance(head_dim, int) else None
     scale_const_id = g.add_node(
-        op=ConstantOp(name=f"{name}_scale"),
+        op=ConstantOp(name=f"{name}_scale", value=scale_value),
         inputs=[],
         output=Tensor(f"{name}_scale", (1,), dtype),
     )
