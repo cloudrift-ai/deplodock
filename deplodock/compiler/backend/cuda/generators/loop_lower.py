@@ -175,8 +175,12 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
         A = Var(_safe(analysis.contraction_a))  # noqa: N806
         B = Var(_safe(analysis.contraction_b))  # noqa: N806
         batch, M, K, N = Var("batch"), Var("M"), Var("K"), Var("N")  # noqa: N806
-        ops.append(Let("Ab", A + batch * (M * K), dtype="const float*"))
-        ops.append(Let("Bb", B + batch * (K * N), dtype="const float*"))
+        # GQA / broadcast batch: one operand may have fewer batch elements.
+        # E.g. 28 Q heads vs 4 KV heads → b_batch_group=7, B uses batch//7.
+        a_batch_idx = batch / analysis.a_batch_group if analysis.a_batch_group > 1 else batch
+        b_batch_idx = batch / analysis.b_batch_group if analysis.b_batch_group > 1 else batch
+        ops.append(Let("Ab", A + a_batch_idx * (M * K), dtype="const float*"))
+        ops.append(Let("Bb", B + b_batch_idx * (K * N), dtype="const float*"))
 
     return ops
 
@@ -950,6 +954,10 @@ def _input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int
             return [Var("i") % acc.size]
         return [Var("i")]
 
+    if acc.is_broadcast:
+        # Broadcast input: use modulo to wrap the flat index into the
+        # smaller input's element range.
+        return [Var("row") * Var("cols") + j % acc.size]
     if acc.is_2d:
         return [Var("row"), j]
     if acc.is_per_row:

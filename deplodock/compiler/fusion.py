@@ -68,6 +68,24 @@ def _tensor_size(shape: tuple) -> int:
     return math.prod(d for d in shape if isinstance(d, int)) if shape else 1
 
 
+def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
+    """Check if small broadcasts to large via NumPy-style rules.
+
+    Aligns shapes from the right. Each dim of small must be 1 or match
+    the corresponding dim of large.
+    """
+    if len(small_shape) > len(large_shape):
+        return False
+    offset = len(large_shape) - len(small_shape)
+    for i, s in enumerate(small_shape):
+        large_dim = large_shape[offset + i]
+        if not isinstance(s, int) or not isinstance(large_dim, int):
+            continue
+        if s != 1 and s != large_dim:
+            return False
+    return True
+
+
 def _is_fusible_op(op, node=None) -> bool:
     from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 
@@ -304,7 +322,8 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
                 return False  # Multi-dim expansion — reject
 
     if not is_pure_contraction:
-        sizes_full: set[int] = set()
+        # Collect external input shapes and sizes (excluding trivial ones).
+        ext_inputs: list[tuple[tuple, int]] = []  # (shape, size)
         for nid in merged:
             node = graph.nodes[nid]
             for inp_id in node.inputs:
@@ -315,14 +334,24 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
                         continue
                     if len(inp_shape) == 1:
                         continue  # 1D vector — uses [j] indexing
-                    # Per-row scalar: last dim is 1 (e.g., (N,1) or (1,28,32,1)).
-                    # These are indexed by row only, not by column.
                     last_dim = inp_shape[-1] if inp_shape else 1
                     if isinstance(last_dim, int) and last_dim == 1:
                         continue
+                    ext_inputs.append((inp_shape, inp_size))
+        if ext_inputs:
+            max_size = max(s for _, s in ext_inputs)
+            # Find the shape of the largest input (reference for broadcast checks).
+            max_shape = next(sh for sh, s in ext_inputs if s == max_size)
+            sizes_full: set[int] = set()
+            for inp_shape, inp_size in ext_inputs:
+                if inp_size == max_size:
                     sizes_full.add(inp_size)
-        if len(sizes_full) > 1:
-            return False
+                elif _is_broadcast_compatible(inp_shape, max_shape):
+                    continue  # Broadcast-compatible — indexed via modulo
+                else:
+                    sizes_full.add(inp_size)
+            if len(sizes_full) > 1:
+                return False
 
     # 5. Single-output: the merged region must have at most one external output.
     # Multi-output fused regions require infrastructure changes in plan.py/backend.py.

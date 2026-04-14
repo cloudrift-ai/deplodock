@@ -1029,3 +1029,179 @@ def test_correctness_contraction_softmax_online_large_n(dump_dir):
     plan = plan_graph(fused)
     program = CudaBackend().compile(plan)
     assert len(program.launches) == 1, f"Expected 1 launch (online), got {len(program.launches)}"
+
+
+# ===========================================================================
+# Fused kernel pattern correctness tests (transformer block patterns)
+# ===========================================================================
+
+
+@requires_cuda
+def test_correctness_contraction_bias_add(dump_dir):
+    """Matmul + bias add fused as contraction with epilogue."""
+    m, k, n = 32, 64, 128
+
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("X", (m, k)), node_id="X")
+    w = g.add_node(InputOp(), [], Tensor("W", (k, n)), node_id="W")
+    bias = g.add_node(InputOp(), [], Tensor("bias", (n,)), node_id="bias")
+    g.inputs = [a, w, bias]
+
+    ew = g.add_node(ElementwiseOp("mul"), [a, w], Tensor("ew", (m, k, n)), node_id="ew")
+    mm = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("mm", (m, n)), node_id="mm")
+    out = g.add_node(ElementwiseOp("add"), [mm, bias], Tensor("out", (m, n)), node_id="out")
+    g.outputs = [out]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    actual = list(outputs.values())[0]
+
+    x_data = _pseudo_random(m * k)
+    w_data = _pseudo_random(k * n)
+    bias_data = _pseudo_random(n)
+    mm_ref = _python_matmul(x_data, w_data, m, k, n)
+    expected = [mm_ref[i] + bias_data[i % n] for i in range(m * n)]
+
+    _assert_close(actual, expected, tol=1e-2, label="contraction_bias_add")
+
+
+@requires_cuda
+def test_correctness_broadcast_pointwise(dump_dir):
+    """Pointwise mul with broadcast input (rotary embedding style)."""
+    batch, heads, seq, dim = 1, 4, 16, 32
+    total = batch * heads * seq * dim
+
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("X", (batch, heads, seq, dim)), node_id="X")
+    cos = g.add_node(InputOp(), [], Tensor("cos", (batch, 1, seq, dim)), node_id="cos")
+    g.inputs = [x, cos]
+
+    out = g.add_node(ElementwiseOp("mul"), [x, cos], Tensor("out", (batch, heads, seq, dim)), node_id="out")
+    g.outputs = [out]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    actual = list(outputs.values())[0]
+
+    x_data = _pseudo_random(total)
+    cos_data = _pseudo_random(batch * 1 * seq * dim)
+    cos_size = batch * seq * dim
+    expected = [x_data[i] * cos_data[i % cos_size] for i in range(total)]
+
+    _assert_close(actual, expected, tol=1e-4, label="broadcast_pointwise")
+
+
+@requires_cuda
+def test_correctness_gqa_batched_contraction(dump_dir):
+    """Batched matmul with broadcast batch dims (GQA: 4 Q heads, 2 KV heads)."""
+    q_heads, kv_heads = 4, 2
+    seq, dim = 8, 16
+    group_size = q_heads // kv_heads  # 2
+
+    g = Graph()
+    # attn_weights: (q_heads, seq, seq) — one per Q head
+    attn = g.add_node(InputOp(), [], Tensor("attn", (q_heads, seq, seq)), node_id="attn")
+    # V: (kv_heads, seq, dim) — shared across groups
+    v = g.add_node(InputOp(), [], Tensor("V", (kv_heads, seq, dim)), node_id="V")
+    g.inputs = [attn, v]
+
+    ew = g.add_node(ElementwiseOp("mul"), [attn, v], Tensor("ew", (q_heads, seq, seq, dim)), node_id="ew")
+    out = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("out", (q_heads, seq, dim)), node_id="out")
+    g.outputs = [out]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    actual = list(outputs.values())[0]
+
+    attn_data = _pseudo_random(q_heads * seq * seq)
+    v_data = _pseudo_random(kv_heads * seq * dim)
+
+    # Reference: for each Q head h, use KV head h // group_size
+    expected = []
+    for h in range(q_heads):
+        kv_h = h // group_size
+        for i in range(seq):
+            for d in range(dim):
+                s = 0.0
+                for j in range(seq):
+                    a_idx = h * seq * seq + i * seq + j
+                    v_idx = kv_h * seq * dim + j * dim + d
+                    s += attn_data[a_idx] * v_data[v_idx]
+                expected.append(s)
+
+    _assert_close(actual, expected, tol=1e-2, label="gqa_batched_contraction")
+
+
+@requires_cuda
+def test_correctness_contraction_residual_add(dump_dir):
+    """Matmul + residual add (output = matmul(X, W) + residual)."""
+    m, k, n = 16, 32, 64
+
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("X", (m, k)), node_id="X")
+    w = g.add_node(InputOp(), [], Tensor("W", (k, n)), node_id="W")
+    res = g.add_node(InputOp(), [], Tensor("res", (m, n)), node_id="res")
+    g.inputs = [x, w, res]
+
+    ew = g.add_node(ElementwiseOp("mul"), [x, w], Tensor("ew", (m, k, n)), node_id="ew")
+    mm = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("mm", (m, n)), node_id="mm")
+    out = g.add_node(ElementwiseOp("add"), [mm, res], Tensor("out", (m, n)), node_id="out")
+    g.outputs = [out]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    actual = list(outputs.values())[0]
+
+    x_data = _pseudo_random(m * k)
+    w_data = _pseudo_random(k * n)
+    res_data = _pseudo_random(m * n)
+    mm_ref = _python_matmul(x_data, w_data, m, k, n)
+    expected = [mm_ref[i] + res_data[i] for i in range(m * n)]
+
+    _assert_close(actual, expected, tol=1e-2, label="contraction_residual_add")
+
+
+@requires_cuda
+def test_correctness_chained_rmsnorm_matmul_residual(dump_dir):
+    """Multi-kernel chain: RMSNorm → matmul+bias → residual add.
+
+    Tests that data flows correctly between kernels in the pipeline.
+    """
+    rows, dim, out_dim = 8, 64, 128
+
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("X", (rows, dim)), node_id="X")
+    eps_node = g.add_node(ConstantOp(name="eps"), [], Tensor("eps", (1,)), node_id="eps")
+    w_norm = g.add_node(InputOp(), [], Tensor("w_norm", (dim,)), node_id="w_norm")
+    w_proj = g.add_node(InputOp(), [], Tensor("W", (dim, out_dim)), node_id="W")
+    bias = g.add_node(InputOp(), [], Tensor("bias", (out_dim,)), node_id="bias")
+    g.inputs = [x, w_norm, w_proj, bias]
+
+    # RMSNorm: x * rsqrt(sum(x^2) + eps) * w_norm
+    sq = g.add_node(ElementwiseOp("mul"), [x, x], Tensor("sq", (rows, dim)), node_id="sq")
+    red = g.add_node(ReduceOp("sum", axis=-1), [sq], Tensor("red", (rows, 1)), node_id="red")
+    add_eps = g.add_node(ElementwiseOp("add"), [red, eps_node], Tensor("ae", (rows, 1)), node_id="ae")
+    rsq = g.add_node(ElementwiseOp("rsqrt"), [add_eps], Tensor("rsq", (rows, 1)), node_id="rsq")
+    norm = g.add_node(ElementwiseOp("mul"), [x, rsq], Tensor("norm", (rows, dim)), node_id="norm")
+    normed = g.add_node(ElementwiseOp("mul"), [norm, w_norm], Tensor("normed", (rows, dim)), node_id="normed")
+
+    # Matmul + bias
+    ew = g.add_node(ElementwiseOp("mul"), [normed, w_proj], Tensor("ew", (rows, dim, out_dim)), node_id="ew")
+    mm = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("mm", (rows, out_dim)), node_id="mm")
+    biased = g.add_node(ElementwiseOp("add"), [mm, bias], Tensor("biased", (rows, out_dim)), node_id="biased")
+    g.outputs = [biased]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    actual = list(outputs.values())[0]
+
+    # Python reference
+    x_data = _pseudo_random(rows * dim)
+    w_norm_data = _pseudo_random(dim)
+    w_data = _pseudo_random(dim * out_dim)
+    bias_data = _pseudo_random(out_dim)
+    eps_data = _pseudo_random(1)[0]
+
+    # RMSNorm
+    normed_ref = _python_rmsnorm(x_data, w_norm_data, eps_data, rows, dim)
+    # Matmul
+    mm_ref = _python_matmul(normed_ref, w_data, rows, dim, out_dim)
+    # Bias
+    expected = [mm_ref[i] + bias_data[i % out_dim] for i in range(rows * out_dim)]
+
+    _assert_close(actual, expected, tol=0.1, label="chained_rmsnorm_matmul")

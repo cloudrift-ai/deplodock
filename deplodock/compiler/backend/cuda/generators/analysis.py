@@ -12,6 +12,21 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
 
+
+def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
+    """Check if small broadcasts to large via NumPy-style rules."""
+    if len(small_shape) > len(large_shape):
+        return False
+    offset = len(large_shape) - len(small_shape)
+    for i, s in enumerate(small_shape):
+        large_dim = large_shape[offset + i]
+        if not isinstance(s, int) or not isinstance(large_dim, int):
+            continue
+        if s != 1 and s != large_dim:
+            return False
+    return True
+
+
 # Type alias for region op tuples: (node_id, op, input_ids)
 RegionEntry = tuple[str, object, list[str]]
 
@@ -40,6 +55,7 @@ class AccessPattern:
     is_row_vector: bool  # 1D, indexed by column only
     is_2d: bool  # indexed by both row and column
     is_per_row: bool = False  # last dim == 1, indexed by row only (e.g., (N,1) or (1,28,32,1))
+    is_broadcast: bool = False  # smaller input that broadcasts to output (indexed via modulo)
 
 
 @dataclass
@@ -67,6 +83,12 @@ class TileAnalysis:
     # Batch dimensions for batched contractions (e.g. multi-head attention).
     batch_dims: tuple[int, ...] = ()
     batch_size: int = 1
+    # GQA / broadcast batch: when one operand has fewer batch elements,
+    # its batch index is divided by this factor.  E.g. 28 Q heads / 4 KV heads = 7.
+    # "b_batch_group" means B's batch index = batch // b_batch_group.
+    # 1 means both operands use the same batch index (no broadcast).
+    a_batch_group: int = 1
+    b_batch_group: int = 1
 
 
 def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
@@ -100,13 +122,22 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
         last_dim = inp_shape[-1] if inp_shape else 1
         last_dim_is_one = isinstance(last_dim, int) and last_dim == 1
         is_per_row = last_dim_is_one and inp_size > 1 and len(inp_shape) >= 2
+        out_size = math.prod(d for d in out_shape if isinstance(d, int))
+        is_broadcast = (
+            inp_size > 1
+            and inp_size < out_size
+            and not is_per_row
+            and len(inp_shape) >= 2
+            and _is_broadcast_compatible(inp_shape, out_shape)
+        )
         input_access[inp] = AccessPattern(
             shape=inp_shape,
             size=inp_size,
             is_scalar=(inp_size == 1 and not has_symbolic),
             is_row_vector=(len(inp_shape) == 1 and (inp_size > 1 or has_symbolic)),
-            is_2d=(len(inp_shape) >= 2 and (inp_size > 1 or has_symbolic) and not is_per_row),
+            is_2d=(len(inp_shape) >= 2 and (inp_size > 1 or has_symbolic) and not is_per_row and not is_broadcast),
             is_per_row=is_per_row,
+            is_broadcast=is_broadcast,
         )
 
     # No reduces → pointwise.
@@ -129,7 +160,7 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
 
     # Check for contraction pattern: exactly 2 ops (mul + sum), two 2D inputs
     # sharing a dimension that gets reduced, producing a 2D output.
-    is_contraction, a_name, b_name, m, n, k, batch_dims, batch_size = _detect_contraction(region, phases, shapes, input_access)
+    is_contraction, a_name, b_name, m, n, k, batch_dims, batch_size, a_bg, b_bg = _detect_contraction(region, phases, shapes, input_access)
 
     if is_contraction:
         epilogue_per_elem = _epilogue_needs_per_element(region, phases, shapes, input_access)
@@ -147,6 +178,8 @@ def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
             epilogue_needs_per_element=epilogue_per_elem,
             batch_dims=batch_dims,
             batch_size=batch_size,
+            a_batch_group=a_bg,
+            b_batch_group=b_bg,
         )
 
     # Row reduction patterns — extract rows/cols from pre-reduction shape.
@@ -240,13 +273,13 @@ def _detect_contraction(
     Returns: (is_contraction, a_name, b_name, M, N, K, batch_dims, batch_size)
     """
     if not phases.reduces:
-        return False, None, None, 0, 0, 0, (), 1
+        return False, None, None, 0, 0, 0, (), 1, 1, 1
 
     # The first reduce must be sum.
     first_reduce = phases.reduces[0]
     _, reduce_op, _ = first_reduce
     if reduce_op.fn != "sum":
-        return False, None, None, 0, 0, 0, (), 1
+        return False, None, None, 0, 0, 0, (), 1, 1, 1
 
     # Find the binary mul in prologue that feeds the reduce.
     mul_entry = None
@@ -257,37 +290,64 @@ def _detect_contraction(
             break
 
     if mul_entry is None:
-        return False, None, None, 0, 0, 0, (), 1
+        return False, None, None, 0, 0, 0, (), 1, 1, 1
 
     _, _, mul_inputs = mul_entry
     a_id, b_id = mul_inputs[0], mul_inputs[1]
 
     # Both inputs must be external (in region.input_names) and >=2D.
     if a_id not in input_access or b_id not in input_access:
-        return False, None, None, 0, 0, 0, (), 1
+        return False, None, None, 0, 0, 0, (), 1, 1, 1
 
     a_acc = input_access[a_id]
     b_acc = input_access[b_id]
 
     if not a_acc.is_2d or not b_acc.is_2d:
-        return False, None, None, 0, 0, 0, (), 1
+        return False, None, None, 0, 0, 0, (), 1, 1, 1
 
     # A(M, K) @ B(K, N) or A(B..., M, K) @ B(B..., K, N).
     a_shape = a_acc.shape
     b_shape = b_acc.shape
 
     if len(a_shape) < 2 or len(b_shape) < 2:
-        return False, None, None, 0, 0, 0, (), 1
+        return False, None, None, 0, 0, 0, (), 1, 1, 1
 
-    # Detect batch dimensions: leading dims that match between A and B.
+    # Detect batch dimensions: leading dims that match or broadcast between A and B.
     batch_dims: tuple[int, ...] = ()
     batch_size = 1
+    a_batch_group = 1
+    b_batch_group = 1
     if len(a_shape) > 2 and len(b_shape) > 2:
         a_batch = a_shape[:-2]
         b_batch = b_shape[:-2]
-        if a_batch != b_batch:
-            return False, None, None, 0, 0, 0, (), 1
-        batch_dims = a_batch
+        if a_batch == b_batch:
+            batch_dims = a_batch
+        elif len(a_batch) == len(b_batch):
+            # Broadcast batch dims (e.g. GQA: 28 Q heads vs 4 KV heads).
+            # Each dim must match or one must divide the other.
+            merged_batch: list[int] = []
+            for ad, bd in zip(a_batch, b_batch, strict=True):
+                if not isinstance(ad, int) or not isinstance(bd, int):
+                    return False, None, None, 0, 0, 0, (), 1, 1, 1
+                if ad == bd:
+                    merged_batch.append(ad)
+                elif ad > bd and bd > 0 and ad % bd == 0:
+                    merged_batch.append(ad)  # A has more, B broadcasts
+                elif bd > ad and ad > 0 and bd % ad == 0:
+                    merged_batch.append(bd)  # B has more, A broadcasts
+                else:
+                    return False, None, None, 0, 0, 0, (), 1, 1, 1
+            batch_dims = tuple(merged_batch)
+            a_batch_size = math.prod(d for d in a_batch if isinstance(d, int))
+            b_batch_size = math.prod(d for d in b_batch if isinstance(d, int))
+            # Group size: how many batch elements of the larger operand
+            # share one element of the smaller operand.
+            if a_batch_size >= b_batch_size and b_batch_size > 0:
+                b_batch_group = a_batch_size // b_batch_size
+            elif a_batch_size > 0:
+                a_batch_group = b_batch_size // a_batch_size
+        else:
+            return False, None, None, 0, 0, 0, (), 1, 1, 1
         batch_size = math.prod(d for d in batch_dims if isinstance(d, int))
         # Batched: A(B..., M, K) @ B(B..., K, N)
         a_k = a_shape[-1]
@@ -299,7 +359,7 @@ def _detect_contraction(
 
     # K dimension must match (both int or both same symbolic string).
     if a_k != b_k:
-        return False, None, None, 0, 0, 0, (), 1
+        return False, None, None, 0, 0, 0, (), 1, 1, 1
 
     m = a_shape[-2] if isinstance(a_shape[-2], int) else 1
     if not batch_dims:
@@ -308,7 +368,7 @@ def _detect_contraction(
     k = a_k if isinstance(a_k, int) else 1
     n = b_shape[-1] if isinstance(b_shape[-1], int) else 1
 
-    return True, a_id, b_id, m, n, k, batch_dims, batch_size
+    return True, a_id, b_id, m, n, k, batch_dims, batch_size, a_batch_group, b_batch_group
 
 
 def _epilogue_needs_per_element(

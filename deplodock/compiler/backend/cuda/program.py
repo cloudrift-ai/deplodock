@@ -47,7 +47,13 @@ class CudaLaunch(Launch):
 # ---------------------------------------------------------------------------
 
 
-def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 10, warmup: int = 3) -> str:
+def generate_source(
+    program: Program,
+    mode: str = "benchmark",
+    num_iters: int = 10,
+    warmup: int = 3,
+    input_data: dict[str, list[float]] | None = None,
+) -> str:
     """Generate a complete .cu program from a Program spec.
 
     Args:
@@ -101,13 +107,23 @@ def generate_source(program: Program, mode: str = "benchmark", num_iters: int = 
         parts.append(f"    {buf.dtype}* d_{alias_name} = d_{target_name};")
     parts.append("")
 
-    # Initialize inputs and constants with pseudorandom data.
+    # Initialize inputs and constants.
     for buf in program.buffers:
         if buf.role in ("input", "constant") and buf.name not in aliased:
-            parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
-            parts.append(f"      for (int i = 0; i < {buf.size}; i++) h[i] = 0.01f * ((i * 7 + 13) % 101 - 50);")
-            parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
-            parts.append("      free(h); }")
+            if input_data and buf.name in input_data:
+                # Use provided data: read from binary file at runtime.
+                parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
+                # Write data via binary file read for large buffers.
+                parts.append(f'      FILE* fp = fopen("{buf.name}.bin", "rb");')
+                parts.append(f"      fread(h, sizeof({buf.dtype}), {buf.size}, fp); fclose(fp);")
+                parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
+                parts.append("      free(h); }")
+            else:
+                # Pseudorandom fallback.
+                parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
+                parts.append(f"      for (int i = 0; i < {buf.size}; i++) h[i] = 0.01f * ((i * 7 + 13) % 101 - 50);")
+                parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
+                parts.append("      free(h); }")
     parts.append("")
 
     # TMA descriptor setup (once, before any launches).
@@ -300,12 +316,20 @@ def compile_program(source: str, arch: str | None = None) -> Path:
     return binary
 
 
-def run_program(program: Program) -> ProgramResult:
+def run_program(program: Program, input_data: dict[str, list[float]] | None = None) -> ProgramResult:
     """Generate, compile, and run a Program. Returns outputs + timing."""
-    source = generate_source(program, mode="run")
+    source = generate_source(program, mode="run", input_data=input_data)
     binary = compile_program(source)
 
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120)
+    # Write input data files next to the binary if provided.
+    if input_data:
+        import struct
+
+        for buf_name, vals in input_data.items():
+            data_path = binary.parent / f"{buf_name}.bin"
+            data_path.write_bytes(struct.pack(f"{len(vals)}f", *vals))
+
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120, cwd=str(binary.parent))
     if result.returncode != 0:
         raise RuntimeError(f"Program execution failed:\n{result.stderr}")
 
