@@ -136,6 +136,14 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
                 inp_node = graph.nodes.get(inp_id)
                 if inp_node and isinstance(inp_node.op, ops_module.ConstantOp) and inp_node.op.value is not None:
                     params[f"_const_{inp_id}"] = inp_node.op.value
+        elif isinstance(op, ops_module.LinearOp):
+            tag = "linear"
+        elif isinstance(op, ops_module.MatmulOp):
+            tag = "matmul"
+        elif isinstance(op, ops_module.SdpaOp):
+            tag = "sdpa"
+        elif isinstance(op, ops_module.UnsqueezeOp):
+            tag = "unsqueeze"
         elif isinstance(op, ops_module.CatOp):
             tag = "cat"
         elif isinstance(op, ops_module.GatherOp):

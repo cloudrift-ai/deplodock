@@ -249,38 +249,37 @@ def test_trace_transpose():
 # ---------------------------------------------------------------------------
 
 
-def test_trace_linear_decomposes_to_mul_reduce():
-    """nn.Linear decomposes to ElementwiseOp(mul) + ReduceOp(sum)."""
+def test_trace_linear_produces_linearop():
+    """nn.Linear produces a single LinearOp node (not decomposed)."""
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+    from deplodock.compiler.ops import LinearOp
     from deplodock.compiler.torch_trace import trace_module
 
     linear = nn.Linear(8, 4, bias=False)
     x = torch.randn(2, 8)
     g = trace_module(linear, (x,))
 
-    has_mul = any(isinstance(n.op, ElementwiseOp) and n.op.fn == "mul" for n in g.nodes.values())
-    has_sum = any(isinstance(n.op, ReduceOp) and n.op.fn == "sum" for n in g.nodes.values())
-    assert has_mul, "Linear should decompose to mul"
-    assert has_sum, "Linear should decompose to sum"
+    has_linear = any(isinstance(n.op, LinearOp) for n in g.nodes.values())
+    assert has_linear, "Linear should produce a LinearOp node"
 
 
 def test_trace_linear_with_bias():
-    """nn.Linear with bias produces an additional add op."""
+    """nn.Linear with bias produces LinearOp with has_bias=True."""
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ops import ElementwiseOp
+    from deplodock.compiler.ops import LinearOp
     from deplodock.compiler.torch_trace import trace_module
 
     linear = nn.Linear(8, 4, bias=True)
     x = torch.randn(2, 8)
     g = trace_module(linear, (x,))
 
-    has_add = any(isinstance(n.op, ElementwiseOp) and n.op.fn == "add" for n in g.nodes.values())
-    assert has_add, "Linear with bias should produce an add op"
+    linear_nodes = [n for n in g.nodes.values() if isinstance(n.op, LinearOp)]
+    assert len(linear_nodes) == 1
+    assert linear_nodes[0].op.has_bias, "Linear with bias should have has_bias=True"
 
 
 # ---------------------------------------------------------------------------

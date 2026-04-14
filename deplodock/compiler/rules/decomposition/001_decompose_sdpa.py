@@ -9,7 +9,7 @@ from deplodock.compiler.ops import ConstantOp, ElementwiseOp, ReduceOp, Transpos
 # Match any sdpa node. The rewrite function extracts Q, K, V from node.inputs.
 # We use a 3-arg pattern but also handle extra args (dropout_p, is_causal, etc.)
 # by checking the fn in the rewrite function.
-PATTERN = "Elementwise{sdpa}($Q, $K, $V)"
+PATTERN = "Sdpa($Q, $K, $V)"
 
 
 def rewrite(graph: Graph, match: Match) -> Graph:

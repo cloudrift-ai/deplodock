@@ -1,4 +1,8 @@
-"""Trace a PyTorch module and convert to compiler Graph IR.
+"""Trace a PyTorch module and convert to Torch IR (faithful capture).
+
+The tracer creates one graph node per FX op, using PyTorch's exact shapes.
+No decomposition, no skipping, no shape overrides.  Decomposition into
+primitive Deplodock IR ops happens in separate rewriter passes.
 
 Requires PyTorch (optional dependency). All torch imports are guarded.
 """
@@ -10,13 +14,19 @@ from typing import TYPE_CHECKING, Any
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import (
+    CatOp,
     ConstantOp,
     ElementwiseOp,
     GatherOp,
     InputOp,
+    LinearOp,
+    MatmulOp,
     ReduceOp,
     ReshapeOp,
+    SdpaOp,
+    SliceOp,
     TransposeOp,
+    UnsqueezeOp,
 )
 
 if TYPE_CHECKING:
@@ -43,13 +53,8 @@ def trace_module(
 ) -> Graph:
     """Trace a PyTorch module and convert the FX graph to our IR.
 
-    Args:
-        module: PyTorch module to trace (e.g., a single transformer layer).
-        example_inputs: Tuple of example input tensors for tracing.
-        kwargs: Optional keyword arguments for the module forward.
-
-    Returns:
-        Graph in our IR with InputOp, ConstantOp, ElementwiseOp, etc.
+    Returns a Torch IR graph — a faithful 1:1 mirror of the FX graph.
+    Use Rewriter passes to decompose into primitive Deplodock IR.
     """
     import torch
 
@@ -69,68 +74,7 @@ def trace_module(
         else:
             logger.debug("Skipping FX node: %s (op=%s)", fx_node.name, fx_node.op)
 
-    # Post-process: strip spurious leading-1 dims introduced by unsqueeze.
-    # Since we skip unsqueeze nodes, downstream ops may have output shapes
-    # with extra leading 1s from PyTorch's broadcast rules.  Normalize by
-    # stripping interior 1-dims that don't appear in any input shape.
-    _strip_unsqueeze_dims(g)
-
     return g
-
-
-def _strip_unsqueeze_dims(g: Graph) -> None:
-    """Fix output shapes after skipping unsqueeze nodes.
-
-    When unsqueeze is passed through, some downstream ops have output shapes
-    with extra dims from PyTorch metadata.  This function:
-    1. Strips leading 1-dims from outputs that have more dims than all inputs
-    2. Recomputes transpose output shapes from the actual input shape
-    """
-    from deplodock.compiler.ops import ConstantOp, InputOp, TransposeOp
-
-    for nid in g.topological_order():
-        node = g.nodes[nid]
-        if isinstance(node.op, (InputOp, ConstantOp)):
-            continue
-
-        out_shape = node.output.shape
-
-        # Transpose: recompute output shape from input shape + axes.
-        if isinstance(node.op, TransposeOp):
-            if node.inputs and node.inputs[0] in g.nodes:
-                inp_shape = list(g.nodes[node.inputs[0]].output.shape)
-                ax0, ax1 = node.op.axes
-                ndim = len(inp_shape)
-                ax0 = ax0 % ndim if ndim > 0 else 0
-                ax1 = ax1 % ndim if ndim > 0 else 0
-                inp_shape[ax0], inp_shape[ax1] = inp_shape[ax1], inp_shape[ax0]
-                node.output = Tensor(node.output.name, tuple(inp_shape), node.output.dtype)
-            continue
-
-        if not out_shape or len(out_shape) <= 2:
-            continue
-
-        # Find max ndim among resolved inputs.
-        max_inp_ndim = 0
-        for inp_id in node.inputs:
-            if inp_id in g.nodes:
-                inp_shape = g.nodes[inp_id].output.shape
-                if len(inp_shape) > max_inp_ndim:
-                    max_inp_ndim = len(inp_shape)
-
-        if max_inp_ndim == 0 or len(out_shape) <= max_inp_ndim:
-            continue
-
-        # Strip leading 1-dims down to max input ndim.
-        new_shape = out_shape
-        while len(new_shape) > max_inp_ndim and len(new_shape) > 1:
-            if isinstance(new_shape[0], int) and new_shape[0] == 1:
-                new_shape = new_shape[1:]
-            else:
-                break
-
-        if new_shape != out_shape:
-            node.output = Tensor(node.output.name, new_shape, node.output.dtype)
 
 
 def _get_shape(fx_node: Any) -> tuple:
@@ -154,12 +98,10 @@ def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = No
         if hasattr(a, "name") and a.name in node_map:
             result.append(node_map[a.name])
         elif isinstance(a, (list, tuple)):
-            # List of tensors (e.g., cat([t1, t2], dim=-1)).
             for item in a:
                 if hasattr(item, "name") and item.name in node_map:
                     result.append(node_map[item.name])
         elif isinstance(a, (int, float)) and g is not None:
-            # Create a constant node for scalar args (e.g., eps=1e-5).
             const_name = f"{fx_node.name}_c{len(result)}"
             const_id = g.add_node(
                 op=ConstantOp(name=const_name, value=float(a)),
@@ -172,36 +114,18 @@ def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = No
     return result
 
 
-def _handle_placeholder(
-    g: Graph,
-    fx_node: Any,
-    node_map: dict[str, str],
-    module: nn.Module,
-) -> None:
+def _handle_placeholder(g: Graph, fx_node: Any, node_map: dict[str, str], module: nn.Module) -> None:
     """Handle placeholder nodes (inputs and parameters)."""
     name = fx_node.name
     shape = _get_shape(fx_node)
     dtype = _get_dtype(fx_node)
-
-    # Parameters start with "p_" in torch.export convention.
     is_param = name.startswith("p_")
 
     if is_param:
-        nid = g.add_node(
-            op=ConstantOp(name=name),
-            inputs=[],
-            output=Tensor(name, shape, dtype),
-            node_id=name,
-        )
+        nid = g.add_node(op=ConstantOp(name=name), inputs=[], output=Tensor(name, shape, dtype), node_id=name)
     else:
-        nid = g.add_node(
-            op=InputOp(),
-            inputs=[],
-            output=Tensor(name, shape, dtype),
-            node_id=name,
-        )
+        nid = g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape, dtype), node_id=name)
         g.inputs.append(nid)
-
     node_map[name] = nid
 
 
@@ -215,7 +139,6 @@ def _handle_output(g: Graph, fx_node: Any, node_map: dict[str, str]) -> None:
 def _op_name(target: Any) -> str | None:
     """Extract a short op name from an ATen target."""
     s = str(target)
-    # e.g. "aten.mul.Tensor" → "mul", "aten.linear.default" → "linear"
     if "aten." in s:
         parts = s.split(".")
         for i, p in enumerate(parts):
@@ -224,12 +147,19 @@ def _op_name(target: Any) -> str | None:
     return None
 
 
-def _handle_call_function(
-    g: Graph,
-    fx_node: Any,
-    node_map: dict[str, str],
-) -> None:
-    """Handle call_function nodes (ATen ops)."""
+def _get_reduce_axis(fx_node: Any) -> int | str:
+    """Extract the reduction axis from an FX node."""
+    if len(fx_node.args) > 1:
+        axis = fx_node.args[1]
+        if isinstance(axis, (list, tuple)):
+            return axis[0] if len(axis) == 1 else axis[0]
+        if isinstance(axis, int):
+            return axis
+    return -1
+
+
+def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> None:
+    """Handle call_function nodes — faithful 1:1 capture of FX ops."""
     name = fx_node.name
     shape = _get_shape(fx_node)
     dtype = _get_dtype(fx_node)
@@ -237,14 +167,12 @@ def _handle_call_function(
     input_ids = _resolve_inputs(fx_node, node_map, g)
 
     if op_name is None:
-        # Skip non-ATen ops (assertions, metadata, etc.)
         if input_ids:
-            # Pass through the first input.
             node_map[name] = input_ids[0]
         return
 
     # --- Elementwise ops ---
-    ew_map = {
+    _EW_MAP = {
         "add": "add",
         "mul": "mul",
         "sub": "sub",
@@ -258,10 +186,11 @@ def _handle_call_function(
         "tanh": "tanh",
         "abs": "abs",
         "sigmoid": "sigmoid",
+        "pow": "pow",
     }
-    if op_name in ew_map:
+    if op_name in _EW_MAP:
         nid = g.add_node(
-            op=ElementwiseOp(fn=ew_map[op_name]),
+            op=ElementwiseOp(fn=_EW_MAP[op_name]),
             inputs=input_ids[:2],
             output=Tensor(name, shape, dtype),
             node_id=name,
@@ -269,108 +198,54 @@ def _handle_call_function(
         node_map[name] = nid
         return
 
-    # pow(x, 2) is elementwise square (used in RMSNorm).
-    if op_name == "pow":
+    # --- Linear ---
+    if op_name == "linear":
+        has_bias = len(input_ids) > 2 and input_ids[2] in g.nodes
         nid = g.add_node(
-            op=ElementwiseOp(fn="pow"),
-            inputs=input_ids[:1],
+            op=LinearOp(has_bias=has_bias),
+            inputs=input_ids[:3] if has_bias else input_ids[:2],
             output=Tensor(name, shape, dtype),
             node_id=name,
         )
         node_map[name] = nid
         return
 
-    # --- Linear (high-level matmul, not decomposed by torch.export) ---
-    if op_name == "linear":
-        # aten.linear(input, weight, bias=None)
-        # PyTorch linear computes x @ weight.T, so we transpose the weight first.
-        inp_id = input_ids[0] if len(input_ids) > 0 else None
-        w_id = input_ids[1] if len(input_ids) > 1 else None
-        if inp_id is None or w_id is None:
-            logger.warning("Could not resolve linear inputs for %s", name)
-            return
-
-        # Transpose weight: (out_features, in_features) → (in_features, out_features)
-        w_shape = g.nodes[w_id].output.shape if w_id in g.nodes else ()
-        wt_shape = (w_shape[-1], w_shape[-2]) if len(w_shape) >= 2 else w_shape
-        wt_name = f"{name}_wt"
-        wt_id = g.add_node(
-            op=TransposeOp(axes=(-2, -1)),
-            inputs=[w_id],
-            output=Tensor(wt_name, wt_shape, dtype),
-            node_id=wt_name,
-        )
-
-        ew_name = f"{name}_ew"
-        ew_id = g.add_node(
-            op=ElementwiseOp(fn="mul"),
-            inputs=[inp_id, wt_id],
-            output=Tensor(ew_name, shape + ("K",), dtype),
-            node_id=ew_name,
-        )
-        red_id = g.add_node(
-            op=ReduceOp(fn="sum", axis="K"),
-            inputs=[ew_id],
+    # --- Matmul ---
+    if op_name in ("mm", "matmul"):
+        nid = g.add_node(
+            op=MatmulOp(),
+            inputs=input_ids[:2],
             output=Tensor(name, shape, dtype),
             node_id=name,
         )
-        node_map[name] = red_id
-
-        # Handle bias if present.
-        bias_id = input_ids[2] if len(input_ids) > 2 else None
-        if bias_id:
-            add_name = f"{name}_bias"
-            add_id = g.add_node(
-                op=ElementwiseOp(fn="add"),
-                inputs=[red_id, bias_id],
-                output=Tensor(add_name, shape, dtype),
-                node_id=add_name,
-            )
-            node_map[name] = add_id
+        node_map[name] = nid
         return
 
-    # --- Matmul / mm ---
-    if op_name in ("mm", "matmul", "addmm"):
-        if op_name == "addmm":
-            inp_id = input_ids[1] if len(input_ids) > 1 else None
-            w_id = input_ids[2] if len(input_ids) > 2 else None
-            bias_id = input_ids[0] if len(input_ids) > 0 else None
-        else:
-            inp_id = input_ids[0] if len(input_ids) > 0 else None
-            w_id = input_ids[1] if len(input_ids) > 1 else None
-            bias_id = None
+    if op_name == "addmm":
+        nid = g.add_node(
+            op=MatmulOp(has_bias=True),
+            inputs=[input_ids[1], input_ids[2], input_ids[0]] if len(input_ids) >= 3 else input_ids,
+            output=Tensor(name, shape, dtype),
+            node_id=name,
+        )
+        node_map[name] = nid
+        return
 
-        if inp_id and w_id:
-            ew_name = f"{name}_ew"
-            ew_id = g.add_node(
-                op=ElementwiseOp(fn="mul"),
-                inputs=[inp_id, w_id],
-                output=Tensor(ew_name, shape + ("K",), dtype),
-                node_id=ew_name,
-            )
-            red_id = g.add_node(
-                op=ReduceOp(fn="sum", axis="K"),
-                inputs=[ew_id],
-                output=Tensor(name, shape, dtype),
-                node_id=name,
-            )
-            node_map[name] = red_id
-            if bias_id:
-                add_name = f"{name}_bias"
-                add_id = g.add_node(
-                    op=ElementwiseOp(fn="add"),
-                    inputs=[red_id, bias_id],
-                    output=Tensor(add_name, shape, dtype),
-                    node_id=add_name,
-                )
-                node_map[name] = add_id
+    # --- SDPA ---
+    if op_name == "scaled_dot_product_attention":
+        nid = g.add_node(
+            op=SdpaOp(),
+            inputs=input_ids[:3],
+            output=Tensor(name, shape, dtype),
+            node_id=name,
+        )
+        node_map[name] = nid
         return
 
     # --- Reductions ---
     if op_name in ("sum", "mean"):
-        axis = _get_reduce_axis(fx_node)
         nid = g.add_node(
-            op=ReduceOp(fn="sum", axis=axis),
+            op=ReduceOp(fn="sum", axis=_get_reduce_axis(fx_node)),
             inputs=input_ids[:1],
             output=Tensor(name, shape, dtype),
             node_id=name,
@@ -379,9 +254,8 @@ def _handle_call_function(
         return
 
     if op_name in ("amax", "max"):
-        axis = _get_reduce_axis(fx_node)
         nid = g.add_node(
-            op=ReduceOp(fn="max", axis=axis),
+            op=ReduceOp(fn="max", axis=_get_reduce_axis(fx_node)),
             inputs=input_ids[:1],
             output=Tensor(name, shape, dtype),
             node_id=name,
@@ -426,40 +300,38 @@ def _handle_call_function(
         node_map[name] = nid
         return
 
-    # --- Ops that pass through (no-ops for our IR) ---
+    # --- Unsqueeze ---
+    if op_name == "unsqueeze":
+        dim = fx_node.args[1] if len(fx_node.args) > 1 and isinstance(fx_node.args[1], int) else 0
+        nid = g.add_node(
+            op=UnsqueezeOp(dim=dim),
+            inputs=input_ids[:1],
+            output=Tensor(name, shape, dtype),
+            node_id=name,
+        )
+        node_map[name] = nid
+        return
+
+    # --- Squeeze / permute / expand ---
+    if op_name in ("squeeze", "expand", "permute"):
+        nid = g.add_node(
+            op=ReshapeOp(shape=shape),
+            inputs=input_ids[:1],
+            output=Tensor(name, shape, dtype),
+            node_id=name,
+        )
+        node_map[name] = nid
+        return
+
+    # --- Pass-through ---
     if op_name in ("to", "contiguous", "_assert_tensor_metadata", "clone", "detach"):
         if input_ids:
             node_map[name] = input_ids[0]
         return
 
-    # --- Unsqueeze: pass through input. The unsqueeze only adds a size-1
-    # dim for broadcasting, which our broadcast indexing handles natively.
-    # Keeping 5D shapes causes wrong transpose axes downstream.
-    if op_name == "unsqueeze":
-        if input_ids:
-            node_map[name] = input_ids[0]
-        return
-
-    # --- Squeeze / permute / expand: reshapes ---
-    if op_name in ("squeeze", "expand", "permute"):
-        if input_ids:
-            nid = g.add_node(
-                op=ReshapeOp(shape=shape),
-                inputs=input_ids[:1],
-                output=Tensor(name, shape, dtype),
-                node_id=name,
-            )
-            node_map[name] = nid
-        return
-
-    # --- Slice: extracts a sub-tensor (NOT a reshape — different data) ---
+    # --- Slice ---
     if op_name == "slice":
         if input_ids:
-            # Emit as an elementwise identity copy with the sliced shape.
-            # The slice args (dim, start, end) are captured as ConstantOp inputs.
-            # The backend will generate a copy kernel with offset indexing.
-            from deplodock.compiler.ops import SliceOp
-
             nid = g.add_node(
                 op=SliceOp(shape=shape),
                 inputs=input_ids,
@@ -469,10 +341,8 @@ def _handle_call_function(
             node_map[name] = nid
         return
 
+    # --- Cat ---
     if op_name == "cat":
-        # Cat concatenates along a dimension — NOT elementwise.
-        from deplodock.compiler.ops import CatOp
-
         nid = g.add_node(
             op=CatOp(),
             inputs=input_ids,
@@ -482,19 +352,7 @@ def _handle_call_function(
         node_map[name] = nid
         return
 
-    # --- Scaled dot product attention (high-level, not decomposed) ---
-    if op_name == "scaled_dot_product_attention":
-        # Only take Q, K, V (first 3 inputs). Extra args (dropout_p, is_causal) are dropped.
-        nid = g.add_node(
-            op=ElementwiseOp(fn="sdpa"),
-            inputs=input_ids[:3],
-            output=Tensor(name, shape, dtype),
-            node_id=name,
-        )
-        node_map[name] = nid
-        return
-
-    # --- Gather / index_select ---
+    # --- Gather ---
     if op_name in ("index_select", "gather", "embedding"):
         axis = fx_node.args[1] if len(fx_node.args) > 1 and isinstance(fx_node.args[1], int) else 0
         nid = g.add_node(
@@ -506,7 +364,7 @@ def _handle_call_function(
         node_map[name] = nid
         return
 
-    # --- Fallback: treat as elementwise ---
+    # --- Fallback ---
     logger.debug("Fallback elementwise for %s (%s)", op_name, fx_node.target)
     if input_ids:
         nid = g.add_node(
@@ -516,14 +374,3 @@ def _handle_call_function(
             node_id=name,
         )
         node_map[name] = nid
-
-
-def _get_reduce_axis(fx_node: Any) -> int | str:
-    """Extract the reduction axis from an FX node."""
-    if len(fx_node.args) > 1:
-        axis = fx_node.args[1]
-        if isinstance(axis, (list, tuple)):
-            return axis[0] if len(axis) == 1 else axis[0]
-        if isinstance(axis, int):
-            return axis
-    return -1

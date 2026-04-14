@@ -8,7 +8,7 @@ the specific decomposition rule in isolation.
 from pathlib import Path
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, ReduceOp, TransposeOp
+from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, ReduceOp, SdpaOp, TransposeOp
 from deplodock.compiler.rewriter import Pass, Rule
 
 RULES_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules" / "decomposition"
@@ -96,7 +96,7 @@ def _make_sdpa_graph(seq_len=32, head_dim=64, num_heads=1):
     g.inputs = [q, k, v]
 
     out = g.add_node(
-        op=ElementwiseOp(fn="sdpa"),
+        op=SdpaOp(),
         inputs=[q, k, v],
         output=Tensor("out", out_shape),
         node_id="sdpa_out",
@@ -208,7 +208,7 @@ def test_sdpa_with_extra_args_not_matched():
     g.inputs = [q, k, v]
 
     out = g.add_node(
-        op=ElementwiseOp(fn="sdpa"),
+        op=SdpaOp(),
         inputs=[q, k, v, dp],
         output=Tensor("out", (1, 32, 64)),
         node_id="sdpa_out",
@@ -218,6 +218,6 @@ def test_sdpa_with_extra_args_not_matched():
     result = Pass(name="decomp", rules=[_load_sdpa_rule()]).apply(g)
 
     # Pattern doesn't match — sdpa survives (graph unchanged).
-    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
-    assert "sdpa" in fns
+    has_sdpa = any(isinstance(n.op, SdpaOp) for n in result.nodes.values())
+    assert has_sdpa, "SdpaOp should survive when pattern doesn't match"
     assert len(result.nodes) == len(g.nodes)
