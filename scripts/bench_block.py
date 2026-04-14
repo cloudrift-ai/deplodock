@@ -214,8 +214,53 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
                 if hasattr(launch, "loop_ir") and launch.loop_ir is not None:
                     dump.dump_loop_ir(launch.loop_ir, launch.kernel_name, schedule=getattr(launch, "schedule", None))
 
-        # Correctness sanity check: run once and verify outputs are non-trivial.
-        run_result = backend.run(program)
+        # Build input_data from actual PyTorch tensors for accuracy check.
+        import torch
+
+        from deplodock.compiler.ops import ConstantOp
+
+        input_data: dict[str, list[float]] = {}
+        # Map graph input names to tensor data.
+        for buf in program.buffers:
+            if buf.role == "input":
+                if buf.name == "hidden_states":
+                    input_data[buf.name] = x.cpu().flatten().tolist()
+                elif buf.name == "position_embeddings_0":
+                    input_data[buf.name] = pos_emb[0].cpu().flatten().tolist()
+                elif buf.name == "position_embeddings_1":
+                    input_data[buf.name] = pos_emb[1].cpu().flatten().tolist()
+            elif buf.role == "constant":
+                # Model weights: match by suffix + size.
+                matched = False
+                for key, param in block.named_parameters():
+                    safe_key = "p_" + key.replace(".", "_")
+                    if safe_key.endswith(buf.name[2:]) and param.numel() == buf.size:
+                        input_data[buf.name] = param.detach().cpu().flatten().tolist()
+                        matched = True
+                        break
+                if not matched and buf.size == 1:
+                    # Scalar constant (eps, scale, etc.) — look up from
+                    # both the original and compiled (post-rewrite) graphs.
+                    for src_graph in (compiled, graph):
+                        found = False
+                        for nid, node in src_graph.nodes.items():
+                            if isinstance(node.op, ConstantOp) and node.op.value is not None:
+                                if buf.name == nid or buf.name.endswith(nid):
+                                    input_data[buf.name] = [node.op.value]
+                                    found = True
+                                    break
+                        if found:
+                            break
+
+        # Run with actual data.
+        run_result = backend.run(program, input_data=input_data)
+
+        # Compute eager reference with same inputs.
+        block.cuda()
+        with torch.no_grad():
+            eager_out = block(x, position_embeddings=pos_emb)[0]
+        eager_flat = eager_out.cpu().flatten().tolist()
+
         for buf_name, values in run_result.outputs.items():
             nonzero = sum(1 for v in values if abs(v) > 1e-12)
             has_nan = any(v != v for v in values)  # NaN != NaN
@@ -223,7 +268,7 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
                 logger.error("CORRECTNESS FAIL: output %s contains NaN", buf_name)
                 return None
             if nonzero == 0:
-                logger.error("CORRECTNESS FAIL: output %s is all zeros (noop kernels?)", buf_name)
+                logger.error("CORRECTNESS FAIL: output %s is all zeros", buf_name)
                 return None
             logger.info(
                 "Correctness check: %s has %d/%d nonzero values, range [%.4f, %.4f]",
@@ -234,11 +279,18 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
                 max(values),
             )
 
+            # Numerical accuracy vs eager PyTorch.
+            if len(values) == len(eager_flat):
+                max_diff = max(abs(a - e) for a, e in zip(values, eager_flat, strict=True))
+                mean_diff = sum(abs(a - e) for a, e in zip(values, eager_flat, strict=True)) / len(values)
+                logger.info(
+                    "Accuracy vs eager: max_diff=%.6f, mean_diff=%.6f, %s",
+                    max_diff,
+                    mean_diff,
+                    "PASS" if max_diff < 1.0 else "FAIL",
+                )
+
         result = backend.benchmark(program, warmup=3, num_iters=10)
-
-        # Move block back to GPU for other benchmarks.
-        block.cuda()
-
         return result.time_ms * 1000  # ms → us
     except Exception as e:
         logger.warning("Deplodock pipeline failed: %s", e)
