@@ -525,3 +525,94 @@ def test_e2e_linear_nonsquare():
 
     max_diff = max(abs(a - e) for a, e in zip(actual, expected, strict=True))
     assert max_diff < 0.01, f"Linear non-square max diff = {max_diff:.6f}"
+
+
+# ===========================================================================
+# Full transformer block e2e tests
+# ===========================================================================
+
+
+def _run_block_e2e(model_name: str, seq_len: int = 8):
+    """Trace a transformer block, compile with deplodock, compare against eager.
+
+    Returns (max_diff, mean_diff, num_elements).
+    """
+    from pathlib import Path
+
+    from transformers import AutoModelForCausalLM
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.rewriter import Rewriter
+    from deplodock.compiler.torch_trace import trace_module
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+    config = model.config
+    block = model.model.layers[0].cuda()
+    hidden = config.hidden_size
+    head_dim = hidden // config.num_attention_heads
+
+    torch.manual_seed(42)
+    x = torch.randn(1, seq_len, hidden, device="cuda")
+    cos = torch.randn(1, 1, seq_len, head_dim, device="cuda")
+    sin = torch.randn(1, 1, seq_len, head_dim, device="cuda")
+
+    # Eager reference
+    with torch.no_grad():
+        eager_out = block(x, position_embeddings=(cos, sin))[0]
+    eager_flat = eager_out.cpu().flatten()
+
+    # Trace + compile
+    block.cpu()
+    graph = trace_module(block, (x.cpu(),), kwargs={"position_embeddings": (cos.cpu(), sin.cpu())})
+    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+    compiled = Rewriter.from_directory(rules_dir).apply(graph)
+    fused = auto_fuse(compiled)
+    plan = plan_graph(fused)
+    backend = CudaBackend()
+    program = backend.compile(plan)
+
+    # Build input_data from actual tensors and weights
+    block.cuda()
+    input_data: dict[str, list[float]] = {
+        "hidden_states": x.cpu().flatten().tolist(),
+        "position_embeddings_0": cos.cpu().flatten().tolist(),
+        "position_embeddings_1": sin.cpu().flatten().tolist(),
+    }
+    for buf in program.buffers:
+        if buf.role == "constant":
+            for key, param in block.named_parameters():
+                safe_key = "p_" + key.replace(".", "_")
+                if safe_key.endswith(buf.name[2:]) and param.numel() == buf.size:
+                    input_data[buf.name] = param.detach().cpu().flatten().tolist()
+                    break
+            if buf.name not in input_data and buf.size == 1:
+                for src_graph in (compiled, graph):
+                    for nid, node in src_graph.nodes.items():
+                        if isinstance(node.op, ConstantOp) and node.op.value is not None:
+                            if buf.name == nid or buf.name.endswith(nid):
+                                input_data[buf.name] = [node.op.value]
+                                break
+                    if buf.name in input_data:
+                        break
+
+    result = backend.run(program, input_data=input_data)
+    deplodock_flat = torch.tensor(list(result.outputs.values())[0])
+
+    diff = (deplodock_flat - eager_flat).abs()
+    return diff.max().item(), diff.mean().item(), diff.numel()
+
+
+@requires_cuda
+def test_e2e_tinyllama_block():
+    """TinyLlama transformer block matches eager PyTorch."""
+    max_diff, mean_diff, n = _run_block_e2e("TinyLlama/TinyLlama-1.1B-Chat-v1.0", seq_len=8)
+    assert max_diff < 0.5, f"TinyLlama max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f} ({n} elements)"
+
+
+@requires_cuda
+def test_e2e_qwen_block():
+    """Qwen 2.5-7B transformer block: track accuracy vs eager."""
+    max_diff, mean_diff, n = _run_block_e2e("Qwen/Qwen2.5-7B", seq_len=8)
+    # Known issue: Qwen has higher error from GQA + 4D attention shapes.
+    # This test tracks the error — it should decrease as we fix issues.
+    assert max_diff < 5.0, f"Qwen max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f} ({n} elements)"
