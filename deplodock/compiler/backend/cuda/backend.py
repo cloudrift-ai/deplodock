@@ -63,8 +63,8 @@ class CudaBackend(Backend):
             aliases=aliases,
         )
 
-    def run(self, program: Program) -> ProgramResult:
-        result = run_program(program)
+    def run(self, program: Program, input_data: dict[str, list[float]] | None = None) -> ProgramResult:
+        result = run_program(program, input_data=input_data)
         return ProgramResult(outputs=result.outputs, time_ms=result.time_ms)
 
     def benchmark(self, program: Program, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
