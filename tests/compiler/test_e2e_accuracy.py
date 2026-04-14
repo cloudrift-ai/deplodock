@@ -330,3 +330,26 @@ def test_e2e_rotary_embedding():
 
     max_diff = max(abs(a - e) for a, e in zip(actual, ref, strict=True))
     assert max_diff < 1e-4, f"Rotary embedding max diff = {max_diff:.6f}"
+
+
+@requires_cuda
+def test_e2e_mid_dim_broadcast():
+    """Mid-dimension broadcast: (2,3,4,5) * (1,3,1,5) — fails with flat modulo."""
+    torch.manual_seed(42)
+    a = torch.randn(2, 3, 4, 5).cuda()
+    b = torch.randn(1, 3, 1, 5).cuda()
+    ref = (a * b).cpu().flatten().tolist()
+
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("X", (2, 3, 4, 5)), node_id="X")
+    y = g.add_node(InputOp(), [], Tensor("Y", (1, 3, 1, 5)), node_id="Y")
+    g.inputs = [x, y]
+    out = g.add_node(ElementwiseOp("mul"), [x, y], Tensor("out", (2, 3, 4, 5)), node_id="out")
+    g.outputs = [out]
+
+    input_data = {"X": a.cpu().flatten().tolist(), "Y": b.cpu().flatten().tolist()}
+    outputs = _compile_and_run_with_data(g, input_data)
+    actual = list(outputs.values())[0]
+
+    max_diff = max(abs(a - e) for a, e in zip(actual, ref, strict=True))
+    assert max_diff < 1e-5, f"Mid-dim broadcast max diff = {max_diff:.6f}"
