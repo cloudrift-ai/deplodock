@@ -985,3 +985,47 @@ def test_correctness_contraction_softmax_fused(dump_dir):
     plan = plan_graph(fused)
     program = CudaBackend().compile(plan)
     assert len(program.launches) == 1, f"Expected 1 launch, got {len(program.launches)}"
+
+
+@requires_cuda
+def test_correctness_contraction_softmax_online_large_n(dump_dir):
+    """Fused matmul + scale + softmax with N > tile_n (128) via online reduction."""
+    m, k, n = 4, 32, 256  # N=256 > tile_n=128 → multi-iteration N-tile loop
+
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("A", (m, k)), node_id="A")
+    b = g.add_node(InputOp(), [], Tensor("B", (k, n)), node_id="B")
+    sc = g.add_node(ConstantOp(name="scale"), [], Tensor("scale", (1,)), node_id="scale")
+    g.inputs = [a, b]
+
+    ew = g.add_node(ElementwiseOp("mul"), [a, b], Tensor("ew", (m, k, n)), node_id="ew")
+    red = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("qk", (m, n)), node_id="qk")
+    scaled = g.add_node(ElementwiseOp("mul"), [red, sc], Tensor("scaled", (m, n)), node_id="scaled")
+    mx = g.add_node(ReduceOp("max", axis=-1), [scaled], Tensor("mx", (m, 1)), node_id="mx")
+    sub = g.add_node(ElementwiseOp("sub"), [scaled, mx], Tensor("sub", (m, n)), node_id="sub")
+    exp = g.add_node(ElementwiseOp("exp"), [sub], Tensor("exp", (m, n)), node_id="exp")
+    sm = g.add_node(ReduceOp("sum", axis=-1), [exp], Tensor("sm", (m, 1)), node_id="sm")
+    div = g.add_node(ElementwiseOp("div"), [exp, sm], Tensor("out", (m, n)), node_id="out")
+    g.outputs = [div]
+
+    outputs = _compile_and_run(g, dump=dump_dir)
+    actual = list(outputs.values())[0]
+
+    # Reference
+    a_data = _pseudo_random(m * k)
+    b_data = _pseudo_random(k * n)
+    scale_data = _pseudo_random(1)[0]
+    scores = _python_matmul(a_data, b_data, m, k, n)
+    scores = [s * scale_data for s in scores]
+    expected = _python_softmax(scores, m, n)
+
+    _assert_close(actual, expected, tol=1e-3, label="contraction_softmax_online")
+
+    # Verify single launch (online reduction, no split)
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.plan import plan_graph
+
+    fused = auto_fuse(g)
+    plan = plan_graph(fused)
+    program = CudaBackend().compile(plan)
+    assert len(program.launches) == 1, f"Expected 1 launch (online), got {len(program.launches)}"

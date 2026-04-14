@@ -154,7 +154,15 @@ def build_schedule(
         elif k_splits > 1:
             dim_params.append(("int", "k_splits"))
 
-        grid_type = "2d_standard" if load_strat == "smem" else "2d_swizzle"
+        # Contraction + multi-reduce (e.g. softmax): use 1D grid with N-tiling.
+        has_multi_reduce = len(analysis.op_phases.reduces) > 1
+        if has_multi_reduce:
+            grid_type = "1d_contraction"
+            k_splits = 1  # incompatible with online reduction
+        elif load_strat == "smem":
+            grid_type = "2d_standard"
+        else:
+            grid_type = "2d_swizzle"
 
         # TMA-specific fields
         tma_params = None

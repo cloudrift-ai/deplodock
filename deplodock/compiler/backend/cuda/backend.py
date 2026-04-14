@@ -221,6 +221,12 @@ def _select_strategy(op: OpKernel, analysis) -> tuple[str, dict]:
     if batch_size > 1 and strategy == "tma_db":
         strategy = "naive"
         matmul_hints["strategy"] = "naive"
+    # Online reduction (contraction + multi-reduce) uses 1D grid which is
+    # incompatible with TMA descriptor setup.  Fall back to naive.
+    has_multi_reduce = len(analysis.op_phases.reduces) > 1 if hasattr(analysis, "op_phases") else False
+    if has_multi_reduce and strategy in ("tma_db", "smem"):
+        strategy = "naive"
+        matmul_hints["strategy"] = "naive"
 
     return strategy, matmul_hints
 
@@ -230,6 +236,15 @@ def _compute_grid(kernel_def, analysis, params: dict) -> tuple[tuple, int]:
 
     Returns (grid_tuple, smem_bytes).
     """
+    if kernel_def.online_reduce and kernel_def.tile_m:
+        # Online reduction: 1D grid over M-tiles only.
+        m = params.get("M", analysis.rows)
+        tile_m = kernel_def.tile_m
+        batch_size = params.get("batch_size", 1)
+        grid = (_cd(m, tile_m), 1, batch_size)
+        # No TMA smem in online mode (uses naive K-loop for now)
+        return grid, 0
+
     if kernel_def.tile_m and kernel_def.tile_n:
         # Contraction grid.
         m = params.get("M", analysis.rows)
@@ -630,17 +645,8 @@ def _compile_fused_region(op: OpKernel) -> list[CudaLaunch]:
         src = f"__global__ void {name}() {{}}"
         return [CudaLaunch(kernel_source=src, kernel_name=name, grid=(1, 1, 1), block=(1, 1, 1), args=[])]
 
-    # Check for softmax split (contraction with N > tile_n).
-    from deplodock.compiler.backend.cuda.generators.analysis import analyze
-
-    region, shapes = _build_region_and_shapes(op)
-    region, shapes = _resolve_contraction_shapes(op, region, shapes)
-    analysis = analyze(region, shapes)
-    if analysis.pattern == "contraction" and len(analysis.op_phases.reduces) > 1:
-        split = _split_contraction_softmax(op, analysis)
-        if split is not None:
-            return split
-
+    # Contraction + multi-reduce (e.g. softmax) is handled by the online
+    # reduction path in lower_generic — no split needed.
     return [_compile_single(op)]
 
 
