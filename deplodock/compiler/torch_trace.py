@@ -243,10 +243,42 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         return
 
     # --- Reductions ---
-    if op_name in ("sum", "mean"):
+    if op_name == "sum":
         nid = g.add_node(
             op=ReduceOp(fn="sum", axis=_get_reduce_axis(fx_node)),
             inputs=input_ids[:1],
+            output=Tensor(name, shape, dtype),
+            node_id=name,
+        )
+        node_map[name] = nid
+        return
+
+    if op_name == "mean":
+        # Decompose mean into sum + div by the reduced dimension size.
+        axis = _get_reduce_axis(fx_node)
+        inp_shape = _get_shape(fx_node.args[0]) if fx_node.args and hasattr(fx_node.args[0], "meta") else ()
+        if isinstance(axis, int) and inp_shape:
+            norm_axis = axis % len(inp_shape) if len(inp_shape) > 0 else 0
+            dim_size = inp_shape[norm_axis] if norm_axis < len(inp_shape) else 1
+        else:
+            dim_size = 1
+        sum_name = f"{name}_sum"
+        sum_id = g.add_node(
+            op=ReduceOp(fn="sum", axis=axis),
+            inputs=input_ids[:1],
+            output=Tensor(sum_name, shape, dtype),
+            node_id=sum_name,
+        )
+        count_name = f"{name}_count"
+        count_id = g.add_node(
+            op=ConstantOp(name=count_name, value=float(dim_size)),
+            inputs=[],
+            output=Tensor(count_name, (1,), dtype),
+            node_id=count_name,
+        )
+        nid = g.add_node(
+            op=ElementwiseOp(fn="div"),
+            inputs=[sum_id, count_id],
             output=Tensor(name, shape, dtype),
             node_id=name,
         )
