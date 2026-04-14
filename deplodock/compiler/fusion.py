@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from deplodock.compiler.ops import (
     FusedRegionOp,
 )
+from deplodock.compiler.shape_utils import is_broadcast_compatible
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir import Graph
@@ -64,24 +65,6 @@ class UnionFind:
 def _tensor_size(shape: tuple) -> int:
     """Compute total elements from shape, treating symbolic dims as 1."""
     return math.prod(d for d in shape if isinstance(d, int)) if shape else 1
-
-
-def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
-    """Check if small broadcasts to large via NumPy-style rules.
-
-    Aligns shapes from the right. Each dim of small must be 1 or match
-    the corresponding dim of large.
-    """
-    if len(small_shape) > len(large_shape):
-        return False
-    offset = len(large_shape) - len(small_shape)
-    for i, s in enumerate(small_shape):
-        large_dim = large_shape[offset + i]
-        if not isinstance(s, int) or not isinstance(large_dim, int):
-            continue
-        if s != 1 and s != large_dim:
-            return False
-    return True
 
 
 def _is_fusible_op(op, node=None) -> bool:
@@ -353,7 +336,7 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
             for inp_shape, inp_size in ext_inputs:
                 if inp_size == max_size:
                     sizes_full.add(inp_size)
-                elif _is_broadcast_compatible(inp_shape, max_shape):
+                elif is_broadcast_compatible(inp_shape, max_shape):
                     continue  # Broadcast-compatible — indexed via modulo
                 else:
                     sizes_full.add(inp_size)
