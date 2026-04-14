@@ -53,6 +53,27 @@ Pointwise, row-reduce, multi-reduce, and naive contraction are fully expressed
 in LoopIR via `lower_generic()`. TMA and smem contraction strategies use
 `SmemPipelineKLoop` (expanded to LoopIR or rendered as inline PTX by codegen).
 
+### Online reduction for contraction + multi-reduce
+
+When a contraction (matmul) is followed by a multi-reduce (e.g. softmax),
+the lowering code emits a **generic online reduction** via
+`_emit_online_contraction_reduce()`. Instead of parallelizing over N
+(which requires one CTA to own the full row for reductions), N is tiled
+sequentially:
+
+1. **Loop 1**: K-loop + head reduce (e.g. max) + write raw scores to output
+2. **Loop 2..n**: For each subsequent reduce, load raw scores, apply
+   inter-reduce ops, compute running reduce via warp_xor
+3. **Final loop**: Load raw scores, apply all inter-reduce + epilogue ops
+   using final reduce values, write normalized output
+
+This works for any multi-reduce pattern (softmax, log-sum-exp, etc.)
+without hardcoded correction factors. The grid is 1D over M-tiles
+(`GridSpec("1d_contraction")`).
+
+**TODO**: When N <= tile_n, the N-tile loops have 1 iteration. A future
+KernelIR optimizer pass could fuse them into a single in-register pass.
+
 ## SGEMM Strategies (generators/tiled.py)
 
 | Strategy          | Description                           | Best for                |

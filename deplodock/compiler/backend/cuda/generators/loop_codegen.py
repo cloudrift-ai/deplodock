@@ -79,6 +79,7 @@ def loop_ir_to_kernel(program: LoopProgram, schedule: object, dim_strides: dict[
         batched=schedule.is_batched,
         extra_smem_bytes=schedule.extra_smem_bytes,
         min_blocks_per_sm=schedule.min_blocks_per_sm,
+        online_reduce=schedule.grid.type == "1d_contraction",
     )
 
 

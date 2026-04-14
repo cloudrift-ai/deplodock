@@ -100,6 +100,27 @@ def _emit_grid(schedule: Schedule, analysis: TileAnalysis) -> list:
     if grid.type == "1d":
         axis_name = "i" if schedule.accum.shape is None else "row"
         return [ParallelAxis(axis_name, "blockIdx.x", grid.bound)]
+    if grid.type == "1d_contraction":
+        # Online reduction: 1D grid over M-tiles, N is tiled sequentially.
+        # Emit bm, tr, tc but NOT bn (comes from the N-tile loop).
+        I = "int"  # noqa: E741
+        thread_m = schedule.thread_m or 8
+        thread_n = schedule.thread_n or 4
+        tile_m = schedule.tile_m or 64
+        tidy, tidx = Builtin("threadIdx.y"), Builtin("threadIdx.x")
+        ops: list = []
+        if schedule.is_batched:
+            ops.append(Let("batch", Builtin("blockIdx.z"), dtype=I))
+        ops.append(Let("bm", Builtin("blockIdx.x") * tile_m, dtype=I))
+        ops.append(Let("tr", tidy * thread_m, dtype=I))
+        ops.append(Let("tc", tidx * thread_n, dtype=I))
+        ops.append(
+            Guard(
+                (Var("bm") + Var("tr")).ge(Var("M")),
+                [],  # early return
+            )
+        )
+        return ops
     if grid.type == "2d_swizzle":
         return _cta_swizzle_grid(
             schedule.thread_m or 8,
@@ -181,7 +202,13 @@ def _emit_reductions(
         # Scalar reduction (row_reduce / reduce_broadcast / multi-reduce)
         return _emit_scalar_reductions(schedule, analysis, region, shapes)
 
-    # 2D register tile contraction: dispatch on load strategy
+    # 2D register tile contraction
+    if schedule.grid.type == "1d_contraction":
+        # Contraction + multi-reduce: online N-tiled reduction.
+        # Handles phases 3-5 (reductions, epilogue, write) internally.
+        return _emit_online_contraction_reduce(schedule, analysis, region, shapes)
+
+    # Standard contraction K-loop (single reduce, no multi-reduce)
     if schedule.load_strategy == "tma":
         return _emit_tma_k_loop(schedule, analysis)
     if schedule.load_strategy == "smem":
@@ -363,6 +390,293 @@ def _emit_smem_k_loop(schedule: Schedule, analysis: TileAnalysis) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Online contraction + multi-reduce (handles phases 3-5 together)
+# ---------------------------------------------------------------------------
+
+
+def _emit_online_contraction_reduce(
+    schedule: Schedule,
+    analysis: TileAnalysis,
+    region: FusedRegionOp,
+    shapes: dict[str, tuple],
+) -> list:
+    """Emit N-tiled contraction with generic online reduction.
+
+    When a contraction (matmul) is followed by multi-reduce (e.g. softmax),
+    we tile over N sequentially and process each reduce in a separate pass
+    over the output buffer.  This works for any multi-reduce pattern without
+    hardcoded correction factors.
+
+    Structure:
+      Loop 1: K-loop + prologue + head reduce + write raw scores
+      Loop 2..len(reduces): apply inter_reduce ops, compute next reduce
+      Final loop: apply all inter_reduce + epilogue ops, write result
+
+    TODO: When N <= tile_n, a KernelIR optimizer pass could detect
+    single-iteration N-loops and fuse them into one in-register pass,
+    eliminating the global memory round-trip for raw scores.
+    """
+    thread_m = schedule.thread_m or 8
+    thread_n = schedule.thread_n or 4
+    tile_n = schedule.tile_n or 128
+    phases = analysis.op_phases
+    output = _safe(region.output_names[0])
+    input_set = set(region.input_names)
+
+    I = "int"  # noqa: E741
+    M, N = Var("M"), Var("N")  # noqa: N806
+
+    # The first reduce (reduces[0]) is the contraction reduce over K —
+    # already handled by the K-loop.  The N-axis reduces start at index 1.
+    # inter_reduce[0] contains ops between the K-reduce and the first N-reduce
+    # (e.g. scale), which we apply on the register tile after the K-loop.
+    n_reduces = phases.reduces[1:]  # reduces over N (skip contraction reduce)
+    n_inter = phases.inter_reduce  # inter_reduce[i] is between reduces[i] and reduces[i+1]
+    is_batched = schedule.is_batched
+
+    def _out_indices(row: LoopExpr, col: LoopExpr) -> list[LoopExpr]:
+        """Build output buffer indices, adding batch dim if needed."""
+        if is_batched:
+            return [Var("batch"), row, col]
+        return [row, col]
+
+    def _running_var(node_id: str, r: int) -> Var:
+        """Get the per-row running accumulator variable for a reduce node."""
+        return Var(f"{reduce_running[node_id]}{r}")
+
+    ops: list = []
+
+    # Running accumulators for each N-axis reduce, one per row of the thread
+    # tile.  Each thread handles thread_m rows, so we need thread_m variables
+    # per reduce.  reduce_running maps node_id → base name (append {r} for row).
+    reduce_running: dict[str, str] = {}  # node_id → base var name (e.g. "running_mx")
+    for node_id, r_op, _ in n_reduces:
+        base = f"running_{_safe(node_id)}"
+        reduce_running[node_id] = base
+        for r in range(thread_m):
+            ops.append(AccumInit(f"{base}{r}", r_op.fn))
+
+    # ---------------------------------------------------------------
+    # Loop 1: K-loop + post-contraction ops + head N-reduce + write raw scores
+    # ---------------------------------------------------------------
+    loop1_body: list = []
+    loop1_body.append(Let("bn", Var("n_tile"), dtype=I))
+
+    # Reset contraction accumulators
+    for r in range(thread_m):
+        for c in range(thread_n):
+            loop1_body.append(SetVar(f"c{r}{c}", Literal(0.0)))
+
+    # K-loop (reuse existing emission based on load strategy)
+    if schedule.load_strategy == "tma":
+        loop1_body.extend(_emit_tma_k_loop(schedule, analysis))
+    elif schedule.load_strategy == "smem":
+        loop1_body.extend(_emit_smem_k_loop(schedule, analysis))
+    else:
+        loop1_body.extend(_emit_contraction_k_loop(schedule, analysis, region, shapes))
+
+    # Apply inter_reduce[0] ops on register tile (ops between contraction
+    # reduce and first N-reduce, e.g. scale multiplication).
+    contraction_id = phases.reduces[0][0]
+    if n_inter:
+        loop1_body.extend(
+            _apply_ops_on_register_tile(
+                n_inter[0],
+                contraction_id,
+                shapes,
+                input_set,
+                thread_m,
+                thread_n,
+                "ir0",
+            )
+        )
+
+    # Head N-reduce (n_reduces[0], e.g. max) via warp_xor per row
+    head_id, head_op, head_inputs = n_reduces[0]
+    head_running = reduce_running[head_id]
+    for r in range(thread_m):
+        tvar = f"tile_{_safe(head_id)}_{r}"
+        loop1_body.append(AccumInit(tvar, head_op.fn))
+        for c in range(thread_n):
+            col_c = Var("bn") + Var("tc") + c
+            loop1_body.append(
+                Guard(
+                    col_c.lt(N),
+                    [
+                        Accum(tvar, head_op.fn, RegAccess("c", [r, c])),
+                    ],
+                )
+            )
+        loop1_body.append(ShuffleReduce(tvar, head_op.fn, kind="warp_xor"))
+        # Update running{r} = combine(running{r}, tile)
+        rvar_r = f"{head_running}{r}"
+        if head_op.fn == "sum":
+            loop1_body.append(SetVar(rvar_r, Var(rvar_r) + Var(tvar)))
+        else:
+            loop1_body.append(SetVar(rvar_r, FuncCall("fmaxf" if head_op.fn == "max" else head_op.fn, [Var(rvar_r), Var(tvar)])))
+
+    # Write raw scores (contraction output after inter_reduce[0] ops, before N-reduces)
+    loop1_body.extend(
+        _contraction_write_ops(
+            Var(output),
+            thread_m,
+            thread_n,
+            schedule.is_batched,
+            k_splits=1,
+        )
+    )
+
+    ops.append(LoopNest("n_tile", Literal(0, I), N, Literal(tile_n, I), loop1_body))
+
+    # ---------------------------------------------------------------
+    # Loop 2..len(n_reduces): compute subsequent N-axis reduces
+    # ---------------------------------------------------------------
+    for ri in range(1, len(n_reduces)):
+        red_id, red_op, red_inputs = n_reduces[ri]
+        red_running = reduce_running[red_id]
+        # inter_reduce between n_reduces[ri-1] and n_reduces[ri] is
+        # phases.inter_reduce[ri] (offset by 1 because inter_reduce[0]
+        # is between the contraction reduce and n_reduces[0])
+        inter_idx = ri  # inter_reduce[ri] = ops between reduces[ri] and reduces[ri+1]
+        inter_ops = n_inter[inter_idx] if inter_idx < len(n_inter) else []
+
+        loop_body: list = []
+        loop_body.append(Let("bn", Var("n_tile"), dtype=I))
+
+        for r in range(thread_m):
+            row = Var("bm") + Var("tr") + r
+            row_body: list = []
+
+            for c in range(thread_n):
+                col = Var("bn") + Var("tc") + c
+                ld_name = f"rv{ri}_{r}_{c}"
+                row_body.append(Load(ld_name, output, _out_indices(row, col), "global", guard=col.lt(N)))
+
+                # Apply inter_reduce ops (e.g. sub(v, running_max{r}), exp(...))
+                val_expr: LoopExpr = Var(ld_name)
+                for _op_id, op_obj, op_inputs in inter_ops:
+                    if not isinstance(op_obj, ElementwiseOp):
+                        continue
+                    if op_obj.info.arity == 1:
+                        val_expr = OpCall(op_obj.fn, [val_expr])
+                    else:
+                        other_input = None
+                        for inp in op_inputs:
+                            if inp in reduce_running:
+                                other_input = inp
+                                break
+                        if other_input is not None:
+                            other_var = _running_var(other_input, r)
+                            if op_inputs[0] == other_input:
+                                val_expr = OpCall(op_obj.fn, [other_var, val_expr])
+                            else:
+                                val_expr = OpCall(op_obj.fn, [val_expr, other_var])
+                        else:
+                            val_expr = OpCall(op_obj.fn, [val_expr, Literal(0.0)])
+
+                vname = f"tv{ri}_{r}_{c}"
+                row_body.append(Let(vname, val_expr))
+
+            # Reduce across columns via warp_xor
+            tvar = f"tile_{_safe(red_id)}_{r}"
+            row_body.append(AccumInit(tvar, red_op.fn))
+            for c in range(thread_n):
+                col = Var("bn") + Var("tc") + c
+                row_body.append(
+                    Guard(
+                        col.lt(N),
+                        [
+                            Accum(tvar, red_op.fn, Var(f"tv{ri}_{r}_{c}")),
+                        ],
+                    )
+                )
+            row_body.append(ShuffleReduce(tvar, red_op.fn, kind="warp_xor"))
+            # Update running{r}
+            rvar_r = f"{red_running}{r}"
+            if red_op.fn == "sum":
+                row_body.append(SetVar(rvar_r, Var(rvar_r) + Var(tvar)))
+            else:
+                row_body.append(SetVar(rvar_r, FuncCall("fmaxf" if red_op.fn == "max" else red_op.fn, [Var(rvar_r), Var(tvar)])))
+
+            loop_body.append(Guard(row.lt(M), row_body))
+
+        ops.append(LoopNest("n_tile", Literal(0, I), N, Literal(tile_n, I), loop_body))
+
+    # ---------------------------------------------------------------
+    # Final loop: apply all inter_reduce + epilogue ops, write result
+    # ---------------------------------------------------------------
+    final_body: list = []
+    final_body.append(Let("bn", Var("n_tile"), dtype=I))
+
+    for r in range(thread_m):
+        row = Var("bm") + Var("tr") + r
+        row_body: list = []
+
+        for c in range(thread_n):
+            col = Var("bn") + Var("tc") + c
+            ld_name = f"fv_{r}_{c}"
+            row_body.append(Load(ld_name, output, _out_indices(row, col), "global", guard=col.lt(N)))
+
+            # Apply N-axis inter_reduce ops (skip inter_reduce[0] which is
+            # between the contraction reduce and first N-reduce — already
+            # applied on the register tile in loop 1).
+            val_expr: LoopExpr = Var(ld_name)
+            all_inter_ops = [op for group in n_inter[1:] for op in group]
+            for _op_id, op_obj, op_inputs in all_inter_ops:
+                if not isinstance(op_obj, ElementwiseOp):
+                    continue
+                if op_obj.info.arity == 1:
+                    val_expr = OpCall(op_obj.fn, [val_expr])
+                else:
+                    other_input = None
+                    for inp in op_inputs:
+                        if inp in reduce_running:
+                            other_input = inp
+                            break
+                    if other_input is not None:
+                        other_var = _running_var(other_input, r)
+                        if op_inputs[0] == other_input:
+                            val_expr = OpCall(op_obj.fn, [other_var, val_expr])
+                        else:
+                            val_expr = OpCall(op_obj.fn, [val_expr, other_var])
+                    else:
+                        val_expr = OpCall(op_obj.fn, [val_expr, Literal(0.0)])
+
+            # Apply epilogue ops
+            for _op_id, op_obj, op_inputs in phases.epilogue:
+                if not isinstance(op_obj, ElementwiseOp):
+                    continue
+                if op_obj.info.arity == 1:
+                    val_expr = OpCall(op_obj.fn, [val_expr])
+                else:
+                    other_input = None
+                    for inp in op_inputs:
+                        if inp in reduce_running:
+                            other_input = inp
+                            break
+                    if other_input is not None:
+                        other_var = _running_var(other_input, r)
+                        if op_inputs[0] == other_input:
+                            val_expr = OpCall(op_obj.fn, [other_var, val_expr])
+                        else:
+                            val_expr = OpCall(op_obj.fn, [val_expr, other_var])
+                    else:
+                        val_expr = OpCall(op_obj.fn, [val_expr, Literal(0.0)])
+
+            result_name = f"fr_{r}_{c}"
+            row_body.append(Let(result_name, val_expr))
+            row_body.append(Store(output, _out_indices(row, col), Var(result_name), "global", guard=col.lt(N)))
+
+        row_body_wrapped: list = []
+        row_body_wrapped.append(Guard(row.lt(M), row_body))
+        final_body.extend(row_body_wrapped)
+
+    ops.append(LoopNest("n_tile", Literal(0, I), N, Literal(tile_n, I), final_body))
+
+    return ops
+
+
+# ---------------------------------------------------------------------------
 # Phase 4: Epilogue
 # ---------------------------------------------------------------------------
 
@@ -378,6 +692,10 @@ def _emit_epilogue(
 
     if accum.shape is None:
         # Pointwise: epilogue was inlined in the pointwise body
+        return []
+
+    if schedule.grid.type == "1d_contraction":
+        # Online reduction handles epilogue internally
         return []
 
     if accum.shape != ():
@@ -465,6 +783,10 @@ def _emit_write(
 
     if accum.shape is None:
         # Pointwise: writes were already emitted in the guard body
+        return []
+
+    if schedule.grid.type == "1d_contraction":
+        # Online reduction handles writes internally
         return []
 
     if accum.shape != ():

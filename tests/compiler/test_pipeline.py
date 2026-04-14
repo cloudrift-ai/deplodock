@@ -134,8 +134,8 @@ def test_contraction_softmax_large_n_splits():
     backend = CudaBackend()
     program = backend.compile(plan)
 
-    # Should have multiple launches (matmul + softmax, not a single broken kernel).
-    assert len(program.launches) >= 2, f"Expected >= 2 launches (matmul + softmax), got {len(program.launches)}"
+    # Online reduction fuses matmul + softmax into a single kernel.
+    assert len(program.launches) >= 1, f"Expected >= 1 launch, got {len(program.launches)}"
 
     # Generated source should be valid (no undefined identifiers).
     source = generate_source(program, mode="run")
