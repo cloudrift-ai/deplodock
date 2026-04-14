@@ -322,32 +322,32 @@ def _detect_contraction(
         b_batch = b_shape[:-2]
         if a_batch == b_batch:
             batch_dims = a_batch
-        elif len(a_batch) == len(b_batch):
+        else:
             # Broadcast batch dims (e.g. GQA: 28 Q heads vs 4 KV heads).
-            # Each dim must match or one must divide the other.
+            # Pad the shorter batch tuple with leading 1s so both have the same ndim,
+            # then check each dim matches or one divides the other.
+            max_len = max(len(a_batch), len(b_batch))
+            a_padded = (1,) * (max_len - len(a_batch)) + a_batch
+            b_padded = (1,) * (max_len - len(b_batch)) + b_batch
             merged_batch: list[int] = []
-            for ad, bd in zip(a_batch, b_batch, strict=True):
+            for ad, bd in zip(a_padded, b_padded, strict=True):
                 if not isinstance(ad, int) or not isinstance(bd, int):
                     return False, None, None, 0, 0, 0, (), 1, 1, 1
                 if ad == bd:
                     merged_batch.append(ad)
                 elif ad > bd and bd > 0 and ad % bd == 0:
-                    merged_batch.append(ad)  # A has more, B broadcasts
+                    merged_batch.append(ad)
                 elif bd > ad and ad > 0 and bd % ad == 0:
-                    merged_batch.append(bd)  # B has more, A broadcasts
+                    merged_batch.append(bd)
                 else:
                     return False, None, None, 0, 0, 0, (), 1, 1, 1
             batch_dims = tuple(merged_batch)
-            a_batch_size = math.prod(d for d in a_batch if isinstance(d, int))
-            b_batch_size = math.prod(d for d in b_batch if isinstance(d, int))
-            # Group size: how many batch elements of the larger operand
-            # share one element of the smaller operand.
+            a_batch_size = math.prod(d for d in a_padded if isinstance(d, int))
+            b_batch_size = math.prod(d for d in b_padded if isinstance(d, int))
             if a_batch_size >= b_batch_size and b_batch_size > 0:
                 b_batch_group = a_batch_size // b_batch_size
             elif a_batch_size > 0:
                 a_batch_group = b_batch_size // a_batch_size
-        else:
-            return False, None, None, 0, 0, 0, (), 1, 1, 1
         batch_size = math.prod(d for d in batch_dims if isinstance(d, int))
         # Batched: A(B..., M, K) @ B(B..., K, N)
         a_k = a_shape[-1]

@@ -21,27 +21,29 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     v_id = match.bindings["V"]
 
     q_shape = g.nodes[q_id].output.shape
+    k_shape = g.nodes[k_id].output.shape
     out_shape = root.output.shape
     dtype = root.output.dtype
     name = root.output.name
 
     head_dim = q_shape[-1] if len(q_shape) >= 2 else 64
     seq_len = q_shape[-2] if len(q_shape) >= 3 else q_shape[-1]
-    batch_heads_shape = q_shape[:-2] if len(q_shape) > 2 else ()
-    scores_shape = batch_heads_shape + (seq_len, seq_len)
+    q_batch = q_shape[:-2] if len(q_shape) > 2 else ()
+    k_batch = k_shape[:-2] if len(k_shape) > 2 else ()
+    scores_shape = q_batch + (seq_len, seq_len)
 
-    # K^T: transpose last two dims
+    # K^T: transpose last two dims.  Use K's actual batch dims (may differ
+    # from Q in GQA: e.g. Q has 28 heads, K has 4).
+    kt_shape = k_batch + (head_dim, seq_len) if isinstance(head_dim, int) else k_shape
     kt_id = g.add_node(
         op=TransposeOp(axes=(-2, -1)),
         inputs=[k_id],
-        output=Tensor(
-            f"{name}_kt",
-            batch_heads_shape + (head_dim, seq_len) if isinstance(head_dim, int) else q_shape,
-            dtype,
-        ),
+        output=Tensor(f"{name}_kt", kt_shape, dtype),
     )
 
-    # QK^T: matmul(Q, K^T) — decomposed as elementwise mul + reduce sum
+    # QK^T: matmul(Q, K^T) — decomposed as elementwise mul + reduce sum.
+    # When Q and K have different batch dims (GQA), the mul broadcasts
+    # K's heads to match Q's.  The intermediate shape uses Q's batch dims.
     qk_ew_id = g.add_node(
         op=ElementwiseOp(fn="mul"),
         inputs=[q_id, kt_id],
