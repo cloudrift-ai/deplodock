@@ -64,9 +64,10 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 ```
                      Layer 1                    Layer 2
 PyTorch module ──→ Graph IR ──→ Decomposition ──→ Fusion ──→ auto_fuse ──→ optimized Graph
-                                  (sdpa, silu,     (matmul)    (general fusion:
-                                   pow → prims)                 region discovery +
-                                                                kernel generation)
+   (faithful                    (sdpa, silu, pow,  (general fusion:
+    1:1 FX                       linear, matmul,    region discovery +
+    capture)                     unsqueeze, mean    kernel generation)
+                                 → primitives)
                                                                         │
                      Layer 3                                            │
                      plan_graph(graph) ──→ ExecutionPlan ◄──────────────┘
@@ -215,6 +216,16 @@ Decomposes high-level ops from `torch.export` into primitives:
 | `001_decompose_sdpa` | `sdpa(Q, K, V)` | QK^T → scale → softmax → @V |
 | `002_decompose_silu` | `silu(x)` | `x * recip(1 + exp(-x))` |
 | `003_decompose_pow` | `pow(x, 2)` | `mul(x, x)` |
+| `004_decompose_linear` | `linear(x, w[, b])` | `transpose(w) → mul → sum [→ add(b)]` |
+| `005_decompose_matmul` | `matmul(a, b[, bias])` | `mul → sum [→ add(bias)]` |
+| `006_decompose_unsqueeze` | `unsqueeze(x, dim)` | `reshape(x, new_shape)` |
+| `007_decompose_mean` | `mean(x, axis)` | `sum(x, axis) → div(count)` |
+
+Guideline: the tracer does a **faithful 1:1 capture** of FX ops. It never
+decomposes or normalizes — even compound ops like `Linear`, `Sdpa`, `Mean`,
+`Unsqueeze` become their own Torch IR nodes (`LinearOp`, `SdpaOp`, `MeanOp`,
+`UnsqueezeOp`). All lowering to primitives happens here in rewrite passes,
+so the tracer stays small and the decomposition lives in one place.
 
 ### 2. Auto-fusion (fusion.py)
 

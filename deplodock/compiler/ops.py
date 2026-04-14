@@ -193,6 +193,17 @@ class UnsqueezeOp(Op):
     dim: int = 0
 
 
+@dataclass
+class MeanOp(Op):
+    """PyTorch aten.mean.dim: reduction that averages along an axis.
+
+    Kept as its own op so the tracer does a faithful 1:1 capture; a
+    decomposition rule rewrites it into sum + div.
+    """
+
+    axis: int | str = -1
+
+
 # ---------------------------------------------------------------------------
 # Fused ops (assembly targets)
 # ---------------------------------------------------------------------------

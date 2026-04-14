@@ -243,48 +243,13 @@
         "dtype": "f32"
       }
     },
-    "mean_sum": {
-      "op": "ReduceOp",
+    "mean": {
+      "op": "MeanOp",
       "op_fields": {
-        "fn": "sum",
         "axis": -1
       },
       "inputs": [
         "pow_1"
-      ],
-      "output": {
-        "name": "mean_sum",
-        "shape": [
-          1,
-          8,
-          1
-        ],
-        "dtype": "float32"
-      }
-    },
-    "mean_count": {
-      "op": "ConstantOp",
-      "op_fields": {
-        "name": "mean_count",
-        "value": 2048.0
-      },
-      "inputs": [],
-      "output": {
-        "name": "mean_count",
-        "shape": [
-          1
-        ],
-        "dtype": "float32"
-      }
-    },
-    "mean": {
-      "op": "ElementwiseOp",
-      "op_fields": {
-        "fn": "div"
-      },
-      "inputs": [
-        "mean_sum",
-        "mean_count"
       ],
       "output": {
         "name": "mean",
@@ -1473,48 +1438,13 @@
         "dtype": "f32"
       }
     },
-    "mean_1_sum": {
-      "op": "ReduceOp",
+    "mean_1": {
+      "op": "MeanOp",
       "op_fields": {
-        "fn": "sum",
         "axis": -1
       },
       "inputs": [
         "pow_2"
-      ],
-      "output": {
-        "name": "mean_1_sum",
-        "shape": [
-          1,
-          8,
-          1
-        ],
-        "dtype": "float32"
-      }
-    },
-    "mean_1_count": {
-      "op": "ConstantOp",
-      "op_fields": {
-        "name": "mean_1_count",
-        "value": 2048.0
-      },
-      "inputs": [],
-      "output": {
-        "name": "mean_1_count",
-        "shape": [
-          1
-        ],
-        "dtype": "float32"
-      }
-    },
-    "mean_1": {
-      "op": "ElementwiseOp",
-      "op_fields": {
-        "fn": "div"
-      },
-      "inputs": [
-        "mean_1_sum",
-        "mean_1_count"
       ],
       "output": {
         "name": "mean_1",

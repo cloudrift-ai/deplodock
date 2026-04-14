@@ -144,6 +144,9 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             tag = "sdpa"
         elif isinstance(op, ops_module.UnsqueezeOp):
             tag = "unsqueeze"
+        elif isinstance(op, ops_module.MeanOp):
+            tag = "mean"
+            params["axis"] = op.axis
         elif isinstance(op, ops_module.CatOp):
             tag = "cat"
         elif isinstance(op, ops_module.GatherOp):
