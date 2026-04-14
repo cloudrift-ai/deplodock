@@ -177,3 +177,82 @@ def test_e2e_matmul_softmax_matches_torch():
 
     max_diff = max(abs(a - e) for a, e in zip(actual, expected, strict=True))
     assert max_diff < 1e-3, f"Matmul+softmax max diff = {max_diff:.6f}"
+
+
+@requires_cuda
+def test_e2e_gqa_attn_v_matches_torch():
+    """GQA attn@V: batched matmul with broadcast batch dims matches torch.
+
+    attn_weights(q_heads, seq, seq) @ V(kv_heads, seq, dim) where
+    q_heads > kv_heads (Grouped Query Attention).
+    """
+    torch.manual_seed(42)
+    q_heads, kv_heads = 4, 2  # group_size = 2
+    seq, dim = 8, 16
+
+    attn_t = torch.randn(q_heads, seq, seq).cuda()
+    v_t = torch.randn(kv_heads, seq, dim).cuda()
+
+    # PyTorch reference: each Q head group shares one KV head
+    group_size = q_heads // kv_heads
+    v_expanded = v_t.repeat_interleave(group_size, dim=0)  # (q_heads, seq, dim)
+    ref = torch.bmm(attn_t, v_expanded)
+    expected = ref.cpu().flatten().tolist()
+
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("attn", (q_heads, seq, seq)), node_id="attn")
+    v = g.add_node(InputOp(), [], Tensor("V", (kv_heads, seq, dim)), node_id="V")
+    g.inputs = [a, v]
+
+    ew = g.add_node(ElementwiseOp("mul"), [a, v],
+                    Tensor("ew", (q_heads, seq, seq, dim)), node_id="ew")
+    out = g.add_node(ReduceOp("sum", axis=-1), [ew],
+                     Tensor("out", (q_heads, seq, dim)), node_id="out")
+    g.outputs = [out]
+
+    input_data = {
+        "attn": attn_t.cpu().flatten().tolist(),
+        "V": v_t.cpu().flatten().tolist(),
+    }
+    outputs = _compile_and_run_with_data(g, input_data)
+    actual = list(outputs.values())[0]
+
+    max_diff = max(abs(a - e) for a, e in zip(actual, expected, strict=True))
+    assert max_diff < 0.05, f"GQA attn@V max diff = {max_diff:.6f}"
+
+
+@requires_cuda
+def test_e2e_gqa_attn_v_qwen_shapes():
+    """GQA attn@V with Qwen-like shapes: 28 Q heads, 4 KV heads."""
+    torch.manual_seed(42)
+    q_heads, kv_heads = 28, 4
+    seq, dim = 8, 16  # small for test speed
+
+    attn_t = torch.randn(q_heads, seq, seq).cuda()
+    v_t = torch.randn(kv_heads, seq, dim).cuda()
+
+    group_size = q_heads // kv_heads
+    v_expanded = v_t.repeat_interleave(group_size, dim=0)
+    ref = torch.bmm(attn_t, v_expanded)
+    expected = ref.cpu().flatten().tolist()
+
+    g = Graph()
+    a = g.add_node(InputOp(), [], Tensor("attn", (q_heads, seq, seq)), node_id="attn")
+    v = g.add_node(InputOp(), [], Tensor("V", (kv_heads, seq, dim)), node_id="V")
+    g.inputs = [a, v]
+
+    ew = g.add_node(ElementwiseOp("mul"), [a, v],
+                    Tensor("ew", (q_heads, seq, seq, dim)), node_id="ew")
+    out = g.add_node(ReduceOp("sum", axis=-1), [ew],
+                     Tensor("out", (q_heads, seq, dim)), node_id="out")
+    g.outputs = [out]
+
+    input_data = {
+        "attn": attn_t.cpu().flatten().tolist(),
+        "V": v_t.cpu().flatten().tolist(),
+    }
+    outputs = _compile_and_run_with_data(g, input_data)
+    actual = list(outputs.values())[0]
+
+    max_diff = max(abs(a - e) for a, e in zip(actual, expected, strict=True))
+    assert max_diff < 0.1, f"GQA attn@V (Qwen) max diff = {max_diff:.6f}"
