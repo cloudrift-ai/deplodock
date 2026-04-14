@@ -69,7 +69,68 @@ def trace_module(
         else:
             logger.debug("Skipping FX node: %s (op=%s)", fx_node.name, fx_node.op)
 
+    # Post-process: strip spurious leading-1 dims introduced by unsqueeze.
+    # Since we skip unsqueeze nodes, downstream ops may have output shapes
+    # with extra leading 1s from PyTorch's broadcast rules.  Normalize by
+    # stripping interior 1-dims that don't appear in any input shape.
+    _strip_unsqueeze_dims(g)
+
     return g
+
+
+def _strip_unsqueeze_dims(g: Graph) -> None:
+    """Fix output shapes after skipping unsqueeze nodes.
+
+    When unsqueeze is passed through, some downstream ops have output shapes
+    with extra dims from PyTorch metadata.  This function:
+    1. Strips leading 1-dims from outputs that have more dims than all inputs
+    2. Recomputes transpose output shapes from the actual input shape
+    """
+    from deplodock.compiler.ops import ConstantOp, InputOp, TransposeOp
+
+    for nid in g.topological_order():
+        node = g.nodes[nid]
+        if isinstance(node.op, (InputOp, ConstantOp)):
+            continue
+
+        out_shape = node.output.shape
+
+        # Transpose: recompute output shape from input shape + axes.
+        if isinstance(node.op, TransposeOp):
+            if node.inputs and node.inputs[0] in g.nodes:
+                inp_shape = list(g.nodes[node.inputs[0]].output.shape)
+                ax0, ax1 = node.op.axes
+                ndim = len(inp_shape)
+                ax0 = ax0 % ndim if ndim > 0 else 0
+                ax1 = ax1 % ndim if ndim > 0 else 0
+                inp_shape[ax0], inp_shape[ax1] = inp_shape[ax1], inp_shape[ax0]
+                node.output = Tensor(node.output.name, tuple(inp_shape), node.output.dtype)
+            continue
+
+        if not out_shape or len(out_shape) <= 2:
+            continue
+
+        # Find max ndim among resolved inputs.
+        max_inp_ndim = 0
+        for inp_id in node.inputs:
+            if inp_id in g.nodes:
+                inp_shape = g.nodes[inp_id].output.shape
+                if len(inp_shape) > max_inp_ndim:
+                    max_inp_ndim = len(inp_shape)
+
+        if max_inp_ndim == 0 or len(out_shape) <= max_inp_ndim:
+            continue
+
+        # Strip leading 1-dims down to max input ndim.
+        new_shape = out_shape
+        while len(new_shape) > max_inp_ndim and len(new_shape) > 1:
+            if isinstance(new_shape[0], int) and new_shape[0] == 1:
+                new_shape = new_shape[1:]
+            else:
+                break
+
+        if new_shape != out_shape:
+            node.output = Tensor(node.output.name, new_shape, node.output.dtype)
 
 
 def _get_shape(fx_node: Any) -> tuple:
@@ -371,8 +432,16 @@ def _handle_call_function(
             node_map[name] = input_ids[0]
         return
 
-    # --- Unsqueeze / squeeze / permute: true reshapes (same data, different view) ---
-    if op_name in ("unsqueeze", "squeeze", "expand", "permute"):
+    # --- Unsqueeze: pass through input. The unsqueeze only adds a size-1
+    # dim for broadcasting, which our broadcast indexing handles natively.
+    # Keeping 5D shapes causes wrong transpose axes downstream.
+    if op_name == "unsqueeze":
+        if input_ids:
+            node_map[name] = input_ids[0]
+        return
+
+    # --- Squeeze / permute / expand: reshapes ---
+    if op_name in ("squeeze", "expand", "permute"):
         if input_ids:
             nid = g.add_node(
                 op=ReshapeOp(shape=shape),
