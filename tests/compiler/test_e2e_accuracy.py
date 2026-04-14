@@ -204,10 +204,8 @@ def test_e2e_gqa_attn_v_matches_torch():
     v = g.add_node(InputOp(), [], Tensor("V", (kv_heads, seq, dim)), node_id="V")
     g.inputs = [a, v]
 
-    ew = g.add_node(ElementwiseOp("mul"), [a, v],
-                    Tensor("ew", (q_heads, seq, seq, dim)), node_id="ew")
-    out = g.add_node(ReduceOp("sum", axis=-1), [ew],
-                     Tensor("out", (q_heads, seq, dim)), node_id="out")
+    ew = g.add_node(ElementwiseOp("mul"), [a, v], Tensor("ew", (q_heads, seq, seq, dim)), node_id="ew")
+    out = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("out", (q_heads, seq, dim)), node_id="out")
     g.outputs = [out]
 
     input_data = {
@@ -241,10 +239,8 @@ def test_e2e_gqa_attn_v_qwen_shapes():
     v = g.add_node(InputOp(), [], Tensor("V", (kv_heads, seq, dim)), node_id="V")
     g.inputs = [a, v]
 
-    ew = g.add_node(ElementwiseOp("mul"), [a, v],
-                    Tensor("ew", (q_heads, seq, seq, dim)), node_id="ew")
-    out = g.add_node(ReduceOp("sum", axis=-1), [ew],
-                     Tensor("out", (q_heads, seq, dim)), node_id="out")
+    ew = g.add_node(ElementwiseOp("mul"), [a, v], Tensor("ew", (q_heads, seq, seq, dim)), node_id="ew")
+    out = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("out", (q_heads, seq, dim)), node_id="out")
     g.outputs = [out]
 
     input_data = {
