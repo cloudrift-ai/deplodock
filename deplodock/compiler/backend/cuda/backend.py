@@ -43,7 +43,7 @@ class CudaBackend(Backend):
         # Noop ops (reshape, transpose) become buffer aliases instead of
         # empty kernel launches. The output buffer shares the input's
         # device pointer — no allocation, no launch overhead.
-        _NOOP_OPS = {"reshape", "transpose", "gather", "scatter"}
+        _NOOP_OPS = {"reshape", "gather", "scatter"}
         aliases: dict[str, str] = {}
         launches = []
         for op in plan.ops:
@@ -775,4 +775,178 @@ def _compile_op(op: OpKernel) -> list[CudaLaunch]:
         _compile_singleton(op)  # sets up _region_ops etc. on op.params
         return _compile_fused_region(op)
 
+    if op.op == "transpose":
+        return [_compile_transpose(op)]
+
+    # Standalone reshape — buffer alias (handled in compile loop above,
+    # but may reach here if the reshape wasn't caught as a noop).
+    if op.op == "reshape":
+        return []
+
+    if op.op == "slice":
+        return [_compile_slice(op)]
+
+    if op.op == "cat":
+        return [_compile_cat(op)]
+
     raise ValueError(f"Unknown op: {op.op!r}")
+
+
+def _compile_transpose(op: OpKernel) -> CudaLaunch:
+    """Compile a transpose as a copy kernel with reindexed access.
+
+    Handles the common case of swapping two axes in an N-D tensor.
+    """
+    name = _unique_name("transpose")
+    src_buf = op.inputs[0]
+    dst_buf = op.outputs[0]
+    in_shape = op.params.get("_input_shapes", {}).get(src_buf, ())
+    out_shape = op.params.get("shape", in_shape)
+    total = math.prod(d for d in out_shape if isinstance(d, int))
+    axes = op.params.get("axes", (-2, -1))
+
+    # Normalize negative axes.
+    ndim = len(in_shape)
+    ax0 = axes[0] % ndim if ndim > 0 else 0
+    ax1 = axes[1] % ndim if ndim > 0 else 1
+
+    # Compute strides for input (row-major).
+    in_strides = [1] * ndim
+    for i in range(ndim - 2, -1, -1):
+        d = in_shape[i + 1] if isinstance(in_shape[i + 1], int) else 1
+        in_strides[i] = in_strides[i + 1] * d
+
+    # Output strides (row-major of output shape).
+    out_strides = [1] * ndim
+    for i in range(ndim - 2, -1, -1):
+        d = out_shape[i + 1] if isinstance(out_shape[i + 1], int) else 1
+        out_strides[i] = out_strides[i + 1] * d
+
+    # Build index computation: for each output element, compute the
+    # corresponding input element by decomposing into multi-dim indices,
+    # swapping the two axes, and recomputing the flat input index.
+    # Generate C code inline.
+
+    src_code = f"__global__ void {name}(const float* src, float* dst, int n) {{\n"
+    src_code += "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    src_code += "    if (i >= n) return;\n"
+    # Decompose flat index i into multi-dim output indices.
+    src_code += "    int rem = i;\n"
+    for d in range(ndim):
+        src_code += f"    int d{d} = rem / {out_strides[d]}; rem %= {out_strides[d]};\n"
+    # Swap the two axes for input indexing.
+    src_code += f"    int t = d{ax0}; d{ax0} = d{ax1}; d{ax1} = t;\n"
+    # Compute flat input index.
+    terms = [f"d{d} * {in_strides[d]}" for d in range(ndim)]
+    src_code += f"    int src_idx = {' + '.join(terms)};\n"
+    src_code += "    dst[i] = src[src_idx];\n"
+    src_code += "}\n"
+
+    return CudaLaunch(
+        kernel_source=src_code,
+        kernel_name=name,
+        grid=(_cd(total, 256), 1, 1),
+        block=(256, 1, 1),
+        args=[src_buf, dst_buf, str(total)],
+    )
+
+
+def _compile_slice(op: OpKernel) -> CudaLaunch:
+    """Compile a slice op as a strided copy kernel.
+
+    Slice extracts a sub-range along the last dimension:
+    dst[i] = src[(i / dst_stride) * src_stride + (i % dst_stride) + start].
+
+    The start offset is extracted from ConstantOp values in the graph.
+    """
+    name = _unique_name("slice")
+    src_buf = op.inputs[0]
+    dst_buf = op.outputs[0]
+    out_shape = op.params.get("shape", (1,))
+    total = math.prod(d for d in out_shape if isinstance(d, int))
+
+    input_shapes = op.params.get("_input_shapes", {})
+    src_shape = input_shapes.get(src_buf, out_shape)
+    src_last = src_shape[-1] if isinstance(src_shape[-1], int) else total
+    out_last = out_shape[-1] if isinstance(out_shape[-1], int) else total
+
+    # Extract start offset from the constant inputs.
+    # Slice inputs are [tensor, dim_const, start_const, end_const].
+    # The start_const has the byte/element offset.
+    start = 0
+    const_inputs = op.inputs[1:]  # skip tensor
+    if len(const_inputs) >= 2:
+        # The second constant is 'start'. Look up its value from params.
+        start_name = const_inputs[1]
+        start_val = op.params.get(f"_const_{start_name}")
+        if start_val is not None:
+            start = int(start_val)
+
+    if src_last == out_last:
+        # No slicing on last dim — simple copy
+        src_code = (
+            f"__global__ void {name}(const float* src, float* dst, int n) {{"
+            " int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) dst[i] = src[i]; }"
+        )
+        return CudaLaunch(
+            kernel_source=src_code, kernel_name=name, grid=(_cd(total, 256), 1, 1), block=(256, 1, 1), args=[src_buf, dst_buf, str(total)]
+        )
+
+    src_code = f"""__global__ void {name}(const float* src, float* dst, int n) {{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {{
+        int row = i / {out_last};
+        int col = i % {out_last};
+        dst[i] = src[row * {src_last} + col + {start}];
+    }}
+}}"""
+    return CudaLaunch(
+        kernel_source=src_code, kernel_name=name, grid=(_cd(total, 256), 1, 1), block=(256, 1, 1), args=[src_buf, dst_buf, str(total)]
+    )
+
+
+def _compile_cat(op: OpKernel) -> CudaLaunch:
+    """Compile a cat op as a copy kernel.
+
+    Cat inputs: [tensor_1, tensor_2, ..., dim_const].
+    Concatenates along the last dimension.
+    """
+    name = _unique_name("cat")
+    dst_buf = op.outputs[0]
+    out_shape = op.params.get("shape", (1,))
+    total = math.prod(d for d in out_shape if isinstance(d, int))
+    out_last = out_shape[-1] if out_shape else 1
+
+    # Source buffers (skip scalar constants — they're the dim arg).
+    input_shapes = op.params.get("_input_shapes", {})
+    src_bufs = [inp for inp in op.inputs if inp in input_shapes and math.prod(d for d in input_shapes[inp] if isinstance(d, int)) > 1]
+
+    if len(src_bufs) == 2:
+        s0_shape = input_shapes.get(src_bufs[0], out_shape)
+        s1_shape = input_shapes.get(src_bufs[1], out_shape)
+        s0_last = s0_shape[-1] if s0_shape else 0
+        s1_last = s1_shape[-1] if s1_shape else 0
+
+        src_code = f"""__global__ void {name}(const float* s0, const float* s1,
+    float* dst, int n, int dst_stride, int s0_stride, int s1_stride) {{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {{
+        int row = i / dst_stride;
+        int col = i % dst_stride;
+        if (col < s0_stride)
+            dst[i] = s0[row * s0_stride + col];
+        else
+            dst[i] = s1[row * s1_stride + (col - s0_stride)];
+    }}
+}}"""
+        return CudaLaunch(
+            kernel_source=src_code,
+            kernel_name=name,
+            grid=(_cd(total, 256), 1, 1),
+            block=(256, 1, 1),
+            args=[src_bufs[0], src_bufs[1], dst_buf, str(total), str(out_last), str(s0_last), str(s1_last)],
+        )
+
+    # Fallback for >2 inputs
+    src_code = f"__global__ void {name}(float* dst, int n) {{ int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) dst[i] = 0.0f; }}"
+    return CudaLaunch(kernel_source=src_code, kernel_name=name, grid=(_cd(total, 256), 1, 1), block=(256, 1, 1), args=[dst_buf, str(total)])

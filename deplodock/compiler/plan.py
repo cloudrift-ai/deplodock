@@ -126,8 +126,18 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             params["axis"] = op.axis
         elif isinstance(op, ops_module.TransposeOp):
             tag = "transpose"
+            params["axes"] = op.axes
         elif isinstance(op, ops_module.ReshapeOp):
             tag = "reshape"
+        elif isinstance(op, ops_module.SliceOp):
+            tag = "slice"
+            # Extract constant values for slice parameters (dim, start, end).
+            for inp_id in node.inputs[1:]:
+                inp_node = graph.nodes.get(inp_id)
+                if inp_node and isinstance(inp_node.op, ops_module.ConstantOp) and inp_node.op.value is not None:
+                    params[f"_const_{inp_id}"] = inp_node.op.value
+        elif isinstance(op, ops_module.CatOp):
+            tag = "cat"
         elif isinstance(op, ops_module.GatherOp):
             tag = "gather"
             params["axis"] = op.axis

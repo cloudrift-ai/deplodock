@@ -140,6 +140,26 @@ class ReshapeOp(Op):
     shape: tuple[int | str, ...]
 
 
+@dataclass
+class SliceOp(Op):
+    """Extract a sub-tensor along a dimension.
+
+    Inputs: [tensor, dim_const, start_const, end_const] where the
+    constants are scalar ConstantOps from the tracer.
+    """
+
+    shape: tuple[int | str, ...]
+
+
+@dataclass
+class CatOp(Op):
+    """Concatenate tensors along a dimension.
+
+    Inputs: [dim_const, tensor_1, tensor_2, ...] where dim_const
+    is a scalar ConstantOp indicating the concat axis.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Fused ops (assembly targets)
 # ---------------------------------------------------------------------------
