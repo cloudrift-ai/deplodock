@@ -53,6 +53,7 @@ _OP_CLASS_MAP: dict[str, str] = {
     "Matmul": "MatmulOp",
     "Sdpa": "SdpaOp",
     "Unsqueeze": "UnsqueezeOp",
+    "Mean": "MeanOp",
 }
 
 # Field ordering per op class — maps positional constraints to field names.

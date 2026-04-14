@@ -51,7 +51,8 @@ def test_tinyllama_has_expected_ops():
     assert ops.get("ConstantOp", 0) >= 9  # weight matrices + layernorm weights + scalar constants
     assert ops.get("InputOp", 0) == 3  # hidden_states + cos + sin
     assert ops.get("ElementwiseOp", 0) > 0
-    assert ops.get("ReduceOp", 0) > 0
+    # Faithful tracer keeps aten.mean.dim as MeanOp (decomposed by rewriter).
+    assert ops.get("MeanOp", 0) > 0
 
 
 def test_tinyllama_has_7_linear_patterns():
