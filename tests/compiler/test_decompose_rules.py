@@ -20,11 +20,12 @@ RULES_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "ru
 
 
 def _make_pow_graph():
-    """Build graph with pow(x) for decomposition testing."""
+    """Build graph with pow(x, 2) for decomposition testing."""
     g = Graph()
     x = g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 128)), node_id="x")
+    exp = g.add_node(op=ConstantOp(name="exp", value=2.0), inputs=[], output=Tensor("exp", (1,)), node_id="exp")
     g.inputs = [x]
-    out = g.add_node(op=ElementwiseOp(fn="pow"), inputs=[x], output=Tensor("out", (4, 128)), node_id="out")
+    out = g.add_node(op=ElementwiseOp(fn="pow"), inputs=[x, exp], output=Tensor("out", (4, 128)), node_id="out")
     g.outputs = [out]
     return g
 

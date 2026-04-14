@@ -45,6 +45,8 @@ OP_REGISTRY: dict[str, OpInfo] = {
     "relu": OpInfo(1),
     "tanh": OpInfo(1),
     "sigmoid": OpInfo(1),
+    "pow": OpInfo(2),
+    "abs": OpInfo(1),
 }
 
 # Default for unknown ops: assume unary, non-commutative.

@@ -57,27 +57,24 @@ def test_tinyllama_has_expected_ops():
 def test_tinyllama_has_7_linear_patterns():
     """The graph should have 7 linear projections (Q, K, V, O, gate, up, down).
 
-    Each linear decomposes to Elementwise{mul} + Reduce{sum}, so we expect
-    7 Reduce{sum} ops that sit on top of Elementwise{mul} ops.
+    The faithful tracer captures each as a LinearOp node (decomposition to
+    mul+reduce_sum happens in a later rewrite pass).
     """
+    from deplodock.compiler.ops import LinearOp
+
     g = _load_fixture("tinyllama_layer0.json")
 
-    # Count Reduce{sum} nodes whose input is Elementwise{mul}.
-    matmul_count = 0
-    for n in g.nodes.values():
-        if isinstance(n.op, ReduceOp) and n.op.fn == "sum":
-            inp_node = g.nodes.get(n.inputs[0])
-            if inp_node and isinstance(inp_node.op, ElementwiseOp) and inp_node.op.fn == "mul":
-                matmul_count += 1
-
-    assert matmul_count == 7, f"Expected 7 linear projections, found {matmul_count}"
+    linear_count = sum(1 for n in g.nodes.values() if isinstance(n.op, LinearOp))
+    assert linear_count == 7, f"Expected 7 linear projections, found {linear_count}"
 
 
 def test_tinyllama_has_sdpa():
     """torch.export keeps scaled_dot_product_attention as a single op."""
+    from deplodock.compiler.ops import SdpaOp
+
     g = _load_fixture("tinyllama_layer0.json")
 
-    sdpa_count = sum(1 for n in g.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.fn == "sdpa")
+    sdpa_count = sum(1 for n in g.nodes.values() if isinstance(n.op, SdpaOp))
     assert sdpa_count == 1
 
 

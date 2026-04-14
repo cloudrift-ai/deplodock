@@ -205,6 +205,8 @@ _C_EXPR: dict[str, str] = {
     "relu": "fmaxf(0.0f, {a})",
     "tanh": "tanhf({a})",
     "sigmoid": "1.0f / (1.0f + expf(-{a}))",
+    "pow": "powf({a}, {b})",
+    "abs": "fabsf({a})",
     # Identity-like: used for builtin aliases (e.g. batch = blockIdx.z)
     "builtin": "{a}",
 }
