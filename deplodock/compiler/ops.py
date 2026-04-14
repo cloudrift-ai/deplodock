@@ -161,6 +161,37 @@ class CatOp(Op):
 
 
 # ---------------------------------------------------------------------------
+# Torch IR ops (captured from PyTorch, decomposed by rewriter passes)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LinearOp(Op):
+    """PyTorch aten.linear: output = x @ weight.T [+ bias]."""
+
+    has_bias: bool = False
+
+
+@dataclass
+class MatmulOp(Op):
+    """PyTorch aten.mm/matmul/addmm: output = A @ B [+ bias]."""
+
+    has_bias: bool = False
+
+
+@dataclass
+class SdpaOp(Op):
+    """PyTorch scaled_dot_product_attention(Q, K, V, ...)."""
+
+
+@dataclass
+class UnsqueezeOp(Op):
+    """PyTorch aten.unsqueeze: add a size-1 dimension."""
+
+    dim: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Fused ops (assembly targets)
 # ---------------------------------------------------------------------------
 
