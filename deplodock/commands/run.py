@@ -60,7 +60,7 @@ def _handle_run(args):
         dump.dump_program(program)
         for launch in program.launches:
             if hasattr(launch, "loop_ir") and launch.loop_ir is not None:
-                dump.dump_loop_ir(launch.loop_ir, launch.kernel_name)
+                dump.dump_loop_ir(launch.loop_ir, launch.kernel_name, schedule=getattr(launch, "schedule", None))
         from deplodock.compiler.backend.cuda.program import generate_source
 
         mode = "benchmark" if args.benchmark else "run"

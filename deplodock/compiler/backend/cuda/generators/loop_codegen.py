@@ -54,10 +54,15 @@ from deplodock.compiler.backend.ir.loop_ir import (
 _active_tma_config = None
 
 
-def loop_ir_to_kernel(program: LoopProgram) -> KernelDef:
-    """Translate a LoopProgram into a KernelDef."""
-    global _active_tma_config  # noqa: PLW0603
-    _active_tma_config = program.tma_config
+def loop_ir_to_kernel(program: LoopProgram, schedule: object, dim_strides: dict[str, list[str]] | None = None) -> KernelDef:
+    """Translate a LoopProgram + Schedule into a KernelDef.
+
+    The Schedule provides backend metadata (block_size, tile dims, TMA config,
+    etc.).  The LoopProgram provides only the loop structure and dim_strides.
+    """
+    global _active_tma_config, _active_dim_strides  # noqa: PLW0603
+    _active_tma_config = schedule.tma_config
+    _active_dim_strides = dim_strides or program.dim_strides or {}
     params = [KernelParam(dtype, name) for dtype, name in program.params]
     body = _lower_ops(program.body)
 
@@ -65,15 +70,15 @@ def loop_ir_to_kernel(program: LoopProgram) -> KernelDef:
         name=program.name,
         params=params,
         body=body,
-        block_size=program.block_size,
-        includes=program.includes,
-        tile_m=program.tile_m,
-        tile_n=program.tile_n,
-        grid_2d=program.grid_2d,
-        tma_params=program.tma_params,
-        batched=program.batched,
-        extra_smem_bytes=program.extra_smem_bytes,
-        min_blocks_per_sm=program.min_blocks_per_sm,
+        block_size=schedule.grid.block_size,
+        includes=schedule.includes,
+        tile_m=schedule.tile_m,
+        tile_n=schedule.tile_n,
+        grid_2d=schedule.grid.type == "2d_standard",
+        tma_params=schedule.tma_params,
+        batched=schedule.is_batched,
+        extra_smem_bytes=schedule.extra_smem_bytes,
+        min_blocks_per_sm=schedule.min_blocks_per_sm,
     )
 
 
@@ -110,6 +115,74 @@ def _lower_expr(expr: LoopExpr) -> KernelExpr:
         return Var(_render_c_expr(expr.op, a_str, b_str))
     msg = f"Unknown LoopExpr type: {type(expr)}"
     raise TypeError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Multi-dim index flattening
+# ---------------------------------------------------------------------------
+
+# Row-major stride variables per buffer dimension.  For a 2D buffer "X" with
+# shape (rows, cols), stride_1 = cols and stride_0 = cols * 1.  The convention:
+# the innermost (last) dimension has stride 1, the next has stride equal to the
+# innermost dimension size, etc.
+#
+# Currently we use a simple convention: for a 2D global buffer the inner
+# stride is "cols" or "N" (resolved from _active_tma_config or by default).
+# Single-element index lists pass through as pre-flattened linear indices.
+
+# Map buffer name → list of stride expressions (outer-to-inner, excluding
+# the implicit stride-1 on the innermost dimension).  Populated per-kernel
+# by loop_ir_to_kernel via _active_dim_strides.
+_active_dim_strides: dict[str, list[str]] = {}
+
+
+def _flatten_indices(indices: list, buf_name: str) -> KernelExpr:
+    """Flatten multi-dimensional indices to a single linear index expression.
+
+    For a 1-element list, returns the element directly (pre-flattened).
+    For 2+ elements, computes row-major linearization using stride variables.
+    """
+    if len(indices) == 1:
+        return _lower_expr(indices[0])
+
+    if len(indices) == 0:
+        return Literal(0, "int")
+
+    # Build row-major linearization: indices[0]*stride_0 + indices[1]*stride_1 + ... + indices[-1]
+    # For 2D: idx[0] * cols + idx[1]  (stride for dim 0 is the size of dim 1)
+    # For 3D: idx[0] * (d1*d2) + idx[1] * d2 + idx[2]
+    #
+    # Stride variables: look up from _active_dim_strides, or use default
+    # naming convention based on number of dimensions.
+    strides = _active_dim_strides.get(buf_name)
+    if strides is None:
+        # Default stride names for common patterns
+        if len(indices) == 2:
+            strides = ["cols"]
+        elif len(indices) == 3:
+            strides = ["d1_x_d2", "d2"]
+        else:
+            strides = [f"stride_{buf_name}_{i}" for i in range(len(indices) - 1)]
+
+    result = _lower_expr(indices[-1])
+    for i in range(len(indices) - 2, -1, -1):
+        stride_idx = i  # strides[0] is for indices[0], strides[1] for indices[1], etc.
+        if stride_idx < len(strides):
+            stride_str = strides[stride_idx]
+            # Handle compound strides like "M * N"
+            if " * " in stride_str:
+                parts = stride_str.split(" * ")
+                stride: KernelExpr = Var(parts[0])
+                for p in parts[1:]:
+                    stride = BinOp("*", stride, Var(p))
+            else:
+                stride = Var(stride_str)
+        else:
+            stride = Literal(1, "int")
+        term = BinOp("*", _lower_expr(indices[i]), stride)
+        result = BinOp("+", term, result)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +313,7 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         return [VarDecl(op.dtype, op.name, init)]
 
     if isinstance(op, Load):
-        idx = _lower_expr(op.indices)
+        idx = _flatten_indices(op.indices, op.src)
         if op.guard:
             guard = _lower_expr(op.guard)
             # Guarded load: type dst = guard ? src[idx] : 0.0f;
@@ -254,7 +327,7 @@ def _lower_op(op: LoopOp) -> list[Stmt]:
         return [VarDecl("float", op.dst, ArrayAccess(op.src, idx))]
 
     if isinstance(op, Store):
-        idx = _lower_expr(op.indices)
+        idx = _flatten_indices(op.indices, op.dst)
         val = _lower_expr(op.value)
         if op.guard:
             guard = _lower_expr(op.guard)

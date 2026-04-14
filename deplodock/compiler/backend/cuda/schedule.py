@@ -104,6 +104,10 @@ class Schedule:
     # Scalar params to append to kernel signature (dim args)
     dim_params: list[tuple[str, str]] = field(default_factory=list)
 
+    # Occupancy / smem hints (consumed by KernelDef, not by LoopIR)
+    extra_smem_bytes: int = 0
+    min_blocks_per_sm: int = 0
+
 
 def build_schedule(
     analysis: TileAnalysis,

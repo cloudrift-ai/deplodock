@@ -102,12 +102,12 @@ class CompilerDump:
         }
         self._write_json("30_execution_plan.json", summary)
 
-    def dump_loop_ir(self, program_ir, kernel_name: str) -> None:
+    def dump_loop_ir(self, program_ir, kernel_name: str, schedule: object | None = None) -> None:
         """Dump a LoopProgram as pretty-printed text and JSON."""
         from deplodock.compiler.backend.ir.loop_ir import pretty_print, to_dict
 
-        self._write_text(f"35_loop_ir_{kernel_name}.txt", pretty_print(program_ir))
-        self._write_json(f"35_loop_ir_{kernel_name}.json", to_dict(program_ir))
+        self._write_text(f"35_loop_ir_{kernel_name}.txt", pretty_print(program_ir, schedule=schedule))
+        self._write_json(f"35_loop_ir_{kernel_name}.json", to_dict(program_ir, schedule=schedule))
 
     def dump_program(self, program: Program) -> None:
         summary = {

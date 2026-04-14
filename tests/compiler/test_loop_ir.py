@@ -4,6 +4,7 @@ import json
 
 from deplodock.compiler.backend.cuda.generators import analyze, build_schedule, lower_generic, lower_to_loop_ir
 from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
+from deplodock.compiler.backend.cuda.schedule import AccumulatorSpec, GridSpec, Schedule
 from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
 from deplodock.compiler.backend.ir.loop_ir import (
     Accum,
@@ -28,6 +29,18 @@ from deplodock.compiler.backend.ir.loop_ir import (
 )
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
 
+
+def _mock_schedule(block_size=(256, 1, 1), tile_m=None, tile_n=None):
+    """Build a minimal Schedule for tests that need block_size/tile info."""
+    return Schedule(
+        grid=GridSpec("1d", block_size),
+        accum=AccumulatorSpec(None),
+        reductions=[],
+        tile_m=tile_m,
+        tile_n=tile_n,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: LoopIR construction and pretty-printing
 # ---------------------------------------------------------------------------
@@ -43,16 +56,14 @@ def test_loop_program_construction():
             Guard(
                 BinOp("<", Var("i"), Var("n")),
                 [
-                    Load("v", "X", Var("i"), "global"),
+                    Load("v", "X", [Var("i")], "global"),
                     Let("out", Var("v") * 2.0),
-                    Store("Y", Var("i"), Var("out"), "global"),
+                    Store("Y", [Var("i")], Var("out"), "global"),
                 ],
             ),
         ],
-        block_size=(256, 1, 1),
     )
     assert prog.name == "test_kernel"
-    assert prog.block_size == (256, 1, 1)
     assert len(prog.params) == 3
     assert len(prog.body) == 2
 
@@ -67,15 +78,15 @@ def test_pretty_print_pointwise():
             Guard(
                 BinOp("<", Var("i"), Var("n")),
                 [
-                    Load("v", "X", Var("i"), "global"),
+                    Load("v", "X", [Var("i")], "global"),
                     Let("out", OpCall("relu", [Var("v")])),
-                    Store("Y", Var("i"), Var("out"), "global"),
+                    Store("Y", [Var("i")], Var("out"), "global"),
                 ],
             ),
         ],
-        block_size=(256, 1, 1),
     )
-    text = pretty_print(prog)
+    sched = _mock_schedule()
+    text = pretty_print(prog, schedule=sched)
     assert "loop_program relu_kernel" in text
     assert "block_size: (256, 1, 1)" in text
     assert "parallel i" in text
@@ -102,7 +113,7 @@ def test_pretty_print_reduce():
                         Var("cols"),
                         Builtin("blockDim.x"),
                         [
-                            Load("v", "X", BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j")), "global"),
+                            Load("v", "X", [Var("row"), Var("j")], "global"),
                             Accum("acc", "sum", Var("v")),
                         ],
                     ),
@@ -110,9 +121,8 @@ def test_pretty_print_reduce():
                 ],
             ),
         ],
-        block_size=(256, 1, 1),
     )
-    text = pretty_print(prog)
+    text = pretty_print(prog, schedule=_mock_schedule())
     assert "alloc reg float acc" in text
     assert "for j" in text
     assert "accum acc sum" in text
@@ -135,11 +145,9 @@ def test_pretty_print_contraction():
                 [RawLoopOp("/* FMA body */", "K-loop body")],
             ),
         ],
-        block_size=(32, 8, 1),
-        tile_m=64,
-        tile_n=128,
     )
-    text = pretty_print(prog)
+    sched = _mock_schedule(block_size=(32, 8, 1), tile_m=64, tile_n=128)
+    text = pretty_print(prog, schedule=sched)
     assert "tile: (64, 128)" in text
     assert "for k" in text
     assert "raw" in text
@@ -159,10 +167,9 @@ def test_loop_ir_json_roundtrip():
             ParallelAxis("i", "blockIdx.x", "n"),
             Guard(
                 BinOp("<", Var("i"), Var("n")),
-                [Store("X", Var("i"), Literal(1.0), "global")],
+                [Store("X", [Var("i")], Literal(1.0), "global")],
             ),
         ],
-        block_size=(256, 1, 1),
     )
     d = to_dict(prog)
     # Must be JSON-serializable
@@ -214,9 +221,9 @@ def test_pointwise_structure():
         output_names=["exp"],
         shapes={"x": (n,), "neg": (n,), "exp": (n,)},
     )
-    prog = lower_to_loop_ir(region, "test_pw", {**region.shapes, **{"x": (n,), "neg": (n,), "exp": (n,)}}, analysis)
+    prog, sched = lower_to_loop_ir(region, "test_pw", {**region.shapes, **{"x": (n,), "neg": (n,), "exp": (n,)}}, analysis)
 
-    assert prog.block_size == (256, 1, 1)
+    assert sched.grid.block_size == (256, 1, 1)
     assert any(isinstance(op, ParallelAxis) for op in prog.body)
     guards = _find_ops(prog.body, Guard, recursive=False)
     assert len(guards) == 1
@@ -235,9 +242,9 @@ def test_single_reduce_structure():
         output_names=["red"],
         shapes={"x": (rows, cols), "red": (rows,)},
     )
-    prog = lower_to_loop_ir(region, "test_red", {"x": (rows, cols), "red": (rows,)}, analysis)
+    prog, sched = lower_to_loop_ir(region, "test_red", {"x": (rows, cols), "red": (rows,)}, analysis)
 
-    assert prog.block_size == (256, 1, 1)
+    assert sched.grid.block_size == (256, 1, 1)
     accum_inits = _find_ops(prog.body, AccumInit)
     assert any(a.name.startswith("acc_") for a in accum_inits)
     loops = _find_ops(prog.body, LoopNest)
@@ -269,7 +276,7 @@ def test_multi_reduce_structure():
             "div": (rows, cols),
         },
     )
-    prog = lower_to_loop_ir(
+    prog, _sched = lower_to_loop_ir(
         region,
         "test_softmax",
         {"x": (rows, cols), "mx": (rows, 1), "sub": (rows, cols), "exp": (rows, cols), "sm": (rows, 1), "div": (rows, cols)},
@@ -286,7 +293,7 @@ def test_multi_reduce_structure():
 
 
 def test_contraction_structure():
-    """Contraction has tile_m/tile_n set and uses RawLoopOp for legacy body."""
+    """Contraction has register tile alloc and K-loop."""
     region, analysis = _make_region_and_analysis(
         region_ops=[
             ("ew", ElementwiseOp("mul"), ["A", "B"]),
@@ -296,7 +303,7 @@ def test_contraction_structure():
         output_names=["C"],
         shapes={"A": (8, 4), "B": (4, 6), "ew": (8, 4, 6), "C": (8, 6)},
     )
-    prog = lower_to_loop_ir(
+    prog, sched = lower_to_loop_ir(
         region,
         "test_mm",
         {"A": (8, 4), "B": (4, 6), "ew": (8, 4, 6), "C": (8, 6)},
@@ -304,7 +311,7 @@ def test_contraction_structure():
         strategy="naive",
     )
 
-    assert prog.block_size == (32, 8, 1)
+    assert sched.grid.block_size == (32, 8, 1)
     # Grid setup uses Let ops, K-loop is LoopNest, write is Guard+Store.
     lets = _find_ops(prog.body, Let, recursive=False)
     assert any(v.name == "bm" for v in lets)  # CTA-swizzle output
@@ -326,10 +333,10 @@ def test_contraction_structure():
 
 def _roundtrip(region, name, shapes, analysis, **kwargs):
     """Lower to LoopIR, codegen to KernelDef, emit to CUDA source."""
-    prog = lower_to_loop_ir(region, name, shapes, analysis, **kwargs)
-    kernel = loop_ir_to_kernel(prog)
+    prog, sched = lower_to_loop_ir(region, name, shapes, analysis, **kwargs)
+    kernel = loop_ir_to_kernel(prog, sched)
     source = emit_kernel(kernel)
-    return prog, kernel, source
+    return prog, kernel, source, sched
 
 
 def test_roundtrip_pointwise():
@@ -348,7 +355,7 @@ def test_roundtrip_pointwise():
         shapes={"gate": (n,), "one": (1,), "neg": (n,), "exp": (n,), "add": (n,), "recip": (n,), "out": (n,)},
     )
     shapes = {"gate": (n,), "one": (1,), "neg": (n,), "exp": (n,), "add": (n,), "recip": (n,), "out": (n,)}
-    _, kernel, source = _roundtrip(region, "silu", shapes, analysis)
+    _, kernel, source, _ = _roundtrip(region, "silu", shapes, analysis)
 
     assert "__global__" in source
     assert "void silu" in source
@@ -365,7 +372,7 @@ def test_roundtrip_row_reduce():
         output_names=["red"],
         shapes={"x": (rows, cols), "red": (rows,)},
     )
-    _, kernel, source = _roundtrip(region, "row_sum", {"x": (rows, cols), "red": (rows,)}, analysis)
+    _, kernel, source, _ = _roundtrip(region, "row_sum", {"x": (rows, cols), "red": (rows,)}, analysis)
 
     assert "__global__" in source
     assert "void row_sum" in source
@@ -410,7 +417,7 @@ def test_roundtrip_rmsnorm():
         "norm": (rows, dim),
         "out": (rows, dim),
     }
-    _, _, source = _roundtrip(region, "rmsnorm", shapes, analysis)
+    _, _, source, _ = _roundtrip(region, "rmsnorm", shapes, analysis)
 
     assert "rsqrtf" in source
     assert "__shfl_down_sync" in source
@@ -446,7 +453,7 @@ def test_roundtrip_softmax():
         "sm": (rows, 1),
         "div": (rows, cols),
     }
-    _, _, source = _roundtrip(region, "softmax", shapes, analysis)
+    _, _, source, _ = _roundtrip(region, "softmax", shapes, analysis)
 
     assert "fmaxf" in source  # max reduce
     assert "expf" in source  # exp
@@ -466,7 +473,7 @@ def test_roundtrip_matmul_naive():
         shapes={"A": (8, 4), "B": (4, 6), "ew": (8, 4, 6), "C": (8, 6)},
     )
     shapes = {"A": (8, 4), "B": (4, 6), "ew": (8, 4, 6), "C": (8, 6)}
-    prog, kernel, source = _roundtrip(region, "matmul", shapes, analysis, strategy="naive")
+    prog, kernel, source, _ = _roundtrip(region, "matmul", shapes, analysis, strategy="naive")
 
     assert "__global__" in source
     assert "void matmul" in source
@@ -485,11 +492,13 @@ def test_roundtrip_matmul_tma():
         shapes={"A": (256, 256), "B": (256, 256), "ew": (256, 256, 256), "C": (256, 256)},
     )
     shapes = {"A": (256, 256), "B": (256, 256), "ew": (256, 256, 256), "C": (256, 256)}
-    prog, kernel, source = _roundtrip(region, "matmul_tma", shapes, analysis, strategy="tma_db", hints={"block_k": 32, "thread_m": 8})
+    prog, kernel, source, sched = _roundtrip(
+        region, "matmul_tma", shapes, analysis, strategy="tma_db", hints={"block_k": 32, "thread_m": 8}
+    )
 
     assert "__global__" in source
     assert "void matmul_tma" in source
-    assert prog.tma_params is not None
+    assert sched.tma_params is not None
 
 
 # ---------------------------------------------------------------------------
@@ -558,12 +567,12 @@ def test_lower_generic_matches_lower_to_loop_ir():
     shapes = {"x": (4, 8), "red": (4,)}
 
     # Via lower_to_loop_ir (routes through lower_generic internally)
-    prog1 = lower_to_loop_ir(region, "test", shapes, analysis)
+    prog1, sched1 = lower_to_loop_ir(region, "test", shapes, analysis)
     # Via explicit build_schedule + lower_generic
-    sched = build_schedule(analysis)
-    prog2 = lower_generic(region, "test", shapes, analysis, sched)
+    sched2 = build_schedule(analysis)
+    prog2 = lower_generic(region, "test", shapes, analysis, sched2)
 
     # Both should produce the same LoopIR structure
-    assert prog1.block_size == prog2.block_size
+    assert sched1.grid.block_size == sched2.grid.block_size
     assert len(prog1.body) == len(prog2.body)
     assert len(prog1.params) == len(prog2.params)

@@ -164,11 +164,17 @@ def _to_name(v: str | Var) -> str:
 
 @dataclass
 class Load:
-    """Load from global or shared memory into a register."""
+    """Load from global or shared memory into a register.
+
+    ``indices`` is a list of per-dimension index expressions.  The codegen
+    flattens them using buffer strides (row-major by default).  A single-
+    element list ``[expr]`` represents a pre-flattened linear index for
+    shared-memory or legacy call sites.
+    """
 
     dst: str
     src: str | Var  # buffer name (Var auto-extracted)
-    indices: LoopExpr
+    indices: list[LoopExpr]
     space: str  # "global" | "smem"
     guard: LoopExpr | None = None  # bounds check; zero if false
 
@@ -178,10 +184,13 @@ class Load:
 
 @dataclass
 class Store:
-    """Write to global or shared memory."""
+    """Write to global or shared memory.
+
+    ``indices`` is a list of per-dimension index expressions (see Load).
+    """
 
     dst: str | Var  # buffer name (Var auto-extracted)
-    indices: LoopExpr
+    indices: list[LoopExpr]
     value: LoopExpr
     space: str  # "global" | "smem"
     guard: LoopExpr | None = None
@@ -300,16 +309,16 @@ class SmemPipelineKLoop:
         for r in range(self.thread_m):
             row_r = row_base + r
             k_col = tk + tidx
-            tk_body.append(Load(f"As_ld_{r}", a_src, row_r * K + k_col, "global", guard=row_r.lt(M).and_(k_col.lt(K))))
-            tk_body.append(Store("As", (sr + r) * smem_stride + tidx, Var(f"As_ld_{r}"), "smem"))
+            tk_body.append(Load(f"As_ld_{r}", a_src, [row_r, k_col], "global", guard=row_r.lt(M).and_(k_col.lt(K))))
+            tk_body.append(Store("As", [(sr + r) * smem_stride + tidx], Var(f"As_ld_{r}"), "smem"))
         tk_body.append(Barrier())
 
         kk_body: list = []
         for c in range(self.thread_n):
             col_c = col_base + c
-            kk_body.append(Load(f"b{c}", b_src, (tk + kk) * N + col_c, "global", guard=col_c.lt(N)))
+            kk_body.append(Load(f"b{c}", b_src, [tk + kk, col_c], "global", guard=col_c.lt(N)))
         for r in range(self.thread_m):
-            kk_body.append(Load(f"a{r}", "As", (sr + r) * smem_stride + kk, "smem"))
+            kk_body.append(Load(f"a{r}", "As", [(sr + r) * smem_stride + kk], "smem"))
             for c in range(self.thread_n):
                 kk_body.append(Accum(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
         tk_body.append(LoopNest("kk", Literal(0, I), Literal(bk, I), None, kk_body))
@@ -321,10 +330,7 @@ class SmemPipelineKLoop:
 
 @dataclass
 class RawLoopOp:
-    """Escape hatch for backend-specific inline code (e.g. TMA asm).
-
-    Should be replaced with proper LoopIR ops over time.
-    """
+    """Escape hatch for backend-specific inline code (e.g. TMA asm)."""
 
     code: str
     comment: str = ""
@@ -355,23 +361,22 @@ LoopOp = (
 
 @dataclass
 class LoopProgram:
-    """Complete loop program for one kernel."""
+    """Complete loop program for one kernel.
+
+    Contains only the loop structure (params, body, strides).  Backend
+    metadata (block_size, tile dims, TMA config, etc.) lives on the
+    Schedule and flows into KernelDef via ``loop_ir_to_kernel()``.
+    """
 
     name: str
     params: list[tuple[str, str]]  # [(dtype, name), ...] e.g. [("const float*", "A"), ("int", "M")]
     body: list[LoopOp]
-    block_size: tuple[int, int, int]
     smem_bytes: int = 0
-    # Metadata carried forward into KernelDef.
-    tile_m: int | None = None
-    tile_n: int | None = None
-    grid_2d: bool = False
-    tma_params: list[str] | None = None
-    tma_config: object | None = None  # TMALoadConfig from cuda backend (if TMA strategy)
-    batched: bool = False
-    includes: list[str] | None = None
-    extra_smem_bytes: int = 0
-    min_blocks_per_sm: int = 0
+    # Per-buffer stride variable names for multi-dim index flattening.
+    # Maps buffer name → list of stride var names (outer-to-inner, excluding
+    # the implicit stride-1 innermost dim).  E.g. {"A": ["K"], "B": ["N"]}
+    # for a contraction where A is (M, K) and B is (K, N).
+    dim_strides: dict[str, list[str]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -381,17 +386,22 @@ class LoopProgram:
 _INDENT = "  "
 
 
-def pretty_print(program: LoopProgram) -> str:
-    """Human-readable text dump of a LoopProgram."""
+def pretty_print(program: LoopProgram, schedule: object | None = None) -> str:
+    """Human-readable text dump of a LoopProgram.
+
+    When ``schedule`` is provided (a backend Schedule dataclass), block_size
+    and tile dimensions are included in the header.
+    """
     lines: list[str] = []
-    bx, by, bz = program.block_size
     params_str = ", ".join(f"{dt} {nm}" for dt, nm in program.params)
     lines.append(f"loop_program {program.name}({params_str}) {{")
-    lines.append(f"  block_size: ({bx}, {by}, {bz})")
+    if schedule is not None:
+        bx, by, bz = schedule.grid.block_size
+        lines.append(f"  block_size: ({bx}, {by}, {bz})")
     if program.smem_bytes:
         lines.append(f"  smem_bytes: {program.smem_bytes}")
-    if program.tile_m is not None:
-        lines.append(f"  tile: ({program.tile_m}, {program.tile_n})")
+    if schedule is not None and getattr(schedule, "tile_m", None) is not None:
+        lines.append(f"  tile: ({schedule.tile_m}, {schedule.tile_n})")
     lines.append("")
     for op in program.body:
         lines.extend(_pp_op(op, depth=1))
@@ -429,12 +439,14 @@ def _pp_op(op: LoopOp, depth: int) -> list[str]:
 
     if isinstance(op, Load):
         guard_str = f"  guard({_pp_expr(op.guard)})" if op.guard else ""
-        return [f"{pad}load {op.dst} = {op.src}[{_pp_expr(op.indices)}] ({op.space}){guard_str}"]
+        idx_str = ", ".join(_pp_expr(i) for i in op.indices)
+        return [f"{pad}load {op.dst} = {op.src}[{idx_str}] ({op.space}){guard_str}"]
 
     if isinstance(op, Store):
         guard_str = f"  guard({_pp_expr(op.guard)})" if op.guard else ""
         atomic_str = " atomic" if op.atomic else ""
-        return [f"{pad}store{atomic_str} {op.dst}[{_pp_expr(op.indices)}] = {_pp_expr(op.value)} ({op.space}){guard_str}"]
+        idx_str = ", ".join(_pp_expr(i) for i in op.indices)
+        return [f"{pad}store{atomic_str} {op.dst}[{idx_str}] = {_pp_expr(op.value)} ({op.space}){guard_str}"]
 
     if isinstance(op, AccumInit):
         return [f"{pad}accum_init {op.name} {op.op}"]
@@ -524,9 +536,15 @@ def _serialize(obj: object) -> object:
     return obj
 
 
-def to_dict(program: LoopProgram) -> dict:
+def to_dict(program: LoopProgram, schedule: object | None = None) -> dict:
     """JSON-serializable dict for dump-dir artifacts."""
     d = _serialize(program)
     # params are tuples serialized as lists; convert to list-of-dicts.
     d["params"] = [{"dtype": p[0], "name": p[1]} for p in program.params]
+    # Merge schedule metadata when available.
+    if schedule is not None:
+        d["block_size"] = list(schedule.grid.block_size)
+        if getattr(schedule, "tile_m", None) is not None:
+            d["tile_m"] = schedule.tile_m
+            d["tile_n"] = schedule.tile_n
     return d

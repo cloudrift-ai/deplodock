@@ -478,7 +478,7 @@ def _compile_single(op: OpKernel) -> CudaLaunch:
 
     # Lower → kernel.
     name = _unique_name(analysis.pattern or "fused_region")
-    kernel_def, loop_prog = lower_tiled(region, name, shapes, analysis, strategy=strategy, hints=hints if hints else {})
+    kernel_def, loop_prog, sched = lower_tiled(region, name, shapes, analysis, strategy=strategy, hints=hints if hints else {})
     source = emit_kernel(kernel_def)
 
     # Stash computed values for grid/args computation.
@@ -509,6 +509,7 @@ def _compile_single(op: OpKernel) -> CudaLaunch:
         tma_descriptors=tma_descs,
         zero_outputs=list(op.outputs) if k_splits > 1 else [],
         loop_ir=loop_prog,
+        schedule=sched,
     )
 
 

@@ -53,7 +53,7 @@ def generate_kernel(region: FusedRegionOp, name: str, shapes: dict[str, tuple]) 
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
 
     analysis = analyze(region, shapes)
-    kernel_def, _loop_prog = lower_tiled(region, name, shapes, analysis)
+    kernel_def, _loop_prog, _schedule = lower_tiled(region, name, shapes, analysis)
     return kernel_def
 
 
@@ -413,18 +413,18 @@ def lower_tiled(
     *,
     strategy: str = "naive",
     hints: dict | None = None,
-) -> tuple[KernelDef, object]:
+) -> tuple[KernelDef, object, object]:
     """Generate a KernelDef for a fused region based on its TileAnalysis.
 
     Routes through LoopIR: lower_to_loop_ir() → loop_ir_to_kernel().
-    Returns ``(kernel_def, loop_program)`` so callers can inspect or dump
-    the intermediate LoopIR.
+    Returns ``(kernel_def, loop_program, schedule)`` so callers can inspect
+    or dump the intermediate LoopIR and pass the Schedule downstream.
     """
     from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
     from deplodock.compiler.backend.cuda.generators.loop_lower import lower_to_loop_ir
 
-    loop_prog = lower_to_loop_ir(region, name, shapes, analysis, strategy=strategy, hints=hints or {})
-    return loop_ir_to_kernel(loop_prog), loop_prog
+    loop_prog, schedule = lower_to_loop_ir(region, name, shapes, analysis, strategy=strategy, hints=hints or {})
+    return loop_ir_to_kernel(loop_prog, schedule), loop_prog, schedule
 
 
 # ---------------------------------------------------------------------------

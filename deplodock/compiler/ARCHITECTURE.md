@@ -30,6 +30,9 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 │  backend/program.py: Buffer, Launch, Program                    │
 │  backend/kernel_ir.py:      Kernel AST (Expr, Stmt, KernelDef)        │
 │  backend/loop_ir.py: LoopIR (LoopProgram, LoopOp, LoopExpr)    │
+│    LoopProgram is purely structural (no backend metadata).     │
+│    Load/Store use multi-dim indices (list[LoopExpr]).           │
+│    Schedule flows alongside LoopProgram through codegen.       │
 │  backend/codegen.py: KernelDef → C source                       │
 │                                                                 │
 │  RULE: Describes WHAT to compute, not HOW.                      │
