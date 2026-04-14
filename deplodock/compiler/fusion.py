@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.ops import (
     FusedRegionOp,
-    ReshapeOp,
 )
 
 if TYPE_CHECKING:
@@ -90,7 +89,14 @@ def _is_fusible_op(op, node=None) -> bool:
 
     # TransposeOp is NOT fusible — it swaps dimensions, which the pointwise
     # codegen can't express.  It stays as a standalone copy kernel.
-    return isinstance(op, (ElementwiseOp, ReduceOp, ReshapeOp))
+    #
+    # ReshapeOp is NOT fusible — it changes the output shape, which breaks
+    # broadcasting semantics for other inputs in the region. For example,
+    # fusing `bias_add(x(1,8,3584), b(3584,)) → reshape(1,8,28,128)` would
+    # make the kernel compute bias[i % 128] instead of bias[i % 3584] because
+    # the pointwise codegen uses the fused region's output shape to derive
+    # per-input broadcast indices. Reshape always stays as a buffer alias.
+    return isinstance(op, (ElementwiseOp, ReduceOp))
 
 
 def _is_contraction_op(nid: str, graph) -> bool:
