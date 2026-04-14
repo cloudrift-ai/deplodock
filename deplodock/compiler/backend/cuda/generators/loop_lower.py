@@ -934,30 +934,72 @@ def _build_dim_strides(analysis: TileAnalysis, region: FusedRegionOp, schedule) 
     return strides
 
 
+def _broadcast_index_expr(
+    flat_idx: LoopExpr,
+    out_shape: tuple[int, ...],
+    inp_shape: tuple[int, ...],
+) -> LoopExpr:
+    """Compute input flat index from output flat index via broadcast mapping.
+
+    Decomposes the output flat index into multi-dim coordinates, maps each
+    coordinate through the input shape (clamping broadcast dims to 0), and
+    recomposes into the input flat index using input strides.
+
+    All shapes must be concrete ints.  The result is a single arithmetic
+    expression (no loops) that the CUDA compiler can optimize.
+    """
+    ndim = len(out_shape)
+    padded = (1,) * (ndim - len(inp_shape)) + inp_shape
+
+    # Compute row-major strides.
+    out_strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        out_strides[d] = out_strides[d + 1] * (out_shape[d + 1] if isinstance(out_shape[d + 1], int) else 1)
+
+    inp_strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        inp_strides[d] = inp_strides[d + 1] * (padded[d + 1] if isinstance(padded[d + 1], int) else 1)
+
+    result: LoopExpr = Literal(0, "int")
+    for d in range(ndim):
+        pd = padded[d]
+        if not isinstance(pd, int) or pd == 1:
+            continue  # broadcast dim — always index 0
+        # coord_d = (flat_idx / out_stride_d) % out_dim_d
+        coord: LoopExpr = flat_idx / out_strides[d] % out_shape[d]
+        result = result + coord * inp_strides[d]
+
+    return result
+
+
 def _input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> list[LoopExpr]:
     """Build per-dimension index expressions for reading an input tensor.
 
     Returns a list of index expressions, one per logical dimension:
     - scalar → []
-    - 1D (pointwise) → [i] or [i % size]
+    - 1D (pointwise) → [i] or broadcast index expr
     - row-vector → [j]
     - per-row → [row]
+    - broadcast → [broadcast_index_expr]
     - 2D → [row, j]
     """
     acc = analysis.input_access[inp]
     j = Var(idx_var)
+    out_shape = analysis.output_shape
 
     if analysis.pattern == "pointwise":
         if acc.is_scalar:
             return []
-        if acc.size < out_size:
-            return [Var("i") % acc.size]
+        if acc.is_broadcast or acc.size < out_size:
+            # Use stride-based multi-dim broadcast indexing.
+            return [_broadcast_index_expr(Var("i"), out_shape, acc.shape)]
         return [Var("i")]
 
     if acc.is_broadcast:
-        # Broadcast input: use modulo to wrap the flat index into the
-        # smaller input's element range.
-        return [Var("row") * Var("cols") + j % acc.size]
+        # Reduce pattern with broadcast input: build flat index from (row, j)
+        # and apply broadcast mapping.
+        flat_idx = Var("row") * Var("cols") + j
+        return [_broadcast_index_expr(flat_idx, out_shape, acc.shape)]
     if acc.is_2d:
         return [Var("row"), j]
     if acc.is_per_row:
