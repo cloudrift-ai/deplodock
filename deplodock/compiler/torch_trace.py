@@ -222,17 +222,28 @@ def _handle_call_function(
     # --- Linear (high-level matmul, not decomposed by torch.export) ---
     if op_name == "linear":
         # aten.linear(input, weight, bias=None)
-        # Decompose into Elementwise{mul} + Reduce{sum}.
+        # PyTorch linear computes x @ weight.T, so we transpose the weight first.
         inp_id = input_ids[0] if len(input_ids) > 0 else None
         w_id = input_ids[1] if len(input_ids) > 1 else None
         if inp_id is None or w_id is None:
             logger.warning("Could not resolve linear inputs for %s", name)
             return
 
+        # Transpose weight: (out_features, in_features) → (in_features, out_features)
+        w_shape = g.nodes[w_id].output.shape if w_id in g.nodes else ()
+        wt_shape = (w_shape[-1], w_shape[-2]) if len(w_shape) >= 2 else w_shape
+        wt_name = f"{name}_wt"
+        wt_id = g.add_node(
+            op=TransposeOp(axes=(-2, -1)),
+            inputs=[w_id],
+            output=Tensor(wt_name, wt_shape, dtype),
+            node_id=wt_name,
+        )
+
         ew_name = f"{name}_ew"
         ew_id = g.add_node(
             op=ElementwiseOp(fn="mul"),
-            inputs=[inp_id, w_id],
+            inputs=[inp_id, wt_id],
             output=Tensor(ew_name, shape + ("K",), dtype),
             node_id=ew_name,
         )
