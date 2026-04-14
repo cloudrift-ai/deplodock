@@ -9,10 +9,22 @@ from dataclasses import dataclass, field
 class Op:
     """Base class for all operations."""
 
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        """Derive the output shape from input shapes.
+
+        Override in subclasses with op-specific logic. Used by graph rewrites
+        (e.g. ``shape_utils.propagate_shapes``) to re-derive shapes after an
+        upstream rewrite changes its inputs.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.infer_output_shape not implemented")
+
 
 @dataclass
 class InputOp(Op):
     """Sentinel for graph input tensors (no computation)."""
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        raise NotImplementedError("InputOp has no inputs; use node.output.shape directly")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +65,16 @@ OP_REGISTRY: dict[str, OpInfo] = {
 _DEFAULT_OP_INFO = OpInfo(1)
 
 
+def _drop_axis(shape: tuple, axis: int | str) -> tuple:
+    """Return shape with the given axis removed (handles negative axes)."""
+    if not isinstance(axis, int):
+        return tuple(shape)  # symbolic axis — leave shape as-is
+    a = axis if axis >= 0 else len(shape) + axis
+    if a < 0 or a >= len(shape):
+        return tuple(shape)
+    return tuple(shape[:a]) + tuple(shape[a + 1 :])
+
+
 @dataclass
 class ElementwiseOp(Op):
     """Apply a scalar function independently to each element."""
@@ -62,6 +84,11 @@ class ElementwiseOp(Op):
     @property
     def info(self) -> OpInfo:
         return OP_REGISTRY.get(self.fn, _DEFAULT_OP_INFO)
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        from deplodock.compiler.shape_utils import broadcast_shapes
+
+        return broadcast_shapes(*input_shapes)
 
 
 @dataclass(frozen=True)
@@ -91,6 +118,9 @@ class ReduceOp(Op):
     def info(self) -> ReduceInfo:
         return REDUCE_REGISTRY.get(self.fn, _DEFAULT_REDUCE_INFO)
 
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return _drop_axis(input_shapes[0], self.axis)
+
 
 @dataclass
 class ScanOp(Op):
@@ -99,12 +129,20 @@ class ScanOp(Op):
     fn: str  # "sum", "max", "prod"
     axis: int | str
 
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(input_shapes[0])  # scan preserves shape
+
 
 @dataclass
 class GatherOp(Op):
     """Read elements from arbitrary positions along an axis."""
 
     axis: int | str
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        # Output shape = input shape with the gather axis sized by the index input.
+        # Conservative fallback: keep input shape (callers should pre-size if needed).
+        return tuple(input_shapes[0])
 
 
 @dataclass
@@ -113,6 +151,9 @@ class ScatterOp(Op):
 
     axis: int | str
     reduce_fn: str | None = None  # None = overwrite, "sum" = scatter-add
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(input_shapes[0])  # scatter preserves the destination shape
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +168,30 @@ class ConstantOp(Op):
     name: str
     value: float | None = None  # scalar value captured at trace time
 
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        raise NotImplementedError("ConstantOp has no inputs; use node.output.shape directly")
+
 
 @dataclass
 class TransposeOp(Op):
-    """Permute dimensions."""
+    """Permute dimensions.
+
+    ``axes`` either lists a full permutation (``len(axes) == ndim``) or
+    names two axes to swap (``len(axes) == 2``), matching torch's
+    ``permute``/``transpose`` overloads.
+    """
 
     axes: tuple[int, ...]
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        in_shape = input_shapes[0]
+        ndim = len(in_shape)
+        if len(self.axes) == ndim:
+            return tuple(in_shape[a] for a in self.axes)
+        a, b = self.axes[0] % ndim, self.axes[1] % ndim
+        out = list(in_shape)
+        out[a], out[b] = out[b], out[a]
+        return tuple(out)
 
 
 @dataclass
@@ -140,6 +199,9 @@ class ReshapeOp(Op):
     """Reshape tensor without changing data."""
 
     shape: tuple[int | str, ...]
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(self.shape)
 
 
 @dataclass
@@ -152,6 +214,9 @@ class SliceOp(Op):
 
     shape: tuple[int | str, ...]
 
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(self.shape)
+
 
 @dataclass
 class CatOp(Op):
@@ -160,6 +225,25 @@ class CatOp(Op):
     Inputs: [dim_const, tensor_1, tensor_2, ...] where dim_const
     is a scalar ConstantOp indicating the concat axis.
     """
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        # Tensor inputs are all but the trailing scalar dim-constant.
+        # Find them by skipping shape-(1,) inputs at the tail.
+        tensor_shapes = [s for s in input_shapes if len(s) > 1 or (len(s) == 1 and isinstance(s[0], int) and s[0] != 1)]
+        if not tensor_shapes:
+            return tuple(input_shapes[0])
+        # Cat along the last dim by default (matches CatOp tracer convention).
+        ndim = len(tensor_shapes[0])
+        out = list(tensor_shapes[0])
+        last = ndim - 1
+        total = 0
+        for s in tensor_shapes:
+            d = s[last]
+            if not isinstance(d, int):
+                return tuple(out)  # symbolic; bail out
+            total += d
+        out[last] = total
+        return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +257,11 @@ class LinearOp(Op):
 
     has_bias: bool = False
 
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        x_shape = input_shapes[0]
+        w_shape = input_shapes[1]  # (out_features, in_features)
+        return tuple(x_shape[:-1]) + (w_shape[-2],)
+
 
 @dataclass
 class MatmulOp(Op):
@@ -180,10 +269,22 @@ class MatmulOp(Op):
 
     has_bias: bool = False
 
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        a_shape = input_shapes[0]
+        b_shape = input_shapes[1]
+        # Standard matmul: A(..., M, K) @ B(..., K, N) → (..., M, N)
+        return tuple(a_shape[:-1]) + (b_shape[-1],)
+
 
 @dataclass
 class SdpaOp(Op):
     """PyTorch scaled_dot_product_attention(Q, K, V, ...)."""
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        # SDPA output mirrors Q's batch+heads+seq dims, with V's last (head_dim).
+        q_shape = input_shapes[0]
+        v_shape = input_shapes[2]
+        return tuple(q_shape[:-1]) + (v_shape[-1],)
 
 
 @dataclass
@@ -191,6 +292,12 @@ class UnsqueezeOp(Op):
     """PyTorch aten.unsqueeze: add a size-1 dimension."""
 
     dim: int = 0
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        in_shape = list(input_shapes[0])
+        d = self.dim if self.dim >= 0 else len(in_shape) + 1 + self.dim
+        in_shape.insert(d, 1)
+        return tuple(in_shape)
 
 
 @dataclass
@@ -202,6 +309,9 @@ class MeanOp(Op):
     """
 
     axis: int | str = -1
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return _drop_axis(input_shapes[0], self.axis)
 
 
 # ---------------------------------------------------------------------------
@@ -223,3 +333,9 @@ class FusedRegionOp(Op):
     output_names: list  # external outputs from this region
     kernel_source: str = ""  # generated CUDA source (filled by cuda/kernel_gen)
     shapes: dict = field(default_factory=dict)  # node_id → shape for all region nodes + inputs
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        # Region's primary output shape is precomputed during fusion.
+        if self.output_names and self.shapes:
+            return tuple(self.shapes.get(self.output_names[0], ()))
+        return ()

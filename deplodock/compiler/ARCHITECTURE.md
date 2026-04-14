@@ -131,15 +131,17 @@ result = backend.run(program)
 
 ```
 compiler/
-├── ops.py            # [L1] Op base class + all op types
+├── ops.py            # [L1] Op base class + all op types (each implements infer_output_shape)
 ├── ir.py             # [L1] Tensor, Node, Graph (with Hints on Node + Graph)
 ├── hints.py          # [L1] Hints metadata bag + resolve_hints()
+├── shape_utils.py    # [L1] Shared shape utilities: broadcast_shapes, propagate_shapes
 ├── torch_trace.py    # [L1] PyTorch → Graph IR (optional torch dep)
 ├── pattern.py        # [L2] Pattern AST + text parser
 ├── matcher.py        # [L2] Graph pattern matching engine
-├── rewriter.py       # [L2] Pass/Rule/Rewriter
-├── rules/            # [L2] Ordered rule files by pass
-│   ├── decomposition/ #     Decompose high-level ops → primitives
+├── rewriter.py       # [L2] Pass/Rule/Rewriter (DEFAULT_PASS_ORDER drives ordering)
+├── rules/            # [L2] Pass directories — each is loaded explicitly via DEFAULT_PASS_ORDER
+│   ├── decomposition/ #     Decompose high-level ops → primitives (runs first)
+│   ├── optimization/  #     Canonicalize primitive IR (runs after decomposition)
 │   └── fusion/       #      (empty — auto_fuse handles all fusion)
 ├── fusion.py         # [L2] auto_fuse: automatic fusion region discovery
 ├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan, plan_graph
@@ -205,7 +207,11 @@ class ExecutionPlan:
 
 ## Graph Transformation (Layer 2)
 
-Three stages:
+Four stages, run in order: **decomposition → optimization → fusion → auto-fuse**.
+
+Pass ordering is explicit, controlled by `DEFAULT_PASS_ORDER` in `rewriter.py`. Within each pass, rule files are loaded alphabetically by filename (`001_*.py`, `002_*.py`, ...). Adding a new pass requires both creating its rule directory and adding its name to `DEFAULT_PASS_ORDER`.
+
+Each `Op` subclass implements `infer_output_shape(input_shapes)`, used by graph rewrites to re-derive shapes after upstream changes (`shape_utils.propagate_shapes`).
 
 ### 1. Decomposition (rules/decomposition/)
 
@@ -227,7 +233,25 @@ decomposes or normalizes — even compound ops like `Linear`, `Sdpa`, `Mean`,
 `UnsqueezeOp`). All lowering to primitives happens here in rewrite passes,
 so the tracer stays small and the decomposition lives in one place.
 
-### 2. Auto-fusion (fusion.py)
+### 2. Optimization (rules/optimization/)
+
+Canonicalizes the primitive IR after decomposition. Operating on
+primitives instead of high-level ops means one set of rules works
+regardless of how the original op was expressed (e.g. `SdpaOp` vs
+hand-rolled QK^T+softmax+V).
+
+| Rule | Pattern | Action |
+|------|---------|--------|
+| `001_eliminate_trivial_unsqueeze` | `Reshape($x)` whose new shape is `x.shape` left-padded with 1's | Drop the reshape (rewire consumers to `x`); use `propagate_shapes` to re-derive downstream output shapes. |
+| `002_eliminate_identity_transpose` | `Transpose($x)` where one swapped dim has size 1 | Replace with `Reshape` (becomes a free buffer alias instead of a copy kernel). |
+
+Rule conventions:
+- Return the same `Graph` object for ineligible matches — `Pass.apply`
+  treats identity-preserving returns as no-ops, so the fixed-point loop
+  doesn't spin on patterns that match more nodes than they can act on.
+- Eligible rewrites must `g = graph.copy()` and return the new graph.
+
+### 3. Auto-fusion (fusion.py)
 
 `auto_fuse(graph)` discovers fusion regions from intermediate tensor sizes:
 - Scores each single-consumer edge by `product(intermediate_shape)`

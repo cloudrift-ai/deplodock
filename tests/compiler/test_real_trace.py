@@ -34,6 +34,36 @@ def _load_rewriter() -> Rewriter:
 # ---- Structure tests (no compilation) ----
 
 
+def test_qwen_rotary_collapses_to_4d_after_optimization():
+    """Optimization pass eliminates the spurious leading 1-dim from rotary muls/adds.
+
+    Qwen2's apply_rotary_pos_emb adds a redundant ``cos.unsqueeze(1)`` dim;
+    the post-decomposition optimization pass collapses it. The rotary
+    elementwise nodes (mul_2/3/4/5 and add_1/2) should be 4D, not 5D.
+    """
+    g = _load_fixture("qwen25_7b_layer0.json")
+    g_opt = _load_rewriter().apply(g)
+    rotary_nids = ["mul_2", "mul_3", "mul_4", "mul_5", "add_1", "add_2"]
+    for nid in rotary_nids:
+        assert nid in g_opt.nodes, f"missing {nid} after optimization"
+        rank = len(g_opt.nodes[nid].output.shape)
+        assert rank == 4, f"{nid} should be 4D after optimization, got rank {rank}: {g_opt.nodes[nid].output.shape}"
+
+
+def test_qwen_post_sdpa_transpose_eliminated():
+    """The (1,1,28,8,128)->(1,28,1,8,128) transpose with size-1 swap dim
+    should be lowered to a Reshape (free buffer alias)."""
+    from deplodock.compiler.ops import ReshapeOp, TransposeOp
+
+    g = _load_fixture("qwen25_7b_layer0.json")
+    g_opt = _load_rewriter().apply(g)
+    # transpose_3 was the original TransposeOp on the 5D SDPA output.
+    if "transpose_3" in g_opt.nodes:
+        op = g_opt.nodes["transpose_3"].op
+        assert not isinstance(op, TransposeOp), "transpose_3 should be lowered to Reshape"
+        assert isinstance(op, ReshapeOp), f"expected ReshapeOp, got {type(op).__name__}"
+
+
 def test_tinyllama_fixture_loads():
     """The TinyLlama layer0 fixture loads as a valid graph."""
     g = _load_fixture("tinyllama_layer0.json")
