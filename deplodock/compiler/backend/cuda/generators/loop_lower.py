@@ -86,14 +86,7 @@ def lower_generic(
         name=name,
         params=params,
         body=body,
-        block_size=schedule.grid.block_size,
-        tile_m=schedule.tile_m,
-        tile_n=schedule.tile_n,
-        grid_2d=schedule.grid.type == "2d_standard",
-        tma_params=schedule.tma_params,
-        tma_config=schedule.tma_config,
-        batched=schedule.is_batched,
-        includes=schedule.includes,
+        dim_strides=_build_dim_strides(analysis, region, schedule),
     )
 
 
@@ -209,16 +202,16 @@ def _emit_pointwise_body(
     guard_body: list = []
     var_map: dict[str, LoopExpr] = {}
     for inp in region.input_names:
-        idx = _input_loop_expr(inp, analysis, "i", out_size)
+        indices = _input_indices(inp, analysis, "i", out_size)
         load_name = f"v_{_safe(inp)}"
-        guard_body.append(Load(load_name, _safe(inp), idx, "global"))
+        guard_body.append(Load(load_name, _safe(inp), indices, "global"))
         var_map[inp] = Var(load_name)
 
     _emit_loop_ops(region.region_ops, var_map, "v_", guard_body)
 
     for out_id in region.output_names:
         val = var_map.get(out_id, Literal(0.0))
-        guard_body.append(Store(_safe(out_id), Var("i"), val, "global"))
+        guard_body.append(Store(_safe(out_id), [Var("i")], val, "global"))
 
     return [Guard(Var("i").lt(Var("n")), guard_body)]
 
@@ -251,9 +244,9 @@ def _emit_scalar_reductions(
 
         pass_var_map: dict[str, LoopExpr] = {}
         for inp in region.input_names:
-            idx = _input_loop_expr(inp, analysis, "j", out_size)
+            indices = _input_indices(inp, analysis, "j", out_size)
             load_name = f"r{ri}ld_{_safe(inp)}"
-            pass_body.append(Load(load_name, _safe(inp), idx, "global"))
+            pass_body.append(Load(load_name, _safe(inp), indices, "global"))
             pass_var_map[inp] = Var(load_name)
 
         for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
@@ -302,11 +295,11 @@ def _emit_contraction_k_loop(
     k_body: list = []
     for c in range(thread_n):
         col = bn + tc + c
-        k_body.append(Load(f"b{c}", b_src, k * N + col, "global", guard=col.lt(N)))
+        k_body.append(Load(f"b{c}", b_src, [k, col], "global", guard=col.lt(N)))
 
     for r in range(thread_m):
         row = bm + tr + r
-        k_body.append(Load(f"a{r}", a_src, row * K + k, "global", guard=row.lt(M)))
+        k_body.append(Load(f"a{r}", a_src, [row, k], "global", guard=row.lt(M)))
         for c in range(thread_n):
             k_body.append(Accum(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
 
@@ -427,9 +420,9 @@ def _emit_scalar_epilogue(
         epi_var_map: dict[str, LoopExpr] = dict(var_map)
 
         for inp in region.input_names:
-            idx = _input_loop_expr(inp, analysis, "j", out_size)
+            indices = _input_indices(inp, analysis, "j", out_size)
             load_name = f"epld_{_safe(inp)}"
-            epi_body.append(Load(load_name, _safe(inp), idx, "global"))
+            epi_body.append(Load(load_name, _safe(inp), indices, "global"))
             epi_var_map[inp] = Var(load_name)
 
         # Re-compute prologue + inter_reduce ops
@@ -448,8 +441,7 @@ def _emit_scalar_epilogue(
 
         for out_id in region.output_names:
             val = epi_var_map.get(out_id, Literal(0.0))
-            idx = Var("row") * Var("cols") + Var("j")
-            epi_body.append(Store(_safe(out_id), idx, val, "global"))
+            epi_body.append(Store(_safe(out_id), [Var("row"), Var("j")], val, "global"))
 
         return [LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), epi_body)]
 
@@ -507,7 +499,7 @@ def _emit_write(
             ops.append(
                 Guard(
                     Builtin("threadIdx.x").eq(Literal(0, "int")),
-                    [Store(_safe(out_id), Var("row"), val, "global")],
+                    [Store(_safe(out_id), [Var("row")], val, "global")],
                 )
             )
         return ops
@@ -523,7 +515,7 @@ def _emit_write(
             ops.append(
                 Guard(
                     Builtin("threadIdx.x").eq(Literal(0, "int")),
-                    [Store(_safe(out_id), Var("row"), val, "global")],
+                    [Store(_safe(out_id), [Var("row")], val, "global")],
                 )
             )
         return ops
@@ -535,14 +527,14 @@ def _emit_write(
         ops.append(
             Guard(
                 Builtin("threadIdx.x").eq(Literal(0, "int")),
-                [Store(_safe(out_id), Var("row"), val, "global")],
+                [Store(_safe(out_id), [Var("row")], val, "global")],
             )
         )
     return ops
 
 
 # ---------------------------------------------------------------------------
-# Legacy dispatch (kept for backward compat during transition)
+# Convenience entry point: build_schedule + lower_generic in one call
 # ---------------------------------------------------------------------------
 
 
@@ -554,12 +546,16 @@ def lower_to_loop_ir(
     *,
     strategy: str = "naive",
     hints: dict | None = None,
-) -> LoopProgram:
-    """Lower a FusedRegionOp to LoopIR via ``build_schedule()`` + ``lower_generic()``."""
+) -> tuple[LoopProgram, object]:
+    """Lower a FusedRegionOp to LoopIR via ``build_schedule()`` + ``lower_generic()``.
+
+    Returns ``(loop_program, schedule)`` so callers can pass the Schedule
+    through to ``loop_ir_to_kernel()``.
+    """
     from deplodock.compiler.backend.cuda.schedule import build_schedule
 
     schedule = build_schedule(analysis, strategy, hints or {})
-    return lower_generic(region, name, shapes, analysis, schedule)
+    return lower_generic(region, name, shapes, analysis, schedule), schedule
 
 
 # ---------------------------------------------------------------------------
@@ -572,25 +568,73 @@ def _safe(name: str) -> str:
     return name.replace("-", "_").replace(".", "_").replace(" ", "_")
 
 
-def _input_loop_expr(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> LoopExpr:
-    """Build the index expression for reading an input tensor."""
+def _build_dim_strides(analysis: TileAnalysis, region: FusedRegionOp, schedule) -> dict[str, list[str]]:
+    """Build per-buffer stride variable names for multi-dim index flattening.
+
+    Contraction buffers use M/N/K strides.  Reduction buffers use "cols".
+    Pointwise buffers use a single flat index (no strides needed).
+    """
+    strides: dict[str, list[str]] = {}
+
+    if analysis.pattern == "contraction" and analysis.contraction_a:
+        a = _safe(analysis.contraction_a)
+        b = _safe(analysis.contraction_b)
+        strides[a] = ["K"]
+        strides[b] = ["N"]
+        # Batched pointer aliases
+        strides["Ab"] = ["K"]
+        strides["Bb"] = ["N"]
+        for out_id in region.output_names:
+            if schedule.is_batched:
+                strides[_safe(out_id)] = ["M * N", "N"]
+            else:
+                strides[_safe(out_id)] = ["N"]
+        # Epilogue external inputs: use N for 2D, nothing for 1D/scalar
+        for inp in region.input_names:
+            safe = _safe(inp)
+            if safe not in strides:
+                acc = analysis.input_access.get(inp)
+                if acc and acc.is_2d:
+                    strides[safe] = ["N"]
+    elif analysis.pattern in ("row_reduce", "reduce_broadcast", "multi_reduce"):
+        # All 2D buffers use "cols" stride
+        for inp in region.input_names:
+            acc = analysis.input_access.get(inp)
+            if acc and acc.is_2d:
+                strides[_safe(inp)] = ["cols"]
+        for out_id in region.output_names:
+            strides[_safe(out_id)] = ["cols"]
+
+    return strides
+
+
+def _input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> list[LoopExpr]:
+    """Build per-dimension index expressions for reading an input tensor.
+
+    Returns a list of index expressions, one per logical dimension:
+    - scalar → []
+    - 1D (pointwise) → [i] or [i % size]
+    - row-vector → [j]
+    - per-row → [row]
+    - 2D → [row, j]
+    """
     acc = analysis.input_access[inp]
-    row, cols, j = Var("row"), Var("cols"), Var(idx_var)
+    j = Var(idx_var)
 
     if analysis.pattern == "pointwise":
         if acc.is_scalar:
-            return Literal(0, "int")
+            return []
         if acc.size < out_size:
-            return Var("i") % acc.size
-        return Var("i")
+            return [Var("i") % acc.size]
+        return [Var("i")]
 
     if acc.is_2d:
-        return row * cols + j
+        return [Var("row"), j]
     if acc.is_per_row:
-        return row
+        return [Var("row")]
     if acc.is_row_vector:
-        return j
-    return Literal(0, "int")
+        return [j]
+    return []
 
 
 def _emit_loop_ops(
@@ -631,315 +675,6 @@ def _build_params(region: FusedRegionOp) -> list[tuple[str, str]]:
     for out in region.output_names:
         params.append(("float* __restrict__", _safe(out)))
     return params
-
-
-# ---------------------------------------------------------------------------
-# Pointwise
-# ---------------------------------------------------------------------------
-
-
-def _lower_pointwise(
-    region: FusedRegionOp,
-    name: str,
-    shapes: dict[str, tuple],
-    analysis: TileAnalysis,
-) -> LoopProgram:
-    out_shape = shapes.get(region.output_names[0], (1,))
-    out_size = math.prod(d for d in out_shape if isinstance(d, int))
-
-    # Params
-    params = _build_params(region)
-    params.append(("int", "n"))
-
-    # Body
-    body: list = []
-    body.append(ParallelAxis("i", "blockIdx.x", "n"))
-
-    # Guard: if (i >= n) return
-    guard_body: list = []
-
-    # Build var_map with input loads
-    var_map: dict[str, LoopExpr] = {}
-    for inp in region.input_names:
-        idx = _input_loop_expr(inp, analysis, "i", out_size)
-        load_name = f"v_{_safe(inp)}"
-        guard_body.append(Load(load_name, _safe(inp), idx, "global"))
-        var_map[inp] = Var(load_name)
-
-    # Emit all ops
-    _emit_loop_ops(region.region_ops, var_map, "v_", guard_body)
-
-    # Store outputs
-    for out_id in region.output_names:
-        val = var_map.get(out_id, Literal(0.0))
-        guard_body.append(Store(_safe(out_id), Var("i"), val, "global"))
-
-    body.append(Guard(Var("i").lt(Var("n")), guard_body))
-
-    return LoopProgram(
-        name=name,
-        params=params,
-        body=body,
-        block_size=(256, 1, 1),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Single reduce (row_reduce without multi-reduce)
-# ---------------------------------------------------------------------------
-
-
-def _lower_single_reduce(
-    region: FusedRegionOp,
-    name: str,
-    shapes: dict[str, tuple],
-    analysis: TileAnalysis,
-) -> LoopProgram:
-    phases = analysis.op_phases
-    out_shape = shapes.get(region.output_names[0], (1,))
-    out_size = math.prod(d for d in out_shape if isinstance(d, int))
-
-    # Params
-    params = _build_params(region)
-    params.append(("int", "rows"))
-    params.append(("int", "cols"))
-
-    body: list = []
-
-    # Parallel over rows
-    body.append(ParallelAxis("row", "blockIdx.x", "rows"))
-
-    # Guard: if (row >= rows) return
-    guarded: list = []
-
-    # Accumulator declarations
-    reduce_vars: dict[str, tuple[str, str]] = {}
-    for node_id, op, _ in phases.reduces:
-        acc_name = f"acc_{_safe(node_id)}"
-        guarded.append(AccumInit(acc_name, op.fn))
-        reduce_vars[node_id] = (acc_name, op.fn)
-
-    # Build var_map for inputs
-    var_map: dict[str, LoopExpr] = {}
-    for inp in region.input_names:
-        var_map[inp] = Var(inp)  # placeholder, actual load inside loop
-
-    # Tile loop over columns
-    loop_body: list = []
-
-    # Load inputs inside loop
-    input_loads: dict[str, str] = {}
-    for inp in region.input_names:
-        idx = _input_loop_expr(inp, analysis, "j", out_size)
-        load_name = f"ld_{_safe(inp)}"
-        loop_body.append(Load(load_name, _safe(inp), idx, "global"))
-        var_map[inp] = Var(load_name)
-        input_loads[inp] = load_name
-
-    # Prologue ops
-    _emit_loop_ops(phases.prologue, var_map, "p_", loop_body)
-
-    # Accumulation
-    for node_id, _op, input_ids in phases.reduces:
-        acc_name, fn = reduce_vars[node_id]
-        val = var_map.get(input_ids[0], Literal(0.0))
-        loop_body.append(Accum(acc_name, fn, val))
-
-    guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), loop_body))
-
-    # Warp reduce
-    for node_id, (acc_name, fn) in reduce_vars.items():
-        guarded.append(ShuffleReduce(acc_name, fn))
-        var_map[node_id] = Var(acc_name)
-
-    # Epilogue
-    epilogue_ops = phases.epilogue
-    if epilogue_ops:
-        if analysis.epilogue_needs_per_element:
-            # Second per-element pass
-            epi_body: list = []
-            epi_var_map: dict[str, LoopExpr] = dict(var_map)
-            for inp in region.input_names:
-                idx = _input_loop_expr(inp, analysis, "j", out_size)
-                load_name = f"eld_{_safe(inp)}"
-                epi_body.append(Load(load_name, _safe(inp), idx, "global"))
-                epi_var_map[inp] = Var(load_name)
-
-            # Re-compute prologue ops needed by epilogue
-            needed = _needed_by(epilogue_ops)
-            for node_id, op, input_ids in phases.prologue:
-                if isinstance(op, ElementwiseOp) and node_id in needed:
-                    a = epi_var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
-                    b = epi_var_map.get(input_ids[1], Literal(0.0)) if len(input_ids) > 1 else Literal(0.0)
-                    var_name = f"p_{_safe(node_id)}"
-                    epi_body.append(Let(var_name, OpCall(op.fn, [a] if len(input_ids) == 1 else [a, b])))
-                    epi_var_map[node_id] = Var(var_name)
-
-            _emit_loop_ops(epilogue_ops, epi_var_map, "e_", epi_body)
-
-            for out_id in region.output_names:
-                val = epi_var_map.get(out_id, Literal(0.0))
-                idx = Var("row") * Var("cols") + Var("j")
-                epi_body.append(Store(_safe(out_id), idx, val, "global"))
-
-            guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), epi_body))
-        else:
-            # Scalar epilogue (thread 0 only)
-            _emit_loop_ops(epilogue_ops, var_map, "e_", guarded)
-            for out_id in region.output_names:
-                val = var_map.get(out_id, Literal(0.0))
-                guarded.append(
-                    Guard(
-                        Builtin("threadIdx.x").eq(Literal(0, "int")),
-                        [Store(_safe(out_id), Var("row"), val, "global")],
-                    )
-                )
-    else:
-        # No epilogue — write last reduce result (thread 0 only)
-        for out_id in region.output_names:
-            val = var_map.get(out_id, Literal(0.0))
-            guarded.append(
-                Guard(
-                    Builtin("threadIdx.x").eq(Literal(0, "int")),
-                    [Store(_safe(out_id), Var("row"), val, "global")],
-                )
-            )
-
-    body.append(Guard(Var("row").lt(Var("rows")), guarded))
-
-    return LoopProgram(
-        name=name,
-        params=params,
-        body=body,
-        block_size=(256, 1, 1),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Multi-reduce (softmax, etc.)
-# ---------------------------------------------------------------------------
-
-
-def _lower_multi_reduce(
-    region: FusedRegionOp,
-    name: str,
-    shapes: dict[str, tuple],
-    analysis: TileAnalysis,
-) -> LoopProgram:
-    phases = analysis.op_phases
-    out_shape = shapes.get(region.output_names[0], (1,))
-    out_size = math.prod(d for d in out_shape if isinstance(d, int))
-
-    # Params
-    params = _build_params(region)
-    params.append(("int", "rows"))
-    params.append(("int", "cols"))
-
-    body: list = []
-    body.append(ParallelAxis("row", "blockIdx.x", "rows"))
-
-    guarded: list = []
-
-    # Accumulator declarations
-    reduce_vars: dict[str, tuple[str, str]] = {}
-    for node_id, op, _ in phases.reduces:
-        acc_name = f"acc_{_safe(node_id)}"
-        guarded.append(AccumInit(acc_name, op.fn))
-        reduce_vars[node_id] = (acc_name, op.fn)
-
-    var_map: dict[str, LoopExpr] = {}
-
-    # One tile loop per reduce pass
-    for ri, (node_id, _op, input_ids) in enumerate(phases.reduces):
-        acc_name, fn = reduce_vars[node_id]
-        pass_body: list = []
-
-        # Re-map inputs for this pass
-        pass_var_map: dict[str, LoopExpr] = {}
-        for inp in region.input_names:
-            idx = _input_loop_expr(inp, analysis, "j", out_size)
-            load_name = f"r{ri}ld_{_safe(inp)}"
-            pass_body.append(Load(load_name, _safe(inp), idx, "global"))
-            pass_var_map[inp] = Var(load_name)
-
-        # Previous reduce results are available as accumulators
-        for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
-            pass_var_map[prev_nid] = Var(prev_acc)
-
-        # Re-compute prologue ops needed by this reduce or inter_reduce ops
-        all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
-        needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
-        for pid, pop, pinp in phases.prologue:
-            if isinstance(pop, ElementwiseOp) and pid in needed:
-                a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
-                b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
-                var_name = f"r{ri}p_{_safe(pid)}"
-                pass_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                pass_var_map[pid] = Var(var_name)
-
-        # Apply inter_reduce ops (e.g. sub, exp between max and sum)
-        if ri > 0 and phases.inter_reduce:
-            _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body)
-
-        # Accumulate
-        val = pass_var_map.get(input_ids[0], Literal(0.0))
-        pass_body.append(Accum(acc_name, fn, val))
-
-        guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), pass_body))
-
-        # Warp shuffle after each pass
-        guarded.append(ShuffleReduce(acc_name, fn))
-        var_map[node_id] = Var(acc_name)
-
-    # Final epilogue pass
-    epilogue_ops = phases.epilogue
-    if epilogue_ops or analysis.epilogue_needs_per_element:
-        epi_body: list = []
-        epi_var_map: dict[str, LoopExpr] = dict(var_map)
-
-        for inp in region.input_names:
-            idx = _input_loop_expr(inp, analysis, "j", out_size)
-            load_name = f"epld_{_safe(inp)}"
-            epi_body.append(Load(load_name, _safe(inp), idx, "global"))
-            epi_var_map[inp] = Var(load_name)
-
-        # Re-compute ALL prologue + inter_reduce ops
-        all_inter_ops = [op for group in phases.inter_reduce for op in group]
-        for pid, pop, pinp in phases.prologue + all_inter_ops:
-            if isinstance(pop, ElementwiseOp):
-                a = epi_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
-                b = epi_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
-                var_name = f"ep_{_safe(pid)}"
-                epi_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                epi_var_map[pid] = Var(var_name)
-
-        _emit_loop_ops(epilogue_ops, epi_var_map, "e_", epi_body)
-
-        for out_id in region.output_names:
-            val = epi_var_map.get(out_id, Literal(0.0))
-            idx = Var("row") * Var("cols") + Var("j")
-            epi_body.append(Store(_safe(out_id), idx, val, "global"))
-
-        guarded.append(LoopNest("j", Builtin("threadIdx.x"), Var("cols"), Builtin("blockDim.x"), epi_body))
-    else:
-        # No epilogue — write last reduce result (thread 0 only)
-        for out_id in region.output_names:
-            val = var_map.get(out_id, Literal(0.0))
-            guarded.append(
-                Guard(
-                    Builtin("threadIdx.x").eq(Literal(0, "int")),
-                    [Store(_safe(out_id), Var("row"), val, "global")],
-                )
-            )
-
-    body.append(Guard(Var("row").lt(Var("rows")), guarded))
-
-    return LoopProgram(
-        name=name,
-        params=params,
-        body=body,
-        block_size=(256, 1, 1),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1129,15 +864,15 @@ def _apply_ops_on_register_tile(
                     other_shape = shapes.get(other, ())
                     other_size = math.prod(d for d in other_shape if isinstance(d, int))
                     if other_size <= 1:
-                        idx = Literal(0, "int")
+                        indices: list = []
                     elif len(other_shape) <= 1:
-                        idx = Var("bn") + Var("tc") + c
+                        indices = [Var("bn") + Var("tc") + c]
                     else:
                         row_e = Var("bm") + Var("tr") + r
                         col_e = Var("bn") + Var("tc") + c
-                        idx = row_e * Var("N") + col_e
+                        indices = [row_e, col_e]
                     ld_name = f"_{prefix}_{safe}_{r}_{c}"
-                    ops.append(Load(ld_name, safe, idx, "global"))
+                    ops.append(Load(ld_name, safe, indices, "global"))
                     if inputs[0] == prev_id:
                         ops.append(SetVar(dst, OpCall(fn, [acc, Var(ld_name)])))
                     else:
@@ -1188,10 +923,10 @@ def _contraction_write_ops(
         for c_idx in range(thread_n):
             col = cb + c_idx
             if is_batched:
-                idx = Var("batch") * (M * N) + row * N + col
+                indices = [Var("batch"), row, col]
             else:
-                idx = row * N + col
-            row_body.append(Store(output, idx, RegAccess("c", [r, c_idx]), "global", guard=col.lt(N), atomic=k_splits > 1))
+                indices = [row, col]
+            row_body.append(Store(output, indices, RegAccess("c", [r, c_idx]), "global", guard=col.lt(N), atomic=k_splits > 1))
         ops.append(Guard(row.lt(M), row_body))
 
     return ops

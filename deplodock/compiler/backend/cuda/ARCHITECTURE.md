@@ -32,8 +32,14 @@ matching.
 ```
 FusedRegionOp → analyze() → TileAnalysis ──→ build_schedule() → Schedule
                                                                      ↓
-                         CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel() ← lower_generic()
+                         CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel(LoopProgram, Schedule)
+                                                                                          ↑
+                                                                              lower_generic() → LoopProgram
 ```
+
+LoopProgram is purely structural (name, params, body, dim_strides).  Backend
+metadata (block_size, tile dims, TMA config, batching, includes) lives on the
+Schedule and is read by ``loop_ir_to_kernel()`` when building the KernelDef.
 
 **Schedule** (`schedule.py`) contains: `GridSpec` (1d/2d_swizzle/2d_standard),
 `AccumulatorSpec` (None/scalar/register-tile), `ReductionSpec` (loop params +
@@ -44,8 +50,8 @@ warp_reduce flag), plus tile dims, k_splits, load strategy, and batching.
 `Accumulate`/`WarpReduce`, `Guard`, `RegAccess`, `RawLoopOp`.
 
 Pointwise, row-reduce, multi-reduce, and naive contraction are fully expressed
-in LoopIR via `lower_generic()`. TMA and smem contraction strategies use legacy
-escape hatches (RawLoopOp) for inline asm and float4 fast paths.
+in LoopIR via `lower_generic()`. TMA and smem contraction strategies use
+`SmemPipelineKLoop` (expanded to LoopIR or rendered as inline PTX by codegen).
 
 ## SGEMM Strategies (generators/tiled.py)
 
