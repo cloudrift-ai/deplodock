@@ -400,8 +400,9 @@ def _emit_contraction_k_loop(
     bn, tc, bm, tr = Var("bn"), Var("tc"), Var("bm"), Var("tr")
     k, K, N, M = Var("k"), Var("K"), Var("N"), Var("M")  # noqa: N806
 
-    a_imap = analysis.port_indexmaps.get(analysis.contraction_a)
-    b_imap = analysis.port_indexmaps.get(analysis.contraction_b)
+    port_imaps = region.port_indexmaps()
+    a_imap = port_imaps.get(analysis.contraction_a)
+    b_imap = port_imaps.get(analysis.contraction_b)
 
     def _apply_indexmap(indices: list, imap) -> list:
         if imap is None or not imap.sources:
@@ -1065,7 +1066,7 @@ def _input_indices(
     transpose-into-matmul / slice-into-matmul load directly.
     """
     natural = _natural_input_indices(inp, region, shapes, analysis, idx_var, out_size)
-    indexmap = analysis.port_indexmaps.get(inp)
+    indexmap = region.port_indexmaps().get(inp)
     if indexmap is None or not indexmap.sources:
         return natural
     from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute

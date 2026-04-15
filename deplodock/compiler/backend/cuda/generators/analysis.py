@@ -7,7 +7,7 @@ reduce_broadcast, or contraction.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from deplodock.compiler.ops import KernelOp
 
@@ -42,10 +42,6 @@ class TileAnalysis:
     # 1 means both operands use the same batch index (no broadcast).
     a_batch_group: int = 1
     b_batch_group: int = 1
-    # Per-input indexmaps carried on Port.indexmap. When set, the load path
-    # substitutes the placeholder coord_map with the kernel's runtime
-    # indices to build the actual input address (transpose-into-matmul).
-    port_indexmaps: dict = field(default_factory=dict)
 
 
 def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
@@ -73,5 +69,4 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
         batch_size=cinfo.batch_size if cinfo is not None else 1,
         a_batch_group=cinfo.a_batch_group if cinfo is not None else 1,
         b_batch_group=cinfo.b_batch_group if cinfo is not None else 1,
-        port_indexmaps=region.port_indexmaps(),
     )
