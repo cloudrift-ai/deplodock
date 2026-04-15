@@ -4,7 +4,6 @@ Fires after 020_seed_contraction so matmul sums are claimed first. The
 reduce Node moves into a ReduceStage; no upstream elementwise absorption
 yet (that's handled by 060_absorb_prologue).
 
-Not yet wired into DEFAULT_PASS_ORDER.
 """
 
 from __future__ import annotations

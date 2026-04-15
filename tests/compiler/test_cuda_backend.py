@@ -23,7 +23,7 @@ _backend = CudaBackend()
 
 def _load_and_compile_fixture() -> Graph:
     """Load TinyLlama fixture and run decomposition + auto_fuse."""
-    from deplodock.compiler.fusion import auto_fuse
+    from tests.compiler._fusion_helper import auto_fuse
 
     with open(FIXTURE_DIR / "tinyllama_layer0.json") as f:
         g = Graph.from_dict(json.load(f))

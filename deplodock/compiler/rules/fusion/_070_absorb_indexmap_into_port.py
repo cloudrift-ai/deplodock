@@ -8,7 +8,6 @@ This enables transpose-into-matmul: an upstream TransposeOp decomposes
 to an IndexMapOp, this rule moves it onto Port.indexmap, and codegen
 substitutes coords during A/B loads.
 
-Not yet wired into DEFAULT_PASS_ORDER.
 """
 
 from __future__ import annotations

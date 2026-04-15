@@ -5,11 +5,7 @@ a single KernelOp node with ContractionCore. The mul and sum Nodes move
 out of the outer graph into ContractionCore.mul / .reduce (structural
 ownership).
 
-This is the rule-based replacement for what greedy auto_fuse + the old
-001_structure_contraction previously did in two steps. Validates ≥2D
-matching-K shapes before firing.
-
-Not yet wired into DEFAULT_PASS_ORDER — unit-test only.
+Validates ≥2D matching-K shapes before firing.
 """
 
 from __future__ import annotations

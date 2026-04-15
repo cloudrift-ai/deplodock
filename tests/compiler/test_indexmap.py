@@ -203,8 +203,8 @@ def test_indexmap_infer_output_shape_returns_out_shape():
 
 def _compile_and_run_with_data(graph, input_data):
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.plan import plan_graph
+    from tests.compiler._fusion_helper import auto_fuse
 
     fused = auto_fuse(graph)
     plan = plan_graph(fused)
@@ -342,10 +342,10 @@ def test_indexmap_cat_matches_torch():
 def test_indexmap_identity_alias_no_kernel():
     """An identity IndexMap should produce a buffer alias (zero kernels)."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.ir import Graph, Tensor
     from deplodock.compiler.ops import InputOp
     from deplodock.compiler.plan import plan_graph
+    from tests.compiler._fusion_helper import auto_fuse
 
     g = Graph()
     x_id = g.add_node(InputOp(), [], Tensor("X", (4, 8)), node_id="X")
@@ -376,9 +376,9 @@ def test_transpose_indexmap_fuses_with_elementwise():
     """IndexMap (transpose) inside a fused region: result matches eager."""
     import torch
 
-    from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.ir import Graph, Tensor
     from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, InputOp, KernelOp
+    from tests.compiler._fusion_helper import auto_fuse
 
     torch.manual_seed(0)
     x = torch.randn(1, 28, 8, 64).cuda()
@@ -423,10 +423,10 @@ def test_cat_indexmap_in_fused_region_emits_ternary():
     import torch
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.ir import Graph, Tensor
     from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, InputOp
     from deplodock.compiler.plan import plan_graph
+    from tests.compiler._fusion_helper import auto_fuse
 
     torch.manual_seed(0)
     a = torch.randn(1, 28, 8, 64).cuda()
@@ -483,10 +483,10 @@ def test_qwen_rotary_chain_fuses_into_region():
     import json
     from pathlib import Path
 
-    from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.ir import Graph
     from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, KernelOp
     from deplodock.compiler.rewriter import Rewriter
+    from tests.compiler._fusion_helper import auto_fuse
 
     fixture = Path(__file__).parent / "fixtures" / "qwen25_7b_layer0.json"
     with open(fixture) as f:

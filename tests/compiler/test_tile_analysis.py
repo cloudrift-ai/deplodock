@@ -5,9 +5,9 @@ as pointwise, row_reduce, reduce_broadcast, or contraction.
 """
 
 from deplodock.compiler.backend.cuda.generators.analysis import analyze
-from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, KernelOp, ReduceOp
+from tests.compiler._fusion_helper import auto_fuse
 from tests.compiler._kernel_builder import build_kernel
 
 

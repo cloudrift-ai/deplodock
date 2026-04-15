@@ -16,7 +16,7 @@ def _load_fixture(name: str) -> Graph:
 
 
 def _compile(g: Graph) -> Graph:
-    from deplodock.compiler.fusion import auto_fuse
+    from tests.compiler._fusion_helper import auto_fuse
 
     rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
     return auto_fuse(Rewriter.from_directory(rules_dir).apply(g))

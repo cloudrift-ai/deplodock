@@ -138,8 +138,8 @@ def test_llama_block_full_fusion(dump_dir):
     g = _build_llama_block()
     initial_count = len(g.nodes)
 
-    from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.rewriter import PassTrace
+    from tests.compiler._fusion_helper import auto_fuse
 
     dump_dir.dump_input_graph(g)
 

@@ -8,10 +8,10 @@ pointwise chains, and multi-consumer diamonds.
 import json
 from pathlib import Path
 
-from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, KernelOp, ReduceOp
 from deplodock.compiler.rewriter import Rewriter
+from tests.compiler._fusion_helper import auto_fuse
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 

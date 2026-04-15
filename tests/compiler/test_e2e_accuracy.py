@@ -9,10 +9,10 @@ import math
 import pytest
 import torch
 
-from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, ReduceOp
 from deplodock.compiler.plan import plan_graph
+from tests.compiler._fusion_helper import auto_fuse
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),

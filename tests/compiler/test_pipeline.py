@@ -43,7 +43,7 @@ def test_compile_graph_fuses_matmul():
     """compile_graph applies fusion rules and produces KernelOp."""
     g = _make_matmul_graph(4, 3, 2)
     rewriter = _load_rewriter()
-    from deplodock.compiler.fusion import auto_fuse
+    from tests.compiler._fusion_helper import auto_fuse
 
     compiled, traces = compile_graph(g, rewriter)
     compiled = auto_fuse(compiled)
@@ -57,7 +57,7 @@ def test_compile_graph_fuses_matmul():
 def test_plan_graph_from_matmul():
     """plan_graph produces a plan with one matmul op from a fused graph."""
     g = _make_matmul_graph(4, 3, 2)
-    from deplodock.compiler.fusion import auto_fuse
+    from tests.compiler._fusion_helper import auto_fuse
 
     compiled, _ = compile_graph(g, _load_rewriter())
     compiled = auto_fuse(compiled)
@@ -71,7 +71,7 @@ def test_matmul_k_dimension_inferred_correctly():
     """Non-square matmul: K must be inferred from input shapes, not output."""
     from deplodock.compiler.backend.cuda.backend import _build_region_and_shapes
     from deplodock.compiler.backend.cuda.generators.analysis import analyze
-    from deplodock.compiler.fusion import auto_fuse
+    from tests.compiler._fusion_helper import auto_fuse
 
     # A(32, 2048) @ B(2048, 512) → C(32, 512). K=2048, not 32.
     g = _make_matmul_graph(32, 2048, 512)
@@ -99,8 +99,8 @@ def test_contraction_softmax_large_n_splits():
     """
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.backend.cuda.program import generate_source
-    from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.ops import ConstantOp
+    from tests.compiler._fusion_helper import auto_fuse
 
     # Build QK^T + softmax: matmul(Q, K^T) → scale → softmax.
     # N = 512 > tile_n = 128, so the softmax can't be fused in-CTA.
@@ -146,7 +146,7 @@ def test_contraction_softmax_large_n_splits():
 def test_pipeline_end_to_end(dump_dir):
     """Full pipeline: graph → fuse → plan → CudaBackend → GPU."""
     g = _make_matmul_graph(4, 3, 2)
-    from deplodock.compiler.fusion import auto_fuse
+    from tests.compiler._fusion_helper import auto_fuse
 
     dump_dir.dump_input_graph(g)
     compiled, traces = compile_graph(g, _load_rewriter())
@@ -172,7 +172,7 @@ def test_pipeline_end_to_end(dump_dir):
 def test_pipeline_benchmark(dump_dir):
     """Benchmark through canonical pipeline returns timing."""
     g = _make_matmul_graph(64, 64, 64)
-    from deplodock.compiler.fusion import auto_fuse
+    from tests.compiler._fusion_helper import auto_fuse
 
     dump_dir.dump_input_graph(g)
     compiled, traces = compile_graph(g, _load_rewriter())

@@ -7,7 +7,6 @@ The pattern uses backreferences (`$x` appears twice) so the matcher
 unifies them. Emits KernelOp with core=(ReduceStage(max), ReduceStage(sub+exp, sum))
 and epilogue=(div,).
 
-Not yet wired into DEFAULT_PASS_ORDER.
 """
 
 from __future__ import annotations
