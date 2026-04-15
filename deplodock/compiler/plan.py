@@ -143,10 +143,16 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
         # FusedRegionOp / KernelOp may have multiple external outputs — allocate a buffer for each.
         if isinstance(op, ops_module.KernelOp) and len([p.buffer_id for p in op.outputs]) > 1:
             outputs = []
+            # Map each internal node id to its output shape so we can
+            # resolve per-output buffer shapes without the compat property.
+            internal_shapes: dict = {}
+            for n in op.prologue:
+                internal_shapes[n.id] = tuple(n.output.shape)
+            for n in op.epilogue:
+                internal_shapes[n.id] = tuple(n.output.shape)
             for out_id in [p.buffer_id for p in op.outputs]:
                 # Each external output needs its own buffer.
-                # Look up shape from the region's shapes dict.
-                out_shape = op.shapes.get(out_id, shape)
+                out_shape = internal_shapes.get(out_id, shape)
                 out_role = "output" if out_id in graph.outputs else "scratch"
                 if out_id not in buf_names:
                     buffers.append(BufferSpec(out_id, out_shape, dtype, role=out_role))
@@ -219,8 +225,13 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
                 if rid in graph.nodes:
                     all_shapes[rid] = graph.nodes[rid].output.shape
             params["_input_shapes"] = all_shapes
-            # Pass full shapes map (includes intermediates) for kernel generation.
-            params["_shapes"] = dict(op.shapes) if op.shapes else all_shapes
+            # Build full shapes map (external + internal) for kernel generation.
+            full_shapes: dict = dict(op.external_shapes)
+            for n in op.prologue:
+                full_shapes[n.id] = tuple(n.output.shape)
+            for n in op.epilogue:
+                full_shapes[n.id] = tuple(n.output.shape)
+            params["_shapes"] = full_shapes if full_shapes else all_shapes
             # Preserve original input/output names for kernel generation.
             # The plan uses fused node IDs as buffer names, but the kernel
             # source must use the original names from the region_ops.
