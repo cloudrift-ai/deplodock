@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import ContractionCore, ElementwiseOp, KernelOp, ReduceOp
+from deplodock.compiler.ops import ContractionCore, ElementwiseOp, KernelOp, ReduceOp, ReduceStage
 
 
 def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
@@ -228,41 +228,48 @@ def _split_phases(kernel: KernelOp) -> OpPhases:
     - ``None``: pure pointwise — all nodes in prologue.
     """
     if isinstance(kernel.core, ContractionCore):
-        # Detect whether the kernel is a pure contraction (only mul + reduce
-        # in prologue) or a combined core (contraction + downstream row
-        # reduces, e.g. matmul→softmax fusion). Pure case has a
-        # deterministic phase layout; the combined case needs the inline
-        # scan to establish the reduce/inter_reduce alternation.
+        # Walk kernel.prologue in order. Pre-reduce ops feed the K-loop
+        # (phases.prologue). After the contraction reduce, ops are either
+        # inter_reduce pre-chains (between stages in post_stages) or the
+        # per-row epilogue. post_stages defines which reduces are part of
+        # the downstream chain and their pre_ops.
         mul_id = kernel.core.mul.id if kernel.core.mul is not None else None
         reduce_id = kernel.core.reduce.id if kernel.core.reduce is not None else None
-        extras = [n for n in kernel.prologue if isinstance(n.op, ReduceOp) and n.id != reduce_id]
-        if not extras:
-            # Pure contraction (possibly with pre-reduce and/or post-reduce
-            # elementwise ops). Walk kernel.prologue in order; nodes appearing
-            # before the contraction reduce go into phases.prologue (feed
-            # into the K-loop), nodes appearing after go into phases.epilogue.
-            prologue: list[RegionEntry] = []
-            post_reduce: list[RegionEntry] = []
-            seen_reduce = False
-            for n in kernel.prologue:
-                if n.id == mul_id or n.id == reduce_id:
-                    if n.id == reduce_id:
-                        seen_reduce = True
-                    continue
-                if seen_reduce:
-                    post_reduce.append(_node_entry(n))
-                else:
-                    prologue.append(_node_entry(n))
-            if kernel.core.mul is not None:
-                prologue.append(_node_entry(kernel.core.mul))
-            reduces: list[RegionEntry] = []
-            if kernel.core.reduce is not None:
-                reduces.append(_node_entry(kernel.core.reduce))
-            epilogue = post_reduce + [_node_entry(n) for n in kernel.epilogue]
-            return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=[])
-        # Combined contraction + row-reduce chain — fall through to the
-        # unstructured scan branch below; it walks prologue + epilogue and
-        # naturally builds the reduces / inter_reduce / epilogue split.
+        post_reduce_ids = {s.reduce.id for s in kernel.core.post_stages if isinstance(s, ReduceStage) and s.reduce is not None}
+
+        prologue: list[RegionEntry] = []
+        seen_reduce = False
+        tail_nodes: list = []  # nodes after contraction reduce (to be split below)
+        for n in kernel.prologue:
+            if n.id == mul_id or n.id == reduce_id:
+                if n.id == reduce_id:
+                    seen_reduce = True
+                continue
+            if seen_reduce:
+                tail_nodes.append(n)
+            else:
+                prologue.append(_node_entry(n))
+        if kernel.core.mul is not None:
+            prologue.append(_node_entry(kernel.core.mul))
+
+        reduces: list[RegionEntry] = []
+        if kernel.core.reduce is not None:
+            reduces.append(_node_entry(kernel.core.reduce))
+
+        inter_reduce: list[list[RegionEntry]] = []
+        current_inter: list[RegionEntry] = []
+        for n in tail_nodes:
+            entry = _node_entry(n)
+            if n.id in post_reduce_ids:
+                inter_reduce.append(current_inter)
+                current_inter = []
+                reduces.append(entry)
+            else:
+                current_inter.append(entry)
+        # Leftover current_inter = per-row epilogue (nothing consumes it
+        # as a reduce input).
+        epilogue = current_inter + [_node_entry(n) for n in kernel.epilogue]
+        return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
 
     if isinstance(kernel.core, tuple) and kernel.core:
         # ReduceCore: the reduce rule leaves Nodes in kernel.prologue and

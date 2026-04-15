@@ -286,6 +286,12 @@ def flatten_kernel_nodes(kernel: KernelOp) -> tuple:
     if isinstance(kernel.core, ContractionCore):
         emit(kernel.core.mul)
         emit(kernel.core.reduce)
+        for stage in kernel.core.post_stages:
+            if not isinstance(stage, ReduceStage):
+                continue
+            for pre in stage.pre_ops:
+                emit(pre)
+            emit(stage.reduce)
     elif isinstance(kernel.core, tuple):
         for stage in kernel.core:
             if not isinstance(stage, ReduceStage):
@@ -382,12 +388,21 @@ def rewrite_port_references(graph: Graph, old_id: str, new_id: str) -> None:
                 a_port = Port(buffer_id=new_id, indexmap=a_port.indexmap)
             if b_port.buffer_id == old_id:
                 b_port = Port(buffer_id=new_id, indexmap=b_port.indexmap)
+            new_post_stages = tuple(
+                ReduceStage(
+                    pre_ops=tuple(_rewire_one(n, old_id, new_id) for n in stage.pre_ops),
+                    reduce=_rewire_one(stage.reduce, old_id, new_id) if stage.reduce is not None else None,
+                )
+                for stage in op.core.post_stages
+                if isinstance(stage, ReduceStage)
+            )
             op.core = ContractionCore(
                 a=a_port,
                 b=b_port,
                 k_axis=op.core.k_axis,
                 mul=_rewire_one(mul, old_id, new_id) if mul is not None else None,
                 reduce=_rewire_one(red, old_id, new_id) if red is not None else None,
+                post_stages=new_post_stages,
             )
         elif isinstance(op.core, tuple):
             new_stages = []
