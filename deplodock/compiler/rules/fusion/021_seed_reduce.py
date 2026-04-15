@@ -37,9 +37,9 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     kernel = KernelOp(
         inputs=[Port(buffer_id=x_id)],
         outputs=[Port(buffer_id=reduce_id)],
-        # Flat-prologue convention: keep reduce in prologue too; core is
-        # an annotation pointing at it.
-        prologue=(red_snap,),
+        # core owns the reduce Node exclusively; prologue holds only
+        # pre-reduce elementwise ops (none at seed time).
+        prologue=(),
         core=(stage,),
         epilogue=(),
         external_shapes=external_shapes,

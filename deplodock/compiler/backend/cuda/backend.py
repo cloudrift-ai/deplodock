@@ -160,16 +160,60 @@ def _build_region_and_shapes(op: OpKernel):
         rename_map.update(dict(zip(original_output_names, op.outputs, strict=False)))
     core = _rehydrate_core(op.params.get("_core_struct"), body_nodes, rename_map)
 
+    # Partition body_nodes into prologue/epilogue using the rehydrated
+    # core's ownership. Core-owned nodes (mul/reduce/stage pre_ops) are
+    # filtered out so kernel.prologue + core.owned + kernel.epilogue is
+    # each node exactly once.
+    prologue, epilogue = _partition_body(body_nodes, core)
+
     kernel = KernelOp(
         inputs=[Port(buffer_id=name) for name in input_names],
         outputs=[Port(buffer_id=name) for name in output_names],
-        prologue=body_nodes,
+        prologue=prologue,
         core=core,
-        epilogue=(),
+        epilogue=epilogue,
         kernel_source=op.params.get("kernel_source", ""),
         external_shapes=external_shapes,
     )
     return kernel, shapes
+
+
+def _partition_body(body_nodes, core):
+    """Split body_nodes into (prologue, epilogue) given core ownership.
+
+    Nodes before the first core-owned node → prologue.
+    Nodes after the last core-owned node → epilogue.
+    Core-owned nodes (mul/reduce/stage pre_ops) are dropped since they
+    live on the core annotation.
+    """
+    from deplodock.compiler.ops import ContractionCore, ReduceStage
+
+    core_ids: set[str] = set()
+    if isinstance(core, ContractionCore):
+        if core.mul is not None:
+            core_ids.add(core.mul.id)
+        if core.reduce is not None:
+            core_ids.add(core.reduce.id)
+        for s in core.post_stages:
+            if isinstance(s, ReduceStage):
+                core_ids.update(pn.id for pn in s.pre_ops)
+                if s.reduce is not None:
+                    core_ids.add(s.reduce.id)
+    elif isinstance(core, tuple):
+        for s in core:
+            if isinstance(s, ReduceStage):
+                core_ids.update(pn.id for pn in s.pre_ops)
+                if s.reduce is not None:
+                    core_ids.add(s.reduce.id)
+
+    if not core_ids:
+        return tuple(body_nodes), ()
+
+    first_idx = next((i for i, n in enumerate(body_nodes) if n.id in core_ids), len(body_nodes))
+    last_idx = max((i for i, n in enumerate(body_nodes) if n.id in core_ids), default=-1)
+    prologue = tuple(n for n in body_nodes[:first_idx] if n.id not in core_ids)
+    epilogue = tuple(n for n in body_nodes[last_idx + 1 :] if n.id not in core_ids)
+    return prologue, epilogue
 
 
 def _rehydrate_core(core_struct, body_nodes, rename_map=None):

@@ -88,11 +88,11 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     kernel = KernelOp(
         inputs=[Port(buffer_id=x_id)],
         outputs=[Port(buffer_id=div_id)],
-        # Flat-prologue convention: keep all 5 nodes in prologue too;
-        # core annotates the two ReduceStages.
-        prologue=(max_snap, sub_snap, exp_snap, sum_snap, div_snap),
+        # core owns max + sub + exp + sum via stages; div is the post-reduce
+        # elementwise → epilogue. prologue is empty at seed time.
+        prologue=(),
         core=stages,
-        epilogue=(),
+        epilogue=(div_snap,),
         external_shapes=external_shapes,
     )
 

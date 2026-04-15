@@ -73,9 +73,9 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     kernel = KernelOp(
         inputs=[Port(buffer_id=a_id), Port(buffer_id=b_id)],
         outputs=[Port(buffer_id=reduce_id)],
-        # Flat-prologue convention: keep mul + reduce in prologue too;
-        # core is an annotation pointing at them.
-        prologue=(mul_snap, reduce_snap),
+        # core owns the mul + reduce Nodes exclusively; prologue holds
+        # only pre-contraction elementwise ops (none at seed time).
+        prologue=(),
         core=core,
         epilogue=(),
         external_shapes=external_shapes,
