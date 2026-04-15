@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import AccessPattern, ContractionCore, KernelOp
+from deplodock.compiler.ops import AccessPattern, KernelOp, _needed_by_ids
 
 # Type alias for region op tuples: (node_id, op, input_ids)
 RegionEntry = tuple[str, object, list[str]]
@@ -109,33 +109,33 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
         )
 
     # Has reduces — determine the pre-reduction tensor shape.
-    first_reduce_input = phases.reduces[0][2][0]  # first reduce's first input_id
+    first_reduce_input = phases.reduces[0][2][0]
     pre_shape = shapes.get(first_reduce_input, out_shape)
 
-    # Check for contraction pattern: exactly 2 ops (mul + sum), two 2D inputs
-    # sharing a dimension that gets reduced, producing a 2D output.
-    is_contraction, a_name, b_name, m, n, k, batch_dims, batch_size, a_bg, b_bg = _detect_contraction(region, phases, shapes, input_access)
-
-    if is_contraction:
-        epilogue_per_elem = _epilogue_needs_per_element(region, phases, shapes, input_access)
-        return TileAnalysis(
-            port_indexmaps=port_indexmaps,
-            pattern="contraction",
-            op_phases=phases,
-            output_shape=out_shape,
-            reduce_fns=reduce_fns,
-            input_access=input_access,
-            rows=m,
-            cols=n,
-            k_dim=k,
-            contraction_a=a_name,
-            contraction_b=b_name,
-            epilogue_needs_per_element=epilogue_per_elem,
-            batch_dims=batch_dims,
-            batch_size=batch_size,
-            a_batch_group=a_bg,
-            b_batch_group=b_bg,
-        )
+    # Contraction pattern (matmul, possibly batched / GQA-broadcast).
+    cinfo = region.contraction_info(shapes)
+    if cinfo is not None:
+        a_acc = input_access.get(cinfo.a_id)
+        b_acc = input_access.get(cinfo.b_id)
+        if a_acc and b_acc and a_acc.is_2d and b_acc.is_2d:
+            return TileAnalysis(
+                port_indexmaps=port_indexmaps,
+                pattern="contraction",
+                op_phases=phases,
+                output_shape=out_shape,
+                reduce_fns=reduce_fns,
+                input_access=input_access,
+                rows=cinfo.m,
+                cols=cinfo.n,
+                k_dim=cinfo.k,
+                contraction_a=cinfo.a_id,
+                contraction_b=cinfo.b_id,
+                epilogue_needs_per_element=region.epilogue_needs_per_element(shapes, out_shape),
+                batch_dims=cinfo.batch_dims,
+                batch_size=cinfo.batch_size,
+                a_batch_group=cinfo.a_batch_group,
+                b_batch_group=cinfo.b_batch_group,
+            )
 
     # Row reduction patterns — extract rows/cols from pre-reduction shape.
     if len(pre_shape) >= 2:
@@ -145,12 +145,8 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
         rows = 1
         cols = math.prod(d for d in pre_shape if isinstance(d, int))
 
-    epilogue_per_elem = _epilogue_needs_per_element(region, phases, shapes, input_access)
-
-    if epilogue_per_elem:
-        pattern = "reduce_broadcast"
-    else:
-        pattern = "row_reduce"
+    epilogue_per_elem = region.epilogue_needs_per_element(shapes, out_shape)
+    pattern = "reduce_broadcast" if epilogue_per_elem else "row_reduce"
 
     return TileAnalysis(
         port_indexmaps=port_indexmaps,
@@ -181,137 +177,6 @@ def _split_phases(kernel: KernelOp) -> OpPhases:
     )
 
 
-def _needed_by(ops: list) -> set[str]:
-    """Return set of node_ids referenced as inputs by the given ops."""
-    needed = set()
-    for _, _, input_ids in ops:
-        needed.update(input_ids)
-    return needed
-
-
-def _detect_contraction(
-    region: KernelOp,
-    phases: OpPhases,
-    shapes: dict[str, tuple],
-    input_access: dict[str, AccessPattern],
-) -> tuple[bool, str | None, str | None, int, int, int, tuple[int, ...], int]:
-    """Determine matmul metadata from a KernelOp's structured ``core``.
-
-    If ``kernel.core`` is a ``ContractionCore``, read a/b buffer IDs from
-    its Ports and derive M, N, K, batch_dims, batch_size (plus GQA batch
-    groups) from the Port shapes — no scanning. Otherwise not a contraction.
-
-    Returns: (is_contraction, a_name, b_name, M, N, K, batch_dims, batch_size,
-              a_batch_group, b_batch_group).
-    """
-    if not isinstance(region.core, ContractionCore):
-        return False, None, None, 0, 0, 0, (), 1, 1, 1
-    a_id = region.core.a.buffer_id
-    b_id = region.core.b.buffer_id
-
-    if a_id not in input_access or b_id not in input_access:
-        return False, None, None, 0, 0, 0, (), 1, 1, 1
-
-    a_acc = input_access[a_id]
-    b_acc = input_access[b_id]
-    if not a_acc.is_2d or not b_acc.is_2d:
-        return False, None, None, 0, 0, 0, (), 1, 1, 1
-
-    a_shape = a_acc.shape
-    b_shape = b_acc.shape
-    if len(a_shape) < 2 or len(b_shape) < 2:
-        return False, None, None, 0, 0, 0, (), 1, 1, 1
-
-    # Detect batch dimensions: leading dims that match or broadcast between A and B.
-    batch_dims: tuple[int, ...] = ()
-    batch_size = 1
-    a_batch_group = 1
-    b_batch_group = 1
-    if len(a_shape) > 2 and len(b_shape) > 2:
-        a_batch = a_shape[:-2]
-        b_batch = b_shape[:-2]
-        if a_batch == b_batch:
-            batch_dims = a_batch
-        else:
-            # Broadcast batch dims (e.g. GQA: 28 Q heads vs 4 KV heads).
-            # Pad the shorter batch tuple with leading 1s so both have the same ndim,
-            # then check each dim matches or one divides the other.
-            max_len = max(len(a_batch), len(b_batch))
-            a_padded = (1,) * (max_len - len(a_batch)) + a_batch
-            b_padded = (1,) * (max_len - len(b_batch)) + b_batch
-            merged_batch: list[int] = []
-            for ad, bd in zip(a_padded, b_padded, strict=True):
-                if not isinstance(ad, int) or not isinstance(bd, int):
-                    return False, None, None, 0, 0, 0, (), 1, 1, 1
-                if ad == bd:
-                    merged_batch.append(ad)
-                elif ad > bd and bd > 0 and ad % bd == 0:
-                    merged_batch.append(ad)
-                elif bd > ad and ad > 0 and bd % ad == 0:
-                    merged_batch.append(bd)
-                else:
-                    return False, None, None, 0, 0, 0, (), 1, 1, 1
-            batch_dims = tuple(merged_batch)
-            a_batch_size = math.prod(d for d in a_padded if isinstance(d, int))
-            b_batch_size = math.prod(d for d in b_padded if isinstance(d, int))
-            if a_batch_size >= b_batch_size and b_batch_size > 0:
-                b_batch_group = a_batch_size // b_batch_size
-            elif a_batch_size > 0:
-                a_batch_group = b_batch_size // a_batch_size
-        batch_size = math.prod(d for d in batch_dims if isinstance(d, int))
-        # Batched: A(B..., M, K) @ B(B..., K, N)
-        a_k = a_shape[-1]
-        b_k = b_shape[-2]
-    else:
-        # 2D: A(M, K) @ B(K, N)
-        a_k = a_shape[-1]
-        b_k = b_shape[0]
-
-    # K dimension must match (both int or both same symbolic string).
-    if a_k != b_k:
-        return False, None, None, 0, 0, 0, (), 1, 1, 1
-
-    m = a_shape[-2] if isinstance(a_shape[-2], int) else 1
-    if not batch_dims:
-        # 2D: M = product of all dims except last
-        m = math.prod(d for d in a_shape[:-1] if isinstance(d, int)) if any(isinstance(d, int) for d in a_shape[:-1]) else 1
-    k = a_k if isinstance(a_k, int) else 1
-    n = b_shape[-1] if isinstance(b_shape[-1], int) else 1
-
-    return True, a_id, b_id, m, n, k, batch_dims, batch_size, a_batch_group, b_batch_group
-
-
-def _epilogue_needs_per_element(
-    region: KernelOp,
-    phases: OpPhases,
-    shapes: dict[str, tuple],
-    input_access: dict[str, AccessPattern],
-) -> bool:
-    """Check if the epilogue requires a second per-element pass.
-
-    This is true when epilogue ops (or prologue ops they depend on) need
-    to read per-element values from 2D inputs — e.g., rmsnorm epilogue
-    needs the original x values to multiply by the normalization factor.
-    """
-    if not phases.epilogue:
-        return False
-
-    epilogue_needs = _needed_by(phases.epilogue) | _needed_by(
-        phases.prologue if any(node_id in _needed_by(phases.epilogue) for node_id, _, _ in phases.prologue) else []
-    )
-
-    # Check if any external input needed by epilogue requires per-element
-    # access (is_2d). Per-row and scalar inputs are available during the
-    # reduce pass and don't need a second per-element loop.
-    for inp in [p.buffer_id for p in region.inputs]:
-        if inp in epilogue_needs:
-            acc = input_access.get(inp)
-            if acc and acc.is_2d:
-                return True
-
-    # Check if any prologue op needed by epilogue (transitive 2D dependency).
-    for node_id, _, _ in phases.prologue:
-        if node_id in _needed_by(phases.epilogue):
-            return True
-
-    return False
+def _needed_by(ops: list) -> set:
+    """Backward-compat alias for ``_needed_by_ids`` (used by codegen)."""
+    return _needed_by_ids(ops)
