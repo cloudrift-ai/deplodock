@@ -68,6 +68,20 @@ def _epilogue_per_element(region: KernelOp, shapes: dict[str, tuple]) -> bool:
     return region.epilogue_needs_per_element(shapes, out_shape)
 
 
+def _grid_type(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> str:
+    """Derive the grid flavor ("1d" / "1d_contraction" / "2d_swizzle" / "2d_standard")
+    from the region pattern + schedule.load_strategy.  Contractions with multi-reduce
+    use 1d_contraction (online N-tiled reduction); smem-load contractions use
+    2d_standard; all other contractions use 2d_swizzle; everything else is 1d."""
+    if _pattern(region, shapes) != "contraction":
+        return "1d"
+    if len(region.reduce_fn_names()) > 1:
+        return "1d_contraction"
+    if schedule.load_strategy == "smem":
+        return "2d_standard"
+    return "2d_swizzle"
+
+
 # ---------------------------------------------------------------------------
 # Generic lowering — single entry point driven by Schedule
 # ---------------------------------------------------------------------------
@@ -124,10 +138,11 @@ def lower_generic(
 def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list:
     grid = schedule.grid
     is_batched = _is_batched(region, shapes)
-    if grid.type == "1d":
+    gtype = _grid_type(schedule, region, shapes)
+    if gtype == "1d":
         axis_name = "i" if _pattern(region, shapes) == "pointwise" else "row"
         return [ParallelAxis(axis_name, "blockIdx.x", grid.bound)]
-    if grid.type == "1d_contraction":
+    if gtype == "1d_contraction":
         # Online reduction: 1D grid over M-tiles, N is tiled sequentially.
         # Emit bm, tr, tc but NOT bn (comes from the N-tile loop).
         I = "int"  # noqa: E741
@@ -148,7 +163,7 @@ def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -
             )
         )
         return ops
-    if grid.type == "2d_swizzle":
+    if gtype == "2d_swizzle":
         return _cta_swizzle_grid(
             schedule.thread_m or 8,
             schedule.thread_n or 4,
@@ -157,7 +172,7 @@ def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -
             is_batched,
         )
     # 2d_standard (smem): row_base/col_base/sr grid
-    if grid.type == "2d_standard":
+    if gtype == "2d_standard":
         I = "int"  # noqa: E741
         tx, ty, _ = grid.block_size
         thread_m = schedule.thread_m or 4
@@ -232,7 +247,7 @@ def _emit_reductions(
         return _emit_scalar_reductions(schedule, region, shapes)
 
     # 2D register tile contraction
-    if schedule.grid.type == "1d_contraction":
+    if _grid_type(schedule, region, shapes) == "1d_contraction":
         # Contraction + multi-reduce: online N-tiled reduction.
         # Handles phases 3-5 (reductions, epilogue, write) internally.
         return _emit_online_contraction_reduce(schedule, region, shapes)
@@ -764,7 +779,7 @@ def _emit_epilogue(
         # Pointwise: epilogue was inlined in the pointwise body
         return []
 
-    if schedule.grid.type == "1d_contraction":
+    if _grid_type(schedule, region, shapes) == "1d_contraction":
         # Online reduction handles epilogue internally
         return []
 
@@ -865,7 +880,7 @@ def _emit_write(
         # Pointwise: writes were already emitted in the guard body
         return []
 
-    if schedule.grid.type == "1d_contraction":
+    if _grid_type(schedule, region, shapes) == "1d_contraction":
         # Online reduction handles writes internally
         return []
 

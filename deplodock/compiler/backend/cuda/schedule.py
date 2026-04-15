@@ -34,7 +34,6 @@ def _safe(name: str) -> str:
 class GridSpec:
     """How thread blocks map to output elements."""
 
-    type: str  # "1d" | "2d_swizzle" | "2d_standard"
     block_size: tuple[int, int, int]
     # 1d grids use a single bound variable.
     bound: str = "n"  # "n" for pointwise, "rows" for reduce
@@ -92,7 +91,7 @@ def build_schedule(
 
     if pattern == "pointwise":
         return Schedule(
-            grid=GridSpec("1d", (256, 1, 1), bound="n"),
+            grid=GridSpec((256, 1, 1), bound="n"),
             dim_params=[("int", "n")],
         )
 
@@ -119,15 +118,10 @@ def build_schedule(
         elif k_splits > 1:
             dim_params.append(("int", "k_splits"))
 
-        # Contraction + multi-reduce (e.g. softmax): use 1D grid with N-tiling.
+        # Contraction + multi-reduce (e.g. softmax): tiles over N (see _grid_type).
         has_multi_reduce = len(analysis.reduce_fns) > 1
         if has_multi_reduce:
-            grid_type = "1d_contraction"
             k_splits = 1  # incompatible with online reduction
-        elif load_strat == "smem":
-            grid_type = "2d_standard"
-        else:
-            grid_type = "2d_swizzle"
 
         # TMA-specific fields
         tma_params = None
@@ -143,7 +137,7 @@ def build_schedule(
             includes = ["cuda.h"]
 
         return Schedule(
-            grid=GridSpec(grid_type, (tx, ty, 1)),
+            grid=GridSpec((tx, ty, 1)),
             tile_m=tile_m,
             tile_n=tile_n,
             thread_m=thread_m,
@@ -161,6 +155,6 @@ def build_schedule(
 
     # row_reduce or reduce_broadcast
     return Schedule(
-        grid=GridSpec("1d", (256, 1, 1), bound="rows"),
+        grid=GridSpec((256, 1, 1), bound="rows"),
         dim_params=[("int", "rows"), ("int", "cols")],
     )

@@ -34,7 +34,7 @@ from tests.compiler._kernel_builder import build_kernel
 def _mock_schedule(block_size=(256, 1, 1), tile_m=None, tile_n=None):
     """Build a minimal Schedule for tests that need block_size/tile info."""
     return Schedule(
-        grid=GridSpec("1d", block_size),
+        grid=GridSpec(block_size),
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -515,7 +515,6 @@ def test_build_schedule_pointwise():
         shapes={"x": (256,), "neg": (256,)},
     )
     sched = build_schedule(analysis)
-    assert sched.grid.type == "1d"
     assert sched.grid.bound == "n"
 
 
@@ -528,7 +527,6 @@ def test_build_schedule_reduce():
         shapes={"x": (4, 8), "red": (4,)},
     )
     sched = build_schedule(analysis)
-    assert sched.grid.type == "1d"
     assert sched.grid.bound == "rows"
 
 
@@ -544,7 +542,6 @@ def test_build_schedule_contraction():
         shapes={"A": (8, 4), "B": (4, 6), "ew": (8, 4, 6), "C": (8, 6)},
     )
     sched = build_schedule(analysis, strategy="naive")
-    assert sched.grid.type == "2d_swizzle"
     assert sched.thread_m == 8
     assert sched.thread_n == 4
     assert sched.tile_m == 64  # ty(8) * thread_m(8)
