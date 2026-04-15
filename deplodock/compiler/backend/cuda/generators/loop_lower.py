@@ -1016,11 +1016,22 @@ def _emit_loop_ops(
     body: list,
 ) -> None:
     """Walk ops and emit Let(name, OpCall(...)) nodes, updating var_map."""
+    from deplodock.compiler.ops import IndexMapOp
+
     for node_id, op, input_ids in ops:
         if isinstance(op, (ReshapeOp, TransposeOp)):
             if input_ids and input_ids[0] in var_map:
                 var_map[node_id] = var_map[input_ids[0]]
             continue
+
+        if isinstance(op, IndexMapOp):
+            # IndexMap inside a fused region — not yet wired up. The standalone
+            # path in backend.py:_compile_indexmap handles unfused IndexMaps.
+            # Fusion currently puts them in their own single-op regions.
+            raise NotImplementedError(
+                f"IndexMapOp inside fused region not yet supported (node {node_id}). "
+                "Either fusion bundled it incorrectly, or _emit_loop_ops needs the in-region path."
+            )
 
         if isinstance(op, ElementwiseOp):
             a = var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)

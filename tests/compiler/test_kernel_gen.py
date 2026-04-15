@@ -422,12 +422,22 @@ def test_kernel_gen_matmul_residual_add():
 
 
 def _compile_and_run(g: Graph, dump=None) -> dict[str, list[float]]:
-    """Full pipeline: auto_fuse → plan → CudaBackend (auto-generates kernels) → run."""
+    """Full pipeline: rewriter → auto_fuse → plan → CudaBackend → run.
+
+    The rewriter lowers view ops (TransposeOp/SliceOp/CatOp/UnsqueezeOp) to
+    IndexMapOp before fusion + compile.
+    """
+    from pathlib import Path
+
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.plan import plan_graph
+    from deplodock.compiler.rewriter import Rewriter
 
     if dump:
         dump.dump_input_graph(g)
+
+    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+    g = Rewriter.from_directory(rules_dir).apply(g)
 
     fused = auto_fuse(g)
 
