@@ -430,10 +430,14 @@ def merged_external_inputs_compat(
     if not ext:
         return True
     max_size = max(s for _, s in ext)
-    max_shape = next(sh for sh, s in ext if s == max_size)
+    # Pick the highest-rank shape among the max-size set as the broadcast
+    # reference. A smaller-rank shape with the same total size (e.g.
+    # (1, 28, 8, 128) and (1, 1, 28, 8, 128) both = 28672) can't be
+    # broadcast-target if a higher-rank padded shape exists in the set.
+    max_shape = max((sh for sh, s in ext if s == max_size), key=len)
     sizes_full: set[int] = set()
     for shape, sz in ext:
-        if sz == max_size:
+        if sz == max_size and len(shape) == len(max_shape):
             sizes_full.add(sz)
         elif is_broadcast_compatible(shape, max_shape):
             continue
