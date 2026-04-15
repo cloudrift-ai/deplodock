@@ -14,7 +14,7 @@ cuda/
 ├── program.py        # CudaLaunch, TmaDescriptorSpec, source gen, nvcc, run
 ├── schedule.py       # Schedule: all kernel structure decisions as a dataclass
 ├── generators/       # Kernel code generation
-│   ├── analysis.py       # TileAnalysis: classify FusedRegionOp patterns
+│   ├── analysis.py       # TileAnalysis: classify KernelOp patterns (dispatch on core type)
 │   ├── loop_lower.py     # lower_generic(): Schedule-driven LoopIR emission
 │   ├── loop_codegen.py   # LoopIR → KernelDef (imperative C AST)
 │   └── tiled.py          # Public API: generate_kernel(), lower_tiled()
@@ -30,12 +30,32 @@ A single `lower_generic()` reads the Schedule and emits LoopIR — no pattern
 matching.
 
 ```
-FusedRegionOp → analyze() → TileAnalysis ──→ build_schedule() → Schedule
-                                                                     ↓
-                         CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel(LoopProgram, Schedule)
-                                                                                          ↑
-                                                                              lower_generic() → LoopProgram
+KernelOp → analyze() → TileAnalysis ──→ build_schedule() → Schedule
+                                                                ↓
+                CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel(LoopProgram, Schedule)
+                                                                                 ↑
+                                                                     lower_generic() → LoopProgram
 ```
+
+`analyze()` dispatches on `kernel.core` type (structured fields set by the
+fusion rules in `rules/fusion/*.py`):
+- `ContractionCore` (with optional `post_stages`) → pattern=contraction.
+  `_detect_contraction()` reads `core.a` / `core.b` Port buffer_ids
+  directly; no scanning. Combined matmul→softmax kernels carry their
+  downstream row reduces in `core.post_stages`, and `_split_phases()`
+  walks prologue + post_stages to build the reduces / inter_reduce /
+  epilogue alternation.
+- `tuple[ReduceStage, ...]` → pattern=row_reduce / reduce_broadcast.
+  First stage's reduce marks end-of-prologue; per-stage `pre_ops` become
+  `OpPhases.inter_reduce` entries; nodes after the last reduce become
+  `OpPhases.epilogue`.
+- `None` → pattern=pointwise; all prologue nodes emit inline.
+
+The `analysis.flat_region_ops(kernel)` helper returns a dedup'd
+`(id, op, inputs)` list covering prologue + core + epilogue in topo
+order — this is the one backend reader that still needs a flat walk
+(pointwise body emit in `tiled.py` / `loop_lower.py`). All other
+readers use the structured fields directly.
 
 LoopProgram is purely structural (name, params, body, dim_strides).  Backend
 metadata (block_size, tile dims, TMA config, batching, includes) lives on the
