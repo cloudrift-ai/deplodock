@@ -12,7 +12,11 @@ from __future__ import annotations
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import Match
 from deplodock.compiler.ops import KernelOp, Port, ReduceOp, ReduceStage
-from deplodock.compiler.rules.fusion._assembly_helpers import copy_node, shape_of
+from deplodock.compiler.rules.fusion._assembly_helpers import (
+    copy_node,
+    rewrite_port_references,
+    shape_of,
+)
 
 PATTERN = "Reduce{$fn, $axis}($x)"
 
@@ -29,11 +33,14 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     x_shape = shape_of(graph, x_id)
     external_shapes = {x_id: x_shape}
 
-    stage = ReduceStage(pre_ops=(), reduce=copy_node(reduce_node))
+    red_snap = copy_node(reduce_node)
+    stage = ReduceStage(pre_ops=(), reduce=red_snap)
     kernel = KernelOp(
         inputs=[Port(buffer_id=x_id)],
         outputs=[Port(buffer_id=reduce_id)],
-        prologue=(),
+        # Flat-prologue convention: keep reduce in prologue too; core is
+        # an annotation pointing at it.
+        prologue=(red_snap,),
         core=(stage,),
         epilogue=(),
         external_shapes=external_shapes,
@@ -49,7 +56,9 @@ def rewrite(graph: Graph, match: Match) -> Graph:
             dtype=reduce_node.output.dtype,
         ),
     )
+    g.nodes[new_id].hints.merge(reduce_node.hints)
     g.replace_node(reduce_id, new_id)
+    rewrite_port_references(g, reduce_id, new_id)
     if reduce_id in g.nodes:
         g.remove_node(reduce_id)
     return g

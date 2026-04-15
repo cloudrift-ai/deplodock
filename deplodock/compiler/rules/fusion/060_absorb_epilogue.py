@@ -1,20 +1,22 @@
-"""Absorb a downstream Elementwise into a KernelOp's epilogue.
+"""Absorb a downstream Elementwise into a KernelOp's prologue.
 
 Pattern: ``Elementwise{$fn}(Kernel(...))`` where the KernelOp has
-fan-out=1. The Elementwise is appended to ``kernel.epilogue`` (or to
-``core.epilogue`` when core is ContractionCore).
-
-Not yet wired into DEFAULT_PASS_ORDER.
+fan-out=1. The Elementwise is appended to ``kernel.prologue`` (legacy
+flat-prologue convention — backend codegen reads ``region_ops`` which
+walks prologue + core + epilogue and dedups by id).
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ContractionCore, ElementwiseOp, KernelOp, Port
+from deplodock.compiler.ops import ElementwiseOp, KernelOp, Port
 from deplodock.compiler.rules.fusion._assembly_helpers import (
     copy_node,
     fan_out_of,
+    kernel_last_node_id,
+    rewire_node_input,
+    rewrite_port_references,
     shape_of,
 )
 
@@ -38,24 +40,17 @@ def rewrite(graph: Graph, match: Match) -> Graph:
 
     kernel = knode.op
     snap = copy_node(em_node)
+    # The absorbed node's first input pointed at the parent kernel's outer id.
+    # Rewire to the kernel's last-internal node id so var_map[id] resolves.
+    last = kernel_last_node_id(kernel)
+    if last is not None:
+        snap = rewire_node_input(snap, kid, last)
 
-    # Place into core.epilogue for ContractionCore, else kernel.epilogue.
-    if isinstance(kernel.core, ContractionCore):
-        new_core = ContractionCore(
-            a=kernel.core.a,
-            b=kernel.core.b,
-            k_axis=kernel.core.k_axis,
-            mul=kernel.core.mul,
-            reduce=kernel.core.reduce,
-        )
-        # ContractionCore doesn't have an epilogue field yet — this is part of
-        # the Direction B plan but not landed. For now, stash in kernel.epilogue.
-        new_kernel_epilogue = kernel.epilogue + (snap,)
-        new_kernel_prologue = kernel.prologue
-    else:
-        new_core = kernel.core
-        new_kernel_epilogue = kernel.epilogue + (snap,)
-        new_kernel_prologue = kernel.prologue
+    # Append snap to prologue (legacy flat-prologue convention). core is
+    # an annotation pointing at reduce/mul nodes already in prologue.
+    new_core = kernel.core
+    new_kernel_prologue = kernel.prologue + (snap,)
+    new_kernel_epilogue = kernel.epilogue
 
     # Any Elementwise inputs besides inputs[0] are new external inputs.
     new_inputs_list: list[Port] = list(kernel.inputs)
@@ -85,7 +80,10 @@ def rewrite(graph: Graph, match: Match) -> Graph:
             dtype=em_node.output.dtype,
         ),
     )
+    g.nodes[new_kid].hints.merge(graph.nodes[kid].hints)
+    g.nodes[new_kid].hints.merge(em_node.hints)
     g.replace_node(em_id, new_kid)
+    rewrite_port_references(g, em_id, new_kid)
     if em_id in g.nodes:
         g.remove_node(em_id)
     if kid in g.nodes and not g.consumers(kid):

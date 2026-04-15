@@ -156,8 +156,8 @@ def test_kernel_reduces_single_reduce():
     assert len(pairs) == 1
     op, shape = pairs[0]
     assert op.fn == "sum" and op.axis == -1
-    # No pre_ops, no prologue → fall back to reduce node's own shape.
-    assert shape == (4,)
+    # Reduce input is the external x buffer; shape is x's full shape.
+    assert shape == (4, 16)
 
 
 def test_kernel_reduces_contraction():

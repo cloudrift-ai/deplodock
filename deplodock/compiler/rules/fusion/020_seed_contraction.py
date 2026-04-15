@@ -26,6 +26,7 @@ from deplodock.compiler.ops import (
 from deplodock.compiler.rules.fusion._assembly_helpers import (
     copy_node,
     fan_out_of,
+    rewrite_port_references,
     shape_of,
     shapes_match_for_contraction,
 )
@@ -76,7 +77,9 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     kernel = KernelOp(
         inputs=[Port(buffer_id=a_id), Port(buffer_id=b_id)],
         outputs=[Port(buffer_id=reduce_id)],
-        prologue=(),
+        # Flat-prologue convention: keep mul + reduce in prologue too;
+        # core is an annotation pointing at them.
+        prologue=(mul_snap, reduce_snap),
         core=core,
         epilogue=(),
         external_shapes=external_shapes,
@@ -92,7 +95,10 @@ def rewrite(graph: Graph, match: Match) -> Graph:
             dtype=reduce_node.output.dtype,
         ),
     )
+    g.nodes[new_id].hints.merge(reduce_node.hints)
+    g.nodes[new_id].hints.merge(mul_node.hints)
     g.replace_node(reduce_id, new_id)
+    rewrite_port_references(g, reduce_id, new_id)
     # Remove the original reduce and mul (they're now owned by the core).
     if reduce_id in g.nodes:
         g.remove_node(reduce_id)
