@@ -376,6 +376,35 @@ class IndexMapOp(Op):
 # ---------------------------------------------------------------------------
 
 
+def _needed_by_ids(ops: list) -> set:
+    """Set of node ids referenced as inputs by the given (id, op, inputs) tuples."""
+    needed: set = set()
+    for _id, _op, input_ids in ops:
+        needed.update(input_ids)
+    return needed
+
+
+@dataclass
+class ContractionInfo:
+    """Resolved matmul metadata for a ContractionCore kernel.
+
+    Built by ``KernelOp.contraction_info(shapes)``. Codegen reads M/N/K
+    + batch info to size the K-loop, tile dims, and grid.
+    """
+
+    a_id: str  # external buffer id for A operand
+    b_id: str  # external buffer id for B operand
+    m: int
+    n: int
+    k: int
+    batch_dims: tuple[int, ...] = ()
+    batch_size: int = 1
+    # GQA / broadcast batch: when one operand has fewer batch elements,
+    # its batch index is divided by this factor (28 Q heads / 4 KV heads = 7).
+    a_batch_group: int = 1
+    b_batch_group: int = 1
+
+
 @dataclass
 class AccessPattern:
     """How a single input tensor is accessed within the kernel.
@@ -603,6 +632,113 @@ class KernelOp(Op):
     def port_indexmaps(self) -> dict:
         """Per-input Port.indexmap dict (only inputs with an indexmap set)."""
         return {p.buffer_id: p.indexmap for p in self.inputs if p.indexmap is not None}
+
+    def contraction_info(self, shapes: dict) -> ContractionInfo | None:
+        """Resolve M/N/K + batch metadata for a ContractionCore kernel.
+
+        Returns ``None`` if this isn't a contraction or the operand shapes
+        are incompatible (K mismatch, sub-2D, batch dims that don't match
+        and don't divide cleanly for GQA-style broadcast).
+        """
+        import math as _math
+
+        if not isinstance(self.core, ContractionCore):
+            return None
+        a_id = self.core.a.buffer_id
+        b_id = self.core.b.buffer_id
+        a_shape = shapes.get(a_id)
+        b_shape = shapes.get(b_id)
+        if a_shape is None or b_shape is None or len(a_shape) < 2 or len(b_shape) < 2:
+            return None
+
+        batch_dims: tuple = ()
+        batch_size = 1
+        a_batch_group = 1
+        b_batch_group = 1
+        if len(a_shape) > 2 and len(b_shape) > 2:
+            a_batch = a_shape[:-2]
+            b_batch = b_shape[:-2]
+            if a_batch == b_batch:
+                batch_dims = a_batch
+            else:
+                # GQA-style broadcast: pad shorter batch with 1s; each dim
+                # must match or one must divide the other.
+                max_len = max(len(a_batch), len(b_batch))
+                a_padded = (1,) * (max_len - len(a_batch)) + a_batch
+                b_padded = (1,) * (max_len - len(b_batch)) + b_batch
+                merged_batch: list = []
+                for ad, bd in zip(a_padded, b_padded, strict=True):
+                    if not isinstance(ad, int) or not isinstance(bd, int):
+                        return None
+                    if ad == bd:
+                        merged_batch.append(ad)
+                    elif ad > bd and bd > 0 and ad % bd == 0:
+                        merged_batch.append(ad)
+                    elif bd > ad and ad > 0 and bd % ad == 0:
+                        merged_batch.append(bd)
+                    else:
+                        return None
+                batch_dims = tuple(merged_batch)
+                a_bs = _math.prod(d for d in a_padded if isinstance(d, int))
+                b_bs = _math.prod(d for d in b_padded if isinstance(d, int))
+                if a_bs >= b_bs and b_bs > 0:
+                    b_batch_group = a_bs // b_bs
+                elif a_bs > 0:
+                    a_batch_group = b_bs // a_bs
+            batch_size = _math.prod(d for d in batch_dims if isinstance(d, int))
+            a_k = a_shape[-1]
+            b_k = b_shape[-2]
+        else:
+            a_k = a_shape[-1]
+            b_k = b_shape[0]
+
+        if a_k != b_k:
+            return None
+
+        if batch_dims:
+            m = a_shape[-2] if isinstance(a_shape[-2], int) else 1
+        else:
+            m = _math.prod(d for d in a_shape[:-1] if isinstance(d, int)) if any(isinstance(d, int) for d in a_shape[:-1]) else 1
+        k = a_k if isinstance(a_k, int) else 1
+        n = b_shape[-1] if isinstance(b_shape[-1], int) else 1
+
+        return ContractionInfo(
+            a_id=a_id,
+            b_id=b_id,
+            m=m,
+            n=n,
+            k=k,
+            batch_dims=batch_dims,
+            batch_size=batch_size,
+            a_batch_group=a_batch_group,
+            b_batch_group=b_batch_group,
+        )
+
+    def epilogue_needs_per_element(self, shapes: dict, output_shape: tuple) -> bool:
+        """True when the epilogue needs a second per-element pass.
+
+        Holds when any epilogue op (or a prologue op it depends on)
+        reads per-element values from a 2D input — e.g. RMSNorm's
+        ``mul(x, rsqrt)`` epilogue needs the original ``x`` per element.
+        """
+        prologue, _reduces, _inter, epilogue = self.phases()
+        if not epilogue:
+            return False
+
+        epilogue_needs_set = _needed_by_ids(epilogue)
+        if any(nid in epilogue_needs_set for nid, _, _ in prologue):
+            epilogue_needs_set = epilogue_needs_set | _needed_by_ids(prologue)
+
+        access = self.input_accesses(shapes, output_shape)
+        for p in self.inputs:
+            if p.buffer_id in epilogue_needs_set:
+                acc = access.get(p.buffer_id)
+                if acc and acc.is_2d:
+                    return True
+        for nid, _, _ in prologue:
+            if nid in _needed_by_ids(epilogue):
+                return True
+        return False
 
     def input_accesses(self, shapes: dict, output_shape: tuple) -> dict:
         """Build an AccessPattern per external input.
