@@ -10,22 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import ContractionCore, KernelOp
-
-
-def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
-    """Check if small broadcasts to large via NumPy-style rules."""
-    if len(small_shape) > len(large_shape):
-        return False
-    offset = len(large_shape) - len(small_shape)
-    for i, s in enumerate(small_shape):
-        large_dim = large_shape[offset + i]
-        if not isinstance(s, int) or not isinstance(large_dim, int):
-            continue
-        if s != 1 and s != large_dim:
-            return False
-    return True
-
+from deplodock.compiler.ops import AccessPattern, ContractionCore, KernelOp
 
 # Type alias for region op tuples: (node_id, op, input_ids)
 RegionEntry = tuple[str, object, list[str]]
@@ -43,19 +28,6 @@ class OpPhases:
     reduces: list[RegionEntry]
     epilogue: list[RegionEntry]
     inter_reduce: list[list[RegionEntry]] = field(default_factory=list)
-
-
-@dataclass
-class AccessPattern:
-    """How a single input tensor is accessed within the kernel."""
-
-    shape: tuple[int, ...]
-    size: int  # total elements
-    is_scalar: bool  # size == 1 (broadcast everywhere)
-    is_row_vector: bool  # 1D, indexed by column only
-    is_2d: bool  # indexed by both row and column
-    is_per_row: bool = False  # last dim == 1, indexed by row only (e.g., (N,1) or (1,28,32,1))
-    is_broadcast: bool = False  # smaller input that broadcasts to output (indexed via modulo)
 
 
 @dataclass
@@ -119,35 +91,7 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
 
     reduce_fns = region.reduce_fn_names()
     port_indexmaps = region.port_indexmaps()
-
-    # Build input access patterns.
-    input_access = {}
-    for inp in [p.buffer_id for p in region.inputs]:
-        inp_shape = shapes.get(inp, (1,))
-        inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
-        has_symbolic = any(isinstance(d, str) for d in inp_shape)
-        # Per-row scalar: last dim is 1 with >1 total elements.
-        # Covers both (N, 1) and (1, 28, 32, 1) — indexed by row only.
-        last_dim = inp_shape[-1] if inp_shape else 1
-        last_dim_is_one = isinstance(last_dim, int) and last_dim == 1
-        is_per_row = last_dim_is_one and inp_size > 1 and len(inp_shape) >= 2
-        out_size = math.prod(d for d in out_shape if isinstance(d, int))
-        is_broadcast = (
-            inp_size > 1
-            and inp_size < out_size
-            and not is_per_row
-            and len(inp_shape) >= 2
-            and _is_broadcast_compatible(inp_shape, out_shape)
-        )
-        input_access[inp] = AccessPattern(
-            shape=inp_shape,
-            size=inp_size,
-            is_scalar=(inp_size == 1 and not has_symbolic),
-            is_row_vector=(len(inp_shape) == 1 and (inp_size > 1 or has_symbolic)),
-            is_2d=(len(inp_shape) >= 2 and (inp_size > 1 or has_symbolic) and not is_per_row and not is_broadcast),
-            is_per_row=is_per_row,
-            is_broadcast=is_broadcast,
-        )
+    input_access = region.input_accesses(shapes, out_shape)
 
     # No reduces → pointwise.
     if not phases.reduces:
@@ -220,11 +164,6 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
         k_dim=cols,  # for row reductions, k == cols
         epilogue_needs_per_element=epilogue_per_elem,
     )
-
-
-def _node_entry(n) -> RegionEntry:
-    """Convert a Node to a (id, op, inputs) tuple."""
-    return (n.id, n.op, list(n.inputs))
 
 
 def _split_phases(kernel: KernelOp) -> OpPhases:
