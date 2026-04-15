@@ -213,6 +213,16 @@ def _emit_reductions(
         return _emit_online_contraction_reduce(schedule, analysis, region, shapes)
 
     # Standard contraction K-loop (single reduce, no multi-reduce)
+    return _dispatch_k_loop(schedule, analysis, region, shapes)
+
+
+def _dispatch_k_loop(
+    schedule: Schedule,
+    analysis: TileAnalysis,
+    region: KernelOp,
+    shapes: dict[str, tuple],
+) -> list:
+    """Pick the K-loop emitter based on schedule.load_strategy."""
     if schedule.load_strategy == "tma":
         return _emit_tma_k_loop(schedule, analysis)
     if schedule.load_strategy == "smem":
@@ -572,13 +582,7 @@ def _emit_online_contraction_reduce(
         for c in range(thread_n):
             loop1_body.append(SetVar(f"c{r}{c}", Literal(0.0)))
 
-    # K-loop (reuse existing emission based on load strategy)
-    if schedule.load_strategy == "tma":
-        loop1_body.extend(_emit_tma_k_loop(schedule, analysis))
-    elif schedule.load_strategy == "smem":
-        loop1_body.extend(_emit_smem_k_loop(schedule, analysis))
-    else:
-        loop1_body.extend(_emit_contraction_k_loop(schedule, analysis, region, shapes))
+    loop1_body.extend(_dispatch_k_loop(schedule, analysis, region, shapes))
 
     # Apply inter_reduce[0] ops on register tile (ops between contraction
     # reduce and first N-reduce, e.g. scale multiplication).
