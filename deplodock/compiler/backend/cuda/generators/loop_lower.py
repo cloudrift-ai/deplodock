@@ -238,7 +238,8 @@ def _emit_pointwise_body(
         guard_body.append(Load(load_name, _safe(inp), indices, "global"))
         var_map[inp] = Var(load_name)
 
-    _emit_loop_ops(region.region_ops, var_map, "v_", guard_body)
+    coord_mapping = _build_pointwise_coord_mapping(out_shape)
+    _emit_loop_ops(region.region_ops, var_map, "v_", guard_body, coord_mapping=coord_mapping, shapes=shapes)
 
     for out_id in region.output_names:
         val = var_map.get(out_id, Literal(0.0))
@@ -258,6 +259,12 @@ def _emit_scalar_reductions(
     out_shape = shapes.get(region.output_names[0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
     guarded: list = []
+
+    # Pre-reduction shape (input to the first reduce) — used to build the
+    # IndexMap coord substitution for any IndexMaps inside the region.
+    first_reduce_input = phases.reduces[0][2][0] if phases.reduces else None
+    pre_shape = shapes.get(first_reduce_input, out_shape) if first_reduce_input else out_shape
+    coord_mapping = _build_reduce_coord_mapping(pre_shape, Var("row"), Var("j"))
 
     # Accumulator allocs were already emitted in phase 2; build var tracking.
     reduce_vars: dict[str, tuple[str, str]] = {}
@@ -285,8 +292,15 @@ def _emit_scalar_reductions(
 
         all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
         needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
+        from deplodock.compiler.ops import IndexMapOp as _IndexMapOp
+
+        prologue_ids = {pid for pid, _, _ in phases.prologue}
         for pid, pop, pinp in phases.prologue:
-            if isinstance(pop, ElementwiseOp) and pid in needed:
+            if pid not in needed:
+                continue
+            if isinstance(pop, _IndexMapOp):
+                _emit_indexmap(pid, pop, pinp, pass_var_map, f"r{ri}p_", pass_body, coord_mapping, shapes, prologue_ids)
+            elif isinstance(pop, ElementwiseOp):
                 a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
                 b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
                 var_name = f"r{ri}p_{_safe(pid)}"
@@ -294,7 +308,7 @@ def _emit_scalar_reductions(
                 pass_var_map[pid] = Var(var_name)
 
         if ri > 0 and phases.inter_reduce:
-            _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body)
+            _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body, coord_mapping=coord_mapping, shapes=shapes)
 
         val = pass_var_map.get(input_ids[0], Literal(0.0))
         pass_body.append(Accum(acc_name, fn, val))
@@ -747,19 +761,32 @@ def _emit_scalar_epilogue(
             epi_body.append(Load(load_name, _safe(inp), indices, "global"))
             epi_var_map[inp] = Var(load_name)
 
+        # Coord mapping for IndexMaps: epilogue iterates per-element over output
+        # at (row, j); pre-reduction shape governs how row decomposes for >2D.
+        first_reduce_input = phases.reduces[0][2][0] if phases.reduces else None
+        pre_shape = shapes.get(first_reduce_input, out_shape) if first_reduce_input else out_shape
+        coord_mapping = _build_reduce_coord_mapping(pre_shape, Var("row"), Var("j"))
+
         # Re-compute prologue + inter_reduce ops
         all_inter_ops = [op for group in phases.inter_reduce for op in group] if has_multi_reduce else []
         recompute_ops = phases.prologue + all_inter_ops if has_multi_reduce else phases.prologue
         needed = _needed_by(phases.epilogue)
+        from deplodock.compiler.ops import IndexMapOp as _IndexMapOp
+
+        recompute_ids = {pid for pid, _, _ in recompute_ops}
         for pid, pop, pinp in recompute_ops:
-            if isinstance(pop, ElementwiseOp) and (pid in needed or has_multi_reduce):
+            if not (pid in needed or has_multi_reduce):
+                continue
+            if isinstance(pop, _IndexMapOp):
+                _emit_indexmap(pid, pop, pinp, epi_var_map, "ep_", epi_body, coord_mapping, shapes, recompute_ids)
+            elif isinstance(pop, ElementwiseOp):
                 a = epi_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
                 b = epi_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
                 var_name = f"ep_{_safe(pid)}"
                 epi_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
                 epi_var_map[pid] = Var(var_name)
 
-        _emit_loop_ops(phases.epilogue, epi_var_map, "e_", epi_body)
+        _emit_loop_ops(phases.epilogue, epi_var_map, "e_", epi_body, coord_mapping=coord_mapping, shapes=shapes)
 
         for out_id in region.output_names:
             val = epi_var_map.get(out_id, Literal(0.0))
@@ -1009,14 +1036,91 @@ def _input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int
     return []
 
 
+def _emit_indexmap(
+    node_id: str,
+    op,
+    input_ids: list[str],
+    var_map: dict[str, LoopExpr],
+    prefix: str,
+    body: list,
+    coord_mapping: dict[str, LoopExpr],
+    shapes: dict[str, tuple],
+    in_region_ids: set[str] | None = None,
+) -> None:
+    """Emit code for a single IndexMapOp inside a fused-region kernel.
+
+    Substitutes the IndexMap's coord_map placeholders with the kernel's
+    actual per-axis coord LoopExprs, flattens the per-axis indices using the
+    input's known shape (so the codegen doesn't need stride scalars for these
+    auxiliary buffers), emits one Load per source, and binds ``var_map[node_id]``
+    to either the single Load var or a Ternary chain over multi-source loads.
+
+    When ``in_region_ids`` is provided and the source's input is in that set,
+    the source's value is taken directly from ``var_map`` (the in-region producer
+    already computed it at the current output position; fusion ensured the
+    coord_map is identity for in-region sources). External inputs always emit
+    a fresh Load at the coord-substituted position.
+    """
+    from deplodock.compiler.backend.ir.expr import Ternary
+    from deplodock.compiler.coord_expr import substitute
+
+    var_name = f"{prefix}{_safe(node_id)}"
+    src_values: list[tuple[LoopExpr, LoopExpr | None]] = []
+    for i, src in enumerate(op.sources):
+        src_input = input_ids[src.input_idx]
+        is_in_region = in_region_ids is not None and src_input in in_region_ids
+        if is_in_region and src_input in var_map:
+            # Reuse the in-region producer's value at the current position.
+            value: LoopExpr = var_map[src_input]
+        else:
+            external = _safe(src_input)
+            in_shape = shapes.get(src_input, ())
+            in_strides = _row_major_strides(in_shape) if in_shape else []
+            substituted = [substitute(c, coord_mapping) for c in src.coord_map]
+            # Pre-flatten the multi-dim indices into a single linear address using
+            # the input's row-major strides — the codegen would otherwise emit
+            # stride_X_d kernel-param references that we haven't declared.
+            if len(substituted) > 1 and len(in_strides) == len(substituted):
+                flat: LoopExpr = Literal(0, "int")
+                for axis, expr in enumerate(substituted):
+                    flat = flat + expr * Literal(in_strides[axis], "int")
+                substituted = [flat]
+            load_name = f"{var_name}_s{i}" if len(op.sources) > 1 else var_name
+            body.append(Load(load_name, external, substituted, "global"))
+            value = Var(load_name)
+        sel = substitute(src.select, coord_mapping) if src.select is not None else None
+        src_values.append((value, sel))
+    if len(src_values) == 1:
+        var_map[node_id] = src_values[0][0]
+    else:
+        # Build a Ternary chain ending in the last (default) source.
+        result: LoopExpr = src_values[-1][0]
+        for value, sel in reversed(src_values[:-1]):
+            if sel is None:
+                raise RuntimeError(f"IndexMapOp {node_id} multi-source needs select on every source except the last")
+            result = Ternary(sel, value, result)
+        var_map[node_id] = result
+
+
 def _emit_loop_ops(
     ops: list,
     var_map: dict[str, LoopExpr],
     prefix: str,
     body: list,
+    coord_mapping: dict[str, LoopExpr] | None = None,
+    shapes: dict[str, tuple] | None = None,
 ) -> None:
-    """Walk ops and emit Let(name, OpCall(...)) nodes, updating var_map."""
+    """Walk ops and emit Let(name, OpCall(...)) nodes, updating var_map.
+
+    ``coord_mapping`` maps IndexMap placeholder var names (``out_coord_d``)
+    to the kernel's per-axis coord LoopExprs in the current scope. ``shapes``
+    maps buffer names to their full shape tuples (needed to flatten IndexMap
+    multi-dim loads). Both are required when ``ops`` contains any
+    ``IndexMapOp``; pointwise / reduce / epilogue callers build them per pattern.
+    """
     from deplodock.compiler.ops import IndexMapOp
+
+    in_region_ids = {nid for nid, _, _ in ops}
 
     for node_id, op, input_ids in ops:
         if isinstance(op, (ReshapeOp, TransposeOp)):
@@ -1025,13 +1129,13 @@ def _emit_loop_ops(
             continue
 
         if isinstance(op, IndexMapOp):
-            # IndexMap inside a fused region — not yet wired up. The standalone
-            # path in backend.py:_compile_indexmap handles unfused IndexMaps.
-            # Fusion currently puts them in their own single-op regions.
-            raise NotImplementedError(
-                f"IndexMapOp inside fused region not yet supported (node {node_id}). "
-                "Either fusion bundled it incorrectly, or _emit_loop_ops needs the in-region path."
-            )
+            if coord_mapping is None or shapes is None:
+                raise RuntimeError(
+                    f"IndexMapOp {node_id} reached _emit_loop_ops without coord_mapping/shapes; "
+                    "the calling pattern lowering must build and pass them."
+                )
+            _emit_indexmap(node_id, op, input_ids, var_map, prefix, body, coord_mapping, shapes, in_region_ids)
+            continue
 
         if isinstance(op, ElementwiseOp):
             a = var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
@@ -1040,6 +1144,56 @@ def _emit_loop_ops(
             args = [a, b] if op.info.arity == 2 and len(input_ids) > 1 else [a]
             body.append(Let(var_name, OpCall(op.fn, args)))
             var_map[node_id] = Var(var_name)
+
+
+def _row_major_strides(shape: tuple) -> list[int]:
+    """Row-major strides (last dim has stride 1). Symbolic dims are treated as 1."""
+    strides = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        d = shape[i + 1] if isinstance(shape[i + 1], int) else 1
+        strides[i] = strides[i + 1] * d
+    return strides
+
+
+def _build_pointwise_coord_mapping(out_shape: tuple) -> dict[str, LoopExpr]:
+    """Decompose flat ``Var("i")`` into per-axis output coords for IndexMap substitution."""
+    from deplodock.compiler.coord_expr import placeholder
+
+    strides = _row_major_strides(out_shape)
+    mapping: dict[str, LoopExpr] = {}
+    for d in range(len(out_shape)):
+        size = out_shape[d] if isinstance(out_shape[d], int) else 1
+        if d == len(out_shape) - 1:
+            mapping[placeholder(d).name] = Var("i") % Literal(size, "int")
+        else:
+            mapping[placeholder(d).name] = (Var("i") / Literal(strides[d], "int")) % Literal(size, "int")
+    return mapping
+
+
+def _build_reduce_coord_mapping(pre_shape: tuple, row_var: LoopExpr, j_var: LoopExpr) -> dict[str, LoopExpr]:
+    """For row-reduce kernels: map placeholders to (row, j).
+
+    For rank-2 ``pre_shape``: placeholder(0) → row, placeholder(1) → j.
+    For higher ranks, decompose ``row`` across the leading dims using strides.
+    """
+    from deplodock.compiler.coord_expr import placeholder
+
+    ndim = len(pre_shape)
+    mapping: dict[str, LoopExpr] = {}
+    if ndim == 0:
+        return mapping
+    mapping[placeholder(ndim - 1).name] = j_var
+    if ndim == 1:
+        return mapping
+    leading = pre_shape[:-1]
+    leading_strides = _row_major_strides(leading) if len(leading) > 1 else [1]
+    for d in range(len(leading)):
+        size = leading[d] if isinstance(leading[d], int) else 1
+        if d == len(leading) - 1:
+            mapping[placeholder(d).name] = row_var % Literal(size, "int")
+        else:
+            mapping[placeholder(d).name] = (row_var / Literal(leading_strides[d], "int")) % Literal(size, "int")
+    return mapping
 
 
 def _build_params(region: FusedRegionOp) -> list[tuple[str, str]]:

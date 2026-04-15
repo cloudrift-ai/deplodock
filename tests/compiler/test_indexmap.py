@@ -366,3 +366,140 @@ def test_indexmap_identity_alias_no_kernel():
     program = CudaBackend().compile(plan)
     assert program.aliases.get("out") == "X"
     assert all(launch.kernel_name != "indexmap" and "indexmap" not in launch.kernel_name for launch in program.launches)
+
+
+# ---------- in-region fusion ----------
+
+
+@requires_cuda
+def test_transpose_indexmap_fuses_with_elementwise():
+    """IndexMap (transpose) inside a fused region: result matches eager."""
+    import torch
+
+    from deplodock.compiler.fusion import auto_fuse
+    from deplodock.compiler.ir import Graph, Tensor
+    from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, IndexMapOp, InputOp
+
+    torch.manual_seed(0)
+    x = torch.randn(1, 28, 8, 64).cuda()
+    y = torch.randn(1, 8, 28, 64).cuda()
+    expected = (x.transpose(1, 2) * y).cpu().flatten().tolist()
+
+    g = Graph()
+    x_id = g.add_node(InputOp(), [], Tensor("X", (1, 28, 8, 64)), node_id="X")
+    y_id = g.add_node(InputOp(), [], Tensor("Y", (1, 8, 28, 64)), node_id="Y")
+    g.inputs = [x_id, y_id]
+    # Transpose X (axes 1,2) → IndexMap with coord swap
+    t_id = g.add_node(
+        IndexMapOp(
+            out_shape=(1, 8, 28, 64),
+            sources=(IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(2), placeholder(1), placeholder(3))),),
+        ),
+        [x_id],
+        Tensor("T", (1, 8, 28, 64)),
+        node_id="T",
+    )
+    out_id = g.add_node(ElementwiseOp("mul"), [t_id, y_id], Tensor("out", (1, 8, 28, 64)), node_id="out")
+    g.outputs = [out_id]
+
+    fused = auto_fuse(g)
+    # The IndexMap should be inside a fused region (not standalone).
+    standalone_ims = [n for n in fused.nodes.values() if isinstance(n.op, IndexMapOp)]
+    fused_with_im = [
+        n for n in fused.nodes.values() if isinstance(n.op, FusedRegionOp) and any(isinstance(o, IndexMapOp) for _, o, _ in n.op.region_ops)
+    ]
+    assert not standalone_ims, f"IndexMap should be absorbed into fused region; standalone: {[n.id for n in standalone_ims]}"
+    assert fused_with_im, "Expected at least one fused region containing the IndexMap"
+
+    outputs = _compile_and_run_with_data(g, {"X": x.cpu().flatten().tolist(), "Y": y.cpu().flatten().tolist()})
+    actual = list(outputs.values())[0]
+    max_diff = max(abs(a - e) for a, e in zip(actual, expected, strict=True))
+    assert max_diff < 1e-4, f"transpose+mul fused max_diff={max_diff}"
+
+
+@requires_cuda
+def test_cat_indexmap_in_fused_region_emits_ternary():
+    """Multi-source IndexMap (cat) inside a region: kernel uses Ternary load."""
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.fusion import auto_fuse
+    from deplodock.compiler.ir import Graph, Tensor
+    from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, InputOp
+    from deplodock.compiler.plan import plan_graph
+
+    torch.manual_seed(0)
+    a = torch.randn(1, 28, 8, 64).cuda()
+    b = torch.randn(1, 28, 8, 64).cuda()
+    y = torch.randn(1, 28, 8, 128).cuda()
+    expected = (torch.cat([a, b], dim=-1) * y).cpu().flatten().tolist()
+
+    g = Graph()
+    a_id = g.add_node(InputOp(), [], Tensor("A", (1, 28, 8, 64)), node_id="A")
+    b_id = g.add_node(InputOp(), [], Tensor("B", (1, 28, 8, 64)), node_id="B")
+    y_id = g.add_node(InputOp(), [], Tensor("Y", (1, 28, 8, 128)), node_id="Y")
+    g.inputs = [a_id, b_id, y_id]
+    src_a = IndexSource(
+        input_idx=0,
+        coord_map=(placeholder(0), placeholder(1), placeholder(2), placeholder(3)),
+        select=placeholder(3).lt(Literal(64, "int")),
+    )
+    src_b = IndexSource(
+        input_idx=1,
+        coord_map=(placeholder(0), placeholder(1), placeholder(2), placeholder(3) - Literal(64, "int")),
+    )
+    cat_id = g.add_node(
+        IndexMapOp(out_shape=(1, 28, 8, 128), sources=(src_a, src_b)),
+        [a_id, b_id],
+        Tensor("cat", (1, 28, 8, 128)),
+        node_id="cat",
+    )
+    out_id = g.add_node(ElementwiseOp("mul"), [cat_id, y_id], Tensor("out", (1, 28, 8, 128)), node_id="out")
+    g.outputs = [out_id]
+
+    fused = auto_fuse(g)
+    plan = plan_graph(fused)
+    program = CudaBackend().compile(plan)
+    # The cat IndexMap should be inside a fused region; its kernel source should
+    # contain a ternary (?:) for the source selection.
+    ternary_kernels = [launch for launch in program.launches if "?" in launch.kernel_source and ":" in launch.kernel_source]
+    assert ternary_kernels, "Expected a fused-region kernel with a ?: ternary for the cat select"
+
+    result = CudaBackend().run(
+        program,
+        input_data={
+            "A": a.cpu().flatten().tolist(),
+            "B": b.cpu().flatten().tolist(),
+            "Y": y.cpu().flatten().tolist(),
+        },
+    )
+    actual = list(result.outputs.values())[0]
+    max_diff = max(abs(a - e) for a, e in zip(actual, expected, strict=True))
+    assert max_diff < 1e-4, f"cat+mul fused max_diff={max_diff}"
+
+
+def test_qwen_rotary_chain_fuses_into_region():
+    """After rewrite + auto_fuse, Qwen's rotary chain absorbs IndexMaps + neg into one region per rotary side."""
+    import json
+    from pathlib import Path
+
+    from deplodock.compiler.fusion import auto_fuse
+    from deplodock.compiler.ir import Graph
+    from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, IndexMapOp
+    from deplodock.compiler.rewriter import Rewriter
+
+    fixture = Path(__file__).parent / "fixtures" / "qwen25_7b_layer0.json"
+    with open(fixture) as f:
+        g = Graph.from_dict(json.load(f))
+    g = Rewriter.from_directory(Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules").apply(g)
+    fused = auto_fuse(g)
+
+    # Count regions that absorbed an IndexMap.
+    indexmap_regions = [
+        n for n in fused.nodes.values() if isinstance(n.op, FusedRegionOp) and any(isinstance(o, IndexMapOp) for _, o, _ in n.op.region_ops)
+    ]
+    assert len(indexmap_regions) >= 2, f"Expected ≥2 fused regions absorbing IndexMaps (Q + K rotary chains); got {len(indexmap_regions)}"
+
+    # Standalone elementwise count should drop to ~1 (only add_5 residual).
+    standalone_em = [nid for nid, n in fused.nodes.items() if isinstance(n.op, ElementwiseOp)]
+    assert len(standalone_em) <= 2, f"Too many standalone elementwise ops post-fusion: {standalone_em}"

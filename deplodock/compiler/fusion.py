@@ -68,14 +68,18 @@ def _tensor_size(shape: tuple) -> int:
 
 
 def _is_fusible_op(op, node=None) -> bool:
-    from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+    from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, ReduceOp
 
-    # TransposeOp / ReshapeOp / SliceOp / CatOp / UnsqueezeOp / IndexMapOp are
-    # NOT directly fusible — they emit standalone kernels (or buffer aliases for
-    # identity IndexMaps). Fusing IndexMapOp with surrounding compute requires
-    # in-region coord-map evaluation in loop_lower (planned follow-up); for now
-    # they sit between fused regions as their own kernels.
-    return isinstance(op, (ElementwiseOp, ReduceOp))
+    # IndexMapOp is fusible: loop_lower._emit_loop_ops handles it inline by
+    # substituting placeholder coords with the kernel's per-axis output coords
+    # and emitting indexed Loads. Multi-source IndexMaps (cat) emit a Ternary
+    # over the source selects. Note: contraction regions still reject IndexMaps
+    # via _can_merge's "non-contraction op must be ElementwiseOp" rule — that
+    # constraint is intentional for the first cut.
+    #
+    # TransposeOp / ReshapeOp / SliceOp / CatOp / UnsqueezeOp are NOT directly
+    # fusible — they get lowered to IndexMapOp by the decomposition pass.
+    return isinstance(op, (ElementwiseOp, ReduceOp, IndexMapOp))
 
 
 def _is_contraction_op(nid: str, graph) -> bool:
@@ -164,11 +168,33 @@ def _reduces_compatible(r1_id: str, r2_id: str, graph) -> bool:
 
 def _can_merge(graph, uf, a_id, b_id) -> bool:
     """Check if merging two regions is valid: convex + compatible reduces."""
-    from deplodock.compiler.ops import ReduceOp
+    from deplodock.compiler.ops import IndexMapOp, ReduceOp
 
     region_a = uf.members(a_id)
     region_b = uf.members(b_id)
     merged = region_a | region_b
+
+    # IndexMap-in-region constraint: an IndexMap source reads its input at a
+    # coord_map-transformed position. If the source's input is also in the
+    # region, the producer's value at the reindexed coord isn't available (the
+    # kernel only has the value at the current output position). Permit
+    # in-region sources only when the coord_map is identity (placeholder(d)
+    # for axis d) — then ``var_map[producer]`` already holds the right value.
+    from deplodock.compiler.coord_expr import is_placeholder
+
+    for nid in merged:
+        node = graph.nodes[nid]
+        if isinstance(node.op, IndexMapOp):
+            for src in node.op.sources:
+                if src.input_idx >= len(node.inputs):
+                    continue
+                src_input = node.inputs[src.input_idx]
+                if src_input not in merged:
+                    continue  # external input — load at any coord is fine
+                # In-region source: require identity coord_map.
+                identity = all(is_placeholder(c, d=i) for i, c in enumerate(src.coord_map))
+                if not identity:
+                    return False
 
     # 1. Convexity: the merged region must be a convex subgraph.
     # If there's a path from any node in merged to another node in merged
@@ -309,21 +335,29 @@ def _can_merge(graph, uf, a_id, b_id) -> bool:
 
     if not is_pure_contraction:
         # Collect external input shapes and sizes (excluding trivial ones).
+        # Inputs read EXCLUSIVELY by IndexMapOps are excluded — IndexMap emits
+        # coord-substituted Loads via its own coord_map, so it doesn't need to
+        # share the elementwise broadcast indexing with other inputs.
         ext_inputs: list[tuple[tuple, int]] = []  # (shape, size)
         for nid in merged:
             node = graph.nodes[nid]
             for inp_id in node.inputs:
-                if inp_id not in merged and inp_id in graph.nodes:
-                    inp_shape = graph.nodes[inp_id].output.shape
-                    inp_size = _tensor_size(inp_shape)
-                    if inp_size <= 1:
-                        continue
-                    if len(inp_shape) == 1:
-                        continue  # 1D vector — uses [j] indexing
-                    last_dim = inp_shape[-1] if inp_shape else 1
-                    if isinstance(last_dim, int) and last_dim == 1:
-                        continue
-                    ext_inputs.append((inp_shape, inp_size))
+                if inp_id in merged or inp_id not in graph.nodes:
+                    continue
+                # Determine which in-region nodes consume this external input.
+                consumer_ops_in_region = [graph.nodes[c].op for c in graph.consumers(inp_id) if c in merged]
+                if consumer_ops_in_region and all(isinstance(o, IndexMapOp) for o in consumer_ops_in_region):
+                    continue  # only IndexMaps read this — their own coord_map handles it
+                inp_shape = graph.nodes[inp_id].output.shape
+                inp_size = _tensor_size(inp_shape)
+                if inp_size <= 1:
+                    continue
+                if len(inp_shape) == 1:
+                    continue  # 1D vector — uses [j] indexing
+                last_dim = inp_shape[-1] if inp_shape else 1
+                if isinstance(last_dim, int) and last_dim == 1:
+                    continue
+                ext_inputs.append((inp_shape, inp_size))
         if ext_inputs:
             max_size = max(s for _, s in ext_inputs)
             # Find the shape of the largest input (reference for broadcast checks).
