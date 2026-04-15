@@ -511,15 +511,12 @@ class KernelOp(Op):
 
     @property
     def region_ops(self) -> list:
+        # Core fields are classification annotations that reference nodes
+        # already held in prologue/epilogue (by Node identity). To avoid
+        # double-counting, walk prologue + epilogue only.
         result: list = []
         for node in self.prologue:
             result.append((node.id, node.op, list(node.inputs)))
-        if isinstance(self.core, tuple):
-            for stage in self.core:
-                for node in stage.pre_ops:
-                    result.append((node.id, node.op, list(node.inputs)))
-                r = stage.reduce
-                result.append((r.id, r.op, list(r.inputs)))
         for node in self.epilogue:
             result.append((node.id, node.op, list(node.inputs)))
         return result
@@ -537,11 +534,6 @@ class KernelOp(Op):
         result: dict = dict(self.external_shapes)
         for node in self.prologue:
             result[node.id] = tuple(node.output.shape)
-        if isinstance(self.core, tuple):
-            for stage in self.core:
-                for node in stage.pre_ops:
-                    result[node.id] = tuple(node.output.shape)
-                result[stage.reduce.id] = tuple(stage.reduce.output.shape)
         for node in self.epilogue:
             result[node.id] = tuple(node.output.shape)
         return result

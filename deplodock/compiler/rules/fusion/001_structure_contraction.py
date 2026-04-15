@@ -44,20 +44,18 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     if contraction is None:
         return graph
 
-    a_port, b_port, k_axis, mul_id, sum_id, epilogue_nodes = contraction
+    a_port, b_port, k_axis, _mul_id, _sum_id, _epilogue_nodes = contraction
 
-    # Build the new KernelOp with ContractionCore. Drop mul and sum from the
-    # prologue; any remaining ops (elementwise preceding the mul) stay; ops
-    # after the sum move to epilogue.
-    new_prologue = tuple(n for n in kernel.prologue if n.id != mul_id and n.id != sum_id and n.id not in {e.id for e in epilogue_nodes})
-    new_epilogue = tuple(epilogue_nodes)
-
+    # Annotation-only restructure: leave prologue intact (so backend compat
+    # properties still see mul/sum nodes) and set ``core`` as a classification
+    # marker. Later refactor stages migrate backend readers to use the core
+    # field directly, at which point mul/sum can be dropped from prologue.
     new_kernel = KernelOp(
         inputs=list(kernel.inputs),
         outputs=list(kernel.outputs),
-        prologue=new_prologue,
+        prologue=kernel.prologue,
         core=ContractionCore(a=a_port, b=b_port, k_axis=k_axis),
-        epilogue=new_epilogue,
+        epilogue=kernel.epilogue,
         kernel_source=kernel.kernel_source,
         external_shapes=dict(kernel.external_shapes),
     )

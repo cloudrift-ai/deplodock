@@ -146,7 +146,7 @@ class Pass:
         return graph
 
 
-DEFAULT_PASS_ORDER = ["decomposition", "optimization"]
+DEFAULT_PASS_ORDER = ["decomposition", "optimization", "fusion"]
 
 
 class Rewriter:
