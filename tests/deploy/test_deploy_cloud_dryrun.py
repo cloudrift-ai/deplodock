@@ -81,6 +81,78 @@ def test_deploy_cloud_dry_run_deploy_steps(run_cli, tmp_path):
     assert "dry-run (not deployed)" in stdout
 
 
+def test_deploy_cloud_provider_flag_override_dry_run(run_cli, tmp_path):
+    """--provider gcp forces GCP dispatch for an H200 (CloudRift is default)."""
+    recipe = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 1,
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+            }
+        },
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA H200 141GB",
+                "deploy.gpu_count": 1,
+            },
+        ],
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+
+    rc, stdout, stderr = run_cli(
+        "deploy",
+        "cloud",
+        "--recipe",
+        str(tmp_path),
+        "--gpu",
+        "NVIDIA H200 141GB",
+        "--gpu-count",
+        "1",
+        "--provider",
+        "gcp",
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    assert "-> gcp a3-ultragpu-1g" in stdout
+
+
+def test_deploy_cloud_provider_default_is_cloudrift_for_h200(run_cli, tmp_path):
+    """Without --provider, H200 defaults to CloudRift (first entry in hardware table)."""
+    recipe = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 1,
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+            }
+        },
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA H200 141GB",
+                "deploy.gpu_count": 1,
+            },
+        ],
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+
+    rc, stdout, stderr = run_cli(
+        "deploy",
+        "cloud",
+        "--recipe",
+        str(tmp_path),
+        "--gpu",
+        "NVIDIA H200 141GB",
+        "--gpu-count",
+        "1",
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    assert "-> cloudrift h200-24-200-1000-generic.1" in stdout
+
+
 def test_deploy_cloud_missing_gpu_flag_fails(run_cli, recipes_dir):
     """Without --gpu and --gpu-count, cloud deploy fails (required args)."""
     rc, stdout, stderr = run_cli(

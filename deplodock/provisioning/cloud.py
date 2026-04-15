@@ -68,14 +68,39 @@ def resolve_vm_spec(loaded_configs, server_name=None):
     return gpu_name, max_gpu_count
 
 
+def _select_provider_entry(gpu_name, gpu_entries, provider):
+    """Pick a (provider, base_type) tuple from the hardware table.
+
+    If provider is None, use the first entry (preference order). If provider
+    is set, find the matching entry or raise ValueError with the available
+    providers for this GPU.
+    """
+    if provider is None:
+        return gpu_entries[0]
+    for entry in gpu_entries:
+        if entry[0] == provider:
+            return entry
+    available = [p for p, _ in gpu_entries]
+    raise ValueError(f"GPU '{gpu_name}' not available on provider '{provider}'. Available: {available}")
+
+
 async def provision_cloud_vm(
-    gpu_name, gpu_count, ssh_key, providers_config=None, server_name=None, dry_run=False, logger=None, max_retries=DEFAULT_PROVISION_RETRIES
+    gpu_name,
+    gpu_count,
+    ssh_key,
+    providers_config=None,
+    server_name=None,
+    dry_run=False,
+    logger=None,
+    max_retries=DEFAULT_PROVISION_RETRIES,
+    provider=None,
 ):
     """Provision a cloud VM for the given GPU requirements.
 
     Retries up to max_retries times on failure (e.g. transient provider issues).
     Looks up the provider from the hardware table and dispatches to the
-    provider's create_instance().
+    provider's create_instance(). If provider is set, overrides the default
+    preference order in the hardware table.
 
     Returns:
         VMConnectionInfo on success, None on failure.
@@ -87,12 +112,14 @@ async def provision_cloud_vm(
         logger.error(f"Unknown GPU '{gpu_name}' — not in hardware table")
         return None
 
-    provider, base_type = gpu_entries[0]
-    instance_type = resolve_instance_type(provider, base_type, gpu_count)
-    logger.info(f"GPU: {gpu_name} x{gpu_count} -> {provider} {instance_type}")
+    selected_provider, base_type = _select_provider_entry(gpu_name, gpu_entries, provider)
+    instance_type = resolve_instance_type(selected_provider, base_type, gpu_count)
+    logger.info(f"GPU: {gpu_name} x{gpu_count} -> {selected_provider} {instance_type}")
 
     for attempt in range(1, max_retries + 1):
-        conn = await _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key, providers_config, server_name, dry_run, logger)
+        conn = await _provision_once(
+            selected_provider, instance_type, gpu_name, gpu_count, ssh_key, providers_config, server_name, dry_run, logger
+        )
         if conn is not None or dry_run:
             return conn
 

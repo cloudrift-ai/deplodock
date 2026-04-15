@@ -78,6 +78,7 @@ async def run_execution_group(
     no_teardown: bool = False,
     on_task_done: OnTaskDone | None = None,
     preallocated_conn=None,
+    provider: str | None = None,
 ) -> tuple[list[tuple[BenchmarkTask, bool]], dict | None]:
     """Run all benchmark tasks for one execution group.
 
@@ -135,6 +136,7 @@ async def run_execution_group(
                 server_name=group_label,
                 dry_run=dry_run,
                 logger=logger,
+                provider=provider,
             )
             if conn is None:
                 logger.error("VM provisioning failed")
@@ -313,6 +315,7 @@ async def _run_groups_on_hosts(
     ssh_key,
     dry_run,
     on_task_done: OnTaskDone | None = None,
+    provider: str | None = None,
 ):
     """Run execution groups on a fixed pool of pre-allocated hosts.
 
@@ -349,6 +352,7 @@ async def _run_groups_on_hosts(
                     no_teardown=True,  # never delete fixed hosts
                     on_task_done=on_task_done,
                     preallocated_conn=host.conn,
+                    provider=provider,
                 )
         finally:
             in_use.discard(id(host))
@@ -364,6 +368,7 @@ async def _run_groups(
     max_workers,
     no_teardown=False,
     on_task_done: OnTaskDone | None = None,
+    provider: str | None = None,
 ):
     """Run execution groups concurrently with a semaphore."""
     sem = asyncio.Semaphore(max_workers or len(groups))
@@ -377,6 +382,7 @@ async def _run_groups(
                 dry_run,
                 no_teardown,
                 on_task_done,
+                provider=provider,
             )
 
     results = await asyncio.gather(
