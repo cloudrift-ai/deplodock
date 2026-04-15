@@ -106,7 +106,7 @@ def lower_generic(
 def _emit_grid(schedule: Schedule) -> list:
     grid = schedule.grid
     if grid.type == "1d":
-        axis_name = "i" if schedule.accum.shape is None else "row"
+        axis_name = "i" if schedule.pattern == "pointwise" else "row"
         return [ParallelAxis(axis_name, "blockIdx.x", grid.bound)]
     if grid.type == "1d_contraction":
         # Online reduction: 1D grid over M-tiles, N is tiled sequentially.
@@ -162,13 +162,11 @@ def _emit_grid(schedule: Schedule) -> list:
 
 def _emit_accumulators(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list:
     ops: list = []
-    accum = schedule.accum
 
-    if accum.shape is None:
-        # Pointwise: no accumulators
+    if schedule.pattern == "pointwise":
         return ops
 
-    if accum.shape == ():
+    if schedule.pattern != "contraction":
         # Scalar accumulators (one per reduce op)
         for _node in region.phases()[1]:
             acc_name = f"acc_{_safe(_node.id)}"
@@ -176,7 +174,7 @@ def _emit_accumulators(schedule: Schedule, region: KernelOp, shapes: dict[str, t
         return ops
 
     # 2D register tile (contraction)
-    ops.append(Alloc("c", accum.dtype, accum.shape, "reg", Literal(0.0)))
+    ops.append(Alloc("c", "float", (schedule.thread_m, schedule.thread_n), "reg", Literal(0.0)))
 
     # Batch pointer aliases for contraction
     cinfo = region.contraction_info(shapes)
@@ -204,13 +202,11 @@ def _emit_reductions(
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
-    accum = schedule.accum
-
-    if accum.shape is None:
+    if schedule.pattern == "pointwise":
         # Pointwise: no reduction, just inline all ops inside a guard
         return _emit_pointwise_body(region, shapes, schedule)
 
-    if accum.shape == ():
+    if schedule.pattern != "contraction":
         # Scalar reduction (row_reduce / reduce_broadcast / multi-reduce)
         return _emit_scalar_reductions(schedule, region, shapes)
 
@@ -739,9 +735,8 @@ def _emit_epilogue(
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
-    accum = schedule.accum
     phases = _phases_view(region)
-    if accum.shape is None:
+    if schedule.pattern == "pointwise":
         # Pointwise: epilogue was inlined in the pointwise body
         return []
 
@@ -749,7 +744,7 @@ def _emit_epilogue(
         # Online reduction handles epilogue internally
         return []
 
-    if accum.shape != ():
+    if schedule.pattern == "contraction":
         # Contraction register tile epilogue
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4
@@ -839,9 +834,7 @@ def _emit_write(
     schedule: Schedule,
     region: KernelOp,
 ) -> list:
-    accum = schedule.accum
-
-    if accum.shape is None:
+    if schedule.pattern == "pointwise":
         # Pointwise: writes were already emitted in the guard body
         return []
 
@@ -849,7 +842,7 @@ def _emit_write(
         # Online reduction handles writes internally
         return []
 
-    if accum.shape != ():
+    if schedule.pattern == "contraction":
         # Contraction register tile write
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4

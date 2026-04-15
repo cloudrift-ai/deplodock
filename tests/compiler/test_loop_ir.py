@@ -4,7 +4,7 @@ import json
 
 from deplodock.compiler.backend.cuda.generators import analyze, build_schedule, lower_generic, lower_to_loop_ir
 from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
-from deplodock.compiler.backend.cuda.schedule import AccumulatorSpec, GridSpec, Schedule
+from deplodock.compiler.backend.cuda.schedule import GridSpec, Schedule
 from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
 from deplodock.compiler.backend.ir.loop_ir import (
     Accum,
@@ -35,8 +35,7 @@ def _mock_schedule(block_size=(256, 1, 1), tile_m=None, tile_n=None):
     """Build a minimal Schedule for tests that need block_size/tile info."""
     return Schedule(
         grid=GridSpec("1d", block_size),
-        accum=AccumulatorSpec(None),
-        reductions=[],
+        pattern="pointwise",
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -518,8 +517,7 @@ def test_build_schedule_pointwise():
     )
     sched = build_schedule(analysis)
     assert sched.grid.type == "1d"
-    assert sched.accum.shape is None
-    assert len(sched.reductions) == 0
+    assert sched.pattern == "pointwise"
 
 
 def test_build_schedule_reduce():
@@ -533,9 +531,7 @@ def test_build_schedule_reduce():
     sched = build_schedule(analysis)
     assert sched.grid.type == "1d"
     assert sched.grid.bound == "rows"
-    assert sched.accum.shape == ()
-    assert len(sched.reductions) == 1
-    assert sched.reductions[0].warp_reduce_after is True
+    assert sched.pattern == "row_reduce"
 
 
 def test_build_schedule_contraction():
@@ -551,9 +547,9 @@ def test_build_schedule_contraction():
     )
     sched = build_schedule(analysis, strategy="naive")
     assert sched.grid.type == "2d_swizzle"
-    assert sched.accum.shape == (8, 4)  # thread_m=8, thread_n=4
-    assert len(sched.reductions) == 1
-    assert sched.reductions[0].warp_reduce_after is False
+    assert sched.pattern == "contraction"
+    assert sched.thread_m == 8
+    assert sched.thread_n == 4
     assert sched.tile_m == 64  # ty(8) * thread_m(8)
     assert sched.tile_n == 128  # tx(32) * thread_n(4)
 
