@@ -45,13 +45,8 @@ class Schedule:
     """Complete kernel structure specification."""
 
     grid: GridSpec
-    # Pattern this schedule targets: "pointwise" | "row_reduce" |
-    # "reduce_broadcast" | "multi_reduce" | "contraction".  Drives the
-    # branches in lower_generic (pointwise body vs scalar reduction vs
-    # register-tile contraction).
-    pattern: str = "pointwise"
 
-    # Contraction tile dims (only when pattern == "contraction")
+    # Contraction tile dims (populated when the region is a contraction)
     tile_m: int | None = None
     tile_n: int | None = None
     thread_m: int | None = None
@@ -104,7 +99,6 @@ def build_schedule(
     if pattern == "pointwise":
         return Schedule(
             grid=GridSpec("1d", (256, 1, 1), bound="n"),
-            pattern="pointwise",
             dim_params=[("int", "n")],
         )
 
@@ -156,7 +150,6 @@ def build_schedule(
 
         return Schedule(
             grid=GridSpec(grid_type, (tx, ty, 1)),
-            pattern="contraction",
             tile_m=tile_m,
             tile_n=tile_n,
             thread_m=thread_m,
@@ -176,7 +169,6 @@ def build_schedule(
     # row_reduce or reduce_broadcast
     return Schedule(
         grid=GridSpec("1d", (256, 1, 1), bound="rows"),
-        pattern=pattern,
         epilogue_per_element=analysis.epilogue_needs_per_element,
         dim_params=[("int", "rows"), ("int", "cols")],
     )

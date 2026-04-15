@@ -35,7 +35,6 @@ def _mock_schedule(block_size=(256, 1, 1), tile_m=None, tile_n=None):
     """Build a minimal Schedule for tests that need block_size/tile info."""
     return Schedule(
         grid=GridSpec("1d", block_size),
-        pattern="pointwise",
         tile_m=tile_m,
         tile_n=tile_n,
     )
@@ -517,7 +516,7 @@ def test_build_schedule_pointwise():
     )
     sched = build_schedule(analysis)
     assert sched.grid.type == "1d"
-    assert sched.pattern == "pointwise"
+    assert sched.grid.bound == "n"
 
 
 def test_build_schedule_reduce():
@@ -531,7 +530,6 @@ def test_build_schedule_reduce():
     sched = build_schedule(analysis)
     assert sched.grid.type == "1d"
     assert sched.grid.bound == "rows"
-    assert sched.pattern == "row_reduce"
 
 
 def test_build_schedule_contraction():
@@ -547,7 +545,6 @@ def test_build_schedule_contraction():
     )
     sched = build_schedule(analysis, strategy="naive")
     assert sched.grid.type == "2d_swizzle"
-    assert sched.pattern == "contraction"
     assert sched.thread_m == 8
     assert sched.thread_n == 4
     assert sched.tile_m == 64  # ty(8) * thread_m(8)
