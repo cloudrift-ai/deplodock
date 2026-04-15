@@ -492,20 +492,32 @@ class KernelOp(Op):
     @property
     def region_ops(self) -> list:
         # Emit (id, op, inputs) tuples in topo order across prologue →
-        # ContractionCore nodes (mul then reduce) → epilogue. ReduceStage
-        # nodes are still hosted in prologue; no extra emission for them.
+        # core nodes → epilogue. Handles:
+        #   - ContractionCore: emit mul then reduce after prologue
+        #   - tuple[ReduceStage]: emit each stage's pre_ops + reduce
+        # ReduceStage nodes ALSO appear when annotated rules (legacy 002)
+        # leave them in prologue — dedup by id.
+        seen: set[str] = set()
         result: list = []
+
+        def emit(node):
+            if node is None or node.id in seen:
+                return
+            seen.add(node.id)
+            result.append((node.id, node.op, list(node.inputs)))
+
         for node in self.prologue:
-            result.append((node.id, node.op, list(node.inputs)))
+            emit(node)
         if isinstance(self.core, ContractionCore):
-            if self.core.mul is not None:
-                m = self.core.mul
-                result.append((m.id, m.op, list(m.inputs)))
-            if self.core.reduce is not None:
-                r = self.core.reduce
-                result.append((r.id, r.op, list(r.inputs)))
+            emit(self.core.mul)
+            emit(self.core.reduce)
+        elif isinstance(self.core, tuple):
+            for stage in self.core:
+                for pre in stage.pre_ops:
+                    emit(pre)
+                emit(stage.reduce)
         for node in self.epilogue:
-            result.append((node.id, node.op, list(node.inputs)))
+            emit(node)
         return result
 
     @property
@@ -526,6 +538,12 @@ class KernelOp(Op):
                 result[self.core.mul.id] = tuple(self.core.mul.output.shape)
             if self.core.reduce is not None:
                 result[self.core.reduce.id] = tuple(self.core.reduce.output.shape)
+        elif isinstance(self.core, tuple):
+            for stage in self.core:
+                for pre in stage.pre_ops:
+                    result[pre.id] = tuple(pre.output.shape)
+                if stage.reduce is not None:
+                    result[stage.reduce.id] = tuple(stage.reduce.output.shape)
         for node in self.epilogue:
             result[node.id] = tuple(node.output.shape)
         return result
