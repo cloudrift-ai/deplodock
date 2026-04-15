@@ -164,8 +164,8 @@ def test_contraction_with_epilogue():
     assert analysis.cols == 6
     assert analysis.k_dim == 8
     assert len(analysis.op_phases.epilogue) == 1
-    epi_nid, epi_op, epi_inputs = analysis.op_phases.epilogue[0]
-    assert epi_op.fn == "add"
+    epi_node = analysis.op_phases.epilogue[0]
+    assert epi_node.op.fn == "add"
 
 
 def test_input_access_patterns():

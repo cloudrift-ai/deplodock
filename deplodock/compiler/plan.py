@@ -215,16 +215,20 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
         elif isinstance(op, ops_module.KernelOp):
             tag = "fused_region"
             params["kernel_source"] = op.kernel_source
-            region_ops = op.body_ops()
-            params["region_ops_count"] = len(region_ops)
-            params["_region_ops"] = region_ops  # for backend matmul detection
+            body_nodes = op.body_ops()
+            # Plan serialization uses (id, op, inputs) tuples for cross-process
+            # / dump portability — Node objects carry Tensor shape metadata
+            # we don't want to pickle.
+            region_tuples = [(n.id, n.op, list(n.inputs)) for n in body_nodes]
+            params["region_ops_count"] = len(region_tuples)
+            params["_region_ops"] = region_tuples
             # Store input shapes so the backend can infer matmul K dimension.
             all_shapes = {inp_id: graph.nodes[inp_id].output.shape for inp_id in node.inputs if inp_id in graph.nodes}
             # Include shapes for intermediate region op nodes (needed by kernel_gen
             # to determine reduction dimensions).
-            for rid, _, _ in region_ops:
-                if rid in graph.nodes:
-                    all_shapes[rid] = graph.nodes[rid].output.shape
+            for n in body_nodes:
+                if n.id in graph.nodes:
+                    all_shapes[n.id] = graph.nodes[n.id].output.shape
             params["_input_shapes"] = all_shapes
             # Build full shapes map (external + internal) for kernel generation.
             full_shapes: dict = dict(op.external_shapes)

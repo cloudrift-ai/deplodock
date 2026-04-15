@@ -108,14 +108,14 @@ def _contraction_epilogue_code(
 
     lines: list[str] = []
     # Track which node_id the accumulators currently represent.
-    prev_id = phases.reduces[0][0]
+    prev_id = phases.reduces[0].id
 
-    for epi_nid, epi_op, epi_inputs in phases.epilogue:
-        fn = epi_op.fn
+    for _node in phases.epilogue:
+        fn = _node.op.fn
         # For binary ops, find the "other" input (not the accumulator chain).
         other = None
-        if len(epi_inputs) == 2:
-            for inp in epi_inputs:
+        if len(_node.inputs) == 2:
+            for inp in _node.inputs:
                 if inp != prev_id:
                     other = inp
                     break
@@ -136,7 +136,7 @@ def _contraction_epilogue_code(
                     op_str = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[fn]
                     # Respect operand order: if accumulator is the second input,
                     # we need to reverse for sub/div.
-                    if epi_inputs[0] == prev_id:
+                    if _node.inputs[0] == prev_id:
                         lines.append(f"{acc}{op_str}={safe}[{idx}];")
                     else:
                         lines.append(f"{acc}={safe}[{idx}]{op_str}{acc};")
@@ -151,7 +151,7 @@ def _contraction_epilogue_code(
                 elif fn == "recip":
                     lines.append(f"{acc}=1.0f/{acc};")
 
-        prev_id = epi_nid
+        prev_id = _node.id
 
     return "\n".join(lines)
 
@@ -178,12 +178,12 @@ def _contraction_softmax_epilogue_code(
 
     # Phase 0: apply ops between contraction reduce and softmax max (e.g. scale).
     if phases.inter_reduce:
-        prev_id = phases.reduces[0][0]  # contraction reduce output
-        for nid, op, inputs in phases.inter_reduce[0]:
-            fn = op.fn
+        prev_id = phases.reduces[0].id  # contraction reduce output
+        for _node in phases.inter_reduce.id:
+            fn = _node.op.fn
             other = None
-            if len(inputs) == 2:
-                for inp in inputs:
+            if len(_node.inputs) == 2:
+                for inp in _node.inputs:
                     if inp != prev_id:
                         other = inp
                         break
@@ -204,13 +204,13 @@ def _contraction_softmax_epilogue_code(
                         else:
                             idx = f"(bm+tr+{r})*N+bn+tc+{c}"
                         op_str = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[fn]
-                        if inputs[0] == prev_id:
+                        if _node.inputs[0] == prev_id:
                             lines.append(f"{acc}{op_str}={safe}[{idx}];")
                         else:
                             lines.append(f"{acc}={safe}[{idx}]{op_str}{acc};")
                     elif fn == "exp":
                         lines.append(f"{acc}=expf({acc});")
-            prev_id = nid
+            prev_id = _node.id
 
     # Phase 1: row max via warp shuffle.
     for r in range(thread_m):
@@ -227,18 +227,18 @@ def _contraction_softmax_epilogue_code(
                 acc = f"c{r}{c}"
                 lines.append(f"if(bn+tc+{c}<N){{")
                 # Apply sub and exp from inter_reduce[1]
-                for _nid, op, _inputs in phases.inter_reduce[1]:
-                    if op.fn == "sub":
+                for _node in phases.inter_reduce.op:
+                    if _node.op.fn == "sub":
                         lines.append(f"  {acc}-=rmax{r};")
-                    elif op.fn == "exp":
+                    elif _node.op.fn == "exp":
                         lines.append(f"  {acc}=expf({acc});")
                 lines.append(f"  rsum{r}+={acc};")
                 lines.append("}")
             lines.append(f"for(int o=16;o>0;o>>=1)rsum{r}+=__shfl_xor_sync(0xffffffff,rsum{r},o);")
 
     # Phase 3: apply epilogue (div).
-    for _epi_nid, epi_op, _inputs in phases.epilogue:
-        if epi_op.fn == "div":
+    for _node in phases.epilogue:
+        if _node.op.fn == "div":
             for r in range(thread_m):
                 for c in range(thread_n):
                     lines.append(f"if(bn+tc+{c}<N)c{r}{c}/=rsum{r};")
@@ -497,21 +497,21 @@ def _emit_ops(
         List of VarDecl statements.
     """
     stmts = []
-    for node_id, op, input_ids in ops:
-        if isinstance(op, (ReshapeOp, TransposeOp)):
-            if input_ids and input_ids[0] in var_map:
-                var_map[node_id] = var_map[input_ids[0]]
+    for _node in ops:
+        if isinstance(_node.op, (ReshapeOp, TransposeOp)):
+            if _node.inputs and _node.inputs[0] in var_map:
+                var_map[_node.id] = var_map[_node.inputs[0]]
             continue
 
-        if isinstance(op, ElementwiseOp):
-            a = var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
-            b = var_map.get(input_ids[1], Literal(0.0)) if len(input_ids) > 1 else Literal(0.0)
-            expr = _build_expr(op.fn, a, b)
+        if isinstance(_node.op, ElementwiseOp):
+            a = var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
+            b = var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
+            expr = _build_expr(_node.op.fn, a, b)
             if expr is None:
                 expr = Literal(0.0)
-            var_name = f"{prefix}{_safe(node_id)}"
+            var_name = f"{prefix}{_safe(_node.id)}"
             stmts.append(VarDecl("float", var_name, expr))
-            var_map[node_id] = Var(var_name)
+            var_map[_node.id] = Var(var_name)
 
     return stmts
 
@@ -703,10 +703,10 @@ def _lower_naive(
 
     # --- Phase 2: Accumulator declarations ---
     reduce_vars: dict[str, tuple[str, str]] = {}  # node_id → (acc_var_name, fn)
-    for node_id, op, _ in phases.reduces:
-        acc_name = f"acc_{_safe(node_id)}"
-        body.append(VarDecl("float", acc_name, _reduce_init(op.fn)))
-        reduce_vars[node_id] = (acc_name, op.fn)
+    for _node in phases.reduces:
+        acc_name = f"acc_{_safe(_node.id)}"
+        body.append(VarDecl("float", acc_name, _reduce_init(_node.op.fn)))
+        reduce_vars[_node.id] = (acc_name, _node.op.fn)
 
     # --- Phase 3+4+5: Tile loop with prologue + accumulation ---
     if is_contraction:
@@ -905,7 +905,9 @@ def _lower_naive(
         # Multi-reduce (e.g. softmax: max → sub → exp → sum → div).
         # Emit one tile loop per reduce pass, then a final epilogue pass.
         # Each pass re-reads inputs from global memory (L2-cached for small rows).
-        for ri, (node_id, _op, input_ids) in enumerate(phases.reduces):
+        for ri, _node in enumerate(phases.reduces):
+            node_id = _node.id
+            input_ids = _node.inputs
             acc_name, fn = reduce_vars[node_id]
             pass_body: list = []
 
@@ -919,17 +921,17 @@ def _lower_naive(
 
             # Re-compute prologue ops needed by this reduce or its inter_reduce ops.
             all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
-            needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
-            for pid, pop, pinp in phases.prologue:
-                if isinstance(pop, ElementwiseOp) and pid in needed:
-                    a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
-                    b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
-                    expr = _build_expr(pop.fn, a, b)
+            needed = _needed_by(all_ops_this_pass + [_node])
+            for _node in phases.prologue:
+                if isinstance(_node.op, ElementwiseOp) and _node.id in needed:
+                    a = pass_var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
+                    b = pass_var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
+                    expr = _build_expr(_node.op.fn, a, b)
                     if expr is None:
                         expr = Literal(0.0)
-                    vn = f"r{ri}p_{_safe(pid)}"
+                    vn = f"r{ri}p_{_safe(_node.id)}"
                     pass_body.append(VarDecl("float", vn, expr))
-                    pass_var_map[pid] = Var(vn)
+                    pass_var_map[_node.id] = Var(vn)
 
             # Apply inter_reduce ops (e.g. sub, exp between max and sum).
             if ri > 0 and phases.inter_reduce:
@@ -959,16 +961,16 @@ def _lower_naive(
             # Re-compute ALL prologue + inter_reduce ops (epilogue may
             # transitively depend on any of them via intermediate nodes).
             all_inter_ops = [op for group in phases.inter_reduce for op in group]
-            for pid, pop, pinp in phases.prologue + all_inter_ops:
-                if isinstance(pop, ElementwiseOp):
-                    a = epi_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
-                    b = epi_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
-                    expr = _build_expr(pop.fn, a, b)
+            for _node in phases.prologue + all_inter_ops:
+                if isinstance(_node.op, ElementwiseOp):
+                    a = epi_var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
+                    b = epi_var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
+                    expr = _build_expr(_node.op.fn, a, b)
                     if expr is None:
                         expr = Literal(0.0)
-                    vn = f"ep_{_safe(pid)}"
+                    vn = f"ep_{_safe(_node.id)}"
                     epi_body.append(VarDecl("float", vn, expr))
-                    epi_var_map[pid] = Var(vn)
+                    epi_var_map[_node.id] = Var(vn)
 
             epi_body.extend(_emit_ops(epilogue_ops, epi_var_map, "e_"))
 
@@ -992,9 +994,9 @@ def _lower_naive(
         loop_body.extend(_emit_ops(phases.prologue, var_map, "p_"))
 
         # Accumulation
-        for node_id, _op, input_ids in phases.reduces:
-            acc_name, fn = reduce_vars[node_id]
-            val = var_map.get(input_ids[0], Literal(0.0))
+        for _node in phases.reduces:
+            acc_name, fn = reduce_vars[_node.id]
+            val = var_map.get(_node.inputs[0], Literal(0.0))
             if fn == "sum":
                 loop_body.append(AugAssign(acc_name, "+=", val))
             else:
@@ -1018,16 +1020,16 @@ def _lower_naive(
                     epi_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
 
                 needed = _needed_by(epilogue_ops)
-                for node_id, op, input_ids in phases.prologue:
-                    if isinstance(op, ElementwiseOp) and node_id in needed:
-                        a = epi_var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
-                        b = epi_var_map.get(input_ids[1], Literal(0.0)) if len(input_ids) > 1 else Literal(0.0)
-                        expr = _build_expr(op.fn, a, b)
+                for _node in phases.prologue:
+                    if isinstance(_node.op, ElementwiseOp) and _node.id in needed:
+                        a = epi_var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
+                        b = epi_var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
+                        expr = _build_expr(_node.op.fn, a, b)
                         if expr is None:
                             expr = Literal(0.0)
-                        vn = f"p_{_safe(node_id)}"
+                        vn = f"p_{_safe(_node.id)}"
                         epi_body.append(VarDecl("float", vn, expr))
-                        epi_var_map[node_id] = Var(vn)
+                        epi_var_map[_node.id] = Var(vn)
 
                 epi_body.extend(_emit_ops(epilogue_ops, epi_var_map, "e_"))
 

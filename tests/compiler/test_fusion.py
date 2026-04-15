@@ -34,7 +34,8 @@ def _fused_regions(g: Graph) -> list:
 def _region_op_types(region) -> list[str]:
     """Return list of op type strings from a FusedRegionOp."""
     result = []
-    for _, op, _ in region.op.body_ops():
+    for _node in region.op.body_ops():
+        op = _node.op
         t = type(op).__name__
         fn = getattr(op, "fn", "")
         result.append(f"{t}({fn})" if fn else t)
