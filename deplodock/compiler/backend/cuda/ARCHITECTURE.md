@@ -37,19 +37,23 @@ KernelOp → analyze() → TileAnalysis ──→ build_schedule() → Schedule
                                                                      lower_generic() → LoopProgram
 ```
 
-`analyze()` dispatches on `kernel.core` type (structured fields set by the
-fusion rules in `rules/fusion/*.py`):
-- `ContractionCore` (with optional `post_stages`) → pattern=contraction.
-  `_detect_contraction()` reads `core.a` / `core.b` Port buffer_ids
-  directly; no scanning. Combined matmul→softmax kernels carry their
-  downstream row reduces in `core.post_stages`, and `_split_phases()`
-  walks prologue + post_stages to build the reduces / inter_reduce /
-  epilogue alternation.
-- `tuple[ReduceStage, ...]` → pattern=row_reduce / reduce_broadcast.
-  First stage's reduce marks end-of-prologue; per-stage `pre_ops` become
-  `OpPhases.inter_reduce` entries; nodes after the last reduce become
-  `OpPhases.epilogue`.
-- `None` → pattern=pointwise; all prologue nodes emit inline.
+`analyze()` is pure assembly — it calls accessor methods on
+`KernelOp` (Layer 1 IR) and packs the results into ``TileAnalysis``.
+Source of truth lives on `KernelOp`:
+- `body_ops()`, `phases()`, `reduce_fn_names()`, `port_indexmaps()` —
+  pure structural decomposition of the core annotation.
+- `input_accesses(shapes, output_shape)` — per-input AccessPattern dict.
+- `contraction_info(shapes)` — `ContractionInfo | None` resolving M/N/K
+  + batch_dims + GQA batch groups for ContractionCore kernels.
+- `epilogue_needs_per_element(shapes, output_shape)` — bool indicating
+  whether the epilogue requires a second per-element pass (RMSNorm-style).
+- `tile_pattern(shapes, output_shape)` →
+  `"pointwise" | "row_reduce" | "reduce_broadcast" | "contraction"`.
+- `tile_dims(shapes, output_shape)` → `(rows, cols, k_dim)`.
+
+Combined matmul→softmax kernels carry their downstream row reduces in
+`core.post_stages`; `KernelOp.phases()` walks prologue + post_stages to
+build the reduces / inter_reduce / epilogue alternation.
 
 The `analysis.flat_region_ops(kernel)` helper returns a dedup'd
 `(id, op, inputs)` list covering prologue + core + epilogue in topo

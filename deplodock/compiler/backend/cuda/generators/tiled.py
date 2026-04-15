@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 
-from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by, flat_region_ops
+from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, flat_region_ops
 from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
@@ -39,6 +39,7 @@ from deplodock.compiler.backend.ir.kernel_ir import (
     VarDecl,
 )
 from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReshapeOp, TransposeOp
+from deplodock.compiler.ops import _needed_by_ids as _needed_by
 
 # ---------------------------------------------------------------------------
 # Convenience entry points (moved from fused.py and matmul.py shims)
