@@ -341,6 +341,39 @@ def _emit_input_loads(
         var_map[inp] = Var(load_name)
 
 
+def _emit_body_node(
+    node,
+    var_map: dict[str, LoopExpr],
+    prefix: str,
+    body: list,
+    coord_mapping,
+    shapes,
+    in_region_ids,
+) -> None:
+    """Emit one body node (Elementwise or IndexMap) into ``body`` + ``var_map``.
+
+    These are the two node types that appear inside a KernelOp body after
+    fusion: Elementwise computes from var_map; IndexMap loads from an
+    external buffer with a coord substitution.  Everything else
+    (Reshape/Transpose) is lowered upstream; Reduce nodes are peeled out
+    by the phase emitters and never reach this helper.
+    """
+    from deplodock.compiler.ops import IndexMapOp
+
+    match node.op:
+        case IndexMapOp():
+            _emit_indexmap(node.id, node.op, node.inputs, var_map, prefix, body, coord_mapping, shapes, in_region_ids)
+        case ElementwiseOp():
+            a = var_map.get(node.inputs[0], Literal(0.0)) if node.inputs else Literal(0.0)
+            b = var_map.get(node.inputs[1], Literal(0.0)) if len(node.inputs) > 1 else Literal(0.0)
+            var_name = f"{prefix}{_safe(node.id)}"
+            args = [a] if len(node.inputs) == 1 else [a, b]
+            body.append(Let(var_name, OpCall(node.op.fn, args)))
+            var_map[node.id] = Var(var_name)
+        case _:
+            raise TypeError(f"Unexpected op in kernel body: {type(node.op).__name__} (node {node.id})")
+
+
 def _recompute_ops_into(
     ops: list,
     var_map: dict[str, LoopExpr],
@@ -351,25 +384,13 @@ def _recompute_ops_into(
     include_ids,
     needed: set | None,
 ) -> None:
-    """Emit IndexMap/Elementwise ops into body+var_map with shared filter logic.
-
-    Used by per-reduce prologue recompute and per-element-epilogue recompute.
-    When ``needed`` is None, all ops in ``ops`` are emitted (no filtering);
-    otherwise only ops whose id is in ``needed`` are.
-    """
-    from deplodock.compiler.ops import IndexMapOp as _IndexMapOp
-
+    """Filtered variant of the body-node emitter used by per-reduce prologue
+    recompute and per-element-epilogue recompute.  When ``needed`` is None,
+    all ops are emitted; otherwise only ops whose id is in ``needed`` are."""
     for _node in ops:
         if needed is not None and _node.id not in needed:
             continue
-        if isinstance(_node.op, _IndexMapOp):
-            _emit_indexmap(_node.id, _node.op, _node.inputs, var_map, prefix, body, coord_mapping, shapes, include_ids)
-        elif isinstance(_node.op, ElementwiseOp):
-            a = var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
-            b = var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
-            var_name = f"{prefix}{_safe(_node.id)}"
-            body.append(Let(var_name, OpCall(_node.op.fn, [a] if len(_node.inputs) == 1 else [a, b])))
-            var_map[_node.id] = Var(var_name)
+        _emit_body_node(_node, var_map, prefix, body, coord_mapping, shapes, include_ids)
 
 
 def _emit_pointwise_body(
@@ -1270,27 +1291,9 @@ def _emit_loop_ops(
     multi-dim loads). Both are required when ``ops`` contains any
     ``IndexMapOp``; pointwise / reduce / epilogue callers build them per pattern.
     """
-    from deplodock.compiler.ops import IndexMapOp
-
     in_region_ids = {n.id for n in ops}
-
     for _node in ops:
-        if isinstance(_node.op, IndexMapOp):
-            if coord_mapping is None or shapes is None:
-                raise RuntimeError(
-                    f"IndexMapOp {_node.id} reached _emit_loop_ops without coord_mapping/shapes; "
-                    "the calling pattern lowering must build and pass them."
-                )
-            _emit_indexmap(_node.id, _node.op, _node.inputs, var_map, prefix, body, coord_mapping, shapes, in_region_ids)
-            continue
-
-        if isinstance(_node.op, ElementwiseOp):
-            a = var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
-            b = var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
-            var_name = f"{prefix}{_safe(_node.id)}"
-            args = [a, b] if _node.op.info.arity == 2 and len(_node.inputs) > 1 else [a]
-            body.append(Let(var_name, OpCall(_node.op.fn, args)))
-            var_map[_node.id] = Var(var_name)
+        _emit_body_node(_node, var_map, prefix, body, coord_mapping, shapes, in_region_ids)
 
 
 def _row_major_strides(shape: tuple) -> list[int]:
