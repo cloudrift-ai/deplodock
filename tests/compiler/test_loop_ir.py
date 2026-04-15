@@ -572,7 +572,7 @@ def test_lower_generic_matches_lower_to_loop_ir():
     prog1, sched1 = lower_to_loop_ir(region, "test", shapes, analysis)
     # Via explicit build_schedule + lower_generic
     sched2 = build_schedule(analysis)
-    prog2 = lower_generic(region, "test", shapes, analysis, sched2)
+    prog2 = lower_generic(region, "test", shapes, sched2)
 
     # Both should produce the same LoopIR structure
     assert sched1.grid.block_size == sched2.grid.block_size
