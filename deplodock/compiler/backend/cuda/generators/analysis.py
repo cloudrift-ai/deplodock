@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import ContractionCore, KernelOp, ReduceStage
+from deplodock.compiler.ops import ContractionCore, KernelOp
 
 
 def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
@@ -96,42 +96,8 @@ class TileAnalysis:
 
 
 def flat_region_ops(kernel: KernelOp) -> list:
-    """Walk kernel body nodes in topo order, return (id, op, inputs) tuples.
-
-    Dedups across prologue, core (ContractionCore.mul/reduce +
-    post_stages, or tuple[ReduceStage] pre_ops/reduce), and epilogue by
-    node id. This is the canonical flat-body walk for backend readers.
-    """
-    seen: set[str] = set()
-    out: list = []
-
-    def emit(node) -> None:
-        if node is None or node.id in seen:
-            return
-        seen.add(node.id)
-        out.append((node.id, node.op, list(node.inputs)))
-
-    for n in kernel.prologue:
-        emit(n)
-    if isinstance(kernel.core, ContractionCore):
-        emit(kernel.core.mul)
-        emit(kernel.core.reduce)
-        for stage in kernel.core.post_stages:
-            if not isinstance(stage, ReduceStage):
-                continue
-            for pre in stage.pre_ops:
-                emit(pre)
-            emit(stage.reduce)
-    elif isinstance(kernel.core, tuple):
-        for stage in kernel.core:
-            if not isinstance(stage, ReduceStage):
-                continue
-            for pre in stage.pre_ops:
-                emit(pre)
-            emit(stage.reduce)
-    for n in kernel.epilogue:
-        emit(n)
-    return out
+    """Flat (id, op, inputs) body walk — delegates to ``KernelOp.body_ops()``."""
+    return kernel.body_ops()
 
 
 def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
@@ -151,13 +117,8 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     out_id = [p.buffer_id for p in region.outputs][0]
     out_shape = shapes.get(out_id, (1,))
 
-    # Collect reduce function names.
-    reduce_fns = [op.fn for _, op, _ in phases.reduces]
-
-    # Collect per-input indexmaps (set by 070_absorb_indexmap_into_port when
-    # a pure-view IndexMap absorbs into a kernel's Port). An empty dict
-    # means no absorption happened and loads use the natural indices.
-    port_indexmaps: dict = {p.buffer_id: p.indexmap for p in region.inputs if p.indexmap is not None}
+    reduce_fns = region.reduce_fn_names()
+    port_indexmaps = region.port_indexmaps()
 
     # Build input access patterns.
     input_access = {}
@@ -267,41 +228,18 @@ def _node_entry(n) -> RegionEntry:
 
 
 def _split_phases(kernel: KernelOp) -> OpPhases:
-    """Derive OpPhases from a KernelOp's structured fields.
+    """Wrap ``KernelOp.phases()`` as an ``OpPhases`` dataclass.
 
-    No scanning — each ``core`` variant maps directly to the four phases:
-      - ``None``: pointwise. All prologue/epilogue nodes pass through.
-      - ``ContractionCore``: prologue → mul → reduce → (post_stages[i].pre_ops
-        → post_stages[i].reduce)* → epilogue.
-      - ``tuple[ReduceStage, ...]``: prologue → (stages[i].pre_ops →
-        stages[i].reduce)* → epilogue.
+    The phase decomposition lives on ``KernelOp`` itself; this function
+    just names the returned fields for consumer convenience.
     """
-    prologue = [_node_entry(n) for n in kernel.prologue]
-    epilogue = [_node_entry(n) for n in kernel.epilogue]
-
-    if isinstance(kernel.core, ContractionCore):
-        reduces: list[RegionEntry] = []
-        inter_reduce: list[list[RegionEntry]] = []
-        if kernel.core.mul is not None:
-            prologue.append(_node_entry(kernel.core.mul))
-        if kernel.core.reduce is not None:
-            reduces.append(_node_entry(kernel.core.reduce))
-        for stage in kernel.core.post_stages:
-            if not isinstance(stage, ReduceStage):
-                continue
-            inter_reduce.append([_node_entry(pn) for pn in stage.pre_ops])
-            if stage.reduce is not None:
-                reduces.append(_node_entry(stage.reduce))
-        return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
-
-    if isinstance(kernel.core, tuple) and kernel.core:
-        stages = [s for s in kernel.core if isinstance(s, ReduceStage)]
-        reduces = [_node_entry(s.reduce) for s in stages if s.reduce is not None]
-        inter_reduce = [[_node_entry(pn) for pn in s.pre_ops] for s in stages[1:]]
-        return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
-
-    # core is None — pure pointwise.
-    return OpPhases(prologue=prologue, reduces=[], epilogue=epilogue, inter_reduce=[])
+    prologue, reduces, inter_reduce, epilogue = kernel.phases()
+    return OpPhases(
+        prologue=prologue,
+        reduces=reduces,
+        epilogue=epilogue,
+        inter_reduce=inter_reduce,
+    )
 
 
 def _needed_by(ops: list) -> set[str]:
