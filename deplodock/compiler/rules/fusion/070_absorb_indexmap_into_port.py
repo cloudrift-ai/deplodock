@@ -56,6 +56,7 @@ def rewrite(graph: Graph, match: Match) -> Graph:
         new_inputs_list[i] = new_port
 
         # Also update the core's a/b Port if this input feeds a contraction.
+        # Preserve post_stages when rebuilding so combined cores stay intact.
         new_core = kernel.core
         if hasattr(new_core, "a") and new_core.a.buffer_id == producer_id:
             from deplodock.compiler.ops import ContractionCore
@@ -66,6 +67,7 @@ def rewrite(graph: Graph, match: Match) -> Graph:
                 k_axis=new_core.k_axis,
                 mul=new_core.mul,
                 reduce=new_core.reduce,
+                post_stages=new_core.post_stages,
             )
         elif hasattr(new_core, "b") and new_core.b.buffer_id == producer_id:
             from deplodock.compiler.ops import ContractionCore
@@ -76,6 +78,7 @@ def rewrite(graph: Graph, match: Match) -> Graph:
                 k_axis=new_core.k_axis,
                 mul=new_core.mul,
                 reduce=new_core.reduce,
+                post_stages=new_core.post_stages,
             )
 
         new_external = dict(kernel.external_shapes)
