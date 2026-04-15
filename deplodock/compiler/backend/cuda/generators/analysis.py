@@ -252,6 +252,8 @@ def _split_phases(kernel: KernelOp) -> OpPhases:
         for n in kernel.prologue:
             if n.id == first_reduce_id:
                 seen_first_reduce = True
+                if n.id == last_reduce_id:
+                    seen_last_reduce = True
                 continue
             if not seen_first_reduce:
                 prologue.append(_node_entry(n))

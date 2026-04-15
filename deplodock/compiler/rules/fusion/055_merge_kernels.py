@@ -33,12 +33,14 @@ from deplodock.compiler.ops import (
 )
 from deplodock.compiler.rules.fusion._assembly_helpers import (
     fan_out_of,
+    flatten_kernel_nodes,
     kernel_kind,
     kernel_last_node_id,
     kernel_reduces_with_input_shapes,
     merged_external_inputs_compat,
     reduces_compatible,
     rewire_node_input,
+    rewrite_port_references,
 )
 
 PATTERN = "_"  # wildcard; filter to KernelOp consuming KernelOp in rewrite
@@ -76,7 +78,10 @@ def rewrite(graph: Graph, match: Match) -> Graph:
                 dtype=b_node.output.dtype,
             ),
         )
+        g.nodes[new_id].hints.merge(graph.nodes[a_id].hints)
+        g.nodes[new_id].hints.merge(graph.nodes[b_id].hints)
         g.replace_node(b_id, new_id)
+        rewrite_port_references(g, b_id, new_id)
         if b_id in g.nodes:
             g.remove_node(b_id)
         if a_id in g.nodes and not g.consumers(a_id):
@@ -98,29 +103,27 @@ def _try_merge(
     b_kind = kernel_kind(b)
 
     # Reject contraction-conflicting cases up front.
-    if a_kind == "contraction" and b_kind != "pointwise":
-        return None
     if b_kind == "contraction":
         # pointwise+contraction belongs to 080_absorb_a_chain; reject.
         return None
+    # Allow contraction + reduce only when the reduces are compatible row
+    # reductions (e.g. matmul → softmax). reduces_compatible is checked
+    # below; if it fails, the merge is rejected anyway.
 
-    # Reduce-axis compat across all reduces in the merged kernel.
-    a_reduces = kernel_reduces_with_input_shapes(a)
-    b_reduces = kernel_reduces_with_input_shapes(b)
-    all_reduces = [(r, s) for r, s in (a_reduces + b_reduces)]
-    if len(all_reduces) > 1:
-        # Skip the contraction reduce (matmul K-loop) — it doesn't co-exist
-        # with kernel-level reduce stages anyway, but be safe.
-        non_contraction = [
-            (r, s)
-            for r, s in all_reduces
-            if not isinstance(r.axis, str)  # symbolic axes mark contraction reduces
-        ]
-        if len(non_contraction) > 1:
-            base_r, base_s = non_contraction[0]
-            for r, s in non_contraction[1:]:
-                if not reduces_compatible(base_r, base_s, r, s):
-                    return None
+    # Reduce-axis compat across non-contraction reduces in the merged kernel.
+    # Contraction reduces are handled by the K-loop — they don't share a
+    # row-reduction axis with row reduces and shouldn't be checked.
+    def _non_contraction_reduces(k):
+        if isinstance(k.core, ContractionCore):
+            return []
+        return kernel_reduces_with_input_shapes(k)
+
+    nc = _non_contraction_reduces(a) + _non_contraction_reduces(b)
+    if len(nc) > 1:
+        base_r, base_s = nc[0]
+        for r, s in nc[1:]:
+            if not reduces_compatible(base_r, base_s, r, s):
+                return None
 
     # Compose external inputs (b's port[port_idx] becomes internal).
     new_inputs: list[Port] = []
@@ -158,69 +161,42 @@ def _try_merge(
     def rewire(node):
         return rewire_node_input(node, a_id, a_last)
 
-    b_prologue = tuple(rewire(n) for n in b.prologue)
+    # Flat-prologue convention (mirrors legacy auto_fuse): merged kernel
+    # holds ALL body nodes in a single prologue tuple, in topo order. The
+    # ``core`` field is an annotation that references nodes already in
+    # prologue — backend codegen reads them via the dedup'd ``region_ops``
+    # compat property regardless of which slot they live in.
+    a_flat = flatten_kernel_nodes(a)
+    b_flat = tuple(rewire(n) for n in flatten_kernel_nodes(b))
+    new_prologue = a_flat + b_flat
+    new_epilogue: tuple = ()
+
+    # Compose the core annotation. Reuse a's ContractionCore (rewiring is
+    # done elsewhere). For tuple cores, concatenate stages with rewiring
+    # applied to b's stages so internal Node references resolve correctly.
+    a_core = a.core
     b_core = b.core
     if isinstance(b_core, tuple):
-        new_stages = []
-        for stage in b_core:
-            new_stages.append(
-                ReduceStage(
-                    pre_ops=tuple(rewire(n) for n in stage.pre_ops),
-                    reduce=rewire(stage.reduce) if stage.reduce is not None else None,
-                )
+        b_core_rewired = tuple(
+            ReduceStage(
+                pre_ops=tuple(rewire(n) for n in stage.pre_ops),
+                reduce=rewire(stage.reduce) if stage.reduce is not None else None,
             )
-        b_core = tuple(new_stages)
-    elif isinstance(b_core, ContractionCore):
-        # b is contraction → already rejected above; defensive only.
-        return None
-    b_epilogue = tuple(rewire(n) for n in b.epilogue)
-
-    # Build merged structure based on kinds.
-    if a_kind == "pointwise" and b_kind == "pointwise":
-        new_prologue = a.prologue + b_prologue
-        new_core = None
-        new_epilogue = b_epilogue  # usually empty for pointwise
-    elif a_kind == "pointwise" and b_kind == "reduce":
-        # a's prologue prepends b's first stage's pre_ops.
-        assert isinstance(b_core, tuple) and b_core
-        first = b_core[0]
-        merged_first = ReduceStage(
-            pre_ops=a.prologue + b_prologue + first.pre_ops,
-            reduce=first.reduce,
+            for stage in b_core
+            if isinstance(stage, ReduceStage)
         )
-        new_core = (merged_first,) + b_core[1:]
-        new_prologue = ()
-        new_epilogue = b_epilogue
-    elif a_kind == "reduce" and b_kind == "pointwise":
-        # b's body becomes a's epilogue (chained after a's epilogue).
-        new_prologue = a.prologue
-        new_core = a.core
-        new_epilogue = a.epilogue + b_prologue + b_epilogue
-    elif a_kind == "reduce" and b_kind == "reduce":
-        # Concatenate stages. b's first stage's pre_ops gain b's prologue
-        # and any of a's epilogue ops as a chain into the new stage. To keep
-        # it simple, merge: a.core + (a.epilogue → b.prologue → b.core[0]) +
-        # b.core[1:]. We model this by injecting the chain as pre_ops of
-        # b.core[0] when a.epilogue + b.prologue is non-empty.
-        assert isinstance(a.core, tuple) and isinstance(b_core, tuple) and b_core
-        chain = a.epilogue + b_prologue
-        if chain:
-            first = b_core[0]
-            merged_first = ReduceStage(
-                pre_ops=chain + first.pre_ops,
-                reduce=first.reduce,
-            )
-            new_core = a.core + (merged_first,) + b_core[1:]
-        else:
-            new_core = a.core + b_core
-        new_prologue = a.prologue
-        new_epilogue = b_epilogue
-    elif a_kind == "contraction" and b_kind == "pointwise":
-        new_prologue = a.prologue
-        new_core = a.core
-        new_epilogue = a.epilogue + b_prologue + b_epilogue
+    elif isinstance(b_core, ContractionCore):
+        return None  # already rejected
     else:
-        return None
+        b_core_rewired = ()
+
+    new_core: object = None
+    if isinstance(a_core, ContractionCore):
+        new_core = a_core
+    elif isinstance(a_core, tuple) and a_core:
+        new_core = a_core + b_core_rewired if b_core_rewired else a_core
+    elif b_core_rewired:
+        new_core = b_core_rewired
 
     new_kernel = KernelOp(
         inputs=new_inputs,

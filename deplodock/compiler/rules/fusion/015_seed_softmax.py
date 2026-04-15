@@ -15,7 +15,11 @@ from __future__ import annotations
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import Match
 from deplodock.compiler.ops import ElementwiseOp, KernelOp, Port, ReduceOp, ReduceStage
-from deplodock.compiler.rules.fusion._assembly_helpers import copy_node, shape_of
+from deplodock.compiler.rules.fusion._assembly_helpers import (
+    copy_node,
+    rewrite_port_references,
+    shape_of,
+)
 
 # Backrefs on $x require the matcher's PatternVar unification (already supported).
 PATTERN = (
@@ -68,22 +72,28 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     graph.nodes.get(sum_sub_id) if sum_sub_id else None
 
     # Build the 2-stage core.
+    max_snap = copy_node(max_node)
+    sub_snap = copy_node(sub_node)
+    exp_snap = copy_node(left_exp_node)
+    sum_snap = copy_node(sum_node)
+    div_snap = copy_node(div_node)
     stages = (
-        ReduceStage(pre_ops=(), reduce=copy_node(max_node)),
+        ReduceStage(pre_ops=(), reduce=max_snap),
         ReduceStage(
-            pre_ops=(copy_node(sub_node), copy_node(left_exp_node)),
-            reduce=copy_node(sum_node),
+            pre_ops=(sub_snap, exp_snap),
+            reduce=sum_snap,
         ),
     )
-    epilogue = (copy_node(div_node),)
 
     external_shapes = {x_id: shape_of(graph, x_id)}
     kernel = KernelOp(
         inputs=[Port(buffer_id=x_id)],
         outputs=[Port(buffer_id=div_id)],
-        prologue=(),
+        # Flat-prologue convention: keep all 5 nodes in prologue too;
+        # core annotates the two ReduceStages.
+        prologue=(max_snap, sub_snap, exp_snap, sum_snap, div_snap),
         core=stages,
-        epilogue=epilogue,
+        epilogue=(),
         external_shapes=external_shapes,
     )
 
@@ -93,7 +103,11 @@ def rewrite(graph: Graph, match: Match) -> Graph:
         inputs=[x_id],
         output=Tensor(name=f"fused_{div_id}", shape=tuple(div_node.output.shape), dtype=div_node.output.dtype),
     )
+    for src_id in (div_id, sum_id, left_exp_id, sub_id, max_id, sum_exp_id):
+        if src_id and src_id in graph.nodes:
+            g.nodes[new_id].hints.merge(graph.nodes[src_id].hints)
     g.replace_node(div_id, new_id)
+    rewrite_port_references(g, div_id, new_id)
     # Remove all absorbed nodes (if no other consumers).
     for nid in (div_id, sum_id, left_exp_id, sub_id, max_id, sum_exp_id, sum_sub_id):
         if nid and nid in g.nodes and not g.consumers(nid):

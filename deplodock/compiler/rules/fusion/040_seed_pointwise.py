@@ -1,19 +1,21 @@
-"""Wrap a standalone Elementwise node into a pointwise KernelOp.
+"""Wrap a standalone fusible op (Elementwise / IndexMap) into a pointwise KernelOp.
 
 Runs after seed-contraction/reduce/softmax so those patterns claim their
-ops first. Any remaining Elementwise node not inside a KernelOp becomes
-a singleton pointwise KernelOp(prologue=(node,), core=None). Absorption
-rules (050/060) then grow it.
-
-Not yet wired into DEFAULT_PASS_ORDER.
+ops first. Any remaining ElementwiseOp or IndexMapOp not inside a
+KernelOp becomes a singleton pointwise KernelOp(prologue=(node,),
+core=None). Absorption rules (050/060) then grow it.
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ElementwiseOp, KernelOp, Port
-from deplodock.compiler.rules.fusion._assembly_helpers import copy_node, shape_of
+from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, KernelOp, Port
+from deplodock.compiler.rules.fusion._assembly_helpers import (
+    copy_node,
+    rewrite_port_references,
+    shape_of,
+)
 
 PATTERN = "_"  # wildcard; filter to Elementwise in rewrite
 
@@ -21,8 +23,14 @@ PATTERN = "_"  # wildcard; filter to Elementwise in rewrite
 def rewrite(graph: Graph, match: Match) -> Graph:
     nid = match.root_node_id
     node = graph.nodes.get(nid)
-    if node is None or not isinstance(node.op, ElementwiseOp):
+    if node is None or not isinstance(node.op, (ElementwiseOp, IndexMapOp)):
         return graph
+    # Identity IndexMaps are buffer aliases (no codegen) — never wrap.
+    if isinstance(node.op, IndexMapOp):
+        if node.inputs and node.inputs[0] in graph.nodes:
+            inp_shape = tuple(graph.nodes[node.inputs[0]].output.shape)
+            if node.op.is_identity(inp_shape):
+                return graph
     # Don't re-seed nodes already held by a KernelOp — but KernelOps don't
     # reference external nodes by their Elementwise identity; if the node
     # is still in the outer graph, it's standalone.
@@ -48,7 +56,9 @@ def rewrite(graph: Graph, match: Match) -> Graph:
             dtype=node.output.dtype,
         ),
     )
+    g.nodes[new_id].hints.merge(node.hints)
     g.replace_node(nid, new_id)
+    rewrite_port_references(g, nid, new_id)
     if nid in g.nodes:
         g.remove_node(nid)
     return g

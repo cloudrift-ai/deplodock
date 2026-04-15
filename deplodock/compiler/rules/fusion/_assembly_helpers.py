@@ -215,46 +215,87 @@ def kernel_reduces_with_input_shapes(kernel: KernelOp) -> list[tuple[ReduceOp, t
     reduce (its inputs[0]) — needed for row-reduce/axis compatibility
     checks.
     """
+
+    def _input_shape_of(reduce_node) -> tuple:
+        if reduce_node is None or not reduce_node.inputs:
+            return ()
+        target = reduce_node.inputs[0]
+        for n in kernel.prologue:
+            if n.id == target:
+                return tuple(n.output.shape)
+        if isinstance(kernel.core, ContractionCore):
+            if kernel.core.mul is not None and kernel.core.mul.id == target:
+                return tuple(kernel.core.mul.output.shape)
+            if kernel.core.reduce is not None and kernel.core.reduce.id == target:
+                return tuple(kernel.core.reduce.output.shape)
+        elif isinstance(kernel.core, tuple):
+            for stage in kernel.core:
+                if not isinstance(stage, ReduceStage):
+                    continue
+                for pre in stage.pre_ops:
+                    if pre.id == target:
+                        return tuple(pre.output.shape)
+                if stage.reduce is not None and stage.reduce.id == target:
+                    return tuple(stage.reduce.output.shape)
+        for n in kernel.epilogue:
+            if n.id == target:
+                return tuple(n.output.shape)
+        if target in kernel.external_shapes:
+            return tuple(kernel.external_shapes[target])
+        return ()
+
     result: list[tuple[ReduceOp, tuple]] = []
     if isinstance(kernel.core, ContractionCore):
-        if kernel.core.reduce is not None:
-            r_node = kernel.core.reduce
-            r_op = r_node.op
-            if isinstance(r_op, ReduceOp):
-                # The reduce consumes the mul output.
-                in_shape = tuple(kernel.core.mul.output.shape) if kernel.core.mul is not None else tuple(r_node.output.shape)
-                result.append((r_op, in_shape))
+        r_node = kernel.core.reduce
+        if r_node is not None and isinstance(r_node.op, ReduceOp):
+            result.append((r_node.op, _input_shape_of(r_node)))
     elif isinstance(kernel.core, tuple):
-        # ReduceStage tuple — input to each reduce is either the last pre_op,
-        # the previous stage's reduce output, or the prologue's last node.
-        for stage_idx, stage in enumerate(kernel.core):
+        for stage in kernel.core:
             if not isinstance(stage, ReduceStage):
                 continue
             r_node = stage.reduce
-            if r_node is None:
+            if r_node is None or not isinstance(r_node.op, ReduceOp):
                 continue
-            r_op = r_node.op
-            if not isinstance(r_op, ReduceOp):
-                continue
-            # Locate the input shape feeding this reduce.
-            in_shape: tuple = ()
-            if stage.pre_ops:
-                in_shape = tuple(stage.pre_ops[-1].output.shape)
-            elif stage_idx > 0 and isinstance(kernel.core[stage_idx - 1], ReduceStage):
-                prev = kernel.core[stage_idx - 1].reduce
-                if prev is not None:
-                    in_shape = tuple(prev.output.shape)
-            elif kernel.prologue:
-                in_shape = tuple(kernel.prologue[-1].output.shape)
-            else:
-                # External input — guess via reduce node's input id.
-                in_shape = tuple(r_node.output.shape)
-            result.append((r_op, in_shape))
+            result.append((r_node.op, _input_shape_of(r_node)))
     return result
 
 
 def kernel_has_contraction(kernel: KernelOp) -> bool:
     return isinstance(kernel.core, ContractionCore)
+
+
+def flatten_kernel_nodes(kernel: KernelOp) -> tuple:
+    """Return ``kernel``'s body nodes in a single flat topo-ordered tuple.
+
+    Walks prologue → core (Contraction mul/reduce, or ReduceStage
+    pre_ops/reduce) → epilogue, deduping by id. Used by merge rules that
+    follow the legacy "everything flat in prologue, core annotates"
+    convention so backend compat readers see a single linear node list.
+    """
+    seen: set[str] = set()
+    out: list = []
+
+    def emit(n) -> None:
+        if n is None or n.id in seen:
+            return
+        seen.add(n.id)
+        out.append(n)
+
+    for n in kernel.prologue:
+        emit(n)
+    if isinstance(kernel.core, ContractionCore):
+        emit(kernel.core.mul)
+        emit(kernel.core.reduce)
+    elif isinstance(kernel.core, tuple):
+        for stage in kernel.core:
+            if not isinstance(stage, ReduceStage):
+                continue
+            for pre in stage.pre_ops:
+                emit(pre)
+            emit(stage.reduce)
+    for n in kernel.epilogue:
+        emit(n)
+    return tuple(out)
 
 
 def kernel_last_node_id(kernel: KernelOp) -> str | None:
@@ -304,6 +345,62 @@ def rewire_node_input(node: Node, old_id: str, new_id: str) -> Node:
 def tensor_size(shape: tuple) -> int:
     """Total int-dim element count (symbolic dims treated as 1)."""
     return math.prod(d for d in shape if isinstance(d, int)) if shape else 1
+
+
+def rewrite_port_references(graph: Graph, old_id: str, new_id: str) -> None:
+    """Rewrite ``old_id`` → ``new_id`` everywhere a KernelOp can hide it.
+
+    The graph-level ``replace_node`` only updates outer ``node.inputs``
+    lists. KernelOps additionally hide outer-id references in:
+      - ``Port.buffer_id`` of ``inputs`` (input Ports name external producers),
+      - ``external_shapes`` keys,
+      - ``inputs`` lists of every internal Node (prologue, core stages,
+        epilogue) — references captured at absorption time that go stale
+        when the surrounding outer id is later renamed.
+
+    Output Ports and ContractionCore.{a,b} Ports always reference internal
+    node ids, never outer-graph ids, so they are NOT rewritten here.
+    """
+    from deplodock.compiler.ops import Port
+
+    for node in graph.nodes.values():
+        op = node.op
+        if not isinstance(op, KernelOp):
+            continue
+        op.inputs = [Port(buffer_id=new_id, indexmap=p.indexmap) if p.buffer_id == old_id else p for p in op.inputs]
+        if old_id in op.external_shapes:
+            op.external_shapes[new_id] = op.external_shapes.pop(old_id)
+        op.prologue = tuple(_rewire_one(n, old_id, new_id) for n in op.prologue)
+        op.epilogue = tuple(_rewire_one(n, old_id, new_id) for n in op.epilogue)
+        if isinstance(op.core, ContractionCore):
+            mul = op.core.mul
+            red = op.core.reduce
+            op.core = ContractionCore(
+                a=op.core.a,
+                b=op.core.b,
+                k_axis=op.core.k_axis,
+                mul=_rewire_one(mul, old_id, new_id) if mul is not None else None,
+                reduce=_rewire_one(red, old_id, new_id) if red is not None else None,
+            )
+        elif isinstance(op.core, tuple):
+            new_stages = []
+            for stage in op.core:
+                if not isinstance(stage, ReduceStage):
+                    new_stages.append(stage)
+                    continue
+                new_stages.append(
+                    ReduceStage(
+                        pre_ops=tuple(_rewire_one(n, old_id, new_id) for n in stage.pre_ops),
+                        reduce=_rewire_one(stage.reduce, old_id, new_id) if stage.reduce is not None else None,
+                    )
+                )
+            op.core = tuple(new_stages)
+
+
+def _rewire_one(node: Node, old_id: str, new_id: str) -> Node:
+    if node is None or old_id not in node.inputs:
+        return node
+    return rewire_node_input(node, old_id, new_id)
 
 
 def merged_external_inputs_compat(

@@ -1,25 +1,23 @@
-"""Absorb an upstream Elementwise into a KernelOp's prologue.
+"""Absorb an upstream fusible op (Elementwise / IndexMap) into a KernelOp.
 
-Pattern: ``Kernel(..., $x, ...)`` where ``$x = Elementwise(...)`` has
-fan-out=1 (only consumer is the KernelOp). The Elementwise moves into
-``kernel.prologue`` (prepended) and the kernel's input Port is rewired
-to the Elementwise's inputs.
+Pattern: ``Kernel(..., $x, ...)`` where ``$x`` is an ``ElementwiseOp`` or
+``IndexMapOp`` with fan-out=1 (only consumer is the KernelOp). The
+producer moves into ``kernel.prologue`` (prepended) and the kernel's
+input Port is rewired to the producer's inputs.
 
 Doesn't handle ContractionCore's a_chain/b_chain yet — that's a later
-rule (080_absorb_a_chain). This rule handles reduce-chain prologue growth
-and pointwise kernel growth.
-
-Not yet wired into DEFAULT_PASS_ORDER.
+rule (080_absorb_a_chain).
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.ir import Graph
 from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ContractionCore, ElementwiseOp, KernelOp, Port
+from deplodock.compiler.ops import ContractionCore, ElementwiseOp, IndexMapOp, KernelOp, Port
 from deplodock.compiler.rules.fusion._assembly_helpers import (
     copy_node,
     fan_out_of,
+    rewrite_port_references,
     shape_of,
 )
 
@@ -37,11 +35,11 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     if isinstance(kernel.core, ContractionCore):
         return graph
 
-    # Find any input that is (a) an Elementwise node, (b) has fan-out=1.
+    # Find any input that is a fusible producer with fan-out=1.
     for i, port in enumerate(kernel.inputs):
         producer_id = port.buffer_id
         prod_node = graph.nodes.get(producer_id)
-        if prod_node is None or not isinstance(prod_node.op, ElementwiseOp):
+        if prod_node is None or not isinstance(prod_node.op, (ElementwiseOp, IndexMapOp)):
             continue
         if fan_out_of(graph, producer_id) != 1:
             continue
@@ -81,7 +79,10 @@ def rewrite(graph: Graph, match: Match) -> Graph:
             inputs=[p.buffer_id for p in new_inputs_list],
             output=g.nodes[kid].output,
         )
+        g.nodes[new_kid].hints.merge(graph.nodes[kid].hints)
+        g.nodes[new_kid].hints.merge(prod_node.hints)
         g.replace_node(kid, new_kid)
+        rewrite_port_references(g, kid, new_kid)
         if kid in g.nodes:
             g.remove_node(kid)
         if producer_id in g.nodes and not g.consumers(producer_id):

@@ -770,7 +770,12 @@ def _emit_scalar_epilogue(
         # Re-compute prologue + inter_reduce ops
         all_inter_ops = [op for group in phases.inter_reduce for op in group] if has_multi_reduce else []
         recompute_ops = phases.prologue + all_inter_ops if has_multi_reduce else phases.prologue
-        needed = _needed_by(phases.epilogue)
+        # Compute transitive closure of "needed" over recompute_ops so a
+        # downstream epilogue op pulls in its prologue producers' producers.
+        needed = set(_needed_by(phases.epilogue))
+        for pid, _pop, pinp in reversed(recompute_ops):
+            if pid in needed:
+                needed.update(pinp)
         from deplodock.compiler.ops import IndexMapOp as _IndexMapOp
 
         recompute_ids = {pid for pid, _, _ in recompute_ops}
