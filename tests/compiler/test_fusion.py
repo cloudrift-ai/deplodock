@@ -72,8 +72,8 @@ def test_auto_fuse_region_has_ops():
     fused = auto_fuse(_load_and_decompose())
     for n in _fused_regions(fused):
         assert len(n.op.region_ops) >= 1
-        assert len(n.op.input_names) > 0
-        assert len(n.op.output_names) > 0
+        assert len(n.op.inputs) > 0
+        assert len(n.op.outputs) > 0
 
 
 # ---------------------------------------------------------------------------

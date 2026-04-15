@@ -105,7 +105,7 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     phases = _split_phases(region)
 
     # Determine output shape.
-    out_id = region.output_names[0]
+    out_id = [p.buffer_id for p in region.outputs][0]
     out_shape = shapes.get(out_id, (1,))
 
     # Collect reduce function names.
@@ -113,7 +113,7 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
 
     # Build input access patterns.
     input_access = {}
-    for inp in region.input_names:
+    for inp in [p.buffer_id for p in region.inputs]:
         inp_shape = shapes.get(inp, (1,))
         inp_size = math.prod(d for d in inp_shape if isinstance(d, int))
         has_symbolic = any(isinstance(d, str) for d in inp_shape)
@@ -453,7 +453,7 @@ def _epilogue_needs_per_element(
     # Check if any external input needed by epilogue requires per-element
     # access (is_2d). Per-row and scalar inputs are available during the
     # reduce pass and don't need a second per-element loop.
-    for inp in region.input_names:
+    for inp in [p.buffer_id for p in region.inputs]:
         if inp in epilogue_needs:
             acc = input_access.get(inp)
             if acc and acc.is_2d:
