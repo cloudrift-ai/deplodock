@@ -77,7 +77,7 @@ def lower_generic(
     body: list = []
 
     # Phase 1: Grid setup
-    body.extend(_emit_grid(schedule, analysis))
+    body.extend(_emit_grid(schedule))
 
     # Phase 2: Accumulators
     body.extend(_emit_accumulators(schedule, analysis, region))
@@ -89,7 +89,7 @@ def lower_generic(
     body.extend(_emit_epilogue(schedule, analysis, region, shapes))
 
     # Phase 5: Write outputs
-    body.extend(_emit_write(schedule, analysis, region))
+    body.extend(_emit_write(schedule, region))
 
     return LoopProgram(
         name=name,
@@ -104,7 +104,7 @@ def lower_generic(
 # ---------------------------------------------------------------------------
 
 
-def _emit_grid(schedule: Schedule, analysis: TileAnalysis) -> list:
+def _emit_grid(schedule: Schedule) -> list:
     grid = schedule.grid
     if grid.type == "1d":
         axis_name = "i" if schedule.accum.shape is None else "row"
@@ -233,7 +233,7 @@ def _dispatch_k_loop(
 ) -> list:
     """Pick the K-loop emitter based on schedule.load_strategy."""
     if schedule.load_strategy == "tma":
-        return _emit_tma_k_loop(schedule, analysis)
+        return _emit_tma_k_loop(schedule)
     if schedule.load_strategy == "smem":
         return _emit_smem_k_loop(schedule, analysis)
     return _emit_contraction_k_loop(schedule, analysis, region, shapes)
@@ -427,7 +427,7 @@ def _emit_contraction_k_loop(
     return [LoopNest("k", Literal(0, "int"), K, None, k_body)]
 
 
-def _emit_tma_k_loop(schedule: Schedule, analysis: TileAnalysis) -> list:
+def _emit_tma_k_loop(schedule: Schedule) -> list:
     """Emit TMA double-buffered K-loop via SmemPipelineKLoop."""
     from deplodock.compiler.backend.ir.loop_ir import SmemPipelineKLoop
 
@@ -842,7 +842,6 @@ def _emit_scalar_epilogue(
 
 def _emit_write(
     schedule: Schedule,
-    analysis: TileAnalysis,
     region: KernelOp,
 ) -> list:
     accum = schedule.accum
