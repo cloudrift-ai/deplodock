@@ -442,16 +442,25 @@ def lower_tiled(
 # ---------------------------------------------------------------------------
 
 
-def _input_expr(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> Expr:
+def _input_expr(
+    inp: str,
+    region: KernelOp,
+    shapes: dict[str, tuple],
+    analysis: TileAnalysis,
+    idx_var: str,
+    out_size: int = 0,
+) -> Expr:
     """Build the array access expression for an input tensor.
 
     Args:
         inp: Input name.
-        analysis: TileAnalysis for AccessPattern lookup.
+        region: KernelOp, used to look up the input's AccessPattern.
+        shapes: Shape map for access classification.
+        analysis: TileAnalysis (for pattern field).
         idx_var: Index variable name — "i" for pointwise, "j" for reductions, "k" for contractions.
         out_size: Total output elements (for pointwise broadcast).
     """
-    acc = analysis.input_access[inp]
+    acc = region.input_accesses(shapes, analysis.output_shape)[inp]
     safe = _safe(inp)
 
     if analysis.pattern == "pointwise":
@@ -471,18 +480,6 @@ def _input_expr(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 
     if acc.is_scalar:
         return ArrayAccess(safe, Literal(0, "int"))
     return ArrayAccess(safe, Literal(0, "int"))
-
-
-def _contraction_input_expr(inp: str, analysis: TileAnalysis) -> Expr:
-    """Build input access for the contraction epilogue: index by [row*N+col]."""
-    acc = analysis.input_access[inp]
-    safe = _safe(inp)
-    if acc.is_scalar:
-        return ArrayAccess(safe, Literal(0, "int"))
-    if acc.is_row_vector:
-        return ArrayAccess(safe, Var("col"))
-    # Default: 2D indexing
-    return ArrayAccess(safe, BinOp("+", BinOp("*", Var("row"), Var("N")), Var("col")))
 
 
 # ---------------------------------------------------------------------------
@@ -699,7 +696,7 @@ def _lower_naive(
         pass
     else:
         for inp in [p.buffer_id for p in region.inputs]:
-            var_map[inp] = _input_expr(inp, analysis, "j" if has_reduce else "i", out_size)
+            var_map[inp] = _input_expr(inp, region, shapes, analysis, "j" if has_reduce else "i", out_size)
 
     # --- Pointwise: emit all ops inline, write, return ---
     if is_pointwise:
@@ -922,7 +919,7 @@ def _lower_naive(
             # Re-map inputs for this pass.
             pass_var_map: dict[str, Expr] = {}
             for inp in [p.buffer_id for p in region.inputs]:
-                pass_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
+                pass_var_map[inp] = _input_expr(inp, region, shapes, analysis, "j", out_size)
             # Previous reduce results are available as accumulators.
             for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
                 pass_var_map[prev_nid] = Var(prev_acc)
@@ -964,7 +961,7 @@ def _lower_naive(
             epi_body: list = []
             epi_var_map: dict[str, Expr] = dict(var_map)
             for inp in [p.buffer_id for p in region.inputs]:
-                epi_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
+                epi_var_map[inp] = _input_expr(inp, region, shapes, analysis, "j", out_size)
 
             # Re-compute ALL prologue + inter_reduce ops (epilogue may
             # transitively depend on any of them via intermediate nodes).
@@ -1025,7 +1022,7 @@ def _lower_naive(
                 epi_body: list = []
                 epi_var_map: dict[str, Expr] = dict(var_map)
                 for inp in [p.buffer_id for p in region.inputs]:
-                    epi_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
+                    epi_var_map[inp] = _input_expr(inp, region, shapes, analysis, "j", out_size)
 
                 needed = _needed_by(epilogue_ops)
                 for _node in phases.prologue:
