@@ -266,11 +266,25 @@ Rule conventions:
 
 Fusion runs as a `Rewriter` pass (last in `DEFAULT_PASS_ORDER`). Rules in `rules/fusion/*.py` execute in filename order:
 
+**Legacy greedy path (still active during the migration to rule-based assembly):**
 1. **`000_greedy_fusion.py`** wraps `auto_fuse(graph)` from `fusion.py` — the greedy edge-merger that discovers fusion regions from intermediate tensor sizes, scoring single-consumer edges by `product(intermediate_shape)` and merging highest-score-first. Produces `KernelOp` nodes with `prologue=<all merged nodes in topo order>`, `core=None`, `epilogue=()` — a flat shape.
 2. **`001_structure_contraction.py`** recognizes `sum(mul(A, B))` matmul shapes inside flat KernelOps and annotates them with `core=ContractionCore(a_port, b_port, k_axis)`.
 3. **`002_structure_reduce.py`** recognizes single- and multi-reduce shapes (row reductions, RMSNorm, softmax) and annotates with `core=(ReduceStage, ...)`.
 
-The annotations reference nodes already held in `prologue` — the rules don't move nodes — so backward-compatibility shims (`KernelOp.region_ops`, `.input_names`, `.output_names`, `.shapes`) keep backend readers working unchanged. A future refactor migrates readers to consume `kernel.core` directly, at which point the mul/sum/reduce nodes can be dropped from `prologue`.
+**Rule-based assembly path (running alongside the legacy rules; will replace them):**
+- `020_seed_contraction` — `Reduce{sum}(Elementwise{mul}(A, B))` → KernelOp with ContractionCore (mul + sum move out of the outer graph into the core).
+- `021_seed_reduce` — single Reduce → KernelOp with one ReduceStage.
+- `030_seed_softmax` — softmax DAG (max + sub + exp + sum + div) → KernelOp with two ReduceStages and a div epilogue (2D coverage; 4D today still falls to ~5 kernels).
+- `040_seed_pointwise` — wraps any leftover standalone Elementwise as a singleton pointwise KernelOp.
+- `050_absorb_prologue` — pulls upstream raw Elementwise (fan-out=1) into a KernelOp's prologue.
+- `055_merge_kernels` — merges two adjacent KernelOps when shape/reduce-axis compat allows. Handles pointwise+pointwise, pointwise+reduce, reduce+pointwise, reduce+reduce (row-compatible), and contraction+pointwise; rejects pointwise+contraction (defer to `080`), contraction+contraction, and contraction/reduce mixes. Inputs that point at the absorbed kernel's outer-graph id are rewired to its last-internal node id via `rewire_node_input`.
+- `060_absorb_epilogue` — appends a downstream raw Elementwise into a KernelOp's epilogue.
+- `_070_absorb_indexmap_into_port` — dormant; activates once the backend's load path reads `Port.indexmap`.
+- `080_absorb_a_chain` — placeholder for ContractionCore a/b-chain absorption.
+
+Shared helpers live in `rules/fusion/_assembly_helpers.py`: shape-compat (`merged_external_inputs_compat`, `broadcast_compat`), reduce-axis compat (`reduces_compatible`, `is_row_reduce`), KernelOp introspection (`kernel_kind`, `kernel_reduces_with_input_shapes`, `kernel_last_node_id`), graph-level checks (`fan_out_of`, `is_convex_merge`), and node-rewiring utilities (`copy_node`, `rewire_node_input`). All shape-compat logic that the new rules need is sourced from these helpers — never copy-pasted.
+
+The annotations reference nodes already held in `prologue` — the legacy rules don't move nodes — so backward-compatibility shims (`KernelOp.region_ops`, `.input_names`, `.output_names`, `.shapes`) keep backend readers working unchanged. A future refactor migrates readers to consume `kernel.core` directly, at which point the mul/sum/reduce nodes can be dropped from `prologue`.
 
 Only `ElementwiseOp` and `ReduceOp` are fusible — `ReshapeOp` and `TransposeOp` are not (reshape would break 1D broadcast indexing; transpose can't be expressed in pointwise codegen). Both become buffer aliases or standalone kernels.
 
