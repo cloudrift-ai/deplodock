@@ -18,7 +18,6 @@ from pathlib import Path
 import pytest
 
 from deplodock.compiler.backend.cuda.generators import generate_kernel
-from deplodock.compiler.backend.cuda.generators.analysis import flat_region_ops
 from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program, run_program
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
@@ -54,7 +53,7 @@ def _run_fused_region(region_node, graph: Graph, inputs: dict[str, list[float]])
             shapes[inp] = graph.nodes[inp].output.shape
     for out in [p.buffer_id for p in op.outputs]:
         # Find the original output shape from the region_ops.
-        for rid, _rop, _ in flat_region_ops(op):
+        for rid, _rop, _ in op.body_ops():
             if rid in [p.buffer_id for p in op.outputs]:
                 # Use the fused node's output shape.
                 pass
@@ -75,11 +74,11 @@ def _run_fused_region(region_node, graph: Graph, inputs: dict[str, list[float]])
     launch_args.append(out_name)
 
     # Add dimension args based on kernel type.
-    has_reduce = any(isinstance(rop, ReduceOp) for _, rop, _ in flat_region_ops(op))
+    has_reduce = any(isinstance(rop, ReduceOp) for _, rop, _ in op.body_ops())
     if has_reduce:
         # Reduction kernel: needs rows, cols.
         # Infer from first reduce input shape.
-        for _, rop, inp_ids in flat_region_ops(op):
+        for _, rop, inp_ids in op.body_ops():
             if isinstance(rop, ReduceOp):
                 inp_shape = shapes.get(inp_ids[0], (1,))
                 if len(inp_shape) >= 2:
@@ -270,7 +269,7 @@ def test_kernel_gen_silu_mul():
     region_node = fused_nodes[0]
     shapes = {nid: fused.nodes[nid].output.shape for nid in fused.nodes}
     # Add shapes for original nodes referenced by region_ops.
-    for rid, _, _ in flat_region_ops(region_node.op):
+    for rid, _, _ in region_node.op.body_ops():
         if rid in g.nodes:
             shapes[rid] = g.nodes[rid].output.shape
     source = emit_kernel(generate_kernel(region_node.op, "test_silu_mul", shapes))
@@ -909,7 +908,7 @@ def test_softmax_single_kernel():
     fused = auto_fuse(g)
     fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) == 1, f"Expected 1 fused region, got {len(fused_nodes)}"
-    assert len(flat_region_ops(fused_nodes[0].op)) == 5  # max, sub, exp, sum, div
+    assert len(fused_nodes[0].op.body_ops()) == 5  # max, sub, exp, sum, div
 
     # Verify generated kernel has both fmaxf (max) and expf (exp).
     shapes = {nid: fused.nodes[nid].output.shape for nid in fused.nodes}

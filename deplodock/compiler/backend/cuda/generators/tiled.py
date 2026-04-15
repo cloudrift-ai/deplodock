@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 
-from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, flat_region_ops
+from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis
 from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
@@ -695,7 +695,7 @@ def _lower_naive(
 
     # --- Pointwise: emit all ops inline, write, return ---
     if is_pointwise:
-        body.extend(_emit_ops(flat_region_ops(region), var_map, "v_"))
+        body.extend(_emit_ops(region.body_ops(), var_map, "v_"))
         for out_id in [p.buffer_id for p in region.outputs]:
             val = var_map.get(out_id, Literal(0.0))
             body.append(Assign(ArrayAccess(_safe(out_id), Var("i")), val))

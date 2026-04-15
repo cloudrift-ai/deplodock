@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from deplodock.compiler.backend.cuda.generators.analysis import flat_region_ops
 from deplodock.compiler.backend.ir.expr import BinOp, Literal, Ternary, Var
 from deplodock.compiler.coord_expr import (
     PLACEHOLDER_PREFIX,
@@ -407,9 +406,7 @@ def test_transpose_indexmap_fuses_with_elementwise():
     # The IndexMap should be inside a fused region (not standalone).
     standalone_ims = [n for n in fused.nodes.values() if isinstance(n.op, IndexMapOp)]
     fused_with_im = [
-        n
-        for n in fused.nodes.values()
-        if isinstance(n.op, KernelOp) and any(isinstance(o, IndexMapOp) for _, o, _ in flat_region_ops(n.op))
+        n for n in fused.nodes.values() if isinstance(n.op, KernelOp) and any(isinstance(o, IndexMapOp) for _, o, _ in n.op.body_ops())
     ]
     assert not standalone_ims, f"IndexMap should be absorbed into fused region; standalone: {[n.id for n in standalone_ims]}"
     assert fused_with_im, "Expected at least one fused region containing the IndexMap"
@@ -499,9 +496,7 @@ def test_qwen_rotary_chain_fuses_into_region():
 
     # Count regions that absorbed an IndexMap.
     indexmap_regions = [
-        n
-        for n in fused.nodes.values()
-        if isinstance(n.op, KernelOp) and any(isinstance(o, IndexMapOp) for _, o, _ in flat_region_ops(n.op))
+        n for n in fused.nodes.values() if isinstance(n.op, KernelOp) and any(isinstance(o, IndexMapOp) for _, o, _ in n.op.body_ops())
     ]
     assert len(indexmap_regions) >= 2, f"Expected ≥2 fused regions absorbing IndexMaps (Q + K rotary chains); got {len(indexmap_regions)}"
 

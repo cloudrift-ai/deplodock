@@ -66,11 +66,6 @@ class TileAnalysis:
     port_indexmaps: dict = field(default_factory=dict)
 
 
-def flat_region_ops(kernel: KernelOp) -> list:
-    """Flat (id, op, inputs) body walk — delegates to ``KernelOp.body_ops()``."""
-    return kernel.body_ops()
-
-
 def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     """Build a ``TileAnalysis`` snapshot from KernelOp accessors.
 

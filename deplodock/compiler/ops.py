@@ -489,7 +489,7 @@ class KernelOp(Op):
     in topo order (flat-prologue convention); ``core`` is an annotation
     pointing at specific nodes (ReduceStage.reduce, ContractionCore.mul/
     reduce/post_stages) already in prologue. Backends read the body via
-    ``analysis.flat_region_ops(kernel)`` which dedups across slots.
+    ``KernelOp.body_ops()`` which dedups across slots.
 
     A KernelOp has one external output (Port) by construction;
     multi-output fusion is a future extension.
