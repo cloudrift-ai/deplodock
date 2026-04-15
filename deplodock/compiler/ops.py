@@ -377,6 +377,23 @@ class IndexMapOp(Op):
 
 
 @dataclass
+class AccessPattern:
+    """How a single input tensor is accessed within the kernel.
+
+    Derived per-input from the input shape and the kernel's output shape.
+    Used by load-path emitters to pick the right indexing form.
+    """
+
+    shape: tuple[int, ...]
+    size: int  # total int-dim element count
+    is_scalar: bool  # size == 1
+    is_row_vector: bool  # 1D, indexed by column only
+    is_2d: bool  # indexed by both row and column
+    is_per_row: bool = False  # last dim == 1 with >1 total elts
+    is_broadcast: bool = False  # smaller than output, broadcast via modulo
+
+
+@dataclass
 class Port:
     """How a KernelOp reads/writes one external buffer.
 
@@ -586,3 +603,41 @@ class KernelOp(Op):
     def port_indexmaps(self) -> dict:
         """Per-input Port.indexmap dict (only inputs with an indexmap set)."""
         return {p.buffer_id: p.indexmap for p in self.inputs if p.indexmap is not None}
+
+    def input_accesses(self, shapes: dict, output_shape: tuple) -> dict:
+        """Build an AccessPattern per external input.
+
+        Classification is shape-driven: scalar, row-vector, per-row,
+        broadcast (smaller-than-output, NumPy-broadcast-compatible), or 2D.
+        """
+        import math as _math
+
+        from deplodock.compiler.shape_utils import is_broadcast_compatible
+
+        out_size = _math.prod(d for d in output_shape if isinstance(d, int))
+        result: dict = {}
+        for p in self.inputs:
+            inp = p.buffer_id
+            inp_shape = shapes.get(inp, (1,))
+            inp_size = _math.prod(d for d in inp_shape if isinstance(d, int))
+            has_symbolic = any(isinstance(d, str) for d in inp_shape)
+            last_dim = inp_shape[-1] if inp_shape else 1
+            last_dim_is_one = isinstance(last_dim, int) and last_dim == 1
+            is_per_row = last_dim_is_one and inp_size > 1 and len(inp_shape) >= 2
+            is_broadcast = (
+                inp_size > 1
+                and inp_size < out_size
+                and not is_per_row
+                and len(inp_shape) >= 2
+                and is_broadcast_compatible(inp_shape, output_shape)
+            )
+            result[inp] = AccessPattern(
+                shape=inp_shape,
+                size=inp_size,
+                is_scalar=(inp_size == 1 and not has_symbolic),
+                is_row_vector=(len(inp_shape) == 1 and (inp_size > 1 or has_symbolic)),
+                is_2d=(len(inp_shape) >= 2 and (inp_size > 1 or has_symbolic) and not is_per_row and not is_broadcast),
+                is_per_row=is_per_row,
+                is_broadcast=is_broadcast,
+            )
+        return result
