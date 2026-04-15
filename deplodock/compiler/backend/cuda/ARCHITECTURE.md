@@ -66,8 +66,8 @@ metadata (block_size, tile dims, TMA config, batching, includes) lives on the
 Schedule and is read by ``loop_ir_to_kernel()`` when building the KernelDef.
 
 **Schedule** (`schedule.py`) contains: `GridSpec` (1d/2d_swizzle/2d_standard),
-`AccumulatorSpec` (None/scalar/register-tile), `ReductionSpec` (loop params +
-warp_reduce flag), plus tile dims, k_splits, load strategy, and batching.
+`pattern` (pointwise / row_reduce / reduce_broadcast / contraction / multi_reduce),
+plus tile dims, k_splits, load strategy, and batching.
 
 **LoopIR** (`backend/loop_ir.py`) makes the loop structure explicit:
 `ParallelAxis`, `LoopNest`, `Alloc`, `Load`/`Store`, `Compute`,

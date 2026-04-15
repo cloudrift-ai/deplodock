@@ -41,39 +41,17 @@ class GridSpec:
 
 
 @dataclass
-class AccumulatorSpec:
-    """Shape and type of per-thread accumulators.
-
-    shape=None  → pointwise (no accumulators)
-    shape=()    → scalar accumulator per reduce op
-    shape=(M,N) → 2D register tile (contraction)
-    """
-
-    shape: tuple[int, ...] | None
-    dtype: str = "float"
-
-
-@dataclass
-class ReductionSpec:
-    """One reduction loop in the kernel."""
-
-    dim: str  # semantic name: "cols" | "K"
-    loop_var: str  # C variable: "j" | "k"
-    start: str  # "threadIdx.x" | "0"
-    end: str  # "cols" | "K"
-    step: str | None  # "blockDim.x" | None (increment by 1)
-    warp_reduce_after: bool  # emit WarpReduce after this loop
-
-
-@dataclass
 class Schedule:
     """Complete kernel structure specification."""
 
     grid: GridSpec
-    accum: AccumulatorSpec
-    reductions: list[ReductionSpec]
+    # Pattern this schedule targets: "pointwise" | "row_reduce" |
+    # "reduce_broadcast" | "multi_reduce" | "contraction".  Drives the
+    # branches in lower_generic (pointwise body vs scalar reduction vs
+    # register-tile contraction).
+    pattern: str = "pointwise"
 
-    # Contraction tile dims (only when accum.shape is 2D)
+    # Contraction tile dims (only when pattern == "contraction")
     tile_m: int | None = None
     tile_n: int | None = None
     thread_m: int | None = None
@@ -126,8 +104,7 @@ def build_schedule(
     if pattern == "pointwise":
         return Schedule(
             grid=GridSpec("1d", (256, 1, 1), bound="n"),
-            accum=AccumulatorSpec(None),
-            reductions=[],
+            pattern="pointwise",
             dim_params=[("int", "n")],
         )
 
@@ -179,17 +156,7 @@ def build_schedule(
 
         return Schedule(
             grid=GridSpec(grid_type, (tx, ty, 1)),
-            accum=AccumulatorSpec((thread_m, thread_n)),
-            reductions=[
-                ReductionSpec(
-                    dim="K",
-                    loop_var="k",
-                    start="0",
-                    end="K",
-                    step=None,
-                    warp_reduce_after=False,
-                ),
-            ],
+            pattern="contraction",
             tile_m=tile_m,
             tile_n=tile_n,
             thread_m=thread_m,
@@ -207,24 +174,9 @@ def build_schedule(
         )
 
     # row_reduce or reduce_broadcast
-    n_reduces = len(analysis.reduce_fns)
-    reduce_specs = []
-    for _i in range(n_reduces):
-        reduce_specs.append(
-            ReductionSpec(
-                dim="cols",
-                loop_var="j",
-                start="threadIdx.x",
-                end="cols",
-                step="blockDim.x",
-                warp_reduce_after=True,
-            )
-        )
-
     return Schedule(
         grid=GridSpec("1d", (256, 1, 1), bound="rows"),
-        accum=AccumulatorSpec(()),
-        reductions=reduce_specs,
+        pattern=pattern,
         epilogue_per_element=analysis.epilogue_needs_per_element,
         dim_params=[("int", "rows"), ("int", "cols")],
     )
