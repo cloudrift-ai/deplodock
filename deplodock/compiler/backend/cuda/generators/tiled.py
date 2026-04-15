@@ -426,7 +426,13 @@ def lower_tiled(
     or dump the intermediate LoopIR and pass the Schedule downstream.
     """
     from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
-    from deplodock.compiler.backend.cuda.generators.loop_lower import _grid_type, lower_to_loop_ir
+    from deplodock.compiler.backend.cuda.generators.loop_lower import (
+        _grid_type,
+        _includes,
+        _tma_config,
+        _tma_params,
+        lower_to_loop_ir,
+    )
 
     loop_prog, schedule = lower_to_loop_ir(region, name, shapes, strategy=strategy, hints=hints or {})
     cinfo = region.contraction_info(shapes)
@@ -439,6 +445,9 @@ def lower_tiled(
             batched=batched,
             grid_2d=gtype == "2d_standard",
             online_reduce=gtype == "1d_contraction",
+            tma_params=_tma_params(schedule, region, shapes),
+            tma_config=_tma_config(schedule, region, shapes),
+            includes=_includes(schedule),
         ),
         loop_prog,
         schedule,

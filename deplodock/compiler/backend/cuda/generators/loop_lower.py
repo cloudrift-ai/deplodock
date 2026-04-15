@@ -81,6 +81,58 @@ def _grid_type(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -
     return "2d_swizzle"
 
 
+def _bound_var(region: KernelOp, shapes: dict[str, tuple]) -> str:
+    """Bound variable for the 1D parallel axis: 'n' for pointwise, 'rows' otherwise."""
+    return "n" if _pattern(region, shapes) == "pointwise" else "rows"
+
+
+def _dim_params(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list[tuple[str, str]]:
+    """Kernel signature scalar dim args, derived from pattern + batching + k_splits."""
+    pattern = _pattern(region, shapes)
+    if pattern == "pointwise":
+        return [("int", "n")]
+    if pattern != "contraction":
+        return [("int", "rows"), ("int", "cols")]
+    dim_params: list[tuple[str, str]] = [("int", "M"), ("int", "N"), ("int", "K")]
+    if _is_batched(region, shapes):
+        dim_params.append(("int", "batch_count"))
+    elif schedule.k_splits > 1:
+        dim_params.append(("int", "k_splits"))
+    return dim_params
+
+
+def _tma_params(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list[str] | None:
+    """TMA descriptor param names when load_strategy == 'tma', else None."""
+    if schedule.load_strategy != "tma":
+        return None
+    cinfo = region.contraction_info(shapes)
+    if cinfo is None or not cinfo.a_id:
+        return None
+    return [f"{_safe(cinfo.a_id)}_tma", f"{_safe(cinfo.b_id)}_tma"]
+
+
+def _tma_config(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]):
+    """TMALoadConfig when load_strategy == 'tma', else None."""
+    from deplodock.compiler.backend.cuda.schedule import TMALoadConfig
+
+    if schedule.load_strategy != "tma":
+        return None
+    cinfo = region.contraction_info(shapes)
+    if cinfo is None or not cinfo.a_id:
+        return None
+    is_batched = cinfo.batch_size > 1
+    a_name = _safe(cinfo.a_id)
+    b_name = _safe(cinfo.b_id)
+    a_ref = f"&{a_name}_tma[batch]" if is_batched else f"&{a_name}_tma"
+    b_ref = f"&{b_name}_tma[batch]" if is_batched else f"&{b_name}_tma"
+    return TMALoadConfig(a_tma_ref=a_ref, b_tma_ref=b_ref)
+
+
+def _includes(schedule: Schedule) -> list[str] | None:
+    """Header includes; TMA kernels need cuda.h for descriptor types."""
+    return ["cuda.h"] if schedule.load_strategy == "tma" else None
+
+
 # ---------------------------------------------------------------------------
 # Generic lowering — single entry point driven by Schedule
 # ---------------------------------------------------------------------------
@@ -102,7 +154,7 @@ def lower_generic(
     5. Write outputs
     """
     params = _build_params(region)
-    params.extend(schedule.dim_params)
+    params.extend(_dim_params(schedule, region, shapes))
 
     body: list = []
 
@@ -125,7 +177,7 @@ def lower_generic(
         name=name,
         params=params,
         body=body,
-        dim_strides=_build_dim_strides(region, shapes, schedule),
+        dim_strides=_build_dim_strides(region, shapes),
     )
 
 
@@ -140,7 +192,7 @@ def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -
     gtype = _grid_type(schedule, region, shapes)
     if gtype == "1d":
         axis_name = "i" if _pattern(region, shapes) == "pointwise" else "row"
-        return [ParallelAxis(axis_name, "blockIdx.x", grid.bound)]
+        return [ParallelAxis(axis_name, "blockIdx.x", _bound_var(region, shapes))]
     if gtype == "1d_contraction":
         # Online reduction: 1D grid over M-tiles, N is tiled sequentially.
         # Emit bm, tr, tc but NOT bn (comes from the N-tile loop).
@@ -239,11 +291,11 @@ def _emit_reductions(
     pattern = _pattern(region, shapes)
     if pattern == "pointwise":
         # Pointwise: no reduction, just inline all ops inside a guard
-        return _emit_pointwise_body(region, shapes, schedule)
+        return _emit_pointwise_body(region, shapes)
 
     if pattern != "contraction":
         # Scalar reduction (row_reduce / reduce_broadcast / multi-reduce)
-        return _emit_scalar_reductions(schedule, region, shapes)
+        return _emit_scalar_reductions(region, shapes)
 
     # 2D register tile contraction
     if _grid_type(schedule, region, shapes) == "1d_contraction":
@@ -323,7 +375,6 @@ def _recompute_ops_into(
 def _emit_pointwise_body(
     region: KernelOp,
     shapes: dict[str, tuple],
-    schedule: Schedule,
 ) -> list:
     """Pointwise: load inputs, emit all ops, store outputs inside a guard."""
     out_shape = shapes.get([p.buffer_id for p in region.outputs][0], (1,))
@@ -344,7 +395,6 @@ def _emit_pointwise_body(
 
 
 def _emit_scalar_reductions(
-    schedule: Schedule,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
@@ -789,11 +839,10 @@ def _emit_epilogue(
         return _contraction_epilogue_ops(phases, shapes, [p.buffer_id for p in region.inputs], thread_m, thread_n)
 
     # Scalar reduction epilogue
-    return _emit_scalar_epilogue(schedule, region, shapes)
+    return _emit_scalar_epilogue(region, shapes)
 
 
 def _emit_scalar_epilogue(
-    schedule: Schedule,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
@@ -987,7 +1036,6 @@ def _safe(name: str) -> str:
 def _build_dim_strides(
     region: KernelOp,
     shapes: dict[str, tuple],
-    schedule,
 ) -> dict[str, list[str]]:
     """Build per-buffer stride variable names for multi-dim index flattening.
 
