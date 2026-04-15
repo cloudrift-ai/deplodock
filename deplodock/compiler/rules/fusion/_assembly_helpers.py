@@ -407,17 +407,23 @@ def merged_external_inputs_compat(
     external_shapes: list[tuple],
     *,
     is_pure_contraction: bool = False,
+    skip_shapes: set[tuple] | None = None,
 ) -> bool:
     """Replicate fusion.py::_can_merge's broadcast/2D-pair shape check.
 
     Reject when two non-broadcast-compatible 2D+ inputs disagree on size.
     Skip the check entirely for pure-contraction kernels (they use A/B
-    indexing).
+    indexing). ``skip_shapes`` carries shapes of inputs read exclusively
+    by IndexMaps in the merged region — those use their own coord_map
+    addressing and don't share the kernel's broadcast indexing.
     """
     if is_pure_contraction:
         return True
+    skip = skip_shapes or set()
     ext: list[tuple[tuple, int]] = []
     for shape in external_shapes:
+        if shape in skip:
+            continue
         sz = tensor_size(shape)
         if sz <= 1:
             continue
