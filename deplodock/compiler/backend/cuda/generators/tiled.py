@@ -434,7 +434,9 @@ def lower_tiled(
     from deplodock.compiler.backend.cuda.generators.loop_lower import lower_to_loop_ir
 
     loop_prog, schedule = lower_to_loop_ir(region, name, shapes, analysis, strategy=strategy, hints=hints or {})
-    return loop_ir_to_kernel(loop_prog, schedule), loop_prog, schedule
+    cinfo = region.contraction_info(shapes)
+    batched = cinfo is not None and cinfo.batch_size > 1
+    return loop_ir_to_kernel(loop_prog, schedule, batched=batched), loop_prog, schedule
 
 
 # ---------------------------------------------------------------------------
