@@ -144,7 +144,7 @@ compiler/
 │   ├── decomposition/ #     Decompose high-level ops → primitives (runs first)
 │   ├── optimization/  #     Canonicalize primitive IR (runs after decomposition)
 │   └── fusion/       #      Greedy fusion + structural classification (KernelOp core)
-├── fusion.py         # [L2] auto_fuse: thin shim that loads rules/fusion/* (legacy callers)
+│                      #      (fusion.py is gone — rule-based assembly is the only path)
 ├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan, plan_graph
 ├── dump.py           # [--] CompilerDump: debug artifact collector (cross-layer)
 ├── pipeline.py       # [L2] compile_graph (graph optimization only)
@@ -262,11 +262,11 @@ Rule conventions:
   doesn't spin on patterns that match more nodes than they can act on.
 - Eligible rewrites must `g = graph.copy()` and return the new graph.
 
-### 3. Fusion (rules/fusion/ + fusion.py)
+### 3. Fusion (rules/fusion/)
 
 Fusion runs as a `Rewriter` pass (last in `DEFAULT_PASS_ORDER`). Rules in `rules/fusion/*.py` execute in filename order:
 
-Rule-based assembly is the only path. The legacy greedy `auto_fuse` and structuring rules (`000_greedy_fusion`, `001_structure_contraction`, `002_structure_reduce`) are deleted; `auto_fuse` survives only as a thin shim that loads `rules/fusion/*` so older test imports keep working.
+Rule-based assembly is the only path. The legacy greedy `auto_fuse`, the structuring rules (`000_greedy_fusion`, `001_structure_contraction`, `002_structure_reduce`), and `fusion.py` itself are deleted. Tests that previously imported `auto_fuse` now import it from `tests/compiler/_fusion_helper.py` — a thin wrapper around `Pass.from_directory(rules/fusion).apply(graph)`.
 
 - `015_seed_softmax` — softmax DAG (`div(exp(sub(x, max(x))), sum(exp(sub(x, max(x)))))`) → KernelOp with two ReduceStages plus a div in prologue (2D coverage; 4D still falls to multiple kernels until the matcher gains DAG-backref unification).
 - `020_seed_contraction` — `Reduce{sum}(Elementwise{mul}(A, B))` → KernelOp with ContractionCore (mul + sum stay in prologue and `core` annotates them).

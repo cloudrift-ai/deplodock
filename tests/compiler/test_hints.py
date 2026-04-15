@@ -174,7 +174,7 @@ def test_hints_flow_through_plan():
 
 
 def test_hints_survive_fusion():
-    from deplodock.compiler.fusion import auto_fuse
+    from tests.compiler._fusion_helper import auto_fuse
 
     g = _matmul_graph()
     # Set a hint on the elementwise (mul) node.

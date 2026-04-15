@@ -21,9 +21,9 @@ from deplodock.compiler.backend.cuda.generators import generate_kernel
 from deplodock.compiler.backend.cuda.program import Buffer, Launch, Program, run_program
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
-from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, KernelOp, ReduceOp
+from tests.compiler._fusion_helper import auto_fuse
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),

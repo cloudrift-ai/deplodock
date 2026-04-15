@@ -8,7 +8,6 @@ per (row, k) inside the K-loop.
 
 Enables ``mul(silu(gate), up) @ Wdown`` fusion.
 
-Not yet wired into DEFAULT_PASS_ORDER. ContractionCore.a_chain field must
 be added before this rule can land.
 """
 
