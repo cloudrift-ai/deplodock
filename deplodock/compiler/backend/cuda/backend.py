@@ -179,7 +179,7 @@ def _rehydrate_core(core_struct, body_nodes, rename_map=None):
     id. ``rename_map`` applies the plan-level buffer remapping so contraction
     a/b buffer lookups find the input_access entries, and internal node
     ids collide-renamed to output_names (e.g. ``c`` → ``n0``) still resolve.
-    Returns None when the annotation is absent (legacy plans).
+    Returns None when the annotation is absent (pointwise kernel).
     """
     if not core_struct:
         return None
