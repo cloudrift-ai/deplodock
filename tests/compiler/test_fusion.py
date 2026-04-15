@@ -10,7 +10,7 @@ from pathlib import Path
 
 from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, FusedRegionOp, InputOp, ReduceOp
+from deplodock.compiler.ops import ConstantOp, ElementwiseOp, FusedRegionOp, InputOp, KernelOp, ReduceOp
 from deplodock.compiler.rewriter import Rewriter
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -28,7 +28,7 @@ def _load_and_decompose() -> Graph:
 
 def _fused_regions(g: Graph) -> list:
     """Return list of FusedRegionOp nodes from a fused graph."""
-    return [n for n in g.nodes.values() if isinstance(n.op, FusedRegionOp)]
+    return [n for n in g.nodes.values() if isinstance(n.op, (FusedRegionOp, KernelOp))]
 
 
 def _region_op_types(region) -> list[str]:

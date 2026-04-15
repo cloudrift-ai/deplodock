@@ -92,8 +92,8 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             continue
 
         # Output buffer(s) for this node.
-        # FusedRegionOp may have multiple external outputs — allocate a buffer for each.
-        if isinstance(op, ops_module.FusedRegionOp) and len(op.output_names) > 1:
+        # FusedRegionOp / KernelOp may have multiple external outputs — allocate a buffer for each.
+        if isinstance(op, (ops_module.FusedRegionOp, ops_module.KernelOp)) and len(op.output_names) > 1:
             outputs = []
             for out_id in op.output_names:
                 # Each external output needs its own buffer.
@@ -158,7 +158,7 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
         elif isinstance(op, ops_module.ScatterOp):
             tag = "scatter"
             params["axis"] = op.axis
-        elif isinstance(op, ops_module.FusedRegionOp):
+        elif isinstance(op, (ops_module.FusedRegionOp, ops_module.KernelOp)):
             tag = "fused_region"
             params["kernel_source"] = op.kernel_source
             params["region_ops_count"] = len(op.region_ops)

@@ -396,3 +396,152 @@ class FusedRegionOp(Op):
         if self.output_names and self.shapes:
             return tuple(self.shapes.get(self.output_names[0], ()))
         return ()
+
+
+# ---------------------------------------------------------------------------
+# KernelOp: structured fused op (prologue → core → epilogue)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Port:
+    """How a KernelOp reads/writes one external buffer.
+
+    ``buffer_id`` names the external graph node; ``indexmap`` (when set)
+    describes the per-output coord access pattern (transpose, slice,
+    broadcast, cat). ``None`` = identity load/store at the natural shape.
+    """
+
+    buffer_id: str
+    indexmap: IndexMapOp | None = None
+
+
+@dataclass
+class ReduceStage:
+    """One reduction in a multi-reduce chain.
+
+    ``pre_ops``: elementwise chain between the previous stage's output (or
+    the prologue, for the first stage) and this reduce. Empty for a single
+    reduce immediately after the prologue.
+
+    ``reduce``: the ReduceOp Node (kept untyped to avoid circular import).
+    """
+
+    pre_ops: tuple  # tuple[Node, ...]
+    reduce: object  # Node
+
+
+@dataclass
+class ContractionCore:
+    """Matmul-shaped sum reduction: out[..., m, n] = sum_k a[..., m, k] * b[..., k, n].
+
+    The IndexMaps on a/b absorb transpositions and broadcasts that used to
+    be separate ops upstream. The mul + sum are implicit — this is THE
+    matmul template.
+    """
+
+    a: Port
+    b: Port
+    k_axis: int  # which dim of a's post-IndexMap shape is K
+
+
+@dataclass
+class KernelOp(Op):
+    """One kernel's worth of computation: prologue → core → epilogue.
+
+    The four codegen templates encode in the union, not in a tag string:
+      - core is None                       ⇒ pointwise (prologue only)
+      - isinstance(core, ContractionCore)  ⇒ matmul / batched matmul
+      - isinstance(core, tuple)            ⇒ reduce chain (1+ ReduceStages)
+
+    Each chain stage is a topologically-sorted tuple of primitive Nodes.
+    Cross-stage data flow is implicit: the last node of ``prologue`` feeds
+    the core; the core's output feeds the first node of ``epilogue``. A
+    KernelOp has one external output (Port) by construction; multi-output
+    fusion is a future extension.
+
+    During Stage 2 of the refactor, ``prologue`` may hold the full flat
+    node list (core=None); Stage 3 rules populate ``core`` structurally.
+    Compat properties emulate the old ``FusedRegionOp`` field names so
+    backend readers work unchanged until their migration.
+    """
+
+    inputs: list  # list[Port] — external reads
+    outputs: list  # list[Port] — external writes (today: always 1)
+    prologue: tuple = ()  # tuple[Node, ...] — elementwise chain
+    # core: ContractionCore | tuple[ReduceStage, ...] | None
+    core: object = None
+    epilogue: tuple = ()  # tuple[Node, ...] — elementwise chain
+    kernel_source: str = ""  # backend-set after emission
+    external_shapes: dict = field(default_factory=dict)  # buffer_id → shape for external buffers
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        # Walk stages in reverse priority to find the output shape.
+        if self.epilogue:
+            return tuple(self.epilogue[-1].output.shape)
+        if isinstance(self.core, ContractionCore):
+            return self._contraction_out_shape(input_shapes)
+        if isinstance(self.core, tuple) and self.core:
+            return tuple(self.core[-1].reduce.output.shape)
+        if self.prologue:
+            return tuple(self.prologue[-1].output.shape)
+        return ()
+
+    def _contraction_out_shape(self, input_shapes: list[tuple]) -> tuple:
+        core = self.core
+        assert isinstance(core, ContractionCore)
+        a_shape = self._port_shape(core.a, input_shapes)
+        b_shape = self._port_shape(core.b, input_shapes)
+        return tuple(a_shape[:-1]) + (b_shape[-1],)
+
+    def _port_shape(self, port: Port, input_shapes: list[tuple]) -> tuple:
+        if port.indexmap is not None:
+            return tuple(port.indexmap.out_shape)
+        for i, p in enumerate(self.inputs):
+            if p.buffer_id == port.buffer_id:
+                return tuple(input_shapes[i])
+        return ()
+
+    # ------------------------------------------------------------------
+    # Backward-compat shims: emulate FusedRegionOp API during migration.
+    # Each flattens prologue + core nodes + epilogue into (id, op, inputs)
+    # tuples, derives name lists from Port lists, and merges internal
+    # node shapes with external buffer shapes.
+    # ------------------------------------------------------------------
+
+    @property
+    def region_ops(self) -> list:
+        result: list = []
+        for node in self.prologue:
+            result.append((node.id, node.op, list(node.inputs)))
+        if isinstance(self.core, tuple):
+            for stage in self.core:
+                for node in stage.pre_ops:
+                    result.append((node.id, node.op, list(node.inputs)))
+                r = stage.reduce
+                result.append((r.id, r.op, list(r.inputs)))
+        for node in self.epilogue:
+            result.append((node.id, node.op, list(node.inputs)))
+        return result
+
+    @property
+    def input_names(self) -> list:
+        return [p.buffer_id for p in self.inputs]
+
+    @property
+    def output_names(self) -> list:
+        return [p.buffer_id for p in self.outputs]
+
+    @property
+    def shapes(self) -> dict:
+        result: dict = dict(self.external_shapes)
+        for node in self.prologue:
+            result[node.id] = tuple(node.output.shape)
+        if isinstance(self.core, tuple):
+            for stage in self.core:
+                for node in stage.pre_ops:
+                    result[node.id] = tuple(node.output.shape)
+                result[stage.reduce.id] = tuple(stage.reduce.output.shape)
+        for node in self.epilogue:
+            result[node.id] = tuple(node.output.shape)
+        return result

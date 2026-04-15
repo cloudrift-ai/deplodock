@@ -57,6 +57,7 @@ _OP_CLASS_MAP: dict[str, str] = {
     "IndexMap": "IndexMapOp",
     "Slice": "SliceOp",
     "Cat": "CatOp",
+    "Kernel": "KernelOp",
 }
 
 # Field ordering per op class — maps positional constraints to field names.

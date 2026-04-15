@@ -15,7 +15,8 @@ import math
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ops import (
-    FusedRegionOp,
+    KernelOp,
+    Port,
 )
 from deplodock.compiler.shape_utils import is_broadcast_compatible
 
@@ -461,22 +462,42 @@ def auto_fuse(graph: Graph) -> Graph:
         if not external_outputs:
             continue
 
-        region_ops = [(nid, g.nodes[nid].op, list(g.nodes[nid].inputs)) for nid in topo]
         primary_out = external_outputs[0]
         out_tensor = g.nodes[primary_out].output
 
-        region_shapes: dict[str, tuple] = {}
+        # External-buffer shapes (only external inputs; internal node shapes
+        # come from each Node's output.shape directly via KernelOp.shapes).
+        external_shapes: dict[str, tuple] = {}
         for inp_id in external_inputs:
             if inp_id in g.nodes:
-                region_shapes[inp_id] = g.nodes[inp_id].output.shape
-        for nid in topo:
-            region_shapes[nid] = g.nodes[nid].output.shape
+                external_shapes[inp_id] = tuple(g.nodes[inp_id].output.shape)
 
-        fused_op = FusedRegionOp(
-            region_ops=region_ops,
-            input_names=external_inputs,
-            output_names=external_outputs,
-            shapes=region_shapes,
+        # Deep-copy the body nodes into the prologue tuple so the KernelOp
+        # can hold them independently of the outer graph (which will have
+        # its originals removed below).
+        from deplodock.compiler.ir import Node
+
+        body_nodes = tuple(
+            Node(
+                id=nid,
+                op=g.nodes[nid].op,
+                inputs=list(g.nodes[nid].inputs),
+                output=Tensor(
+                    name=g.nodes[nid].output.name,
+                    shape=tuple(g.nodes[nid].output.shape),
+                    dtype=g.nodes[nid].output.dtype,
+                ),
+            )
+            for nid in topo
+        )
+
+        fused_op = KernelOp(
+            inputs=[Port(buffer_id=bid) for bid in external_inputs],
+            outputs=[Port(buffer_id=bid) for bid in external_outputs],
+            prologue=body_nodes,
+            core=None,
+            epilogue=(),
+            external_shapes=external_shapes,
         )
         fused_id = g.add_node(
             op=fused_op,
