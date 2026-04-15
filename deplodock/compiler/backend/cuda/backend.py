@@ -364,7 +364,7 @@ def _select_strategy(op: OpKernel, analysis) -> tuple[str, dict]:
         matmul_hints["strategy"] = "naive"
     # Online reduction (contraction + multi-reduce) uses 1D grid which is
     # incompatible with TMA descriptor setup.  Fall back to naive.
-    has_multi_reduce = len(analysis.op_phases.reduces) > 1 if hasattr(analysis, "op_phases") else False
+    has_multi_reduce = len(analysis.reduce_fns) > 1
     if has_multi_reduce and strategy in ("tma_db", "smem"):
         strategy = "naive"
         matmul_hints["strategy"] = "naive"
@@ -682,11 +682,10 @@ def _split_contraction_softmax(op: OpKernel, analysis) -> list[CudaLaunch] | Non
 
     Returns None if the region doesn't need splitting.
     """
-    phases = analysis.op_phases
     tile_n = 128
 
     # Only split when: contraction + multi-reduce + N > tile_n.
-    if len(phases.reduces) <= 1 or analysis.cols <= tile_n:
+    if len(analysis.reduce_fns) <= 1 or analysis.cols <= tile_n:
         return None
 
     from deplodock.compiler.ops import ReduceOp

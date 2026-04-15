@@ -42,6 +42,14 @@ if TYPE_CHECKING:
     from deplodock.compiler.backend.cuda.schedule import Schedule
 
 
+def _phases_view(region: KernelOp):
+    """Bundle ``KernelOp.phases()`` tuple as a namespace for ``phases.X`` reads."""
+    from types import SimpleNamespace
+
+    p, r, i, e = region.phases()
+    return SimpleNamespace(prologue=p, reduces=r, inter_reduce=i, epilogue=e)
+
+
 # ---------------------------------------------------------------------------
 # Generic lowering — single entry point driven by Schedule
 # ---------------------------------------------------------------------------
@@ -72,7 +80,7 @@ def lower_generic(
     body.extend(_emit_grid(schedule, analysis))
 
     # Phase 2: Accumulators
-    body.extend(_emit_accumulators(schedule, analysis))
+    body.extend(_emit_accumulators(schedule, analysis, region))
 
     # Phase 3: Reduction loops (0 for pointwise, 1+ for reduce/contraction)
     body.extend(_emit_reductions(schedule, analysis, region, shapes))
@@ -153,7 +161,7 @@ def _emit_grid(schedule: Schedule, analysis: TileAnalysis) -> list:
 # ---------------------------------------------------------------------------
 
 
-def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
+def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis, region: KernelOp) -> list:
     ops: list = []
     accum = schedule.accum
 
@@ -163,7 +171,7 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
 
     if accum.shape == ():
         # Scalar accumulators (one per reduce op)
-        for _node in analysis.op_phases.reduces:
+        for _node in region.phases()[1]:
             acc_name = f"acc_{_safe(_node.id)}"
             ops.append(AccumInit(acc_name, _node.op.fn))
         return ops
@@ -314,7 +322,7 @@ def _emit_scalar_reductions(
     shapes: dict[str, tuple],
 ) -> list:
     """Emit scalar reduction loops (single or multi-reduce)."""
-    phases = analysis.op_phases
+    phases = _phases_view(region)
     out_shape = shapes.get([p.buffer_id for p in region.outputs][0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
     guarded: list = []
@@ -505,7 +513,7 @@ def _emit_online_contraction_reduce(
     thread_m = schedule.thread_m or 8
     thread_n = schedule.thread_n or 4
     tile_n = schedule.tile_n or 128
-    phases = analysis.op_phases
+    phases = _phases_view(region)
     output = _safe([p.buffer_id for p in region.outputs][0])
     input_set = set([p.buffer_id for p in region.inputs])
 
@@ -736,8 +744,7 @@ def _emit_epilogue(
     shapes: dict[str, tuple],
 ) -> list:
     accum = schedule.accum
-    phases = analysis.op_phases
-
+    phases = _phases_view(region)
     if accum.shape is None:
         # Pointwise: epilogue was inlined in the pointwise body
         return []
@@ -763,7 +770,7 @@ def _emit_scalar_epilogue(
     shapes: dict[str, tuple],
 ) -> list:
     """Emit epilogue for scalar reductions (inside the row guard)."""
-    phases = analysis.op_phases
+    phases = _phases_view(region)
     out_shape = shapes.get([p.buffer_id for p in region.outputs][0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
 
@@ -860,7 +867,7 @@ def _emit_write(
         )
 
     # Scalar reduction write
-    phases = analysis.op_phases
+    phases = _phases_view(region)
     reduce_vars: dict[str, tuple[str, str]] = {}
     for _node in phases.reduces:
         reduce_vars[_node.id] = (f"acc_{_safe(_node.id)}", _node.op.fn)

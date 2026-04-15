@@ -9,22 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir import Node
 from deplodock.compiler.ops import AccessPattern, KernelOp
-
-
-@dataclass
-class OpPhases:
-    """Ops split into prologue (before first reduce), reduces, epilogue (after last reduce).
-
-    For multi-reduce patterns (e.g. softmax max+sum), inter_reduce[i] holds the
-    ops between reduces[i] and reduces[i+1].
-    """
-
-    prologue: list[Node]
-    reduces: list[Node]
-    epilogue: list[Node]
-    inter_reduce: list[list[Node]] = field(default_factory=list)
 
 
 @dataclass
@@ -32,11 +17,11 @@ class TileAnalysis:
     """Analysis result for a KernelOp.
 
     Captures everything needed to choose a tiling strategy and generate
-    the kernel, without re-walking the ops.
+    the kernel, without re-walking the ops. Phase decomposition is NOT
+    stored here — consumers call ``KernelOp.phases()`` directly.
     """
 
     pattern: str  # "pointwise" | "row_reduce" | "reduce_broadcast" | "contraction"
-    op_phases: OpPhases
     output_shape: tuple[int, ...]
     reduce_fns: list[str]  # ["sum"], ["max", "sum"], etc.
     input_access: dict[str, AccessPattern]  # per external input
@@ -72,14 +57,11 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     the results into the codegen-facing struct.
     """
     out_shape = shapes.get(region.outputs[0].buffer_id, (1,))
-    prologue, reduces, inter_reduce, epilogue = region.phases()
-    phases = OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
     rows, cols, k_dim = region.tile_dims(shapes, out_shape)
     cinfo = region.contraction_info(shapes)
 
     return TileAnalysis(
         pattern=region.tile_pattern(shapes, out_shape),
-        op_phases=phases,
         output_shape=out_shape,
         reduce_fns=region.reduce_fn_names(),
         input_access=region.input_accesses(shapes, out_shape),

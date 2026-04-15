@@ -41,6 +41,15 @@ from deplodock.compiler.backend.ir.kernel_ir import (
 from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReshapeOp, TransposeOp
 from deplodock.compiler.ops import _needed_by_ids as _needed_by
 
+
+def _phases_view(region: KernelOp):
+    """Bundle ``KernelOp.phases()`` tuple as a namespace for ``phases.X`` reads."""
+    from types import SimpleNamespace
+
+    p, r, i, e = region.phases()
+    return SimpleNamespace(prologue=p, reduces=r, inter_reduce=i, epilogue=e)
+
+
 # ---------------------------------------------------------------------------
 # Convenience entry points (moved from fused.py and matmul.py shims)
 # ---------------------------------------------------------------------------
@@ -611,9 +620,8 @@ def _lower_naive(
     """
     is_contraction = analysis.pattern == "contraction"
     is_pointwise = analysis.pattern == "pointwise"
-    has_reduce = bool(analysis.op_phases.reduces)
-    phases = analysis.op_phases
-
+    has_reduce = bool(region.phases()[1])
+    phases = _phases_view(region)
     # --- Params ---
     # When a buffer appears in both input_names and output_names (in-place
     # operation, e.g. softmax split from a contraction), emit a single
