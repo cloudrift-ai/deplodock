@@ -160,7 +160,10 @@ def _build_region_and_shapes(op: OpKernel):
     if original_input_names != list(op.inputs) or original_output_names != list(op.outputs):
         rename_map = dict(zip(original_input_names, op.inputs, strict=False))
         rename_map.update(dict(zip(original_output_names, op.outputs, strict=False)))
-    core = _rehydrate_core(op.params.get("_core_struct"), body_nodes, rename_map)
+    core_struct = op.params.get("_core_struct")
+    if core_struct is None:
+        core_struct = _infer_core_struct(region_ops, input_names)
+    core = _rehydrate_core(core_struct, body_nodes, rename_map)
 
     kernel = KernelOp(
         inputs=[Port(buffer_id=name) for name in input_names],
@@ -172,6 +175,67 @@ def _build_region_and_shapes(op: OpKernel):
         external_shapes=external_shapes,
     )
     return kernel, shapes
+
+
+def _infer_core_struct(region_ops: list, input_names: list) -> dict | None:
+    """Infer a structured core from flat region_ops (legacy plan fallback).
+
+    Recognizes ``sum(mul(a, b))`` as a ContractionCore and generic reduce
+    chains as tuple[ReduceStage]. Returns a dict in the same shape as
+    plan.py::_serialize_core so _rehydrate_core can consume it uniformly.
+    """
+    from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+
+    id_to_entry = {rid: (rop, inps) for rid, rop, inps in region_ops}
+    reduces = [(rid, rop, inps) for rid, rop, inps in region_ops if isinstance(rop, ReduceOp)]
+    if not reduces:
+        return None
+    first_rid, first_op, first_inps = reduces[0]
+    if first_op.fn == "sum" and len(first_inps) == 1:
+        feeder_id = first_inps[0]
+        feeder = id_to_entry.get(feeder_id)
+        if (
+            feeder
+            and isinstance(feeder[0], ElementwiseOp)
+            and feeder[0].fn == "mul"
+            and len(feeder[1]) == 2
+            and feeder[1][0] in input_names
+            and feeder[1][1] in input_names
+        ):
+            k_axis = first_op.axis if isinstance(first_op.axis, int) else None
+            if k_axis is None or k_axis < 0:
+                # Best-effort: defer axis resolution to caller; use 0 if unresolved.
+                k_axis = k_axis if isinstance(k_axis, int) else 0
+            return {
+                "kind": "contraction",
+                "a_buffer": feeder[1][0],
+                "b_buffer": feeder[1][1],
+                "k_axis": k_axis,
+                "mul_id": feeder_id,
+                "reduce_id": first_rid,
+                "post_stages": [],
+            }
+    # Generic reduce chain.
+    stages = []
+    prev_reduce_id = None
+    for rid, _rop, rinps in reduces:
+        pre_chain: list[str] = []
+        cur = rinps[0] if rinps else None
+        visited: set[str] = set()
+        while cur in id_to_entry and cur not in visited:
+            visited.add(cur)
+            entry = id_to_entry[cur]
+            if isinstance(entry[0], ReduceOp):
+                break
+            pre_chain.append(cur)
+            cur = entry[1][0] if entry[1] else None
+            if cur == prev_reduce_id:
+                break
+        stages.append({"reduce_id": rid, "pre_op_ids": list(reversed(pre_chain))})
+        prev_reduce_id = rid
+    if stages:
+        stages[0]["pre_op_ids"] = []
+    return {"kind": "reduce", "stages": stages}
 
 
 def _rehydrate_core(core_struct, body_nodes, rename_map=None):
