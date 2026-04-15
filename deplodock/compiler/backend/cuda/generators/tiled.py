@@ -1,6 +1,6 @@
 """Unified tiled kernel generator.
 
-Produces a KernelDef from a TileAnalysis for any fused region pattern:
+Produces a KernelDef from a KernelOp for any fused region pattern:
 pointwise, row_reduce, reduce_broadcast, or contraction.
 
 A single code path handles all patterns through composable phases:
@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import math
 
-from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis
 from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
@@ -58,12 +57,9 @@ def _phases_view(region: KernelOp):
 def generate_kernel(region: KernelOp, name: str, shapes: dict[str, tuple]) -> KernelDef:
     """Generate a CUDA kernel from a KernelOp.
 
-    Analyzes the region and produces a KernelDef via the unified tiled generator.
+    Produces a KernelDef via the unified tiled generator.
     """
-    from deplodock.compiler.backend.cuda.generators.analysis import analyze
-
-    analysis = analyze(region, shapes)
-    kernel_def, _loop_prog, _schedule = lower_tiled(region, name, shapes, analysis)
+    kernel_def, _loop_prog, _schedule = lower_tiled(region, name, shapes)
     return kernel_def
 
 
@@ -274,7 +270,6 @@ def _lower_smem(  # noqa: C901
     region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     *,
     hints: dict,
 ) -> KernelDef:
@@ -287,11 +282,12 @@ def _lower_smem(  # noqa: C901
     Block: (32, 4) = 128 threads. Each thread computes thread_m × 4 outputs.
     Supports k_splits via blockIdx.z + atomicAdd for SM utilization.
     """
-    a_name = _safe(analysis.contraction_a)
-    b_name = _safe(analysis.contraction_b)
+    cinfo = region.contraction_info(shapes)
+    a_name = _safe(cinfo.a_id)
+    b_name = _safe(cinfo.b_id)
     out_id = [p.buffer_id for p in region.outputs][0]
     c_name = _safe(out_id)
-    is_batched = analysis.batch_size > 1
+    is_batched = cinfo.batch_size > 1
 
     thread_m = int(hints.get("thread_m", 4))
     thread_n = 4
@@ -419,12 +415,11 @@ def lower_tiled(
     region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     *,
     strategy: str = "naive",
     hints: dict | None = None,
 ) -> tuple[KernelDef, object, object]:
-    """Generate a KernelDef for a fused region based on its TileAnalysis.
+    """Generate a KernelDef for a fused region.
 
     Routes through LoopIR: lower_to_loop_ir() → loop_ir_to_kernel().
     Returns ``(kernel_def, loop_program, schedule)`` so callers can inspect
@@ -433,7 +428,7 @@ def lower_tiled(
     from deplodock.compiler.backend.cuda.generators.loop_codegen import loop_ir_to_kernel
     from deplodock.compiler.backend.cuda.generators.loop_lower import _grid_type, lower_to_loop_ir
 
-    loop_prog, schedule = lower_to_loop_ir(region, name, shapes, analysis, strategy=strategy, hints=hints or {})
+    loop_prog, schedule = lower_to_loop_ir(region, name, shapes, strategy=strategy, hints=hints or {})
     cinfo = region.contraction_info(shapes)
     batched = cinfo is not None and cinfo.batch_size > 1
     gtype = _grid_type(schedule, region, shapes)
@@ -615,7 +610,6 @@ def _lower_naive(
     region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     *,
     strategy: str = "naive",
     hints: dict | None = None,
@@ -628,10 +622,15 @@ def _lower_naive(
     Hints (cuda.matmul.* namespace, without prefix):
         block_k: K-tile size (default 16 for naive, 32 for tma_db)
     """
-    is_contraction = analysis.pattern == "contraction"
-    is_pointwise = analysis.pattern == "pointwise"
+    out_shape_top = shapes.get(region.outputs[0].buffer_id, (1,))
+    pattern = region.tile_pattern(shapes, out_shape_top)
+    is_contraction = pattern == "contraction"
+    is_pointwise = pattern == "pointwise"
     has_reduce = bool(region.phases()[1])
     phases = _phases_view(region)
+    cinfo = region.contraction_info(shapes)
+    _rows, cols_dim, _k_dim = region.tile_dims(shapes, out_shape_top)
+    epi_per_elem = region.epilogue_needs_per_element(shapes, out_shape_top)
     # --- Params ---
     # When a buffer appears in both input_names and output_names (in-place
     # operation, e.g. softmax split from a contraction), emit a single
@@ -647,7 +646,7 @@ def _lower_naive(
 
     if is_contraction:
         params.extend([KernelParam("int", "M"), KernelParam("int", "N"), KernelParam("int", "K")])
-        is_batched = analysis.batch_size > 1
+        is_batched = cinfo is not None and cinfo.batch_size > 1
         if is_batched:
             params.append(KernelParam("int", "batch_count"))
         # Block (32, 8) = 256 threads.  thread_m controls rows per thread.
@@ -728,8 +727,8 @@ def _lower_naive(
 
     # --- Phase 3+4+5: Tile loop with prologue + accumulation ---
     if is_contraction:
-        a_name = _safe(analysis.contraction_a)
-        b_name = _safe(analysis.contraction_b)
+        a_name = _safe(cinfo.a_id)
+        b_name = _safe(cinfo.b_id)
         out_id = [p.buffer_id for p in region.outputs][0]
         c_name = _safe(out_id)
         default_bk = 32 if strategy == "tma_db" else 16
@@ -842,8 +841,8 @@ def _lower_naive(
                 f"    __syncthreads();\n"
                 f"}}\n"
             )
-            if len(phases.reduces) > 1 and analysis.cols <= tile_n:
-                epi_code = _contraction_softmax_epilogue_code(phases, shapes, thread_m, thread_n, analysis.cols)
+            if len(phases.reduces) > 1 and cols_dim <= tile_n:
+                epi_code = _contraction_softmax_epilogue_code(phases, shapes, thread_m, thread_n, cols_dim)
             else:
                 epi_code = _contraction_epilogue_code(phases, shapes, thread_m, thread_n)
             if epi_code:
@@ -900,9 +899,9 @@ def _lower_naive(
                 f"        {naive_fma_safe}\n"
                 f"}}\n"
             )
-            if len(phases.reduces) > 1 and analysis.cols <= tile_n:
+            if len(phases.reduces) > 1 and cols_dim <= tile_n:
                 # Fused contraction + softmax: in-register softmax after K-loop.
-                epi_code = _contraction_softmax_epilogue_code(phases, shapes, thread_m, thread_n, analysis.cols)
+                epi_code = _contraction_softmax_epilogue_code(phases, shapes, thread_m, thread_n, cols_dim)
             else:
                 epi_code = _contraction_epilogue_code(phases, shapes, thread_m, thread_n)
             if epi_code:
@@ -970,7 +969,7 @@ def _lower_naive(
 
         # Final epilogue pass: re-read inputs, recompute inter-reduce ops, apply epilogue, write.
         epilogue_ops = phases.epilogue
-        if epilogue_ops or analysis.epilogue_needs_per_element:
+        if epilogue_ops or epi_per_elem:
             epi_body: list = []
             epi_var_map: dict[str, Expr] = dict(var_map)
             for inp in [p.buffer_id for p in region.inputs]:
@@ -1031,7 +1030,7 @@ def _lower_naive(
         # Epilogue
         epilogue_ops = phases.epilogue
         if epilogue_ops:
-            if analysis.epilogue_needs_per_element:
+            if epi_per_elem:
                 epi_body: list = []
                 epi_var_map: dict[str, Expr] = dict(var_map)
                 for inp in [p.buffer_id for p in region.inputs]:

@@ -40,7 +40,7 @@ sys.path.insert(0, str(REPO))
 
 from deplodock.compiler.backend.codegen import emit_kernel  # noqa: E402
 
-from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled  # noqa: E402
+from deplodock.compiler.backend.cuda.generators import lower_tiled  # noqa: E402
 from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp  # noqa: E402
@@ -93,7 +93,7 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
         output_names=["C"],
     )
     shapes = {"A": ("M", "K"), "B": ("K", "N"), "ew": ("M", "K", "N"), "C": ("M", "N")}
-    kernel, _loop_prog, _sched = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
+    kernel, _loop_prog, _sched = lower_tiled(region, "fused_matmul", shapes, strategy=strategy)
     src = emit_kernel(kernel)
 
     dim_args: dict[str, int] = {"M": size, "N": size, "K": size}

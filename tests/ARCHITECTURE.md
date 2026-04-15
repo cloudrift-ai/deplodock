@@ -51,7 +51,6 @@ tests/
 │   ├── test_torch_trace.py     # PyTorch tracer smoke tests
 │   ├── test_torch_trace_ops.py # PyTorch tracer op handlers and helpers
 │   ├── test_backend_ir.py      # Backend IR AST nodes + codegen emission
-│   ├── test_tile_analysis.py   # TileAnalysis pattern classification
 │   ├── test_kernel_gen.py      # Kernel generation from FusedRegionOps
 │   ├── test_loop_ir.py         # LoopIR dataclasses, pretty-print, structure, round-trip
 │   ├── test_cuda.py            # CUDA codegen, lowering, GPU correctness

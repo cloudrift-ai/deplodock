@@ -1,4 +1,4 @@
-"""Lower KernelOp + TileAnalysis to LoopIR.
+"""Lower KernelOp to LoopIR.
 
 ``lower_generic()`` is the single entry point: it reads a ``Schedule`` and
 emits LoopIR through five phases (grid → accumulators → reductions →
@@ -13,7 +13,6 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis
 from deplodock.compiler.backend.ir.loop_ir import (
     Accum,
     AccumInit,
@@ -960,7 +959,6 @@ def lower_to_loop_ir(
     region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     *,
     strategy: str = "naive",
     hints: dict | None = None,
@@ -972,7 +970,7 @@ def lower_to_loop_ir(
     """
     from deplodock.compiler.backend.cuda.schedule import build_schedule
 
-    schedule = build_schedule(region, shapes, analysis, strategy, hints or {})
+    schedule = build_schedule(region, shapes, strategy, hints or {})
     return lower_generic(region, name, shapes, schedule), schedule
 
 

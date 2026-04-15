@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deplodock.compiler.backend.codegen import emit_kernel
 
-from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
+from deplodock.compiler.backend.cuda.generators import lower_tiled
 from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_benchmark
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir import Graph, Tensor
@@ -79,14 +79,14 @@ def _set_matmul_hints(graph: Graph, hints: MatmulHints) -> None:
 
 
 def _lower_matmul_with_hints(hints: MatmulHints):
-    """Build graph, set hints, lower via the unified analyze → lower_tiled path."""
+    """Build graph, set hints, lower via lower_tiled."""
     g = _make_matmul_graph()
     _set_matmul_hints(g, hints)
     return _lower_matmul(g)
 
 
 def _lower_matmul(graph: Graph):
-    """Lower a matmul graph through analyze → lower_tiled."""
+    """Lower a matmul graph via lower_tiled."""
     out_node = graph.nodes[graph.outputs[0]]
     ew_node = graph.nodes[out_node.inputs[0]]
     input_a = graph.nodes[ew_node.inputs[0]]
@@ -104,7 +104,7 @@ def _lower_matmul(graph: Graph):
         c_name: out_node.output.shape,
     }
     strategy = graph.hints.prefix("cuda.matmul").get("strategy", "naive")
-    kernel_def, _loop_prog, _sched = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
+    kernel_def, _loop_prog, _sched = lower_tiled(region, "fused_matmul", shapes, strategy=strategy)
     return kernel_def
 
 

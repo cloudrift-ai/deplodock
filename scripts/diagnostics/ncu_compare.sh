@@ -57,7 +57,7 @@ import sys, pathlib
 sys.path.insert(0, "$REPO_DIR")
 from deplodock.compiler.backend.cuda.runner import generate_benchmark_program, _detect_arch
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
-from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
+from deplodock.compiler.backend.cuda.generators import lower_tiled
 from deplodock.compiler.backend.codegen import emit_kernel
 from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
 
@@ -76,7 +76,7 @@ region = FusedRegionOp(
     input_names=["A", "B"], output_names=["C"],
 )
 shapes = {"A": ("M", "K"), "B": ("K", "N"), "ew": ("M", "K", "N"), "C": ("M", "N")}
-kernel = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
+kernel = lower_tiled(region, "fused_matmul", shapes, strategy=strategy)
 src = emit_kernel(kernel)
 dim_args = {"M": size, "N": size, "K": size}
 if selected.get("k_splits", 1) > 1: dim_args["k_splits"] = selected["k_splits"]

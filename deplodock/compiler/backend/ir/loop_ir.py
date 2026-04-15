@@ -1,9 +1,9 @@
 """LoopIR: loop-nest intermediate representation for GPU kernel generation.
 
 Backend-agnostic: describes a kernel as explicit parallel axes, sequential
-loops, memory operations, and reductions.  Sits between TileAnalysis
-(pattern classification) and KernelDef (imperative C AST), separating
-the "what loops do we need" decision from "how to emit C code".
+loops, memory operations, and reductions.  Sits between the KernelOp
+accessors (pattern classification) and KernelDef (imperative C AST),
+separating the "what loops do we need" decision from "how to emit C code".
 
 Backend-specific constructs (e.g. CUDA TMA inline asm) use the RawLoopOp
 escape hatch.

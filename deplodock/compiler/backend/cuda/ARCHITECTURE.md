@@ -14,7 +14,6 @@ cuda/
 ├── program.py        # CudaLaunch, TmaDescriptorSpec, source gen, nvcc, run
 ├── schedule.py       # Schedule: all kernel structure decisions as a dataclass
 ├── generators/       # Kernel code generation
-│   ├── analysis.py       # TileAnalysis: classify KernelOp patterns (dispatch on core type)
 │   ├── loop_lower.py     # lower_generic(): Schedule-driven LoopIR emission
 │   ├── loop_codegen.py   # LoopIR → KernelDef (imperative C AST)
 │   └── tiled.py          # Public API: generate_kernel(), lower_tiled()
@@ -30,16 +29,16 @@ A single `lower_generic()` reads the Schedule and emits LoopIR — no pattern
 matching.
 
 ```
-KernelOp → analyze() → TileAnalysis ──→ build_schedule() → Schedule
-                                                                ↓
-                CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel(LoopProgram, Schedule)
-                                                                                 ↑
-                                                                     lower_generic() → LoopProgram
+KernelOp ──→ build_schedule() → Schedule
+                                    ↓
+    CUDA source ← emit_kernel() ← KernelDef ← loop_ir_to_kernel(LoopProgram, Schedule)
+                                                        ↑
+                                            lower_generic() → LoopProgram
 ```
 
-`analyze()` is pure assembly — it calls accessor methods on
-`KernelOp` (Layer 1 IR) and packs the results into ``TileAnalysis``.
-Source of truth lives on `KernelOp`:
+All structural facts are read directly off `KernelOp` (Layer 1 IR) via
+accessor methods — no intermediate dataclass.  Source of truth on
+`KernelOp`:
 - `body_ops()`, `phases()`, `reduce_fn_names()`, `port_indexmaps()` —
   pure structural decomposition of the core annotation.
 - `input_accesses(shapes, output_shape)` — per-input AccessPattern dict.
@@ -124,7 +123,7 @@ the GPU tuning profile and applies hint overrides:
 - **M-aware k_splits**: when `M < tile_m`, increases k_splits to fill the GPU
 - **Epilogue fusion**: contraction + bias/activation/residual add fused in-register
   after K-loop (k_splits forced to 1 when epilogue present)
-- **Batched contraction**: `TileAnalysis.batch_dims` detects >2D matmul operands
+- **Batched contraction**: `KernelOp.contraction_info(shapes).batch_dims` detects >2D matmul operands
   (e.g. multi-head attention QK^T). Uses `blockIdx.z` for batch loop with pointer
   offsets (`A+batch*M*K`, `B+batch*K*N`, `C+batch*M*N`). Currently naive-only
   (TMA batched descriptors in program.py not yet supported).

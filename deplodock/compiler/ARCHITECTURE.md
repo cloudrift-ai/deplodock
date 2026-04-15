@@ -159,8 +159,7 @@ compiler/
 │       ├── backend.py    #  CudaBackend implements Backend ABC
 │       ├── program.py    #  CudaLaunch, TmaDescriptorSpec, source gen, nvcc
 │       ├── generators/   #  Kernel generators
-│       │   ├── analysis.py    #  TileAnalysis: classify KernelOp patterns
-│       │   ├── loop_lower.py  #  TileAnalysis → LoopIR (CUDA lowering)
+│       │   ├── loop_lower.py  #  KernelOp → LoopIR (CUDA lowering)
 │       │   ├── loop_codegen.py #  LoopIR → KernelDef (CUDA codegen)
 │       │   └── tiled.py       #  Public API: generate_kernel(), lower_tiled()
 │       ├── runner.py     #  Single-kernel compile + run + benchmark
