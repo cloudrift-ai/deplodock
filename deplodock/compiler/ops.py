@@ -436,13 +436,18 @@ class ContractionCore:
     """Matmul-shaped sum reduction: out[..., m, n] = sum_k a[..., m, k] * b[..., k, n].
 
     The IndexMaps on a/b absorb transpositions and broadcasts that used to
-    be separate ops upstream. The mul + sum are implicit — this is THE
-    matmul template.
+    be separate ops upstream. The ``mul`` and ``reduce`` Node fields hold
+    the elementwise-multiply and sum-reduction operations that the
+    structural rule moved out of the KernelOp's prologue — they're
+    "implicit" in the template but explicit in the IR so the backend can
+    reach them for codegen.
     """
 
     a: Port
     b: Port
     k_axis: int  # which dim of a's post-IndexMap shape is K
+    mul: object = None  # Node holding the elementwise multiply
+    reduce: object = None  # Node holding the sum reduction
 
 
 @dataclass
@@ -511,12 +516,19 @@ class KernelOp(Op):
 
     @property
     def region_ops(self) -> list:
-        # Core fields are classification annotations that reference nodes
-        # already held in prologue/epilogue (by Node identity). To avoid
-        # double-counting, walk prologue + epilogue only.
+        # Emit (id, op, inputs) tuples in topo order across prologue →
+        # ContractionCore nodes (mul then reduce) → epilogue. ReduceStage
+        # nodes are still hosted in prologue; no extra emission for them.
         result: list = []
         for node in self.prologue:
             result.append((node.id, node.op, list(node.inputs)))
+        if isinstance(self.core, ContractionCore):
+            if self.core.mul is not None:
+                m = self.core.mul
+                result.append((m.id, m.op, list(m.inputs)))
+            if self.core.reduce is not None:
+                r = self.core.reduce
+                result.append((r.id, r.op, list(r.inputs)))
         for node in self.epilogue:
             result.append((node.id, node.op, list(node.inputs)))
         return result
@@ -534,6 +546,11 @@ class KernelOp(Op):
         result: dict = dict(self.external_shapes)
         for node in self.prologue:
             result[node.id] = tuple(node.output.shape)
+        if isinstance(self.core, ContractionCore):
+            if self.core.mul is not None:
+                result[self.core.mul.id] = tuple(self.core.mul.output.shape)
+            if self.core.reduce is not None:
+                result[self.core.reduce.id] = tuple(self.core.reduce.output.shape)
         for node in self.epilogue:
             result[node.id] = tuple(node.output.shape)
         return result
