@@ -59,13 +59,16 @@ def loop_ir_to_kernel(
     schedule: object,
     *,
     batched: bool = False,
+    grid_2d: bool = False,
+    online_reduce: bool = False,
     dim_strides: dict[str, list[str]] | None = None,
 ) -> KernelDef:
     """Translate a LoopProgram + Schedule into a KernelDef.
 
     The Schedule provides backend metadata (block_size, tile dims, TMA config,
     etc.).  The LoopProgram provides only the loop structure and dim_strides.
-    ``batched`` is derived by the caller from the KernelOp's contraction_info.
+    ``batched``, ``grid_2d``, and ``online_reduce`` are derived by the caller
+    (from KernelOp + schedule.load_strategy) and passed in explicitly.
     """
     global _active_tma_config, _active_dim_strides  # noqa: PLW0603
     _active_tma_config = schedule.tma_config
@@ -81,12 +84,12 @@ def loop_ir_to_kernel(
         includes=schedule.includes,
         tile_m=schedule.tile_m,
         tile_n=schedule.tile_n,
-        grid_2d=schedule.grid.type == "2d_standard",
+        grid_2d=grid_2d,
         tma_params=schedule.tma_params,
         batched=batched,
         extra_smem_bytes=schedule.extra_smem_bytes,
         min_blocks_per_sm=schedule.min_blocks_per_sm,
-        online_reduce=schedule.grid.type == "1d_contraction",
+        online_reduce=online_reduce,
     )
 
 

@@ -65,9 +65,10 @@ LoopProgram is purely structural (name, params, body, dim_strides).  Backend
 metadata (block_size, tile dims, TMA config, batching, includes) lives on the
 Schedule and is read by ``loop_ir_to_kernel()`` when building the KernelDef.
 
-**Schedule** (`schedule.py`) contains: `GridSpec` (1d/2d_swizzle/2d_standard),
-`pattern` (pointwise / row_reduce / reduce_broadcast / contraction / multi_reduce),
-plus tile dims, k_splits, load strategy, and batching.
+**Schedule** (`schedule.py`) contains: `GridSpec` (block_size + bound var),
+tile dims, k_splits, and load strategy.  The grid flavor (1d / 1d_contraction
+/ 2d_swizzle / 2d_standard) is derived at lower-time from the KernelOp + the
+schedule's load_strategy via `_grid_type()` in `loop_lower.py`.
 
 **LoopIR** (`backend/loop_ir.py`) makes the loop structure explicit:
 `ParallelAxis`, `LoopNest`, `Alloc`, `Load`/`Store`, `Compute`,
@@ -93,7 +94,8 @@ sequentially:
 
 This works for any multi-reduce pattern (softmax, log-sum-exp, etc.)
 without hardcoded correction factors. The grid is 1D over M-tiles
-(`GridSpec("1d_contraction")`).
+(flavor "1d_contraction", picked by `_grid_type()` for multi-reduce
+contractions).
 
 **TODO**: When N <= tile_n, the N-tile loops have 1 iteration. A future
 KernelIR optimizer pass could fuse them into a single in-register pass.
