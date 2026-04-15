@@ -59,7 +59,6 @@ def lower_generic(
     region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     schedule: Schedule,
 ) -> LoopProgram:
     """Lower a KernelOp to LoopIR using a Schedule.
@@ -80,13 +79,13 @@ def lower_generic(
     body.extend(_emit_grid(schedule))
 
     # Phase 2: Accumulators
-    body.extend(_emit_accumulators(schedule, analysis, region))
+    body.extend(_emit_accumulators(schedule, region, shapes))
 
     # Phase 3: Reduction loops (0 for pointwise, 1+ for reduce/contraction)
-    body.extend(_emit_reductions(schedule, analysis, region, shapes))
+    body.extend(_emit_reductions(schedule, region, shapes))
 
     # Phase 4: Epilogue
-    body.extend(_emit_epilogue(schedule, analysis, region, shapes))
+    body.extend(_emit_epilogue(schedule, region, shapes))
 
     # Phase 5: Write outputs
     body.extend(_emit_write(schedule, region))
@@ -95,7 +94,7 @@ def lower_generic(
         name=name,
         params=params,
         body=body,
-        dim_strides=_build_dim_strides(analysis, region, shapes, schedule),
+        dim_strides=_build_dim_strides(region, shapes, schedule),
     )
 
 
@@ -161,7 +160,7 @@ def _emit_grid(schedule: Schedule) -> list:
 # ---------------------------------------------------------------------------
 
 
-def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis, region: KernelOp) -> list:
+def _emit_accumulators(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list:
     ops: list = []
     accum = schedule.accum
 
@@ -180,14 +179,15 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis, region: Kerne
     ops.append(Alloc("c", accum.dtype, accum.shape, "reg", Literal(0.0)))
 
     # Batch pointer aliases for contraction
-    if schedule.is_batched and analysis.contraction_a:
-        A = Var(_safe(analysis.contraction_a))  # noqa: N806
-        B = Var(_safe(analysis.contraction_b))  # noqa: N806
+    cinfo = region.contraction_info(shapes)
+    if schedule.is_batched and cinfo is not None and cinfo.a_id:
+        A = Var(_safe(cinfo.a_id))  # noqa: N806
+        B = Var(_safe(cinfo.b_id))  # noqa: N806
         batch, M, K, N = Var("batch"), Var("M"), Var("K"), Var("N")  # noqa: N806
         # GQA / broadcast batch: one operand may have fewer batch elements.
         # E.g. 28 Q heads vs 4 KV heads → b_batch_group=7, B uses batch//7.
-        a_batch_idx = batch / analysis.a_batch_group if analysis.a_batch_group > 1 else batch
-        b_batch_idx = batch / analysis.b_batch_group if analysis.b_batch_group > 1 else batch
+        a_batch_idx = batch / cinfo.a_batch_group if cinfo.a_batch_group > 1 else batch
+        b_batch_idx = batch / cinfo.b_batch_group if cinfo.b_batch_group > 1 else batch
         ops.append(Let("Ab", A + a_batch_idx * (M * K), dtype="const float*"))
         ops.append(Let("Bb", B + b_batch_idx * (K * N), dtype="const float*"))
 
@@ -201,7 +201,6 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis, region: Kerne
 
 def _emit_reductions(
     schedule: Schedule,
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
@@ -209,25 +208,24 @@ def _emit_reductions(
 
     if accum.shape is None:
         # Pointwise: no reduction, just inline all ops inside a guard
-        return _emit_pointwise_body(analysis, region, shapes, schedule)
+        return _emit_pointwise_body(region, shapes, schedule)
 
     if accum.shape == ():
         # Scalar reduction (row_reduce / reduce_broadcast / multi-reduce)
-        return _emit_scalar_reductions(schedule, analysis, region, shapes)
+        return _emit_scalar_reductions(schedule, region, shapes)
 
     # 2D register tile contraction
     if schedule.grid.type == "1d_contraction":
         # Contraction + multi-reduce: online N-tiled reduction.
         # Handles phases 3-5 (reductions, epilogue, write) internally.
-        return _emit_online_contraction_reduce(schedule, analysis, region, shapes)
+        return _emit_online_contraction_reduce(schedule, region, shapes)
 
     # Standard contraction K-loop (single reduce, no multi-reduce)
-    return _dispatch_k_loop(schedule, analysis, region, shapes)
+    return _dispatch_k_loop(schedule, region, shapes)
 
 
 def _dispatch_k_loop(
     schedule: Schedule,
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
@@ -235,14 +233,13 @@ def _dispatch_k_loop(
     if schedule.load_strategy == "tma":
         return _emit_tma_k_loop(schedule)
     if schedule.load_strategy == "smem":
-        return _emit_smem_k_loop(schedule, analysis)
-    return _emit_contraction_k_loop(schedule, analysis, region, shapes)
+        return _emit_smem_k_loop(schedule, region, shapes)
+    return _emit_contraction_k_loop(schedule, region, shapes)
 
 
 def _emit_input_loads(
     region: KernelOp,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     idx_var: str,
     prefix: str,
     body: list,
@@ -255,7 +252,7 @@ def _emit_input_loads(
     three previously duplicated this loop with only prefix / idx_var differing.
     """
     for inp in [p.buffer_id for p in region.inputs]:
-        indices = _input_indices(inp, region, shapes, analysis, idx_var, out_size)
+        indices = _input_indices(inp, region, shapes, idx_var, out_size)
         load_name = f"{prefix}{_safe(inp)}"
         body.append(Load(load_name, _safe(inp), indices, "global"))
         var_map[inp] = Var(load_name)
@@ -293,7 +290,6 @@ def _recompute_ops_into(
 
 
 def _emit_pointwise_body(
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
     schedule: Schedule,
@@ -304,7 +300,7 @@ def _emit_pointwise_body(
 
     guard_body: list = []
     var_map: dict[str, LoopExpr] = {}
-    _emit_input_loads(region, shapes, analysis, "i", "v_", guard_body, var_map, out_size)
+    _emit_input_loads(region, shapes, "i", "v_", guard_body, var_map, out_size)
 
     coord_mapping = _build_pointwise_coord_mapping(out_shape)
     _emit_loop_ops(region.body_ops(), var_map, "v_", guard_body, coord_mapping=coord_mapping, shapes=shapes)
@@ -318,7 +314,6 @@ def _emit_pointwise_body(
 
 def _emit_scalar_reductions(
     schedule: Schedule,
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
@@ -351,7 +346,7 @@ def _emit_scalar_reductions(
         pass_body: list = []
 
         pass_var_map: dict[str, LoopExpr] = {}
-        _emit_input_loads(region, shapes, analysis, "j", f"r{ri}ld_", pass_body, pass_var_map, out_size)
+        _emit_input_loads(region, shapes, "j", f"r{ri}ld_", pass_body, pass_var_map, out_size)
 
         for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
             pass_var_map[prev_nid] = Var(prev_acc)
@@ -385,15 +380,15 @@ def _emit_scalar_reductions(
 
 def _emit_contraction_k_loop(
     schedule: Schedule,
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
     """Emit the K-loop for contraction (naive global-load strategy)."""
     thread_m = schedule.thread_m or 8
     thread_n = schedule.thread_n or 4
-    A = Var(_safe(analysis.contraction_a))  # noqa: N806
-    B = Var(_safe(analysis.contraction_b))  # noqa: N806
+    cinfo = region.contraction_info(shapes)
+    A = Var(_safe(cinfo.a_id))  # noqa: N806
+    B = Var(_safe(cinfo.b_id))  # noqa: N806
     a_src = Var("Ab") if schedule.is_batched else A
     b_src = Var("Bb") if schedule.is_batched else B
 
@@ -401,8 +396,8 @@ def _emit_contraction_k_loop(
     k, K, N, M = Var("k"), Var("K"), Var("N"), Var("M")  # noqa: N806
 
     port_imaps = region.port_indexmaps()
-    a_imap = port_imaps.get(analysis.contraction_a)
-    b_imap = port_imaps.get(analysis.contraction_b)
+    a_imap = port_imaps.get(cinfo.a_id)
+    b_imap = port_imaps.get(cinfo.b_id)
 
     def _apply_indexmap(indices: list, imap) -> list:
         if imap is None or not imap.sources:
@@ -458,12 +453,13 @@ def _emit_tma_k_loop(schedule: Schedule) -> list:
     ]
 
 
-def _emit_smem_k_loop(schedule: Schedule, analysis: TileAnalysis) -> list:
+def _emit_smem_k_loop(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list:
     """Emit smem K-tile loop via SmemPipelineKLoop.expand()."""
     from deplodock.compiler.backend.ir.loop_ir import SmemPipelineKLoop
 
-    A = Var(_safe(analysis.contraction_a))  # noqa: N806
-    B = Var(_safe(analysis.contraction_b))  # noqa: N806
+    cinfo = region.contraction_info(shapes)
+    A = Var(_safe(cinfo.a_id))  # noqa: N806
+    B = Var(_safe(cinfo.b_id))  # noqa: N806
     a_buf = "Ab" if schedule.is_batched else A.name
     b_buf = "Bb" if schedule.is_batched else B.name
 
@@ -492,7 +488,6 @@ def _emit_smem_k_loop(schedule: Schedule, analysis: TileAnalysis) -> list:
 
 def _emit_online_contraction_reduce(
     schedule: Schedule,
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
@@ -597,7 +592,7 @@ def _emit_online_contraction_reduce(
         for c in range(thread_n):
             loop1_body.append(SetVar(f"c{r}{c}", Literal(0.0)))
 
-    loop1_body.extend(_dispatch_k_loop(schedule, analysis, region, shapes))
+    loop1_body.extend(_dispatch_k_loop(schedule, region, shapes))
 
     # Apply inter_reduce[0] ops on register tile (ops between contraction
     # reduce and first N-reduce, e.g. scale multiplication).
@@ -741,7 +736,6 @@ def _emit_online_contraction_reduce(
 
 def _emit_epilogue(
     schedule: Schedule,
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
@@ -762,12 +756,11 @@ def _emit_epilogue(
         return _contraction_epilogue_ops(phases, shapes, [p.buffer_id for p in region.inputs], thread_m, thread_n)
 
     # Scalar reduction epilogue
-    return _emit_scalar_epilogue(schedule, analysis, region, shapes)
+    return _emit_scalar_epilogue(schedule, region, shapes)
 
 
 def _emit_scalar_epilogue(
     schedule: Schedule,
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
@@ -794,7 +787,7 @@ def _emit_scalar_epilogue(
         epi_body: list = []
         epi_var_map: dict[str, LoopExpr] = dict(var_map)
 
-        _emit_input_loads(region, shapes, analysis, "j", "epld_", epi_body, epi_var_map, out_size)
+        _emit_input_loads(region, shapes, "j", "epld_", epi_body, epi_var_map, out_size)
 
         # Coord mapping for IndexMaps: epilogue iterates per-element over output
         # at (row, j); pre-reduction shape governs how row decomposes for >2D.
@@ -944,7 +937,7 @@ def lower_to_loop_ir(
     from deplodock.compiler.backend.cuda.schedule import build_schedule
 
     schedule = build_schedule(analysis, strategy, hints or {})
-    return lower_generic(region, name, shapes, analysis, schedule), schedule
+    return lower_generic(region, name, shapes, schedule), schedule
 
 
 # ---------------------------------------------------------------------------
@@ -958,7 +951,6 @@ def _safe(name: str) -> str:
 
 
 def _build_dim_strides(
-    analysis: TileAnalysis,
     region: KernelOp,
     shapes: dict[str, tuple],
     schedule,
@@ -969,11 +961,14 @@ def _build_dim_strides(
     Pointwise buffers use a single flat index (no strides needed).
     """
     strides: dict[str, list[str]] = {}
-    input_access = region.input_accesses(shapes, analysis.output_shape)
+    out_shape = shapes.get(region.outputs[0].buffer_id, (1,))
+    pattern = region.tile_pattern(shapes, out_shape)
+    input_access = region.input_accesses(shapes, out_shape)
+    cinfo = region.contraction_info(shapes)
 
-    if analysis.pattern == "contraction" and analysis.contraction_a:
-        a = _safe(analysis.contraction_a)
-        b = _safe(analysis.contraction_b)
+    if pattern == "contraction" and cinfo is not None and cinfo.a_id:
+        a = _safe(cinfo.a_id)
+        b = _safe(cinfo.b_id)
         strides[a] = ["K"]
         strides[b] = ["N"]
         # Batched pointer aliases
@@ -991,7 +986,7 @@ def _build_dim_strides(
                 acc = input_access.get(inp)
                 if acc and acc.is_2d:
                     strides[safe] = ["N"]
-    elif analysis.pattern in ("row_reduce", "reduce_broadcast", "multi_reduce"):
+    elif pattern in ("row_reduce", "reduce_broadcast", "multi_reduce"):
         # All 2D buffers use "cols" stride
         for inp in [p.buffer_id for p in region.inputs]:
             acc = input_access.get(inp)
@@ -1045,7 +1040,6 @@ def _input_indices(
     inp: str,
     region: KernelOp,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     idx_var: str,
     out_size: int = 0,
 ) -> list[LoopExpr]:
@@ -1065,7 +1059,7 @@ def _input_indices(
     to produce the actual input-space indices — this is how
     transpose-into-matmul / slice-into-matmul load directly.
     """
-    natural = _natural_input_indices(inp, region, shapes, analysis, idx_var, out_size)
+    natural = _natural_input_indices(inp, region, shapes, idx_var, out_size)
     indexmap = region.port_indexmaps().get(inp)
     if indexmap is None or not indexmap.sources:
         return natural
@@ -1080,16 +1074,16 @@ def _natural_input_indices(
     inp: str,
     region: KernelOp,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     idx_var: str,
     out_size: int = 0,
 ) -> list[LoopExpr]:
     """Per-dim index expressions assuming no Port.indexmap substitution."""
-    acc = region.input_accesses(shapes, analysis.output_shape)[inp]
+    out_shape = shapes.get(region.outputs[0].buffer_id, (1,))
+    pattern = region.tile_pattern(shapes, out_shape)
+    acc = region.input_accesses(shapes, out_shape)[inp]
     j = Var(idx_var)
-    out_shape = analysis.output_shape
 
-    if analysis.pattern == "pointwise":
+    if pattern == "pointwise":
         if acc.is_scalar:
             return []
         if acc.is_broadcast or acc.size < out_size:
