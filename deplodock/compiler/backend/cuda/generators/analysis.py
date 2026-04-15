@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import ContractionCore, ElementwiseOp, KernelOp, ReduceOp, ReduceStage
+from deplodock.compiler.ops import ContractionCore, KernelOp, ReduceOp, ReduceStage
 
 
 def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
@@ -354,24 +354,10 @@ def _detect_contraction(
     Returns: (is_contraction, a_name, b_name, M, N, K, batch_dims, batch_size,
               a_batch_group, b_batch_group).
     """
-    if isinstance(region.core, ContractionCore):
-        a_id = region.core.a.buffer_id
-        b_id = region.core.b.buffer_id
-    else:
-        # Unstructured kernel (core=None) — fall back to pattern scan over the
-        # phases for tests and edge cases where the fusion rule hasn't classified.
-        if not phases.reduces:
-            return False, None, None, 0, 0, 0, (), 1, 1, 1
-        _, reduce_op, _ = phases.reduces[0]
-        if reduce_op.fn != "sum":
-            return False, None, None, 0, 0, 0, (), 1, 1, 1
-        mul_entry = next(
-            (e for e in phases.prologue if isinstance(e[1], ElementwiseOp) and e[1].fn == "mul" and len(e[2]) == 2),
-            None,
-        )
-        if mul_entry is None:
-            return False, None, None, 0, 0, 0, (), 1, 1, 1
-        a_id, b_id = mul_entry[2][0], mul_entry[2][1]
+    if not isinstance(region.core, ContractionCore):
+        return False, None, None, 0, 0, 0, (), 1, 1, 1
+    a_id = region.core.a.buffer_id
+    b_id = region.core.b.buffer_id
 
     if a_id not in input_access or b_id not in input_access:
         return False, None, None, 0, 0, 0, (), 1, 1, 1
