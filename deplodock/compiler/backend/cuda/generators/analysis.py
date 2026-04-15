@@ -7,7 +7,6 @@ reduce_broadcast, or contraction.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ops import AccessPattern, KernelOp, _needed_by_ids
@@ -73,108 +72,46 @@ def flat_region_ops(kernel: KernelOp) -> list:
 
 
 def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
-    """Analyze a KernelOp and classify its computation pattern.
+    """Build a ``TileAnalysis`` snapshot from KernelOp accessors.
 
-    Args:
-        region: The fused region containing primitive ops in topo order.
-        shapes: Map of node_id/buffer_name -> shape tuple.
-
-    Returns:
-        TileAnalysis with pattern classification and metadata.
+    All derivation logic lives on ``KernelOp`` (Layer 1). This function
+    is pure assembly: it calls the accessors with ``shapes`` and packs
+    the results into the codegen-facing struct.
     """
-    # Split ops into phases directly from structured kernel fields.
-    phases = _split_phases(region)
-
-    # Determine output shape.
-    out_id = [p.buffer_id for p in region.outputs][0]
-    out_shape = shapes.get(out_id, (1,))
-
-    reduce_fns = region.reduce_fn_names()
-    port_indexmaps = region.port_indexmaps()
-    input_access = region.input_accesses(shapes, out_shape)
-
-    # No reduces → pointwise.
-    if not phases.reduces:
-        total = math.prod(d for d in out_shape if isinstance(d, int))
-        return TileAnalysis(
-            port_indexmaps=port_indexmaps,
-            pattern="pointwise",
-            op_phases=phases,
-            output_shape=out_shape,
-            reduce_fns=[],
-            input_access=input_access,
-            rows=1,
-            cols=total,
-            k_dim=0,
-        )
-
-    # Has reduces — determine the pre-reduction tensor shape.
-    first_reduce_input = phases.reduces[0][2][0]
-    pre_shape = shapes.get(first_reduce_input, out_shape)
-
-    # Contraction pattern (matmul, possibly batched / GQA-broadcast).
+    out_shape = shapes.get(region.outputs[0].buffer_id, (1,))
+    prologue, reduces, inter_reduce, epilogue = region.phases()
+    phases = OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
+    rows, cols, k_dim = region.tile_dims(shapes, out_shape)
     cinfo = region.contraction_info(shapes)
-    if cinfo is not None:
-        a_acc = input_access.get(cinfo.a_id)
-        b_acc = input_access.get(cinfo.b_id)
-        if a_acc and b_acc and a_acc.is_2d and b_acc.is_2d:
-            return TileAnalysis(
-                port_indexmaps=port_indexmaps,
-                pattern="contraction",
-                op_phases=phases,
-                output_shape=out_shape,
-                reduce_fns=reduce_fns,
-                input_access=input_access,
-                rows=cinfo.m,
-                cols=cinfo.n,
-                k_dim=cinfo.k,
-                contraction_a=cinfo.a_id,
-                contraction_b=cinfo.b_id,
-                epilogue_needs_per_element=region.epilogue_needs_per_element(shapes, out_shape),
-                batch_dims=cinfo.batch_dims,
-                batch_size=cinfo.batch_size,
-                a_batch_group=cinfo.a_batch_group,
-                b_batch_group=cinfo.b_batch_group,
-            )
-
-    # Row reduction patterns — extract rows/cols from pre-reduction shape.
-    if len(pre_shape) >= 2:
-        rows = math.prod(d for d in pre_shape[:-1] if isinstance(d, int))
-        cols = pre_shape[-1] if isinstance(pre_shape[-1], int) else 1
-    else:
-        rows = 1
-        cols = math.prod(d for d in pre_shape if isinstance(d, int))
-
-    epilogue_per_elem = region.epilogue_needs_per_element(shapes, out_shape)
-    pattern = "reduce_broadcast" if epilogue_per_elem else "row_reduce"
 
     return TileAnalysis(
-        port_indexmaps=port_indexmaps,
-        pattern=pattern,
+        pattern=region.tile_pattern(shapes, out_shape),
         op_phases=phases,
         output_shape=out_shape,
-        reduce_fns=reduce_fns,
-        input_access=input_access,
+        reduce_fns=region.reduce_fn_names(),
+        input_access=region.input_accesses(shapes, out_shape),
         rows=rows,
         cols=cols,
-        k_dim=cols,  # for row reductions, k == cols
-        epilogue_needs_per_element=epilogue_per_elem,
+        k_dim=k_dim,
+        contraction_a=cinfo.a_id if cinfo is not None else None,
+        contraction_b=cinfo.b_id if cinfo is not None else None,
+        epilogue_needs_per_element=region.epilogue_needs_per_element(shapes, out_shape),
+        batch_dims=cinfo.batch_dims if cinfo is not None else (),
+        batch_size=cinfo.batch_size if cinfo is not None else 1,
+        a_batch_group=cinfo.a_batch_group if cinfo is not None else 1,
+        b_batch_group=cinfo.b_batch_group if cinfo is not None else 1,
+        port_indexmaps=region.port_indexmaps(),
     )
 
 
 def _split_phases(kernel: KernelOp) -> OpPhases:
-    """Wrap ``KernelOp.phases()`` as an ``OpPhases`` dataclass.
+    """Backward-compat wrapper around ``KernelOp.phases()``.
 
-    The phase decomposition lives on ``KernelOp`` itself; this function
-    just names the returned fields for consumer convenience.
+    Kept for any remaining importers; new code should call
+    ``kernel.phases()`` directly and construct OpPhases inline if needed.
     """
     prologue, reduces, inter_reduce, epilogue = kernel.phases()
-    return OpPhases(
-        prologue=prologue,
-        reduces=reduces,
-        epilogue=epilogue,
-        inter_reduce=inter_reduce,
-    )
+    return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
 
 
 def _needed_by(ops: list) -> set:
