@@ -56,6 +56,18 @@ def _pattern(region: KernelOp, shapes: dict[str, tuple]) -> str:
     return region.tile_pattern(shapes, out_shape)
 
 
+def _is_batched(region: KernelOp, shapes: dict[str, tuple]) -> bool:
+    """True when the region has a batched contraction (cinfo.batch_size > 1)."""
+    cinfo = region.contraction_info(shapes)
+    return cinfo is not None and cinfo.batch_size > 1
+
+
+def _epilogue_per_element(region: KernelOp, shapes: dict[str, tuple]) -> bool:
+    """Whether the epilogue needs a per-element second pass over inputs."""
+    out_shape = shapes.get(region.outputs[0].buffer_id, (1,))
+    return region.epilogue_needs_per_element(shapes, out_shape)
+
+
 # ---------------------------------------------------------------------------
 # Generic lowering — single entry point driven by Schedule
 # ---------------------------------------------------------------------------
@@ -111,6 +123,7 @@ def lower_generic(
 
 def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list:
     grid = schedule.grid
+    is_batched = _is_batched(region, shapes)
     if grid.type == "1d":
         axis_name = "i" if _pattern(region, shapes) == "pointwise" else "row"
         return [ParallelAxis(axis_name, "blockIdx.x", grid.bound)]
@@ -123,7 +136,7 @@ def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -
         tile_m = schedule.tile_m or 64
         tidy, tidx = Builtin("threadIdx.y"), Builtin("threadIdx.x")
         ops: list = []
-        if schedule.is_batched:
+        if is_batched:
             ops.append(Let("batch", Builtin("blockIdx.z"), dtype=I))
         ops.append(Let("bm", Builtin("blockIdx.x") * tile_m, dtype=I))
         ops.append(Let("tr", tidy * thread_m, dtype=I))
@@ -141,7 +154,7 @@ def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -
             schedule.thread_n or 4,
             schedule.tile_m or 64,
             schedule.tile_n or 128,
-            schedule.is_batched,
+            is_batched,
         )
     # 2d_standard (smem): row_base/col_base/sr grid
     if grid.type == "2d_standard":
@@ -152,7 +165,7 @@ def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -
         bidy, bidx = Builtin("blockIdx.y"), Builtin("blockIdx.x")
         tidy, tidx = Builtin("threadIdx.y"), Builtin("threadIdx.x")
         ops: list = []
-        if schedule.is_batched:
+        if is_batched:
             ops.append(Let("batch", Builtin("blockIdx.z"), dtype=I))
         ops.append(Let("row_base", (bidy * ty + tidy) * thread_m, dtype=I))
         ops.append(Let("col_base", (bidx * tx + tidx) * thread_n, dtype=I))
@@ -185,7 +198,7 @@ def _emit_accumulators(schedule: Schedule, region: KernelOp, shapes: dict[str, t
 
     # Batch pointer aliases for contraction
     cinfo = region.contraction_info(shapes)
-    if schedule.is_batched and cinfo is not None and cinfo.a_id:
+    if _is_batched(region, shapes) and cinfo is not None and cinfo.a_id:
         A = Var(_safe(cinfo.a_id))  # noqa: N806
         B = Var(_safe(cinfo.b_id))  # noqa: N806
         batch, M, K, N = Var("batch"), Var("M"), Var("K"), Var("N")  # noqa: N806
@@ -235,7 +248,7 @@ def _dispatch_k_loop(
 ) -> list:
     """Pick the K-loop emitter based on schedule.load_strategy."""
     if schedule.load_strategy == "tma":
-        return _emit_tma_k_loop(schedule)
+        return _emit_tma_k_loop(schedule, region, shapes)
     if schedule.load_strategy == "smem":
         return _emit_smem_k_loop(schedule, region, shapes)
     return _emit_contraction_k_loop(schedule, region, shapes)
@@ -391,10 +404,11 @@ def _emit_contraction_k_loop(
     thread_m = schedule.thread_m or 8
     thread_n = schedule.thread_n or 4
     cinfo = region.contraction_info(shapes)
+    is_batched = _is_batched(region, shapes)
     A = Var(_safe(cinfo.a_id))  # noqa: N806
     B = Var(_safe(cinfo.b_id))  # noqa: N806
-    a_src = Var("Ab") if schedule.is_batched else A
-    b_src = Var("Bb") if schedule.is_batched else B
+    a_src = Var("Ab") if is_batched else A
+    b_src = Var("Bb") if is_batched else B
 
     bn, tc, bm, tr = Var("bn"), Var("tc"), Var("bm"), Var("tr")
     k, K, N, M = Var("k"), Var("K"), Var("N"), Var("M")  # noqa: N806
@@ -428,7 +442,7 @@ def _emit_contraction_k_loop(
     return [LoopNest("k", Literal(0, "int"), K, None, k_body)]
 
 
-def _emit_tma_k_loop(schedule: Schedule) -> list:
+def _emit_tma_k_loop(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list:
     """Emit TMA double-buffered K-loop via SmemPipelineKLoop."""
     from deplodock.compiler.backend.ir.loop_ir import SmemPipelineKLoop
 
@@ -452,7 +466,7 @@ def _emit_tma_k_loop(schedule: Schedule) -> list:
             thread_n=thread_n,
             tx=schedule.grid.block_size[0],
             k_splits=schedule.k_splits,
-            is_batched=schedule.is_batched,
+            is_batched=_is_batched(region, shapes),
         )
     ]
 
@@ -462,10 +476,11 @@ def _emit_smem_k_loop(schedule: Schedule, region: KernelOp, shapes: dict[str, tu
     from deplodock.compiler.backend.ir.loop_ir import SmemPipelineKLoop
 
     cinfo = region.contraction_info(shapes)
+    is_batched = _is_batched(region, shapes)
     A = Var(_safe(cinfo.a_id))  # noqa: N806
     B = Var(_safe(cinfo.b_id))  # noqa: N806
-    a_buf = "Ab" if schedule.is_batched else A.name
-    b_buf = "Bb" if schedule.is_batched else B.name
+    a_buf = "Ab" if is_batched else A.name
+    b_buf = "Bb" if is_batched else B.name
 
     pipeline = SmemPipelineKLoop(
         stages=2,
@@ -478,7 +493,7 @@ def _emit_smem_k_loop(schedule: Schedule, region: KernelOp, shapes: dict[str, tu
         thread_n=schedule.thread_n or 4,
         tx=schedule.grid.block_size[0],
         k_splits=schedule.k_splits,
-        is_batched=schedule.is_batched,
+        is_batched=is_batched,
         a_buf=a_buf,
         b_buf=b_buf,
     )
@@ -527,7 +542,7 @@ def _emit_online_contraction_reduce(
     # (e.g. scale), which we apply on the register tile after the K-loop.
     n_reduces = phases.reduces[1:]  # reduces over N (skip contraction reduce)
     n_inter = phases.inter_reduce  # inter_reduce[i] is between reduces[i] and reduces[i+1]
-    is_batched = schedule.is_batched
+    is_batched = _is_batched(region, shapes)
 
     def _out_indices(row: LoopExpr, col: LoopExpr) -> list[LoopExpr]:
         """Build output buffer indices, adding batch dim if needed."""
@@ -641,7 +656,7 @@ def _emit_online_contraction_reduce(
             Var(output),
             thread_m,
             thread_n,
-            schedule.is_batched,
+            is_batched,
             k_splits=1,
         )
     )
@@ -772,8 +787,9 @@ def _emit_scalar_epilogue(
     phases = _phases_view(region)
     out_shape = shapes.get([p.buffer_id for p in region.outputs][0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
+    epi_per_elem = _epilogue_per_element(region, shapes)
 
-    if not phases.epilogue and not schedule.epilogue_per_element:
+    if not phases.epilogue and not epi_per_elem:
         return []
 
     reduce_vars: dict[str, tuple[str, str]] = {}
@@ -786,7 +802,7 @@ def _emit_scalar_epilogue(
 
     has_multi_reduce = len(phases.reduces) > 1
 
-    if has_multi_reduce or schedule.epilogue_per_element:
+    if has_multi_reduce or epi_per_elem:
         # Per-element epilogue loop
         epi_body: list = []
         epi_var_map: dict[str, LoopExpr] = dict(var_map)
@@ -861,7 +877,7 @@ def _emit_write(
         rb = Var(schedule.row_base_var) if schedule.row_base_var else None
         cb = Var(schedule.col_base_var) if schedule.col_base_var else None
         return _contraction_write_ops(
-            Var(_safe(out_id)), thread_m, thread_n, schedule.is_batched, schedule.k_splits, row_base=rb, col_base=cb
+            Var(_safe(out_id)), thread_m, thread_n, _is_batched(region, shapes), schedule.k_splits, row_base=rb, col_base=cb
         )
 
     # Scalar reduction write
@@ -874,9 +890,10 @@ def _emit_write(
     for node_id, (acc_name, _fn) in reduce_vars.items():
         var_map[node_id] = Var(acc_name)
 
-    if schedule.epilogue_per_element or len(phases.reduces) > 1:
+    epi_per_elem = _epilogue_per_element(region, shapes)
+    if epi_per_elem or len(phases.reduces) > 1:
         # Per-element writes were already emitted in the epilogue loop
-        if phases.epilogue or schedule.epilogue_per_element:
+        if phases.epilogue or epi_per_elem:
             return []
         # No epilogue — write last reduce result (thread 0 only)
         ops: list = []
@@ -978,8 +995,9 @@ def _build_dim_strides(
         # Batched pointer aliases
         strides["Ab"] = ["K"]
         strides["Bb"] = ["N"]
+        batched = cinfo.batch_size > 1
         for out_id in [p.buffer_id for p in region.outputs]:
-            if schedule.is_batched:
+            if batched:
                 strides[_safe(out_id)] = ["M * N", "N"]
             else:
                 strides[_safe(out_id)] = ["N"]

@@ -54,11 +54,18 @@ from deplodock.compiler.backend.ir.loop_ir import (
 _active_tma_config = None
 
 
-def loop_ir_to_kernel(program: LoopProgram, schedule: object, dim_strides: dict[str, list[str]] | None = None) -> KernelDef:
+def loop_ir_to_kernel(
+    program: LoopProgram,
+    schedule: object,
+    *,
+    batched: bool = False,
+    dim_strides: dict[str, list[str]] | None = None,
+) -> KernelDef:
     """Translate a LoopProgram + Schedule into a KernelDef.
 
     The Schedule provides backend metadata (block_size, tile dims, TMA config,
     etc.).  The LoopProgram provides only the loop structure and dim_strides.
+    ``batched`` is derived by the caller from the KernelOp's contraction_info.
     """
     global _active_tma_config, _active_dim_strides  # noqa: PLW0603
     _active_tma_config = schedule.tma_config
@@ -76,7 +83,7 @@ def loop_ir_to_kernel(program: LoopProgram, schedule: object, dim_strides: dict[
         tile_n=schedule.tile_n,
         grid_2d=schedule.grid.type == "2d_standard",
         tma_params=schedule.tma_params,
-        batched=schedule.is_batched,
+        batched=batched,
         extra_smem_bytes=schedule.extra_smem_bytes,
         min_blocks_per_sm=schedule.min_blocks_per_sm,
         online_reduce=schedule.grid.type == "1d_contraction",

@@ -59,12 +59,6 @@ class Schedule:
     load_strategy: str = "global"  # "global" | "smem" | "tma"
     block_k: int = 16
 
-    # Batching
-    is_batched: bool = False
-
-    # Epilogue
-    epilogue_per_element: bool = False
-
     # TMA-specific (set by build_schedule when strategy is tma)
     tma_params: list[str] | None = None
     tma_config: object | None = None
@@ -157,7 +151,6 @@ def build_schedule(
             k_splits=k_splits,
             load_strategy=load_strat,
             block_k=block_k,
-            is_batched=is_batched,
             dim_params=dim_params,
             tma_params=tma_params,
             tma_config=tma_config,
@@ -169,6 +162,5 @@ def build_schedule(
     # row_reduce or reduce_broadcast
     return Schedule(
         grid=GridSpec("1d", (256, 1, 1), bound="rows"),
-        epilogue_per_element=analysis.epilogue_needs_per_element,
         dim_params=[("int", "rows"), ("int", "cols")],
     )
