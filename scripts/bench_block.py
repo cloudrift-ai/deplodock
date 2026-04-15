@@ -186,9 +186,7 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
         if dump:
             dump.dump_input_graph(graph)
 
-        from deplodock.compiler.fusion import auto_fuse
-
-        # Decompose + matmul recognition + auto-fuse.
+        # Decompose + optimization + fusion — all run inside the Rewriter.
         rules_dir = Path(__file__).parent.parent / "deplodock" / "compiler" / "rules"
         rewriter = Rewriter.from_directory(rules_dir)
         pass_traces: list[PassTrace] = []
@@ -196,10 +194,6 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
 
         if dump:
             dump.dump_passes(pass_traces)
-
-        compiled = auto_fuse(compiled)
-
-        if dump:
             dump.dump_fused_graph(compiled)
 
         # Plan from graph.

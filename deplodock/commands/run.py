@@ -33,9 +33,8 @@ def _handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    from deplodock.compiler.fusion import auto_fuse
-
-    # Apply decomposition + matmul recognition.
+    # Apply decomposition + optimization + fusion passes. Fusion runs inside
+    # the Rewriter as a pass, so no separate auto_fuse call is needed.
     rules_dir = Path(__file__).parent.parent / "compiler" / "rules"
     rewriter = Rewriter.from_directory(rules_dir)
     pass_traces: list[PassTrace] = []
@@ -43,11 +42,6 @@ def _handle_run(args):
 
     if dump:
         dump.dump_passes(pass_traces)
-
-    # Auto-fuse remaining ops into regions.
-    compiled = auto_fuse(compiled)
-
-    if dump:
         dump.dump_fused_graph(compiled)
 
     # Plan from graph.
