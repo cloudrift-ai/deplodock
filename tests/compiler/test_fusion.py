@@ -8,6 +8,7 @@ pointwise chains, and multi-consumer diamonds.
 import json
 from pathlib import Path
 
+from deplodock.compiler.backend.cuda.generators.analysis import flat_region_ops
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, KernelOp, ReduceOp
 from deplodock.compiler.rewriter import Rewriter
@@ -34,7 +35,7 @@ def _fused_regions(g: Graph) -> list:
 def _region_op_types(region) -> list[str]:
     """Return list of op type strings from a FusedRegionOp."""
     result = []
-    for _, op, _ in region.op.region_ops:
+    for _, op, _ in flat_region_ops(region.op):
         t = type(op).__name__
         fn = getattr(op, "fn", "")
         result.append(f"{t}({fn})" if fn else t)
@@ -71,7 +72,7 @@ def test_auto_fuse_region_has_ops():
     """Each FusedRegionOp contains primitive ops."""
     fused = auto_fuse(_load_and_decompose())
     for n in _fused_regions(fused):
-        assert len(n.op.region_ops) >= 1
+        assert len(flat_region_ops(n.op)) >= 1
         assert len(n.op.inputs) > 0
         assert len(n.op.outputs) > 0
 

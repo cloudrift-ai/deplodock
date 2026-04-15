@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by
+from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis, _needed_by, flat_region_ops
 from deplodock.compiler.backend.ir.loop_ir import (
     Accum,
     AccumInit,
@@ -239,7 +239,7 @@ def _emit_pointwise_body(
         var_map[inp] = Var(load_name)
 
     coord_mapping = _build_pointwise_coord_mapping(out_shape)
-    _emit_loop_ops(region.region_ops, var_map, "v_", guard_body, coord_mapping=coord_mapping, shapes=shapes)
+    _emit_loop_ops(flat_region_ops(region), var_map, "v_", guard_body, coord_mapping=coord_mapping, shapes=shapes)
 
     for out_id in [p.buffer_id for p in region.outputs]:
         val = var_map.get(out_id, Literal(0.0))
