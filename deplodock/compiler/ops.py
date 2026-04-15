@@ -372,33 +372,6 @@ class IndexMapOp(Op):
 
 
 # ---------------------------------------------------------------------------
-# Fused ops (assembly targets)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class FusedRegionOp(Op):
-    """A fused region of primitive ops with a generated kernel.
-
-    Produced by auto_fuse(). Contains the original subgraph of primitive
-    ops (for the kernel generator to walk) and the generated CUDA source
-    (filled in after kernel generation).
-    """
-
-    region_ops: list  # [(node_id, op, input_ids), ...] — primitive ops in topo order
-    input_names: list  # external inputs to this region
-    output_names: list  # external outputs from this region
-    kernel_source: str = ""  # generated CUDA source (filled by cuda/kernel_gen)
-    shapes: dict = field(default_factory=dict)  # node_id → shape for all region nodes + inputs
-
-    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
-        # Region's primary output shape is precomputed during fusion.
-        if self.output_names and self.shapes:
-            return tuple(self.shapes.get(self.output_names[0], ()))
-        return ()
-
-
-# ---------------------------------------------------------------------------
 # KernelOp: structured fused op (prologue → core → epilogue)
 # ---------------------------------------------------------------------------
 
@@ -465,10 +438,12 @@ class KernelOp(Op):
     KernelOp has one external output (Port) by construction; multi-output
     fusion is a future extension.
 
-    During Stage 2 of the refactor, ``prologue`` may hold the full flat
-    node list (core=None); Stage 3 rules populate ``core`` structurally.
-    Compat properties emulate the old ``FusedRegionOp`` field names so
-    backend readers work unchanged until their migration.
+    ``prologue`` may hold the full flat node list (core=None) for
+    unclassified kernels; the fusion rules in ``rules/fusion/`` restructure
+    them by populating ``core``. The ``region_ops`` / ``input_names`` /
+    ``output_names`` / ``shapes`` compat properties provide a legacy flat
+    view used by backend readers; they will eventually be replaced with
+    direct structured-field consumption.
     """
 
     inputs: list  # list[Port] — external reads

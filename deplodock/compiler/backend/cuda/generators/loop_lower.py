@@ -35,7 +35,7 @@ from deplodock.compiler.backend.ir.loop_ir import (
     Store,
     Var,
 )
-from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReshapeOp, TransposeOp
+from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReshapeOp, TransposeOp
 
 if TYPE_CHECKING:
     from deplodock.compiler.backend.cuda.schedule import Schedule
@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
 
 def lower_generic(
-    region: FusedRegionOp,
+    region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
     analysis: TileAnalysis,
@@ -193,7 +193,7 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
 def _emit_reductions(
     schedule: Schedule,
     analysis: TileAnalysis,
-    region: FusedRegionOp,
+    region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
     accum = schedule.accum
@@ -222,7 +222,7 @@ def _emit_reductions(
 
 def _emit_pointwise_body(
     analysis: TileAnalysis,
-    region: FusedRegionOp,
+    region: KernelOp,
     shapes: dict[str, tuple],
     schedule: Schedule,
 ) -> list:
@@ -251,7 +251,7 @@ def _emit_pointwise_body(
 def _emit_scalar_reductions(
     schedule: Schedule,
     analysis: TileAnalysis,
-    region: FusedRegionOp,
+    region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
     """Emit scalar reduction loops (single or multi-reduce)."""
@@ -323,7 +323,7 @@ def _emit_scalar_reductions(
 def _emit_contraction_k_loop(
     schedule: Schedule,
     analysis: TileAnalysis,
-    region: FusedRegionOp,
+    region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
     """Emit the K-loop for contraction (naive global-load strategy)."""
@@ -415,7 +415,7 @@ def _emit_smem_k_loop(schedule: Schedule, analysis: TileAnalysis) -> list:
 def _emit_online_contraction_reduce(
     schedule: Schedule,
     analysis: TileAnalysis,
-    region: FusedRegionOp,
+    region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
     """Emit N-tiled contraction with generic online reduction.
@@ -702,7 +702,7 @@ def _emit_online_contraction_reduce(
 def _emit_epilogue(
     schedule: Schedule,
     analysis: TileAnalysis,
-    region: FusedRegionOp,
+    region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
     accum = schedule.accum
@@ -729,7 +729,7 @@ def _emit_epilogue(
 def _emit_scalar_epilogue(
     schedule: Schedule,
     analysis: TileAnalysis,
-    region: FusedRegionOp,
+    region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
     """Emit epilogue for scalar reductions (inside the row guard)."""
@@ -808,7 +808,7 @@ def _emit_scalar_epilogue(
 def _emit_write(
     schedule: Schedule,
     analysis: TileAnalysis,
-    region: FusedRegionOp,
+    region: KernelOp,
 ) -> list:
     accum = schedule.accum
 
@@ -892,7 +892,7 @@ def _emit_write(
 
 
 def lower_to_loop_ir(
-    region: FusedRegionOp,
+    region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
     analysis: TileAnalysis,
@@ -921,7 +921,7 @@ def _safe(name: str) -> str:
     return name.replace("-", "_").replace(".", "_").replace(" ", "_")
 
 
-def _build_dim_strides(analysis: TileAnalysis, region: FusedRegionOp, schedule) -> dict[str, list[str]]:
+def _build_dim_strides(analysis: TileAnalysis, region: KernelOp, schedule) -> dict[str, list[str]]:
     """Build per-buffer stride variable names for multi-dim index flattening.
 
     Contraction buffers use M/N/K strides.  Reduction buffers use "cols".
@@ -1196,7 +1196,7 @@ def _build_reduce_coord_mapping(pre_shape: tuple, row_var: LoopExpr, j_var: Loop
     return mapping
 
 
-def _build_params(region: FusedRegionOp) -> list[tuple[str, str]]:
+def _build_params(region: KernelOp) -> list[tuple[str, str]]:
     """Build kernel params, deduplicating buffers that are both input and output.
 
     When a buffer appears in both input_names and output_names (in-place op),

@@ -7,14 +7,15 @@ as pointwise, row_reduce, reduce_broadcast, or contraction.
 from deplodock.compiler.backend.cuda.generators.analysis import analyze
 from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, FusedRegionOp, InputOp, KernelOp, ReduceOp
+from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, KernelOp, ReduceOp
+from tests.compiler._kernel_builder import build_kernel
 
 
 def _fuse_and_analyze(g: Graph):
     """Auto-fuse a graph and return TileAnalysis for the first fused region."""
     fused = auto_fuse(g)
     for nd in fused.nodes.values():
-        if isinstance(nd.op, (FusedRegionOp, KernelOp)):
+        if isinstance(nd.op, KernelOp):
             shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
             for nid in fused.nodes:
                 shapes[nid] = fused.nodes[nid].output.shape
@@ -22,8 +23,8 @@ def _fuse_and_analyze(g: Graph):
     raise AssertionError("No FusedRegionOp found")
 
 
-def _analyze_manual(region: FusedRegionOp, shapes: dict):
-    """Analyze a manually-constructed FusedRegionOp."""
+def _analyze_manual(region: KernelOp, shapes: dict):
+    """Analyze a manually-constructed KernelOp."""
     return analyze(region, shapes)
 
 
@@ -48,12 +49,13 @@ def test_pointwise_silu():
 
 def test_row_reduce_sum():
     """Simple row sum is row_reduce."""
-    region = FusedRegionOp(
+    shapes = {"x": (8, 64), "out": (8,)}
+    region = build_kernel(
         region_ops=[("out", ReduceOp("sum", axis=1), ["x"])],
         input_names=["x"],
         output_names=["out"],
+        shapes=shapes,
     )
-    shapes = {"x": (8, 64), "out": (8,)}
 
     analysis = _analyze_manual(region, shapes)
     assert analysis.pattern == "row_reduce"
@@ -102,7 +104,7 @@ def test_reduce_broadcast_softmax():
     # Collect all fused regions and their analyses.
     analyses = []
     for nd in fused.nodes.values():
-        if isinstance(nd.op, (FusedRegionOp, KernelOp)):
+        if isinstance(nd.op, KernelOp):
             shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
             for nid in fused.nodes:
                 shapes[nid] = fused.nodes[nid].output.shape
@@ -138,15 +140,6 @@ def test_contraction_matmul():
 
 def test_contraction_with_epilogue():
     """Contraction + bias add epilogue is still classified as contraction."""
-    region = FusedRegionOp(
-        region_ops=[
-            ("ew", ElementwiseOp("mul"), ["A", "B"]),
-            ("red", ReduceOp("sum", axis=1), ["ew"]),
-            ("ba", ElementwiseOp("add"), ["red", "bias"]),
-        ],
-        input_names=["A", "B", "bias"],
-        output_names=["ba"],
-    )
     shapes = {
         "A": (4, 8),
         "B": (8, 6),
@@ -155,6 +148,16 @@ def test_contraction_with_epilogue():
         "bias": (6,),
         "ba": (4, 6),
     }
+    region = build_kernel(
+        region_ops=[
+            ("ew", ElementwiseOp("mul"), ["A", "B"]),
+            ("red", ReduceOp("sum", axis=1), ["ew"]),
+            ("ba", ElementwiseOp("add"), ["red", "bias"]),
+        ],
+        input_names=["A", "B", "bias"],
+        output_names=["ba"],
+        shapes=shapes,
+    )
     analysis = _analyze_manual(region, shapes)
     assert analysis.pattern == "contraction"
     assert analysis.rows == 4

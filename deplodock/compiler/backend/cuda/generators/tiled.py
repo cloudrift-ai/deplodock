@@ -38,14 +38,14 @@ from deplodock.compiler.backend.ir.kernel_ir import (
     Var,
     VarDecl,
 )
-from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReshapeOp, TransposeOp
+from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReshapeOp, TransposeOp
 
 # ---------------------------------------------------------------------------
 # Convenience entry points (moved from fused.py and matmul.py shims)
 # ---------------------------------------------------------------------------
 
 
-def generate_kernel(region: FusedRegionOp, name: str, shapes: dict[str, tuple]) -> KernelDef:
+def generate_kernel(region: KernelOp, name: str, shapes: dict[str, tuple]) -> KernelDef:
     """Generate a CUDA kernel from a FusedRegionOp.
 
     Analyzes the region and produces a KernelDef via the unified tiled generator.
@@ -261,7 +261,7 @@ def _reduce_init(fn: str) -> Literal:
 
 
 def _lower_smem(  # noqa: C901
-    region: FusedRegionOp,
+    region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
     analysis: TileAnalysis,
@@ -406,7 +406,7 @@ def _lower_smem(  # noqa: C901
 
 
 def lower_tiled(
-    region: FusedRegionOp,
+    region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
     analysis: TileAnalysis,
@@ -592,7 +592,7 @@ def _emit_warp_reduce(node_id: str, acc_var: str, fn: str) -> list:
 
 
 def _lower_naive(
-    region: FusedRegionOp,
+    region: KernelOp,
     name: str,
     shapes: dict[str, tuple],
     analysis: TileAnalysis,
@@ -1059,7 +1059,7 @@ def _lower_naive(
 
 
 def _build_epilogue_inline(
-    region: FusedRegionOp,
+    region: KernelOp,
     analysis: TileAnalysis,
     phases,
     var_map: dict[str, Expr],

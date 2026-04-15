@@ -94,8 +94,20 @@ class CudaBackend(Backend):
 
 
 def _build_region_and_shapes(op: OpKernel):
-    """Extract FusedRegionOp and shapes from an OpKernel's params."""
-    from deplodock.compiler.ops import FusedRegionOp
+    """Reconstruct a KernelOp with flat prologue + shapes dict from plan params.
+
+    The plan serializes flat ``_region_ops`` tuples; this function rebuilds
+    Node objects for each, populates their output shapes from the ``_shapes``
+    dict, and wraps them in a KernelOp (prologue=all_nodes, core=None). The
+    backend's compat properties (``region_ops``, ``input_names``,
+    ``output_names``, ``shapes``) expose the same flat view that generators
+    have always consumed — so no reader migration is required.
+
+    Also performs plan-level buffer-name remapping when fusion rewires graph
+    edges so kernel params align with allocated buffers.
+    """
+    from deplodock.compiler.ir import Node, Tensor
+    from deplodock.compiler.ops import KernelOp, Port
 
     region_ops = op.params["_region_ops"]
     shapes = dict(op.params.get("_shapes", {}))
@@ -104,42 +116,56 @@ def _build_region_and_shapes(op: OpKernel):
         shapes.update(input_shapes)
         shapes[op.outputs[0]] = op.params.get("shape", (1,))
 
-    # Use plan-level buffer names for the kernel params.
-    # When fusion rewires graph edges, plan-level names (op.inputs) may differ
-    # from original names (_input_names). Remap to keep kernel params aligned
-    # with the buffers that will be passed as launch args.
+    # Plan-level buffer names for launch-args alignment (fusion may rewire edges).
     original_input_names = op.params.get("_input_names", list(op.inputs))
     original_output_names = op.params.get("_output_names", list(op.outputs))
 
     if original_input_names != list(op.inputs) or original_output_names != list(op.outputs):
         input_map = dict(zip(original_input_names, op.inputs, strict=False))
         output_map = dict(zip(original_output_names, op.outputs, strict=False))
-        # Reverse output map: plan_name → original_name (for op node IDs)
         all_renames = {**input_map, **output_map}
 
         rewritten_ops = []
         for rid, rop, inp_ids in region_ops:
             new_inps = [all_renames.get(i, i) for i in inp_ids]
-            # Also rename the op node_id if it's an output
             new_rid = all_renames.get(rid, rid)
             rewritten_ops.append((new_rid, rop, new_inps))
-
-        region = FusedRegionOp(
-            region_ops=rewritten_ops,
-            input_names=list(op.inputs),
-            output_names=list(op.outputs),
-        )
-
-        for orig, plan_name in {**input_map, **output_map}.items():
+        region_ops = rewritten_ops
+        input_names = list(op.inputs)
+        output_names = list(op.outputs)
+        for orig, plan_name in all_renames.items():
             if orig in shapes and plan_name not in shapes:
                 shapes[plan_name] = shapes[orig]
     else:
-        region = FusedRegionOp(
-            region_ops=region_ops,
-            input_names=original_input_names,
-            output_names=original_output_names,
+        input_names = original_input_names
+        output_names = original_output_names
+
+    # Build Node objects with shapes pulled from the shapes dict. The external
+    # shapes (input buffer shapes) come from `_input_shapes`; internal node
+    # shapes from the full `_shapes` dict.
+    body_nodes = tuple(
+        Node(
+            id=nid,
+            op=op_obj,
+            inputs=list(inp_ids),
+            output=Tensor(name=nid, shape=tuple(shapes.get(nid, ())), dtype="f32"),
         )
-    return region, shapes
+        for nid, op_obj, inp_ids in region_ops
+    )
+
+    input_shapes = op.params.get("_input_shapes", {})
+    external_shapes = {name: tuple(shapes.get(name, input_shapes.get(name, ()))) for name in input_names}
+
+    kernel = KernelOp(
+        inputs=[Port(buffer_id=name) for name in input_names],
+        outputs=[Port(buffer_id=name) for name in output_names],
+        prologue=body_nodes,
+        core=None,
+        epilogue=(),
+        kernel_source=op.params.get("kernel_source", ""),
+        external_shapes=external_shapes,
+    )
+    return kernel, shapes
 
 
 def _select_strategy(op: OpKernel, analysis) -> tuple[str, dict]:
