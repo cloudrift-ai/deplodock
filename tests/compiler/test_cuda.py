@@ -2,7 +2,7 @@
 
 import pytest
 
-from deplodock.compiler.backend.cuda.generators import analyze, lower_tiled
+from deplodock.compiler.backend.cuda.generators import lower_tiled
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc, run_kernel
 from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
 from deplodock.compiler.backend.ir.kernel_ir import (
@@ -62,7 +62,7 @@ def _lower_matmul(m=None, k=None, n=None, **matmul_hints):
         shapes=shapes,
     )
     strategy = matmul_hints.get("strategy", "naive")
-    kernel_def, _loop_prog, _sched = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
+    kernel_def, _loop_prog, _sched = lower_tiled(region, "fused_matmul", shapes, strategy=strategy)
     return kernel_def
 
 
@@ -386,8 +386,7 @@ def _lower_matmul_with_epilogue(epilogue_ops, extra_inputs, extra_shapes):
         shapes=shapes,
     )
 
-    analysis = analyze(region, shapes)
-    kernel_def, _loop_prog, _sched = lower_tiled(region, "matmul_epi", shapes, analysis, strategy="naive")
+    kernel_def, _loop_prog, _sched = lower_tiled(region, "matmul_epi", shapes, strategy="naive")
     return kernel_def, M, K, N
 
 

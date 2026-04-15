@@ -243,9 +243,9 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             params["_output_names"] = list([p.buffer_id for p in op.outputs])
             params["_input_names"] = list([p.buffer_id for p in op.inputs])
             # Structured-core annotation: preserves ContractionCore /
-            # ReduceStage metadata across plan round-trip so analyze()
-            # can use its structured-dispatch path instead of rescanning
-            # the flat prologue for reduce boundaries.
+            # ReduceStage metadata across plan round-trip so backend
+            # readers can use the structured dispatch path instead of
+            # rescanning the flat prologue for reduce boundaries.
             params["_core_struct"] = _serialize_core(op)
         else:
             tag = op_type.lower()

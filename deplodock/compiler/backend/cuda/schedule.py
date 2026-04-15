@@ -5,8 +5,8 @@ what accumulator shape to use, how to loop over reduced dimensions,
 and how to write outputs.  The lowering function ``lower_generic()``
 reads the Schedule and emits LoopIR mechanically — no pattern matching.
 
-``build_schedule()`` synthesizes a Schedule from a ``TileAnalysis``
-plus strategy and tuning hints.
+``build_schedule()`` synthesizes a Schedule from a KernelOp + strategy
+and tuning hints.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis
     from deplodock.compiler.ops import KernelOp
 
 
@@ -79,21 +78,20 @@ class Schedule:
 def build_schedule(
     region: KernelOp,
     shapes: dict[str, tuple],
-    analysis: TileAnalysis,
     strategy: str = "naive",
     hints: dict | None = None,
 ) -> Schedule:
-    """Synthesize a Schedule from region + analysis + strategy + tuning hints.
+    """Synthesize a Schedule from region + shapes + strategy + tuning hints.
 
-    ``region`` / ``shapes`` drive the structural fields (pattern, reduce count);
-    ``analysis`` still supplies the derived contraction_a/b and batch_size used
-    for TMA descriptor wiring.
+    All structural facts (pattern, reduce count, contraction operands,
+    batch size) come from KernelOp accessors.
     """
     hints = hints or {}
     out_shape = shapes.get(region.outputs[0].buffer_id, (1,))
     pattern = region.tile_pattern(shapes, out_shape)
     reduce_fns = region.reduce_fn_names()
-    is_batched = analysis.batch_size > 1
+    cinfo = region.contraction_info(shapes)
+    is_batched = cinfo is not None and cinfo.batch_size > 1
 
     if pattern == "pointwise":
         return Schedule(
@@ -133,9 +131,9 @@ def build_schedule(
         tma_params = None
         tma_config = None
         includes = None
-        if load_strat == "tma" and analysis.contraction_a:
-            a_name = _safe(analysis.contraction_a)
-            b_name = _safe(analysis.contraction_b)
+        if load_strat == "tma" and cinfo is not None and cinfo.a_id:
+            a_name = _safe(cinfo.a_id)
+            b_name = _safe(cinfo.b_id)
             tma_a_ref = f"&{a_name}_tma[batch]" if is_batched else f"&{a_name}_tma"
             tma_b_ref = f"&{b_name}_tma[batch]" if is_batched else f"&{b_name}_tma"
             tma_params = [f"{a_name}_tma", f"{b_name}_tma"]
