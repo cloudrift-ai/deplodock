@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import yaml
 
-from deplodock.provisioning.cloud import _provision_once, delete_cloud_vm, resolve_vm_spec
+from deplodock.provisioning.cloud import _provision_once, _select_provider_entry, delete_cloud_vm, resolve_vm_spec
 from deplodock.provisioning.types import VMConnectionInfo
 from deplodock.recipe import load_recipe
 
@@ -161,6 +161,25 @@ def test_vm_connection_info_defaults():
     assert conn.ssh_port == 22
     assert conn.port_mappings == []
     assert conn.delete_info == ()
+
+
+# ── _select_provider_entry ──────────────────────────────────────
+
+
+def test_select_provider_entry_defaults_to_first():
+    entries = [("cloudrift", "h200-24-200-1000-generic"), ("gcp", "a3-ultragpu")]
+    assert _select_provider_entry("NVIDIA H200 141GB", entries, None) == ("cloudrift", "h200-24-200-1000-generic")
+
+
+def test_select_provider_entry_override_picks_matching():
+    entries = [("cloudrift", "h200-24-200-1000-generic"), ("gcp", "a3-ultragpu")]
+    assert _select_provider_entry("NVIDIA H200 141GB", entries, "gcp") == ("gcp", "a3-ultragpu")
+
+
+def test_select_provider_entry_unavailable_provider_raises():
+    entries = [("gcp", "a2-ultragpu")]
+    with pytest.raises(ValueError, match="not available on provider 'cloudrift'"):
+        _select_provider_entry("NVIDIA A100 80GB", entries, "cloudrift")
 
 
 # ── _provision_once ─────────────────────────────────────────────

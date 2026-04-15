@@ -3,10 +3,7 @@ model:
 
 engine:
   llm:
-    tensor_parallel_size: 8
     pipeline_parallel_size: 1
-    gpu_memory_utilization: 0.8
-    max_concurrent_requests: 64
     vllm:
       image: "vllm/vllm-openai"
       extra_args: "--enable-prefix-caching --language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
@@ -18,6 +15,16 @@ benchmark:
   random_output_len: 4000
 
 matrices:
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 1
+    engine.llm.tensor_parallel_size: 1
+    engine.llm.gpu_memory_utilization: 0.95
+    engine.llm.max_concurrent_requests: 4
+    engine.llm.context_length: 8192
+
   - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
     deploy.gpu_count: 8
+    engine.llm.tensor_parallel_size: 8
+    engine.llm.gpu_memory_utilization: 0.8
+    engine.llm.max_concurrent_requests: 64
     engine.llm.context_length: 262144

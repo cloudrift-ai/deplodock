@@ -126,9 +126,11 @@ def handle_bench(args):
                 sys.exit(1)
 
         root_logger.info(f"Fixed-host mode: {len(allocated)} host(s), running {len(groups)} group(s)")
-        raw_results = asyncio.run(_run_groups_on_hosts(groups, allocated, config, ssh_key, dry_run, on_task_done))
+        raw_results = asyncio.run(_run_groups_on_hosts(groups, allocated, config, ssh_key, dry_run, on_task_done, provider=args.provider))
     else:
-        raw_results = asyncio.run(_run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown, on_task_done))
+        raw_results = asyncio.run(
+            _run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown, on_task_done, provider=args.provider)
+        )
 
     # Flatten results, handling exceptions
     all_results: list[tuple[BenchmarkTask, bool]] = []
@@ -275,5 +277,11 @@ def register_bench_command(subparsers):
         dest="filters",
         metavar="KEY=PATTERN",
         help="Filter variants by parameter value (fnmatch glob, repeatable, AND logic)",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=["gcp", "cloudrift"],
+        default=None,
+        help="Force cloud provider for all groups (default: first listed for the GPU in the hardware table)",
     )
     parser.set_defaults(func=handle_bench)

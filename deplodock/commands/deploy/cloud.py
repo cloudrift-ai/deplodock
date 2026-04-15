@@ -44,6 +44,7 @@ async def _handle_cloud(args):
         providers_config=providers_config,
         server_name=args.name,
         dry_run=args.dry_run,
+        provider=args.provider,
     )
     if conn is None:
         logger.error("Error: VM provisioning failed.")
@@ -82,4 +83,10 @@ def register_cloud_target(subparsers):
     parser.add_argument("--billing-exempt", action="store_true", help="Skip billing for CloudRift (admin-only)")
     parser.add_argument("--gpu", required=True, help="GPU name (selects matching matrix entry)")
     parser.add_argument("--gpu-count", type=int, required=True, help="GPU count (selects matching matrix entry)")
+    parser.add_argument(
+        "--provider",
+        choices=["gcp", "cloudrift"],
+        default=None,
+        help="Force cloud provider (default: first listed for the GPU in the hardware table)",
+    )
     parser.set_defaults(func=handle_cloud)

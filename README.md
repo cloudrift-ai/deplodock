@@ -313,11 +313,14 @@ deplodock deploy ssh --recipe <path> --ssh user@host[:port] [--dry-run]
 
 ### Cloud
 
-Provisions a cloud VM and deploys via SSH. Requires `--gpu` and `--gpu-count` to select the matching matrix entry from the recipe.
+Provisions a cloud VM and deploys via SSH. Requires `--gpu` and `--gpu-count` to select the matching matrix entry from the recipe. When a GPU is offered by more than one provider (e.g. H200 is available on both CloudRift and GCP), the first provider listed in the hardware table is used by default; pass `--provider {gcp,cloudrift}` to override.
 
 ```bash
 deplodock deploy cloud --recipe <path> --gpu "NVIDIA GeForce RTX 5090" --gpu-count 1 [--dry-run]
+deplodock deploy cloud --recipe <path> --gpu "NVIDIA H200 141GB" --gpu-count 1 --provider gcp
 ```
+
+**H200 on CloudRift:** only available on on-prem CloudRift deployments. Set `CLOUDRIFT_API_URL` to the on-prem cluster before running (the public `api.cloudrift.ai` does not offer H200).
 
 ### Hardware-Aware Deploy
 
@@ -351,6 +354,7 @@ The same `--ssh USER@HOST[:PORT]` syntax is used by `deplodock bench --ssh ...`.
 |---------------|-----------|---------------------|----------------------------------------|
 | `--gpu`       | Yes       | -                   | GPU name (selects matching matrix entry)|
 | `--gpu-count` | Yes       | -                   | GPU count (selects matching matrix entry)|
+| `--provider`  | No        | first in hw table   | Force provider (`gcp` or `cloudrift`)  |
 | `--name`      | No        | `cloud-deploy`      | VM name prefix                         |
 | `--ssh-key`   | No        | `~/.ssh/id_ed25519` | SSH private key path                   |
 
@@ -452,6 +456,7 @@ deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Run on a fixed po
 | `--no-teardown`      | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
 | `--local`            | false               | Run on the local machine via ssh to 127.0.0.1 (skips cloud provisioning) |
 | `--ssh USER@HOST[:PORT]` | none            | Pre-allocated SSH host (repeatable). Skips cloud provisioning            |
+| `--provider`         | first in hw table   | Force cloud provider for all groups (`gcp` or `cloudrift`)               |
 
 When `--local` and/or `--ssh` are supplied, deplodock detects each host's GPU via PCI sysfs and verifies that every planned execution group can run on at least one of the supplied hosts (matching `deploy.gpu` and sufficient `deploy.gpu_count`). If any group is unsatisfied, the run aborts before any work starts. Fixed hosts are assumed to be already provisioned (docker, NVIDIA toolkit, etc.) and are never deleted at the end of the run.
 
