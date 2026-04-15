@@ -144,11 +144,24 @@ def _try_merge(
             continue  # this was a's output — now internal
         add_port(p, b.external_shapes.get(p.buffer_id, ()))
 
-    # Shape compat check.
+    # Shape compat check. Inputs consumed ONLY by IndexMaps inside the
+    # merged body are exempt — IndexMaps read via their own coord_map, so
+    # they don't share the kernel's broadcast-row indexing.
+    from deplodock.compiler.ops import IndexMapOp
+
+    a_body = flatten_kernel_nodes(a)
+    b_body = flatten_kernel_nodes(b)
+    merged_body = a_body + b_body
+    skip_shapes: set[tuple] = set()
+    for buf_id, shape in new_external_shapes.items():
+        consumers = [n for n in merged_body if buf_id in n.inputs]
+        if consumers and all(isinstance(n.op, IndexMapOp) for n in consumers):
+            skip_shapes.add(shape)
     is_pure_contraction = a_kind == "contraction" or b_kind == "contraction"
     if not merged_external_inputs_compat(
         list(new_external_shapes.values()),
         is_pure_contraction=is_pure_contraction,
+        skip_shapes=skip_shapes,
     ):
         return None
 
