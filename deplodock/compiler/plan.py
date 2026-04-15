@@ -213,11 +213,9 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             tag = "scatter"
             params["axis"] = op.axis
         elif isinstance(op, ops_module.KernelOp):
-            from deplodock.compiler.backend.cuda.generators.analysis import flat_region_ops
-
             tag = "fused_region"
             params["kernel_source"] = op.kernel_source
-            region_ops = flat_region_ops(op)
+            region_ops = op.body_ops()
             params["region_ops_count"] = len(region_ops)
             params["_region_ops"] = region_ops  # for backend matmul detection
             # Store input shapes so the backend can infer matmul K dimension.

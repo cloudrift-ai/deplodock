@@ -55,7 +55,7 @@ Combined matmul→softmax kernels carry their downstream row reduces in
 `core.post_stages`; `KernelOp.phases()` walks prologue + post_stages to
 build the reduces / inter_reduce / epilogue alternation.
 
-The `analysis.flat_region_ops(kernel)` helper returns a dedup'd
+The `KernelOp.body_ops()` method returns a dedup'd
 `(id, op, inputs)` list covering prologue + core + epilogue in topo
 order — this is the one backend reader that still needs a flat walk
 (pointwise body emit in `tiled.py` / `loop_lower.py`). All other
