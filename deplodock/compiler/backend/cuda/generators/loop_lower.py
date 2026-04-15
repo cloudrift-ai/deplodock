@@ -337,14 +337,28 @@ def _emit_contraction_k_loop(
     bn, tc, bm, tr = Var("bn"), Var("tc"), Var("bm"), Var("tr")
     k, K, N, M = Var("k"), Var("K"), Var("N"), Var("M")  # noqa: N806
 
+    a_imap = analysis.port_indexmaps.get(analysis.contraction_a)
+    b_imap = analysis.port_indexmaps.get(analysis.contraction_b)
+
+    def _apply_indexmap(indices: list, imap) -> list:
+        if imap is None or not imap.sources:
+            return indices
+        from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute
+
+        src = imap.sources[0]
+        mapping = {f"{PLACEHOLDER_PREFIX}{i}": ix for i, ix in enumerate(indices)}
+        return [substitute(c, mapping) for c in src.coord_map]
+
     k_body: list = []
     for c in range(thread_n):
         col = bn + tc + c
-        k_body.append(Load(f"b{c}", b_src, [k, col], "global", guard=col.lt(N)))
+        b_idx = _apply_indexmap([k, col], b_imap)
+        k_body.append(Load(f"b{c}", b_src, b_idx, "global", guard=col.lt(N)))
 
     for r in range(thread_m):
         row = bm + tr + r
-        k_body.append(Load(f"a{r}", a_src, [row, k], "global", guard=row.lt(M)))
+        a_idx = _apply_indexmap([row, k], a_imap)
+        k_body.append(Load(f"a{r}", a_src, a_idx, "global", guard=row.lt(M)))
         for c in range(thread_n):
             k_body.append(Accum(f"c{r}{c}", "sum", Var(f"a{r}") * Var(f"b{c}")))
 
