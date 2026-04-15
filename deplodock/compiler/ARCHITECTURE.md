@@ -293,8 +293,6 @@ Fusion constraints enforced across rules:
 
 The CUDA backend auto-generates kernels during `compile()` for any `KernelOp` via `generators/tiled.py`. Reshape/transpose ops become buffer aliases (zero-cost pointer assignment, no kernel launch).
 
-`KernelOp` is a legacy dataclass retained as a backend-internal struct (used by `_build_region_and_shapes` to reconstruct region data from serialized plan params). It is no longer emitted into the outer graph — fusion emits `KernelOp`.
-
 ## CUDA Backend Details
 
 See [`backend/cuda/ARCHITECTURE.md`](backend/cuda/ARCHITECTURE.md) for full details on:
