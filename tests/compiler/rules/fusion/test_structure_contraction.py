@@ -20,12 +20,7 @@ from deplodock.compiler.ops import (
 from deplodock.compiler.pattern import parse_pattern
 
 RULE_PATH = (
-    Path(__file__).parent.parent.parent.parent.parent
-    / "deplodock"
-    / "compiler"
-    / "rules"
-    / "fusion"
-    / "001_structure_contraction.py"
+    Path(__file__).parent.parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion" / "001_structure_contraction.py"
 )
 
 

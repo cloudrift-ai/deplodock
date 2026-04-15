@@ -15,13 +15,7 @@ from deplodock.compiler.ops import (
 )
 from deplodock.compiler.pattern import parse_pattern
 
-RULES_DIR = (
-    Path(__file__).parent.parent.parent.parent.parent
-    / "deplodock"
-    / "compiler"
-    / "rules"
-    / "fusion"
-)
+RULES_DIR = Path(__file__).parent.parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion"
 
 
 def _load_rule(name: str):
