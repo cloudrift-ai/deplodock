@@ -47,14 +47,50 @@ def build_kernel(
     )
     external_shapes = {n: tuple(shapes.get(n, ())) for n in input_names}
     core = _infer_core(body, input_names)
+    prologue, epilogue = _partition_body(body, core)
     return KernelOp(
         inputs=[Port(buffer_id=n) for n in input_names],
         outputs=[Port(buffer_id=n) for n in output_names],
-        prologue=body,
+        prologue=prologue,
         core=core,
-        epilogue=(),
+        epilogue=epilogue,
         external_shapes=external_shapes,
     )
+
+
+def _partition_body(body: tuple, core: object) -> tuple:
+    """Split body nodes into (prologue, epilogue) given that core owns the
+    reduce/mul/stage pre_ops Nodes. Nodes before the first core-owned node
+    go to prologue; after the last go to epilogue. Core-owned nodes are
+    filtered out since they live on the core annotation.
+    """
+    core_ids: set[str] = set()
+    if isinstance(core, ContractionCore):
+        if core.mul is not None:
+            core_ids.add(core.mul.id)
+        if core.reduce is not None:
+            core_ids.add(core.reduce.id)
+        for s in core.post_stages:
+            if isinstance(s, ReduceStage):
+                core_ids.update(pn.id for pn in s.pre_ops)
+                if s.reduce is not None:
+                    core_ids.add(s.reduce.id)
+    elif isinstance(core, tuple):
+        for s in core:
+            if isinstance(s, ReduceStage):
+                core_ids.update(pn.id for pn in s.pre_ops)
+                if s.reduce is not None:
+                    core_ids.add(s.reduce.id)
+
+    if not core_ids:
+        return tuple(body), ()
+
+    # Find first and last core-owned node positions.
+    first_idx = next((i for i, n in enumerate(body) if n.id in core_ids), len(body))
+    last_idx = max((i for i, n in enumerate(body) if n.id in core_ids), default=-1)
+    prologue = tuple(n for n in body[:first_idx] if n.id not in core_ids)
+    epilogue = tuple(n for n in body[last_idx + 1 :] if n.id not in core_ids)
+    return prologue, epilogue
 
 
 def _infer_core(body: tuple, input_names: list) -> object:

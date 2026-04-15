@@ -267,98 +267,41 @@ def _node_entry(n) -> RegionEntry:
 
 
 def _split_phases(kernel: KernelOp) -> OpPhases:
-    """Derive OpPhases directly from a KernelOp's structured fields.
+    """Derive OpPhases from a KernelOp's structured fields.
 
-    No scanning: each ``core`` variant maps deterministically to the four
-    phases (prologue, reduces, inter_reduce, epilogue).
-
-    - ``ContractionCore``: prologue + [mul] feed [reduce]; epilogue follows.
-    - ``tuple[ReduceStage, ...]`` (ReduceCore): each stage contributes one
-      reduce and its pre_ops as inter_reduce[i-1]. Nodes between the last
-      stage's reduce and the end of prologue are the row-reduce epilogue.
-    - ``None``: pure pointwise — all nodes in prologue.
+    No scanning — each ``core`` variant maps directly to the four phases:
+      - ``None``: pointwise. All prologue/epilogue nodes pass through.
+      - ``ContractionCore``: prologue → mul → reduce → (post_stages[i].pre_ops
+        → post_stages[i].reduce)* → epilogue.
+      - ``tuple[ReduceStage, ...]``: prologue → (stages[i].pre_ops →
+        stages[i].reduce)* → epilogue.
     """
-    if isinstance(kernel.core, ContractionCore):
-        # Walk kernel.prologue in order. Pre-reduce ops feed the K-loop
-        # (phases.prologue). After the contraction reduce, ops are either
-        # inter_reduce pre-chains (between stages in post_stages) or the
-        # per-row epilogue. post_stages defines which reduces are part of
-        # the downstream chain and their pre_ops.
-        mul_id = kernel.core.mul.id if kernel.core.mul is not None else None
-        reduce_id = kernel.core.reduce.id if kernel.core.reduce is not None else None
-        post_reduce_ids = {s.reduce.id for s in kernel.core.post_stages if isinstance(s, ReduceStage) and s.reduce is not None}
+    prologue = [_node_entry(n) for n in kernel.prologue]
+    epilogue = [_node_entry(n) for n in kernel.epilogue]
 
-        prologue: list[RegionEntry] = []
-        seen_reduce = False
-        tail_nodes: list = []  # nodes after contraction reduce (to be split below)
-        for n in kernel.prologue:
-            if n.id == mul_id or n.id == reduce_id:
-                if n.id == reduce_id:
-                    seen_reduce = True
-                continue
-            if seen_reduce:
-                tail_nodes.append(n)
-            else:
-                prologue.append(_node_entry(n))
+    if isinstance(kernel.core, ContractionCore):
+        reduces: list[RegionEntry] = []
+        inter_reduce: list[list[RegionEntry]] = []
         if kernel.core.mul is not None:
             prologue.append(_node_entry(kernel.core.mul))
-
-        reduces: list[RegionEntry] = []
         if kernel.core.reduce is not None:
             reduces.append(_node_entry(kernel.core.reduce))
-
-        inter_reduce: list[list[RegionEntry]] = []
-        current_inter: list[RegionEntry] = []
-        for n in tail_nodes:
-            entry = _node_entry(n)
-            if n.id in post_reduce_ids:
-                inter_reduce.append(current_inter)
-                current_inter = []
-                reduces.append(entry)
-            else:
-                current_inter.append(entry)
-        # Leftover current_inter = per-row epilogue (nothing consumes it
-        # as a reduce input).
-        epilogue = current_inter + [_node_entry(n) for n in kernel.epilogue]
+        for stage in kernel.core.post_stages:
+            if not isinstance(stage, ReduceStage):
+                continue
+            inter_reduce.append([_node_entry(pn) for pn in stage.pre_ops])
+            if stage.reduce is not None:
+                reduces.append(_node_entry(stage.reduce))
         return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
 
     if isinstance(kernel.core, tuple) and kernel.core:
-        # ReduceCore: the reduce rule leaves Nodes in kernel.prologue and
-        # annotates boundaries via stages. Find stage reduce positions.
-        stages = kernel.core
-        reduce_node_ids = {s.reduce.id for s in stages}
-        # First stage's reduce marks end-of-prologue.
-        first_reduce_id = stages[0].reduce.id
-        prologue: list[RegionEntry] = []
-        seen_first_reduce = False
-        tail: list = []  # nodes in kernel.prologue after last reduce
-        last_reduce_id = stages[-1].reduce.id
-        seen_last_reduce = False
-        for n in kernel.prologue:
-            if n.id == first_reduce_id:
-                seen_first_reduce = True
-                if n.id == last_reduce_id:
-                    seen_last_reduce = True
-                continue
-            if not seen_first_reduce:
-                prologue.append(_node_entry(n))
-                continue
-            if n.id in reduce_node_ids:
-                if n.id == last_reduce_id:
-                    seen_last_reduce = True
-                continue
-            if seen_last_reduce:
-                tail.append(_node_entry(n))
-        # Reduces + inter-reduce chains come straight from the stages.
-        reduces_entries = [_node_entry(s.reduce) for s in stages]
-        inter_reduce: list[list[RegionEntry]] = [[_node_entry(pn) for pn in s.pre_ops] for s in stages[1:]]
-        epilogue = tail + [_node_entry(n) for n in kernel.epilogue]
-        return OpPhases(prologue=prologue, reduces=reduces_entries, epilogue=epilogue, inter_reduce=inter_reduce)
+        stages = [s for s in kernel.core if isinstance(s, ReduceStage)]
+        reduces = [_node_entry(s.reduce) for s in stages if s.reduce is not None]
+        inter_reduce = [[_node_entry(pn) for pn in s.pre_ops] for s in stages[1:]]
+        return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
 
-    # core is None — pure pointwise. No reduces, no inter_reduce.
-    prologue_out = [_node_entry(n) for n in kernel.prologue]
-    epilogue_out = [_node_entry(n) for n in kernel.epilogue]
-    return OpPhases(prologue=prologue_out, reduces=[], epilogue=epilogue_out, inter_reduce=[])
+    # core is None — pure pointwise.
+    return OpPhases(prologue=prologue, reduces=[], epilogue=epilogue, inter_reduce=[])
 
 
 def _needed_by(ops: list) -> set[str]:

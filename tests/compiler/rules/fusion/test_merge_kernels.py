@@ -140,11 +140,10 @@ def test_pointwise_plus_reduce_merges():
     assert len(ks) == 1
     k = ks[0]
     assert isinstance(k.core, tuple) and len(k.core) == 1
-    # Flat-prologue convention: sq + reduce live in prologue; core is the
-    # ReduceStage annotation pointing at the reduce node.
+    # Structured: sq is in prologue (pre-reduce); reduce lives in core.
     assert any(n.id == "sq" for n in k.prologue)
-    assert any(n.id == "red" for n in k.prologue)
     stage = k.core[0]
+    assert stage.reduce.id == "red"
     assert stage.reduce.inputs == ["sq"]
 
 
@@ -180,10 +179,9 @@ def test_reduce_plus_pointwise_merges():
     assert len(ks) == 1
     k = ks[0]
     assert isinstance(k.core, tuple) and len(k.core) == 1
-    # Flat-prologue convention: rsqrt is in prologue (after the reduce);
-    # core annotates the reduce.
-    assert any(n.id == "rsqrt" for n in k.prologue)
-    rsqrt_in_kernel = next(n for n in k.prologue if n.id == "rsqrt")
+    # Structured: rsqrt is in epilogue (post-reduce); core annotates the reduce.
+    assert any(n.id == "rsqrt" for n in k.epilogue)
+    rsqrt_in_kernel = next(n for n in k.epilogue if n.id == "rsqrt")
     assert rsqrt_in_kernel.inputs == ["red"]
 
 
@@ -223,9 +221,9 @@ def test_contraction_plus_pointwise_merges():
     assert len(ks) == 1
     k = ks[0]
     assert isinstance(k.core, ContractionCore)
-    # Flat-prologue convention: add is in prologue.
-    assert any(n.id == "add" for n in k.prologue)
-    add_n = next(n for n in k.prologue if n.id == "add")
+    # Structured: bias add is the contraction's epilogue.
+    assert any(n.id == "add" for n in k.epilogue)
+    add_n = next(n for n in k.epilogue if n.id == "add")
     # a_out → red rewire; bias unchanged.
     assert add_n.inputs == ["red", "bias"]
     # bias is now part of merged kernel's external inputs.

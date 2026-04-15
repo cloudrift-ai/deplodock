@@ -1,9 +1,10 @@
-"""Absorb a downstream Elementwise into a KernelOp's prologue.
+"""Absorb a downstream Elementwise into a KernelOp's epilogue.
 
 Pattern: ``Elementwise{$fn}(Kernel(...))`` where the KernelOp has
-fan-out=1. The Elementwise is appended to ``kernel.prologue`` (legacy
-flat-prologue convention — backend codegen reads ``region_ops`` which
-walks prologue + core + epilogue and dedups by id).
+fan-out=1. The Elementwise is appended to ``kernel.epilogue`` — it runs
+after the kernel's core produces its output. For pointwise kernels
+(core=None) this still makes sense: epilogue is strictly downstream of
+prologue.
 """
 
 from __future__ import annotations
@@ -46,11 +47,10 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     if last is not None:
         snap = rewire_node_input(snap, kid, last)
 
-    # Append snap to prologue (legacy flat-prologue convention). core is
-    # an annotation pointing at reduce/mul nodes already in prologue.
+    # Append snap to epilogue — it's strictly downstream of the core.
     new_core = kernel.core
-    new_kernel_prologue = kernel.prologue + (snap,)
-    new_kernel_epilogue = kernel.epilogue
+    new_kernel_prologue = kernel.prologue
+    new_kernel_epilogue = kernel.epilogue + (snap,)
 
     # Any Elementwise inputs besides inputs[0] are new external inputs.
     new_inputs_list: list[Port] = list(kernel.inputs)

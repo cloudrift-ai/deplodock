@@ -174,8 +174,7 @@ def test_050_absorb_prologue_grows_pointwise_kernel():
 
 
 def test_060_absorb_epilogue_appends_downstream_elementwise():
-    """Elementwise(Kernel(...)) with fan-out=1 on the kernel → append to prologue
-    (flat-prologue convention)."""
+    """Elementwise(Kernel(...)) with fan-out=1 on the kernel → append to epilogue."""
     from deplodock.compiler.ir import Node
     from deplodock.compiler.ops import Port
 
@@ -208,7 +207,7 @@ def test_060_absorb_epilogue_appends_downstream_elementwise():
     kernels = [n for n in result.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(kernels) == 1
     k = kernels[0].op
-    assert any(n.op.fn == "relu" for n in k.prologue)
+    assert any(n.op.fn == "relu" for n in k.epilogue)
     assert "out" not in result.nodes or isinstance(result.nodes.get("out"), type(None))
 
 
@@ -231,5 +230,5 @@ def test_assembly_pipeline_runs_for_matmul_plus_bias():
     assert len(kernels) == 1
     k = kernels[0].op
     assert isinstance(k.core, ContractionCore)
-    # Bias add absorbed into prologue (flat-prologue convention).
-    assert any(n.op.fn == "add" for n in k.prologue)
+    # Bias add absorbed into epilogue.
+    assert any(n.op.fn == "add" for n in k.epilogue)

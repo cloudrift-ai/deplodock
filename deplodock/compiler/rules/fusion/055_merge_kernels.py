@@ -174,23 +174,20 @@ def _try_merge(
     def rewire(node):
         return rewire_node_input(node, a_id, a_last)
 
-    # Flat-prologue convention: merged kernel holds ALL body nodes in a
-    # single prologue tuple, in topo order. ``core`` is an annotation
-    # that references nodes already in prologue — backend codegen reads
-    # them via ``analysis.flat_region_ops(kernel)`` which dedups across
-    # prologue + core + epilogue.
-    a_flat = flatten_kernel_nodes(a)
-    b_flat = tuple(rewire(n) for n in flatten_kernel_nodes(b))
-    new_prologue = a_flat + b_flat
-    new_epilogue: tuple = ()
+    # Structured merge: prologue + epilogue hold only the non-core ops.
+    # a's prologue stays, a's core stays, a's epilogue runs just before
+    # b's prologue (which we rewire), then b's core, then b's epilogue.
+    # For structurally disjoint merges (e.g. contraction + reduce kernel)
+    # we fold b's epilogue into the new kernel's epilogue.
+    b_prologue_rewired = tuple(rewire(n) for n in b.prologue)
+    b_epilogue_rewired = tuple(rewire(n) for n in b.epilogue)
 
-    # Compose the core annotation. Reuse a's ContractionCore (rewiring is
-    # done elsewhere). For tuple cores, concatenate stages with rewiring
-    # applied to b's stages so internal Node references resolve correctly.
+    # Compose the core annotation from a's + b's cores. For tuple cores,
+    # rewire b's pre_ops/reduce so internal Node refs resolve correctly.
     a_core = a.core
     b_core = b.core
     if isinstance(b_core, tuple):
-        b_core_rewired = tuple(
+        b_stages_rewired = tuple(
             ReduceStage(
                 pre_ops=tuple(rewire(n) for n in stage.pre_ops),
                 reduce=rewire(stage.reduce) if stage.reduce is not None else None,
@@ -201,14 +198,28 @@ def _try_merge(
     elif isinstance(b_core, ContractionCore):
         return None  # already rejected
     else:
-        b_core_rewired = ()
+        b_stages_rewired = ()
 
+    # Inter-core bridge: ops between a's core output and b's first stage
+    # (= a.epilogue + b.prologue, both rewired to resolve a's outer id).
+    bridge = tuple(a.epilogue) + b_prologue_rewired
+
+    new_prologue: tuple = a.prologue
+    new_epilogue: tuple = ()
     new_core: object = None
+
     if isinstance(a_core, ContractionCore):
-        # Appending a row-reduce kernel to a contraction → record the
-        # downstream stages in post_stages so the backend sees the
-        # combined structure explicitly.
-        new_post = a_core.post_stages + b_core_rewired if b_core_rewired else a_core.post_stages
+        if b_stages_rewired:
+            # a=contraction, b=reduce-chain → absorb b's stages into a's
+            # post_stages. Bridge ops become pre_ops of the first absorbed
+            # stage (they run between the contraction reduce and the
+            # first downstream reduce).
+            first = b_stages_rewired[0]
+            merged_first = ReduceStage(pre_ops=bridge + first.pre_ops, reduce=first.reduce)
+            new_post = a_core.post_stages + (merged_first,) + b_stages_rewired[1:]
+        else:
+            # a=contraction, b=pointwise → b's body is a per-row epilogue.
+            new_post = a_core.post_stages
         new_core = ContractionCore(
             a=a_core.a,
             b=a_core.b,
@@ -217,10 +228,39 @@ def _try_merge(
             reduce=a_core.reduce,
             post_stages=new_post,
         )
+        if b_stages_rewired:
+            new_epilogue = b_epilogue_rewired
+        else:
+            # pointwise b: bridge + b.epilogue become the contraction epilogue.
+            new_epilogue = bridge + b_epilogue_rewired
     elif isinstance(a_core, tuple) and a_core:
-        new_core = a_core + b_core_rewired if b_core_rewired else a_core
-    elif b_core_rewired:
-        new_core = b_core_rewired
+        if b_stages_rewired:
+            # a=reduce-chain, b=reduce-chain → concatenate stages, folding
+            # the bridge into b's first stage's pre_ops.
+            first = b_stages_rewired[0]
+            merged_first = ReduceStage(pre_ops=bridge + first.pre_ops, reduce=first.reduce)
+            new_core = a_core + (merged_first,) + b_stages_rewired[1:]
+            new_epilogue = b_epilogue_rewired
+        else:
+            # a=reduce-chain, b=pointwise → bridge + b.prologue + b.epilogue
+            # all run after a's last reduce → new epilogue.
+            new_core = a_core
+            new_epilogue = bridge + b_epilogue_rewired
+    else:
+        # a=pointwise.
+        if isinstance(b_core, ContractionCore):
+            return None  # already rejected
+        if b_stages_rewired:
+            # a=pointwise, b=reduce-chain → a's body runs before b's first
+            # stage, either as new prologue or absorbed into first stage.
+            new_prologue = a.prologue + bridge
+            new_core = b_stages_rewired
+            new_epilogue = b_epilogue_rewired
+        else:
+            # a=pointwise, b=pointwise → concatenate linearly.
+            new_prologue = a.prologue + bridge
+            new_core = None
+            new_epilogue = b_epilogue_rewired
 
     new_kernel = KernelOp(
         inputs=new_inputs,
