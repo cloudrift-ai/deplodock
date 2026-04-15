@@ -213,15 +213,18 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             tag = "scatter"
             params["axis"] = op.axis
         elif isinstance(op, ops_module.KernelOp):
+            from deplodock.compiler.backend.cuda.generators.analysis import flat_region_ops
+
             tag = "fused_region"
             params["kernel_source"] = op.kernel_source
-            params["region_ops_count"] = len(op.region_ops)
-            params["_region_ops"] = op.region_ops  # for backend matmul detection
+            region_ops = flat_region_ops(op)
+            params["region_ops_count"] = len(region_ops)
+            params["_region_ops"] = region_ops  # for backend matmul detection
             # Store input shapes so the backend can infer matmul K dimension.
             all_shapes = {inp_id: graph.nodes[inp_id].output.shape for inp_id in node.inputs if inp_id in graph.nodes}
             # Include shapes for intermediate region op nodes (needed by kernel_gen
             # to determine reduction dimensions).
-            for rid, _, _ in op.region_ops:
+            for rid, _, _ in region_ops:
                 if rid in graph.nodes:
                     all_shapes[rid] = graph.nodes[rid].output.shape
             params["_input_shapes"] = all_shapes

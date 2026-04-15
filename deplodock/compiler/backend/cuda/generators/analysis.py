@@ -91,6 +91,45 @@ class TileAnalysis:
     b_batch_group: int = 1
 
 
+def flat_region_ops(kernel: KernelOp) -> list:
+    """Walk kernel body nodes in topo order, return (id, op, inputs) tuples.
+
+    Replaces the old ``KernelOp.region_ops`` compat property: dedups across
+    prologue, core (ContractionCore.mul/reduce + post_stages, or
+    tuple[ReduceStage] pre_ops/reduce), and epilogue by node id.
+    """
+    seen: set[str] = set()
+    out: list = []
+
+    def emit(node) -> None:
+        if node is None or node.id in seen:
+            return
+        seen.add(node.id)
+        out.append((node.id, node.op, list(node.inputs)))
+
+    for n in kernel.prologue:
+        emit(n)
+    if isinstance(kernel.core, ContractionCore):
+        emit(kernel.core.mul)
+        emit(kernel.core.reduce)
+        for stage in kernel.core.post_stages:
+            if not isinstance(stage, ReduceStage):
+                continue
+            for pre in stage.pre_ops:
+                emit(pre)
+            emit(stage.reduce)
+    elif isinstance(kernel.core, tuple):
+        for stage in kernel.core:
+            if not isinstance(stage, ReduceStage):
+                continue
+            for pre in stage.pre_ops:
+                emit(pre)
+            emit(stage.reduce)
+    for n in kernel.epilogue:
+        emit(n)
+    return out
+
+
 def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     """Analyze a FusedRegionOp and classify its computation pattern.
 
