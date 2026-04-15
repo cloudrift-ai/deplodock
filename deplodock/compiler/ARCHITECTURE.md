@@ -224,8 +224,11 @@ Decomposes high-level ops from `torch.export` into primitives:
 | `003_decompose_pow` | `pow(x, 2)` | `mul(x, x)` |
 | `004_decompose_linear` | `linear(x, w[, b])` | `transpose(w) → mul → sum [→ add(b)]` |
 | `005_decompose_matmul` | `matmul(a, b[, bias])` | `mul → sum [→ add(bias)]` |
-| `006_decompose_unsqueeze` | `unsqueeze(x, dim)` | `reshape(x, new_shape)` |
 | `007_decompose_mean` | `mean(x, axis)` | `sum(x, axis) → div(count)` |
+| `010_unsqueeze_to_indexmap` | `unsqueeze(x, dim)` | `IndexMapOp` with one source, identity coord_map skipping the inserted axis |
+| `011_transpose_to_indexmap` | `transpose(x, axes=(a, b))` | `IndexMapOp` with one source, coord_map swapping placeholders for axes a and b |
+| `013_slice_to_indexmap` | `slice(x, dim, start)` | `IndexMapOp` with one source, coord_map adding `start` offset on the slice axis |
+| `014_cat_to_indexmap` | `cat([a, b], dim)` | `IndexMapOp` with two sources; source 0's `select` picks output positions where the dim coord is below the split |
 
 Guideline: the tracer does a **faithful 1:1 capture** of FX ops. It never
 decomposes or normalizes — even compound ops like `Linear`, `Sdpa`, `Mean`,
@@ -242,8 +245,15 @@ hand-rolled QK^T+softmax+V).
 
 | Rule | Pattern | Action |
 |------|---------|--------|
-| `001_eliminate_trivial_unsqueeze` | `Reshape($x)` whose new shape is `x.shape` left-padded with 1's | Drop the reshape (rewire consumers to `x`); use `propagate_shapes` to re-derive downstream output shapes. |
-| `002_eliminate_identity_transpose` | `Transpose($x)` where one swapped dim has size 1 | Replace with `Reshape` (becomes a free buffer alias instead of a copy kernel). |
+| `001_merge_index_maps` | `IndexMap($inner)` where `$inner` is itself an `IndexMapOp` | Compose the two IndexMaps via coord-map substitution (substitute outer's placeholders into the inner's coord_map). The result reads the inner's input directly with one combined coord_map. Identity-after-composition cases become free buffer aliases via the backend's noop alias detection. |
+
+Note: `IndexMapOp` (in `ops.py`) subsumes Slice/Cat/Transpose/Unsqueeze. Its
+`sources` list is one or more `IndexSource(input_idx, coord_map, select)`,
+where `coord_map[i]` is a `LoopExpr` over placeholder vars
+`Var("out_coord_0")`, `Var("out_coord_1")`, ... that produces the i-th
+input index. `select` (optional, used by cat) is a boolean LoopExpr picking
+which output positions read this source. Multi-source IndexMaps lower to a
+Ternary load chain in the standalone `_compile_indexmap` kernel.
 
 Rule conventions:
 - Return the same `Graph` object for ineligible matches — `Pass.apply`

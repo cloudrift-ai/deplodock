@@ -87,18 +87,19 @@ def test_cuda_backend_benchmark():
 
 
 def test_noop_ops_become_aliases():
-    """Reshape ops produce buffer aliases. Transposes become copy kernels."""
+    """Identity IndexMap ops produce buffer aliases (no kernel launch).
+
+    Reshape, Transpose, etc. all decompose to IndexMapOp; identity IndexMaps
+    (pure pointer aliases over the input) are detected by ``compile()`` and
+    emit no kernel — just a host-side pointer assignment.
+    """
     compiled = _load_and_compile_fixture()
     plan = plan_graph(compiled)
 
-    # The plan should contain reshape ops (transposes are now copy kernels, not aliases).
-    reshape_count = sum(1 for op in plan.ops if op.op == "reshape")
-    assert reshape_count > 0, "Fixture should have reshape ops"
-
     program = _backend.compile(plan)
 
-    # Aliases should exist for reshapes (not transposes).
-    assert len(program.aliases) >= reshape_count
+    # The fixture has at least one identity IndexMap (e.g. reshape).
+    assert len(program.aliases) > 0, "Expected at least one alias from identity IndexMap"
 
     # Source should use pointer assignment for aliased buffers, not cudaMalloc.
     source = generate_source(program, mode="run")

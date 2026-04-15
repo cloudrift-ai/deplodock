@@ -147,6 +147,9 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
         elif isinstance(op, ops_module.MeanOp):
             tag = "mean"
             params["axis"] = op.axis
+        elif isinstance(op, ops_module.IndexMapOp):
+            tag = "indexmap"
+            params["_indexmap"] = op  # backend reads sources/out_shape directly
         elif isinstance(op, ops_module.CatOp):
             tag = "cat"
         elif isinstance(op, ops_module.GatherOp):

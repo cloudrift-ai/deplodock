@@ -315,6 +315,63 @@ class MeanOp(Op):
 
 
 # ---------------------------------------------------------------------------
+# Unified view op (subsumes Slice/Cat/Transpose/Reshape/Unsqueeze)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IndexSource:
+    """One input source for an IndexMapOp.
+
+    ``coord_map[i]`` is a ``LoopExpr`` producing the input's i-th index from
+    placeholder vars ``Var("out_coord_0")``, ``Var("out_coord_1")``, ...
+    See ``deplodock.compiler.coord_expr`` for the substitution helpers.
+
+    ``select`` is None for single-source ops; for multi-source IndexMaps
+    (cat) it's a boolean ``LoopExpr`` selecting which output positions
+    read this source.
+    """
+
+    input_idx: int  # position in IndexMapOp's input list
+    coord_map: tuple  # tuple[LoopExpr, ...] — kept untyped to avoid backend import at import time
+    select: object | None = None  # LoopExpr | None
+
+
+@dataclass
+class IndexMapOp(Op):
+    """Compute output by reindexing inputs via affine coord arithmetic.
+
+    Subsumes Slice, Cat, Transpose, Reshape, Unsqueeze — every layout-only
+    op is a function from output coordinates to input coordinates.
+    Multi-source forms (cat) use ``select`` on each source to pick which
+    output positions read which input.
+    """
+
+    out_shape: tuple[int, ...]
+    sources: tuple[IndexSource, ...]
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(self.out_shape)
+
+    def is_identity(self, input_shape: tuple) -> bool:
+        """True when this IndexMap is a pure pointer alias of its single input."""
+        from deplodock.compiler.backend.ir.expr import Var
+        from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX
+
+        if len(self.sources) != 1:
+            return False
+        src = self.sources[0]
+        if src.select is not None:
+            return False
+        if tuple(self.out_shape) != tuple(input_shape):
+            return False
+        for i, c in enumerate(src.coord_map):
+            if not isinstance(c, Var) or c.name != f"{PLACEHOLDER_PREFIX}{i}":
+                return False
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Fused ops (assembly targets)
 # ---------------------------------------------------------------------------
 

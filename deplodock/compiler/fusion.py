@@ -70,15 +70,11 @@ def _tensor_size(shape: tuple) -> int:
 def _is_fusible_op(op, node=None) -> bool:
     from deplodock.compiler.ops import ElementwiseOp, ReduceOp
 
-    # TransposeOp is NOT fusible — it swaps dimensions, which the pointwise
-    # codegen can't express.  It stays as a standalone copy kernel.
-    #
-    # ReshapeOp is NOT fusible — it changes the output shape, which breaks
-    # broadcasting semantics for other inputs in the region. For example,
-    # fusing `bias_add(x(1,8,3584), b(3584,)) → reshape(1,8,28,128)` would
-    # make the kernel compute bias[i % 128] instead of bias[i % 3584] because
-    # the pointwise codegen uses the fused region's output shape to derive
-    # per-input broadcast indices. Reshape always stays as a buffer alias.
+    # TransposeOp / ReshapeOp / SliceOp / CatOp / UnsqueezeOp / IndexMapOp are
+    # NOT directly fusible — they emit standalone kernels (or buffer aliases for
+    # identity IndexMaps). Fusing IndexMapOp with surrounding compute requires
+    # in-region coord-map evaluation in loop_lower (planned follow-up); for now
+    # they sit between fused regions as their own kernels.
     return isinstance(op, (ElementwiseOp, ReduceOp))
 
 

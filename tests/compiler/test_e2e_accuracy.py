@@ -21,9 +21,16 @@ requires_cuda = pytest.mark.skipif(
 
 
 def _compile_and_run_with_data(graph: Graph, input_data: dict[str, list[float]]) -> dict[str, list[float]]:
-    """Full pipeline with actual input data."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    """Full pipeline with actual input data — runs the rewriter so view ops
+    (TransposeOp/SliceOp/CatOp/UnsqueezeOp) get lowered to IndexMapOp before
+    fusion + compile."""
+    from pathlib import Path
 
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.rewriter import Rewriter
+
+    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+    graph = Rewriter.from_directory(rules_dir).apply(graph)
     fused = auto_fuse(graph)
     plan = plan_graph(fused)
     backend = CudaBackend()

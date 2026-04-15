@@ -40,10 +40,13 @@ class CudaBackend(Backend):
 
         buffers = [Buffer(name=b.name, size=_safe_prod(b.shape), dtype="float", role=b.role) for b in plan.buffers]
 
-        # Noop ops (reshape, transpose) become buffer aliases instead of
-        # empty kernel launches. The output buffer shares the input's
-        # device pointer — no allocation, no launch overhead.
+        # Noop ops become buffer aliases instead of empty kernel launches:
+        # the output buffer shares the input's device pointer — no allocation,
+        # no launch overhead. Reshape stays for back-compat until decomposition
+        # rules lower it to IndexMapOp; identity IndexMaps are detected below.
         _NOOP_OPS = {"reshape", "gather", "scatter"}
+        # Map planned buffer names → input shapes for identity-IndexMap detection.
+        buffer_shapes: dict[str, tuple] = {b.name: tuple(b.shape) for b in plan.buffers}
         aliases: dict[str, str] = {}
         launches = []
         for op in plan.ops:
@@ -54,6 +57,18 @@ class CudaBackend(Backend):
                     target = aliases[target]
                 aliases[op.outputs[0]] = target
                 continue
+            # Identity IndexMap: pure pointer alias of its single input.
+            if op.op == "indexmap" and op.inputs and op.outputs:
+                idx_map = op.params.get("_indexmap")
+                if idx_map is not None:
+                    src = op.inputs[0]
+                    src_resolved = src
+                    while src_resolved in aliases:
+                        src_resolved = aliases[src_resolved]
+                    in_shape = buffer_shapes.get(src_resolved, ())
+                    if in_shape and idx_map.is_identity(in_shape):
+                        aliases[op.outputs[0]] = src_resolved
+                        continue
             launches.extend(_compile_op(op))
 
         return Program(
@@ -775,178 +790,121 @@ def _compile_op(op: OpKernel) -> list[CudaLaunch]:
         _compile_singleton(op)  # sets up _region_ops etc. on op.params
         return _compile_fused_region(op)
 
-    if op.op == "transpose":
-        return [_compile_transpose(op)]
-
     # Standalone reshape — buffer alias (handled in compile loop above,
     # but may reach here if the reshape wasn't caught as a noop).
     if op.op == "reshape":
         return []
 
-    if op.op == "slice":
-        return [_compile_slice(op)]
+    if op.op == "indexmap":
+        # Identity IndexMaps were aliased in compile() above. A standalone
+        # non-identity IndexMap gets a unified coord-map kernel that handles
+        # transpose / slice / cat / unsqueeze in one place.
+        return [_compile_indexmap(op)]
 
-    if op.op == "cat":
-        return [_compile_cat(op)]
+    raise ValueError(
+        f"Unknown op: {op.op!r}. "
+        "Slice/Cat/Transpose/Unsqueeze should have been decomposed to IndexMapOp "
+        "by the rewriter — make sure your pipeline applies Rewriter.from_directory(rules_dir) "
+        "before backend.compile()."
+    )
 
-    raise ValueError(f"Unknown op: {op.op!r}")
+
+def _row_major_strides(shape: tuple) -> list[int]:
+    """Compute row-major strides for a shape (last dim has stride 1)."""
+    strides = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        d = shape[i + 1] if isinstance(shape[i + 1], int) else 1
+        strides[i] = strides[i + 1] * d
+    return strides
 
 
-def _compile_transpose(op: OpKernel) -> CudaLaunch:
-    """Compile a transpose as a copy kernel with reindexed access.
+def _compile_indexmap(op: OpKernel) -> CudaLaunch:
+    """Compile a standalone IndexMapOp into a single pointwise CUDA kernel.
 
-    Handles the common case of swapping two axes in an N-D tensor.
+    For each output position, evaluates the coord_map (substituting placeholder
+    vars with the kernel's per-axis output coords), flattens the per-axis input
+    indices using the input's row-major strides, and emits one Load. Multi-source
+    IndexMaps (cat) emit a Ternary chain over the source selects.
     """
-    name = _unique_name("transpose")
-    src_buf = op.inputs[0]
-    dst_buf = op.outputs[0]
-    in_shape = op.params.get("_input_shapes", {}).get(src_buf, ())
-    out_shape = op.params.get("shape", in_shape)
+    from deplodock.compiler.backend.cuda.generators.loop_codegen import _expr_to_c
+    from deplodock.compiler.backend.ir.expr import Literal, Var
+    from deplodock.compiler.coord_expr import placeholder, substitute
+
+    name = _unique_name("indexmap")
+    indexmap = op.params["_indexmap"]
+    out_shape = tuple(indexmap.out_shape)
     total = math.prod(d for d in out_shape if isinstance(d, int))
-    axes = op.params.get("axes", (-2, -1))
+    out_buf = op.outputs[0]
+    input_shapes = op.params.get("_input_shapes", {})
 
-    # Normalize negative axes.
-    ndim = len(in_shape)
-    ax0 = axes[0] % ndim if ndim > 0 else 0
-    ax1 = axes[1] % ndim if ndim > 0 else 1
+    # Each IndexSource.input_idx names the position in op.inputs that source reads.
+    # Decomposition rules ensure op.inputs contains only the tensors the IndexMap
+    # actually reads (constants like slice start/end were baked into coord_map).
+    referenced_idxs = sorted({src.input_idx for src in indexmap.sources})
+    tensor_inputs = [op.inputs[i] for i in referenced_idxs]
+    tensor_input_shapes = [tuple(input_shapes.get(inp, ())) for inp in tensor_inputs]
+    # Remap source.input_idx → position in tensor_inputs (in case there are gaps).
+    idx_remap = {orig: new for new, orig in enumerate(referenced_idxs)}
 
-    # Compute strides for input (row-major).
-    in_strides = [1] * ndim
-    for i in range(ndim - 2, -1, -1):
-        d = in_shape[i + 1] if isinstance(in_shape[i + 1], int) else 1
-        in_strides[i] = in_strides[i + 1] * d
+    # Build placeholder substitutions: out_coord_d → flat-index decomposition.
+    out_strides = _row_major_strides(out_shape)
+    coord_subs: dict[str, object] = {}
+    for d in range(len(out_shape)):
+        size = out_shape[d] if isinstance(out_shape[d], int) else 1
+        if d == len(out_shape) - 1:
+            expr = Var("i") % Literal(size, "int")
+        else:
+            expr = (Var("i") / Literal(out_strides[d], "int")) % Literal(size, "int")
+        coord_subs[placeholder(d).name] = expr
 
-    # Output strides (row-major of output shape).
-    out_strides = [1] * ndim
-    for i in range(ndim - 2, -1, -1):
-        d = out_shape[i + 1] if isinstance(out_shape[i + 1], int) else 1
-        out_strides[i] = out_strides[i + 1] * d
+    # For each source: substitute the coord_map, flatten via input strides, build a load.
+    src_pieces: list[tuple[str, str | None]] = []  # (load_c, select_c)
+    for src in indexmap.sources:
+        new_idx = idx_remap[src.input_idx]
+        in_buf = tensor_inputs[new_idx]
+        in_shape = tensor_input_shapes[new_idx]
+        in_strides = _row_major_strides(in_shape)
+        substituted = [substitute(c, coord_subs) for c in src.coord_map]
+        # Flatten: sum over axes of coord * stride
+        flat: object = Literal(0, "int")
+        for axis, c in enumerate(substituted):
+            flat = flat + c * Literal(in_strides[axis], "int")
+        flat_c = _expr_to_c(flat)
+        load_c = f"{in_buf}[{flat_c}]"
+        select_c: str | None = None
+        if src.select is not None:
+            sel_sub = substitute(src.select, coord_subs)
+            select_c = _expr_to_c(sel_sub)
+        src_pieces.append((load_c, select_c))
 
-    # Build index computation: for each output element, compute the
-    # corresponding input element by decomposing into multi-dim indices,
-    # swapping the two axes, and recomputing the flat input index.
-    # Generate C code inline.
+    # Combine sources via Ternary chain. Last source is the default branch.
+    if len(src_pieces) == 1:
+        value_c = src_pieces[0][0]
+    else:
+        value_c = src_pieces[-1][0]
+        for load_c, sel_c in reversed(src_pieces[:-1]):
+            assert sel_c is not None, "multi-source IndexMap requires select on all but the last source"
+            value_c = f"(({sel_c}) ? ({load_c}) : ({value_c}))"
 
-    src_code = f"__global__ void {name}(const float* src, float* dst, int n) {{\n"
-    src_code += "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-    src_code += "    if (i >= n) return;\n"
-    # Decompose flat index i into multi-dim output indices.
-    src_code += "    int rem = i;\n"
-    for d in range(ndim):
-        src_code += f"    int d{d} = rem / {out_strides[d]}; rem %= {out_strides[d]};\n"
-    # Swap the two axes for input indexing.
-    src_code += f"    int t = d{ax0}; d{ax0} = d{ax1}; d{ax1} = t;\n"
-    # Compute flat input index.
-    terms = [f"d{d} * {in_strides[d]}" for d in range(ndim)]
-    src_code += f"    int src_idx = {' + '.join(terms)};\n"
-    src_code += "    dst[i] = src[src_idx];\n"
-    src_code += "}\n"
+    in_param_decls = ", ".join(f"const float* __restrict__ {b}" for b in tensor_inputs)
+    src_code = (
+        f"__global__ void {name}({in_param_decls}, float* __restrict__ {out_buf}, int n) {{\n"
+        f"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        f"    if (i < n) {out_buf}[i] = {value_c};\n"
+        f"}}\n"
+    )
 
+    args = [*tensor_inputs, out_buf, str(total)]
     return CudaLaunch(
         kernel_source=src_code,
         kernel_name=name,
         grid=(_cd(total, 256), 1, 1),
         block=(256, 1, 1),
-        args=[src_buf, dst_buf, str(total)],
+        args=args,
     )
 
 
-def _compile_slice(op: OpKernel) -> CudaLaunch:
-    """Compile a slice op as a strided copy kernel.
-
-    Slice extracts a sub-range along the last dimension:
-    dst[i] = src[(i / dst_stride) * src_stride + (i % dst_stride) + start].
-
-    The start offset is extracted from ConstantOp values in the graph.
-    """
-    name = _unique_name("slice")
-    src_buf = op.inputs[0]
-    dst_buf = op.outputs[0]
-    out_shape = op.params.get("shape", (1,))
-    total = math.prod(d for d in out_shape if isinstance(d, int))
-
-    input_shapes = op.params.get("_input_shapes", {})
-    src_shape = input_shapes.get(src_buf, out_shape)
-    src_last = src_shape[-1] if isinstance(src_shape[-1], int) else total
-    out_last = out_shape[-1] if isinstance(out_shape[-1], int) else total
-
-    # Extract start offset from the constant inputs.
-    # Slice inputs are [tensor, dim_const, start_const, end_const].
-    # The start_const has the byte/element offset.
-    start = 0
-    const_inputs = op.inputs[1:]  # skip tensor
-    if len(const_inputs) >= 2:
-        # The second constant is 'start'. Look up its value from params.
-        start_name = const_inputs[1]
-        start_val = op.params.get(f"_const_{start_name}")
-        if start_val is not None:
-            start = int(start_val)
-
-    if src_last == out_last:
-        # No slicing on last dim — simple copy
-        src_code = (
-            f"__global__ void {name}(const float* src, float* dst, int n) {{"
-            " int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) dst[i] = src[i]; }"
-        )
-        return CudaLaunch(
-            kernel_source=src_code, kernel_name=name, grid=(_cd(total, 256), 1, 1), block=(256, 1, 1), args=[src_buf, dst_buf, str(total)]
-        )
-
-    src_code = f"""__global__ void {name}(const float* src, float* dst, int n) {{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {{
-        int row = i / {out_last};
-        int col = i % {out_last};
-        dst[i] = src[row * {src_last} + col + {start}];
-    }}
-}}"""
-    return CudaLaunch(
-        kernel_source=src_code, kernel_name=name, grid=(_cd(total, 256), 1, 1), block=(256, 1, 1), args=[src_buf, dst_buf, str(total)]
-    )
-
-
-def _compile_cat(op: OpKernel) -> CudaLaunch:
-    """Compile a cat op as a copy kernel.
-
-    Cat inputs: [tensor_1, tensor_2, ..., dim_const].
-    Concatenates along the last dimension.
-    """
-    name = _unique_name("cat")
-    dst_buf = op.outputs[0]
-    out_shape = op.params.get("shape", (1,))
-    total = math.prod(d for d in out_shape if isinstance(d, int))
-    out_last = out_shape[-1] if out_shape else 1
-
-    # Source buffers (skip scalar constants — they're the dim arg).
-    input_shapes = op.params.get("_input_shapes", {})
-    src_bufs = [inp for inp in op.inputs if inp in input_shapes and math.prod(d for d in input_shapes[inp] if isinstance(d, int)) > 1]
-
-    if len(src_bufs) == 2:
-        s0_shape = input_shapes.get(src_bufs[0], out_shape)
-        s1_shape = input_shapes.get(src_bufs[1], out_shape)
-        s0_last = s0_shape[-1] if s0_shape else 0
-        s1_last = s1_shape[-1] if s1_shape else 0
-
-        src_code = f"""__global__ void {name}(const float* s0, const float* s1,
-    float* dst, int n, int dst_stride, int s0_stride, int s1_stride) {{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {{
-        int row = i / dst_stride;
-        int col = i % dst_stride;
-        if (col < s0_stride)
-            dst[i] = s0[row * s0_stride + col];
-        else
-            dst[i] = s1[row * s1_stride + (col - s0_stride)];
-    }}
-}}"""
-        return CudaLaunch(
-            kernel_source=src_code,
-            kernel_name=name,
-            grid=(_cd(total, 256), 1, 1),
-            block=(256, 1, 1),
-            args=[src_bufs[0], src_bufs[1], dst_buf, str(total), str(out_last), str(s0_last), str(s1_last)],
-        )
-
-    # Fallback for >2 inputs
-    src_code = f"__global__ void {name}(float* dst, int n) {{ int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) dst[i] = 0.0f; }}"
-    return CudaLaunch(kernel_source=src_code, kernel_name=name, grid=(_cd(total, 256), 1, 1), block=(256, 1, 1), args=[dst_buf, str(total)])
+# Slice / Cat / Transpose used to have dedicated standalone kernel emitters
+# here. They've been replaced by ``_compile_indexmap`` (above), which uses one
+# coord-map evaluator for all view ops. The decomposition rules in
+# ``rules/decomposition/{010..014}*.py`` lower the legacy ops into IndexMapOp.
