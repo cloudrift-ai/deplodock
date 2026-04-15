@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReduceOp
+from deplodock.compiler.ops import ContractionCore, ElementwiseOp, KernelOp, ReduceOp
 
 
 def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
@@ -101,8 +101,8 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     Returns:
         TileAnalysis with pattern classification and metadata.
     """
-    # Split ops into phases.
-    phases = _split_phases(region.region_ops)
+    # Split ops into phases directly from structured kernel fields.
+    phases = _split_phases(region)
 
     # Determine output shape.
     out_id = region.output_names[0]
@@ -210,42 +210,89 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     )
 
 
-def _split_phases(region_ops: list) -> OpPhases:
-    """Split region ops into prologue, reduces, inter-reduce ops, and epilogue.
+def _node_entry(n) -> RegionEntry:
+    """Convert a Node to a (id, op, inputs) tuple."""
+    return (n.id, n.op, list(n.inputs))
 
-    For multi-reduce (e.g. softmax: max → sub → exp → sum → div):
-      prologue = [] (or scale op)
-      reduces = [max, sum]
-      inter_reduce = [[sub, exp]]  (ops between max and sum)
-      epilogue = [div]
+
+def _split_phases(kernel: KernelOp) -> OpPhases:
+    """Derive OpPhases directly from a KernelOp's structured fields.
+
+    No scanning: each ``core`` variant maps deterministically to the four
+    phases (prologue, reduces, inter_reduce, epilogue).
+
+    - ``ContractionCore``: prologue + [mul] feed [reduce]; epilogue follows.
+    - ``tuple[ReduceStage, ...]`` (ReduceCore): each stage contributes one
+      reduce and its pre_ops as inter_reduce[i-1]. Nodes between the last
+      stage's reduce and the end of prologue are the row-reduce epilogue.
+    - ``None``: pure pointwise — all nodes in prologue.
     """
-    prologue: list[RegionEntry] = []
-    reduces: list[RegionEntry] = []
-    inter_reduce: list[list[RegionEntry]] = []
-    epilogue: list[RegionEntry] = []
+    if isinstance(kernel.core, ContractionCore):
+        prologue = [_node_entry(n) for n in kernel.prologue]
+        if kernel.core.mul is not None:
+            prologue.append(_node_entry(kernel.core.mul))
+        reduces: list[RegionEntry] = []
+        if kernel.core.reduce is not None:
+            reduces.append(_node_entry(kernel.core.reduce))
+        epilogue = [_node_entry(n) for n in kernel.epilogue]
+        return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=[])
+
+    if isinstance(kernel.core, tuple) and kernel.core:
+        # ReduceCore: the reduce rule leaves Nodes in kernel.prologue and
+        # annotates boundaries via stages. Find stage reduce positions.
+        stages = kernel.core
+        reduce_node_ids = {s.reduce.id for s in stages}
+        # First stage's reduce marks end-of-prologue.
+        first_reduce_id = stages[0].reduce.id
+        prologue: list[RegionEntry] = []
+        seen_first_reduce = False
+        tail: list = []  # nodes in kernel.prologue after last reduce
+        last_reduce_id = stages[-1].reduce.id
+        seen_last_reduce = False
+        for n in kernel.prologue:
+            if n.id == first_reduce_id:
+                seen_first_reduce = True
+                continue
+            if not seen_first_reduce:
+                prologue.append(_node_entry(n))
+                continue
+            if n.id in reduce_node_ids:
+                if n.id == last_reduce_id:
+                    seen_last_reduce = True
+                continue
+            if seen_last_reduce:
+                tail.append(_node_entry(n))
+        # Reduces + inter-reduce chains come straight from the stages.
+        reduces_entries = [_node_entry(s.reduce) for s in stages]
+        inter_reduce: list[list[RegionEntry]] = [[_node_entry(pn) for pn in s.pre_ops] for s in stages[1:]]
+        epilogue = tail + [_node_entry(n) for n in kernel.epilogue]
+        return OpPhases(prologue=prologue, reduces=reduces_entries, epilogue=epilogue, inter_reduce=inter_reduce)
+
+    # core is None — unstructured. Scan kernel.prologue + epilogue to find
+    # reduce boundaries, matching the legacy behavior for kernels that
+    # haven't been classified by the fusion rules (e.g. tests that construct
+    # KernelOps by hand).
+    prologue_out: list[RegionEntry] = []
+    reduces_out: list[RegionEntry] = []
+    inter_reduce_out: list[list[RegionEntry]] = []
+    epilogue_out: list[RegionEntry] = []
     current_inter: list[RegionEntry] = []
     phase = "prologue"
-    for entry in region_ops:
-        _, op, _ = entry
-        if isinstance(op, ReduceOp):
+    flat_nodes = list(kernel.prologue) + list(kernel.epilogue)
+    for n in flat_nodes:
+        entry = _node_entry(n)
+        if isinstance(n.op, ReduceOp):
             if phase == "epilogue":
-                # Second+ reduce: save inter-reduce ops, start new inter group.
-                inter_reduce.append(current_inter)
+                inter_reduce_out.append(current_inter)
                 current_inter = []
-            reduces.append(entry)
+            reduces_out.append(entry)
             phase = "epilogue"
         elif phase == "prologue":
-            prologue.append(entry)
+            prologue_out.append(entry)
         else:
             current_inter.append(entry)
-    # Everything after the last reduce goes into epilogue.
-    epilogue = current_inter
-    return OpPhases(
-        prologue=prologue,
-        reduces=reduces,
-        epilogue=epilogue,
-        inter_reduce=inter_reduce,
-    )
+    epilogue_out = current_inter
+    return OpPhases(prologue=prologue_out, reduces=reduces_out, epilogue=epilogue_out, inter_reduce=inter_reduce_out)
 
 
 def _needed_by(ops: list) -> set[str]:
@@ -262,53 +309,44 @@ def _detect_contraction(
     shapes: dict[str, tuple],
     input_access: dict[str, AccessPattern],
 ) -> tuple[bool, str | None, str | None, int, int, int, tuple[int, ...], int]:
-    """Detect if region is a contraction (matmul-like) pattern.
+    """Determine matmul metadata from a KernelOp's structured ``core``.
 
-    A contraction requires:
-    - Prologue has exactly one binary ElementwiseOp (mul) with two 2D inputs
-    - First reduce is sum
-    - The two inputs share a dimension (K) that gets reduced
-    - Output is 2D (M, N)
+    If ``kernel.core`` is a ``ContractionCore``, read a/b buffer IDs from
+    its Ports and derive M, N, K, batch_dims, batch_size (plus GQA batch
+    groups) from the Port shapes — no scanning. Otherwise not a contraction.
 
-    Returns: (is_contraction, a_name, b_name, M, N, K, batch_dims, batch_size)
+    Returns: (is_contraction, a_name, b_name, M, N, K, batch_dims, batch_size,
+              a_batch_group, b_batch_group).
     """
-    if not phases.reduces:
-        return False, None, None, 0, 0, 0, (), 1, 1, 1
+    if isinstance(region.core, ContractionCore):
+        a_id = region.core.a.buffer_id
+        b_id = region.core.b.buffer_id
+    else:
+        # Unstructured kernel (core=None) — fall back to pattern scan over the
+        # phases for tests and edge cases where the fusion rule hasn't classified.
+        if not phases.reduces:
+            return False, None, None, 0, 0, 0, (), 1, 1, 1
+        _, reduce_op, _ = phases.reduces[0]
+        if reduce_op.fn != "sum":
+            return False, None, None, 0, 0, 0, (), 1, 1, 1
+        mul_entry = next(
+            (e for e in phases.prologue if isinstance(e[1], ElementwiseOp) and e[1].fn == "mul" and len(e[2]) == 2),
+            None,
+        )
+        if mul_entry is None:
+            return False, None, None, 0, 0, 0, (), 1, 1, 1
+        a_id, b_id = mul_entry[2][0], mul_entry[2][1]
 
-    # The first reduce must be sum.
-    first_reduce = phases.reduces[0]
-    _, reduce_op, _ = first_reduce
-    if reduce_op.fn != "sum":
-        return False, None, None, 0, 0, 0, (), 1, 1, 1
-
-    # Find the binary mul in prologue that feeds the reduce.
-    mul_entry = None
-    for entry in phases.prologue:
-        _, op, input_ids = entry
-        if isinstance(op, ElementwiseOp) and op.fn == "mul" and len(input_ids) == 2:
-            mul_entry = entry
-            break
-
-    if mul_entry is None:
-        return False, None, None, 0, 0, 0, (), 1, 1, 1
-
-    _, _, mul_inputs = mul_entry
-    a_id, b_id = mul_inputs[0], mul_inputs[1]
-
-    # Both inputs must be external (in region.input_names) and >=2D.
     if a_id not in input_access or b_id not in input_access:
         return False, None, None, 0, 0, 0, (), 1, 1, 1
 
     a_acc = input_access[a_id]
     b_acc = input_access[b_id]
-
     if not a_acc.is_2d or not b_acc.is_2d:
         return False, None, None, 0, 0, 0, (), 1, 1, 1
 
-    # A(M, K) @ B(K, N) or A(B..., M, K) @ B(B..., K, N).
     a_shape = a_acc.shape
     b_shape = b_acc.shape
-
     if len(a_shape) < 2 or len(b_shape) < 2:
         return False, None, None, 0, 0, 0, (), 1, 1, 1
 
