@@ -157,8 +157,8 @@ def test_llama_block_full_fusion(dump_dir):
         name = type(n.op).__name__
         ops_by_type[name] = ops_by_type.get(name, 0) + 1
 
-    # auto_fuse produces FusedRegionOps from discovered fusion regions.
-    assert ops_by_type.get("FusedRegionOp", 0) >= 1, f"Expected FusedRegionOps, got {ops_by_type}"
+    # auto_fuse produces KernelOps from discovered fusion regions.
+    assert ops_by_type.get("KernelOp", 0) >= 1, f"Expected KernelOps, got {ops_by_type}"
 
     # Node count should be significantly reduced.
     assert len(result.nodes) < initial_count

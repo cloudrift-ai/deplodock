@@ -40,7 +40,7 @@ requires_cuda = pytest.mark.skipif(
 
 
 def test_compile_graph_fuses_matmul():
-    """compile_graph applies fusion rules and produces FusedRegionOp."""
+    """compile_graph applies fusion rules and produces KernelOp."""
     g = _make_matmul_graph(4, 3, 2)
     rewriter = _load_rewriter()
     from deplodock.compiler.fusion import auto_fuse
@@ -49,7 +49,7 @@ def test_compile_graph_fuses_matmul():
     compiled = auto_fuse(compiled)
 
     op_types = {type(n.op).__name__ for n in compiled.nodes.values()}
-    assert "FusedRegionOp" in op_types
+    assert "KernelOp" in op_types
 
     assert len(traces) > 0
 

@@ -7,14 +7,14 @@ as pointwise, row_reduce, reduce_broadcast, or contraction.
 from deplodock.compiler.backend.cuda.generators.analysis import analyze
 from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, FusedRegionOp, InputOp, ReduceOp
+from deplodock.compiler.ops import ConstantOp, ElementwiseOp, FusedRegionOp, InputOp, KernelOp, ReduceOp
 
 
 def _fuse_and_analyze(g: Graph):
     """Auto-fuse a graph and return TileAnalysis for the first fused region."""
     fused = auto_fuse(g)
     for nd in fused.nodes.values():
-        if isinstance(nd.op, FusedRegionOp):
+        if isinstance(nd.op, (FusedRegionOp, KernelOp)):
             shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
             for nid in fused.nodes:
                 shapes[nid] = fused.nodes[nid].output.shape
@@ -102,7 +102,7 @@ def test_reduce_broadcast_softmax():
     # Collect all fused regions and their analyses.
     analyses = []
     for nd in fused.nodes.values():
-        if isinstance(nd.op, FusedRegionOp):
+        if isinstance(nd.op, (FusedRegionOp, KernelOp)):
             shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
             for nid in fused.nodes:
                 shapes[nid] = fused.nodes[nid].output.shape
