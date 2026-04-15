@@ -63,11 +63,12 @@ The compiler has four layers. Each layer depends only on the layers above it. **
 
 ```
                      Layer 1                    Layer 2
-PyTorch module ──→ Graph IR ──→ Decomposition ──→ Fusion ──→ auto_fuse ──→ optimized Graph
-   (faithful                    (sdpa, silu, pow,  (general fusion:
-    1:1 FX                       linear, matmul,    region discovery +
-    capture)                     unsqueeze, mean    kernel generation)
-                                 → primitives)
+PyTorch module ──→ Graph IR ──→ Decomposition ──→ Optimization ──→ Fusion ──→ optimized Graph
+   (faithful                    (sdpa, silu, pow,  (canonicalize      (greedy region
+    1:1 FX                       linear, matmul,    primitive IR)      merger + structural
+    capture)                     unsqueeze, mean)                      classification into
+                                                                       KernelOps with
+                                                                       prologue/core/epilogue)
                                                                         │
                      Layer 3                                            │
                      plan_graph(graph) ──→ ExecutionPlan ◄──────────────┘
@@ -142,8 +143,8 @@ compiler/
 ├── rules/            # [L2] Pass directories — each is loaded explicitly via DEFAULT_PASS_ORDER
 │   ├── decomposition/ #     Decompose high-level ops → primitives (runs first)
 │   ├── optimization/  #     Canonicalize primitive IR (runs after decomposition)
-│   └── fusion/       #      (empty — auto_fuse handles all fusion)
-├── fusion.py         # [L2] auto_fuse: automatic fusion region discovery
+│   └── fusion/       #      Greedy fusion + structural classification (KernelOp core)
+├── fusion.py         # [L2] auto_fuse: greedy region merger (wrapped by rules/fusion/000)
 ├── plan.py           # [L3] BufferSpec, OpKernel, ExecutionPlan, plan_graph
 ├── dump.py           # [--] CompilerDump: debug artifact collector (cross-layer)
 ├── pipeline.py       # [L2] compile_graph (graph optimization only)
@@ -261,17 +262,19 @@ Rule conventions:
   doesn't spin on patterns that match more nodes than they can act on.
 - Eligible rewrites must `g = graph.copy()` and return the new graph.
 
-### 3. Auto-fusion (fusion.py)
+### 3. Fusion (rules/fusion/ + fusion.py)
 
-`auto_fuse(graph)` discovers fusion regions from intermediate tensor sizes:
-- Scores each single-consumer edge by `product(intermediate_shape)`
-- Greedy merge highest-score-first
-- Only `ElementwiseOp` and `ReduceOp` are fusible — `ReshapeOp` and `TransposeOp` are NOT
-  (reshape would break 1D broadcast indexing of other inputs; transpose can't be
-  expressed in pointwise codegen). Both always become buffer aliases or standalone kernels.
-- Produces `FusedRegionOp` nodes
+Fusion runs as a `Rewriter` pass (last in `DEFAULT_PASS_ORDER`). Rules in `rules/fusion/*.py` execute in filename order:
 
-Fusion constraints enforced by `_can_merge()`:
+1. **`000_greedy_fusion.py`** wraps `auto_fuse(graph)` from `fusion.py` — the greedy edge-merger that discovers fusion regions from intermediate tensor sizes, scoring single-consumer edges by `product(intermediate_shape)` and merging highest-score-first. Produces `KernelOp` nodes with `prologue=<all merged nodes in topo order>`, `core=None`, `epilogue=()` — a flat shape.
+2. **`001_structure_contraction.py`** recognizes `sum(mul(A, B))` matmul shapes inside flat KernelOps and annotates them with `core=ContractionCore(a_port, b_port, k_axis)`.
+3. **`002_structure_reduce.py`** recognizes single- and multi-reduce shapes (row reductions, RMSNorm, softmax) and annotates with `core=(ReduceStage, ...)`.
+
+The annotations reference nodes already held in `prologue` — the rules don't move nodes — so backward-compatibility shims (`KernelOp.region_ops`, `.input_names`, `.output_names`, `.shapes`) keep backend readers working unchanged. A future refactor migrates readers to consume `kernel.core` directly, at which point the mul/sum/reduce nodes can be dropped from `prologue`.
+
+Only `ElementwiseOp` and `ReduceOp` are fusible — `ReshapeOp` and `TransposeOp` are not (reshape would break 1D broadcast indexing; transpose can't be expressed in pointwise codegen). Both become buffer aliases or standalone kernels.
+
+Fusion constraints enforced by `_can_merge()` in `fusion.py`:
 - **Convexity**: merged region must be a convex subgraph (no external nodes between)
 - **Contraction + epilogue**: contraction core (mul+sum) can fuse with pointwise epilogue ops (bias add, activation, residual add from graph-level inputs)
 - **Single reduce**: one reduction pass per kernel (softmax needs two regions: max+sub+exp and sum+div)
@@ -279,7 +282,9 @@ Fusion constraints enforced by `_can_merge()`:
 - **Shape compatibility**: all full-rank external inputs must have the same total size (scalars, vectors, and per-row tensors are exempt)
 - **Single output**: one external output per region
 
-The CUDA backend auto-generates kernels during `compile()` for any `FusedRegionOp` via `generators/tiled.py`. Reshape/transpose ops become buffer aliases (zero-cost pointer assignment, no kernel launch).
+The CUDA backend auto-generates kernels during `compile()` for any `KernelOp` via `generators/tiled.py`. Reshape/transpose ops become buffer aliases (zero-cost pointer assignment, no kernel launch).
+
+`FusedRegionOp` is a legacy dataclass retained as a backend-internal struct (used by `_build_region_and_shapes` to reconstruct region data from serialized plan params). It is no longer emitted into the outer graph — fusion emits `KernelOp`.
 
 ## CUDA Backend Details
 
