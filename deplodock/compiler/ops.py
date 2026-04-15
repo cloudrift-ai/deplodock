@@ -414,6 +414,11 @@ class ContractionCore:
     structural rule moved out of the KernelOp's prologue — they're
     "implicit" in the template but explicit in the IR so the backend can
     reach them for codegen.
+
+    ``post_stages`` lets a contraction carry a downstream row-reduce chain
+    in the same kernel (matmul → softmax fusion): the contraction reduce
+    runs first, then each ReduceStage applies its pre_ops chain and
+    reduce to the per-row accumulator.
     """
 
     a: Port
@@ -421,6 +426,7 @@ class ContractionCore:
     k_axis: int  # which dim of a's post-IndexMap shape is K
     mul: object = None  # Node holding the elementwise multiply
     reduce: object = None  # Node holding the sum reduction
+    post_stages: tuple = ()  # tuple[ReduceStage, ...] — downstream row reduces
 
 
 @dataclass
@@ -511,6 +517,12 @@ class KernelOp(Op):
         if isinstance(self.core, ContractionCore):
             emit(self.core.mul)
             emit(self.core.reduce)
+            for stage in self.core.post_stages:
+                if not isinstance(stage, ReduceStage):
+                    continue
+                for pre in stage.pre_ops:
+                    emit(pre)
+                emit(stage.reduce)
         elif isinstance(self.core, tuple):
             for stage in self.core:
                 for pre in stage.pre_ops:
@@ -538,6 +550,13 @@ class KernelOp(Op):
                 result[self.core.mul.id] = tuple(self.core.mul.output.shape)
             if self.core.reduce is not None:
                 result[self.core.reduce.id] = tuple(self.core.reduce.output.shape)
+            for stage in self.core.post_stages:
+                if not isinstance(stage, ReduceStage):
+                    continue
+                for pre in stage.pre_ops:
+                    result[pre.id] = tuple(pre.output.shape)
+                if stage.reduce is not None:
+                    result[stage.reduce.id] = tuple(stage.reduce.output.shape)
         elif isinstance(self.core, tuple):
             for stage in self.core:
                 for pre in stage.pre_ops:

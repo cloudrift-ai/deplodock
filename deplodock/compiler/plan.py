@@ -67,6 +67,16 @@ def _serialize_core(kernel) -> dict | None:
     if core is None:
         return None
     if isinstance(core, ContractionCore):
+        post_stages = []
+        for stage in core.post_stages:
+            if not isinstance(stage, ReduceStage):
+                continue
+            post_stages.append(
+                {
+                    "reduce_id": stage.reduce.id if stage.reduce is not None else None,
+                    "pre_op_ids": [n.id for n in stage.pre_ops],
+                }
+            )
         return {
             "kind": "contraction",
             "a_buffer": core.a.buffer_id,
@@ -74,6 +84,7 @@ def _serialize_core(kernel) -> dict | None:
             "k_axis": core.k_axis,
             "mul_id": core.mul.id if core.mul is not None else None,
             "reduce_id": core.reduce.id if core.reduce is not None else None,
+            "post_stages": post_stages,
         }
     if isinstance(core, tuple):
         stages = []

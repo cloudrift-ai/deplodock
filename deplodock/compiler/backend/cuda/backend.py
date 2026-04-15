@@ -201,12 +201,20 @@ def _rehydrate_core(core_struct, body_nodes, rename_map=None):
 
     kind = core_struct.get("kind")
     if kind == "contraction":
+        post_stages = tuple(
+            ReduceStage(
+                pre_ops=tuple(n for n in (_node(pid) for pid in s.get("pre_op_ids", [])) if n is not None),
+                reduce=_node(s.get("reduce_id")),
+            )
+            for s in core_struct.get("post_stages", [])
+        )
         return ContractionCore(
             a=Port(buffer_id=_rename(core_struct["a_buffer"])),
             b=Port(buffer_id=_rename(core_struct["b_buffer"])),
             k_axis=core_struct["k_axis"],
             mul=_node(core_struct.get("mul_id")),
             reduce=_node(core_struct.get("reduce_id")),
+            post_stages=post_stages,
         )
     if kind == "reduce":
         stages = []

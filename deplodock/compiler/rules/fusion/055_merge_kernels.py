@@ -205,7 +205,18 @@ def _try_merge(
 
     new_core: object = None
     if isinstance(a_core, ContractionCore):
-        new_core = a_core
+        # Appending a row-reduce kernel to a contraction → record the
+        # downstream stages in post_stages so the backend sees the
+        # combined structure explicitly.
+        new_post = a_core.post_stages + b_core_rewired if b_core_rewired else a_core.post_stages
+        new_core = ContractionCore(
+            a=a_core.a,
+            b=a_core.b,
+            k_axis=a_core.k_axis,
+            mul=a_core.mul,
+            reduce=a_core.reduce,
+            post_stages=new_post,
+        )
     elif isinstance(a_core, tuple) and a_core:
         new_core = a_core + b_core_rewired if b_core_rewired else a_core
     elif b_core_rewired:
