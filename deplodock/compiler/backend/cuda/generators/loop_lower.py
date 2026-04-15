@@ -1014,7 +1014,26 @@ def _input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int
     - per-row → [row]
     - broadcast → [broadcast_index_expr]
     - 2D → [row, j]
+
+    If the input's Port carries an ``indexmap`` (set by
+    070_absorb_indexmap_into_port), the natural indices are first
+    substituted as placeholder coord values into the IndexMap's coord_map
+    to produce the actual input-space indices — this is how
+    transpose-into-matmul / slice-into-matmul load directly.
     """
+    natural = _natural_input_indices(inp, analysis, idx_var, out_size)
+    indexmap = analysis.port_indexmaps.get(inp)
+    if indexmap is None or not indexmap.sources:
+        return natural
+    from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute
+
+    src = indexmap.sources[0]
+    mapping = {f"{PLACEHOLDER_PREFIX}{i}": ix for i, ix in enumerate(natural)}
+    return [substitute(c, mapping) for c in src.coord_map]
+
+
+def _natural_input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> list[LoopExpr]:
+    """Per-dim index expressions assuming no Port.indexmap substitution."""
     acc = analysis.input_access[inp]
     j = Var(idx_var)
     out_shape = analysis.output_shape
