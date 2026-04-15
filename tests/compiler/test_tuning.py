@@ -58,6 +58,15 @@ def _make_matmul_op(m, n, k, *, epilogue_ops=None, extra_inputs=None, extra_inpu
             "shape": (m, n),
             "_region_ops": region_ops,
             "_input_shapes": input_shapes,
+            "_core_struct": {
+                "kind": "contraction",
+                "a_buffer": "A",
+                "b_buffer": "B",
+                "k_axis": 1,
+                "mul_id": "ew",
+                "reduce_id": "red",
+                "post_stages": [],
+            },
         },
     )
 
