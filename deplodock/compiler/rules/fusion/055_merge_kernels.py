@@ -174,11 +174,11 @@ def _try_merge(
     def rewire(node):
         return rewire_node_input(node, a_id, a_last)
 
-    # Flat-prologue convention (mirrors legacy auto_fuse): merged kernel
-    # holds ALL body nodes in a single prologue tuple, in topo order. The
-    # ``core`` field is an annotation that references nodes already in
-    # prologue — backend codegen reads them via the dedup'd ``region_ops``
-    # compat property regardless of which slot they live in.
+    # Flat-prologue convention: merged kernel holds ALL body nodes in a
+    # single prologue tuple, in topo order. ``core`` is an annotation
+    # that references nodes already in prologue — backend codegen reads
+    # them via ``analysis.flat_region_ops(kernel)`` which dedups across
+    # prologue + core + epilogue.
     a_flat = flatten_kernel_nodes(a)
     b_flat = tuple(rewire(n) for n in flatten_kernel_nodes(b))
     new_prologue = a_flat + b_flat

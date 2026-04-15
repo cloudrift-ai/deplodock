@@ -159,7 +159,7 @@ compiler/
 │       ├── backend.py    #  CudaBackend implements Backend ABC
 │       ├── program.py    #  CudaLaunch, TmaDescriptorSpec, source gen, nvcc
 │       ├── generators/   #  Kernel generators
-│       │   ├── analysis.py    #  TileAnalysis: classify FusedRegionOp patterns
+│       │   ├── analysis.py    #  TileAnalysis: classify KernelOp patterns
 │       │   ├── loop_lower.py  #  TileAnalysis → LoopIR (CUDA lowering)
 │       │   ├── loop_codegen.py #  LoopIR → KernelDef (CUDA codegen)
 │       │   └── tiled.py       #  Public API: generate_kernel(), lower_tiled()
@@ -293,7 +293,7 @@ Fusion constraints enforced across rules:
 
 The CUDA backend auto-generates kernels during `compile()` for any `KernelOp` via `generators/tiled.py`. Reshape/transpose ops become buffer aliases (zero-cost pointer assignment, no kernel launch).
 
-`FusedRegionOp` is a legacy dataclass retained as a backend-internal struct (used by `_build_region_and_shapes` to reconstruct region data from serialized plan params). It is no longer emitted into the outer graph — fusion emits `KernelOp`.
+`KernelOp` is a legacy dataclass retained as a backend-internal struct (used by `_build_region_and_shapes` to reconstruct region data from serialized plan params). It is no longer emitted into the outer graph — fusion emits `KernelOp`.
 
 ## CUDA Backend Details
 

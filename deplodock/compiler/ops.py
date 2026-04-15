@@ -439,17 +439,14 @@ class KernelOp(Op):
       - isinstance(core, tuple)            ⇒ reduce chain (1+ ReduceStages)
 
     Each chain stage is a topologically-sorted tuple of primitive Nodes.
-    Cross-stage data flow is implicit: the last node of ``prologue`` feeds
-    the core; the core's output feeds the first node of ``epilogue``. A
-    KernelOp has one external output (Port) by construction; multi-output
-    fusion is a future extension.
+    Cross-stage data flow is implicit: ``prologue`` holds every body node
+    in topo order (flat-prologue convention); ``core`` is an annotation
+    pointing at specific nodes (ReduceStage.reduce, ContractionCore.mul/
+    reduce/post_stages) already in prologue. Backends read the body via
+    ``analysis.flat_region_ops(kernel)`` which dedups across slots.
 
-    ``prologue`` may hold the full flat node list (core=None) for
-    unclassified kernels; the fusion rules in ``rules/fusion/`` restructure
-    them by populating ``core``. The ``region_ops`` / ``input_names`` /
-    ``output_names`` / ``shapes`` compat properties provide a legacy flat
-    view used by backend readers; they will eventually be replaced with
-    direct structured-field consumption.
+    A KernelOp has one external output (Port) by construction;
+    multi-output fusion is a future extension.
     """
 
     inputs: list  # list[Port] — external reads

@@ -140,11 +140,11 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             continue
 
         # Output buffer(s) for this node.
-        # FusedRegionOp / KernelOp may have multiple external outputs — allocate a buffer for each.
+        # KernelOp / KernelOp may have multiple external outputs — allocate a buffer for each.
         if isinstance(op, ops_module.KernelOp) and len([p.buffer_id for p in op.outputs]) > 1:
             outputs = []
             # Map each internal node id to its output shape so we can
-            # resolve per-output buffer shapes without the compat property.
+            # resolve per-output buffer shapes for multi-output kernels.
             internal_shapes: dict = {}
             for n in op.prologue:
                 internal_shapes[n.id] = tuple(n.output.shape)
