@@ -9,10 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from deplodock.compiler.ir import Node
 from deplodock.compiler.ops import AccessPattern, KernelOp
-
-# Type alias for region op tuples: (node_id, op, input_ids)
-RegionEntry = tuple[str, object, list[str]]
 
 
 @dataclass
@@ -23,10 +21,10 @@ class OpPhases:
     ops between reduces[i] and reduces[i+1].
     """
 
-    prologue: list[RegionEntry]
-    reduces: list[RegionEntry]
-    epilogue: list[RegionEntry]
-    inter_reduce: list[list[RegionEntry]] = field(default_factory=list)
+    prologue: list[Node]
+    reduces: list[Node]
+    epilogue: list[Node]
+    inter_reduce: list[list[Node]] = field(default_factory=list)
 
 
 @dataclass

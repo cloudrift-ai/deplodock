@@ -53,8 +53,8 @@ def _run_fused_region(region_node, graph: Graph, inputs: dict[str, list[float]])
             shapes[inp] = graph.nodes[inp].output.shape
     for out in [p.buffer_id for p in op.outputs]:
         # Find the original output shape from the region_ops.
-        for rid, _rop, _ in op.body_ops():
-            if rid in [p.buffer_id for p in op.outputs]:
+        for _node in op.body_ops():
+            if _node.id in [p.buffer_id for p in op.outputs]:
                 # Use the fused node's output shape.
                 pass
         shapes[out] = region_node.output.shape
@@ -74,13 +74,13 @@ def _run_fused_region(region_node, graph: Graph, inputs: dict[str, list[float]])
     launch_args.append(out_name)
 
     # Add dimension args based on kernel type.
-    has_reduce = any(isinstance(rop, ReduceOp) for _, rop, _ in op.body_ops())
+    has_reduce = any(isinstance(n.op, ReduceOp) for n in op.body_ops())
     if has_reduce:
         # Reduction kernel: needs rows, cols.
         # Infer from first reduce input shape.
-        for _, rop, inp_ids in op.body_ops():
-            if isinstance(rop, ReduceOp):
-                inp_shape = shapes.get(inp_ids[0], (1,))
+        for _node in op.body_ops():
+            if isinstance(_node.op, ReduceOp):
+                inp_shape = shapes.get(_node.inputs[0], (1,))
                 if len(inp_shape) >= 2:
                     rows = math.prod(d for d in inp_shape[:-1] if isinstance(d, int))
                     cols = inp_shape[-1] if isinstance(inp_shape[-1], int) else 1
@@ -269,9 +269,9 @@ def test_kernel_gen_silu_mul():
     region_node = fused_nodes[0]
     shapes = {nid: fused.nodes[nid].output.shape for nid in fused.nodes}
     # Add shapes for original nodes referenced by region_ops.
-    for rid, _, _ in region_node.op.body_ops():
-        if rid in g.nodes:
-            shapes[rid] = g.nodes[rid].output.shape
+    for _node in region_node.op.body_ops():
+        if _node.id in g.nodes:
+            shapes[_node.id] = g.nodes[_node.id].output.shape
     source = emit_kernel(generate_kernel(region_node.op, "test_silu_mul", shapes))
     assert "__global__" in source and "void test_silu_mul" in source
     assert "expf" in source

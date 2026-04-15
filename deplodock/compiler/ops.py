@@ -376,11 +376,11 @@ class IndexMapOp(Op):
 # ---------------------------------------------------------------------------
 
 
-def _needed_by_ids(ops: list) -> set:
-    """Set of node ids referenced as inputs by the given (id, op, inputs) tuples."""
+def _needed_by_ids(nodes: list) -> set:
+    """Set of node ids referenced as inputs by the given Nodes."""
     needed: set = set()
-    for _id, _op, input_ids in ops:
-        needed.update(input_ids)
+    for n in nodes:
+        needed.update(n.inputs)
     return needed
 
 
@@ -539,10 +539,12 @@ class KernelOp(Op):
     # ------------------------------------------------------------------
 
     def body_ops(self) -> list:
-        """Flat ``(id, op, inputs)`` view of body nodes in topo order.
+        """Flat ``Node`` view of body nodes in topo order.
 
         Walks prologue + core (ContractionCore.mul/reduce + post_stages,
         or tuple[ReduceStage] pre_ops/reduce) + epilogue, deduped by id.
+        Consumers read ``n.id`` / ``n.op`` / ``n.inputs`` directly — no
+        tuple flattening.
         """
         seen: set[str] = set()
         out: list = []
@@ -551,7 +553,7 @@ class KernelOp(Op):
             if node is None or node.id in seen:
                 return
             seen.add(node.id)
-            out.append((node.id, node.op, list(node.inputs)))
+            out.append(node)
 
         for n in self.prologue:
             emit(n)
@@ -577,40 +579,36 @@ class KernelOp(Op):
 
     def phases(self) -> tuple:
         """Return ``(prologue, reduces, inter_reduce, epilogue)`` as
-        RegionEntry lists. Each list contains ``(id, op, inputs)`` tuples.
+        ``list[Node]`` (with ``inter_reduce`` a ``list[list[Node]]``).
 
         - ``prologue``: pre-reduce ops; for ContractionCore this includes
           the mul appended after user prologue (mul feeds the K-loop).
-        - ``reduces``: one entry per reduce Node in core order.
+        - ``reduces``: one Node per reduce in core order.
         - ``inter_reduce[i]``: pre_ops chain that feeds ``reduces[i+1]``.
         - ``epilogue``: post-last-reduce ops.
         """
-
-        def entry(n):
-            return (n.id, n.op, list(n.inputs))
-
-        prologue = [entry(n) for n in self.prologue]
-        epilogue = [entry(n) for n in self.epilogue]
+        prologue = list(self.prologue)
+        epilogue = list(self.epilogue)
 
         if isinstance(self.core, ContractionCore):
             reduces: list = []
             inter_reduce: list = []
             if self.core.mul is not None:
-                prologue.append(entry(self.core.mul))
+                prologue.append(self.core.mul)
             if self.core.reduce is not None:
-                reduces.append(entry(self.core.reduce))
+                reduces.append(self.core.reduce)
             for stage in self.core.post_stages:
                 if not isinstance(stage, ReduceStage):
                     continue
-                inter_reduce.append([entry(pn) for pn in stage.pre_ops])
+                inter_reduce.append(list(stage.pre_ops))
                 if stage.reduce is not None:
-                    reduces.append(entry(stage.reduce))
+                    reduces.append(stage.reduce)
             return prologue, reduces, inter_reduce, epilogue
 
         if isinstance(self.core, tuple) and self.core:
             stages = [s for s in self.core if isinstance(s, ReduceStage)]
-            reduces = [entry(s.reduce) for s in stages if s.reduce is not None]
-            inter_reduce = [[entry(pn) for pn in s.pre_ops] for s in stages[1:]]
+            reduces = [s.reduce for s in stages if s.reduce is not None]
+            inter_reduce = [list(s.pre_ops) for s in stages[1:]]
             return prologue, reduces, inter_reduce, epilogue
 
         return prologue, [], [], epilogue
@@ -758,7 +756,7 @@ class KernelOp(Op):
             if a_acc and b_acc and a_acc.is_2d and b_acc.is_2d:
                 return cinfo.m, cinfo.n, cinfo.k
 
-        first_reduce_input = reduces[0][2][0]
+        first_reduce_input = reduces[0].inputs[0]
         pre_shape = shapes.get(first_reduce_input, output_shape)
         if len(pre_shape) >= 2:
             rows = _math.prod(d for d in pre_shape[:-1] if isinstance(d, int))
@@ -780,7 +778,7 @@ class KernelOp(Op):
             return False
 
         epilogue_needs_set = _needed_by_ids(epilogue)
-        if any(nid in epilogue_needs_set for nid, _, _ in prologue):
+        if any(n.id in epilogue_needs_set for n in prologue):
             epilogue_needs_set = epilogue_needs_set | _needed_by_ids(prologue)
 
         access = self.input_accesses(shapes, output_shape)
@@ -789,8 +787,8 @@ class KernelOp(Op):
                 acc = access.get(p.buffer_id)
                 if acc and acc.is_2d:
                     return True
-        for nid, _, _ in prologue:
-            if nid in _needed_by_ids(epilogue):
+        for n in prologue:
+            if n.id in _needed_by_ids(epilogue):
                 return True
         return False
 

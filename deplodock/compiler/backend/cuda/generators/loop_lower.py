@@ -163,9 +163,9 @@ def _emit_accumulators(schedule: Schedule, analysis: TileAnalysis) -> list:
 
     if accum.shape == ():
         # Scalar accumulators (one per reduce op)
-        for node_id, op, _ in analysis.op_phases.reduces:
-            acc_name = f"acc_{_safe(node_id)}"
-            ops.append(AccumInit(acc_name, op.fn))
+        for _node in analysis.op_phases.reduces:
+            acc_name = f"acc_{_safe(_node.id)}"
+            ops.append(AccumInit(acc_name, _node.op.fn))
         return ops
 
     # 2D register tile (contraction)
@@ -270,17 +270,17 @@ def _recompute_ops_into(
     """
     from deplodock.compiler.ops import IndexMapOp as _IndexMapOp
 
-    for pid, pop, pinp in ops:
-        if needed is not None and pid not in needed:
+    for _node in ops:
+        if needed is not None and _node.id not in needed:
             continue
-        if isinstance(pop, _IndexMapOp):
-            _emit_indexmap(pid, pop, pinp, var_map, prefix, body, coord_mapping, shapes, include_ids)
-        elif isinstance(pop, ElementwiseOp):
-            a = var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
-            b = var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
-            var_name = f"{prefix}{_safe(pid)}"
-            body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-            var_map[pid] = Var(var_name)
+        if isinstance(_node.op, _IndexMapOp):
+            _emit_indexmap(_node.id, _node.op, _node.inputs, var_map, prefix, body, coord_mapping, shapes, include_ids)
+        elif isinstance(_node.op, ElementwiseOp):
+            a = var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
+            b = var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
+            var_name = f"{prefix}{_safe(_node.id)}"
+            body.append(Let(var_name, OpCall(_node.op.fn, [a] if len(_node.inputs) == 1 else [a, b])))
+            var_map[_node.id] = Var(var_name)
 
 
 def _emit_pointwise_body(
@@ -321,21 +321,23 @@ def _emit_scalar_reductions(
 
     # Pre-reduction shape (input to the first reduce) — used to build the
     # IndexMap coord substitution for any IndexMaps inside the region.
-    first_reduce_input = phases.reduces[0][2][0] if phases.reduces else None
+    first_reduce_input = phases.reduces[0].inputs[0] if phases.reduces else None
     pre_shape = shapes.get(first_reduce_input, out_shape) if first_reduce_input else out_shape
     coord_mapping = _build_reduce_coord_mapping(pre_shape, Var("row"), Var("j"))
 
     # Accumulator allocs were already emitted in phase 2; build var tracking.
     reduce_vars: dict[str, tuple[str, str]] = {}
-    for node_id, op, _ in phases.reduces:
-        acc_name = f"acc_{_safe(node_id)}"
-        reduce_vars[node_id] = (acc_name, op.fn)
+    for _node in phases.reduces:
+        acc_name = f"acc_{_safe(_node.id)}"
+        reduce_vars[_node.id] = (acc_name, _node.op.fn)
 
     var_map: dict[str, LoopExpr] = {}
 
     # One tile loop per reduce pass. For single-reduce this is one pass;
     # for multi-reduce (softmax) it's one per reduce with inter-reduce ops between.
-    for ri, (node_id, _op, input_ids) in enumerate(phases.reduces):
+    for ri, _node in enumerate(phases.reduces):
+        node_id = _node.id
+        input_ids = _node.inputs
         acc_name, fn = reduce_vars[node_id]
         pass_body: list = []
 
@@ -346,8 +348,8 @@ def _emit_scalar_reductions(
             pass_var_map[prev_nid] = Var(prev_acc)
 
         all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
-        needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
-        prologue_ids = {pid for pid, _, _ in phases.prologue}
+        needed = _needed_by(all_ops_this_pass + [_node])
+        prologue_ids = {pn.id for pn in phases.prologue}
         _recompute_ops_into(
             phases.prologue,
             pass_var_map,
@@ -536,7 +538,9 @@ def _emit_online_contraction_reduce(
         """Apply a chain of Elementwise ops, threading per-row running
         reduction vars as the binary-op partner when the op references them.
         """
-        for _op_id, op_obj, op_inputs in op_entries:
+        for entry in op_entries:
+            op_obj = entry.op
+            op_inputs = entry.inputs
             if not isinstance(op_obj, ElementwiseOp):
                 continue
             if op_obj.info.arity == 1:
@@ -566,11 +570,11 @@ def _emit_online_contraction_reduce(
     # tile.  Each thread handles thread_m rows, so we need thread_m variables
     # per reduce.  reduce_running maps node_id → base name (append {r} for row).
     reduce_running: dict[str, str] = {}  # node_id → base var name (e.g. "running_mx")
-    for node_id, r_op, _ in n_reduces:
-        base = f"running_{_safe(node_id)}"
-        reduce_running[node_id] = base
+    for rn in n_reduces:
+        base = f"running_{_safe(rn.id)}"
+        reduce_running[rn.id] = base
         for r in range(thread_m):
-            ops.append(AccumInit(f"{base}{r}", r_op.fn))
+            ops.append(AccumInit(f"{base}{r}", rn.op.fn))
 
     # ---------------------------------------------------------------
     # Loop 1: K-loop + post-contraction ops + head N-reduce + write raw scores
@@ -587,7 +591,7 @@ def _emit_online_contraction_reduce(
 
     # Apply inter_reduce[0] ops on register tile (ops between contraction
     # reduce and first N-reduce, e.g. scale multiplication).
-    contraction_id = phases.reduces[0][0]
+    contraction_id = phases.reduces[0].id
     if n_inter:
         loop1_body.extend(
             _apply_ops_on_register_tile(
@@ -602,7 +606,9 @@ def _emit_online_contraction_reduce(
         )
 
     # Head N-reduce (n_reduces[0], e.g. max) via warp_xor per row
-    head_id, head_op, head_inputs = n_reduces[0]
+    head_node = n_reduces[0]
+    head_id = head_node.id
+    head_op = head_node.op
     head_running = reduce_running[head_id]
     for r in range(thread_m):
         tvar = f"tile_{_safe(head_id)}_{r}"
@@ -637,7 +643,9 @@ def _emit_online_contraction_reduce(
     # Loop 2..len(n_reduces): compute subsequent N-axis reduces
     # ---------------------------------------------------------------
     for ri in range(1, len(n_reduces)):
-        red_id, red_op, red_inputs = n_reduces[ri]
+        red_node = n_reduces[ri]
+        red_id = red_node.id
+        red_op = red_node.op
         red_running = reduce_running[red_id]
         # inter_reduce between n_reduces[ri-1] and n_reduces[ri] is
         # phases.inter_reduce[ri] (offset by 1 because inter_reduce[0]
@@ -763,8 +771,8 @@ def _emit_scalar_epilogue(
         return []
 
     reduce_vars: dict[str, tuple[str, str]] = {}
-    for node_id, op, _ in phases.reduces:
-        reduce_vars[node_id] = (f"acc_{_safe(node_id)}", op.fn)
+    for _node in phases.reduces:
+        reduce_vars[_node.id] = (f"acc_{_safe(_node.id)}", _node.op.fn)
 
     var_map: dict[str, LoopExpr] = {}
     for node_id, (acc_name, _fn) in reduce_vars.items():
@@ -781,7 +789,7 @@ def _emit_scalar_epilogue(
 
         # Coord mapping for IndexMaps: epilogue iterates per-element over output
         # at (row, j); pre-reduction shape governs how row decomposes for >2D.
-        first_reduce_input = phases.reduces[0][2][0] if phases.reduces else None
+        first_reduce_input = phases.reduces[0].inputs[0] if phases.reduces else None
         pre_shape = shapes.get(first_reduce_input, out_shape) if first_reduce_input else out_shape
         coord_mapping = _build_reduce_coord_mapping(pre_shape, Var("row"), Var("j"))
 
@@ -791,10 +799,10 @@ def _emit_scalar_epilogue(
         # Compute transitive closure of "needed" over recompute_ops so a
         # downstream epilogue op pulls in its prologue producers' producers.
         needed = set(_needed_by(phases.epilogue))
-        for pid, _pop, pinp in reversed(recompute_ops):
-            if pid in needed:
-                needed.update(pinp)
-        recompute_ids = {pid for pid, _, _ in recompute_ops}
+        for _node in reversed(recompute_ops):
+            if _node.id in needed:
+                needed.update(_node.inputs)
+        recompute_ids = {_node.id for _node in recompute_ops}
         _recompute_ops_into(
             recompute_ops,
             epi_var_map,
@@ -854,8 +862,8 @@ def _emit_write(
     # Scalar reduction write
     phases = analysis.op_phases
     reduce_vars: dict[str, tuple[str, str]] = {}
-    for node_id, op, _ in phases.reduces:
-        reduce_vars[node_id] = (f"acc_{_safe(node_id)}", op.fn)
+    for _node in phases.reduces:
+        reduce_vars[_node.id] = (f"acc_{_safe(_node.id)}", _node.op.fn)
 
     var_map: dict[str, LoopExpr] = {}
     for node_id, (acc_name, _fn) in reduce_vars.items():
@@ -1159,30 +1167,30 @@ def _emit_loop_ops(
     """
     from deplodock.compiler.ops import IndexMapOp
 
-    in_region_ids = {nid for nid, _, _ in ops}
+    in_region_ids = {n.id for n in ops}
 
-    for node_id, op, input_ids in ops:
-        if isinstance(op, (ReshapeOp, TransposeOp)):
-            if input_ids and input_ids[0] in var_map:
-                var_map[node_id] = var_map[input_ids[0]]
+    for _node in ops:
+        if isinstance(_node.op, (ReshapeOp, TransposeOp)):
+            if _node.inputs and _node.inputs[0] in var_map:
+                var_map[_node.id] = var_map[_node.inputs[0]]
             continue
 
-        if isinstance(op, IndexMapOp):
+        if isinstance(_node.op, IndexMapOp):
             if coord_mapping is None or shapes is None:
                 raise RuntimeError(
-                    f"IndexMapOp {node_id} reached _emit_loop_ops without coord_mapping/shapes; "
+                    f"IndexMapOp {_node.id} reached _emit_loop_ops without coord_mapping/shapes; "
                     "the calling pattern lowering must build and pass them."
                 )
-            _emit_indexmap(node_id, op, input_ids, var_map, prefix, body, coord_mapping, shapes, in_region_ids)
+            _emit_indexmap(_node.id, _node.op, _node.inputs, var_map, prefix, body, coord_mapping, shapes, in_region_ids)
             continue
 
-        if isinstance(op, ElementwiseOp):
-            a = var_map.get(input_ids[0], Literal(0.0)) if input_ids else Literal(0.0)
-            b = var_map.get(input_ids[1], Literal(0.0)) if len(input_ids) > 1 else Literal(0.0)
-            var_name = f"{prefix}{_safe(node_id)}"
-            args = [a, b] if op.info.arity == 2 and len(input_ids) > 1 else [a]
-            body.append(Let(var_name, OpCall(op.fn, args)))
-            var_map[node_id] = Var(var_name)
+        if isinstance(_node.op, ElementwiseOp):
+            a = var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
+            b = var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
+            var_name = f"{prefix}{_safe(_node.id)}"
+            args = [a, b] if _node.op.info.arity == 2 and len(_node.inputs) > 1 else [a]
+            body.append(Let(var_name, OpCall(_node.op.fn, args)))
+            var_map[_node.id] = Var(var_name)
 
 
 def _row_major_strides(shape: tuple) -> list[int]:
@@ -1331,7 +1339,7 @@ def _contraction_epilogue_ops(
         return []
 
     # Track the "previous" node ID through the op chain.
-    prev_id = phases.reduces[0][0]
+    prev_id = phases.reduces[0].id
 
     # Per-row reduce result variables: reduce_node_id → "rXXX{r}" template
     reduce_row_vars: dict[str, str] = {}
@@ -1407,15 +1415,15 @@ def _apply_ops_on_register_tile(
     ops: list = []
     extra = extra_vars or {}
 
-    for nid, ir_op, inputs in op_list:
-        if not isinstance(ir_op, ElementwiseOp):
+    for _node in op_list:
+        if not isinstance(_node.op, ElementwiseOp):
             continue
-        fn = ir_op.fn
+        fn = _node.op.fn
 
         # Find the "other" input (not the accumulator chain) for binary ops.
         other = None
-        if ir_op.info.arity == 2 and len(inputs) == 2:
-            for inp in inputs:
+        if _node.op.info.arity == 2 and len(_node.inputs) == 2:
+            for inp in _node.inputs:
                 if inp != prev_id:
                     other = inp
                     break
@@ -1430,7 +1438,7 @@ def _apply_ops_on_register_tile(
                 if other is not None and other in extra:
                     # Per-row variable (rmax, rsum)
                     other_val = Var(extra[other].format(r=r))
-                    if inputs[0] == prev_id:
+                    if _node.inputs[0] == prev_id:
                         ops.append(SetVar(dst, OpCall(fn, [acc, other_val])))
                     else:
                         ops.append(SetVar(dst, OpCall(fn, [other_val, acc])))
@@ -1449,7 +1457,7 @@ def _apply_ops_on_register_tile(
                         indices = [row_e, col_e]
                     ld_name = f"_{prefix}_{safe}_{r}_{c}"
                     ops.append(Load(ld_name, safe, indices, "global"))
-                    if inputs[0] == prev_id:
+                    if _node.inputs[0] == prev_id:
                         ops.append(SetVar(dst, OpCall(fn, [acc, Var(ld_name)])))
                     else:
                         ops.append(SetVar(dst, OpCall(fn, [Var(ld_name), acc])))
@@ -1457,7 +1465,7 @@ def _apply_ops_on_register_tile(
                     # Unary op on accumulator
                     ops.append(SetVar(dst, OpCall(fn, [acc])))
 
-        prev_id = nid
+        prev_id = _node.id
 
     return ops
 
