@@ -1,7 +1,7 @@
 """Validate the new rule-based KernelOp assembly path end-to-end.
 
 The seed + absorb rules are staged with underscore-prefixed filenames
-(e.g. `_020_seed_contraction.py`) so they don't run through the default
+(e.g. `020_seed_contraction.py`) so they don't run through the default
 Rewriter pipeline while the backend is still consuming the old
 flat-prologue format. These tests load the new rules directly and run
 them against hand-crafted raw-op graphs, asserting structural output.
@@ -74,7 +74,7 @@ def test_020_seed_contraction_emits_contraction_core():
     red = g.add_node(ReduceOp("sum", axis=1), [mul], Tensor("C", (4, 16)), node_id="C")
     g.outputs = [red]
 
-    result = _apply_rule(g, "_020_seed_contraction")
+    result = _apply_rule(g, "020_seed_contraction")
 
     # Expect one KernelOp with ContractionCore.
     kernels = [n for n in result.nodes.values() if isinstance(n.op, KernelOp)]
@@ -100,7 +100,7 @@ def test_021_seed_reduce_emits_reduce_stage():
     red = g.add_node(ReduceOp("sum", axis=-1), [x], Tensor("y", (8,)), node_id="y")
     g.outputs = [red]
 
-    result = _apply_rule(g, "_021_seed_reduce")
+    result = _apply_rule(g, "021_seed_reduce")
 
     kernels = [n for n in result.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(kernels) == 1
@@ -120,7 +120,7 @@ def test_040_seed_pointwise_wraps_standalone_elementwise():
     add = g.add_node(ElementwiseOp("add"), [x, y], Tensor("z", (4,)), node_id="z")
     g.outputs = [add]
 
-    result = _apply_rule(g, "_040_seed_pointwise")
+    result = _apply_rule(g, "040_seed_pointwise")
 
     kernels = [n for n in result.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(kernels) == 1
@@ -166,7 +166,7 @@ def test_050_absorb_prologue_grows_pointwise_kernel():
     kid = g.add_node(op=kop, inputs=[mul_node, z], output=Tensor("out", (4,), "f32"), node_id="out")
     g.outputs = [kid]
 
-    result = _apply_rule(g, "_050_absorb_prologue")
+    result = _apply_rule(g, "050_absorb_prologue")
 
     kernels = [n for n in result.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(kernels) == 1
@@ -208,7 +208,7 @@ def test_060_absorb_epilogue_appends_downstream_elementwise():
     nid = g.add_node(ElementwiseOp("relu"), [kid], Tensor("out", (4,)), node_id="out")
     g.outputs = [nid]
 
-    result = _apply_rule(g, "_060_absorb_epilogue")
+    result = _apply_rule(g, "060_absorb_epilogue")
 
     kernels = [n for n in result.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(kernels) == 1
@@ -230,8 +230,8 @@ def test_assembly_pipeline_runs_for_matmul_plus_bias():
     add = g.add_node(ElementwiseOp("add"), [red, bias], Tensor("y", (4, 16)), node_id="y")
     g.outputs = [add]
 
-    g = _apply_rule(g, "_020_seed_contraction")
-    g = _apply_rule(g, "_060_absorb_epilogue")
+    g = _apply_rule(g, "020_seed_contraction")
+    g = _apply_rule(g, "060_absorb_epilogue")
 
     kernels = [n for n in g.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(kernels) == 1
