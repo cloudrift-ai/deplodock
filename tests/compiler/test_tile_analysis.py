@@ -12,20 +12,20 @@ from tests.compiler._kernel_builder import build_kernel
 
 
 def _fuse_and_analyze(g: Graph):
-    """Auto-fuse a graph and return TileAnalysis for the first fused region."""
+    """Auto-fuse a graph and return ``(kernel, TileAnalysis)`` for the first fused region."""
     fused = auto_fuse(g)
     for nd in fused.nodes.values():
         if isinstance(nd.op, KernelOp):
             shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
             for nid in fused.nodes:
                 shapes[nid] = fused.nodes[nid].output.shape
-            return analyze(nd.op, shapes)
-    raise AssertionError("No FusedRegionOp found")
+            return nd.op, analyze(nd.op, shapes)
+    raise AssertionError("No KernelOp found")
 
 
 def _analyze_manual(region: KernelOp, shapes: dict):
-    """Analyze a manually-constructed KernelOp."""
-    return analyze(region, shapes)
+    """Analyze a manually-constructed KernelOp; returns (region, analysis)."""
+    return region, analyze(region, shapes)
 
 
 def test_pointwise_silu():
@@ -41,10 +41,10 @@ def test_pointwise_silu():
     out = g.add_node(ElementwiseOp("mul"), [gate, recip], Tensor("out", (256,)), node_id="out")
     g.outputs = [out]
 
-    analysis = _fuse_and_analyze(g)
+    kernel, analysis = _fuse_and_analyze(g)
     assert analysis.pattern == "pointwise"
-    assert len(analysis.op_phases.reduces) == 0
-    assert len(analysis.op_phases.prologue) > 0
+    assert len(kernel.phases()[1]) == 0
+    assert len(kernel.phases()[0]) > 0
 
 
 def test_row_reduce_sum():
@@ -57,7 +57,7 @@ def test_row_reduce_sum():
         shapes=shapes,
     )
 
-    analysis = _analyze_manual(region, shapes)
+    kernel, analysis = _analyze_manual(region, shapes)
     assert analysis.pattern == "row_reduce"
     assert analysis.rows == 8
     assert analysis.cols == 64
@@ -80,7 +80,7 @@ def test_reduce_broadcast_rmsnorm():
     out = g.add_node(ElementwiseOp("mul"), [norm, w], Tensor("out", (4, 128)), node_id="out")
     g.outputs = [out]
 
-    analysis = _fuse_and_analyze(g)
+    kernel, analysis = _fuse_and_analyze(g)
     assert analysis.pattern == "reduce_broadcast"
     assert analysis.rows == 4
     assert analysis.cols == 128
@@ -129,7 +129,7 @@ def test_contraction_matmul():
     out = g.add_node(ReduceOp("sum", axis=1), [ew], Tensor("C", (4, 6)), node_id="C")
     g.outputs = [out]
 
-    analysis = _fuse_and_analyze(g)
+    kernel, analysis = _fuse_and_analyze(g)
     assert analysis.pattern == "contraction"
     assert analysis.rows == 4
     assert analysis.cols == 6
@@ -158,13 +158,13 @@ def test_contraction_with_epilogue():
         output_names=["ba"],
         shapes=shapes,
     )
-    analysis = _analyze_manual(region, shapes)
+    kernel, analysis = _analyze_manual(region, shapes)
     assert analysis.pattern == "contraction"
     assert analysis.rows == 4
     assert analysis.cols == 6
     assert analysis.k_dim == 8
-    assert len(analysis.op_phases.epilogue) == 1
-    epi_node = analysis.op_phases.epilogue[0]
+    assert len(kernel.phases()[3]) == 1
+    epi_node = kernel.phases()[3][0]
     assert epi_node.op.fn == "add"
 
 
@@ -183,7 +183,7 @@ def test_input_access_patterns():
     out = g.add_node(ElementwiseOp("mul"), [norm, w], Tensor("out", (4, 128)), node_id="out")
     g.outputs = [out]
 
-    analysis = _fuse_and_analyze(g)
+    kernel, analysis = _fuse_and_analyze(g)
     assert analysis.input_access["x"].is_2d
     assert analysis.input_access["w"].is_row_vector
     assert analysis.input_access["eps"].is_scalar

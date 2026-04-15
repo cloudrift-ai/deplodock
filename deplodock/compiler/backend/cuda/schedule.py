@@ -155,7 +155,7 @@ def build_schedule(
             dim_params.append(("int", "k_splits"))
 
         # Contraction + multi-reduce (e.g. softmax): use 1D grid with N-tiling.
-        has_multi_reduce = len(analysis.op_phases.reduces) > 1
+        has_multi_reduce = len(analysis.reduce_fns) > 1
         if has_multi_reduce:
             grid_type = "1d_contraction"
             k_splits = 1  # incompatible with online reduction
@@ -207,7 +207,7 @@ def build_schedule(
         )
 
     # row_reduce or reduce_broadcast
-    n_reduces = len(analysis.op_phases.reduces)
+    n_reduces = len(analysis.reduce_fns)
     reduce_specs = []
     for _i in range(n_reduces):
         reduce_specs.append(
