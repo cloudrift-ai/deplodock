@@ -184,6 +184,8 @@ def test_input_access_patterns():
     g.outputs = [out]
 
     kernel, analysis = _fuse_and_analyze(g)
-    assert analysis.input_access["x"].is_2d
-    assert analysis.input_access["w"].is_row_vector
-    assert analysis.input_access["eps"].is_scalar
+    shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
+    access = kernel.input_accesses(shapes, analysis.output_shape)
+    assert access["x"].is_2d
+    assert access["w"].is_row_vector
+    assert access["eps"].is_scalar

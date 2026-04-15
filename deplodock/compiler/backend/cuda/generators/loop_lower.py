@@ -95,7 +95,7 @@ def lower_generic(
         name=name,
         params=params,
         body=body,
-        dim_strides=_build_dim_strides(analysis, region, schedule),
+        dim_strides=_build_dim_strides(analysis, region, shapes, schedule),
     )
 
 
@@ -241,6 +241,7 @@ def _dispatch_k_loop(
 
 def _emit_input_loads(
     region: KernelOp,
+    shapes: dict[str, tuple],
     analysis: TileAnalysis,
     idx_var: str,
     prefix: str,
@@ -254,7 +255,7 @@ def _emit_input_loads(
     three previously duplicated this loop with only prefix / idx_var differing.
     """
     for inp in [p.buffer_id for p in region.inputs]:
-        indices = _input_indices(inp, analysis, idx_var, out_size)
+        indices = _input_indices(inp, region, shapes, analysis, idx_var, out_size)
         load_name = f"{prefix}{_safe(inp)}"
         body.append(Load(load_name, _safe(inp), indices, "global"))
         var_map[inp] = Var(load_name)
@@ -303,7 +304,7 @@ def _emit_pointwise_body(
 
     guard_body: list = []
     var_map: dict[str, LoopExpr] = {}
-    _emit_input_loads(region, analysis, "i", "v_", guard_body, var_map, out_size)
+    _emit_input_loads(region, shapes, analysis, "i", "v_", guard_body, var_map, out_size)
 
     coord_mapping = _build_pointwise_coord_mapping(out_shape)
     _emit_loop_ops(region.body_ops(), var_map, "v_", guard_body, coord_mapping=coord_mapping, shapes=shapes)
@@ -350,7 +351,7 @@ def _emit_scalar_reductions(
         pass_body: list = []
 
         pass_var_map: dict[str, LoopExpr] = {}
-        _emit_input_loads(region, analysis, "j", f"r{ri}ld_", pass_body, pass_var_map, out_size)
+        _emit_input_loads(region, shapes, analysis, "j", f"r{ri}ld_", pass_body, pass_var_map, out_size)
 
         for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
             pass_var_map[prev_nid] = Var(prev_acc)
@@ -792,7 +793,7 @@ def _emit_scalar_epilogue(
         epi_body: list = []
         epi_var_map: dict[str, LoopExpr] = dict(var_map)
 
-        _emit_input_loads(region, analysis, "j", "epld_", epi_body, epi_var_map, out_size)
+        _emit_input_loads(region, shapes, analysis, "j", "epld_", epi_body, epi_var_map, out_size)
 
         # Coord mapping for IndexMaps: epilogue iterates per-element over output
         # at (row, j); pre-reduction shape governs how row decomposes for >2D.
@@ -955,13 +956,19 @@ def _safe(name: str) -> str:
     return name.replace("-", "_").replace(".", "_").replace(" ", "_")
 
 
-def _build_dim_strides(analysis: TileAnalysis, region: KernelOp, schedule) -> dict[str, list[str]]:
+def _build_dim_strides(
+    analysis: TileAnalysis,
+    region: KernelOp,
+    shapes: dict[str, tuple],
+    schedule,
+) -> dict[str, list[str]]:
     """Build per-buffer stride variable names for multi-dim index flattening.
 
     Contraction buffers use M/N/K strides.  Reduction buffers use "cols".
     Pointwise buffers use a single flat index (no strides needed).
     """
     strides: dict[str, list[str]] = {}
+    input_access = region.input_accesses(shapes, analysis.output_shape)
 
     if analysis.pattern == "contraction" and analysis.contraction_a:
         a = _safe(analysis.contraction_a)
@@ -980,13 +987,13 @@ def _build_dim_strides(analysis: TileAnalysis, region: KernelOp, schedule) -> di
         for inp in [p.buffer_id for p in region.inputs]:
             safe = _safe(inp)
             if safe not in strides:
-                acc = analysis.input_access.get(inp)
+                acc = input_access.get(inp)
                 if acc and acc.is_2d:
                     strides[safe] = ["N"]
     elif analysis.pattern in ("row_reduce", "reduce_broadcast", "multi_reduce"):
         # All 2D buffers use "cols" stride
         for inp in [p.buffer_id for p in region.inputs]:
-            acc = analysis.input_access.get(inp)
+            acc = input_access.get(inp)
             if acc and acc.is_2d:
                 strides[_safe(inp)] = ["cols"]
         for out_id in [p.buffer_id for p in region.outputs]:
@@ -1033,7 +1040,14 @@ def _broadcast_index_expr(
     return result
 
 
-def _input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> list[LoopExpr]:
+def _input_indices(
+    inp: str,
+    region: KernelOp,
+    shapes: dict[str, tuple],
+    analysis: TileAnalysis,
+    idx_var: str,
+    out_size: int = 0,
+) -> list[LoopExpr]:
     """Build per-dimension index expressions for reading an input tensor.
 
     Returns a list of index expressions, one per logical dimension:
@@ -1050,7 +1064,7 @@ def _input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int
     to produce the actual input-space indices — this is how
     transpose-into-matmul / slice-into-matmul load directly.
     """
-    natural = _natural_input_indices(inp, analysis, idx_var, out_size)
+    natural = _natural_input_indices(inp, region, shapes, analysis, idx_var, out_size)
     indexmap = analysis.port_indexmaps.get(inp)
     if indexmap is None or not indexmap.sources:
         return natural
@@ -1061,9 +1075,16 @@ def _input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int
     return [substitute(c, mapping) for c in src.coord_map]
 
 
-def _natural_input_indices(inp: str, analysis: TileAnalysis, idx_var: str, out_size: int = 0) -> list[LoopExpr]:
+def _natural_input_indices(
+    inp: str,
+    region: KernelOp,
+    shapes: dict[str, tuple],
+    analysis: TileAnalysis,
+    idx_var: str,
+    out_size: int = 0,
+) -> list[LoopExpr]:
     """Per-dim index expressions assuming no Port.indexmap substitution."""
-    acc = analysis.input_access[inp]
+    acc = region.input_accesses(shapes, analysis.output_shape)[inp]
     j = Var(idx_var)
     out_shape = analysis.output_shape
 

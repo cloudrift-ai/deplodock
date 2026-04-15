@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import AccessPattern, KernelOp
+from deplodock.compiler.ops import KernelOp
 
 
 @dataclass
@@ -24,7 +24,6 @@ class TileAnalysis:
     pattern: str  # "pointwise" | "row_reduce" | "reduce_broadcast" | "contraction"
     output_shape: tuple[int, ...]
     reduce_fns: list[str]  # ["sum"], ["max", "sum"], etc.
-    input_access: dict[str, AccessPattern]  # per external input
     # Dimensions (concrete ints, derived from shapes).
     rows: int  # product of non-reduced dims (M for contraction, rows for reduce)
     cols: int  # last dim of the pre-reduction tensor (N for contraction, cols for reduce)
@@ -64,7 +63,6 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
         pattern=region.tile_pattern(shapes, out_shape),
         output_shape=out_shape,
         reduce_fns=region.reduce_fn_names(),
-        input_access=region.input_accesses(shapes, out_shape),
         rows=rows,
         cols=cols,
         k_dim=k_dim,
