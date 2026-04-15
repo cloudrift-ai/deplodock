@@ -34,7 +34,7 @@ from deplodock.compiler.backend.ir.loop_ir import (
     Store,
     Var,
 )
-from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReshapeOp, TransposeOp
+from deplodock.compiler.ops import ElementwiseOp, KernelOp
 from deplodock.compiler.ops import _needed_by_ids as _needed_by
 
 if TYPE_CHECKING:
@@ -1275,11 +1275,6 @@ def _emit_loop_ops(
     in_region_ids = {n.id for n in ops}
 
     for _node in ops:
-        if isinstance(_node.op, (ReshapeOp, TransposeOp)):
-            if _node.inputs and _node.inputs[0] in var_map:
-                var_map[_node.id] = var_map[_node.inputs[0]]
-            continue
-
         if isinstance(_node.op, IndexMapOp):
             if coord_mapping is None or shapes is None:
                 raise RuntimeError(

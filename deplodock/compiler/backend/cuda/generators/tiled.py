@@ -37,7 +37,7 @@ from deplodock.compiler.backend.ir.kernel_ir import (
     Var,
     VarDecl,
 )
-from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReshapeOp, TransposeOp
+from deplodock.compiler.ops import ElementwiseOp, KernelOp
 from deplodock.compiler.ops import _needed_by_ids as _needed_by
 
 
@@ -521,11 +521,6 @@ def _emit_ops(
     """
     stmts = []
     for _node in ops:
-        if isinstance(_node.op, (ReshapeOp, TransposeOp)):
-            if _node.inputs and _node.inputs[0] in var_map:
-                var_map[_node.id] = var_map[_node.inputs[0]]
-            continue
-
         if isinstance(_node.op, ElementwiseOp):
             a = var_map.get(_node.inputs[0], Literal(0.0)) if _node.inputs else Literal(0.0)
             b = var_map.get(_node.inputs[1], Literal(0.0)) if len(_node.inputs) > 1 else Literal(0.0)
