@@ -156,16 +156,66 @@ def _build_region_and_shapes(op: OpKernel):
     input_shapes = op.params.get("_input_shapes", {})
     external_shapes = {name: tuple(shapes.get(name, input_shapes.get(name, ()))) for name in input_names}
 
+    rename_map: dict[str, str] = {}
+    if original_input_names != list(op.inputs) or original_output_names != list(op.outputs):
+        rename_map = dict(zip(original_input_names, op.inputs, strict=False))
+        rename_map.update(dict(zip(original_output_names, op.outputs, strict=False)))
+    core = _rehydrate_core(op.params.get("_core_struct"), body_nodes, rename_map)
+
     kernel = KernelOp(
         inputs=[Port(buffer_id=name) for name in input_names],
         outputs=[Port(buffer_id=name) for name in output_names],
         prologue=body_nodes,
-        core=None,
+        core=core,
         epilogue=(),
         kernel_source=op.params.get("kernel_source", ""),
         external_shapes=external_shapes,
     )
     return kernel, shapes
+
+
+def _rehydrate_core(core_struct, body_nodes, rename_map=None):
+    """Rebuild ContractionCore / tuple[ReduceStage] from the plan annotation.
+
+    ``body_nodes`` is the flat reconstructed prologue; we re-link by node
+    id. ``rename_map`` applies the plan-level buffer remapping so contraction
+    a/b buffer lookups find the input_access entries, and internal node
+    ids collide-renamed to output_names (e.g. ``c`` → ``n0``) still resolve.
+    Returns None when the annotation is absent (legacy plans).
+    """
+    if not core_struct:
+        return None
+    from deplodock.compiler.ops import ContractionCore, Port, ReduceStage
+
+    rmap = rename_map or {}
+
+    def _rename(buf):
+        return rmap.get(buf, buf)
+
+    by_id = {n.id: n for n in body_nodes}
+
+    def _node(nid):
+        if nid is None:
+            return None
+        return by_id.get(_rename(nid)) or by_id.get(nid)
+
+    kind = core_struct.get("kind")
+    if kind == "contraction":
+        return ContractionCore(
+            a=Port(buffer_id=_rename(core_struct["a_buffer"])),
+            b=Port(buffer_id=_rename(core_struct["b_buffer"])),
+            k_axis=core_struct["k_axis"],
+            mul=_node(core_struct.get("mul_id")),
+            reduce=_node(core_struct.get("reduce_id")),
+        )
+    if kind == "reduce":
+        stages = []
+        for s in core_struct.get("stages", []):
+            red = _node(s.get("reduce_id"))
+            pre_ops = tuple(n for n in (_node(pid) for pid in s.get("pre_op_ids", [])) if n is not None)
+            stages.append(ReduceStage(pre_ops=pre_ops, reduce=red))
+        return tuple(stages) if stages else None
+    return None
 
 
 def _select_strategy(op: OpKernel, analysis) -> tuple[str, dict]:

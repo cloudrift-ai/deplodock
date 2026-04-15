@@ -228,14 +228,41 @@ def _split_phases(kernel: KernelOp) -> OpPhases:
     - ``None``: pure pointwise — all nodes in prologue.
     """
     if isinstance(kernel.core, ContractionCore):
-        prologue = [_node_entry(n) for n in kernel.prologue]
-        if kernel.core.mul is not None:
-            prologue.append(_node_entry(kernel.core.mul))
-        reduces: list[RegionEntry] = []
-        if kernel.core.reduce is not None:
-            reduces.append(_node_entry(kernel.core.reduce))
-        epilogue = [_node_entry(n) for n in kernel.epilogue]
-        return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=[])
+        # Detect whether the kernel is a pure contraction (only mul + reduce
+        # in prologue) or a combined core (contraction + downstream row
+        # reduces, e.g. matmul→softmax fusion). Pure case has a
+        # deterministic phase layout; the combined case needs the inline
+        # scan to establish the reduce/inter_reduce alternation.
+        mul_id = kernel.core.mul.id if kernel.core.mul is not None else None
+        reduce_id = kernel.core.reduce.id if kernel.core.reduce is not None else None
+        extras = [n for n in kernel.prologue if isinstance(n.op, ReduceOp) and n.id != reduce_id]
+        if not extras:
+            # Pure contraction (possibly with pre-reduce and/or post-reduce
+            # elementwise ops). Walk kernel.prologue in order; nodes appearing
+            # before the contraction reduce go into phases.prologue (feed
+            # into the K-loop), nodes appearing after go into phases.epilogue.
+            prologue: list[RegionEntry] = []
+            post_reduce: list[RegionEntry] = []
+            seen_reduce = False
+            for n in kernel.prologue:
+                if n.id == mul_id or n.id == reduce_id:
+                    if n.id == reduce_id:
+                        seen_reduce = True
+                    continue
+                if seen_reduce:
+                    post_reduce.append(_node_entry(n))
+                else:
+                    prologue.append(_node_entry(n))
+            if kernel.core.mul is not None:
+                prologue.append(_node_entry(kernel.core.mul))
+            reduces: list[RegionEntry] = []
+            if kernel.core.reduce is not None:
+                reduces.append(_node_entry(kernel.core.reduce))
+            epilogue = post_reduce + [_node_entry(n) for n in kernel.epilogue]
+            return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=[])
+        # Combined contraction + row-reduce chain — fall through to the
+        # unstructured scan branch below; it walks prologue + epilogue and
+        # naturally builds the reduces / inter_reduce / epilogue split.
 
     if isinstance(kernel.core, tuple) and kernel.core:
         # ReduceCore: the reduce rule leaves Nodes in kernel.prologue and
