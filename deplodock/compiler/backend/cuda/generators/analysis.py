@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import AccessPattern, KernelOp, _needed_by_ids
+from deplodock.compiler.ops import AccessPattern, KernelOp
 
 # Type alias for region op tuples: (node_id, op, input_ids)
 RegionEntry = tuple[str, object, list[str]]
@@ -102,18 +102,3 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
         b_batch_group=cinfo.b_batch_group if cinfo is not None else 1,
         port_indexmaps=region.port_indexmaps(),
     )
-
-
-def _split_phases(kernel: KernelOp) -> OpPhases:
-    """Backward-compat wrapper around ``KernelOp.phases()``.
-
-    Kept for any remaining importers; new code should call
-    ``kernel.phases()`` directly and construct OpPhases inline if needed.
-    """
-    prologue, reduces, inter_reduce, epilogue = kernel.phases()
-    return OpPhases(prologue=prologue, reduces=reduces, epilogue=epilogue, inter_reduce=inter_reduce)
-
-
-def _needed_by(ops: list) -> set:
-    """Backward-compat alias for ``_needed_by_ids`` (used by codegen)."""
-    return _needed_by_ids(ops)
