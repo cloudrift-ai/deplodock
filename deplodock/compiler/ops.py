@@ -484,3 +484,105 @@ class KernelOp(Op):
             if p.buffer_id == port.buffer_id:
                 return tuple(input_shapes[i])
         return ()
+
+    # ------------------------------------------------------------------
+    # Body / phase views — pure derivations of the structured fields.
+    # These are the canonical source for backend readers; analysis.py
+    # delegates to them. Keep them free of shape / codegen concerns so
+    # they stay Layer-1 appropriate.
+    # ------------------------------------------------------------------
+
+    def body_ops(self) -> list:
+        """Flat ``(id, op, inputs)`` view of body nodes in topo order.
+
+        Walks prologue + core (ContractionCore.mul/reduce + post_stages,
+        or tuple[ReduceStage] pre_ops/reduce) + epilogue, deduped by id.
+        """
+        seen: set[str] = set()
+        out: list = []
+
+        def emit(node) -> None:
+            if node is None or node.id in seen:
+                return
+            seen.add(node.id)
+            out.append((node.id, node.op, list(node.inputs)))
+
+        for n in self.prologue:
+            emit(n)
+        if isinstance(self.core, ContractionCore):
+            emit(self.core.mul)
+            emit(self.core.reduce)
+            for stage in self.core.post_stages:
+                if not isinstance(stage, ReduceStage):
+                    continue
+                for pre in stage.pre_ops:
+                    emit(pre)
+                emit(stage.reduce)
+        elif isinstance(self.core, tuple):
+            for stage in self.core:
+                if not isinstance(stage, ReduceStage):
+                    continue
+                for pre in stage.pre_ops:
+                    emit(pre)
+                emit(stage.reduce)
+        for n in self.epilogue:
+            emit(n)
+        return out
+
+    def phases(self) -> tuple:
+        """Return ``(prologue, reduces, inter_reduce, epilogue)`` as
+        RegionEntry lists. Each list contains ``(id, op, inputs)`` tuples.
+
+        - ``prologue``: pre-reduce ops; for ContractionCore this includes
+          the mul appended after user prologue (mul feeds the K-loop).
+        - ``reduces``: one entry per reduce Node in core order.
+        - ``inter_reduce[i]``: pre_ops chain that feeds ``reduces[i+1]``.
+        - ``epilogue``: post-last-reduce ops.
+        """
+
+        def entry(n):
+            return (n.id, n.op, list(n.inputs))
+
+        prologue = [entry(n) for n in self.prologue]
+        epilogue = [entry(n) for n in self.epilogue]
+
+        if isinstance(self.core, ContractionCore):
+            reduces: list = []
+            inter_reduce: list = []
+            if self.core.mul is not None:
+                prologue.append(entry(self.core.mul))
+            if self.core.reduce is not None:
+                reduces.append(entry(self.core.reduce))
+            for stage in self.core.post_stages:
+                if not isinstance(stage, ReduceStage):
+                    continue
+                inter_reduce.append([entry(pn) for pn in stage.pre_ops])
+                if stage.reduce is not None:
+                    reduces.append(entry(stage.reduce))
+            return prologue, reduces, inter_reduce, epilogue
+
+        if isinstance(self.core, tuple) and self.core:
+            stages = [s for s in self.core if isinstance(s, ReduceStage)]
+            reduces = [entry(s.reduce) for s in stages if s.reduce is not None]
+            inter_reduce = [[entry(pn) for pn in s.pre_ops] for s in stages[1:]]
+            return prologue, reduces, inter_reduce, epilogue
+
+        return prologue, [], [], epilogue
+
+    def reduce_fn_names(self) -> list:
+        """Return the ``.fn`` string of each reduce Node in core order."""
+        if isinstance(self.core, ContractionCore):
+            names = []
+            if self.core.reduce is not None:
+                names.append(self.core.reduce.op.fn)
+            for stage in self.core.post_stages:
+                if isinstance(stage, ReduceStage) and stage.reduce is not None:
+                    names.append(stage.reduce.op.fn)
+            return names
+        if isinstance(self.core, tuple):
+            return [s.reduce.op.fn for s in self.core if isinstance(s, ReduceStage) and s.reduce is not None]
+        return []
+
+    def port_indexmaps(self) -> dict:
+        """Per-input Port.indexmap dict (only inputs with an indexmap set)."""
+        return {p.buffer_id: p.indexmap for p in self.inputs if p.indexmap is not None}
