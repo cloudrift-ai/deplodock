@@ -89,6 +89,10 @@ class TileAnalysis:
     # 1 means both operands use the same batch index (no broadcast).
     a_batch_group: int = 1
     b_batch_group: int = 1
+    # Per-input indexmaps carried on Port.indexmap. When set, the load path
+    # substitutes the placeholder coord_map with the kernel's runtime
+    # indices to build the actual input address (transpose-into-matmul).
+    port_indexmaps: dict = field(default_factory=dict)
 
 
 def flat_region_ops(kernel: KernelOp) -> list:
@@ -150,6 +154,11 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     # Collect reduce function names.
     reduce_fns = [op.fn for _, op, _ in phases.reduces]
 
+    # Collect per-input indexmaps (set by 070_absorb_indexmap_into_port when
+    # a pure-view IndexMap absorbs into a kernel's Port). An empty dict
+    # means no absorption happened and loads use the natural indices.
+    port_indexmaps: dict = {p.buffer_id: p.indexmap for p in region.inputs if p.indexmap is not None}
+
     # Build input access patterns.
     input_access = {}
     for inp in [p.buffer_id for p in region.inputs]:
@@ -183,6 +192,7 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     if not phases.reduces:
         total = math.prod(d for d in out_shape if isinstance(d, int))
         return TileAnalysis(
+            port_indexmaps=port_indexmaps,
             pattern="pointwise",
             op_phases=phases,
             output_shape=out_shape,
@@ -204,6 +214,7 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     if is_contraction:
         epilogue_per_elem = _epilogue_needs_per_element(region, phases, shapes, input_access)
         return TileAnalysis(
+            port_indexmaps=port_indexmaps,
             pattern="contraction",
             op_phases=phases,
             output_shape=out_shape,
@@ -237,6 +248,7 @@ def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
         pattern = "row_reduce"
 
     return TileAnalysis(
+        port_indexmaps=port_indexmaps,
         pattern=pattern,
         op_phases=phases,
         output_shape=out_shape,
