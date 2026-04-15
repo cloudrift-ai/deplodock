@@ -223,7 +223,7 @@ def test_pointwise_structure():
         output_names=["exp"],
         shapes={"x": (n,), "neg": (n,), "exp": (n,)},
     )
-    prog, sched = lower_to_loop_ir(region, "test_pw", {**region.shapes, **{"x": (n,), "neg": (n,), "exp": (n,)}}, analysis)
+    prog, sched = lower_to_loop_ir(region, "test_pw", {"x": (n,), "neg": (n,), "exp": (n,)}, analysis)
 
     assert sched.grid.block_size == (256, 1, 1)
     assert any(isinstance(op, ParallelAxis) for op in prog.body)

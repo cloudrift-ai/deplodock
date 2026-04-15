@@ -531,30 +531,3 @@ class KernelOp(Op):
         for node in self.epilogue:
             emit(node)
         return result
-
-    @property
-    def shapes(self) -> dict:
-        result: dict = dict(self.external_shapes)
-        for node in self.prologue:
-            result[node.id] = tuple(node.output.shape)
-        if isinstance(self.core, ContractionCore):
-            if self.core.mul is not None:
-                result[self.core.mul.id] = tuple(self.core.mul.output.shape)
-            if self.core.reduce is not None:
-                result[self.core.reduce.id] = tuple(self.core.reduce.output.shape)
-            for stage in self.core.post_stages:
-                if not isinstance(stage, ReduceStage):
-                    continue
-                for pre in stage.pre_ops:
-                    result[pre.id] = tuple(pre.output.shape)
-                if stage.reduce is not None:
-                    result[stage.reduce.id] = tuple(stage.reduce.output.shape)
-        elif isinstance(self.core, tuple):
-            for stage in self.core:
-                for pre in stage.pre_ops:
-                    result[pre.id] = tuple(pre.output.shape)
-                if stage.reduce is not None:
-                    result[stage.reduce.id] = tuple(stage.reduce.output.shape)
-        for node in self.epilogue:
-            result[node.id] = tuple(node.output.shape)
-        return result
