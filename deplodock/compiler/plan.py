@@ -53,6 +53,43 @@ class ExecutionPlan:
     ops: list[OpKernel]
 
 
+def _serialize_core(kernel) -> dict | None:
+    """Serialize a KernelOp's core annotation as a JSON-compatible dict.
+
+    Returns ``None`` when ``kernel.core is None`` (pure pointwise). For
+    ContractionCore / tuple[ReduceStage, ...] cores, emits identifiers
+    and axis metadata — the referenced Nodes are already serialized
+    through ``_region_ops``, so the backend re-links them on rehydrate.
+    """
+    from deplodock.compiler.ops import ContractionCore, ReduceStage
+
+    core = kernel.core
+    if core is None:
+        return None
+    if isinstance(core, ContractionCore):
+        return {
+            "kind": "contraction",
+            "a_buffer": core.a.buffer_id,
+            "b_buffer": core.b.buffer_id,
+            "k_axis": core.k_axis,
+            "mul_id": core.mul.id if core.mul is not None else None,
+            "reduce_id": core.reduce.id if core.reduce is not None else None,
+        }
+    if isinstance(core, tuple):
+        stages = []
+        for stage in core:
+            if not isinstance(stage, ReduceStage):
+                continue
+            stages.append(
+                {
+                    "reduce_id": stage.reduce.id if stage.reduce is not None else None,
+                    "pre_op_ids": [n.id for n in stage.pre_ops],
+                }
+            )
+        return {"kind": "reduce", "stages": stages}
+    return None
+
+
 def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
     """Walk a compiled graph and produce a backend-agnostic ExecutionPlan.
 
@@ -178,6 +215,11 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             # source must use the original names from the region_ops.
             params["_output_names"] = list(op.output_names)
             params["_input_names"] = list(op.input_names)
+            # Structured-core annotation: preserves ContractionCore /
+            # ReduceStage metadata across plan round-trip so analyze()
+            # can use its structured-dispatch path instead of rescanning
+            # the flat prologue for reduce boundaries.
+            params["_core_struct"] = _serialize_core(op)
         else:
             tag = op_type.lower()
 
