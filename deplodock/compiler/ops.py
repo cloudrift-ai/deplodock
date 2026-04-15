@@ -714,6 +714,60 @@ class KernelOp(Op):
             b_batch_group=b_batch_group,
         )
 
+    def tile_pattern(self, shapes: dict, output_shape: tuple) -> str:
+        """Classify the kernel as pointwise / row_reduce / reduce_broadcast / contraction.
+
+        Pure derivation from the structured fields + shapes:
+          - no reduces → pointwise.
+          - ContractionCore with both operands 2D → contraction.
+          - any other reduce shape → row_reduce, or reduce_broadcast when
+            the epilogue requires a second per-element pass.
+        """
+        _prologue, reduces, _inter, _epilogue = self.phases()
+        if not reduces:
+            return "pointwise"
+        cinfo = self.contraction_info(shapes)
+        if cinfo is not None:
+            access = self.input_accesses(shapes, output_shape)
+            a_acc = access.get(cinfo.a_id)
+            b_acc = access.get(cinfo.b_id)
+            if a_acc and b_acc and a_acc.is_2d and b_acc.is_2d:
+                return "contraction"
+        return "reduce_broadcast" if self.epilogue_needs_per_element(shapes, output_shape) else "row_reduce"
+
+    def tile_dims(self, shapes: dict, output_shape: tuple) -> tuple:
+        """Return ``(rows, cols, k_dim)`` for the kernel's tile schedule.
+
+        - pointwise: rows=1, cols=total output elements, k_dim=0.
+        - contraction: M, N, K from ``contraction_info``.
+        - row reduce / reduce_broadcast: rows = product of leading dims of
+          the pre-reduction tensor, cols = trailing dim, k_dim=cols.
+        """
+        import math as _math
+
+        _prologue, reduces, _inter, _epilogue = self.phases()
+        if not reduces:
+            total = _math.prod(d for d in output_shape if isinstance(d, int))
+            return 1, total, 0
+
+        cinfo = self.contraction_info(shapes)
+        if cinfo is not None:
+            access = self.input_accesses(shapes, output_shape)
+            a_acc = access.get(cinfo.a_id)
+            b_acc = access.get(cinfo.b_id)
+            if a_acc and b_acc and a_acc.is_2d and b_acc.is_2d:
+                return cinfo.m, cinfo.n, cinfo.k
+
+        first_reduce_input = reduces[0][2][0]
+        pre_shape = shapes.get(first_reduce_input, output_shape)
+        if len(pre_shape) >= 2:
+            rows = _math.prod(d for d in pre_shape[:-1] if isinstance(d, int))
+            cols = pre_shape[-1] if isinstance(pre_shape[-1], int) else 1
+        else:
+            rows = 1
+            cols = _math.prod(d for d in pre_shape if isinstance(d, int))
+        return rows, cols, cols
+
     def epilogue_needs_per_element(self, shapes: dict, output_shape: tuple) -> bool:
         """True when the epilogue needs a second per-element pass.
 
