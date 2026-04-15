@@ -44,18 +44,19 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     if contraction is None:
         return graph
 
-    a_port, b_port, k_axis, _mul_id, _sum_id, _epilogue_nodes = contraction
+    a_port, b_port, k_axis, mul_node, sum_node, epilogue_nodes = contraction
 
-    # Annotation-only restructure: leave prologue intact (so backend compat
-    # properties still see mul/sum nodes) and set ``core`` as a classification
-    # marker. Later refactor stages migrate backend readers to use the core
-    # field directly, at which point mul/sum can be dropped from prologue.
+    # Move mul and sum out of prologue into ContractionCore; move any ops
+    # after sum (transitively depending on the reduce) into epilogue.
+    moved_ids = {mul_node.id, sum_node.id} | {n.id for n in epilogue_nodes}
+    new_prologue = tuple(n for n in kernel.prologue if n.id not in moved_ids)
+
     new_kernel = KernelOp(
         inputs=list(kernel.inputs),
         outputs=list(kernel.outputs),
-        prologue=kernel.prologue,
-        core=ContractionCore(a=a_port, b=b_port, k_axis=k_axis),
-        epilogue=kernel.epilogue,
+        prologue=new_prologue,
+        core=ContractionCore(a=a_port, b=b_port, k_axis=k_axis, mul=mul_node, reduce=sum_node),
+        epilogue=tuple(epilogue_nodes),
         kernel_source=kernel.kernel_source,
         external_shapes=dict(kernel.external_shapes),
     )
@@ -145,4 +146,4 @@ def _detect_contraction(kernel: KernelOp):
     a_port = Port(buffer_id=a_port.buffer_id, indexmap=a_port.indexmap)
     b_port = Port(buffer_id=b_port.buffer_id, indexmap=b_port.indexmap)
 
-    return a_port, b_port, k_axis, mul_node.id, sum_node.id, epilogue
+    return a_port, b_port, k_axis, mul_node, sum_node, epilogue

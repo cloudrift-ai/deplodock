@@ -90,12 +90,28 @@ def test_rule_structures_flat_matmul_kernel():
 
     kernels_after = [n for n in structured.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(kernels_after) == 1
-    core = kernels_after[0].op.core
+    kernel_op = kernels_after[0].op
+    core = kernel_op.core
     assert isinstance(core, ContractionCore), f"expected ContractionCore, got {type(core).__name__}"
     assert core.a.buffer_id == "A"
     assert core.b.buffer_id == "B"
     # K axis is the last dim of A (1 since A is 2D).
     assert core.k_axis == 1
+
+    # ContractionCore owns the mul and reduce Nodes (moved out of prologue).
+    assert core.mul is not None and isinstance(core.mul.op, ElementwiseOp) and core.mul.op.fn == "mul"
+    assert core.reduce is not None and isinstance(core.reduce.op, ReduceOp) and core.reduce.op.fn == "sum"
+
+    # Prologue no longer contains the mul/sum Nodes.
+    prologue_ids = {n.id for n in kernel_op.prologue}
+    assert core.mul.id not in prologue_ids
+    assert core.reduce.id not in prologue_ids
+
+    # Compat region_ops still emits the full flat sequence the backend expects.
+    region_ops = kernel_op.region_ops
+    ops_by_type = [type(op).__name__ for _, op, _ in region_ops]
+    assert "ElementwiseOp" in ops_by_type
+    assert "ReduceOp" in ops_by_type
 
 
 def test_rule_is_noop_on_non_kernel_ops():
