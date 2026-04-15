@@ -50,6 +50,12 @@ def _phases_view(region: KernelOp):
     return SimpleNamespace(prologue=p, reduces=r, inter_reduce=i, epilogue=e)
 
 
+def _pattern(region: KernelOp, shapes: dict[str, tuple]) -> str:
+    """Derive the tile pattern from ``region`` / ``shapes`` (no schedule dependency)."""
+    out_shape = shapes.get(region.outputs[0].buffer_id, (1,))
+    return region.tile_pattern(shapes, out_shape)
+
+
 # ---------------------------------------------------------------------------
 # Generic lowering — single entry point driven by Schedule
 # ---------------------------------------------------------------------------
@@ -76,7 +82,7 @@ def lower_generic(
     body: list = []
 
     # Phase 1: Grid setup
-    body.extend(_emit_grid(schedule))
+    body.extend(_emit_grid(schedule, region, shapes))
 
     # Phase 2: Accumulators
     body.extend(_emit_accumulators(schedule, region, shapes))
@@ -88,7 +94,7 @@ def lower_generic(
     body.extend(_emit_epilogue(schedule, region, shapes))
 
     # Phase 5: Write outputs
-    body.extend(_emit_write(schedule, region))
+    body.extend(_emit_write(schedule, region, shapes))
 
     return LoopProgram(
         name=name,
@@ -103,10 +109,10 @@ def lower_generic(
 # ---------------------------------------------------------------------------
 
 
-def _emit_grid(schedule: Schedule) -> list:
+def _emit_grid(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list:
     grid = schedule.grid
     if grid.type == "1d":
-        axis_name = "i" if schedule.pattern == "pointwise" else "row"
+        axis_name = "i" if _pattern(region, shapes) == "pointwise" else "row"
         return [ParallelAxis(axis_name, "blockIdx.x", grid.bound)]
     if grid.type == "1d_contraction":
         # Online reduction: 1D grid over M-tiles, N is tiled sequentially.
@@ -162,11 +168,12 @@ def _emit_grid(schedule: Schedule) -> list:
 
 def _emit_accumulators(schedule: Schedule, region: KernelOp, shapes: dict[str, tuple]) -> list:
     ops: list = []
+    pattern = _pattern(region, shapes)
 
-    if schedule.pattern == "pointwise":
+    if pattern == "pointwise":
         return ops
 
-    if schedule.pattern != "contraction":
+    if pattern != "contraction":
         # Scalar accumulators (one per reduce op)
         for _node in region.phases()[1]:
             acc_name = f"acc_{_safe(_node.id)}"
@@ -202,11 +209,12 @@ def _emit_reductions(
     region: KernelOp,
     shapes: dict[str, tuple],
 ) -> list:
-    if schedule.pattern == "pointwise":
+    pattern = _pattern(region, shapes)
+    if pattern == "pointwise":
         # Pointwise: no reduction, just inline all ops inside a guard
         return _emit_pointwise_body(region, shapes, schedule)
 
-    if schedule.pattern != "contraction":
+    if pattern != "contraction":
         # Scalar reduction (row_reduce / reduce_broadcast / multi-reduce)
         return _emit_scalar_reductions(schedule, region, shapes)
 
@@ -736,7 +744,8 @@ def _emit_epilogue(
     shapes: dict[str, tuple],
 ) -> list:
     phases = _phases_view(region)
-    if schedule.pattern == "pointwise":
+    pattern = _pattern(region, shapes)
+    if pattern == "pointwise":
         # Pointwise: epilogue was inlined in the pointwise body
         return []
 
@@ -744,7 +753,7 @@ def _emit_epilogue(
         # Online reduction handles epilogue internally
         return []
 
-    if schedule.pattern == "contraction":
+    if pattern == "contraction":
         # Contraction register tile epilogue
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4
@@ -833,8 +842,10 @@ def _emit_scalar_epilogue(
 def _emit_write(
     schedule: Schedule,
     region: KernelOp,
+    shapes: dict[str, tuple],
 ) -> list:
-    if schedule.pattern == "pointwise":
+    pattern = _pattern(region, shapes)
+    if pattern == "pointwise":
         # Pointwise: writes were already emitted in the guard body
         return []
 
@@ -842,7 +853,7 @@ def _emit_write(
         # Online reduction handles writes internally
         return []
 
-    if schedule.pattern == "contraction":
+    if pattern == "contraction":
         # Contraction register tile write
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4
