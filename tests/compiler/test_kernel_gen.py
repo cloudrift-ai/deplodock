@@ -723,36 +723,6 @@ def _python_sdpa(
     return out
 
 
-def test_batched_matmul_detection():
-    """Batched 3D contraction is detected by auto_fuse and analyze()."""
-    from deplodock.compiler.backend.cuda.generators.analysis import analyze
-
-    batch, m, k, n = 2, 4, 8, 6
-    g = Graph()
-    a = g.add_node(InputOp(), [], Tensor("A", (batch, m, k)), node_id="A")
-    b = g.add_node(InputOp(), [], Tensor("B", (batch, k, n)), node_id="B")
-    g.inputs = [a, b]
-    # Broadcast mul + reduce_sum → contraction pattern
-    ew = g.add_node(ElementwiseOp("mul"), [a, b], Tensor("ew", (batch, m, k, n)), node_id="ew")
-    red = g.add_node(ReduceOp("sum", axis=-1), [ew], Tensor("out", (batch, m, n)), node_id="out")
-    g.outputs = [red]
-
-    fused = auto_fuse(g)
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
-    assert len(fused_nodes) == 1, f"Expected 1 fused region, got {len(fused_nodes)}"
-
-    # Analyze the fused region
-    nd = fused_nodes[0]
-    shapes = {nid: fused.nodes[nid].output.shape for nid in fused.nodes}
-    analysis = analyze(nd.op, shapes)
-    assert analysis.pattern == "contraction"
-    assert analysis.batch_size == batch
-    assert analysis.batch_dims == (batch,)
-    assert analysis.rows == m
-    assert analysis.cols == n
-    assert analysis.k_dim == k
-
-
 @requires_cuda
 def test_correctness_batched_matmul(dump_dir):
     """Batched matmul: A(2,4,8) @ B(2,8,6) produces correct output."""

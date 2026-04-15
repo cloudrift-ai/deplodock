@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deplodock.compiler.backend.cuda.generators.analysis import TileAnalysis
+    from deplodock.compiler.ops import KernelOp
 
 
 @dataclass
@@ -76,17 +77,22 @@ class Schedule:
 
 
 def build_schedule(
+    region: KernelOp,
+    shapes: dict[str, tuple],
     analysis: TileAnalysis,
     strategy: str = "naive",
     hints: dict | None = None,
 ) -> Schedule:
-    """Synthesize a Schedule from analysis + strategy + tuning hints.
+    """Synthesize a Schedule from region + analysis + strategy + tuning hints.
 
-    This replaces the implicit schedule decisions previously scattered
-    across six lowering functions.
+    ``region`` / ``shapes`` drive the structural fields (pattern, reduce count);
+    ``analysis`` still supplies the derived contraction_a/b and batch_size used
+    for TMA descriptor wiring.
     """
     hints = hints or {}
-    pattern = analysis.pattern
+    out_shape = shapes.get(region.outputs[0].buffer_id, (1,))
+    pattern = region.tile_pattern(shapes, out_shape)
+    reduce_fns = region.reduce_fn_names()
     is_batched = analysis.batch_size > 1
 
     if pattern == "pointwise":
@@ -119,7 +125,7 @@ def build_schedule(
             dim_params.append(("int", "k_splits"))
 
         # Contraction + multi-reduce (e.g. softmax): tiles over N (see _grid_type).
-        has_multi_reduce = len(analysis.reduce_fns) > 1
+        has_multi_reduce = len(reduce_fns) > 1
         if has_multi_reduce:
             k_splits = 1  # incompatible with online reduction
 

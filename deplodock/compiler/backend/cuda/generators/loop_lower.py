@@ -972,7 +972,7 @@ def lower_to_loop_ir(
     """
     from deplodock.compiler.backend.cuda.schedule import build_schedule
 
-    schedule = build_schedule(analysis, strategy, hints or {})
+    schedule = build_schedule(region, shapes, analysis, strategy, hints or {})
     return lower_generic(region, name, shapes, schedule), schedule
 
 
