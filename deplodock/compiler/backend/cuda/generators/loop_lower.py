@@ -1,4 +1,4 @@
-"""Lower FusedRegionOp + TileAnalysis to LoopIR.
+"""Lower KernelOp + TileAnalysis to LoopIR.
 
 ``lower_generic()`` is the single entry point: it reads a ``Schedule`` and
 emits LoopIR through five phases (grid → accumulators → reductions →
@@ -53,7 +53,7 @@ def lower_generic(
     analysis: TileAnalysis,
     schedule: Schedule,
 ) -> LoopProgram:
-    """Lower a FusedRegionOp to LoopIR using a Schedule.
+    """Lower a KernelOp to LoopIR using a Schedule.
 
     Five phases, each parameterized by the Schedule:
     1. Grid setup
@@ -919,7 +919,7 @@ def lower_to_loop_ir(
     strategy: str = "naive",
     hints: dict | None = None,
 ) -> tuple[LoopProgram, object]:
-    """Lower a FusedRegionOp to LoopIR via ``build_schedule()`` + ``lower_generic()``.
+    """Lower a KernelOp to LoopIR via ``build_schedule()`` + ``lower_generic()``.
 
     Returns ``(loop_program, schedule)`` so callers can pass the Schedule
     through to ``loop_ir_to_kernel()``.

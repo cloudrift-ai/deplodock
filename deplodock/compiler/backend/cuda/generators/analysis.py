@@ -1,4 +1,4 @@
-"""Tile analysis: classify a FusedRegionOp's computation pattern.
+"""Tile analysis: classify a KernelOp's computation pattern.
 
 Walks the ops, identifies reduction axes, op phases, input access patterns,
 and classifies the region as one of: pointwise, row_reduce,
@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import ContractionCore, KernelOp, ReduceOp, ReduceStage
+from deplodock.compiler.ops import ContractionCore, KernelOp, ReduceStage
 
 
 def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
@@ -60,7 +60,7 @@ class AccessPattern:
 
 @dataclass
 class TileAnalysis:
-    """Analysis result for a FusedRegionOp.
+    """Analysis result for a KernelOp.
 
     Captures everything needed to choose a tiling strategy and generate
     the kernel, without re-walking the ops.
@@ -98,9 +98,9 @@ class TileAnalysis:
 def flat_region_ops(kernel: KernelOp) -> list:
     """Walk kernel body nodes in topo order, return (id, op, inputs) tuples.
 
-    Replaces the old ``KernelOp.region_ops`` compat property: dedups across
-    prologue, core (ContractionCore.mul/reduce + post_stages, or
-    tuple[ReduceStage] pre_ops/reduce), and epilogue by node id.
+    Dedups across prologue, core (ContractionCore.mul/reduce +
+    post_stages, or tuple[ReduceStage] pre_ops/reduce), and epilogue by
+    node id. This is the canonical flat-body walk for backend readers.
     """
     seen: set[str] = set()
     out: list = []
@@ -135,7 +135,7 @@ def flat_region_ops(kernel: KernelOp) -> list:
 
 
 def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
-    """Analyze a FusedRegionOp and classify its computation pattern.
+    """Analyze a KernelOp and classify its computation pattern.
 
     Args:
         region: The fused region containing primitive ops in topo order.
@@ -355,31 +355,10 @@ def _split_phases(kernel: KernelOp) -> OpPhases:
         epilogue = tail + [_node_entry(n) for n in kernel.epilogue]
         return OpPhases(prologue=prologue, reduces=reduces_entries, epilogue=epilogue, inter_reduce=inter_reduce)
 
-    # core is None — unstructured. Scan kernel.prologue + epilogue to find
-    # reduce boundaries, matching the legacy behavior for kernels that
-    # haven't been classified by the fusion rules (e.g. tests that construct
-    # KernelOps by hand).
-    prologue_out: list[RegionEntry] = []
-    reduces_out: list[RegionEntry] = []
-    inter_reduce_out: list[list[RegionEntry]] = []
-    epilogue_out: list[RegionEntry] = []
-    current_inter: list[RegionEntry] = []
-    phase = "prologue"
-    flat_nodes = list(kernel.prologue) + list(kernel.epilogue)
-    for n in flat_nodes:
-        entry = _node_entry(n)
-        if isinstance(n.op, ReduceOp):
-            if phase == "epilogue":
-                inter_reduce_out.append(current_inter)
-                current_inter = []
-            reduces_out.append(entry)
-            phase = "epilogue"
-        elif phase == "prologue":
-            prologue_out.append(entry)
-        else:
-            current_inter.append(entry)
-    epilogue_out = current_inter
-    return OpPhases(prologue=prologue_out, reduces=reduces_out, epilogue=epilogue_out, inter_reduce=inter_reduce_out)
+    # core is None — pure pointwise. No reduces, no inter_reduce.
+    prologue_out = [_node_entry(n) for n in kernel.prologue]
+    epilogue_out = [_node_entry(n) for n in kernel.epilogue]
+    return OpPhases(prologue=prologue_out, reduces=[], epilogue=epilogue_out, inter_reduce=[])
 
 
 def _needed_by(ops: list) -> set[str]:

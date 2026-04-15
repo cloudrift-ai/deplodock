@@ -1,9 +1,9 @@
 """Kernel generators for the CUDA backend.
 
-Pipeline: FusedRegionOp → analyze() → TileAnalysis → build_schedule() → Schedule
+Pipeline: KernelOp → analyze() → TileAnalysis → build_schedule() → Schedule
           → lower_generic() → LoopIR → loop_ir_to_kernel() → KernelDef
 
-analysis.py     — TileAnalysis: classify FusedRegionOp patterns.
+analysis.py     — TileAnalysis: classify KernelOp patterns.
 schedule.py     — Schedule: all kernel structure decisions as a dataclass.
 loop_lower.py   — lower_generic(): Schedule-driven LoopIR emission.
 loop_codegen.py — loop_ir_to_kernel(): LoopIR → KernelDef (imperative C AST).

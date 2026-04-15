@@ -94,17 +94,15 @@ class CudaBackend(Backend):
 
 
 def _build_region_and_shapes(op: OpKernel):
-    """Reconstruct a KernelOp with flat prologue + shapes dict from plan params.
+    """Reconstruct a KernelOp + shapes dict from plan params.
 
-    The plan serializes flat ``_region_ops`` tuples; this function rebuilds
-    Node objects for each, populates their output shapes from the ``_shapes``
-    dict, and wraps them in a KernelOp (prologue=all_nodes, core=None). The
-    backend's compat properties (``region_ops``, ``input_names``,
-    ``output_names``, ``shapes``) expose the same flat view that generators
-    have always consumed — so no reader migration is required.
+    The plan serializes ``_region_ops`` (flat (id, op, inputs) tuples) and
+    ``_core_struct`` (ContractionCore / ReduceStage annotation). This
+    function rebuilds the Node objects, rehydrates the structured core,
+    and assembles a KernelOp ready for ``analyze()``.
 
-    Also performs plan-level buffer-name remapping when fusion rewires graph
-    edges so kernel params align with allocated buffers.
+    Also performs plan-level buffer-name remapping when fusion rewires
+    graph edges so kernel params align with allocated buffers.
     """
     from deplodock.compiler.ir import Node, Tensor
     from deplodock.compiler.ops import KernelOp, Port
@@ -728,7 +726,7 @@ def _split_contraction_softmax(op: OpKernel, analysis) -> list[CudaLaunch] | Non
 
 
 def _compile_fused_region(op: OpKernel) -> list[CudaLaunch]:
-    """Compile a FusedRegionOp via the unified analysis → tiled generator path.
+    """Compile a KernelOp via the unified analysis → tiled generator path.
 
     Returns a list of CudaLaunch objects (usually one, but multi-reduce
     contractions with N > tile_n are split into matmul + softmax).
@@ -869,7 +867,7 @@ def _compile_op(op: OpKernel) -> list[CudaLaunch]:
     if op.op == "fused_region":
         return _compile_fused_region(op)
 
-    # Unfused elementwise/reduce ops — wrap as a FusedRegionOp first.
+    # Unfused elementwise/reduce ops — wrap as a KernelOp first.
     if op.op.startswith("elementwise_") or op.op.startswith("reduce_"):
         _compile_singleton(op)  # sets up _region_ops etc. on op.params
         return _compile_fused_region(op)

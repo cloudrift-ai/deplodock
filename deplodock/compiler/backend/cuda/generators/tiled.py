@@ -46,7 +46,7 @@ from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReshapeOp, Transpose
 
 
 def generate_kernel(region: KernelOp, name: str, shapes: dict[str, tuple]) -> KernelDef:
-    """Generate a CUDA kernel from a FusedRegionOp.
+    """Generate a CUDA kernel from a KernelOp.
 
     Analyzes the region and produces a KernelDef via the unified tiled generator.
     """
