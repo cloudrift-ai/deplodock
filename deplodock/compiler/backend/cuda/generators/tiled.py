@@ -1069,32 +1069,6 @@ def _lower_naive(
 # ---------------------------------------------------------------------------
 
 
-def _build_epilogue_inline(
-    region: KernelOp,
-    analysis: TileAnalysis,
-    phases,
-    var_map: dict[str, Expr],
-    reduce_vars: dict[str, tuple[str, str]],
-) -> list:
-    """Build epilogue statements for contraction (inline after k-loop)."""
-    epilogue_ops = phases.epilogue
-    if not epilogue_ops:
-        return []
-
-    stmts = []
-
-    # Map reduce results to acc
-    for node_id, (acc_name, _fn) in reduce_vars.items():
-        var_map[node_id] = Var(acc_name)
-
-    # Map external inputs for epilogue
-    for inp in [p.buffer_id for p in region.inputs]:
-        var_map[inp] = _contraction_input_expr(inp, analysis)
-
-    stmts.extend(_emit_ops(epilogue_ops, var_map, "e_"))
-    return stmts
-
-
 def _expr_to_str(expr: Expr) -> str:
     """Quick string conversion for an Expr (used in RawCode fallbacks)."""
     from deplodock.compiler.backend.ir.kernel_codegen import _emit_expr
