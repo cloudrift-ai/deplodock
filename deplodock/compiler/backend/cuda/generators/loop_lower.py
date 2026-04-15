@@ -220,6 +220,58 @@ def _emit_reductions(
     return _emit_contraction_k_loop(schedule, analysis, region, shapes)
 
 
+def _emit_input_loads(
+    region: KernelOp,
+    analysis: TileAnalysis,
+    idx_var: str,
+    prefix: str,
+    body: list,
+    var_map: dict[str, LoopExpr],
+    out_size: int = 0,
+) -> None:
+    """Emit a Load for each external input; register the loaded Var in var_map.
+
+    Used by pointwise, per-reduce, and per-element-epilogue passes — all
+    three previously duplicated this loop with only prefix / idx_var differing.
+    """
+    for inp in [p.buffer_id for p in region.inputs]:
+        indices = _input_indices(inp, analysis, idx_var, out_size)
+        load_name = f"{prefix}{_safe(inp)}"
+        body.append(Load(load_name, _safe(inp), indices, "global"))
+        var_map[inp] = Var(load_name)
+
+
+def _recompute_ops_into(
+    ops: list,
+    var_map: dict[str, LoopExpr],
+    prefix: str,
+    body: list,
+    coord_mapping,
+    shapes,
+    include_ids,
+    needed: set | None,
+) -> None:
+    """Emit IndexMap/Elementwise ops into body+var_map with shared filter logic.
+
+    Used by per-reduce prologue recompute and per-element-epilogue recompute.
+    When ``needed`` is None, all ops in ``ops`` are emitted (no filtering);
+    otherwise only ops whose id is in ``needed`` are.
+    """
+    from deplodock.compiler.ops import IndexMapOp as _IndexMapOp
+
+    for pid, pop, pinp in ops:
+        if needed is not None and pid not in needed:
+            continue
+        if isinstance(pop, _IndexMapOp):
+            _emit_indexmap(pid, pop, pinp, var_map, prefix, body, coord_mapping, shapes, include_ids)
+        elif isinstance(pop, ElementwiseOp):
+            a = var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
+            b = var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
+            var_name = f"{prefix}{_safe(pid)}"
+            body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
+            var_map[pid] = Var(var_name)
+
+
 def _emit_pointwise_body(
     analysis: TileAnalysis,
     region: KernelOp,
@@ -232,11 +284,7 @@ def _emit_pointwise_body(
 
     guard_body: list = []
     var_map: dict[str, LoopExpr] = {}
-    for inp in [p.buffer_id for p in region.inputs]:
-        indices = _input_indices(inp, analysis, "i", out_size)
-        load_name = f"v_{_safe(inp)}"
-        guard_body.append(Load(load_name, _safe(inp), indices, "global"))
-        var_map[inp] = Var(load_name)
+    _emit_input_loads(region, analysis, "i", "v_", guard_body, var_map, out_size)
 
     coord_mapping = _build_pointwise_coord_mapping(out_shape)
     _emit_loop_ops(flat_region_ops(region), var_map, "v_", guard_body, coord_mapping=coord_mapping, shapes=shapes)
@@ -281,31 +329,24 @@ def _emit_scalar_reductions(
         pass_body: list = []
 
         pass_var_map: dict[str, LoopExpr] = {}
-        for inp in [p.buffer_id for p in region.inputs]:
-            indices = _input_indices(inp, analysis, "j", out_size)
-            load_name = f"r{ri}ld_{_safe(inp)}"
-            pass_body.append(Load(load_name, _safe(inp), indices, "global"))
-            pass_var_map[inp] = Var(load_name)
+        _emit_input_loads(region, analysis, "j", f"r{ri}ld_", pass_body, pass_var_map, out_size)
 
         for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
             pass_var_map[prev_nid] = Var(prev_acc)
 
         all_ops_this_pass = list(phases.inter_reduce[ri - 1]) if ri > 0 else []
         needed = _needed_by(all_ops_this_pass + [(node_id, _op, input_ids)])
-        from deplodock.compiler.ops import IndexMapOp as _IndexMapOp
-
         prologue_ids = {pid for pid, _, _ in phases.prologue}
-        for pid, pop, pinp in phases.prologue:
-            if pid not in needed:
-                continue
-            if isinstance(pop, _IndexMapOp):
-                _emit_indexmap(pid, pop, pinp, pass_var_map, f"r{ri}p_", pass_body, coord_mapping, shapes, prologue_ids)
-            elif isinstance(pop, ElementwiseOp):
-                a = pass_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
-                b = pass_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
-                var_name = f"r{ri}p_{_safe(pid)}"
-                pass_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                pass_var_map[pid] = Var(var_name)
+        _recompute_ops_into(
+            phases.prologue,
+            pass_var_map,
+            f"r{ri}p_",
+            pass_body,
+            coord_mapping,
+            shapes,
+            prologue_ids,
+            needed,
+        )
 
         if ri > 0 and phases.inter_reduce:
             _emit_loop_ops(phases.inter_reduce[ri - 1], pass_var_map, f"r{ri}_", pass_body, coord_mapping=coord_mapping, shapes=shapes)
@@ -476,6 +517,38 @@ def _emit_online_contraction_reduce(
         """Get the per-row running accumulator variable for a reduce node."""
         return Var(f"{reduce_running[node_id]}{r}")
 
+    def _apply_ops_with_running(
+        val_expr: LoopExpr,
+        op_entries: list,
+        r: int,
+    ) -> LoopExpr:
+        """Apply a chain of Elementwise ops, threading per-row running
+        reduction vars as the binary-op partner when the op references them.
+        """
+        for _op_id, op_obj, op_inputs in op_entries:
+            if not isinstance(op_obj, ElementwiseOp):
+                continue
+            if op_obj.info.arity == 1:
+                val_expr = OpCall(op_obj.fn, [val_expr])
+                continue
+            other_input = next((inp for inp in op_inputs if inp in reduce_running), None)
+            if other_input is not None:
+                other_var = _running_var(other_input, r)
+                if op_inputs[0] == other_input:
+                    val_expr = OpCall(op_obj.fn, [other_var, val_expr])
+                else:
+                    val_expr = OpCall(op_obj.fn, [val_expr, other_var])
+            else:
+                val_expr = OpCall(op_obj.fn, [val_expr, Literal(0.0)])
+        return val_expr
+
+    def _combine_running(rvar_r: str, tvar: str, fn: str) -> LoopExpr:
+        """Fold a tile-reduced value into the per-row running accumulator."""
+        if fn == "sum":
+            return SetVar(rvar_r, Var(rvar_r) + Var(tvar))
+        fc = "fmaxf" if fn == "max" else fn
+        return SetVar(rvar_r, FuncCall(fc, [Var(rvar_r), Var(tvar)]))
+
     ops: list = []
 
     # Running accumulators for each N-axis reduce, one per row of the thread
@@ -540,12 +613,7 @@ def _emit_online_contraction_reduce(
                 )
             )
         loop1_body.append(ShuffleReduce(tvar, head_op.fn, kind="warp_xor"))
-        # Update running{r} = combine(running{r}, tile)
-        rvar_r = f"{head_running}{r}"
-        if head_op.fn == "sum":
-            loop1_body.append(SetVar(rvar_r, Var(rvar_r) + Var(tvar)))
-        else:
-            loop1_body.append(SetVar(rvar_r, FuncCall("fmaxf" if head_op.fn == "max" else head_op.fn, [Var(rvar_r), Var(tvar)])))
+        loop1_body.append(_combine_running(f"{head_running}{r}", tvar, head_op.fn))
 
     # Write raw scores (contraction output after inter_reduce[0] ops, before N-reduces)
     loop1_body.extend(
@@ -585,27 +653,7 @@ def _emit_online_contraction_reduce(
                 row_body.append(Load(ld_name, output, _out_indices(row, col), "global", guard=col.lt(N)))
 
                 # Apply inter_reduce ops (e.g. sub(v, running_max{r}), exp(...))
-                val_expr: LoopExpr = Var(ld_name)
-                for _op_id, op_obj, op_inputs in inter_ops:
-                    if not isinstance(op_obj, ElementwiseOp):
-                        continue
-                    if op_obj.info.arity == 1:
-                        val_expr = OpCall(op_obj.fn, [val_expr])
-                    else:
-                        other_input = None
-                        for inp in op_inputs:
-                            if inp in reduce_running:
-                                other_input = inp
-                                break
-                        if other_input is not None:
-                            other_var = _running_var(other_input, r)
-                            if op_inputs[0] == other_input:
-                                val_expr = OpCall(op_obj.fn, [other_var, val_expr])
-                            else:
-                                val_expr = OpCall(op_obj.fn, [val_expr, other_var])
-                        else:
-                            val_expr = OpCall(op_obj.fn, [val_expr, Literal(0.0)])
-
+                val_expr = _apply_ops_with_running(Var(ld_name), inter_ops, r)
                 vname = f"tv{ri}_{r}_{c}"
                 row_body.append(Let(vname, val_expr))
 
@@ -623,12 +671,7 @@ def _emit_online_contraction_reduce(
                     )
                 )
             row_body.append(ShuffleReduce(tvar, red_op.fn, kind="warp_xor"))
-            # Update running{r}
-            rvar_r = f"{red_running}{r}"
-            if red_op.fn == "sum":
-                row_body.append(SetVar(rvar_r, Var(rvar_r) + Var(tvar)))
-            else:
-                row_body.append(SetVar(rvar_r, FuncCall("fmaxf" if red_op.fn == "max" else red_op.fn, [Var(rvar_r), Var(tvar)])))
+            row_body.append(_combine_running(f"{red_running}{r}", tvar, red_op.fn))
 
             loop_body.append(Guard(row.lt(M), row_body))
 
@@ -649,51 +692,11 @@ def _emit_online_contraction_reduce(
             ld_name = f"fv_{r}_{c}"
             row_body.append(Load(ld_name, output, _out_indices(row, col), "global", guard=col.lt(N)))
 
-            # Apply N-axis inter_reduce ops (skip inter_reduce[0] which is
-            # between the contraction reduce and first N-reduce — already
-            # applied on the register tile in loop 1).
-            val_expr: LoopExpr = Var(ld_name)
+            # Apply N-axis inter_reduce ops (skip inter_reduce[0] — already
+            # applied on the register tile in loop 1) then epilogue ops.
             all_inter_ops = [op for group in n_inter[1:] for op in group]
-            for _op_id, op_obj, op_inputs in all_inter_ops:
-                if not isinstance(op_obj, ElementwiseOp):
-                    continue
-                if op_obj.info.arity == 1:
-                    val_expr = OpCall(op_obj.fn, [val_expr])
-                else:
-                    other_input = None
-                    for inp in op_inputs:
-                        if inp in reduce_running:
-                            other_input = inp
-                            break
-                    if other_input is not None:
-                        other_var = _running_var(other_input, r)
-                        if op_inputs[0] == other_input:
-                            val_expr = OpCall(op_obj.fn, [other_var, val_expr])
-                        else:
-                            val_expr = OpCall(op_obj.fn, [val_expr, other_var])
-                    else:
-                        val_expr = OpCall(op_obj.fn, [val_expr, Literal(0.0)])
-
-            # Apply epilogue ops
-            for _op_id, op_obj, op_inputs in phases.epilogue:
-                if not isinstance(op_obj, ElementwiseOp):
-                    continue
-                if op_obj.info.arity == 1:
-                    val_expr = OpCall(op_obj.fn, [val_expr])
-                else:
-                    other_input = None
-                    for inp in op_inputs:
-                        if inp in reduce_running:
-                            other_input = inp
-                            break
-                    if other_input is not None:
-                        other_var = _running_var(other_input, r)
-                        if op_inputs[0] == other_input:
-                            val_expr = OpCall(op_obj.fn, [other_var, val_expr])
-                        else:
-                            val_expr = OpCall(op_obj.fn, [val_expr, other_var])
-                    else:
-                        val_expr = OpCall(op_obj.fn, [val_expr, Literal(0.0)])
+            val_expr = _apply_ops_with_running(Var(ld_name), all_inter_ops, r)
+            val_expr = _apply_ops_with_running(val_expr, list(phases.epilogue), r)
 
             result_name = f"fr_{r}_{c}"
             row_body.append(Let(result_name, val_expr))
@@ -769,11 +772,7 @@ def _emit_scalar_epilogue(
         epi_body: list = []
         epi_var_map: dict[str, LoopExpr] = dict(var_map)
 
-        for inp in [p.buffer_id for p in region.inputs]:
-            indices = _input_indices(inp, analysis, "j", out_size)
-            load_name = f"epld_{_safe(inp)}"
-            epi_body.append(Load(load_name, _safe(inp), indices, "global"))
-            epi_var_map[inp] = Var(load_name)
+        _emit_input_loads(region, analysis, "j", "epld_", epi_body, epi_var_map, out_size)
 
         # Coord mapping for IndexMaps: epilogue iterates per-element over output
         # at (row, j); pre-reduction shape governs how row decomposes for >2D.
@@ -790,20 +789,17 @@ def _emit_scalar_epilogue(
         for pid, _pop, pinp in reversed(recompute_ops):
             if pid in needed:
                 needed.update(pinp)
-        from deplodock.compiler.ops import IndexMapOp as _IndexMapOp
-
         recompute_ids = {pid for pid, _, _ in recompute_ops}
-        for pid, pop, pinp in recompute_ops:
-            if not (pid in needed or has_multi_reduce):
-                continue
-            if isinstance(pop, _IndexMapOp):
-                _emit_indexmap(pid, pop, pinp, epi_var_map, "ep_", epi_body, coord_mapping, shapes, recompute_ids)
-            elif isinstance(pop, ElementwiseOp):
-                a = epi_var_map.get(pinp[0], Literal(0.0)) if pinp else Literal(0.0)
-                b = epi_var_map.get(pinp[1], Literal(0.0)) if len(pinp) > 1 else Literal(0.0)
-                var_name = f"ep_{_safe(pid)}"
-                epi_body.append(Let(var_name, OpCall(pop.fn, [a] if len(pinp) == 1 else [a, b])))
-                epi_var_map[pid] = Var(var_name)
+        _recompute_ops_into(
+            recompute_ops,
+            epi_var_map,
+            "ep_",
+            epi_body,
+            coord_mapping,
+            shapes,
+            recompute_ids,
+            needed=None if has_multi_reduce else needed,
+        )
 
         _emit_loop_ops(phases.epilogue, epi_var_map, "e_", epi_body, coord_mapping=coord_mapping, shapes=shapes)
 
