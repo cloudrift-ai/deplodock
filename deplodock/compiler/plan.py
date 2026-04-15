@@ -141,9 +141,9 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
 
         # Output buffer(s) for this node.
         # FusedRegionOp / KernelOp may have multiple external outputs — allocate a buffer for each.
-        if isinstance(op, ops_module.KernelOp) and len(op.output_names) > 1:
+        if isinstance(op, ops_module.KernelOp) and len([p.buffer_id for p in op.outputs]) > 1:
             outputs = []
-            for out_id in op.output_names:
+            for out_id in [p.buffer_id for p in op.outputs]:
                 # Each external output needs its own buffer.
                 # Look up shape from the region's shapes dict.
                 out_shape = op.shapes.get(out_id, shape)
@@ -224,8 +224,8 @@ def plan_graph(graph: Graph, name: str = "graph") -> ExecutionPlan:
             # Preserve original input/output names for kernel generation.
             # The plan uses fused node IDs as buffer names, but the kernel
             # source must use the original names from the region_ops.
-            params["_output_names"] = list(op.output_names)
-            params["_input_names"] = list(op.input_names)
+            params["_output_names"] = list([p.buffer_id for p in op.outputs])
+            params["_input_names"] = list([p.buffer_id for p in op.inputs])
             # Structured-core annotation: preserves ContractionCore /
             # ReduceStage metadata across plan round-trip so analyze()
             # can use its structured-dispatch path instead of rescanning

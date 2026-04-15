@@ -279,7 +279,7 @@ def _lower_smem(  # noqa: C901
     """
     a_name = _safe(analysis.contraction_a)
     b_name = _safe(analysis.contraction_b)
-    out_id = region.output_names[0]
+    out_id = [p.buffer_id for p in region.outputs][0]
     c_name = _safe(out_id)
     is_batched = analysis.batch_size > 1
 
@@ -293,12 +293,12 @@ def _lower_smem(  # noqa: C901
     smem_stride = bk + 1  # bank conflict padding
 
     params = []
-    output_set_smem = set(region.output_names)
-    for inp in region.input_names:
+    output_set_smem = set([p.buffer_id for p in region.outputs])
+    for inp in [p.buffer_id for p in region.inputs]:
         if inp in output_set_smem:
             continue
         params.append(KernelParam("const float* __restrict__", _safe(inp)))
-    for out in region.output_names:
+    for out in [p.buffer_id for p in region.outputs]:
         params.append(KernelParam("float* __restrict__", _safe(out)))
     params.extend([KernelParam("int", "M"), KernelParam("int", "N"), KernelParam("int", "K")])
     if is_batched:
@@ -618,12 +618,12 @@ def _lower_naive(
     # operation, e.g. softmax split from a contraction), emit a single
     # read-write float* parameter instead of separate const/non-const params.
     params = []
-    output_set = set(region.output_names)
-    for inp in region.input_names:
+    output_set = set([p.buffer_id for p in region.outputs])
+    for inp in [p.buffer_id for p in region.inputs]:
         if inp in output_set:
             continue  # will be emitted as float* (read-write) with outputs
         params.append(KernelParam("const float* __restrict__", _safe(inp)))
-    for out in region.output_names:
+    for out in [p.buffer_id for p in region.outputs]:
         params.append(KernelParam("float* __restrict__", _safe(out)))
 
     if is_contraction:
@@ -682,20 +682,20 @@ def _lower_naive(
 
     # --- Build var_map for input access ---
     var_map: dict[str, Expr] = {}
-    out_shape = shapes.get(region.output_names[0], (1,))
+    out_shape = shapes.get([p.buffer_id for p in region.outputs][0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
 
     if is_contraction:
         # Contraction inputs are indexed inside the k-loop; set up later.
         pass
     else:
-        for inp in region.input_names:
+        for inp in [p.buffer_id for p in region.inputs]:
             var_map[inp] = _input_expr(inp, analysis, "j" if has_reduce else "i", out_size)
 
     # --- Pointwise: emit all ops inline, write, return ---
     if is_pointwise:
         body.extend(_emit_ops(region.region_ops, var_map, "v_"))
-        for out_id in region.output_names:
+        for out_id in [p.buffer_id for p in region.outputs]:
             val = var_map.get(out_id, Literal(0.0))
             body.append(Assign(ArrayAccess(_safe(out_id), Var("i")), val))
         return KernelDef(name=name, params=params, body=body, block_size=block_size)
@@ -711,7 +711,7 @@ def _lower_naive(
     if is_contraction:
         a_name = _safe(analysis.contraction_a)
         b_name = _safe(analysis.contraction_b)
-        out_id = region.output_names[0]
+        out_id = [p.buffer_id for p in region.outputs][0]
         c_name = _safe(out_id)
         default_bk = 32 if strategy == "tma_db" else 16
         bk = int(_hints.get("block_k", default_bk))
@@ -910,7 +910,7 @@ def _lower_naive(
 
             # Re-map inputs for this pass.
             pass_var_map: dict[str, Expr] = {}
-            for inp in region.input_names:
+            for inp in [p.buffer_id for p in region.inputs]:
                 pass_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
             # Previous reduce results are available as accumulators.
             for prev_nid, (prev_acc, _prev_fn) in reduce_vars.items():
@@ -952,7 +952,7 @@ def _lower_naive(
         if epilogue_ops or analysis.epilogue_needs_per_element:
             epi_body: list = []
             epi_var_map: dict[str, Expr] = dict(var_map)
-            for inp in region.input_names:
+            for inp in [p.buffer_id for p in region.inputs]:
                 epi_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
 
             # Re-compute ALL prologue + inter_reduce ops (epilogue may
@@ -971,7 +971,7 @@ def _lower_naive(
 
             epi_body.extend(_emit_ops(epilogue_ops, epi_var_map, "e_"))
 
-            for out_id in region.output_names:
+            for out_id in [p.buffer_id for p in region.outputs]:
                 val = epi_var_map.get(out_id, Literal(0.0))
                 idx = BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j"))
                 epi_body.append(Assign(ArrayAccess(_safe(out_id), idx), val))
@@ -980,7 +980,7 @@ def _lower_naive(
         else:
             # No epilogue — write last reduce result (thread 0 only).
             write_body = []
-            for out_id in region.output_names:
+            for out_id in [p.buffer_id for p in region.outputs]:
                 val = var_map.get(out_id, Literal(0.0))
                 write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
             body.append(IfStmt(BinOp("==", Builtin("threadIdx.x"), Literal(0, "int")), write_body))
@@ -1013,7 +1013,7 @@ def _lower_naive(
             if analysis.epilogue_needs_per_element:
                 epi_body: list = []
                 epi_var_map: dict[str, Expr] = dict(var_map)
-                for inp in region.input_names:
+                for inp in [p.buffer_id for p in region.inputs]:
                     epi_var_map[inp] = _input_expr(inp, analysis, "j", out_size)
 
                 needed = _needed_by(epilogue_ops)
@@ -1030,7 +1030,7 @@ def _lower_naive(
 
                 epi_body.extend(_emit_ops(epilogue_ops, epi_var_map, "e_"))
 
-                for out_id in region.output_names:
+                for out_id in [p.buffer_id for p in region.outputs]:
                     val = epi_var_map.get(out_id, Literal(0.0))
                     idx = BinOp("+", BinOp("*", Var("row"), Var("cols")), Var("j"))
                     epi_body.append(Assign(ArrayAccess(_safe(out_id), idx), val))
@@ -1039,13 +1039,13 @@ def _lower_naive(
             else:
                 body.extend(_emit_ops(epilogue_ops, var_map, "e_"))
                 write_body = []
-                for out_id in region.output_names:
+                for out_id in [p.buffer_id for p in region.outputs]:
                     val = var_map.get(out_id, Literal(0.0))
                     write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
                 body.append(IfStmt(BinOp("==", Builtin("threadIdx.x"), Literal(0, "int")), write_body))
         else:
             write_body = []
-            for out_id in region.output_names:
+            for out_id in [p.buffer_id for p in region.outputs]:
                 val = var_map.get(out_id, Literal(0.0))
                 write_body.append(Assign(ArrayAccess(_safe(out_id), Var("row")), val))
             body.append(IfStmt(BinOp("==", Builtin("threadIdx.x"), Literal(0, "int")), write_body))
@@ -1077,7 +1077,7 @@ def _build_epilogue_inline(
         var_map[node_id] = Var(acc_name)
 
     # Map external inputs for epilogue
-    for inp in region.input_names:
+    for inp in [p.buffer_id for p in region.inputs]:
         var_map[inp] = _contraction_input_expr(inp, analysis)
 
     stmts.extend(_emit_ops(epilogue_ops, var_map, "e_"))

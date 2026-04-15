@@ -227,12 +227,12 @@ def _emit_pointwise_body(
     schedule: Schedule,
 ) -> list:
     """Pointwise: load inputs, emit all ops, store outputs inside a guard."""
-    out_shape = shapes.get(region.output_names[0], (1,))
+    out_shape = shapes.get([p.buffer_id for p in region.outputs][0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
 
     guard_body: list = []
     var_map: dict[str, LoopExpr] = {}
-    for inp in region.input_names:
+    for inp in [p.buffer_id for p in region.inputs]:
         indices = _input_indices(inp, analysis, "i", out_size)
         load_name = f"v_{_safe(inp)}"
         guard_body.append(Load(load_name, _safe(inp), indices, "global"))
@@ -241,7 +241,7 @@ def _emit_pointwise_body(
     coord_mapping = _build_pointwise_coord_mapping(out_shape)
     _emit_loop_ops(region.region_ops, var_map, "v_", guard_body, coord_mapping=coord_mapping, shapes=shapes)
 
-    for out_id in region.output_names:
+    for out_id in [p.buffer_id for p in region.outputs]:
         val = var_map.get(out_id, Literal(0.0))
         guard_body.append(Store(_safe(out_id), [Var("i")], val, "global"))
 
@@ -256,7 +256,7 @@ def _emit_scalar_reductions(
 ) -> list:
     """Emit scalar reduction loops (single or multi-reduce)."""
     phases = analysis.op_phases
-    out_shape = shapes.get(region.output_names[0], (1,))
+    out_shape = shapes.get([p.buffer_id for p in region.outputs][0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
     guarded: list = []
 
@@ -281,7 +281,7 @@ def _emit_scalar_reductions(
         pass_body: list = []
 
         pass_var_map: dict[str, LoopExpr] = {}
-        for inp in region.input_names:
+        for inp in [p.buffer_id for p in region.inputs]:
             indices = _input_indices(inp, analysis, "j", out_size)
             load_name = f"r{ri}ld_{_safe(inp)}"
             pass_body.append(Load(load_name, _safe(inp), indices, "global"))
@@ -438,8 +438,8 @@ def _emit_online_contraction_reduce(
     thread_n = schedule.thread_n or 4
     tile_n = schedule.tile_n or 128
     phases = analysis.op_phases
-    output = _safe(region.output_names[0])
-    input_set = set(region.input_names)
+    output = _safe([p.buffer_id for p in region.outputs][0])
+    input_set = set([p.buffer_id for p in region.inputs])
 
     I = "int"  # noqa: E741
     M, N = Var("M"), Var("N")  # noqa: N806
@@ -720,7 +720,7 @@ def _emit_epilogue(
         # Contraction register tile epilogue
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4
-        return _contraction_epilogue_ops(phases, shapes, region.input_names, thread_m, thread_n)
+        return _contraction_epilogue_ops(phases, shapes, [p.buffer_id for p in region.inputs], thread_m, thread_n)
 
     # Scalar reduction epilogue
     return _emit_scalar_epilogue(schedule, analysis, region, shapes)
@@ -734,7 +734,7 @@ def _emit_scalar_epilogue(
 ) -> list:
     """Emit epilogue for scalar reductions (inside the row guard)."""
     phases = analysis.op_phases
-    out_shape = shapes.get(region.output_names[0], (1,))
+    out_shape = shapes.get([p.buffer_id for p in region.outputs][0], (1,))
     out_size = math.prod(d for d in out_shape if isinstance(d, int))
 
     if not phases.epilogue and not schedule.epilogue_per_element:
@@ -755,7 +755,7 @@ def _emit_scalar_epilogue(
         epi_body: list = []
         epi_var_map: dict[str, LoopExpr] = dict(var_map)
 
-        for inp in region.input_names:
+        for inp in [p.buffer_id for p in region.inputs]:
             indices = _input_indices(inp, analysis, "j", out_size)
             load_name = f"epld_{_safe(inp)}"
             epi_body.append(Load(load_name, _safe(inp), indices, "global"))
@@ -793,7 +793,7 @@ def _emit_scalar_epilogue(
 
         _emit_loop_ops(phases.epilogue, epi_var_map, "e_", epi_body, coord_mapping=coord_mapping, shapes=shapes)
 
-        for out_id in region.output_names:
+        for out_id in [p.buffer_id for p in region.outputs]:
             val = epi_var_map.get(out_id, Literal(0.0))
             epi_body.append(Store(_safe(out_id), [Var("row"), Var("j")], val, "global"))
 
@@ -829,7 +829,7 @@ def _emit_write(
         # Contraction register tile write
         thread_m = schedule.thread_m or 8
         thread_n = schedule.thread_n or 4
-        out_id = region.output_names[0]
+        out_id = [p.buffer_id for p in region.outputs][0]
         rb = Var(schedule.row_base_var) if schedule.row_base_var else None
         cb = Var(schedule.col_base_var) if schedule.col_base_var else None
         return _contraction_write_ops(
@@ -852,7 +852,7 @@ def _emit_write(
             return []
         # No epilogue — write last reduce result (thread 0 only)
         ops: list = []
-        for out_id in region.output_names:
+        for out_id in [p.buffer_id for p in region.outputs]:
             val = var_map.get(out_id, Literal(0.0))
             ops.append(
                 Guard(
@@ -868,7 +868,7 @@ def _emit_write(
         ops = []
         # Re-derive var_map with epilogue results
         _emit_loop_ops(phases.epilogue, var_map, "e_", [])  # just update var_map
-        for out_id in region.output_names:
+        for out_id in [p.buffer_id for p in region.outputs]:
             val = var_map.get(out_id, Literal(0.0))
             ops.append(
                 Guard(
@@ -880,7 +880,7 @@ def _emit_write(
 
     # No epilogue — write last reduce result (thread 0)
     ops = []
-    for out_id in region.output_names:
+    for out_id in [p.buffer_id for p in region.outputs]:
         val = var_map.get(out_id, Literal(0.0))
         ops.append(
             Guard(
@@ -942,13 +942,13 @@ def _build_dim_strides(analysis: TileAnalysis, region: KernelOp, schedule) -> di
         # Batched pointer aliases
         strides["Ab"] = ["K"]
         strides["Bb"] = ["N"]
-        for out_id in region.output_names:
+        for out_id in [p.buffer_id for p in region.outputs]:
             if schedule.is_batched:
                 strides[_safe(out_id)] = ["M * N", "N"]
             else:
                 strides[_safe(out_id)] = ["N"]
         # Epilogue external inputs: use N for 2D, nothing for 1D/scalar
-        for inp in region.input_names:
+        for inp in [p.buffer_id for p in region.inputs]:
             safe = _safe(inp)
             if safe not in strides:
                 acc = analysis.input_access.get(inp)
@@ -956,11 +956,11 @@ def _build_dim_strides(analysis: TileAnalysis, region: KernelOp, schedule) -> di
                     strides[safe] = ["N"]
     elif analysis.pattern in ("row_reduce", "reduce_broadcast", "multi_reduce"):
         # All 2D buffers use "cols" stride
-        for inp in region.input_names:
+        for inp in [p.buffer_id for p in region.inputs]:
             acc = analysis.input_access.get(inp)
             if acc and acc.is_2d:
                 strides[_safe(inp)] = ["cols"]
-        for out_id in region.output_names:
+        for out_id in [p.buffer_id for p in region.outputs]:
             strides[_safe(out_id)] = ["cols"]
 
     return strides
@@ -1209,12 +1209,12 @@ def _build_params(region: KernelOp) -> list[tuple[str, str]]:
     ``const float*`` and ``float*``.
     """
     params: list[tuple[str, str]] = []
-    output_set = set(region.output_names)
-    for inp in region.input_names:
+    output_set = set([p.buffer_id for p in region.outputs])
+    for inp in [p.buffer_id for p in region.inputs]:
         if inp in output_set:
             continue  # will be added as read-write output
         params.append(("const float* __restrict__", _safe(inp)))
-    for out in region.output_names:
+    for out in [p.buffer_id for p in region.outputs]:
         params.append(("float* __restrict__", _safe(out)))
     return params
 

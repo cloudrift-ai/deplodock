@@ -48,13 +48,13 @@ def _run_fused_region(region_node, graph: Graph, inputs: dict[str, list[float]])
     """Run a FusedRegionOp through kernel_gen → CUDA."""
     op = region_node.op
     shapes = {nid: graph.nodes[nid].output.shape for nid in graph.nodes}
-    for inp in op.input_names:
+    for inp in [p.buffer_id for p in op.inputs]:
         if inp in graph.nodes:
             shapes[inp] = graph.nodes[inp].output.shape
-    for out in op.output_names:
+    for out in [p.buffer_id for p in op.outputs]:
         # Find the original output shape from the region_ops.
         for rid, _rop, _ in op.region_ops:
-            if rid in op.output_names:
+            if rid in [p.buffer_id for p in op.outputs]:
                 # Use the fused node's output shape.
                 pass
         shapes[out] = region_node.output.shape
@@ -64,11 +64,11 @@ def _run_fused_region(region_node, graph: Graph, inputs: dict[str, list[float]])
     # Build Program.
     buffers = []
     launch_args = []
-    for inp in op.input_names:
+    for inp in [p.buffer_id for p in op.inputs]:
         size = len(inputs.get(inp, [1]))
         buffers.append(Buffer(inp, size, role="input"))
         launch_args.append(inp)
-    out_name = op.output_names[0]
+    out_name = [p.buffer_id for p in op.outputs][0]
     out_size = math.prod(d for d in region_node.output.shape if isinstance(d, int))
     buffers.append(Buffer(out_name, out_size, role="output"))
     launch_args.append(out_name)

@@ -533,14 +533,6 @@ class KernelOp(Op):
         return result
 
     @property
-    def input_names(self) -> list:
-        return [p.buffer_id for p in self.inputs]
-
-    @property
-    def output_names(self) -> list:
-        return [p.buffer_id for p in self.outputs]
-
-    @property
     def shapes(self) -> dict:
         result: dict = dict(self.external_shapes)
         for node in self.prologue:
