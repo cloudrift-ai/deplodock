@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
+from deplodock.compiler.ops import ElementwiseOp, KernelOp, ReduceOp
 
 
 def _is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
@@ -91,7 +91,7 @@ class TileAnalysis:
     b_batch_group: int = 1
 
 
-def analyze(region: FusedRegionOp, shapes: dict[str, tuple]) -> TileAnalysis:
+def analyze(region: KernelOp, shapes: dict[str, tuple]) -> TileAnalysis:
     """Analyze a FusedRegionOp and classify its computation pattern.
 
     Args:
@@ -257,7 +257,7 @@ def _needed_by(ops: list) -> set[str]:
 
 
 def _detect_contraction(
-    region: FusedRegionOp,
+    region: KernelOp,
     phases: OpPhases,
     shapes: dict[str, tuple],
     input_access: dict[str, AccessPattern],
@@ -372,7 +372,7 @@ def _detect_contraction(
 
 
 def _epilogue_needs_per_element(
-    region: FusedRegionOp,
+    region: KernelOp,
     phases: OpPhases,
     shapes: dict[str, tuple],
     input_access: dict[str, AccessPattern],

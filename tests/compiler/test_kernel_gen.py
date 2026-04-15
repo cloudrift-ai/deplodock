@@ -23,7 +23,7 @@ from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
 from deplodock.compiler.fusion import auto_fuse
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, FusedRegionOp, InputOp, KernelOp, ReduceOp
+from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, KernelOp, ReduceOp
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
@@ -132,7 +132,7 @@ def test_kernel_gen_matmul():
     g.outputs = [red]
 
     fused = auto_fuse(g)
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) >= 1
 
     region_node = fused_nodes[0]
@@ -176,7 +176,7 @@ def test_kernel_gen_rmsnorm():
     g.outputs = [out]
 
     fused = auto_fuse(g)
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) >= 1
 
     region_node = fused_nodes[0]
@@ -217,7 +217,7 @@ def test_kernel_gen_softmax():
     g.outputs = [out]
 
     fused = auto_fuse(g)
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) >= 1
 
     region_node = fused_nodes[0]
@@ -262,7 +262,7 @@ def test_kernel_gen_silu_mul():
     fused = auto_fuse(g)
 
     # Find the fused region.
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) >= 1, "Expected at least one FusedRegionOp"
 
     # Generate kernel and verify it compiles.
@@ -339,7 +339,7 @@ def test_kernel_gen_attention():
     fused.topological_order()
 
     # Generate kernels for any fused regions that do exist (e.g., 2D matmul pairs).
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     for nd in fused_nodes:
         shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
         for nid in fused.nodes:
@@ -371,7 +371,7 @@ def test_kernel_gen_triple_matmul():
     g.outputs = [red]
 
     fused = auto_fuse(g)
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) >= 1
 
     shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
@@ -404,7 +404,7 @@ def test_kernel_gen_matmul_residual_add():
     g.outputs = [out]
 
     fused = auto_fuse(g)
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) >= 1
 
     shapes = {nid: g.nodes[nid].output.shape for nid in g.nodes}
@@ -738,7 +738,7 @@ def test_batched_matmul_detection():
     g.outputs = [red]
 
     fused = auto_fuse(g)
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) == 1, f"Expected 1 fused region, got {len(fused_nodes)}"
 
     # Analyze the fused region
@@ -906,7 +906,7 @@ def test_softmax_single_kernel():
     g.outputs = [div]
 
     fused = auto_fuse(g)
-    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [nd for nd in fused.nodes.values() if isinstance(nd.op, KernelOp)]
     assert len(fused_nodes) == 1, f"Expected 1 fused region, got {len(fused_nodes)}"
     assert len(fused_nodes[0].op.region_ops) == 5  # max, sub, exp, sum, div
 

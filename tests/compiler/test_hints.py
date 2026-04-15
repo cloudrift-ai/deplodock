@@ -183,8 +183,8 @@ def test_hints_survive_fusion():
 
     fused = auto_fuse(g)
     # The fused node should have inherited the hint.
-    from deplodock.compiler.ops import FusedRegionOp, KernelOp
+    from deplodock.compiler.ops import KernelOp
 
-    fused_nodes = [n for n in fused.nodes.values() if isinstance(n.op, (FusedRegionOp, KernelOp))]
+    fused_nodes = [n for n in fused.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(fused_nodes) == 1
     assert fused_nodes[0].hints.get("cuda.matmul.strategy") == "tma_db"

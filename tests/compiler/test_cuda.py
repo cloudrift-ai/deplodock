@@ -18,7 +18,8 @@ from deplodock.compiler.backend.ir.kernel_ir import (
     VarDecl,
 )
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, InputOp, ReduceOp
+from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
+from tests.compiler._kernel_builder import build_kernel
 
 # ---- helpers ----
 
@@ -48,17 +49,18 @@ def _lower_matmul(m=None, k=None, n=None, **matmul_hints):
     input_a = g.nodes[ew_node.inputs[0]]
     input_b = g.nodes[ew_node.inputs[1]]
     a_name, b_name, c_name = input_a.output.name, input_b.output.name, out_node.output.name
-    region = FusedRegionOp(
-        region_ops=[(ew_node.id, ew_node.op, [a_name, b_name]), (out_node.id, out_node.op, [ew_node.id])],
-        input_names=[a_name, b_name],
-        output_names=[c_name],
-    )
     shapes = {
         a_name: input_a.output.shape,
         b_name: input_b.output.shape,
         ew_node.id: ew_node.output.shape,
         c_name: out_node.output.shape,
     }
+    region = build_kernel(
+        region_ops=[(ew_node.id, ew_node.op, [a_name, b_name]), (out_node.id, out_node.op, [ew_node.id])],
+        input_names=[a_name, b_name],
+        output_names=[c_name],
+        shapes=shapes,
+    )
     strategy = matmul_hints.get("strategy", "naive")
     kernel_def, _loop_prog, _sched = lower_tiled(region, "fused_matmul", shapes, analyze(region, shapes), strategy=strategy)
     return kernel_def
@@ -367,11 +369,6 @@ def _lower_matmul_with_epilogue(epilogue_ops, extra_inputs, extra_shapes):
     input_names = ["A", "B"] + list(extra_inputs)
     # Use the last epilogue op's node_id as the output.
     out_id = epilogue_ops[-1][0]
-    region = FusedRegionOp(
-        region_ops=region_ops,
-        input_names=input_names,
-        output_names=[out_id],
-    )
     shapes = {
         "A": (M, K),
         "B": (K, N),
@@ -380,9 +377,14 @@ def _lower_matmul_with_epilogue(epilogue_ops, extra_inputs, extra_shapes):
         out_id: (M, N),
         **extra_shapes,
     }
-    # Add shapes for intermediate epilogue ops (all (M, N)).
     for nid, _, _ in epilogue_ops[:-1]:
         shapes[nid] = (M, N)
+    region = build_kernel(
+        region_ops=region_ops,
+        input_names=input_names,
+        output_names=[out_id],
+        shapes=shapes,
+    )
 
     analysis = analyze(region, shapes)
     kernel_def, _loop_prog, _sched = lower_tiled(region, "matmul_epi", shapes, analysis, strategy="naive")

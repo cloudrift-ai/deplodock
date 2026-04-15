@@ -27,7 +27,8 @@ from deplodock.compiler.backend.ir.loop_ir import (
     pretty_print,
     to_dict,
 )
-from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp
+from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+from tests.compiler._kernel_builder import build_kernel
 
 
 def _mock_schedule(block_size=(256, 1, 1), tile_m=None, tile_n=None):
@@ -187,11 +188,12 @@ def test_loop_ir_json_roundtrip():
 
 
 def _make_region_and_analysis(region_ops, input_names, output_names, shapes):
-    """Build FusedRegionOp + TileAnalysis."""
-    region = FusedRegionOp(
+    """Build KernelOp + TileAnalysis."""
+    region = build_kernel(
         region_ops=region_ops,
         input_names=input_names,
         output_names=output_names,
+        shapes=shapes,
     )
     analysis = analyze(region, shapes)
     return region, analysis

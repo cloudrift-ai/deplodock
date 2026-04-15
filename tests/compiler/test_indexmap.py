@@ -378,7 +378,7 @@ def test_transpose_indexmap_fuses_with_elementwise():
 
     from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.ir import Graph, Tensor
-    from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, IndexMapOp, InputOp, KernelOp
+    from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, InputOp, KernelOp
 
     torch.manual_seed(0)
     x = torch.randn(1, 28, 8, 64).cuda()
@@ -408,7 +408,7 @@ def test_transpose_indexmap_fuses_with_elementwise():
     fused_with_im = [
         n
         for n in fused.nodes.values()
-        if isinstance(n.op, (FusedRegionOp, KernelOp))
+        if isinstance(n.op, KernelOp)
         and any(isinstance(o, IndexMapOp) for _, o, _ in n.op.region_ops)
     ]
     assert not standalone_ims, f"IndexMap should be absorbed into fused region; standalone: {[n.id for n in standalone_ims]}"
@@ -488,7 +488,7 @@ def test_qwen_rotary_chain_fuses_into_region():
 
     from deplodock.compiler.fusion import auto_fuse
     from deplodock.compiler.ir import Graph
-    from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, IndexMapOp, KernelOp
+    from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, KernelOp
     from deplodock.compiler.rewriter import Rewriter
 
     fixture = Path(__file__).parent / "fixtures" / "qwen25_7b_layer0.json"
@@ -501,7 +501,7 @@ def test_qwen_rotary_chain_fuses_into_region():
     indexmap_regions = [
         n
         for n in fused.nodes.values()
-        if isinstance(n.op, (FusedRegionOp, KernelOp))
+        if isinstance(n.op, KernelOp)
         and any(isinstance(o, IndexMapOp) for _, o, _ in n.op.region_ops)
     ]
     assert len(indexmap_regions) >= 2, f"Expected ≥2 fused regions absorbing IndexMaps (Q + K rotary chains); got {len(indexmap_regions)}"
