@@ -61,17 +61,21 @@ def loop_ir_to_kernel(
     batched: bool = False,
     grid_2d: bool = False,
     online_reduce: bool = False,
+    tma_params: list[str] | None = None,
+    tma_config: object | None = None,
+    includes: list[str] | None = None,
     dim_strides: dict[str, list[str]] | None = None,
 ) -> KernelDef:
     """Translate a LoopProgram + Schedule into a KernelDef.
 
-    The Schedule provides backend metadata (block_size, tile dims, TMA config,
-    etc.).  The LoopProgram provides only the loop structure and dim_strides.
-    ``batched``, ``grid_2d``, and ``online_reduce`` are derived by the caller
-    (from KernelOp + schedule.load_strategy) and passed in explicitly.
+    The Schedule provides true scheduling knobs (block_size, tile dims,
+    occupancy hints).  Derived facts (``batched``, ``grid_2d``,
+    ``online_reduce``, ``tma_params``, ``tma_config``, ``includes``) are
+    computed by the caller from the KernelOp + schedule.load_strategy
+    and passed in explicitly.
     """
     global _active_tma_config, _active_dim_strides  # noqa: PLW0603
-    _active_tma_config = schedule.tma_config
+    _active_tma_config = tma_config
     _active_dim_strides = dim_strides or program.dim_strides or {}
     params = [KernelParam(dtype, name) for dtype, name in program.params]
     body = _lower_ops(program.body)
@@ -81,11 +85,11 @@ def loop_ir_to_kernel(
         params=params,
         body=body,
         block_size=schedule.grid.block_size,
-        includes=schedule.includes,
+        includes=includes,
         tile_m=schedule.tile_m,
         tile_n=schedule.tile_n,
         grid_2d=grid_2d,
-        tma_params=schedule.tma_params,
+        tma_params=tma_params,
         batched=batched,
         extra_smem_bytes=schedule.extra_smem_bytes,
         min_blocks_per_sm=schedule.min_blocks_per_sm,
