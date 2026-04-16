@@ -160,5 +160,6 @@ transpose/reshape/unsqueeze/slice/cat, linear, matmul, SDPA, mean.
 - `tests/compiler/test_pipeline.py` — end-to-end on small synthetic graphs.
 - `tests/compiler/test_torch_trace*.py`, `test_real_trace.py`, `test_hints.py` — tracer / hint coverage.
 - `tests/compiler/test_torch_ops.py` — Op.forward() + numpy backend: per-op tests + torch cross-checks.
+- `tests/compiler/rules/test_decompose_rules.py` — individual decomposition rules (SDPA, pow).
 
 Full-model E2E (TinyLlama layer) comes back in a follow-up commit once decomposition of higher-level ops is ported into the new lowering.
