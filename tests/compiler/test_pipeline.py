@@ -1,6 +1,14 @@
-"""Tests for the end-to-end pipeline: Graph → Rewriter → plan_graph → CudaBackend → GPU."""
+"""End-to-end pipeline tests: Graph → compile_graph → CudaBackend → GPU.
 
-from pathlib import Path
+Exercises the structural pipeline on small synthetic graphs that only use
+primitives the naive lowering + codegen fully supports (ElementwiseOp,
+ReduceOp, InputOp). Decomposition of higher-level ops (LinearOp,
+SdpaOp, MatmulOp, MeanOp) plus layout-op -> IndexMapOp rewriting are
+out-of-scope here; TinyLlama-layer-level E2E will land once that
+decomposition is ported into the new lowering.
+"""
+
+from __future__ import annotations
 
 import pytest
 
@@ -9,29 +17,6 @@ from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
-from deplodock.compiler.plan import plan_graph
-from deplodock.compiler.rewriter import Rewriter
-
-# ---- helpers ----
-
-
-def _make_matmul_graph(m, k, n):
-    g = Graph()
-    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (m, k)), node_id="A")
-    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (k, n)), node_id="B")
-    g.inputs = [a, b]
-    ew = g.add_node(op=ElementwiseOp(fn="mul"), inputs=[a, b], output=Tensor("AB", (m, k, n)), node_id="ew")
-    red = g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=[ew], output=Tensor("C", (m, n)), node_id="red")
-    g.outputs = [red]
-    return g
-
-
-def _load_rewriter():
-    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
-    return Rewriter.from_directory(rules_dir)
-
-
-# ---- tests ----
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
@@ -39,130 +24,107 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
-def test_compile_graph_fuses_matmul():
-    """compile_graph applies fusion rules and produces KernelOp."""
-    g = _make_matmul_graph(4, 3, 2)
-    rewriter = _load_rewriter()
-    from tests.compiler._fusion_helper import auto_fuse
-
-    compiled, traces = compile_graph(g, rewriter)
-    compiled = auto_fuse(compiled)
-
-    op_types = {type(n.op).__name__ for n in compiled.nodes.values()}
-    assert "KernelOp" in op_types
-
-    assert len(traces) > 0
-
-
-def test_plan_graph_from_matmul():
-    """plan_graph produces a plan with one matmul op from a fused graph."""
-    g = _make_matmul_graph(4, 3, 2)
-    from tests.compiler._fusion_helper import auto_fuse
-
-    compiled, _ = compile_graph(g, _load_rewriter())
-    compiled = auto_fuse(compiled)
-    plan = plan_graph(compiled)
-
-    fused_ops = [op for op in plan.ops if op.op in ("matmul", "fused_region")]
-    assert len(fused_ops) >= 1
-
-
-def test_contraction_softmax_large_n_splits():
-    """Contraction + softmax with N > tile_n (128) produces multiple launches.
-
-    When the attention dimension exceeds the tile width, the backend can't
-    fuse softmax into the matmul epilogue. It should split into separate
-    matmul + softmax kernel launches instead of emitting undefined symbols.
-    """
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import generate_source
-    from deplodock.compiler.ops import ConstantOp
-    from tests.compiler._fusion_helper import auto_fuse
-
-    # Build QK^T + softmax: matmul(Q, K^T) → scale → softmax.
-    # N = 512 > tile_n = 128, so the softmax can't be fused in-CTA.
-    seq_len = 512
-    head_dim = 64
+def _pointwise_chain_graph() -> Graph:
+    """y = exp(-(x)) — exercises two chained pointwise kernels."""
     g = Graph()
-    q = g.add_node(op=InputOp(), inputs=[], output=Tensor("Q", (seq_len, head_dim)), node_id="Q")
-    k = g.add_node(op=InputOp(), inputs=[], output=Tensor("K", (head_dim, seq_len)), node_id="K")
-    g.inputs = [q, k]
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (8,)), node_id="x")
+    g.add_node(op=ElementwiseOp("neg"), inputs=["x"], output=Tensor("n", (8,)), node_id="n")
+    g.add_node(op=ElementwiseOp("exp"), inputs=["n"], output=Tensor("y", (8,)), node_id="y")
+    g.inputs = ["x"]
+    g.outputs = ["y"]
+    return g
 
-    # QK^T: matmul(Q, K) = mul + reduce_sum.
-    ew = g.add_node(op=ElementwiseOp(fn="mul"), inputs=[q, k], output=Tensor("QK_ew", (seq_len, head_dim, seq_len)), node_id="ew")
-    red = g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=[ew], output=Tensor("QK", (seq_len, seq_len)), node_id="red")
 
-    # Scale by constant.
-    scale = g.add_node(op=ConstantOp(name="scale"), inputs=[], output=Tensor("scale", (1,)), node_id="scale")
-    scaled = g.add_node(op=ElementwiseOp(fn="mul"), inputs=[red, scale], output=Tensor("scaled", (seq_len, seq_len)), node_id="scaled")
+def _matmul_graph(m: int, k: int, n: int) -> Graph:
+    """c = mul_sum(a, b): an (m, k) × (k, n) matmul expressed as mul + sum."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k)), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (k, n)), node_id="b")
+    g.add_node(
+        op=ElementwiseOp("mul"),
+        inputs=["a", "b"],
+        output=Tensor("ab", (m, k, n)),
+        node_id="ab",
+    )
+    g.add_node(
+        op=ReduceOp(fn="sum", axis=1),
+        inputs=["ab"],
+        output=Tensor("c", (m, n)),
+        node_id="c",
+    )
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+    return g
 
-    # Softmax: max → sub → exp → sum → div.
-    mx = g.add_node(op=ReduceOp(fn="max", axis=-1), inputs=[scaled], output=Tensor("mx", (seq_len, 1)), node_id="mx")
-    sub = g.add_node(op=ElementwiseOp(fn="sub"), inputs=[scaled, mx], output=Tensor("sub", (seq_len, seq_len)), node_id="sub")
-    exp = g.add_node(op=ElementwiseOp(fn="exp"), inputs=[sub], output=Tensor("exp", (seq_len, seq_len)), node_id="exp")
-    sm = g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=[exp], output=Tensor("sm", (seq_len, 1)), node_id="sm")
-    out = g.add_node(op=ElementwiseOp(fn="div"), inputs=[exp, sm], output=Tensor("out", (seq_len, seq_len)), node_id="out")
-    g.outputs = [out]
 
-    # Fuse and compile.
-    fused = auto_fuse(g)
-    plan = plan_graph(fused)
+# ---------------------------------------------------------------------------
+# compile_graph semantics (no GPU required)
+# ---------------------------------------------------------------------------
 
-    backend = CudaBackend()
-    program = backend.compile(plan)
 
-    # Online reduction fuses matmul + softmax into a single kernel.
-    assert len(program.launches) >= 1, f"Expected >= 1 launch, got {len(program.launches)}"
+def test_compile_graph_lowers_matmul_to_single_kernel():
+    kernels = compile_graph(_matmul_graph(4, 3, 2))
+    assert len(kernels) == 1
+    assert kernels[0].contraction is not None
+    assert kernels[0].reduce_stages == ()
 
-    # Generated source should be valid (no undefined identifiers).
-    source = generate_source(program, mode="run")
-    assert "int main()" in source
+
+def test_compile_graph_chains_pointwise_as_separate_kernels():
+    kernels = compile_graph(_pointwise_chain_graph())
+    # neg and exp become separate singleton pointwise kernels.
+    assert len(kernels) == 2
+    assert all(k.contraction is None and k.reduce_stages == () for k in kernels)
+
+
+def test_cuda_backend_compile_from_pipeline():
+    """End-to-end: compile_graph -> CudaBackend.compile -> Program."""
+    kernels = compile_graph(_matmul_graph(4, 3, 2))
+    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=["c"])
+    assert len(program.launches) == 1
+    launch = program.launches[0]
+    assert launch.kernel_name.endswith("_contract")
+    roles = {b.name: b.role for b in program.buffers}
+    assert roles["a"] == "input"
+    assert roles["b"] == "input"
+    assert roles["c"] == "output"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end on GPU
+# ---------------------------------------------------------------------------
 
 
 @requires_cuda
-def test_pipeline_end_to_end(dump_dir):
-    """Full pipeline: graph → fuse → plan → CudaBackend → GPU."""
-    g = _make_matmul_graph(4, 3, 2)
-    from tests.compiler._fusion_helper import auto_fuse
+def test_pointwise_chain_runs_on_gpu():
+    g = _pointwise_chain_graph()
+    kernels = compile_graph(g)
+    program = CudaBackend().compile(kernels, graph_inputs=["x"], graph_outputs=["y"])
 
-    dump_dir.dump_input_graph(g)
-    compiled, traces = compile_graph(g, _load_rewriter())
-    dump_dir.dump_passes(traces)
-    compiled = auto_fuse(compiled)
-    dump_dir.dump_fused_graph(compiled)
-    plan = plan_graph(compiled)
-    dump_dir.dump_plan(plan)
+    import math
 
-    backend = CudaBackend()
-    program = backend.compile(plan)
-    dump_dir.dump_program(program)
-    result = backend.run(program)
-    dump_dir.dump_result(result)
-
-    # Output should have values (matmul result).
-    assert len(result.outputs) == 1
-    output_values = list(result.outputs.values())[0]
-    assert len(output_values) == 4 * 2  # M * N
+    x_data = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0]
+    expected = [math.exp(-xi) for xi in x_data]
+    result = CudaBackend().run(program, input_data={"x": x_data})
+    assert result.outputs["y"] == pytest.approx(expected, rel=1e-5)
 
 
 @requires_cuda
-def test_pipeline_benchmark(dump_dir):
-    """Benchmark through canonical pipeline returns timing."""
-    g = _make_matmul_graph(64, 64, 64)
-    from tests.compiler._fusion_helper import auto_fuse
+def test_matmul_runs_on_gpu():
+    g = _matmul_graph(3, 4, 5)
+    kernels = compile_graph(g)
+    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=["c"])
 
-    dump_dir.dump_input_graph(g)
-    compiled, traces = compile_graph(g, _load_rewriter())
-    dump_dir.dump_passes(traces)
-    compiled = auto_fuse(compiled)
-    dump_dir.dump_fused_graph(compiled)
-    plan = plan_graph(compiled)
-    dump_dir.dump_plan(plan)
+    import random
 
-    backend = CudaBackend()
-    program = backend.compile(plan)
-    dump_dir.dump_program(program)
-    result = backend.benchmark(program, warmup=2, num_iters=3)
-    dump_dir.dump_benchmark(result)
-
-    assert result.time_ms > 0
+    random.seed(0)
+    a_data = [random.random() for _ in range(3 * 4)]
+    b_data = [random.random() for _ in range(4 * 5)]
+    expected = []
+    for m in range(3):
+        for n in range(5):
+            s = 0.0
+            for k in range(4):
+                s += a_data[m * 4 + k] * b_data[k * 5 + n]
+            expected.append(s)
+    result = CudaBackend().run(program, input_data={"a": a_data, "b": b_data})
+    assert result.outputs["c"] == pytest.approx(expected, rel=1e-5)
