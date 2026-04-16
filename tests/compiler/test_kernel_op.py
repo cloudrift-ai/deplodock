@@ -8,7 +8,6 @@ runtime invariants enforced by ``__post_init__``.
 import pytest
 
 from deplodock.compiler.backend.ir.expr import Var
-from deplodock.compiler.ir import Node, Tensor
 from deplodock.compiler.ops import (
     Combine,
     ContractionCore,
@@ -22,15 +21,6 @@ from deplodock.compiler.ops import (
     ReduceOp,
     ReduceStage,
 )
-
-
-def _ew(nid: str, fn: str, inputs: list[str], shape: tuple) -> Node:
-    return Node(id=nid, op=ElementwiseOp(fn=fn), inputs=inputs, output=Tensor(name=nid, shape=shape))
-
-
-def _red(nid: str, fn: str, axis, inputs: list[str], shape: tuple) -> Node:
-    return Node(id=nid, op=ReduceOp(fn=fn, axis=axis), inputs=inputs, output=Tensor(name=nid, shape=shape))
-
 
 # ---------------------------------------------------------------------------
 # Port — signal-flow leaf
@@ -55,7 +45,7 @@ def test_port_with_indexmap():
 
 
 def test_combine_cross_input_add():
-    add = _ew("n0", "add", ["a", "b"], (4,))
+    add = ElementwiseOp("add")
     c = Combine(sources=(Port("a"), Port("b")), ops=(add,))
     assert len(c.sources) == 2
     assert c.ops == (add,)
@@ -72,7 +62,7 @@ def test_combine_rejects_empty_sources():
 
 
 def test_combine_rejects_reduce_in_ops():
-    red = _red("n0", "sum", -1, ["a"], ())
+    red = ReduceOp("sum", -1)
     with pytest.raises(TypeError, match="expected ElementwiseOp"):
         Combine(sources=(Port("a"),), ops=(red,))
 
@@ -99,8 +89,7 @@ def test_mux_rejects_empty_branches():
 
 
 def test_mux_nests_into_combine():
-    """A Combine can have a Mux as one of its sources."""
-    dequant = _ew("n0", "mul", ["src", "scale"], (4,))
+    dequant = ElementwiseOp("mul")
     muxed = Mux(
         branches=(
             MuxBranch(input=Port("src_a"), select=Var("cond_a")),
@@ -117,8 +106,8 @@ def test_mux_nests_into_combine():
 
 
 def test_contraction_matmul_shape():
-    mul = _ew("mul", "mul", ["a", "b"], (4, 3, 5))  # per-K product
-    red = _red("red", "sum", -1, ["mul"], (4, 3))
+    mul = ElementwiseOp("mul")
+    red = ReduceOp("sum", -1)
     operand = Combine(sources=(Port("a"), Port("b")), ops=(mul,))
     cc = ContractionCore(operand=operand, k_axis=-1, reduce=red)
     assert cc.k_axis == -1
@@ -126,7 +115,7 @@ def test_contraction_matmul_shape():
 
 
 def test_contraction_rejects_elementwise_as_reduce():
-    mul = _ew("mul", "mul", ["a", "b"], (4, 3, 5))
+    mul = ElementwiseOp("mul")
     with pytest.raises(TypeError, match="expected ReduceOp"):
         ContractionCore(operand=Port("x"), k_axis=-1, reduce=mul)
 
@@ -137,27 +126,27 @@ def test_contraction_rejects_elementwise_as_reduce():
 
 
 def test_reduce_stage_empty_pre_ops():
-    red = _red("r0", "max", -1, ["x"], (4,))
+    red = ReduceOp("max", -1)
     stage = ReduceStage(pre_ops=(), reduce=red)
     assert stage.pre_ops == ()
 
 
 def test_reduce_stage_softmax_sum():
-    sub = _ew("sub", "sub", ["x", "rmax"], (4, 8))
-    exp = _ew("exp", "exp", ["sub"], (4, 8))
-    red = _red("rsum", "sum", -1, ["exp"], (4,))
+    sub = ElementwiseOp("sub")
+    exp = ElementwiseOp("exp")
+    red = ReduceOp("sum", -1)
     stage = ReduceStage(pre_ops=(sub, exp), reduce=red)
     assert stage.pre_ops == (sub, exp)
 
 
 def test_reduce_stage_rejects_reduce_in_pre_ops():
-    red = _red("r0", "sum", -1, ["x"], (4,))
+    red = ReduceOp("sum", -1)
     with pytest.raises(TypeError, match="expected ElementwiseOp"):
         ReduceStage(pre_ops=(red,), reduce=red)
 
 
 def test_reduce_stage_rejects_elementwise_as_reduce():
-    mul = _ew("mul", "mul", ["x", "y"], (4,))
+    mul = ElementwiseOp("mul")
     with pytest.raises(TypeError, match="expected ReduceOp"):
         ReduceStage(pre_ops=(), reduce=mul)
 
@@ -168,8 +157,7 @@ def test_reduce_stage_rejects_elementwise_as_reduce():
 
 
 def test_kernel_pointwise():
-    """Pointwise kernel: no contraction, no reduces, all work in inputs[0]."""
-    add = _ew("add", "add", ["x", "y"], (4,))
+    add = ElementwiseOp("add")
     body = Combine(sources=(Port("x"), Port("y")), ops=(add,))
     k = KernelOp(inputs=(body,), outputs=(Port("z"),))
     assert k.contraction is None
@@ -178,32 +166,25 @@ def test_kernel_pointwise():
 
 
 def test_kernel_matmul():
-    """Plain matmul: contraction only, no reduce_stages, no epilogue."""
-    mul = _ew("mul", "mul", ["a", "b"], (4, 3, 5))
-    red = _red("red", "sum", -1, ["mul"], (4, 3))
+    mul = ElementwiseOp("mul")
+    red = ReduceOp("sum", -1)
     operand = Combine(sources=(Port("a"), Port("b")), ops=(mul,))
     cc = ContractionCore(operand=operand, k_axis=-1, reduce=red)
-    k = KernelOp(
-        inputs=(Port("a"), Port("b")),
-        outputs=(Port("y"),),
-        contraction=cc,
-    )
+    k = KernelOp(inputs=(Port("a"), Port("b")), outputs=(Port("y"),), contraction=cc)
     assert k.contraction is cc
-    assert k.reduce_stages == ()
 
 
 def test_kernel_matmul_plus_softmax():
-    """Contraction + reduce chain: matmul feeding softmax (max, sub+exp+sum, div)."""
-    mul = _ew("mul", "mul", ["q", "k"], (4, 8, 16))
-    contraction_reduce = _red("cred", "sum", -1, ["mul"], (4, 8))
+    mul = ElementwiseOp("mul")
+    contraction_reduce = ReduceOp("sum", -1)
     operand = Combine(sources=(Port("Q"), Port("K")), ops=(mul,))
     cc = ContractionCore(operand=operand, k_axis=-1, reduce=contraction_reduce)
 
-    rmax = _red("rmax", "max", -1, ["cred"], (4,))
-    sub = _ew("sub", "sub", ["cred", "rmax"], (4, 8))
-    exp = _ew("exp", "exp", ["sub"], (4, 8))
-    rsum = _red("rsum", "sum", -1, ["exp"], (4,))
-    div = _ew("div", "div", ["exp", "rsum"], (4, 8))
+    rmax = ReduceOp("max", -1)
+    sub = ElementwiseOp("sub")
+    exp = ElementwiseOp("exp")
+    rsum = ReduceOp("sum", -1)
+    div = ElementwiseOp("div")
 
     k = KernelOp(
         inputs=(Port("Q"), Port("K")),
@@ -220,12 +201,11 @@ def test_kernel_matmul_plus_softmax():
 
 
 def test_kernel_pure_reduce_chain():
-    """Pure softmax: reduce_stages without a contraction."""
-    rmax = _red("rmax", "max", -1, ["x"], (4,))
-    sub = _ew("sub", "sub", ["x", "rmax"], (4, 8))
-    exp = _ew("exp", "exp", ["sub"], (4, 8))
-    rsum = _red("rsum", "sum", -1, ["exp"], (4,))
-    div = _ew("div", "div", ["exp", "rsum"], (4, 8))
+    rmax = ReduceOp("max", -1)
+    sub = ElementwiseOp("sub")
+    exp = ElementwiseOp("exp")
+    rsum = ReduceOp("sum", -1)
+    div = ElementwiseOp("div")
 
     k = KernelOp(
         inputs=(Port("x"),),
@@ -241,8 +221,7 @@ def test_kernel_pure_reduce_chain():
 
 
 def test_kernel_scatter_output():
-    """Mux on the output side models scatter / masked writeout."""
-    add = _ew("add", "add", ["x", "y"], (4,))
+    add = ElementwiseOp("add")
     body = Combine(sources=(Port("x"), Port("y")), ops=(add,))
     scatter = Mux(
         branches=(
@@ -255,10 +234,6 @@ def test_kernel_scatter_output():
 
 
 def test_kernel_epilogue_rejects_reduce():
-    red = _red("r0", "sum", -1, ["x"], (4,))
+    red = ReduceOp("sum", -1)
     with pytest.raises(TypeError, match="expected ElementwiseOp"):
-        KernelOp(
-            inputs=(Port("x"),),
-            outputs=(Port("y"),),
-            epilogue=(red,),
-        )
+        KernelOp(inputs=(Port("x"),), outputs=(Port("y"),), epilogue=(red,))

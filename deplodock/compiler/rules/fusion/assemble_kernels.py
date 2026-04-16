@@ -109,6 +109,12 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
             dtype=last_node.output.dtype,
         ),
     )
+    # Promote hints from consumed graph nodes to the KernelOp node.
+    for nid in all_consumed:
+        orig = graph.nodes.get(nid)
+        if orig is not None and orig.hints:
+            g.nodes[new_nid].hints.merge(orig.hints)
+
     g.replace_node(last_nid, new_nid)
     for nid in all_consumed:
         if nid in g.nodes and nid != last_nid:
@@ -142,11 +148,11 @@ def _build_contraction(graph: Graph, chain: ChainMatch, port_map: dict) -> Contr
     red_node = graph.nodes[contraction_reduce_ids[0]]
 
     src_ports = tuple(port_map.get(inp, Port(buffer_id=inp)) for inp in mul_node.inputs)
-    operand = Combine(sources=src_ports, ops=(mul_node,))
+    operand = Combine(sources=src_ports, ops=(mul_node.op,))
 
     assert isinstance(red_node.op, ReduceOp)
     k_axis = red_node.op.axis if isinstance(red_node.op.axis, int) else -1
-    return ContractionCore(operand=operand, k_axis=k_axis, reduce=red_node)
+    return ContractionCore(operand=operand, k_axis=k_axis, reduce=red_node.op)
 
 
 def _build_reduce_stages(graph: Graph, chain: ChainMatch) -> list[ReduceStage]:
@@ -156,16 +162,16 @@ def _build_reduce_stages(graph: Graph, chain: ChainMatch) -> list[ReduceStage]:
         reduce_node = None
         for seg in group_segs:
             if seg.name.endswith(".pre_ops"):
-                pre_ops = [graph.nodes[nid] for nid in seg.node_ids]
+                pre_ops = [graph.nodes[nid].op for nid in seg.node_ids]
             elif seg.name.endswith(".reduce"):
                 reduce_node = graph.nodes[seg.node_ids[0]]
         if reduce_node is not None:
-            stages.append(ReduceStage(pre_ops=tuple(pre_ops), reduce=reduce_node))
+            stages.append(ReduceStage(pre_ops=tuple(pre_ops), reduce=reduce_node.op))
     return stages
 
 
-def _build_epilogue(graph: Graph, chain: ChainMatch) -> list[Node]:
-    return [graph.nodes[nid] for nid in chain.get("epilogue")]
+def _build_epilogue(graph: Graph, chain: ChainMatch) -> list[ElementwiseOp]:
+    return [graph.nodes[nid].op for nid in chain.get("epilogue")]
 
 
 def _last_node_id(chain: ChainMatch) -> str:

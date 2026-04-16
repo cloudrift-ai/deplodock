@@ -38,7 +38,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deplodock.compiler.backend.ir.expr import Expr
-    from deplodock.compiler.ir import Node
 
 
 @dataclass
@@ -487,7 +486,7 @@ class Combine:
     """
 
     sources: tuple[KernelInput, ...]
-    ops: tuple[Node[ElementwiseOp], ...]
+    ops: tuple[ElementwiseOp, ...]
 
     def __post_init__(self) -> None:
         if not self.sources:
@@ -521,10 +520,10 @@ class ContractionCore:
 
     operand: KernelInput
     k_axis: int
-    reduce: Node[ReduceOp]
+    reduce: ReduceOp
 
     def __post_init__(self) -> None:
-        _assert_reduce_node(self.reduce, "ContractionCore.reduce")
+        _assert_reduce_op(self.reduce, "ContractionCore.reduce")
 
 
 @dataclass
@@ -540,12 +539,12 @@ class ReduceStage:
     ``pre_ops`` consume in-register accumulators, not external loads.
     """
 
-    pre_ops: tuple[Node[ElementwiseOp], ...]
-    reduce: Node[ReduceOp]
+    pre_ops: tuple[ElementwiseOp, ...]
+    reduce: ReduceOp
 
     def __post_init__(self) -> None:
         _assert_elementwise_chain(self.pre_ops, "ReduceStage.pre_ops")
-        _assert_reduce_node(self.reduce, "ReduceStage.reduce")
+        _assert_reduce_op(self.reduce, "ReduceStage.reduce")
 
 
 @dataclass
@@ -578,7 +577,7 @@ class KernelOp(Op):
     outputs: tuple[KernelOutput, ...]
     contraction: ContractionCore | None = None
     reduce_stages: tuple[ReduceStage, ...] = ()
-    epilogue: tuple[Node[ElementwiseOp], ...] = ()
+    epilogue: tuple[ElementwiseOp, ...] = ()
     external_shapes: dict = field(default_factory=dict)
     kernel_source: str = ""  # backend-set after emission
 
@@ -587,26 +586,27 @@ class KernelOp(Op):
 
 
 # ---------------------------------------------------------------------------
-# Runtime invariant helpers — back the type annotations on chains / slots.
-# Python's type system can't statically enforce that a Node's ``op`` is a
-# specific subclass; these run at construction time to fail loudly when a
-# rule (or a test) mis-files an op into the wrong slot.
+# OpSlot — lightweight operation descriptor for structural chains.
+# Position in the tuple IS the connectivity; shape is derived via
+# op.infer_output_shape() when needed.
 # ---------------------------------------------------------------------------
 
 
-type ElementwiseChain = tuple[Node[ElementwiseOp], ...]
+type OpSlot = ElementwiseOp | ReduceOp
+type ElementwiseChain = tuple[ElementwiseOp, ...]
+
+
+# ---------------------------------------------------------------------------
+# Runtime invariant helpers
+# ---------------------------------------------------------------------------
 
 
 def _assert_elementwise_chain(chain: ElementwiseChain, where: str) -> None:
-    for i, node in enumerate(chain):
-        _assert_elementwise_node(node, f"{where}[{i}]")
+    for i, op in enumerate(chain):
+        if not isinstance(op, ElementwiseOp):
+            raise TypeError(f"{where}[{i}] is {type(op).__name__}, expected ElementwiseOp")
 
 
-def _assert_elementwise_node(node: Node[ElementwiseOp], where: str) -> None:
-    if not isinstance(node.op, ElementwiseOp):
-        raise TypeError(f"{where} has op {type(node.op).__name__}, expected ElementwiseOp")
-
-
-def _assert_reduce_node(node: Node[ReduceOp], where: str) -> None:
-    if not isinstance(node.op, ReduceOp):
-        raise TypeError(f"{where} has op {type(node.op).__name__}, expected ReduceOp")
+def _assert_reduce_op(op: ReduceOp, where: str) -> None:
+    if not isinstance(op, ReduceOp):
+        raise TypeError(f"{where} is {type(op).__name__}, expected ReduceOp")

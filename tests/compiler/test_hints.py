@@ -157,21 +157,25 @@ def test_graph_copy_preserves_hints():
 
 
 def test_hints_flow_through_lower():
-    """Node hints are preserved on the Node instance stored inside a KernelOp.
+    """Node hints from consumed graph nodes are promoted to the KernelOp's graph node.
 
-    After lowering, the matmul pair (mul + sum) becomes one KernelOp whose
-    ``contraction.operand.ops[0]`` is the original mul ``Node`` with its
-    hints intact, and ``contraction.reduce`` is the original sum ``Node``.
+    After fusion, the matmul pair (mul + sum) becomes one KernelOp graph
+    node whose ``.hints`` carries the merged hints from all consumed nodes.
     """
-    from deplodock.compiler.pipeline import compile_graph
+    from deplodock.compiler.rewriter import Rewriter
 
     g = _matmul_graph()
     ew_id = next(nid for nid, n in g.nodes.items() if isinstance(n.op, ElementwiseOp))
     g.nodes[ew_id].hints.set("cuda.matmul.strategy", "tma_db")
 
-    kernels = compile_graph(g)
-    assert len(kernels) == 1
-    contraction = kernels[0].contraction
-    assert contraction is not None
-    mul_node = contraction.operand.ops[0]
-    assert mul_node.hints.get("cuda.matmul.strategy") == "tma_db"
+    from pathlib import Path
+
+    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+    rewriter = Rewriter.from_directory(rules_dir)
+    fused = rewriter.apply(g)
+
+    from deplodock.compiler.ops import KernelOp
+
+    kernel_nodes = [n for n in fused.nodes.values() if isinstance(n.op, KernelOp)]
+    assert len(kernel_nodes) == 1
+    assert kernel_nodes[0].hints.get("cuda.matmul.strategy") == "tma_db"

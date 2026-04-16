@@ -68,7 +68,7 @@ def test_reduce_sum():
     kernels = compile_graph(g)
     assert len(kernels) == 1
     assert len(kernels[0].reduce_stages) == 1
-    assert kernels[0].reduce_stages[0].reduce.op.fn == "sum"
+    assert kernels[0].reduce_stages[0].reduce.fn == "sum"
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ def test_matmul_mul_sum():
     kernels = compile_graph(g)
     assert len(kernels) == 1
     assert isinstance(kernels[0].contraction, ContractionCore)
-    assert kernels[0].contraction.reduce.op.fn == "sum"
+    assert kernels[0].contraction.reduce.fn == "sum"
 
 
 def test_no_matmul_when_mul_fans_out():
