@@ -101,13 +101,18 @@ _DEFAULT_OP_INFO = OpInfo(1)
 
 
 def _drop_axis(shape: tuple, axis: int | str) -> tuple:
-    """Return shape with the given axis removed (handles negative axes)."""
+    """Return shape with the given axis set to 1 (keepdim=True semantics).
+
+    Keeping the reduced dim as size-1 ensures that post-reduce values
+    broadcast correctly with pre-reduce values (e.g. RMSNorm's
+    ``mul(X:(M,K), rsqrt:(M,1))`` broadcasts to ``(M,K)``).
+    """
     if not isinstance(axis, int):
-        return tuple(shape)  # symbolic axis — leave shape as-is
+        return tuple(shape)
     a = axis if axis >= 0 else len(shape) + axis
     if a < 0 or a >= len(shape):
         return tuple(shape)
-    return tuple(shape[:a]) + tuple(shape[a + 1 :])
+    return tuple(shape[:a]) + (1,) + tuple(shape[a + 1 :])
 
 
 @dataclass
