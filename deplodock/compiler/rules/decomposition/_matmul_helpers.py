@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.coord_expr import placeholder
-from deplodock.compiler.ops import IndexMapOp, IndexSource
+from deplodock.compiler.ir.expr import placeholder
+from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
 
 
 def matmul_unsqueeze(a_shape: tuple, b_shape: tuple) -> tuple[IndexMapOp, IndexMapOp, tuple, int]:

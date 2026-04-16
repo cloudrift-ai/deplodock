@@ -1,8 +1,8 @@
 """Tests for the hint system."""
 
-from deplodock.compiler.hints import Hints, resolve_hints
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.graph import Graph, Hints, Tensor, resolve_hints
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
 
 def _matmul_graph() -> Graph:
@@ -174,7 +174,7 @@ def test_hints_flow_through_lower():
     rewriter = Rewriter.from_directory(rules_dir)
     fused = rewriter.apply(g)
 
-    from deplodock.compiler.ops import KernelOp
+    from deplodock.compiler.ir.block import KernelOp
 
     kernel_nodes = [n for n in fused.nodes.values() if isinstance(n.op, KernelOp)]
     assert len(kernel_nodes) == 1

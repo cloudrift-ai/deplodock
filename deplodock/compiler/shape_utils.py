@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.ir import Tensor
+from deplodock.compiler.ir.graph import Tensor
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir import Graph
+    from deplodock.compiler.ir.graph import Graph
 
 
 def is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:

@@ -1,8 +1,9 @@
 """Decompose silu(x) into x * recip(1 + exp(-x)) to enable SiLU+Mul fusion."""
 
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp
 
 GRAMMAR = [Production("root", ElementwiseOp, "1", {"fn": "silu"})]
 

@@ -1,8 +1,10 @@
 """Decompose MeanOp into sum + div by the reduced dimension size."""
 
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.frontend import MeanOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, MeanOp, ReduceOp
 
 GRAMMAR = [Production("root", MeanOp, "1")]
 

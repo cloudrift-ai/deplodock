@@ -2,8 +2,9 @@
 
 import pytest
 
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
 # ---- helpers ----
 

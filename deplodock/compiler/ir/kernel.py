@@ -1,15 +1,21 @@
-"""Kernel IR: imperative AST for GPU kernel code generation.
+"""Kernel IR: imperative C-like AST for GPU kernel code generation.
 
-Backend-agnostic: the AST nodes represent generic C/C++ constructs
-(variables, loops, array accesses, function calls) that can be emitted
-as CUDA, HIP, or any C-like GPU language by a matching codegen printer.
+The last IR before textual C/C++ source. Nodes represent generic C/C++
+constructs (variables, loops, array accesses, function calls) that can be
+emitted as CUDA, HIP, or any C-like GPU language by a matching codegen
+printer (see ``backend/kernel_codegen.py``).
+
+Builds on the shared expression AST from ``ir.expr``; adds kernel-specific
+expression nodes (``ArrayAccess``, ``Cast``, ``FieldAccess``, ``VectorLoad``)
+and a hierarchy of statement types (``VarDecl``, ``Assign``, ``ForLoop``,
+``IfStmt``, ``SyncThreads``, ``ArrayDecl``, ``PragmaUnroll``, ``RawCode``).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.backend.ir.expr import (
+from deplodock.compiler.ir.expr import (
     BinOp,
     Builtin,
     Expr,
@@ -20,7 +26,8 @@ from deplodock.compiler.backend.ir.expr import (
     _ExprOps,
 )
 
-# Re-export shared types so existing ``from kernel_ir import Var`` still works.
+# Re-export shared types so existing ``from kernel_ir import Var`` style
+# works after the move.
 __all__ = [
     # Shared expression types (re-exported)
     "Var",

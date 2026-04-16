@@ -8,8 +8,9 @@ import pytest
 import torch
 
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp, ReduceOp
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
@@ -90,7 +91,7 @@ def test_e2e_reduce_sum():
 
 @requires_cuda
 def test_e2e_matmul():
-    from deplodock.compiler.ops import MatmulOp
+    from deplodock.compiler.ir.frontend import MatmulOp
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")

@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
-from deplodock.compiler.ir import Graph
+from deplodock.compiler.ir.graph import Graph
 
 # ---------------------------------------------------------------------------
 # Grammar types

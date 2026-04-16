@@ -3,15 +3,18 @@
 import pytest
 import torch
 
-from deplodock.compiler.backend.ir.expr import BinOp, Literal, Ternary, Var
-from deplodock.compiler.coord_expr import (
+from deplodock.compiler.ir.expr import (
     PLACEHOLDER_PREFIX,
+    BinOp,
+    Literal,
+    Ternary,
+    Var,
     compose_index_maps,
     is_placeholder,
     placeholder,
     substitute,
 )
-from deplodock.compiler.ops import IndexMapOp, IndexSource
+from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

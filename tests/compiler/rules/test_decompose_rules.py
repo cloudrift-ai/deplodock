@@ -9,22 +9,20 @@ from pathlib import Path
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import (
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.frontend import (
     CatOp,
-    ConstantOp,
-    ElementwiseOp,
-    InputOp,
     LinearOp,
     MatmulOp,
     MeanOp,
-    ReduceOp,
     ReshapeOp,
     SdpaOp,
     SliceOp,
     TransposeOp,
     UnsqueezeOp,
 )
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass, Rule
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "decomposition"

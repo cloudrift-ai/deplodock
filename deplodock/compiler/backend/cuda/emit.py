@@ -10,8 +10,10 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend.cuda.program import CudaLaunch
-from deplodock.compiler.backend.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var
-from deplodock.compiler.backend.ir.kernel_ir import (
+from deplodock.compiler.backend.program import Buffer, Program
+from deplodock.compiler.ir.block import Combine, KernelInput, KernelOp, Mux, Port
+from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var
+from deplodock.compiler.ir.kernel import (
     ArrayAccess,
     AugAssign,
     ForLoop,
@@ -21,20 +23,11 @@ from deplodock.compiler.backend.ir.kernel_ir import (
     Stmt,
     VarDecl,
 )
-from deplodock.compiler.backend.ir.kernel_ir import (
+from deplodock.compiler.ir.kernel import (
     Assign as IrAssign,
 )
-from deplodock.compiler.backend.program import Buffer, Program
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.lower import KernelInfo
-from deplodock.compiler.ops import (
-    Combine,
-    ElementwiseOp,
-    KernelInput,
-    KernelOp,
-    Mux,
-    Port,
-    ReduceOp,
-)
 
 _BLOCK = 256
 
@@ -200,7 +193,7 @@ def _emit_mux_value(
     Decomposes the flat coord into per-axis output coordinates and
     substitutes them into the Mux branch select predicates.
     """
-    from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute
+    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, substitute
 
     # Decompose flat coord into per-axis output coords.
     ndim = len(out_shape)
@@ -234,7 +227,7 @@ def _emit_mux_value(
 
 
 def _emit_indexmap_load(buf_name: str, indexmap, coord: Expr, src_shape: tuple, stmts: list[Stmt], name_seq: list[int]) -> Expr:
-    from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute
+    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, substitute
 
     assert len(indexmap.sources) == 1
     src = indexmap.sources[0]
@@ -416,7 +409,7 @@ def _emit_plan(plan, info: KernelInfo, shapes: dict[str, tuple], buf_shapes: dic
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
     if fn == "max":
-        from deplodock.compiler.backend.ir.kernel_ir import VarAssign
+        from deplodock.compiler.ir.kernel import VarAssign
 
         return VarAssign(name=acc_name, value=FuncCall("fmaxf", [Var(acc_name), value]))
     op = {"sum": "+=", "prod": "*="}.get(fn, "+=")
@@ -592,7 +585,7 @@ def _reduce_n_rows(kernel: KernelOp, shapes: dict[str, tuple]) -> int:
 
 
 def _emit_kernel_source(kernel_def: KernelDef) -> str:
-    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as _emit
+    from deplodock.compiler.backend.kernel_codegen import emit_kernel as _emit
 
     return _emit(kernel_def)
 

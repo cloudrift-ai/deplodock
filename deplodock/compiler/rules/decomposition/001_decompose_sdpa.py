@@ -7,20 +7,12 @@ via integer-divide indexing: ``K[b, q_head // group_size, s, d]``.
 
 import math
 
-from deplodock.compiler.backend.ir.expr import BinOp, Literal
-from deplodock.compiler.coord_expr import placeholder
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
+from deplodock.compiler.ir.frontend import SdpaOp, TransposeOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import (
-    ConstantOp,
-    ElementwiseOp,
-    IndexMapOp,
-    IndexSource,
-    InputOp,
-    ReduceOp,
-    SdpaOp,
-    TransposeOp,
-)
 
 GRAMMAR = [Production("root", SdpaOp, "1")]
 

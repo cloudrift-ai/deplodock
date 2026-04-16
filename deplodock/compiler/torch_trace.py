@@ -12,23 +12,20 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import (
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.frontend import (
     CatOp,
-    ConstantOp,
-    ElementwiseOp,
-    GatherOp,
-    InputOp,
     LinearOp,
     MatmulOp,
     MeanOp,
-    ReduceOp,
     ReshapeOp,
     SdpaOp,
     SliceOp,
     TransposeOp,
     UnsqueezeOp,
 )
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, GatherOp, ReduceOp
 
 if TYPE_CHECKING:
     import torch

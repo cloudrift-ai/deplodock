@@ -4,9 +4,11 @@ Same unsqueeze strategy as matmul decomposition: inputs become
 broadcast-compatible via IndexMapOp before the mul.
 """
 
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.frontend import LinearOp, TransposeOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ElementwiseOp, InputOp, LinearOp, ReduceOp, TransposeOp
 
 GRAMMAR = [Production("root", LinearOp, "1")]
 

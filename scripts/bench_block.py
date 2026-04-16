@@ -198,7 +198,7 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
 
         import torch
 
-        from deplodock.compiler.ops import ConstantOp
+        from deplodock.compiler.ir.base import ConstantOp
 
         input_data: dict[str, list[float]] = {}
         for buf in program.buffers:

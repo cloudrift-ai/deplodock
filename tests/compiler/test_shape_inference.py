@@ -2,19 +2,18 @@
 
 import pytest
 
-from deplodock.compiler.ops import (
+from deplodock.compiler.ir.frontend import (
     CatOp,
-    ElementwiseOp,
     LinearOp,
     MatmulOp,
     MeanOp,
-    ReduceOp,
     ReshapeOp,
     SdpaOp,
     SliceOp,
     TransposeOp,
     UnsqueezeOp,
 )
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.shape_utils import broadcast_shapes
 
 

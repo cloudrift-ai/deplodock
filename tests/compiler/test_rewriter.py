@@ -1,8 +1,9 @@
 """Tests for the grammar-based rewrite engine."""
 
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ScanOp
 from deplodock.compiler.matcher import Production
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ScanOp
 from deplodock.compiler.rewriter import Pass, Rule
 
 

@@ -7,10 +7,11 @@ elementwise op.
 
 from __future__ import annotations
 
-from deplodock.compiler.coord_expr import placeholder
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.expr import placeholder
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ElementwiseOp, IndexMapOp, IndexSource, InputOp
 
 GRAMMAR = [Production("root", ElementwiseOp, "1")]
 
@@ -81,7 +82,7 @@ def _broadcast_indexmap(inp_shape: tuple, out_shape: tuple) -> IndexMapOp | None
         if inp_shape[d] == out_shape[out_d]:
             coord_map.append(placeholder(out_d))
         elif inp_shape[d] == 1:
-            from deplodock.compiler.backend.ir.expr import Literal
+            from deplodock.compiler.ir.expr import Literal
 
             coord_map.append(Literal(0, "int"))
         else:

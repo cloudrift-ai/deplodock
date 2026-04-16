@@ -9,9 +9,10 @@ import pytest
 
 from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.lower import KernelInfo
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 
 requires_cuda = pytest.mark.skipif(
@@ -40,7 +41,7 @@ def _reduce_sum_graph() -> Graph:
 
 
 def _matmul_graph() -> Graph:
-    from deplodock.compiler.ops import MatmulOp
+    from deplodock.compiler.ir.frontend import MatmulOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 8)), node_id="a")
@@ -53,7 +54,7 @@ def _matmul_graph() -> Graph:
 
 def _softmax_kernel_info():
     """Build a KernelInfo with the softmax SSA pattern directly."""
-    from deplodock.compiler.ops import Assign, KernelOp, Port
+    from deplodock.compiler.ir.block import Assign, KernelOp, Port
 
     kernel = KernelOp(
         inputs=(Port(), Port()),
@@ -126,7 +127,7 @@ def test_softmax_emits_multiple_k_loops():
     info = _softmax_kernel_info()
     shapes = {"$0": (4, 8), "$1": (4, 8)}
     kdef, arg_order = emit_kernel(info, "k0_softmax", shapes)
-    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as emit_src
+    from deplodock.compiler.backend.kernel_codegen import emit_kernel as emit_src
 
     source = emit_src(kdef)
     loop_count = source.count("for (int")
@@ -138,7 +139,7 @@ def test_softmax_emits_multiple_k_loops():
 def test_softmax_emits_per_element_store():
     """Softmax output is per-element: the final div stores inside a K-loop."""
     from deplodock.compiler.backend.cuda.emit import emit_kernel
-    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as emit_src
+    from deplodock.compiler.backend.kernel_codegen import emit_kernel as emit_src
 
     info = _softmax_kernel_info()
     shapes = {"$0": (4, 8), "$1": (4, 8)}

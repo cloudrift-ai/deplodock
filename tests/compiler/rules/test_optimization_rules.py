@@ -5,14 +5,9 @@ from pathlib import Path
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import (
-    ConstantOp,
-    ElementwiseOp,
-    IndexMapOp,
-    InputOp,
-    ReduceOp,
-)
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
 from deplodock.compiler.rewriter import Pass, Rule
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "optimization"

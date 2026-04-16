@@ -2,17 +2,9 @@
 
 import pytest
 
-from deplodock.compiler.backend.ir.expr import Var
-from deplodock.compiler.ops import (
-    Assign,
-    Combine,
-    ElementwiseOp,
-    KernelOp,
-    Mux,
-    MuxBranch,
-    Port,
-    ReduceOp,
-)
+from deplodock.compiler.ir.block import Assign, Combine, KernelOp, Mux, MuxBranch, Port
+from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
 # ---------------------------------------------------------------------------
 # Port / Combine / Mux

@@ -8,11 +8,12 @@ After decomposition: IndexMapOp.inputs = [tensor_a, tensor_b]; the dim is baked
 into the source selects and the second source's coord_map offset.
 """
 
-from deplodock.compiler.backend.ir.expr import Literal
-from deplodock.compiler.coord_expr import placeholder
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.expr import Literal, placeholder
+from deplodock.compiler.ir.frontend import CatOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import CatOp, ConstantOp, IndexMapOp, IndexSource, InputOp
 
 GRAMMAR = [Production("root", CatOp, "1")]
 

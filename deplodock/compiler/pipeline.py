@@ -13,9 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from deplodock.compiler.ir import Graph
+from deplodock.compiler.ir.base import ConstantOp
+from deplodock.compiler.ir.graph import Graph
 from deplodock.compiler.lower import KernelInfo, extract_kernels
-from deplodock.compiler.ops import ConstantOp
 from deplodock.compiler.rewriter import Rewriter
 
 _RULES_DIR = Path(__file__).parent / "rules"

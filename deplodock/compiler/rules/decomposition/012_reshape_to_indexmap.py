@@ -7,11 +7,12 @@ delinearizes into the input coordinate space using input strides.
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.ir.expr import BinOp, Literal
-from deplodock.compiler.coord_expr import placeholder
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
+from deplodock.compiler.ir.frontend import ReshapeOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import IndexMapOp, IndexSource, InputOp, ReshapeOp
 
 GRAMMAR = [Production("root", ReshapeOp, "1")]
 

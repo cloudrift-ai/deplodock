@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult, ProgramResult
     from deplodock.compiler.backend.program import Program
-    from deplodock.compiler.ir import Graph
+    from deplodock.compiler.ir.graph import Graph
     from deplodock.compiler.plan import ExecutionPlan
     from deplodock.compiler.rewriter import PassTrace
 
@@ -104,7 +104,7 @@ class CompilerDump:
 
     def dump_loop_ir(self, program_ir, kernel_name: str, schedule: object | None = None) -> None:
         """Dump a LoopProgram as pretty-printed text and JSON."""
-        from deplodock.compiler.backend.ir.loop_ir import pretty_print, to_dict
+        from deplodock.compiler.ir.kernel import pretty_print, to_dict
 
         self._write_text(f"35_loop_ir_{kernel_name}.txt", pretty_print(program_ir, schedule=schedule))
         self._write_json(f"35_loop_ir_{kernel_name}.json", to_dict(program_ir, schedule=schedule))

@@ -7,9 +7,11 @@ Inputs are unsqueezed so the mul is a standard NumPy broadcast:
   reduce_sum(axis=-2) → (..., M, N)
 """
 
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.frontend import MatmulOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ElementwiseOp, InputOp, MatmulOp, ReduceOp
 from deplodock.compiler.rules.decomposition._matmul_helpers import matmul_unsqueeze
 
 GRAMMAR = [Production("root", MatmulOp, "1")]

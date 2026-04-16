@@ -11,8 +11,8 @@ import time
 import numpy as np
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, ProgramResult
-from deplodock.compiler.ir import Graph
-from deplodock.compiler.ops import ConstantOp, InputOp
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.graph import Graph
 
 
 class NumpyBackend(Backend):

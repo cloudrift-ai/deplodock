@@ -6,17 +6,11 @@ wrapped as a single-launch copy kernel.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.block import KernelOp, Mux, MuxBranch, Port
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import (
-    IndexMapOp,
-    IndexSource,
-    InputOp,
-    KernelOp,
-    Mux,
-    MuxBranch,
-    Port,
-)
 
 GRAMMAR = [Production("wrap", IndexMapOp, "1")]
 
