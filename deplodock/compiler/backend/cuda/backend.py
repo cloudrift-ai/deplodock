@@ -8,6 +8,7 @@ this module is the stable interface the runner / commands call.
 from __future__ import annotations
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, ProgramResult
+from deplodock.compiler.backend.cuda.emit import compile_kernels
 from deplodock.compiler.backend.cuda.program import benchmark_program, run_program
 from deplodock.compiler.backend.program import Program
 
@@ -15,9 +16,21 @@ from deplodock.compiler.backend.program import Program
 class CudaBackend(Backend):
     """CUDA backend: list[KernelOp] → Program → nvcc → GPU."""
 
-    def compile(self, kernels: list) -> Program:
+    def compile(
+        self,
+        kernels: list,
+        *,
+        name: str = "prog",
+        graph_inputs: list[str] | None = None,
+        graph_outputs: list[str] | None = None,
+    ) -> Program:
         """Emit CUDA source per ``KernelOp`` and assemble a runnable Program."""
-        raise NotImplementedError("CudaBackend.compile: structural codegen lands in feature/structural-compiler c4")
+        return compile_kernels(
+            kernels,
+            name=name,
+            graph_inputs=graph_inputs,
+            graph_outputs=graph_outputs,
+        )
 
     def run(self, program: Program, input_data: dict[str, list[float]] | None = None) -> ProgramResult:
         result = run_program(program, input_data=input_data)
