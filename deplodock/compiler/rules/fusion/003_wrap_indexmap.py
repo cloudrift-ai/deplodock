@@ -10,6 +10,7 @@ from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainMatch, Production
 from deplodock.compiler.ops import (
     IndexMapOp,
+    IndexSource,
     InputOp,
     KernelOp,
     Mux,
@@ -36,7 +37,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     else:
         branches = []
         for src in op.sources:
-            branches.append(MuxBranch(input=Port(), select=src.select))
+            branch_indexmap = IndexMapOp(
+                out_shape=tuple(op.out_shape),
+                sources=(IndexSource(input_idx=0, coord_map=src.coord_map),),
+            )
+            branches.append(MuxBranch(input=Port(indexmap=branch_indexmap), select=src.select))
         kernel_inputs = (Mux(branches=tuple(branches)),)
 
     kernel = KernelOp(inputs=kernel_inputs, outputs=(Port(),))

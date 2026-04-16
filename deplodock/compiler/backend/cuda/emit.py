@@ -65,7 +65,7 @@ def compile_kernels(
             if buf_name not in shapes and port.indexmap is not None:
                 shapes[buf_name] = tuple(port.indexmap.out_shape)
         dollar_shapes = _dollar_shapes(info, shapes)
-        out_shape = info.kernel.infer_output_shape(dollar_shapes)
+        out_shape = info.output_shape or info.kernel.infer_output_shape(dollar_shapes)
         shapes.setdefault(info.output_name, out_shape)
 
     def role_for(bid: str) -> str:
@@ -93,7 +93,7 @@ def compile_kernels(
         dollar_shapes = _dollar_shapes(info, shapes)
         kernel_def, arg_order = emit_kernel(info, kname, dollar_shapes, shapes)
         source = _emit_kernel_source(kernel_def)
-        grid, block = _launch_config(info.kernel, dollar_shapes)
+        grid, block = _launch_config(info.kernel, dollar_shapes, info.output_shape)
         launches.append(CudaLaunch(kernel_source=source, kernel_name=kname, grid=grid, block=block, args=arg_order))
 
     return Program(name=name, buffers=buffers, launches=launches)
@@ -124,7 +124,7 @@ def _dollar_shapes(info: KernelInfo, buf_shapes: dict[str, tuple] | None = None)
 def emit_kernel(
     info: KernelInfo, kernel_name: str, shapes: dict[str, tuple], buf_shapes: dict[str, tuple] | None = None
 ) -> tuple[KernelDef, list[str]]:
-    out_shape = info.kernel.infer_output_shape(shapes)
+    out_shape = info.output_shape or info.kernel.infer_output_shape(shapes)
     params, arg_order = _build_params(info)
     body, block_size = _emit_body(info, out_shape, shapes, buf_shapes or {})
     kd = KernelDef(name=kernel_name, params=params, body=body, block_size=block_size)
@@ -158,7 +158,7 @@ def _emit_input_value(
         result: Expr | None = None
         for branch in reversed(inp.branches):
             sub = _emit_input_value(branch.input, coord, buf_name, src_shape, stmts, name_seq)
-            result = sub if result is None else Ternary(cond=branch.select, then=sub, else_=result)
+            result = sub if result is None else Ternary(cond=branch.select, if_true=sub, if_false=result)
         assert result is not None
         return result
 
@@ -185,6 +185,52 @@ def _emit_input_value(
         return value
 
     raise NotImplementedError(f"unexpected KernelInput variant: {type(inp).__name__}")
+
+
+def _emit_mux_value(
+    mux: Mux,
+    coord: Expr,
+    branch_infos: list[tuple[str, tuple]],
+    out_shape: tuple,
+    stmts: list[Stmt],
+    name_seq: list[int],
+) -> Expr:
+    """Emit code for a Mux input with per-branch buffer names.
+
+    Decomposes the flat coord into per-axis output coordinates and
+    substitutes them into the Mux branch select predicates.
+    """
+    from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute
+
+    # Decompose flat coord into per-axis output coords.
+    ndim = len(out_shape)
+    mapping: dict[str, Expr] = {}
+    remainder = coord
+    for d in range(ndim - 1, -1, -1):
+        dim_size = int(out_shape[d]) if isinstance(out_shape[d], int) else 1
+        axis_var = f"{PLACEHOLDER_PREFIX}{d}"
+        if d == 0:
+            mapping[axis_var] = remainder
+        else:
+            mapping[axis_var] = BinOp("%", remainder, Literal(dim_size, "int"))
+            remainder = BinOp("/", remainder, Literal(dim_size, "int"))
+
+    result: Expr | None = None
+    for i, branch in enumerate(reversed(mux.branches)):
+        bi = len(mux.branches) - 1 - i
+        buf_name, src_shape = branch_infos[bi] if bi < len(branch_infos) else ("?", ())
+
+        # Substitute placeholders in the branch's select predicate.
+        select_expr = substitute(branch.select, mapping) if branch.select is not None else None
+
+        # Emit the branch's input value with coordinate mapping.
+        sub = _emit_input_value(branch.input, coord, buf_name, src_shape, stmts, name_seq)
+        if select_expr is not None:
+            result = sub if result is None else Ternary(cond=select_expr, if_true=sub, if_false=result)
+        else:
+            result = sub if result is None else result
+    assert result is not None
+    return result
 
 
 def _emit_indexmap_load(buf_name: str, indexmap, coord: Expr, src_shape: tuple, stmts: list[Stmt], name_seq: list[int]) -> Expr:
@@ -244,7 +290,7 @@ def _emit_body(
     plan = analyze_kernel(info.kernel, shapes, out_shape)
     idx = Var("idx")
     idx_init = VarDecl(
-        dtype="int",
+        dtype="long long",
         name="idx",
         init=BinOp("+", BinOp("*", Var("blockIdx.x"), Var("blockDim.x")), Var("threadIdx.x")),
     )
@@ -267,21 +313,39 @@ def _emit_plan(plan, info: KernelInfo, shapes: dict[str, tuple], buf_shapes: dic
     values: dict[str, Expr] = {}
 
     # Build $N → (port, buf_name, src_shape) mapping.
+    # For Mux inputs, enumerate all leaf Ports inside branches.
     port_info: dict[str, tuple[Port, str, tuple]] = {}
+    mux_info: dict[str, list[tuple[str, str, tuple]]] = {}  # key → [(branch_buf, branch_src_shape), ...]
     port_idx = 0
     for inp in kernel.inputs:
         if isinstance(inp, Port):
             key = f"${port_idx}"
             buf_name = info.input_names[port_idx] if port_idx < len(info.input_names) else key
-            # src_shape is the ACTUAL buffer shape (for indexmap stride computation)
             src_shape = buf_shapes.get(buf_name, shapes.get(key, ()))
             port_info[key] = (inp, buf_name, src_shape)
             port_idx += 1
+        elif isinstance(inp, Mux):
+            key = f"${port_idx}"
+            branch_infos = []
+            for branch in inp.branches:
+                if isinstance(branch.input, Port):
+                    bname = info.input_names[port_idx] if port_idx < len(info.input_names) else f"${port_idx}"
+                    bshape = buf_shapes.get(bname, ())
+                    branch_infos.append((bname, bshape))
+                    port_idx += 1
+            mux_info[key] = branch_infos
+            # For port_info, use the first branch as representative
+            if branch_infos:
+                port_info[key] = (Port(), branch_infos[0][0], branch_infos[0][1])
 
     # Load per-row ports upfront.
     for key, (port, buf_name, src_shape) in port_info.items():
         if key not in plan.per_elem_ports:
-            values[key] = _emit_input_value(port, idx, buf_name, src_shape, stmts, name_seq)
+            inp = kernel.inputs[int(key[1:])] if key[1:].isdigit() else port
+            if isinstance(inp, Mux) and key in mux_info:
+                values[key] = _emit_mux_value(inp, idx, mux_info[key], info.output_shape, stmts, name_seq)
+            else:
+                values[key] = _emit_input_value(port, idx, buf_name, src_shape, stmts, name_seq)
 
     loop_count = 0
     for step in plan.steps:
@@ -342,7 +406,8 @@ def _emit_plan(plan, info: KernelInfo, shapes: dict[str, tuple], buf_shapes: dic
         if kernel.body:
             out_val = values[kernel.body[-1].name]
         else:
-            first_key = next((f"${i}" for i, inp in enumerate(kernel.inputs) if isinstance(inp, Port)), None)
+            # Copy kernel: use first available value (Port or Mux).
+            first_key = next((k for k in sorted(values) if k.startswith("$")), None)
             out_val = values[first_key] if first_key else Literal(0.0, "float")
         stmts.append(IrAssign(target=ArrayAccess(array=info.output_name, index=idx), value=out_val))
 
@@ -504,12 +569,12 @@ def _kernel_name(kernel: KernelOp, idx: int) -> str:
     return f"k{idx}_pointwise"
 
 
-def _launch_config(kernel: KernelOp, shapes: dict[str, tuple]) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+def _launch_config(kernel: KernelOp, shapes: dict[str, tuple], out_shape: tuple = ()) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     has_reduce = any(isinstance(a.op, ReduceOp) for a in kernel.body)
     if has_reduce:
         n_output = _reduce_n_rows(kernel, shapes)
     else:
-        n_output = _numel(kernel.infer_output_shape(shapes))
+        n_output = _numel(out_shape) if out_shape else _numel(kernel.infer_output_shape(shapes))
     n_blocks = (n_output + _BLOCK - 1) // _BLOCK
     return (max(n_blocks, 1), 1, 1), (_BLOCK, 1, 1)
 
