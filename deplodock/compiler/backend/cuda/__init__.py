@@ -1,8 +1,8 @@
 """CUDA backend: codegen, lowering, and kernel execution."""
 
-from deplodock.compiler.backend.cuda.generators import generate_kernel, lower_tiled
+from deplodock.compiler.backend.cuda.emit import compile_kernels, emit_kernel
 from deplodock.compiler.backend.cuda.runner import KernelResult, has_cuda_gpu, has_nvcc, run_kernel
-from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel
+from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as emit_kernel_source
 from deplodock.compiler.backend.ir.kernel_ir import (
     ArrayAccess,
     Assign,
@@ -30,16 +30,16 @@ __all__ = [
     "IfStmt",
     "KernelDef",
     "KernelParam",
+    "KernelResult",
     "Literal",
     "Stmt",
     "SyncThreads",
     "Var",
     "VarDecl",
+    "compile_kernels",
     "emit_kernel",
-    "KernelResult",
+    "emit_kernel_source",
     "has_cuda_gpu",
     "has_nvcc",
-    "generate_kernel",
-    "lower_tiled",
     "run_kernel",
 ]
