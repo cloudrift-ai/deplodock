@@ -21,7 +21,7 @@ from deplodock.compiler.rewriter import Pass, Rule
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion"
 
-_RULE = "assemble_kernels.py"
+_RULE = "001_assemble_kernels.py"
 
 
 def _load() -> Rule:
