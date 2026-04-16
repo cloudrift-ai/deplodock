@@ -78,7 +78,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
 
     all_consumed = set(chain.consumed)
     external_inputs = _collect_external_inputs(graph, all_consumed)
-    inputs, external_shapes, port_map = _build_input_tree(graph, external_inputs, all_consumed)
+    inputs, port_map = _build_input_tree(graph, external_inputs, all_consumed)
     body = _build_body(graph, chain, port_map)
 
     last_nid = _last_node_id(chain)
@@ -88,7 +88,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         inputs=tuple(inputs),
         body=tuple(body),
         outputs=(Port(buffer_id=last_nid),),
-        external_shapes=external_shapes,
     )
 
     g = graph.copy()
@@ -186,10 +185,10 @@ def _build_input_tree(
     graph: Graph,
     external_inputs: list[str],
     consumed: set[str],
-) -> tuple[list, dict[str, tuple], dict]:
+) -> tuple[list, dict]:
+    """Build KernelInput trees and a port_map for absorbed IndexMapOps."""
     inputs = []
-    external_shapes: dict[str, tuple] = {}
-    port_map: dict[str, Port | Mux] = {}
+    port_map: dict[str, Port] = {}
 
     for buf_id in external_inputs:
         node = graph.nodes.get(buf_id)
@@ -200,20 +199,17 @@ def _build_input_tree(
             continue
 
         if isinstance(node.op, IndexMapOp) and len(node.op.sources) == 1 and len(graph.consumers(buf_id)) == 1:
-            # Single-source IndexMapOp with fan-out 1: absorb into Port.indexmap.
             consumed.add(buf_id)
             src_id = node.inputs[node.op.sources[0].input_idx]
-            external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
             p = Port(buffer_id=src_id, indexmap=node.op)
             inputs.append(p)
             port_map[buf_id] = p
         else:
-            external_shapes[buf_id] = tuple(node.output.shape)
             p = Port(buffer_id=buf_id)
             inputs.append(p)
             port_map[buf_id] = p
 
-    return inputs, external_shapes, port_map
+    return inputs, port_map
 
 
 def _first_port_id(inp) -> str:
@@ -234,23 +230,19 @@ def _wrap_indexmap_kernel(graph: Graph, node: Node) -> Graph:
     op = node.op
     assert isinstance(op, IndexMapOp)
 
-    external_shapes: dict[str, tuple] = {}
     if len(op.sources) == 1:
         src_id = node.inputs[op.sources[0].input_idx]
-        external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
         inputs: tuple = (Port(buffer_id=src_id, indexmap=op),)
     else:
         branches = []
         for src in op.sources:
             src_id = node.inputs[src.input_idx]
-            external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
             branches.append(MuxBranch(input=Port(buffer_id=src_id), select=src.select))
         inputs = (Mux(branches=tuple(branches)),)
 
     kernel = KernelOp(
         inputs=inputs,
         outputs=(Port(buffer_id=nid),),
-        external_shapes=external_shapes,
     )
 
     g = graph.copy()

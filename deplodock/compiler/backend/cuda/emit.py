@@ -17,8 +17,8 @@ produces a 2D grid with a serial K-loop.  Otherwise:
   thread per block.
 
 All shapes are treated as flat buffers: each input tensor has a known
-shape (``kernel.external_shapes[buffer_id]``) and is indexed by a
-single linearized offset.
+shape (looked up from an externally-provided ``shapes`` dict keyed by
+``buffer_id``) and is indexed by a single linearized offset.
 """
 
 from __future__ import annotations
@@ -65,29 +65,27 @@ def compile_kernels(
     kernels: list[KernelOp],
     *,
     name: str = "prog",
+    buf_shapes: dict[str, tuple] | None = None,
     graph_inputs: list[str] | None = None,
     graph_outputs: list[str] | None = None,
     graph_constants: list[str] | None = None,
 ) -> Program:
     """Assemble a ``Program`` from a list of structural ``KernelOp``.
 
-    ``graph_inputs`` / ``graph_outputs`` / ``graph_constants`` mark buffer
-    roles; anything else produced by one kernel and consumed by another
-    is "scratch". Constants are initialized from ``input_data`` or with
-    pseudorandom values at runtime (same as inputs).
+    ``buf_shapes`` maps buffer names → shapes for all external buffers.
+    ``graph_inputs`` / ``graph_outputs`` / ``graph_constants`` mark roles.
     """
+    shapes = dict(buf_shapes or {})
     graph_input_set = set(graph_inputs or [])
     graph_output_set = set(graph_outputs or [])
     graph_constant_set = set(graph_constants or [])
 
-    # Discover every external buffer + its shape.
-    buf_shapes: dict[str, tuple] = {}
+    # Infer output shapes for kernels and add to shapes dict.
     for k in kernels:
-        for bid, shape in k.external_shapes.items():
-            buf_shapes[bid] = tuple(shape)
+        out_shape = k.infer_output_shape(shapes)
         for out in k.outputs:
             if isinstance(out, Port):
-                buf_shapes.setdefault(out.buffer_id, k.infer_output_shape())
+                shapes.setdefault(out.buffer_id, out_shape)
 
     def role_for(bid: str) -> str:
         if bid in graph_input_set:
@@ -98,14 +96,14 @@ def compile_kernels(
             return "output"
         return "scratch"
 
-    buffers = [Buffer(name=bid, size=_numel(shape), dtype="float", role=role_for(bid)) for bid, shape in buf_shapes.items()]
+    buffers = [Buffer(name=bid, size=_numel(shape), dtype="float", role=role_for(bid)) for bid, shape in shapes.items()]
 
     launches: list[CudaLaunch] = []
     for i, k in enumerate(kernels):
-        kname = _kernel_name(k, i)
-        kernel_def, arg_order = emit_kernel(k, kname)
+        kname = _kernel_name(k, i, shapes)
+        kernel_def, arg_order = emit_kernel(k, kname, shapes)
         source = _emit_kernel_source(kernel_def)
-        grid, block = _launch_config(k)
+        grid, block = _launch_config(k, shapes)
         launches.append(
             CudaLaunch(
                 kernel_source=source,
@@ -144,18 +142,18 @@ def _detect_contraction(kernel: KernelOp) -> tuple[int, Assign, Assign] | None:
 # ---------------------------------------------------------------------------
 
 
-def emit_kernel(kernel: KernelOp, kernel_name: str) -> tuple[KernelDef, list[str]]:
+def emit_kernel(kernel: KernelOp, kernel_name: str, shapes: dict[str, tuple]) -> tuple[KernelDef, list[str]]:
     """Emit a single ``KernelOp`` as a ``KernelDef`` + ordered launch args."""
-    out_shape = kernel.infer_output_shape()
+    out_shape = kernel.infer_output_shape(shapes)
     params, arg_order = _build_params(kernel)
 
     contraction = _detect_contraction(kernel)
     if contraction is not None:
-        body, block_size = _emit_contraction_body(kernel, out_shape, contraction)
+        body, block_size = _emit_contraction_body(kernel, out_shape, contraction, shapes)
     elif any(isinstance(a.op, ReduceOp) for a in kernel.body):
-        body, block_size = _emit_reduce_body(kernel, out_shape)
+        body, block_size = _emit_reduce_body(kernel, out_shape, shapes)
     else:
-        body, block_size = _emit_pointwise_body(kernel, out_shape)
+        body, block_size = _emit_pointwise_body(kernel, out_shape, shapes)
 
     kd = KernelDef(name=kernel_name, params=params, body=body, block_size=block_size)
     return kd, arg_order
@@ -283,7 +281,7 @@ def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[S
 # ---------------------------------------------------------------------------
 
 
-def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], tuple[int, int, int]]:
+def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> tuple[list[Stmt], tuple[int, int, int]]:
     numel = _numel(out_shape)
     idx = Var("idx")
     stmts: list[Stmt] = [
@@ -300,7 +298,7 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt]
     values: dict[str, Expr] = {}
     for inp in kernel.inputs:
         if isinstance(inp, Port):
-            values[inp.buffer_id] = _emit_input_value(inp, idx, kernel.external_shapes, guarded, name_seq)
+            values[inp.buffer_id] = _emit_input_value(inp, idx, shapes, guarded, name_seq)
 
     for assign in kernel.body:
         arg_exprs = [values[a] for a in assign.args]
@@ -329,7 +327,7 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt]
     return stmts, (_BLOCK, 1, 1)
 
 
-def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], tuple[int, int, int]]:
+def _emit_reduce_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> tuple[list[Stmt], tuple[int, int, int]]:
     """Walk kernel.body SSA (mixed ElementwiseOp / ReduceOp Assigns).
 
     The body is split into "segments" separated by ReduceOps. Each segment
@@ -345,7 +343,7 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], t
     """
     assert len(kernel.inputs) >= 1 and isinstance(kernel.inputs[0], Port)
     src_port = kernel.inputs[0]
-    src_shape = kernel.external_shapes.get(src_port.buffer_id, ())
+    src_shape = shapes.get(src_port.buffer_id, ())
     k_size = src_shape[-1] if src_shape else 1
 
     row = Var("row")
@@ -569,6 +567,7 @@ def _emit_contraction_body(
     kernel: KernelOp,
     out_shape: tuple,
     contraction: tuple[int, Assign, Assign],
+    shapes: dict[str, tuple],
 ) -> tuple[list[Stmt], tuple[int, int, int]]:
     """Emit a contraction (matmul) body with batch support.
 
@@ -583,7 +582,7 @@ def _emit_contraction_body(
     a_port = next(p for p in kernel.inputs if isinstance(p, Port) and p.buffer_id == a_name)
     b_port = next(p for p in kernel.inputs if isinstance(p, Port) and p.buffer_id == b_name)
 
-    a_shape = kernel.external_shapes.get(a_port.buffer_id, ())
+    a_shape = shapes.get(a_port.buffer_id, ())
     k_size = int(a_shape[-1]) if a_shape else 1
 
     # Parse output shape: (...batch, M, N).
@@ -628,8 +627,8 @@ def _emit_contraction_body(
 
     name_seq_k = [0]
     inner_stmts: list[Stmt] = []
-    a_val = _emit_input_value(a_port, flat_coord, kernel.external_shapes, inner_stmts, name_seq_k)
-    b_val = _emit_input_value(b_port, flat_coord, kernel.external_shapes, inner_stmts, name_seq_k)
+    a_val = _emit_input_value(a_port, flat_coord, shapes, inner_stmts, name_seq_k)
+    b_val = _emit_input_value(b_port, flat_coord, shapes, inner_stmts, name_seq_k)
     prod_expr = _apply_elementwise(mul_assign.op.fn, [a_val, b_val])
     inner_stmts.append(AugAssign(target="acc", op=_reduce_op(fn), value=prod_expr))
     stmts.append(ForLoop(var=k.name, start=Literal(0, "int"), end=Literal(k_size, "int"), body=inner_stmts))
@@ -659,7 +658,7 @@ def _emit_contraction_body(
                 # Load extra input at the output coord.
                 port = next((p for p in kernel.inputs if isinstance(p, Port) and p.buffer_id == a), None)
                 if port is not None:
-                    val = _emit_input_value(port, out_flat, kernel.external_shapes, stmts, name_seq)
+                    val = _emit_input_value(port, out_flat, shapes, stmts, name_seq)
                     arg_exprs.append(val)
                 else:
                     arg_exprs.append(Literal(0.0, "float"))
@@ -802,7 +801,7 @@ def _build_params(kernel: KernelOp) -> tuple[list[KernelParam], list[str]]:
     return params, args
 
 
-def _kernel_name(kernel: KernelOp, idx: int) -> str:
+def _kernel_name(kernel: KernelOp, idx: int, shapes: dict[str, tuple]) -> str:
     if _detect_contraction(kernel) is not None:
         return f"k{idx}_contract"
     if any(isinstance(a.op, ReduceOp) for a in kernel.body):
@@ -810,8 +809,8 @@ def _kernel_name(kernel: KernelOp, idx: int) -> str:
     return f"k{idx}_pointwise"
 
 
-def _launch_config(kernel: KernelOp) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    out_shape = kernel.infer_output_shape()
+def _launch_config(kernel: KernelOp, shapes: dict[str, tuple]) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    out_shape = kernel.infer_output_shape(shapes)
     if _detect_contraction(kernel) is not None:
         int_shape = tuple(int(d) for d in out_shape if isinstance(d, int))
         m = int_shape[-2] if len(int_shape) >= 2 else 1
@@ -821,26 +820,26 @@ def _launch_config(kernel: KernelOp) -> tuple[tuple[int, int, int], tuple[int, i
     if any(isinstance(a.op, ReduceOp) for a in kernel.body):
         # For reduce kernels, the grid is over outer rows (one block per row).
         # Use the first input Port's shape minus the last axis.
-        n_rows = _reduce_n_rows(kernel)
+        n_rows = _reduce_n_rows(kernel, shapes)
         return (n_rows, 1, 1), (1, 1, 1)
     numel = _numel(out_shape)
     n_blocks = (numel + _BLOCK - 1) // _BLOCK
     return (max(n_blocks, 1), 1, 1), (_BLOCK, 1, 1)
 
 
-def _reduce_n_rows(kernel: KernelOp) -> int:
+def _reduce_n_rows(kernel: KernelOp, shapes: dict[str, tuple]) -> int:
     """Number of outer rows for a reduce kernel's grid.
 
     Uses the first input Port's shape minus the last axis (the reduce dim).
     """
     for inp in kernel.inputs:
         if isinstance(inp, Port):
-            src_shape = kernel.external_shapes.get(inp.buffer_id, ())
+            src_shape = shapes.get(inp.buffer_id, ())
             if len(src_shape) >= 2:
                 return _numel(src_shape[:-1])
             return _numel(src_shape) if src_shape else 1
     # Fallback: use output shape.
-    return _numel(kernel.infer_output_shape())
+    return _numel(kernel.infer_output_shape(shapes))
 
 
 def _emit_kernel_source(kernel_def: KernelDef) -> str:

@@ -54,7 +54,9 @@ def test_compile_graph_fuses_chain():
 def test_pipeline_to_program():
     result = compile_graph(_matmul_graph(4, 3, 2))
     out_name = result.kernels[-1].outputs[0].buffer_id
-    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=[out_name])
+    program = CudaBackend().compile(
+        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=[out_name]
+    )
     assert len(program.launches) >= 1
     roles = {b.name: b.role for b in program.buffers}
     assert roles.get("a") == "input"
@@ -79,7 +81,9 @@ def test_pointwise_chain_gpu():
 
     g = _pointwise_chain_graph()
     result = compile_graph(g)
-    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
+    program = CudaBackend().compile(
+        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
+    )
     x_data = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0]
     expected = [math.exp(-xi) for xi in x_data]
     result = CudaBackend().run(program, input_data={"x": x_data})
@@ -94,7 +98,9 @@ def test_matmul_gpu():
     g = _matmul_graph(3, 4, 5)
     result = compile_graph(g)
     out_name = result.kernels[-1].outputs[0].buffer_id
-    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=[out_name])
+    program = CudaBackend().compile(
+        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=[out_name]
+    )
     a_data = [random.random() for _ in range(12)]
     b_data = [random.random() for _ in range(20)]
     expected = []

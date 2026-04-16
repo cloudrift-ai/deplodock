@@ -26,13 +26,15 @@ _RULES_DIR = Path(__file__).parent / "rules"
 class CompileResult:
     """Output of ``compile_graph``: kernels plus graph-level metadata.
 
-    ``graph_inputs``, ``graph_outputs``, and ``graph_constants`` record the
-    buffer roles from the original graph so the backend can mark buffer
-    roles (input / output / constant / scratch) without the caller having
-    to thread them manually.
+    ``buf_shapes`` maps every buffer_id to its shape (from the post-rewrite
+    graph). ``graph_inputs``, ``graph_outputs``, and ``graph_constants``
+    record the buffer roles from the original graph so the backend can
+    mark buffer roles (input / output / constant / scratch) without the
+    caller having to thread them manually.
     """
 
     kernels: list[KernelOp]
+    buf_shapes: dict[str, tuple] = field(default_factory=dict)
     graph_inputs: list[str] = field(default_factory=list)
     graph_outputs: list[str] = field(default_factory=list)
     graph_constants: list[str] = field(default_factory=list)
@@ -55,10 +57,14 @@ def compile_graph(graph: Graph) -> CompileResult:
     # Constants survive rewriting as ConstantOp nodes.
     graph_constants = [nid for nid, n in graph.nodes.items() if isinstance(n.op, ConstantOp)]
 
+    # Extract buffer shapes from the post-rewrite graph.
+    buf_shapes = {nid: tuple(n.output.shape) for nid, n in graph.nodes.items()}
+
     kernels = extract_kernels(graph)
 
     return CompileResult(
         kernels=kernels,
+        buf_shapes=buf_shapes,
         graph_inputs=graph_inputs,
         graph_outputs=graph_outputs,
         graph_constants=graph_constants,

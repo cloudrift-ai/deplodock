@@ -21,6 +21,7 @@ class CudaBackend(Backend):
         kernels: list,
         *,
         name: str = "prog",
+        buf_shapes: dict[str, tuple] | None = None,
         graph_inputs: list[str] | None = None,
         graph_outputs: list[str] | None = None,
         graph_constants: list[str] | None = None,
@@ -29,6 +30,7 @@ class CudaBackend(Backend):
         return compile_kernels(
             kernels,
             name=name,
+            buf_shapes=buf_shapes,
             graph_inputs=graph_inputs,
             graph_outputs=graph_outputs,
             graph_constants=graph_constants,
