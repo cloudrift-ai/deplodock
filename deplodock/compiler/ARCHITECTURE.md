@@ -118,12 +118,19 @@ shape inference for contractions.
 
 ## Lowering policy (rules/fusion/assemble_kernels.py)
 
-Grammar-based fusion via the rewriter:
+Backward-cone region growing via the rewriter:
 
-1. **Contraction** (optional) — `ElementwiseOp(mul)` + `ReduceOp(sum)` pair becomes two Assigns in the kernel body.
-2. **Stage** (repeating) — `pre_ops* + reduce` groups become Assigns.
-3. **Epilogue** — trailing `ElementwiseOp` chain becomes Assigns.
-4. `InputOp` / `ConstantOp` nodes emit no kernel — they survive as external `Port.buffer_id` leaves.
+1. **Forward BFS** from seed — collect all downstream fusable primitives
+   (``ElementwiseOp``, ``ReduceOp``), enforcing that reductions form a
+   single linear chain (no parallel reductions).
+2. **Find output** — last node in topo order with no consumers in the
+   forward set.
+3. **Backward cone** — from output, absorb nodes whose consumers are
+   all in the region. Trims nodes with side-outputs.
+4. **Body** — topologically sorted ``Assign`` statements from the region.
+5. ``InputOp`` / ``ConstantOp`` / ``IndexMapOp`` nodes emit no kernel —
+   they survive as external ``Port.buffer_id`` leaves (IndexMapOps at
+   boundaries are absorbed into ``Port.indexmap``).
 
 ## Codegen policy (backend/cuda/emit.py)
 
