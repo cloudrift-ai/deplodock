@@ -87,7 +87,10 @@ def _emit_expr(expr: KernelExpr, parent_prec: int = 0) -> str:
     if isinstance(expr, Literal):
         if isinstance(expr.value, float) or expr.dtype == "float":
             return f"{float(expr.value):.1f}f"
-        return str(expr.value)
+        v = int(expr.value)
+        # Use LL suffix for large constants to prevent 32-bit overflow
+        # in index arithmetic (e.g., stride * idx for large tensors).
+        return f"{v}LL" if abs(v) > 32768 else str(v)
     if isinstance(expr, BinOp):
         prec = _PRECEDENCE.get(expr.op, 10)
         left = _emit_expr(expr.left, prec)

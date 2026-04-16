@@ -23,6 +23,13 @@ from deplodock.compiler.ops import (
 
 
 def _same_rank(op, node, graph):
+    """IndexMapOp predicate: pass through single-source same-rank IndexMapOps.
+
+    Multi-source IndexMapOps (cat) have Mux semantics that can't be
+    folded into a simple Port.indexmap — they need their own kernel.
+    """
+    if len(op.sources) > 1:
+        return False
     in_shape = graph.nodes[node.inputs[0]].output.shape
     return len(op.out_shape) <= len(in_shape)
 

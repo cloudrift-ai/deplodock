@@ -101,7 +101,7 @@ def test_tinyllama_block_accuracy():
 
 
 @requires_cuda
-@pytest.mark.xfail(reason="Qwen 7B GQA block has a full-pipeline accuracy regression under investigation")
+@pytest.mark.xfail(reason="Qwen 7B attention produces wrong values — under investigation")
 def test_qwen_block_accuracy():
     """Qwen 7B block (random weights): deplodock output matches PyTorch eager."""
     from transformers import AutoConfig, AutoModelForCausalLM
