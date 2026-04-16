@@ -78,13 +78,13 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     if chain is None or not chain.consumed:
         return graph
 
-    contraction = _build_contraction(graph, chain)
     reduce_stages = _build_reduce_stages(graph, chain)
     epilogue_nodes = _build_epilogue(graph, chain)
 
     all_consumed = set(chain.consumed)
     external_inputs = _collect_external_inputs(graph, all_consumed)
-    inputs, external_shapes = _build_input_tree(graph, external_inputs, all_consumed)
+    inputs, external_shapes, port_map = _build_input_tree(graph, external_inputs, all_consumed)
+    contraction = _build_contraction(graph, chain, port_map)
 
     last_nid = _last_node_id(chain)
     last_node = graph.nodes[last_nid]
@@ -123,11 +123,15 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
 # ---------------------------------------------------------------------------
 
 
-def _build_contraction(graph: Graph, chain: ChainMatch) -> ContractionCore | None:
+def _build_contraction(graph: Graph, chain: ChainMatch, port_map: dict) -> ContractionCore | None:
+    """Build a ContractionCore, using ``port_map`` to resolve absorbed inputs.
+
+    ``port_map`` maps original buffer_id → absorbed Port (with indexmap
+    set if the original id was an IndexMapOp absorbed by the backward walk).
+    """
     mul_ids = chain.get("mul")
     if not mul_ids:
         return None
-    # Only the contraction group's reduce (first one if stages also matched)
     contraction_reduce_ids = [
         nid for seg in chain.segments if seg.name.startswith("contraction[") and seg.name.endswith("].reduce") for nid in seg.node_ids
     ]
@@ -137,7 +141,7 @@ def _build_contraction(graph: Graph, chain: ChainMatch) -> ContractionCore | Non
     mul_node = graph.nodes[mul_ids[0]]
     red_node = graph.nodes[contraction_reduce_ids[0]]
 
-    src_ports = tuple(Port(buffer_id=inp) for inp in mul_node.inputs)
+    src_ports = tuple(port_map.get(inp, Port(buffer_id=inp)) for inp in mul_node.inputs)
     operand = Combine(sources=src_ports, ops=(mul_node,))
 
     assert isinstance(red_node.op, ReduceOp)
@@ -193,19 +197,26 @@ def _build_input_tree(
     graph: Graph,
     external_inputs: list[str],
     consumed: set[str],
-) -> tuple[list, dict[str, tuple]]:
+) -> tuple[list, dict[str, tuple], dict]:
     """Build KernelInput trees for each external input.
 
     Single-source IndexMapOp with fan-out 1 → fold into Port.indexmap.
     Multi-source IndexMapOp → Mux. Otherwise → bare Port.
+
+    Returns ``(inputs, external_shapes, port_map)`` where ``port_map``
+    maps original buffer_id → the constructed Port/Mux (so the
+    contraction builder can resolve absorbed inputs).
     """
     inputs = []
     external_shapes: dict[str, tuple] = {}
+    port_map: dict[str, Port | Mux] = {}
 
     for buf_id in external_inputs:
         node = graph.nodes.get(buf_id)
         if node is None:
-            inputs.append(Port(buffer_id=buf_id))
+            p = Port(buffer_id=buf_id)
+            inputs.append(p)
+            port_map[buf_id] = p
             continue
 
         if isinstance(node.op, IndexMapOp) and len(graph.consumers(buf_id)) == 1:
@@ -213,19 +224,25 @@ def _build_input_tree(
             if len(node.op.sources) == 1:
                 src_id = node.inputs[node.op.sources[0].input_idx]
                 external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
-                inputs.append(Port(buffer_id=src_id, indexmap=node.op))
+                p = Port(buffer_id=src_id, indexmap=node.op)
+                inputs.append(p)
+                port_map[buf_id] = p
             else:
                 branches = []
                 for src in node.op.sources:
                     src_id = node.inputs[src.input_idx]
                     external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
                     branches.append(MuxBranch(input=Port(buffer_id=src_id), select=src.select))
-                inputs.append(Mux(branches=tuple(branches)))
+                m = Mux(branches=tuple(branches))
+                inputs.append(m)
+                port_map[buf_id] = m
         else:
             external_shapes[buf_id] = tuple(node.output.shape)
-            inputs.append(Port(buffer_id=buf_id))
+            p = Port(buffer_id=buf_id)
+            inputs.append(p)
+            port_map[buf_id] = p
 
-    return inputs, external_shapes
+    return inputs, external_shapes, port_map
 
 
 def _first_port_id(inp) -> str:
