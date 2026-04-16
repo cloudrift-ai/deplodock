@@ -1,10 +1,25 @@
-"""Decompose scaled_dot_product_attention into QK^T → scale → softmax → @V."""
+"""Decompose scaled_dot_product_attention into QK^T → scale → softmax → @V.
+
+For GQA (Grouped Query Attention) where Q has more heads than K/V, an
+explicit IndexMapOp is inserted on K and V to broadcast the head dim
+via integer-divide indexing: ``K[b, q_head // group_size, s, d]``.
+"""
 
 import math
 
+from deplodock.compiler.backend.ir.expr import BinOp, Literal
+from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, ReduceOp, SdpaOp, TransposeOp
+from deplodock.compiler.ops import (
+    ConstantOp,
+    ElementwiseOp,
+    IndexMapOp,
+    IndexSource,
+    ReduceOp,
+    SdpaOp,
+    TransposeOp,
+)
 
 GRAMMAR = [Production("root", SdpaOp, "1")]
 
@@ -29,8 +44,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     k_batch = k_shape[:-2] if len(k_shape) > 2 else ()
     scores_shape = q_batch + (seq_len, seq_len)
 
-    # K^T: transpose last two dims.  Use K's actual batch dims (may differ
-    # from Q in GQA: e.g. Q has 28 heads, K has 4).
+    # K^T: transpose last two dims.
     kt_shape = k_batch + (head_dim, seq_len) if isinstance(head_dim, int) else k_shape
     kt_id = g.add_node(
         op=TransposeOp(axes=(-2, -1)),
@@ -38,20 +52,48 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         output=Tensor(f"{name}_kt", kt_shape, dtype),
     )
 
-    # QK^T: matmul(Q, K^T) — decomposed as elementwise mul + reduce sum.
-    # When Q and K have different batch dims (GQA), the mul broadcasts
-    # K's heads to match Q's.  The intermediate shape uses Q's batch dims.
+    # GQA: when Q has more heads than K, insert an IndexMapOp on K^T to
+    # broadcast via integer-divide: K^T[b, q_head // group_size, d, s].
+    if q_batch and k_batch and len(q_batch) == len(k_batch):
+        q_heads = q_batch[-1] if isinstance(q_batch[-1], int) else None
+        k_heads = k_batch[-1] if isinstance(k_batch[-1], int) else None
+        if q_heads and k_heads and q_heads > k_heads and q_heads % k_heads == 0:
+            group_size = q_heads // k_heads
+            gqa_out_shape = q_batch + (head_dim, seq_len)
+            ndim = len(gqa_out_shape)
+            coord_map = []
+            for d in range(ndim):
+                p = placeholder(d)
+                head_axis = len(q_batch) - 1
+                if d == head_axis:
+                    coord_map.append(BinOp("/", p, Literal(group_size, "int")))
+                else:
+                    coord_map.append(p)
+            kt_id = g.add_node(
+                op=IndexMapOp(
+                    out_shape=gqa_out_shape,
+                    sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),),
+                ),
+                inputs=[kt_id],
+                output=Tensor(f"{name}_kt_gqa", gqa_out_shape, dtype),
+            )
+
+    # QK^T: matmul(Q, K^T) — unsqueeze for broadcast-compatible mul + reduce.
+    from deplodock.compiler.rules.decomposition._matmul_helpers import matmul_unsqueeze
+
+    q_eff_shape = tuple(g.nodes[q_id].output.shape)
+    kt_eff_shape = tuple(g.nodes[kt_id].output.shape)
+    q_unsq, kt_unsq, qk_mul_shape, qk_k_axis = matmul_unsqueeze(q_eff_shape, kt_eff_shape)
+
+    q_unsq_id = g.add_node(op=q_unsq, inputs=[q_id], output=Tensor(f"{name}_q_unsq", q_unsq.out_shape, dtype))
+    kt_unsq_id = g.add_node(op=kt_unsq, inputs=[kt_id], output=Tensor(f"{name}_kt_unsq", kt_unsq.out_shape, dtype))
     qk_ew_id = g.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[q_id, kt_id],
-        output=Tensor(
-            f"{name}_qk_ew",
-            scores_shape + (head_dim,) if isinstance(head_dim, int) else scores_shape,
-            dtype,
-        ),
+        inputs=[q_unsq_id, kt_unsq_id],
+        output=Tensor(f"{name}_qk_ew", qk_mul_shape, dtype),
     )
     qk_id = g.add_node(
-        op=ReduceOp(fn="sum", axis=-1),
+        op=ReduceOp(fn="sum", axis=qk_k_axis),
         inputs=[qk_ew_id],
         output=Tensor(f"{name}_qk", scores_shape, dtype),
     )
@@ -96,18 +138,48 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         output=Tensor(f"{name}_softmax", scores_shape, dtype),
     )
 
-    # Softmax @ V: matmul(softmax, V) — decomposed as mul + reduce sum
+    # Softmax @ V: matmul(softmax, V) — decomposed as mul + reduce sum.
+    # GQA: V needs the same head broadcast as K.
+    v_shape = g.nodes[v_id].output.shape
+    v_batch = v_shape[:-2] if len(v_shape) > 2 else ()
+    actual_v_id = v_id
+    if q_batch and v_batch and len(q_batch) == len(v_batch):
+        q_heads_v = q_batch[-1] if isinstance(q_batch[-1], int) else None
+        v_heads = v_batch[-1] if isinstance(v_batch[-1], int) else None
+        if q_heads_v and v_heads and q_heads_v > v_heads and q_heads_v % v_heads == 0:
+            group_size_v = q_heads_v // v_heads
+            gqa_v_shape = q_batch + v_shape[-2:]
+            ndim_v = len(gqa_v_shape)
+            coord_map_v = []
+            for d in range(ndim_v):
+                p = placeholder(d)
+                head_axis_v = len(q_batch) - 1
+                if d == head_axis_v:
+                    coord_map_v.append(BinOp("/", p, Literal(group_size_v, "int")))
+                else:
+                    coord_map_v.append(p)
+            actual_v_id = g.add_node(
+                op=IndexMapOp(
+                    out_shape=gqa_v_shape,
+                    sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map_v)),),
+                ),
+                inputs=[v_id],
+                output=Tensor(f"{name}_v_gqa", gqa_v_shape, dtype),
+            )
+
+    s_eff_shape = tuple(g.nodes[softmax_id].output.shape)
+    v_eff_shape = tuple(g.nodes[actual_v_id].output.shape)
+    s_unsq, v_unsq, sv_mul_shape, sv_k_axis = matmul_unsqueeze(s_eff_shape, v_eff_shape)
+
+    s_unsq_id = g.add_node(op=s_unsq, inputs=[softmax_id], output=Tensor(f"{name}_s_unsq", s_unsq.out_shape, dtype))
+    v_unsq_id = g.add_node(op=v_unsq, inputs=[actual_v_id], output=Tensor(f"{name}_v_unsq", v_unsq.out_shape, dtype))
     sv_ew_id = g.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[softmax_id, v_id],
-        output=Tensor(
-            f"{name}_sv_ew",
-            out_shape + (seq_len,) if isinstance(seq_len, int) else out_shape,
-            dtype,
-        ),
+        inputs=[s_unsq_id, v_unsq_id],
+        output=Tensor(f"{name}_sv_ew", sv_mul_shape, dtype),
     )
     sv_id = g.add_node(
-        op=ReduceOp(fn="sum", axis=-1),
+        op=ReduceOp(fn="sum", axis=sv_k_axis),
         inputs=[sv_ew_id],
         output=Tensor(name, out_shape, dtype),
     )

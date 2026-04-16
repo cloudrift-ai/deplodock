@@ -550,6 +550,39 @@ class KernelOp(Op):
     def __post_init__(self) -> None:
         _validate_ssa(self)
 
+    def infer_shapes(self) -> dict[str, tuple]:
+        """Derive the shape of every named value (inputs + Assigns).
+
+        Walks the SSA body, calling ``op.infer_output_shape`` at each
+        Assign. Returns a dict mapping value names to shapes.
+        """
+        shapes: dict[str, tuple] = {}
+        for inp in self.inputs:
+            if isinstance(inp, Port):
+                if inp.indexmap is not None:
+                    shapes[inp.buffer_id] = tuple(inp.indexmap.out_shape)
+                else:
+                    shapes[inp.buffer_id] = tuple(self.external_shapes.get(inp.buffer_id, ()))
+            elif isinstance(inp, Combine):
+                for src in inp.sources:
+                    if isinstance(src, Port):
+                        if src.indexmap is not None:
+                            shapes[src.buffer_id] = tuple(src.indexmap.out_shape)
+                        else:
+                            shapes[src.buffer_id] = tuple(self.external_shapes.get(src.buffer_id, ()))
+        for assign in self.body:
+            arg_shapes = [shapes[a] for a in assign.args if a in shapes]
+            if arg_shapes:
+                shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
+        return shapes
+
+    def infer_output_shape(self, input_shapes: list[tuple] | None = None) -> tuple:
+        """Derive the kernel's output shape from the SSA body."""
+        shapes = self.infer_shapes()
+        if self.body:
+            return shapes.get(self.body[-1].name, ())
+        return ()
+
 
 type ElementwiseChain = tuple[ElementwiseOp, ...]
 
