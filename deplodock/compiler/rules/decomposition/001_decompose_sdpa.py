@@ -143,17 +143,17 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     v_shape = g.nodes[v_id].output.shape
     v_batch = v_shape[:-2] if len(v_shape) > 2 else ()
     actual_v_id = v_id
-    if q_batch and v_batch and len(q_batch) == len(v_batch):
+    if q_batch and v_batch:
         q_heads_v = q_batch[-1] if isinstance(q_batch[-1], int) else None
         v_heads = v_batch[-1] if isinstance(v_batch[-1], int) else None
         if q_heads_v and v_heads and q_heads_v > v_heads and q_heads_v % v_heads == 0:
             group_size_v = q_heads_v // v_heads
-            gqa_v_shape = q_batch + v_shape[-2:]
-            ndim_v = len(gqa_v_shape)
+            # Replace V's head dim with Q's head count; keep V's other batch dims.
+            head_axis_v = len(v_batch) - 1
+            gqa_v_shape = tuple(v_batch[:head_axis_v]) + (q_heads_v,) + tuple(v_shape[-2:])
             coord_map_v = []
-            for d in range(ndim_v):
+            for d in range(len(v_shape)):
                 p = placeholder(d)
-                head_axis_v = len(q_batch) - 1
                 if d == head_axis_v:
                     coord_map_v.append(BinOp("/", p, Literal(group_size_v, "int")))
                 else:
