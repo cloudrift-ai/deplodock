@@ -2,24 +2,33 @@
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp
+from deplodock.compiler.ops import ConstantOp, ElementwiseOp, InputOp
 
 GRAMMAR = [Production("root", ElementwiseOp, "1", {"fn": "pow"})]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     """Replace pow(x, 2) with mul(x, x) — enables RMSNorm pattern matching."""
-    g = graph.copy()
-    root = g.nodes[match.root_node_id]
+    root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
     exp_id = root.inputs[1]
 
     # Only decompose pow(x, 2) — check the exponent constant.
-    exp_node = g.nodes.get(exp_id)
+    exp_node = graph.nodes.get(exp_id)
     if exp_node and isinstance(exp_node.op, ConstantOp) and exp_node.op.value != 2.0:
-        return graph  # Not pow(x, 2) — leave unchanged.
+        return None  # Not pow(x, 2) — leave unchanged.
 
-    mul_id = g.add_node(
+    frag = Graph()
+
+    # InputOp sentinel for x.
+    frag.add_node(
+        op=InputOp(),
+        inputs=[],
+        output=Tensor(graph.nodes[x_id].output.name, graph.nodes[x_id].output.shape, graph.nodes[x_id].output.dtype),
+        node_id=x_id,
+    )
+
+    mul_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
         inputs=[x_id, x_id],
         output=Tensor(
@@ -29,11 +38,5 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         ),
     )
 
-    g.replace_node(match.root_node_id, mul_id)
-    g.remove_node(match.root_node_id)
-
-    # Remove the exponent constant if it has no other consumers.
-    if exp_id in g.nodes and not g.consumers(exp_id):
-        g.remove_node(exp_id)
-
-    return g
+    frag.outputs = [mul_id]
+    return frag

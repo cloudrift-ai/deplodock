@@ -12,12 +12,12 @@ from deplodock.compiler.backend.ir.expr import Literal
 from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import CatOp, ConstantOp, IndexMapOp, IndexSource
+from deplodock.compiler.ops import CatOp, ConstantOp, IndexMapOp, IndexSource, InputOp
 
 GRAMMAR = [Production("root", CatOp, "1")]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     rs_id = match.root_node_id
     root = graph.nodes[rs_id]
     a_id = root.inputs[0]
@@ -26,23 +26,30 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
 
     rs_node = graph.nodes[rs_id]
     a_shape = tuple(graph.nodes[a_id].output.shape)
-    # b_shape would be useful for asserting shape compatibility but is unused
-    # here — the cat semantics are encoded entirely via select + offset on the
-    # split axis, computed from a_shape's split position.
     out_shape = tuple(rs_node.output.shape)
     ndim = len(out_shape)
 
     dim_node = graph.nodes.get(dim_id)
     if not (isinstance(dim_node.op, ConstantOp) and dim_node.op.value is not None):
-        return graph
+        return None
     dim = int(dim_node.op.value)
     norm_dim = dim if dim >= 0 else ndim + dim
 
     if not isinstance(a_shape[norm_dim], int):
-        return graph
+        return None
     split = a_shape[norm_dim]
 
-    g = graph.copy()
+    frag = Graph()
+
+    # InputOp sentinels for tensor inputs (constant dim input is baked into
+    # the coord_map; the rewriter's _remove_orphans handles cleanup).
+    for eid in sorted({a_id, b_id}):
+        frag.add_node(
+            op=InputOp(),
+            inputs=[],
+            output=Tensor(graph.nodes[eid].output.name, graph.nodes[eid].output.shape, graph.nodes[eid].output.dtype),
+            node_id=eid,
+        )
 
     # Source A: identity coord_map, select = (out_coord_dim < split)
     src_a = IndexSource(
@@ -60,15 +67,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
             coord_map_b.append(placeholder(i))
     src_b = IndexSource(input_idx=1, coord_map=tuple(coord_map_b))
 
-    new_id = g.add_node(
+    new_id = frag.add_node(
         op=IndexMapOp(out_shape=out_shape, sources=(src_a, src_b)),
         inputs=[a_id, b_id],
         output=Tensor(rs_node.output.name, out_shape, rs_node.output.dtype),
     )
-    g.replace_node(rs_id, new_id)
-    g.remove_node(rs_id)
 
-    if dim_id in g.nodes and not g.consumers(dim_id):
-        g.remove_node(dim_id)
-
-    return g
+    frag.outputs = [new_id]
+    return frag

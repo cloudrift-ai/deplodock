@@ -16,6 +16,7 @@ from deplodock.compiler.ops import (
     ElementwiseOp,
     IndexMapOp,
     IndexSource,
+    InputOp,
     ReduceOp,
     SdpaOp,
     TransposeOp,
@@ -24,16 +25,15 @@ from deplodock.compiler.ops import (
 GRAMMAR = [Production("root", SdpaOp, "1")]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     """Replace sdpa(Q, K, V, ...) with QK^T → scale → softmax → @V."""
-    g = graph.copy()
-    root = g.nodes[match.root_node_id]
+    root = graph.nodes[match.root_node_id]
     q_id = root.inputs[0]
     k_id = root.inputs[1]
     v_id = root.inputs[2]
 
-    q_shape = g.nodes[q_id].output.shape
-    k_shape = g.nodes[k_id].output.shape
+    q_shape = graph.nodes[q_id].output.shape
+    k_shape = graph.nodes[k_id].output.shape
     out_shape = root.output.shape
     dtype = root.output.dtype
     name = root.output.name
@@ -44,9 +44,22 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     k_batch = k_shape[:-2] if len(k_shape) > 2 else ()
     scores_shape = q_batch + (seq_len, seq_len)
 
+    frag = Graph()
+
+    # InputOp sentinels for all external references.
+    # Q, K, V are always referenced.
+    ext_ids = {q_id, k_id, v_id}
+    for eid in sorted(ext_ids):
+        frag.add_node(
+            op=InputOp(),
+            inputs=[],
+            output=Tensor(graph.nodes[eid].output.name, graph.nodes[eid].output.shape, graph.nodes[eid].output.dtype),
+            node_id=eid,
+        )
+
     # K^T: transpose last two dims.
     kt_shape = k_batch + (head_dim, seq_len) if isinstance(head_dim, int) else k_shape
-    kt_id = g.add_node(
+    kt_id = frag.add_node(
         op=TransposeOp(axes=(-2, -1)),
         inputs=[k_id],
         output=Tensor(f"{name}_kt", kt_shape, dtype),
@@ -69,7 +82,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
                     coord_map.append(BinOp("/", p, Literal(group_size, "int")))
                 else:
                     coord_map.append(p)
-            kt_id = g.add_node(
+            kt_id = frag.add_node(
                 op=IndexMapOp(
                     out_shape=gqa_out_shape,
                     sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),),
@@ -81,18 +94,18 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     # QK^T: matmul(Q, K^T) — unsqueeze for broadcast-compatible mul + reduce.
     from deplodock.compiler.rules.decomposition._matmul_helpers import matmul_unsqueeze
 
-    q_eff_shape = tuple(g.nodes[q_id].output.shape)
-    kt_eff_shape = tuple(g.nodes[kt_id].output.shape)
+    q_eff_shape = tuple(graph.nodes[q_id].output.shape)
+    kt_eff_shape = tuple(frag.nodes[kt_id].output.shape)
     q_unsq, kt_unsq, qk_mul_shape, qk_k_axis = matmul_unsqueeze(q_eff_shape, kt_eff_shape)
 
-    q_unsq_id = g.add_node(op=q_unsq, inputs=[q_id], output=Tensor(f"{name}_q_unsq", q_unsq.out_shape, dtype))
-    kt_unsq_id = g.add_node(op=kt_unsq, inputs=[kt_id], output=Tensor(f"{name}_kt_unsq", kt_unsq.out_shape, dtype))
-    qk_ew_id = g.add_node(
+    q_unsq_id = frag.add_node(op=q_unsq, inputs=[q_id], output=Tensor(f"{name}_q_unsq", q_unsq.out_shape, dtype))
+    kt_unsq_id = frag.add_node(op=kt_unsq, inputs=[kt_id], output=Tensor(f"{name}_kt_unsq", kt_unsq.out_shape, dtype))
+    qk_ew_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
         inputs=[q_unsq_id, kt_unsq_id],
         output=Tensor(f"{name}_qk_ew", qk_mul_shape, dtype),
     )
-    qk_id = g.add_node(
+    qk_id = frag.add_node(
         op=ReduceOp(fn="sum", axis=qk_k_axis),
         inputs=[qk_ew_id],
         output=Tensor(f"{name}_qk", scores_shape, dtype),
@@ -100,39 +113,39 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
 
     # Scale constant: 1/sqrt(head_dim)
     scale_value = 1.0 / math.sqrt(head_dim) if isinstance(head_dim, int) else None
-    scale_const_id = g.add_node(
+    scale_const_id = frag.add_node(
         op=ConstantOp(name=f"{name}_scale", value=scale_value),
         inputs=[],
         output=Tensor(f"{name}_scale", (1,), dtype),
     )
-    scaled_id = g.add_node(
+    scaled_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
         inputs=[qk_id, scale_const_id],
         output=Tensor(f"{name}_scaled", scores_shape, dtype),
     )
 
     # Softmax: max → sub → exp → sum → div
-    max_id = g.add_node(
+    max_id = frag.add_node(
         op=ReduceOp(fn="max", axis=-1),
         inputs=[scaled_id],
         output=Tensor(f"{name}_max", scores_shape[:-1] + (1,) if scores_shape else (1,), dtype),
     )
-    sub_id = g.add_node(
+    sub_id = frag.add_node(
         op=ElementwiseOp(fn="sub"),
         inputs=[scaled_id, max_id],
         output=Tensor(f"{name}_shifted", scores_shape, dtype),
     )
-    exp_id = g.add_node(
+    exp_id = frag.add_node(
         op=ElementwiseOp(fn="exp"),
         inputs=[sub_id],
         output=Tensor(f"{name}_exp", scores_shape, dtype),
     )
-    sum_id = g.add_node(
+    sum_id = frag.add_node(
         op=ReduceOp(fn="sum", axis=-1),
         inputs=[exp_id],
         output=Tensor(f"{name}_sum", scores_shape[:-1] + (1,) if scores_shape else (1,), dtype),
     )
-    softmax_id = g.add_node(
+    softmax_id = frag.add_node(
         op=ElementwiseOp(fn="div"),
         inputs=[exp_id, sum_id],
         output=Tensor(f"{name}_softmax", scores_shape, dtype),
@@ -140,7 +153,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
 
     # Softmax @ V: matmul(softmax, V) — decomposed as mul + reduce sum.
     # GQA: V needs the same head broadcast as K.
-    v_shape = g.nodes[v_id].output.shape
+    v_shape = graph.nodes[v_id].output.shape
     v_batch = v_shape[:-2] if len(v_shape) > 2 else ()
     actual_v_id = v_id
     if q_batch and v_batch:
@@ -158,7 +171,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
                     coord_map_v.append(BinOp("/", p, Literal(group_size_v, "int")))
                 else:
                     coord_map_v.append(p)
-            actual_v_id = g.add_node(
+            actual_v_id = frag.add_node(
                 op=IndexMapOp(
                     out_shape=gqa_v_shape,
                     sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map_v)),),
@@ -167,29 +180,22 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
                 output=Tensor(f"{name}_v_gqa", gqa_v_shape, dtype),
             )
 
-    s_eff_shape = tuple(g.nodes[softmax_id].output.shape)
-    v_eff_shape = tuple(g.nodes[actual_v_id].output.shape)
+    s_eff_shape = tuple(frag.nodes[softmax_id].output.shape)
+    v_eff_shape = tuple(frag.nodes[actual_v_id].output.shape)
     s_unsq, v_unsq, sv_mul_shape, sv_k_axis = matmul_unsqueeze(s_eff_shape, v_eff_shape)
 
-    s_unsq_id = g.add_node(op=s_unsq, inputs=[softmax_id], output=Tensor(f"{name}_s_unsq", s_unsq.out_shape, dtype))
-    v_unsq_id = g.add_node(op=v_unsq, inputs=[actual_v_id], output=Tensor(f"{name}_v_unsq", v_unsq.out_shape, dtype))
-    sv_ew_id = g.add_node(
+    s_unsq_id = frag.add_node(op=s_unsq, inputs=[softmax_id], output=Tensor(f"{name}_s_unsq", s_unsq.out_shape, dtype))
+    v_unsq_id = frag.add_node(op=v_unsq, inputs=[actual_v_id], output=Tensor(f"{name}_v_unsq", v_unsq.out_shape, dtype))
+    sv_ew_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
         inputs=[s_unsq_id, v_unsq_id],
         output=Tensor(f"{name}_sv_ew", sv_mul_shape, dtype),
     )
-    sv_id = g.add_node(
+    sv_id = frag.add_node(
         op=ReduceOp(fn="sum", axis=sv_k_axis),
         inputs=[sv_ew_id],
         output=Tensor(name, out_shape, dtype),
     )
 
-    g.replace_node(match.root_node_id, sv_id)
-    g.remove_node(match.root_node_id)
-
-    # Remove extra constant args (dropout_p, is_causal, etc.)
-    for extra_inp in root.inputs[3:]:
-        if extra_inp in g.nodes and not g.consumers(extra_inp):
-            g.remove_node(extra_inp)
-
-    return g
+    frag.outputs = [sv_id]
+    return frag

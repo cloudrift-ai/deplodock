@@ -8,17 +8,16 @@ coord_map for axis i reads the input's coord at axis i (for i < k) or i-1
 from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import IndexMapOp, IndexSource, UnsqueezeOp
+from deplodock.compiler.ops import IndexMapOp, IndexSource, InputOp, UnsqueezeOp
 
 GRAMMAR = [Production("root", UnsqueezeOp, "1")]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph:
-    g = graph.copy()
-    root = g.nodes[match.root_node_id]
+def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+    root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
     out_shape = tuple(root.output.shape)
-    in_shape = tuple(g.nodes[x_id].output.shape)
+    in_shape = tuple(graph.nodes[x_id].output.shape)
     dim = root.op.dim
     norm_dim = dim if dim >= 0 else len(out_shape) + dim
 
@@ -30,11 +29,21 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         out_axis = i if i < norm_dim else i + 1
         coord_map.append(placeholder(out_axis))
 
-    new_id = g.add_node(
+    frag = Graph()
+
+    # InputOp sentinel for x.
+    frag.add_node(
+        op=InputOp(),
+        inputs=[],
+        output=Tensor(graph.nodes[x_id].output.name, graph.nodes[x_id].output.shape, graph.nodes[x_id].output.dtype),
+        node_id=x_id,
+    )
+
+    new_id = frag.add_node(
         op=IndexMapOp(out_shape=out_shape, sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),)),
         inputs=[x_id],
         output=Tensor(root.output.name, out_shape, root.output.dtype),
     )
-    g.replace_node(match.root_node_id, new_id)
-    g.remove_node(match.root_node_id)
-    return g
+
+    frag.outputs = [new_id]
+    return frag
