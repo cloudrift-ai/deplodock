@@ -23,6 +23,7 @@ class CudaBackend(Backend):
         name: str = "prog",
         graph_inputs: list[str] | None = None,
         graph_outputs: list[str] | None = None,
+        graph_constants: list[str] | None = None,
     ) -> Program:
         """Emit CUDA source per ``KernelOp`` and assemble a runnable Program."""
         return compile_kernels(
@@ -30,6 +31,7 @@ class CudaBackend(Backend):
             name=name,
             graph_inputs=graph_inputs,
             graph_outputs=graph_outputs,
+            graph_constants=graph_constants,
         )
 
     def run(self, program: Program, input_data: dict[str, list[float]] | None = None) -> ProgramResult:
