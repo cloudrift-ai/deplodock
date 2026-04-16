@@ -237,11 +237,22 @@ def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[S
     out_shape = indexmap.out_shape
     ndim = len(out_shape)
 
-    # Decompose flat coord into per-axis coords: coord_i = (coord / stride_i) % dim_i
+    # Scan coord_map for the max placeholder index (composed IndexMaps may
+    # reference higher dims than out_shape has).
+    max_placeholder = ndim - 1
+    for cm in src.coord_map:
+        for var_name in _collect_var_names(cm):
+            if var_name.startswith(PLACEHOLDER_PREFIX):
+                idx = int(var_name[len(PLACEHOLDER_PREFIX) :])
+                max_placeholder = max(max_placeholder, idx)
+
+    # Decompose flat coord into per-axis coords for all needed placeholder dims.
     mapping: dict[str, Expr] = {}
     remainder = coord
-    for d in range(ndim - 1, -1, -1):
-        dim_size = int(out_shape[d])
+    effective_ndim = max_placeholder + 1
+    effective_shape = tuple(out_shape) + (1,) * (effective_ndim - ndim)
+    for d in range(effective_ndim - 1, -1, -1):
+        dim_size = int(effective_shape[d]) if d < len(effective_shape) and isinstance(effective_shape[d], int) else 1
         axis_var = f"{PLACEHOLDER_PREFIX}{d}"
         if d == 0:
             mapping[axis_var] = remainder
@@ -733,22 +744,30 @@ def _infer_output_shape(kernel: KernelOp) -> tuple:
     """Derive the kernel's output shape.
 
     Tries ``KernelOp.infer_output_shape()`` first; falls back to the output
-    Port's ``external_shapes`` entry or the first input Port's shape when
-    the SSA body has cross-iteration-space ops (e.g. softmax) whose shapes
-    can't be broadcast in the standard sense.
+    Port's ``external_shapes`` entry or the first input Port's shape.
     """
     try:
-        return kernel.infer_output_shape()
+        shape = kernel.infer_output_shape()
+        if shape:
+            return shape
     except (ValueError, KeyError):
-        # Cross-space SSA: look for an explicit output shape first.
-        for out in kernel.outputs:
-            if isinstance(out, Port) and out.buffer_id in kernel.external_shapes:
-                return tuple(kernel.external_shapes[out.buffer_id])
-        # Fall back to the first input Port's shape.
-        for inp in kernel.inputs:
-            if isinstance(inp, Port) and inp.buffer_id in kernel.external_shapes:
+        pass
+    # Fallback: output Port shape from external_shapes.
+    for out in kernel.outputs:
+        if isinstance(out, Port) and out.buffer_id in kernel.external_shapes:
+            return tuple(kernel.external_shapes[out.buffer_id])
+    # Fallback: output Port indexmap out_shape.
+    for out in kernel.outputs:
+        if isinstance(out, Port) and out.indexmap is not None:
+            return tuple(out.indexmap.out_shape)
+    # Fallback: first input Port shape.
+    for inp in kernel.inputs:
+        if isinstance(inp, Port):
+            if inp.indexmap is not None:
+                return tuple(inp.indexmap.out_shape)
+            if inp.buffer_id in kernel.external_shapes:
                 return tuple(kernel.external_shapes[inp.buffer_id])
-        return ()
+    return ()
 
 
 def _port_shape(inp, shapes: dict) -> tuple:
@@ -858,6 +877,23 @@ def _emit_kernel_source(kernel_def: KernelDef) -> str:
     from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as _emit
 
     return _emit(kernel_def)
+
+
+def _collect_var_names(expr) -> list[str]:
+    """Recursively collect all Var names from an expression tree."""
+    if isinstance(expr, Var):
+        return [expr.name]
+    names: list[str] = []
+    for attr in ("left", "right", "expr", "cond", "then", "else_"):
+        child = getattr(expr, attr, None)
+        if child is not None:
+            names.extend(_collect_var_names(child))
+    for attr in ("args",):
+        children = getattr(expr, attr, None)
+        if children is not None and isinstance(children, (list, tuple)):
+            for c in children:
+                names.extend(_collect_var_names(c))
+    return names
 
 
 def _fresh(seq: list[int]) -> str:
