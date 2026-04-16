@@ -199,9 +199,11 @@ def test_ssa_invariants_hold():
     for k in _kernel_nodes(result):
         # Re-validate explicitly
         defined = set()
+        port_idx = 0
         for inp in k.op.inputs:
             if isinstance(inp, Port):
-                defined.add(inp.buffer_id)
+                defined.add(f"${port_idx}")
+                port_idx += 1
         for a in k.op.body:
             for arg in a.args:
                 assert arg in defined, f"arg {arg!r} not defined before use in {a.name}"

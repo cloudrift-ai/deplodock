@@ -81,7 +81,13 @@ def analyze_kernel(kernel: KernelOp, shapes: dict[str, tuple], out_shape: tuple)
 
     Works for both flat (pointwise) and reduce kernels.
     """
-    input_ports = {p.buffer_id: p for p in kernel.inputs if isinstance(p, Port)}
+    # Build $N → Port mapping.
+    input_ports: dict[str, Port] = {}
+    port_idx = 0
+    for inp in kernel.inputs:
+        if isinstance(inp, Port):
+            input_ports[f"${port_idx}"] = inp
+            port_idx += 1
     has_reduce = any(isinstance(a.op, ReduceOp) for a in kernel.body)
 
     # --- Reduction geometry (None for flat) ---
@@ -102,7 +108,7 @@ def analyze_kernel(kernel: KernelOp, shapes: dict[str, tuple], out_shape: tuple)
 
     # --- Classify ports ---
     if has_reduce:
-        per_elem_ports = frozenset(name for name, port in input_ports.items() if _numel(_port_shape(port, shapes)) > n_rows)
+        per_elem_ports = frozenset(name for name, port in input_ports.items() if _numel(_dollar_port_shape(name, port, shapes)) > n_rows)
     else:
         per_elem_ports = frozenset()  # flat: all ports loaded at idx
 
@@ -272,11 +278,20 @@ def _n_rows(pre_reduce_shape: tuple, reduce_axis: int) -> int:
     return _numel(tuple(outer)) if outer else 1
 
 
+def _dollar_port_shape(key: str, port, shapes: dict) -> tuple:
+    """Get port shape for a $N-keyed port."""
+    if isinstance(port, Port) and port.indexmap is not None:
+        return tuple(port.indexmap.out_shape)
+    return tuple(shapes.get(key, ()))
+
+
 def _port_shape(inp, shapes: dict) -> tuple:
+    """Get port shape from indexmap or shapes dict (keyed by $N)."""
     if isinstance(inp, Port):
         if inp.indexmap is not None:
             return tuple(inp.indexmap.out_shape)
-        return tuple(shapes.get(inp.buffer_id, ()))
+        # Without buffer_id, the caller must have populated shapes with $N keys.
+        return ()
     if isinstance(inp, Combine) and inp.sources:
         return _port_shape(inp.sources[0], shapes)
     if isinstance(inp, Mux) and inp.branches:

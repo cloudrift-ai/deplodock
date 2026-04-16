@@ -648,13 +648,14 @@ class IndexMapOp(Op):
 class Port:
     """Signal-flow leaf: one external buffer read/write with optional layout.
 
-    ``buffer_id`` names the external graph node; ``indexmap`` (when set)
-    describes the per-output coord access pattern (transpose, slice,
-    broadcast). ``None`` = identity load/store at the natural shape.
-    Used on both the input and output sides of a kernel.
+    Position in ``KernelOp.inputs`` is the implicit index. The mapping
+    from Port index to external buffer name lives in the graph node's
+    ``inputs`` list, not inside the kernel.
+
+    ``indexmap`` (when set) describes the per-output coord access pattern
+    (transpose, slice, broadcast). ``None`` = identity load/store.
     """
 
-    buffer_id: str
     indexmap: IndexMapOp | None = None
 
 
@@ -728,7 +729,7 @@ class Assign:
 
     SSA invariants (enforced by ``KernelOp.__post_init__``):
       - Each ``name`` is defined exactly once across all Assigns.
-      - Every ``arg`` references an input ``Port.buffer_id`` or a prior
+      - Every ``arg`` references ``$N`` (input Port N) or a prior
         ``Assign.name``.
       - No forward references.
     """
@@ -767,30 +768,31 @@ class KernelOp(Op):
     def infer_shapes(self, input_shapes: dict[str, tuple] | None = None) -> dict[str, tuple]:
         """Derive the shape of every named value (inputs + Assigns).
 
-        ``input_shapes`` maps Port ``buffer_id`` → shape for all external
-        buffers. When a Port carries an ``indexmap``, its effective shape
-        is ``indexmap.out_shape`` regardless of the provided shape.
-
-        Walks the SSA body, calling ``op.infer_output_shape`` at each
-        Assign. Returns a dict mapping value names to shapes.
+        ``input_shapes`` maps ``$N`` (or external buffer names) → shape.
+        When a Port carries an ``indexmap``, its effective shape is
+        ``indexmap.out_shape`` regardless of the provided shape.
         """
         ext = input_shapes or {}
         shapes: dict[str, tuple] = {}
+        port_idx = 0
         for inp in self.inputs:
             if isinstance(inp, Port):
+                key = f"${port_idx}"
                 if inp.indexmap is not None:
-                    shapes[inp.buffer_id] = tuple(inp.indexmap.out_shape)
+                    shapes[key] = tuple(inp.indexmap.out_shape)
                 else:
-                    shapes[inp.buffer_id] = tuple(ext.get(inp.buffer_id, ()))
+                    shapes[key] = tuple(ext.get(key, ()))
+                port_idx += 1
             elif isinstance(inp, Combine):
                 for src in inp.sources:
                     if isinstance(src, Port):
+                        key = f"${port_idx}"
                         if src.indexmap is not None:
-                            shapes[src.buffer_id] = tuple(src.indexmap.out_shape)
+                            shapes[key] = tuple(src.indexmap.out_shape)
                         else:
-                            shapes[src.buffer_id] = tuple(ext.get(src.buffer_id, ()))
+                            shapes[key] = tuple(ext.get(key, ()))
+                        port_idx += 1
         for assign in self.body:
-            # Prefer graph-provided shape (from ext dict) if available.
             if assign.name in ext:
                 shapes[assign.name] = tuple(ext[assign.name])
                 continue
@@ -803,10 +805,7 @@ class KernelOp(Op):
         return shapes
 
     def infer_output_shape(self, input_shapes: dict[str, tuple] | list[tuple] | None = None) -> tuple:
-        """Derive the kernel's output shape from the SSA body.
-
-        ``input_shapes`` is a dict mapping Port buffer_id → shape.
-        """
+        """Derive the kernel's output shape from the SSA body."""
         ext = input_shapes if isinstance(input_shapes, dict) else None
         shapes = self.infer_shapes(ext)
         if self.body:
@@ -833,13 +832,16 @@ def _assert_elementwise_chain(chain: ElementwiseChain, where: str) -> None:
 def _validate_ssa(kernel: KernelOp) -> None:
     """Enforce SSA invariants: unique names, defined-before-use."""
     defined: set[str] = set()
+    port_idx = 0
     for inp in kernel.inputs:
         if isinstance(inp, Port):
-            defined.add(inp.buffer_id)
+            defined.add(f"${port_idx}")
+            port_idx += 1
         elif isinstance(inp, Combine):
             for src in inp.sources:
                 if isinstance(src, Port):
-                    defined.add(src.buffer_id)
+                    defined.add(f"${port_idx}")
+                    port_idx += 1
     for assign in kernel.body:
         for arg in assign.args:
             if arg not in defined:
