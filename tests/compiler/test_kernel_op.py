@@ -109,15 +109,14 @@ def test_contraction_matmul_shape():
     mul = ElementwiseOp("mul")
     red = ReduceOp("sum", -1)
     operand = Combine(sources=(Port("a"), Port("b")), ops=(mul,))
-    cc = ContractionCore(operand=operand, k_axis=-1, reduce=red)
-    assert cc.k_axis == -1
+    cc = ContractionCore(operand=operand, reduce=red)
     assert isinstance(cc.operand, Combine)
 
 
 def test_contraction_rejects_elementwise_as_reduce():
     mul = ElementwiseOp("mul")
     with pytest.raises(TypeError, match="expected ReduceOp"):
-        ContractionCore(operand=Port("x"), k_axis=-1, reduce=mul)
+        ContractionCore(operand=Port("x"), reduce=mul)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +168,7 @@ def test_kernel_matmul():
     mul = ElementwiseOp("mul")
     red = ReduceOp("sum", -1)
     operand = Combine(sources=(Port("a"), Port("b")), ops=(mul,))
-    cc = ContractionCore(operand=operand, k_axis=-1, reduce=red)
+    cc = ContractionCore(operand=operand, reduce=red)
     k = KernelOp(inputs=(Port("a"), Port("b")), outputs=(Port("y"),), contraction=cc)
     assert k.contraction is cc
 
@@ -178,7 +177,7 @@ def test_kernel_matmul_plus_softmax():
     mul = ElementwiseOp("mul")
     contraction_reduce = ReduceOp("sum", -1)
     operand = Combine(sources=(Port("Q"), Port("K")), ops=(mul,))
-    cc = ContractionCore(operand=operand, k_axis=-1, reduce=contraction_reduce)
+    cc = ContractionCore(operand=operand, reduce=contraction_reduce)
 
     rmax = ReduceOp("max", -1)
     sub = ElementwiseOp("sub")
