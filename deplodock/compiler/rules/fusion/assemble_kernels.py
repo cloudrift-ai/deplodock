@@ -38,7 +38,7 @@ from deplodock.compiler.ops import (
 
 GRAMMAR = [Production("any", (ElementwiseOp, ReduceOp, IndexMapOp), "1")]
 
-_FUSABLE = (ElementwiseOp, ReduceOp, IndexMapOp)
+_FUSABLE = (ElementwiseOp, ReduceOp)
 
 
 def rewrite(graph: Graph, match: ChainMatch) -> Graph:
@@ -121,17 +121,33 @@ def _grow_region(graph: Graph, seed: str) -> tuple[set[str], str] | None:
         if nid in forward:
             continue
         node = graph.nodes.get(nid)
-        if node is None or not isinstance(node.op, _FUSABLE):
+        if node is None:
+            continue
+        # Pass through broadcast IndexMapOps (same or lower rank) but stop
+        # at rank-increasing ones (unsqueezes change the iteration space).
+        if isinstance(node.op, IndexMapOp):
+            in_rank = len(graph.nodes[node.inputs[0]].output.shape)
+            out_rank = len(node.op.out_shape)
+            if out_rank <= in_rank:
+                for cid in graph.consumers(nid):
+                    queue.append(cid)
+            continue
+        if not isinstance(node.op, _FUSABLE):
             continue
         if isinstance(node.op, ReduceOp):
-            if last_reduce is not None and not _reduce_depends_on(graph, nid, last_reduce, forward):
-                continue
+            if last_reduce is not None:
+                if not _reduce_depends_on(graph, nid, last_reduce, forward):
+                    continue
+                if not _same_reduce_geometry(graph, nid, last_reduce):
+                    continue
             last_reduce = nid
         forward.add(nid)
+        # Don't cross geometry boundaries: if any consumer is a ReduceOp
+        # on a different geometry, stop exploring from this node.
+        if last_reduce is not None and _has_rejected_reduce_consumer(graph, nid, last_reduce, forward):
+            continue
         for cid in graph.consumers(nid):
-            cnode = graph.nodes.get(cid)
-            if cnode is not None and isinstance(cnode.op, _FUSABLE):
-                queue.append(cid)
+            queue.append(cid)
 
     if not forward:
         return None
@@ -147,20 +163,84 @@ def _grow_region(graph: Graph, seed: str) -> tuple[set[str], str] | None:
         return None
 
     # Phase 3: backward cone — absorb nodes whose consumers are all in region.
+    # Look through IndexMapOps: a node's effective consumers are its direct
+    # consumers if fusable, or their consumers if they're IndexMapOps.
     region: set[str] = set()
     for nid in reversed(sorted_fwd):
         if nid == output:
             region.add(nid)
             continue
-        consumers = graph.consumers(nid)
-        if consumers and all(c in region for c in consumers):
+        effective = _effective_consumers(graph, nid, forward)
+        if effective is not None and effective and all(c in region for c in effective):
             region.add(nid)
 
     return (region, output) if region else None
 
 
+def _effective_consumers(graph: Graph, nid: str, forward: set[str]) -> list[str] | None:
+    """Get consumers in forward set, looking through IndexMapOp chains.
+
+    Returns None if any consumer path leads to a dead end (a non-forward
+    node that isn't an IndexMapOp chain to forward). This signals a side
+    output that prevents absorption.
+    """
+    result: list[str] = []
+    stack = list(graph.consumers(nid))
+    visited: set[str] = set()
+    while stack:
+        cid = stack.pop()
+        if cid in visited:
+            continue
+        visited.add(cid)
+        if cid in forward:
+            result.append(cid)
+        else:
+            cnode = graph.nodes.get(cid)
+            if cnode is not None and isinstance(cnode.op, IndexMapOp):
+                stack.extend(graph.consumers(cid))
+            else:
+                return None  # dead end — side output exists
+    return result
+
+
+def _has_rejected_reduce_consumer(graph: Graph, nid: str, last_reduce: str, forward: set[str]) -> bool:
+    """Check if any consumer of nid is a ReduceOp that would be rejected."""
+    for cid in graph.consumers(nid):
+        cnode = graph.nodes.get(cid)
+        if cnode is None or not isinstance(cnode.op, ReduceOp):
+            continue
+        if cid in forward:
+            continue
+        if not _reduce_depends_on(graph, cid, last_reduce, forward):
+            return True
+        if not _same_reduce_geometry(graph, cid, last_reduce):
+            return True
+    return False
+
+
+def _same_reduce_geometry(graph: Graph, nid_a: str, nid_b: str) -> bool:
+    """Check if two ReduceOps share the same iteration space.
+
+    Same pre-reduce shape and same axis → same K-loop geometry.
+    """
+    a = graph.nodes[nid_a]
+    b = graph.nodes[nid_b]
+    assert isinstance(a.op, ReduceOp) and isinstance(b.op, ReduceOp)
+    shape_a = tuple(graph.nodes[a.inputs[0]].output.shape)
+    shape_b = tuple(graph.nodes[b.inputs[0]].output.shape)
+    if len(shape_a) != len(shape_b):
+        return False
+    axis_a = a.op.axis % len(shape_a) if shape_a else 0
+    axis_b = b.op.axis % len(shape_b) if shape_b else 0
+    return axis_a == axis_b and shape_a == shape_b
+
+
 def _reduce_depends_on(graph: Graph, reduce_nid: str, prev_reduce: str, through: set[str]) -> bool:
-    """Check if reduce_nid transitively depends on prev_reduce through nodes in ``through``."""
+    """Check if reduce_nid transitively depends on prev_reduce.
+
+    Traces backward through nodes in ``through`` and through IndexMapOps
+    (which are transparent in the forward BFS).
+    """
     visited: set[str] = set()
     stack = list(graph.nodes[reduce_nid].inputs)
     while stack:
@@ -170,10 +250,11 @@ def _reduce_depends_on(graph: Graph, reduce_nid: str, prev_reduce: str, through:
         visited.add(nid)
         if nid == prev_reduce:
             return True
-        if nid in through:
-            node = graph.nodes.get(nid)
-            if node is not None:
-                stack.extend(node.inputs)
+        node = graph.nodes.get(nid)
+        if node is None:
+            continue
+        if nid in through or isinstance(node.op, IndexMapOp):
+            stack.extend(node.inputs)
     return False
 
 
@@ -239,12 +320,32 @@ def _build_input_tree(
             port_map[buf_id] = p
             continue
 
-        if isinstance(node.op, IndexMapOp) and len(node.op.sources) == 1 and len(graph.consumers(buf_id)) == 1:
-            consumed.add(buf_id)
+        if isinstance(node.op, IndexMapOp) and len(node.op.sources) == 1:
+            # Follow IndexMapOp chain to find ultimate non-IndexMapOp source.
+            chain = [buf_id]
+            cur_id = node.inputs[node.op.sources[0].input_idx]
+            while cur_id in graph.nodes:
+                cur_node = graph.nodes[cur_id]
+                if isinstance(cur_node.op, IndexMapOp) and len(cur_node.op.sources) == 1:
+                    chain.append(cur_id)
+                    cur_id = cur_node.inputs[cur_node.op.sources[0].input_idx]
+                else:
+                    break
+            # cur_id is the ultimate source (non-IndexMapOp)
+            if cur_id in consumed:
+                # Internal chain — remap all to ultimate source, consume chain.
+                for nid in chain:
+                    consumed.add(nid)
+                    port_map[nid] = Port(buffer_id=cur_id)
+                continue
+            # External source — absorb only this IndexMapOp (single step).
             src_id = node.inputs[node.op.sources[0].input_idx]
-            p = Port(buffer_id=src_id, indexmap=node.op)
-            inputs.append(p)
-            port_map[buf_id] = p
+            if len(graph.consumers(buf_id)) == 1:
+                consumed.add(buf_id)
+                p = Port(buffer_id=src_id, indexmap=node.op)
+                inputs.append(p)
+                port_map[buf_id] = p
+                continue
         else:
             p = Port(buffer_id=buf_id)
             inputs.append(p)
