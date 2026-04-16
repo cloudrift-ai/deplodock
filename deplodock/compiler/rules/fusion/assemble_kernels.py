@@ -63,7 +63,15 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     seed = match.root_node_id
     node = graph.nodes[seed]
 
-    if isinstance(node.op, (InputOp, ConstantOp, KernelOp, IndexMapOp)):
+    if isinstance(node.op, (InputOp, ConstantOp, KernelOp)):
+        return graph
+
+    # Standalone IndexMapOp: only wrap as a copy kernel once all consumers
+    # are already KernelOps (so the backward walk had its chance to absorb).
+    if isinstance(node.op, IndexMapOp):
+        consumers = graph.consumers(seed)
+        if all(isinstance(graph.nodes[c].op, KernelOp) for c in consumers if c in graph.nodes):
+            return _wrap_indexmap_kernel(graph, node)
         return graph
 
     chain = parse_chain(graph, seed, _KERNEL_GRAMMAR)
@@ -229,3 +237,45 @@ def _first_port_id(inp) -> str:
     if isinstance(inp, Combine):
         return _first_port_id(inp.sources[0])
     return ""
+
+
+def _wrap_indexmap_kernel(graph: Graph, node: Node) -> Graph:
+    """Wrap a standalone IndexMapOp as a copy KernelOp.
+
+    Single-source → Port(src, indexmap=op). Multi-source → Mux.
+    The kernel has no contraction, no reduce_stages, no epilogue —
+    it just reads via the indexmap and writes to the output buffer.
+    """
+    nid = node.id
+    op = node.op
+    assert isinstance(op, IndexMapOp)
+
+    external_shapes: dict[str, tuple] = {}
+    if len(op.sources) == 1:
+        src_id = node.inputs[op.sources[0].input_idx]
+        external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
+        inputs: tuple = (Port(buffer_id=src_id, indexmap=op),)
+    else:
+        branches = []
+        for src in op.sources:
+            src_id = node.inputs[src.input_idx]
+            external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
+            branches.append(MuxBranch(input=Port(buffer_id=src_id), select=src.select))
+        inputs = (Mux(branches=tuple(branches)),)
+
+    kernel = KernelOp(
+        inputs=inputs,
+        outputs=(Port(buffer_id=nid),),
+        external_shapes=external_shapes,
+    )
+
+    g = graph.copy()
+    input_nids = [_first_port_id(inputs[0])]
+    new_nid = g.add_node(
+        op=kernel,
+        inputs=input_nids,
+        output=Tensor(name=f"kernel_{nid}", shape=tuple(op.out_shape), dtype=node.output.dtype),
+    )
+    g.replace_node(nid, new_nid)
+    g.remove_node(nid)
+    return g
