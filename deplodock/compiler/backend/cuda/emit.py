@@ -172,32 +172,30 @@ def _emit_input_value(
         return result
 
     if isinstance(inp, Combine):
-        # Evaluate each source, bind to a named temporary, then fold the
-        # ops chain top-down substituting source results by buffer_id.
-        source_exprs: dict[str, Expr] = {}
+        # Load each source into a temporary.
+        source_vals: list[Expr] = []
         for src in inp.sources:
             expr = _emit_input_value(src, coord, shapes, stmts, name_seq)
             tname = _fresh(name_seq)
             stmts.append(VarDecl(dtype="float", name=tname, init=expr))
-            # Each Combine source is rooted at some buffer; expose its tmp
-            # name by the same id so downstream ops can reference it.
-            source_exprs[_source_id(src)] = Var(tname)
+            source_vals.append(Var(tname))
 
-        # Apply the elementwise chain. Each node's inputs are buffer_ids
-        # referenced either from source_exprs or from prior ops' outputs
-        # (keyed by node.id).
-        value_by_id: dict[str, Expr] = dict(source_exprs)
-        last: Expr | None = None
-        for node in inp.ops:
-            assert isinstance(node.op, ElementwiseOp)
-            node_inputs = [value_by_id.get(nid, Var(nid)) for nid in node.inputs]
-            value = _apply_elementwise(node.op.fn, node_inputs)
+        # Stack-machine: first op gets sources[0] (and sources[1] if
+        # binary); each subsequent op gets the prior result as arg[0]
+        # and the next unused source as arg[1].
+        source_iter = iter(source_vals)
+        value = next(source_iter)
+        for op in inp.ops:
+            assert isinstance(op, ElementwiseOp)
+            if op.info.arity == 1:
+                value = _apply_elementwise(op.fn, [value])
+            else:
+                extra = next(source_iter, ArrayAccess(array="?", index=coord))
+                value = _apply_elementwise(op.fn, [value, extra])
             tname = _fresh(name_seq)
             stmts.append(VarDecl(dtype="float", name=tname, init=value))
-            value_by_id[node.id] = Var(tname)
-            last = Var(tname)
-        assert last is not None
-        return last
+            value = Var(tname)
+        return value
 
     raise NotImplementedError(f"unexpected KernelInput variant: {type(inp).__name__}")
 
@@ -246,17 +244,6 @@ def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[S
     return ArrayAccess(array=port.buffer_id, index=flat_idx)
 
 
-def _source_id(src: KernelInput) -> str:
-    """Return a buffer-id-like key for a KernelInput, so downstream ops can reference it."""
-    if isinstance(src, Port):
-        return src.buffer_id
-    if isinstance(src, Combine):
-        # The combine's last op's id identifies its output value.
-        if src.ops:
-            return src.ops[-1].id
-    return f"<anon_{id(src)}>"
-
-
 # ---------------------------------------------------------------------------
 # Body emitters per kernel shape
 # ---------------------------------------------------------------------------
@@ -275,15 +262,13 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt]
     guarded: list[Stmt] = []
     name_seq = [0]
 
-    # Load each input Port/tree → build value map keyed by buffer_id.
-    value_map: dict[str, Expr] = {}
-    for inp in kernel.inputs:
-        expr = _emit_input_value(inp, idx, kernel.external_shapes, guarded, name_seq)
-        value_map[_source_id(inp)] = expr
+    # Load input Port/tree values. First input is the initial value;
+    # remaining inputs are extras for binary epilogue ops.
+    input_vals = [_emit_input_value(inp, idx, kernel.external_shapes, guarded, name_seq) for inp in kernel.inputs]
+    value = input_vals[0] if input_vals else Literal(0.0, "float")
+    extra_iter = iter(input_vals[1:])
 
-    # Apply the epilogue chain, resolving each op's inputs from value_map
-    # or from prior ops.
-    value = _apply_chain(kernel.epilogue, value_map, idx, guarded, name_seq)
+    value = _apply_chain(kernel.epilogue, value, extra_iter, idx, guarded, name_seq)
 
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port), "naive pointwise: output must be a plain Port"
@@ -322,7 +307,7 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], t
     prev_value_expr: Expr | None = None
     name_seq = [0]
     for si, stage in enumerate(stages):
-        fn = stage.reduce.op.fn
+        fn = stage.reduce.fn
         acc_name = f"acc{si}"
         stmts.append(VarDecl(dtype="float", name=acc_name, init=Literal(_identity(fn), "float")))
         k_var = Var(f"k{si}")
@@ -338,8 +323,8 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], t
             # reduce this would be a shared-mem chain.
             elem_expr = prev_value_expr  # type: ignore[assignment]
             for pre in stage.pre_ops:
-                assert isinstance(pre.op, ElementwiseOp)
-                elem_expr = _apply_elementwise(pre.op.fn, [elem_expr] + [Literal(0.0, "float")] * (pre.op.info.arity - 1))
+                assert isinstance(pre, ElementwiseOp)
+                elem_expr = _apply_elementwise(pre.fn, [elem_expr] + [Literal(0.0, "float")] * (pre.info.arity - 1))
         inner.append(AugAssign(target=acc_name, op=_reduce_op(fn), value=elem_expr))
         stmts.append(
             ForLoop(
@@ -352,8 +337,7 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], t
         prev_value_expr = Var(acc_name)
 
     value: Expr = prev_value_expr  # type: ignore[assignment]
-    last_reduce_id = stages[-1].reduce.id
-    value = _apply_epilogue(kernel.epilogue, value, last_reduce_id, row, stmts, name_seq)
+    value = _apply_epilogue(kernel.epilogue, value, list(kernel.inputs[1:]), row, stmts, name_seq, kernel.external_shapes)
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port)
     stmts.append(Assign(target=ArrayAccess(array=out_port.buffer_id, index=row), value=value))
@@ -400,7 +384,7 @@ def _emit_contraction_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stm
     else:
         batch = None
 
-    fn = contraction.reduce.op.fn
+    fn = contraction.reduce.fn
     stmts.append(VarDecl(dtype="float", name="acc", init=Literal(_identity(fn), "float")))
 
     k = Var("k")
@@ -425,18 +409,17 @@ def _emit_contraction_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stm
     inner_stmts: list[Stmt] = []
     a_val = _emit_input_value(a_port, a_flat, kernel.external_shapes, inner_stmts, name_seq_k)
     b_val = _emit_input_value(b_port, b_flat, kernel.external_shapes, inner_stmts, name_seq_k)
-    assert len(operand.ops) == 1 and operand.ops[0].op.fn == "mul"
+    assert len(operand.ops) == 1 and operand.ops[0].fn == "mul"
     prod_expr = BinOp("*", a_val, b_val)
     inner_stmts.append(AugAssign(target="acc", op=_reduce_op(fn), value=prod_expr))
     stmts.append(ForLoop(var=k.name, start=Literal(0, "int"), end=Literal(k_size, "int"), body=inner_stmts))
 
     name_seq = [0]
     value: Expr = Var("acc")
-    contraction_reduce_id = contraction.reduce.id
     out_flat: Expr = BinOp("+", BinOp("*", m, Literal(n_size, "int")), n)
     if batch is not None:
         out_flat = BinOp("+", BinOp("*", batch, Literal(m_size * n_size, "int")), out_flat)
-    value = _apply_epilogue(kernel.epilogue, value, contraction_reduce_id, out_flat, stmts, name_seq)
+    value = _apply_epilogue(kernel.epilogue, value, list(kernel.inputs), out_flat, stmts, name_seq, kernel.external_shapes)
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port)
     stmts.append(Assign(target=ArrayAccess(array=out_port.buffer_id, index=out_flat), value=value))
@@ -449,42 +432,51 @@ def _emit_contraction_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stm
 
 
 def _apply_chain(
-    chain: tuple,
-    value_map: dict[str, Expr],
+    chain: tuple[ElementwiseOp, ...],
+    value: Expr,
+    extra_iter: iter,
     coord: Expr,
     stmts: list[Stmt],
     name_seq: list[int],
 ) -> Expr:
-    """Apply an elementwise chain, resolving each op's inputs from ``value_map``
-    (prior ops + external Ports) or by loading from the buffer at ``coord``."""
-    last: Expr | None = None
-    for node in chain:
-        assert isinstance(node.op, ElementwiseOp)
-        node_inputs = [value_map.get(nid, ArrayAccess(array=nid, index=coord)) for nid in node.inputs]
-        applied = _apply_elementwise(node.op.fn, node_inputs)
+    """Apply an elementwise chain using positional (stack-machine) convention.
+
+    ``value`` is the initial input (prior chain value or body output).
+    Binary ops consume ``value`` as arg[0] and the next element from
+    ``extra_iter`` as arg[1].
+    """
+    for op in chain:
+        assert isinstance(op, ElementwiseOp)
+        if op.info.arity == 1:
+            value = _apply_elementwise(op.fn, [value])
+        else:
+            extra = next(extra_iter, ArrayAccess(array="?", index=coord))
+            value = _apply_elementwise(op.fn, [value, extra])
         tname = _fresh(name_seq)
-        stmts.append(VarDecl(dtype="float", name=tname, init=applied))
-        value_map[node.id] = Var(tname)
-        last = Var(tname)
-    return last if last is not None else Literal(0.0, "float")
+        stmts.append(VarDecl(dtype="float", name=tname, init=value))
+        value = Var(tname)
+    return value
 
 
 def _apply_epilogue(
-    chain: tuple,
+    chain: tuple[ElementwiseOp, ...],
     value: Expr,
-    body_node_id: str,
+    extra_inputs: list,
     coord: Expr,
     stmts: list[Stmt],
     name_seq: list[int],
+    shapes: dict | None = None,
 ) -> Expr:
     """Apply epilogue after a contraction/reduce body output.
 
-    Returns ``value`` unchanged if the chain is empty.
+    ``extra_inputs`` are KernelInput trees for binary epilogue ops
+    (e.g., bias Port for bias-add). Each binary op consumes the next
+    extra input loaded at ``coord``.
     """
     if not chain:
         return value
-    value_map: dict[str, Expr] = {body_node_id: value}
-    return _apply_chain(chain, value_map, coord, stmts, name_seq)
+    extra_vals = [_emit_input_value(inp, coord, shapes or {}, stmts, name_seq) for inp in extra_inputs]
+    return _apply_chain(chain, value, iter(extra_vals), coord, stmts, name_seq)
 
 
 # ---------------------------------------------------------------------------
@@ -557,16 +549,77 @@ def _contraction_k_size(operand: KernelInput, shapes: dict[str, tuple]) -> int:
 
 
 def _infer_output_shape(kernel: KernelOp) -> tuple:
-    # Priority: epilogue last node > last reduce > contraction > body input.
-    if kernel.epilogue:
-        return tuple(kernel.epilogue[-1].output.shape)
-    if kernel.reduce_stages:
-        return tuple(kernel.reduce_stages[-1].reduce.output.shape)
+    """Derive the kernel's output shape by walking the pipeline.
+
+    Shape propagates: input shapes → [contraction reduce] →
+    [reduce_stages] → [epilogue] → output shape.
+    """
+    shapes = kernel.external_shapes
+
+    # Start from input shapes.
+    input_shapes = [_port_shape(inp, shapes) for inp in kernel.inputs]
+    if not input_shapes:
+        input_shapes = [_port_shape(p, shapes) for p in _iter_leaf_ports(kernel)]
+
+    # Contraction output shape: A(..., M, K) reduced over K → (..., M, N).
     if kernel.contraction is not None:
-        return tuple(kernel.contraction.reduce.output.shape)
-    if kernel.inputs and isinstance(kernel.inputs[0], Combine):
-        return tuple(kernel.inputs[0].ops[-1].output.shape)
+        operand = kernel.contraction.operand
+        src_shapes = [_port_shape(s, shapes) for s in (operand.sources if isinstance(operand, Combine) else [operand])]
+        if len(src_shapes) >= 2:
+            a_shape, b_shape = src_shapes[0], src_shapes[1]
+            mul_shape = tuple(a_shape) + (b_shape[-1],) if b_shape else tuple(a_shape)
+        else:
+            mul_shape = src_shapes[0] if src_shapes else ()
+        shape = kernel.contraction.reduce.infer_output_shape([mul_shape])
+    elif input_shapes:
+        shape = input_shapes[0]
+    else:
+        return ()
+
+    # Reduce stages.
+    for stage in kernel.reduce_stages:
+        for op in stage.pre_ops:
+            shape = op.infer_output_shape([shape])
+        shape = stage.reduce.infer_output_shape([shape])
+
+    # Epilogue.
+    for op in kernel.epilogue:
+        shape = op.infer_output_shape([shape])
+
+    return tuple(shape)
+
+
+def _port_shape(inp, shapes: dict) -> tuple:
+    if isinstance(inp, Port):
+        if inp.indexmap is not None:
+            return tuple(inp.indexmap.out_shape)
+        return tuple(shapes.get(inp.buffer_id, ()))
+    if isinstance(inp, Combine):
+        if inp.sources:
+            return _port_shape(inp.sources[0], shapes)
+    if isinstance(inp, Mux):
+        if inp.branches:
+            return _port_shape(inp.branches[0].input, shapes)
     return ()
+
+
+def _iter_leaf_ports(kernel: KernelOp):
+    """Yield all leaf Ports from the kernel's trees."""
+    if kernel.contraction is not None:
+        yield from _leaf_ports_from(kernel.contraction.operand)
+    for inp in kernel.inputs:
+        yield from _leaf_ports_from(inp)
+
+
+def _leaf_ports_from(inp):
+    if isinstance(inp, Port):
+        yield inp
+    elif isinstance(inp, Mux):
+        for b in inp.branches:
+            yield from _leaf_ports_from(b.input)
+    elif isinstance(inp, Combine):
+        for s in inp.sources:
+            yield from _leaf_ports_from(s)
 
 
 def _build_params(kernel: KernelOp) -> tuple[list[KernelParam], list[str]]:
