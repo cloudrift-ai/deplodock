@@ -153,38 +153,26 @@ def test_graph_copy_preserves_hints():
     assert g.hints.get("x") == 1
 
 
-# --- Integration: hints flow through plan_graph ---
+# --- Integration: hints on the lowered KernelOps ---
 
 
-def test_hints_flow_through_plan():
-    from deplodock.compiler.plan import plan_graph
+def test_hints_flow_through_lower():
+    """Node hints are preserved on the Node instance stored inside a KernelOp.
 
-    g = _matmul_graph()
-    g.hints.set("cuda.matmul.strategy", "tma_db")
-
-    plan = plan_graph(g)
-    # Find the reduce op kernel.
-    reduce_ops = [op for op in plan.ops if op.op.startswith("reduce_")]
-    assert len(reduce_ops) == 1
-    hints = reduce_ops[0].params.get("_hints", {})
-    assert hints.get("cuda.matmul.strategy") == "tma_db"
-
-
-# --- Integration: hints flow through fusion ---
-
-
-def test_hints_survive_fusion():
-    from tests.compiler._fusion_helper import auto_fuse
+    After lowering, the matmul pair (mul + sum) becomes one KernelOp whose
+    ``contraction.operand.ops[0]`` is the original mul ``Node`` with its
+    hints intact, and ``contraction.reduce`` is the original sum ``Node``.
+    """
+    from deplodock.compiler.lower import lower
 
     g = _matmul_graph()
-    # Set a hint on the elementwise (mul) node.
-    ew_id = [nid for nid, n in g.nodes.items() if isinstance(n.op, ElementwiseOp)][0]
+    ew_id = next(nid for nid, n in g.nodes.items() if isinstance(n.op, ElementwiseOp))
     g.nodes[ew_id].hints.set("cuda.matmul.strategy", "tma_db")
 
-    fused = auto_fuse(g)
-    # The fused node should have inherited the hint.
-    from deplodock.compiler.ops import KernelOp
-
-    fused_nodes = [n for n in fused.nodes.values() if isinstance(n.op, KernelOp)]
-    assert len(fused_nodes) == 1
-    assert fused_nodes[0].hints.get("cuda.matmul.strategy") == "tma_db"
+    kernels = lower(g)
+    assert len(kernels) == 1
+    contraction = kernels[0].contraction
+    assert contraction is not None
+    mul_node = contraction.operand.ops[0]
+    assert mul_node.id == ew_id
+    assert mul_node.hints.get("cuda.matmul.strategy") == "tma_db"

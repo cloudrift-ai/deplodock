@@ -1,14 +1,16 @@
-"""Tests against real ATen traces from TinyLlama (fixture-based, no torch needed)."""
+"""Tests against real ATen traces from TinyLlama (fixture-based, no torch needed).
+
+Fixture coverage only — verifies the tracer produced the expected op
+types. Compilation / decomposition tests moved into ``test_lower.py``
+and ``test_emit.py`` against synthetic inputs; E2E flows through
+``test_pipeline.py``.
+"""
 
 import json
 from pathlib import Path
 
 from deplodock.compiler.ir import Graph
-from deplodock.compiler.ops import (
-    ElementwiseOp,
-    ReduceOp,
-)
-from deplodock.compiler.rewriter import Rewriter
+from deplodock.compiler.ops import ElementwiseOp
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
@@ -26,33 +28,7 @@ def _count_ops(graph: Graph) -> dict[str, int]:
     return counts
 
 
-def _load_rewriter() -> Rewriter:
-    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
-    return Rewriter.from_directory(rules_dir)
-
-
-# ---- Structure tests (no compilation) ----
-
-
-def test_view_ops_lowered_to_indexmap():
-    """Slice/Cat/Transpose/Unsqueeze decompose to IndexMapOp.
-
-    The unified IndexMap representation lets fusion and code generation use one
-    coord-map evaluator instead of per-op standalone kernels. ReshapeOp stays
-    as-is — it's already a free buffer alias via the backend's `_NOOP_OPS` path,
-    so decomposing it to an IndexMap would be lossy work for no win.
-    """
-    from deplodock.compiler.ops import CatOp, SliceOp, TransposeOp, UnsqueezeOp
-
-    g = _load_fixture("qwen25_7b_layer0.json")
-    g_opt = _load_rewriter().apply(g)
-    legacy_view_ops = (SliceOp, CatOp, TransposeOp, UnsqueezeOp)
-    survivors = [nid for nid, n in g_opt.nodes.items() if isinstance(n.op, legacy_view_ops)]
-    assert not survivors, f"legacy view ops should all decompose to IndexMapOp; survivors: {survivors}"
-
-
 def test_tinyllama_fixture_loads():
-    """The TinyLlama layer0 fixture loads as a valid graph."""
     g = _load_fixture("tinyllama_layer0.json")
     assert len(g.nodes) > 0
     assert len(g.inputs) > 0
@@ -68,20 +44,15 @@ def test_tinyllama_has_expected_ops():
     assert ops.get("ConstantOp", 0) >= 9  # weight matrices + layernorm weights + scalar constants
     assert ops.get("InputOp", 0) == 3  # hidden_states + cos + sin
     assert ops.get("ElementwiseOp", 0) > 0
-    # Faithful tracer keeps aten.mean.dim as MeanOp (decomposed by rewriter).
+    # Faithful tracer keeps aten.mean.dim as MeanOp (lowering handles decomposition).
     assert ops.get("MeanOp", 0) > 0
 
 
 def test_tinyllama_has_7_linear_patterns():
-    """The graph should have 7 linear projections (Q, K, V, O, gate, up, down).
-
-    The faithful tracer captures each as a LinearOp node (decomposition to
-    mul+reduce_sum happens in a later rewrite pass).
-    """
+    """The graph should have 7 linear projections (Q, K, V, O, gate, up, down)."""
     from deplodock.compiler.ops import LinearOp
 
     g = _load_fixture("tinyllama_layer0.json")
-
     linear_count = sum(1 for n in g.nodes.values() if isinstance(n.op, LinearOp))
     assert linear_count == 7, f"Expected 7 linear projections, found {linear_count}"
 
@@ -91,7 +62,6 @@ def test_tinyllama_has_sdpa():
     from deplodock.compiler.ops import SdpaOp
 
     g = _load_fixture("tinyllama_layer0.json")
-
     sdpa_count = sum(1 for n in g.nodes.values() if isinstance(n.op, SdpaOp))
     assert sdpa_count == 1
 
@@ -99,47 +69,17 @@ def test_tinyllama_has_sdpa():
 def test_tinyllama_has_silu():
     """torch.export keeps silu as a single op (not decomposed)."""
     g = _load_fixture("tinyllama_layer0.json")
-
     silu_count = sum(1 for n in g.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.fn == "silu")
     assert silu_count == 1
 
-    # ---- Compilation tests ----
-
-    rewriter = _load_rewriter()
-    compiled = rewriter.apply(g)
-
-    # Decomposition may add nodes (sdpa → 12 ops), matmul fusion removes 18.
-    # Net change depends on which rules are active. Just verify compilation doesn't crash.
-    assert len(compiled.nodes) > 0
-
-
-def test_tinyllama_compile_preserves_io():
-    """Compilation should preserve input/output count."""
-    g = _load_fixture("tinyllama_layer0.json")
-
-    rewriter = _load_rewriter()
-    compiled = rewriter.apply(g)
-
-    assert len(compiled.inputs) == len(g.inputs)
-    assert len(compiled.outputs) == len(g.outputs)
-
-    reduce_sum_count = sum(1 for n in compiled.nodes.values() if isinstance(n.op, ReduceOp) and n.op.fn == "sum")
-    # 9 matmuls consume 9 Reduce{sum}. Remaining are from softmax decomposition + RMSNorm.
-    # Decomposition doesn't reduce sum ops — that's auto_fuse's job
-    assert reduce_sum_count >= 0
-
 
 def test_tinyllama_roundtrip_serialization():
-    """Load fixture → compile → serialize → deserialize → same ops."""
+    """Load fixture → serialize → deserialize → same ops."""
     g = _load_fixture("tinyllama_layer0.json")
-    rewriter = _load_rewriter()
-    compiled = rewriter.apply(g)
-
-    # Serialize and deserialize.
-    data = compiled.to_dict()
+    data = g.to_dict()
     reloaded = Graph.from_dict(data)
 
-    assert len(reloaded.nodes) == len(compiled.nodes)
-    assert _count_ops(reloaded) == _count_ops(compiled)
-    assert reloaded.inputs == compiled.inputs
-    assert reloaded.outputs == compiled.outputs
+    assert len(reloaded.nodes) == len(g.nodes)
+    assert _count_ops(reloaded) == _count_ops(g)
+    assert reloaded.inputs == g.inputs
+    assert reloaded.outputs == g.outputs
