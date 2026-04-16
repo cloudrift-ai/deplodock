@@ -223,10 +223,16 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt]
     ]
     guarded: list[Stmt] = []
     name_seq = [0]
-    # Pointwise kernel: the body lives in inputs[0] (a Combine or a Port).
-    assert len(kernel.inputs) == 1, "naive pointwise: expected one body input slot"
-    value = _emit_input_value(kernel.inputs[0], idx, kernel.external_shapes, guarded, name_seq)
-    value = _apply_epilogue(kernel.epilogue, value, idx, guarded, name_seq)
+
+    # Load each input Port/tree → build value map keyed by buffer_id.
+    value_map: dict[str, Expr] = {}
+    for inp in kernel.inputs:
+        expr = _emit_input_value(inp, idx, kernel.external_shapes, guarded, name_seq)
+        value_map[_source_id(inp)] = expr
+
+    # Apply the epilogue chain, resolving each op's inputs from value_map
+    # or from prior ops.
+    value = _apply_chain(kernel.epilogue, value_map, idx, guarded, name_seq)
 
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port), "naive pointwise: output must be a plain Port"
@@ -295,7 +301,8 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], t
         prev_value_expr = Var(acc_name)
 
     value: Expr = prev_value_expr  # type: ignore[assignment]
-    value = _apply_epilogue(kernel.epilogue, value, row, stmts, name_seq)
+    last_reduce_id = stages[-1].reduce.id
+    value = _apply_epilogue(kernel.epilogue, value, last_reduce_id, row, stmts, name_seq)
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port)
     stmts.append(Assign(target=ArrayAccess(array=out_port.buffer_id, index=row), value=value))
@@ -359,8 +366,9 @@ def _emit_contraction_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stm
     # Post-contraction reduce_stages + epilogue at (m, n). For the naive
     # singleton matmul, both are typically empty.
     value: Expr = Var("acc")
-    # TODO: feed acc into reduce_stages when they exist (softmax fusion).
-    value = _apply_epilogue(kernel.epilogue, value, BinOp("+", BinOp("*", m, Literal(n_size, "int")), n), stmts, name_seq)
+    contraction_reduce_id = contraction.reduce.id
+    out_coord = BinOp("+", BinOp("*", m, Literal(n_size, "int")), n)
+    value = _apply_epilogue(kernel.epilogue, value, contraction_reduce_id, out_coord, stmts, name_seq)
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port)
     stmts.append(
@@ -380,23 +388,43 @@ def _emit_contraction_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stm
 # ---------------------------------------------------------------------------
 
 
-def _apply_epilogue(
+def _apply_chain(
     chain: tuple,
-    value: Expr,
+    value_map: dict[str, Expr],
     coord: Expr,
     stmts: list[Stmt],
     name_seq: list[int],
 ) -> Expr:
+    """Apply an elementwise chain, resolving each op's inputs from ``value_map``
+    (prior ops + external Ports) or by loading from the buffer at ``coord``."""
+    last: Expr | None = None
     for node in chain:
         assert isinstance(node.op, ElementwiseOp)
-        # Epilogue ops get the prior value as their first input; additional
-        # inputs resolve to external loads at the same coord.
-        inputs = [value] + [ArrayAccess(array=nid, index=coord) for nid in node.inputs[1:]]
-        applied = _apply_elementwise(node.op.fn, inputs)
+        node_inputs = [value_map.get(nid, ArrayAccess(array=nid, index=coord)) for nid in node.inputs]
+        applied = _apply_elementwise(node.op.fn, node_inputs)
         tname = _fresh(name_seq)
         stmts.append(VarDecl(dtype="float", name=tname, init=applied))
-        value = Var(tname)
-    return value
+        value_map[node.id] = Var(tname)
+        last = Var(tname)
+    return last if last is not None else Literal(0.0, "float")
+
+
+def _apply_epilogue(
+    chain: tuple,
+    value: Expr,
+    body_node_id: str,
+    coord: Expr,
+    stmts: list[Stmt],
+    name_seq: list[int],
+) -> Expr:
+    """Apply epilogue after a contraction/reduce body output.
+
+    Returns ``value`` unchanged if the chain is empty.
+    """
+    if not chain:
+        return value
+    value_map: dict[str, Expr] = {body_node_id: value}
+    return _apply_chain(chain, value_map, coord, stmts, name_seq)
 
 
 # ---------------------------------------------------------------------------

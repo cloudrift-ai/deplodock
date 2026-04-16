@@ -110,7 +110,6 @@ class Pass:
                 matches = match_grammar(graph, rule.grammar)
                 if not matches:
                     continue
-                rule_changed = False
                 for match in matches:
                     logger.debug("Rule %s matched at %s", rule.name, match.root_node_id)
                     new_graph = rule.rewrite(graph, match)
@@ -118,16 +117,16 @@ class Pass:
                         if trace is not None:
                             trace.rules_applied.append(RuleApplication(rule_name=rule.name, matched_at=match.root_node_id))
                         graph = new_graph
-                        rule_changed = True
-                if rule_changed:
-                    changed = True
+                        changed = True
+                        break  # graph changed — restart from first rule
+                if changed:
                     break
         if trace is not None:
             trace.graph_after = graph.to_dict()
         return graph
 
 
-DEFAULT_PASS_ORDER = ["decomposition", "optimization"]
+DEFAULT_PASS_ORDER = ["decomposition", "optimization", "fusion"]
 
 
 class Rewriter:
