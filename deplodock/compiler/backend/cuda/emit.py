@@ -5,16 +5,18 @@ Walks the structural IR (Port | Mux | Combine inputs, SSA body of
 ``KernelOp`` directly -- no classification pass, no Schedule, no
 LoopIR intermediate.
 
-Contraction (matmul) is detected by pattern-matching the SSA body:
-a binary ``ElementwiseOp`` whose **both** args are input Port names,
-followed by a ``ReduceOp`` consuming it.  When found, the emitter
-produces a 2D grid with a serial K-loop.  Otherwise:
+Body emission uses a unified ``_emit_body`` dispatcher that selects
+one of two code-shapes based solely on the presence of ``ReduceOp``
+in the SSA body:
 
 - **Pointwise** (no ReduceOp in body): 1D grid over the flattened
   output numel; one thread per output coord; block size fixed at 256.
-- **Reduce chain** (ReduceOp in body, no contraction pattern): 1D grid
-  over the post-reduce outer shape; one block per reduced row; one
-  thread per block.
+  Empty bodies (copy kernels) are a subcase.
+- **Reduce / contraction** (ReduceOp in body): 1D grid over the
+  post-reduce outer shape; one block per reduced row; one thread per
+  block.  The body is split into segments at ReduceOp boundaries.
+  Contractions (mul + sum) are just a segment with an elementwise
+  ``mul`` inside the K-loop and a ``sum`` accumulator.
 
 All shapes are treated as flat buffers: each input tensor has a known
 shape (looked up from an externally-provided ``shapes`` dict keyed by
@@ -128,26 +130,6 @@ def compile_kernels(
 
 
 # ---------------------------------------------------------------------------
-# Contraction detection: pattern-match SSA body
-# ---------------------------------------------------------------------------
-
-
-def _detect_contraction(kernel: KernelOp) -> tuple[int, Assign, Assign] | None:
-    """Look for a binary ElementwiseOp whose BOTH args are input Port names,
-    followed by a ReduceOp consuming it.  Returns (index, mul_assign, red_assign)
-    or None.
-    """
-    input_names = {p.buffer_id for p in kernel.inputs if isinstance(p, Port)}
-    for i, assign in enumerate(kernel.body):
-        if isinstance(assign.op, ElementwiseOp) and len(assign.args) == 2 and all(a in input_names for a in assign.args):
-            if i + 1 < len(kernel.body):
-                next_a = kernel.body[i + 1]
-                if isinstance(next_a.op, ReduceOp) and assign.name in next_a.args:
-                    return i, assign, next_a
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Per-kernel emission
 # ---------------------------------------------------------------------------
 
@@ -156,15 +138,7 @@ def emit_kernel(kernel: KernelOp, kernel_name: str, shapes: dict[str, tuple]) ->
     """Emit a single ``KernelOp`` as a ``KernelDef`` + ordered launch args."""
     out_shape = kernel.infer_output_shape(shapes)
     params, arg_order = _build_params(kernel)
-
-    contraction = _detect_contraction(kernel)
-    if contraction is not None:
-        body, block_size = _emit_contraction_body(kernel, out_shape, contraction, shapes)
-    elif any(isinstance(a.op, ReduceOp) for a in kernel.body):
-        body, block_size = _emit_reduce_body(kernel, out_shape, shapes)
-    else:
-        body, block_size = _emit_pointwise_body(kernel, out_shape, shapes)
-
+    body, block_size = _emit_body(kernel, out_shape, shapes)
     kd = KernelDef(name=kernel_name, params=params, body=body, block_size=block_size)
     return kd, arg_order
 
@@ -291,7 +265,29 @@ def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[S
 # ---------------------------------------------------------------------------
 
 
-def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> tuple[list[Stmt], tuple[int, int, int]]:
+def _emit_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> tuple[list[Stmt], tuple[int, int, int]]:
+    """Unified body emitter.
+
+    Dispatches based on the presence of ``ReduceOp`` in the body:
+    - No body (copy kernel): ``_emit_flat`` with no ops.
+    - No ReduceOps (pointwise): ``_emit_flat`` with 256 threads/block.
+    - ReduceOps present (reduce/contraction): ``_emit_segments`` with
+      segment-based K-loops, 1 thread/block.
+    """
+    has_reduce = any(isinstance(a.op, ReduceOp) for a in kernel.body)
+
+    if not has_reduce:
+        return _emit_flat(kernel, out_shape, shapes)
+    return _emit_segments(kernel, out_shape, shapes)
+
+
+def _emit_flat(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> tuple[list[Stmt], tuple[int, int, int]]:
+    """Emit a pointwise (or copy) kernel: 1D grid, 256 threads/block.
+
+    Each thread handles one output element at ``idx``.  Loads all input
+    Ports via ``_emit_input_value`` (IndexMap-aware), walks body Assigns
+    as inline expressions, stores the result.
+    """
     numel = _numel(out_shape)
     idx = Var("idx")
     stmts: list[Stmt] = [
@@ -320,12 +316,16 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, t
         guarded.append(VarDecl(dtype="float", name=tname, init=value))
         values[assign.name] = Var(tname)
 
-    # Store last Assign's value to the output.
-    last_name = kernel.body[-1].name if kernel.body else None
-    out_val = values.get(last_name, Literal(0.0, "float")) if last_name else Literal(0.0, "float")
-
+    # Store last Assign's value to the output (or copy input for empty body).
     out_port = kernel.outputs[0]
-    assert isinstance(out_port, Port), "naive pointwise: output must be a plain Port"
+    assert isinstance(out_port, Port), "flat emit: output must be a plain Port"
+    if kernel.body:
+        last_name = kernel.body[-1].name
+        out_val = values[last_name]
+    else:
+        # Copy kernel: forward the first input Port's value.
+        first_port = next((p for p in kernel.inputs if isinstance(p, Port)), None)
+        out_val = values[first_port.buffer_id] if first_port else Literal(0.0, "float")
     guarded.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=idx), value=out_val))
 
     stmts.append(
@@ -337,24 +337,32 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, t
     return stmts, (_BLOCK, 1, 1)
 
 
-def _emit_reduce_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> tuple[list[Stmt], tuple[int, int, int]]:
-    """Walk kernel.body SSA (mixed ElementwiseOp / ReduceOp Assigns).
+def _emit_segments(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> tuple[list[Stmt], tuple[int, int, int]]:
+    """Emit a reduce/contraction kernel using segment-based K-loops.
 
-    The body is split into "segments" separated by ReduceOps. Each segment
+    The body is split into "segments" separated by ReduceOps.  Each segment
     is a sequence of ElementwiseOps optionally followed by a ReduceOp:
 
         [elementwise*, reduce] or [elementwise*]  (trailing)
 
     For each segment, if any value references a per-element input (an input
     Port or a pre-reduce Assign), the entire segment is emitted inside a
-    K-loop. Per-element values from *prior* segments (which were computed
+    K-loop.  Per-element values from *prior* segments (which were computed
     in their own K-loops) are recomputed from the inputs inside the current
-    loop. Post-reduce accumulators (per-row scalars) are referenced directly.
+    loop.  Post-reduce accumulators (per-row scalars) are referenced directly.
+
+    Contractions (e.g. matmul = mul + sum) are handled naturally: the ``mul``
+    is an elementwise Assign inside the K-loop, and the ``sum`` is the
+    segment's ReduceOp accumulator.
     """
-    assert len(kernel.inputs) >= 1 and isinstance(kernel.inputs[0], Port)
-    src_port = kernel.inputs[0]
-    src_shape = shapes.get(src_port.buffer_id, ())
-    k_size = src_shape[-1] if src_shape else 1
+    # Derive the per-element (broadcast) shape before the first reduce,
+    # and the reduce axis position.  This determines K-size and the correct
+    # flat coord decomposition for IndexMap-aware loading.
+    ssa_shapes = kernel.infer_shapes(shapes)
+    first_reduce = next(a for a in kernel.body if isinstance(a.op, ReduceOp))
+    pre_reduce_shape = tuple(int(d) for d in ssa_shapes[first_reduce.args[0]])
+    reduce_axis = first_reduce.op.axis % len(pre_reduce_shape)
+    k_size = int(pre_reduce_shape[reduce_axis])
 
     row = Var("row")
     stmts: list[Stmt] = [
@@ -369,6 +377,8 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tupl
 
     # Identify all input Port names (per-element iteration space).
     input_port_names: set[str] = {p.buffer_id for p in kernel.inputs if isinstance(p, Port)}
+    # Map port names -> Port objects for IndexMap-aware loading.
+    input_ports: dict[str, Port] = {p.buffer_id: p for p in kernel.inputs if isinstance(p, Port)}
 
     # Track which SSA names are per-row (post-reduce scalars) vs per-element.
     per_row_values: set[str] = set()
@@ -436,10 +446,12 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tupl
             # from inputs through all prior elementwise chains.
             loop_values: dict[str, Expr] = dict(values)  # inherit per-row scalars
 
-            # Load input Ports at per-element coords.
-            load_idx = BinOp("+", BinOp("*", row, Literal(k_size, "int")), k_var)
-            for port_name in input_port_names:
-                loop_values[port_name] = ArrayAccess(array=port_name, index=load_idx)
+            # Load all input Ports at per-element coords using IndexMap-aware loading.
+            # Compute the flat coord in the full broadcast shape by decomposing
+            # `row` into the outer dims and inserting `k` at the reduce axis.
+            load_idx = _broadcast_load_idx(row, k_var, pre_reduce_shape, reduce_axis)
+            for port_name, port in input_ports.items():
+                loop_values[port_name] = _emit_input_value(port, load_idx, shapes, inner_stmts, name_seq)
 
             # Recompute any prior per-element Assigns needed by this segment.
             # Collect all prior elementwise assigns (in body order).
@@ -485,7 +497,7 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tupl
                 last_ew = ew_assigns[-1]
                 out_port = kernel.outputs[0]
                 assert isinstance(out_port, Port)
-                store_idx = BinOp("+", BinOp("*", row, Literal(k_size, "int")), k_var)
+                store_idx = _broadcast_load_idx(row, k_var, pre_reduce_shape, reduce_axis)
                 inner_stmts.append(
                     IrAssign(
                         target=ArrayAccess(array=out_port.buffer_id, index=store_idx),
@@ -573,121 +585,64 @@ def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
     return AugAssign(target=acc_name, op=_reduce_op(fn), value=value)
 
 
-def _emit_contraction_body(
-    kernel: KernelOp,
-    out_shape: tuple,
-    contraction: tuple[int, Assign, Assign],
-    shapes: dict[str, tuple],
-) -> tuple[list[Stmt], tuple[int, int, int]]:
-    """Emit a contraction (matmul) body with batch support.
+def _broadcast_load_idx(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis: int) -> Expr:
+    """Compute a flat coord into ``broadcast_shape`` from ``row`` and ``k``.
 
-    Output shape ``(...batch, M, N)``. Grid: (N, M, batch_size).
-    Each thread computes one output element by iterating K serially.
-    Post-contraction Assigns (epilogue) are emitted as flat elementwise.
+    ``row`` is a flat index into the outer shape (broadcast_shape with the
+    reduce axis removed).  ``k`` is the reduce-dimension loop variable.
+    ``reduce_axis`` is the axis position of the reduce dimension within
+    the broadcast shape.
+
+    For a 2D broadcast shape ``(R, K)`` with ``reduce_axis=1``, this
+    reduces to ``row * K + k`` (the simple case).
+
+    For a 3D broadcast shape ``(M, K, N)`` with ``reduce_axis=1``, it
+    decomposes ``row`` into ``(m, n)`` over ``(M, N)`` and produces
+    ``m * K * N + k * N + n``.
     """
-    con_idx, mul_assign, red_assign = contraction
+    ndim = len(broadcast_shape)
+    if ndim <= 1:
+        return k
 
-    # Find the a and b Ports from the mul Assign's args.
-    a_name, b_name = mul_assign.args
-    a_port = next(p for p in kernel.inputs if isinstance(p, Port) and p.buffer_id == a_name)
-    b_port = next(p for p in kernel.inputs if isinstance(p, Port) and p.buffer_id == b_name)
+    # Build the outer shape (broadcast_shape minus the reduce axis).
+    outer_shape = list(broadcast_shape)
+    del outer_shape[reduce_axis]
 
-    a_shape = shapes.get(a_port.buffer_id, ())
-    k_size = int(a_shape[-1]) if a_shape else 1
-
-    # Parse output shape: (...batch, M, N).
-    int_shape = tuple(int(d) for d in out_shape if isinstance(d, int))
-    if len(int_shape) < 2:
-        m_size, n_size, batch_size = 1, _numel(int_shape), 1
-    else:
-        m_size = int_shape[-2]
-        n_size = int_shape[-1]
-        batch_size = _numel(int_shape[:-2]) if len(int_shape) > 2 else 1
-
-    stmts: list[Stmt] = []
-    m = Var("m")
-    n = Var("n")
-    stmts.append(VarDecl(dtype="int", name="m", init=Var("blockIdx.y")))
-    stmts.append(VarDecl(dtype="int", name="n", init=Var("blockIdx.x")))
-    stmts.append(
-        IfStmt(
-            cond=BinOp("!=", Var("threadIdx.x"), Literal(0, "int")),
-            body=[RawCode("return;")],
-        )
-    )
-
-    # Batch: blockIdx.z indexes into the batch.
-    if batch_size > 1:
-        stmts.append(VarDecl(dtype="int", name="batch", init=Var("blockIdx.z")))
-        batch = Var("batch")
-    else:
-        batch = None
-
-    fn = red_assign.op.fn
-    stmts.append(VarDecl(dtype="float", name="acc", init=Literal(_identity(fn), "float")))
-
-    k = Var("k")
-
-    # Both operands are in the same broadcast space (M, K, N) via their
-    # IndexMapOps.  Use a single flat coord for both.
-    kn = BinOp("+", BinOp("*", k, Literal(n_size, "int")), n)
-    flat_coord: Expr = BinOp("+", BinOp("*", m, Literal(k_size * n_size, "int")), kn)
-    if batch is not None:
-        flat_coord = BinOp("+", BinOp("*", batch, Literal(m_size * k_size * n_size, "int")), flat_coord)
-
-    name_seq_k = [0]
-    inner_stmts: list[Stmt] = []
-    a_val = _emit_input_value(a_port, flat_coord, shapes, inner_stmts, name_seq_k)
-    b_val = _emit_input_value(b_port, flat_coord, shapes, inner_stmts, name_seq_k)
-    prod_expr = _apply_elementwise(mul_assign.op.fn, [a_val, b_val])
-    inner_stmts.append(AugAssign(target="acc", op=_reduce_op(fn), value=prod_expr))
-    stmts.append(ForLoop(var=k.name, start=Literal(0, "int"), end=Literal(k_size, "int"), body=inner_stmts))
-
-    # Build values dict with contraction output, then walk post-contraction Assigns.
-    values: dict[str, Expr] = {}
-    values[red_assign.name] = Var("acc")
-
-    # Also register input Port buffer_ids for any post-contraction refs.
-    for inp in kernel.inputs:
-        if isinstance(inp, Port):
-            values[inp.buffer_id] = None  # loaded on demand below
-
-    name_seq = [0]
-    out_flat: Expr = BinOp("+", BinOp("*", m, Literal(n_size, "int")), n)
-    if batch is not None:
-        out_flat = BinOp("+", BinOp("*", batch, Literal(m_size * n_size, "int")), out_flat)
-
-    # Post-contraction body: everything after the reduce Assign.
-    post_start = con_idx + 2  # skip the mul and reduce Assigns
-    for assign in kernel.body[post_start:]:
-        arg_exprs = []
-        for a in assign.args:
-            if a in values and values[a] is not None:
-                arg_exprs.append(values[a])
-            else:
-                # Load extra input at the output coord.
-                port = next((p for p in kernel.inputs if isinstance(p, Port) and p.buffer_id == a), None)
-                if port is not None:
-                    val = _emit_input_value(port, out_flat, shapes, stmts, name_seq)
-                    arg_exprs.append(val)
-                else:
-                    arg_exprs.append(Literal(0.0, "float"))
-        if isinstance(assign.op, ElementwiseOp):
-            value = _apply_elementwise(assign.op.fn, arg_exprs)
+    # Simple 2D case: row * K + k.
+    if ndim == 2:
+        if reduce_axis == ndim - 1:
+            return BinOp("+", BinOp("*", row, Literal(int(broadcast_shape[reduce_axis]), "int")), k)
         else:
-            raise NotImplementedError(f"post-contraction: unexpected op {type(assign.op).__name__}")
-        tname = _fresh(name_seq)
-        stmts.append(VarDecl(dtype="float", name=tname, init=value))
-        values[assign.name] = Var(tname)
+            # reduce_axis == 0: k * outer + row
+            return BinOp("+", BinOp("*", k, Literal(int(outer_shape[0]), "int")), row)
 
-    # Store the final value.
-    last_name = kernel.body[-1].name if kernel.body else red_assign.name
-    out_val = values.get(last_name, Var("acc"))
+    # General N-D case: decompose row into per-axis coords for the outer
+    # dims, insert k at the reduce axis, then flatten.
+    outer_coords: list[Expr] = []
+    remainder = row
+    for d in range(len(outer_shape) - 1, -1, -1):
+        dim = int(outer_shape[d])
+        if d == 0:
+            outer_coords.insert(0, remainder)
+        else:
+            outer_coords.insert(0, BinOp("/", remainder, Literal(dim, "int")))
+            remainder = BinOp("%", remainder, Literal(dim, "int"))
+            # Swap: the remainder is the low-order coord
+            outer_coords[0], remainder = remainder, outer_coords[0]
 
-    out_port = kernel.outputs[0]
-    assert isinstance(out_port, Port)
-    stmts.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=out_flat), value=out_val))
-    return stmts, (1, 1, 1)
+    # Insert k at reduce_axis.
+    full_coords: list[Expr] = list(outer_coords)
+    full_coords.insert(reduce_axis, k)
+
+    # Flatten using broadcast_shape strides.
+    flat: Expr = Literal(0, "int")
+    stride = 1
+    for d in range(ndim - 1, -1, -1):
+        term = full_coords[d] if stride == 1 else BinOp("*", full_coords[d], Literal(stride, "int"))
+        flat = term if (isinstance(flat, Literal) and flat.value == 0) else BinOp("+", term, flat)
+        stride *= int(broadcast_shape[d])
+
+    return flat
 
 
 # ---------------------------------------------------------------------------
@@ -812,8 +767,6 @@ def _build_params(kernel: KernelOp) -> tuple[list[KernelParam], list[str]]:
 
 
 def _kernel_name(kernel: KernelOp, idx: int, shapes: dict[str, tuple]) -> str:
-    if _detect_contraction(kernel) is not None:
-        return f"k{idx}_contract"
     if any(isinstance(a.op, ReduceOp) for a in kernel.body):
         return f"k{idx}_reduce"
     return f"k{idx}_pointwise"
@@ -821,12 +774,6 @@ def _kernel_name(kernel: KernelOp, idx: int, shapes: dict[str, tuple]) -> str:
 
 def _launch_config(kernel: KernelOp, shapes: dict[str, tuple]) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     out_shape = kernel.infer_output_shape(shapes)
-    if _detect_contraction(kernel) is not None:
-        int_shape = tuple(int(d) for d in out_shape if isinstance(d, int))
-        m = int_shape[-2] if len(int_shape) >= 2 else 1
-        n = int_shape[-1] if int_shape else 1
-        batch = _numel(int_shape[:-2]) if len(int_shape) > 2 else 1
-        return (n, m, batch), (1, 1, 1)
     if any(isinstance(a.op, ReduceOp) for a in kernel.body):
         # For reduce kernels, the grid is over outer rows (one block per row).
         # Use the first input Port's shape minus the last axis.
@@ -840,14 +787,19 @@ def _launch_config(kernel: KernelOp, shapes: dict[str, tuple]) -> tuple[tuple[in
 def _reduce_n_rows(kernel: KernelOp, shapes: dict[str, tuple]) -> int:
     """Number of outer rows for a reduce kernel's grid.
 
-    Uses the first input Port's shape minus the last axis (the reduce dim).
+    Derives the broadcast shape from SSA shape inference and returns the
+    product of all dimensions except the reduce axis.  This correctly
+    handles contractions where the broadcast shape has more dimensions
+    than any single input Port.
     """
-    for inp in kernel.inputs:
-        if isinstance(inp, Port):
-            src_shape = shapes.get(inp.buffer_id, ())
-            if len(src_shape) >= 2:
-                return _numel(src_shape[:-1])
-            return _numel(src_shape) if src_shape else 1
+    ssa_shapes = kernel.infer_shapes(shapes)
+    for assign in kernel.body:
+        if isinstance(assign.op, ReduceOp):
+            pre_shape = tuple(int(d) for d in ssa_shapes[assign.args[0]])
+            reduce_axis = assign.op.axis % len(pre_shape)
+            outer = list(pre_shape)
+            del outer[reduce_axis]
+            return _numel(tuple(outer)) if outer else 1
     # Fallback: use output shape.
     return _numel(kernel.infer_output_shape(shapes))
 

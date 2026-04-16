@@ -5,10 +5,9 @@ from __future__ import annotations
 import pytest
 
 from deplodock.compiler.backend.cuda.backend import CudaBackend
-from deplodock.compiler.backend.cuda.emit import _detect_contraction
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp
+from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 
 requires_cuda = pytest.mark.skipif(
@@ -42,7 +41,8 @@ def _matmul_graph(m: int, k: int, n: int) -> Graph:
 def test_compile_graph_fuses_matmul():
     result = compile_graph(_matmul_graph(4, 3, 2))
     assert len(result.kernels) == 1
-    assert _detect_contraction(result.kernels[0]) is not None
+    # Matmul is lowered as mul + sum (ReduceOp present in body).
+    assert any(isinstance(a.op, ReduceOp) for a in result.kernels[0].body)
 
 
 def test_compile_graph_fuses_chain():
