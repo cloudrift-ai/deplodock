@@ -107,7 +107,20 @@ def compile_kernels(
             return "output"
         return "scratch"
 
-    buffers = [Buffer(name=bid, size=_numel(shape), dtype="float", role=role_for(bid)) for bid, shape in shapes.items()]
+    # Only allocate buffers that are actually referenced by kernel launches.
+    referenced: set[str] = set()
+    for k in kernels:
+        for port in _leaf_ports(k):
+            referenced.add(port.buffer_id)
+        for out in k.outputs:
+            if isinstance(out, Port):
+                referenced.add(out.buffer_id)
+    # Also include graph-level constants that kernels read.
+    referenced |= graph_constant_set & set(shapes.keys())
+
+    buffers = [
+        Buffer(name=bid, size=_numel(shape), dtype="float", role=role_for(bid)) for bid, shape in shapes.items() if bid in referenced
+    ]
 
     launches: list[CudaLaunch] = []
     for i, k in enumerate(kernels):
@@ -410,11 +423,14 @@ def _emit_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> 
                     if port_name not in per_element_ports and port_name not in loop_values:
                         loop_values[port_name] = _emit_input_value(port, idx, shapes, guarded, name_seq)
 
-                # Load per-element Ports inside the K-loop at the broadcast coord.
-                load_idx = _broadcast_load_idx(idx, k_var, pre_reduce_shape, reduce_axis)
+                # Load per-element Ports inside the K-loop at broadcast coords,
+                # but compute a per-port flat index that accounts for broadcast dims.
+                bcast_coords = _decompose_broadcast_coords(idx, k_var, pre_reduce_shape, reduce_axis)
                 for port_name, port in input_ports.items():
                     if port_name in per_element_ports:
-                        loop_values[port_name] = _emit_input_value(port, load_idx, shapes, inner_stmts, name_seq)
+                        ps = _port_shape(port, shapes)
+                        port_idx = _flatten_coords_for_port(bcast_coords, pre_reduce_shape, ps)
+                        loop_values[port_name] = _emit_input_value(port, port_idx, shapes, inner_stmts, name_seq)
 
                 prior_assigns: list[Assign] = []
                 for seg in segments:
@@ -519,39 +535,20 @@ def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
     return AugAssign(target=acc_name, op=_reduce_op(fn), value=value)
 
 
-def _broadcast_load_idx(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis: int) -> Expr:
-    """Compute a flat coord into ``broadcast_shape`` from ``row`` and ``k``.
+def _decompose_broadcast_coords(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis: int) -> list[Expr]:
+    """Decompose ``(row, k)`` into per-dimension broadcast coordinates.
 
-    ``row`` is a flat index into the outer shape (broadcast_shape with the
-    reduce axis removed).  ``k`` is the reduce-dimension loop variable.
-    ``reduce_axis`` is the axis position of the reduce dimension within
-    the broadcast shape.
-
-    For a 2D broadcast shape ``(R, K)`` with ``reduce_axis=1``, this
-    reduces to ``row * K + k`` (the simple case).
-
-    For a 3D broadcast shape ``(M, K, N)`` with ``reduce_axis=1``, it
-    decomposes ``row`` into ``(m, n)`` over ``(M, N)`` and produces
-    ``m * K * N + k * N + n``.
+    Returns a list of ``Expr`` with one entry per dimension of
+    ``broadcast_shape``.  ``row`` indexes the outer shape (broadcast_shape
+    minus the reduce axis); ``k`` is the reduce-dimension loop variable.
     """
     ndim = len(broadcast_shape)
     if ndim <= 1:
-        return k
+        return [k]
 
-    # Build the outer shape (broadcast_shape minus the reduce axis).
     outer_shape = list(broadcast_shape)
     del outer_shape[reduce_axis]
 
-    # Simple 2D case: row * K + k.
-    if ndim == 2:
-        if reduce_axis == ndim - 1:
-            return BinOp("+", BinOp("*", row, Literal(int(broadcast_shape[reduce_axis]), "int")), k)
-        else:
-            # reduce_axis == 0: k * outer + row
-            return BinOp("+", BinOp("*", k, Literal(int(outer_shape[0]), "int")), row)
-
-    # General N-D case: decompose row into per-axis coords for the outer
-    # dims, insert k at the reduce axis, then flatten.
     outer_coords: list[Expr] = []
     remainder = row
     for d in range(len(outer_shape) - 1, -1, -1):
@@ -561,22 +558,50 @@ def _broadcast_load_idx(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis:
         else:
             outer_coords.insert(0, BinOp("/", remainder, Literal(dim, "int")))
             remainder = BinOp("%", remainder, Literal(dim, "int"))
-            # Swap: the remainder is the low-order coord
             outer_coords[0], remainder = remainder, outer_coords[0]
 
-    # Insert k at reduce_axis.
-    full_coords: list[Expr] = list(outer_coords)
+    full_coords = list(outer_coords)
     full_coords.insert(reduce_axis, k)
+    return full_coords
 
-    # Flatten using broadcast_shape strides.
+
+def _flatten_coords_for_port(broadcast_coords: list[Expr], broadcast_shape: tuple, port_shape: tuple) -> Expr:
+    """Flatten broadcast coords into a flat index for a specific port.
+
+    Dims where ``port_shape[d] == 1`` and ``broadcast_shape[d] > 1``
+    are clamped to 0 (broadcast).  The result is a flat index into the
+    port's own shape.
+    """
+    ndim = len(broadcast_shape)
+    port_ndim = len(port_shape)
+
+    if port_ndim == 0:
+        return Literal(0, "int")
+
+    pad = ndim - port_ndim
     flat: Expr = Literal(0, "int")
     stride = 1
     for d in range(ndim - 1, -1, -1):
-        term = full_coords[d] if stride == 1 else BinOp("*", full_coords[d], Literal(stride, "int"))
+        pd = d - pad
+        if pd < 0:
+            continue
+        p_dim = int(port_shape[pd])
+        b_dim = int(broadcast_shape[d])
+        coord = Literal(0, "int") if (p_dim == 1 and b_dim > 1) else broadcast_coords[d]
+        term = coord if stride == 1 else BinOp("*", coord, Literal(stride, "int"))
         flat = term if (isinstance(flat, Literal) and flat.value == 0) else BinOp("+", term, flat)
-        stride *= int(broadcast_shape[d])
+        stride *= p_dim
 
     return flat
+
+
+def _broadcast_load_idx(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis: int) -> Expr:
+    """Compute a flat coord into ``broadcast_shape`` from ``row`` and ``k``.
+
+    Used for stores where the output shape matches the broadcast shape.
+    """
+    coords = _decompose_broadcast_coords(row, k, broadcast_shape, reduce_axis)
+    return _flatten_coords_for_port(coords, broadcast_shape, broadcast_shape)
 
 
 # ---------------------------------------------------------------------------

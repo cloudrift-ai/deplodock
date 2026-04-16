@@ -57,7 +57,8 @@ tests/
 │   ├── test_cuda_backend.py    # CudaBackend compile/run/benchmark
 │   ├── test_program.py         # Program source gen + GPU execution
 │   ├── test_tuning.py          # GPU tuning profile dispatch
-│   └── test_llama_block.py     # Full Llama block through compiler
+│   ├── test_llama_block.py     # Full Llama block through compiler
+│   └── test_torch_ops.py   # Op.forward() + numpy backend (no GPU needed)
 ├── scripts/
 │   └── test_plot_mcr_sweep.py  # load_results() from scripts/plot_mcr_sweep.py
 ```

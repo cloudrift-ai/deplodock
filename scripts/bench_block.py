@@ -187,6 +187,7 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
         backend = CudaBackend()
         program = backend.compile(
             result.kernels,
+            buf_shapes=result.buf_shapes,
             graph_inputs=result.graph_inputs,
             graph_outputs=result.graph_outputs,
             graph_constants=result.graph_constants,
@@ -216,6 +217,9 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
                         input_data[buf.name] = param.detach().cpu().flatten().tolist()
                         matched = True
                         break
+                if not matched and buf.name in result.constant_values:
+                    input_data[buf.name] = [result.constant_values[buf.name]]
+                    matched = True
                 if not matched and buf.size == 1:
                     for nid, node in graph.nodes.items():
                         if isinstance(node.op, ConstantOp) and node.op.value is not None:

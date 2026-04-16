@@ -139,6 +139,18 @@ Walks the SSA body — no classification pass, no `Schedule` dataclass, no `Loop
 
 The naive schedule is correctness-first — no shared memory, no async copies, no TMA, no vectorization. Performance work lives in follow-up commits.
 
+## Numpy backend (`backend/numpy/backend.py`)
+
+`NumpyBackend` derives from `Backend` (same ABC as `CudaBackend`).
+Every `Op` subclass implements `forward(*inputs: np.ndarray) -> np.ndarray` — the
+numpy equivalent of the tensor operation. `NumpyBackend.compile(graph)` stores the
+graph; `run()` / `run_arrays()` walk it in topological order, calling `forward` at
+each node, reshaping outputs to match declared `node.output.shape`. No GPU required.
+
+Covered ops: all elementwise functions, reductions, scans, gather/scatter,
+transpose/reshape/unsqueeze/slice/cat, linear, matmul, SDPA, mean.
+`IndexMapOp` and `KernelOp` raise `NotImplementedError` (structural IR).
+
 ## Testing
 
 - `tests/compiler/test_ir.py`, `test_shape_inference.py`, `test_indexmap.py`, `test_backend_ir.py` — Layer 1 unit tests.
@@ -147,5 +159,6 @@ The naive schedule is correctness-first — no shared memory, no async copies, n
 - `tests/compiler/test_emit.py` — recursive-descent codegen source-level assertions + on-GPU numerical checks.
 - `tests/compiler/test_pipeline.py` — end-to-end on small synthetic graphs.
 - `tests/compiler/test_torch_trace*.py`, `test_real_trace.py`, `test_hints.py` — tracer / hint coverage.
+- `tests/compiler/test_torch_ops.py` — Op.forward() + numpy backend: per-op tests + torch cross-checks.
 
 Full-model E2E (TinyLlama layer) comes back in a follow-up commit once decomposition of higher-level ops is ported into the new lowering.

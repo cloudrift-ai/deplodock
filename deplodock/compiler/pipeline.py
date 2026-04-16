@@ -38,6 +38,7 @@ class CompileResult:
     graph_inputs: list[str] = field(default_factory=list)
     graph_outputs: list[str] = field(default_factory=list)
     graph_constants: list[str] = field(default_factory=list)
+    constant_values: dict[str, float] = field(default_factory=dict)
 
 
 def compile_graph(graph: Graph) -> CompileResult:
@@ -50,13 +51,24 @@ def compile_graph(graph: Graph) -> CompileResult:
     # Capture inputs before rewriting (InputOp nodes keep their ids).
     graph_inputs = list(graph.inputs)
 
-    rewriter = Rewriter.from_directory(_RULES_DIR)
-    graph = rewriter.apply(graph)
+    # Run decomposition + optimization (but not fusion) first to get
+    # intermediate node shapes. These shapes are the source of truth for
+    # SSA shape inference inside KernelOps.
+    rewriter_pre = Rewriter.from_directory(_RULES_DIR, pass_order=["decomposition", "optimization"])
+    graph = rewriter_pre.apply(graph)
+    buf_shapes = {nid: tuple(n.output.shape) for nid, n in graph.nodes.items()}
+
+    # Now run fusion.
+    rewriter_fusion = Rewriter.from_directory(_RULES_DIR, pass_order=["fusion"])
+    graph = rewriter_fusion.apply(graph)
+
+    # Add post-fusion node shapes (KernelOp outputs).
+    for nid, n in graph.nodes.items():
+        if nid not in buf_shapes:
+            buf_shapes[nid] = tuple(n.output.shape)
 
     graph_constants = [nid for nid, n in graph.nodes.items() if isinstance(n.op, ConstantOp)]
-
-    # Extract buffer shapes from the post-rewrite graph.
-    buf_shapes = {nid: tuple(n.output.shape) for nid, n in graph.nodes.items()}
+    constant_values = {nid: n.op.value for nid, n in graph.nodes.items() if isinstance(n.op, ConstantOp) and n.op.value is not None}
 
     kernels = extract_kernels(graph)
 
@@ -76,6 +88,7 @@ def compile_graph(graph: Graph) -> CompileResult:
         graph_inputs=graph_inputs,
         graph_outputs=graph_outputs,
         graph_constants=graph_constants,
+        constant_values=constant_values,
     )
 
 
