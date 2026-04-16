@@ -71,7 +71,7 @@ def test_compile_result_metadata():
     result = compile_graph(g)
     assert isinstance(result, CompileResult)
     assert result.graph_inputs == ["x"]
-    assert result.graph_outputs == ["y"]
+    assert len(result.graph_outputs) == 1
     assert len(result.kernels) == 1
 
 
@@ -87,7 +87,7 @@ def test_pointwise_chain_gpu():
     x_data = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0]
     expected = [math.exp(-xi) for xi in x_data]
     result = CudaBackend().run(program, input_data={"x": x_data})
-    assert result.outputs["y"] == pytest.approx(expected, rel=1e-5)
+    assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-5)
 
 
 @requires_cuda

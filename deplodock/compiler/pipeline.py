@@ -47,20 +47,28 @@ def compile_graph(graph: Graph) -> CompileResult:
     extracts the resulting ``KernelOp`` nodes together with graph-level
     metadata (inputs, outputs, constants).
     """
-    # Capture metadata from the pre-rewrite graph.
+    # Capture inputs before rewriting (InputOp nodes keep their ids).
     graph_inputs = list(graph.inputs)
-    graph_outputs = list(graph.outputs)
 
     rewriter = Rewriter.from_directory(_RULES_DIR)
     graph = rewriter.apply(graph)
 
-    # Constants survive rewriting as ConstantOp nodes.
     graph_constants = [nid for nid, n in graph.nodes.items() if isinstance(n.op, ConstantOp)]
 
     # Extract buffer shapes from the post-rewrite graph.
     buf_shapes = {nid: tuple(n.output.shape) for nid, n in graph.nodes.items()}
 
     kernels = extract_kernels(graph)
+
+    # Graph outputs: the output Port buffer_ids of the KernelOp nodes
+    # that correspond to graph.outputs entries.
+    graph_outputs = []
+    for nid in graph.outputs:
+        node = graph.nodes.get(nid)
+        if node is not None and isinstance(node.op, KernelOp):
+            for out in node.op.outputs:
+                if hasattr(out, "buffer_id"):
+                    graph_outputs.append(out.buffer_id)
 
     return CompileResult(
         kernels=kernels,
@@ -69,3 +77,24 @@ def compile_graph(graph: Graph) -> CompileResult:
         graph_outputs=graph_outputs,
         graph_constants=graph_constants,
     )
+
+
+def _all_leaf_ports(kernel: KernelOp) -> list:
+    """Collect all leaf Port objects from a kernel's input trees."""
+    from deplodock.compiler.ops import Combine, Mux, Port
+
+    ports: list = []
+
+    def walk(inp):
+        if isinstance(inp, Port):
+            ports.append(inp)
+        elif isinstance(inp, Mux):
+            for b in inp.branches:
+                walk(b.input)
+        elif isinstance(inp, Combine):
+            for s in inp.sources:
+                walk(s)
+
+    for inp in kernel.inputs:
+        walk(inp)
+    return ports

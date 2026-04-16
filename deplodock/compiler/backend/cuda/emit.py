@@ -332,6 +332,23 @@ def _emit_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> 
 
         reduce_count = 0
 
+        # Distinguish per-element input Ports from scalar/per-row ones.
+        # A Port is "per-element" if its numel exceeds the output row count.
+        n_rows = _reduce_n_rows(kernel, shapes)
+        per_element_ports: set[str] = set()
+        for pname, port in input_ports.items():
+            port_shape = shapes.get(pname, ())
+            if port.indexmap is not None:
+                port_shape = port.indexmap.out_shape
+            if _numel(port_shape) > n_rows:
+                per_element_ports.add(pname)
+
+        # Pre-load scalar/per-row Ports at `idx` outside any K-loop.
+        for port_name, port in input_ports.items():
+            if port_name not in per_element_ports:
+                values[port_name] = _emit_input_value(port, idx, shapes, guarded, name_seq)
+                per_row_values.add(port_name)
+
         segments: list[list[Assign]] = []
         current_seg: list[Assign] = []
         for assign in kernel.body:
@@ -348,19 +365,24 @@ def _emit_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> 
             ew_assigns = segment[:-1] if seg_has_reduce else segment
             reduce_assign = last if seg_has_reduce else None
 
+            # Names defined within this segment are local — don't trigger K-loop.
+            seg_local = {a.name for a in ew_assigns}
+
             needs_k_loop = False
             for assign in ew_assigns:
                 for a in assign.args:
-                    if a in input_port_names or a not in per_row_values:
-                        needs_k_loop = True
-                        break
+                    if a in seg_local or a in per_row_values or (a in input_port_names and a not in per_element_ports):
+                        continue
+                    needs_k_loop = True
+                    break
                 if needs_k_loop:
                     break
             if seg_has_reduce:
                 assert reduce_assign is not None
                 for a in reduce_assign.args:
-                    if a in input_port_names or a not in per_row_values:
-                        needs_k_loop = True
+                    if a in seg_local or a in per_row_values or (a in input_port_names and a not in per_element_ports):
+                        continue
+                    needs_k_loop = True
 
             if not needs_k_loop and not seg_has_reduce:
                 for assign in ew_assigns:
@@ -383,9 +405,16 @@ def _emit_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> 
                 inner_stmts: list[Stmt] = []
                 loop_values: dict[str, Expr] = dict(values)
 
+                # Load scalar/per-row Ports outside the K-loop at `idx`.
+                for port_name, port in input_ports.items():
+                    if port_name not in per_element_ports and port_name not in loop_values:
+                        loop_values[port_name] = _emit_input_value(port, idx, shapes, guarded, name_seq)
+
+                # Load per-element Ports inside the K-loop at the broadcast coord.
                 load_idx = _broadcast_load_idx(idx, k_var, pre_reduce_shape, reduce_axis)
                 for port_name, port in input_ports.items():
-                    loop_values[port_name] = _emit_input_value(port, load_idx, shapes, inner_stmts, name_seq)
+                    if port_name in per_element_ports:
+                        loop_values[port_name] = _emit_input_value(port, load_idx, shapes, inner_stmts, name_seq)
 
                 prior_assigns: list[Assign] = []
                 for seg in segments:

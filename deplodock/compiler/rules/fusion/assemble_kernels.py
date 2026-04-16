@@ -84,19 +84,26 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     last_nid = _last_node_id(chain)
     last_node = graph.nodes[last_nid]
 
+    g = graph.copy()
+    input_nids = [p.buffer_id if isinstance(p, Port) else _first_port_id(p) for p in inputs]
+
+    # Use a placeholder output Port; update buffer_id after add_node
+    # so the output buffer matches the graph node id that downstream
+    # consumers reference.
+    out_port = Port(buffer_id=last_nid)
     kernel = KernelOp(
         inputs=tuple(inputs),
         body=tuple(body),
-        outputs=(Port(buffer_id=last_nid),),
+        outputs=(out_port,),
     )
 
-    g = graph.copy()
-    input_nids = [p.buffer_id if isinstance(p, Port) else _first_port_id(p) for p in inputs]
     new_nid = g.add_node(
         op=kernel,
         inputs=input_nids,
         output=Tensor(name=f"kernel_{last_nid}", shape=last_node.output.shape, dtype=last_node.output.dtype),
     )
+    # Update the output Port to use the new graph node id so buffers match.
+    out_port.buffer_id = new_nid
     for nid in all_consumed:
         orig = graph.nodes.get(nid)
         if orig is not None and orig.hints:
@@ -240,9 +247,10 @@ def _wrap_indexmap_kernel(graph: Graph, node: Node) -> Graph:
             branches.append(MuxBranch(input=Port(buffer_id=src_id), select=src.select))
         inputs = (Mux(branches=tuple(branches)),)
 
+    out_port = Port(buffer_id=nid)
     kernel = KernelOp(
         inputs=inputs,
-        outputs=(Port(buffer_id=nid),),
+        outputs=(out_port,),
     )
 
     g = graph.copy()
@@ -252,6 +260,7 @@ def _wrap_indexmap_kernel(graph: Graph, node: Node) -> Graph:
         inputs=input_nids,
         output=Tensor(name=f"kernel_{nid}", shape=tuple(op.out_shape), dtype=node.output.dtype),
     )
+    out_port.buffer_id = new_nid
     g.replace_node(nid, new_nid)
     g.remove_node(nid)
     return g

@@ -193,7 +193,7 @@ def test_pointwise_runs_on_gpu():
         result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
     )
     result = CudaBackend().run(program, input_data={"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
-    assert result.outputs["z"] == pytest.approx([11, 22, 33, 44])
+    assert list(result.outputs.values())[0] == pytest.approx([11, 22, 33, 44])
 
 
 @requires_cuda
@@ -206,7 +206,7 @@ def test_reduce_runs_on_gpu():
     x_data = [float(i) for i in range(32)]
     result = CudaBackend().run(program, input_data={"x": x_data})
     expected = [sum(x_data[row * 8 : (row + 1) * 8]) for row in range(4)]
-    assert result.outputs["y"] == pytest.approx(expected)
+    assert list(result.outputs.values())[0] == pytest.approx(expected)
 
 
 @requires_cuda
