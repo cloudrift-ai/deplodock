@@ -526,62 +526,30 @@ class ContractionCore:
 
 
 @dataclass
-class ReduceStage:
-    """One reduction in a multi-reduce chain.
-
-    ``pre_ops``: elementwise chain between the previous stage's output
-    (or the pipeline's pre-reduce value, for the first stage) and this
-    reduce. Empty when the reduce runs directly on the prior output.
-
-    ``reduce``: the ``ReduceOp`` Node. The previous stage's reduced axis
-    is gone from the iteration space by the time ``pre_ops`` runs —
-    ``pre_ops`` consume in-register accumulators, not external loads.
-    """
-
-    pre_ops: tuple[ElementwiseOp, ...]
-    reduce: ReduceOp
-
-    def __post_init__(self) -> None:
-        _assert_elementwise_chain(self.pre_ops, "ReduceStage.pre_ops")
-        _assert_reduce_op(self.reduce, "ReduceStage.reduce")
-
-
-@dataclass
 class KernelOp(Op):
     """One kernel's worth of computation: a tiled dataflow pipeline.
 
     The pipeline is linear:
 
-        inputs → [contraction] → [reduce_stages] → [epilogue] → outputs
+        inputs → [contraction] → [body] → outputs
 
-    - ``inputs``: a tuple of ``KernelInput`` trees, one per logical body
-      input. Recursive (Port | Mux | Combine); every elementwise op used
-      to assemble a value lives inside the tree.
-    - ``contraction``: optional systolic core (matmul and its
-      generalizations). When present, its ``operand`` is itself a
-      ``KernelInput`` (typically a Combine of two inputs with a mul).
-    - ``reduce_stages``: optional sequence of post-contraction (or
-      post-input if no contraction) reductions. Each stage's ``pre_ops``
-      consume the prior stage's (or contraction's) output.
-    - ``epilogue``: optional post-body elementwise chain at the output
-      iteration space (bias, activation, residual).
-    - ``outputs``: write targets (Port | Mux) — Mux supports scatter /
-      masked writeout.
+    - ``inputs``: ``KernelInput`` trees (Port | Mux | Combine).
+    - ``contraction``: optional systolic core (matmul).
+    - ``body``: a flat sequential chain of ``ElementwiseOp`` and
+      ``ReduceOp`` ops. ``ElementwiseOp`` transforms the current value;
+      ``ReduceOp`` collapses an axis. Position defines the dataflow.
+      Replaces the old ``reduce_stages`` + ``epilogue`` split.
+    - ``outputs``: write targets (Port | Mux).
 
-    ``external_shapes`` keeps buffer-id → shape for every leaf ``Port``
-    the codegen needs to allocate launch args for.
+    ``external_shapes`` keeps buffer-id → shape for codegen.
     """
 
     inputs: tuple[KernelInput, ...]
     outputs: tuple[KernelOutput, ...]
     contraction: ContractionCore | None = None
-    reduce_stages: tuple[ReduceStage, ...] = ()
-    epilogue: tuple[ElementwiseOp, ...] = ()
+    body: tuple[OpSlot, ...] = ()
     external_shapes: dict = field(default_factory=dict)
     kernel_source: str = ""  # backend-set after emission
-
-    def __post_init__(self) -> None:
-        _assert_elementwise_chain(self.epilogue, "KernelOp.epilogue")
 
 
 # ---------------------------------------------------------------------------

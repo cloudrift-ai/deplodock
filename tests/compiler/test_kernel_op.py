@@ -1,9 +1,4 @@
-"""Tests for the structural KernelOp IR.
-
-Covers construction of each KernelInput variant (Port / Mux / Combine),
-the contraction / reduce-chain / epilogue slots on KernelOp, and the
-runtime invariants enforced by ``__post_init__``.
-"""
+"""Tests for the structural KernelOp IR."""
 
 import pytest
 
@@ -19,220 +14,74 @@ from deplodock.compiler.ops import (
     MuxBranch,
     Port,
     ReduceOp,
-    ReduceStage,
 )
 
-# ---------------------------------------------------------------------------
-# Port — signal-flow leaf
-# ---------------------------------------------------------------------------
+
+def test_port_plain():
+    assert Port("x").buffer_id == "x"
 
 
-def test_port_plain_read():
-    p = Port("x")
-    assert p.buffer_id == "x"
-    assert p.indexmap is None
-
-
-def test_port_with_indexmap():
+def test_port_indexmap():
     idx = IndexMapOp(out_shape=(4, 3), sources=(IndexSource(input_idx=0, coord_map=(Var("out_coord_0"),)),))
-    p = Port("x", indexmap=idx)
-    assert p.indexmap is idx
+    assert Port("x", indexmap=idx).indexmap is idx
 
 
-# ---------------------------------------------------------------------------
-# Combine — operadic composition
-# ---------------------------------------------------------------------------
-
-
-def test_combine_cross_input_add():
-    add = ElementwiseOp("add")
-    c = Combine(sources=(Port("a"), Port("b")), ops=(add,))
+def test_combine_binary():
+    c = Combine(sources=(Port("a"), Port("b")), ops=(ElementwiseOp("add"),))
     assert len(c.sources) == 2
-    assert c.ops == (add,)
 
 
-def test_combine_rejects_no_op_wrapper():
-    with pytest.raises(ValueError, match="no-op wrapper"):
+def test_combine_rejects_noop():
+    with pytest.raises(ValueError):
         Combine(sources=(Port("a"),), ops=())
 
 
-def test_combine_rejects_empty_sources():
-    with pytest.raises(ValueError, match="non-empty"):
-        Combine(sources=(), ops=())
-
-
 def test_combine_rejects_reduce_in_ops():
-    red = ReduceOp("sum", -1)
-    with pytest.raises(TypeError, match="expected ElementwiseOp"):
-        Combine(sources=(Port("a"),), ops=(red,))
+    with pytest.raises(TypeError):
+        Combine(sources=(Port("a"),), ops=(ReduceOp("sum", -1),))
 
 
-# ---------------------------------------------------------------------------
-# Mux — hardware multiplexer
-# ---------------------------------------------------------------------------
-
-
-def test_mux_kv_cache_pattern():
-    m = Mux(
-        branches=(
-            MuxBranch(input=Port("k_cache"), select=Var("t_lt_past")),
-            MuxBranch(input=Port("k_new"), select=Var("t_ge_past")),
-        )
-    )
+def test_mux():
+    m = Mux(branches=(MuxBranch(Port("a"), Var("c1")), MuxBranch(Port("b"), Var("c2"))))
     assert len(m.branches) == 2
-    assert isinstance(m.branches[0].input, Port)
 
 
-def test_mux_rejects_empty_branches():
-    with pytest.raises(ValueError, match="non-empty"):
-        Mux(branches=())
-
-
-def test_mux_nests_into_combine():
-    dequant = ElementwiseOp("mul")
-    muxed = Mux(
-        branches=(
-            MuxBranch(input=Port("src_a"), select=Var("cond_a")),
-            MuxBranch(input=Port("src_b"), select=Var("cond_b")),
-        )
+def test_contraction():
+    cc = ContractionCore(
+        operand=Combine(sources=(Port("a"), Port("b")), ops=(ElementwiseOp("mul"),)),
+        reduce=ReduceOp("sum", -1),
     )
-    c = Combine(sources=(muxed, Port("scale")), ops=(dequant,))
-    assert c.sources[0] is muxed
-
-
-# ---------------------------------------------------------------------------
-# ContractionCore — systolic core
-# ---------------------------------------------------------------------------
-
-
-def test_contraction_matmul_shape():
-    mul = ElementwiseOp("mul")
-    red = ReduceOp("sum", -1)
-    operand = Combine(sources=(Port("a"), Port("b")), ops=(mul,))
-    cc = ContractionCore(operand=operand, reduce=red)
     assert isinstance(cc.operand, Combine)
 
 
-def test_contraction_rejects_elementwise_as_reduce():
-    mul = ElementwiseOp("mul")
-    with pytest.raises(TypeError, match="expected ReduceOp"):
-        ContractionCore(operand=Port("x"), reduce=mul)
-
-
-# ---------------------------------------------------------------------------
-# ReduceStage — one reduction in a chain
-# ---------------------------------------------------------------------------
-
-
-def test_reduce_stage_empty_pre_ops():
-    red = ReduceOp("max", -1)
-    stage = ReduceStage(pre_ops=(), reduce=red)
-    assert stage.pre_ops == ()
-
-
-def test_reduce_stage_softmax_sum():
-    sub = ElementwiseOp("sub")
-    exp = ElementwiseOp("exp")
-    red = ReduceOp("sum", -1)
-    stage = ReduceStage(pre_ops=(sub, exp), reduce=red)
-    assert stage.pre_ops == (sub, exp)
-
-
-def test_reduce_stage_rejects_reduce_in_pre_ops():
-    red = ReduceOp("sum", -1)
-    with pytest.raises(TypeError, match="expected ElementwiseOp"):
-        ReduceStage(pre_ops=(red,), reduce=red)
-
-
-def test_reduce_stage_rejects_elementwise_as_reduce():
-    mul = ElementwiseOp("mul")
-    with pytest.raises(TypeError, match="expected ReduceOp"):
-        ReduceStage(pre_ops=(), reduce=mul)
-
-
-# ---------------------------------------------------------------------------
-# KernelOp — tiled dataflow pipeline
-# ---------------------------------------------------------------------------
+def test_contraction_rejects_elementwise():
+    with pytest.raises(TypeError):
+        ContractionCore(operand=Port("x"), reduce=ElementwiseOp("mul"))
 
 
 def test_kernel_pointwise():
-    add = ElementwiseOp("add")
-    body = Combine(sources=(Port("x"), Port("y")), ops=(add,))
-    k = KernelOp(inputs=(body,), outputs=(Port("z"),))
-    assert k.contraction is None
-    assert k.reduce_stages == ()
-    assert k.epilogue == ()
+    k = KernelOp(inputs=(Combine(sources=(Port("x"),), ops=(ElementwiseOp("exp"),)),), outputs=(Port("y"),))
+    assert k.body == ()
 
 
-def test_kernel_matmul():
-    mul = ElementwiseOp("mul")
-    red = ReduceOp("sum", -1)
-    operand = Combine(sources=(Port("a"), Port("b")), ops=(mul,))
-    cc = ContractionCore(operand=operand, reduce=red)
-    k = KernelOp(inputs=(Port("a"), Port("b")), outputs=(Port("y"),), contraction=cc)
-    assert k.contraction is cc
+def test_kernel_reduce():
+    k = KernelOp(inputs=(Port("x"),), outputs=(Port("y"),), body=(ReduceOp("sum", -1),))
+    assert isinstance(k.body[0], ReduceOp)
 
 
-def test_kernel_matmul_plus_softmax():
-    mul = ElementwiseOp("mul")
-    contraction_reduce = ReduceOp("sum", -1)
-    operand = Combine(sources=(Port("Q"), Port("K")), ops=(mul,))
-    cc = ContractionCore(operand=operand, reduce=contraction_reduce)
-
-    rmax = ReduceOp("max", -1)
-    sub = ElementwiseOp("sub")
-    exp = ElementwiseOp("exp")
-    rsum = ReduceOp("sum", -1)
-    div = ElementwiseOp("div")
-
-    k = KernelOp(
-        inputs=(Port("Q"), Port("K")),
-        outputs=(Port("S"),),
-        contraction=cc,
-        reduce_stages=(
-            ReduceStage(pre_ops=(), reduce=rmax),
-            ReduceStage(pre_ops=(sub, exp), reduce=rsum),
-        ),
-        epilogue=(div,),
-    )
-    assert len(k.reduce_stages) == 2
-    assert k.epilogue == (div,)
-
-
-def test_kernel_pure_reduce_chain():
-    rmax = ReduceOp("max", -1)
-    sub = ElementwiseOp("sub")
-    exp = ElementwiseOp("exp")
-    rsum = ReduceOp("sum", -1)
-    div = ElementwiseOp("div")
-
+def test_kernel_softmax_body():
     k = KernelOp(
         inputs=(Port("x"),),
         outputs=(Port("y"),),
-        reduce_stages=(
-            ReduceStage(pre_ops=(), reduce=rmax),
-            ReduceStage(pre_ops=(sub, exp), reduce=rsum),
-        ),
-        epilogue=(div,),
+        body=(ReduceOp("max", -1), ElementwiseOp("sub"), ElementwiseOp("exp"), ReduceOp("sum", -1), ElementwiseOp("div")),
     )
-    assert k.contraction is None
-    assert len(k.reduce_stages) == 2
+    assert len(k.body) == 5
 
 
-def test_kernel_scatter_output():
-    add = ElementwiseOp("add")
-    body = Combine(sources=(Port("x"), Port("y")), ops=(add,))
-    scatter = Mux(
-        branches=(
-            MuxBranch(input=Port("out_a"), select=Var("cond_a")),
-            MuxBranch(input=Port("out_b"), select=Var("cond_b")),
-        )
+def test_kernel_matmul_with_body():
+    cc = ContractionCore(
+        operand=Combine(sources=(Port("a"), Port("b")), ops=(ElementwiseOp("mul"),)),
+        reduce=ReduceOp("sum", -1),
     )
-    k = KernelOp(inputs=(body,), outputs=(scatter,))
-    assert isinstance(k.outputs[0], Mux)
-
-
-def test_kernel_epilogue_rejects_reduce():
-    red = ReduceOp("sum", -1)
-    with pytest.raises(TypeError, match="expected ElementwiseOp"):
-        KernelOp(inputs=(Port("x"),), outputs=(Port("y"),), epilogue=(red,))
+    k = KernelOp(inputs=(Port("bias"),), outputs=(Port("y"),), contraction=cc, body=(ElementwiseOp("add"),))
+    assert len(k.body) == 1

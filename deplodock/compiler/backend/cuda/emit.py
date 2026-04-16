@@ -49,6 +49,7 @@ from deplodock.compiler.ops import (
     KernelOp,
     Mux,
     Port,
+    ReduceOp,
 )
 
 _BLOCK = 256  # thread count per block for 1D pointwise / reduce-target parallelism
@@ -127,9 +128,10 @@ def emit_kernel(kernel: KernelOp, kernel_name: str) -> tuple[KernelDef, list[str
     out_shape = _infer_output_shape(kernel)
     params, arg_order = _build_params(kernel)
 
+    has_reduce = any(isinstance(op, ReduceOp) for op in kernel.body)
     if kernel.contraction is not None:
         body, block_size = _emit_contraction_body(kernel, out_shape)
-    elif kernel.reduce_stages:
+    elif has_reduce:
         body, block_size = _emit_reduce_body(kernel, out_shape)
     else:
         body, block_size = _emit_pointwise_body(kernel, out_shape)
@@ -268,7 +270,7 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt]
     value = input_vals[0] if input_vals else Literal(0.0, "float")
     extra_iter = iter(input_vals[1:])
 
-    value = _apply_chain(kernel.epilogue, value, extra_iter, idx, guarded, name_seq)
+    value = _apply_chain(kernel.body, value, extra_iter, idx, guarded, name_seq)
 
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port), "naive pointwise: output must be a plain Port"
@@ -284,15 +286,17 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt]
 
 
 def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], tuple[int, int, int]]:
-    """Single-thread-per-block naive reduction: one block per output row."""
-    stages = kernel.reduce_stages
-    assert len(stages) >= 1
-    # First stage reads from the first kernel input (assumed a Port).
-    assert len(kernel.inputs) == 1 and isinstance(kernel.inputs[0], Port)
+    """Walk kernel.body (mixed ElementwiseOp / ReduceOp chain).
+
+    Each ReduceOp emits a K-loop with an accumulator. ElementwiseOps
+    between reduces apply to the current value (inside or outside the
+    K-loop depending on position).
+    """
+    assert len(kernel.inputs) >= 1 and isinstance(kernel.inputs[0], Port)
     src_port = kernel.inputs[0]
     src_shape = kernel.external_shapes.get(src_port.buffer_id, ())
     k_size = src_shape[-1] if src_shape else 1
-    # Output coord = row index along leading axes (flattened).
+
     row = Var("row")
     stmts: list[Stmt] = [
         VarDecl(dtype="int", name="row", init=Var("blockIdx.x")),
@@ -301,43 +305,46 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], t
             body=[RawCode("return;")],
         ),
     ]
-    # Run stages in sequence. For the very first stage, the input is a
-    # straight reduction over ``src_port`` along its last axis. Subsequent
-    # stages operate on per-row accumulators (pre_ops) and reduce again.
-    prev_value_expr: Expr | None = None
     name_seq = [0]
-    for si, stage in enumerate(stages):
-        fn = stage.reduce.fn
-        acc_name = f"acc{si}"
-        stmts.append(VarDecl(dtype="float", name=acc_name, init=Literal(_identity(fn), "float")))
-        k_var = Var(f"k{si}")
-        inner: list[Stmt] = []
-        if si == 0:
-            # Load element from src_port at (row * K + k).
-            load_idx = BinOp("+", BinOp("*", row, Literal(k_size, "int")), k_var)
-            elem_expr: Expr = ArrayAccess(array=src_port.buffer_id, index=load_idx)
-        else:
-            # Feed pre_ops starting from prev_value_expr (unused for naive;
-            # pre_ops operate on per-row accumulators, but we only emit a
-            # single-row-per-block path). For a future per-block parallel
-            # reduce this would be a shared-mem chain.
-            elem_expr = prev_value_expr  # type: ignore[assignment]
-            for pre in stage.pre_ops:
-                assert isinstance(pre, ElementwiseOp)
-                elem_expr = _apply_elementwise(pre.fn, [elem_expr] + [Literal(0.0, "float")] * (pre.info.arity - 1))
-        inner.append(AugAssign(target=acc_name, op=_reduce_op(fn), value=elem_expr))
-        stmts.append(
-            ForLoop(
-                var=k_var.name,
-                start=Literal(0, "int"),
-                end=Literal(k_size, "int"),
-                body=inner,
-            )
-        )
-        prev_value_expr = Var(acc_name)
+    reduce_count = 0
+    value: Expr | None = None
 
-    value: Expr = prev_value_expr  # type: ignore[assignment]
-    value = _apply_epilogue(kernel.epilogue, value, list(kernel.inputs[1:]), row, stmts, name_seq, kernel.external_shapes)
+    for op in kernel.body:
+        if isinstance(op, ReduceOp):
+            fn = op.fn
+            acc_name = f"acc{reduce_count}"
+            stmts.append(VarDecl(dtype="float", name=acc_name, init=Literal(_identity(fn), "float")))
+            k_var = Var(f"k{reduce_count}")
+            if value is None:
+                load_idx = BinOp("+", BinOp("*", row, Literal(k_size, "int")), k_var)
+                elem: Expr = ArrayAccess(array=src_port.buffer_id, index=load_idx)
+            else:
+                elem = value
+            stmts.append(
+                ForLoop(
+                    var=k_var.name,
+                    start=Literal(0, "int"),
+                    end=Literal(k_size, "int"),
+                    body=[AugAssign(target=acc_name, op=_reduce_op(fn), value=elem)],
+                )
+            )
+            value = Var(acc_name)
+            reduce_count += 1
+        elif isinstance(op, ElementwiseOp):
+            if value is None:
+                load_idx = BinOp("+", BinOp("*", row, Literal(k_size, "int")), Literal(0, "int"))
+                value = ArrayAccess(array=src_port.buffer_id, index=load_idx)
+            if op.info.arity == 1:
+                value = _apply_elementwise(op.fn, [value])
+            else:
+                extra_vals = [_emit_input_value(inp, row, kernel.external_shapes, stmts, name_seq) for inp in kernel.inputs[1:]]
+                extra = extra_vals[0] if extra_vals else Literal(0.0, "float")
+                value = _apply_elementwise(op.fn, [value, extra])
+            tname = _fresh(name_seq)
+            stmts.append(VarDecl(dtype="float", name=tname, init=value))
+            value = Var(tname)
+
+    assert value is not None
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port)
     stmts.append(Assign(target=ArrayAccess(array=out_port.buffer_id, index=row), value=value))
@@ -419,7 +426,7 @@ def _emit_contraction_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stm
     out_flat: Expr = BinOp("+", BinOp("*", m, Literal(n_size, "int")), n)
     if batch is not None:
         out_flat = BinOp("+", BinOp("*", batch, Literal(m_size * n_size, "int")), out_flat)
-    value = _apply_epilogue(kernel.epilogue, value, list(kernel.inputs), out_flat, stmts, name_seq, kernel.external_shapes)
+    value = _apply_epilogue(kernel.body, value, list(kernel.inputs), out_flat, stmts, name_seq, kernel.external_shapes)
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port)
     stmts.append(Assign(target=ArrayAccess(array=out_port.buffer_id, index=out_flat), value=value))
@@ -576,14 +583,8 @@ def _infer_output_shape(kernel: KernelOp) -> tuple:
     else:
         return ()
 
-    # Reduce stages.
-    for stage in kernel.reduce_stages:
-        for op in stage.pre_ops:
-            shape = op.infer_output_shape([shape])
-        shape = stage.reduce.infer_output_shape([shape])
-
-    # Epilogue.
-    for op in kernel.epilogue:
+    # Body chain (mixed elementwise + reduce).
+    for op in kernel.body:
         shape = op.infer_output_shape([shape])
 
     return tuple(shape)
@@ -661,10 +662,14 @@ def _leaf_ports(kernel: KernelOp) -> list[Port]:
     return leaves
 
 
+def _has_reduce(kernel: KernelOp) -> bool:
+    return any(isinstance(op, ReduceOp) for op in kernel.body)
+
+
 def _kernel_name(kernel: KernelOp, idx: int) -> str:
     if kernel.contraction is not None:
         return f"k{idx}_contract"
-    if kernel.reduce_stages:
+    if _has_reduce(kernel):
         return f"k{idx}_reduce"
     return f"k{idx}_pointwise"
 
@@ -677,7 +682,7 @@ def _launch_config(kernel: KernelOp) -> tuple[tuple[int, int, int], tuple[int, i
         n = int_shape[-1] if int_shape else 1
         batch = _numel(int_shape[:-2]) if len(int_shape) > 2 else 1
         return (n, m, batch), (1, 1, 1)
-    if kernel.reduce_stages:
+    if _has_reduce(kernel):
         n_rows = _numel(out_shape)
         return (n_rows, 1, 1), (1, 1, 1)
     numel = _numel(out_shape)
