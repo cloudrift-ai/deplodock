@@ -115,7 +115,7 @@ def test_contraction_emits_matmul():
     program = CudaBackend().compile(
         result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
     )
-    source = program.launches[0].kernel_source
+    source = program.launches[-1].kernel_source
     assert "for (int k" in source
     assert "acc0 +=" in source
 

@@ -53,6 +53,10 @@ class Op:
         """
         raise NotImplementedError(f"{type(self).__name__}.infer_output_shape not implemented")
 
+    def forward(self, *inputs):
+        """Compute the operation using numpy arrays. Override in subclasses."""
+        raise NotImplementedError(f"{type(self).__name__}.forward not implemented")
+
 
 @dataclass
 class InputOp(Op):
@@ -60,6 +64,9 @@ class InputOp(Op):
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         raise NotImplementedError("InputOp has no inputs; use node.output.shape directly")
+
+    def forward(self, *inputs):
+        raise NotImplementedError("InputOp is a sentinel; value is supplied by the executor")
 
 
 # ---------------------------------------------------------------------------
@@ -101,18 +108,13 @@ _DEFAULT_OP_INFO = OpInfo(1)
 
 
 def _drop_axis(shape: tuple, axis: int | str) -> tuple:
-    """Return shape with the given axis set to 1 (keepdim=True semantics).
-
-    Keeping the reduced dim as size-1 ensures that post-reduce values
-    broadcast correctly with pre-reduce values (e.g. RMSNorm's
-    ``mul(X:(M,K), rsqrt:(M,1))`` broadcasts to ``(M,K)``).
-    """
+    """Return shape with the given axis removed (handles negative axes)."""
     if not isinstance(axis, int):
         return tuple(shape)
     a = axis if axis >= 0 else len(shape) + axis
     if a < 0 or a >= len(shape):
         return tuple(shape)
-    return tuple(shape[:a]) + (1,) + tuple(shape[a + 1 :])
+    return tuple(shape[:a]) + tuple(shape[a + 1 :])
 
 
 @dataclass
@@ -129,6 +131,31 @@ class ElementwiseOp(Op):
         from deplodock.compiler.shape_utils import broadcast_shapes
 
         return broadcast_shapes(*input_shapes)
+
+    def forward(self, *inputs):
+        import numpy as np
+
+        _EW_FN = {
+            "add": lambda a, b: a + b,
+            "sub": lambda a, b: a - b,
+            "mul": lambda a, b: a * b,
+            "div": lambda a, b: a / b,
+            "mod": lambda a, b: a % b,
+            "neg": lambda a: -a,
+            "exp": lambda a: np.exp(a),
+            "rsqrt": lambda a: 1.0 / np.sqrt(a),
+            "recip": lambda a: 1.0 / a,
+            "relu": lambda a: np.maximum(a, 0),
+            "tanh": lambda a: np.tanh(a),
+            "sigmoid": lambda a: 1.0 / (1.0 + np.exp(-a)),
+            "pow": lambda a, b: np.power(a, b),
+            "abs": lambda a: np.abs(a),
+            "silu": lambda a: a / (1.0 + np.exp(-a)),
+        }
+        fn = _EW_FN.get(self.fn)
+        if fn is None:
+            raise NotImplementedError(f"ElementwiseOp.forward: unknown fn {self.fn!r}")
+        return fn(*inputs)
 
 
 @dataclass(frozen=True)
@@ -161,6 +188,20 @@ class ReduceOp(Op):
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return _drop_axis(input_shapes[0], self.axis)
 
+    def forward(self, *inputs):
+        import numpy as np
+
+        a = inputs[0]
+        _RED_FN = {
+            "sum": lambda x, ax: np.sum(x, axis=ax),
+            "max": lambda x, ax: np.max(x, axis=ax),
+            "prod": lambda x, ax: np.prod(x, axis=ax),
+        }
+        fn = _RED_FN.get(self.fn)
+        if fn is None:
+            raise NotImplementedError(f"ReduceOp.forward: unknown fn {self.fn!r}")
+        return fn(a, self.axis)
+
 
 @dataclass
 class ScanOp(Op):
@@ -171,6 +212,20 @@ class ScanOp(Op):
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(input_shapes[0])  # scan preserves shape
+
+    def forward(self, *inputs):
+        import numpy as np
+
+        a = inputs[0]
+        _SCAN_FN = {
+            "sum": lambda x, ax: np.cumsum(x, axis=ax),
+            "max": lambda x, ax: np.maximum.accumulate(x, axis=ax),
+            "prod": lambda x, ax: np.cumprod(x, axis=ax),
+        }
+        fn = _SCAN_FN.get(self.fn)
+        if fn is None:
+            raise NotImplementedError(f"ScanOp.forward: unknown fn {self.fn!r}")
+        return fn(a, self.axis)
 
 
 @dataclass
@@ -184,6 +239,12 @@ class GatherOp(Op):
         # Conservative fallback: keep input shape (callers should pre-size if needed).
         return tuple(input_shapes[0])
 
+    def forward(self, *inputs):
+        import numpy as np
+
+        data, indices = inputs[0], inputs[1].astype(np.intp)
+        return np.take_along_axis(data, indices, axis=self.axis)
+
 
 @dataclass
 class ScatterOp(Op):
@@ -194,6 +255,16 @@ class ScatterOp(Op):
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(input_shapes[0])  # scatter preserves the destination shape
+
+    def forward(self, *inputs):
+        import numpy as np
+
+        dest, indices, values = inputs[0].copy(), inputs[1].astype(np.intp), inputs[2]
+        if self.reduce_fn == "sum":
+            np.add.at(dest, (np.arange(dest.shape[0])[:, None], indices), values)
+        else:
+            np.put_along_axis(dest, indices, values, axis=self.axis)
+        return dest
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +281,13 @@ class ConstantOp(Op):
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         raise NotImplementedError("ConstantOp has no inputs; use node.output.shape directly")
+
+    def forward(self, *inputs):
+        import numpy as np
+
+        if self.value is not None:
+            return np.array([self.value], dtype=np.float32)
+        raise NotImplementedError("ConstantOp with value=None must be supplied by the executor")
 
 
 @dataclass
@@ -233,6 +311,16 @@ class TransposeOp(Op):
         out[a], out[b] = out[b], out[a]
         return tuple(out)
 
+    def forward(self, *inputs):
+        import numpy as np
+
+        a = inputs[0]
+        ndim = a.ndim
+        if len(self.axes) == ndim:
+            return np.transpose(a, self.axes)
+        ax0, ax1 = self.axes[0] % ndim, self.axes[1] % ndim
+        return np.swapaxes(a, ax0, ax1)
+
 
 @dataclass
 class ReshapeOp(Op):
@@ -241,7 +329,23 @@ class ReshapeOp(Op):
     shape: tuple[int | str, ...]
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
-        return tuple(self.shape)
+        if -1 not in self.shape:
+            return tuple(self.shape)
+        in_numel = 1
+        for d in input_shapes[0]:
+            in_numel *= int(d)
+        known = 1
+        for d in self.shape:
+            if d != -1:
+                known *= int(d)
+        resolved = list(self.shape)
+        resolved[resolved.index(-1)] = in_numel // known if known else 1
+        return tuple(resolved)
+
+    def forward(self, *inputs):
+        import numpy as np
+
+        return np.reshape(inputs[0], self.shape)
 
 
 @dataclass
@@ -256,6 +360,15 @@ class SliceOp(Op):
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(self.shape)
+
+    def forward(self, *inputs):
+        tensor = inputs[0]
+        dim = int(inputs[1].flat[0]) if len(inputs) > 1 else 0
+        start = int(inputs[2].flat[0]) if len(inputs) > 2 else 0
+        end = int(inputs[3].flat[0]) if len(inputs) > 3 else tensor.shape[dim]
+        slices = [slice(None)] * tensor.ndim
+        slices[dim] = slice(start, end)
+        return tensor[tuple(slices)]
 
 
 @dataclass
@@ -285,6 +398,18 @@ class CatOp(Op):
         out[last] = total
         return tuple(out)
 
+    def forward(self, *inputs):
+        import numpy as np
+
+        arrays = []
+        dim = -1
+        for inp in inputs:
+            if inp.ndim == 0 or (inp.ndim == 1 and inp.size == 1):
+                dim = int(inp.flat[0])
+            else:
+                arrays.append(inp)
+        return np.concatenate(arrays, axis=dim)
+
 
 # ---------------------------------------------------------------------------
 # Torch IR ops (captured from PyTorch, decomposed by rewriter passes)
@@ -302,6 +427,13 @@ class LinearOp(Op):
         w_shape = input_shapes[1]  # (out_features, in_features)
         return tuple(x_shape[:-1]) + (w_shape[-2],)
 
+    def forward(self, *inputs):
+        x, w = inputs[0], inputs[1]
+        result = x @ w.T
+        if self.has_bias:
+            result = result + inputs[2]
+        return result
+
 
 @dataclass
 class MatmulOp(Op):
@@ -315,6 +447,13 @@ class MatmulOp(Op):
         # Standard matmul: A(..., M, K) @ B(..., K, N) → (..., M, N)
         return tuple(a_shape[:-1]) + (b_shape[-1],)
 
+    def forward(self, *inputs):
+        a, b = inputs[0], inputs[1]
+        result = a @ b
+        if self.has_bias:
+            result = result + inputs[2]
+        return result
+
 
 @dataclass
 class SdpaOp(Op):
@@ -325,6 +464,17 @@ class SdpaOp(Op):
         q_shape = input_shapes[0]
         v_shape = input_shapes[2]
         return tuple(q_shape[:-1]) + (v_shape[-1],)
+
+    def forward(self, *inputs):
+        import numpy as np
+
+        q, k, v = inputs[0], inputs[1], inputs[2]
+        d_k = q.shape[-1]
+        scores = q @ np.swapaxes(k, -2, -1) / np.sqrt(d_k)
+        scores_max = np.max(scores, axis=-1, keepdims=True)
+        exp_scores = np.exp(scores - scores_max)
+        attn = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+        return attn @ v
 
 
 @dataclass
@@ -339,6 +489,11 @@ class UnsqueezeOp(Op):
         in_shape.insert(d, 1)
         return tuple(in_shape)
 
+    def forward(self, *inputs):
+        import numpy as np
+
+        return np.expand_dims(inputs[0], axis=self.dim)
+
 
 @dataclass
 class MeanOp(Op):
@@ -352,6 +507,11 @@ class MeanOp(Op):
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return _drop_axis(input_shapes[0], self.axis)
+
+    def forward(self, *inputs):
+        import numpy as np
+
+        return np.mean(inputs[0], axis=self.axis)
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +740,10 @@ class KernelOp(Op):
                         else:
                             shapes[src.buffer_id] = tuple(ext.get(src.buffer_id, ()))
         for assign in self.body:
+            # Prefer graph-provided shape (from ext dict) if available.
+            if assign.name in ext:
+                shapes[assign.name] = tuple(ext[assign.name])
+                continue
             arg_shapes = [shapes[a] for a in assign.args if a in shapes]
             if arg_shapes:
                 try:

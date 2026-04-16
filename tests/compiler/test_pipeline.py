@@ -40,9 +40,9 @@ def _matmul_graph(m: int, k: int, n: int) -> Graph:
 
 def test_compile_graph_fuses_matmul():
     result = compile_graph(_matmul_graph(4, 3, 2))
-    assert len(result.kernels) == 1
-    # Matmul is lowered as mul + sum (ReduceOp present in body).
-    assert any(isinstance(a.op, ReduceOp) for a in result.kernels[0].body)
+    # Matmul decomposes into unsqueeze copies + mul/sum kernel.
+    matmul_kernels = [k for k in result.kernels if any(isinstance(a.op, ReduceOp) for a in k.body)]
+    assert len(matmul_kernels) == 1
 
 
 def test_compile_graph_fuses_chain():
