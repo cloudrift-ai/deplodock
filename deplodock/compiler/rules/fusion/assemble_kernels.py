@@ -32,7 +32,6 @@ from deplodock.compiler.ops import (
     MuxBranch,
     Port,
     ReduceOp,
-    ReduceStage,
 )
 
 GRAMMAR = [Production("any", (ElementwiseOp, ReduceOp, IndexMapOp), "1")]
@@ -78,8 +77,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     if chain is None or not chain.consumed:
         return graph
 
-    reduce_stages = _build_reduce_stages(graph, chain)
-    epilogue_nodes = _build_epilogue(graph, chain)
+    body_ops = _build_body(graph, chain)
 
     all_consumed = set(chain.consumed)
     external_inputs = _collect_external_inputs(graph, all_consumed)
@@ -93,8 +91,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         inputs=tuple(inputs),
         outputs=(Port(buffer_id=last_nid),),
         contraction=contraction,
-        reduce_stages=tuple(reduce_stages),
-        epilogue=tuple(epilogue_nodes),
+        body=tuple(body_ops),
         external_shapes=external_shapes,
     )
 
@@ -154,23 +151,16 @@ def _build_contraction(graph: Graph, chain: ChainMatch, port_map: dict) -> Contr
     return ContractionCore(operand=operand, reduce=red_node.op)
 
 
-def _build_reduce_stages(graph: Graph, chain: ChainMatch) -> list[ReduceStage]:
-    stages = []
+def _build_body(graph: Graph, chain: ChainMatch) -> list:
+    """Build the flat body chain from stage groups + epilogue segments."""
+    ops: list = []
     for group_segs in chain.get_groups("stage"):
-        pre_ops = []
-        reduce_node = None
         for seg in group_segs:
-            if seg.name.endswith(".pre_ops"):
-                pre_ops = [graph.nodes[nid].op for nid in seg.node_ids]
-            elif seg.name.endswith(".reduce"):
-                reduce_node = graph.nodes[seg.node_ids[0]]
-        if reduce_node is not None:
-            stages.append(ReduceStage(pre_ops=tuple(pre_ops), reduce=reduce_node.op))
-    return stages
-
-
-def _build_epilogue(graph: Graph, chain: ChainMatch) -> list[ElementwiseOp]:
-    return [graph.nodes[nid].op for nid in chain.get("epilogue")]
+            for nid in seg.node_ids:
+                ops.append(graph.nodes[nid].op)
+    for nid in chain.get("epilogue"):
+        ops.append(graph.nodes[nid].op)
+    return ops
 
 
 def _last_node_id(chain: ChainMatch) -> str:

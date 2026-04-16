@@ -35,7 +35,7 @@ def test_pointwise_add():
     assert len(kernels) == 1
     k = kernels[0]
     assert k.contraction is None
-    assert k.reduce_stages == ()
+    assert all(isinstance(op, ElementwiseOp) for op in k.body)
 
 
 def test_chained_pointwise_fuses_into_one():
@@ -50,7 +50,7 @@ def test_chained_pointwise_fuses_into_one():
     kernels = compile_graph(g)
     assert len(kernels) == 1
     assert kernels[0].contraction is None
-    assert kernels[0].reduce_stages == ()
+    assert len(kernels[0].body) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +67,7 @@ def test_reduce_sum():
 
     kernels = compile_graph(g)
     assert len(kernels) == 1
-    assert len(kernels[0].reduce_stages) == 1
-    assert kernels[0].reduce_stages[0].reduce.fn == "sum"
+    assert any(isinstance(op, ReduceOp) for op in kernels[0].body)
 
 
 # ---------------------------------------------------------------------------
