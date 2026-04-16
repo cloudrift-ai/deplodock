@@ -58,19 +58,17 @@ at a coord `Expr`, appending temporaries to a `list[Stmt]`.
 | `Mux`       | Nested `Ternary` chain over `branch.select`                 |
 | `Combine`   | Temporaries for each source + `VarDecl` fold over ops chain |
 
-**Body emitters**: three paths selected by `_detect_contraction` and
-the presence of `ReduceOp` Assigns:
+**Body emitter**: unified `_emit_body` dispatches based solely on the
+presence of `ReduceOp` in the SSA body:
 
-| Pattern                    | Emitter                  | Emission                                                      |
-| -------------------------- | ------------------------ | ------------------------------------------------------------- |
-| Contraction (mul+reduce)   | `_emit_contraction_body` | 2D grid (N, M, batch); serial K-loop; post-contraction SSA    |
-| Reduce (no contraction)    | `_emit_reduce_body`      | 1 block/row; segment-based K-loops with recomputation         |
-| Pointwise (no ReduceOp)    | `_emit_pointwise_body`   | 1D grid; inline elementwise per Assign                        |
+| Pattern                    | Emitter          | Emission                                                      |
+| -------------------------- | ---------------- | ------------------------------------------------------------- |
+| No ReduceOp (pointwise)    | `_emit_flat`     | 1D grid; 256 threads/block; inline elementwise per Assign     |
+| ReduceOp present           | `_emit_segments` | 1 block/row; segment-based K-loops with recomputation         |
 
-**Contraction detection** (`_detect_contraction`): pattern-matches the
-SSA body for a binary `ElementwiseOp` whose both args are input Port
-names, followed by a `ReduceOp` consuming it. Returns the index and
-the two Assigns, or `None`.
+Contractions (matmul = mul + sum) go through `_emit_segments` naturally:
+the `mul` is an elementwise Assign inside the K-loop, and the `sum` is
+the segment's ReduceOp accumulator. No special detection or classification.
 
 ## Naive Schedule Policy
 
@@ -80,17 +78,16 @@ follow-up commits.
 
 - **Pointwise** (no `ReduceOp` in body):
   1D grid, `block = (256, 1, 1)`, one thread per flat output coord.
-- **Reduce chain** (`ReduceOp` in body, no contraction):
-  1D grid over the outer rows (input shape minus last axis); `block = (1, 1, 1)`.
-  The body is split into segments at ReduceOp boundaries. Each segment with
-  per-element references emits its own K-loop. Per-element values from prior
-  segments are recomputed inside the current loop (transitive dependency
-  analysis). Supports cross-iteration-space patterns like softmax
-  (reduce_max -> elementwise -> reduce_sum -> elementwise). Max reduction
-  uses `fmaxf(acc, val)` instead of `AugAssign`.
-- **Contraction** (detected mul+reduce pattern):
-  2D grid `(N, M, batch)`; `block = (1, 1, 1)`; each thread iterates K
-  serially.
+  Empty bodies (copy kernels) are a subcase.
+- **Reduce / contraction** (`ReduceOp` in body):
+  1D grid over the outer rows (broadcast shape minus reduce axis);
+  `block = (1, 1, 1)`. The body is split into segments at ReduceOp
+  boundaries. Each segment with per-element references emits its own
+  K-loop. Per-element values from prior segments are recomputed inside
+  the current loop (transitive dependency analysis). Supports
+  cross-iteration-space patterns like softmax (reduce_max -> elementwise
+  -> reduce_sum -> elementwise) and contractions (mul -> reduce_sum).
+  Max reduction uses `fmaxf(acc, val)` instead of `AugAssign`.
 
 ## Buffer Roles
 

@@ -117,7 +117,7 @@ def test_contraction_emits_matmul():
     )
     source = program.launches[0].kernel_source
     assert "for (int k" in source
-    assert "acc +=" in source
+    assert "acc0 +=" in source
 
 
 def test_buffer_roles():

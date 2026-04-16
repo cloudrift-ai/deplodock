@@ -23,7 +23,7 @@
 │      inputs (Port | Mux | Combine) →                             │
 │        body (tuple[Assign, ...])  — SSA: name = op(args) →       │
 │        outputs (Port | Mux)                                      │
-│  Contraction (matmul) is detected by pattern-matching the body.  │
+│  Contraction (matmul) is lowered as mul + reduce_sum Assigns.  │
 │                                                                  │
 │  RULE: Operates on Graph + KernelOp IR only. No backend imports. │
 ├──────────────────────────────────────────────────────────────────┤
@@ -133,10 +133,9 @@ Walks the SSA body — no classification pass, no `Schedule` dataclass, no `Loop
   - `Port` → `ArrayAccess(buffer, coord)`.
   - `Mux` → nested `Ternary` chain over branch `select` predicates.
   - `Combine` → emit each source to a temporary, then fold the `ops` chain.
-- `_detect_contraction(kernel)`: pattern-matches SSA body for a binary ElementwiseOp (both args are input Ports) followed by a ReduceOp consuming it.
-- `_emit_pointwise_body`: 1D grid over flat numel, 256 threads/block, 1 thread/coord. Walks body Assigns as inline expressions.
-- `_emit_reduce_body`: 1 block/row, segment-based codegen. Body is split into segments at ReduceOp boundaries. Each segment with per-element references gets its own K-loop; per-element values from prior segments are recomputed via transitive dependency analysis. Supports cross-iteration-space patterns (e.g. softmax: reduce_max → sub+exp → reduce_sum → div). Max reduction uses `fmaxf` instead of `AugAssign`.
-- `_emit_contraction_body`: 2D grid (N, M, batch), 1 thread/(m, n), serial K-loop. Post-contraction Assigns emitted as flat elementwise.
+- `_emit_body`: unified dispatcher, selects `_emit_flat` (no ReduceOp) or `_emit_segments` (ReduceOp present).
+- `_emit_flat`: 1D grid over flat numel, 256 threads/block, 1 thread/coord. Walks body Assigns as inline expressions. Handles copy kernels (empty body).
+- `_emit_segments`: 1 block/row, segment-based codegen. Body is split into segments at ReduceOp boundaries. Each segment with per-element references gets its own K-loop; per-element values from prior segments are recomputed via transitive dependency analysis. Supports cross-iteration-space patterns (e.g. softmax: reduce_max → sub+exp → reduce_sum → div) and contractions (mul → reduce_sum). Max reduction uses `fmaxf` instead of `AugAssign`.
 
 The naive schedule is correctness-first — no shared memory, no async copies, no TMA, no vectorization. Performance work lives in follow-up commits.
 
