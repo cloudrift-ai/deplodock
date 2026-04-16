@@ -18,13 +18,11 @@
 │  lower.py:   lower(graph: Graph) -> list[KernelOp]               │
 │  pipeline.py: public entry (compile_graph)                        │
 │                                                                  │
-│  Each KernelOp is one GPU kernel described as a tiled dataflow   │
-│  pipeline (see ops.py docstring for analogies):                  │
+│  Each KernelOp is one GPU kernel described as an SSA program:    │
 │      inputs (Port | Mux | Combine) →                             │
-│        [contraction (ContractionCore)] →                         │
-│        [reduce_stages (tuple[ReduceStage, ...])] →               │
-│        [epilogue (Node[ElementwiseOp], ...)] →                   │
+│        body (tuple[Assign, ...])  — SSA: name = op(args) →       │
 │        outputs (Port | Mux)                                      │
+│  Contraction (matmul) is detected by pattern-matching the body.  │
 │                                                                  │
 │  RULE: Operates on Graph + KernelOp IR only. No backend imports. │
 ├──────────────────────────────────────────────────────────────────┤
@@ -69,7 +67,8 @@ Program (Layer 3)
 
 ## Structural KernelOp Cheat Sheet
 
-Every slot has a single predefined op type; `__post_init__` enforces it.
+SSA invariants are enforced by `KernelOp.__post_init__`: unique names,
+defined-before-use, no forward references.
 
 | Slot                          | Type                                     | Used for                                                            |
 | ----------------------------- | ---------------------------------------- | ------------------------------------------------------------------- |
@@ -78,13 +77,13 @@ Every slot has a single predefined op type; `__post_init__` enforces it.
 | `Mux.branches[i].input`       | `KernelInput` (recursive)                | Dispatched read (cat, RoPE halves, KV cache)                        |
 | `Mux.branches[i].select`      | `Expr` (from `backend/ir/expr`)          | Output-coord predicate                                              |
 | `Combine.sources`             | `tuple[KernelInput, ...]`                | N sub-inputs to an elementwise chain                                |
-| `Combine.ops`                 | `tuple[Node[ElementwiseOp], ...]`        | Per-coord elementwise work                                          |
-| `ContractionCore.operand`     | `KernelInput`                            | The per-K value (for matmul: `Combine((a, b), ops=(mul,))`)         |
-| `ContractionCore.k_axis`      | `int`                                    | Reduction axis of the operand                                       |
-| `ContractionCore.reduce`      | `Node[ReduceOp]`                         | Contraction reduce (sum / max / prod)                               |
-| `ReduceStage.pre_ops`         | `tuple[Node[ElementwiseOp], ...]`        | Chain between reduces in a multi-reduce kernel                      |
-| `ReduceStage.reduce`          | `Node[ReduceOp]`                         | One reduce in the chain                                             |
-| `KernelOp.epilogue`           | `tuple[Node[ElementwiseOp], ...]`        | Post-body elementwise on the output coord space (bias, activation)  |
+| `Combine.ops`                 | `tuple[ElementwiseOp, ...]`              | Per-coord elementwise work                                          |
+| `Assign.name`                 | `str`                                    | SSA value name                                                      |
+| `Assign.op`                   | `ElementwiseOp \| ReduceOp`              | The operation to apply                                              |
+| `Assign.args`                 | `tuple[str, ...]`                        | References to input Port buffer_ids or prior Assign names           |
+| `KernelOp.inputs`             | `tuple[KernelInput, ...]`                | Port, Mux, or Combine input trees                                   |
+| `KernelOp.body`               | `tuple[Assign, ...]`                     | SSA body: name = op(args)                                           |
+| `KernelOp.outputs`            | `tuple[KernelOutput, ...]`               | Port or Mux output targets                                          |
 
 Analogies (use in module/class docstrings):
 
@@ -92,30 +91,28 @@ Analogies (use in module/class docstrings):
 - **Hardware multiplexer** (FPGA N-to-1 mux / 1-to-N demux) for `Mux`.
 - **Operad / expression tree** for `Combine`.
 - **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store) for `KernelOp`.
-- **Systolic core** for `ContractionCore`.
 
-## Lowering policy (lower.py)
+## Lowering policy (rules/fusion/assemble_kernels.py)
 
-Greedy walk over topo-sorted graph nodes:
+Grammar-based fusion via the rewriter:
 
-1. **Matmul pair** — `ReduceOp(sum)` whose sole input is a fan-out-1 `ElementwiseOp(mul)` collapses into a single `ContractionCore` `KernelOp`.
-2. **Everything else** — each compute node (ElementwiseOp / ReduceOp) becomes its own singleton `KernelOp`.
-3. `InputOp` / `ConstantOp` nodes emit no kernel — they survive as external `Port.buffer_id` leaves.
-
-Decomposition of `LinearOp` / `SdpaOp` / `MatmulOp` / `MeanOp` and layout-op (`TransposeOp`, `SliceOp`, `CatOp`, ...) handling are not yet in the lowering — they will be added incrementally as new patterns (and their tests) come online.
+1. **Contraction** (optional) — `ElementwiseOp(mul)` + `ReduceOp(sum)` pair becomes two Assigns in the kernel body.
+2. **Stage** (repeating) — `pre_ops* + reduce` groups become Assigns.
+3. **Epilogue** — trailing `ElementwiseOp` chain becomes Assigns.
+4. `InputOp` / `ConstantOp` nodes emit no kernel — they survive as external `Port.buffer_id` leaves.
 
 ## Codegen policy (backend/cuda/emit.py)
 
-Recursive descent over the `KernelOp` structure — no classification pass, no `Schedule` dataclass, no `LoopIR` intermediate. Per-variant walkers:
+Walks the SSA body — no classification pass, no `Schedule` dataclass, no `LoopIR` intermediate. Maintains a `values: dict[str, Expr]` mapping Assign names to C expressions.
 
 - `_emit_input_value(KernelInput, coord) -> Expr`:
   - `Port` → `ArrayAccess(buffer, coord)`.
   - `Mux` → nested `Ternary` chain over branch `select` predicates.
   - `Combine` → emit each source to a temporary, then fold the `ops` chain.
-- `_emit_pointwise_body`: 1D grid over flat numel, 256 threads/block, 1 thread/coord.
-- `_emit_reduce_body`: 1 block/row, serial K-loop, single-thread reduction.
-- `_emit_contraction_body`: 2D grid (N, M, 1), 1 thread/(m, n), serial K-loop.
-- `_apply_epilogue`: fold `KernelOp.epilogue` chain onto the body output.
+- `_detect_contraction(kernel)`: pattern-matches SSA body for a binary ElementwiseOp (both args are input Ports) followed by a ReduceOp consuming it.
+- `_emit_pointwise_body`: 1D grid over flat numel, 256 threads/block, 1 thread/coord. Walks body Assigns as inline expressions.
+- `_emit_reduce_body`: 1 block/row, serial K-loop per ReduceOp Assign, inline elementwise for ElementwiseOp Assigns.
+- `_emit_contraction_body`: 2D grid (N, M, batch), 1 thread/(m, n), serial K-loop. Post-contraction Assigns emitted as flat elementwise.
 
 The naive schedule is correctness-first — no shared memory, no async copies, no TMA, no vectorization. Performance work lives in follow-up commits.
 

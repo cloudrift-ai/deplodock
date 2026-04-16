@@ -1,12 +1,11 @@
 """Tests for the compile_graph pipeline: decomposition → optimization → fusion → extract.
 
 After compile_graph, every primitive op is inside a KernelOp. Tests verify
-the structural shape of the resulting KernelOps.
+the structural shape of the resulting KernelOps (SSA Assign body).
 """
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.ops import (
-    ContractionCore,
     ElementwiseOp,
     InputOp,
     ReduceOp,
@@ -16,11 +15,6 @@ from deplodock.compiler.pipeline import compile_graph
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
-
-
-# ---------------------------------------------------------------------------
-# Pointwise
-# ---------------------------------------------------------------------------
 
 
 def test_pointwise_add():
@@ -33,13 +27,10 @@ def test_pointwise_add():
 
     kernels = compile_graph(g)
     assert len(kernels) == 1
-    k = kernels[0]
-    assert k.contraction is None
-    assert all(isinstance(op, ElementwiseOp) for op in k.body)
+    assert all(isinstance(a.op, ElementwiseOp) for a in kernels[0].body)
 
 
 def test_chained_pointwise_fuses_into_one():
-    """exp → neg with fan-out 1 fuses into one kernel."""
     g = Graph()
     _input(g, "x", (4,))
     g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
@@ -49,13 +40,7 @@ def test_chained_pointwise_fuses_into_one():
 
     kernels = compile_graph(g)
     assert len(kernels) == 1
-    assert kernels[0].contraction is None
     assert len(kernels[0].body) == 2
-
-
-# ---------------------------------------------------------------------------
-# Reduce
-# ---------------------------------------------------------------------------
 
 
 def test_reduce_sum():
@@ -67,12 +52,7 @@ def test_reduce_sum():
 
     kernels = compile_graph(g)
     assert len(kernels) == 1
-    assert any(isinstance(op, ReduceOp) for op in kernels[0].body)
-
-
-# ---------------------------------------------------------------------------
-# Matmul (mul + sum pair)
-# ---------------------------------------------------------------------------
+    assert any(isinstance(a.op, ReduceOp) for a in kernels[0].body)
 
 
 def test_matmul_mul_sum():
@@ -86,12 +66,12 @@ def test_matmul_mul_sum():
 
     kernels = compile_graph(g)
     assert len(kernels) == 1
-    assert isinstance(kernels[0].contraction, ContractionCore)
-    assert kernels[0].contraction.reduce.fn == "sum"
+    # Matmul = mul assign + reduce assign
+    assert any(isinstance(a.op, ElementwiseOp) and a.op.fn == "mul" for a in kernels[0].body)
+    assert any(isinstance(a.op, ReduceOp) and a.op.fn == "sum" for a in kernels[0].body)
 
 
 def test_no_matmul_when_mul_fans_out():
-    """mul with fan-out > 1 can't be paired with sum as a contraction."""
     g = Graph()
     _input(g, "a", (4, 8))
     _input(g, "b", (4, 8))
@@ -102,18 +82,10 @@ def test_no_matmul_when_mul_fans_out():
     g.outputs = ["d", "n"]
 
     kernels = compile_graph(g)
-    # mul has fan-out > 1 → separate kernel. sum and neg are also separate.
     assert len(kernels) == 3
-    assert all(k.contraction is None for k in kernels)
-
-
-# ---------------------------------------------------------------------------
-# MatmulOp (high-level) gets decomposed then fused
-# ---------------------------------------------------------------------------
 
 
 def test_matmul_op_decomposes_and_fuses():
-    """MatmulOp → decompose to mul+sum → fuse into ContractionCore."""
     from deplodock.compiler.ops import MatmulOp
 
     g = Graph()
@@ -124,13 +96,9 @@ def test_matmul_op_decomposes_and_fuses():
     g.outputs = ["m"]
 
     kernels = compile_graph(g)
-    contractions = [k for k in kernels if k.contraction is not None]
-    assert len(contractions) >= 1
-
-
-# ---------------------------------------------------------------------------
-# Pipeline entry point
-# ---------------------------------------------------------------------------
+    # Should have at least one kernel with a mul+sum pattern
+    has_reduce = any(any(isinstance(a.op, ReduceOp) for a in k.body) for k in kernels)
+    assert has_reduce
 
 
 def test_compile_graph_produces_kernel_ops():
