@@ -2,6 +2,7 @@
 
 from deplodock.compiler.dump import CompilerDump
 from deplodock.compiler.ir import Graph, Node, Tensor
+from deplodock.compiler.matcher import Match, match_pattern
 from deplodock.compiler.ops import (
     ConstantOp,
     ElementwiseOp,
@@ -14,6 +15,8 @@ from deplodock.compiler.ops import (
     ScatterOp,
     TransposeOp,
 )
+from deplodock.compiler.pattern import PatternNode, PatternVar, PatternWildcard, parse_pattern
+from deplodock.compiler.rewriter import Pass, PassTrace, Rewriter, Rule, RuleApplication
 
 __all__ = [
     "CompilerDump",
@@ -22,12 +25,23 @@ __all__ = [
     "GatherOp",
     "Graph",
     "InputOp",
+    "Match",
     "Node",
     "Op",
+    "Pass",
+    "PassTrace",
+    "PatternNode",
+    "PatternVar",
+    "PatternWildcard",
     "ReduceOp",
     "ReshapeOp",
+    "Rewriter",
+    "Rule",
+    "RuleApplication",
     "ScanOp",
     "ScatterOp",
     "Tensor",
     "TransposeOp",
+    "match_pattern",
+    "parse_pattern",
 ]
