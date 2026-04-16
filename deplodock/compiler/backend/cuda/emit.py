@@ -5,22 +5,18 @@ Walks the structural IR (Port | Mux | Combine inputs, SSA body of
 ``KernelOp`` directly -- no classification pass, no Schedule, no
 LoopIR intermediate.
 
-Body emission uses a unified ``_emit_body`` dispatcher that selects
-one of two code-shapes based solely on the presence of ``ReduceOp``
-in the SSA body:
+Body emission dispatches to one of two code-shapes based solely on
+the presence of ``ReduceOp`` in the SSA body:
 
-- **Pointwise** (no ReduceOp in body): 1D grid over the flattened
-  output numel; one thread per output coord; block size fixed at 256.
-  Empty bodies (copy kernels) are a subcase.
-- **Reduce / contraction** (ReduceOp in body): 1D grid over the
-  post-reduce outer shape; one block per reduced row; one thread per
-  block.  The body is split into segments at ReduceOp boundaries.
-  Contractions (mul + sum) are just a segment with an elementwise
-  ``mul`` inside the K-loop and a ``sum`` accumulator.
+- ``_emit_flat``: 1D grid over flat output numel, 256 threads/block.
+  One thread per element; walks the SSA body as inline expressions.
+- ``_emit_segments``: 1D grid over post-reduce rows, one thread per
+  row.  The body is split into segments at ReduceOp boundaries; each
+  segment that touches per-element values gets its own K-loop.
+  Cross-boundary per-element dependencies are recomputed (not stored).
 
-All shapes are treated as flat buffers: each input tensor has a known
-shape (looked up from an externally-provided ``shapes`` dict keyed by
-``buffer_id``) and is indexed by a single linearized offset.
+All shapes are treated as flat buffers indexed by a single linearized
+offset.
 """
 
 from __future__ import annotations
@@ -44,7 +40,6 @@ from deplodock.compiler.backend.ir.kernel_ir import (
 )
 from deplodock.compiler.backend.program import Buffer, Program
 from deplodock.compiler.ops import (
-    Assign,
     Combine,
     ElementwiseOp,
     KernelInput,
@@ -85,13 +80,9 @@ def compile_kernels(
     # output Ports. Kernels are in topo order, so a prior kernel's output
     # shape is available for a later kernel's input.
     for k in kernels:
-        # Register input leaf Ports not yet in shapes (e.g., Ports with indexmap
-        # whose buffer_id is the original source, already in buf_shapes).
         for port in _leaf_ports(k):
             if port.buffer_id not in shapes:
                 if port.indexmap is not None:
-                    # The source shape isn't known — use indexmap.out_shape
-                    # as a size hint (conservative: at least this many elements).
                     shapes[port.buffer_id] = tuple(port.indexmap.out_shape)
         out_shape = k.infer_output_shape(shapes)
         for out in k.outputs:
@@ -115,7 +106,6 @@ def compile_kernels(
         for out in k.outputs:
             if isinstance(out, Port):
                 referenced.add(out.buffer_id)
-    # Also include graph-level constants that kernels read.
     referenced |= graph_constant_set & set(shapes.keys())
 
     buffers = [
@@ -167,12 +157,7 @@ def _emit_input_value(
     stmts: list[Stmt],
     name_seq: list[int],
 ) -> Expr:
-    """Emit code to evaluate ``inp`` at the linear output coord ``coord``.
-
-    Appends any required ``VarDecl``s to ``stmts`` (for Combine chains)
-    and returns an ``Expr`` that yields the value of ``inp`` at ``coord``.
-    ``name_seq`` is a mutable counter used to generate fresh temporaries.
-    """
+    """Emit code to evaluate ``inp`` at the linear output coord ``coord``."""
     if isinstance(inp, Port):
         if inp.indexmap is not None:
             src_shape = shapes.get(inp.buffer_id, ())
@@ -180,7 +165,6 @@ def _emit_input_value(
         return ArrayAccess(array=inp.buffer_id, index=coord)
 
     if isinstance(inp, Mux):
-        # Nested ternary: (cond0 ? branch0 : (cond1 ? branch1 : ...))
         result: Expr | None = None
         for branch in reversed(inp.branches):
             sub = _emit_input_value(branch.input, coord, shapes, stmts, name_seq)
@@ -189,7 +173,6 @@ def _emit_input_value(
         return result
 
     if isinstance(inp, Combine):
-        # Load each source into a temporary.
         source_vals: list[Expr] = []
         for src in inp.sources:
             expr = _emit_input_value(src, coord, shapes, stmts, name_seq)
@@ -197,9 +180,6 @@ def _emit_input_value(
             stmts.append(VarDecl(dtype="float", name=tname, init=expr))
             source_vals.append(Var(tname))
 
-        # Stack-machine: first op gets sources[0] (and sources[1] if
-        # binary); each subsequent op gets the prior result as arg[0]
-        # and the next unused source as arg[1].
         source_iter = iter(source_vals)
         value = next(source_iter)
         for op in inp.ops:
@@ -218,11 +198,7 @@ def _emit_input_value(
 
 
 def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[Stmt], name_seq: list[int]) -> Expr:
-    """Emit a load from ``port.buffer_id`` at the coord transformed by ``port.indexmap``.
-
-    ``src_shape`` is the actual shape of the source buffer, used for
-    computing flat input strides.
-    """
+    """Emit a load from ``port.buffer_id`` at the coord transformed by ``port.indexmap``."""
     from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute
 
     indexmap = port.indexmap
@@ -231,8 +207,6 @@ def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[S
     out_shape = indexmap.out_shape
     ndim = len(out_shape)
 
-    # Scan coord_map for the max placeholder index (composed IndexMaps may
-    # reference higher dims than out_shape has).
     max_placeholder = ndim - 1
     for cm in src.coord_map:
         for var_name in _collect_var_names(cm):
@@ -240,7 +214,6 @@ def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[S
                 idx = int(var_name[len(PLACEHOLDER_PREFIX) :])
                 max_placeholder = max(max_placeholder, idx)
 
-    # Decompose flat coord into per-axis coords for all needed placeholder dims.
     mapping: dict[str, Expr] = {}
     remainder = coord
     effective_ndim = max_placeholder + 1
@@ -254,10 +227,8 @@ def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[S
             mapping[axis_var] = BinOp("%", remainder, Literal(dim_size, "int"))
             remainder = BinOp("/", remainder, Literal(dim_size, "int"))
 
-    # Apply coord_map substitution to get input coords.
     input_coords = [substitute(cm, mapping) for cm in src.coord_map]
 
-    # Flatten input coords using the SOURCE buffer's strides (not the IndexMap output shape).
     flat_idx: Expr = Literal(0, "int")
     stride = 1
     for d in range(len(input_coords) - 1, -1, -1):
@@ -273,275 +244,139 @@ def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[S
 
 
 # ---------------------------------------------------------------------------
-# Unified body emitter: walks the SSA Assign sequence
+# Body dispatch
 # ---------------------------------------------------------------------------
 
 
 def _emit_body(kernel: KernelOp, out_shape: tuple, shapes: dict[str, tuple]) -> tuple[list[Stmt], tuple[int, int, int]]:
-    """Unified body emitter — one code path for all kernel shapes.
+    """Analyze kernel into a plan, then emit statements from it."""
+    from deplodock.compiler.backend.kernel_plan import analyze_kernel
 
-    ``idx = blockIdx.x * blockDim.x + threadIdx.x`` indexes into the
-    output space. For pointwise kernels, ``idx`` indexes elements directly.
-    For kernels with ReduceOps, ``idx`` indexes outer (post-reduce) rows;
-    the ReduceOps emit K-loops internally.
-
-    The body is split into "segments" at ReduceOp boundaries. Each segment
-    that references per-element values (input Ports or pre-reduce Assigns)
-    emits a K-loop. Pure post-reduce segments emit inline. Trailing
-    per-element segments store inside their K-loop.
-    """
-    has_reduce = any(isinstance(a.op, ReduceOp) for a in kernel.body)
-
-    # Compute output numel (elements for pointwise, rows for reduce).
-    if has_reduce:
-        n_output = _reduce_n_rows(kernel, shapes)
-    else:
-        n_output = _numel(out_shape)
-
+    plan = analyze_kernel(kernel, shapes, out_shape)
     idx = Var("idx")
-    stmts: list[Stmt] = [
-        VarDecl(
-            dtype="int",
-            name="idx",
-            init=BinOp("+", BinOp("*", Var("blockIdx.x"), Var("blockDim.x")), Var("threadIdx.x")),
-        ),
-    ]
-    guarded: list[Stmt] = []
+    idx_init = VarDecl(
+        dtype="int",
+        name="idx",
+        init=BinOp("+", BinOp("*", Var("blockIdx.x"), Var("blockDim.x")), Var("threadIdx.x")),
+    )
+    guarded = _emit_plan(plan, kernel, shapes, idx)
+    stmts: list[Stmt] = [idx_init, IfStmt(cond=BinOp("<", idx, Literal(plan.n_output, "int")), body=guarded)]
+    return stmts, (_BLOCK, 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Plan-based emitter: reduce / contraction kernels
+# ---------------------------------------------------------------------------
+
+
+def _emit_plan(plan, kernel: KernelOp, shapes: dict[str, tuple], idx: Expr) -> list[Stmt]:
+    """Walk a KernelPlan and emit statements. No analysis — just code generation."""
+    from deplodock.compiler.backend.kernel_plan import Inline, Loop
+
+    stmts: list[Stmt] = []
     name_seq = [0]
-
-    input_port_names: set[str] = {p.buffer_id for p in kernel.inputs if isinstance(p, Port)}
-    input_ports: dict[str, Port] = {p.buffer_id: p for p in kernel.inputs if isinstance(p, Port)}
     values: dict[str, Expr] = {}
-    per_row_values: set[str] = set()
 
-    if not has_reduce:
-        # Pointwise / copy: load all inputs at idx, walk body inline, store.
-        for port_name, port in input_ports.items():
-            values[port_name] = _emit_input_value(port, idx, shapes, guarded, name_seq)
+    input_ports = {p.buffer_id: p for p in kernel.inputs if isinstance(p, Port)}
 
-        for assign in kernel.body:
-            arg_exprs = [values[a] for a in assign.args]
-            value = _apply_elementwise(assign.op.fn, arg_exprs)
-            tname = _fresh(name_seq)
-            guarded.append(VarDecl(dtype="float", name=tname, init=value))
-            values[assign.name] = Var(tname)
+    # Load per-row ports upfront (outside all loops).
+    for name, port in input_ports.items():
+        if name not in plan.per_elem_ports:
+            values[name] = _emit_input_value(port, idx, shapes, stmts, name_seq)
 
+    loop_count = 0
+    for step in plan.steps:
+        if isinstance(step, Inline):
+            for assign in step.body:
+                arg_exprs = [values[a] for a in assign.args]
+                value = _apply_elementwise(assign.op.fn, arg_exprs)
+                tname = _fresh(name_seq)
+                stmts.append(VarDecl(dtype="float", name=tname, init=value))
+                values[assign.name] = Var(tname)
+
+        elif isinstance(step, Loop):
+            k_var_name = f"k{loop_count}"
+            k_var = Var(k_var_name)
+
+            # Declare accumulator outside loop.
+            if step.accum:
+                stmts.append(VarDecl(dtype="float", name=step.accum.var, init=Literal(step.accum.identity, "float")))
+
+            inner: list[Stmt] = []
+            loop_values: dict[str, Expr] = dict(values)
+
+            # Load per-element ports at broadcast coords inside the loop.
+            bcast = _decompose_broadcast_coords(idx, k_var, step.iter_shape, step.reduce_axis)
+            for name, port in input_ports.items():
+                if name in plan.per_elem_ports:
+                    ps = _port_shape(port, shapes)
+                    pidx = _flatten_coords_for_port(bcast, step.iter_shape, ps)
+                    loop_values[name] = _emit_input_value(port, pidx, shapes, inner, name_seq)
+
+            # Recompute prior element-space deps.
+            for assign in step.recompute:
+                arg_exprs = [loop_values[a] for a in assign.args]
+                value = _apply_elementwise(assign.op.fn, arg_exprs)
+                tname = _fresh(name_seq)
+                inner.append(VarDecl(dtype="float", name=tname, init=value))
+                loop_values[assign.name] = Var(tname)
+
+            # This segment's elementwise body.
+            for assign in step.body:
+                arg_exprs = [loop_values[a] for a in assign.args]
+                value = _apply_elementwise(assign.op.fn, arg_exprs)
+                tname = _fresh(name_seq)
+                inner.append(VarDecl(dtype="float", name=tname, init=value))
+                loop_values[assign.name] = Var(tname)
+
+            # Accumulate or store.
+            if step.accum:
+                src = loop_values[step.accum.src]
+                inner.append(_emit_reduce_accum(step.accum.var, step.accum.fn, src))
+                values[step.accum.result] = Var(step.accum.var)
+
+            if step.stores_output:
+                out_port = kernel.outputs[0]
+                assert isinstance(out_port, Port)
+                store_idx = _broadcast_load_idx(idx, k_var, step.iter_shape, step.reduce_axis)
+                last = step.body[-1]
+                inner.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=store_idx), value=loop_values[last.name]))
+
+            stmts.append(ForLoop(var=k_var_name, start=Literal(0, "int"), end=Literal(step.k_size, "int"), body=inner))
+            loop_count += 1
+
+    # Store final value after all loops / inline steps.
+    if plan.stores_final:
         out_port = kernel.outputs[0]
         assert isinstance(out_port, Port)
         if kernel.body:
             out_val = values[kernel.body[-1].name]
         else:
+            # Copy kernel (empty body): forward the first input port.
             first_port = next((p for p in kernel.inputs if isinstance(p, Port)), None)
             out_val = values[first_port.buffer_id] if first_port else Literal(0.0, "float")
-        guarded.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=idx), value=out_val))
+        stmts.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=idx), value=out_val))
 
-    else:
-        # Segment-based: split body at ReduceOps, emit K-loops as needed.
-        ssa_shapes = kernel.infer_shapes(shapes)
-        first_reduce = next(a for a in kernel.body if isinstance(a.op, ReduceOp))
-        pre_reduce_shape = tuple(int(d) for d in ssa_shapes.get(first_reduce.args[0], ()))
-        reduce_axis = first_reduce.op.axis % len(pre_reduce_shape) if pre_reduce_shape else 0
-        k_size = int(pre_reduce_shape[reduce_axis]) if pre_reduce_shape else 1
-
-        reduce_count = 0
-
-        # Distinguish per-element input Ports from scalar/per-row ones.
-        # A Port is "per-element" if its numel exceeds the output row count.
-        n_rows = _reduce_n_rows(kernel, shapes)
-        per_element_ports: set[str] = set()
-        for pname, port in input_ports.items():
-            port_shape = shapes.get(pname, ())
-            if port.indexmap is not None:
-                port_shape = port.indexmap.out_shape
-            if _numel(port_shape) > n_rows:
-                per_element_ports.add(pname)
-
-        # Pre-load scalar/per-row Ports at `idx` outside any K-loop.
-        for port_name, port in input_ports.items():
-            if port_name not in per_element_ports:
-                values[port_name] = _emit_input_value(port, idx, shapes, guarded, name_seq)
-                per_row_values.add(port_name)
-
-        segments: list[list[Assign]] = []
-        current_seg: list[Assign] = []
-        for assign in kernel.body:
-            current_seg.append(assign)
-            if isinstance(assign.op, ReduceOp):
-                segments.append(current_seg)
-                current_seg = []
-        if current_seg:
-            segments.append(current_seg)
-
-        for segment in segments:
-            last = segment[-1]
-            seg_has_reduce = isinstance(last.op, ReduceOp)
-            ew_assigns = segment[:-1] if seg_has_reduce else segment
-            reduce_assign = last if seg_has_reduce else None
-
-            # Names defined within this segment are local — don't trigger K-loop.
-            seg_local = {a.name for a in ew_assigns}
-
-            needs_k_loop = False
-            for assign in ew_assigns:
-                for a in assign.args:
-                    if a in seg_local or a in per_row_values or (a in input_port_names and a not in per_element_ports):
-                        continue
-                    needs_k_loop = True
-                    break
-                if needs_k_loop:
-                    break
-            if seg_has_reduce:
-                assert reduce_assign is not None
-                for a in reduce_assign.args:
-                    if a in seg_local or a in per_row_values or (a in input_port_names and a not in per_element_ports):
-                        continue
-                    needs_k_loop = True
-
-            if not needs_k_loop and not seg_has_reduce:
-                for assign in ew_assigns:
-                    arg_exprs = [values[a] for a in assign.args]
-                    value = _apply_elementwise(assign.op.fn, arg_exprs)
-                    tname = _fresh(name_seq)
-                    guarded.append(VarDecl(dtype="float", name=tname, init=value))
-                    values[assign.name] = Var(tname)
-                    per_row_values.add(assign.name)
-            else:
-                k_var_name = f"k{reduce_count}"
-                k_var = Var(k_var_name)
-
-                if seg_has_reduce:
-                    assert reduce_assign is not None
-                    fn = reduce_assign.op.fn
-                    acc_name = f"acc{reduce_count}"
-                    guarded.append(VarDecl(dtype="float", name=acc_name, init=Literal(_identity(fn), "float")))
-
-                inner_stmts: list[Stmt] = []
-                loop_values: dict[str, Expr] = dict(values)
-
-                # Load scalar/per-row Ports outside the K-loop at `idx`.
-                for port_name, port in input_ports.items():
-                    if port_name not in per_element_ports and port_name not in loop_values:
-                        loop_values[port_name] = _emit_input_value(port, idx, shapes, guarded, name_seq)
-
-                # Load per-element Ports inside the K-loop at broadcast coords,
-                # but compute a per-port flat index that accounts for broadcast dims.
-                bcast_coords = _decompose_broadcast_coords(idx, k_var, pre_reduce_shape, reduce_axis)
-                for port_name, port in input_ports.items():
-                    if port_name in per_element_ports:
-                        ps = _port_shape(port, shapes)
-                        port_idx = _flatten_coords_for_port(bcast_coords, pre_reduce_shape, ps)
-                        loop_values[port_name] = _emit_input_value(port, port_idx, shapes, inner_stmts, name_seq)
-
-                prior_assigns: list[Assign] = []
-                for seg in segments:
-                    if seg is segment:
-                        break
-                    for a in seg:
-                        if not isinstance(a.op, ReduceOp):
-                            prior_assigns.append(a)
-
-                needed_names = _transitive_deps(segment, prior_assigns, per_row_values)
-
-                for prior in prior_assigns:
-                    if prior.name in per_row_values or prior.name not in needed_names:
-                        continue
-                    arg_exprs = [loop_values[a] for a in prior.args]
-                    value = _apply_elementwise(prior.op.fn, arg_exprs)
-                    tname = _fresh(name_seq)
-                    inner_stmts.append(VarDecl(dtype="float", name=tname, init=value))
-                    loop_values[prior.name] = Var(tname)
-
-                for assign in ew_assigns:
-                    arg_exprs = [loop_values[a] for a in assign.args]
-                    value = _apply_elementwise(assign.op.fn, arg_exprs)
-                    tname = _fresh(name_seq)
-                    inner_stmts.append(VarDecl(dtype="float", name=tname, init=value))
-                    loop_values[assign.name] = Var(tname)
-
-                if seg_has_reduce:
-                    assert reduce_assign is not None
-                    reduce_src = loop_values[reduce_assign.args[0]]
-                    inner_stmts.append(_emit_reduce_accum(acc_name, reduce_assign.op.fn, reduce_src))
-                    values[reduce_assign.name] = Var(acc_name)
-                    per_row_values.add(reduce_assign.name)
-                else:
-                    last_ew = ew_assigns[-1]
-                    out_port = kernel.outputs[0]
-                    assert isinstance(out_port, Port)
-                    store_idx = _broadcast_load_idx(idx, k_var, pre_reduce_shape, reduce_axis)
-                    inner_stmts.append(
-                        IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=store_idx), value=loop_values[last_ew.name])
-                    )
-
-                guarded.append(ForLoop(var=k_var_name, start=Literal(0, "int"), end=Literal(k_size, "int"), body=inner_stmts))
-                reduce_count += 1
-
-        # Store final value if it's a per-row scalar (not already stored in a K-loop).
-        last_assign = kernel.body[-1] if kernel.body else None
-        if last_assign is not None and last_assign.name in per_row_values:
-            out_port = kernel.outputs[0]
-            assert isinstance(out_port, Port)
-            guarded.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=idx), value=values[last_assign.name]))
-
-    stmts.append(IfStmt(cond=BinOp("<", idx, Literal(n_output, "int")), body=guarded))
-    return stmts, (_BLOCK, 1, 1)
-
-
-def _transitive_deps(
-    segment: list[Assign],
-    prior_assigns: list[Assign],
-    per_row_values: set[str],
-) -> set[str]:
-    """Compute the transitive closure of prior per-element values needed by segment.
-
-    Walks backwards: starts with direct args of the segment's assigns, then
-    expands to include any prior assign whose name is in the needed set.
-    Per-row (post-reduce) values are excluded since they don't need recomputation.
-    """
-    needed: set[str] = set()
-    for assign in segment:
-        needed.update(assign.args)
-
-    # Build a lookup from prior assign names to their args.
-    prior_args: dict[str, tuple[str, ...]] = {a.name: a.args for a in prior_assigns}
-
-    # Expand transitively.
-    changed = True
-    while changed:
-        changed = False
-        for name, args in prior_args.items():
-            if name in needed and name not in per_row_values:
-                for arg in args:
-                    if arg not in needed and arg not in per_row_values:
-                        needed.add(arg)
-                        changed = True
-
-    return needed
+    return stmts
 
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
-    """Emit the accumulator update for a reduce op.
-
-    For sum/prod, uses AugAssign (``acc += val``).
-    For max, uses VarAssign with fmaxf (``acc = fmaxf(acc, val)``).
-    """
+    """Emit accumulator update: ``acc += val`` or ``acc = fmaxf(acc, val)``."""
     if fn == "max":
         from deplodock.compiler.backend.ir.kernel_ir import VarAssign
 
-        return VarAssign(
-            name=acc_name,
-            value=FuncCall("fmaxf", [Var(acc_name), value]),
-        )
-    return AugAssign(target=acc_name, op=_reduce_op(fn), value=value)
+        return VarAssign(name=acc_name, value=FuncCall("fmaxf", [Var(acc_name), value]))
+    op = {"sum": "+=", "prod": "*="}.get(fn, "+=")
+    return AugAssign(target=acc_name, op=op, value=value)
+
+
+# ---------------------------------------------------------------------------
+# Coordinate helpers
+# ---------------------------------------------------------------------------
 
 
 def _decompose_broadcast_coords(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis: int) -> list[Expr]:
-    """Decompose ``(row, k)`` into per-dimension broadcast coordinates.
-
-    Returns a list of ``Expr`` with one entry per dimension of
-    ``broadcast_shape``.  ``row`` indexes the outer shape (broadcast_shape
-    minus the reduce axis); ``k`` is the reduce-dimension loop variable.
-    """
+    """Decompose ``(row, k)`` into per-dimension broadcast coordinates."""
     ndim = len(broadcast_shape)
     if ndim <= 1:
         return [k]
@@ -566,15 +401,9 @@ def _decompose_broadcast_coords(row: Expr, k: Expr, broadcast_shape: tuple, redu
 
 
 def _flatten_coords_for_port(broadcast_coords: list[Expr], broadcast_shape: tuple, port_shape: tuple) -> Expr:
-    """Flatten broadcast coords into a flat index for a specific port.
-
-    Dims where ``port_shape[d] == 1`` and ``broadcast_shape[d] > 1``
-    are clamped to 0 (broadcast).  The result is a flat index into the
-    port's own shape.
-    """
+    """Flatten broadcast coords into a flat index, clamping broadcast dims to 0."""
     ndim = len(broadcast_shape)
     port_ndim = len(port_shape)
-
     if port_ndim == 0:
         return Literal(0, "int")
 
@@ -591,29 +420,24 @@ def _flatten_coords_for_port(broadcast_coords: list[Expr], broadcast_shape: tupl
         term = coord if stride == 1 else BinOp("*", coord, Literal(stride, "int"))
         flat = term if (isinstance(flat, Literal) and flat.value == 0) else BinOp("+", term, flat)
         stride *= p_dim
-
     return flat
 
 
 def _broadcast_load_idx(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis: int) -> Expr:
-    """Compute a flat coord into ``broadcast_shape`` from ``row`` and ``k``.
-
-    Used for stores where the output shape matches the broadcast shape.
-    """
+    """Flat coord into ``broadcast_shape`` from ``row`` and ``k``."""
     coords = _decompose_broadcast_coords(row, k, broadcast_shape, reduce_axis)
     return _flatten_coords_for_port(coords, broadcast_shape, broadcast_shape)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Elementwise / reduce helpers
 # ---------------------------------------------------------------------------
-
 
 _SUPPORTED_UNARY = {
     "exp": "expf",
-    "neg": None,  # -x via unary minus below
+    "neg": None,
     "rsqrt": "rsqrtf",
-    "recip": None,  # 1 / x
+    "recip": None,
     "relu": None,
     "tanh": "tanhf",
     "sigmoid": None,
@@ -640,7 +464,6 @@ def _apply_elementwise(fn: str, inputs: list[Expr]) -> Expr:
         return FuncCall("fmaxf", [Literal(0.0, "float"), inputs[0]])
     if fn == "sigmoid":
         assert len(inputs) == 1
-        # 1 / (1 + expf(-x))
         neg_x = BinOp("-", Literal(0.0, "float"), inputs[0])
         exp_neg = FuncCall("expf", [neg_x])
         return BinOp("/", Literal(1.0, "float"), BinOp("+", Literal(1.0, "float"), exp_neg))
@@ -651,12 +474,9 @@ def _apply_elementwise(fn: str, inputs: list[Expr]) -> Expr:
     raise NotImplementedError(f"elementwise fn={fn} not yet supported by emit")
 
 
-def _identity(reduce_fn: str) -> float:
-    return {"sum": 0.0, "max": -1e30, "prod": 1.0}.get(reduce_fn, 0.0)
-
-
-def _reduce_op(reduce_fn: str) -> str:
-    return {"sum": "+=", "prod": "*="}.get(reduce_fn, "+=")
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
 
 
 def _numel(shape: tuple) -> int:
@@ -675,17 +495,6 @@ def _port_shape(inp, shapes: dict) -> tuple:
         if inp.branches:
             return _port_shape(inp.branches[0].input, shapes)
     return ()
-
-
-def _leaf_ports_from(inp):
-    if isinstance(inp, Port):
-        yield inp
-    elif isinstance(inp, Mux):
-        for b in inp.branches:
-            yield from _leaf_ports_from(b.input)
-    elif isinstance(inp, Combine):
-        for s in inp.sources:
-            yield from _leaf_ports_from(s)
 
 
 def _leaf_ports(kernel: KernelOp) -> list[Port]:
@@ -708,21 +517,15 @@ def _leaf_ports(kernel: KernelOp) -> list[Port]:
 
 
 def _build_params(kernel: KernelOp) -> tuple[list[KernelParam], list[str]]:
-    """Determine kernel params + launch arg order.
-
-    Order: all external input Port buffers (deduped), then output Port
-    buffers. Launch args list the same names as string buffer ids.
-    """
+    """Determine kernel params + launch arg order."""
     seen: list[str] = []
-    inputs_refs = _leaf_ports(kernel)
-    for p in inputs_refs:
+    for p in _leaf_ports(kernel):
         if p.buffer_id not in seen and p.buffer_id not in {o.buffer_id for o in kernel.outputs if isinstance(o, Port)}:
             seen.append(p.buffer_id)
     output_ids = [o.buffer_id for o in kernel.outputs if isinstance(o, Port)]
     params = [KernelParam(dtype="const float*", name=bid) for bid in seen]
     params += [KernelParam(dtype="float*", name=bid) for bid in output_ids]
-    args = seen + output_ids
-    return params, args
+    return params, seen + output_ids
 
 
 def _kernel_name(kernel: KernelOp, idx: int, shapes: dict[str, tuple]) -> str:
@@ -732,11 +535,6 @@ def _kernel_name(kernel: KernelOp, idx: int, shapes: dict[str, tuple]) -> str:
 
 
 def _launch_config(kernel: KernelOp, shapes: dict[str, tuple]) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """1D grid, 256 threads/block for all kernel shapes.
-
-    For reduce kernels, the output count is the number of outer rows.
-    For pointwise, it's the total output numel.
-    """
     has_reduce = any(isinstance(a.op, ReduceOp) for a in kernel.body)
     if has_reduce:
         n_output = _reduce_n_rows(kernel, shapes)
@@ -747,13 +545,6 @@ def _launch_config(kernel: KernelOp, shapes: dict[str, tuple]) -> tuple[tuple[in
 
 
 def _reduce_n_rows(kernel: KernelOp, shapes: dict[str, tuple]) -> int:
-    """Number of outer rows for a reduce kernel's grid.
-
-    Derives the broadcast shape from SSA shape inference and returns the
-    product of all dimensions except the reduce axis.  This correctly
-    handles contractions where the broadcast shape has more dimensions
-    than any single input Port.
-    """
     ssa_shapes = kernel.infer_shapes(shapes)
     for assign in kernel.body:
         if isinstance(assign.op, ReduceOp):
@@ -762,7 +553,6 @@ def _reduce_n_rows(kernel: KernelOp, shapes: dict[str, tuple]) -> int:
             outer = list(pre_shape)
             del outer[reduce_axis]
             return _numel(tuple(outer)) if outer else 1
-    # Fallback: use output shape.
     return _numel(kernel.infer_output_shape(shapes))
 
 
@@ -773,7 +563,6 @@ def _emit_kernel_source(kernel_def: KernelDef) -> str:
 
 
 def _collect_var_names(expr) -> list[str]:
-    """Recursively collect all Var names from an expression tree."""
     if isinstance(expr, Var):
         return [expr.name]
     names: list[str] = []
