@@ -1,17 +1,20 @@
-"""Compiler pipeline entry points."""
+"""Compiler pipeline entry points.
+
+Maps a traced ``Graph`` to a list of ``KernelOp`` ready for backend codegen.
+The implementation lives in ``deplodock.compiler.lower`` (added in a
+follow-up commit); this module is the stable public entry point.
+"""
 
 from __future__ import annotations
 
 from deplodock.compiler.ir import Graph
-from deplodock.compiler.rewriter import PassTrace, Rewriter
 
 
-def compile_graph(graph: Graph, rewriter: Rewriter) -> tuple[Graph, list[PassTrace]]:
-    """Run rewrite passes only, return optimized graph + traces.
+def compile_graph(graph: Graph) -> list:
+    """Lower a traced ``Graph`` to a list of ``KernelOp``.
 
-    This is the primary entry point for graph-level compilation.
-    The result can be passed to plan_graph() → Backend for execution.
+    Returns the per-kernel structural IR consumed by backends. Each
+    ``KernelOp`` carries its own input-assembly tree, optional contraction,
+    optional reduce-stage chain, and optional epilogue.
     """
-    pass_traces: list[PassTrace] = []
-    graph = rewriter.apply(graph, pass_traces=pass_traces)
-    return graph, pass_traces
+    raise NotImplementedError("compile_graph: structural lowering lands in feature/structural-compiler c3")

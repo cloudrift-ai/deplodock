@@ -1,8 +1,8 @@
-"""Backend abstraction for compiling and running execution plans.
+"""Backend abstraction for compiling and running structural KernelOps.
 
-A Backend converts a backend-agnostic ExecutionPlan into a runnable
-artifact and executes it.  Each backend (CUDA, ROCm, ...) implements
-this interface.
+A Backend converts a list of ``KernelOp`` (the structural compiler IR)
+into a runnable artifact and executes it. Each backend (CUDA, ROCm, ...)
+implements this interface.
 """
 
 from __future__ import annotations
@@ -10,8 +10,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
-
-from deplodock.compiler.plan import ExecutionPlan
 
 
 @dataclass
@@ -33,11 +31,11 @@ class BenchmarkResult:
 
 
 class Backend(ABC):
-    """Abstract backend for executing an ExecutionPlan."""
+    """Abstract backend for compiling + executing a list of KernelOps."""
 
     @abstractmethod
-    def compile(self, plan: ExecutionPlan) -> Any:
-        """Convert a backend-agnostic plan to a backend-specific program."""
+    def compile(self, kernels: list) -> Any:
+        """Lower structural KernelOps to a backend-specific Program."""
 
     @abstractmethod
     def run(self, program: Any) -> ProgramResult:
