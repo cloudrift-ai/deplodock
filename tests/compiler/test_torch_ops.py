@@ -381,6 +381,27 @@ def test_sdpa():
     _check_cuda(g, {"q": q_np, "k": k_np, "v": v_np}, expected, rtol=5e-5, atol=2e-6)
 
 
+def test_sdpa_gqa():
+    """GQA: Q has more heads than K/V (28 Q heads, 4 KV heads)."""
+    B, Hq, Hkv, S, D = 1, 28, 4, 8, 16
+    q_np = rng.standard_normal((B, Hq, S, D)).astype(np.float32)
+    k_np = rng.standard_normal((B, Hkv, S, D)).astype(np.float32)
+    v_np = rng.standard_normal((B, Hkv, S, D)).astype(np.float32)
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("q", (B, Hq, S, D)), node_id="q")
+    g.add_node(InputOp(), [], Tensor("k", (B, Hkv, S, D)), node_id="k")
+    g.add_node(InputOp(), [], Tensor("v", (B, Hkv, S, D)), node_id="v")
+    g.add_node(SdpaOp(), ["q", "k", "v"], Tensor("out", (B, Hq, S, D)), node_id="out")
+    g.inputs, g.outputs = ["q", "k", "v"], ["out"]
+    # Reference: expand K/V heads to match Q, then standard SDPA.
+    group = Hq // Hkv
+    k_exp = torch.from_numpy(k_np).repeat_interleave(group, dim=1)
+    v_exp = torch.from_numpy(v_np).repeat_interleave(group, dim=1)
+    expected = _torch_to_np(torch.nn.functional.scaled_dot_product_attention(torch.from_numpy(q_np), k_exp, v_exp))
+    np.testing.assert_allclose(_run(g, {"q": q_np, "k": k_np, "v": v_np}), expected, rtol=1e-4, atol=1e-5)
+    _check_cuda(g, {"q": q_np, "k": k_np, "v": v_np}, expected, rtol=5e-3, atol=1e-4)
+
+
 # ---------------------------------------------------------------------------
 # Compound graphs
 # ---------------------------------------------------------------------------

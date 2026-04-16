@@ -46,13 +46,13 @@ def test_elementwise_infer():
     assert op.infer_output_shape([(1, 28, 8, 128), (1, 1, 8, 128)]) == (1, 28, 8, 128)
 
 
-def test_reduce_drops_axis():
-    assert ReduceOp("sum", axis=-1).infer_output_shape([(1, 8, 128)]) == (1, 8)
-    assert ReduceOp("max", axis=1).infer_output_shape([(4, 8, 128)]) == (4, 128)
+def test_reduce_keepdim():
+    assert ReduceOp("sum", axis=-1).infer_output_shape([(1, 8, 128)]) == (1, 8, 1)
+    assert ReduceOp("max", axis=1).infer_output_shape([(4, 8, 128)]) == (4, 1, 128)
 
 
-def test_mean_drops_axis():
-    assert MeanOp(axis=-1).infer_output_shape([(1, 8, 3584)]) == (1, 8)
+def test_mean_keepdim():
+    assert MeanOp(axis=-1).infer_output_shape([(1, 8, 3584)]) == (1, 8, 1)
 
 
 def test_transpose_swap():

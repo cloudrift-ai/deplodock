@@ -108,13 +108,18 @@ _DEFAULT_OP_INFO = OpInfo(1)
 
 
 def _drop_axis(shape: tuple, axis: int | str) -> tuple:
-    """Return shape with the given axis removed (handles negative axes)."""
+    """Return shape with the given axis set to 1 (keepdim=True semantics).
+
+    Keeping the reduced dim as size-1 ensures that post-reduce values
+    broadcast correctly with pre-reduce values (e.g. RMSNorm's
+    ``mul(X:(M,K), rsqrt:(M,1))`` broadcasts to ``(M,K)``).
+    """
     if not isinstance(axis, int):
         return tuple(shape)
     a = axis if axis >= 0 else len(shape) + axis
     if a < 0 or a >= len(shape):
         return tuple(shape)
-    return tuple(shape[:a]) + tuple(shape[a + 1 :])
+    return tuple(shape[:a]) + (1,) + tuple(shape[a + 1 :])
 
 
 @dataclass
@@ -470,6 +475,16 @@ class SdpaOp(Op):
         import numpy as np
 
         q, k, v = inputs[0], inputs[1], inputs[2]
+        # Align ndims: pad K/V with leading 1s to match Q's rank.
+        while k.ndim < q.ndim:
+            k = np.expand_dims(k, 0)
+        while v.ndim < q.ndim:
+            v = np.expand_dims(v, 0)
+        # GQA: if Q has more heads than K/V, expand K/V by repeating heads.
+        if q.ndim >= 3 and k.shape[-3] != q.shape[-3]:
+            group = q.shape[-3] // k.shape[-3]
+            k = np.repeat(k, group, axis=-3)
+            v = np.repeat(v, group, axis=-3)
         d_k = q.shape[-1]
         scores = q @ np.swapaxes(k, -2, -1) / np.sqrt(d_k)
         scores_max = np.max(scores, axis=-1, keepdims=True)
