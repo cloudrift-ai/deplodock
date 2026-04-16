@@ -1,4 +1,4 @@
-"""Run a compiled graph IR through the full pipeline."""
+"""Run a compiled graph IR through the structural compiler + CUDA backend."""
 
 import logging
 
@@ -21,8 +21,7 @@ def _handle_run(args):
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.dump import CompilerDump
     from deplodock.compiler.ir import Graph
-    from deplodock.compiler.plan import plan_graph
-    from deplodock.compiler.rewriter import PassTrace, Rewriter
+    from deplodock.compiler.pipeline import compile_graph
 
     dump = CompilerDump.resolve(args.dump_dir)
 
@@ -33,42 +32,15 @@ def _handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    # Apply decomposition + optimization + fusion passes. Fusion runs inside
-    # the Rewriter as a pass, so no separate fusion call is needed.
-    rules_dir = Path(__file__).parent.parent / "compiler" / "rules"
-    rewriter = Rewriter.from_directory(rules_dir)
-    pass_traces: list[PassTrace] = []
-    compiled = rewriter.apply(graph, pass_traces=pass_traces)
+    kernels = compile_graph(graph)
 
-    if dump:
-        dump.dump_passes(pass_traces)
-        dump.dump_fused_graph(compiled)
-
-    # Plan from graph.
-    plan = plan_graph(compiled, name=ir_path.stem)
     backend = CudaBackend()
-    program = backend.compile(plan)
+    program = backend.compile(kernels)
 
     if dump:
-        dump.dump_plan(plan)
         dump.dump_program(program)
-        for launch in program.launches:
-            if hasattr(launch, "loop_ir") and launch.loop_ir is not None:
-                dump.dump_loop_ir(launch.loop_ir, launch.kernel_name, schedule=getattr(launch, "schedule", None))
-        from deplodock.compiler.backend.cuda.program import generate_source
 
-        mode = "benchmark" if args.benchmark else "run"
-        dump.dump_source(generate_source(program, mode=mode))
-
-    op_counts: dict[str, int] = {}
-    for op in plan.ops:
-        op_counts[op.op] = op_counts.get(op.op, 0) + 1
-    logger.info(
-        "Graph %s: %d ops (%s)",
-        ir_path.name,
-        len(plan.ops),
-        ", ".join(f"{v} {k}" for k, v in sorted(op_counts.items())),
-    )
+    logger.info("Compiled %s: %d kernels", ir_path.name, len(kernels))
 
     if args.benchmark:
         result = backend.benchmark(program, num_iters=args.iters)
