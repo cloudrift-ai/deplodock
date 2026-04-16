@@ -18,10 +18,6 @@ comes back online:
 
 collect_ignore = [
     "test_indexmap.py",
-    "test_torch_trace.py",
-    "test_torch_trace_ops.py",
-    "test_real_trace.py",
-    "test_hints.py",
     "test_kernel_gen.py",
     "test_cuda.py",
     "test_cuda_backend.py",
