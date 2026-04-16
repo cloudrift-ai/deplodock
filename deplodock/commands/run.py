@@ -37,6 +37,7 @@ def _handle_run(args):
     backend = CudaBackend()
     program = backend.compile(
         result.kernels,
+        buf_shapes=result.buf_shapes,
         graph_inputs=result.graph_inputs,
         graph_outputs=result.graph_outputs,
         graph_constants=result.graph_constants,

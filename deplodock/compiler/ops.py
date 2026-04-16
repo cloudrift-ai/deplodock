@@ -33,7 +33,7 @@ dataclasses (see the ``_assert_*`` helpers at the bottom of the file).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -545,48 +545,53 @@ class KernelOp(Op):
     inputs: tuple[KernelInput, ...]
     body: tuple[Assign, ...] = ()
     outputs: tuple[KernelOutput, ...] = ()
-    external_shapes: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _validate_ssa(self)
 
-    def infer_shapes(self) -> dict[str, tuple]:
+    def infer_shapes(self, input_shapes: dict[str, tuple] | None = None) -> dict[str, tuple]:
         """Derive the shape of every named value (inputs + Assigns).
+
+        ``input_shapes`` maps Port ``buffer_id`` → shape for all external
+        buffers. When a Port carries an ``indexmap``, its effective shape
+        is ``indexmap.out_shape`` regardless of the provided shape.
 
         Walks the SSA body, calling ``op.infer_output_shape`` at each
         Assign. Returns a dict mapping value names to shapes.
         """
+        ext = input_shapes or {}
         shapes: dict[str, tuple] = {}
         for inp in self.inputs:
             if isinstance(inp, Port):
                 if inp.indexmap is not None:
                     shapes[inp.buffer_id] = tuple(inp.indexmap.out_shape)
                 else:
-                    shapes[inp.buffer_id] = tuple(self.external_shapes.get(inp.buffer_id, ()))
+                    shapes[inp.buffer_id] = tuple(ext.get(inp.buffer_id, ()))
             elif isinstance(inp, Combine):
                 for src in inp.sources:
                     if isinstance(src, Port):
                         if src.indexmap is not None:
                             shapes[src.buffer_id] = tuple(src.indexmap.out_shape)
                         else:
-                            shapes[src.buffer_id] = tuple(self.external_shapes.get(src.buffer_id, ()))
+                            shapes[src.buffer_id] = tuple(ext.get(src.buffer_id, ()))
         for assign in self.body:
             arg_shapes = [shapes[a] for a in assign.args if a in shapes]
             if arg_shapes:
                 try:
                     shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
                 except (ValueError, TypeError):
-                    # Cross-iteration-space ops (e.g. sub(x:(M,K), max:(M,)))
-                    # may fail standard broadcast. Use the largest arg shape.
                     shapes[assign.name] = max(arg_shapes, key=len)
         return shapes
 
-    def infer_output_shape(self, input_shapes: list[tuple] | None = None) -> tuple:
-        """Derive the kernel's output shape from the SSA body."""
-        shapes = self.infer_shapes()
+    def infer_output_shape(self, input_shapes: dict[str, tuple] | list[tuple] | None = None) -> tuple:
+        """Derive the kernel's output shape from the SSA body.
+
+        ``input_shapes`` is a dict mapping Port buffer_id → shape.
+        """
+        ext = input_shapes if isinstance(input_shapes, dict) else None
+        shapes = self.infer_shapes(ext)
         if self.body:
             return shapes.get(self.body[-1].name, ())
-        # Empty body (copy kernel): output = input shape.
         if shapes:
             return next(iter(shapes.values()))
         return ()
