@@ -1,19 +1,19 @@
 """Decompose LinearOp into transpose(weight) → mul → reduce_sum [→ add(bias)]."""
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ElementwiseOp, ReduceOp, TransposeOp
+from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.ops import ElementwiseOp, LinearOp, ReduceOp, TransposeOp
 
-PATTERN = "Linear($x, $w) | Linear($x, $w, $b)"
+GRAMMAR = [Production("root", LinearOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     """Replace LinearOp(x, w [, b]) with x @ w.T [+ b]."""
     g = graph.copy()
     root = g.nodes[match.root_node_id]
-    x_id = match.bindings["x"]
-    w_id = match.bindings["w"]
-    b_id = match.bindings.get("b")
+    x_id = root.inputs[0]
+    w_id = root.inputs[1]
+    b_id = root.inputs[2] if len(root.inputs) > 2 else None
     shape = root.output.shape
     dtype = root.output.dtype
     name = root.output.name

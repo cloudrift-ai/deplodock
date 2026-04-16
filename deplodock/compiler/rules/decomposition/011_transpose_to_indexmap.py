@@ -8,15 +8,15 @@ and b read from each other.
 
 from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import IndexMapOp, IndexSource
+from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.ops import IndexMapOp, IndexSource, TransposeOp
 
-PATTERN = "Transpose($x)"
+GRAMMAR = [Production("root", TransposeOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     root = graph.nodes[match.root_node_id]
-    x_id = match.bindings["x"]
+    x_id = root.inputs[0]
     in_shape = tuple(graph.nodes[x_id].output.shape)
     out_shape = tuple(root.output.shape)
     ndim = len(in_shape)

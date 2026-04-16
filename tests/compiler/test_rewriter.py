@@ -1,8 +1,8 @@
-"""Tests for the rewrite engine."""
+"""Tests for the grammar-based rewrite engine."""
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp
-from deplodock.compiler.pattern import parse_pattern
+from deplodock.compiler.matcher import Production
+from deplodock.compiler.ops import ElementwiseOp, InputOp, ScanOp
 from deplodock.compiler.rewriter import Pass, Rule
 
 
@@ -56,6 +56,10 @@ def test_fixed_point_no_change():
 def test_pass_with_no_matching_rules():
     """A pass whose rules don't match returns the graph unchanged."""
     g = _make_silu_graph()
-    rule = Rule(name="noop", pattern=parse_pattern("Scan{sum, $ax}($x)"), rewrite=lambda graph, match: graph)
+    rule = Rule(
+        name="noop",
+        grammar=[Production("root", ScanOp, "1")],
+        rewrite=lambda graph, match: graph,
+    )
     result = Pass(name="noop", rules=[rule]).apply(g)
     assert len(result.nodes) == len(g.nodes)

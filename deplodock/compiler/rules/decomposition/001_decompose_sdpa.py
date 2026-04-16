@@ -3,22 +3,19 @@
 import math
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, ReduceOp, TransposeOp
+from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.ops import ConstantOp, ElementwiseOp, ReduceOp, SdpaOp, TransposeOp
 
-# Match any sdpa node. The rewrite function extracts Q, K, V from node.inputs.
-# We use a 3-arg pattern but also handle extra args (dropout_p, is_causal, etc.)
-# by checking the fn in the rewrite function.
-PATTERN = "Sdpa($Q, $K, $V)"
+GRAMMAR = [Production("root", SdpaOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     """Replace sdpa(Q, K, V, ...) with QK^T → scale → softmax → @V."""
     g = graph.copy()
     root = g.nodes[match.root_node_id]
-    q_id = match.bindings["Q"]
-    k_id = match.bindings["K"]
-    v_id = match.bindings["V"]
+    q_id = root.inputs[0]
+    k_id = root.inputs[1]
+    v_id = root.inputs[2]
 
     q_shape = g.nodes[q_id].output.shape
     k_shape = g.nodes[k_id].output.shape

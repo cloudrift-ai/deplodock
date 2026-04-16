@@ -11,17 +11,18 @@ into the source selects and the second source's coord_map offset.
 from deplodock.compiler.backend.ir.expr import Literal
 from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ConstantOp, IndexMapOp, IndexSource
+from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.ops import CatOp, ConstantOp, IndexMapOp, IndexSource
 
-PATTERN = "Cat($a, $b, $dim)"
+GRAMMAR = [Production("root", CatOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     rs_id = match.root_node_id
-    a_id = match.bindings["a"]
-    b_id = match.bindings["b"]
-    dim_id = match.bindings["dim"]
+    root = graph.nodes[rs_id]
+    a_id = root.inputs[0]
+    b_id = root.inputs[1]
+    dim_id = root.inputs[2]
 
     rs_node = graph.nodes[rs_id]
     a_shape = tuple(graph.nodes[a_id].output.shape)

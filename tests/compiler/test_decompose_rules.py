@@ -194,12 +194,11 @@ def test_sdpa_output_is_valid():
     assert isinstance(out_node.op, (ElementwiseOp, ReduceOp))
 
 
-def test_sdpa_with_extra_args_not_matched():
-    """SDPA with extra args (dropout_p) does NOT match the 3-arg pattern.
+def test_sdpa_with_extra_args_decomposes():
+    """SDPA with extra args (dropout_p) still matches and decomposes.
 
-    The matcher is strict about arity: Elementwise{sdpa}($Q, $K, $V)
-    requires exactly 3 inputs. Nodes with extra args (dropout_p, is_causal)
-    must be stripped to 3 inputs by the tracer before decomposition.
+    The grammar matches any SdpaOp regardless of input count. The rewrite
+    extracts Q, K, V from inputs[0:3] and cleans up extra constant args.
     """
     g = Graph()
     q = g.add_node(op=InputOp(), inputs=[], output=Tensor("Q", (1, 32, 64)), node_id="Q")
@@ -218,7 +217,6 @@ def test_sdpa_with_extra_args_not_matched():
 
     result = Pass(name="decomp", rules=[_load_sdpa_rule()]).apply(g)
 
-    # Pattern doesn't match — sdpa survives (graph unchanged).
+    # Grammar matches any SdpaOp — decomposition fires and removes the op.
     has_sdpa = any(isinstance(n.op, SdpaOp) for n in result.nodes.values())
-    assert has_sdpa, "SdpaOp should survive when pattern doesn't match"
-    assert len(result.nodes) == len(g.nodes)
+    assert not has_sdpa, "SdpaOp should be decomposed even with extra args"
