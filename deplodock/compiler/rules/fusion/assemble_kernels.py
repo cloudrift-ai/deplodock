@@ -1,27 +1,27 @@
 """Assemble primitive ops into structural ``KernelOp`` nodes.
 
-Uses the chain grammar to parse each fan-out-1 path through the
-primitive graph. After this rule runs to fixed point, every compute
-node in the graph is wrapped in a ``KernelOp`` — the graph contains
-only ``KernelOp``, ``InputOp``, and ``ConstantOp`` nodes.
+Uses backward-cone region growing to fuse DAG subgraphs of primitive
+ops into single kernels. Starting from a seed node, the algorithm:
 
-The kernel grammar:
+1. **Forward BFS** — collect all downstream fusable primitives
+   (``ElementwiseOp``, ``ReduceOp``), enforcing that reductions form
+   a single linear chain (no parallel reductions).
+2. **Find output** — last node in topo order with no consumers in
+   the forward set.
+3. **Backward cone** — from the output, absorb nodes whose consumers
+   are all inside the region. This trims nodes with side-outputs.
 
-    contraction?  (mul + sum pair, backtracking)
-    stage*        (pre_ops* + reduce, repeating)
-    epilogue*     (trailing elementwise chain)
-
-Each consumed graph node becomes an ``Assign`` in the kernel body::
-
-    mul = mul(a, b)
-    dot = reduce_sum(mul)
-    out = add(dot, bias)
+After this rule runs to fixed point, every compute node in the graph
+is wrapped in a ``KernelOp`` — the graph contains only ``KernelOp``,
+``InputOp``, and ``ConstantOp`` nodes.
 """
 
 from __future__ import annotations
 
+from collections import deque
+
 from deplodock.compiler.ir import Graph, Node, Tensor
-from deplodock.compiler.matcher import ChainMatch, Group, Production, parse_chain
+from deplodock.compiler.matcher import ChainMatch, Production
 from deplodock.compiler.ops import (
     Assign,
     Combine,
@@ -38,29 +38,11 @@ from deplodock.compiler.ops import (
 
 GRAMMAR = [Production("any", (ElementwiseOp, ReduceOp, IndexMapOp), "1")]
 
-_KERNEL_GRAMMAR = [
-    Group(
-        "contraction",
-        [
-            Production("mul", ElementwiseOp, "1", {"fn": "mul"}),
-            Production("reduce", ReduceOp, "1", {"fn": "sum"}),
-        ],
-        "?",
-    ),
-    Group(
-        "stage",
-        [
-            Production("pre_ops", ElementwiseOp, "*"),
-            Production("reduce", ReduceOp, "1"),
-        ],
-        "*",
-    ),
-    Production("epilogue", ElementwiseOp, "*"),
-]
+_FUSABLE = (ElementwiseOp, ReduceOp, IndexMapOp)
 
 
 def rewrite(graph: Graph, match: ChainMatch) -> Graph:
-    """Replace a primitive chain with a single ``KernelOp`` node."""
+    """Replace a primitive region with a single ``KernelOp`` node."""
     seed = match.root_node_id
     node = graph.nodes[seed]
 
@@ -73,24 +55,23 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
             return _wrap_indexmap_kernel(graph, node)
         return graph
 
-    chain = parse_chain(graph, seed, _KERNEL_GRAMMAR)
-    if chain is None or not chain.consumed:
+    result = _grow_region(graph, seed)
+    if result is None:
         return graph
 
-    all_consumed = set(chain.consumed)
+    all_consumed, last_nid = result
     external_inputs = _collect_external_inputs(graph, all_consumed)
     inputs, port_map = _build_input_tree(graph, external_inputs, all_consumed)
-    body = _build_body(graph, chain, port_map)
+    body = _build_body_from_region(graph, all_consumed, port_map)
 
-    last_nid = _last_node_id(chain)
+    if not body:
+        return graph
+
     last_node = graph.nodes[last_nid]
 
     g = graph.copy()
     input_nids = [p.buffer_id if isinstance(p, Port) else _first_port_id(p) for p in inputs]
 
-    # Use a placeholder output Port; update buffer_id after add_node
-    # so the output buffer matches the graph node id that downstream
-    # consumers reference.
     out_port = Port(buffer_id=last_nid)
     kernel = KernelOp(
         inputs=tuple(inputs),
@@ -103,7 +84,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         inputs=input_nids,
         output=Tensor(name=f"kernel_{last_nid}", shape=last_node.output.shape, dtype=last_node.output.dtype),
     )
-    # Update the output Port to use the new graph node id so buffers match.
     out_port.buffer_id = new_nid
     for nid in all_consumed:
         orig = graph.nodes.get(nid)
@@ -111,9 +91,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
             g.nodes[new_nid].hints.merge(orig.hints)
 
     g.replace_node(last_nid, new_nid)
-
-    # Propagate the last_nid → new_nid rename into already-fused KernelOps
-    # that reference last_nid in their Assign.args or Port.buffer_ids.
     _rename_in_kernels(g, last_nid, new_nid)
 
     for nid in all_consumed:
@@ -125,21 +102,88 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
 
 
 # ---------------------------------------------------------------------------
-# Body builder — produces Assign statements from the parsed chain
+# Region growing
 # ---------------------------------------------------------------------------
 
 
-def _build_body(graph: Graph, chain: ChainMatch, port_map: dict) -> list[Assign]:
-    """Build SSA Assigns from the grammar parse.
+def _grow_region(graph: Graph, seed: str) -> tuple[set[str], str] | None:
+    """Grow a fusable region from seed via forward BFS + backward cone."""
+    topo = graph.topological_order()
+    topo_idx = {nid: i for i, nid in enumerate(topo)}
 
-    Each consumed graph node becomes an Assign: ``name = op(args)``.
-    Args reference input Port.buffer_ids or prior Assign names. When a
-    Port was absorbed from an IndexMapOp (recorded in ``port_map``), the
-    arg name is remapped from the IndexMapOp's output id to the absorbed
-    Port's buffer_id.
-    """
-    assigns: list[Assign] = []
-    # Build reverse map: original graph id → absorbed Port buffer_id.
+    # Phase 1: forward BFS — collect downstream fusable nodes.
+    forward: set[str] = set()
+    last_reduce: str | None = None
+    queue: deque[str] = deque([seed])
+
+    while queue:
+        nid = queue.popleft()
+        if nid in forward:
+            continue
+        node = graph.nodes.get(nid)
+        if node is None or not isinstance(node.op, _FUSABLE):
+            continue
+        if isinstance(node.op, ReduceOp):
+            if last_reduce is not None and not _reduce_depends_on(graph, nid, last_reduce, forward):
+                continue
+            last_reduce = nid
+        forward.add(nid)
+        for cid in graph.consumers(nid):
+            cnode = graph.nodes.get(cid)
+            if cnode is not None and isinstance(cnode.op, _FUSABLE):
+                queue.append(cid)
+
+    if not forward:
+        return None
+
+    # Phase 2: find output — last in topo with no forward consumers.
+    sorted_fwd = sorted(forward, key=lambda n: topo_idx[n])
+    output: str | None = None
+    for nid in reversed(sorted_fwd):
+        if not any(c in forward for c in graph.consumers(nid)):
+            output = nid
+            break
+    if output is None:
+        return None
+
+    # Phase 3: backward cone — absorb nodes whose consumers are all in region.
+    region: set[str] = set()
+    for nid in reversed(sorted_fwd):
+        if nid == output:
+            region.add(nid)
+            continue
+        consumers = graph.consumers(nid)
+        if consumers and all(c in region for c in consumers):
+            region.add(nid)
+
+    return (region, output) if region else None
+
+
+def _reduce_depends_on(graph: Graph, reduce_nid: str, prev_reduce: str, through: set[str]) -> bool:
+    """Check if reduce_nid transitively depends on prev_reduce through nodes in ``through``."""
+    visited: set[str] = set()
+    stack = list(graph.nodes[reduce_nid].inputs)
+    while stack:
+        nid = stack.pop()
+        if nid in visited:
+            continue
+        visited.add(nid)
+        if nid == prev_reduce:
+            return True
+        if nid in through:
+            node = graph.nodes.get(nid)
+            if node is not None:
+                stack.extend(node.inputs)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Body builder
+# ---------------------------------------------------------------------------
+
+
+def _build_body_from_region(graph: Graph, region: set[str], port_map: dict) -> list[Assign]:
+    """Build SSA Assigns from the fused region in topological order."""
     remap: dict[str, str] = {}
     for orig_id, port_or_mux in port_map.items():
         if isinstance(port_or_mux, Port):
@@ -148,33 +192,15 @@ def _build_body(graph: Graph, chain: ChainMatch, port_map: dict) -> list[Assign]
     def _remap_args(node: Node) -> tuple[str, ...]:
         return tuple(remap.get(inp, inp) for inp in node.inputs)
 
-    # Contraction group
-    for seg in chain.segments:
-        if seg.name.startswith("contraction["):
-            for nid in seg.node_ids:
-                node = graph.nodes[nid]
-                assigns.append(Assign(name=nid, op=node.op, args=_remap_args(node)))
-
-    # Stage groups
-    for group_segs in chain.get_groups("stage"):
-        for seg in group_segs:
-            for nid in seg.node_ids:
-                node = graph.nodes[nid]
-                assigns.append(Assign(name=nid, op=node.op, args=_remap_args(node)))
-
-    # Epilogue
-    for nid in chain.get("epilogue"):
+    assigns: list[Assign] = []
+    for nid in graph.topological_order():
+        if nid not in region:
+            continue
         node = graph.nodes[nid]
+        if not isinstance(node.op, (ElementwiseOp, ReduceOp)):
+            continue
         assigns.append(Assign(name=nid, op=node.op, args=_remap_args(node)))
-
     return assigns
-
-
-def _last_node_id(chain: ChainMatch) -> str:
-    for seg in reversed(chain.segments):
-        if seg.node_ids:
-            return seg.node_ids[-1]
-    return chain.root_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +210,9 @@ def _last_node_id(chain: ChainMatch) -> str:
 
 def _collect_external_inputs(graph: Graph, consumed: set[str]) -> list[str]:
     seen: list[str] = []
-    for nid in consumed:
+    for nid in graph.topological_order():
+        if nid not in consumed:
+            continue
         node = graph.nodes.get(nid)
         if node is None:
             continue
@@ -232,17 +260,14 @@ def _rename_in_kernels(graph: Graph, old_id: str, new_id: str) -> None:
     for node in graph.nodes.values():
         if not isinstance(node.op, KernelOp):
             continue
-        # Recursively update all Port.buffer_ids in the input tree.
         for inp in node.op.inputs:
             _rename_ports(inp, old_id, new_id)
-        # Update Assign args.
         for assign in node.op.body:
             if old_id in assign.args:
                 assign.args = tuple(new_id if a == old_id else a for a in assign.args)
 
 
 def _rename_ports(inp, old_id: str, new_id: str) -> None:
-    """Recursively rename Port.buffer_ids in a KernelInput tree."""
     if isinstance(inp, Port):
         if inp.buffer_id == old_id:
             inp.buffer_id = new_id
