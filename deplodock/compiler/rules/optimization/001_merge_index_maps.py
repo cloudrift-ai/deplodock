@@ -9,16 +9,17 @@ slice → transpose, or transpose composed with cat).
 
 from deplodock.compiler.coord_expr import compose_index_maps
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
+from deplodock.compiler.matcher import ChainMatch, Production
 from deplodock.compiler.ops import IndexMapOp
 from deplodock.compiler.shape_utils import propagate_shapes
 
-PATTERN = "IndexMap($inner)"
+GRAMMAR = [Production("root", IndexMapOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     outer_id = match.root_node_id
-    inner_id = match.bindings["inner"]
+    root = graph.nodes[outer_id]
+    inner_id = root.inputs[0]
 
     outer_node = graph.nodes[outer_id]
     inner_node = graph.nodes.get(inner_id)

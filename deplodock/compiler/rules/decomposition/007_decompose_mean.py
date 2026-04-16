@@ -1,17 +1,17 @@
 """Decompose MeanOp into sum + div by the reduced dimension size."""
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ConstantOp, ElementwiseOp, ReduceOp
+from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.ops import ConstantOp, ElementwiseOp, MeanOp, ReduceOp
 
-PATTERN = "Mean($x)"
+GRAMMAR = [Production("root", MeanOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     """Replace mean(x, axis) with sum(x, axis) / axis_size."""
     g = graph.copy()
     root = g.nodes[match.root_node_id]
-    x_id = match.bindings["x"]
+    x_id = root.inputs[0]
 
     axis = root.op.axis
     shape = root.output.shape

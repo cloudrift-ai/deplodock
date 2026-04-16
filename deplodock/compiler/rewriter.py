@@ -1,4 +1,10 @@
-"""Pass-based graph rewrite engine."""
+"""Pass-based graph rewrite engine.
+
+Rules declare a ``GRAMMAR`` — a chain grammar (list of ``Production`` /
+``Group``) — and a ``rewrite(graph, match)`` function. The engine
+matches the grammar against the graph via ``match_grammar()`` and calls
+the rewrite function for each match. Each pass runs to fixed point.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from deplodock.compiler.ir import Graph
-from deplodock.compiler.matcher import match_pattern
-from deplodock.compiler.pattern import Pattern, parse_pattern
+from deplodock.compiler.matcher import ChainGrammar, match_grammar
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +29,10 @@ class RuleApplication:
     """Record of a single rule firing."""
 
     rule_name: str
-    matched_at: str  # root node id
-    bindings: dict[str, str]
-    captured_constraints: dict[str, str | int]
+    matched_at: str
 
     def to_dict(self) -> dict:
-        return {
-            "rule": self.rule_name,
-            "matched_at": self.matched_at,
-            "bindings": self.bindings,
-            "captured_constraints": {k: str(v) for k, v in self.captured_constraints.items()},
-        }
+        return {"rule": self.rule_name, "matched_at": self.matched_at}
 
 
 @dataclass
@@ -57,37 +55,29 @@ class PassTrace:
 
 @dataclass
 class Rule:
-    """A single rewrite rule: pattern + rewrite function."""
+    """A single rewrite rule: grammar + rewrite function."""
 
     name: str
-    pattern: list[Pattern]  # alternatives
-    rewrite: RewriteFn
+    grammar: ChainGrammar
+    rewrite: object  # Callable[[Graph, ChainMatch], Graph]
 
     @staticmethod
     def from_file(path: Path) -> Rule:
-        """Load a rule from a Python file exporting PATTERN and rewrite()."""
+        """Load a rule from a Python file exporting ``GRAMMAR`` and ``rewrite()``."""
         spec = importlib.util.spec_from_file_location(path.stem, path)
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot load rule from {path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        pattern_text = getattr(module, "PATTERN", None)
+        grammar = getattr(module, "GRAMMAR", None)
         rewrite_fn = getattr(module, "rewrite", None)
-        if pattern_text is None:
-            raise ValueError(f"Rule {path} missing PATTERN string")
+        if grammar is None:
+            raise ValueError(f"Rule {path} missing GRAMMAR")
         if rewrite_fn is None:
             raise ValueError(f"Rule {path} missing rewrite() function")
 
-        return Rule(
-            name=path.stem,
-            pattern=parse_pattern(pattern_text),
-            rewrite=rewrite_fn,
-        )
-
-
-# Type alias for rewrite functions.
-RewriteFn = type(lambda graph, match: graph)  # noqa: E731
+        return Rule(name=path.stem, grammar=grammar, rewrite=rewrite_fn)
 
 
 @dataclass
@@ -107,11 +97,9 @@ class Pass:
     def apply(self, graph: Graph, trace: PassTrace | None = None) -> Graph:
         """Apply rules in order with restart-on-match until fixed point.
 
-        A rule signals "no change" by returning the same ``Graph`` object it
-        received (identity comparison). The fixed-point loop only restarts
-        when at least one rewrite actually produced a new graph — this
-        prevents infinite loops when a rule's pattern is broader than the
-        cases it can act on.
+        A rule signals "no change" by returning the same ``Graph`` object
+        (identity comparison). The loop restarts from the first rule when
+        any rewrite produces a new graph.
         """
         if trace is not None:
             trace.graph_before = graph.to_dict()
@@ -119,7 +107,7 @@ class Pass:
         while changed:
             changed = False
             for rule in self.rules:
-                matches = match_pattern(graph, rule.pattern)
+                matches = match_grammar(graph, rule.grammar)
                 if not matches:
                     continue
                 rule_changed = False
@@ -128,19 +116,12 @@ class Pass:
                     new_graph = rule.rewrite(graph, match)
                     if new_graph is not graph:
                         if trace is not None:
-                            trace.rules_applied.append(
-                                RuleApplication(
-                                    rule_name=rule.name,
-                                    matched_at=match.root_node_id,
-                                    bindings=dict(match.bindings),
-                                    captured_constraints=dict(match.captured_constraints),
-                                )
-                            )
+                            trace.rules_applied.append(RuleApplication(rule_name=rule.name, matched_at=match.root_node_id))
                         graph = new_graph
                         rule_changed = True
                 if rule_changed:
                     changed = True
-                    break  # restart from first rule
+                    break
         if trace is not None:
             trace.graph_after = graph.to_dict()
         return graph
@@ -157,12 +138,7 @@ class Rewriter:
 
     @staticmethod
     def from_directory(rules_dir: Path, pass_order: list[str] | None = None) -> Rewriter:
-        """Load passes from named subdirectories in the given order.
-
-        Each name in ``pass_order`` must correspond to a subdirectory of
-        ``rules_dir``. Within each pass, rule files are picked up
-        alphabetically (``001_*.py``, ``002_*.py``, ...).
-        """
+        """Load passes from named subdirectories in the given order."""
         order = pass_order if pass_order is not None else DEFAULT_PASS_ORDER
         passes: list[Pass] = []
         for name in order:

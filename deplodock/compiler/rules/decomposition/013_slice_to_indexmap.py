@@ -10,17 +10,18 @@ baked into the coord_map.
 from deplodock.compiler.backend.ir.expr import Literal
 from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ConstantOp, IndexMapOp, IndexSource
+from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.ops import ConstantOp, IndexMapOp, IndexSource, SliceOp
 
-PATTERN = "Slice($x, $dim, $start, $end)"
+GRAMMAR = [Production("root", SliceOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     rs_id = match.root_node_id
-    x_id = match.bindings["x"]
-    dim_id = match.bindings["dim"]
-    start_id = match.bindings["start"]
+    root = graph.nodes[rs_id]
+    x_id = root.inputs[0]
+    dim_id = root.inputs[1]
+    start_id = root.inputs[2]
 
     rs_node = graph.nodes[rs_id]
     in_shape = tuple(graph.nodes[x_id].output.shape)
@@ -56,7 +57,8 @@ def rewrite(graph: Graph, match: Match) -> Graph:
     g.remove_node(rs_id)
 
     # Clean up unused dim/start/end constants if they have no other consumers.
-    for cid in (dim_id, start_id, match.bindings.get("end")):
+    end_id = root.inputs[3] if len(root.inputs) > 3 else None
+    for cid in (dim_id, start_id, end_id):
         if cid and cid in g.nodes and not g.consumers(cid):
             g.remove_node(cid)
 

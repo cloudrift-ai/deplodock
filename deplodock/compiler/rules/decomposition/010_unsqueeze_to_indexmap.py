@@ -7,16 +7,16 @@ coord_map for axis i reads the input's coord at axis i (for i < k) or i-1
 
 from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import IndexMapOp, IndexSource
+from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.ops import IndexMapOp, IndexSource, UnsqueezeOp
 
-PATTERN = "Unsqueeze($x)"
+GRAMMAR = [Production("root", UnsqueezeOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     g = graph.copy()
     root = g.nodes[match.root_node_id]
-    x_id = match.bindings["x"]
+    x_id = root.inputs[0]
     out_shape = tuple(root.output.shape)
     in_shape = tuple(g.nodes[x_id].output.shape)
     dim = root.op.dim

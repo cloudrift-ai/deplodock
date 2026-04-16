@@ -1,19 +1,19 @@
 """Decompose MatmulOp into mul → reduce_sum [→ add(bias)]."""
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
-from deplodock.compiler.ops import ElementwiseOp, ReduceOp
+from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.ops import ElementwiseOp, MatmulOp, ReduceOp
 
-PATTERN = "Matmul($a, $b) | Matmul($a, $b, $bias)"
+GRAMMAR = [Production("root", MatmulOp, "1")]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     """Replace MatmulOp(a, b [, bias]) with a @ b [+ bias]."""
     g = graph.copy()
     root = g.nodes[match.root_node_id]
-    a_id = match.bindings["a"]
-    b_id = match.bindings["b"]
-    bias_id = match.bindings.get("bias")
+    a_id = root.inputs[0]
+    b_id = root.inputs[1]
+    bias_id = root.inputs[2] if len(root.inputs) > 2 else None
     shape = root.output.shape
     dtype = root.output.dtype
     name = root.output.name

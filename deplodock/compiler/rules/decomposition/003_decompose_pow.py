@@ -1,18 +1,18 @@
 """Decompose pow(x, 2) into mul(x, x) to enable RMSNorm fusion."""
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.matcher import Match
+from deplodock.compiler.matcher import ChainMatch, Production
 from deplodock.compiler.ops import ConstantOp, ElementwiseOp
 
-PATTERN = "Elementwise{pow}($x, $exp)"
+GRAMMAR = [Production("root", ElementwiseOp, "1", {"fn": "pow"})]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     """Replace pow(x, 2) with mul(x, x) — enables RMSNorm pattern matching."""
     g = graph.copy()
     root = g.nodes[match.root_node_id]
-    x_id = match.bindings["x"]
-    exp_id = match.bindings["exp"]
+    x_id = root.inputs[0]
+    exp_id = root.inputs[1]
 
     # Only decompose pow(x, 2) — check the exponent constant.
     exp_node = g.nodes.get(exp_id)
