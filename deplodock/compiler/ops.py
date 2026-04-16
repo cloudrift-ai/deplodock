@@ -518,7 +518,7 @@ class ContractionCore:
     sum-of-abs-diff) and different reduce functions.
     """
 
-    operand: KernelInput
+    operand: Combine
     reduce: ReduceOp
 
     def __post_init__(self) -> None:
