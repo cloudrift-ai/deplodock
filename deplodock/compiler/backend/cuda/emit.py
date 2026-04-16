@@ -65,15 +65,18 @@ def compile_kernels(
     name: str = "prog",
     graph_inputs: list[str] | None = None,
     graph_outputs: list[str] | None = None,
+    graph_constants: list[str] | None = None,
 ) -> Program:
     """Assemble a ``Program`` from a list of structural ``KernelOp``.
 
-    ``graph_inputs`` / ``graph_outputs`` are buffer-id sets used to mark
-    buffer roles; anything produced by one kernel and consumed by another
-    is "scratch".
+    ``graph_inputs`` / ``graph_outputs`` / ``graph_constants`` mark buffer
+    roles; anything else produced by one kernel and consumed by another
+    is "scratch". Constants are initialized from ``input_data`` or with
+    pseudorandom values at runtime (same as inputs).
     """
     graph_input_set = set(graph_inputs or [])
     graph_output_set = set(graph_outputs or [])
+    graph_constant_set = set(graph_constants or [])
 
     # Discover every external buffer + its shape.
     buf_shapes: dict[str, tuple] = {}
@@ -84,10 +87,11 @@ def compile_kernels(
             if isinstance(out, Port):
                 buf_shapes.setdefault(out.buffer_id, _infer_output_shape(k))
 
-    # Assign roles: inputs override scratch; outputs override scratch.
     def role_for(bid: str) -> str:
         if bid in graph_input_set:
             return "input"
+        if bid in graph_constant_set:
+            return "constant"
         if bid in graph_output_set:
             return "output"
         return "scratch"
@@ -154,7 +158,8 @@ def _emit_input_value(
     """
     if isinstance(inp, Port):
         if inp.indexmap is not None:
-            return _emit_indexmap_load(inp, coord, stmts, name_seq)
+            src_shape = shapes.get(inp.buffer_id, ())
+            return _emit_indexmap_load(inp, coord, src_shape, stmts, name_seq)
         return ArrayAccess(array=inp.buffer_id, index=coord)
 
     if isinstance(inp, Mux):
@@ -197,13 +202,11 @@ def _emit_input_value(
     raise NotImplementedError(f"unexpected KernelInput variant: {type(inp).__name__}")
 
 
-def _emit_indexmap_load(port: Port, coord: Expr, stmts: list[Stmt], name_seq: list[int]) -> Expr:
+def _emit_indexmap_load(port: Port, coord: Expr, src_shape: tuple, stmts: list[Stmt], name_seq: list[int]) -> Expr:
     """Emit a load from ``port.buffer_id`` at the coord transformed by ``port.indexmap``.
 
-    The IndexMapOp's coord_map maps output coords to input coords via
-    affine expressions over ``Var("out_coord_0")``, ``Var("out_coord_1")``, ...
-    We substitute the placeholder vars with the actual coord expressions
-    derived from the flat ``coord`` index, then compute the flat input index.
+    ``src_shape`` is the actual shape of the source buffer, used for
+    computing flat input strides.
     """
     from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute
 
@@ -228,13 +231,7 @@ def _emit_indexmap_load(port: Port, coord: Expr, stmts: list[Stmt], name_seq: li
     # Apply coord_map substitution to get input coords.
     input_coords = [substitute(cm, mapping) for cm in src.coord_map]
 
-    # Flatten input coords to a flat index into the source buffer.
-    # Input shape is the source's shape — we need it from external_shapes,
-    # but for now derive from the coord_map length (each coord_map entry = one input dim).
-    # Compute flat index: sum(coord_i * stride_i)
-    src_shape = port.indexmap.out_shape  # fallback; ideally from external_shapes
-    # For identity-shaped IndexMaps the input shape == out_shape.
-    # For general IndexMaps, the coord_map already handles the remapping.
+    # Flatten input coords using the SOURCE buffer's strides (not the IndexMap output shape).
     flat_idx: Expr = Literal(0, "int")
     stride = 1
     for d in range(len(input_coords) - 1, -1, -1):
@@ -242,8 +239,9 @@ def _emit_indexmap_load(port: Port, coord: Expr, stmts: list[Stmt], name_seq: li
             flat_idx = input_coords[d]
         else:
             flat_idx = BinOp("+", BinOp("*", input_coords[d], Literal(stride, "int")), flat_idx)
-        if d > 0 and d - 1 < len(src_shape):
-            stride *= int(src_shape[d]) if isinstance(src_shape[d], int) else 1
+        if d > 0:
+            dim = int(src_shape[d]) if d < len(src_shape) and isinstance(src_shape[d], int) else 1
+            stride *= dim
 
     return ArrayAccess(array=port.buffer_id, index=flat_idx)
 
@@ -363,15 +361,25 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], t
 
 
 def _emit_contraction_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], tuple[int, int, int]]:
-    """Naive matmul: 2D grid over (M, N), one thread per output element."""
+    """Naive matmul with batch support.
+
+    Output shape ``(...batch, M, N)``. Grid: (N, M, batch_size).
+    Each thread computes one output element by iterating K serially.
+    """
     contraction = kernel.contraction
     assert contraction is not None
     operand = contraction.operand
-    # Determine K: look at any Port inside operand; assume the two sources
-    # share the K dimension along the last axis (matmul convention).
+
     k_size = _contraction_k_size(operand, kernel.external_shapes)
-    # Output is 2D: (M, N). For our singleton matmul pattern, M*N = numel.
-    n_size = int(out_shape[-1]) if out_shape else 1
+
+    # Parse output shape: (...batch, M, N).
+    int_shape = tuple(int(d) for d in out_shape if isinstance(d, int))
+    if len(int_shape) < 2:
+        m_size, n_size, batch_size = 1, _numel(int_shape), 1
+    else:
+        m_size = int_shape[-2]
+        n_size = int_shape[-1]
+        batch_size = _numel(int_shape[:-2]) if len(int_shape) > 2 else 1
 
     stmts: list[Stmt] = []
     m = Var("m")
@@ -385,54 +393,53 @@ def _emit_contraction_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stm
         )
     )
 
+    # Batch: blockIdx.z indexes into the batch.
+    if batch_size > 1:
+        stmts.append(VarDecl(dtype="int", name="batch", init=Var("blockIdx.z")))
+        batch = Var("batch")
+    else:
+        batch = None
+
     fn = contraction.reduce.op.fn
     stmts.append(VarDecl(dtype="float", name="acc", init=Literal(_identity(fn), "float")))
 
     k = Var("k")
-    # For naive matmul mul(a,b) → operand is a Combine with two sources
-    # (a and b). Compute the per-K product by walking the tree at coord
-    # = m*K + k for the A-operand and k*N + n for the B-operand. We
-    # special-case this shape because the generic tree walker can't know
-    # the matmul layout convention.
     assert isinstance(operand, Combine), "naive contraction expects operand = Combine(a, b) with mul"
     assert len(operand.sources) == 2
     a_port, b_port = operand.sources
     assert isinstance(a_port, Port) and isinstance(b_port, Port)
-    a_idx = BinOp("+", BinOp("*", m, Literal(k_size, "int")), k)
-    b_idx = BinOp("+", BinOp("*", k, Literal(n_size, "int")), n)
-    a_load = ArrayAccess(array=a_port.buffer_id, index=a_idx)
-    b_load = ArrayAccess(array=b_port.buffer_id, index=b_idx)
-    # Apply the operand.ops chain (expected: [mul]).
-    assert len(operand.ops) == 1 and operand.ops[0].op.fn == "mul"
-    prod_expr = BinOp("*", a_load, b_load)
 
-    stmts.append(
-        ForLoop(
-            var=k.name,
-            start=Literal(0, "int"),
-            end=Literal(k_size, "int"),
-            body=[AugAssign(target="acc", op=_reduce_op(fn), value=prod_expr)],
-        )
-    )
+    # Each operand has its own index space: A[..., m, k] and B[..., k, n].
+    a_shape = kernel.external_shapes.get(a_port.buffer_id, ())
+    b_shape = kernel.external_shapes.get(b_port.buffer_id, ())
+    a_k = int(a_shape[-1]) if a_shape else k_size
+    b_n = int(b_shape[-1]) if b_shape else n_size
+
+    a_flat: Expr = BinOp("+", BinOp("*", m, Literal(a_k, "int")), k)
+    b_flat: Expr = BinOp("+", BinOp("*", k, Literal(b_n, "int")), n)
+    if batch is not None:
+        a_flat = BinOp("+", BinOp("*", batch, Literal(m_size * a_k, "int")), a_flat)
+        b_flat = BinOp("+", BinOp("*", batch, Literal(k_size * b_n, "int")), b_flat)
+
+    name_seq_k = [0]
+    inner_stmts: list[Stmt] = []
+    a_val = _emit_input_value(a_port, a_flat, kernel.external_shapes, inner_stmts, name_seq_k)
+    b_val = _emit_input_value(b_port, b_flat, kernel.external_shapes, inner_stmts, name_seq_k)
+    assert len(operand.ops) == 1 and operand.ops[0].op.fn == "mul"
+    prod_expr = BinOp("*", a_val, b_val)
+    inner_stmts.append(AugAssign(target="acc", op=_reduce_op(fn), value=prod_expr))
+    stmts.append(ForLoop(var=k.name, start=Literal(0, "int"), end=Literal(k_size, "int"), body=inner_stmts))
 
     name_seq = [0]
-    # Post-contraction reduce_stages + epilogue at (m, n). For the naive
-    # singleton matmul, both are typically empty.
     value: Expr = Var("acc")
     contraction_reduce_id = contraction.reduce.id
-    out_coord = BinOp("+", BinOp("*", m, Literal(n_size, "int")), n)
-    value = _apply_epilogue(kernel.epilogue, value, contraction_reduce_id, out_coord, stmts, name_seq)
+    out_flat: Expr = BinOp("+", BinOp("*", m, Literal(n_size, "int")), n)
+    if batch is not None:
+        out_flat = BinOp("+", BinOp("*", batch, Literal(m_size * n_size, "int")), out_flat)
+    value = _apply_epilogue(kernel.epilogue, value, contraction_reduce_id, out_flat, stmts, name_seq)
     out_port = kernel.outputs[0]
     assert isinstance(out_port, Port)
-    stmts.append(
-        Assign(
-            target=ArrayAccess(
-                array=out_port.buffer_id,
-                index=BinOp("+", BinOp("*", m, Literal(n_size, "int")), n),
-            ),
-            value=value,
-        )
-    )
+    stmts.append(Assign(target=ArrayAccess(array=out_port.buffer_id, index=out_flat), value=value))
     return stmts, (1, 1, 1)
 
 
@@ -612,9 +619,11 @@ def _kernel_name(kernel: KernelOp, idx: int) -> str:
 def _launch_config(kernel: KernelOp) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     out_shape = _infer_output_shape(kernel)
     if kernel.contraction is not None:
-        m = int(out_shape[-2]) if len(out_shape) >= 2 else 1
-        n = int(out_shape[-1]) if out_shape else 1
-        return (n, m, 1), (1, 1, 1)
+        int_shape = tuple(int(d) for d in out_shape if isinstance(d, int))
+        m = int_shape[-2] if len(int_shape) >= 2 else 1
+        n = int_shape[-1] if int_shape else 1
+        batch = _numel(int_shape[:-2]) if len(int_shape) > 2 else 1
+        return (n, m, batch), (1, 1, 1)
     if kernel.reduce_stages:
         n_rows = _numel(out_shape)
         return (n_rows, 1, 1), (1, 1, 1)
