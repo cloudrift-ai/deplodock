@@ -93,6 +93,29 @@ Analogies (use in module/class docstrings):
 - **Operad / expression tree** for `Combine`.
 - **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store) for `KernelOp`.
 
+## Shape inference
+
+Every ``Op`` subclass implements ``infer_output_shape(input_shapes) → tuple``.
+The compiler never stores shapes redundantly — shapes are derived when
+needed by calling ``infer_output_shape`` on the op instance.
+
+| Op type | Rule |
+|---|---|
+| ``ElementwiseOp`` | ``broadcast_shapes(*input_shapes)`` — NumPy right-aligned broadcast. Inputs MUST be broadcast-compatible; matmul decomposition inserts unsqueeze IndexMapOps to ensure this. |
+| ``ReduceOp`` | Drop the ``axis`` dim from the input shape. |
+| ``IndexMapOp`` | Returns ``self.out_shape`` — the output shape is part of the op definition because it cannot be derived from the coord_map + input shape (e.g., reshape ``(12,) → (3, 4)``). |
+| ``TransposeOp`` | Permute the input shape by ``self.axes``. |
+| ``ReshapeOp`` | Returns ``self.shape``. |
+| ``LinearOp`` / ``MatmulOp`` / ``SdpaOp`` / ``MeanOp`` | High-level ops; decomposed before shape inference runs on the kernel IR. |
+| ``KernelOp`` | ``infer_shapes() → dict[str, tuple]`` walks the SSA body, calling each ``Assign.op.infer_output_shape`` with the arg shapes. ``infer_output_shape()`` returns the last Assign's shape. |
+
+**Invariant**: after decomposition + optimization, every ``ElementwiseOp("mul")``
+in the graph has broadcast-compatible inputs. Matmul ``A(..., M, K) × B(..., K, N)``
+is decomposed with unsqueeze IndexMapOps (``A → A[..., M, K, 1]``,
+``B → B[..., 1, K, N]``) so the mul broadcasts to ``(..., M, K, N)`` and
+the reduce over ``K`` (axis -2) yields ``(..., M, N)``. No special-case
+shape inference for contractions.
+
 ## Lowering policy (rules/fusion/assemble_kernels.py)
 
 Grammar-based fusion via the rewriter:
