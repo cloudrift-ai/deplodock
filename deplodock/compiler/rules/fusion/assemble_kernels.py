@@ -24,6 +24,7 @@ from deplodock.compiler.ir import Graph, Node, Tensor
 from deplodock.compiler.matcher import ChainMatch, Group, Production, parse_chain
 from deplodock.compiler.ops import (
     Assign,
+    Combine,
     ConstantOp,
     ElementwiseOp,
     IndexMapOp,
@@ -110,6 +111,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
             g.nodes[new_nid].hints.merge(orig.hints)
 
     g.replace_node(last_nid, new_nid)
+
+    # Propagate the last_nid → new_nid rename into already-fused KernelOps
+    # that reference last_nid in their Assign.args or Port.buffer_ids.
+    _rename_in_kernels(g, last_nid, new_nid)
+
     for nid in all_consumed:
         if nid in g.nodes and nid != last_nid:
             g.remove_node(nid)
@@ -219,6 +225,35 @@ def _build_input_tree(
     return inputs, port_map
 
 
+def _rename_in_kernels(graph: Graph, old_id: str, new_id: str) -> None:
+    """Update internal refs in already-fused KernelOps when a node is renamed."""
+    if old_id == new_id:
+        return
+    for node in graph.nodes.values():
+        if not isinstance(node.op, KernelOp):
+            continue
+        # Recursively update all Port.buffer_ids in the input tree.
+        for inp in node.op.inputs:
+            _rename_ports(inp, old_id, new_id)
+        # Update Assign args.
+        for assign in node.op.body:
+            if old_id in assign.args:
+                assign.args = tuple(new_id if a == old_id else a for a in assign.args)
+
+
+def _rename_ports(inp, old_id: str, new_id: str) -> None:
+    """Recursively rename Port.buffer_ids in a KernelInput tree."""
+    if isinstance(inp, Port):
+        if inp.buffer_id == old_id:
+            inp.buffer_id = new_id
+    elif isinstance(inp, Mux):
+        for branch in inp.branches:
+            _rename_ports(branch.input, old_id, new_id)
+    elif isinstance(inp, Combine):
+        for src in inp.sources:
+            _rename_ports(src, old_id, new_id)
+
+
 def _first_port_id(inp) -> str:
     if isinstance(inp, Port):
         return inp.buffer_id
@@ -262,5 +297,6 @@ def _wrap_indexmap_kernel(graph: Graph, node: Node) -> Graph:
     )
     out_port.buffer_id = new_nid
     g.replace_node(nid, new_nid)
+    _rename_in_kernels(g, nid, new_nid)
     g.remove_node(nid)
     return g
