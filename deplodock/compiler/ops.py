@@ -508,58 +508,49 @@ type KernelOutput = Port | Mux
 
 
 @dataclass
-class ContractionCore:
-    """Systolic core: sum (or associative reduce) over a per-K operand.
+class Assign:
+    """One named value in the kernel's SSA body: ``name = op(args)``.
 
-    For matmul, ``operand`` is a ``Combine(sources=(a, b), ops=(mul,))``:
-    the per-K element product whose reduction over ``reduce.axis`` yields one
-    output element. Generalizes to other associative contractions by
-    choosing different ``operand.ops`` chains (e.g. sub+abs for
-    sum-of-abs-diff) and different reduce functions.
+    SSA invariants (enforced by ``KernelOp.__post_init__``):
+      - Each ``name`` is defined exactly once across all Assigns.
+      - Every ``arg`` references an input ``Port.buffer_id`` or a prior
+        ``Assign.name``.
+      - No forward references.
     """
 
-    operand: Combine
-    reduce: ReduceOp
-
-    def __post_init__(self) -> None:
-        _assert_reduce_op(self.reduce, "ContractionCore.reduce")
+    name: str
+    op: ElementwiseOp | ReduceOp
+    args: tuple[str, ...]
 
 
 @dataclass
 class KernelOp(Op):
-    """One kernel's worth of computation: a tiled dataflow pipeline.
+    """One kernel's worth of computation as an SSA program.
 
-    The pipeline is linear:
+    The kernel reads external buffers via ``inputs`` (Port | Mux | Combine),
+    computes through a flat sequence of named ``Assign`` statements, and
+    writes the result via ``outputs`` (Port | Mux).
 
-        inputs → [contraction] → [body] → outputs
+    Every kernel reads as a program::
 
-    - ``inputs``: ``KernelInput`` trees (Port | Mux | Combine).
-    - ``contraction``: optional systolic core (matmul).
-    - ``body``: a flat sequential chain of ``ElementwiseOp`` and
-      ``ReduceOp`` ops. ``ElementwiseOp`` transforms the current value;
-      ``ReduceOp`` collapses an axis. Position defines the dataflow.
-      Replaces the old ``reduce_stages`` + ``epilogue`` split.
-    - ``outputs``: write targets (Port | Mux).
+        mul = mul(a, b)
+        dot = reduce_sum(mul)
+        out = add(dot, bias)
 
-    ``external_shapes`` keeps buffer-id → shape for codegen.
+    The codegen walks the body sequentially, maintaining a ``values`` dict
+    mapping Assign names to C expressions. Contraction (matmul K-loop) is
+    detected by pattern-matching the SSA graph, not by a separate field.
     """
 
     inputs: tuple[KernelInput, ...]
-    outputs: tuple[KernelOutput, ...]
-    contraction: ContractionCore | None = None
-    body: tuple[OpSlot, ...] = ()
+    body: tuple[Assign, ...] = ()
+    outputs: tuple[KernelOutput, ...] = ()
     external_shapes: dict = field(default_factory=dict)
-    kernel_source: str = ""  # backend-set after emission
+
+    def __post_init__(self) -> None:
+        _validate_ssa(self)
 
 
-# ---------------------------------------------------------------------------
-# OpSlot — lightweight operation descriptor for structural chains.
-# Position in the tuple IS the connectivity; shape is derived via
-# op.infer_output_shape() when needed.
-# ---------------------------------------------------------------------------
-
-
-type OpSlot = ElementwiseOp | ReduceOp
 type ElementwiseChain = tuple[ElementwiseOp, ...]
 
 
@@ -574,6 +565,20 @@ def _assert_elementwise_chain(chain: ElementwiseChain, where: str) -> None:
             raise TypeError(f"{where}[{i}] is {type(op).__name__}, expected ElementwiseOp")
 
 
-def _assert_reduce_op(op: ReduceOp, where: str) -> None:
-    if not isinstance(op, ReduceOp):
-        raise TypeError(f"{where} is {type(op).__name__}, expected ReduceOp")
+def _validate_ssa(kernel: KernelOp) -> None:
+    """Enforce SSA invariants: unique names, defined-before-use."""
+    defined: set[str] = set()
+    for inp in kernel.inputs:
+        if isinstance(inp, Port):
+            defined.add(inp.buffer_id)
+        elif isinstance(inp, Combine):
+            for src in inp.sources:
+                if isinstance(src, Port):
+                    defined.add(src.buffer_id)
+    for assign in kernel.body:
+        for arg in assign.args:
+            if arg not in defined:
+                raise ValueError(f"Assign {assign.name!r}: arg {arg!r} not defined")
+        if assign.name in defined:
+            raise ValueError(f"Assign {assign.name!r}: name already defined")
+        defined.add(assign.name)

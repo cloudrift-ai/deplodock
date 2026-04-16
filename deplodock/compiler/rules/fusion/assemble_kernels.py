@@ -5,15 +5,17 @@ primitive graph. After this rule runs to fixed point, every compute
 node in the graph is wrapped in a ``KernelOp`` — the graph contains
 only ``KernelOp``, ``InputOp``, and ``ConstantOp`` nodes.
 
-The kernel grammar (see ``ops.py`` docstring for analogies):
+The kernel grammar:
 
     contraction?  (mul + sum pair, backtracking)
     stage*        (pre_ops* + reduce, repeating)
     epilogue*     (trailing elementwise chain)
 
-Input-tree construction (backward walk): for each external input,
-single-source ``IndexMapOp`` with fan-out 1 folds into ``Port.indexmap``;
-multi-source ``IndexMapOp`` builds a ``Mux``.
+Each consumed graph node becomes an ``Assign`` in the kernel body::
+
+    mul = mul(a, b)
+    dot = reduce_sum(mul)
+    out = add(dot, bias)
 """
 
 from __future__ import annotations
@@ -21,9 +23,8 @@ from __future__ import annotations
 from deplodock.compiler.ir import Graph, Node, Tensor
 from deplodock.compiler.matcher import ChainMatch, Group, Production, parse_chain
 from deplodock.compiler.ops import (
-    Combine,
+    Assign,
     ConstantOp,
-    ContractionCore,
     ElementwiseOp,
     IndexMapOp,
     InputOp,
@@ -65,8 +66,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     if isinstance(node.op, (InputOp, ConstantOp, KernelOp)):
         return graph
 
-    # Standalone IndexMapOp: only wrap as a copy kernel once all consumers
-    # are already KernelOps (so the backward walk had its chance to absorb).
     if isinstance(node.op, IndexMapOp):
         consumers = graph.consumers(seed)
         if all(isinstance(graph.nodes[c].op, KernelOp) for c in consumers if c in graph.nodes):
@@ -77,21 +76,18 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     if chain is None or not chain.consumed:
         return graph
 
-    body_ops = _build_body(graph, chain)
-
     all_consumed = set(chain.consumed)
     external_inputs = _collect_external_inputs(graph, all_consumed)
     inputs, external_shapes, port_map = _build_input_tree(graph, external_inputs, all_consumed)
-    contraction = _build_contraction(graph, chain, port_map)
+    body = _build_body(graph, chain, port_map)
 
     last_nid = _last_node_id(chain)
     last_node = graph.nodes[last_nid]
 
     kernel = KernelOp(
         inputs=tuple(inputs),
+        body=tuple(body),
         outputs=(Port(buffer_id=last_nid),),
-        contraction=contraction,
-        body=tuple(body_ops),
         external_shapes=external_shapes,
     )
 
@@ -100,13 +96,8 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     new_nid = g.add_node(
         op=kernel,
         inputs=input_nids,
-        output=Tensor(
-            name=f"kernel_{last_nid}",
-            shape=last_node.output.shape,
-            dtype=last_node.output.dtype,
-        ),
+        output=Tensor(name=f"kernel_{last_nid}", shape=last_node.output.shape, dtype=last_node.output.dtype),
     )
-    # Promote hints from consumed graph nodes to the KernelOp node.
     for nid in all_consumed:
         orig = graph.nodes.get(nid)
         if orig is not None and orig.hints:
@@ -122,45 +113,49 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
 
 
 # ---------------------------------------------------------------------------
-# KernelOp field builders
+# Body builder — produces Assign statements from the parsed chain
 # ---------------------------------------------------------------------------
 
 
-def _build_contraction(graph: Graph, chain: ChainMatch, port_map: dict) -> ContractionCore | None:
-    """Build a ContractionCore, using ``port_map`` to resolve absorbed inputs.
+def _build_body(graph: Graph, chain: ChainMatch, port_map: dict) -> list[Assign]:
+    """Build SSA Assigns from the grammar parse.
 
-    ``port_map`` maps original buffer_id → absorbed Port (with indexmap
-    set if the original id was an IndexMapOp absorbed by the backward walk).
+    Each consumed graph node becomes an Assign: ``name = op(args)``.
+    Args reference input Port.buffer_ids or prior Assign names. When a
+    Port was absorbed from an IndexMapOp (recorded in ``port_map``), the
+    arg name is remapped from the IndexMapOp's output id to the absorbed
+    Port's buffer_id.
     """
-    mul_ids = chain.get("mul")
-    if not mul_ids:
-        return None
-    contraction_reduce_ids = [
-        nid for seg in chain.segments if seg.name.startswith("contraction[") and seg.name.endswith("].reduce") for nid in seg.node_ids
-    ]
-    if not contraction_reduce_ids:
-        return None
+    assigns: list[Assign] = []
+    # Build reverse map: original graph id → absorbed Port buffer_id.
+    remap: dict[str, str] = {}
+    for orig_id, port_or_mux in port_map.items():
+        if isinstance(port_or_mux, Port):
+            remap[orig_id] = port_or_mux.buffer_id
 
-    mul_node = graph.nodes[mul_ids[0]]
-    red_node = graph.nodes[contraction_reduce_ids[0]]
+    def _remap_args(node: Node) -> tuple[str, ...]:
+        return tuple(remap.get(inp, inp) for inp in node.inputs)
 
-    src_ports = tuple(port_map.get(inp, Port(buffer_id=inp)) for inp in mul_node.inputs)
-    operand = Combine(sources=src_ports, ops=(mul_node.op,))
+    # Contraction group
+    for seg in chain.segments:
+        if seg.name.startswith("contraction["):
+            for nid in seg.node_ids:
+                node = graph.nodes[nid]
+                assigns.append(Assign(name=nid, op=node.op, args=_remap_args(node)))
 
-    assert isinstance(red_node.op, ReduceOp)
-    return ContractionCore(operand=operand, reduce=red_node.op)
-
-
-def _build_body(graph: Graph, chain: ChainMatch) -> list:
-    """Build the flat body chain from stage groups + epilogue segments."""
-    ops: list = []
+    # Stage groups
     for group_segs in chain.get_groups("stage"):
         for seg in group_segs:
             for nid in seg.node_ids:
-                ops.append(graph.nodes[nid].op)
+                node = graph.nodes[nid]
+                assigns.append(Assign(name=nid, op=node.op, args=_remap_args(node)))
+
+    # Epilogue
     for nid in chain.get("epilogue"):
-        ops.append(graph.nodes[nid].op)
-    return ops
+        node = graph.nodes[nid]
+        assigns.append(Assign(name=nid, op=node.op, args=_remap_args(node)))
+
+    return assigns
 
 
 def _last_node_id(chain: ChainMatch) -> str:
@@ -176,7 +171,6 @@ def _last_node_id(chain: ChainMatch) -> str:
 
 
 def _collect_external_inputs(graph: Graph, consumed: set[str]) -> list[str]:
-    """Collect buffer ids of all external inputs referenced by consumed nodes."""
     seen: list[str] = []
     for nid in consumed:
         node = graph.nodes.get(nid)
@@ -193,15 +187,6 @@ def _build_input_tree(
     external_inputs: list[str],
     consumed: set[str],
 ) -> tuple[list, dict[str, tuple], dict]:
-    """Build KernelInput trees for each external input.
-
-    Single-source IndexMapOp with fan-out 1 → fold into Port.indexmap.
-    Multi-source IndexMapOp → Mux. Otherwise → bare Port.
-
-    Returns ``(inputs, external_shapes, port_map)`` where ``port_map``
-    maps original buffer_id → the constructed Port/Mux (so the
-    contraction builder can resolve absorbed inputs).
-    """
     inputs = []
     external_shapes: dict[str, tuple] = {}
     port_map: dict[str, Port | Mux] = {}
@@ -241,23 +226,19 @@ def _build_input_tree(
 
 
 def _first_port_id(inp) -> str:
-    """Extract the first Port.buffer_id from a KernelInput tree."""
     if isinstance(inp, Port):
         return inp.buffer_id
     if isinstance(inp, Mux):
         return _first_port_id(inp.branches[0].input)
-    if isinstance(inp, Combine):
-        return _first_port_id(inp.sources[0])
     return ""
 
 
-def _wrap_indexmap_kernel(graph: Graph, node: Node) -> Graph:
-    """Wrap a standalone IndexMapOp as a copy KernelOp.
+# ---------------------------------------------------------------------------
+# Standalone IndexMapOp wrapping
+# ---------------------------------------------------------------------------
 
-    Single-source → Port(src, indexmap=op). Multi-source → Mux.
-    The kernel has no contraction, no reduce_stages, no epilogue —
-    it just reads via the indexmap and writes to the output buffer.
-    """
+
+def _wrap_indexmap_kernel(graph: Graph, node: Node) -> Graph:
     nid = node.id
     op = node.op
     assert isinstance(op, IndexMapOp)

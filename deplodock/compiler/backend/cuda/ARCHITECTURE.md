@@ -43,21 +43,34 @@ Program
 .cu  →  nvcc  →  GPU
 ```
 
-## Per-Variant Walkers in `emit.py`
+## Walkers and Emitters in `emit.py`
 
-Every walker takes the IR node + a coord `Expr` and emits code that
-evaluates the node at that coord. Temporaries are appended to a
-running `list[Stmt]`; the walker returns the `Expr` that yields the
-value.
+The emitter walks `KernelOp`'s SSA `body` (a sequence of `Assign`
+statements). Each `Assign` is `name = op(args)` where args reference
+input `Port.buffer_id`s or prior `Assign` names.
 
-| IR variant          | Walker                           | Emission                                                                        |
-| ------------------- | -------------------------------- | ------------------------------------------------------------------------------- |
-| `Port`              | `_emit_input_value`              | `ArrayAccess(buffer, coord)`                                                    |
-| `Mux`               | `_emit_input_value`              | Nested `Ternary` chain over `branch.select`                                     |
-| `Combine`           | `_emit_input_value`              | Temporaries for each source + `VarDecl` fold over `ops` chain                   |
-| `ContractionCore`   | `_emit_contraction_body`         | 2D grid (N, M, 1); serial K-loop; `acc += a[m*K+k] * b[k*N+n]`                   |
-| `ReduceStage`       | `_emit_reduce_body`              | 1 block/row; serial K-loop; shared-memory reduce is future work                 |
-| `KernelOp.epilogue` | `_apply_epilogue`                | Linear fold over the elementwise chain at the output coord                      |
+**Input-tree walker** (`_emit_input_value`): evaluates a `KernelInput`
+at a coord `Expr`, appending temporaries to a `list[Stmt]`.
+
+| IR variant  | Emission                                                    |
+| ----------- | ----------------------------------------------------------- |
+| `Port`      | `ArrayAccess(buffer, coord)` or indexmap load               |
+| `Mux`       | Nested `Ternary` chain over `branch.select`                 |
+| `Combine`   | Temporaries for each source + `VarDecl` fold over ops chain |
+
+**Body emitters**: three paths selected by `_detect_contraction` and
+the presence of `ReduceOp` Assigns:
+
+| Pattern                    | Emitter                  | Emission                                                      |
+| -------------------------- | ------------------------ | ------------------------------------------------------------- |
+| Contraction (mul+reduce)   | `_emit_contraction_body` | 2D grid (N, M, batch); serial K-loop; post-contraction SSA    |
+| Reduce (no contraction)    | `_emit_reduce_body`      | 1 block/row; serial K-loop per ReduceOp Assign                |
+| Pointwise (no ReduceOp)    | `_emit_pointwise_body`   | 1D grid; inline elementwise per Assign                        |
+
+**Contraction detection** (`_detect_contraction`): pattern-matches the
+SSA body for a binary `ElementwiseOp` whose both args are input Port
+names, followed by a `ReduceOp` consuming it. Returns the index and
+the two Assigns, or `None`.
 
 ## Naive Schedule Policy
 
@@ -65,13 +78,13 @@ Correctness-first. No shared memory, no async copies, no TMA, no
 vectorization, no tiling beyond the trivial. Tuning and tiling are
 follow-up commits.
 
-- **Pointwise** (`contraction is None`, `reduce_stages == ()`):
+- **Pointwise** (no `ReduceOp` in body):
   1D grid, `block = (256, 1, 1)`, one thread per flat output coord.
-- **Reduce chain** (`reduce_stages` non-empty, no contraction):
+- **Reduce chain** (`ReduceOp` in body, no contraction):
   1D grid over the post-reduce shape; `block = (1, 1, 1)`; each block
   runs a serial K-loop over the reduced axis.
-- **Contraction** (matmul-shaped):
-  2D grid `(N, M, 1)`; `block = (1, 1, 1)`; each thread iterates K
+- **Contraction** (detected mul+reduce pattern):
+  2D grid `(N, M, batch)`; `block = (1, 1, 1)`; each thread iterates K
   serially.
 
 ## Buffer Roles
