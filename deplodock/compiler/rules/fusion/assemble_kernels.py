@@ -151,8 +151,7 @@ def _build_contraction(graph: Graph, chain: ChainMatch, port_map: dict) -> Contr
     operand = Combine(sources=src_ports, ops=(mul_node.op,))
 
     assert isinstance(red_node.op, ReduceOp)
-    k_axis = red_node.op.axis if isinstance(red_node.op.axis, int) else -1
-    return ContractionCore(operand=operand, k_axis=k_axis, reduce=red_node.op)
+    return ContractionCore(operand=operand, reduce=red_node.op)
 
 
 def _build_reduce_stages(graph: Graph, chain: ChainMatch) -> list[ReduceStage]:

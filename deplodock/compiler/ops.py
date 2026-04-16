@@ -512,14 +512,13 @@ class ContractionCore:
     """Systolic core: sum (or associative reduce) over a per-K operand.
 
     For matmul, ``operand`` is a ``Combine(sources=(a, b), ops=(mul,))``:
-    the per-K element product whose reduction over ``k_axis`` yields one
+    the per-K element product whose reduction over ``reduce.axis`` yields one
     output element. Generalizes to other associative contractions by
     choosing different ``operand.ops`` chains (e.g. sub+abs for
     sum-of-abs-diff) and different reduce functions.
     """
 
     operand: KernelInput
-    k_axis: int
     reduce: ReduceOp
 
     def __post_init__(self) -> None:
