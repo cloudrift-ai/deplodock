@@ -1,12 +1,12 @@
 """Kernel IR to C source code generation.
 
-Backend-agnostic printer: walks the AST from ir.py and emits C/C++ text.
-Usable for both CUDA and HIP targets.
+Backend-agnostic printer: walks the AST from ``compiler/ir/kernel.py`` and
+emits C/C++ text. Usable for both CUDA and HIP targets.
 """
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.ir.kernel_ir import (
+from deplodock.compiler.ir.kernel import (
     ArrayAccess,
     ArrayDecl,
     Assign,
@@ -22,10 +22,12 @@ from deplodock.compiler.backend.ir.kernel_ir import (
     KernelExpr,
     Literal,
     PragmaUnroll,
+    RawCode,
     Stmt,
     SyncThreads,
     Ternary,
     Var,
+    VarAssign,
     VarDecl,
     VectorLoad,
 )
@@ -139,8 +141,6 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
         value = _emit_expr(stmt.value)
         return f"{pad}{target} = {value};"
 
-    from deplodock.compiler.backend.ir.kernel_ir import VarAssign
-
     if isinstance(stmt, VarAssign):
         value = _emit_expr(stmt.value)
         return f"{pad}{stmt.name} = {value};"
@@ -180,8 +180,6 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
         if stmt.factor is not None:
             return f"{pad}#pragma unroll {stmt.factor}"
         return f"{pad}#pragma unroll"
-
-    from deplodock.compiler.backend.ir.kernel_ir import RawCode
 
     if isinstance(stmt, RawCode):
         # Indent each line of the raw code.

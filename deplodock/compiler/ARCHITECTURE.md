@@ -6,10 +6,15 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │  LAYER 1 · Frontend (backend-agnostic)                           │
 │                                                                  │
-│  torch_trace.py ─→ Graph IR (ir.py, ops.py)                      │
-│      Tensor, Node[T_Op], Graph; primitive Op subclasses          │
-│      (ElementwiseOp, ReduceOp, IndexMapOp, LinearOp, MatmulOp,   │
-│       SdpaOp, MeanOp, ...).                                      │
+│  torch_trace.py ─→ Graph populated with frontend ops             │
+│      ir/graph.py:    Tensor, Node[T_Op], Graph, Hints            │
+│      ir/base.py:     Op, InputOp, ConstantOp                     │
+│      ir/frontend.py: Torch-captured ops (LinearOp, MatmulOp,     │
+│                      SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,   │
+│                      ReshapeOp, SliceOp, CatOp)                  │
+│      ir/tensor.py:   minimal IR survives decomposition           │
+│                      (ElementwiseOp, ReduceOp, IndexMapOp, ...)  │
+│      ir/expr.py:     Expr AST + coord_expr helpers               │
 │                                                                  │
 │  RULE: No GPU, no CUDA, no backend imports.                      │
 ├──────────────────────────────────────────────────────────────────┤
@@ -19,11 +24,11 @@
 │  pipeline.py: compile_graph(graph) -> CompileResult              │
 │    CompileResult: kernels + graph_inputs/outputs/constants       │
 │                                                                  │
-│  Each KernelOp is one GPU kernel described as an SSA program:    │
+│  Each KernelOp (ir/block.py) is one GPU kernel as an SSA program:│
 │      inputs (Port | Mux | Combine) →                             │
 │        body (tuple[Assign, ...])  — SSA: name = op(args) →       │
 │        outputs (Port | Mux)                                      │
-│  Contraction (matmul) is lowered as mul + reduce_sum Assigns.  │
+│  Contraction (matmul) is lowered as mul + reduce_sum Assigns.    │
 │                                                                  │
 │  RULE: Operates on Graph + KernelOp IR only. No backend imports. │
 ├──────────────────────────────────────────────────────────────────┤
@@ -31,18 +36,24 @@
 │                                                                  │
 │  backend/base.py:           Backend ABC (compile, run, benchmark)│
 │  backend/program.py:        Buffer, Launch, Program              │
-│  backend/ir/expr.py:        Shared Expr AST (Var, BinOp, ...)    │
-│  backend/ir/kernel_ir.py:   Imperative AST (KernelDef, Stmt, ...)│
-│  backend/ir/kernel_codegen.py: KernelDef → C source              │
+│  backend/kernel_codegen.py: KernelDef → C source                 │
 │  backend/cuda/emit.py:      KernelOp → KernelDef via recursive   │
 │                              descent; no classification.         │
 │  backend/cuda/backend.py:   CudaBackend.compile(list[KernelOp])  │
 │  backend/cuda/program.py:   generate_source, nvcc, run           │
 │  backend/cuda/runner.py:    single-kernel compile + run harness  │
 │                                                                  │
+│  The imperative C-like kernel AST itself lives upstream in       │
+│  ir/kernel.py (KernelDef, Stmt, ArrayAccess, ...), so the        │
+│  backend only *consumes* it.                                     │
+│                                                                  │
 │  RULE: GPU specifics live here; everything above is portable.    │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+See `ir/ARCHITECTURE.md` for the per-dialect breakdown of each IR level,
+what ops are legal at each stage, and the invariants the rewriter
+establishes between stages.
 
 ## Canonical Data Flow
 
@@ -76,7 +87,7 @@ defined-before-use, no forward references.
 | `Port.buffer_id`              | `str`                                    | External buffer read/write                                          |
 | `Port.indexmap`               | `IndexMapOp \| None`                     | Layout transform at the load/store                                  |
 | `Mux.branches[i].input`       | `KernelInput` (recursive)                | Dispatched read (cat, RoPE halves, KV cache)                        |
-| `Mux.branches[i].select`      | `Expr` (from `backend/ir/expr`)          | Output-coord predicate                                              |
+| `Mux.branches[i].select`      | `Expr` (from `ir/expr`)                  | Output-coord predicate                                              |
 | `Combine.sources`             | `tuple[KernelInput, ...]`                | N sub-inputs to an elementwise chain                                |
 | `Combine.ops`                 | `tuple[ElementwiseOp, ...]`              | Per-coord elementwise work                                          |
 | `Assign.name`                 | `str`                                    | SSA value name                                                      |

@@ -13,14 +13,8 @@ import math
 from collections import deque
 from dataclasses import dataclass
 
-from deplodock.compiler.ops import (
-    Assign,
-    Combine,
-    KernelOp,
-    Mux,
-    Port,
-    ReduceOp,
-)
+from deplodock.compiler.ir.block import Assign, Combine, KernelOp, Mux, Port
+from deplodock.compiler.ir.tensor import ReduceOp
 
 # ---------------------------------------------------------------------------
 # Plan data structures

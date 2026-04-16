@@ -1,8 +1,9 @@
 """Unit tests for the chain-grammar parser (matcher.parse_chain)."""
 
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import Group, Production, match_grammar, parse_chain
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 
 
 def _build_chain(ops: list[tuple[str, object]]) -> Graph:

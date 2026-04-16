@@ -1,21 +1,102 @@
-"""Tensor IR: Tensor, Node, and Graph.
+"""Graph container + ``Hints`` metadata.
 
-The IR is a directed acyclic dataflow graph (Kahn-style) over tensor
-values. Each ``Node`` wraps one primitive ``Op`` subtype, so nodes are
+The graph is a directed acyclic dataflow graph (Kahn-style) over tensor
+values. Each ``Node`` wraps one primitive ``Op`` subclass, so nodes are
 parameterized by their op type — a ``Node[ElementwiseOp]`` is statically
 distinguishable from a ``Node[ReduceOp]``. The structural compiler IR
-(``KernelOp`` trees in ``ops.py``) relies on that distinction to carry
+(``KernelOp`` trees in ``ir/block.py``) relies on that distinction to carry
 typed chains like ``tuple[Node[ElementwiseOp], ...]``.
+
+The same ``Graph`` hosts nodes from every IR level as the rewriter runs:
+frontend ops during tracing → tensor/minimal ops after decomposition →
+``KernelOp`` nodes after fusion. Shapes, inputs, outputs, and hints live
+on nodes; ops themselves are shape-free and shared-free by convention.
+
+``Hints`` is the advisory metadata bag attached to individual nodes and
+to the graph as a whole. It lives here because ``Node`` and ``Graph`` are
+its only users.
 """
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
+from typing import Any
 
-from deplodock.compiler import ops as ops_module
-from deplodock.compiler.hints import Hints
-from deplodock.compiler.ops import Op
+from deplodock.compiler.ir.base import Op
+
+# ---------------------------------------------------------------------------
+# Hints
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Hints:
+    """Advisory metadata bag keyed by dotted namespace strings.
+
+    Hints do not affect computation semantics — backends may ignore unknown
+    hints. Keys use dotted namespaces (e.g. ``cuda.matmul.strategy``).
+    """
+
+    _data: dict[str, Any] = field(default_factory=dict)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return the value for *key*, or *default* if absent."""
+        return self._data.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        """Set a hint value."""
+        self._data[key] = value
+
+    def has(self, key: str) -> bool:
+        """Return whether *key* is present."""
+        return key in self._data
+
+    def remove(self, key: str) -> None:
+        """Remove *key* if present."""
+        self._data.pop(key, None)
+
+    def merge(self, other: Hints) -> None:
+        """Merge *other* into self.  Other's values win on conflict."""
+        self._data.update(other._data)
+
+    def prefix(self, ns: str) -> dict[str, Any]:
+        """Return all hints under *ns* as a flat dict with the prefix stripped.
+
+        >>> h = Hints(); h.set("cuda.matmul.strategy", "naive")
+        >>> h.prefix("cuda.matmul")
+        {'strategy': 'naive'}
+        """
+        dot = ns if ns.endswith(".") else ns + "."
+        return {k[len(dot) :]: v for k, v in self._data.items() if k.startswith(dot)}
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-compatible dict."""
+        return dict(self._data)
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> Hints:
+        """Deserialize from a dict."""
+        return Hints(_data=dict(data))
+
+    def __bool__(self) -> bool:
+        return bool(self._data)
+
+    def __repr__(self) -> str:
+        return f"Hints({self._data!r})"
+
+
+def resolve_hints(graph: Graph, node_id: str) -> Hints:
+    """Merge graph-level hints with node-level hints (node wins)."""
+    merged = Hints()
+    merged.merge(graph.hints)
+    merged.merge(graph.nodes[node_id].hints)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Tensor + Node + Graph
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -44,6 +125,24 @@ class Node[T_Op: Op]:
     inputs: list[str]  # node ids
     output: Tensor
     hints: Hints = field(default_factory=Hints)
+
+
+def _lookup_op_class(name: str) -> type[Op] | None:
+    """Find an Op subclass by name across all IR dialect modules.
+
+    Used by ``Graph.from_dict`` to reconstruct nodes. Lazy-imports each
+    module to avoid pulling them all in at graph import time.
+    """
+    from deplodock.compiler.ir import base as _base
+    from deplodock.compiler.ir import block as _block
+    from deplodock.compiler.ir import frontend as _frontend
+    from deplodock.compiler.ir import tensor as _tensor
+
+    for module in (_base, _tensor, _frontend, _block):
+        cls = getattr(module, name, None)
+        if isinstance(cls, type) and issubclass(cls, Op):
+            return cls
+    return None
 
 
 class Graph:
@@ -154,7 +253,7 @@ class Graph:
         # First pass: create all nodes (inputs first, then in order).
         for nid, ndata in data["nodes"].items():
             op_cls_name = ndata["op"]
-            op_cls = getattr(ops_module, op_cls_name, None)
+            op_cls = _lookup_op_class(op_cls_name)
             if op_cls is None:
                 raise ValueError(f"Unknown op class: {op_cls_name}")
 

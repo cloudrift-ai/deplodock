@@ -15,9 +15,9 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.matcher import ChainGrammar, ChainMatch, match_grammar
-from deplodock.compiler.ops import InputOp
 
 logger = logging.getLogger(__name__)
 

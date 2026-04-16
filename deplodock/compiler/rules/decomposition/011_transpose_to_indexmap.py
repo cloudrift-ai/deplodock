@@ -6,10 +6,12 @@ always a length-2 tuple describing two dims to swap — matching PyTorch's
 and b read from each other.
 """
 
-from deplodock.compiler.coord_expr import placeholder
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.expr import placeholder
+from deplodock.compiler.ir.frontend import TransposeOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import IndexMapOp, IndexSource, InputOp, TransposeOp
 
 GRAMMAR = [Production("root", TransposeOp, "1")]
 

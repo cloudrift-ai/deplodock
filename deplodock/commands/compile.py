@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir import Graph
+    from deplodock.compiler.ir.graph import Graph
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ def handle_compile(args):
 
 
 def _load_graph(path: Path) -> Graph:
-    from deplodock.compiler.ir import Graph
+    from deplodock.compiler.ir.graph import Graph
 
     with open(path) as f:
         data = json.load(f)

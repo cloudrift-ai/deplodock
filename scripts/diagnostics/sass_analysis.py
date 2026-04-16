@@ -39,11 +39,14 @@ REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO))
 
 from deplodock.compiler.backend.codegen import emit_kernel  # noqa: E402
-
 from deplodock.compiler.backend.cuda.generators import lower_tiled  # noqa: E402
+
 from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
-from deplodock.compiler.ops import ElementwiseOp, FusedRegionOp, ReduceOp  # noqa: E402
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp  # noqa: E402
+
+# TODO: FusedRegionOp no longer exists in the structural IR; this diagnostic
+# script predates the KernelOp refactor and needs porting before it can run.
 
 # Opcode families we care about for the histogram. The article groups by these.
 # Pattern → display name. Each pattern is matched as a prefix on the SASS
@@ -87,7 +90,7 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
     print(f"# profile: {profile}, config for {size}: TM={tm}, BK={bk}, ks={ks}", file=sys.stderr)
 
     strategy = selected.get("strategy", "tma_db")
-    region = FusedRegionOp(
+    region = FusedRegionOp(  # noqa: F821  (see TODO above — script pre-dates KernelOp refactor)
         region_ops=[("ew", ElementwiseOp("mul"), ["A", "B"]), ("C", ReduceOp("sum", axis=1), ["ew"])],
         input_names=["A", "B"],
         output_names=["C"],

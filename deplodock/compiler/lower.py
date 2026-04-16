@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir import Graph
-from deplodock.compiler.ops import KernelOp
+from deplodock.compiler.ir.block import KernelOp
+from deplodock.compiler.ir.graph import Graph
 
 
 @dataclass

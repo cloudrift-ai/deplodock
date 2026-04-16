@@ -20,7 +20,7 @@ def _handle_run(args):
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.dump import CompilerDump
-    from deplodock.compiler.ir import Graph
+    from deplodock.compiler.ir.graph import Graph
     from deplodock.compiler.pipeline import compile_graph
 
     dump = CompilerDump.resolve(args.dump_dir)

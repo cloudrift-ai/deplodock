@@ -4,12 +4,9 @@ After compile_graph, every primitive op is inside a KernelOp. Tests verify
 the structural shape of the resulting KernelOps (SSA Assign body).
 """
 
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import (
-    ElementwiseOp,
-    InputOp,
-    ReduceOp,
-)
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 
 
@@ -59,7 +56,7 @@ def test_reduce_sum():
 
 
 def test_matmul():
-    from deplodock.compiler.ops import MatmulOp
+    from deplodock.compiler.ir.frontend import MatmulOp
 
     g = Graph()
     _input(g, "a", (4, 8))
@@ -90,7 +87,7 @@ def test_no_matmul_when_mul_fans_out():
 
 
 def test_matmul_op_decomposes_and_fuses():
-    from deplodock.compiler.ops import MatmulOp
+    from deplodock.compiler.ir.frontend import MatmulOp
 
     g = Graph()
     _input(g, "a", (4, 8))

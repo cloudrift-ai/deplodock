@@ -9,17 +9,11 @@ The grammar:
 
 from __future__ import annotations
 
-from deplodock.compiler.ir import Graph, Node, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.block import Assign, KernelOp, Port
+from deplodock.compiler.ir.graph import Graph, Node, Tensor
+from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import (
-    Assign,
-    ElementwiseOp,
-    IndexMapOp,
-    InputOp,
-    KernelOp,
-    Port,
-    ReduceOp,
-)
 
 
 def _same_rank(op, node, graph):

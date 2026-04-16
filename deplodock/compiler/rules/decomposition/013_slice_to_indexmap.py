@@ -7,11 +7,12 @@ After decomposition: IndexMapOp.inputs = [tensor]; the dim/start values are
 baked into the coord_map.
 """
 
-from deplodock.compiler.backend.ir.expr import Literal
-from deplodock.compiler.coord_expr import placeholder
-from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.expr import Literal, placeholder
+from deplodock.compiler.ir.frontend import SliceOp
+from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ConstantOp, IndexMapOp, IndexSource, InputOp, SliceOp
 
 GRAMMAR = [Production("root", SliceOp, "1")]
 
