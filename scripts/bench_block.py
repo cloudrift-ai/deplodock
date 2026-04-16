@@ -172,49 +172,34 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
 
 
 def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
-    from pathlib import Path
-
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.plan import plan_graph
-    from deplodock.compiler.rewriter import PassTrace, Rewriter
+    from deplodock.compiler.pipeline import compile_graph
     from deplodock.compiler.torch_trace import trace_module
 
     try:
-        # Trace the block through our pipeline.
         graph = trace_module(block.cpu(), (x.cpu(),), kwargs={"position_embeddings": (pos_emb[0].cpu(), pos_emb[1].cpu())})
 
         if dump:
             dump.dump_input_graph(graph)
 
-        # Decompose + optimization + fusion — all run inside the Rewriter.
-        rules_dir = Path(__file__).parent.parent / "deplodock" / "compiler" / "rules"
-        rewriter = Rewriter.from_directory(rules_dir)
-        pass_traces: list[PassTrace] = []
-        compiled = rewriter.apply(graph, pass_traces=pass_traces)
+        result = compile_graph(graph)
 
-        if dump:
-            dump.dump_passes(pass_traces)
-            dump.dump_fused_graph(compiled)
-
-        # Plan from graph.
-        plan = plan_graph(compiled)
         backend = CudaBackend()
-        program = backend.compile(plan)
+        program = backend.compile(
+            result.kernels,
+            graph_inputs=result.graph_inputs,
+            graph_outputs=result.graph_outputs,
+            graph_constants=result.graph_constants,
+        )
 
         if dump:
-            dump.dump_plan(plan)
             dump.dump_program(program)
-            for launch in program.launches:
-                if hasattr(launch, "loop_ir") and launch.loop_ir is not None:
-                    dump.dump_loop_ir(launch.loop_ir, launch.kernel_name, schedule=getattr(launch, "schedule", None))
 
-        # Build input_data from actual PyTorch tensors for accuracy check.
         import torch
 
         from deplodock.compiler.ops import ConstantOp
 
         input_data: dict[str, list[float]] = {}
-        # Map graph input names to tensor data.
         for buf in program.buffers:
             if buf.role == "input":
                 if buf.name == "hidden_states":
@@ -224,7 +209,6 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
                 elif buf.name == "position_embeddings_1":
                     input_data[buf.name] = pos_emb[1].cpu().flatten().tolist()
             elif buf.role == "constant":
-                # Model weights: match by suffix + size.
                 matched = False
                 for key, param in block.named_parameters():
                     safe_key = "p_" + key.replace(".", "_")
@@ -233,18 +217,11 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
                         matched = True
                         break
                 if not matched and buf.size == 1:
-                    # Scalar constant (eps, scale, etc.) — look up from
-                    # both the original and compiled (post-rewrite) graphs.
-                    for src_graph in (compiled, graph):
-                        found = False
-                        for nid, node in src_graph.nodes.items():
-                            if isinstance(node.op, ConstantOp) and node.op.value is not None:
-                                if buf.name == nid or buf.name.endswith(nid):
-                                    input_data[buf.name] = [node.op.value]
-                                    found = True
-                                    break
-                        if found:
-                            break
+                    for nid, node in graph.nodes.items():
+                        if isinstance(node.op, ConstantOp) and node.op.value is not None:
+                            if buf.name == nid or buf.name.endswith(nid):
+                                input_data[buf.name] = [node.op.value]
+                                break
 
         # Run with actual data.
         run_result = backend.run(program, input_data=input_data)
