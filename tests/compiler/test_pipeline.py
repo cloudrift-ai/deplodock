@@ -41,7 +41,7 @@ def _matmul_graph(m: int, k: int, n: int) -> Graph:
 def test_compile_graph_fuses_matmul():
     result = compile_graph(_matmul_graph(4, 3, 2))
     # Matmul decomposes into unsqueeze copies + mul/sum kernel.
-    matmul_kernels = [k for k in result.kernels if any(isinstance(a.op, ReduceOp) for a in k.body)]
+    matmul_kernels = [k for k in result.kernels if any(isinstance(a.op, ReduceOp) for a in k.kernel.body)]
     assert len(matmul_kernels) == 1
 
 
@@ -53,7 +53,7 @@ def test_compile_graph_fuses_chain():
 
 def test_pipeline_to_program():
     result = compile_graph(_matmul_graph(4, 3, 2))
-    out_name = result.kernels[-1].outputs[0].buffer_id
+    out_name = result.kernels[-1].output_name
     program = CudaBackend().compile(
         result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=[out_name]
     )
@@ -97,7 +97,7 @@ def test_matmul_gpu():
     random.seed(0)
     g = _matmul_graph(3, 4, 5)
     result = compile_graph(g)
-    out_name = result.kernels[-1].outputs[0].buffer_id
+    out_name = result.kernels[-1].output_name
     program = CudaBackend().compile(
         result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=[out_name]
     )

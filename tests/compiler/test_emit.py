@@ -10,6 +10,7 @@ import pytest
 from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.lower import KernelInfo
 from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 
@@ -50,35 +51,22 @@ def _matmul_graph() -> Graph:
     return g
 
 
-def _softmax_kernel():
-    """Build a KernelOp with the softmax SSA pattern directly.
-
-    Body:
-        mx  = reduce_max(x)
-        sub = sub(x, mx)
-        ex  = exp(sub)
-        sm  = reduce_sum(ex)
-        out = div(ex, sm)
-
-    Returns (kernel, shapes) where shapes maps buffer_id -> shape.
-    """
+def _softmax_kernel_info():
+    """Build a KernelInfo with the softmax SSA pattern directly."""
     from deplodock.compiler.ops import Assign, KernelOp, Port
 
-    x_port = Port(buffer_id="x")
-    out_port = Port(buffer_id="y")
     kernel = KernelOp(
-        inputs=(x_port,),
+        inputs=(Port(), Port()),
         body=(
-            Assign(name="mx", op=ReduceOp(fn="max", axis=-1), args=("x",)),
-            Assign(name="sub", op=ElementwiseOp("sub"), args=("x", "mx")),
+            Assign(name="mx", op=ReduceOp(fn="max", axis=-1), args=("$0",)),
+            Assign(name="sub", op=ElementwiseOp("sub"), args=("$0", "mx")),
             Assign(name="ex", op=ElementwiseOp("exp"), args=("sub",)),
             Assign(name="sm", op=ReduceOp(fn="sum", axis=-1), args=("ex",)),
             Assign(name="out", op=ElementwiseOp("div"), args=("ex", "sm")),
         ),
-        outputs=(out_port,),
+        outputs=(Port(),),
     )
-    shapes = {"x": (4, 8), "y": (4, 8)}
-    return kernel, shapes
+    return KernelInfo(kernel=kernel, input_names=["x", "x"], output_name="y")
 
 
 # ---------------------------------------------------------------------------
@@ -135,17 +123,15 @@ def test_softmax_emits_multiple_k_loops():
     """Softmax pattern emits separate K-loops for max, sub+exp+sum, div."""
     from deplodock.compiler.backend.cuda.emit import emit_kernel
 
-    kernel, shapes = _softmax_kernel()
-    kdef, arg_order = emit_kernel(kernel, "k0_softmax", shapes)
+    info = _softmax_kernel_info()
+    shapes = {"$0": (4, 8), "$1": (4, 8)}
+    kdef, arg_order = emit_kernel(info, "k0_softmax", shapes)
     from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as emit_src
 
     source = emit_src(kdef)
-    # Must have multiple for-loops (at least 3: max, sub+exp+sum, div).
     loop_count = source.count("for (int")
     assert loop_count >= 3, f"expected >= 3 K-loops, got {loop_count}\n{source}"
-    # Max reduction uses fmaxf, not +=.
-    assert "fmaxf" in source, f"expected fmaxf for max reduction\n{source}"
-    # Sum reduction uses +=.
+    assert "fmaxf" in source
     assert "+=" in source
 
 
@@ -154,16 +140,14 @@ def test_softmax_emits_per_element_store():
     from deplodock.compiler.backend.cuda.emit import emit_kernel
     from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as emit_src
 
-    kernel, shapes = _softmax_kernel()
-    kdef, _ = emit_kernel(kernel, "k0_softmax", shapes)
+    info = _softmax_kernel_info()
+    shapes = {"$0": (4, 8), "$1": (4, 8)}
+    kdef, _ = emit_kernel(info, "k0_softmax", shapes)
     source = emit_src(kdef)
-    # The output store y[...] must appear inside the last K-loop, not after it.
-    # Verify there's a y[...] = ... assignment somewhere in the source.
     assert "y[" in source, f"expected output store y[...]\n{source}"
 
 
 def test_chained_pointwise_single_kernel():
-    """Two fan-out-1 elementwise ops fuse into one kernel."""
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4,)), node_id="x")
     g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
@@ -211,17 +195,14 @@ def test_reduce_runs_on_gpu():
 
 @requires_cuda
 def test_softmax_runs_on_gpu():
-    """End-to-end GPU correctness test for the softmax kernel."""
     import math
 
     from deplodock.compiler.backend.cuda.emit import compile_kernels
 
-    kernel, shapes = _softmax_kernel()
-    program = compile_kernels([kernel], buf_shapes=shapes, graph_inputs=["x"], graph_outputs=["y"])
-    # 4 rows x 8 cols
+    info = _softmax_kernel_info()
+    program = compile_kernels([info], buf_shapes={"x": (4, 8), "y": (4, 8)}, graph_inputs=["x"], graph_outputs=["y"])
     x_data = [float(i) for i in range(32)]
     result = CudaBackend().run(program, input_data={"x": x_data})
-    # Compute expected softmax row-by-row.
     expected = []
     for row in range(4):
         row_vals = x_data[row * 8 : (row + 1) * 8]
@@ -236,7 +217,7 @@ def test_softmax_runs_on_gpu():
 def test_matmul_runs_on_gpu():
     g = _matmul_graph()
     result = compile_graph(g)
-    out_name = result.kernels[-1].outputs[0].buffer_id
+    out_name = result.kernels[-1].output_name
     program = CudaBackend().compile(
         result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=[out_name]
     )

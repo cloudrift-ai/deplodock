@@ -46,35 +46,28 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     assert output_nid is not None
 
     external_inputs = _collect_external_inputs(graph, all_consumed)
-    inputs, port_map = _build_input_tree(graph, external_inputs, all_consumed)
+    ports, remap, input_names = _build_input_tree(graph, external_inputs, all_consumed)
     all_consumed |= layout_ids
-    body = _build_body_from_region(graph, all_consumed, port_map)
+    body = _build_body_from_region(graph, all_consumed, remap)
 
     if not body:
         return None
 
     last_node = graph.nodes[output_nid]
 
-    # Build fragment: InputOps for external ports, one KernelOp node.
+    # Build fragment: InputOps for external buffers, one KernelOp node.
     frag = Graph()
-    input_nids = []
-    for p in inputs:
-        bid = p.buffer_id if isinstance(p, Port) else _first_port_id(p)
-        if bid not in frag.nodes:
-            ext = graph.nodes.get(bid)
+    for name in input_names:
+        if name not in frag.nodes:
+            ext = graph.nodes.get(name)
             shape = ext.output.shape if ext else ()
             dtype = ext.output.dtype if ext else "f32"
-            frag.add_node(InputOp(), [], Tensor(bid, shape, dtype), node_id=bid)
-        input_nids.append(bid)
+            frag.add_node(InputOp(), [], Tensor(name, shape, dtype), node_id=name)
 
-    out_port = Port(buffer_id="__out__")
-    kernel = KernelOp(inputs=tuple(inputs), body=tuple(body), outputs=(out_port,))
-
-    out_id = frag.add_node(kernel, input_nids, Tensor(f"kernel_{output_nid}", last_node.output.shape, last_node.output.dtype))
-    out_port.buffer_id = out_id
+    kernel = KernelOp(inputs=tuple(ports), body=tuple(body), outputs=(Port(),))
+    out_id = frag.add_node(kernel, input_names, Tensor(f"kernel_{output_nid}", last_node.output.shape, last_node.output.dtype))
     frag.outputs = [out_id]
 
-    # The match.consumed must include all compute + layout + absorbed IndexMapOps.
     match.consumed = all_consumed
     return frag
 
@@ -84,12 +77,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 # ---------------------------------------------------------------------------
 
 
-def _build_body_from_region(graph: Graph, region: set[str], port_map: dict) -> list[Assign]:
-    remap: dict[str, str] = {}
-    for orig_id, port_or_mux in port_map.items():
-        if isinstance(port_or_mux, Port):
-            remap[orig_id] = port_or_mux.buffer_id
-
+def _build_body_from_region(graph: Graph, region: set[str], remap: dict[str, str]) -> list[Assign]:
     def _remap_args(node: Node) -> tuple[str, ...]:
         return tuple(remap.get(inp, inp) for inp in node.inputs)
 
@@ -123,19 +111,24 @@ def _collect_external_inputs(graph: Graph, consumed: set[str]) -> list[str]:
     return seen
 
 
-def _build_input_tree(graph: Graph, external_inputs: list[str], consumed: set[str]) -> tuple[list, dict]:
-    inputs = []
-    port_map: dict[str, Port] = {}
+def _build_input_tree(graph: Graph, external_inputs: list[str], consumed: set[str]) -> tuple[list[Port], dict[str, str], list[str]]:
+    """Build Ports and a remap dict mapping graph node IDs to $N references.
+
+    Returns (ports, remap, input_names) where:
+    - ports: list of Port objects (position = $N index)
+    - remap: graph_node_id → "$N" for Assign.args
+    - input_names: buffer name for each Port (for graph node inputs)
+    """
+    ports: list[Port] = []
+    remap: dict[str, str] = {}
+    input_names: list[str] = []
+    idx = 0
 
     for buf_id in external_inputs:
         node = graph.nodes.get(buf_id)
-        if node is None:
-            p = Port(buffer_id=buf_id)
-            inputs.append(p)
-            port_map[buf_id] = p
-            continue
 
-        if isinstance(node.op, IndexMapOp) and len(node.op.sources) == 1:
+        if node is not None and isinstance(node.op, IndexMapOp) and len(node.op.sources) == 1:
+            # Follow IndexMapOp chain to find ultimate non-IndexMapOp source.
             chain = [buf_id]
             cur_id = node.inputs[node.op.sources[0].input_idx]
             while cur_id in graph.nodes:
@@ -146,30 +139,29 @@ def _build_input_tree(graph: Graph, external_inputs: list[str], consumed: set[st
                 else:
                     break
             if cur_id in consumed:
+                # Internal chain — remap all to the consumed source's $N.
+                # Find which $N the source already has.
+                src_ref = remap.get(cur_id, cur_id)
                 for nid in chain:
                     consumed.add(nid)
-                    port_map[nid] = Port(buffer_id=cur_id)
+                    remap[nid] = src_ref
                 continue
+            # External source — absorb this IndexMapOp into Port.
             src_id = node.inputs[node.op.sources[0].input_idx]
             if len(graph.consumers(buf_id)) == 1:
                 consumed.add(buf_id)
-                p = Port(buffer_id=src_id, indexmap=node.op)
-                inputs.append(p)
-                port_map[buf_id] = p
+                ref = f"${idx}"
+                ports.append(Port(indexmap=node.op))
+                input_names.append(src_id)
+                remap[buf_id] = ref
+                idx += 1
                 continue
 
-        p = Port(buffer_id=buf_id)
-        inputs.append(p)
-        port_map[buf_id] = p
+        # Plain port (no IndexMapOp absorption).
+        ref = f"${idx}"
+        ports.append(Port())
+        input_names.append(buf_id)
+        remap[buf_id] = ref
+        idx += 1
 
-    return inputs, port_map
-
-
-def _first_port_id(inp) -> str:
-    if isinstance(inp, Port):
-        return inp.buffer_id
-    from deplodock.compiler.ops import Mux
-
-    if isinstance(inp, Mux):
-        return _first_port_id(inp.branches[0].input)
-    return ""
+    return ports, remap, input_names

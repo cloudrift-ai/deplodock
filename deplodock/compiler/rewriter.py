@@ -17,7 +17,7 @@ from pathlib import Path
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainGrammar, ChainMatch, match_grammar
-from deplodock.compiler.ops import Combine, InputOp, KernelOp, Mux, Port
+from deplodock.compiler.ops import InputOp
 
 logger = logging.getLogger(__name__)
 
@@ -186,21 +186,10 @@ def _apply_replacement(graph: Graph, match: ChainMatch, fragment: Graph) -> Grap
             g.nodes[new_id].hints = frag_node.hints
         id_map[frag_id] = new_id
 
-    # Update KernelOp output Ports to match their new graph node IDs.
-    for frag_id, new_id in id_map.items():
-        if frag_id == new_id:
-            continue
-        node = g.nodes.get(new_id)
-        if node is not None and isinstance(node.op, KernelOp):
-            for out in node.op.outputs:
-                if isinstance(out, Port) and out.buffer_id == frag_id:
-                    out.buffer_id = new_id
-
     # Wire fragment output to replace the match output.
     new_output = id_map[fragment.outputs[0]]
     old_output = match.output or match.root_node_id
-    g.replace_node(old_output, new_output)
-    _rename_in_kernels(g, old_output, new_output)
+    g.replace_node(old_output, new_output)  # also updates KernelOp internals
 
     # Merge hints from consumed nodes into the new output.
     for nid in match.consumed:
@@ -219,32 +208,6 @@ def _apply_replacement(graph: Graph, match: ChainMatch, fragment: Graph) -> Grap
     _remove_orphans(g)
 
     return g
-
-
-def _rename_in_kernels(graph: Graph, old_id: str, new_id: str) -> None:
-    """Update string references inside KernelOp internals (Port/Assign)."""
-    if old_id == new_id:
-        return
-    for node in graph.nodes.values():
-        if not isinstance(node.op, KernelOp):
-            continue
-        for inp in node.op.inputs:
-            _rename_ports(inp, old_id, new_id)
-        for assign in node.op.body:
-            if old_id in assign.args:
-                assign.args = tuple(new_id if a == old_id else a for a in assign.args)
-
-
-def _rename_ports(inp, old_id: str, new_id: str) -> None:
-    if isinstance(inp, Port):
-        if inp.buffer_id == old_id:
-            inp.buffer_id = new_id
-    elif isinstance(inp, Mux):
-        for branch in inp.branches:
-            _rename_ports(branch.input, old_id, new_id)
-    elif isinstance(inp, Combine):
-        for src in inp.sources:
-            _rename_ports(src, old_id, new_id)
 
 
 def _remove_orphans(graph: Graph) -> None:

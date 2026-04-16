@@ -28,7 +28,7 @@ def test_pointwise_add():
     result = compile_graph(g)
     kernels = result.kernels
     assert len(kernels) == 1
-    assert all(isinstance(a.op, ElementwiseOp) for a in kernels[0].body)
+    assert all(isinstance(a.op, ElementwiseOp) for a in kernels[0].kernel.body)
 
 
 def test_chained_pointwise_fuses_into_one():
@@ -42,7 +42,7 @@ def test_chained_pointwise_fuses_into_one():
     result = compile_graph(g)
     kernels = result.kernels
     assert len(kernels) == 1
-    assert len(kernels[0].body) == 2
+    assert len(kernels[0].kernel.body) == 2
 
 
 def test_reduce_sum():
@@ -55,7 +55,7 @@ def test_reduce_sum():
     result = compile_graph(g)
     kernels = result.kernels
     assert len(kernels) == 1
-    assert any(isinstance(a.op, ReduceOp) for a in kernels[0].body)
+    assert any(isinstance(a.op, ReduceOp) for a in kernels[0].kernel.body)
 
 
 def test_matmul():
@@ -70,8 +70,8 @@ def test_matmul():
 
     result = compile_graph(g)
     kernels = result.kernels
-    assert any(isinstance(a.op, ElementwiseOp) and a.op.fn == "mul" for k in kernels for a in k.body)
-    assert any(isinstance(a.op, ReduceOp) and a.op.fn == "sum" for k in kernels for a in k.body)
+    assert any(isinstance(a.op, ElementwiseOp) and a.op.fn == "mul" for k in kernels for a in k.kernel.body)
+    assert any(isinstance(a.op, ReduceOp) and a.op.fn == "sum" for k in kernels for a in k.kernel.body)
 
 
 def test_no_matmul_when_mul_fans_out():
@@ -102,7 +102,7 @@ def test_matmul_op_decomposes_and_fuses():
     result = compile_graph(g)
     kernels = result.kernels
     # Should have at least one kernel with a mul+sum pattern
-    has_reduce = any(any(isinstance(a.op, ReduceOp) for a in k.body) for k in kernels)
+    has_reduce = any(any(isinstance(a.op, ReduceOp) for a in k.kernel.body) for k in kernels)
     assert has_reduce
 
 

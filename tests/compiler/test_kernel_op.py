@@ -20,21 +20,21 @@ from deplodock.compiler.ops import (
 
 
 def test_port_plain():
-    assert Port("x").buffer_id == "x"
+    assert Port().indexmap is None
 
 
 def test_combine_binary():
-    c = Combine(sources=(Port("a"), Port("b")), ops=(ElementwiseOp("add"),))
+    c = Combine(sources=(Port(), Port()), ops=(ElementwiseOp("add"),))
     assert len(c.sources) == 2
 
 
 def test_combine_rejects_noop():
     with pytest.raises(ValueError):
-        Combine(sources=(Port("a"),), ops=())
+        Combine(sources=(Port(),), ops=())
 
 
 def test_mux():
-    m = Mux(branches=(MuxBranch(Port("a"), Var("c1")), MuxBranch(Port("b"), Var("c2"))))
+    m = Mux(branches=(MuxBranch(Port(), Var("c1")), MuxBranch(Port(), Var("c2"))))
     assert len(m.branches) == 2
 
 
@@ -44,10 +44,10 @@ def test_mux():
 
 
 def test_assign_construction():
-    a = Assign("out", ElementwiseOp("add"), args=("x", "y"))
+    a = Assign("out", ElementwiseOp("add"), args=("$0", "$1"))
     assert a.name == "out"
     assert a.op.fn == "add"
-    assert a.args == ("x", "y")
+    assert a.args == ("$0", "$1")
 
 
 # ---------------------------------------------------------------------------
@@ -57,70 +57,70 @@ def test_assign_construction():
 
 def test_kernel_pointwise():
     k = KernelOp(
-        inputs=(Port("x"), Port("y")),
-        body=(Assign("z", ElementwiseOp("add"), args=("x", "y")),),
-        outputs=(Port("z"),),
+        inputs=(Port(), Port()),
+        body=(Assign("z", ElementwiseOp("add"), args=("$0", "$1")),),
+        outputs=(Port(),),
     )
     assert len(k.body) == 1
 
 
 def test_kernel_reduce():
     k = KernelOp(
-        inputs=(Port("x"),),
-        body=(Assign("s", ReduceOp("sum", -1), args=("x",)),),
-        outputs=(Port("s"),),
+        inputs=(Port(),),
+        body=(Assign("s", ReduceOp("sum", -1), args=("$0",)),),
+        outputs=(Port(),),
     )
     assert isinstance(k.body[0].op, ReduceOp)
 
 
 def test_kernel_matmul():
     k = KernelOp(
-        inputs=(Port("a"), Port("b")),
+        inputs=(Port(), Port()),
         body=(
-            Assign("mul", ElementwiseOp("mul"), args=("a", "b")),
+            Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
             Assign("dot", ReduceOp("sum", -1), args=("mul",)),
         ),
-        outputs=(Port("dot"),),
+        outputs=(Port(),),
     )
     assert len(k.body) == 2
 
 
 def test_kernel_matmul_bias():
     k = KernelOp(
-        inputs=(Port("a"), Port("b"), Port("bias")),
+        inputs=(Port(), Port(), Port()),
         body=(
-            Assign("mul", ElementwiseOp("mul"), args=("a", "b")),
+            Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
             Assign("dot", ReduceOp("sum", -1), args=("mul",)),
-            Assign("out", ElementwiseOp("add"), args=("dot", "bias")),
+            Assign("out", ElementwiseOp("add"), args=("dot", "$2")),
         ),
-        outputs=(Port("out"),),
+        outputs=(Port(),),
     )
     assert len(k.body) == 3
 
 
 def test_kernel_softmax():
     k = KernelOp(
-        inputs=(Port("x"),),
+        inputs=(Port(),),
         body=(
-            Assign("max", ReduceOp("max", -1), args=("x",)),
-            Assign("sub", ElementwiseOp("sub"), args=("x", "max")),
+            Assign("max", ReduceOp("max", -1), args=("$0",)),
+            Assign("sub", ElementwiseOp("sub"), args=("$0", "max")),
             Assign("exp", ElementwiseOp("exp"), args=("sub",)),
             Assign("sum", ReduceOp("sum", -1), args=("exp",)),
             Assign("div", ElementwiseOp("div"), args=("exp", "sum")),
         ),
-        outputs=(Port("div"),),
+        outputs=(Port(),),
     )
     assert len(k.body) == 5
 
 
 def test_kernel_unary_chain():
     k = KernelOp(
-        inputs=(Port("x"),),
+        inputs=(Port(),),
         body=(
-            Assign("neg", ElementwiseOp("neg"), args=("x",)),
+            Assign("neg", ElementwiseOp("neg"), args=("$0",)),
             Assign("exp", ElementwiseOp("exp"), args=("neg",)),
         ),
-        outputs=(Port("exp"),),
+        outputs=(Port(),),
     )
     assert len(k.body) == 2
 
@@ -128,13 +128,13 @@ def test_kernel_unary_chain():
 def test_kernel_scatter_output():
     scatter = Mux(
         branches=(
-            MuxBranch(input=Port("out_a"), select=Var("c1")),
-            MuxBranch(input=Port("out_b"), select=Var("c2")),
+            MuxBranch(input=Port(), select=Var("c1")),
+            MuxBranch(input=Port(), select=Var("c2")),
         )
     )
     k = KernelOp(
-        inputs=(Port("x"), Port("y")),
-        body=(Assign("z", ElementwiseOp("add"), args=("x", "y")),),
+        inputs=(Port(), Port()),
+        body=(Assign("z", ElementwiseOp("add"), args=("$0", "$1")),),
         outputs=(scatter,),
     )
     assert isinstance(k.outputs[0], Mux)
@@ -148,45 +148,44 @@ def test_kernel_scatter_output():
 def test_ssa_rejects_undefined_arg():
     with pytest.raises(ValueError, match="not defined"):
         KernelOp(
-            inputs=(Port("x"),),
+            inputs=(Port(),),
             body=(Assign("y", ElementwiseOp("exp"), args=("z",)),),
-            outputs=(Port("y"),),
+            outputs=(Port(),),
         )
 
 
 def test_ssa_rejects_duplicate_name():
     with pytest.raises(ValueError, match="already defined"):
         KernelOp(
-            inputs=(Port("x"),),
+            inputs=(Port(),),
             body=(
-                Assign("y", ElementwiseOp("exp"), args=("x",)),
+                Assign("y", ElementwiseOp("exp"), args=("$0",)),
                 Assign("y", ElementwiseOp("neg"), args=("y",)),
             ),
-            outputs=(Port("y"),),
+            outputs=(Port(),),
         )
 
 
 def test_ssa_rejects_forward_reference():
     with pytest.raises(ValueError, match="not defined"):
         KernelOp(
-            inputs=(Port("x"),),
+            inputs=(Port(),),
             body=(
-                Assign("a", ElementwiseOp("add"), args=("x", "b")),
-                Assign("b", ElementwiseOp("exp"), args=("x",)),
+                Assign("a", ElementwiseOp("add"), args=("$0", "b")),
+                Assign("b", ElementwiseOp("exp"), args=("$0",)),
             ),
-            outputs=(Port("a"),),
+            outputs=(Port(),),
         )
 
 
 def test_ssa_allows_input_name_reuse_in_multiple_args():
-    """Same input referenced by multiple Assigns is valid SSA."""
     k = KernelOp(
-        inputs=(Port("x"),),
+        inputs=(Port(),),
         body=(
-            Assign("a", ElementwiseOp("exp"), args=("x",)),
-            Assign("b", ElementwiseOp("neg"), args=("x",)),
+            Assign("a", ElementwiseOp("exp"), args=("$0",)),
+            Assign("b", ElementwiseOp("neg"), args=("$0",)),
             Assign("c", ElementwiseOp("add"), args=("a", "b")),
         ),
-        outputs=(Port("c"),),
+        outputs=(Port(),),
     )
     assert len(k.body) == 3
