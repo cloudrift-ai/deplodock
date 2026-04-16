@@ -421,7 +421,6 @@ def _emit_contraction_body(
     b_port = next(p for p in kernel.inputs if isinstance(p, Port) and p.buffer_id == b_name)
 
     a_shape = kernel.external_shapes.get(a_port.buffer_id, ())
-    b_shape = kernel.external_shapes.get(b_port.buffer_id, ())
     k_size = int(a_shape[-1]) if a_shape else 1
 
     # Parse output shape: (...batch, M, N).
@@ -456,19 +455,18 @@ def _emit_contraction_body(
     stmts.append(VarDecl(dtype="float", name="acc", init=Literal(_identity(fn), "float")))
 
     k = Var("k")
-    a_k = int(a_shape[-1]) if a_shape else k_size
-    b_n = int(b_shape[-1]) if b_shape else n_size
 
-    a_flat: Expr = BinOp("+", BinOp("*", m, Literal(a_k, "int")), k)
-    b_flat: Expr = BinOp("+", BinOp("*", k, Literal(b_n, "int")), n)
+    # Both operands are in the same broadcast space (M, K, N) via their
+    # IndexMapOps.  Use a single flat coord for both.
+    kn = BinOp("+", BinOp("*", k, Literal(n_size, "int")), n)
+    flat_coord: Expr = BinOp("+", BinOp("*", m, Literal(k_size * n_size, "int")), kn)
     if batch is not None:
-        a_flat = BinOp("+", BinOp("*", batch, Literal(m_size * a_k, "int")), a_flat)
-        b_flat = BinOp("+", BinOp("*", batch, Literal(k_size * b_n, "int")), b_flat)
+        flat_coord = BinOp("+", BinOp("*", batch, Literal(m_size * k_size * n_size, "int")), flat_coord)
 
     name_seq_k = [0]
     inner_stmts: list[Stmt] = []
-    a_val = _emit_input_value(a_port, a_flat, kernel.external_shapes, inner_stmts, name_seq_k)
-    b_val = _emit_input_value(b_port, b_flat, kernel.external_shapes, inner_stmts, name_seq_k)
+    a_val = _emit_input_value(a_port, flat_coord, kernel.external_shapes, inner_stmts, name_seq_k)
+    b_val = _emit_input_value(b_port, flat_coord, kernel.external_shapes, inner_stmts, name_seq_k)
     prod_expr = _apply_elementwise(mul_assign.op.fn, [a_val, b_val])
     inner_stmts.append(AugAssign(target="acc", op=_reduce_op(fn), value=prod_expr))
     stmts.append(ForLoop(var=k.name, start=Literal(0, "int"), end=Literal(k_size, "int"), body=inner_stmts))
@@ -580,54 +578,8 @@ def _numel(shape: tuple) -> int:
 
 
 def _infer_output_shape(kernel: KernelOp) -> tuple:
-    """Derive the kernel's output shape by walking the SSA body.
-
-    Tracks shapes per Assign name: starts from input Port shapes,
-    then propagates through each Assign's op.infer_output_shape.
-
-    For contractions (mul+reduce pattern), the mul's output shape is
-    taken from the higher-rank operand (the one with the indexmap that
-    broadcasts into the (M,K,N) space), bypassing broadcast_shapes.
-    """
-    shapes: dict[str, tuple] = {}
-    for inp in kernel.inputs:
-        if isinstance(inp, Port):
-            shapes[inp.buffer_id] = _port_shape(inp, kernel.external_shapes)
-        elif isinstance(inp, Combine):
-            for src in inp.sources:
-                if isinstance(src, Port):
-                    shapes[src.buffer_id] = _port_shape(src, kernel.external_shapes)
-        elif isinstance(inp, Mux):
-            for branch in inp.branches:
-                if isinstance(branch.input, Port):
-                    shapes[branch.input.buffer_id] = _port_shape(branch.input, kernel.external_shapes)
-
-    # Detect contraction to handle mul shape specially.
-    contraction = _detect_contraction(kernel)
-    contraction_names: set[str] = set()
-    if contraction is not None:
-        _, mul_assign, red_assign = contraction
-        contraction_names = {mul_assign.name, red_assign.name}
-
-    for assign in kernel.body:
-        arg_shapes = [shapes[a] for a in assign.args if a in shapes]
-        if not arg_shapes:
-            continue
-        if assign.name in contraction_names and isinstance(assign.op, ElementwiseOp):
-            # Contraction mul: A[..., M, K] * B[..., K, N] → [..., M, K, N].
-            # Not broadcast-compatible; compute as A_shape + (B_shape[-1],).
-            a_shape, b_shape = arg_shapes[0], arg_shapes[1] if len(arg_shapes) > 1 else arg_shapes[0]
-            shapes[assign.name] = tuple(a_shape) + (b_shape[-1],)
-        else:
-            shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
-
-    last = kernel.body[-1].name if kernel.body else None
-    if last and last in shapes:
-        return tuple(shapes[last])
-
-    # Fallback: use input shapes directly (e.g., empty body = copy kernel).
-    input_shapes = [_port_shape(inp, kernel.external_shapes) for inp in kernel.inputs]
-    return tuple(input_shapes[0]) if input_shapes else ()
+    """Delegate to ``KernelOp.infer_output_shape()``."""
+    return kernel.infer_output_shape()
 
 
 def _port_shape(inp, shapes: dict) -> tuple:

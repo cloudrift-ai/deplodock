@@ -55,20 +55,19 @@ def test_reduce_sum():
     assert any(isinstance(a.op, ReduceOp) for a in kernels[0].body)
 
 
-def test_matmul_mul_sum():
+def test_matmul():
+    from deplodock.compiler.ops import MatmulOp
+
     g = Graph()
     _input(g, "a", (4, 8))
     _input(g, "b", (8, 4))
-    g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8, 4)), node_id="m")
-    g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=["m"], output=Tensor("o", (4, 4)), node_id="o")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (4, 4)), node_id="o")
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
     kernels = compile_graph(g)
-    assert len(kernels) == 1
-    # Matmul = mul assign + reduce assign
-    assert any(isinstance(a.op, ElementwiseOp) and a.op.fn == "mul" for a in kernels[0].body)
-    assert any(isinstance(a.op, ReduceOp) and a.op.fn == "sum" for a in kernels[0].body)
+    assert any(isinstance(a.op, ElementwiseOp) and a.op.fn == "mul" for k in kernels for a in k.body)
+    assert any(isinstance(a.op, ReduceOp) and a.op.fn == "sum" for k in kernels for a in k.body)
 
 
 def test_no_matmul_when_mul_fans_out():

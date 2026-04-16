@@ -8,7 +8,7 @@ from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.emit import _detect_contraction
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
+from deplodock.compiler.ops import ElementwiseOp, InputOp
 from deplodock.compiler.pipeline import compile_graph
 
 requires_cuda = pytest.mark.skipif(
@@ -28,11 +28,12 @@ def _pointwise_chain_graph() -> Graph:
 
 
 def _matmul_graph(m: int, k: int, n: int) -> Graph:
+    from deplodock.compiler.ops import MatmulOp
+
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k)), node_id="a")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (k, n)), node_id="b")
-    g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("ab", (m, k, n)), node_id="ab")
-    g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=["ab"], output=Tensor("c", (m, n)), node_id="c")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("c", (m, n)), node_id="c")
     g.inputs = ["a", "b"]
     g.outputs = ["c"]
     return g
@@ -52,8 +53,9 @@ def test_compile_graph_fuses_chain():
 
 def test_pipeline_to_program():
     kernels = compile_graph(_matmul_graph(4, 3, 2))
-    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=["c"])
-    assert len(program.launches) == 1
+    out_name = kernels[-1].outputs[0].buffer_id
+    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=[out_name])
+    assert len(program.launches) >= 1
     roles = {b.name: b.role for b in program.buffers}
     assert roles.get("a") == "input"
     assert roles.get("b") == "input"
@@ -79,7 +81,8 @@ def test_matmul_gpu():
     random.seed(0)
     g = _matmul_graph(3, 4, 5)
     kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=["c"])
+    out_name = kernels[-1].outputs[0].buffer_id
+    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=[out_name])
     a_data = [random.random() for _ in range(12)]
     b_data = [random.random() for _ in range(20)]
     expected = []
@@ -87,4 +90,4 @@ def test_matmul_gpu():
         for ni in range(5):
             expected.append(sum(a_data[mi * 4 + k] * b_data[k * 5 + ni] for k in range(4)))
     result = CudaBackend().run(program, input_data={"a": a_data, "b": b_data})
-    assert result.outputs["c"] == pytest.approx(expected, rel=1e-5)
+    assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-5)

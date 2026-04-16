@@ -39,11 +39,12 @@ def _reduce_sum_graph() -> Graph:
 
 
 def _matmul_graph() -> Graph:
+    from deplodock.compiler.ops import MatmulOp
+
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 8)), node_id="a")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (8, 4)), node_id="b")
-    g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8, 4)), node_id="m")
-    g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=["m"], output=Tensor("o", (4, 4)), node_id="o")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (4, 4)), node_id="o")
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
     return g
@@ -135,7 +136,8 @@ def test_reduce_runs_on_gpu():
 def test_matmul_runs_on_gpu():
     g = _matmul_graph()
     kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=["o"])
+    out_name = kernels[-1].outputs[0].buffer_id
+    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=[out_name])
     a_data = [float(i) for i in range(32)]
     b_data = [float(i) for i in range(32)]
     result = CudaBackend().run(program, input_data={"a": a_data, "b": b_data})
@@ -144,4 +146,4 @@ def test_matmul_runs_on_gpu():
         for ni in range(4):
             s = sum(a_data[mi * 8 + k] * b_data[k * 4 + ni] for k in range(8))
             expected.append(s)
-    assert result.outputs["o"] == pytest.approx(expected)
+    assert list(result.outputs.values())[0] == pytest.approx(expected)
