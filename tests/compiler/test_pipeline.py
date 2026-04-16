@@ -40,25 +40,37 @@ def _matmul_graph(m: int, k: int, n: int) -> Graph:
 
 
 def test_compile_graph_fuses_matmul():
-    kernels = compile_graph(_matmul_graph(4, 3, 2))
-    assert len(kernels) == 1
-    assert _detect_contraction(kernels[0]) is not None
+    result = compile_graph(_matmul_graph(4, 3, 2))
+    assert len(result.kernels) == 1
+    assert _detect_contraction(result.kernels[0]) is not None
 
 
 def test_compile_graph_fuses_chain():
     """neg → exp fuses into one kernel (fan-out 1 chain)."""
-    kernels = compile_graph(_pointwise_chain_graph())
-    assert len(kernels) == 1
+    result = compile_graph(_pointwise_chain_graph())
+    assert len(result.kernels) == 1
 
 
 def test_pipeline_to_program():
-    kernels = compile_graph(_matmul_graph(4, 3, 2))
-    out_name = kernels[-1].outputs[0].buffer_id
-    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=[out_name])
+    result = compile_graph(_matmul_graph(4, 3, 2))
+    out_name = result.kernels[-1].outputs[0].buffer_id
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=[out_name])
     assert len(program.launches) >= 1
     roles = {b.name: b.role for b in program.buffers}
     assert roles.get("a") == "input"
     assert roles.get("b") == "input"
+
+
+def test_compile_result_metadata():
+    """compile_graph returns a CompileResult with graph_inputs/outputs."""
+    from deplodock.compiler.pipeline import CompileResult
+
+    g = _pointwise_chain_graph()
+    result = compile_graph(g)
+    assert isinstance(result, CompileResult)
+    assert result.graph_inputs == ["x"]
+    assert result.graph_outputs == ["y"]
+    assert len(result.kernels) == 1
 
 
 @requires_cuda
@@ -66,8 +78,8 @@ def test_pointwise_chain_gpu():
     import math
 
     g = _pointwise_chain_graph()
-    kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["x"], graph_outputs=["y"])
+    result = compile_graph(g)
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
     x_data = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0]
     expected = [math.exp(-xi) for xi in x_data]
     result = CudaBackend().run(program, input_data={"x": x_data})
@@ -80,9 +92,9 @@ def test_matmul_gpu():
 
     random.seed(0)
     g = _matmul_graph(3, 4, 5)
-    kernels = compile_graph(g)
-    out_name = kernels[-1].outputs[0].buffer_id
-    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=[out_name])
+    result = compile_graph(g)
+    out_name = result.kernels[-1].outputs[0].buffer_id
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=[out_name])
     a_data = [random.random() for _ in range(12)]
     b_data = [random.random() for _ in range(20)]
     expected = []

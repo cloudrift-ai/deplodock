@@ -42,9 +42,9 @@ def handle_compile(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    kernels = compile_graph(graph)
+    result = compile_graph(graph)
 
-    logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, len(kernels))
+    logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, len(result.kernels))
 
     output_path = args.output or f"{base_name}.compiled.json"
     # Persist as the original graph for now; structural KernelOp serialization

@@ -25,7 +25,8 @@ def test_pointwise_add():
     g.inputs = ["x", "y"]
     g.outputs = ["z"]
 
-    kernels = compile_graph(g)
+    result = compile_graph(g)
+    kernels = result.kernels
     assert len(kernels) == 1
     assert all(isinstance(a.op, ElementwiseOp) for a in kernels[0].body)
 
@@ -38,7 +39,8 @@ def test_chained_pointwise_fuses_into_one():
     g.inputs = ["x"]
     g.outputs = ["n"]
 
-    kernels = compile_graph(g)
+    result = compile_graph(g)
+    kernels = result.kernels
     assert len(kernels) == 1
     assert len(kernels[0].body) == 2
 
@@ -50,7 +52,8 @@ def test_reduce_sum():
     g.inputs = ["x"]
     g.outputs = ["r"]
 
-    kernels = compile_graph(g)
+    result = compile_graph(g)
+    kernels = result.kernels
     assert len(kernels) == 1
     assert any(isinstance(a.op, ReduceOp) for a in kernels[0].body)
 
@@ -65,7 +68,8 @@ def test_matmul():
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    kernels = compile_graph(g)
+    result = compile_graph(g)
+    kernels = result.kernels
     assert any(isinstance(a.op, ElementwiseOp) and a.op.fn == "mul" for k in kernels for a in k.body)
     assert any(isinstance(a.op, ReduceOp) and a.op.fn == "sum" for k in kernels for a in k.body)
 
@@ -80,7 +84,8 @@ def test_no_matmul_when_mul_fans_out():
     g.inputs = ["a", "b"]
     g.outputs = ["d", "n"]
 
-    kernels = compile_graph(g)
+    result = compile_graph(g)
+    kernels = result.kernels
     assert len(kernels) == 3
 
 
@@ -94,7 +99,8 @@ def test_matmul_op_decomposes_and_fuses():
     g.inputs = ["a", "b"]
     g.outputs = ["m"]
 
-    kernels = compile_graph(g)
+    result = compile_graph(g)
+    kernels = result.kernels
     # Should have at least one kernel with a mul+sum pattern
     has_reduce = any(any(isinstance(a.op, ReduceOp) for a in k.body) for k in kernels)
     assert has_reduce
@@ -107,5 +113,6 @@ def test_compile_graph_produces_kernel_ops():
     g.inputs = ["x"]
     g.outputs = ["e"]
 
-    kernels = compile_graph(g)
+    result = compile_graph(g)
+    kernels = result.kernels
     assert len(kernels) == 1

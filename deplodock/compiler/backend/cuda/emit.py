@@ -321,8 +321,16 @@ def _emit_pointwise_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt]
 def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], tuple[int, int, int]]:
     """Walk kernel.body SSA (mixed ElementwiseOp / ReduceOp Assigns).
 
-    Each ReduceOp emits a K-loop with an accumulator. ElementwiseOps
-    apply inline to the current value.
+    The body is split into "segments" separated by ReduceOps. Each segment
+    is a sequence of ElementwiseOps optionally followed by a ReduceOp:
+
+        [elementwise*, reduce] or [elementwise*]  (trailing)
+
+    For each segment, if any value references a per-element input (an input
+    Port or a pre-reduce Assign), the entire segment is emitted inside a
+    K-loop. Per-element values from *prior* segments (which were computed
+    in their own K-loops) are recomputed from the inputs inside the current
+    loop. Post-reduce accumulators (per-row scalars) are referenced directly.
     """
     assert len(kernel.inputs) >= 1 and isinstance(kernel.inputs[0], Port)
     src_port = kernel.inputs[0]
@@ -340,66 +348,210 @@ def _emit_reduce_body(kernel: KernelOp, out_shape: tuple) -> tuple[list[Stmt], t
     name_seq = [0]
     reduce_count = 0
 
-    # Build values dict for SSA names.
+    # Identify all input Port names (per-element iteration space).
+    input_port_names: set[str] = {p.buffer_id for p in kernel.inputs if isinstance(p, Port)}
+
+    # Track which SSA names are per-row (post-reduce scalars) vs per-element.
+    per_row_values: set[str] = set()
+
+    # Final values dict: maps SSA name -> Expr for per-row values only.
+    # Per-element values are recomputed inside each K-loop.
     values: dict[str, Expr] = {}
-    for inp in kernel.inputs:
-        if isinstance(inp, Port):
-            values[inp.buffer_id] = None  # placeholder; loaded inside loops
 
+    # Split body into segments: [elementwise*, reduce?]
+    segments: list[list[Assign]] = []
+    current_seg: list[Assign] = []
     for assign in kernel.body:
+        current_seg.append(assign)
         if isinstance(assign.op, ReduceOp):
-            fn = assign.op.fn
-            acc_name = f"acc{reduce_count}"
-            stmts.append(VarDecl(dtype="float", name=acc_name, init=Literal(_identity(fn), "float")))
-            k_var = Var(f"k{reduce_count}")
+            segments.append(current_seg)
+            current_seg = []
+    if current_seg:
+        segments.append(current_seg)
 
-            # The arg to reduce references a prior Assign or an input Port.
-            assert len(assign.args) == 1
-            src_name = assign.args[0]
+    for segment in segments:
+        last = segment[-1]
+        has_reduce = isinstance(last.op, ReduceOp)
+        ew_assigns = segment[:-1] if has_reduce else segment
+        reduce_assign = last if has_reduce else None
 
-            # If the source is a raw input Port, load it inside the K-loop.
+        # Check if any elementwise op in this segment needs per-element access.
+        needs_k_loop = False
+        for assign in ew_assigns:
+            for a in assign.args:
+                if a in input_port_names or a not in per_row_values:
+                    needs_k_loop = True
+                    break
+            if needs_k_loop:
+                break
+        # A reduce always needs a K-loop (its input is per-element).
+        if has_reduce:
+            assert reduce_assign is not None
+            for a in reduce_assign.args:
+                if a in input_port_names or a not in per_row_values:
+                    needs_k_loop = True
+
+        if not needs_k_loop and not has_reduce:
+            # All args are per-row scalars; emit inline.
+            for assign in ew_assigns:
+                arg_exprs = [values[a] for a in assign.args]
+                value = _apply_elementwise(assign.op.fn, arg_exprs)
+                tname = _fresh(name_seq)
+                stmts.append(VarDecl(dtype="float", name=tname, init=value))
+                values[assign.name] = Var(tname)
+                per_row_values.add(assign.name)
+        else:
+            # Emit a K-loop for this segment.
+            k_var_name = f"k{reduce_count}"
+            k_var = Var(k_var_name)
+
+            # Set up accumulator if segment ends with a reduce.
+            if has_reduce:
+                assert reduce_assign is not None
+                fn = reduce_assign.op.fn
+                acc_name = f"acc{reduce_count}"
+                stmts.append(VarDecl(dtype="float", name=acc_name, init=Literal(_identity(fn), "float")))
+
             inner_stmts: list[Stmt] = []
-            if src_name in {p.buffer_id for p in kernel.inputs if isinstance(p, Port)} and values.get(src_name) is None:
-                load_idx = BinOp("+", BinOp("*", row, Literal(k_size, "int")), k_var)
-                elem: Expr = ArrayAccess(array=src_name, index=load_idx)
-            else:
-                # Source is a prior Assign; its expression is already in values.
-                elem = values[src_name]
+            # Inside the loop, build per-element values by recomputing
+            # from inputs through all prior elementwise chains.
+            loop_values: dict[str, Expr] = dict(values)  # inherit per-row scalars
 
-            inner_stmts.append(AugAssign(target=acc_name, op=_reduce_op(fn), value=elem))
+            # Load input Ports at per-element coords.
+            load_idx = BinOp("+", BinOp("*", row, Literal(k_size, "int")), k_var)
+            for port_name in input_port_names:
+                loop_values[port_name] = ArrayAccess(array=port_name, index=load_idx)
+
+            # Recompute any prior per-element Assigns needed by this segment.
+            # Collect all prior elementwise assigns (in body order).
+            prior_assigns: list[Assign] = []
+            for seg in segments:
+                if seg is segment:
+                    break
+                for a in seg:
+                    if not isinstance(a.op, ReduceOp):
+                        prior_assigns.append(a)
+
+            # Compute transitive closure of needed prior names.
+            needed_names = _transitive_deps(segment, prior_assigns, per_row_values)
+
+            for prior in prior_assigns:
+                if prior.name in per_row_values:
+                    continue
+                if prior.name not in needed_names:
+                    continue
+                arg_exprs = [loop_values[a] for a in prior.args]
+                value = _apply_elementwise(prior.op.fn, arg_exprs)
+                tname = _fresh(name_seq)
+                inner_stmts.append(VarDecl(dtype="float", name=tname, init=value))
+                loop_values[prior.name] = Var(tname)
+
+            # Emit this segment's elementwise ops.
+            for assign in ew_assigns:
+                arg_exprs = [loop_values[a] for a in assign.args]
+                value = _apply_elementwise(assign.op.fn, arg_exprs)
+                tname = _fresh(name_seq)
+                inner_stmts.append(VarDecl(dtype="float", name=tname, init=value))
+                loop_values[assign.name] = Var(tname)
+
+            if has_reduce:
+                assert reduce_assign is not None
+                fn = reduce_assign.op.fn
+                reduce_src = loop_values[reduce_assign.args[0]]
+                inner_stmts.append(_emit_reduce_accum(acc_name, fn, reduce_src))
+                values[reduce_assign.name] = Var(acc_name)
+                per_row_values.add(reduce_assign.name)
+            else:
+                # Trailing per-element segment: store inside the loop.
+                last_ew = ew_assigns[-1]
+                out_port = kernel.outputs[0]
+                assert isinstance(out_port, Port)
+                store_idx = BinOp("+", BinOp("*", row, Literal(k_size, "int")), k_var)
+                inner_stmts.append(
+                    IrAssign(
+                        target=ArrayAccess(array=out_port.buffer_id, index=store_idx),
+                        value=loop_values[last_ew.name],
+                    )
+                )
+
             stmts.append(
                 ForLoop(
-                    var=k_var.name,
+                    var=k_var_name,
                     start=Literal(0, "int"),
                     end=Literal(k_size, "int"),
                     body=inner_stmts,
                 )
             )
-            values[assign.name] = Var(acc_name)
             reduce_count += 1
 
-        elif isinstance(assign.op, ElementwiseOp):
-            arg_exprs = []
-            for a in assign.args:
-                if a in values and values[a] is not None:
-                    arg_exprs.append(values[a])
-                else:
-                    # Load extra inputs at the row coord.
-                    extra_vals = [_emit_input_value(inp, row, kernel.external_shapes, stmts, name_seq) for inp in kernel.inputs[1:]]
-                    arg_exprs.append(extra_vals[0] if extra_vals else Literal(0.0, "float"))
-            value = _apply_elementwise(assign.op.fn, arg_exprs)
-            tname = _fresh(name_seq)
-            stmts.append(VarDecl(dtype="float", name=tname, init=value))
-            values[assign.name] = Var(tname)
+    # Store the final value (only if the last segment was NOT a per-element
+    # trailing segment, which already stored inside its K-loop).
+    last_assign = kernel.body[-1] if kernel.body else None
+    if last_assign is not None and last_assign.name in per_row_values:
+        out_val = values.get(last_assign.name, Literal(0.0, "float"))
+        out_port = kernel.outputs[0]
+        assert isinstance(out_port, Port)
+        stmts.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=row), value=out_val))
+    elif last_assign is not None and not isinstance(last_assign.op, ReduceOp):
+        # Trailing per-element segment already stored inside its K-loop.
+        pass
+    else:
+        # Fallback: last was a reduce, store the accumulator.
+        if last_assign is not None:
+            out_val = values.get(last_assign.name, Literal(0.0, "float"))
+            out_port = kernel.outputs[0]
+            assert isinstance(out_port, Port)
+            stmts.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=row), value=out_val))
 
-    # Store the last Assign's value.
-    last_name = kernel.body[-1].name if kernel.body else None
-    out_val = values.get(last_name, Literal(0.0, "float")) if last_name else Literal(0.0, "float")
-
-    out_port = kernel.outputs[0]
-    assert isinstance(out_port, Port)
-    stmts.append(IrAssign(target=ArrayAccess(array=out_port.buffer_id, index=row), value=out_val))
     return stmts, (1, 1, 1)
+
+
+def _transitive_deps(
+    segment: list[Assign],
+    prior_assigns: list[Assign],
+    per_row_values: set[str],
+) -> set[str]:
+    """Compute the transitive closure of prior per-element values needed by segment.
+
+    Walks backwards: starts with direct args of the segment's assigns, then
+    expands to include any prior assign whose name is in the needed set.
+    Per-row (post-reduce) values are excluded since they don't need recomputation.
+    """
+    needed: set[str] = set()
+    for assign in segment:
+        needed.update(assign.args)
+
+    # Build a lookup from prior assign names to their args.
+    prior_args: dict[str, tuple[str, ...]] = {a.name: a.args for a in prior_assigns}
+
+    # Expand transitively.
+    changed = True
+    while changed:
+        changed = False
+        for name, args in prior_args.items():
+            if name in needed and name not in per_row_values:
+                for arg in args:
+                    if arg not in needed and arg not in per_row_values:
+                        needed.add(arg)
+                        changed = True
+
+    return needed
+
+
+def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
+    """Emit the accumulator update for a reduce op.
+
+    For sum/prod, uses AugAssign (``acc += val``).
+    For max, uses VarAssign with fmaxf (``acc = fmaxf(acc, val)``).
+    """
+    if fn == "max":
+        from deplodock.compiler.backend.ir.kernel_ir import VarAssign
+
+        return VarAssign(
+            name=acc_name,
+            value=FuncCall("fmaxf", [Var(acc_name), value]),
+        )
+    return AugAssign(target=acc_name, op=_reduce_op(fn), value=value)
 
 
 def _emit_contraction_body(
@@ -578,8 +730,25 @@ def _numel(shape: tuple) -> int:
 
 
 def _infer_output_shape(kernel: KernelOp) -> tuple:
-    """Delegate to ``KernelOp.infer_output_shape()``."""
-    return kernel.infer_output_shape()
+    """Derive the kernel's output shape.
+
+    Tries ``KernelOp.infer_output_shape()`` first; falls back to the output
+    Port's ``external_shapes`` entry or the first input Port's shape when
+    the SSA body has cross-iteration-space ops (e.g. softmax) whose shapes
+    can't be broadcast in the standard sense.
+    """
+    try:
+        return kernel.infer_output_shape()
+    except (ValueError, KeyError):
+        # Cross-space SSA: look for an explicit output shape first.
+        for out in kernel.outputs:
+            if isinstance(out, Port) and out.buffer_id in kernel.external_shapes:
+                return tuple(kernel.external_shapes[out.buffer_id])
+        # Fall back to the first input Port's shape.
+        for inp in kernel.inputs:
+            if isinstance(inp, Port) and inp.buffer_id in kernel.external_shapes:
+                return tuple(kernel.external_shapes[inp.buffer_id])
+        return ()
 
 
 def _port_shape(inp, shapes: dict) -> tuple:
@@ -661,11 +830,28 @@ def _launch_config(kernel: KernelOp) -> tuple[tuple[int, int, int], tuple[int, i
         batch = _numel(int_shape[:-2]) if len(int_shape) > 2 else 1
         return (n, m, batch), (1, 1, 1)
     if any(isinstance(a.op, ReduceOp) for a in kernel.body):
-        n_rows = _numel(out_shape)
+        # For reduce kernels, the grid is over outer rows (one block per row).
+        # Use the first input Port's shape minus the last axis.
+        n_rows = _reduce_n_rows(kernel)
         return (n_rows, 1, 1), (1, 1, 1)
     numel = _numel(out_shape)
     n_blocks = (numel + _BLOCK - 1) // _BLOCK
     return (max(n_blocks, 1), 1, 1), (_BLOCK, 1, 1)
+
+
+def _reduce_n_rows(kernel: KernelOp) -> int:
+    """Number of outer rows for a reduce kernel's grid.
+
+    Uses the first input Port's shape minus the last axis (the reduce dim).
+    """
+    for inp in kernel.inputs:
+        if isinstance(inp, Port):
+            src_shape = kernel.external_shapes.get(inp.buffer_id, ())
+            if len(src_shape) >= 2:
+                return _numel(src_shape[:-1])
+            return _numel(src_shape) if src_shape else 1
+    # Fallback: use output shape.
+    return _numel(_infer_output_shape(kernel))
 
 
 def _emit_kernel_source(kernel_def: KernelDef) -> str:
