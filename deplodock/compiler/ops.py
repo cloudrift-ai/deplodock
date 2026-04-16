@@ -1,8 +1,44 @@
-"""Tensor operation types for the minimal IR."""
+"""Tensor operation types and structural kernel IR.
+
+This module defines two layers:
+
+1. **Primitive ops** (``ElementwiseOp``, ``ReduceOp``, ``IndexMapOp``,
+   ``ConstantOp``, ``TransposeOp``, ``ReshapeOp``, ``SliceOp``, ``CatOp``,
+   ``LinearOp``, ``MatmulOp``, ``SdpaOp``, ``UnsqueezeOp``, ``MeanOp``, ...)
+   — one ``Op`` subclass per primitive tensor operation. A ``Node[T_Op]``
+   in ``ir.py`` wraps one of these.
+
+2. **Structural kernel IR** (``KernelOp`` and its tree types below).
+   One ``KernelOp`` is one GPU kernel; its input-assembly tree and body
+   together describe *what* the kernel computes. Analogies for readers:
+
+   - **Dataflow / signal-flow graph** — leaves are buffer-backed sources,
+     internal nodes transform values, edges carry per-coord values. This
+     is the framing for the ``KernelInput`` tree as a whole.
+   - **Hardware multiplexer** (FPGA N-to-1 mux / 1-to-N demux) — for
+     coord-predicated selection, inputs and outputs both.
+   - **Operad / expression tree** — N-ary ops composed with operadic
+     identity collapse, for ``Combine``.
+   - **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store;
+     MLIR ``linalg`` structured ops) — for ``KernelOp`` as a whole.
+   - **Systolic core** — fused multiply-accumulate over a reduction axis,
+     for ``ContractionCore``.
+
+Every elementwise chain in the structural IR is a
+``tuple[Node[ElementwiseOp], ...]`` (alias ``ElementwiseChain``); every
+reduction slot is a ``Node[ReduceOp]``. Invariants are enforced at
+construction time by ``__post_init__`` hooks on the structural
+dataclasses (see the ``_assert_*`` helpers at the bottom of the file).
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from deplodock.compiler.backend.ir.expr import Expr
+    from deplodock.compiler.ir import Node
 
 
 @dataclass
@@ -372,63 +408,36 @@ class IndexMapOp(Op):
 
 
 # ---------------------------------------------------------------------------
-# KernelOp: structured fused op (prologue → core → epilogue)
+# Structural kernel IR
 # ---------------------------------------------------------------------------
-
-
-def _needed_by_ids(nodes: list) -> set:
-    """Set of node ids referenced as inputs by the given Nodes."""
-    needed: set = set()
-    for n in nodes:
-        needed.update(n.inputs)
-    return needed
-
-
-@dataclass
-class ContractionInfo:
-    """Resolved matmul metadata for a ContractionCore kernel.
-
-    Built by ``KernelOp.contraction_info(shapes)``. Codegen reads M/N/K
-    + batch info to size the K-loop, tile dims, and grid.
-    """
-
-    a_id: str  # external buffer id for A operand
-    b_id: str  # external buffer id for B operand
-    m: int
-    n: int
-    k: int
-    batch_dims: tuple[int, ...] = ()
-    batch_size: int = 1
-    # GQA / broadcast batch: when one operand has fewer batch elements,
-    # its batch index is divided by this factor (28 Q heads / 4 KV heads = 7).
-    a_batch_group: int = 1
-    b_batch_group: int = 1
-
-
-@dataclass
-class AccessPattern:
-    """How a single input tensor is accessed within the kernel.
-
-    Derived per-input from the input shape and the kernel's output shape.
-    Used by load-path emitters to pick the right indexing form.
-    """
-
-    shape: tuple[int, ...]
-    size: int  # total int-dim element count
-    is_scalar: bool  # size == 1
-    is_row_vector: bool  # 1D, indexed by column only
-    is_2d: bool  # indexed by both row and column
-    is_per_row: bool = False  # last dim == 1 with >1 total elts
-    is_broadcast: bool = False  # smaller than output, broadcast via modulo
+#
+# One KernelOp = one GPU kernel. Its shape is a tiled dataflow pipeline:
+#
+#     inputs (KernelInput tree) ──► [contraction] ──► [reduce_stages] ──►
+#                                        [epilogue] ──► outputs (Port | Mux)
+#
+# Every stage except inputs/outputs is optional; omitting all three mid
+# stages yields a pointwise / copy kernel (body lives inside inputs[0]).
+#
+# KernelInput is a recursive tagged union (``Port | Mux | Combine``):
+#   - Port    : signal-flow leaf; one external buffer read + optional indexmap.
+#   - Mux     : hardware-mux; coord-predicated dispatch among branches.
+#   - Combine : operadic composition; elementwise-chain over N sub-inputs.
+#
+# KernelOutput is a narrower union (``Port | Mux``): outputs don't
+# assemble values, they just dispatch writes (Mux on outputs = scatter).
+# Post-body elementwise work (bias, activation, residual) lives in the
+# kernel-level ``epilogue`` chain.
 
 
 @dataclass
 class Port:
-    """How a KernelOp reads/writes one external buffer.
+    """Signal-flow leaf: one external buffer read/write with optional layout.
 
     ``buffer_id`` names the external graph node; ``indexmap`` (when set)
     describes the per-output coord access pattern (transpose, slice,
-    broadcast, cat). ``None`` = identity load/store at the natural shape.
+    broadcast). ``None`` = identity load/store at the natural shape.
+    Used on both the input and output sides of a kernel.
     """
 
     buffer_id: str
@@ -436,396 +445,168 @@ class Port:
 
 
 @dataclass
-class ReduceStage:
-    """One reduction in a multi-reduce chain.
+class MuxBranch:
+    """One branch of a Mux: an input tree + a coord-predicate selector."""
 
-    ``pre_ops``: elementwise chain between the previous stage's output (or
-    the prologue, for the first stage) and this reduce. Empty for a single
-    reduce immediately after the prologue.
+    input: KernelInput
+    select: Expr
 
-    ``reduce``: the ReduceOp Node (kept untyped to avoid circular import).
+
+@dataclass
+class Mux:
+    """Hardware multiplexer: coord-predicated dispatch among branches.
+
+    On inputs: at each output coord, exactly one branch's ``select`` is
+    True and its ``input`` supplies the value. Branches must be disjoint;
+    invariants expect them to be exhaustive or to carry a catch-all in
+    the last position (compiler-side convention, not structurally encoded).
+
+    On outputs: same shape, inverted semantics — each branch describes
+    where to write when its predicate is True. Unmatched coords produce
+    no write (masked scatter).
     """
 
-    pre_ops: tuple  # tuple[Node, ...]
-    reduce: object  # Node
+    branches: tuple[MuxBranch, ...]
+
+    def __post_init__(self) -> None:
+        if not self.branches:
+            raise ValueError("Mux.branches must be non-empty")
+
+
+@dataclass
+class Combine:
+    """Operadic composition: N sub-inputs combined by an elementwise chain.
+
+    ``sources`` are the operadic inputs (each another ``KernelInput``);
+    ``ops`` is an elementwise chain applied to produce one value per
+    output coord. Nesting is operadic composition — Combines compose into
+    Combines.
+
+    Canonicalization: a no-op wrapper (single source, empty ops) is
+    illegal; the tree should already have been collapsed to the source.
+    """
+
+    sources: tuple[KernelInput, ...]
+    ops: tuple[Node[ElementwiseOp], ...]
+
+    def __post_init__(self) -> None:
+        if not self.sources:
+            raise ValueError("Combine.sources must be non-empty")
+        if len(self.sources) == 1 and not self.ops:
+            raise ValueError("Combine(sources=(x,), ops=()) is a no-op wrapper; use the inner input directly")
+        _assert_elementwise_chain(self.ops, "Combine.ops")
+
+
+# A kernel input slot is a signal-flow tree; the leaves read external
+# buffers (``Port``), internal nodes transform values (``Combine``) or
+# dispatch between sources (``Mux``).
+type KernelInput = Port | Mux | Combine
+
+# A kernel output slot is simpler: either a plain write target (``Port``)
+# or a scatter/masked writeout (``Mux``). Post-body elementwise work lives
+# in ``KernelOp.epilogue``.
+type KernelOutput = Port | Mux
 
 
 @dataclass
 class ContractionCore:
-    """Matmul-shaped sum reduction: out[..., m, n] = sum_k a[..., m, k] * b[..., k, n].
+    """Systolic core: sum (or associative reduce) over a per-K operand.
 
-    The IndexMaps on a/b absorb transpositions and broadcasts that used to
-    be separate ops upstream. The ``mul`` and ``reduce`` Node fields hold
-    the elementwise-multiply and sum-reduction operations that the
-    structural rule moved out of the KernelOp's prologue — they're
-    "implicit" in the template but explicit in the IR so the backend can
-    reach them for codegen.
-
-    ``post_stages`` lets a contraction carry a downstream row-reduce chain
-    in the same kernel (matmul → softmax fusion): the contraction reduce
-    runs first, then each ReduceStage applies its pre_ops chain and
-    reduce to the per-row accumulator.
+    For matmul, ``operand`` is a ``Combine(sources=(a, b), ops=(mul,))``:
+    the per-K element product whose reduction over ``k_axis`` yields one
+    output element. Generalizes to other associative contractions by
+    choosing different ``operand.ops`` chains (e.g. sub+abs for
+    sum-of-abs-diff) and different reduce functions.
     """
 
-    a: Port
-    b: Port
-    k_axis: int  # which dim of a's post-IndexMap shape is K
-    mul: object = None  # Node holding the elementwise multiply
-    reduce: object = None  # Node holding the sum reduction
-    post_stages: tuple = ()  # tuple[ReduceStage, ...] — downstream row reduces
+    operand: KernelInput
+    k_axis: int
+    reduce: Node[ReduceOp]
+
+    def __post_init__(self) -> None:
+        _assert_reduce_node(self.reduce, "ContractionCore.reduce")
+
+
+@dataclass
+class ReduceStage:
+    """One reduction in a multi-reduce chain.
+
+    ``pre_ops``: elementwise chain between the previous stage's output
+    (or the pipeline's pre-reduce value, for the first stage) and this
+    reduce. Empty when the reduce runs directly on the prior output.
+
+    ``reduce``: the ``ReduceOp`` Node. The previous stage's reduced axis
+    is gone from the iteration space by the time ``pre_ops`` runs —
+    ``pre_ops`` consume in-register accumulators, not external loads.
+    """
+
+    pre_ops: tuple[Node[ElementwiseOp], ...]
+    reduce: Node[ReduceOp]
+
+    def __post_init__(self) -> None:
+        _assert_elementwise_chain(self.pre_ops, "ReduceStage.pre_ops")
+        _assert_reduce_node(self.reduce, "ReduceStage.reduce")
 
 
 @dataclass
 class KernelOp(Op):
-    """One kernel's worth of computation: prologue → core → epilogue.
+    """One kernel's worth of computation: a tiled dataflow pipeline.
 
-    The four codegen templates encode in the union, not in a tag string:
-      - core is None                       ⇒ pointwise (prologue only)
-      - isinstance(core, ContractionCore)  ⇒ matmul / batched matmul
-      - isinstance(core, tuple)            ⇒ reduce chain (1+ ReduceStages)
+    The pipeline is linear:
 
-    Each chain stage is a topologically-sorted tuple of primitive Nodes.
-    Cross-stage data flow is implicit: ``prologue`` holds every body node
-    in topo order (flat-prologue convention); ``core`` is an annotation
-    pointing at specific nodes (ReduceStage.reduce, ContractionCore.mul/
-    reduce/post_stages) already in prologue. Backends read the body via
-    ``KernelOp.body_ops()`` which dedups across slots.
+        inputs → [contraction] → [reduce_stages] → [epilogue] → outputs
 
-    A KernelOp has one external output (Port) by construction;
-    multi-output fusion is a future extension.
+    - ``inputs``: a tuple of ``KernelInput`` trees, one per logical body
+      input. Recursive (Port | Mux | Combine); every elementwise op used
+      to assemble a value lives inside the tree.
+    - ``contraction``: optional systolic core (matmul and its
+      generalizations). When present, its ``operand`` is itself a
+      ``KernelInput`` (typically a Combine of two inputs with a mul).
+    - ``reduce_stages``: optional sequence of post-contraction (or
+      post-input if no contraction) reductions. Each stage's ``pre_ops``
+      consume the prior stage's (or contraction's) output.
+    - ``epilogue``: optional post-body elementwise chain at the output
+      iteration space (bias, activation, residual).
+    - ``outputs``: write targets (Port | Mux) — Mux supports scatter /
+      masked writeout.
+
+    ``external_shapes`` keeps buffer-id → shape for every leaf ``Port``
+    the codegen needs to allocate launch args for.
     """
 
-    inputs: list  # list[Port] — external reads
-    outputs: list  # list[Port] — external writes (today: always 1)
-    prologue: tuple = ()  # tuple[Node, ...] — elementwise chain
-    # core: ContractionCore | tuple[ReduceStage, ...] | None
-    core: object = None
-    epilogue: tuple = ()  # tuple[Node, ...] — elementwise chain
+    inputs: tuple[KernelInput, ...]
+    outputs: tuple[KernelOutput, ...]
+    contraction: ContractionCore | None = None
+    reduce_stages: tuple[ReduceStage, ...] = ()
+    epilogue: tuple[Node[ElementwiseOp], ...] = ()
+    external_shapes: dict = field(default_factory=dict)
     kernel_source: str = ""  # backend-set after emission
-    external_shapes: dict = field(default_factory=dict)  # buffer_id → shape for external buffers
 
-    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
-        # Walk stages in reverse priority to find the output shape.
-        if self.epilogue:
-            return tuple(self.epilogue[-1].output.shape)
-        if isinstance(self.core, ContractionCore):
-            return self._contraction_out_shape(input_shapes)
-        if isinstance(self.core, tuple) and self.core:
-            return tuple(self.core[-1].reduce.output.shape)
-        if self.prologue:
-            return tuple(self.prologue[-1].output.shape)
-        return ()
+    def __post_init__(self) -> None:
+        _assert_elementwise_chain(self.epilogue, "KernelOp.epilogue")
 
-    def _contraction_out_shape(self, input_shapes: list[tuple]) -> tuple:
-        core = self.core
-        assert isinstance(core, ContractionCore)
-        a_shape = self._port_shape(core.a, input_shapes)
-        b_shape = self._port_shape(core.b, input_shapes)
-        return tuple(a_shape[:-1]) + (b_shape[-1],)
 
-    def _port_shape(self, port: Port, input_shapes: list[tuple]) -> tuple:
-        if port.indexmap is not None:
-            return tuple(port.indexmap.out_shape)
-        for i, p in enumerate(self.inputs):
-            if p.buffer_id == port.buffer_id:
-                return tuple(input_shapes[i])
-        return ()
+# ---------------------------------------------------------------------------
+# Runtime invariant helpers — back the type annotations on chains / slots.
+# Python's type system can't statically enforce that a Node's ``op`` is a
+# specific subclass; these run at construction time to fail loudly when a
+# rule (or a test) mis-files an op into the wrong slot.
+# ---------------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Body / phase views — pure derivations of the structured fields.
-    # These are the canonical source for backend readers; analysis.py
-    # delegates to them. Keep them free of shape / codegen concerns so
-    # they stay Layer-1 appropriate.
-    # ------------------------------------------------------------------
 
-    def body_ops(self) -> list:
-        """Flat ``Node`` view of body nodes in topo order.
+type ElementwiseChain = tuple[Node[ElementwiseOp], ...]
 
-        Walks prologue + core (ContractionCore.mul/reduce + post_stages,
-        or tuple[ReduceStage] pre_ops/reduce) + epilogue, deduped by id.
-        Consumers read ``n.id`` / ``n.op`` / ``n.inputs`` directly — no
-        tuple flattening.
-        """
-        seen: set[str] = set()
-        out: list = []
 
-        def emit(node) -> None:
-            if node is None or node.id in seen:
-                return
-            seen.add(node.id)
-            out.append(node)
+def _assert_elementwise_chain(chain: ElementwiseChain, where: str) -> None:
+    for i, node in enumerate(chain):
+        _assert_elementwise_node(node, f"{where}[{i}]")
 
-        for n in self.prologue:
-            emit(n)
-        if isinstance(self.core, ContractionCore):
-            emit(self.core.mul)
-            emit(self.core.reduce)
-            for stage in self.core.post_stages:
-                if not isinstance(stage, ReduceStage):
-                    continue
-                for pre in stage.pre_ops:
-                    emit(pre)
-                emit(stage.reduce)
-        elif isinstance(self.core, tuple):
-            for stage in self.core:
-                if not isinstance(stage, ReduceStage):
-                    continue
-                for pre in stage.pre_ops:
-                    emit(pre)
-                emit(stage.reduce)
-        for n in self.epilogue:
-            emit(n)
-        return out
 
-    def phases(self) -> tuple:
-        """Return ``(prologue, reduces, inter_reduce, epilogue)`` as
-        ``list[Node]`` (with ``inter_reduce`` a ``list[list[Node]]``).
+def _assert_elementwise_node(node: Node[ElementwiseOp], where: str) -> None:
+    if not isinstance(node.op, ElementwiseOp):
+        raise TypeError(f"{where} has op {type(node.op).__name__}, expected ElementwiseOp")
 
-        - ``prologue``: pre-reduce ops; for ContractionCore this includes
-          the mul appended after user prologue (mul feeds the K-loop).
-        - ``reduces``: one Node per reduce in core order.
-        - ``inter_reduce[i]``: pre_ops chain that feeds ``reduces[i+1]``.
-        - ``epilogue``: post-last-reduce ops.
-        """
-        prologue = list(self.prologue)
-        epilogue = list(self.epilogue)
 
-        if isinstance(self.core, ContractionCore):
-            reduces: list = []
-            inter_reduce: list = []
-            if self.core.mul is not None:
-                prologue.append(self.core.mul)
-            if self.core.reduce is not None:
-                reduces.append(self.core.reduce)
-            for stage in self.core.post_stages:
-                if not isinstance(stage, ReduceStage):
-                    continue
-                inter_reduce.append(list(stage.pre_ops))
-                if stage.reduce is not None:
-                    reduces.append(stage.reduce)
-            return prologue, reduces, inter_reduce, epilogue
-
-        if isinstance(self.core, tuple) and self.core:
-            stages = [s for s in self.core if isinstance(s, ReduceStage)]
-            reduces = [s.reduce for s in stages if s.reduce is not None]
-            inter_reduce = [list(s.pre_ops) for s in stages[1:]]
-            return prologue, reduces, inter_reduce, epilogue
-
-        return prologue, [], [], epilogue
-
-    def reduce_fn_names(self) -> list:
-        """Return the ``.fn`` string of each reduce Node in core order."""
-        if isinstance(self.core, ContractionCore):
-            names = []
-            if self.core.reduce is not None:
-                names.append(self.core.reduce.op.fn)
-            for stage in self.core.post_stages:
-                if isinstance(stage, ReduceStage) and stage.reduce is not None:
-                    names.append(stage.reduce.op.fn)
-            return names
-        if isinstance(self.core, tuple):
-            return [s.reduce.op.fn for s in self.core if isinstance(s, ReduceStage) and s.reduce is not None]
-        return []
-
-    def port_indexmaps(self) -> dict:
-        """Per-input Port.indexmap dict (only inputs with an indexmap set)."""
-        return {p.buffer_id: p.indexmap for p in self.inputs if p.indexmap is not None}
-
-    def contraction_info(self, shapes: dict) -> ContractionInfo | None:
-        """Resolve M/N/K + batch metadata for a ContractionCore kernel.
-
-        Returns ``None`` if this isn't a contraction or the operand shapes
-        are incompatible (K mismatch, sub-2D, batch dims that don't match
-        and don't divide cleanly for GQA-style broadcast).
-        """
-        import math as _math
-
-        if not isinstance(self.core, ContractionCore):
-            return None
-        a_id = self.core.a.buffer_id
-        b_id = self.core.b.buffer_id
-        a_shape = shapes.get(a_id)
-        b_shape = shapes.get(b_id)
-        if a_shape is None or b_shape is None or len(a_shape) < 2 or len(b_shape) < 2:
-            return None
-
-        batch_dims: tuple = ()
-        batch_size = 1
-        a_batch_group = 1
-        b_batch_group = 1
-        if len(a_shape) > 2 and len(b_shape) > 2:
-            a_batch = a_shape[:-2]
-            b_batch = b_shape[:-2]
-            if a_batch == b_batch:
-                batch_dims = a_batch
-            else:
-                # GQA-style broadcast: pad shorter batch with 1s; each dim
-                # must match or one must divide the other.
-                max_len = max(len(a_batch), len(b_batch))
-                a_padded = (1,) * (max_len - len(a_batch)) + a_batch
-                b_padded = (1,) * (max_len - len(b_batch)) + b_batch
-                merged_batch: list = []
-                for ad, bd in zip(a_padded, b_padded, strict=True):
-                    if not isinstance(ad, int) or not isinstance(bd, int):
-                        return None
-                    if ad == bd:
-                        merged_batch.append(ad)
-                    elif ad > bd and bd > 0 and ad % bd == 0:
-                        merged_batch.append(ad)
-                    elif bd > ad and ad > 0 and bd % ad == 0:
-                        merged_batch.append(bd)
-                    else:
-                        return None
-                batch_dims = tuple(merged_batch)
-                a_bs = _math.prod(d for d in a_padded if isinstance(d, int))
-                b_bs = _math.prod(d for d in b_padded if isinstance(d, int))
-                if a_bs >= b_bs and b_bs > 0:
-                    b_batch_group = a_bs // b_bs
-                elif a_bs > 0:
-                    a_batch_group = b_bs // a_bs
-            batch_size = _math.prod(d for d in batch_dims if isinstance(d, int))
-            a_k = a_shape[-1]
-            b_k = b_shape[-2]
-        else:
-            a_k = a_shape[-1]
-            b_k = b_shape[0]
-
-        if a_k != b_k:
-            return None
-
-        if batch_dims:
-            m = a_shape[-2] if isinstance(a_shape[-2], int) else 1
-        else:
-            m = _math.prod(d for d in a_shape[:-1] if isinstance(d, int)) if any(isinstance(d, int) for d in a_shape[:-1]) else 1
-        k = a_k if isinstance(a_k, int) else 1
-        n = b_shape[-1] if isinstance(b_shape[-1], int) else 1
-
-        return ContractionInfo(
-            a_id=a_id,
-            b_id=b_id,
-            m=m,
-            n=n,
-            k=k,
-            batch_dims=batch_dims,
-            batch_size=batch_size,
-            a_batch_group=a_batch_group,
-            b_batch_group=b_batch_group,
-        )
-
-    def tile_pattern(self, shapes: dict, output_shape: tuple) -> str:
-        """Classify the kernel as pointwise / row_reduce / reduce_broadcast / contraction.
-
-        Pure derivation from the structured fields + shapes:
-          - no reduces → pointwise.
-          - ContractionCore with both operands 2D → contraction.
-          - any other reduce shape → row_reduce, or reduce_broadcast when
-            the epilogue requires a second per-element pass.
-        """
-        _prologue, reduces, _inter, _epilogue = self.phases()
-        if not reduces:
-            return "pointwise"
-        cinfo = self.contraction_info(shapes)
-        if cinfo is not None:
-            access = self.input_accesses(shapes, output_shape)
-            a_acc = access.get(cinfo.a_id)
-            b_acc = access.get(cinfo.b_id)
-            if a_acc and b_acc and a_acc.is_2d and b_acc.is_2d:
-                return "contraction"
-        return "reduce_broadcast" if self.epilogue_needs_per_element(shapes, output_shape) else "row_reduce"
-
-    def tile_dims(self, shapes: dict, output_shape: tuple) -> tuple:
-        """Return ``(rows, cols, k_dim)`` for the kernel's tile schedule.
-
-        - pointwise: rows=1, cols=total output elements, k_dim=0.
-        - contraction: M, N, K from ``contraction_info``.
-        - row reduce / reduce_broadcast: rows = product of leading dims of
-          the pre-reduction tensor, cols = trailing dim, k_dim=cols.
-        """
-        import math as _math
-
-        _prologue, reduces, _inter, _epilogue = self.phases()
-        if not reduces:
-            total = _math.prod(d for d in output_shape if isinstance(d, int))
-            return 1, total, 0
-
-        cinfo = self.contraction_info(shapes)
-        if cinfo is not None:
-            access = self.input_accesses(shapes, output_shape)
-            a_acc = access.get(cinfo.a_id)
-            b_acc = access.get(cinfo.b_id)
-            if a_acc and b_acc and a_acc.is_2d and b_acc.is_2d:
-                return cinfo.m, cinfo.n, cinfo.k
-
-        first_reduce_input = reduces[0].inputs[0]
-        pre_shape = shapes.get(first_reduce_input, output_shape)
-        if len(pre_shape) >= 2:
-            rows = _math.prod(d for d in pre_shape[:-1] if isinstance(d, int))
-            cols = pre_shape[-1] if isinstance(pre_shape[-1], int) else 1
-        else:
-            rows = 1
-            cols = _math.prod(d for d in pre_shape if isinstance(d, int))
-        return rows, cols, cols
-
-    def epilogue_needs_per_element(self, shapes: dict, output_shape: tuple) -> bool:
-        """True when the epilogue needs a second per-element pass.
-
-        Holds when any epilogue op (or a prologue op it depends on)
-        reads per-element values from a 2D input — e.g. RMSNorm's
-        ``mul(x, rsqrt)`` epilogue needs the original ``x`` per element.
-        """
-        prologue, _reduces, _inter, epilogue = self.phases()
-        if not epilogue:
-            return False
-
-        epilogue_needs_set = _needed_by_ids(epilogue)
-        if any(n.id in epilogue_needs_set for n in prologue):
-            epilogue_needs_set = epilogue_needs_set | _needed_by_ids(prologue)
-
-        access = self.input_accesses(shapes, output_shape)
-        for p in self.inputs:
-            if p.buffer_id in epilogue_needs_set:
-                acc = access.get(p.buffer_id)
-                if acc and acc.is_2d:
-                    return True
-        for n in prologue:
-            if n.id in _needed_by_ids(epilogue):
-                return True
-        return False
-
-    def input_accesses(self, shapes: dict, output_shape: tuple) -> dict:
-        """Build an AccessPattern per external input.
-
-        Classification is shape-driven: scalar, row-vector, per-row,
-        broadcast (smaller-than-output, NumPy-broadcast-compatible), or 2D.
-        """
-        import math as _math
-
-        from deplodock.compiler.shape_utils import is_broadcast_compatible
-
-        out_size = _math.prod(d for d in output_shape if isinstance(d, int))
-        result: dict = {}
-        for p in self.inputs:
-            inp = p.buffer_id
-            inp_shape = shapes.get(inp, (1,))
-            inp_size = _math.prod(d for d in inp_shape if isinstance(d, int))
-            has_symbolic = any(isinstance(d, str) for d in inp_shape)
-            last_dim = inp_shape[-1] if inp_shape else 1
-            last_dim_is_one = isinstance(last_dim, int) and last_dim == 1
-            is_per_row = last_dim_is_one and inp_size > 1 and len(inp_shape) >= 2
-            is_broadcast = (
-                inp_size > 1
-                and inp_size < out_size
-                and not is_per_row
-                and len(inp_shape) >= 2
-                and is_broadcast_compatible(inp_shape, output_shape)
-            )
-            result[inp] = AccessPattern(
-                shape=inp_shape,
-                size=inp_size,
-                is_scalar=(inp_size == 1 and not has_symbolic),
-                is_row_vector=(len(inp_shape) == 1 and (inp_size > 1 or has_symbolic)),
-                is_2d=(len(inp_shape) >= 2 and (inp_size > 1 or has_symbolic) and not is_per_row and not is_broadcast),
-                is_per_row=is_per_row,
-                is_broadcast=is_broadcast,
-            )
-        return result
+def _assert_reduce_node(node: Node[ReduceOp], where: str) -> None:
+    if not isinstance(node.op, ReduceOp):
+        raise TypeError(f"{where} has op {type(node.op).__name__}, expected ReduceOp")

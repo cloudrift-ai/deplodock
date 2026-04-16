@@ -22,7 +22,6 @@ collect_ignore = [
     "test_torch_trace_ops.py",
     "test_real_trace.py",
     "test_hints.py",
-    "test_kernel_op.py",
     "test_kernel_gen.py",
     "test_cuda.py",
     "test_cuda_backend.py",

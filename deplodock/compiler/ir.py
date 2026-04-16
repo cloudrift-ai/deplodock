@@ -1,4 +1,12 @@
-"""Tensor IR: Tensor, Node, and Graph."""
+"""Tensor IR: Tensor, Node, and Graph.
+
+The IR is a directed acyclic dataflow graph (Kahn-style) over tensor
+values. Each ``Node`` wraps one primitive ``Op`` subtype, so nodes are
+parameterized by their op type — a ``Node[ElementwiseOp]`` is statically
+distinguishable from a ``Node[ReduceOp]``. The structural compiler IR
+(``KernelOp`` trees in ``ops.py``) relies on that distinction to carry
+typed chains like ``tuple[Node[ElementwiseOp], ...]``.
+"""
 
 from __future__ import annotations
 
@@ -20,11 +28,19 @@ class Tensor:
 
 
 @dataclass
-class Node:
-    """A single operation in the compute graph."""
+class Node[T_Op: Op]:
+    """A single operation in the compute graph.
+
+    Generic on the op type (PEP 695) so consumers can narrow to
+    ``Node[ElementwiseOp]`` or ``Node[ReduceOp]`` where the surrounding
+    structure demands it (e.g. a body-chain slot that admits only
+    elementwise ops, or a ``ReduceStage`` whose ``reduce`` field must be
+    a reduction). The parameter is erased at runtime; owning dataclasses
+    enforce the invariant via ``__post_init__``.
+    """
 
     id: str
-    op: Op
+    op: T_Op
     inputs: list[str]  # node ids
     output: Tensor
     hints: Hints = field(default_factory=Hints)
