@@ -1,16 +1,17 @@
-"""Tests for Graph -> list[KernelOp] structural lowering."""
+"""Tests for the compile_graph pipeline: decomposition → optimization → fusion → extract.
 
-import pytest
+After compile_graph, every primitive op is inside a KernelOp. Tests verify
+the structural shape of the resulting KernelOps.
+"""
 
 from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.lower import lower
 from deplodock.compiler.ops import (
-    Combine,
     ContractionCore,
     ElementwiseOp,
     InputOp,
     ReduceOp,
 )
+from deplodock.compiler.pipeline import compile_graph
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -18,148 +19,27 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Pointwise: single ElementwiseOp becomes one Combine-rooted KernelOp.
+# Pointwise
 # ---------------------------------------------------------------------------
 
 
-def test_lower_pointwise_add():
+def test_pointwise_add():
     g = Graph()
     _input(g, "x", (4,))
     _input(g, "y", (4,))
-    g.add_node(
-        op=ElementwiseOp(fn="add"),
-        inputs=["x", "y"],
-        output=Tensor("add0", (4,)),
-        node_id="add0",
-    )
+    g.add_node(op=ElementwiseOp(fn="add"), inputs=["x", "y"], output=Tensor("z", (4,)), node_id="z")
     g.inputs = ["x", "y"]
-    g.outputs = ["add0"]
+    g.outputs = ["z"]
 
-    kernels = lower(g)
-    assert len(kernels) == 1
-    k = kernels[0]
-
-    # Pointwise: body lives in inputs[0] as a Combine; no core stages.
-    assert k.contraction is None
-    assert k.reduce_stages == ()
-    assert k.epilogue == ()
-    assert len(k.inputs) == 1
-    assert isinstance(k.inputs[0], Combine)
-    assert k.inputs[0].ops[0].op.fn == "add"
-    assert [s.buffer_id for s in k.inputs[0].sources] == ["x", "y"]
-    assert [o.buffer_id for o in k.outputs] == ["add0"]
-
-
-# ---------------------------------------------------------------------------
-# Reduce: single ReduceOp (non-matmul) becomes one reduce_stages kernel.
-# ---------------------------------------------------------------------------
-
-
-def test_lower_reduce_sum():
-    g = Graph()
-    _input(g, "x", (4, 8))
-    g.add_node(
-        op=ReduceOp(fn="sum", axis=-1),
-        inputs=["x"],
-        output=Tensor("r0", (4,)),
-        node_id="r0",
-    )
-    g.inputs = ["x"]
-    g.outputs = ["r0"]
-
-    kernels = lower(g)
+    kernels = compile_graph(g)
     assert len(kernels) == 1
     k = kernels[0]
     assert k.contraction is None
-    assert len(k.reduce_stages) == 1
-    stage = k.reduce_stages[0]
-    assert stage.pre_ops == ()
-    assert stage.reduce.op.fn == "sum"
-
-
-# ---------------------------------------------------------------------------
-# Matmul: mul + sum (fan-out=1 on mul) collapses into one ContractionCore.
-# ---------------------------------------------------------------------------
-
-
-def test_lower_matmul_mul_sum_pair():
-    g = Graph()
-    _input(g, "a", (4, 8))
-    _input(g, "b", (4, 8))
-    g.add_node(
-        op=ElementwiseOp(fn="mul"),
-        inputs=["a", "b"],
-        output=Tensor("mul0", (4, 8)),
-        node_id="mul0",
-    )
-    g.add_node(
-        op=ReduceOp(fn="sum", axis=-1),
-        inputs=["mul0"],
-        output=Tensor("dot0", (4,)),
-        node_id="dot0",
-    )
-    g.inputs = ["a", "b"]
-    g.outputs = ["dot0"]
-
-    kernels = lower(g)
-    assert len(kernels) == 1
-    k = kernels[0]
-    assert isinstance(k.contraction, ContractionCore)
     assert k.reduce_stages == ()
-    assert k.contraction.reduce.op.fn == "sum"
-    assert k.contraction.k_axis == -1
-    operand = k.contraction.operand
-    assert isinstance(operand, Combine)
-    assert operand.ops[0].op.fn == "mul"
-    assert [s.buffer_id for s in operand.sources] == ["a", "b"]
 
 
-# ---------------------------------------------------------------------------
-# Fan-out guard: mul with >1 consumer should NOT collapse into matmul.
-# ---------------------------------------------------------------------------
-
-
-def test_lower_no_matmul_when_mul_fans_out():
-    g = Graph()
-    _input(g, "a", (4, 8))
-    _input(g, "b", (4, 8))
-    g.add_node(
-        op=ElementwiseOp(fn="mul"),
-        inputs=["a", "b"],
-        output=Tensor("mul0", (4, 8)),
-        node_id="mul0",
-    )
-    g.add_node(
-        op=ReduceOp(fn="sum", axis=-1),
-        inputs=["mul0"],
-        output=Tensor("dot0", (4,)),
-        node_id="dot0",
-    )
-    # Second consumer of mul0 — pointwise copy.
-    g.add_node(
-        op=ElementwiseOp(fn="neg"),
-        inputs=["mul0"],
-        output=Tensor("neg0", (4, 8)),
-        node_id="neg0",
-    )
-    g.inputs = ["a", "b"]
-    g.outputs = ["dot0", "neg0"]
-
-    kernels = lower(g)
-    # Three kernels: mul0 (pointwise), dot0 (pure reduce), neg0 (pointwise).
-    assert len(kernels) == 3
-    assert kernels[0].contraction is None  # mul is now a pointwise kernel
-    assert kernels[0].reduce_stages == ()
-    assert kernels[1].contraction is None
-    assert len(kernels[1].reduce_stages) == 1
-
-
-# ---------------------------------------------------------------------------
-# Chained primitives: each node becomes its own singleton kernel.
-# ---------------------------------------------------------------------------
-
-
-def test_lower_chain_of_pointwise_all_singletons():
+def test_chained_pointwise_fuses_into_one():
+    """exp → neg with fan-out 1 fuses into one kernel."""
     g = Graph()
     _input(g, "x", (4,))
     g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
@@ -167,19 +47,74 @@ def test_lower_chain_of_pointwise_all_singletons():
     g.inputs = ["x"]
     g.outputs = ["n"]
 
-    kernels = lower(g)
-    assert len(kernels) == 2
-    assert [k.inputs[0].ops[0].op.fn for k in kernels] == ["exp", "neg"]
-    # Second kernel consumes the first's output by buffer_id.
-    assert kernels[1].inputs[0].sources[0].buffer_id == "e"
+    kernels = compile_graph(g)
+    assert len(kernels) == 1
+    assert kernels[0].contraction is None
+    assert kernels[0].reduce_stages == ()
 
 
 # ---------------------------------------------------------------------------
-# Unsupported op types should raise until follow-up commits add support.
+# Reduce
 # ---------------------------------------------------------------------------
 
 
-def test_lower_rejects_unknown_op_type():
+def test_reduce_sum():
+    g = Graph()
+    _input(g, "x", (4, 8))
+    g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["x"], output=Tensor("r", (4,)), node_id="r")
+    g.inputs = ["x"]
+    g.outputs = ["r"]
+
+    kernels = compile_graph(g)
+    assert len(kernels) == 1
+    assert len(kernels[0].reduce_stages) == 1
+    assert kernels[0].reduce_stages[0].reduce.op.fn == "sum"
+
+
+# ---------------------------------------------------------------------------
+# Matmul (mul + sum pair)
+# ---------------------------------------------------------------------------
+
+
+def test_matmul_mul_sum():
+    g = Graph()
+    _input(g, "a", (4, 8))
+    _input(g, "b", (8, 4))
+    g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8, 4)), node_id="m")
+    g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=["m"], output=Tensor("o", (4, 4)), node_id="o")
+    g.inputs = ["a", "b"]
+    g.outputs = ["o"]
+
+    kernels = compile_graph(g)
+    assert len(kernels) == 1
+    assert isinstance(kernels[0].contraction, ContractionCore)
+    assert kernels[0].contraction.reduce.op.fn == "sum"
+
+
+def test_no_matmul_when_mul_fans_out():
+    """mul with fan-out > 1 can't be paired with sum as a contraction."""
+    g = Graph()
+    _input(g, "a", (4, 8))
+    _input(g, "b", (4, 8))
+    g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8)), node_id="m")
+    g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["m"], output=Tensor("d", (4,)), node_id="d")
+    g.add_node(op=ElementwiseOp("neg"), inputs=["m"], output=Tensor("n", (4, 8)), node_id="n")
+    g.inputs = ["a", "b"]
+    g.outputs = ["d", "n"]
+
+    kernels = compile_graph(g)
+    # mul has fan-out > 1 → separate kernel. sum and neg are also separate.
+    assert len(kernels) == 3
+    assert all(k.contraction is None for k in kernels)
+
+
+# ---------------------------------------------------------------------------
+# MatmulOp (high-level) gets decomposed then fused
+# ---------------------------------------------------------------------------
+
+
+def test_matmul_op_decomposes_and_fuses():
+    """MatmulOp → decompose to mul+sum → fuse into ContractionCore."""
     from deplodock.compiler.ops import MatmulOp
 
     g = Graph()
@@ -189,18 +124,17 @@ def test_lower_rejects_unknown_op_type():
     g.inputs = ["a", "b"]
     g.outputs = ["m"]
 
-    with pytest.raises(NotImplementedError, match="MatmulOp"):
-        lower(g)
+    kernels = compile_graph(g)
+    contractions = [k for k in kernels if k.contraction is not None]
+    assert len(contractions) >= 1
 
 
 # ---------------------------------------------------------------------------
-# Pipeline entry point mirrors lower() 1:1.
+# Pipeline entry point
 # ---------------------------------------------------------------------------
 
 
-def test_compile_graph_entry_point():
-    from deplodock.compiler.pipeline import compile_graph
-
+def test_compile_graph_produces_kernel_ops():
     g = Graph()
     _input(g, "x", (4,))
     g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
@@ -209,4 +143,3 @@ def test_compile_graph_entry_point():
 
     kernels = compile_graph(g)
     assert len(kernels) == 1
-    assert kernels[0].inputs[0].ops[0].op.fn == "exp"

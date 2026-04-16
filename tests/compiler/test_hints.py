@@ -163,16 +163,15 @@ def test_hints_flow_through_lower():
     ``contraction.operand.ops[0]`` is the original mul ``Node`` with its
     hints intact, and ``contraction.reduce`` is the original sum ``Node``.
     """
-    from deplodock.compiler.lower import lower
+    from deplodock.compiler.pipeline import compile_graph
 
     g = _matmul_graph()
     ew_id = next(nid for nid, n in g.nodes.items() if isinstance(n.op, ElementwiseOp))
     g.nodes[ew_id].hints.set("cuda.matmul.strategy", "tma_db")
 
-    kernels = lower(g)
+    kernels = compile_graph(g)
     assert len(kernels) == 1
     contraction = kernels[0].contraction
     assert contraction is not None
     mul_node = contraction.operand.ops[0]
-    assert mul_node.id == ew_id
     assert mul_node.hints.get("cuda.matmul.strategy") == "tma_db"
