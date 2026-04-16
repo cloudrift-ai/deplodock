@@ -80,8 +80,18 @@ def compile_kernels(
     graph_output_set = set(graph_outputs or [])
     graph_constant_set = set(graph_constants or [])
 
-    # Infer output shapes for kernels and add to shapes dict.
+    # Collect ALL referenced buffer shapes: leaf Ports from inputs +
+    # output Ports. Kernels are in topo order, so a prior kernel's output
+    # shape is available for a later kernel's input.
     for k in kernels:
+        # Register input leaf Ports not yet in shapes (e.g., Ports with indexmap
+        # whose buffer_id is the original source, already in buf_shapes).
+        for port in _leaf_ports(k):
+            if port.buffer_id not in shapes:
+                if port.indexmap is not None:
+                    # The source shape isn't known — use indexmap.out_shape
+                    # as a size hint (conservative: at least this many elements).
+                    shapes[port.buffer_id] = tuple(port.indexmap.out_shape)
         out_shape = k.infer_output_shape(shapes)
         for out in k.outputs:
             if isinstance(out, Port):
