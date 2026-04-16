@@ -1,4 +1,8 @@
-"""Decompose LinearOp into transpose(weight) → mul → reduce_sum [→ add(bias)]."""
+"""Decompose LinearOp into transpose(weight) → unsqueeze → mul → reduce_sum [→ add(bias)].
+
+Same unsqueeze strategy as matmul decomposition: inputs become
+broadcast-compatible via IndexMapOp before the mul.
+"""
 
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainMatch, Production
@@ -8,7 +12,6 @@ GRAMMAR = [Production("root", LinearOp, "1")]
 
 
 def rewrite(graph: Graph, match: ChainMatch) -> Graph:
-    """Replace LinearOp(x, w [, b]) with x @ w.T [+ b]."""
     g = graph.copy()
     root = g.nodes[match.root_node_id]
     x_id = root.inputs[0]
@@ -18,7 +21,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     dtype = root.output.dtype
     name = root.output.name
 
-    # Transpose weight: (out_features, in_features) → (in_features, out_features)
     w_shape = g.nodes[w_id].output.shape
     wt_shape = (w_shape[-1], w_shape[-2]) if len(w_shape) >= 2 else w_shape
     wt_id = g.add_node(
@@ -27,22 +29,27 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         output=Tensor(f"{name}_wt", wt_shape, dtype),
     )
 
-    # mul(x, w_transposed) → intermediate with an extra K dimension
+    # Reuse matmul's unsqueeze logic for x @ wt.
+    from deplodock.compiler.rules.decomposition._matmul_helpers import matmul_unsqueeze
+
+    x_shape = tuple(g.nodes[x_id].output.shape)
+    a_unsq, b_unsq, mul_shape, k_axis = matmul_unsqueeze(x_shape, tuple(wt_shape))
+
+    a_unsq_id = g.add_node(op=a_unsq, inputs=[x_id], output=Tensor(f"{name}_x_unsq", a_unsq.out_shape, dtype))
+    b_unsq_id = g.add_node(op=b_unsq, inputs=[wt_id], output=Tensor(f"{name}_wt_unsq", b_unsq.out_shape, dtype))
+
     ew_id = g.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[x_id, wt_id],
-        output=Tensor(f"{name}_ew", shape + ("K",), dtype),
+        inputs=[a_unsq_id, b_unsq_id],
+        output=Tensor(f"{name}_ew", mul_shape, dtype),
     )
-
-    # reduce_sum over K → result
     red_id = g.add_node(
-        op=ReduceOp(fn="sum", axis="K"),
+        op=ReduceOp(fn="sum", axis=k_axis),
         inputs=[ew_id],
         output=Tensor(name, shape, dtype),
     )
 
     if b_id:
-        # result + bias
         add_id = g.add_node(
             op=ElementwiseOp(fn="add"),
             inputs=[red_id, b_id],

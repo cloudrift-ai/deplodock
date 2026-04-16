@@ -614,9 +614,10 @@ def _infer_output_shape(kernel: KernelOp) -> tuple:
         if not arg_shapes:
             continue
         if assign.name in contraction_names and isinstance(assign.op, ElementwiseOp):
-            # Contraction mul: take the highest-rank arg shape (the
-            # indexmap-expanded one) instead of broadcasting.
-            shapes[assign.name] = max(arg_shapes, key=len)
+            # Contraction mul: A[..., M, K] * B[..., K, N] → [..., M, K, N].
+            # Not broadcast-compatible; compute as A_shape + (B_shape[-1],).
+            a_shape, b_shape = arg_shapes[0], arg_shapes[1] if len(arg_shapes) > 1 else arg_shapes[0]
+            shapes[assign.name] = tuple(a_shape) + (b_shape[-1],)
         else:
             shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
 
