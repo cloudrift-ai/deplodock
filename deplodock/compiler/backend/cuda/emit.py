@@ -87,7 +87,7 @@ def compile_kernels(
             buf_shapes[bid] = tuple(shape)
         for out in k.outputs:
             if isinstance(out, Port):
-                buf_shapes.setdefault(out.buffer_id, _infer_output_shape(k))
+                buf_shapes.setdefault(out.buffer_id, k.infer_output_shape())
 
     def role_for(bid: str) -> str:
         if bid in graph_input_set:
@@ -146,7 +146,7 @@ def _detect_contraction(kernel: KernelOp) -> tuple[int, Assign, Assign] | None:
 
 def emit_kernel(kernel: KernelOp, kernel_name: str) -> tuple[KernelDef, list[str]]:
     """Emit a single ``KernelOp`` as a ``KernelDef`` + ordered launch args."""
-    out_shape = _infer_output_shape(kernel)
+    out_shape = kernel.infer_output_shape()
     params, arg_order = _build_params(kernel)
 
     contraction = _detect_contraction(kernel)
@@ -740,36 +740,6 @@ def _numel(shape: tuple) -> int:
     return int(math.prod(int(d) for d in shape if isinstance(d, int)) or 1)
 
 
-def _infer_output_shape(kernel: KernelOp) -> tuple:
-    """Derive the kernel's output shape.
-
-    Tries ``KernelOp.infer_output_shape()`` first; falls back to the output
-    Port's ``external_shapes`` entry or the first input Port's shape.
-    """
-    try:
-        shape = kernel.infer_output_shape()
-        if shape:
-            return shape
-    except (ValueError, KeyError):
-        pass
-    # Fallback: output Port shape from external_shapes.
-    for out in kernel.outputs:
-        if isinstance(out, Port) and out.buffer_id in kernel.external_shapes:
-            return tuple(kernel.external_shapes[out.buffer_id])
-    # Fallback: output Port indexmap out_shape.
-    for out in kernel.outputs:
-        if isinstance(out, Port) and out.indexmap is not None:
-            return tuple(out.indexmap.out_shape)
-    # Fallback: first input Port shape.
-    for inp in kernel.inputs:
-        if isinstance(inp, Port):
-            if inp.indexmap is not None:
-                return tuple(inp.indexmap.out_shape)
-            if inp.buffer_id in kernel.external_shapes:
-                return tuple(kernel.external_shapes[inp.buffer_id])
-    return ()
-
-
 def _port_shape(inp, shapes: dict) -> tuple:
     if isinstance(inp, Port):
         if inp.indexmap is not None:
@@ -841,7 +811,7 @@ def _kernel_name(kernel: KernelOp, idx: int) -> str:
 
 
 def _launch_config(kernel: KernelOp) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    out_shape = _infer_output_shape(kernel)
+    out_shape = kernel.infer_output_shape()
     if _detect_contraction(kernel) is not None:
         int_shape = tuple(int(d) for d in out_shape if isinstance(d, int))
         m = int_shape[-2] if len(int_shape) >= 2 else 1
@@ -870,7 +840,7 @@ def _reduce_n_rows(kernel: KernelOp) -> int:
                 return _numel(src_shape[:-1])
             return _numel(src_shape) if src_shape else 1
     # Fallback: use output shape.
-    return _numel(_infer_output_shape(kernel))
+    return _numel(kernel.infer_output_shape())
 
 
 def _emit_kernel_source(kernel_def: KernelDef) -> str:
