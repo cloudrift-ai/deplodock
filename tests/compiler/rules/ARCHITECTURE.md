@@ -19,10 +19,14 @@ scale constant, incorrect coordinate mapping, etc.
 
 ```
 tests/compiler/rules/
-└── test_decompose_rules.py   # all decomposition rules (structural + correctness)
+├── test_decompose_rules.py      # decomposition rules (structural + correctness)
+├── test_optimization_rules.py   # optimization rules (structural + correctness)
+└── test_fusion_rules.py         # fusion rules (structural only — KernelOp not numpy-executable)
 ```
 
 ## Covered Rules
+
+### Decomposition (`rules/decomposition/`)
 
 | Rule file | Op | Structural | Correctness |
 |---|---|---|---|
@@ -37,6 +41,18 @@ tests/compiler/rules/
 | `012_reshape_to_indexmap.py` | `ReshapeOp` | — | ✓ |
 | `013_slice_to_indexmap.py` | `SliceOp` | — | ✓ |
 | `014_cat_to_indexmap.py` | `CatOp` | — | ✓ |
+
+### Optimization (`rules/optimization/`)
+
+| Rule file | Op | Structural | Correctness |
+|---|---|---|---|
+| `002_insert_broadcast_indexmap.py` | `ElementwiseOp` (broadcast) | ✓ | ✓ (1D, scalar, 3D, RMSNorm chain) |
+
+### Fusion (`rules/fusion/`)
+
+| Rule file | Op | Structural | Correctness |
+|---|---|---|---|
+| `assemble_kernels.py` | primitives → `KernelOp` | ✓ (pointwise, contraction, softmax, SSA invariants) | — (KernelOp not numpy-executable) |
 
 ## Adding a New Rule Test
 

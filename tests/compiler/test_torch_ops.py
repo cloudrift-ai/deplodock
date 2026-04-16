@@ -1,7 +1,9 @@
 """Tests for Op.forward() and the numpy graph executor.
 
 Compares numpy backend output against PyTorch eager for every aten
-operation the tracer captures. Requires PyTorch.
+operation the tracer captures. When CUDA is available, also compiles
+each graph through the full pipeline (decomposition → fusion → codegen)
+and verifies GPU output matches. Requires PyTorch.
 """
 
 import numpy as np
@@ -29,17 +31,47 @@ from deplodock.compiler.ops import (
 
 rng = np.random.default_rng(42)
 
+_np_backend = NumpyBackend()
 
-_backend = NumpyBackend()
+try:
+    from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
+
+    _has_cuda = has_nvcc() and has_cuda_gpu()
+except Exception:
+    _has_cuda = False
 
 
 def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> np.ndarray:
     """Execute graph via NumpyBackend and return the single output array."""
-    return list(_backend.run_arrays(_backend.compile(graph, input_data=inputs)).values())[0]
+    return list(_np_backend.run_arrays(_np_backend.compile(graph, input_data=inputs)).values())[0]
 
 
 def _torch_to_np(t: torch.Tensor) -> np.ndarray:
     return t.detach().cpu().numpy()
+
+
+def _check_cuda(graph: Graph, np_inputs: dict[str, np.ndarray], expected: np.ndarray, *, rtol=1e-4, atol=1e-5):
+    """Compile through full CUDA pipeline and compare output against expected."""
+    if not _has_cuda:
+        return
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.pipeline import compile_graph
+
+    cr = compile_graph(graph)
+    program = CudaBackend().compile(
+        cr.kernels,
+        buf_shapes=cr.buf_shapes,
+        graph_inputs=cr.graph_inputs,
+        graph_outputs=cr.graph_outputs,
+        graph_constants=cr.graph_constants,
+    )
+    input_data = {nid: arr.flatten().tolist() for nid, arr in np_inputs.items()}
+    for nid, val in cr.constant_values.items():
+        if nid not in input_data:
+            input_data[nid] = [val]
+    cuda_flat = list(CudaBackend().run(program, input_data=input_data).outputs.values())[0]
+    actual = np.array(cuda_flat, dtype=np.float32).reshape(expected.shape)
+    np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol, err_msg="CUDA output mismatch")
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +99,9 @@ def test_unary(fn, torch_fn):
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(ElementwiseOp(fn), ["x"], Tensor("y", (4, 8)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch_fn(torch.from_numpy(x_np)))
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-5, atol=1e-5)
+    _check_cuda(g, {"x": x_np}, expected, rtol=2e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +126,9 @@ def test_binary(fn, torch_fn):
     g.add_node(InputOp(), [], Tensor("y", (4, 8)), node_id="y")
     g.add_node(ElementwiseOp(fn), ["x", "y"], Tensor("z", (4, 8)), node_id="z")
     g.inputs, g.outputs = ["x", "y"], ["z"]
-    actual = _run(g, {"x": x_np, "y": y_np})
     expected = _torch_to_np(torch_fn(torch.from_numpy(x_np), torch.from_numpy(y_np)))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np, "y": y_np}), expected, rtol=1e-6, atol=1e-6)
+    _check_cuda(g, {"x": x_np, "y": y_np}, expected, rtol=1e-3 if fn == "div" else 1e-5, atol=1e-5)
 
 
 def test_pow():
@@ -106,9 +138,9 @@ def test_pow():
     g.add_node(ConstantOp(name="p", value=2.0), [], Tensor("p", (1,)), node_id="p")
     g.add_node(ElementwiseOp("pow"), ["x", "p"], Tensor("y", (4, 8)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).pow(2.0))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
+    _check_cuda(g, {"x": x_np}, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_add_broadcast():
@@ -119,9 +151,9 @@ def test_add_broadcast():
     g.add_node(InputOp(), [], Tensor("y", (8,)), node_id="y")
     g.add_node(ElementwiseOp("add"), ["x", "y"], Tensor("z", (4, 8)), node_id="z")
     g.inputs, g.outputs = ["x", "y"], ["z"]
-    actual = _run(g, {"x": x_np, "y": y_np})
     expected = _torch_to_np(torch.from_numpy(x_np) + torch.from_numpy(y_np))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np, "y": y_np}), expected, rtol=1e-6, atol=1e-6)
+    _check_cuda(g, {"x": x_np, "y": y_np}, expected, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +167,9 @@ def test_reduce_sum():
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(ReduceOp("sum", -1), ["x"], Tensor("y", (4,)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).sum(dim=-1))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
+    _check_cuda(g, {"x": x_np}, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_reduce_max():
@@ -146,9 +178,9 @@ def test_reduce_max():
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(ReduceOp("max", -1), ["x"], Tensor("y", (4,)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).amax(dim=-1))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
+    _check_cuda(g, {"x": x_np}, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_reduce_sum_keepdim():
@@ -157,9 +189,9 @@ def test_reduce_sum_keepdim():
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(ReduceOp("sum", -1), ["x"], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).sum(dim=-1, keepdim=True))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
+    _check_cuda(g, {"x": x_np}, expected, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +205,13 @@ def test_mean():
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(MeanOp(axis=-1), ["x"], Tensor("y", (4,)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).mean(dim=-1))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
+    _check_cuda(g, {"x": x_np}, expected, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
-# Layout ops
+# Layout ops (numpy only — standalone layout ops don't go through CUDA pipeline)
 # ---------------------------------------------------------------------------
 
 
@@ -189,9 +221,8 @@ def test_transpose():
     g.add_node(InputOp(), [], Tensor("x", (3, 4)), node_id="x")
     g.add_node(TransposeOp(axes=(1, 0)), ["x"], Tensor("y", (4, 3)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).transpose(0, 1))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
 
 
 def test_transpose_perm():
@@ -200,9 +231,8 @@ def test_transpose_perm():
     g.add_node(InputOp(), [], Tensor("x", (2, 3, 4)), node_id="x")
     g.add_node(TransposeOp(axes=(0, 2, 1)), ["x"], Tensor("y", (2, 4, 3)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).permute(0, 2, 1))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
 
 
 def test_reshape():
@@ -211,9 +241,8 @@ def test_reshape():
     g.add_node(InputOp(), [], Tensor("x", (3, 4)), node_id="x")
     g.add_node(ReshapeOp(shape=(2, 6)), ["x"], Tensor("y", (2, 6)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).reshape(2, 6))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
 
 
 def test_unsqueeze():
@@ -222,13 +251,12 @@ def test_unsqueeze():
     g.add_node(InputOp(), [], Tensor("x", (4,)), node_id="x")
     g.add_node(UnsqueezeOp(dim=0), ["x"], Tensor("y", (1, 4)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np).unsqueeze(0))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# Slice / Cat / Gather
+# Slice / Cat / Gather (numpy only)
 # ---------------------------------------------------------------------------
 
 
@@ -241,9 +269,8 @@ def test_slice():
     g.add_node(ConstantOp(name="end", value=6.0), [], Tensor("end", (1,)), node_id="end")
     g.add_node(SliceOp(shape=(4, 4)), ["x", "dim", "start", "end"], Tensor("y", (4, 4)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.from_numpy(x_np)[:, 2:6])
-    np.testing.assert_allclose(actual, expected, rtol=1e-5)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
 
 
 def test_cat():
@@ -255,9 +282,8 @@ def test_cat():
     g.add_node(ConstantOp(name="dim", value=1.0), [], Tensor("dim", (1,)), node_id="dim")
     g.add_node(CatOp(), ["a", "b", "dim"], Tensor("y", (4, 8)), node_id="y")
     g.inputs, g.outputs = ["a", "b"], ["y"]
-    actual = _run(g, {"a": a_np, "b": b_np})
     expected = _torch_to_np(torch.cat([torch.from_numpy(a_np), torch.from_numpy(b_np)], dim=1))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5)
+    np.testing.assert_allclose(_run(g, {"a": a_np, "b": b_np}), expected, rtol=1e-6, atol=1e-6)
 
 
 def test_gather():
@@ -268,9 +294,8 @@ def test_gather():
     g.add_node(InputOp(), [], Tensor("idx", (4, 3)), node_id="idx")
     g.add_node(GatherOp(axis=1), ["x", "idx"], Tensor("y", (4, 3)), node_id="y")
     g.inputs, g.outputs = ["x", "idx"], ["y"]
-    actual = _run(g, {"x": x_np, "idx": idx.astype(np.float32)})
     expected = _torch_to_np(torch.from_numpy(x_np).gather(1, torch.from_numpy(idx).long()))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5)
+    np.testing.assert_allclose(_run(g, {"x": x_np, "idx": idx.astype(np.float32)}), expected, rtol=1e-6, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -286,9 +311,9 @@ def test_matmul():
     g.add_node(InputOp(), [], Tensor("b", (8, 3)), node_id="b")
     g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (4, 3)), node_id="c")
     g.inputs, g.outputs = ["a", "b"], ["c"]
-    actual = _run(g, {"a": a_np, "b": b_np})
     expected = _torch_to_np(torch.from_numpy(a_np) @ torch.from_numpy(b_np))
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_run(g, {"a": a_np, "b": b_np}), expected, rtol=1e-5, atol=1e-6)
+    _check_cuda(g, {"a": a_np, "b": b_np}, expected, rtol=5e-5, atol=2e-6)
 
 
 def test_matmul_with_bias():
@@ -301,9 +326,9 @@ def test_matmul_with_bias():
     g.add_node(InputOp(), [], Tensor("bias", (3,)), node_id="bias")
     g.add_node(MatmulOp(has_bias=True), ["a", "b", "bias"], Tensor("c", (4, 3)), node_id="c")
     g.inputs, g.outputs = ["a", "b", "bias"], ["c"]
-    actual = _run(g, {"a": a_np, "b": b_np, "bias": bias_np})
     expected = _torch_to_np(torch.addmm(torch.from_numpy(bias_np), torch.from_numpy(a_np), torch.from_numpy(b_np)))
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_run(g, {"a": a_np, "b": b_np, "bias": bias_np}), expected, rtol=1e-5, atol=1e-6)
+    _check_cuda(g, {"a": a_np, "b": b_np, "bias": bias_np}, expected, rtol=5e-5, atol=2e-6)
 
 
 def test_linear():
@@ -314,9 +339,9 @@ def test_linear():
     g.add_node(ConstantOp(name="w"), [], Tensor("w", (4, 8)), node_id="w")
     g.add_node(LinearOp(has_bias=False), ["x", "w"], Tensor("y", (2, 4)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np, "w": w_np})
     expected = _torch_to_np(torch.nn.functional.linear(torch.from_numpy(x_np), torch.from_numpy(w_np)))
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_run(g, {"x": x_np, "w": w_np}), expected, rtol=1e-4, atol=1e-6)
+    _check_cuda(g, {"x": x_np, "w": w_np}, expected, rtol=5e-5, atol=2e-6)
 
 
 def test_linear_with_bias():
@@ -329,9 +354,9 @@ def test_linear_with_bias():
     g.add_node(ConstantOp(name="b"), [], Tensor("b", (4,)), node_id="b")
     g.add_node(LinearOp(has_bias=True), ["x", "w", "b"], Tensor("y", (2, 4)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    actual = _run(g, {"x": x_np, "w": w_np, "b": b_np})
     expected = _torch_to_np(torch.nn.functional.linear(torch.from_numpy(x_np), torch.from_numpy(w_np), torch.from_numpy(b_np)))
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_run(g, {"x": x_np, "w": w_np, "b": b_np}), expected, rtol=1e-4, atol=1e-6)
+    _check_cuda(g, {"x": x_np, "w": w_np, "b": b_np}, expected, rtol=5e-5, atol=2e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +374,11 @@ def test_sdpa():
     g.add_node(InputOp(), [], Tensor("v", (1, 2, 4, 8)), node_id="v")
     g.add_node(SdpaOp(), ["q", "k", "v"], Tensor("out", (1, 2, 4, 8)), node_id="out")
     g.inputs, g.outputs = ["q", "k", "v"], ["out"]
-    actual = _run(g, {"q": q_np, "k": k_np, "v": v_np})
     expected = _torch_to_np(
         torch.nn.functional.scaled_dot_product_attention(torch.from_numpy(q_np), torch.from_numpy(k_np), torch.from_numpy(v_np))
     )
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_run(g, {"q": q_np, "k": k_np, "v": v_np}), expected, rtol=1e-5, atol=1e-6)
+    _check_cuda(g, {"q": q_np, "k": k_np, "v": v_np}, expected, rtol=5e-5, atol=2e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +397,9 @@ def test_softmax_graph():
     g.add_node(ReduceOp("sum", -1), ["exp"], Tensor("sm", (rows, 1)), node_id="sm")
     g.add_node(ElementwiseOp("div"), ["exp", "sm"], Tensor("out", (rows, cols)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
-    actual = _run(g, {"x": x_np})
     expected = _torch_to_np(torch.softmax(torch.from_numpy(x_np), dim=-1))
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(_run(g, {"x": x_np}), expected, rtol=1e-6, atol=1e-6)
+    _check_cuda(g, {"x": x_np}, expected, rtol=2e-4, atol=1e-5)
 
 
 def test_rmsnorm_graph():
@@ -393,10 +418,10 @@ def test_rmsnorm_graph():
     g.add_node(ElementwiseOp("mul"), ["X", "rsq"], Tensor("norm", (rows, dim)), node_id="norm")
     g.add_node(ElementwiseOp("mul"), ["norm", "w"], Tensor("out", (rows, dim)), node_id="out")
     g.inputs, g.outputs = ["X", "w"], ["out"]
-    actual = _run(g, {"X": X_np, "w": w_np})
 
     X_t = torch.from_numpy(X_np)
     w_t = torch.from_numpy(w_np)
     sq_sum = X_t.pow(2).sum(-1, keepdim=True)
     expected = _torch_to_np(X_t * torch.rsqrt(sq_sum + eps) * w_t)
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(_run(g, {"X": X_np, "w": w_np}), expected, rtol=1e-5, atol=1e-6)
+    _check_cuda(g, {"X": X_np, "w": w_np}, expected, rtol=1e-4, atol=1e-5)
