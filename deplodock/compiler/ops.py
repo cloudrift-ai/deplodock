@@ -304,22 +304,23 @@ class TransposeOp(Op):
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         in_shape = input_shapes[0]
         ndim = len(in_shape)
-        if len(self.axes) == ndim:
-            return tuple(in_shape[a] for a in self.axes)
-        a, b = self.axes[0] % ndim, self.axes[1] % ndim
-        out = list(in_shape)
-        out[a], out[b] = out[b], out[a]
-        return tuple(out)
+        if len(self.axes) == 2:
+            # Tracer convention: 2-tuple is always a swap (aten.transpose).
+            a, b = self.axes[0] % ndim, self.axes[1] % ndim
+            out = list(in_shape)
+            out[a], out[b] = out[b], out[a]
+            return tuple(out)
+        return tuple(in_shape[a] for a in self.axes)
 
     def forward(self, *inputs):
         import numpy as np
 
         a = inputs[0]
         ndim = a.ndim
-        if len(self.axes) == ndim:
-            return np.transpose(a, self.axes)
-        ax0, ax1 = self.axes[0] % ndim, self.axes[1] % ndim
-        return np.swapaxes(a, ax0, ax1)
+        if len(self.axes) == 2:
+            ax0, ax1 = self.axes[0] % ndim, self.axes[1] % ndim
+            return np.swapaxes(a, ax0, ax1)
+        return np.transpose(a, self.axes)
 
 
 @dataclass
@@ -552,6 +553,55 @@ class IndexMapOp(Op):
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(self.out_shape)
+
+    def forward(self, *inputs):
+        import numpy as np
+
+        from deplodock.compiler.backend.ir.expr import BinOp, Literal, Ternary, Var
+
+        def _eval(expr, env):
+            if isinstance(expr, Var):
+                return env[expr.name]
+            if isinstance(expr, Literal):
+                return expr.value
+            if isinstance(expr, BinOp):
+                lv, r = _eval(expr.left, env), _eval(expr.right, env)
+                if expr.op == "+":
+                    return lv + r
+                if expr.op == "-":
+                    return lv - r
+                if expr.op == "*":
+                    return lv * r
+                if expr.op in ("/", "//"):
+                    return int(lv) // int(r)
+                if expr.op == "%":
+                    return int(lv) % int(r)
+                if expr.op == "<":
+                    return lv < r
+                if expr.op == ">=":
+                    return lv >= r
+                if expr.op == "==":
+                    return lv == r
+                if expr.op == "&&":
+                    return bool(lv) and bool(r)
+                if expr.op == "||":
+                    return bool(lv) or bool(r)
+                raise ValueError(f"Unknown BinOp: {expr.op}")
+            if isinstance(expr, Ternary):
+                return _eval(expr.if_true, env) if _eval(expr.cond, env) else _eval(expr.if_false, env)
+            raise TypeError(f"Unsupported expr type in IndexMapOp.forward: {type(expr).__name__}")
+
+        shape = tuple(int(d) for d in self.out_shape)
+        output = np.empty(shape, dtype=inputs[0].dtype if inputs else np.float32)
+        for out_idx in np.ndindex(shape):
+            env = {f"out_coord_{i}": out_idx[i] for i in range(len(out_idx))}
+            for source in self.sources:
+                if source.select is not None and not _eval(source.select, env):
+                    continue
+                in_coords = tuple(int(_eval(c, env)) for c in source.coord_map)
+                output[out_idx] = inputs[source.input_idx][in_coords]
+                break
+        return output
 
     def is_identity(self, input_shape: tuple) -> bool:
         """True when this IndexMap is a pure pointer alias of its single input."""

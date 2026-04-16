@@ -43,7 +43,8 @@ tests/
 │   ├── test_hints.py           # Hints get/set/merge/serialize + integration
 │   ├── test_matcher.py         # Pattern matching engine
 │   ├── test_rewriter.py        # Rewrite engine (SiLU decomposition)
-│   ├── test_decompose_rules.py # Individual decomposition rules (SDPA, pow)
+│   ├── rules/
+│   │   └── test_decompose_rules.py # Individual decomposition rules (SDPA, pow)
 │   ├── test_fusion.py          # auto_fuse — softmax, RMSNorm, SiLU, matmul, etc.
 │   ├── test_plan.py            # plan_graph — ExecutionPlan from Graph
 │   ├── test_pipeline.py        # Full compile pipeline: graph → GPU
