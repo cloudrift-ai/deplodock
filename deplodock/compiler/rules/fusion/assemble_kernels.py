@@ -199,23 +199,14 @@ def _build_input_tree(
             port_map[buf_id] = p
             continue
 
-        if isinstance(node.op, IndexMapOp) and len(graph.consumers(buf_id)) == 1:
+        if isinstance(node.op, IndexMapOp) and len(node.op.sources) == 1 and len(graph.consumers(buf_id)) == 1:
+            # Single-source IndexMapOp with fan-out 1: absorb into Port.indexmap.
             consumed.add(buf_id)
-            if len(node.op.sources) == 1:
-                src_id = node.inputs[node.op.sources[0].input_idx]
-                external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
-                p = Port(buffer_id=src_id, indexmap=node.op)
-                inputs.append(p)
-                port_map[buf_id] = p
-            else:
-                branches = []
-                for src in node.op.sources:
-                    src_id = node.inputs[src.input_idx]
-                    external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
-                    branches.append(MuxBranch(input=Port(buffer_id=src_id), select=src.select))
-                m = Mux(branches=tuple(branches))
-                inputs.append(m)
-                port_map[buf_id] = m
+            src_id = node.inputs[node.op.sources[0].input_idx]
+            external_shapes[src_id] = tuple(graph.nodes[src_id].output.shape)
+            p = Port(buffer_id=src_id, indexmap=node.op)
+            inputs.append(p)
+            port_map[buf_id] = p
         else:
             external_shapes[buf_id] = tuple(node.output.shape)
             p = Port(buffer_id=buf_id)
