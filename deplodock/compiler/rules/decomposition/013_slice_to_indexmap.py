@@ -11,12 +11,12 @@ from deplodock.compiler.backend.ir.expr import Literal
 from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import ConstantOp, IndexMapOp, IndexSource, SliceOp
+from deplodock.compiler.ops import ConstantOp, IndexMapOp, IndexSource, InputOp, SliceOp
 
 GRAMMAR = [Production("root", SliceOp, "1")]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     rs_id = match.root_node_id
     root = graph.nodes[rs_id]
     x_id = root.inputs[0]
@@ -32,15 +32,25 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
     dim_node = graph.nodes.get(dim_id)
     start_node = graph.nodes.get(start_id)
     if not (isinstance(dim_node.op, ConstantOp) and isinstance(start_node.op, ConstantOp)):
-        return graph
+        return None
     if dim_node.op.value is None or start_node.op.value is None:
-        return graph
+        return None
 
     dim = int(dim_node.op.value)
     norm_dim = dim if dim >= 0 else ndim + dim
     start = int(start_node.op.value)
 
-    g = graph.copy()
+    frag = Graph()
+
+    # InputOp sentinel for x (the tensor input only — constant inputs are
+    # baked into the coord_map; the rewriter's _remove_orphans handles cleanup).
+    frag.add_node(
+        op=InputOp(),
+        inputs=[],
+        output=Tensor(graph.nodes[x_id].output.name, graph.nodes[x_id].output.shape, graph.nodes[x_id].output.dtype),
+        node_id=x_id,
+    )
+
     coord_map = []
     for i in range(ndim):
         if i == norm_dim and start != 0:
@@ -48,18 +58,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         else:
             coord_map.append(placeholder(i))
 
-    new_id = g.add_node(
+    new_id = frag.add_node(
         op=IndexMapOp(out_shape=out_shape, sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),)),
         inputs=[x_id],
         output=Tensor(rs_node.output.name, out_shape, rs_node.output.dtype),
     )
-    g.replace_node(rs_id, new_id)
-    g.remove_node(rs_id)
 
-    # Clean up unused dim/start/end constants if they have no other consumers.
-    end_id = root.inputs[3] if len(root.inputs) > 3 else None
-    for cid in (dim_id, start_id, end_id):
-        if cid and cid in g.nodes and not g.consumers(cid):
-            g.remove_node(cid)
-
-    return g
+    frag.outputs = [new_id]
+    return frag

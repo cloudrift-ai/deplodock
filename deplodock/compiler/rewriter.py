@@ -1,9 +1,11 @@
 """Pass-based graph rewrite engine.
 
-Rules declare a ``GRAMMAR`` — a chain grammar (list of ``Production`` /
-``Group``) — and a ``rewrite(graph, match)`` function. The engine
-matches the grammar against the graph via ``match_grammar()`` and calls
-the rewrite function for each match. Each pass runs to fixed point.
+Rules declare a ``GRAMMAR`` and a ``rewrite(graph, match)`` function that
+returns a ``Graph`` fragment (the replacement subgraph) or ``None`` (no-op).
+
+The engine matches the grammar, calls the rewrite function, and splices the
+returned fragment into the main graph: adds new nodes, wires the fragment's
+output to replace the consumed region, and cleans up.
 """
 
 from __future__ import annotations
@@ -13,21 +15,20 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from deplodock.compiler.ir import Graph
-from deplodock.compiler.matcher import ChainGrammar, match_grammar
+from deplodock.compiler.ir import Graph, Tensor
+from deplodock.compiler.matcher import ChainGrammar, ChainMatch, match_grammar
+from deplodock.compiler.ops import Combine, InputOp, KernelOp, Mux, Port
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Trace dataclasses — capture what each pass did for debugging/dump
+# Trace dataclasses
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class RuleApplication:
-    """Record of a single rule firing."""
-
     rule_name: str
     matched_at: str
 
@@ -37,8 +38,6 @@ class RuleApplication:
 
 @dataclass
 class PassTrace:
-    """Record of a single pass execution."""
-
     name: str
     graph_before: dict | None = None
     graph_after: dict | None = None
@@ -53,30 +52,32 @@ class PassTrace:
         }
 
 
+# ---------------------------------------------------------------------------
+# Rule / Pass / Rewriter
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class Rule:
     """A single rewrite rule: grammar + rewrite function."""
 
     name: str
     grammar: ChainGrammar
-    rewrite: object  # Callable[[Graph, ChainMatch], Graph]
+    rewrite: object  # Callable[[Graph, ChainMatch], Graph | None]
 
     @staticmethod
     def from_file(path: Path) -> Rule:
-        """Load a rule from a Python file exporting ``GRAMMAR`` and ``rewrite()``."""
         spec = importlib.util.spec_from_file_location(path.stem, path)
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot load rule from {path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-
         grammar = getattr(module, "GRAMMAR", None)
         rewrite_fn = getattr(module, "rewrite", None)
         if grammar is None:
             raise ValueError(f"Rule {path} missing GRAMMAR")
         if rewrite_fn is None:
             raise ValueError(f"Rule {path} missing rewrite() function")
-
         return Rule(name=path.stem, grammar=grammar, rewrite=rewrite_fn)
 
 
@@ -89,18 +90,12 @@ class Pass:
 
     @staticmethod
     def from_directory(path: Path) -> Pass:
-        """Load all .py rule files from a directory, sorted by filename."""
         rule_files = sorted(f for f in path.glob("*.py") if f.name != "__init__.py" and not f.name.startswith("_"))
         rules = [Rule.from_file(f) for f in rule_files]
         return Pass(name=path.name, rules=rules)
 
     def apply(self, graph: Graph, trace: PassTrace | None = None) -> Graph:
-        """Apply rules in order with restart-on-match until fixed point.
-
-        A rule signals "no change" by returning the same ``Graph`` object
-        (identity comparison). The loop restarts from the first rule when
-        any rewrite produces a new graph.
-        """
+        """Apply rules to fixed point. Rules return Graph fragment or None."""
         if trace is not None:
             trace.graph_before = graph.to_dict()
         changed = True
@@ -112,13 +107,14 @@ class Pass:
                     continue
                 for match in matches:
                     logger.debug("Rule %s matched at %s", rule.name, match.root_node_id)
-                    new_graph = rule.rewrite(graph, match)
-                    if new_graph is not graph:
-                        if trace is not None:
-                            trace.rules_applied.append(RuleApplication(rule_name=rule.name, matched_at=match.root_node_id))
-                        graph = new_graph
-                        changed = True
-                        break  # graph changed — restart from first rule
+                    fragment = rule.rewrite(graph, match)
+                    if fragment is None:
+                        continue
+                    if trace is not None:
+                        trace.rules_applied.append(RuleApplication(rule_name=rule.name, matched_at=match.root_node_id))
+                    graph = _apply_replacement(graph, match, fragment)
+                    changed = True
+                    break
                 if changed:
                     break
         if trace is not None:
@@ -137,7 +133,6 @@ class Rewriter:
 
     @staticmethod
     def from_directory(rules_dir: Path, pass_order: list[str] | None = None) -> Rewriter:
-        """Load passes from named subdirectories in the given order."""
         order = pass_order if pass_order is not None else DEFAULT_PASS_ORDER
         passes: list[Pass] = []
         for name in order:
@@ -150,7 +145,6 @@ class Rewriter:
         return Rewriter(passes=passes)
 
     def apply(self, graph: Graph, pass_traces: list[PassTrace] | None = None) -> Graph:
-        """Apply all passes in order."""
         for p in self.passes:
             logger.debug("Running pass: %s", p.name)
             trace = None
@@ -159,3 +153,112 @@ class Rewriter:
                 pass_traces.append(trace)
             graph = p.apply(graph, trace=trace)
         return graph
+
+
+# ---------------------------------------------------------------------------
+# Splice: insert a fragment into the main graph
+# ---------------------------------------------------------------------------
+
+
+def _apply_replacement(graph: Graph, match: ChainMatch, fragment: Graph) -> Graph:
+    """Splice a replacement fragment into the graph.
+
+    1. Add fragment's non-InputOp nodes to the graph (with fresh IDs).
+    2. Wire the fragment's output to replace the match's output.
+    3. Remove consumed nodes and orphaned constants.
+    """
+    g = graph.copy()
+
+    # Add fragment nodes, mapping fragment IDs to new graph IDs.
+    id_map: dict[str, str] = {}
+    for frag_id in fragment.topological_order():
+        frag_node = fragment.nodes[frag_id]
+        if isinstance(frag_node.op, InputOp):
+            id_map[frag_id] = frag_id  # references existing graph node
+            continue
+        mapped_inputs = [id_map.get(inp, inp) for inp in frag_node.inputs]
+        new_id = g.add_node(
+            op=frag_node.op,
+            inputs=mapped_inputs,
+            output=Tensor(frag_node.output.name, frag_node.output.shape, frag_node.output.dtype),
+        )
+        if frag_node.hints:
+            g.nodes[new_id].hints = frag_node.hints
+        id_map[frag_id] = new_id
+
+    # Update KernelOp output Ports to match their new graph node IDs.
+    for frag_id, new_id in id_map.items():
+        if frag_id == new_id:
+            continue
+        node = g.nodes.get(new_id)
+        if node is not None and isinstance(node.op, KernelOp):
+            for out in node.op.outputs:
+                if isinstance(out, Port) and out.buffer_id == frag_id:
+                    out.buffer_id = new_id
+
+    # Wire fragment output to replace the match output.
+    new_output = id_map[fragment.outputs[0]]
+    old_output = match.output or match.root_node_id
+    g.replace_node(old_output, new_output)
+    _rename_in_kernels(g, old_output, new_output)
+
+    # Merge hints from consumed nodes into the new output.
+    for nid in match.consumed:
+        orig = graph.nodes.get(nid)
+        if orig is not None and orig.hints:
+            g.nodes[new_output].hints.merge(orig.hints)
+
+    # Remove consumed nodes.
+    for nid in match.consumed:
+        if nid in g.nodes and nid != old_output:
+            g.remove_node(nid)
+    if old_output in g.nodes:
+        g.remove_node(old_output)
+
+    # Remove orphaned nodes (zero consumers, not a graph output).
+    _remove_orphans(g)
+
+    return g
+
+
+def _rename_in_kernels(graph: Graph, old_id: str, new_id: str) -> None:
+    """Update string references inside KernelOp internals (Port/Assign)."""
+    if old_id == new_id:
+        return
+    for node in graph.nodes.values():
+        if not isinstance(node.op, KernelOp):
+            continue
+        for inp in node.op.inputs:
+            _rename_ports(inp, old_id, new_id)
+        for assign in node.op.body:
+            if old_id in assign.args:
+                assign.args = tuple(new_id if a == old_id else a for a in assign.args)
+
+
+def _rename_ports(inp, old_id: str, new_id: str) -> None:
+    if isinstance(inp, Port):
+        if inp.buffer_id == old_id:
+            inp.buffer_id = new_id
+    elif isinstance(inp, Mux):
+        for branch in inp.branches:
+            _rename_ports(branch.input, old_id, new_id)
+    elif isinstance(inp, Combine):
+        for src in inp.sources:
+            _rename_ports(src, old_id, new_id)
+
+
+def _remove_orphans(graph: Graph) -> None:
+    """Remove nodes with zero consumers that aren't graph outputs."""
+    output_set = set(graph.outputs)
+    changed = True
+    while changed:
+        changed = False
+        for nid in list(graph.nodes):
+            if nid in output_set or nid in graph.inputs:
+                continue
+            node = graph.nodes[nid]
+            if isinstance(node.op, InputOp):
+                continue
+            if not graph.consumers(nid):
+                graph.remove_node(nid)
+                changed = True

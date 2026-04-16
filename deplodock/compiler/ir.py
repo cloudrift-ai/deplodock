@@ -57,7 +57,10 @@ class Graph:
         self._id_counter = itertools.count()
 
     def _next_id(self) -> str:
-        return f"n{next(self._id_counter)}"
+        while True:
+            nid = f"n{next(self._id_counter)}"
+            if nid not in self.nodes:
+                return nid
 
     def add_node(
         self,

@@ -11,7 +11,7 @@ from deplodock.compiler.backend.ir.expr import BinOp, Literal
 from deplodock.compiler.coord_expr import placeholder
 from deplodock.compiler.ir import Graph, Tensor
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ops import IndexMapOp, IndexSource, ReshapeOp
+from deplodock.compiler.ops import IndexMapOp, IndexSource, InputOp, ReshapeOp
 
 GRAMMAR = [Production("root", ReshapeOp, "1")]
 
@@ -55,7 +55,7 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     return tuple(coords)
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph:
+def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
     in_shape = tuple(graph.nodes[x_id].output.shape)
@@ -67,12 +67,21 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph:
         sources=(IndexSource(input_idx=0, coord_map=coord_map),),
     )
 
-    g = graph.copy()
-    new_id = g.add_node(
+    frag = Graph()
+
+    # InputOp sentinel for x.
+    frag.add_node(
+        op=InputOp(),
+        inputs=[],
+        output=Tensor(graph.nodes[x_id].output.name, graph.nodes[x_id].output.shape, graph.nodes[x_id].output.dtype),
+        node_id=x_id,
+    )
+
+    new_id = frag.add_node(
         op=indexmap,
         inputs=[x_id],
         output=Tensor(root.output.name, out_shape, root.output.dtype),
     )
-    g.replace_node(match.root_node_id, new_id)
-    g.remove_node(match.root_node_id)
-    return g
+
+    frag.outputs = [new_id]
+    return frag
