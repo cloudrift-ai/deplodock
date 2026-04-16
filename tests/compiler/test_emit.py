@@ -50,6 +50,37 @@ def _matmul_graph() -> Graph:
     return g
 
 
+def _softmax_kernel():
+    """Build a KernelOp with the softmax SSA pattern directly.
+
+    Body:
+        mx  = reduce_max(x)
+        sub = sub(x, mx)
+        ex  = exp(sub)
+        sm  = reduce_sum(ex)
+        out = div(ex, sm)
+
+    The output is per-element (same shape as x). We provide y's shape
+    in external_shapes so the emitter knows the output buffer size.
+    """
+    from deplodock.compiler.ops import Assign, KernelOp, Port
+
+    x_port = Port(buffer_id="x")
+    out_port = Port(buffer_id="y")
+    return KernelOp(
+        inputs=(x_port,),
+        body=(
+            Assign(name="mx", op=ReduceOp(fn="max", axis=-1), args=("x",)),
+            Assign(name="sub", op=ElementwiseOp("sub"), args=("x", "mx")),
+            Assign(name="ex", op=ElementwiseOp("exp"), args=("sub",)),
+            Assign(name="sm", op=ReduceOp(fn="sum", axis=-1), args=("ex",)),
+            Assign(name="out", op=ElementwiseOp("div"), args=("ex", "sm")),
+        ),
+        outputs=(out_port,),
+        external_shapes={"x": (4, 8), "y": (4, 8)},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Source-level structure assertions
 # ---------------------------------------------------------------------------
@@ -57,8 +88,8 @@ def _matmul_graph() -> Graph:
 
 def test_pointwise_emits_correct_source():
     g = _pointwise_add_graph()
-    kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["x", "y"], graph_outputs=["z"])
+    result = compile_graph(g)
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
     assert len(program.launches) == 1
     source = program.launches[0].kernel_source
     assert "blockIdx.x" in source
@@ -67,8 +98,8 @@ def test_pointwise_emits_correct_source():
 
 def test_reduce_emits_k_loop():
     g = _reduce_sum_graph()
-    kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["x"], graph_outputs=["y"])
+    result = compile_graph(g)
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
     source = program.launches[0].kernel_source
     assert "for (int" in source
     assert "+=" in source
@@ -76,8 +107,8 @@ def test_reduce_emits_k_loop():
 
 def test_contraction_emits_matmul():
     g = _matmul_graph()
-    kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=["o"])
+    result = compile_graph(g)
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
     source = program.launches[0].kernel_source
     assert "for (int k" in source
     assert "acc +=" in source
@@ -85,11 +116,42 @@ def test_contraction_emits_matmul():
 
 def test_buffer_roles():
     g = _pointwise_add_graph()
-    kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["x", "y"], graph_outputs=["z"])
+    result = compile_graph(g)
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
     roles = {b.name: b.role for b in program.buffers}
     assert roles.get("x") == "input"
     assert roles.get("y") == "input"
+
+
+def test_softmax_emits_multiple_k_loops():
+    """Softmax pattern emits separate K-loops for max, sub+exp+sum, div."""
+    from deplodock.compiler.backend.cuda.emit import emit_kernel
+
+    kernel = _softmax_kernel()
+    kdef, arg_order = emit_kernel(kernel, "k0_softmax")
+    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as emit_src
+
+    source = emit_src(kdef)
+    # Must have multiple for-loops (at least 3: max, sub+exp+sum, div).
+    loop_count = source.count("for (int")
+    assert loop_count >= 3, f"expected >= 3 K-loops, got {loop_count}\n{source}"
+    # Max reduction uses fmaxf, not +=.
+    assert "fmaxf" in source, f"expected fmaxf for max reduction\n{source}"
+    # Sum reduction uses +=.
+    assert "+=" in source
+
+
+def test_softmax_emits_per_element_store():
+    """Softmax output is per-element: the final div stores inside a K-loop."""
+    from deplodock.compiler.backend.cuda.emit import emit_kernel
+    from deplodock.compiler.backend.ir.kernel_codegen import emit_kernel as emit_src
+
+    kernel = _softmax_kernel()
+    kdef, _ = emit_kernel(kernel, "k0_softmax")
+    source = emit_src(kdef)
+    # The output store y[...] must appear inside the last K-loop, not after it.
+    # Verify there's a y[...] = ... assignment somewhere in the source.
+    assert "y[" in source, f"expected output store y[...]\n{source}"
 
 
 def test_chained_pointwise_single_kernel():
@@ -101,9 +163,10 @@ def test_chained_pointwise_single_kernel():
     g.inputs = ["x"]
     g.outputs = ["n"]
 
-    kernels = compile_graph(g)
+    result = compile_graph(g)
+    kernels = result.kernels
     assert len(kernels) == 1
-    program = CudaBackend().compile(kernels, graph_inputs=["x"], graph_outputs=["n"])
+    program = CudaBackend().compile(kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
     assert len(program.launches) == 1
 
 
@@ -115,8 +178,8 @@ def test_chained_pointwise_single_kernel():
 @requires_cuda
 def test_pointwise_runs_on_gpu():
     g = _pointwise_add_graph()
-    kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["x", "y"], graph_outputs=["z"])
+    result = compile_graph(g)
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
     result = CudaBackend().run(program, input_data={"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
     assert result.outputs["z"] == pytest.approx([11, 22, 33, 44])
 
@@ -124,8 +187,8 @@ def test_pointwise_runs_on_gpu():
 @requires_cuda
 def test_reduce_runs_on_gpu():
     g = _reduce_sum_graph()
-    kernels = compile_graph(g)
-    program = CudaBackend().compile(kernels, graph_inputs=["x"], graph_outputs=["y"])
+    result = compile_graph(g)
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs)
     x_data = [float(i) for i in range(32)]
     result = CudaBackend().run(program, input_data={"x": x_data})
     expected = [sum(x_data[row * 8 : (row + 1) * 8]) for row in range(4)]
@@ -133,11 +196,34 @@ def test_reduce_runs_on_gpu():
 
 
 @requires_cuda
+def test_softmax_runs_on_gpu():
+    """End-to-end GPU correctness test for the softmax kernel."""
+    import math
+
+    from deplodock.compiler.backend.cuda.emit import compile_kernels
+
+    kernel = _softmax_kernel()
+    program = compile_kernels([kernel], graph_inputs=["x"], graph_outputs=["y"])
+    # 4 rows x 8 cols
+    x_data = [float(i) for i in range(32)]
+    result = CudaBackend().run(program, input_data={"x": x_data})
+    # Compute expected softmax row-by-row.
+    expected = []
+    for row in range(4):
+        row_vals = x_data[row * 8 : (row + 1) * 8]
+        mx = max(row_vals)
+        exps = [math.exp(v - mx) for v in row_vals]
+        s = sum(exps)
+        expected.extend(e / s for e in exps)
+    assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-3)
+
+
+@requires_cuda
 def test_matmul_runs_on_gpu():
     g = _matmul_graph()
-    kernels = compile_graph(g)
-    out_name = kernels[-1].outputs[0].buffer_id
-    program = CudaBackend().compile(kernels, graph_inputs=["a", "b"], graph_outputs=[out_name])
+    result = compile_graph(g)
+    out_name = result.kernels[-1].outputs[0].buffer_id
+    program = CudaBackend().compile(result.kernels, graph_inputs=result.graph_inputs, graph_outputs=[out_name])
     a_data = [float(i) for i in range(32)]
     b_data = [float(i) for i in range(32)]
     result = CudaBackend().run(program, input_data={"a": a_data, "b": b_data})

@@ -15,8 +15,9 @@
 ├──────────────────────────────────────────────────────────────────┤
 │  LAYER 2 · Lowering → structural KernelOps                       │
 │                                                                  │
-│  lower.py:   lower(graph: Graph) -> list[KernelOp]               │
-│  pipeline.py: public entry (compile_graph)                        │
+│  lower.py:   extract_kernels(graph) -> list[KernelOp]            │
+│  pipeline.py: compile_graph(graph) -> CompileResult              │
+│    CompileResult: kernels + graph_inputs/outputs/constants       │
 │                                                                  │
 │  Each KernelOp is one GPU kernel described as an SSA program:    │
 │      inputs (Port | Mux | Combine) →                             │
@@ -50,10 +51,10 @@ PyTorch module
    │  torch_trace.trace_module(...)
    ▼
 Graph (Layer 1)
-   │  pipeline.compile_graph(graph)  →  lower.lower(graph)
+   │  pipeline.compile_graph(graph)  →  CompileResult
    ▼
-list[KernelOp] (Layer 2, structural IR)
-   │  CudaBackend.compile(kernels, graph_inputs, graph_outputs)
+CompileResult (Layer 2: kernels + metadata)
+   │  CudaBackend.compile(result.kernels, graph_inputs, graph_outputs)
    │    └─ for k in kernels:
    │         emit.emit_kernel(k, name)  → KernelDef
    │         kernel_codegen.emit_kernel(KernelDef) → C source
@@ -111,7 +112,7 @@ Walks the SSA body — no classification pass, no `Schedule` dataclass, no `Loop
   - `Combine` → emit each source to a temporary, then fold the `ops` chain.
 - `_detect_contraction(kernel)`: pattern-matches SSA body for a binary ElementwiseOp (both args are input Ports) followed by a ReduceOp consuming it.
 - `_emit_pointwise_body`: 1D grid over flat numel, 256 threads/block, 1 thread/coord. Walks body Assigns as inline expressions.
-- `_emit_reduce_body`: 1 block/row, serial K-loop per ReduceOp Assign, inline elementwise for ElementwiseOp Assigns.
+- `_emit_reduce_body`: 1 block/row, segment-based codegen. Body is split into segments at ReduceOp boundaries. Each segment with per-element references gets its own K-loop; per-element values from prior segments are recomputed via transitive dependency analysis. Supports cross-iteration-space patterns (e.g. softmax: reduce_max → sub+exp → reduce_sum → div). Max reduction uses `fmaxf` instead of `AugAssign`.
 - `_emit_contraction_body`: 2D grid (N, M, batch), 1 thread/(m, n), serial K-loop. Post-contraction Assigns emitted as flat elementwise.
 
 The naive schedule is correctness-first — no shared memory, no async copies, no TMA, no vectorization. Performance work lives in follow-up commits.

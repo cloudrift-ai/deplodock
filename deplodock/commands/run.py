@@ -32,15 +32,20 @@ def _handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    kernels = compile_graph(graph)
+    result = compile_graph(graph)
 
     backend = CudaBackend()
-    program = backend.compile(kernels)
+    program = backend.compile(
+        result.kernels,
+        graph_inputs=result.graph_inputs,
+        graph_outputs=result.graph_outputs,
+        graph_constants=result.graph_constants,
+    )
 
     if dump:
         dump.dump_program(program)
 
-    logger.info("Compiled %s: %d kernels", ir_path.name, len(kernels))
+    logger.info("Compiled %s: %d kernels", ir_path.name, len(result.kernels))
 
     if args.benchmark:
         result = backend.benchmark(program, num_iters=args.iters)

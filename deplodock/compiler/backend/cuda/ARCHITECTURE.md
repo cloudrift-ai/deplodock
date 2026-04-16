@@ -64,7 +64,7 @@ the presence of `ReduceOp` Assigns:
 | Pattern                    | Emitter                  | Emission                                                      |
 | -------------------------- | ------------------------ | ------------------------------------------------------------- |
 | Contraction (mul+reduce)   | `_emit_contraction_body` | 2D grid (N, M, batch); serial K-loop; post-contraction SSA    |
-| Reduce (no contraction)    | `_emit_reduce_body`      | 1 block/row; serial K-loop per ReduceOp Assign                |
+| Reduce (no contraction)    | `_emit_reduce_body`      | 1 block/row; segment-based K-loops with recomputation         |
 | Pointwise (no ReduceOp)    | `_emit_pointwise_body`   | 1D grid; inline elementwise per Assign                        |
 
 **Contraction detection** (`_detect_contraction`): pattern-matches the
@@ -81,8 +81,13 @@ follow-up commits.
 - **Pointwise** (no `ReduceOp` in body):
   1D grid, `block = (256, 1, 1)`, one thread per flat output coord.
 - **Reduce chain** (`ReduceOp` in body, no contraction):
-  1D grid over the post-reduce shape; `block = (1, 1, 1)`; each block
-  runs a serial K-loop over the reduced axis.
+  1D grid over the outer rows (input shape minus last axis); `block = (1, 1, 1)`.
+  The body is split into segments at ReduceOp boundaries. Each segment with
+  per-element references emits its own K-loop. Per-element values from prior
+  segments are recomputed inside the current loop (transitive dependency
+  analysis). Supports cross-iteration-space patterns like softmax
+  (reduce_max -> elementwise -> reduce_sum -> elementwise). Max reduction
+  uses `fmaxf(acc, val)` instead of `AugAssign`.
 - **Contraction** (detected mul+reduce pattern):
   2D grid `(N, M, batch)`; `block = (1, 1, 1)`; each thread iterates K
   serially.
