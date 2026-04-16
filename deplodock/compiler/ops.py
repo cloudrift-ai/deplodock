@@ -573,7 +573,12 @@ class KernelOp(Op):
         for assign in self.body:
             arg_shapes = [shapes[a] for a in assign.args if a in shapes]
             if arg_shapes:
-                shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
+                try:
+                    shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
+                except (ValueError, TypeError):
+                    # Cross-iteration-space ops (e.g. sub(x:(M,K), max:(M,)))
+                    # may fail standard broadcast. Use the largest arg shape.
+                    shapes[assign.name] = max(arg_shapes, key=len)
         return shapes
 
     def infer_output_shape(self, input_shapes: list[tuple] | None = None) -> tuple:
@@ -581,6 +586,9 @@ class KernelOp(Op):
         shapes = self.infer_shapes()
         if self.body:
             return shapes.get(self.body[-1].name, ())
+        # Empty body (copy kernel): output = input shape.
+        if shapes:
+            return next(iter(shapes.values()))
         return ()
 
 
