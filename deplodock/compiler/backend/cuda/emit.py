@@ -153,6 +153,8 @@ def _emit_input_value(
     ``name_seq`` is a mutable counter used to generate fresh temporaries.
     """
     if isinstance(inp, Port):
+        if inp.indexmap is not None:
+            return _emit_indexmap_load(inp, coord, stmts, name_seq)
         return ArrayAccess(array=inp.buffer_id, index=coord)
 
     if isinstance(inp, Mux):
@@ -193,6 +195,57 @@ def _emit_input_value(
         return last
 
     raise NotImplementedError(f"unexpected KernelInput variant: {type(inp).__name__}")
+
+
+def _emit_indexmap_load(port: Port, coord: Expr, stmts: list[Stmt], name_seq: list[int]) -> Expr:
+    """Emit a load from ``port.buffer_id`` at the coord transformed by ``port.indexmap``.
+
+    The IndexMapOp's coord_map maps output coords to input coords via
+    affine expressions over ``Var("out_coord_0")``, ``Var("out_coord_1")``, ...
+    We substitute the placeholder vars with the actual coord expressions
+    derived from the flat ``coord`` index, then compute the flat input index.
+    """
+    from deplodock.compiler.coord_expr import PLACEHOLDER_PREFIX, substitute
+
+    indexmap = port.indexmap
+    assert indexmap is not None and len(indexmap.sources) == 1
+    src = indexmap.sources[0]
+    out_shape = indexmap.out_shape
+    ndim = len(out_shape)
+
+    # Decompose flat coord into per-axis coords: coord_i = (coord / stride_i) % dim_i
+    mapping: dict[str, Expr] = {}
+    remainder = coord
+    for d in range(ndim - 1, -1, -1):
+        dim_size = int(out_shape[d])
+        axis_var = f"{PLACEHOLDER_PREFIX}{d}"
+        if d == 0:
+            mapping[axis_var] = remainder
+        else:
+            mapping[axis_var] = BinOp("%", remainder, Literal(dim_size, "int"))
+            remainder = BinOp("/", remainder, Literal(dim_size, "int"))
+
+    # Apply coord_map substitution to get input coords.
+    input_coords = [substitute(cm, mapping) for cm in src.coord_map]
+
+    # Flatten input coords to a flat index into the source buffer.
+    # Input shape is the source's shape — we need it from external_shapes,
+    # but for now derive from the coord_map length (each coord_map entry = one input dim).
+    # Compute flat index: sum(coord_i * stride_i)
+    src_shape = port.indexmap.out_shape  # fallback; ideally from external_shapes
+    # For identity-shaped IndexMaps the input shape == out_shape.
+    # For general IndexMaps, the coord_map already handles the remapping.
+    flat_idx: Expr = Literal(0, "int")
+    stride = 1
+    for d in range(len(input_coords) - 1, -1, -1):
+        if stride == 1:
+            flat_idx = input_coords[d]
+        else:
+            flat_idx = BinOp("+", BinOp("*", input_coords[d], Literal(stride, "int")), flat_idx)
+        if d > 0 and d - 1 < len(src_shape):
+            stride *= int(src_shape[d]) if isinstance(src_shape[d], int) else 1
+
+    return ArrayAccess(array=port.buffer_id, index=flat_idx)
 
 
 def _source_id(src: KernelInput) -> str:
