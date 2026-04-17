@@ -138,53 +138,56 @@ is decomposed with unsqueeze IndexMapOps (``A → A[..., M, K, 1]``,
 the reduce over ``K`` (axis -2) yields ``(..., M, N)``. No special-case
 shape inference for contractions.
 
-## Lowering policy (rules/fusion/assemble_kernels.py)
+## Fusion policy (rules/fusion/)
 
-Backward-cone region growing via the rewriter:
+Lift-then-merge, driven by the rewriter's fixpoint loop:
 
-1. **Forward BFS** from seed — collect all downstream fusable primitives
-   (``ElementwiseOp``, ``ReduceOp``), enforcing that reductions form a
-   single linear chain (no parallel reductions).
-2. **Find output** — last node in topo order with no consumers in the
-   forward set.
-3. **Backward cone** — from output, absorb nodes whose consumers are
-   all in the region. Trims nodes with side-outputs.
-4. **Body** — topologically sorted ``Assign`` statements from the region.
-5. ``InputOp`` / ``ConstantOp`` / ``IndexMapOp`` nodes emit no kernel —
-   they survive as external buffers referenced by ``LoopLaunch.input_names``
-   in ``Port`` order. Identity-alias IndexMapOps at boundaries are baked
-   into the consuming ``Port.index`` Exprs during fusion (see step 6).
-6. **Layout absorption covers permutations, identity aliases, and linear
-   offset slices**: a ``coord_map`` entry must be either ``Literal(0)``
-   at a size-1 source dim, ``Var("out_coord_k")`` for any ``k`` (any
-   order — transposes qualify), or a ``+``/``-`` combination of
-   placeholders and literals (e.g. ``out_coord_3 + 32`` for rotary
-   ``rotate_half``). Every non-size-1 output dim must be covered by at
-   least one placeholder. Broadcasts into fresh non-unit output dims and
-   multiplicative / modular arithmetic (``*``, ``//``, ``%``, GQA ``/N``,
-   head-split reshapes) are rejected by ``_same_rank`` and lowered as
-   standalone kernels via ``003_wrap_indexmap``. Absorbed IndexMapOps
-   are baked directly into the consuming ``Port.index`` Exprs; there is
-   no separate ``indexmap`` field on Port. Port indices align source-
-   buffer dims to axis extents right-to-left rather than by positional
-   left-pad, so extra iteration axes (e.g. reduce axes or absorbed
-   unsqueezes) don't misalign the read.
-7. **Multi-source IndexMap absorption**: multi-source IndexMapOps
-   (``cat``/``concat``, rotary ``rotate_half`` concat) feeding a single
-   consumer kernel are absorbed as one ``Port`` per source plus a
-   ``Select`` body statement at the top of the kernel body that picks
-   the right branch via each source's ``select`` predicate. Predicates
-   are substituted with the consumer's axis Vars at absorption time;
-   ``kernel_plan`` hoists leading row-space Selects to an ``Inline``
-   prelude so they run once per output coord before any reduce sweep.
-8. **IndexMap composition** (``optimization/001_compose_indexmap``):
-   before fusion, adjacent single-source IndexMapOp chains collapse
-   into one op with a substituted ``coord_map``. Applies per-consumer
-   when the parent has multiple consumers — each consumer gets its own
-   composed op; orphaned parents are removed by ``_remove_orphans``.
-   This reduces double-hop chains (e.g. matmul's
-   ``unsqueeze → broadcast``) to a single IndexMapOp, which rule 001
-   can then absorb into the consuming kernel's ``Port.index``.
+1. **Lift each tensor op into a trivial one-op ``LoopOp``** — one rule
+   per tensor op (``001_lift_elementwise``, ``002_lift_reduce``,
+   ``003_lift_indexmap``, ``004_lift_gather``). Each produces a kernel
+   whose iteration space matches its op's natural shape, with Ports
+   expressing the input access pattern directly as ``Expr``s over axis
+   Vars. Reductions contribute one ``LocalBuffer`` accumulator and one
+   ``Update`` statement; multi-source IndexMapOps (cat / concat)
+   contribute a ``Select`` prelude choosing among per-source Ports.
+2. **Merge adjacent ``LoopOp`` pairs** (``005_merge_loop_ops``). The
+   grammar matches a ``LoopOp`` whose sole consumer is another
+   ``LoopOp``. Merging is defined by a single substitution σ:
+   - Solve ``writer.index[k] == reader.index[k]`` at each output dim
+     for every producer axis. Supported forms: direct ``Var(a)``,
+     ``Var(a) ± c``, and ``Literal(0)`` broadcast slots (no binding).
+     Unsupported forms (multiplicative, modular, data-dependent) make
+     the merge return ``None``.
+   - Every unbound producer axis must be kind ``"reduce"`` — a leaking
+     free axis would require replicating producer work per consumer
+     slot, which we refuse.
+   - The merged kernel must have at most one reduce axis (matches the
+     current single-reduce CUDA backend — multi-reduce kernels feeding
+     reductions across different data axes stay separate).
+   - Axes and SSA names are renamed to avoid collisions; producer
+     Ports are substituted through σ; the producer's connecting
+     ``Write`` becomes ``Assign(bridge, ElementwiseOp("copy"), …)``
+     that the consumer reads in place of the consumed Port.
+3. **Fixpoint** — lift rules fire once per tensor op; merge fires
+   repeatedly on adjacent LoopOps. The process terminates because
+   every lift consumes one tensor op and every merge consumes two
+   LoopOps.
+
+The merge rule subsumes two passes the old pipeline had as separate
+concerns:
+
+- **Layout composition** (chained single-source IndexMapOps): merging
+  two lifted IndexMap kernels composes their ``coord_map``s via σ, so
+  no dedicated pre-pass is needed.
+- **Absorption of identity-alias / linear-offset layouts**: transposes,
+  keep-dim reductions, ``+``/``-`` offset slices (e.g. rotary
+  ``rotate_half``) all fall out of σ-based binding — the consumer's
+  reader index and the producer's writer index align affinely, so the
+  producer's Port becomes the merged kernel's Port under the solved σ.
+
+``optimization/002_insert_broadcast_indexmap.py`` survives because it
+addresses a different concern — promoting implicit elementwise
+broadcasts to explicit ``IndexMapOp``s — which merge does not handle.
 
 ## Codegen policy (backend/cuda/emit.py)
 

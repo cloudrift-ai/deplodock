@@ -46,7 +46,8 @@ tests/
 │   ├── rules/
 │   │   ├── test_decompose_rules.py    # Decomposition rules (structural + correctness)
 │   │   ├── test_optimization_rules.py # Optimization rules (broadcast indexmap)
-│   │   └── test_fusion_rules.py       # Fusion rules (assemble_kernels structural)
+│   │   ├── test_fusion_rules.py       # Fusion pass (lift-then-merge, structural)
+│   │   └── test_merge_core.py         # σ solver and merge_loop_ops (unit)
 │   ├── test_fusion.py          # auto_fuse — softmax, RMSNorm, SiLU, matmul, etc.
 │   ├── test_plan.py            # plan_graph — ExecutionPlan from Graph
 │   ├── test_pipeline.py        # Full compile pipeline: graph → GPU

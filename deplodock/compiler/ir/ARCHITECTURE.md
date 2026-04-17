@@ -29,8 +29,8 @@ PyTorch module
 │   IndexMapOp (subsumes Slice / Cat / Transpose / Reshape / Unsqueeze via coord_map over expr.py)                     │
 │   + InputOp / ConstantOp                                                                                             │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-   │  rules/optimization/*  (IndexMap composition, broadcast insertion)
-   │  rules/fusion/*        (assemble_kernels, wrap_indexmap)
+   │  rules/optimization/*  (broadcast insertion)
+   │  rules/fusion/*        (lift each tensor op → LoopOp, then merge adjacent LoopOp pairs)
    ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ LAYER 2 · Lowering — Graph populated with LOOP IR ops (loop.py)                                                      │

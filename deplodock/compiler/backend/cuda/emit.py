@@ -558,6 +558,9 @@ def _apply_elementwise(fn: str, inputs: list[Expr]) -> Expr:
     if fn == "neg":
         assert len(inputs) == 1
         return BinOp("-", Literal(0.0, "float"), inputs[0])
+    if fn == "copy":
+        assert len(inputs) == 1
+        return inputs[0]
     if fn == "recip":
         assert len(inputs) == 1
         return BinOp("/", Literal(1.0, "float"), inputs[0])

@@ -1,9 +1,10 @@
-"""Tests for fusion rules (assemble_kernels).
+"""Tests for the fusion pass (lift-then-merge).
 
-The fusion rule produces LoopOp nodes with SSA body statements
-(``Assign``, ``Update``, ``Write``). Tests verify structural properties:
-kernel count, graph composition (only LoopOp/InputOp/ConstantOp remain),
-and that the SSA body contains the expected ops.
+The fusion pass lifts each tensor op into a trivial ``LoopOp`` and then
+merges adjacent ``LoopOp`` pairs via the σ-based merge rule. Tests verify
+post-fixpoint structural properties: kernel count, graph composition (only
+``LoopOp`` / ``InputOp`` / ``ConstantOp`` remain), and that the SSA body
+contains the expected ops.
 """
 
 from pathlib import Path
@@ -12,19 +13,13 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Assign, LoopOp, Port, Update, Write
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
-from deplodock.compiler.rewriter import Pass, Rule
+from deplodock.compiler.rewriter import Pass
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion"
 
-_RULE = "001_assemble_kernels.py"
-
-
-def _load() -> Rule:
-    return Rule.from_file(RULES_DIR / _RULE)
-
 
 def _fuse(graph: Graph) -> Graph:
-    return Pass(name="fusion", rules=[_load()]).apply(graph)
+    return Pass.from_directory(RULES_DIR).apply(graph)
 
 
 def _kernel_nodes(graph: Graph) -> list:

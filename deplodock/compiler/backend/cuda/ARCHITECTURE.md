@@ -55,7 +55,7 @@ GpuProgram
 
 The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Assign` / `Update` / `Write` / `Select` statements. Each `Assign` is `name = op(args)` where args reference input Ports by `$N` position or prior `Assign.name`s; the `$N` → buffer name mapping lives on the `LoopLaunch`.
 
-**Port loads** (`_emit_port_load(port, buf_name, src_shape, axis_env)`): evaluates `Port.index` in the current axis environment and emits `ArrayAccess(buffer, coord)`. There is no `indexmap` field on `Port` — absorbed identity-alias IndexMapOps have already been baked into `Port.index` during fusion; non-identity IndexMapOps are lowered to their own copy kernel by `003_wrap_indexmap`.
+**Port loads** (`_emit_port_load(port, buf_name, src_shape, axis_env)`): evaluates `Port.index` in the current axis environment and emits `ArrayAccess(buffer, coord)`. There is no `indexmap` field on `Port` — every IndexMapOp is lifted to a one-op `LoopOp` by `003_lift_indexmap`, and the σ-based merge rule folds the coord_map into the consumer's `Port.index` whenever a merge is legal. Unmerged IndexMap kernels stay as standalone copy kernels.
 
 **Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a body `Select` into a nested `Ternary` chain over each `SelectBranch.select` predicate. (There is no `Mux` / `Combine` IR — those were replaced by `Select` / `SelectBranch`.)
 
