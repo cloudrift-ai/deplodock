@@ -273,6 +273,25 @@ class Cast(_ExprOps):
 Expr = Var | Literal | BinOp | Builtin | FuncCall | Ternary | Cast
 
 
+def render(expr: Expr) -> str:
+    """Format an ``Expr`` tree as a compact, human-readable string."""
+    if isinstance(expr, Var):
+        return expr.name
+    if isinstance(expr, Literal):
+        return str(expr.value)
+    if isinstance(expr, Builtin):
+        return expr.name
+    if isinstance(expr, BinOp):
+        return f"({render(expr.left)} {expr.op} {render(expr.right)})"
+    if isinstance(expr, FuncCall):
+        return f"{expr.name}({', '.join(render(a) for a in expr.args)})"
+    if isinstance(expr, Ternary):
+        return f"({render(expr.cond)} ? {render(expr.if_true)} : {render(expr.if_false)})"
+    if isinstance(expr, Cast):
+        return f"({expr.dtype}){render(expr.expr)}"
+    return repr(expr)
+
+
 # ---------------------------------------------------------------------------
 # Coordinate-expression helpers for IndexMapOp
 # ---------------------------------------------------------------------------
