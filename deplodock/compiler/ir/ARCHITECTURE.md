@@ -154,6 +154,27 @@ only — ``ReduceOp`` is NOT a valid ``Assign.op``). Reductions are
 modeled as ``LocalBuffer`` + ``Update``; the former ``LoopOp.outputs``
 tuple is gone (writes are inline ``Write`` body statements).
 
+### `loop_plan.py` — analysis: LoopOp → KernelPlan (Layer 2)
+
+Walks a ``LoopOp``'s flat SSA body and produces an explicit nested-loop
+view: ordered ``Loop`` / ``Inline`` steps with accumulators,
+rematerialization sets, and trailing writes. Consumed by the CUDA
+emitter (``backend/cuda/emit.py``) and by the human-readable pretty
+printer (``pretty_print_plan``) so dump output and codegen stay in sync.
+
+| Symbol              | Role                                                                                                |
+|---------------------|-----------------------------------------------------------------------------------------------------|
+| ``Accum``           | Reduction accumulator: ``var`` (e.g. ``acc0``), ``fn``, ``identity``, SSA ``src``, ``result`` name. |
+| ``Loop``            | K-loop step: ``recompute`` + ``body`` + optional ``accum`` + optional ``stores_output``.            |
+| ``Inline``          | Straight-line block of ``Assign`` / ``Select`` statements (no loop).                                |
+| ``TrailingWrite``   | Write emitted once per thread after all reduce sweeps (for non-elementwise outputs).                |
+| ``KernelPlan``      | Tuple of ``Step`` + per-element port set + output thread count + trailing writes.                   |
+| ``analyze_kernel``  | Entry point: splits the body at ``Update`` boundaries, classifies elem-/row-space values.           |
+| ``pretty_print_plan`` | Render a ``LoopOp`` + ``KernelPlan`` as an explicit ``for a0 in ...`` nested-loop program.        |
+
+**Rule:** Imports ``expr``, ``loop``. No dependency on ``program`` or
+any backend — this analysis is pure structural IR.
+
 ### `gpu.py` — GPU IR, imperative C-like AST (Layer 3)
 
 The last IR before text. One ``GpuKernel`` per kernel; the rest of the
