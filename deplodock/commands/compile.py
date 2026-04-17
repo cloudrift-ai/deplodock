@@ -42,12 +42,12 @@ def handle_compile(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    result = compile_graph(graph)
+    program = compile_graph(graph)
 
-    logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, len(result.kernels))
+    logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, len(program.launches))
 
     output_path = args.output or f"{base_name}.compiled.json"
-    # Persist as the original graph for now; structural KernelOp serialization
+    # Persist as the original graph for now; structural LoopOp serialization
     # lands when the lowering is in place.
     with open(output_path, "w") as f:
         json.dump(graph.to_dict(), f, indent=2)

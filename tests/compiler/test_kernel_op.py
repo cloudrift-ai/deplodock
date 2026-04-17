@@ -1,9 +1,9 @@
-"""Tests for the structural KernelOp IR with SSA Assign body."""
+"""Tests for the structural LoopOp IR with SSA Assign body."""
 
 import pytest
 
-from deplodock.compiler.ir.block import Assign, Combine, KernelOp, Mux, MuxBranch, Port
 from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.loop import Assign, Combine, LoopOp, Mux, MuxBranch, Port
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
 # ---------------------------------------------------------------------------
@@ -43,12 +43,12 @@ def test_assign_construction():
 
 
 # ---------------------------------------------------------------------------
-# KernelOp with SSA body
+# LoopOp with SSA body
 # ---------------------------------------------------------------------------
 
 
 def test_kernel_pointwise():
-    k = KernelOp(
+    k = LoopOp(
         inputs=(Port(), Port()),
         body=(Assign("z", ElementwiseOp("add"), args=("$0", "$1")),),
         outputs=(Port(),),
@@ -57,7 +57,7 @@ def test_kernel_pointwise():
 
 
 def test_kernel_reduce():
-    k = KernelOp(
+    k = LoopOp(
         inputs=(Port(),),
         body=(Assign("s", ReduceOp("sum", -1), args=("$0",)),),
         outputs=(Port(),),
@@ -66,7 +66,7 @@ def test_kernel_reduce():
 
 
 def test_kernel_matmul():
-    k = KernelOp(
+    k = LoopOp(
         inputs=(Port(), Port()),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
@@ -78,7 +78,7 @@ def test_kernel_matmul():
 
 
 def test_kernel_matmul_bias():
-    k = KernelOp(
+    k = LoopOp(
         inputs=(Port(), Port(), Port()),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
@@ -91,7 +91,7 @@ def test_kernel_matmul_bias():
 
 
 def test_kernel_softmax():
-    k = KernelOp(
+    k = LoopOp(
         inputs=(Port(),),
         body=(
             Assign("max", ReduceOp("max", -1), args=("$0",)),
@@ -106,7 +106,7 @@ def test_kernel_softmax():
 
 
 def test_kernel_unary_chain():
-    k = KernelOp(
+    k = LoopOp(
         inputs=(Port(),),
         body=(
             Assign("neg", ElementwiseOp("neg"), args=("$0",)),
@@ -124,7 +124,7 @@ def test_kernel_scatter_output():
             MuxBranch(input=Port(), select=Var("c2")),
         )
     )
-    k = KernelOp(
+    k = LoopOp(
         inputs=(Port(), Port()),
         body=(Assign("z", ElementwiseOp("add"), args=("$0", "$1")),),
         outputs=(scatter,),
@@ -139,7 +139,7 @@ def test_kernel_scatter_output():
 
 def test_ssa_rejects_undefined_arg():
     with pytest.raises(ValueError, match="not defined"):
-        KernelOp(
+        LoopOp(
             inputs=(Port(),),
             body=(Assign("y", ElementwiseOp("exp"), args=("z",)),),
             outputs=(Port(),),
@@ -148,7 +148,7 @@ def test_ssa_rejects_undefined_arg():
 
 def test_ssa_rejects_duplicate_name():
     with pytest.raises(ValueError, match="already defined"):
-        KernelOp(
+        LoopOp(
             inputs=(Port(),),
             body=(
                 Assign("y", ElementwiseOp("exp"), args=("$0",)),
@@ -160,7 +160,7 @@ def test_ssa_rejects_duplicate_name():
 
 def test_ssa_rejects_forward_reference():
     with pytest.raises(ValueError, match="not defined"):
-        KernelOp(
+        LoopOp(
             inputs=(Port(),),
             body=(
                 Assign("a", ElementwiseOp("add"), args=("$0", "b")),
@@ -171,7 +171,7 @@ def test_ssa_rejects_forward_reference():
 
 
 def test_ssa_allows_input_name_reuse_in_multiple_args():
-    k = KernelOp(
+    k = LoopOp(
         inputs=(Port(),),
         body=(
             Assign("a", ElementwiseOp("exp"), args=("$0",)),

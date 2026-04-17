@@ -1,8 +1,8 @@
-"""Backend abstraction for compiling and running structural KernelOps.
+"""Backend abstraction for compiling and running a ``LoopProgram``.
 
-A Backend converts a list of ``KernelOp`` (the structural compiler IR)
-into a runnable artifact and executes it. Each backend (CUDA, ROCm, ...)
-implements this interface.
+A Backend lowers a ``LoopProgram`` (the post-fusion program form) to a
+backend-specific runnable artifact and executes it. Each backend (CUDA,
+ROCm, NumPy, ...) implements this interface.
 """
 
 from __future__ import annotations
@@ -10,6 +10,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
+
+from deplodock.compiler.program.loop import LoopProgram
 
 
 @dataclass
@@ -31,11 +33,11 @@ class BenchmarkResult:
 
 
 class Backend(ABC):
-    """Abstract backend for compiling + executing a list of KernelOps."""
+    """Abstract backend for compiling + executing a ``LoopProgram``."""
 
     @abstractmethod
-    def compile(self, kernels: list) -> Any:
-        """Lower structural KernelOps to a backend-specific Program."""
+    def compile(self, program: LoopProgram) -> Any:
+        """Lower a ``LoopProgram`` to a backend-specific runnable program."""
 
     @abstractmethod
     def run(self, program: Any) -> ProgramResult:

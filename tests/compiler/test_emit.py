@@ -12,8 +12,8 @@ from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
-from deplodock.compiler.lower import KernelInfo
 from deplodock.compiler.pipeline import compile_graph
+from deplodock.compiler.program.loop import LoopBuffer, LoopLaunch, LoopProgram
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
@@ -52,11 +52,11 @@ def _matmul_graph() -> Graph:
     return g
 
 
-def _softmax_kernel_info():
-    """Build a KernelInfo with the softmax SSA pattern directly."""
-    from deplodock.compiler.ir.block import Assign, KernelOp, Port
+def _softmax_launch() -> LoopLaunch:
+    """Build a LoopLaunch with the softmax SSA pattern directly."""
+    from deplodock.compiler.ir.loop import Assign, LoopOp, Port
 
-    kernel = KernelOp(
+    loop = LoopOp(
         inputs=(Port(), Port()),
         body=(
             Assign(name="mx", op=ReduceOp(fn="max", axis=-1), args=("$0",)),
@@ -67,7 +67,22 @@ def _softmax_kernel_info():
         ),
         outputs=(Port(),),
     )
-    return KernelInfo(kernel=kernel, input_names=["x", "x"], output_name="y")
+    return LoopLaunch(loop=loop, input_names=["x", "x"], output_name="y")
+
+
+def _softmax_program() -> LoopProgram:
+    """Wrap the softmax launch in a standalone LoopProgram for codegen tests."""
+    launch = _softmax_launch()
+    return LoopProgram(
+        name="softmax",
+        buffers=[
+            LoopBuffer(name="x", shape=(4, 8), role="input"),
+            LoopBuffer(name="y", shape=(4, 8), role="output"),
+        ],
+        launches=[launch],
+        graph_inputs=["x"],
+        graph_outputs=["y"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +92,8 @@ def _softmax_kernel_info():
 
 def test_pointwise_emits_correct_source():
     g = _pointwise_add_graph()
-    result = compile_graph(g)
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
-    )
+    loop_program = compile_graph(g)
+    program = CudaBackend().compile(loop_program)
     assert len(program.launches) == 1
     source = program.launches[0].kernel_source
     assert "blockIdx.x" in source
@@ -89,10 +102,8 @@ def test_pointwise_emits_correct_source():
 
 def test_reduce_emits_k_loop():
     g = _reduce_sum_graph()
-    result = compile_graph(g)
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
-    )
+    loop_program = compile_graph(g)
+    program = CudaBackend().compile(loop_program)
     source = program.launches[0].kernel_source
     assert "for (int" in source
     assert "+=" in source
@@ -100,10 +111,8 @@ def test_reduce_emits_k_loop():
 
 def test_contraction_emits_matmul():
     g = _matmul_graph()
-    result = compile_graph(g)
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
-    )
+    loop_program = compile_graph(g)
+    program = CudaBackend().compile(loop_program)
     source = program.launches[-1].kernel_source
     assert "for (int k" in source
     assert "acc0 +=" in source
@@ -111,10 +120,8 @@ def test_contraction_emits_matmul():
 
 def test_buffer_roles():
     g = _pointwise_add_graph()
-    result = compile_graph(g)
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
-    )
+    loop_program = compile_graph(g)
+    program = CudaBackend().compile(loop_program)
     roles = {b.name: b.role for b in program.buffers}
     assert roles.get("x") == "input"
     assert roles.get("y") == "input"
@@ -124,9 +131,9 @@ def test_softmax_emits_multiple_k_loops():
     """Softmax pattern emits separate K-loops for max, sub+exp+sum, div."""
     from deplodock.compiler.backend.cuda.emit import emit_kernel
 
-    info = _softmax_kernel_info()
-    shapes = {"$0": (4, 8), "$1": (4, 8)}
-    kdef, arg_order = emit_kernel(info, "k0_softmax", shapes)
+    loop_program = _softmax_program()
+    launch = loop_program.launches[0]
+    kdef, arg_order = emit_kernel(launch, "k0_softmax", loop_program)
     from deplodock.compiler.backend.kernel_codegen import emit_kernel as emit_src
 
     source = emit_src(kdef)
@@ -141,9 +148,9 @@ def test_softmax_emits_per_element_store():
     from deplodock.compiler.backend.cuda.emit import emit_kernel
     from deplodock.compiler.backend.kernel_codegen import emit_kernel as emit_src
 
-    info = _softmax_kernel_info()
-    shapes = {"$0": (4, 8), "$1": (4, 8)}
-    kdef, _ = emit_kernel(info, "k0_softmax", shapes)
+    loop_program = _softmax_program()
+    launch = loop_program.launches[0]
+    kdef, _ = emit_kernel(launch, "k0_softmax", loop_program)
     source = emit_src(kdef)
     assert "y[" in source, f"expected output store y[...]\n{source}"
 
@@ -156,12 +163,9 @@ def test_chained_pointwise_single_kernel():
     g.inputs = ["x"]
     g.outputs = ["n"]
 
-    result = compile_graph(g)
-    kernels = result.kernels
-    assert len(kernels) == 1
-    program = CudaBackend().compile(
-        kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
-    )
+    loop_program = compile_graph(g)
+    assert len(loop_program.launches) == 1
+    program = CudaBackend().compile(loop_program)
     assert len(program.launches) == 1
 
 
@@ -173,10 +177,8 @@ def test_chained_pointwise_single_kernel():
 @requires_cuda
 def test_pointwise_runs_on_gpu():
     g = _pointwise_add_graph()
-    result = compile_graph(g)
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
-    )
+    loop_program = compile_graph(g)
+    program = CudaBackend().compile(loop_program)
     result = CudaBackend().run(program, input_data={"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
     assert list(result.outputs.values())[0] == pytest.approx([11, 22, 33, 44])
 
@@ -184,10 +186,8 @@ def test_pointwise_runs_on_gpu():
 @requires_cuda
 def test_reduce_runs_on_gpu():
     g = _reduce_sum_graph()
-    result = compile_graph(g)
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
-    )
+    loop_program = compile_graph(g)
+    program = CudaBackend().compile(loop_program)
     x_data = [float(i) for i in range(32)]
     result = CudaBackend().run(program, input_data={"x": x_data})
     expected = [sum(x_data[row * 8 : (row + 1) * 8]) for row in range(4)]
@@ -200,8 +200,8 @@ def test_softmax_runs_on_gpu():
 
     from deplodock.compiler.backend.cuda.emit import compile_kernels
 
-    info = _softmax_kernel_info()
-    program = compile_kernels([info], buf_shapes={"x": (4, 8), "y": (4, 8)}, graph_inputs=["x"], graph_outputs=["y"])
+    loop_program = _softmax_program()
+    program = compile_kernels(loop_program)
     x_data = [float(i) for i in range(32)]
     result = CudaBackend().run(program, input_data={"x": x_data})
     expected = []
@@ -217,11 +217,8 @@ def test_softmax_runs_on_gpu():
 @requires_cuda
 def test_matmul_runs_on_gpu():
     g = _matmul_graph()
-    result = compile_graph(g)
-    out_name = result.kernels[-1].output_name
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=[out_name]
-    )
+    loop_program = compile_graph(g)
+    program = CudaBackend().compile(loop_program)
     a_data = [float(i) for i in range(32)]
     b_data = [float(i) for i in range(32)]
     result = CudaBackend().run(program, input_data={"a": a_data, "b": b_data})

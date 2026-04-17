@@ -1,28 +1,30 @@
-"""Structural kernel IR — one ``KernelOp`` is one GPU kernel.
+"""Loop IR — one ``LoopOp`` is one GPU kernel's worth of loop-nest compute.
 
-After fusion (``rules/fusion/assemble_kernels``), each ``KernelOp`` describes
-the compute for one GPU kernel as an SSA program:
+After fusion (``rules/fusion/assemble_kernels``), each ``LoopOp`` describes
+the compute for one GPU kernel as an SSA program over iteration space:
 
     inputs (Port | Mux | Combine) →
       body (tuple[Assign, ...])  — SSA: name = op(args) →
       outputs (Port | Mux)
 
+"Loop" here refers to the tiled loop-nest that codegen eventually emits —
+one LoopOp maps to one ``GpuKernel`` (``ir/gpu.py``) and one CUDA launch.
 Analogies for readers:
 
 - **Dataflow / signal-flow graph** — leaves are buffer-backed sources,
   internal nodes transform values, edges carry per-coord values. This is
-  the framing for the ``KernelInput`` tree as a whole.
+  the framing for the ``LoopInput`` tree as a whole.
 - **Hardware multiplexer** (FPGA N-to-1 mux / 1-to-N demux) — for
   coord-predicated selection, inputs and outputs both.
 - **Operad / expression tree** — N-ary ops composed with operadic
   identity collapse, for ``Combine``.
 - **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store;
-  MLIR ``linalg`` structured ops) — for ``KernelOp`` as a whole.
+  MLIR ``linalg`` structured ops) — for ``LoopOp`` as a whole.
 
 Every elementwise chain is a ``tuple[ElementwiseOp, ...]`` (alias
 ``ElementwiseChain``); every reduction slot is a ``ReduceOp``. SSA
 invariants (unique names, defined-before-use, no forward references) are
-enforced at construction time by ``KernelOp.__post_init__``.
+enforced at construction time by ``LoopOp.__post_init__``.
 """
 
 from __future__ import annotations
@@ -38,20 +40,20 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# KernelInput tree: Port | Mux | Combine
+# LoopInput tree: Port | Mux | Combine
 # ---------------------------------------------------------------------------
 #
-# One KernelOp = one GPU kernel. Its shape is a tiled dataflow pipeline:
+# One LoopOp = one GPU kernel. Its shape is a tiled dataflow pipeline:
 #
-#     inputs (KernelInput tree) ──► [contraction] ──► [reduce_stages] ──►
-#                                        [epilogue] ──► outputs (Port | Mux)
+#     inputs (LoopInput tree) ──► [contraction] ──► [reduce_stages] ──►
+#                                      [epilogue] ──► outputs (Port | Mux)
 #
-# KernelInput is a recursive tagged union (``Port | Mux | Combine``):
+# LoopInput is a recursive tagged union (``Port | Mux | Combine``):
 #   - Port    : signal-flow leaf; one external buffer read + optional indexmap.
 #   - Mux     : hardware-mux; coord-predicated dispatch among branches.
 #   - Combine : operadic composition; elementwise-chain over N sub-inputs.
 #
-# KernelOutput is a narrower union (``Port | Mux``): outputs don't
+# LoopOutput is a narrower union (``Port | Mux``): outputs don't
 # assemble values, they just dispatch writes (Mux on outputs = scatter).
 
 
@@ -59,9 +61,10 @@ if TYPE_CHECKING:
 class Port:
     """Signal-flow leaf: one external buffer read/write with optional layout.
 
-    Position in ``KernelOp.inputs`` is the implicit index. The mapping
+    Position in ``LoopOp.inputs`` is the implicit index. The mapping
     from Port index to external buffer name lives in the graph node's
-    ``inputs`` list, not inside the kernel.
+    ``inputs`` list (or equivalently the ``LoopLaunch.input_names`` at
+    program level), not inside the kernel.
 
     ``indexmap`` (when set) describes the per-output coord access pattern
     (transpose, slice, broadcast). ``None`` = identity load/store.
@@ -74,7 +77,7 @@ class Port:
 class MuxBranch:
     """One branch of a Mux: an input tree + a coord-predicate selector."""
 
-    input: KernelInput
+    input: LoopInput
     select: Expr
 
 
@@ -103,7 +106,7 @@ class Mux:
 class Combine:
     """Operadic composition: N sub-inputs combined by an elementwise chain.
 
-    ``sources`` are the operadic inputs (each another ``KernelInput``);
+    ``sources`` are the operadic inputs (each another ``LoopInput``);
     ``ops`` is an elementwise chain applied to produce one value per
     output coord. Nesting is operadic composition — Combines compose into
     Combines.
@@ -112,7 +115,7 @@ class Combine:
     illegal; the tree should already have been collapsed to the source.
     """
 
-    sources: tuple[KernelInput, ...]
+    sources: tuple[LoopInput, ...]
     ops: tuple[ElementwiseOp, ...]
 
     def __post_init__(self) -> None:
@@ -123,27 +126,27 @@ class Combine:
         _assert_elementwise_chain(self.ops, "Combine.ops")
 
 
-# A kernel input slot is a signal-flow tree; the leaves read external
+# A loop input slot is a signal-flow tree; the leaves read external
 # buffers (``Port``), internal nodes transform values (``Combine``) or
 # dispatch between sources (``Mux``).
-type KernelInput = Port | Mux | Combine
+type LoopInput = Port | Mux | Combine
 
-# A kernel output slot is simpler: either a plain write target (``Port``)
+# A loop output slot is simpler: either a plain write target (``Port``)
 # or a scatter/masked writeout (``Mux``). Post-body elementwise work lives
-# in ``KernelOp.epilogue``.
-type KernelOutput = Port | Mux
+# in ``LoopOp.epilogue``.
+type LoopOutput = Port | Mux
 
 
 # ---------------------------------------------------------------------------
-# SSA body: Assign and KernelOp
+# SSA body: Assign and LoopOp
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Assign:
-    """One named value in the kernel's SSA body: ``name = op(args)``.
+    """One named value in the loop's SSA body: ``name = op(args)``.
 
-    SSA invariants (enforced by ``KernelOp.__post_init__``):
+    SSA invariants (enforced by ``LoopOp.__post_init__``):
       - Each ``name`` is defined exactly once across all Assigns.
       - Every ``arg`` references ``$N`` (input Port N) or a prior
         ``Assign.name``.
@@ -156,14 +159,14 @@ class Assign:
 
 
 @dataclass
-class KernelOp(Op):
+class LoopOp(Op):
     """One kernel's worth of computation as an SSA program.
 
-    The kernel reads external buffers via ``inputs`` (Port | Mux | Combine),
+    The loop reads external buffers via ``inputs`` (Port | Mux | Combine),
     computes through a flat sequence of named ``Assign`` statements, and
     writes the result via ``outputs`` (Port | Mux).
 
-    Every kernel reads as a program::
+    Every loop reads as a program::
 
         mul = mul(a, b)
         dot = reduce_sum(mul)
@@ -174,9 +177,9 @@ class KernelOp(Op):
     detected by pattern-matching the SSA graph, not by a separate field.
     """
 
-    inputs: tuple[KernelInput, ...]
+    inputs: tuple[LoopInput, ...]
     body: tuple[Assign, ...] = ()
-    outputs: tuple[KernelOutput, ...] = ()
+    outputs: tuple[LoopOutput, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_ssa(self)
@@ -221,7 +224,7 @@ class KernelOp(Op):
         return shapes
 
     def infer_output_shape(self, input_shapes: dict[str, tuple] | list[tuple] | None = None) -> tuple:
-        """Derive the kernel's output shape from the SSA body."""
+        """Derive the loop's output shape from the SSA body."""
         ext = input_shapes if isinstance(input_shapes, dict) else None
         shapes = self.infer_shapes(ext)
         if self.body:
@@ -245,11 +248,11 @@ def _assert_elementwise_chain(chain: ElementwiseChain, where: str) -> None:
             raise TypeError(f"{where}[{i}] is {type(op).__name__}, expected ElementwiseOp")
 
 
-def _validate_ssa(kernel: KernelOp) -> None:
+def _validate_ssa(loop: LoopOp) -> None:
     """Enforce SSA invariants: unique names, defined-before-use."""
     defined: set[str] = set()
     port_idx = 0
-    for inp in kernel.inputs:
+    for inp in loop.inputs:
         if isinstance(inp, Port):
             defined.add(f"${port_idx}")
             port_idx += 1
@@ -258,7 +261,7 @@ def _validate_ssa(kernel: KernelOp) -> None:
                 if isinstance(src, Port):
                     defined.add(f"${port_idx}")
                     port_idx += 1
-    for assign in kernel.body:
+    for assign in loop.body:
         for arg in assign.args:
             if arg not in defined:
                 raise ValueError(f"Assign {assign.name!r}: arg {arg!r} not defined")

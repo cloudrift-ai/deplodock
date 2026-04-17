@@ -1,11 +1,11 @@
-"""Tests for the unified Program execution abstraction."""
+"""Tests for the unified GpuProgram execution abstraction."""
 
 import pytest
 
 from deplodock.compiler.backend.cuda.program import (
-    Buffer,
-    Launch,
-    Program,
+    GpuBuffer,
+    GpuLaunch,
+    GpuProgram,
     benchmark_program,
     generate_source,
     run_program,
@@ -25,17 +25,17 @@ __global__ void ew_add(const float* A, const float* B, float* C, int n) {
 """
 
 
-def _make_add_program(n: int = 8) -> Program:
+def _make_add_program(n: int = 8) -> GpuProgram:
     """Simple elementwise add: C = A + B."""
-    return Program(
+    return GpuProgram(
         name="test_add",
         buffers=[
-            Buffer("A", n, role="input"),
-            Buffer("B", n, role="input"),
-            Buffer("C", n, role="output"),
+            GpuBuffer("A", n, role="input"),
+            GpuBuffer("B", n, role="input"),
+            GpuBuffer("C", n, role="output"),
         ],
         launches=[
-            Launch(
+            GpuLaunch(
                 kernel_source=EW_ADD_SOURCE,
                 kernel_name="ew_add",
                 grid=((n + 255) // 256, 1, 1),
@@ -80,23 +80,23 @@ def test_buffers_allocated_by_role():
 
 
 def test_multi_kernel_program():
-    """Program with 2 launches generates both kernel calls."""
-    prog = Program(
+    """GpuProgram with 2 launches generates both kernel calls."""
+    prog = GpuProgram(
         name="test_multi",
         buffers=[
-            Buffer("X", 4, role="input"),
-            Buffer("Y", 4, role="output"),
-            Buffer("Z", 4, role="output"),
+            GpuBuffer("X", 4, role="input"),
+            GpuBuffer("Y", 4, role="output"),
+            GpuBuffer("Z", 4, role="output"),
         ],
         launches=[
-            Launch(
+            GpuLaunch(
                 kernel_source="__global__ void k1(float* X, float* Y, int n) { int i = threadIdx.x; if (i < n) Y[i] = X[i] * 2; }",
                 kernel_name="k1",
                 grid=(1, 1, 1),
                 block=(256, 1, 1),
                 args=["X", "Y", "4"],
             ),
-            Launch(
+            GpuLaunch(
                 kernel_source="__global__ void k2(float* Y, float* Z, int n) { int i = threadIdx.x; if (i < n) Z[i] = Y[i] + 1; }",
                 kernel_name="k2",
                 grid=(1, 1, 1),
@@ -146,15 +146,15 @@ def test_benchmark_program_returns_timing():
 @requires_cuda
 def test_multi_kernel_execution():
     """Two sequential kernels produce correct chained output."""
-    prog = Program(
+    prog = GpuProgram(
         name="chain",
         buffers=[
-            Buffer("A", 4, role="input"),
-            Buffer("B", 4, role="scratch"),
-            Buffer("C", 4, role="output"),
+            GpuBuffer("A", 4, role="input"),
+            GpuBuffer("B", 4, role="scratch"),
+            GpuBuffer("C", 4, role="output"),
         ],
         launches=[
-            Launch(
+            GpuLaunch(
                 kernel_source=(
                     "__global__ void double_it(const float* A, float* B, int n) { int i = threadIdx.x; if (i < n) B[i] = A[i] * 2.0f; }"
                 ),
@@ -163,7 +163,7 @@ def test_multi_kernel_execution():
                 block=(256, 1, 1),
                 args=["A", "B", "4"],
             ),
-            Launch(
+            GpuLaunch(
                 kernel_source=(
                     "__global__ void add_one(const float* B, float* C, int n) { int i = threadIdx.x; if (i < n) C[i] = B[i] + 1.0f; }"
                 ),

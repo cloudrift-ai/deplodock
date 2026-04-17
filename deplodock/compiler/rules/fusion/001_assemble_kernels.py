@@ -1,4 +1,4 @@
-"""Assemble primitive ops into structural ``KernelOp`` nodes.
+"""Assemble primitive ops into structural ``LoopOp`` nodes.
 
 The grammar:
 
@@ -10,8 +10,8 @@ The grammar:
 from __future__ import annotations
 
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.block import Assign, KernelOp, Port
 from deplodock.compiler.ir.graph import Graph, Node, Tensor
+from deplodock.compiler.ir.loop import Assign, LoopOp, Port
 from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -56,7 +56,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     last_node = graph.nodes[output_nid]
 
-    # Build fragment: InputOps for external buffers, one KernelOp node.
+    # Build fragment: InputOps for external buffers, one LoopOp node.
     frag = Graph()
     for name in input_names:
         if name not in frag.nodes:
@@ -65,7 +65,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
             dtype = ext.output.dtype if ext else "f32"
             frag.add_node(InputOp(), [], Tensor(name, shape, dtype), node_id=name)
 
-    kernel = KernelOp(inputs=tuple(ports), body=tuple(body), outputs=(Port(),))
+    kernel = LoopOp(inputs=tuple(ports), body=tuple(body), outputs=(Port(),))
     out_id = frag.add_node(kernel, input_names, Tensor(f"kernel_{output_nid}", last_node.output.shape, last_node.output.dtype))
     frag.outputs = [out_id]
 

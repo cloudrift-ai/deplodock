@@ -18,7 +18,7 @@ docker-compose.vllm.yml
 nginx.vllm.conf
 
 # PyCharm
-.idea/*.cubin
+.idea
 
 # Recipe artifacts
 /recipes/**

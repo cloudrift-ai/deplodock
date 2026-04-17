@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from deplodock.compiler.ir.kernel import KernelDef
+from deplodock.compiler.ir.gpu import GpuKernel
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def has_cuda_gpu() -> bool:
 
 def generate_host_program(
     kernel_source: str,
-    kernel: KernelDef,
+    kernel: GpuKernel,
     inputs: dict[str, list[float]],
     output_name: str,
     output_size: int,
@@ -44,7 +44,7 @@ def generate_host_program(
 
     Args:
         kernel_source: CUDA kernel source from codegen.
-        kernel: KernelDef for block size and parameter info.
+        kernel: GpuKernel for block size and parameter info.
         inputs: Mapping of param name → flat float data.
         output_name: Name of the output parameter.
         output_size: Number of elements in the output.
@@ -191,7 +191,7 @@ class MatmulBenchmarkResult:
 
 
 def run_kernel(
-    kernel: KernelDef,
+    kernel: GpuKernel,
     kernel_source: str,
     inputs: dict[str, list[float]],
     output_name: str,
@@ -201,7 +201,7 @@ def run_kernel(
     """Compile and run a CUDA kernel, return output and timing.
 
     Args:
-        kernel: KernelDef for metadata (block size, params).
+        kernel: GpuKernel for metadata (block size, params).
         kernel_source: CUDA kernel source from codegen.
         inputs: Mapping of param name → flat float data.
         output_name: Name of the output parameter.
@@ -307,7 +307,7 @@ def _dim_decls(m: int, n: int, k: int, *, use_define: bool) -> str:
 
 def generate_benchmark_program(
     kernel_source: str,
-    kernel: KernelDef,
+    kernel: GpuKernel,
     dim_args: dict[str, int],
     num_iterations: int = 10,
     compare_cublas: bool = True,
@@ -641,7 +641,7 @@ def _sample_clock_and_temp() -> tuple[int | None, int | None]:
 
 
 def run_benchmark(
-    kernel: KernelDef,
+    kernel: GpuKernel,
     kernel_source: str,
     dim_args: dict[str, int],
     num_iterations: int = 10,

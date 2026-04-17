@@ -4,12 +4,12 @@ The graph is a directed acyclic dataflow graph (Kahn-style) over tensor
 values. Each ``Node`` wraps one primitive ``Op`` subclass, so nodes are
 parameterized by their op type — a ``Node[ElementwiseOp]`` is statically
 distinguishable from a ``Node[ReduceOp]``. The structural compiler IR
-(``KernelOp`` trees in ``ir/block.py``) relies on that distinction to carry
+(``LoopOp`` trees in ``ir/block.py``) relies on that distinction to carry
 typed chains like ``tuple[Node[ElementwiseOp], ...]``.
 
 The same ``Graph`` hosts nodes from every IR level as the rewriter runs:
 frontend ops during tracing → tensor/minimal ops after decomposition →
-``KernelOp`` nodes after fusion. Shapes, inputs, outputs, and hints live
+``LoopOp`` nodes after fusion. Shapes, inputs, outputs, and hints live
 on nodes; ops themselves are shape-free and shared-free by convention.
 
 ``Hints`` is the advisory metadata bag attached to individual nodes and
@@ -134,11 +134,11 @@ def _lookup_op_class(name: str) -> type[Op] | None:
     module to avoid pulling them all in at graph import time.
     """
     from deplodock.compiler.ir import base as _base
-    from deplodock.compiler.ir import block as _block
     from deplodock.compiler.ir import frontend as _frontend
+    from deplodock.compiler.ir import loop as _loop
     from deplodock.compiler.ir import tensor as _tensor
 
-    for module in (_base, _tensor, _frontend, _block):
+    for module in (_base, _tensor, _frontend, _loop):
         cls = getattr(module, name, None)
         if isinstance(cls, type) and issubclass(cls, Op):
             return cls

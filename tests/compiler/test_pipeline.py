@@ -10,6 +10,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
+from deplodock.compiler.program.loop import LoopProgram
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
@@ -40,40 +41,35 @@ def _matmul_graph(m: int, k: int, n: int) -> Graph:
 
 
 def test_compile_graph_fuses_matmul():
-    result = compile_graph(_matmul_graph(4, 3, 2))
+    program = compile_graph(_matmul_graph(4, 3, 2))
     # Matmul decomposes into unsqueeze copies + mul/sum kernel.
-    matmul_kernels = [k for k in result.kernels if any(isinstance(a.op, ReduceOp) for a in k.kernel.body)]
-    assert len(matmul_kernels) == 1
+    matmul_launches = [L for L in program.launches if any(isinstance(a.op, ReduceOp) for a in L.loop.body)]
+    assert len(matmul_launches) == 1
 
 
 def test_compile_graph_fuses_chain():
     """neg → exp fuses into one kernel (fan-out 1 chain)."""
-    result = compile_graph(_pointwise_chain_graph())
-    assert len(result.kernels) == 1
+    program = compile_graph(_pointwise_chain_graph())
+    assert len(program.launches) == 1
 
 
 def test_pipeline_to_program():
-    result = compile_graph(_matmul_graph(4, 3, 2))
-    out_name = result.kernels[-1].output_name
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=[out_name]
-    )
-    assert len(program.launches) >= 1
-    roles = {b.name: b.role for b in program.buffers}
+    loop_program = compile_graph(_matmul_graph(4, 3, 2))
+    gpu_program = CudaBackend().compile(loop_program)
+    assert len(gpu_program.launches) >= 1
+    roles = {b.name: b.role for b in gpu_program.buffers}
     assert roles.get("a") == "input"
     assert roles.get("b") == "input"
 
 
 def test_compile_result_metadata():
-    """compile_graph returns a CompileResult with graph_inputs/outputs."""
-    from deplodock.compiler.pipeline import CompileResult
-
+    """compile_graph returns a LoopProgram with graph_inputs/outputs."""
     g = _pointwise_chain_graph()
-    result = compile_graph(g)
-    assert isinstance(result, CompileResult)
-    assert result.graph_inputs == ["x"]
-    assert len(result.graph_outputs) == 1
-    assert len(result.kernels) == 1
+    program = compile_graph(g)
+    assert isinstance(program, LoopProgram)
+    assert program.graph_inputs == ["x"]
+    assert len(program.graph_outputs) == 1
+    assert len(program.launches) == 1
 
 
 @requires_cuda
@@ -81,13 +77,11 @@ def test_pointwise_chain_gpu():
     import math
 
     g = _pointwise_chain_graph()
-    result = compile_graph(g)
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=result.graph_outputs
-    )
+    loop_program = compile_graph(g)
+    gpu_program = CudaBackend().compile(loop_program)
     x_data = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0]
     expected = [math.exp(-xi) for xi in x_data]
-    result = CudaBackend().run(program, input_data={"x": x_data})
+    result = CudaBackend().run(gpu_program, input_data={"x": x_data})
     assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-5)
 
 
@@ -97,16 +91,13 @@ def test_matmul_gpu():
 
     random.seed(0)
     g = _matmul_graph(3, 4, 5)
-    result = compile_graph(g)
-    out_name = result.kernels[-1].output_name
-    program = CudaBackend().compile(
-        result.kernels, buf_shapes=result.buf_shapes, graph_inputs=result.graph_inputs, graph_outputs=[out_name]
-    )
+    loop_program = compile_graph(g)
+    gpu_program = CudaBackend().compile(loop_program)
     a_data = [random.random() for _ in range(12)]
     b_data = [random.random() for _ in range(20)]
     expected = []
     for mi in range(3):
         for ni in range(5):
             expected.append(sum(a_data[mi * 4 + k] * b_data[k * 5 + ni] for k in range(4)))
-    result = CudaBackend().run(program, input_data={"a": a_data, "b": b_data})
+    result = CudaBackend().run(gpu_program, input_data={"a": a_data, "b": b_data})
     assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-5)

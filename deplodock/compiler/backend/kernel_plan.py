@@ -1,4 +1,4 @@
-"""Pre-codegen analysis: KernelOp → KernelPlan.
+"""Pre-codegen analysis: LoopOp → KernelPlan.
 
 Analyzes a flat SSA body to determine iteration spaces, segment
 boundaries, and rematerialization sets. The result is a ``KernelPlan``
@@ -13,7 +13,7 @@ import math
 from collections import deque
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.block import Assign, Combine, KernelOp, Mux, Port
+from deplodock.compiler.ir.loop import Assign, Combine, LoopOp, Mux, Port
 from deplodock.compiler.ir.tensor import ReduceOp
 
 # ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ class KernelPlan:
 # ---------------------------------------------------------------------------
 
 
-def analyze_kernel(kernel: KernelOp, shapes: dict[str, tuple], out_shape: tuple) -> KernelPlan:
+def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -> KernelPlan:
     """Analyze a kernel's SSA body and produce a KernelPlan.
 
     Works for both flat (pointwise) and reduce kernels.

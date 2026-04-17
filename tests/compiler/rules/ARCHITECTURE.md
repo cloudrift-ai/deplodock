@@ -21,7 +21,7 @@ scale constant, incorrect coordinate mapping, etc.
 tests/compiler/rules/
 ├── test_decompose_rules.py      # decomposition rules (structural + correctness)
 ├── test_optimization_rules.py   # optimization rules (structural + correctness)
-└── test_fusion_rules.py         # fusion rules (structural only — KernelOp not numpy-executable)
+└── test_fusion_rules.py         # fusion rules (structural only — LoopOp not numpy-executable)
 ```
 
 ## Covered Rules
@@ -52,7 +52,7 @@ tests/compiler/rules/
 
 | Rule file | Op | Structural | Correctness |
 |---|---|---|---|
-| `assemble_kernels.py` | primitives → `KernelOp` | ✓ (pointwise, contraction, softmax, SSA invariants) | — (KernelOp not numpy-executable) |
+| `assemble_kernels.py` | primitives → `LoopOp` | ✓ (pointwise, contraction, softmax, SSA invariants) | — (LoopOp not numpy-executable) |
 
 ## Adding a New Rule Test
 

@@ -1,8 +1,15 @@
-"""GPU program abstraction: buffers, launches, and execution order.
+"""GPU program form: buffers, launches, and execution order.
 
-Backend-agnostic: describes a complete GPU computation as a sequence of
-kernel launches over named buffers. Backend-specific extensions (e.g.,
-TMA descriptors for CUDA) subclass Launch to add extra fields.
+Backend-agnostic (within GPU land): describes a complete GPU computation
+as a sequence of kernel launches over named buffers. Backend-specific
+extensions (e.g. TMA descriptors for CUDA) subclass ``GpuLaunch`` to add
+extra fields (see ``backend/cuda/program.py``'s ``CudaLaunch``).
+
+``GpuProgram`` is the program-form pair of ``ir/gpu.py``'s ``GpuKernel``:
+the latter describes one ``__global__`` function, the former describes
+many of them wired together into a runnable program. This mirrors how
+``LoopProgram`` (``program/loop.py``) pairs with ``ir/loop.py``'s
+``LoopOp``.
 """
 
 from __future__ import annotations
@@ -11,7 +18,7 @@ from dataclasses import dataclass, field
 
 
 @dataclass
-class Buffer:
+class GpuBuffer:
     """GPU buffer specification."""
 
     name: str
@@ -21,8 +28,8 @@ class Buffer:
 
 
 @dataclass
-class Launch:
-    """One kernel invocation."""
+class GpuLaunch:
+    """One GPU kernel invocation."""
 
     kernel_source: str  # complete __global__ function
     kernel_name: str
@@ -34,12 +41,12 @@ class Launch:
 
 
 @dataclass
-class Program:
+class GpuProgram:
     """A complete GPU program: buffers + kernels + launch order."""
 
     name: str
-    buffers: list[Buffer]
-    launches: list[Launch]
+    buffers: list[GpuBuffer]
+    launches: list[GpuLaunch]
     defines: dict[str, str] = field(default_factory=dict)
     includes: list[str] = field(default_factory=list)
     # Buffer aliases: {alias_name: target_name}. The alias shares the
