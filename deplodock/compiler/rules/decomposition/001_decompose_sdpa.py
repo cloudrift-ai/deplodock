@@ -116,6 +116,48 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         output=Tensor(f"{name}_scaled", scores_shape, dtype),
     )
 
+    # Causal mask: add -1e9 to positions where key_pos > query_pos.
+    if root.op.is_causal:
+        ndim_scores = len(scores_shape)
+        i_var = placeholder(ndim_scores - 2)  # query position
+        j_var = placeholder(ndim_scores - 1)  # key position
+
+        zero_id = frag.add_node(
+            op=ConstantOp(name=f"{name}_mask_zero", value=0.0),
+            inputs=[],
+            output=Tensor(f"{name}_mask_zero", (1,), dtype),
+        )
+        mask_fill_id = frag.add_node(
+            op=ConstantOp(name=f"{name}_mask_fill", value=-1e9),
+            inputs=[],
+            output=Tensor(f"{name}_mask_fill", (1,), dtype),
+        )
+        causal_mask_op = IndexMapOp(
+            out_shape=scores_shape,
+            sources=(
+                IndexSource(
+                    input_idx=0,
+                    coord_map=(Literal(0, "int"),),
+                    select=BinOp("<=", j_var, i_var),
+                ),
+                IndexSource(
+                    input_idx=1,
+                    coord_map=(Literal(0, "int"),),
+                    select=BinOp(">", j_var, i_var),
+                ),
+            ),
+        )
+        mask_id = frag.add_node(
+            op=causal_mask_op,
+            inputs=[zero_id, mask_fill_id],
+            output=Tensor(f"{name}_cmask", scores_shape, dtype),
+        )
+        scaled_id = frag.add_node(
+            op=ElementwiseOp(fn="add"),
+            inputs=[scaled_id, mask_id],
+            output=Tensor(f"{name}_masked", scores_shape, dtype),
+        )
+
     # Softmax: max → sub → exp → sum → div
     max_id = frag.add_node(
         op=ReduceOp(fn="max", axis=-1),

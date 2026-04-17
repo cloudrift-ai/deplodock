@@ -378,6 +378,25 @@ def test_sdpa():
     _check_cuda(g, {"q": q_np, "k": k_np, "v": v_np}, expected, rtol=5e-5, atol=2e-6)
 
 
+def test_sdpa_causal():
+    """SDPA with causal masking: future positions should be masked out."""
+    q_np = rng.standard_normal((1, 2, 8, 16)).astype(np.float32)
+    k_np = rng.standard_normal((1, 2, 8, 16)).astype(np.float32)
+    v_np = rng.standard_normal((1, 2, 8, 16)).astype(np.float32)
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("q", (1, 2, 8, 16)), node_id="q")
+    g.add_node(InputOp(), [], Tensor("k", (1, 2, 8, 16)), node_id="k")
+    g.add_node(InputOp(), [], Tensor("v", (1, 2, 8, 16)), node_id="v")
+    g.add_node(SdpaOp(is_causal=True), ["q", "k", "v"], Tensor("out", (1, 2, 8, 16)), node_id="out")
+    g.inputs, g.outputs = ["q", "k", "v"], ["out"]
+    expected = _torch_to_np(
+        torch.nn.functional.scaled_dot_product_attention(
+            torch.from_numpy(q_np), torch.from_numpy(k_np), torch.from_numpy(v_np), is_causal=True
+        )
+    )
+    np.testing.assert_allclose(_run(g, {"q": q_np, "k": k_np, "v": v_np}), expected, rtol=1e-5, atol=1e-6)
+
+
 def test_sdpa_gqa():
     """GQA: Q has more heads than K/V (28 Q heads, 4 KV heads)."""
     B, Hq, Hkv, S, D = 1, 28, 4, 8, 16

@@ -99,7 +99,7 @@ def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = No
             for item in a:
                 if hasattr(item, "name") and item.name in node_map:
                     result.append(node_map[item.name])
-        elif isinstance(a, (int, float)) and g is not None:
+        elif isinstance(a, (int, float)) and not isinstance(a, bool) and g is not None:
             const_name = f"{fx_node.name}_c{len(result)}"
             const_id = g.add_node(
                 op=ConstantOp(name=const_name, value=float(a)),
@@ -231,8 +231,14 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
 
     # --- SDPA ---
     if op_name == "scaled_dot_product_attention":
+        # args: (Q, K, V, attn_mask, dropout_p, is_causal)
+        is_causal = False
+        for a in fx_node.args[3:]:
+            if isinstance(a, bool):
+                is_causal = a
+                break
         nid = g.add_node(
-            op=SdpaOp(),
+            op=SdpaOp(is_causal=is_causal),
             inputs=input_ids[:3],
             output=Tensor(name, shape, dtype),
             node_id=name,
