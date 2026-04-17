@@ -94,34 +94,7 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
     loop = launch.loop
 
     # Build $N → ndarray map by walking the LoopOp's input tree.
-    dollar: dict[str, np.ndarray] = {}
-    port_idx = [0]
-
-    def bind(inp: LoopInput) -> np.ndarray:
-        if isinstance(inp, Port):
-            key = f"${port_idx[0]}"
-            buf_name = launch.input_names[port_idx[0]]
-            port_idx[0] += 1
-            base = buffers[buf_name]
-            arr = inp.indexmap.forward(base) if inp.indexmap is not None else base
-            dollar[key] = arr
-            return arr
-        if isinstance(inp, Combine):
-            vals = [bind(s) for s in inp.sources]
-            acc = vals[0]
-            val_iter = iter(vals[1:])
-            for op in inp.ops:
-                assert isinstance(op, ElementwiseOp)
-                if op.info.arity == 1:
-                    acc = op.forward(acc)
-                else:
-                    acc = op.forward(acc, next(val_iter))
-            return acc
-        if isinstance(inp, Mux):
-            return _eval_mux(inp, out_shape, bind_for_mux_branch=bind)
-        raise TypeError(f"Unknown LoopInput variant: {type(inp).__name__}")
-
-    top_vals: list[np.ndarray] = [bind(inp) for inp in loop.inputs]
+    dollar, top_vals = _bind_inputs(loop, launch, buffers, out_shape)
 
     # Evaluate SSA body. ReduceOps use keepdims=True (matches LoopOp.infer_shapes);
     # ElementwiseOp args may need rank-alignment to reconcile keepdim-1 axes
@@ -153,6 +126,50 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
                 break
             arr = np.squeeze(arr, axis=size1[-1])
     return arr.reshape(out_shape)
+
+
+def _bind_inputs(
+    loop: LoopOp,
+    launch: LoopLaunch,
+    buffers: dict[str, np.ndarray],
+    out_shape: tuple[int, ...],
+) -> tuple[dict[str, np.ndarray], list[np.ndarray]]:
+    """Walk ``loop.inputs`` recursively and bind each leaf ``Port`` to its buffer.
+
+    Returns ``(dollar, top_vals)`` where ``dollar[$N]`` maps each top-level
+    Port position to its (possibly indexmap-transformed) ndarray, and
+    ``top_vals[i]`` is the value of ``loop.inputs[i]`` (possibly derived
+    via ``Mux``/``Combine``).
+    """
+    dollar: dict[str, np.ndarray] = {}
+    port_idx = [0]
+
+    def bind(inp: LoopInput) -> np.ndarray:
+        if isinstance(inp, Port):
+            key = f"${port_idx[0]}"
+            buf_name = launch.input_names[port_idx[0]]
+            port_idx[0] += 1
+            base = buffers[buf_name]
+            arr = inp.indexmap.forward(base) if inp.indexmap is not None else base
+            dollar[key] = arr
+            return arr
+        if isinstance(inp, Combine):
+            vals = [bind(s) for s in inp.sources]
+            acc = vals[0]
+            val_iter = iter(vals[1:])
+            for op in inp.ops:
+                assert isinstance(op, ElementwiseOp)
+                if op.info.arity == 1:
+                    acc = op.forward(acc)
+                else:
+                    acc = op.forward(acc, next(val_iter))
+            return acc
+        if isinstance(inp, Mux):
+            return _eval_mux(inp, out_shape, bind_for_mux_branch=bind)
+        raise TypeError(f"Unknown LoopInput variant: {type(inp).__name__}")
+
+    top_vals = [bind(inp) for inp in loop.inputs]
+    return dollar, top_vals
 
 
 def _align_ranks(args: list[np.ndarray]) -> list[np.ndarray]:

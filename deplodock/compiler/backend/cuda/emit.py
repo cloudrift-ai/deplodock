@@ -278,31 +278,7 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
     values: dict[str, Expr] = {}
     out_shape = program.output_shape(launch)
 
-    # Build $N → (port, buf_name, src_shape) mapping.
-    # For Mux inputs, enumerate all leaf Ports inside branches.
-    port_info: dict[str, tuple[Port, str, tuple]] = {}
-    mux_info: dict[str, list[tuple[str, str, tuple]]] = {}  # key → [(branch_buf, branch_src_shape), ...]
-    port_idx = 0
-    for inp in loop.inputs:
-        if isinstance(inp, Port):
-            key = f"${port_idx}"
-            buf_name = launch.input_names[port_idx] if port_idx < len(launch.input_names) else key
-            src_shape = program.shape(buf_name) if buf_name in {b.name for b in program.buffers} else dollar_shapes.get(key, ())
-            port_info[key] = (inp, buf_name, src_shape)
-            port_idx += 1
-        elif isinstance(inp, Mux):
-            key = f"${port_idx}"
-            branch_infos = []
-            for branch in inp.branches:
-                if isinstance(branch.input, Port):
-                    bname = launch.input_names[port_idx] if port_idx < len(launch.input_names) else f"${port_idx}"
-                    bshape = program.shape(bname) if bname in {b.name for b in program.buffers} else ()
-                    branch_infos.append((bname, bshape))
-                    port_idx += 1
-            mux_info[key] = branch_infos
-            # For port_info, use the first branch as representative
-            if branch_infos:
-                port_info[key] = (Port(), branch_infos[0][0], branch_infos[0][1])
+    port_info, mux_info = _collect_port_info(loop, launch, program, dollar_shapes)
 
     # Load per-row ports upfront.
     for key, (port, buf_name, src_shape) in port_info.items():
@@ -378,6 +354,46 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
         stmts.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=idx), value=out_val))
 
     return stmts
+
+
+def _collect_port_info(
+    loop: LoopOp,
+    launch: LoopLaunch,
+    program: LoopProgram,
+    dollar_shapes: dict[str, tuple],
+) -> tuple[dict[str, tuple[Port, str, tuple]], dict[str, list[tuple[str, tuple]]]]:
+    """Walk ``loop.inputs`` and bind each $N to its external buffer.
+
+    Returns two dicts:
+    - ``port_info[key]`` → (port, buffer_name, source_shape) for each top-level input.
+      For Mux inputs, the first branch's Port is used as a representative.
+    - ``mux_info[key]`` → per-branch [(branch_buffer_name, branch_source_shape), ...]
+      for Mux inputs; absent for plain Port inputs.
+    """
+    port_info: dict[str, tuple[Port, str, tuple]] = {}
+    mux_info: dict[str, list[tuple[str, tuple]]] = {}
+    buf_name_set = {b.name for b in program.buffers}
+    port_idx = 0
+    for inp in loop.inputs:
+        if isinstance(inp, Port):
+            key = f"${port_idx}"
+            buf_name = launch.input_names[port_idx] if port_idx < len(launch.input_names) else key
+            src_shape = program.shape(buf_name) if buf_name in buf_name_set else dollar_shapes.get(key, ())
+            port_info[key] = (inp, buf_name, src_shape)
+            port_idx += 1
+        elif isinstance(inp, Mux):
+            key = f"${port_idx}"
+            branch_infos: list[tuple[str, tuple]] = []
+            for branch in inp.branches:
+                if isinstance(branch.input, Port):
+                    bname = launch.input_names[port_idx] if port_idx < len(launch.input_names) else f"${port_idx}"
+                    bshape = program.shape(bname) if bname in buf_name_set else ()
+                    branch_infos.append((bname, bshape))
+                    port_idx += 1
+            mux_info[key] = branch_infos
+            if branch_infos:
+                port_info[key] = (Port(), branch_infos[0][0], branch_infos[0][1])
+    return port_info, mux_info
 
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
