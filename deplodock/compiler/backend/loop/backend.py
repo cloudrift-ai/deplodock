@@ -116,13 +116,24 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
             # Build coord env using broadcast axis coord arrays.
             axis_env = _broadcast_axis_env(loop.axes)
             branch_vals = [values[b.value] for b in stmt.branches]
-            result = None
+            # Walk branches in reverse: the last branch is the catch-all, earlier
+            # branches override where their predicate holds. Let numpy broadcasting
+            # compute the natural output shape (only the axes that the predicates
+            # and branch values actually depend on) — don't force the full iter
+            # shape, so row-space Selects stay row-shaped.
+            result: np.ndarray | None = None
             for b, val in zip(reversed(stmt.branches), reversed(branch_vals), strict=True):
                 mask = b.select.eval(axis_env) if b.select is not None else True
+                val_arr = np.asarray(val, dtype=np.float32)
                 if result is None:
-                    result = np.broadcast_to(val, _iter_shape(loop.axes)).astype(np.float32, copy=True)
+                    # Seed with the last branch's value expanded to the predicate's
+                    # broadcast shape (scalar True → leave as-is).
+                    if isinstance(mask, np.ndarray):
+                        result = np.broadcast_to(val_arr, np.broadcast_shapes(val_arr.shape, mask.shape)).astype(np.float32, copy=True)
+                    else:
+                        result = val_arr.astype(np.float32, copy=True)
                 else:
-                    result = np.where(mask, np.broadcast_to(val, _iter_shape(loop.axes)), result)
+                    result = np.where(mask, val_arr, result).astype(np.float32, copy=False)
             values[stmt.name] = result
         elif isinstance(stmt, Write):
             val = values[stmt.value]

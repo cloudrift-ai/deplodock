@@ -288,3 +288,47 @@ def test_offset_slice_absorbs_into_kernel():
     assert any("+ 32" in render(e).replace(" ", "").replace("+32", "+ 32") or "a1 + 32" in render(e) for e in x_port_idx), (
         f"expected '+ 32' offset in Port.index, got {[render(e) for e in x_port_idx]}"
     )
+
+
+# ===================================================================
+# Multi-source cat absorption into consuming kernel
+# ===================================================================
+
+
+def test_multi_source_cat_absorbs_into_consumer():
+    """A two-source IndexMapOp (cat/concat) fuses into its consuming elementwise kernel as two ports + a Select body stmt."""
+    from deplodock.compiler.ir.expr import BinOp, Literal, Var, placeholder
+    from deplodock.compiler.ir.loop import Select
+    from deplodock.compiler.ir.tensor import IndexSource
+    from deplodock.compiler.pipeline import compile_graph
+
+    # Cat along dim 1: first half from a, second half from b. Then add y.
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (4, 3)), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (4, 3)), node_id="b")
+    lt = BinOp("<", Var("out_coord_1"), Literal(3, "int"))
+    second_half = BinOp("-", placeholder(1), Literal(3, "int"))
+    g.add_node(
+        IndexMapOp(
+            out_shape=(4, 6),
+            sources=(
+                IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(1)), select=lt),
+                IndexSource(input_idx=1, coord_map=(placeholder(0), second_half), select=None),
+            ),
+        ),
+        ["a", "b"],
+        Tensor("cat", (4, 6)),
+        node_id="cat",
+    )
+    g.add_node(InputOp(), [], Tensor("y", (4, 6)), node_id="y")
+    g.add_node(ElementwiseOp("add"), ["cat", "y"], Tensor("z", (4, 6)), node_id="z")
+    g.inputs, g.outputs = ["a", "b", "y"], ["z"]
+
+    lp = compile_graph(g)
+    assert len(lp.launches) == 1, f"cat should absorb into elementwise kernel; got {len(lp.launches)} launches"
+    launch = lp.launches[0]
+    assert set(launch.input_names) == {"a", "b", "y"}, f"expected ports to read a, b, y directly; got {launch.input_names}"
+
+    # The Select must be in the kernel body.
+    selects = [s for s in launch.loop.body if isinstance(s, Select)]
+    assert len(selects) == 1, f"expected one Select stmt in body; got {len(selects)}: {launch.loop.body}"

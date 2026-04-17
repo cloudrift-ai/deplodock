@@ -154,24 +154,37 @@ Backward-cone region growing via the rewriter:
    they survive as external buffers referenced by ``LoopLaunch.input_names``
    in ``Port`` order. Identity-alias IndexMapOps at boundaries are baked
    into the consuming ``Port.index`` Exprs during fusion (see step 6).
-6. **Layout absorption covers permutations + identity aliases**: a
-   ``coord_map`` entry must be either ``Literal(0)`` at a size-1 source
-   dim or ``Var("out_coord_k")`` for any ``k`` (any order — transposes
-   qualify), with every non-size-1 output dim covered by some
-   placeholder. Broadcasts into fresh non-unit output dims and arithmetic
-   reshapes (``//``, ``%``, ``+`` offsets, GQA ``/N``) are rejected by
-   ``_same_rank`` and lowered as standalone kernels via
-   ``003_wrap_indexmap``. Absorbed IndexMapOps are baked directly into
-   the consuming ``Port.index`` Exprs; there is no separate ``indexmap``
-   field on Port. Port indices align source-buffer dims to axis extents
-   right-to-left rather than by positional left-pad, so extra iteration
-   axes (e.g. reduce axes or absorbed unsqueezes) don't misalign the read.
-7. **IndexMap composition** (``optimization/001_compose_indexmap``):
-   before fusion, adjacent single-source IndexMapOp chains collapse into
-   one op with a substituted ``coord_map``. This reduces double-hop
-   chains (e.g. matmul's ``unsqueeze → broadcast``) to a single
-   IndexMapOp, which rule 001 can then absorb into the consuming kernel's
-   ``Port.index``.
+6. **Layout absorption covers permutations, identity aliases, and linear
+   offset slices**: a ``coord_map`` entry must be either ``Literal(0)``
+   at a size-1 source dim, ``Var("out_coord_k")`` for any ``k`` (any
+   order — transposes qualify), or a ``+``/``-`` combination of
+   placeholders and literals (e.g. ``out_coord_3 + 32`` for rotary
+   ``rotate_half``). Every non-size-1 output dim must be covered by at
+   least one placeholder. Broadcasts into fresh non-unit output dims and
+   multiplicative / modular arithmetic (``*``, ``//``, ``%``, GQA ``/N``,
+   head-split reshapes) are rejected by ``_same_rank`` and lowered as
+   standalone kernels via ``003_wrap_indexmap``. Absorbed IndexMapOps
+   are baked directly into the consuming ``Port.index`` Exprs; there is
+   no separate ``indexmap`` field on Port. Port indices align source-
+   buffer dims to axis extents right-to-left rather than by positional
+   left-pad, so extra iteration axes (e.g. reduce axes or absorbed
+   unsqueezes) don't misalign the read.
+7. **Multi-source IndexMap absorption**: multi-source IndexMapOps
+   (``cat``/``concat``, rotary ``rotate_half`` concat) feeding a single
+   consumer kernel are absorbed as one ``Port`` per source plus a
+   ``Select`` body statement at the top of the kernel body that picks
+   the right branch via each source's ``select`` predicate. Predicates
+   are substituted with the consumer's axis Vars at absorption time;
+   ``kernel_plan`` hoists leading row-space Selects to an ``Inline``
+   prelude so they run once per output coord before any reduce sweep.
+8. **IndexMap composition** (``optimization/001_compose_indexmap``):
+   before fusion, adjacent single-source IndexMapOp chains collapse
+   into one op with a substituted ``coord_map``. Applies per-consumer
+   when the parent has multiple consumers — each consumer gets its own
+   composed op; orphaned parents are removed by ``_remove_orphans``.
+   This reduces double-hop chains (e.g. matmul's
+   ``unsqueeze → broadcast``) to a single IndexMapOp, which rule 001
+   can then absorb into the consuming kernel's ``Port.index``.
 
 ## Codegen policy (backend/cuda/emit.py)
 
