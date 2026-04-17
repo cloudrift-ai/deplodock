@@ -26,16 +26,11 @@ class NumpyBackend(Backend):
         return NumpyProgram(graph=graph)
 
     def run(self, compiled: NumpyProgram, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
-        """Execute the graph and return outputs as flat float lists."""
+        """Execute the graph and return outputs as numpy arrays."""
         t0 = time.perf_counter()
         arrays = _execute(compiled.graph, input_data or {})
         elapsed = (time.perf_counter() - t0) * 1000
-        outputs = {nid: arr.flatten().tolist() for nid, arr in arrays.items()}
-        return ProgramResult(outputs=outputs, time_ms=elapsed)
-
-    def run_arrays(self, compiled: NumpyProgram, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
-        """Execute the graph and return outputs as numpy arrays."""
-        return _execute(compiled.graph, input_data or {})
+        return ProgramResult(outputs=arrays, time_ms=elapsed)
 
 
 class NumpyProgram:

@@ -236,7 +236,8 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
             eager_out = block(x, position_embeddings=pos_emb)[0]
         eager_flat = eager_out.cpu().flatten().tolist()
 
-        for buf_name, values in run_result.outputs.items():
+        for buf_name, arr in run_result.outputs.items():
+            values = arr.flatten().tolist() if hasattr(arr, "flatten") else list(arr)
             nonzero = sum(1 for v in values if abs(v) > 1e-12)
             has_nan = any(v != v for v in values)  # NaN != NaN
             if has_nan:

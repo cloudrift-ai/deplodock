@@ -36,14 +36,15 @@
 ├──────────────────────────────────────────────────────────────────┤
 │  LAYER 3 · Backends                                              │
 │                                                                  │
-│  backend/base.py:  Backend ABC — compile(graph), run, run_arrays │
+│  backend/base.py:  Backend ABC — compile(graph), run, benchmark  │
 │  backend/numpy/:   NumpyBackend — Graph interpreter (pre-fusion) │
 │  backend/loop/:    LoopBackend  — LoopProgram interpreter (numpy)│
 │  backend/cuda/:    CudaBackend  — LoopProgram → GpuProgram → nvcc│
 │                                                                  │
 │  All three backends share:                                       │
 │    backend.compile(graph) → compiled                             │
-│    backend.run_arrays(compiled, input_data=…) → dict[name, nd]   │
+│    backend.run(compiled, input_data=…) → ProgramResult           │
+│      (outputs=dict[name, ndarray], time_ms)                      │
 │                                                                  │
 │  Codegen internals (CUDA):                                       │
 │    backend/kernel_codegen.py: GpuKernel → C source               │
@@ -72,8 +73,8 @@ PyTorch module
    ▼
 Graph (Layer 1)
    │  backend.compile(graph)  — unified across numpy / loop / cuda
-   │    ├─ NumpyBackend: wrap Graph; numpy walk in run_arrays
-   │    ├─ LoopBackend:  compile_graph(graph) → LoopProgram; interpret in run_arrays
+   │    ├─ NumpyBackend: wrap Graph; numpy walk in run
+   │    ├─ LoopBackend:  compile_graph(graph) → LoopProgram; interpret in run
    │    └─ CudaBackend:  compile_graph(graph) → LoopProgram
    │                     compile_kernels(lp)  → GpuProgram
    ▼
@@ -176,8 +177,8 @@ The naive schedule is correctness-first — no shared memory, no async copies, n
 `NumpyBackend` derives from `Backend` (same ABC as `CudaBackend`).
 Every `Op` subclass implements `forward(*inputs: np.ndarray) -> np.ndarray` — the
 numpy equivalent of the tensor operation. `NumpyBackend.compile(graph)` stores the
-graph; `run()` / `run_arrays()` walk it in topological order, calling `forward` at
-each node, reshaping outputs to match declared `node.output.shape`. No GPU required.
+graph; `run()` walks it in topological order, calling `forward` at each node,
+reshaping outputs to match declared `node.output.shape`. No GPU required.
 
 Covered ops: all elementwise functions, reductions, scans, gather/scatter,
 transpose/reshape/unsqueeze/slice/cat, linear, matmul, SDPA, mean.

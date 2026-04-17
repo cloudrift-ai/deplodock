@@ -13,7 +13,7 @@ intermediate `LoopIR` stage.
   triangulation reference: disagreement with CUDA on the same
   `LoopProgram` implicates codegen; disagreement with numpy implicates
   fusion. All three backends expose the same `compile(graph)` /
-  `run_arrays(compiled, input_data=…)` API (`backend/base.py`).
+  `run(compiled, input_data=…) → ProgramResult` API (`backend/base.py`).
 
 ## Module Layout
 

@@ -5,7 +5,9 @@ executes it. Each backend (NumPy, Loop, CUDA, ...) implements this
 interface; all backends share the same call surface:
 
     compiled = backend.compile(graph)
-    outputs  = backend.run_arrays(compiled, input_data={...})   # dict[name, ndarray]
+    result   = backend.run(compiled, input_data={...})
+    outputs  = result.outputs   # dict[name, ndarray]
+    elapsed  = result.time_ms
 
 Individual backends may do different internal lowerings: the CUDA backend
 runs ``compile_graph → compile_kernels`` internally, the Loop backend runs
@@ -28,9 +30,9 @@ if TYPE_CHECKING:
 
 @dataclass
 class ProgramResult:
-    """Result of running a program: outputs as flat lists + optional timing."""
+    """Result of running a program: outputs as ndarrays + optional wall-time."""
 
-    outputs: dict[str, list[float]]
+    outputs: dict[str, Any]  # actually dict[str, np.ndarray] at runtime
     time_ms: float | None = None
 
 
@@ -53,11 +55,7 @@ class Backend(ABC):
 
     @abstractmethod
     def run(self, compiled: Any, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
-        """Execute; return outputs as flat lists (subprocess-friendly)."""
-
-    @abstractmethod
-    def run_arrays(self, compiled: Any, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
-        """Execute; return outputs as numpy arrays with declared shapes."""
+        """Execute; return ``ProgramResult`` with outputs as ndarrays + wall-time."""
 
     def benchmark(
         self,
