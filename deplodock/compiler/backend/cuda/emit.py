@@ -68,13 +68,23 @@ def compile_kernels(program: LoopProgram) -> GpuProgram:
         gpu_kernel, arg_order = emit_kernel(launch, kname, program)
         source = _emit_kernel_source(gpu_kernel)
         grid, block = _launch_config(launch, program)
-        launches.append(CudaLaunch(kernel_source=source, kernel_name=kname, grid=grid, block=block, args=arg_order))
+        launches.append(
+            CudaLaunch(
+                kernel_source=source,
+                kernel_name=kname,
+                grid=grid,
+                block=block,
+                args=arg_order,
+                comment=program.pretty_print_launch(i),
+            )
+        )
 
     return GpuProgram(
         name=program.name,
         buffers=buffers,
         launches=launches,
         constant_values=dict(program.constant_values),
+        comment=program.pretty_print(),
     )
 
 

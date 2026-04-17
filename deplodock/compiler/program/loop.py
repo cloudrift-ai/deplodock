@@ -120,6 +120,48 @@ class LoopProgram:
                 out[key] = ()
         return out
 
+    # ── pretty-printing ──────────────────────────────────────────────
+
+    def pretty_print_launch(self, idx: int) -> str:
+        """Render a single launch as a human-readable text block.
+
+        Used by CUDA codegen to stash per-kernel metadata alongside the
+        generated source; also used as the per-launch fragment in
+        :meth:`pretty_print`.
+        """
+        from deplodock.compiler.ir.loop import pretty_print_loop
+
+        launch = self.launches[idx]
+        lines: list[str] = []
+        lines.append(f"launch {idx:02d}: inputs=[{', '.join(launch.input_names)}] output={launch.output_name}")
+        if isinstance(launch.loop, LoopOp):
+            lines.append(pretty_print_loop(launch.loop, indent="  "))
+        else:
+            lines.append(f"  (non-LoopOp: {type(launch.loop).__name__})")
+        return "\n".join(lines)
+
+    def pretty_print(self) -> str:
+        """Render the whole LoopProgram — buffers, launches, and per-launch LoopOp bodies."""
+        lines: list[str] = []
+        lines.append(f"# LoopProgram: {self.name}")
+        lines.append(f"# {len(self.buffers)} buffers, {len(self.launches)} launches")
+        lines.append("")
+
+        for role in ("input", "constant", "output", "scratch"):
+            bufs = [b for b in self.buffers if b.role == role]
+            if not bufs:
+                continue
+            for b in bufs:
+                shape_str = ",".join(str(d) for d in b.shape) or "scalar"
+                lines.append(f"{b.name} = buffer({shape_str}, {b.dtype}, {role})")
+            lines.append("")
+
+        for i in range(len(self.launches)):
+            lines.append(self.pretty_print_launch(i))
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
     # ── construction ─────────────────────────────────────────────────
 
     @classmethod

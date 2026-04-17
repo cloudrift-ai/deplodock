@@ -123,14 +123,25 @@ class CompilerDump:
         self._write_json("40_program_summary.json", summary)
         self._write_text("40_program.txt", program.pretty_print())
 
-        # Kernel sources concatenated (deduplicated by name, same order as generate_source).
+        # Program-level LoopIR metadata (populated by codegen).
+        if program.comment:
+            self._write_text("38_loop_program.txt", program.comment)
+
+        # Kernel sources concatenated (deduplicated by name, same order as
+        # generate_source), each preceded by its LoopIR metadata as a C++
+        # block comment so reviewers can see the lowering source-of-truth.
         seen: set[str] = set()
-        kernels: list[str] = []
+        blocks: list[str] = []
         for launch in program.launches:
-            if launch.kernel_name not in seen:
-                kernels.append(launch.kernel_source)
-                seen.add(launch.kernel_name)
-        self._write_text("40_kernels.cu", "\n\n".join(kernels))
+            if launch.kernel_name in seen:
+                continue
+            seen.add(launch.kernel_name)
+            if launch.comment:
+                banner = "\n".join(f" * {line}" if line else " *" for line in launch.comment.split("\n"))
+                blocks.append(f"/*\n{banner}\n */\n{launch.kernel_source}")
+            else:
+                blocks.append(launch.kernel_source)
+        self._write_text("40_kernels.cu", "\n\n".join(blocks))
 
         # Full nvcc input (kernels + host main) — reproduces what nvcc compiles.
         self._write_text("40_full_program.cu", generate_source(program, mode="benchmark"))

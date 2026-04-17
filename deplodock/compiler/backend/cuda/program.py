@@ -41,8 +41,6 @@ class CudaLaunch(GpuLaunch):
     """CUDA kernel launch with optional TMA descriptor metadata."""
 
     tma_descriptors: list[TmaDescriptorSpec] = field(default_factory=list)
-    loop_ir: object | None = None  # LoopProgram, if generated via LoopIR pipeline
-    schedule: object | None = None  # Schedule, if generated via LoopIR pipeline
 
 
 # ---------------------------------------------------------------------------

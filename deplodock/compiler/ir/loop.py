@@ -30,6 +30,7 @@ from typing import Literal
 
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.expr import Expr
+from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.tensor import ElementwiseOp
 
 # ---------------------------------------------------------------------------
@@ -208,6 +209,50 @@ class LoopOp(Op):
     def infer_output_shape(self, input_shapes: list[tuple] | dict[str, tuple] | None = None) -> tuple:
         """Output shape = extents of free axes in declaration order."""
         return tuple(a.extent for a in self.free_axes())
+
+
+# ---------------------------------------------------------------------------
+# Pretty-printing
+# ---------------------------------------------------------------------------
+
+
+def pretty_print_loop(loop: LoopOp, indent: str = "") -> str:
+    """Format a ``LoopOp`` as a compact, human-readable text block."""
+    lines: list[str] = []
+
+    axis_parts = [f"{a.kind}({a.name}:{a.extent})" for a in loop.axes]
+    lines.append(f"{indent}axes:   {', '.join(axis_parts) if axis_parts else '(none)'}")
+
+    if loop.inputs:
+        port_parts = [f"${i}[{', '.join(render_expr(e) for e in p.index)}]" for i, p in enumerate(loop.inputs)]
+        lines.append(f"{indent}inputs: {', '.join(port_parts)}")
+
+    if loop.locals:
+        loc_parts: list[str] = []
+        for lb in loop.locals:
+            init = render_expr(lb.init) if lb.init is not None else "?"
+            if lb.combine is not None:
+                loc_parts.append(f"{lb.name}:{lb.dtype}={init} combine={lb.combine.fn}")
+            else:
+                loc_parts.append(f"{lb.name}:{lb.dtype} (scratch)")
+        lines.append(f"{indent}locals: {', '.join(loc_parts)}")
+
+    lines.append(f"{indent}body:")
+    for stmt in loop.body:
+        if isinstance(stmt, Assign):
+            args = ", ".join(stmt.args)
+            lines.append(f"{indent}  {stmt.name} = {stmt.op.fn}({args})")
+        elif isinstance(stmt, Update):
+            lines.append(f"{indent}  {stmt.target} <- combine({stmt.target}, {stmt.value})")
+        elif isinstance(stmt, Write):
+            idx = ", ".join(render_expr(e) for e in stmt.index)
+            lines.append(f"{indent}  out{stmt.output}[{idx}] = {stmt.value}")
+        elif isinstance(stmt, Select):
+            for bi, br in enumerate(stmt.branches):
+                prefix = f"{stmt.name} =" if bi == 0 else f"{' ' * len(stmt.name)}  "
+                lines.append(f"{indent}  {prefix} {br.value} when ({render_expr(br.select)})")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

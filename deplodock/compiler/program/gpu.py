@@ -50,6 +50,10 @@ class GpuLaunch:
     args: list[str]  # buffer names and scalar literals in param order
     smem_bytes: int = 0
     zero_outputs: list[str] = field(default_factory=list)  # buffers to zero before launch
+    # Free-form text metadata captured at codegen time (e.g. pretty-printed
+    # LoopOp the kernel was lowered from). Informational only — emitted as a
+    # comment above the kernel source when dumping; never parsed.
+    comment: str = ""
 
 
 @dataclass
@@ -69,6 +73,9 @@ class GpuProgram:
     # buffers with a compile-time scalar). Callers (e.g. fixtures) may
     # auto-inject these at run time so tests don't have to supply them.
     constant_values: dict[str, float] = field(default_factory=dict)
+    # Free-form text metadata (e.g. pretty-printed LoopProgram). Written
+    # by codegen, consumed by dump tooling.
+    comment: str = ""
 
     def shape(self, name: str) -> tuple:
         """Return the declared shape of the named buffer."""
