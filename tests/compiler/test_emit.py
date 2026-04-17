@@ -55,10 +55,14 @@ def _matmul_graph() -> Graph:
 
 def _softmax_launch() -> LoopLaunch:
     """Build a LoopLaunch with the softmax SSA pattern directly."""
-    from deplodock.compiler.ir.loop import Assign, LoopOp, Port
+    from deplodock.compiler.ir.expr import Var
+    from deplodock.compiler.ir.loop import Assign, Axis, LoopOp, Port
 
+    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    p = Port(index=(Var("a0"), Var("a1")))
     loop = LoopOp(
-        inputs=(Port(), Port()),
+        axes=axes,
+        inputs=(p, p),
         body=(
             Assign(name="mx", op=ReduceOp(fn="max", axis=-1), args=("$0",)),
             Assign(name="sub", op=ElementwiseOp("sub"), args=("$0", "mx")),
@@ -66,7 +70,7 @@ def _softmax_launch() -> LoopLaunch:
             Assign(name="sm", op=ReduceOp(fn="sum", axis=-1), args=("ex",)),
             Assign(name="out", op=ElementwiseOp("div"), args=("ex", "sm")),
         ),
-        outputs=(Port(),),
+        outputs=(Port(index=(Var("a0"), Var("a1"))),),
     )
     return LoopLaunch(loop=loop, input_names=["x", "x"], output_name="y")
 

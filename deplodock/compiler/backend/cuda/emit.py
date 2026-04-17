@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend.cuda.program import CudaLaunch
-from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var
+from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Var, substitute
 from deplodock.compiler.ir.gpu import (
     ArrayAccess,
     AugAssign,
@@ -30,8 +30,8 @@ from deplodock.compiler.ir.gpu import (
 from deplodock.compiler.ir.gpu import (
     Assign as IrAssign,
 )
-from deplodock.compiler.ir.loop import Combine, LoopInput, LoopOp, Mux, Port
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.loop import Axis, LoopOp, Port
+from deplodock.compiler.ir.tensor import ReduceOp
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
 
@@ -97,149 +97,86 @@ def emit_kernel(launch: LoopLaunch, kernel_name: str, program: LoopProgram) -> t
 
 
 # ---------------------------------------------------------------------------
-# Input-tree walker
+# Axis-env helpers
 # ---------------------------------------------------------------------------
 
 
-def _emit_input_value(
-    inp: LoopInput,
-    coord: Expr,
-    buf_name: str,
-    src_shape: tuple,
-    stmts: list[Stmt],
-    name_seq: list[int],
-) -> Expr:
-    """Emit code to evaluate ``inp`` at the linear output coord ``coord``.
+def _axis_env_for_flat(axes: tuple[Axis, ...], flat_idx: Expr) -> dict[str, Expr]:
+    """Decompose a flat iteration index into per-axis Exprs.
 
-    ``buf_name`` is the external buffer name for this Port.
-    ``src_shape`` is the source buffer's shape (for indexmap stride computation).
+    For pointwise kernels with only free axes, ``flat_idx`` iterates over
+    the entire iteration space. The axes are unpacked row-major
+    (leftmost axis is outermost).
     """
-    if isinstance(inp, Port):
-        if inp.indexmap is not None:
-            return _emit_indexmap_load(buf_name, inp.indexmap, coord, src_shape, stmts, name_seq)
-        return ArrayAccess(array=buf_name, index=coord)
-
-    if isinstance(inp, Mux):
-        result: Expr | None = None
-        for branch in reversed(inp.branches):
-            sub = _emit_input_value(branch.input, coord, buf_name, src_shape, stmts, name_seq)
-            result = sub if result is None else Ternary(cond=branch.select, if_true=sub, if_false=result)
-        assert result is not None
-        return result
-
-    if isinstance(inp, Combine):
-        source_vals: list[Expr] = []
-        for src in inp.sources:
-            expr = _emit_input_value(src, coord, buf_name, src_shape, stmts, name_seq)
-            tname = _fresh(name_seq)
-            stmts.append(VarDecl(dtype="float", name=tname, init=expr))
-            source_vals.append(Var(tname))
-
-        source_iter = iter(source_vals)
-        value = next(source_iter)
-        for op in inp.ops:
-            assert isinstance(op, ElementwiseOp)
-            if op.info.arity == 1:
-                value = _apply_elementwise(op.fn, [value])
-            else:
-                extra = next(source_iter, ArrayAccess(array="?", index=coord))
-                value = _apply_elementwise(op.fn, [value, extra])
-            tname = _fresh(name_seq)
-            stmts.append(VarDecl(dtype="float", name=tname, init=value))
-            value = Var(tname)
-        return value
-
-    raise NotImplementedError(f"unexpected LoopInput variant: {type(inp).__name__}")
+    env: dict[str, Expr] = {}
+    if not axes:
+        return env
+    remainder = flat_idx
+    extents = [int(a.extent) for a in axes]
+    for i in range(len(axes) - 1, -1, -1):
+        dim = extents[i]
+        if i == 0:
+            env[axes[i].name] = remainder
+        else:
+            env[axes[i].name] = BinOp("%", remainder, Literal(dim, "int"))
+            remainder = BinOp("/", remainder, Literal(dim, "int"))
+    return env
 
 
-def _emit_mux_value(
-    mux: Mux,
-    coord: Expr,
-    branch_infos: list[tuple[str, tuple]],
-    out_shape: tuple,
-    stmts: list[Stmt],
-    name_seq: list[int],
-) -> Expr:
-    """Emit code for a Mux input with per-branch buffer names.
+def _axis_env_for_reduce(axes: tuple[Axis, ...], row_idx: Expr, k: Expr) -> dict[str, Expr]:
+    """Axis env for a reduce kernel: row_idx unpacks free axes, k is the reduce axis."""
+    env: dict[str, Expr] = {}
+    free = [a for a in axes if a.kind == "free"]
+    reduce_a = next((a for a in axes if a.kind == "reduce"), None)
 
-    Decomposes the flat coord into per-axis output coordinates and
-    substitutes them into the Mux branch select predicates.
+    # Unpack row_idx across free axes row-major.
+    remainder = row_idx
+    extents = [int(a.extent) for a in free]
+    for i in range(len(free) - 1, -1, -1):
+        dim = extents[i]
+        if i == 0:
+            env[free[i].name] = remainder
+        else:
+            env[free[i].name] = BinOp("%", remainder, Literal(dim, "int"))
+            remainder = BinOp("/", remainder, Literal(dim, "int"))
+
+    if reduce_a is not None:
+        env[reduce_a.name] = k
+    return env
+
+
+def _emit_port_load(port: Port, buf_name: str, src_shape: tuple, axis_env: dict[str, Expr]) -> Expr:
+    """Evaluate ``port.index`` under ``axis_env`` and emit an ArrayAccess.
+
+    Each Expr in ``port.index`` is substituted with the axis_env, then
+    combined into a flat buffer offset using row-major strides from
+    ``src_shape``.
     """
-    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, substitute
+    if not port.index:
+        return ArrayAccess(array=buf_name, index=Literal(0, "int"))
 
-    # Decompose flat coord into per-axis output coords.
-    ndim = len(out_shape)
-    mapping: dict[str, Expr] = {}
-    remainder = coord
-    for d in range(ndim - 1, -1, -1):
-        dim_size = int(out_shape[d]) if isinstance(out_shape[d], int) else 1
-        axis_var = f"{PLACEHOLDER_PREFIX}{d}"
-        if d == 0:
-            mapping[axis_var] = remainder
-        else:
-            mapping[axis_var] = BinOp("%", remainder, Literal(dim_size, "int"))
-            remainder = BinOp("/", remainder, Literal(dim_size, "int"))
-
-    result: Expr | None = None
-    for i, branch in enumerate(reversed(mux.branches)):
-        bi = len(mux.branches) - 1 - i
-        buf_name, src_shape = branch_infos[bi] if bi < len(branch_infos) else ("?", ())
-
-        # Substitute placeholders in the branch's select predicate.
-        select_expr = substitute(branch.select, mapping) if branch.select is not None else None
-
-        # Emit the branch's input value with coordinate mapping.
-        sub = _emit_input_value(branch.input, coord, buf_name, src_shape, stmts, name_seq)
-        if select_expr is not None:
-            result = sub if result is None else Ternary(cond=select_expr, if_true=sub, if_false=result)
-        else:
-            result = sub if result is None else result
-    assert result is not None
-    return result
+    coords = [substitute(e, axis_env) for e in port.index]
+    flat = _flatten_coords(coords, src_shape)
+    return ArrayAccess(array=buf_name, index=flat)
 
 
-def _emit_indexmap_load(buf_name: str, indexmap, coord: Expr, src_shape: tuple, stmts: list[Stmt], name_seq: list[int]) -> Expr:
-    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, substitute
-
-    assert len(indexmap.sources) == 1
-    src = indexmap.sources[0]
-    out_shape = indexmap.out_shape
-    ndim = len(out_shape)
-
-    max_placeholder = ndim - 1
-    for cm in src.coord_map:
-        for var_name in _collect_var_names(cm):
-            if var_name.startswith(PLACEHOLDER_PREFIX):
-                idx = int(var_name[len(PLACEHOLDER_PREFIX) :])
-                max_placeholder = max(max_placeholder, idx)
-
-    mapping: dict[str, Expr] = {}
-    remainder = coord
-    effective_ndim = max_placeholder + 1
-    effective_shape = tuple(out_shape) + (1,) * (effective_ndim - ndim)
-    for d in range(effective_ndim - 1, -1, -1):
-        dim_size = int(effective_shape[d]) if d < len(effective_shape) and isinstance(effective_shape[d], int) else 1
-        axis_var = f"{PLACEHOLDER_PREFIX}{d}"
-        if d == 0:
-            mapping[axis_var] = remainder
-        else:
-            mapping[axis_var] = BinOp("%", remainder, Literal(dim_size, "int"))
-            remainder = BinOp("/", remainder, Literal(dim_size, "int"))
-
-    input_coords = [substitute(cm, mapping) for cm in src.coord_map]
-
-    flat_idx: Expr = Literal(0, "int")
+def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
+    """Combine per-dim coord Exprs into a flat row-major index."""
+    if not coords:
+        return Literal(0, "int")
+    flat: Expr = Literal(0, "int")
     stride = 1
-    for d in range(len(input_coords) - 1, -1, -1):
-        if stride == 1:
-            flat_idx = input_coords[d]
+    dims = [int(d) if isinstance(d, int) else 1 for d in shape]
+    for d in range(len(coords) - 1, -1, -1):
+        coord = coords[d]
+        term = coord if stride == 1 else BinOp("*", coord, Literal(stride, "int"))
+        if isinstance(flat, Literal) and flat.value == 0:
+            flat = term
         else:
-            flat_idx = BinOp("+", BinOp("*", input_coords[d], Literal(stride, "int")), flat_idx)
-        if d > 0:
-            dim = int(src_shape[d]) if d < len(src_shape) and isinstance(src_shape[d], int) else 1
-            stride *= dim
-
-    return ArrayAccess(array=buf_name, index=flat_idx)
+            flat = BinOp("+", term, flat)
+        if d > 0 and d < len(dims):
+            stride *= dims[d]
+    return flat
 
 
 # ---------------------------------------------------------------------------
@@ -272,22 +209,21 @@ def _emit_body(
 def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], program: LoopProgram, idx: Expr) -> list[Stmt]:
     from deplodock.compiler.backend.kernel_plan import Inline, Loop
 
-    loop = launch.loop
+    loop: LoopOp = launch.loop
     stmts: list[Stmt] = []
     name_seq = [0]
     values: dict[str, Expr] = {}
-    out_shape = program.output_shape(launch)
 
-    port_info, mux_info = _collect_port_info(loop, launch, program, dollar_shapes)
+    # Map $N → (port, buf_name, src_shape).
+    port_info = _collect_port_info(loop, launch, program, dollar_shapes)
+
+    free_axes = tuple(a for a in loop.axes if a.kind == "free")
+    flat_env = _axis_env_for_flat(free_axes, idx)
 
     # Load per-row ports upfront.
     for key, (port, buf_name, src_shape) in port_info.items():
         if key not in plan.per_elem_ports:
-            inp = loop.inputs[int(key[1:])] if key[1:].isdigit() else port
-            if isinstance(inp, Mux) and key in mux_info:
-                values[key] = _emit_mux_value(inp, idx, mux_info[key], out_shape, stmts, name_seq)
-            else:
-                values[key] = _emit_input_value(port, idx, buf_name, src_shape, stmts, name_seq)
+            values[key] = _emit_port_load(port, buf_name, src_shape, flat_env)
 
     loop_count = 0
     for step in plan.steps:
@@ -309,13 +245,13 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
             inner: list[Stmt] = []
             loop_values: dict[str, Expr] = dict(values)
 
-            # Load per-element ports at broadcast coords.
-            bcast = _decompose_broadcast_coords(idx, k_var, step.iter_shape, step.reduce_axis)
+            # Axis env for this reduce loop: row_idx + k.
+            axis_env = _axis_env_for_reduce(loop.axes, idx, k_var)
+
+            # Load per-element ports at (row, k).
             for key, (port, buf_name, src_shape) in port_info.items():
                 if key in plan.per_elem_ports:
-                    ps = _port_shape_from_info(port, src_shape)
-                    pidx = _flatten_coords_for_port(bcast, step.iter_shape, ps)
-                    loop_values[key] = _emit_input_value(port, pidx, buf_name, src_shape, inner, name_seq)
+                    loop_values[key] = _emit_port_load(port, buf_name, src_shape, axis_env)
 
             for assign in step.recompute:
                 arg_exprs = [loop_values[a] for a in assign.args]
@@ -337,8 +273,9 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
                 values[step.accum.result] = Var(step.accum.var)
 
             if step.stores_output:
-                store_idx = _broadcast_load_idx(idx, k_var, step.iter_shape, step.reduce_axis)
+                # Per-element store inside the loop: emit ArrayAccess via full iter index.
                 last = step.body[-1]
+                store_idx = _iter_flat_index(loop.axes, axis_env, program.shape(launch.output_name))
                 inner.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=store_idx), value=loop_values[last.name]))
 
             stmts.append(ForLoop(var=k_var_name, start=Literal(0, "int"), end=Literal(step.k_size, "int"), body=inner))
@@ -348,7 +285,6 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
         if loop.body:
             out_val = values[loop.body[-1].name]
         else:
-            # Copy kernel: use first available value (Port or Mux).
             first_key = next((k for k in sorted(values) if k.startswith("$")), None)
             out_val = values[first_key] if first_key else Literal(0.0, "float")
         stmts.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=idx), value=out_val))
@@ -361,39 +297,28 @@ def _collect_port_info(
     launch: LoopLaunch,
     program: LoopProgram,
     dollar_shapes: dict[str, tuple],
-) -> tuple[dict[str, tuple[Port, str, tuple]], dict[str, list[tuple[str, tuple]]]]:
-    """Walk ``loop.inputs`` and bind each $N to its external buffer.
-
-    Returns two dicts:
-    - ``port_info[key]`` → (port, buffer_name, source_shape) for each top-level input.
-      For Mux inputs, the first branch's Port is used as a representative.
-    - ``mux_info[key]`` → per-branch [(branch_buffer_name, branch_source_shape), ...]
-      for Mux inputs; absent for plain Port inputs.
-    """
+) -> dict[str, tuple[Port, str, tuple]]:
+    """Build the $N → (port, buffer_name, source_shape) mapping for codegen."""
     port_info: dict[str, tuple[Port, str, tuple]] = {}
-    mux_info: dict[str, list[tuple[str, tuple]]] = {}
     buf_name_set = {b.name for b in program.buffers}
-    port_idx = 0
-    for inp in loop.inputs:
-        if isinstance(inp, Port):
-            key = f"${port_idx}"
-            buf_name = launch.input_names[port_idx] if port_idx < len(launch.input_names) else key
-            src_shape = program.shape(buf_name) if buf_name in buf_name_set else dollar_shapes.get(key, ())
-            port_info[key] = (inp, buf_name, src_shape)
-            port_idx += 1
-        elif isinstance(inp, Mux):
-            key = f"${port_idx}"
-            branch_infos: list[tuple[str, tuple]] = []
-            for branch in inp.branches:
-                if isinstance(branch.input, Port):
-                    bname = launch.input_names[port_idx] if port_idx < len(launch.input_names) else f"${port_idx}"
-                    bshape = program.shape(bname) if bname in buf_name_set else ()
-                    branch_infos.append((bname, bshape))
-                    port_idx += 1
-            mux_info[key] = branch_infos
-            if branch_infos:
-                port_info[key] = (Port(), branch_infos[0][0], branch_infos[0][1])
-    return port_info, mux_info
+    for i, port in enumerate(loop.inputs):
+        key = f"${i}"
+        buf_name = launch.input_names[i] if i < len(launch.input_names) else key
+        src_shape = program.shape(buf_name) if buf_name in buf_name_set else dollar_shapes.get(key, ())
+        port_info[key] = (port, buf_name, src_shape)
+    return port_info
+
+
+def _iter_flat_index(axes: tuple[Axis, ...], axis_env: dict[str, Expr], shape: tuple) -> Expr:
+    """Build a flat row-major offset into a buffer of ``shape`` using the full iter axes.
+
+    Used for per-element stores inside a reduce K-loop, where the output
+    buffer has the full iteration shape (pre-reduce). The axis_env gives
+    per-axis Exprs; we combine them into a flat offset with strides from
+    ``shape``.
+    """
+    coords = [axis_env.get(a.name, Literal(0, "int")) for a in axes]
+    return _flatten_coords(coords, shape)
 
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
@@ -403,58 +328,6 @@ def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
         return VarAssign(name=acc_name, value=FuncCall("fmaxf", [Var(acc_name), value]))
     op = {"sum": "+=", "prod": "*="}.get(fn, "+=")
     return AugAssign(target=acc_name, op=op, value=value)
-
-
-# ---------------------------------------------------------------------------
-# Coordinate helpers
-# ---------------------------------------------------------------------------
-
-
-def _decompose_broadcast_coords(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis: int) -> list[Expr]:
-    ndim = len(broadcast_shape)
-    if ndim <= 1:
-        return [k]
-    outer_shape = list(broadcast_shape)
-    del outer_shape[reduce_axis]
-    outer_coords: list[Expr] = []
-    remainder = row
-    for d in range(len(outer_shape) - 1, -1, -1):
-        dim = int(outer_shape[d])
-        if d == 0:
-            outer_coords.insert(0, remainder)
-        else:
-            outer_coords.insert(0, BinOp("/", remainder, Literal(dim, "int")))
-            remainder = BinOp("%", remainder, Literal(dim, "int"))
-            outer_coords[0], remainder = remainder, outer_coords[0]
-    full_coords = list(outer_coords)
-    full_coords.insert(reduce_axis, k)
-    return full_coords
-
-
-def _flatten_coords_for_port(broadcast_coords: list[Expr], broadcast_shape: tuple, port_shape: tuple) -> Expr:
-    ndim = len(broadcast_shape)
-    port_ndim = len(port_shape)
-    if port_ndim == 0:
-        return Literal(0, "int")
-    pad = ndim - port_ndim
-    flat: Expr = Literal(0, "int")
-    stride = 1
-    for d in range(ndim - 1, -1, -1):
-        pd = d - pad
-        if pd < 0:
-            continue
-        p_dim = int(port_shape[pd])
-        b_dim = int(broadcast_shape[d])
-        coord = Literal(0, "int") if (p_dim == 1 and b_dim > 1) else broadcast_coords[d]
-        term = coord if stride == 1 else BinOp("*", coord, Literal(stride, "int"))
-        flat = term if (isinstance(flat, Literal) and flat.value == 0) else BinOp("+", term, flat)
-        stride *= p_dim
-    return flat
-
-
-def _broadcast_load_idx(row: Expr, k: Expr, broadcast_shape: tuple, reduce_axis: int) -> Expr:
-    coords = _decompose_broadcast_coords(row, k, broadcast_shape, reduce_axis)
-    return _flatten_coords_for_port(coords, broadcast_shape, broadcast_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -511,12 +384,6 @@ def _numel(shape: tuple) -> int:
     return int(math.prod(int(d) for d in shape if isinstance(d, int)) or 1)
 
 
-def _port_shape_from_info(port: Port, src_shape: tuple) -> tuple:
-    if port.indexmap is not None:
-        return tuple(port.indexmap.out_shape)
-    return tuple(src_shape)
-
-
 def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
     seen: list[str] = []
     for buf_name in launch.input_names:
@@ -534,50 +401,23 @@ def _kernel_name(loop: LoopOp, idx: int) -> str:
 
 
 def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    loop = launch.loop
-    dollar_shapes = program.dollar_shapes(launch)
+    loop: LoopOp = launch.loop
     out_shape = program.output_shape(launch)
     has_reduce = any(isinstance(a.op, ReduceOp) for a in loop.body)
     if has_reduce:
-        n_output = _reduce_n_rows(loop, dollar_shapes)
+        # Number of rows = product of free-axis extents.
+        free_extents = [int(a.extent) for a in loop.axes if a.kind == "free"]
+        n_output = _numel(tuple(free_extents)) if free_extents else 1
     else:
-        n_output = _numel(out_shape) if out_shape else _numel(loop.infer_output_shape(dollar_shapes))
+        n_output = _numel(out_shape) if out_shape else _numel(tuple(a.extent for a in loop.axes))
     n_blocks = (n_output + _BLOCK - 1) // _BLOCK
     return (max(n_blocks, 1), 1, 1), (_BLOCK, 1, 1)
-
-
-def _reduce_n_rows(loop: LoopOp, shapes: dict[str, tuple]) -> int:
-    ssa_shapes = loop.infer_shapes(shapes)
-    for assign in loop.body:
-        if isinstance(assign.op, ReduceOp):
-            pre_shape = tuple(int(d) for d in ssa_shapes[assign.args[0]])
-            reduce_axis = assign.op.axis % len(pre_shape)
-            outer = list(pre_shape)
-            del outer[reduce_axis]
-            return _numel(tuple(outer)) if outer else 1
-    return _numel(loop.infer_output_shape(shapes))
 
 
 def _emit_kernel_source(gpu_kernel: GpuKernel) -> str:
     from deplodock.compiler.backend.kernel_codegen import emit_kernel as _emit
 
     return _emit(gpu_kernel)
-
-
-def _collect_var_names(expr) -> list[str]:
-    if isinstance(expr, Var):
-        return [expr.name]
-    names: list[str] = []
-    for attr in ("left", "right", "expr", "cond", "then", "else_"):
-        child = getattr(expr, attr, None)
-        if child is not None:
-            names.extend(_collect_var_names(child))
-    for attr in ("args",):
-        children = getattr(expr, attr, None)
-        if children is not None and isinstance(children, (list, tuple)):
-            for c in children:
-                names.extend(_collect_var_names(c))
-    return names
 
 
 def _fresh(seq: list[int]) -> str:

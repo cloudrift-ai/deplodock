@@ -13,7 +13,8 @@ import math
 from collections import deque
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.loop import Assign, Combine, LoopOp, Mux, Port
+from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.loop import Assign, LoopOp, Port
 from deplodock.compiler.ir.tensor import ReduceOp
 
 # ---------------------------------------------------------------------------
@@ -80,13 +81,12 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 
     # --- Reduction geometry (None for flat) ---
     if has_reduce:
-        ssa_shapes = kernel.infer_shapes(shapes)
-        first_reduce = next(a for a in kernel.body if isinstance(a.op, ReduceOp))
-        pre_shape = tuple(int(d) for d in ssa_shapes.get(first_reduce.args[0], ()))
-        reduce_axis = first_reduce.op.axis % len(pre_shape) if pre_shape else 0
-        k_size = int(pre_shape[reduce_axis]) if pre_shape else 1
-        n_rows = _n_rows(pre_shape, reduce_axis)
+        pre_shape = tuple(a.extent for a in kernel.axes)
+        reduce_axis_idx = next((i for i, a in enumerate(kernel.axes) if a.kind == "reduce"), 0)
+        k_size = int(pre_shape[reduce_axis_idx]) if pre_shape else 1
+        n_rows = _n_rows(pre_shape, reduce_axis_idx)
         n_output = n_rows
+        reduce_axis = reduce_axis_idx
     else:
         pre_shape = ()
         reduce_axis = 0
@@ -94,9 +94,10 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         n_rows = 0
         n_output = _numel(out_shape)
 
-    # --- Classify ports ---
+    # --- Classify ports as per-element (references reduce axis) vs per-row ---
     if has_reduce:
-        per_elem_ports = frozenset(name for name, port in input_ports.items() if _numel(_dollar_port_shape(name, port, shapes)) > n_rows)
+        reduce_axis_names = {a.name for a in kernel.axes if a.kind == "reduce"}
+        per_elem_ports = frozenset(name for name, port in input_ports.items() if _port_references_axis(port, reduce_axis_names))
     else:
         per_elem_ports = frozenset()  # flat: all ports loaded at idx
 
@@ -131,10 +132,10 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 
     for seg in segments:
         last = seg[-1]
-        has_reduce = isinstance(last.op, ReduceOp)
-        ew = seg[:-1] if has_reduce else seg
+        seg_has_reduce = isinstance(last.op, ReduceOp)
+        ew = seg[:-1] if seg_has_reduce else seg
 
-        if has_reduce:
+        if seg_has_reduce:
             remat = _remat_set(seg, prior_ew, row_space)
             remat_assigns = tuple(a for a in prior_ew if a.name in remat)
             accum = Accum(
@@ -193,18 +194,28 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 
 
 def _collect_input_ports(kernel: LoopOp) -> dict[str, Port]:
-    """Build $N → Port mapping for the kernel's top-level Port inputs.
+    """Build $N → Port mapping for the kernel's top-level Port inputs."""
+    return {f"${i}": inp for i, inp in enumerate(kernel.inputs)}
 
-    Non-Port inputs (Mux, Combine) are skipped — they're handled by the
-    codegen walker directly. Used for shape analysis on flat Port reads.
-    """
-    input_ports: dict[str, Port] = {}
-    port_idx = 0
-    for inp in kernel.inputs:
-        if isinstance(inp, Port):
-            input_ports[f"${port_idx}"] = inp
-            port_idx += 1
-    return input_ports
+
+def _port_references_axis(port: Port, axis_names: set[str]) -> bool:
+    """Does any Expr in ``port.index`` reference a Var with a name in ``axis_names``?"""
+    return any(_expr_references_any(e, axis_names) for e in port.index)
+
+
+def _expr_references_any(expr, names: set[str]) -> bool:
+    if isinstance(expr, Var):
+        return expr.name in names
+    children = []
+    for attr in ("left", "right", "cond", "if_true", "if_false"):
+        c = getattr(expr, attr, None)
+        if c is not None:
+            children.append(c)
+    for attr in ("args",):
+        c = getattr(expr, attr, None)
+        if isinstance(c, (list, tuple)):
+            children.extend(c)
+    return any(_expr_references_any(c, names) for c in children)
 
 
 def _split_at_reduces(body: tuple[Assign, ...]) -> list[list[Assign]]:
@@ -279,24 +290,3 @@ def _n_rows(pre_reduce_shape: tuple, reduce_axis: int) -> int:
     if outer:
         del outer[reduce_axis]
     return _numel(tuple(outer)) if outer else 1
-
-
-def _dollar_port_shape(key: str, port, shapes: dict) -> tuple:
-    """Get port shape for a $N-keyed port."""
-    if isinstance(port, Port) and port.indexmap is not None:
-        return tuple(port.indexmap.out_shape)
-    return tuple(shapes.get(key, ()))
-
-
-def _port_shape(inp, shapes: dict) -> tuple:
-    """Get port shape from indexmap or shapes dict (keyed by $N)."""
-    if isinstance(inp, Port):
-        if inp.indexmap is not None:
-            return tuple(inp.indexmap.out_shape)
-        # Without buffer_id, the caller must have populated shapes with $N keys.
-        return ()
-    if isinstance(inp, Combine) and inp.sources:
-        return _port_shape(inp.sources[0], shapes)
-    if isinstance(inp, Mux) and inp.branches:
-        return _port_shape(inp.branches[0].input, shapes)
-    return ()

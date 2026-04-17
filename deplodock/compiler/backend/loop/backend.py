@@ -6,9 +6,9 @@ handles per-element semantics; ``keepdims=True`` reductions keep the
 axis-1 shape invariant the SSA body expects.
 
 The interpreter is intentionally a faithful mirror of ``backend/cuda/emit``'s
-semantics: same `$N` port-indexing convention, same treatment of
-``Port.indexmap`` and ``Mux.select``. Disagreement between ``LoopBackend``
-and ``CudaBackend`` on the same ``LoopProgram`` implicates codegen.
+semantics: same ``$N`` port-indexing convention, same ``Port.index`` axis
+substitution. Disagreement between ``LoopBackend`` and ``CudaBackend`` on
+the same ``LoopProgram`` implicates codegen.
 """
 
 from __future__ import annotations
@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from deplodock.compiler.backend import Backend, ProgramResult
-from deplodock.compiler.ir.loop import Combine, LoopInput, LoopOp, Mux, Port
+from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.loop import Axis, LoopOp, Port
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -71,9 +72,7 @@ def _execute(program: LoopProgram, input_data: dict[str, np.ndarray]) -> dict[st
                 buffers[b.name] = np.asarray(input_data[b.name], dtype=np.float32).reshape(_concrete_shape(b.shape))
             elif b.name in program.constant_values:
                 buffers[b.name] = np.array([program.constant_values[b.name]], dtype=np.float32)
-            # Other constants (weights supplied by caller via input_data) must have been covered above.
 
-    # Execute each launch in order.
     for launch in program.launches:
         buffers[launch.output_name] = _exec_launch(launch, program, buffers)
 
@@ -84,8 +83,8 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
     """Evaluate one launch. Returns ndarray with shape == program.output_shape(launch)."""
     out_shape = _concrete_shape(program.output_shape(launch))
 
-    # Non-LoopOp launches (TransposeOp with >2 axes, GatherOp, etc. that fusion
-    # didn't wrap) are evaluated via Op.forward directly.
+    # Non-LoopOp launches (ops fusion didn't wrap — multi-source IndexMapOp
+    # for cat, non-2-axis TransposeOp, GatherOp, etc.) go through Op.forward.
     if not isinstance(launch.loop, LoopOp):
         args = [buffers[n] for n in launch.input_names]
         result = launch.loop.forward(*args)
@@ -93,8 +92,8 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
 
     loop = launch.loop
 
-    # Build $N → ndarray map by walking the LoopOp's input tree.
-    dollar, top_vals = _bind_inputs(loop, launch, buffers, out_shape)
+    # Bind $N → ndarray via Port.index substitution.
+    dollar = _bind_inputs(loop, launch, buffers)
 
     # Evaluate SSA body. ReduceOps use keepdims=True (matches LoopOp.infer_shapes);
     # ElementwiseOp args may need rank-alignment to reconcile keepdim-1 axes
@@ -110,16 +109,13 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
 
     if loop.body:
         result = values[loop.body[-1].name]
-    elif top_vals:
-        # Copy kernel — no body, pass through the (single) top-level input.
-        result = top_vals[0]
+    elif dollar:
+        result = next(iter(dollar.values()))
     else:
         raise ValueError("LoopOp has neither inputs nor body")
 
-    # Reshape to declared output shape (reconciles any broadcast/keepdim drift).
     arr = np.asarray(result, dtype=np.float32)
     if arr.shape != out_shape:
-        # Squeeze keepdim-1 axes that exceed the declared output rank before reshape.
         while arr.ndim > len(out_shape):
             size1 = [i for i in range(arr.ndim) if arr.shape[i] == 1]
             if not size1:
@@ -132,44 +128,103 @@ def _bind_inputs(
     loop: LoopOp,
     launch: LoopLaunch,
     buffers: dict[str, np.ndarray],
-    out_shape: tuple[int, ...],
-) -> tuple[dict[str, np.ndarray], list[np.ndarray]]:
-    """Walk ``loop.inputs`` recursively and bind each leaf ``Port`` to its buffer.
+) -> dict[str, np.ndarray]:
+    """Bind each ``$i`` port to a numpy view / gather from its external buffer.
 
-    Returns ``(dollar, top_vals)`` where ``dollar[$N]`` maps each top-level
-    Port position to its (possibly indexmap-transformed) ndarray, and
-    ``top_vals[i]`` is the value of ``loop.inputs[i]`` (possibly derived
-    via ``Mux``/``Combine``).
+    For identity-like Ports (index is ``(Var(a0), Var(a1), ...)`` matching
+    the LoopOp's axes), returns the buffer directly. For non-identity
+    patterns (transpose, broadcast, slice), materializes via advanced
+    indexing: each Expr in ``port.index`` is evaluated under an axis env
+    of broadcast-shaped ``arange`` arrays, producing one coord-array per
+    dim; the result is indexed from the buffer.
     """
     dollar: dict[str, np.ndarray] = {}
-    port_idx = [0]
+    for i, port in enumerate(loop.inputs):
+        key = f"${i}"
+        buf_name = launch.input_names[i]
+        base = buffers[buf_name]
+        dollar[key] = _apply_port_index(port, base, loop.axes)
+    return dollar
 
-    def bind(inp: LoopInput) -> np.ndarray:
-        if isinstance(inp, Port):
-            key = f"${port_idx[0]}"
-            buf_name = launch.input_names[port_idx[0]]
-            port_idx[0] += 1
-            base = buffers[buf_name]
-            arr = inp.indexmap.forward(base) if inp.indexmap is not None else base
-            dollar[key] = arr
-            return arr
-        if isinstance(inp, Combine):
-            vals = [bind(s) for s in inp.sources]
-            acc = vals[0]
-            val_iter = iter(vals[1:])
-            for op in inp.ops:
-                assert isinstance(op, ElementwiseOp)
-                if op.info.arity == 1:
-                    acc = op.forward(acc)
-                else:
-                    acc = op.forward(acc, next(val_iter))
-            return acc
-        if isinstance(inp, Mux):
-            return _eval_mux(inp, out_shape, bind_for_mux_branch=bind)
-        raise TypeError(f"Unknown LoopInput variant: {type(inp).__name__}")
 
-    top_vals = [bind(inp) for inp in loop.inputs]
-    return dollar, top_vals
+def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...]) -> np.ndarray:
+    """Return the array that the body sees for this Port.
+
+    The returned array has rank ``len(axes)`` with shape ``(extent_i if
+    axis i is used by port.index else 1)``, producing a broadcast-ready
+    view. Values at iteration coord (c0, ..., cN) equal ``base[e0, ..., em]``
+    where each ``ek`` is ``port.index[k]`` evaluated under the current
+    axis coords.
+    """
+    if not port.index:
+        return base
+
+    axis_names = {a.name for a in axes}
+    used_axes: set[str] = set()
+    for e in port.index:
+        _collect_used_axis_names(e, axis_names, used_axes)
+
+    # Per-axis broadcast dim size.
+    bshape = tuple(int(a.extent) if a.name in used_axes else 1 for a in axes)
+
+    # Identity fast-path: buffer already matches broadcast shape (reshape only).
+    if _is_identity(port, axes, base.shape):
+        return base.reshape(bshape)
+
+    # Axis env: used axes get arange-broadcast arrays; unused get 0.
+    axis_env: dict[str, object] = {}
+    for i, a in enumerate(axes):
+        if a.name in used_axes:
+            shape = [1] * len(axes)
+            shape[i] = int(a.extent)
+            axis_env[a.name] = np.arange(int(a.extent)).reshape(shape)
+        else:
+            axis_env[a.name] = 0
+
+    coord_arrs = []
+    for e in port.index:
+        arr = e.eval(axis_env)
+        if isinstance(arr, np.ndarray):
+            arr = np.broadcast_to(arr, bshape).astype(np.intp)
+        else:
+            arr = np.full(bshape, int(arr), dtype=np.intp)
+        coord_arrs.append(arr)
+
+    return base[tuple(coord_arrs)]
+
+
+def _is_identity(port: Port, axes: tuple[Axis, ...], base_shape: tuple) -> bool:
+    """True if port.index is identity across all axes used (no transpose/permute)."""
+    axis_names_by_position: dict[str, int] = {a.name: i for i, a in enumerate(axes)}
+    if len(port.index) != len(base_shape):
+        return False
+    prev_pos = -1
+    for i, e in enumerate(port.index):
+        if not isinstance(e, Var):
+            return False
+        pos = axis_names_by_position.get(e.name)
+        if pos is None or pos <= prev_pos:
+            return False
+        if int(base_shape[i]) != int(axes[pos].extent):
+            return False
+        prev_pos = pos
+    return True
+
+
+def _collect_used_axis_names(expr, axis_names: set[str], out: set[str]) -> None:
+    if isinstance(expr, Var):
+        if expr.name in axis_names:
+            out.add(expr.name)
+        return
+    for attr in ("left", "right", "cond", "if_true", "if_false"):
+        c = getattr(expr, attr, None)
+        if c is not None:
+            _collect_used_axis_names(c, axis_names, out)
+    for attr in ("args",):
+        c = getattr(expr, attr, None)
+        if isinstance(c, (list, tuple)):
+            for child in c:
+                _collect_used_axis_names(child, axis_names, out)
 
 
 def _align_ranks(args: list[np.ndarray]) -> list[np.ndarray]:
@@ -180,10 +235,6 @@ def _align_ranks(args: list[np.ndarray]) -> list[np.ndarray]:
     ``mul(qk_summed, scale)``), numpy's native broadcast doesn't line up the
     axes the way the compiler intends. We squeeze size-1 axes from
     higher-rank args until all args share the minimum rank.
-
-    The RMSNorm case (reduce→keepdim then broadcast against a same-rank
-    tensor via IndexMap expansion) is untouched: args already have matching
-    rank so no squeezing happens.
     """
     if len(args) <= 1:
         return args
@@ -195,8 +246,7 @@ def _align_ranks(args: list[np.ndarray]) -> list[np.ndarray]:
         while a.ndim > min_rank:
             size1 = [i for i in range(a.ndim) if a.shape[i] == 1]
             if not size1:
-                break  # no size-1 axis to squeeze; leave as-is (broadcast may still fail later)
-            # Squeeze the rightmost size-1 axis — typically the most recent keepdim artifact.
+                break
             a = np.squeeze(a, axis=size1[-1])
         aligned.append(a)
     return aligned
@@ -213,40 +263,6 @@ def _reduce_keepdims(op: ReduceOp, x: np.ndarray) -> np.ndarray:
     if fn == "prod":
         return np.prod(x, axis=axis, keepdims=True)
     raise NotImplementedError(f"_reduce_keepdims: unknown fn {fn!r}")
-
-
-def _eval_mux(mux: Mux, out_shape: tuple[int, ...], *, bind_for_mux_branch) -> np.ndarray:
-    """Evaluate a Mux at the output coordinate grid.
-
-    Each branch's ``select`` is an ``Expr`` over ``out_coord_N`` placeholders.
-    Build a bool mask per branch by substituting coord-grid ndarrays into
-    the select, then fold with ``np.where`` (first-match semantics).
-
-    Branches are ``bind``-evaluated in forward order so the enclosing
-    port_idx walker reads ``input_names[i]`` for each branch's Port in
-    the correct sequence; the ``np.where`` fold then runs in reverse so
-    earlier branches override later (catch-all) ones.
-    """
-    # Coord grids: one ndarray per output axis.
-    if out_shape:
-        grids = np.meshgrid(*[np.arange(d) for d in out_shape], indexing="ij")
-    else:
-        grids = []
-    env = {f"out_coord_{i}": grids[i] for i in range(len(grids))}
-
-    # Forward-order bind to advance the enclosing port_idx in the right sequence.
-    branch_vals = [bind_for_mux_branch(branch.input) for branch in mux.branches]
-
-    # Reverse-order mask fold: last branch is the catch-all, earlier override.
-    result: np.ndarray | None = None
-    for branch, val in zip(reversed(mux.branches), reversed(branch_vals), strict=True):
-        mask = branch.select.eval(env) if branch.select is not None else True
-        if result is None:
-            result = np.broadcast_to(val, out_shape).astype(np.float32, copy=True)
-        else:
-            result = np.where(mask, np.broadcast_to(val, out_shape), result)
-    assert result is not None
-    return result
 
 
 __all__ = ["LoopBackend"]
