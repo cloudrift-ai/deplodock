@@ -13,6 +13,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 from deplodock.compiler.backend import BenchmarkResult, ProgramResult
 from deplodock.compiler.program.gpu import GpuBuffer, GpuLaunch, GpuProgram  # noqa: F401 — re-export
 
@@ -53,7 +55,7 @@ def generate_source(
     mode: str = "benchmark",
     num_iters: int = 10,
     warmup: int = 3,
-    input_data: dict[str, list[float]] | None = None,
+    input_data: dict[str, np.ndarray] | None = None,
 ) -> str:
     """Generate a complete .cu program from a Program spec.
 
@@ -330,18 +332,16 @@ def compile_program(source: str, arch: str | None = None) -> Path:
     return binary
 
 
-def run_program(program: GpuProgram, input_data: dict[str, list[float]] | None = None) -> ProgramResult:
+def run_program(program: GpuProgram, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
     """Generate, compile, and run a Program. Returns outputs + timing."""
     source = generate_source(program, mode="run", input_data=input_data)
     binary = compile_program(source)
 
     # Write input data files next to the binary if provided.
     if input_data:
-        import struct
-
         for buf_name, vals in input_data.items():
             data_path = binary.parent / f"{buf_name}.bin"
-            data_path.write_bytes(struct.pack(f"{len(vals)}f", *vals))
+            data_path.write_bytes(np.ascontiguousarray(vals, dtype=np.float32).tobytes())
 
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120, cwd=str(binary.parent))
     if result.returncode != 0:

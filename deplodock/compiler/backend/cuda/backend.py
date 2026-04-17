@@ -29,8 +29,7 @@ class CudaBackend(Backend):
 
     def run(self, compiled: GpuProgram, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
         """Execute the compiled program; returns outputs as ndarrays with declared shapes."""
-        flat_input = {k: np.asarray(v, dtype=np.float32).flatten().tolist() for k, v in (input_data or {}).items()}
-        result = run_program(compiled, input_data=flat_input)
+        result = run_program(compiled, input_data=input_data)
         outputs: dict[str, np.ndarray] = {}
         for name, vals in result.outputs.items():
             shape = tuple(int(d) for d in compiled.shape(name))
