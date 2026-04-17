@@ -35,9 +35,9 @@ def _handle_run(args):
     compiled = backend.compile(graph)
 
     if dump:
-        dump.dump_program(compiled.gpu)
+        dump.dump_program(compiled)
 
-    logger.info("Compiled %s: %d kernels", ir_path.name, len(compiled.loop.launches))
+    logger.info("Compiled %s: %d kernels", ir_path.name, len(compiled.launches))
 
     if args.benchmark:
         result = backend.benchmark(compiled, num_iters=args.iters)

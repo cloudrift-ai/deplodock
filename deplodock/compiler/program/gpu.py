@@ -19,12 +19,24 @@ from dataclasses import dataclass, field
 
 @dataclass
 class GpuBuffer:
-    """GPU buffer specification."""
+    """GPU buffer specification.
+
+    ``shape`` carries the buffer's declared shape; ``size`` is the derived
+    element count.
+    """
 
     name: str
-    size: int  # total number of elements
+    shape: tuple[int | str, ...]
     dtype: str = "float"
     role: str = "scratch"  # "input" | "output" | "constant" | "scratch"
+
+    @property
+    def size(self) -> int:
+        """Element count. Requires concrete int dims."""
+        n = 1
+        for d in self.shape:
+            n *= int(d)
+        return n
 
 
 @dataclass
@@ -53,6 +65,17 @@ class GpuProgram:
     # target's device pointer (no separate allocation). Used for
     # reshape/transpose which are metadata-only ops.
     aliases: dict[str, str] = field(default_factory=dict)
+    # Scalar constant values captured at trace time (graph-input role
+    # buffers with a compile-time scalar). Callers (e.g. fixtures) may
+    # auto-inject these at run time so tests don't have to supply them.
+    constant_values: dict[str, float] = field(default_factory=dict)
+
+    def shape(self, name: str) -> tuple:
+        """Return the declared shape of the named buffer."""
+        for b in self.buffers:
+            if b.name == name:
+                return tuple(b.shape)
+        raise KeyError(f"Buffer {name!r} not in GpuProgram")
 
     def pretty_print(self) -> str:
         """Human-readable program listing: buffers, aliases, launch schedule."""

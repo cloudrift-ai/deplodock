@@ -57,7 +57,7 @@ def compile_kernels(program: LoopProgram) -> GpuProgram:
     buf_names = {b.name for b in program.buffers}
     referenced |= set(program.graph_constants) & buf_names
 
-    buffers = [GpuBuffer(name=b.name, size=_numel(b.shape), dtype="float", role=b.role) for b in program.buffers if b.name in referenced]
+    buffers = [GpuBuffer(name=b.name, shape=tuple(b.shape), dtype="float", role=b.role) for b in program.buffers if b.name in referenced]
 
     launches: list[CudaLaunch] = []
     for i, launch in enumerate(program.launches):
@@ -73,7 +73,12 @@ def compile_kernels(program: LoopProgram) -> GpuProgram:
         grid, block = _launch_config(launch, program)
         launches.append(CudaLaunch(kernel_source=source, kernel_name=kname, grid=grid, block=block, args=arg_order))
 
-    return GpuProgram(name=program.name, buffers=buffers, launches=launches)
+    return GpuProgram(
+        name=program.name,
+        buffers=buffers,
+        launches=launches,
+        constant_values=dict(program.constant_values),
+    )
 
 
 # ---------------------------------------------------------------------------

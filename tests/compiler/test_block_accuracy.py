@@ -53,7 +53,7 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32):
 
     # Build input data.
     input_data: dict[str, list[float]] = {}
-    for buf in compiled.gpu.buffers:
+    for buf in compiled.buffers:
         if buf.role == "input":
             if buf.name == "hidden_states":
                 input_data[buf.name] = x.cpu().flatten().tolist()
@@ -67,8 +67,8 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32):
                 if safe_key.endswith(buf.name[2:]) and param.numel() == buf.size:
                     input_data[buf.name] = param.detach().cpu().flatten().tolist()
                     break
-            if buf.name not in input_data and buf.name in compiled.loop.constant_values:
-                input_data[buf.name] = [compiled.loop.constant_values[buf.name]]
+            if buf.name not in input_data and buf.name in compiled.constant_values:
+                input_data[buf.name] = [compiled.constant_values[buf.name]]
 
     # Run.
     run_result = backend.run(compiled, input_data=input_data)
@@ -125,7 +125,7 @@ def test_qwen_block_accuracy():
     compiled = backend.compile(graph)
 
     input_data: dict[str, list[float]] = {}
-    for buf in compiled.gpu.buffers:
+    for buf in compiled.buffers:
         if buf.role == "input":
             if buf.name == "hidden_states":
                 input_data[buf.name] = x.flatten().tolist()
@@ -139,8 +139,8 @@ def test_qwen_block_accuracy():
                 if safe_key.endswith(buf.name[2:]) and param.numel() == buf.size:
                     input_data[buf.name] = param.detach().cpu().float().flatten().tolist()
                     break
-            if buf.name not in input_data and buf.name in compiled.loop.constant_values:
-                input_data[buf.name] = [compiled.loop.constant_values[buf.name]]
+            if buf.name not in input_data and buf.name in compiled.constant_values:
+                input_data[buf.name] = [compiled.constant_values[buf.name]]
 
     run_result = backend.run(compiled, input_data=input_data)
     deplodock_flat = list(run_result.outputs.values())[0]

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.backend.cuda.backend import CompiledCudaProgram, CudaBackend
+from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
@@ -93,29 +93,29 @@ def _softmax_program() -> LoopProgram:
 
 def test_pointwise_emits_correct_source():
     compiled = CudaBackend().compile(_pointwise_add_graph())
-    assert len(compiled.gpu.launches) == 1
-    source = compiled.gpu.launches[0].kernel_source
+    assert len(compiled.launches) == 1
+    source = compiled.launches[0].kernel_source
     assert "blockIdx.x" in source
     assert "x[" in source and "y[" in source
 
 
 def test_reduce_emits_k_loop():
     compiled = CudaBackend().compile(_reduce_sum_graph())
-    source = compiled.gpu.launches[0].kernel_source
+    source = compiled.launches[0].kernel_source
     assert "for (int" in source
     assert "+=" in source
 
 
 def test_contraction_emits_matmul():
     compiled = CudaBackend().compile(_matmul_graph())
-    source = compiled.gpu.launches[-1].kernel_source
+    source = compiled.launches[-1].kernel_source
     assert "for (int k" in source
     assert "acc0 +=" in source
 
 
 def test_buffer_roles():
     compiled = CudaBackend().compile(_pointwise_add_graph())
-    roles = {b.name: b.role for b in compiled.gpu.buffers}
+    roles = {b.name: b.role for b in compiled.buffers}
     assert roles.get("x") == "input"
     assert roles.get("y") == "input"
 
@@ -157,8 +157,7 @@ def test_chained_pointwise_single_kernel():
     g.outputs = ["n"]
 
     compiled = CudaBackend().compile(g)
-    assert len(compiled.loop.launches) == 1
-    assert len(compiled.gpu.launches) == 1
+    assert len(compiled.launches) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -184,15 +183,14 @@ def test_reduce_runs_on_gpu():
 
 @requires_cuda
 def test_softmax_runs_on_gpu():
-    """Softmax from a hand-built LoopProgram (no Graph). Uses compile_kernels directly
-    and wraps in a CompiledCudaProgram manually."""
+    """Softmax from a hand-built LoopProgram (no Graph). Uses compile_kernels
+    directly — the resulting GpuProgram is what CudaBackend.run/run_arrays expects."""
     import math
 
     from deplodock.compiler.backend.cuda.emit import compile_kernels
 
     loop_program = _softmax_program()
-    gpu_program = compile_kernels(loop_program)
-    compiled = CompiledCudaProgram(gpu=gpu_program, loop=loop_program)
+    compiled = compile_kernels(loop_program)
     x_data = [float(i) for i in range(32)]
     result = CudaBackend().run(compiled, input_data={"x": x_data})
     expected = []
