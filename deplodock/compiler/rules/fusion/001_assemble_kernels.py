@@ -126,43 +126,63 @@ def _build_input_tree(graph: Graph, external_inputs: list[str], consumed: set[st
     idx = 0
 
     for buf_id in external_inputs:
-        node = graph.nodes.get(buf_id)
-
-        if node is not None and isinstance(node.op, IndexMapOp) and len(node.op.sources) == 1:
-            # Follow IndexMapOp chain to find ultimate non-IndexMapOp source.
-            chain = [buf_id]
-            cur_id = node.inputs[node.op.sources[0].input_idx]
-            while cur_id in graph.nodes:
-                cur_node = graph.nodes[cur_id]
-                if isinstance(cur_node.op, IndexMapOp) and len(cur_node.op.sources) == 1:
-                    chain.append(cur_id)
-                    cur_id = cur_node.inputs[cur_node.op.sources[0].input_idx]
-                else:
-                    break
-            if cur_id in consumed:
-                # Internal chain — remap all to the consumed source's $N.
-                # Find which $N the source already has.
-                src_ref = remap.get(cur_id, cur_id)
-                for nid in chain:
-                    consumed.add(nid)
-                    remap[nid] = src_ref
-                continue
-            # External source — absorb this IndexMapOp into Port.
-            src_id = node.inputs[node.op.sources[0].input_idx]
-            if len(graph.consumers(buf_id)) == 1:
-                consumed.add(buf_id)
-                ref = f"${idx}"
-                ports.append(Port(indexmap=node.op))
-                input_names.append(src_id)
-                remap[buf_id] = ref
-                idx += 1
-                continue
-
-        # Plain port (no IndexMapOp absorption).
-        ref = f"${idx}"
-        ports.append(Port())
-        input_names.append(buf_id)
-        remap[buf_id] = ref
+        new_port = _emit_port_for_external(graph, buf_id, consumed, remap, idx)
+        if new_port is None:
+            continue
+        port, input_name = new_port
+        ports.append(port)
+        input_names.append(input_name)
+        remap[buf_id] = f"${idx}"
         idx += 1
 
     return ports, remap, input_names
+
+
+def _emit_port_for_external(
+    graph: Graph,
+    buf_id: str,
+    consumed: set[str],
+    remap: dict[str, str],
+    idx: int,
+) -> tuple[Port, str] | None:
+    """Build one Port for a single external input.
+
+    Returns ``(port, input_name)`` where ``input_name`` is the buffer name
+    the Port should bind to at the program level, and ``port`` is the Port
+    to append (with any IndexMapOp absorbed into ``port.indexmap``).
+
+    Returns ``None`` when ``buf_id`` has been folded into an internal
+    reference (IndexMap chain terminating at an already-consumed node) —
+    the caller should skip appending a new Port.
+
+    Side effects: mutates ``consumed`` to mark folded-in IndexMapOp nodes,
+    and ``remap`` when folding to an internal source.
+    """
+    node = graph.nodes.get(buf_id)
+
+    if node is not None and isinstance(node.op, IndexMapOp) and len(node.op.sources) == 1:
+        # Follow IndexMapOp chain to find ultimate non-IndexMapOp source.
+        chain = [buf_id]
+        cur_id = node.inputs[node.op.sources[0].input_idx]
+        while cur_id in graph.nodes:
+            cur_node = graph.nodes[cur_id]
+            if isinstance(cur_node.op, IndexMapOp) and len(cur_node.op.sources) == 1:
+                chain.append(cur_id)
+                cur_id = cur_node.inputs[cur_node.op.sources[0].input_idx]
+            else:
+                break
+        if cur_id in consumed:
+            # Internal chain — remap all to the consumed source's $N.
+            src_ref = remap.get(cur_id, cur_id)
+            for nid in chain:
+                consumed.add(nid)
+                remap[nid] = src_ref
+            return None
+        # External source — absorb this IndexMapOp into Port.
+        src_id = node.inputs[node.op.sources[0].input_idx]
+        if len(graph.consumers(buf_id)) == 1:
+            consumed.add(buf_id)
+            return Port(indexmap=node.op), src_id
+
+    # Plain port (no IndexMapOp absorption).
+    return Port(), buf_id

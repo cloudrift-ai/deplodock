@@ -75,13 +75,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 
     Works for both flat (pointwise) and reduce kernels.
     """
-    # Build $N → Port mapping.
-    input_ports: dict[str, Port] = {}
-    port_idx = 0
-    for inp in kernel.inputs:
-        if isinstance(inp, Port):
-            input_ports[f"${port_idx}"] = inp
-            port_idx += 1
+    input_ports = _collect_input_ports(kernel)
     has_reduce = any(isinstance(a.op, ReduceOp) for a in kernel.body)
 
     # --- Reduction geometry (None for flat) ---
@@ -196,6 +190,21 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 # ---------------------------------------------------------------------------
 # Segment helpers
 # ---------------------------------------------------------------------------
+
+
+def _collect_input_ports(kernel: LoopOp) -> dict[str, Port]:
+    """Build $N → Port mapping for the kernel's top-level Port inputs.
+
+    Non-Port inputs (Mux, Combine) are skipped — they're handled by the
+    codegen walker directly. Used for shape analysis on flat Port reads.
+    """
+    input_ports: dict[str, Port] = {}
+    port_idx = 0
+    for inp in kernel.inputs:
+        if isinstance(inp, Port):
+            input_ports[f"${port_idx}"] = inp
+            port_idx += 1
+    return input_ports
 
 
 def _split_at_reduces(body: tuple[Assign, ...]) -> list[list[Assign]]:
