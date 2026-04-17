@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from deplodock.compiler.backend import Backend, BenchmarkResult, ProgramResult
+from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.loop import Combine, LoopInput, LoopOp, Mux, Port
 from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
@@ -52,20 +52,7 @@ class LoopBackend(Backend):
     def run_arrays(self, compiled: WrappedLoopProgram, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
         return _execute(compiled.program, input_data or {})
 
-    def benchmark(self, compiled: WrappedLoopProgram, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
-        for _ in range(warmup):
-            _execute(compiled.program, {})
-        times = []
-        for _ in range(num_iters):
-            t0 = time.perf_counter()
-            _execute(compiled.program, {})
-            times.append((time.perf_counter() - t0) * 1000)
-        return BenchmarkResult(
-            time_ms=sum(times) / len(times),
-            min_ms=min(times),
-            max_ms=max(times),
-            num_launches=len(compiled.program.launches),
-        )
+    # ``benchmark`` inherits the default wall-time loop from ``Backend``.
 
 
 # ---------------------------------------------------------------------------

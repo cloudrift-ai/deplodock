@@ -10,13 +10,16 @@ import time
 
 import numpy as np
 
-from deplodock.compiler.backend import Backend, BenchmarkResult, ProgramResult
+from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph
 
 
 class NumpyBackend(Backend):
-    """Numpy backend: Graph → in-memory interpreter → numpy arrays."""
+    """Numpy backend: Graph → in-memory interpreter → numpy arrays.
+
+    Inherits the default wall-time ``benchmark`` from ``Backend``.
+    """
 
     def compile(self, graph: Graph) -> NumpyProgram:
         """Wrap the graph for execution. Input data is supplied at run time."""
@@ -33,25 +36,6 @@ class NumpyBackend(Backend):
     def run_arrays(self, compiled: NumpyProgram, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
         """Execute the graph and return outputs as numpy arrays."""
         return _execute(compiled.graph, input_data or {})
-
-    def benchmark(self, compiled: NumpyProgram, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
-        """Execute the graph repeatedly and return timing stats.
-
-        Uses empty input_data; intended only for measuring compiler overhead,
-        not real workload timing (the numpy backend is not a performance path).
-        """
-        for _ in range(warmup):
-            _execute(compiled.graph, {})
-        times = []
-        for _ in range(num_iters):
-            t0 = time.perf_counter()
-            _execute(compiled.graph, {})
-            times.append((time.perf_counter() - t0) * 1000)
-        return BenchmarkResult(
-            time_ms=sum(times) / len(times),
-            min_ms=min(times),
-            max_ms=max(times),
-        )
 
 
 class NumpyProgram:
