@@ -35,7 +35,7 @@ from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
 # TODO: FusedRegionOp no longer exists in the structural IR; this bench
-# script predates the KernelOp refactor and needs porting before it can run.
+# script predates the LoopOp refactor and needs porting before it can run.
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -96,7 +96,7 @@ def _lower_matmul(graph: Graph):
     input_a = graph.nodes[ew_node.inputs[0]]
     input_b = graph.nodes[ew_node.inputs[1]]
     a_name, b_name, c_name = input_a.output.name, input_b.output.name, out_node.output.name
-    region = FusedRegionOp(  # noqa: F821  (see TODO above — script pre-dates KernelOp refactor)
+    region = FusedRegionOp(  # noqa: F821  (see TODO above — script pre-dates LoopOp refactor)
         region_ops=[(ew_node.id, ew_node.op, [a_name, b_name]), (out_node.id, out_node.op, [ew_node.id])],
         input_names=[a_name, b_name],
         output_names=[c_name],

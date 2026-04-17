@@ -1,14 +1,18 @@
-"""Kernel IR: imperative C-like AST for GPU kernel code generation.
+"""GPU IR: imperative C-like AST for GPU kernel code generation.
 
 The last IR before textual C/C++ source. Nodes represent generic C/C++
 constructs (variables, loops, array accesses, function calls) that can be
 emitted as CUDA, HIP, or any C-like GPU language by a matching codegen
 printer (see ``backend/kernel_codegen.py``).
 
-Builds on the shared expression AST from ``ir.expr``; adds kernel-specific
+Builds on the shared expression AST from ``ir.expr``; adds GPU-specific
 expression nodes (``ArrayAccess``, ``Cast``, ``FieldAccess``, ``VectorLoad``)
 and a hierarchy of statement types (``VarDecl``, ``Assign``, ``ForLoop``,
 ``IfStmt``, ``SyncThreads``, ``ArrayDecl``, ``PragmaUnroll``, ``RawCode``).
+
+One ``GpuKernel`` corresponds to one ``LoopOp`` (``ir/loop.py``) after
+codegen; the ``compiler/program/gpu.py`` ``GpuProgram`` is the
+program-level form that bundles many ``GpuKernel`` launches.
 """
 
 from __future__ import annotations
@@ -26,8 +30,6 @@ from deplodock.compiler.ir.expr import (
     _ExprOps,
 )
 
-# Re-export shared types so existing ``from kernel_ir import Var`` style
-# works after the move.
 __all__ = [
     # Shared expression types (re-exported)
     "Var",
@@ -38,12 +40,12 @@ __all__ = [
     "Ternary",
     "Expr",
     "_ExprOps",
-    # Kernel-specific expression types
+    # GPU-specific expression types
     "ArrayAccess",
     "Cast",
     "FieldAccess",
     "VectorLoad",
-    "KernelExpr",
+    "GpuExpr",
     # Statements
     "VarDecl",
     "Assign",
@@ -57,14 +59,14 @@ __all__ = [
     "RawCode",
     "Stmt",
     # Kernel definition
-    "KernelParam",
-    "KernelDef",
+    "GpuKernelParam",
+    "GpuKernel",
     # Utilities
     "pretty_print",
 ]
 
 # ---------------------------------------------------------------------------
-# Kernel-specific expression types
+# GPU-specific expression types
 # ---------------------------------------------------------------------------
 
 
@@ -104,7 +106,7 @@ class VectorLoad(_ExprOps):
     width: int = 4  # 2 or 4
 
 
-KernelExpr = Expr | ArrayAccess | Cast | FieldAccess | VectorLoad
+GpuExpr = Expr | ArrayAccess | Cast | FieldAccess | VectorLoad
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +120,7 @@ class VarDecl:
 
     dtype: str
     name: str
-    init: KernelExpr | None = None
+    init: GpuExpr | None = None
 
 
 @dataclass
@@ -126,7 +128,7 @@ class Assign:
     """Array element assignment: target[index] = value."""
 
     target: ArrayAccess
-    value: KernelExpr
+    value: GpuExpr
 
 
 @dataclass
@@ -134,7 +136,7 @@ class VarAssign:
     """Plain variable reassignment: name = value."""
 
     name: str
-    value: KernelExpr
+    value: GpuExpr
 
 
 @dataclass
@@ -143,7 +145,7 @@ class AugAssign:
 
     target: str
     op: str  # "+=", "-=", "*="
-    value: KernelExpr
+    value: GpuExpr
 
 
 @dataclass
@@ -151,17 +153,17 @@ class ForLoop:
     """C-style for loop: for (int var = start; var < end; var += step)."""
 
     var: str
-    start: KernelExpr
-    end: KernelExpr
+    start: GpuExpr
+    end: GpuExpr
     body: list[Stmt]
-    step: KernelExpr | None = None  # None = var++ (increment by 1)
+    step: GpuExpr | None = None  # None = var++ (increment by 1)
 
 
 @dataclass
 class IfStmt:
     """If statement with optional else."""
 
-    cond: KernelExpr
+    cond: GpuExpr
     body: list[Stmt]
     else_body: list[Stmt] | None = None
 
@@ -178,7 +180,7 @@ class ArrayDecl:
     dtype: str  # "__shared__ float", "float", "float4"
     name: str
     dimensions: list[int]  # [64, 64] for 2D, [256] for 1D
-    init: KernelExpr | None = None
+    init: GpuExpr | None = None
 
 
 @dataclass
@@ -204,19 +206,19 @@ Stmt = VarDecl | Assign | VarAssign | AugAssign | ForLoop | IfStmt | SyncThreads
 
 
 @dataclass
-class KernelParam:
-    """Kernel function parameter."""
+class GpuKernelParam:
+    """GPU kernel function parameter."""
 
     dtype: str  # "float*", "int", etc.
     name: str
 
 
 @dataclass
-class KernelDef:
-    """__global__ kernel function."""
+class GpuKernel:
+    """One ``__global__`` GPU kernel function — the last IR node before C source."""
 
     name: str
-    params: list[KernelParam]
+    params: list[GpuKernelParam]
     body: list[Stmt]
     block_size: tuple[int, int, int] = (16, 16, 1)
     includes: list[str] | None = None  # Extra #include headers
@@ -237,8 +239,8 @@ class KernelDef:
 _INDENT = "  "
 
 
-def pretty_print(kernel: KernelDef) -> str:
-    """Human-readable text dump of a KernelDef AST."""
+def pretty_print(kernel: GpuKernel) -> str:
+    """Human-readable text dump of a GpuKernel AST."""
     lines: list[str] = []
     params = ", ".join(f"{p.dtype} {p.name}" for p in kernel.params)
     bx, by, bz = kernel.block_size
@@ -253,8 +255,8 @@ def pretty_print(kernel: KernelDef) -> str:
     return "\n".join(lines)
 
 
-def _pp_expr(expr: KernelExpr) -> str:
-    """Pretty-print a KernelExpr as a compact string."""
+def _pp_expr(expr: GpuExpr) -> str:
+    """Pretty-print a GpuExpr as a compact string."""
     if isinstance(expr, Var):
         return expr.name
     if isinstance(expr, Literal):

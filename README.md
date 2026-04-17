@@ -24,7 +24,7 @@ Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLa
     - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
     - [pull.py](deplodock/commands/pull.py) — `pull` command (download HF model)
     - [trace.py](deplodock/commands/trace.py) — `trace` command (PyTorch → Graph IR)
-    - [compile.py](deplodock/commands/compile.py) — `compile` command (structural lowering to `KernelOp`s)
+    - [compile.py](deplodock/commands/compile.py) — `compile` command (structural lowering to a `LoopProgram`)
     - [inspect_graph.py](deplodock/commands/inspect_graph.py) — `inspect` command (graph summary)
   - [scripts/](scripts/) — Standalone benchmark scripts
     - [bench_matmul.py](scripts/bench_matmul.py) — single matmul benchmark

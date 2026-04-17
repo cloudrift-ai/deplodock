@@ -1,43 +1,42 @@
 # CUDA Backend Architecture
 
-The CUDA backend turns a list of structural `KernelOp`s (produced by
-`deplodock.compiler.lower`) into a runnable `Program` — one `CudaLaunch`
-per kernel. Source generation is a **recursive descent** over the
-structural IR; there's no classification pass, no `Schedule` dataclass,
-and no intermediate `LoopIR` stage.
+The CUDA backend lowers a `LoopProgram` (produced by
+`deplodock.compiler.pipeline.compile_graph`) into a runnable `GpuProgram` —
+one `CudaLaunch` per kernel. Source generation is a **recursive descent**
+over the structural IR; there's no classification pass, no `Schedule`
+dataclass, and no intermediate `LoopIR` stage.
 
 ## Module Layout
 
 ```
 cuda/
-├── backend.py   # CudaBackend(Backend): compile(list[KernelOp]) → Program
-├── emit.py      # emit_kernel(KernelOp, name) → KernelDef (recursive descent)
-├── program.py   # CudaLaunch, generate_source(), nvcc compilation + run
+├── backend.py   # CudaBackend(Backend): compile(LoopProgram) → GpuProgram
+├── emit.py      # compile_kernels(LoopProgram) → GpuProgram
+│                #   emit_kernel(LoopLaunch, name, LoopProgram) → GpuKernel
+├── program.py   # CudaLaunch(GpuLaunch), generate_source(), nvcc + run
 └── runner.py    # Single-kernel compile + run + benchmark harness
 ```
 
-Shared infrastructure (backend-agnostic) lives in
-`deplodock/compiler/backend/ir/`:
+Shared infrastructure (backend-agnostic) lives in two places:
 
 ```
-backend/ir/
-├── expr.py           # Var, Literal, BinOp, Ternary, FuncCall
-├── kernel_ir.py      # KernelDef, Stmt (VarDecl / Assign / ForLoop / IfStmt / ...)
-└── kernel_codegen.py # KernelDef → C source
+compiler/ir/gpu.py         # GpuKernel, GpuKernelParam, Stmt hierarchy, expressions
+compiler/program/gpu.py    # GpuBuffer, GpuLaunch, GpuProgram (runnable program form)
+backend/kernel_codegen.py  # GpuKernel → C source (up one level; not CUDA-specific)
 ```
 
 ## Emission Pipeline
 
 ```
-list[KernelOp]
+LoopProgram
     │
-    │  compile_kernels(kernels, graph_inputs, graph_outputs)
-    │    for each KernelOp:
-    │      emit.emit_kernel(k, name) → (KernelDef, arg_order)
-    │      kernel_codegen.emit_kernel(KernelDef) → C source string
+    │  compile_kernels(loop_program)
+    │    for each LoopLaunch in loop_program.launches:
+    │      emit.emit_kernel(launch, name, loop_program) → (GpuKernel, arg_order)
+    │      kernel_codegen.emit_kernel(GpuKernel) → C source string
     │      wrap as CudaLaunch(kernel_source, grid, block, args)
     ▼
-Program
+GpuProgram
     │  generate_source(program)
     ▼
 .cu  →  nvcc  →  GPU
@@ -45,11 +44,12 @@ Program
 
 ## Walkers and Emitters in `emit.py`
 
-The emitter walks `KernelOp`'s SSA `body` (a sequence of `Assign`
+The emitter walks each `LoopOp`'s SSA `body` (a sequence of `Assign`
 statements). Each `Assign` is `name = op(args)` where args reference
-input `Port.buffer_id`s or prior `Assign` names.
+input Ports by `$N` position or prior `Assign.name`s; the `$N` → buffer
+name mapping lives on the `LoopLaunch`.
 
-**Input-tree walker** (`_emit_input_value`): evaluates a `KernelInput`
+**Input-tree walker** (`_emit_input_value`): evaluates a `LoopInput`
 at a coord `Expr`, appending temporaries to a `list[Stmt]`.
 
 | IR variant  | Emission                                                    |
@@ -59,16 +59,28 @@ at a coord `Expr`, appending temporaries to a `list[Stmt]`.
 | `Combine`   | Temporaries for each source + `VarDecl` fold over ops chain |
 
 **Body emitter**: unified `_emit_body` dispatches based solely on the
-presence of `ReduceOp` in the SSA body:
+presence of `ReduceOp` in the SSA body (via `backend.kernel_plan`):
 
-| Pattern                    | Emitter          | Emission                                                      |
-| -------------------------- | ---------------- | ------------------------------------------------------------- |
-| No ReduceOp (pointwise)    | `_emit_flat`     | 1D grid; 256 threads/block; inline elementwise per Assign     |
-| ReduceOp present           | `_emit_segments` | 1 block/row; segment-based K-loops with recomputation         |
+| Pattern                    | Emitter path          | Emission                                                      |
+| -------------------------- | --------------------- | ------------------------------------------------------------- |
+| No ReduceOp (pointwise)    | `Inline` steps only   | 1D grid; 256 threads/block; inline elementwise per Assign     |
+| ReduceOp present           | `Loop` + `Inline`     | 1 block/row; segment-based K-loops with recomputation         |
 
-Contractions (matmul = mul + sum) go through `_emit_segments` naturally:
+Contractions (matmul = mul + sum) go through the `Loop` path naturally:
 the `mul` is an elementwise Assign inside the K-loop, and the `sum` is
 the segment's ReduceOp accumulator. No special detection or classification.
+
+## Shape handling
+
+Shapes are read from the `LoopProgram`, never recomputed:
+
+- `program.shape(name)` — per-buffer shape lookup.
+- `program.dollar_shapes(launch)` — `$N → shape` map for a launch's Ports,
+  already honoring `Port.indexmap.out_shape` overrides.
+- `program.output_shape(launch)` — shape of the launch's output buffer.
+
+No fallback call to `LoopOp.infer_output_shape(...)` happens in the
+codegen path.
 
 ## Naive Schedule Policy
 
@@ -91,18 +103,19 @@ follow-up commits.
 
 ## Buffer Roles
 
-`CudaBackend.compile(kernels, graph_inputs=..., graph_outputs=...)`
-marks buffers as `input` / `output` / `scratch` based on whether the
-buffer-id appears in the caller-supplied graph-boundary sets. Any
-buffer produced by one kernel and consumed by another is `scratch`.
+`LoopProgram.from_graph` assigns each buffer a `role` based on graph-level
+position (`input` / `output` / `constant` / `scratch`). `compile_kernels`
+filters to buffers actually referenced by some launch (or a referenced
+graph constant) when emitting `GpuBuffer`s.
 
 ## Constraints to Preserve
 
 - `emit.py` must not import `backend.cuda.generators` or
   `backend.cuda.schedule` (deleted). The recursive-descent emitter is
   the only code path.
-- A new backend (ROCm, SYCL, ...) reuses `backend/ir/*` wholesale;
-  only the per-variant walkers in its emit.py need to be rewritten.
-- The structural IR types (`KernelOp`, `Port`, `Mux`, `Combine`, ...)
-  stay backend-agnostic — do NOT import from `backend/cuda/` into
-  `ops.py` or `lower.py`.
+- A new backend (ROCm, SYCL, ...) reuses `ir/gpu.py`, `program/gpu.py`,
+  and `backend/kernel_codegen.py` wholesale; only its own `emit.py` /
+  `program.py` need to be rewritten.
+- The loop-IR types (`LoopOp`, `Port`, `Mux`, `Combine`, ...) stay
+  backend-agnostic — do NOT import from `backend/cuda/` into `ir/loop.py`
+  or `program/loop.py`.

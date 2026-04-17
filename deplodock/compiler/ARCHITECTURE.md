@@ -18,42 +18,43 @@
 │                                                                  │
 │  RULE: No GPU, no CUDA, no backend imports.                      │
 ├──────────────────────────────────────────────────────────────────┤
-│  LAYER 2 · Lowering → structural KernelOps                       │
+│  LAYER 2 · Lowering → LoopProgram                                │
 │                                                                  │
-│  lower.py:   extract_kernels(graph) -> list[KernelOp]            │
-│  pipeline.py: compile_graph(graph) -> CompileResult              │
-│    CompileResult: kernels + graph_inputs/outputs/constants       │
+│  pipeline.py: compile_graph(graph) -> LoopProgram                │
+│    LoopProgram (program/loop.py):                                │
+│       LoopBuffer (shape, role) × N                               │
+│       LoopLaunch (LoopOp + input/output buffer names) × N        │
+│       + graph_inputs/outputs/constants/constant_values           │
 │                                                                  │
-│  Each KernelOp (ir/block.py) is one GPU kernel as an SSA program:│
+│  Each LoopOp (ir/loop.py) is one GPU kernel as an SSA program:   │
 │      inputs (Port | Mux | Combine) →                             │
 │        body (tuple[Assign, ...])  — SSA: name = op(args) →       │
 │        outputs (Port | Mux)                                      │
 │  Contraction (matmul) is lowered as mul + reduce_sum Assigns.    │
 │                                                                  │
-│  RULE: Operates on Graph + KernelOp IR only. No backend imports. │
+│  RULE: Operates on Graph + Loop IR only. No backend imports.     │
 ├──────────────────────────────────────────────────────────────────┤
 │  LAYER 3 · Backend (emit + run)                                  │
 │                                                                  │
 │  backend/base.py:           Backend ABC (compile, run, benchmark)│
-│  backend/program.py:        Buffer, Launch, Program              │
-│  backend/kernel_codegen.py: KernelDef → C source                 │
-│  backend/cuda/emit.py:      KernelOp → KernelDef via recursive   │
-│                              descent; no classification.         │
-│  backend/cuda/backend.py:   CudaBackend.compile(list[KernelOp])  │
-│  backend/cuda/program.py:   generate_source, nvcc, run           │
+│  backend/kernel_codegen.py: GpuKernel → C source                 │
+│  backend/cuda/emit.py:      LoopProgram → GpuProgram             │
+│  backend/cuda/backend.py:   CudaBackend.compile(LoopProgram)     │
+│  backend/cuda/program.py:   CudaLaunch(GpuLaunch), nvcc, run     │
 │  backend/cuda/runner.py:    single-kernel compile + run harness  │
 │                                                                  │
-│  The imperative C-like kernel AST itself lives upstream in       │
-│  ir/kernel.py (KernelDef, Stmt, ArrayAccess, ...), so the        │
-│  backend only *consumes* it.                                     │
+│  Program forms (shared across backends):                         │
+│      program/loop.py: LoopProgram + LoopBuffer + LoopLaunch      │
+│      program/gpu.py:  GpuProgram + GpuBuffer + GpuLaunch         │
+│  The imperative C-like kernel AST lives upstream in ir/gpu.py    │
+│  (GpuKernel, Stmt, ArrayAccess, ...); the backend consumes it.   │
 │                                                                  │
 │  RULE: GPU specifics live here; everything above is portable.    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 See `ir/ARCHITECTURE.md` for the per-dialect breakdown of each IR level,
-what ops are legal at each stage, and the invariants the rewriter
-establishes between stages.
+and `program/ARCHITECTURE.md` for the Program-form pairing.
 
 ## Canonical Data Flow
 
@@ -62,47 +63,48 @@ PyTorch module
    │  torch_trace.trace_module(...)
    ▼
 Graph (Layer 1)
-   │  pipeline.compile_graph(graph)  →  CompileResult
+   │  pipeline.compile_graph(graph)  →  LoopProgram
    ▼
-CompileResult (Layer 2: kernels + metadata)
-   │  CudaBackend.compile(result.kernels, graph_inputs, graph_outputs)
-   │    └─ for k in kernels:
-   │         emit.emit_kernel(k, name)  → KernelDef
-   │         kernel_codegen.emit_kernel(KernelDef) → C source
-   │         wrap as CudaLaunch, collect in Program
+LoopProgram (Layer 2: LoopBuffers + LoopLaunches)
+   │  CudaBackend.compile(loop_program)
+   │    └─ for launch in loop_program.launches:
+   │         emit.emit_kernel(launch, name, loop_program)  → GpuKernel
+   │         kernel_codegen.emit_kernel(GpuKernel) → C source
+   │         wrap as CudaLaunch, collect in GpuProgram
    ▼
-Program (Layer 3)
-   │  program.generate_source(program)
+GpuProgram (Layer 3)
+   │  backend/cuda/program.generate_source(program)
    ▼
 .cu  →  nvcc  →  GPU
 ```
 
-## Structural KernelOp Cheat Sheet
+## Structural LoopOp Cheat Sheet
 
-SSA invariants are enforced by `KernelOp.__post_init__`: unique names,
+SSA invariants are enforced by `LoopOp.__post_init__`: unique names,
 defined-before-use, no forward references.
 
 | Slot                          | Type                                     | Used for                                                            |
 | ----------------------------- | ---------------------------------------- | ------------------------------------------------------------------- |
-| `Port.buffer_id`              | `str`                                    | External buffer read/write                                          |
 | `Port.indexmap`               | `IndexMapOp \| None`                     | Layout transform at the load/store                                  |
-| `Mux.branches[i].input`       | `KernelInput` (recursive)                | Dispatched read (cat, RoPE halves, KV cache)                        |
+| `Mux.branches[i].input`       | `LoopInput` (recursive)                  | Dispatched read (cat, RoPE halves, KV cache)                        |
 | `Mux.branches[i].select`      | `Expr` (from `ir/expr`)                  | Output-coord predicate                                              |
-| `Combine.sources`             | `tuple[KernelInput, ...]`                | N sub-inputs to an elementwise chain                                |
+| `Combine.sources`             | `tuple[LoopInput, ...]`                  | N sub-inputs to an elementwise chain                                |
 | `Combine.ops`                 | `tuple[ElementwiseOp, ...]`              | Per-coord elementwise work                                          |
 | `Assign.name`                 | `str`                                    | SSA value name                                                      |
 | `Assign.op`                   | `ElementwiseOp \| ReduceOp`              | The operation to apply                                              |
-| `Assign.args`                 | `tuple[str, ...]`                        | References to input Port buffer_ids or prior Assign names           |
-| `KernelOp.inputs`             | `tuple[KernelInput, ...]`                | Port, Mux, or Combine input trees                                   |
-| `KernelOp.body`               | `tuple[Assign, ...]`                     | SSA body: name = op(args)                                           |
-| `KernelOp.outputs`            | `tuple[KernelOutput, ...]`               | Port or Mux output targets                                          |
+| `Assign.args`                 | `tuple[str, ...]`                        | References to input Ports (`$N`) or prior Assign names              |
+| `LoopOp.inputs`               | `tuple[LoopInput, ...]`                  | Port, Mux, or Combine input trees                                   |
+| `LoopOp.body`                 | `tuple[Assign, ...]`                     | SSA body: name = op(args)                                           |
+| `LoopOp.outputs`              | `tuple[LoopOutput, ...]`                 | Port or Mux output targets                                          |
+| `LoopLaunch.input_names`      | `list[str]`                              | Per-Port external buffer name (program-level)                       |
+| `LoopLaunch.output_name`      | `str`                                    | External buffer written by this LoopOp                              |
 
 Analogies (use in module/class docstrings):
 
-- **Dataflow / signal-flow graph** for `KernelInput` trees.
+- **Dataflow / signal-flow graph** for `LoopInput` trees.
 - **Hardware multiplexer** (FPGA N-to-1 mux / 1-to-N demux) for `Mux`.
 - **Operad / expression tree** for `Combine`.
-- **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store) for `KernelOp`.
+- **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store) for `LoopOp`.
 
 ## Shape inference
 
@@ -118,7 +120,7 @@ needed by calling ``infer_output_shape`` on the op instance.
 | ``TransposeOp`` | Permute the input shape by ``self.axes``. |
 | ``ReshapeOp`` | Returns ``self.shape``. |
 | ``LinearOp`` / ``MatmulOp`` / ``SdpaOp`` / ``MeanOp`` | High-level ops; decomposed before shape inference runs on the kernel IR. |
-| ``KernelOp`` | ``infer_shapes() → dict[str, tuple]`` walks the SSA body, calling each ``Assign.op.infer_output_shape`` with the arg shapes. ``infer_output_shape()`` returns the last Assign's shape. |
+| ``LoopOp`` | ``infer_shapes() → dict[str, tuple]`` walks the SSA body, calling each ``Assign.op.infer_output_shape`` with the arg shapes. ``infer_output_shape()`` returns the last Assign's shape. |
 
 **Invariant**: after decomposition + optimization, every ``ElementwiseOp("mul")``
 in the graph has broadcast-compatible inputs. Matmul ``A(..., M, K) × B(..., K, N)``
@@ -147,7 +149,7 @@ Backward-cone region growing via the rewriter:
 
 Walks the SSA body — no classification pass, no `Schedule` dataclass, no `LoopIR` intermediate. Maintains a `values: dict[str, Expr]` mapping Assign names to C expressions.
 
-- `_emit_input_value(KernelInput, coord) -> Expr`:
+- `_emit_input_value(LoopInput, coord) -> Expr`:
   - `Port` → `ArrayAccess(buffer, coord)`.
   - `Mux` → nested `Ternary` chain over branch `select` predicates.
   - `Combine` → emit each source to a temporary, then fold the `ops` chain.
@@ -167,13 +169,13 @@ each node, reshaping outputs to match declared `node.output.shape`. No GPU requi
 
 Covered ops: all elementwise functions, reductions, scans, gather/scatter,
 transpose/reshape/unsqueeze/slice/cat, linear, matmul, SDPA, mean.
-`IndexMapOp` and `KernelOp` raise `NotImplementedError` (structural IR).
+`IndexMapOp` and `LoopOp` raise `NotImplementedError` (structural IR).
 
 ## Testing
 
 - `tests/compiler/test_ir.py`, `test_shape_inference.py`, `test_indexmap.py`, `test_backend_ir.py` — Layer 1 unit tests.
 - `tests/compiler/test_kernel_op.py` — structural IR construction + invariant violations.
-- `tests/compiler/test_lower.py` — `lower()` group-discovery + KernelOp assembly.
+- `tests/compiler/test_lower.py` — `compile_graph` group-discovery + LoopOp assembly.
 - `tests/compiler/test_emit.py` — recursive-descent codegen source-level assertions + on-GPU numerical checks.
 - `tests/compiler/test_pipeline.py` — end-to-end on small synthetic graphs.
 - `tests/compiler/test_torch_trace*.py`, `test_real_trace.py`, `test_hints.py` — tracer / hint coverage.

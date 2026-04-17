@@ -189,7 +189,7 @@ def _apply_replacement(graph: Graph, match: ChainMatch, fragment: Graph) -> Grap
     # Wire fragment output to replace the match output.
     new_output = id_map[fragment.outputs[0]]
     old_output = match.output or match.root_node_id
-    g.replace_node(old_output, new_output)  # also updates KernelOp internals
+    g.replace_node(old_output, new_output)  # also updates LoopOp internals
 
     # Merge hints from consumed nodes into the new output.
     for nid in match.consumed:

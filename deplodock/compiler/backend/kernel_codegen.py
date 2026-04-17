@@ -6,7 +6,7 @@ emits C/C++ text. Usable for both CUDA and HIP targets.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.kernel import (
+from deplodock.compiler.ir.gpu import (
     ArrayAccess,
     ArrayDecl,
     Assign,
@@ -17,9 +17,9 @@ from deplodock.compiler.ir.kernel import (
     FieldAccess,
     ForLoop,
     FuncCall,
+    GpuExpr,
+    GpuKernel,
     IfStmt,
-    KernelDef,
-    KernelExpr,
     Literal,
     PragmaUnroll,
     RawCode,
@@ -50,7 +50,7 @@ _PRECEDENCE: dict[str, int] = {
 }
 
 
-def emit_kernel(kernel: KernelDef) -> str:
+def emit_kernel(kernel: GpuKernel) -> str:
     """Emit complete CUDA C source for a __global__ kernel."""
     preamble = ""
     if kernel.includes:
@@ -82,7 +82,7 @@ def emit_kernel(kernel: KernelDef) -> str:
     return f"{preamble}__global__{launch_bounds} void {kernel.name}({params}) {{\n{body}\n}}\n"
 
 
-def _emit_expr(expr: KernelExpr, parent_prec: int = 0) -> str:
+def _emit_expr(expr: GpuExpr, parent_prec: int = 0) -> str:
     """Emit an expression as C code."""
     if isinstance(expr, Var):
         return expr.name

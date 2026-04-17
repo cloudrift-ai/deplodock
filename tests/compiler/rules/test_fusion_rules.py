@@ -1,16 +1,16 @@
 """Tests for fusion rules (assemble_kernels).
 
-The fusion rule produces KernelOp nodes which the numpy backend cannot
+The fusion rule produces LoopOp nodes which the numpy backend cannot
 execute, so these tests verify structural properties: kernel count,
-graph composition (only KernelOp/InputOp/ConstantOp remain), and that
+graph composition (only LoopOp/InputOp/ConstantOp remain), and that
 the SSA body contains the expected ops.
 """
 
 from pathlib import Path
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.block import KernelOp, Port
 from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.loop import LoopOp, Port
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass, Rule
 
@@ -28,7 +28,7 @@ def _fuse(graph: Graph) -> Graph:
 
 
 def _kernel_nodes(graph: Graph) -> list:
-    return [n for n in graph.nodes.values() if isinstance(n.op, KernelOp)]
+    return [n for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
 
 
 # ===================================================================
@@ -54,7 +54,7 @@ def test_pointwise_chain_fuses_to_one_kernel():
 def test_pointwise_chain_only_kernel_input_constant():
     result = _fuse(_make_pointwise_chain())
     for n in result.nodes.values():
-        assert isinstance(n.op, (KernelOp, InputOp, ConstantOp))
+        assert isinstance(n.op, (LoopOp, InputOp, ConstantOp))
 
 
 def test_pointwise_chain_body_ops():
@@ -156,7 +156,7 @@ def test_softmax_fuses():
 def test_softmax_only_kernel_input_constant():
     result = _fuse(_make_softmax())
     for n in result.nodes.values():
-        assert isinstance(n.op, (KernelOp, InputOp, ConstantOp))
+        assert isinstance(n.op, (LoopOp, InputOp, ConstantOp))
 
 
 def test_softmax_body_covers_all_ops():
@@ -189,7 +189,7 @@ def test_single_elementwise_fuses():
 
 
 def test_ssa_invariants_hold():
-    """KernelOp.__post_init__ validates SSA; this just confirms no crash."""
+    """LoopOp.__post_init__ validates SSA; this just confirms no crash."""
     result = _fuse(_make_softmax())
     for k in _kernel_nodes(result):
         # Re-validate explicitly

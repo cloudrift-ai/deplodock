@@ -7,8 +7,8 @@ wrapped as a single-launch copy kernel.
 from __future__ import annotations
 
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.block import KernelOp, Mux, MuxBranch, Port
 from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.loop import LoopOp, Mux, MuxBranch, Port
 from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -21,7 +21,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     if not isinstance(node.op, IndexMapOp):
         return None
     consumers = graph.consumers(nid)
-    if not all(isinstance(graph.nodes[c].op, KernelOp) for c in consumers if c in graph.nodes):
+    if not all(isinstance(graph.nodes[c].op, LoopOp) for c in consumers if c in graph.nodes):
         return None
 
     op = node.op
@@ -38,7 +38,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
             branches.append(MuxBranch(input=Port(indexmap=branch_indexmap), select=src.select))
         kernel_inputs = (Mux(branches=tuple(branches)),)
 
-    kernel = KernelOp(inputs=kernel_inputs, outputs=(Port(),))
+    kernel = LoopOp(inputs=kernel_inputs, outputs=(Port(),))
 
     frag = Graph()
     for inp_id in node.inputs:

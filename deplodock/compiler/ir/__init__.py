@@ -12,9 +12,10 @@ One file per IR level:
 - ``tensor``   — minimal post-decomposition IR (``ElementwiseOp``,
                  ``ReduceOp``, ``ScanOp``, ``GatherOp``, ``ScatterOp``,
                  ``IndexMapOp``).
-- ``block``    — structural kernel IR (``KernelOp`` + ``Port`` / ``Mux`` /
-                 ``Combine`` / ``Assign`` SSA tree).
-- ``kernel``   — imperative C-like AST (``KernelDef``, ``Stmt`` variants).
+- ``loop``     — loop IR (``LoopOp`` + ``Port`` / ``Mux`` / ``Combine`` /
+                 ``Assign`` SSA tree). One ``LoopOp`` per GPU kernel.
+- ``gpu``      — GPU IR (imperative C-like AST: ``GpuKernel``, ``Stmt``
+                 variants, ``ArrayAccess``, ``Cast``, ``VectorLoad``, ...).
 
 See ``ARCHITECTURE.md`` in this directory for stage-by-stage semantics and
 invariants.

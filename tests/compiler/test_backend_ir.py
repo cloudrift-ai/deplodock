@@ -5,7 +5,7 @@ emit_kernel / _emit_expr / _emit_stmt produce correct C/CUDA source.
 """
 
 from deplodock.compiler.backend.kernel_codegen import emit_kernel
-from deplodock.compiler.ir.kernel import (
+from deplodock.compiler.ir.gpu import (
     ArrayAccess,
     ArrayDecl,
     Assign,
@@ -16,9 +16,9 @@ from deplodock.compiler.ir.kernel import (
     FieldAccess,
     ForLoop,
     FuncCall,
+    GpuKernel,
+    GpuKernelParam,
     IfStmt,
-    KernelDef,
-    KernelParam,
     Literal,
     PragmaUnroll,
     RawCode,
@@ -281,13 +281,13 @@ def test_raw_code_multiline_indented():
 
 
 # ---------------------------------------------------------------------------
-# KernelDef emission
+# GpuKernel emission
 # ---------------------------------------------------------------------------
 
 
 def test_kernel_def_minimal():
     """Minimal kernel with no body emits valid CUDA."""
-    kd = KernelDef(
+    kd = GpuKernel(
         name="empty_kernel",
         params=[],
         body=[],
@@ -301,13 +301,13 @@ def test_kernel_def_minimal():
 
 def test_kernel_def_with_params():
     """Kernel with float* and int params."""
-    kd = KernelDef(
+    kd = GpuKernel(
         name="add_kernel",
         params=[
-            KernelParam("float*", "A"),
-            KernelParam("float*", "B"),
-            KernelParam("float*", "C"),
-            KernelParam("int", "N"),
+            GpuKernelParam("float*", "A"),
+            GpuKernelParam("float*", "B"),
+            GpuKernelParam("float*", "C"),
+            GpuKernelParam("int", "N"),
         ],
         body=[
             VarDecl("int", "i", Builtin("threadIdx.x")),
@@ -327,7 +327,7 @@ def test_kernel_def_with_params():
 
 def test_kernel_def_with_includes():
     """Kernel with extra includes."""
-    kd = KernelDef(
+    kd = GpuKernel(
         name="test",
         params=[],
         body=[],
@@ -340,9 +340,9 @@ def test_kernel_def_with_includes():
 
 def test_kernel_def_with_tma_params():
     """Kernel with TMA descriptor params (grid_constant)."""
-    kd = KernelDef(
+    kd = GpuKernel(
         name="matmul",
-        params=[KernelParam("float*", "C")],
+        params=[GpuKernelParam("float*", "C")],
         body=[],
         block_size=(32, 8, 1),
         tma_params=["A_tma", "B_tma"],
@@ -358,13 +358,13 @@ def test_kernel_def_with_tma_params():
 
 def test_kernel_def_launch_bounds_2d():
     """2D block computes correct max threads."""
-    kd = KernelDef(name="k", params=[], body=[], block_size=(32, 8, 1))
+    kd = GpuKernel(name="k", params=[], body=[], block_size=(32, 8, 1))
     source = emit_kernel(kd)
     assert "__launch_bounds__(256)" in source
 
 
 def test_kernel_def_min_blocks_per_sm():
     """min_blocks_per_sm emits two-arg __launch_bounds__."""
-    kd = KernelDef(name="k", params=[], body=[], block_size=(128, 1, 1), min_blocks_per_sm=2)
+    kd = GpuKernel(name="k", params=[], body=[], block_size=(128, 1, 1), min_blocks_per_sm=2)
     source = emit_kernel(kd)
     assert "__launch_bounds__(128, 2)" in source

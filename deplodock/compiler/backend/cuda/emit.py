@@ -1,8 +1,14 @@
-"""Naive recursive-descent CUDA codegen from structural ``KernelOp``.
+"""Naive recursive-descent CUDA codegen: ``LoopProgram`` → ``GpuProgram``.
 
-Receives ``KernelInfo`` objects (KernelOp + buffer name mappings) and
-emits CUDA C source. The KernelOp body uses ``$N`` references for input
-Ports; the codegen maps these to actual buffer names via ``KernelInfo``.
+Consumes a ``LoopProgram`` (one ``LoopLaunch`` per GPU kernel, with
+authoritative buffer shapes) and emits CUDA C source packaged as a
+``GpuProgram``. The ``LoopOp`` body uses ``$N`` references for input
+Ports; the codegen maps these to actual buffer names via
+``LoopLaunch.input_names``.
+
+Shapes are read from the ``LoopProgram`` (never recomputed) — see
+``program.shape(...)``, ``program.dollar_shapes(launch)``,
+``program.output_shape(launch)``.
 """
 
 from __future__ import annotations
@@ -10,24 +16,24 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend.cuda.program import CudaLaunch
-from deplodock.compiler.backend.program import Buffer, Program
-from deplodock.compiler.ir.block import Combine, KernelInput, KernelOp, Mux, Port
 from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var
-from deplodock.compiler.ir.kernel import (
+from deplodock.compiler.ir.gpu import (
     ArrayAccess,
     AugAssign,
     ForLoop,
+    GpuKernel,
+    GpuKernelParam,
     IfStmt,
-    KernelDef,
-    KernelParam,
     Stmt,
     VarDecl,
 )
-from deplodock.compiler.ir.kernel import (
+from deplodock.compiler.ir.gpu import (
     Assign as IrAssign,
 )
+from deplodock.compiler.ir.loop import Combine, LoopInput, LoopOp, Mux, Port
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
-from deplodock.compiler.lower import KernelInfo
+from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
+from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
 
 _BLOCK = 256
 
@@ -37,76 +43,31 @@ _BLOCK = 256
 # ---------------------------------------------------------------------------
 
 
-def compile_kernels(
-    kernels: list[KernelInfo],
-    *,
-    name: str = "prog",
-    buf_shapes: dict[str, tuple] | None = None,
-    graph_inputs: list[str] | None = None,
-    graph_outputs: list[str] | None = None,
-    graph_constants: list[str] | None = None,
-) -> Program:
-    shapes = dict(buf_shapes or {})
-    graph_input_set = set(graph_inputs or [])
-    graph_output_set = set(graph_outputs or [])
-    graph_constant_set = set(graph_constants or [])
+def compile_kernels(program: LoopProgram) -> GpuProgram:
+    """Lower a ``LoopProgram`` to a ``GpuProgram``.
 
-    # Collect referenced buffer shapes.
-    for info in kernels:
-        for i, port in enumerate(_leaf_ports(info.kernel)):
-            buf_name = info.input_names[i] if i < len(info.input_names) else f"${i}"
-            if buf_name not in shapes and port.indexmap is not None:
-                shapes[buf_name] = tuple(port.indexmap.out_shape)
-        dollar_shapes = _dollar_shapes(info, shapes)
-        out_shape = info.output_shape or info.kernel.infer_output_shape(dollar_shapes)
-        shapes.setdefault(info.output_name, out_shape)
-
-    def role_for(bid: str) -> str:
-        if bid in graph_input_set:
-            return "input"
-        if bid in graph_constant_set:
-            return "constant"
-        if bid in graph_output_set:
-            return "output"
-        return "scratch"
-
+    One ``CudaLaunch`` is produced per ``LoopLaunch``. Buffer set is
+    filtered to those actually referenced (either as launch input/output
+    or as a graph-level constant that's referenced and shape-known).
+    """
     referenced: set[str] = set()
-    for info in kernels:
-        referenced.update(info.input_names)
-        referenced.add(info.output_name)
-    referenced |= graph_constant_set & set(shapes.keys())
+    for launch in program.launches:
+        referenced.update(launch.input_names)
+        referenced.add(launch.output_name)
+    buf_names = {b.name for b in program.buffers}
+    referenced |= set(program.graph_constants) & buf_names
 
-    buffers = [
-        Buffer(name=bid, size=_numel(shape), dtype="float", role=role_for(bid)) for bid, shape in shapes.items() if bid in referenced
-    ]
+    buffers = [GpuBuffer(name=b.name, size=_numel(b.shape), dtype="float", role=b.role) for b in program.buffers if b.name in referenced]
 
     launches: list[CudaLaunch] = []
-    for i, info in enumerate(kernels):
-        kname = _kernel_name(info.kernel, i)
-        dollar_shapes = _dollar_shapes(info, shapes)
-        kernel_def, arg_order = emit_kernel(info, kname, dollar_shapes, shapes)
-        source = _emit_kernel_source(kernel_def)
-        grid, block = _launch_config(info.kernel, dollar_shapes, info.output_shape)
+    for i, launch in enumerate(program.launches):
+        kname = _kernel_name(launch.loop, i)
+        gpu_kernel, arg_order = emit_kernel(launch, kname, program)
+        source = _emit_kernel_source(gpu_kernel)
+        grid, block = _launch_config(launch, program)
         launches.append(CudaLaunch(kernel_source=source, kernel_name=kname, grid=grid, block=block, args=arg_order))
 
-    return Program(name=name, buffers=buffers, launches=launches)
-
-
-def _dollar_shapes(info: KernelInfo, buf_shapes: dict[str, tuple] | None = None) -> dict[str, tuple]:
-    """Build $N → shape mapping from KernelInfo for infer_shapes."""
-    ext = buf_shapes or {}
-    result: dict[str, tuple] = {}
-    port_idx = 0
-    for inp in info.kernel.inputs:
-        if isinstance(inp, Port):
-            key = f"${port_idx}"
-            buf_name = info.input_names[port_idx] if port_idx < len(info.input_names) else key
-            if inp.indexmap is not None:
-                result[key] = tuple(inp.indexmap.out_shape)
-            elif buf_name in ext:
-                result[key] = tuple(ext[buf_name])
-            port_idx += 1
-    return result
+    return GpuProgram(name=program.name, buffers=buffers, launches=launches)
 
 
 # ---------------------------------------------------------------------------
@@ -114,13 +75,13 @@ def _dollar_shapes(info: KernelInfo, buf_shapes: dict[str, tuple] | None = None)
 # ---------------------------------------------------------------------------
 
 
-def emit_kernel(
-    info: KernelInfo, kernel_name: str, shapes: dict[str, tuple], buf_shapes: dict[str, tuple] | None = None
-) -> tuple[KernelDef, list[str]]:
-    out_shape = info.output_shape or info.kernel.infer_output_shape(shapes)
-    params, arg_order = _build_params(info)
-    body, block_size = _emit_body(info, out_shape, shapes, buf_shapes or {})
-    kd = KernelDef(name=kernel_name, params=params, body=body, block_size=block_size)
+def emit_kernel(launch: LoopLaunch, kernel_name: str, program: LoopProgram) -> tuple[GpuKernel, list[str]]:
+    """Emit one ``GpuKernel`` for a single ``LoopLaunch``."""
+    dollar_shapes = program.dollar_shapes(launch)
+    out_shape = program.output_shape(launch)
+    params, arg_order = _build_params(launch)
+    body, block_size = _emit_body(launch, out_shape, dollar_shapes, program)
+    kd = GpuKernel(name=kernel_name, params=params, body=body, block_size=block_size)
     return kd, arg_order
 
 
@@ -130,7 +91,7 @@ def emit_kernel(
 
 
 def _emit_input_value(
-    inp: KernelInput,
+    inp: LoopInput,
     coord: Expr,
     buf_name: str,
     src_shape: tuple,
@@ -177,7 +138,7 @@ def _emit_input_value(
             value = Var(tname)
         return value
 
-    raise NotImplementedError(f"unexpected KernelInput variant: {type(inp).__name__}")
+    raise NotImplementedError(f"unexpected LoopInput variant: {type(inp).__name__}")
 
 
 def _emit_mux_value(
@@ -276,18 +237,18 @@ def _emit_indexmap_load(buf_name: str, indexmap, coord: Expr, src_shape: tuple, 
 
 
 def _emit_body(
-    info: KernelInfo, out_shape: tuple, shapes: dict[str, tuple], buf_shapes: dict[str, tuple]
+    launch: LoopLaunch, out_shape: tuple, dollar_shapes: dict[str, tuple], program: LoopProgram
 ) -> tuple[list[Stmt], tuple[int, int, int]]:
     from deplodock.compiler.backend.kernel_plan import analyze_kernel
 
-    plan = analyze_kernel(info.kernel, shapes, out_shape)
+    plan = analyze_kernel(launch.loop, dollar_shapes, out_shape)
     idx = Var("idx")
     idx_init = VarDecl(
         dtype="long long",
         name="idx",
         init=BinOp("+", BinOp("*", Var("blockIdx.x"), Var("blockDim.x")), Var("threadIdx.x")),
     )
-    guarded = _emit_plan(plan, info, shapes, buf_shapes, idx)
+    guarded = _emit_plan(plan, launch, dollar_shapes, program, idx)
     stmts: list[Stmt] = [idx_init, IfStmt(cond=BinOp("<", idx, Literal(plan.n_output, "int")), body=guarded)]
     return stmts, (_BLOCK, 1, 1)
 
@@ -297,24 +258,25 @@ def _emit_body(
 # ---------------------------------------------------------------------------
 
 
-def _emit_plan(plan, info: KernelInfo, shapes: dict[str, tuple], buf_shapes: dict[str, tuple], idx: Expr) -> list[Stmt]:
+def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], program: LoopProgram, idx: Expr) -> list[Stmt]:
     from deplodock.compiler.backend.kernel_plan import Inline, Loop
 
-    kernel = info.kernel
+    loop = launch.loop
     stmts: list[Stmt] = []
     name_seq = [0]
     values: dict[str, Expr] = {}
+    out_shape = program.output_shape(launch)
 
     # Build $N → (port, buf_name, src_shape) mapping.
     # For Mux inputs, enumerate all leaf Ports inside branches.
     port_info: dict[str, tuple[Port, str, tuple]] = {}
     mux_info: dict[str, list[tuple[str, str, tuple]]] = {}  # key → [(branch_buf, branch_src_shape), ...]
     port_idx = 0
-    for inp in kernel.inputs:
+    for inp in loop.inputs:
         if isinstance(inp, Port):
             key = f"${port_idx}"
-            buf_name = info.input_names[port_idx] if port_idx < len(info.input_names) else key
-            src_shape = buf_shapes.get(buf_name, shapes.get(key, ()))
+            buf_name = launch.input_names[port_idx] if port_idx < len(launch.input_names) else key
+            src_shape = program.shape(buf_name) if buf_name in {b.name for b in program.buffers} else dollar_shapes.get(key, ())
             port_info[key] = (inp, buf_name, src_shape)
             port_idx += 1
         elif isinstance(inp, Mux):
@@ -322,8 +284,8 @@ def _emit_plan(plan, info: KernelInfo, shapes: dict[str, tuple], buf_shapes: dic
             branch_infos = []
             for branch in inp.branches:
                 if isinstance(branch.input, Port):
-                    bname = info.input_names[port_idx] if port_idx < len(info.input_names) else f"${port_idx}"
-                    bshape = buf_shapes.get(bname, ())
+                    bname = launch.input_names[port_idx] if port_idx < len(launch.input_names) else f"${port_idx}"
+                    bshape = program.shape(bname) if bname in {b.name for b in program.buffers} else ()
                     branch_infos.append((bname, bshape))
                     port_idx += 1
             mux_info[key] = branch_infos
@@ -334,9 +296,9 @@ def _emit_plan(plan, info: KernelInfo, shapes: dict[str, tuple], buf_shapes: dic
     # Load per-row ports upfront.
     for key, (port, buf_name, src_shape) in port_info.items():
         if key not in plan.per_elem_ports:
-            inp = kernel.inputs[int(key[1:])] if key[1:].isdigit() else port
+            inp = loop.inputs[int(key[1:])] if key[1:].isdigit() else port
             if isinstance(inp, Mux) and key in mux_info:
-                values[key] = _emit_mux_value(inp, idx, mux_info[key], info.output_shape, stmts, name_seq)
+                values[key] = _emit_mux_value(inp, idx, mux_info[key], out_shape, stmts, name_seq)
             else:
                 values[key] = _emit_input_value(port, idx, buf_name, src_shape, stmts, name_seq)
 
@@ -390,26 +352,26 @@ def _emit_plan(plan, info: KernelInfo, shapes: dict[str, tuple], buf_shapes: dic
             if step.stores_output:
                 store_idx = _broadcast_load_idx(idx, k_var, step.iter_shape, step.reduce_axis)
                 last = step.body[-1]
-                inner.append(IrAssign(target=ArrayAccess(array=info.output_name, index=store_idx), value=loop_values[last.name]))
+                inner.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=store_idx), value=loop_values[last.name]))
 
             stmts.append(ForLoop(var=k_var_name, start=Literal(0, "int"), end=Literal(step.k_size, "int"), body=inner))
             loop_count += 1
 
     if plan.stores_final:
-        if kernel.body:
-            out_val = values[kernel.body[-1].name]
+        if loop.body:
+            out_val = values[loop.body[-1].name]
         else:
             # Copy kernel: use first available value (Port or Mux).
             first_key = next((k for k in sorted(values) if k.startswith("$")), None)
             out_val = values[first_key] if first_key else Literal(0.0, "float")
-        stmts.append(IrAssign(target=ArrayAccess(array=info.output_name, index=idx), value=out_val))
+        stmts.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=idx), value=out_val))
 
     return stmts
 
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
     if fn == "max":
-        from deplodock.compiler.ir.kernel import VarAssign
+        from deplodock.compiler.ir.gpu import VarAssign
 
         return VarAssign(name=acc_name, value=FuncCall("fmaxf", [Var(acc_name), value]))
     op = {"sum": "+=", "prod": "*="}.get(fn, "+=")
@@ -528,66 +490,51 @@ def _port_shape_from_info(port: Port, src_shape: tuple) -> tuple:
     return tuple(src_shape)
 
 
-def _leaf_ports(kernel: KernelOp) -> list[Port]:
-    leaves: list[Port] = []
-
-    def walk(inp: KernelInput) -> None:
-        if isinstance(inp, Port):
-            leaves.append(inp)
-        elif isinstance(inp, Mux):
-            for b in inp.branches:
-                walk(b.input)
-        elif isinstance(inp, Combine):
-            for s in inp.sources:
-                walk(s)
-
-    for inp in kernel.inputs:
-        walk(inp)
-    return leaves
-
-
-def _build_params(info: KernelInfo) -> tuple[list[KernelParam], list[str]]:
+def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
     seen: list[str] = []
-    for buf_name in info.input_names:
-        if buf_name not in seen and buf_name != info.output_name:
+    for buf_name in launch.input_names:
+        if buf_name not in seen and buf_name != launch.output_name:
             seen.append(buf_name)
-    params = [KernelParam(dtype="const float*", name=bid) for bid in seen]
-    params.append(KernelParam(dtype="float*", name=info.output_name))
-    return params, seen + [info.output_name]
+    params = [GpuKernelParam(dtype="const float*", name=bid) for bid in seen]
+    params.append(GpuKernelParam(dtype="float*", name=launch.output_name))
+    return params, seen + [launch.output_name]
 
 
-def _kernel_name(kernel: KernelOp, idx: int) -> str:
-    if any(isinstance(a.op, ReduceOp) for a in kernel.body):
+def _kernel_name(loop: LoopOp, idx: int) -> str:
+    if any(isinstance(a.op, ReduceOp) for a in loop.body):
         return f"k{idx}_reduce"
     return f"k{idx}_pointwise"
 
 
-def _launch_config(kernel: KernelOp, shapes: dict[str, tuple], out_shape: tuple = ()) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    has_reduce = any(isinstance(a.op, ReduceOp) for a in kernel.body)
+def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    loop = launch.loop
+    dollar_shapes = program.dollar_shapes(launch)
+    out_shape = program.output_shape(launch)
+    has_reduce = any(isinstance(a.op, ReduceOp) for a in loop.body)
     if has_reduce:
-        n_output = _reduce_n_rows(kernel, shapes)
+        n_output = _reduce_n_rows(loop, dollar_shapes)
     else:
-        n_output = _numel(out_shape) if out_shape else _numel(kernel.infer_output_shape(shapes))
+        n_output = _numel(out_shape) if out_shape else _numel(loop.infer_output_shape(dollar_shapes))
     n_blocks = (n_output + _BLOCK - 1) // _BLOCK
     return (max(n_blocks, 1), 1, 1), (_BLOCK, 1, 1)
 
 
-def _reduce_n_rows(kernel: KernelOp, shapes: dict[str, tuple]) -> int:
-    ssa_shapes = kernel.infer_shapes(shapes)
-    for assign in kernel.body:
+def _reduce_n_rows(loop: LoopOp, shapes: dict[str, tuple]) -> int:
+    ssa_shapes = loop.infer_shapes(shapes)
+    for assign in loop.body:
         if isinstance(assign.op, ReduceOp):
             pre_shape = tuple(int(d) for d in ssa_shapes[assign.args[0]])
             reduce_axis = assign.op.axis % len(pre_shape)
             outer = list(pre_shape)
             del outer[reduce_axis]
             return _numel(tuple(outer)) if outer else 1
-    return _numel(kernel.infer_output_shape(shapes))
+    return _numel(loop.infer_output_shape(shapes))
 
 
-def _emit_kernel_source(kernel_def: KernelDef) -> str:
+def _emit_kernel_source(gpu_kernel: GpuKernel) -> str:
     from deplodock.compiler.backend.kernel_codegen import emit_kernel as _emit
 
-    return _emit(kernel_def)
+    return _emit(gpu_kernel)
 
 
 def _collect_var_names(expr) -> list[str]:

@@ -30,18 +30,20 @@ PyTorch module
    │  rules/fusion/*        (assemble_kernels, wrap_indexmap)
    ▼
 ┌────────────────────────────────────────────────────────────┐
-│ Graph populated with BLOCK / KERNEL ops (block.py)         │
-│   KernelOp (one per GPU kernel) — SSA program whose ports  │
+│ Graph populated with LOOP IR ops (loop.py)                 │
+│   LoopOp (one per GPU kernel) — SSA program whose ports    │
 │   read / write external buffers; Mux for coord-predicated  │
 │   dispatch; Combine for elementwise composition.           │
 │   + InputOp / ConstantOp still present as buffer sources.  │
 └────────────────────────────────────────────────────────────┘
-   │  backend/cuda/emit.py
+   │  compile_graph → LoopProgram (program/loop.py)
+   │  backend/cuda/emit.compile_kernels
    ▼
 ┌────────────────────────────────────────────────────────────┐
-│ KERNEL IR (kernel.py) — one KernelDef per kernel           │
+│ GPU IR (gpu.py) — one GpuKernel per kernel                 │
 │   Imperative C-like AST: VarDecl, Assign, ForLoop, IfStmt, │
 │   ArrayAccess, Cast, VectorLoad, ...                       │
+│   Wrapped into GpuProgram (program/gpu.py) for execution.  │
 └────────────────────────────────────────────────────────────┘
    │  backend/kernel_codegen.py
    ▼
@@ -75,13 +77,13 @@ Hosts nodes from every dialect as the rewriter progresses.
 | ``Hints``         | Advisory metadata bag (dotted keys, e.g. ``cuda.matmul.strategy``). |
 | ``resolve_hints`` | Merge graph + node hints.                             |
 
-**Rule:** Imports ``base``; lazy-imports ``frontend``/``tensor``/``block``
+**Rule:** Imports ``base``; lazy-imports ``frontend``/``tensor``/``loop``
 inside ``Graph.from_dict`` for op-class reconstruction.
 
 ### `expr.py` — shared expression sublanguage
 
-Backend-agnostic expression AST used by both the block IR (coord maps,
-Mux selectors) and the kernel IR (array indices, loop bounds). Plus the
+Backend-agnostic expression AST used by both the loop IR (coord maps,
+Mux selectors) and the GPU IR (array indices, loop bounds). Plus the
 coord-expression helpers that operate on it.
 
 | Symbol                      | Role                                        |
@@ -109,7 +111,7 @@ decomposition pass completes, none of these ops should remain.
 | Layout-only    | ``TransposeOp``, ``ReshapeOp``, ``SliceOp``, ``CatOp``, ``UnsqueezeOp`` — decomposed to ``IndexMapOp``. |
 | Compound math  | ``LinearOp``, ``MatmulOp``, ``SdpaOp``, ``MeanOp`` — decomposed to elementwise + reduce chains. |
 
-**Rule:** Imports ``base`` only. Must not depend on ``tensor`` / ``block``
+**Rule:** Imports ``base`` only. Must not depend on ``tensor`` / ``loop``
 (decomposition rewrites *into* those; the frontend is upstream).
 
 ### `tensor.py` — minimal IR (post-decomposition)
@@ -130,41 +132,44 @@ consumes.
 **Rule:** Imports ``base`` and ``shape_utils`` (for broadcasting).
 Lazy-imports ``expr`` inside ``IndexMapOp.forward`` / ``is_identity`` only.
 
-### `block.py` — structural kernel IR (SSA)
+### `loop.py` — Loop IR (structural SSA)
 
-After fusion, each ``KernelOp`` is exactly one GPU kernel described as an
-SSA program.
+After fusion, each ``LoopOp`` is exactly one GPU kernel described as an
+SSA program over iteration space. "Loop" refers to the tiled loop-nest
+that codegen eventually emits — one ``LoopOp`` maps to one ``GpuKernel``
+and one CUDA launch.
 
-| Symbol                        | Role                                       |
-|-------------------------------|--------------------------------------------|
-| ``KernelOp``                  | One kernel: inputs tree + SSA body + outputs tree. |
-| ``Port``                      | Leaf: external buffer access + optional ``IndexMapOp``. |
-| ``Mux`` + ``MuxBranch``       | Coord-predicated dispatch (input or output side). |
-| ``Combine``                   | Operadic composition of N sub-inputs + elementwise chain. |
-| ``Assign``                    | SSA body statement: ``name = op(args)``.   |
-| ``KernelInput`` / ``KernelOutput`` | Type unions.                          |
-| ``ElementwiseChain``          | ``tuple[ElementwiseOp, ...]`` alias.       |
+| Symbol                      | Role                                         |
+|-----------------------------|----------------------------------------------|
+| ``LoopOp``                  | One kernel: inputs tree + SSA body + outputs tree. |
+| ``Port``                    | Leaf: external buffer access + optional ``IndexMapOp``. |
+| ``Mux`` + ``MuxBranch``     | Coord-predicated dispatch (input or output side). |
+| ``Combine``                 | Operadic composition of N sub-inputs + elementwise chain. |
+| ``Assign``                  | SSA body statement: ``name = op(args)``.     |
+| ``LoopInput`` / ``LoopOutput`` | Type unions.                              |
+| ``ElementwiseChain``        | ``tuple[ElementwiseOp, ...]`` alias.         |
 
 **Rule:** Imports ``base`` and ``tensor`` (needs ``ElementwiseOp`` /
 ``ReduceOp`` / ``IndexMapOp`` for ``Combine.ops``, ``Assign.op``,
 ``Port.indexmap``). ``expr`` is imported under ``TYPE_CHECKING`` only
 (``Expr`` appears in ``MuxBranch.select`` annotation).
 
-### `kernel.py` — imperative C-like AST
+### `gpu.py` — GPU IR (imperative C-like AST)
 
-The last IR before text. One ``KernelDef`` per kernel; the rest of the
+The last IR before text. One ``GpuKernel`` per kernel; the rest of the
 hierarchy is the C/C++ statement + expression AST the codegen emits.
 
 | Group              | Symbols                                             |
 |--------------------|-----------------------------------------------------|
-| Kernel-specific expr | ``ArrayAccess``, ``Cast``, ``FieldAccess``, ``VectorLoad`` |
+| GPU-specific expr  | ``ArrayAccess``, ``Cast``, ``FieldAccess``, ``VectorLoad`` |
 | Statements         | ``VarDecl``, ``Assign``, ``VarAssign``, ``AugAssign``, ``ForLoop``, ``IfStmt``, ``SyncThreads``, ``ArrayDecl``, ``PragmaUnroll``, ``RawCode`` |
-| Kernel def         | ``KernelDef``, ``KernelParam``                      |
+| Kernel def         | ``GpuKernel``, ``GpuKernelParam``                   |
+| Type alias         | ``GpuExpr``                                         |
 | Utilities          | ``pretty_print``                                    |
 
 **Rule:** Imports ``expr`` only. No dependency on the higher dialects
-(frontend / tensor / block) — by the time we are emitting C code, the
-block-IR ops have already been translated into statements.
+(frontend / tensor / loop) — by the time we are emitting C code, the
+loop-IR ops have already been translated into statements.
 
 ## Invariants by stage
 
@@ -174,26 +179,43 @@ block-IR ops have already been translated into statements.
   ``CatOp``. Only ``ElementwiseOp``, ``ReduceOp``, ``IndexMapOp`` (plus
   scan / gather / scatter for non-decomposed primitives), and boundary
   sentinels.
-- **After fusion**: only ``KernelOp`` + ``InputOp`` + ``ConstantOp``.
-  Tensor-IR ops survive only *inside* ``KernelOp.body`` as ``Assign.op``.
-- **Kernel IR** sees only expressions and statements — no ``Op`` subclass
+- **After fusion**: only ``LoopOp`` + ``InputOp`` + ``ConstantOp``.
+  Tensor-IR ops survive only *inside* ``LoopOp.body`` as ``Assign.op``.
+- **GPU IR** sees only expressions and statements — no ``Op`` subclass
   appears.
 
 ## Sub-IRs shared across stages
 
 - **``expr.py``** is the common expression sublanguage. It appears inside
   ``IndexMapOp.coord_map`` (tensor), ``Mux.select`` / ``MuxBranch.select``
-  (block), and ``ArrayAccess.index`` / ``ForLoop.end`` / everywhere in
-  kernel IR. Coord-expression helpers (``substitute``, ``compose_index_maps``)
+  (loop), and ``ArrayAccess.index`` / ``ForLoop.end`` / everywhere in
+  GPU IR. Coord-expression helpers (``substitute``, ``compose_index_maps``)
   are pure AST operations and live here too.
 - **``graph.py``** is the shared container. The *contents* change per stage
   but the container doesn't.
+
+## Program forms — the execution view
+
+The Loop IR and GPU IR each have a matching *Program* form (in
+``compiler/program/``) that bundles many kernels with their buffer
+metadata and launch order. See ``compiler/program/ARCHITECTURE.md`` for
+the per-level breakdown.
+
+- ``LoopProgram`` (``program/loop.py``) wraps ``LoopOp``s as ``LoopLaunch``es
+  over ``LoopBuffer``s. Built by ``compile_graph``; authoritative source
+  for buffer shapes.
+- ``GpuProgram`` (``program/gpu.py``) wraps ``GpuKernel``s as ``GpuLaunch``es
+  (usually ``CudaLaunch``) over ``GpuBuffer``s. Produced by codegen.
+
+Codegen is a program-to-program lowering: ``LoopProgram → GpuProgram``.
 
 ## See also
 
 - ``compiler/ARCHITECTURE.md`` — pipeline-level view of how frontend /
   lowering / backend fit together.
+- ``compiler/program/ARCHITECTURE.md`` — the LoopProgram / GpuProgram
+  symmetric pairing.
 - ``compiler/rules/`` — the decomposition / optimization / fusion passes
   that transform one IR stage into the next.
-- ``compiler/backend/cuda/emit.py`` — block IR → kernel IR.
-- ``compiler/backend/kernel_codegen.py`` — kernel IR → C source.
+- ``compiler/backend/cuda/emit.py`` — LoopProgram → GpuProgram lowering.
+- ``compiler/backend/kernel_codegen.py`` — GpuKernel → C source.

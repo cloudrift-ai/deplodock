@@ -23,14 +23,8 @@ def _compile_and_run(graph: Graph, input_data: dict[str, list[float]]) -> dict[s
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.pipeline import compile_graph
 
-    result = compile_graph(graph)
-    program = CudaBackend().compile(
-        result.kernels,
-        buf_shapes=result.buf_shapes,
-        graph_inputs=result.graph_inputs,
-        graph_outputs=result.graph_outputs,
-        graph_constants=result.graph_constants,
-    )
+    loop_program = compile_graph(graph)
+    program = CudaBackend().compile(loop_program)
     run_result = CudaBackend().run(program, input_data=input_data)
     return run_result.outputs
 

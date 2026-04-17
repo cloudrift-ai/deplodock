@@ -14,7 +14,7 @@ remain in the graph:
   placeholder vars from ``ir.expr``.
 
 Plus the boundary sentinels ``InputOp`` and ``ConstantOp`` from ``ir.base``.
-Fusion / ``assemble_kernels`` then folds this IR into ``ir.block.KernelOp``
+Fusion / ``assemble_kernels`` then folds this IR into ``ir.block.LoopOp``
 nodes.
 """
 

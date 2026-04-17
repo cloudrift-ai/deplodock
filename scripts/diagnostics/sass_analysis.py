@@ -46,7 +46,7 @@ from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp  # noqa: E402
 
 # TODO: FusedRegionOp no longer exists in the structural IR; this diagnostic
-# script predates the KernelOp refactor and needs porting before it can run.
+# script predates the LoopOp refactor and needs porting before it can run.
 
 # Opcode families we care about for the histogram. The article groups by these.
 # Pattern → display name. Each pattern is matched as a prefix on the SASS
@@ -90,7 +90,7 @@ def compile_tma_bench(size: int, tmpdir: Path) -> Path:
     print(f"# profile: {profile}, config for {size}: TM={tm}, BK={bk}, ks={ks}", file=sys.stderr)
 
     strategy = selected.get("strategy", "tma_db")
-    region = FusedRegionOp(  # noqa: F821  (see TODO above — script pre-dates KernelOp refactor)
+    region = FusedRegionOp(  # noqa: F821  (see TODO above — script pre-dates LoopOp refactor)
         region_ops=[("ew", ElementwiseOp("mul"), ["A", "B"]), ("C", ReduceOp("sum", axis=1), ["ew"])],
         input_names=["A", "B"],
         output_names=["C"],

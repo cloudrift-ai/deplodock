@@ -1,7 +1,8 @@
 """CUDA program: source generation, compilation, and execution.
 
-Extends the backend-agnostic Program/Launch/Buffer with CUDA-specific
-features (TMA descriptors, nvcc compilation, GPU execution).
+Extends the backend-agnostic ``GpuProgram`` / ``GpuLaunch`` / ``GpuBuffer``
+with CUDA-specific features (TMA descriptors, nvcc compilation, GPU
+execution).
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from deplodock.compiler.backend import BenchmarkResult, ProgramResult
-from deplodock.compiler.backend.program import Buffer, Launch, Program  # noqa: F401 — re-export
+from deplodock.compiler.program.gpu import GpuBuffer, GpuLaunch, GpuProgram  # noqa: F401 — re-export
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ class TmaDescriptorSpec:
 
 
 @dataclass
-class CudaLaunch(Launch):
+class CudaLaunch(GpuLaunch):
     """CUDA kernel launch with optional TMA descriptor metadata."""
 
     tma_descriptors: list[TmaDescriptorSpec] = field(default_factory=list)
@@ -48,7 +49,7 @@ class CudaLaunch(Launch):
 
 
 def generate_source(
-    program: Program,
+    program: GpuProgram,
     mode: str = "benchmark",
     num_iters: int = 10,
     warmup: int = 3,
@@ -186,12 +187,12 @@ def generate_source(
     return "\n".join(parts)
 
 
-def _tma_var(launch: Launch, desc: TmaDescriptorSpec) -> str:
+def _tma_var(launch: GpuLaunch, desc: TmaDescriptorSpec) -> str:
     """Unique variable name for a TMA descriptor: kernel_param_desc."""
     return f"{launch.kernel_name}_{desc.param_name}_desc"
 
 
-def _generate_tma_setup(program: Program) -> str:
+def _generate_tma_setup(program: GpuProgram) -> str:
     """Generate CUtensorMap descriptor creation code for all TMA launches.
 
     Each TMA descriptor encodes a 2D tile view of a global-memory buffer.
@@ -245,7 +246,7 @@ def _generate_tma_setup(program: Program) -> str:
     return "\n".join(lines)
 
 
-def _generate_launches(program: Program) -> str:
+def _generate_launches(program: GpuProgram) -> str:
     """Generate the kernel launch statements."""
     lines: list[str] = []
     buf_sizes = {b.name: b.size for b in program.buffers}
@@ -275,7 +276,7 @@ def _generate_launches(program: Program) -> str:
     return "\n".join(lines)
 
 
-def _format_arg(arg: str, program: Program) -> str:
+def _format_arg(arg: str, program: GpuProgram) -> str:
     """Format a launch argument: buffer names become d_name, others pass through."""
     buf_names = {b.name for b in program.buffers}
     if arg in buf_names:
@@ -316,7 +317,7 @@ def compile_program(source: str, arch: str | None = None) -> Path:
     return binary
 
 
-def run_program(program: Program, input_data: dict[str, list[float]] | None = None) -> ProgramResult:
+def run_program(program: GpuProgram, input_data: dict[str, list[float]] | None = None) -> ProgramResult:
     """Generate, compile, and run a Program. Returns outputs + timing."""
     source = generate_source(program, mode="run", input_data=input_data)
     binary = compile_program(source)
@@ -337,7 +338,7 @@ def run_program(program: Program, input_data: dict[str, list[float]] | None = No
 
 
 def benchmark_program(
-    program: Program,
+    program: GpuProgram,
     warmup: int = 5,
     num_iters: int = 20,
 ) -> BenchmarkResult:
@@ -357,7 +358,7 @@ def benchmark_program(
 # ---------------------------------------------------------------------------
 
 
-def _parse_run_output(stdout: str, program: Program) -> ProgramResult:
+def _parse_run_output(stdout: str, program: GpuProgram) -> ProgramResult:
     """Parse output from a run-mode program."""
     outputs: dict[str, list[float]] = {}
     time_ms = None
@@ -374,7 +375,7 @@ def _parse_run_output(stdout: str, program: Program) -> ProgramResult:
     return ProgramResult(outputs=outputs, time_ms=time_ms)
 
 
-def _parse_benchmark_output(stdout: str, program: Program) -> BenchmarkResult:
+def _parse_benchmark_output(stdout: str, program: GpuProgram) -> BenchmarkResult:
     """Parse output from a benchmark-mode program."""
     time_ms = 0.0
     num_launches = 0

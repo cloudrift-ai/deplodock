@@ -43,7 +43,7 @@ Or for a specific test file:
 - `deplodock vm delete cloudrift ...` — delete a CloudRift GPU VM
 - `deplodock pull <model>` — download a HuggingFace model to local cache
 - `deplodock trace <model> --layer N` — trace a transformer layer to Graph IR (JSON)
-- `deplodock compile <model_or_ir> [--layer N] [--dump-dir DIR]` — lower a traced graph to structural `KernelOp`s (auto-pulls + traces if given a model ID)
+- `deplodock compile <model_or_ir> [--layer N] [--dump-dir DIR]` — lower a traced graph to a `LoopProgram` (auto-pulls + traces if given a model ID)
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
 - `deplodock run <ir_file> [--benchmark] [--dump-dir DIR]` — run a compiled graph IR through the full pipeline
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`

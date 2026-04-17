@@ -157,9 +157,9 @@ def test_graph_copy_preserves_hints():
 
 
 def test_hints_flow_through_lower():
-    """Node hints from consumed graph nodes are promoted to the KernelOp's graph node.
+    """Node hints from consumed graph nodes are promoted to the LoopOp's graph node.
 
-    After fusion, the matmul pair (mul + sum) becomes one KernelOp graph
+    After fusion, the matmul pair (mul + sum) becomes one LoopOp graph
     node whose ``.hints`` carries the merged hints from all consumed nodes.
     """
     from deplodock.compiler.rewriter import Rewriter
@@ -174,8 +174,8 @@ def test_hints_flow_through_lower():
     rewriter = Rewriter.from_directory(rules_dir)
     fused = rewriter.apply(g)
 
-    from deplodock.compiler.ir.block import KernelOp
+    from deplodock.compiler.ir.loop import LoopOp
 
-    kernel_nodes = [n for n in fused.nodes.values() if isinstance(n.op, KernelOp)]
+    kernel_nodes = [n for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
     assert len(kernel_nodes) == 1
     assert kernel_nodes[0].hints.get("cuda.matmul.strategy") == "tma_db"
