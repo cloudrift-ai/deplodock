@@ -1,10 +1,19 @@
 # CUDA Backend Architecture
 
-The CUDA backend lowers a `LoopProgram` (produced by
-`deplodock.compiler.pipeline.compile_graph`) into a runnable `GpuProgram` —
-one `CudaLaunch` per kernel. Source generation is a **recursive descent**
-over the structural IR; there's no classification pass, no `Schedule`
-dataclass, and no intermediate `LoopIR` stage.
+The CUDA backend takes a `Graph` and lowers it via `compile_graph →
+LoopProgram → compile_kernels → GpuProgram` — one `CudaLaunch` per
+kernel. Source generation is a **recursive descent** over the structural
+IR; there's no classification pass, no `Schedule` dataclass, and no
+intermediate `LoopIR` stage.
+
+**Peer backends:**
+- `backend/numpy/` — `NumpyBackend` evaluates the Graph directly (pre-fusion).
+- `backend/loop/` — `LoopBackend` interprets the `LoopProgram` via numpy
+  whole-tensor operations (post-fusion, pre-codegen). Used as a
+  triangulation reference: disagreement with CUDA on the same
+  `LoopProgram` implicates codegen; disagreement with numpy implicates
+  fusion. All three backends expose the same `compile(graph)` /
+  `run_arrays(compiled, input_data=…)` API (`backend/base.py`).
 
 ## Module Layout
 

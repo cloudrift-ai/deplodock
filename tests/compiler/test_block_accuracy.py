@@ -24,7 +24,6 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32):
     from transformers import AutoModelForCausalLM
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import compile_graph
     from deplodock.compiler.torch_trace import trace_module
 
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
@@ -48,19 +47,13 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32):
 
     # Compile.
     graph = trace_module(block.cpu(), (x.cpu(),), kwargs={"position_embeddings": (cos.cpu(), sin.cpu())})
-    cr = compile_graph(graph)
 
-    program = CudaBackend().compile(
-        cr.kernels,
-        buf_shapes=cr.buf_shapes,
-        graph_inputs=cr.graph_inputs,
-        graph_outputs=cr.graph_outputs,
-        graph_constants=cr.graph_constants,
-    )
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
 
     # Build input data.
     input_data: dict[str, list[float]] = {}
-    for buf in program.buffers:
+    for buf in compiled.gpu.buffers:
         if buf.role == "input":
             if buf.name == "hidden_states":
                 input_data[buf.name] = x.cpu().flatten().tolist()
@@ -74,11 +67,11 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32):
                 if safe_key.endswith(buf.name[2:]) and param.numel() == buf.size:
                     input_data[buf.name] = param.detach().cpu().flatten().tolist()
                     break
-            if buf.name not in input_data and buf.name in cr.constant_values:
-                input_data[buf.name] = [cr.constant_values[buf.name]]
+            if buf.name not in input_data and buf.name in compiled.loop.constant_values:
+                input_data[buf.name] = [compiled.loop.constant_values[buf.name]]
 
     # Run.
-    run_result = CudaBackend().run(program, input_data=input_data)
+    run_result = backend.run(compiled, input_data=input_data)
     deplodock_flat = list(run_result.outputs.values())[0]
 
     return deplodock_flat, eager_flat
@@ -107,7 +100,6 @@ def test_qwen_block_accuracy():
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import compile_graph
     from deplodock.compiler.torch_trace import trace_module
 
     torch.set_default_dtype(torch.float32)
@@ -128,17 +120,12 @@ def test_qwen_block_accuracy():
     eager_flat = eager_out.cpu().flatten().tolist()
 
     graph = trace_module(block.cpu(), (x,), kwargs={"position_embeddings": (cos, sin)})
-    cr = compile_graph(graph)
-    program = CudaBackend().compile(
-        cr.kernels,
-        buf_shapes=cr.buf_shapes,
-        graph_inputs=cr.graph_inputs,
-        graph_outputs=cr.graph_outputs,
-        graph_constants=cr.graph_constants,
-    )
+
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
 
     input_data: dict[str, list[float]] = {}
-    for buf in program.buffers:
+    for buf in compiled.gpu.buffers:
         if buf.role == "input":
             if buf.name == "hidden_states":
                 input_data[buf.name] = x.flatten().tolist()
@@ -152,9 +139,9 @@ def test_qwen_block_accuracy():
                 if safe_key.endswith(buf.name[2:]) and param.numel() == buf.size:
                     input_data[buf.name] = param.detach().cpu().float().flatten().tolist()
                     break
-            if buf.name not in input_data and buf.name in cr.constant_values:
-                input_data[buf.name] = [cr.constant_values[buf.name]]
+            if buf.name not in input_data and buf.name in compiled.loop.constant_values:
+                input_data[buf.name] = [compiled.loop.constant_values[buf.name]]
 
-    run_result = CudaBackend().run(program, input_data=input_data)
+    run_result = backend.run(compiled, input_data=input_data)
     deplodock_flat = list(run_result.outputs.values())[0]
     _assert_accuracy(deplodock_flat, eager_flat)
