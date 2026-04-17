@@ -36,9 +36,11 @@ after fusion completes.
 IndexMaps are baked directly into the consuming `Port.index` Exprs
 during fusion — there is no `Port.indexmap` field and no separate
 metadata-only-alias concept here (unlike `GpuProgram`, which has
-`aliases` for buffer-pointer aliasing at the device level). Non-identity
-IndexMapOps are lowered to their own copy kernel via
-`rules/fusion/003_wrap_indexmap.py`.
+`aliases` for buffer-pointer aliasing at the device level). Each
+IndexMapOp is lifted to a one-op `LoopOp` by
+`rules/fusion/003_lift_indexmap.py`; if its consumer is another
+`LoopOp` and the σ solver can align the indices, the merge rule
+absorbs the copy kernel into the consumer's `Port.index`.
 
 ## `gpu.py` — GpuProgram
 

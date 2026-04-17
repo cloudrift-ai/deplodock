@@ -14,8 +14,9 @@ remain in the graph:
   placeholder vars from ``ir.expr``.
 
 Plus the boundary sentinels ``InputOp`` and ``ConstantOp`` from ``ir.base``.
-Fusion / ``assemble_kernels`` then folds this IR into ``ir.block.LoopOp``
-nodes.
+Fusion then lifts each tensor op into a trivial ``ir.loop.LoopOp`` and
+merges adjacent LoopOp pairs via the σ-based rule in
+``rules/fusion/005_merge_loop_ops``.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ OP_REGISTRY: dict[str, OpInfo] = {
     "sigmoid": OpInfo(1),
     "pow": OpInfo(2),
     "abs": OpInfo(1),
+    "copy": OpInfo(1),
 }
 
 # Default for unknown ops: assume unary, non-commutative.
@@ -121,6 +123,7 @@ class ElementwiseOp(Op):
             "pow": lambda a, b: np.power(a, b),
             "abs": lambda a: np.abs(a),
             "silu": lambda a: a / (1.0 + np.exp(-a)),
+            "copy": lambda a: a,
         }
         fn = _EW_FN.get(self.fn)
         if fn is None:

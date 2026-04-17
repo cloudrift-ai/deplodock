@@ -50,9 +50,24 @@ tests/compiler/rules/
 
 ### Fusion (`rules/fusion/`)
 
-| Rule file | Op | Structural | Correctness |
-|---|---|---|---|
-| `assemble_kernels.py` | primitives → `LoopOp` | ✓ (pointwise, contraction, softmax, SSA invariants) | — (LoopOp not numpy-executable) |
+The fusion pass is driven by lift-then-merge: each tensor op becomes a
+trivial `LoopOp` (one lift rule per op), then adjacent LoopOp pairs
+merge via a σ-based legality check. `test_fusion_rules.py` runs the
+whole directory as a single pass; `test_merge_core.py` unit-tests the
+σ solver and merge bookkeeping directly.
+
+| Rule file | Op | Tested via |
+|---|---|---|
+| `001_lift_elementwise.py` | `ElementwiseOp` → `LoopOp` | `test_fusion_rules.py` (pass fixpoint) |
+| `002_lift_reduce.py`      | `ReduceOp` → `LoopOp`      | `test_fusion_rules.py`, `test_merge_core.py::test_merge_reduce_then_elementwise` |
+| `003_lift_indexmap.py`    | `IndexMapOp` → `LoopOp`    | `test_optimization_rules.py::test_matmul_with_transpose_fuses_to_one_kernel` (e2e) |
+| `004_lift_gather.py`      | `GatherOp` → `LoopOp`      | `test_torch_ops.py::test_gather` |
+| `005_merge_loop_ops.py`   | `LoopOp → LoopOp`          | `test_merge_core.py` (17 unit tests) + `test_fusion_rules.py` (fixpoint) |
+
+Numerical correctness for lifted + merged kernels runs through the
+numpy `LoopBackend` in `test_e2e_accuracy.py` (pointwise, reduce,
+matmul, RMSNorm, softmax) and `test_block_accuracy.py` (TinyLlama,
+Qwen2.5-7B real blocks, `@requires_cuda`).
 
 ## Adding a New Rule Test
 
