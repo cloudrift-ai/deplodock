@@ -1,148 +1,93 @@
 """Loop IR — one ``LoopOp`` is one GPU kernel's worth of loop-nest compute.
 
-After fusion (``rules/fusion/assemble_kernels``), each ``LoopOp`` describes
-the compute for one GPU kernel as an SSA program over iteration space:
+After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
+an SSA program over a named iteration space:
 
-    inputs (Port | Mux | Combine) →
-      body (tuple[Assign, ...])  — SSA: name = op(args) →
-      outputs (Port | Mux)
+    axes  : tuple[Axis, ...]            — iteration space (free + reduce)
+    inputs: tuple[Port, ...]            — per-input access patterns
+    body  : tuple[Assign, ...]          — SSA: name = op(args)
+    outputs: tuple[Port, ...]           — per-output access patterns
 
 "Loop" here refers to the tiled loop-nest that codegen eventually emits —
-one LoopOp maps to one ``GpuKernel`` (``ir/gpu.py``) and one CUDA launch.
-Analogies for readers:
+one LoopOp maps to one ``GpuKernel`` and one CUDA launch.
 
-- **Dataflow / signal-flow graph** — leaves are buffer-backed sources,
-  internal nodes transform values, edges carry per-coord values. This is
-  the framing for the ``LoopInput`` tree as a whole.
-- **Hardware multiplexer** (FPGA N-to-1 mux / 1-to-N demux) — for
-  coord-predicated selection, inputs and outputs both.
-- **Operad / expression tree** — N-ary ops composed with operadic
-  identity collapse, for ``Combine``.
-- **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store;
-  MLIR ``linalg`` structured ops) — for ``LoopOp`` as a whole.
+Each input/output ``Port`` has a ``tuple[Expr, ...]`` index pattern that
+describes, per-buffer-dim, how to address the external buffer from the
+iteration coords (axis Vars). The former Mux/Combine input-tree variants
+are gone; `Combine` semantics are handled by plain ``Assign`` statements
+in the body, and `Mux` semantics (coord-predicated dispatch) will be
+re-introduced as a body-level ``Select`` statement in a follow-up.
 
-Every elementwise chain is a ``tuple[ElementwiseOp, ...]`` (alias
-``ElementwiseChain``); every reduction slot is a ``ReduceOp``. SSA
-invariants (unique names, defined-before-use, no forward references) are
-enforced at construction time by ``LoopOp.__post_init__``.
+SSA invariants (unique names, defined-before-use, no forward references)
+are enforced at construction time by ``LoopOp.__post_init__``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Literal
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
+from deplodock.compiler.ir.expr import Expr
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
-if TYPE_CHECKING:
-    from deplodock.compiler.ir.expr import Expr
+# ---------------------------------------------------------------------------
+# Axis — named iteration variable
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Axis:
+    """One named iteration variable at the loop level.
+
+    Referenced from ``Expr`` subtrees (inside ``Port.index`` etc.) by
+    ``Var(name)``. ``kind`` distinguishes parallel free axes (part of the
+    output iteration space) from reduce axes (swept sequentially inside
+    the loop and collapsed via accumulators).
+
+    ``extent`` is a static integer in v1; future revisions may allow an
+    ``Expr`` for dynamic batch/seq dims.
+    """
+
+    name: str
+    extent: int
+    kind: Literal["free", "reduce"]
 
 
 # ---------------------------------------------------------------------------
-# LoopInput tree: Port | Mux | Combine
+# Port — external-buffer access pattern
 # ---------------------------------------------------------------------------
-#
-# One LoopOp = one GPU kernel. Its shape is a tiled dataflow pipeline:
-#
-#     inputs (LoopInput tree) ──► [contraction] ──► [reduce_stages] ──►
-#                                      [epilogue] ──► outputs (Port | Mux)
-#
-# LoopInput is a recursive tagged union (``Port | Mux | Combine``):
-#   - Port    : signal-flow leaf; one external buffer read + optional indexmap.
-#   - Mux     : hardware-mux; coord-predicated dispatch among branches.
-#   - Combine : operadic composition; elementwise-chain over N sub-inputs.
-#
-# LoopOutput is a narrower union (``Port | Mux``): outputs don't
-# assemble values, they just dispatch writes (Mux on outputs = scatter).
 
 
-@dataclass
+@dataclass(frozen=True)
 class Port:
-    """Signal-flow leaf: one external buffer read/write with optional layout.
+    """Access pattern for one external buffer (input or output).
 
-    Position in ``LoopOp.inputs`` is the implicit index. The mapping
-    from Port index to external buffer name lives in the graph node's
-    ``inputs`` list (or equivalently the ``LoopLaunch.input_names`` at
-    program level), not inside the kernel.
+    ``index`` is a tuple of ``Expr`` — one per dimension of the external
+    buffer. Each Expr computes the offset into its buffer dim from the
+    enclosing ``LoopOp.axes`` (via ``Var(axis_name)``), possibly combined
+    with literals and arithmetic for transposes, broadcasts, slices.
 
-    ``indexmap`` (when set) describes the per-output coord access pattern
-    (transpose, slice, broadcast). ``None`` = identity load/store.
+    Identity access on a buffer whose shape matches the LoopOp's axes is
+    ``Port(index=(Var(a.name) for a in axes))``. A broadcast from a
+    size-1 dim is ``Literal(0, "int")`` at that position. A transpose
+    swaps the axis Vars.
+
+    Input ports are positionally bound: the i-th ``Port`` in
+    ``LoopOp.inputs`` is the ``$i`` reference in SSA body args. The
+    external buffer name lives at the program level in
+    ``LoopLaunch.input_names[i]`` / ``LoopLaunch.output_name``.
     """
 
-    indexmap: IndexMapOp | None = None
-
-
-@dataclass
-class MuxBranch:
-    """One branch of a Mux: an input tree + a coord-predicate selector."""
-
-    input: LoopInput
-    select: Expr
-
-
-@dataclass
-class Mux:
-    """Hardware multiplexer: coord-predicated dispatch among branches.
-
-    On inputs: at each output coord, exactly one branch's ``select`` is
-    True and its ``input`` supplies the value. Branches must be disjoint;
-    invariants expect them to be exhaustive or to carry a catch-all in
-    the last position (compiler-side convention, not structurally encoded).
-
-    On outputs: same shape, inverted semantics — each branch describes
-    where to write when its predicate is True. Unmatched coords produce
-    no write (masked scatter).
-    """
-
-    branches: tuple[MuxBranch, ...]
-
-    def __post_init__(self) -> None:
-        if not self.branches:
-            raise ValueError("Mux.branches must be non-empty")
-
-
-@dataclass
-class Combine:
-    """Operadic composition: N sub-inputs combined by an elementwise chain.
-
-    ``sources`` are the operadic inputs (each another ``LoopInput``);
-    ``ops`` is an elementwise chain applied to produce one value per
-    output coord. Nesting is operadic composition — Combines compose into
-    Combines.
-
-    Canonicalization: a no-op wrapper (single source, empty ops) is
-    illegal; the tree should already have been collapsed to the source.
-    """
-
-    sources: tuple[LoopInput, ...]
-    ops: tuple[ElementwiseOp, ...]
-
-    def __post_init__(self) -> None:
-        if not self.sources:
-            raise ValueError("Combine.sources must be non-empty")
-        if len(self.sources) == 1 and not self.ops:
-            raise ValueError("Combine(sources=(x,), ops=()) is a no-op wrapper; use the inner input directly")
-        _assert_elementwise_chain(self.ops, "Combine.ops")
-
-
-# A loop input slot is a signal-flow tree; the leaves read external
-# buffers (``Port``), internal nodes transform values (``Combine``) or
-# dispatch between sources (``Mux``).
-type LoopInput = Port | Mux | Combine
-
-# A loop output slot is simpler: either a plain write target (``Port``)
-# or a scatter/masked writeout (``Mux``). Post-body elementwise work lives
-# in ``LoopOp.epilogue``.
-type LoopOutput = Port | Mux
+    index: tuple[Expr, ...] = ()
 
 
 # ---------------------------------------------------------------------------
-# SSA body: Assign and LoopOp
+# SSA body
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class Assign:
     """One named value in the loop's SSA body: ``name = op(args)``.
 
@@ -158,109 +103,87 @@ class Assign:
     args: tuple[str, ...]
 
 
+# ---------------------------------------------------------------------------
+# LoopOp
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class LoopOp(Op):
-    """One kernel's worth of computation as an SSA program.
+    """One kernel's worth of computation as an SSA program over named axes.
 
-    The loop reads external buffers via ``inputs`` (Port | Mux | Combine),
-    computes through a flat sequence of named ``Assign`` statements, and
-    writes the result via ``outputs`` (Port | Mux).
-
-    Every loop reads as a program::
-
-        mul = mul(a, b)
-        dot = reduce_sum(mul)
-        out = add(dot, bias)
-
-    The codegen walks the body sequentially, maintaining a ``values`` dict
-    mapping Assign names to C expressions. Contraction (matmul K-loop) is
-    detected by pattern-matching the SSA graph, not by a separate field.
+    Reads external buffers via ``inputs`` Ports, computes through a flat
+    sequence of named ``Assign`` statements, and writes the result via
+    ``outputs`` Ports.
     """
 
-    inputs: tuple[LoopInput, ...]
+    axes: tuple[Axis, ...] = ()
+    inputs: tuple[Port, ...] = ()
     body: tuple[Assign, ...] = ()
-    outputs: tuple[LoopOutput, ...] = ()
+    outputs: tuple[Port, ...] = ()
 
     def __post_init__(self) -> None:
-        _validate_ssa(self)
+        _validate(self)
+
+    def free_axes(self) -> tuple[Axis, ...]:
+        return tuple(a for a in self.axes if a.kind == "free")
+
+    def reduce_axes(self) -> tuple[Axis, ...]:
+        return tuple(a for a in self.axes if a.kind == "reduce")
+
+    def infer_output_shape(self, input_shapes: list[tuple] | dict[str, tuple] | None = None) -> tuple:
+        """Output shape = extents of free axes in declaration order.
+
+        If there are no free axes (scalar output, unusual), returns ().
+        """
+        return tuple(a.extent for a in self.free_axes())
 
     def infer_shapes(self, input_shapes: dict[str, tuple] | None = None) -> dict[str, tuple]:
-        """Derive the shape of every named value (inputs + Assigns).
+        """Derive per-SSA-name shape by walking the body.
 
-        ``input_shapes`` maps ``$N`` (or external buffer names) → shape.
-        When a Port carries an ``indexmap``, its effective shape is
-        ``indexmap.out_shape`` regardless of the provided shape.
+        Ports read through their ``index`` pattern; identity-like Ports
+        yield the iteration shape (free + reduce axes in declaration
+        order). Non-identity patterns collapse / transpose accordingly.
+        ElementwiseOps broadcast; ReduceOps (keepdim) keep an axis-1 at
+        the reduced position.
         """
-        ext = input_shapes or {}
+        iter_shape = tuple(a.extent for a in self.axes)
+        axis_name_to_pos = {a.name: i for i, a in enumerate(self.axes)}
         shapes: dict[str, tuple] = {}
-        port_idx = 0
-        for inp in self.inputs:
-            if isinstance(inp, Port):
-                key = f"${port_idx}"
-                if inp.indexmap is not None:
-                    shapes[key] = tuple(inp.indexmap.out_shape)
-                else:
-                    shapes[key] = tuple(ext.get(key, ()))
-                port_idx += 1
-            elif isinstance(inp, Combine):
-                for src in inp.sources:
-                    if isinstance(src, Port):
-                        key = f"${port_idx}"
-                        if src.indexmap is not None:
-                            shapes[key] = tuple(src.indexmap.out_shape)
-                        else:
-                            shapes[key] = tuple(ext.get(key, ()))
-                        port_idx += 1
+
+        for i, port in enumerate(self.inputs):
+            shape = _port_effective_shape(port, iter_shape, axis_name_to_pos)
+            shapes[f"${i}"] = shape
+
         for assign in self.body:
-            if assign.name in ext:
-                shapes[assign.name] = tuple(ext[assign.name])
-                continue
             arg_shapes = [shapes[a] for a in assign.args if a in shapes]
-            if arg_shapes:
-                try:
-                    shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
-                except (ValueError, TypeError):
-                    shapes[assign.name] = max(arg_shapes, key=len)
+            if not arg_shapes:
+                shapes[assign.name] = ()
+                continue
+            try:
+                shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
+            except (ValueError, TypeError):
+                shapes[assign.name] = max(arg_shapes, key=len)
+
         return shapes
 
-    def infer_output_shape(self, input_shapes: dict[str, tuple] | list[tuple] | None = None) -> tuple:
-        """Derive the loop's output shape from the SSA body."""
-        ext = input_shapes if isinstance(input_shapes, dict) else None
-        shapes = self.infer_shapes(ext)
-        if self.body:
-            return shapes.get(self.body[-1].name, ())
-        if shapes:
-            return next(iter(shapes.values()))
-        return ()
-
-
-type ElementwiseChain = tuple[ElementwiseOp, ...]
-
 
 # ---------------------------------------------------------------------------
-# Runtime invariant helpers
+# Validation helpers
 # ---------------------------------------------------------------------------
 
 
-def _assert_elementwise_chain(chain: ElementwiseChain, where: str) -> None:
-    for i, op in enumerate(chain):
-        if not isinstance(op, ElementwiseOp):
-            raise TypeError(f"{where}[{i}] is {type(op).__name__}, expected ElementwiseOp")
+def _validate(loop: LoopOp) -> None:
+    """Enforce Axis uniqueness + SSA invariants at construction time."""
+    # Axis uniqueness.
+    seen_axes: set[str] = set()
+    for a in loop.axes:
+        if a.name in seen_axes:
+            raise ValueError(f"LoopOp.axes: duplicate axis name {a.name!r}")
+        seen_axes.add(a.name)
 
-
-def _validate_ssa(loop: LoopOp) -> None:
-    """Enforce SSA invariants: unique names, defined-before-use."""
-    defined: set[str] = set()
-    port_idx = 0
-    for inp in loop.inputs:
-        if isinstance(inp, Port):
-            defined.add(f"${port_idx}")
-            port_idx += 1
-        elif isinstance(inp, Combine):
-            for src in inp.sources:
-                if isinstance(src, Port):
-                    defined.add(f"${port_idx}")
-                    port_idx += 1
+    # SSA: unique names, defined-before-use, no forward refs.
+    defined: set[str] = {f"${i}" for i in range(len(loop.inputs))}
     for assign in loop.body:
         for arg in assign.args:
             if arg not in defined:
@@ -268,3 +191,28 @@ def _validate_ssa(loop: LoopOp) -> None:
         if assign.name in defined:
             raise ValueError(f"Assign {assign.name!r}: name already defined")
         defined.add(assign.name)
+
+
+def _port_effective_shape(
+    port: Port,
+    iter_shape: tuple[int, ...],
+    axis_name_to_pos: dict[str, int],
+) -> tuple[int, ...]:
+    """Return the effective shape the body sees through this port.
+
+    Rank equals ``len(port.index)``. For each index Expr: if it's a Var
+    naming an axis, that axis's extent; if it's a Literal, 1 (scalar); a
+    nontrivial Expr is conservatively reported as 1 (the body sees a
+    scalar per iteration point for compound indexings).
+    """
+    from deplodock.compiler.ir.expr import Literal, Var
+
+    out: list[int] = []
+    for e in port.index:
+        if isinstance(e, Var) and e.name in axis_name_to_pos:
+            out.append(iter_shape[axis_name_to_pos[e.name]])
+        elif isinstance(e, Literal):
+            out.append(1)
+        else:
+            out.append(1)
+    return tuple(out)

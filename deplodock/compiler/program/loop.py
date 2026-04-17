@@ -7,7 +7,7 @@ here; nothing recomputes them.
 
 The pairing:
 
-    ir/loop.py   : LoopOp, Port, Mux, Combine, Assign           (structural IR)
+    ir/loop.py   : LoopOp, Axis, Port, Assign                    (structural IR)
     program/loop.py: LoopBuffer, LoopLaunch, LoopProgram          (program form)
 
     ir/gpu.py    : GpuKernel, GpuKernelParam, Stmts               (structural IR)
@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.ir.graph import Graph
-from deplodock.compiler.ir.loop import Combine, Port
+from deplodock.compiler.ir.loop import LoopOp
 
 
 @dataclass
@@ -107,31 +107,22 @@ class LoopProgram:
         return self.shape(launch.output_name)
 
     def dollar_shapes(self, launch: LoopLaunch) -> dict[str, tuple]:
-        """Map ``$N`` → shape for ``launch``'s Ports.
+        """Map ``$N`` → external buffer shape for ``launch``'s Ports.
 
-        A Port with an ``indexmap`` contributes the indexmap's ``out_shape``
-        (the effective shape the body sees); a Port without one reads
-        the external buffer shape from the program's buffer table.
+        For each Port position, returns the shape of the external buffer
+        bound to that position. Effective "body-visible" shapes (which may
+        differ under broadcast/transpose via ``Port.index``) are derived
+        by callers from the axes + Port.index pattern if needed.
         """
         out: dict[str, tuple] = {}
-        port_idx = 0
-
-        def record(port: Port) -> None:
-            nonlocal port_idx
-            key = f"${port_idx}"
-            if port.indexmap is not None:
-                out[key] = tuple(port.indexmap.out_shape)
+        if not isinstance(launch.loop, LoopOp):
+            return out
+        for i in range(len(launch.loop.inputs)):
+            key = f"${i}"
+            if i < len(launch.input_names):
+                out[key] = self.shape(launch.input_names[i])
             else:
-                out[key] = self.shape(launch.input_names[port_idx])
-            port_idx += 1
-
-        for inp in launch.loop.inputs:
-            if isinstance(inp, Port):
-                record(inp)
-            elif isinstance(inp, Combine):
-                for src in inp.sources:
-                    if isinstance(src, Port):
-                        record(src)
+                out[key] = ()
         return out
 
     # ── construction ─────────────────────────────────────────────────
