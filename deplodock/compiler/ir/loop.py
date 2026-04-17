@@ -5,20 +5,21 @@ an SSA program over a named iteration space:
 
     axes  : tuple[Axis, ...]            — iteration space (free + reduce)
     inputs: tuple[Port, ...]            — per-input access patterns
-    body  : tuple[Assign, ...]          — SSA: name = op(args)
-    outputs: tuple[Port, ...]           — per-output access patterns
+    locals: tuple[LocalBuffer, ...]     — thread-local state (accumulators,
+                                          scratch); v1: scalar + scope=thread
+    body  : tuple[Stmt, ...]            — SSA: Assign | Update | Write | Select
 
-"Loop" here refers to the tiled loop-nest that codegen eventually emits —
-one LoopOp maps to one ``GpuKernel`` and one CUDA launch.
+Reductions are modeled as explicit accumulator state: each reduction
+contributes a ``LocalBuffer`` (with a ``combine`` op and ``init`` value)
+plus one or more ``Update`` statements that fold values in. The former
+``LoopOp.outputs`` tuple is gone — writes are inline ``Write`` statements
+in the body, carrying their own output index and value.
 
-Each input/output ``Port`` has a ``tuple[Expr, ...]`` index pattern that
-describes, per-buffer-dim, how to address the external buffer from the
-iteration coords (axis Vars). The former Mux/Combine input-tree variants
-are gone; `Combine` semantics are handled by plain ``Assign`` statements
-in the body, and `Mux` semantics (coord-predicated dispatch) will be
-re-introduced as a body-level ``Select`` statement in a follow-up.
+By convention, the last ``Update`` in ``body`` marks the end of the
+reduce sweep: everything before is per-reduce-iteration, everything
+after is post-reduce (runs once per free-axis point).
 
-SSA invariants (unique names, defined-before-use, no forward references)
+SSA invariants (unique names, defined-before-use, accumulator pairing)
 are enforced at construction time by ``LoopOp.__post_init__``.
 """
 
@@ -29,7 +30,7 @@ from typing import Literal
 
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.expr import Expr
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor import ElementwiseOp
 
 # ---------------------------------------------------------------------------
 # Axis — named iteration variable
@@ -61,46 +62,124 @@ class Axis:
 
 @dataclass(frozen=True)
 class Port:
-    """Access pattern for one external buffer (input or output).
+    """Access pattern for one external input buffer.
 
     ``index`` is a tuple of ``Expr`` — one per dimension of the external
     buffer. Each Expr computes the offset into its buffer dim from the
     enclosing ``LoopOp.axes`` (via ``Var(axis_name)``), possibly combined
     with literals and arithmetic for transposes, broadcasts, slices.
-
-    Identity access on a buffer whose shape matches the LoopOp's axes is
-    ``Port(index=(Var(a.name) for a in axes))``. A broadcast from a
-    size-1 dim is ``Literal(0, "int")`` at that position. A transpose
-    swaps the axis Vars.
-
-    Input ports are positionally bound: the i-th ``Port`` in
-    ``LoopOp.inputs`` is the ``$i`` reference in SSA body args. The
-    external buffer name lives at the program level in
-    ``LoopLaunch.input_names[i]`` / ``LoopLaunch.output_name``.
     """
 
     index: tuple[Expr, ...] = ()
 
 
 # ---------------------------------------------------------------------------
-# SSA body
+# LocalBuffer — thread-local scratch / accumulator
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LocalBuffer:
+    """Thread-local state: accumulator (combine set) or scratch (combine=None).
+
+    Accumulators are declared with an ``init`` value and a ``combine``
+    ElementwiseOp; ``Update`` statements fold new values into them via the
+    combine op. After the reduce sweep, other body statements read the
+    accumulator's finalized value by referring to its ``name``.
+
+    v1 invariants (enforced): ``shape == ()`` (scalar) and
+    ``scope == "thread"``. The ``shape`` / ``scope`` fields exist for
+    forward-compat with Stage-2 smem tiling.
+    """
+
+    name: str
+    dtype: str = "f32"
+    init: Expr | None = None
+    combine: ElementwiseOp | None = None
+    shape: tuple[int, ...] = ()
+    scope: Literal["thread", "warp", "block"] = "thread"
+
+
+# ---------------------------------------------------------------------------
+# Body statements
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Assign:
-    """One named value in the loop's SSA body: ``name = op(args)``.
+    """Pure SSA body statement: ``name = op(args)``.
 
-    SSA invariants (enforced by ``LoopOp.__post_init__``):
-      - Each ``name`` is defined exactly once across all Assigns.
-      - Every ``arg`` references ``$N`` (input Port N) or a prior
-        ``Assign.name``.
-      - No forward references.
+    ``op`` is always an ``ElementwiseOp`` (reductions have moved to
+    ``LocalBuffer`` + ``Update``). ``args`` reference ``$N`` ports,
+    ``LocalBuffer.name`` (reads current / finalized acc value), or prior
+    SSA names.
     """
 
     name: str
-    op: ElementwiseOp | ReduceOp
+    op: ElementwiseOp
     args: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Update:
+    """Fold a value into a LocalBuffer accumulator.
+
+    Semantics: ``acc = combine(acc, value)`` where ``combine`` is the
+    LocalBuffer's combine op. ``target`` must name a LocalBuffer with
+    ``combine is not None``. ``value`` references an SSA name (Assign,
+    prior Update target finalized, or ``$N``).
+
+    The positionally-last Update in ``LoopOp.body`` marks the end of the
+    reduce sweep: statements after read finalized accumulators.
+    """
+
+    target: str
+    value: str
+
+
+@dataclass(frozen=True)
+class Write:
+    """Write an SSA value to output buffer ``output`` at position ``index``.
+
+    ``output`` is an integer index into the program-level output-name
+    tuple (``LoopLaunch.output_name`` is the sole output in v1, so
+    ``output=0`` is common). ``index`` uses axis Vars to compute the
+    per-dim offset. ``value`` references an SSA name available at this
+    point in the body (Assign, Accumulator, or ``$N``).
+    """
+
+    output: int
+    index: tuple[Expr, ...]
+    value: str
+
+
+@dataclass(frozen=True)
+class SelectBranch:
+    """One branch of a ``Select`` body statement."""
+
+    value: str  # SSA name when predicate holds
+    select: Expr  # predicate over axis Vars
+
+
+@dataclass(frozen=True)
+class Select:
+    """Coord-predicated value binding — replaces Mux.
+
+    At each iteration coord, exactly one branch's ``select`` predicate
+    should be True; its ``value`` is bound to ``name`` in the SSA scope.
+    Branches are expected to be disjoint; later branches act as
+    catch-alls when no earlier predicate matches.
+    """
+
+    name: str
+    branches: tuple[SelectBranch, ...]
+
+    def __post_init__(self) -> None:
+        if not self.branches:
+            raise ValueError("Select.branches must be non-empty")
+
+
+Stmt = Assign | Update | Write | Select
 
 
 # ---------------------------------------------------------------------------
@@ -110,17 +189,12 @@ class Assign:
 
 @dataclass
 class LoopOp(Op):
-    """One kernel's worth of computation as an SSA program over named axes.
-
-    Reads external buffers via ``inputs`` Ports, computes through a flat
-    sequence of named ``Assign`` statements, and writes the result via
-    ``outputs`` Ports.
-    """
+    """One kernel's worth of computation as an SSA program over named axes."""
 
     axes: tuple[Axis, ...] = ()
     inputs: tuple[Port, ...] = ()
-    body: tuple[Assign, ...] = ()
-    outputs: tuple[Port, ...] = ()
+    locals: tuple[LocalBuffer, ...] = ()
+    body: tuple[Stmt, ...] = ()
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -132,21 +206,11 @@ class LoopOp(Op):
         return tuple(a for a in self.axes if a.kind == "reduce")
 
     def infer_output_shape(self, input_shapes: list[tuple] | dict[str, tuple] | None = None) -> tuple:
-        """Output shape = extents of free axes in declaration order.
-
-        If there are no free axes (scalar output, unusual), returns ().
-        """
+        """Output shape = extents of free axes in declaration order."""
         return tuple(a.extent for a in self.free_axes())
 
     def infer_shapes(self, input_shapes: dict[str, tuple] | None = None) -> dict[str, tuple]:
-        """Derive per-SSA-name shape by walking the body.
-
-        Ports read through their ``index`` pattern; identity-like Ports
-        yield the iteration shape (free + reduce axes in declaration
-        order). Non-identity patterns collapse / transpose accordingly.
-        ElementwiseOps broadcast; ReduceOps (keepdim) keep an axis-1 at
-        the reduced position.
-        """
+        """Derive per-SSA-name shape by walking the body."""
         iter_shape = tuple(a.extent for a in self.axes)
         axis_name_to_pos = {a.name: i for i, a in enumerate(self.axes)}
         shapes: dict[str, tuple] = {}
@@ -155,15 +219,26 @@ class LoopOp(Op):
             shape = _port_effective_shape(port, iter_shape, axis_name_to_pos)
             shapes[f"${i}"] = shape
 
-        for assign in self.body:
-            arg_shapes = [shapes[a] for a in assign.args if a in shapes]
-            if not arg_shapes:
-                shapes[assign.name] = ()
-                continue
-            try:
-                shapes[assign.name] = assign.op.infer_output_shape(arg_shapes)
-            except (ValueError, TypeError):
-                shapes[assign.name] = max(arg_shapes, key=len)
+        # LocalBuffers are scalars in v1; their "read" shape is () (plus
+        # whatever broadcast the consumer applies).
+        for lb in self.locals:
+            shapes[lb.name] = ()
+
+        for stmt in self.body:
+            if isinstance(stmt, Assign):
+                arg_shapes = [shapes[a] for a in stmt.args if a in shapes]
+                if not arg_shapes:
+                    shapes[stmt.name] = ()
+                    continue
+                try:
+                    shapes[stmt.name] = stmt.op.infer_output_shape(arg_shapes)
+                except (ValueError, TypeError):
+                    shapes[stmt.name] = max(arg_shapes, key=len)
+            elif isinstance(stmt, Select):
+                # Shape of a Select = broadcast of branch shapes. Conservative: () or
+                # the shape of the first branch's value if known.
+                first = stmt.branches[0].value
+                shapes[stmt.name] = shapes.get(first, ())
 
         return shapes
 
@@ -174,7 +249,7 @@ class LoopOp(Op):
 
 
 def _validate(loop: LoopOp) -> None:
-    """Enforce Axis uniqueness + SSA invariants at construction time."""
+    """Enforce Axis uniqueness, SSA invariants, accumulator pairing, v1 pins."""
     # Axis uniqueness.
     seen_axes: set[str] = set()
     for a in loop.axes:
@@ -182,15 +257,70 @@ def _validate(loop: LoopOp) -> None:
             raise ValueError(f"LoopOp.axes: duplicate axis name {a.name!r}")
         seen_axes.add(a.name)
 
-    # SSA: unique names, defined-before-use, no forward refs.
+    # LocalBuffer uniqueness + v1 pins.
+    local_names: set[str] = set()
+    accumulators: dict[str, LocalBuffer] = {}
+    for lb in loop.locals:
+        if lb.name in local_names:
+            raise ValueError(f"LocalBuffer: duplicate name {lb.name!r}")
+        local_names.add(lb.name)
+        if lb.shape != ():
+            raise ValueError(f"LocalBuffer {lb.name!r}: v1 requires shape=() (got {lb.shape!r})")
+        if lb.scope != "thread":
+            raise ValueError(f"LocalBuffer {lb.name!r}: v1 requires scope='thread' (got {lb.scope!r})")
+        if lb.combine is not None:
+            accumulators[lb.name] = lb
+
+    # SSA scope.
     defined: set[str] = {f"${i}" for i in range(len(loop.inputs))}
-    for assign in loop.body:
-        for arg in assign.args:
-            if arg not in defined:
-                raise ValueError(f"Assign {assign.name!r}: arg {arg!r} not defined")
-        if assign.name in defined:
-            raise ValueError(f"Assign {assign.name!r}: name already defined")
-        defined.add(assign.name)
+    defined |= local_names
+
+    reduce_axes = {a.name for a in loop.axes if a.kind == "reduce"}
+    update_targets: set[str] = set()
+    output_indices: set[int] = set()
+
+    for stmt in loop.body:
+        if isinstance(stmt, Assign):
+            for arg in stmt.args:
+                if arg not in defined:
+                    raise ValueError(f"Assign {stmt.name!r}: arg {arg!r} not defined")
+            if stmt.name in defined:
+                raise ValueError(f"Assign {stmt.name!r}: name already defined")
+            defined.add(stmt.name)
+        elif isinstance(stmt, Update):
+            if stmt.target not in accumulators:
+                raise ValueError(f"Update.target {stmt.target!r} does not name a LocalBuffer with combine set")
+            if stmt.value not in defined:
+                raise ValueError(f"Update: value {stmt.value!r} not defined")
+            update_targets.add(stmt.target)
+        elif isinstance(stmt, Select):
+            for b in stmt.branches:
+                if b.value not in defined:
+                    raise ValueError(f"Select {stmt.name!r}: branch value {b.value!r} not defined")
+            if stmt.name in defined:
+                raise ValueError(f"Select {stmt.name!r}: name already defined")
+            defined.add(stmt.name)
+        elif isinstance(stmt, Write):
+            if stmt.value not in defined:
+                raise ValueError(f"Write: value {stmt.value!r} not defined")
+            output_indices.add(stmt.output)
+
+    # Accumulator liveness: every acc must be updated at least once.
+    for lb in loop.locals:
+        if lb.combine is not None and lb.name not in update_targets:
+            raise ValueError(f"LocalBuffer {lb.name!r}: combine set but never Updated")
+
+    # Reduce / accumulator pairing.
+    if reduce_axes and not accumulators:
+        raise ValueError("LoopOp has reduce axes but no accumulator LocalBuffer")
+    if accumulators and not reduce_axes:
+        raise ValueError("LoopOp has accumulator LocalBuffer but no reduce axis")
+
+    # Output indices must form a dense [0, N) range.
+    if output_indices:
+        expected = set(range(max(output_indices) + 1))
+        if output_indices != expected:
+            raise ValueError(f"Write.output indices {sorted(output_indices)} do not form a dense [0, N) range")
 
 
 def _port_effective_shape(
@@ -198,13 +328,7 @@ def _port_effective_shape(
     iter_shape: tuple[int, ...],
     axis_name_to_pos: dict[str, int],
 ) -> tuple[int, ...]:
-    """Return the effective shape the body sees through this port.
-
-    Rank equals ``len(port.index)``. For each index Expr: if it's a Var
-    naming an axis, that axis's extent; if it's a Literal, 1 (scalar); a
-    nontrivial Expr is conservatively reported as 1 (the body sees a
-    scalar per iteration point for compound indexings).
-    """
+    """Return the effective shape the body sees through this port."""
     from deplodock.compiler.ir.expr import Literal, Var
 
     out: list[int] = []

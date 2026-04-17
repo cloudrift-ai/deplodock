@@ -27,10 +27,12 @@
 │       + graph_inputs/outputs/constants/constant_values           │
 │                                                                  │
 │  Each LoopOp (ir/loop.py) is one GPU kernel as an SSA program:   │
-│      inputs (Port | Mux | Combine) →                             │
-│        body (tuple[Assign, ...])  — SSA: name = op(args) →       │
-│        outputs (Port | Mux)                                      │
-│  Contraction (matmul) is lowered as mul + reduce_sum Assigns.    │
+│      axes   (tuple[Axis, ...]) — named iteration variables       │
+│      inputs (tuple[Port, ...]) — per-input access patterns       │
+│      locals (tuple[LocalBuffer, ...]) — thread-local accumulators│
+│      body   (tuple[Stmt, ...])                                   │
+│        Assign | Update | Write | Select                          │
+│  Reductions = LocalBuffer(combine) + Update; writes are inline.  │
 │                                                                  │
 │  RULE: Operates on Graph + Loop IR only. No backend imports.     │
 ├──────────────────────────────────────────────────────────────────┤
@@ -98,25 +100,23 @@ defined-before-use, no forward references.
 
 | Slot                          | Type                                     | Used for                                                            |
 | ----------------------------- | ---------------------------------------- | ------------------------------------------------------------------- |
-| `Port.indexmap`               | `IndexMapOp \| None`                     | Layout transform at the load/store                                  |
-| `Mux.branches[i].input`       | `LoopInput` (recursive)                  | Dispatched read (cat, RoPE halves, KV cache)                        |
-| `Mux.branches[i].select`      | `Expr` (from `ir/expr`)                  | Output-coord predicate                                              |
-| `Combine.sources`             | `tuple[LoopInput, ...]`                  | N sub-inputs to an elementwise chain                                |
-| `Combine.ops`                 | `tuple[ElementwiseOp, ...]`              | Per-coord elementwise work                                          |
-| `Assign.name`                 | `str`                                    | SSA value name                                                      |
-| `Assign.op`                   | `ElementwiseOp \| ReduceOp`              | The operation to apply                                              |
-| `Assign.args`                 | `tuple[str, ...]`                        | References to input Ports (`$N`) or prior Assign names              |
-| `LoopOp.inputs`               | `tuple[LoopInput, ...]`                  | Port, Mux, or Combine input trees                                   |
-| `LoopOp.body`                 | `tuple[Assign, ...]`                     | SSA body: name = op(args)                                           |
-| `LoopOp.outputs`              | `tuple[LoopOutput, ...]`                 | Port or Mux output targets                                          |
+| `Axis.name` / `extent` / `kind` | `str` / `int` / `"free"|"reduce"`     | One iteration variable; reduce axes pair with accumulators          |
+| `Port.index`                  | `tuple[Expr, ...]`                       | Per-input-dim access pattern over axis Vars                         |
+| `LocalBuffer.name` / `init` / `combine` | `str` / `Expr` / `ElementwiseOp \| None` | Accumulator state (combine set) or plain scratch                    |
+| `Assign.op`                   | `ElementwiseOp`                          | Pure SSA body op; ReduceOp is NOT valid here                        |
+| `Update.target` / `value`     | `str` / `str`                            | Fold value into a LocalBuffer accumulator                           |
+| `Write.output` / `index` / `value` | `int` / `tuple[Expr, ...]` / `str`  | Inline store at a position                                          |
+| `Select.branches[i].value` / `select` | `str` / `Expr`                    | Coord-predicated SSA binding (replaces old Mux)                     |
+| `LoopOp.axes` / `inputs` / `locals` / `body` | 4 tuples                       | Iteration + access patterns + state + SSA statements                |
 | `LoopLaunch.input_names`      | `list[str]`                              | Per-Port external buffer name (program-level)                       |
 | `LoopLaunch.output_name`      | `str`                                    | External buffer written by this LoopOp                              |
 
 Analogies (use in module/class docstrings):
 
-- **Dataflow / signal-flow graph** for `LoopInput` trees.
-- **Hardware multiplexer** (FPGA N-to-1 mux / 1-to-N demux) for `Mux`.
-- **Operad / expression tree** for `Combine`.
+- **Named iteration axes** like Halide ``Var``/``RVar`` or MLIR
+  ``linalg.generic`` iterator types.
+- **Accumulator state** like MLIR ``scf.for`` iter_args — the
+  ``Update`` statement is the combine-and-write.
 - **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store) for `LoopOp`.
 
 ## Shape inference
@@ -133,7 +133,7 @@ needed by calling ``infer_output_shape`` on the op instance.
 | ``TransposeOp`` | Permute the input shape by ``self.axes``. |
 | ``ReshapeOp`` | Returns ``self.shape``. |
 | ``LinearOp`` / ``MatmulOp`` / ``SdpaOp`` / ``MeanOp`` | High-level ops; decomposed before shape inference runs on the kernel IR. |
-| ``LoopOp`` | ``infer_shapes() → dict[str, tuple]`` walks the SSA body, calling each ``Assign.op.infer_output_shape`` with the arg shapes. ``infer_output_shape()`` returns the last Assign's shape. |
+| ``LoopOp`` | ``infer_output_shape()`` returns the tuple of free-axis extents. ``infer_shapes()`` walks the SSA body, propagating per-name shapes through Assigns/Selects. |
 
 **Invariant**: after decomposition + optimization, every ``ElementwiseOp("mul")``
 in the graph has broadcast-compatible inputs. Matmul ``A(..., M, K) × B(..., K, N)``

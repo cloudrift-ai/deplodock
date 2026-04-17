@@ -31,10 +31,11 @@ PyTorch module
    ▼
 ┌────────────────────────────────────────────────────────────┐
 │ Graph populated with LOOP IR ops (loop.py)                 │
-│   LoopOp (one per GPU kernel) — SSA program whose ports    │
-│   read / write external buffers; Mux for coord-predicated  │
-│   dispatch; Combine for elementwise composition.           │
-│   + InputOp / ConstantOp still present as buffer sources.  │
+│   LoopOp (one per GPU kernel) — SSA program over named     │
+│   Axes. Ports read external buffers via Expr index         │
+│   patterns; LocalBuffers carry accumulator state; body     │
+│   statements (Assign/Update/Write/Select) execute in       │
+│   order. + InputOp / ConstantOp as buffer sources.         │
 └────────────────────────────────────────────────────────────┘
    │  compile_graph → LoopProgram (program/loop.py)
    │  backend/cuda/emit.compile_kernels
@@ -132,24 +133,26 @@ Lazy-imports ``expr`` inside ``IndexMapOp.forward`` / ``is_identity`` only.
 ### `loop.py` — Loop IR (structural SSA)
 
 After fusion, each ``LoopOp`` is exactly one GPU kernel described as an
-SSA program over iteration space. "Loop" refers to the tiled loop-nest
-that codegen eventually emits — one ``LoopOp`` maps to one ``GpuKernel``
-and one CUDA launch.
+SSA program over a **named iteration space**. "Loop" refers to the tiled
+loop-nest that codegen eventually emits — one ``LoopOp`` maps to one
+``GpuKernel`` and one CUDA launch.
 
 | Symbol                      | Role                                         |
 |-----------------------------|----------------------------------------------|
-| ``LoopOp``                  | One kernel: inputs tree + SSA body + outputs tree. |
-| ``Port``                    | Leaf: external buffer access + optional ``IndexMapOp``. |
-| ``Mux`` + ``MuxBranch``     | Coord-predicated dispatch (input or output side). |
-| ``Combine``                 | Operadic composition of N sub-inputs + elementwise chain. |
-| ``Assign``                  | SSA body statement: ``name = op(args)``.     |
-| ``LoopInput`` / ``LoopOutput`` | Type unions.                              |
-| ``ElementwiseChain``        | ``tuple[ElementwiseOp, ...]`` alias.         |
+| ``Axis``                    | Named iteration variable (``name`` + ``extent`` + ``kind={"free","reduce"}``). |
+| ``LoopOp``                  | One kernel: ``axes`` + ``inputs`` + ``locals`` + SSA ``body``. |
+| ``Port``                    | Access pattern for one external buffer — ``index: tuple[Expr, ...]`` over axis Vars. |
+| ``LocalBuffer``             | Thread-local state: scalar accumulator (``combine`` set) or scratch. v1 pins ``shape=()`` and ``scope="thread"``. |
+| ``Assign``                  | SSA body stmt: ``name = op(args)`` with ``op: ElementwiseOp``. |
+| ``Update``                  | Fold a value into a ``LocalBuffer`` accumulator: ``acc = combine(acc, value)``. |
+| ``Write``                   | Write an SSA value to output ``output`` at ``index``. |
+| ``Select`` + ``SelectBranch`` | Coord-predicated binding (replaces the old Mux). |
+| ``Stmt``                    | Union: ``Assign | Update | Write | Select``. |
 
-**Rule:** Imports ``base`` and ``tensor`` (needs ``ElementwiseOp`` /
-``ReduceOp`` / ``IndexMapOp`` for ``Combine.ops``, ``Assign.op``,
-``Port.indexmap``). ``expr`` is imported under ``TYPE_CHECKING`` only
-(``Expr`` appears in ``MuxBranch.select`` annotation).
+**Rule:** Imports ``base``, ``expr``, and ``tensor`` (``ElementwiseOp``
+only — ``ReduceOp`` is NOT a valid ``Assign.op``). Reductions are
+modeled as ``LocalBuffer`` + ``Update``; the former ``LoopOp.outputs``
+tuple is gone (writes are inline ``Write`` body statements).
 
 ### `gpu.py` — GPU IR (imperative C-like AST)
 
