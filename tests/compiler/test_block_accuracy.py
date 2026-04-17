@@ -72,7 +72,7 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32):
 
     # Run.
     run_result = backend.run(compiled, input_data=input_data)
-    deplodock_flat = list(run_result.outputs.values())[0]
+    deplodock_flat = list(run_result.outputs.values())[0].flatten().tolist()
 
     return deplodock_flat, eager_flat
 
@@ -143,5 +143,5 @@ def test_qwen_block_accuracy():
                 input_data[buf.name] = [compiled.constant_values[buf.name]]
 
     run_result = backend.run(compiled, input_data=input_data)
-    deplodock_flat = list(run_result.outputs.values())[0]
+    deplodock_flat = list(run_result.outputs.values())[0].flatten().tolist()
     _assert_accuracy(deplodock_flat, eager_flat)

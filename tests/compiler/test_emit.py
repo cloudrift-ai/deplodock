@@ -184,7 +184,7 @@ def test_reduce_runs_on_gpu():
 @requires_cuda
 def test_softmax_runs_on_gpu():
     """Softmax from a hand-built LoopProgram (no Graph). Uses compile_kernels
-    directly — the resulting GpuProgram is what CudaBackend.run/run_arrays expects."""
+    directly — the resulting GpuProgram is what CudaBackend.run expects."""
     import math
 
     from deplodock.compiler.backend.cuda.emit import compile_kernels

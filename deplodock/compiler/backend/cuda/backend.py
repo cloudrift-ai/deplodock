@@ -28,19 +28,14 @@ class CudaBackend(Backend):
         return compile_kernels(compile_graph(graph))
 
     def run(self, compiled: GpuProgram, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
-        """Execute the compiled program; returns outputs as flat float lists."""
+        """Execute the compiled program; returns outputs as ndarrays with declared shapes."""
         flat_input = {k: np.asarray(v, dtype=np.float32).flatten().tolist() for k, v in (input_data or {}).items()}
         result = run_program(compiled, input_data=flat_input)
-        return ProgramResult(outputs=result.outputs, time_ms=result.time_ms)
-
-    def run_arrays(self, compiled: GpuProgram, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
-        """Execute and reshape flat outputs to ndarrays using ``GpuProgram`` buffer shapes."""
-        result = self.run(compiled, input_data=input_data)
         outputs: dict[str, np.ndarray] = {}
         for name, vals in result.outputs.items():
             shape = tuple(int(d) for d in compiled.shape(name))
             outputs[name] = np.asarray(vals, dtype=np.float32).reshape(shape)
-        return outputs
+        return ProgramResult(outputs=outputs, time_ms=result.time_ms)
 
     def benchmark(
         self,

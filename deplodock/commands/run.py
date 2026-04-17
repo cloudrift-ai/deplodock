@@ -46,7 +46,8 @@ def _handle_run(args):
             dump.dump_benchmark(result)
     else:
         result = backend.run(compiled)
-        for buf_name, values in result.outputs.items():
-            logger.info("Output %s: %d elements, first 5: %s", buf_name, len(values), values[:5])
+        for buf_name, arr in result.outputs.items():
+            flat = arr.flatten()
+            logger.info("Output %s: %d elements, first 5: %s", buf_name, flat.size, flat[:5].tolist())
         if dump:
             dump.dump_result(result)

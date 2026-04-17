@@ -134,7 +134,8 @@ class CompilerDump:
         self._write_text("50_full_program.cu", source)
 
     def dump_result(self, result: ProgramResult) -> None:
-        data: dict = {"outputs": result.outputs}
+        # outputs are ndarrays; serialize as nested lists for JSON.
+        data: dict = {"outputs": {n: arr.tolist() for n, arr in result.outputs.items()}}
         if result.time_ms is not None:
             data["time_ms"] = result.time_ms
         self._write_json("60_result.json", data)

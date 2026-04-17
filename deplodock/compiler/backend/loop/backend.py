@@ -41,11 +41,7 @@ class LoopBackend(Backend):
         t0 = time.perf_counter()
         arrays = _execute(compiled, input_data or {})
         elapsed = (time.perf_counter() - t0) * 1000
-        outputs = {n: np.asarray(v, dtype=np.float32).flatten().tolist() for n, v in arrays.items()}
-        return ProgramResult(outputs=outputs, time_ms=elapsed)
-
-    def run_arrays(self, compiled: LoopProgram, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
-        return _execute(compiled, input_data or {})
+        return ProgramResult(outputs=arrays, time_ms=elapsed)
 
     # ``benchmark`` inherits the default wall-time loop from ``Backend``.
 
