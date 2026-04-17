@@ -96,4 +96,4 @@ def test_matmul_gpu():
         for ni in range(5):
             expected.append(sum(a_data[mi * 4 + k] * b_data[k * 5 + ni] for k in range(4)))
     result = CudaBackend().run(compiled, input_data={"a": a_data, "b": b_data})
-    assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-5)
+    assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected, rel=1e-5)

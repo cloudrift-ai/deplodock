@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from deplodock.compiler.ir.expr import (
     BinOp,
     Builtin,
+    Cast,
     Expr,
     FuncCall,
     Literal,
@@ -76,14 +77,6 @@ class ArrayAccess(_ExprOps):
 
     array: str
     index: Expr
-
-
-@dataclass
-class Cast(_ExprOps):
-    """Type cast: (dtype)(expr)."""
-
-    dtype: str  # "float4", "int", etc.
-    expr: Expr
 
 
 @dataclass

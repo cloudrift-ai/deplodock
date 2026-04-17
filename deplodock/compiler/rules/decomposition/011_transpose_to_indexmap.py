@@ -1,9 +1,8 @@
 """Lower TransposeOp(x, axes) → IndexMapOp.
 
-Per the tracer convention (``torch_trace.py``), ``TransposeOp.axes`` is
-always a length-2 tuple describing two dims to swap — matching PyTorch's
-``aten.transpose(dim0, dim1)``. coord_map is identity except positions a
-and b read from each other.
+``TransposeOp.axes`` is either a length-2 swap (matching
+``aten.transpose(dim0, dim1)``) or a full permutation of length ``ndim``
+(matching ``aten.permute``).
 """
 
 from deplodock.compiler.ir.base import InputOp
@@ -24,21 +23,26 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     ndim = len(in_shape)
     axes = root.op.axes
 
-    if len(axes) != 2:
-        return None  # only the 2-axis swap form is produced by the tracer
-    a = axes[0] if axes[0] >= 0 else ndim + axes[0]
-    b = axes[1] if axes[1] >= 0 else ndim + axes[1]
-    if not (0 <= a < ndim and 0 <= b < ndim):
+    if len(axes) == 2:
+        a = axes[0] if axes[0] >= 0 else ndim + axes[0]
+        b = axes[1] if axes[1] >= 0 else ndim + axes[1]
+        if not (0 <= a < ndim and 0 <= b < ndim):
+            return None
+        perm = list(range(ndim))
+        perm[a], perm[b] = perm[b], perm[a]
+    elif len(axes) == ndim:
+        perm = [(a if a >= 0 else ndim + a) for a in axes]
+        if sorted(perm) != list(range(ndim)):
+            return None
+    else:
         return None
-    coord_map = []
-    for i in range(ndim):
-        if i == a:
-            coord_map.append(placeholder(b))
-        elif i == b:
-            coord_map.append(placeholder(a))
-        else:
-            coord_map.append(placeholder(i))
-    coord_map = tuple(coord_map)
+
+    # ``perm[i]`` is the input dim that becomes output dim i. Invert so we can
+    # express each input dim as a function of output-coordinate placeholders.
+    inv = [0] * ndim
+    for i, p in enumerate(perm):
+        inv[p] = i
+    coord_map = tuple(placeholder(inv[j]) for j in range(ndim))
 
     frag = Graph()
 
