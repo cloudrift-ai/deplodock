@@ -163,9 +163,22 @@ def generate_source(
         parts.append("    cudaEventDestroy(_start);")
         parts.append("    cudaEventDestroy(_stop);")
     else:
-        # Single run.
+        # Single run with GPU-event timing (kernel-only, excludes subprocess/nvcc overhead).
+        parts.append("    cudaEvent_t _start, _stop;")
+        parts.append("    cudaEventCreate(&_start);")
+        parts.append("    cudaEventCreate(&_stop);")
+        parts.append("")
+        parts.append("    cudaEventRecord(_start);")
         parts.append(launch_code)
-        parts.append("    cudaDeviceSynchronize();")
+        parts.append("    cudaEventRecord(_stop);")
+        parts.append("    cudaEventSynchronize(_stop);")
+        parts.append("")
+        parts.append("    float _total_ms;")
+        parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
+        parts.append('    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms);')
+        parts.append("")
+        parts.append("    cudaEventDestroy(_start);")
+        parts.append("    cudaEventDestroy(_stop);")
     parts.append("")
 
     # Read back outputs.
