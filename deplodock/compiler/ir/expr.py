@@ -3,28 +3,21 @@
 Backend-agnostic expression sublanguage used by:
 
 - ``IndexMapOp.coord_map`` (``ir.tensor``): affine output→input coord maps.
-- ``Mux.select`` / ``MuxBranch.select`` (``ir.block``): coord predicates.
-- Kernel IR (``ir.kernel``): array indices, loop bounds, ternary selects.
+- ``Mux.select`` / ``MuxBranch.select`` (``ir.loop``): coord predicates.
+- GPU IR (``ir.gpu``): array indices, loop bounds, ternary selects.
 
 The ``_ExprOps`` mixin adds Python operator overloading so expressions can be
 built as arithmetic (``Var("i") * 4 + Var("j")``) and comparisons
-(``Var("i").lt(Var("n"))``).
+(``Var("i").lt(Var("n"))``). Each concrete node implements ``eval(env)`` for
+evaluation against a name → value environment (scalars or ndarrays).
 
-Coordinate helpers live here because they are pure operations over the
-expression AST — substitution, composition, and placeholder convention.
-``compose_index_maps`` is the one exception: it constructs ``IndexMapOp`` /
-``IndexSource`` from ``ir.tensor``, which it imports lazily to avoid a
-tensor→expr→tensor cycle at import time.
+Coordinate helpers (``placeholder``, ``is_placeholder``, ``substitute``) are
+pure operations over the expression AST.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from deplodock.compiler.ir.tensor import IndexMapOp
-
 
 # ---------------------------------------------------------------------------
 # Operator overloading mixin
@@ -274,9 +267,7 @@ Expr = Var | Literal | BinOp | Builtin | FuncCall | Ternary
 # ``coord_map[i]`` is an ``Expr`` over placeholder variables
 # ``Var("out_coord_0")``, ``Var("out_coord_1")``, ... — one per output
 # dimension. At lowering time the placeholders are substituted with the
-# ``Expr``s that the kernel uses for its actual output coordinates. The
-# same substitution machinery composes adjacent IndexMaps during
-# optimization.
+# ``Expr``s that the kernel uses for its actual output coordinates.
 
 
 PLACEHOLDER_PREFIX = "out_coord_"
@@ -324,46 +315,3 @@ def substitute(expr: Expr, mapping: dict[str, Expr]) -> Expr:
     if isinstance(expr, FuncCall):
         return FuncCall(expr.name, [substitute(a, mapping) for a in expr.args])
     return expr
-
-
-def compose_index_maps(outer: IndexMapOp, inner: IndexMapOp) -> IndexMapOp:
-    """Compose two adjacent IndexMapOps into one.
-
-    Substitutes the outer's placeholder coords with the inner's coord_map.
-    Both must be single-source (multi-source × multi-source composition is
-    not supported — the optimization rule rejects that case).
-
-    Returns a new ``IndexMapOp`` with:
-    - ``out_shape`` from ``outer``
-    - one source whose ``input_idx = inner.sources[0].input_idx``
-    - ``coord_map`` = outer's coord_map composed with inner's coord_map
-    - ``select`` = composed conjunction of outer's and inner's selects (if any)
-    """
-    from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
-
-    if len(outer.sources) != 1 or len(inner.sources) != 1:
-        raise ValueError("compose_index_maps only supports single-source IndexMaps")
-
-    outer_src = outer.sources[0]
-    inner_src = inner.sources[0]
-
-    # Mapping: outer's placeholder for axis i → outer's coord_map[i] applied to inner's coords.
-    # We want the result expressed over the inner's input coords; walk the inner's coord_map,
-    # substituting its placeholders with the outer's coord_map (which are themselves over the
-    # merged op's placeholders).
-    outer_to_inner_mapping = {placeholder(d).name: outer_src.coord_map[d] for d in range(len(outer_src.coord_map))}
-    merged_coord_map = tuple(substitute(c, outer_to_inner_mapping) for c in inner_src.coord_map)
-
-    merged_select = None
-    if outer_src.select is not None and inner_src.select is not None:
-        inner_select_under_outer = substitute(inner_src.select, outer_to_inner_mapping)
-        merged_select = BinOp("&&", outer_src.select, inner_select_under_outer)
-    elif outer_src.select is not None:
-        merged_select = outer_src.select
-    elif inner_src.select is not None:
-        merged_select = substitute(inner_src.select, outer_to_inner_mapping)
-
-    return IndexMapOp(
-        out_shape=tuple(outer.out_shape),
-        sources=(IndexSource(input_idx=inner_src.input_idx, coord_map=merged_coord_map, select=merged_select),),
-    )
