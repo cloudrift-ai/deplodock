@@ -207,7 +207,84 @@ def test_matmul_with_transpose_fuses_to_one_kernel():
     g.inputs, g.outputs = ["a", "b"], ["c"]
 
     lp = compile_graph(g)
-    assert len(lp.launches) == 1, f"expected 1 launch, got {len(lp.launches)}: {[l.output_name for l in lp.launches]}"
+    assert len(lp.launches) == 1, f"expected 1 launch, got {len(lp.launches)}: {[la.output_name for la in lp.launches]}"
     launch = lp.launches[0]
     assert set(launch.input_names) == {"a", "b"}, f"transpose should be absorbed; inputs={launch.input_names}"
     assert isinstance(launch.loop, LoopOp)
+
+
+def test_compose_indexmap_multi_consumer():
+    """Parent IndexMapOp with multiple consumers still composes per-consumer."""
+    from deplodock.compiler.ir.expr import Literal, placeholder
+    from deplodock.compiler.ir.tensor import IndexSource
+
+    # a(4,8) -- unsqueeze --> u(4,8,1) -- broadcast --> b1(4,8,3)
+    #                                  \-- broadcast --> b2(4,8,5)
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")
+    g.add_node(
+        IndexMapOp(out_shape=(4, 8, 1), sources=(IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(1))),)),
+        ["a"],
+        Tensor("u", (4, 8, 1)),
+        node_id="u",
+    )
+    g.add_node(
+        IndexMapOp(out_shape=(4, 8, 3), sources=(IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(1), Literal(0, "int"))),)),
+        ["u"],
+        Tensor("b1", (4, 8, 3)),
+        node_id="b1",
+    )
+    g.add_node(
+        IndexMapOp(out_shape=(4, 8, 5), sources=(IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(1), Literal(0, "int"))),)),
+        ["u"],
+        Tensor("b2", (4, 8, 5)),
+        node_id="b2",
+    )
+    g.inputs, g.outputs = ["a"], ["b1", "b2"]
+
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    before = _run(g, {"a": x})
+
+    # Fixed-point apply: compose runs once per consumer.
+    rule = _load("001_compose_indexmap.py")
+    result = _apply(g, rule)
+
+    after = _run(result, {"a": x})
+    _assert_close(before, after)
+
+    # Both consumers now read ``a`` directly.
+    im_nodes = [n for n in result.nodes.values() if isinstance(n.op, IndexMapOp)]
+    assert all(n.inputs == ["a"] for n in im_nodes), f"every IndexMapOp should read 'a': {[n.inputs for n in im_nodes]}"
+
+
+def test_offset_slice_absorbs_into_kernel():
+    """Rotary-style ``x[..., offset:]`` slice fuses into its consuming kernel."""
+    from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
+    from deplodock.compiler.ir.tensor import IndexSource
+    from deplodock.compiler.pipeline import compile_graph
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 64)), node_id="x")
+    g.add_node(InputOp(), [], Tensor("y", (4, 32)), node_id="y")
+    g.add_node(
+        IndexMapOp(
+            out_shape=(4, 32),
+            sources=(IndexSource(input_idx=0, coord_map=(placeholder(0), BinOp("+", placeholder(1), Literal(32, "int")))),),
+        ),
+        ["x"],
+        Tensor("sl", (4, 32)),
+        node_id="sl",
+    )
+    g.add_node(ElementwiseOp("mul"), ["sl", "y"], Tensor("z", (4, 32)), node_id="z")
+    g.inputs, g.outputs = ["x", "y"], ["z"]
+
+    lp = compile_graph(g)
+    assert len(lp.launches) == 1, f"expected 1 launch, got {len(lp.launches)}"
+    # The Port for x should use the absorbed offset expression.
+    from deplodock.compiler.ir.expr import render
+
+    loop = lp.launches[0].loop
+    x_port_idx = loop.inputs[lp.launches[0].input_names.index("x")].index
+    assert any("+ 32" in render(e).replace(" ", "").replace("+32", "+ 32") or "a1 + 32" in render(e) for e in x_port_idx), (
+        f"expected '+ 32' offset in Port.index, got {[render(e) for e in x_port_idx]}"
+    )
