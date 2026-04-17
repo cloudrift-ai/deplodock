@@ -88,17 +88,14 @@ coord-expression helpers that operate on it.
 
 | Symbol                      | Role                                        |
 |-----------------------------|---------------------------------------------|
-| ``Var``, ``Literal``, ``BinOp``, ``Builtin``, ``FuncCall``, ``Ternary`` | Expression nodes. |
+| ``Var``, ``Literal``, ``BinOp``, ``Builtin``, ``FuncCall``, ``Ternary`` | Expression nodes. Each has an ``eval(env)`` method for numpy evaluation. |
 | ``_ExprOps``                | Mixin: Python operator overloading for expression building. |
 | ``Expr``                    | Type alias for the union.                   |
 | ``PLACEHOLDER_PREFIX``      | Convention: ``out_coord_N`` names output coordinates. |
 | ``placeholder`` / ``is_placeholder`` | Build / recognize placeholder vars. |
 | ``substitute``              | Tree rewrite: replace named ``Var`` nodes.  |
-| ``compose_index_maps``      | Compose adjacent ``IndexMapOp``s via placeholder substitution. |
 
-**Rule:** No module-top imports from other IR files.
-``compose_index_maps`` lazy-imports ``IndexMapOp`` / ``IndexSource`` from
-``tensor`` inside the function to avoid an import cycle.
+**Rule:** No imports from other IR files.
 
 ### `frontend.py` — Torch IR
 
@@ -189,8 +186,8 @@ loop-IR ops have already been translated into statements.
 - **``expr.py``** is the common expression sublanguage. It appears inside
   ``IndexMapOp.coord_map`` (tensor), ``Mux.select`` / ``MuxBranch.select``
   (loop), and ``ArrayAccess.index`` / ``ForLoop.end`` / everywhere in
-  GPU IR. Coord-expression helpers (``substitute``, ``compose_index_maps``)
-  are pure AST operations and live here too.
+  GPU IR. Coord-expression helpers (``substitute``, ``placeholder``,
+  ``is_placeholder``) are pure AST operations and live here too.
 - **``graph.py``** is the shared container. The *contents* change per stage
   but the container doesn't.
 

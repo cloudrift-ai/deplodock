@@ -9,7 +9,6 @@ from deplodock.compiler.ir.expr import (
     Literal,
     Ternary,
     Var,
-    compose_index_maps,
     is_placeholder,
     placeholder,
     substitute,
@@ -73,78 +72,6 @@ def test_substitute_rewrites_ternary():
     assert isinstance(result, Ternary)
     assert isinstance(result.if_true, Var) and result.if_true.name == "col"
     assert isinstance(result.if_false, BinOp) and result.if_false.op == "-"
-
-
-# ---------- compose_index_maps ----------
-
-
-def test_compose_identity_with_offset():
-    # outer: identity (out_coord_0)
-    # inner: x[out_coord_0 + 5]  (slice with start=5)
-    outer = IndexMapOp(
-        out_shape=(10,),
-        sources=(IndexSource(input_idx=0, coord_map=(placeholder(0),)),),
-    )
-    inner = IndexMapOp(
-        out_shape=(10,),
-        sources=(IndexSource(input_idx=0, coord_map=(placeholder(0) + Literal(5, "int"),)),),
-    )
-    merged = compose_index_maps(outer, inner)
-    assert merged.out_shape == (10,)
-    assert len(merged.sources) == 1
-    cm = merged.sources[0].coord_map
-    assert len(cm) == 1
-    # Composed coord should be (out_coord_0 + 5)
-    assert isinstance(cm[0], BinOp) and cm[0].op == "+"
-    assert isinstance(cm[0].left, Var) and cm[0].left.name == placeholder(0).name
-    assert isinstance(cm[0].right, Literal) and cm[0].right.value == 5
-
-
-def test_compose_two_offsets():
-    # outer: x[out_coord_0 + 3]
-    # inner: x[out_coord_0 + 5]
-    # merged: x[(out_coord_0 + 3) + 5]
-    outer = IndexMapOp(
-        out_shape=(10,),
-        sources=(IndexSource(input_idx=0, coord_map=(placeholder(0) + Literal(3, "int"),)),),
-    )
-    inner = IndexMapOp(
-        out_shape=(10,),
-        sources=(IndexSource(input_idx=0, coord_map=(placeholder(0) + Literal(5, "int"),)),),
-    )
-    merged = compose_index_maps(outer, inner)
-    cm = merged.sources[0].coord_map
-    # Should be (out_coord_0 + 3) + 5 — outer's expr substituted into inner's placeholder
-    assert isinstance(cm[0], BinOp) and cm[0].op == "+"
-    assert isinstance(cm[0].right, Literal) and cm[0].right.value == 5
-    inner_add = cm[0].left
-    assert isinstance(inner_add, BinOp) and inner_add.op == "+"
-    assert isinstance(inner_add.right, Literal) and inner_add.right.value == 3
-
-
-def test_compose_transpose_with_slice():
-    # outer (slice, dim=1, start=64): x[out_coord_0, out_coord_1 + 64]
-    # inner (transpose, swap 0/1): x[out_coord_1, out_coord_0]
-    # merged: composing reads inner's coord_map under outer's placeholder mapping
-    outer = IndexMapOp(
-        out_shape=(8, 64),
-        sources=(IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(1) + Literal(64, "int"))),),
-    )
-    inner = IndexMapOp(
-        out_shape=(8, 128),
-        sources=(IndexSource(input_idx=0, coord_map=(placeholder(1), placeholder(0))),),
-    )
-    merged = compose_index_maps(outer, inner)
-    cm = merged.sources[0].coord_map
-    # inner read coord_map is (out_coord_1, out_coord_0); we substitute outer's
-    # placeholder(d) := outer.coord_map[d]:
-    #   placeholder(0) → outer.coord_map[0] = out_coord_0
-    #   placeholder(1) → outer.coord_map[1] = out_coord_1 + 64
-    # So merged coord_map = (out_coord_1 + 64, out_coord_0)
-    assert isinstance(cm[0], BinOp) and cm[0].op == "+"
-    assert isinstance(cm[0].left, Var) and cm[0].left.name == placeholder(1).name
-    assert isinstance(cm[0].right, Literal) and cm[0].right.value == 64
-    assert isinstance(cm[1], Var) and cm[1].name == placeholder(0).name
 
 
 # ---------- IndexMapOp.is_identity ----------
