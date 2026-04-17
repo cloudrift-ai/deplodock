@@ -21,9 +21,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.ir.graph import Graph
-from deplodock.compiler.ir.loop import Combine, LoopOp, Port
+from deplodock.compiler.ir.loop import Combine, Port
 
 
 @dataclass
@@ -50,13 +50,19 @@ class LoopBuffer:
 
 @dataclass
 class LoopLaunch:
-    """One ``LoopOp`` invocation wired to named buffers.
+    """One op invocation wired to named buffers.
 
-    ``input_names`` is in Port order — the i-th Port reads ``input_names[i]``.
-    ``output_name`` identifies the buffer this launch writes into.
+    ``loop`` is typically a ``LoopOp`` (for fused compute); LoopBackend
+    also accepts any graph-level ``Op`` as a "direct-call" launch (evaluated
+    via ``Op.forward``) to support ops that fusion didn't wrap (e.g.
+    non-2-axis ``TransposeOp``, ``GatherOp``). CudaBackend only handles
+    ``LoopOp`` launches and raises otherwise.
+
+    ``input_names`` is in buffer / Port order — the i-th Port reads
+    ``input_names[i]``. ``output_name`` identifies the buffer written.
     """
 
-    loop: LoopOp
+    loop: Op
     input_names: list[str]
     output_name: str
 
@@ -173,23 +179,22 @@ class LoopProgram:
             for nid, node in graph.nodes.items()
         ]
 
-        # One LoopLaunch per LoopOp node, in topological order.
+        # One LoopLaunch per compute node, in topological order. Any graph-level
+        # op that isn't Input/Constant becomes a launch; fused nodes contain a
+        # LoopOp (typical), while unfused primitives carry their original op
+        # and LoopBackend evaluates them via Op.forward directly.
         launches: list[LoopLaunch] = []
         for nid in graph.topological_order():
             node = graph.nodes[nid]
-            if isinstance(node.op, LoopOp):
-                launches.append(
-                    LoopLaunch(
-                        loop=node.op,
-                        input_names=list(node.inputs),
-                        output_name=nid,
-                    )
+            if isinstance(node.op, (InputOp, ConstantOp)):
+                continue
+            launches.append(
+                LoopLaunch(
+                    loop=node.op,
+                    input_names=list(node.inputs),
+                    output_name=nid,
                 )
-            elif not isinstance(node.op, (InputOp, ConstantOp)):
-                raise ValueError(
-                    f"LoopProgram.from_graph: node {nid!r} has unexpected op "
-                    f"{type(node.op).__name__}; expected LoopOp / InputOp / ConstantOp"
-                )
+            )
 
         return cls(
             name=name,

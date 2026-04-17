@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, ProgramResult
-from deplodock.compiler.ir.loop import Combine, LoopInput, Mux, Port
+from deplodock.compiler.ir.loop import Combine, LoopInput, LoopOp, Mux, Port
 from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -103,16 +103,23 @@ def _execute(program: LoopProgram, input_data: dict[str, np.ndarray]) -> dict[st
 
 
 def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np.ndarray]) -> np.ndarray:
-    """Evaluate one LoopLaunch. Returns an ndarray with shape == program.output_shape(launch)."""
-    loop = launch.loop
+    """Evaluate one launch. Returns ndarray with shape == program.output_shape(launch)."""
     out_shape = _concrete_shape(program.output_shape(launch))
+
+    # Non-LoopOp launches (TransposeOp with >2 axes, GatherOp, etc. that fusion
+    # didn't wrap) are evaluated via Op.forward directly.
+    if not isinstance(launch.loop, LoopOp):
+        args = [buffers[n] for n in launch.input_names]
+        result = launch.loop.forward(*args)
+        return np.asarray(result, dtype=np.float32).reshape(out_shape)
+
+    loop = launch.loop
 
     # Build $N → ndarray map by walking the LoopOp's input tree.
     dollar: dict[str, np.ndarray] = {}
-    port_idx = [0]  # Mutable cell so recursive helpers can advance it.
+    port_idx = [0]
 
     def bind(inp: LoopInput) -> np.ndarray:
-        """Evaluate an input tree node; record leaf Ports under their $N key."""
         if isinstance(inp, Port):
             key = f"${port_idx[0]}"
             buf_name = launch.input_names[port_idx[0]]
@@ -136,10 +143,11 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
             return _eval_mux(inp, out_shape, bind_for_mux_branch=bind)
         raise TypeError(f"Unknown LoopInput variant: {type(inp).__name__}")
 
-    # Pre-populate $N for all top-level inputs (bind drives port_idx).
     top_vals: list[np.ndarray] = [bind(inp) for inp in loop.inputs]
 
-    # Evaluate SSA body. ReduceOps need keepdims=True to match LoopOp.infer_shapes semantics.
+    # Evaluate SSA body. ReduceOps use keepdims=True (matches LoopOp.infer_shapes);
+    # ElementwiseOp args may need rank-alignment to reconcile keepdim-1 axes
+    # that downstream consumers don't carry (see _align_ranks below).
     values: dict[str, np.ndarray] = dict(dollar)
     for assign in loop.body:
         args = [values[a] for a in assign.args]
@@ -147,7 +155,7 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
             values[assign.name] = _reduce_keepdims(assign.op, args[0])
         else:
             assert isinstance(assign.op, ElementwiseOp)
-            values[assign.name] = assign.op.forward(*args)
+            values[assign.name] = assign.op.forward(*_align_ranks(args))
 
     if loop.body:
         result = values[loop.body[-1].name]
@@ -158,7 +166,45 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
         raise ValueError("LoopOp has neither inputs nor body")
 
     # Reshape to declared output shape (reconciles any broadcast/keepdim drift).
-    return np.asarray(result, dtype=np.float32).reshape(out_shape)
+    arr = np.asarray(result, dtype=np.float32)
+    if arr.shape != out_shape:
+        # Squeeze keepdim-1 axes that exceed the declared output rank before reshape.
+        while arr.ndim > len(out_shape):
+            size1 = [i for i in range(arr.ndim) if arr.shape[i] == 1]
+            if not size1:
+                break
+            arr = np.squeeze(arr, axis=size1[-1])
+    return arr.reshape(out_shape)
+
+
+def _align_ranks(args: list[np.ndarray]) -> list[np.ndarray]:
+    """Bring args to a broadcast-compatible rank.
+
+    When a ReduceOp with keepdim=True produces an extra size-1 axis and the
+    downstream consumer has the same rank *minus* that axis (e.g. SDPA's
+    ``mul(qk_summed, scale)``), numpy's native broadcast doesn't line up the
+    axes the way the compiler intends. We squeeze size-1 axes from
+    higher-rank args until all args share the minimum rank.
+
+    The RMSNorm case (reduce→keepdim then broadcast against a same-rank
+    tensor via IndexMap expansion) is untouched: args already have matching
+    rank so no squeezing happens.
+    """
+    if len(args) <= 1:
+        return args
+    min_rank = min(a.ndim for a in args)
+    if all(a.ndim == min_rank for a in args):
+        return args
+    aligned: list[np.ndarray] = []
+    for a in args:
+        while a.ndim > min_rank:
+            size1 = [i for i in range(a.ndim) if a.shape[i] == 1]
+            if not size1:
+                break  # no size-1 axis to squeeze; leave as-is (broadcast may still fail later)
+            # Squeeze the rightmost size-1 axis — typically the most recent keepdim artifact.
+            a = np.squeeze(a, axis=size1[-1])
+        aligned.append(a)
+    return aligned
 
 
 def _reduce_keepdims(op: ReduceOp, x: np.ndarray) -> np.ndarray:
@@ -180,6 +226,11 @@ def _eval_mux(mux: Mux, out_shape: tuple[int, ...], *, bind_for_mux_branch) -> n
     Each branch's ``select`` is an ``Expr`` over ``out_coord_N`` placeholders.
     Build a bool mask per branch by substituting coord-grid ndarrays into
     the select, then fold with ``np.where`` (first-match semantics).
+
+    Branches are ``bind``-evaluated in forward order so the enclosing
+    port_idx walker reads ``input_names[i]`` for each branch's Port in
+    the correct sequence; the ``np.where`` fold then runs in reverse so
+    earlier branches override later (catch-all) ones.
     """
     from deplodock.compiler.ir.expr import eval_expr
 
@@ -190,9 +241,12 @@ def _eval_mux(mux: Mux, out_shape: tuple[int, ...], *, bind_for_mux_branch) -> n
         grids = []
     env = {f"out_coord_{i}": grids[i] for i in range(len(grids))}
 
+    # Forward-order bind to advance the enclosing port_idx in the right sequence.
+    branch_vals = [bind_for_mux_branch(branch.input) for branch in mux.branches]
+
+    # Reverse-order mask fold: last branch is the catch-all, earlier override.
     result: np.ndarray | None = None
-    for branch in reversed(mux.branches):
-        val = bind_for_mux_branch(branch.input)
+    for branch, val in zip(reversed(mux.branches), reversed(branch_vals), strict=True):
         mask = eval_expr(branch.select, env) if branch.select is not None else True
         if result is None:
             result = np.broadcast_to(val, out_shape).astype(np.float32, copy=True)
