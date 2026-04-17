@@ -34,6 +34,11 @@ def main():
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations (default: 100)")
     parser.add_argument("--backends", default=",".join(ALL_BACKENDS), help=f"Comma-separated backends (default: {','.join(ALL_BACKENDS)})")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable per-launch tensor dumps in the Deplodock backend (implies --dump-dir if set).",
+    )
     args = parser.parse_args()
 
     try:
@@ -87,6 +92,10 @@ def main():
     cos, sin = rotary_emb(x.cpu(), position_ids.cpu())
     pos_emb = (cos.to(device), sin.to(device))
 
+    # Sanity check: print input/weight/eager-output magnitudes so the accuracy
+    # check below is known to be comparing meaningful (non-trivial) values.
+    _log_sanity_stats(block, x, pos_emb)
+
     results: dict[str, float] = {}
 
     # --- Eager ---
@@ -105,7 +114,7 @@ def main():
         from deplodock.compiler.dump import CompilerDump
 
         dump = CompilerDump.resolve(args.dump_dir)
-        us = _bench_deplodock(block, x, rotary_emb, pos_emb, dump=dump)
+        us = _bench_deplodock(block, x, rotary_emb, pos_emb, dump=dump, debug=args.debug)
         if us is not None:
             results["Deplodock (naive attn)"] = us
 
@@ -126,6 +135,52 @@ def main():
             print(f"{name:<32s} {latency_us:>12.0f} {'(attn only)':>10s}")
         else:
             print(f"{name:<32s} {latency_us:>12.0f} {speedup:>10.2f}x")
+
+
+def _log_sanity_stats(block, x, pos_emb):
+    """Log magnitudes of inputs, weights, and eager output so the accuracy
+    check (against the max_diff threshold) is known to be comparing real
+    non-trivial values — not near-zero noise."""
+    import torch
+
+    def _stats(t: torch.Tensor) -> str:
+        t = t.detach()
+        flat = t.flatten().float()
+        return f"shape={list(t.shape)} std={flat.std().item():.4f} range=[{flat.min().item():.3f}, {flat.max().item():.3f}]"
+
+    logger.info("Sanity check (inputs / weights / eager output):")
+    logger.info("  input x:   %s", _stats(x))
+    logger.info("  cos:       %s", _stats(pos_emb[0]))
+    logger.info("  sin:       %s", _stats(pos_emb[1]))
+
+    total_params = 0
+    sample_names = {"self_attn.q_proj.weight", "mlp.gate_proj.weight", "input_layernorm.weight"}
+    for name, p in block.named_parameters():
+        total_params += p.numel()
+        if name in sample_names:
+            logger.info("  weight %-40s %s", name, _stats(p))
+    logger.info("  total params: %s", f"{total_params:,}")
+
+    with torch.no_grad():
+        eager_out = block(x, position_embeddings=pos_emb)[0]
+    flat = eager_out.detach().flatten().float().cpu().numpy()
+    n = flat.size
+    above_1 = int((abs(flat) > 1.0).sum())
+    above_01 = int((abs(flat) > 0.1).sum())
+    logger.info(
+        "  eager out: shape=%s n=%d std=%.4f range=[%.3f, %.3f]  |v|>1.0: %d/%d (%.1f%%)  |v|>0.1: %d/%d (%.1f%%)",
+        list(eager_out.shape),
+        n,
+        flat.std(),
+        flat.min(),
+        flat.max(),
+        above_1,
+        n,
+        100 * above_1 / n,
+        above_01,
+        n,
+        100 * above_01 / n,
+    )
 
 
 def _bench_eager(block, x, pos_emb, warmup, iters):
@@ -171,9 +226,8 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
     return (start.elapsed_time(end) / iters) * 1000
 
 
-def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
+def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import compile_graph
     from deplodock.compiler.torch_trace import trace_module
 
     try:
@@ -182,16 +236,8 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
         if dump:
             dump.dump_input_graph(graph)
 
-        result = compile_graph(graph)
-
-        backend = CudaBackend()
-        program = backend.compile(
-            result.kernels,
-            buf_shapes=result.buf_shapes,
-            graph_inputs=result.graph_inputs,
-            graph_outputs=result.graph_outputs,
-            graph_constants=result.graph_constants,
-        )
+        backend = CudaBackend(debug=debug or None)
+        program = backend.compile(graph)
 
         if dump:
             dump.dump_program(program)
@@ -217,8 +263,8 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
                         input_data[buf.name] = param.detach().cpu().flatten().tolist()
                         matched = True
                         break
-                if not matched and buf.name in result.constant_values:
-                    input_data[buf.name] = [result.constant_values[buf.name]]
+                if not matched and buf.name in program.constant_values:
+                    input_data[buf.name] = [program.constant_values[buf.name]]
                     matched = True
                 if not matched and buf.size == 1:
                     for nid, node in graph.nodes.items():
@@ -229,6 +275,8 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None):
 
         # Run with actual data.
         run_result = backend.run(program, input_data=input_data)
+        if dump and backend.last_debug_result is not None:
+            dump.dump_per_launch_values(backend.last_debug_result.per_launch)
 
         # Compute eager reference with same inputs.
         block.cuda()

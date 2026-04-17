@@ -65,15 +65,18 @@ def handle_bench(args):
         root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
 
-    # Inject DEPLODOCK_DUMP_DIR into command tasks when --dump-dir is set.
-    # The env var uses $task_dir which is resolved at runtime by the command
-    # workload runner. Artifacts are pulled back via result_files glob.
-    if args.dump_dir:
+    # Inject DEPLODOCK_DUMP_DIR / DEPLODOCK_DEBUG into command tasks when
+    # --dump-dir / --debug are set. The env vars use $task_dir which is
+    # resolved at runtime by the command workload runner. Artifacts are
+    # pulled back via result_files glob.
+    if args.dump_dir or args.debug:
         for task in tasks:
             if task.recipe.command is not None:
                 task.recipe.command.env["DEPLODOCK_DUMP_DIR"] = "$task_dir/dump"
                 if "dump/*" not in task.recipe.command.result_files:
                     task.recipe.command.result_files.append("dump/*")
+                if args.debug:
+                    task.recipe.command.env["DEPLODOCK_DEBUG"] = "1"
 
     # Create per-recipe run directories
     recipe_run_dirs = {}
@@ -291,5 +294,11 @@ def register_bench_command(subparsers):
         action="store_true",
         default=False,
         help="Dump compiler artifacts (graphs, kernels, plans) into the results directory",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable per-launch tensor dumps in the compiled CUDA program (implies --dump-dir).",
     )
     parser.set_defaults(func=handle_bench)

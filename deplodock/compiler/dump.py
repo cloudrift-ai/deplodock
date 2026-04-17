@@ -140,6 +140,16 @@ class CompilerDump:
             data["time_ms"] = result.time_ms
         self._write_json("60_result.json", data)
 
+    def dump_per_launch_values(self, per_launch: dict) -> None:
+        """Dump per-kernel tensor snapshots from a debug run.
+
+        ``per_launch`` maps launch_idx → {buf_name: ndarray}. Writes one
+        JSON per launch so large runs don't produce a single giant file.
+        """
+        for li, bufs in per_launch.items():
+            data = {name: arr.tolist() for name, arr in bufs.items()}
+            self._write_json(f"70_launch_{li:03d}.json", data)
+
     def dump_benchmark(self, result: BenchmarkResult) -> None:
         data = {
             "time_ms": result.time_ms,

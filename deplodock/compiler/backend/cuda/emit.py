@@ -10,6 +10,7 @@ sweep; statements after (and final ``Write``s) run once per free point.
 
 from __future__ import annotations
 
+import logging
 import math
 
 from deplodock.compiler.backend.cuda.program import CudaLaunch
@@ -31,6 +32,8 @@ from deplodock.compiler.ir.loop import Assign as IrAssignStmt
 from deplodock.compiler.ir.loop import Axis, LoopOp, Port, Select, Update
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
+
+logger = logging.getLogger(__name__)
 
 _BLOCK = 256
 
@@ -59,6 +62,8 @@ def compile_kernels(program: LoopProgram) -> GpuProgram:
                 f"{type(launch.loop).__name__!r}; fusion must wrap every primitive "
                 f"into a LoopOp before CUDA codegen."
             )
+        for w in check_port_bounds(launch, program, launch_idx=i):
+            logger.warning("OOB port access: %s", w)
         kname = _kernel_name(launch.loop, i)
         gpu_kernel, arg_order = emit_kernel(launch, kname, program)
         source = _emit_kernel_source(gpu_kernel)
@@ -71,6 +76,177 @@ def compile_kernels(program: LoopProgram) -> GpuProgram:
         launches=launches,
         constant_values=dict(program.constant_values),
     )
+
+
+def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int = -1) -> list[str]:
+    """Symbolically check whether any Port.index can go out of bounds.
+
+    For each per-dim index Expr, compute the maximum value attained over
+    all combinations of axis extents and compare against the source
+    buffer's dim extent. Ports that are only referenced inside ``Select``
+    branches have their bounds evaluated *under* the branch's predicate —
+    the rotary ``rotate_half`` pattern (two halves each reading a slice of
+    a D-wide tensor and disjoint on ``axis < D/2``/``>=D/2``) is correctly
+    recognized as in-bounds because the predicate constrains the axis.
+
+    Returns a list of human-readable OOB warnings (empty when the kernel
+    is in-bounds). CUDA codegen clamps port reads via
+    ``min(max(coord, 0), extent-1)`` regardless, so OOB findings are
+    informational — they flag kernels where some predicate is expected to
+    mask the stray load but the checker couldn't prove it.
+    """
+    from deplodock.compiler.ir.loop import Select
+
+    warnings: list[str] = []
+    if not isinstance(launch.loop, LoopOp):
+        return warnings
+    loop = launch.loop
+    axes_extents = {a.name: int(a.extent) - 1 for a in loop.axes}
+    buf_name_set = {b.name for b in program.buffers}
+
+    # Collect Select predicates gating each port (by SSA name ``$N``).
+    select_preds: dict[str, list[Expr]] = {}
+    for stmt in loop.body:
+        if isinstance(stmt, Select):
+            for branch in stmt.branches:
+                select_preds.setdefault(branch.value, []).append(branch.select)
+
+    for pi, port in enumerate(loop.inputs):
+        buf_name = launch.input_names[pi] if pi < len(launch.input_names) else None
+        if buf_name is None or buf_name not in buf_name_set:
+            continue
+        src_shape = tuple(int(d) for d in program.shape(buf_name))
+        port_key = f"${pi}"
+        preds = select_preds.get(port_key, [])
+        # Per-port axis bounds, tightened by each predicate (conservatively:
+        # if any predicate proves tighter bounds for this port, use them).
+        tight_axes = _tighten_axes_from_preds(axes_extents, preds) if preds else axes_extents
+
+        for d, idx_expr in enumerate(port.index):
+            if d >= len(src_shape):
+                warnings.append(
+                    f"launch {launch_idx} ({launch.output_name}): port ${pi} ({buf_name} shape={src_shape}) "
+                    f"has index rank {len(port.index)} > buf rank {len(src_shape)}"
+                )
+                continue
+            max_coord = _max_index_value(idx_expr, tight_axes)
+            if max_coord is None:
+                continue
+            if max_coord >= src_shape[d]:
+                warnings.append(
+                    f"launch {launch_idx} ({launch.output_name}): port ${pi} ({buf_name} shape={src_shape}) "
+                    f"reads out of bounds at dim {d}: max_index={max_coord}, dim_extent={src_shape[d]}, "
+                    f"expr={idx_expr}"
+                )
+    return warnings
+
+
+def _tighten_axes_from_preds(axes_extents: dict[str, int], preds: list[Expr]) -> dict[str, int]:
+    """Return per-axis max values tightened under a set of Select predicates.
+
+    The checker handles a small pattern library: ``Var(a) < K``,
+    ``Var(a) >= K``, and ``K > Var(a)`` / ``K <= Var(a)`` — enough to
+    cover the ``rotate_half`` predicate ``axis < D/2``. Unsupported
+    predicates leave the bounds untouched (conservative: warning may
+    fire on a stray read that's actually safe).
+    """
+    # Start with the loose bounds; each predicate may reduce an axis max.
+    tight = dict(axes_extents)
+    for pred in preds:
+        for axis_name, new_max in _axis_constraints_from_pred(pred).items():
+            if axis_name in tight:
+                tight[axis_name] = min(tight[axis_name], new_max)
+    return tight
+
+
+def _axis_constraints_from_pred(pred: Expr) -> dict[str, int]:
+    """Extract ``{axis_name: max_value}`` constraints from a predicate.
+
+    Recognizes ``Var(a) < K``, ``K > Var(a)``, ``Var(a) <= K``,
+    ``K >= Var(a)`` and their AND-conjunctions (``BinOp("&&", ...)``).
+    Returns an empty dict for unrecognized predicates (no tightening).
+    """
+    if isinstance(pred, BinOp):
+        if pred.op in ("&&", "and"):
+            left = _axis_constraints_from_pred(pred.left)
+            right = _axis_constraints_from_pred(pred.right)
+            merged = dict(left)
+            for k, v in right.items():
+                merged[k] = min(merged.get(k, v), v)
+            return merged
+        # axis < K  →  axis ≤ K-1
+        if pred.op == "<":
+            axis, k = _match_var_const(pred.left, pred.right)
+            if axis is not None:
+                return {axis: k - 1}
+            axis, k = _match_var_const(pred.right, pred.left)
+            if axis is not None:  # K > axis  →  axis ≤ K-1
+                return {axis: k - 1}
+        if pred.op == "<=":
+            axis, k = _match_var_const(pred.left, pred.right)
+            if axis is not None:
+                return {axis: k}
+            axis, k = _match_var_const(pred.right, pred.left)
+            if axis is not None:  # K >= axis
+                return {axis: k}
+    return {}
+
+
+def _match_var_const(a: Expr, b: Expr) -> tuple[str | None, int]:
+    """If ``a`` is a Var and ``b`` is an int Literal, return (a.name, b.value)."""
+    if isinstance(a, Var) and isinstance(b, Literal):
+        try:
+            return a.name, int(b.value)
+        except (TypeError, ValueError):
+            return None, 0
+    return None, 0
+
+
+def _max_index_value(expr: Expr, axis_max: dict[str, int]) -> int | None:
+    """Maximum non-negative value an Expr can attain given per-axis maxes.
+
+    Conservatively bounds: Literals → value, Vars → axis_max, BinOps →
+    recursive max for +/*/%//. Returns ``None`` for unsupported shapes.
+    """
+    if isinstance(expr, Literal):
+        try:
+            return int(expr.value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(expr, Var):
+        if expr.name in axis_max:
+            return axis_max[expr.name]
+        return None
+    if isinstance(expr, BinOp):
+        left = _max_index_value(expr.left, axis_max)
+        right = _max_index_value(expr.right, axis_max)
+        if left is None or right is None:
+            return None
+        if expr.op == "+":
+            return left + right
+        if expr.op == "*":
+            return left * right
+        if expr.op == "%":
+            right_val = right
+            if right_val <= 0:
+                return None
+            return right_val - 1
+        if expr.op == "/":
+            if right <= 0:
+                return None
+            return left // right
+        if expr.op == "-":
+            # Conservative upper bound: for `a - b`, max is left - min(b).
+            # We only know min(b) statically when b is a Literal (then
+            # min == max == value). Otherwise fall back to ``left``.
+            if isinstance(expr.right, Literal):
+                try:
+                    return left - int(expr.right.value)
+                except (TypeError, ValueError):
+                    return left
+            return left
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -132,12 +308,40 @@ def _axis_env_for_reduce(axes: tuple[Axis, ...], row_idx: Expr, k: Expr) -> dict
 
 
 def _emit_port_load(port: Port, buf_name: str, src_shape: tuple, axis_env: dict[str, Expr]) -> Expr:
-    """Evaluate ``port.index`` under ``axis_env`` and emit an ArrayAccess."""
+    """Evaluate ``port.index`` under ``axis_env`` and emit an ArrayAccess.
+
+    Each per-dim coord is clamped to ``[0, dim_extent-1]`` via
+    ``max(0, min(coord, extent-1))`` so that out-of-bounds reads from
+    Select-masked branches stay in the allocated buffer (matches
+    LoopBackend's ``np.clip`` behavior). Const coords and coords that are
+    already bounded (a single Var matching the dim's extent) skip the
+    clamp to keep the emitted code tight.
+    """
     if not port.index:
         return ArrayAccess(array=buf_name, index=Literal(0, "int"))
     coords = [substitute(e, axis_env) for e in port.index]
+    coords = [_clamp_coord(c, src_shape[d] if d < len(src_shape) else None) for d, c in enumerate(coords)]
     flat = _flatten_coords(coords, src_shape)
     return ArrayAccess(array=buf_name, index=flat)
+
+
+def _clamp_coord(coord: Expr, dim_extent) -> Expr:
+    """Wrap ``coord`` in a clamp to ``[0, dim_extent-1]`` unless provably in-bounds."""
+    if dim_extent is None or not isinstance(dim_extent, int) or dim_extent <= 0:
+        return coord
+    if isinstance(coord, Literal):
+        try:
+            v = int(coord.value)
+            if 0 <= v < dim_extent:
+                return coord
+        except (TypeError, ValueError):
+            return coord
+    if dim_extent == 1:
+        return Literal(0, "int")
+    upper = Literal(dim_extent - 1, "int")
+    # (coord > upper) ? upper : ((coord < 0) ? 0 : coord)
+    clamped_high = Ternary(cond=BinOp(">", coord, upper), if_true=upper, if_false=coord)
+    return Ternary(cond=BinOp("<", clamped_high, Literal(0, "int")), if_true=Literal(0, "int"), if_false=clamped_high)
 
 
 def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:

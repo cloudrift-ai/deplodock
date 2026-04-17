@@ -11,6 +11,11 @@ def register_run_command(subparsers):
     parser.add_argument("--benchmark", action="store_true", help="Run in benchmark mode (timed iterations)")
     parser.add_argument("--iters", type=int, default=10, help="Benchmark iterations")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable per-launch tensor dumps (requires --dump-dir). Equivalent to DEPLODOCK_DEBUG=1.",
+    )
     parser.set_defaults(func=_handle_run)
 
 
@@ -31,7 +36,7 @@ def _handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    backend = CudaBackend()
+    backend = CudaBackend(debug=args.debug or None)
     compiled = backend.compile(graph)
 
     if dump:
@@ -51,3 +56,5 @@ def _handle_run(args):
             logger.info("Output %s: %d elements, first 5: %s", buf_name, flat.size, flat[:5].tolist())
         if dump:
             dump.dump_result(result)
+            if backend.last_debug_result is not None:
+                dump.dump_per_launch_values(backend.last_debug_result.per_launch)

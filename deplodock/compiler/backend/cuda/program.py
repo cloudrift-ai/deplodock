@@ -56,6 +56,7 @@ def generate_source(
     num_iters: int = 10,
     warmup: int = 3,
     input_data: dict[str, np.ndarray] | None = None,
+    debug: bool = False,
 ) -> str:
     """Generate a complete .cu program from a Program spec.
 
@@ -64,6 +65,8 @@ def generate_source(
         mode: "run" (print outputs) or "benchmark" (timed iterations).
         num_iters: Number of timed iterations (benchmark mode).
         warmup: Number of warmup iterations.
+        debug: If True, dump all non-input buffers after each kernel launch
+               as ``DBUF <launch_idx> <buf_name> <value>`` lines.
     """
     has_tma = any(getattr(launch, "tma_descriptors", None) for launch in program.launches)
     parts: list[str] = []
@@ -134,54 +137,84 @@ def generate_source(
         parts.append(_generate_tma_setup(program))
         parts.append("")
 
-    # Build launch code block.
-    launch_code = _generate_launches(program)
-
-    if mode == "benchmark":
-        # Warmup.
-        parts.append(f"    for (int _w = 0; _w < {warmup}; _w++) {{")
-        parts.append(launch_code)
-        parts.append("    }")
-        parts.append("    cudaDeviceSynchronize();")
+    if debug:
+        # Debug mode: emit launches one at a time, write each launch's output
+        # buffer to a binary file next to the binary. Python reads the files
+        # after the subprocess exits. We only dump the launch's own output
+        # buffer (not every scratch buffer) to keep disk/memory bounded.
+        buf_by_name = {b.name: b for b in program.buffers}
+        parts.append('    printf("DEBUG_START\\n");')
+        for li, launch in enumerate(program.launches):
+            single = _generate_single_launch(launch, program)
+            parts.append(f"    // --- launch {li}: {launch.kernel_name} ---")
+            parts.append(single)
+            parts.append(f"    cudaError_t _err{li} = cudaDeviceSynchronize();")
+            parts.append(f"    if (_err{li} != cudaSuccess) {{")
+            parts.append(f'        fprintf(stderr, "LAUNCH_FAIL {li} {launch.kernel_name}: %s\\n", cudaGetErrorString(_err{li}));')
+            parts.append("        return 1;")
+            parts.append("    }")
+            # Identify the launch's output buffer. For CUDA launches, the
+            # output is the last buffer arg (buffer name that's not an input).
+            out_name = _launch_output_name(launch, program)
+            if out_name is not None and out_name in buf_by_name:
+                buf = buf_by_name[out_name]
+                parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
+                parts.append(f"      cudaMemcpy(h, d_{buf.name}, {buf.size} * sizeof({buf.dtype}), cudaMemcpyDeviceToHost);")
+                parts.append(f'      FILE* fp = fopen("launch_{li:03d}.bin", "wb");')
+                parts.append(f"      fwrite(h, sizeof({buf.dtype}), {buf.size}, fp); fclose(fp);")
+                parts.append(f'      printf("DBUF {li} {buf.name} {buf.size}\\n");')
+                parts.append("      free(h); }")
+        parts.append('    printf("DEBUG_END\\n");')
         parts.append("")
-
-        # Timed iterations.
-        parts.append("    cudaEvent_t _start, _stop;")
-        parts.append("    cudaEventCreate(&_start);")
-        parts.append("    cudaEventCreate(&_stop);")
-        parts.append("")
-        parts.append("    cudaEventRecord(_start);")
-        parts.append(f"    for (int _iter = 0; _iter < {num_iters}; _iter++) {{")
-        parts.append(launch_code)
-        parts.append("    }")
-        parts.append("    cudaEventRecord(_stop);")
-        parts.append("    cudaEventSynchronize(_stop);")
-        parts.append("")
-        parts.append("    float _total_ms;")
-        parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
-        parts.append(f'    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms / {num_iters});')
-        parts.append(f'    printf("PROGRAM_LAUNCHES={len(program.launches)}\\n");')
-        parts.append("")
-        parts.append("    cudaEventDestroy(_start);")
-        parts.append("    cudaEventDestroy(_stop);")
     else:
-        # Single run with GPU-event timing (kernel-only, excludes subprocess/nvcc overhead).
-        parts.append("    cudaEvent_t _start, _stop;")
-        parts.append("    cudaEventCreate(&_start);")
-        parts.append("    cudaEventCreate(&_stop);")
+        # Build launch code block.
+        launch_code = _generate_launches(program)
+
+        if mode == "benchmark":
+            # Warmup.
+            parts.append(f"    for (int _w = 0; _w < {warmup}; _w++) {{")
+            parts.append(launch_code)
+            parts.append("    }")
+            parts.append("    cudaDeviceSynchronize();")
+            parts.append("")
+
+            # Timed iterations.
+            parts.append("    cudaEvent_t _start, _stop;")
+            parts.append("    cudaEventCreate(&_start);")
+            parts.append("    cudaEventCreate(&_stop);")
+            parts.append("")
+            parts.append("    cudaEventRecord(_start);")
+            parts.append(f"    for (int _iter = 0; _iter < {num_iters}; _iter++) {{")
+            parts.append(launch_code)
+            parts.append("    }")
+            parts.append("    cudaEventRecord(_stop);")
+            parts.append("    cudaEventSynchronize(_stop);")
+            parts.append("")
+            parts.append("    float _total_ms;")
+            parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
+            parts.append(f'    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms / {num_iters});')
+            parts.append(f'    printf("PROGRAM_LAUNCHES={len(program.launches)}\\n");')
+            parts.append("")
+            parts.append("    cudaEventDestroy(_start);")
+            parts.append("    cudaEventDestroy(_stop);")
+        else:
+            # Single run with GPU-event timing (kernel-only, excludes subprocess/nvcc overhead).
+            parts.append("    cudaEvent_t _start, _stop;")
+            parts.append("    cudaEventCreate(&_start);")
+            parts.append("    cudaEventCreate(&_stop);")
+            parts.append("")
+            parts.append("    cudaEventRecord(_start);")
+            parts.append(launch_code)
+            parts.append("    cudaEventRecord(_stop);")
+            parts.append("    cudaEventSynchronize(_stop);")
+            parts.append("")
+            parts.append("    float _total_ms;")
+            parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
+            parts.append('    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms);')
+            parts.append("")
+            parts.append("    cudaEventDestroy(_start);")
+            parts.append("    cudaEventDestroy(_stop);")
         parts.append("")
-        parts.append("    cudaEventRecord(_start);")
-        parts.append(launch_code)
-        parts.append("    cudaEventRecord(_stop);")
-        parts.append("    cudaEventSynchronize(_stop);")
-        parts.append("")
-        parts.append("    float _total_ms;")
-        parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
-        parts.append('    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms);')
-        parts.append("")
-        parts.append("    cudaEventDestroy(_start);")
-        parts.append("    cudaEventDestroy(_stop);")
-    parts.append("")
 
     # Read back outputs.
     for buf in program.buffers:
@@ -291,6 +324,48 @@ def _generate_launches(program: GpuProgram) -> str:
     return "\n".join(lines)
 
 
+def _launch_output_name(launch: GpuLaunch, program: GpuProgram) -> str | None:
+    """Best-effort: identify which buffer this launch writes to.
+
+    Convention: the kernel's last pointer parameter is the output, and the
+    corresponding launch arg is the output buffer name. TMA descriptors are
+    prepended to the args tuple, so the output is still the final regular
+    arg.
+    """
+    buf_names = {b.name for b in program.buffers}
+    for arg in reversed(launch.args):
+        if arg in buf_names:
+            return arg
+    return None
+
+
+def _generate_single_launch(launch: GpuLaunch, program: GpuProgram) -> str:
+    """Generate a single kernel launch statement (for debug mode)."""
+    lines: list[str] = []
+    buf_sizes = {b.name: b.size for b in program.buffers}
+    for buf_name in launch.zero_outputs:
+        size = buf_sizes.get(buf_name, 0)
+        lines.append(f"    cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
+
+    tma_descs = getattr(launch, "tma_descriptors", [])
+    tma_args = [_tma_var(launch, d) for d in tma_descs]
+    regular_args = [_format_arg(a, program) for a in launch.args]
+    all_args = tma_args + regular_args
+    args_str = ", ".join(all_args)
+
+    gx, gy, gz = launch.grid
+    bx, by, bz = launch.block
+    if gz == 1 and bz == 1:
+        grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
+        block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
+    else:
+        grid_str = f"dim3({gx}, {gy}, {gz})"
+        block_str = f"dim3({bx}, {by}, {bz})"
+    smem = f", {launch.smem_bytes}" if launch.smem_bytes > 0 else ""
+    lines.append(f"    {launch.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
+    return "\n".join(lines)
+
+
 def _format_arg(arg: str, program: GpuProgram) -> str:
     """Format a launch argument: buffer names become d_name, others pass through."""
     buf_names = {b.name for b in program.buffers}
@@ -350,6 +425,43 @@ def run_program(program: GpuProgram, input_data: dict[str, np.ndarray] | None = 
     return _parse_run_output(result.stdout, program)
 
 
+@dataclass
+class DebugResult:
+    """Per-launch buffer snapshots from a debug run."""
+
+    outputs: dict[str, list[float]]  # final outputs (same as ProgramResult)
+    per_launch: dict[int, dict[str, np.ndarray]]  # launch_idx → {buf_name: ndarray}
+
+
+def run_program_debug(program: GpuProgram, input_data: dict[str, np.ndarray] | None = None) -> DebugResult:
+    """Run with debug=True, returning per-launch buffer snapshots.
+
+    The generated program writes each launch's output buffer to a binary
+    file ``launch_NNN.bin`` next to the binary and emits one metadata line
+    per launch on stdout (``DBUF <li> <buf_name> <numel>``). We then read
+    the binaries and reshape them using the program's declared shapes.
+    This avoids the per-element printf that makes the stdout unusable.
+    """
+    source = generate_source(program, mode="run", input_data=input_data, debug=True)
+    binary = compile_program(source)
+
+    if input_data:
+        for buf_name, vals in input_data.items():
+            data_path = binary.parent / f"{buf_name}.bin"
+            data_path.write_bytes(np.ascontiguousarray(vals, dtype=np.float32).tobytes())
+
+    # Clean any stale launch dumps from a previous debug run so we don't
+    # return stale data if the program crashes mid-run.
+    for stale in binary.parent.glob("launch_*.bin"):
+        stale.unlink()
+
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=300, cwd=str(binary.parent))
+    if result.returncode != 0:
+        raise RuntimeError(f"Debug program execution failed:\n{result.stderr}\nstdout:\n{result.stdout}")
+
+    return _parse_debug_output(result.stdout, program, binary.parent)
+
+
 def benchmark_program(
     program: GpuProgram,
     warmup: int = 5,
@@ -400,6 +512,36 @@ def _parse_benchmark_output(stdout: str, program: GpuProgram) -> BenchmarkResult
             num_launches = int(line.split("=")[1])
 
     return BenchmarkResult(time_ms=time_ms, num_launches=num_launches)
+
+
+def _parse_debug_output(stdout: str, program: GpuProgram, workdir: Path) -> DebugResult:
+    """Parse output from a debug-mode program.
+
+    Each launch emits a ``DBUF <li> <buf_name> <numel>`` metadata line on
+    stdout and writes ``launch_NNN.bin`` into ``workdir``. We read the
+    binaries and reshape them with the declared buffer shape.
+    """
+    outputs: dict[str, list[float]] = {}
+    buf_shapes = {b.name: tuple(b.shape) for b in program.buffers}
+    per_launch_np: dict[int, dict[str, np.ndarray]] = {}
+
+    for line in stdout.strip().split("\n"):
+        if line.startswith("DBUF "):
+            parts = line.split()
+            launch_idx = int(parts[1])
+            buf_name = parts[2]
+            numel = int(parts[3])
+            bin_path = workdir / f"launch_{launch_idx:03d}.bin"
+            if not bin_path.exists():
+                continue
+            raw = np.fromfile(bin_path, dtype=np.float32, count=numel)
+            shape = buf_shapes.get(buf_name, (numel,))
+            per_launch_np.setdefault(launch_idx, {})[buf_name] = raw.reshape(shape)
+        elif line.startswith("OUT "):
+            parts = line.split()
+            outputs.setdefault(parts[1], []).append(float(parts[2]))
+
+    return DebugResult(outputs=outputs, per_launch=per_launch_np)
 
 
 def _detect_arch() -> str:

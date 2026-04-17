@@ -23,26 +23,70 @@ _REDUCE_COMBINE: dict[str, str] = {"sum": "add", "max": "max", "prod": "mul", "m
 
 
 def _same_rank(op, node, graph):
-    """IndexMapOp predicate: pass through single-source same-rank IndexMapOps.
+    """IndexMapOp predicate: only absorb IndexMapOps that are equivalent to
+    a size-1 squeeze/unsqueeze of the source buffer (identity reshape).
 
-    Multi-source IndexMapOps (cat) have Mux-like semantics that can't be
-    folded into a simple Port.index — they need their own kernel.
-    IndexMapOps that expand numel (e.g. GQA head broadcast from 4→28
-    heads) must also be rejected — absorbing them as layout nodes drops
-    their effect, causing the port's out_shape to be smaller than the
-    kernel output, which leads to out-of-bounds reads.
+    An IndexMapOp can only be absorbed as a "layout" node when it doesn't
+    change the semantic per-element mapping: its ``coord_map`` must be a
+    permutation-free subset of the output placeholders (``out_coord_k``)
+    in strictly-increasing order, with size-1 source dims bound to
+    ``Literal(0)`` and any unused output dims having size 1.
+
+    Transposes (dim-reordering), broadcasts (size-1 → size-N), and
+    arithmetic reshapes (merge/split via ``//``/``%``) are rejected here
+    and instead wrapped as standalone kernels by ``003_wrap_indexmap``.
+    Absorbing them as silent no-ops would drop their coordinate transform
+    from the kernel body while the output axes already reflect it, which
+    misaligns per-element reads against the input buffer shape.
     """
     if len(op.sources) > 1:
         return False
     in_shape = graph.nodes[node.inputs[0]].output.shape
-    if len(op.out_shape) > len(in_shape):
-        return False
-    import math
+    return _is_identity_alias(op, in_shape)
 
-    in_numel = math.prod(int(d) for d in in_shape if isinstance(d, int)) or 1
-    out_numel = math.prod(int(d) for d in op.out_shape if isinstance(d, int)) or 1
-    if out_numel > in_numel:
+
+def _is_identity_alias(op, in_shape) -> bool:
+    """True iff the IndexMapOp is a size-1 squeeze/unsqueeze (identity
+    reshape that only adds/removes size-1 dims).
+
+    Accepts: ``coord_map`` whose entries are ``Var("out_coord_k")`` in
+    strictly-increasing order of ``k`` (one per non-size-1 source dim),
+    with ``Literal(0, "int")`` entries permitted at size-1 source dims.
+    Unused output positions (ones not referenced by any ``out_coord_k``)
+    must have extent 1 in ``op.out_shape``.
+    """
+    from deplodock.compiler.ir.expr import Literal, Var
+
+    src = op.sources[0]
+    cm = src.coord_map
+    if len(cm) != len(in_shape):
         return False
+
+    next_k = 0
+    used: set[int] = set()
+    for i, entry in enumerate(cm):
+        if isinstance(entry, Literal):
+            if entry.value != 0:
+                return False
+            if i < len(in_shape) and isinstance(in_shape[i], int) and in_shape[i] != 1:
+                return False
+        elif isinstance(entry, Var) and entry.name.startswith(PLACEHOLDER_PREFIX):
+            try:
+                k = int(entry.name[len(PLACEHOLDER_PREFIX) :])
+            except ValueError:
+                return False
+            if k < next_k:
+                return False
+            next_k = k + 1
+            used.add(k)
+        else:
+            return False
+
+    for i, d in enumerate(op.out_shape):
+        if i in used:
+            continue
+        if isinstance(d, int) and d != 1:
+            return False
     return True
 
 
@@ -221,30 +265,41 @@ def _build_body_from_region(
 def _build_write_index(axes: tuple[Axis, ...], output_shape: tuple) -> tuple[Expr, ...]:
     """Build the per-output-dim index for the kernel's final Write.
 
-    When the output shape matches the full pre-reduce rank, each dim is:
-    - ``Var(axis.name)`` if the output keeps that axis's full extent
-      (softmax-like per-element output that varies with the reduce axis), or
-    - ``Literal(0, "int")`` if the output has size 1 at that position
-      (keepdim-collapsed reduce dim).
-
-    For lower-rank outputs (drop-axis reduces), use only free-axis Vars.
+    Maps the kernel's non-size-1 free axes onto the non-size-1 positions of
+    ``output_shape`` in declared order; size-1 output dims receive
+    ``Literal(0, "int")``. This handles post-reduce writes (reduce axes
+    never appear in the index), keep-dim reductions (size-1 dims from
+    collapsed reduce axes), and unsqueeze-style absorbed size-1 dims
+    uniformly.
     """
     free_axes = tuple(a for a in axes if a.kind == "free")
+    non_unit_free = [a for a in free_axes if a.extent != 1]
+    non_unit_out_count = sum(1 for d in output_shape if not (isinstance(d, int) and d == 1))
+
+    if len(non_unit_free) == non_unit_out_count:
+        out: list[Expr] = []
+        nu_idx = 0
+        for d in output_shape:
+            if isinstance(d, int) and d == 1:
+                out.append(Literal(0, "int"))
+            else:
+                out.append(Var(non_unit_free[nu_idx].name))
+                nu_idx += 1
+        return tuple(out)
+
+    # Fallbacks for edge cases where the non-unit counts don't line up.
     if len(output_shape) == len(free_axes):
         return tuple(Var(a.name) for a in free_axes)
     if len(output_shape) == len(axes):
-        out: list[Expr] = []
+        out = []
         for a, dim in zip(axes, output_shape, strict=True):
             if isinstance(dim, int) and dim == 1 and a.extent != 1:
                 out.append(Literal(0, "int"))
             else:
                 out.append(Var(a.name))
         return tuple(out)
-    # Fallback: right-align free axes onto the output dims, pad leading with 0.
     n_extra = len(output_shape) - len(free_axes)
-    out = []
-    for _ in range(n_extra):
-        out.append(Literal(0, "int"))
+    out = [Literal(0, "int") for _ in range(max(0, n_extra))]
     for a in free_axes:
         out.append(Var(a.name))
     return tuple(out)
@@ -351,38 +406,31 @@ def _emit_port_for_external(
 def _indexmap_to_port_index(op: IndexMapOp, axes: tuple[Axis, ...], src_shape: tuple) -> tuple[Expr, ...]:
     """Translate an IndexMapOp's coord_map (single source) into a Port.index.
 
-    The coord_map uses ``Var("out_coord_i")`` placeholders referring to
-    position ``i`` in ``op.out_shape``. We map those positions onto the
-    kernel's axis space:
-
-    - If ``len(op.out_shape) == len(axes)``: pre-reduce (broadcast) shape
-      — placeholder(i) → axes[i].
-    - If ``len(op.out_shape) == len(free_axes)``: post-reduce shape —
-      placeholder(i) → free_axes[i].
-    - Otherwise: right-align onto the full axes (pad with zeros for
-      missing leading positions).
-
-    For source-buffer dims of size 1 (broadcast semantics), the index is
-    forced to ``Literal(0, "int")`` regardless of what the coord_map
-    produces — matching the clip-to-in-bounds behavior of
-    ``IndexMapOp.forward``.
+    Aligns ``op.out_shape`` to the kernel's axes by matching non-size-1
+    extents from the right (mirroring how the absorbed IndexMapOp slots
+    into the surrounding kernel). Each ``out_coord_i`` placeholder is
+    substituted with the corresponding axis Var for non-size-1 positions,
+    or ``Literal(0)`` for size-1 positions. Source-buffer size-1 dims are
+    forced to ``Literal(0)`` regardless (clip-to-bounds, matches
+    ``IndexMapOp.forward``).
     """
     src = op.sources[0]
-    free_axes = tuple(a for a in axes if a.kind == "free")
-    out_rank = len(op.out_shape)
+    out_shape = op.out_shape
 
     mapping: dict[str, Expr] = {}
-    if out_rank == len(axes):
-        for i, a in enumerate(axes):
-            mapping[f"{PLACEHOLDER_PREFIX}{i}"] = Var(a.name)
-    elif out_rank == len(free_axes):
-        for i, a in enumerate(free_axes):
-            mapping[f"{PLACEHOLDER_PREFIX}{i}"] = Var(a.name)
-    else:
-        # Right-align: the last out_rank axes map onto placeholders 0..out_rank-1.
-        tail = axes[-out_rank:] if out_rank > 0 else ()
-        for i, a in enumerate(tail):
-            mapping[f"{PLACEHOLDER_PREFIX}{i}"] = Var(a.name)
+    axis_cursor = len(axes) - 1
+    for out_i in range(len(out_shape) - 1, -1, -1):
+        out_d = out_shape[out_i]
+        if isinstance(out_d, int) and out_d == 1:
+            mapping[f"{PLACEHOLDER_PREFIX}{out_i}"] = Literal(0, "int")
+            continue
+        while axis_cursor >= 0 and int(axes[axis_cursor].extent) != int(out_d):
+            axis_cursor -= 1
+        if axis_cursor < 0:
+            mapping[f"{PLACEHOLDER_PREFIX}{out_i}"] = Literal(0, "int")
+            continue
+        mapping[f"{PLACEHOLDER_PREFIX}{out_i}"] = Var(axes[axis_cursor].name)
+        axis_cursor -= 1
 
     out: list[Expr] = []
     for i, c in enumerate(src.coord_map):
@@ -396,50 +444,28 @@ def _indexmap_to_port_index(op: IndexMapOp, axes: tuple[Axis, ...], src_shape: t
 def _identity_index_for_shape(src_shape: tuple, axes: tuple[Axis, ...]) -> tuple[Expr, ...]:
     """Build an identity-like index for a buffer of ``src_shape`` under ``axes``.
 
-    Two alignment options, picked by rank match:
-
-    - ``len(src_shape) == len(axes)``: the buffer matches the full
-      pre-reduce iteration space. Map dim i → axes[i].
-    - ``len(src_shape) == len(free_axes)``: the buffer matches the
-      post-reduce output shape. Map dim i → free_axes[i] (skips reduce
-      axis).
-    - Otherwise: right-align onto the full axes tuple (padding at the
-      left); size-1 broadcast dims get ``Literal(0, "int")``.
+    Aligns ``src_shape``'s non-size-1 dims to ``axes``'s extents by walking
+    right-to-left and, for each src dim, selecting the next axis (also
+    right-to-left) with matching extent. Axes whose extent doesn't match
+    any remaining src dim are skipped — they may be reduce axes or extra
+    iteration dims (absorbed unsqueezes). Size-1 source dims become
+    ``Literal(0)`` (broadcast).
     """
     if not src_shape:
         return ()
-    free_axes = tuple(a for a in axes if a.kind == "free")
-    rank = len(src_shape)
-    n_axes = len(axes)
 
-    def _build_index(target_axes: tuple[Axis, ...]) -> tuple[Expr, ...]:
-        out: list[Expr] = []
-        for i, dim in enumerate(src_shape):
-            axis = target_axes[i]
-            if isinstance(dim, int) and dim == 1 and axis.extent != 1:
-                out.append(Literal(0, "int"))
-            else:
-                out.append(Var(axis.name))
-        return tuple(out)
+    result: list[Expr] = [Literal(0, "int")] * len(src_shape)
+    axis_cursor = len(axes) - 1  # right-to-left pointer into axes
 
-    if rank == n_axes:
-        return _build_index(axes)
-    if rank == len(free_axes):
-        return _build_index(free_axes)
-    if rank > n_axes:
-        index: list[Expr] = []
-        for i in range(rank):
-            if i < n_axes:
-                index.append(Var(axes[i].name))
-            else:
-                index.append(Literal(0, "int"))
-        return tuple(index)
-    pad = n_axes - rank
-    out: list[Expr] = []
-    for i, dim in enumerate(src_shape):
-        axis = axes[pad + i]
-        if isinstance(dim, int) and dim == 1 and axis.extent != 1:
-            out.append(Literal(0, "int"))
-        else:
-            out.append(Var(axis.name))
-    return tuple(out)
+    for i in range(len(src_shape) - 1, -1, -1):
+        dim = src_shape[i]
+        if isinstance(dim, int) and dim == 1:
+            continue
+        # Walk axes right-to-left looking for matching extent.
+        while axis_cursor >= 0 and int(axes[axis_cursor].extent) != int(dim):
+            axis_cursor -= 1
+        if axis_cursor < 0:
+            break
+        result[i] = Var(axes[axis_cursor].name)
+        axis_cursor -= 1
+    return tuple(result)

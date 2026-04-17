@@ -157,6 +157,14 @@ Backward-cone region growing via the rewriter:
 5. ``InputOp`` / ``ConstantOp`` / ``IndexMapOp`` nodes emit no kernel —
    they survive as external ``Port.buffer_id`` leaves (IndexMapOps at
    boundaries are absorbed into ``Port.indexmap``).
+6. **Layout absorption is restricted to identity-alias IndexMapOps**:
+   size-1 squeeze/unsqueeze whose ``coord_map`` is a strictly-increasing
+   subset of ``out_coord`` placeholders. Transposes, broadcasts, and
+   arithmetic reshapes are rejected by ``_same_rank`` and lowered as
+   standalone kernels via ``003_wrap_indexmap``. Port indices align
+   source-buffer dims to axis extents right-to-left rather than by
+   positional left-pad, so extra iteration axes (e.g. reduce axes or
+   absorbed unsqueezes) don't misalign the read.
 
 ## Codegen policy (backend/cuda/emit.py)
 
