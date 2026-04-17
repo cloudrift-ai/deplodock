@@ -55,8 +55,8 @@ def test_compile_graph_fuses_chain():
 
 def test_pipeline_to_program():
     compiled = CudaBackend().compile(_matmul_graph(4, 3, 2))
-    assert len(compiled.gpu.launches) >= 1
-    roles = {b.name: b.role for b in compiled.gpu.buffers}
+    assert len(compiled.launches) >= 1
+    roles = {b.name: b.role for b in compiled.buffers}
     assert roles.get("a") == "input"
     assert roles.get("b") == "input"
 

@@ -55,7 +55,7 @@ def run_graph(request) -> Callable:
 
         be = CudaBackend()
         compiled = be.compile(graph)
-        augmented = _inject_constants(dict(input_data), compiled.loop.constant_values)
+        augmented = _inject_constants(dict(input_data), compiled.constant_values)
         return be.run_arrays(compiled, input_data=augmented)
 
     return _run

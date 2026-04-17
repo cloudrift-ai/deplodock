@@ -30,9 +30,9 @@ def _make_add_program(n: int = 8) -> GpuProgram:
     return GpuProgram(
         name="test_add",
         buffers=[
-            GpuBuffer("A", n, role="input"),
-            GpuBuffer("B", n, role="input"),
-            GpuBuffer("C", n, role="output"),
+            GpuBuffer("A", (n,), role="input"),
+            GpuBuffer("B", (n,), role="input"),
+            GpuBuffer("C", (n,), role="output"),
         ],
         launches=[
             GpuLaunch(
@@ -84,9 +84,9 @@ def test_multi_kernel_program():
     prog = GpuProgram(
         name="test_multi",
         buffers=[
-            GpuBuffer("X", 4, role="input"),
-            GpuBuffer("Y", 4, role="output"),
-            GpuBuffer("Z", 4, role="output"),
+            GpuBuffer("X", (4,), role="input"),
+            GpuBuffer("Y", (4,), role="output"),
+            GpuBuffer("Z", (4,), role="output"),
         ],
         launches=[
             GpuLaunch(
@@ -149,9 +149,9 @@ def test_multi_kernel_execution():
     prog = GpuProgram(
         name="chain",
         buffers=[
-            GpuBuffer("A", 4, role="input"),
-            GpuBuffer("B", 4, role="scratch"),
-            GpuBuffer("C", 4, role="output"),
+            GpuBuffer("A", (4,), role="input"),
+            GpuBuffer("B", (4,), role="scratch"),
+            GpuBuffer("C", (4,), role="output"),
         ],
         launches=[
             GpuLaunch(
