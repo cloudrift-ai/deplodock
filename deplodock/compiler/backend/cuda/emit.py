@@ -61,6 +61,12 @@ def compile_kernels(program: LoopProgram) -> GpuProgram:
 
     launches: list[CudaLaunch] = []
     for i, launch in enumerate(program.launches):
+        if not isinstance(launch.loop, LoopOp):
+            raise TypeError(
+                f"CudaBackend: launch {i} has non-LoopOp "
+                f"{type(launch.loop).__name__!r}; fusion must wrap every primitive "
+                f"into a LoopOp before CUDA codegen."
+            )
         kname = _kernel_name(launch.loop, i)
         gpu_kernel, arg_order = emit_kernel(launch, kname, program)
         source = _emit_kernel_source(gpu_kernel)
