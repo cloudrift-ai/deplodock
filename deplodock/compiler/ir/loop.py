@@ -209,39 +209,6 @@ class LoopOp(Op):
         """Output shape = extents of free axes in declaration order."""
         return tuple(a.extent for a in self.free_axes())
 
-    def infer_shapes(self, input_shapes: dict[str, tuple] | None = None) -> dict[str, tuple]:
-        """Derive per-SSA-name shape by walking the body."""
-        iter_shape = tuple(a.extent for a in self.axes)
-        axis_name_to_pos = {a.name: i for i, a in enumerate(self.axes)}
-        shapes: dict[str, tuple] = {}
-
-        for i, port in enumerate(self.inputs):
-            shape = _port_effective_shape(port, iter_shape, axis_name_to_pos)
-            shapes[f"${i}"] = shape
-
-        # LocalBuffers are scalars in v1; their "read" shape is () (plus
-        # whatever broadcast the consumer applies).
-        for lb in self.locals:
-            shapes[lb.name] = ()
-
-        for stmt in self.body:
-            if isinstance(stmt, Assign):
-                arg_shapes = [shapes[a] for a in stmt.args if a in shapes]
-                if not arg_shapes:
-                    shapes[stmt.name] = ()
-                    continue
-                try:
-                    shapes[stmt.name] = stmt.op.infer_output_shape(arg_shapes)
-                except (ValueError, TypeError):
-                    shapes[stmt.name] = max(arg_shapes, key=len)
-            elif isinstance(stmt, Select):
-                # Shape of a Select = broadcast of branch shapes. Conservative: () or
-                # the shape of the first branch's value if known.
-                first = stmt.branches[0].value
-                shapes[stmt.name] = shapes.get(first, ())
-
-        return shapes
-
 
 # ---------------------------------------------------------------------------
 # Validation helpers
@@ -321,22 +288,3 @@ def _validate(loop: LoopOp) -> None:
         expected = set(range(max(output_indices) + 1))
         if output_indices != expected:
             raise ValueError(f"Write.output indices {sorted(output_indices)} do not form a dense [0, N) range")
-
-
-def _port_effective_shape(
-    port: Port,
-    iter_shape: tuple[int, ...],
-    axis_name_to_pos: dict[str, int],
-) -> tuple[int, ...]:
-    """Return the effective shape the body sees through this port."""
-    from deplodock.compiler.ir.expr import Literal, Var
-
-    out: list[int] = []
-    for e in port.index:
-        if isinstance(e, Var) and e.name in axis_name_to_pos:
-            out.append(iter_shape[axis_name_to_pos[e.name]])
-        elif isinstance(e, Literal):
-            out.append(1)
-        else:
-            out.append(1)
-    return tuple(out)

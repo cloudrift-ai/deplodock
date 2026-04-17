@@ -102,14 +102,9 @@ class CompilerDump:
         }
         self._write_json("30_execution_plan.json", summary)
 
-    def dump_loop_ir(self, program_ir, kernel_name: str, schedule: object | None = None) -> None:
-        """Dump a LoopProgram as pretty-printed text and JSON."""
-        from deplodock.compiler.ir.gpu import pretty_print, to_dict
-
-        self._write_text(f"35_loop_ir_{kernel_name}.txt", pretty_print(program_ir, schedule=schedule))
-        self._write_json(f"35_loop_ir_{kernel_name}.json", to_dict(program_ir, schedule=schedule))
-
     def dump_program(self, program: GpuProgram) -> None:
+        from deplodock.compiler.backend.cuda.program import generate_source
+
         summary = {
             "name": program.name,
             "buffers": [{"name": b.name, "size": b.size, "dtype": b.dtype, "role": b.role} for b in program.buffers],
@@ -127,8 +122,18 @@ class CompilerDump:
         }
         self._write_json("40_program_summary.json", summary)
         self._write_text("40_program.txt", program.pretty_print())
-        for i, launch in enumerate(program.launches):
-            self._write_text(f"40_kernel_{i:02d}_{launch.kernel_name}.cu", launch.kernel_source)
+
+        # Kernel sources concatenated (deduplicated by name, same order as generate_source).
+        seen: set[str] = set()
+        kernels: list[str] = []
+        for launch in program.launches:
+            if launch.kernel_name not in seen:
+                kernels.append(launch.kernel_source)
+                seen.add(launch.kernel_name)
+        self._write_text("40_kernels.cu", "\n\n".join(kernels))
+
+        # Full nvcc input (kernels + host main) — reproduces what nvcc compiles.
+        self._write_text("40_full_program.cu", generate_source(program, mode="benchmark"))
 
     def dump_source(self, source: str) -> None:
         self._write_text("50_full_program.cu", source)

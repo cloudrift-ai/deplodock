@@ -29,9 +29,8 @@ after fusion completes.
 | `LoopLaunch(loop, input_names, output_name)`                                            | One `LoopOp` invocation wired to named buffers (Port order).      |
 | `LoopProgram(name, buffers, launches, graph_inputs/outputs/constants, constant_values)` | The full post-fusion program.                                     |
 
-`LoopProgram` exposes shape queries — `shape(name)`, `input_shapes(launch)`,
-`output_shape(launch)`, `dollar_shapes(launch)` — so codegen never
-recomputes shapes.
+`LoopProgram` exposes shape queries — `shape(name)`, `output_shape(launch)`,
+`dollar_shapes(launch)` — so codegen never recomputes shapes.
 
 **Rule:** No `aliases` field. At loop level, identity/metadata-only
 IndexMaps are baked directly into the consuming `Port.index` Exprs

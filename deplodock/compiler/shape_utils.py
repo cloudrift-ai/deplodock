@@ -1,32 +1,6 @@
-"""Shape utilities shared across passes: broadcasting + downstream propagation."""
+"""Shape utilities shared across passes: NumPy right-aligned broadcasting."""
 
 from __future__ import annotations
-
-from collections.abc import Iterable
-from typing import TYPE_CHECKING
-
-from deplodock.compiler.ir.graph import Tensor
-
-if TYPE_CHECKING:
-    from deplodock.compiler.ir.graph import Graph
-
-
-def is_broadcast_compatible(small_shape: tuple, large_shape: tuple) -> bool:
-    """Check if small broadcasts to large via NumPy-style right-aligned rules.
-
-    Aligns shapes from the right. Each dim of small must be 1 or match the
-    corresponding dim of large. Symbolic (non-int) dims are skipped.
-    """
-    if len(small_shape) > len(large_shape):
-        return False
-    offset = len(large_shape) - len(small_shape)
-    for i, s in enumerate(small_shape):
-        large_dim = large_shape[offset + i]
-        if not isinstance(s, int) or not isinstance(large_dim, int):
-            continue
-        if s != 1 and s != large_dim:
-            return False
-    return True
 
 
 def broadcast_shapes(*shapes: tuple, allow_divisible: bool = False) -> tuple:
@@ -66,34 +40,3 @@ def broadcast_shapes(*shapes: tuple, allow_divisible: bool = False) -> tuple:
                 raise ValueError(f"Cannot broadcast shapes {shapes} at axis {axis}: {out_dim} vs {d}")
         result.append(out_dim)
     return tuple(result)
-
-
-def propagate_shapes(graph: Graph, start_node_ids: Iterable[str]) -> None:
-    """Re-derive output shapes for nodes downstream of start_node_ids.
-
-    For every reachable consumer (in topological order), recompute its
-    output shape by calling ``node.op.infer_output_shape(input_shapes)``.
-    Continues propagation only if the shape changed.
-
-    Inference failures (``NotImplementedError`` for ops that don't support
-    it, or ``ValueError`` for inputs the op's shape rule can't handle —
-    e.g. GQA-style broadcasts that violate strict NumPy rules) are silently
-    skipped: the node keeps its existing shape and propagation does not
-    continue past it.
-    """
-    dirty: set[str] = set(start_node_ids)
-    topo = graph.topological_order()
-    for nid in topo:
-        node = graph.nodes.get(nid)
-        if node is None:
-            continue
-        if not any(inp in dirty for inp in node.inputs):
-            continue
-        input_shapes = [graph.nodes[inp].output.shape for inp in node.inputs if inp in graph.nodes]
-        try:
-            new_shape = node.op.infer_output_shape(input_shapes)
-        except (NotImplementedError, ValueError):
-            continue
-        if new_shape != node.output.shape:
-            node.output = Tensor(name=node.output.name, shape=new_shape, dtype=node.output.dtype)
-            dirty.add(nid)

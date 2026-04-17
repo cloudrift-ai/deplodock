@@ -73,36 +73,6 @@ def _execute(program: LoopProgram, input_data: dict[str, np.ndarray]) -> dict[st
     return {name: buffers[name] for name in program.graph_outputs}
 
 
-def execute_debug(program: LoopProgram, input_data: dict[str, np.ndarray]) -> list[dict[str, np.ndarray]]:
-    """Walk the LoopProgram, returning per-launch buffer snapshots.
-
-    Returns a list (one entry per launch) where each entry maps buffer
-    names to their numpy arrays immediately after that launch executes.
-    Only includes non-input, non-constant buffers that have been written.
-    """
-    buffers: dict[str, np.ndarray] = {}
-
-    for b in program.buffers:
-        if b.role == "input":
-            if b.name not in input_data:
-                raise KeyError(f"Missing input {b.name!r} for LoopProgram")
-            buffers[b.name] = np.asarray(input_data[b.name], dtype=np.float32).reshape(_concrete_shape(b.shape))
-        elif b.role == "constant":
-            if b.name in input_data:
-                buffers[b.name] = np.asarray(input_data[b.name], dtype=np.float32).reshape(_concrete_shape(b.shape))
-            elif b.name in program.constant_values:
-                buffers[b.name] = np.array([program.constant_values[b.name]], dtype=np.float32)
-
-    snapshots: list[dict[str, np.ndarray]] = []
-    skip_roles = {"input", "constant"}
-    for launch in program.launches:
-        buffers[launch.output_name] = _exec_launch(launch, program, buffers)
-        snap = {n: arr.copy() for n, arr in buffers.items() if n in {b.name for b in program.buffers if b.role not in skip_roles}}
-        snapshots.append(snap)
-
-    return snapshots
-
-
 def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np.ndarray]) -> np.ndarray:
     """Evaluate one launch. Returns ndarray with shape == program.output_shape(launch)."""
     out_shape = _concrete_shape(program.output_shape(launch))

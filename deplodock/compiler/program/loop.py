@@ -77,8 +77,7 @@ class LoopProgram:
       - launch order (topological),
       - constant scalar values.
 
-    Downstream consumers (codegen) read shapes via the helper methods;
-    no one recomputes shapes from ``LoopOp.infer_shapes``.
+    Downstream consumers (codegen) read shapes via the helper methods.
     """
 
     name: str
@@ -97,10 +96,6 @@ class LoopProgram:
             if b.name == name:
                 return tuple(b.shape)
         raise KeyError(f"Buffer {name!r} not in LoopProgram")
-
-    def input_shapes(self, launch: LoopLaunch) -> tuple[tuple, ...]:
-        """Shapes of the external buffers read by ``launch`` (Port order)."""
-        return tuple(self.shape(n) for n in launch.input_names)
 
     def output_shape(self, launch: LoopLaunch) -> tuple:
         """Shape of the buffer written by ``launch``."""
