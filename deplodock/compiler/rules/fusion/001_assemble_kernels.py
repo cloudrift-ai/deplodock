@@ -23,21 +23,19 @@ _REDUCE_COMBINE: dict[str, str] = {"sum": "add", "max": "max", "prod": "mul", "m
 
 
 def _same_rank(op, node, graph):
-    """IndexMapOp predicate: only absorb IndexMapOps that are equivalent to
-    a size-1 squeeze/unsqueeze of the source buffer (identity reshape).
+    """IndexMapOp predicate: absorb IndexMapOps that translate to simple
+    per-dim index Exprs — pure permutations, broadcasts, squeezes, and
+    unsqueezes.
 
-    An IndexMapOp can only be absorbed as a "layout" node when it doesn't
-    change the semantic per-element mapping: its ``coord_map`` must be a
-    permutation-free subset of the output placeholders (``out_coord_k``)
-    in strictly-increasing order, with size-1 source dims bound to
-    ``Literal(0)`` and any unused output dims having size 1.
+    Each ``coord_map`` entry must be either:
+      - ``Literal(0, "int")`` at a size-1 source dim (broadcast read), or
+      - ``Var("out_coord_k")`` for some output axis ``k`` — any ``k``, any
+        order (covers transposes, leading/trailing singleton adds, and
+        size-1 → size-N broadcasts).
 
-    Transposes (dim-reordering), broadcasts (size-1 → size-N), and
-    arithmetic reshapes (merge/split via ``//``/``%``) are rejected here
-    and instead wrapped as standalone kernels by ``003_wrap_indexmap``.
-    Absorbing them as silent no-ops would drop their coordinate transform
-    from the kernel body while the output axes already reflect it, which
-    misaligns per-element reads against the input buffer shape.
+    Arithmetic entries (``BinOp``, ``FuncCall``) such as ``out_coord_1 / 8``
+    for GQA replication or ``// %`` head-split reshapes fall through to
+    ``003_wrap_indexmap`` as standalone copy kernels.
     """
     if len(op.sources) > 1:
         return False
@@ -46,14 +44,14 @@ def _same_rank(op, node, graph):
 
 
 def _is_identity_alias(op, in_shape) -> bool:
-    """True iff the IndexMapOp is a size-1 squeeze/unsqueeze (identity
-    reshape that only adds/removes size-1 dims).
+    """True iff every ``coord_map`` entry is a plain placeholder or a
+    ``Literal(0)`` at a size-1 source dim, and every non-size-1 output dim
+    is covered by a placeholder. See :func:`_same_rank`.
 
-    Accepts: ``coord_map`` whose entries are ``Var("out_coord_k")`` in
-    strictly-increasing order of ``k`` (one per non-size-1 source dim),
-    with ``Literal(0, "int")`` entries permitted at size-1 source dims.
-    Unused output positions (ones not referenced by any ``out_coord_k``)
-    must have extent 1 in ``op.out_shape``.
+    Permutations (any placeholder order) are fine. Broadcasts into new
+    non-unit output dims are NOT allowed here — they expand the consumer
+    kernel's iteration space in ways the region matcher can't currently
+    reconcile with downstream reductions.
     """
     from deplodock.compiler.ir.expr import Literal, Var
 
@@ -62,7 +60,6 @@ def _is_identity_alias(op, in_shape) -> bool:
     if len(cm) != len(in_shape):
         return False
 
-    next_k = 0
     used: set[int] = set()
     for i, entry in enumerate(cm):
         if isinstance(entry, Literal):
@@ -75,9 +72,6 @@ def _is_identity_alias(op, in_shape) -> bool:
                 k = int(entry.name[len(PLACEHOLDER_PREFIX) :])
             except ValueError:
                 return False
-            if k < next_k:
-                return False
-            next_k = k + 1
             used.add(k)
         else:
             return False

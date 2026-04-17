@@ -154,16 +154,24 @@ Backward-cone region growing via the rewriter:
    they survive as external buffers referenced by ``LoopLaunch.input_names``
    in ``Port`` order. Identity-alias IndexMapOps at boundaries are baked
    into the consuming ``Port.index`` Exprs during fusion (see step 6).
-6. **Layout absorption is restricted to identity-alias IndexMapOps**:
-   size-1 squeeze/unsqueeze whose ``coord_map`` is a strictly-increasing
-   subset of ``out_coord`` placeholders. Transposes, broadcasts, and
-   arithmetic reshapes are rejected by ``_same_rank`` and lowered as
-   standalone kernels via ``003_wrap_indexmap``. Absorbed IndexMapOps
-   are baked directly into the consuming ``Port.index`` Exprs; there is
-   no separate ``indexmap`` field on Port. Port indices align source-buffer
-   dims to axis extents right-to-left rather than by positional left-pad,
-   so extra iteration axes (e.g. reduce axes or absorbed unsqueezes)
-   don't misalign the read.
+6. **Layout absorption covers permutations + identity aliases**: a
+   ``coord_map`` entry must be either ``Literal(0)`` at a size-1 source
+   dim or ``Var("out_coord_k")`` for any ``k`` (any order — transposes
+   qualify), with every non-size-1 output dim covered by some
+   placeholder. Broadcasts into fresh non-unit output dims and arithmetic
+   reshapes (``//``, ``%``, ``+`` offsets, GQA ``/N``) are rejected by
+   ``_same_rank`` and lowered as standalone kernels via
+   ``003_wrap_indexmap``. Absorbed IndexMapOps are baked directly into
+   the consuming ``Port.index`` Exprs; there is no separate ``indexmap``
+   field on Port. Port indices align source-buffer dims to axis extents
+   right-to-left rather than by positional left-pad, so extra iteration
+   axes (e.g. reduce axes or absorbed unsqueezes) don't misalign the read.
+7. **IndexMap composition** (``optimization/001_compose_indexmap``):
+   before fusion, adjacent single-source IndexMapOp chains collapse into
+   one op with a substituted ``coord_map``. This reduces double-hop
+   chains (e.g. matmul's ``unsqueeze → broadcast``) to a single
+   IndexMapOp, which rule 001 can then absorb into the consuming kernel's
+   ``Port.index``.
 
 ## Codegen policy (backend/cuda/emit.py)
 
