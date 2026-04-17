@@ -1,39 +1,23 @@
-"""End-to-end accuracy tests: compare deplodock output against PyTorch eager.
+"""End-to-end accuracy tests: verify deplodock output on canonical patterns.
 
-Uses actual PyTorch tensor data (not pseudo-random) so the numerical
-comparison is meaningful. Requires a GPU.
+Parametrized over backends (numpy / loop / cuda) via the ``run_graph``
+fixture in ``conftest.py``; the cuda variant is skipped when nvcc+GPU
+are unavailable. Expected values are computed with numpy directly — no
+torch dependency.
 """
 
-import pytest
-import torch
+import numpy as np
 
-from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
-requires_cuda = pytest.mark.skipif(
-    not has_nvcc() or not has_cuda_gpu(),
-    reason="CUDA not available (need nvcc + GPU)",
-)
 
-
-def _compile_and_run(graph: Graph, input_data: dict[str, list[float]]) -> dict[str, list[float]]:
-    """Full pipeline: compile_graph → CudaBackend.compile → run."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import compile_graph
-
-    loop_program = compile_graph(graph)
-    program = CudaBackend().compile(loop_program)
-    run_result = CudaBackend().run(program, input_data=input_data)
-    return run_result.outputs
-
-
-def _assert_close(actual: list[float], expected: list[float], *, rtol: float = 1e-4, atol: float = 1e-5):
-    assert len(actual) == len(expected), f"length mismatch: {len(actual)} vs {len(expected)}"
-    max_diff = max(abs(a - e) for a, e in zip(actual, expected, strict=True))
-    mean_diff = sum(abs(a - e) for a, e in zip(actual, expected, strict=True)) / len(actual)
-    assert max_diff < atol + rtol * max(abs(e) for e in expected), f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
+def _assert_close(actual, expected, *, rtol: float = 1e-4, atol: float = 1e-5):
+    actual = np.asarray(actual, dtype=np.float32).flatten()
+    expected = np.asarray(expected, dtype=np.float32).flatten()
+    assert actual.shape == expected.shape, f"shape mismatch: {actual.shape} vs {expected.shape}"
+    np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
 
 
 # ---------------------------------------------------------------------------
@@ -41,8 +25,7 @@ def _assert_close(actual: list[float], expected: list[float], *, rtol: float = 1
 # ---------------------------------------------------------------------------
 
 
-@requires_cuda
-def test_e2e_pointwise_add():
+def test_e2e_pointwise_add(run_graph):
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (8,)), node_id="x")
     g.add_node(InputOp(), [], Tensor("y", (8,)), node_id="y")
@@ -50,11 +33,10 @@ def test_e2e_pointwise_add():
     g.inputs = ["x", "y"]
     g.outputs = ["z"]
 
-    x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-    y = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
-    outputs = _compile_and_run(g, {"x": x, "y": y})
-    expected = [a + b for a, b in zip(x, y, strict=True)]
-    _assert_close(list(outputs.values())[0], expected)
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], dtype=np.float32)
+    y = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0], dtype=np.float32)
+    outputs = run_graph(g, {"x": x, "y": y})
+    _assert_close(list(outputs.values())[0], x + y)
 
 
 # ---------------------------------------------------------------------------
@@ -62,19 +44,17 @@ def test_e2e_pointwise_add():
 # ---------------------------------------------------------------------------
 
 
-@requires_cuda
-def test_e2e_reduce_sum():
+def test_e2e_reduce_sum(run_graph):
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(ReduceOp("sum", -1), ["x"], Tensor("y", (4,)), node_id="y")
     g.inputs = ["x"]
     g.outputs = ["y"]
 
-    torch.manual_seed(0)
-    x_t = torch.randn(4, 8)
-    x_data = x_t.flatten().tolist()
-    expected = x_t.sum(-1).flatten().tolist()
-    outputs = _compile_and_run(g, {"x": x_data})
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    expected = x.sum(-1)
+    outputs = run_graph(g, {"x": x})
     _assert_close(list(outputs.values())[0], expected)
 
 
@@ -83,8 +63,7 @@ def test_e2e_reduce_sum():
 # ---------------------------------------------------------------------------
 
 
-@requires_cuda
-def test_e2e_matmul():
+def test_e2e_matmul(run_graph):
     from deplodock.compiler.ir.frontend import MatmulOp
 
     g = Graph()
@@ -94,11 +73,11 @@ def test_e2e_matmul():
     g.inputs = ["a", "b"]
     g.outputs = ["c"]
 
-    torch.manual_seed(0)
-    a_t = torch.randn(4, 8)
-    b_t = torch.randn(8, 3)
-    expected = (a_t @ b_t).flatten().tolist()
-    outputs = _compile_and_run(g, {"a": a_t.flatten().tolist(), "b": b_t.flatten().tolist()})
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((4, 8)).astype(np.float32)
+    b = rng.standard_normal((8, 3)).astype(np.float32)
+    expected = a @ b
+    outputs = run_graph(g, {"a": a, "b": b})
     _assert_close(list(outputs.values())[0], expected, rtol=1e-3)
 
 
@@ -107,18 +86,16 @@ def test_e2e_matmul():
 # ---------------------------------------------------------------------------
 
 
-@requires_cuda
-def test_e2e_rmsnorm():
+def test_e2e_rmsnorm(run_graph):
     """RMSNorm: x * rsqrt(sum(x^2) + eps) * w."""
-    torch.manual_seed(42)
     rows, dim = 8, 64
     eps = 1e-6
 
-    x_t = torch.randn(rows, dim).cuda()
-    w_t = torch.randn(dim).cuda()
-    sq_sum = x_t.pow(2).sum(-1, keepdim=True)
-    ref = x_t * torch.rsqrt(sq_sum + eps) * w_t
-    expected = ref.cpu().flatten().tolist()
+    rng = np.random.default_rng(42)
+    x = rng.standard_normal((rows, dim)).astype(np.float32)
+    w = rng.standard_normal((dim,)).astype(np.float32)
+    sq_sum = (x * x).sum(-1, keepdims=True)
+    expected = x * (1.0 / np.sqrt(sq_sum + eps)) * w
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("X", (rows, dim)), node_id="X")
@@ -134,14 +111,7 @@ def test_e2e_rmsnorm():
     g.add_node(ElementwiseOp("mul"), ["norm", "w"], Tensor("out", (rows, dim)), node_id="out")
     g.outputs = ["out"]
 
-    outputs = _compile_and_run(
-        g,
-        {
-            "X": x_t.cpu().flatten().tolist(),
-            "w": w_t.cpu().flatten().tolist(),
-            "eps": [eps],
-        },
-    )
+    outputs = run_graph(g, {"X": x, "w": w})
     _assert_close(list(outputs.values())[0], expected, rtol=1e-3)
 
 
@@ -150,13 +120,14 @@ def test_e2e_rmsnorm():
 # ---------------------------------------------------------------------------
 
 
-@requires_cuda
-def test_e2e_softmax():
+def test_e2e_softmax(run_graph):
     """Softmax: max → sub → exp → sum → div."""
-    torch.manual_seed(0)
     rows, cols = 4, 8
-    x_t = torch.randn(rows, cols).cuda()
-    expected = torch.softmax(x_t, dim=-1).cpu().flatten().tolist()
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((rows, cols)).astype(np.float32)
+    mx = x.max(-1, keepdims=True)
+    ex = np.exp(x - mx)
+    expected = ex / ex.sum(-1, keepdims=True)
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (rows, cols)), node_id="x")
@@ -169,5 +140,5 @@ def test_e2e_softmax():
     g.add_node(ElementwiseOp("div"), ["exp", "sm"], Tensor("out", (rows, cols)), node_id="out")
     g.outputs = ["out"]
 
-    outputs = _compile_and_run(g, {"x": x_t.cpu().flatten().tolist()})
+    outputs = run_graph(g, {"x": x})
     _assert_close(list(outputs.values())[0], expected, rtol=1e-3)

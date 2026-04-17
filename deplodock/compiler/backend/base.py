@@ -1,22 +1,33 @@
-"""Backend abstraction for compiling and running a ``LoopProgram``.
+"""Backend abstraction for compiling and running a ``Graph``.
 
-A Backend lowers a ``LoopProgram`` (the post-fusion program form) to a
-backend-specific runnable artifact and executes it. Each backend (CUDA,
-ROCm, NumPy, ...) implements this interface.
+A Backend lowers a ``Graph`` to a backend-specific runnable artifact and
+executes it. Each backend (NumPy, Loop, CUDA, ...) implements this
+interface; all backends share the same call surface:
+
+    compiled = backend.compile(graph)
+    outputs  = backend.run_arrays(compiled, input_data={...})   # dict[name, ndarray]
+
+Individual backends may do different internal lowerings: the CUDA backend
+runs ``compile_graph → compile_kernels`` internally, the Loop backend runs
+``compile_graph`` only, the numpy backend walks the graph directly. From
+the caller's perspective the interface is identical.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from deplodock.compiler.program.loop import LoopProgram
+if TYPE_CHECKING:
+    import numpy as np
+
+    from deplodock.compiler.ir.graph import Graph
 
 
 @dataclass
 class ProgramResult:
-    """Result of running a program."""
+    """Result of running a program: outputs as flat lists + optional timing."""
 
     outputs: dict[str, list[float]]
     time_ms: float | None = None
@@ -33,16 +44,20 @@ class BenchmarkResult:
 
 
 class Backend(ABC):
-    """Abstract backend for compiling + executing a ``LoopProgram``."""
+    """Abstract backend: Graph → compiled artifact → run."""
 
     @abstractmethod
-    def compile(self, program: LoopProgram) -> Any:
-        """Lower a ``LoopProgram`` to a backend-specific runnable program."""
+    def compile(self, graph: Graph) -> Any:
+        """Lower a ``Graph`` to a backend-specific runnable artifact."""
 
     @abstractmethod
-    def run(self, program: Any) -> ProgramResult:
-        """Execute a compiled program and return outputs."""
+    def run(self, compiled: Any, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
+        """Execute; return outputs as flat lists (subprocess-friendly)."""
 
     @abstractmethod
-    def benchmark(self, program: Any, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
-        """Execute a compiled program with timing."""
+    def run_arrays(self, compiled: Any, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+        """Execute; return outputs as numpy arrays with declared shapes."""
+
+    @abstractmethod
+    def benchmark(self, compiled: Any, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
+        """Execute with timing."""

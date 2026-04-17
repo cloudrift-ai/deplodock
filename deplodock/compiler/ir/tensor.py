@@ -265,52 +265,16 @@ class IndexMapOp(Op):
     def forward(self, *inputs):
         import numpy as np
 
-        from deplodock.compiler.ir.expr import BinOp, Literal, Ternary, Var
-
-        def _eval(expr, env):
-            if isinstance(expr, Var):
-                return env[expr.name]
-            if isinstance(expr, Literal):
-                return expr.value
-            if isinstance(expr, BinOp):
-                lv, r = _eval(expr.left, env), _eval(expr.right, env)
-                if expr.op == "+":
-                    return lv + r
-                if expr.op == "-":
-                    return lv - r
-                if expr.op == "*":
-                    return lv * r
-                if expr.op in ("/", "//"):
-                    return int(lv) // int(r)
-                if expr.op == "%":
-                    return int(lv) % int(r)
-                if expr.op == "<":
-                    return lv < r
-                if expr.op == "<=":
-                    return lv <= r
-                if expr.op == ">":
-                    return lv > r
-                if expr.op == ">=":
-                    return lv >= r
-                if expr.op == "==":
-                    return lv == r
-                if expr.op == "&&":
-                    return bool(lv) and bool(r)
-                if expr.op == "||":
-                    return bool(lv) or bool(r)
-                raise ValueError(f"Unknown BinOp: {expr.op}")
-            if isinstance(expr, Ternary):
-                return _eval(expr.if_true, env) if _eval(expr.cond, env) else _eval(expr.if_false, env)
-            raise TypeError(f"Unsupported expr type in IndexMapOp.forward: {type(expr).__name__}")
+        from deplodock.compiler.ir.expr import eval_expr
 
         shape = tuple(int(d) for d in self.out_shape)
         output = np.empty(shape, dtype=inputs[0].dtype if inputs else np.float32)
         for out_idx in np.ndindex(shape):
             env = {f"out_coord_{i}": out_idx[i] for i in range(len(out_idx))}
             for source in self.sources:
-                if source.select is not None and not _eval(source.select, env):
+                if source.select is not None and not eval_expr(source.select, env):
                     continue
-                in_coords = tuple(int(_eval(c, env)) for c in source.coord_map)
+                in_coords = tuple(int(eval_expr(c, env)) for c in source.coord_map)
                 output[out_idx] = inputs[source.input_idx][in_coords]
                 break
         return output

@@ -187,6 +187,112 @@ def is_placeholder(expr: object, d: int | None = None) -> bool:
     return expr.name == f"{PLACEHOLDER_PREFIX}{d}"
 
 
+def eval_expr(expr: Expr, env: dict[str, object]) -> object:
+    """Evaluate an ``Expr`` given a name → value environment.
+
+    Values in ``env`` may be scalars or numpy ndarrays; all BinOp operators
+    compose over ndarrays via numpy broadcasting. Used by:
+    - ``IndexMapOp.forward`` (scalar env — per-coord evaluation).
+    - ``LoopBackend`` (ndarray env — Mux select masks over coord grids).
+
+    Supported:
+    - ``Var``: looked up in ``env``.
+    - ``Literal``: returns its ``.value``.
+    - ``BinOp``: arithmetic (``+``, ``-``, ``*``, ``/``, ``//``, ``%``),
+      relational (``<``, ``<=``, ``>``, ``>=``, ``==``), logical
+      (``&&``, ``||``). Integer-like division uses floor for ``/`` + ``//``.
+    - ``Ternary``: ``cond ? if_true : if_false`` — both branches are
+      evaluated; for ndarray ``cond`` the caller should use ``np.where``
+      semantics (this helper uses Python conditional, which only works
+      for scalar ``cond``).
+    - ``FuncCall``: math intrinsics (``expf``/``exp``, ``fmaxf``/``fmax``,
+      ``rsqrtf``/``rsqrt``, ``tanhf``/``tanh``, ``fabsf``/``abs``).
+    - ``Builtin``: raises (not evaluable outside a kernel).
+    """
+
+    def _ev(e):
+        if isinstance(e, Var):
+            return env[e.name]
+        if isinstance(e, Literal):
+            return e.value
+        if isinstance(e, BinOp):
+            lv, rv = _ev(e.left), _ev(e.right)
+            op = e.op
+            if op == "+":
+                return lv + rv
+            if op == "-":
+                return lv - rv
+            if op == "*":
+                return lv * rv
+            if op in ("/", "//"):
+                # Floor division; int-cast in the scalar path to match prior semantics.
+                try:
+                    return int(lv) // int(rv)
+                except TypeError:
+                    return lv // rv
+            if op == "%":
+                try:
+                    return int(lv) % int(rv)
+                except TypeError:
+                    return lv % rv
+            if op == "<":
+                return lv < rv
+            if op == "<=":
+                return lv <= rv
+            if op == ">":
+                return lv > rv
+            if op == ">=":
+                return lv >= rv
+            if op == "==":
+                return lv == rv
+            if op == "&&":
+                try:
+                    return bool(lv) and bool(rv)
+                except (TypeError, ValueError):
+                    # Elementwise logical-AND for ndarrays.
+                    import numpy as np
+
+                    return np.logical_and(lv, rv)
+            if op == "||":
+                try:
+                    return bool(lv) or bool(rv)
+                except (TypeError, ValueError):
+                    import numpy as np
+
+                    return np.logical_or(lv, rv)
+            raise ValueError(f"Unknown BinOp: {op}")
+        if isinstance(e, Ternary):
+            return _ev(e.if_true) if _ev(e.cond) else _ev(e.if_false)
+        if isinstance(e, FuncCall):
+            import numpy as np
+
+            _FNS = {
+                "expf": np.exp,
+                "exp": np.exp,
+                "rsqrtf": lambda x: 1.0 / np.sqrt(x),
+                "rsqrt": lambda x: 1.0 / np.sqrt(x),
+                "tanhf": np.tanh,
+                "tanh": np.tanh,
+                "fabsf": np.abs,
+                "fabs": np.abs,
+                "fmaxf": np.maximum,
+                "fmax": np.maximum,
+                "fminf": np.minimum,
+                "fmin": np.minimum,
+                "powf": np.power,
+                "pow": np.power,
+            }
+            fn = _FNS.get(e.name)
+            if fn is None:
+                raise NotImplementedError(f"eval_expr: unknown FuncCall {e.name!r}")
+            return fn(*(_ev(a) for a in e.args))
+        if isinstance(e, Builtin):
+            raise NotImplementedError(f"eval_expr cannot evaluate Builtin {e.name!r} (GPU-only)")
+        raise TypeError(f"Unsupported expr type in eval_expr: {type(e).__name__}")
+
+    return _ev(expr)
+
+
 def substitute(expr: Expr, mapping: dict[str, Expr]) -> Expr:
     """Replace ``Var(name)`` nodes in ``expr`` with ``mapping[name]``.
 

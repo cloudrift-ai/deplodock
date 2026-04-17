@@ -1,18 +1,19 @@
 """Tests for the structural CUDA emitter with the grammar-based fusion pipeline.
 
-Exercises source-level assertions and end-to-end GPU runs.
+Exercises source-level assertions and end-to-end GPU runs. CUDA-specific
+by design (source-level assertions on emitted C code); not parameterized
+over backends.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.backend.cuda.backend import CudaBackend
+from deplodock.compiler.backend.cuda.backend import CompiledCudaProgram, CudaBackend
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopBuffer, LoopLaunch, LoopProgram
 
 requires_cuda = pytest.mark.skipif(
@@ -91,38 +92,30 @@ def _softmax_program() -> LoopProgram:
 
 
 def test_pointwise_emits_correct_source():
-    g = _pointwise_add_graph()
-    loop_program = compile_graph(g)
-    program = CudaBackend().compile(loop_program)
-    assert len(program.launches) == 1
-    source = program.launches[0].kernel_source
+    compiled = CudaBackend().compile(_pointwise_add_graph())
+    assert len(compiled.gpu.launches) == 1
+    source = compiled.gpu.launches[0].kernel_source
     assert "blockIdx.x" in source
     assert "x[" in source and "y[" in source
 
 
 def test_reduce_emits_k_loop():
-    g = _reduce_sum_graph()
-    loop_program = compile_graph(g)
-    program = CudaBackend().compile(loop_program)
-    source = program.launches[0].kernel_source
+    compiled = CudaBackend().compile(_reduce_sum_graph())
+    source = compiled.gpu.launches[0].kernel_source
     assert "for (int" in source
     assert "+=" in source
 
 
 def test_contraction_emits_matmul():
-    g = _matmul_graph()
-    loop_program = compile_graph(g)
-    program = CudaBackend().compile(loop_program)
-    source = program.launches[-1].kernel_source
+    compiled = CudaBackend().compile(_matmul_graph())
+    source = compiled.gpu.launches[-1].kernel_source
     assert "for (int k" in source
     assert "acc0 +=" in source
 
 
 def test_buffer_roles():
-    g = _pointwise_add_graph()
-    loop_program = compile_graph(g)
-    program = CudaBackend().compile(loop_program)
-    roles = {b.name: b.role for b in program.buffers}
+    compiled = CudaBackend().compile(_pointwise_add_graph())
+    roles = {b.name: b.role for b in compiled.gpu.buffers}
     assert roles.get("x") == "input"
     assert roles.get("y") == "input"
 
@@ -163,10 +156,9 @@ def test_chained_pointwise_single_kernel():
     g.inputs = ["x"]
     g.outputs = ["n"]
 
-    loop_program = compile_graph(g)
-    assert len(loop_program.launches) == 1
-    program = CudaBackend().compile(loop_program)
-    assert len(program.launches) == 1
+    compiled = CudaBackend().compile(g)
+    assert len(compiled.loop.launches) == 1
+    assert len(compiled.gpu.launches) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -176,34 +168,33 @@ def test_chained_pointwise_single_kernel():
 
 @requires_cuda
 def test_pointwise_runs_on_gpu():
-    g = _pointwise_add_graph()
-    loop_program = compile_graph(g)
-    program = CudaBackend().compile(loop_program)
-    result = CudaBackend().run(program, input_data={"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
+    compiled = CudaBackend().compile(_pointwise_add_graph())
+    result = CudaBackend().run(compiled, input_data={"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
     assert list(result.outputs.values())[0] == pytest.approx([11, 22, 33, 44])
 
 
 @requires_cuda
 def test_reduce_runs_on_gpu():
-    g = _reduce_sum_graph()
-    loop_program = compile_graph(g)
-    program = CudaBackend().compile(loop_program)
+    compiled = CudaBackend().compile(_reduce_sum_graph())
     x_data = [float(i) for i in range(32)]
-    result = CudaBackend().run(program, input_data={"x": x_data})
+    result = CudaBackend().run(compiled, input_data={"x": x_data})
     expected = [sum(x_data[row * 8 : (row + 1) * 8]) for row in range(4)]
     assert list(result.outputs.values())[0] == pytest.approx(expected)
 
 
 @requires_cuda
 def test_softmax_runs_on_gpu():
+    """Softmax from a hand-built LoopProgram (no Graph). Uses compile_kernels directly
+    and wraps in a CompiledCudaProgram manually."""
     import math
 
     from deplodock.compiler.backend.cuda.emit import compile_kernels
 
     loop_program = _softmax_program()
-    program = compile_kernels(loop_program)
+    gpu_program = compile_kernels(loop_program)
+    compiled = CompiledCudaProgram(gpu=gpu_program, loop=loop_program)
     x_data = [float(i) for i in range(32)]
-    result = CudaBackend().run(program, input_data={"x": x_data})
+    result = CudaBackend().run(compiled, input_data={"x": x_data})
     expected = []
     for row in range(4):
         row_vals = x_data[row * 8 : (row + 1) * 8]
@@ -216,12 +207,10 @@ def test_softmax_runs_on_gpu():
 
 @requires_cuda
 def test_matmul_runs_on_gpu():
-    g = _matmul_graph()
-    loop_program = compile_graph(g)
-    program = CudaBackend().compile(loop_program)
+    compiled = CudaBackend().compile(_matmul_graph())
     a_data = [float(i) for i in range(32)]
     b_data = [float(i) for i in range(32)]
-    result = CudaBackend().run(program, input_data={"a": a_data, "b": b_data})
+    result = CudaBackend().run(compiled, input_data={"a": a_data, "b": b_data})
     expected = []
     for mi in range(4):
         for ni in range(4):

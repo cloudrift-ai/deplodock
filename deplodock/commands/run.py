@@ -21,7 +21,6 @@ def _handle_run(args):
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.dump import CompilerDump
     from deplodock.compiler.ir.graph import Graph
-    from deplodock.compiler.pipeline import compile_graph
 
     dump = CompilerDump.resolve(args.dump_dir)
 
@@ -32,23 +31,21 @@ def _handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    loop_program = compile_graph(graph)
-
     backend = CudaBackend()
-    program = backend.compile(loop_program)
+    compiled = backend.compile(graph)
 
     if dump:
-        dump.dump_program(program)
+        dump.dump_program(compiled.gpu)
 
-    logger.info("Compiled %s: %d kernels", ir_path.name, len(loop_program.launches))
+    logger.info("Compiled %s: %d kernels", ir_path.name, len(compiled.loop.launches))
 
     if args.benchmark:
-        result = backend.benchmark(program, num_iters=args.iters)
+        result = backend.benchmark(compiled, num_iters=args.iters)
         logger.info("Time: %.3f ms (%d launches)", result.time_ms, result.num_launches)
         if dump:
             dump.dump_benchmark(result)
     else:
-        result = backend.run(program)
+        result = backend.run(compiled)
         for buf_name, values in result.outputs.items():
             logger.info("Output %s: %d elements, first 5: %s", buf_name, len(values), values[:5])
         if dump:

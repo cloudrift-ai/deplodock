@@ -34,14 +34,22 @@
 │                                                                  │
 │  RULE: Operates on Graph + Loop IR only. No backend imports.     │
 ├──────────────────────────────────────────────────────────────────┤
-│  LAYER 3 · Backend (emit + run)                                  │
+│  LAYER 3 · Backends                                              │
 │                                                                  │
-│  backend/base.py:           Backend ABC (compile, run, benchmark)│
-│  backend/kernel_codegen.py: GpuKernel → C source                 │
-│  backend/cuda/emit.py:      LoopProgram → GpuProgram             │
-│  backend/cuda/backend.py:   CudaBackend.compile(LoopProgram)     │
-│  backend/cuda/program.py:   CudaLaunch(GpuLaunch), nvcc, run     │
-│  backend/cuda/runner.py:    single-kernel compile + run harness  │
+│  backend/base.py:  Backend ABC — compile(graph), run, run_arrays │
+│  backend/numpy/:   NumpyBackend — Graph interpreter (pre-fusion) │
+│  backend/loop/:    LoopBackend  — LoopProgram interpreter (numpy)│
+│  backend/cuda/:    CudaBackend  — LoopProgram → GpuProgram → nvcc│
+│                                                                  │
+│  All three backends share:                                       │
+│    backend.compile(graph) → compiled                             │
+│    backend.run_arrays(compiled, input_data=…) → dict[name, nd]   │
+│                                                                  │
+│  Codegen internals (CUDA):                                       │
+│    backend/kernel_codegen.py: GpuKernel → C source               │
+│    backend/cuda/emit.py:      LoopProgram → GpuProgram           │
+│    backend/cuda/program.py:   CudaLaunch(GpuLaunch), nvcc, run   │
+│    backend/cuda/runner.py:    single-kernel compile + run harness│
 │                                                                  │
 │  Program forms (shared across backends):                         │
 │      program/loop.py: LoopProgram + LoopBuffer + LoopLaunch      │
@@ -63,14 +71,18 @@ PyTorch module
    │  torch_trace.trace_module(...)
    ▼
 Graph (Layer 1)
-   │  pipeline.compile_graph(graph)  →  LoopProgram
+   │  backend.compile(graph)  — unified across numpy / loop / cuda
+   │    ├─ NumpyBackend: wrap Graph; numpy walk in run_arrays
+   │    ├─ LoopBackend:  compile_graph(graph) → LoopProgram; interpret in run_arrays
+   │    └─ CudaBackend:  compile_graph(graph) → LoopProgram
+   │                     compile_kernels(lp)  → GpuProgram
    ▼
 LoopProgram (Layer 2: LoopBuffers + LoopLaunches)
-   │  CudaBackend.compile(loop_program)
-   │    └─ for launch in loop_program.launches:
-   │         emit.emit_kernel(launch, name, loop_program)  → GpuKernel
-   │         kernel_codegen.emit_kernel(GpuKernel) → C source
-   │         wrap as CudaLaunch, collect in GpuProgram
+   │  [CUDA path]
+   │    for launch in loop_program.launches:
+   │      emit.emit_kernel(launch, name, loop_program)  → GpuKernel
+   │      kernel_codegen.emit_kernel(GpuKernel) → C source
+   │      wrap as CudaLaunch, collect in GpuProgram
    ▼
 GpuProgram (Layer 3)
    │  backend/cuda/program.generate_source(program)
