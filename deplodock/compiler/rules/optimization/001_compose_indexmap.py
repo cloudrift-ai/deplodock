@@ -6,9 +6,12 @@ directly. ``Z``'s ``out_shape`` equals ``X.out_shape``; its ``coord_map[i]``
 is ``Y.coord_map[i]`` with ``Y``'s output placeholders substituted by the
 matching entry in ``X.coord_map``.
 
-Only applies when the parent has a single consumer (the outer op) — otherwise
-we'd leave a shared parent dangling. ``select`` predicates, if any, combine
-as a logical AND so multi-source cat chains remain correct.
+Applies even when the parent has multiple consumers: each consumer gets
+its own composed IndexMapOp. The parent stays in the graph while other
+consumers still read it; if this composition was the parent's sole
+consumer, ``_remove_orphans`` cleans it up after the rewrite. ``select``
+predicates, if any, combine as a logical AND so multi-source cat chains
+remain correct.
 
 This optimization runs before fusion so rule ``001_assemble_kernels`` sees
 a simpler IR: each external input has at most one IndexMapOp between it
@@ -37,10 +40,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     parent_id = node.inputs[outer_src.input_idx]
     parent = graph.nodes.get(parent_id)
     if parent is None or not isinstance(parent.op, IndexMapOp) or len(parent.op.sources) != 1:
-        return None
-    # Only compose when the parent's sole consumer is this outer op; otherwise
-    # composing would orphan other consumers that still reference the parent.
-    if len(graph.consumers(parent_id)) != 1:
         return None
 
     parent_src = parent.op.sources[0]
@@ -77,5 +76,9 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     out_id = frag.add_node(new_op, [grandparent_id], Tensor(node.output.name, node.output.shape, node.output.dtype), node_id=nid)
     frag.outputs = [out_id]
 
-    match.consumed = {nid, parent_id}
+    # Replace only the outer (``nid``). When this was the parent's sole
+    # consumer, ``_remove_orphans`` cleans the parent up after the rewrite;
+    # if the parent has other consumers, it stays so they still have an
+    # IndexMapOp to read.
+    match.consumed = {nid}
     return frag

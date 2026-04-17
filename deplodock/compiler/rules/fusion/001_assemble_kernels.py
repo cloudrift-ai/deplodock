@@ -24,18 +24,23 @@ _REDUCE_COMBINE: dict[str, str] = {"sum": "add", "max": "max", "prod": "mul", "m
 
 def _same_rank(op, node, graph):
     """IndexMapOp predicate: absorb IndexMapOps that translate to simple
-    per-dim index Exprs — pure permutations, broadcasts, squeezes, and
-    unsqueezes.
+    per-dim index Exprs — permutations, squeezes, unsqueezes, and linear
+    (``+``/``-``) offset slices.
 
-    Each ``coord_map`` entry must be either:
-      - ``Literal(0, "int")`` at a size-1 source dim (broadcast read), or
-      - ``Var("out_coord_k")`` for some output axis ``k`` — any ``k``, any
-        order (covers transposes, leading/trailing singleton adds, and
-        size-1 → size-N broadcasts).
+    Each ``coord_map`` entry must be one of:
+      - ``Literal(0, "int")`` at a size-1 source dim (broadcast read),
+      - ``Var("out_coord_k")`` for some output axis ``k`` (any order —
+        transposes and leading/trailing/mid unsqueezes qualify),
+      - a ``+``/``-`` combination of placeholders and literals (simple
+        slice offsets, e.g. ``out_coord_3 + 32`` for rotary
+        ``rotate_half``).
 
-    Arithmetic entries (``BinOp``, ``FuncCall``) such as ``out_coord_1 / 8``
-    for GQA replication or ``// %`` head-split reshapes fall through to
-    ``003_wrap_indexmap`` as standalone copy kernels.
+    Multiplicative / modular arithmetic (``* // %``) for GQA replication
+    or head-split reshapes falls through to ``003_wrap_indexmap`` as a
+    standalone copy kernel. Broadcasts into fresh non-unit output dims
+    are also rejected here — they expand the kernel's iteration space in
+    ways the region matcher can't currently reconcile with downstream
+    reductions.
     """
     if len(op.sources) > 1:
         return False
@@ -43,15 +48,43 @@ def _same_rank(op, node, graph):
     return _is_identity_alias(op, in_shape)
 
 
-def _is_identity_alias(op, in_shape) -> bool:
-    """True iff every ``coord_map`` entry is a plain placeholder or a
-    ``Literal(0)`` at a size-1 source dim, and every non-size-1 output dim
-    is covered by a placeholder. See :func:`_same_rank`.
+def _is_linear_placeholder_expr(expr) -> bool:
+    """True iff ``expr`` is a linear (``+``/``-``) combination of placeholders and literals."""
+    from deplodock.compiler.ir.expr import BinOp, Cast, Literal, Var
 
-    Permutations (any placeholder order) are fine. Broadcasts into new
-    non-unit output dims are NOT allowed here — they expand the consumer
-    kernel's iteration space in ways the region matcher can't currently
-    reconcile with downstream reductions.
+    if isinstance(expr, Literal):
+        return True
+    if isinstance(expr, Var):
+        return expr.name.startswith(PLACEHOLDER_PREFIX)
+    if isinstance(expr, BinOp) and expr.op in ("+", "-"):
+        return _is_linear_placeholder_expr(expr.left) and _is_linear_placeholder_expr(expr.right)
+    if isinstance(expr, Cast):
+        return _is_linear_placeholder_expr(expr.expr)
+    return False
+
+
+def _collect_placeholders(expr, used: set[int]) -> None:
+    """Collect the set of ``out_coord_k`` indices referenced anywhere in ``expr``."""
+    from deplodock.compiler.ir.expr import BinOp, Cast, Var
+
+    if isinstance(expr, Var) and expr.name.startswith(PLACEHOLDER_PREFIX):
+        try:
+            used.add(int(expr.name[len(PLACEHOLDER_PREFIX) :]))
+        except ValueError:
+            pass
+    elif isinstance(expr, BinOp):
+        _collect_placeholders(expr.left, used)
+        _collect_placeholders(expr.right, used)
+    elif isinstance(expr, Cast):
+        _collect_placeholders(expr.expr, used)
+
+
+def _is_identity_alias(op, in_shape) -> bool:
+    """True iff every ``coord_map`` entry is either a plain placeholder, a
+    ``Literal(0)`` at a size-1 source dim, or a linear (``+``/``-``)
+    expression over placeholders and literals, and every non-size-1
+    output dim is covered by at least one placeholder. See
+    :func:`_same_rank`.
     """
     from deplodock.compiler.ir.expr import Literal, Var
 
@@ -69,10 +102,11 @@ def _is_identity_alias(op, in_shape) -> bool:
                 return False
         elif isinstance(entry, Var) and entry.name.startswith(PLACEHOLDER_PREFIX):
             try:
-                k = int(entry.name[len(PLACEHOLDER_PREFIX) :])
+                used.add(int(entry.name[len(PLACEHOLDER_PREFIX) :]))
             except ValueError:
                 return False
-            used.add(k)
+        elif _is_linear_placeholder_expr(entry):
+            _collect_placeholders(entry, used)
         else:
             return False
 
@@ -382,14 +416,18 @@ def _emit_port_for_external(
                 consumed.add(nid)
                 remap[nid] = src_ref
             return None
-        # External source — absorb this IndexMapOp into Port.index.
+        # External source — absorb this IndexMapOp into Port.index. Only mark
+        # ``buf_id`` as consumed when we're its sole consumer; otherwise the
+        # IndexMapOp stays in the graph for the other consumers (which will
+        # get their own standalone copy kernel from ``003_wrap_indexmap``),
+        # while this kernel still reads the ultimate source directly.
         if len(graph.consumers(buf_id)) == 1:
             consumed.add(buf_id)
-            src_id = node.inputs[node.op.sources[0].input_idx]
-            src_node = graph.nodes.get(src_id)
-            src_shape = src_node.output.shape if src_node is not None else ()
-            index = _indexmap_to_port_index(node.op, axes, src_shape)
-            return Port(index=index), src_id
+        src_id = node.inputs[node.op.sources[0].input_idx]
+        src_node = graph.nodes.get(src_id)
+        src_shape = src_node.output.shape if src_node is not None else ()
+        index = _indexmap_to_port_index(node.op, axes, src_shape)
+        return Port(index=index), src_id
 
     # Plain port (identity load on all axes matching source buffer rank).
     src_shape = node.output.shape if node is not None else ()
