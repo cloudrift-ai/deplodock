@@ -2,13 +2,10 @@
 
 Consumes a ``LoopProgram`` (one ``LoopLaunch`` per GPU kernel, with
 authoritative buffer shapes) and emits CUDA C source packaged as a
-``GpuProgram``. The ``LoopOp`` body uses ``$N`` references for input
-Ports; the codegen maps these to actual buffer names via
-``LoopLaunch.input_names``.
-
-Shapes are read from the ``LoopProgram`` (never recomputed) — see
-``program.shape(...)``, ``program.dollar_shapes(launch)``,
-``program.output_shape(launch)``.
+``GpuProgram``. The ``LoopOp`` body is an SSA program over named axes:
+``Assign``/``Update``/``Write``/``Select`` statements interpreted in
+order. The positionally-last ``Update`` marks the end of the reduce
+sweep; statements after (and final ``Write``s) run once per free point.
 """
 
 from __future__ import annotations
@@ -16,7 +13,7 @@ from __future__ import annotations
 import math
 
 from deplodock.compiler.backend.cuda.program import CudaLaunch
-from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Var, substitute
+from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var, substitute
 from deplodock.compiler.ir.gpu import (
     ArrayAccess,
     AugAssign,
@@ -30,8 +27,7 @@ from deplodock.compiler.ir.gpu import (
 from deplodock.compiler.ir.gpu import (
     Assign as IrAssign,
 )
-from deplodock.compiler.ir.loop import Axis, LoopOp, Port
-from deplodock.compiler.ir.tensor import ReduceOp
+from deplodock.compiler.ir.loop import Axis, LoopOp, Port, Update
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
 
@@ -44,12 +40,7 @@ _BLOCK = 256
 
 
 def compile_kernels(program: LoopProgram) -> GpuProgram:
-    """Lower a ``LoopProgram`` to a ``GpuProgram``.
-
-    One ``CudaLaunch`` is produced per ``LoopLaunch``. Buffer set is
-    filtered to those actually referenced (either as launch input/output
-    or as a graph-level constant that's referenced and shape-known).
-    """
+    """Lower a ``LoopProgram`` to a ``GpuProgram``."""
     referenced: set[str] = set()
     for launch in program.launches:
         referenced.update(launch.input_names)
@@ -102,12 +93,7 @@ def emit_kernel(launch: LoopLaunch, kernel_name: str, program: LoopProgram) -> t
 
 
 def _axis_env_for_flat(axes: tuple[Axis, ...], flat_idx: Expr) -> dict[str, Expr]:
-    """Decompose a flat iteration index into per-axis Exprs.
-
-    For pointwise kernels with only free axes, ``flat_idx`` iterates over
-    the entire iteration space. The axes are unpacked row-major
-    (leftmost axis is outermost).
-    """
+    """Decompose a flat iteration index into per-axis Exprs."""
     env: dict[str, Expr] = {}
     if not axes:
         return env
@@ -129,7 +115,6 @@ def _axis_env_for_reduce(axes: tuple[Axis, ...], row_idx: Expr, k: Expr) -> dict
     free = [a for a in axes if a.kind == "free"]
     reduce_a = next((a for a in axes if a.kind == "reduce"), None)
 
-    # Unpack row_idx across free axes row-major.
     remainder = row_idx
     extents = [int(a.extent) for a in free]
     for i in range(len(free) - 1, -1, -1):
@@ -146,15 +131,9 @@ def _axis_env_for_reduce(axes: tuple[Axis, ...], row_idx: Expr, k: Expr) -> dict
 
 
 def _emit_port_load(port: Port, buf_name: str, src_shape: tuple, axis_env: dict[str, Expr]) -> Expr:
-    """Evaluate ``port.index`` under ``axis_env`` and emit an ArrayAccess.
-
-    Each Expr in ``port.index`` is substituted with the axis_env, then
-    combined into a flat buffer offset using row-major strides from
-    ``src_shape``.
-    """
+    """Evaluate ``port.index`` under ``axis_env`` and emit an ArrayAccess."""
     if not port.index:
         return ArrayAccess(array=buf_name, index=Literal(0, "int"))
-
     coords = [substitute(e, axis_env) for e in port.index]
     flat = _flatten_coords(coords, src_shape)
     return ArrayAccess(array=buf_name, index=flat)
@@ -214,7 +193,6 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
     name_seq = [0]
     values: dict[str, Expr] = {}
 
-    # Map $N → (port, buf_name, src_shape).
     port_info = _collect_port_info(loop, launch, program, dollar_shapes)
 
     free_axes = tuple(a for a in loop.axes if a.kind == "free")
@@ -245,10 +223,8 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
             inner: list[Stmt] = []
             loop_values: dict[str, Expr] = dict(values)
 
-            # Axis env for this reduce loop: row_idx + k.
             axis_env = _axis_env_for_reduce(loop.axes, idx, k_var)
 
-            # Load per-element ports at (row, k).
             for key, (port, buf_name, src_shape) in port_info.items():
                 if key in plan.per_elem_ports:
                     loop_values[key] = _emit_port_load(port, buf_name, src_shape, axis_env)
@@ -273,21 +249,23 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
                 values[step.accum.result] = Var(step.accum.var)
 
             if step.stores_output:
-                # Per-element store inside the loop: emit ArrayAccess via full iter index.
-                last = step.body[-1]
-                store_idx = _iter_flat_index(loop.axes, axis_env, program.shape(launch.output_name))
-                inner.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=store_idx), value=loop_values[last.name]))
+                # Per-element store inside the loop.
+                store_value = loop_values[step.store_value]
+                store_idx_coords = [substitute(e, axis_env) for e in step.store_index]
+                buf_shape = program.shape(launch.output_name)
+                store_idx = _flatten_coords(store_idx_coords, buf_shape)
+                inner.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=store_idx), value=store_value))
 
             stmts.append(ForLoop(var=k_var_name, start=Literal(0, "int"), end=Literal(step.k_size, "int"), body=inner))
             loop_count += 1
 
-    if plan.stores_final:
-        if loop.body:
-            out_val = values[loop.body[-1].name]
-        else:
-            first_key = next((k for k in sorted(values) if k.startswith("$")), None)
-            out_val = values[first_key] if first_key else Literal(0.0, "float")
-        stmts.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=idx), value=out_val))
+    # Trailing writes: run once per free point, post-reduce.
+    for tw in plan.trailing_writes:
+        value = values.get(tw.value, Literal(0.0, "float"))
+        coords = [substitute(e, flat_env) for e in tw.index]
+        buf_shape = program.shape(launch.output_name)
+        store_idx = _flatten_coords(coords, buf_shape)
+        stmts.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=store_idx), value=value))
 
     return stmts
 
@@ -309,24 +287,16 @@ def _collect_port_info(
     return port_info
 
 
-def _iter_flat_index(axes: tuple[Axis, ...], axis_env: dict[str, Expr], shape: tuple) -> Expr:
-    """Build a flat row-major offset into a buffer of ``shape`` using the full iter axes.
-
-    Used for per-element stores inside a reduce K-loop, where the output
-    buffer has the full iteration shape (pre-reduce). The axis_env gives
-    per-axis Exprs; we combine them into a flat offset with strides from
-    ``shape``.
-    """
-    coords = [axis_env.get(a.name, Literal(0, "int")) for a in axes]
-    return _flatten_coords(coords, shape)
-
-
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
     if fn == "max":
         from deplodock.compiler.ir.gpu import VarAssign
 
         return VarAssign(name=acc_name, value=FuncCall("fmaxf", [Var(acc_name), value]))
-    op = {"sum": "+=", "prod": "*="}.get(fn, "+=")
+    if fn == "min":
+        from deplodock.compiler.ir.gpu import VarAssign
+
+        return VarAssign(name=acc_name, value=FuncCall("fminf", [Var(acc_name), value]))
+    op = {"add": "+=", "sum": "+=", "mul": "*=", "prod": "*="}.get(fn, "+=")
     return AugAssign(target=acc_name, op=op, value=value)
 
 
@@ -351,6 +321,12 @@ def _apply_elementwise(fn: str, inputs: list[Expr]) -> Expr:
         assert len(inputs) == 2
         op = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "%"}[fn]
         return BinOp(op, inputs[0], inputs[1])
+    if fn == "max":
+        assert len(inputs) == 2
+        return FuncCall("fmaxf", list(inputs))
+    if fn == "min":
+        assert len(inputs) == 2
+        return FuncCall("fminf", list(inputs))
     if fn == "pow":
         assert len(inputs) == 2
         return FuncCall("powf", list(inputs))
@@ -395,7 +371,7 @@ def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
 
 
 def _kernel_name(loop: LoopOp, idx: int) -> str:
-    if any(isinstance(a.op, ReduceOp) for a in loop.body):
+    if any(isinstance(s, Update) for s in loop.body):
         return f"k{idx}_reduce"
     return f"k{idx}_pointwise"
 
@@ -403,9 +379,8 @@ def _kernel_name(loop: LoopOp, idx: int) -> str:
 def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     loop: LoopOp = launch.loop
     out_shape = program.output_shape(launch)
-    has_reduce = any(isinstance(a.op, ReduceOp) for a in loop.body)
+    has_reduce = any(isinstance(s, Update) for s in loop.body)
     if has_reduce:
-        # Number of rows = product of free-axis extents.
         free_extents = [int(a.extent) for a in loop.axes if a.kind == "free"]
         n_output = _numel(tuple(free_extents)) if free_extents else 1
     else:
@@ -424,3 +399,6 @@ def _fresh(seq: list[int]) -> str:
     name = f"t{seq[0]}"
     seq[0] += 1
     return name
+
+
+_ = Ternary  # re-exported for potential future Select emission helpers

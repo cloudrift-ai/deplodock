@@ -12,9 +12,14 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Expr, Literal, Var, substitute
 from deplodock.compiler.ir.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.loop import Assign, Axis, LoopOp, Port
+from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, LoopOp, Port, Stmt, Update, Write
 from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
+
+# Identity values for reductions — lifted from the former REDUCE_REGISTRY.
+_REDUCE_IDENTITY: dict[str, float] = {"sum": 0.0, "max": -1e30, "prod": 1.0, "min": 1e30}
+# Combine op name for each reduction family.
+_REDUCE_COMBINE: dict[str, str] = {"sum": "add", "max": "max", "prod": "mul", "min": "min"}
 
 
 def _same_rank(op, node, graph):
@@ -57,16 +62,14 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     ports, remap, input_names = _build_input_ports(graph, external_inputs, all_consumed, axes)
     all_consumed |= layout_ids
-    body = _build_body_from_region(graph, all_consumed, remap)
+
+    output_shape = graph.nodes[output_nid].output.shape
+    locals_list, body = _build_body_from_region(graph, all_consumed, remap, output_nid, axes, output_shape)
 
     if not body:
         return None
 
     last_node = graph.nodes[output_nid]
-
-    # Output port: identity-like access using free-axis Vars.
-    free_axes = tuple(a for a in axes if a.kind == "free")
-    out_port = Port(index=tuple(Var(a.name) for a in free_axes))
 
     # Build fragment: InputOps for external buffers, one LoopOp node.
     frag = Graph()
@@ -77,7 +80,12 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
             dtype = ext.output.dtype if ext else "f32"
             frag.add_node(InputOp(), [], Tensor(name, shape, dtype), node_id=name)
 
-    kernel = LoopOp(axes=axes, inputs=tuple(ports), body=tuple(body), outputs=(out_port,))
+    kernel = LoopOp(
+        axes=axes,
+        inputs=tuple(ports),
+        locals=tuple(locals_list),
+        body=tuple(body),
+    )
     out_id = frag.add_node(kernel, input_names, Tensor(f"kernel_{output_nid}", last_node.output.shape, last_node.output.dtype))
     frag.outputs = [out_id]
 
@@ -93,16 +101,22 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 def _iter_geometry(graph: Graph, match: ChainMatch, output_nid: str) -> tuple[tuple, int | None]:
     """Return (pre_reduce_shape, reduce_axis_position).
 
-    If the match contains any ReduceOps, the matcher's bind unifies their
-    ``input_shape`` → ``pre_shape`` and ``axis`` → ``reduce_axis``. For
-    pointwise-only kernels, pre_shape = output shape and reduce_axis = None.
+    If the match actually contains a ReduceOp, use the matcher's bound
+    ``pre_shape``/``reduce_axis`` (which describe the pre-reduce broadcast
+    iteration). Otherwise (pointwise-only region), pre_shape = output shape
+    and reduce_axis = None.
     """
-    bindings = getattr(match, "bindings", {}) or {}
-    pre_shape = bindings.get("pre_shape")
-    reduce_axis = bindings.get("reduce_axis")
-
-    if pre_shape is not None:
-        # Normalize negative axis.
+    reduce_ids = match.get("reduce") if hasattr(match, "get") else []
+    if reduce_ids:
+        bindings = getattr(match, "bindings", {}) or {}
+        pre_shape = bindings.get("pre_shape")
+        reduce_axis = bindings.get("reduce_axis")
+        if pre_shape is None:
+            # Fall back to looking up the reduce's input shape directly.
+            rnode = graph.nodes[reduce_ids[0]]
+            pre_shape = rnode.output.shape
+            # Try to derive axis from the ReduceOp itself.
+            reduce_axis = getattr(rnode.op, "axis", -1)
         ra = int(reduce_axis) if reduce_axis is not None else -1
         if ra < 0:
             ra = len(pre_shape) + ra
@@ -132,19 +146,96 @@ def _build_axes(pre_shape: tuple, reduce_axis: int | None) -> tuple[Axis, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _build_body_from_region(graph: Graph, region: set[str], remap: dict[str, str]) -> list[Assign]:
+def _build_body_from_region(
+    graph: Graph,
+    region: set[str],
+    remap: dict[str, str],
+    output_nid: str,
+    axes: tuple[Axis, ...],
+    output_shape: tuple,
+) -> tuple[list[LocalBuffer], list[Stmt]]:
+    """Lower the region's ops into (LocalBuffers, body statements).
+
+    - ``ElementwiseOp`` nodes become ``Assign`` statements.
+    - ``ReduceOp`` nodes become a ``LocalBuffer(name=nid, combine=<op>, init=<identity>)``
+      plus an ``Update(target=nid, value=remap[input])`` statement. Downstream
+      references to ``nid`` thus read the finalized accumulator.
+    - After the final op, a ``Write(output=0, index=<free-axis Vars>, value=...)``
+      statement stores the kernel's result.
+    """
+
     def _remap_args(node: Node) -> tuple[str, ...]:
         return tuple(remap.get(inp, inp) for inp in node.inputs)
 
-    assigns: list[Assign] = []
+    locals_list: list[LocalBuffer] = []
+    body: list[Stmt] = []
+
+    final_ssa: str | None = None
     for nid in graph.topological_order():
         if nid not in region:
             continue
         node = graph.nodes[nid]
-        if not isinstance(node.op, (ElementwiseOp, ReduceOp)):
-            continue
-        assigns.append(Assign(name=nid, op=node.op, args=_remap_args(node)))
-    return assigns
+        if isinstance(node.op, ElementwiseOp):
+            args = _remap_args(node)
+            body.append(Assign(name=nid, op=node.op, args=args))
+            final_ssa = nid
+        elif isinstance(node.op, ReduceOp):
+            fn = node.op.fn
+            combine_fn = _REDUCE_COMBINE.get(fn, fn)
+            identity = _REDUCE_IDENTITY.get(fn, 0.0)
+            locals_list.append(
+                LocalBuffer(
+                    name=nid,
+                    combine=ElementwiseOp(combine_fn),
+                    init=Literal(identity),
+                )
+            )
+            args = _remap_args(node)
+            body.append(Update(target=nid, value=args[0]))
+            final_ssa = nid
+
+    if not body:
+        return locals_list, body
+
+    if final_ssa is None:
+        final_ssa = output_nid
+
+    write_index = _build_write_index(axes, output_shape)
+    body.append(Write(output=0, index=write_index, value=final_ssa))
+
+    return locals_list, body
+
+
+def _build_write_index(axes: tuple[Axis, ...], output_shape: tuple) -> tuple[Expr, ...]:
+    """Build the per-output-dim index for the kernel's final Write.
+
+    When the output shape matches the full pre-reduce rank, each dim is:
+    - ``Var(axis.name)`` if the output keeps that axis's full extent
+      (softmax-like per-element output that varies with the reduce axis), or
+    - ``Literal(0, "int")`` if the output has size 1 at that position
+      (keepdim-collapsed reduce dim).
+
+    For lower-rank outputs (drop-axis reduces), use only free-axis Vars.
+    """
+    free_axes = tuple(a for a in axes if a.kind == "free")
+    if len(output_shape) == len(free_axes):
+        return tuple(Var(a.name) for a in free_axes)
+    if len(output_shape) == len(axes):
+        out: list[Expr] = []
+        for a, dim in zip(axes, output_shape, strict=True):
+            if isinstance(dim, int) and dim == 1 and a.extent != 1:
+                out.append(Literal(0, "int"))
+            else:
+                out.append(Var(a.name))
+        return tuple(out)
+    # Fallback: right-align free axes onto the output dims, pad leading with 0.
+    n_extra = len(output_shape) - len(free_axes)
+    out = []
+    for _ in range(n_extra):
+        out.append(Literal(0, "int"))
+    for a in free_axes:
+        out.append(Var(a.name))
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,8 @@ from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.loop import Update
+from deplodock.compiler.ir.tensor import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopProgram
 
@@ -43,7 +44,7 @@ def _matmul_graph(m: int, k: int, n: int) -> Graph:
 def test_compile_graph_fuses_matmul():
     program = compile_graph(_matmul_graph(4, 3, 2))
     # Matmul decomposes into unsqueeze copies + mul/sum kernel.
-    matmul_launches = [L for L in program.launches if any(isinstance(a.op, ReduceOp) for a in L.loop.body)]
+    matmul_launches = [L for L in program.launches if any(isinstance(s, Update) for s in L.loop.body)]
     assert len(matmul_launches) == 1
 
 

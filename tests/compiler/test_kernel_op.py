@@ -1,10 +1,20 @@
-"""Tests for the structural LoopOp IR with SSA Assign body."""
+"""Tests for the structural LoopOp IR with SSA body (Assign/Update/Write/Select)."""
 
 import pytest
 
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.loop import Assign, Axis, LoopOp, Port
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.loop import (
+    Assign,
+    Axis,
+    LocalBuffer,
+    LoopOp,
+    Port,
+    Select,
+    SelectBranch,
+    Update,
+    Write,
+)
+from deplodock.compiler.ir.tensor import ElementwiseOp
 
 # ---------------------------------------------------------------------------
 # Axis / Port
@@ -64,10 +74,12 @@ def test_kernel_pointwise():
     k = LoopOp(
         axes=axes,
         inputs=(p, p),
-        body=(Assign("z", ElementwiseOp("add"), args=("$0", "$1")),),
-        outputs=(Port(index=(Var("a0"),)),),
+        body=(
+            Assign("z", ElementwiseOp("add"), args=("$0", "$1")),
+            Write(output=0, index=(Var("a0"),), value="z"),
+        ),
     )
-    assert len(k.body) == 1
+    assert len(k.body) == 2
 
 
 def test_kernel_reduce():
@@ -76,10 +88,13 @@ def test_kernel_reduce():
     k = LoopOp(
         axes=axes,
         inputs=(p,),
-        body=(Assign("s", ReduceOp("sum", -1), args=("$0",)),),
-        outputs=(Port(index=(Var("a0"),)),),
+        locals=(LocalBuffer(name="s", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        body=(
+            Update(target="s", value="$0"),
+            Write(output=0, index=(Var("a0"),), value="s"),
+        ),
     )
-    assert isinstance(k.body[0].op, ReduceOp)
+    assert any(isinstance(lb.combine, ElementwiseOp) for lb in k.locals)
 
 
 def test_kernel_matmul():
@@ -88,13 +103,14 @@ def test_kernel_matmul():
     k = LoopOp(
         axes=axes,
         inputs=(p, p),
+        locals=(LocalBuffer(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
-            Assign("dot", ReduceOp("sum", -1), args=("mul",)),
+            Update(target="dot", value="mul"),
+            Write(output=0, index=(Var("a0"),), value="dot"),
         ),
-        outputs=(Port(index=(Var("a0"),)),),
     )
-    assert len(k.body) == 2
+    assert len(k.body) == 3
 
 
 def test_kernel_matmul_bias():
@@ -104,14 +120,15 @@ def test_kernel_matmul_bias():
     k = LoopOp(
         axes=axes,
         inputs=(p_mk, p_mk, p_bias),
+        locals=(LocalBuffer(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
-            Assign("dot", ReduceOp("sum", -1), args=("mul",)),
+            Update(target="dot", value="mul"),
             Assign("out", ElementwiseOp("add"), args=("dot", "$2")),
+            Write(output=0, index=(Var("a0"),), value="out"),
         ),
-        outputs=(Port(index=(Var("a0"),)),),
     )
-    assert len(k.body) == 3
+    assert len(k.body) == 4
 
 
 def test_kernel_softmax():
@@ -120,16 +137,21 @@ def test_kernel_softmax():
     k = LoopOp(
         axes=axes,
         inputs=(p,),
-        body=(
-            Assign("max", ReduceOp("max", -1), args=("$0",)),
-            Assign("sub", ElementwiseOp("sub"), args=("$0", "max")),
-            Assign("exp", ElementwiseOp("exp"), args=("sub",)),
-            Assign("sum", ReduceOp("sum", -1), args=("exp",)),
-            Assign("div", ElementwiseOp("div"), args=("exp", "sum")),
+        locals=(
+            LocalBuffer(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
+            LocalBuffer(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
-        outputs=(Port(index=(Var("a0"), Var("a1"))),),
+        body=(
+            Update(target="mx", value="$0"),
+            Assign("sub", ElementwiseOp("sub"), args=("$0", "mx")),
+            Assign("ex", ElementwiseOp("exp"), args=("sub",)),
+            Update(target="sm", value="ex"),
+            Assign("div", ElementwiseOp("div"), args=("ex", "sm")),
+            Write(output=0, index=(Var("a0"), Var("a1")), value="div"),
+        ),
     )
-    assert len(k.body) == 5
+    assert any(lb.name == "mx" for lb in k.locals)
+    assert any(lb.name == "sm" for lb in k.locals)
 
 
 def test_kernel_unary_chain():
@@ -141,14 +163,36 @@ def test_kernel_unary_chain():
         body=(
             Assign("neg", ElementwiseOp("neg"), args=("$0",)),
             Assign("exp", ElementwiseOp("exp"), args=("neg",)),
+            Write(output=0, index=(Var("a0"),), value="exp"),
         ),
-        outputs=(Port(index=(Var("a0"),)),),
     )
-    assert len(k.body) == 2
+    assert len(k.body) == 3
+
+
+def test_kernel_scatter_output_via_select():
+    """Select replaces Mux for coord-predicated dispatch on output."""
+    axes = (Axis("a0", 4, "free"),)
+    p = Port(index=(Var("a0"),))
+    k = LoopOp(
+        axes=axes,
+        inputs=(p, p),
+        body=(
+            Assign("z", ElementwiseOp("add"), args=("$0", "$1")),
+            Select(
+                name="v",
+                branches=(
+                    SelectBranch(value="$0", select=Var("c1")),
+                    SelectBranch(value="$1", select=Var("c2")),
+                ),
+            ),
+            Write(output=0, index=(Var("a0"),), value="v"),
+        ),
+    )
+    assert isinstance(k.body[1], Select)
 
 
 # ---------------------------------------------------------------------------
-# Axis / SSA validation
+# Validator — SSA / accumulator / v1 pins
 # ---------------------------------------------------------------------------
 
 
@@ -165,7 +209,6 @@ def test_ssa_rejects_undefined_arg():
             axes=axes,
             inputs=(p,),
             body=(Assign("y", ElementwiseOp("exp"), args=("z",)),),
-            outputs=(p,),
         )
 
 
@@ -180,7 +223,6 @@ def test_ssa_rejects_duplicate_name():
                 Assign("y", ElementwiseOp("exp"), args=("$0",)),
                 Assign("y", ElementwiseOp("neg"), args=("y",)),
             ),
-            outputs=(p,),
         )
 
 
@@ -195,7 +237,6 @@ def test_ssa_rejects_forward_reference():
                 Assign("a", ElementwiseOp("add"), args=("$0", "b")),
                 Assign("b", ElementwiseOp("exp"), args=("$0",)),
             ),
-            outputs=(p,),
         )
 
 
@@ -210,6 +251,92 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
             Assign("b", ElementwiseOp("neg"), args=("$0",)),
             Assign("c", ElementwiseOp("add"), args=("a", "b")),
         ),
-        outputs=(p,),
     )
     assert len(k.body) == 3
+
+
+def test_rejects_update_without_matching_local():
+    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    p = Port(index=(Var("a0"), Var("a1")))
+    with pytest.raises(ValueError, match="does not name a LocalBuffer"):
+        LoopOp(
+            axes=axes,
+            inputs=(p,),
+            body=(Update(target="acc", value="$0"),),
+        )
+
+
+def test_rejects_accumulator_without_reduce_axis():
+    axes = (Axis("a0", 4, "free"),)
+    p = Port(index=(Var("a0"),))
+    with pytest.raises(ValueError, match="no reduce axis"):
+        LoopOp(
+            axes=axes,
+            inputs=(p,),
+            locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+            body=(Update(target="acc", value="$0"),),
+        )
+
+
+def test_rejects_reduce_axis_without_accumulator():
+    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    p = Port(index=(Var("a0"), Var("a1")))
+    with pytest.raises(ValueError, match="no accumulator"):
+        LoopOp(
+            axes=axes,
+            inputs=(p,),
+            body=(Assign("a", ElementwiseOp("exp"), args=("$0",)),),
+        )
+
+
+def test_rejects_shaped_localbuffer_in_v1():
+    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    p = Port(index=(Var("a0"), Var("a1")))
+    with pytest.raises(ValueError, match="shape=\\(\\)"):
+        LoopOp(
+            axes=axes,
+            inputs=(p,),
+            locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0), shape=(4,)),),
+            body=(Update(target="acc", value="$0"),),
+        )
+
+
+def test_rejects_nonthread_scope_in_v1():
+    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    p = Port(index=(Var("a0"), Var("a1")))
+    with pytest.raises(ValueError, match="scope='thread'"):
+        LoopOp(
+            axes=axes,
+            inputs=(p,),
+            locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0), scope="block"),),
+            body=(Update(target="acc", value="$0"),),
+        )
+
+
+def test_rejects_nondense_output_indices():
+    axes = (Axis("a0", 4, "free"),)
+    p = Port(index=(Var("a0"),))
+    with pytest.raises(ValueError, match="dense"):
+        LoopOp(
+            axes=axes,
+            inputs=(p,),
+            body=(
+                Assign("z", ElementwiseOp("neg"), args=("$0",)),
+                Write(output=2, index=(Var("a0"),), value="z"),
+            ),
+        )
+
+
+def test_rejects_unused_accumulator():
+    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    p = Port(index=(Var("a0"), Var("a1")))
+    with pytest.raises(ValueError, match="never Updated"):
+        LoopOp(
+            axes=axes,
+            inputs=(p,),
+            locals=(
+                LocalBuffer(name="a", combine=ElementwiseOp("add"), init=Literal(0.0)),
+                LocalBuffer(name="b", combine=ElementwiseOp("add"), init=Literal(0.0)),
+            ),
+            body=(Update(target="a", value="$0"),),
+        )

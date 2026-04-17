@@ -1,17 +1,31 @@
 """Tests for the compile_graph pipeline: decomposition → optimization → fusion → extract.
 
-After compile_graph, every primitive op is inside a LoopOp. Tests verify
-the structural shape of the resulting KernelOps (SSA Assign body).
+After compile_graph, every primitive op is inside a LoopOp. Reductions
+live as ``LocalBuffer + Update`` on the LoopOp; elementwise ops as
+``Assign``; final output as a ``Write``.
 """
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
+from deplodock.compiler.ir.loop import Assign, Update, Write
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
+
+
+def _elementwise_fns(body) -> list[str]:
+    return [s.op.fn for s in body if isinstance(s, Assign)]
+
+
+def _has_update(body) -> bool:
+    return any(isinstance(s, Update) for s in body)
+
+
+def _has_write(body) -> bool:
+    return any(isinstance(s, Write) for s in body)
 
 
 def test_pointwise_add():
@@ -25,7 +39,8 @@ def test_pointwise_add():
     result = compile_graph(g)
     launches = result.launches
     assert len(launches) == 1
-    assert all(isinstance(a.op, ElementwiseOp) for a in launches[0].loop.body)
+    assert "add" in _elementwise_fns(launches[0].loop.body)
+    assert _has_write(launches[0].loop.body)
 
 
 def test_chained_pointwise_fuses_into_one():
@@ -39,7 +54,8 @@ def test_chained_pointwise_fuses_into_one():
     result = compile_graph(g)
     launches = result.launches
     assert len(launches) == 1
-    assert len(launches[0].loop.body) == 2
+    fns = _elementwise_fns(launches[0].loop.body)
+    assert "exp" in fns and "neg" in fns
 
 
 def test_reduce_sum():
@@ -52,7 +68,10 @@ def test_reduce_sum():
     result = compile_graph(g)
     launches = result.launches
     assert len(launches) == 1
-    assert any(isinstance(a.op, ReduceOp) for a in launches[0].loop.body)
+    loop = launches[0].loop
+    assert _has_update(loop.body)
+    # Reduction target is a LocalBuffer with combine=add (sum).
+    assert any(lb.combine is not None and lb.combine.fn == "add" for lb in loop.locals)
 
 
 def test_matmul():
@@ -67,8 +86,11 @@ def test_matmul():
 
     result = compile_graph(g)
     launches = result.launches
-    assert any(isinstance(a.op, ElementwiseOp) and a.op.fn == "mul" for k in launches for a in k.loop.body)
-    assert any(isinstance(a.op, ReduceOp) and a.op.fn == "sum" for k in launches for a in k.loop.body)
+    # Expect a mul Assign and a sum Update somewhere across the launches.
+    has_mul = any("mul" in _elementwise_fns(k.loop.body) for k in launches)
+    has_sum = any(any(lb.combine is not None and lb.combine.fn == "add" for lb in k.loop.locals) for k in launches)
+    assert has_mul
+    assert has_sum
 
 
 def test_no_matmul_when_mul_fans_out():
@@ -98,8 +120,7 @@ def test_matmul_op_decomposes_and_fuses():
 
     result = compile_graph(g)
     launches = result.launches
-    # Should have at least one kernel with a mul+sum pattern
-    has_reduce = any(any(isinstance(a.op, ReduceOp) for a in k.loop.body) for k in launches)
+    has_reduce = any(_has_update(k.loop.body) for k in launches)
     assert has_reduce
 
 

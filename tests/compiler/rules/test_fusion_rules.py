@@ -1,16 +1,16 @@
 """Tests for fusion rules (assemble_kernels).
 
-The fusion rule produces LoopOp nodes which the numpy backend cannot
-execute, so these tests verify structural properties: kernel count,
-graph composition (only LoopOp/InputOp/ConstantOp remain), and that
-the SSA body contains the expected ops.
+The fusion rule produces LoopOp nodes with SSA body statements
+(``Assign``, ``Update``, ``Write``). Tests verify structural properties:
+kernel count, graph composition (only LoopOp/InputOp/ConstantOp remain),
+and that the SSA body contains the expected ops.
 """
 
 from pathlib import Path
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import LoopOp, Port
+from deplodock.compiler.ir.loop import Assign, LoopOp, Port, Update, Write
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass, Rule
 
@@ -29,6 +29,18 @@ def _fuse(graph: Graph) -> Graph:
 
 def _kernel_nodes(graph: Graph) -> list:
     return [n for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
+
+
+def _assign_fns(body) -> list[str]:
+    return [s.op.fn for s in body if isinstance(s, Assign)]
+
+
+def _has_update(body) -> bool:
+    return any(isinstance(s, Update) for s in body)
+
+
+def _local_combine_fns(locals_) -> set[str]:
+    return {lb.combine.fn for lb in locals_ if lb.combine is not None}
 
 
 # ===================================================================
@@ -60,7 +72,7 @@ def test_pointwise_chain_only_kernel_input_constant():
 def test_pointwise_chain_body_ops():
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
-    body_ops = [a.op.fn for a in kernel.op.body]
+    body_ops = _assign_fns(kernel.op.body)
     assert "neg" in body_ops
     assert "exp" in body_ops
 
@@ -69,6 +81,12 @@ def test_pointwise_chain_inputs_are_ports():
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
     assert all(isinstance(inp, Port) for inp in kernel.op.inputs)
+
+
+def test_pointwise_chain_has_write():
+    result = _fuse(_make_pointwise_chain())
+    kernel = _kernel_nodes(result)[0]
+    assert any(isinstance(s, Write) for s in kernel.op.body)
 
 
 # ===================================================================
@@ -95,9 +113,9 @@ def test_contraction_fuses_to_one_kernel():
 def test_contraction_body_has_mul_and_sum():
     result = _fuse(_make_contraction())
     kernel = _kernel_nodes(result)[0]
-    body_fns = [(type(a.op).__name__, getattr(a.op, "fn", "")) for a in kernel.op.body]
-    assert ("ElementwiseOp", "mul") in body_fns
-    assert ("ReduceOp", "sum") in body_fns
+    assert "mul" in _assign_fns(kernel.op.body)
+    assert _has_update(kernel.op.body)
+    assert "add" in _local_combine_fns(kernel.op.locals)
 
 
 # ===================================================================
@@ -126,8 +144,7 @@ def test_contraction_epilogue_fuses_to_one_kernel():
 def test_contraction_epilogue_body_has_add():
     result = _fuse(_make_contraction_with_epilogue())
     kernel = _kernel_nodes(result)[0]
-    body_fns = [a.op.fn for a in kernel.op.body if isinstance(a.op, ElementwiseOp)]
-    assert "add" in body_fns
+    assert "add" in _assign_fns(kernel.op.body)
 
 
 # ===================================================================
@@ -161,11 +178,14 @@ def test_softmax_only_kernel_input_constant():
 
 def test_softmax_body_covers_all_ops():
     result = _fuse(_make_softmax())
-    all_body_fns = set()
+    all_fns = set()
     for k in _kernel_nodes(result):
-        for a in k.op.body:
-            all_body_fns.add(a.op.fn)
-    assert {"sub", "exp", "div"} <= all_body_fns
+        all_fns |= set(_assign_fns(k.op.body))
+        all_fns |= _local_combine_fns(k.op.locals)
+    # Expect elementwise sub/exp/div and reduce combine add/max from the
+    # max and sum accumulators.
+    assert {"sub", "exp", "div"} <= all_fns
+    assert {"add", "max"} <= all_fns
 
 
 # ===================================================================
@@ -199,7 +219,15 @@ def test_ssa_invariants_hold():
             if isinstance(inp, Port):
                 defined.add(f"${port_idx}")
                 port_idx += 1
-        for a in k.op.body:
-            for arg in a.args:
-                assert arg in defined, f"arg {arg!r} not defined before use in {a.name}"
-            defined.add(a.name)
+        for lb in k.op.locals:
+            defined.add(lb.name)
+        for s in k.op.body:
+            if isinstance(s, Assign):
+                for arg in s.args:
+                    assert arg in defined, f"arg {arg!r} not defined before use in {s.name}"
+                defined.add(s.name)
+            elif isinstance(s, Update):
+                assert s.target in defined
+                assert s.value in defined
+            elif isinstance(s, Write):
+                assert s.value in defined

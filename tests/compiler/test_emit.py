@@ -13,7 +13,7 @@ from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp  # noqa: F401
 from deplodock.compiler.program.loop import LoopBuffer, LoopLaunch, LoopProgram
 
 requires_cuda = pytest.mark.skipif(
@@ -55,22 +55,26 @@ def _matmul_graph() -> Graph:
 
 def _softmax_launch() -> LoopLaunch:
     """Build a LoopLaunch with the softmax SSA pattern directly."""
-    from deplodock.compiler.ir.expr import Var
-    from deplodock.compiler.ir.loop import Assign, Axis, LoopOp, Port
+    from deplodock.compiler.ir.expr import Literal, Var
+    from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, LoopOp, Port, Update, Write
 
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
     loop = LoopOp(
         axes=axes,
         inputs=(p, p),
+        locals=(
+            LocalBuffer(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
+            LocalBuffer(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
+        ),
         body=(
-            Assign(name="mx", op=ReduceOp(fn="max", axis=-1), args=("$0",)),
+            Update(target="mx", value="$0"),
             Assign(name="sub", op=ElementwiseOp("sub"), args=("$0", "mx")),
             Assign(name="ex", op=ElementwiseOp("exp"), args=("sub",)),
-            Assign(name="sm", op=ReduceOp(fn="sum", axis=-1), args=("ex",)),
+            Update(target="sm", value="ex"),
             Assign(name="out", op=ElementwiseOp("div"), args=("ex", "sm")),
+            Write(output=0, index=(Var("a0"), Var("a1")), value="out"),
         ),
-        outputs=(Port(index=(Var("a0"), Var("a1"))),),
     )
     return LoopLaunch(loop=loop, input_names=["x", "x"], output_name="y")
 
