@@ -59,7 +59,7 @@ The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Assign` / `Updat
 
 **Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a body `Select` into a nested `Ternary` chain over each `SelectBranch.select` predicate. (There is no `Mux` / `Combine` IR — those were replaced by `Select` / `SelectBranch`.)
 
-**Body emitter**: `_emit_body` calls `backend.kernel_plan.analyze_kernel(loop, dollar_shapes, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The plan decomposes the body into ordered `Inline` (straight-line block) and `Loop` (K-loop over a reduce axis) steps:
+**Body emitter**: `_emit_body` calls `ir.loop_plan.analyze_kernel(loop, dollar_shapes, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The plan decomposes the body into ordered `Inline` (straight-line block) and `Loop` (K-loop over a reduce axis) steps:
 
 | Pattern                 | Plan shape             | Emission                                                             |
 | ----------------------- | ---------------------- | -------------------------------------------------------------------- |

@@ -123,22 +123,32 @@ class LoopProgram:
     # ── pretty-printing ──────────────────────────────────────────────
 
     def pretty_print_launch(self, idx: int) -> str:
-        """Render a single launch as a human-readable text block.
+        """Render a single launch as a human-readable nested-loop block.
+
+        Uses ``analyze_kernel`` (the same plan codegen consumes) so the
+        dump view mirrors the loop nest a kernel will actually execute.
 
         Used by CUDA codegen to stash per-kernel metadata alongside the
         generated source; also used as the per-launch fragment in
         :meth:`pretty_print`.
         """
         from deplodock.compiler.ir.loop import pretty_print_loop
+        from deplodock.compiler.ir.loop_plan import analyze_kernel, pretty_print_plan
 
         launch = self.launches[idx]
-        lines: list[str] = []
-        lines.append(f"launch {idx:02d}: inputs=[{', '.join(launch.input_names)}] output={launch.output_name}")
-        if isinstance(launch.loop, LoopOp):
-            lines.append(pretty_print_loop(launch.loop, indent="  "))
-        else:
-            lines.append(f"  (non-LoopOp: {type(launch.loop).__name__})")
-        return "\n".join(lines)
+        header = f"launch {idx:02d}: inputs=[{', '.join(launch.input_names)}] output={launch.output_name}"
+
+        if not isinstance(launch.loop, LoopOp):
+            return f"{header}\n  (non-LoopOp: {type(launch.loop).__name__})"
+
+        try:
+            plan = analyze_kernel(launch.loop, self.dollar_shapes(launch), self.output_shape(launch))
+            body = pretty_print_plan(launch.loop, plan, port_buffers=list(launch.input_names), indent="  ")
+        except Exception:
+            # Fall back to the flat SSA-body view if plan analysis fails.
+            body = pretty_print_loop(launch.loop, indent="  ")
+
+        return f"{header}\n{body}"
 
     def pretty_print(self) -> str:
         """Render the whole LoopProgram — buffers, launches, and per-launch LoopOp bodies."""

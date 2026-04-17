@@ -381,7 +381,7 @@ def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
 def _emit_body(
     launch: LoopLaunch, out_shape: tuple, dollar_shapes: dict[str, tuple], program: LoopProgram
 ) -> tuple[list[Stmt], tuple[int, int, int]]:
-    from deplodock.compiler.backend.kernel_plan import analyze_kernel
+    from deplodock.compiler.ir.loop_plan import analyze_kernel
 
     plan = analyze_kernel(launch.loop, dollar_shapes, out_shape)
     idx = Var("tid")
@@ -401,7 +401,7 @@ def _emit_body(
 
 
 def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], program: LoopProgram, idx: Expr) -> list[Stmt]:
-    from deplodock.compiler.backend.kernel_plan import Inline, Loop
+    from deplodock.compiler.ir.loop_plan import Inline, Loop
 
     loop: LoopOp = launch.loop
     stmts: list[Stmt] = []
