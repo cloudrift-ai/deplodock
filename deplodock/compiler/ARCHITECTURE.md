@@ -3,65 +3,61 @@
 ## Three-Layer Shape
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  LAYER 1 · Frontend (backend-agnostic)                           │
-│                                                                  │
-│  torch_trace.py ─→ Graph populated with frontend ops             │
-│      ir/graph.py:    Tensor, Node[T_Op], Graph, Hints            │
-│      ir/base.py:     Op, InputOp, ConstantOp                     │
-│      ir/frontend.py: Torch-captured ops (LinearOp, MatmulOp,     │
-│                      SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,   │
-│                      ReshapeOp, SliceOp, CatOp)                  │
-│      ir/tensor.py:   minimal IR survives decomposition           │
-│                      (ElementwiseOp, ReduceOp, IndexMapOp, ...)  │
-│      ir/expr.py:     Expr AST + coord_expr helpers               │
-│                                                                  │
-│  RULE: No GPU, no CUDA, no backend imports.                      │
-├──────────────────────────────────────────────────────────────────┤
-│  LAYER 2 · Lowering → LoopProgram                                │
-│                                                                  │
-│  pipeline.py: compile_graph(graph) -> LoopProgram                │
-│    LoopProgram (program/loop.py):                                │
-│       LoopBuffer (shape, role) × N                               │
-│       LoopLaunch (LoopOp + input/output buffer names) × N        │
-│       + graph_inputs/outputs/constants/constant_values           │
-│                                                                  │
-│  Each LoopOp (ir/loop.py) is one GPU kernel as an SSA program:   │
-│      axes   (tuple[Axis, ...]) — named iteration variables       │
-│      inputs (tuple[Port, ...]) — per-input access patterns       │
-│      locals (tuple[LocalBuffer, ...]) — thread-local accumulators│
-│      body   (tuple[Stmt, ...])                                   │
-│        Assign | Update | Write | Select                          │
-│  Reductions = LocalBuffer(combine) + Update; writes are inline.  │
-│                                                                  │
-│  RULE: Operates on Graph + Loop IR only. No backend imports.     │
-├──────────────────────────────────────────────────────────────────┤
-│  LAYER 3 · Backends                                              │
-│                                                                  │
-│  backend/base.py:  Backend ABC — compile(graph), run, benchmark  │
-│  backend/numpy/:   NumpyBackend — Graph interpreter (pre-fusion) │
-│  backend/loop/:    LoopBackend  — LoopProgram interpreter (numpy)│
-│  backend/cuda/:    CudaBackend  — LoopProgram → GpuProgram → nvcc│
-│                                                                  │
-│  All three backends share:                                       │
-│    backend.compile(graph) → compiled                             │
-│    backend.run(compiled, input_data=…) → ProgramResult           │
-│      (outputs=dict[name, ndarray], time_ms)                      │
-│                                                                  │
-│  Codegen internals (CUDA):                                       │
-│    backend/kernel_codegen.py: GpuKernel → C source               │
-│    backend/cuda/emit.py:      LoopProgram → GpuProgram           │
-│    backend/cuda/program.py:   CudaLaunch(GpuLaunch), nvcc, run   │
-│    backend/cuda/runner.py:    single-kernel compile + run harness│
-│                                                                  │
-│  Program forms (shared across backends):                         │
-│      program/loop.py: LoopProgram + LoopBuffer + LoopLaunch      │
-│      program/gpu.py:  GpuProgram + GpuBuffer + GpuLaunch         │
-│  The imperative C-like kernel AST lives upstream in ir/gpu.py    │
-│  (GpuKernel, Stmt, ArrayAccess, ...); the backend consumes it.   │
-│                                                                  │
-│  RULE: GPU specifics live here; everything above is portable.    │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 1 · Frontend (backend-agnostic)                                                                               │
+│                                                                                                                      │
+│  torch_trace.py ─→ Graph populated with frontend ops                                                                 │
+│      ir/graph.py:    Tensor, Node[T_Op], Graph, Hints                                                                │
+│      ir/base.py:     Op, InputOp, ConstantOp                                                                         │
+│      ir/frontend.py: Torch-captured ops (LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,               │
+│                      ReshapeOp, SliceOp, CatOp)                                                                      │
+│      ir/tensor.py:   minimal IR survives decomposition (ElementwiseOp, ReduceOp, IndexMapOp, ...)                    │
+│      ir/expr.py:     Expr AST + coord_expr helpers                                                                   │
+│                                                                                                                      │
+│  RULE: No GPU, no CUDA, no backend imports.                                                                          │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  LAYER 2 · Lowering → LoopProgram                                                                                    │
+│                                                                                                                      │
+│  pipeline.py: compile_graph(graph) -> LoopProgram                                                                    │
+│    LoopProgram (program/loop.py):                                                                                    │
+│       LoopBuffer (shape, role) × N                                                                                   │
+│       LoopLaunch (LoopOp + input/output buffer names) × N                                                            │
+│       + graph_inputs/outputs/constants/constant_values                                                               │
+│                                                                                                                      │
+│  Each LoopOp (ir/loop.py) is one GPU kernel as an SSA program:                                                       │
+│      axes   (tuple[Axis, ...])        — named iteration variables                                                    │
+│      inputs (tuple[Port, ...])        — per-input access patterns                                                    │
+│      locals (tuple[LocalBuffer, ...]) — thread-local accumulators                                                    │
+│      body   (tuple[Stmt, ...])        — Assign | Update | Write | Select                                             │
+│  Reductions = LocalBuffer(combine) + Update; writes are inline.                                                      │
+│                                                                                                                      │
+│  RULE: Operates on Graph + Loop IR only. No backend imports.                                                         │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  LAYER 3 · Backends                                                                                                  │
+│                                                                                                                      │
+│  backend/base.py:  Backend ABC — compile(graph), run, benchmark                                                      │
+│  backend/numpy/:   NumpyBackend — Graph interpreter (pre-fusion)                                                     │
+│  backend/loop/:    LoopBackend  — LoopProgram interpreter (numpy)                                                    │
+│  backend/cuda/:    CudaBackend  — LoopProgram → GpuProgram → nvcc                                                    │
+│                                                                                                                      │
+│  All three backends share:                                                                                           │
+│    backend.compile(graph) → compiled                                                                                 │
+│    backend.run(compiled, input_data=…) → ProgramResult (outputs=dict[name, ndarray], time_ms)                        │
+│                                                                                                                      │
+│  Codegen internals (CUDA):                                                                                           │
+│    backend/kernel_codegen.py: GpuKernel → C source                                                                   │
+│    backend/cuda/emit.py:      LoopProgram → GpuProgram                                                               │
+│    backend/cuda/program.py:   CudaLaunch(GpuLaunch), nvcc, run                                                       │
+│    backend/cuda/runner.py:    single-kernel compile + run harness                                                    │
+│                                                                                                                      │
+│  Program forms (shared across backends):                                                                             │
+│      program/loop.py: LoopProgram + LoopBuffer + LoopLaunch                                                          │
+│      program/gpu.py:  GpuProgram + GpuBuffer + GpuLaunch                                                             │
+│  The imperative C-like kernel AST lives upstream in ir/gpu.py (GpuKernel, Stmt, ArrayAccess, ...);                   │
+│  the backend consumes it.                                                                                            │
+│                                                                                                                      │
+│  RULE: GPU specifics live here; everything above is portable.                                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 See `ir/ARCHITECTURE.md` for the per-dialect breakdown of each IR level,
@@ -98,18 +94,18 @@ GpuProgram (Layer 3)
 SSA invariants are enforced by `LoopOp.__post_init__`: unique names,
 defined-before-use, no forward references.
 
-| Slot                          | Type                                     | Used for                                                            |
-| ----------------------------- | ---------------------------------------- | ------------------------------------------------------------------- |
-| `Axis.name` / `extent` / `kind` | `str` / `int` / `"free"|"reduce"`     | One iteration variable; reduce axes pair with accumulators          |
-| `Port.index`                  | `tuple[Expr, ...]`                       | Per-input-dim access pattern over axis Vars                         |
-| `LocalBuffer.name` / `init` / `combine` | `str` / `Expr` / `ElementwiseOp \| None` | Accumulator state (combine set) or plain scratch                    |
-| `Assign.op`                   | `ElementwiseOp`                          | Pure SSA body op; ReduceOp is NOT valid here                        |
-| `Update.target` / `value`     | `str` / `str`                            | Fold value into a LocalBuffer accumulator                           |
-| `Write.output` / `index` / `value` | `int` / `tuple[Expr, ...]` / `str`  | Inline store at a position                                          |
-| `Select.branches[i].value` / `select` | `str` / `Expr`                    | Coord-predicated SSA binding (replaces old Mux)                     |
-| `LoopOp.axes` / `inputs` / `locals` / `body` | 4 tuples                       | Iteration + access patterns + state + SSA statements                |
-| `LoopLaunch.input_names`      | `list[str]`                              | Per-Port external buffer name (program-level)                       |
-| `LoopLaunch.output_name`      | `str`                                    | External buffer written by this LoopOp                              |
+| Slot                                         | Type                                      | Used for                                                       |
+|----------------------------------------------|-------------------------------------------|----------------------------------------------------------------|
+| `Axis.name` / `extent` / `kind`              | `str` / `int` / `"free"                   | One iteration variable; reduce axes pair with accumulators     |
+| `Port.index`                                 | `tuple[Expr, ...]`                        | Per-input-dim access pattern over axis Vars                    |
+| `LocalBuffer.name` / `init` / `combine`      | `str` / `Expr` / `ElementwiseOp \| None`  | Accumulator state (combine set) or plain scratch               |
+| `Assign.op`                                  | `ElementwiseOp`                           | Pure SSA body op; ReduceOp is NOT valid here                   |
+| `Update.target` / `value`                    | `str` / `str`                             | Fold value into a LocalBuffer accumulator                      |
+| `Write.output` / `index` / `value`           | `int` / `tuple[Expr, ...]` / `str`        | Inline store at a position                                     |
+| `Select.branches[i].value` / `select`        | `str` / `Expr`                            | Coord-predicated SSA binding (replaces old Mux)                |
+| `LoopOp.axes` / `inputs` / `locals` / `body` | 4 tuples                                  | Iteration + access patterns + state + SSA statements           |
+| `LoopLaunch.input_names`                     | `list[str]`                               | Per-Port external buffer name (program-level)                  |
+| `LoopLaunch.output_name`                     | `str`                                     | External buffer written by this LoopOp                         |
 
 Analogies (use in module/class docstrings):
 
@@ -125,15 +121,15 @@ Every ``Op`` subclass implements ``infer_output_shape(input_shapes) → tuple``.
 The compiler never stores shapes redundantly — shapes are derived when
 needed by calling ``infer_output_shape`` on the op instance.
 
-| Op type | Rule |
-|---|---|
-| ``ElementwiseOp`` | ``broadcast_shapes(*input_shapes)`` — NumPy right-aligned broadcast. Inputs MUST be broadcast-compatible; matmul decomposition inserts unsqueeze IndexMapOps to ensure this. |
-| ``ReduceOp`` | Drop the ``axis`` dim from the input shape. |
-| ``IndexMapOp`` | Returns ``self.out_shape`` — the output shape is part of the op definition because it cannot be derived from the coord_map + input shape (e.g., reshape ``(12,) → (3, 4)``). |
-| ``TransposeOp`` | Permute the input shape by ``self.axes``. |
-| ``ReshapeOp`` | Returns ``self.shape``. |
-| ``LinearOp`` / ``MatmulOp`` / ``SdpaOp`` / ``MeanOp`` | High-level ops; decomposed before shape inference runs on the kernel IR. |
-| ``LoopOp`` | ``infer_output_shape()`` returns the tuple of free-axis extents. ``infer_shapes()`` walks the SSA body, propagating per-name shapes through Assigns/Selects. |
+| Op type                                               | Rule                                                                                                                                                                         |
+|-------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ``ElementwiseOp``                                     | ``broadcast_shapes(*input_shapes)`` — NumPy right-aligned broadcast. Inputs MUST be broadcast-compatible; matmul decomposition inserts unsqueeze IndexMapOps to ensure this. |
+| ``ReduceOp``                                          | Drop the ``axis`` dim from the input shape.                                                                                                                                  |
+| ``IndexMapOp``                                        | Returns ``self.out_shape`` — the output shape is part of the op definition because it cannot be derived from the coord_map + input shape (e.g., reshape ``(12,) → (3, 4)``). |
+| ``TransposeOp``                                       | Permute the input shape by ``self.axes``.                                                                                                                                    |
+| ``ReshapeOp``                                         | Returns ``self.shape``.                                                                                                                                                      |
+| ``LinearOp`` / ``MatmulOp`` / ``SdpaOp`` / ``MeanOp`` | High-level ops; decomposed before shape inference runs on the kernel IR.                                                                                                     |
+| ``LoopOp``                                            | ``infer_output_shape()`` returns the tuple of free-axis extents. ``infer_shapes()`` walks the SSA body, propagating per-name shapes through Assigns/Selects.                 |
 
 **Invariant**: after decomposition + optimization, every ``ElementwiseOp("mul")``
 in the graph has broadcast-compatible inputs. Matmul ``A(..., M, K) × B(..., K, N)``
@@ -155,28 +151,28 @@ Backward-cone region growing via the rewriter:
    all in the region. Trims nodes with side-outputs.
 4. **Body** — topologically sorted ``Assign`` statements from the region.
 5. ``InputOp`` / ``ConstantOp`` / ``IndexMapOp`` nodes emit no kernel —
-   they survive as external ``Port.buffer_id`` leaves (IndexMapOps at
-   boundaries are absorbed into ``Port.indexmap``).
+   they survive as external buffers referenced by ``LoopLaunch.input_names``
+   in ``Port`` order. Identity-alias IndexMapOps at boundaries are baked
+   into the consuming ``Port.index`` Exprs during fusion (see step 6).
 6. **Layout absorption is restricted to identity-alias IndexMapOps**:
    size-1 squeeze/unsqueeze whose ``coord_map`` is a strictly-increasing
    subset of ``out_coord`` placeholders. Transposes, broadcasts, and
    arithmetic reshapes are rejected by ``_same_rank`` and lowered as
-   standalone kernels via ``003_wrap_indexmap``. Port indices align
-   source-buffer dims to axis extents right-to-left rather than by
-   positional left-pad, so extra iteration axes (e.g. reduce axes or
-   absorbed unsqueezes) don't misalign the read.
+   standalone kernels via ``003_wrap_indexmap``. Absorbed IndexMapOps
+   are baked directly into the consuming ``Port.index`` Exprs; there is
+   no separate ``indexmap`` field on Port. Port indices align source-buffer
+   dims to axis extents right-to-left rather than by positional left-pad,
+   so extra iteration axes (e.g. reduce axes or absorbed unsqueezes)
+   don't misalign the read.
 
 ## Codegen policy (backend/cuda/emit.py)
 
 Walks the SSA body — no classification pass, no `Schedule` dataclass, no `LoopIR` intermediate. Maintains a `values: dict[str, Expr]` mapping Assign names to C expressions.
 
-- `_emit_input_value(LoopInput, coord) -> Expr`:
-  - `Port` → `ArrayAccess(buffer, coord)`.
-  - `Mux` → nested `Ternary` chain over branch `select` predicates.
-  - `Combine` → emit each source to a temporary, then fold the `ops` chain.
-- `_emit_body`: unified dispatcher, selects `_emit_flat` (no ReduceOp) or `_emit_segments` (ReduceOp present).
-- `_emit_flat`: 1D grid over flat numel, 256 threads/block, 1 thread/coord. Walks body Assigns as inline expressions. Handles copy kernels (empty body).
-- `_emit_segments`: 1 block/row, segment-based codegen. Body is split into segments at ReduceOp boundaries. Each segment with per-element references gets its own K-loop; per-element values from prior segments are recomputed via transitive dependency analysis. Supports cross-iteration-space patterns (e.g. softmax: reduce_max → sub+exp → reduce_sum → div) and contractions (mul → reduce_sum). Max reduction uses `fmaxf` instead of `AugAssign`.
+- `_emit_port_load(port, buf, src_shape, env) -> Expr`: emits `ArrayAccess(buffer, coord)` for a Port.index pattern evaluated in the axis environment. Select statements inside the SSA body are handled separately by `_emit_select`, which lowers `SelectBranch`es into a nested `Ternary` chain.
+- `_emit_body`: unified entry for one kernel body. Calls `backend.kernel_plan.analyze_kernel(loop, dollar_shapes, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`.
+- `_emit_plan`: walks `plan.steps` — each step is either `Inline` (a straight-line block of `Assign` / `Select` / `Write` / `Update`) or `Loop` (a K-loop over a reduce axis). Per-element port loads referenced inside a loop are deferred into that loop; other port loads happen upfront. Grid is 1D over flat free-axis extents; block is `(256, 1, 1)` for pure-elementwise plans, `(1, 1, 1)` for plans containing a `Loop` step. Empty bodies (copy kernels) are a pointwise subcase.
+- Reductions (single `Loop` step) emit an accumulator `LocalBuffer` + `Update`; max reductions use `fmaxf` instead of `AugAssign`. Softmax-style cross-iteration patterns (reduce_max → sub+exp → reduce_sum → div) and contractions (mul → reduce_sum) fall out naturally from multiple `Loop` steps recomputing per-element values as needed.
 
 The naive schedule is correctness-first — no shared memory, no async copies, no TMA, no vectorization. Performance work lives in follow-up commits.
 

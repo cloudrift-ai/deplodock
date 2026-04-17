@@ -59,6 +59,10 @@ Or for a specific test file:
 - `make bench` — run benchmarks (`deplodock bench recipes/*`)
 - `make clean` — remove venv and generated files
 
+## Documentation Conventions
+
+- Target ~120 characters for `ARCHITECTURE.md`, `README.md`, and other docs (ASCII diagrams, tables, prose). Wider is fine if a table or diagram reads better that way — some overflow is acceptable. Python code stays under 140 chars (Ruff-enforced).
+
 ## Contribution Instructions
 
 IMPORTANT: You MUST follow ALL of these steps for EVERY code change. Do NOT skip any step.
