@@ -15,6 +15,7 @@ the caller's perspective the interface is identical.
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -58,6 +59,29 @@ class Backend(ABC):
     def run_arrays(self, compiled: Any, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
         """Execute; return outputs as numpy arrays with declared shapes."""
 
-    @abstractmethod
-    def benchmark(self, compiled: Any, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
-        """Execute with timing."""
+    def benchmark(
+        self,
+        compiled: Any,
+        *,
+        input_data: dict[str, np.ndarray] | None = None,
+        warmup: int = 5,
+        num_iters: int = 20,
+    ) -> BenchmarkResult:
+        """Wall-time benchmark over repeated ``run()`` calls.
+
+        Default implementation — good enough for numpy / loop interpreters.
+        Backends with better timing (e.g. CUDA using GPU events inside an
+        nvcc-compiled subprocess) override for device-precise measurements.
+        """
+        for _ in range(warmup):
+            self.run(compiled, input_data=input_data)
+        times: list[float] = []
+        for _ in range(num_iters):
+            t0 = time.perf_counter()
+            self.run(compiled, input_data=input_data)
+            times.append((time.perf_counter() - t0) * 1000)
+        return BenchmarkResult(
+            time_ms=sum(times) / len(times),
+            min_ms=min(times),
+            max_ms=max(times),
+        )

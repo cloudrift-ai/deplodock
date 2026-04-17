@@ -55,6 +55,17 @@ class CudaBackend(Backend):
             outputs[name] = np.asarray(vals, dtype=np.float32).reshape(shape)
         return outputs
 
-    def benchmark(self, compiled: CompiledCudaProgram, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
+    def benchmark(
+        self,
+        compiled: CompiledCudaProgram,
+        *,
+        input_data: dict[str, np.ndarray] | None = None,
+        warmup: int = 5,
+        num_iters: int = 20,
+    ) -> BenchmarkResult:
+        """Override the default wall-time loop with GPU-event timing
+        (via the nvcc-compiled subprocess). ``input_data`` is currently
+        unused — the benchmark subprocess generates random inputs."""
+        del input_data  # subprocess generates its own random inputs
         result = benchmark_program(compiled.gpu, warmup=warmup, num_iters=num_iters)
         return BenchmarkResult(time_ms=result.time_ms, num_launches=result.num_launches)
