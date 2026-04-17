@@ -214,8 +214,6 @@ def _eval_mux(mux: Mux, out_shape: tuple[int, ...], *, bind_for_mux_branch) -> n
     the correct sequence; the ``np.where`` fold then runs in reverse so
     earlier branches override later (catch-all) ones.
     """
-    from deplodock.compiler.ir.expr import eval_expr
-
     # Coord grids: one ndarray per output axis.
     if out_shape:
         grids = np.meshgrid(*[np.arange(d) for d in out_shape], indexing="ij")
@@ -229,7 +227,7 @@ def _eval_mux(mux: Mux, out_shape: tuple[int, ...], *, bind_for_mux_branch) -> n
     # Reverse-order mask fold: last branch is the catch-all, earlier override.
     result: np.ndarray | None = None
     for branch, val in zip(reversed(mux.branches), reversed(branch_vals), strict=True):
-        mask = eval_expr(branch.select, env) if branch.select is not None else True
+        mask = branch.select.eval(env) if branch.select is not None else True
         if result is None:
             result = np.broadcast_to(val, out_shape).astype(np.float32, copy=True)
         else:

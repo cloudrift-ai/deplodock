@@ -108,6 +108,9 @@ class Var(_ExprOps):
 
     name: str
 
+    def eval(self, env: dict[str, object]) -> object:
+        return env[self.name]
+
 
 @dataclass
 class Literal(_ExprOps):
@@ -116,21 +119,115 @@ class Literal(_ExprOps):
     value: int | float
     dtype: str = "float"
 
+    def eval(self, env: dict[str, object]) -> object:
+        return self.value
+
 
 @dataclass
 class BinOp(_ExprOps):
-    """Binary operation."""
+    """Binary operation.
 
-    op: str  # "+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "&&", "||"
+    Evaluates ``left`` and ``right`` in ``env`` then applies the op.
+    Values may be scalars or numpy ndarrays; arithmetic composes via
+    numpy broadcasting. Integer floor division is used for both ``/``
+    and ``//``. Logical ``&&`` / ``||`` fall back to ``np.logical_and``
+    / ``np.logical_or`` when the operand is an ndarray (scalar bool
+    coercion would raise).
+    """
+
+    op: str  # "+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "&&", "||"
     left: Expr
     right: Expr
+
+    def eval(self, env: dict[str, object]) -> object:
+        lv, rv = self.left.eval(env), self.right.eval(env)
+        op = self.op
+        if op == "+":
+            return lv + rv
+        if op == "-":
+            return lv - rv
+        if op == "*":
+            return lv * rv
+        if op in ("/", "//"):
+            try:
+                return int(lv) // int(rv)
+            except TypeError:
+                return lv // rv
+        if op == "%":
+            try:
+                return int(lv) % int(rv)
+            except TypeError:
+                return lv % rv
+        if op == "<":
+            return lv < rv
+        if op == "<=":
+            return lv <= rv
+        if op == ">":
+            return lv > rv
+        if op == ">=":
+            return lv >= rv
+        if op == "==":
+            return lv == rv
+        if op == "&&":
+            try:
+                return bool(lv) and bool(rv)
+            except (TypeError, ValueError):
+                import numpy as np
+
+                return np.logical_and(lv, rv)
+        if op == "||":
+            try:
+                return bool(lv) or bool(rv)
+            except (TypeError, ValueError):
+                import numpy as np
+
+                return np.logical_or(lv, rv)
+        raise ValueError(f"Unknown BinOp: {op}")
 
 
 @dataclass
 class Builtin(_ExprOps):
-    """GPU built-in variable (threadIdx.x, blockIdx.y, blockDim.x, etc.)."""
+    """GPU built-in variable (threadIdx.x, blockIdx.y, blockDim.x, etc.).
+
+    Not evaluable outside a kernel — GPU codegen substitutes these at emit
+    time. Calling ``eval`` raises.
+    """
 
     name: str
+
+    def eval(self, env: dict[str, object]) -> object:
+        raise NotImplementedError(f"Builtin {self.name!r} is GPU-only; cannot eval in numpy")
+
+
+_FUNC_CALLS: dict[str, object] = {}
+"""Registered math intrinsics for ``FuncCall.eval``. Populated lazily on first call."""
+
+
+def _load_func_calls() -> dict[str, object]:
+    """One-time load of numpy math intrinsics for FuncCall dispatch."""
+    if _FUNC_CALLS:
+        return _FUNC_CALLS
+    import numpy as np
+
+    _FUNC_CALLS.update(
+        {
+            "expf": np.exp,
+            "exp": np.exp,
+            "rsqrtf": lambda x: 1.0 / np.sqrt(x),
+            "rsqrt": lambda x: 1.0 / np.sqrt(x),
+            "tanhf": np.tanh,
+            "tanh": np.tanh,
+            "fabsf": np.abs,
+            "fabs": np.abs,
+            "fmaxf": np.maximum,
+            "fmax": np.maximum,
+            "fminf": np.minimum,
+            "fmin": np.minimum,
+            "powf": np.power,
+            "pow": np.power,
+        }
+    )
+    return _FUNC_CALLS
 
 
 @dataclass
@@ -140,14 +237,28 @@ class FuncCall(_ExprOps):
     name: str
     args: list[Expr]
 
+    def eval(self, env: dict[str, object]) -> object:
+        fn = _load_func_calls().get(self.name)
+        if fn is None:
+            raise NotImplementedError(f"FuncCall.eval: unknown intrinsic {self.name!r}")
+        return fn(*(a.eval(env) for a in self.args))
+
 
 @dataclass
 class Ternary(_ExprOps):
-    """Ternary expression: cond ? if_true : if_false."""
+    """Ternary expression: cond ? if_true : if_false.
+
+    Uses Python's conditional: when ``cond`` evaluates to an ndarray,
+    callers that want elementwise selection should use ``np.where``
+    directly; ``Ternary.eval`` only supports scalar ``cond``.
+    """
 
     cond: Expr
     if_true: Expr
     if_false: Expr
+
+    def eval(self, env: dict[str, object]) -> object:
+        return self.if_true.eval(env) if self.cond.eval(env) else self.if_false.eval(env)
 
 
 Expr = Var | Literal | BinOp | Builtin | FuncCall | Ternary
@@ -185,112 +296,6 @@ def is_placeholder(expr: object, d: int | None = None) -> bool:
     if d is None:
         return True
     return expr.name == f"{PLACEHOLDER_PREFIX}{d}"
-
-
-def eval_expr(expr: Expr, env: dict[str, object]) -> object:
-    """Evaluate an ``Expr`` given a name → value environment.
-
-    Values in ``env`` may be scalars or numpy ndarrays; all BinOp operators
-    compose over ndarrays via numpy broadcasting. Used by:
-    - ``IndexMapOp.forward`` (scalar env — per-coord evaluation).
-    - ``LoopBackend`` (ndarray env — Mux select masks over coord grids).
-
-    Supported:
-    - ``Var``: looked up in ``env``.
-    - ``Literal``: returns its ``.value``.
-    - ``BinOp``: arithmetic (``+``, ``-``, ``*``, ``/``, ``//``, ``%``),
-      relational (``<``, ``<=``, ``>``, ``>=``, ``==``), logical
-      (``&&``, ``||``). Integer-like division uses floor for ``/`` + ``//``.
-    - ``Ternary``: ``cond ? if_true : if_false`` — both branches are
-      evaluated; for ndarray ``cond`` the caller should use ``np.where``
-      semantics (this helper uses Python conditional, which only works
-      for scalar ``cond``).
-    - ``FuncCall``: math intrinsics (``expf``/``exp``, ``fmaxf``/``fmax``,
-      ``rsqrtf``/``rsqrt``, ``tanhf``/``tanh``, ``fabsf``/``abs``).
-    - ``Builtin``: raises (not evaluable outside a kernel).
-    """
-
-    def _ev(e):
-        if isinstance(e, Var):
-            return env[e.name]
-        if isinstance(e, Literal):
-            return e.value
-        if isinstance(e, BinOp):
-            lv, rv = _ev(e.left), _ev(e.right)
-            op = e.op
-            if op == "+":
-                return lv + rv
-            if op == "-":
-                return lv - rv
-            if op == "*":
-                return lv * rv
-            if op in ("/", "//"):
-                # Floor division; int-cast in the scalar path to match prior semantics.
-                try:
-                    return int(lv) // int(rv)
-                except TypeError:
-                    return lv // rv
-            if op == "%":
-                try:
-                    return int(lv) % int(rv)
-                except TypeError:
-                    return lv % rv
-            if op == "<":
-                return lv < rv
-            if op == "<=":
-                return lv <= rv
-            if op == ">":
-                return lv > rv
-            if op == ">=":
-                return lv >= rv
-            if op == "==":
-                return lv == rv
-            if op == "&&":
-                try:
-                    return bool(lv) and bool(rv)
-                except (TypeError, ValueError):
-                    # Elementwise logical-AND for ndarrays.
-                    import numpy as np
-
-                    return np.logical_and(lv, rv)
-            if op == "||":
-                try:
-                    return bool(lv) or bool(rv)
-                except (TypeError, ValueError):
-                    import numpy as np
-
-                    return np.logical_or(lv, rv)
-            raise ValueError(f"Unknown BinOp: {op}")
-        if isinstance(e, Ternary):
-            return _ev(e.if_true) if _ev(e.cond) else _ev(e.if_false)
-        if isinstance(e, FuncCall):
-            import numpy as np
-
-            _FNS = {
-                "expf": np.exp,
-                "exp": np.exp,
-                "rsqrtf": lambda x: 1.0 / np.sqrt(x),
-                "rsqrt": lambda x: 1.0 / np.sqrt(x),
-                "tanhf": np.tanh,
-                "tanh": np.tanh,
-                "fabsf": np.abs,
-                "fabs": np.abs,
-                "fmaxf": np.maximum,
-                "fmax": np.maximum,
-                "fminf": np.minimum,
-                "fmin": np.minimum,
-                "powf": np.power,
-                "pow": np.power,
-            }
-            fn = _FNS.get(e.name)
-            if fn is None:
-                raise NotImplementedError(f"eval_expr: unknown FuncCall {e.name!r}")
-            return fn(*(_ev(a) for a in e.args))
-        if isinstance(e, Builtin):
-            raise NotImplementedError(f"eval_expr cannot evaluate Builtin {e.name!r} (GPU-only)")
-        raise TypeError(f"Unsupported expr type in eval_expr: {type(e).__name__}")
-
-    return _ev(expr)
 
 
 def substitute(expr: Expr, mapping: dict[str, Expr]) -> Expr:

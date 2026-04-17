@@ -265,16 +265,14 @@ class IndexMapOp(Op):
     def forward(self, *inputs):
         import numpy as np
 
-        from deplodock.compiler.ir.expr import eval_expr
-
         shape = tuple(int(d) for d in self.out_shape)
         output = np.empty(shape, dtype=inputs[0].dtype if inputs else np.float32)
         for out_idx in np.ndindex(shape):
             env = {f"out_coord_{i}": out_idx[i] for i in range(len(out_idx))}
             for source in self.sources:
-                if source.select is not None and not eval_expr(source.select, env):
+                if source.select is not None and not source.select.eval(env):
                     continue
-                in_coords = tuple(int(eval_expr(c, env)) for c in source.coord_map)
+                in_coords = tuple(int(c.eval(env)) for c in source.coord_map)
                 input_tensor = inputs[source.input_idx]
                 # Clip coords to valid range. After fusion, a Port's IndexMap
                 # may produce out-of-bounds coords when the consuming Mux
