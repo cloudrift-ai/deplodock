@@ -246,17 +246,22 @@ def _bind_inputs(
     launch: LoopLaunch,
     buffers: dict[str, np.ndarray],
 ) -> dict[str, np.ndarray]:
-    """Bind each ``$i`` port to a broadcast-ready array."""
+    """Bind each ``$i`` port to a broadcast-ready array.
+
+    Ports load in declaration order; each loaded value is exposed as
+    ``$i`` to later ports so data-dependent access patterns (e.g. gather)
+    can reference an earlier port's value in their index Expr.
+    """
     dollar: dict[str, np.ndarray] = {}
     for i, port in enumerate(loop.inputs):
         key = f"${i}"
         buf_name = launch.input_names[i]
         base = buffers[buf_name]
-        dollar[key] = _apply_port_index(port, base, loop.axes)
+        dollar[key] = _apply_port_index(port, base, loop.axes, dollar)
     return dollar
 
 
-def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...]) -> np.ndarray:
+def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...], dollar: dict[str, np.ndarray]) -> np.ndarray:
     """Return the array the body sees for this Port (rank == len(axes))."""
     if not port.index:
         return base
@@ -265,6 +270,11 @@ def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...]) -> n
     used_axes: set[str] = set()
     for e in port.index:
         _collect_used_axis_names(e, axis_names, used_axes)
+
+    # A reference to another port (``$N``) implicitly spans the full iter
+    # shape — conservatively extend used_axes to cover all axes in that case.
+    if any(_references_dollar(e) for e in port.index):
+        used_axes = set(axis_names)
 
     bshape = tuple(int(a.extent) if a.name in used_axes else 1 for a in axes)
 
@@ -279,6 +289,8 @@ def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...]) -> n
             axis_env[a.name] = np.arange(int(a.extent)).reshape(shape)
         else:
             axis_env[a.name] = 0
+    # Expose earlier ports' loaded values so e.g. gather can reference ``$0``.
+    axis_env.update(dollar)
 
     coord_arrs = []
     for dim, e in enumerate(port.index):
@@ -316,12 +328,26 @@ def _is_identity(port: Port, axes: tuple[Axis, ...], base_shape: tuple) -> bool:
     return True
 
 
+def _references_dollar(expr) -> bool:
+    """True if ``expr`` contains any ``Var($N)`` reference to a prior port."""
+    if isinstance(expr, Var):
+        return expr.name.startswith("$")
+    for attr in ("left", "right", "cond", "if_true", "if_false", "expr"):
+        c = getattr(expr, attr, None)
+        if c is not None and _references_dollar(c):
+            return True
+    args = getattr(expr, "args", None)
+    if isinstance(args, (list, tuple)):
+        return any(_references_dollar(a) for a in args)
+    return False
+
+
 def _collect_used_axis_names(expr, axis_names: set[str], out: set[str]) -> None:
     if isinstance(expr, Var):
         if expr.name in axis_names:
             out.add(expr.name)
         return
-    for attr in ("left", "right", "cond", "if_true", "if_false"):
+    for attr in ("left", "right", "cond", "if_true", "if_false", "expr"):
         c = getattr(expr, attr, None)
         if c is not None:
             _collect_used_axis_names(c, axis_names, out)

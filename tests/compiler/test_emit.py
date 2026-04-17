@@ -208,7 +208,7 @@ def test_softmax_runs_on_gpu():
         exps = [math.exp(v - mx) for v in row_vals]
         s = sum(exps)
         expected.extend(e / s for e in exps)
-    assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-3)
+    assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected, rel=1e-3)
 
 
 @requires_cuda
@@ -222,4 +222,4 @@ def test_matmul_runs_on_gpu():
         for ni in range(4):
             s = sum(a_data[mi * 8 + k] * b_data[k * 4 + ni] for k in range(8))
             expected.append(s)
-    assert list(result.outputs.values())[0] == pytest.approx(expected)
+    assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected)

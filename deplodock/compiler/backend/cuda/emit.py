@@ -27,7 +27,8 @@ from deplodock.compiler.ir.gpu import (
 from deplodock.compiler.ir.gpu import (
     Assign as IrAssign,
 )
-from deplodock.compiler.ir.loop import Axis, LoopOp, Port, Update
+from deplodock.compiler.ir.loop import Assign as IrAssignStmt
+from deplodock.compiler.ir.loop import Axis, LoopOp, Port, Select, Update
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
 
@@ -169,10 +170,10 @@ def _emit_body(
     from deplodock.compiler.backend.kernel_plan import analyze_kernel
 
     plan = analyze_kernel(launch.loop, dollar_shapes, out_shape)
-    idx = Var("idx")
+    idx = Var("tid")
     idx_init = VarDecl(
         dtype="long long",
-        name="idx",
+        name="tid",
         init=BinOp("+", BinOp("*", Var("blockIdx.x"), Var("blockDim.x")), Var("threadIdx.x")),
     )
     guarded = _emit_plan(plan, launch, dollar_shapes, program, idx)
@@ -198,20 +199,30 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
     free_axes = tuple(a for a in loop.axes if a.kind == "free")
     flat_env = _axis_env_for_flat(free_axes, idx)
 
-    # Load per-row ports upfront.
+    # Load per-row ports upfront. Threading ``load_env`` forward lets a later
+    # port's index Expr reference an earlier port by name (e.g. gather: the
+    # data port's axis index reads ``$0`` — the already-loaded index value).
+    load_env: dict[str, Expr] = dict(flat_env)
     for key, (port, buf_name, src_shape) in port_info.items():
         if key not in plan.per_elem_ports:
-            values[key] = _emit_port_load(port, buf_name, src_shape, flat_env)
+            values[key] = _emit_port_load(port, buf_name, src_shape, load_env)
+            load_env[key] = values[key]
 
     loop_count = 0
     for step in plan.steps:
         if isinstance(step, Inline):
-            for assign in step.body:
-                arg_exprs = [values[a] for a in assign.args]
-                value = _apply_elementwise(assign.op.fn, arg_exprs)
-                tname = _fresh(name_seq)
-                stmts.append(VarDecl(dtype="float", name=tname, init=value))
-                values[assign.name] = Var(tname)
+            for stmt in step.body:
+                if isinstance(stmt, IrAssignStmt):
+                    arg_exprs = [values[a] for a in stmt.args]
+                    value = _apply_elementwise(stmt.op.fn, arg_exprs)
+                    tname = _fresh(name_seq)
+                    stmts.append(VarDecl(dtype="float", name=tname, init=value))
+                    values[stmt.name] = Var(tname)
+                elif isinstance(stmt, Select):
+                    value = _emit_select(stmt, values, flat_env)
+                    tname = _fresh(name_seq)
+                    stmts.append(VarDecl(dtype="float", name=tname, init=value))
+                    values[stmt.name] = Var(tname)
 
         elif isinstance(step, Loop):
             k_var_name = f"k{loop_count}"
@@ -401,4 +412,13 @@ def _fresh(seq: list[int]) -> str:
     return name
 
 
-_ = Ternary  # re-exported for potential future Select emission helpers
+def _emit_select(stmt: Select, values: dict[str, Expr], axis_env: dict[str, Expr]) -> Expr:
+    """Emit a chained ternary for a Select: each branch's predicate selects its value."""
+    branches = list(stmt.branches)
+    # Last branch is the catch-all (by convention: select=Literal(1) when the
+    # rule had no explicit predicate). Build the chain right-to-left.
+    result: Expr = values[branches[-1].value]
+    for branch in reversed(branches[:-1]):
+        cond = substitute(branch.select, axis_env)
+        result = Ternary(cond=cond, if_true=values[branch.value], if_false=result)
+    return result

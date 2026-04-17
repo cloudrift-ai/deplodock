@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.loop import Assign, LoopOp, Port, Update, Write
+from deplodock.compiler.ir.loop import Assign, LoopOp, Port, Select, Update, Write
 
 # ---------------------------------------------------------------------------
 # Plan data structures
@@ -52,7 +52,7 @@ class Loop:
 class Inline:
     """Per-row assigns emitted without a loop."""
 
-    body: tuple[Assign, ...]
+    body: tuple[Assign | Select, ...]
 
 
 type Step = Loop | Inline
@@ -140,9 +140,9 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 
     # --- Split body into segments at Update boundaries ---
     if not has_reduce:
-        # Flat: Writes are trailing, everything else is Inline.
-        assigns_only = [s for s in kernel.body if isinstance(s, Assign)]
-        steps: list[Step] = [Inline(body=tuple(assigns_only))] if assigns_only else []
+        # Flat: Writes are trailing; Assigns and Selects fold into one Inline step.
+        inline_body = [s for s in kernel.body if isinstance(s, Assign | Select)]
+        steps: list[Step] = [Inline(body=tuple(inline_body))] if inline_body else []
         return KernelPlan(
             steps=tuple(steps),
             per_elem_ports=per_elem_ports,

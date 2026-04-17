@@ -254,7 +254,23 @@ class Ternary(_ExprOps):
         return self.if_true.eval(env) if self.cond.eval(env) else self.if_false.eval(env)
 
 
-Expr = Var | Literal | BinOp | Builtin | FuncCall | Ternary
+@dataclass
+class Cast(_ExprOps):
+    """Type cast of an inner expression to ``dtype`` (e.g. ``"int"``, ``"float"``)."""
+
+    dtype: str
+    expr: Expr
+
+    def eval(self, env: dict[str, object]) -> object:
+        v = self.expr.eval(env)
+        if self.dtype == "int":
+            import numpy as np
+
+            return np.asarray(v).astype(np.int64) if hasattr(v, "__array__") else int(v)
+        return v
+
+
+Expr = Var | Literal | BinOp | Builtin | FuncCall | Ternary | Cast
 
 
 # ---------------------------------------------------------------------------
@@ -314,4 +330,6 @@ def substitute(expr: Expr, mapping: dict[str, Expr]) -> Expr:
         )
     if isinstance(expr, FuncCall):
         return FuncCall(expr.name, [substitute(a, mapping) for a in expr.args])
+    if isinstance(expr, Cast):
+        return Cast(expr.dtype, substitute(expr.expr, mapping))
     return expr
