@@ -227,12 +227,13 @@ def pretty_print_loop(loop: LoopOp, indent: str = "") -> str:
         port_parts = [f"${i}[{', '.join(render_expr(e) for e in p.index)}]" for i, p in enumerate(loop.inputs)]
         lines.append(f"{indent}inputs: {', '.join(port_parts)}")
 
+    locals_by_name: dict[str, LocalBuffer] = {lb.name: lb for lb in loop.locals}
     if loop.locals:
         loc_parts: list[str] = []
         for lb in loop.locals:
             init = render_expr(lb.init) if lb.init is not None else "?"
             if lb.combine is not None:
-                loc_parts.append(f"{lb.name}:{lb.dtype}={init} combine={lb.combine.fn}")
+                loc_parts.append(f"{lb.name}:{lb.dtype}={init} via {lb.combine.fn}")
             else:
                 loc_parts.append(f"{lb.name}:{lb.dtype} (scratch)")
         lines.append(f"{indent}locals: {', '.join(loc_parts)}")
@@ -243,7 +244,9 @@ def pretty_print_loop(loop: LoopOp, indent: str = "") -> str:
             args = ", ".join(stmt.args)
             lines.append(f"{indent}  {stmt.name} = {stmt.op.fn}({args})")
         elif isinstance(stmt, Update):
-            lines.append(f"{indent}  {stmt.target} <- combine({stmt.target}, {stmt.value})")
+            lb = locals_by_name.get(stmt.target)
+            fn = lb.combine.fn if lb is not None and lb.combine is not None else "?"
+            lines.append(f"{indent}  {stmt.target} <- {fn}({stmt.target}, {stmt.value})")
         elif isinstance(stmt, Write):
             idx = ", ".join(render_expr(e) for e in stmt.index)
             lines.append(f"{indent}  out{stmt.output}[{idx}] = {stmt.value}")
