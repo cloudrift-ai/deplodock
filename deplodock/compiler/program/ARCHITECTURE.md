@@ -23,31 +23,34 @@ GpuProgram     ← program/gpu.py   +  ir/gpu.py
 Pairs with `ir/loop.py`. Produced by `LoopProgram.from_graph(graph)`
 after fusion completes.
 
-| Type | Role |
-|------|------|
-| `LoopBuffer(name, shape, dtype, role)` | One buffer. Shape is authoritative; `size` is a derived property. |
-| `LoopLaunch(loop, input_names, output_name)` | One `LoopOp` invocation wired to named buffers (Port order). |
-| `LoopProgram(name, buffers, launches, graph_inputs/outputs/constants, constant_values)` | The full post-fusion program. |
+| Type                                                                                    | Role                                                              |
+|-----------------------------------------------------------------------------------------|-------------------------------------------------------------------|
+| `LoopBuffer(name, shape, dtype, role)`                                                  | One buffer. Shape is authoritative; `size` is a derived property. |
+| `LoopLaunch(loop, input_names, output_name)`                                            | One `LoopOp` invocation wired to named buffers (Port order).      |
+| `LoopProgram(name, buffers, launches, graph_inputs/outputs/constants, constant_values)` | The full post-fusion program.                                     |
 
 `LoopProgram` exposes shape queries — `shape(name)`, `input_shapes(launch)`,
 `output_shape(launch)`, `dollar_shapes(launch)` — so codegen never
 recomputes shapes.
 
 **Rule:** No `aliases` field. At loop level, identity/metadata-only
-IndexMaps are absorbed into `Port.indexmap`; there's no separate
+IndexMaps are baked directly into the consuming `Port.index` Exprs
+during fusion — there is no `Port.indexmap` field and no separate
 metadata-only-alias concept here (unlike `GpuProgram`, which has
-`aliases` for buffer-pointer aliasing at the device level).
+`aliases` for buffer-pointer aliasing at the device level). Non-identity
+IndexMapOps are lowered to their own copy kernel via
+`rules/fusion/003_wrap_indexmap.py`.
 
 ## `gpu.py` — GpuProgram
 
 Pairs with `ir/gpu.py`. Produced by `backend/cuda/emit.compile_kernels`
 by lowering each `LoopLaunch` to a `CudaLaunch(GpuLaunch)`.
 
-| Type | Role |
-|------|------|
-| `GpuBuffer(name, size, dtype, role)` | One buffer. `size` is element count (resolved from `LoopBuffer.shape`). |
-| `GpuLaunch(kernel_source, kernel_name, grid, block, args, smem_bytes, zero_outputs)` | One GPU kernel invocation. |
-| `GpuProgram(name, buffers, launches, defines, includes, aliases)` | The full device program. |
+| Type                                                                                 | Role                                                                    |
+|--------------------------------------------------------------------------------------|-------------------------------------------------------------------------|
+| `GpuBuffer(name, size, dtype, role)`                                                 | One buffer. `size` is element count (resolved from `LoopBuffer.shape`). |
+| `GpuLaunch(kernel_source, kernel_name, grid, block, args, smem_bytes, zero_outputs)` | One GPU kernel invocation.                                              |
+| `GpuProgram(name, buffers, launches, defines, includes, aliases)`                    | The full device program.                                                |
 
 Backend-specific subclasses (`backend/cuda/program.py::CudaLaunch`) add
 fields like `tma_descriptors`.

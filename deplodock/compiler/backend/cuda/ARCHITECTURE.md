@@ -53,39 +53,28 @@ GpuProgram
 
 ## Walkers and Emitters in `emit.py`
 
-The emitter walks each `LoopOp`'s SSA `body` (a sequence of `Assign`
-statements). Each `Assign` is `name = op(args)` where args reference
-input Ports by `$N` position or prior `Assign.name`s; the `$N` → buffer
-name mapping lives on the `LoopLaunch`.
+The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Assign` / `Update` / `Write` / `Select` statements. Each `Assign` is `name = op(args)` where args reference input Ports by `$N` position or prior `Assign.name`s; the `$N` → buffer name mapping lives on the `LoopLaunch`.
 
-**Input-tree walker** (`_emit_input_value`): evaluates a `LoopInput`
-at a coord `Expr`, appending temporaries to a `list[Stmt]`.
+**Port loads** (`_emit_port_load(port, buf_name, src_shape, axis_env)`): evaluates `Port.index` in the current axis environment and emits `ArrayAccess(buffer, coord)`. There is no `indexmap` field on `Port` — absorbed identity-alias IndexMapOps have already been baked into `Port.index` during fusion; non-identity IndexMapOps are lowered to their own copy kernel by `003_wrap_indexmap`.
 
-| IR variant  | Emission                                                    |
-| ----------- | ----------------------------------------------------------- |
-| `Port`      | `ArrayAccess(buffer, coord)` or indexmap load               |
-| `Mux`       | Nested `Ternary` chain over `branch.select`                 |
-| `Combine`   | Temporaries for each source + `VarDecl` fold over ops chain |
+**Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a body `Select` into a nested `Ternary` chain over each `SelectBranch.select` predicate. (There is no `Mux` / `Combine` IR — those were replaced by `Select` / `SelectBranch`.)
 
-**Body emitter**: unified `_emit_body` dispatches based solely on the
-presence of `ReduceOp` in the SSA body (via `backend.kernel_plan`):
+**Body emitter**: `_emit_body` calls `backend.kernel_plan.analyze_kernel(loop, dollar_shapes, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The plan decomposes the body into ordered `Inline` (straight-line block) and `Loop` (K-loop over a reduce axis) steps:
 
-| Pattern                    | Emitter path          | Emission                                                      |
-| -------------------------- | --------------------- | ------------------------------------------------------------- |
-| No ReduceOp (pointwise)    | `Inline` steps only   | 1D grid; 256 threads/block; inline elementwise per Assign     |
-| ReduceOp present           | `Loop` + `Inline`     | 1 block/row; segment-based K-loops with recomputation         |
+| Pattern                 | Plan shape             | Emission                                                             |
+| ----------------------- | ---------------------- | -------------------------------------------------------------------- |
+| No ReduceOp (pointwise) | `Inline` steps only    | 1D grid over free-axis numel; `block = (256, 1, 1)`; inline Assigns  |
+| ReduceOp present        | `Loop` + other steps   | 1D grid over outer rows; `block = (1, 1, 1)`; K-loops with recompute |
 
-Contractions (matmul = mul + sum) go through the `Loop` path naturally:
-the `mul` is an elementwise Assign inside the K-loop, and the `sum` is
-the segment's ReduceOp accumulator. No special detection or classification.
+Contractions (matmul = mul + sum) fall out of the `Loop` path: the `mul` is an elementwise Assign inside the K-loop and the `sum` is the accumulator's `Update`. No special detection or classification.
 
 ## Shape handling
 
 Shapes are read from the `LoopProgram`, never recomputed:
 
 - `program.shape(name)` — per-buffer shape lookup.
-- `program.dollar_shapes(launch)` — `$N → shape` map for a launch's Ports,
-  already honoring `Port.indexmap.out_shape` overrides.
+- `program.dollar_shapes(launch)` — `$N → shape` map for a launch's Ports
+  (the external buffer shape bound to each Port position).
 - `program.output_shape(launch)` — shape of the launch's output buffer.
 
 No fallback call to `LoopOp.infer_output_shape(...)` happens in the
@@ -125,6 +114,6 @@ graph constant) when emitting `GpuBuffer`s.
 - A new backend (ROCm, SYCL, ...) reuses `ir/gpu.py`, `program/gpu.py`,
   and `backend/kernel_codegen.py` wholesale; only its own `emit.py` /
   `program.py` need to be rewritten.
-- The loop-IR types (`LoopOp`, `Port`, `Mux`, `Combine`, ...) stay
-  backend-agnostic — do NOT import from `backend/cuda/` into `ir/loop.py`
-  or `program/loop.py`.
+- The loop-IR types (`LoopOp`, `Port`, `LocalBuffer`, `Assign`, `Update`,
+  `Write`, `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT
+  import from `backend/cuda/` into `ir/loop.py` or `program/loop.py`.
