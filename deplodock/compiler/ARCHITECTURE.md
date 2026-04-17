@@ -129,7 +129,7 @@ needed by calling ``infer_output_shape`` on the op instance.
 | ``TransposeOp``                                       | Permute the input shape by ``self.axes``.                                                                                                                                    |
 | ``ReshapeOp``                                         | Returns ``self.shape``.                                                                                                                                                      |
 | ``LinearOp`` / ``MatmulOp`` / ``SdpaOp`` / ``MeanOp`` | High-level ops; decomposed before shape inference runs on the kernel IR.                                                                                                     |
-| ``LoopOp``                                            | ``infer_output_shape()`` returns the tuple of free-axis extents. ``infer_shapes()`` walks the SSA body, propagating per-name shapes through Assigns/Selects.                 |
+| ``LoopOp``                                            | ``infer_output_shape()`` returns the tuple of free-axis extents.                                                                                                             |
 
 **Invariant**: after decomposition + optimization, every ``ElementwiseOp("mul")``
 in the graph has broadcast-compatible inputs. Matmul ``A(..., M, K) × B(..., K, N)``

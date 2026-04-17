@@ -20,12 +20,7 @@ class Op:
     """Base class for all operations."""
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
-        """Derive the output shape from input shapes.
-
-        Override in subclasses with op-specific logic. Used by graph rewrites
-        (e.g. ``shape_utils.propagate_shapes``) to re-derive shapes after an
-        upstream rewrite changes its inputs.
-        """
+        """Derive the output shape from input shapes. Override in subclasses."""
         raise NotImplementedError(f"{type(self).__name__}.infer_output_shape not implemented")
 
     def forward(self, *inputs):
