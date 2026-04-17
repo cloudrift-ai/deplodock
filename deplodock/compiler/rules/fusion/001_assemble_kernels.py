@@ -12,7 +12,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Expr, Literal, Var, substitute
 from deplodock.compiler.ir.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, LoopOp, Port, Stmt, Update, Write
+from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, LoopOp, Port, Select, SelectBranch, Stmt, Update, Write
 from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -144,7 +144,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     pre_shape, reduce_axis = _iter_geometry(graph, match, output_nid)
     axes = _build_axes(pre_shape, reduce_axis)
 
-    ports, remap, input_names = _build_input_ports(graph, external_inputs, all_consumed, axes)
+    ports, remap, input_names, prelude = _build_input_ports(graph, external_inputs, all_consumed, axes)
     all_consumed |= layout_ids
 
     output_shape = graph.nodes[output_nid].output.shape
@@ -152,6 +152,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     if not body:
         return None
+
+    # Select statements absorbed from multi-source IndexMapOp inputs run once
+    # per output coord before the region's Assigns, so downstream statements
+    # can reference the Select's SSA name.
+    body = prelude + body
 
     last_node = graph.nodes[output_nid]
 
@@ -357,27 +362,33 @@ def _build_input_ports(
     external_inputs: list[str],
     consumed: set[str],
     axes: tuple[Axis, ...],
-) -> tuple[list[Port], dict[str, str], list[str]]:
-    """Build Ports with explicit index Exprs and a remap dict.
+) -> tuple[list[Port], dict[str, str], list[str], list[Stmt]]:
+    """Build Ports with explicit index Exprs, plus any prelude body stmts.
 
-    Returns (ports, remap, input_names).
+    Returns ``(ports, remap, input_names, prelude)``. ``prelude`` contains
+    ``Select`` statements emitted for absorbed multi-source IndexMapOps;
+    callers prepend it to the kernel body so downstream Assigns can
+    reference the Select's SSA name.
     """
     ports: list[Port] = []
     remap: dict[str, str] = {}
     input_names: list[str] = []
+    prelude: list[Stmt] = []
     idx = 0
 
     for buf_id in external_inputs:
-        new_port = _emit_port_for_external(graph, buf_id, consumed, remap, axes)
-        if new_port is None:
+        result = _emit_port_for_external(graph, buf_id, consumed, remap, axes, idx)
+        if result is None:
             continue
-        port, input_name = new_port
-        ports.append(port)
-        input_names.append(input_name)
-        remap[buf_id] = f"${idx}"
-        idx += 1
+        port_specs, remap_val, stmts = result
+        for port, input_name in port_specs:
+            ports.append(port)
+            input_names.append(input_name)
+        remap[buf_id] = remap_val
+        prelude.extend(stmts)
+        idx += len(port_specs)
 
-    return ports, remap, input_names
+    return ports, remap, input_names, prelude
 
 
 def _emit_port_for_external(
@@ -386,14 +397,21 @@ def _emit_port_for_external(
     consumed: set[str],
     remap: dict[str, str],
     axes: tuple[Axis, ...],
-) -> tuple[Port, str] | None:
-    """Build one Port for a single external input.
+    start_idx: int,
+) -> tuple[list[tuple[Port, str]], str, list[Stmt]] | None:
+    """Build port(s) + optional prelude statements for one external input.
 
-    Returns ``(port, input_name)`` where ``port.index`` is a tuple of
-    Exprs over axis Vars (one Expr per source-buffer dim) and ``input_name``
-    is the buffer name the Port binds to at the program level.
+    Returns ``(port_specs, remap_value, prelude_stmts)`` where:
+      - ``port_specs`` is a list of ``(Port, input_name)`` pairs — one entry
+        for simple/single-source IndexMapOp inputs, multiple for absorbed
+        multi-source IndexMapOps (cat/concat).
+      - ``remap_value`` is what ``buf_id`` should map to in the body:
+        ``f"${start_idx}"`` for a single port, or a ``Select`` SSA name
+        when multiple ports + a ``Select`` prelude are emitted.
+      - ``prelude_stmts`` is the list of ``Stmt``s to prepend to the body
+        (always empty except for absorbed multi-source IndexMapOps).
 
-    Returns ``None`` when the input has been folded into an internal
+    Returns ``None`` when the input has been folded into an existing $N
     reference (IndexMap chain terminating at an already-consumed node).
     """
     node = graph.nodes.get(buf_id)
@@ -427,28 +445,42 @@ def _emit_port_for_external(
         src_node = graph.nodes.get(src_id)
         src_shape = src_node.output.shape if src_node is not None else ()
         index = _indexmap_to_port_index(node.op, axes, src_shape)
-        return Port(index=index), src_id
+        return [(Port(index=index), src_id)], f"${start_idx}", []
+
+    if node is not None and isinstance(node.op, IndexMapOp) and len(node.op.sources) > 1:
+        # Multi-source IndexMapOp (cat/concat): absorb as one Port per source
+        # plus a ``Select`` prelude statement that picks the right branch.
+        mapping = _build_axis_mapping(axes, node.op.out_shape)
+        port_specs: list[tuple[Port, str]] = []
+        branches: list[SelectBranch] = []
+        for i, src in enumerate(node.op.sources):
+            src_id = node.inputs[src.input_idx]
+            src_node = graph.nodes.get(src_id)
+            if src_node is None:
+                return None  # source not in graph; bail
+            src_shape = src_node.output.shape
+            port_index = _source_to_port_index(src, mapping, src_shape)
+            port_specs.append((Port(index=port_index), src_id))
+            sel_expr: Expr = substitute(src.select, mapping) if src.select is not None else Literal(1, "int")
+            branches.append(SelectBranch(value=f"${start_idx + i}", select=sel_expr))
+        if len(graph.consumers(buf_id)) == 1:
+            consumed.add(buf_id)
+        sel_name = f"sel_{buf_id}"
+        return port_specs, sel_name, [Select(name=sel_name, branches=tuple(branches))]
 
     # Plain port (identity load on all axes matching source buffer rank).
     src_shape = node.output.shape if node is not None else ()
     index = _identity_index_for_shape(src_shape, axes)
-    return Port(index=index), buf_id
+    return [(Port(index=index), buf_id)], f"${start_idx}", []
 
 
-def _indexmap_to_port_index(op: IndexMapOp, axes: tuple[Axis, ...], src_shape: tuple) -> tuple[Expr, ...]:
-    """Translate an IndexMapOp's coord_map (single source) into a Port.index.
+def _build_axis_mapping(axes: tuple[Axis, ...], out_shape: tuple) -> dict[str, Expr]:
+    """Build a placeholder → axis-Var mapping for an IndexMapOp's ``out_shape``.
 
-    Aligns ``op.out_shape`` to the kernel's axes by matching non-size-1
-    extents from the right (mirroring how the absorbed IndexMapOp slots
-    into the surrounding kernel). Each ``out_coord_i`` placeholder is
-    substituted with the corresponding axis Var for non-size-1 positions,
-    or ``Literal(0)`` for size-1 positions. Source-buffer size-1 dims are
-    forced to ``Literal(0)`` regardless (clip-to-bounds, matches
-    ``IndexMapOp.forward``).
+    Walks right-to-left, matching each non-size-1 output dim to the next
+    axis with the same extent. Size-1 output dims (and unmatched ones)
+    map to ``Literal(0)``.
     """
-    src = op.sources[0]
-    out_shape = op.out_shape
-
     mapping: dict[str, Expr] = {}
     axis_cursor = len(axes) - 1
     for out_i in range(len(out_shape) - 1, -1, -1):
@@ -463,7 +495,15 @@ def _indexmap_to_port_index(op: IndexMapOp, axes: tuple[Axis, ...], src_shape: t
             continue
         mapping[f"{PLACEHOLDER_PREFIX}{out_i}"] = Var(axes[axis_cursor].name)
         axis_cursor -= 1
+    return mapping
 
+
+def _source_to_port_index(src, mapping: dict[str, Expr], src_shape: tuple) -> tuple[Expr, ...]:
+    """Substitute placeholders in one ``IndexSource.coord_map`` → Port index.
+
+    Source-buffer size-1 dims are forced to ``Literal(0)`` (clip-to-bounds,
+    matching ``IndexMapOp.forward``).
+    """
     out: list[Expr] = []
     for i, c in enumerate(src.coord_map):
         if i < len(src_shape) and isinstance(src_shape[i], int) and src_shape[i] == 1:
@@ -471,6 +511,11 @@ def _indexmap_to_port_index(op: IndexMapOp, axes: tuple[Axis, ...], src_shape: t
         else:
             out.append(substitute(c, mapping))
     return tuple(out)
+
+
+def _indexmap_to_port_index(op: IndexMapOp, axes: tuple[Axis, ...], src_shape: tuple) -> tuple[Expr, ...]:
+    """Single-source IndexMapOp → Port.index (delegates to ``_source_to_port_index``)."""
+    return _source_to_port_index(op.sources[0], _build_axis_mapping(axes, op.out_shape), src_shape)
 
 
 def _identity_index_for_shape(src_shape: tuple, axes: tuple[Axis, ...]) -> tuple[Expr, ...]:

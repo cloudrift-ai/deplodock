@@ -138,6 +138,14 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
                 elem_space.add(stmt.name)
             else:
                 row_space.add(stmt.name)
+        elif isinstance(stmt, Select):
+            # Select output is row-space when all branch values are row-space
+            # (the typical case for absorbed multi-source IndexMapOps, whose
+            # branches read row-space ports).
+            if all(br.value in row_space for br in stmt.branches):
+                row_space.add(stmt.name)
+            else:
+                elem_space.add(stmt.name)
         # Update/Write don't define new names in our SSA sense.
 
     # --- Split body into segments at Update boundaries ---
@@ -153,8 +161,22 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         )
 
     acc_map = {lb.name: lb for lb in kernel.locals}
-    segments = _split_at_updates(kernel.body)
-    steps = []
+
+    # Hoist leading row-space Select statements (emitted by rule 001 when
+    # absorbing multi-source IndexMapOps) into an Inline prelude — computed
+    # once per output coord, before any K-loop. They land in ``row_space``
+    # above so downstream Loop segments see their SSA name as row-space.
+    body_list = list(kernel.body)
+    prelude_selects: list[Select] = []
+    while body_list and isinstance(body_list[0], Select) and body_list[0].name in row_space:
+        prelude_selects.append(body_list[0])
+        body_list.pop(0)
+
+    steps: list[Step] = []
+    if prelude_selects:
+        steps.append(Inline(body=tuple(prelude_selects)))
+
+    segments = _split_at_updates(tuple(body_list))
     acc_count = 0
     prior_ew: list[Assign] = []
 
