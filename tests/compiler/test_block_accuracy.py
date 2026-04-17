@@ -94,7 +94,7 @@ def test_tinyllama_block_accuracy():
 
 
 @requires_cuda
-@pytest.mark.xfail(reason="Qwen 7B CUDA path: causal mask works in numpy but CUDA codegen has remaining issue")
+@pytest.mark.xfail(reason="Fusion drops interior IndexMapOps; port out_shape < kernel output")
 def test_qwen_block_accuracy():
     """Qwen 7B block (random weights): deplodock output matches PyTorch eager."""
     from transformers import AutoConfig, AutoModelForCausalLM

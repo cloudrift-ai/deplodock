@@ -27,11 +27,23 @@ def _same_rank(op, node, graph):
 
     Multi-source IndexMapOps (cat) have Mux-like semantics that can't be
     folded into a simple Port.index — they need their own kernel.
+    IndexMapOps that expand numel (e.g. GQA head broadcast from 4→28
+    heads) must also be rejected — absorbing them as layout nodes drops
+    their effect, causing the port's out_shape to be smaller than the
+    kernel output, which leads to out-of-bounds reads.
     """
     if len(op.sources) > 1:
         return False
     in_shape = graph.nodes[node.inputs[0]].output.shape
-    return len(op.out_shape) <= len(in_shape)
+    if len(op.out_shape) > len(in_shape):
+        return False
+    import math
+
+    in_numel = math.prod(int(d) for d in in_shape if isinstance(d, int)) or 1
+    out_numel = math.prod(int(d) for d in op.out_shape if isinstance(d, int)) or 1
+    if out_numel > in_numel:
+        return False
+    return True
 
 
 GRAMMAR = [
