@@ -48,7 +48,7 @@ def run_graph(request) -> Callable:
             be = LoopBackend()
             compiled = be.compile(graph)
             # Auto-supply ConstantOp scalar values (matches NumpyBackend convention).
-            augmented = _inject_constants(dict(input_data), compiled.program.constant_values)
+            augmented = _inject_constants(dict(input_data), compiled.constant_values)
             return be.run_arrays(compiled, input_data=augmented)
         # cuda
         from deplodock.compiler.backend.cuda.backend import CudaBackend

@@ -7,6 +7,6 @@ as a reference/debugging backend — sits between the ``NumpyBackend``
 codegen.
 """
 
-from deplodock.compiler.backend.loop.backend import LoopBackend, WrappedLoopProgram
+from deplodock.compiler.backend.loop.backend import LoopBackend
 
-__all__ = ["LoopBackend", "WrappedLoopProgram"]
+__all__ = ["LoopBackend"]

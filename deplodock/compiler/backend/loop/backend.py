@@ -14,14 +14,13 @@ and ``CudaBackend`` on the same ``LoopProgram`` implicates codegen.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.loop import Combine, LoopInput, LoopOp, Mux, Port
-from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
+from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
 
@@ -29,28 +28,24 @@ if TYPE_CHECKING:
     from deplodock.compiler.ir.graph import Graph
 
 
-@dataclass
-class WrappedLoopProgram:
-    """Compiled-loop artifact: wraps a post-fusion ``LoopProgram``."""
-
-    program: LoopProgram
-
-
 class LoopBackend(Backend):
-    """Execute a ``LoopProgram`` via numpy whole-tensor operations."""
+    """Execute a ``LoopProgram`` via numpy whole-tensor operations.
 
-    def compile(self, graph: Graph) -> WrappedLoopProgram:
-        return WrappedLoopProgram(compile_graph(graph))
+    The compiled artifact is just the ``LoopProgram`` itself — no wrapping.
+    """
 
-    def run(self, compiled: WrappedLoopProgram, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
+    def compile(self, graph: Graph) -> LoopProgram:
+        return compile_graph(graph)
+
+    def run(self, compiled: LoopProgram, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
         t0 = time.perf_counter()
-        arrays = _execute(compiled.program, input_data or {})
+        arrays = _execute(compiled, input_data or {})
         elapsed = (time.perf_counter() - t0) * 1000
         outputs = {n: np.asarray(v, dtype=np.float32).flatten().tolist() for n, v in arrays.items()}
         return ProgramResult(outputs=outputs, time_ms=elapsed)
 
-    def run_arrays(self, compiled: WrappedLoopProgram, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
-        return _execute(compiled.program, input_data or {})
+    def run_arrays(self, compiled: LoopProgram, *, input_data: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+        return _execute(compiled, input_data or {})
 
     # ``benchmark`` inherits the default wall-time loop from ``Backend``.
 
@@ -243,5 +238,4 @@ def _eval_mux(mux: Mux, out_shape: tuple[int, ...], *, bind_for_mux_branch) -> n
     return result
 
 
-# Re-export IndexMapOp for any consumers that need it.
-__all__ = ["LoopBackend", "WrappedLoopProgram", "IndexMapOp"]
+__all__ = ["LoopBackend"]
