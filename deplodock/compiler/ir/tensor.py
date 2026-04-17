@@ -286,6 +286,10 @@ class IndexMapOp(Op):
                     return int(lv) % int(r)
                 if expr.op == "<":
                     return lv < r
+                if expr.op == "<=":
+                    return lv <= r
+                if expr.op == ">":
+                    return lv > r
                 if expr.op == ">=":
                     return lv >= r
                 if expr.op == "==":

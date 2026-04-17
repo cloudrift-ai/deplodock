@@ -168,13 +168,13 @@ def test_mean_correctness():
 # ===================================================================
 
 
-def _make_sdpa_graph(seq_len=4, head_dim=8, num_heads=1):
+def _make_sdpa_graph(seq_len=4, head_dim=8, num_heads=1, is_causal=False):
     g = Graph()
     s = (num_heads, seq_len, head_dim)
     g.add_node(op=InputOp(), inputs=[], output=Tensor("Q", s), node_id="Q")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("K", s), node_id="K")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("V", s), node_id="V")
-    g.add_node(op=SdpaOp(), inputs=["Q", "K", "V"], output=Tensor("out", s), node_id="sdpa_out")
+    g.add_node(op=SdpaOp(is_causal=is_causal), inputs=["Q", "K", "V"], output=Tensor("out", s), node_id="sdpa_out")
     g.inputs, g.outputs = ["Q", "K", "V"], ["sdpa_out"]
     return g
 
@@ -248,6 +248,25 @@ def test_sdpa_correctness():
     q = rng.standard_normal((1, 4, 8)).astype(np.float32)
     k = rng.standard_normal((1, 4, 8)).astype(np.float32)
     v = rng.standard_normal((1, 4, 8)).astype(np.float32)
+    inputs = {"Q": q, "K": k, "V": v}
+    before = _run(g, inputs)
+    after = _run(_apply(g, _load("001_decompose_sdpa.py")), inputs)
+    _assert_close(before, after, rtol=1e-4, atol=1e-5)
+
+
+def test_sdpa_causal_decomposes():
+    """Causal SDPA decomposes into primitives including a causal mask IndexMapOp."""
+    g = _make_sdpa_graph(seq_len=4, head_dim=8, num_heads=1, is_causal=True)
+    result = _apply(g, _load("001_decompose_sdpa.py"))
+    assert not any(isinstance(n.op, SdpaOp) for n in result.nodes.values())
+
+
+def test_sdpa_causal_correctness():
+    """Causal SDPA decomposition matches the original causal SdpaOp numerically."""
+    g = _make_sdpa_graph(seq_len=8, head_dim=16, num_heads=2, is_causal=True)
+    q = rng.standard_normal((2, 8, 16)).astype(np.float32)
+    k = rng.standard_normal((2, 8, 16)).astype(np.float32)
+    v = rng.standard_normal((2, 8, 16)).astype(np.float32)
     inputs = {"Q": q, "K": k, "V": v}
     before = _run(g, inputs)
     after = _run(_apply(g, _load("001_decompose_sdpa.py")), inputs)
