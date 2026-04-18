@@ -385,7 +385,7 @@ def _fmt_op(node: Node, graph: Graph) -> str:
         red = f", reduce={op.reduce_fn}" if getattr(op, "reduce_fn", None) else ""
         return f"scatter({', '.join(arg_names)}, axis={op.axis}{red})"
     if cls == "IndexMapOp":
-        return _fmt_indexmap(op, arg_names)
+        return _fmt_indexmap(node, graph)
 
     # Generic fallback (frontend ops like MeanOp, LinearOp, SdpaOp, or LoopOp).
     fields = {k: v for k, v in op.__dict__.items() if not k.startswith("_") and k != "name"}
@@ -394,23 +394,30 @@ def _fmt_op(node: Node, graph: Graph) -> str:
     return f"{label}({', '.join(parts)})"
 
 
-def _fmt_indexmap(op, arg_names: list[str]) -> str:
+def _fmt_indexmap(node: Node, graph: Graph) -> str:
     """Render IndexMapOp concisely when its coord expression is simple.
 
     Single-source, no select, ≤6 output dims → ``src[coord_0, coord_1, ...]``
     with ``out_coord_N`` placeholders replaced by ``i``/``j``/``k``/``l``/``m``/``n``.
-    Everything else (multi-source, selected reads, many dims) falls back to
-    the opaque ``indexmap(src0, src1, ...)`` form.
+    A ``Literal(0)`` at a position where the input's corresponding dim has
+    extent 1 is rendered as ``na`` (numpy-style newaxis), making broadcasts
+    visually distinct from scalar slices. Everything else (multi-source,
+    selected reads, many dims) falls back to ``indexmap(src0, src1, ...)``.
     """
-    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Var, render
+    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, render
 
+    op = node.op
     sources = op.sources
     out_shape = op.out_shape
+    arg_names = [graph.nodes[inp].output.name for inp in node.inputs]
+
     if len(sources) != 1 or sources[0].select is not None or len(out_shape) > len(_DIM_NAMES):
         return f"indexmap({', '.join(arg_names)})"
 
     src = sources[0]
     input_name = arg_names[src.input_idx] if src.input_idx < len(arg_names) else f"${src.input_idx}"
+    input_id = node.inputs[src.input_idx] if src.input_idx < len(node.inputs) else None
+    input_shape = graph.nodes[input_id].output.shape if input_id and input_id in graph.nodes else ()
 
     def rename(e):
         if isinstance(e, Var) and e.name.startswith(PLACEHOLDER_PREFIX):
@@ -422,5 +429,11 @@ def _fmt_indexmap(op, arg_names: list[str]) -> str:
                 pass
         return None
 
-    coord_strs = [render(e, rename) for e in src.coord_map]
+    coord_strs: list[str] = []
+    for dim, e in enumerate(src.coord_map):
+        # Literal(0) at an extent-1 input dim is a broadcast — render as `na`.
+        if isinstance(e, Literal) and e.value == 0 and dim < len(input_shape) and input_shape[dim] == 1:
+            coord_strs.append("na")
+        else:
+            coord_strs.append(render(e, rename))
     return f"{input_name}[{', '.join(coord_strs)}]"
