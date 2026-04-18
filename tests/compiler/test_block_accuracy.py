@@ -136,7 +136,6 @@ def test_tinyllama_block_accuracy(backend_kind, seq_len):
 
 @requires_cuda
 def test_qwen_block_accuracy():
-    """Qwen 7B block on CUDA: deplodock output matches PyTorch eager within tolerance.
-    """
+    """Qwen 7B block on CUDA: deplodock output matches PyTorch eager within tolerance."""
     deplodock, eager = _compile_and_run_block("Qwen/Qwen2.5-7B", seq_len=32, backend_kind="cuda")
     _assert_accuracy(deplodock, eager)

@@ -46,7 +46,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     body: tuple[Stmt, ...] = inner
     for a in reversed(axes):
         body = (Loop(axis=a, body=body),)
-    kernel = LoopOp(axes=axes, inputs=(idx_port, data_port), body=body)
+    kernel = LoopOp(inputs=(idx_port, data_port), body=body)
 
     frag = Graph()
     for buf_id in (idx_id, data_id):

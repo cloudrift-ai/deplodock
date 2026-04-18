@@ -58,7 +58,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     nested: tuple[Stmt, ...] = tuple(body)
     for a in reversed(axes):
         nested = (Loop(axis=a, body=nested),)
-    kernel = LoopOp(axes=axes, inputs=tuple(ports), body=nested)
+    kernel = LoopOp(inputs=tuple(ports), body=nested)
 
     frag = Graph()
     for inp_id in input_names:

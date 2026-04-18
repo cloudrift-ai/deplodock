@@ -64,7 +64,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     body: tuple[Stmt, ...] = inner
     for a in reversed(free_axes):
         body = (Loop(axis=a, body=body),)
-    kernel = LoopOp(axes=axes, inputs=(input_port,), locals=(acc,), body=body)
+    kernel = LoopOp(inputs=(input_port,), locals=(acc,), body=body)
 
     frag = Graph()
     frag.add_node(InputOp(), [], Tensor(src_id, src_shape, src_node.output.dtype), node_id=src_id)

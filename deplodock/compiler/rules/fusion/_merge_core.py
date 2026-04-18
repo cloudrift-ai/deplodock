@@ -82,7 +82,7 @@ def merge_loop_ops(
             return None
 
     # Flatten nested Loop blocks — merge operates on the linear stmt sequence.
-    # The output body gets re-nested via _normalize_flat_to_nested before return.
+    # The output body gets re-nested via flat_body_to_nested before return.
     from deplodock.compiler.ir.loop import flatten_body
 
     producer_flat = tuple(flatten_body(producer.body))
@@ -176,9 +176,7 @@ def merge_loop_ops(
     pre_reduce_sigma = dict(bound_common)
     pre_reduce_sigma.update(unbound_binding)
 
-    merged_axes = tuple(consumer.axes) + tuple(
-        Axis(name=axis_rename[a.name], extent=a.extent, kind=a.kind) for a in unbound_axes
-    )
+    merged_axes = tuple(consumer.axes) + tuple(Axis(name=axis_rename[a.name], extent=a.extent, kind=a.kind) for a in unbound_axes)
     merged_locals = _merge_locals(consumer.locals, producer.locals, local_rename, pre_reduce_sigma)
 
     # Build merged ports: consumer ports (minus consumer_ports) first, then
@@ -242,9 +240,7 @@ def merge_loop_ops(
 
         bridge = _fresh_name(f"v_bridge_cp{cp}", taken_names)
         taken_names.add(bridge)
-        bridge_value = _rename_ssa_arg(
-            write.value, producer_port_remap_per_cp[cp], local_rename, ssa_rename_k
-        )
+        bridge_value = _rename_ssa_arg(write.value, producer_port_remap_per_cp[cp], local_rename, ssa_rename_k)
         post_rewritten = _rewrite_body(
             post_reduce_stmts,
             sigma=s,
@@ -282,22 +278,18 @@ def merge_loop_ops(
         elif isinstance(stmt, Write):
             body.append(Write(output=stmt.output, index=stmt.index, value=rewrite_arg(stmt.value)))
         elif isinstance(stmt, Select):
-            new_branches = tuple(
-                SelectBranch(value=rewrite_arg(br.value), select=br.select) for br in stmt.branches
-            )
+            new_branches = tuple(SelectBranch(value=rewrite_arg(br.value), select=br.select) for br in stmt.branches)
             body.append(Select(name=stmt.name, branches=new_branches))
 
-    # Re-nest the flat merged body into the nested Loop-block form so the
-    # output matches the rest of the Phase-3 pipeline.
-    from deplodock.compiler.ir.loop import _normalize_flat_to_nested
+    # Re-nest the flat merged body into the nested Loop-block form.
+    from deplodock.compiler.ir.loop import flat_body_to_nested
 
-    flat_merged = LoopOp(
-        axes=merged_axes,
+    nested = flat_body_to_nested(tuple(merged_axes), tuple(body))
+    return LoopOp(
         inputs=tuple(merged_ports),
         locals=tuple(merged_locals),
-        body=tuple(body),
+        body=nested,
     )
-    return _normalize_flat_to_nested(flat_merged)
 
 
 # ---------------------------------------------------------------------------

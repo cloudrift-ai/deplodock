@@ -146,9 +146,7 @@ def _detect_reduce_axis_aliases(
     consumer_port_set = set(consumer_ports)
     aliases: dict[str, str] = {}
     for a_p in unbound_reduce:
-        found = _find_alias_for(
-            a_p, producer_op, producer_node, consumer_op, consumer_node, consumer_port_set, consumer_reduce_by_name
-        )
+        found = _find_alias_for(a_p, producer_op, producer_node, consumer_op, consumer_node, consumer_port_set, consumer_reduce_by_name)
         if found is not None:
             aliases[a_p.name] = found
 

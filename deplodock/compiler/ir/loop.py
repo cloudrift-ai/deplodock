@@ -3,33 +3,26 @@
 After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
-    axes  : tuple[Axis, ...]            — iteration space (free + reduce)
     inputs: tuple[Port, ...]            — per-input access patterns
     locals: tuple[LocalBuffer, ...]     — thread-local state (accumulators,
                                           scratch); v1: scalar + scope=thread
     body  : tuple[Stmt, ...]            — SSA: Assign | Update | Write | Select | Loop
+    axes  : computed property           — iteration space walked from body's Loop tree
 
-Iteration structure can be expressed two ways during the ongoing refactor:
-
-1. **Flat body** (legacy, in-transition): body is a linear sequence of
-   Assign/Update/Write/Select. The positionally-last ``Update`` marks the
-   end of the reduce sweep by convention: statements before run per
-   reduce-iteration, statements after run once per free-axis point.
-2. **Nested body** (target): iteration is explicit via ``Loop(axis, body)``
-   statements. Each ``Loop`` is one iteration dimension; ``Loop.body`` runs
-   ``axis.extent`` times. Reduce-kind Loops fold ``Update`` statements into
-   outer ``LocalBuffer`` accumulators. Free-kind Loops run in parallel with
-   no accumulator folding. Reading top-to-bottom matches execution order.
-
-Consumers should call ``_normalize_flat_to_nested`` at entry to upgrade
-legacy flat bodies to the nested form transparently during the migration.
+Iteration is explicit via ``Loop(axis, body)`` statements. Each ``Loop``
+is one iteration dimension; ``Loop.body`` runs ``axis.extent`` times.
+Reduce-kind Loops fold ``Update`` statements into outer ``LocalBuffer``
+accumulators. Free-kind Loops run in parallel with no accumulator
+folding. Reading top-to-bottom matches execution order.
 
 Reductions are modeled as explicit accumulator state: each reduction
 contributes a ``LocalBuffer`` (with a ``combine`` op and ``init`` value)
 plus one or more ``Update`` statements that fold values in.
 
-SSA invariants (unique names, defined-before-use, accumulator pairing)
-are enforced at construction time by ``LoopOp.__post_init__``.
+SSA names defined by ``Assign``/``Select`` inside a ``Loop.body`` are
+scoped to that body — only ``LocalBuffer`` accumulators cross Loop
+boundaries. Invariants (unique names, defined-before-use, accumulator
+pairing, axis-shadow detection) are enforced by ``LoopOp.__post_init__``.
 """
 
 from __future__ import annotations
@@ -218,15 +211,40 @@ Stmt = Assign | Update | Write | Select | Loop
 
 @dataclass
 class LoopOp(Op):
-    """One kernel's worth of computation as an SSA program over named axes."""
+    """One kernel's worth of computation as an SSA program over named axes.
 
-    axes: tuple[Axis, ...] = ()
+    ``axes`` is a computed property over the body's ``Loop`` tree — the tree
+    is the single source of truth. See the :attr:`axes` docstring for the
+    collection order.
+    """
+
     inputs: tuple[Port, ...] = ()
     locals: tuple[LocalBuffer, ...] = ()
     body: tuple[Stmt, ...] = ()
 
     def __post_init__(self) -> None:
         _validate(self)
+
+    @property
+    def axes(self) -> tuple[Axis, ...]:
+        """Iteration axes collected from the body's ``Loop`` tree.
+
+        Pre-order traversal: outer ``Loop`` blocks (the kernel's grid) come
+        first, nested inner Loops follow. Sibling Loops with the same axis
+        name (softmax's two K-sweeps) contribute one entry — axes are
+        deduplicated by name, keeping the first occurrence.
+        """
+        seen: dict[str, Axis] = {}
+
+        def walk(stmts: tuple[Stmt, ...]) -> None:
+            for s in stmts:
+                if isinstance(s, Loop):
+                    if s.axis.name not in seen:
+                        seen[s.axis.name] = s.axis
+                    walk(s.body)
+
+        walk(self.body)
+        return tuple(seen.values())
 
     def free_axes(self) -> tuple[Axis, ...]:
         return tuple(a for a in self.axes if a.kind == "free")
@@ -496,88 +514,66 @@ def flatten_body(body: tuple[Stmt, ...]) -> list[Stmt]:
     return out
 
 
-def has_flat_reduce(loop: LoopOp) -> bool:
-    """True if ``loop`` carries reduce axes on its ``axes`` tuple but has no
-    ``Loop`` block in its body — i.e. the legacy flat representation.
-    """
-    if any(a.kind == "reduce" for a in loop.axes):
-        return not any(isinstance(s, Loop) for s in loop.body)
-    # Any Updates at the top level of body (no wrapping Loop) also count as flat.
-    if any(isinstance(s, Update) for s in loop.body):
-        return not any(isinstance(s, Loop) for s in loop.body)
-    return False
-
-
 # ---------------------------------------------------------------------------
-# Flat → nested normalization shim
+# Flat → nested normalization shim (used by merge and legacy test fixtures)
 # ---------------------------------------------------------------------------
 
 
-def _normalize_flat_to_nested(loop: LoopOp) -> LoopOp:
-    """Upgrade a legacy flat-body ``LoopOp`` to the nested ``Loop``-block form.
+def flat_body_to_nested(axes: tuple[Axis, ...], body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Wrap a flat SSA body into the nested ``Loop``-block form.
 
-    Idempotent: if the body already contains any ``Loop``, returns ``loop``
+    Pure body transform — takes the flat body + axes hint, returns a new
+    body tuple. Used by the merge rule to re-nest its flat intermediate
+    output; also used by test helpers that still build flat bodies by
+    hand and want the nested form the IR now requires.
+
+    Idempotent: if the body already contains any ``Loop``, returns it
     unchanged.
 
-    The nested form is:
+    Layout:
 
     - Outer free-axis ``Loop``s wrap everything, innermost = last free axis.
-    - At the innermost free level, body contains:
-      - One ``Loop(reduce_axis, body=segment)`` per segment produced by
-        splitting the flat body at ``Update`` boundaries.
-      - Post-reduce ``Assign`` / ``Select`` / ``Write`` statements
-        (everything after the last ``Update``) sit after the reduce Loops.
-    - Non-reduce flat bodies are wrapped only in free Loops; no reduce Loops.
-
-    ``loop.axes`` is preserved as-is for back-compat (all axes still listed
-    on the stored field). Phase 4 will drop reduce axes from the stored
-    tuple once producers emit nested directly.
+    - Inside the innermost free level, one ``Loop(reduce_axis, body=segment)``
+      per segment produced by splitting the flat body at ``Update`` boundaries.
+    - Post-reduce ``Assign`` / ``Select`` / ``Write`` statements (everything
+      after the last ``Update``) sit after the reduce Loops.
+    - Non-reduce flat bodies are wrapped only in free Loops.
     """
-    if not any(isinstance(s, (Loop, Update)) for s in loop.body):
-        # No Loops and no Updates — purely a flat pointwise body; nothing to
-        # segment. Wrap in free Loops for the nested form.
-        return _wrap_in_free_loops(loop, body=tuple(loop.body))
+    if any(isinstance(s, Loop) for s in body):
+        return tuple(body)
 
-    if any(isinstance(s, Loop) for s in loop.body):
-        return loop
+    free_axes = [a for a in axes if a.kind == "free"]
+    has_update = any(isinstance(s, Update) for s in body)
 
-    # Flat body with at least one Update: split at Updates into segments.
-    reduce_axes = [a for a in loop.axes if a.kind == "reduce"]
-    if not reduce_axes:
-        # No reduce axis but body contains Update — malformed. Leave as-is;
-        # the validator will complain.
-        return loop
+    if not has_update:
+        # Pure pointwise: wrap in free Loops only.
+        wrapped: tuple[Stmt, ...] = tuple(body)
+        for a in reversed(free_axes):
+            wrapped = (Loop(axis=a, body=wrapped),)
+        return wrapped
+
+    # Reduce body: split at Updates into segments.
+    reduce_axes = [a for a in axes if a.kind == "reduce"]
     if len(reduce_axes) != 1:
-        # Multiple reduce axes on the flat form — not a softmax-like case the
-        # shim supports. Leave unchanged; the validator will flag it.
-        return loop
+        # Malformed or multi-reduce flat — leave unchanged; caller/validator flags.
+        return tuple(body)
     reduce_axis = reduce_axes[0]
 
-    # Split the flat body at Update boundaries.
     segments: list[list[Stmt]] = []
     current: list[Stmt] = []
-    for stmt in loop.body:
+    for stmt in body:
         current.append(stmt)
         if isinstance(stmt, Update):
             segments.append(current)
             current = []
     tail = current  # post-last-Update stmts
 
-    # Each Update-terminated segment → one reduce Loop over the same axis.
-    nested_body: list[Stmt] = []
+    nested: list[Stmt] = []
     for seg in segments:
-        nested_body.append(Loop(axis=reduce_axis, body=tuple(seg)))
-    nested_body.extend(tail)
+        nested.append(Loop(axis=reduce_axis, body=tuple(seg)))
+    nested.extend(tail)
 
-    return _wrap_in_free_loops(loop, body=tuple(nested_body))
-
-
-def _wrap_in_free_loops(loop: LoopOp, body: tuple[Stmt, ...]) -> LoopOp:
-    """Wrap ``body`` in nested ``Loop(free_axis, ...)`` blocks, outermost
-    first. Returns a new ``LoopOp`` with the wrapped body.
-    """
-    free_axes = [a for a in loop.axes if a.kind == "free"]
-    wrapped: tuple[Stmt, ...] = body
+    wrapped = tuple(nested)
     for a in reversed(free_axes):
         wrapped = (Loop(axis=a, body=wrapped),)
-    return LoopOp(axes=loop.axes, inputs=loop.inputs, locals=loop.locals, body=wrapped)
+    return wrapped

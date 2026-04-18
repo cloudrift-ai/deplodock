@@ -9,9 +9,21 @@ multi-reduce, free-axis leakage).
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinOp, Literal, Var
-from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, LoopOp, Port, Update, Write
+from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, LoopOp, Port, Update, Write, flat_body_to_nested
 from deplodock.compiler.ir.tensor import ElementwiseOp
 from deplodock.compiler.rules.fusion._merge_core import _bind_axis, _solve_sigma, merge_loop_ops
+
+
+def _loop(*, axes=(), inputs=(), locals=(), body=()):
+    """Build a LoopOp from a flat body + axes hint.
+
+    Test-local shim: LoopOp.axes is now a property over the body's Loop tree,
+    so the constructor no longer accepts axes=. Fixtures that still think in
+    terms of (axes, flat_body) use this helper to get the nested body form
+    the IR requires.
+    """
+    return LoopOp(inputs=inputs, locals=locals, body=flat_body_to_nested(axes, body))
+
 
 # ---------------------------------------------------------------------------
 # Solver
@@ -82,7 +94,7 @@ def test_bind_axis_ignores_non_producer_var():
 
 
 def _simple_elementwise(fn: str, axis_name: str = "a0", extent: int = 8) -> LoopOp:
-    return LoopOp(
+    return _loop(
         axes=(Axis(name=axis_name, extent=extent, kind="free"),),
         inputs=(Port(index=(Var(axis_name),)),),
         locals=(),
@@ -131,7 +143,7 @@ def test_merge_elementwise_ssa_rename_on_collision():
 def test_merge_with_offset_read():
     """Consumer reads producer at `a0 + 5` — σ folds the offset into producer ports."""
     producer = _simple_elementwise("neg", axis_name="a0", extent=16)
-    consumer = LoopOp(
+    consumer = _loop(
         axes=(Axis(name="c0", extent=3, kind="free"),),
         inputs=(Port(index=(BinOp("+", Var("c0"), Literal(5, "int")),)),),
         locals=(),
@@ -162,7 +174,7 @@ def test_merge_with_offset_read():
 
 def _reduce_sum_over_axis1(outer: int = 4, inner: int = 8) -> LoopOp:
     """Kernel: out[i] = sum_j (a[i, j] * b[i, j]). One input port (external buf)."""
-    return LoopOp(
+    return _loop(
         axes=(
             Axis(name="i", extent=outer, kind="free"),
             Axis(name="j", extent=inner, kind="reduce"),
@@ -180,7 +192,7 @@ def _reduce_sum_over_axis1(outer: int = 4, inner: int = 8) -> LoopOp:
 def test_merge_reduce_then_elementwise():
     """Producer reduces over j; consumer adds a scalar bias per row."""
     producer = _reduce_sum_over_axis1()
-    consumer = LoopOp(
+    consumer = _loop(
         axes=(Axis(name="i", extent=4, kind="free"),),
         inputs=(
             Port(index=(Var("i"),)),  # from producer
@@ -220,7 +232,7 @@ def test_merge_alias_unifies_reduce_axes():
     """Two reductions over the same data axis collapse to one reduce axis when
     the caller passes an alias, turning a would-be 2-reduce merge into 1."""
     # Producer reduces x along a1 (extent 8).
-    producer = LoopOp(
+    producer = _loop(
         axes=(Axis(name="a0", extent=4, kind="free"), Axis(name="a1", extent=8, kind="reduce")),
         inputs=(Port(index=(Var("a0"), Var("a1"))),),
         locals=(LocalBuffer(name="acc_p", combine=ElementwiseOp("max"), init=Literal(-1e30)),),
@@ -231,7 +243,7 @@ def test_merge_alias_unifies_reduce_axes():
     )
     # Consumer also reduces x along b1 (extent 8), reads producer's output at [b0],
     # adds them.
-    consumer = LoopOp(
+    consumer = _loop(
         axes=(Axis(name="b0", extent=4, kind="free"), Axis(name="b1", extent=8, kind="reduce")),
         inputs=(
             Port(index=(Var("b0"),)),  # from producer
@@ -259,7 +271,7 @@ def test_merge_alias_unifies_reduce_axes():
 
 def test_merge_alias_ignores_already_bound():
     """axis_aliases entries are no-ops for axes already bound by σ."""
-    producer = LoopOp(
+    producer = _loop(
         axes=(Axis(name="a0", extent=8, kind="free"),),
         inputs=(Port(index=(Var("a0"),)),),
         body=(
@@ -267,7 +279,7 @@ def test_merge_alias_ignores_already_bound():
             Write(output=0, index=(Var("a0"),), value="v"),
         ),
     )
-    consumer = LoopOp(
+    consumer = _loop(
         axes=(Axis(name="b0", extent=8, kind="free"),),
         inputs=(Port(index=(Var("b0"),)),),
         body=(
@@ -283,7 +295,7 @@ def test_merge_alias_ignores_already_bound():
 def test_merge_rejects_multi_reduce():
     """Two reduce axes in the merged kernel — single-reduce backend can't handle."""
     producer = _reduce_sum_over_axis1(outer=4, inner=8)
-    consumer = LoopOp(
+    consumer = _loop(
         axes=(Axis(name="k", extent=4, kind="reduce"),),
         inputs=(Port(index=(Var("k"),)),),
         locals=(LocalBuffer(name="out_acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -300,7 +312,7 @@ def test_merge_rejects_free_axis_leak():
     """Producer's writer leaves a free axis unbound in σ — unsafe to replicate."""
     # Producer writes at index (Var("a0"), Literal(0)); the a1 axis is free but doesn't
     # appear in the writer, so a consumer reading at (Var("c0"), Var("c1")) can't bind a1.
-    producer = LoopOp(
+    producer = _loop(
         axes=(
             Axis(name="a0", extent=4, kind="free"),
             Axis(name="a1", extent=8, kind="free"),
@@ -313,7 +325,7 @@ def test_merge_rejects_free_axis_leak():
             Write(output=0, index=(Var("a0"),), value="v"),
         ),
     )
-    consumer = LoopOp(
+    consumer = _loop(
         axes=(Axis(name="c0", extent=4, kind="free"),),
         inputs=(Port(index=(Var("c0"),)),),
         locals=(),
@@ -329,7 +341,7 @@ def test_merge_rejects_free_axis_leak():
 
 def test_merge_rejects_non_affine_writer():
     """Writer `a * 2` — solver refuses."""
-    producer = LoopOp(
+    producer = _loop(
         axes=(Axis(name="a", extent=4, kind="free"),),
         inputs=(Port(index=(Var("a"),)),),
         locals=(),
