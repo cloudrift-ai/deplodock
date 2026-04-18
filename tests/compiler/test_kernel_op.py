@@ -13,8 +13,22 @@ from deplodock.compiler.ir.loop import (
     SelectBranch,
     Update,
     Write,
+    flat_body_to_nested,
+    flatten_body,
 )
 from deplodock.compiler.ir.tensor import ElementwiseOp
+
+
+def _loop(*, axes=(), inputs=(), locals=(), body=()):
+    """Build a LoopOp from a flat body + axes hint.
+
+    Test-local shim: LoopOp.axes is now a property over the body's Loop tree,
+    so the constructor no longer accepts axes=. Fixtures that still think in
+    terms of (axes, flat_body) use this helper to get the nested body form
+    the IR requires.
+    """
+    return LoopOp(inputs=inputs, locals=locals, body=flat_body_to_nested(axes, body))
+
 
 # ---------------------------------------------------------------------------
 # Axis / Port
@@ -71,7 +85,7 @@ def _pointwise_axes(n: int) -> tuple[Axis, ...]:
 def test_kernel_pointwise():
     axes = (Axis("a0", 4, "free"),)
     p = Port(index=(Var("a0"),))
-    k = LoopOp(
+    k = _loop(
         axes=axes,
         inputs=(p, p),
         body=(
@@ -79,13 +93,13 @@ def test_kernel_pointwise():
             Write(output=0, index=(Var("a0"),), value="z"),
         ),
     )
-    assert len(k.body) == 2
+    assert len(flatten_body(k.body)) == 2
 
 
 def test_kernel_reduce():
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
-    k = LoopOp(
+    k = _loop(
         axes=axes,
         inputs=(p,),
         locals=(LocalBuffer(name="s", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -100,7 +114,7 @@ def test_kernel_reduce():
 def test_kernel_matmul():
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
-    k = LoopOp(
+    k = _loop(
         axes=axes,
         inputs=(p, p),
         locals=(LocalBuffer(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -110,14 +124,14 @@ def test_kernel_matmul():
             Write(output=0, index=(Var("a0"),), value="dot"),
         ),
     )
-    assert len(k.body) == 3
+    assert len(flatten_body(k.body)) == 3
 
 
 def test_kernel_matmul_bias():
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p_mk = Port(index=(Var("a0"), Var("a1")))
     p_bias = Port(index=(Var("a0"),))
-    k = LoopOp(
+    k = _loop(
         axes=axes,
         inputs=(p_mk, p_mk, p_bias),
         locals=(LocalBuffer(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -128,13 +142,16 @@ def test_kernel_matmul_bias():
             Write(output=0, index=(Var("a0"),), value="out"),
         ),
     )
-    assert len(k.body) == 4
+    assert len(flatten_body(k.body)) == 4
 
 
-def test_kernel_softmax():
+def test_kernel_softmax_two_accumulators():
+    # Under nested SSA scoping, per-segment SSA names (sub, ex) are scoped to
+    # their own reduce Loop — the old flat fixture relied on laxness. Here we
+    # just verify a kernel with two accumulators + two Updates builds fine.
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
-    k = LoopOp(
+    k = _loop(
         axes=axes,
         inputs=(p,),
         locals=(
@@ -143,11 +160,8 @@ def test_kernel_softmax():
         ),
         body=(
             Update(target="mx", value="$0"),
-            Assign("sub", ElementwiseOp("sub"), args=("$0", "mx")),
-            Assign("ex", ElementwiseOp("exp"), args=("sub",)),
-            Update(target="sm", value="ex"),
-            Assign("div", ElementwiseOp("div"), args=("ex", "sm")),
-            Write(output=0, index=(Var("a0"), Var("a1")), value="div"),
+            Update(target="sm", value="$0"),
+            Write(output=0, index=(Var("a0"),), value="mx"),
         ),
     )
     assert any(lb.name == "mx" for lb in k.locals)
@@ -157,7 +171,7 @@ def test_kernel_softmax():
 def test_kernel_unary_chain():
     axes = (Axis("a0", 4, "free"),)
     p = Port(index=(Var("a0"),))
-    k = LoopOp(
+    k = _loop(
         axes=axes,
         inputs=(p,),
         body=(
@@ -166,14 +180,14 @@ def test_kernel_unary_chain():
             Write(output=0, index=(Var("a0"),), value="exp"),
         ),
     )
-    assert len(k.body) == 3
+    assert len(flatten_body(k.body)) == 3
 
 
 def test_kernel_scatter_output_via_select():
     """Select replaces Mux for coord-predicated dispatch on output."""
     axes = (Axis("a0", 4, "free"),)
     p = Port(index=(Var("a0"),))
-    k = LoopOp(
+    k = _loop(
         axes=axes,
         inputs=(p, p),
         body=(
@@ -188,7 +202,7 @@ def test_kernel_scatter_output_via_select():
             Write(output=0, index=(Var("a0"),), value="v"),
         ),
     )
-    assert isinstance(k.body[1], Select)
+    assert isinstance(flatten_body(k.body)[1], Select)
 
 
 # ---------------------------------------------------------------------------
@@ -197,15 +211,16 @@ def test_kernel_scatter_output_via_select():
 
 
 def test_rejects_duplicate_axis_name():
-    with pytest.raises(ValueError, match="duplicate axis"):
-        LoopOp(axes=(Axis("a0", 4, "free"), Axis("a0", 8, "free")))
+    # Two same-named nested Loops form a shadow; the validator rejects.
+    with pytest.raises(ValueError, match="shadows"):
+        _loop(axes=(Axis("a0", 4, "free"), Axis("a0", 8, "free")))
 
 
 def test_ssa_rejects_undefined_arg():
     axes = _pointwise_axes(1)
     p = Port(index=(Var("a0"),))
     with pytest.raises(ValueError, match="not defined"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             body=(Assign("y", ElementwiseOp("exp"), args=("z",)),),
@@ -216,7 +231,7 @@ def test_ssa_rejects_duplicate_name():
     axes = _pointwise_axes(1)
     p = Port(index=(Var("a0"),))
     with pytest.raises(ValueError, match="already defined"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             body=(
@@ -230,7 +245,7 @@ def test_ssa_rejects_forward_reference():
     axes = _pointwise_axes(1)
     p = Port(index=(Var("a0"),))
     with pytest.raises(ValueError, match="not defined"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             body=(
@@ -243,7 +258,7 @@ def test_ssa_rejects_forward_reference():
 def test_ssa_allows_input_name_reuse_in_multiple_args():
     axes = _pointwise_axes(1)
     p = Port(index=(Var("a0"),))
-    k = LoopOp(
+    k = _loop(
         axes=axes,
         inputs=(p,),
         body=(
@@ -252,14 +267,14 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
             Assign("c", ElementwiseOp("add"), args=("a", "b")),
         ),
     )
-    assert len(k.body) == 3
+    assert len(flatten_body(k.body)) == 3
 
 
 def test_rejects_update_without_matching_local():
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
     with pytest.raises(ValueError, match="does not name a LocalBuffer"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             body=(Update(target="acc", value="$0"),),
@@ -270,7 +285,7 @@ def test_rejects_accumulator_without_reduce_axis():
     axes = (Axis("a0", 4, "free"),)
     p = Port(index=(Var("a0"),))
     with pytest.raises(ValueError, match="no reduce axis"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -279,13 +294,20 @@ def test_rejects_accumulator_without_reduce_axis():
 
 
 def test_rejects_reduce_axis_without_accumulator():
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    from deplodock.compiler.ir.loop import Loop
+
+    a0 = Axis("a0", 4, "free")
+    a1 = Axis("a1", 8, "reduce")
     p = Port(index=(Var("a0"), Var("a1")))
     with pytest.raises(ValueError, match="no accumulator"):
         LoopOp(
-            axes=axes,
             inputs=(p,),
-            body=(Assign("a", ElementwiseOp("exp"), args=("$0",)),),
+            body=(
+                Loop(
+                    axis=a0,
+                    body=(Loop(axis=a1, body=(Assign("a", ElementwiseOp("exp"), args=("$0",)),)),),
+                ),
+            ),
         )
 
 
@@ -293,7 +315,7 @@ def test_rejects_shaped_localbuffer_in_v1():
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
     with pytest.raises(ValueError, match="shape=\\(\\)"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0), shape=(4,)),),
@@ -305,7 +327,7 @@ def test_rejects_nonthread_scope_in_v1():
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
     with pytest.raises(ValueError, match="scope='thread'"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0), scope="block"),),
@@ -317,7 +339,7 @@ def test_rejects_nondense_output_indices():
     axes = (Axis("a0", 4, "free"),)
     p = Port(index=(Var("a0"),))
     with pytest.raises(ValueError, match="dense"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             body=(
@@ -331,7 +353,7 @@ def test_rejects_unused_accumulator():
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
     with pytest.raises(ValueError, match="never Updated"):
-        LoopOp(
+        _loop(
             axes=axes,
             inputs=(p,),
             locals=(
@@ -351,7 +373,7 @@ def test_loop_stmt_basic():
     from deplodock.compiler.ir.loop import Loop
 
     # Pointwise kernel with body wrapped in a free Loop.
-    loop = LoopOp(
+    loop = _loop(
         axes=(Axis("a0", 8, "free"),),
         inputs=(Port(index=(Var("a0"),)),),
         body=(
@@ -372,7 +394,7 @@ def test_loop_stmt_reduce_kernel():
     from deplodock.compiler.ir.loop import Loop
 
     # Reduce kernel — free a0 outer, reduce k inner.
-    loop = LoopOp(
+    loop = _loop(
         axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
         locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -391,6 +413,7 @@ def test_loop_stmt_reduce_kernel():
     )
     # Validator accepts the nested form.
     from deplodock.compiler.ir.loop import iter_loops
+
     loops = iter_loops(loop.body)
     assert len(loops) == 2
     assert loops[0].axis.name == "a0"
@@ -402,7 +425,7 @@ def test_loop_stmt_softmax_sibling_reduces():
 
     # Softmax shape: two sibling reduce Loops over the same axis "k", inside
     # a single outer free iteration. Sibling same-name is legal.
-    loop = LoopOp(
+    loop = _loop(
         axes=(Axis("a0", 4, "free"), Axis("a1", 8, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("a1"))), Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
         locals=(
@@ -427,6 +450,7 @@ def test_loop_stmt_softmax_sibling_reduces():
         ),
     )
     from deplodock.compiler.ir.loop import iter_loops
+
     reduce_loops = [L for L in iter_loops(loop.body) if L.axis.kind == "reduce"]
     assert len(reduce_loops) == 2
     assert all(L.axis.name == "k" for L in reduce_loops)
@@ -437,7 +461,7 @@ def test_loop_axis_nested_shadow_rejected():
     from deplodock.compiler.ir.loop import Loop
 
     with pytest.raises(ValueError, match="shadows"):
-        LoopOp(
+        _loop(
             axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
             inputs=(Port(index=(Var("a0"), Var("k"))),),
             locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -461,7 +485,7 @@ def test_loop_axis_sibling_same_name_allowed():
     from deplodock.compiler.ir.loop import Loop
 
     # Two reduce Loops over the same axis, sibling (not nested).
-    LoopOp(
+    _loop(
         axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
         locals=(
@@ -483,7 +507,7 @@ def test_loop_ssa_scoping():
 
     # A Loop body defines "v"; a sibling statement tries to reference it.
     with pytest.raises(ValueError, match="not defined"):
-        LoopOp(
+        _loop(
             axes=(Axis("a0", 4, "free"),),
             inputs=(Port(index=(Var("a0"),)),),
             body=(
@@ -502,130 +526,76 @@ def test_loop_ssa_scoping():
 # ---------------------------------------------------------------------------
 
 
-def test_shim_pointwise_wraps_in_free_loops():
-    from deplodock.compiler.ir.loop import Loop, _normalize_flat_to_nested
+def test_flat_body_to_nested_pointwise():
+    from deplodock.compiler.ir.loop import Loop
 
-    flat = LoopOp(
-        axes=(Axis("a0", 8, "free"),),
-        inputs=(Port(index=(Var("a0"),)),),
-        body=(
-            Assign("v", ElementwiseOp("neg"), args=("$0",)),
-            Write(output=0, index=(Var("a0"),), value="v"),
-        ),
+    axes = (Axis("a0", 8, "free"),)
+    flat = (
+        Assign("v", ElementwiseOp("neg"), args=("$0",)),
+        Write(output=0, index=(Var("a0"),), value="v"),
     )
-    nested = _normalize_flat_to_nested(flat)
-    assert len(nested.body) == 1
-    assert isinstance(nested.body[0], Loop)
-    assert nested.body[0].axis.name == "a0"
-    # Inside the Loop: the original Assign + Write.
-    inner = nested.body[0].body
+    nested = flat_body_to_nested(axes, flat)
+    assert len(nested) == 1
+    assert isinstance(nested[0], Loop) and nested[0].axis.name == "a0"
+    inner = nested[0].body
     assert len(inner) == 2
     assert isinstance(inner[0], Assign)
     assert isinstance(inner[1], Write)
 
 
-def test_shim_reduce_splits_at_updates():
-    from deplodock.compiler.ir.loop import Loop, _normalize_flat_to_nested
+def test_flat_body_to_nested_reduce_splits_at_update():
+    from deplodock.compiler.ir.loop import Loop
 
-    flat = LoopOp(
-        axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
-        inputs=(Port(index=(Var("a0"), Var("k"))),),
-        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
-        body=(
-            Update(target="acc", value="$0"),
-            Write(output=0, index=(Var("a0"),), value="acc"),
-        ),
+    axes = (Axis("a0", 4, "free"), Axis("k", 8, "reduce"))
+    flat = (
+        Update(target="acc", value="$0"),
+        Write(output=0, index=(Var("a0"),), value="acc"),
     )
-    nested = _normalize_flat_to_nested(flat)
-    # Outer: Loop(a0, body=...).
-    assert len(nested.body) == 1 and isinstance(nested.body[0], Loop) and nested.body[0].axis.name == "a0"
-    inner = nested.body[0].body
-    # Inside a0: Loop(k, [Update]) then Write.
+    nested = flat_body_to_nested(axes, flat)
+    assert len(nested) == 1 and isinstance(nested[0], Loop) and nested[0].axis.name == "a0"
+    inner = nested[0].body
     assert len(inner) == 2
     assert isinstance(inner[0], Loop) and inner[0].axis.name == "k"
     assert isinstance(inner[0].body[0], Update)
     assert isinstance(inner[1], Write)
 
 
-def test_shim_idempotent_on_nested():
-    from deplodock.compiler.ir.loop import Loop, _normalize_flat_to_nested
+def test_flat_body_to_nested_idempotent():
+    from deplodock.compiler.ir.loop import Loop
 
-    nested = LoopOp(
-        axes=(Axis("a0", 8, "free"),),
-        inputs=(Port(index=(Var("a0"),)),),
-        body=(
-            Loop(
-                axis=Axis("a0", 8, "free"),
-                body=(
-                    Assign("v", ElementwiseOp("neg"), args=("$0",)),
-                    Write(output=0, index=(Var("a0"),), value="v"),
-                ),
+    already_nested = (
+        Loop(
+            axis=Axis("a0", 8, "free"),
+            body=(
+                Assign("v", ElementwiseOp("neg"), args=("$0",)),
+                Write(output=0, index=(Var("a0"),), value="v"),
             ),
         ),
     )
-    result = _normalize_flat_to_nested(nested)
-    # Idempotent: same object (or at least structurally identical).
-    assert result.body == nested.body
+    assert flat_body_to_nested((Axis("a0", 8, "free"),), already_nested) == already_nested
 
 
-def test_shim_softmax_like_two_updates():
-    """Flat softmax body with two Updates splits into two reduce Loops."""
-    from deplodock.compiler.ir.loop import Loop, _normalize_flat_to_nested
+def test_flat_body_to_nested_softmax_two_updates():
+    from deplodock.compiler.ir.loop import Loop
 
-    flat = LoopOp(
-        axes=(Axis("a0", 4, "free"), Axis("a1", 8, "free"), Axis("k", 8, "reduce")),
-        inputs=(
-            Port(index=(Var("a0"), Var("a1"))),
-            Port(index=(Var("a0"), Var("k"))),
-        ),
-        locals=(
-            LocalBuffer(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-            LocalBuffer(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
-        ),
-        body=(
-            Update(target="mx", value="$1"),
-            Assign("v_mx", ElementwiseOp("neg"), args=("mx",)),
-            Update(target="sm", value="v_mx"),
-            Write(output=0, index=(Var("a0"), Var("a1")), value="sm"),
-        ),
+    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "free"), Axis("k", 8, "reduce"))
+    flat = (
+        Update(target="mx", value="$1"),
+        Assign("v_mx", ElementwiseOp("neg"), args=("mx",)),
+        Update(target="sm", value="v_mx"),
+        Write(output=0, index=(Var("a0"), Var("a1")), value="sm"),
     )
-    nested = _normalize_flat_to_nested(flat)
+    nested = flat_body_to_nested(axes, flat)
     # Structure: Loop(a0, [Loop(a1, [Loop(k, [Update mx]), Loop(k, [Assign, Update sm]), Write])])
-    assert len(nested.body) == 1 and nested.body[0].axis.name == "a0"
-    inner_a1 = nested.body[0].body[0]
+    assert len(nested) == 1 and nested[0].axis.name == "a0"
+    inner_a1 = nested[0].body[0]
     assert isinstance(inner_a1, Loop) and inner_a1.axis.name == "a1"
     inner_stmts = inner_a1.body
-    # Two reduce Loops (one per Update segment) + 1 post-reduce Write.
     reduce_loops = [s for s in inner_stmts if isinstance(s, Loop)]
     assert len(reduce_loops) == 2
     assert all(L.axis.name == "k" for L in reduce_loops)
     writes = [s for s in inner_stmts if isinstance(s, Write)]
     assert len(writes) == 1
-
-
-def test_has_flat_reduce_helper():
-    from deplodock.compiler.ir.loop import has_flat_reduce
-
-    flat_reduce = LoopOp(
-        axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
-        inputs=(Port(index=(Var("a0"), Var("k"))),),
-        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
-        body=(
-            Update(target="acc", value="$0"),
-            Write(output=0, index=(Var("a0"),), value="acc"),
-        ),
-    )
-    assert has_flat_reduce(flat_reduce)
-
-    flat_pointwise = LoopOp(
-        axes=(Axis("a0", 4, "free"),),
-        inputs=(Port(index=(Var("a0"),)),),
-        body=(
-            Assign("v", ElementwiseOp("neg"), args=("$0",)),
-            Write(output=0, index=(Var("a0"),), value="v"),
-        ),
-    )
-    assert not has_flat_reduce(flat_pointwise)
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +605,7 @@ def test_has_flat_reduce_helper():
 
 def _flat_reduce_kernel() -> LoopOp:
     """Flat-body reduce kernel for parity comparison."""
-    return LoopOp(
+    return _loop(
         axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
         locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -651,14 +621,13 @@ def _nested_reduce_kernel() -> LoopOp:
     from deplodock.compiler.ir.loop import Loop
 
     return LoopOp(
-        axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
         locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Loop(
-                axis=Axis("a0_outer", 4, "free"),
+                axis=Axis("a0", 4, "free"),
                 body=(
-                    Loop(axis=Axis("k_inner", 8, "reduce"), body=(Update(target="acc", value="$0"),)),
+                    Loop(axis=Axis("k", 8, "reduce"), body=(Update(target="acc", value="$0"),)),
                     Write(output=0, index=(Var("a0"),), value="acc"),
                 ),
             ),

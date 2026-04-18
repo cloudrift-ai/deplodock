@@ -56,24 +56,44 @@ def _matmul_graph() -> Graph:
 def _softmax_launch() -> LoopLaunch:
     """Build a LoopLaunch with the softmax SSA pattern directly."""
     from deplodock.compiler.ir.expr import Literal, Var
-    from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, LoopOp, Port, Update, Write
+    from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, Loop, LoopOp, Port, Update, Write
 
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    a0 = Axis("a0", 4, "free")
+    a1 = Axis("a1", 8, "reduce")
     p = Port(index=(Var("a0"), Var("a1")))
     loop = LoopOp(
-        axes=axes,
         inputs=(p, p),
         locals=(
             LocalBuffer(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
             LocalBuffer(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
         body=(
-            Update(target="mx", value="$0"),
-            Assign(name="sub", op=ElementwiseOp("sub"), args=("$0", "mx")),
-            Assign(name="ex", op=ElementwiseOp("exp"), args=("sub",)),
-            Update(target="sm", value="ex"),
-            Assign(name="out", op=ElementwiseOp("div"), args=("ex", "sm")),
-            Write(output=0, index=(Var("a0"), Var("a1")), value="out"),
+            Loop(
+                axis=a0,
+                body=(
+                    # Max sweep (K-loop 1).
+                    Loop(axis=a1, body=(Update(target="mx", value="$0"),)),
+                    # Sum sweep (K-loop 2) — rematerializes exp inside.
+                    Loop(
+                        axis=a1,
+                        body=(
+                            Assign(name="sub_s", op=ElementwiseOp("sub"), args=("$0", "mx")),
+                            Assign(name="ex_s", op=ElementwiseOp("exp"), args=("sub_s",)),
+                            Update(target="sm", value="ex_s"),
+                        ),
+                    ),
+                    # Write sweep (K-loop 3): per-element div.
+                    Loop(
+                        axis=a1,
+                        body=(
+                            Assign(name="sub_w", op=ElementwiseOp("sub"), args=("$1", "mx")),
+                            Assign(name="ex_w", op=ElementwiseOp("exp"), args=("sub_w",)),
+                            Assign(name="out", op=ElementwiseOp("div"), args=("ex_w", "sm")),
+                            Write(output=0, index=(Var("a0"), Var("a1")), value="out"),
+                        ),
+                    ),
+                ),
+            ),
         ),
     )
     return LoopLaunch(loop=loop, input_names=["x", "x"], output_name="y")
