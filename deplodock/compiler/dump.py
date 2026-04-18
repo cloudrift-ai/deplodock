@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult, ProgramResult
+    from deplodock.compiler.ir.gpu import GpuKernel
     from deplodock.compiler.ir.graph import Graph
     from deplodock.compiler.plan import ExecutionPlan
     from deplodock.compiler.program.gpu import GpuProgram
@@ -110,6 +111,22 @@ class CompilerDump:
             ],
         }
         self._write_json("30_execution_plan.json", summary)
+
+    def dump_kernel_ir(self, kernels: list[GpuKernel]) -> None:
+        """Pretty-printed KernelIR AST for each kernel (pre-source-emission).
+
+        This is the article's "Kernel IR" stage — the C-like AST with named axes
+        still visible (``for j in [threadIdx.x, cols), step=blockDim.x``) before
+        the tree-walk codegen renders it to CUDA source.
+        """
+        from deplodock.compiler.ir.gpu import pretty_print
+
+        blocks: list[str] = []
+        for i, kernel in enumerate(kernels):
+            blocks.append(f"=== launch {i}: {kernel.name} ===")
+            blocks.append(pretty_print(kernel))
+            blocks.append("")
+        self._write_text("39_kernel_ir.txt", "\n".join(blocks))
 
     def dump_program(self, program: GpuProgram) -> None:
         from deplodock.compiler.backend.cuda.program import generate_source

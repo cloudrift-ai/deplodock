@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.backend.cuda.program import CudaLaunch
 from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var, substitute
@@ -33,6 +34,9 @@ from deplodock.compiler.ir.loop import Axis, LoopOp, Port, Select, Update
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
 
+if TYPE_CHECKING:
+    from deplodock.compiler.dump import CompilerDump
+
 logger = logging.getLogger(__name__)
 
 _BLOCK = 256
@@ -43,7 +47,7 @@ _BLOCK = 256
 # ---------------------------------------------------------------------------
 
 
-def compile_kernels(program: LoopProgram) -> GpuProgram:
+def compile_kernels(program: LoopProgram, dump: CompilerDump | None = None) -> GpuProgram:
     """Lower a ``LoopProgram`` to a ``GpuProgram``."""
     referenced: set[str] = set()
     for launch in program.launches:
@@ -55,6 +59,7 @@ def compile_kernels(program: LoopProgram) -> GpuProgram:
     buffers = [GpuBuffer(name=b.name, shape=tuple(b.shape), dtype="float", role=b.role) for b in program.buffers if b.name in referenced]
 
     launches: list[CudaLaunch] = []
+    gpu_kernels: list[GpuKernel] = []
     for i, launch in enumerate(program.launches):
         if not isinstance(launch.loop, LoopOp):
             raise TypeError(
@@ -78,6 +83,10 @@ def compile_kernels(program: LoopProgram) -> GpuProgram:
                 comment=program.pretty_print_launch(i),
             )
         )
+        gpu_kernels.append(gpu_kernel)
+
+    if dump is not None:
+        dump.dump_kernel_ir(gpu_kernels)
 
     return GpuProgram(
         name=program.name,
