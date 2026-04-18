@@ -124,13 +124,45 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
     buf_name_set = {b.name for b in program.buffers}
 
     # Collect Select predicates gating each port (by SSA name ``$N``).
-    from deplodock.compiler.ir.loop import flatten_body
+    # Tracks *transitive* gating: if an SSA name is computed from a port and
+    # then used as a Select branch value, the port inherits that branch's
+    # predicate. Needed for the rotary rotate_half pattern, where the port is
+    # wrapped in an Assign (``v1 = neg($5)``) before reaching the Select.
+    from deplodock.compiler.ir.loop import Assign, flatten_body
+
+    flat = list(flatten_body(loop.body))
+
+    # ssa_port_deps[name] = set of ``$N`` refs that name reads (transitively).
+    ssa_port_deps: dict[str, set[str]] = {}
+
+    def _port_deps_of_arg(arg: str) -> set[str]:
+        if arg.startswith("$"):
+            return {arg}
+        return ssa_port_deps.get(arg, set())
+
+    for stmt in flat:
+        if isinstance(stmt, Assign):
+            deps: set[str] = set()
+            for arg in stmt.args:
+                deps |= _port_deps_of_arg(arg)
+            ssa_port_deps[stmt.name] = deps
+        elif isinstance(stmt, Select):
+            deps = set()
+            for br in stmt.branches:
+                deps |= _port_deps_of_arg(br.value)
+            ssa_port_deps[stmt.name] = deps
 
     select_preds: dict[str, list[Expr]] = {}
-    for stmt in flatten_body(loop.body):
+    for stmt in flat:
         if isinstance(stmt, Select):
             for branch in stmt.branches:
-                select_preds.setdefault(branch.value, []).append(branch.select)
+                # Skip always-true fallback predicates — they add no constraint.
+                if isinstance(branch.select, Literal) and branch.select.value:
+                    continue
+                # Apply this branch's predicate to every port the branch's value
+                # depends on (direct ``$N`` or transitively via SSA).
+                for port_ref in _port_deps_of_arg(branch.value):
+                    select_preds.setdefault(port_ref, []).append(branch.select)
 
     for pi, port in enumerate(loop.inputs):
         buf_name = launch.input_names[pi] if pi < len(launch.input_names) else None

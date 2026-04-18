@@ -123,6 +123,18 @@ def generate_source(
                 parts.append(f"      fread(h, sizeof({buf.dtype}), {buf.size}, fp); fclose(fp);")
                 parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
                 parts.append("      free(h); }")
+            elif buf.role == "constant" and buf.name in program.constant_values:
+                # Pre-baked scalar constant (eps, softmax scale, mask fill, etc.).
+                # Fill every element with the trace-time value — critical for
+                # numerical correctness of RMSNorm eps, SDPA scale, and the
+                # softmax -∞ mask fill. Without this, bench binaries that skip
+                # input_data were overwriting these with pseudorandom values
+                # and producing NaN outputs.
+                value = program.constant_values[buf.name]
+                parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
+                parts.append(f"      for (int i = 0; i < {buf.size}; i++) h[i] = ({buf.dtype}){value!r}f;")
+                parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
+                parts.append("      free(h); }")
             else:
                 # Pseudorandom fallback.
                 parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")

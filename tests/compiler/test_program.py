@@ -68,6 +68,46 @@ def test_generate_benchmark_source():
     assert "cudaEventCreate" in src
 
 
+def test_generate_source_bakes_scalar_constants():
+    """Pre-baked scalar constants (RMSNorm eps, softmax scale, mask fill, …)
+    must be written into the generated .cu as literals — NOT overwritten by the
+    pseudorandom fallback. Otherwise benchmark binaries that skip input_data
+    (like the subprocess-based bench path) get garbage eps and produce NaN.
+    """
+    prog = GpuProgram(
+        name="bake_test",
+        buffers=[
+            GpuBuffer("A", (8,), role="input"),
+            GpuBuffer("eps", (1,), role="constant"),
+            GpuBuffer("scale", (1,), role="constant"),
+            GpuBuffer("mask_fill", (1,), role="constant"),
+            GpuBuffer("C", (8,), role="output"),
+        ],
+        launches=[
+            GpuLaunch(
+                kernel_source=EW_ADD_SOURCE,
+                kernel_name="ew_add",
+                grid=(1, 1, 1),
+                block=(256, 1, 1),
+                args=["A", "eps", "C", "8"],
+            ),
+        ],
+        constant_values={"eps": 1e-5, "scale": 0.125, "mask_fill": -1e9},
+    )
+    src = generate_source(prog, mode="benchmark")
+
+    # Each baked constant's value appears in an initializer line.
+    assert "1e-05" in src, "RMSNorm-style eps should be baked as 1e-05"
+    assert "0.125" in src, "softmax-style scale should be baked as 0.125"
+    assert "-1000000000.0" in src or "-1e+09" in src, "mask_fill should be baked as -1e9"
+
+    # And the pseudorandom fallback ("0.01f * ((i * 7") should not appear for
+    # the baked scalars — only for unbaked inputs like A.
+    baked_init_count = src.count("0.01f * ((i * 7")
+    # Only one non-baked input remains (A).
+    assert baked_init_count == 1, f"expected 1 pseudorandom init for A, got {baked_init_count}"
+
+
 def test_buffers_allocated_by_role():
     prog = _make_add_program()
     src = generate_source(prog, mode="run")
