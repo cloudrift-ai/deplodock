@@ -14,15 +14,19 @@ The resulting ``LoopProgram`` is the single input to backend codegen
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.graph import Graph
 from deplodock.compiler.program.loop import LoopProgram
 from deplodock.compiler.rewriter import Rewriter
 
+if TYPE_CHECKING:
+    from deplodock.compiler.dump import CompilerDump
+
 _RULES_DIR = Path(__file__).parent / "rules"
 
 
-def compile_graph(graph: Graph, name: str = "prog") -> LoopProgram:
+def compile_graph(graph: Graph, name: str = "prog", dump: CompilerDump | None = None) -> LoopProgram:
     """Lower a traced ``Graph`` to a ``LoopProgram``.
 
     The returned program is authoritative for buffer shapes and launch
@@ -31,6 +35,9 @@ def compile_graph(graph: Graph, name: str = "prog") -> LoopProgram:
     """
     rewriter_pre = Rewriter.from_directory(_RULES_DIR, pass_order=["decomposition", "optimization"])
     graph = rewriter_pre.apply(graph)
+
+    if dump is not None:
+        dump.dump_tensor_ir(graph)
 
     rewriter_fusion = Rewriter.from_directory(_RULES_DIR, pass_order=["fusion"])
     graph = rewriter_fusion.apply(graph)

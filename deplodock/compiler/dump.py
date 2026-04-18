@@ -69,6 +69,15 @@ class CompilerDump:
     def dump_input_graph(self, graph: Graph) -> None:
         self._write_json("00_input_graph.json", graph.to_dict())
 
+    def dump_tensor_ir(self, graph: Graph) -> None:
+        """Graph after decomposition + optimization passes, before fusion.
+
+        This is the article's "Tensor IR" — only primitive ops (add/mul/sub/div/rsqrt/exp,
+        sum/max reductions, reshape/transpose/slice, gather). High-level ops like
+        rms_norm, linear, sdpa have been lowered to this canonical op set.
+        """
+        self._write_json("10_tensor_ir.json", graph.to_dict())
+
     def dump_pass(self, index: int, pt: PassTrace) -> None:
         prefix = f"{index + 1:02d}_pass_{pt.name}"
         data = pt.to_dict()

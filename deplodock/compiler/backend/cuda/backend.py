@@ -18,6 +18,7 @@ from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.gpu import GpuProgram
 
 if TYPE_CHECKING:
+    from deplodock.compiler.dump import CompilerDump
     from deplodock.compiler.ir.graph import Graph
 
 
@@ -31,17 +32,21 @@ class CudaBackend(Backend):
     ``run()`` uses the per-launch debug path that dumps every non-input
     buffer after each kernel launch. ``last_debug_result`` is then
     populated with the per-launch snapshots for the last ``run()`` call.
+
+    When ``dump`` is provided, intermediate compilation artifacts are
+    written to the dump directory during ``compile()``.
     """
 
-    def __init__(self, *, debug: bool | None = None) -> None:
+    def __init__(self, *, debug: bool | None = None, dump: CompilerDump | None = None) -> None:
         if debug is None:
             debug = os.environ.get(_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes")
         self.debug = debug
+        self.dump = dump
         self.last_debug_result = None  # set by run() when debug=True
 
     def compile(self, graph: Graph) -> GpuProgram:
         """Lower ``Graph`` → ``LoopProgram`` → ``GpuProgram``."""
-        return compile_kernels(compile_graph(graph))
+        return compile_kernels(compile_graph(graph, dump=self.dump))
 
     def run(self, compiled: GpuProgram, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
         """Execute the compiled program; returns outputs as ndarrays with declared shapes."""

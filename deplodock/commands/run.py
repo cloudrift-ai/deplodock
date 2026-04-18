@@ -36,7 +36,7 @@ def _handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    backend = CudaBackend(debug=args.debug or None)
+    backend = CudaBackend(debug=args.debug or None, dump=dump)
     compiled = backend.compile(graph)
 
     if dump:

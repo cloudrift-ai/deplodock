@@ -42,7 +42,7 @@ def handle_compile(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    program = compile_graph(graph)
+    program = compile_graph(graph, dump=dump)
 
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, len(program.launches))
 
