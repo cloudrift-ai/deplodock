@@ -278,6 +278,50 @@ class Graph:
         g.outputs = list(data["outputs"])
         return g
 
+    def pretty_print(self) -> str:
+        """Render the graph as readable text (topological order + sections)."""
+        from deplodock.compiler.ir.base import ConstantOp, InputOp
+
+        order = self.topological_order()
+        lines: list[str] = [
+            f"# Graph: {len(self.nodes)} nodes, {len(self.inputs)} inputs, {len(self.outputs)} outputs",
+            "",
+        ]
+
+        if self.inputs:
+            lines.append("inputs:")
+            for nid in self.inputs:
+                lines.append(f"  {_fmt_tensor(self.nodes[nid].output)}")
+            lines.append("")
+
+        const_ids = [nid for nid in order if isinstance(self.nodes[nid].op, ConstantOp)]
+        if const_ids:
+            lines.append("constants:")
+            for nid in const_ids:
+                n = self.nodes[nid]
+                val = getattr(n.op, "value", None)
+                suffix = f" = {val}" if val is not None else ""
+                lines.append(f"  {_fmt_tensor(n.output)}{suffix}")
+            lines.append("")
+
+        compute_ids = [nid for nid in order if not isinstance(self.nodes[nid].op, (InputOp, ConstantOp))]
+        if compute_ids:
+            name_w = max(len(self.nodes[nid].output.name) for nid in compute_ids)
+            op_w = max(len(_fmt_op(self.nodes[nid], self)) for nid in compute_ids)
+            for nid in compute_ids:
+                n = self.nodes[nid]
+                op_str = _fmt_op(n, self)
+                shape_str = _fmt_shape(n.output.shape)
+                lines.append(f"{n.output.name:<{name_w}}  =  {op_str:<{op_w}}  -> {shape_str} {n.output.dtype}")
+            lines.append("")
+
+        if self.outputs:
+            lines.append("outputs:")
+            for nid in self.outputs:
+                lines.append(f"  {_fmt_tensor(self.nodes[nid].output)}")
+
+        return "\n".join(lines)
+
     def to_dict(self) -> dict:
         """Serialize graph to a JSON-compatible dict."""
         result: dict = {
@@ -302,3 +346,46 @@ class Graph:
                 entry["hints"] = node.hints.to_dict()
             result["nodes"][nid] = entry
         return result
+
+
+# ---------------------------------------------------------------------------
+# Pretty-print helpers (used by Graph.pretty_print)
+# ---------------------------------------------------------------------------
+
+
+def _fmt_shape(shape: tuple) -> str:
+    inside = ", ".join(str(d) for d in shape)
+    if len(shape) == 1:
+        inside += ","
+    return f"({inside})"
+
+
+def _fmt_tensor(t: Tensor) -> str:
+    return f"{t.name}: {_fmt_shape(t.shape)} {t.dtype}"
+
+
+def _fmt_op(node: Node, graph: Graph) -> str:
+    """Render `node` as a function-call-like string using input tensor names."""
+    op = node.op
+    cls = type(op).__name__
+    arg_names = [graph.nodes[inp].output.name for inp in node.inputs]
+
+    if cls == "ElementwiseOp":
+        return f"{op.fn}({', '.join(arg_names)})"
+    if cls == "ReduceOp":
+        return f"{op.fn}({', '.join(arg_names)}, axis={op.axis})"
+    if cls == "ScanOp":
+        return f"scan_{op.fn}({', '.join(arg_names)}, axis={op.axis})"
+    if cls == "GatherOp":
+        return f"gather({', '.join(arg_names)}, axis={op.axis})"
+    if cls == "ScatterOp":
+        red = f", reduce={op.reduce_fn}" if getattr(op, "reduce_fn", None) else ""
+        return f"scatter({', '.join(arg_names)}, axis={op.axis}{red})"
+    if cls == "IndexMapOp":
+        return f"indexmap({', '.join(arg_names)})"
+
+    # Generic fallback (frontend ops like MeanOp, LinearOp, SdpaOp, or LoopOp).
+    fields = {k: v for k, v in op.__dict__.items() if not k.startswith("_") and k != "name"}
+    label = cls.removesuffix("Op").lower() or cls
+    parts = list(arg_names) + [f"{k}={v}" for k, v in fields.items()]
+    return f"{label}({', '.join(parts)})"

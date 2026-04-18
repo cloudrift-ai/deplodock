@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _IR_STAGE_FILES = {
-    "tensor": "10_tensor_ir.json",
+    "tensor": "10_tensor_ir.txt",
     "loop": "38_loop_program.txt",
     "kernel": "39_kernel_ir.txt",
     "cuda": "40_kernels.cu",
