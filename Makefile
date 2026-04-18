@@ -30,7 +30,7 @@ format: setup
 	./venv/bin/ruff check --fix
 
 test: setup
-	./venv/bin/pytest tests/ -v
+	./venv/bin/pytest tests/ -v -n auto
 
 bench: setup
 	@echo "Running benchmarks..."
