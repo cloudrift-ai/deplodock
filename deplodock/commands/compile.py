@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_IR_STAGE_FILES = {
+    "tensor": "10_tensor_ir.json",
+    "loop": "38_loop_program.txt",
+    "kernel": "39_kernel_ir.txt",
+    "cuda": "40_kernels.cu",
+}
+
 
 def register_compile_command(subparsers):
     parser = subparsers.add_parser("compile", help="Compile a model or IR through structural lowering")
@@ -20,23 +28,26 @@ def register_compile_command(subparsers):
     parser.add_argument("--layer", type=int, default=0, help="Layer index (when input is a model ID)")
     parser.add_argument("--output", "-o", help="Output path for compiled IR")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
+    parser.add_argument(
+        "--ir",
+        choices=list(_IR_STAGE_FILES),
+        default=None,
+        help="Print the requested IR stage to stdout (or --output) and exit. Skips the normal .compiled.json save.",
+    )
     parser.set_defaults(func=handle_compile)
 
 
 def handle_compile(args):
+    if args.ir is not None:
+        _handle_compile_inspect(args)
+        return
+
     from deplodock.compiler.dump import CompilerDump
     from deplodock.compiler.pipeline import compile_graph
 
     dump = CompilerDump.resolve(args.dump_dir)
 
-    input_path = Path(args.input)
-    if input_path.suffix == ".json" and input_path.exists():
-        graph = _load_graph(input_path)
-        base_name = input_path.stem
-    else:
-        graph = _trace_model(args.input, args.layer)
-        safe_name = args.input.replace("/", "-").lower()
-        base_name = f"{safe_name}-layer{args.layer}"
+    graph, base_name = _load_or_trace(args)
 
     initial_count = len(graph.nodes)
     if dump:
@@ -52,6 +63,48 @@ def handle_compile(args):
     with open(output_path, "w") as f:
         json.dump(graph.to_dict(), f, indent=2)
     logger.info("Saved: %s", output_path)
+
+
+def _handle_compile_inspect(args):
+    """Run the pipeline to produce --ir STAGE artifact, then print it."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.dump import CompilerDump
+    from deplodock.compiler.pipeline import compile_graph
+
+    graph, _ = _load_or_trace(args)
+    stage = args.ir
+    stage_file = _IR_STAGE_FILES[stage]
+
+    with tempfile.TemporaryDirectory(prefix="deplodock-inspect-") as tmp:
+        dump_dir = Path(args.dump_dir) if args.dump_dir else Path(tmp)
+        dump = CompilerDump(dir=dump_dir)
+        dump.dump_input_graph(graph)
+
+        if stage in ("tensor", "loop"):
+            compile_graph(graph, dump=dump)
+        else:
+            CudaBackend(dump=dump).compile(graph)
+
+        content = (dump.dir / stage_file).read_text()
+
+    if args.output:
+        Path(args.output).write_text(content)
+    else:
+        sys.stdout.write(content)
+        if not content.endswith("\n"):
+            sys.stdout.write("\n")
+
+
+def _load_or_trace(args) -> tuple[Graph, str]:
+    input_path = Path(args.input)
+    if input_path.suffix == ".json" and input_path.exists():
+        graph = _load_graph(input_path)
+        base_name = input_path.stem
+    else:
+        graph = _trace_model(args.input, args.layer)
+        safe_name = args.input.replace("/", "-").lower()
+        base_name = f"{safe_name}-layer{args.layer}"
+    return graph, base_name
 
 
 def _load_graph(path: Path) -> Graph:

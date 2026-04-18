@@ -42,4 +42,7 @@ def compile_graph(graph: Graph, name: str = "prog", dump: CompilerDump | None = 
     rewriter_fusion = Rewriter.from_directory(_RULES_DIR, pass_order=["fusion"])
     graph = rewriter_fusion.apply(graph)
 
-    return LoopProgram.from_graph(graph, name=name)
+    program = LoopProgram.from_graph(graph, name=name)
+    if dump is not None:
+        dump.dump_loop_program(program)
+    return program

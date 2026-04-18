@@ -39,9 +39,6 @@ def _handle_run(args):
     backend = CudaBackend(debug=args.debug or None, dump=dump)
     compiled = backend.compile(graph)
 
-    if dump:
-        dump.dump_program(compiled)
-
     logger.info("Compiled %s: %d kernels", ir_path.name, len(compiled.launches))
 
     if args.benchmark:
