@@ -102,10 +102,7 @@ def _handle_trace_code(args):
         sys.exit(2)
 
     if not tree.body or not isinstance(tree.body[-1], ast.Expr) or not isinstance(tree.body[-1].value, ast.Call):
-        logger.error(
-            '--code must end with a call expression, e.g. "m(x)" or '
-            '"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"'
-        )
+        logger.error('--code must end with a call expression, e.g. "m(x)" or "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"')
         sys.exit(2)
 
     call = tree.body[-1].value
