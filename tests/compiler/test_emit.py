@@ -243,3 +243,92 @@ def test_matmul_runs_on_gpu():
             s = sum(a_data[mi * 8 + k] * b_data[k * 4 + ni] for k in range(8))
             expected.append(s)
     assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected)
+
+
+# ---- check_port_bounds: rotate_half / transitive Select gating ----
+
+
+def _rotate_half_launch() -> LoopLaunch:
+    """Build a LoopLaunch mimicking rotary's rotate_half pattern:
+
+      for a0 in 0..64:
+          v0 = neg($1)             # $1 at [a0 + 32] — OOB when a0 >= 32 without the Select
+          v1 = Select(
+                branch(v0,  a0 < 32),   # use negated lower-upper shift when a0 < 32
+                branch($2,  Literal(1)),  # else use $2 (shifted down)
+              )
+          out[a0] = v1
+
+    The port $1 reads position ``a0 + 32`` which is in-bounds ONLY when a0 < 32
+    (then positions 32..63). Without the Select's predicate the static checker
+    sees max_index=95, out-of-bounds on a 64-element buffer. With the transitive
+    tracing (neg → Select branch gated by ``a0 < 32``), the checker sees the
+    constraint and the warning is silenced.
+    """
+    from deplodock.compiler.ir.expr import BinOp, Literal, Var
+    from deplodock.compiler.ir.loop import Assign, Axis, Loop, LoopOp, Port, Select, SelectBranch, Write
+    from deplodock.compiler.ir.tensor import ElementwiseOp
+
+    axis_a0 = Axis(name="a0", extent=64, kind="free")
+    body = (
+        Assign(name="v0", op=ElementwiseOp("neg"), args=("$1",)),
+        Select(
+            name="v1",
+            branches=(
+                SelectBranch(value="v0", select=BinOp("<", Var("a0"), Literal(32, "int"))),
+                SelectBranch(value="$2", select=Literal(1, "int")),
+            ),
+        ),
+        Write(output=0, index=(Var("a0"),), value="v1"),
+    )
+    loop = LoopOp(
+        inputs=(
+            Port(index=(Var("a0"),)),  # $0 — dummy
+            Port(index=(BinOp("+", Var("a0"), Literal(32, "int")),)),  # $1 — the OOB-looking one
+            Port(index=(BinOp("-", Var("a0"), Literal(32, "int")),)),  # $2 — the other half
+        ),
+        body=(Loop(axis=axis_a0, body=body),),
+    )
+    return LoopLaunch(loop=loop, input_names=["x", "x", "x"], output_name="out")
+
+
+def test_check_port_bounds_recognizes_transitive_select_gating():
+    """The rotate_half pattern wraps ``$N`` in an Assign before the Select.
+    The static OOB checker must trace through the SSA chain to see that the
+    port is effectively gated by the Select's predicate.
+    """
+    from deplodock.compiler.backend.cuda.emit import check_port_bounds
+
+    launch = _rotate_half_launch()
+    program = LoopProgram(
+        name="prog",
+        buffers=[LoopBuffer(name="x", shape=(64,), role="input"), LoopBuffer(name="out", shape=(64,), role="output")],
+        launches=[launch],
+    )
+    warnings = check_port_bounds(launch, program, launch_idx=0)
+    assert warnings == [], f"expected no OOB warnings, got: {warnings}"
+
+
+def test_check_port_bounds_still_warns_without_gating_select():
+    """Sanity: remove the Select and the same OOB read should warn.
+    Proves the silence in the previous test comes from the transitive Select
+    analysis, not from loose bounds letting everything through.
+    """
+    from deplodock.compiler.backend.cuda.emit import check_port_bounds
+    from deplodock.compiler.ir.expr import BinOp, Literal, Var
+    from deplodock.compiler.ir.loop import Axis, Loop, LoopOp, Port, Write
+
+    axis_a0 = Axis(name="a0", extent=64, kind="free")
+    body = (Write(output=0, index=(Var("a0"),), value="$0"),)
+    loop = LoopOp(
+        inputs=(Port(index=(BinOp("+", Var("a0"), Literal(32, "int")),)),),
+        body=(Loop(axis=axis_a0, body=body),),
+    )
+    launch = LoopLaunch(loop=loop, input_names=["x"], output_name="out")
+    program = LoopProgram(
+        name="prog",
+        buffers=[LoopBuffer(name="x", shape=(64,), role="input"), LoopBuffer(name="out", shape=(64,), role="output")],
+        launches=[launch],
+    )
+    warnings = check_port_bounds(launch, program, launch_idx=0)
+    assert len(warnings) == 1 and "out of bounds" in warnings[0]
