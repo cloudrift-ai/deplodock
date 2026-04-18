@@ -167,9 +167,9 @@ names defined inside a Loop body are scoped to that body — only
 Walks a ``LoopOp``'s nested ``Loop`` tree and produces an explicit
 nested-loop view as a ``KernelPlan``: ordered ``Loop`` / ``Inline``
 steps with accumulators, rematerialization sets, and trailing writes.
-Consumed by the CUDA emitter (``backend/cuda/emit.py``) and by the
-human-readable pretty printer (``pretty_print_plan``) so dump output
-and codegen stay in sync.
+Consumed by the CUDA emitter (``backend/cuda/emit.py``). The human
+dump view uses ``ir.loop.pretty_print`` directly since the IR is
+already nested.
 
 | Symbol              | Role                                                                                                |
 |---------------------|-----------------------------------------------------------------------------------------------------|
@@ -179,7 +179,6 @@ and codegen stay in sync.
 | ``TrailingWrite``   | Write emitted once per thread after all reduce sweeps (for non-elementwise outputs).                |
 | ``KernelPlan``      | Tuple of ``Step`` + per-element port set + output thread count + trailing writes.                   |
 | ``analyze_kernel``  | Entry point: walks the body's ``Loop`` tree; each reduce ``Loop`` block → one ``Loop`` step.        |
-| ``pretty_print_plan`` | Render a ``LoopOp`` + ``KernelPlan`` as an explicit ``for a0 in ...`` nested-loop program.        |
 
 **Rule:** Imports ``expr``, ``loop``. No dependency on ``program`` or
 any backend — this analysis is pure structural IR.
