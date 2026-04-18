@@ -165,7 +165,7 @@ printer (``pretty_print_plan``) so dump output and codegen stay in sync.
 | Symbol              | Role                                                                                                |
 |---------------------|-----------------------------------------------------------------------------------------------------|
 | ``Accum``           | Reduction accumulator: ``var`` (e.g. ``acc0``), ``fn``, ``identity``, SSA ``src``, ``result`` name. |
-| ``Loop``            | K-loop step: ``recompute`` + ``body`` + optional ``accum`` + optional ``stores_output``.            |
+| ``Loop``            | K-loop step: ``recompute`` + ``body`` (``Assign`` / ``Select``) + optional ``accum`` / ``stores_output``. |
 | ``Inline``          | Straight-line block of ``Assign`` / ``Select`` statements (no loop).                                |
 | ``TrailingWrite``   | Write emitted once per thread after all reduce sweeps (for non-elementwise outputs).                |
 | ``KernelPlan``      | Tuple of ``Step`` + per-element port set + output thread count + trailing writes.                   |

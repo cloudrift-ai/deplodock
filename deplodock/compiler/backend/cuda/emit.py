@@ -461,12 +461,15 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
                 inner.append(VarDecl(dtype="float", name=tname, init=value))
                 loop_values[assign.name] = Var(tname)
 
-            for assign in step.body:
-                arg_exprs = [loop_values[a] for a in assign.args]
-                value = _apply_elementwise(assign.op.fn, arg_exprs)
+            for stmt in step.body:
+                if isinstance(stmt, Select):
+                    value = _emit_select(stmt, loop_values, axis_env)
+                else:
+                    arg_exprs = [loop_values[a] for a in stmt.args]
+                    value = _apply_elementwise(stmt.op.fn, arg_exprs)
                 tname = _fresh(name_seq)
                 inner.append(VarDecl(dtype="float", name=tname, init=value))
-                loop_values[assign.name] = Var(tname)
+                loop_values[stmt.name] = Var(tname)
 
             if step.accum:
                 src = loop_values[step.accum.src]
