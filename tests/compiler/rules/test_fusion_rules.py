@@ -67,6 +67,13 @@ def _assign_fns(body) -> list[str]:
     return [s.op.fn for s in flatten_body(body) if isinstance(s, Assign)]
 
 
+def _count_copies(body) -> int:
+    """Count identity ``Assign(op=copy)`` statements in a LoopOp body."""
+    from deplodock.compiler.ir.loop import flatten_body
+
+    return sum(1 for s in flatten_body(body) if isinstance(s, Assign) and s.op.fn == "copy")
+
+
 def _has_update(body) -> bool:
     from deplodock.compiler.ir.loop import flatten_body
 
@@ -123,6 +130,44 @@ def test_pointwise_chain_has_write():
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
     assert any(isinstance(s, Write) for s in flatten_body(kernel.op.body))
+
+
+def test_pointwise_chain_no_residual_copies():
+    """After fusion + copy-elimination, no identity ``copy`` Assigns remain."""
+    result = _fuse(_make_pointwise_chain())
+    kernel = _kernel_nodes(result)[0]
+    assert _count_copies(kernel.op.body) == 0
+
+
+# ===================================================================
+# Copy elimination: transitive alias chain + port-ref rewriting
+# ===================================================================
+
+
+def _make_rms_norm_like():
+    """A 4-op fused graph (mul → reduce_sum → div → mul-by-weight) that
+    produces many bridge copies during merge — the realistic target of the
+    copy-elimination pass."""
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
+    g.add_node(ConstantOp(name="w"), [], Tensor("w", (4, 8)), node_id="w")
+    g.add_node(ElementwiseOp("mul"), ["x", "x"], Tensor("sq", (4, 8)), node_id="sq")
+    g.add_node(ReduceOp("sum", -1), ["sq"], Tensor("red", (4,)), node_id="red")
+    g.add_node(ElementwiseOp("mul"), ["red", "red"], Tensor("sqr", (4,)), node_id="sqr")
+    g.inputs, g.outputs = ["x", "w"], ["sqr"]
+    return g
+
+
+def test_rms_norm_like_no_residual_copies():
+    result = _fuse(_make_rms_norm_like())
+    kernel = _kernel_nodes(result)[0]
+    assert _count_copies(kernel.op.body) == 0, "copy-elimination must clear all bridge copies"
+
+
+def test_rms_norm_like_correctness():
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    w = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_correctness(_make_rms_norm_like, {"x": x, "w": w})
 
 
 # ===================================================================
