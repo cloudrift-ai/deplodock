@@ -39,7 +39,7 @@ class Loop:
     """A K-loop segment: iterates over the reduction dimension."""
 
     recompute: tuple[Assign, ...]  # prior element-space assigns to re-eval
-    body: tuple[Assign, ...]  # this segment's elementwise assigns
+    body: tuple[Assign | Select, ...]  # this segment's elementwise assigns/selects
     accum: Accum | None  # accumulator (reduce segments)
     stores_output: bool  # True for trailing element segments (store inside loop)
     store_index: tuple[Expr, ...] = ()  # write index when stores_output
@@ -183,7 +183,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     for seg in segments:
         # A segment is a sequence of statements terminating at Update or at end.
         last = seg[-1]
-        ew = [s for s in seg[:-1] if isinstance(s, Assign)]
+        ew = [s for s in seg[:-1] if isinstance(s, (Assign, Select))]
         if isinstance(last, Update):
             remat = _remat_set(seg, prior_ew, row_space)
             remat_assigns = tuple(a for a in prior_ew if a.name in remat)
@@ -209,14 +209,14 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
                 )
             )
             acc_count += 1
-            prior_ew.extend(ew)
+            prior_ew.extend(s for s in ew if isinstance(s, Assign))
         else:
             # Tail segment after the last Update.
-            # If any Assign in the tail references an elem_space value, emit a Loop
+            # If any stmt in the tail references an elem_space value, emit a Loop
             # so the per-element recomputation can reach it.
-            assigns = [s for s in seg if isinstance(s, Assign)]
+            tail_stmts = [s for s in seg if isinstance(s, (Assign, Select))]
             tail_writes = [s for s in seg if isinstance(s, Write)]
-            if assigns and _touches_elem_space(assigns, elem_space):
+            if tail_stmts and _touches_elem_space(tail_stmts, elem_space):
                 remat = _remat_set(seg, prior_ew, row_space)
                 remat_assigns = tuple(a for a in prior_ew if a.name in remat)
                 # If there are Writes in the tail, emit them inside the Loop body.
@@ -233,7 +233,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
                 steps.append(
                     Loop(
                         recompute=remat_assigns,
-                        body=tuple(assigns),
+                        body=tuple(tail_stmts),
                         accum=None,
                         stores_output=bool(tail_writes),
                         store_index=store_idx,
@@ -244,10 +244,10 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
                         k_size=k_size,
                     )
                 )
-                prior_ew.extend(assigns)
-            elif assigns:
-                steps.append(Inline(body=tuple(assigns)))
-                prior_ew.extend(assigns)
+                prior_ew.extend(s for s in tail_stmts if isinstance(s, Assign))
+            elif tail_stmts:
+                steps.append(Inline(body=tuple(tail_stmts)))
+                prior_ew.extend(s for s in tail_stmts if isinstance(s, Assign))
 
     return KernelPlan(
         steps=tuple(steps),
@@ -301,10 +301,18 @@ def _split_at_updates(body: tuple) -> list[list]:
     return segments
 
 
-def _touches_elem_space(assigns: list[Assign], elem_space: set[str]) -> bool:
-    """Does any assign in the list reference an element-space value?"""
-    local = {a.name for a in assigns}
-    return any(arg in elem_space and arg not in local for a in assigns for arg in a.args)
+def _touches_elem_space(stmts: list, elem_space: set[str]) -> bool:
+    """Does any stmt in the list reference an element-space value?"""
+    local = {s.name for s in stmts}
+
+    def refs(stmt) -> tuple[str, ...]:
+        if isinstance(stmt, Assign):
+            return stmt.args
+        if isinstance(stmt, Select):
+            return tuple(br.value for br in stmt.branches)
+        return ()
+
+    return any(arg in elem_space and arg not in local for s in stmts for arg in refs(s))
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +341,8 @@ def _remat_set(segment: list, prior_ew: list[Assign], row_space: set[str]) -> se
     for stmt in segment:
         if isinstance(stmt, Assign):
             _seed_from_args(stmt.args)
+        elif isinstance(stmt, Select):
+            _seed_from_args(tuple(br.value for br in stmt.branches))
         elif isinstance(stmt, Update):
             _seed_from_args((stmt.value,))
         elif isinstance(stmt, Write):
