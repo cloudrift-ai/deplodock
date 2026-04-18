@@ -129,6 +129,20 @@ def merge_loop_ops(
         else:
             specific_names.add(name)
 
+    # Singleton free axes (extent 1) are semantically no-op loops — binding them
+    # to Literal(0, int) is equivalent to iterating once at 0. Collapse them so
+    # the σ solver's "writer at dim k = Literal(0)" case doesn't force the axis
+    # to look unbound. Without this, reduce-into-elementwise merges refuse any
+    # time the reduction has a singleton batch dim (e.g. (1, N, D) → (1, N, 1)).
+    # Use dtype="int" — these axes are always used as array indices.
+    zero_idx = Literal(0, dtype="int")
+    singleton_free = [a for a in producer.axes if a.name not in bound_in_all and a.kind == "free" and int(a.extent) == 1]
+    for a in singleton_free:
+        for s in sigma_list:
+            s[a.name] = zero_idx
+        bound_common[a.name] = zero_idx
+        bound_in_all.add(a.name)
+
     unbound_axes = [a for a in producer.axes if a.name not in bound_in_all]
     if any(a.kind != "reduce" for a in unbound_axes):
         return None

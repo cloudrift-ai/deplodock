@@ -228,6 +228,49 @@ def test_merge_reduce_then_elementwise():
 # ---------------------------------------------------------------------------
 
 
+def test_merge_reduce_with_singleton_batch_dim():
+    """Reduction output with a singleton batch dim still merges into a consumer.
+
+    Reproduces the RMSNorm failure: producer reduces shape ``(1, N, D) -> (1, N, 1)``.
+    Its write index at the batch dim is ``Literal(0)`` (not ``Var(a0)``) because
+    the dim extent is 1. Without the singleton-free-axis collapse in merge_core,
+    ``a0`` looks unbound and the merge refuses.
+    """
+    # Producer: sum-of-squares over the last dim, with a singleton batch axis.
+    producer = _loop(
+        axes=(
+            Axis(name="a0", extent=1, kind="free"),
+            Axis(name="a1", extent=32, kind="free"),
+            Axis(name="a2", extent=2048, kind="reduce"),
+        ),
+        inputs=(Port(index=(Literal(0, "int"), Var("a1"), Var("a2"))),),
+        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        body=(
+            Assign(name="sq", op=ElementwiseOp("mul"), args=("$0", "$0")),
+            Update(target="acc", value="sq"),
+            Write(output=0, index=(Literal(0, "int"), Var("a1"), Literal(0, "int")), value="acc"),
+        ),
+    )
+    # Consumer: trivial elementwise over the reduction result (1, 32, 1).
+    consumer = _loop(
+        axes=(
+            Axis(name="a0", extent=1, kind="free"),
+            Axis(name="a1", extent=32, kind="free"),
+            Axis(name="a2", extent=1, kind="free"),
+        ),
+        inputs=(Port(index=(Literal(0, "int"), Var("a1"), Literal(0, "int"))),),
+        locals=(),
+        body=(
+            Assign(name="v", op=ElementwiseOp("rsqrt"), args=("$0",)),
+            Write(output=0, index=(Var("a0"), Var("a1"), Var("a2")), value="v"),
+        ),
+    )
+    merged = merge_loop_ops(producer, 0, consumer, 0)
+    assert merged is not None, "merge must succeed with singleton batch dim"
+    reduce_axes = [a for a in merged.axes if a.kind == "reduce"]
+    assert len(reduce_axes) == 1 and reduce_axes[0].extent == 2048
+
+
 def test_merge_alias_unifies_reduce_axes():
     """Two reductions over the same data axis collapse to one reduce axis when
     the caller passes an alias, turning a would-be 2-reduce merge into 1."""
