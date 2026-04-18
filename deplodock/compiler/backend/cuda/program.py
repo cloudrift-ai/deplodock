@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -410,17 +411,19 @@ def run_program(program: GpuProgram, input_data: dict[str, np.ndarray] | None = 
     source = generate_source(program, mode="run", input_data=input_data)
     binary = compile_program(source)
 
-    # Write input data files next to the binary if provided.
-    if input_data:
-        for buf_name, vals in input_data.items():
-            data_path = binary.parent / f"{buf_name}.bin"
-            data_path.write_bytes(np.ascontiguousarray(vals, dtype=np.float32).tobytes())
+    # Run in a per-invocation temp dir so concurrent runs can't clobber
+    # each other's input .bin files (the binary fopen()s them relatively).
+    with tempfile.TemporaryDirectory(prefix="deplodock_run_") as rundir:
+        if input_data:
+            for buf_name, vals in input_data.items():
+                data_path = Path(rundir) / f"{buf_name}.bin"
+                data_path.write_bytes(np.ascontiguousarray(vals, dtype=np.float32).tobytes())
 
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120, cwd=str(binary.parent))
-    if result.returncode != 0:
-        raise RuntimeError(f"Program execution failed:\n{result.stderr}")
+        result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120, cwd=rundir)
+        if result.returncode != 0:
+            raise RuntimeError(f"Program execution failed:\n{result.stderr}")
 
-    return _parse_run_output(result.stdout, program)
+        return _parse_run_output(result.stdout, program)
 
 
 @dataclass
@@ -443,21 +446,20 @@ def run_program_debug(program: GpuProgram, input_data: dict[str, np.ndarray] | N
     source = generate_source(program, mode="run", input_data=input_data, debug=True)
     binary = compile_program(source)
 
-    if input_data:
-        for buf_name, vals in input_data.items():
-            data_path = binary.parent / f"{buf_name}.bin"
-            data_path.write_bytes(np.ascontiguousarray(vals, dtype=np.float32).tobytes())
+    # Per-invocation temp dir: binary reads inputs and writes launch_*.bin
+    # here, so concurrent debug runs stay isolated.
+    with tempfile.TemporaryDirectory(prefix="deplodock_dbg_") as rundir:
+        rundir_path = Path(rundir)
+        if input_data:
+            for buf_name, vals in input_data.items():
+                data_path = rundir_path / f"{buf_name}.bin"
+                data_path.write_bytes(np.ascontiguousarray(vals, dtype=np.float32).tobytes())
 
-    # Clean any stale launch dumps from a previous debug run so we don't
-    # return stale data if the program crashes mid-run.
-    for stale in binary.parent.glob("launch_*.bin"):
-        stale.unlink()
+        result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=300, cwd=rundir)
+        if result.returncode != 0:
+            raise RuntimeError(f"Debug program execution failed:\n{result.stderr}\nstdout:\n{result.stdout}")
 
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=300, cwd=str(binary.parent))
-    if result.returncode != 0:
-        raise RuntimeError(f"Debug program execution failed:\n{result.stderr}\nstdout:\n{result.stdout}")
-
-    return _parse_debug_output(result.stdout, program, binary.parent)
+        return _parse_debug_output(result.stdout, program, rundir_path)
 
 
 def benchmark_program(
