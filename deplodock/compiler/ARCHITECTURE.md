@@ -209,8 +209,11 @@ graph; `run()` walks it in topological order, calling `forward` at each node,
 reshaping outputs to match declared `node.output.shape`. No GPU required.
 
 Covered ops: all elementwise functions, reductions, scans, gather/scatter,
-transpose/reshape/unsqueeze/slice/cat, linear, matmul, SDPA, mean.
-`IndexMapOp` and `LoopOp` raise `NotImplementedError` (structural IR).
+transpose/reshape/unsqueeze/slice/cat, linear, matmul, SDPA, mean, plus
+`IndexMapOp` and `LoopOp`. `LoopOp.forward` delegates to
+`backend/loop/backend.py::execute_loop_op`, the same numpy interpreter that
+`LoopBackend` uses — this lets `NumpyBackend` execute graphs *after* fusion,
+so fusion rules can be validated numerically on CPU without CUDA.
 
 ## Testing
 

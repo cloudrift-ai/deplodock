@@ -65,9 +65,19 @@ whole directory as a single pass; `test_merge_core.py` unit-tests the
 | `005_merge_loop_ops.py`   | `LoopOp → LoopOp`          | `test_merge_core.py` (17 unit tests) + `test_fusion_rules.py` (fixpoint) |
 
 Numerical correctness for lifted + merged kernels runs through the
-numpy `LoopBackend` in `test_e2e_accuracy.py` (pointwise, reduce,
-matmul, RMSNorm, softmax) and `test_block_accuracy.py` (TinyLlama,
-Qwen2.5-7B real blocks, `@requires_cuda`).
+numpy backends in three places:
+
+- `test_fusion_rules.py::test_*_correctness` — runs the pre- and
+  post-fusion graph through `NumpyBackend` (which uses `LoopOp.forward`
+  post-fusion) and asserts outputs match.
+- `test_e2e_accuracy.py` — full-pipeline coverage on toy shapes
+  (pointwise, reduce, matmul, RMSNorm, softmax) via the `run_graph`
+  fixture parameterized over `numpy` / `loop` / `cuda`.
+- `test_block_accuracy.py` — real transformer block (TinyLlama layer 0
+  with random weights, `seq_len=8` for the CPU lane, `seq_len=32` for
+  the CUDA lane) compiled end-to-end and compared against PyTorch
+  eager. The `_cpu` variant runs `LoopBackend` + CPU eager (always
+  on, ~3s); the `_cuda` variants are gated by `@requires_cuda`.
 
 ## Adding a New Rule Test
 
