@@ -46,7 +46,7 @@ class CudaBackend(Backend):
 
     def compile(self, graph: Graph) -> GpuProgram:
         """Lower ``Graph`` → ``LoopProgram`` → ``GpuProgram``."""
-        return compile_kernels(compile_graph(graph, dump=self.dump))
+        return compile_kernels(compile_graph(graph, dump=self.dump), dump=self.dump)
 
     def run(self, compiled: GpuProgram, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
         """Execute the compiled program; returns outputs as ndarrays with declared shapes."""
