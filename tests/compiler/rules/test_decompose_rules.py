@@ -164,6 +164,63 @@ def test_mean_correctness():
 
 
 # ===================================================================
+# RMSNorm decomposition: rms_norm(x, w) → x * rsqrt(mean(x^2) + eps) * w
+# ===================================================================
+
+
+def _make_rms_norm_graph(dim=64, seq_len=8, eps_input=False):
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, seq_len, dim)), node_id="x")
+    g.add_node(op=ConstantOp(name="w"), inputs=[], output=Tensor("w", (dim,)), node_id="w")
+    ins = ["x", "w"]
+    if eps_input:
+        g.add_node(op=ConstantOp(name="eps", value=1e-5), inputs=[], output=Tensor("eps", (1,)), node_id="eps")
+        ins.append("eps")
+    g.add_node(op=ElementwiseOp(fn="rms_norm"), inputs=ins, output=Tensor("out", (1, seq_len, dim)), node_id="out")
+    g.inputs, g.outputs = ["x"], ["out"]
+    return g
+
+
+def test_rms_norm_decomposes():
+    result = _apply(_make_rms_norm_graph(), _load("006_decompose_rms_norm.py"))
+    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    assert "rms_norm" not in fns
+    assert {"mul", "add", "rsqrt"} <= fns
+    assert any(isinstance(n.op, MeanOp) for n in result.nodes.values())
+
+
+def test_rms_norm_with_eps_input_decomposes():
+    """Three-input form (x, w, eps) from explicit torch.nn.RMSNorm(dim, eps=...)."""
+    result = _apply(_make_rms_norm_graph(eps_input=True), _load("006_decompose_rms_norm.py"))
+    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    assert "rms_norm" not in fns
+
+
+def test_rms_norm_preserves_io_shape():
+    g = _make_rms_norm_graph(dim=64, seq_len=8)
+    result = _apply(g, _load("006_decompose_rms_norm.py"))
+    assert result.nodes[result.outputs[0]].output.shape == (1, 8, 64)
+
+
+def test_rms_norm_trace_to_tensor_ir_primitives_only():
+    """End-to-end protection: torch.nn.RMSNorm → trace → compile through decomposition
+    must yield a graph of primitives only (no rms_norm fused op).
+    """
+    import torch
+
+    from deplodock.compiler.rewriter import Rewriter
+    from deplodock.compiler.torch_trace import trace_module
+
+    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules"
+    graph = trace_module(torch.nn.RMSNorm(64), (torch.randn(1, 8, 64),))
+    pre = Rewriter.from_directory(rules_dir, pass_order=["decomposition", "optimization"])
+    decomposed = pre.apply(graph)
+    for n in decomposed.nodes.values():
+        if isinstance(n.op, ElementwiseOp):
+            assert n.op.fn != "rms_norm", f"rms_norm survived decomposition at {n.output.name}"
+
+
+# ===================================================================
 # SDPA decomposition: sdpa(Q, K, V) → QK^T → scale → softmax → @V
 # ===================================================================
 
