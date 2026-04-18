@@ -239,5 +239,7 @@ def test_multi_source_cat_absorbs_into_consumer():
     assert set(launch.input_names) == {"a", "b", "y"}, f"expected ports to read a, b, y directly; got {launch.input_names}"
 
     # The Select must be in the kernel body.
-    selects = [s for s in launch.loop.body if isinstance(s, Select)]
+    from deplodock.compiler.ir.loop import flatten_body
+
+    selects = [s for s in flatten_body(launch.loop.body) if isinstance(s, Select)]
     assert len(selects) == 1, f"expected one Select stmt in body; got {len(selects)}: {launch.loop.body}"

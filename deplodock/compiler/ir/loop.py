@@ -266,7 +266,7 @@ class LoopOp(Op):
         """
         import numpy as np
 
-        writes = [s for s in self.body if isinstance(s, Write)]
+        writes = [s for s in flatten_body(self.body) if isinstance(s, Write)]
         if not writes:
             return self.infer_output_shape()
         w = writes[0]

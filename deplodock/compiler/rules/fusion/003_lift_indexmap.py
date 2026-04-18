@@ -13,7 +13,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, substitute
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import Axis, LoopOp, Port, Select, SelectBranch, Write
+from deplodock.compiler.ir.loop import Axis, Loop, LoopOp, Port, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tensor import IndexMapOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -54,7 +54,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         body.append(Select(name="v", branches=tuple(branches)))
         body.append(Write(output=0, index=write_index, value="v"))
 
-    kernel = LoopOp(axes=axes, inputs=tuple(ports), body=tuple(body))
+    # Wrap in nested free Loops.
+    nested: tuple[Stmt, ...] = tuple(body)
+    for a in reversed(axes):
+        nested = (Loop(axis=a, body=nested),)
+    kernel = LoopOp(axes=axes, inputs=tuple(ports), body=nested)
 
     frag = Graph()
     for inp_id in input_names:

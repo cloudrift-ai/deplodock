@@ -62,11 +62,15 @@ def _kernel_nodes(graph: Graph) -> list:
 
 
 def _assign_fns(body) -> list[str]:
-    return [s.op.fn for s in body if isinstance(s, Assign)]
+    from deplodock.compiler.ir.loop import flatten_body
+
+    return [s.op.fn for s in flatten_body(body) if isinstance(s, Assign)]
 
 
 def _has_update(body) -> bool:
-    return any(isinstance(s, Update) for s in body)
+    from deplodock.compiler.ir.loop import flatten_body
+
+    return any(isinstance(s, Update) for s in flatten_body(body))
 
 
 def _local_combine_fns(locals_) -> set[str]:
@@ -114,9 +118,11 @@ def test_pointwise_chain_inputs_are_ports():
 
 
 def test_pointwise_chain_has_write():
+    from deplodock.compiler.ir.loop import flatten_body
+
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
-    assert any(isinstance(s, Write) for s in kernel.op.body)
+    assert any(isinstance(s, Write) for s in flatten_body(kernel.op.body))
 
 
 # ===================================================================
@@ -240,6 +246,8 @@ def test_single_elementwise_fuses():
 
 def test_ssa_invariants_hold():
     """LoopOp.__post_init__ validates SSA; this just confirms no crash."""
+    from deplodock.compiler.ir.loop import flatten_body
+
     result = _fuse(_make_softmax())
     for k in _kernel_nodes(result):
         # Re-validate explicitly
@@ -251,7 +259,7 @@ def test_ssa_invariants_hold():
                 port_idx += 1
         for lb in k.op.locals:
             defined.add(lb.name)
-        for s in k.op.body:
+        for s in flatten_body(k.op.body):
             if isinstance(s, Assign):
                 for arg in s.args:
                     assert arg in defined, f"arg {arg!r} not defined before use in {s.name}"

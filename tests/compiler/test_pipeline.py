@@ -42,9 +42,11 @@ def _matmul_graph(m: int, k: int, n: int) -> Graph:
 
 
 def test_compile_graph_fuses_matmul():
+    from deplodock.compiler.ir.loop import flatten_body
+
     program = compile_graph(_matmul_graph(4, 3, 2))
     # Matmul decomposes into unsqueeze copies + mul/sum kernel.
-    matmul_launches = [L for L in program.launches if any(isinstance(s, Update) for s in L.loop.body)]
+    matmul_launches = [L for L in program.launches if any(isinstance(s, Update) for s in flatten_body(L.loop.body))]
     assert len(matmul_launches) == 1
 
 

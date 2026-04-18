@@ -52,15 +52,21 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 def _elementwise_fns(body) -> list[str]:
-    return [s.op.fn for s in body if isinstance(s, Assign)]
+    from deplodock.compiler.ir.loop import flatten_body
+
+    return [s.op.fn for s in flatten_body(body) if isinstance(s, Assign)]
 
 
 def _has_update(body) -> bool:
-    return any(isinstance(s, Update) for s in body)
+    from deplodock.compiler.ir.loop import flatten_body
+
+    return any(isinstance(s, Update) for s in flatten_body(body))
 
 
 def _has_write(body) -> bool:
-    return any(isinstance(s, Write) for s in body)
+    from deplodock.compiler.ir.loop import flatten_body
+
+    return any(isinstance(s, Write) for s in flatten_body(body))
 
 
 def test_pointwise_add():

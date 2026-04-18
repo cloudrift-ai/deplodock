@@ -127,8 +127,10 @@ def _detect_reduce_axis_aliases(
     assert isinstance(producer_op, LoopOp)
     assert isinstance(consumer_op, LoopOp)
 
+    from deplodock.compiler.ir.loop import flatten_body
+
     write_axis_names: set[str] = set()
-    for stmt in producer_op.body:
+    for stmt in flatten_body(producer_op.body):
         if isinstance(stmt, Write) and stmt.output == 0:
             for e in stmt.index:
                 _collect_axis_names(e, write_axis_names)
@@ -170,7 +172,7 @@ def _detect_reduce_axis_aliases(
     if c_reduce.name in aliases.values():
         return aliases
 
-    writes = [s for s in producer_op.body if isinstance(s, Write) and s.output == 0]
+    writes = [s for s in flatten_body(producer_op.body) if isinstance(s, Write) and s.output == 0]
     if len(writes) != 1:
         return aliases
     w = writes[0]
