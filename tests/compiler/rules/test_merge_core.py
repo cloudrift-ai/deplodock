@@ -210,6 +210,70 @@ def test_merge_reduce_then_elementwise():
 # ---------------------------------------------------------------------------
 
 
+def test_merge_alias_unifies_reduce_axes():
+    """Two reductions over the same data axis collapse to one reduce axis when
+    the caller passes an alias, turning a would-be 2-reduce merge into 1."""
+    # Producer reduces x along a1 (extent 8).
+    producer = LoopOp(
+        axes=(Axis(name="a0", extent=4, kind="free"), Axis(name="a1", extent=8, kind="reduce")),
+        inputs=(Port(index=(Var("a0"), Var("a1"))),),
+        locals=(LocalBuffer(name="acc_p", combine=ElementwiseOp("max"), init=Literal(-1e30)),),
+        body=(
+            Update(target="acc_p", value="$0"),
+            Write(output=0, index=(Var("a0"),), value="acc_p"),
+        ),
+    )
+    # Consumer also reduces x along b1 (extent 8), reads producer's output at [b0],
+    # adds them.
+    consumer = LoopOp(
+        axes=(Axis(name="b0", extent=4, kind="free"), Axis(name="b1", extent=8, kind="reduce")),
+        inputs=(
+            Port(index=(Var("b0"),)),  # from producer
+            Port(index=(Var("b0"), Var("b1"))),  # same external buffer, different reduce axis
+        ),
+        locals=(LocalBuffer(name="acc_c", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        body=(
+            Update(target="acc_c", value="$1"),
+            Assign(name="v", op=ElementwiseOp("add"), args=("$0", "acc_c")),
+            Write(output=0, index=(Var("b0"),), value="v"),
+        ),
+    )
+    # Without aliases: 2 reduce axes → reject.
+    assert merge_loop_ops(producer, 0, consumer, 0) is None
+    # With alias a1 → b1: 1 reduce axis → accept.
+    merged = merge_loop_ops(producer, 0, consumer, 0, axis_aliases={"a1": "b1"})
+    assert merged is not None
+    reduce_axes = [a for a in merged.axes if a.kind == "reduce"]
+    assert len(reduce_axes) == 1, f"expected 1 reduce axis, got {[a.name for a in reduce_axes]}"
+    assert reduce_axes[0].name == "b1", "producer's a1 should be aliased away"
+    # Both accumulators survive: producer's acc_p (max) and consumer's acc_c (add).
+    combine_fns = {lb.combine.fn for lb in merged.locals if lb.combine is not None}
+    assert combine_fns == {"max", "add"}
+
+
+def test_merge_alias_ignores_already_bound():
+    """axis_aliases entries are no-ops for axes already bound by σ."""
+    producer = LoopOp(
+        axes=(Axis(name="a0", extent=8, kind="free"),),
+        inputs=(Port(index=(Var("a0"),)),),
+        body=(
+            Assign(name="v", op=ElementwiseOp("neg"), args=("$0",)),
+            Write(output=0, index=(Var("a0"),), value="v"),
+        ),
+    )
+    consumer = LoopOp(
+        axes=(Axis(name="b0", extent=8, kind="free"),),
+        inputs=(Port(index=(Var("b0"),)),),
+        body=(
+            Assign(name="v", op=ElementwiseOp("exp"), args=("$0",)),
+            Write(output=0, index=(Var("b0"),), value="v"),
+        ),
+    )
+    # a0 is already bound by σ (writer[0] = reader[0]). The alias should be silently ignored.
+    merged = merge_loop_ops(producer, 0, consumer, 0, axis_aliases={"a0": "b0"})
+    assert merged is not None
+
+
 def test_merge_rejects_multi_reduce():
     """Two reduce axes in the merged kernel — single-reduce backend can't handle."""
     producer = _reduce_sum_over_axis1(outer=4, inner=8)

@@ -301,3 +301,78 @@ def test_single_elementwise_correctness():
 
     x = rng.standard_normal(8).astype(np.float32)
     _assert_correctness(_make, {"x": x})
+
+
+# ===================================================================
+# Sibling reductions: axis aliasing collapses them into one kernel.
+# ===================================================================
+
+
+def _make_sibling_reductions():
+    """``s = sum(x, -1); m = max(x, -1); out = s + m`` — two reduces over x
+    feeding one elementwise. With reduce-axis aliasing, fuses into one kernel
+    with two accumulators sharing one reduce axis."""
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
+    g.add_node(ReduceOp("sum", -1), ["x"], Tensor("s", (4,)), node_id="s")
+    g.add_node(ReduceOp("max", -1), ["x"], Tensor("m", (4,)), node_id="m")
+    g.add_node(ElementwiseOp("add"), ["s", "m"], Tensor("out", (4,)), node_id="out")
+    g.inputs, g.outputs = ["x"], ["out"]
+    return g
+
+
+def test_sibling_reductions_fuse_to_one_kernel():
+    result = _fuse(_make_sibling_reductions())
+    kernels = _kernel_nodes(result)
+    assert len(kernels) == 1, f"expected 1 kernel, got {len(kernels)}"
+
+
+def test_sibling_reductions_share_reduce_axis():
+    result = _fuse(_make_sibling_reductions())
+    kernel = _kernel_nodes(result)[0]
+    reduce_axes = [a for a in kernel.op.axes if a.kind == "reduce"]
+    assert len(reduce_axes) == 1, f"expected 1 reduce axis, got {[a.name for a in reduce_axes]}"
+
+
+def test_sibling_reductions_have_both_accumulators():
+    result = _fuse(_make_sibling_reductions())
+    kernel = _kernel_nodes(result)[0]
+    combine_fns = _local_combine_fns(kernel.op.locals)
+    assert {"add", "max"} <= combine_fns
+
+
+def test_sibling_reductions_correctness():
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_correctness(_make_sibling_reductions, {"x": x})
+
+
+# ===================================================================
+# Softmax: multi-port producer consumption + reduce-axis aliasing.
+# ===================================================================
+
+
+def test_softmax_fuses_to_one_kernel():
+    """Softmax's two-reduce pattern (max sweep → sub → exp → sum sweep → div)
+    fuses into a single kernel with two accumulators sharing one reduce axis."""
+    result = _fuse(_make_softmax())
+    kernels = _kernel_nodes(result)
+    assert len(kernels) == 1, f"expected 1 kernel, got {len(kernels)}"
+
+
+def test_softmax_single_reduce_axis():
+    result = _fuse(_make_softmax())
+    kernel = _kernel_nodes(result)[0]
+    reduce_axes = [a for a in kernel.op.axes if a.kind == "reduce"]
+    assert len(reduce_axes) == 1
+
+
+def test_softmax_has_both_accumulators():
+    result = _fuse(_make_softmax())
+    kernel = _kernel_nodes(result)[0]
+    combine_fns = _local_combine_fns(kernel.op.locals)
+    assert {"add", "max"} <= combine_fns, f"missing accumulators: {combine_fns}"
+
+
+def test_softmax_single_kernel_correctness():
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_correctness(_make_softmax, {"x": x})
