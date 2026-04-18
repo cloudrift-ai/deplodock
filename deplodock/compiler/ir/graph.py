@@ -364,6 +364,9 @@ def _fmt_tensor(t: Tensor) -> str:
     return f"{t.name}: {_fmt_shape(t.shape)} {t.dtype}"
 
 
+_DIM_NAMES = ("i", "j", "k", "l", "m", "n")
+
+
 def _fmt_op(node: Node, graph: Graph) -> str:
     """Render `node` as a function-call-like string using input tensor names."""
     op = node.op
@@ -382,10 +385,42 @@ def _fmt_op(node: Node, graph: Graph) -> str:
         red = f", reduce={op.reduce_fn}" if getattr(op, "reduce_fn", None) else ""
         return f"scatter({', '.join(arg_names)}, axis={op.axis}{red})"
     if cls == "IndexMapOp":
-        return f"indexmap({', '.join(arg_names)})"
+        return _fmt_indexmap(op, arg_names)
 
     # Generic fallback (frontend ops like MeanOp, LinearOp, SdpaOp, or LoopOp).
     fields = {k: v for k, v in op.__dict__.items() if not k.startswith("_") and k != "name"}
     label = cls.removesuffix("Op").lower() or cls
     parts = list(arg_names) + [f"{k}={v}" for k, v in fields.items()]
     return f"{label}({', '.join(parts)})"
+
+
+def _fmt_indexmap(op, arg_names: list[str]) -> str:
+    """Render IndexMapOp concisely when its coord expression is simple.
+
+    Single-source, no select, ≤6 output dims → ``src[coord_0, coord_1, ...]``
+    with ``out_coord_N`` placeholders replaced by ``i``/``j``/``k``/``l``/``m``/``n``.
+    Everything else (multi-source, selected reads, many dims) falls back to
+    the opaque ``indexmap(src0, src1, ...)`` form.
+    """
+    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Var, render
+
+    sources = op.sources
+    out_shape = op.out_shape
+    if len(sources) != 1 or sources[0].select is not None or len(out_shape) > len(_DIM_NAMES):
+        return f"indexmap({', '.join(arg_names)})"
+
+    src = sources[0]
+    input_name = arg_names[src.input_idx] if src.input_idx < len(arg_names) else f"${src.input_idx}"
+
+    def rename(e):
+        if isinstance(e, Var) and e.name.startswith(PLACEHOLDER_PREFIX):
+            try:
+                n = int(e.name[len(PLACEHOLDER_PREFIX) :])
+                if 0 <= n < len(_DIM_NAMES):
+                    return _DIM_NAMES[n]
+            except ValueError:
+                pass
+        return None
+
+    coord_strs = [render(e, rename) for e in src.coord_map]
+    return f"{input_name}[{', '.join(coord_strs)}]"
