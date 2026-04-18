@@ -77,8 +77,12 @@ class CompilerDump:
         This is the article's "Tensor IR" — only primitive ops (add/mul/sub/div/rsqrt/exp,
         sum/max reductions, reshape/transpose/slice, gather). High-level ops like
         rms_norm, linear, sdpa have been lowered to this canonical op set.
+
+        Dumped twice: ``10_tensor_ir.json`` (round-trippable via Graph.from_dict)
+        and ``10_tensor_ir.txt`` (human-readable, consumed by ``compile --ir tensor``).
         """
         self._write_json("10_tensor_ir.json", graph.to_dict())
+        self._write_text("10_tensor_ir.txt", graph.pretty_print())
 
     def dump_pass(self, index: int, pt: PassTrace) -> None:
         prefix = f"{index + 1:02d}_pass_{pt.name}"
