@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from deplodock.compiler.ir.graph import Graph
     from deplodock.compiler.plan import ExecutionPlan
     from deplodock.compiler.program.gpu import GpuProgram
+    from deplodock.compiler.program.loop import LoopProgram
     from deplodock.compiler.rewriter import PassTrace
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,15 @@ class CompilerDump:
             ],
         }
         self._write_json("30_execution_plan.json", summary)
+
+    def dump_loop_program(self, program: LoopProgram) -> None:
+        """LoopProgram pretty-print (post-fusion).
+
+        This is the article's "Loop IR" stage — fused LoopOp nodes with named
+        iteration axes (free/reduce), accumulators, and SSA bodies, before any
+        backend-specific lowering.
+        """
+        self._write_text("38_loop_program.txt", program.pretty_print())
 
     def dump_kernel_ir(self, kernels: list[GpuKernel]) -> None:
         """Pretty-printed KernelIR AST for each kernel (pre-source-emission).
