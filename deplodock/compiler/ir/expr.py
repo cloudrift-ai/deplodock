@@ -17,6 +17,7 @@ pure operations over the expression AST.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
@@ -273,8 +274,20 @@ class Cast(_ExprOps):
 Expr = Var | Literal | BinOp | Builtin | FuncCall | Ternary | Cast
 
 
-def render(expr: Expr) -> str:
-    """Format an ``Expr`` tree as a compact, human-readable string."""
+def render(expr: Expr, formatter: Callable[[object], str | None] | None = None) -> str:
+    """Format an ``Expr`` tree as a compact, human-readable string.
+
+    ``formatter``: optional hook, called with each node before the default
+    dispatch. Return a string to override rendering; return ``None`` to fall
+    through to the default. Lets extensions (e.g. ``ir.gpu``'s GPU-specific
+    node types plus no-paren C-style formatting) reuse this dispatch while
+    overriding select nodes. The hook must recurse back through ``render``
+    (passing itself) to preserve the override for nested nodes.
+    """
+    if formatter is not None:
+        override = formatter(expr)
+        if override is not None:
+            return override
     if isinstance(expr, Var):
         return expr.name
     if isinstance(expr, Literal):
@@ -282,13 +295,13 @@ def render(expr: Expr) -> str:
     if isinstance(expr, Builtin):
         return expr.name
     if isinstance(expr, BinOp):
-        return f"({render(expr.left)} {expr.op} {render(expr.right)})"
+        return f"({render(expr.left, formatter)} {expr.op} {render(expr.right, formatter)})"
     if isinstance(expr, FuncCall):
-        return f"{expr.name}({', '.join(render(a) for a in expr.args)})"
+        return f"{expr.name}({', '.join(render(a, formatter) for a in expr.args)})"
     if isinstance(expr, Ternary):
-        return f"({render(expr.cond)} ? {render(expr.if_true)} : {render(expr.if_false)})"
+        return f"({render(expr.cond, formatter)} ? {render(expr.if_true, formatter)} : {render(expr.if_false, formatter)})"
     if isinstance(expr, Cast):
-        return f"({expr.dtype}){render(expr.expr)}"
+        return f"({expr.dtype}){render(expr.expr, formatter)}"
     return repr(expr)
 
 

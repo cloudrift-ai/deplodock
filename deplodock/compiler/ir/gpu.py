@@ -30,6 +30,9 @@ from deplodock.compiler.ir.expr import (
     Var,
     _ExprOps,
 )
+from deplodock.compiler.ir.expr import (
+    render as render_expr,
+)
 
 __all__ = [
     # Shared expression types (re-exported)
@@ -248,32 +251,36 @@ def pretty_print(kernel: GpuKernel) -> str:
     return "\n".join(lines)
 
 
-def _pp_expr(expr: GpuExpr) -> str:
-    """Pretty-print a GpuExpr as a compact string."""
-    if isinstance(expr, Var):
-        return expr.name
-    if isinstance(expr, Literal):
-        if isinstance(expr.value, float):
-            return f"{expr.value:g}"
-        return str(expr.value)
+def _gpu_fmt(expr: object) -> str | None:
+    """Formatter hook for ``render_expr``: overrides for C-style kernel display.
+
+    Differs from the default ``render`` in four ways: no parens around BinOp /
+    Ternary / Cast (C operator precedence is implicit); ``{v:g}`` for float
+    Literal (compact readable form); extra parens around Cast operand; adds the
+    GPU-specific node types (ArrayAccess, FieldAccess, VectorLoad) that aren't
+    in the portable ``Expr`` union. Returning None falls through to ``render``'s
+    default dispatch.
+    """
+    if isinstance(expr, Literal) and isinstance(expr.value, float):
+        return f"{expr.value:g}"
     if isinstance(expr, BinOp):
-        return f"{_pp_expr(expr.left)} {expr.op} {_pp_expr(expr.right)}"
-    if isinstance(expr, Builtin):
-        return expr.name
-    if isinstance(expr, FuncCall):
-        args = ", ".join(_pp_expr(a) for a in expr.args)
-        return f"{expr.name}({args})"
+        return f"{render_expr(expr.left, _gpu_fmt)} {expr.op} {render_expr(expr.right, _gpu_fmt)}"
     if isinstance(expr, Ternary):
-        return f"{_pp_expr(expr.cond)} ? {_pp_expr(expr.if_true)} : {_pp_expr(expr.if_false)}"
-    if isinstance(expr, ArrayAccess):
-        return f"{expr.array}[{_pp_expr(expr.index)}]"
+        return f"{render_expr(expr.cond, _gpu_fmt)} ? {render_expr(expr.if_true, _gpu_fmt)} : {render_expr(expr.if_false, _gpu_fmt)}"
     if isinstance(expr, Cast):
-        return f"({expr.dtype})({_pp_expr(expr.expr)})"
+        return f"({expr.dtype})({render_expr(expr.expr, _gpu_fmt)})"
+    if isinstance(expr, ArrayAccess):
+        return f"{expr.array}[{render_expr(expr.index, _gpu_fmt)}]"
     if isinstance(expr, FieldAccess):
-        return f"{_pp_expr(expr.expr)}.{expr.field}"
+        return f"{render_expr(expr.expr, _gpu_fmt)}.{expr.field}"
     if isinstance(expr, VectorLoad):
-        return f"*(float{expr.width}*)(&{expr.array}[{_pp_expr(expr.index)}])"
-    return "??"
+        return f"*(float{expr.width}*)(&{expr.array}[{render_expr(expr.index, _gpu_fmt)}])"
+    return None
+
+
+def _pp_expr(expr: GpuExpr) -> str:
+    """Pretty-print a GpuExpr in the kernel's C-style display form."""
+    return render_expr(expr, _gpu_fmt)
 
 
 def _pp_stmt(stmt: Stmt, depth: int) -> list[str]:
