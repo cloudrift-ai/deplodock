@@ -14,7 +14,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import Assign, Axis, LoopOp, Port, Write
+from deplodock.compiler.ir.loop import Assign, Axis, Loop, LoopOp, Port, Stmt, Write
 from deplodock.compiler.ir.tensor import ElementwiseOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -42,10 +42,14 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         args.append(f"${i}")
 
     write_index = tuple(Var(a.name) for a in axes)
-    body = (
+    inner: tuple[Stmt, ...] = (
         Assign(name="v", op=node.op, args=tuple(args)),
         Write(output=0, index=write_index, value="v"),
     )
+    # Nest the body in free-axis Loops (outer axis wraps the innermost).
+    body: tuple[Stmt, ...] = inner
+    for a in reversed(axes):
+        body = (Loop(axis=a, body=body),)
     kernel = LoopOp(axes=axes, inputs=tuple(ports), body=body)
 
     frag = Graph()

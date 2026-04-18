@@ -15,7 +15,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Cast, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import Axis, LoopOp, Port, Write
+from deplodock.compiler.ir.loop import Axis, Loop, LoopOp, Port, Stmt, Write
 from deplodock.compiler.ir.tensor import GatherOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -42,7 +42,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     data_index = tuple(Cast("int", Var("$0")) if i == axis else Var(axes[i].name) for i in range(ndim))
     data_port = Port(index=data_index)
 
-    body = (Write(output=0, index=tuple(Var(a.name) for a in axes), value="$1"),)
+    inner: tuple[Stmt, ...] = (Write(output=0, index=tuple(Var(a.name) for a in axes), value="$1"),)
+    body: tuple[Stmt, ...] = inner
+    for a in reversed(axes):
+        body = (Loop(axis=a, body=body),)
     kernel = LoopOp(axes=axes, inputs=(idx_port, data_port), body=body)
 
     frag = Graph()

@@ -104,9 +104,12 @@ def test_merge_elementwise_chain():
     # Consumer had 1 port (the producer); producer had 1 port (external). Result: 1 port.
     assert len(merged.inputs) == 1
     # Body: producer Assign(neg) → bridge Assign(copy) → consumer Assign(exp) → Write.
-    assign_fns = [s.op.fn for s in merged.body if isinstance(s, Assign)]
+    from deplodock.compiler.ir.loop import flatten_body
+
+    flat = flatten_body(merged.body)
+    assign_fns = [s.op.fn for s in flat if isinstance(s, Assign)]
     assert assign_fns == ["neg", "copy", "exp"]
-    writes = [s for s in merged.body if isinstance(s, Write)]
+    writes = [s for s in flat if isinstance(s, Write)]
     assert len(writes) == 1
 
 
@@ -200,9 +203,12 @@ def test_merge_reduce_then_elementwise():
     local_names = [lb.name for lb in merged.locals]
     assert "acc" in local_names
     # Body must contain the Update, then the bridge-copy, then the consumer's add.
-    fns = [s.op.fn for s in merged.body if isinstance(s, Assign)]
+    from deplodock.compiler.ir.loop import flatten_body
+
+    flat = flatten_body(merged.body)
+    fns = [s.op.fn for s in flat if isinstance(s, Assign)]
     assert fns == ["neg", "copy", "add"]
-    assert any(isinstance(s, Update) for s in merged.body)
+    assert any(isinstance(s, Update) for s in flat)
 
 
 # ---------------------------------------------------------------------------

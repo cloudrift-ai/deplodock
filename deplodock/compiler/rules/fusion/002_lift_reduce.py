@@ -10,7 +10,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import Axis, LocalBuffer, LoopOp, Port, Update, Write
+from deplodock.compiler.ir.loop import Axis, LocalBuffer, Loop, LoopOp, Port, Stmt, Update, Write
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -52,10 +52,18 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     acc = LocalBuffer(name="acc", combine=ElementwiseOp(combine_fn), init=Literal(init))
 
     write_index = _build_write_index(axes, tuple(node.output.shape))
-    body = (
-        Update(target="acc", value="$0"),
+
+    # Nested body: Loop(reduce_axis, [Update]) followed by Write, the whole
+    # thing wrapped in Loop(free_axis, ...) blocks (outermost first).
+    reduce_axis = next(a for a in axes if a.kind == "reduce")
+    free_axes = [a for a in axes if a.kind == "free"]
+    inner: tuple[Stmt, ...] = (
+        Loop(axis=reduce_axis, body=(Update(target="acc", value="$0"),)),
         Write(output=0, index=write_index, value="acc"),
     )
+    body: tuple[Stmt, ...] = inner
+    for a in reversed(free_axes):
+        body = (Loop(axis=a, body=body),)
     kernel = LoopOp(axes=axes, inputs=(input_port,), locals=(acc,), body=body)
 
     frag = Graph()

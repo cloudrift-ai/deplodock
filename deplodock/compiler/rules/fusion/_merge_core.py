@@ -81,7 +81,14 @@ def merge_loop_ops(
         if cp < 0 or cp >= len(consumer.inputs):
             return None
 
-    writes = [s for s in producer.body if isinstance(s, Write) and s.output == producer_output]
+    # Flatten nested Loop blocks — merge operates on the linear stmt sequence.
+    # The output body gets re-nested via _normalize_flat_to_nested before return.
+    from deplodock.compiler.ir.loop import flatten_body
+
+    producer_flat = tuple(flatten_body(producer.body))
+    consumer_flat = tuple(flatten_body(consumer.body))
+
+    writes = [s for s in producer_flat if isinstance(s, Write) and s.output == producer_output]
     if len(writes) != 1:
         return None
     write = writes[0]
@@ -132,11 +139,11 @@ def merge_loop_ops(
 
     # Split producer body at the last Update. Pre-reduce includes the Update.
     last_update_idx = -1
-    for i, stmt in enumerate(producer.body):
+    for i, stmt in enumerate(producer_flat):
         if isinstance(stmt, Update):
             last_update_idx = i
-    pre_reduce_stmts = producer.body[: last_update_idx + 1]
-    post_reduce_stmts = producer.body[last_update_idx + 1 :]
+    pre_reduce_stmts = producer_flat[: last_update_idx + 1]
+    post_reduce_stmts = producer_flat[last_update_idx + 1 :]
 
     # Pre-reduce stmts may only reference bound_common / aliased / unbound axes —
     # never specific_names (which disagree across σ_k). Enforcing this keeps the
@@ -265,7 +272,7 @@ def merge_loop_ops(
             return f"${consumer_port_remap[idx]}"
         return arg
 
-    for stmt in consumer.body:
+    for stmt in consumer_flat:
         if isinstance(stmt, Assign):
             new_args = tuple(rewrite_arg(a) for a in stmt.args)
             body.append(Assign(name=stmt.name, op=stmt.op, args=new_args))
@@ -280,12 +287,17 @@ def merge_loop_ops(
             )
             body.append(Select(name=stmt.name, branches=new_branches))
 
-    return LoopOp(
+    # Re-nest the flat merged body into the nested Loop-block form so the
+    # output matches the rest of the Phase-3 pipeline.
+    from deplodock.compiler.ir.loop import _normalize_flat_to_nested
+
+    flat_merged = LoopOp(
         axes=merged_axes,
         inputs=tuple(merged_ports),
         locals=tuple(merged_locals),
         body=tuple(body),
     )
+    return _normalize_flat_to_nested(flat_merged)
 
 
 # ---------------------------------------------------------------------------
@@ -381,13 +393,15 @@ def _fresh_ssa_map(
 ) -> dict[str, str]:
     """Rename producer SSA names (Assign / Select outputs) that collide with
     consumer names. Does not rename locals — those are handled separately."""
+    from deplodock.compiler.ir.loop import flatten_body
+
     producer_ssa: set[str] = set()
-    for stmt in producer.body:
+    for stmt in flatten_body(producer.body):
         if isinstance(stmt, (Assign, Select)):
             producer_ssa.add(stmt.name)
 
     consumer_names: set[str] = {lb.name for lb in consumer.locals}
-    for stmt in consumer.body:
+    for stmt in flatten_body(consumer.body):
         if isinstance(stmt, (Assign, Select)):
             consumer_names.add(stmt.name)
 
@@ -418,11 +432,13 @@ def _all_defined_names(
     local_rename: dict[str, str],
     ssa_rename: dict[str, str],
 ) -> set[str]:
+    from deplodock.compiler.ir.loop import flatten_body
+
     names: set[str] = set()
     for op in (producer, consumer):
         for lb in op.locals:
             names.add(lb.name)
-        for stmt in op.body:
+        for stmt in flatten_body(op.body):
             if isinstance(stmt, (Assign, Select)):
                 names.add(stmt.name)
     names.update(local_rename.values())
