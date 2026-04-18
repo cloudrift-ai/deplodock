@@ -83,22 +83,34 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
         result = launch.loop.forward(*args)
         return np.asarray(result, dtype=np.float32).reshape(out_shape)
 
-    loop = launch.loop
+    input_arrays = [buffers[n] for n in launch.input_names]
+    return execute_loop_op(launch.loop, input_arrays, out_shape)
 
-    dollar = _bind_inputs(loop, launch, buffers)
 
-    # Initialize LocalBuffers to their init values (per-axis-point broadcast shape).
+def execute_loop_op(
+    loop: LoopOp,
+    input_arrays: list[np.ndarray],
+    out_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Numpy interpreter for one ``LoopOp``.
+
+    ``input_arrays[i]`` is the external buffer that feeds ``loop.inputs[i]``
+    (the ``$i`` Port). ``out_shape`` is the shape of the output buffer the
+    kernel writes into. Returns an ndarray of shape ``out_shape``.
+
+    Shared between ``LoopBackend`` (which resolves buffers from a
+    ``LoopProgram``) and ``LoopOp.forward`` (which is called directly from
+    the graph-level numpy walker).
+    """
+    dollar = _bind_inputs(loop, input_arrays)
+
     reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.kind == "reduce")
     values: dict[str, np.ndarray] = dict(dollar)
     lb_map: dict[str, LocalBuffer] = {lb.name: lb for lb in loop.locals}
     for lb in loop.locals:
-        if lb.init is not None:
-            init_val = lb.init.eval({})
-        else:
-            init_val = 0.0
+        init_val = lb.init.eval({}) if lb.init is not None else 0.0
         values[lb.name] = np.asarray(init_val, dtype=np.float32)
 
-    # Output buffer allocation.
     output_array = np.zeros(out_shape, dtype=np.float32)
     output_written = False
 
@@ -113,7 +125,6 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
             reduced = _fold_to_accumulator(src, lb, reduce_axis_positions)
             values[stmt.target] = reduced
         elif isinstance(stmt, Select):
-            # Build coord env using broadcast axis coord arrays.
             axis_env = _broadcast_axis_env(loop.axes)
             branch_vals = [values[b.value] for b in stmt.branches]
             # Walk branches in reverse: the last branch is the catch-all, earlier
@@ -126,8 +137,6 @@ def _exec_launch(launch: LoopLaunch, program: LoopProgram, buffers: dict[str, np
                 mask = b.select.eval(axis_env) if b.select is not None else True
                 val_arr = np.asarray(val, dtype=np.float32)
                 if result is None:
-                    # Seed with the last branch's value expanded to the predicate's
-                    # broadcast shape (scalar True → leave as-is).
                     if isinstance(mask, np.ndarray):
                         result = np.broadcast_to(val_arr, np.broadcast_shapes(val_arr.shape, mask.shape)).astype(np.float32, copy=True)
                     else:
@@ -269,11 +278,7 @@ def _write_output(
         output_array[...] = val
 
 
-def _bind_inputs(
-    loop: LoopOp,
-    launch: LoopLaunch,
-    buffers: dict[str, np.ndarray],
-) -> dict[str, np.ndarray]:
+def _bind_inputs(loop: LoopOp, input_arrays: list[np.ndarray]) -> dict[str, np.ndarray]:
     """Bind each ``$i`` port to a broadcast-ready array.
 
     Ports load in declaration order; each loaded value is exposed as
@@ -282,10 +287,7 @@ def _bind_inputs(
     """
     dollar: dict[str, np.ndarray] = {}
     for i, port in enumerate(loop.inputs):
-        key = f"${i}"
-        buf_name = launch.input_names[i]
-        base = buffers[buf_name]
-        dollar[key] = _apply_port_index(port, base, loop.axes, dollar)
+        dollar[f"${i}"] = _apply_port_index(port, input_arrays[i], loop.axes, dollar)
     return dollar
 
 
@@ -407,4 +409,4 @@ def _align_ranks(args: list[np.ndarray]) -> list[np.ndarray]:
 # Keep Assign imported for IDE cross-references; the interpreter dispatches by isinstance above.
 _ = Assign
 
-__all__ = ["LoopBackend"]
+__all__ = ["LoopBackend", "execute_loop_op"]

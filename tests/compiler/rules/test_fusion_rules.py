@@ -2,13 +2,18 @@
 
 The fusion pass lifts each tensor op into a trivial ``LoopOp`` and then
 merges adjacent ``LoopOp`` pairs via the σ-based merge rule. Tests verify
-post-fixpoint structural properties: kernel count, graph composition (only
-``LoopOp`` / ``InputOp`` / ``ConstantOp`` remain), and that the SSA body
-contains the expected ops.
+post-fixpoint structural properties (kernel count, graph composition,
+expected ops in SSA bodies) *and* numeric correctness — each fixture is
+executed via ``NumpyBackend`` both pre- and post-fusion, and the outputs
+must match. ``LoopOp.forward`` makes the post-fusion run possible without
+a GPU.
 """
 
 from pathlib import Path
 
+import numpy as np
+
+from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Assign, LoopOp, Port, Update, Write
@@ -17,9 +22,39 @@ from deplodock.compiler.rewriter import Pass
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion"
 
+rng = np.random.default_rng(0)
+_backend = NumpyBackend()
+
 
 def _fuse(graph: Graph) -> Graph:
     return Pass.from_directory(RULES_DIR).apply(graph)
+
+
+def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return _backend.run(_backend.compile(graph), input_data=inputs).outputs
+
+
+def _assert_close(before: dict, after: dict, *, rtol=1e-5, atol=1e-5):
+    bvals = list(before.values())
+    avals = list(after.values())
+    assert len(bvals) == len(avals), f"output count mismatch: {len(bvals)} vs {len(avals)}"
+    for i, (b, a) in enumerate(zip(bvals, avals, strict=True)):
+        np.testing.assert_allclose(a, b, rtol=rtol, atol=atol, err_msg=f"output[{i}]")
+
+
+def _assert_correctness(make_graph, inputs):
+    """Run the pre- and post-fusion graph through NumpyBackend; assert outputs match.
+
+    Exercises fusion rules for *semantic* equivalence on top of the
+    structural checks in this file — ``LoopOp.forward`` executes the
+    lifted+merged kernels numerically against the original tensor-IR
+    evaluation.
+    """
+    g_before = make_graph()
+    g_after = _fuse(make_graph())
+    before = _run(g_before, inputs)
+    after = _run(g_after, inputs)
+    _assert_close(before, after)
 
 
 def _kernel_nodes(graph: Graph) -> list:
@@ -226,3 +261,43 @@ def test_ssa_invariants_hold():
                 assert s.value in defined
             elif isinstance(s, Write):
                 assert s.value in defined
+
+
+# ===================================================================
+# Correctness: pre-fusion vs post-fusion numeric equivalence via NumpyBackend.
+# ===================================================================
+
+
+def test_pointwise_chain_correctness():
+    x = rng.standard_normal(8).astype(np.float32)
+    _assert_correctness(_make_pointwise_chain, {"x": x})
+
+
+def test_contraction_correctness():
+    a = rng.standard_normal((4, 8)).astype(np.float32)
+    b = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_correctness(_make_contraction, {"a": a, "b": b})
+
+
+def test_contraction_epilogue_correctness():
+    a = rng.standard_normal((4, 8)).astype(np.float32)
+    b = rng.standard_normal((4, 8)).astype(np.float32)
+    bias = rng.standard_normal(4).astype(np.float32)
+    _assert_correctness(_make_contraction_with_epilogue, {"a": a, "b": b, "bias": bias})
+
+
+def test_softmax_correctness():
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_correctness(_make_softmax, {"x": x})
+
+
+def test_single_elementwise_correctness():
+    def _make():
+        g = Graph()
+        g.add_node(InputOp(), [], Tensor("x", (8,)), node_id="x")
+        g.add_node(ElementwiseOp("neg"), ["x"], Tensor("y", (8,)), node_id="y")
+        g.inputs, g.outputs = ["x"], ["y"]
+        return g
+
+    x = rng.standard_normal(8).astype(np.float32)
+    _assert_correctness(_make, {"x": x})

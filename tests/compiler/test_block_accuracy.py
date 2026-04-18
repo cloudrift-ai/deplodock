@@ -1,10 +1,18 @@
 """End-to-end accuracy test: compile a real transformer block and compare
-against PyTorch eager on GPU.
+against PyTorch eager.
 
 Both models use random weights for a single block (num_hidden_layers=1),
 which keeps the test fast and avoids weight downloads. This catches bugs
 that small synthetic graphs miss — deep IndexMapOp chains, 5D+ tensor
 shapes, multi-kernel pipelines with composed coordinate mappings.
+
+Runs under two backends:
+
+- ``loop`` — ``LoopBackend`` (numpy interpreter), eager on CPU. Always on.
+  Slow (~40s per TinyLlama run) but catches compile/fusion bugs without
+  needing a GPU. Qwen is excluded from the CPU lane because the matmuls
+  scale cubically and CPU numpy takes several minutes.
+- ``cuda`` — ``CudaBackend``, eager on CUDA. Gated by ``@requires_cuda``.
 """
 
 from __future__ import annotations
@@ -21,11 +29,14 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
-def _compile_and_run_block(model_id: str, seq_len: int = 32):
-    """Compile a single transformer block (random weights) and compare against eager."""
+def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str = "cuda"):
+    """Compile a single transformer block (random weights) and compare against eager.
+
+    ``backend_kind`` selects ``"cuda"`` (CudaBackend + GPU eager) or
+    ``"loop"`` (LoopBackend + CPU eager).
+    """
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.torch_trace import trace_module
 
     torch.manual_seed(42)
@@ -41,16 +52,26 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32):
     cos = torch.randn(1, 1, seq_len, head_dim)
     sin = torch.randn(1, 1, seq_len, head_dim)
 
-    # Eager reference.
-    block_gpu = block.cuda()
-    with torch.no_grad():
-        eager_out = block_gpu(x.cuda(), position_embeddings=(cos.cuda(), sin.cuda()))[0]
-    eager_flat = eager_out.cpu().flatten().tolist()
+    if backend_kind == "cuda":
+        from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-    # Compile.
+        block_eager = block.cuda()
+        x_eager, cos_eager, sin_eager = x.cuda(), cos.cuda(), sin.cuda()
+        with torch.no_grad():
+            eager_out = block_eager(x_eager, position_embeddings=(cos_eager, sin_eager))[0]
+        eager_flat = eager_out.cpu().flatten().tolist()
+        backend = CudaBackend()
+    elif backend_kind == "loop":
+        from deplodock.compiler.backend.loop.backend import LoopBackend
+
+        with torch.no_grad():
+            eager_out = block(x, position_embeddings=(cos, sin))[0]
+        eager_flat = eager_out.flatten().tolist()
+        backend = LoopBackend()
+    else:
+        raise ValueError(f"Unknown backend_kind: {backend_kind!r}")
+
     graph = trace_module(block.cpu(), (x,), kwargs={"position_embeddings": (cos, sin)})
-
-    backend = CudaBackend()
     compiled = backend.compile(graph)
 
     input_data: dict[str, np.ndarray] = {}
@@ -89,19 +110,33 @@ def _assert_accuracy(deplodock, eager, max_threshold=1e-3, mean_threshold=1e-4):
     assert max_eager > 0.1, f"eager output is suspiciously small (max_abs={max_eager}); threshold would be trivial"
     max_diff = max(abs(a - e) for a, e in zip(deplodock, eager, strict=True))
     mean_diff = sum(abs(a - e) for a, e in zip(deplodock, eager, strict=True)) / len(deplodock)
-    assert max_diff < max_threshold, f"max_diff={max_diff:.6f} >= {max_threshold:.6f} (mean_diff={mean_diff:.6f}, max_eager={max_eager:.3f})"
+    assert max_diff < max_threshold, (
+        f"max_diff={max_diff:.6f} >= {max_threshold:.6f} (mean_diff={mean_diff:.6f}, max_eager={max_eager:.3f})"
+    )
     assert mean_diff < mean_threshold, f"mean_diff={mean_diff:.6f} >= {mean_threshold:.6f} (max_diff={max_diff:.6f})"
 
 
-@requires_cuda
-def test_tinyllama_block_accuracy():
+@pytest.mark.parametrize(
+    "backend_kind,seq_len",
+    [
+        # CPU lane: ``LoopBackend`` + CPU eager. Always on. ``seq_len=8`` keeps
+        # the numpy interpreter under ~5s while still exercising the full block
+        # (QKV projections, rotary, SDPA + reduce sweeps, softmax, o_proj,
+        # RMSNorm, SwiGLU MLP, residual add).
+        pytest.param("loop", 8, id="cpu"),
+        # CUDA lane: ``CudaBackend`` + GPU eager. Uses the full ``seq_len=32``.
+        pytest.param("cuda", 32, id="cuda", marks=requires_cuda),
+    ],
+)
+def test_tinyllama_block_accuracy(backend_kind, seq_len):
     """TinyLlama block: deplodock output matches PyTorch eager within tolerance."""
-    deplodock, eager = _compile_and_run_block("TinyLlama/TinyLlama-1.1B-Chat-v1.0", seq_len=32)
+    deplodock, eager = _compile_and_run_block("TinyLlama/TinyLlama-1.1B-Chat-v1.0", seq_len=seq_len, backend_kind=backend_kind)
     _assert_accuracy(deplodock, eager)
 
 
 @requires_cuda
 def test_qwen_block_accuracy():
-    """Qwen 7B block: deplodock output matches PyTorch eager within tolerance."""
-    deplodock, eager = _compile_and_run_block("Qwen/Qwen2.5-7B", seq_len=32)
+    """Qwen 7B block on CUDA: deplodock output matches PyTorch eager within tolerance.
+    """
+    deplodock, eager = _compile_and_run_block("Qwen/Qwen2.5-7B", seq_len=32, backend_kind="cuda")
     _assert_accuracy(deplodock, eager)

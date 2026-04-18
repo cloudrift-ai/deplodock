@@ -210,6 +210,52 @@ class LoopOp(Op):
         """Output shape = extents of free axes in declaration order."""
         return tuple(a.extent for a in self.free_axes())
 
+    def forward(self, *inputs):
+        """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
+
+        Enables graph-level execution via ``NumpyBackend`` after fusion has
+        replaced tensor-IR ops with ``LoopOp`` nodes. Output shape is inferred
+        from the kernel's sole ``Write`` statement; callers (``NumpyBackend``)
+        reshape the result to the node's declared output shape, so keep-dim
+        reductions and similar element-count-preserving variations work
+        transparently.
+        """
+        import numpy as np
+
+        from deplodock.compiler.backend.loop.backend import execute_loop_op
+
+        out_shape = self._infer_write_shape()
+        input_arrays = [np.asarray(x, dtype=np.float32) for x in inputs]
+        return execute_loop_op(self, input_arrays, out_shape)
+
+    def _infer_write_shape(self) -> tuple[int, ...]:
+        """Derive the output buffer shape from the kernel's ``Write`` index.
+
+        Evaluates each dim's index Expr over the full iteration space; the
+        per-dim extent is ``max(value) + 1``. Handles plain ``Var(axis)`` (→
+        axis extent), ``Literal(c)`` (→ 1), and affine combinations uniformly.
+        Falls back to ``infer_output_shape`` when no ``Write`` is present.
+        """
+        import numpy as np
+
+        writes = [s for s in self.body if isinstance(s, Write)]
+        if not writes:
+            return self.infer_output_shape()
+        w = writes[0]
+        env: dict[str, object] = {}
+        for i, a in enumerate(self.axes):
+            shape = [1] * len(self.axes)
+            shape[i] = int(a.extent)
+            env[a.name] = np.arange(int(a.extent)).reshape(shape)
+        dims: list[int] = []
+        for e in w.index:
+            vals = e.eval(env)
+            if isinstance(vals, np.ndarray):
+                dims.append(int(vals.max()) + 1)
+            else:
+                dims.append(int(vals) + 1)
+        return tuple(dims)
+
 
 # ---------------------------------------------------------------------------
 # Pretty-printing

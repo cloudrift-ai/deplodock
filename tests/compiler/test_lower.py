@@ -3,13 +3,48 @@
 After compile_graph, every primitive op is inside a LoopOp. Reductions
 live as ``LocalBuffer + Update`` on the LoopOp; elementwise ops as
 ``Assign``; final output as a ``Write``.
+
+Structural fixtures also have a matching ``*_correctness`` test that runs
+the pre-pipeline graph and the post-pipeline graph through ``NumpyBackend``
+(now that ``LoopOp.forward`` can execute fused kernels) and compares the
+outputs — this validates the full decomposition+optimization+fusion chain
+preserves semantics without needing a GPU.
 """
 
+from pathlib import Path
+
+import numpy as np
+
+from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Assign, Update, Write
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
+from deplodock.compiler.rewriter import Rewriter
+
+_RULES_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+_backend = NumpyBackend()
+rng = np.random.default_rng(0)
+
+
+def _fully_rewrite(graph: Graph) -> Graph:
+    """Apply the full rewriter chain (decomposition → optimization → fusion)."""
+    return Rewriter.from_directory(_RULES_DIR).apply(graph)
+
+
+def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return _backend.run(_backend.compile(graph), input_data=inputs).outputs
+
+
+def _assert_pipeline_preserves_semantics(make_graph, inputs, *, rtol=1e-5, atol=1e-5):
+    """Numpy-execute the original graph and the rewritten graph; outputs must match."""
+    before = _run(make_graph(), inputs)
+    after = _run(_fully_rewrite(make_graph()), inputs)
+    bvals, avals = list(before.values()), list(after.values())
+    assert len(bvals) == len(avals)
+    for i, (b, a) in enumerate(zip(bvals, avals, strict=True)):
+        np.testing.assert_allclose(a, b, rtol=rtol, atol=atol, err_msg=f"output[{i}]")
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -134,3 +169,79 @@ def test_compile_graph_produces_kernel_ops():
     result = compile_graph(g)
     launches = result.launches
     assert len(launches) == 1
+
+
+# ===================================================================
+# Correctness: full rewriter (decomp + opt + fusion) preserves semantics.
+# ===================================================================
+
+
+def test_pointwise_add_correctness():
+    def _make():
+        g = Graph()
+        _input(g, "x", (4,))
+        _input(g, "y", (4,))
+        g.add_node(op=ElementwiseOp("add"), inputs=["x", "y"], output=Tensor("z", (4,)), node_id="z")
+        g.inputs, g.outputs = ["x", "y"], ["z"]
+        return g
+
+    x = rng.standard_normal(4).astype(np.float32)
+    y = rng.standard_normal(4).astype(np.float32)
+    _assert_pipeline_preserves_semantics(_make, {"x": x, "y": y})
+
+
+def test_chained_pointwise_correctness():
+    def _make():
+        g = Graph()
+        _input(g, "x", (4,))
+        g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
+        g.add_node(op=ElementwiseOp("neg"), inputs=["e"], output=Tensor("n", (4,)), node_id="n")
+        g.inputs, g.outputs = ["x"], ["n"]
+        return g
+
+    x = rng.standard_normal(4).astype(np.float32)
+    _assert_pipeline_preserves_semantics(_make, {"x": x})
+
+
+def test_reduce_sum_correctness():
+    def _make():
+        g = Graph()
+        _input(g, "x", (4, 8))
+        g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["x"], output=Tensor("r", (4,)), node_id="r")
+        g.inputs, g.outputs = ["x"], ["r"]
+        return g
+
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_pipeline_preserves_semantics(_make, {"x": x})
+
+
+def test_matmul_correctness():
+    from deplodock.compiler.ir.frontend import MatmulOp
+
+    def _make():
+        g = Graph()
+        _input(g, "a", (4, 8))
+        _input(g, "b", (8, 4))
+        g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (4, 4)), node_id="o")
+        g.inputs, g.outputs = ["a", "b"], ["o"]
+        return g
+
+    a = rng.standard_normal((4, 8)).astype(np.float32)
+    b = rng.standard_normal((8, 4)).astype(np.float32)
+    _assert_pipeline_preserves_semantics(_make, {"a": a, "b": b}, rtol=1e-4)
+
+
+def test_mul_fan_out_correctness():
+    def _make():
+        g = Graph()
+        _input(g, "a", (4, 8))
+        _input(g, "b", (4, 8))
+        g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8)), node_id="m")
+        g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["m"], output=Tensor("d", (4,)), node_id="d")
+        g.add_node(op=ElementwiseOp("neg"), inputs=["m"], output=Tensor("n", (4, 8)), node_id="n")
+        g.inputs, g.outputs = ["a", "b"], ["d", "n"]
+        return g
+
+    a = rng.standard_normal((4, 8)).astype(np.float32)
+    b = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_pipeline_preserves_semantics(_make, {"a": a, "b": b})
