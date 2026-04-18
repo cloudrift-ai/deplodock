@@ -170,6 +170,16 @@ def test_rms_norm_like_correctness():
     _assert_correctness(_make_rms_norm_like, {"x": x, "w": w})
 
 
+def test_rms_norm_like_ssa_names_are_canonical():
+    """After rename pass, every SSA name in the body is v0, v1, v2, ... in order."""
+    from deplodock.compiler.ir.loop import Select, flatten_body
+
+    result = _fuse(_make_rms_norm_like())
+    kernel = _kernel_nodes(result)[0]
+    ssa_names = [s.name for s in flatten_body(kernel.op.body) if isinstance(s, (Assign, Select))]
+    assert ssa_names == [f"v{i}" for i in range(len(ssa_names))], f"unexpected SSA names: {ssa_names}"
+
+
 # ===================================================================
 # Reduce chain: mul → reduce_sum (contraction)
 # ===================================================================
