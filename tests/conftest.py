@@ -11,6 +11,91 @@ import yaml
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
 
+# ── LPT static bucketing for pytest-xdist ───────────────────────────
+# Record per-test call durations in the pytest cache; next run partitions
+# items across N worker buckets via LPT (longest-processing-time-first)
+# greedy — each item goes to the currently-lightest bucket. Buckets are
+# tagged via @pytest.mark.xdist_group so `--dist=loadgroup` routes every
+# item in a bucket to the same worker. Theoretical makespan is the load
+# of the heaviest bucket (lower bound = longest single test).
+
+_DURATIONS_KEY = "test_durations/call"
+_CALL_DURATIONS: dict[str, float] = {}
+
+
+def pytest_runtest_logreport(report):
+    if report.when == "call":
+        _CALL_DURATIONS[report.nodeid] = report.duration
+
+
+def pytest_sessionfinish(session):
+    cache = getattr(session.config, "cache", None)
+    if cache is None or not _CALL_DURATIONS:
+        return
+    existing = cache.get(_DURATIONS_KEY, {}) or {}
+    existing.update(_CALL_DURATIONS)
+    cache.set(_DURATIONS_KEY, existing)
+
+
+def _num_workers(config) -> int | None:
+    """Mirror xdist's -n resolution: int, 'auto', 'logical', or None."""
+    try:
+        n = config.getoption("numprocesses", None)
+    except ValueError:
+        return None
+    if n in (None, 0):
+        return None
+    if isinstance(n, int):
+        return n if n >= 1 else None
+    if n in ("auto", "logical"):
+        return os.cpu_count() or 1
+    try:
+        return int(n)
+    except (TypeError, ValueError):
+        return None
+
+
+def pytest_collection_modifyitems(config, items):
+    import heapq
+
+    cache = getattr(config, "cache", None)
+    if cache is None:
+        return
+    durations = cache.get(_DURATIONS_KEY, {}) or {}
+    if not durations:
+        return
+    nworkers = _num_workers(config)
+    if nworkers is None or nworkers < 2:
+        return
+
+    known = sorted(durations[it.nodeid] for it in items if it.nodeid in durations)
+    fallback = known[len(known) // 2] if known else 0.0
+
+    def dur(item) -> float:
+        return durations.get(item.nodeid, fallback)
+
+    sorted_items = sorted(items, key=dur, reverse=True)
+
+    # LPT: pop the lightest bucket, add this item, push back.
+    buckets: list[tuple[float, int, list]] = [(0.0, w, []) for w in range(nworkers)]
+    heapq.heapify(buckets)
+    for it in sorted_items:
+        load, wid, bucket = heapq.heappop(buckets)
+        bucket.append(it)
+        heapq.heappush(buckets, (load + dur(it), wid, bucket))
+
+    # Tag items with their bucket's xdist_group so loadgroup routes them together.
+    # Reorder items so same-bucket tests are contiguous and heaviest bucket leads
+    # (helps xdist dispatch long work first).
+    buckets_sorted = sorted(buckets, key=lambda b: -b[0])
+    reordered: list = []
+    for _load, wid, bucket in buckets_sorted:
+        group = f"w{wid}"
+        for it in bucket:
+            it.add_marker(pytest.mark.xdist_group(group))
+            reordered.append(it)
+    items[:] = reordered
+
 
 @pytest.fixture(scope="session")
 def project_root():
