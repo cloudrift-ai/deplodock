@@ -140,26 +140,35 @@ loop-nest that codegen eventually emits — one ``LoopOp`` maps to one
 | Symbol                        | Role                                                                                                              |
 |-------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | ``Axis``                      | Named iteration variable (``name`` + ``extent`` + ``kind={"free","reduce"}``).                                    |
-| ``LoopOp``                    | One kernel: ``axes`` + ``inputs`` + ``locals`` + SSA ``body``.                                                    |
+| ``LoopOp``                    | One kernel: ``axes`` + ``inputs`` + ``locals`` + nested ``body``.                                                 |
 | ``Port``                      | Access pattern for one external buffer — ``index: tuple[Expr, ...]`` over axis Vars.                              |
 | ``LocalBuffer``               | Thread-local state: scalar accumulator (``combine`` set) or scratch. v1 pins ``shape=()`` and ``scope="thread"``. |
 | ``Assign``                    | SSA body stmt: ``name = op(args)`` with ``op: ElementwiseOp``.                                                    |
 | ``Update``                    | Fold a value into a ``LocalBuffer`` accumulator: ``acc = combine(acc, value)``.                                   |
 | ``Write``                     | Write an SSA value to output ``output`` at ``index``.                                                             |
 | ``Select`` + ``SelectBranch`` | Coord-predicated binding (replaces the old Mux).                                                                  |
-| ``Stmt``                      | Union: ``Assign                                                                                                   |
+| ``Loop``                      | Explicit iteration block: ``axis`` (free or reduce) + nested ``body``. Body runs ``axis.extent`` times.           |
+| ``Stmt``                      | Union: ``Assign \| Update \| Write \| Select \| Loop``.                                                           |
+
+``LoopOp.body`` is a nested tree of ``Loop`` blocks (outer free Loops
+for the grid iteration, inner reduce Loops for per-row sweeps). Reading
+top-to-bottom matches execution order. ``flatten_body(body)`` extracts
+the leaf statement sequence for consumers that want a linear view
+regardless of block structure.
 
 **Rule:** Imports ``base``, ``expr``, and ``tensor`` (``ElementwiseOp``
 only — ``ReduceOp`` is NOT a valid ``Assign.op``). Reductions are
-modeled as ``LocalBuffer`` + ``Update``; the former ``LoopOp.outputs``
-tuple is gone (writes are inline ``Write`` body statements).
+modeled as ``LocalBuffer`` + ``Update`` inside a reduce ``Loop``. SSA
+names defined inside a Loop body are scoped to that body — only
+``LocalBuffer`` accumulators cross Loop boundaries.
 
 ### `loop_plan.py` — analysis: LoopOp → KernelPlan (Layer 2)
 
-Walks a ``LoopOp``'s flat SSA body and produces an explicit nested-loop
-view: ordered ``Loop`` / ``Inline`` steps with accumulators,
-rematerialization sets, and trailing writes. Consumed by the CUDA
-emitter (``backend/cuda/emit.py``) and by the human-readable pretty
+Flattens a ``LoopOp``'s nested body (via ``flatten_body``) and produces
+an explicit nested-loop view as a ``KernelPlan``: ordered ``Loop`` /
+``Inline`` steps with accumulators, rematerialization sets, and
+trailing writes. Consumed by the CUDA emitter (``backend/cuda/emit.py``)
+and by the human-readable pretty
 printer (``pretty_print_plan``) so dump output and codegen stay in sync.
 
 | Symbol              | Role                                                                                                |
