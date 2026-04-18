@@ -626,3 +626,72 @@ def test_has_flat_reduce_helper():
         ),
     )
     assert not has_flat_reduce(flat_pointwise)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: consumers handle nested bodies
+# ---------------------------------------------------------------------------
+
+
+def _flat_reduce_kernel() -> LoopOp:
+    """Flat-body reduce kernel for parity comparison."""
+    return LoopOp(
+        axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
+        inputs=(Port(index=(Var("a0"), Var("k"))),),
+        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        body=(
+            Update(target="acc", value="$0"),
+            Write(output=0, index=(Var("a0"),), value="acc"),
+        ),
+    )
+
+
+def _nested_reduce_kernel() -> LoopOp:
+    """Same kernel as _flat_reduce_kernel, but body is nested via explicit Loops."""
+    from deplodock.compiler.ir.loop import Loop
+
+    return LoopOp(
+        axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
+        inputs=(Port(index=(Var("a0"), Var("k"))),),
+        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        body=(
+            Loop(
+                axis=Axis("a0_outer", 4, "free"),
+                body=(
+                    Loop(axis=Axis("k_inner", 8, "reduce"), body=(Update(target="acc", value="$0"),)),
+                    Write(output=0, index=(Var("a0"),), value="acc"),
+                ),
+            ),
+        ),
+    )
+
+
+def test_analyze_kernel_handles_nested_body():
+    """analyze_kernel should produce the same plan for flat and nested forms."""
+    from deplodock.compiler.ir.loop_plan import analyze_kernel
+
+    flat = _flat_reduce_kernel()
+    nested = _nested_reduce_kernel()
+    shapes = {"$0": (4, 8)}
+    out_shape = (4,)
+    plan_flat = analyze_kernel(flat, shapes, out_shape)
+    plan_nested = analyze_kernel(nested, shapes, out_shape)
+    # Both should produce a Loop step (reduce) and a trailing Write.
+    assert len(plan_flat.steps) == len(plan_nested.steps)
+    assert len(plan_flat.trailing_writes) == len(plan_nested.trailing_writes)
+
+
+def test_execute_loop_op_handles_nested_body():
+    """Numpy interpreter should produce the same output for flat and nested forms."""
+    import numpy as np
+
+    from deplodock.compiler.backend.loop.backend import execute_loop_op
+
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+
+    flat = _flat_reduce_kernel()
+    nested = _nested_reduce_kernel()
+    out_flat = execute_loop_op(flat, [x], (4,))
+    out_nested = execute_loop_op(nested, [x], (4,))
+    np.testing.assert_allclose(out_flat, out_nested, rtol=1e-5)

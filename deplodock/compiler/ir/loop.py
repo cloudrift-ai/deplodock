@@ -472,6 +472,30 @@ def iter_loops(body: tuple[Stmt, ...]) -> list[Loop]:
     return out
 
 
+def flatten_body(body: tuple[Stmt, ...]) -> list[Stmt]:
+    """Extract leaf statements (``Assign`` / ``Update`` / ``Write`` / ``Select``)
+    from ``body``, recursing through ``Loop`` blocks.
+
+    Useful for consumers that operate on the flat statement sequence
+    regardless of block structure (numpy whole-tensor interpreter,
+    Update-boundary segmentation in ``loop_plan.analyze_kernel``). Leaf
+    statements come out in pre-order (parent before children); the Loop
+    wrappers are transparent — their ``axis`` metadata is discarded at
+    this level.
+    """
+    out: list[Stmt] = []
+
+    def walk(stmts: tuple[Stmt, ...]) -> None:
+        for s in stmts:
+            if isinstance(s, Loop):
+                walk(s.body)
+            else:
+                out.append(s)
+
+    walk(body)
+    return out
+
+
 def has_flat_reduce(loop: LoopOp) -> bool:
     """True if ``loop`` carries reduce axes on its ``axes`` tuple but has no
     ``Loop`` block in its body — i.e. the legacy flat representation.

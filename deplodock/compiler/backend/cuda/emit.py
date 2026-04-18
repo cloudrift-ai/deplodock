@@ -115,8 +115,10 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
     buf_name_set = {b.name for b in program.buffers}
 
     # Collect Select predicates gating each port (by SSA name ``$N``).
+    from deplodock.compiler.ir.loop import flatten_body
+
     select_preds: dict[str, list[Expr]] = {}
-    for stmt in loop.body:
+    for stmt in flatten_body(loop.body):
         if isinstance(stmt, Select):
             for branch in stmt.branches:
                 select_preds.setdefault(branch.value, []).append(branch.select)
@@ -602,15 +604,19 @@ def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
 
 
 def _kernel_name(loop: LoopOp, idx: int) -> str:
-    if any(isinstance(s, Update) for s in loop.body):
+    from deplodock.compiler.ir.loop import flatten_body
+
+    if any(isinstance(s, Update) for s in flatten_body(loop.body)):
         return f"k{idx}_reduce"
     return f"k{idx}_pointwise"
 
 
 def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    from deplodock.compiler.ir.loop import flatten_body
+
     loop: LoopOp = launch.loop
     out_shape = program.output_shape(launch)
-    has_reduce = any(isinstance(s, Update) for s in loop.body)
+    has_reduce = any(isinstance(s, Update) for s in flatten_body(loop.body))
     if has_reduce:
         free_extents = [int(a.extent) for a in loop.axes if a.kind == "free"]
         n_output = _numel(tuple(free_extents)) if free_extents else 1
