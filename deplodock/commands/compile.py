@@ -16,9 +16,11 @@ logger = logging.getLogger(__name__)
 
 _IR_STAGE_FILES = {
     "tensor": "10_tensor_ir.txt",
-    "loop": "38_loop_program.txt",
+    "loop": "37_loop_kernels.txt",
+    "loop-program": "38_loop_program.txt",
     "kernel": "39_kernel_ir.txt",
     "cuda": "40_kernels.cu",
+    "cuda-program": "40_program.txt",
 }
 
 
@@ -80,7 +82,7 @@ def _handle_compile_inspect(args):
         dump = CompilerDump(dir=dump_dir)
         dump.dump_input_graph(graph)
 
-        if stage in ("tensor", "loop"):
+        if stage in ("tensor", "loop", "loop-program"):
             compile_graph(graph, dump=dump)
         else:
             CudaBackend(dump=dump).compile(graph)

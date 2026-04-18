@@ -120,10 +120,17 @@ class CompilerDump:
     def dump_loop_program(self, program: LoopProgram) -> None:
         """LoopProgram pretty-print (post-fusion).
 
-        This is the article's "Loop IR" stage — fused LoopOp nodes with named
-        iteration axes (free/reduce), accumulators, and SSA bodies, before any
-        backend-specific lowering.
+        Writes both a kernel-only view (``37_loop_kernels.txt``, one LoopOp
+        per launch with ``=== launch N: ... ===`` separators — analogous to
+        ``39_kernel_ir.txt`` and ``40_kernels.cu``) and the full program view
+        (``38_loop_program.txt``, buffers + launch schedule + bodies).
         """
+        blocks: list[str] = []
+        for i, launch in enumerate(program.launches):
+            blocks.append(f"=== launch {i}: {launch.output_name} ===")
+            blocks.append(program.pretty_print_launch(i))
+            blocks.append("")
+        self._write_text("37_loop_kernels.txt", "\n".join(blocks))
         self._write_text("38_loop_program.txt", program.pretty_print())
 
     def dump_kernel_ir(self, kernels: list[GpuKernel]) -> None:

@@ -45,7 +45,7 @@ Or for a specific test file:
 - `deplodock trace <model> --layer N` — trace a transformer layer to Graph IR (JSON)
 - `deplodock trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)
 - `deplodock compile <model_or_ir> [--layer N] [--dump-dir DIR]` — lower a traced graph to a `LoopProgram` (auto-pulls + traces if given a model ID)
-- `deplodock compile <ir_file> --ir {tensor|loop|kernel|cuda}` — print the requested IR stage to stdout (skips the normal `.compiled.json` save)
+- `deplodock compile <ir_file> --ir {tensor|loop|loop-program|kernel|cuda|cuda-program}` — print the requested IR stage to stdout (skips the normal `.compiled.json` save). `loop`/`kernel`/`cuda` show per-kernel views; `loop-program`/`cuda-program` add program-level context (buffer list + launch schedule).
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
 - `deplodock run <ir_file> [--benchmark] [--dump-dir DIR]` — run a compiled graph IR through the full pipeline
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
