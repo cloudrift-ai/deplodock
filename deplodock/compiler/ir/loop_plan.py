@@ -1,9 +1,9 @@
-"""LoopOp → KernelPlan: explicit nested-loop view of a flat SSA body.
+"""LoopOp → KernelPlan: explicit nested-loop view of a nested Loop-tree body.
 
-Analyzes a flat SSA body to determine iteration spaces, segment
-boundaries, and rematerialization sets. The result is a ``KernelPlan``
-that codegen walks mechanically (no re-derivation needed) and that the
-pretty-printer renders as the loop nest a kernel will execute.
+Walks a ``LoopOp``'s nested ``Loop`` tree to determine iteration spaces,
+segment boundaries, and rematerialization sets. The result is a
+``KernelPlan`` that codegen walks mechanically (no re-derivation needed)
+and that the pretty-printer renders as the loop nest a kernel will execute.
 
 The analysis is backend-agnostic (no CUDA imports).
 """
@@ -16,7 +16,8 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.expr import render as render_expr
-from deplodock.compiler.ir.loop import Assign, LoopOp, Port, Select, Update, Write
+from deplodock.compiler.ir.loop import Assign, LoopOp, Port, Select, Stmt, Update, Write
+from deplodock.compiler.ir.loop import Loop as LoopStmt
 
 # ---------------------------------------------------------------------------
 # Plan data structures
@@ -85,26 +86,29 @@ class KernelPlan:
 
 
 def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -> KernelPlan:
-    """Analyze a kernel's SSA body and produce a KernelPlan."""
-    from deplodock.compiler.ir.loop import flatten_body
+    """Analyze a kernel's nested-``Loop`` body and produce a ``KernelPlan``.
 
+    Walks the body tree: descends outer free ``Loop`` blocks to find the
+    "inner body" (the first level that either has reduce ``Loop`` children
+    or no Loop children at all), then classifies each inner-body child —
+    reduce ``Loop``s become ``plan.Loop`` steps, loose stmts become prelude
+    / post-reduce Inline or Loop-with-stores, direct ``Write`` children
+    become ``TrailingWrite``s.
+    """
     input_ports = _collect_input_ports(kernel)
-    # Flatten any nested Loop blocks; segmentation logic below operates on
-    # the linear statement sequence regardless of block structure.
-    flat = tuple(flatten_body(kernel.body))
-    has_reduce = any(isinstance(s, Update) for s in flat)
+    inner_body = _descend_free_loops(kernel.body)
+    reduce_loops = [s for s in inner_body if isinstance(s, LoopStmt) and s.axis.kind == "reduce"]
+    has_reduce = bool(reduce_loops)
 
     # --- Reduction geometry (None for flat) ---
     if has_reduce:
         pre_shape = tuple(a.extent for a in kernel.axes)
         reduce_axis_idx = next((i for i, a in enumerate(kernel.axes) if a.kind == "reduce"), 0)
         k_size = int(pre_shape[reduce_axis_idx]) if pre_shape else 1
-        n_rows = _n_rows(pre_shape, reduce_axis_idx)
-        n_output = n_rows
-        reduce_axis = reduce_axis_idx
+        n_output = _n_rows(pre_shape, reduce_axis_idx)
     else:
         pre_shape = ()
-        reduce_axis = 0
+        reduce_axis_idx = 0
         k_size = 0
         n_output = _numel(out_shape)
 
@@ -113,50 +117,38 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         reduce_axis_names = {a.name for a in kernel.axes if a.kind == "reduce"}
         per_elem_ports = frozenset(name for name, port in input_ports.items() if _port_references_axis(port, reduce_axis_names))
     else:
-        per_elem_ports = frozenset()  # flat: all ports loaded at idx
+        per_elem_ports = frozenset()
 
-    # Filter body: Writes that appear *after* the last Update become trailing_writes;
-    # Writes that appear inside the per-reduce-iter region are stores_output flags
-    # on the Loop step they trail.
-    trailing_writes: list[TrailingWrite] = []
-    last_update_idx = -1
-    for i, stmt in enumerate(flat):
-        if isinstance(stmt, Update):
-            last_update_idx = i
-    for i, stmt in enumerate(flat):
-        if isinstance(stmt, Write):
-            if last_update_idx >= 0 and i < last_update_idx:
-                # Writes inside the reduce-sweep region are folded into the
-                # enclosing Loop step below; don't emit as trailing.
-                continue
-            trailing_writes.append(TrailingWrite(output=stmt.output, index=stmt.index, value=stmt.value))
+    # --- Classify all SSA values as element-space or row-space (tree-wide) ---
+    from deplodock.compiler.ir.loop import flatten_body
 
-    # --- Classify all SSA values as element-space or row-space ---
+    flat_all = tuple(flatten_body(kernel.body))
     accumulator_names = {lb.name for lb in kernel.locals if lb.combine is not None}
     row_space: set[str] = {name for name in input_ports if name not in per_elem_ports}
     row_space |= accumulator_names
     elem_space: set[str] = set(per_elem_ports)
 
-    for stmt in flat:
+    for stmt in flat_all:
         if isinstance(stmt, Assign):
             if any(a in elem_space for a in stmt.args):
                 elem_space.add(stmt.name)
             else:
                 row_space.add(stmt.name)
         elif isinstance(stmt, Select):
-            # Select output is row-space when all branch values are row-space
-            # (the typical case for absorbed multi-source IndexMapOps, whose
-            # branches read row-space ports).
             if all(br.value in row_space for br in stmt.branches):
                 row_space.add(stmt.name)
             else:
                 elem_space.add(stmt.name)
-        # Update/Write don't define new names in our SSA sense.
 
-    # --- Split body into segments at Update boundaries ---
+    # --- Trailing writes: direct Write children of the inner body ---
+    trailing_writes: list[TrailingWrite] = []
+    for stmt in inner_body:
+        if isinstance(stmt, Write):
+            trailing_writes.append(TrailingWrite(output=stmt.output, index=stmt.index, value=stmt.value))
+
+    # --- Pointwise: no reduce Loops; collect leaf Assign/Select as one Inline ---
     if not has_reduce:
-        # Flat: Writes are trailing; Assigns and Selects fold into one Inline step.
-        inline_body = [s for s in flat if isinstance(s, Assign | Select)]
+        inline_body = [s for s in flatten_body(inner_body) if isinstance(s, (Assign, Select))]
         steps: list[Step] = [Inline(body=tuple(inline_body))] if inline_body else []
         return KernelPlan(
             steps=tuple(steps),
@@ -165,94 +157,72 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
             trailing_writes=tuple(trailing_writes),
         )
 
+    # --- Reduce: build steps by walking inner_body left-to-right. ---
     acc_map = {lb.name: lb for lb in kernel.locals}
+    steps = []
+    prior_ew: list[Assign] = []
+    acc_count = 0
 
-    # Hoist leading row-space Select statements (emitted by rule 001 when
-    # absorbing multi-source IndexMapOps) into an Inline prelude — computed
-    # once per output coord, before any K-loop. They land in ``row_space``
-    # above so downstream Loop segments see their SSA name as row-space.
-    body_list = list(flat)
+    # Hoist leading row-space Selects (from absorbed multi-source IndexMapOps)
+    # into an Inline prelude — computed once per output coord, before any K-loop.
+    idx = 0
     prelude_selects: list[Select] = []
-    while body_list and isinstance(body_list[0], Select) and body_list[0].name in row_space:
-        prelude_selects.append(body_list[0])
-        body_list.pop(0)
-
-    steps: list[Step] = []
+    while idx < len(inner_body) and isinstance(inner_body[idx], Select) and inner_body[idx].name in row_space:
+        prelude_selects.append(inner_body[idx])
+        idx += 1
     if prelude_selects:
         steps.append(Inline(body=tuple(prelude_selects)))
 
-    segments = _split_at_updates(tuple(body_list))
-    acc_count = 0
-    prior_ew: list[Assign] = []
+    # Walk remaining children: reduce Loops → Loop steps; trailing stmts → Inline/Loop-with-stores.
+    tail_stmts: list[Assign | Select] = []
+    tail_writes: list[Write] = []
+    for stmt in inner_body[idx:]:
+        if isinstance(stmt, LoopStmt) and stmt.axis.kind == "reduce":
+            step = _reduce_loop_to_step(stmt, acc_map, acc_count, prior_ew, row_space, pre_shape, reduce_axis_idx, k_size)
+            if step is None:
+                continue
+            steps.append(step)
+            if step.accum is not None:
+                acc_count += 1
+            # Bring this reduce Loop's element-space Assigns into scope for later remat.
+            prior_ew.extend(s for s in stmt.body if isinstance(s, Assign))
+        elif isinstance(stmt, (Assign, Select)):
+            tail_stmts.append(stmt)
+        elif isinstance(stmt, Write):
+            tail_writes.append(stmt)
+        # Non-reduce Loop children at this level — pass through silently; free-axis
+        # tiling is a future story and won't happen in current producers.
 
-    for seg in segments:
-        # A segment is a sequence of statements terminating at Update or at end.
-        last = seg[-1]
-        ew = [s for s in seg[:-1] if isinstance(s, (Assign, Select))]
-        if isinstance(last, Update):
-            remat = _remat_set(seg, prior_ew, row_space)
+    # Tail after last reduce Loop.
+    if tail_stmts:
+        if _touches_elem_space(tail_stmts, elem_space):
+            remat = _remat_set(tail_stmts, prior_ew, row_space)
             remat_assigns = tuple(a for a in prior_ew if a.name in remat)
-            lb = acc_map[last.target]
-            combine_fn = lb.combine.fn if lb.combine is not None else "add"
-            identity = _literal_value(lb.init)
-            accum = Accum(
-                var=f"acc{acc_count}",
-                fn=combine_fn,
-                identity=identity,
-                src=last.value,
-                result=last.target,
-            )
+            store_idx: tuple[Expr, ...] = ()
+            store_val = ""
+            store_out = 0
+            if tail_writes:
+                w = tail_writes[-1]
+                store_idx = w.index
+                store_val = w.value
+                store_out = w.output
+                trailing_writes = [t for t in trailing_writes if not (t.index == w.index and t.value == w.value)]
             steps.append(
                 Loop(
                     recompute=remat_assigns,
-                    body=tuple(ew),
-                    accum=accum,
-                    stores_output=False,
+                    body=tuple(tail_stmts),
+                    accum=None,
+                    stores_output=bool(tail_writes),
+                    store_index=store_idx,
+                    store_value=store_val,
+                    store_output_idx=store_out,
                     iter_shape=pre_shape,
-                    reduce_axis=reduce_axis,
+                    reduce_axis=reduce_axis_idx,
                     k_size=k_size,
                 )
             )
-            acc_count += 1
-            prior_ew.extend(s for s in ew if isinstance(s, Assign))
         else:
-            # Tail segment after the last Update.
-            # If any stmt in the tail references an elem_space value, emit a Loop
-            # so the per-element recomputation can reach it.
-            tail_stmts = [s for s in seg if isinstance(s, (Assign, Select))]
-            tail_writes = [s for s in seg if isinstance(s, Write)]
-            if tail_stmts and _touches_elem_space(tail_stmts, elem_space):
-                remat = _remat_set(seg, prior_ew, row_space)
-                remat_assigns = tuple(a for a in prior_ew if a.name in remat)
-                # If there are Writes in the tail, emit them inside the Loop body.
-                store_idx: tuple[Expr, ...] = ()
-                store_val = ""
-                store_out = 0
-                if tail_writes:
-                    w = tail_writes[-1]
-                    store_idx = w.index
-                    store_val = w.value
-                    store_out = w.output
-                    # The Write is now inside the loop; remove it from trailing.
-                    trailing_writes = [t for t in trailing_writes if not (t.index == w.index and t.value == w.value)]
-                steps.append(
-                    Loop(
-                        recompute=remat_assigns,
-                        body=tuple(tail_stmts),
-                        accum=None,
-                        stores_output=bool(tail_writes),
-                        store_index=store_idx,
-                        store_value=store_val,
-                        store_output_idx=store_out,
-                        iter_shape=pre_shape,
-                        reduce_axis=reduce_axis,
-                        k_size=k_size,
-                    )
-                )
-                prior_ew.extend(s for s in tail_stmts if isinstance(s, Assign))
-            elif tail_stmts:
-                steps.append(Inline(body=tuple(tail_stmts)))
-                prior_ew.extend(s for s in tail_stmts if isinstance(s, Assign))
+            steps.append(Inline(body=tuple(tail_stmts)))
 
     return KernelPlan(
         steps=tuple(steps),
@@ -260,6 +230,94 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         n_output=n_output,
         trailing_writes=tuple(trailing_writes),
     )
+
+
+def _descend_free_loops(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Descend through outer free ``Loop`` wrappers to the innermost body.
+
+    Keeps descending as long as ``body`` is a single free ``Loop`` — the free
+    axes are grid dims already captured in ``LoopOp.axes`` via the property
+    walk. Stops at the first level with either multiple children or a non-
+    free-Loop child (a reduce Loop, an Assign, a Write, etc.).
+    """
+    while len(body) == 1 and isinstance(body[0], LoopStmt) and body[0].axis.kind == "free":
+        body = body[0].body
+    return body
+
+
+def _reduce_loop_to_step(
+    loop: LoopStmt,
+    acc_map: dict,
+    acc_count: int,
+    prior_ew: list[Assign],
+    row_space: set[str],
+    pre_shape: tuple,
+    reduce_axis_idx: int,
+    k_size: int,
+) -> Loop | None:
+    """Convert a reduce ``Loop`` block into a ``plan.Loop`` step.
+
+    Two shapes supported:
+    - Body ends in ``Update``: classic reduce segment with an accumulator.
+    - Body ends in ``Write`` with no ``Update``: per-K elementwise pass that
+      stores each element (``stores_output=True``). Used by softmax's
+      writeback sweep.
+    """
+    body = loop.body
+    if not body:
+        return None
+
+    updates = [s for s in body if isinstance(s, Update)]
+    writes = [s for s in body if isinstance(s, Write)]
+    ew = [s for s in body if isinstance(s, (Assign, Select))]
+
+    if updates:
+        # Classic reduce segment: last Update drives the accumulator.
+        last_update = updates[-1]
+        # Elementwise stmts are those before the last Update.
+        last_idx = body.index(last_update)
+        ew = [s for s in body[:last_idx] if isinstance(s, (Assign, Select))]
+        remat = _remat_set(list(body), prior_ew, row_space)
+        remat_assigns = tuple(a for a in prior_ew if a.name in remat)
+        lb = acc_map[last_update.target]
+        combine_fn = lb.combine.fn if lb.combine is not None else "add"
+        identity = _literal_value(lb.init)
+        accum = Accum(
+            var=f"acc{acc_count}",
+            fn=combine_fn,
+            identity=identity,
+            src=last_update.value,
+            result=last_update.target,
+        )
+        return Loop(
+            recompute=remat_assigns,
+            body=tuple(ew),
+            accum=accum,
+            stores_output=False,
+            iter_shape=pre_shape,
+            reduce_axis=reduce_axis_idx,
+            k_size=k_size,
+        )
+
+    # No Update — per-K elementwise pass. Must have Writes to justify iteration.
+    if writes:
+        remat = _remat_set(list(body), prior_ew, row_space)
+        remat_assigns = tuple(a for a in prior_ew if a.name in remat)
+        w = writes[-1]
+        return Loop(
+            recompute=remat_assigns,
+            body=tuple(ew),
+            accum=None,
+            stores_output=True,
+            store_index=w.index,
+            store_value=w.value,
+            store_output_idx=w.output,
+            iter_shape=pre_shape,
+            reduce_axis=reduce_axis_idx,
+            k_size=k_size,
+        )
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -290,20 +348,6 @@ def _expr_references_any(expr, names: set[str]) -> bool:
         if isinstance(c, (list, tuple)):
             children.extend(c)
     return any(_expr_references_any(c, names) for c in children)
-
-
-def _split_at_updates(body: tuple) -> list[list]:
-    """Split SSA body into segments, cutting after each Update."""
-    segments: list[list] = []
-    current: list = []
-    for stmt in body:
-        current.append(stmt)
-        if isinstance(stmt, Update):
-            segments.append(current)
-            current = []
-    if current:
-        segments.append(current)
-    return segments
 
 
 def _touches_elem_space(stmts: list, elem_space: set[str]) -> bool:
