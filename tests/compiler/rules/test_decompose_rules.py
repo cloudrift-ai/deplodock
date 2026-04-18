@@ -221,6 +221,67 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
 
 
 # ===================================================================
+# Softmax decomposition: softmax(x, dim) → exp(x-max) / sum(exp(x-max))
+# ===================================================================
+
+
+def _make_softmax_graph(dim_extent=8, seq_len=4, axis=-1):
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, seq_len, dim_extent)), node_id="x")
+    g.add_node(op=ConstantOp(name="axis", value=float(axis)), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
+    g.add_node(
+        op=ElementwiseOp(fn="softmax"),
+        inputs=["x", "axis"],
+        output=Tensor("out", (1, seq_len, dim_extent)),
+        node_id="out",
+    )
+    g.inputs, g.outputs = ["x"], ["out"]
+    return g
+
+
+def test_softmax_decomposes():
+    result = _apply(_make_softmax_graph(), _load("008_decompose_softmax.py"))
+    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    assert "softmax" not in fns
+    assert {"sub", "exp", "div"} <= fns
+    reduce_fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ReduceOp)}
+    assert {"max", "sum"} <= reduce_fns
+
+
+def test_softmax_preserves_io_shape():
+    g = _make_softmax_graph(dim_extent=8, seq_len=4)
+    result = _apply(g, _load("008_decompose_softmax.py"))
+    assert result.nodes[result.outputs[0]].output.shape == (1, 4, 8)
+
+
+def test_softmax_correctness():
+    g = _make_softmax_graph(dim_extent=8, seq_len=4)
+    # Numpy backend doesn't know how to execute the fused softmax op, so we
+    # compare the decomposed graph against a numpy reference directly.
+    x = rng.standard_normal((1, 4, 8)).astype(np.float32)
+    shifted = x - x.max(axis=-1, keepdims=True)
+    expected = np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
+    after = _run(_apply(g, _load("008_decompose_softmax.py")), {"x": x})
+    np.testing.assert_allclose(list(after.values())[0], expected, rtol=1e-5, atol=1e-6)
+
+
+def test_softmax_trace_to_tensor_ir_primitives_only():
+    """End-to-end: torch.nn.Softmax → trace → decomposition yields primitives only."""
+    import torch
+
+    from deplodock.compiler.rewriter import Rewriter
+    from deplodock.compiler.torch_trace import trace_module
+
+    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules"
+    graph = trace_module(torch.nn.Softmax(dim=-1), (torch.randn(1, 4, 8),))
+    pre = Rewriter.from_directory(rules_dir, pass_order=["decomposition", "optimization"])
+    decomposed = pre.apply(graph)
+    for n in decomposed.nodes.values():
+        if isinstance(n.op, ElementwiseOp):
+            assert n.op.fn != "softmax", f"softmax survived decomposition at {n.output.name}"
+
+
+# ===================================================================
 # SDPA decomposition: sdpa(Q, K, V) → QK^T → scale → softmax → @V
 # ===================================================================
 
