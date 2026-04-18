@@ -86,8 +86,13 @@ class KernelPlan:
 
 def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -> KernelPlan:
     """Analyze a kernel's SSA body and produce a KernelPlan."""
+    from deplodock.compiler.ir.loop import flatten_body
+
     input_ports = _collect_input_ports(kernel)
-    has_reduce = any(isinstance(s, Update) for s in kernel.body)
+    # Flatten any nested Loop blocks; segmentation logic below operates on
+    # the linear statement sequence regardless of block structure.
+    flat = tuple(flatten_body(kernel.body))
+    has_reduce = any(isinstance(s, Update) for s in flat)
 
     # --- Reduction geometry (None for flat) ---
     if has_reduce:
@@ -115,10 +120,10 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     # on the Loop step they trail.
     trailing_writes: list[TrailingWrite] = []
     last_update_idx = -1
-    for i, stmt in enumerate(kernel.body):
+    for i, stmt in enumerate(flat):
         if isinstance(stmt, Update):
             last_update_idx = i
-    for i, stmt in enumerate(kernel.body):
+    for i, stmt in enumerate(flat):
         if isinstance(stmt, Write):
             if last_update_idx >= 0 and i < last_update_idx:
                 # Writes inside the reduce-sweep region are folded into the
@@ -132,7 +137,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     row_space |= accumulator_names
     elem_space: set[str] = set(per_elem_ports)
 
-    for stmt in kernel.body:
+    for stmt in flat:
         if isinstance(stmt, Assign):
             if any(a in elem_space for a in stmt.args):
                 elem_space.add(stmt.name)
@@ -151,7 +156,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     # --- Split body into segments at Update boundaries ---
     if not has_reduce:
         # Flat: Writes are trailing; Assigns and Selects fold into one Inline step.
-        inline_body = [s for s in kernel.body if isinstance(s, Assign | Select)]
+        inline_body = [s for s in flat if isinstance(s, Assign | Select)]
         steps: list[Step] = [Inline(body=tuple(inline_body))] if inline_body else []
         return KernelPlan(
             steps=tuple(steps),
@@ -166,7 +171,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     # absorbing multi-source IndexMapOps) into an Inline prelude — computed
     # once per output coord, before any K-loop. They land in ``row_space``
     # above so downstream Loop segments see their SSA name as row-space.
-    body_list = list(kernel.body)
+    body_list = list(flat)
     prelude_selects: list[Select] = []
     while body_list and isinstance(body_list[0], Select) and body_list[0].name in row_space:
         prelude_selects.append(body_list[0])

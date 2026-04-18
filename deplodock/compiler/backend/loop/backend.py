@@ -114,7 +114,12 @@ def execute_loop_op(
     output_array = np.zeros(out_shape, dtype=np.float32)
     output_written = False
 
-    for stmt in loop.body:
+    # Flatten any nested Loop blocks; whole-tensor numpy semantics don't care
+    # about block boundaries — Updates still fold over reduce axes, Assigns
+    # still broadcast. Loop axes come from loop.axes as today.
+    from deplodock.compiler.ir.loop import flatten_body
+
+    for stmt in flatten_body(loop.body):
         if isinstance(stmt, Assign):
             args = [values[a] for a in stmt.args]
             assert isinstance(stmt.op, ElementwiseOp)
