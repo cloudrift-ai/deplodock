@@ -69,7 +69,13 @@ class CompilerDump:
     # --- Dump methods ---
 
     def dump_input_graph(self, graph: Graph) -> None:
+        """Graph as captured by the tracer, before any rewriter passes.
+
+        Dumped twice: ``00_input_graph.json`` (round-trippable) and
+        ``00_input_graph.txt`` (human-readable, for ``compile --ir torch``).
+        """
         self._write_json("00_input_graph.json", graph.to_dict())
+        self._write_text("00_input_graph.txt", graph.pretty_print())
 
     def dump_tensor_ir(self, graph: Graph) -> None:
         """Graph after decomposition + optimization passes, before fusion.
