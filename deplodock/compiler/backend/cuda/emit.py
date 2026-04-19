@@ -462,11 +462,18 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
     # Load per-row ports upfront. Threading ``load_env`` forward lets a later
     # port's index Expr reference an earlier port by name (e.g. gather: the
     # data port's axis index reads ``$0`` — the already-loaded index value).
+    # Skip ports whose index references a body-form Load's SSA name — those
+    # values haven't been bound yet; the body walker's Load stmt will materialize
+    # the read at its actual scope.
     load_env: dict[str, Expr] = dict(flat_env)
+    body_load_names: set[str] = {ld.name for ld in loop.loads}
     for key, (port, buf_name, src_shape) in port_info.items():
-        if key not in plan.per_elem_ports:
-            values[key] = _emit_port_load(port, buf_name, src_shape, load_env)
-            load_env[key] = values[key]
+        if key in plan.per_elem_ports:
+            continue
+        if any(_expr_refs_any_name(e, body_load_names) for e in port.index):
+            continue
+        values[key] = _emit_port_load(port, buf_name, src_shape, load_env)
+        load_env[key] = values[key]
 
     loop_count = 0
     for step in plan.steps:
@@ -485,14 +492,16 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
                     values[stmt.name] = Var(tname)
                 elif isinstance(stmt, Load):
                     # Body-form Load: emit a port-load expression via the same
-                    # machinery _collect_port_info feeds. Source index maps
-                    # 1:1 to the legacy $N port ordering during the migration.
+                    # machinery _collect_port_info feeds. Later Loads can
+                    # reference this Load's SSA name in their index (gather),
+                    # so thread the binding back into ``load_env``.
                     key = f"${stmt.source}"
                     port, buf_name, src_shape = port_info[key]
-                    expr = _emit_port_load(Port(index=stmt.index), buf_name, src_shape, flat_env)
+                    expr = _emit_port_load(Port(index=stmt.index), buf_name, src_shape, load_env)
                     tname = _fresh(name_seq)
                     stmts.append(VarDecl(dtype="float", name=tname, init=expr))
                     values[stmt.name] = Var(tname)
+                    load_env[stmt.name] = Var(tname)
 
         elif isinstance(step, Loop):
             k_var_name = f"k{loop_count}"
@@ -573,6 +582,20 @@ def _collect_port_info(
         src_shape = program.shape(buf_name) if buf_name in buf_name_set else dollar_shapes.get(key, ())
         port_info[key] = (port, buf_name, src_shape)
     return port_info
+
+
+def _expr_refs_any_name(expr: Expr, names: set[str]) -> bool:
+    """True if any ``Var(name)`` in ``expr`` refers to a name in ``names``."""
+    if isinstance(expr, Var):
+        return expr.name in names
+    for attr in ("left", "right", "cond", "if_true", "if_false", "expr"):
+        c = getattr(expr, attr, None)
+        if c is not None and _expr_refs_any_name(c, names):
+            return True
+    args = getattr(expr, "args", None)
+    if isinstance(args, (list, tuple)):
+        return any(_expr_refs_any_name(a, names) for a in args)
+    return False
 
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:

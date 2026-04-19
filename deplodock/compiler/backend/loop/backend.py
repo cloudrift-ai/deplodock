@@ -304,9 +304,16 @@ def _bind_inputs(loop: LoopOp, input_arrays: list[np.ndarray]) -> dict[str, np.n
     Ports load in declaration order; each loaded value is exposed as
     ``$i`` to later ports so data-dependent access patterns (e.g. gather)
     can reference an earlier port's value in their index Expr.
+
+    Ports whose index references an SSA name that hasn't been bound yet
+    (a body-form ``Load`` will emit the value later) are skipped; the
+    body walker handles them on demand.
     """
     dollar: dict[str, np.ndarray] = {}
+    body_load_names: set[str] = {ld.name for ld in loop.loads}
     for i, port in enumerate(loop.inputs):
+        if any(_references_ssa(e, body_load_names) for e in port.index):
+            continue
         dollar[f"${i}"] = _apply_port_index(port, input_arrays[i], loop.axes, dollar)
     return dollar
 
@@ -321,9 +328,11 @@ def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...], doll
     for e in port.index:
         _collect_used_axis_names(e, axis_names, used_axes)
 
-    # A reference to another port (``$N``) implicitly spans the full iter
-    # shape — conservatively extend used_axes to cover all axes in that case.
-    if any(_references_dollar(e) for e in port.index):
+    # A reference to another port's loaded value — via ``$N`` (legacy) or a
+    # body-form Load's SSA name (bound in ``dollar``) — implicitly spans the
+    # full iter shape; conservatively extend used_axes to cover all axes.
+    ssa_names: set[str] = {k for k in dollar if not k.startswith("$")}
+    if any(_references_dollar(e) or _references_ssa(e, ssa_names) for e in port.index):
         used_axes = set(axis_names)
 
     bshape = tuple(int(a.extent) if a.name in used_axes else 1 for a in axes)
@@ -389,6 +398,21 @@ def _references_dollar(expr) -> bool:
     args = getattr(expr, "args", None)
     if isinstance(args, (list, tuple)):
         return any(_references_dollar(a) for a in args)
+    return False
+
+
+def _references_ssa(expr, ssa_names: set[str]) -> bool:
+    """True if ``expr`` contains any ``Var(name)`` reference to an SSA
+    binding in ``ssa_names`` (values from previously-emitted Loads)."""
+    if isinstance(expr, Var):
+        return expr.name in ssa_names
+    for attr in ("left", "right", "cond", "if_true", "if_false", "expr"):
+        c = getattr(expr, attr, None)
+        if c is not None and _references_ssa(c, ssa_names):
+            return True
+    args = getattr(expr, "args", None)
+    if isinstance(args, (list, tuple)):
+        return any(_references_ssa(a, ssa_names) for a in args)
     return False
 
 
