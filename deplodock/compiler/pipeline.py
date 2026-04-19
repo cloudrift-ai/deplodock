@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.graph import Graph
+from deplodock.compiler.ir.loop_ir import LoopOp
+from deplodock.compiler.ir.simplify import simplify_loop_op
 from deplodock.compiler.program.loop import LoopProgram
 from deplodock.compiler.rewriter import Rewriter
 
@@ -42,6 +44,10 @@ def compile_graph(graph: Graph, name: str = "prog", dump: CompilerDump | None = 
 
     rewriter_fusion = Rewriter.from_directory(_RULES_DIR, pass_order=["fusion"])
     graph = rewriter_fusion.apply(graph)
+
+    for node in graph.nodes.values():
+        if isinstance(node.op, LoopOp):
+            node.op = simplify_loop_op(node.op)
 
     program = LoopProgram.from_graph(graph, name=name)
     if dump is not None:

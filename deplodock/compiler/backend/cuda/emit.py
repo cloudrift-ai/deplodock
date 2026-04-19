@@ -31,6 +31,7 @@ from deplodock.compiler.ir.kernel_ir import (
 )
 from deplodock.compiler.ir.loop_ir import Assign as IrAssignStmt
 from deplodock.compiler.ir.loop_ir import Axis, LoopOp, Port, Select, Update
+from deplodock.compiler.ir.simplify import simplify_kernel
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
 
@@ -71,6 +72,7 @@ def compile_kernels(program: LoopProgram, dump: CompilerDump | None = None) -> G
             logger.warning("OOB port access: %s", w)
         kname = _kernel_name(launch.loop, i)
         gpu_kernel, arg_order = emit_kernel(launch, kname, program)
+        gpu_kernel = simplify_kernel(gpu_kernel)
         source = _emit_kernel_source(gpu_kernel)
         grid, block = _launch_config(launch, program)
         launches.append(

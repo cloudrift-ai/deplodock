@@ -81,6 +81,24 @@ Hosts nodes from every dialect as the rewriter progresses.
 **Rule:** Imports ``base``; lazy-imports ``frontend``/``tensor``/``loop``
 inside ``Graph.from_dict`` for op-class reconstruction.
 
+### `simplify.py` — generic Expr / IR simplifier (all layers)
+
+Pure, idempotent bottom-up rewrite over the shared ``Expr`` AST plus the
+GPU-specific extensions. Applied at every pipeline stage that emits IR
+the user might inspect: after fusion (on ``LoopOp`` Expr fields) and
+after kernel emission (on ``GpuKernel`` statement trees).
+
+| Symbol                                       | Role                                                                                  |
+|----------------------------------------------|---------------------------------------------------------------------------------------|
+| ``Interval`` / ``Context``                   | Integer-range context threaded through the walk (Axis extents / ForLoop bounds / IfStmt conds). |
+| ``simplify_expr(e, ctx)``                    | Core Expr rewriter: const fold, algebraic identities, Ternary collapse, range-based comparison folding. |
+| ``infer_range(e, ctx)``                      | Companion range analysis over integer Exprs.                                          |
+| ``simplify_loop_op(op)``                     | LoopOp walker — seeds Context from axis extents.                                      |
+| ``simplify_kernel(k)``                       | GpuKernel walker — pushes ranges from VarDecl (nonneg thread-index compositions) + IfStmt conds + ForLoop bounds. |
+
+**Rule:** Imports ``expr``, ``loop_ir``, ``kernel_ir``. No dependencies
+on passes / pipeline / backend — pure IR → IR.
+
 ### `expr.py` — shared expression sublanguage (all layers)
 
 Backend-agnostic expression AST used by both the loop IR (coord maps,

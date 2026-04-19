@@ -19,6 +19,7 @@
 │  LAYER 2 · Lowering → LoopProgram                                                                                    │
 │                                                                                                                      │
 │  pipeline.py: compile_graph(graph) -> LoopProgram                                                                    │
+│    After fusion, ir/simplify.simplify_loop_op is applied to every LoopOp (const fold + clamp elimination).           │
 │    LoopProgram (program/loop.py):                                                                                    │
 │       LoopBuffer (shape, role) × N                                                                                   │
 │       LoopLaunch (LoopOp + input/output buffer names) × N                                                            │
