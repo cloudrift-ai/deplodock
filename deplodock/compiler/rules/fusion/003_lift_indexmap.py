@@ -27,7 +27,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     if not isinstance(op, IndexMapOp):
         return None
 
-    axes = tuple(Axis(name=f"a{i}", extent=int(d), kind="free") for i, d in enumerate(op.out_shape))
+    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(op.out_shape))
     mapping = {f"{PLACEHOLDER_PREFIX}{i}": Var(a.name) for i, a in enumerate(axes)}
     write_index = tuple(Var(a.name) for a in axes)
 

@@ -341,11 +341,11 @@ def _axis_env_for_flat(axes: tuple[Axis, ...], flat_idx: Expr) -> dict[str, Expr
     return env
 
 
-def _axis_env_for_reduce(axes: tuple[Axis, ...], row_idx: Expr, k: Expr) -> dict[str, Expr]:
+def _axis_env_for_reduce(axes: tuple[Axis, ...], reduce_names: frozenset[str], row_idx: Expr, k: Expr) -> dict[str, Expr]:
     """Axis env for a reduce kernel: row_idx unpacks free axes, k is the reduce axis."""
     env: dict[str, Expr] = {}
-    free = [a for a in axes if a.kind == "free"]
-    reduce_a = next((a for a in axes if a.kind == "reduce"), None)
+    free = [a for a in axes if a.name not in reduce_names]
+    reduce_a = next((a for a in axes if a.name in reduce_names), None)
 
     remainder = row_idx
     extents = [int(a.extent) for a in free]
@@ -455,7 +455,8 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
 
     port_info = _collect_port_info(loop, launch, program, dollar_shapes)
 
-    free_axes = tuple(a for a in loop.axes if a.kind == "free")
+    reduce_names = loop.reduce_axis_names
+    free_axes = tuple(a for a in loop.axes if a.name not in reduce_names)
     flat_env = _axis_env_for_flat(free_axes, idx)
 
     # Load per-row ports upfront. Threading ``load_env`` forward lets a later
@@ -493,7 +494,7 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
             inner: list[Stmt] = []
             loop_values: dict[str, Expr] = dict(values)
 
-            axis_env = _axis_env_for_reduce(loop.axes, idx, k_var)
+            axis_env = _axis_env_for_reduce(loop.axes, reduce_names, idx, k_var)
 
             for key, (port, buf_name, src_shape) in port_info.items():
                 if key in plan.per_elem_ports:
@@ -661,7 +662,8 @@ def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int,
     out_shape = program.output_shape(launch)
     has_reduce = any(isinstance(s, Update) for s in flatten_body(loop.body))
     if has_reduce:
-        free_extents = [int(a.extent) for a in loop.axes if a.kind == "free"]
+        reduce_names = loop.reduce_axis_names
+        free_extents = [int(a.extent) for a in loop.axes if a.name not in reduce_names]
         n_output = _numel(tuple(free_extents)) if free_extents else 1
     else:
         n_output = _numel(out_shape) if out_shape else _numel(tuple(a.extent for a in loop.axes))

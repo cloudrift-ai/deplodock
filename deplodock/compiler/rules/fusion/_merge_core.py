@@ -20,13 +20,12 @@ The producer's post-reduce body is instantiated *per σ_k*, with distinct
 SSA names and a distinct bridge value that the matching consumer port ref
 is rewritten to.
 
-Legality:
-- every unbound producer axis must be kind ``"reduce"``;
-- the merged kernel must have at most one reduce axis (single-reduce CUDA
-  backend);
+Legality (semantic only — scheduling lives in the backend):
+- every unbound producer axis must be a reduce axis (leaking a producer
+  free axis would require replicating producer work per consumer slot);
 - the producer's pre-reduce statements must not reference axes that are
-  bound differently across σ_k (doing so would require replicating the
-  Update, which is semantically ambiguous).
+  bound differently across σ_k (replicating the Update under disagreeing
+  bindings is semantically ambiguous).
 """
 
 from __future__ import annotations
@@ -93,19 +92,9 @@ def merge_loop_ops(
         return None
     write = writes[0]
 
-    # Rank-growth guard: refuse to inline a reducing producer into a consumer
-    # whose Write has higher rank. The extra consumer free dims would make
-    # the producer's reduce body run once per iteration of each new dim —
-    # the MLP pathology where gate*up (reduce over hidden) would feed a
-    # rank-4 broadcast-then-mul before down_proj. Softmax-style merges are
-    # unaffected: under rank-preserving reductions (keepdim), the producer's
-    # Write and the consumer's Write have the same rank.
-    consumer_writes = [s for s in consumer_flat if isinstance(s, Write) and s.output == 0]
-    if consumer_writes and any(a.kind == "reduce" for a in producer.axes) and len(consumer_writes[0].index) > len(write.index):
-        return None
-
     producer_axis_names = {a.name for a in producer.axes}
     consumer_axis_by_name = {a.name: a for a in consumer.axes}
+    producer_reduce_names = producer.reduce_axis_names
 
     # Solve σ per consumer port, applying axis aliases.
     sigmas: dict[int, dict[str, Expr]] = {}
@@ -147,7 +136,7 @@ def merge_loop_ops(
     # time the reduction has a singleton batch dim (e.g. (1, N, D) → (1, N, 1)).
     # Use dtype="int" — these axes are always used as array indices.
     zero_idx = Literal(0, dtype="int")
-    singleton_free = [a for a in producer.axes if a.name not in bound_in_all and a.kind == "free" and int(a.extent) == 1]
+    singleton_free = [a for a in producer.axes if a.name not in bound_in_all and a.name not in producer_reduce_names and int(a.extent) == 1]
     for a in singleton_free:
         for s in sigma_list:
             s[a.name] = zero_idx
@@ -155,10 +144,16 @@ def merge_loop_ops(
         bound_in_all.add(a.name)
 
     unbound_axes = [a for a in producer.axes if a.name not in bound_in_all]
-    if any(a.kind != "reduce" for a in unbound_axes):
+    if any(a.name not in producer_reduce_names for a in unbound_axes):
         return None
 
-    consumer_reduce_count = sum(1 for a in consumer.axes if a.kind == "reduce")
+    # Single-reduce guard: ``flat_body_to_nested`` only wraps one reduce axis
+    # per kernel (lines 540-544 of loop_ir.py) — multi-reduce merges produce
+    # LoopOps it leaves unwrapped, yielding an empty ``axes`` property. Until
+    # backend-side scheduling grows to split multi-reduce kernels, keep this
+    # constraint at merge time. Properly lives at the backend, but the IR
+    # re-nester forces our hand here.
+    consumer_reduce_count = len(consumer.reduce_axis_names)
     if consumer_reduce_count + len(unbound_axes) > 1:
         return None
 
@@ -201,7 +196,7 @@ def merge_loop_ops(
     pre_reduce_sigma = dict(bound_common)
     pre_reduce_sigma.update(unbound_binding)
 
-    merged_axes = tuple(consumer.axes) + tuple(Axis(name=axis_rename[a.name], extent=a.extent, kind=a.kind) for a in unbound_axes)
+    merged_axes = tuple(consumer.axes) + tuple(Axis(name=axis_rename[a.name], extent=a.extent) for a in unbound_axes)
     merged_accs = _merge_accumulators(consumer.accumulators, producer.accumulators, local_rename, pre_reduce_sigma)
 
     # Build merged ports: consumer ports (minus consumer_ports) first, then
@@ -309,7 +304,10 @@ def merge_loop_ops(
     # Re-nest the flat merged body into the nested Loop-block form.
     from deplodock.compiler.ir.loop_ir import flat_body_to_nested
 
-    nested = flat_body_to_nested(tuple(merged_axes), tuple(body))
+    # Merged reduce axes = consumer's reduce axes + the new ones from producer's
+    # unbound reduce axes (renamed via axis_rename).
+    merged_reduce_names = set(consumer.reduce_axis_names) | {axis_rename[a.name] for a in unbound_axes}
+    nested = flat_body_to_nested(tuple(merged_axes), tuple(body), merged_reduce_names)
     return LoopOp(
         inputs=tuple(merged_ports),
         accumulators=tuple(merged_accs),

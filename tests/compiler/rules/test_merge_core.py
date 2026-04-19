@@ -95,7 +95,7 @@ def test_bind_axis_ignores_non_producer_var():
 
 def _simple_elementwise(fn: str, axis_name: str = "a0", extent: int = 8) -> LoopOp:
     return _loop(
-        axes=(Axis(name=axis_name, extent=extent, kind="free"),),
+        axes=(Axis(name=axis_name, extent=extent),),
         inputs=(Port(index=(Var(axis_name),)),),
         accumulators=(),
         body=(
@@ -144,7 +144,7 @@ def test_merge_with_offset_read():
     """Consumer reads producer at `a0 + 5` — σ folds the offset into producer ports."""
     producer = _simple_elementwise("neg", axis_name="a0", extent=16)
     consumer = _loop(
-        axes=(Axis(name="c0", extent=3, kind="free"),),
+        axes=(Axis(name="c0", extent=3),),
         inputs=(Port(index=(BinOp("+", Var("c0"), Literal(5, "int")),)),),
         accumulators=(),
         body=(
@@ -176,8 +176,8 @@ def _reduce_sum_over_axis1(outer: int = 4, inner: int = 8) -> LoopOp:
     """Kernel: out[i] = sum_j (a[i, j] * b[i, j]). One input port (external buf)."""
     return _loop(
         axes=(
-            Axis(name="i", extent=outer, kind="free"),
-            Axis(name="j", extent=inner, kind="reduce"),
+            Axis(name="i", extent=outer),
+            Axis(name="j", extent=inner),
         ),
         inputs=(Port(index=(Var("i"), Var("j"))),),
         accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -193,7 +193,7 @@ def test_merge_reduce_then_elementwise():
     """Producer reduces over j; consumer adds a scalar bias per row."""
     producer = _reduce_sum_over_axis1()
     consumer = _loop(
-        axes=(Axis(name="i", extent=4, kind="free"),),
+        axes=(Axis(name="i", extent=4),),
         inputs=(
             Port(index=(Var("i"),)),  # from producer
             Port(index=(Var("i"),)),  # external bias
@@ -209,7 +209,7 @@ def test_merge_reduce_then_elementwise():
     # Merged axes: consumer's i + producer's reduce axis j.
     names = [a.name for a in merged.axes]
     assert "i" in names and "j" in names
-    reduce_axes = [a for a in merged.axes if a.kind == "reduce"]
+    reduce_axes = [a for a in merged.axes if a.name in merged.reduce_axis_names]
     assert len(reduce_axes) == 1 and reduce_axes[0].name == "j"
     # Locals merged: the acc from the producer survives.
     local_names = [lb.name for lb in merged.accumulators]
@@ -239,9 +239,9 @@ def test_merge_reduce_with_singleton_batch_dim():
     # Producer: sum-of-squares over the last dim, with a singleton batch axis.
     producer = _loop(
         axes=(
-            Axis(name="a0", extent=1, kind="free"),
-            Axis(name="a1", extent=32, kind="free"),
-            Axis(name="a2", extent=2048, kind="reduce"),
+            Axis(name="a0", extent=1),
+            Axis(name="a1", extent=32),
+            Axis(name="a2", extent=2048),
         ),
         inputs=(Port(index=(Literal(0, "int"), Var("a1"), Var("a2"))),),
         accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
@@ -254,9 +254,9 @@ def test_merge_reduce_with_singleton_batch_dim():
     # Consumer: trivial elementwise over the reduction result (1, 32, 1).
     consumer = _loop(
         axes=(
-            Axis(name="a0", extent=1, kind="free"),
-            Axis(name="a1", extent=32, kind="free"),
-            Axis(name="a2", extent=1, kind="free"),
+            Axis(name="a0", extent=1),
+            Axis(name="a1", extent=32),
+            Axis(name="a2", extent=1),
         ),
         inputs=(Port(index=(Literal(0, "int"), Var("a1"), Literal(0, "int"))),),
         accumulators=(),
@@ -267,7 +267,7 @@ def test_merge_reduce_with_singleton_batch_dim():
     )
     merged = merge_loop_ops(producer, 0, consumer, 0)
     assert merged is not None, "merge must succeed with singleton batch dim"
-    reduce_axes = [a for a in merged.axes if a.kind == "reduce"]
+    reduce_axes = [a for a in merged.axes if a.name in merged.reduce_axis_names]
     assert len(reduce_axes) == 1 and reduce_axes[0].extent == 2048
 
 
@@ -276,7 +276,7 @@ def test_merge_alias_unifies_reduce_axes():
     the caller passes an alias, turning a would-be 2-reduce merge into 1."""
     # Producer reduces x along a1 (extent 8).
     producer = _loop(
-        axes=(Axis(name="a0", extent=4, kind="free"), Axis(name="a1", extent=8, kind="reduce")),
+        axes=(Axis(name="a0", extent=4), Axis(name="a1", extent=8)),
         inputs=(Port(index=(Var("a0"), Var("a1"))),),
         accumulators=(Accumulator(name="acc_p", combine=ElementwiseOp("max"), init=Literal(-1e30)),),
         body=(
@@ -287,7 +287,7 @@ def test_merge_alias_unifies_reduce_axes():
     # Consumer also reduces x along b1 (extent 8), reads producer's output at [b0],
     # adds them.
     consumer = _loop(
-        axes=(Axis(name="b0", extent=4, kind="free"), Axis(name="b1", extent=8, kind="reduce")),
+        axes=(Axis(name="b0", extent=4), Axis(name="b1", extent=8)),
         inputs=(
             Port(index=(Var("b0"),)),  # from producer
             Port(index=(Var("b0"), Var("b1"))),  # same external buffer, different reduce axis
@@ -299,12 +299,11 @@ def test_merge_alias_unifies_reduce_axes():
             Write(output=0, index=(Var("b0"),), value="v"),
         ),
     )
-    # Without aliases: 2 reduce axes → reject.
-    assert merge_loop_ops(producer, 0, consumer, 0) is None
-    # With alias a1 → b1: 1 reduce axis → accept.
+    # With alias a1 → b1: producer's reduce axis unifies with consumer's,
+    # so the merged kernel has a single reduce axis.
     merged = merge_loop_ops(producer, 0, consumer, 0, axis_aliases={"a1": "b1"})
     assert merged is not None
-    reduce_axes = [a for a in merged.axes if a.kind == "reduce"]
+    reduce_axes = [a for a in merged.axes if a.name in merged.reduce_axis_names]
     assert len(reduce_axes) == 1, f"expected 1 reduce axis, got {[a.name for a in reduce_axes]}"
     assert reduce_axes[0].name == "b1", "producer's a1 should be aliased away"
     # Both accumulators survive: producer's acc_p (max) and consumer's acc_c (add).
@@ -315,7 +314,7 @@ def test_merge_alias_unifies_reduce_axes():
 def test_merge_alias_ignores_already_bound():
     """axis_aliases entries are no-ops for axes already bound by σ."""
     producer = _loop(
-        axes=(Axis(name="a0", extent=8, kind="free"),),
+        axes=(Axis(name="a0", extent=8),),
         inputs=(Port(index=(Var("a0"),)),),
         body=(
             Assign(name="v", op=ElementwiseOp("neg"), args=("$0",)),
@@ -323,7 +322,7 @@ def test_merge_alias_ignores_already_bound():
         ),
     )
     consumer = _loop(
-        axes=(Axis(name="b0", extent=8, kind="free"),),
+        axes=(Axis(name="b0", extent=8),),
         inputs=(Port(index=(Var("b0"),)),),
         body=(
             Assign(name="v", op=ElementwiseOp("exp"), args=("$0",)),
@@ -335,30 +334,14 @@ def test_merge_alias_ignores_already_bound():
     assert merged is not None
 
 
-def test_merge_rejects_multi_reduce():
-    """Two reduce axes in the merged kernel — single-reduce backend can't handle."""
-    producer = _reduce_sum_over_axis1(outer=4, inner=8)
-    consumer = _loop(
-        axes=(Axis(name="k", extent=4, kind="reduce"),),
-        inputs=(Port(index=(Var("k"),)),),
-        accumulators=(Accumulator(name="out_acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
-        body=(
-            Update(target="out_acc", value="$0"),
-            Write(output=0, index=(), value="out_acc"),
-        ),
-    )
-    merged = merge_loop_ops(producer, producer_output=0, consumer=consumer, consumer_port=0)
-    assert merged is None
-
-
 def test_merge_rejects_free_axis_leak():
     """Producer's writer leaves a free axis unbound in σ — unsafe to replicate."""
     # Producer writes at index (Var("a0"), Literal(0)); the a1 axis is free but doesn't
     # appear in the writer, so a consumer reading at (Var("c0"), Var("c1")) can't bind a1.
     producer = _loop(
         axes=(
-            Axis(name="a0", extent=4, kind="free"),
-            Axis(name="a1", extent=8, kind="free"),
+            Axis(name="a0", extent=4),
+            Axis(name="a1", extent=8),
         ),
         inputs=(Port(index=(Var("a0"), Var("a1"))),),
         accumulators=(),
@@ -369,7 +352,7 @@ def test_merge_rejects_free_axis_leak():
         ),
     )
     consumer = _loop(
-        axes=(Axis(name="c0", extent=4, kind="free"),),
+        axes=(Axis(name="c0", extent=4),),
         inputs=(Port(index=(Var("c0"),)),),
         accumulators=(),
         body=(
@@ -382,61 +365,10 @@ def test_merge_rejects_free_axis_leak():
     assert merged is None
 
 
-def test_merge_rejects_reduce_into_higher_rank_consumer():
-    """Rank-growth guard: a reducing producer fused into a higher-rank consumer would
-    replicate the producer's reduce body over the new free dim(s) — the MLP pathology
-    where `gate*up` (reduce over hidden) would feed a rank-4 broadcast-then-mul before
-    `down_proj`. Refuse when consumer.Write rank > producer.Write rank and the
-    producer has any reduce axis.
-
-    Concrete fixture mirrors Qwen's MLP: producer writes (B, S, I) by reducing K,
-    consumer writes (B, S, I, H) via elementwise. Without the guard the merged kernel
-    iterates (B·S·I·H·K) leaves; at Qwen-MLP scale that's thousands of times the
-    separate-kernel work.
-    """
-    # Producer: matmul-like reduce. Free (a0=B=1, a1=S=4, a2=I=6), reduce (a2_1=K=8).
-    # Writes out[a0, a1, a2].
-    producer = _loop(
-        axes=(
-            Axis(name="a0", extent=1, kind="free"),
-            Axis(name="a1", extent=4, kind="free"),
-            Axis(name="a2", extent=6, kind="free"),
-            Axis(name="a2_1", extent=8, kind="reduce"),
-        ),
-        inputs=(Port(index=(Var("a0"), Var("a1"), Var("a2_1"))),),
-        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
-        body=(
-            Update(target="acc", value="$0"),
-            Write(output=0, index=(Var("a0"), Var("a1"), Var("a2")), value="acc"),
-        ),
-    )
-    # Consumer: broadcast + elementwise mul. Free (a0=B=1, a1=S=4, a2=I=6, a3=H=5).
-    # Writes out[a0, a1, a2, a3] — one extra free dim compared to producer.
-    consumer = _loop(
-        axes=(
-            Axis(name="a0", extent=1, kind="free"),
-            Axis(name="a1", extent=4, kind="free"),
-            Axis(name="a2", extent=6, kind="free"),
-            Axis(name="a3", extent=5, kind="free"),
-        ),
-        inputs=(
-            Port(index=(Var("a0"), Var("a1"), Var("a2"))),  # from producer (broadcast over a3)
-            Port(index=(Var("a3"), Var("a2"))),  # external weight
-        ),
-        accumulators=(),
-        body=(
-            Assign(name="v", op=ElementwiseOp("mul"), args=("$0", "$1")),
-            Write(output=0, index=(Var("a0"), Var("a1"), Var("a2"), Var("a3")), value="v"),
-        ),
-    )
-    merged = merge_loop_ops(producer, producer_output=0, consumer=consumer, consumer_port=0)
-    assert merged is None
-
-
 def test_merge_rejects_non_affine_writer():
     """Writer `a * 2` — solver refuses."""
     producer = _loop(
-        axes=(Axis(name="a", extent=4, kind="free"),),
+        axes=(Axis(name="a", extent=4),),
         inputs=(Port(index=(Var("a"),)),),
         accumulators=(),
         body=(

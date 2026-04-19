@@ -395,7 +395,7 @@ def test_sibling_reductions_fuse_to_one_kernel():
 def test_sibling_reductions_share_reduce_axis():
     result = _fuse(_make_sibling_reductions())
     kernel = _kernel_nodes(result)[0]
-    reduce_axes = [a for a in kernel.op.axes if a.kind == "reduce"]
+    reduce_axes = [a for a in kernel.op.axes if a.name in kernel.op.reduce_axis_names]
     assert len(reduce_axes) == 1, f"expected 1 reduce axis, got {[a.name for a in reduce_axes]}"
 
 
@@ -427,7 +427,7 @@ def test_softmax_fuses_to_one_kernel():
 def test_softmax_single_reduce_axis():
     result = _fuse(_make_softmax())
     kernel = _kernel_nodes(result)[0]
-    reduce_axes = [a for a in kernel.op.axes if a.kind == "reduce"]
+    reduce_axes = [a for a in kernel.op.axes if a.name in kernel.op.reduce_axis_names]
     assert len(reduce_axes) == 1
 
 

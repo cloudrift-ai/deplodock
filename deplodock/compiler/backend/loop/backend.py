@@ -104,7 +104,8 @@ def execute_loop_op(
     """
     dollar = _bind_inputs(loop, input_arrays)
 
-    reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.kind == "reduce")
+    reduce_names = loop.reduce_axis_names
+    reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.name in reduce_names)
     values: dict[str, np.ndarray] = dict(dollar)
     acc_map: dict[str, Accumulator] = {acc.name: acc for acc in loop.accumulators}
     for acc in loop.accumulators:

@@ -44,19 +44,20 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     if axis < 0 or axis >= ndim:
         return None
 
-    axes = tuple(Axis(name=f"a{i}", extent=int(d), kind="reduce" if i == axis else "free") for i, d in enumerate(src_shape))
+    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(src_shape))
+    reduce_axis_name = f"a{axis}"
     input_port = Port(index=tuple(Var(a.name) for a in axes))
 
     combine_fn = _COMBINE.get(op.fn, op.fn)
     init = _IDENTITY.get(op.fn, 0.0)
     acc = Accumulator(name="acc", combine=ElementwiseOp(combine_fn), init=Literal(init))
 
-    write_index = _build_write_index(axes, tuple(node.output.shape))
+    write_index = _build_write_index(axes, reduce_axis_name, tuple(node.output.shape))
 
     # Nested body: Loop(reduce_axis, [Update]) followed by Write, the whole
     # thing wrapped in Loop(free_axis, ...) blocks (outermost first).
-    reduce_axis = next(a for a in axes if a.kind == "reduce")
-    free_axes = [a for a in axes if a.kind == "free"]
+    reduce_axis = next(a for a in axes if a.name == reduce_axis_name)
+    free_axes = [a for a in axes if a.name != reduce_axis_name]
     inner: tuple[Stmt, ...] = (
         Loop(axis=reduce_axis, body=(Update(target="acc", value="$0"),)),
         Write(output=0, index=write_index, value="acc"),
@@ -73,12 +74,12 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     return frag
 
 
-def _build_write_index(axes: tuple[Axis, ...], out_shape: tuple) -> tuple[Expr, ...]:
+def _build_write_index(axes: tuple[Axis, ...], reduce_axis_name: str, out_shape: tuple) -> tuple[Expr, ...]:
     """Build the Write's index for a reduce kernel under the keepdim invariant.
 
     Tensor IR's rank-preservation rule (enforced by the tracer and every
     decomposition rule) says reductions keep their reduced axis at size 1, so
-    ``len(out_shape) == len(axes)``. Reduce axes and singleton dims become
+    ``len(out_shape) == len(axes)``. The reduce axis and singleton dims become
     ``Literal(0)`` at their dim position; free axes become ``Var(axis.name)``.
     """
     if len(out_shape) != len(axes):
@@ -88,7 +89,7 @@ def _build_write_index(axes: tuple[Axis, ...], out_shape: tuple) -> tuple[Expr, 
         )
     result: list[Expr] = []
     for a, d in zip(axes, out_shape, strict=True):
-        if a.kind == "reduce" or (isinstance(d, int) and d == 1):
+        if a.name == reduce_axis_name or (isinstance(d, int) and d == 1):
             result.append(Literal(0, "int"))
         else:
             result.append(Var(a.name))
