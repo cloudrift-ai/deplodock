@@ -528,7 +528,7 @@ def benchmark_program(
     source = generate_source(program, mode="benchmark", num_iters=num_iters, warmup=warmup)
     binary = compile_program(source)
 
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120)
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"Program execution failed:\n{result.stderr}")
 

@@ -132,7 +132,9 @@ class LoopProgram:
         from deplodock.compiler.ir.loop_ir import pretty_print
 
         launch = self.launches[idx]
-        header = f"launch {idx:02d}: inputs=[{', '.join(launch.input_names)}] output={launch.output_name}"
+        seen: set[str] = set()
+        unique_inputs = [n for n in launch.input_names if not (n in seen or seen.add(n))]
+        header = f"launch {idx:02d}: inputs=[{', '.join(unique_inputs)}] output={launch.output_name}"
 
         if not isinstance(launch.loop, LoopOp):
             return f"{header}\n  (non-LoopOp: {type(launch.loop).__name__})"

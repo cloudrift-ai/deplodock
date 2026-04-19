@@ -42,6 +42,7 @@ LoopProgram
     │  compile_kernels(loop_program)
     │    for each LoopLaunch in loop_program.launches:
     │      emit.emit_kernel(launch, name, loop_program) → (GpuKernel, arg_order)
+    │      ir.simplify.simplify_kernel(GpuKernel) → GpuKernel  (const fold / clamp eliminate)
     │      kernel_codegen.emit_kernel(GpuKernel) → C source string
     │      wrap as CudaLaunch(kernel_source, grid, block, args)
     ▼
