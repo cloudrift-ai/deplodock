@@ -8,6 +8,7 @@ Inputs are unsqueezed so the mul is a standard NumPy broadcast:
 """
 
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.frontend import MatmulOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
@@ -46,9 +47,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     a_unsq_id = frag.add_node(op=a_unsq, inputs=[a_id], output=Tensor(f"{name}_a_unsq", a_unsq.out_shape, dtype))
     b_unsq_id = frag.add_node(op=b_unsq, inputs=[b_id], output=Tensor(f"{name}_b_unsq", b_unsq.out_shape, dtype))
+    a_bc = broadcast_to(frag, a_unsq_id, mul_shape)
+    b_bc = broadcast_to(frag, b_unsq_id, mul_shape)
     ew_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[a_unsq_id, b_unsq_id],
+        inputs=[a_bc, b_bc],
         output=Tensor(f"{name}_ew", mul_shape, dtype),
     )
     red_id = frag.add_node(
@@ -58,7 +61,8 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     )
 
     if bias_id:
-        add_id = frag.add_node(op=ElementwiseOp(fn="add"), inputs=[red_id, bias_id], output=Tensor(f"{name}_bias", shape, dtype))
+        bias_bc = broadcast_to(frag, bias_id, shape)
+        add_id = frag.add_node(op=ElementwiseOp(fn="add"), inputs=[red_id, bias_bc], output=Tensor(f"{name}_bias", shape, dtype))
         frag.outputs = [add_id]
     else:
         frag.outputs = [red_id]

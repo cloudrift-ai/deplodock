@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.base import Op, _drop_axis
+from deplodock.compiler.ir.base import Op, _keepdim_axis
 
 # ---------------------------------------------------------------------------
 # Layout-only ops (decomposed to IndexMapOp)
@@ -260,7 +260,7 @@ class MeanOp(Op):
     axis: int | str = -1
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
-        return _drop_axis(input_shapes[0], self.axis)
+        return _keepdim_axis(input_shapes[0], self.axis)
 
     def forward(self, *inputs):
         import numpy as np

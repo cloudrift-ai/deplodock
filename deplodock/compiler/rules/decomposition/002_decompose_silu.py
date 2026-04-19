@@ -1,6 +1,7 @@
 """Decompose silu(x) into x * recip(1 + exp(-x)) to enable SiLU+Mul fusion."""
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp
 from deplodock.compiler.matcher import ChainMatch, Production
@@ -48,9 +49,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     )
 
     # 1 + exp(-x)
+    one_bc = broadcast_to(frag, one_id, shape)
     add_id = frag.add_node(
         op=ElementwiseOp(fn="add"),
-        inputs=[one_id, exp_id],
+        inputs=[one_bc, exp_id],
         output=Tensor(f"{name}_denom", shape, dtype),
     )
 

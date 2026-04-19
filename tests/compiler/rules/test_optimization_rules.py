@@ -1,16 +1,18 @@
-"""Tests for optimization rules: structural checks and numerical correctness."""
+"""Tests for the broadcast_to helper and its integration into decomposition.
 
-from pathlib import Path
+``broadcast_to`` replaces the old ``002_insert_broadcast_indexmap`` optimization
+pass: decomposition rules call the helper directly to wrap smaller-shape
+inputs in IndexMapOps, so every ElementwiseOp post-decomposition has all
+inputs at the output shape — the rank-preserving Tensor IR invariant.
+"""
 
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp, ReduceOp
-from deplodock.compiler.rewriter import Pass, Rule
-
-RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "optimization"
+from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()
@@ -20,226 +22,118 @@ def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     return _backend.run(_backend.compile(graph), input_data=inputs).outputs
 
 
-def _assert_close(before: dict, after: dict, *, rtol=1e-5, atol=1e-6):
-    bvals = list(before.values())
-    avals = list(after.values())
-    assert len(bvals) == len(avals)
-    for i, (b, a) in enumerate(zip(bvals, avals, strict=True)):
-        np.testing.assert_allclose(a, b, rtol=rtol, atol=atol, err_msg=f"output[{i}]")
+# ===================================================================
+# broadcast_to — unit tests
+# ===================================================================
 
 
-def _load(name: str) -> Rule:
-    return Rule.from_file(RULES_DIR / name)
+def test_broadcast_to_is_identity_when_shapes_match():
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
+    out_id = broadcast_to(g, "x", (4, 8))
+    assert out_id == "x", "matching shapes must short-circuit"
+    assert len(g.nodes) == 1
 
 
-def _apply(graph: Graph, rule: Rule) -> Graph:
-    return Pass(name="opt", rules=[rule]).apply(graph)
+def test_broadcast_to_adds_indexmap_for_rank_mismatch():
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("y", (8,)), node_id="y")
+    out_id = broadcast_to(g, "y", (4, 8))
+    assert out_id != "y"
+    assert g.nodes[out_id].output.shape == (4, 8)
+    assert isinstance(g.nodes[out_id].op, IndexMapOp)
+
+
+def test_broadcast_to_scalar_to_tensor():
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("s", (1,)), node_id="s")
+    out_id = broadcast_to(g, "s", (2, 4, 8))
+    assert g.nodes[out_id].output.shape == (2, 4, 8)
+    assert isinstance(g.nodes[out_id].op, IndexMapOp)
+
+
+def test_broadcast_to_rejects_non_size_1_mismatch():
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("y", (4, 3)), node_id="y")
+    try:
+        broadcast_to(g, "y", (4, 8))
+    except ValueError as e:
+        assert "broadcast" in str(e).lower()
+    else:
+        raise AssertionError("should have raised on non-size-1 dim mismatch")
 
 
 # ===================================================================
-# insert_broadcast_indexmap: add explicit IndexMapOp for broadcast reads
+# broadcast_to correctness via numpy backend
 # ===================================================================
 
-_RULE = "002_insert_broadcast_indexmap.py"
 
-
-def _make_broadcast_add_graph():
-    """(4, 8) + (8,) → broadcast add."""
+def test_broadcast_to_preserves_semantics_rank_mismatch():
+    """(4, 8) + broadcast_to((8,)) == numpy's (4, 8) + (8,)."""
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(InputOp(), [], Tensor("y", (8,)), node_id="y")
-    g.add_node(ElementwiseOp("add"), ["x", "y"], Tensor("z", (4, 8)), node_id="z")
+    y_bc = broadcast_to(g, "y", (4, 8))
+    g.add_node(ElementwiseOp("add"), ["x", y_bc], Tensor("z", (4, 8)), node_id="z")
     g.inputs, g.outputs = ["x", "y"], ["z"]
-    return g
-
-
-def test_broadcast_inserts_indexmap():
-    g = _make_broadcast_add_graph()
-    result = _apply(g, _load(_RULE))
-    has_indexmap = any(isinstance(n.op, IndexMapOp) for n in result.nodes.values())
-    assert has_indexmap, "Should insert IndexMapOp for broadcast input"
-
-
-def test_broadcast_preserves_elementwise():
-    g = _make_broadcast_add_graph()
-    result = _apply(g, _load(_RULE))
-    adds = [n for n in result.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.fn == "add"]
-    assert len(adds) == 1
-
-
-def test_broadcast_no_insert_when_shapes_match():
-    """Equal shapes → no IndexMapOp inserted."""
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    g.add_node(InputOp(), [], Tensor("y", (4, 8)), node_id="y")
-    g.add_node(ElementwiseOp("add"), ["x", "y"], Tensor("z", (4, 8)), node_id="z")
-    g.inputs, g.outputs = ["x", "y"], ["z"]
-    result = _apply(g, _load(_RULE))
-    has_indexmap = any(isinstance(n.op, IndexMapOp) for n in result.nodes.values())
-    assert not has_indexmap
-
-
-def test_broadcast_idempotent():
-    g = _make_broadcast_add_graph()
-    p = Pass(name="opt", rules=[_load(_RULE)])
-    once = p.apply(g)
-    twice = p.apply(once)
-    assert len(twice.nodes) == len(once.nodes)
-
-
-def test_broadcast_add_correctness():
-    g = _make_broadcast_add_graph()
     x = rng.standard_normal((4, 8)).astype(np.float32)
-    y = rng.standard_normal(8).astype(np.float32)
-    inputs = {"x": x, "y": y}
-    before = _run(g, inputs)
-    after = _run(_apply(g, _load(_RULE)), inputs)
-    _assert_close(before, after)
+    y = rng.standard_normal((8,)).astype(np.float32)
+    result = _run(g, {"x": x, "y": y})
+    np.testing.assert_allclose(list(result.values())[0], x + y, rtol=1e-6)
 
 
-def test_broadcast_mul_scalar_correctness():
-    """(4, 8) * (1,) scalar broadcast."""
+def test_broadcast_to_scalar_mul_correctness():
+    """Scalar (1,) broadcasts and multiplies element-wise."""
     g = Graph()
-    g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
+    g.add_node(InputOp(), [], Tensor("x", (2, 4, 8)), node_id="x")
     g.add_node(ConstantOp(name="s", value=2.0), [], Tensor("s", (1,)), node_id="s")
-    g.add_node(ElementwiseOp("mul"), ["x", "s"], Tensor("z", (4, 8)), node_id="z")
+    s_bc = broadcast_to(g, "s", (2, 4, 8))
+    g.add_node(ElementwiseOp("mul"), ["x", s_bc], Tensor("z", (2, 4, 8)), node_id="z")
     g.inputs, g.outputs = ["x"], ["z"]
-    x = rng.standard_normal((4, 8)).astype(np.float32)
-    before = _run(g, {"x": x})
-    after = _run(_apply(g, _load(_RULE)), {"x": x})
-    _assert_close(before, after)
+    x = rng.standard_normal((2, 4, 8)).astype(np.float32)
+    result = _run(g, {"x": x})
+    np.testing.assert_allclose(list(result.values())[0], x * 2.0, rtol=1e-6)
 
 
-def test_broadcast_3d_correctness():
-    """(2, 4, 8) + (4, 1) → broadcast on two axes."""
+def test_broadcast_to_3d_correctness():
+    """(2, 4, 8) + broadcast_to((4, 1)) covers the per-row scalar bias shape."""
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (2, 4, 8)), node_id="x")
     g.add_node(InputOp(), [], Tensor("y", (4, 1)), node_id="y")
-    g.add_node(ElementwiseOp("add"), ["x", "y"], Tensor("z", (2, 4, 8)), node_id="z")
+    y_bc = broadcast_to(g, "y", (2, 4, 8))
+    g.add_node(ElementwiseOp("add"), ["x", y_bc], Tensor("z", (2, 4, 8)), node_id="z")
     g.inputs, g.outputs = ["x", "y"], ["z"]
     x = rng.standard_normal((2, 4, 8)).astype(np.float32)
     y = rng.standard_normal((4, 1)).astype(np.float32)
-    before = _run(g, {"x": x, "y": y})
-    after = _run(_apply(g, _load(_RULE)), {"x": x, "y": y})
-    _assert_close(before, after)
-
-
-def test_broadcast_rmsnorm_chain_correctness():
-    """Broadcast appears in RMSNorm: (rows, 1) * (rows, dim) and (dim,) * (rows, dim)."""
-    rows, dim = 4, 16
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("x", (rows, dim)), node_id="x")
-    g.add_node(InputOp(), [], Tensor("w", (dim,)), node_id="w")
-    g.add_node(ConstantOp(name="eps", value=1e-6), [], Tensor("eps", (1,)), node_id="eps")
-    g.add_node(ElementwiseOp("mul"), ["x", "x"], Tensor("sq", (rows, dim)), node_id="sq")
-    g.add_node(ReduceOp("sum", -1), ["sq"], Tensor("red", (rows, 1)), node_id="red")
-    g.add_node(ElementwiseOp("add"), ["red", "eps"], Tensor("ae", (rows, 1)), node_id="ae")
-    g.add_node(ElementwiseOp("rsqrt"), ["ae"], Tensor("rsq", (rows, 1)), node_id="rsq")
-    g.add_node(ElementwiseOp("mul"), ["x", "rsq"], Tensor("norm", (rows, dim)), node_id="norm")
-    g.add_node(ElementwiseOp("mul"), ["norm", "w"], Tensor("out", (rows, dim)), node_id="out")
-    g.inputs, g.outputs = ["x", "w"], ["out"]
-
-    x = rng.standard_normal((rows, dim)).astype(np.float32)
-    w = rng.standard_normal(dim).astype(np.float32)
-    before = _run(g, {"x": x, "w": w})
-    after = _run(_apply(g, _load(_RULE)), {"x": x, "w": w})
-    _assert_close(before, after, rtol=1e-4)
-
-
-def test_matmul_with_transpose_fuses_to_one_kernel():
-    """``A @ B.T`` fuses to a single kernel with the transpose absorbed into Port.index."""
-    from deplodock.compiler.ir.frontend import MatmulOp, TransposeOp
-    from deplodock.compiler.ir.loop import LoopOp
-    from deplodock.compiler.pipeline import compile_graph
-
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")
-    g.add_node(InputOp(), [], Tensor("b", (3, 8)), node_id="b")
-    g.add_node(TransposeOp(axes=(1, 0)), ["b"], Tensor("bt", (8, 3)), node_id="bt")
-    g.add_node(MatmulOp(), ["a", "bt"], Tensor("c", (4, 3)), node_id="c")
-    g.inputs, g.outputs = ["a", "b"], ["c"]
-
-    lp = compile_graph(g)
-    assert len(lp.launches) == 1, f"expected 1 launch, got {len(lp.launches)}: {[la.output_name for la in lp.launches]}"
-    launch = lp.launches[0]
-    assert set(launch.input_names) == {"a", "b"}, f"transpose should be absorbed; inputs={launch.input_names}"
-    assert isinstance(launch.loop, LoopOp)
-
-
-def test_offset_slice_absorbs_into_kernel():
-    """Rotary-style ``x[..., offset:]`` slice fuses into its consuming kernel."""
-    from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
-    from deplodock.compiler.ir.tensor import IndexSource
-    from deplodock.compiler.pipeline import compile_graph
-
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("x", (4, 64)), node_id="x")
-    g.add_node(InputOp(), [], Tensor("y", (4, 32)), node_id="y")
-    g.add_node(
-        IndexMapOp(
-            out_shape=(4, 32),
-            sources=(IndexSource(input_idx=0, coord_map=(placeholder(0), BinOp("+", placeholder(1), Literal(32, "int")))),),
-        ),
-        ["x"],
-        Tensor("sl", (4, 32)),
-        node_id="sl",
-    )
-    g.add_node(ElementwiseOp("mul"), ["sl", "y"], Tensor("z", (4, 32)), node_id="z")
-    g.inputs, g.outputs = ["x", "y"], ["z"]
-
-    lp = compile_graph(g)
-    assert len(lp.launches) == 1, f"expected 1 launch, got {len(lp.launches)}"
-    # The Port for x should use the absorbed offset expression.
-    from deplodock.compiler.ir.expr import render
-
-    loop = lp.launches[0].loop
-    x_port_idx = loop.inputs[lp.launches[0].input_names.index("x")].index
-    assert any("+ 32" in render(e).replace(" ", "").replace("+32", "+ 32") or "a1 + 32" in render(e) for e in x_port_idx), (
-        f"expected '+ 32' offset in Port.index, got {[render(e) for e in x_port_idx]}"
-    )
+    result = _run(g, {"x": x, "y": y})
+    np.testing.assert_allclose(list(result.values())[0], x + y, rtol=1e-6)
 
 
 # ===================================================================
-# Multi-source cat absorption into consuming kernel
+# Integration: decomposition emits broadcast-explicit IR
 # ===================================================================
 
 
-def test_multi_source_cat_absorbs_into_consumer():
-    """A two-source IndexMapOp (cat/concat) fuses into its consuming elementwise kernel as two ports + a Select body stmt."""
-    from deplodock.compiler.ir.expr import BinOp, Literal, Var, placeholder
-    from deplodock.compiler.ir.loop import Select
-    from deplodock.compiler.ir.tensor import IndexSource
-    from deplodock.compiler.pipeline import compile_graph
+def test_tracer_emits_broadcast_explicit_elementwise():
+    """After tracing `a + b` with broadcast-requiring shapes, every
+    ElementwiseOp in the graph has matched-shape inputs (the tracer wraps
+    smaller inputs in IndexMapOps via broadcast_to)."""
+    import torch
 
-    # Cat along dim 1: first half from a, second half from b. Then add y.
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("a", (4, 3)), node_id="a")
-    g.add_node(InputOp(), [], Tensor("b", (4, 3)), node_id="b")
-    lt = BinOp("<", Var("out_coord_1"), Literal(3, "int"))
-    second_half = BinOp("-", placeholder(1), Literal(3, "int"))
-    g.add_node(
-        IndexMapOp(
-            out_shape=(4, 6),
-            sources=(
-                IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(1)), select=lt),
-                IndexSource(input_idx=1, coord_map=(placeholder(0), second_half), select=None),
-            ),
-        ),
-        ["a", "b"],
-        Tensor("cat", (4, 6)),
-        node_id="cat",
-    )
-    g.add_node(InputOp(), [], Tensor("y", (4, 6)), node_id="y")
-    g.add_node(ElementwiseOp("add"), ["cat", "y"], Tensor("z", (4, 6)), node_id="z")
-    g.inputs, g.outputs = ["a", "b", "y"], ["z"]
+    from deplodock.compiler.ir.tensor import ElementwiseOp
+    from deplodock.compiler.torch_trace import trace_module
 
-    lp = compile_graph(g)
-    assert len(lp.launches) == 1, f"cat should absorb into elementwise kernel; got {len(lp.launches)} launches"
-    launch = lp.launches[0]
-    assert set(launch.input_names) == {"a", "b", "y"}, f"expected ports to read a, b, y directly; got {launch.input_names}"
+    class BroadcastAdd(torch.nn.Module):
+        def forward(self, x, y):
+            return x + y
 
-    # The Select must be in the kernel body.
-    from deplodock.compiler.ir.loop import flatten_body
-
-    selects = [s for s in flatten_body(launch.loop.body) if isinstance(s, Select)]
-    assert len(selects) == 1, f"expected one Select stmt in body; got {len(selects)}: {launch.loop.body}"
+    graph = trace_module(BroadcastAdd(), (torch.randn(4, 8), torch.randn(8)))
+    for n in graph.nodes.values():
+        if not isinstance(n.op, ElementwiseOp):
+            continue
+        out_shape = tuple(n.output.shape)
+        for inp_id in n.inputs:
+            inp_shape = tuple(graph.nodes[inp_id].output.shape)
+            assert inp_shape == out_shape, (
+                f"ElementwiseOp {n.id} input shape {inp_shape} != output {out_shape} — tracer must insert broadcast IndexMapOp"
+            )

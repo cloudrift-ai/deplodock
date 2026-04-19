@@ -40,9 +40,21 @@ def test_broadcast_shapes_divisible_only_when_opted_in():
     assert broadcast_shapes((28, 8, 128), (4, 8, 128), allow_divisible=True) == (28, 8, 128)
 
 
-def test_elementwise_infer():
+def test_elementwise_infer_matching_shapes():
+    """ElementwiseOp is rank-preserving: matching inputs pass through."""
     op = ElementwiseOp("mul")
-    assert op.infer_output_shape([(1, 28, 8, 128), (1, 1, 8, 128)]) == (1, 28, 8, 128)
+    assert op.infer_output_shape([(1, 28, 8, 128), (1, 28, 8, 128)]) == (1, 28, 8, 128)
+
+
+def test_elementwise_infer_rejects_mismatched_shapes():
+    """ElementwiseOp refuses to broadcast — callers must wrap in IndexMapOp first."""
+    op = ElementwiseOp("mul")
+    try:
+        op.infer_output_shape([(1, 28, 8, 128), (1, 1, 8, 128)])
+    except ValueError as e:
+        assert "must all match" in str(e)
+    else:
+        raise AssertionError("should have raised on mismatched shapes")
 
 
 def test_reduce_keepdim():

@@ -76,9 +76,14 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 def _build_write_index(axes: tuple[Axis, ...], out_shape: tuple) -> tuple[Expr, ...]:
     """Build the Write's index for a reduce kernel.
 
+    Tensor IR's production path (tracer + decomposition rules) emits keepdim
+    reductions where the output rank matches the input rank. Hand-built test
+    fixtures sometimes use dropped-axis shapes, so we fall back gracefully
+    rather than raise.
+
     - keepdim: ``len(out_shape) == len(axes)`` — reduce axes become ``Literal(0)``.
-    - non-keepdim: ``len(out_shape) == free-axis-count`` — free axes only.
-    - fallback: align non-size-1 output dims onto free axes right-to-left.
+    - dropped: ``len(out_shape) == free-axis-count`` — free axes only.
+    - fallback: right-align non-size-1 output dims onto free axes.
     """
     free_axes = tuple(a for a in axes if a.kind == "free")
 
@@ -94,7 +99,6 @@ def _build_write_index(axes: tuple[Axis, ...], out_shape: tuple) -> tuple[Expr, 
     if len(out_shape) == len(free_axes):
         return tuple(Var(a.name) for a in free_axes)
 
-    # Fallback: right-align non-size-1 output dims onto free axes.
     out_list: list[Expr] = [Literal(0, "int")] * len(out_shape)
     cursor = len(free_axes) - 1
     for i in range(len(out_shape) - 1, -1, -1):

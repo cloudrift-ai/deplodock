@@ -5,6 +5,7 @@ broadcast-compatible via IndexMapOp before the mul.
 """
 
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.frontend import LinearOp, TransposeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
@@ -53,9 +54,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     a_unsq_id = frag.add_node(op=a_unsq, inputs=[x_id], output=Tensor(f"{name}_x_unsq", a_unsq.out_shape, dtype))
     b_unsq_id = frag.add_node(op=b_unsq, inputs=[wt_id], output=Tensor(f"{name}_wt_unsq", b_unsq.out_shape, dtype))
 
+    a_bc = broadcast_to(frag, a_unsq_id, mul_shape)
+    b_bc = broadcast_to(frag, b_unsq_id, mul_shape)
     ew_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[a_unsq_id, b_unsq_id],
+        inputs=[a_bc, b_bc],
         output=Tensor(f"{name}_ew", mul_shape, dtype),
     )
     red_id = frag.add_node(
@@ -65,9 +68,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     )
 
     if b_id:
+        bias_bc = broadcast_to(frag, b_id, shape)
         add_id = frag.add_node(
             op=ElementwiseOp(fn="add"),
-            inputs=[red_id, b_id],
+            inputs=[red_id, bias_bc],
             output=Tensor(f"{name}_bias", shape, dtype),
         )
         frag.outputs = [add_id]

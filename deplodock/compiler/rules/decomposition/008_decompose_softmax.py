@@ -10,6 +10,7 @@ without going through the SDPA fast-path.
 """
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
@@ -49,9 +50,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[x_id],
         output=Tensor(f"{name}_max", red_shape, dtype),
     )
+    max_bc = broadcast_to(frag, max_id, out_shape)
     sub_id = frag.add_node(
         op=ElementwiseOp(fn="sub"),
-        inputs=[x_id, max_id],
+        inputs=[x_id, max_bc],
         output=Tensor(f"{name}_shifted", out_shape, dtype),
     )
     exp_id = frag.add_node(
@@ -64,9 +66,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[exp_id],
         output=Tensor(f"{name}_sum", red_shape, dtype),
     )
+    sum_bc = broadcast_to(frag, sum_id, out_shape)
     out_id = frag.add_node(
         op=ElementwiseOp(fn="div"),
-        inputs=[exp_id, sum_id],
+        inputs=[exp_id, sum_bc],
         output=Tensor(name, out_shape, dtype),
     )
 
