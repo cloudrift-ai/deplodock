@@ -459,21 +459,11 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
     free_axes = tuple(a for a in loop.axes if a.name not in reduce_names)
     flat_env = _axis_env_for_flat(free_axes, idx)
 
-    # Load per-row ports upfront. Threading ``load_env`` forward lets a later
-    # port's index Expr reference an earlier port by name (e.g. gather: the
-    # data port's axis index reads ``$0`` — the already-loaded index value).
-    # Skip ports whose index references a body-form Load's SSA name — those
-    # values haven't been bound yet; the body walker's Load stmt will materialize
-    # the read at its actual scope.
+    # Port loads materialize through body-form ``Load`` stmts at their
+    # actual scope (Inline prelude, K-loop body, or post-reduce). The
+    # ``load_env`` is threaded forward as Loads emit so a later Load's
+    # index can reference an earlier Load's SSA value (gather).
     load_env: dict[str, Expr] = dict(flat_env)
-    body_load_names: set[str] = {ld.name for ld in loop.loads}
-    for key, (port, buf_name, src_shape) in port_info.items():
-        if key in plan.per_elem_ports:
-            continue
-        if any(_expr_refs_any_name(e, body_load_names) for e in port.index):
-            continue
-        values[key] = _emit_port_load(port, buf_name, src_shape, load_env)
-        load_env[key] = values[key]
 
     loop_count = 0
     for step in plan.steps:
