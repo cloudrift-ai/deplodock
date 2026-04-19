@@ -248,7 +248,7 @@ def merge_loop_ops(
     )
     body.extend(pre_reduce_rewritten)
     for stmt in pre_reduce_rewritten:
-        if isinstance(stmt, (Assign, Select)):
+        if isinstance(stmt, (Assign, Select, Load)):
             taken_names.add(stmt.name)
 
     # Lazily instantiate the producer's post-reduce body per σ_k when the
@@ -263,7 +263,7 @@ def merge_loop_ops(
         # Fresh SSA rename for this instantiation, inheriting common collisions.
         ssa_rename_k: dict[str, str] = dict(ssa_rename_common)
         for stmt in post_reduce_stmts:
-            if isinstance(stmt, (Assign, Select)):
+            if isinstance(stmt, (Assign, Select, Load)):
                 base = stmt.name
                 renamed_common = ssa_rename_common.get(base, base)
                 fresh = _fresh_name(f"{renamed_common}_cp{cp}", taken_names)
@@ -485,8 +485,10 @@ def _all_defined_names(
     for op in (producer, consumer):
         for lb in op.accumulators:
             names.add(lb.name)
+        for decl in op.accum_decls:
+            names.add(decl.name)
         for stmt in flatten_body(op.body):
-            if isinstance(stmt, (Assign, Select)):
+            if isinstance(stmt, (Assign, Select, Load)):
                 names.add(stmt.name)
     names.update(local_rename.values())
     names.update(ssa_rename.values())
