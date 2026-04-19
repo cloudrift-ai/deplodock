@@ -33,7 +33,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     ndim = len(out_shape)
     axis = int(node.op.axis) if int(node.op.axis) >= 0 else ndim + int(node.op.axis)
 
-    axes = tuple(Axis(name=f"a{i}", extent=int(d), kind="free") for i, d in enumerate(out_shape))
+    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
 
     # Port 0: idx — identity load over all output axes.
     idx_port = Port(index=tuple(Var(a.name) for a in axes))

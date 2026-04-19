@@ -157,7 +157,7 @@ loop-nest that codegen eventually emits — one ``LoopOp`` maps to one
 
 | Symbol                        | Role                                                                                                              |
 |-------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| ``Axis``                      | Named iteration variable (``name`` + ``extent`` + ``kind={"free","reduce"}``).                                    |
+| ``Axis``                      | Named iteration variable (``name`` + ``extent``). Free vs reduce is inferred from body structure — a Loop is a reduce Loop iff its body contains an Update (see ``LoopOp.reduce_axis_names``). |
 | ``LoopOp``                    | One kernel: ``axes`` + ``inputs`` + ``locals`` + nested ``body``.                                                 |
 | ``Port``                      | Access pattern for one external buffer — ``index: tuple[Expr, ...]`` over axis Vars.                              |
 | ``Accumulator``               | Reduce accumulator: ``name``, ``combine`` (ElementwiseOp), ``init`` (Expr). Folded by ``Update``.                |

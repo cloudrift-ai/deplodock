@@ -293,7 +293,7 @@ def test_loop_op_walker_simplifies_port_index():
     """Port index (a0 + 0) * 1 simplifies to a0 under axis range info."""
     assign = Assign("v", ElementwiseOp(fn="neg"), ("$0",))
     write = Write(0, (Var("a0"),), "v")
-    loop = Loop(Axis("a0", 8, "free"), (assign, write))
+    loop = Loop(Axis("a0", 8), (assign, write))
     port = Port(index=(BinOp("*", BinOp("+", Var("a0"), _int(0)), _int(1)),))
     op = LoopOp(inputs=(port,), body=(loop,))
     simplified = simplify_loop_op(op)
@@ -303,7 +303,7 @@ def test_loop_op_walker_simplifies_port_index():
 def test_loop_op_walker_idempotent():
     assign = Assign("v", ElementwiseOp(fn="neg"), ("$0",))
     write = Write(0, (Var("a0"),), "v")
-    loop = Loop(Axis("a0", 8, "free"), (assign, write))
+    loop = Loop(Axis("a0", 8), (assign, write))
     port = Port(index=(BinOp("+", Var("a0"), _int(0)),))
     op = LoopOp(inputs=(port,), body=(loop,))
     once = simplify_loop_op(op)

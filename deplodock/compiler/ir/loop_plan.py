@@ -95,14 +95,15 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     become ``TrailingWrite``s.
     """
     input_ports = _collect_input_ports(kernel)
-    inner_body = _descend_free_loops(kernel.body)
-    reduce_loops = [s for s in inner_body if isinstance(s, LoopStmt) and s.axis.kind == "reduce"]
+    inner_body = _descend_free_loops(kernel.body, kernel)
+    reduce_axis_names = kernel.reduce_axis_names
+    reduce_loops = [s for s in inner_body if isinstance(s, LoopStmt) and s.axis.name in reduce_axis_names]
     has_reduce = bool(reduce_loops)
 
     # --- Reduction geometry (None for flat) ---
     if has_reduce:
         pre_shape = tuple(a.extent for a in kernel.axes)
-        reduce_axis_idx = next((i for i, a in enumerate(kernel.axes) if a.kind == "reduce"), 0)
+        reduce_axis_idx = next((i for i, a in enumerate(kernel.axes) if a.name in reduce_axis_names), 0)
         k_size = int(pre_shape[reduce_axis_idx]) if pre_shape else 1
         n_output = _n_rows(pre_shape, reduce_axis_idx)
     else:
@@ -113,7 +114,6 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 
     # --- Classify ports as per-element (references reduce axis) vs per-row ---
     if has_reduce:
-        reduce_axis_names = {a.name for a in kernel.axes if a.kind == "reduce"}
         per_elem_ports = frozenset(name for name, port in input_ports.items() if _port_references_axis(port, reduce_axis_names))
     else:
         per_elem_ports = frozenset()
@@ -176,7 +176,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     tail_stmts: list[Assign | Select] = []
     tail_writes: list[Write] = []
     for stmt in inner_body[idx:]:
-        if isinstance(stmt, LoopStmt) and stmt.axis.kind == "reduce":
+        if isinstance(stmt, LoopStmt) and stmt.axis.name in reduce_axis_names:
             new_steps = _reduce_loop_to_steps(stmt, acc_map, acc_count, prior_ew, row_space, pre_shape, reduce_axis_idx, k_size)
             if not new_steps:
                 continue
@@ -233,7 +233,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     )
 
 
-def _descend_free_loops(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def _descend_free_loops(body: tuple[Stmt, ...], kernel: LoopOp) -> tuple[Stmt, ...]:
     """Descend through outer free ``Loop`` wrappers to the innermost body.
 
     Keeps descending as long as ``body`` is a single free ``Loop`` — the free
@@ -241,7 +241,8 @@ def _descend_free_loops(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     walk. Stops at the first level with either multiple children or a non-
     free-Loop child (a reduce Loop, an Assign, a Write, etc.).
     """
-    while len(body) == 1 and isinstance(body[0], LoopStmt) and body[0].axis.kind == "free":
+    reduce_names = kernel.reduce_axis_names
+    while len(body) == 1 and isinstance(body[0], LoopStmt) and body[0].axis.name not in reduce_names:
         body = body[0].body
     return body
 

@@ -135,11 +135,13 @@ def _detect_reduce_axis_aliases(
             for e in stmt.index:
                 _collect_axis_names(e, write_axis_names)
 
-    unbound_reduce = [a for a in producer_op.axes if a.kind == "reduce" and a.name not in write_axis_names]
+    producer_reduce_names = producer_op.reduce_axis_names
+    unbound_reduce = [a for a in producer_op.axes if a.name in producer_reduce_names and a.name not in write_axis_names]
     if not unbound_reduce:
         return {}
 
-    consumer_reduce_by_name = {a.name: a for a in consumer_op.axes if a.kind == "reduce"}
+    consumer_reduce_names = consumer_op.reduce_axis_names
+    consumer_reduce_by_name = {a.name: a for a in consumer_op.axes if a.name in consumer_reduce_names}
     if not consumer_reduce_by_name:
         return {}
 
@@ -175,7 +177,7 @@ def _detect_reduce_axis_aliases(
         return aliases
     w = writes[0]
 
-    producer_free_names = {a.name for a in producer_op.axes if a.kind == "free"}
+    producer_free_names = {a.name for a in producer_op.axes if a.name not in producer_reduce_names}
     flow_alias_found = False
     for cp in consumer_ports:
         c_port = consumer_op.inputs[cp]

@@ -31,7 +31,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     if out_shape and not all(isinstance(d, int) for d in out_shape):
         return None
 
-    axes = tuple(Axis(name=f"a{i}", extent=int(d), kind="free") for i, d in enumerate(out_shape))
+    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
 
     ports: list[Port] = []
     args: list[str] = []

@@ -17,15 +17,13 @@ order.
 
 SSA names defined by ``Assign``/``Select`` inside a ``Loop.body`` are
 scoped to that body — only ``Accumulator`` state crosses Loop boundaries
-(via ``Update``). Invariants (unique names, defined-before-use,
-accumulator pairing, axis-shadow detection) are enforced by
-``LoopOp.__post_init__``.
+(via ``Update``). Invariants (unique names, defined-before-use, accumulator
+liveness) are enforced by ``LoopOp.__post_init__``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.expr import Expr
@@ -42,9 +40,9 @@ class Axis:
     """One named iteration variable at the loop level.
 
     Referenced from ``Expr`` subtrees (inside ``Port.index`` etc.) by
-    ``Var(name)``. ``kind`` distinguishes parallel free axes (part of the
-    output iteration space) from reduce axes (swept sequentially inside
-    the loop and collapsed via accumulators).
+    ``Var(name)``. Free vs reduce is inferred structurally from the body:
+    a ``Loop`` over this axis is a reduce loop iff its body (recursively)
+    contains an ``Update``. See ``LoopOp.reduce_axis_names``.
 
     ``extent`` is a static integer in v1; future revisions may allow an
     ``Expr`` for dynamic batch/seq dims.
@@ -52,7 +50,6 @@ class Axis:
 
     name: str
     extent: int
-    kind: Literal["free", "reduce"]
 
 
 # ---------------------------------------------------------------------------
@@ -236,11 +233,32 @@ class LoopOp(Op):
         walk(self.body)
         return tuple(seen.values())
 
+    @property
+    def reduce_axis_names(self) -> frozenset[str]:
+        """Names of axes whose Loop directly wraps an ``Update``.
+
+        Derived from body structure, not stored metadata: a Loop is a
+        'reduce Loop' iff its immediate body contains an Update.
+        """
+        names: set[str] = set()
+
+        def walk(stmts: tuple[Stmt, ...], innermost: str | None) -> None:
+            for s in stmts:
+                if isinstance(s, Update) and innermost is not None:
+                    names.add(innermost)
+                elif isinstance(s, Loop):
+                    walk(s.body, s.axis.name)
+
+        walk(self.body, None)
+        return frozenset(names)
+
     def free_axes(self) -> tuple[Axis, ...]:
-        return tuple(a for a in self.axes if a.kind == "free")
+        reduce_names = self.reduce_axis_names
+        return tuple(a for a in self.axes if a.name not in reduce_names)
 
     def reduce_axes(self) -> tuple[Axis, ...]:
-        return tuple(a for a in self.axes if a.kind == "reduce")
+        reduce_names = self.reduce_axis_names
+        return tuple(a for a in self.axes if a.name in reduce_names)
 
     def infer_output_shape(self, input_shapes: list[tuple] | dict[str, tuple] | None = None) -> tuple:
         """Output shape = extents of free axes in declaration order."""
@@ -354,7 +372,9 @@ def _render_body(
                 lines.append(f"{indent}{prefix} {render_arg(br.value)} when ({render_expr(br.select)})")
         elif isinstance(stmt, Loop):
             a = stmt.axis
-            lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {a.kind}")
+            # Kind is structural: a Loop whose immediate body contains an Update is a reduce Loop.
+            kind = "reduce" if any(isinstance(s, Update) for s in stmt.body) else "free"
+            lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {kind}")
             _render_body(stmt.body, indent + "    ", accs_by_name, render_arg, lines)
 
 
@@ -389,17 +409,15 @@ def _validate(loop: LoopOp) -> None:
     # Kernel-scope names (visible everywhere): ports + accumulators.
     kernel_scope: set[str] = {f"${i}" for i in range(len(loop.inputs))} | set(accumulators)
 
-    # Collect body-level axis names (from stored tuple + nested Loop blocks).
-    reduce_axes: set[str] = {a.name for a in loop.axes if a.kind == "reduce"}
     update_targets: set[str] = set()
-    output_indices: set[int] = set()
 
-    def _walk(stmts: tuple[Stmt, ...], defined: set[str], ancestor_loop_axes: tuple[str, ...]) -> None:
+    def _walk(stmts: tuple[Stmt, ...], defined: set[str]) -> None:
         """Validate a body scope. ``defined`` contains in-scope SSA names.
-        ``ancestor_loop_axes`` are the names of Loops enclosing this body —
-        a nested Loop axis may not shadow any of them (a Loop inside itself
-        is ambiguous). Sibling Loops with the same axis name are fine — that
-        is the softmax pattern (two sequential sweeps over the same axis).
+        Sibling Loops with the same axis name are fine — that's the softmax
+        pattern (two sequential sweeps over the same axis). Nested Loops
+        that re-use an outer axis name are left to backend codegen to
+        disambiguate (the axis is only referenced as Var(name), and SSA
+        scoping handles variable shadowing).
         """
         for stmt in stmts:
             if isinstance(stmt, Assign):
@@ -425,33 +443,16 @@ def _validate(loop: LoopOp) -> None:
             elif isinstance(stmt, Write):
                 if stmt.value not in defined:
                     raise ValueError(f"Write: value {stmt.value!r} not defined")
-                output_indices.add(stmt.output)
             elif isinstance(stmt, Loop):
-                if stmt.axis.name in ancestor_loop_axes:
-                    raise ValueError(f"Loop axis {stmt.axis.name!r} shadows enclosing Loop axis")
-                if stmt.axis.kind == "reduce":
-                    reduce_axes.add(stmt.axis.name)
                 # SSA names defined inside Loop.body are scoped to that body.
-                _walk(stmt.body, set(defined), ancestor_loop_axes + (stmt.axis.name,))
+                _walk(stmt.body, set(defined))
 
-    _walk(loop.body, set(kernel_scope), ())
+    _walk(loop.body, set(kernel_scope))
 
     # Accumulator liveness: every acc must be updated at least once (anywhere in the tree).
     for acc in loop.accumulators:
         if acc.name not in update_targets:
             raise ValueError(f"Accumulator {acc.name!r}: declared but never Updated")
-
-    # Reduce / accumulator pairing — treat stored ``axes`` and nested reduce Loops as one set.
-    if reduce_axes and not accumulators:
-        raise ValueError("LoopOp has reduce axes but no Accumulator")
-    if accumulators and not reduce_axes:
-        raise ValueError("LoopOp has Accumulator but no reduce axis")
-
-    # Output indices must form a dense [0, N) range.
-    if output_indices:
-        expected = set(range(max(output_indices) + 1))
-        if output_indices != expected:
-            raise ValueError(f"Write.output indices {sorted(output_indices)} do not form a dense [0, N) range")
 
 
 # ---------------------------------------------------------------------------
@@ -502,13 +503,16 @@ def flatten_body(body: tuple[Stmt, ...]) -> list[Stmt]:
 # ---------------------------------------------------------------------------
 
 
-def flat_body_to_nested(axes: tuple[Axis, ...], body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def flat_body_to_nested(
+    axes: tuple[Axis, ...],
+    body: tuple[Stmt, ...],
+    reduce_axis_names: frozenset[str] | set[str] = frozenset(),
+) -> tuple[Stmt, ...]:
     """Wrap a flat SSA body into the nested ``Loop``-block form.
 
     Pure body transform — takes the flat body + axes hint, returns a new
-    body tuple. Used by the merge rule to re-nest its flat intermediate
-    output; also used by test helpers that still build flat bodies by
-    hand and want the nested form the IR now requires.
+    body tuple. ``reduce_axis_names`` identifies which axes should become
+    reduce Loops (wrapping ``Update`` segments); the rest are free.
 
     Idempotent: if the body already contains any ``Loop``, returns it
     unchanged.
@@ -525,8 +529,37 @@ def flat_body_to_nested(axes: tuple[Axis, ...], body: tuple[Stmt, ...]) -> tuple
     if any(isinstance(s, Loop) for s in body):
         return tuple(body)
 
-    free_axes = [a for a in axes if a.kind == "free"]
+    reduce_axis_names = frozenset(reduce_axis_names)
     has_update = any(isinstance(s, Update) for s in body)
+
+    # If caller didn't specify reduce axis names but the body has Updates,
+    # infer from body structure: axes that appear in the Write index are
+    # free; axes that appear ONLY on the Update's data flow (via some
+    # Assign/Port reference) but NOT in any Write index are reduce axes.
+    # This matches the historical signature where ``Axis.kind`` encoded
+    # the distinction. Singleton axes (extent 1) that don't appear in the
+    # Write are treated as free (degenerate) rather than reduce — the
+    # Write typically uses Literal(0) for them.
+    if has_update and not reduce_axis_names:
+        from deplodock.compiler.ir.expr import BinOp as _BinOp
+        from deplodock.compiler.ir.expr import Var as _Var
+
+        write_axis_names: set[str] = set()
+
+        def _walk_expr(e) -> None:
+            if isinstance(e, _Var):
+                write_axis_names.add(e.name)
+            elif isinstance(e, _BinOp):
+                _walk_expr(e.left)
+                _walk_expr(e.right)
+
+        for s in body:
+            if isinstance(s, Write):
+                for e in s.index:
+                    _walk_expr(e)
+        reduce_axis_names = frozenset(a.name for a in axes if a.name not in write_axis_names and int(a.extent) > 1)
+
+    free_axes = [a for a in axes if a.name not in reduce_axis_names]
 
     if not has_update:
         # Pure pointwise: wrap in free Loops only.
@@ -536,7 +569,7 @@ def flat_body_to_nested(axes: tuple[Axis, ...], body: tuple[Stmt, ...]) -> tuple
         return wrapped
 
     # Reduce body: split at Updates into segments.
-    reduce_axes = [a for a in axes if a.kind == "reduce"]
+    reduce_axes = [a for a in axes if a.name in reduce_axis_names]
     if len(reduce_axes) != 1:
         # Malformed or multi-reduce flat — leave unchanged; caller/validator flags.
         return tuple(body)

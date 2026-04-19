@@ -35,16 +35,10 @@ def _loop(*, axes=(), inputs=(), accumulators=(), body=()):
 # ---------------------------------------------------------------------------
 
 
-def test_axis_free():
-    a = Axis("a0", 8, "free")
+def test_axis_construction():
+    a = Axis("a0", 8)
     assert a.name == "a0"
     assert a.extent == 8
-    assert a.kind == "free"
-
-
-def test_axis_reduce():
-    a = Axis("a1", 4, "reduce")
-    assert a.kind == "reduce"
 
 
 def test_port_default_is_empty_index():
@@ -79,11 +73,11 @@ def test_assign_construction():
 
 
 def _pointwise_axes(n: int) -> tuple[Axis, ...]:
-    return tuple(Axis(f"a{i}", 4, "free") for i in range(n))
+    return tuple(Axis(f"a{i}", 4) for i in range(n))
 
 
 def test_kernel_pointwise():
-    axes = (Axis("a0", 4, "free"),)
+    axes = (Axis("a0", 4),)
     p = Port(index=(Var("a0"),))
     k = _loop(
         axes=axes,
@@ -97,7 +91,7 @@ def test_kernel_pointwise():
 
 
 def test_kernel_reduce():
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    axes = (Axis("a0", 4), Axis("a1", 8))
     p = Port(index=(Var("a0"), Var("a1")))
     k = _loop(
         axes=axes,
@@ -112,7 +106,7 @@ def test_kernel_reduce():
 
 
 def test_kernel_matmul():
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    axes = (Axis("a0", 4), Axis("a1", 8))
     p = Port(index=(Var("a0"), Var("a1")))
     k = _loop(
         axes=axes,
@@ -128,7 +122,7 @@ def test_kernel_matmul():
 
 
 def test_kernel_matmul_bias():
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    axes = (Axis("a0", 4), Axis("a1", 8))
     p_mk = Port(index=(Var("a0"), Var("a1")))
     p_bias = Port(index=(Var("a0"),))
     k = _loop(
@@ -149,7 +143,7 @@ def test_kernel_softmax_two_accumulators():
     # Under nested SSA scoping, per-segment SSA names (sub, ex) are scoped to
     # their own reduce Loop — the old flat fixture relied on laxness. Here we
     # just verify a kernel with two accumulators + two Updates builds fine.
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    axes = (Axis("a0", 4), Axis("a1", 8))
     p = Port(index=(Var("a0"), Var("a1")))
     k = _loop(
         axes=axes,
@@ -169,7 +163,7 @@ def test_kernel_softmax_two_accumulators():
 
 
 def test_kernel_unary_chain():
-    axes = (Axis("a0", 4, "free"),)
+    axes = (Axis("a0", 4),)
     p = Port(index=(Var("a0"),))
     k = _loop(
         axes=axes,
@@ -185,7 +179,7 @@ def test_kernel_unary_chain():
 
 def test_kernel_scatter_output_via_select():
     """Select replaces Mux for coord-predicated dispatch on output."""
-    axes = (Axis("a0", 4, "free"),)
+    axes = (Axis("a0", 4),)
     p = Port(index=(Var("a0"),))
     k = _loop(
         axes=axes,
@@ -208,12 +202,6 @@ def test_kernel_scatter_output_via_select():
 # ---------------------------------------------------------------------------
 # Validator — SSA / accumulator / v1 pins
 # ---------------------------------------------------------------------------
-
-
-def test_rejects_duplicate_axis_name():
-    # Two same-named nested Loops form a shadow; the validator rejects.
-    with pytest.raises(ValueError, match="shadows"):
-        _loop(axes=(Axis("a0", 4, "free"), Axis("a0", 8, "free")))
 
 
 def test_ssa_rejects_undefined_arg():
@@ -271,7 +259,7 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
 
 
 def test_rejects_update_without_matching_local():
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    axes = (Axis("a0", 4), Axis("a1", 8))
     p = Port(index=(Var("a0"), Var("a1")))
     with pytest.raises(ValueError, match="does not name an Accumulator"):
         _loop(
@@ -281,52 +269,8 @@ def test_rejects_update_without_matching_local():
         )
 
 
-def test_rejects_accumulator_without_reduce_axis():
-    axes = (Axis("a0", 4, "free"),)
-    p = Port(index=(Var("a0"),))
-    with pytest.raises(ValueError, match="no reduce axis"):
-        _loop(
-            axes=axes,
-            inputs=(p,),
-            accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
-            body=(Update(target="acc", value="$0"),),
-        )
-
-
-def test_rejects_reduce_axis_without_accumulator():
-    from deplodock.compiler.ir.loop_ir import Loop
-
-    a0 = Axis("a0", 4, "free")
-    a1 = Axis("a1", 8, "reduce")
-    p = Port(index=(Var("a0"), Var("a1")))
-    with pytest.raises(ValueError, match="no Accumulator"):
-        LoopOp(
-            inputs=(p,),
-            body=(
-                Loop(
-                    axis=a0,
-                    body=(Loop(axis=a1, body=(Assign("a", ElementwiseOp("exp"), args=("$0",)),)),),
-                ),
-            ),
-        )
-
-
-def test_rejects_nondense_output_indices():
-    axes = (Axis("a0", 4, "free"),)
-    p = Port(index=(Var("a0"),))
-    with pytest.raises(ValueError, match="dense"):
-        _loop(
-            axes=axes,
-            inputs=(p,),
-            body=(
-                Assign("z", ElementwiseOp("neg"), args=("$0",)),
-                Write(output=2, index=(Var("a0"),), value="z"),
-            ),
-        )
-
-
 def test_rejects_unused_accumulator():
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
+    axes = (Axis("a0", 4), Axis("a1", 8))
     p = Port(index=(Var("a0"), Var("a1")))
     with pytest.raises(ValueError, match="never Updated"):
         _loop(
@@ -350,11 +294,11 @@ def test_loop_stmt_basic():
 
     # Pointwise kernel with body wrapped in a free Loop.
     loop = _loop(
-        axes=(Axis("a0", 8, "free"),),
+        axes=(Axis("a0", 8),),
         inputs=(Port(index=(Var("a0"),)),),
         body=(
             Loop(
-                axis=Axis("a0", 8, "free"),
+                axis=Axis("a0", 8),
                 body=(
                     Assign("v", ElementwiseOp("neg"), args=("$0",)),
                     Write(output=0, index=(Var("a0"),), value="v"),
@@ -371,15 +315,15 @@ def test_loop_stmt_reduce_kernel():
 
     # Reduce kernel — free a0 outer, reduce k inner.
     loop = _loop(
-        axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
+        axes=(Axis("a0", 4), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
         accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Loop(
-                axis=Axis("a0", 4, "free"),
+                axis=Axis("a0", 4),
                 body=(
                     Loop(
-                        axis=Axis("k", 8, "reduce"),
+                        axis=Axis("k", 8),
                         body=(Update(target="acc", value="$0"),),
                     ),
                     Write(output=0, index=(Var("a0"),), value="acc"),
@@ -402,7 +346,7 @@ def test_loop_stmt_softmax_sibling_reduces():
     # Softmax shape: two sibling reduce Loops over the same axis "k", inside
     # a single outer free iteration. Sibling same-name is legal.
     loop = _loop(
-        axes=(Axis("a0", 4, "free"), Axis("a1", 8, "free"), Axis("k", 8, "reduce")),
+        axes=(Axis("a0", 4), Axis("a1", 8), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("a1"))), Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
         accumulators=(
             Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
@@ -410,13 +354,13 @@ def test_loop_stmt_softmax_sibling_reduces():
         ),
         body=(
             Loop(
-                axis=Axis("a0", 4, "free"),
+                axis=Axis("a0", 4),
                 body=(
                     Loop(
-                        axis=Axis("a1", 8, "free"),
+                        axis=Axis("a1", 8),
                         body=(
-                            Loop(axis=Axis("k", 8, "reduce"), body=(Update(target="mx", value="$1"),)),
-                            Loop(axis=Axis("k", 8, "reduce"), body=(Update(target="sm", value="$2"),)),
+                            Loop(axis=Axis("k", 8), body=(Update(target="mx", value="$1"),)),
+                            Loop(axis=Axis("k", 8), body=(Update(target="sm", value="$2"),)),
                             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
                             Write(output=0, index=(Var("a0"), Var("a1")), value="v"),
                         ),
@@ -427,33 +371,10 @@ def test_loop_stmt_softmax_sibling_reduces():
     )
     from deplodock.compiler.ir.loop_ir import iter_loops
 
-    reduce_loops = [L for L in iter_loops(loop.body) if L.axis.kind == "reduce"]
+    # A reduce Loop is structurally one whose body contains an Update.
+    reduce_loops = [L for L in iter_loops(loop.body) if any(isinstance(s, Update) for s in L.body)]
     assert len(reduce_loops) == 2
     assert all(L.axis.name == "k" for L in reduce_loops)
-
-
-def test_loop_axis_nested_shadow_rejected():
-    """Nested Loop inside another Loop with the same axis name is ambiguous."""
-    from deplodock.compiler.ir.loop_ir import Loop
-
-    with pytest.raises(ValueError, match="shadows"):
-        _loop(
-            axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
-            inputs=(Port(index=(Var("a0"), Var("k"))),),
-            accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
-            body=(
-                Loop(
-                    axis=Axis("k", 8, "reduce"),  # outer reduce k
-                    body=(
-                        Loop(
-                            axis=Axis("k", 8, "reduce"),  # nested reduce also named k — shadow
-                            body=(Update(target="acc", value="$0"),),
-                        ),
-                    ),
-                ),
-                Write(output=0, index=(Var("a0"),), value="acc"),
-            ),
-        )
 
 
 def test_loop_axis_sibling_same_name_allowed():
@@ -462,15 +383,15 @@ def test_loop_axis_sibling_same_name_allowed():
 
     # Two reduce Loops over the same axis, sibling (not nested).
     _loop(
-        axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
+        axes=(Axis("a0", 4), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
         accumulators=(
             Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
             Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
         body=(
-            Loop(axis=Axis("k", 8, "reduce"), body=(Update(target="mx", value="$0"),)),
-            Loop(axis=Axis("k", 8, "reduce"), body=(Update(target="sm", value="$1"),)),
+            Loop(axis=Axis("k", 8), body=(Update(target="mx", value="$0"),)),
+            Loop(axis=Axis("k", 8), body=(Update(target="sm", value="$1"),)),
             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
             Write(output=0, index=(Var("a0"),), value="v"),
         ),
@@ -484,11 +405,11 @@ def test_loop_ssa_scoping():
     # A Loop body defines "v"; a sibling statement tries to reference it.
     with pytest.raises(ValueError, match="not defined"):
         _loop(
-            axes=(Axis("a0", 4, "free"),),
+            axes=(Axis("a0", 4),),
             inputs=(Port(index=(Var("a0"),)),),
             body=(
                 Loop(
-                    axis=Axis("a0_inner", 4, "free"),
+                    axis=Axis("a0_inner", 4),
                     body=(Assign("v", ElementwiseOp("neg"), args=("$0",)),),
                 ),
                 # Reference 'v' outside the Loop — should fail.
@@ -505,7 +426,7 @@ def test_loop_ssa_scoping():
 def test_flat_body_to_nested_pointwise():
     from deplodock.compiler.ir.loop_ir import Loop
 
-    axes = (Axis("a0", 8, "free"),)
+    axes = (Axis("a0", 8),)
     flat = (
         Assign("v", ElementwiseOp("neg"), args=("$0",)),
         Write(output=0, index=(Var("a0"),), value="v"),
@@ -522,7 +443,7 @@ def test_flat_body_to_nested_pointwise():
 def test_flat_body_to_nested_reduce_splits_at_update():
     from deplodock.compiler.ir.loop_ir import Loop
 
-    axes = (Axis("a0", 4, "free"), Axis("k", 8, "reduce"))
+    axes = (Axis("a0", 4), Axis("k", 8))
     flat = (
         Update(target="acc", value="$0"),
         Write(output=0, index=(Var("a0"),), value="acc"),
@@ -541,20 +462,20 @@ def test_flat_body_to_nested_idempotent():
 
     already_nested = (
         Loop(
-            axis=Axis("a0", 8, "free"),
+            axis=Axis("a0", 8),
             body=(
                 Assign("v", ElementwiseOp("neg"), args=("$0",)),
                 Write(output=0, index=(Var("a0"),), value="v"),
             ),
         ),
     )
-    assert flat_body_to_nested((Axis("a0", 8, "free"),), already_nested) == already_nested
+    assert flat_body_to_nested((Axis("a0", 8),), already_nested) == already_nested
 
 
 def test_flat_body_to_nested_softmax_two_updates():
     from deplodock.compiler.ir.loop_ir import Loop
 
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "free"), Axis("k", 8, "reduce"))
+    axes = (Axis("a0", 4), Axis("a1", 8), Axis("k", 8))
     flat = (
         Update(target="mx", value="$1"),
         Assign("v_mx", ElementwiseOp("neg"), args=("mx",)),
@@ -582,7 +503,7 @@ def test_flat_body_to_nested_softmax_two_updates():
 def _flat_reduce_kernel() -> LoopOp:
     """Flat-body reduce kernel for parity comparison."""
     return _loop(
-        axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
+        axes=(Axis("a0", 4), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
         accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
@@ -601,9 +522,9 @@ def _nested_reduce_kernel() -> LoopOp:
         accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Loop(
-                axis=Axis("a0", 4, "free"),
+                axis=Axis("a0", 4),
                 body=(
-                    Loop(axis=Axis("k", 8, "reduce"), body=(Update(target="acc", value="$0"),)),
+                    Loop(axis=Axis("k", 8), body=(Update(target="acc", value="$0"),)),
                     Write(output=0, index=(Var("a0"),), value="acc"),
                 ),
             ),

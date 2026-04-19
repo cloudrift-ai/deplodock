@@ -159,20 +159,14 @@ Lift-then-merge, driven by the rewriter's fixpoint loop:
      ``Var(a) ± c``, and ``Literal(0)`` broadcast slots (no binding).
      Unsupported forms (multiplicative, modular, data-dependent) make
      the merge return ``None``.
-   - Every unbound producer axis must be kind ``"reduce"`` — a leaking
+   - Every unbound producer axis must correspond to a reduce Loop in
+     the producer's body (i.e. its Loop wraps an Update). A leaking
      free axis would require replicating producer work per consumer
      slot, which we refuse.
-   - The merged kernel must have at most one reduce axis (matches the
-     current single-reduce CUDA backend — multi-reduce kernels feeding
-     reductions across different data axes stay separate).
-   - **Rank-growth guard**: refuse merging a reducing producer into a
-     consumer whose ``Write`` has higher rank. The extra consumer free
-     dims would make the producer's reduce body run once per iteration
-     of each new dim — the MLP pathology where ``gate*up`` (reduce over
-     hidden) would feed a rank-4 broadcast-then-mul before ``down_proj``
-     and blow up per-layer work by ~3500× on Qwen-scale models.
-     Rank-preserving reductions (keepdim) share the consumer's Write
-     rank, so softmax-style merges are unaffected.
+   - The merged kernel is held to at most one reduce axis — this is a
+     pragmatic constraint of ``flat_body_to_nested``'s re-nest path,
+     not a semantic limit on fusion. Removing it is gated on a
+     backend-side schedule pass that can split multi-reduce kernels.
    - Axes and SSA names are renamed to avoid collisions; producer
      Ports are substituted through σ; the producer's connecting
      ``Write`` becomes ``Assign(bridge, ElementwiseOp("copy"), …)``

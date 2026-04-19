@@ -58,8 +58,8 @@ def _softmax_launch() -> LoopLaunch:
     from deplodock.compiler.ir.expr import Literal, Var
     from deplodock.compiler.ir.loop_ir import Accumulator, Assign, Axis, Loop, LoopOp, Port, Update, Write
 
-    a0 = Axis("a0", 4, "free")
-    a1 = Axis("a1", 8, "reduce")
+    a0 = Axis("a0", 4)
+    a1 = Axis("a1", 8)
     p = Port(index=(Var("a0"), Var("a1")))
     loop = LoopOp(
         inputs=(p, p),
@@ -269,7 +269,7 @@ def _rotate_half_launch() -> LoopLaunch:
     from deplodock.compiler.ir.loop_ir import Assign, Axis, Loop, LoopOp, Port, Select, SelectBranch, Write
     from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
-    axis_a0 = Axis(name="a0", extent=64, kind="free")
+    axis_a0 = Axis(name="a0", extent=64)
     body = (
         Assign(name="v0", op=ElementwiseOp("neg"), args=("$1",)),
         Select(
@@ -318,7 +318,7 @@ def test_check_port_bounds_still_warns_without_gating_select():
     from deplodock.compiler.ir.expr import BinOp, Literal, Var
     from deplodock.compiler.ir.loop_ir import Axis, Loop, LoopOp, Port, Write
 
-    axis_a0 = Axis(name="a0", extent=64, kind="free")
+    axis_a0 = Axis(name="a0", extent=64)
     body = (Write(output=0, index=(Var("a0"),), value="$0"),)
     loop = LoopOp(
         inputs=(Port(index=(BinOp("+", Var("a0"), Literal(32, "int")),)),),
