@@ -95,6 +95,38 @@ class Accumulator:
 
 
 @dataclass(frozen=True)
+class Load:
+    """Read a value from an external input buffer into an SSA name.
+
+    Replaces the ``$N`` port-reference convention: instead of a side-channel
+    ``LoopOp.inputs`` tuple whose entries are indexed by string sentinels,
+    each read becomes an explicit statement in the body. ``source`` is the
+    index into ``LoopLaunch.input_names`` identifying which external buffer;
+    ``index`` is the dim-wise access pattern over the enclosing axes.
+    The produced SSA ``name`` is a regular value downstream stmts read.
+    """
+
+    name: str
+    source: int
+    index: tuple[Expr, ...]
+
+
+@dataclass(frozen=True)
+class AccumDecl:
+    """Declare a reduce accumulator at a body position.
+
+    Replaces the side-channel ``LoopOp.accumulators`` tuple: the accumulator
+    is live from this statement through the end of the enclosing ``Loop.body``
+    scope. ``Update`` statements with matching ``target`` name fold values
+    into it; stmts after the reduce sweep read its finalized value.
+    """
+
+    name: str
+    combine: ElementwiseOp
+    init: Expr
+
+
+@dataclass(frozen=True)
 class Assign:
     """Pure SSA body statement: ``name = op(args)``.
 
@@ -187,7 +219,7 @@ class Loop:
     body: tuple[Stmt, ...]
 
 
-Stmt = Assign | Update | Write | Select | Loop
+Stmt = Assign | Update | Write | Select | Loop | Load | AccumDecl
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +283,57 @@ class LoopOp(Op):
         walk(self.body, None)
         return frozenset(names)
 
+    @property
+    def loads(self) -> tuple[Load, ...]:
+        """All ``Load`` statements in the body, pre-order.
+
+        New-form successor to ``inputs``: Loads carry an explicit SSA name,
+        source-buffer index, and access pattern — unlike ``$N`` refs, they
+        live at the scope they're needed and can share a source with other
+        Loads that use different indices.
+        """
+        result: list[Load] = []
+
+        def walk(stmts: tuple[Stmt, ...]) -> None:
+            for s in stmts:
+                if isinstance(s, Load):
+                    result.append(s)
+                elif isinstance(s, Loop):
+                    walk(s.body)
+
+        walk(self.body)
+        return tuple(result)
+
+    @property
+    def num_inputs(self) -> int:
+        """Number of external input buffers referenced by body Loads.
+
+        Derived as ``max(load.source) + 1``, or 0 when no Loads are present.
+        This is the count ``LoopLaunch.input_names`` must provide.
+        """
+        loads = self.loads
+        return max((ld.source for ld in loads), default=-1) + 1
+
+    @property
+    def accum_decls(self) -> tuple[AccumDecl, ...]:
+        """All ``AccumDecl`` statements in the body, pre-order.
+
+        New-form successor to ``accumulators``: scope is lexical — each
+        AccumDecl is live from its position through the end of the
+        enclosing ``Loop.body`` (or the kernel body, at top level).
+        """
+        result: list[AccumDecl] = []
+
+        def walk(stmts: tuple[Stmt, ...]) -> None:
+            for s in stmts:
+                if isinstance(s, AccumDecl):
+                    result.append(s)
+                elif isinstance(s, Loop):
+                    walk(s.body)
+
+        walk(self.body)
+        return tuple(result)
+
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
 
@@ -313,8 +396,16 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
     ``$N[...]`` with the port's index exprs inlined.
     """
     ports = loop.inputs
-    buffers = port_buffers or [f"${i}" for i in range(len(ports))]
-    accs_by_name: dict[str, Accumulator] = {a.name: a for a in loop.accumulators}
+    # Buffer names used when rendering Load stmts and $N port refs. Sized
+    # to cover both the legacy inputs tuple and body Loads.
+    nbufs = max(len(ports), loop.num_inputs)
+    buffers = list(port_buffers) if port_buffers else [f"${i}" for i in range(nbufs)]
+    # Extend if port_buffers was shorter than what the body references.
+    while len(buffers) < nbufs:
+        buffers.append(f"${len(buffers)}")
+    accs_by_name: dict[str, Accumulator | AccumDecl] = {a.name: a for a in loop.accumulators}
+    for decl in loop.accum_decls:
+        accs_by_name[decl.name] = decl
 
     def render_arg(name: str) -> str:
         if name.startswith("$"):
@@ -331,15 +422,16 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
     for acc in loop.accumulators:
         lines.append(f"{indent}{acc.name} = {render_expr(acc.init)}")
 
-    _render_body(loop.body, indent, accs_by_name, render_arg, lines)
+    _render_body(loop.body, indent, accs_by_name, render_arg, buffers, lines)
     return "\n".join(lines)
 
 
 def _render_body(
     stmts: tuple[Stmt, ...],
     indent: str,
-    accs_by_name: dict[str, Accumulator],
+    accs_by_name: dict[str, Accumulator | AccumDecl],
     render_arg,
+    buffers: list[str],
     lines: list[str],
 ) -> None:
     """Render a body tuple (recursive for nested ``Loop``)."""
@@ -347,6 +439,12 @@ def _render_body(
         if isinstance(stmt, Assign):
             args = ", ".join(render_arg(a) for a in stmt.args)
             lines.append(f"{indent}{stmt.name} = {stmt.op.fn}({args})")
+        elif isinstance(stmt, Load):
+            buf = buffers[stmt.source] if 0 <= stmt.source < len(buffers) else f"src{stmt.source}"
+            idx = ", ".join(render_expr(e) for e in stmt.index)
+            lines.append(f"{indent}{stmt.name} = load {buf}[{idx}]")
+        elif isinstance(stmt, AccumDecl):
+            lines.append(f"{indent}{stmt.name} = {render_expr(stmt.init)}  # accum, combine={stmt.combine.fn}")
         elif isinstance(stmt, Update):
             acc = accs_by_name.get(stmt.target)
             fn = acc.combine.fn if acc is not None else "?"
@@ -363,7 +461,7 @@ def _render_body(
             # Kind is structural: a Loop whose immediate body contains an Update is a reduce Loop.
             kind = "reduce" if any(isinstance(s, Update) for s in stmt.body) else "free"
             lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {kind}")
-            _render_body(stmt.body, indent + "    ", accs_by_name, render_arg, lines)
+            _render_body(stmt.body, indent + "    ", accs_by_name, render_arg, buffers, lines)
 
 
 # ---------------------------------------------------------------------------
@@ -387,14 +485,21 @@ def _validate(loop: LoopOp) -> None:
             raise ValueError(f"LoopOp.axes: duplicate axis name {a.name!r}")
         all_axis_names.add(a.name)
 
-    # Accumulator uniqueness.
-    accumulators: dict[str, Accumulator] = {}
+    # Accumulator uniqueness — covers both kernel-scope stored field and
+    # in-body AccumDecls. Duplicate names across either source is rejected.
+    accumulators: dict[str, Accumulator | AccumDecl] = {}
     for acc in loop.accumulators:
         if acc.name in accumulators:
             raise ValueError(f"Accumulator: duplicate name {acc.name!r}")
         accumulators[acc.name] = acc
+    for decl in loop.accum_decls:
+        if decl.name in accumulators:
+            raise ValueError(f"Accumulator: duplicate name {decl.name!r}")
+        accumulators[decl.name] = decl
 
-    # Kernel-scope names (visible everywhere): ports + accumulators.
+    # Kernel-scope names (visible everywhere): $N ports (old form) + all
+    # accumulators (old tuple + body decls). Body-level Load/AccumDecl
+    # bindings get added as the walk encounters them.
     kernel_scope: set[str] = {f"${i}" for i in range(len(loop.inputs))} | set(accumulators)
 
     update_targets: set[str] = set()
@@ -414,6 +519,19 @@ def _validate(loop: LoopOp) -> None:
                         raise ValueError(f"Assign {stmt.name!r}: arg {arg!r} not defined")
                 if stmt.name in defined:
                     raise ValueError(f"Assign {stmt.name!r}: name already defined")
+                defined.add(stmt.name)
+            elif isinstance(stmt, Load):
+                # Load is a binding site — introduces its SSA name. Source-index
+                # bounds check happens here only when the legacy inputs field is
+                # populated; otherwise num_inputs is self-derived from Loads.
+                if loop.inputs and (stmt.source < 0 or stmt.source >= len(loop.inputs)):
+                    raise ValueError(f"Load {stmt.name!r}: source {stmt.source} out of range 0..{len(loop.inputs)}")
+                if stmt.name in defined:
+                    raise ValueError(f"Load {stmt.name!r}: name already defined")
+                defined.add(stmt.name)
+            elif isinstance(stmt, AccumDecl):
+                # AccumDecl uniqueness was checked above (across field + body).
+                # Here just confirm the name becomes an in-scope readable value.
                 defined.add(stmt.name)
             elif isinstance(stmt, Update):
                 if stmt.target not in accumulators:
@@ -438,9 +556,9 @@ def _validate(loop: LoopOp) -> None:
     _walk(loop.body, set(kernel_scope))
 
     # Accumulator liveness: every acc must be updated at least once (anywhere in the tree).
-    for acc in loop.accumulators:
-        if acc.name not in update_targets:
-            raise ValueError(f"Accumulator {acc.name!r}: declared but never Updated")
+    for acc_name in accumulators:
+        if acc_name not in update_targets:
+            raise ValueError(f"Accumulator {acc_name!r}: declared but never Updated")
 
 
 # ---------------------------------------------------------------------------
