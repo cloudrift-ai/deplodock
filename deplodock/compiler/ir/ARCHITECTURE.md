@@ -35,7 +35,7 @@ PyTorch module
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ LAYER 2 · Lowering — Graph populated with LOOP IR ops (loop.py)                                                      │
 │   LoopOp (one per GPU kernel) — SSA program over named Axes. Ports read external buffers via Expr index              │
-│   patterns; LocalBuffers carry accumulator state; body statements (Assign/Update/Write/Select) execute               │
+│   patterns; Accumulators carry accumulator state; body statements (Assign/Update/Write/Select) execute               │
 │   in order. + InputOp / ConstantOp as buffer sources.                                                                │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
    │  compile_graph → LoopProgram (program/loop.py)
@@ -160,9 +160,9 @@ loop-nest that codegen eventually emits — one ``LoopOp`` maps to one
 | ``Axis``                      | Named iteration variable (``name`` + ``extent`` + ``kind={"free","reduce"}``).                                    |
 | ``LoopOp``                    | One kernel: ``axes`` + ``inputs`` + ``locals`` + nested ``body``.                                                 |
 | ``Port``                      | Access pattern for one external buffer — ``index: tuple[Expr, ...]`` over axis Vars.                              |
-| ``LocalBuffer``               | Thread-local state: scalar accumulator (``combine`` set) or scratch. v1 pins ``shape=()`` and ``scope="thread"``. |
+| ``Accumulator``               | Reduce accumulator: ``name``, ``combine`` (ElementwiseOp), ``init`` (Expr). Folded by ``Update``.                |
 | ``Assign``                    | SSA body stmt: ``name = op(args)`` with ``op: ElementwiseOp``.                                                    |
-| ``Update``                    | Fold a value into a ``LocalBuffer`` accumulator: ``acc = combine(acc, value)``.                                   |
+| ``Update``                    | Fold a value into a ``Accumulator`` accumulator: ``acc = combine(acc, value)``.                                   |
 | ``Write``                     | Write an SSA value to output ``output`` at ``index``.                                                             |
 | ``Select`` + ``SelectBranch`` | Coord-predicated binding (replaces the old Mux).                                                                  |
 | ``Loop``                      | Explicit iteration block: ``axis`` (free or reduce) + nested ``body``. Body runs ``axis.extent`` times.           |
@@ -176,9 +176,9 @@ regardless of block structure.
 
 **Rule:** Imports ``base``, ``expr``, and ``tensor`` (``ElementwiseOp``
 only — ``ReduceOp`` is NOT a valid ``Assign.op``). Reductions are
-modeled as ``LocalBuffer`` + ``Update`` inside a reduce ``Loop``. SSA
+modeled as ``Accumulator`` + ``Update`` inside a reduce ``Loop``. SSA
 names defined inside a Loop body are scoped to that body — only
-``LocalBuffer`` accumulators cross Loop boundaries.
+``Accumulator`` accumulators cross Loop boundaries.
 
 ### `loop_plan.py` — analysis: LoopOp → KernelPlan (Layer 2)
 

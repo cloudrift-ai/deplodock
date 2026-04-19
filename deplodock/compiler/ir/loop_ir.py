@@ -3,26 +3,23 @@
 After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
-    inputs: tuple[Port, ...]            — per-input access patterns
-    locals: tuple[LocalBuffer, ...]     — thread-local state (accumulators,
-                                          scratch); v1: scalar + scope=thread
-    body  : tuple[Stmt, ...]            — SSA: Assign | Update | Write | Select | Loop
-    axes  : computed property           — iteration space walked from body's Loop tree
+    inputs      : tuple[Port, ...]           — per-input access patterns
+    accumulators: tuple[Accumulator, ...]    — reduce accumulators
+    body        : tuple[Stmt, ...]           — SSA: Assign | Update | Write | Select | Loop
+    axes        : computed property          — iteration space walked from body's Loop tree
 
 Iteration is explicit via ``Loop(axis, body)`` statements. Each ``Loop``
 is one iteration dimension; ``Loop.body`` runs ``axis.extent`` times.
-Reduce-kind Loops fold ``Update`` statements into outer ``LocalBuffer``
-accumulators. Free-kind Loops run in parallel with no accumulator
-folding. Reading top-to-bottom matches execution order.
-
-Reductions are modeled as explicit accumulator state: each reduction
-contributes a ``LocalBuffer`` (with a ``combine`` op and ``init`` value)
-plus one or more ``Update`` statements that fold values in.
+Reduce-kind Loops fold ``Update`` statements into an ``Accumulator``
+declared on the enclosing ``LoopOp``. Free-kind Loops run in parallel
+with no accumulator folding. Reading top-to-bottom matches execution
+order.
 
 SSA names defined by ``Assign``/``Select`` inside a ``Loop.body`` are
-scoped to that body — only ``LocalBuffer`` accumulators cross Loop
-boundaries. Invariants (unique names, defined-before-use, accumulator
-pairing, axis-shadow detection) are enforced by ``LoopOp.__post_init__``.
+scoped to that body — only ``Accumulator`` state crosses Loop boundaries
+(via ``Update``). Invariants (unique names, defined-before-use,
+accumulator pairing, axis-shadow detection) are enforced by
+``LoopOp.__post_init__``.
 """
 
 from __future__ import annotations
@@ -77,30 +74,23 @@ class Port:
 
 
 # ---------------------------------------------------------------------------
-# LocalBuffer — thread-local scratch / accumulator
+# Accumulator — reduce accumulator declaration
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class LocalBuffer:
-    """Thread-local state: accumulator (combine set) or scratch (combine=None).
+class Accumulator:
+    """Reduce accumulator folded across a reduce axis by ``Update``.
 
-    Accumulators are declared with an ``init`` value and a ``combine``
-    ElementwiseOp; ``Update`` statements fold new values into them via the
-    combine op. After the reduce sweep, other body statements read the
-    accumulator's finalized value by referring to its ``name``.
-
-    v1 invariants (enforced): ``shape == ()`` (scalar) and
-    ``scope == "thread"``. The ``shape`` / ``scope`` fields exist for
-    forward-compat with Stage-2 smem tiling.
+    Semantics per ``Update``: ``acc = combine(acc, value)``, initialized
+    to ``init`` before the reduce sweep. After the sweep, body statements
+    read the finalized value by referring to ``name``.
     """
 
     name: str
+    combine: ElementwiseOp
+    init: Expr
     dtype: str = "f32"
-    init: Expr | None = None
-    combine: ElementwiseOp | None = None
-    shape: tuple[int, ...] = ()
-    scope: Literal["thread", "warp", "block"] = "thread"
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +103,8 @@ class Assign:
     """Pure SSA body statement: ``name = op(args)``.
 
     ``op`` is always an ``ElementwiseOp`` (reductions have moved to
-    ``LocalBuffer`` + ``Update``). ``args`` reference ``$N`` ports,
-    ``LocalBuffer.name`` (reads current / finalized acc value), or prior
+    ``Accumulator`` + ``Update``). ``args`` reference ``$N`` ports,
+    ``Accumulator.name`` (reads current / finalized acc value), or prior
     SSA names.
     """
 
@@ -125,12 +115,12 @@ class Assign:
 
 @dataclass(frozen=True)
 class Update:
-    """Fold a value into a LocalBuffer accumulator.
+    """Fold a value into an Accumulator.
 
-    Semantics: ``acc = combine(acc, value)`` where ``combine`` is the
-    LocalBuffer's combine op. ``target`` must name a LocalBuffer with
-    ``combine is not None``. ``value`` references an SSA name (Assign,
-    prior Update target finalized, or ``$N``).
+    Semantics: ``acc = combine(acc, value)`` using the Accumulator's
+    ``combine`` op. ``target`` must name an ``Accumulator``; ``value``
+    references an SSA name (Assign, prior Update target finalized, or
+    ``$N``).
 
     The positionally-last Update in ``LoopOp.body`` marks the end of the
     reduce sweep: statements after read finalized accumulators.
@@ -187,13 +177,13 @@ class Loop:
     """Explicit iteration block — one loop over an axis.
 
     ``body`` executes ``axis.extent`` times, once per axis value. Reduce-kind
-    Loops fold any ``Update`` statements in their body into the outer
-    ``LocalBuffer`` accumulator (one sweep over the axis per accumulator).
-    Free-kind Loops run in parallel with no folding.
+    Loops fold any ``Update`` statements in their body into the enclosing
+    ``Accumulator`` (one sweep over the axis per accumulator). Free-kind
+    Loops run in parallel with no folding.
 
     SSA scoping: ``Assign`` / ``Select`` names defined inside ``body`` are
     scoped to that body — invisible to statements outside the Loop. Only
-    ``LocalBuffer`` accumulators (written via ``Update``) cross the Loop
+    ``Accumulator`` state (written via ``Update``) crosses the Loop
     boundary, carrying the finalized reduced value.
     """
 
@@ -219,7 +209,7 @@ class LoopOp(Op):
     """
 
     inputs: tuple[Port, ...] = ()
-    locals: tuple[LocalBuffer, ...] = ()
+    accumulators: tuple[Accumulator, ...] = ()
     body: tuple[Stmt, ...] = ()
 
     def __post_init__(self) -> None:
@@ -311,14 +301,14 @@ class LoopOp(Op):
 def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: str = "") -> str:
     """Render a ``LoopOp`` as an explicit nested-loop program.
 
-    ``LocalBuffer`` inits show at the top as plain assignments. Each ``Loop``
+    ``Accumulator`` inits show at the top as plain assignments. Each ``Loop``
     block renders as ``for X in 0..N:  # kind``. ``$N`` port references are
     rendered as ``buf[...]`` when ``port_buffers`` is supplied, otherwise as
     ``$N[...]`` with the port's index exprs inlined.
     """
     ports = loop.inputs
     buffers = port_buffers or [f"${i}" for i in range(len(ports))]
-    locals_by_name: dict[str, LocalBuffer] = {lb.name: lb for lb in loop.locals}
+    accs_by_name: dict[str, Accumulator] = {a.name: a for a in loop.accumulators}
 
     def render_arg(name: str) -> str:
         if name.startswith("$"):
@@ -332,19 +322,17 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
         return name
 
     lines: list[str] = []
-    for lb in loop.locals:
-        if lb.init is None:
-            continue
-        lines.append(f"{indent}{lb.name} = {render_expr(lb.init)}")
+    for acc in loop.accumulators:
+        lines.append(f"{indent}{acc.name} = {render_expr(acc.init)}")
 
-    _render_body(loop.body, indent, locals_by_name, render_arg, lines)
+    _render_body(loop.body, indent, accs_by_name, render_arg, lines)
     return "\n".join(lines)
 
 
 def _render_body(
     stmts: tuple[Stmt, ...],
     indent: str,
-    locals_by_name: dict[str, LocalBuffer],
+    accs_by_name: dict[str, Accumulator],
     render_arg,
     lines: list[str],
 ) -> None:
@@ -354,8 +342,8 @@ def _render_body(
             args = ", ".join(render_arg(a) for a in stmt.args)
             lines.append(f"{indent}{stmt.name} = {stmt.op.fn}({args})")
         elif isinstance(stmt, Update):
-            lb = locals_by_name.get(stmt.target)
-            fn = lb.combine.fn if lb is not None and lb.combine is not None else "?"
+            acc = accs_by_name.get(stmt.target)
+            fn = acc.combine.fn if acc is not None else "?"
             lines.append(f"{indent}{stmt.target} <- {fn}({stmt.target}, {render_arg(stmt.value)})")
         elif isinstance(stmt, Write):
             idx = ", ".join(render_expr(e) for e in stmt.index)
@@ -367,7 +355,7 @@ def _render_body(
         elif isinstance(stmt, Loop):
             a = stmt.axis
             lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {a.kind}")
-            _render_body(stmt.body, indent + "    ", locals_by_name, render_arg, lines)
+            _render_body(stmt.body, indent + "    ", accs_by_name, render_arg, lines)
 
 
 # ---------------------------------------------------------------------------
@@ -376,11 +364,11 @@ def _render_body(
 
 
 def _validate(loop: LoopOp) -> None:
-    """Enforce Axis uniqueness, SSA invariants, accumulator pairing, v1 pins.
+    """Enforce Axis uniqueness, SSA invariants, accumulator pairing.
 
     Body validation recurses into ``Loop`` blocks. SSA names defined inside a
     ``Loop.body`` are scoped to that body — invisible outside. Only
-    ``LocalBuffer`` accumulators cross Loop boundaries (via ``Update``).
+    ``Accumulator`` state crosses Loop boundaries (via ``Update``).
     Axis names (from the stored ``LoopOp.axes`` and from any nested Loops) are
     validated as a flat set for uniqueness across the kernel.
     """
@@ -391,22 +379,15 @@ def _validate(loop: LoopOp) -> None:
             raise ValueError(f"LoopOp.axes: duplicate axis name {a.name!r}")
         all_axis_names.add(a.name)
 
-    # LocalBuffer uniqueness + v1 pins.
-    local_names: set[str] = set()
-    accumulators: dict[str, LocalBuffer] = {}
-    for lb in loop.locals:
-        if lb.name in local_names:
-            raise ValueError(f"LocalBuffer: duplicate name {lb.name!r}")
-        local_names.add(lb.name)
-        if lb.shape != ():
-            raise ValueError(f"LocalBuffer {lb.name!r}: v1 requires shape=() (got {lb.shape!r})")
-        if lb.scope != "thread":
-            raise ValueError(f"LocalBuffer {lb.name!r}: v1 requires scope='thread' (got {lb.scope!r})")
-        if lb.combine is not None:
-            accumulators[lb.name] = lb
+    # Accumulator uniqueness.
+    accumulators: dict[str, Accumulator] = {}
+    for acc in loop.accumulators:
+        if acc.name in accumulators:
+            raise ValueError(f"Accumulator: duplicate name {acc.name!r}")
+        accumulators[acc.name] = acc
 
-    # Kernel-scope names (visible everywhere): ports + locals.
-    kernel_scope: set[str] = {f"${i}" for i in range(len(loop.inputs))} | local_names
+    # Kernel-scope names (visible everywhere): ports + accumulators.
+    kernel_scope: set[str] = {f"${i}" for i in range(len(loop.inputs))} | set(accumulators)
 
     # Collect body-level axis names (from stored tuple + nested Loop blocks).
     reduce_axes: set[str] = {a.name for a in loop.axes if a.kind == "reduce"}
@@ -430,7 +411,7 @@ def _validate(loop: LoopOp) -> None:
                 defined.add(stmt.name)
             elif isinstance(stmt, Update):
                 if stmt.target not in accumulators:
-                    raise ValueError(f"Update.target {stmt.target!r} does not name a LocalBuffer with combine set")
+                    raise ValueError(f"Update.target {stmt.target!r} does not name an Accumulator")
                 if stmt.value not in defined:
                     raise ValueError(f"Update: value {stmt.value!r} not defined")
                 update_targets.add(stmt.target)
@@ -456,15 +437,15 @@ def _validate(loop: LoopOp) -> None:
     _walk(loop.body, set(kernel_scope), ())
 
     # Accumulator liveness: every acc must be updated at least once (anywhere in the tree).
-    for lb in loop.locals:
-        if lb.combine is not None and lb.name not in update_targets:
-            raise ValueError(f"LocalBuffer {lb.name!r}: combine set but never Updated")
+    for acc in loop.accumulators:
+        if acc.name not in update_targets:
+            raise ValueError(f"Accumulator {acc.name!r}: declared but never Updated")
 
     # Reduce / accumulator pairing — treat stored ``axes`` and nested reduce Loops as one set.
     if reduce_axes and not accumulators:
-        raise ValueError("LoopOp has reduce axes but no accumulator LocalBuffer")
+        raise ValueError("LoopOp has reduce axes but no Accumulator")
     if accumulators and not reduce_axes:
-        raise ValueError("LoopOp has accumulator LocalBuffer but no reduce axis")
+        raise ValueError("LoopOp has Accumulator but no reduce axis")
 
     # Output indices must form a dense [0, N) range.
     if output_indices:

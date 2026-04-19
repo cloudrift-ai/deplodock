@@ -31,7 +31,7 @@ class Accum:
     fn: str  # combine op name ("add", "max", "mul", "min")
     identity: float
     src: str  # SSA name that feeds the accumulator
-    result: str  # LocalBuffer name (= this is what post-reduce code reads)
+    result: str  # Accumulator name (= this is what post-reduce code reads)
 
 
 @dataclass(frozen=True)
@@ -122,7 +122,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     from deplodock.compiler.ir.loop_ir import flatten_body
 
     flat_all = tuple(flatten_body(kernel.body))
-    accumulator_names = {lb.name for lb in kernel.locals if lb.combine is not None}
+    accumulator_names = {acc.name for acc in kernel.accumulators}
     row_space: set[str] = {name for name in input_ports if name not in per_elem_ports}
     row_space |= accumulator_names
     elem_space: set[str] = set(per_elem_ports)
@@ -157,7 +157,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         )
 
     # --- Reduce: build steps by walking inner_body left-to-right. ---
-    acc_map = {lb.name: lb for lb in kernel.locals}
+    acc_map = {acc.name: acc for acc in kernel.accumulators}
     steps = []
     prior_ew: list[Assign] = []
     acc_count = 0
@@ -287,9 +287,9 @@ def _reduce_loop_to_steps(
         in_loop = tuple(s for s in ew if not (isinstance(s, Assign) and s.name in row_space))
         remat = _remat_set(list(body), prior_ew, row_space)
         remat_assigns = tuple(a for a in prior_ew if a.name in remat)
-        lb = acc_map[last_update.target]
-        combine_fn = lb.combine.fn if lb.combine is not None else "add"
-        identity = _literal_value(lb.init)
+        acc = acc_map[last_update.target]
+        combine_fn = acc.combine.fn
+        identity = _literal_value(acc.init)
         accum = Accum(
             var=f"acc{acc_count}",
             fn=combine_fn,
