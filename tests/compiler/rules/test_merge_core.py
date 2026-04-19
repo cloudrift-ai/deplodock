@@ -9,7 +9,7 @@ multi-reduce, free-axis leakage).
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinOp, Literal, Var
-from deplodock.compiler.ir.loop_ir import Accumulator, Assign, Axis, LoopOp, Port, Update, Write, flat_body_to_nested
+from deplodock.compiler.ir.loop_ir import AccumDecl, Accumulator, Assign, Axis, LoopOp, Port, Update, Write, flat_body_to_nested
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.rules.fusion._merge_core import _bind_axis, _solve_sigma, merge_loop_ops
 
@@ -18,11 +18,13 @@ def _loop(*, axes=(), inputs=(), accumulators=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
     Test-local shim: LoopOp.axes is now a property over the body's Loop tree,
-    so the constructor no longer accepts axes=. Fixtures that still think in
-    terms of (axes, flat_body) use this helper to get the nested body form
-    the IR requires.
+    so the constructor no longer accepts axes=. The ``accumulators=`` kwarg
+    is also gone — each ``Accumulator`` (alias for ``AccumDecl``) gets
+    prepended to the body as an ``AccumDecl`` statement, preserving the
+    legacy fixture shape.
     """
-    return LoopOp(inputs=inputs, accumulators=accumulators, body=flat_body_to_nested(axes, body))
+    prefix = tuple(AccumDecl(name=a.name, combine=a.combine, init=a.init) for a in accumulators)
+    return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, prefix + tuple(body)))
 
 
 # ---------------------------------------------------------------------------

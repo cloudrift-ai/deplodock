@@ -30,12 +30,9 @@ Legality (semantic only — scheduling lives in the backend):
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from deplodock.compiler.ir.expr import BinOp, Cast, Expr, Literal, Var, substitute
 from deplodock.compiler.ir.loop_ir import (
     AccumDecl,
-    Accumulator,
     Assign,
     Axis,
     Load,
@@ -194,13 +191,10 @@ def merge_loop_ops(
                     return None
 
     axis_rename = _fresh_axis_names(unbound_axes, consumer.axes)
-    # Accumulator name collisions: consider both the legacy accumulators
-    # tuple and in-body AccumDecls. Producer decl names that collide with any
-    # consumer name (field or body) get renamed; the renames propagate through
-    # _rewrite_body to produce unique accumulators in the merged body.
-    all_producer_accs: tuple[Accumulator | AccumDecl, ...] = tuple(producer.accumulators) + tuple(producer.accum_decls)
-    all_consumer_accs: tuple[Accumulator | AccumDecl, ...] = tuple(consumer.accumulators) + tuple(consumer.accum_decls)
-    local_rename = _fresh_local_names(all_producer_accs, all_consumer_accs)
+    # AccumDecl name collisions across producer and consumer bodies. Renamed
+    # producer decl names propagate through _rewrite_body so the merged body
+    # ends up with unique accumulator names.
+    local_rename = _fresh_local_names(producer.accum_decls, consumer.accum_decls)
     ssa_rename_common = _fresh_ssa_map(producer, consumer, local_rename)
 
     # Augment each σ_k with bindings for unbound axes (they survive as new axes).
@@ -212,11 +206,6 @@ def merge_loop_ops(
     pre_reduce_sigma.update(unbound_binding)
 
     merged_axes = tuple(consumer.axes) + tuple(Axis(name=axis_rename[a.name], extent=a.extent) for a in unbound_axes)
-    # Merge accumulators: consumer's kept as-is; producer's renamed to avoid
-    # collisions and inits σ-substituted.
-    merged_accs: list[Accumulator] = list(consumer.accumulators)
-    for acc in producer.accumulators:
-        merged_accs.append(replace(acc, name=local_rename.get(acc.name, acc.name), init=substitute(acc.init, pre_reduce_sigma)))
 
     # Build merged ports: consumer ports (minus consumer_ports) first, then
     # a set of producer ports per σ_k (σ_k-substituted).
@@ -347,7 +336,6 @@ def merge_loop_ops(
     nested = flat_body_to_nested(tuple(merged_axes), tuple(body), merged_reduce_names)
     return LoopOp(
         inputs=tuple(merged_ports),
-        accumulators=tuple(merged_accs),
         body=nested,
     )
 
@@ -426,8 +414,8 @@ def _fresh_axis_names(to_rename: list[Axis], taken: tuple[Axis, ...]) -> dict[st
 
 
 def _fresh_local_names(
-    to_rename: tuple[Accumulator, ...],
-    taken: tuple[Accumulator, ...],
+    to_rename: tuple[AccumDecl, ...],
+    taken: tuple[AccumDecl, ...],
 ) -> dict[str, str]:
     used = {lb.name for lb in taken}
     result: dict[str, str] = {}
@@ -452,9 +440,7 @@ def _fresh_ssa_map(
         if isinstance(stmt, (Assign, Select, Load)):
             producer_ssa.add(stmt.name)
 
-    consumer_names: set[str] = {lb.name for lb in consumer.accumulators}
-    for decl in consumer.accum_decls:
-        consumer_names.add(decl.name)
+    consumer_names: set[str] = {d.name for d in consumer.accum_decls}
     for stmt in flatten_body(consumer.body):
         if isinstance(stmt, (Assign, Select, Load)):
             consumer_names.add(stmt.name)
@@ -490,8 +476,6 @@ def _all_defined_names(
 
     names: set[str] = set()
     for op in (producer, consumer):
-        for lb in op.accumulators:
-            names.add(lb.name)
         for decl in op.accum_decls:
             names.add(decl.name)
         for stmt in flatten_body(op.body):

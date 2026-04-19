@@ -3,22 +3,20 @@
 After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
-    inputs      : tuple[Port, ...]           — per-input access patterns
-    accumulators: tuple[Accumulator, ...]    — reduce accumulators
-    body        : tuple[Stmt, ...]           — SSA: Assign | Update | Write | Select | Loop
-    axes        : computed property          — iteration space walked from body's Loop tree
+    inputs : tuple[Port, ...]   — computed property derived from body Loads
+    body   : tuple[Stmt, ...]   — SSA: Assign | Update | Write | Select | Loop | Load | AccumDecl
+    axes   : computed property  — iteration space walked from body's Loop tree
 
 Iteration is explicit via ``Loop(axis, body)`` statements. Each ``Loop``
 is one iteration dimension; ``Loop.body`` runs ``axis.extent`` times.
-Reduce-kind Loops fold ``Update`` statements into an ``Accumulator``
-declared on the enclosing ``LoopOp``. Free-kind Loops run in parallel
-with no accumulator folding. Reading top-to-bottom matches execution
-order.
+Reduce-kind Loops fold ``Update`` statements into an ``AccumDecl``
+declared inline in the body. Free-kind Loops run in parallel with no
+accumulator folding. Reading top-to-bottom matches execution order.
 
-SSA names defined by ``Assign``/``Select`` inside a ``Loop.body`` are
-scoped to that body — only ``Accumulator`` state crosses Loop boundaries
-(via ``Update``). Invariants (unique names, defined-before-use, accumulator
-liveness) are enforced by ``LoopOp.__post_init__``.
+SSA names defined by ``Assign`` / ``Select`` / ``Load`` inside a
+``Loop.body`` are scoped to that body — only ``AccumDecl`` state crosses
+Loop boundaries (via ``Update``). Invariants (unique names, defined-
+before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``.
 """
 
 from __future__ import annotations
@@ -71,25 +69,6 @@ class Port:
 
 
 # ---------------------------------------------------------------------------
-# Accumulator — reduce accumulator declaration
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Accumulator:
-    """Reduce accumulator folded across a reduce axis by ``Update``.
-
-    Semantics per ``Update``: ``acc = combine(acc, value)``, initialized
-    to ``init`` before the reduce sweep. After the sweep, body statements
-    read the finalized value by referring to ``name``.
-    """
-
-    name: str
-    combine: ElementwiseOp
-    init: Expr
-
-
-# ---------------------------------------------------------------------------
 # Body statements
 # ---------------------------------------------------------------------------
 
@@ -115,15 +94,27 @@ class Load:
 class AccumDecl:
     """Declare a reduce accumulator at a body position.
 
-    Replaces the side-channel ``LoopOp.accumulators`` tuple: the accumulator
-    is live from this statement through the end of the enclosing ``Loop.body``
-    scope. ``Update`` statements with matching ``target`` name fold values
-    into it; stmts after the reduce sweep read its finalized value.
+    The accumulator is live from this statement through the end of the
+    enclosing ``Loop.body`` scope. ``Update`` statements with matching
+    ``target`` name fold values into it via ``combine``; stmts after the
+    reduce sweep read the finalized value by SSA name.
+
+    Semantics per ``Update``: ``acc = combine(acc, value)``, initialized
+    to ``init`` before the reduce sweep. One ``AccumDecl`` per accumulator;
+    duplicates are rejected by the validator.
     """
 
     name: str
     combine: ElementwiseOp
     init: Expr
+
+
+# Backwards-compatible alias. ``Accumulator`` used to be a side-channel
+# ``LoopOp.accumulators`` tuple entry; now it's just an ``AccumDecl`` living
+# in the body. Readers / tests that still import ``Accumulator`` get the
+# same dataclass — constructing one is interchangeable with constructing an
+# ``AccumDecl``.
+Accumulator = AccumDecl
 
 
 @dataclass(frozen=True)
@@ -233,11 +224,11 @@ class LoopOp(Op):
 
     ``axes`` is a computed property over the body's ``Loop`` tree — the tree
     is the single source of truth. See the :attr:`axes` docstring for the
-    collection order.
+    collection order. ``inputs`` and ``accumulators`` are computed properties
+    derived from body-form ``Load`` and ``AccumDecl`` statements.
     """
 
     inputs: tuple[Port, ...] = ()
-    accumulators: tuple[Accumulator, ...] = ()
     body: tuple[Stmt, ...] = ()
 
     def __post_init__(self) -> None:
@@ -318,9 +309,9 @@ class LoopOp(Op):
     def accum_decls(self) -> tuple[AccumDecl, ...]:
         """All ``AccumDecl`` statements in the body, pre-order.
 
-        New-form successor to ``accumulators``: scope is lexical — each
-        AccumDecl is live from its position through the end of the
-        enclosing ``Loop.body`` (or the kernel body, at top level).
+        Scope is lexical — each AccumDecl is live from its position through
+        the end of the enclosing ``Loop.body`` (or the kernel body, at top
+        level).
         """
         result: list[AccumDecl] = []
 
@@ -333,6 +324,13 @@ class LoopOp(Op):
 
         walk(self.body)
         return tuple(result)
+
+    @property
+    def accumulators(self) -> tuple[AccumDecl, ...]:
+        """Alias for :attr:`accum_decls` — kept for readers that still use
+        ``loop.accumulators``. New code should use ``accum_decls`` directly.
+        """
+        return self.accum_decls
 
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
@@ -390,22 +388,18 @@ class LoopOp(Op):
 def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: str = "") -> str:
     """Render a ``LoopOp`` as an explicit nested-loop program.
 
-    ``Accumulator`` inits show at the top as plain assignments. Each ``Loop``
-    block renders as ``for X in 0..N:  # kind``. ``$N`` port references are
-    rendered as ``buf[...]`` when ``port_buffers`` is supplied, otherwise as
-    ``$N[...]`` with the port's index exprs inlined.
+    Each ``Loop`` block renders as ``for X in 0..N:  # kind``. ``$N`` port
+    references (from legacy test fixtures that still emit them) are
+    rendered as ``buf[...]`` when ``port_buffers`` is supplied, otherwise
+    as ``$N[...]`` with the port's index exprs inlined.
     """
     ports = loop.inputs
-    # Buffer names used when rendering Load stmts and $N port refs. Sized
-    # to cover both the legacy inputs tuple and body Loads.
+    # Buffer names used when rendering Load stmts and $N port refs.
     nbufs = max(len(ports), loop.num_inputs)
     buffers = list(port_buffers) if port_buffers else [f"${i}" for i in range(nbufs)]
-    # Extend if port_buffers was shorter than what the body references.
     while len(buffers) < nbufs:
         buffers.append(f"${len(buffers)}")
-    accs_by_name: dict[str, Accumulator | AccumDecl] = {a.name: a for a in loop.accumulators}
-    for decl in loop.accum_decls:
-        accs_by_name[decl.name] = decl
+    accs_by_name: dict[str, AccumDecl] = {d.name: d for d in loop.accum_decls}
 
     def render_arg(name: str) -> str:
         if name.startswith("$"):
@@ -419,9 +413,6 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
         return name
 
     lines: list[str] = []
-    for acc in loop.accumulators:
-        lines.append(f"{indent}{acc.name} = {render_expr(acc.init)}")
-
     _render_body(loop.body, indent, accs_by_name, render_arg, buffers, lines)
     return "\n".join(lines)
 
@@ -429,7 +420,7 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
 def _render_body(
     stmts: tuple[Stmt, ...],
     indent: str,
-    accs_by_name: dict[str, Accumulator | AccumDecl],
+    accs_by_name: dict[str, AccumDecl],
     render_arg,
     buffers: list[str],
     lines: list[str],
@@ -474,7 +465,7 @@ def _validate(loop: LoopOp) -> None:
 
     Body validation recurses into ``Loop`` blocks. SSA names defined inside a
     ``Loop.body`` are scoped to that body — invisible outside. Only
-    ``Accumulator`` state crosses Loop boundaries (via ``Update``).
+    ``AccumDecl`` state crosses Loop boundaries (via ``Update``).
     Axis names (from the stored ``LoopOp.axes`` and from any nested Loops) are
     validated as a flat set for uniqueness across the kernel.
     """
@@ -485,22 +476,17 @@ def _validate(loop: LoopOp) -> None:
             raise ValueError(f"LoopOp.axes: duplicate axis name {a.name!r}")
         all_axis_names.add(a.name)
 
-    # Accumulator uniqueness — covers both kernel-scope stored field and
-    # in-body AccumDecls. Duplicate names across either source is rejected.
-    accumulators: dict[str, Accumulator | AccumDecl] = {}
-    for acc in loop.accumulators:
-        if acc.name in accumulators:
-            raise ValueError(f"Accumulator: duplicate name {acc.name!r}")
-        accumulators[acc.name] = acc
+    # Accumulator uniqueness — AccumDecls walked from the body tree.
+    accumulators: dict[str, AccumDecl] = {}
     for decl in loop.accum_decls:
         if decl.name in accumulators:
             raise ValueError(f"Accumulator: duplicate name {decl.name!r}")
         accumulators[decl.name] = decl
 
-    # Kernel-scope names (visible everywhere): $N ports (old form) + all
-    # accumulators (old tuple + body decls). Body-level Load/AccumDecl
-    # bindings get added as the walk encounters them.
-    kernel_scope: set[str] = {f"${i}" for i in range(len(loop.inputs))} | set(accumulators)
+    # Kernel-scope names (visible everywhere): $N ports (legacy form, used by
+    # a few test fixtures that still spell args as ``$0``). Body-level Load /
+    # AccumDecl bindings get added as the walk encounters them.
+    kernel_scope: set[str] = {f"${i}" for i in range(len(loop.inputs))}
 
     update_targets: set[str] = set()
 

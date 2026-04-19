@@ -1,8 +1,9 @@
 """Lift ``ReduceOp`` to a single-reduce-axis ``LoopOp``.
 
 The lifted kernel iterates over the full input shape; the reduce axis is
-kind ``"reduce"`` and contributes an ``Accumulator``. The Write index
-covers only free axes (with size-1 placeholders for keep-dim outputs).
+kind ``"reduce"`` and contributes an ``AccumDecl`` + ``Update`` pair. The
+Write index covers only free axes (with size-1 placeholders for keep-dim
+outputs).
 """
 
 from __future__ import annotations
