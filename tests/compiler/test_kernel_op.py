@@ -4,9 +4,12 @@ import pytest
 
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop_ir import (
+    AccumDecl,
     Accumulator,
     Assign,
     Axis,
+    Load,
+    Loop,
     LoopOp,
     Port,
     Select,
@@ -39,6 +42,93 @@ def test_axis_construction():
     a = Axis("a0", 8)
     assert a.name == "a0"
     assert a.extent == 8
+
+
+# ---------------------------------------------------------------------------
+# Body-form Load / AccumDecl (new IR: inputs + accumulators as statements)
+# ---------------------------------------------------------------------------
+
+
+def test_load_stmt_binding():
+    """Load introduces an SSA name; LoopOp.loads collects them in pre-order."""
+    k = LoopOp(
+        body=(
+            Loop(
+                axis=Axis("a0", 4),
+                body=(
+                    Load("x_val", source=0, index=(Var("a0"),)),
+                    Assign("y", ElementwiseOp("neg"), ("x_val",)),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
+        ),
+    )
+    loads = k.loads
+    assert len(loads) == 1 and loads[0].name == "x_val" and loads[0].source == 0
+    assert k.num_inputs == 1
+
+
+def test_load_stmt_multiple_sources():
+    """num_inputs derives from the max source index across all Loads."""
+    k = LoopOp(
+        body=(
+            Loop(
+                axis=Axis("a0", 4),
+                body=(
+                    Load("a", source=0, index=(Var("a0"),)),
+                    Load("b", source=2, index=(Var("a0"),)),  # non-contiguous source idx is fine
+                    Assign("y", ElementwiseOp("add"), ("a", "b")),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
+        ),
+    )
+    assert k.num_inputs == 3
+
+
+def test_accum_decl_stmt_scope():
+    """AccumDecl in the body is visible to Updates in its enclosing scope."""
+    k = LoopOp(
+        body=(
+            Loop(
+                axis=Axis("row", 4),
+                body=(
+                    AccumDecl("acc", combine=ElementwiseOp("add"), init=Literal(0.0)),
+                    Loop(
+                        axis=Axis("k", 8),
+                        body=(
+                            Load("x_val", source=0, index=(Var("row"), Var("k"))),
+                            Update(target="acc", value="x_val"),
+                        ),
+                    ),
+                    Write(output=0, index=(Var("row"),), value="acc"),
+                ),
+            ),
+        ),
+    )
+    assert len(k.accum_decls) == 1 and k.accum_decls[0].name == "acc"
+
+
+def test_accum_decl_update_without_decl_rejected():
+    """Update targeting an undeclared accumulator fails validation."""
+    with pytest.raises(ValueError, match="does not name an Accumulator"):
+        LoopOp(
+            body=(
+                Loop(
+                    axis=Axis("row", 4),
+                    body=(
+                        Loop(
+                            axis=Axis("k", 8),
+                            body=(
+                                Load("x_val", source=0, index=(Var("row"), Var("k"))),
+                                Update(target="missing_acc", value="x_val"),
+                            ),
+                        ),
+                        Write(output=0, index=(Var("row"),), value="missing_acc"),
+                    ),
+                ),
+            ),
+        )
 
 
 def test_port_default_is_empty_index():
