@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.backend.cuda.program import CudaLaunch
 from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var, substitute
-from deplodock.compiler.ir.gpu import (
+from deplodock.compiler.ir.kernel_ir import (
     ArrayAccess,
     AugAssign,
     ForLoop,
@@ -26,11 +26,11 @@ from deplodock.compiler.ir.gpu import (
     Stmt,
     VarDecl,
 )
-from deplodock.compiler.ir.gpu import (
+from deplodock.compiler.ir.kernel_ir import (
     Assign as IrAssign,
 )
-from deplodock.compiler.ir.loop import Assign as IrAssignStmt
-from deplodock.compiler.ir.loop import Axis, LoopOp, Port, Select, Update
+from deplodock.compiler.ir.loop_ir import Assign as IrAssignStmt
+from deplodock.compiler.ir.loop_ir import Axis, LoopOp, Port, Select, Update
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
 
@@ -114,7 +114,7 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
     informational — they flag kernels where some predicate is expected to
     mask the stray load but the checker couldn't prove it.
     """
-    from deplodock.compiler.ir.loop import Select
+    from deplodock.compiler.ir.loop_ir import Select
 
     warnings: list[str] = []
     if not isinstance(launch.loop, LoopOp):
@@ -128,7 +128,7 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
     # then used as a Select branch value, the port inherits that branch's
     # predicate. Needed for the rotary rotate_half pattern, where the port is
     # wrapped in an Assign (``v1 = neg($5)``) before reaching the Select.
-    from deplodock.compiler.ir.loop import Assign, flatten_body
+    from deplodock.compiler.ir.loop_ir import Assign, flatten_body
 
     flat = list(flatten_body(loop.body))
 
@@ -560,11 +560,11 @@ def _collect_port_info(
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
     if fn == "max":
-        from deplodock.compiler.ir.gpu import VarAssign
+        from deplodock.compiler.ir.kernel_ir import VarAssign
 
         return VarAssign(name=acc_name, value=FuncCall("fmaxf", [Var(acc_name), value]))
     if fn == "min":
-        from deplodock.compiler.ir.gpu import VarAssign
+        from deplodock.compiler.ir.kernel_ir import VarAssign
 
         return VarAssign(name=acc_name, value=FuncCall("fminf", [Var(acc_name), value]))
     op = {"add": "+=", "sum": "+=", "mul": "*=", "prod": "*="}.get(fn, "+=")
@@ -645,7 +645,7 @@ def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
 
 
 def _kernel_name(loop: LoopOp, idx: int) -> str:
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     if any(isinstance(s, Update) for s in flatten_body(loop.body)):
         return f"k{idx}_reduce"
@@ -653,7 +653,7 @@ def _kernel_name(loop: LoopOp, idx: int) -> str:
 
 
 def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     loop: LoopOp = launch.loop
     out_shape = program.output_shape(launch)

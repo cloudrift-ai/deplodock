@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult, ProgramResult
-    from deplodock.compiler.ir.gpu import GpuKernel
     from deplodock.compiler.ir.graph import Graph
+    from deplodock.compiler.ir.kernel_ir import GpuKernel
     from deplodock.compiler.plan import ExecutionPlan
     from deplodock.compiler.program.gpu import GpuProgram
     from deplodock.compiler.program.loop import LoopProgram
@@ -146,7 +146,7 @@ class CompilerDump:
         still visible (``for j in [threadIdx.x, cols), step=blockDim.x``) before
         the tree-walk codegen renders it to CUDA source.
         """
-        from deplodock.compiler.ir.gpu import pretty_print
+        from deplodock.compiler.ir.kernel_ir import pretty_print
 
         blocks: list[str] = []
         for i, kernel in enumerate(kernels):

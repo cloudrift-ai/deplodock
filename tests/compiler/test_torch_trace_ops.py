@@ -106,7 +106,7 @@ def test_trace_all_elementwise_ops():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.tensor import ElementwiseOp
+    from deplodock.compiler.ir.tensor_ir import ElementwiseOp
     from deplodock.compiler.torch_trace import trace_module
 
     class AllOps(nn.Module):
@@ -133,7 +133,7 @@ def test_trace_binary_ops():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.tensor import ElementwiseOp
+    from deplodock.compiler.ir.tensor_ir import ElementwiseOp
     from deplodock.compiler.torch_trace import trace_module
 
     class BinaryOps(nn.Module):
@@ -162,7 +162,7 @@ def test_trace_sum_reduction():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.tensor import ReduceOp
+    from deplodock.compiler.ir.tensor_ir import ReduceOp
     from deplodock.compiler.torch_trace import trace_module
 
     class SumReduce(nn.Module):
@@ -183,7 +183,7 @@ def test_trace_max_reduction():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.tensor import ReduceOp
+    from deplodock.compiler.ir.tensor_ir import ReduceOp
     from deplodock.compiler.torch_trace import trace_module
 
     class MaxReduce(nn.Module):
@@ -209,7 +209,7 @@ def test_trace_reshape():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend import ReshapeOp
+    from deplodock.compiler.ir.frontend_ir import ReshapeOp
     from deplodock.compiler.torch_trace import trace_module
 
     class Reshape(nn.Module):
@@ -229,7 +229,7 @@ def test_trace_transpose():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend import TransposeOp
+    from deplodock.compiler.ir.frontend_ir import TransposeOp
     from deplodock.compiler.torch_trace import trace_module
 
     class Transpose(nn.Module):
@@ -254,7 +254,7 @@ def test_trace_linear_produces_linearop():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend import LinearOp
+    from deplodock.compiler.ir.frontend_ir import LinearOp
     from deplodock.compiler.torch_trace import trace_module
 
     linear = nn.Linear(8, 4, bias=False)
@@ -270,7 +270,7 @@ def test_trace_linear_with_bias():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.ir.frontend import LinearOp
+    from deplodock.compiler.ir.frontend_ir import LinearOp
     from deplodock.compiler.torch_trace import trace_module
 
     linear = nn.Linear(8, 4, bias=True)

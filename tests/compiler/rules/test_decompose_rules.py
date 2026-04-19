@@ -10,7 +10,7 @@ import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.frontend import (
+from deplodock.compiler.ir.frontend_ir import (
     CatOp,
     LinearOp,
     MatmulOp,
@@ -22,7 +22,7 @@ from deplodock.compiler.ir.frontend import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass, Rule
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "decomposition"
@@ -346,7 +346,7 @@ def test_sdpa_idempotent():
 
 def test_sdpa_output_is_valid():
     """SDPA ends with a squeeze IndexMapOp (after the keepdim reduce)."""
-    from deplodock.compiler.ir.tensor import IndexMapOp
+    from deplodock.compiler.ir.tensor_ir import IndexMapOp
 
     result = _apply(_make_sdpa_graph(), _load("001_decompose_sdpa.py"))
     assert isinstance(result.nodes[result.outputs[0]].op, (ElementwiseOp, ReduceOp, IndexMapOp))

@@ -12,7 +12,7 @@ from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, IndexMapOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, IndexMapOp
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()
@@ -120,7 +120,7 @@ def test_tracer_emits_broadcast_explicit_elementwise():
     smaller inputs in IndexMapOps via broadcast_to)."""
     import torch
 
-    from deplodock.compiler.ir.tensor import ElementwiseOp
+    from deplodock.compiler.ir.tensor_ir import ElementwiseOp
     from deplodock.compiler.torch_trace import trace_module
 
     class BroadcastAdd(torch.nn.Module):

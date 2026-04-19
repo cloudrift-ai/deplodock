@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
-from deplodock.compiler.ir.frontend import ReshapeOp
+from deplodock.compiler.ir.frontend_ir import ReshapeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
+from deplodock.compiler.ir.tensor_ir import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
 
 GRAMMAR = [Production("root", ReshapeOp, "1")]

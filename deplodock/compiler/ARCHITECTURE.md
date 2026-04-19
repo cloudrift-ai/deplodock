@@ -9,9 +9,9 @@
 │  torch_trace.py ─→ Graph populated with frontend ops                                                                 │
 │      ir/graph.py:    Tensor, Node[T_Op], Graph, Hints                                                                │
 │      ir/base.py:     Op, InputOp, ConstantOp                                                                         │
-│      ir/frontend.py: Torch-captured ops (LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,               │
+│      ir/frontend_ir.py: Torch-captured ops (LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,               │
 │                      ReshapeOp, SliceOp, CatOp)                                                                      │
-│      ir/tensor.py:   minimal IR survives decomposition (ElementwiseOp, ReduceOp, IndexMapOp, ...)                    │
+│      ir/tensor_ir.py:   minimal IR survives decomposition (ElementwiseOp, ReduceOp, IndexMapOp, ...)                    │
 │      ir/expr.py:     Expr AST + coord_expr helpers                                                                   │
 │                                                                                                                      │
 │  RULE: No GPU, no CUDA, no backend imports.                                                                          │
@@ -24,7 +24,7 @@
 │       LoopLaunch (LoopOp + input/output buffer names) × N                                                            │
 │       + graph_inputs/outputs/constants/constant_values                                                               │
 │                                                                                                                      │
-│  Each LoopOp (ir/loop.py) is one GPU kernel as an SSA program:                                                       │
+│  Each LoopOp (ir/loop_ir.py) is one GPU kernel as an SSA program:                                                       │
 │      axes   (tuple[Axis, ...])        — named iteration variables                                                    │
 │      inputs (tuple[Port, ...])        — per-input access patterns                                                    │
 │      locals (tuple[LocalBuffer, ...]) — thread-local accumulators                                                    │
@@ -53,7 +53,7 @@
 │  Program forms (shared across backends):                                                                             │
 │      program/loop.py: LoopProgram + LoopBuffer + LoopLaunch                                                          │
 │      program/gpu.py:  GpuProgram + GpuBuffer + GpuLaunch                                                             │
-│  The imperative C-like kernel AST lives upstream in ir/gpu.py (GpuKernel, Stmt, ArrayAccess, ...);                   │
+│  The imperative C-like kernel AST lives upstream in ir/kernel_ir.py (GpuKernel, Stmt, ArrayAccess, ...);                   │
 │  the backend consumes it.                                                                                            │
 │                                                                                                                      │
 │  RULE: GPU specifics live here; everything above is portable.                                                        │

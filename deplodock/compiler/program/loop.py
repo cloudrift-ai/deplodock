@@ -7,10 +7,10 @@ here; nothing recomputes them.
 
 The pairing:
 
-    ir/loop.py   : LoopOp, Axis, Port, Assign                    (structural IR)
+    ir/loop_ir.py   : LoopOp, Axis, Port, Assign                    (structural IR)
     program/loop.py: LoopBuffer, LoopLaunch, LoopProgram          (program form)
 
-    ir/gpu.py    : GpuKernel, GpuKernelParam, Stmts               (structural IR)
+    ir/kernel_ir.py    : GpuKernel, GpuKernelParam, Stmts               (structural IR)
     program/gpu.py: GpuBuffer, GpuLaunch, GpuProgram              (program form)
 
 ``backend/cuda/emit.py::compile_kernels`` is the program-to-program
@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.ir.graph import Graph
-from deplodock.compiler.ir.loop import LoopOp
+from deplodock.compiler.ir.loop_ir import LoopOp
 
 
 @dataclass
@@ -129,7 +129,7 @@ class LoopProgram:
         generated source; also used as the per-launch fragment in
         :meth:`pretty_print`.
         """
-        from deplodock.compiler.ir.loop import pretty_print
+        from deplodock.compiler.ir.loop_ir import pretty_print
 
         launch = self.launches[idx]
         header = f"launch {idx:02d}: inputs=[{', '.join(launch.input_names)}] output={launch.output_name}"

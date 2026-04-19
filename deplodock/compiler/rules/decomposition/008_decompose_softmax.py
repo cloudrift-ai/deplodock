@@ -12,7 +12,7 @@ without going through the SDPA fast-path.
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
 GRAMMAR = [Production("root", ElementwiseOp, "1", {"fn": "softmax"})]

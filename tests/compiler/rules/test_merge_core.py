@@ -9,8 +9,8 @@ multi-reduce, free-axis leakage).
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinOp, Literal, Var
-from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, LoopOp, Port, Update, Write, flat_body_to_nested
-from deplodock.compiler.ir.tensor import ElementwiseOp
+from deplodock.compiler.ir.loop_ir import Assign, Axis, LocalBuffer, LoopOp, Port, Update, Write, flat_body_to_nested
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.rules.fusion._merge_core import _bind_axis, _solve_sigma, merge_loop_ops
 
 
@@ -116,7 +116,7 @@ def test_merge_elementwise_chain():
     # Consumer had 1 port (the producer); producer had 1 port (external). Result: 1 port.
     assert len(merged.inputs) == 1
     # Body: producer Assign(neg) → bridge Assign(copy) → consumer Assign(exp) → Write.
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     flat = flatten_body(merged.body)
     assign_fns = [s.op.fn for s in flat if isinstance(s, Assign)]
@@ -215,7 +215,7 @@ def test_merge_reduce_then_elementwise():
     local_names = [lb.name for lb in merged.locals]
     assert "acc" in local_names
     # Body must contain the Update, then the bridge-copy, then the consumer's add.
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     flat = flatten_body(merged.body)
     fns = [s.op.fn for s in flat if isinstance(s, Assign)]

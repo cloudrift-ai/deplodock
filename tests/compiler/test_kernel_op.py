@@ -3,7 +3,7 @@
 import pytest
 
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.loop import (
+from deplodock.compiler.ir.loop_ir import (
     Assign,
     Axis,
     LocalBuffer,
@@ -16,7 +16,7 @@ from deplodock.compiler.ir.loop import (
     flat_body_to_nested,
     flatten_body,
 )
-from deplodock.compiler.ir.tensor import ElementwiseOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 
 def _loop(*, axes=(), inputs=(), locals=(), body=()):
@@ -294,7 +294,7 @@ def test_rejects_accumulator_without_reduce_axis():
 
 
 def test_rejects_reduce_axis_without_accumulator():
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     a0 = Axis("a0", 4, "free")
     a1 = Axis("a1", 8, "reduce")
@@ -370,7 +370,7 @@ def test_rejects_unused_accumulator():
 
 
 def test_loop_stmt_basic():
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     # Pointwise kernel with body wrapped in a free Loop.
     loop = _loop(
@@ -391,7 +391,7 @@ def test_loop_stmt_basic():
 
 
 def test_loop_stmt_reduce_kernel():
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     # Reduce kernel — free a0 outer, reduce k inner.
     loop = _loop(
@@ -412,7 +412,7 @@ def test_loop_stmt_reduce_kernel():
         ),
     )
     # Validator accepts the nested form.
-    from deplodock.compiler.ir.loop import iter_loops
+    from deplodock.compiler.ir.loop_ir import iter_loops
 
     loops = iter_loops(loop.body)
     assert len(loops) == 2
@@ -421,7 +421,7 @@ def test_loop_stmt_reduce_kernel():
 
 
 def test_loop_stmt_softmax_sibling_reduces():
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     # Softmax shape: two sibling reduce Loops over the same axis "k", inside
     # a single outer free iteration. Sibling same-name is legal.
@@ -449,7 +449,7 @@ def test_loop_stmt_softmax_sibling_reduces():
             ),
         ),
     )
-    from deplodock.compiler.ir.loop import iter_loops
+    from deplodock.compiler.ir.loop_ir import iter_loops
 
     reduce_loops = [L for L in iter_loops(loop.body) if L.axis.kind == "reduce"]
     assert len(reduce_loops) == 2
@@ -458,7 +458,7 @@ def test_loop_stmt_softmax_sibling_reduces():
 
 def test_loop_axis_nested_shadow_rejected():
     """Nested Loop inside another Loop with the same axis name is ambiguous."""
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     with pytest.raises(ValueError, match="shadows"):
         _loop(
@@ -482,7 +482,7 @@ def test_loop_axis_nested_shadow_rejected():
 
 def test_loop_axis_sibling_same_name_allowed():
     """Sibling Loops with the same axis name are fine — that's softmax's two K-loops."""
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     # Two reduce Loops over the same axis, sibling (not nested).
     _loop(
@@ -503,7 +503,7 @@ def test_loop_axis_sibling_same_name_allowed():
 
 def test_loop_ssa_scoping():
     """Assign defined inside Loop body is invisible outside — caller Assign must fail."""
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     # A Loop body defines "v"; a sibling statement tries to reference it.
     with pytest.raises(ValueError, match="not defined"):
@@ -527,7 +527,7 @@ def test_loop_ssa_scoping():
 
 
 def test_flat_body_to_nested_pointwise():
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     axes = (Axis("a0", 8, "free"),)
     flat = (
@@ -544,7 +544,7 @@ def test_flat_body_to_nested_pointwise():
 
 
 def test_flat_body_to_nested_reduce_splits_at_update():
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     axes = (Axis("a0", 4, "free"), Axis("k", 8, "reduce"))
     flat = (
@@ -561,7 +561,7 @@ def test_flat_body_to_nested_reduce_splits_at_update():
 
 
 def test_flat_body_to_nested_idempotent():
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     already_nested = (
         Loop(
@@ -576,7 +576,7 @@ def test_flat_body_to_nested_idempotent():
 
 
 def test_flat_body_to_nested_softmax_two_updates():
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "free"), Axis("k", 8, "reduce"))
     flat = (
@@ -618,7 +618,7 @@ def _flat_reduce_kernel() -> LoopOp:
 
 def _nested_reduce_kernel() -> LoopOp:
     """Same kernel as _flat_reduce_kernel, but body is nested via explicit Loops."""
-    from deplodock.compiler.ir.loop import Loop
+    from deplodock.compiler.ir.loop_ir import Loop
 
     return LoopOp(
         inputs=(Port(index=(Var("a0"), Var("k"))),),

@@ -13,7 +13,7 @@ from deplodock.compiler.ir.expr import (
     placeholder,
     substitute,
 )
-from deplodock.compiler.ir.tensor import IndexMapOp, IndexSource
+from deplodock.compiler.ir.tensor_ir import IndexMapOp, IndexSource
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

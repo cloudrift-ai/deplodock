@@ -10,7 +10,7 @@ expression nodes (``ArrayAccess``, ``Cast``, ``FieldAccess``, ``VectorLoad``)
 and a hierarchy of statement types (``VarDecl``, ``Assign``, ``ForLoop``,
 ``IfStmt``, ``SyncThreads``, ``ArrayDecl``, ``PragmaUnroll``, ``RawCode``).
 
-One ``GpuKernel`` corresponds to one ``LoopOp`` (``ir/loop.py``) after
+One ``GpuKernel`` corresponds to one ``LoopOp`` (``ir/loop_ir.py``) after
 codegen; the ``compiler/program/gpu.py`` ``GpuProgram`` is the
 program-level form that bundles many ``GpuKernel`` launches.
 """

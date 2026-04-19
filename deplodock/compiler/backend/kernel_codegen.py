@@ -6,7 +6,7 @@ emits C/C++ text. Usable for both CUDA and HIP targets.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.gpu import (
+from deplodock.compiler.ir.kernel_ir import (
     ArrayAccess,
     ArrayDecl,
     Assign,

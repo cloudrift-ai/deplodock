@@ -18,7 +18,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinOp, Cast, Var
 from deplodock.compiler.ir.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.loop import Axis, LoopOp, Write
+from deplodock.compiler.ir.loop_ir import Axis, LoopOp, Write
 from deplodock.compiler.matcher import ChainMatch, Production
 from deplodock.compiler.rules.fusion._merge_core import merge_loop_ops
 
@@ -127,7 +127,7 @@ def _detect_reduce_axis_aliases(
     assert isinstance(producer_op, LoopOp)
     assert isinstance(consumer_op, LoopOp)
 
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     write_axis_names: set[str] = set()
     for stmt in flatten_body(producer_op.body):
