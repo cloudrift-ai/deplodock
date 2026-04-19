@@ -71,11 +71,13 @@ class CompilerDump:
     def dump_input_graph(self, graph: Graph) -> None:
         """Graph as captured by the tracer, before any rewriter passes.
 
-        Dumped twice: ``00_input_graph.json`` (round-trippable) and
-        ``00_input_graph.txt`` (human-readable, for ``compile --ir torch``).
+        Dumped three ways: ``00_input_graph.json`` (round-trippable),
+        ``00_input_graph.txt`` (human-readable, for ``compile --ir torch``),
+        and ``00_input_graph.dot`` (Graphviz DAG — render via ``dot -Tsvg``).
         """
         self._write_json("00_input_graph.json", graph.to_dict())
         self._write_text("00_input_graph.txt", graph.pretty_print())
+        self._write_text("00_input_graph.dot", _graph_to_dot(graph))
 
     def dump_tensor_ir(self, graph: Graph) -> None:
         """Graph after decomposition + optimization passes, before fusion.
@@ -84,11 +86,13 @@ class CompilerDump:
         sum/max reductions, reshape/transpose/slice, gather). High-level ops like
         rms_norm, linear, sdpa have been lowered to this canonical op set.
 
-        Dumped twice: ``10_tensor_ir.json`` (round-trippable via Graph.from_dict)
-        and ``10_tensor_ir.txt`` (human-readable, consumed by ``compile --ir tensor``).
+        Dumped three ways: ``10_tensor_ir.json`` (round-trippable via Graph.from_dict),
+        ``10_tensor_ir.txt`` (human-readable, consumed by ``compile --ir tensor``),
+        and ``10_tensor_ir.dot`` (Graphviz DAG).
         """
         self._write_json("10_tensor_ir.json", graph.to_dict())
         self._write_text("10_tensor_ir.txt", graph.pretty_print())
+        self._write_text("10_tensor_ir.dot", _graph_to_dot(graph))
 
     def dump_pass(self, index: int, pt: PassTrace) -> None:
         prefix = f"{index + 1:02d}_pass_{pt.name}"
@@ -255,3 +259,86 @@ def _safe_params(params: dict) -> dict:
         except (TypeError, ValueError):
             safe[k] = str(v)
     return safe
+
+
+# ---------------------------------------------------------------------------
+# Graphviz DOT emitter
+# ---------------------------------------------------------------------------
+#
+# Renders a ``Graph`` as Graphviz DOT source. Plain text — no graphviz binary
+# required at dump time; users render with ``dot -Tsvg foo.dot -o foo.svg``.
+
+
+def _op_label(op: object) -> str:
+    """Short op label for a DOT node."""
+    cls = type(op).__name__
+    if cls in ("ElementwiseOp", "ReduceOp", "ScanOp"):
+        return getattr(op, "fn", cls.lower())
+    if cls == "InputOp":
+        return "input"
+    if cls == "ConstantOp":
+        name = getattr(op, "name", None)
+        return f"const {name}" if name else "const"
+    if cls == "GatherOp":
+        return "gather"
+    if cls == "ScatterOp":
+        return "scatter"
+    if cls == "IndexMapOp":
+        return "index_map"
+    return cls.removesuffix("Op").lower() or cls
+
+
+def _node_style(op: object, is_output: bool) -> tuple[str, str]:
+    """(shape, fillcolor) for a Graph Node based on its op."""
+    cls = type(op).__name__
+    if cls == "InputOp":
+        return "ellipse", "#d0f0c0"
+    if cls == "ConstantOp":
+        return "ellipse", "#e0e0e0"
+    if cls == "IndexMapOp":
+        return "parallelogram", "#c0d8f0" if is_output else "white"
+    return "box", "#c0d8f0" if is_output else "white"
+
+
+def _fmt_shape(shape: tuple) -> str:
+    if not shape:
+        return "scalar"
+    return "(" + ",".join(str(d) for d in shape) + ")"
+
+
+def _graph_to_dot(graph: Graph) -> str:
+    """Render a ``Graph`` as Graphviz DOT source.
+
+    Nodes are walked in topological order for deterministic output. Each node
+    is labeled with its id, op label, and output shape + dtype. Boundary
+    sentinels get coloured ellipses; layout-only ``IndexMapOp`` gets a
+    parallelogram (to reinforce that no math happens there). Output nodes get
+    a light-blue fill regardless of shape.
+
+    Consumed via ``dot -Tsvg FILE.dot -o FILE.svg`` (or -Tpng / -Tpdf).
+    """
+    outputs = set(graph.outputs)
+    lines: list[str] = [
+        "digraph G {",
+        "  rankdir=TB;",
+        '  node [style="rounded,filled", fontname="Helvetica", fontsize=10];',
+        '  edge [arrowsize=0.7, color="#555555"];',
+        "",
+    ]
+    for nid in graph.topological_order():
+        node = graph.nodes[nid]
+        op_text = _op_label(node.op)
+        shape = _fmt_shape(tuple(node.output.shape))
+        dtype = node.output.dtype
+        label = f"{nid}\\n{op_text}\\n{shape} {dtype}"
+        dot_shape, fill = _node_style(node.op, nid in outputs)
+        lines.append(f'  "{nid}" [label="{label}", shape={dot_shape}, fillcolor="{fill}"];')
+
+    lines.append("")
+    for nid in graph.topological_order():
+        for src in graph.nodes[nid].inputs:
+            lines.append(f'  "{src}" -> "{nid}";')
+
+    lines.append("}")
+    lines.append("")  # trailing newline
+    return "\n".join(lines)
