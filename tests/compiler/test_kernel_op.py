@@ -25,12 +25,13 @@ from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 def _loop(*, axes=(), inputs=(), accumulators=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
-    Test-local shim: LoopOp.axes is now a property over the body's Loop tree,
-    so the constructor no longer accepts axes=. Fixtures that still think in
-    terms of (axes, flat_body) use this helper to get the nested body form
-    the IR requires.
+    Test-local shim: LoopOp.axes is a property over the body's Loop tree,
+    and ``accumulators=`` is gone — each ``Accumulator`` (alias for
+    ``AccumDecl``) gets prepended to the body as an AccumDecl statement
+    to keep the legacy fixture shape working.
     """
-    return LoopOp(inputs=inputs, accumulators=accumulators, body=flat_body_to_nested(axes, body))
+    prefix = tuple(AccumDecl(name=a.name, combine=a.combine, init=a.init) for a in accumulators)
+    return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, prefix + tuple(body)))
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +209,9 @@ def test_kernel_matmul():
             Write(output=0, index=(Var("a0"),), value="dot"),
         ),
     )
-    assert len(flatten_body(k.body)) == 3
+    # AccumDecl + Assign + Update + Write — the AccumDecl is added by the
+    # fixture shim now that ``accumulators=`` is a body-statement alias.
+    assert len(flatten_body(k.body)) == 4
 
 
 def test_kernel_matmul_bias():
@@ -226,7 +229,8 @@ def test_kernel_matmul_bias():
             Write(output=0, index=(Var("a0"),), value="out"),
         ),
     )
-    assert len(flatten_body(k.body)) == 4
+    # AccumDecl + Assign + Update + Assign + Write (AccumDecl from the shim).
+    assert len(flatten_body(k.body)) == 5
 
 
 def test_kernel_softmax_two_accumulators():
@@ -609,11 +613,11 @@ def _nested_reduce_kernel() -> LoopOp:
 
     return LoopOp(
         inputs=(Port(index=(Var("a0"), Var("k"))),),
-        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Loop(
                 axis=Axis("a0", 4),
                 body=(
+                    AccumDecl(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),
                     Loop(axis=Axis("k", 8), body=(Update(target="acc", value="$0"),)),
                     Write(output=0, index=(Var("a0"),), value="acc"),
                 ),

@@ -64,7 +64,8 @@ from deplodock.compiler.ir.kernel_ir import (
 from deplodock.compiler.ir.kernel_ir import Assign as GpuAssign
 from deplodock.compiler.ir.kernel_ir import Stmt as GpuStmt
 from deplodock.compiler.ir.loop_ir import (
-    Accumulator,
+    AccumDecl,
+    Load,
     Loop,
     LoopOp,
     Port,
@@ -378,27 +379,27 @@ def _simplify_loop_stmt(stmt: LoopStmt, ctx: Context) -> LoopStmt:
         )
     if isinstance(stmt, Write):
         return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value)
+    if isinstance(stmt, Load):
+        return Load(stmt.name, stmt.source, _simplify_expr_tuple(stmt.index, ctx))
+    if isinstance(stmt, AccumDecl):
+        return AccumDecl(stmt.name, stmt.combine, simplify_expr(stmt.init, ctx))  # type: ignore[arg-type]
     # Assign / Update carry only SSA names — no Expr field to simplify
     return stmt
 
 
 def simplify_loop_op(op: LoopOp) -> LoopOp:
-    """Simplify every Expr inside a LoopOp. Seeds Context from axis extents."""
+    """Simplify every Expr inside a LoopOp. Seeds Context from axis extents.
+
+    Port indices (from the legacy ``inputs`` tuple) are walked with a full-
+    axis Context — they materialize at the innermost point of the iteration
+    space. Body Loads, AccumDecls, Writes, Selects get simplified as the
+    walker descends through Loop blocks, accumulating axis ranges.
+    """
     ctx = Context.empty()
-    # Axis names aren't in ctx at the LoopOp level — they only gain a range
-    # once inside a Loop block. Port indices are read at the innermost point
-    # of the iteration space, so we walk them per-scope too. But for the
-    # top-level inputs/accumulators we rebuild with an empty Context first
-    # and rely on the Loop walker to push axis ranges.
-    new_inputs = tuple(Port(_simplify_expr_tuple(p.index, ctx)) for p in op.inputs)
-    new_accumulators = tuple(Accumulator(name=acc.name, combine=acc.combine, init=simplify_expr(acc.init, ctx)) for acc in op.accumulators)
-    # Body — push axis ranges as we descend into Loop blocks.
     new_body = tuple(_simplify_loop_stmt(s, ctx) for s in op.body)
-    # Now walk inputs again with a Context that has every axis range, so
-    # Port indices see their bounds and can fold comparison clamps.
     full_ctx = Context({a.name: Interval(0, a.extent - 1) for a in op.axes})
     new_inputs = tuple(Port(_simplify_expr_tuple(p.index, full_ctx)) for p in op.inputs)
-    return replace(op, inputs=new_inputs, accumulators=new_accumulators, body=new_body)
+    return replace(op, inputs=new_inputs, body=new_body)
 
 
 # ---------------------------------------------------------------------------

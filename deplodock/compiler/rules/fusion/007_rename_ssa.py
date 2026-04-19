@@ -39,7 +39,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         return None
 
     flat = list(flatten_body(loop.body))
-    acc_names = {acc.name for acc in loop.accumulators}
+    acc_names = {decl.name for decl in loop.accum_decls}
 
     rename: dict[str, str] = {}
     counter = 0
@@ -76,7 +76,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     new_loop = LoopOp(
         inputs=loop.inputs,
-        accumulators=loop.accumulators,
         body=flat_body_to_nested(loop.axes, tuple(new_body), loop.reduce_axis_names),
     )
 

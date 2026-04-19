@@ -21,7 +21,7 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop_ir import AccumDecl, Accumulator, Assign, Axis, Load, LoopOp, Port, Select, Update, Write
+from deplodock.compiler.ir.loop_ir import AccumDecl, Assign, Axis, Load, LoopOp, Port, Select, Update, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -111,14 +111,10 @@ def execute_loop_op(
     reduce_names = loop.reduce_axis_names
     reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.name in reduce_names)
     values: dict[str, np.ndarray] = dict(dollar)
-    # Accumulators live either in the legacy ``accumulators`` tuple or as
-    # in-body ``AccumDecl`` stmts. Initialize both sources.
-    acc_map: dict[str, Accumulator | AccumDecl] = {acc.name: acc for acc in loop.accumulators}
-    for acc in loop.accumulators:
-        init_val = acc.init.eval({})
-        values[acc.name] = np.asarray(init_val, dtype=np.float32)
+    # AccumDecls are body-form reduce accumulator declarations. Each one
+    # binds an SSA name that subsequent Updates fold values into.
+    acc_map: dict[str, AccumDecl] = {decl.name: decl for decl in loop.accum_decls}
     for decl in loop.accum_decls:
-        acc_map[decl.name] = decl
         init_val = decl.init.eval({})
         values[decl.name] = np.asarray(init_val, dtype=np.float32)
 
@@ -196,7 +192,7 @@ def execute_loop_op(
     raise ValueError("LoopOp produced no output")
 
 
-def _fold_to_accumulator(src: np.ndarray, acc: Accumulator | AccumDecl, reduce_axis_positions: tuple[int, ...]) -> np.ndarray:
+def _fold_to_accumulator(src: np.ndarray, acc: AccumDecl, reduce_axis_positions: tuple[int, ...]) -> np.ndarray:
     """Reduce ``src`` along the reduce axes using the Accumulator's combine op.
 
     Returns a ndarray of the reduced shape (keepdims=True preserved for
