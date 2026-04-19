@@ -15,7 +15,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Cast, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Axis, Loop, LoopOp, Port, Stmt, Write
+from deplodock.compiler.ir.loop_ir import Axis, Load, Loop, LoopOp, Port, Stmt, Write
 from deplodock.compiler.ir.tensor_ir import GatherOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -36,13 +36,18 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
 
     # Port 0: idx — identity load over all output axes.
-    idx_port = Port(index=tuple(Var(a.name) for a in axes))
+    idx_index = tuple(Var(a.name) for a in axes)
+    idx_port = Port(index=idx_index)
     # Port 1: data — every dim is a free axis except ``axis``, which reads the
-    # loaded idx value (``$0``) cast to int.
-    data_index = tuple(Cast("int", Var("$0")) if i == axis else Var(axes[i].name) for i in range(ndim))
+    # loaded idx value cast to int (referenced by the idx Load's SSA name).
+    data_index = tuple(Cast("int", Var("idx")) if i == axis else Var(axes[i].name) for i in range(ndim))
     data_port = Port(index=data_index)
 
-    inner: tuple[Stmt, ...] = (Write(output=0, index=tuple(Var(a.name) for a in axes), value="$1"),)
+    inner: tuple[Stmt, ...] = (
+        Load(name="idx", source=0, index=idx_index),
+        Load(name="data", source=1, index=data_index),
+        Write(output=0, index=tuple(Var(a.name) for a in axes), value="data"),
+    )
     body: tuple[Stmt, ...] = inner
     for a in reversed(axes):
         body = (Loop(axis=a, body=body),)

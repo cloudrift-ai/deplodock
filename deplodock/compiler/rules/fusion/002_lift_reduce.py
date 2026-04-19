@@ -10,7 +10,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import AccumDecl, Axis, Loop, LoopOp, Port, Stmt, Update, Write
+from deplodock.compiler.ir.loop_ir import AccumDecl, Axis, Load, Loop, LoopOp, Port, Stmt, Update, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -46,7 +46,8 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(src_shape))
     reduce_axis_name = f"a{axis}"
-    input_port = Port(index=tuple(Var(a.name) for a in axes))
+    load_index = tuple(Var(a.name) for a in axes)
+    input_port = Port(index=load_index)
 
     combine_fn = _COMBINE.get(op.fn, op.fn)
     init = _IDENTITY.get(op.fn, 0.0)
@@ -57,13 +58,13 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     write_index = _build_write_index(axes, reduce_axis_name, tuple(node.output.shape))
 
-    # Nested body: AccumDecl + Loop(reduce_axis, [Update]) + Write, wrapped in
-    # Loop(free_axis, ...) blocks (outermost first).
+    # Nested body: AccumDecl + Loop(reduce_axis, [Load + Update]) + Write,
+    # wrapped in Loop(free_axis, ...) blocks (outermost first).
     reduce_axis = next(a for a in axes if a.name == reduce_axis_name)
     free_axes = [a for a in axes if a.name != reduce_axis_name]
     inner: tuple[Stmt, ...] = (
         decl,
-        Loop(axis=reduce_axis, body=(Update(target="acc", value="$0"),)),
+        Loop(axis=reduce_axis, body=(Load(name="in0", source=0, index=load_index), Update(target="acc", value="in0"))),
         Write(output=0, index=write_index, value="acc"),
     )
     body: tuple[Stmt, ...] = inner
