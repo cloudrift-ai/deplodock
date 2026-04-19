@@ -102,7 +102,11 @@ def execute_loop_op(
     ``LoopProgram``) and ``LoopOp.forward`` (which is called directly from
     the graph-level numpy walker).
     """
-    dollar = _bind_inputs(loop, input_arrays)
+    # Keep eager ``_bind_inputs`` as a compatibility path for kernels that
+    # still reference ports via ``$N`` in body args (legacy test fixtures).
+    # Production lift rules all emit body-form Loads; those materialize
+    # inside the statement walk below.
+    dollar = _bind_inputs(loop, input_arrays) if loop.inputs else {}
 
     reduce_names = loop.reduce_axis_names
     reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.name in reduce_names)
