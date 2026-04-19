@@ -2,7 +2,7 @@
 
 import pytest
 
-from deplodock.compiler.ir.frontend import (
+from deplodock.compiler.ir.frontend_ir import (
     CatOp,
     LinearOp,
     MatmulOp,
@@ -13,7 +13,7 @@ from deplodock.compiler.ir.frontend import (
     TransposeOp,
     UnsqueezeOp,
 )
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.shape_utils import broadcast_shapes
 
 

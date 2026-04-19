@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.ir.expr import BinOp, Cast, Expr, Literal, Var, substitute
-from deplodock.compiler.ir.loop import (
+from deplodock.compiler.ir.loop_ir import (
     Assign,
     Axis,
     LocalBuffer,
@@ -46,7 +46,7 @@ from deplodock.compiler.ir.loop import (
     Update,
     Write,
 )
-from deplodock.compiler.ir.tensor import ElementwiseOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -83,7 +83,7 @@ def merge_loop_ops(
 
     # Flatten nested Loop blocks — merge operates on the linear stmt sequence.
     # The output body gets re-nested via flat_body_to_nested before return.
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     producer_flat = tuple(flatten_body(producer.body))
     consumer_flat = tuple(flatten_body(consumer.body))
@@ -296,7 +296,7 @@ def merge_loop_ops(
             body.append(Select(name=stmt.name, branches=new_branches))
 
     # Re-nest the flat merged body into the nested Loop-block form.
-    from deplodock.compiler.ir.loop import flat_body_to_nested
+    from deplodock.compiler.ir.loop_ir import flat_body_to_nested
 
     nested = flat_body_to_nested(tuple(merged_axes), tuple(body))
     return LoopOp(
@@ -399,7 +399,7 @@ def _fresh_ssa_map(
 ) -> dict[str, str]:
     """Rename producer SSA names (Assign / Select outputs) that collide with
     consumer names. Does not rename locals — those are handled separately."""
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     producer_ssa: set[str] = set()
     for stmt in flatten_body(producer.body):
@@ -438,7 +438,7 @@ def _all_defined_names(
     local_rename: dict[str, str],
     ssa_rename: dict[str, str],
 ) -> set[str]:
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     names: set[str] = set()
     for op in (producer, consumer):

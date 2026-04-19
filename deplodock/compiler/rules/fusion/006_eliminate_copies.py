@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import (
+from deplodock.compiler.ir.loop_ir import (
     Assign,
     LoopOp,
     Select,
@@ -28,7 +28,7 @@ from deplodock.compiler.ir.loop import (
     flat_body_to_nested,
     flatten_body,
 )
-from deplodock.compiler.ir.tensor import ElementwiseOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
 GRAMMAR = [Production("root", LoopOp, "1")]

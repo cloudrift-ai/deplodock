@@ -32,7 +32,7 @@ from deplodock.compiler.backend.cuda.runner import MatmulBenchmarkResult, run_be
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 
 # TODO: FusedRegionOp no longer exists in the structural IR; this bench
 # script predates the LoopOp refactor and needs porting before it can run.

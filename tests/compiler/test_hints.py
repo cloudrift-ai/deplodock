@@ -2,7 +2,7 @@
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Hints, Tensor, resolve_hints
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 
 
 def _matmul_graph() -> Graph:
@@ -178,7 +178,7 @@ def test_hints_flow_through_lower():
     rewriter = Rewriter.from_directory(rules_dir)
     fused = rewriter.apply(g)
 
-    from deplodock.compiler.ir.loop import LoopOp
+    from deplodock.compiler.ir.loop_ir import LoopOp
 
     kernel_nodes = [n for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
     assert len(kernel_nodes) == 1

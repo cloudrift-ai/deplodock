@@ -18,8 +18,8 @@ import numpy as np
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import Assign, Update, Write
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.loop_ir import Assign, Update, Write
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.rewriter import Rewriter
 
@@ -52,19 +52,19 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 def _elementwise_fns(body) -> list[str]:
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     return [s.op.fn for s in flatten_body(body) if isinstance(s, Assign)]
 
 
 def _has_update(body) -> bool:
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     return any(isinstance(s, Update) for s in flatten_body(body))
 
 
 def _has_write(body) -> bool:
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop_ir import flatten_body
 
     return any(isinstance(s, Write) for s in flatten_body(body))
 
@@ -116,7 +116,7 @@ def test_reduce_sum():
 
 
 def test_matmul():
-    from deplodock.compiler.ir.frontend import MatmulOp
+    from deplodock.compiler.ir.frontend_ir import MatmulOp
 
     g = Graph()
     _input(g, "a", (4, 8))
@@ -150,7 +150,7 @@ def test_no_matmul_when_mul_fans_out():
 
 
 def test_matmul_op_decomposes_and_fuses():
-    from deplodock.compiler.ir.frontend import MatmulOp
+    from deplodock.compiler.ir.frontend_ir import MatmulOp
 
     g = Graph()
     _input(g, "a", (4, 8))
@@ -222,7 +222,7 @@ def test_reduce_sum_correctness():
 
 
 def test_matmul_correctness():
-    from deplodock.compiler.ir.frontend import MatmulOp
+    from deplodock.compiler.ir.frontend_ir import MatmulOp
 
     def _make():
         g = Graph()

@@ -33,7 +33,7 @@ from typing import Literal
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.expr import render as render_expr
-from deplodock.compiler.ir.tensor import ElementwiseOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 # ---------------------------------------------------------------------------
 # Axis — named iteration variable

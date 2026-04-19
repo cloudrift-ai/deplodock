@@ -13,7 +13,7 @@ from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp  # noqa: F401
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp  # noqa: F401
 from deplodock.compiler.program.loop import LoopBuffer, LoopLaunch, LoopProgram
 
 requires_cuda = pytest.mark.skipif(
@@ -42,7 +42,7 @@ def _reduce_sum_graph() -> Graph:
 
 
 def _matmul_graph() -> Graph:
-    from deplodock.compiler.ir.frontend import MatmulOp
+    from deplodock.compiler.ir.frontend_ir import MatmulOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 8)), node_id="a")
@@ -56,7 +56,7 @@ def _matmul_graph() -> Graph:
 def _softmax_launch() -> LoopLaunch:
     """Build a LoopLaunch with the softmax SSA pattern directly."""
     from deplodock.compiler.ir.expr import Literal, Var
-    from deplodock.compiler.ir.loop import Assign, Axis, LocalBuffer, Loop, LoopOp, Port, Update, Write
+    from deplodock.compiler.ir.loop_ir import Assign, Axis, LocalBuffer, Loop, LoopOp, Port, Update, Write
 
     a0 = Axis("a0", 4, "free")
     a1 = Axis("a1", 8, "reduce")
@@ -266,8 +266,8 @@ def _rotate_half_launch() -> LoopLaunch:
     constraint and the warning is silenced.
     """
     from deplodock.compiler.ir.expr import BinOp, Literal, Var
-    from deplodock.compiler.ir.loop import Assign, Axis, Loop, LoopOp, Port, Select, SelectBranch, Write
-    from deplodock.compiler.ir.tensor import ElementwiseOp
+    from deplodock.compiler.ir.loop_ir import Assign, Axis, Loop, LoopOp, Port, Select, SelectBranch, Write
+    from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
     axis_a0 = Axis(name="a0", extent=64, kind="free")
     body = (
@@ -316,7 +316,7 @@ def test_check_port_bounds_still_warns_without_gating_select():
     """
     from deplodock.compiler.backend.cuda.emit import check_port_bounds
     from deplodock.compiler.ir.expr import BinOp, Literal, Var
-    from deplodock.compiler.ir.loop import Axis, Loop, LoopOp, Port, Write
+    from deplodock.compiler.ir.loop_ir import Axis, Loop, LoopOp, Port, Write
 
     axis_a0 = Axis(name="a0", extent=64, kind="free")
     body = (Write(output=0, index=(Var("a0"),), value="$0"),)

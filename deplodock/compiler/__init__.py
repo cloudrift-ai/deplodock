@@ -2,9 +2,9 @@
 
 from deplodock.compiler.dump import CompilerDump
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
-from deplodock.compiler.ir.frontend import ReshapeOp, TransposeOp
+from deplodock.compiler.ir.frontend_ir import ReshapeOp, TransposeOp
 from deplodock.compiler.ir.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, GatherOp, ReduceOp, ScanOp, ScatterOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, GatherOp, ReduceOp, ScanOp, ScatterOp
 from deplodock.compiler.matcher import ChainMatch, Group, Production, match_grammar
 from deplodock.compiler.rewriter import Pass, PassTrace, Rewriter, Rule, RuleApplication
 

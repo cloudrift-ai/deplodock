@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from deplodock.compiler.ir.gpu import GpuKernel
+from deplodock.compiler.ir.kernel_ir import GpuKernel
 
 logger = logging.getLogger(__name__)
 

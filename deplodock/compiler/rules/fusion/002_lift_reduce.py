@@ -10,8 +10,8 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import Axis, LocalBuffer, Loop, LoopOp, Port, Stmt, Update, Write
-from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.loop_ir import Axis, LocalBuffer, Loop, LoopOp, Port, Stmt, Update, Write
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
 GRAMMAR = [Production("root", ReduceOp, "1")]

@@ -9,10 +9,10 @@ runnable whole, with authoritative buffer metadata.
 Graph (frontend → tensor → loop IR, populated in place by rewrites)
    │ pipeline.compile_graph
    ▼
-LoopProgram    ← program/loop.py  +  ir/loop.py
+LoopProgram    ← program/loop.py  +  ir/loop_ir.py
    │ backend/cuda/emit.compile_kernels
    ▼
-GpuProgram     ← program/gpu.py   +  ir/gpu.py
+GpuProgram     ← program/gpu.py   +  ir/kernel_ir.py
    │ backend/cuda/program.generate_source
    ▼
 .cu source
@@ -20,7 +20,7 @@ GpuProgram     ← program/gpu.py   +  ir/gpu.py
 
 ## `loop.py` — LoopProgram
 
-Pairs with `ir/loop.py`. Produced by `LoopProgram.from_graph(graph)`
+Pairs with `ir/loop_ir.py`. Produced by `LoopProgram.from_graph(graph)`
 after fusion completes.
 
 | Type                                                                                    | Role                                                              |
@@ -44,7 +44,7 @@ absorbs the copy kernel into the consumer's `Port.index`.
 
 ## `gpu.py` — GpuProgram
 
-Pairs with `ir/gpu.py`. Produced by `backend/cuda/emit.compile_kernels`
+Pairs with `ir/kernel_ir.py`. Produced by `backend/cuda/emit.compile_kernels`
 by lowering each `LoopLaunch` to a `CudaLaunch(GpuLaunch)`.
 
 | Type                                                                                 | Role                                                                    |

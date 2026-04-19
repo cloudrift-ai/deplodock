@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.frontend import (
+from deplodock.compiler.ir.frontend_ir import (
     CatOp,
     LinearOp,
     MatmulOp,
@@ -23,7 +23,7 @@ from deplodock.compiler.ir.frontend import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, GatherOp, ReduceOp
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp, GatherOp, ReduceOp
 
 rng = np.random.default_rng(42)
 

@@ -168,7 +168,7 @@ Walks a ``LoopOp``'s nested ``Loop`` tree and produces an explicit
 nested-loop view as a ``KernelPlan``: ordered ``Loop`` / ``Inline``
 steps with accumulators, rematerialization sets, and trailing writes.
 Consumed by the CUDA emitter (``backend/cuda/emit.py``). The human
-dump view uses ``ir.loop.pretty_print`` directly since the IR is
+dump view uses ``ir.loop_ir.pretty_print`` directly since the IR is
 already nested.
 
 | Symbol              | Role                                                                                                |

@@ -29,7 +29,7 @@ cuda/
 Shared infrastructure (backend-agnostic) lives in two places:
 
 ```
-compiler/ir/gpu.py         # GpuKernel, GpuKernelParam, Stmt hierarchy, expressions
+compiler/ir/kernel_ir.py         # GpuKernel, GpuKernelParam, Stmt hierarchy, expressions
 compiler/program/gpu.py    # GpuBuffer, GpuLaunch, GpuProgram (runnable program form)
 backend/kernel_codegen.py  # GpuKernel → C source (up one level; not CUDA-specific)
 ```
@@ -111,9 +111,9 @@ graph constant) when emitting `GpuBuffer`s.
 - `emit.py` must not import `backend.cuda.generators` or
   `backend.cuda.schedule` (deleted). The recursive-descent emitter is
   the only code path.
-- A new backend (ROCm, SYCL, ...) reuses `ir/gpu.py`, `program/gpu.py`,
+- A new backend (ROCm, SYCL, ...) reuses `ir/kernel_ir.py`, `program/gpu.py`,
   and `backend/kernel_codegen.py` wholesale; only its own `emit.py` /
   `program.py` need to be rewritten.
 - The loop-IR types (`LoopOp`, `Port`, `LocalBuffer`, `Assign`, `Update`,
   `Write`, `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT
-  import from `backend/cuda/` into `ir/loop.py` or `program/loop.py`.
+  import from `backend/cuda/` into `ir/loop_ir.py` or `program/loop.py`.
