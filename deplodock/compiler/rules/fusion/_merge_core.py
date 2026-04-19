@@ -197,7 +197,11 @@ def merge_loop_ops(
     pre_reduce_sigma.update(unbound_binding)
 
     merged_axes = tuple(consumer.axes) + tuple(Axis(name=axis_rename[a.name], extent=a.extent) for a in unbound_axes)
-    merged_accs = _merge_accumulators(consumer.accumulators, producer.accumulators, local_rename, pre_reduce_sigma)
+    # Merge accumulators: consumer's kept as-is; producer's renamed to avoid
+    # collisions and inits σ-substituted.
+    merged_accs: list[Accumulator] = list(consumer.accumulators)
+    for acc in producer.accumulators:
+        merged_accs.append(replace(acc, name=local_rename.get(acc.name, acc.name), init=substitute(acc.init, pre_reduce_sigma)))
 
     # Build merged ports: consumer ports (minus consumer_ports) first, then
     # a set of producer ports per σ_k (σ_k-substituted).
@@ -464,20 +468,6 @@ def _all_defined_names(
 # ---------------------------------------------------------------------------
 # Port / local merging
 # ---------------------------------------------------------------------------
-
-
-def _merge_accumulators(
-    consumer_accs: tuple[Accumulator, ...],
-    producer_accs: tuple[Accumulator, ...],
-    rename: dict[str, str],
-    sigma: dict[str, Expr],
-) -> list[Accumulator]:
-    result: list[Accumulator] = list(consumer_accs)
-    for acc in producer_accs:
-        new_name = rename.get(acc.name, acc.name)
-        new_init = substitute(acc.init, sigma)
-        result.append(replace(acc, name=new_name, init=new_init))
-    return result
 
 
 # ---------------------------------------------------------------------------
