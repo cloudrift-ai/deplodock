@@ -37,6 +37,15 @@ class ProgramResult:
 
 
 @dataclass
+class LaunchTime:
+    """Per-launch GPU-event timing inside a benchmark run."""
+
+    idx: int
+    kernel_name: str
+    time_ms: float
+
+
+@dataclass
 class BenchmarkResult:
     """Result of benchmarking a program."""
 
@@ -44,6 +53,7 @@ class BenchmarkResult:
     min_ms: float | None = None
     max_ms: float | None = None
     num_launches: int = 0
+    per_launch: list[LaunchTime] | None = None
 
 
 class Backend(ABC):

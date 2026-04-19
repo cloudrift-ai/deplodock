@@ -44,6 +44,11 @@ def _handle_run(args):
     if args.benchmark:
         result = backend.benchmark(compiled, num_iters=args.iters)
         logger.info("Time: %.3f ms (%d launches)", result.time_ms, result.num_launches)
+        if result.per_launch:
+            total = sum(lt.time_ms for lt in result.per_launch)
+            logger.info("Top kernels by time (sum=%.4f ms):", total)
+            for lt in sorted(result.per_launch, key=lambda x: x.time_ms, reverse=True)[:5]:
+                logger.info("  %3d %-40s %.4f ms", lt.idx, lt.kernel_name, lt.time_ms)
         if dump:
             dump.dump_benchmark(result)
     else:

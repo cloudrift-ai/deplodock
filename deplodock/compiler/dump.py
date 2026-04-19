@@ -220,12 +220,14 @@ class CompilerDump:
             self._write_json(f"70_launch_{li:03d}.json", data)
 
     def dump_benchmark(self, result: BenchmarkResult) -> None:
-        data = {
+        data: dict = {
             "time_ms": result.time_ms,
             "min_ms": result.min_ms,
             "max_ms": result.max_ms,
             "num_launches": result.num_launches,
         }
+        if result.per_launch:
+            data["per_launch"] = [{"idx": lt.idx, "kernel_name": lt.kernel_name, "time_ms": lt.time_ms} for lt in result.per_launch]
         self._write_json("60_benchmark.json", data)
 
     # --- Internal helpers ---
