@@ -290,12 +290,22 @@ def _reduce_loop_to_steps(
         last_update = updates[-1]
         last_idx = body.index(last_update)
         ew = [s for s in body[:last_idx] if isinstance(s, (Assign, Select, Load))]
-        # LICM: row_space Assigns don't vary with the reduce axis; emit them
-        # as an Inline step before the K-loop so they compute once per row
-        # instead of K times. Selects and Loads stay inside conservatively
-        # when their value depends on the reduce axis.
-        pre_body = tuple(s for s in ew if isinstance(s, Assign) and s.name in row_space)
-        in_loop = tuple(s for s in ew if not (isinstance(s, Assign) and s.name in row_space))
+
+        # LICM: row_space Assigns and Loads don't vary with the reduce axis;
+        # emit them as an Inline step before the K-loop so they compute once
+        # per row instead of K times. Selects stay inside conservatively.
+        # Row-space Loads must be hoisted alongside any Assign that uses them
+        # — an Assign hoisted to pre_body would otherwise reference a Load
+        # still in the K-loop body.
+        def _is_hoistable(s: Assign | Select | Load) -> bool:
+            if isinstance(s, Assign):
+                return s.name in row_space
+            if isinstance(s, Load):
+                return s.name in row_space
+            return False
+
+        pre_body = tuple(s for s in ew if _is_hoistable(s))
+        in_loop = tuple(s for s in ew if not _is_hoistable(s))
         remat = _remat_set(list(body), prior_ew, row_space)
         remat_assigns = tuple(a for a in prior_ew if a.name in remat)
         acc = acc_map[last_update.target]
