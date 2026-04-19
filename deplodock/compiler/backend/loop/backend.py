@@ -4,7 +4,7 @@ Walks each ``LoopLaunch`` in topological order, evaluating its ``LoopOp``
 as whole-tensor numpy operations. Body statements dispatch on type:
 
 - ``Assign``: pure computation via ``ElementwiseOp.forward``.
-- ``Update``: fold a value into a ``LocalBuffer`` accumulator; done as a
+- ``Update``: fold a value into an ``Accumulator``; done as a
   numpy reduction (``np.sum``/``np.max``/etc.) over the reduce axis since
   this is whole-tensor evaluation, not coord-by-coord.
 - ``Write``: stash an SSA value into the output buffer at the computed
@@ -21,7 +21,7 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop_ir import Assign, Axis, LocalBuffer, LoopOp, Port, Select, Update, Write
+from deplodock.compiler.ir.loop_ir import Accumulator, Assign, Axis, LoopOp, Port, Select, Update, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -106,10 +106,10 @@ def execute_loop_op(
 
     reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.kind == "reduce")
     values: dict[str, np.ndarray] = dict(dollar)
-    lb_map: dict[str, LocalBuffer] = {lb.name: lb for lb in loop.locals}
-    for lb in loop.locals:
-        init_val = lb.init.eval({}) if lb.init is not None else 0.0
-        values[lb.name] = np.asarray(init_val, dtype=np.float32)
+    acc_map: dict[str, Accumulator] = {acc.name: acc for acc in loop.accumulators}
+    for acc in loop.accumulators:
+        init_val = acc.init.eval({})
+        values[acc.name] = np.asarray(init_val, dtype=np.float32)
 
     output_array = np.zeros(out_shape, dtype=np.float32)
     output_written = False
@@ -125,9 +125,9 @@ def execute_loop_op(
             assert isinstance(stmt.op, ElementwiseOp)
             values[stmt.name] = stmt.op.forward(*_align_ranks(args))
         elif isinstance(stmt, Update):
-            lb = lb_map[stmt.target]
+            acc = acc_map[stmt.target]
             src = values[stmt.value]
-            reduced = _fold_to_accumulator(src, lb, reduce_axis_positions)
+            reduced = _fold_to_accumulator(src, acc, reduce_axis_positions)
             values[stmt.target] = reduced
         elif isinstance(stmt, Select):
             axis_env = _broadcast_axis_env(loop.axes)
@@ -174,19 +174,16 @@ def execute_loop_op(
     raise ValueError("LoopOp produced no output")
 
 
-def _fold_to_accumulator(src: np.ndarray, lb: LocalBuffer, reduce_axis_positions: tuple[int, ...]) -> np.ndarray:
-    """Reduce ``src`` along the reduce axes using the LocalBuffer's combine op.
+def _fold_to_accumulator(src: np.ndarray, acc: Accumulator, reduce_axis_positions: tuple[int, ...]) -> np.ndarray:
+    """Reduce ``src`` along the reduce axes using the Accumulator's combine op.
 
     Returns a ndarray of the reduced shape (keepdims=True preserved for
     downstream broadcast compatibility).
     """
     if not reduce_axis_positions:
         return np.asarray(src, dtype=np.float32)
-    combine = lb.combine
     axes = tuple(reduce_axis_positions)
-    if combine is None:
-        return np.asarray(src, dtype=np.float32)
-    fn = combine.fn
+    fn = acc.combine.fn
     if fn == "add":
         return np.sum(src, axis=axes, keepdims=True).astype(np.float32)
     if fn == "max":

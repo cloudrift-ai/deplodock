@@ -1,8 +1,8 @@
 """Lift ``ReduceOp`` to a single-reduce-axis ``LoopOp``.
 
 The lifted kernel iterates over the full input shape; the reduce axis is
-kind ``"reduce"`` and contributes an accumulator ``LocalBuffer``. The Write
-index covers only free axes (with size-1 placeholders for keep-dim outputs).
+kind ``"reduce"`` and contributes an ``Accumulator``. The Write index
+covers only free axes (with size-1 placeholders for keep-dim outputs).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Axis, LocalBuffer, Loop, LoopOp, Port, Stmt, Update, Write
+from deplodock.compiler.ir.loop_ir import Accumulator, Axis, Loop, LoopOp, Port, Stmt, Update, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -49,7 +49,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     combine_fn = _COMBINE.get(op.fn, op.fn)
     init = _IDENTITY.get(op.fn, 0.0)
-    acc = LocalBuffer(name="acc", combine=ElementwiseOp(combine_fn), init=Literal(init))
+    acc = Accumulator(name="acc", combine=ElementwiseOp(combine_fn), init=Literal(init))
 
     write_index = _build_write_index(axes, tuple(node.output.shape))
 
@@ -64,7 +64,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     body: tuple[Stmt, ...] = inner
     for a in reversed(free_axes):
         body = (Loop(axis=a, body=body),)
-    kernel = LoopOp(inputs=(input_port,), locals=(acc,), body=body)
+    kernel = LoopOp(inputs=(input_port,), accumulators=(acc,), body=body)
 
     frag = Graph()
     frag.add_node(InputOp(), [], Tensor(src_id, src_shape, src_node.output.dtype), node_id=src_id)

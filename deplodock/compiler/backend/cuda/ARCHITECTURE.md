@@ -138,6 +138,6 @@ graph constant) when emitting `GpuBuffer`s.
 - A new backend (ROCm, SYCL, ...) reuses `ir/kernel_ir.py`, `program/gpu.py`,
   and `backend/kernel_codegen.py` wholesale; only its own `emit.py` /
   `program.py` need to be rewritten.
-- The loop-IR types (`LoopOp`, `Port`, `LocalBuffer`, `Assign`, `Update`,
+- The loop-IR types (`LoopOp`, `Port`, `Accumulator`, `Assign`, `Update`,
   `Write`, `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT
   import from `backend/cuda/` into `ir/loop_ir.py` or `program/loop.py`.

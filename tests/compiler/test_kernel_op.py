@@ -4,9 +4,9 @@ import pytest
 
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop_ir import (
+    Accumulator,
     Assign,
     Axis,
-    LocalBuffer,
     LoopOp,
     Port,
     Select,
@@ -19,7 +19,7 @@ from deplodock.compiler.ir.loop_ir import (
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 
-def _loop(*, axes=(), inputs=(), locals=(), body=()):
+def _loop(*, axes=(), inputs=(), accumulators=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
     Test-local shim: LoopOp.axes is now a property over the body's Loop tree,
@@ -27,7 +27,7 @@ def _loop(*, axes=(), inputs=(), locals=(), body=()):
     terms of (axes, flat_body) use this helper to get the nested body form
     the IR requires.
     """
-    return LoopOp(inputs=inputs, locals=locals, body=flat_body_to_nested(axes, body))
+    return LoopOp(inputs=inputs, accumulators=accumulators, body=flat_body_to_nested(axes, body))
 
 
 # ---------------------------------------------------------------------------
@@ -102,13 +102,13 @@ def test_kernel_reduce():
     k = _loop(
         axes=axes,
         inputs=(p,),
-        locals=(LocalBuffer(name="s", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        accumulators=(Accumulator(name="s", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Update(target="s", value="$0"),
             Write(output=0, index=(Var("a0"),), value="s"),
         ),
     )
-    assert any(isinstance(lb.combine, ElementwiseOp) for lb in k.locals)
+    assert any(isinstance(lb.combine, ElementwiseOp) for lb in k.accumulators)
 
 
 def test_kernel_matmul():
@@ -117,7 +117,7 @@ def test_kernel_matmul():
     k = _loop(
         axes=axes,
         inputs=(p, p),
-        locals=(LocalBuffer(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        accumulators=(Accumulator(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
             Update(target="dot", value="mul"),
@@ -134,7 +134,7 @@ def test_kernel_matmul_bias():
     k = _loop(
         axes=axes,
         inputs=(p_mk, p_mk, p_bias),
-        locals=(LocalBuffer(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        accumulators=(Accumulator(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
             Update(target="dot", value="mul"),
@@ -154,9 +154,9 @@ def test_kernel_softmax_two_accumulators():
     k = _loop(
         axes=axes,
         inputs=(p,),
-        locals=(
-            LocalBuffer(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-            LocalBuffer(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
+        accumulators=(
+            Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
+            Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
         body=(
             Update(target="mx", value="$0"),
@@ -164,8 +164,8 @@ def test_kernel_softmax_two_accumulators():
             Write(output=0, index=(Var("a0"),), value="mx"),
         ),
     )
-    assert any(lb.name == "mx" for lb in k.locals)
-    assert any(lb.name == "sm" for lb in k.locals)
+    assert any(lb.name == "mx" for lb in k.accumulators)
+    assert any(lb.name == "sm" for lb in k.accumulators)
 
 
 def test_kernel_unary_chain():
@@ -273,7 +273,7 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
 def test_rejects_update_without_matching_local():
     axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
     p = Port(index=(Var("a0"), Var("a1")))
-    with pytest.raises(ValueError, match="does not name a LocalBuffer"):
+    with pytest.raises(ValueError, match="does not name an Accumulator"):
         _loop(
             axes=axes,
             inputs=(p,),
@@ -288,7 +288,7 @@ def test_rejects_accumulator_without_reduce_axis():
         _loop(
             axes=axes,
             inputs=(p,),
-            locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+            accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
             body=(Update(target="acc", value="$0"),),
         )
 
@@ -299,7 +299,7 @@ def test_rejects_reduce_axis_without_accumulator():
     a0 = Axis("a0", 4, "free")
     a1 = Axis("a1", 8, "reduce")
     p = Port(index=(Var("a0"), Var("a1")))
-    with pytest.raises(ValueError, match="no accumulator"):
+    with pytest.raises(ValueError, match="no Accumulator"):
         LoopOp(
             inputs=(p,),
             body=(
@@ -308,30 +308,6 @@ def test_rejects_reduce_axis_without_accumulator():
                     body=(Loop(axis=a1, body=(Assign("a", ElementwiseOp("exp"), args=("$0",)),)),),
                 ),
             ),
-        )
-
-
-def test_rejects_shaped_localbuffer_in_v1():
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
-    p = Port(index=(Var("a0"), Var("a1")))
-    with pytest.raises(ValueError, match="shape=\\(\\)"):
-        _loop(
-            axes=axes,
-            inputs=(p,),
-            locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0), shape=(4,)),),
-            body=(Update(target="acc", value="$0"),),
-        )
-
-
-def test_rejects_nonthread_scope_in_v1():
-    axes = (Axis("a0", 4, "free"), Axis("a1", 8, "reduce"))
-    p = Port(index=(Var("a0"), Var("a1")))
-    with pytest.raises(ValueError, match="scope='thread'"):
-        _loop(
-            axes=axes,
-            inputs=(p,),
-            locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0), scope="block"),),
-            body=(Update(target="acc", value="$0"),),
         )
 
 
@@ -356,9 +332,9 @@ def test_rejects_unused_accumulator():
         _loop(
             axes=axes,
             inputs=(p,),
-            locals=(
-                LocalBuffer(name="a", combine=ElementwiseOp("add"), init=Literal(0.0)),
-                LocalBuffer(name="b", combine=ElementwiseOp("add"), init=Literal(0.0)),
+            accumulators=(
+                Accumulator(name="a", combine=ElementwiseOp("add"), init=Literal(0.0)),
+                Accumulator(name="b", combine=ElementwiseOp("add"), init=Literal(0.0)),
             ),
             body=(Update(target="a", value="$0"),),
         )
@@ -397,7 +373,7 @@ def test_loop_stmt_reduce_kernel():
     loop = _loop(
         axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
-        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Loop(
                 axis=Axis("a0", 4, "free"),
@@ -428,9 +404,9 @@ def test_loop_stmt_softmax_sibling_reduces():
     loop = _loop(
         axes=(Axis("a0", 4, "free"), Axis("a1", 8, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("a1"))), Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
-        locals=(
-            LocalBuffer(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-            LocalBuffer(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
+        accumulators=(
+            Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
+            Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
         body=(
             Loop(
@@ -464,7 +440,7 @@ def test_loop_axis_nested_shadow_rejected():
         _loop(
             axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
             inputs=(Port(index=(Var("a0"), Var("k"))),),
-            locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+            accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
             body=(
                 Loop(
                     axis=Axis("k", 8, "reduce"),  # outer reduce k
@@ -488,9 +464,9 @@ def test_loop_axis_sibling_same_name_allowed():
     _loop(
         axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
-        locals=(
-            LocalBuffer(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-            LocalBuffer(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
+        accumulators=(
+            Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
+            Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
         body=(
             Loop(axis=Axis("k", 8, "reduce"), body=(Update(target="mx", value="$0"),)),
@@ -608,7 +584,7 @@ def _flat_reduce_kernel() -> LoopOp:
     return _loop(
         axes=(Axis("a0", 4, "free"), Axis("k", 8, "reduce")),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
-        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Update(target="acc", value="$0"),
             Write(output=0, index=(Var("a0"),), value="acc"),
@@ -622,7 +598,7 @@ def _nested_reduce_kernel() -> LoopOp:
 
     return LoopOp(
         inputs=(Port(index=(Var("a0"), Var("k"))),),
-        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Loop(
                 axis=Axis("a0", 4, "free"),

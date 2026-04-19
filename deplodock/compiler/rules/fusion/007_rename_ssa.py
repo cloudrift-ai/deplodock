@@ -7,7 +7,7 @@ semantics are unaffected but the LoopIR pretty-print is unreadable.
 
 This pass walks each LoopOp's flat body in definition order, assigns
 ``v0``, ``v1``, ... to each Assign / Select output, and rewrites every
-downstream reference. LocalBuffer names (``acc``, ``acc_1``) are already
+downstream reference. Accumulator names (``acc``, ``acc_1``) are already
 short and semantically meaningful — left untouched. Idempotent: a body
 already in ``v0..vN`` form returns None and the rewriter moves on.
 """
@@ -39,13 +39,13 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         return None
 
     flat = list(flatten_body(loop.body))
-    local_names = {lb.name for lb in loop.locals}
+    acc_names = {acc.name for acc in loop.accumulators}
 
     rename: dict[str, str] = {}
     counter = 0
     for stmt in flat:
         if isinstance(stmt, (Assign, Select)):
-            if stmt.name in local_names or stmt.name in rename:
+            if stmt.name in acc_names or stmt.name in rename:
                 continue
             rename[stmt.name] = f"v{counter}"
             counter += 1
@@ -76,7 +76,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     new_loop = LoopOp(
         inputs=loop.inputs,
-        locals=loop.locals,
+        accumulators=loop.accumulators,
         body=flat_body_to_nested(loop.axes, tuple(new_body)),
     )
 

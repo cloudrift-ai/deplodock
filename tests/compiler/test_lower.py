@@ -1,7 +1,7 @@
 """Tests for the compile_graph pipeline: decomposition → optimization → fusion → extract.
 
 After compile_graph, every primitive op is inside a LoopOp. Reductions
-live as ``LocalBuffer + Update`` on the LoopOp; elementwise ops as
+live as ``Accumulator + Update`` on the LoopOp; elementwise ops as
 ``Assign``; final output as a ``Write``.
 
 Structural fixtures also have a matching ``*_correctness`` test that runs
@@ -111,8 +111,8 @@ def test_reduce_sum():
     assert len(launches) == 1
     loop = launches[0].loop
     assert _has_update(loop.body)
-    # Reduction target is a LocalBuffer with combine=add (sum).
-    assert any(lb.combine is not None and lb.combine.fn == "add" for lb in loop.locals)
+    # Reduction target is a Accumulator with combine=add (sum).
+    assert any(lb.combine.fn == "add" for lb in loop.accumulators)
 
 
 def test_matmul():
@@ -129,7 +129,7 @@ def test_matmul():
     launches = result.launches
     # Expect a mul Assign and a sum Update somewhere across the launches.
     has_mul = any("mul" in _elementwise_fns(k.loop.body) for k in launches)
-    has_sum = any(any(lb.combine is not None and lb.combine.fn == "add" for lb in k.loop.locals) for k in launches)
+    has_sum = any(any(lb.combine.fn == "add" for lb in k.loop.accumulators) for k in launches)
     assert has_mul
     assert has_sum
 

@@ -35,9 +35,9 @@ from dataclasses import replace
 
 from deplodock.compiler.ir.expr import BinOp, Cast, Expr, Literal, Var, substitute
 from deplodock.compiler.ir.loop_ir import (
+    Accumulator,
     Assign,
     Axis,
-    LocalBuffer,
     LoopOp,
     Port,
     Select,
@@ -190,7 +190,7 @@ def merge_loop_ops(
                 return None
 
     axis_rename = _fresh_axis_names(unbound_axes, consumer.axes)
-    local_rename = _fresh_local_names(producer.locals, consumer.locals)
+    local_rename = _fresh_local_names(producer.accumulators, consumer.accumulators)
     ssa_rename_common = _fresh_ssa_map(producer, consumer, local_rename)
 
     # Augment each σ_k with bindings for unbound axes (they survive as new axes).
@@ -202,7 +202,7 @@ def merge_loop_ops(
     pre_reduce_sigma.update(unbound_binding)
 
     merged_axes = tuple(consumer.axes) + tuple(Axis(name=axis_rename[a.name], extent=a.extent, kind=a.kind) for a in unbound_axes)
-    merged_locals = _merge_locals(consumer.locals, producer.locals, local_rename, pre_reduce_sigma)
+    merged_accs = _merge_accumulators(consumer.accumulators, producer.accumulators, local_rename, pre_reduce_sigma)
 
     # Build merged ports: consumer ports (minus consumer_ports) first, then
     # a set of producer ports per σ_k (σ_k-substituted).
@@ -312,7 +312,7 @@ def merge_loop_ops(
     nested = flat_body_to_nested(tuple(merged_axes), tuple(body))
     return LoopOp(
         inputs=tuple(merged_ports),
-        locals=tuple(merged_locals),
+        accumulators=tuple(merged_accs),
         body=nested,
     )
 
@@ -391,8 +391,8 @@ def _fresh_axis_names(to_rename: list[Axis], taken: tuple[Axis, ...]) -> dict[st
 
 
 def _fresh_local_names(
-    to_rename: tuple[LocalBuffer, ...],
-    taken: tuple[LocalBuffer, ...],
+    to_rename: tuple[Accumulator, ...],
+    taken: tuple[Accumulator, ...],
 ) -> dict[str, str]:
     used = {lb.name for lb in taken}
     result: dict[str, str] = {}
@@ -417,7 +417,7 @@ def _fresh_ssa_map(
         if isinstance(stmt, (Assign, Select)):
             producer_ssa.add(stmt.name)
 
-    consumer_names: set[str] = {lb.name for lb in consumer.locals}
+    consumer_names: set[str] = {lb.name for lb in consumer.accumulators}
     for stmt in flatten_body(consumer.body):
         if isinstance(stmt, (Assign, Select)):
             consumer_names.add(stmt.name)
@@ -453,7 +453,7 @@ def _all_defined_names(
 
     names: set[str] = set()
     for op in (producer, consumer):
-        for lb in op.locals:
+        for lb in op.accumulators:
             names.add(lb.name)
         for stmt in flatten_body(op.body):
             if isinstance(stmt, (Assign, Select)):
@@ -468,17 +468,17 @@ def _all_defined_names(
 # ---------------------------------------------------------------------------
 
 
-def _merge_locals(
-    consumer_locals: tuple[LocalBuffer, ...],
-    producer_locals: tuple[LocalBuffer, ...],
-    local_rename: dict[str, str],
+def _merge_accumulators(
+    consumer_accs: tuple[Accumulator, ...],
+    producer_accs: tuple[Accumulator, ...],
+    rename: dict[str, str],
     sigma: dict[str, Expr],
-) -> list[LocalBuffer]:
-    result: list[LocalBuffer] = list(consumer_locals)
-    for lb in producer_locals:
-        new_name = local_rename.get(lb.name, lb.name)
-        new_init = substitute(lb.init, sigma) if lb.init is not None else None
-        result.append(replace(lb, name=new_name, init=new_init))
+) -> list[Accumulator]:
+    result: list[Accumulator] = list(consumer_accs)
+    for acc in producer_accs:
+        new_name = rename.get(acc.name, acc.name)
+        new_init = substitute(acc.init, sigma)
+        result.append(replace(acc, name=new_name, init=new_init))
     return result
 
 

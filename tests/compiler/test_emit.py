@@ -56,16 +56,16 @@ def _matmul_graph() -> Graph:
 def _softmax_launch() -> LoopLaunch:
     """Build a LoopLaunch with the softmax SSA pattern directly."""
     from deplodock.compiler.ir.expr import Literal, Var
-    from deplodock.compiler.ir.loop_ir import Assign, Axis, LocalBuffer, Loop, LoopOp, Port, Update, Write
+    from deplodock.compiler.ir.loop_ir import Accumulator, Assign, Axis, Loop, LoopOp, Port, Update, Write
 
     a0 = Axis("a0", 4, "free")
     a1 = Axis("a1", 8, "reduce")
     p = Port(index=(Var("a0"), Var("a1")))
     loop = LoopOp(
         inputs=(p, p),
-        locals=(
-            LocalBuffer(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-            LocalBuffer(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
+        accumulators=(
+            Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
+            Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
         body=(
             Loop(

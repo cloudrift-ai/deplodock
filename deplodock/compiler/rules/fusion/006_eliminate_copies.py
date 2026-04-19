@@ -82,7 +82,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     new_loop = LoopOp(
         inputs=loop.inputs,
-        locals=loop.locals,
+        accumulators=loop.accumulators,
         body=flat_body_to_nested(loop.axes, tuple(new_body)),
     )
 
