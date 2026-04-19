@@ -196,7 +196,7 @@ already nested.
 | ``Inline``          | Straight-line block of ``Assign`` / ``Select`` statements (no loop).                                |
 | ``TrailingWrite``   | Write emitted once per thread after all reduce sweeps (for non-elementwise outputs).                |
 | ``KernelPlan``      | Tuple of ``Step`` + per-element port set + output thread count + trailing writes.                   |
-| ``analyze_kernel``  | Entry point: walks the body's ``Loop`` tree; each reduce ``Loop`` block → one ``Loop`` step.        |
+| ``analyze_kernel``  | Entry point: walks the body's ``Loop`` tree; each reduce ``Loop`` block → an optional ``Inline`` prelude (LICM: loop-invariant assigns hoisted out of the K-loop) + one ``Loop`` step. |
 
 **Rule:** Imports ``expr``, ``loop``. No dependency on ``program`` or
 any backend — this analysis is pure structural IR.

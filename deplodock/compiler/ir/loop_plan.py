@@ -177,11 +177,13 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     tail_writes: list[Write] = []
     for stmt in inner_body[idx:]:
         if isinstance(stmt, LoopStmt) and stmt.axis.kind == "reduce":
-            step = _reduce_loop_to_step(stmt, acc_map, acc_count, prior_ew, row_space, pre_shape, reduce_axis_idx, k_size)
-            if step is None:
+            new_steps = _reduce_loop_to_steps(stmt, acc_map, acc_count, prior_ew, row_space, pre_shape, reduce_axis_idx, k_size)
+            if not new_steps:
                 continue
-            steps.append(step)
-            if step.accum is not None:
+            steps.extend(new_steps)
+            # The Loop step (if any) is the last one; count its accumulator.
+            last_step = new_steps[-1]
+            if isinstance(last_step, Loop) and last_step.accum is not None:
                 acc_count += 1
             # Bring this reduce Loop's element-space Assigns into scope for later remat.
             prior_ew.extend(s for s in stmt.body if isinstance(s, Assign))
@@ -244,7 +246,7 @@ def _descend_free_loops(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     return body
 
 
-def _reduce_loop_to_step(
+def _reduce_loop_to_steps(
     loop: LoopStmt,
     acc_map: dict,
     acc_count: int,
@@ -253,10 +255,14 @@ def _reduce_loop_to_step(
     pre_shape: tuple,
     reduce_axis_idx: int,
     k_size: int,
-) -> Loop | None:
-    """Convert a reduce ``Loop`` block into a ``plan.Loop`` step.
+) -> list[Step]:
+    """Convert a reduce ``Loop`` block into plan ``Step``s.
 
-    Two shapes supported:
+    Returns a list of steps: optional ``Inline`` prelude for loop-invariant
+    ``Assign``s hoisted out of the K-loop (classical LICM), followed by the
+    ``Loop`` step for the K-iterated work.
+
+    Two body shapes supported:
     - Body ends in ``Update``: classic reduce segment with an accumulator.
     - Body ends in ``Write`` with no ``Update``: per-K elementwise pass that
       stores each element (``stores_output=True``). Used by softmax's
@@ -264,18 +270,21 @@ def _reduce_loop_to_step(
     """
     body = loop.body
     if not body:
-        return None
+        return []
 
     updates = [s for s in body if isinstance(s, Update)]
     writes = [s for s in body if isinstance(s, Write)]
-    ew = [s for s in body if isinstance(s, (Assign, Select))]
 
     if updates:
         # Classic reduce segment: last Update drives the accumulator.
         last_update = updates[-1]
-        # Elementwise stmts are those before the last Update.
         last_idx = body.index(last_update)
         ew = [s for s in body[:last_idx] if isinstance(s, (Assign, Select))]
+        # LICM: row_space Assigns don't vary with the reduce axis; emit them
+        # as an Inline step before the K-loop so they compute once per row
+        # instead of K times. Selects stay inside conservatively.
+        pre_body = tuple(s for s in ew if isinstance(s, Assign) and s.name in row_space)
+        in_loop = tuple(s for s in ew if not (isinstance(s, Assign) and s.name in row_space))
         remat = _remat_set(list(body), prior_ew, row_space)
         remat_assigns = tuple(a for a in prior_ew if a.name in remat)
         lb = acc_map[last_update.target]
@@ -288,35 +297,39 @@ def _reduce_loop_to_step(
             src=last_update.value,
             result=last_update.target,
         )
-        return Loop(
+        loop_step = Loop(
             recompute=remat_assigns,
-            body=tuple(ew),
+            body=in_loop,
             accum=accum,
             stores_output=False,
             iter_shape=pre_shape,
             reduce_axis=reduce_axis_idx,
             k_size=k_size,
         )
+        return [Inline(body=pre_body), loop_step] if pre_body else [loop_step]
 
     # No Update — per-K elementwise pass. Must have Writes to justify iteration.
     if writes:
+        ew = [s for s in body if isinstance(s, (Assign, Select))]
         remat = _remat_set(list(body), prior_ew, row_space)
         remat_assigns = tuple(a for a in prior_ew if a.name in remat)
         w = writes[-1]
-        return Loop(
-            recompute=remat_assigns,
-            body=tuple(ew),
-            accum=None,
-            stores_output=True,
-            store_index=w.index,
-            store_value=w.value,
-            store_output_idx=w.output,
-            iter_shape=pre_shape,
-            reduce_axis=reduce_axis_idx,
-            k_size=k_size,
-        )
+        return [
+            Loop(
+                recompute=remat_assigns,
+                body=tuple(ew),
+                accum=None,
+                stores_output=True,
+                store_index=w.index,
+                store_value=w.value,
+                store_output_idx=w.output,
+                iter_shape=pre_shape,
+                reduce_axis=reduce_axis_idx,
+                k_size=k_size,
+            )
+        ]
 
-    return None
+    return []
 
 
 # ---------------------------------------------------------------------------
