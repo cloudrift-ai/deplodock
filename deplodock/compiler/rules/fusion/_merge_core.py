@@ -305,12 +305,20 @@ def merge_loop_ops(
             new_args = tuple(rewrite_arg(a) for a in stmt.args)
             body.append(Assign(name=stmt.name, op=stmt.op, args=new_args))
         elif isinstance(stmt, Load):
-            # Consumer Load stays put: σ is identity on consumer axes, source
-            # is unchanged relative to the merged kernel's input list (its
-            # position is preserved via consumer_port_remap only when ports
-            # were dropped).
-            new_source = consumer_port_remap.get(stmt.source, stmt.source)
-            body.append(Load(name=stmt.name, source=new_source, index=stmt.index))
+            if stmt.source in consumer_port_set:
+                # Consumer is reading the producer via a body-form Load.
+                # Instantiate the producer's body once (lazily, σ_k keyed on
+                # source) and bind the Load's SSA name to the bridge value
+                # via a copy. This parallels how the $N path's rewrite_arg
+                # triggers instantiation at each reference.
+                bridge = instantiate_for_cp(stmt.source)
+                body.append(Assign(name=stmt.name, op=ElementwiseOp("copy"), args=(bridge,)))
+            else:
+                # Consumer Load of its own external input: remap the source
+                # index through consumer_port_remap to account for dropped
+                # consumed ports.
+                new_source = consumer_port_remap.get(stmt.source, stmt.source)
+                body.append(Load(name=stmt.name, source=new_source, index=stmt.index))
         elif isinstance(stmt, AccumDecl):
             # Consumer AccumDecl passes through unchanged.
             body.append(stmt)
@@ -434,12 +442,14 @@ def _fresh_ssa_map(
 
     producer_ssa: set[str] = set()
     for stmt in flatten_body(producer.body):
-        if isinstance(stmt, (Assign, Select)):
+        if isinstance(stmt, (Assign, Select, Load)):
             producer_ssa.add(stmt.name)
 
     consumer_names: set[str] = {lb.name for lb in consumer.accumulators}
+    for decl in consumer.accum_decls:
+        consumer_names.add(decl.name)
     for stmt in flatten_body(consumer.body):
-        if isinstance(stmt, (Assign, Select)):
+        if isinstance(stmt, (Assign, Select, Load)):
             consumer_names.add(stmt.name)
 
     # Renamed producer locals also occupy space in the merged namespace.

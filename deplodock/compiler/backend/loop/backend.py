@@ -21,7 +21,7 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop_ir import AccumDecl, Accumulator, Assign, Axis, LoopOp, Port, Select, Update, Write
+from deplodock.compiler.ir.loop_ir import AccumDecl, Accumulator, Assign, Axis, Load, LoopOp, Port, Select, Update, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -131,6 +131,17 @@ def execute_loop_op(
             args = [values[a] for a in stmt.args]
             assert isinstance(stmt.op, ElementwiseOp)
             values[stmt.name] = stmt.op.forward(*_align_ranks(args))
+        elif isinstance(stmt, Load):
+            # Body-form port read: mirror what _bind_inputs does for $N.
+            # Resolve the source index to an external buffer and apply the
+            # Load's access pattern.
+            if stmt.source >= len(input_arrays):
+                raise ValueError(f"Load source {stmt.source} out of range (have {len(input_arrays)} inputs)")
+            port_equiv = Port(index=stmt.index)
+            values[stmt.name] = _apply_port_index(port_equiv, input_arrays[stmt.source], loop.axes, values)
+        elif isinstance(stmt, AccumDecl):
+            # AccumDecl was initialized above; nothing to do here.
+            pass
         elif isinstance(stmt, Update):
             acc = acc_map[stmt.target]
             src = values[stmt.value]
