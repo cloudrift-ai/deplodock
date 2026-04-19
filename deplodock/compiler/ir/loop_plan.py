@@ -158,6 +158,8 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 
     # --- Reduce: build steps by walking inner_body left-to-right. ---
     acc_map = {acc.name: acc for acc in kernel.accumulators}
+    for decl in kernel.accum_decls:
+        acc_map[decl.name] = decl
     steps = []
     prior_ew: list[Assign] = []
     acc_count = 0
