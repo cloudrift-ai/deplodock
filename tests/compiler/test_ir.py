@@ -10,10 +10,15 @@ from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
 
 def _make_matmul_graph():
-    """Build: C[M,N] = reduce_sum(elementwise_mul(A[M,K], B[K,N]), axis=1)."""
+    """Build: C[M,1,N] = reduce_sum(elementwise_mul(A[M,K,N], B[M,K,N]), axis=1).
+
+    Uses keepdim reduction and matching-shape elementwise inputs to stay on
+    the Tensor IR rank-preservation invariant (see ir/broadcast.py for how
+    decomposition rules insert explicit IndexMapOps when shapes differ).
+    """
     g = Graph()
-    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", ("M", "K")), node_id="A")
-    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", ("K", "N")), node_id="B")
+    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", ("M", "K", "N")), node_id="A")
+    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", ("M", "K", "N")), node_id="B")
     g.inputs = [a, b]
 
     ew = g.add_node(
@@ -25,7 +30,7 @@ def _make_matmul_graph():
     red = g.add_node(
         op=ReduceOp(fn="sum", axis=1),
         inputs=[ew],
-        output=Tensor("C", ("M", "N")),
+        output=Tensor("C", ("M", 1, "N")),
         node_id="red",
     )
     g.outputs = [red]
@@ -82,7 +87,7 @@ def test_replace_node():
     new_id = g.add_node(
         op=ReduceOp(fn="sum", axis=0),
         inputs=["ew"],
-        output=Tensor("C2", ("N",)),
+        output=Tensor("C2", (1, "K", "N")),
         node_id="red2",
     )
     g.replace_node("red", new_id)

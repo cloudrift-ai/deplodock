@@ -125,9 +125,9 @@ def test_reduce_sum(run_graph):
     x_np = rng.standard_normal((4, 8)).astype(np.float32)
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    g.add_node(ReduceOp("sum", -1), ["x"], Tensor("y", (4,)), node_id="y")
+    g.add_node(ReduceOp("sum", -1), ["x"], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    expected = _torch_to_np(torch.from_numpy(x_np).sum(dim=-1))
+    expected = _torch_to_np(torch.from_numpy(x_np).sum(dim=-1, keepdim=True))
     np.testing.assert_allclose(_run(run_graph, g, {"x": x_np}), expected, rtol=1e-5, atol=1e-5)
 
 
@@ -135,9 +135,9 @@ def test_reduce_max(run_graph):
     x_np = rng.standard_normal((4, 8)).astype(np.float32)
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    g.add_node(ReduceOp("max", -1), ["x"], Tensor("y", (4,)), node_id="y")
+    g.add_node(ReduceOp("max", -1), ["x"], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    expected = _torch_to_np(torch.from_numpy(x_np).amax(dim=-1))
+    expected = _torch_to_np(torch.from_numpy(x_np).amax(dim=-1, keepdim=True))
     np.testing.assert_allclose(_run(run_graph, g, {"x": x_np}), expected, rtol=1e-5, atol=1e-5)
 
 
@@ -160,9 +160,9 @@ def test_mean(run_graph):
     x_np = rng.standard_normal((4, 8)).astype(np.float32)
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    g.add_node(MeanOp(axis=-1), ["x"], Tensor("y", (4,)), node_id="y")
+    g.add_node(MeanOp(axis=-1), ["x"], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
-    expected = _torch_to_np(torch.from_numpy(x_np).mean(dim=-1))
+    expected = _torch_to_np(torch.from_numpy(x_np).mean(dim=-1, keepdim=True))
     np.testing.assert_allclose(_run(run_graph, g, {"x": x_np}), expected, rtol=1e-5, atol=1e-5)
 
 

@@ -8,7 +8,7 @@ via integer-divide indexing: ``K[b, q_head // group_size, s, d]``.
 import math
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to
+from deplodock.compiler.ir.broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
 from deplodock.compiler.ir.frontend import SdpaOp, TransposeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
@@ -27,7 +27,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     q_shape = graph.nodes[q_id].output.shape
     k_shape = graph.nodes[k_id].output.shape
-    out_shape = root.output.shape
     dtype = root.output.dtype
     name = root.output.name
 
@@ -100,11 +99,13 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[q_bc, kt_bc],
         output=Tensor(f"{name}_qk_ew", qk_mul_shape, dtype),
     )
-    qk_id = frag.add_node(
+    qk_reduce_shape = tuple(qk_mul_shape[:qk_k_axis]) + (1,) + tuple(qk_mul_shape[qk_k_axis + 1 :])
+    qk_reduce_id = frag.add_node(
         op=ReduceOp(fn="sum", axis=qk_k_axis),
         inputs=[qk_ew_id],
-        output=Tensor(f"{name}_qk", scores_shape, dtype),
+        output=Tensor(f"{name}_qk_reduce", qk_reduce_shape, dtype),
     )
+    qk_id = squeeze_axis(frag, qk_reduce_id, qk_k_axis, out_name=f"{name}_qk")
 
     # Scale constant: 1/sqrt(head_dim)
     scale_value = 1.0 / math.sqrt(head_dim) if isinstance(head_dim, int) else None
@@ -233,11 +234,13 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[s_bc, v_bc],
         output=Tensor(f"{name}_sv_ew", sv_mul_shape, dtype),
     )
-    sv_id = frag.add_node(
+    sv_reduce_shape = tuple(sv_mul_shape[:sv_k_axis]) + (1,) + tuple(sv_mul_shape[sv_k_axis + 1 :])
+    sv_reduce_id = frag.add_node(
         op=ReduceOp(fn="sum", axis=sv_k_axis),
         inputs=[sv_ew_id],
-        output=Tensor(name, out_shape, dtype),
+        output=Tensor(f"{name}_sv_reduce", sv_reduce_shape, dtype),
     )
+    sv_id = squeeze_axis(frag, sv_reduce_id, sv_k_axis, out_name=name)
 
     frag.outputs = [sv_id]
     return frag

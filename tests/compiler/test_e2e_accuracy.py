@@ -47,13 +47,13 @@ def test_e2e_pointwise_add(run_graph):
 def test_e2e_reduce_sum(run_graph):
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    g.add_node(ReduceOp("sum", -1), ["x"], Tensor("y", (4,)), node_id="y")
+    g.add_node(ReduceOp("sum", -1), ["x"], Tensor("y", (4, 1)), node_id="y")
     g.inputs = ["x"]
     g.outputs = ["y"]
 
     rng = np.random.default_rng(0)
     x = rng.standard_normal((4, 8)).astype(np.float32)
-    expected = x.sum(-1)
+    expected = x.sum(-1, keepdims=True)
     outputs = run_graph(g, {"x": x})
     _assert_close(list(outputs.values())[0], expected)
 

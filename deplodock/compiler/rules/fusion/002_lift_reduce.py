@@ -74,39 +74,22 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
 
 def _build_write_index(axes: tuple[Axis, ...], out_shape: tuple) -> tuple[Expr, ...]:
-    """Build the Write's index for a reduce kernel.
+    """Build the Write's index for a reduce kernel under the keepdim invariant.
 
-    Tensor IR's production path (tracer + decomposition rules) emits keepdim
-    reductions where the output rank matches the input rank. Hand-built test
-    fixtures sometimes use dropped-axis shapes, so we fall back gracefully
-    rather than raise.
-
-    - keepdim: ``len(out_shape) == len(axes)`` — reduce axes become ``Literal(0)``.
-    - dropped: ``len(out_shape) == free-axis-count`` — free axes only.
-    - fallback: right-align non-size-1 output dims onto free axes.
+    Tensor IR's rank-preservation rule (enforced by the tracer and every
+    decomposition rule) says reductions keep their reduced axis at size 1, so
+    ``len(out_shape) == len(axes)``. Reduce axes and singleton dims become
+    ``Literal(0)`` at their dim position; free axes become ``Var(axis.name)``.
     """
-    free_axes = tuple(a for a in axes if a.kind == "free")
-
-    if len(out_shape) == len(axes):
-        result: list[Expr] = []
-        for a, d in zip(axes, out_shape, strict=True):
-            if a.kind == "reduce" or (isinstance(d, int) and d == 1):
-                result.append(Literal(0, "int"))
-            else:
-                result.append(Var(a.name))
-        return tuple(result)
-
-    if len(out_shape) == len(free_axes):
-        return tuple(Var(a.name) for a in free_axes)
-
-    out_list: list[Expr] = [Literal(0, "int")] * len(out_shape)
-    cursor = len(free_axes) - 1
-    for i in range(len(out_shape) - 1, -1, -1):
-        d = out_shape[i]
-        if isinstance(d, int) and d == 1:
-            continue
-        if cursor < 0:
-            break
-        out_list[i] = Var(free_axes[cursor].name)
-        cursor -= 1
-    return tuple(out_list)
+    if len(out_shape) != len(axes):
+        raise ValueError(
+            f"lift_reduce: out_shape rank {len(out_shape)} must equal axes count {len(axes)} "
+            f"(keepdim invariant — wrap in a squeeze IndexMapOp if a dropped shape is needed)"
+        )
+    result: list[Expr] = []
+    for a, d in zip(axes, out_shape, strict=True):
+        if a.kind == "reduce" or (isinstance(d, int) and d == 1):
+            result.append(Literal(0, "int"))
+        else:
+            result.append(Var(a.name))
+    return tuple(result)

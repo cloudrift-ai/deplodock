@@ -8,7 +8,7 @@ Inputs are unsqueezed so the mul is a standard NumPy broadcast:
 """
 
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to
+from deplodock.compiler.ir.broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.ir.frontend import MatmulOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
@@ -54,17 +54,23 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[a_bc, b_bc],
         output=Tensor(f"{name}_ew", mul_shape, dtype),
     )
+    # ReduceOp is keepdim: output has the reduced dim at size 1 (same rank as
+    # mul_shape). Squeeze that dim back out for downstream consumers that
+    # expect the matmul's declared shape.
+    reduce_shape = tuple(mul_shape[:k_axis]) + (1,) + tuple(mul_shape[k_axis + 1 :])
     red_id = frag.add_node(
         op=ReduceOp(fn="sum", axis=k_axis),
         inputs=[ew_id],
-        output=Tensor(name, shape, dtype),
+        output=Tensor(f"{name}_reduce", reduce_shape, dtype),
     )
 
     if bias_id:
+        sq_id = squeeze_axis(frag, red_id, k_axis)
         bias_bc = broadcast_to(frag, bias_id, shape)
-        add_id = frag.add_node(op=ElementwiseOp(fn="add"), inputs=[red_id, bias_bc], output=Tensor(f"{name}_bias", shape, dtype))
+        add_id = frag.add_node(op=ElementwiseOp(fn="add"), inputs=[sq_id, bias_bc], output=Tensor(name, shape, dtype))
         frag.outputs = [add_id]
     else:
-        frag.outputs = [red_id]
+        sq_id = squeeze_axis(frag, red_id, k_axis, out_name=name)
+        frag.outputs = [sq_id]
 
     return frag

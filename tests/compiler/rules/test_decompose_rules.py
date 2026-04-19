@@ -345,8 +345,11 @@ def test_sdpa_idempotent():
 
 
 def test_sdpa_output_is_valid():
+    """SDPA ends with a squeeze IndexMapOp (after the keepdim reduce)."""
+    from deplodock.compiler.ir.tensor import IndexMapOp
+
     result = _apply(_make_sdpa_graph(), _load("001_decompose_sdpa.py"))
-    assert isinstance(result.nodes[result.outputs[0]].op, (ElementwiseOp, ReduceOp))
+    assert isinstance(result.nodes[result.outputs[0]].op, (ElementwiseOp, ReduceOp, IndexMapOp))
 
 
 def test_sdpa_with_extra_args_decomposes():
