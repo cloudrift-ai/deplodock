@@ -382,6 +382,57 @@ def test_merge_rejects_free_axis_leak():
     assert merged is None
 
 
+def test_merge_rejects_reduce_into_higher_rank_consumer():
+    """Rank-growth guard: a reducing producer fused into a higher-rank consumer would
+    replicate the producer's reduce body over the new free dim(s) — the MLP pathology
+    where `gate*up` (reduce over hidden) would feed a rank-4 broadcast-then-mul before
+    `down_proj`. Refuse when consumer.Write rank > producer.Write rank and the
+    producer has any reduce axis.
+
+    Concrete fixture mirrors Qwen's MLP: producer writes (B, S, I) by reducing K,
+    consumer writes (B, S, I, H) via elementwise. Without the guard the merged kernel
+    iterates (B·S·I·H·K) leaves; at Qwen-MLP scale that's thousands of times the
+    separate-kernel work.
+    """
+    # Producer: matmul-like reduce. Free (a0=B=1, a1=S=4, a2=I=6), reduce (a2_1=K=8).
+    # Writes out[a0, a1, a2].
+    producer = _loop(
+        axes=(
+            Axis(name="a0", extent=1, kind="free"),
+            Axis(name="a1", extent=4, kind="free"),
+            Axis(name="a2", extent=6, kind="free"),
+            Axis(name="a2_1", extent=8, kind="reduce"),
+        ),
+        inputs=(Port(index=(Var("a0"), Var("a1"), Var("a2_1"))),),
+        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
+        body=(
+            Update(target="acc", value="$0"),
+            Write(output=0, index=(Var("a0"), Var("a1"), Var("a2")), value="acc"),
+        ),
+    )
+    # Consumer: broadcast + elementwise mul. Free (a0=B=1, a1=S=4, a2=I=6, a3=H=5).
+    # Writes out[a0, a1, a2, a3] — one extra free dim compared to producer.
+    consumer = _loop(
+        axes=(
+            Axis(name="a0", extent=1, kind="free"),
+            Axis(name="a1", extent=4, kind="free"),
+            Axis(name="a2", extent=6, kind="free"),
+            Axis(name="a3", extent=5, kind="free"),
+        ),
+        inputs=(
+            Port(index=(Var("a0"), Var("a1"), Var("a2"))),  # from producer (broadcast over a3)
+            Port(index=(Var("a3"), Var("a2"))),  # external weight
+        ),
+        locals=(),
+        body=(
+            Assign(name="v", op=ElementwiseOp("mul"), args=("$0", "$1")),
+            Write(output=0, index=(Var("a0"), Var("a1"), Var("a2"), Var("a3")), value="v"),
+        ),
+    )
+    merged = merge_loop_ops(producer, producer_output=0, consumer=consumer, consumer_port=0)
+    assert merged is None
+
+
 def test_merge_rejects_non_affine_writer():
     """Writer `a * 2` — solver refuses."""
     producer = _loop(

@@ -165,6 +165,14 @@ Lift-then-merge, driven by the rewriter's fixpoint loop:
    - The merged kernel must have at most one reduce axis (matches the
      current single-reduce CUDA backend — multi-reduce kernels feeding
      reductions across different data axes stay separate).
+   - **Rank-growth guard**: refuse merging a reducing producer into a
+     consumer whose ``Write`` has higher rank. The extra consumer free
+     dims would make the producer's reduce body run once per iteration
+     of each new dim — the MLP pathology where ``gate*up`` (reduce over
+     hidden) would feed a rank-4 broadcast-then-mul before ``down_proj``
+     and blow up per-layer work by ~3500× on Qwen-scale models.
+     Rank-preserving reductions (keepdim) share the consumer's Write
+     rank, so softmax-style merges are unaffected.
    - Axes and SSA names are renamed to avoid collisions; producer
      Ports are substituted through σ; the producer's connecting
      ``Write`` becomes ``Assign(bridge, ElementwiseOp("copy"), …)``
