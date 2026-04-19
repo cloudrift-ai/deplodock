@@ -87,7 +87,6 @@ class Accumulator:
     name: str
     combine: ElementwiseOp
     init: Expr
-    dtype: str = "f32"
 
 
 # ---------------------------------------------------------------------------
@@ -252,18 +251,6 @@ class LoopOp(Op):
         walk(self.body, None)
         return frozenset(names)
 
-    def free_axes(self) -> tuple[Axis, ...]:
-        reduce_names = self.reduce_axis_names
-        return tuple(a for a in self.axes if a.name not in reduce_names)
-
-    def reduce_axes(self) -> tuple[Axis, ...]:
-        reduce_names = self.reduce_axis_names
-        return tuple(a for a in self.axes if a.name in reduce_names)
-
-    def infer_output_shape(self, input_shapes: list[tuple] | dict[str, tuple] | None = None) -> tuple:
-        """Output shape = extents of free axes in declaration order."""
-        return tuple(a.extent for a in self.free_axes())
-
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
 
@@ -288,13 +275,14 @@ class LoopOp(Op):
         Evaluates each dim's index Expr over the full iteration space; the
         per-dim extent is ``max(value) + 1``. Handles plain ``Var(axis)`` (→
         axis extent), ``Literal(c)`` (→ 1), and affine combinations uniformly.
-        Falls back to ``infer_output_shape`` when no ``Write`` is present.
+        Falls back to the free-axis extents when no ``Write`` is present.
         """
         import numpy as np
 
         writes = [s for s in flatten_body(self.body) if isinstance(s, Write)]
         if not writes:
-            return self.infer_output_shape()
+            reduce_names = self.reduce_axis_names
+            return tuple(a.extent for a in self.axes if a.name not in reduce_names)
         w = writes[0]
         env: dict[str, object] = {}
         for i, a in enumerate(self.axes):

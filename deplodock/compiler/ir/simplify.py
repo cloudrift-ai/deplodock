@@ -391,15 +391,7 @@ def simplify_loop_op(op: LoopOp) -> LoopOp:
     # top-level inputs/accumulators we rebuild with an empty Context first
     # and rely on the Loop walker to push axis ranges.
     new_inputs = tuple(Port(_simplify_expr_tuple(p.index, ctx)) for p in op.inputs)
-    new_accumulators = tuple(
-        Accumulator(
-            name=acc.name,
-            combine=acc.combine,
-            init=simplify_expr(acc.init, ctx),
-            dtype=acc.dtype,
-        )
-        for acc in op.accumulators
-    )
+    new_accumulators = tuple(Accumulator(name=acc.name, combine=acc.combine, init=simplify_expr(acc.init, ctx)) for acc in op.accumulators)
     # Body — push axis ranges as we descend into Loop blocks.
     new_body = tuple(_simplify_loop_stmt(s, ctx) for s in op.body)
     # Now walk inputs again with a Context that has every axis range, so
