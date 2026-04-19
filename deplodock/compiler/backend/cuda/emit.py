@@ -30,7 +30,7 @@ from deplodock.compiler.ir.kernel_ir import (
     Assign as IrAssign,
 )
 from deplodock.compiler.ir.loop_ir import Assign as IrAssignStmt
-from deplodock.compiler.ir.loop_ir import Axis, LoopOp, Port, Select, Update
+from deplodock.compiler.ir.loop_ir import Axis, Load, LoopOp, Port, Select, Update
 from deplodock.compiler.ir.simplify import simplify_kernel
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -483,6 +483,16 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
                     tname = _fresh(name_seq)
                     stmts.append(VarDecl(dtype="float", name=tname, init=value))
                     values[stmt.name] = Var(tname)
+                elif isinstance(stmt, Load):
+                    # Body-form Load: emit a port-load expression via the same
+                    # machinery _collect_port_info feeds. Source index maps
+                    # 1:1 to the legacy $N port ordering during the migration.
+                    key = f"${stmt.source}"
+                    port, buf_name, src_shape = port_info[key]
+                    expr = _emit_port_load(Port(index=stmt.index), buf_name, src_shape, flat_env)
+                    tname = _fresh(name_seq)
+                    stmts.append(VarDecl(dtype="float", name=tname, init=expr))
+                    values[stmt.name] = Var(tname)
 
         elif isinstance(step, Loop):
             k_var_name = f"k{loop_count}"
@@ -510,6 +520,10 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
             for stmt in step.body:
                 if isinstance(stmt, Select):
                     value = _emit_select(stmt, loop_values, axis_env)
+                elif isinstance(stmt, Load):
+                    key = f"${stmt.source}"
+                    port, buf_name, src_shape = port_info[key]
+                    value = _emit_port_load(Port(index=stmt.index), buf_name, src_shape, axis_env)
                 else:
                     arg_exprs = [loop_values[a] for a in stmt.args]
                     value = _apply_elementwise(stmt.op.fn, arg_exprs)
