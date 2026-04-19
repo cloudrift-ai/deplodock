@@ -13,7 +13,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, substitute
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Axis, Loop, LoopOp, Port, Select, SelectBranch, Stmt, Write
+from deplodock.compiler.ir.loop_ir import Axis, Load, Loop, LoopOp, Port, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tensor_ir import IndexMapOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -39,18 +39,23 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         src = op.sources[0]
         src_id = node.inputs[src.input_idx]
         src_shape = graph.nodes[src_id].output.shape if src_id in graph.nodes else ()
-        ports.append(Port(index=_substituted_index(src.coord_map, mapping, src_shape)))
+        idx = _substituted_index(src.coord_map, mapping, src_shape)
+        ports.append(Port(index=idx))
         input_names.append(src_id)
-        body.append(Write(output=0, index=write_index, value="$0"))
+        body.append(Load(name="in0", source=0, index=idx))
+        body.append(Write(output=0, index=write_index, value="in0"))
     else:
         branches: list[SelectBranch] = []
         for i, src in enumerate(op.sources):
             src_id = node.inputs[src.input_idx]
             src_shape = graph.nodes[src_id].output.shape if src_id in graph.nodes else ()
-            ports.append(Port(index=_substituted_index(src.coord_map, mapping, src_shape)))
+            idx = _substituted_index(src.coord_map, mapping, src_shape)
+            ports.append(Port(index=idx))
             input_names.append(src_id)
+            name = f"in{i}"
+            body.append(Load(name=name, source=i, index=idx))
             select_expr = substitute(src.select, mapping) if src.select is not None else Literal(1, "int")
-            branches.append(SelectBranch(value=f"${i}", select=select_expr))
+            branches.append(SelectBranch(value=name, select=select_expr))
         body.append(Select(name="v", branches=tuple(branches)))
         body.append(Write(output=0, index=write_index, value="v"))
 

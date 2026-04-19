@@ -170,8 +170,9 @@ def merge_loop_ops(
     # Pre-reduce stmts may only reference bound_common / aliased / unbound axes —
     # never specific_names (which disagree across σ_k). Enforcing this keeps the
     # Update emission unambiguous. "Reference" here includes the axes that
-    # appear in the index Expr of any Port the stmt reads via `$N`, because
-    # port accesses materialize under σ_k substitution.
+    # appear in the index Expr of any Port the stmt reads via `$N`, and the
+    # axes that appear in any body-form Load.index expression — both
+    # materialize under σ_k substitution and so must not drift across σ_k.
     if specific_names:
         # Collect per-port axis dependencies.
         port_axes: dict[int, set[str]] = {}
@@ -185,6 +186,12 @@ def merge_loop_ops(
                 return None
             if _stmt_port_refs_axes(stmt, port_axes, specific_names):
                 return None
+            if isinstance(stmt, Load):
+                load_axes: set[str] = set()
+                for e in stmt.index:
+                    _collect_expr_axes(e, load_axes)
+                if load_axes & specific_names:
+                    return None
 
     axis_rename = _fresh_axis_names(unbound_axes, consumer.axes)
     # Accumulator name collisions: consider both the legacy accumulators
