@@ -10,7 +10,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Accumulator, Axis, Loop, LoopOp, Port, Stmt, Update, Write
+from deplodock.compiler.ir.loop_ir import AccumDecl, Axis, Loop, LoopOp, Port, Stmt, Update, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -50,22 +50,26 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     combine_fn = _COMBINE.get(op.fn, op.fn)
     init = _IDENTITY.get(op.fn, 0.0)
-    acc = Accumulator(name="acc", combine=ElementwiseOp(combine_fn), init=Literal(init))
+    # Emit the accumulator as a body-form AccumDecl at the scope above its
+    # reduce loop. The legacy ``accumulators=`` tuple on LoopOp stays empty;
+    # the validator and readers see the AccumDecl via the body walk.
+    decl = AccumDecl(name="acc", combine=ElementwiseOp(combine_fn), init=Literal(init))
 
     write_index = _build_write_index(axes, reduce_axis_name, tuple(node.output.shape))
 
-    # Nested body: Loop(reduce_axis, [Update]) followed by Write, the whole
-    # thing wrapped in Loop(free_axis, ...) blocks (outermost first).
+    # Nested body: AccumDecl + Loop(reduce_axis, [Update]) + Write, wrapped in
+    # Loop(free_axis, ...) blocks (outermost first).
     reduce_axis = next(a for a in axes if a.name == reduce_axis_name)
     free_axes = [a for a in axes if a.name != reduce_axis_name]
     inner: tuple[Stmt, ...] = (
+        decl,
         Loop(axis=reduce_axis, body=(Update(target="acc", value="$0"),)),
         Write(output=0, index=write_index, value="acc"),
     )
     body: tuple[Stmt, ...] = inner
     for a in reversed(free_axes):
         body = (Loop(axis=a, body=body),)
-    kernel = LoopOp(inputs=(input_port,), accumulators=(acc,), body=body)
+    kernel = LoopOp(inputs=(input_port,), body=body)
 
     frag = Graph()
     frag.add_node(InputOp(), [], Tensor(src_id, src_shape, src_node.output.dtype), node_id=src_id)

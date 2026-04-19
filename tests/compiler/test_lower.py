@@ -112,7 +112,7 @@ def test_reduce_sum():
     loop = launches[0].loop
     assert _has_update(loop.body)
     # Reduction target is a Accumulator with combine=add (sum).
-    assert any(lb.combine.fn == "add" for lb in loop.accumulators)
+    assert any(lb.combine.fn == "add" for lb in (tuple(loop.accumulators) + tuple(loop.accum_decls)))
 
 
 def test_matmul():
@@ -129,7 +129,7 @@ def test_matmul():
     launches = result.launches
     # Expect a mul Assign and a sum Update somewhere across the launches.
     has_mul = any("mul" in _elementwise_fns(k.loop.body) for k in launches)
-    has_sum = any(any(lb.combine.fn == "add" for lb in k.loop.accumulators) for k in launches)
+    has_sum = any(any(lb.combine.fn == "add" for lb in (tuple(k.loop.accumulators) + tuple(k.loop.accum_decls))) for k in launches)
     assert has_mul
     assert has_sum
 

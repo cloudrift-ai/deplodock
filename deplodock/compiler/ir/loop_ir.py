@@ -681,9 +681,17 @@ def flat_body_to_nested(
         return tuple(body)
     reduce_axis = reduce_axes[0]
 
+    # Split body into segments at Update boundaries. AccumDecls are hoisted
+    # OUT of their segment (they must live at the scope enclosing the reduce
+    # Loop so Write stmts after the reduce can read the finalized accumulator
+    # value). Every other stmt stays in the segment leading up to the Update.
     segments: list[list[Stmt]] = []
     current: list[Stmt] = []
+    hoisted_decls: list[Stmt] = []
     for stmt in body:
+        if isinstance(stmt, AccumDecl):
+            hoisted_decls.append(stmt)
+            continue
         current.append(stmt)
         if isinstance(stmt, Update):
             segments.append(current)
@@ -691,6 +699,7 @@ def flat_body_to_nested(
     tail = current  # post-last-Update stmts
 
     nested: list[Stmt] = []
+    nested.extend(hoisted_decls)
     for seg in segments:
         nested.append(Loop(axis=reduce_axis, body=tuple(seg)))
     nested.extend(tail)

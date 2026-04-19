@@ -34,9 +34,11 @@ from dataclasses import replace
 
 from deplodock.compiler.ir.expr import BinOp, Cast, Expr, Literal, Var, substitute
 from deplodock.compiler.ir.loop_ir import (
+    AccumDecl,
     Accumulator,
     Assign,
     Axis,
+    Load,
     LoopOp,
     Port,
     Select,
@@ -185,7 +187,13 @@ def merge_loop_ops(
                 return None
 
     axis_rename = _fresh_axis_names(unbound_axes, consumer.axes)
-    local_rename = _fresh_local_names(producer.accumulators, consumer.accumulators)
+    # Accumulator name collisions: consider both the legacy accumulators
+    # tuple and in-body AccumDecls. Producer decl names that collide with any
+    # consumer name (field or body) get renamed; the renames propagate through
+    # _rewrite_body to produce unique accumulators in the merged body.
+    all_producer_accs: tuple[Accumulator | AccumDecl, ...] = tuple(producer.accumulators) + tuple(producer.accum_decls)
+    all_consumer_accs: tuple[Accumulator | AccumDecl, ...] = tuple(consumer.accumulators) + tuple(consumer.accum_decls)
+    local_rename = _fresh_local_names(all_producer_accs, all_consumer_accs)
     ssa_rename_common = _fresh_ssa_map(producer, consumer, local_rename)
 
     # Augment each σ_k with bindings for unbound axes (they survive as new axes).
@@ -296,6 +304,16 @@ def merge_loop_ops(
         if isinstance(stmt, Assign):
             new_args = tuple(rewrite_arg(a) for a in stmt.args)
             body.append(Assign(name=stmt.name, op=stmt.op, args=new_args))
+        elif isinstance(stmt, Load):
+            # Consumer Load stays put: σ is identity on consumer axes, source
+            # is unchanged relative to the merged kernel's input list (its
+            # position is preserved via consumer_port_remap only when ports
+            # were dropped).
+            new_source = consumer_port_remap.get(stmt.source, stmt.source)
+            body.append(Load(name=stmt.name, source=new_source, index=stmt.index))
+        elif isinstance(stmt, AccumDecl):
+            # Consumer AccumDecl passes through unchanged.
+            body.append(stmt)
         elif isinstance(stmt, Update):
             new_value = rewrite_arg(stmt.value)
             body.append(Update(target=stmt.target, value=new_value))
@@ -564,6 +582,28 @@ def _rewrite_body(
                     name=ssa_rename.get(stmt.name, stmt.name),
                     op=stmt.op,
                     args=tuple(rn(a) for a in stmt.args),
+                )
+            )
+        elif isinstance(stmt, Load):
+            # Load is a body-form port reference. σ-substitute its index and
+            # remap the source through port_remap so producer-side Loads land
+            # on their merged-kernel input positions.
+            new_source = port_remap.get(stmt.source, stmt.source)
+            result.append(
+                Load(
+                    name=ssa_rename.get(stmt.name, stmt.name),
+                    source=new_source,
+                    index=tuple(substitute(e, sigma) for e in stmt.index),
+                )
+            )
+        elif isinstance(stmt, AccumDecl):
+            # AccumDecl stays verbatim (name may get renamed via local_rename
+            # for collision avoidance with another kernel's accumulator).
+            result.append(
+                AccumDecl(
+                    name=local_rename.get(stmt.name, stmt.name),
+                    combine=stmt.combine,
+                    init=substitute(stmt.init, sigma),
                 )
             )
         elif isinstance(stmt, Update):
