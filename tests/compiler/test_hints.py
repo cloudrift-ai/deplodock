@@ -6,13 +6,17 @@ from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
 
 
 def _matmul_graph() -> Graph:
-    """Build a minimal matmul graph: C = Reduce{sum}(Elementwise{mul}(A, B))."""
+    """Build a minimal matmul graph: C = Reduce{sum}(Elementwise{mul}(A, B)).
+
+    Uses matching-shape elementwise and keepdim reduction to stay on the
+    rank-preserving Tensor IR invariant.
+    """
     g = Graph()
-    a = g.add_node(InputOp(), [], Tensor("A", (4, 8)))
-    b = g.add_node(InputOp(), [], Tensor("B", (8, 4)))
+    a = g.add_node(InputOp(), [], Tensor("A", (4, 8, 4)))
+    b = g.add_node(InputOp(), [], Tensor("B", (4, 8, 4)))
     g.inputs = [a, b]
     ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", (4, 8, 4)))
-    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", (4, 4)))
+    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", (4, 1, 4)))
     g.outputs = [c]
     return g
 

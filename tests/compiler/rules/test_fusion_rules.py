@@ -152,8 +152,8 @@ def _make_rms_norm_like():
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(ConstantOp(name="w"), [], Tensor("w", (4, 8)), node_id="w")
     g.add_node(ElementwiseOp("mul"), ["x", "x"], Tensor("sq", (4, 8)), node_id="sq")
-    g.add_node(ReduceOp("sum", -1), ["sq"], Tensor("red", (4,)), node_id="red")
-    g.add_node(ElementwiseOp("mul"), ["red", "red"], Tensor("sqr", (4,)), node_id="sqr")
+    g.add_node(ReduceOp("sum", -1), ["sq"], Tensor("red", (4, 1)), node_id="red")
+    g.add_node(ElementwiseOp("mul"), ["red", "red"], Tensor("sqr", (4, 1)), node_id="sqr")
     g.inputs, g.outputs = ["x", "w"], ["sqr"]
     return g
 
@@ -190,7 +190,7 @@ def _make_contraction():
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (4, 8)), node_id="b")
     g.add_node(ElementwiseOp("mul"), ["a", "b"], Tensor("m", (4, 8)), node_id="m")
-    g.add_node(ReduceOp("sum", -1), ["m"], Tensor("y", (4,)), node_id="y")
+    g.add_node(ReduceOp("sum", -1), ["m"], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["a", "b"], ["y"]
     return g
 
@@ -215,13 +215,15 @@ def test_contraction_body_has_mul_and_sum():
 
 
 def _make_contraction_with_epilogue():
+    from deplodock.compiler.ir.broadcast import broadcast_to
+
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (4, 8)), node_id="b")
-    g.add_node(InputOp(), [], Tensor("bias", (4,)), node_id="bias")
+    g.add_node(InputOp(), [], Tensor("bias", (4, 1)), node_id="bias")
     g.add_node(ElementwiseOp("mul"), ["a", "b"], Tensor("m", (4, 8)), node_id="m")
-    g.add_node(ReduceOp("sum", -1), ["m"], Tensor("s", (4,)), node_id="s")
-    g.add_node(ElementwiseOp("add"), ["s", "bias"], Tensor("y", (4,)), node_id="y")
+    g.add_node(ReduceOp("sum", -1), ["m"], Tensor("s", (4, 1)), node_id="s")
+    g.add_node(ElementwiseOp("add"), ["s", broadcast_to(g, "bias", (4, 1))], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["a", "b", "bias"], ["y"]
     return g
 
@@ -345,7 +347,7 @@ def test_contraction_correctness():
 def test_contraction_epilogue_correctness():
     a = rng.standard_normal((4, 8)).astype(np.float32)
     b = rng.standard_normal((4, 8)).astype(np.float32)
-    bias = rng.standard_normal(4).astype(np.float32)
+    bias = rng.standard_normal((4, 1)).astype(np.float32)
     _assert_correctness(_make_contraction_with_epilogue, {"a": a, "b": b, "bias": bias})
 
 
@@ -377,9 +379,9 @@ def _make_sibling_reductions():
     with two accumulators sharing one reduce axis."""
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    g.add_node(ReduceOp("sum", -1), ["x"], Tensor("s", (4,)), node_id="s")
-    g.add_node(ReduceOp("max", -1), ["x"], Tensor("m", (4,)), node_id="m")
-    g.add_node(ElementwiseOp("add"), ["s", "m"], Tensor("out", (4,)), node_id="out")
+    g.add_node(ReduceOp("sum", -1), ["x"], Tensor("s", (4, 1)), node_id="s")
+    g.add_node(ReduceOp("max", -1), ["x"], Tensor("m", (4, 1)), node_id="m")
+    g.add_node(ElementwiseOp("add"), ["s", "m"], Tensor("out", (4, 1)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     return g
 

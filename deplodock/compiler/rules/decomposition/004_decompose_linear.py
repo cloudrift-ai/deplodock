@@ -5,7 +5,7 @@ broadcast-compatible via IndexMapOp before the mul.
 """
 
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to
+from deplodock.compiler.ir.broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.ir.frontend import LinearOp, TransposeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
@@ -61,21 +61,26 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[a_bc, b_bc],
         output=Tensor(f"{name}_ew", mul_shape, dtype),
     )
+    # Keepdim reduce + squeeze — keeps the rank-preservation invariant local
+    # to the ReduceOp while restoring the Linear's declared output shape.
+    reduce_shape = tuple(mul_shape[:k_axis]) + (1,) + tuple(mul_shape[k_axis + 1 :])
     red_id = frag.add_node(
         op=ReduceOp(fn="sum", axis=k_axis),
         inputs=[ew_id],
-        output=Tensor(name, shape, dtype),
+        output=Tensor(f"{name}_reduce", reduce_shape, dtype),
     )
 
     if b_id:
+        sq_id = squeeze_axis(frag, red_id, k_axis)
         bias_bc = broadcast_to(frag, b_id, shape)
         add_id = frag.add_node(
             op=ElementwiseOp(fn="add"),
-            inputs=[red_id, bias_bc],
-            output=Tensor(f"{name}_bias", shape, dtype),
+            inputs=[sq_id, bias_bc],
+            output=Tensor(name, shape, dtype),
         )
         frag.outputs = [add_id]
     else:
-        frag.outputs = [red_id]
+        sq_id = squeeze_axis(frag, red_id, k_axis, out_name=name)
+        frag.outputs = [sq_id]
 
     return frag

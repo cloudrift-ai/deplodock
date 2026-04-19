@@ -50,6 +50,42 @@ def broadcast_to(graph: Graph, node_id: str, target_shape: tuple) -> str:
     )
 
 
+def squeeze_axis(graph: Graph, node_id: str, axis: int, out_name: str | None = None) -> str:
+    """Drop a single size-1 axis from ``node_id``'s output via an IndexMapOp.
+
+    Used by decomposition rules (matmul, linear, etc.) that keep a reduction's
+    reduced axis at size 1 for the ``ReduceOp`` itself, then squeeze it away
+    for downstream ops that expect the old dropped-axis shape. Keeps the
+    rank-preservation invariant local to the reduce while giving consumers the
+    shape they declared.
+
+    ``axis`` is the position of the size-1 dim to drop, given in terms of the
+    input shape. Negative axes count from the end. ``out_name`` names the new
+    tensor; defaults to ``"{input_name}_sq"``.
+    """
+    node = graph.nodes[node_id]
+    inp_shape = tuple(node.output.shape)
+    a = axis if axis >= 0 else len(inp_shape) + axis
+    if a < 0 or a >= len(inp_shape):
+        raise ValueError(f"squeeze_axis: axis {axis} out of range for shape {inp_shape}")
+    if inp_shape[a] != 1:
+        raise ValueError(f"squeeze_axis: cannot drop non-size-1 dim {a} of shape {inp_shape}")
+    out_shape = tuple(inp_shape[:a]) + tuple(inp_shape[a + 1 :])
+    coord_map = []
+    out_d = 0
+    for in_d in range(len(inp_shape)):
+        if in_d == a:
+            coord_map.append(Literal(0, "int"))
+        else:
+            coord_map.append(placeholder(out_d))
+            out_d += 1
+    return graph.add_node(
+        op=IndexMapOp(out_shape=out_shape, sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),)),
+        inputs=[node_id],
+        output=Tensor(out_name or f"{node.output.name}_sq", out_shape, node.output.dtype),
+    )
+
+
 def _broadcast_indexmap(inp_shape: tuple, out_shape: tuple) -> IndexMapOp | None:
     out_ndim = len(out_shape)
     inp_ndim = len(inp_shape)
