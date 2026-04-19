@@ -13,6 +13,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend import (
     CatOp,
     LinearOp,
@@ -25,7 +26,7 @@ from deplodock.compiler.ir.frontend import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor import ElementwiseOp, GatherOp, ReduceOp
+from deplodock.compiler.ir.tensor import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
 
 if TYPE_CHECKING:
     import torch
@@ -156,6 +157,38 @@ def _get_reduce_axis(fx_node: Any) -> int | str:
     return -1
 
 
+def _keepdim_shape(input_shape: tuple, axis: int | str) -> tuple:
+    """Return the keepdim output shape for a reduction over ``axis``."""
+    if not isinstance(axis, int) or not input_shape:
+        return tuple(input_shape)
+    a = axis if axis >= 0 else len(input_shape) + axis
+    if a < 0 or a >= len(input_shape):
+        return tuple(input_shape)
+    return tuple(input_shape[:a]) + (1,) + tuple(input_shape[a + 1 :])
+
+
+def _squeeze_indexmap(in_shape: tuple, out_shape: tuple, axis: int | str) -> IndexMapOp:
+    """Build an IndexMapOp that drops a single size-1 axis.
+
+    ``in_shape`` is the keepdim-reduce output (rank N, dim ``axis`` = 1).
+    ``out_shape`` is the non-keepdim shape (rank N-1, ``axis`` removed).
+    """
+    if not isinstance(axis, int):
+        # Symbolic axis fallback — identity map (no safety net).
+        coord_map = tuple(placeholder(d) for d in range(len(out_shape)))
+        return IndexMapOp(out_shape=tuple(out_shape), sources=(IndexSource(input_idx=0, coord_map=coord_map),))
+    a = axis if axis >= 0 else len(in_shape) + axis
+    coord_map = []
+    out_d = 0
+    for in_d in range(len(in_shape)):
+        if in_d == a:
+            coord_map.append(Literal(0, "int"))
+        else:
+            coord_map.append(placeholder(out_d))
+            out_d += 1
+    return IndexMapOp(out_shape=tuple(out_shape), sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),))
+
+
 def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> None:
     """Handle call_function nodes — faithful 1:1 capture of FX ops."""
     name = fx_node.name
@@ -187,9 +220,12 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         "pow": "pow",
     }
     if op_name in _EW_MAP:
+        from deplodock.compiler.ir.broadcast import broadcast_to
+
+        bc_ids = [broadcast_to(g, inp, shape) for inp in input_ids[:2]]
         nid = g.add_node(
             op=ElementwiseOp(fn=_EW_MAP[op_name]),
-            inputs=input_ids[:2],
+            inputs=bc_ids,
             output=Tensor(name, shape, dtype),
             node_id=name,
         )
@@ -247,33 +283,32 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         return
 
     # --- Reductions ---
-    if op_name == "sum":
-        nid = g.add_node(
-            op=ReduceOp(fn="sum", axis=_get_reduce_axis(fx_node)),
-            inputs=input_ids[:1],
-            output=Tensor(name, shape, dtype),
-            node_id=name,
-        )
-        node_map[name] = nid
-        return
+    # Reductions are always emitted as keepdim (rank-preserving). If the
+    # traced op was non-keepdim, a squeeze IndexMapOp is inserted afterwards
+    # so the downstream graph sees the correct (dropped-axis) shape while the
+    # ReduceOp itself stays rank-preserving.
+    _RED_OP_MAP = {"sum": "sum", "mean": "mean", "amax": "max", "max": "max"}
+    if op_name in _RED_OP_MAP:
+        axis = _get_reduce_axis(fx_node)
+        x_shape = tuple(g.nodes[input_ids[0]].output.shape) if input_ids else ()
+        keepdim_shape = _keepdim_shape(x_shape, axis)
+        fn_name = _RED_OP_MAP[op_name]
+        if op_name == "mean":
+            red_node_op = MeanOp(axis=axis)
+        else:
+            red_node_op = ReduceOp(fn=fn_name, axis=axis)
 
-    if op_name == "mean":
-        nid = g.add_node(
-            op=MeanOp(axis=_get_reduce_axis(fx_node)),
-            inputs=input_ids[:1],
-            output=Tensor(name, shape, dtype),
-            node_id=name,
-        )
-        node_map[name] = nid
-        return
-
-    if op_name in ("amax", "max"):
-        nid = g.add_node(
-            op=ReduceOp(fn="max", axis=_get_reduce_axis(fx_node)),
-            inputs=input_ids[:1],
-            output=Tensor(name, shape, dtype),
-            node_id=name,
-        )
+        if tuple(shape) == keepdim_shape:
+            nid = g.add_node(op=red_node_op, inputs=input_ids[:1], output=Tensor(name, shape, dtype), node_id=name)
+        else:
+            # Emit keepdim reduce + squeeze IndexMapOp.
+            red_id = g.add_node(op=red_node_op, inputs=input_ids[:1], output=Tensor(f"{name}_keepdim", keepdim_shape, dtype))
+            nid = g.add_node(
+                op=_squeeze_indexmap(keepdim_shape, shape, axis),
+                inputs=[red_id],
+                output=Tensor(name, shape, dtype),
+                node_id=name,
+            )
         node_map[name] = nid
         return
 
@@ -381,6 +416,15 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
     # --- Fallback ---
     logger.debug("Fallback elementwise for %s (%s)", op_name, fx_node.target)
     if input_ids:
+        from deplodock.compiler.ir.broadcast import broadcast_to
+
+        # Fused-op fallbacks (rms_norm, softmax, …) intentionally keep their
+        # smaller inputs unbroadcast — their decomposition rule owns the
+        # broadcast insertion for the primitives they emit. For any other
+        # op (real elementwise), wrap mismatched inputs so ElementwiseOp's
+        # matching-shape invariant holds.
+        if op_name not in ("rms_norm", "softmax"):
+            input_ids = [broadcast_to(g, inp, shape) for inp in input_ids]
         nid = g.add_node(
             op=ElementwiseOp(fn=op_name),
             inputs=input_ids,

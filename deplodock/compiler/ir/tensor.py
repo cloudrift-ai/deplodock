@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.base import Op, _drop_axis
+from deplodock.compiler.ir.base import Op, _keepdim_axis
 
 # ---------------------------------------------------------------------------
 # Op metadata registries
@@ -98,9 +98,22 @@ class ElementwiseOp(Op):
         return OP_REGISTRY.get(self.fn, _DEFAULT_OP_INFO)
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
-        from deplodock.compiler.shape_utils import broadcast_shapes
-
-        return broadcast_shapes(*input_shapes)
+        """Elementwise is rank-preserving with no implicit broadcasting:
+        every input must have shape equal to the output. Broadcasts must be
+        expressed as explicit ``IndexMapOp`` wrappers upstream (the
+        decomposition rules use the ``broadcast_to`` helper for this).
+        """
+        if not input_shapes:
+            return ()
+        head = tuple(input_shapes[0])
+        for s in input_shapes[1:]:
+            if tuple(s) != head:
+                shapes_fmt = [tuple(s) for s in input_shapes]
+                raise ValueError(
+                    f"ElementwiseOp({self.fn!r}) input shapes must all match output; "
+                    f"got {shapes_fmt}. Wrap in IndexMapOp (ir/broadcast.broadcast_to)."
+                )
+        return head
 
     def forward(self, *inputs):
         import numpy as np
@@ -128,6 +141,11 @@ class ElementwiseOp(Op):
         fn = _EW_FN.get(self.fn)
         if fn is None:
             raise NotImplementedError(f"ElementwiseOp.forward: unknown fn {self.fn!r}")
+        # No shape check here — inside a LoopOp body, `forward` is called
+        # per-iteration on scalar (possibly ()-shape vs (1,)-shape) values,
+        # so a tensor-level "shapes must match" assert doesn't apply.
+        # infer_output_shape enforces the matching-shape invariant at the
+        # graph level, which is the right scope.
         return fn(*inputs)
 
 
@@ -143,16 +161,16 @@ class ReduceOp(Op):
         return REDUCE_REGISTRY.get(self.fn, _DEFAULT_REDUCE_INFO)
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
-        return _drop_axis(input_shapes[0], self.axis)
+        return _keepdim_axis(input_shapes[0], self.axis)
 
     def forward(self, *inputs):
         import numpy as np
 
         a = inputs[0]
         _RED_FN = {
-            "sum": lambda x, ax: np.sum(x, axis=ax),
-            "max": lambda x, ax: np.max(x, axis=ax),
-            "prod": lambda x, ax: np.prod(x, axis=ax),
+            "sum": lambda x, ax: np.sum(x, axis=ax, keepdims=True),
+            "max": lambda x, ax: np.max(x, axis=ax, keepdims=True),
+            "prod": lambda x, ax: np.prod(x, axis=ax, keepdims=True),
         }
         fn = _RED_FN.get(self.fn)
         if fn is None:

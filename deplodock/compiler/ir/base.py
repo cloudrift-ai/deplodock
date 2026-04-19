@@ -5,7 +5,7 @@ are boundary sentinels that carry tensors into the graph without computing
 anything — they appear unchanged from the frontend stage all the way through
 to fusion, and the numpy backend supplies their values at runtime.
 
-``_drop_axis`` is a small shape helper used by both ``ReduceOp`` (minimal IR,
+``_keepdim_axis`` is a small shape helper used by both ``ReduceOp`` (minimal IR,
 ``tensor.py``) and ``MeanOp`` (frontend IR, ``frontend.py``). Keeping it here
 avoids a frontend→tensor dependency for a single function.
 """
@@ -57,12 +57,14 @@ class ConstantOp(Op):
         raise NotImplementedError("ConstantOp with value=None must be supplied by the executor")
 
 
-def _drop_axis(shape: tuple, axis: int | str) -> tuple:
+def _keepdim_axis(shape: tuple, axis: int | str) -> tuple:
     """Return shape with the given axis set to 1 (keepdim=True semantics).
 
-    Keeping the reduced dim as size-1 ensures that post-reduce values
-    broadcast correctly with pre-reduce values (e.g. RMSNorm's
-    ``mul(X:(M,K), rsqrt:(M,1))`` broadcasts to ``(M,K)``).
+    This is the reduction's output shape: the reduced dim collapses to 1,
+    preserving rank. Rank-preservation is a Tensor IR invariant — it lets
+    elementwise ops consume reduction outputs without any implicit reshape
+    (see ``ir/broadcast.py``'s ``broadcast_to`` for the explicit
+    broadcast wrapper that expands (…, 1, …) back up).
     """
     if not isinstance(axis, int):
         return tuple(shape)

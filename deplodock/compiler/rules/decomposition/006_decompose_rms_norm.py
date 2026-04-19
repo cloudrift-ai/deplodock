@@ -6,6 +6,7 @@ The resulting MeanOp is further lowered to sum + div by 007_decompose_mean.
 """
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.frontend import MeanOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp
@@ -60,9 +61,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[],
         output=Tensor(f"{name}_eps", (1,), dtype),
     )
+    eps_bc = broadcast_to(frag, eps_id, red_shape)
     add_id = frag.add_node(
         op=ElementwiseOp(fn="add"),
-        inputs=[mean_id, eps_id],
+        inputs=[mean_id, eps_bc],
         output=Tensor(f"{name}_add_eps", red_shape, dtype),
     )
     rsq_id = frag.add_node(
@@ -70,14 +72,16 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[add_id],
         output=Tensor(f"{name}_rsq", red_shape, dtype),
     )
+    rsq_bc = broadcast_to(frag, rsq_id, out_shape)
     norm_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[x_id, rsq_id],
+        inputs=[x_id, rsq_bc],
         output=Tensor(f"{name}_norm", out_shape, dtype),
     )
+    w_bc = broadcast_to(frag, w_id, out_shape)
     out_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[norm_id, w_id],
+        inputs=[norm_id, w_bc],
         output=Tensor(name, out_shape, dtype),
     )
 

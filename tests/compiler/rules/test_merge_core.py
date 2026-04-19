@@ -228,52 +228,6 @@ def test_merge_reduce_then_elementwise():
 # ---------------------------------------------------------------------------
 
 
-def test_merge_refuses_reduce_producer_into_higher_rank_consumer():
-    """Producer with a reduce axis should NOT merge into a consumer whose
-    output has higher rank — the extra free dim would replicate the producer's
-    reduce body across every iteration of it.
-
-    This is the MLP ``gate*up → elementwise*down_weight`` pattern: inlining
-    the reducing producer (whose output is e.g. shape (B, S, intermediate))
-    into the elementwise that broadcasts against (intermediate, hidden_out)
-    would make the reduction run once per (B, S, intermediate, hidden_out)
-    slot instead of once per (B, S, intermediate) slot — thousands of times
-    more work. Refuse; keep them as separate kernels.
-    """
-    # Producer: output (B, S, I) via reduce over K. Rank 3.
-    producer = _loop(
-        axes=(
-            Axis(name="b", extent=1, kind="free"),
-            Axis(name="s", extent=32, kind="free"),
-            Axis(name="i", extent=64, kind="free"),
-            Axis(name="k", extent=128, kind="reduce"),
-        ),
-        inputs=(Port(index=(Var("b"), Var("s"), Var("k"))),),
-        locals=(LocalBuffer(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
-        body=(
-            Assign(name="v", op=ElementwiseOp("mul"), args=("$0", "$0")),
-            Update(target="acc", value="v"),
-            Write(output=0, index=(Var("b"), Var("s"), Var("i")), value="acc"),
-        ),
-    )
-    # Consumer: output (B, S, I, H). Rank 4 — one extra dim (H) not in producer.
-    consumer = _loop(
-        axes=(
-            Axis(name="b", extent=1, kind="free"),
-            Axis(name="s", extent=32, kind="free"),
-            Axis(name="i", extent=64, kind="free"),
-            Axis(name="h", extent=64, kind="free"),
-        ),
-        inputs=(Port(index=(Var("b"), Var("s"), Var("i"))),),
-        locals=(),
-        body=(
-            Assign(name="y", op=ElementwiseOp("mul"), args=("$0", "$0")),
-            Write(output=0, index=(Var("b"), Var("s"), Var("i"), Var("h")), value="y"),
-        ),
-    )
-    assert merge_loop_ops(producer, 0, consumer, 0) is None
-
-
 def test_merge_reduce_with_singleton_batch_dim():
     """Reduction output with a singleton batch dim still merges into a consumer.
 

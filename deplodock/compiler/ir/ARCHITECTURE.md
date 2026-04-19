@@ -62,7 +62,7 @@ Cross-cutting types used at every stage.
 | ``Op``        | Base class. Subclasses implement ``infer_output_shape`` and ``forward`` (numpy). |
 | ``InputOp``   | Sentinel: graph input tensor. Value supplied by executor.                        |
 | ``ConstantOp``| Sentinel: weights / RoPE tables / scalar constants.                              |
-| ``_drop_axis``| Shape helper — shared by ``ReduceOp`` (tensor) and ``MeanOp`` (frontend).        |
+| ``_keepdim_axis``| Shape helper — shared by ``ReduceOp`` (tensor) and ``MeanOp`` (frontend).        |
 
 **Rule:** No dependencies on other IR modules. Everyone may import from here.
 

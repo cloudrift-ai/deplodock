@@ -8,6 +8,7 @@ via integer-divide indexing: ``K[b, q_head // group_size, s, d]``.
 import math
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
 from deplodock.compiler.ir.frontend import SdpaOp, TransposeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
@@ -92,9 +93,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     q_unsq_id = frag.add_node(op=q_unsq, inputs=[q_id], output=Tensor(f"{name}_q_unsq", q_unsq.out_shape, dtype))
     kt_unsq_id = frag.add_node(op=kt_unsq, inputs=[kt_id], output=Tensor(f"{name}_kt_unsq", kt_unsq.out_shape, dtype))
+    q_bc = broadcast_to(frag, q_unsq_id, qk_mul_shape)
+    kt_bc = broadcast_to(frag, kt_unsq_id, qk_mul_shape)
     qk_ew_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[q_unsq_id, kt_unsq_id],
+        inputs=[q_bc, kt_bc],
         output=Tensor(f"{name}_qk_ew", qk_mul_shape, dtype),
     )
     qk_id = frag.add_node(
@@ -110,9 +113,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[],
         output=Tensor(f"{name}_scale", (1,), dtype),
     )
+    scale_bc = broadcast_to(frag, scale_const_id, scores_shape)
     scaled_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[qk_id, scale_const_id],
+        inputs=[qk_id, scale_bc],
         output=Tensor(f"{name}_scaled", scores_shape, dtype),
     )
 
@@ -164,9 +168,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[scaled_id],
         output=Tensor(f"{name}_max", scores_shape[:-1] + (1,) if scores_shape else (1,), dtype),
     )
+    max_bc = broadcast_to(frag, max_id, scores_shape)
     sub_id = frag.add_node(
         op=ElementwiseOp(fn="sub"),
-        inputs=[scaled_id, max_id],
+        inputs=[scaled_id, max_bc],
         output=Tensor(f"{name}_shifted", scores_shape, dtype),
     )
     exp_id = frag.add_node(
@@ -179,9 +184,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[exp_id],
         output=Tensor(f"{name}_sum", scores_shape[:-1] + (1,) if scores_shape else (1,), dtype),
     )
+    sum_bc = broadcast_to(frag, sum_id, scores_shape)
     softmax_id = frag.add_node(
         op=ElementwiseOp(fn="div"),
-        inputs=[exp_id, sum_id],
+        inputs=[exp_id, sum_bc],
         output=Tensor(f"{name}_softmax", scores_shape, dtype),
     )
 
@@ -220,9 +226,11 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
     s_unsq_id = frag.add_node(op=s_unsq, inputs=[softmax_id], output=Tensor(f"{name}_s_unsq", s_unsq.out_shape, dtype))
     v_unsq_id = frag.add_node(op=v_unsq, inputs=[actual_v_id], output=Tensor(f"{name}_v_unsq", v_unsq.out_shape, dtype))
+    s_bc = broadcast_to(frag, s_unsq_id, sv_mul_shape)
+    v_bc = broadcast_to(frag, v_unsq_id, sv_mul_shape)
     sv_ew_id = frag.add_node(
         op=ElementwiseOp(fn="mul"),
-        inputs=[s_unsq_id, v_unsq_id],
+        inputs=[s_bc, v_bc],
         output=Tensor(f"{name}_sv_ew", sv_mul_shape, dtype),
     )
     sv_id = frag.add_node(

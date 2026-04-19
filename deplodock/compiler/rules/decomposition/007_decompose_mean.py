@@ -1,6 +1,7 @@
 """Decompose MeanOp into sum + div by the reduced dimension size."""
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.frontend import MeanOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor import ElementwiseOp, ReduceOp
@@ -47,9 +48,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         inputs=[],
         output=Tensor(f"{name}_count", (1,), dtype),
     )
+    count_bc = broadcast_to(frag, count_id, shape)
     div_id = frag.add_node(
         op=ElementwiseOp(fn="div"),
-        inputs=[sum_id, count_id],
+        inputs=[sum_id, count_bc],
         output=Tensor(name, shape, dtype),
     )
 
