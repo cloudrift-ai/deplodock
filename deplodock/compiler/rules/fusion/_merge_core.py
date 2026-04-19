@@ -93,6 +93,17 @@ def merge_loop_ops(
         return None
     write = writes[0]
 
+    # Rank-growth guard: refuse to inline a reducing producer into a consumer
+    # whose Write has higher rank. The extra consumer free dims would make
+    # the producer's reduce body run once per iteration of each new dim —
+    # the MLP pathology where gate*up (reduce over hidden) would feed a
+    # rank-4 broadcast-then-mul before down_proj. Softmax-style merges are
+    # unaffected: under rank-preserving reductions (keepdim), the producer's
+    # Write and the consumer's Write have the same rank.
+    consumer_writes = [s for s in consumer_flat if isinstance(s, Write) and s.output == 0]
+    if consumer_writes and any(a.kind == "reduce" for a in producer.axes) and len(consumer_writes[0].index) > len(write.index):
+        return None
+
     producer_axis_names = {a.name for a in producer.axes}
     consumer_axis_by_name = {a.name: a for a in consumer.axes}
 
