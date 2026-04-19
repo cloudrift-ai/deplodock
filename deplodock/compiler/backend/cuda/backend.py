@@ -82,4 +82,8 @@ class CudaBackend(Backend):
         unused — the benchmark subprocess generates random inputs."""
         del input_data  # subprocess generates its own random inputs
         result = benchmark_program(compiled, warmup=warmup, num_iters=num_iters)
-        return BenchmarkResult(time_ms=result.time_ms, num_launches=result.num_launches)
+        return BenchmarkResult(
+            time_ms=result.time_ms,
+            num_launches=result.num_launches,
+            per_launch=result.per_launch,
+        )

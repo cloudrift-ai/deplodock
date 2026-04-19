@@ -80,6 +80,29 @@ Shapes are read from the `LoopProgram`, never recomputed:
 No fallback call to `LoopOp.infer_output_shape(...)` happens in the
 codegen path.
 
+## Benchmark Mode Timing
+
+`generate_source(mode="benchmark")` emits two levels of timing inside the
+timed loop:
+
+- **Program total**: one global `cudaEvent` pair wraps all `num_iters`
+  iterations; the delta / `num_iters` is printed as `PROGRAM_TIME_MS` —
+  the same number the pre-per-kernel build reported.
+- **Per-launch**: one `cudaEvent` pair per launch index (reused across
+  iterations) records each kernel, and `cudaEventElapsedTime` is
+  accumulated into `_kacc[i]` at the end of every iteration. After the
+  loop, averages are printed as `KERNEL_TIME_MS <idx> <kernel_name>
+  <ms>` lines, one per launch.
+
+`_parse_benchmark_output()` collects the per-launch lines into
+`BenchmarkResult.per_launch: list[LaunchTime] | None` (sorted by idx).
+When the subprocess emits no `KERNEL_TIME_MS` lines the field stays
+`None`, keeping the parser compatible with old binaries.
+
+`zero_outputs` `cudaMemset` calls stay outside each launch's event pair —
+they aren't kernel time and would otherwise inflate the first launch
+after an atomicAdd reduction.
+
 ## Naive Schedule Policy
 
 Correctness-first. No shared memory, no async copies, no TMA, no

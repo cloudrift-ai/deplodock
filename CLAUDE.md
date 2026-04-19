@@ -47,7 +47,7 @@ Or for a specific test file:
 - `deplodock compile <model_or_ir> [--layer N] [--dump-dir DIR]` — lower a traced graph to a `LoopProgram` (auto-pulls + traces if given a model ID)
 - `deplodock compile <ir_file> --ir {tensor|loop|loop-program|kernel|cuda|cuda-program}` — print the requested IR stage to stdout (skips the normal `.compiled.json` save). `loop`/`kernel`/`cuda` show per-kernel views; `loop-program`/`cuda-program` add program-level context (buffer list + launch schedule).
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
-- `deplodock run <ir_file> [--benchmark] [--dump-dir DIR]` — run a compiled graph IR through the full pipeline
+- `deplodock run <ir_file> [--benchmark] [--dump-dir DIR]` — run a compiled graph IR through the full pipeline. With `--benchmark`, logs top-N per-kernel GPU-event times; `--dump-dir` stores them under `per_launch` in `60_benchmark.json`, inherited by `bench` via `DEPLODOCK_DUMP_DIR`.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 7B): `Qwen/Qwen2.5-7B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

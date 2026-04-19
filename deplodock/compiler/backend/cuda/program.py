@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from deplodock.compiler.backend import BenchmarkResult, ProgramResult
+from deplodock.compiler.backend import BenchmarkResult, LaunchTime, ProgramResult
 from deplodock.compiler.program.gpu import GpuBuffer, GpuLaunch, GpuProgram  # noqa: F401 — re-export
 
 logger = logging.getLogger(__name__)
@@ -178,25 +178,31 @@ def generate_source(
         parts.append('    printf("DEBUG_END\\n");')
         parts.append("")
     else:
-        # Build launch code block.
-        launch_code = _generate_launches(program)
-
         if mode == "benchmark":
-            # Warmup.
+            # Warmup (untimed).
             parts.append(f"    for (int _w = 0; _w < {warmup}; _w++) {{")
-            parts.append(launch_code)
+            parts.append(_generate_launches(program))
             parts.append("    }")
             parts.append("    cudaDeviceSynchronize();")
             parts.append("")
 
-            # Timed iterations.
+            # Per-launch event pairs + a global pair for the program total.
+            n_launches = len(program.launches)
+            parts.append(f"    const int NL = {n_launches};")
+            parts.append("    cudaEvent_t _ks[NL], _ke[NL];")
+            parts.append("    for (int i = 0; i < NL; i++) { cudaEventCreate(&_ks[i]); cudaEventCreate(&_ke[i]); }")
+            parts.append("    float _kacc[NL] = {0};")
             parts.append("    cudaEvent_t _start, _stop;")
             parts.append("    cudaEventCreate(&_start);")
             parts.append("    cudaEventCreate(&_stop);")
             parts.append("")
             parts.append("    cudaEventRecord(_start);")
             parts.append(f"    for (int _iter = 0; _iter < {num_iters}; _iter++) {{")
-            parts.append(launch_code)
+            parts.append(_generate_timed_launches(program))
+            parts.append("        cudaEventSynchronize(_ke[NL - 1]);")
+            parts.append("        for (int i = 0; i < NL; i++) {")
+            parts.append("            float _ms; cudaEventElapsedTime(&_ms, _ks[i], _ke[i]); _kacc[i] += _ms;")
+            parts.append("        }")
             parts.append("    }")
             parts.append("    cudaEventRecord(_stop);")
             parts.append("    cudaEventSynchronize(_stop);")
@@ -204,11 +210,15 @@ def generate_source(
             parts.append("    float _total_ms;")
             parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
             parts.append(f'    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms / {num_iters});')
-            parts.append(f'    printf("PROGRAM_LAUNCHES={len(program.launches)}\\n");')
+            parts.append(f'    printf("PROGRAM_LAUNCHES={n_launches}\\n");')
+            for li, launch in enumerate(program.launches):
+                parts.append(f'    printf("KERNEL_TIME_MS {li} {launch.kernel_name} %.6f\\n", _kacc[{li}] / {num_iters});')
             parts.append("")
+            parts.append("    for (int i = 0; i < NL; i++) { cudaEventDestroy(_ks[i]); cudaEventDestroy(_ke[i]); }")
             parts.append("    cudaEventDestroy(_start);")
             parts.append("    cudaEventDestroy(_stop);")
         else:
+            launch_code = _generate_launches(program)
             # Single run with GPU-event timing (kernel-only, excludes subprocess/nvcc overhead).
             parts.append("    cudaEvent_t _start, _stop;")
             parts.append("    cudaEventCreate(&_start);")
@@ -332,6 +342,41 @@ def _generate_launches(program: GpuProgram) -> str:
             block_str = f"dim3({bx}, {by}, {bz})"
         smem = f", {launch.smem_bytes}" if launch.smem_bytes > 0 else ""
         lines.append(f"        {launch.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
+    return "\n".join(lines)
+
+
+def _generate_timed_launches(program: GpuProgram) -> str:
+    """Per-launch event-timed launch statements for benchmark mode.
+
+    Mirrors ``_generate_launches`` but wraps each kernel invocation in a
+    ``cudaEventRecord(_ks[i])`` / ``cudaEventRecord(_ke[i])`` pair so per-
+    launch elapsed time can be accumulated across iterations. ``zero_outputs``
+    memsets stay outside the event pair — they aren't kernel time.
+    """
+    lines: list[str] = []
+    buf_sizes = {b.name: b.size for b in program.buffers}
+    for li, launch in enumerate(program.launches):
+        for buf_name in launch.zero_outputs:
+            size = buf_sizes.get(buf_name, 0)
+            lines.append(f"        cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
+
+        tma_descs = getattr(launch, "tma_descriptors", [])
+        tma_args = [_tma_var(launch, d) for d in tma_descs]
+        regular_args = [_format_arg(a, program) for a in launch.args]
+        args_str = ", ".join(tma_args + regular_args)
+
+        gx, gy, gz = launch.grid
+        bx, by, bz = launch.block
+        if gz == 1 and bz == 1:
+            grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
+            block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
+        else:
+            grid_str = f"dim3({gx}, {gy}, {gz})"
+            block_str = f"dim3({bx}, {by}, {bz})"
+        smem = f", {launch.smem_bytes}" if launch.smem_bytes > 0 else ""
+        lines.append(f"        cudaEventRecord(_ks[{li}]);")
+        lines.append(f"        {launch.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
+        lines.append(f"        cudaEventRecord(_ke[{li}]);")
     return "\n".join(lines)
 
 
@@ -516,14 +561,23 @@ def _parse_benchmark_output(stdout: str, program: GpuProgram) -> BenchmarkResult
     """Parse output from a benchmark-mode program."""
     time_ms = 0.0
     num_launches = 0
+    per_launch: list[LaunchTime] = []
 
     for line in stdout.strip().split("\n"):
         if line.startswith("PROGRAM_TIME_MS="):
             time_ms = float(line.split("=")[1])
         elif line.startswith("PROGRAM_LAUNCHES="):
             num_launches = int(line.split("=")[1])
+        elif line.startswith("KERNEL_TIME_MS "):
+            parts = line.split()
+            per_launch.append(LaunchTime(idx=int(parts[1]), kernel_name=parts[2], time_ms=float(parts[3])))
 
-    return BenchmarkResult(time_ms=time_ms, num_launches=num_launches)
+    per_launch.sort(key=lambda lt: lt.idx)
+    return BenchmarkResult(
+        time_ms=time_ms,
+        num_launches=num_launches,
+        per_launch=per_launch if per_launch else None,
+    )
 
 
 def _parse_debug_output(stdout: str, program: GpuProgram, workdir: Path) -> DebugResult:
