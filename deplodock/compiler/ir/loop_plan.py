@@ -15,7 +15,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.loop_ir import Assign, LoopOp, Port, Select, Stmt, Update, Write
+from deplodock.compiler.ir.loop_ir import AccumDecl, Assign, Load, LoopOp, Port, Select, Stmt, Update, Write
 from deplodock.compiler.ir.loop_ir import Loop as LoopStmt
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ class Loop:
     """A K-loop segment: iterates over the reduction dimension."""
 
     recompute: tuple[Assign, ...]  # prior element-space assigns to re-eval
-    body: tuple[Assign | Select, ...]  # this segment's elementwise assigns/selects
+    body: tuple[Assign | Select | Load, ...]  # this segment's elementwise assigns/selects
     accum: Accum | None  # accumulator (reduce segments)
     stores_output: bool  # True for trailing element segments (store inside loop)
     store_index: tuple[Expr, ...] = ()  # write index when stores_output
@@ -54,7 +54,7 @@ class Loop:
 class Inline:
     """Per-row assigns emitted without a loop."""
 
-    body: tuple[Assign | Select, ...]
+    body: tuple[Assign | Select | Load, ...]
 
 
 type Step = Loop | Inline
@@ -127,6 +127,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     row_space |= accumulator_names
     elem_space: set[str] = set(per_elem_ports)
 
+    reduce_names_for_classify: set[str] = set(kernel.reduce_axis_names)
     for stmt in flat_all:
         if isinstance(stmt, Assign):
             if any(a in elem_space for a in stmt.args):
@@ -138,6 +139,12 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
                 row_space.add(stmt.name)
             else:
                 elem_space.add(stmt.name)
+        elif isinstance(stmt, Load):
+            # Load is elem-space iff its index touches any reduce axis.
+            if _port_references_axis(Port(index=stmt.index), reduce_names_for_classify):
+                elem_space.add(stmt.name)
+            else:
+                row_space.add(stmt.name)
 
     # --- Trailing writes: direct Write children of the inner body ---
     trailing_writes: list[TrailingWrite] = []
@@ -145,9 +152,9 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         if isinstance(stmt, Write):
             trailing_writes.append(TrailingWrite(output=stmt.output, index=stmt.index, value=stmt.value))
 
-    # --- Pointwise: no reduce Loops; collect leaf Assign/Select as one Inline ---
+    # --- Pointwise: no reduce Loops; collect leaf Assign/Select/Load as one Inline ---
     if not has_reduce:
-        inline_body = [s for s in flatten_body(inner_body) if isinstance(s, (Assign, Select))]
+        inline_body = [s for s in flatten_body(inner_body) if isinstance(s, (Assign, Select, Load))]
         steps: list[Step] = [Inline(body=tuple(inline_body))] if inline_body else []
         return KernelPlan(
             steps=tuple(steps),
@@ -175,7 +182,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         steps.append(Inline(body=tuple(prelude_selects)))
 
     # Walk remaining children: reduce Loops → Loop steps; trailing stmts → Inline/Loop-with-stores.
-    tail_stmts: list[Assign | Select] = []
+    tail_stmts: list[Assign | Select | Load | AccumDecl] = []
     tail_writes: list[Write] = []
     for stmt in inner_body[idx:]:
         if isinstance(stmt, LoopStmt) and stmt.axis.name in reduce_axis_names:
@@ -189,7 +196,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
                 acc_count += 1
             # Bring this reduce Loop's element-space Assigns into scope for later remat.
             prior_ew.extend(s for s in stmt.body if isinstance(s, Assign))
-        elif isinstance(stmt, (Assign, Select)):
+        elif isinstance(stmt, (Assign, Select, Load, AccumDecl)):
             tail_stmts.append(stmt)
         elif isinstance(stmt, Write):
             tail_writes.append(stmt)
@@ -282,10 +289,11 @@ def _reduce_loop_to_steps(
         # Classic reduce segment: last Update drives the accumulator.
         last_update = updates[-1]
         last_idx = body.index(last_update)
-        ew = [s for s in body[:last_idx] if isinstance(s, (Assign, Select))]
+        ew = [s for s in body[:last_idx] if isinstance(s, (Assign, Select, Load))]
         # LICM: row_space Assigns don't vary with the reduce axis; emit them
         # as an Inline step before the K-loop so they compute once per row
-        # instead of K times. Selects stay inside conservatively.
+        # instead of K times. Selects and Loads stay inside conservatively
+        # when their value depends on the reduce axis.
         pre_body = tuple(s for s in ew if isinstance(s, Assign) and s.name in row_space)
         in_loop = tuple(s for s in ew if not (isinstance(s, Assign) and s.name in row_space))
         remat = _remat_set(list(body), prior_ew, row_space)
@@ -313,7 +321,7 @@ def _reduce_loop_to_steps(
 
     # No Update — per-K elementwise pass. Must have Writes to justify iteration.
     if writes:
-        ew = [s for s in body if isinstance(s, (Assign, Select))]
+        ew = [s for s in body if isinstance(s, (Assign, Select, Load))]
         remat = _remat_set(list(body), prior_ew, row_space)
         remat_assigns = tuple(a for a in prior_ew if a.name in remat)
         w = writes[-1]

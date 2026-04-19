@@ -14,7 +14,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Assign, Axis, Loop, LoopOp, Port, Stmt, Write
+from deplodock.compiler.ir.loop_ir import Assign, Axis, Load, Loop, LoopOp, Port, Stmt, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -34,16 +34,21 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
 
     ports: list[Port] = []
-    args: list[str] = []
+    load_stmts: list[Stmt] = []
+    load_names: list[str] = []
     for i, inp_id in enumerate(node.inputs):
         inp_node = graph.nodes.get(inp_id)
         inp_shape = tuple(inp_node.output.shape) if inp_node is not None else ()
-        ports.append(Port(index=_identity_index(inp_shape, axes)))
-        args.append(f"${i}")
+        idx = _identity_index(inp_shape, axes)
+        ports.append(Port(index=idx))
+        name = f"in{i}"
+        load_names.append(name)
+        load_stmts.append(Load(name=name, source=i, index=idx))
 
     write_index = tuple(Var(a.name) for a in axes)
     inner: tuple[Stmt, ...] = (
-        Assign(name="v", op=node.op, args=tuple(args)),
+        *load_stmts,
+        Assign(name="v", op=node.op, args=tuple(load_names)),
         Write(output=0, index=write_index, value="v"),
     )
     # Nest the body in free-axis Loops (outer axis wraps the innermost).
