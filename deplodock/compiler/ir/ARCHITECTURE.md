@@ -35,7 +35,7 @@ PyTorch module
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ LAYER 2 · Lowering — Graph populated with LOOP IR ops (loop.py)                                                      │
 │   LoopOp (one per GPU kernel) — SSA program over named Axes. Ports read external buffers via Expr index              │
-│   patterns; Accumulators carry accumulator state; body statements (Assign/Update/Write/Select) execute               │
+│   patterns; Accum stmts carry accumulator state; body statements (Assign/Accum/Write/Select/Load) execute            │
 │   in order. + InputOp / ConstantOp as buffer sources.                                                                │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
    │  compile_graph → LoopProgram (program/loop.py)
@@ -157,16 +157,16 @@ loop-nest that codegen eventually emits — one ``LoopOp`` maps to one
 
 | Symbol                        | Role                                                                                                              |
 |-------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| ``Axis``                      | Named iteration variable (``name`` + ``extent``). Free vs reduce is inferred from body structure — a Loop is a reduce Loop iff its body contains an Update (see ``LoopOp.reduce_axis_names``). |
-| ``LoopOp``                    | One kernel: ``axes`` + ``inputs`` + ``locals`` + nested ``body``.                                                 |
+| ``Axis``                      | Named iteration variable (``name`` + ``extent``). Free vs reduce is inferred from body structure — a Loop is a reduce Loop iff its body contains an Accum (see ``LoopOp.reduce_axis_names``). |
+| ``LoopOp``                    | One kernel: ``inputs`` + nested ``body`` (``axes`` / ``accums`` are computed properties).                         |
 | ``Port``                      | Access pattern for one external buffer — ``index: tuple[Expr, ...]`` over axis Vars.                              |
-| ``Accumulator``               | Reduce accumulator: ``name``, ``combine`` (ElementwiseOp), ``init`` (Expr). Folded by ``Update``.                |
+| ``Load``                      | Body-form port read: ``name = load(src)[index...]``; introduces an SSA name.                                      |
+| ``Accum``                     | Reduce accumulator: ``name = op(name, value)`` inside a reduce ``Loop``. Implicitly initialized to ``ACCUM_IDENTITY[op.fn]``; after the Loop the ``name`` is in scope with the finalized value. |
 | ``Assign``                    | SSA body stmt: ``name = op(args)`` with ``op: ElementwiseOp``.                                                    |
-| ``Update``                    | Fold a value into a ``Accumulator`` accumulator: ``acc = combine(acc, value)``.                                   |
 | ``Write``                     | Write an SSA value to output ``output`` at ``index``.                                                             |
 | ``Select`` + ``SelectBranch`` | Coord-predicated binding (replaces the old Mux).                                                                  |
 | ``Loop``                      | Explicit iteration block: ``axis`` (free or reduce) + nested ``body``. Body runs ``axis.extent`` times.           |
-| ``Stmt``                      | Union: ``Assign \| Update \| Write \| Select \| Loop``.                                                           |
+| ``Stmt``                      | Union: ``Assign \| Accum \| Write \| Select \| Loop \| Load``.                                                    |
 
 ``LoopOp.body`` is a nested tree of ``Loop`` blocks (outer free Loops
 for the grid iteration, inner reduce Loops for per-row sweeps). Reading
@@ -176,9 +176,9 @@ regardless of block structure.
 
 **Rule:** Imports ``base``, ``expr``, and ``tensor`` (``ElementwiseOp``
 only — ``ReduceOp`` is NOT a valid ``Assign.op``). Reductions are
-modeled as ``Accumulator`` + ``Update`` inside a reduce ``Loop``. SSA
-names defined inside a Loop body are scoped to that body — only
-``Accumulator`` accumulators cross Loop boundaries.
+modeled as ``Accum`` statements inside a reduce ``Loop``. SSA names
+defined inside a Loop body are scoped to that body — only ``Accum``
+targets cross Loop boundaries.
 
 ### `loop_plan.py` — analysis: LoopOp → KernelPlan (Layer 2)
 

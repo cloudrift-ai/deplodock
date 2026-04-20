@@ -4,17 +4,17 @@ After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
     inputs : tuple[Port, ...]   — computed property derived from body Loads
-    body   : tuple[Stmt, ...]   — SSA: Assign | Accum | Write | Select | Loop | Load | AccumDecl
+    body   : tuple[Stmt, ...]   — SSA: Assign | Accum | Write | Select | Loop | Load
     axes   : computed property  — iteration space walked from body's Loop tree
 
 Iteration is explicit via ``Loop(axis, body)`` statements. Each ``Loop``
 is one iteration dimension; ``Loop.body`` runs ``axis.extent`` times.
-Reduce-kind Loops fold ``Accum`` statements into an ``AccumDecl``
-declared inline in the body. Free-kind Loops run in parallel with no
+Reduce-kind Loops fold ``Accum`` statements into the accumulator named
+by each ``Accum.name``. Free-kind Loops run in parallel with no
 accumulator folding. Reading top-to-bottom matches execution order.
 
 SSA names defined by ``Assign`` / ``Select`` / ``Load`` inside a
-``Loop.body`` are scoped to that body — only ``AccumDecl`` state crosses
+``Loop.body`` are scoped to that body — only accumulator state crosses
 Loop boundaries (via ``Accum``). Invariants (unique names, defined-
 before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``.
 """
@@ -113,33 +113,12 @@ ACCUM_IDENTITY: dict[str, float] = {
 
 
 @dataclass(frozen=True)
-class _AccumMeta:
-    """Fixture helper — declares an accumulator's combine / init for shim
-    backfill. Not a body statement. Test ``_loop(accumulators=...)`` callers
-    pass one of these per accumulator; the shim copies ``combine`` onto the
-    matching body ``Accum.op``. Production code never constructs these.
-    """
-
-    name: str
-    combine: ElementwiseOp
-    init: Expr
-
-
-# Legacy aliases for fixture readability. Both resolve to ``_AccumMeta``;
-# the old ``Accumulator(name, combine, init)`` and ``AccumDecl(...)`` calls
-# keep compiling.
-AccumDecl = _AccumMeta
-Accumulator = _AccumMeta
-
-
-@dataclass(frozen=True)
 class Assign:
     """Pure SSA body statement: ``name = op(args)``.
 
-    ``op`` is always an ``ElementwiseOp`` (reductions have moved to
-    ``Accumulator`` + ``Accum``). ``args`` reference ``$N`` ports,
-    ``Accumulator.name`` (reads current / finalized acc value), or prior
-    SSA names.
+    ``op`` is always an ``ElementwiseOp`` (reductions live in ``Accum``).
+    ``args`` reference ``$N`` ports, an ``Accum.name`` (reads current /
+    finalized acc value), or prior SSA names.
     """
 
     name: str
@@ -194,7 +173,7 @@ class Write:
     tuple (``LoopLaunch.output_name`` is the sole output in v1, so
     ``output=0`` is common). ``index`` uses axis Vars to compute the
     per-dim offset. ``value`` references an SSA name available at this
-    point in the body (Assign, Accumulator, or ``$N``).
+    point in the body (Assign, Accum, or ``$N``).
     """
 
     output: int
@@ -233,14 +212,14 @@ class Loop:
     """Explicit iteration block — one loop over an axis.
 
     ``body`` executes ``axis.extent`` times, once per axis value. Reduce-kind
-    Loops fold any ``Accum`` statements in their body into the enclosing
-    ``Accumulator`` (one sweep over the axis per accumulator). Free-kind
+    Loops fold any ``Accum`` statements in their body into the named
+    accumulator (one sweep over the axis per accumulator). Free-kind
     Loops run in parallel with no folding.
 
     SSA scoping: ``Assign`` / ``Select`` names defined inside ``body`` are
     scoped to that body — invisible to statements outside the Loop. Only
-    ``Accumulator`` state (written via ``Accum``) crosses the Loop
-    boundary, carrying the finalized reduced value.
+    ``Accum`` targets cross the Loop boundary, carrying the finalized
+    reduced value.
     """
 
     axis: Axis
@@ -261,8 +240,8 @@ class LoopOp(Op):
 
     ``axes`` is a computed property over the body's ``Loop`` tree — the tree
     is the single source of truth. See the :attr:`axes` docstring for the
-    collection order. ``inputs`` and ``accumulators`` are computed properties
-    derived from body-form ``Load`` and ``AccumDecl`` statements.
+    collection order. ``loads`` and ``accums`` are computed properties
+    derived from body-form ``Load`` and ``Accum`` statements.
     """
 
     inputs: tuple[Port, ...] = ()
@@ -364,17 +343,6 @@ class LoopOp(Op):
         walk(self.body)
         return tuple(seen.values())
 
-    # Legacy aliases — older readers spell the property as ``accum_decls`` or
-    # ``accumulators``. Both resolve to the same tuple of unique ``Accum``
-    # stmts as ``accums``.
-    @property
-    def accum_decls(self) -> tuple[Accum, ...]:
-        return self.accums
-
-    @property
-    def accumulators(self) -> tuple[Accum, ...]:
-        return self.accums
-
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
 
@@ -442,7 +410,7 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
     buffers = list(port_buffers) if port_buffers else [f"${i}" for i in range(nbufs)]
     while len(buffers) < nbufs:
         buffers.append(f"${len(buffers)}")
-    accs_by_name: dict[str, Accum] = {d.name: d for d in loop.accum_decls}
+    accs_by_name: dict[str, Accum] = {d.name: d for d in loop.accums}
 
     def render_arg(name: str) -> str:
         if name.startswith("$"):
@@ -517,11 +485,11 @@ def _validate(loop: LoopOp) -> None:
 
     # Accumulator op-consistency: all Updates targeting the same name must
     # share the same combine op (they're folding into the same accumulator).
-    accumulators: dict[str, Accum] = {}
-    for info in loop.accum_decls:
-        if info.name in accumulators:
+    seen_accums: dict[str, Accum] = {}
+    for info in loop.accums:
+        if info.name in seen_accums:
             raise ValueError(f"Accumulator: duplicate name {info.name!r}")
-        accumulators[info.name] = info
+        seen_accums[info.name] = info
 
     # Kernel-scope names (visible everywhere): $N ports (legacy form, used by
     # a few test fixtures that still spell args as ``$0``). Body-level Load

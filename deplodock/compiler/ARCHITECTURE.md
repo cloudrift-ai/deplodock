@@ -28,9 +28,9 @@
 │  Each LoopOp (ir/loop_ir.py) is one GPU kernel as an SSA program:                                                       │
 │      axes   (tuple[Axis, ...])        — named iteration variables                                                    │
 │      inputs (tuple[Port, ...])        — per-input access patterns                                                    │
-│      accumulators (tuple[Accumulator, ...]) — reduce accumulators                                                   │
-│      body   (tuple[Stmt, ...])        — Assign | Update | Write | Select                                             │
-│  Reductions = Accumulator(combine) + Update; writes are inline.                                                      │
+│      accums (tuple[Accum, ...])       — reduce accumulators (computed from body)                                     │
+│      body   (tuple[Stmt, ...])        — Assign | Accum | Write | Select                                              │
+│  Reductions = ``Accum`` stmts inside a reduce ``Loop``; writes are inline.                                           │
 │                                                                                                                      │
 │  RULE: Operates on Graph + Loop IR only. No backend imports.                                                         │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
@@ -99,12 +99,11 @@ defined-before-use, no forward references.
 |----------------------------------------------|-------------------------------------------|----------------------------------------------------------------|
 | `Axis.name` / `extent` / `kind`              | `str` / `int` / `"free"                   | One iteration variable; reduce axes pair with accumulators     |
 | `Port.index`                                 | `tuple[Expr, ...]`                        | Per-input-dim access pattern over axis Vars                    |
-| `Accumulator.name` / `combine` / `init`      | `str` / `ElementwiseOp` / `Expr`          | Reduce accumulator declaration                                 |
+| `Accum.name` / `value` / `op`                | `str` / `str` / `ElementwiseOp`           | Reduce fold: ``name = op(name, value)`` inside a reduce Loop   |
 | `Assign.op`                                  | `ElementwiseOp`                           | Pure SSA body op; ReduceOp is NOT valid here                   |
-| `Update.target` / `value`                    | `str` / `str`                             | Fold value into an Accumulator                                 |
 | `Write.output` / `index` / `value`           | `int` / `tuple[Expr, ...]` / `str`        | Inline store at a position                                     |
 | `Select.branches[i].value` / `select`        | `str` / `Expr`                            | Coord-predicated SSA binding (replaces old Mux)                |
-| `LoopOp.axes` / `inputs` / `accumulators` / `body` | 4 tuples                            | Iteration + access patterns + state + SSA statements           |
+| `LoopOp.axes` / `inputs` / `accums` / `body` | 4 tuples                                  | Iteration + access patterns + state + SSA statements           |
 | `LoopLaunch.input_names`                     | `list[str]`                               | Per-Port external buffer name (program-level)                  |
 | `LoopLaunch.output_name`                     | `str`                                     | External buffer written by this LoopOp                         |
 
@@ -113,7 +112,7 @@ Analogies (use in module/class docstrings):
 - **Named iteration axes** like Halide ``Var``/``RVar`` or MLIR
   ``linalg.generic`` iterator types.
 - **Accumulator state** like MLIR ``scf.for`` iter_args — the
-  ``Update`` statement is the combine-and-write.
+  ``Accum`` statement is the combine-and-write.
 - **Tiled dataflow pipeline** (CUTLASS mainloop → MMA → epilogue → store) for `LoopOp`.
 
 ## Shape inference
@@ -148,9 +147,9 @@ Lift-then-merge, driven by the rewriter's fixpoint loop:
    ``003_lift_indexmap``, ``004_lift_gather``). Each produces a kernel
    whose iteration space matches its op's natural shape, with Ports
    expressing the input access pattern directly as ``Expr``s over axis
-   Vars. Reductions contribute one ``Accumulator`` accumulator and one
-   ``Update`` statement; multi-source IndexMapOps (cat / concat)
-   contribute a ``Select`` prelude choosing among per-source Ports.
+   Vars. Reductions contribute one ``Accum`` statement inside a reduce
+   ``Loop`` over the reduction axis; multi-source IndexMapOps (cat /
+   concat) contribute a ``Select`` prelude choosing among per-source Ports.
 2. **Merge adjacent ``LoopOp`` pairs** (``005_merge_loop_ops``). The
    grammar matches a ``LoopOp`` whose sole consumer is another
    ``LoopOp``. Merging is defined by a single substitution σ:
@@ -198,8 +197,8 @@ Walks the SSA body — no classification pass, no `Schedule` dataclass, no `Loop
 
 - `_emit_port_load(port, buf, src_shape, env) -> Expr`: emits `ArrayAccess(buffer, coord)` for a Port.index pattern evaluated in the axis environment. Select statements inside the SSA body are handled separately by `_emit_select`, which lowers `SelectBranch`es into a nested `Ternary` chain.
 - `_emit_body`: unified entry for one kernel body. Calls `ir.loop_plan.analyze_kernel(loop, dollar_shapes, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The same plan powers `LoopProgram.pretty_print_launch` so the dump view mirrors the loop nest codegen emits.
-- `_emit_plan`: walks `plan.steps` — each step is either `Inline` (a straight-line block of `Assign` / `Select` / `Write` / `Update`) or `Loop` (a K-loop over a reduce axis). Per-element port loads referenced inside a loop are deferred into that loop; other port loads happen upfront. Grid is 1D over flat free-axis extents; block is `(256, 1, 1)` for pure-elementwise plans, `(1, 1, 1)` for plans containing a `Loop` step. Empty bodies (copy kernels) are a pointwise subcase.
-- Reductions (single `Loop` step) emit an accumulator `Accumulator` + `Update`; max reductions use `fmaxf` instead of `AugAssign`. Softmax-style cross-iteration patterns (reduce_max → sub+exp → reduce_sum → div) and contractions (mul → reduce_sum) fall out naturally from multiple `Loop` steps recomputing per-element values as needed.
+- `_emit_plan`: walks `plan.steps` — each step is either `Inline` (a straight-line block of `Assign` / `Select` / `Write` / `Accum`) or `Loop` (a K-loop over a reduce axis). Per-element port loads referenced inside a loop are deferred into that loop; other port loads happen upfront. Grid is 1D over flat free-axis extents; block is `(256, 1, 1)` for pure-elementwise plans, `(1, 1, 1)` for plans containing a `Loop` step. Empty bodies (copy kernels) are a pointwise subcase.
+- Reductions (single `Loop` step) emit an accumulator init + `Accum` fold; max reductions use `fmaxf` instead of `AugAssign`. Softmax-style cross-iteration patterns (reduce_max → sub+exp → reduce_sum → div) and contractions (mul → reduce_sum) fall out naturally from multiple `Loop` steps recomputing per-element values as needed.
 
 The naive schedule is correctness-first — no shared memory, no async copies, no TMA, no vectorization. Performance work lives in follow-up commits.
 

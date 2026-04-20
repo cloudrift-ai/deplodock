@@ -389,7 +389,7 @@ def simplify_loop_op(op: LoopOp) -> LoopOp:
 
     Port indices (from the legacy ``inputs`` tuple) are walked with a full-
     axis Context — they materialize at the innermost point of the iteration
-    space. Body Loads, AccumDecls, Writes, Selects get simplified as the
+    space. Body Loads, Accums, Writes, Selects get simplified as the
     walker descends through Loop blocks, accumulating axis ranges.
     """
     ctx = Context.empty()
