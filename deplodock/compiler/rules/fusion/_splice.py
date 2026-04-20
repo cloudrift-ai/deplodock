@@ -1,33 +1,39 @@
-"""Tree-splicing merge for two adjacent ``LoopOp``s — parallel tree walk.
+"""Consumer-driven recursive splicing of two adjacent ``LoopOp``s.
 
-The producer is the host namespace: its body passes through unchanged
-(axes, SSA names, Load sources all retained). The consumer adapts to fit:
-σ-matched axes are rewritten to the producer's axis name, colliding axis
-and SSA names are freshened, Load sources are remapped to the merged
-layout, and Loads targeting the producer are dropped with their downstream
-references rewired to the producer's Write value.
+Fuses a producer/consumer pair by walking the consumer body and, at every
+``Load`` that targets the producer's output, reverse-reconstructing the
+producer expression that computed that value. Producer accumulators are
+hoisted lazily to the consumer scope where they belong (the scope whose
+enclosing axes match σ(enclosing producer axes)). Sibling reduce loops that
+sweep the same external buffer at the same dim share an axis name so the
+post-fusion kernel carries a single reduce axis.
 
-σ is a minimal positional solver: producer.Write.index[k] paired with the
-consumer Load.index[k] gives ``{producer_axis: reader_expr}`` entries for
-each ``Var(p)`` writer position, with ``Literal(c)`` writer positions
-adding no binding. Anything else in the writer → no merge.
+Algorithm outline:
 
-Under the lift convention each kernel iterates its own output shape with
-identity Write, so σ values are typically ``Var(consumer_axis)`` identity
-maps. A reduce-axis alias detector feeds σ when producer and consumer
-both have reduce axes over a shared external buffer. The consumer-side
-substitution is built by inverting σ: for every ``σ[p] = Var(c)`` entry,
-``consumer_sigma[c] = Var(p)``.
+- ``walk`` descends the consumer body. It emits rewritten stmts and returns
+  a ``bubble`` of accumulators that still need to be materialized at an
+  outer scope.
+- At a consumer Load of the producer, ``dfs_build`` walks the producer's
+  SSA from ``write.value`` back to its Loads, emitting freshened
+  ``Load | Assign | Select`` stmts with σ applied to every Expr.
+  References to producer Accums become ``PendingAccum`` records.
+- ``emit_accum_loops`` materializes a pending accumulator's reduce Loop
+  at the current scope. It runs a mini-dfs over the accum body and checks
+  for a sibling reduce Loop in the current-scope output that already
+  reads the same external buffer at the same dim — if so, it reuses that
+  sibling's axis name so both reduces end up sharing one axis.
+- Consumer Loads whose source is not the producer get their source index
+  bumped in a final pass (producer's inputs are prepended to the merged
+  kernel's input list).
 
-Not yet supported (returns ``None``):
-
-- Multi-read (consumer reads the producer at more than one distinct index).
-- Non-trivial writer forms (``Var(p) ± c``, ``Cast``, multiplicative).
-- Producer/consumer with differently-ordered Loop nests (e.g. producer's
-  σ-matched Loop is at a different depth than the consumer's matching one).
+Returns ``None`` when the pattern isn't supported: σ fails, consumer
+introduces an axis outside σ's image, accumulator scope can't be reached,
+or ``LoopOp`` validation fails on the merged body.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.expr import Expr, Literal, Var, substitute
 from deplodock.compiler.ir.loop import (
@@ -41,8 +47,86 @@ from deplodock.compiler.ir.loop import (
     SelectBranch,
     Stmt,
     Write,
-    flatten_body,
 )
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+
+
+class _NotSupported(Exception):
+    """Pattern not handled — caller converts to ``None`` return."""
+
+
+# ---------------------------------------------------------------------------
+# Per-accumulator data extracted on demand from the producer
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _AccumDecl:
+    """One producer accumulator, scoped enough for materialization.
+
+    ``body`` is the immediate body of the reduce Loop — the stmts that fold
+    into the accumulator (Loads + Assigns + Selects + the Accum itself).
+    ``enclosing_axes`` is the free-axis chain outer to the reduce Loop; an
+    accumulator can only be materialized at a consumer scope whose enclosing
+    axes σ-match this tuple.
+    """
+
+    name: str
+    reduce_axis: Axis
+    enclosing_axes: tuple[Axis, ...]
+    body: tuple[Stmt, ...]
+
+
+@dataclass
+class _PendingAccum:
+    """A producer accumulator whose reduce Loop still needs to be emitted.
+
+    Created at each ``dfs_build`` site that references an Accum. The
+    ``required_c_axes`` tuple is σ(enclosing_axes) — the consumer axis
+    names that must be in scope when we emit the Loop.
+    """
+
+    decl: _AccumDecl
+    sigma: dict[str, Expr]
+    bound_name: str
+    required_c_axes: tuple[str, ...]
+
+
+@dataclass
+class _Ctx:
+    producer: LoopOp
+    consumer: LoopOp
+    source: int
+    producer_inputs: list[str]
+    consumer_inputs: list[str]
+    used_names: set[str] = field(default_factory=set)
+    # Scope-keyed: (producer_accum_name, required_consumer_axes) → consumer-side binding.
+    # Same accum at different scopes gets different bindings because its value
+    # varies per-outer-iteration (e.g. SDPA's QK^T reduce inside softmax's K loop
+    # vs inside the output free loop).
+    accum_name: dict[tuple[str, tuple[str, ...]], str] = field(default_factory=dict)
+    consumer_source_remap: dict[int, int] = field(default_factory=dict)
+    merged_inputs: list[str] = field(default_factory=list)
+    materialized: set[tuple[str, tuple[str, ...]]] = field(default_factory=set)
+
+    def fresh(self, hint: str) -> str:
+        name = hint
+        i = 1
+        while name in self.used_names:
+            name = f"{hint}_s{i}"
+            i += 1
+        self.used_names.add(name)
+        return name
+
+    def name_for_accum(self, prod_name: str, scope: tuple[str, ...]) -> str:
+        key = (prod_name, scope)
+        existing = self.accum_name.get(key)
+        if existing is not None:
+            return existing
+        new = self.fresh(prod_name)
+        self.accum_name[key] = new
+        return new
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -57,327 +141,440 @@ def splice_loop_ops(
     producer_inputs: list[str] | None = None,
     consumer_inputs: list[str] | None = None,
 ) -> LoopOp | None:
-    """Splice ``producer``'s body into every ``consumer`` Load with matching
-    ``source``. Returns ``None`` when the pattern isn't supported yet."""
-
-    writes = [s for s in flatten_body(producer.body) if isinstance(s, Write) and s.output == 0]
-    if len(writes) != 1:
-        return None
-    write = writes[0]
-
-    target_loads = [ld for ld in consumer.loads if ld.source == source]
-    if not target_loads:
-        return None
-
-    producer_axis_names = {a.name for a in producer.axes}
-
-    # Per-Load σ. Each consumer Load that targets the producer gets its own
-    # σ: writer.index vs that Load's reader index. Single-read is the common
-    # case; softmax-style multi-read (two sweeps over producer at distinct
-    # indices) exercises the per-Load path.
-    per_load_sigma: dict[str, dict[str, Expr]] = {}
-    for ld in target_loads:
-        s = _solve_sigma(write.index, ld.index, producer_axis_names)
-        if s is None:
-            return None
-        per_load_sigma[ld.name] = s
-
-    # Common σ: bindings that agree across every per-Load σ. Drives
-    # producer/consumer Loop folding during the tree walk.
-    common_sigma: dict[str, Expr] = {}
-    first_sigma = next(iter(per_load_sigma.values()))
-    for p_name, r in first_sigma.items():
-        if all(per_load_sigma[lname].get(p_name) == r for lname in per_load_sigma):
-            common_sigma[p_name] = r
-
-    if producer_inputs is not None and consumer_inputs is not None:
-        aliases = _detect_reduce_axis_aliases(producer, consumer, common_sigma, source, producer_inputs, consumer_inputs)
-        for p_name, c_var in aliases.items():
-            common_sigma.setdefault(p_name, c_var)
-        bridge_aliases = _detect_output_coord_reduce_aliases(producer, consumer, per_load_sigma, common_sigma, write, producer_inputs)
-        for p_name, c_var in bridge_aliases.items():
-            common_sigma.setdefault(p_name, c_var)
-
-    # Parametric axes: producer axes bound by some per-Load σ but not
-    # common — their binding varies per Load (the element-space replay
-    # substitutes them per-site). Fine: they don't need a producer Loop
-    # in the row-space output.
-    parametric_axes: set[str] = set()
-    for ps in per_load_sigma.values():
-        for p_name in ps:
-            if p_name not in common_sigma:
-                parametric_axes.add(p_name)
-
-    reduce_names = producer.reduce_axis_names
-    for ax in producer.axes:
-        if ax.name in common_sigma or ax.name in parametric_axes or ax.name in reduce_names:
-            continue
-        if int(ax.extent) == 1:
-            continue
-        return None
-
-    # --- Consumer adaptation tables (built against common_sigma) ---
-    producer_ssa_names = _collect_ssa_names(producer)
-    consumer_ssa_names = _collect_ssa_names(consumer)
-    consumer_axis_names = {a.name for a in consumer.axes}
-
-    sigma_matched_c_axes = {b.name for b in common_sigma.values() if isinstance(b, Var)}
-    non_matched_c_axes = consumer_axis_names - sigma_matched_c_axes
-    taken_by_producer = producer_axis_names | producer_ssa_names
-    consumer_axis_rename = _fresh_names(non_matched_c_axes, taken_by_producer)
-
-    consumer_ssa_rename = _fresh_names(
-        consumer_ssa_names,
-        taken_by_producer | set(consumer_axis_rename.values()),
-    )
-
-    consumer_sigma: dict[str, Expr] = {}
-    for p_name, reader_expr in common_sigma.items():
-        if isinstance(reader_expr, Var):
-            consumer_sigma[reader_expr.name] = Var(p_name)
-    for old, new in consumer_axis_rename.items():
-        consumer_sigma[old] = Var(new)
-
-    producer_to_consumer_axis = {p_name: r.name for p_name, r in common_sigma.items() if isinstance(r, Var)}
-
-    consumer_source_remap: dict[int, int] = {}
-    next_src = producer.num_inputs
-    for i in range(consumer.num_inputs):
-        if i == source:
-            continue
-        consumer_source_remap[i] = next_src
-        next_src += 1
-
-    # --- Split producer body into row-space + element-space template ---
-    # Row-space: stmts that feed the producer's Accums (scope-crossing
-    # values like softmax's acc_max) — emitted once at the merged scope.
-    # Element-space template: stmts feeding the Write, with the Write
-    # elided and output-coord Loops unwrapped. Replayed per consumer Load
-    # at the Load site with that Load's σ.
-    row_stmts, element_template = _split_producer_body(producer.body, write)
-
-    # Multi-read safety checks.
-    if len(target_loads) > 1:
-        # (1) Every parametric axis (σ-bound per-Load but not common) must
-        # appear inside the element-space template. Otherwise different
-        # consumer Loads would inline an expression that ignores their
-        # distinct σ bindings — or, when the template is empty, Write.value
-        # is just an Accum name reachable only via scope propagation, not
-        # re-runnable per Load.
-        template_axes = _axes_in_template(element_template)
-        if not parametric_axes.issubset(template_axes):
-            return None
-
-        # (2) Any producer Accum referenced by the element-space template
-        # must be defined at a scope whose enclosing row-space Loops are
-        # all bound by common σ. If the Accum sits under a parametric
-        # producer Loop (e.g. SDPA's score reduce nested inside the
-        # output K axis), its value varies per-parametric-iteration and
-        # can't be shared across distinct consumer reads — one
-        # ``acc`` in row-space, many consumer reads with different σ
-        # would all see the last written value.
-        common_axis_names = {v.name for v in common_sigma.values() if isinstance(v, Var)} | set(common_sigma)
-        referenced = _referenced_ssa_names(element_template)
-        accum_scopes = _accum_defining_scopes(row_stmts)
-        for acc_name in referenced:
-            scope = accum_scopes.get(acc_name)
-            if scope is None:
-                continue  # not an Accum (e.g. external SSA); no scope constraint
-            if not scope.issubset(common_axis_names):
-                return None
-
-    # --- Per-Load replay ---
-    consumer_load_alias: dict[str, str] = {}
-    replay_stmts_per_load: dict[str, tuple[Stmt, ...]] = {}
-    for i, ld in enumerate(target_loads):
-        load_sigma = per_load_sigma[ld.name]
-        # σ values use consumer's original axis names; push through
-        # consumer_sigma so renames are applied before replay substitutes.
-        axis_sub = {p_name: substitute(r, consumer_sigma) for p_name, r in load_sigma.items()}
-        suffix = f"_r{i}"
-        replay_stmts, final_name = _replay_element_template(element_template, axis_sub, suffix, write.value)
-        replay_stmts_per_load[ld.name] = replay_stmts
-        consumer_load_alias[ld.name] = final_name
-
-    # --- Align producer's free-loop chain to consumer's depths ---
-    aligned_row_stmts = _align_producer_free_chain(
-        row_stmts,
-        consumer.body,
-        producer_to_consumer_axis,
-        producer.reduce_axis_names,
-    )
-
-    # --- Parallel tree walk ---
-    merged_body = _merge_trees(
-        aligned_row_stmts,
-        consumer.body,
-        consumer_sigma=consumer_sigma,
-        consumer_ssa_rename=consumer_ssa_rename,
-        consumer_axis_rename=consumer_axis_rename,
-        consumer_source_remap=consumer_source_remap,
-        consumer_load_alias=consumer_load_alias,
-        replay_stmts_per_load=replay_stmts_per_load,
-        producer_to_consumer_axis=producer_to_consumer_axis,
-    )
-
+    """Splice ``producer``'s body into every ``consumer`` Load that targets
+    ``source``. Returns ``None`` when the pattern isn't supported."""
     try:
-        return LoopOp(body=merged_body)
+        p_inputs = list(producer_inputs or [])
+        c_inputs = list(consumer_inputs or [])
+        merged_inputs = list(p_inputs) + [c for i, c in enumerate(c_inputs) if i != source]
+        ctx = _Ctx(
+            producer=producer,
+            consumer=consumer,
+            source=source,
+            producer_inputs=p_inputs,
+            consumer_inputs=c_inputs,
+            used_names=_collect_names(producer) | _collect_names(consumer),
+            consumer_source_remap=_build_consumer_source_remap(producer, consumer, source),
+            merged_inputs=merged_inputs,
+        )
+        new_body, bubble = _walk(consumer.body, ctx, enclosing=())
+        if bubble:
+            return None
+        new_body = _unify_sibling_reduce_axes(new_body, ctx.merged_inputs)
+        return LoopOp(body=new_body)
+    except _NotSupported:
+        return None
     except ValueError:
         return None
 
 
 # ---------------------------------------------------------------------------
-# Parallel tree walk
+# Recursion core
 # ---------------------------------------------------------------------------
 
 
-def _merge_trees(
-    p_stmts: tuple[Stmt, ...],
+def _walk(
     c_stmts: tuple[Stmt, ...],
-    *,
-    consumer_sigma: dict[str, Expr],
-    consumer_ssa_rename: dict[str, str],
-    consumer_axis_rename: dict[str, str],
-    consumer_source_remap: dict[int, int],
-    consumer_load_alias: dict[str, str],
-    replay_stmts_per_load: dict[str, tuple[Stmt, ...]],
-    producer_to_consumer_axis: dict[str, str],
-) -> tuple[Stmt, ...]:
-    """Walk producer (row-space) and consumer bodies at the current scope.
+    ctx: _Ctx,
+    enclosing: tuple[Axis, ...],
+) -> tuple[tuple[Stmt, ...], list[_PendingAccum]]:
+    """Walk consumer stmts at the current scope. Return (new_body, bubble).
 
-    Producer's row-space stmts emit verbatim; where a row-space Loop's
-    axis is σ-bound to a consumer Loop at this scope, the two bodies
-    merge recursively. Consumer stmts then follow, rewritten: σ-matched
-    Loops consumed above are skipped; a target Load is replaced by the
-    pre-computed element-space replay for that Load (may be multiple
-    stmts); remaining consumer stmts get axis substitution, SSA rename,
-    source remap, and load aliasing."""
+    ``bubble`` lists accumulators that must be materialized at an outer
+    scope (caller is responsible for flushing them at its level)."""
+    out: list[Stmt] = []
+    bubble: list[_PendingAccum] = []
+    enclosing_names = tuple(a.name for a in enclosing)
 
-    c_loop_by_axis: dict[str, Loop] = {s.axis.name: s for s in c_stmts if isinstance(s, Loop)}
-    consumed_c_loops: set[str] = set()
+    for s in c_stmts:
+        if isinstance(s, Loop):
+            inner_out, inner_bubble = _walk(s.body, ctx, enclosing + (s.axis,))
+            here, up = _partition_pendings(inner_bubble, enclosing_names)
+            out.extend(_emit_accum_loops(here, ctx, enclosing, current_scope_out=out))
+            out.append(Loop(axis=s.axis, body=inner_out))
+            bubble.extend(up)
 
-    def ren(name: str) -> str:
-        """Resolve a consumer SSA reference: dropped-Load names → replay
-        final-value name; otherwise → fresh name (or identity)."""
-        if name in consumer_load_alias:
-            return consumer_load_alias[name]
-        return consumer_ssa_rename.get(name, name)
+        elif isinstance(s, Load) and s.source == ctx.source:
+            sigma = _solve_sigma(_producer_write(ctx).index, s.index, _producer_axis_names(ctx))
+            if sigma is None:
+                raise _NotSupported
+            prod_stmts, new_pending, final_name = _dfs_build(_producer_write(ctx).value, sigma, ctx, enclosing_names)
+            here, up = _partition_pendings(new_pending, enclosing_names)
+            out.extend(_emit_accum_loops(here, ctx, enclosing, current_scope_out=out))
+            out.extend(prod_stmts)
+            # Alias consumer's load name to producer's final value via a
+            # copy Assign. normalize's copy-elim pass will collapse it.
+            # The consumer's load.name is already in used_names (consumer
+            # SSA names were seeded up front) — that's fine, we're
+            # replacing the Load that bound it with this Assign.
+            out.append(Assign(name=s.name, op=ElementwiseOp("copy"), args=(final_name,)))
+            bubble.extend(up)
 
-    def rewrite_consumer(stmt: Stmt) -> Stmt | tuple[Stmt, ...] | None:
-        """Rewrite a consumer stmt. Loops recurse; target Loads expand to
-        their replay stmt tuple; other stmts rewrite in place."""
-        if isinstance(stmt, Loop):
-            axis_name = stmt.axis.name
-            # Use consumer_sigma for the axis rename so the Loop header stays
-            # consistent with body Expr substitution. consumer_sigma contains
-            # both σ-matched entries (→ producer's axis name) and non-matched
-            # rename entries. When a σ-matched Loop folds with a producer
-            # Loop, this rewrite doesn't run (the Loop is in consumed_c_loops);
-            # when the producer counterpart was stripped into element-space,
-            # applying the same mapping here keeps axis name + body refs aligned.
-            mapped = consumer_sigma.get(axis_name)
-            new_axis_name = mapped.name if isinstance(mapped, Var) else consumer_axis_rename.get(axis_name, axis_name)
-            new_body: list[Stmt] = []
-            for c in stmt.body:
-                rewritten = rewrite_consumer(c)
-                if rewritten is None:
-                    continue
-                if isinstance(rewritten, tuple):
-                    new_body.extend(rewritten)
-                else:
-                    new_body.append(rewritten)
-            return Loop(axis=Axis(name=new_axis_name, extent=stmt.axis.extent), body=tuple(new_body))
-        if isinstance(stmt, Load):
-            new_source = consumer_source_remap.get(stmt.source)
-            if new_source is None:
-                # Target Load: emit the pre-computed element-space replay.
-                return replay_stmts_per_load.get(stmt.name, ())
-            return Load(
-                name=consumer_ssa_rename.get(stmt.name, stmt.name),
-                source=new_source,
-                index=tuple(substitute(e, consumer_sigma) for e in stmt.index),
+        elif isinstance(s, Load):
+            # Consumer-origin Load (not the spliced source). Remap source
+            # index so it lands after the producer's inputs in the merged
+            # kernel's input list.
+            new_src = ctx.consumer_source_remap.get(s.source, s.source)
+            out.append(Load(name=s.name, source=new_src, index=s.index))
+
+        else:
+            out.append(s)
+
+    return tuple(out), bubble
+
+
+# ---------------------------------------------------------------------------
+# Reverse-reconstruction of producer expression at a Load site
+# ---------------------------------------------------------------------------
+
+
+def _dfs_build(
+    root_ssa: str,
+    sigma: dict[str, Expr],
+    ctx: _Ctx,
+    enclosing_names: tuple[str, ...],
+) -> tuple[list[Stmt], list[_PendingAccum], str]:
+    """Walk producer SSA from ``root_ssa`` back to Loads / Accums, emitting
+    freshened stmts in reverse-topological (i.e. definition) order.
+
+    Returns (emitted_stmts, pending_accums, final_name) where final_name is
+    the freshened SSA name that holds root_ssa's value at the emission site.
+    """
+    defs = _producer_defs(ctx)
+    emitted: list[Stmt] = []
+    pending: list[_PendingAccum] = []
+    ssa_rename: dict[str, str] = {}
+
+    def rename(n: str) -> str:
+        return ssa_rename.get(n, n)
+
+    visited: set[str] = set()
+
+    def visit(n: str) -> str:
+        if n in ssa_rename:
+            return ssa_rename[n]
+        if n in visited:
+            # Cycle (shouldn't happen in SSA) — return tentative name.
+            return ssa_rename.get(n, n)
+        visited.add(n)
+
+        defn = defs.get(n)
+        if defn is None:
+            # Not a producer def — an external name (shouldn't arrive here).
+            return n
+
+        if isinstance(defn, Accum):
+            decl = _find_accum_scope(ctx.producer, n)
+            if decl is None:
+                raise _NotSupported
+            required_c_axes = tuple(_c_axis_name(sigma.get(ax.name), ctx) for ax in decl.enclosing_axes)
+            if any(a is None for a in required_c_axes):
+                raise _NotSupported
+            required_c_axes_t: tuple[str, ...] = required_c_axes  # type: ignore[assignment]
+            bound = ctx.name_for_accum(n, required_c_axes_t)
+            ssa_rename[n] = bound
+            pending.append(
+                _PendingAccum(
+                    decl=decl,
+                    sigma=dict(sigma),
+                    bound_name=bound,
+                    required_c_axes=required_c_axes_t,
+                )
             )
-        if isinstance(stmt, Assign):
-            return Assign(
-                name=consumer_ssa_rename.get(stmt.name, stmt.name),
-                op=stmt.op,
-                args=tuple(ren(a) for a in stmt.args),
+            return bound
+
+        if isinstance(defn, Load):
+            # Recurse into any ssa inputs first (Loads don't have any), then
+            # emit the Load with sigma-substituted index.
+            new_name = ctx.fresh(defn.name)
+            ssa_rename[n] = new_name
+            emitted.append(
+                Load(
+                    name=new_name,
+                    source=defn.source,
+                    index=tuple(substitute(e, sigma) for e in defn.index),
+                )
             )
-        if isinstance(stmt, Accum):
-            return Accum(
-                name=consumer_ssa_rename.get(stmt.name, stmt.name),
-                value=ren(stmt.value),
-                op=stmt.op,
-            )
-        if isinstance(stmt, Select):
-            return Select(
-                name=consumer_ssa_rename.get(stmt.name, stmt.name),
-                branches=tuple(
-                    SelectBranch(
-                        value=ren(b.value),
-                        select=substitute(b.select, consumer_sigma),
-                    )
-                    for b in stmt.branches
-                ),
-            )
-        if isinstance(stmt, Write):
-            return Write(
-                output=stmt.output,
-                index=tuple(substitute(e, consumer_sigma) for e in stmt.index),
-                value=ren(stmt.value),
-            )
-        return stmt
+            return new_name
+
+        if isinstance(defn, Assign):
+            resolved_args = tuple(visit(a) for a in defn.args)
+            new_name = ctx.fresh(defn.name)
+            ssa_rename[n] = new_name
+            emitted.append(Assign(name=new_name, op=defn.op, args=resolved_args))
+            return new_name
+
+        if isinstance(defn, Select):
+            resolved_branches = tuple(SelectBranch(value=visit(b.value), select=substitute(b.select, sigma)) for b in defn.branches)
+            new_name = ctx.fresh(defn.name)
+            ssa_rename[n] = new_name
+            emitted.append(Select(name=new_name, branches=resolved_branches))
+            return new_name
+
+        raise _NotSupported
+
+    final_name = visit(root_ssa)
+    return emitted, pending, final_name
+
+
+# ---------------------------------------------------------------------------
+# Accumulator materialization
+# ---------------------------------------------------------------------------
+
+
+def _emit_accum_loops(
+    pendings: list[_PendingAccum],
+    ctx: _Ctx,
+    enclosing: tuple[Axis, ...],
+    current_scope_out: list[Stmt],
+) -> list[Stmt]:
+    """Build reduce Loops for each unique pending accumulator at this scope.
+
+    Dedupes by decl name. For each pending, checks whether an already-emitted
+    sibling Loop at this scope reduces over the same external buffer at the
+    same dim — if so, reuses that sibling's reduce axis name.
+    """
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    unique: list[_PendingAccum] = []
+    for p in pendings:
+        key = (p.decl.name, p.required_c_axes)
+        if key in seen or key in ctx.materialized:
+            continue
+        seen.add(key)
+        unique.append(p)
 
     out: list[Stmt] = []
+    for p in unique:
+        reduce_axis_name = _find_sibling_reduce_alias(p, current_scope_out + out, ctx)
+        if reduce_axis_name is None:
+            reduce_axis_name = ctx.fresh(p.decl.reduce_axis.name)
+        extended_sigma: dict[str, Expr] = dict(p.sigma)
+        extended_sigma[p.decl.reduce_axis.name] = Var(reduce_axis_name)
+        body_stmts, nested_pending, _ = _dfs_build_accum_body(p, extended_sigma, ctx)
+        # Nested accumulators that match THIS scope are emitted before.
+        nested_here, nested_up = _partition_pendings(nested_pending, tuple(a.name for a in enclosing))
+        if nested_up:
+            raise _NotSupported
+        out.extend(_emit_accum_loops(nested_here, ctx, enclosing, current_scope_out=current_scope_out + out))
+        out.append(Loop(axis=Axis(name=reduce_axis_name, extent=p.decl.reduce_axis.extent), body=body_stmts))
+        ctx.materialized.add((p.decl.name, p.required_c_axes))
+    return out
 
-    # Producer pass over row-space stmts (Writes already elided by the
-    # splitter). σ-matched row-space Loops fold with their consumer Loops
-    # — except when both sides are reduce loops, in which case they emit
-    # as siblings under the shared axis name. Folding their bodies would
-    # interleave accumulators (sum seeing max mid-sweep), breaking the
-    # softmax pattern where the second reduce reads the first's finalized
-    # value.
-    for p_stmt in p_stmts:
-        if isinstance(p_stmt, Loop):
-            matched_c_axis = producer_to_consumer_axis.get(p_stmt.axis.name)
-            if matched_c_axis is not None and matched_c_axis in c_loop_by_axis:
-                c_loop = c_loop_by_axis[matched_c_axis]
-                p_is_reduce = any(isinstance(s, Accum) for s in p_stmt.body)
-                c_is_reduce = any(isinstance(s, Accum) for s in c_loop.body)
-                if p_is_reduce and c_is_reduce:
-                    # Sibling reduce Loops share axis; consumer's Loop
-                    # emits in the consumer pass (not consumed here).
-                    out.append(p_stmt)
-                    continue
-                merged_inner = _merge_trees(
-                    p_stmt.body,
-                    c_loop.body,
-                    consumer_sigma=consumer_sigma,
-                    consumer_ssa_rename=consumer_ssa_rename,
-                    consumer_axis_rename=consumer_axis_rename,
-                    consumer_source_remap=consumer_source_remap,
-                    consumer_load_alias=consumer_load_alias,
-                    replay_stmts_per_load=replay_stmts_per_load,
-                    producer_to_consumer_axis=producer_to_consumer_axis,
+
+def _dfs_build_accum_body(
+    p: _PendingAccum,
+    sigma: dict[str, Expr],
+    ctx: _Ctx,
+) -> tuple[tuple[Stmt, ...], list[_PendingAccum], str]:
+    """Materialize a producer accumulator's reduce-body under ``sigma``.
+
+    Rewrites the decl body's Loads and Assigns/Selects with freshened SSA
+    names and σ-substituted Exprs. The trailing Accum stmt binds to the
+    accumulator's canonical consumer-side name (``ctx.name_for_accum``).
+    """
+    emitted: list[Stmt] = []
+    pending: list[_PendingAccum] = []
+    ssa_rename: dict[str, str] = {}
+
+    def rename(n: str) -> str:
+        return ssa_rename.get(n, n)
+
+    for s in p.decl.body:
+        if isinstance(s, Load):
+            new_name = ctx.fresh(s.name)
+            ssa_rename[s.name] = new_name
+            emitted.append(
+                Load(
+                    name=new_name,
+                    source=s.source,
+                    index=tuple(substitute(e, sigma) for e in s.index),
                 )
-                out.append(Loop(axis=p_stmt.axis, body=merged_inner))
-                consumed_c_loops.add(matched_c_axis)
-                continue
-        out.append(p_stmt)
-
-    # Consumer pass: skip σ-consumed Loops; rewrite and emit the rest.
-    for c_stmt in c_stmts:
-        if isinstance(c_stmt, Loop) and c_stmt.axis.name in consumed_c_loops:
-            continue
-        rewritten = rewrite_consumer(c_stmt)
-        if rewritten is None:
-            continue
-        if isinstance(rewritten, tuple):
-            out.extend(rewritten)
+            )
+        elif isinstance(s, Assign):
+            new_name = ctx.fresh(s.name)
+            ssa_rename[s.name] = new_name
+            emitted.append(Assign(name=new_name, op=s.op, args=tuple(rename(a) for a in s.args)))
+        elif isinstance(s, Select):
+            new_name = ctx.fresh(s.name)
+            ssa_rename[s.name] = new_name
+            emitted.append(
+                Select(
+                    name=new_name,
+                    branches=tuple(SelectBranch(value=rename(b.value), select=substitute(b.select, sigma)) for b in s.branches),
+                )
+            )
+        elif isinstance(s, Accum):
+            # Bind the reduce to the canonical consumer-side accum name.
+            emitted.append(Accum(name=p.bound_name, value=rename(s.value), op=s.op))
+        elif isinstance(s, Loop):
+            # Nested reduce/free loop inside the accum body — not yet supported.
+            raise _NotSupported
+        elif isinstance(s, Write):
+            raise _NotSupported
         else:
-            out.append(rewritten)
+            raise _NotSupported
+    return tuple(emitted), pending, p.bound_name
 
+
+# ---------------------------------------------------------------------------
+# Sibling-reduce alias detection
+# ---------------------------------------------------------------------------
+
+
+def _find_sibling_reduce_alias(
+    p: _PendingAccum,
+    emitted_so_far: list[Stmt],
+    ctx: _Ctx,
+) -> str | None:
+    """Scan already-emitted siblings at the current scope for a reduce Loop
+    that reads the same external buffer at the same dim that p's reduce
+    axis would read. Return that Loop's axis name for reuse, or ``None``.
+
+    The match is tight: both the pending's reduce and the sibling's reduce
+    must contain a bare ``Var(axis)`` at the same (buffer, dim) position.
+    """
+    p_patterns = _reduce_axis_buffer_positions(p.decl.body, p.decl.reduce_axis.name, ctx.producer_inputs)
+    if not p_patterns:
+        return None
+
+    for stmt in emitted_so_far:
+        if not isinstance(stmt, Loop):
+            continue
+        if not _loop_is_reduce(stmt):
+            continue
+        # Sibling Loops in current_scope_out have already been source-
+        # remapped into the merged kernel's input space, so look up buffers
+        # via merged_inputs.
+        sib_axis = stmt.axis.name
+        sib_patterns = _reduce_axis_buffer_positions(stmt.body, sib_axis, ctx.merged_inputs)
+        if p_patterns & sib_patterns:
+            if int(p.decl.reduce_axis.extent) != int(stmt.axis.extent):
+                continue
+            return sib_axis
+
+    return None
+
+
+def _reduce_axis_buffer_positions(
+    body: tuple[Stmt, ...],
+    reduce_axis_name: str,
+    inputs: list[str],
+) -> set[tuple[str, int]]:
+    """Set of (external_buffer_name, dim) positions where a bare
+    ``Var(reduce_axis_name)`` appears in a Load's index inside ``body``."""
+    positions: set[tuple[str, int]] = set()
+
+    def walk(stmts: tuple[Stmt, ...]) -> None:
+        for s in stmts:
+            if isinstance(s, Load):
+                if 0 <= s.source < len(inputs):
+                    buf = inputs[s.source]
+                    for dim, e in enumerate(s.index):
+                        if isinstance(e, Var) and e.name == reduce_axis_name:
+                            positions.add((buf, dim))
+            elif isinstance(s, Loop):
+                walk(s.body)
+
+    walk(body)
+    return positions
+
+
+def _loop_is_reduce(loop: Loop) -> bool:
+    return any(isinstance(s, Accum) for s in loop.body)
+
+
+def _unify_sibling_reduce_axes(body: tuple[Stmt, ...], merged_inputs: list[str]) -> tuple[Stmt, ...]:
+    """Post-pass: at every scope, find sibling reduce Loops whose reduce
+    axes index the same (external_buffer, dim) position, and rename them
+    to share a single canonical axis name.
+
+    Example: after splicing max + sub + exp into sum + div, the merged
+    body has both max's and sum's reduce loops as siblings, each loading
+    x at dim 1. This pass collapses their axis names so the final kernel
+    reports one reduce axis (per LoopOp.axes dedup-by-name)."""
+    # Recurse into nested Loops first.
+    new_body: list[Stmt] = []
+    for s in body:
+        if isinstance(s, Loop):
+            new_body.append(Loop(axis=s.axis, body=_unify_sibling_reduce_axes(s.body, merged_inputs)))
+        else:
+            new_body.append(s)
+
+    # Group sibling reduce Loops by their (buffer, dim) pattern.
+    groups: dict[frozenset[tuple[str, int]], list[int]] = {}
+    for i, s in enumerate(new_body):
+        if isinstance(s, Loop) and _loop_is_reduce(s):
+            positions = _reduce_axis_buffer_positions(s.body, s.axis.name, merged_inputs)
+            if positions:
+                groups.setdefault(frozenset(positions), []).append(i)
+
+    for _, indices in groups.items():
+        if len(indices) < 2:
+            continue
+        first_loop = new_body[indices[0]]
+        assert isinstance(first_loop, Loop)
+        canonical_axis = first_loop.axis.name
+        canonical_extent = int(first_loop.axis.extent)
+        for idx in indices[1:]:
+            loop = new_body[idx]
+            assert isinstance(loop, Loop)
+            if int(loop.axis.extent) != canonical_extent:
+                continue
+            if loop.axis.name == canonical_axis:
+                continue
+            renamed_body = _rename_axis_in_body(loop.body, loop.axis.name, canonical_axis)
+            new_body[idx] = Loop(axis=Axis(name=canonical_axis, extent=canonical_extent), body=renamed_body)
+
+    return tuple(new_body)
+
+
+def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -> tuple[Stmt, ...]:
+    mapping = {old_name: Var(new_name)}
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, Loop):
+            # Shadow check: if s.axis.name == old_name, the rename is at this
+            # exact Loop's scope and we're already handling it at the caller.
+            # Otherwise descend.
+            if s.axis.name == old_name:
+                out.append(Loop(axis=Axis(name=new_name, extent=s.axis.extent), body=_rename_axis_in_body(s.body, old_name, new_name)))
+            else:
+                out.append(Loop(axis=s.axis, body=_rename_axis_in_body(s.body, old_name, new_name)))
+        elif isinstance(s, Load):
+            out.append(Load(name=s.name, source=s.source, index=tuple(substitute(e, mapping) for e in s.index)))
+        elif isinstance(s, Write):
+            out.append(Write(output=s.output, index=tuple(substitute(e, mapping) for e in s.index), value=s.value))
+        elif isinstance(s, Select):
+            out.append(
+                Select(
+                    name=s.name,
+                    branches=tuple(SelectBranch(value=b.value, select=substitute(b.select, mapping)) for b in s.branches),
+                )
+            )
+        else:
+            out.append(s)
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Consumer source remap
+# ---------------------------------------------------------------------------
+
+
+def _build_consumer_source_remap(producer: LoopOp, consumer: LoopOp, source: int) -> dict[int, int]:
+    """Consumer-origin Load sources shift past producer's inputs. The
+    spliced source itself is dropped from the map — those Loads never
+    survive the splice. Producer-origin Loads keep their original sources
+    because producer inputs come first in the merged kernel."""
+    n_prod = producer.num_inputs
+    remap: dict[int, int] = {}
+    next_src = n_prod
+    for i in range(consumer.num_inputs):
+        if i == source:
+            continue
+        remap[i] = next_src
+        next_src += 1
+    return remap
 
 
 # ---------------------------------------------------------------------------
@@ -385,13 +582,14 @@ def _merge_trees(
 # ---------------------------------------------------------------------------
 
 
-def _solve_sigma(writer: tuple[Expr, ...], reader: tuple[Expr, ...], producer_axes: set[str]) -> dict[str, Expr] | None:
-    """``writer[k] == reader[k]`` per dim. Supported writer forms:
-
-    - ``Var(a)`` with ``a`` in ``producer_axes`` → bind ``a → reader[k]``.
-    - ``Literal(c)`` → no binding (writer pins a constant).
-
-    Anything else → unsupported (returns ``None``)."""
+def _solve_sigma(
+    writer: tuple[Expr, ...],
+    reader: tuple[Expr, ...],
+    producer_axes: set[str],
+) -> dict[str, Expr] | None:
+    """Solve the per-dim pairing writer[k] == reader[k]. Supported writer
+    forms: ``Var(a)`` (``a`` in producer_axes) → bind a→reader[k];
+    ``Literal(c)`` → no binding. Anything else → None."""
     if len(writer) != len(reader):
         return None
     sigma: dict[str, Expr] = {}
@@ -408,486 +606,166 @@ def _solve_sigma(writer: tuple[Expr, ...], reader: tuple[Expr, ...], producer_ax
     return sigma
 
 
-# ---------------------------------------------------------------------------
-# Reduce-axis alias (sibling reductions)
-# ---------------------------------------------------------------------------
-
-
-def _detect_reduce_axis_aliases(
-    producer: LoopOp,
-    consumer: LoopOp,
+def _check_no_extra_consumer_axes(
     sigma: dict[str, Expr],
-    target_source: int,
-    producer_inputs: list[str],
-    consumer_inputs: list[str],
-) -> dict[str, Expr]:
-    """Producer reduce axes that unify with consumer reduce axes.
-
-    A producer reduce axis ``p_ax`` aliases to a consumer reduce axis ``c_ax``
-    when both index the same external buffer at the same dim as a bare
-    ``Var``, the extents match, and the consumer's Load exposing ``c_ax``
-    does *not* target the producer."""
-    reduce_names = producer.reduce_axis_names
-    candidate_p_axes = [a for a in producer.axes if a.name in reduce_names and a.name not in sigma]
-    if not candidate_p_axes:
-        return {}
-
-    consumer_reduce = {a.name: a for a in consumer.axes if a.name in consumer.reduce_axis_names}
-    if not consumer_reduce:
-        return {}
-
-    aliases: dict[str, Expr] = {}
-    paired: set[str] = set()
-
-    for p_ax in candidate_p_axes:
-        alias = _find_alias(p_ax, producer, consumer, target_source, producer_inputs, consumer_inputs, consumer_reduce)
-        if alias is not None and alias not in paired:
-            aliases[p_ax.name] = Var(alias)
-            paired.add(alias)
-
-    return aliases
-
-
-def _detect_output_coord_reduce_aliases(
-    producer: LoopOp,
-    consumer: LoopOp,
-    per_load_sigma: dict[str, dict[str, Expr]],
-    common_sigma: dict[str, Expr],
-    write: Write,
-    producer_inputs: list[str],
-) -> dict[str, Expr]:
-    """Alias producer reduce axes via the output-coord bridge.
-
-    When the consumer reads the producer's *output* (not a shared external
-    buffer), the strict buffer-match check misses aliases. But the
-    producer's element-space and its reduce loads often both index the
-    same external buffer at the same dim — via different producer axes
-    (the element-space uses an output-coord; the reduce uses a reduce
-    axis). In softmax, producer's ``a1`` (max reduce) and ``a1_p1``
-    (exp's output-coord) both index ``input`` at dim 1: that's what makes
-    them the "same K dim". When the consumer's reduce axis ``c_ax`` is
-    σ-bound to the producer's output-coord ``p_out`` in any per-Load σ,
-    and a producer reduce axis ``p_ax`` indexes the same (buffer, dim) as
-    ``p_out``, alias ``p_ax → Var(c_ax)`` so both reduce sweeps merge
-    into sibling loops sharing an axis name.
-
-    This is strictly tighter than matching by extent alone: patterns like
-    SDPA (producer reduces over D, consumer reduces over K; both extent
-    but different physical dims) get no alias here.
-    """
-    output_coord_axes = {e.name for e in write.index if isinstance(e, Var)}
-
-    reduce_names = producer.reduce_axis_names
-    candidate_p_axes = [a for a in producer.axes if a.name in reduce_names and a.name not in common_sigma]
-    if not candidate_p_axes:
-        return {}
-
-    consumer_reduce = {a.name: a for a in consumer.axes if a.name in consumer.reduce_axis_names}
-    if not consumer_reduce:
-        return {}
-
-    # Load fingerprints: which axis names appear at each (buffer, dim).
-    load_patterns: dict[tuple[str, int], set[str]] = {}
-    for ld in producer.loads:
-        if ld.source >= len(producer_inputs):
+    enclosing_names: tuple[str, ...],
+    ctx: _Ctx,
+) -> None:
+    """Reject when the consumer introduces axes outside σ's image — that
+    would mean the producer is being asked to redo the same work for
+    unrelated consumer iterations. See design clarification #3."""
+    producer_output_coord_axes = {e.name for e in _producer_write(ctx).index if isinstance(e, Var)}
+    mapped_consumer_axes: set[str] = set()
+    for p_name, r in sigma.items():
+        if p_name not in producer_output_coord_axes:
             continue
-        buf = producer_inputs[ld.source]
-        for dim, expr in enumerate(ld.index):
-            if isinstance(expr, Var):
-                load_patterns.setdefault((buf, dim), set()).add(expr.name)
-
-    aliases: dict[str, Expr] = {}
-    paired_c: set[str] = set()
-
-    for p_ax in candidate_p_axes:
-        p_ax_positions = {pos for pos, axes in load_patterns.items() if p_ax.name in axes}
-        if not p_ax_positions:
+        if isinstance(r, Var):
+            mapped_consumer_axes.add(r.name)
+    # Every axis currently in the consumer's enclosing chain must either be
+    # mapped from a producer output-coord axis OR be literal-pinned in the
+    # producer's Write (i.e. producer iterates over it implicitly by having
+    # extent 1).
+    for c_axis in enclosing_names:
+        if c_axis in mapped_consumer_axes:
             continue
-        for ps in per_load_sigma.values():
-            for p_out_name, reader_expr in ps.items():
-                if p_out_name not in output_coord_axes:
-                    continue
-                if not isinstance(reader_expr, Var):
-                    continue
-                c_ax_name = reader_expr.name
-                if c_ax_name not in consumer_reduce or c_ax_name in paired_c:
-                    continue
-                if int(consumer_reduce[c_ax_name].extent) != int(p_ax.extent):
-                    continue
-                p_out_positions = {pos for pos, axes in load_patterns.items() if p_out_name in axes}
-                if p_ax_positions & p_out_positions:
-                    aliases[p_ax.name] = Var(c_ax_name)
-                    paired_c.add(c_ax_name)
-                    break
-            if p_ax.name in aliases:
-                break
-
-    return aliases
-
-
-def _find_alias(
-    p_ax: Axis,
-    producer: LoopOp,
-    consumer: LoopOp,
-    target_source: int,
-    producer_inputs: list[str],
-    consumer_inputs: list[str],
-    consumer_reduce: dict[str, Axis],
-) -> str | None:
-    for p_load in producer.loads:
-        if p_load.source >= len(producer_inputs):
+        # The axis may correspond to a producer axis via a pinned Literal;
+        # that's fine. If there's no correspondence at all, the consumer is
+        # introducing extra iteration.
+        if _axis_is_broadcastable(c_axis, ctx):
             continue
-        p_buf = producer_inputs[p_load.source]
-        for dim, expr in enumerate(p_load.index):
-            if not (isinstance(expr, Var) and expr.name == p_ax.name):
-                continue
-            for c_load in consumer.loads:
-                if c_load.source == target_source:
-                    continue
-                if c_load.source >= len(consumer_inputs):
-                    continue
-                if consumer_inputs[c_load.source] != p_buf:
-                    continue
-                if dim >= len(c_load.index):
-                    continue
-                c_expr = c_load.index[dim]
-                if not isinstance(c_expr, Var):
-                    continue
-                c_axis = consumer_reduce.get(c_expr.name)
-                if c_axis is None:
-                    continue
-                if int(c_axis.extent) != int(p_ax.extent):
-                    continue
-                return c_axis.name
-    return None
+        raise _NotSupported
+
+
+def _axis_is_broadcastable(c_axis: str, ctx: _Ctx) -> bool:
+    """True if ``c_axis`` is a consumer axis with extent 1 or only used for
+    the spliced Load (which we're replacing anyway)."""
+    for a in ctx.consumer.axes:
+        if a.name == c_axis and int(a.extent) == 1:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
-# Name collection + fresh-name tables
+# Producer inspection helpers — on-demand walks, no precomputed analysis
 # ---------------------------------------------------------------------------
 
 
-def _collect_ssa_names(op: LoopOp) -> set[str]:
-    names: set[str] = set()
-    for stmt in flatten_body(op.body):
-        if isinstance(stmt, (Assign, Load, Select, Accum)):
-            names.add(stmt.name)
-    return names
+def _producer_write(ctx: _Ctx) -> Write:
+    for s in _iter_all(ctx.producer.body):
+        if isinstance(s, Write) and s.output == 0:
+            return s
+    raise _NotSupported
 
 
-def _fresh_names(to_rename: set[str], taken: set[str]) -> dict[str, str]:
-    """Map original→fresh for names in ``to_rename`` that collide with ``taken``.
-    Names without collision get no entry (identity)."""
-    result: dict[str, str] = {}
-    used = set(taken)
-    for name in to_rename:
-        if name not in used:
-            used.add(name)
-            continue
-        candidate = name
-        suffix = 1
-        while candidate in used:
-            candidate = f"{name}_p{suffix}"
-            suffix += 1
-        result[name] = candidate
-        used.add(candidate)
-    return result
+def _producer_axis_names(ctx: _Ctx) -> set[str]:
+    return {a.name for a in ctx.producer.axes}
 
 
-# ---------------------------------------------------------------------------
-# Producer body split: row-space vs element-space template
-# ---------------------------------------------------------------------------
+def _producer_defs(ctx: _Ctx) -> dict[str, Stmt]:
+    """Collect producer SSA definitions (flat, ignoring Loop scope).
+
+    This is safe for our use because the producer's SSA names are unique
+    across the tree (enforced by LoopOp validator)."""
+    defs: dict[str, Stmt] = {}
+    for s in _iter_all(ctx.producer.body):
+        if isinstance(s, (Load, Assign, Select, Accum)):
+            defs[s.name] = s
+    return defs
 
 
-def _split_producer_body(
-    body: tuple[Stmt, ...],
-    write: Write,
-) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
-    """Split producer's body into ``(row_stmts, element_template)``.
+def _find_accum_scope(producer: LoopOp, accum_name: str) -> _AccumDecl | None:
+    """Walk the producer body to find the Accum named ``accum_name``,
+    returning its scoping information (reduce axis, enclosing free axes,
+    and the immediate reduce-Loop body)."""
+    result: list[_AccumDecl] = []
 
-    The Write is elided. Stmts that feed the Write's value (via SSA dep
-    flooding inside the Write's scope, stopping at Accum names which
-    cross scopes as accumulator bindings) form the element-space
-    template. Stmts that feed Accums (or don't feed the Write) form
-    row-space.
-
-    Loops that iterate output-coord axes (axes appearing as ``Var`` in
-    the Write's index) are unwrapped in the element-space template —
-    the replay substitutes those axes per-site. Loops whose bodies are
-    purely row-space stay wrapped in row_stmts.
-    """
-    output_coord_axes: set[str] = set()
-    for e in write.index:
-        if isinstance(e, Var):
-            output_coord_axes.add(e.name)
-
-    def split(stmts: tuple[Stmt, ...]) -> tuple[list[Stmt], list[Stmt]]:
-        write_idx: int | None = None
-        for i, s in enumerate(stmts):
-            if isinstance(s, Write) and s.output == 0 and s is write:
-                write_idx = i
-                break
-
-        row_out: list[Stmt] = []
-        element_flat: list[Stmt] = []
-
-        if write_idx is not None:
-            # This scope owns the Write. Flood locally from write.value
-            # via SSA args of Assign/Select; stop at Loads (leaves) and at
-            # names not defined in this scope (Accum names from outer).
-            local_defs: dict[str, Stmt] = {}
-            for s in stmts:
-                if isinstance(s, (Assign, Load, Select)):
-                    local_defs[s.name] = s
-
-            element_names: set[str] = set()
-            to_visit = [write.value]
-            while to_visit:
-                n = to_visit.pop()
-                if n in element_names or n not in local_defs:
-                    continue
-                element_names.add(n)
-                defn = local_defs[n]
-                if isinstance(defn, Assign):
-                    for a in defn.args:
-                        to_visit.append(a)
-                elif isinstance(defn, Select):
-                    for b in defn.branches:
-                        to_visit.append(b.value)
-
-            for i, s in enumerate(stmts):
-                if i == write_idx:
-                    continue  # elide Write
-                if isinstance(s, Loop):
-                    inner_row, inner_element = split(s.body)
-                    if inner_row:
-                        row_out.append(Loop(axis=s.axis, body=tuple(inner_row)))
-                    if inner_element:
-                        if s.axis.name in output_coord_axes:
-                            element_flat.extend(inner_element)
-                        else:
-                            element_flat.append(Loop(axis=s.axis, body=tuple(inner_element)))
-                elif isinstance(s, (Assign, Load, Select)) and s.name in element_names:
-                    element_flat.append(s)
+    def walk(stmts: tuple[Stmt, ...], enclosing: tuple[Axis, ...]) -> None:
+        for s in stmts:
+            if isinstance(s, Loop):
+                is_reduce = any(isinstance(ss, Accum) for ss in s.body)
+                if is_reduce:
+                    for ss in s.body:
+                        if isinstance(ss, Accum) and ss.name == accum_name:
+                            result.append(
+                                _AccumDecl(
+                                    name=accum_name,
+                                    reduce_axis=s.axis,
+                                    enclosing_axes=enclosing,
+                                    body=s.body,
+                                )
+                            )
+                            return
+                    # Nested reduce scanning: not currently emitted, but
+                    # walk in case future producers nest.
+                    walk(s.body, enclosing + (s.axis,))
                 else:
-                    row_out.append(s)
-            return row_out, element_flat
+                    walk(s.body, enclosing + (s.axis,))
+            # ignore non-Loop sibling stmts (Accum should always be inside a Loop)
 
-        # No Write at this scope: recurse into Loops to locate it below.
-        for s in stmts:
-            if isinstance(s, Loop):
-                inner_row, inner_element = split(s.body)
-                if inner_row:
-                    row_out.append(Loop(axis=s.axis, body=tuple(inner_row)))
-                if inner_element:
-                    if s.axis.name in output_coord_axes:
-                        element_flat.extend(inner_element)
-                    else:
-                        element_flat.append(Loop(axis=s.axis, body=tuple(inner_element)))
-            else:
-                row_out.append(s)
-        return row_out, element_flat
-
-    row_stmts, element_template = split(body)
-    return tuple(row_stmts), tuple(element_template)
+    walk(producer.body, ())
+    return result[0] if result else None
 
 
-# ---------------------------------------------------------------------------
-# Element-space replay (per consumer Load)
-# ---------------------------------------------------------------------------
-
-
-def _referenced_ssa_names(stmts: tuple[Stmt, ...]) -> set[str]:
-    """Every SSA name read inside ``stmts`` (Assign.args, Accum.value,
-    Select.branches.value, Write.value)."""
-    names: set[str] = set()
+def _iter_all(stmts: tuple[Stmt, ...]):
+    """Iterate every stmt in the tree (depth-first, no scope tracking)."""
     for s in stmts:
+        yield s
         if isinstance(s, Loop):
-            names |= _referenced_ssa_names(s.body)
-        elif isinstance(s, Assign):
-            names |= set(s.args)
-        elif isinstance(s, Accum):
-            names.add(s.value)
-        elif isinstance(s, Select):
-            for b in s.branches:
-                names.add(b.value)
-        elif isinstance(s, Write):
-            names.add(s.value)
+            yield from _iter_all(s.body)
+
+
+# ---------------------------------------------------------------------------
+# Name collection
+# ---------------------------------------------------------------------------
+
+
+def _collect_names(op: LoopOp) -> set[str]:
+    """All SSA names plus all axis names in ``op``."""
+    names: set[str] = set()
+    for s in _iter_all(op.body):
+        if isinstance(s, (Load, Assign, Select, Accum)):
+            names.add(s.name)
+        if isinstance(s, Loop):
+            names.add(s.axis.name)
     return names
 
 
-def _accum_defining_scopes(row_stmts: tuple[Stmt, ...]) -> dict[str, set[str]]:
-    """For each ``Accum`` name defined in ``row_stmts``, return the set of
-    enclosing Loop axis names **outside** the Accum's own reduce Loop —
-    i.e. the scope in which the finalized accumulator is usable."""
-    result: dict[str, set[str]] = {}
-
-    def walk(stmts: tuple[Stmt, ...], enclosing: tuple[str, ...]) -> None:
-        for s in stmts:
-            if isinstance(s, Loop):
-                walk(s.body, enclosing + (s.axis.name,))
-            elif isinstance(s, Accum):
-                # The Accum is finalized after its enclosing reduce Loop
-                # exits — that's one axis up from here.
-                scope = set(enclosing[:-1]) if enclosing else set()
-                result.setdefault(s.name, scope)
-
-    walk(row_stmts, ())
-    return result
-
-
-def _axes_in_template(template: tuple[Stmt, ...]) -> set[str]:
-    """Collect every axis name referenced via ``Var`` inside the template's
-    Expr fields (Load indices, Select predicates, Loop axis names)."""
-    axes: set[str] = set()
-
-    def walk_expr(expr: object) -> None:
-        if isinstance(expr, Var):
-            axes.add(expr.name)
-            return
-        for attr in ("left", "right", "cond", "if_true", "if_false", "expr"):
-            child = getattr(expr, attr, None)
-            if child is not None:
-                walk_expr(child)
-        children = getattr(expr, "args", None)
-        if isinstance(children, (list, tuple)):
-            for c in children:
-                walk_expr(c)
-
-    def walk_stmts(stmts: tuple[Stmt, ...]) -> None:
-        for s in stmts:
-            if isinstance(s, Load):
-                for e in s.index:
-                    walk_expr(e)
-            elif isinstance(s, Select):
-                for b in s.branches:
-                    walk_expr(b.select)
-            elif isinstance(s, Loop):
-                axes.add(s.axis.name)
-                walk_stmts(s.body)
-
-    walk_stmts(template)
-    return axes
-
-
-def _replay_element_template(
-    template: tuple[Stmt, ...],
-    axis_sub: dict[str, Expr],
-    suffix: str,
-    write_value_name: str,
-) -> tuple[tuple[Stmt, ...], str]:
-    """Emit a per-Load replay of the element-space template.
-
-    Substitutes producer axis Vars per ``axis_sub`` (post-consumer_sigma
-    — so consumer renames are already applied in the mapped exprs) and
-    freshens every SSA name with ``suffix``. Returns the replay stmts
-    plus the final (freshened) SSA name that the dropped target Load
-    should alias to.
-    """
-    ssa_rename: dict[str, str] = {}
-
-    def rn(name: str) -> str:
-        return ssa_rename.get(name, name)
-
-    def walk(stmts: tuple[Stmt, ...]) -> list[Stmt]:
-        result: list[Stmt] = []
-        for s in stmts:
-            if isinstance(s, Load):
-                new_name = s.name + suffix
-                ssa_rename[s.name] = new_name
-                result.append(
-                    Load(
-                        name=new_name,
-                        source=s.source,
-                        index=tuple(substitute(e, axis_sub) for e in s.index),
-                    )
-                )
-            elif isinstance(s, Assign):
-                new_name = s.name + suffix
-                ssa_rename[s.name] = new_name
-                result.append(Assign(name=new_name, op=s.op, args=tuple(rn(a) for a in s.args)))
-            elif isinstance(s, Select):
-                new_name = s.name + suffix
-                ssa_rename[s.name] = new_name
-                result.append(
-                    Select(
-                        name=new_name,
-                        branches=tuple(SelectBranch(value=rn(b.value), select=substitute(b.select, axis_sub)) for b in s.branches),
-                    )
-                )
-            elif isinstance(s, Loop):
-                result.append(Loop(axis=s.axis, body=tuple(walk(s.body))))
-            else:
-                result.append(s)
-        return result
-
-    out = tuple(walk(template))
-    final_name = ssa_rename.get(write_value_name, write_value_name)
-    return out, final_name
-
-
 # ---------------------------------------------------------------------------
-# Producer free-loop reorder (pre-walk alignment)
+# Small utilities
 # ---------------------------------------------------------------------------
 
 
-def _consumer_depths(body: tuple[Stmt, ...]) -> dict[str, int]:
-    """Record the nesting depth of every ``Loop`` in the consumer body
-    (pre-order). Duplicate axis names — rare under normal lift/merge —
-    resolve to the outermost occurrence."""
-    depths: dict[str, int] = {}
+def _partition_pendings(
+    pendings: list[_PendingAccum],
+    enclosing_names: tuple[str, ...],
+) -> tuple[list[_PendingAccum], list[_PendingAccum]]:
+    """Split pendings into (flush-here, bubble-up).
 
-    def walk(stmts: tuple[Stmt, ...], depth: int) -> None:
-        for s in stmts:
-            if isinstance(s, Loop):
-                depths.setdefault(s.axis.name, depth)
-                walk(s.body, depth + 1)
-
-    walk(body, 0)
-    return depths
-
-
-def _align_producer_free_chain(
-    producer_body: tuple[Stmt, ...],
-    consumer_body: tuple[Stmt, ...],
-    producer_to_consumer_axis: dict[str, str],
-    reduce_axis_names: frozenset[str],
-) -> tuple[Stmt, ...]:
-    """Permute producer's outer free-loop chain so σ-matched axes sit at
-    the same depth as their consumer partners.
-
-    The chain is the top run of singleton-body Loops that aren't reduce
-    loops. For each axis in the chain, the target depth is the consumer
-    depth of its σ partner (producer axes without a Var-valued σ entry
-    sort to the end). Stable sort keeps the relative order of axes with
-    the same target.
+    - ``required_c_axes == enclosing_names`` → flush here.
+    - ``required_c_axes`` is a strict prefix of enclosing_names → bubble up.
+    - otherwise (longer, or non-prefix mismatch) → NotSupported.
     """
-    chain: list[Axis] = []
-    current = producer_body
-    while len(current) == 1 and isinstance(current[0], Loop):
-        loop = current[0]
-        if loop.axis.name in reduce_axis_names:
-            break
-        chain.append(loop.axis)
-        current = loop.body
+    here: list[_PendingAccum] = []
+    up: list[_PendingAccum] = []
+    for p in pendings:
+        if p.required_c_axes == enclosing_names:
+            here.append(p)
+        elif _is_strict_prefix(p.required_c_axes, enclosing_names):
+            up.append(p)
+        else:
+            raise _NotSupported
+    return here, up
 
-    if len(chain) < 2:
-        return producer_body
 
-    consumer_depth = _consumer_depths(consumer_body)
-    sentinel = len(consumer_depth) + len(chain)
+def _is_strict_prefix(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    return len(a) < len(b) and b[: len(a)] == a
 
-    def target(axis: Axis) -> int:
-        c = producer_to_consumer_axis.get(axis.name)
-        if c is None:
-            return sentinel
-        return consumer_depth.get(c, sentinel)
 
-    reordered = sorted(chain, key=target)
-    if [a.name for a in reordered] == [a.name for a in chain]:
-        return producer_body
-
-    result: tuple[Stmt, ...] = current
-    for axis in reversed(reordered):
-        result = (Loop(axis=axis, body=result),)
-    return result
+def _c_axis_name(r: Expr | None, ctx: _Ctx) -> str | None:
+    """Extract a consumer axis name from a σ value. Only bare ``Var``s are
+    supported (affine binding forms would need more work)."""
+    if r is None:
+        return None
+    if isinstance(r, Var):
+        return r.name
+    return None
