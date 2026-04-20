@@ -23,7 +23,7 @@ from deplodock.compiler.ir.kernel_ir import (
     IfStmt,
     VarDecl,
 )
-from deplodock.compiler.ir.loop_ir import Assign, Axis, Loop, LoopOp, Port, Write
+from deplodock.compiler.ir.loop_ir import Assign, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.simplify import (
     Context,
     Interval,
@@ -289,23 +289,24 @@ def test_kernel_walker_idempotent():
 # ---------------------------------------------------------------------------
 
 
-def test_loop_op_walker_simplifies_port_index():
-    """Port index (a0 + 0) * 1 simplifies to a0 under axis range info."""
-    assign = Assign("v", ElementwiseOp(fn="neg"), ("$0",))
+def test_loop_op_walker_simplifies_load_index():
+    """Body Load index (a0 + 0) * 1 simplifies to a0 under axis range info."""
+    load = Load(name="x", source=0, index=(BinOp("*", BinOp("+", Var("a0"), _int(0)), _int(1)),))
+    assign = Assign("v", ElementwiseOp(fn="neg"), ("x",))
     write = Write(0, (Var("a0"),), "v")
-    loop = Loop(Axis("a0", 8), (assign, write))
-    port = Port(index=(BinOp("*", BinOp("+", Var("a0"), _int(0)), _int(1)),))
-    op = LoopOp(inputs=(port,), body=(loop,))
+    loop = Loop(Axis("a0", 8), (load, assign, write))
+    op = LoopOp(body=(loop,))
     simplified = simplify_loop_op(op)
-    assert simplified.inputs[0].index == (Var("a0"),)
+    simplified_load = simplified.loads[0]
+    assert simplified_load.index == (Var("a0"),)
 
 
 def test_loop_op_walker_idempotent():
-    assign = Assign("v", ElementwiseOp(fn="neg"), ("$0",))
+    load = Load(name="x", source=0, index=(BinOp("+", Var("a0"), _int(0)),))
+    assign = Assign("v", ElementwiseOp(fn="neg"), ("x",))
     write = Write(0, (Var("a0"),), "v")
-    loop = Loop(Axis("a0", 8), (assign, write))
-    port = Port(index=(BinOp("+", Var("a0"), _int(0)),))
-    op = LoopOp(inputs=(port,), body=(loop,))
+    loop = Loop(Axis("a0", 8), (load, assign, write))
+    op = LoopOp(body=(loop,))
     once = simplify_loop_op(op)
     twice = simplify_loop_op(once)
     assert once == twice

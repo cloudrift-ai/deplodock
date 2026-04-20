@@ -7,7 +7,7 @@ here; nothing recomputes them.
 
 The pairing:
 
-    ir/loop_ir.py   : LoopOp, Axis, Port, Assign                    (structural IR)
+    ir/loop_ir.py   : LoopOp, Axis, Load, Assign, Accum             (structural IR)
     program/loop.py: LoopBuffer, LoopLaunch, LoopProgram          (program form)
 
     ir/kernel_ir.py    : GpuKernel, GpuKernelParam, Stmts               (structural IR)
@@ -58,8 +58,9 @@ class LoopLaunch:
     non-2-axis ``TransposeOp``, ``GatherOp``). CudaBackend only handles
     ``LoopOp`` launches and raises otherwise.
 
-    ``input_names`` is in buffer / Port order — the i-th Port reads
-    ``input_names[i]``. ``output_name`` identifies the buffer written.
+    ``input_names`` is in source order — the body-form ``Load`` stmts
+    with ``source=i`` read ``input_names[i]``. ``output_name`` identifies
+    the buffer written.
     """
 
     loop: Op
@@ -101,23 +102,22 @@ class LoopProgram:
         """Shape of the buffer written by ``launch``."""
         return self.shape(launch.output_name)
 
-    def dollar_shapes(self, launch: LoopLaunch) -> dict[str, tuple]:
-        """Map ``$N`` → external buffer shape for ``launch``'s Ports.
+    def source_shapes(self, launch: LoopLaunch) -> dict[int, tuple]:
+        """Map ``Load.source`` → external buffer shape for ``launch``.
 
-        For each Port position, returns the shape of the external buffer
-        bound to that position. Effective "body-visible" shapes (which may
-        differ under broadcast/transpose via ``Port.index``) are derived
-        by callers from the axes + Port.index pattern if needed.
+        For each body Load source index, returns the shape of the bound
+        external buffer. Effective "body-visible" shapes (which may differ
+        under broadcast/transpose via ``Load.index``) are derived by callers
+        from the axes + Load.index pattern if needed.
         """
-        out: dict[str, tuple] = {}
+        out: dict[int, tuple] = {}
         if not isinstance(launch.loop, LoopOp):
             return out
-        for i in range(len(launch.loop.inputs)):
-            key = f"${i}"
+        for i in range(launch.loop.num_inputs):
             if i < len(launch.input_names):
-                out[key] = self.shape(launch.input_names[i])
+                out[i] = self.shape(launch.input_names[i])
             else:
-                out[key] = ()
+                out[i] = ()
         return out
 
     # ── pretty-printing ──────────────────────────────────────────────

@@ -3,9 +3,10 @@
 After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
-    inputs : tuple[Port, ...]   — computed property derived from body Loads
     body   : tuple[Stmt, ...]   — SSA: Assign | Accum | Write | Select | Loop | Load
     axes   : computed property  — iteration space walked from body's Loop tree
+    loads  : computed property  — body-form Load stmts (external reads)
+    accums : computed property  — Accum stmts seeded from the body
 
 Iteration is explicit via ``Loop(axis, body)`` statements. Each ``Loop``
 is one iteration dimension; ``Loop.body`` runs ``axis.extent`` times.
@@ -37,7 +38,7 @@ from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 class Axis:
     """One named iteration variable at the loop level.
 
-    Referenced from ``Expr`` subtrees (inside ``Port.index`` etc.) by
+    Referenced from ``Expr`` subtrees (inside ``Load.index`` etc.) by
     ``Var(name)``. Free vs reduce is inferred structurally from the body:
     a ``Loop`` over this axis is a reduce loop iff its body (recursively)
     contains an ``Accum``. See ``LoopOp.reduce_axis_names``.
@@ -51,24 +52,6 @@ class Axis:
 
 
 # ---------------------------------------------------------------------------
-# Port — external-buffer access pattern
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Port:
-    """Access pattern for one external input buffer.
-
-    ``index`` is a tuple of ``Expr`` — one per dimension of the external
-    buffer. Each Expr computes the offset into its buffer dim from the
-    enclosing ``LoopOp.axes`` (via ``Var(axis_name)``), possibly combined
-    with literals and arithmetic for transposes, broadcasts, slices.
-    """
-
-    index: tuple[Expr, ...] = ()
-
-
-# ---------------------------------------------------------------------------
 # Body statements
 # ---------------------------------------------------------------------------
 
@@ -77,12 +60,11 @@ class Port:
 class Load:
     """Read a value from an external input buffer into an SSA name.
 
-    Replaces the ``$N`` port-reference convention: instead of a side-channel
-    ``LoopOp.inputs`` tuple whose entries are indexed by string sentinels,
-    each read becomes an explicit statement in the body. ``source`` is the
-    index into ``LoopLaunch.input_names`` identifying which external buffer;
-    ``index`` is the dim-wise access pattern over the enclosing axes.
-    The produced SSA ``name`` is a regular value downstream stmts read.
+    Each external-buffer read is an explicit body statement. ``source`` is
+    the index into ``LoopLaunch.input_names`` identifying which external
+    buffer; ``index`` is the dim-wise access pattern over the enclosing
+    axes. The produced SSA ``name`` is a regular value downstream stmts
+    read.
     """
 
     name: str
@@ -238,13 +220,12 @@ Stmt = Assign | Accum | Write | Select | Loop | Load
 class LoopOp(Op):
     """One kernel's worth of computation as an SSA program over named axes.
 
-    ``axes`` is a computed property over the body's ``Loop`` tree — the tree
-    is the single source of truth. See the :attr:`axes` docstring for the
-    collection order. ``loads`` and ``accums`` are computed properties
-    derived from body-form ``Load`` and ``Accum`` statements.
+    ``body`` is the sole stored field: a tuple of nested ``Loop`` blocks
+    with leaf ``Load`` / ``Assign`` / ``Accum`` / ``Write`` / ``Select``
+    statements. ``axes``, ``loads``, ``accums``, and ``num_inputs`` are
+    computed properties derived from that tree.
     """
 
-    inputs: tuple[Port, ...] = ()
     body: tuple[Stmt, ...] = ()
 
     def __post_init__(self) -> None:
@@ -399,67 +380,50 @@ class LoopOp(Op):
 def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: str = "") -> str:
     """Render a ``LoopOp`` as an explicit nested-loop program.
 
-    Each ``Loop`` block renders as ``for X in 0..N:  # kind``. ``$N`` port
-    references (from legacy test fixtures that still emit them) are
-    rendered as ``buf[...]`` when ``port_buffers`` is supplied, otherwise
-    as ``$N[...]`` with the port's index exprs inlined.
+    Each ``Loop`` block renders as ``for X in 0..N:  # kind``. Body Loads
+    render as ``name = load buf[index...]`` where ``buf`` is the matching
+    entry in ``port_buffers`` (when supplied) or a ``$source`` fallback.
     """
-    ports = loop.inputs
-    # Buffer names used when rendering Load stmts and $N port refs.
-    nbufs = max(len(ports), loop.num_inputs)
+    nbufs = loop.num_inputs
     buffers = list(port_buffers) if port_buffers else [f"${i}" for i in range(nbufs)]
     while len(buffers) < nbufs:
         buffers.append(f"${len(buffers)}")
-    accs_by_name: dict[str, Accum] = {d.name: d for d in loop.accums}
-
-    def render_arg(name: str) -> str:
-        if name.startswith("$"):
-            try:
-                pi = int(name[1:])
-            except ValueError:
-                return name
-            if 0 <= pi < len(ports):
-                idx = ", ".join(render_expr(e) for e in ports[pi].index)
-                return f"{buffers[pi]}[{idx}]" if idx else buffers[pi]
-        return name
 
     lines: list[str] = []
-    _render_body(loop.body, indent, accs_by_name, render_arg, buffers, lines)
+    _render_body(loop.body, indent, buffers, lines)
     return "\n".join(lines)
 
 
 def _render_body(
     stmts: tuple[Stmt, ...],
     indent: str,
-    accs_by_name: dict[str, Accum],
-    render_arg,
     buffers: list[str],
     lines: list[str],
 ) -> None:
     """Render a body tuple (recursive for nested ``Loop``)."""
     for stmt in stmts:
         if isinstance(stmt, Assign):
-            args = ", ".join(render_arg(a) for a in stmt.args)
+            args = ", ".join(stmt.args)
             lines.append(f"{indent}{stmt.name} = {stmt.op.fn}({args})")
         elif isinstance(stmt, Load):
             buf = buffers[stmt.source] if 0 <= stmt.source < len(buffers) else f"src{stmt.source}"
             idx = ", ".join(render_expr(e) for e in stmt.index)
             lines.append(f"{indent}{stmt.name} = load {buf}[{idx}]")
         elif isinstance(stmt, Accum):
-            lines.append(f"{indent}{stmt.name} <- {stmt.op.fn}({stmt.name}, {render_arg(stmt.value)})")
+            lines.append(f"{indent}{stmt.name} <- {stmt.op.fn}({stmt.name}, {stmt.value})")
         elif isinstance(stmt, Write):
             idx = ", ".join(render_expr(e) for e in stmt.index)
-            lines.append(f"{indent}out{stmt.output}[{idx}] = {render_arg(stmt.value)}")
+            lines.append(f"{indent}out{stmt.output}[{idx}] = {stmt.value}")
         elif isinstance(stmt, Select):
             for bi, br in enumerate(stmt.branches):
                 prefix = f"{stmt.name} =" if bi == 0 else f"{' ' * len(stmt.name)}  "
-                lines.append(f"{indent}{prefix} {render_arg(br.value)} when ({render_expr(br.select)})")
+                lines.append(f"{indent}{prefix} {br.value} when ({render_expr(br.select)})")
         elif isinstance(stmt, Loop):
             a = stmt.axis
             # Kind is structural: a Loop whose immediate body contains an Accum is a reduce Loop.
             kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
             lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {kind}")
-            _render_body(stmt.body, indent + "    ", accs_by_name, render_arg, buffers, lines)
+            _render_body(stmt.body, indent + "    ", buffers, lines)
 
 
 # ---------------------------------------------------------------------------
@@ -491,13 +455,6 @@ def _validate(loop: LoopOp) -> None:
             raise ValueError(f"Accumulator: duplicate name {info.name!r}")
         seen_accums[info.name] = info
 
-    # Kernel-scope names (visible everywhere): $N ports (legacy form, used by
-    # a few test fixtures that still spell args as ``$0``). Body-level Load
-    # / Accum targets become in-scope names as the walk encounters them.
-    # Accum.name also populates the enclosing scope after its Loop
-    # returns — handled by merging inner-scope accumulator targets back out.
-    kernel_scope: set[str] = {f"${i}" for i in range(len(loop.inputs))}
-
     # Op-consistency across repeated Updates to same target.
     target_ops: dict[str, ElementwiseOp] = {}
 
@@ -522,11 +479,11 @@ def _validate(loop: LoopOp) -> None:
                     raise ValueError(f"Assign {stmt.name!r}: name already defined")
                 defined.add(stmt.name)
             elif isinstance(stmt, Load):
-                # Load is a binding site — introduces its SSA name. Source-index
-                # bounds check happens here only when the legacy inputs field is
-                # populated; otherwise num_inputs is self-derived from Loads.
-                if loop.inputs and (stmt.source < 0 or stmt.source >= len(loop.inputs)):
-                    raise ValueError(f"Load {stmt.name!r}: source {stmt.source} out of range 0..{len(loop.inputs)}")
+                # Load is a binding site — introduces its SSA name. ``source``
+                # indexes into ``LoopLaunch.input_names`` at the program level,
+                # which is checked against the launch's input count there.
+                if stmt.source < 0:
+                    raise ValueError(f"Load {stmt.name!r}: source {stmt.source} must be non-negative")
                 if stmt.name in defined:
                     raise ValueError(f"Load {stmt.name!r}: name already defined")
                 defined.add(stmt.name)
@@ -560,7 +517,7 @@ def _validate(loop: LoopOp) -> None:
                 exported_accs.update(inner_exports)
         return exported_accs
 
-    _walk(loop.body, set(kernel_scope))
+    _walk(loop.body, set())
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +600,7 @@ def flat_body_to_nested(
     # If caller didn't specify reduce axis names but the body has Updates,
     # infer from body structure: axes that appear in the Write index are
     # free; axes that appear ONLY on the Accum's data flow (via some
-    # Assign/Port reference) but NOT in any Write index are reduce axes.
+    # Assign/Load reference) but NOT in any Write index are reduce axes.
     # This matches the historical signature where ``Axis.kind`` encoded
     # the distinction. Singleton axes (extent 1) that don't appear in the
     # Write are treated as free (degenerate) rather than reduce — the

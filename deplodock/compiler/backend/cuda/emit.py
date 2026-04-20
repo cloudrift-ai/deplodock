@@ -29,7 +29,7 @@ from deplodock.compiler.ir.kernel_ir import (
 from deplodock.compiler.ir.kernel_ir import (
     Assign as IrAssign,
 )
-from deplodock.compiler.ir.loop_ir import Accum, Axis, Load, LoopOp, Port, Select
+from deplodock.compiler.ir.loop_ir import Accum, Axis, Load, LoopOp, Select
 from deplodock.compiler.ir.loop_ir import Assign as IrAssignStmt
 from deplodock.compiler.ir.simplify import simplify_kernel
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
@@ -100,21 +100,21 @@ def compile_kernels(program: LoopProgram, dump: CompilerDump | None = None) -> G
 
 
 def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int = -1) -> list[str]:
-    """Symbolically check whether any Port.index can go out of bounds.
+    """Symbolically check whether any body ``Load.index`` can go out of bounds.
 
     For each per-dim index Expr, compute the maximum value attained over
     all combinations of axis extents and compare against the source
-    buffer's dim extent. Ports that are only referenced inside ``Select``
+    buffer's dim extent. Loads that are only referenced inside ``Select``
     branches have their bounds evaluated *under* the branch's predicate —
     the rotary ``rotate_half`` pattern (two halves each reading a slice of
     a D-wide tensor and disjoint on ``axis < D/2``/``>=D/2``) is correctly
     recognized as in-bounds because the predicate constrains the axis.
 
     Returns a list of human-readable OOB warnings (empty when the kernel
-    is in-bounds). CUDA codegen clamps port reads via
-    ``min(max(coord, 0), extent-1)`` regardless, so OOB findings are
-    informational — they flag kernels where some predicate is expected to
-    mask the stray load but the checker couldn't prove it.
+    is in-bounds). CUDA codegen clamps reads via ``min(max(coord, 0),
+    extent-1)`` regardless, so OOB findings are informational — they flag
+    kernels where some predicate is expected to mask the stray load but
+    the checker couldn't prove it.
     """
     from deplodock.compiler.ir.loop_ir import Select
 
@@ -125,34 +125,35 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
     axes_extents = {a.name: int(a.extent) - 1 for a in loop.axes}
     buf_name_set = {b.name for b in program.buffers}
 
-    # Collect Select predicates gating each port (by SSA name ``$N``).
-    # Tracks *transitive* gating: if an SSA name is computed from a port and
-    # then used as a Select branch value, the port inherits that branch's
-    # predicate. Needed for the rotary rotate_half pattern, where the port is
-    # wrapped in an Assign (``v1 = neg($5)``) before reaching the Select.
+    # Collect Select predicates gating each Load by SSA name. Tracks
+    # *transitive* gating: if an SSA name is computed from a Load and then
+    # used as a Select branch value, the Load inherits that branch's
+    # predicate. Needed for the rotary rotate_half pattern, where the Load
+    # is wrapped in an Assign (``v1 = neg(x_lo)``) before reaching the Select.
     from deplodock.compiler.ir.loop_ir import Assign, flatten_body
 
     flat = list(flatten_body(loop.body))
+    load_names = {ld.name for ld in loop.loads}
 
-    # ssa_port_deps[name] = set of ``$N`` refs that name reads (transitively).
-    ssa_port_deps: dict[str, set[str]] = {}
+    # ssa_load_deps[name] = set of Load SSA names that name reads (transitively).
+    ssa_load_deps: dict[str, set[str]] = {}
 
-    def _port_deps_of_arg(arg: str) -> set[str]:
-        if arg.startswith("$"):
+    def _load_deps_of_arg(arg: str) -> set[str]:
+        if arg in load_names:
             return {arg}
-        return ssa_port_deps.get(arg, set())
+        return ssa_load_deps.get(arg, set())
 
     for stmt in flat:
         if isinstance(stmt, Assign):
             deps: set[str] = set()
             for arg in stmt.args:
-                deps |= _port_deps_of_arg(arg)
-            ssa_port_deps[stmt.name] = deps
+                deps |= _load_deps_of_arg(arg)
+            ssa_load_deps[stmt.name] = deps
         elif isinstance(stmt, Select):
             deps = set()
             for br in stmt.branches:
-                deps |= _port_deps_of_arg(br.value)
-            ssa_port_deps[stmt.name] = deps
+                deps |= _load_deps_of_arg(br.value)
+            ssa_load_deps[stmt.name] = deps
 
     select_preds: dict[str, list[Expr]] = {}
     for stmt in flat:
@@ -161,27 +162,26 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
                 # Skip always-true fallback predicates — they add no constraint.
                 if isinstance(branch.select, Literal) and branch.select.value:
                     continue
-                # Apply this branch's predicate to every port the branch's value
-                # depends on (direct ``$N`` or transitively via SSA).
-                for port_ref in _port_deps_of_arg(branch.value):
-                    select_preds.setdefault(port_ref, []).append(branch.select)
+                # Apply this branch's predicate to every Load the branch's value
+                # depends on (direct or transitively via SSA).
+                for load_ref in _load_deps_of_arg(branch.value):
+                    select_preds.setdefault(load_ref, []).append(branch.select)
 
-    for pi, port in enumerate(loop.inputs):
-        buf_name = launch.input_names[pi] if pi < len(launch.input_names) else None
+    for ld in loop.loads:
+        buf_name = launch.input_names[ld.source] if ld.source < len(launch.input_names) else None
         if buf_name is None or buf_name not in buf_name_set:
             continue
         src_shape = tuple(int(d) for d in program.shape(buf_name))
-        port_key = f"${pi}"
-        preds = select_preds.get(port_key, [])
-        # Per-port axis bounds, tightened by each predicate (conservatively:
-        # if any predicate proves tighter bounds for this port, use them).
+        preds = select_preds.get(ld.name, [])
+        # Per-Load axis bounds, tightened by each predicate (conservatively:
+        # if any predicate proves tighter bounds for this Load, use them).
         tight_axes = _tighten_axes_from_preds(axes_extents, preds) if preds else axes_extents
 
-        for d, idx_expr in enumerate(port.index):
+        for d, idx_expr in enumerate(ld.index):
             if d >= len(src_shape):
                 warnings.append(
-                    f"launch {launch_idx} ({launch.output_name}): port ${pi} ({buf_name} shape={src_shape}) "
-                    f"has index rank {len(port.index)} > buf rank {len(src_shape)}"
+                    f"launch {launch_idx} ({launch.output_name}): load {ld.name!r} ({buf_name} shape={src_shape}) "
+                    f"has index rank {len(ld.index)} > buf rank {len(src_shape)}"
                 )
                 continue
             max_coord = _max_index_value(idx_expr, tight_axes)
@@ -189,7 +189,7 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
                 continue
             if max_coord >= src_shape[d]:
                 warnings.append(
-                    f"launch {launch_idx} ({launch.output_name}): port ${pi} ({buf_name} shape={src_shape}) "
+                    f"launch {launch_idx} ({launch.output_name}): load {ld.name!r} ({buf_name} shape={src_shape}) "
                     f"reads out of bounds at dim {d}: max_index={max_coord}, dim_extent={src_shape[d]}, "
                     f"expr={idx_expr}"
                 )
@@ -311,10 +311,9 @@ def _max_index_value(expr: Expr, axis_max: dict[str, int]) -> int | None:
 
 def emit_kernel(launch: LoopLaunch, kernel_name: str, program: LoopProgram) -> tuple[GpuKernel, list[str]]:
     """Emit one ``GpuKernel`` for a single ``LoopLaunch``."""
-    dollar_shapes = program.dollar_shapes(launch)
     out_shape = program.output_shape(launch)
     params, arg_order = _build_params(launch)
-    body, block_size = _emit_body(launch, out_shape, dollar_shapes, program)
+    body, block_size = _emit_body(launch, out_shape, program)
     kd = GpuKernel(name=kernel_name, params=params, body=body, block_size=block_size)
     return kd, arg_order
 
@@ -362,8 +361,8 @@ def _axis_env_for_reduce(axes: tuple[Axis, ...], reduce_names: frozenset[str], r
     return env
 
 
-def _emit_port_load(port: Port, buf_name: str, src_shape: tuple, axis_env: dict[str, Expr]) -> Expr:
-    """Evaluate ``port.index`` under ``axis_env`` and emit an ArrayAccess.
+def _emit_load_access(index: tuple, buf_name: str, src_shape: tuple, axis_env: dict[str, Expr]) -> Expr:
+    """Evaluate a Load's ``index`` under ``axis_env`` and emit an ArrayAccess.
 
     Each per-dim coord is clamped to ``[0, dim_extent-1]`` via
     ``max(0, min(coord, extent-1))`` so that out-of-bounds reads from
@@ -372,9 +371,9 @@ def _emit_port_load(port: Port, buf_name: str, src_shape: tuple, axis_env: dict[
     already bounded (a single Var matching the dim's extent) skip the
     clamp to keep the emitted code tight.
     """
-    if not port.index:
+    if not index:
         return ArrayAccess(array=buf_name, index=Literal(0, "int"))
-    coords = [substitute(e, axis_env) for e in port.index]
+    coords = [substitute(e, axis_env) for e in index]
     coords = [_clamp_coord(c, src_shape[d] if d < len(src_shape) else None) for d, c in enumerate(coords)]
     flat = _flatten_coords(coords, src_shape)
     return ArrayAccess(array=buf_name, index=flat)
@@ -423,19 +422,17 @@ def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
 # ---------------------------------------------------------------------------
 
 
-def _emit_body(
-    launch: LoopLaunch, out_shape: tuple, dollar_shapes: dict[str, tuple], program: LoopProgram
-) -> tuple[list[Stmt], tuple[int, int, int]]:
+def _emit_body(launch: LoopLaunch, out_shape: tuple, program: LoopProgram) -> tuple[list[Stmt], tuple[int, int, int]]:
     from deplodock.compiler.ir.loop_plan import analyze_kernel
 
-    plan = analyze_kernel(launch.loop, dollar_shapes, out_shape)
+    plan = analyze_kernel(launch.loop, out_shape)
     idx = Var("tid")
     idx_init = VarDecl(
         dtype="long long",
         name="tid",
         init=BinOp("+", BinOp("*", Var("blockIdx.x"), Var("blockDim.x")), Var("threadIdx.x")),
     )
-    guarded = _emit_plan(plan, launch, dollar_shapes, program, idx)
+    guarded = _emit_plan(plan, launch, program, idx)
     stmts: list[Stmt] = [idx_init, IfStmt(cond=BinOp("<", idx, Literal(plan.n_output, "int")), body=guarded)]
     return stmts, (_BLOCK, 1, 1)
 
@@ -445,7 +442,7 @@ def _emit_body(
 # ---------------------------------------------------------------------------
 
 
-def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], program: LoopProgram, idx: Expr) -> list[Stmt]:
+def _emit_plan(plan, launch: LoopLaunch, program: LoopProgram, idx: Expr) -> list[Stmt]:
     from deplodock.compiler.ir.loop_plan import Inline, Loop
 
     loop: LoopOp = launch.loop
@@ -453,16 +450,16 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
     name_seq = [0]
     values: dict[str, Expr] = {}
 
-    port_info = _collect_port_info(loop, launch, program, dollar_shapes)
+    source_info = _collect_source_info(loop, launch, program)
 
     reduce_names = loop.reduce_axis_names
     free_axes = tuple(a for a in loop.axes if a.name not in reduce_names)
     flat_env = _axis_env_for_flat(free_axes, idx)
 
-    # Port loads materialize through body-form ``Load`` stmts at their
-    # actual scope (Inline prelude, K-loop body, or post-reduce). The
-    # ``load_env`` is threaded forward as Loads emit so a later Load's
-    # index can reference an earlier Load's SSA value (gather).
+    # Body-form ``Load`` stmts materialize at their scope (Inline prelude,
+    # K-loop body, or post-reduce). The ``load_env`` is threaded forward as
+    # Loads emit so a later Load's index can reference an earlier Load's SSA
+    # value (gather).
     load_env: dict[str, Expr] = dict(flat_env)
 
     loop_count = 0
@@ -481,13 +478,11 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
                     stmts.append(VarDecl(dtype="float", name=tname, init=value))
                     values[stmt.name] = Var(tname)
                 elif isinstance(stmt, Load):
-                    # Body-form Load: emit a port-load expression via the same
-                    # machinery _collect_port_info feeds. Later Loads can
-                    # reference this Load's SSA name in their index (gather),
-                    # so thread the binding back into ``load_env``.
-                    key = f"${stmt.source}"
-                    port, buf_name, src_shape = port_info[key]
-                    expr = _emit_port_load(Port(index=stmt.index), buf_name, src_shape, load_env)
+                    # Body-form Load: emit the access expression directly.
+                    # Later Loads can reference this one's SSA name in their
+                    # index (gather), so thread the binding into ``load_env``.
+                    buf_name, src_shape = source_info[stmt.source]
+                    expr = _emit_load_access(stmt.index, buf_name, src_shape, load_env)
                     tname = _fresh(name_seq)
                     stmts.append(VarDecl(dtype="float", name=tname, init=expr))
                     values[stmt.name] = Var(tname)
@@ -505,10 +500,6 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
 
             axis_env = _axis_env_for_reduce(loop.axes, reduce_names, idx, k_var)
 
-            for key, (port, buf_name, src_shape) in port_info.items():
-                if key in plan.per_elem_ports:
-                    loop_values[key] = _emit_port_load(port, buf_name, src_shape, axis_env)
-
             for assign in step.recompute:
                 arg_exprs = [loop_values[a] for a in assign.args]
                 value = _apply_elementwise(assign.op.fn, arg_exprs)
@@ -520,9 +511,8 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
                 if isinstance(stmt, Select):
                     value = _emit_select(stmt, loop_values, axis_env)
                 elif isinstance(stmt, Load):
-                    key = f"${stmt.source}"
-                    port, buf_name, src_shape = port_info[key]
-                    value = _emit_port_load(Port(index=stmt.index), buf_name, src_shape, axis_env)
+                    buf_name, src_shape = source_info[stmt.source]
+                    value = _emit_load_access(stmt.index, buf_name, src_shape, axis_env)
                 else:
                     arg_exprs = [loop_values[a] for a in stmt.args]
                     value = _apply_elementwise(stmt.op.fn, arg_exprs)
@@ -557,21 +547,19 @@ def _emit_plan(plan, launch: LoopLaunch, dollar_shapes: dict[str, tuple], progra
     return stmts
 
 
-def _collect_port_info(
+def _collect_source_info(
     loop: LoopOp,
     launch: LoopLaunch,
     program: LoopProgram,
-    dollar_shapes: dict[str, tuple],
-) -> dict[str, tuple[Port, str, tuple]]:
-    """Build the $N → (port, buffer_name, source_shape) mapping for codegen."""
-    port_info: dict[str, tuple[Port, str, tuple]] = {}
+) -> dict[int, tuple[str, tuple]]:
+    """Build source_index → (buffer_name, source_shape) for Load emission."""
+    source_info: dict[int, tuple[str, tuple]] = {}
     buf_name_set = {b.name for b in program.buffers}
-    for i, port in enumerate(loop.inputs):
-        key = f"${i}"
-        buf_name = launch.input_names[i] if i < len(launch.input_names) else key
-        src_shape = program.shape(buf_name) if buf_name in buf_name_set else dollar_shapes.get(key, ())
-        port_info[key] = (port, buf_name, src_shape)
-    return port_info
+    for i in range(loop.num_inputs):
+        buf_name = launch.input_names[i] if i < len(launch.input_names) else f"buf{i}"
+        src_shape = program.shape(buf_name) if buf_name in buf_name_set else ()
+        source_info[i] = (buf_name, src_shape)
+    return source_info
 
 
 def _expr_refs_any_name(expr: Expr, names: set[str]) -> bool:

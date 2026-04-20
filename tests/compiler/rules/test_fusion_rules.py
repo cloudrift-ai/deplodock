@@ -16,7 +16,7 @@ import numpy as np
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Accum, Assign, LoopOp, Port, Write
+from deplodock.compiler.ir.loop_ir import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass
 
@@ -118,10 +118,14 @@ def test_pointwise_chain_body_ops():
     assert "exp" in body_ops
 
 
-def test_pointwise_chain_inputs_are_ports():
+def test_pointwise_chain_inputs_are_loads():
+    from deplodock.compiler.ir.loop_ir import Load
+
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
-    assert all(isinstance(inp, Port) for inp in kernel.op.inputs)
+    loads = kernel.op.loads
+    assert len(loads) >= 1
+    assert all(isinstance(ld, Load) for ld in loads)
 
 
 def test_pointwise_chain_has_write():
@@ -309,11 +313,6 @@ def test_ssa_invariants_hold():
     for k in _kernel_nodes(result):
         # Re-validate explicitly
         defined = set()
-        port_idx = 0
-        for inp in k.op.inputs:
-            if isinstance(inp, Port):
-                defined.add(f"${port_idx}")
-                port_idx += 1
         for decl in k.op.accums:
             defined.add(decl.name)
         from deplodock.compiler.ir.loop_ir import Accum, Load

@@ -21,7 +21,7 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Load, LoopOp, Port, Select, Write
+from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Load, LoopOp, Select, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -94,23 +94,17 @@ def execute_loop_op(
 ) -> np.ndarray:
     """Numpy interpreter for one ``LoopOp``.
 
-    ``input_arrays[i]`` is the external buffer that feeds ``loop.inputs[i]``
-    (the ``$i`` Port). ``out_shape`` is the shape of the output buffer the
-    kernel writes into. Returns an ndarray of shape ``out_shape``.
+    ``input_arrays[i]`` is the external buffer indexed by ``Load.source == i``
+    in the body. ``out_shape`` is the shape of the output buffer the kernel
+    writes into. Returns an ndarray of shape ``out_shape``.
 
     Shared between ``LoopBackend`` (which resolves buffers from a
     ``LoopProgram``) and ``LoopOp.forward`` (which is called directly from
     the graph-level numpy walker).
     """
-    # Keep eager ``_bind_inputs`` as a compatibility path for kernels that
-    # still reference ports via ``$N`` in body args (legacy test fixtures).
-    # Production lift rules all emit body-form Loads; those materialize
-    # inside the statement walk below.
-    dollar = _bind_inputs(loop, input_arrays) if loop.inputs else {}
-
     reduce_names = loop.reduce_axis_names
     reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.name in reduce_names)
-    values: dict[str, np.ndarray] = dict(dollar)
+    values: dict[str, np.ndarray] = {}
     # Accums are body-form reduce accumulator declarations. Each one
     # binds an SSA name that subsequent Updates fold values into.
     acc_map: dict[str, Accum] = {decl.name: decl for decl in loop.accums}
@@ -132,13 +126,11 @@ def execute_loop_op(
             assert isinstance(stmt.op, ElementwiseOp)
             values[stmt.name] = stmt.op.forward(*_align_ranks(args))
         elif isinstance(stmt, Load):
-            # Body-form port read: mirror what _bind_inputs does for $N.
-            # Resolve the source index to an external buffer and apply the
-            # Load's access pattern.
+            # Body-form port read: resolve the source index to an external
+            # buffer and apply the Load's access pattern.
             if stmt.source >= len(input_arrays):
                 raise ValueError(f"Load source {stmt.source} out of range (have {len(input_arrays)} inputs)")
-            port_equiv = Port(index=stmt.index)
-            values[stmt.name] = _apply_port_index(port_equiv, input_arrays[stmt.source], loop.axes, values)
+            values[stmt.name] = _apply_load_index(stmt.index, input_arrays[stmt.source], loop.axes, values)
         elif isinstance(stmt, Accum):
             # Fold the value into the accumulator. Init happens above via
             # the accums walk; each Accum folds per-iteration.
@@ -185,9 +177,6 @@ def execute_loop_op(
                         break
                     arr = np.squeeze(arr, axis=size1[-1])
                 return arr.reshape(out_shape)
-    if dollar:
-        arr = np.asarray(next(iter(dollar.values())), dtype=np.float32)
-        return arr.reshape(out_shape)
     raise ValueError("LoopOp produced no output")
 
 
@@ -297,46 +286,34 @@ def _write_output(
         output_array[...] = val
 
 
-def _bind_inputs(loop: LoopOp, input_arrays: list[np.ndarray]) -> dict[str, np.ndarray]:
-    """Bind each ``$i`` port to a broadcast-ready array.
+def _apply_load_index(
+    index: tuple,
+    base: np.ndarray,
+    axes: tuple[Axis, ...],
+    bindings: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Return the array a Load reads from ``base`` under this kernel's axes.
 
-    Ports load in declaration order; each loaded value is exposed as
-    ``$i`` to later ports so data-dependent access patterns (e.g. gather)
-    can reference an earlier port's value in their index Expr.
-
-    Ports whose index references an SSA name that hasn't been bound yet
-    (a body-form ``Load`` will emit the value later) are skipped; the
-    body walker handles them on demand.
+    ``bindings`` is the running SSA-name → ndarray map; earlier Loads' values
+    are exposed so data-dependent access patterns (e.g. gather's ``Cast(int,
+    Var("idx"))``) can reference them in this Load's index Expr.
     """
-    dollar: dict[str, np.ndarray] = {}
-    body_load_names: set[str] = {ld.name for ld in loop.loads}
-    for i, port in enumerate(loop.inputs):
-        if any(_references_ssa(e, body_load_names) for e in port.index):
-            continue
-        dollar[f"${i}"] = _apply_port_index(port, input_arrays[i], loop.axes, dollar)
-    return dollar
-
-
-def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...], dollar: dict[str, np.ndarray]) -> np.ndarray:
-    """Return the array the body sees for this Port (rank == len(axes))."""
-    if not port.index:
+    if not index:
         return base
 
     axis_names = {a.name for a in axes}
     used_axes: set[str] = set()
-    for e in port.index:
+    for e in index:
         _collect_used_axis_names(e, axis_names, used_axes)
 
-    # A reference to another port's loaded value — via ``$N`` (legacy) or a
-    # body-form Load's SSA name (bound in ``dollar``) — implicitly spans the
-    # full iter shape; conservatively extend used_axes to cover all axes.
-    ssa_names: set[str] = {k for k in dollar if not k.startswith("$")}
-    if any(_references_dollar(e) or _references_ssa(e, ssa_names) for e in port.index):
+    # A reference to an earlier Load's SSA name implicitly spans the full
+    # iter shape; conservatively extend used_axes to cover all axes.
+    if any(_references_ssa(e, set(bindings)) for e in index):
         used_axes = set(axis_names)
 
     bshape = tuple(int(a.extent) if a.name in used_axes else 1 for a in axes)
 
-    if _is_identity(port, axes, base.shape):
+    if _is_identity_index(index, axes, base.shape):
         return base.reshape(bshape)
 
     axis_env: dict[str, object] = {}
@@ -347,11 +324,11 @@ def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...], doll
             axis_env[a.name] = np.arange(int(a.extent)).reshape(shape)
         else:
             axis_env[a.name] = 0
-    # Expose earlier ports' loaded values so e.g. gather can reference ``$0``.
-    axis_env.update(dollar)
+    # Expose earlier Loads' values so e.g. gather can reference the loaded idx.
+    axis_env.update(bindings)
 
     coord_arrs = []
-    for dim, e in enumerate(port.index):
+    for dim, e in enumerate(index):
         arr = e.eval(axis_env)
         if isinstance(arr, np.ndarray):
             arr = np.broadcast_to(arr, bshape).astype(np.intp)
@@ -369,12 +346,12 @@ def _apply_port_index(port: Port, base: np.ndarray, axes: tuple[Axis, ...], doll
     return base[tuple(coord_arrs)]
 
 
-def _is_identity(port: Port, axes: tuple[Axis, ...], base_shape: tuple) -> bool:
+def _is_identity_index(index: tuple, axes: tuple[Axis, ...], base_shape: tuple) -> bool:
     axis_names_by_position: dict[str, int] = {a.name: i for i, a in enumerate(axes)}
-    if len(port.index) != len(base_shape):
+    if len(index) != len(base_shape):
         return False
     prev_pos = -1
-    for i, e in enumerate(port.index):
+    for i, e in enumerate(index):
         if not isinstance(e, Var):
             return False
         pos = axis_names_by_position.get(e.name)
@@ -384,20 +361,6 @@ def _is_identity(port: Port, axes: tuple[Axis, ...], base_shape: tuple) -> bool:
             return False
         prev_pos = pos
     return True
-
-
-def _references_dollar(expr) -> bool:
-    """True if ``expr`` contains any ``Var($N)`` reference to a prior port."""
-    if isinstance(expr, Var):
-        return expr.name.startswith("$")
-    for attr in ("left", "right", "cond", "if_true", "if_false", "expr"):
-        c = getattr(expr, attr, None)
-        if c is not None and _references_dollar(c):
-            return True
-    args = getattr(expr, "args", None)
-    if isinstance(args, (list, tuple)):
-        return any(_references_dollar(a) for a in args)
-    return False
 
 
 def _references_ssa(expr, ssa_names: set[str]) -> bool:

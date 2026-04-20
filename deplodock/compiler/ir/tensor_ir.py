@@ -299,8 +299,8 @@ class IndexMapOp(Op):
                     continue
                 in_coords = tuple(int(c.eval(env)) for c in source.coord_map)
                 input_tensor = inputs[source.input_idx]
-                # Clip coords to valid range. After fusion, a Port's IndexMap
-                # may produce out-of-bounds coords when the consuming Mux
+                # Clip coords to valid range. After fusion, a Load's IndexMap
+                # may produce out-of-bounds coords when the consuming Select
                 # masks the range to another branch — reading garbage is
                 # safe because the value is never used. CUDA emits direct
                 # reads without bounds-checking for the same reason.

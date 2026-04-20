@@ -26,10 +26,10 @@
 │       + graph_inputs/outputs/constants/constant_values                                                               │
 │                                                                                                                      │
 │  Each LoopOp (ir/loop_ir.py) is one GPU kernel as an SSA program:                                                       │
-│      axes   (tuple[Axis, ...])        — named iteration variables                                                    │
-│      inputs (tuple[Port, ...])        — per-input access patterns                                                    │
+│      body   (tuple[Stmt, ...])        — Assign | Accum | Write | Select | Loop | Load (sole stored field)            │
+│      axes   (tuple[Axis, ...])        — iteration space (computed from body's Loop tree)                             │
+│      loads  (tuple[Load, ...])        — body-form external reads (computed from body)                                │
 │      accums (tuple[Accum, ...])       — reduce accumulators (computed from body)                                     │
-│      body   (tuple[Stmt, ...])        — Assign | Accum | Write | Select                                              │
 │  Reductions = ``Accum`` stmts inside a reduce ``Loop``; writes are inline.                                           │
 │                                                                                                                      │
 │  RULE: Operates on Graph + Loop IR only. No backend imports.                                                         │
@@ -98,13 +98,13 @@ defined-before-use, no forward references.
 | Slot                                         | Type                                      | Used for                                                       |
 |----------------------------------------------|-------------------------------------------|----------------------------------------------------------------|
 | `Axis.name` / `extent` / `kind`              | `str` / `int` / `"free"                   | One iteration variable; reduce axes pair with accumulators     |
-| `Port.index`                                 | `tuple[Expr, ...]`                        | Per-input-dim access pattern over axis Vars                    |
+| `Load.name` / `source` / `index`             | `str` / `int` / `tuple[Expr, ...]`        | Body-form external read: ``name = load src[index...]``          |
 | `Accum.name` / `value` / `op`                | `str` / `str` / `ElementwiseOp`           | Reduce fold: ``name = op(name, value)`` inside a reduce Loop   |
 | `Assign.op`                                  | `ElementwiseOp`                           | Pure SSA body op; ReduceOp is NOT valid here                   |
 | `Write.output` / `index` / `value`           | `int` / `tuple[Expr, ...]` / `str`        | Inline store at a position                                     |
 | `Select.branches[i].value` / `select`        | `str` / `Expr`                            | Coord-predicated SSA binding (replaces old Mux)                |
-| `LoopOp.axes` / `inputs` / `accums` / `body` | 4 tuples                                  | Iteration + access patterns + state + SSA statements           |
-| `LoopLaunch.input_names`                     | `list[str]`                               | Per-Port external buffer name (program-level)                  |
+| `LoopOp.body`                                | `tuple[Stmt, ...]`                        | Sole stored field; `axes` / `loads` / `accums` are computed    |
+| `LoopLaunch.input_names`                     | `list[str]`                               | Per-source external buffer name (indexed by `Load.source`)     |
 | `LoopLaunch.output_name`                     | `str`                                     | External buffer written by this LoopOp                         |
 
 Analogies (use in module/class docstrings):
@@ -145,19 +145,21 @@ Lift-then-merge, driven by the rewriter's fixpoint loop:
 1. **Lift each tensor op into a trivial one-op ``LoopOp``** — one rule
    per tensor op (``001_lift_elementwise``, ``002_lift_reduce``,
    ``003_lift_indexmap``, ``004_lift_gather``). Each produces a kernel
-   whose iteration space matches its op's natural shape, with Ports
-   expressing the input access pattern directly as ``Expr``s over axis
-   Vars. Reductions contribute one ``Accum`` statement inside a reduce
-   ``Loop`` over the reduction axis; multi-source IndexMapOps (cat /
-   concat) contribute a ``Select`` prelude choosing among per-source Ports.
+   whose iteration space matches its op's natural shape, with body-form
+   ``Load`` statements expressing each input's access pattern directly
+   as ``Expr``s over axis Vars. Reductions contribute one ``Accum``
+   statement inside a reduce ``Loop`` over the reduction axis;
+   multi-source IndexMapOps (cat / concat) contribute a ``Select``
+   prelude choosing among per-source Loads.
 2. **Merge adjacent ``LoopOp`` pairs** (``005_merge_loop_ops``). The
    grammar matches a ``LoopOp`` whose sole consumer is another
    ``LoopOp``. Merging is defined by a single substitution σ:
    - Solve ``writer.index[k] == reader.index[k]`` at each output dim
-     for every producer axis. Supported forms: direct ``Var(a)``,
-     ``Var(a) ± c``, and ``Literal(0)`` broadcast slots (no binding).
-     Unsupported forms (multiplicative, modular, data-dependent) make
-     the merge return ``None``.
+     for every producer axis; the reader index comes from the consumer
+     body's ``Load`` with the matching ``source``. Supported writer
+     forms: direct ``Var(a)``, ``Var(a) ± c``, and ``Literal(0)``
+     broadcast slots (no binding). Unsupported forms (multiplicative,
+     modular, data-dependent) make the merge return ``None``.
    - Every unbound producer axis must correspond to a reduce Loop in
      the producer's body (i.e. its Loop wraps an Update). A leaking
      free axis would require replicating producer work per consumer
@@ -166,10 +168,11 @@ Lift-then-merge, driven by the rewriter's fixpoint loop:
      pragmatic constraint of ``flat_body_to_nested``'s re-nest path,
      not a semantic limit on fusion. Removing it is gated on a
      backend-side schedule pass that can split multi-reduce kernels.
-   - Axes and SSA names are renamed to avoid collisions; producer
-     Ports are substituted through σ; the producer's connecting
-     ``Write`` becomes ``Assign(bridge, ElementwiseOp("copy"), …)``
-     that the consumer reads in place of the consumed Port.
+   - Axes and SSA names are renamed to avoid collisions; producer Loads
+     have their ``source`` remapped and their ``index`` σ-substituted;
+     the producer's connecting ``Write`` becomes ``Assign(bridge,
+     ElementwiseOp("copy"), …)`` that the consumer's Load SSA name is
+     aliased to.
 3. **Fixpoint** — lift rules fire once per tensor op; merge fires
    repeatedly on adjacent LoopOps. The process terminates because
    every lift consumes one tensor op and every merge consumes two
@@ -185,7 +188,8 @@ concerns:
   keep-dim reductions, ``+``/``-`` offset slices (e.g. rotary
   ``rotate_half``) all fall out of σ-based binding — the consumer's
   reader index and the producer's writer index align affinely, so the
-  producer's Port becomes the merged kernel's Port under the solved σ.
+  producer's Load becomes a body Load in the merged kernel under the
+  solved σ.
 
 ``optimization/002_insert_broadcast_indexmap.py`` survives because it
 addresses a different concern — promoting implicit elementwise
@@ -195,9 +199,9 @@ broadcasts to explicit ``IndexMapOp``s — which merge does not handle.
 
 Walks the SSA body — no classification pass, no `Schedule` dataclass, no `LoopIR` intermediate. Maintains a `values: dict[str, Expr]` mapping Assign names to C expressions.
 
-- `_emit_port_load(port, buf, src_shape, env) -> Expr`: emits `ArrayAccess(buffer, coord)` for a Port.index pattern evaluated in the axis environment. Select statements inside the SSA body are handled separately by `_emit_select`, which lowers `SelectBranch`es into a nested `Ternary` chain.
-- `_emit_body`: unified entry for one kernel body. Calls `ir.loop_plan.analyze_kernel(loop, dollar_shapes, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The same plan powers `LoopProgram.pretty_print_launch` so the dump view mirrors the loop nest codegen emits.
-- `_emit_plan`: walks `plan.steps` — each step is either `Inline` (a straight-line block of `Assign` / `Select` / `Write` / `Accum`) or `Loop` (a K-loop over a reduce axis). Per-element port loads referenced inside a loop are deferred into that loop; other port loads happen upfront. Grid is 1D over flat free-axis extents; block is `(256, 1, 1)` for pure-elementwise plans, `(1, 1, 1)` for plans containing a `Loop` step. Empty bodies (copy kernels) are a pointwise subcase.
+- `_emit_load_access(index, buf, src_shape, env) -> Expr`: emits `ArrayAccess(buffer, coord)` for a body `Load.index` pattern evaluated in the axis environment. Select statements inside the SSA body are handled separately by `_emit_select`, which lowers `SelectBranch`es into a nested `Ternary` chain.
+- `_emit_body`: unified entry for one kernel body. Calls `ir.loop_plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The same plan powers `LoopProgram.pretty_print_launch` so the dump view mirrors the loop nest codegen emits.
+- `_emit_plan`: walks `plan.steps` — each step is either `Inline` (a straight-line block of `Assign` / `Select` / `Write` / `Accum` / `Load`) or `Loop` (a K-loop over a reduce axis). Loads inside a reduce Loop's body materialize inside that loop; Loads in prelude Inline steps happen once per row. Grid is 1D over flat free-axis extents; block is `(256, 1, 1)` for pure-elementwise plans, `(1, 1, 1)` for plans containing a `Loop` step. Empty bodies (copy kernels) are a pointwise subcase.
 - Reductions (single `Loop` step) emit an accumulator init + `Accum` fold; max reductions use `fmaxf` instead of `AugAssign`. Softmax-style cross-iteration patterns (reduce_max → sub+exp → reduce_sum → div) and contractions (mul → reduce_sum) fall out naturally from multiple `Loop` steps recomputing per-element values as needed.
 
 The naive schedule is correctness-first — no shared memory, no async copies, no TMA, no vectorization. Performance work lives in follow-up commits.

@@ -54,13 +54,13 @@ GpuProgram
 
 ## Walkers and Emitters in `emit.py`
 
-The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Assign` / `Update` / `Write` / `Select` statements. Each `Assign` is `name = op(args)` where args reference input Ports by `$N` position or prior `Assign.name`s; the `$N` → buffer name mapping lives on the `LoopLaunch`.
+The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Load` / `Assign` / `Accum` / `Write` / `Select` statements. Each `Assign` is `name = op(args)` where args reference prior SSA names (from Loads, Assigns, Selects); external buffer reads are explicit `Load` stmts keyed by `source` int into `LoopLaunch.input_names`.
 
-**Port loads** (`_emit_port_load(port, buf_name, src_shape, axis_env)`): evaluates `Port.index` in the current axis environment and emits `ArrayAccess(buffer, coord)`. There is no `indexmap` field on `Port` — every IndexMapOp is lifted to a one-op `LoopOp` by `003_lift_indexmap`, and the σ-based merge rule folds the coord_map into the consumer's `Port.index` whenever a merge is legal. Unmerged IndexMap kernels stay as standalone copy kernels.
+**Load emission** (`_emit_load_access(index, buf_name, src_shape, axis_env)`): evaluates `Load.index` in the current axis environment and emits `ArrayAccess(buffer, coord)`. There is no separate indexing abstraction — every IndexMapOp is lifted to a one-op `LoopOp` by `003_lift_indexmap`, and the σ-based merge rule folds the coord_map into the consumer's body Loads whenever a merge is legal. Unmerged IndexMap kernels stay as standalone copy kernels.
 
 **Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a body `Select` into a nested `Ternary` chain over each `SelectBranch.select` predicate. (There is no `Mux` / `Combine` IR — those were replaced by `Select` / `SelectBranch`.)
 
-**Body emitter**: `_emit_body` calls `ir.loop_plan.analyze_kernel(loop, dollar_shapes, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The plan decomposes the body into ordered `Inline` (straight-line block) and `Loop` (K-loop over a reduce axis) steps:
+**Body emitter**: `_emit_body` calls `ir.loop_plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The plan decomposes the body into ordered `Inline` (straight-line block) and `Loop` (K-loop over a reduce axis) steps:
 
 | Pattern                 | Plan shape             | Emission                                                             |
 | ----------------------- | ---------------------- | -------------------------------------------------------------------- |
@@ -74,8 +74,8 @@ Contractions (matmul = mul + sum) fall out of the `Loop` path: the `mul` is an e
 Shapes are read from the `LoopProgram`, never recomputed:
 
 - `program.shape(name)` — per-buffer shape lookup.
-- `program.dollar_shapes(launch)` — `$N → shape` map for a launch's Ports
-  (the external buffer shape bound to each Port position).
+- `program.source_shapes(launch)` — `source → shape` map for a launch's
+  body Loads (the external buffer shape bound to each `Load.source`).
 - `program.output_shape(launch)` — shape of the launch's output buffer.
 
 No fallback call to `LoopOp.infer_output_shape(...)` happens in the
@@ -138,6 +138,6 @@ graph constant) when emitting `GpuBuffer`s.
 - A new backend (ROCm, SYCL, ...) reuses `ir/kernel_ir.py`, `program/gpu.py`,
   and `backend/kernel_codegen.py` wholesale; only its own `emit.py` /
   `program.py` need to be rewritten.
-- The loop-IR types (`LoopOp`, `Port`, `Load`, `Assign`, `Accum`,
+- The loop-IR types (`LoopOp`, `Load`, `Assign`, `Accum`,
   `Write`, `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT
   import from `backend/cuda/` into `ir/loop_ir.py` or `program/loop.py`.

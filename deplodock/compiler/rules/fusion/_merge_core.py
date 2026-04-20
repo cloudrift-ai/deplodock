@@ -1,23 +1,25 @@
 """Core helpers for merging two adjacent ``LoopOp``s.
 
 Given ``producer`` (writes a buffer via a ``Write`` statement) and ``consumer``
-(reads that buffer via one or more ``Port``s), ``merge_loop_ops`` produces a
-single ``LoopOp`` whose iteration space is the consumer's axes plus any
-producer-only reduce axes that survive after axis alignment.
+(reads that buffer via one or more body-form ``Load``s), ``merge_loop_ops``
+produces a single ``LoopOp`` whose iteration space is the consumer's axes
+plus any producer-only reduce axes that survive after axis alignment.
 
 The substitution σ maps each producer axis to an ``Expr`` over consumer axes.
-For each consumer port that reads the producer, σ is solved from the equation
-``writer.index[k] == reader.index[k]`` at each output dim. Supported writer
-forms: direct ``Var(a)``, ``Var(a) ± c``, and ``Literal(0)`` broadcast slots.
+For each consumer source that reads the producer, σ is solved from the
+equation ``writer.index[k] == reader.index[k]`` at each output dim — the
+reader index is pulled from the consumer body's ``Load`` at that source.
+Supported writer forms: direct ``Var(a)``, ``Var(a) ± c``, and ``Literal(0)``
+broadcast slots.
 
-When the consumer reads the producer at *multiple* distinct reader indices
+When the consumer reads the producer at *multiple* distinct sources
 (e.g. softmax, where the sum-reduce kernel reads the max+sub+exp kernel at
 ``[row, col]`` for the post-reduce divide and ``[row, k]`` for the sum
-sweep), each port gets its own σ_k. Producer axes bound identically across
+sweep), each source gets its own σ_k. Producer axes bound identically across
 all σ_k become part of a shared σ_common — the producer's pre-reduce body
 (up to and including the last ``Accum``) is emitted once using σ_common.
 The producer's post-reduce body is instantiated *per σ_k*, with distinct
-SSA names and a distinct bridge value that the matching consumer port ref
+SSA names and a distinct bridge value that the matching consumer Load
 is rewritten to.
 
 Legality (semantic only — scheduling lives in the backend):
@@ -37,7 +39,6 @@ from deplodock.compiler.ir.loop_ir import (
     Axis,
     Load,
     LoopOp,
-    Port,
     Select,
     SelectBranch,
     Stmt,
@@ -74,8 +75,9 @@ def merge_loop_ops(
         return None
     if len(set(consumer_ports)) != len(consumer_ports):
         return None
+    consumer_num_inputs = consumer.num_inputs
     for cp in consumer_ports:
-        if cp < 0 or cp >= len(consumer.inputs):
+        if cp < 0 or cp >= consumer_num_inputs:
             return None
 
     # Flatten nested Loop blocks — merge operates on the linear stmt sequence.
@@ -94,10 +96,22 @@ def merge_loop_ops(
     consumer_axis_by_name = {a.name: a for a in consumer.axes}
     producer_reduce_names = producer.reduce_axis_names
 
-    # Solve σ per consumer port, applying axis aliases.
+    # Per-source reader index: producer→consumer connections materialize in the
+    # consumer body as one or more ``Load`` stmts sharing a source. Under our
+    # current 1:1 Load:source invariant (post-merge replication keeps this),
+    # ``consumer_loads_by_source[cp]`` yields the single reader index for σ.
+    consumer_loads_by_source: dict[int, tuple[Expr, ...]] = {}
+    for stmt in consumer_flat:
+        if isinstance(stmt, Load) and stmt.source not in consumer_loads_by_source:
+            consumer_loads_by_source[stmt.source] = stmt.index
+
+    # Solve σ per consumer source, applying axis aliases.
     sigmas: dict[int, dict[str, Expr]] = {}
     for cp in consumer_ports:
-        s = _solve_sigma(write.index, consumer.inputs[cp].index, producer_axis_names)
+        reader_index = consumer_loads_by_source.get(cp)
+        if reader_index is None:
+            return None
+        s = _solve_sigma(write.index, reader_index, producer_axis_names)
         if s is None:
             return None
         if axis_aliases:
@@ -166,21 +180,12 @@ def merge_loop_ops(
     # Pre-reduce stmts may only reference bound_common / aliased / unbound axes —
     # never specific_names (which disagree across σ_k). Enforcing this keeps the
     # Accum emission unambiguous. "Reference" here includes the axes that
-    # appear in the index Expr of any Port the stmt reads via `$N`, and the
-    # axes that appear in any body-form Load.index expression — both
-    # materialize under σ_k substitution and so must not drift across σ_k.
+    # appear in any body-form Load.index expression and any Write / Select
+    # predicate — all materialize under σ_k substitution and so must not drift
+    # across σ_k.
     if specific_names:
-        # Collect per-port axis dependencies.
-        port_axes: dict[int, set[str]] = {}
-        for j, port in enumerate(producer.inputs):
-            used: set[str] = set()
-            for e in port.index:
-                _collect_expr_axes(e, used)
-            port_axes[j] = used
         for stmt in pre_reduce_stmts:
             if _stmt_refs_axes(stmt, specific_names):
-                return None
-            if _stmt_port_refs_axes(stmt, port_axes, specific_names):
                 return None
             if isinstance(stmt, Load):
                 load_axes: set[str] = set()
@@ -206,24 +211,26 @@ def merge_loop_ops(
 
     merged_axes = tuple(consumer.axes) + tuple(Axis(name=axis_rename[a.name], extent=a.extent) for a in unbound_axes)
 
-    # Build merged ports: consumer ports (minus consumer_ports) first, then
-    # a set of producer ports per σ_k (σ_k-substituted).
-    merged_ports: list[Port] = []
+    # Renumber source indices for the merged kernel: consumer non-consumed
+    # sources first, then one fresh slot per (σ_k, producer source). The body
+    # Loads carry the σ-substituted indices via ``_rewrite_body``; this map is
+    # what ``port_remap`` consults to rewrite each Load's ``source``.
+    next_source = 0
     consumer_port_remap: dict[int, int] = {}
     consumer_port_set = set(consumer_ports)
-    for i, p in enumerate(consumer.inputs):
+    producer_num_inputs = producer.num_inputs
+    for i in range(consumer_num_inputs):
         if i in consumer_port_set:
             continue
-        merged_ports.append(p)
-        consumer_port_remap[i] = len(merged_ports) - 1
+        consumer_port_remap[i] = next_source
+        next_source += 1
 
     producer_port_remap_per_cp: dict[int, dict[int, int]] = {}
     for cp in consumer_ports:
-        s = sigmas[cp]
         remap: dict[int, int] = {}
-        for j, p in enumerate(producer.inputs):
-            merged_ports.append(Port(index=tuple(substitute(e, s) for e in p.index)))
-            remap[j] = len(merged_ports) - 1
+        for j in range(producer_num_inputs):
+            remap[j] = next_source
+            next_source += 1
         producer_port_remap_per_cp[cp] = remap
 
     # Track all defined names in the merged kernel for fresh-name generation.
@@ -267,7 +274,7 @@ def merge_loop_ops(
 
         bridge = _fresh_name(f"v_bridge_cp{cp}", taken_names)
         taken_names.add(bridge)
-        bridge_value = _rename_ssa_arg(write.value, producer_port_remap_per_cp[cp], local_rename, ssa_rename_k)
+        bridge_value = _rename_ssa_arg(write.value, local_rename, ssa_rename_k)
         post_rewritten = _rewrite_body(
             post_reduce_stmts,
             sigma=s,
@@ -280,48 +287,36 @@ def merge_loop_ops(
         instantiated_bridges[cp] = bridge
         return bridge
 
-    # Walk consumer body, rewriting $i references. For consumed ports, trigger
-    # σ_k instantiation (which appends stmts to body before the current one).
-    def rewrite_arg(arg: str) -> str:
-        if not arg.startswith("$"):
-            return arg
-        try:
-            idx = int(arg[1:])
-        except ValueError:
-            return arg
-        if idx in consumer_port_set:
-            return instantiate_for_cp(idx)
-        if idx in consumer_port_remap:
-            return f"${consumer_port_remap[idx]}"
-        return arg
+    # Walk consumer body, rewriting Load references. For consumed sources,
+    # trigger σ_k instantiation and alias the Load's SSA name directly to
+    # the bridge value (no extra copy stmt — downstream refs are rewritten
+    # via ``load_alias``).
+    load_alias: dict[str, str] = {}
+
+    def rename(a: str) -> str:
+        return load_alias.get(a, a)
 
     for stmt in consumer_flat:
         if isinstance(stmt, Assign):
-            new_args = tuple(rewrite_arg(a) for a in stmt.args)
-            body.append(Assign(name=stmt.name, op=stmt.op, args=new_args))
+            body.append(Assign(name=stmt.name, op=stmt.op, args=tuple(rename(a) for a in stmt.args)))
         elif isinstance(stmt, Load):
             if stmt.source in consumer_port_set:
-                # Consumer is reading the producer via a body-form Load.
-                # Instantiate the producer's body once (lazily, σ_k keyed on
-                # source) and bind the Load's SSA name to the bridge value
-                # via a copy. This parallels how the $N path's rewrite_arg
-                # triggers instantiation at each reference.
                 bridge = instantiate_for_cp(stmt.source)
-                body.append(Assign(name=stmt.name, op=ElementwiseOp("copy"), args=(bridge,)))
+                load_alias[stmt.name] = bridge
             else:
-                # Consumer Load of its own external input: remap the source
-                # index through consumer_port_remap to account for dropped
-                # consumed ports.
                 new_source = consumer_port_remap.get(stmt.source, stmt.source)
                 body.append(Load(name=stmt.name, source=new_source, index=stmt.index))
         elif isinstance(stmt, Accum):
-            new_value = rewrite_arg(stmt.value)
-            body.append(Accum(name=stmt.name, value=new_value, op=stmt.op))
+            body.append(Accum(name=stmt.name, value=rename(stmt.value), op=stmt.op))
         elif isinstance(stmt, Write):
-            body.append(Write(output=stmt.output, index=stmt.index, value=rewrite_arg(stmt.value)))
+            body.append(Write(output=stmt.output, index=stmt.index, value=rename(stmt.value)))
         elif isinstance(stmt, Select):
-            new_branches = tuple(SelectBranch(value=rewrite_arg(br.value), select=br.select) for br in stmt.branches)
-            body.append(Select(name=stmt.name, branches=new_branches))
+            body.append(
+                Select(
+                    name=stmt.name,
+                    branches=tuple(SelectBranch(value=rename(b.value), select=b.select) for b in stmt.branches),
+                )
+            )
 
     # Re-nest the flat merged body into the nested Loop-block form.
     from deplodock.compiler.ir.loop_ir import flat_body_to_nested
@@ -330,10 +325,7 @@ def merge_loop_ops(
     # unbound reduce axes (renamed via axis_rename).
     merged_reduce_names = set(consumer.reduce_axis_names) | {axis_rename[a.name] for a in unbound_axes}
     nested = flat_body_to_nested(tuple(merged_axes), tuple(body), merged_reduce_names)
-    return LoopOp(
-        inputs=tuple(merged_ports),
-        body=nested,
-    )
+    return LoopOp(body=nested)
 
 
 # ---------------------------------------------------------------------------
@@ -483,11 +475,6 @@ def _all_defined_names(
 
 
 # ---------------------------------------------------------------------------
-# Port / local merging
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Axis-reference helpers
 # ---------------------------------------------------------------------------
 
@@ -499,8 +486,8 @@ def _stmt_refs_axes(stmt: Stmt, axis_names: set[str]) -> bool:
     if isinstance(stmt, Select):
         return any(_expr_refs_axes(br.select, axis_names) for br in stmt.branches)
     # Assign and Accum don't reference axes directly — their args are SSA
-    # names. Axis references only live in Port index exprs and in Write /
-    # Select expressions.
+    # names. Axis references live in Load.index, Write.index, and Select
+    # branch predicates; Load is checked separately by the caller.
     return False
 
 
@@ -524,31 +511,6 @@ def _collect_expr_axes(expr: Expr, out: set[str]) -> None:
         _collect_expr_axes(expr.expr, out)
 
 
-def _stmt_port_refs_axes(stmt: Stmt, port_axes: dict[int, set[str]], axis_names: set[str]) -> bool:
-    """Return True if any ``$N`` reference in ``stmt`` reads a Port whose
-    index expressions include any axis in ``axis_names``."""
-    args: tuple[str, ...] = ()
-    if isinstance(stmt, Assign):
-        args = stmt.args
-    elif isinstance(stmt, Accum):
-        args = (stmt.value,)
-    elif isinstance(stmt, Write):
-        args = (stmt.value,)
-    elif isinstance(stmt, Select):
-        args = tuple(br.value for br in stmt.branches)
-    for arg in args:
-        if not arg.startswith("$"):
-            continue
-        try:
-            idx = int(arg[1:])
-        except ValueError:
-            continue
-        axes_used = port_axes.get(idx, set())
-        if axes_used & axis_names:
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Body rewrite
 # ---------------------------------------------------------------------------
@@ -563,7 +525,7 @@ def _rewrite_body(
     ssa_rename: dict[str, str],
     replace_write: dict[int, Stmt] | None = None,
 ) -> list[Stmt]:
-    """Apply σ to every Expr, remap ``$N`` refs, rename locals and SSA names.
+    """Apply σ to every Expr, remap Load sources, rename locals and SSA names.
 
     ``replace_write`` maps ``id(Write)`` → replacement statement; used to swap
     the connecting Write for an Assign binding the bridge SSA value.
@@ -572,7 +534,7 @@ def _rewrite_body(
     result: list[Stmt] = []
 
     def rn(arg: str) -> str:
-        return _rename_ssa_arg(arg, port_remap, local_rename, ssa_rename)
+        return _rename_ssa_arg(arg, local_rename, ssa_rename)
 
     for stmt in body:
         if isinstance(stmt, Assign):
@@ -628,21 +590,12 @@ def _rewrite_body(
 
 def _rename_ssa_arg(
     arg: str,
-    port_remap: dict[int, int],
     local_rename: dict[str, str],
     ssa_rename: dict[str, str],
 ) -> str:
     """Rewrite a body-statement argument reference under the merge's rename maps."""
     if arg in ssa_rename:
         return ssa_rename[arg]
-    if arg.startswith("$"):
-        try:
-            idx = int(arg[1:])
-        except ValueError:
-            return arg
-        if idx in port_remap:
-            return f"${port_remap[idx]}"
-        return arg
     if arg in local_rename:
         return local_rename[arg]
     return arg

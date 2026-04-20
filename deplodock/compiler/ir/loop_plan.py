@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.loop_ir import Accum as IrAccum
-from deplodock.compiler.ir.loop_ir import Assign, Load, LoopOp, Port, Select, Stmt, Write
+from deplodock.compiler.ir.loop_ir import Assign, Load, LoopOp, Select, Stmt, Write
 from deplodock.compiler.ir.loop_ir import Loop as LoopStmt
 
 # ---------------------------------------------------------------------------
@@ -75,7 +75,6 @@ class KernelPlan:
     """Everything codegen needs to emit a reduce/contraction kernel."""
 
     steps: tuple[Step, ...]
-    per_elem_ports: frozenset[str]
     n_output: int  # thread count: elements for flat, rows for reduce
     trailing_writes: tuple[TrailingWrite, ...] = ()
 
@@ -85,7 +84,7 @@ class KernelPlan:
 # ---------------------------------------------------------------------------
 
 
-def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -> KernelPlan:
+def analyze_kernel(kernel: LoopOp, out_shape: tuple) -> KernelPlan:
     """Analyze a kernel's nested-``Loop`` body and produce a ``KernelPlan``.
 
     Walks the body tree: descends outer free ``Loop`` blocks to find the
@@ -95,7 +94,6 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     / post-reduce Inline or Loop-with-stores, direct ``Write`` children
     become ``TrailingWrite``s.
     """
-    input_ports = _collect_input_ports(kernel)
     inner_body = _descend_free_loops(kernel.body, kernel)
     reduce_axis_names = kernel.reduce_axis_names
     reduce_loops = [s for s in inner_body if isinstance(s, LoopStmt) and s.axis.name in reduce_axis_names]
@@ -113,20 +111,13 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         k_size = 0
         n_output = _numel(out_shape)
 
-    # --- Classify ports as per-element (references reduce axis) vs per-row ---
-    if has_reduce:
-        per_elem_ports = frozenset(name for name, port in input_ports.items() if _port_references_axis(port, reduce_axis_names))
-    else:
-        per_elem_ports = frozenset()
-
     # --- Classify all SSA values as element-space or row-space (tree-wide) ---
     from deplodock.compiler.ir.loop_ir import flatten_body
 
     flat_all = tuple(flatten_body(kernel.body))
     accumulator_names = {decl.name for decl in kernel.accums}
-    row_space: set[str] = {name for name in input_ports if name not in per_elem_ports}
-    row_space |= accumulator_names
-    elem_space: set[str] = set(per_elem_ports)
+    row_space: set[str] = set(accumulator_names)
+    elem_space: set[str] = set()
 
     reduce_names_for_classify: set[str] = set(kernel.reduce_axis_names)
     for stmt in flat_all:
@@ -142,7 +133,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
                 elem_space.add(stmt.name)
         elif isinstance(stmt, Load):
             # Load is elem-space iff its index touches any reduce axis.
-            if _port_references_axis(Port(index=stmt.index), reduce_names_for_classify):
+            if _index_references_axis(stmt.index, reduce_names_for_classify):
                 elem_space.add(stmt.name)
             else:
                 row_space.add(stmt.name)
@@ -159,7 +150,6 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         steps: list[Step] = [Inline(body=tuple(inline_body))] if inline_body else []
         return KernelPlan(
             steps=tuple(steps),
-            per_elem_ports=per_elem_ports,
             n_output=n_output,
             trailing_writes=tuple(trailing_writes),
         )
@@ -235,7 +225,6 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
 
     return KernelPlan(
         steps=tuple(steps),
-        per_elem_ports=per_elem_ports,
         n_output=n_output,
         trailing_writes=tuple(trailing_writes),
     )
@@ -357,14 +346,9 @@ def _reduce_loop_to_steps(
 # ---------------------------------------------------------------------------
 
 
-def _collect_input_ports(kernel: LoopOp) -> dict[str, Port]:
-    """Build $N → Port mapping for the kernel's top-level Port inputs."""
-    return {f"${i}": inp for i, inp in enumerate(kernel.inputs)}
-
-
-def _port_references_axis(port: Port, axis_names: set[str]) -> bool:
-    """Does any Expr in ``port.index`` reference a Var with a name in ``axis_names``?"""
-    return any(_expr_references_any(e, axis_names) for e in port.index)
+def _index_references_axis(index: tuple, axis_names: set[str]) -> bool:
+    """Does any Expr in ``index`` reference a Var with a name in ``axis_names``?"""
+    return any(_expr_references_any(e, axis_names) for e in index)
 
 
 def _expr_references_any(expr, names: set[str]) -> bool:

@@ -1,9 +1,9 @@
 """Lift ``IndexMapOp`` to a single-op ``LoopOp`` copy kernel.
 
-Single-source IndexMapOps become a one-Port kernel whose ``Port.index`` is
+Single-source IndexMapOps become a one-Load kernel whose ``Load.index`` is
 the IndexMapOp's ``coord_map`` with placeholders substituted by axis Vars.
 Multi-source IndexMapOps (cat / concat) become a Select-based kernel: one
-Port per source, each guarded by the source's ``select`` predicate, the
+Load per source, each guarded by the source's ``select`` predicate, the
 chosen value written to the output. Downstream merging folds the copy
 kernel into its consumer whenever their axes align via σ.
 """
@@ -13,7 +13,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, substitute
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Axis, Load, Loop, LoopOp, Port, Select, SelectBranch, Stmt, Write
+from deplodock.compiler.ir.loop_ir import Axis, Load, Loop, LoopOp, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tensor_ir import IndexMapOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -31,7 +31,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     mapping = {f"{PLACEHOLDER_PREFIX}{i}": Var(a.name) for i, a in enumerate(axes)}
     write_index = tuple(Var(a.name) for a in axes)
 
-    ports: list[Port] = []
     input_names: list[str] = []
     body: list = []
 
@@ -40,7 +39,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         src_id = node.inputs[src.input_idx]
         src_shape = graph.nodes[src_id].output.shape if src_id in graph.nodes else ()
         idx = _substituted_index(src.coord_map, mapping, src_shape)
-        ports.append(Port(index=idx))
         input_names.append(src_id)
         body.append(Load(name="in0", source=0, index=idx))
         body.append(Write(output=0, index=write_index, value="in0"))
@@ -50,7 +48,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
             src_id = node.inputs[src.input_idx]
             src_shape = graph.nodes[src_id].output.shape if src_id in graph.nodes else ()
             idx = _substituted_index(src.coord_map, mapping, src_shape)
-            ports.append(Port(index=idx))
             input_names.append(src_id)
             name = f"in{i}"
             body.append(Load(name=name, source=i, index=idx))
@@ -63,7 +60,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     nested: tuple[Stmt, ...] = tuple(body)
     for a in reversed(axes):
         nested = (Loop(axis=a, body=nested),)
-    kernel = LoopOp(inputs=tuple(ports), body=nested)
+    kernel = LoopOp(body=nested)
 
     frag = Graph()
     for inp_id in input_names:

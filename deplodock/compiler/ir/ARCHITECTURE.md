@@ -158,9 +158,8 @@ loop-nest that codegen eventually emits — one ``LoopOp`` maps to one
 | Symbol                        | Role                                                                                                              |
 |-------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | ``Axis``                      | Named iteration variable (``name`` + ``extent``). Free vs reduce is inferred from body structure — a Loop is a reduce Loop iff its body contains an Accum (see ``LoopOp.reduce_axis_names``). |
-| ``LoopOp``                    | One kernel: ``inputs`` + nested ``body`` (``axes`` / ``accums`` are computed properties).                         |
-| ``Port``                      | Access pattern for one external buffer — ``index: tuple[Expr, ...]`` over axis Vars.                              |
-| ``Load``                      | Body-form port read: ``name = load(src)[index...]``; introduces an SSA name.                                      |
+| ``LoopOp``                    | One kernel: nested ``body`` is the sole stored field (``axes`` / ``loads`` / ``accums`` are computed properties). |
+| ``Load``                      | Body-form external read: ``name = load(src)[index...]``; introduces an SSA name. ``source`` indexes into ``LoopLaunch.input_names`` at the program level. |
 | ``Accum``                     | Reduce accumulator: ``name = op(name, value)`` inside a reduce ``Loop``. Implicitly initialized to ``ACCUM_IDENTITY[op.fn]``; after the Loop the ``name`` is in scope with the finalized value. |
 | ``Assign``                    | SSA body stmt: ``name = op(args)`` with ``op: ElementwiseOp``.                                                    |
 | ``Write``                     | Write an SSA value to output ``output`` at ``index``.                                                             |
@@ -234,7 +233,7 @@ loop-IR ops have already been translated into statements.
 ## Sub-IRs shared across stages
 
 - **``expr.py``** is the common expression sublanguage. It appears inside
-  ``IndexMapOp.coord_map`` (tensor), ``Port.index`` /
+  ``IndexMapOp.coord_map`` (tensor), ``Load.index`` / ``Write.index`` /
   ``SelectBranch.select`` (loop), and ``ArrayAccess.index`` /
   ``ForLoop.end`` / everywhere in GPU IR. Coord-expression helpers
   (``substitute``, ``placeholder``, ``is_placeholder``) are pure AST
