@@ -65,6 +65,14 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     merged_input_ids: list[str] = list(producer_node.inputs)
     merged_input_ids.extend(inp for i, inp in enumerate(consumer_inputs) if i != target_source)
 
+    # If producer and consumer both reference the same external node, the
+    # merged kernel ends up with duplicate input slots (e.g. sibling reduces
+    # over a shared buffer). Collapse them so the body's source indices
+    # resolve to unique buffers — this lets ``normalize.unify_sibling_reduce_axes``
+    # recognize sibling reduces that load from the same (source, dim).
+    if len(set(merged_input_ids)) < len(merged_input_ids):
+        merged, merged_input_ids = _dedupe_duplicate_inputs(merged, merged_input_ids)
+
     frag = Graph()
     for inp_id in merged_input_ids:
         if inp_id in frag.nodes:
@@ -112,6 +120,36 @@ def _dedupe_consumer_inputs(op: LoopOp, inputs: list[str], dup_slots: list[int])
     assert kept_new is not None
     for old in removed:
         old_to_new[old] = kept_new
+
+    def remap(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+        out: list[Stmt] = []
+        for s in stmts:
+            if isinstance(s, Loop):
+                out.append(Loop(axis=s.axis, body=remap(s.body)))
+            elif isinstance(s, Load):
+                out.append(Load(name=s.name, source=old_to_new[s.source], index=s.index))
+            else:
+                out.append(s)
+        return tuple(out)
+
+    return LoopOp(body=remap(op.body)), new_inputs
+
+
+def _dedupe_duplicate_inputs(op: LoopOp, inputs: list[str]) -> tuple[LoopOp, list[str]]:
+    """General post-splice dedup: collapse every repeated input-id to its
+    first occurrence and rewrite body Load sources to match. Reconstructing
+    the LoopOp re-runs normalize, which can then unify sibling reduces that
+    load from the now-identical source indices."""
+    first_seen: dict[str, int] = {}
+    old_to_new: dict[int, int] = {}
+    new_inputs: list[str] = []
+    for old_idx, inp in enumerate(inputs):
+        if inp in first_seen:
+            old_to_new[old_idx] = first_seen[inp]
+        else:
+            first_seen[inp] = len(new_inputs)
+            old_to_new[old_idx] = len(new_inputs)
+            new_inputs.append(inp)
 
     def remap(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         out: list[Stmt] = []

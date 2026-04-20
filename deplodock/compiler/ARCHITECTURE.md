@@ -175,12 +175,19 @@ Lift-then-splice, driven by the rewriter's fixpoint loop:
    emissions (necessary for patterns like SDPA where QK^T's D-reduce is
    needed both inside the softmax-max reduce and inside the output-K
    free loop — reusing one emission would stale-bind the accumulator).
-4. **Sibling reduce axis unification** — a post-pass scans the merged
-   body: at every scope, sibling reduce Loops whose reduce axes index
-   the same ``(external_buffer, dim)`` position share a canonical axis
-   name. This collapses ``sum(x, -1) + max(x, -1)`` into one kernel with
-   two accumulators sharing one reduce sweep name, and makes softmax's
-   max-over-K and sum-over-K report as a single reduce axis.
+4. **Duplicate input dedup + sibling reduce axis unification** — when
+   producer and consumer both reference the same external node, the
+   merged kernel's input list ends up with duplicates (``[x, x]``).
+   ``005_merge_loop_ops._dedupe_duplicate_inputs`` collapses them,
+   rewriting body Load sources so identical buffers share one source
+   index. Body reconstruction then triggers
+   ``ir/loop/normalize.unify_sibling_reduce_axes``, which at every scope
+   finds sibling reduce Loops whose reduce axes index the same
+   ``(source, dim)`` position and renames them to a single canonical
+   axis name. Together these collapse ``sum(x, -1) + max(x, -1)`` into
+   one kernel with two accumulators sharing one reduce sweep name, and
+   make softmax's max-over-K and sum-over-K report as a single reduce
+   axis.
 5. **Fixpoint** — lift rules fire once per tensor op; the splice fires
    repeatedly on adjacent LoopOps. Patterns the splicer can't handle
    (σ unsolvable, or an accumulator's required enclosing axes can't be
