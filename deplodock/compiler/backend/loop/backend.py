@@ -21,7 +21,7 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Load, LoopOp, Select, Write
+from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, LoopOp, Select, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -118,7 +118,7 @@ def execute_loop_op(
     # Flatten any nested Loop blocks; whole-tensor numpy semantics don't care
     # about block boundaries — Updates still fold over reduce axes, Assigns
     # still broadcast. Loop axes come from loop.axes as today.
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     for stmt in flatten_body(loop.body):
         if isinstance(stmt, Assign):

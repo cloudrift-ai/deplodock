@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.graph import Graph
-from deplodock.compiler.ir.loop_ir import LoopOp
+from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.simplify import simplify_loop_op
 from deplodock.compiler.program.loop import LoopProgram
 from deplodock.compiler.rewriter import Rewriter

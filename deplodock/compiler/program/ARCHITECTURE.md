@@ -9,7 +9,7 @@ runnable whole, with authoritative buffer metadata.
 Graph (frontend → tensor → loop IR, populated in place by rewrites)
    │ pipeline.compile_graph
    ▼
-LoopProgram    ← program/loop.py  +  ir/loop_ir.py
+LoopProgram    ← program/loop.py  +  ir/loop/ir.py
    │ backend/cuda/emit.compile_kernels
    ▼
 GpuProgram     ← program/gpu.py   +  ir/kernel_ir.py
@@ -20,7 +20,7 @@ GpuProgram     ← program/gpu.py   +  ir/kernel_ir.py
 
 ## `loop.py` — LoopProgram
 
-Pairs with `ir/loop_ir.py`. Produced by `LoopProgram.from_graph(graph)`
+Pairs with `ir/loop/ir.py`. Produced by `LoopProgram.from_graph(graph)`
 after fusion completes.
 
 | Type                                                                                    | Role                                                              |

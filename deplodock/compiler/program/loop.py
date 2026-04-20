@@ -7,7 +7,7 @@ here; nothing recomputes them.
 
 The pairing:
 
-    ir/loop_ir.py   : LoopOp, Axis, Load, Assign, Accum             (structural IR)
+    ir/loop/ir.py   : LoopOp, Axis, Load, Assign, Accum             (structural IR)
     program/loop.py: LoopBuffer, LoopLaunch, LoopProgram          (program form)
 
     ir/kernel_ir.py    : GpuKernel, GpuKernelParam, Stmts               (structural IR)
@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.ir.graph import Graph
-from deplodock.compiler.ir.loop_ir import LoopOp
+from deplodock.compiler.ir.loop import LoopOp
 
 
 @dataclass
@@ -129,7 +129,7 @@ class LoopProgram:
         generated source; also used as the per-launch fragment in
         :meth:`pretty_print`.
         """
-        from deplodock.compiler.ir.loop_ir import pretty_print
+        from deplodock.compiler.ir.loop import pretty_print
 
         launch = self.launches[idx]
         seen: set[str] = set()

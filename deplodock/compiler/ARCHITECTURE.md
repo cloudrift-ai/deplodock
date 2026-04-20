@@ -25,7 +25,7 @@
 │       LoopLaunch (LoopOp + input/output buffer names) × N                                                            │
 │       + graph_inputs/outputs/constants/constant_values                                                               │
 │                                                                                                                      │
-│  Each LoopOp (ir/loop_ir.py) is one GPU kernel as an SSA program:                                                       │
+│  Each LoopOp (ir/loop/ir.py) is one GPU kernel as an SSA program:                                                       │
 │      body   (tuple[Stmt, ...])        — Assign | Accum | Write | Select | Loop | Load (sole stored field)            │
 │      axes   (tuple[Axis, ...])        — iteration space (computed from body's Loop tree)                             │
 │      loads  (tuple[Load, ...])        — body-form external reads (computed from body)                                │
@@ -212,7 +212,7 @@ handle.
 Walks the SSA body — no classification pass, no `Schedule` dataclass, no `LoopIR` intermediate. Maintains a `values: dict[str, Expr]` mapping Assign names to C expressions.
 
 - `_emit_load_access(index, buf, src_shape, env) -> Expr`: emits `ArrayAccess(buffer, coord)` for a body `Load.index` pattern evaluated in the axis environment. Select statements inside the SSA body are handled separately by `_emit_select`, which lowers `SelectBranch`es into a nested `Ternary` chain.
-- `_emit_body`: unified entry for one kernel body. Calls `ir.loop_plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The same plan powers `LoopProgram.pretty_print_launch` so the dump view mirrors the loop nest codegen emits.
+- `_emit_body`: unified entry for one kernel body. Calls `ir.loop.plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The same plan powers `LoopProgram.pretty_print_launch` so the dump view mirrors the loop nest codegen emits.
 - `_emit_plan`: walks `plan.steps` — each step is either `Inline` (a straight-line block of `Assign` / `Select` / `Write` / `Accum` / `Load`) or `Loop` (a K-loop over a reduce axis). Loads inside a reduce Loop's body materialize inside that loop; Loads in prelude Inline steps happen once per row. Grid is 1D over flat free-axis extents; block is `(256, 1, 1)` for pure-elementwise plans, `(1, 1, 1)` for plans containing a `Loop` step. Empty bodies (copy kernels) are a pointwise subcase.
 - Reductions (single `Loop` step) emit an accumulator init + `Accum` fold; max reductions use `fmaxf` instead of `AugAssign`. Softmax-style cross-iteration patterns (reduce_max → sub+exp → reduce_sum → div) and contractions (mul → reduce_sum) fall out naturally from multiple `Loop` steps recomputing per-element values as needed.
 

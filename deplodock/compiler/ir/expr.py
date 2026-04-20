@@ -3,7 +3,7 @@
 Backend-agnostic expression sublanguage used by:
 
 - ``IndexMapOp.coord_map`` (``ir.tensor_ir``): affine output→input coord maps.
-- ``Mux.select`` / ``MuxBranch.select`` (``ir.loop_ir``): coord predicates.
+- ``Mux.select`` / ``MuxBranch.select`` (``ir.loop``): coord predicates.
 - GPU IR (``ir.kernel_ir``): array indices, loop bounds, ternary selects.
 
 The ``_ExprOps`` mixin adds Python operator overloading so expressions can be

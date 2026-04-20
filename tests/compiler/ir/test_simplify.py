@@ -23,7 +23,7 @@ from deplodock.compiler.ir.kernel_ir import (
     IfStmt,
     VarDecl,
 )
-from deplodock.compiler.ir.loop_ir import Assign, Axis, Load, Loop, LoopOp, Write
+from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.simplify import (
     Context,
     Interval,

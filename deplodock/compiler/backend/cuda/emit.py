@@ -29,8 +29,8 @@ from deplodock.compiler.ir.kernel_ir import (
 from deplodock.compiler.ir.kernel_ir import (
     Assign as IrAssign,
 )
-from deplodock.compiler.ir.loop_ir import Accum, Axis, Load, LoopOp, Select
-from deplodock.compiler.ir.loop_ir import Assign as IrAssignStmt
+from deplodock.compiler.ir.loop import Accum, Axis, Load, LoopOp, Select
+from deplodock.compiler.ir.loop import Assign as IrAssignStmt
 from deplodock.compiler.ir.simplify import simplify_kernel
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -116,7 +116,7 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
     kernels where some predicate is expected to mask the stray load but
     the checker couldn't prove it.
     """
-    from deplodock.compiler.ir.loop_ir import Select
+    from deplodock.compiler.ir.loop import Select
 
     warnings: list[str] = []
     if not isinstance(launch.loop, LoopOp):
@@ -130,7 +130,7 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
     # used as a Select branch value, the Load inherits that branch's
     # predicate. Needed for the rotary rotate_half pattern, where the Load
     # is wrapped in an Assign (``v1 = neg(x_lo)``) before reaching the Select.
-    from deplodock.compiler.ir.loop_ir import Assign, flatten_body
+    from deplodock.compiler.ir.loop import Assign, flatten_body
 
     flat = list(flatten_body(loop.body))
     load_names = {ld.name for ld in loop.loads}
@@ -423,7 +423,7 @@ def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
 
 
 def _emit_body(launch: LoopLaunch, out_shape: tuple, program: LoopProgram) -> tuple[list[Stmt], tuple[int, int, int]]:
-    from deplodock.compiler.ir.loop_plan import analyze_kernel
+    from deplodock.compiler.ir.loop.plan import analyze_kernel
 
     plan = analyze_kernel(launch.loop, out_shape)
     idx = Var("tid")
@@ -443,7 +443,7 @@ def _emit_body(launch: LoopLaunch, out_shape: tuple, program: LoopProgram) -> tu
 
 
 def _emit_plan(plan, launch: LoopLaunch, program: LoopProgram, idx: Expr) -> list[Stmt]:
-    from deplodock.compiler.ir.loop_plan import Inline, Loop
+    from deplodock.compiler.ir.loop.plan import Inline, Loop
 
     loop: LoopOp = launch.loop
     stmts: list[Stmt] = []
@@ -663,7 +663,7 @@ def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
 
 
 def _kernel_name(loop: LoopOp, idx: int) -> str:
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     if any(isinstance(s, Accum) for s in flatten_body(loop.body)):
         return f"k{idx}_reduce"
@@ -671,7 +671,7 @@ def _kernel_name(loop: LoopOp, idx: int) -> str:
 
 
 def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     loop: LoopOp = launch.loop
     out_shape = program.output_shape(launch)

@@ -4,7 +4,7 @@ One file per program level, parallel to ``ir/``:
 
 - ``loop`` — ``LoopProgram`` + ``LoopBuffer`` + ``LoopLaunch``. Built by
   ``compile_graph`` after fusion; authoritative shape + launch-order view.
-  Pairs with ``ir/loop_ir.py``.
+  Pairs with ``ir/loop/ir.py``.
 - ``gpu`` — ``GpuProgram`` + ``GpuBuffer`` + ``GpuLaunch``. Produced by
   backend codegen (``backend/cuda/emit``). Pairs with ``ir/kernel_ir.py``.
 

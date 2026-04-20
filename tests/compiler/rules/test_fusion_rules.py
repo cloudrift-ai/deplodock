@@ -16,7 +16,7 @@ import numpy as np
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Accum, Assign, LoopOp, Write
+from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass
 
@@ -62,20 +62,20 @@ def _kernel_nodes(graph: Graph) -> list:
 
 
 def _assign_fns(body) -> list[str]:
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     return [s.op.fn for s in flatten_body(body) if isinstance(s, Assign)]
 
 
 def _count_copies(body) -> int:
     """Count identity ``Assign(op=copy)`` statements in a LoopOp body."""
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     return sum(1 for s in flatten_body(body) if isinstance(s, Assign) and s.op.fn == "copy")
 
 
 def _has_update(body) -> bool:
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     return any(isinstance(s, Accum) for s in flatten_body(body))
 
@@ -119,7 +119,7 @@ def test_pointwise_chain_body_ops():
 
 
 def test_pointwise_chain_inputs_are_loads():
-    from deplodock.compiler.ir.loop_ir import Load
+    from deplodock.compiler.ir.loop import Load
 
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
@@ -129,7 +129,7 @@ def test_pointwise_chain_inputs_are_loads():
 
 
 def test_pointwise_chain_has_write():
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
@@ -176,7 +176,7 @@ def test_rms_norm_like_correctness():
 
 def test_rms_norm_like_ssa_names_are_canonical():
     """After rename pass, every SSA name in the body is v0, v1, v2, ... in order."""
-    from deplodock.compiler.ir.loop_ir import Select, flatten_body
+    from deplodock.compiler.ir.loop import Select, flatten_body
 
     result = _fuse(_make_rms_norm_like())
     kernel = _kernel_nodes(result)[0]
@@ -307,7 +307,7 @@ def test_single_elementwise_fuses():
 
 def test_ssa_invariants_hold():
     """LoopOp.__post_init__ validates SSA; this just confirms no crash."""
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     result = _fuse(_make_softmax())
     for k in _kernel_nodes(result):
@@ -315,7 +315,7 @@ def test_ssa_invariants_hold():
         defined = set()
         for decl in k.op.accums:
             defined.add(decl.name)
-        from deplodock.compiler.ir.loop_ir import Accum, Load
+        from deplodock.compiler.ir.loop import Accum, Load
 
         for s in flatten_body(k.op.body):
             if isinstance(s, Assign):
