@@ -140,60 +140,72 @@ shape inference for contractions.
 
 ## Fusion policy (rules/fusion/)
 
-Lift-then-merge, driven by the rewriter's fixpoint loop:
+Lift-then-splice, driven by the rewriter's fixpoint loop:
 
 1. **Lift each tensor op into a trivial one-op ``LoopOp``** — one rule
    per tensor op (``001_lift_elementwise``, ``002_lift_reduce``,
    ``003_lift_indexmap``, ``004_lift_gather``). Each produces a kernel
-   whose iteration space matches its op's natural shape, with body-form
-   ``Load`` statements expressing each input's access pattern directly
-   as ``Expr``s over axis Vars. Reductions contribute one ``Accum``
+   whose iteration space matches its op's output shape, with axes named
+   ``a0, a1, ...`` and a Write at the identity index. Body-form
+   ``Load`` statements express each input's access pattern directly as
+   ``Expr``s over axis Vars. Reductions contribute one ``Accum``
    statement inside a reduce ``Loop`` over the reduction axis;
    multi-source IndexMapOps (cat / concat) contribute a ``Select``
    prelude choosing among per-source Loads.
-2. **Merge adjacent ``LoopOp`` pairs** (``005_merge_loop_ops``). The
-   grammar matches a ``LoopOp`` whose sole consumer is another
-   ``LoopOp``. Merging is defined by a single substitution σ:
-   - Solve ``writer.index[k] == reader.index[k]`` at each output dim
-     for every producer axis; the reader index comes from the consumer
-     body's ``Load`` with the matching ``source``. Supported writer
-     forms: direct ``Var(a)``, ``Var(a) ± c``, and ``Literal(0)``
-     broadcast slots (no binding). Unsupported forms (multiplicative,
-     modular, data-dependent) make the merge return ``None``.
-   - Every unbound producer axis must correspond to a reduce Loop in
-     the producer's body (i.e. its Loop wraps an Update). A leaking
-     free axis would require replicating producer work per consumer
-     slot, which we refuse.
-   - The merged kernel is held to at most one reduce axis — this is a
-     pragmatic constraint of ``flat_body_to_nested``'s re-nest path,
-     not a semantic limit on fusion. Removing it is gated on a
-     backend-side schedule pass that can split multi-reduce kernels.
-   - Axes and SSA names are renamed to avoid collisions; producer Loads
-     have their ``source`` remapped and their ``index`` σ-substituted;
-     the producer's connecting ``Write`` becomes ``Assign(bridge,
-     ElementwiseOp("copy"), …)`` that the consumer's Load SSA name is
-     aliased to.
-3. **Fixpoint** — lift rules fire once per tensor op; merge fires
-   repeatedly on adjacent LoopOps. The process terminates because
-   every lift consumes one tensor op and every merge consumes two
-   LoopOps.
+2. **Splice adjacent ``LoopOp`` pairs** (``005_merge_loop_ops`` calls
+   ``_splice.py::splice_loop_ops``). Under the lift convention every
+   kernel writes at an identity index, so the common case is a direct
+   tree splice — replace each consumer ``Load(source=target)`` with the
+   producer's body inlined. A minimal σ handles the two non-identity
+   cases:
+   - ``Var(p)`` in ``writer.index[k]`` → bind ``p → reader.index[k]``.
+   - ``Literal(c)`` in ``writer.index[k]`` → no binding (keep-dim
+     reduction slot, broadcast position).
+   Anything else in the writer (``Var(p) ± c``, ``Cast``,
+   multiplicative) → splice refuses and the kernels stay separate.
+3. **Axis-alias detection** — when both producer and consumer have
+   reduce axes that index the same external buffer at the same dim as
+   bare ``Var``s with matching extents, the producer's reduce axis is
+   aliased to the consumer's. This collapses ``sum(x, -1) + max(x, -1)``
+   into a single kernel with two accumulators sharing one reduce sweep.
+4. **Bake producer body as a tree** — walk ``producer.body``: strip each
+   ``Loop`` whose axis is σ-bound or extent-1 (consumer iterates those;
+   singletons are no-ops), keep surviving reduce Loops with renamed axes,
+   apply σ / SSA-rename / source-remap to every stmt, drop the target
+   ``Write``. The result preserves the producer's natural scope shape.
+5. **Splice into consumer tree, per-stmt** — for each top-level producer
+   baked stmt, compute its effective consumer-axis dependencies (direct
+   Expr refs plus axis deps propagated via SSA references to earlier
+   stmts). Each stmt's **splice parent** is the innermost consumer Loop
+   whose axis sits in those deps. Walk consumer body once, and at each
+   Loop prepend the stmts bucketed for that axis. Row-space reduce
+   sweeps (deps ``{a0}``) land as siblings at ``Loop(a0)``; element-space
+   producer Loads (deps ``{a0, a1}``) land inside ``Loop(a1)``. No
+   flatten/renest pass — the output IR matches the schedule the emitter
+   would otherwise hoist at codegen time.
+6. **Fixpoint** — lift rules fire once per tensor op; the splice fires
+   repeatedly on adjacent LoopOps. Patterns the splicer can't handle
+   (multi-read — the consumer reads the producer at multiple distinct
+   indices, e.g. softmax's sum sweep + final divide) simply stay as
+   separate kernels. Copy-elimination (``006_eliminate_copies``) and
+   SSA canonicalisation (``007_rename_ssa``) run after and walk bodies
+   tree-wise (preserving the nest structure the splicer produced).
 
-The merge rule subsumes two passes the old pipeline had as separate
-concerns:
+The splicer subsumes two passes the old pipeline had as separate concerns:
 
-- **Layout composition** (chained single-source IndexMapOps): merging
-  two lifted IndexMap kernels composes their ``coord_map``s via σ, so
-  no dedicated pre-pass is needed.
-- **Absorption of identity-alias / linear-offset layouts**: transposes,
-  keep-dim reductions, ``+``/``-`` offset slices (e.g. rotary
-  ``rotate_half``) all fall out of σ-based binding — the consumer's
-  reader index and the producer's writer index align affinely, so the
-  producer's Load becomes a body Load in the merged kernel under the
-  solved σ.
+- **Layout composition** (chained single-source IndexMapOps): the
+  producer's ``coord_map`` survives as body Load indices; when the
+  consumer's Load is an identity read, the splice trivially inlines
+  without σ, so composed layouts come out correctly.
+- **Absorption of identity-alias / keep-dim reductions**: keep-dim
+  reduction writes use ``Literal(0)`` on the reduced dim — the splicer
+  allows this without binding, and the reducer's ``Accum`` lands at the
+  merged kernel's reduce scope naturally.
 
 ``optimization/002_insert_broadcast_indexmap.py`` survives because it
 addresses a different concern — promoting implicit elementwise
-broadcasts to explicit ``IndexMapOp``s — which merge does not handle.
+broadcasts to explicit ``IndexMapOp``s — which the splicer does not
+handle.
 
 ## Codegen policy (backend/cuda/emit.py)
 

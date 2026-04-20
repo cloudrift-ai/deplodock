@@ -50,19 +50,21 @@ tests/compiler/rules/
 
 ### Fusion (`rules/fusion/`)
 
-The fusion pass is driven by lift-then-merge: each tensor op becomes a
-trivial `LoopOp` (one lift rule per op), then adjacent LoopOp pairs
-merge via a σ-based legality check. `test_fusion_rules.py` runs the
-whole directory as a single pass; `test_merge_core.py` unit-tests the
-σ solver and merge bookkeeping directly.
+The fusion pass is driven by lift-then-splice: each tensor op becomes a
+trivial `LoopOp` (one lift rule per op), then adjacent LoopOp pairs are
+spliced by inlining the producer body at each consumer `Load` that
+reads it. `test_fusion_rules.py` runs the whole directory as a single
+pass; the splicer's behaviour is exercised end-to-end there (no
+separate unit-test file — the old `test_merge_core.py` was retired
+with `_merge_core.py`).
 
 | Rule file | Op | Tested via |
 |---|---|---|
 | `001_lift_elementwise.py` | `ElementwiseOp` → `LoopOp` | `test_fusion_rules.py` (pass fixpoint) |
-| `002_lift_reduce.py`      | `ReduceOp` → `LoopOp`      | `test_fusion_rules.py`, `test_merge_core.py::test_merge_reduce_then_elementwise` |
+| `002_lift_reduce.py`      | `ReduceOp` → `LoopOp`      | `test_fusion_rules.py::test_contraction_*` |
 | `003_lift_indexmap.py`    | `IndexMapOp` → `LoopOp`    | `test_optimization_rules.py::test_matmul_with_transpose_fuses_to_one_kernel` (e2e) |
 | `004_lift_gather.py`      | `GatherOp` → `LoopOp`      | `test_torch_ops.py::test_gather` |
-| `005_merge_loop_ops.py`   | `LoopOp → LoopOp`          | `test_merge_core.py` (17 unit tests) + `test_fusion_rules.py` (fixpoint) |
+| `005_merge_loop_ops.py`   | `LoopOp → LoopOp` (splice) | `test_fusion_rules.py` (fixpoint) |
 
 Numerical correctness for lifted + merged kernels runs through the
 numpy backends in three places:

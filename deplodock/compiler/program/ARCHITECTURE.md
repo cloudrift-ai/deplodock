@@ -38,7 +38,7 @@ during fusion — there is no separate metadata-only-alias concept here
 (unlike `GpuProgram`, which has `aliases` for buffer-pointer aliasing
 at the device level). Each IndexMapOp is lifted to a one-op `LoopOp`
 by `rules/fusion/003_lift_indexmap.py`; if its consumer is another
-`LoopOp` and the σ solver can align the indices, the merge rule
+`LoopOp` and the splicer's σ can align the indices, the merge rule
 absorbs the copy kernel into the consumer's body Loads.
 
 ## `gpu.py` — GpuProgram
