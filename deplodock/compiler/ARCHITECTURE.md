@@ -153,43 +153,41 @@ Lift-then-splice, driven by the rewriter's fixpoint loop:
    multi-source IndexMapOps (cat / concat) contribute a ``Select``
    prelude choosing among per-source Loads.
 2. **Splice adjacent ``LoopOp`` pairs** (``005_merge_loop_ops`` calls
-   ``_splice.py::splice_loop_ops``). Under the lift convention every
-   kernel writes at an identity index, so the common case is a direct
-   tree splice — replace each consumer ``Load(source=target)`` with the
-   producer's body inlined. A minimal σ handles the two non-identity
-   cases:
+   ``_splice.py::splice_loop_ops``). The splicer walks the consumer body
+   recursively; at every ``Load(source=target)`` it reverse-reconstructs
+   the producer expression that computed the loaded value, via a DFS from
+   the producer's ``Write.value`` back to its Loads. A minimal σ handles
+   non-identity Write forms:
    - ``Var(p)`` in ``writer.index[k]`` → bind ``p → reader.index[k]``.
    - ``Literal(c)`` in ``writer.index[k]`` → no binding (keep-dim
      reduction slot, broadcast position).
    Anything else in the writer (``Var(p) ± c``, ``Cast``,
    multiplicative) → splice refuses and the kernels stay separate.
-3. **Axis-alias detection** — when both producer and consumer have
-   reduce axes that index the same external buffer at the same dim as
-   bare ``Var``s with matching extents, the producer's reduce axis is
-   aliased to the consumer's. This collapses ``sum(x, -1) + max(x, -1)``
-   into a single kernel with two accumulators sharing one reduce sweep.
-4. **Bake producer body as a tree** — walk ``producer.body``: strip each
-   ``Loop`` whose axis is σ-bound or extent-1 (consumer iterates those;
-   singletons are no-ops), keep surviving reduce Loops with renamed axes,
-   apply σ / SSA-rename / source-remap to every stmt, drop the target
-   ``Write``. The result preserves the producer's natural scope shape.
-5. **Splice into consumer tree, per-stmt** — for each top-level producer
-   baked stmt, compute its effective consumer-axis dependencies (direct
-   Expr refs plus axis deps propagated via SSA references to earlier
-   stmts). Each stmt's **splice parent** is the innermost consumer Loop
-   whose axis sits in those deps. Walk consumer body once, and at each
-   Loop prepend the stmts bucketed for that axis. Row-space reduce
-   sweeps (deps ``{a0}``) land as siblings at ``Loop(a0)``; element-space
-   producer Loads (deps ``{a0, a1}``) land inside ``Loop(a1)``. No
-   flatten/renest pass — the output IR matches the schedule the emitter
-   would otherwise hoist at codegen time.
-6. **Fixpoint** — lift rules fire once per tensor op; the splice fires
+3. **Lazy accumulator hoisting** — when the DFS encounters a producer
+   ``Accum`` reference, it records a pending entry with the scope at
+   which that accumulator's reduce Loop must live: σ-mapped to the
+   consumer's axis names, computed from the accumulator's
+   ``enclosing_axes`` tuple. Pending entries bubble up through consumer
+   ``Loop`` returns; at each scope the walker flushes the entries that
+   match — emitting the accumulator's reduce Loop before any stmt that
+   references it. Key (producer_accum, required_c_axes) is scope-keyed:
+   the same accumulator needed at distinct consumer scopes gets separate
+   emissions (necessary for patterns like SDPA where QK^T's D-reduce is
+   needed both inside the softmax-max reduce and inside the output-K
+   free loop — reusing one emission would stale-bind the accumulator).
+4. **Sibling reduce axis unification** — a post-pass scans the merged
+   body: at every scope, sibling reduce Loops whose reduce axes index
+   the same ``(external_buffer, dim)`` position share a canonical axis
+   name. This collapses ``sum(x, -1) + max(x, -1)`` into one kernel with
+   two accumulators sharing one reduce sweep name, and makes softmax's
+   max-over-K and sum-over-K report as a single reduce axis.
+5. **Fixpoint** — lift rules fire once per tensor op; the splice fires
    repeatedly on adjacent LoopOps. Patterns the splicer can't handle
-   (multi-read — the consumer reads the producer at multiple distinct
-   indices, e.g. softmax's sum sweep + final divide) simply stay as
-   separate kernels. Copy-elimination and SSA canonicalisation are no
-   longer fusion-pass rules — they live in ``ir/loop/normalize.py`` and
-   run inside ``LoopOp.__post_init__`` on every constructed body.
+   (σ unsolvable, or an accumulator's required enclosing axes can't be
+   mapped to the current consumer scope) simply stay as separate kernels.
+   Copy-elimination and SSA canonicalisation are not fusion-pass rules —
+   they live in ``ir/loop/normalize.py`` and run inside
+   ``LoopOp.__post_init__`` on every constructed body.
 
 The splicer subsumes two passes the old pipeline had as separate concerns:
 
