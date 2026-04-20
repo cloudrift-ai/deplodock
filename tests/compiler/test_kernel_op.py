@@ -10,7 +10,6 @@ from deplodock.compiler.ir.loop_ir import (
     Load,
     Loop,
     LoopOp,
-    Port,
     Select,
     SelectBranch,
     Write,
@@ -20,14 +19,78 @@ from deplodock.compiler.ir.loop_ir import (
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 
+def Port(index=()):
+    """Back-compat test shim — Port is gone at the IR level, but fixtures
+    still spell reads as ``Port(index=...)``. The shim just returns the
+    index tuple for ``_loop`` to synthesize body-form Loads from."""
+    return tuple(index)
+
+
 def _loop(*, axes=(), inputs=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
-    Test-local shim: LoopOp.axes is a property over the body's Loop tree,
-    so ``axes=`` feeds ``flat_body_to_nested`` to produce the nested
-    form.
+    Test-local shim: ``LoopOp.axes`` is a property over the body's Loop
+    tree, so ``axes=`` feeds ``flat_body_to_nested`` to produce the
+    nested form. When ``inputs=(...)`` is provided (legacy Port-tuples),
+    each ``$N`` ref is rewritten to a freshly-named Load that is inserted
+    just before the referencing statement. Load cache resets at each
+    ``Accum`` and at each nested ``Loop`` boundary so sibling reduce
+    sweeps (softmax pattern) get their own scope-local Loads.
     """
-    return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, body))
+    if not inputs:
+        return LoopOp(body=flat_body_to_nested(axes, body))
+
+    index_of = {i: tuple(p) for i, p in enumerate(inputs)}
+    fresh_counter = [0]
+
+    def process(stmts):
+        """Rewrite ``$N`` refs in ``stmts`` and insert Loads at first use."""
+        local_loads: dict[int, str] = {}
+        extra_loads: list = []
+
+        def rewrite_arg(a: str) -> str:
+            if not a.startswith("$"):
+                return a
+            try:
+                src = int(a[1:])
+            except ValueError:
+                return a
+            cached = local_loads.get(src)
+            if cached is not None:
+                return cached
+            fresh_counter[0] += 1
+            name = f"in{src}_{fresh_counter[0]}"
+            local_loads[src] = name
+            extra_loads.append(Load(name=name, source=src, index=index_of[src]))
+            return name
+
+        result: list = []
+        for stmt in stmts:
+            if isinstance(stmt, Assign):
+                stmt = Assign(stmt.name, stmt.op, tuple(rewrite_arg(a) for a in stmt.args))
+            elif isinstance(stmt, Accum):
+                stmt = Accum(stmt.name, rewrite_arg(stmt.value), stmt.op)
+            elif isinstance(stmt, Write):
+                stmt = Write(stmt.output, stmt.index, rewrite_arg(stmt.value))
+            elif isinstance(stmt, Select):
+                stmt = Select(
+                    stmt.name,
+                    tuple(SelectBranch(rewrite_arg(b.value), b.select) for b in stmt.branches),
+                )
+            elif isinstance(stmt, Loop):
+                # Nested Loop: its body is a fresh scope — recursive call has
+                # its own ``local_loads`` / ``extra_loads`` so Loads land
+                # inside the Loop body.
+                stmt = Loop(axis=stmt.axis, body=process(stmt.body))
+            result.extend(extra_loads)
+            extra_loads = []
+            result.append(stmt)
+            if isinstance(stmt, Accum):
+                local_loads = {}
+
+        return tuple(result)
+
+    return LoopOp(body=flat_body_to_nested(axes, process(body)))
 
 
 # ---------------------------------------------------------------------------
@@ -109,30 +172,16 @@ def test_update_synthesizes_accum_decl():
     assert isinstance(k.accums[0].init, Literal) and k.accums[0].init.value == 0.0
 
 
-def test_port_default_is_empty_index():
-    assert Port().index == ()
-
-
-def test_port_with_index():
-    p = Port(index=(Var("a0"), Var("a1")))
-    assert len(p.index) == 2
-
-
-def test_port_broadcast_literal():
-    p = Port(index=(Literal(0, "int"), Var("a0")))
-    assert isinstance(p.index[0], Literal)
-
-
 # ---------------------------------------------------------------------------
 # Assign
 # ---------------------------------------------------------------------------
 
 
 def test_assign_construction():
-    a = Assign("out", ElementwiseOp("add"), args=("$0", "$1"))
+    a = Assign("out", ElementwiseOp("add"), args=("a", "b"))
     assert a.name == "out"
     assert a.op.fn == "add"
-    assert a.args == ("$0", "$1")
+    assert a.args == ("a", "b")
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +204,7 @@ def test_kernel_pointwise():
             Write(output=0, index=(Var("a0"),), value="z"),
         ),
     )
-    assert len(flatten_body(k.body)) == 2
+    assert len(flatten_body(k.body)) == 4  # 2 synthesized Loads + Assign + Write
 
 
 def test_kernel_reduce():
@@ -184,8 +233,8 @@ def test_kernel_matmul():
             Write(output=0, index=(Var("a0"),), value="dot"),
         ),
     )
-    # Assign + Accum + Write — accumulator info is carried on Accum.op now.
-    assert len(flatten_body(k.body)) == 3
+    # 2 synthesized Loads + Assign + Accum + Write — accumulator info is carried on Accum.op now.
+    assert len(flatten_body(k.body)) == 5
 
 
 def test_kernel_matmul_bias():
@@ -202,8 +251,8 @@ def test_kernel_matmul_bias():
             Write(output=0, index=(Var("a0"),), value="out"),
         ),
     )
-    # Assign + Accum + Assign + Write (no decl stmt — Accum carries op).
-    assert len(flatten_body(k.body)) == 4
+    # 3 synthesized Loads + Assign + Accum + Assign + Write (no decl stmt — Accum carries op).
+    assert len(flatten_body(k.body)) == 7
 
 
 def test_kernel_softmax_two_accumulators():
@@ -237,7 +286,8 @@ def test_kernel_unary_chain():
             Write(output=0, index=(Var("a0"),), value="exp"),
         ),
     )
-    assert len(flatten_body(k.body)) == 3
+    # 1 synthesized Load + 2 Assigns + Write.
+    assert len(flatten_body(k.body)) == 4
 
 
 def test_kernel_scatter_output_via_select():
@@ -259,7 +309,7 @@ def test_kernel_scatter_output_via_select():
             Write(output=0, index=(Var("a0"),), value="v"),
         ),
     )
-    assert isinstance(flatten_body(k.body)[1], Select)
+    assert any(isinstance(s, Select) for s in flatten_body(k.body))
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +368,8 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
             Assign("c", ElementwiseOp("add"), args=("a", "b")),
         ),
     )
-    assert len(flatten_body(k.body)) == 3
+    # 1 synthesized Load + 3 Assigns.
+    assert len(flatten_body(k.body)) == 4
 
 
 def test_update_op_conflict_rejected():
@@ -561,14 +612,16 @@ def _nested_reduce_kernel() -> LoopOp:
     from deplodock.compiler.ir.loop_ir import Loop
 
     return LoopOp(
-        inputs=(Port(index=(Var("a0"), Var("k"))),),
         body=(
             Loop(
                 axis=Axis("a0", 4),
                 body=(
                     Loop(
                         axis=Axis("k", 8),
-                        body=(Accum(name="acc", value="$0", op=ElementwiseOp("add")),),
+                        body=(
+                            Load(name="x_k", source=0, index=(Var("a0"), Var("k"))),
+                            Accum(name="acc", value="x_k", op=ElementwiseOp("add")),
+                        ),
                     ),
                     Write(output=0, index=(Var("a0"),), value="acc"),
                 ),
@@ -583,10 +636,9 @@ def test_analyze_kernel_handles_nested_body():
 
     flat = _flat_reduce_kernel()
     nested = _nested_reduce_kernel()
-    shapes = {"$0": (4, 8)}
     out_shape = (4,)
-    plan_flat = analyze_kernel(flat, shapes, out_shape)
-    plan_nested = analyze_kernel(nested, shapes, out_shape)
+    plan_flat = analyze_kernel(flat, out_shape)
+    plan_nested = analyze_kernel(nested, out_shape)
     # Both should produce a Loop step (reduce) and a trailing Write.
     assert len(plan_flat.steps) == len(plan_nested.steps)
     assert len(plan_flat.trailing_writes) == len(plan_nested.trailing_writes)

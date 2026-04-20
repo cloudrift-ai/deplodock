@@ -11,7 +11,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Accum, Axis, Load, Loop, LoopOp, Port, Stmt, Write
+from deplodock.compiler.ir.loop_ir import Accum, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
@@ -49,7 +49,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(src_shape))
     reduce_axis_name = f"a{axis}"
     load_index = tuple(Var(a.name) for a in axes)
-    input_port = Port(index=load_index)
 
     combine = ElementwiseOp(_COMBINE.get(op.fn, op.fn))
     write_index = _build_write_index(axes, reduce_axis_name, tuple(node.output.shape))
@@ -73,7 +72,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     body: tuple[Stmt, ...] = inner
     for a in reversed(free_axes):
         body = (Loop(axis=a, body=body),)
-    kernel = LoopOp(inputs=(input_port,), body=body)
+    kernel = LoopOp(body=body)
 
     frag = Graph()
     frag.add_node(InputOp(), [], Tensor(src_id, src_shape, src_node.output.dtype), node_id=src_id)

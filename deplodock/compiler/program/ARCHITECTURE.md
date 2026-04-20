@@ -26,21 +26,20 @@ after fusion completes.
 | Type                                                                                    | Role                                                              |
 |-----------------------------------------------------------------------------------------|-------------------------------------------------------------------|
 | `LoopBuffer(name, shape, dtype, role)`                                                  | One buffer. Shape is authoritative; `size` is a derived property. |
-| `LoopLaunch(loop, input_names, output_name)`                                            | One `LoopOp` invocation wired to named buffers (Port order).      |
+| `LoopLaunch(loop, input_names, output_name)`                                            | One `LoopOp` invocation wired to named buffers (`Load.source` order). |
 | `LoopProgram(name, buffers, launches, graph_inputs/outputs/constants, constant_values)` | The full post-fusion program.                                     |
 
 `LoopProgram` exposes shape queries — `shape(name)`, `output_shape(launch)`,
-`dollar_shapes(launch)` — so codegen never recomputes shapes.
+`source_shapes(launch)` — so codegen never recomputes shapes.
 
 **Rule:** No `aliases` field. At loop level, identity/metadata-only
-IndexMaps are baked directly into the consuming `Port.index` Exprs
-during fusion — there is no `Port.indexmap` field and no separate
-metadata-only-alias concept here (unlike `GpuProgram`, which has
-`aliases` for buffer-pointer aliasing at the device level). Each
-IndexMapOp is lifted to a one-op `LoopOp` by
-`rules/fusion/003_lift_indexmap.py`; if its consumer is another
+IndexMaps are baked directly into the consuming `Load.index` Exprs
+during fusion — there is no separate metadata-only-alias concept here
+(unlike `GpuProgram`, which has `aliases` for buffer-pointer aliasing
+at the device level). Each IndexMapOp is lifted to a one-op `LoopOp`
+by `rules/fusion/003_lift_indexmap.py`; if its consumer is another
 `LoopOp` and the σ solver can align the indices, the merge rule
-absorbs the copy kernel into the consumer's `Port.index`.
+absorbs the copy kernel into the consumer's body Loads.
 
 ## `gpu.py` — GpuProgram
 

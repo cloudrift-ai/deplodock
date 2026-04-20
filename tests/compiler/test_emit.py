@@ -56,24 +56,30 @@ def _matmul_graph() -> Graph:
 def _softmax_launch() -> LoopLaunch:
     """Build a LoopLaunch with the softmax SSA pattern directly."""
     from deplodock.compiler.ir.expr import Var
-    from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Loop, LoopOp, Port, Write
+    from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Load, Loop, LoopOp, Write
 
     a0 = Axis("a0", 4)
     a1 = Axis("a1", 8)
-    p = Port(index=(Var("a0"), Var("a1")))
+    idx = (Var("a0"), Var("a1"))
     loop = LoopOp(
-        inputs=(p, p),
         body=(
             Loop(
                 axis=a0,
                 body=(
                     # Max sweep (K-loop 1).
-                    Loop(axis=a1, body=(Accum(name="mx", value="$0", op=ElementwiseOp("max")),)),
+                    Loop(
+                        axis=a1,
+                        body=(
+                            Load(name="x_mx", source=0, index=idx),
+                            Accum(name="mx", value="x_mx", op=ElementwiseOp("max")),
+                        ),
+                    ),
                     # Sum sweep (K-loop 2) — rematerializes exp inside.
                     Loop(
                         axis=a1,
                         body=(
-                            Assign(name="sub_s", op=ElementwiseOp("sub"), args=("$0", "mx")),
+                            Load(name="x_sm", source=0, index=idx),
+                            Assign(name="sub_s", op=ElementwiseOp("sub"), args=("x_sm", "mx")),
                             Assign(name="ex_s", op=ElementwiseOp("exp"), args=("sub_s",)),
                             Accum(name="sm", value="ex_s", op=ElementwiseOp("add")),
                         ),
@@ -82,7 +88,8 @@ def _softmax_launch() -> LoopLaunch:
                     Loop(
                         axis=a1,
                         body=(
-                            Assign(name="sub_w", op=ElementwiseOp("sub"), args=("$1", "mx")),
+                            Load(name="x_wr", source=1, index=idx),
+                            Assign(name="sub_w", op=ElementwiseOp("sub"), args=("x_wr", "mx")),
                             Assign(name="ex_w", op=ElementwiseOp("exp"), args=("sub_w",)),
                             Assign(name="out", op=ElementwiseOp("div"), args=("ex_w", "sm")),
                             Write(output=0, index=(Var("a0"), Var("a1")), value="out"),
@@ -248,43 +255,40 @@ def _rotate_half_launch() -> LoopLaunch:
     """Build a LoopLaunch mimicking rotary's rotate_half pattern:
 
       for a0 in 0..64:
-          v0 = neg($1)             # $1 at [a0 + 32] — OOB when a0 >= 32 without the Select
+          x_hi = load x[a0 + 32]   # OOB when a0 >= 32 without the Select
+          x_lo = load x[a0 - 32]
+          v0 = neg(x_hi)
           v1 = Select(
-                branch(v0,  a0 < 32),   # use negated lower-upper shift when a0 < 32
-                branch($2,  Literal(1)),  # else use $2 (shifted down)
+                branch(v0,   a0 < 32),   # use negated upper half when a0 < 32
+                branch(x_lo, Literal(1)),  # else use lower half (shifted down)
               )
           out[a0] = v1
 
-    The port $1 reads position ``a0 + 32`` which is in-bounds ONLY when a0 < 32
-    (then positions 32..63). Without the Select's predicate the static checker
-    sees max_index=95, out-of-bounds on a 64-element buffer. With the transitive
-    tracing (neg → Select branch gated by ``a0 < 32``), the checker sees the
-    constraint and the warning is silenced.
+    The load ``x_hi`` reads position ``a0 + 32`` which is in-bounds ONLY when
+    a0 < 32 (then positions 32..63). Without the Select's predicate the static
+    checker sees max_index=95, out-of-bounds on a 64-element buffer. With the
+    transitive tracing (neg → Select branch gated by ``a0 < 32``), the checker
+    sees the constraint and the warning is silenced.
     """
     from deplodock.compiler.ir.expr import BinOp, Literal, Var
-    from deplodock.compiler.ir.loop_ir import Assign, Axis, Loop, LoopOp, Port, Select, SelectBranch, Write
+    from deplodock.compiler.ir.loop_ir import Assign, Axis, Load, Loop, LoopOp, Select, SelectBranch, Write
     from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
     axis_a0 = Axis(name="a0", extent=64)
     body = (
-        Assign(name="v0", op=ElementwiseOp("neg"), args=("$1",)),
+        Load(name="x_hi", source=1, index=(BinOp("+", Var("a0"), Literal(32, "int")),)),
+        Load(name="x_lo", source=2, index=(BinOp("-", Var("a0"), Literal(32, "int")),)),
+        Assign(name="v0", op=ElementwiseOp("neg"), args=("x_hi",)),
         Select(
             name="v1",
             branches=(
                 SelectBranch(value="v0", select=BinOp("<", Var("a0"), Literal(32, "int"))),
-                SelectBranch(value="$2", select=Literal(1, "int")),
+                SelectBranch(value="x_lo", select=Literal(1, "int")),
             ),
         ),
         Write(output=0, index=(Var("a0"),), value="v1"),
     )
-    loop = LoopOp(
-        inputs=(
-            Port(index=(Var("a0"),)),  # $0 — dummy
-            Port(index=(BinOp("+", Var("a0"), Literal(32, "int")),)),  # $1 — the OOB-looking one
-            Port(index=(BinOp("-", Var("a0"), Literal(32, "int")),)),  # $2 — the other half
-        ),
-        body=(Loop(axis=axis_a0, body=body),),
-    )
+    loop = LoopOp(body=(Loop(axis=axis_a0, body=body),))
     return LoopLaunch(loop=loop, input_names=["x", "x", "x"], output_name="out")
 
 
@@ -312,14 +316,14 @@ def test_check_port_bounds_still_warns_without_gating_select():
     """
     from deplodock.compiler.backend.cuda.emit import check_port_bounds
     from deplodock.compiler.ir.expr import BinOp, Literal, Var
-    from deplodock.compiler.ir.loop_ir import Axis, Loop, LoopOp, Port, Write
+    from deplodock.compiler.ir.loop_ir import Axis, Load, Loop, LoopOp, Write
 
     axis_a0 = Axis(name="a0", extent=64)
-    body = (Write(output=0, index=(Var("a0"),), value="$0"),)
-    loop = LoopOp(
-        inputs=(Port(index=(BinOp("+", Var("a0"), Literal(32, "int")),)),),
-        body=(Loop(axis=axis_a0, body=body),),
+    body = (
+        Load(name="x_hi", source=0, index=(BinOp("+", Var("a0"), Literal(32, "int")),)),
+        Write(output=0, index=(Var("a0"),), value="x_hi"),
     )
+    loop = LoopOp(body=(Loop(axis=axis_a0, body=body),))
     launch = LoopLaunch(loop=loop, input_names=["x"], output_name="out")
     program = LoopProgram(
         name="prog",

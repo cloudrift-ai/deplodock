@@ -55,8 +55,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     for stmt in flat:
         if isinstance(stmt, Assign) and isinstance(stmt.op, ElementwiseOp) and stmt.op.fn == "copy" and len(stmt.args) == 1:
             # Record alias and drop the copy — downstream refs will resolve through it.
-            # Args include both SSA names and Port references ($N); both flow fine
-            # through the alias (an Assign's `args` field accepts either form).
             alias[stmt.name] = stmt.args[0]
             dropped += 1
             continue
@@ -81,7 +79,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         return None
 
     new_loop = LoopOp(
-        inputs=loop.inputs,
         body=flat_body_to_nested(loop.axes, tuple(new_body), loop.reduce_axis_names),
     )
 

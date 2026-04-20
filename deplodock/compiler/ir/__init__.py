@@ -12,8 +12,9 @@ One file per IR level:
 - ``tensor``   — minimal post-decomposition IR (``ElementwiseOp``,
                  ``ReduceOp``, ``ScanOp``, ``GatherOp``, ``ScatterOp``,
                  ``IndexMapOp``).
-- ``loop``     — loop IR (``LoopOp`` + ``Axis`` + ``Port`` + SSA
-                 ``Assign`` body). One ``LoopOp`` per GPU kernel.
+- ``loop``     — loop IR (``LoopOp`` + ``Axis`` + body-form ``Load`` +
+                 SSA ``Assign`` / ``Accum`` / ``Write`` / ``Select``
+                 statements). One ``LoopOp`` per GPU kernel.
 - ``gpu``      — GPU IR (imperative C-like AST: ``GpuKernel``, ``Stmt``
                  variants, ``ArrayAccess``, ``Cast``, ``VectorLoad``, ...).
 

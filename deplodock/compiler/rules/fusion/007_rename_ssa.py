@@ -75,7 +75,6 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
             new_body.append(stmt)
 
     new_loop = LoopOp(
-        inputs=loop.inputs,
         body=flat_body_to_nested(loop.axes, tuple(new_body), loop.reduce_axis_names),
     )
 

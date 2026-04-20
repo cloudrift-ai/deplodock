@@ -178,10 +178,13 @@ def _detect_reduce_axis_aliases(
     w = writes[0]
 
     producer_free_names = {a.name for a in producer_op.axes if a.name not in producer_reduce_names}
+    consumer_load_by_source: dict[int, tuple] = {ld.source: ld.index for ld in consumer_op.loads}
     flow_alias_found = False
     for cp in consumer_ports:
-        c_port = consumer_op.inputs[cp]
-        for dim, r_expr in enumerate(c_port.index):
+        reader_index = consumer_load_by_source.get(cp)
+        if reader_index is None:
+            continue
+        for dim, r_expr in enumerate(reader_index):
             if dim >= len(w.index):
                 continue
             if not (isinstance(r_expr, Var) and r_expr.name == c_reduce.name):
@@ -210,23 +213,25 @@ def _find_alias_for(
     consumer_reduce_by_name: dict[str, Axis],
 ) -> str | None:
     """Return the consumer axis name that aliases ``a_p``, or None."""
-    for p_idx, port in enumerate(producer_op.inputs):
+    for p_load in producer_op.loads:
+        p_idx = p_load.source
         if p_idx >= len(producer_node.inputs):
             continue
         p_buf = producer_node.inputs[p_idx]
-        for dim, expr in enumerate(port.index):
+        for dim, expr in enumerate(p_load.index):
             if not (isinstance(expr, Var) and expr.name == a_p.name):
                 continue
-            for c_idx, c_port in enumerate(consumer_op.inputs):
+            for c_load in consumer_op.loads:
+                c_idx = c_load.source
                 if c_idx in consumer_port_set:
                     continue
                 if c_idx >= len(consumer_node.inputs):
                     continue
                 if consumer_node.inputs[c_idx] != p_buf:
                     continue
-                if dim >= len(c_port.index):
+                if dim >= len(c_load.index):
                     continue
-                c_expr = c_port.index[dim]
+                c_expr = c_load.index[dim]
                 if not isinstance(c_expr, Var):
                     continue
                 c_axis = consumer_reduce_by_name.get(c_expr.name)

@@ -9,19 +9,78 @@ multi-reduce, free-axis leakage).
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinOp, Literal, Var
-from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, LoopOp, Port, Write, flat_body_to_nested
+from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Load, Loop, LoopOp, Select, SelectBranch, Write, flat_body_to_nested
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.rules.fusion._merge_core import _bind_axis, _solve_sigma, merge_loop_ops
+
+
+def Port(index=()):
+    """Back-compat test shim — Port is gone at the IR level, but fixtures
+    still spell reads as ``Port(index=...)``. The shim returns the index
+    tuple for ``_loop`` to synthesize body-form Loads from."""
+    return tuple(index)
 
 
 def _loop(*, axes=(), inputs=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
-    Test-local shim: LoopOp.axes is a property over the body's Loop tree,
-    so ``axes=`` feeds ``flat_body_to_nested`` to produce the nested
-    form.
+    Test-local shim: ``LoopOp.axes`` is a property over the body's Loop
+    tree, so ``axes=`` feeds ``flat_body_to_nested`` to produce the
+    nested form. When ``inputs=(...)`` is provided (legacy Port-tuples),
+    each ``$N`` ref is rewritten to a freshly-named Load inserted just
+    before the referencing stmt. Load cache resets at each ``Accum`` and
+    at each nested ``Loop`` so sibling reduce sweeps get scope-local Loads.
     """
-    return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, body))
+    if not inputs:
+        return LoopOp(body=flat_body_to_nested(axes, body))
+
+    index_of = {i: tuple(p) for i, p in enumerate(inputs)}
+    fresh_counter = [0]
+
+    def process(stmts):
+        local_loads: dict[int, str] = {}
+        extra_loads: list = []
+
+        def rewrite_arg(a: str) -> str:
+            if not a.startswith("$"):
+                return a
+            try:
+                src = int(a[1:])
+            except ValueError:
+                return a
+            cached = local_loads.get(src)
+            if cached is not None:
+                return cached
+            fresh_counter[0] += 1
+            name = f"in{src}_{fresh_counter[0]}"
+            local_loads[src] = name
+            extra_loads.append(Load(name=name, source=src, index=index_of[src]))
+            return name
+
+        result: list = []
+        for stmt in stmts:
+            if isinstance(stmt, Assign):
+                stmt = Assign(stmt.name, stmt.op, tuple(rewrite_arg(a) for a in stmt.args))
+            elif isinstance(stmt, Accum):
+                stmt = Accum(stmt.name, rewrite_arg(stmt.value), stmt.op)
+            elif isinstance(stmt, Write):
+                stmt = Write(stmt.output, stmt.index, rewrite_arg(stmt.value))
+            elif isinstance(stmt, Select):
+                stmt = Select(
+                    stmt.name,
+                    tuple(SelectBranch(rewrite_arg(b.value), b.select) for b in stmt.branches),
+                )
+            elif isinstance(stmt, Loop):
+                stmt = Loop(axis=stmt.axis, body=process(stmt.body))
+            result.extend(extra_loads)
+            extra_loads = []
+            result.append(stmt)
+            if isinstance(stmt, Accum):
+                local_loads = {}
+
+        return tuple(result)
+
+    return LoopOp(body=flat_body_to_nested(axes, process(body)))
 
 
 # ---------------------------------------------------------------------------
@@ -111,8 +170,10 @@ def test_merge_elementwise_chain():
     # Merged iteration space = consumer axes (producer's bound a0).
     assert len(merged.axes) == 1
     assert merged.axes[0].name == "a0"
-    # Consumer had 1 port (the producer); producer had 1 port (external). Result: 1 port.
-    assert len(merged.inputs) == 1
+    # Consumer had 1 source (the producer); producer had 1 source (external).
+    # After merge the consumer source is consumed, so only producer's source
+    # survives → 1 distinct source.
+    assert merged.num_inputs == 1
     # Body: producer Assign(neg) → bridge Assign(copy) → consumer Assign(exp) → Write.
     from deplodock.compiler.ir.loop_ir import flatten_body
 
@@ -154,11 +215,12 @@ def test_merge_with_offset_read():
     # Merged iterates over consumer's c0 (extent 3).
     assert merged.axes[0].name == "c0"
     assert merged.axes[0].extent == 3
-    # Producer's Port originally indexed (Var("a0"),); σ["a0"] = Var("c0") + 5,
-    # so the merged Port should read at (c0 + 5,).
-    prod_port = merged.inputs[0]
-    assert len(prod_port.index) == 1
-    idx = prod_port.index[0]
+    # Producer's Load originally indexed (Var("a0"),); σ["a0"] = Var("c0") + 5,
+    # so the merged kernel's Load should read at (c0 + 5,).
+    merged_loads = merged.loads
+    assert len(merged_loads) == 1
+    assert len(merged_loads[0].index) == 1
+    idx = merged_loads[0].index[0]
     assert isinstance(idx, BinOp) and idx.op == "+"
     assert isinstance(idx.left, Var) and idx.left.name == "c0"
     assert isinstance(idx.right, Literal) and idx.right.value == 5

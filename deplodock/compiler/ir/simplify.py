@@ -21,7 +21,7 @@ Entry points:
   (``Var | Literal | BinOp | Builtin | FuncCall | Ternary | Cast``) plus
   the GPU extensions (``ArrayAccess | FieldAccess | VectorLoad``).
 - ``simplify_loop_op(op)`` — walks a ``LoopOp``, seeding Context from its
-  ``Axis`` extents, rewriting every Expr in ``Port.index`` / ``Select`` /
+  ``Axis`` extents, rewriting every Expr in ``Load.index`` / ``Select`` /
   ``Write`` / ``Accum.init``.
 - ``simplify_kernel(k)`` — walks a ``GpuKernel``, seeding Context from
   enclosing ``ForLoop`` bounds (literal start/end only), rewriting every
@@ -67,7 +67,6 @@ from deplodock.compiler.ir.loop_ir import (
     Load,
     Loop,
     LoopOp,
-    Port,
     Select,
     SelectBranch,
     Write,
@@ -387,16 +386,12 @@ def _simplify_loop_stmt(stmt: LoopStmt, ctx: Context) -> LoopStmt:
 def simplify_loop_op(op: LoopOp) -> LoopOp:
     """Simplify every Expr inside a LoopOp. Seeds Context from axis extents.
 
-    Port indices (from the legacy ``inputs`` tuple) are walked with a full-
-    axis Context — they materialize at the innermost point of the iteration
-    space. Body Loads, Accums, Writes, Selects get simplified as the
-    walker descends through Loop blocks, accumulating axis ranges.
+    Body Loads, Accums, Writes, Selects get simplified as the walker
+    descends through Loop blocks, accumulating axis ranges.
     """
     ctx = Context.empty()
     new_body = tuple(_simplify_loop_stmt(s, ctx) for s in op.body)
-    full_ctx = Context({a.name: Interval(0, a.extent - 1) for a in op.axes})
-    new_inputs = tuple(Port(_simplify_expr_tuple(p.index, full_ctx)) for p in op.inputs)
-    return replace(op, inputs=new_inputs, body=new_body)
+    return replace(op, body=new_body)
 
 
 # ---------------------------------------------------------------------------
