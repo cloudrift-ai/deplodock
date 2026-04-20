@@ -358,14 +358,20 @@ def _is_lookthrough(node, productions: list[Production], graph: Graph) -> bool:
 
 
 def _match_grammar_chain(graph: Graph, grammar: ChainGrammar) -> list[ChainMatch]:
-    consumed: set[str] = set()
+    """Return every chain match rooted at a node in topo order.
+
+    Matches are allowed to overlap — e.g. both ``{A, B}`` and ``{B, C}``
+    for a two-production ``producer → consumer`` grammar. The rewriter
+    applies at most one match per iteration (breaks after the first
+    successful ``rewrite``), so overlap is only a candidate enumeration
+    concern, not a correctness one. Returning overlapping matches lets
+    rule 5 (``LoopOp → LoopOp``) try ``{B, C}`` after ``{A, B}`` fails
+    to splice, instead of skipping ``B`` for the rest of the pass.
+    """
     results: list[ChainMatch] = []
     for nid in graph.topological_order():
-        if nid in consumed:
-            continue
-        match = parse_chain(graph, nid, grammar, consumed)
+        match = parse_chain(graph, nid, grammar)
         if match is not None:
-            consumed.update(match.consumed)
             results.append(match)
     return results
 
