@@ -5,11 +5,12 @@ After merge + copy-elimination the surviving SSA names look like
 suffixes and collision-avoidance ``_N`` increments at every hop. Kernel
 semantics are unaffected but the LoopIR pretty-print is unreadable.
 
-This pass walks each LoopOp's flat body in definition order, assigns
-``v0``, ``v1``, ... to each Assign / Select output, and rewrites every
-downstream reference. Accum names (``acc``, ``acc_1``) are already
-short and semantically meaningful — left untouched. Idempotent: a body
-already in ``v0..vN`` form returns None and the rewriter moves on.
+This pass walks each LoopOp's body **preserving its tree shape**, assigns
+``v0``, ``v1``, ... to each Assign / Select / Load output in definition
+order, and rewrites every downstream reference. Accum names (``acc``,
+``acc_1``) are already short and semantically meaningful — left untouched.
+Idempotent: a body already in ``v0..vN`` form returns None and the
+rewriter moves on.
 """
 
 from __future__ import annotations
@@ -19,12 +20,13 @@ from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop_ir import (
     Accum,
     Assign,
+    Load,
+    Loop,
     LoopOp,
     Select,
     SelectBranch,
     Stmt,
     Write,
-    flat_body_to_nested,
     flatten_body,
 )
 from deplodock.compiler.matcher import ChainMatch, Production
@@ -38,12 +40,12 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     if not isinstance(loop, LoopOp):
         return None
 
-    flat = list(flatten_body(loop.body))
+    # Build rename map by pre-order walk of the body (flatten preserves
+    # definition order — that's all we need from it; we don't reshape).
     acc_names = {decl.name for decl in loop.accums}
-
     rename: dict[str, str] = {}
     counter = 0
-    for stmt in flat:
+    for stmt in flatten_body(loop.body):
         if isinstance(stmt, (Assign, Select)):
             if stmt.name in acc_names or stmt.name in rename:
                 continue
@@ -53,30 +55,34 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     if all(old == new for old, new in rename.items()):
         return None  # already canonical
 
-    def rn(arg: str) -> str:
-        return rename.get(arg, arg)
+    def rn(name: str) -> str:
+        return rename.get(name, name)
 
-    new_body: list[Stmt] = []
-    for stmt in flat:
-        if isinstance(stmt, Assign):
-            new_body.append(Assign(name=rn(stmt.name), op=stmt.op, args=tuple(rn(a) for a in stmt.args)))
-        elif isinstance(stmt, Accum):
-            new_body.append(Accum(name=stmt.name, value=rn(stmt.value), op=stmt.op))
-        elif isinstance(stmt, Write):
-            new_body.append(Write(output=stmt.output, index=stmt.index, value=rn(stmt.value)))
-        elif isinstance(stmt, Select):
-            new_body.append(
-                Select(
-                    name=rn(stmt.name),
-                    branches=tuple(SelectBranch(value=rn(br.value), select=br.select) for br in stmt.branches),
+    def walk(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+        out: list[Stmt] = []
+        for stmt in stmts:
+            if isinstance(stmt, Loop):
+                out.append(Loop(axis=stmt.axis, body=walk(stmt.body)))
+            elif isinstance(stmt, Assign):
+                out.append(Assign(name=rn(stmt.name), op=stmt.op, args=tuple(rn(a) for a in stmt.args)))
+            elif isinstance(stmt, Load):
+                out.append(Load(name=stmt.name, source=stmt.source, index=stmt.index))
+            elif isinstance(stmt, Accum):
+                out.append(Accum(name=stmt.name, value=rn(stmt.value), op=stmt.op))
+            elif isinstance(stmt, Write):
+                out.append(Write(output=stmt.output, index=stmt.index, value=rn(stmt.value)))
+            elif isinstance(stmt, Select):
+                out.append(
+                    Select(
+                        name=rn(stmt.name),
+                        branches=tuple(SelectBranch(value=rn(br.value), select=br.select) for br in stmt.branches),
+                    )
                 )
-            )
-        else:
-            new_body.append(stmt)
+            else:
+                out.append(stmt)
+        return tuple(out)
 
-    new_loop = LoopOp(
-        body=flat_body_to_nested(loop.axes, tuple(new_body), loop.reduce_axis_names),
-    )
+    new_loop = LoopOp(body=walk(loop.body))
 
     frag = Graph()
     for inp_id in node.inputs:

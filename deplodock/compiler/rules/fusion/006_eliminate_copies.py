@@ -6,11 +6,11 @@ those bridges stack: ``y = copy(copy(copy(x)))`` with three intermediate SSA
 names. The generated CUDA is unaffected (the codegen collapses copies), but
 the LoopIR pretty-print becomes unreadable.
 
-This pass walks each LoopOp's flat body, treats every ``Assign(name=Y,
-op=ElementwiseOp("copy"), args=(X,))`` as ``Y aliases X``, rewrites every
-downstream reference through the alias chain to its root, and drops the copy
-Assigns themselves. Purely cosmetic — copy is semantically the identity
-function and has no runtime side-effects.
+This pass walks each LoopOp's body **preserving tree shape**, treats every
+``Assign(name=Y, op=ElementwiseOp("copy"), args=(X,))`` as ``Y aliases X``,
+rewrites every downstream reference through the alias chain to its root, and
+drops the copy Assigns themselves. Purely cosmetic — copy is semantically
+the identity function and has no runtime side-effects.
 """
 
 from __future__ import annotations
@@ -20,13 +20,13 @@ from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop_ir import (
     Accum,
     Assign,
+    Load,
+    Loop,
     LoopOp,
     Select,
     SelectBranch,
     Stmt,
     Write,
-    flat_body_to_nested,
-    flatten_body,
 )
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.matcher import ChainMatch, Production
@@ -40,8 +40,8 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     if not isinstance(loop, LoopOp):
         return None
 
-    flat = list(flatten_body(loop.body))
     alias: dict[str, str] = {}
+    dropped = [0]
 
     def resolve(name: str) -> str:
         seen: set[str] = set()
@@ -50,37 +50,40 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
             name = alias[name]
         return name
 
-    new_body: list[Stmt] = []
-    dropped = 0
-    for stmt in flat:
-        if isinstance(stmt, Assign) and isinstance(stmt.op, ElementwiseOp) and stmt.op.fn == "copy" and len(stmt.args) == 1:
-            # Record alias and drop the copy — downstream refs will resolve through it.
-            alias[stmt.name] = stmt.args[0]
-            dropped += 1
-            continue
-
-        if isinstance(stmt, Assign):
-            new_body.append(Assign(name=stmt.name, op=stmt.op, args=tuple(resolve(a) for a in stmt.args)))
-        elif isinstance(stmt, Accum):
-            new_body.append(Accum(name=stmt.name, value=resolve(stmt.value), op=stmt.op))
-        elif isinstance(stmt, Write):
-            new_body.append(Write(output=stmt.output, index=stmt.index, value=resolve(stmt.value)))
-        elif isinstance(stmt, Select):
-            new_body.append(
-                Select(
-                    name=stmt.name,
-                    branches=tuple(SelectBranch(value=resolve(br.value), select=br.select) for br in stmt.branches),
+    def walk(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+        out: list[Stmt] = []
+        for stmt in stmts:
+            if isinstance(stmt, Loop):
+                out.append(Loop(axis=stmt.axis, body=walk(stmt.body)))
+                continue
+            if isinstance(stmt, Assign) and isinstance(stmt.op, ElementwiseOp) and stmt.op.fn == "copy" and len(stmt.args) == 1:
+                alias[stmt.name] = stmt.args[0]
+                dropped[0] += 1
+                continue
+            if isinstance(stmt, Assign):
+                out.append(Assign(name=stmt.name, op=stmt.op, args=tuple(resolve(a) for a in stmt.args)))
+            elif isinstance(stmt, Load):
+                out.append(stmt)
+            elif isinstance(stmt, Accum):
+                out.append(Accum(name=stmt.name, value=resolve(stmt.value), op=stmt.op))
+            elif isinstance(stmt, Write):
+                out.append(Write(output=stmt.output, index=stmt.index, value=resolve(stmt.value)))
+            elif isinstance(stmt, Select):
+                out.append(
+                    Select(
+                        name=stmt.name,
+                        branches=tuple(SelectBranch(value=resolve(br.value), select=br.select) for br in stmt.branches),
+                    )
                 )
-            )
-        else:
-            new_body.append(stmt)
+            else:
+                out.append(stmt)
+        return tuple(out)
 
-    if dropped == 0:
+    new_body = walk(loop.body)
+    if dropped[0] == 0:
         return None
 
-    new_loop = LoopOp(
-        body=flat_body_to_nested(loop.axes, tuple(new_body), loop.reduce_axis_names),
-    )
+    new_loop = LoopOp(body=new_body)
 
     frag = Graph()
     for inp_id in node.inputs:

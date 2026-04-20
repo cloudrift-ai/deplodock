@@ -15,8 +15,8 @@ remain in the graph:
 
 Plus the boundary sentinels ``InputOp`` and ``ConstantOp`` from ``ir.base``.
 Fusion then lifts each tensor op into a trivial ``ir.loop_ir.LoopOp`` and
-merges adjacent LoopOp pairs via the σ-based rule in
-``rules/fusion/005_merge_loop_ops``.
+splices adjacent LoopOp pairs in ``rules/fusion/005_merge_loop_ops`` via
+the tree-splicer in ``rules/fusion/_splice.py``.
 """
 
 from __future__ import annotations

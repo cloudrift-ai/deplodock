@@ -1,12 +1,12 @@
-"""Tests for the fusion pass (lift-then-merge).
+"""Tests for the fusion pass (lift-then-splice).
 
 The fusion pass lifts each tensor op into a trivial ``LoopOp`` and then
-merges adjacent ``LoopOp`` pairs via the σ-based merge rule. Tests verify
-post-fixpoint structural properties (kernel count, graph composition,
-expected ops in SSA bodies) *and* numeric correctness — each fixture is
-executed via ``NumpyBackend`` both pre- and post-fusion, and the outputs
-must match. ``LoopOp.forward`` makes the post-fusion run possible without
-a GPU.
+splices adjacent ``LoopOp`` pairs via the tree-splicer in
+``rules/fusion/_splice.py``. Tests verify post-fixpoint structural
+properties (kernel count, graph composition, expected ops in SSA bodies)
+*and* numeric correctness — each fixture is executed via ``NumpyBackend``
+both pre- and post-fusion, and the outputs must match. ``LoopOp.forward``
+makes the post-fusion run possible without a GPU.
 """
 
 from pathlib import Path
