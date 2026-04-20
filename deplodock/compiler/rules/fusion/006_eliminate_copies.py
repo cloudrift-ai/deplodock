@@ -18,12 +18,12 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop_ir import (
+    Accum,
     Assign,
     LoopOp,
     Select,
     SelectBranch,
     Stmt,
-    Update,
     Write,
     flat_body_to_nested,
     flatten_body,
@@ -63,8 +63,8 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
 
         if isinstance(stmt, Assign):
             new_body.append(Assign(name=stmt.name, op=stmt.op, args=tuple(resolve(a) for a in stmt.args)))
-        elif isinstance(stmt, Update):
-            new_body.append(Update(target=stmt.target, value=resolve(stmt.value)))
+        elif isinstance(stmt, Accum):
+            new_body.append(Accum(name=stmt.name, value=resolve(stmt.value), op=stmt.op))
         elif isinstance(stmt, Write):
             new_body.append(Write(output=stmt.output, index=stmt.index, value=resolve(stmt.value)))
         elif isinstance(stmt, Select):

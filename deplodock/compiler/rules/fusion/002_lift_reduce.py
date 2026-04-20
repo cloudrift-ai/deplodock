@@ -1,7 +1,7 @@
 """Lift ``ReduceOp`` to a single-reduce-axis ``LoopOp``.
 
 The lifted kernel iterates over the full input shape; the reduce axis is
-kind ``"reduce"`` and contributes an ``AccumDecl`` + ``Update`` pair. The
+kind ``"reduce"`` and contributes an ``Accum`` + ``Accum`` pair. The
 Write index covers only free axes (with size-1 placeholders for keep-dim
 outputs).
 """
@@ -11,14 +11,15 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import AccumDecl, Axis, Load, Loop, LoopOp, Port, Stmt, Update, Write
+from deplodock.compiler.ir.loop_ir import Accum, Axis, Load, Loop, LoopOp, Port, Stmt, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
 GRAMMAR = [Production("root", ReduceOp, "1")]
 
-# Identity + combine tables (the same values the old assembler used).
-_IDENTITY: dict[str, float] = {"sum": 0.0, "max": -1e30, "prod": 1.0, "min": 1e30}
+# Map ReduceOp.fn ("sum"/"max"/"min"/"prod") to the combine op name that
+# ``Accum`` carries. Accum init is derived from this op by the Loop IR
+# identity table (``ACCUM_IDENTITY``), so no separate init lookup is needed.
 _COMBINE: dict[str, str] = {"sum": "add", "max": "max", "prod": "mul", "min": "min"}
 
 
@@ -50,22 +51,23 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     load_index = tuple(Var(a.name) for a in axes)
     input_port = Port(index=load_index)
 
-    combine_fn = _COMBINE.get(op.fn, op.fn)
-    init = _IDENTITY.get(op.fn, 0.0)
-    # Emit the accumulator as a body-form AccumDecl at the scope above its
-    # reduce loop. The legacy ``accumulators=`` tuple on LoopOp stays empty;
-    # the validator and readers see the AccumDecl via the body walk.
-    decl = AccumDecl(name="acc", combine=ElementwiseOp(combine_fn), init=Literal(init))
-
+    combine = ElementwiseOp(_COMBINE.get(op.fn, op.fn))
     write_index = _build_write_index(axes, reduce_axis_name, tuple(node.output.shape))
 
-    # Nested body: AccumDecl + Loop(reduce_axis, [Load + Update]) + Write,
-    # wrapped in Loop(free_axis, ...) blocks (outermost first).
+    # Nested body: Loop(reduce_axis, [Load + Accum]) + Write wrapped in
+    # Loop(free_axis, ...) blocks (outermost first). The Accum implicitly
+    # declares the ``acc`` accumulator — its op defines the combine and,
+    # via ACCUM_IDENTITY, the init value.
     reduce_axis = next(a for a in axes if a.name == reduce_axis_name)
     free_axes = [a for a in axes if a.name != reduce_axis_name]
     inner: tuple[Stmt, ...] = (
-        decl,
-        Loop(axis=reduce_axis, body=(Load(name="in0", source=0, index=load_index), Update(target="acc", value="in0"))),
+        Loop(
+            axis=reduce_axis,
+            body=(
+                Load(name="in0", source=0, index=load_index),
+                Accum(name="acc", value="in0", op=combine),
+            ),
+        ),
         Write(output=0, index=write_index, value="acc"),
     )
     body: tuple[Stmt, ...] = inner

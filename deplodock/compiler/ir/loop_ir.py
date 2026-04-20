@@ -4,27 +4,27 @@ After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
     inputs : tuple[Port, ...]   — computed property derived from body Loads
-    body   : tuple[Stmt, ...]   — SSA: Assign | Update | Write | Select | Loop | Load | AccumDecl
+    body   : tuple[Stmt, ...]   — SSA: Assign | Accum | Write | Select | Loop | Load | AccumDecl
     axes   : computed property  — iteration space walked from body's Loop tree
 
 Iteration is explicit via ``Loop(axis, body)`` statements. Each ``Loop``
 is one iteration dimension; ``Loop.body`` runs ``axis.extent`` times.
-Reduce-kind Loops fold ``Update`` statements into an ``AccumDecl``
+Reduce-kind Loops fold ``Accum`` statements into an ``AccumDecl``
 declared inline in the body. Free-kind Loops run in parallel with no
 accumulator folding. Reading top-to-bottom matches execution order.
 
 SSA names defined by ``Assign`` / ``Select`` / ``Load`` inside a
 ``Loop.body`` are scoped to that body — only ``AccumDecl`` state crosses
-Loop boundaries (via ``Update``). Invariants (unique names, defined-
+Loop boundaries (via ``Accum``). Invariants (unique names, defined-
 before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.expr import Expr
+from deplodock.compiler.ir.expr import Expr, Literal
 from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
@@ -40,7 +40,7 @@ class Axis:
     Referenced from ``Expr`` subtrees (inside ``Port.index`` etc.) by
     ``Var(name)``. Free vs reduce is inferred structurally from the body:
     a ``Loop`` over this axis is a reduce loop iff its body (recursively)
-    contains an ``Update``. See ``LoopOp.reduce_axis_names``.
+    contains an ``Accum``. See ``LoopOp.reduce_axis_names``.
 
     ``extent`` is a static integer in v1; future revisions may allow an
     ``Expr`` for dynamic batch/seq dims.
@@ -90,18 +90,34 @@ class Load:
     index: tuple[Expr, ...]
 
 
+# ---------------------------------------------------------------------------
+# Accumulator identity table
+# ---------------------------------------------------------------------------
+#
+# ``Accum`` stmts carry their own reduce op — ``add`` / ``max`` / ``min`` /
+# ``mul``. The init value for the accumulator is derived from the op via
+# this table. No separate declaration stmt is needed: an ``Accum(target,
+# value, op=...)`` inside a reduce ``Loop`` implicitly initializes the
+# accumulator to ``ACCUM_IDENTITY[op.fn]`` before the sweep and folds via
+# ``op`` at each iteration. The target SSA name is bound in the enclosing
+# scope after the Loop.
+
+ACCUM_IDENTITY: dict[str, float] = {
+    "add": 0.0,
+    "sum": 0.0,
+    "max": -1e30,
+    "min": 1e30,
+    "mul": 1.0,
+    "prod": 1.0,
+}
+
+
 @dataclass(frozen=True)
-class AccumDecl:
-    """Declare a reduce accumulator at a body position.
-
-    The accumulator is live from this statement through the end of the
-    enclosing ``Loop.body`` scope. ``Update`` statements with matching
-    ``target`` name fold values into it via ``combine``; stmts after the
-    reduce sweep read the finalized value by SSA name.
-
-    Semantics per ``Update``: ``acc = combine(acc, value)``, initialized
-    to ``init`` before the reduce sweep. One ``AccumDecl`` per accumulator;
-    duplicates are rejected by the validator.
+class _AccumMeta:
+    """Fixture helper — declares an accumulator's combine / init for shim
+    backfill. Not a body statement. Test ``_loop(accumulators=...)`` callers
+    pass one of these per accumulator; the shim copies ``combine`` onto the
+    matching body ``Accum.op``. Production code never constructs these.
     """
 
     name: str
@@ -109,12 +125,11 @@ class AccumDecl:
     init: Expr
 
 
-# Backwards-compatible alias. ``Accumulator`` used to be a side-channel
-# ``LoopOp.accumulators`` tuple entry; now it's just an ``AccumDecl`` living
-# in the body. Readers / tests that still import ``Accumulator`` get the
-# same dataclass — constructing one is interchangeable with constructing an
-# ``AccumDecl``.
-Accumulator = AccumDecl
+# Legacy aliases for fixture readability. Both resolve to ``_AccumMeta``;
+# the old ``Accumulator(name, combine, init)`` and ``AccumDecl(...)`` calls
+# keep compiling.
+AccumDecl = _AccumMeta
+Accumulator = _AccumMeta
 
 
 @dataclass(frozen=True)
@@ -122,7 +137,7 @@ class Assign:
     """Pure SSA body statement: ``name = op(args)``.
 
     ``op`` is always an ``ElementwiseOp`` (reductions have moved to
-    ``Accumulator`` + ``Update``). ``args`` reference ``$N`` ports,
+    ``Accumulator`` + ``Accum``). ``args`` reference ``$N`` ports,
     ``Accumulator.name`` (reads current / finalized acc value), or prior
     SSA names.
     """
@@ -133,20 +148,42 @@ class Assign:
 
 
 @dataclass(frozen=True)
-class Update:
-    """Fold a value into an Accumulator.
+class Accum:
+    """Reduce accumulator — declares-and-folds in one statement.
 
-    Semantics: ``acc = combine(acc, value)`` using the Accumulator's
-    ``combine`` op. ``target`` must name an ``Accumulator``; ``value``
-    references an SSA name (Assign, prior Update target finalized, or
-    ``$N``).
+    Semantics: ``name = op(name, value)`` inside the enclosing reduce
+    ``Loop``. Before the first iteration ``name`` is initialized to
+    ``ACCUM_IDENTITY[op.fn]``. After the Loop completes, ``name`` is an
+    SSA binding visible in the enclosing scope, carrying the finalized
+    reduced value.
 
-    The positionally-last Update in ``LoopOp.body`` marks the end of the
-    reduce sweep: statements after read finalized accumulators.
+    ``op`` is one of ``add`` / ``max`` / ``min`` / ``mul`` — it defines
+    both the combine operation and the accumulator's identity value.
+    Multiple ``Accum`` stmts targeting the same ``name`` in one reduce
+    Loop must agree on ``op`` (they're folding into the same accumulator).
+
+    Default op is ``add`` — fixtures that sum values can omit ``op=``;
+    ``max`` / ``min`` / ``mul`` must be passed explicitly.
     """
 
-    target: str
+    name: str
     value: str
+    op: ElementwiseOp = field(default_factory=lambda: ElementwiseOp("add"))
+
+    @property
+    def init(self) -> Expr:
+        """Identity value for the accumulator (``ACCUM_IDENTITY[op.fn]``).
+
+        Exposed as an attribute so readers that need an ``Expr`` init (loop
+        backend, emit) don't have to re-implement the lookup.
+        """
+        return Literal(ACCUM_IDENTITY.get(self.op.fn, 0.0))
+
+    @property
+    def combine(self) -> ElementwiseOp:
+        """Alias for :attr:`op` — matches the legacy ``Accum.combine``
+        field name so older reader code keeps working."""
+        return self.op
 
 
 @dataclass(frozen=True)
@@ -196,13 +233,13 @@ class Loop:
     """Explicit iteration block — one loop over an axis.
 
     ``body`` executes ``axis.extent`` times, once per axis value. Reduce-kind
-    Loops fold any ``Update`` statements in their body into the enclosing
+    Loops fold any ``Accum`` statements in their body into the enclosing
     ``Accumulator`` (one sweep over the axis per accumulator). Free-kind
     Loops run in parallel with no folding.
 
     SSA scoping: ``Assign`` / ``Select`` names defined inside ``body`` are
     scoped to that body — invisible to statements outside the Loop. Only
-    ``Accumulator`` state (written via ``Update``) crosses the Loop
+    ``Accumulator`` state (written via ``Accum``) crosses the Loop
     boundary, carrying the finalized reduced value.
     """
 
@@ -210,7 +247,7 @@ class Loop:
     body: tuple[Stmt, ...]
 
 
-Stmt = Assign | Update | Write | Select | Loop | Load | AccumDecl
+Stmt = Assign | Accum | Write | Select | Loop | Load
 
 
 # ---------------------------------------------------------------------------
@@ -257,16 +294,16 @@ class LoopOp(Op):
 
     @property
     def reduce_axis_names(self) -> frozenset[str]:
-        """Names of axes whose Loop directly wraps an ``Update``.
+        """Names of axes whose Loop directly wraps an ``Accum``.
 
         Derived from body structure, not stored metadata: a Loop is a
-        'reduce Loop' iff its immediate body contains an Update.
+        'reduce Loop' iff its immediate body contains an Accum.
         """
         names: set[str] = set()
 
         def walk(stmts: tuple[Stmt, ...], innermost: str | None) -> None:
             for s in stmts:
-                if isinstance(s, Update) and innermost is not None:
+                if isinstance(s, Accum) and innermost is not None:
                     names.add(innermost)
                 elif isinstance(s, Loop):
                     walk(s.body, s.axis.name)
@@ -306,31 +343,37 @@ class LoopOp(Op):
         return max((ld.source for ld in loads), default=-1) + 1
 
     @property
-    def accum_decls(self) -> tuple[AccumDecl, ...]:
-        """All ``AccumDecl`` statements in the body, pre-order.
+    def accums(self) -> tuple[Accum, ...]:
+        """Unique reduce accumulators in the body, pre-order by first use.
 
-        Scope is lexical — each AccumDecl is live from its position through
-        the end of the enclosing ``Loop.body`` (or the kernel body, at top
-        level).
+        Walks the body; for each distinct ``Accum.name`` returns the first
+        ``Accum`` stmt that targets it. Callers read ``accum.name``,
+        ``accum.op`` (the combine), and ``accum.init`` (identity derived
+        from op) directly without a separate summary type.
         """
-        result: list[AccumDecl] = []
+        seen: dict[str, Accum] = {}
 
         def walk(stmts: tuple[Stmt, ...]) -> None:
             for s in stmts:
-                if isinstance(s, AccumDecl):
-                    result.append(s)
+                if isinstance(s, Accum):
+                    if s.name not in seen:
+                        seen[s.name] = s
                 elif isinstance(s, Loop):
                     walk(s.body)
 
         walk(self.body)
-        return tuple(result)
+        return tuple(seen.values())
+
+    # Legacy aliases — older readers spell the property as ``accum_decls`` or
+    # ``accumulators``. Both resolve to the same tuple of unique ``Accum``
+    # stmts as ``accums``.
+    @property
+    def accum_decls(self) -> tuple[Accum, ...]:
+        return self.accums
 
     @property
-    def accumulators(self) -> tuple[AccumDecl, ...]:
-        """Alias for :attr:`accum_decls` — kept for readers that still use
-        ``loop.accumulators``. New code should use ``accum_decls`` directly.
-        """
-        return self.accum_decls
+    def accumulators(self) -> tuple[Accum, ...]:
+        return self.accums
 
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
@@ -399,7 +442,7 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
     buffers = list(port_buffers) if port_buffers else [f"${i}" for i in range(nbufs)]
     while len(buffers) < nbufs:
         buffers.append(f"${len(buffers)}")
-    accs_by_name: dict[str, AccumDecl] = {d.name: d for d in loop.accum_decls}
+    accs_by_name: dict[str, Accum] = {d.name: d for d in loop.accum_decls}
 
     def render_arg(name: str) -> str:
         if name.startswith("$"):
@@ -420,7 +463,7 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
 def _render_body(
     stmts: tuple[Stmt, ...],
     indent: str,
-    accs_by_name: dict[str, AccumDecl],
+    accs_by_name: dict[str, Accum],
     render_arg,
     buffers: list[str],
     lines: list[str],
@@ -434,12 +477,8 @@ def _render_body(
             buf = buffers[stmt.source] if 0 <= stmt.source < len(buffers) else f"src{stmt.source}"
             idx = ", ".join(render_expr(e) for e in stmt.index)
             lines.append(f"{indent}{stmt.name} = load {buf}[{idx}]")
-        elif isinstance(stmt, AccumDecl):
-            lines.append(f"{indent}{stmt.name} = {render_expr(stmt.init)}  # accum, combine={stmt.combine.fn}")
-        elif isinstance(stmt, Update):
-            acc = accs_by_name.get(stmt.target)
-            fn = acc.combine.fn if acc is not None else "?"
-            lines.append(f"{indent}{stmt.target} <- {fn}({stmt.target}, {render_arg(stmt.value)})")
+        elif isinstance(stmt, Accum):
+            lines.append(f"{indent}{stmt.name} <- {stmt.op.fn}({stmt.name}, {render_arg(stmt.value)})")
         elif isinstance(stmt, Write):
             idx = ", ".join(render_expr(e) for e in stmt.index)
             lines.append(f"{indent}out{stmt.output}[{idx}] = {render_arg(stmt.value)}")
@@ -449,8 +488,8 @@ def _render_body(
                 lines.append(f"{indent}{prefix} {render_arg(br.value)} when ({render_expr(br.select)})")
         elif isinstance(stmt, Loop):
             a = stmt.axis
-            # Kind is structural: a Loop whose immediate body contains an Update is a reduce Loop.
-            kind = "reduce" if any(isinstance(s, Update) for s in stmt.body) else "free"
+            # Kind is structural: a Loop whose immediate body contains an Accum is a reduce Loop.
+            kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
             lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {kind}")
             _render_body(stmt.body, indent + "    ", accs_by_name, render_arg, buffers, lines)
 
@@ -464,10 +503,10 @@ def _validate(loop: LoopOp) -> None:
     """Enforce Axis uniqueness, SSA invariants, accumulator pairing.
 
     Body validation recurses into ``Loop`` blocks. SSA names defined inside a
-    ``Loop.body`` are scoped to that body — invisible outside. Only
-    ``AccumDecl`` state crosses Loop boundaries (via ``Update``).
-    Axis names (from the stored ``LoopOp.axes`` and from any nested Loops) are
-    validated as a flat set for uniqueness across the kernel.
+    ``Loop.body`` are scoped to that body — invisible outside — except for
+    ``Accum.name`` names, which are bound post-Loop in the enclosing
+    scope. Axis names are validated as a flat set for uniqueness across
+    the kernel.
     """
     # LoopOp.axes uniqueness (stored axes).
     all_axis_names: set[str] = set()
@@ -476,28 +515,36 @@ def _validate(loop: LoopOp) -> None:
             raise ValueError(f"LoopOp.axes: duplicate axis name {a.name!r}")
         all_axis_names.add(a.name)
 
-    # Accumulator uniqueness — AccumDecls walked from the body tree.
-    accumulators: dict[str, AccumDecl] = {}
-    for decl in loop.accum_decls:
-        if decl.name in accumulators:
-            raise ValueError(f"Accumulator: duplicate name {decl.name!r}")
-        accumulators[decl.name] = decl
+    # Accumulator op-consistency: all Updates targeting the same name must
+    # share the same combine op (they're folding into the same accumulator).
+    accumulators: dict[str, Accum] = {}
+    for info in loop.accum_decls:
+        if info.name in accumulators:
+            raise ValueError(f"Accumulator: duplicate name {info.name!r}")
+        accumulators[info.name] = info
 
     # Kernel-scope names (visible everywhere): $N ports (legacy form, used by
-    # a few test fixtures that still spell args as ``$0``). Body-level Load /
-    # AccumDecl bindings get added as the walk encounters them.
+    # a few test fixtures that still spell args as ``$0``). Body-level Load
+    # / Accum targets become in-scope names as the walk encounters them.
+    # Accum.name also populates the enclosing scope after its Loop
+    # returns — handled by merging inner-scope accumulator targets back out.
     kernel_scope: set[str] = {f"${i}" for i in range(len(loop.inputs))}
 
-    update_targets: set[str] = set()
+    # Op-consistency across repeated Updates to same target.
+    target_ops: dict[str, ElementwiseOp] = {}
 
-    def _walk(stmts: tuple[Stmt, ...], defined: set[str]) -> None:
-        """Validate a body scope. ``defined`` contains in-scope SSA names.
+    def _walk(stmts: tuple[Stmt, ...], defined: set[str]) -> set[str]:
+        """Validate a body scope. Returns the set of ``Accum.name`` names
+        that propagate to the enclosing scope after this body completes
+        (they carry the accumulator's finalized value).
+
         Sibling Loops with the same axis name are fine — that's the softmax
         pattern (two sequential sweeps over the same axis). Nested Loops
         that re-use an outer axis name are left to backend codegen to
         disambiguate (the axis is only referenced as Var(name), and SSA
         scoping handles variable shadowing).
         """
+        exported_accs: set[str] = set()
         for stmt in stmts:
             if isinstance(stmt, Assign):
                 for arg in stmt.args:
@@ -515,16 +562,17 @@ def _validate(loop: LoopOp) -> None:
                 if stmt.name in defined:
                     raise ValueError(f"Load {stmt.name!r}: name already defined")
                 defined.add(stmt.name)
-            elif isinstance(stmt, AccumDecl):
-                # AccumDecl uniqueness was checked above (across field + body).
-                # Here just confirm the name becomes an in-scope readable value.
+            elif isinstance(stmt, Accum):
+                if stmt.value not in defined and stmt.name != stmt.value:
+                    raise ValueError(f"Accum: value {stmt.value!r} not defined")
+                # Each Accum implicitly declares / extends an accumulator.
+                # Repeated Updates to same target must share op.
+                prev_op = target_ops.get(stmt.name)
+                if prev_op is not None and prev_op.fn != stmt.op.fn:
+                    raise ValueError(f"Accum {stmt.name!r}: op {stmt.op.fn!r} conflicts with earlier Accum's op {prev_op.fn!r}")
+                target_ops[stmt.name] = stmt.op
                 defined.add(stmt.name)
-            elif isinstance(stmt, Update):
-                if stmt.target not in accumulators:
-                    raise ValueError(f"Update.target {stmt.target!r} does not name an Accumulator")
-                if stmt.value not in defined:
-                    raise ValueError(f"Update: value {stmt.value!r} not defined")
-                update_targets.add(stmt.target)
+                exported_accs.add(stmt.name)
             elif isinstance(stmt, Select):
                 for b in stmt.branches:
                     if b.value not in defined:
@@ -536,15 +584,15 @@ def _validate(loop: LoopOp) -> None:
                 if stmt.value not in defined:
                     raise ValueError(f"Write: value {stmt.value!r} not defined")
             elif isinstance(stmt, Loop):
-                # SSA names defined inside Loop.body are scoped to that body.
-                _walk(stmt.body, set(defined))
+                # SSA names defined inside Loop.body are scoped to that body,
+                # except Accum.names which carry the finalized reduced
+                # value out to the enclosing scope.
+                inner_exports = _walk(stmt.body, set(defined))
+                defined.update(inner_exports)
+                exported_accs.update(inner_exports)
+        return exported_accs
 
     _walk(loop.body, set(kernel_scope))
-
-    # Accumulator liveness: every acc must be updated at least once (anywhere in the tree).
-    for acc_name in accumulators:
-        if acc_name not in update_targets:
-            raise ValueError(f"Accumulator {acc_name!r}: declared but never Updated")
 
 
 # ---------------------------------------------------------------------------
@@ -567,12 +615,12 @@ def iter_loops(body: tuple[Stmt, ...]) -> list[Loop]:
 
 
 def flatten_body(body: tuple[Stmt, ...]) -> list[Stmt]:
-    """Extract leaf statements (``Assign`` / ``Update`` / ``Write`` / ``Select``)
+    """Extract leaf statements (``Assign`` / ``Accum`` / ``Write`` / ``Select``)
     from ``body``, recursing through ``Loop`` blocks.
 
     Useful for consumers that operate on the flat statement sequence
     regardless of block structure (numpy whole-tensor interpreter,
-    Update-boundary segmentation in ``loop_plan.analyze_kernel``). Leaf
+    Accum-boundary segmentation in ``loop_plan.analyze_kernel``). Leaf
     statements come out in pre-order (parent before children); the Loop
     wrappers are transparent — their ``axis`` metadata is discarded at
     this level.
@@ -604,7 +652,7 @@ def flat_body_to_nested(
 
     Pure body transform — takes the flat body + axes hint, returns a new
     body tuple. ``reduce_axis_names`` identifies which axes should become
-    reduce Loops (wrapping ``Update`` segments); the rest are free.
+    reduce Loops (wrapping ``Accum`` segments); the rest are free.
 
     Idempotent: if the body already contains any ``Loop``, returns it
     unchanged.
@@ -613,20 +661,20 @@ def flat_body_to_nested(
 
     - Outer free-axis ``Loop``s wrap everything, innermost = last free axis.
     - Inside the innermost free level, one ``Loop(reduce_axis, body=segment)``
-      per segment produced by splitting the flat body at ``Update`` boundaries.
+      per segment produced by splitting the flat body at ``Accum`` boundaries.
     - Post-reduce ``Assign`` / ``Select`` / ``Write`` statements (everything
-      after the last ``Update``) sit after the reduce Loops.
+      after the last ``Accum``) sit after the reduce Loops.
     - Non-reduce flat bodies are wrapped only in free Loops.
     """
     if any(isinstance(s, Loop) for s in body):
         return tuple(body)
 
     reduce_axis_names = frozenset(reduce_axis_names)
-    has_update = any(isinstance(s, Update) for s in body)
+    has_update = any(isinstance(s, Accum) for s in body)
 
     # If caller didn't specify reduce axis names but the body has Updates,
     # infer from body structure: axes that appear in the Write index are
-    # free; axes that appear ONLY on the Update's data flow (via some
+    # free; axes that appear ONLY on the Accum's data flow (via some
     # Assign/Port reference) but NOT in any Write index are reduce axes.
     # This matches the historical signature where ``Axis.kind`` encoded
     # the distinction. Singleton axes (extent 1) that don't appear in the
@@ -660,32 +708,26 @@ def flat_body_to_nested(
             wrapped = (Loop(axis=a, body=wrapped),)
         return wrapped
 
-    # Reduce body: split at Updates into segments.
+    # Reduce body: split at Updates into segments. Each Accum terminates
+    # a segment that gets wrapped in a reduce ``Loop``; the Accum implicitly
+    # declares its accumulator (via its ``op`` field), which becomes visible
+    # in the enclosing scope after the Loop completes.
     reduce_axes = [a for a in axes if a.name in reduce_axis_names]
     if len(reduce_axes) != 1:
         # Malformed or multi-reduce flat — leave unchanged; caller/validator flags.
         return tuple(body)
     reduce_axis = reduce_axes[0]
 
-    # Split body into segments at Update boundaries. AccumDecls are hoisted
-    # OUT of their segment (they must live at the scope enclosing the reduce
-    # Loop so Write stmts after the reduce can read the finalized accumulator
-    # value). Every other stmt stays in the segment leading up to the Update.
     segments: list[list[Stmt]] = []
     current: list[Stmt] = []
-    hoisted_decls: list[Stmt] = []
     for stmt in body:
-        if isinstance(stmt, AccumDecl):
-            hoisted_decls.append(stmt)
-            continue
         current.append(stmt)
-        if isinstance(stmt, Update):
+        if isinstance(stmt, Accum):
             segments.append(current)
             current = []
-    tail = current  # post-last-Update stmts
+    tail = current  # post-last-Accum stmts
 
     nested: list[Stmt] = []
-    nested.extend(hoisted_decls)
     for seg in segments:
         nested.append(Loop(axis=reduce_axis, body=tuple(seg)))
     nested.extend(tail)

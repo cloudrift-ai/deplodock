@@ -1,7 +1,7 @@
 """Tests for the compile_graph pipeline: decomposition → optimization → fusion → extract.
 
 After compile_graph, every primitive op is inside a LoopOp. Reductions
-live as ``Accumulator + Update`` on the LoopOp; elementwise ops as
+live as ``Accum + Accum`` on the LoopOp; elementwise ops as
 ``Assign``; final output as a ``Write``.
 
 Structural fixtures also have a matching ``*_correctness`` test that runs
@@ -18,7 +18,7 @@ import numpy as np
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Assign, Update, Write
+from deplodock.compiler.ir.loop_ir import Accum, Assign, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.rewriter import Rewriter
@@ -60,7 +60,7 @@ def _elementwise_fns(body) -> list[str]:
 def _has_update(body) -> bool:
     from deplodock.compiler.ir.loop_ir import flatten_body
 
-    return any(isinstance(s, Update) for s in flatten_body(body))
+    return any(isinstance(s, Accum) for s in flatten_body(body))
 
 
 def _has_write(body) -> bool:
@@ -111,7 +111,7 @@ def test_reduce_sum():
     assert len(launches) == 1
     loop = launches[0].loop
     assert _has_update(loop.body)
-    # Reduction target is a Accumulator with combine=add (sum).
+    # Reduction target is a Accum with combine=add (sum).
     assert any(lb.combine.fn == "add" for lb in (tuple(loop.accumulators) + tuple(loop.accum_decls)))
 
 
@@ -127,7 +127,7 @@ def test_matmul():
 
     result = compile_graph(g)
     launches = result.launches
-    # Expect a mul Assign and a sum Update somewhere across the launches.
+    # Expect a mul Assign and a sum Accum somewhere across the launches.
     has_mul = any("mul" in _elementwise_fns(k.loop.body) for k in launches)
     has_sum = any(any(lb.combine.fn == "add" for lb in (tuple(k.loop.accumulators) + tuple(k.loop.accum_decls))) for k in launches)
     assert has_mul

@@ -7,7 +7,7 @@ semantics are unaffected but the LoopIR pretty-print is unreadable.
 
 This pass walks each LoopOp's flat body in definition order, assigns
 ``v0``, ``v1``, ... to each Assign / Select output, and rewrites every
-downstream reference. Accumulator names (``acc``, ``acc_1``) are already
+downstream reference. Accum names (``acc``, ``acc_1``) are already
 short and semantically meaningful — left untouched. Idempotent: a body
 already in ``v0..vN`` form returns None and the rewriter moves on.
 """
@@ -17,12 +17,12 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop_ir import (
+    Accum,
     Assign,
     LoopOp,
     Select,
     SelectBranch,
     Stmt,
-    Update,
     Write,
     flat_body_to_nested,
     flatten_body,
@@ -60,8 +60,8 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     for stmt in flat:
         if isinstance(stmt, Assign):
             new_body.append(Assign(name=rn(stmt.name), op=stmt.op, args=tuple(rn(a) for a in stmt.args)))
-        elif isinstance(stmt, Update):
-            new_body.append(Update(target=stmt.target, value=rn(stmt.value)))
+        elif isinstance(stmt, Accum):
+            new_body.append(Accum(name=stmt.name, value=rn(stmt.value), op=stmt.op))
         elif isinstance(stmt, Write):
             new_body.append(Write(output=stmt.output, index=stmt.index, value=rn(stmt.value)))
         elif isinstance(stmt, Select):

@@ -15,7 +15,7 @@ When the consumer reads the producer at *multiple* distinct reader indices
 ``[row, col]`` for the post-reduce divide and ``[row, k]`` for the sum
 sweep), each port gets its own σ_k. Producer axes bound identically across
 all σ_k become part of a shared σ_common — the producer's pre-reduce body
-(up to and including the last ``Update``) is emitted once using σ_common.
+(up to and including the last ``Accum``) is emitted once using σ_common.
 The producer's post-reduce body is instantiated *per σ_k*, with distinct
 SSA names and a distinct bridge value that the matching consumer port ref
 is rewritten to.
@@ -24,7 +24,7 @@ Legality (semantic only — scheduling lives in the backend):
 - every unbound producer axis must be a reduce axis (leaking a producer
   free axis would require replicating producer work per consumer slot);
 - the producer's pre-reduce statements must not reference axes that are
-  bound differently across σ_k (replicating the Update under disagreeing
+  bound differently across σ_k (replicating the Accum under disagreeing
   bindings is semantically ambiguous).
 """
 
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinOp, Cast, Expr, Literal, Var, substitute
 from deplodock.compiler.ir.loop_ir import (
-    AccumDecl,
+    Accum,
     Assign,
     Axis,
     Load,
@@ -41,7 +41,6 @@ from deplodock.compiler.ir.loop_ir import (
     Select,
     SelectBranch,
     Stmt,
-    Update,
     Write,
 )
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
@@ -156,17 +155,17 @@ def merge_loop_ops(
     if consumer_reduce_count + len(unbound_axes) > 1:
         return None
 
-    # Split producer body at the last Update. Pre-reduce includes the Update.
+    # Split producer body at the last Accum. Pre-reduce includes the Accum.
     last_update_idx = -1
     for i, stmt in enumerate(producer_flat):
-        if isinstance(stmt, Update):
+        if isinstance(stmt, Accum):
             last_update_idx = i
     pre_reduce_stmts = producer_flat[: last_update_idx + 1]
     post_reduce_stmts = producer_flat[last_update_idx + 1 :]
 
     # Pre-reduce stmts may only reference bound_common / aliased / unbound axes —
     # never specific_names (which disagree across σ_k). Enforcing this keeps the
-    # Update emission unambiguous. "Reference" here includes the axes that
+    # Accum emission unambiguous. "Reference" here includes the axes that
     # appear in the index Expr of any Port the stmt reads via `$N`, and the
     # axes that appear in any body-form Load.index expression — both
     # materialize under σ_k substitution and so must not drift across σ_k.
@@ -191,7 +190,7 @@ def merge_loop_ops(
                     return None
 
     axis_rename = _fresh_axis_names(unbound_axes, consumer.axes)
-    # AccumDecl name collisions across producer and consumer bodies. Renamed
+    # Accum name collisions across producer and consumer bodies. Renamed
     # producer decl names propagate through _rewrite_body so the merged body
     # ends up with unique accumulator names.
     local_rename = _fresh_local_names(producer.accum_decls, consumer.accum_decls)
@@ -315,12 +314,9 @@ def merge_loop_ops(
                 # consumed ports.
                 new_source = consumer_port_remap.get(stmt.source, stmt.source)
                 body.append(Load(name=stmt.name, source=new_source, index=stmt.index))
-        elif isinstance(stmt, AccumDecl):
-            # Consumer AccumDecl passes through unchanged.
-            body.append(stmt)
-        elif isinstance(stmt, Update):
+        elif isinstance(stmt, Accum):
             new_value = rewrite_arg(stmt.value)
-            body.append(Update(target=stmt.target, value=new_value))
+            body.append(Accum(name=stmt.name, value=new_value, op=stmt.op))
         elif isinstance(stmt, Write):
             body.append(Write(output=stmt.output, index=stmt.index, value=rewrite_arg(stmt.value)))
         elif isinstance(stmt, Select):
@@ -414,8 +410,8 @@ def _fresh_axis_names(to_rename: list[Axis], taken: tuple[Axis, ...]) -> dict[st
 
 
 def _fresh_local_names(
-    to_rename: tuple[AccumDecl, ...],
-    taken: tuple[AccumDecl, ...],
+    to_rename: tuple[Accum, ...],
+    taken: tuple[Accum, ...],
 ) -> dict[str, str]:
     used = {lb.name for lb in taken}
     result: dict[str, str] = {}
@@ -502,7 +498,7 @@ def _stmt_refs_axes(stmt: Stmt, axis_names: set[str]) -> bool:
         return any(_expr_refs_axes(e, axis_names) for e in stmt.index)
     if isinstance(stmt, Select):
         return any(_expr_refs_axes(br.select, axis_names) for br in stmt.branches)
-    # Assign and Update don't reference axes directly — their args are SSA
+    # Assign and Accum don't reference axes directly — their args are SSA
     # names. Axis references only live in Port index exprs and in Write /
     # Select expressions.
     return False
@@ -534,7 +530,7 @@ def _stmt_port_refs_axes(stmt: Stmt, port_axes: dict[int, set[str]], axis_names:
     args: tuple[str, ...] = ()
     if isinstance(stmt, Assign):
         args = stmt.args
-    elif isinstance(stmt, Update):
+    elif isinstance(stmt, Accum):
         args = (stmt.value,)
     elif isinstance(stmt, Write):
         args = (stmt.value,)
@@ -599,21 +595,14 @@ def _rewrite_body(
                     index=tuple(substitute(e, sigma) for e in stmt.index),
                 )
             )
-        elif isinstance(stmt, AccumDecl):
-            # AccumDecl stays verbatim (name may get renamed via local_rename
-            # for collision avoidance with another kernel's accumulator).
+        elif isinstance(stmt, Accum):
+            # Accum: rename target if collision-renamed; value via SSA
+            # rename; op passes through (it determines combine + init).
             result.append(
-                AccumDecl(
+                Accum(
                     name=local_rename.get(stmt.name, stmt.name),
-                    combine=stmt.combine,
-                    init=substitute(stmt.init, sigma),
-                )
-            )
-        elif isinstance(stmt, Update):
-            result.append(
-                Update(
-                    target=local_rename.get(stmt.target, stmt.target),
                     value=rn(stmt.value),
+                    op=stmt.op,
                 )
             )
         elif isinstance(stmt, Write):
