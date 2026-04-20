@@ -59,10 +59,10 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         return None
 
     # Build the merged node's ``inputs`` list in the same order the splicer
-    # renumbered sources: consumer's retained inputs first (drop the target
-    # source), then producer's inputs appended.
-    merged_input_ids: list[str] = [inp for i, inp in enumerate(consumer_node.inputs) if i != target_source]
-    merged_input_ids.extend(producer_node.inputs)
+    # renumbered sources: producer's inputs first, then consumer's retained
+    # inputs (dropping the target source).
+    merged_input_ids: list[str] = list(producer_node.inputs)
+    merged_input_ids.extend(inp for i, inp in enumerate(consumer_node.inputs) if i != target_source)
 
     frag = Graph()
     for inp_id in merged_input_ids:
