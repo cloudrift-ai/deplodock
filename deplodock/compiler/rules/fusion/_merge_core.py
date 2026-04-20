@@ -193,7 +193,7 @@ def merge_loop_ops(
     # Accum name collisions across producer and consumer bodies. Renamed
     # producer decl names propagate through _rewrite_body so the merged body
     # ends up with unique accumulator names.
-    local_rename = _fresh_local_names(producer.accum_decls, consumer.accum_decls)
+    local_rename = _fresh_local_names(producer.accums, consumer.accums)
     ssa_rename_common = _fresh_ssa_map(producer, consumer, local_rename)
 
     # Augment each σ_k with bindings for unbound axes (they survive as new axes).
@@ -436,7 +436,7 @@ def _fresh_ssa_map(
         if isinstance(stmt, (Assign, Select, Load)):
             producer_ssa.add(stmt.name)
 
-    consumer_names: set[str] = {d.name for d in consumer.accum_decls}
+    consumer_names: set[str] = {d.name for d in consumer.accums}
     for stmt in flatten_body(consumer.body):
         if isinstance(stmt, (Assign, Select, Load)):
             consumer_names.add(stmt.name)
@@ -472,7 +472,7 @@ def _all_defined_names(
 
     names: set[str] = set()
     for op in (producer, consumer):
-        for decl in op.accum_decls:
+        for decl in op.accums:
             names.add(decl.name)
         for stmt in flatten_body(op.body):
             if isinstance(stmt, (Assign, Select, Load)):

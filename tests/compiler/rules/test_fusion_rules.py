@@ -206,7 +206,7 @@ def test_contraction_body_has_mul_and_sum():
     kernel = _kernel_nodes(result)[0]
     assert "mul" in _assign_fns(kernel.op.body)
     assert _has_update(kernel.op.body)
-    assert "add" in _local_combine_fns(tuple(kernel.op.accumulators) + tuple(kernel.op.accum_decls))
+    assert "add" in _local_combine_fns(kernel.op.accums)
 
 
 # ===================================================================
@@ -274,7 +274,7 @@ def test_softmax_body_covers_all_ops():
     all_fns = set()
     for k in _kernel_nodes(result):
         all_fns |= set(_assign_fns(k.op.body))
-        all_fns |= _local_combine_fns(tuple(k.op.accumulators) + tuple(k.op.accum_decls))
+        all_fns |= _local_combine_fns(k.op.accums)
     # Expect elementwise sub/exp/div and reduce combine add/max from the
     # max and sum accumulators.
     assert {"sub", "exp", "div"} <= all_fns
@@ -314,9 +314,7 @@ def test_ssa_invariants_hold():
             if isinstance(inp, Port):
                 defined.add(f"${port_idx}")
                 port_idx += 1
-        for lb in k.op.accumulators:
-            defined.add(lb.name)
-        for decl in k.op.accum_decls:
+        for decl in k.op.accums:
             defined.add(decl.name)
         from deplodock.compiler.ir.loop_ir import Accum, Load
 
@@ -408,7 +406,7 @@ def test_sibling_reductions_share_reduce_axis():
 def test_sibling_reductions_have_both_accumulators():
     result = _fuse(_make_sibling_reductions())
     kernel = _kernel_nodes(result)[0]
-    combine_fns = _local_combine_fns(tuple(kernel.op.accumulators) + tuple(kernel.op.accum_decls))
+    combine_fns = _local_combine_fns(kernel.op.accums)
     assert {"add", "max"} <= combine_fns
 
 
@@ -440,7 +438,7 @@ def test_softmax_single_reduce_axis():
 def test_softmax_has_both_accumulators():
     result = _fuse(_make_softmax())
     kernel = _kernel_nodes(result)[0]
-    combine_fns = _local_combine_fns(tuple(kernel.op.accumulators) + tuple(kernel.op.accum_decls))
+    combine_fns = _local_combine_fns(kernel.op.accums)
     assert {"add", "max"} <= combine_fns, f"missing accumulators: {combine_fns}"
 
 

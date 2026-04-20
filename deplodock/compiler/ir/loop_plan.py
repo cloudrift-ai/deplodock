@@ -123,7 +123,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
     from deplodock.compiler.ir.loop_ir import flatten_body
 
     flat_all = tuple(flatten_body(kernel.body))
-    accumulator_names = {decl.name for decl in kernel.accum_decls}
+    accumulator_names = {decl.name for decl in kernel.accums}
     row_space: set[str] = {name for name in input_ports if name not in per_elem_ports}
     row_space |= accumulator_names
     elem_space: set[str] = set(per_elem_ports)
@@ -165,7 +165,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         )
 
     # --- Reduce: build steps by walking inner_body left-to-right. ---
-    acc_map = {decl.name: decl for decl in kernel.accum_decls}
+    acc_map = {decl.name: decl for decl in kernel.accums}
     steps = []
     prior_ew: list[Assign] = []
     acc_count = 0

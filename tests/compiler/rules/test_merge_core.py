@@ -9,35 +9,19 @@ multi-reduce, free-axis leakage).
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinOp, Literal, Var
-from deplodock.compiler.ir.loop_ir import Accum, Accumulator, Assign, Axis, LoopOp, Port, Write, flat_body_to_nested
+from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, LoopOp, Port, Write, flat_body_to_nested
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.rules.fusion._merge_core import _bind_axis, _solve_sigma, merge_loop_ops
 
 
-def _loop(*, axes=(), inputs=(), accumulators=(), body=()):
+def _loop(*, axes=(), inputs=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
     Test-local shim: LoopOp.axes is a property over the body's Loop tree,
-    so ``axes=`` feeds ``flat_body_to_nested`` instead. ``accumulators=``
-    is gone at the IR level — reductions carry their combine op on each
-    ``Accum``. The shim backfills ``Accum.op`` from the ``accumulators``
-    tuple when a fixture's ``Accum(name=..., value=...)`` omits it,
-    keeping legacy tests readable.
+    so ``axes=`` feeds ``flat_body_to_nested`` to produce the nested
+    form.
     """
-    acc_ops = {a.name: a.combine for a in accumulators}
-    body = tuple(_backfill_update_op(s, acc_ops) for s in body)
     return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, body))
-
-
-def _backfill_update_op(stmt, acc_ops):
-    """Apply ``acc_ops`` to each Accum that defaulted to ``add`` but whose
-    target is declared with a non-add combine via the fixture's legacy
-    ``accumulators=`` kwarg."""
-    if isinstance(stmt, Accum):
-        desired = acc_ops.get(stmt.name)
-        if desired is not None and stmt.op.fn == "add" and desired.fn != "add":
-            return Accum(name=stmt.name, value=stmt.value, op=desired)
-    return stmt
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +96,6 @@ def _simple_elementwise(fn: str, axis_name: str = "a0", extent: int = 8) -> Loop
     return _loop(
         axes=(Axis(name=axis_name, extent=extent),),
         inputs=(Port(index=(Var(axis_name),)),),
-        accumulators=(),
         body=(
             Assign(name="v", op=ElementwiseOp(fn), args=("$0",)),
             Write(output=0, index=(Var(axis_name),), value="v"),
@@ -161,7 +144,6 @@ def test_merge_with_offset_read():
     consumer = _loop(
         axes=(Axis(name="c0", extent=3),),
         inputs=(Port(index=(BinOp("+", Var("c0"), Literal(5, "int")),)),),
-        accumulators=(),
         body=(
             Assign(name="e", op=ElementwiseOp("exp"), args=("$0",)),
             Write(output=0, index=(Var("c0"),), value="e"),
@@ -195,7 +177,6 @@ def _reduce_sum_over_axis1(outer: int = 4, inner: int = 8) -> LoopOp:
             Axis(name="j", extent=inner),
         ),
         inputs=(Port(index=(Var("i"), Var("j"))),),
-        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign(name="m", op=ElementwiseOp("neg"), args=("$0",)),
             Accum(name="acc", value="m"),
@@ -213,7 +194,6 @@ def test_merge_reduce_then_elementwise():
             Port(index=(Var("i"),)),  # from producer
             Port(index=(Var("i"),)),  # external bias
         ),
-        accumulators=(),
         body=(
             Assign(name="y", op=ElementwiseOp("add"), args=("$0", "$1")),
             Write(output=0, index=(Var("i"),), value="y"),
@@ -227,7 +207,7 @@ def test_merge_reduce_then_elementwise():
     reduce_axes = [a for a in merged.axes if a.name in merged.reduce_axis_names]
     assert len(reduce_axes) == 1 and reduce_axes[0].name == "j"
     # Locals merged: the acc from the producer survives.
-    local_names = [lb.name for lb in merged.accumulators]
+    local_names = [lb.name for lb in merged.accums]
     assert "acc" in local_names
     # Body must contain the Accum, then the bridge-copy, then the consumer's add.
     from deplodock.compiler.ir.loop_ir import flatten_body
@@ -259,7 +239,6 @@ def test_merge_reduce_with_singleton_batch_dim():
             Axis(name="a2", extent=2048),
         ),
         inputs=(Port(index=(Literal(0, "int"), Var("a1"), Var("a2"))),),
-        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign(name="sq", op=ElementwiseOp("mul"), args=("$0", "$0")),
             Accum(name="acc", value="sq"),
@@ -274,7 +253,6 @@ def test_merge_reduce_with_singleton_batch_dim():
             Axis(name="a2", extent=1),
         ),
         inputs=(Port(index=(Literal(0, "int"), Var("a1"), Literal(0, "int"))),),
-        accumulators=(),
         body=(
             Assign(name="v", op=ElementwiseOp("rsqrt"), args=("$0",)),
             Write(output=0, index=(Var("a0"), Var("a1"), Var("a2")), value="v"),
@@ -293,9 +271,8 @@ def test_merge_alias_unifies_reduce_axes():
     producer = _loop(
         axes=(Axis(name="a0", extent=4), Axis(name="a1", extent=8)),
         inputs=(Port(index=(Var("a0"), Var("a1"))),),
-        accumulators=(Accumulator(name="acc_p", combine=ElementwiseOp("max"), init=Literal(-1e30)),),
         body=(
-            Accum(name="acc_p", value="$0"),
+            Accum(name="acc_p", value="$0", op=ElementwiseOp("max")),
             Write(output=0, index=(Var("a0"),), value="acc_p"),
         ),
     )
@@ -307,7 +284,6 @@ def test_merge_alias_unifies_reduce_axes():
             Port(index=(Var("b0"),)),  # from producer
             Port(index=(Var("b0"), Var("b1"))),  # same external buffer, different reduce axis
         ),
-        accumulators=(Accumulator(name="acc_c", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Accum(name="acc_c", value="$1"),
             Assign(name="v", op=ElementwiseOp("add"), args=("$0", "acc_c")),
@@ -322,7 +298,7 @@ def test_merge_alias_unifies_reduce_axes():
     assert len(reduce_axes) == 1, f"expected 1 reduce axis, got {[a.name for a in reduce_axes]}"
     assert reduce_axes[0].name == "b1", "producer's a1 should be aliased away"
     # Both accumulators survive: producer's acc_p (max) and consumer's acc_c (add).
-    combine_fns = {lb.combine.fn for lb in merged.accumulators if lb.combine is not None}
+    combine_fns = {lb.combine.fn for lb in merged.accums if lb.combine is not None}
     assert combine_fns == {"max", "add"}
 
 
@@ -359,7 +335,6 @@ def test_merge_rejects_free_axis_leak():
             Axis(name="a1", extent=8),
         ),
         inputs=(Port(index=(Var("a0"), Var("a1"))),),
-        accumulators=(),
         body=(
             Assign(name="v", op=ElementwiseOp("neg"), args=("$0",)),
             # Writer only has a0 — a1 is unused downstream.
@@ -369,7 +344,6 @@ def test_merge_rejects_free_axis_leak():
     consumer = _loop(
         axes=(Axis(name="c0", extent=4),),
         inputs=(Port(index=(Var("c0"),)),),
-        accumulators=(),
         body=(
             Assign(name="e", op=ElementwiseOp("exp"), args=("$0",)),
             Write(output=0, index=(Var("c0"),), value="e"),
@@ -385,7 +359,6 @@ def test_merge_rejects_non_affine_writer():
     producer = _loop(
         axes=(Axis(name="a", extent=4),),
         inputs=(Port(index=(Var("a"),)),),
-        accumulators=(),
         body=(
             Assign(name="v", op=ElementwiseOp("neg"), args=("$0",)),
             Write(output=0, index=(BinOp("*", Var("a"), Literal(2, "int")),), value="v"),

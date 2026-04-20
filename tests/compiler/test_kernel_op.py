@@ -5,7 +5,6 @@ import pytest
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop_ir import (
     Accum,
-    Accumulator,
     Assign,
     Axis,
     Load,
@@ -21,26 +20,14 @@ from deplodock.compiler.ir.loop_ir import (
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 
-def _loop(*, axes=(), inputs=(), accumulators=(), body=()):
+def _loop(*, axes=(), inputs=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
     Test-local shim: LoopOp.axes is a property over the body's Loop tree,
-    and accumulator metadata now lives on each ``Accum.op`` (no separate
-    decl stmt). The shim backfills ``Accum.op`` from the ``accumulators=``
-    kwarg for legacy fixtures that spell ``Accum(name=..., value=...)``
-    without an op.
+    so ``axes=`` feeds ``flat_body_to_nested`` to produce the nested
+    form.
     """
-    acc_ops = {a.name: a.combine for a in accumulators}
-    body = tuple(_backfill_update_op(s, acc_ops) for s in body)
     return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, body))
-
-
-def _backfill_update_op(stmt, acc_ops):
-    if isinstance(stmt, Accum):
-        desired = acc_ops.get(stmt.name)
-        if desired is not None and stmt.op.fn == "add" and desired.fn != "add":
-            return Accum(name=stmt.name, value=stmt.value, op=desired)
-    return stmt
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +85,7 @@ def test_load_stmt_multiple_sources():
 
 def test_update_synthesizes_accum_decl():
     """An ``Accum`` in a reduce Loop implicitly declares its accumulator.
-    ``LoopOp.accum_decls`` synthesizes the declaration info (name, combine
+    ``LoopOp.accums`` synthesizes the declaration info (name, combine
     op, identity value) from the Accum. No explicit decl stmt is needed."""
     k = LoopOp(
         body=(
@@ -117,9 +104,9 @@ def test_update_synthesizes_accum_decl():
             ),
         ),
     )
-    assert len(k.accum_decls) == 1 and k.accum_decls[0].name == "acc"
-    assert k.accum_decls[0].combine.fn == "add"
-    assert isinstance(k.accum_decls[0].init, Literal) and k.accum_decls[0].init.value == 0.0
+    assert len(k.accums) == 1 and k.accums[0].name == "acc"
+    assert k.accums[0].combine.fn == "add"
+    assert isinstance(k.accums[0].init, Literal) and k.accums[0].init.value == 0.0
 
 
 def test_port_default_is_empty_index():
@@ -177,13 +164,12 @@ def test_kernel_reduce():
     k = _loop(
         axes=axes,
         inputs=(p,),
-        accumulators=(Accumulator(name="s", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Accum(name="s", value="$0"),
             Write(output=0, index=(Var("a0"),), value="s"),
         ),
     )
-    assert any(isinstance(lb.combine, ElementwiseOp) for lb in k.accumulators)
+    assert any(isinstance(lb.combine, ElementwiseOp) for lb in k.accums)
 
 
 def test_kernel_matmul():
@@ -192,7 +178,6 @@ def test_kernel_matmul():
     k = _loop(
         axes=axes,
         inputs=(p, p),
-        accumulators=(Accumulator(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
             Accum(name="dot", value="mul"),
@@ -210,7 +195,6 @@ def test_kernel_matmul_bias():
     k = _loop(
         axes=axes,
         inputs=(p_mk, p_mk, p_bias),
-        accumulators=(Accumulator(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
             Accum(name="dot", value="mul"),
@@ -231,18 +215,14 @@ def test_kernel_softmax_two_accumulators():
     k = _loop(
         axes=axes,
         inputs=(p,),
-        accumulators=(
-            Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-            Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
-        ),
         body=(
-            Accum(name="mx", value="$0"),
+            Accum(name="mx", value="$0", op=ElementwiseOp("max")),
             Accum(name="sm", value="$0"),
             Write(output=0, index=(Var("a0"),), value="mx"),
         ),
     )
-    assert any(lb.name == "mx" for lb in k.accumulators)
-    assert any(lb.name == "sm" for lb in k.accumulators)
+    assert any(lb.name == "mx" for lb in k.accums)
+    assert any(lb.name == "sm" for lb in k.accums)
 
 
 def test_kernel_unary_chain():
@@ -390,7 +370,6 @@ def test_loop_stmt_reduce_kernel():
     loop = _loop(
         axes=(Axis("a0", 4), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
-        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Loop(
                 axis=Axis("a0", 4),
@@ -421,10 +400,6 @@ def test_loop_stmt_softmax_sibling_reduces():
     loop = _loop(
         axes=(Axis("a0", 4), Axis("a1", 8), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("a1"))), Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
-        accumulators=(
-            Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-            Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
-        ),
         body=(
             Loop(
                 axis=Axis("a0", 4),
@@ -432,7 +407,7 @@ def test_loop_stmt_softmax_sibling_reduces():
                     Loop(
                         axis=Axis("a1", 8),
                         body=(
-                            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$1"),)),
+                            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$1", op=ElementwiseOp("max")),)),
                             Loop(axis=Axis("k", 8), body=(Accum(name="sm", value="$2"),)),
                             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
                             Write(output=0, index=(Var("a0"), Var("a1")), value="v"),
@@ -458,12 +433,8 @@ def test_loop_axis_sibling_same_name_allowed():
     _loop(
         axes=(Axis("a0", 4), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
-        accumulators=(
-            Accumulator(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-            Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
-        ),
         body=(
-            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0"),)),
+            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0", op=ElementwiseOp("max")),)),
             Loop(axis=Axis("k", 8), body=(Accum(name="sm", value="$1"),)),
             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
             Write(output=0, index=(Var("a0"),), value="v"),
@@ -578,7 +549,6 @@ def _flat_reduce_kernel() -> LoopOp:
     return _loop(
         axes=(Axis("a0", 4), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("k"))),),
-        accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Accum(name="acc", value="$0"),
             Write(output=0, index=(Var("a0"),), value="acc"),

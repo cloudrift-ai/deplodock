@@ -111,10 +111,10 @@ def execute_loop_op(
     reduce_names = loop.reduce_axis_names
     reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.name in reduce_names)
     values: dict[str, np.ndarray] = dict(dollar)
-    # AccumDecls are body-form reduce accumulator declarations. Each one
+    # Accums are body-form reduce accumulator declarations. Each one
     # binds an SSA name that subsequent Updates fold values into.
-    acc_map: dict[str, Accum] = {decl.name: decl for decl in loop.accum_decls}
-    for decl in loop.accum_decls:
+    acc_map: dict[str, Accum] = {decl.name: decl for decl in loop.accums}
+    for decl in loop.accums:
         init_val = decl.init.eval({})
         values[decl.name] = np.asarray(init_val, dtype=np.float32)
 
@@ -141,7 +141,7 @@ def execute_loop_op(
             values[stmt.name] = _apply_port_index(port_equiv, input_arrays[stmt.source], loop.axes, values)
         elif isinstance(stmt, Accum):
             # Fold the value into the accumulator. Init happens above via
-            # the accum_decls walk; each Accum folds per-iteration.
+            # the accums walk; each Accum folds per-iteration.
             acc = acc_map[stmt.name]
             src = values[stmt.value]
             reduced = _fold_to_accumulator(src, acc, reduce_axis_positions)
