@@ -124,7 +124,8 @@ def test_load_stmt_binding():
         ),
     )
     loads = k.loads
-    assert len(loads) == 1 and loads[0].name == "x_val" and loads[0].source == 0
+    # rename_ssa_sequential canonicalizes Load names to in0, in1, ...
+    assert len(loads) == 1 and loads[0].name == "in0" and loads[0].source == 0
     assert k.num_inputs == 1
 
 
@@ -167,7 +168,8 @@ def test_update_synthesizes_accum_decl():
             ),
         ),
     )
-    assert len(k.accums) == 1 and k.accums[0].name == "acc"
+    # rename_ssa_sequential canonicalizes Accum names to acc0, acc1, ...
+    assert len(k.accums) == 1 and k.accums[0].name == "acc0"
     assert k.accums[0].combine.fn == "add"
     assert isinstance(k.accums[0].init, Literal) and k.accums[0].init.value == 0.0
 
@@ -270,8 +272,9 @@ def test_kernel_softmax_two_accumulators():
             Write(output=0, index=(Var("a0"),), value="mx"),
         ),
     )
-    assert any(lb.name == "mx" for lb in k.accums)
-    assert any(lb.name == "sm" for lb in k.accums)
+    # rename_ssa_sequential renames Accums to acc0, acc1 in definition order.
+    assert any(lb.name == "acc0" for lb in k.accums)
+    assert any(lb.name == "acc1" for lb in k.accums)
 
 
 def test_kernel_unary_chain():
@@ -437,10 +440,11 @@ def test_loop_stmt_reduce_kernel():
     # Validator accepts the nested form.
     from deplodock.compiler.ir.loop import iter_loops
 
+    # rename_ssa_sequential canonicalizes axes to a0, a1, ... in pre-order.
     loops = iter_loops(loop.body)
     assert len(loops) == 2
     assert loops[0].axis.name == "a0"
-    assert loops[1].axis.name == "k"
+    assert loops[1].axis.name == "a1"
 
 
 def test_loop_stmt_softmax_sibling_reduces():
@@ -473,7 +477,8 @@ def test_loop_stmt_softmax_sibling_reduces():
     # A reduce Loop is structurally one whose body contains an Accum.
     reduce_loops = [L for L in iter_loops(loop.body) if any(isinstance(s, Accum) for s in L.body)]
     assert len(reduce_loops) == 2
-    assert all(L.axis.name == "k" for L in reduce_loops)
+    # Both sibling reduce Loops share one axis name after canonicalization.
+    assert reduce_loops[0].axis.name == reduce_loops[1].axis.name
 
 
 def test_loop_axis_sibling_same_name_allowed():

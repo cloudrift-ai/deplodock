@@ -319,43 +319,104 @@ def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -
 
 
 def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
-    """Rename Assign / Select SSA names to ``v0``, ``v1``, ... in body-
-    pre-order definition order. Accum names stay as-is (they already
-    encode semantic roles like ``acc``); Load names are also left alone
-    (they're binding sites with structural meaning). Idempotent: bodies
-    already in ``v0..vN`` form round-trip unchanged."""
-    acc_names = {s.name for s in flatten_body(stmts) if isinstance(s, Accum)}
-    rename: dict[str, str] = {}
-    counter = 0
-    for stmt in flatten_body(stmts):
-        if isinstance(stmt, (Assign, Select)):
-            if stmt.name in acc_names or stmt.name in rename:
-                continue
-            rename[stmt.name] = f"v{counter}"
-            counter += 1
+    """Canonicalize names in a fused body:
 
-    if all(old == new for old, new in rename.items()):
+    - Axes renamed to ``a0, a1, ...`` in pre-order of first declaration.
+      Sibling ``Loop``s with the same axis name (post-unification reduce
+      axes) share one renumbering entry.
+    - Load SSA names renamed to ``in0, in1, ...`` in definition order.
+    - Accum names renamed to ``acc0, acc1, ...`` in definition order.
+    - Assign / Select SSA names renamed to ``v0, v1, ...`` in definition
+      order.
+
+    Idempotent: bodies already in canonical form round-trip unchanged."""
+    ssa_rename: dict[str, str] = {}
+    v_counter = 0
+    in_counter = 0
+    acc_counter = 0
+    for stmt in flatten_body(stmts):
+        if isinstance(stmt, Load):
+            if stmt.name in ssa_rename:
+                continue
+            ssa_rename[stmt.name] = f"in{in_counter}"
+            in_counter += 1
+        elif isinstance(stmt, Accum):
+            if stmt.name in ssa_rename:
+                continue
+            ssa_rename[stmt.name] = f"acc{acc_counter}"
+            acc_counter += 1
+        elif isinstance(stmt, (Assign, Select)):
+            if stmt.name in ssa_rename:
+                continue
+            ssa_rename[stmt.name] = f"v{v_counter}"
+            v_counter += 1
+
+    axis_rename: dict[str, str] = {}
+    a_counter = 0
+
+    def collect_axes(body: tuple[Stmt, ...]) -> None:
+        nonlocal a_counter
+        for s in body:
+            if isinstance(s, Loop):
+                if s.axis.name not in axis_rename:
+                    axis_rename[s.axis.name] = f"a{a_counter}"
+                    a_counter += 1
+                collect_axes(s.body)
+
+    collect_axes(stmts)
+
+    ssa_noop = all(old == new for old, new in ssa_rename.items())
+    axis_noop = all(old == new for old, new in axis_rename.items())
+    if ssa_noop and axis_noop:
         return stmts
 
+    # Expr-level substitution covers axis renames AND Load renames — a Load's
+    # SSA name can appear as ``Var(load_name)`` in another Load's index (the
+    # gather pattern: ``data[..., Var("idx"), ...]`` where ``idx`` is another
+    # Load's name). Assign/Select names never surface in Exprs so they stay
+    # out of this map.
+    expr_sub: dict[str, Expr] = {old: Var(new) for old, new in axis_rename.items() if old != new}
+    for stmt in flatten_body(stmts):
+        if isinstance(stmt, Load):
+            old = stmt.name
+            new = ssa_rename.get(old, old)
+            if old != new:
+                expr_sub[old] = Var(new)
+
     def rn(name: str) -> str:
-        return rename.get(name, name)
+        return ssa_rename.get(name, name)
 
     def walk(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         out: list[Stmt] = []
         for stmt in body:
             if isinstance(stmt, Loop):
-                out.append(Loop(axis=stmt.axis, body=walk(stmt.body)))
+                new_axis_name = axis_rename.get(stmt.axis.name, stmt.axis.name)
+                out.append(Loop(axis=Axis(name=new_axis_name, extent=stmt.axis.extent), body=walk(stmt.body)))
+            elif isinstance(stmt, Load):
+                out.append(
+                    Load(
+                        name=rn(stmt.name),
+                        source=stmt.source,
+                        index=tuple(substitute(e, expr_sub) for e in stmt.index),
+                    )
+                )
             elif isinstance(stmt, Assign):
                 out.append(Assign(name=rn(stmt.name), op=stmt.op, args=tuple(rn(a) for a in stmt.args)))
             elif isinstance(stmt, Accum):
-                out.append(Accum(name=stmt.name, value=rn(stmt.value), op=stmt.op))
+                out.append(Accum(name=rn(stmt.name), value=rn(stmt.value), op=stmt.op))
             elif isinstance(stmt, Write):
-                out.append(Write(output=stmt.output, index=stmt.index, value=rn(stmt.value)))
+                out.append(
+                    Write(
+                        output=stmt.output,
+                        index=tuple(substitute(e, expr_sub) for e in stmt.index),
+                        value=rn(stmt.value),
+                    )
+                )
             elif isinstance(stmt, Select):
                 out.append(
                     Select(
                         name=rn(stmt.name),
-                        branches=tuple(SelectBranch(value=rn(br.value), select=br.select) for br in stmt.branches),
+                        branches=tuple(SelectBranch(value=rn(br.value), select=substitute(br.select, expr_sub)) for br in stmt.branches),
                     )
                 )
             else:
