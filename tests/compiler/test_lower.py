@@ -18,7 +18,7 @@ import numpy as np
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Accum, Assign, Write
+from deplodock.compiler.ir.loop import Accum, Assign, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.rewriter import Rewriter
@@ -52,19 +52,19 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 def _elementwise_fns(body) -> list[str]:
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     return [s.op.fn for s in flatten_body(body) if isinstance(s, Assign)]
 
 
 def _has_update(body) -> bool:
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     return any(isinstance(s, Accum) for s in flatten_body(body))
 
 
 def _has_write(body) -> bool:
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop import flatten_body
 
     return any(isinstance(s, Write) for s in flatten_body(body))
 

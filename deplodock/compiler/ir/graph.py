@@ -135,8 +135,8 @@ def _lookup_op_class(name: str) -> type[Op] | None:
     """
     from deplodock.compiler.ir import base as _base
     from deplodock.compiler.ir import frontend_ir as _frontend
-    from deplodock.compiler.ir import loop_ir as _loop
     from deplodock.compiler.ir import tensor_ir as _tensor
+    from deplodock.compiler.ir.loop import ir as _loop
 
     for module in (_base, _tensor, _frontend, _loop):
         cls = getattr(module, name, None)

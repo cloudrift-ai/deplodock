@@ -8,7 +8,7 @@ extra fields (see ``backend/cuda/program.py``'s ``CudaLaunch``).
 ``GpuProgram`` is the program-form pair of ``ir/kernel_ir.py``'s ``GpuKernel``:
 the latter describes one ``__global__`` function, the former describes
 many of them wired together into a runnable program. This mirrors how
-``LoopProgram`` (``program/loop.py``) pairs with ``ir/loop_ir.py``'s
+``LoopProgram`` (``program/loop.py``) pairs with ``ir/loop/ir.py``'s
 ``LoopOp``.
 """
 

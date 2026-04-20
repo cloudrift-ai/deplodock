@@ -178,7 +178,7 @@ def test_hints_flow_through_lower():
     rewriter = Rewriter.from_directory(rules_dir)
     fused = rewriter.apply(g)
 
-    from deplodock.compiler.ir.loop_ir import LoopOp
+    from deplodock.compiler.ir.loop import LoopOp
 
     kernel_nodes = [n for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
     assert len(kernel_nodes) == 1

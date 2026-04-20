@@ -60,7 +60,7 @@ The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Load` / `Assign`
 
 **Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a body `Select` into a nested `Ternary` chain over each `SelectBranch.select` predicate. (There is no `Mux` / `Combine` IR — those were replaced by `Select` / `SelectBranch`.)
 
-**Body emitter**: `_emit_body` calls `ir.loop_plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The plan decomposes the body into ordered `Inline` (straight-line block) and `Loop` (K-loop over a reduce axis) steps:
+**Body emitter**: `_emit_body` calls `ir.loop.plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The plan decomposes the body into ordered `Inline` (straight-line block) and `Loop` (K-loop over a reduce axis) steps:
 
 | Pattern                 | Plan shape             | Emission                                                             |
 | ----------------------- | ---------------------- | -------------------------------------------------------------------- |
@@ -140,4 +140,4 @@ graph constant) when emitting `GpuBuffer`s.
   `program.py` need to be rewritten.
 - The loop-IR types (`LoopOp`, `Load`, `Assign`, `Accum`,
   `Write`, `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT
-  import from `backend/cuda/` into `ir/loop_ir.py` or `program/loop.py`.
+  import from `backend/cuda/` into `ir/loop/ir.py` or `program/loop.py`.

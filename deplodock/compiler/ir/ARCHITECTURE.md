@@ -33,7 +33,7 @@ PyTorch module
    │  rules/fusion/*        (lift each tensor op → LoopOp, then merge adjacent LoopOp pairs)
    ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 2 · Lowering — Graph populated with LOOP IR ops (loop.py)                                                      │
+│ LAYER 2 · Lowering — Graph populated with LOOP IR ops (loop/ir.py)                                                   │
 │   LoopOp (one per GPU kernel) — SSA program over named Axes. Ports read external buffers via Expr index              │
 │   patterns; Accum stmts carry accumulator state; body statements (Assign/Accum/Write/Select/Load) execute            │
 │   in order. + InputOp / ConstantOp as buffer sources.                                                                │
@@ -96,7 +96,7 @@ after kernel emission (on ``GpuKernel`` statement trees).
 | ``simplify_loop_op(op)``                     | LoopOp walker — seeds Context from axis extents.                                      |
 | ``simplify_kernel(k)``                       | GpuKernel walker — pushes ranges from VarDecl (nonneg thread-index compositions) + IfStmt conds + ForLoop bounds. |
 
-**Rule:** Imports ``expr``, ``loop_ir``, ``kernel_ir``. No dependencies
+**Rule:** Imports ``expr``, ``loop.ir``, ``kernel_ir``. No dependencies
 on passes / pipeline / backend — pure IR → IR.
 
 ### `expr.py` — shared expression sublanguage (all layers)
@@ -148,7 +148,7 @@ consumes.
 **Rule:** Imports ``base`` and ``shape_utils`` (for broadcasting).
 Lazy-imports ``expr`` inside ``IndexMapOp.forward`` / ``is_identity`` only.
 
-### `loop.py` — Loop IR, structural SSA (Layer 2)
+### `loop/ir.py` — Loop IR, structural SSA (Layer 2)
 
 After fusion, each ``LoopOp`` is exactly one GPU kernel described as an
 SSA program over a **named iteration space**. "Loop" refers to the tiled
@@ -179,13 +179,30 @@ modeled as ``Accum`` statements inside a reduce ``Loop``. SSA names
 defined inside a Loop body are scoped to that body — only ``Accum``
 targets cross Loop boundaries.
 
-### `loop_plan.py` — analysis: LoopOp → KernelPlan (Layer 2)
+### `loop/normalize.py` — body-shape normalization (Layer 2)
+
+Pure ``body → body`` passes applied inside ``LoopOp.__post_init__`` so
+every constructed ``LoopOp`` — including intermediate results produced
+by fusion rules — is canonicalized before validation.
+
+| Symbol                              | Role                                                                                                                              |
+|-------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| ``drop_size_one_free_axes``         | Inline ``Loop(axis, extent=1)`` free loops; substitute ``Var(axis.name) → Literal(0)`` through the body. Reduce loops untouched.  |
+| ``canonicalize_free_axis_order``    | Sort the outer chain of free Loops alphabetically by axis name. Free loops commute, so reordering is safe.                        |
+| ``linearize_pointwise_body``        | For pointwise kernels (no Accum), push non-Loop siblings into the inner Loop so all leaves end up at the innermost scope.         |
+| ``normalize_body``                  | Compose the three passes in order.                                                                                                |
+
+**Rule:** Imports ``expr`` and ``loop.ir``. No dependency on ``plan``
+or any pass infrastructure — these are local structural rewrites with
+no Context.
+
+### `loop/plan.py` — analysis: LoopOp → KernelPlan (Layer 2)
 
 Walks a ``LoopOp``'s nested ``Loop`` tree and produces an explicit
 nested-loop view as a ``KernelPlan``: ordered ``Loop`` / ``Inline``
 steps with accumulators, rematerialization sets, and trailing writes.
 Consumed by the CUDA emitter (``backend/cuda/emit.py``). The human
-dump view uses ``ir.loop_ir.pretty_print`` directly since the IR is
+dump view uses ``ir.loop.ir.pretty_print`` directly since the IR is
 already nested.
 
 | Symbol              | Role                                                                                                |

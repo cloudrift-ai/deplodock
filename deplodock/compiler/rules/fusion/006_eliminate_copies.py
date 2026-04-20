@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import (
+from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
     Load,

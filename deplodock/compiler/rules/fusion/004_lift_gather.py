@@ -15,7 +15,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Cast, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Axis, Load, Loop, LoopOp, Stmt, Write
+from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor_ir import GatherOp
 from deplodock.compiler.matcher import ChainMatch, Production
 

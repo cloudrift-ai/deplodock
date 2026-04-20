@@ -63,7 +63,7 @@ from deplodock.compiler.ir.kernel_ir import (
 )
 from deplodock.compiler.ir.kernel_ir import Assign as GpuAssign
 from deplodock.compiler.ir.kernel_ir import Stmt as GpuStmt
-from deplodock.compiler.ir.loop_ir import (
+from deplodock.compiler.ir.loop import (
     Load,
     Loop,
     LoopOp,
@@ -71,7 +71,7 @@ from deplodock.compiler.ir.loop_ir import (
     SelectBranch,
     Write,
 )
-from deplodock.compiler.ir.loop_ir import Stmt as LoopStmt
+from deplodock.compiler.ir.loop import Stmt as LoopStmt
 
 __all__ = [
     "Interval",

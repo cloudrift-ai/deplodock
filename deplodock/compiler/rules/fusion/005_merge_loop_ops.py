@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import LoopOp
+from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.matcher import ChainMatch, Production
 from deplodock.compiler.rules.fusion._splice import splice_loop_ops
 

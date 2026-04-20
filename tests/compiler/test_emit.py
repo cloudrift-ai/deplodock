@@ -56,7 +56,7 @@ def _matmul_graph() -> Graph:
 def _softmax_launch() -> LoopLaunch:
     """Build a LoopLaunch with the softmax SSA pattern directly."""
     from deplodock.compiler.ir.expr import Var
-    from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Load, Loop, LoopOp, Write
+    from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, Loop, LoopOp, Write
 
     a0 = Axis("a0", 4)
     a1 = Axis("a1", 8)
@@ -271,7 +271,7 @@ def _rotate_half_launch() -> LoopLaunch:
     sees the constraint and the warning is silenced.
     """
     from deplodock.compiler.ir.expr import BinOp, Literal, Var
-    from deplodock.compiler.ir.loop_ir import Assign, Axis, Load, Loop, LoopOp, Select, SelectBranch, Write
+    from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Select, SelectBranch, Write
     from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
     axis_a0 = Axis(name="a0", extent=64)
@@ -316,7 +316,7 @@ def test_check_port_bounds_still_warns_without_gating_select():
     """
     from deplodock.compiler.backend.cuda.emit import check_port_bounds
     from deplodock.compiler.ir.expr import BinOp, Literal, Var
-    from deplodock.compiler.ir.loop_ir import Axis, Load, Loop, LoopOp, Write
+    from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 
     axis_a0 = Axis(name="a0", extent=64)
     body = (

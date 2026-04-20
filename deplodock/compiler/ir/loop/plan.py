@@ -15,9 +15,9 @@ from collections import deque
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.loop_ir import Accum as IrAccum
-from deplodock.compiler.ir.loop_ir import Assign, Load, LoopOp, Select, Stmt, Write
-from deplodock.compiler.ir.loop_ir import Loop as LoopStmt
+from deplodock.compiler.ir.loop.ir import Accum as IrAccum
+from deplodock.compiler.ir.loop.ir import Assign, Load, LoopOp, Select, Stmt, Write
+from deplodock.compiler.ir.loop.ir import Loop as LoopStmt
 
 # ---------------------------------------------------------------------------
 # Plan data structures
@@ -112,7 +112,7 @@ def analyze_kernel(kernel: LoopOp, out_shape: tuple) -> KernelPlan:
         n_output = _numel(out_shape)
 
     # --- Classify all SSA values as element-space or row-space (tree-wide) ---
-    from deplodock.compiler.ir.loop_ir import flatten_body
+    from deplodock.compiler.ir.loop.ir import flatten_body
 
     flat_all = tuple(flatten_body(kernel.body))
     accumulator_names = {decl.name for decl in kernel.accums}

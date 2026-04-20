@@ -30,7 +30,7 @@ Not yet supported (returns ``None``):
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import Expr, Literal, Var, substitute
-from deplodock.compiler.ir.loop_ir import (
+from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
     Axis,
