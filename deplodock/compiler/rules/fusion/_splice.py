@@ -145,9 +145,22 @@ def splice_loop_ops(
     # own namespace, so no rename composition is needed.
     consumer_load_alias = {ld.name: write.value for ld in target_loads}
 
+    # --- Align producer's free-loop chain to consumer's depths ---
+    # The parallel walk matches Loops by axis name at each scope level. If
+    # σ-matched axes sit at different depths on each side (e.g. consumer's
+    # reduce axis is forced innermost while producer has it mid-nest), the
+    # walk can't fold them and the merged body is ill-scoped. Permuting
+    # producer's *free* Loops to match consumer's depth layout fixes this.
+    aligned_body = _align_producer_free_chain(
+        producer.body,
+        consumer.body,
+        producer_to_consumer_axis,
+        producer.reduce_axis_names,
+    )
+
     # --- Parallel tree walk ---
     merged_body = _merge_trees(
-        producer.body,
+        aligned_body,
         consumer.body,
         consumer_sigma=consumer_sigma,
         consumer_ssa_rename=consumer_ssa_rename,
@@ -416,4 +429,71 @@ def _fresh_names(to_rename: set[str], taken: set[str]) -> dict[str, str]:
             suffix += 1
         result[name] = candidate
         used.add(candidate)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Producer free-loop reorder (pre-walk alignment)
+# ---------------------------------------------------------------------------
+
+
+def _consumer_depths(body: tuple[Stmt, ...]) -> dict[str, int]:
+    """Record the nesting depth of every ``Loop`` in the consumer body
+    (pre-order). Duplicate axis names — rare under normal lift/merge —
+    resolve to the outermost occurrence."""
+    depths: dict[str, int] = {}
+
+    def walk(stmts: tuple[Stmt, ...], depth: int) -> None:
+        for s in stmts:
+            if isinstance(s, Loop):
+                depths.setdefault(s.axis.name, depth)
+                walk(s.body, depth + 1)
+
+    walk(body, 0)
+    return depths
+
+
+def _align_producer_free_chain(
+    producer_body: tuple[Stmt, ...],
+    consumer_body: tuple[Stmt, ...],
+    producer_to_consumer_axis: dict[str, str],
+    reduce_axis_names: frozenset[str],
+) -> tuple[Stmt, ...]:
+    """Permute producer's outer free-loop chain so σ-matched axes sit at
+    the same depth as their consumer partners.
+
+    The chain is the top run of singleton-body Loops that aren't reduce
+    loops. For each axis in the chain, the target depth is the consumer
+    depth of its σ partner (producer axes without a Var-valued σ entry
+    sort to the end). Stable sort keeps the relative order of axes with
+    the same target.
+    """
+    chain: list[Axis] = []
+    current = producer_body
+    while len(current) == 1 and isinstance(current[0], Loop):
+        loop = current[0]
+        if loop.axis.name in reduce_axis_names:
+            break
+        chain.append(loop.axis)
+        current = loop.body
+
+    if len(chain) < 2:
+        return producer_body
+
+    consumer_depth = _consumer_depths(consumer_body)
+    sentinel = len(consumer_depth) + len(chain)
+
+    def target(axis: Axis) -> int:
+        c = producer_to_consumer_axis.get(axis.name)
+        if c is None:
+            return sentinel
+        return consumer_depth.get(c, sentinel)
+
+    reordered = sorted(chain, key=target)
+    if [a.name for a in reordered] == [a.name for a in chain]:
+        return producer_body
+
+    result: tuple[Stmt, ...] = current
+    for axis in reversed(reordered):
+        result = (Loop(axis=axis, body=result),)
     return result
