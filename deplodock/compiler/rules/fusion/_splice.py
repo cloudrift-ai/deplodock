@@ -64,24 +64,23 @@ class _NotSupported(Exception):
 class _AccumDecl:
     """One producer accumulator, scoped enough for materialization.
 
-    ``body`` is the immediate body of the reduce Loop — the stmts that fold
-    into the accumulator (Loads + Assigns + Selects + the Accum itself).
     ``enclosing_axes`` is the free-axis chain outer to the reduce Loop; an
     accumulator can only be materialized at a consumer scope whose enclosing
-    axes σ-match this tuple.
-    """
+    axes σ-match this tuple. ``accum_value`` is the SSA name whose value
+    gets folded into the accumulator; ``accum_op`` is the fold op."""
 
     name: str
     reduce_axis: Axis
     enclosing_axes: tuple[Axis, ...]
-    body: tuple[Stmt, ...]
+    accum_value: str
+    accum_op: ElementwiseOp
 
 
 @dataclass
 class _PendingAccum:
     """A producer accumulator whose reduce Loop still needs to be emitted.
 
-    Created at each ``dfs_build`` site that references an Accum. The
+    Created at each ``_emit`` site that visits an Accum. The
     ``required_c_axes`` tuple is σ(enclosing_axes) — the consumer axis
     names that must be in scope when we emit the Loop.
     """
@@ -218,7 +217,7 @@ def _walk(
             sigma = _solve_sigma(_producer_write(ctx).index, s.index, _producer_axis_names(ctx))
             if sigma is None:
                 raise _NotSupported
-            prod_stmts, new_pending, final_name = _dfs_build(_producer_write(ctx).value, sigma, ctx)
+            prod_stmts, new_pending, final_name = _emit(_producer_write(ctx).value, ctx, sigma)
             here, up = _partition_pendings(new_pending, scope)
             out.extend(_emit_accum_loops(here, ctx, scope))
             out.extend(prod_stmts)
@@ -244,53 +243,64 @@ def _walk(
 
 
 # ---------------------------------------------------------------------------
-# Reverse-reconstruction of producer expression at a Load site
+# Demand-driven emission: produce a target SSA value from the producer
 # ---------------------------------------------------------------------------
 
 
-def _dfs_build(
-    root_ssa: str,
-    sigma: dict[str, Expr],
+def _emit(
+    target: str,
     ctx: _Ctx,
+    sigma: dict[str, Expr],
 ) -> tuple[list[Stmt], list[_PendingAccum], str]:
-    """Walk producer SSA from ``root_ssa`` back to Loads / Accums, emitting
-    freshened stmts in reverse-topological (i.e. definition) order.
+    """Emit the producer-side SSA chain needed to compute ``target``.
 
-    Returns (emitted_stmts, pending_accums, final_name) where final_name is
-    the freshened SSA name that holds root_ssa's value at the emission site.
+    DFS from ``target`` through producer SSA defs, emitting Load / Assign /
+    Select stmts in dependency order with fresh names and ``sigma`` applied
+    to every Expr. Accum references terminate the walk: a ``_PendingAccum``
+    is recorded so the caller can materialize the reduce Loop at the right
+    scope (that materialization calls ``_emit`` again with the Accum's
+    ``value`` as the target).
+
+    Used by ``_walk`` at every consumer Load-of-producer site, and by
+    ``_emit_accum_loops`` to build an accumulator's reduce-body stmts.
     """
     defs = _producer_defs(ctx)
     emitted: list[Stmt] = []
     pending: list[_PendingAccum] = []
     ssa_rename: dict[str, str] = {}
-
-    def rename(n: str) -> str:
-        return ssa_rename.get(n, n)
-
     visited: set[str] = set()
 
     def visit(n: str) -> str:
         if n in ssa_rename:
             return ssa_rename[n]
         if n in visited:
-            # Cycle (shouldn't happen in SSA) — return tentative name.
             return ssa_rename.get(n, n)
         visited.add(n)
 
-        defn = defs.get(n)
-        if defn is None:
-            # Not a producer def — an external name (shouldn't arrive here).
+        entry = defs.get(n)
+        if entry is None:
             return n
+        defn, enclosing = entry
 
         if isinstance(defn, Accum):
-            decl = _find_accum_scope(ctx.producer, n)
-            if decl is None:
+            # The enclosing chain's last axis is the reduce axis; the rest
+            # are the free axes outer to the reduce Loop.
+            if not enclosing:
                 raise _NotSupported
-            required_c_axes = tuple(_c_axis_name(sigma.get(ax.name), ctx) for ax in decl.enclosing_axes)
+            reduce_axis = enclosing[-1]
+            free_axes = enclosing[:-1]
+            decl = _AccumDecl(
+                name=defn.name,
+                reduce_axis=reduce_axis,
+                enclosing_axes=free_axes,
+                accum_value=defn.value,
+                accum_op=defn.op,
+            )
+            required_c_axes = tuple(_c_axis_name(sigma.get(a.name), ctx) for a in free_axes)
             if any(a is None for a in required_c_axes):
                 raise _NotSupported
             required_c_axes_t: tuple[str, ...] = required_c_axes  # type: ignore[assignment]
-            bound = ctx.name_for_accum(n, required_c_axes_t)
+            bound = ctx.name_for_accum(defn.name, required_c_axes_t)
             ssa_rename[n] = bound
             pending.append(
                 _PendingAccum(
@@ -303,8 +313,6 @@ def _dfs_build(
             return bound
 
         if isinstance(defn, Load):
-            # Recurse into any ssa inputs first (Loads don't have any), then
-            # emit the Load with sigma-substituted index.
             new_name = ctx.fresh(defn.name)
             ssa_rename[n] = new_name
             emitted.append(
@@ -332,7 +340,7 @@ def _dfs_build(
 
         raise _NotSupported
 
-    final_name = visit(root_ssa)
+    final_name = visit(target)
     return emitted, pending, final_name
 
 
@@ -365,69 +373,18 @@ def _emit_accum_loops(
         reduce_axis_name = ctx.fresh(p.decl.reduce_axis.name)
         extended_sigma: dict[str, Expr] = dict(p.sigma)
         extended_sigma[p.decl.reduce_axis.name] = Var(reduce_axis_name)
-        body_stmts, nested_pending, _ = _dfs_build_accum_body(p, extended_sigma, ctx)
+        # Emit the SSA chain that computes the Accum's folded value.
+        body_stmts, nested_pending, value_fresh = _emit(p.decl.accum_value, ctx, extended_sigma)
         nested_here, nested_up = _partition_pendings(nested_pending, scope)
         if nested_up:
             raise _NotSupported
         out.extend(_emit_accum_loops(nested_here, ctx, scope))
-        out.append(Loop(axis=Axis(name=reduce_axis_name, extent=p.decl.reduce_axis.extent), body=body_stmts))
+        # Append the Accum stmt that folds value_fresh into the canonical
+        # consumer-side binding name.
+        body_stmts.append(Accum(name=p.bound_name, value=value_fresh, op=p.decl.accum_op))
+        out.append(Loop(axis=Axis(name=reduce_axis_name, extent=p.decl.reduce_axis.extent), body=tuple(body_stmts)))
         ctx.materialized.add((p.decl.name, p.required_c_axes))
     return out
-
-
-def _dfs_build_accum_body(
-    p: _PendingAccum,
-    sigma: dict[str, Expr],
-    ctx: _Ctx,
-) -> tuple[tuple[Stmt, ...], list[_PendingAccum], str]:
-    """Materialize a producer accumulator's reduce-body under ``sigma``.
-
-    Rewrites the decl body's Loads and Assigns/Selects with freshened SSA
-    names and σ-substituted Exprs. The trailing Accum stmt binds to the
-    accumulator's canonical consumer-side name (``ctx.name_for_accum``).
-    """
-    emitted: list[Stmt] = []
-    pending: list[_PendingAccum] = []
-    ssa_rename: dict[str, str] = {}
-
-    def rename(n: str) -> str:
-        return ssa_rename.get(n, n)
-
-    for s in p.decl.body:
-        if isinstance(s, Load):
-            new_name = ctx.fresh(s.name)
-            ssa_rename[s.name] = new_name
-            emitted.append(
-                Load(
-                    name=new_name,
-                    source=s.source,
-                    index=tuple(substitute(e, sigma) for e in s.index),
-                )
-            )
-        elif isinstance(s, Assign):
-            new_name = ctx.fresh(s.name)
-            ssa_rename[s.name] = new_name
-            emitted.append(Assign(name=new_name, op=s.op, args=tuple(rename(a) for a in s.args)))
-        elif isinstance(s, Select):
-            new_name = ctx.fresh(s.name)
-            ssa_rename[s.name] = new_name
-            emitted.append(
-                Select(
-                    name=new_name,
-                    branches=tuple(SelectBranch(value=rename(b.value), select=substitute(b.select, sigma)) for b in s.branches),
-                )
-            )
-        elif isinstance(s, Accum):
-            # Bind the reduce to the canonical consumer-side accum name.
-            emitted.append(Accum(name=p.bound_name, value=rename(s.value), op=s.op))
-        elif isinstance(s, Loop):
-            # Nested reduce/free loop inside the accum body — not yet supported.
-            raise _NotSupported
-        elif isinstance(s, Write):
-            raise _NotSupported
-        else:
-            raise _NotSupported
-    return tuple(emitted), pending, p.bound_name
 
 
 # ---------------------------------------------------------------------------
@@ -496,49 +453,25 @@ def _producer_axis_names(ctx: _Ctx) -> set[str]:
     return {a.name for a in ctx.producer.axes}
 
 
-def _producer_defs(ctx: _Ctx) -> dict[str, Stmt]:
-    """Collect producer SSA definitions (flat, ignoring Loop scope).
+def _producer_defs(ctx: _Ctx) -> dict[str, tuple[Stmt, tuple[Axis, ...]]]:
+    """Collect producer SSA definitions with their enclosing Loop axes.
 
-    This is safe for our use because the producer's SSA names are unique
-    across the tree (enforced by LoopOp validator)."""
-    defs: dict[str, Stmt] = {}
-    for s in _iter_all(ctx.producer.body):
-        if isinstance(s, (Load, Assign, Select, Accum)):
-            defs[s.name] = s
-    return defs
-
-
-def _find_accum_scope(producer: LoopOp, accum_name: str) -> _AccumDecl | None:
-    """Walk the producer body to find the Accum named ``accum_name``,
-    returning its scoping information (reduce axis, enclosing free axes,
-    and the immediate reduce-Loop body)."""
-    result: list[_AccumDecl] = []
+    Returns ``{ssa_name: (defining_stmt, enclosing_axes)}``. The enclosing
+    chain lets ``_emit`` classify an Accum's scope — its last axis is the
+    reduce axis; prior entries are the free axes outer to the reduce Loop.
+    Producer SSA names are unique across the tree (enforced by LoopOp
+    validator), so a flat dict is sound."""
+    defs: dict[str, tuple[Stmt, tuple[Axis, ...]]] = {}
 
     def walk(stmts: tuple[Stmt, ...], enclosing: tuple[Axis, ...]) -> None:
         for s in stmts:
             if isinstance(s, Loop):
-                is_reduce = any(isinstance(ss, Accum) for ss in s.body)
-                if is_reduce:
-                    for ss in s.body:
-                        if isinstance(ss, Accum) and ss.name == accum_name:
-                            result.append(
-                                _AccumDecl(
-                                    name=accum_name,
-                                    reduce_axis=s.axis,
-                                    enclosing_axes=enclosing,
-                                    body=s.body,
-                                )
-                            )
-                            return
-                    # Nested reduce scanning: not currently emitted, but
-                    # walk in case future producers nest.
-                    walk(s.body, enclosing + (s.axis,))
-                else:
-                    walk(s.body, enclosing + (s.axis,))
-            # ignore non-Loop sibling stmts (Accum should always be inside a Loop)
+                walk(s.body, enclosing + (s.axis,))
+            elif isinstance(s, (Load, Assign, Select, Accum)):
+                defs[s.name] = (s, enclosing)
 
-    walk(producer.body, ())
-    return result[0] if result else None
+    walk(ctx.producer.body, ())
+    return defs
 
 
 def _iter_all(stmts: tuple[Stmt, ...]):
