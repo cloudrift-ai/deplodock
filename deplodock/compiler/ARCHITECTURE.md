@@ -202,10 +202,14 @@ The splicer subsumes two passes the old pipeline had as separate concerns:
   allows this without binding, and the reducer's ``Accum`` lands at the
   merged kernel's reduce scope naturally.
 
-``optimization/002_insert_broadcast_indexmap.py`` survives because it
-addresses a different concern — promoting implicit elementwise
-broadcasts to explicit ``IndexMapOp``s — which the splicer does not
-handle.
+``optimization/001_compose_indexmaps.py`` runs between decomposition and
+fusion to collapse chains of single-source / single-consumer
+``IndexMapOp`` nodes into one composed coord_map. Matmul's decomposition
+emits a ``b → unsqueeze → broadcast → mul`` chain where each layout op
+is its own ``IndexMapOp``; without composition the unsqueeze lifts to a
+trivial copy kernel that the splicer can't merge (its output has no
+counterpart at the consumer's outermost axis). Composing before lift
+keeps the matmul at one launch.
 
 ## Codegen policy (backend/cuda/emit.py)
 

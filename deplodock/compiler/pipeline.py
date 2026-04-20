@@ -1,12 +1,15 @@
 """Compiler pipeline entry points.
 
 Lowers a traced ``Graph`` to a ``LoopProgram`` (the post-fusion program
-form) via two rewriter stages:
+form) via three rewriter stages:
 
     1. **Decomposition** — rewrites high-level ops to primitives. Each rule
        emits already-broadcast-explicit IR (every ElementwiseOp input has
        the op's output shape; broadcasts live in ``IndexMapOp`` wrappers).
-    2. **Fusion** — assembles primitives into ``LoopOp`` nodes.
+    2. **Optimization** — compose adjacent ``IndexMapOp`` chains so that
+       pure layout ops fold into a single coord_map before they lift to
+       trivial ``LoopOp`` copies.
+    3. **Fusion** — assembles primitives into ``LoopOp`` nodes.
 
 The resulting ``LoopProgram`` is the single input to backend codegen
 (``backend/cuda/emit.compile_kernels``).
@@ -36,7 +39,7 @@ def compile_graph(graph: Graph, name: str = "prog", dump: CompilerDump | None = 
     order; downstream codegen reads shapes from it and never recomputes
     them.
     """
-    rewriter_pre = Rewriter.from_directory(_RULES_DIR, pass_order=["decomposition"])
+    rewriter_pre = Rewriter.from_directory(_RULES_DIR, pass_order=["decomposition", "optimization"])
     graph = rewriter_pre.apply(graph)
 
     if dump is not None:
