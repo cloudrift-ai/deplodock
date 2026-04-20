@@ -4,9 +4,7 @@ Fuses a producer/consumer pair by walking the consumer body and, at every
 ``Load`` that targets the producer's output, reverse-reconstructing the
 producer expression that computed that value. Producer accumulators are
 hoisted lazily to the consumer scope where they belong (the scope whose
-enclosing axes match σ(enclosing producer axes)). Sibling reduce loops that
-sweep the same external buffer at the same dim share an axis name so the
-post-fusion kernel carries a single reduce axis.
+enclosing axes match σ(enclosing producer axes)).
 
 Algorithm outline:
 
@@ -18,17 +16,19 @@ Algorithm outline:
   ``Load | Assign | Select`` stmts with σ applied to every Expr.
   References to producer Accums become ``PendingAccum`` records.
 - ``emit_accum_loops`` materializes a pending accumulator's reduce Loop
-  at the current scope. It runs a mini-dfs over the accum body and checks
-  for a sibling reduce Loop in the current-scope output that already
-  reads the same external buffer at the same dim — if so, it reuses that
-  sibling's axis name so both reduces end up sharing one axis.
+  at the current scope. Scope-keyed: an accumulator needed at distinct
+  consumer scopes gets separate emissions (SDPA's QK^T reduce inside
+  softmax-max vs inside the output-K free loop).
 - Consumer Loads whose source is not the producer get their source index
-  bumped in a final pass (producer's inputs are prepended to the merged
+  bumped inline in ``walk`` (producer's inputs are prepended to the merged
   kernel's input list).
 
-Returns ``None`` when the pattern isn't supported: σ fails, consumer
-introduces an axis outside σ's image, accumulator scope can't be reached,
-or ``LoopOp`` validation fails on the merged body.
+Sibling reduce axis unification is handled by
+``ir/loop/normalize.py::unify_sibling_reduce_axes`` in
+``LoopOp.__post_init__``, so the splicer doesn't need to track it here.
+
+Returns ``None`` when the pattern isn't supported: σ fails, accumulator
+scope can't be reached, or ``LoopOp`` validation fails on the merged body.
 """
 
 from __future__ import annotations
@@ -106,7 +106,6 @@ class _Ctx:
     # vs inside the output free loop).
     accum_name: dict[tuple[str, tuple[str, ...]], str] = field(default_factory=dict)
     consumer_source_remap: dict[int, int] = field(default_factory=dict)
-    merged_inputs: list[str] = field(default_factory=list)
     materialized: set[tuple[str, tuple[str, ...]]] = field(default_factory=set)
 
     def fresh(self, hint: str) -> str:
@@ -146,7 +145,6 @@ def splice_loop_ops(
     try:
         p_inputs = list(producer_inputs or [])
         c_inputs = list(consumer_inputs or [])
-        merged_inputs = list(p_inputs) + [c for i, c in enumerate(c_inputs) if i != source]
         ctx = _Ctx(
             producer=producer,
             consumer=consumer,
@@ -155,12 +153,12 @@ def splice_loop_ops(
             consumer_inputs=c_inputs,
             used_names=_collect_names(producer) | _collect_names(consumer),
             consumer_source_remap=_build_consumer_source_remap(producer, consumer, source),
-            merged_inputs=merged_inputs,
         )
         new_body, bubble = _walk(consumer.body, ctx, enclosing=())
         if bubble:
             return None
-        new_body = _unify_sibling_reduce_axes(new_body, ctx.merged_inputs)
+        # Sibling reduce-axis unification runs in LoopOp.__post_init__ via
+        # ir/loop/normalize.py::unify_sibling_reduce_axes.
         return LoopOp(body=new_body)
     except _NotSupported:
         return None
@@ -190,7 +188,7 @@ def _walk(
         if isinstance(s, Loop):
             inner_out, inner_bubble = _walk(s.body, ctx, enclosing + (s.axis,))
             here, up = _partition_pendings(inner_bubble, enclosing_names)
-            out.extend(_emit_accum_loops(here, ctx, enclosing, current_scope_out=out))
+            out.extend(_emit_accum_loops(here, ctx, enclosing))
             out.append(Loop(axis=s.axis, body=inner_out))
             bubble.extend(up)
 
@@ -200,7 +198,7 @@ def _walk(
                 raise _NotSupported
             prod_stmts, new_pending, final_name = _dfs_build(_producer_write(ctx).value, sigma, ctx, enclosing_names)
             here, up = _partition_pendings(new_pending, enclosing_names)
-            out.extend(_emit_accum_loops(here, ctx, enclosing, current_scope_out=out))
+            out.extend(_emit_accum_loops(here, ctx, enclosing))
             out.extend(prod_stmts)
             # Alias consumer's load name to producer's final value via a
             # copy Assign. normalize's copy-elim pass will collapse it.
@@ -326,14 +324,12 @@ def _emit_accum_loops(
     pendings: list[_PendingAccum],
     ctx: _Ctx,
     enclosing: tuple[Axis, ...],
-    current_scope_out: list[Stmt],
 ) -> list[Stmt]:
     """Build reduce Loops for each unique pending accumulator at this scope.
 
-    Dedupes by decl name. For each pending, checks whether an already-emitted
-    sibling Loop at this scope reduces over the same external buffer at the
-    same dim — if so, reuses that sibling's reduce axis name.
-    """
+    Dedupes by (decl name, required scope). Sibling-reduce axis unification
+    runs later in ``LoopOp.__post_init__`` — here we always pick fresh axis
+    names and let the normalize pass collapse collisions."""
     seen: set[tuple[str, tuple[str, ...]]] = set()
     unique: list[_PendingAccum] = []
     for p in pendings:
@@ -345,17 +341,14 @@ def _emit_accum_loops(
 
     out: list[Stmt] = []
     for p in unique:
-        reduce_axis_name = _find_sibling_reduce_alias(p, current_scope_out + out, ctx)
-        if reduce_axis_name is None:
-            reduce_axis_name = ctx.fresh(p.decl.reduce_axis.name)
+        reduce_axis_name = ctx.fresh(p.decl.reduce_axis.name)
         extended_sigma: dict[str, Expr] = dict(p.sigma)
         extended_sigma[p.decl.reduce_axis.name] = Var(reduce_axis_name)
         body_stmts, nested_pending, _ = _dfs_build_accum_body(p, extended_sigma, ctx)
-        # Nested accumulators that match THIS scope are emitted before.
         nested_here, nested_up = _partition_pendings(nested_pending, tuple(a.name for a in enclosing))
         if nested_up:
             raise _NotSupported
-        out.extend(_emit_accum_loops(nested_here, ctx, enclosing, current_scope_out=current_scope_out + out))
+        out.extend(_emit_accum_loops(nested_here, ctx, enclosing))
         out.append(Loop(axis=Axis(name=reduce_axis_name, extent=p.decl.reduce_axis.extent), body=body_stmts))
         ctx.materialized.add((p.decl.name, p.required_c_axes))
     return out
@@ -414,146 +407,6 @@ def _dfs_build_accum_body(
         else:
             raise _NotSupported
     return tuple(emitted), pending, p.bound_name
-
-
-# ---------------------------------------------------------------------------
-# Sibling-reduce alias detection
-# ---------------------------------------------------------------------------
-
-
-def _find_sibling_reduce_alias(
-    p: _PendingAccum,
-    emitted_so_far: list[Stmt],
-    ctx: _Ctx,
-) -> str | None:
-    """Scan already-emitted siblings at the current scope for a reduce Loop
-    that reads the same external buffer at the same dim that p's reduce
-    axis would read. Return that Loop's axis name for reuse, or ``None``.
-
-    The match is tight: both the pending's reduce and the sibling's reduce
-    must contain a bare ``Var(axis)`` at the same (buffer, dim) position.
-    """
-    p_patterns = _reduce_axis_buffer_positions(p.decl.body, p.decl.reduce_axis.name, ctx.producer_inputs)
-    if not p_patterns:
-        return None
-
-    for stmt in emitted_so_far:
-        if not isinstance(stmt, Loop):
-            continue
-        if not _loop_is_reduce(stmt):
-            continue
-        # Sibling Loops in current_scope_out have already been source-
-        # remapped into the merged kernel's input space, so look up buffers
-        # via merged_inputs.
-        sib_axis = stmt.axis.name
-        sib_patterns = _reduce_axis_buffer_positions(stmt.body, sib_axis, ctx.merged_inputs)
-        if p_patterns & sib_patterns:
-            if int(p.decl.reduce_axis.extent) != int(stmt.axis.extent):
-                continue
-            return sib_axis
-
-    return None
-
-
-def _reduce_axis_buffer_positions(
-    body: tuple[Stmt, ...],
-    reduce_axis_name: str,
-    inputs: list[str],
-) -> set[tuple[str, int]]:
-    """Set of (external_buffer_name, dim) positions where a bare
-    ``Var(reduce_axis_name)`` appears in a Load's index inside ``body``."""
-    positions: set[tuple[str, int]] = set()
-
-    def walk(stmts: tuple[Stmt, ...]) -> None:
-        for s in stmts:
-            if isinstance(s, Load):
-                if 0 <= s.source < len(inputs):
-                    buf = inputs[s.source]
-                    for dim, e in enumerate(s.index):
-                        if isinstance(e, Var) and e.name == reduce_axis_name:
-                            positions.add((buf, dim))
-            elif isinstance(s, Loop):
-                walk(s.body)
-
-    walk(body)
-    return positions
-
-
-def _loop_is_reduce(loop: Loop) -> bool:
-    return any(isinstance(s, Accum) for s in loop.body)
-
-
-def _unify_sibling_reduce_axes(body: tuple[Stmt, ...], merged_inputs: list[str]) -> tuple[Stmt, ...]:
-    """Post-pass: at every scope, find sibling reduce Loops whose reduce
-    axes index the same (external_buffer, dim) position, and rename them
-    to share a single canonical axis name.
-
-    Example: after splicing max + sub + exp into sum + div, the merged
-    body has both max's and sum's reduce loops as siblings, each loading
-    x at dim 1. This pass collapses their axis names so the final kernel
-    reports one reduce axis (per LoopOp.axes dedup-by-name)."""
-    # Recurse into nested Loops first.
-    new_body: list[Stmt] = []
-    for s in body:
-        if isinstance(s, Loop):
-            new_body.append(Loop(axis=s.axis, body=_unify_sibling_reduce_axes(s.body, merged_inputs)))
-        else:
-            new_body.append(s)
-
-    # Group sibling reduce Loops by their (buffer, dim) pattern.
-    groups: dict[frozenset[tuple[str, int]], list[int]] = {}
-    for i, s in enumerate(new_body):
-        if isinstance(s, Loop) and _loop_is_reduce(s):
-            positions = _reduce_axis_buffer_positions(s.body, s.axis.name, merged_inputs)
-            if positions:
-                groups.setdefault(frozenset(positions), []).append(i)
-
-    for _, indices in groups.items():
-        if len(indices) < 2:
-            continue
-        first_loop = new_body[indices[0]]
-        assert isinstance(first_loop, Loop)
-        canonical_axis = first_loop.axis.name
-        canonical_extent = int(first_loop.axis.extent)
-        for idx in indices[1:]:
-            loop = new_body[idx]
-            assert isinstance(loop, Loop)
-            if int(loop.axis.extent) != canonical_extent:
-                continue
-            if loop.axis.name == canonical_axis:
-                continue
-            renamed_body = _rename_axis_in_body(loop.body, loop.axis.name, canonical_axis)
-            new_body[idx] = Loop(axis=Axis(name=canonical_axis, extent=canonical_extent), body=renamed_body)
-
-    return tuple(new_body)
-
-
-def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -> tuple[Stmt, ...]:
-    mapping = {old_name: Var(new_name)}
-    out: list[Stmt] = []
-    for s in body:
-        if isinstance(s, Loop):
-            # Shadow check: if s.axis.name == old_name, the rename is at this
-            # exact Loop's scope and we're already handling it at the caller.
-            # Otherwise descend.
-            if s.axis.name == old_name:
-                out.append(Loop(axis=Axis(name=new_name, extent=s.axis.extent), body=_rename_axis_in_body(s.body, old_name, new_name)))
-            else:
-                out.append(Loop(axis=s.axis, body=_rename_axis_in_body(s.body, old_name, new_name)))
-        elif isinstance(s, Load):
-            out.append(Load(name=s.name, source=s.source, index=tuple(substitute(e, mapping) for e in s.index)))
-        elif isinstance(s, Write):
-            out.append(Write(output=s.output, index=tuple(substitute(e, mapping) for e in s.index), value=s.value))
-        elif isinstance(s, Select):
-            out.append(
-                Select(
-                    name=s.name,
-                    branches=tuple(SelectBranch(value=b.value, select=substitute(b.select, mapping)) for b in s.branches),
-                )
-            )
-        else:
-            out.append(s)
-    return tuple(out)
 
 
 # ---------------------------------------------------------------------------

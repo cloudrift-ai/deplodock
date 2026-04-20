@@ -21,6 +21,11 @@ applied in order by :func:`normalize_body`:
   aliases, rewire downstream references to the alias root, and drop the
   copies. Merge chains leave stacks of identity copies; this collapses
   them so the IR prints / compares cleanly.
+- :func:`unify_sibling_reduce_axes` — at every scope, find sibling reduce
+  ``Loop``s whose reduce axes index the same ``(source, dim)`` position and
+  rename them to a single canonical axis name. Softmax's max-over-K /
+  sum-over-K end up sharing one reduce axis; likewise
+  ``sum(x, -1) + max(x, -1)`` after fusion.
 - :func:`rename_ssa_sequential` — after the other passes settle, rename
   Assign / Select SSA names to ``v0``, ``v1``, ... in definition order.
   Accum and Load names are preserved (Accum names carry semantic roles;
@@ -29,7 +34,7 @@ applied in order by :func:`normalize_body`:
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.expr import Expr, Literal, substitute
+from deplodock.compiler.ir.expr import Expr, Literal, Var, substitute
 from deplodock.compiler.ir.loop.ir import (
     Accum,
     Assign,
@@ -50,6 +55,7 @@ __all__ = [
     "canonicalize_free_axis_order",
     "linearize_pointwise_body",
     "eliminate_copy_aliases",
+    "unify_sibling_reduce_axes",
     "rename_ssa_sequential",
 ]
 
@@ -65,6 +71,7 @@ def normalize_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     stmts = canonicalize_free_axis_order(stmts)
     stmts = linearize_pointwise_body(stmts)
     stmts = eliminate_copy_aliases(stmts)
+    stmts = unify_sibling_reduce_axes(stmts)
     stmts = rename_ssa_sequential(stmts)
     return stmts
 
@@ -279,7 +286,114 @@ def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Pass 5: canonicalize SSA names to sequential v0, v1, ...
+# Pass 5: unify sibling reduce-loop axis names
+# ---------------------------------------------------------------------------
+
+
+def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """At every scope, find sibling reduce ``Loop``s whose reduce axes index
+    the same ``(Load.source, dim)`` position and rename them to a single
+    canonical axis name.
+
+    Fusion commonly plants sibling reduces that sweep the same buffer at the
+    same dim — softmax's max-over-K followed by sum-over-K, or
+    ``sum(x, -1) + max(x, -1)`` after fusion. Sharing an axis name makes
+    ``LoopOp.axes`` (which dedupes by name) report one reduce axis rather
+    than N, matching the schedule the emitter would otherwise produce.
+
+    Self-contained within a single body: two Loads with the same ``source``
+    index are provably the same external buffer, so no caller-supplied
+    input-name list is needed. Idempotent."""
+
+    def walk(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+        # Recurse into nested scopes first.
+        new_body: list[Stmt] = []
+        for s in body:
+            if isinstance(s, Loop):
+                new_body.append(Loop(axis=s.axis, body=walk(s.body)))
+            else:
+                new_body.append(s)
+
+        # Group sibling reduce Loops by their reduce axis's (source, dim) pattern.
+        groups: dict[frozenset[tuple[int, int]], list[int]] = {}
+        for i, s in enumerate(new_body):
+            if isinstance(s, Loop) and _immediate_has_accum(s.body):
+                positions = _reduce_axis_source_positions(s.body, s.axis.name)
+                if positions:
+                    groups.setdefault(frozenset(positions), []).append(i)
+
+        for indices in groups.values():
+            if len(indices) < 2:
+                continue
+            first = new_body[indices[0]]
+            assert isinstance(first, Loop)
+            canonical = first.axis.name
+            canonical_extent = int(first.axis.extent)
+            for idx in indices[1:]:
+                loop = new_body[idx]
+                assert isinstance(loop, Loop)
+                if int(loop.axis.extent) != canonical_extent:
+                    continue
+                if loop.axis.name == canonical:
+                    continue
+                renamed = _rename_axis_in_body(loop.body, loop.axis.name, canonical)
+                new_body[idx] = Loop(axis=Axis(name=canonical, extent=canonical_extent), body=renamed)
+
+        return tuple(new_body)
+
+    return walk(stmts)
+
+
+def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str) -> set[tuple[int, int]]:
+    """Collect ``(source, dim)`` positions where ``Var(reduce_axis_name)``
+    appears bare in a Load index within ``body`` (recursing into nested
+    Loops — important when the reduce body contains a nested free loop
+    that does the actual load)."""
+    positions: set[tuple[int, int]] = set()
+
+    def go(stmts: tuple[Stmt, ...]) -> None:
+        for s in stmts:
+            if isinstance(s, Load):
+                for dim, e in enumerate(s.index):
+                    if isinstance(e, Var) and e.name == reduce_axis_name:
+                        positions.add((s.source, dim))
+            elif isinstance(s, Loop):
+                go(s.body)
+
+    go(body)
+    return positions
+
+
+def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -> tuple[Stmt, ...]:
+    """Substitute ``Var(old_name) → Var(new_name)`` in every Expr field of
+    ``body``, and rename any nested Loop whose axis name is ``old_name``."""
+    mapping: dict[str, Expr] = {old_name: Var(new_name)}
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, Loop):
+            inner = _rename_axis_in_body(s.body, old_name, new_name)
+            if s.axis.name == old_name:
+                out.append(Loop(axis=Axis(name=new_name, extent=s.axis.extent), body=inner))
+            else:
+                out.append(Loop(axis=s.axis, body=inner))
+        elif isinstance(s, Load):
+            out.append(Load(name=s.name, source=s.source, index=tuple(substitute(e, mapping) for e in s.index)))
+        elif isinstance(s, Write):
+            out.append(Write(output=s.output, index=tuple(substitute(e, mapping) for e in s.index), value=s.value))
+        elif isinstance(s, Select):
+            out.append(
+                Select(
+                    name=s.name,
+                    branches=tuple(SelectBranch(value=br.value, select=substitute(br.select, mapping)) for br in s.branches),
+                )
+            )
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Pass 6: canonicalize SSA names to sequential v0, v1, ...
 # ---------------------------------------------------------------------------
 
 
