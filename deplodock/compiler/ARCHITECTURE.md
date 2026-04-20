@@ -187,9 +187,9 @@ Lift-then-splice, driven by the rewriter's fixpoint loop:
    repeatedly on adjacent LoopOps. Patterns the splicer can't handle
    (multi-read — the consumer reads the producer at multiple distinct
    indices, e.g. softmax's sum sweep + final divide) simply stay as
-   separate kernels. Copy-elimination (``006_eliminate_copies``) and
-   SSA canonicalisation (``007_rename_ssa``) run after and walk bodies
-   tree-wise (preserving the nest structure the splicer produced).
+   separate kernels. Copy-elimination and SSA canonicalisation are no
+   longer fusion-pass rules — they live in ``ir/loop/normalize.py`` and
+   run inside ``LoopOp.__post_init__`` on every constructed body.
 
 The splicer subsumes two passes the old pipeline had as separate concerns:
 

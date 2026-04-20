@@ -2,8 +2,8 @@
 
 Invoked from ``LoopOp.__post_init__`` so every constructed ``LoopOp`` —
 including intermediate results produced by fusion rules — lands in a
-canonical shape before validation. Three independent transforms, applied
-in order:
+canonical shape before validation. Pure ``body → body`` transforms,
+applied in order by :func:`normalize_body`:
 
 - :func:`drop_size_one_free_axes` — inline ``Loop(axis, extent=1)`` free
   loops, rewriting ``Var(axis.name)`` to ``Literal(0, "int")`` throughout
@@ -17,9 +17,14 @@ in order:
   push non-Loop siblings into the inner Loop's body so all leaves end up
   at the innermost scope. Keeps the plan analyzer's pointwise invariant
   intact after fusion merges produce mixed-sibling bodies.
-
-All three are pure ``body → body`` transforms. ``normalize_body`` composes
-them in the order above.
+- :func:`eliminate_copy_aliases` — treat ``y = copy(x)`` Assigns as
+  aliases, rewire downstream references to the alias root, and drop the
+  copies. Merge chains leave stacks of identity copies; this collapses
+  them so the IR prints / compares cleanly.
+- :func:`rename_ssa_sequential` — after the other passes settle, rename
+  Assign / Select SSA names to ``v0``, ``v1``, ... in definition order.
+  Accum and Load names are preserved (Accum names carry semantic roles;
+  Load names are structural binding sites).
 """
 
 from __future__ import annotations
@@ -35,13 +40,17 @@ from deplodock.compiler.ir.loop.ir import (
     SelectBranch,
     Stmt,
     Write,
+    flatten_body,
 )
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 __all__ = [
     "normalize_body",
     "drop_size_one_free_axes",
     "canonicalize_free_axis_order",
     "linearize_pointwise_body",
+    "eliminate_copy_aliases",
+    "rename_ssa_sequential",
 ]
 
 
@@ -51,11 +60,12 @@ __all__ = [
 
 
 def normalize_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
-    """Apply :func:`drop_size_one_free_axes`, :func:`canonicalize_free_axis_order`,
-    and :func:`linearize_pointwise_body` in sequence."""
+    """Apply the structural and cosmetic normalization passes in order."""
     stmts = drop_size_one_free_axes(stmts)
     stmts = canonicalize_free_axis_order(stmts)
     stmts = linearize_pointwise_body(stmts)
+    stmts = eliminate_copy_aliases(stmts)
+    stmts = rename_ssa_sequential(stmts)
     return stmts
 
 
@@ -215,3 +225,106 @@ def linearize_pointwise_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     merged_inner = tuple(before + list(loop.body) + after)
     merged_inner = linearize_pointwise_body(merged_inner)
     return (Loop(axis=loop.axis, body=merged_inner),)
+
+
+# ---------------------------------------------------------------------------
+# Pass 4: eliminate `y = copy(x)` identity aliases
+# ---------------------------------------------------------------------------
+
+
+def _is_copy_assign(stmt: Stmt) -> bool:
+    return isinstance(stmt, Assign) and isinstance(stmt.op, ElementwiseOp) and stmt.op.fn == "copy" and len(stmt.args) == 1
+
+
+def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Collapse ``y = copy(x)`` Assigns. The merge rule plants identity
+    copies as bridges between producer writes and consumer reads; a long
+    chain stacks them (``y = copy(copy(copy(x)))``). Every such Assign is
+    dropped and downstream references to ``y`` are rewired to the alias
+    root. Semantically a no-op — pure IR hygiene."""
+    alias: dict[str, str] = {}
+
+    def resolve(name: str) -> str:
+        seen: set[str] = set()
+        while name in alias and name not in seen:
+            seen.add(name)
+            name = alias[name]
+        return name
+
+    def walk(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+        out: list[Stmt] = []
+        for stmt in body:
+            if isinstance(stmt, Loop):
+                out.append(Loop(axis=stmt.axis, body=walk(stmt.body)))
+            elif _is_copy_assign(stmt):
+                alias[stmt.name] = stmt.args[0]
+            elif isinstance(stmt, Assign):
+                out.append(Assign(name=stmt.name, op=stmt.op, args=tuple(resolve(a) for a in stmt.args)))
+            elif isinstance(stmt, Accum):
+                out.append(Accum(name=stmt.name, value=resolve(stmt.value), op=stmt.op))
+            elif isinstance(stmt, Write):
+                out.append(Write(output=stmt.output, index=stmt.index, value=resolve(stmt.value)))
+            elif isinstance(stmt, Select):
+                out.append(
+                    Select(
+                        name=stmt.name,
+                        branches=tuple(SelectBranch(value=resolve(br.value), select=br.select) for br in stmt.branches),
+                    )
+                )
+            else:
+                out.append(stmt)
+        return tuple(out)
+
+    return walk(stmts)
+
+
+# ---------------------------------------------------------------------------
+# Pass 5: canonicalize SSA names to sequential v0, v1, ...
+# ---------------------------------------------------------------------------
+
+
+def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Rename Assign / Select SSA names to ``v0``, ``v1``, ... in body-
+    pre-order definition order. Accum names stay as-is (they already
+    encode semantic roles like ``acc``); Load names are also left alone
+    (they're binding sites with structural meaning). Idempotent: bodies
+    already in ``v0..vN`` form round-trip unchanged."""
+    acc_names = {s.name for s in flatten_body(stmts) if isinstance(s, Accum)}
+    rename: dict[str, str] = {}
+    counter = 0
+    for stmt in flatten_body(stmts):
+        if isinstance(stmt, (Assign, Select)):
+            if stmt.name in acc_names or stmt.name in rename:
+                continue
+            rename[stmt.name] = f"v{counter}"
+            counter += 1
+
+    if all(old == new for old, new in rename.items()):
+        return stmts
+
+    def rn(name: str) -> str:
+        return rename.get(name, name)
+
+    def walk(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+        out: list[Stmt] = []
+        for stmt in body:
+            if isinstance(stmt, Loop):
+                out.append(Loop(axis=stmt.axis, body=walk(stmt.body)))
+            elif isinstance(stmt, Assign):
+                out.append(Assign(name=rn(stmt.name), op=stmt.op, args=tuple(rn(a) for a in stmt.args)))
+            elif isinstance(stmt, Accum):
+                out.append(Accum(name=stmt.name, value=rn(stmt.value), op=stmt.op))
+            elif isinstance(stmt, Write):
+                out.append(Write(output=stmt.output, index=stmt.index, value=rn(stmt.value)))
+            elif isinstance(stmt, Select):
+                out.append(
+                    Select(
+                        name=rn(stmt.name),
+                        branches=tuple(SelectBranch(value=rn(br.value), select=br.select) for br in stmt.branches),
+                    )
+                )
+            else:
+                out.append(stmt)
+        return tuple(out)
+
+    return walk(stmts)
