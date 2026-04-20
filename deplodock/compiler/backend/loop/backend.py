@@ -4,7 +4,7 @@ Walks each ``LoopLaunch`` in topological order, evaluating its ``LoopOp``
 as whole-tensor numpy operations. Body statements dispatch on type:
 
 - ``Assign``: pure computation via ``ElementwiseOp.forward``.
-- ``Update``: fold a value into an ``Accumulator``; done as a
+- ``Accum``: fold a value into an ``Accum``; done as a
   numpy reduction (``np.sum``/``np.max``/etc.) over the reduce axis since
   this is whole-tensor evaluation, not coord-by-coord.
 - ``Write``: stash an SSA value into the output buffer at the computed
@@ -21,7 +21,7 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop_ir import AccumDecl, Assign, Axis, Load, LoopOp, Port, Select, Update, Write
+from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Load, LoopOp, Port, Select, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -113,7 +113,7 @@ def execute_loop_op(
     values: dict[str, np.ndarray] = dict(dollar)
     # AccumDecls are body-form reduce accumulator declarations. Each one
     # binds an SSA name that subsequent Updates fold values into.
-    acc_map: dict[str, AccumDecl] = {decl.name: decl for decl in loop.accum_decls}
+    acc_map: dict[str, Accum] = {decl.name: decl for decl in loop.accum_decls}
     for decl in loop.accum_decls:
         init_val = decl.init.eval({})
         values[decl.name] = np.asarray(init_val, dtype=np.float32)
@@ -139,14 +139,13 @@ def execute_loop_op(
                 raise ValueError(f"Load source {stmt.source} out of range (have {len(input_arrays)} inputs)")
             port_equiv = Port(index=stmt.index)
             values[stmt.name] = _apply_port_index(port_equiv, input_arrays[stmt.source], loop.axes, values)
-        elif isinstance(stmt, AccumDecl):
-            # AccumDecl was initialized above; nothing to do here.
-            pass
-        elif isinstance(stmt, Update):
-            acc = acc_map[stmt.target]
+        elif isinstance(stmt, Accum):
+            # Fold the value into the accumulator. Init happens above via
+            # the accum_decls walk; each Accum folds per-iteration.
+            acc = acc_map[stmt.name]
             src = values[stmt.value]
             reduced = _fold_to_accumulator(src, acc, reduce_axis_positions)
-            values[stmt.target] = reduced
+            values[stmt.name] = reduced
         elif isinstance(stmt, Select):
             axis_env = _broadcast_axis_env(loop.axes)
             branch_vals = [values[b.value] for b in stmt.branches]
@@ -192,8 +191,8 @@ def execute_loop_op(
     raise ValueError("LoopOp produced no output")
 
 
-def _fold_to_accumulator(src: np.ndarray, acc: AccumDecl, reduce_axis_positions: tuple[int, ...]) -> np.ndarray:
-    """Reduce ``src`` along the reduce axes using the Accumulator's combine op.
+def _fold_to_accumulator(src: np.ndarray, acc: Accum, reduce_axis_positions: tuple[int, ...]) -> np.ndarray:
+    """Reduce ``src`` along the reduce axes using the Accum's combine op.
 
     Returns a ndarray of the reduced shape (keepdims=True preserved for
     downstream broadcast compatibility).

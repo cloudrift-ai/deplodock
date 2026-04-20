@@ -16,7 +16,7 @@ import numpy as np
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop_ir import Assign, LoopOp, Port, Update, Write
+from deplodock.compiler.ir.loop_ir import Accum, Assign, LoopOp, Port, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass
 
@@ -77,7 +77,7 @@ def _count_copies(body) -> int:
 def _has_update(body) -> bool:
     from deplodock.compiler.ir.loop_ir import flatten_body
 
-    return any(isinstance(s, Update) for s in flatten_body(body))
+    return any(isinstance(s, Accum) for s in flatten_body(body))
 
 
 def _local_combine_fns(locals_) -> set[str]:
@@ -318,16 +318,16 @@ def test_ssa_invariants_hold():
             defined.add(lb.name)
         for decl in k.op.accum_decls:
             defined.add(decl.name)
-        from deplodock.compiler.ir.loop_ir import AccumDecl, Load
+        from deplodock.compiler.ir.loop_ir import Accum, Load
 
         for s in flatten_body(k.op.body):
             if isinstance(s, Assign):
                 for arg in s.args:
                     assert arg in defined, f"arg {arg!r} not defined before use in {s.name}"
                 defined.add(s.name)
-            elif isinstance(s, (Load, AccumDecl)):
+            elif isinstance(s, (Load, Accum)):
                 defined.add(s.name)
-            elif isinstance(s, Update):
+            elif isinstance(s, Accum):
                 assert s.target in defined
                 assert s.value in defined
             elif isinstance(s, Write):

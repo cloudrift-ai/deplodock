@@ -3,8 +3,8 @@
 Consumes a ``LoopProgram`` (one ``LoopLaunch`` per GPU kernel, with
 authoritative buffer shapes) and emits CUDA C source packaged as a
 ``GpuProgram``. The ``LoopOp`` body is an SSA program over named axes:
-``Assign``/``Update``/``Write``/``Select`` statements interpreted in
-order. The positionally-last ``Update`` marks the end of the reduce
+``Assign``/``Accum``/``Write``/``Select`` statements interpreted in
+order. The positionally-last ``Accum`` marks the end of the reduce
 sweep; statements after (and final ``Write``s) run once per free point.
 """
 
@@ -29,8 +29,8 @@ from deplodock.compiler.ir.kernel_ir import (
 from deplodock.compiler.ir.kernel_ir import (
     Assign as IrAssign,
 )
+from deplodock.compiler.ir.loop_ir import Accum, Axis, Load, LoopOp, Port, Select
 from deplodock.compiler.ir.loop_ir import Assign as IrAssignStmt
-from deplodock.compiler.ir.loop_ir import Axis, Load, LoopOp, Port, Select, Update
 from deplodock.compiler.ir.simplify import simplify_kernel
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -677,7 +677,7 @@ def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
 def _kernel_name(loop: LoopOp, idx: int) -> str:
     from deplodock.compiler.ir.loop_ir import flatten_body
 
-    if any(isinstance(s, Update) for s in flatten_body(loop.body)):
+    if any(isinstance(s, Accum) for s in flatten_body(loop.body)):
         return f"k{idx}_reduce"
     return f"k{idx}_pointwise"
 
@@ -687,7 +687,7 @@ def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int,
 
     loop: LoopOp = launch.loop
     out_shape = program.output_shape(launch)
-    has_reduce = any(isinstance(s, Update) for s in flatten_body(loop.body))
+    has_reduce = any(isinstance(s, Accum) for s in flatten_body(loop.body))
     if has_reduce:
         reduce_names = loop.reduce_axis_names
         free_extents = [int(a.extent) for a in loop.axes if a.name not in reduce_names]

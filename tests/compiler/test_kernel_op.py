@@ -1,10 +1,10 @@
-"""Tests for the structural LoopOp IR with SSA body (Assign/Update/Write/Select)."""
+"""Tests for the structural LoopOp IR with SSA body (Assign/Accum/Write/Select)."""
 
 import pytest
 
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop_ir import (
-    AccumDecl,
+    Accum,
     Accumulator,
     Assign,
     Axis,
@@ -14,7 +14,6 @@ from deplodock.compiler.ir.loop_ir import (
     Port,
     Select,
     SelectBranch,
-    Update,
     Write,
     flat_body_to_nested,
     flatten_body,
@@ -26,12 +25,22 @@ def _loop(*, axes=(), inputs=(), accumulators=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
     Test-local shim: LoopOp.axes is a property over the body's Loop tree,
-    and ``accumulators=`` is gone — each ``Accumulator`` (alias for
-    ``AccumDecl``) gets prepended to the body as an AccumDecl statement
-    to keep the legacy fixture shape working.
+    and accumulator metadata now lives on each ``Accum.op`` (no separate
+    decl stmt). The shim backfills ``Accum.op`` from the ``accumulators=``
+    kwarg for legacy fixtures that spell ``Accum(name=..., value=...)``
+    without an op.
     """
-    prefix = tuple(AccumDecl(name=a.name, combine=a.combine, init=a.init) for a in accumulators)
-    return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, prefix + tuple(body)))
+    acc_ops = {a.name: a.combine for a in accumulators}
+    body = tuple(_backfill_update_op(s, acc_ops) for s in body)
+    return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, body))
+
+
+def _backfill_update_op(stmt, acc_ops):
+    if isinstance(stmt, Accum):
+        desired = acc_ops.get(stmt.name)
+        if desired is not None and stmt.op.fn == "add" and desired.fn != "add":
+            return Accum(name=stmt.name, value=stmt.value, op=desired)
+    return stmt
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +55,7 @@ def test_axis_construction():
 
 
 # ---------------------------------------------------------------------------
-# Body-form Load / AccumDecl (new IR: inputs + accumulators as statements)
+# Body-form Load / Accum (new IR: inputs + accumulators as statements)
 # ---------------------------------------------------------------------------
 
 
@@ -87,19 +96,20 @@ def test_load_stmt_multiple_sources():
     assert k.num_inputs == 3
 
 
-def test_accum_decl_stmt_scope():
-    """AccumDecl in the body is visible to Updates in its enclosing scope."""
+def test_update_synthesizes_accum_decl():
+    """An ``Accum`` in a reduce Loop implicitly declares its accumulator.
+    ``LoopOp.accum_decls`` synthesizes the declaration info (name, combine
+    op, identity value) from the Accum. No explicit decl stmt is needed."""
     k = LoopOp(
         body=(
             Loop(
                 axis=Axis("row", 4),
                 body=(
-                    AccumDecl("acc", combine=ElementwiseOp("add"), init=Literal(0.0)),
                     Loop(
                         axis=Axis("k", 8),
                         body=(
                             Load("x_val", source=0, index=(Var("row"), Var("k"))),
-                            Update(target="acc", value="x_val"),
+                            Accum(name="acc", value="x_val", op=ElementwiseOp("add")),
                         ),
                     ),
                     Write(output=0, index=(Var("row"),), value="acc"),
@@ -108,28 +118,8 @@ def test_accum_decl_stmt_scope():
         ),
     )
     assert len(k.accum_decls) == 1 and k.accum_decls[0].name == "acc"
-
-
-def test_accum_decl_update_without_decl_rejected():
-    """Update targeting an undeclared accumulator fails validation."""
-    with pytest.raises(ValueError, match="does not name an Accumulator"):
-        LoopOp(
-            body=(
-                Loop(
-                    axis=Axis("row", 4),
-                    body=(
-                        Loop(
-                            axis=Axis("k", 8),
-                            body=(
-                                Load("x_val", source=0, index=(Var("row"), Var("k"))),
-                                Update(target="missing_acc", value="x_val"),
-                            ),
-                        ),
-                        Write(output=0, index=(Var("row"),), value="missing_acc"),
-                    ),
-                ),
-            ),
-        )
+    assert k.accum_decls[0].combine.fn == "add"
+    assert isinstance(k.accum_decls[0].init, Literal) and k.accum_decls[0].init.value == 0.0
 
 
 def test_port_default_is_empty_index():
@@ -189,7 +179,7 @@ def test_kernel_reduce():
         inputs=(p,),
         accumulators=(Accumulator(name="s", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
-            Update(target="s", value="$0"),
+            Accum(name="s", value="$0"),
             Write(output=0, index=(Var("a0"),), value="s"),
         ),
     )
@@ -205,13 +195,12 @@ def test_kernel_matmul():
         accumulators=(Accumulator(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
-            Update(target="dot", value="mul"),
+            Accum(name="dot", value="mul"),
             Write(output=0, index=(Var("a0"),), value="dot"),
         ),
     )
-    # AccumDecl + Assign + Update + Write — the AccumDecl is added by the
-    # fixture shim now that ``accumulators=`` is a body-statement alias.
-    assert len(flatten_body(k.body)) == 4
+    # Assign + Accum + Write — accumulator info is carried on Accum.op now.
+    assert len(flatten_body(k.body)) == 3
 
 
 def test_kernel_matmul_bias():
@@ -224,13 +213,13 @@ def test_kernel_matmul_bias():
         accumulators=(Accumulator(name="dot", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
-            Update(target="dot", value="mul"),
+            Accum(name="dot", value="mul"),
             Assign("out", ElementwiseOp("add"), args=("dot", "$2")),
             Write(output=0, index=(Var("a0"),), value="out"),
         ),
     )
-    # AccumDecl + Assign + Update + Assign + Write (AccumDecl from the shim).
-    assert len(flatten_body(k.body)) == 5
+    # Assign + Accum + Assign + Write (no decl stmt — Accum carries op).
+    assert len(flatten_body(k.body)) == 4
 
 
 def test_kernel_softmax_two_accumulators():
@@ -247,8 +236,8 @@ def test_kernel_softmax_two_accumulators():
             Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
         body=(
-            Update(target="mx", value="$0"),
-            Update(target="sm", value="$0"),
+            Accum(name="mx", value="$0"),
+            Accum(name="sm", value="$0"),
             Write(output=0, index=(Var("a0"),), value="mx"),
         ),
     )
@@ -352,29 +341,19 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
     assert len(flatten_body(k.body)) == 3
 
 
-def test_rejects_update_without_matching_local():
-    axes = (Axis("a0", 4), Axis("a1", 8))
-    p = Port(index=(Var("a0"), Var("a1")))
-    with pytest.raises(ValueError, match="does not name an Accumulator"):
+def test_update_op_conflict_rejected():
+    """Multiple Updates to the same target must share the same op — mixing
+    ``max`` and ``add`` on one accumulator is semantically ambiguous."""
+    axes = (Axis("a0", 4),)
+    p = Port(index=(Var("a0"),))
+    with pytest.raises(ValueError, match="conflicts with"):
         _loop(
             axes=axes,
             inputs=(p,),
-            body=(Update(target="acc", value="$0"),),
-        )
-
-
-def test_rejects_unused_accumulator():
-    axes = (Axis("a0", 4), Axis("a1", 8))
-    p = Port(index=(Var("a0"), Var("a1")))
-    with pytest.raises(ValueError, match="never Updated"):
-        _loop(
-            axes=axes,
-            inputs=(p,),
-            accumulators=(
-                Accumulator(name="a", combine=ElementwiseOp("add"), init=Literal(0.0)),
-                Accumulator(name="b", combine=ElementwiseOp("add"), init=Literal(0.0)),
+            body=(
+                Accum(name="acc", value="$0", op=ElementwiseOp("max")),
+                Accum(name="acc", value="$0", op=ElementwiseOp("add")),
             ),
-            body=(Update(target="a", value="$0"),),
         )
 
 
@@ -418,7 +397,7 @@ def test_loop_stmt_reduce_kernel():
                 body=(
                     Loop(
                         axis=Axis("k", 8),
-                        body=(Update(target="acc", value="$0"),),
+                        body=(Accum(name="acc", value="$0"),),
                     ),
                     Write(output=0, index=(Var("a0"),), value="acc"),
                 ),
@@ -453,8 +432,8 @@ def test_loop_stmt_softmax_sibling_reduces():
                     Loop(
                         axis=Axis("a1", 8),
                         body=(
-                            Loop(axis=Axis("k", 8), body=(Update(target="mx", value="$1"),)),
-                            Loop(axis=Axis("k", 8), body=(Update(target="sm", value="$2"),)),
+                            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$1"),)),
+                            Loop(axis=Axis("k", 8), body=(Accum(name="sm", value="$2"),)),
                             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
                             Write(output=0, index=(Var("a0"), Var("a1")), value="v"),
                         ),
@@ -465,8 +444,8 @@ def test_loop_stmt_softmax_sibling_reduces():
     )
     from deplodock.compiler.ir.loop_ir import iter_loops
 
-    # A reduce Loop is structurally one whose body contains an Update.
-    reduce_loops = [L for L in iter_loops(loop.body) if any(isinstance(s, Update) for s in L.body)]
+    # A reduce Loop is structurally one whose body contains an Accum.
+    reduce_loops = [L for L in iter_loops(loop.body) if any(isinstance(s, Accum) for s in L.body)]
     assert len(reduce_loops) == 2
     assert all(L.axis.name == "k" for L in reduce_loops)
 
@@ -484,8 +463,8 @@ def test_loop_axis_sibling_same_name_allowed():
             Accumulator(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
         ),
         body=(
-            Loop(axis=Axis("k", 8), body=(Update(target="mx", value="$0"),)),
-            Loop(axis=Axis("k", 8), body=(Update(target="sm", value="$1"),)),
+            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0"),)),
+            Loop(axis=Axis("k", 8), body=(Accum(name="sm", value="$1"),)),
             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
             Write(output=0, index=(Var("a0"),), value="v"),
         ),
@@ -539,7 +518,7 @@ def test_flat_body_to_nested_reduce_splits_at_update():
 
     axes = (Axis("a0", 4), Axis("k", 8))
     flat = (
-        Update(target="acc", value="$0"),
+        Accum(name="acc", value="$0"),
         Write(output=0, index=(Var("a0"),), value="acc"),
     )
     nested = flat_body_to_nested(axes, flat)
@@ -547,7 +526,7 @@ def test_flat_body_to_nested_reduce_splits_at_update():
     inner = nested[0].body
     assert len(inner) == 2
     assert isinstance(inner[0], Loop) and inner[0].axis.name == "k"
-    assert isinstance(inner[0].body[0], Update)
+    assert isinstance(inner[0].body[0], Accum)
     assert isinstance(inner[1], Write)
 
 
@@ -571,13 +550,13 @@ def test_flat_body_to_nested_softmax_two_updates():
 
     axes = (Axis("a0", 4), Axis("a1", 8), Axis("k", 8))
     flat = (
-        Update(target="mx", value="$1"),
+        Accum(name="mx", value="$1"),
         Assign("v_mx", ElementwiseOp("neg"), args=("mx",)),
-        Update(target="sm", value="v_mx"),
+        Accum(name="sm", value="v_mx"),
         Write(output=0, index=(Var("a0"), Var("a1")), value="sm"),
     )
     nested = flat_body_to_nested(axes, flat)
-    # Structure: Loop(a0, [Loop(a1, [Loop(k, [Update mx]), Loop(k, [Assign, Update sm]), Write])])
+    # Structure: Loop(a0, [Loop(a1, [Loop(k, [Accum mx]), Loop(k, [Assign, Accum sm]), Write])])
     assert len(nested) == 1 and nested[0].axis.name == "a0"
     inner_a1 = nested[0].body[0]
     assert isinstance(inner_a1, Loop) and inner_a1.axis.name == "a1"
@@ -601,7 +580,7 @@ def _flat_reduce_kernel() -> LoopOp:
         inputs=(Port(index=(Var("a0"), Var("k"))),),
         accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
-            Update(target="acc", value="$0"),
+            Accum(name="acc", value="$0"),
             Write(output=0, index=(Var("a0"),), value="acc"),
         ),
     )
@@ -617,8 +596,10 @@ def _nested_reduce_kernel() -> LoopOp:
             Loop(
                 axis=Axis("a0", 4),
                 body=(
-                    AccumDecl(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),
-                    Loop(axis=Axis("k", 8), body=(Update(target="acc", value="$0"),)),
+                    Loop(
+                        axis=Axis("k", 8),
+                        body=(Accum(name="acc", value="$0", op=ElementwiseOp("add")),),
+                    ),
                     Write(output=0, index=(Var("a0"),), value="acc"),
                 ),
             ),

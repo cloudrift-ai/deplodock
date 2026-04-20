@@ -22,7 +22,7 @@ Entry points:
   the GPU extensions (``ArrayAccess | FieldAccess | VectorLoad``).
 - ``simplify_loop_op(op)`` — walks a ``LoopOp``, seeding Context from its
   ``Axis`` extents, rewriting every Expr in ``Port.index`` / ``Select`` /
-  ``Write`` / ``Accumulator.init``.
+  ``Write`` / ``Accum.init``.
 - ``simplify_kernel(k)`` — walks a ``GpuKernel``, seeding Context from
   enclosing ``ForLoop`` bounds (literal start/end only), rewriting every
   Expr inside statements.
@@ -64,7 +64,6 @@ from deplodock.compiler.ir.kernel_ir import (
 from deplodock.compiler.ir.kernel_ir import Assign as GpuAssign
 from deplodock.compiler.ir.kernel_ir import Stmt as GpuStmt
 from deplodock.compiler.ir.loop_ir import (
-    AccumDecl,
     Load,
     Loop,
     LoopOp,
@@ -381,9 +380,7 @@ def _simplify_loop_stmt(stmt: LoopStmt, ctx: Context) -> LoopStmt:
         return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value)
     if isinstance(stmt, Load):
         return Load(stmt.name, stmt.source, _simplify_expr_tuple(stmt.index, ctx))
-    if isinstance(stmt, AccumDecl):
-        return AccumDecl(stmt.name, stmt.combine, simplify_expr(stmt.init, ctx))  # type: ignore[arg-type]
-    # Assign / Update carry only SSA names — no Expr field to simplify
+    # Assign / Accum carry only SSA names — no Expr field to simplify.
     return stmt
 
 

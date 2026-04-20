@@ -55,8 +55,8 @@ def _matmul_graph() -> Graph:
 
 def _softmax_launch() -> LoopLaunch:
     """Build a LoopLaunch with the softmax SSA pattern directly."""
-    from deplodock.compiler.ir.expr import Literal, Var
-    from deplodock.compiler.ir.loop_ir import AccumDecl, Assign, Axis, Loop, LoopOp, Port, Update, Write
+    from deplodock.compiler.ir.expr import Var
+    from deplodock.compiler.ir.loop_ir import Accum, Assign, Axis, Loop, LoopOp, Port, Write
 
     a0 = Axis("a0", 4)
     a1 = Axis("a1", 8)
@@ -67,17 +67,15 @@ def _softmax_launch() -> LoopLaunch:
             Loop(
                 axis=a0,
                 body=(
-                    AccumDecl(name="mx", combine=ElementwiseOp("max"), init=Literal(-1e30)),
-                    AccumDecl(name="sm", combine=ElementwiseOp("add"), init=Literal(0.0)),
                     # Max sweep (K-loop 1).
-                    Loop(axis=a1, body=(Update(target="mx", value="$0"),)),
+                    Loop(axis=a1, body=(Accum(name="mx", value="$0", op=ElementwiseOp("max")),)),
                     # Sum sweep (K-loop 2) — rematerializes exp inside.
                     Loop(
                         axis=a1,
                         body=(
                             Assign(name="sub_s", op=ElementwiseOp("sub"), args=("$0", "mx")),
                             Assign(name="ex_s", op=ElementwiseOp("exp"), args=("sub_s",)),
-                            Update(target="sm", value="ex_s"),
+                            Accum(name="sm", value="ex_s", op=ElementwiseOp("add")),
                         ),
                     ),
                     # Write sweep (K-loop 3): per-element div.

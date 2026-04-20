@@ -15,7 +15,8 @@ from collections import deque
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.loop_ir import AccumDecl, Assign, Load, LoopOp, Port, Select, Stmt, Update, Write
+from deplodock.compiler.ir.loop_ir import Accum as IrAccum
+from deplodock.compiler.ir.loop_ir import Assign, Load, LoopOp, Port, Select, Stmt, Write
 from deplodock.compiler.ir.loop_ir import Loop as LoopStmt
 
 # ---------------------------------------------------------------------------
@@ -24,14 +25,14 @@ from deplodock.compiler.ir.loop_ir import Loop as LoopStmt
 
 
 @dataclass(frozen=True)
-class Accum:
+class PlanAccum:
     """Reduction accumulator emitted outside the K-loop."""
 
     var: str  # variable name ("acc0")
     fn: str  # combine op name ("add", "max", "mul", "min")
     identity: float
     src: str  # SSA name that feeds the accumulator
-    result: str  # Accumulator name (= this is what post-reduce code reads)
+    result: str  # IrAccum name (= this is what post-reduce code reads)
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,7 @@ class Loop:
 
     recompute: tuple[Assign, ...]  # prior element-space assigns to re-eval
     body: tuple[Assign | Select | Load, ...]  # this segment's elementwise assigns/selects
-    accum: Accum | None  # accumulator (reduce segments)
+    accum: PlanAccum | None  # accumulator (reduce segments)
     stores_output: bool  # True for trailing element segments (store inside loop)
     store_index: tuple[Expr, ...] = ()  # write index when stores_output
     store_value: str = ""  # SSA name to store when stores_output
@@ -180,7 +181,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
         steps.append(Inline(body=tuple(prelude_selects)))
 
     # Walk remaining children: reduce Loops → Loop steps; trailing stmts → Inline/Loop-with-stores.
-    tail_stmts: list[Assign | Select | Load | AccumDecl] = []
+    tail_stmts: list[Assign | Select | Load | IrAccum] = []
     tail_writes: list[Write] = []
     for stmt in inner_body[idx:]:
         if isinstance(stmt, LoopStmt) and stmt.axis.name in reduce_axis_names:
@@ -194,7 +195,7 @@ def analyze_kernel(kernel: LoopOp, shapes: dict[str, tuple], out_shape: tuple) -
                 acc_count += 1
             # Bring this reduce Loop's element-space Assigns into scope for later remat.
             prior_ew.extend(s for s in stmt.body if isinstance(s, Assign))
-        elif isinstance(stmt, (Assign, Select, Load, AccumDecl)):
+        elif isinstance(stmt, (Assign, Select, Load, IrAccum)):
             tail_stmts.append(stmt)
         elif isinstance(stmt, Write):
             tail_writes.append(stmt)
@@ -271,8 +272,8 @@ def _reduce_loop_to_steps(
     ``Loop`` step for the K-iterated work.
 
     Two body shapes supported:
-    - Body ends in ``Update``: classic reduce segment with an accumulator.
-    - Body ends in ``Write`` with no ``Update``: per-K elementwise pass that
+    - Body ends in ``IrAccum``: classic reduce segment with an accumulator.
+    - Body ends in ``Write`` with no ``IrAccum``: per-K elementwise pass that
       stores each element (``stores_output=True``). Used by softmax's
       writeback sweep.
     """
@@ -280,11 +281,11 @@ def _reduce_loop_to_steps(
     if not body:
         return []
 
-    updates = [s for s in body if isinstance(s, Update)]
+    updates = [s for s in body if isinstance(s, IrAccum)]
     writes = [s for s in body if isinstance(s, Write)]
 
     if updates:
-        # Classic reduce segment: last Update drives the accumulator.
+        # Classic reduce segment: last IrAccum drives the accumulator.
         last_update = updates[-1]
         last_idx = body.index(last_update)
         ew = [s for s in body[:last_idx] if isinstance(s, (Assign, Select, Load))]
@@ -306,15 +307,15 @@ def _reduce_loop_to_steps(
         in_loop = tuple(s for s in ew if not _is_hoistable(s))
         remat = _remat_set(list(body), prior_ew, row_space)
         remat_assigns = tuple(a for a in prior_ew if a.name in remat)
-        acc = acc_map[last_update.target]
+        acc = acc_map[last_update.name]
         combine_fn = acc.combine.fn
         identity = _literal_value(acc.init)
-        accum = Accum(
+        accum = PlanAccum(
             var=f"acc{acc_count}",
             fn=combine_fn,
             identity=identity,
             src=last_update.value,
-            result=last_update.target,
+            result=last_update.name,
         )
         loop_step = Loop(
             recompute=remat_assigns,
@@ -327,7 +328,7 @@ def _reduce_loop_to_steps(
         )
         return [Inline(body=pre_body), loop_step] if pre_body else [loop_step]
 
-    # No Update — per-K elementwise pass. Must have Writes to justify iteration.
+    # No IrAccum — per-K elementwise pass. Must have Writes to justify iteration.
     if writes:
         ew = [s for s in body if isinstance(s, (Assign, Select, Load))]
         remat = _remat_set(list(body), prior_ew, row_space)
@@ -403,7 +404,7 @@ def _touches_elem_space(stmts: list, elem_space: set[str]) -> bool:
 def _remat_set(segment: list, prior_ew: list[Assign], row_space: set[str]) -> set[str]:
     """Compute the set of prior element-space assigns to recompute.
 
-    Backward reachability from segment args (Assign or Update), stopping
+    Backward reachability from segment args (Assign or IrAccum), stopping
     at row-space values and input ports. Each name enters the worklist at
     most once.
     """
@@ -423,7 +424,7 @@ def _remat_set(segment: list, prior_ew: list[Assign], row_space: set[str]) -> se
             _seed_from_args(stmt.args)
         elif isinstance(stmt, Select):
             _seed_from_args(tuple(br.value for br in stmt.branches))
-        elif isinstance(stmt, Update):
+        elif isinstance(stmt, IrAccum):
             _seed_from_args((stmt.value,))
         elif isinstance(stmt, Write):
             _seed_from_args((stmt.value,))
@@ -464,7 +465,7 @@ def _n_rows(pre_reduce_shape: tuple, reduce_axis: int) -> int:
 
 
 __all__ = [
-    "Accum",
+    "PlanAccum",
     "Inline",
     "KernelPlan",
     "Loop",

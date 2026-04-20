@@ -9,7 +9,7 @@ multi-reduce, free-axis leakage).
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinOp, Literal, Var
-from deplodock.compiler.ir.loop_ir import AccumDecl, Accumulator, Assign, Axis, LoopOp, Port, Update, Write, flat_body_to_nested
+from deplodock.compiler.ir.loop_ir import Accum, Accumulator, Assign, Axis, LoopOp, Port, Write, flat_body_to_nested
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 from deplodock.compiler.rules.fusion._merge_core import _bind_axis, _solve_sigma, merge_loop_ops
 
@@ -17,14 +17,27 @@ from deplodock.compiler.rules.fusion._merge_core import _bind_axis, _solve_sigma
 def _loop(*, axes=(), inputs=(), accumulators=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
-    Test-local shim: LoopOp.axes is now a property over the body's Loop tree,
-    so the constructor no longer accepts axes=. The ``accumulators=`` kwarg
-    is also gone — each ``Accumulator`` (alias for ``AccumDecl``) gets
-    prepended to the body as an ``AccumDecl`` statement, preserving the
-    legacy fixture shape.
+    Test-local shim: LoopOp.axes is a property over the body's Loop tree,
+    so ``axes=`` feeds ``flat_body_to_nested`` instead. ``accumulators=``
+    is gone at the IR level — reductions carry their combine op on each
+    ``Accum``. The shim backfills ``Accum.op`` from the ``accumulators``
+    tuple when a fixture's ``Accum(name=..., value=...)`` omits it,
+    keeping legacy tests readable.
     """
-    prefix = tuple(AccumDecl(name=a.name, combine=a.combine, init=a.init) for a in accumulators)
-    return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, prefix + tuple(body)))
+    acc_ops = {a.name: a.combine for a in accumulators}
+    body = tuple(_backfill_update_op(s, acc_ops) for s in body)
+    return LoopOp(inputs=inputs, body=flat_body_to_nested(axes, body))
+
+
+def _backfill_update_op(stmt, acc_ops):
+    """Apply ``acc_ops`` to each Accum that defaulted to ``add`` but whose
+    target is declared with a non-add combine via the fixture's legacy
+    ``accumulators=`` kwarg."""
+    if isinstance(stmt, Accum):
+        desired = acc_ops.get(stmt.name)
+        if desired is not None and stmt.op.fn == "add" and desired.fn != "add":
+            return Accum(name=stmt.name, value=stmt.value, op=desired)
+    return stmt
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +198,7 @@ def _reduce_sum_over_axis1(outer: int = 4, inner: int = 8) -> LoopOp:
         accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign(name="m", op=ElementwiseOp("neg"), args=("$0",)),
-            Update(target="acc", value="m"),
+            Accum(name="acc", value="m"),
             Write(output=0, index=(Var("i"),), value="acc"),
         ),
     )
@@ -216,13 +229,13 @@ def test_merge_reduce_then_elementwise():
     # Locals merged: the acc from the producer survives.
     local_names = [lb.name for lb in merged.accumulators]
     assert "acc" in local_names
-    # Body must contain the Update, then the bridge-copy, then the consumer's add.
+    # Body must contain the Accum, then the bridge-copy, then the consumer's add.
     from deplodock.compiler.ir.loop_ir import flatten_body
 
     flat = flatten_body(merged.body)
     fns = [s.op.fn for s in flat if isinstance(s, Assign)]
     assert fns == ["neg", "copy", "add"]
-    assert any(isinstance(s, Update) for s in flat)
+    assert any(isinstance(s, Accum) for s in flat)
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +262,7 @@ def test_merge_reduce_with_singleton_batch_dim():
         accumulators=(Accumulator(name="acc", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
             Assign(name="sq", op=ElementwiseOp("mul"), args=("$0", "$0")),
-            Update(target="acc", value="sq"),
+            Accum(name="acc", value="sq"),
             Write(output=0, index=(Literal(0, "int"), Var("a1"), Literal(0, "int")), value="acc"),
         ),
     )
@@ -282,7 +295,7 @@ def test_merge_alias_unifies_reduce_axes():
         inputs=(Port(index=(Var("a0"), Var("a1"))),),
         accumulators=(Accumulator(name="acc_p", combine=ElementwiseOp("max"), init=Literal(-1e30)),),
         body=(
-            Update(target="acc_p", value="$0"),
+            Accum(name="acc_p", value="$0"),
             Write(output=0, index=(Var("a0"),), value="acc_p"),
         ),
     )
@@ -296,7 +309,7 @@ def test_merge_alias_unifies_reduce_axes():
         ),
         accumulators=(Accumulator(name="acc_c", combine=ElementwiseOp("add"), init=Literal(0.0)),),
         body=(
-            Update(target="acc_c", value="$1"),
+            Accum(name="acc_c", value="$1"),
             Assign(name="v", op=ElementwiseOp("add"), args=("$0", "acc_c")),
             Write(output=0, index=(Var("b0"),), value="v"),
         ),
