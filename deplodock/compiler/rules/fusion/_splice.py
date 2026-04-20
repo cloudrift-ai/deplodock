@@ -99,38 +99,38 @@ def splice_loop_ops(
 
     # Producer axes surviving as Loops: reduce (not σ-bound) with extent > 1.
     surviving_axes = [a for a in producer.axes if a.name in reduce_names and a.name not in sigma and int(a.extent) > 1]
-    axis_rename = _fresh_names({a.name for a in surviving_axes}, consumer_axis_names | consumer_ssa)
-    ssa_rename = _fresh_names(producer_ssa, consumer_ssa | consumer_axis_names | set(axis_rename.values()))
+    producer_axis_rename = _fresh_names({a.name for a in surviving_axes}, consumer_axis_names | consumer_ssa)
+    producer_ssa_rename = _fresh_names(producer_ssa, consumer_ssa | consumer_axis_names | set(producer_axis_rename.values()))
 
-    full_sigma: dict[str, Expr] = dict(sigma)
-    for old, new in axis_rename.items():
-        full_sigma[old] = Var(new)
+    producer_sigma: dict[str, Expr] = dict(sigma)
+    for old, new in producer_axis_rename.items():
+        producer_sigma[old] = Var(new)
 
     # --- Source renumbering ---
+    # Layout: [producer.inputs] ++ [consumer.inputs \ source]. Producer Loads
+    # keep their source unchanged; consumer Loads shift past producer's inputs
+    # and compact over the dropped slot.
     consumer_source_remap: dict[int, int] = {}
-    next_src = 0
+    next_src = producer.num_inputs
     for i in range(consumer.num_inputs):
         if i == source:
             continue
         consumer_source_remap[i] = next_src
         next_src += 1
-    producer_source_remap: dict[int, int] = {j: next_src + j for j in range(producer.num_inputs)}
 
-    bridge_value = ssa_rename.get(write.value, write.value)
-    load_alias = {ld.name: bridge_value for ld in target_loads}
+    bridge_value = producer_ssa_rename.get(write.value, write.value)
+    consumer_load_alias = {ld.name: bridge_value for ld in target_loads}
 
     # --- Parallel tree walk ---
     merged_body = _merge_trees(
         producer.body,
         consumer.body,
-        sigma=sigma,
-        full_sigma=full_sigma,
-        ssa_rename=ssa_rename,
-        axis_rename=axis_rename,
-        producer_source_remap=producer_source_remap,
+        producer_sigma=producer_sigma,
+        producer_ssa_rename=producer_ssa_rename,
+        producer_axis_rename=producer_axis_rename,
         consumer_source_remap=consumer_source_remap,
         target_source=source,
-        load_alias=load_alias,
+        consumer_load_alias=consumer_load_alias,
         skip_write=write,
     )
 
@@ -149,14 +149,12 @@ def _merge_trees(
     p_stmts: tuple[Stmt, ...],
     c_stmts: tuple[Stmt, ...],
     *,
-    sigma: dict[str, Expr],
-    full_sigma: dict[str, Expr],
-    ssa_rename: dict[str, str],
-    axis_rename: dict[str, str],
-    producer_source_remap: dict[int, int],
+    producer_sigma: dict[str, Expr],
+    producer_ssa_rename: dict[str, str],
+    producer_axis_rename: dict[str, str],
     consumer_source_remap: dict[int, int],
     target_source: int,
-    load_alias: dict[str, str],
+    consumer_load_alias: dict[str, str],
     skip_write: Write,
 ) -> tuple[Stmt, ...]:
     """Walk producer and consumer bodies at the current scope.
@@ -179,44 +177,48 @@ def _merge_trees(
             return None
         if isinstance(stmt, Loop):
             axis_name = stmt.axis.name
-            new_axis_name = axis_rename.get(axis_name, axis_name)
+            new_axis_name = producer_axis_rename.get(axis_name, axis_name)
             new_body = tuple(s for s in (rewrite_producer(c) for c in stmt.body) if s is not None)
             return Loop(axis=Axis(name=new_axis_name, extent=stmt.axis.extent), body=new_body)
         if isinstance(stmt, Load):
             return Load(
-                name=ssa_rename.get(stmt.name, stmt.name),
-                source=producer_source_remap[stmt.source],
-                index=tuple(substitute(e, full_sigma) for e in stmt.index),
+                name=producer_ssa_rename.get(stmt.name, stmt.name),
+                source=stmt.source,
+                index=tuple(substitute(e, producer_sigma) for e in stmt.index),
             )
         if isinstance(stmt, Assign):
             return Assign(
-                name=ssa_rename.get(stmt.name, stmt.name),
+                name=producer_ssa_rename.get(stmt.name, stmt.name),
                 op=stmt.op,
-                args=tuple(ssa_rename.get(a, a) for a in stmt.args),
+                args=tuple(producer_ssa_rename.get(a, a) for a in stmt.args),
             )
         if isinstance(stmt, Accum):
             return Accum(
-                name=ssa_rename.get(stmt.name, stmt.name),
-                value=ssa_rename.get(stmt.value, stmt.value),
+                name=producer_ssa_rename.get(stmt.name, stmt.name),
+                value=producer_ssa_rename.get(stmt.value, stmt.value),
                 op=stmt.op,
             )
         if isinstance(stmt, Select):
             return Select(
-                name=ssa_rename.get(stmt.name, stmt.name),
+                name=producer_ssa_rename.get(stmt.name, stmt.name),
                 branches=tuple(
-                    SelectBranch(value=ssa_rename.get(b.value, b.value), select=substitute(b.select, full_sigma)) for b in stmt.branches
+                    SelectBranch(
+                        value=producer_ssa_rename.get(b.value, b.value),
+                        select=substitute(b.select, producer_sigma),
+                    )
+                    for b in stmt.branches
                 ),
             )
         if isinstance(stmt, Write):
             return Write(
                 output=stmt.output,
-                index=tuple(substitute(e, full_sigma) for e in stmt.index),
-                value=ssa_rename.get(stmt.value, stmt.value),
+                index=tuple(substitute(e, producer_sigma) for e in stmt.index),
+                value=producer_ssa_rename.get(stmt.value, stmt.value),
             )
         return stmt
 
     def ren(name: str) -> str:
-        return load_alias.get(name, name)
+        return consumer_load_alias.get(name, name)
 
     out: list[Stmt] = []
 
@@ -226,20 +228,18 @@ def _merge_trees(
         if p_stmt is skip_write:
             continue
         if isinstance(p_stmt, Loop):
-            bound = sigma.get(p_stmt.axis.name)
+            bound = producer_sigma.get(p_stmt.axis.name)
             if isinstance(bound, Var) and bound.name in c_loop_by_axis:
                 c_loop = c_loop_by_axis[bound.name]
                 merged_inner = _merge_trees(
                     p_stmt.body,
                     c_loop.body,
-                    sigma=sigma,
-                    full_sigma=full_sigma,
-                    ssa_rename=ssa_rename,
-                    axis_rename=axis_rename,
-                    producer_source_remap=producer_source_remap,
+                    producer_sigma=producer_sigma,
+                    producer_ssa_rename=producer_ssa_rename,
+                    producer_axis_rename=producer_axis_rename,
                     consumer_source_remap=consumer_source_remap,
                     target_source=target_source,
-                    load_alias=load_alias,
+                    consumer_load_alias=consumer_load_alias,
                     skip_write=skip_write,
                 )
                 out.append(Loop(axis=c_loop.axis, body=merged_inner))
@@ -258,21 +258,19 @@ def _merge_trees(
             merged_inner = _merge_trees(
                 (),
                 c_stmt.body,
-                sigma=sigma,
-                full_sigma=full_sigma,
-                ssa_rename=ssa_rename,
-                axis_rename=axis_rename,
-                producer_source_remap=producer_source_remap,
+                producer_sigma=producer_sigma,
+                producer_ssa_rename=producer_ssa_rename,
+                producer_axis_rename=producer_axis_rename,
                 consumer_source_remap=consumer_source_remap,
                 target_source=target_source,
-                load_alias=load_alias,
+                consumer_load_alias=consumer_load_alias,
                 skip_write=skip_write,
             )
             out.append(Loop(axis=c_stmt.axis, body=merged_inner))
             continue
         if isinstance(c_stmt, Load):
             if c_stmt.source == target_source:
-                continue  # dropped; name resolves via load_alias
+                continue  # dropped; name resolves via consumer_load_alias
             out.append(Load(name=c_stmt.name, source=consumer_source_remap[c_stmt.source], index=c_stmt.index))
             continue
         if isinstance(c_stmt, Assign):
