@@ -190,7 +190,9 @@ by fusion rules — is canonicalized before validation.
 | ``drop_size_one_free_axes``         | Inline ``Loop(axis, extent=1)`` free loops; substitute ``Var(axis.name) → Literal(0)`` through the body. Reduce loops untouched.  |
 | ``canonicalize_free_axis_order``    | Sort the outer chain of free Loops alphabetically by axis name. Free loops commute, so reordering is safe.                        |
 | ``linearize_pointwise_body``        | For pointwise kernels (no Accum), push non-Loop siblings into the inner Loop so all leaves end up at the innermost scope.         |
-| ``normalize_body``                  | Compose the three passes in order.                                                                                                |
+| ``eliminate_copy_aliases``          | Drop ``y = copy(x)`` identity Assigns (left behind by merge bridges) and rewire downstream refs to the alias root.                |
+| ``rename_ssa_sequential``           | Canonicalize Assign / Select SSA names to ``v0``, ``v1``, ... in definition order. Accum / Load names left untouched.             |
+| ``normalize_body``                  | Compose the passes in order.                                                                                                      |
 
 **Rule:** Imports ``expr`` and ``loop.ir``. No dependency on ``plan``
 or any pass infrastructure — these are local structural rewrites with
