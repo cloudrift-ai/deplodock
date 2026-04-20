@@ -229,6 +229,11 @@ class LoopOp(Op):
     body: tuple[Stmt, ...] = ()
 
     def __post_init__(self) -> None:
+        new_body = _drop_size_one_free_axes(self.body)
+        new_body = _canonicalize_free_axis_order(new_body)
+        new_body = _linearize_pointwise_body(new_body)
+        if new_body != self.body:
+            self.body = new_body
         _validate(self)
 
     @property
@@ -424,6 +429,156 @@ def _render_body(
             kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
             lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {kind}")
             _render_body(stmt.body, indent + "    ", buffers, lines)
+
+
+# ---------------------------------------------------------------------------
+# Body normalization (invoked from LoopOp.__post_init__)
+# ---------------------------------------------------------------------------
+
+
+def _immediate_has_accum(stmts: tuple[Stmt, ...]) -> bool:
+    """True if the immediate statement sequence contains an ``Accum`` — marks
+    the enclosing Loop as a reduce loop."""
+    return any(isinstance(s, Accum) for s in stmts)
+
+
+def _substitute_vars_in_body(stmts: tuple[Stmt, ...], mapping: dict[str, Expr]) -> tuple[Stmt, ...]:
+    """Rewrite ``Var(name)`` occurrences in every Expr subtree of ``stmts``."""
+    from deplodock.compiler.ir.expr import substitute
+
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop):
+            out.append(Loop(axis=s.axis, body=_substitute_vars_in_body(s.body, mapping)))
+        elif isinstance(s, Load):
+            out.append(Load(name=s.name, source=s.source, index=tuple(substitute(e, mapping) for e in s.index)))
+        elif isinstance(s, Write):
+            out.append(Write(output=s.output, index=tuple(substitute(e, mapping) for e in s.index), value=s.value))
+        elif isinstance(s, Select):
+            out.append(
+                Select(
+                    name=s.name,
+                    branches=tuple(SelectBranch(value=b.value, select=substitute(b.select, mapping)) for b in s.branches),
+                )
+            )
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def _drop_size_one_free_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Inline ``Loop(axis, extent=1)`` free loops — the axis iterates once, so
+    ``Var(axis.name)`` rewrites to ``Literal(0, "int")`` and the loop's body
+    splices into the enclosing scope. Reduce loops (bodies with ``Accum``)
+    are left alone: dropping the loop would strip the accumulator."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop):
+            inner = _drop_size_one_free_axes(s.body)
+            is_reduce = _immediate_has_accum(inner)
+            if int(s.axis.extent) == 1 and not is_reduce:
+                sub = {s.axis.name: Literal(0, "int")}
+                out.extend(_substitute_vars_in_body(inner, sub))
+            else:
+                out.append(Loop(axis=s.axis, body=inner))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def _canonicalize_free_axis_order(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Reorder the outer chain of free Loops alphabetically by axis name.
+
+    A chain is a sequence of singleton-body Loops, each a free loop (no
+    direct ``Accum`` in its body). Reordering is safe for free loops —
+    they commute. The chain ends at a reduce Loop or a branching body;
+    recursion continues into that terminal body."""
+    chain_axes: list[Axis] = []
+    current = stmts
+    while len(current) == 1 and isinstance(current[0], Loop):
+        loop = current[0]
+        if _immediate_has_accum(loop.body):
+            break
+        chain_axes.append(loop.axis)
+        current = loop.body
+
+    terminal = tuple(
+        Loop(axis=s.axis, body=_canonicalize_free_axis_order(s.body)) if isinstance(s, Loop) else s for s in current
+    )
+
+    chain_axes_sorted = sorted(chain_axes, key=lambda a: a.name)
+    result: tuple[Stmt, ...] = terminal
+    for axis in reversed(chain_axes_sorted):
+        result = (Loop(axis=axis, body=result),)
+    return result
+
+
+def _any_accum_in_tree(stmts: tuple[Stmt, ...]) -> bool:
+    for s in stmts:
+        if isinstance(s, Accum):
+            return True
+        if isinstance(s, Loop) and _any_accum_in_tree(s.body):
+            return True
+    return False
+
+
+def _stmt_ssa_refs(stmt: Stmt) -> set[str]:
+    """SSA names referenced (read) by ``stmt`` at its own scope."""
+    if isinstance(stmt, Assign):
+        return set(stmt.args)
+    if isinstance(stmt, Accum):
+        return {stmt.value} if stmt.value else set()
+    if isinstance(stmt, Select):
+        return {b.value for b in stmt.branches}
+    if isinstance(stmt, Write):
+        return {stmt.value}
+    return set()
+
+
+def _inner_ssa_defs(stmts: tuple[Stmt, ...]) -> set[str]:
+    """SSA names defined anywhere under ``stmts`` (recursing into Loops)."""
+    defs: set[str] = set()
+    for s in stmts:
+        if isinstance(s, (Assign, Load, Select, Accum)):
+            defs.add(s.name)
+        if isinstance(s, Loop):
+            defs |= _inner_ssa_defs(s.body)
+    return defs
+
+
+def _linearize_pointwise_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """For kernels with no reductions (no ``Accum`` anywhere), push non-Loop
+    siblings into the inner Loop's body so the result is a single linear
+    chain ending at the innermost scope.
+
+    Post-merge bodies can look like ``Loop(a0) → Loop(a1) → [Load x,
+    Loop(a2) → [...Write]]`` — leaves scattered across nest depths. The
+    plan analyzer (``loop_plan.analyze_kernel``) expects pointwise leaves
+    at the innermost scope; linearizing here keeps that invariant without
+    touching reduce kernels (where mixed-sibling structure is meaningful).
+
+    Skips the push when a sibling references an SSA name defined inside
+    the Loop — that case is already ill-scoped and validation should
+    surface it rather than have us silently reshape it into validity.
+    """
+    if _any_accum_in_tree(stmts):
+        return stmts
+
+    loops = [(i, s) for i, s in enumerate(stmts) if isinstance(s, Loop)]
+    if len(loops) != 1:
+        return stmts
+
+    loop_idx, loop = loops[0]
+    before = list(stmts[:loop_idx])
+    after = list(stmts[loop_idx + 1 :])
+    inner_defs = _inner_ssa_defs(loop.body)
+    for sib in before + after:
+        if _stmt_ssa_refs(sib) & inner_defs:
+            return stmts
+
+    merged_inner = tuple(before + list(loop.body) + after)
+    merged_inner = _linearize_pointwise_body(merged_inner)
+    return (Loop(axis=loop.axis, body=merged_inner),)
 
 
 # ---------------------------------------------------------------------------
