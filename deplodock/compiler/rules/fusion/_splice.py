@@ -94,6 +94,12 @@ class _PendingAccum:
 
 @dataclass
 class _Ctx:
+    """Per-splice state: one instance lives for the entire recursive walk.
+
+    Holds the splice's invariants (producer, consumer, target source) plus
+    the naming and materialization bookkeeping that must persist across
+    every call in the recursion."""
+
     producer: LoopOp
     consumer: LoopOp
     source: int
@@ -127,6 +133,23 @@ class _Ctx:
         return new
 
 
+@dataclass(frozen=True)
+class _Scope:
+    """Per-call recursion state: the consumer axes enclosing the current
+    walk position. Every recursive step into a ``Loop`` creates a new
+    ``_Scope`` via :meth:`nest`; the pre-nest value stays alive in the
+    caller's frame and is what we return to after the child call."""
+
+    enclosing: tuple[Axis, ...] = ()
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(a.name for a in self.enclosing)
+
+    def nest(self, axis: Axis) -> _Scope:
+        return _Scope(enclosing=self.enclosing + (axis,))
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -154,7 +177,7 @@ def splice_loop_ops(
             used_names=_collect_names(producer) | _collect_names(consumer),
             consumer_source_remap=_build_consumer_source_remap(producer, consumer, source),
         )
-        new_body, bubble = _walk(consumer.body, ctx, enclosing=())
+        new_body, bubble = _walk(consumer.body, ctx, _Scope())
         if bubble:
             return None
         # Sibling reduce-axis unification runs in LoopOp.__post_init__ via
@@ -174,7 +197,7 @@ def splice_loop_ops(
 def _walk(
     c_stmts: tuple[Stmt, ...],
     ctx: _Ctx,
-    enclosing: tuple[Axis, ...],
+    scope: _Scope,
 ) -> tuple[tuple[Stmt, ...], list[_PendingAccum]]:
     """Walk consumer stmts at the current scope. Return (new_body, bubble).
 
@@ -182,13 +205,12 @@ def _walk(
     scope (caller is responsible for flushing them at its level)."""
     out: list[Stmt] = []
     bubble: list[_PendingAccum] = []
-    enclosing_names = tuple(a.name for a in enclosing)
 
     for s in c_stmts:
         if isinstance(s, Loop):
-            inner_out, inner_bubble = _walk(s.body, ctx, enclosing + (s.axis,))
-            here, up = _partition_pendings(inner_bubble, enclosing_names)
-            out.extend(_emit_accum_loops(here, ctx, enclosing))
+            inner_out, inner_bubble = _walk(s.body, ctx, scope.nest(s.axis))
+            here, up = _partition_pendings(inner_bubble, scope)
+            out.extend(_emit_accum_loops(here, ctx, scope))
             out.append(Loop(axis=s.axis, body=inner_out))
             bubble.extend(up)
 
@@ -196,9 +218,9 @@ def _walk(
             sigma = _solve_sigma(_producer_write(ctx).index, s.index, _producer_axis_names(ctx))
             if sigma is None:
                 raise _NotSupported
-            prod_stmts, new_pending, final_name = _dfs_build(_producer_write(ctx).value, sigma, ctx, enclosing_names)
-            here, up = _partition_pendings(new_pending, enclosing_names)
-            out.extend(_emit_accum_loops(here, ctx, enclosing))
+            prod_stmts, new_pending, final_name = _dfs_build(_producer_write(ctx).value, sigma, ctx)
+            here, up = _partition_pendings(new_pending, scope)
+            out.extend(_emit_accum_loops(here, ctx, scope))
             out.extend(prod_stmts)
             # Alias consumer's load name to producer's final value via a
             # copy Assign. normalize's copy-elim pass will collapse it.
@@ -230,7 +252,6 @@ def _dfs_build(
     root_ssa: str,
     sigma: dict[str, Expr],
     ctx: _Ctx,
-    enclosing_names: tuple[str, ...],
 ) -> tuple[list[Stmt], list[_PendingAccum], str]:
     """Walk producer SSA from ``root_ssa`` back to Loads / Accums, emitting
     freshened stmts in reverse-topological (i.e. definition) order.
@@ -323,7 +344,7 @@ def _dfs_build(
 def _emit_accum_loops(
     pendings: list[_PendingAccum],
     ctx: _Ctx,
-    enclosing: tuple[Axis, ...],
+    scope: _Scope,
 ) -> list[Stmt]:
     """Build reduce Loops for each unique pending accumulator at this scope.
 
@@ -345,10 +366,10 @@ def _emit_accum_loops(
         extended_sigma: dict[str, Expr] = dict(p.sigma)
         extended_sigma[p.decl.reduce_axis.name] = Var(reduce_axis_name)
         body_stmts, nested_pending, _ = _dfs_build_accum_body(p, extended_sigma, ctx)
-        nested_here, nested_up = _partition_pendings(nested_pending, tuple(a.name for a in enclosing))
+        nested_here, nested_up = _partition_pendings(nested_pending, scope)
         if nested_up:
             raise _NotSupported
-        out.extend(_emit_accum_loops(nested_here, ctx, enclosing))
+        out.extend(_emit_accum_loops(nested_here, ctx, scope))
         out.append(Loop(axis=Axis(name=reduce_axis_name, extent=p.decl.reduce_axis.extent), body=body_stmts))
         ctx.materialized.add((p.decl.name, p.required_c_axes))
     return out
@@ -459,45 +480,6 @@ def _solve_sigma(
     return sigma
 
 
-def _check_no_extra_consumer_axes(
-    sigma: dict[str, Expr],
-    enclosing_names: tuple[str, ...],
-    ctx: _Ctx,
-) -> None:
-    """Reject when the consumer introduces axes outside σ's image — that
-    would mean the producer is being asked to redo the same work for
-    unrelated consumer iterations. See design clarification #3."""
-    producer_output_coord_axes = {e.name for e in _producer_write(ctx).index if isinstance(e, Var)}
-    mapped_consumer_axes: set[str] = set()
-    for p_name, r in sigma.items():
-        if p_name not in producer_output_coord_axes:
-            continue
-        if isinstance(r, Var):
-            mapped_consumer_axes.add(r.name)
-    # Every axis currently in the consumer's enclosing chain must either be
-    # mapped from a producer output-coord axis OR be literal-pinned in the
-    # producer's Write (i.e. producer iterates over it implicitly by having
-    # extent 1).
-    for c_axis in enclosing_names:
-        if c_axis in mapped_consumer_axes:
-            continue
-        # The axis may correspond to a producer axis via a pinned Literal;
-        # that's fine. If there's no correspondence at all, the consumer is
-        # introducing extra iteration.
-        if _axis_is_broadcastable(c_axis, ctx):
-            continue
-        raise _NotSupported
-
-
-def _axis_is_broadcastable(c_axis: str, ctx: _Ctx) -> bool:
-    """True if ``c_axis`` is a consumer axis with extent 1 or only used for
-    the spliced Load (which we're replacing anyway)."""
-    for a in ctx.consumer.axes:
-        if a.name == c_axis and int(a.extent) == 1:
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Producer inspection helpers — on-demand walks, no precomputed analysis
 # ---------------------------------------------------------------------------
@@ -590,20 +572,21 @@ def _collect_names(op: LoopOp) -> set[str]:
 
 def _partition_pendings(
     pendings: list[_PendingAccum],
-    enclosing_names: tuple[str, ...],
+    scope: _Scope,
 ) -> tuple[list[_PendingAccum], list[_PendingAccum]]:
     """Split pendings into (flush-here, bubble-up).
 
-    - ``required_c_axes == enclosing_names`` → flush here.
-    - ``required_c_axes`` is a strict prefix of enclosing_names → bubble up.
+    - ``required_c_axes == scope.names`` → flush here.
+    - ``required_c_axes`` is a strict prefix of ``scope.names`` → bubble up.
     - otherwise (longer, or non-prefix mismatch) → NotSupported.
     """
+    names = scope.names
     here: list[_PendingAccum] = []
     up: list[_PendingAccum] = []
     for p in pendings:
-        if p.required_c_axes == enclosing_names:
+        if p.required_c_axes == names:
             here.append(p)
-        elif _is_strict_prefix(p.required_c_axes, enclosing_names):
+        elif _is_strict_prefix(p.required_c_axes, names):
             up.append(p)
         else:
             raise _NotSupported
