@@ -13,10 +13,6 @@ applied in order by :func:`normalize_body`:
   ``Loop`` blocks alphabetically by axis name. Free loops commute, so
   reordering is safe; the chain terminates at a reduce Loop or a
   branching body.
-- :func:`linearize_pointwise_body` — for kernels without any ``Accum``,
-  push non-Loop siblings into the inner Loop's body so all leaves end up
-  at the innermost scope. Keeps the plan analyzer's pointwise invariant
-  intact after fusion merges produce mixed-sibling bodies.
 - :func:`eliminate_copy_aliases` — treat ``y = copy(x)`` Assigns as
   aliases, rewire downstream references to the alias root, and drop the
   copies. Merge chains leave stacks of identity copies; this collapses
@@ -53,7 +49,6 @@ __all__ = [
     "normalize_body",
     "drop_size_one_free_axes",
     "canonicalize_free_axis_order",
-    "linearize_pointwise_body",
     "eliminate_copy_aliases",
     "unify_sibling_reduce_axes",
     "rename_ssa_sequential",
@@ -69,7 +64,6 @@ def normalize_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     """Apply the structural and cosmetic normalization passes in order."""
     stmts = drop_size_one_free_axes(stmts)
     stmts = canonicalize_free_axis_order(stmts)
-    stmts = linearize_pointwise_body(stmts)
     stmts = eliminate_copy_aliases(stmts)
     stmts = unify_sibling_reduce_axes(stmts)
     stmts = rename_ssa_sequential(stmts)
@@ -85,41 +79,6 @@ def _immediate_has_accum(stmts: tuple[Stmt, ...]) -> bool:
     """True when the immediate sequence contains an ``Accum`` — marks the
     enclosing Loop as a reduce loop."""
     return any(isinstance(s, Accum) for s in stmts)
-
-
-def _any_accum_in_tree(stmts: tuple[Stmt, ...]) -> bool:
-    """True when any ``Accum`` appears anywhere in the body tree (recursing
-    through nested ``Loop`` blocks)."""
-    for s in stmts:
-        if isinstance(s, Accum):
-            return True
-        if isinstance(s, Loop) and _any_accum_in_tree(s.body):
-            return True
-    return False
-
-
-def _stmt_ssa_refs(stmt: Stmt) -> set[str]:
-    """SSA names read by ``stmt`` at its own scope (Loop recurses separately)."""
-    if isinstance(stmt, Assign):
-        return set(stmt.args)
-    if isinstance(stmt, Accum):
-        return {stmt.value} if stmt.value else set()
-    if isinstance(stmt, Select):
-        return {b.value for b in stmt.branches}
-    if isinstance(stmt, Write):
-        return {stmt.value}
-    return set()
-
-
-def _inner_ssa_defs(stmts: tuple[Stmt, ...]) -> set[str]:
-    """SSA names defined anywhere under ``stmts`` (recurses into Loops)."""
-    defs: set[str] = set()
-    for s in stmts:
-        if isinstance(s, (Assign, Load, Select, Accum)):
-            defs.add(s.name)
-        if isinstance(s, Loop):
-            defs |= _inner_ssa_defs(s.body)
-    return defs
 
 
 # ---------------------------------------------------------------------------
@@ -197,45 +156,7 @@ def canonicalize_free_axis_order(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Pass 3: linearize pointwise bodies
-# ---------------------------------------------------------------------------
-
-
-def linearize_pointwise_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
-    """For kernels with no ``Accum`` anywhere, push non-Loop siblings into
-    the inner Loop's body so all leaves end up at the innermost scope.
-
-    Keeps :func:`loop.plan.analyze_kernel`'s pointwise invariant intact
-    after fusion merges that produce mixed-sibling bodies like
-    ``Loop(a0) → Loop(a1) → [Load x, Loop(a2) → [...Write]]``.
-
-    Skips the push when a sibling references an SSA name defined inside
-    the Loop — that case is already ill-scoped and validation should
-    surface it rather than have this transform silently reshape it into
-    validity.
-    """
-    if _any_accum_in_tree(stmts):
-        return stmts
-
-    loops = [(i, s) for i, s in enumerate(stmts) if isinstance(s, Loop)]
-    if len(loops) != 1:
-        return stmts
-
-    loop_idx, loop = loops[0]
-    before = list(stmts[:loop_idx])
-    after = list(stmts[loop_idx + 1 :])
-    inner_defs = _inner_ssa_defs(loop.body)
-    for sib in before + after:
-        if _stmt_ssa_refs(sib) & inner_defs:
-            return stmts
-
-    merged_inner = tuple(before + list(loop.body) + after)
-    merged_inner = linearize_pointwise_body(merged_inner)
-    return (Loop(axis=loop.axis, body=merged_inner),)
-
-
-# ---------------------------------------------------------------------------
-# Pass 4: eliminate `y = copy(x)` identity aliases
+# Pass 3: eliminate `y = copy(x)` identity aliases
 # ---------------------------------------------------------------------------
 
 
