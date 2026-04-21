@@ -101,7 +101,6 @@ def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: int) -> LoopOp |
         loops={"producer": producer, "consumer": consumer},
         splice_edges={("consumer", source): "producer"},
         input_remap=input_remap,
-        root="consumer",
     )
 
 
@@ -109,7 +108,6 @@ def splice_loops(
     loops: dict[str, LoopOp],
     splice_edges: dict[tuple[str, int], str],
     input_remap: dict[tuple[str, int], int],
-    root: str,
 ) -> LoopOp | None:
     """Splice a DAG of ``LoopOp``s into one merged kernel.
 
@@ -120,13 +118,19 @@ def splice_loops(
     should be inlined."
     ``input_remap`` assigns every non-splice Load's ``(origin_tag,
     source_idx)`` to a slot in the merged kernel's external input list.
-    ``root`` names the tag whose ``Write``s seed the traversal — the
-    subgraph's sink.
 
-    Handles any single-root, single-output-per-target DAG — chains,
-    diamonds, shared sub-producers. Returns ``None`` if any splice edge
-    hits an unsupported pattern (non-Var/Literal writer index, arithmetic
-    σ targets, etc.)."""
+    The sink — the loop whose Writes seed the traversal — is derived
+    from ``splice_edges``: it's the unique tag in ``loops`` that never
+    appears as a splice target. Returns ``None`` if the sink is ambiguous
+    (cycle or multiple sinks) or if any splice edge hits an unsupported
+    pattern (non-Var/Literal writer index, arithmetic σ targets, etc.).
+    Handles any single-sink, single-output-per-target DAG — chains,
+    diamonds, shared sub-producers."""
+    target_tags = set(splice_edges.values())
+    candidates = [tag for tag in loops if tag not in target_tags]
+    if len(candidates) != 1:
+        return None
+    root = candidates[0]
     try:
         return _Splicer(
             loops={tag: op.analyze() for tag, op in loops.items()},
@@ -176,7 +180,7 @@ def splice_graph(graph) -> tuple[LoopOp, list[str]] | None:
                     external_slot[inp] = len(external_slot)
                 input_remap[(nid, src_idx)] = external_slot[inp]
 
-    merged = splice_loops(loops=loops, splice_edges=splice_edges, input_remap=input_remap, root=root)
+    merged = splice_loops(loops=loops, splice_edges=splice_edges, input_remap=input_remap)
     if merged is None:
         return None
     externals = [nid for nid, _ in sorted(external_slot.items(), key=lambda kv: kv[1])]

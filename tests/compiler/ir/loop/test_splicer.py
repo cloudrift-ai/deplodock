@@ -313,7 +313,6 @@ def test_chain_three_loops():
             ("a", 0): 0,  # a's x → merged slot 0
             ("c", 1): 1,  # c's bias → merged slot 1
         },
-        root="c",
     )
     assert merged is not None
     fns = _elementwise_fns(merged)
