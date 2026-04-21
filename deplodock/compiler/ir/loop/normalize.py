@@ -30,7 +30,9 @@ applied in order by :func:`normalize_body`:
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var, substitute
+from collections.abc import Callable
+
+from deplodock.compiler.ir.expr import Expr, Literal, Sigma, Var
 from deplodock.compiler.ir.loop.ir import (
     Accum,
     Assign,
@@ -38,10 +40,9 @@ from deplodock.compiler.ir.loop.ir import (
     Load,
     Loop,
     Select,
-    SelectBranch,
     Stmt,
-    Write,
     flatten_body,
+    map_body,
 )
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
@@ -53,6 +54,28 @@ __all__ = [
     "unify_sibling_reduce_axes",
     "rename_ssa_sequential",
 ]
+
+
+def _identity_rename(n: str) -> str:
+    return n
+
+
+def _rewrite_body(
+    body: tuple[Stmt, ...],
+    rename_ssa: Callable[[str], str],
+    sigma: Sigma,
+    axis_fn: Callable[[Axis], Axis] = lambda a: a,
+) -> tuple[Stmt, ...]:
+    """Walk ``body`` applying ``Stmt.rewrite(rename_ssa, sigma)`` to each
+    non-``Loop`` stmt and ``axis_fn`` to each ``Loop``'s axis, recursing
+    into Loop bodies. Thin shared helper over ``map_body``."""
+
+    def fn(s: Stmt) -> Stmt | None:
+        if isinstance(s, Loop):
+            return Loop(axis=axis_fn(s.axis), body=_rewrite_body(s.body, rename_ssa, sigma, axis_fn))
+        return s.rewrite(rename_ssa, sigma)
+
+    return map_body(body, fn)
 
 
 # ---------------------------------------------------------------------------
@@ -86,45 +109,21 @@ def _immediate_has_accum(stmts: tuple[Stmt, ...]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _substitute_vars_in_body(stmts: tuple[Stmt, ...], mapping: dict[str, Expr]) -> tuple[Stmt, ...]:
-    """Rewrite ``Var(name)`` occurrences in every Expr subtree of ``stmts``."""
-    out: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, Loop):
-            out.append(Loop(axis=s.axis, body=_substitute_vars_in_body(s.body, mapping)))
-        elif isinstance(s, Load):
-            out.append(Load(name=s.name, source=s.source, index=tuple(substitute(e, mapping) for e in s.index)))
-        elif isinstance(s, Write):
-            out.append(Write(output=s.output, index=tuple(substitute(e, mapping) for e in s.index), value=s.value))
-        elif isinstance(s, Select):
-            out.append(
-                Select(
-                    name=s.name,
-                    branches=tuple(SelectBranch(value=b.value, select=substitute(b.select, mapping)) for b in s.branches),
-                )
-            )
-        else:
-            out.append(s)
-    return tuple(out)
-
-
 def drop_size_one_free_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     """Inline every free ``Loop(axis, extent=1)``: replace it with its body
     after substituting ``Var(axis.name) → Literal(0, "int")``. Reduce Loops
     keep their wrappers because dropping them would remove the accumulator."""
-    out: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, Loop):
-            inner = drop_size_one_free_axes(s.body)
-            is_reduce = _immediate_has_accum(inner)
-            if int(s.axis.extent) == 1 and not is_reduce:
-                sub = {s.axis.name: Literal(0, "int")}
-                out.extend(_substitute_vars_in_body(inner, sub))
-            else:
-                out.append(Loop(axis=s.axis, body=inner))
-        else:
-            out.append(s)
-    return tuple(out)
+
+    def fn(s: Stmt) -> Stmt | tuple[Stmt, ...]:
+        if not isinstance(s, Loop):
+            return s
+        inner = map_body(s.body, fn)
+        if int(s.axis.extent) == 1 and not _immediate_has_accum(inner):
+            sub = Sigma({s.axis.name: Literal(0, "int")})
+            return _rewrite_body(inner, _identity_rename, sub)
+        return Loop(axis=s.axis, body=inner)
+
+    return map_body(stmts, fn)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +170,7 @@ def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     dropped and downstream references to ``y`` are rewired to the alias
     root. Semantically a no-op — pure IR hygiene."""
     alias: dict[str, str] = {}
+    identity_sigma = Sigma()
 
     def resolve(name: str) -> str:
         seen: set[str] = set()
@@ -179,35 +179,19 @@ def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
             name = alias[name]
         return name
 
-    def walk(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
-        out: list[Stmt] = []
-        for stmt in body:
-            if isinstance(stmt, Loop):
-                out.append(Loop(axis=stmt.axis, body=walk(stmt.body)))
-            elif _is_copy_assign(stmt):
-                alias[stmt.name] = stmt.args[0]
-            elif isinstance(stmt, Assign):
-                out.append(Assign(name=stmt.name, op=stmt.op, args=tuple(resolve(a) for a in stmt.args)))
-            elif isinstance(stmt, Accum):
-                out.append(Accum(name=stmt.name, value=resolve(stmt.value), op=stmt.op))
-            elif isinstance(stmt, Write):
-                out.append(Write(output=stmt.output, index=stmt.index, value=resolve(stmt.value)))
-            elif isinstance(stmt, Select):
-                out.append(
-                    Select(
-                        name=stmt.name,
-                        branches=tuple(SelectBranch(value=resolve(br.value), select=br.select) for br in stmt.branches),
-                    )
-                )
-            else:
-                out.append(stmt)
-        return tuple(out)
+    def fn(s: Stmt) -> Stmt | None:
+        if isinstance(s, Loop):
+            return Loop(axis=s.axis, body=map_body(s.body, fn))
+        if _is_copy_assign(s):
+            alias[s.name] = s.args[0]  # type: ignore[attr-defined]
+            return None
+        return s.rewrite(resolve, identity_sigma)
 
-    return walk(stmts)
+    return map_body(stmts, fn)
 
 
 # ---------------------------------------------------------------------------
-# Pass 5: unify sibling reduce-loop axis names
+# Pass 4: unify sibling reduce-loop axis names
 # ---------------------------------------------------------------------------
 
 
@@ -288,33 +272,16 @@ def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str)
 def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -> tuple[Stmt, ...]:
     """Substitute ``Var(old_name) → Var(new_name)`` in every Expr field of
     ``body``, and rename any nested Loop whose axis name is ``old_name``."""
-    mapping: dict[str, Expr] = {old_name: Var(new_name)}
-    out: list[Stmt] = []
-    for s in body:
-        if isinstance(s, Loop):
-            inner = _rename_axis_in_body(s.body, old_name, new_name)
-            if s.axis.name == old_name:
-                out.append(Loop(axis=Axis(name=new_name, extent=s.axis.extent), body=inner))
-            else:
-                out.append(Loop(axis=s.axis, body=inner))
-        elif isinstance(s, Load):
-            out.append(Load(name=s.name, source=s.source, index=tuple(substitute(e, mapping) for e in s.index)))
-        elif isinstance(s, Write):
-            out.append(Write(output=s.output, index=tuple(substitute(e, mapping) for e in s.index), value=s.value))
-        elif isinstance(s, Select):
-            out.append(
-                Select(
-                    name=s.name,
-                    branches=tuple(SelectBranch(value=br.value, select=substitute(br.select, mapping)) for br in s.branches),
-                )
-            )
-        else:
-            out.append(s)
-    return tuple(out)
+    sub = Sigma({old_name: Var(new_name)})
+
+    def axis_fn(a: Axis) -> Axis:
+        return Axis(name=new_name, extent=a.extent) if a.name == old_name else a
+
+    return _rewrite_body(body, _identity_rename, sub, axis_fn)
 
 
 # ---------------------------------------------------------------------------
-# Pass 6: canonicalize SSA names to sequential v0, v1, ...
+# Pass 5: canonicalize SSA names to sequential v0, v1, ...
 # ---------------------------------------------------------------------------
 
 
@@ -383,44 +350,13 @@ def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
             if old != new:
                 expr_sub[old] = Var(new)
 
-    def rn(name: str) -> str:
+    sigma = Sigma(expr_sub)
+
+    def rename_ssa(name: str) -> str:
         return ssa_rename.get(name, name)
 
-    def walk(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
-        out: list[Stmt] = []
-        for stmt in body:
-            if isinstance(stmt, Loop):
-                new_axis_name = axis_rename.get(stmt.axis.name, stmt.axis.name)
-                out.append(Loop(axis=Axis(name=new_axis_name, extent=stmt.axis.extent), body=walk(stmt.body)))
-            elif isinstance(stmt, Load):
-                out.append(
-                    Load(
-                        name=rn(stmt.name),
-                        source=stmt.source,
-                        index=tuple(substitute(e, expr_sub) for e in stmt.index),
-                    )
-                )
-            elif isinstance(stmt, Assign):
-                out.append(Assign(name=rn(stmt.name), op=stmt.op, args=tuple(rn(a) for a in stmt.args)))
-            elif isinstance(stmt, Accum):
-                out.append(Accum(name=rn(stmt.name), value=rn(stmt.value), op=stmt.op))
-            elif isinstance(stmt, Write):
-                out.append(
-                    Write(
-                        output=stmt.output,
-                        index=tuple(substitute(e, expr_sub) for e in stmt.index),
-                        value=rn(stmt.value),
-                    )
-                )
-            elif isinstance(stmt, Select):
-                out.append(
-                    Select(
-                        name=rn(stmt.name),
-                        branches=tuple(SelectBranch(value=rn(br.value), select=substitute(br.select, expr_sub)) for br in stmt.branches),
-                    )
-                )
-            else:
-                out.append(stmt)
-        return tuple(out)
+    def axis_fn(a: Axis) -> Axis:
+        new = axis_rename.get(a.name, a.name)
+        return Axis(name=new, extent=a.extent) if new != a.name else a
 
-    return walk(stmts)
+    return _rewrite_body(stmts, rename_ssa, sigma, axis_fn)

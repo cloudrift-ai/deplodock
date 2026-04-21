@@ -34,7 +34,7 @@ from deplodock.compiler.ir.loop.ir import (
     Write,
     flat_body_to_nested,
     flatten_body,
-    iter_loops,
+    map_body,
     pretty_print,
 )
 from deplodock.compiler.ir.loop.plan import KernelPlan, analyze_kernel
@@ -59,7 +59,7 @@ __all__ = [
     "analyze_kernel",
     "flat_body_to_nested",
     "flatten_body",
-    "iter_loops",
+    "map_body",
     "pretty_print",
     "splice_graph",
     "splice_loop_ops",

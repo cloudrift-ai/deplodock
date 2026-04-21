@@ -22,6 +22,7 @@ before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
@@ -90,11 +91,14 @@ class Stmt:
         """SSA names this stmt reads — its 'requirements'."""
         raise NotImplementedError
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
-        """Return a copy with ``new_name`` as the SSA binding, SSA refs
-        remapped via ``resolved``, and ``sigma`` substituted into every
-        ``Expr`` subterm. Only meaningful for SSA-binding stmts (``Load``,
-        ``Assign``, ``Select``); other stmt kinds raise ``NotImplementedError``.
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+        """Return a copy with every SSA name (binding + dep refs) mapped
+        through ``rename_ssa`` and every Expr subterm σ-substituted.
+
+        ``rename_ssa`` is applied uniformly to the stmt's own name (if any)
+        and to each name it reads. Callers typically provide a callable
+        that defaults to identity (``lambda n: mapping.get(n, n)``) so only
+        the names they care about are changed.
         """
         raise NotImplementedError
 
@@ -117,8 +121,8 @@ class Load(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
-        return Load(name=new_name, source=self.source, index=tuple(sigma.apply(e) for e in self.index))
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+        return Load(name=rename_ssa(self.name), source=self.source, index=tuple(sigma.apply(e) for e in self.index))
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +163,8 @@ class Assign(Stmt):
     def deps(self) -> tuple[str, ...]:
         return self.args
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
-        return Assign(name=new_name, op=self.op, args=tuple(resolved[a] for a in self.args))
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+        return Assign(name=rename_ssa(self.name), op=self.op, args=tuple(rename_ssa(a) for a in self.args))
 
 
 @dataclass(frozen=True)
@@ -198,8 +202,8 @@ class Accum(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
-        return Accum(name=new_name, value=resolved[self.value], op=self.op)
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+        return Accum(name=rename_ssa(self.name), value=rename_ssa(self.value), op=self.op)
 
 
 @dataclass(frozen=True)
@@ -219,6 +223,9 @@ class Write(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
+
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+        return Write(output=self.output, index=tuple(sigma.apply(e) for e in self.index), value=rename_ssa(self.value))
 
 
 @dataclass(frozen=True)
@@ -249,10 +256,12 @@ class Select(Stmt):
     def deps(self) -> tuple[str, ...]:
         return tuple(b.value for b in self.branches)
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
         return Select(
-            name=new_name,
-            branches=tuple(SelectBranch(value=resolved[b.value], select=sigma.apply(b.select)) for b in self.branches),
+            name=rename_ssa(self.name),
+            branches=tuple(
+                SelectBranch(value=rename_ssa(b.value), select=sigma.apply(b.select)) for b in self.branches
+            ),
         )
 
 
@@ -435,6 +444,16 @@ class LoopOp(Op):
             writes=tuple(writes),
             live_axes=_compute_live_axes(defs, scopes, reduce_axes),
         )
+
+    def map(self, fn: Callable[[Stmt], Stmt | None]) -> LoopOp:
+        """Transform the body through ``map_body(self.body, fn)`` and wrap
+        the result in a new ``LoopOp`` (which re-runs normalize + validate).
+
+        Convenience for callers that already have a ``LoopOp`` in hand.
+        Most internal passes work on raw ``tuple[Stmt, ...]`` bodies and
+        use ``map_body`` directly.
+        """
+        return LoopOp(body=map_body(self.body, fn))
 
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
@@ -721,20 +740,6 @@ def _validate(loop: LoopOp) -> None:
 # ---------------------------------------------------------------------------
 
 
-def iter_loops(body: tuple[Stmt, ...]) -> list[Loop]:
-    """Return every ``Loop`` in ``body`` in pre-order tree traversal."""
-    out: list[Loop] = []
-
-    def walk(stmts: tuple[Stmt, ...]) -> None:
-        for s in stmts:
-            if isinstance(s, Loop):
-                out.append(s)
-                walk(s.body)
-
-    walk(body)
-    return out
-
-
 def flatten_body(body: tuple[Stmt, ...]) -> list[Stmt]:
     """Extract leaf statements (``Assign`` / ``Accum`` / ``Write`` / ``Select``)
     from ``body``, recursing through ``Loop`` blocks.
@@ -757,6 +762,36 @@ def flatten_body(body: tuple[Stmt, ...]) -> list[Stmt]:
 
     walk(body)
     return out
+
+
+def map_body(
+    body: tuple[Stmt, ...],
+    fn: Callable[[Stmt], Stmt | None | Iterable[Stmt]],
+) -> tuple[Stmt, ...]:
+    """Flat body transformer: apply ``fn`` to each stmt, splice its result
+    into the output. ``fn`` may return:
+
+    - a single ``Stmt`` (kept in place of the input),
+    - ``None`` (drop the input), or
+    - an iterable of ``Stmt`` (inline all of them — useful for 1:N
+      expansions like loop unrolling or size-1 Loop inlining).
+
+    ``fn`` is called on *every* stmt including ``Loop`` wrappers; recursion
+    into a Loop's body is the caller's responsibility (typically by writing
+    a self-recursive ``fn`` that returns ``Loop(axis=..., body=map_body(s.body, fn))``
+    for Loop cases). Lets callers pick their own policy for axis renames,
+    Loop skipping, or selective recursion.
+    """
+    out: list[Stmt] = []
+    for s in body:
+        r = fn(s)
+        if r is None:
+            continue
+        if isinstance(r, Stmt):
+            out.append(r)
+        else:
+            out.extend(r)
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
