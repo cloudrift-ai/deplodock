@@ -62,22 +62,22 @@ def _kernel_nodes(graph: Graph) -> list:
 
 
 def _assign_fns(body) -> list[str]:
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop import iter_body
 
-    return [s.op.fn for s in flatten_body(body) if isinstance(s, Assign)]
+    return [s.op.fn for s in iter_body(body) if isinstance(s, Assign)]
 
 
 def _count_copies(body) -> int:
     """Count identity ``Assign(op=copy)`` statements in a LoopOp body."""
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop import iter_body
 
-    return sum(1 for s in flatten_body(body) if isinstance(s, Assign) and s.op.fn == "copy")
+    return sum(1 for s in iter_body(body) if isinstance(s, Assign) and s.op.fn == "copy")
 
 
 def _has_update(body) -> bool:
-    from deplodock.compiler.ir.loop import flatten_body
+    from deplodock.compiler.ir.loop import iter_body
 
-    return any(isinstance(s, Accum) for s in flatten_body(body))
+    return any(isinstance(s, Accum) for s in iter_body(body))
 
 
 def _local_combine_fns(locals_) -> set[str]:
@@ -129,11 +129,9 @@ def test_pointwise_chain_inputs_are_loads():
 
 
 def test_pointwise_chain_has_write():
-    from deplodock.compiler.ir.loop import flatten_body
-
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
-    assert any(isinstance(s, Write) for s in flatten_body(kernel.op.body))
+    assert any(isinstance(s, Write) for s in kernel.op)
 
 
 def test_pointwise_chain_no_residual_copies():
@@ -176,11 +174,11 @@ def test_rms_norm_like_correctness():
 
 def test_rms_norm_like_ssa_names_are_canonical():
     """After rename pass, every SSA name in the body is v0, v1, v2, ... in order."""
-    from deplodock.compiler.ir.loop import Select, flatten_body
+    from deplodock.compiler.ir.loop import Select
 
     result = _fuse(_make_rms_norm_like())
     kernel = _kernel_nodes(result)[0]
-    ssa_names = [s.name for s in flatten_body(kernel.op.body) if isinstance(s, (Assign, Select))]
+    ssa_names = [s.name for s in kernel.op if isinstance(s, (Assign, Select))]
     assert ssa_names == [f"v{i}" for i in range(len(ssa_names))], f"unexpected SSA names: {ssa_names}"
 
 
@@ -307,8 +305,6 @@ def test_single_elementwise_fuses():
 
 def test_ssa_invariants_hold():
     """LoopOp.__post_init__ validates SSA; this just confirms no crash."""
-    from deplodock.compiler.ir.loop import flatten_body
-
     result = _fuse(_make_softmax())
     for k in _kernel_nodes(result):
         # Re-validate explicitly
@@ -317,7 +313,7 @@ def test_ssa_invariants_hold():
             defined.add(decl.name)
         from deplodock.compiler.ir.loop import Accum, Load
 
-        for s in flatten_body(k.op.body):
+        for s in k.op:
             if isinstance(s, Assign):
                 for arg in s.args:
                     assert arg in defined, f"arg {arg!r} not defined before use in {s.name}"

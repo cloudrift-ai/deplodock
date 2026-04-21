@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.loop.ir import Accum as IrAccum
-from deplodock.compiler.ir.loop.ir import Assign, Load, LoopOp, Select, Stmt, Write
+from deplodock.compiler.ir.loop.ir import Assign, Load, LoopOp, Select, Stmt, Write, iter_body
 from deplodock.compiler.ir.loop.ir import Loop as LoopStmt
 
 # ---------------------------------------------------------------------------
@@ -112,9 +112,7 @@ def analyze_kernel(kernel: LoopOp, out_shape: tuple) -> KernelPlan:
         n_output = _numel(out_shape)
 
     # --- Classify all SSA values as element-space or row-space (tree-wide) ---
-    from deplodock.compiler.ir.loop.ir import flatten_body
-
-    flat_all = tuple(flatten_body(kernel.body))
+    flat_all = tuple(kernel)
     accumulator_names = {decl.name for decl in kernel.accums}
     row_space: set[str] = set(accumulator_names)
     elem_space: set[str] = set()
@@ -146,7 +144,7 @@ def analyze_kernel(kernel: LoopOp, out_shape: tuple) -> KernelPlan:
 
     # --- Pointwise: no reduce Loops; collect leaf Assign/Select/Load as one Inline ---
     if not has_reduce:
-        inline_body = [s for s in flatten_body(inner_body) if isinstance(s, (Assign, Select, Load))]
+        inline_body = [s for s in iter_body(inner_body) if isinstance(s, (Assign, Select, Load))]
         steps: list[Step] = [Inline(body=tuple(inline_body))] if inline_body else []
         return KernelPlan(
             steps=tuple(steps),

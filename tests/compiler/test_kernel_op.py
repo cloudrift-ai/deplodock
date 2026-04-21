@@ -14,7 +14,6 @@ from deplodock.compiler.ir.loop import (
     SelectBranch,
     Write,
     flat_body_to_nested,
-    flatten_body,
 )
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
@@ -206,7 +205,7 @@ def test_kernel_pointwise():
             Write(output=0, index=(Var("a0"),), value="z"),
         ),
     )
-    assert len(flatten_body(k.body)) == 4  # 2 synthesized Loads + Assign + Write
+    assert sum(1 for s in k if not isinstance(s, Loop)) == 4  # 2 synthesized Loads + Assign + Write
 
 
 def test_kernel_reduce():
@@ -236,7 +235,7 @@ def test_kernel_matmul():
         ),
     )
     # 2 synthesized Loads + Assign + Accum + Write — accumulator info is carried on Accum.op now.
-    assert len(flatten_body(k.body)) == 5
+    assert sum(1 for s in k if not isinstance(s, Loop)) == 5
 
 
 def test_kernel_matmul_bias():
@@ -254,7 +253,7 @@ def test_kernel_matmul_bias():
         ),
     )
     # 3 synthesized Loads + Assign + Accum + Assign + Write (no decl stmt — Accum carries op).
-    assert len(flatten_body(k.body)) == 7
+    assert sum(1 for s in k if not isinstance(s, Loop)) == 7
 
 
 def test_kernel_softmax_two_accumulators():
@@ -290,7 +289,7 @@ def test_kernel_unary_chain():
         ),
     )
     # 1 synthesized Load + 2 Assigns + Write.
-    assert len(flatten_body(k.body)) == 4
+    assert sum(1 for s in k if not isinstance(s, Loop)) == 4
 
 
 def test_kernel_scatter_output_via_select():
@@ -312,7 +311,7 @@ def test_kernel_scatter_output_via_select():
             Write(output=0, index=(Var("a0"),), value="v"),
         ),
     )
-    assert any(isinstance(s, Select) for s in flatten_body(k.body))
+    assert any(isinstance(s, Select) for s in k)
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +371,7 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
         ),
     )
     # 1 synthesized Load + 3 Assigns.
-    assert len(flatten_body(k.body)) == 4
+    assert sum(1 for s in k if not isinstance(s, Loop)) == 4
 
 
 def test_update_op_conflict_rejected():

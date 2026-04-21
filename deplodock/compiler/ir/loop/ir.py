@@ -22,7 +22,7 @@ before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
@@ -322,15 +322,9 @@ class LoopOp(Op):
         deduplicated by name, keeping the first occurrence.
         """
         seen: dict[str, Axis] = {}
-
-        def walk(stmts: tuple[Stmt, ...]) -> None:
-            for s in stmts:
-                if isinstance(s, Loop):
-                    if s.axis.name not in seen:
-                        seen[s.axis.name] = s.axis
-                    walk(s.body)
-
-        walk(self.body)
+        for s in self:
+            if isinstance(s, Loop) and s.axis.name not in seen:
+                seen[s.axis.name] = s.axis
         return tuple(seen.values())
 
     @property
@@ -361,17 +355,7 @@ class LoopOp(Op):
         live at the scope they're needed and can share a source with other
         Loads that use different indices.
         """
-        result: list[Load] = []
-
-        def walk(stmts: tuple[Stmt, ...]) -> None:
-            for s in stmts:
-                if isinstance(s, Load):
-                    result.append(s)
-                elif isinstance(s, Loop):
-                    walk(s.body)
-
-        walk(self.body)
-        return tuple(result)
+        return tuple(s for s in self if isinstance(s, Load))
 
     @property
     def num_inputs(self) -> int:
@@ -393,16 +377,9 @@ class LoopOp(Op):
         from op) directly without a separate summary type.
         """
         seen: dict[str, Accum] = {}
-
-        def walk(stmts: tuple[Stmt, ...]) -> None:
-            for s in stmts:
-                if isinstance(s, Accum):
-                    if s.name not in seen:
-                        seen[s.name] = s
-                elif isinstance(s, Loop):
-                    walk(s.body)
-
-        walk(self.body)
+        for s in self:
+            if isinstance(s, Accum) and s.name not in seen:
+                seen[s.name] = s
         return tuple(seen.values())
 
     def analyze(self) -> LoopMeta:
@@ -455,6 +432,12 @@ class LoopOp(Op):
         """
         return LoopOp(body=map_body(self.body, fn))
 
+    def __iter__(self) -> Iterator[Stmt]:
+        """Yield every ``Stmt`` in this op's body in pre-order (same as
+        :func:`iter_body`). Enables ``for s in loop_op: ...`` and
+        comprehensions like ``[s for s in loop_op if isinstance(s, Load)]``."""
+        return iter_body(self.body)
+
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
 
@@ -483,7 +466,7 @@ class LoopOp(Op):
         """
         import numpy as np
 
-        writes = [s for s in flatten_body(self.body) if isinstance(s, Write)]
+        writes = [s for s in self if isinstance(s, Write)]
         if not writes:
             reduce_names = self.reduce_axis_names
             return tuple(a.extent for a in self.axes if a.name not in reduce_names)
@@ -740,28 +723,20 @@ def _validate(loop: LoopOp) -> None:
 # ---------------------------------------------------------------------------
 
 
-def flatten_body(body: tuple[Stmt, ...]) -> list[Stmt]:
-    """Extract leaf statements (``Assign`` / ``Accum`` / ``Write`` / ``Select``)
-    from ``body``, recursing through ``Loop`` blocks.
+def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
+    """Yield every ``Stmt`` in ``body`` in pre-order, recursing through
+    ``Loop`` wrappers. ``Loop`` nodes are yielded themselves *and* then
+    their body is walked — callers that want only leaves can filter with
+    ``isinstance`` or use :func:`flatten_body`.
 
-    Useful for consumers that operate on the flat statement sequence
-    regardless of block structure (numpy whole-tensor interpreter,
-    Accum-boundary segmentation in ``loop.plan.analyze_kernel``). Leaf
-    statements come out in pre-order (parent before children); the Loop
-    wrappers are transparent — their ``axis`` metadata is discarded at
-    this level.
+    The default primitive for collection walks; composes naturally with
+    comprehensions and ``any()`` / ``sum()`` without allocating a new
+    body tuple.
     """
-    out: list[Stmt] = []
-
-    def walk(stmts: tuple[Stmt, ...]) -> None:
-        for s in stmts:
-            if isinstance(s, Loop):
-                walk(s.body)
-            else:
-                out.append(s)
-
-    walk(body)
-    return out
+    for s in body:
+        yield s
+        if isinstance(s, Loop):
+            yield from iter_body(s.body)
 
 
 def map_body(
