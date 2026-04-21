@@ -64,21 +64,13 @@ class _NotSupported(Exception):
 
 @dataclass
 class _AccumRef:
-    """A producer accumulator referenced by a consumer splice site.
-
-    Bundles everything needed to later materialize the reduce Loop: the
-    producer Accum's identity, its enclosing chain (reduce axis is the
-    last element), the SSA name of the folded value, the fold op, and the
-    σ active at the reference site. ``required_c_axes`` is the consumer
-    scope that must be in scope when we finally emit the Loop."""
+    """An unresolved producer-Accum reference: the ``name`` identifies which
+    Accum, ``sigma`` is the σ active at the reference site (used at
+    materialization to rebuild the same ``required_c_axes`` → same bound
+    name via ``ctx.name_for_accum``)."""
 
     name: str
-    enclosing: tuple[Axis, ...]
-    value: str
-    op: ElementwiseOp
     sigma: dict[str, Expr]
-    bound_name: str
-    required_c_axes: tuple[str, ...]
 
 
 @dataclass
@@ -256,20 +248,6 @@ def _walk(
 # ---------------------------------------------------------------------------
 
 
-class _Bubble(Exception):
-    """Early exit from ``_emit``'s walk: target accum bubbles to outer scope."""
-
-    def __init__(self, ref: _AccumRef) -> None:
-        self.ref = ref
-
-
-class _Skip(Exception):
-    """Early exit from ``_emit``'s walk: target accum was already materialized."""
-
-    def __init__(self, bound: str) -> None:
-        self.bound = bound
-
-
 def _emit(
     target: str,
     ctx: _Ctx,
@@ -301,72 +279,63 @@ def _emit(
     refs: list[_AccumRef] = []
     ssa_rename: dict[str, str] = {}
     needed: set[str] = {target}
-    collected: list[tuple[Stmt, str]] = []  # (original_stmt, fresh_name), reverse order
+    collected: list[tuple[Stmt, str, dict[str, Expr]]] = []  # (stmt, fresh_name, σ-at-collection)
     outer_scope = scope
-    eff_sigma: dict[str, Expr] = dict(sigma)
-    eff_scope = scope
-    wrapper: tuple[Axis, str, ElementwiseOp, str] | None = None  # (fresh_axis, bound, op, value)
+    wrapper: Axis | None = None  # reduce axis for the target accum's Loop, if any
 
-    def visit(stmts: tuple[Stmt, ...], producer_scope=_Scope()) -> None:
-        nonlocal eff_scope, wrapper
+    def visit(stmts: tuple[Stmt, ...], producer_scope: _Scope, eff_sigma: dict[str, Expr], eff_scope: _Scope) -> None:
+        nonlocal wrapper
         for s in reversed(stmts):
             if isinstance(s, Loop):
-                visit(s.body, producer_scope.nest(s.axis))
+                inner_sigma, inner_scope = eff_sigma, eff_scope
+                target_def = next((x for x in s.body if isinstance(x, Accum) and x.name == target), None)
+                if target_def is not None:
+                    # Loop directly wraps the target Accum — partition/bubble here,
+                    # then extend σ/scope with a fresh reduce axis for the descent.
+                    enclosing = producer_scope.enclosing + (s.axis,)
+                    required = _Scope(enclosing=enclosing[:-1]).remap(eff_sigma).names
+                    bound = ctx.name_for_accum(target, required)
+                    names = eff_scope.names
+                    if not set(required).issubset(set(names)):
+                        raise _NotSupported
+                    if set(required).issubset(set(names[:-1]) if names else set()):
+                        # Can't materialize here — register the target as an unresolved
+                        # ref for an outer _emit call to retry, and skip the descent.
+                        refs.append(_AccumRef(name=target, sigma=dict(eff_sigma)))
+                        ssa_rename[target] = bound
+                        continue
+                    fresh = Axis(name=ctx.fresh(s.axis.name), extent=s.axis.extent)
+                    wrapper = fresh
+                    ssa_rename[target] = bound  # pre-register so the Accum visit picks up this name
+                    inner_sigma = {**eff_sigma, s.axis.name: Var(fresh.name)}
+                    inner_scope = eff_scope.nest(fresh)
+                visit(s.body, producer_scope.nest(s.axis), inner_sigma, inner_scope)
                 continue
             if not isinstance(s, (Load, Assign, Select, Accum)):
                 continue
             if s.name not in needed:
                 continue
             needed.discard(s.name)
-            if isinstance(s, Accum):
-                if s.name == target:
-                    enclosing = producer_scope.enclosing
-                    if not enclosing:
-                        raise _NotSupported
-                    required = _Scope(enclosing=enclosing[:-1]).remap(eff_sigma).names
-                    bound = ctx.name_for_accum(s.name, required)
-                    names = eff_scope.names
-                    if not set(required).issubset(set(names)):
-                        raise _NotSupported
-                    if set(required).issubset(set(names[:-1]) if names else set()):
-                        raise _Bubble(_AccumRef(s.name, enclosing, s.value, s.op, dict(eff_sigma), bound, required))
-                    key = (s.name, required)
-                    if key in ctx.materialized:
-                        raise _Skip(bound)
-                    ctx.materialized.add(key)
-                    fresh = Axis(name=ctx.fresh(enclosing[-1].name), extent=enclosing[-1].extent)
-                    eff_sigma[enclosing[-1].name] = Var(fresh.name)
-                    eff_scope = eff_scope.nest(fresh)
-                    ssa_rename[s.name] = bound
-                    wrapper = (fresh, bound, s.op, s.value)
-                    needed.add(s.value)
-                else:
-                    ssa_rename[s.name] = _register_accum_ref(s, producer_scope.enclosing, eff_sigma, ctx, refs)
+            if isinstance(s, Accum) and s.name != target:
+                ssa_rename[s.name] = _register_accum_ref(s, producer_scope.enclosing, eff_sigma, ctx, refs)
                 continue
             if producer_scope.remap(eff_sigma) != eff_scope:
                 raise _NotSupported
-            new_name = ctx.fresh(s.name)
+            new_name = ssa_rename[s.name] if s.name in ssa_rename else ctx.fresh(s.name)
             ssa_rename[s.name] = new_name
-            collected.append((s, new_name))
+            collected.append((s, new_name, eff_sigma))
             needed.update(s.deps())
 
-    try:
-        visit(ctx.producer.body)
-    except _Bubble as b:
-        return [], [b.ref], b.ref.bound_name
-    except _Skip as sk:
-        return [], [], sk.bound
+    visit(ctx.producer.body, _Scope(), sigma, scope)
 
     emitted: list[Stmt] = []
-    for s, new_name in reversed(collected):
+    for s, new_name, stmt_sigma in reversed(collected):
         resolved = {d: ssa_rename.get(d, d) for d in s.deps()}
-        emitted.append(s.rewrite(new_name, resolved, eff_sigma))
+        emitted.append(s.rewrite(new_name, resolved, stmt_sigma))
 
     if wrapper is None:
         return emitted, refs, ssa_rename.get(target, target)
 
-    reduce_fresh, bound, op, value = wrapper
-    value_fresh = ssa_rename.get(value, value)
     out: list[Stmt] = []
     bubble: list[_AccumRef] = []
     for sub in refs:
@@ -375,9 +344,8 @@ def _emit(
         bubble.extend(sub_bubble)
     if bubble:
         raise _NotSupported
-    emitted.append(Accum(name=bound, value=value_fresh, op=op))
-    out.append(Loop(axis=reduce_fresh, body=tuple(emitted)))
-    return out, [], bound
+    out.append(Loop(axis=wrapper, body=tuple(emitted)))
+    return out, [], ssa_rename[target]
 
 
 def _register_accum_ref(
@@ -388,22 +356,20 @@ def _register_accum_ref(
     refs: list[_AccumRef],
 ) -> str:
     """Record an ``_AccumRef`` for later reduce-Loop materialization;
-    return the canonical consumer-side binding name."""
+    return the canonical consumer-side binding name.
+
+    Ctx-level dedupe: a second registration of the same
+    ``(name, required_c_axes)`` reuses the existing binding and does not
+    add another ref — the first ref's materialization covers both sites."""
     if not enclosing:
         raise _NotSupported
     required_c_axes = _Scope(enclosing=enclosing[:-1]).remap(sigma).names
     bound = ctx.name_for_accum(defn.name, required_c_axes)
-    refs.append(
-        _AccumRef(
-            name=defn.name,
-            enclosing=enclosing,
-            value=defn.value,
-            op=defn.op,
-            sigma=dict(sigma),
-            bound_name=bound,
-            required_c_axes=required_c_axes,
-        )
-    )
+    key = (defn.name, required_c_axes)
+    if key in ctx.materialized:
+        return bound
+    ctx.materialized.add(key)
+    refs.append(_AccumRef(name=defn.name, sigma=dict(sigma)))
     return bound
 
 
