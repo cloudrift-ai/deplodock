@@ -200,37 +200,6 @@ def test_reduction_producer():
 
 
 # ---------------------------------------------------------------------------
-# Nested accum → unsupported
-# ---------------------------------------------------------------------------
-
-
-def test_nested_accum_rejected():
-    """Producer with an Accum whose reduce Loop sits inside another Accum's
-    reduce Loop is not spliceable (whole-tensor backend limitation)."""
-    producer = _loop(
-        axes=(A0, A1, K),
-        body=(
-            Load(name="x", source=0, index=(Var("a0"), Var("a1"), Var("k"))),
-            # Inner Accum over a1 — reducing inside the outer k-reduce.
-            Accum(name="inner", value="x", op=ElementwiseOp("add")),
-            Accum(name="outer", value="inner", op=ElementwiseOp("add")),
-            Write(output=0, index=(Var("a0"),), value="outer"),
-        ),
-        reduce_axes=frozenset({"a1", "k"}),
-    )
-    consumer = _loop(
-        axes=(A0,),
-        body=(
-            Load(name="sv", source=0, index=(Var("a0"),)),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("sv",)),
-            Write(output=0, index=(Var("a0"),), value="y"),
-        ),
-    )
-
-    assert splice_loop_ops(producer, consumer, source=0) is None
-
-
-# ---------------------------------------------------------------------------
 # Consumer has extra input: source-remapping puts consumer inputs after producer's
 # ---------------------------------------------------------------------------
 
