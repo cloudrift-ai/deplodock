@@ -1,0 +1,297 @@
+"""Standalone tests for ``splice_loop_ops``.
+
+Each test builds producer/consumer ``LoopOp``s by hand and splices them
+directly, asserting on the merged body structure. This skips the usual
+frontend → tensor-IR → loop-IR pipeline so failures point at the splicer
+itself rather than some upstream lowering quirk.
+"""
+
+from __future__ import annotations
+
+from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.loop import (
+    Accum,
+    Assign,
+    Axis,
+    Load,
+    LoopOp,
+    Write,
+    flat_body_to_nested,
+    flatten_body,
+    splice_loop_ops,
+)
+from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _loop(axes: tuple[Axis, ...], body: tuple, reduce_axes: frozenset[str] = frozenset()) -> LoopOp:
+    return LoopOp(body=flat_body_to_nested(axes, body, reduce_axes))
+
+
+def _ops_by_name(op: LoopOp) -> dict[str, object]:
+    """Flatten body, index Assigns/Loads/Accums by their SSA name."""
+    out: dict[str, object] = {}
+    for s in flatten_body(op.body):
+        name = getattr(s, "name", None)
+        if name is not None:
+            out[name] = s
+    return out
+
+
+def _count_kind(op: LoopOp, cls: type) -> int:
+    return sum(1 for s in flatten_body(op.body) if isinstance(s, cls))
+
+
+def _elementwise_fns(op: LoopOp) -> list[str]:
+    return [s.op.fn for s in flatten_body(op.body) if isinstance(s, Assign)]
+
+
+# ---------------------------------------------------------------------------
+# Fixtures — shared axes
+# ---------------------------------------------------------------------------
+
+
+A0 = Axis("a0", 4)
+A1 = Axis("a1", 8)
+K = Axis("k", 16)
+
+
+# ---------------------------------------------------------------------------
+# Basic pipeline: pointwise producer → pointwise consumer
+# ---------------------------------------------------------------------------
+
+
+def test_pointwise_chain():
+    """producer: y = exp(x)  ;  consumer: z = add(y, y)."""
+    producer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"),)),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+    consumer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="yv", source=0, index=(Var("a0"),)),
+            Assign(name="z", op=ElementwiseOp("add"), args=("yv", "yv")),
+            Write(output=0, index=(Var("a0"),), value="z"),
+        ),
+    )
+
+    merged = splice_loop_ops(producer, consumer, source=0)
+    assert merged is not None
+    fns = _elementwise_fns(merged)
+    # exp from producer + copy alias for the Load + add from consumer.
+    assert "exp" in fns
+    assert "add" in fns
+    # Producer's Load (consumer had no other inputs) survives as source 0.
+    loads = [s for s in flatten_body(merged.body) if isinstance(s, Load)]
+    assert len(loads) == 1
+    assert loads[0].source == 0
+    # Single Write, referencing the final add.
+    writes = [s for s in flatten_body(merged.body) if isinstance(s, Write)]
+    assert len(writes) == 1
+
+
+# ---------------------------------------------------------------------------
+# Shared intermediate: consumer uses producer output twice at same index → one emission
+# ---------------------------------------------------------------------------
+
+
+def test_shared_intermediate_deduped():
+    """Two consumer refs to the same producer value under identity σ share one binding."""
+    producer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"),)),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+    # Consumer loads producer twice at the same index — both solve σ = {a0: a0}.
+    consumer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="ya", source=0, index=(Var("a0"),)),
+            Load(name="yb", source=0, index=(Var("a0"),)),
+            Assign(name="z", op=ElementwiseOp("add"), args=("ya", "yb")),
+            Write(output=0, index=(Var("a0"),), value="z"),
+        ),
+    )
+
+    merged = splice_loop_ops(producer, consumer, source=0)
+    assert merged is not None
+    # Only one exp in the merged body (producer chain materializes once).
+    assert _elementwise_fns(merged).count("exp") == 1
+
+
+# ---------------------------------------------------------------------------
+# Different σs: two consumer loads at different indices → two emissions
+# ---------------------------------------------------------------------------
+
+
+def test_different_indices_emit_twice():
+    """Consumer loads a 2D producer with two different index permutations —
+    the two σs are distinct, so the producer's chain materializes twice."""
+    # Producer axes (a0, a1); writes y[a0, a1] = exp(x[a0, a1]).
+    A1_same = Axis("a1", 4)  # square so the transposed load is well-typed.
+    A0_same = Axis("a0", 4)
+    producer = _loop(
+        axes=(A0_same, A1_same),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"), Var("a1"))),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+            Write(output=0, index=(Var("a0"), Var("a1")), value="y"),
+        ),
+    )
+    # Consumer reads the producer at (a0, a1) and (a1, a0) — transposed.
+    consumer = _loop(
+        axes=(A0_same, A1_same),
+        body=(
+            Load(name="ya", source=0, index=(Var("a0"), Var("a1"))),
+            Load(name="yb", source=0, index=(Var("a1"), Var("a0"))),
+            Assign(name="z", op=ElementwiseOp("add"), args=("ya", "yb")),
+            Write(output=0, index=(Var("a0"), Var("a1")), value="z"),
+        ),
+    )
+
+    merged = splice_loop_ops(producer, consumer, source=0)
+    assert merged is not None
+    # Two distinct σs ({a0:a0,a1:a1}, {a0:a1,a1:a0}) → exp materializes twice.
+    assert _elementwise_fns(merged).count("exp") == 2
+
+
+# ---------------------------------------------------------------------------
+# Reduction producer: sum over k, consumer is pointwise on the result
+# ---------------------------------------------------------------------------
+
+
+def test_reduction_producer():
+    """Producer: s = sum_k x[a0,k]. Consumer: y = exp(s[a0])."""
+    producer = _loop(
+        axes=(A0, K),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"), Var("k"))),
+            Accum(name="s", value="x", op=ElementwiseOp("add")),
+            Write(output=0, index=(Var("a0"),), value="s"),
+        ),
+        reduce_axes=frozenset({"k"}),
+    )
+    consumer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="sv", source=0, index=(Var("a0"),)),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("sv",)),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+
+    merged = splice_loop_ops(producer, consumer, source=0)
+    assert merged is not None
+    # The Accum survives in the merged body.
+    assert _count_kind(merged, Accum) == 1
+    # Elementwise chain includes the producer-load copy + the consumer's exp.
+    assert "exp" in _elementwise_fns(merged)
+
+
+# ---------------------------------------------------------------------------
+# Nested accum → unsupported
+# ---------------------------------------------------------------------------
+
+
+def test_nested_accum_rejected():
+    """Producer with an Accum whose reduce Loop sits inside another Accum's
+    reduce Loop is not spliceable (whole-tensor backend limitation)."""
+    producer = _loop(
+        axes=(A0, A1, K),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"), Var("a1"), Var("k"))),
+            # Inner Accum over a1 — reducing inside the outer k-reduce.
+            Accum(name="inner", value="x", op=ElementwiseOp("add")),
+            Accum(name="outer", value="inner", op=ElementwiseOp("add")),
+            Write(output=0, index=(Var("a0"),), value="outer"),
+        ),
+        reduce_axes=frozenset({"a1", "k"}),
+    )
+    consumer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="sv", source=0, index=(Var("a0"),)),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("sv",)),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+
+    assert splice_loop_ops(producer, consumer, source=0) is None
+
+
+# ---------------------------------------------------------------------------
+# Consumer has extra input: source-remapping puts consumer inputs after producer's
+# ---------------------------------------------------------------------------
+
+
+def test_consumer_extra_input_source_remap():
+    """Consumer has producer at source 0 and an unrelated buffer at source 1;
+    after splice, that unrelated buffer should load from merged source 1
+    (producer's input is at 0)."""
+    producer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"),)),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+    consumer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="yv", source=0, index=(Var("a0"),)),  # from producer
+            Load(name="b", source=1, index=(Var("a0"),)),  # unrelated
+            Assign(name="z", op=ElementwiseOp("add"), args=("yv", "b")),
+            Write(output=0, index=(Var("a0"),), value="z"),
+        ),
+    )
+
+    merged = splice_loop_ops(producer, consumer, source=0)
+    assert merged is not None
+    loads = {s.name: s for s in flatten_body(merged.body) if isinstance(s, Load)}
+    # Producer's Load survives at source 0; consumer's unrelated Load shifts to 1.
+    assert any(ld.source == 0 for ld in loads.values())
+    assert any(ld.source == 1 for ld in loads.values())
+    assert merged.num_inputs == 2
+
+
+# ---------------------------------------------------------------------------
+# Literal in producer write index: no σ-binding needed, still splices
+# ---------------------------------------------------------------------------
+
+
+def test_literal_producer_write_index():
+    """Producer writes at (a0, 0); consumer reads at (a0, 0). The Literal dim
+    contributes no σ binding and shouldn't block splicing."""
+    producer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"),)),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+            Write(output=0, index=(Var("a0"), Literal(0)), value="y"),
+        ),
+    )
+    consumer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="yv", source=0, index=(Var("a0"), Literal(0))),
+            Assign(name="z", op=ElementwiseOp("neg"), args=("yv",)),
+            Write(output=0, index=(Var("a0"),), value="z"),
+        ),
+    )
+
+    merged = splice_loop_ops(producer, consumer, source=0)
+    assert merged is not None
+    assert "exp" in _elementwise_fns(merged)
+    assert "neg" in _elementwise_fns(merged)
