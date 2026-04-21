@@ -109,12 +109,10 @@ def execute_loop_op(
     # at the outer. Collapsing both simultaneously would fold dimensions
     # that were meant to vary.
     axis_position = {a.name: i for i, a in enumerate(loop.axes)}
-    accum_axis_position: dict[str, int] = {}
     meta = loop.analyze()
-    for decl in loop.accums:
-        enc = meta.scopes[decl.name].enclosing
-        if enc:
-            accum_axis_position[decl.name] = axis_position[enc[-1].name]
+    accum_axis_position: dict[str, int] = {
+        name: axis_position[axis.name] for name, axis in meta.reduce_axes.items()
+    }
     values: dict[str, np.ndarray] = {}
     # Accums are body-form reduce accumulator declarations. Each one
     # binds an SSA name that subsequent Updates fold values into.

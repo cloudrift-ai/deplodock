@@ -138,16 +138,10 @@ class _Splicer(LoopBuilder):
         time the key is seen.
         """
         meta = self.loops[origin]
-        def_stmt = meta.defs.get(name)
-        if def_stmt is None:
+        if name not in meta.defs:
             raise _NotSupported
 
-        full_enc = meta.scopes[name]
-        # Accums bind *before* the reduce axis — drop the tail for scope
-        # derivation. The reduce axis gets freshened inside ``_resolve_accum``.
-        bind_enclosing = full_enc.enclosing[:-1] if isinstance(def_stmt, Accum) else full_enc.enclosing
-        required_axes = tuple(_remap_axis_name(a, sigma) for a in bind_enclosing)
-
+        required_axes = tuple(_remap_axis_name(a, sigma) for a in meta.scopes[name].enclosing)
         emit_scope = _scope_for_axes(ref_scope, required_axes)
 
         # σ restricted to axes transitively used in Expr subtrees reachable
@@ -219,8 +213,7 @@ class _Splicer(LoopBuilder):
         """Emit ``Loop(fresh_reduce_axis, [Accum(bound, value_bound, op)])`` at
         ``d.demand_scope``. The Accum's value is queued under σ extended with
         the fresh reduce-axis binding."""
-        full_enc = self.loops[d.origin].scopes[stmt.name]
-        orig_axis = full_enc.enclosing[-1]
+        orig_axis = self.loops[d.origin].reduce_axes[stmt.name]
         fresh_name = self.fresh(orig_axis.name)
         reduce_axis = Axis(name=fresh_name, extent=orig_axis.extent)
         inner_sigma = d.sigma.extend(orig_axis.name, Var(fresh_name))
