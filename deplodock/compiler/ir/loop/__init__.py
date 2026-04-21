@@ -38,7 +38,7 @@ from deplodock.compiler.ir.loop.ir import (
     pretty_print,
 )
 from deplodock.compiler.ir.loop.plan import KernelPlan, analyze_kernel
-from deplodock.compiler.ir.loop.splicer import splice_loop_ops
+from deplodock.compiler.ir.loop.splicer import splice_loop_chain, splice_loop_ops
 
 __all__ = [
     "ACCUM_IDENTITY",
@@ -61,5 +61,6 @@ __all__ = [
     "flatten_body",
     "iter_loops",
     "pretty_print",
+    "splice_loop_chain",
     "splice_loop_ops",
 ]

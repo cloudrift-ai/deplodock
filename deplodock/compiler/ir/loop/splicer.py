@@ -38,6 +38,7 @@ from deplodock.compiler.ir.loop.ir import (
     Axis,
     Load,
     Loop,
+    LoopMeta,
     LoopOp,
     Scope,
     Select,
@@ -68,7 +69,7 @@ class _Demand:
     """
 
     name: str
-    origin: str  # "producer" | "consumer"
+    origin: str  # tag identifying which loop this def came from
     sigma: Sigma
     demand_scope: Scope
     bound_as: str
@@ -79,13 +80,60 @@ class _Demand:
 # ---------------------------------------------------------------------------
 
 
-def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: int) -> LoopOp | None:
-    """Splice ``producer``'s expression into every consumer ``Load`` that
-    targets ``source``. Returns ``None`` when the pattern isn't supported."""
+def splice_loop_chain(
+    loops: dict[str, LoopOp],
+    splice_edges: dict[tuple[str, int], str],
+    input_remap: dict[tuple[str, int], int],
+    root: str,
+) -> LoopOp | None:
+    """Splice a graph of LoopOps into one merged kernel.
+
+    ``loops`` maps an opaque tag to each participating ``LoopOp``.
+    ``splice_edges`` identifies which Loads are inlined from another
+    registered loop: key ``(origin_tag, source_idx)`` → value ``target_tag``,
+    meaning "the origin loop's Load at source_idx reads target_tag's
+    output and should be inlined."
+    ``input_remap`` assigns every non-splice Load's ``(origin_tag,
+    source_idx)`` to a slot in the merged kernel's external input list.
+    ``root`` names the tag whose ``Write``s seed the traversal — typically
+    the chain's final consumer.
+
+    Returns ``None`` if any splice edge hits an unsupported pattern
+    (non-Var/Literal writer index, arithmetic σ targets, etc.)."""
     try:
-        return _Splicer(producer, consumer, source).run()
+        return _Splicer(
+            loops={tag: op.analyze() for tag, op in loops.items()},
+            splice_edges=splice_edges,
+            input_remap=input_remap,
+            root=root,
+        ).run()
     except (_NotSupported, ValueError):
         return None
+
+
+def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: int) -> LoopOp | None:
+    """Pairwise splicer: inline ``producer`` into every ``consumer`` Load
+    that targets ``source``. Returns ``None`` when the pattern isn't
+    supported.
+
+    Thin wrapper over ``splice_loop_chain``: producer inputs occupy slots
+    ``[0, n_prod)`` in the merged kernel; the consumer's surviving inputs
+    follow in declaration order, skipping the spliced slot.
+    """
+    n_prod = producer.num_inputs
+    input_remap: dict[tuple[str, int], int] = {("producer", i): i for i in range(n_prod)}
+    next_slot = n_prod
+    for i in range(consumer.num_inputs):
+        if i == source:
+            continue
+        input_remap[("consumer", i)] = next_slot
+        next_slot += 1
+    return splice_loop_chain(
+        loops={"producer": producer, "consumer": consumer},
+        splice_edges={("consumer", source): "producer"},
+        input_remap=input_remap,
+        root="consumer",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,22 +142,38 @@ def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: int) -> LoopOp |
 
 
 class _Splicer(LoopBuilder):
-    """One-shot splicer for a producer/consumer pair.
+    """Multi-loop splicer driven by an explicit splice-edge graph.
+
+    Each registered loop has a tag (opaque string). ``splice_edges``
+    identifies which Loads are inlined from another registered loop;
+    all other Loads are re-indexed into the merged kernel's external
+    input list via ``input_remap``. ``root`` names the tag whose Writes
+    seed the traversal — typically the chain's final consumer.
 
     Inherits body building (``insert`` / ``fresh`` / ``finish``) from
-    ``LoopBuilder``; adds per-splice analysis (``loops``, ``source``), the
-    worklist of pending demands, and the dedup table that keeps the
-    merged body minimal.
-
-    Worklist dep-resolution is reverse-topological — producers demanded
-    after consumers — so the builder's prepend-at-leaf behavior yields
-    defined-before-use ordering naturally.
+    ``LoopBuilder``; adds the worklist of pending demands and the dedup
+    table that keeps the merged body minimal. Worklist dep-resolution
+    is reverse-topological — producers demanded after consumers — so
+    the builder's prepend-at-leaf behavior yields defined-before-use
+    ordering naturally.
     """
 
-    def __init__(self, producer: LoopOp, consumer: LoopOp, source: int) -> None:
-        super().__init__(used_names=_collect_names(producer) | _collect_names(consumer))
-        self.source = source
-        self.loops = {"producer": producer.analyze(), "consumer": consumer.analyze()}
+    def __init__(
+        self,
+        *,
+        loops: dict[str, LoopMeta],
+        splice_edges: dict[tuple[str, int], str],
+        input_remap: dict[tuple[str, int], int],
+        root: str,
+    ) -> None:
+        used: set[str] = set()
+        for meta in loops.values():
+            used |= _collect_names(meta.op)
+        super().__init__(used_names=used)
+        self.loops = loops
+        self.splice_edges = splice_edges
+        self.input_remap = input_remap
+        self.root = root
         self._pending: deque[_Demand] = deque()
         # Dedup: a stmt is uniquely identified by its (origin, name), the
         # emit scope it lands at in the merged body, and the σ restricted
@@ -123,11 +187,11 @@ class _Splicer(LoopBuilder):
             self._resolve(self._pending.popleft())
         return LoopOp(body=self.finish())
 
-    # -- Seed: every consumer Write, with its value queued ------------------
+    # -- Seed: every root Write, with its value queued ----------------------
 
     def _seed(self) -> None:
-        for w, scope in self.loops["consumer"].writes:
-            v_bound = self._ensure_dep(w.value, "consumer", Sigma(), scope)
+        for w, scope in self.loops[self.root].writes:
+            v_bound = self._ensure_dep(w.value, self.root, Sigma(), scope)
             self.insert(Write(output=w.output, index=w.index, value=v_bound), scope)
 
     # -- Dep binding: look up or queue --------------------------------------
@@ -164,10 +228,11 @@ class _Splicer(LoopBuilder):
         stmt = self.loops[d.origin].defs[d.name]
 
         if isinstance(stmt, Load):
-            if d.origin == "consumer" and stmt.source == self.source:
-                self._resolve_producer_load(stmt, d)
+            target_tag = self.splice_edges.get((d.origin, stmt.source))
+            if target_tag is not None:
+                self._resolve_splice_load(stmt, d, target_tag)
             else:
-                self._resolve_plain_load(stmt, d)
+                self._resolve_external_load(stmt, d)
         elif isinstance(stmt, Accum):
             self._resolve_accum(stmt, d)
         elif isinstance(stmt, (Assign, Select)):
@@ -181,32 +246,27 @@ class _Splicer(LoopBuilder):
         resolved = {arg: self._ensure_dep(arg, d.origin, d.sigma, d.demand_scope) for arg in stmt.deps()}
         self.insert(stmt.rewrite(d.bound_as, resolved, d.sigma), d.demand_scope)
 
-    def _resolve_plain_load(self, stmt: Load, d: _Demand) -> None:
-        """A Load that doesn't target the producer — remap source, σ-sub index.
-        Producer inputs occupy [0, n_prod) in the merged kernel; consumer's
-        surviving inputs shift to [n_prod, ...), skipping the spliced slot."""
-        if d.origin == "consumer":
-            n_prod = self.loops["producer"].op.num_inputs
-            s = stmt.source
-            new_src = n_prod + (s if s < self.source else s - 1)
-        else:
-            new_src = stmt.source
+    def _resolve_external_load(self, stmt: Load, d: _Demand) -> None:
+        """A Load that isn't a splice edge — remap source via ``input_remap``,
+        σ-sub the index, emit as-is."""
+        new_src = self.input_remap[(d.origin, stmt.source)]
         new_index = tuple(d.sigma.apply(e) for e in stmt.index)
         self.insert(Load(name=d.bound_as, source=new_src, index=new_index), d.demand_scope)
 
-    def _resolve_producer_load(self, stmt: Load, d: _Demand) -> None:
-        """A consumer Load that targets the producer — emit a copy alias and
-        queue the producer's ``Write.value`` under the solved σ. The producer's
-        expression chain reconstructs piecemeal in subsequent iterations."""
-        producer = self.loops["producer"]
-        prod_write = next((w for w, _ in producer.writes if w.output == 0), None)
-        if prod_write is None:
+    def _resolve_splice_load(self, stmt: Load, d: _Demand, target_tag: str) -> None:
+        """A Load that's a splice edge to another registered loop — emit a
+        copy alias and queue the target loop's ``Write.value`` under the
+        solved σ. The target's expression chain reconstructs piecemeal over
+        subsequent iterations."""
+        target = self.loops[target_tag]
+        target_write = next((w for w, _ in target.writes if w.output == 0), None)
+        if target_write is None:
             raise _NotSupported
         effective_index = tuple(d.sigma.apply(e) for e in stmt.index)
-        sigma = _solve_sigma(prod_write.index, effective_index, {a.name for a in producer.op.axes})
+        sigma = _solve_sigma(target_write.index, effective_index, {a.name for a in target.op.axes})
         if sigma is None:
             raise _NotSupported
-        v_bound = self._ensure_dep(prod_write.value, "producer", sigma, d.demand_scope)
+        v_bound = self._ensure_dep(target_write.value, target_tag, sigma, d.demand_scope)
         self.insert(Assign(name=d.bound_as, op=ElementwiseOp("copy"), args=(v_bound,)), d.demand_scope)
 
     def _resolve_accum(self, stmt: Accum, d: _Demand) -> None:
