@@ -189,7 +189,7 @@ def _fold_to_accumulator(src: np.ndarray, acc: Accum, reduce_axis_positions: tup
     if not reduce_axis_positions:
         return np.asarray(src, dtype=np.float32)
     axes = tuple(reduce_axis_positions)
-    fn = acc.combine.fn
+    fn = acc.op.fn
     if fn == "add":
         return np.sum(src, axis=axes, keepdims=True).astype(np.float32)
     if fn == "max":

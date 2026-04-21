@@ -170,7 +170,7 @@ def test_update_synthesizes_accum_decl():
     )
     # rename_ssa_sequential canonicalizes Accum names to acc0, acc1, ...
     assert len(k.accums) == 1 and k.accums[0].name == "acc0"
-    assert k.accums[0].combine.fn == "add"
+    assert k.accums[0].op.fn == "add"
     assert isinstance(k.accums[0].init, Literal) and k.accums[0].init.value == 0.0
 
 
@@ -220,7 +220,7 @@ def test_kernel_reduce():
             Write(output=0, index=(Var("a0"),), value="s"),
         ),
     )
-    assert any(isinstance(lb.combine, ElementwiseOp) for lb in k.accums)
+    assert any(isinstance(lb.op, ElementwiseOp) for lb in k.accums)
 
 
 def test_kernel_matmul():

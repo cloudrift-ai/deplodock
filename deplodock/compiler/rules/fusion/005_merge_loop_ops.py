@@ -52,13 +52,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
         consumer_op, consumer_inputs = _dedupe_consumer_inputs(consumer_op, consumer_inputs, consumer_sources)
     target_source = consumer_inputs.index(producer_id)
 
-    merged = splice_loop_ops(
-        producer_node.op,
-        consumer_op,
-        target_source,
-        producer_inputs=list(producer_node.inputs),
-        consumer_inputs=consumer_inputs,
-    )
+    merged = splice_loop_ops(producer_node.op, consumer_op, target_source)
     if merged is None:
         return None
 
