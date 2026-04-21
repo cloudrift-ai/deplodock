@@ -138,6 +138,51 @@ def splice_loops(
         return None
 
 
+def splice_graph(graph) -> tuple[LoopOp, list[str]] | None:
+    """Splice a subgraph of ``LoopOp`` nodes into one merged kernel.
+
+    Each ``LoopOp`` node in ``graph`` becomes a registered loop tagged
+    by its node id. Within each LoopOp node, a Load whose source points
+    at another ``LoopOp`` node becomes a splice edge; a Load whose
+    source points at a non-``LoopOp`` node (e.g. ``InputOp``) becomes
+    an external read, assigned a slot in first-seen order.
+
+    Returns ``(merged_op, external_node_ids)`` where ``external_node_ids``
+    is the list of non-``LoopOp`` input node ids in merged-slot order.
+    Returns ``None`` if the graph has zero / multiple outputs, the sink
+    is not a ``LoopOp``, or any splice edge hits an unsupported pattern.
+    """
+    if len(graph.outputs) != 1:
+        return None
+    root = graph.outputs[0]
+    root_node = graph.nodes.get(root)
+    if root_node is None or not isinstance(root_node.op, LoopOp):
+        return None
+
+    loop_ids = {nid for nid, n in graph.nodes.items() if isinstance(n.op, LoopOp)}
+    loops: dict[str, LoopOp] = {nid: graph.nodes[nid].op for nid in loop_ids}
+    splice_edges: dict[tuple[str, int], str] = {}
+    input_remap: dict[tuple[str, int], int] = {}
+    external_slot: dict[str, int] = {}
+
+    for nid, node in graph.nodes.items():
+        if nid not in loop_ids:
+            continue
+        for src_idx, inp in enumerate(node.inputs):
+            if inp in loop_ids:
+                splice_edges[(nid, src_idx)] = inp
+            else:
+                if inp not in external_slot:
+                    external_slot[inp] = len(external_slot)
+                input_remap[(nid, src_idx)] = external_slot[inp]
+
+    merged = splice_loops(loops=loops, splice_edges=splice_edges, input_remap=input_remap, root=root)
+    if merged is None:
+        return None
+    externals = [nid for nid, _ in sorted(external_slot.items(), key=lambda kv: kv[1])]
+    return merged, externals
+
+
 # ---------------------------------------------------------------------------
 # _Splicer — all per-splice state + the worklist loop
 # ---------------------------------------------------------------------------
