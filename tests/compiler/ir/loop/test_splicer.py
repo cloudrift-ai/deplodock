@@ -308,7 +308,7 @@ def test_chain_three_loops():
 
     merged = splice_loops(
         loops={"a": a, "b": b, "c": c},
-        splice_edges={("b", 0): "a", ("c", 0): "b"},
+        splice_edges={("b", 0): ("a", 0), ("c", 0): ("b", 0)},
         input_remap={
             ("a", 0): 0,  # a's x → merged slot 0
             ("c", 1): 1,  # c's bias → merged slot 1
@@ -324,6 +324,96 @@ def test_chain_three_loops():
     assert len(loads) == 2
     assert {ld.source for ld in loads} == {0, 1}
     assert merged.num_inputs == 2
+
+
+# ---------------------------------------------------------------------------
+# Multi-output support
+# ---------------------------------------------------------------------------
+
+
+def test_multi_output_root_preserves_all_writes():
+    """A root whose body contains Writes at multiple output indices should
+    seed each of them — the merged kernel carries all Writes."""
+    producer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"),)),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+    # Consumer produces two outputs: a negation and an absolute value — both
+    # reading the producer.
+    consumer = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="yv", source=0, index=(Var("a0"),)),
+            Assign(name="z0", op=ElementwiseOp("neg"), args=("yv",)),
+            Assign(name="z1", op=ElementwiseOp("abs"), args=("yv",)),
+            Write(output=0, index=(Var("a0"),), value="z0"),
+            Write(output=1, index=(Var("a0"),), value="z1"),
+        ),
+    )
+
+    merged = splice_loop_ops(producer, consumer, source=0)
+    assert merged is not None
+    writes = [s for s in flatten_body(merged.body) if isinstance(s, Write)]
+    assert {w.output for w in writes} == {0, 1}
+    fns = _elementwise_fns(merged)
+    # Producer chain materialized once (shared σ); both consumer ops present.
+    assert fns.count("exp") == 1
+    assert "neg" in fns
+    assert "abs" in fns
+
+
+def test_multi_output_splice_target():
+    """A splice target with two outputs (output=0 and output=1) — distinct
+    splice edges read each output. The target's expression chain reconstructs
+    separately for each output via the standard worklist walk."""
+    # Target: y0 = exp(x), y1 = neg(x). Two outputs.
+    target = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"),)),
+            Assign(name="y0", op=ElementwiseOp("exp"), args=("x",)),
+            Assign(name="y1", op=ElementwiseOp("neg"), args=("x",)),
+            Write(output=0, index=(Var("a0"),), value="y0"),
+            Write(output=1, index=(Var("a0"),), value="y1"),
+        ),
+    )
+    # Sink: z = add(target_out0, target_out1). Two consumer input slots both
+    # pointing at the target — slot 0 reads output 0 (exp), slot 1 reads
+    # output 1 (neg).
+    sink = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="a", source=0, index=(Var("a0"),)),
+            Load(name="b", source=1, index=(Var("a0"),)),
+            Assign(name="z", op=ElementwiseOp("add"), args=("a", "b")),
+            Write(output=0, index=(Var("a0"),), value="z"),
+        ),
+    )
+
+    merged = splice_loops(
+        loops={"target": target, "sink": sink},
+        splice_edges={
+            ("sink", 0): ("target", 0),  # sink's slot 0 ← target's output 0 (exp)
+            ("sink", 1): ("target", 1),  # sink's slot 1 ← target's output 1 (neg)
+        },
+        input_remap={
+            ("target", 0): 0,  # target's x → merged slot 0
+        },
+    )
+    assert merged is not None
+    fns = _elementwise_fns(merged)
+    # Both target ops appear in the merged body once each.
+    assert fns.count("exp") == 1
+    assert fns.count("neg") == 1
+    assert "add" in fns
+    # Only one external Load (target's x); the splice edges replaced sink's Loads.
+    loads = [s for s in flatten_body(merged.body) if isinstance(s, Load)]
+    assert len(loads) == 1
+    assert merged.num_inputs == 1
 
 
 def test_literal_producer_write_index():
