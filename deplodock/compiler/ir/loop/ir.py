@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.expr import Expr, Literal, Sigma
+from deplodock.compiler.ir.expr import Expr, Literal, Sigma, free_vars
 from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
@@ -417,7 +417,13 @@ class LoopOp(Op):
                     writes.append((s, scope))
 
         walk(self.body, Scope())
-        return LoopMeta(op=self, defs=defs, scopes=scopes, writes=tuple(writes))
+        return LoopMeta(
+            op=self,
+            defs=defs,
+            scopes=scopes,
+            writes=tuple(writes),
+            live_axes=_compute_live_axes(defs, scopes),
+        )
 
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
@@ -484,12 +490,62 @@ class LoopMeta:
       binding scope.
     - ``writes``: every ``Write`` stmt paired with the ``Scope`` it sits
       in — one entry per output, in body order.
+    - ``live_axes``: SSA name → axis names transitively reachable through
+      Expr subtrees (``Load.index``, ``SelectBranch.select``) while resolving
+      the stmt's dep chain. For an ``Accum``, the reduce axis is excluded
+      since it gets freshened at emission time.
     """
 
     op: LoopOp
     defs: dict[str, Stmt]
     scopes: dict[str, Scope]
     writes: tuple[tuple[Write, Scope], ...]
+    live_axes: dict[str, frozenset[str]]
+
+
+def _compute_live_axes(defs: dict[str, Stmt], scopes: dict[str, Scope]) -> dict[str, frozenset[str]]:
+    """Axes reachable through Expr subtrees rooted at each SSA name.
+
+    A dep's live axes are the union of its own Expr subtree's free vars plus
+    the live axes of every SSA name it reads. ``Accum`` excludes its reduce
+    axis (the enclosing's tail), since that axis gets freshened per emission.
+    """
+    cache: dict[str, frozenset[str]] = {}
+    in_progress: set[str] = set()
+
+    def live(name: str) -> frozenset[str]:
+        if name in cache:
+            return cache[name]
+        if name in in_progress:
+            return frozenset()  # cycle: approximate as empty and let the caller union
+        in_progress.add(name)
+        stmt = defs.get(name)
+        if stmt is None:
+            in_progress.discard(name)
+            cache[name] = frozenset()
+            return cache[name]
+        own: frozenset[str] = frozenset()
+        if isinstance(stmt, Load):
+            for e in stmt.index:
+                own |= free_vars(e)
+        elif isinstance(stmt, Select):
+            for b in stmt.branches:
+                own |= free_vars(b.select) | live(b.value)
+        elif isinstance(stmt, Assign):
+            for a in stmt.args:
+                own |= live(a)
+        elif isinstance(stmt, Accum):
+            own |= live(stmt.value)
+            enc = scopes[name].enclosing
+            if enc:
+                own -= {enc[-1].name}
+        in_progress.discard(name)
+        cache[name] = own
+        return own
+
+    for n in defs:
+        live(n)
+    return cache
 
 
 # ---------------------------------------------------------------------------

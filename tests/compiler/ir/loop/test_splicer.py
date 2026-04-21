@@ -271,6 +271,35 @@ def test_consumer_extra_input_source_remap():
 # ---------------------------------------------------------------------------
 
 
+def test_live_axes_computed():
+    """``LoopMeta.live_axes`` captures axes transitively used through each
+    dep's Expr subtrees. For Accum, the reduce axis is excluded.
+
+    Normalization canonicalizes SSA and axis names (``Load→in0``,
+    ``Accum→acc0``; free axes first then reduce axes), so we assert on
+    sizes and the reduce-axis-exclusion property rather than pre-normalize
+    names.
+    """
+    op = _loop(
+        axes=(A0, K),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"), Var("k"))),
+            Accum(name="s", value="x", op=ElementwiseOp("add")),
+            Write(output=0, index=(Var("a0"),), value="s"),
+        ),
+        reduce_axes=frozenset({"k"}),
+    )
+    meta = op.analyze()
+    [(load_name, load_scope)] = [(n, s) for n, s in meta.scopes.items() if isinstance(meta.defs[n], Load)]
+    [(acc_name, acc_scope)] = [(n, s) for n, s in meta.scopes.items() if isinstance(meta.defs[n], Accum)]
+    # Load's live_axes = both axis names (post-normalize).
+    assert meta.live_axes[load_name] == {a.name for a in load_scope.enclosing}
+    # Accum's reduce axis (tail of its enclosing) is stripped from live_axes.
+    reduce_name = acc_scope.enclosing[-1].name
+    assert reduce_name not in meta.live_axes[acc_name]
+    assert meta.live_axes[acc_name] == {a.name for a in acc_scope.enclosing[:-1]}
+
+
 def test_literal_producer_write_index():
     """Producer writes at (a0, 0); consumer reads at (a0, 0). The Literal dim
     contributes no σ binding and shouldn't block splicing."""
