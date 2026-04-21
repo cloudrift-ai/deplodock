@@ -41,7 +41,7 @@ from deplodock.compiler.ir.loop.ir import (
     Loop,
     Select,
     Stmt,
-    flatten_body,
+    iter_body,
     map_body,
 )
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
@@ -254,19 +254,13 @@ def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str)
     appears bare in a Load index within ``body`` (recursing into nested
     Loops — important when the reduce body contains a nested free loop
     that does the actual load)."""
-    positions: set[tuple[int, int]] = set()
-
-    def go(stmts: tuple[Stmt, ...]) -> None:
-        for s in stmts:
-            if isinstance(s, Load):
-                for dim, e in enumerate(s.index):
-                    if isinstance(e, Var) and e.name == reduce_axis_name:
-                        positions.add((s.source, dim))
-            elif isinstance(s, Loop):
-                go(s.body)
-
-    go(body)
-    return positions
+    return {
+        (s.source, dim)
+        for s in iter_body(body)
+        if isinstance(s, Load)
+        for dim, e in enumerate(s.index)
+        if isinstance(e, Var) and e.name == reduce_axis_name
+    }
 
 
 def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -> tuple[Stmt, ...]:
@@ -301,7 +295,7 @@ def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     v_counter = 0
     in_counter = 0
     acc_counter = 0
-    for stmt in flatten_body(stmts):
+    for stmt in iter_body(stmts):
         if isinstance(stmt, Load):
             if stmt.name in ssa_rename:
                 continue
@@ -319,18 +313,9 @@ def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
             v_counter += 1
 
     axis_rename: dict[str, str] = {}
-    a_counter = 0
-
-    def collect_axes(body: tuple[Stmt, ...]) -> None:
-        nonlocal a_counter
-        for s in body:
-            if isinstance(s, Loop):
-                if s.axis.name not in axis_rename:
-                    axis_rename[s.axis.name] = f"a{a_counter}"
-                    a_counter += 1
-                collect_axes(s.body)
-
-    collect_axes(stmts)
+    for s in iter_body(stmts):
+        if isinstance(s, Loop) and s.axis.name not in axis_rename:
+            axis_rename[s.axis.name] = f"a{len(axis_rename)}"
 
     ssa_noop = all(old == new for old, new in ssa_rename.items())
     axis_noop = all(old == new for old, new in axis_rename.items())
@@ -343,7 +328,7 @@ def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     # Load's name). Assign/Select names never surface in Exprs so they stay
     # out of this map.
     expr_sub: dict[str, Expr] = {old: Var(new) for old, new in axis_rename.items() if old != new}
-    for stmt in flatten_body(stmts):
+    for stmt in iter_body(stmts):
         if isinstance(stmt, Load):
             old = stmt.name
             new = ssa_rename.get(old, old)

@@ -406,14 +406,9 @@ def _solve_sigma(
 def _collect_names(op: LoopOp) -> set[str]:
     """All SSA names plus all axis names used anywhere in ``op``."""
     names: set[str] = set()
-
-    def walk(stmts: tuple[Stmt, ...]) -> None:
-        for s in stmts:
-            if isinstance(s, Loop):
-                names.add(s.axis.name)
-                walk(s.body)
-            elif isinstance(s, (Load, Assign, Select, Accum)):
-                names.add(s.name)
-
-    walk(op.body)
+    for s in op:
+        if isinstance(s, Loop):
+            names.add(s.axis.name)
+        elif isinstance(s, (Load, Assign, Select, Accum)):
+            names.add(s.name)
     return names

@@ -130,9 +130,9 @@ def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int 
     # used as a Select branch value, the Load inherits that branch's
     # predicate. Needed for the rotary rotate_half pattern, where the Load
     # is wrapped in an Assign (``v1 = neg(x_lo)``) before reaching the Select.
-    from deplodock.compiler.ir.loop import Assign, flatten_body
+    from deplodock.compiler.ir.loop import Assign
 
-    flat = list(flatten_body(loop.body))
+    flat = list(loop)
     load_names = {ld.name for ld in loop.loads}
 
     # ssa_load_deps[name] = set of Load SSA names that name reads (transitively).
@@ -663,19 +663,15 @@ def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
 
 
 def _kernel_name(loop: LoopOp, idx: int) -> str:
-    from deplodock.compiler.ir.loop import flatten_body
-
-    if any(isinstance(s, Accum) for s in flatten_body(loop.body)):
+    if any(isinstance(s, Accum) for s in loop):
         return f"k{idx}_reduce"
     return f"k{idx}_pointwise"
 
 
 def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    from deplodock.compiler.ir.loop import flatten_body
-
     loop: LoopOp = launch.loop
     out_shape = program.output_shape(launch)
-    has_reduce = any(isinstance(s, Accum) for s in flatten_body(loop.body))
+    has_reduce = any(isinstance(s, Accum) for s in loop)
     if has_reduce:
         reduce_names = loop.reduce_axis_names
         free_extents = [int(a.extent) for a in loop.axes if a.name not in reduce_names]

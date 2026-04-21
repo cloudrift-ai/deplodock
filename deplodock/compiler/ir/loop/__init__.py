@@ -33,7 +33,7 @@ from deplodock.compiler.ir.loop.ir import (
     Stmt,
     Write,
     flat_body_to_nested,
-    flatten_body,
+    iter_body,
     map_body,
     pretty_print,
 )
@@ -58,7 +58,7 @@ __all__ = [
     "Write",
     "analyze_kernel",
     "flat_body_to_nested",
-    "flatten_body",
+    "iter_body",
     "map_body",
     "pretty_print",
     "splice_graph",
