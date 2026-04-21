@@ -102,8 +102,19 @@ def execute_loop_op(
     ``LoopProgram``) and ``LoopOp.forward`` (which is called directly from
     the graph-level numpy walker).
     """
-    reduce_names = loop.reduce_axis_names
-    reduce_axis_positions = tuple(i for i, a in enumerate(loop.axes) if a.name in reduce_names)
+    # Per-Accum reduce axis: each Accum folds only over the axis of its
+    # immediately enclosing reduce ``Loop`` (not over every reduce axis in
+    # the kernel). Nested reductions — e.g. outer sum over k that reads an
+    # inner max over j — need j collapsed first at the inner Accum, then k
+    # at the outer. Collapsing both simultaneously would fold dimensions
+    # that were meant to vary.
+    axis_position = {a.name: i for i, a in enumerate(loop.axes)}
+    accum_axis_position: dict[str, int] = {}
+    meta = loop.analyze()
+    for decl in loop.accums:
+        enc = meta.scopes[decl.name].enclosing
+        if enc:
+            accum_axis_position[decl.name] = axis_position[enc[-1].name]
     values: dict[str, np.ndarray] = {}
     # Accums are body-form reduce accumulator declarations. Each one
     # binds an SSA name that subsequent Updates fold values into.
@@ -132,11 +143,13 @@ def execute_loop_op(
                 raise ValueError(f"Load source {stmt.source} out of range (have {len(input_arrays)} inputs)")
             values[stmt.name] = _apply_load_index(stmt.index, input_arrays[stmt.source], loop.axes, values)
         elif isinstance(stmt, Accum):
-            # Fold the value into the accumulator. Init happens above via
-            # the accums walk; each Accum folds per-iteration.
+            # Fold the value over this Accum's own enclosing reduce axis only.
+            # Init happened above via the accums walk.
             acc = acc_map[stmt.name]
             src = values[stmt.value]
-            reduced = _fold_to_accumulator(src, acc, reduce_axis_positions)
+            own_pos = accum_axis_position.get(stmt.name)
+            positions = (own_pos,) if own_pos is not None else ()
+            reduced = _fold_to_accumulator(src, acc, positions)
             values[stmt.name] = reduced
         elif isinstance(stmt, Select):
             axis_env = _broadcast_axis_env(loop.axes)

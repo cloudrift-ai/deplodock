@@ -82,17 +82,6 @@ class _Demand:
 def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: int) -> LoopOp | None:
     """Splice ``producer``'s expression into every consumer ``Load`` that
     targets ``source``. Returns ``None`` when the pattern isn't supported."""
-    # Refuse when the producer has an ``Accum`` nested inside another
-    # ``Accum``'s reduce Loop. Splicing such a producer would produce a
-    # merged body where the inner Accum's reduce depends on a fresh axis
-    # introduced by the outer Accum's materialization — valid in scalar-
-    # loop semantics but the whole-tensor numpy backend (``execute_loop_op``)
-    # reduces every Accum over *all* reduce axes at once, collapsing
-    # dimensions that were meant to vary. The old splicer hit this same
-    # limitation via a different code path (``required ⊆ names`` check on
-    # a bubbled sub-ref); match it here by rejecting the pattern up front.
-    if _has_nested_accums(producer.body):
-        return None
     try:
         return _Splicer(producer, consumer, source).run()
     except (_NotSupported, ValueError):
@@ -159,19 +148,7 @@ class _Splicer(LoopBuilder):
         bind_enclosing = full_enc.enclosing[:-1] if isinstance(def_stmt, Accum) else full_enc.enclosing
         required_axes = tuple(_remap_axis_name(a, sigma) for a in bind_enclosing)
 
-        # Producer plain stmts: require the σ-mapped enclosing to axis-set-equal
-        # ``ref_scope``. With whole-tensor backend semantics Accums reduce over
-        # every reduce axis at once, so emitting a producer plain stmt at a
-        # scope that has extra reduce axes would collapse dimensions that were
-        # meant to vary — e.g. softmax's sum accum would fold matmul@V's k along
-        # with softmax's k. Consumer stmts (and Accums) are fine at a shorter
-        # prefix (the original outer-scope binding seen from a nested reference).
-        if origin == "producer" and not isinstance(def_stmt, Accum):
-            if set(required_axes) != set(a.name for a in ref_scope.enclosing):
-                raise _NotSupported
-            emit_scope = ref_scope
-        else:
-            emit_scope = _scope_for_axes(ref_scope, required_axes)
+        emit_scope = _scope_for_axes(ref_scope, required_axes)
 
         # σ restricted to axes transitively used in Expr subtrees reachable
         # from this stmt. Bindings outside this set don't affect any emitted
@@ -255,20 +232,6 @@ class _Splicer(LoopBuilder):
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
-
-
-def _has_nested_accums(stmts: tuple[Stmt, ...], inside_accum_loop: bool = False) -> bool:
-    """True if any ``Accum``'s reduce Loop sits inside another ``Accum``'s
-    reduce Loop. A Loop's immediate body Accum is "this Loop's" — only
-    deeper Loops with Accums count as nested."""
-    for s in stmts:
-        if isinstance(s, Loop):
-            wraps_accum = any(isinstance(x, Accum) for x in s.body)
-            if inside_accum_loop and wraps_accum:
-                return True
-            if _has_nested_accums(s.body, inside_accum_loop or wraps_accum):
-                return True
-    return False
 
 
 def _scope_for_axes(ref_scope: Scope, required: tuple[str, ...]) -> Scope:
