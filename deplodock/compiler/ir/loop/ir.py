@@ -183,6 +183,9 @@ class Accum(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
+    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: dict[str, Expr]) -> Stmt:
+        return Accum(name=new_name, value=resolved[self.value], op=self.op)
+
 
 @dataclass(frozen=True)
 class Write(Stmt):
