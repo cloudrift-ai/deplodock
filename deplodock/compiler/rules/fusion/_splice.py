@@ -152,23 +152,19 @@ class _Scope:
     def names(self) -> tuple[str, ...]:
         return tuple(a.name for a in self.enclosing)
 
-    @property
-    def name_set(self) -> frozenset[str]:
-        return frozenset(a.name for a in self.enclosing)
-
     def nest(self, axis: Axis) -> _Scope:
         return _Scope(enclosing=self.enclosing + (axis,))
 
-    def remap(self, sigma: dict[str, Expr]) -> _Scope | None:
-        """σ-remap each axis name. Returns ``None`` if any axis σ-maps to a non-``Var``
-        (affine binding forms aren't supported). Axis extents are preserved."""
+    def remap(self, sigma: dict[str, Expr]) -> _Scope:
+        """σ-remap each axis name"""
         out: list[Axis] = []
         for a in self.enclosing:
             r = sigma.get(a.name)
-            if not isinstance(r, Var):
-                return None
             out.append(Axis(name=r.name, extent=a.extent))
         return _Scope(enclosing=tuple(out))
+
+    def __eq__(self, other):
+        return frozenset(a.name for a in self.enclosing) == frozenset(a.name for a in other.enclosing)
 
 
 # ---------------------------------------------------------------------------
@@ -302,10 +298,10 @@ def _emit(
     needed: set[str] = {target}
     collected: list[tuple[Stmt, str]] = []  # (original_stmt, fresh_name), reverse order
 
-    def visit(stmts: tuple[Stmt, ...], enclosing: tuple[Axis, ...]) -> None:
+    def visit(stmts: tuple[Stmt, ...], producer_scope=_Scope()) -> None:
         for s in reversed(stmts):
             if isinstance(s, Loop):
-                visit(s.body, enclosing + (s.axis,))
+                visit(s.body, producer_scope.nest(s.axis))
                 continue
             if not isinstance(s, (Load, Assign, Select, Accum)):
                 continue
@@ -313,17 +309,16 @@ def _emit(
                 continue
             needed.discard(s.name)
             if isinstance(s, Accum):
-                ssa_rename[s.name] = _record_accum_pending(s, enclosing, sigma, ctx, pending)
+                ssa_rename[s.name] = _record_accum_pending(s, producer_scope.enclosing, sigma, ctx, pending)
                 continue
-            required = _Scope(enclosing=enclosing).remap(sigma)
-            if required is None or not (required.name_set <= scope.name_set):
+            if producer_scope.remap(sigma) != scope:
                 raise _NotSupported
             new_name = ctx.fresh(s.name)
             ssa_rename[s.name] = new_name
             collected.append((s, new_name))
             needed.update(_ssa_deps(s))
 
-    visit(ctx.producer.body, ())
+    visit(ctx.producer.body)
 
     emitted: list[Stmt] = []
     for s, new_name in reversed(collected):
