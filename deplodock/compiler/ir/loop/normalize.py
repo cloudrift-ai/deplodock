@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.ir.expr import Expr, Literal, Sigma, Var
+from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop.ir import (
     Accum,
     Assign,
@@ -44,6 +44,7 @@ from deplodock.compiler.ir.loop.ir import (
     iter_body,
     map_body,
 )
+from deplodock.compiler.ir.loop.sigma import Sigma
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 __all__ = [

@@ -26,8 +26,9 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.expr import Expr, Literal, Sigma, free_vars
+from deplodock.compiler.ir.expr import Expr, Literal, free_vars
 from deplodock.compiler.ir.expr import render as render_expr
+from deplodock.compiler.ir.loop.sigma import Sigma
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 # ---------------------------------------------------------------------------

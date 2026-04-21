@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.expr import Expr, Literal, Sigma, Var
+from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop.builder import LoopBuilder
 from deplodock.compiler.ir.loop.ir import (
     Accum,
@@ -45,6 +45,7 @@ from deplodock.compiler.ir.loop.ir import (
     Stmt,
     Write,
 )
+from deplodock.compiler.ir.loop.sigma import Sigma
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 
