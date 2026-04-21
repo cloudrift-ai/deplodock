@@ -51,10 +51,11 @@ class _NotSupported(Exception):
     """Pattern not handled — caller converts to ``None`` return."""
 
 
-# Binding keys for the splicer's dedup tables. ``origin`` is the loop tag
-# ("producer" | "consumer"), ``name`` is the SSA name in that loop.
-_PlainKey = tuple[str, str, Sigma]  # (origin, name, sigma)
-_AccumKey = tuple[str, str, tuple[str, ...]]  # (origin, name, required_c_axes)
+# Unified binding key: ``(origin, name, emit_scope, sigma.restrict(enclosing))``.
+# ``emit_scope`` is where the stmt lands in the merged body; ``sigma`` is
+# restricted to the stmt's own enclosing axis names — the only bindings that
+# affect its rewrite (Load.index / Select.select) or its dep resolution.
+_BindKey = tuple[str, str, Scope, Sigma]
 
 
 @dataclass
@@ -108,7 +109,7 @@ class _Splicer(LoopBuilder):
 
     Inherits body building (``insert`` / ``fresh`` / ``finish``) from
     ``LoopBuilder``; adds per-splice analysis (``loops``, ``source``), the
-    worklist of pending demands, and the two dedup tables that keep the
+    worklist of pending demands, and the dedup table that keeps the
     merged body minimal.
 
     Worklist dep-resolution is reverse-topological — producers demanded
@@ -121,13 +122,11 @@ class _Splicer(LoopBuilder):
         self.source = source
         self.loops = {"producer": producer.analyze(), "consumer": consumer.analyze()}
         self._pending: deque[_Demand] = deque()
-        # Plain deps dedupe by σ — two refs to the same producer name under
-        # different σs emit twice.
-        self._plain_binding: dict[_PlainKey, str] = {}
-        # Accums dedupe by the σ-mapped enclosing axes — same accum at
-        # different scopes emits twice (SDPA's QK^T at softmax-max vs
-        # softmax-output).
-        self._accum_binding: dict[_AccumKey, str] = {}
+        # Dedup: a stmt is uniquely identified by its (origin, name), the
+        # emit scope it lands at in the merged body, and the σ restricted
+        # to its own enclosing — the only bindings that affect its rewrite.
+        # Same key → share a single emission.
+        self._binding: dict[_BindKey, str] = {}
 
     def run(self) -> LoopOp:
         self._seed()
@@ -145,50 +144,43 @@ class _Splicer(LoopBuilder):
     # -- Dep binding: look up or queue --------------------------------------
 
     def _ensure_dep(self, name: str, origin: str, sigma: Sigma, ref_scope: Scope) -> str:
-        """Return the merged-body name bound to ``(origin, name, σ)``. Queue a
-        new demand if this is the first reference.
-
-        ``ref_scope`` is where the reference sits in the merged body; used
-        only to compute an Accum's enclosure. Plain deps take their scope
-        from the def's own enclosing (σ-remapped).
+        """Return the merged-body name for ``(origin, name)`` at the emit
+        scope induced by ``ref_scope`` and σ. Queue a new demand the first
+        time the key is seen.
         """
         meta = self.loops[origin]
         def_stmt = meta.defs.get(name)
         if def_stmt is None:
             raise _NotSupported
 
-        if isinstance(def_stmt, Accum):
-            full_enc = meta.scopes[name]
-            required = tuple(_remap_axis_name(a, sigma) for a in full_enc.enclosing[:-1])
-            existing = self._accum_binding.get((origin, name, required))
-            if existing is not None:
-                return existing
-            bound = self.fresh(name)
-            self._accum_binding[(origin, name, required)] = bound
-            accum_enc = _scope_for_axes(ref_scope, required)
-            self._pending.append(_Demand(name=name, origin=origin, sigma=sigma, demand_scope=accum_enc, bound_as=bound))
-            return bound
+        full_enc = meta.scopes[name]
+        # Accums bind *before* the reduce axis — drop the tail for scope
+        # derivation. The reduce axis gets freshened inside ``_resolve_accum``.
+        bind_enclosing = full_enc.enclosing[:-1] if isinstance(def_stmt, Accum) else full_enc.enclosing
+        required_axes = tuple(_remap_axis_name(a, sigma) for a in bind_enclosing)
 
-        existing = self._plain_binding.get((origin, name, sigma))
+        # Producer plain stmts: require the σ-mapped enclosing to axis-set-equal
+        # ``ref_scope``. With whole-tensor backend semantics Accums reduce over
+        # every reduce axis at once, so emitting a producer plain stmt at a
+        # scope that has extra reduce axes would collapse dimensions that were
+        # meant to vary — e.g. softmax's sum accum would fold matmul@V's k along
+        # with softmax's k. Consumer stmts (and Accums) are fine at a shorter
+        # prefix (the original outer-scope binding seen from a nested reference).
+        if origin == "producer" and not isinstance(def_stmt, Accum):
+            if set(required_axes) != set(a.name for a in ref_scope.enclosing):
+                raise _NotSupported
+            emit_scope = ref_scope
+        else:
+            emit_scope = _scope_for_axes(ref_scope, required_axes)
+
+        restricted = sigma.restrict({a.name for a in full_enc.enclosing})
+        key = (origin, name, emit_scope, restricted)
+        existing = self._binding.get(key)
         if existing is not None:
             return existing
         bound = self.fresh(name)
-        self._plain_binding[(origin, name, sigma)] = bound
-        required_axes = tuple(_remap_axis_name(a, sigma) for a in meta.scopes[name].enclosing)
-        # Producer plain stmts: require the σ-mapped enclosing to axis-set-equal
-        # ``ref_scope``. With whole-tensor backend semantics Accums reduce over
-        # every reduce axis at once, so emitting a producer stmt at a scope that
-        # has extra reduce axes would collapse dimensions that were meant to
-        # vary — e.g. softmax's sum accum would fold matmul@V's k along with
-        # softmax's k. Consumer stmts are fine at a shorter prefix (the
-        # original outer-scope binding seen from a nested reference).
-        if origin == "producer":
-            if set(required_axes) != set(a.name for a in ref_scope.enclosing):
-                raise _NotSupported
-            def_scope = ref_scope
-        else:
-            def_scope = _scope_for_axes(ref_scope, required_axes)
-        self._pending.append(_Demand(name=name, origin=origin, sigma=sigma, demand_scope=def_scope, bound_as=bound))
+        self._binding[key] = bound
+        self._pending.append(_Demand(name=name, origin=origin, sigma=sigma, demand_scope=emit_scope, bound_as=bound))
         return bound
 
     # -- Resolution dispatch -------------------------------------------------
