@@ -80,43 +80,12 @@ class _Demand:
 # ---------------------------------------------------------------------------
 
 
-def splice_loop_chain(
-    loops: dict[str, LoopOp],
-    splice_edges: dict[tuple[str, int], str],
-    input_remap: dict[tuple[str, int], int],
-    root: str,
-) -> LoopOp | None:
-    """Splice a graph of LoopOps into one merged kernel.
-
-    ``loops`` maps an opaque tag to each participating ``LoopOp``.
-    ``splice_edges`` identifies which Loads are inlined from another
-    registered loop: key ``(origin_tag, source_idx)`` → value ``target_tag``,
-    meaning "the origin loop's Load at source_idx reads target_tag's
-    output and should be inlined."
-    ``input_remap`` assigns every non-splice Load's ``(origin_tag,
-    source_idx)`` to a slot in the merged kernel's external input list.
-    ``root`` names the tag whose ``Write``s seed the traversal — typically
-    the chain's final consumer.
-
-    Returns ``None`` if any splice edge hits an unsupported pattern
-    (non-Var/Literal writer index, arithmetic σ targets, etc.)."""
-    try:
-        return _Splicer(
-            loops={tag: op.analyze() for tag, op in loops.items()},
-            splice_edges=splice_edges,
-            input_remap=input_remap,
-            root=root,
-        ).run()
-    except (_NotSupported, ValueError):
-        return None
-
-
 def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: int) -> LoopOp | None:
     """Pairwise splicer: inline ``producer`` into every ``consumer`` Load
     that targets ``source``. Returns ``None`` when the pattern isn't
     supported.
 
-    Thin wrapper over ``splice_loop_chain``: producer inputs occupy slots
+    Thin wrapper over ``splice_loops``: producer inputs occupy slots
     ``[0, n_prod)`` in the merged kernel; the consumer's surviving inputs
     follow in declaration order, skipping the spliced slot.
     """
@@ -128,12 +97,45 @@ def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: int) -> LoopOp |
             continue
         input_remap[("consumer", i)] = next_slot
         next_slot += 1
-    return splice_loop_chain(
+    return splice_loops(
         loops={"producer": producer, "consumer": consumer},
         splice_edges={("consumer", source): "producer"},
         input_remap=input_remap,
         root="consumer",
     )
+
+
+def splice_loops(
+    loops: dict[str, LoopOp],
+    splice_edges: dict[tuple[str, int], str],
+    input_remap: dict[tuple[str, int], int],
+    root: str,
+) -> LoopOp | None:
+    """Splice a DAG of ``LoopOp``s into one merged kernel.
+
+    ``loops`` maps an opaque tag to each participating ``LoopOp``.
+    ``splice_edges`` identifies which Loads are inlined from another
+    registered loop: key ``(origin_tag, source_idx)`` → value ``target_tag``
+    meaning "this loop's Load at source_idx reads target_tag's output and
+    should be inlined."
+    ``input_remap`` assigns every non-splice Load's ``(origin_tag,
+    source_idx)`` to a slot in the merged kernel's external input list.
+    ``root`` names the tag whose ``Write``s seed the traversal — the
+    subgraph's sink.
+
+    Handles any single-root, single-output-per-target DAG — chains,
+    diamonds, shared sub-producers. Returns ``None`` if any splice edge
+    hits an unsupported pattern (non-Var/Literal writer index, arithmetic
+    σ targets, etc.)."""
+    try:
+        return _Splicer(
+            loops={tag: op.analyze() for tag, op in loops.items()},
+            splice_edges=splice_edges,
+            input_remap=input_remap,
+            root=root,
+        ).run()
+    except (_NotSupported, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -18,8 +18,8 @@ from deplodock.compiler.ir.loop import (
     Write,
     flat_body_to_nested,
     flatten_body,
-    splice_loop_chain,
     splice_loop_ops,
+    splice_loops,
 )
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
@@ -306,7 +306,7 @@ def test_chain_three_loops():
         ),
     )
 
-    merged = splice_loop_chain(
+    merged = splice_loops(
         loops={"a": a, "b": b, "c": c},
         splice_edges={("b", 0): "a", ("c", 0): "b"},
         input_remap={
