@@ -300,8 +300,9 @@ class _Splicer(LoopBuilder):
     def _resolve_plain(self, stmt: Stmt, d: _Demand) -> None:
         """Generic Assign / Select emission — rewrite the stmt with fresh args
         and σ-substituted Exprs, insert at ``d.demand_scope``."""
-        resolved = {arg: self._ensure_dep(arg, d.origin, d.sigma, d.demand_scope) for arg in stmt.deps()}
-        self.insert(stmt.rewrite(d.bound_as, resolved, d.sigma), d.demand_scope)
+        rename = {arg: self._ensure_dep(arg, d.origin, d.sigma, d.demand_scope) for arg in stmt.deps()}
+        rename[stmt.name] = d.bound_as  # type: ignore[attr-defined]
+        self.insert(stmt.rewrite(lambda n: rename.get(n, n), d.sigma), d.demand_scope)
 
     def _resolve_external_load(self, stmt: Load, d: _Demand) -> None:
         """A Load that isn't a splice edge — remap source via ``input_remap``,
