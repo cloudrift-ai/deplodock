@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var, substitute
+from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
@@ -47,7 +47,6 @@ from deplodock.compiler.ir.loop import (
     Loop,
     LoopOp,
     Select,
-    SelectBranch,
     Stmt,
     Write,
 )
@@ -323,34 +322,9 @@ def _emit(
     emitted: list[Stmt] = []
     for s, new_name in reversed(collected):
         resolved = {d: ssa_rename.get(d, d) for d in s.deps()}
-        emitted.append(_build_rewritten_stmt(s, new_name, resolved, sigma))
+        emitted.append(s.rewrite(new_name, resolved, sigma))
 
     return emitted, pending, ssa_rename.get(target, target)
-
-
-def _build_rewritten_stmt(
-    defn: Stmt,
-    new_name: str,
-    resolved: dict[str, str],
-    sigma: dict[str, Expr],
-) -> Stmt:
-    """Construct the rewritten form of ``defn``: ``new_name`` as the SSA
-    binding, ``sigma`` applied to every Expr, and each SSA reference
-    remapped via ``resolved``."""
-    if isinstance(defn, Load):
-        return Load(
-            name=new_name,
-            source=defn.source,
-            index=tuple(substitute(e, sigma) for e in defn.index),
-        )
-    if isinstance(defn, Assign):
-        return Assign(name=new_name, op=defn.op, args=tuple(resolved[a] for a in defn.args))
-    if isinstance(defn, Select):
-        return Select(
-            name=new_name,
-            branches=tuple(SelectBranch(value=resolved[b.value], select=substitute(b.select, sigma)) for b in defn.branches),
-        )
-    raise _NotSupported
 
 
 def _record_accum_pending(
