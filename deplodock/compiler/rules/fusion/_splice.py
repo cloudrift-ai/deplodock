@@ -210,20 +210,21 @@ def _analyze(body: tuple[Stmt, ...]) -> tuple[dict[str, Stmt], dict[str, _Scope]
 
 
 @dataclass
+class _LoopMeta:
+    op: LoopOp
+    inputs: list[str]
+    defs: dict[str, Stmt]
+    enc: dict[str, _Scope]
+    writes: list[tuple[Write, _Scope]]
+    axis_names: set[str]
+    source_remap: dict[int, int]
+
+
+@dataclass
 class _Ctx:
-    producer: LoopOp
-    consumer: LoopOp
+    loops: dict[str, _LoopMeta]
     source: int
-    producer_inputs: list[str]
-    consumer_inputs: list[str]
-    producer_defs: dict[str, Stmt]
-    producer_enc: dict[str, _Scope]
-    consumer_defs: dict[str, Stmt]
-    consumer_enc: dict[str, _Scope]
-    consumer_writes: list[tuple[Write, _Scope]]
     producer_write: Write
-    producer_axis_names: set[str]
-    consumer_source_remap: dict[int, int]
 
     @classmethod
     def build(
@@ -239,21 +240,27 @@ class _Ctx:
         prod_write = next((w for w, _ in p_writes if w.output == 0), None)
         if prod_write is None:
             raise _NotSupported
-        return cls(
-            producer=producer,
-            consumer=consumer,
-            source=source,
-            producer_inputs=producer_inputs,
-            consumer_inputs=consumer_inputs,
-            producer_defs=p_defs,
-            producer_enc=p_enc,
-            consumer_defs=c_defs,
-            consumer_enc=c_enc,
-            consumer_writes=c_writes,
-            producer_write=prod_write,
-            producer_axis_names={a.name for a in producer.axes},
-            consumer_source_remap=_build_consumer_source_remap(producer, consumer, source),
-        )
+        loops = {
+            "producer": _LoopMeta(
+                op=producer,
+                inputs=producer_inputs,
+                defs=p_defs,
+                enc=p_enc,
+                writes=p_writes,
+                axis_names={a.name for a in producer.axes},
+                source_remap={},
+            ),
+            "consumer": _LoopMeta(
+                op=consumer,
+                inputs=consumer_inputs,
+                defs=c_defs,
+                enc=c_enc,
+                writes=c_writes,
+                axis_names={a.name for a in consumer.axes},
+                source_remap=_build_consumer_source_remap(producer, consumer, source),
+            ),
+        }
+        return cls(loops=loops, source=source, producer_write=prod_write)
 
 
 def _build_consumer_source_remap(producer: LoopOp, consumer: LoopOp, source: int) -> dict[int, int]:
@@ -338,7 +345,7 @@ def _has_nested_accums(stmts: tuple[Stmt, ...], inside_accum_loop: bool = False)
 
 
 def _seed(ctx: _Ctx, b: LoopBuilder) -> None:
-    for w, scope in ctx.consumer_writes:
+    for w, scope in ctx.loops["consumer"].writes:
         v_bound = _ensure_dep(w.value, "consumer", {}, scope, ctx, b)
         b.insert(Write(output=w.output, index=w.index, value=v_bound), scope)
 
@@ -363,14 +370,13 @@ def _ensure_dep(
     to compute an Accum's enclosure. Plain deps take their scope from the
     def's own enclosing (σ-remapped).
     """
-    defs = ctx.consumer_defs if origin == "consumer" else ctx.producer_defs
-    encs = ctx.consumer_enc if origin == "consumer" else ctx.producer_enc
-    def_stmt = defs.get(name)
+    meta = ctx.loops[origin]
+    def_stmt = meta.defs.get(name)
     if def_stmt is None:
         raise _NotSupported
 
     if isinstance(def_stmt, Accum):
-        full_enc = encs[name]
+        full_enc = meta.enc[name]
         required = tuple(_remap_axis_name(a, sigma) for a in full_enc.enclosing[:-1])
         existing = b.seen_accum(origin, name, required)
         if existing is not None:
@@ -386,7 +392,7 @@ def _ensure_dep(
         return existing
     bound = b.fresh(name)
     b.bind_plain(origin, name, sigma, bound)
-    required_axes = tuple(_remap_axis_name(a, sigma) for a in encs[name].enclosing)
+    required_axes = tuple(_remap_axis_name(a, sigma) for a in meta.enc[name].enclosing)
     # Producer plain stmts: require the σ-mapped enclosing to axis-set-equal
     # ``ref_scope``. With whole-tensor backend semantics Accums reduce over
     # every reduce axis at once, so emitting a producer stmt at a scope that
@@ -410,8 +416,7 @@ def _ensure_dep(
 
 
 def _resolve(d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
-    defs = ctx.consumer_defs if d.origin == "consumer" else ctx.producer_defs
-    stmt = defs[d.name]
+    stmt = ctx.loops[d.origin].defs[d.name]
 
     if isinstance(stmt, Load):
         if d.origin == "consumer" and stmt.source == ctx.source:
@@ -435,10 +440,7 @@ def _resolve_plain(stmt: Stmt, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
 
 def _resolve_plain_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
     """A Load that doesn't target the producer — remap source, σ-sub index."""
-    if d.origin == "consumer":
-        new_src = ctx.consumer_source_remap.get(stmt.source, stmt.source)
-    else:
-        new_src = stmt.source
+    new_src = ctx.loops[d.origin].source_remap.get(stmt.source, stmt.source)
     new_index = tuple(substitute(e, d.sigma) for e in stmt.index)
     b.insert(Load(name=d.bound_as, source=new_src, index=new_index), d.demand_scope)
 
@@ -448,7 +450,7 @@ def _resolve_producer_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) ->
     queue the producer's ``Write.value`` under the solved σ. The producer's
     expression chain reconstructs piecemeal in subsequent iterations."""
     effective_index = tuple(substitute(e, d.sigma) for e in stmt.index)
-    sigma = _solve_sigma(ctx.producer_write.index, effective_index, ctx.producer_axis_names)
+    sigma = _solve_sigma(ctx.producer_write.index, effective_index, ctx.loops["producer"].axis_names)
     if sigma is None:
         raise _NotSupported
     v_bound = _ensure_dep(ctx.producer_write.value, "producer", sigma, d.demand_scope, ctx, b)
@@ -459,8 +461,7 @@ def _resolve_accum(stmt: Accum, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
     """Emit ``Loop(fresh_reduce_axis, [Accum(bound, value_bound, op)])`` at
     ``d.demand_scope``. The Accum's value is queued under σ extended with
     the fresh reduce-axis binding."""
-    encs = ctx.consumer_enc if d.origin == "consumer" else ctx.producer_enc
-    full_enc = encs[stmt.name]
+    full_enc = ctx.loops[d.origin].enc[stmt.name]
     orig_axis = full_enc.enclosing[-1]
     fresh_name = b.fresh(orig_axis.name)
     reduce_axis = Axis(name=fresh_name, extent=orig_axis.extent)
