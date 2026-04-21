@@ -217,7 +217,6 @@ class _LoopMeta:
     enc: dict[str, _Scope]
     writes: list[tuple[Write, _Scope]]
     axis_names: set[str]
-    source_remap: dict[int, int]
 
 
 @dataclass
@@ -248,7 +247,6 @@ class _Ctx:
                 enc=p_enc,
                 writes=p_writes,
                 axis_names={a.name for a in producer.axes},
-                source_remap={},
             ),
             "consumer": _LoopMeta(
                 op=consumer,
@@ -257,26 +255,9 @@ class _Ctx:
                 enc=c_enc,
                 writes=c_writes,
                 axis_names={a.name for a in consumer.axes},
-                source_remap=_build_consumer_source_remap(producer, consumer, source),
             ),
         }
         return cls(loops=loops, source=source, producer_write=prod_write)
-
-
-def _build_consumer_source_remap(producer: LoopOp, consumer: LoopOp, source: int) -> dict[int, int]:
-    """Consumer-origin Load sources shift past producer's inputs. The
-    spliced source is dropped (those Loads don't survive). Producer-origin
-    Loads keep their original sources — producer inputs come first in the
-    merged kernel's input list."""
-    n_prod = producer.num_inputs
-    remap: dict[int, int] = {}
-    next_src = n_prod
-    for i in range(consumer.num_inputs):
-        if i == source:
-            continue
-        remap[i] = next_src
-        next_src += 1
-    return remap
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +420,15 @@ def _resolve_plain(stmt: Stmt, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
 
 
 def _resolve_plain_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
-    """A Load that doesn't target the producer — remap source, σ-sub index."""
-    new_src = ctx.loops[d.origin].source_remap.get(stmt.source, stmt.source)
+    """A Load that doesn't target the producer — remap source, σ-sub index.
+    Producer inputs occupy [0, n_prod) in the merged kernel; consumer's
+    surviving inputs shift to [n_prod, ...), skipping the spliced slot."""
+    if d.origin == "consumer":
+        n_prod = ctx.loops["producer"].op.num_inputs
+        s = stmt.source
+        new_src = n_prod + (s if s < ctx.source else s - 1)
+    else:
+        new_src = stmt.source
     new_index = tuple(substitute(e, d.sigma) for e in stmt.index)
     b.insert(Load(name=d.bound_as, source=new_src, index=new_index), d.demand_scope)
 
