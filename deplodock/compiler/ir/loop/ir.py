@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.expr import Expr, Literal, substitute
+from deplodock.compiler.ir.expr import Expr, Literal, Sigma
 from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
@@ -90,7 +90,7 @@ class Stmt:
         """SSA names this stmt reads — its 'requirements'."""
         raise NotImplementedError
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: dict[str, Expr]) -> Stmt:
+    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
         """Return a copy with ``new_name`` as the SSA binding, SSA refs
         remapped via ``resolved``, and ``sigma`` substituted into every
         ``Expr`` subterm. Only meaningful for SSA-binding stmts (``Load``,
@@ -117,8 +117,8 @@ class Load(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: dict[str, Expr]) -> Stmt:
-        return Load(name=new_name, source=self.source, index=tuple(substitute(e, sigma) for e in self.index))
+    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
+        return Load(name=new_name, source=self.source, index=tuple(sigma.apply(e) for e in self.index))
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ class Assign(Stmt):
     def deps(self) -> tuple[str, ...]:
         return self.args
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: dict[str, Expr]) -> Stmt:
+    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
         return Assign(name=new_name, op=self.op, args=tuple(resolved[a] for a in self.args))
 
 
@@ -198,7 +198,7 @@ class Accum(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: dict[str, Expr]) -> Stmt:
+    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
         return Accum(name=new_name, value=resolved[self.value], op=self.op)
 
 
@@ -249,10 +249,10 @@ class Select(Stmt):
     def deps(self) -> tuple[str, ...]:
         return tuple(b.value for b in self.branches)
 
-    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: dict[str, Expr]) -> Stmt:
+    def rewrite(self, new_name: str, resolved: dict[str, str], sigma: Sigma) -> Stmt:
         return Select(
             name=new_name,
-            branches=tuple(SelectBranch(value=resolved[b.value], select=substitute(b.select, sigma)) for b in self.branches),
+            branches=tuple(SelectBranch(value=resolved[b.value], select=sigma.apply(b.select)) for b in self.branches),
         )
 
 

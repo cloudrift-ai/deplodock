@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var, render, substitute
+from deplodock.compiler.ir.expr import Expr, Literal, Sigma, Var
 from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
@@ -51,6 +51,12 @@ class _NotSupported(Exception):
     """Pattern not handled — caller converts to ``None`` return."""
 
 
+# Binding keys for the splicer's dedup tables. ``origin`` is the loop tag
+# ("producer" | "consumer"), ``name`` is the SSA name in that loop.
+_PlainKey = tuple[str, str, Sigma]  # (origin, name, sigma)
+_AccumKey = tuple[str, str, tuple[str, ...]]  # (origin, name, required_c_axes)
+
+
 # ---------------------------------------------------------------------------
 # Demand — one pending worklist entry
 # ---------------------------------------------------------------------------
@@ -67,14 +73,9 @@ class _Demand:
 
     name: str
     origin: str  # "producer" | "consumer"
-    sigma: dict[str, Expr]
+    sigma: Sigma
     demand_scope: Scope
     bound_as: str
-
-
-def _sigma_key(sigma: dict[str, Expr]) -> tuple[tuple[str, str], ...]:
-    """Hashable key for σ — (k, render(v)) pairs sorted by k."""
-    return tuple(sorted((k, render(v)) for k, v in sigma.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -96,13 +97,13 @@ class LoopBuilder:
         self._body: tuple[Stmt, ...] = ()
         self._used: set[str] = set(used_names)
         self._pending: deque[_Demand] = deque()
-        # Key: (origin, name, σ-key). Plain deps dedupe by σ — two refs to
-        # the same producer name under different σs emit twice.
-        self._plain_binding: dict[tuple[str, str, tuple[tuple[str, str], ...]], str] = {}
-        # Key: (origin, name, required_c_axes). Accums dedupe by the
-        # σ-mapped enclosing axes — same accum at different scopes emits
-        # twice (SDPA's QK^T at softmax-max vs softmax-output).
-        self._accum_binding: dict[tuple[str, str, tuple[str, ...]], str] = {}
+        # Plain deps dedupe by σ — two refs to the same producer name under
+        # different σs emit twice.
+        self._plain_binding: dict[_PlainKey, str] = {}
+        # Accums dedupe by the σ-mapped enclosing axes — same accum at
+        # different scopes emits twice (SDPA's QK^T at softmax-max vs
+        # softmax-output).
+        self._accum_binding: dict[_AccumKey, str] = {}
 
     def fresh(self, hint: str) -> str:
         if hint not in self._used:
@@ -124,11 +125,11 @@ class LoopBuilder:
     def has_deps(self) -> bool:
         return bool(self._pending)
 
-    def seen_plain(self, origin: str, name: str, sigma: dict[str, Expr]) -> str | None:
-        return self._plain_binding.get((origin, name, _sigma_key(sigma)))
+    def seen_plain(self, origin: str, name: str, sigma: Sigma) -> str | None:
+        return self._plain_binding.get((origin, name, sigma))
 
-    def bind_plain(self, origin: str, name: str, sigma: dict[str, Expr], bound_as: str) -> None:
-        self._plain_binding[(origin, name, _sigma_key(sigma))] = bound_as
+    def bind_plain(self, origin: str, name: str, sigma: Sigma, bound_as: str) -> None:
+        self._plain_binding[(origin, name, sigma)] = bound_as
 
     def seen_accum(self, origin: str, name: str, required: tuple[str, ...]) -> str | None:
         return self._accum_binding.get((origin, name, required))
@@ -232,7 +233,7 @@ def _has_nested_accums(stmts: tuple[Stmt, ...], inside_accum_loop: bool = False)
 
 def _seed(ctx: _Ctx, b: LoopBuilder) -> None:
     for w, scope in ctx.loops["consumer"].writes:
-        v_bound = _ensure_dep(w.value, "consumer", {}, scope, ctx, b)
+        v_bound = _ensure_dep(w.value, "consumer", Sigma(), scope, ctx, b)
         b.insert(Write(output=w.output, index=w.index, value=v_bound), scope)
 
 
@@ -244,7 +245,7 @@ def _seed(ctx: _Ctx, b: LoopBuilder) -> None:
 def _ensure_dep(
     name: str,
     origin: str,
-    sigma: dict[str, Expr],
+    sigma: Sigma,
     ref_scope: Scope,
     ctx: _Ctx,
     b: LoopBuilder,
@@ -270,7 +271,7 @@ def _ensure_dep(
         bound = b.fresh(name)
         b.bind_accum(origin, name, required, bound)
         accum_enc = _scope_for_axes(ref_scope, required)
-        b.queue(_Demand(name=name, origin=origin, sigma=dict(sigma), demand_scope=accum_enc, bound_as=bound))
+        b.queue(_Demand(name=name, origin=origin, sigma=sigma, demand_scope=accum_enc, bound_as=bound))
         return bound
 
     existing = b.seen_plain(origin, name, sigma)
@@ -292,7 +293,7 @@ def _ensure_dep(
         def_scope = ref_scope
     else:
         def_scope = _scope_for_axes(ref_scope, required_axes)
-    b.queue(_Demand(name=name, origin=origin, sigma=dict(sigma), demand_scope=def_scope, bound_as=bound))
+    b.queue(_Demand(name=name, origin=origin, sigma=sigma, demand_scope=def_scope, bound_as=bound))
     return bound
 
 
@@ -334,7 +335,7 @@ def _resolve_plain_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> No
         new_src = n_prod + (s if s < ctx.source else s - 1)
     else:
         new_src = stmt.source
-    new_index = tuple(substitute(e, d.sigma) for e in stmt.index)
+    new_index = tuple(d.sigma.apply(e) for e in stmt.index)
     b.insert(Load(name=d.bound_as, source=new_src, index=new_index), d.demand_scope)
 
 
@@ -346,7 +347,7 @@ def _resolve_producer_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) ->
     prod_write = next((w for w, _ in producer.writes if w.output == 0), None)
     if prod_write is None:
         raise _NotSupported
-    effective_index = tuple(substitute(e, d.sigma) for e in stmt.index)
+    effective_index = tuple(d.sigma.apply(e) for e in stmt.index)
     sigma = _solve_sigma(prod_write.index, effective_index, {a.name for a in producer.op.axes})
     if sigma is None:
         raise _NotSupported
@@ -362,8 +363,7 @@ def _resolve_accum(stmt: Accum, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
     orig_axis = full_enc.enclosing[-1]
     fresh_name = b.fresh(orig_axis.name)
     reduce_axis = Axis(name=fresh_name, extent=orig_axis.extent)
-    inner_sigma = dict(d.sigma)
-    inner_sigma[orig_axis.name] = Var(fresh_name)
+    inner_sigma = d.sigma.extend(orig_axis.name, Var(fresh_name))
     inner_scope = Scope(enclosing=d.demand_scope.enclosing + (reduce_axis,))
     value_bound = _ensure_dep(stmt.value, d.origin, inner_sigma, inner_scope, ctx, b)
     b.insert(Accum(name=d.bound_as, value=value_bound, op=stmt.op), inner_scope)
@@ -398,7 +398,7 @@ def _scope_for_axes(ref_scope: Scope, required: tuple[str, ...]) -> Scope:
     return Scope(enclosing=ref_scope.enclosing[:k])
 
 
-def _remap_axis_name(axis: Axis, sigma: dict[str, Expr]) -> str:
+def _remap_axis_name(axis: Axis, sigma: Sigma) -> str:
     target = sigma.get(axis.name)
     if target is None:
         return axis.name
@@ -411,24 +411,24 @@ def _solve_sigma(
     writer: tuple[Expr, ...],
     reader: tuple[Expr, ...],
     producer_axes: set[str],
-) -> dict[str, Expr] | None:
+) -> Sigma | None:
     """Solve per-dim pairing ``writer[k] == reader[k]``. Supported writer
     forms: ``Var(a)`` (``a`` in ``producer_axes``) → bind ``a → reader[k]``;
     ``Literal(c)`` → no binding. Anything else → ``None``."""
     if len(writer) != len(reader):
         return None
-    sigma: dict[str, Expr] = {}
+    mapping: dict[str, Expr] = {}
     for w, r in zip(writer, reader, strict=True):
         if isinstance(w, Literal):
             continue
         if isinstance(w, Var) and w.name in producer_axes:
-            existing = sigma.get(w.name)
+            existing = mapping.get(w.name)
             if existing is not None and existing != r:
                 return None
-            sigma[w.name] = r
+            mapping[w.name] = r
             continue
         return None
-    return sigma
+    return Sigma(mapping)
 
 
 # ---------------------------------------------------------------------------
