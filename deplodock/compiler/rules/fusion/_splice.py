@@ -201,48 +201,49 @@ def _walk(
     ctx: _Ctx,
     scope: _Scope,
 ) -> tuple[tuple[Stmt, ...], list[_PendingAccum]]:
-    """Walk consumer stmts at the current scope. Return (new_body, bubble).
+    """Walk consumer stmts at the current scope.
 
-    ``bubble`` lists accumulators that must be materialized at an outer
-    scope (caller is responsible for flushing them at its level)."""
+    Shape at every step: process a stmt → get its rewritten form + any
+    pendings → flush pendings that match the current scope before the
+    rewritten stmts → bubble the rest upward. The caller does the same
+    one level out until every pending finds its scope."""
     out: list[Stmt] = []
     bubble: list[_PendingAccum] = []
 
     for s in c_stmts:
-        if isinstance(s, Loop):
-            inner_out, inner_bubble = _walk(s.body, ctx, scope.nest(s.axis))
-            here, up = _partition_pendings(inner_bubble, scope)
-            out.extend(_emit_accum_loops(here, ctx, scope))
-            out.append(Loop(axis=s.axis, body=inner_out))
-            bubble.extend(up)
-
-        elif isinstance(s, Load) and s.source == ctx.source:
-            sigma = _solve_sigma(_producer_write(ctx).index, s.index, _producer_axis_names(ctx))
-            if sigma is None:
-                raise _NotSupported
-            prod_stmts, new_pending, final_name = _emit(_producer_write(ctx).value, ctx, sigma)
-            here, up = _partition_pendings(new_pending, scope)
-            out.extend(_emit_accum_loops(here, ctx, scope))
-            out.extend(prod_stmts)
-            # Alias consumer's load name to producer's final value via a
-            # copy Assign. normalize's copy-elim pass will collapse it.
-            # The consumer's load.name is already in used_names (consumer
-            # SSA names were seeded up front) — that's fine, we're
-            # replacing the Load that bound it with this Assign.
-            out.append(Assign(name=s.name, op=ElementwiseOp("copy"), args=(final_name,)))
-            bubble.extend(up)
-
-        elif isinstance(s, Load):
-            # Consumer-origin Load (not the spliced source). Remap source
-            # index so it lands after the producer's inputs in the merged
-            # kernel's input list.
-            new_src = ctx.consumer_source_remap.get(s.source, s.source)
-            out.append(Load(name=s.name, source=new_src, index=s.index))
-
-        else:
-            out.append(s)
+        new_stmts, new_pending = _process_stmt(s, ctx, scope)
+        here, up = _partition_pendings(new_pending, scope)
+        out.extend(_emit_accum_loops(here, ctx, scope))
+        out.extend(new_stmts)
+        bubble.extend(up)
 
     return tuple(out), bubble
+
+
+def _process_stmt(s: Stmt, ctx: _Ctx, scope: _Scope) -> tuple[list[Stmt], list[_PendingAccum]]:
+    """Rewrite one consumer stmt at ``scope``. Returns the stmts to emit
+    (may be empty, one, or many) and any producer-accumulator pendings
+    the rewrite produced (for the caller to partition/flush/bubble)."""
+    if isinstance(s, Loop):
+        inner_out, inner_bubble = _walk(s.body, ctx, scope.nest(s.axis))
+        return [Loop(axis=s.axis, body=inner_out)], inner_bubble
+
+    if isinstance(s, Load) and s.source == ctx.source:
+        # Spliced Load: replace with the producer expression that computes
+        # its value, aliased via copy (normalize's copy-elim collapses it).
+        sigma = _solve_sigma(_producer_write(ctx).index, s.index, _producer_axis_names(ctx))
+        if sigma is None:
+            raise _NotSupported
+        prod_stmts, new_pending, final_name = _emit(_producer_write(ctx).value, ctx, sigma)
+        alias = Assign(name=s.name, op=ElementwiseOp("copy"), args=(final_name,))
+        return [*prod_stmts, alias], new_pending
+
+    if isinstance(s, Load):
+        # Consumer-origin Load: remap source past the producer's inputs.
+        new_src = ctx.consumer_source_remap.get(s.source, s.source)
+        return [Load(name=s.name, source=new_src, index=s.index)], []
+
+    return [s], []
 
 
 # ---------------------------------------------------------------------------
@@ -533,25 +534,36 @@ def _partition_pendings(
 ) -> tuple[list[_PendingAccum], list[_PendingAccum]]:
     """Split pendings into (flush-here, bubble-up).
 
-    - ``required_c_axes == scope.names`` → flush here.
-    - ``required_c_axes`` is a strict prefix of ``scope.names`` → bubble up.
-    - otherwise (longer, or non-prefix mismatch) → NotSupported.
+    An accumulator can live at any consumer scope whose axes cover its
+    ``required_c_axes`` (extra axes mean redundant iterations — correct,
+    just not LICM-optimal). We bubble pendings outward as long as the
+    caller's scope still covers the requirement; otherwise we flush at
+    this scope (the innermost that still covers — bubbling further would
+    drop a needed axis).
+
+    - ``required_c_axes`` ⊆ parent scope → bubble (there's a cleaner
+      outer home — the current axis isn't needed).
+    - ``required_c_axes`` ⊆ scope but not ⊆ parent → flush here (this is
+      the innermost scope that still has all the required axes, which
+      happens when ``scope.names[-1]`` is in the requirement, or when
+      the requirement contains an axis not present in any outer scope).
+    - ``required_c_axes`` ⊄ scope → NotSupported (an outer bubble
+      can't fix it; outer scopes have fewer axes).
     """
     names = scope.names
+    names_set = set(names)
+    parent_set = set(names[:-1]) if names else set()
     here: list[_PendingAccum] = []
     up: list[_PendingAccum] = []
     for p in pendings:
-        if p.required_c_axes == names:
-            here.append(p)
-        elif _is_strict_prefix(p.required_c_axes, names):
+        req = set(p.required_c_axes)
+        if not req.issubset(names_set):
+            raise _NotSupported
+        if req.issubset(parent_set):
             up.append(p)
         else:
-            raise _NotSupported
+            here.append(p)
     return here, up
-
-
-def _is_strict_prefix(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
-    return len(a) < len(b) and b[: len(a)] == a
 
 
 def _c_axis_name(r: Expr | None, ctx: _Ctx) -> str | None:
