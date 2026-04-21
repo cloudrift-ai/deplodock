@@ -56,8 +56,22 @@ class Axis:
 # ---------------------------------------------------------------------------
 
 
+class Stmt:
+    """Base class for loop-IR body statements.
+
+    Concrete stmts (``Load``, ``Assign``, ``Accum``, ``Select``, ``Write``,
+    ``Loop``) are frozen dataclasses that inherit from this base. Each
+    implements :meth:`deps` — the SSA names the stmt reads — so consumers
+    (splicer, validators) can query dependencies uniformly.
+    """
+
+    def deps(self) -> tuple[str, ...]:
+        """SSA names this stmt reads — its 'requirements'."""
+        raise NotImplementedError
+
+
 @dataclass(frozen=True)
-class Load:
+class Load(Stmt):
     """Read a value from an external input buffer into an SSA name.
 
     Each external-buffer read is an explicit body statement. ``source`` is
@@ -70,6 +84,9 @@ class Load:
     name: str
     source: int
     index: tuple[Expr, ...]
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +112,7 @@ ACCUM_IDENTITY: dict[str, float] = {
 
 
 @dataclass(frozen=True)
-class Assign:
+class Assign(Stmt):
     """Pure SSA body statement: ``name = op(args)``.
 
     ``op`` is always an ``ElementwiseOp`` (reductions live in ``Accum``).
@@ -107,9 +124,12 @@ class Assign:
     op: ElementwiseOp
     args: tuple[str, ...]
 
+    def deps(self) -> tuple[str, ...]:
+        return self.args
+
 
 @dataclass(frozen=True)
-class Accum:
+class Accum(Stmt):
     """Reduce accumulator — declares-and-folds in one statement.
 
     Semantics: ``name = op(name, value)`` inside the enclosing reduce
@@ -146,9 +166,12 @@ class Accum:
         field name so older reader code keeps working."""
         return self.op
 
+    def deps(self) -> tuple[str, ...]:
+        return (self.value,)
+
 
 @dataclass(frozen=True)
-class Write:
+class Write(Stmt):
     """Write an SSA value to output buffer ``output`` at position ``index``.
 
     ``output`` is an integer index into the program-level output-name
@@ -162,6 +185,9 @@ class Write:
     index: tuple[Expr, ...]
     value: str
 
+    def deps(self) -> tuple[str, ...]:
+        return (self.value,)
+
 
 @dataclass(frozen=True)
 class SelectBranch:
@@ -172,7 +198,7 @@ class SelectBranch:
 
 
 @dataclass(frozen=True)
-class Select:
+class Select(Stmt):
     """Coord-predicated value binding — replaces Mux.
 
     At each iteration coord, exactly one branch's ``select`` predicate
@@ -188,9 +214,12 @@ class Select:
         if not self.branches:
             raise ValueError("Select.branches must be non-empty")
 
+    def deps(self) -> tuple[str, ...]:
+        return tuple(b.value for b in self.branches)
+
 
 @dataclass(frozen=True)
-class Loop:
+class Loop(Stmt):
     """Explicit iteration block — one loop over an axis.
 
     ``body`` executes ``axis.extent`` times, once per axis value. Reduce-kind
@@ -207,8 +236,8 @@ class Loop:
     axis: Axis
     body: tuple[Stmt, ...]
 
-
-Stmt = Assign | Accum | Write | Select | Loop | Load
+    def deps(self) -> tuple[str, ...]:
+        return ()
 
 
 # ---------------------------------------------------------------------------

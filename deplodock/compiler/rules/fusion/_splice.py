@@ -316,27 +316,16 @@ def _emit(
             new_name = ctx.fresh(s.name)
             ssa_rename[s.name] = new_name
             collected.append((s, new_name))
-            needed.update(_ssa_deps(s))
+            needed.update(s.deps())
 
     visit(ctx.producer.body)
 
     emitted: list[Stmt] = []
     for s, new_name in reversed(collected):
-        resolved = {d: ssa_rename.get(d, d) for d in _ssa_deps(s)}
+        resolved = {d: ssa_rename.get(d, d) for d in s.deps()}
         emitted.append(_build_rewritten_stmt(s, new_name, resolved, sigma))
 
     return emitted, pending, ssa_rename.get(target, target)
-
-
-def _ssa_deps(defn: Stmt) -> tuple[str, ...]:
-    """SSA names the stmt reads — its 'requirements'."""
-    if isinstance(defn, Load):
-        return ()
-    if isinstance(defn, Assign):
-        return defn.args
-    if isinstance(defn, Select):
-        return tuple(b.value for b in defn.branches)
-    raise _NotSupported
 
 
 def _build_rewritten_stmt(
