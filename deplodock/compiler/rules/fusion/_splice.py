@@ -1,7 +1,7 @@
 """Worklist-driven splicer for adjacent ``LoopOp``s.
 
 Builds the merged body one statement at a time. Seed: every consumer
-``Write``. Each iteration pops one pending dep from ``LoopBuilder`` and
+``Write``. Each iteration pops one pending dep from ``_SpliceState`` and
 emits its def, queueing that def's own deps in turn. Three dep shapes:
 
 - **Consumer Load from the producer** — emit a copy alias at the demand
@@ -37,6 +37,7 @@ from deplodock.compiler.ir.loop import (
     Axis,
     Load,
     Loop,
+    LoopBuilder,
     LoopMeta,
     LoopOp,
     Scope,
@@ -79,23 +80,24 @@ class _Demand:
 
 
 # ---------------------------------------------------------------------------
-# LoopBuilder — the merged body + the worklist
+# _SpliceState — LoopBuilder plus the splicer's worklist and dedup tables
 # ---------------------------------------------------------------------------
 
 
-class LoopBuilder:
-    """Accumulates the merged body by inserting stmts one at a time.
+class _SpliceState(LoopBuilder):
+    """Body builder plus splicer bookkeeping.
 
-    ``insert`` is pure tree-splicing: given an enclosure path, descend
-    into the body creating ``Loop`` nodes as needed, and prepend the
-    stmt at the leaf. Worklist dep-resolution is reverse-topological —
-    producers demanded after consumers — so prepend always places
-    definitions before uses.
+    Inherits fresh-name allocation and scope-aware insertion from
+    ``LoopBuilder``; adds the worklist of pending demands and the two
+    dedup tables that keep the merged body minimal.
+
+    Worklist dep-resolution is reverse-topological — producers demanded
+    after consumers — so the builder's prepend-at-leaf behavior yields
+    defined-before-use ordering naturally.
     """
 
     def __init__(self, used_names: set[str]) -> None:
-        self._body: tuple[Stmt, ...] = ()
-        self._used: set[str] = set(used_names)
+        super().__init__(used_names)
         self._pending: deque[_Demand] = deque()
         # Plain deps dedupe by σ — two refs to the same producer name under
         # different σs emit twice.
@@ -104,17 +106,6 @@ class LoopBuilder:
         # different scopes emits twice (SDPA's QK^T at softmax-max vs
         # softmax-output).
         self._accum_binding: dict[_AccumKey, str] = {}
-
-    def fresh(self, hint: str) -> str:
-        if hint not in self._used:
-            self._used.add(hint)
-            return hint
-        i = 1
-        while f"{hint}_s{i}" in self._used:
-            i += 1
-        name = f"{hint}_s{i}"
-        self._used.add(name)
-        return name
 
     def queue(self, demand: _Demand) -> None:
         self._pending.append(demand)
@@ -136,25 +127,6 @@ class LoopBuilder:
 
     def bind_accum(self, origin: str, name: str, required: tuple[str, ...], bound_as: str) -> None:
         self._accum_binding[(origin, name, required)] = bound_as
-
-    def insert(self, stmt: Stmt, enclosure: Scope) -> None:
-        self._body = _prepend_at(self._body, enclosure.enclosing, stmt)
-
-    def finish(self) -> tuple[Stmt, ...]:
-        return self._body
-
-
-def _prepend_at(body: tuple[Stmt, ...], path: tuple[Axis, ...], stmt: Stmt) -> tuple[Stmt, ...]:
-    """Descend ``body`` following ``path``; create missing ``Loop`` nodes;
-    prepend ``stmt`` at the leaf."""
-    if not path:
-        return (stmt,) + tuple(body)
-    head, rest = path[0], path[1:]
-    for i, s in enumerate(body):
-        if isinstance(s, Loop) and s.axis == head:
-            new_inner = _prepend_at(s.body, rest, stmt)
-            return tuple(body[:i]) + (Loop(axis=head, body=new_inner),) + tuple(body[i + 1 :])
-    return (Loop(axis=head, body=_prepend_at((), rest, stmt)),) + tuple(body)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +172,7 @@ def splice_loop_ops(
         return None
     try:
         ctx = _Ctx.build(producer, consumer, source)
-        b = LoopBuilder(used_names=_collect_names(producer) | _collect_names(consumer))
+        b = _SpliceState(used_names=_collect_names(producer) | _collect_names(consumer))
         _seed(ctx, b)
         while b.has_deps():
             d = b.take()
@@ -231,7 +203,7 @@ def _has_nested_accums(stmts: tuple[Stmt, ...], inside_accum_loop: bool = False)
 # ---------------------------------------------------------------------------
 
 
-def _seed(ctx: _Ctx, b: LoopBuilder) -> None:
+def _seed(ctx: _Ctx, b: _SpliceState) -> None:
     for w, scope in ctx.loops["consumer"].writes:
         v_bound = _ensure_dep(w.value, "consumer", Sigma(), scope, ctx, b)
         b.insert(Write(output=w.output, index=w.index, value=v_bound), scope)
@@ -248,7 +220,7 @@ def _ensure_dep(
     sigma: Sigma,
     ref_scope: Scope,
     ctx: _Ctx,
-    b: LoopBuilder,
+    b: _SpliceState,
 ) -> str:
     """Return the merged-body name bound to ``(origin, name, σ)``. Queue a
     new demand if this is the first reference.
@@ -302,7 +274,7 @@ def _ensure_dep(
 # ---------------------------------------------------------------------------
 
 
-def _resolve(d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+def _resolve(d: _Demand, ctx: _Ctx, b: _SpliceState) -> None:
     stmt = ctx.loops[d.origin].defs[d.name]
 
     if isinstance(stmt, Load):
@@ -318,14 +290,14 @@ def _resolve(d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
         raise _NotSupported
 
 
-def _resolve_plain(stmt: Stmt, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+def _resolve_plain(stmt: Stmt, d: _Demand, ctx: _Ctx, b: _SpliceState) -> None:
     """Generic Assign / Select emission — rewrite the stmt with fresh args
     and σ-substituted Exprs, insert at ``d.demand_scope``."""
     resolved = {arg: _ensure_dep(arg, d.origin, d.sigma, d.demand_scope, ctx, b) for arg in stmt.deps()}
     b.insert(stmt.rewrite(d.bound_as, resolved, d.sigma), d.demand_scope)
 
 
-def _resolve_plain_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+def _resolve_plain_load(stmt: Load, d: _Demand, ctx: _Ctx, b: _SpliceState) -> None:
     """A Load that doesn't target the producer — remap source, σ-sub index.
     Producer inputs occupy [0, n_prod) in the merged kernel; consumer's
     surviving inputs shift to [n_prod, ...), skipping the spliced slot."""
@@ -339,7 +311,7 @@ def _resolve_plain_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> No
     b.insert(Load(name=d.bound_as, source=new_src, index=new_index), d.demand_scope)
 
 
-def _resolve_producer_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+def _resolve_producer_load(stmt: Load, d: _Demand, ctx: _Ctx, b: _SpliceState) -> None:
     """A consumer Load that targets the producer — emit a copy alias and
     queue the producer's ``Write.value`` under the solved σ. The producer's
     expression chain reconstructs piecemeal in subsequent iterations."""
@@ -355,7 +327,7 @@ def _resolve_producer_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) ->
     b.insert(Assign(name=d.bound_as, op=ElementwiseOp("copy"), args=(v_bound,)), d.demand_scope)
 
 
-def _resolve_accum(stmt: Accum, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+def _resolve_accum(stmt: Accum, d: _Demand, ctx: _Ctx, b: _SpliceState) -> None:
     """Emit ``Loop(fresh_reduce_axis, [Accum(bound, value_bound, op)])`` at
     ``d.demand_scope``. The Accum's value is queued under σ extended with
     the fresh reduce-axis binding."""

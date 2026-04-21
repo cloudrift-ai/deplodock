@@ -17,6 +17,7 @@ plan-module's ``Loop`` and ``Inline`` (which collide with ``ir.Loop``),
 import from :mod:`.plan` explicitly.
 """
 
+from deplodock.compiler.ir.loop.builder import LoopBuilder
 from deplodock.compiler.ir.loop.ir import (
     ACCUM_IDENTITY,
     Accum,
@@ -46,6 +47,7 @@ __all__ = [
     "KernelPlan",
     "Load",
     "Loop",
+    "LoopBuilder",
     "LoopMeta",
     "LoopOp",
     "Scope",
