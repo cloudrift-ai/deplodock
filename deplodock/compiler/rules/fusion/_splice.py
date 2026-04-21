@@ -1,44 +1,36 @@
-"""Consumer-driven recursive splicing of two adjacent ``LoopOp``s.
+"""Worklist-driven splicer for adjacent ``LoopOp``s.
 
-Fuses a producer/consumer pair by walking the consumer body and, at every
-``Load`` that targets the producer's output, reverse-reconstructing the
-producer expression that computed that value. Producer accumulators are
-hoisted lazily to the consumer scope where they belong (the scope whose
-enclosing axes match σ(enclosing producer axes)).
+Builds the merged body one statement at a time. Seed: every consumer
+``Write``. Each iteration pops one pending dep from ``LoopBuilder`` and
+emits its def, queueing that def's own deps in turn. Three dep shapes:
 
-Algorithm outline:
+- **Consumer Load from the producer** — emit a copy alias at the demand
+  scope; queue the producer's ``Write.value`` under σ = solve(writer,
+  reader). The producer's expression chain lands piecemeal over
+  subsequent iterations.
+- **Accum (producer or consumer)** — freshen the reduce axis, place a
+  new ``Loop(reduce_axis, Accum(...))`` at ``_accum_enclosure`` of the
+  demand scope, and queue the Accum's ``value``. Scope-keyed dedup:
+  the same Accum demanded at different ``required_c_axes`` gets two
+  separate materializations (SDPA's QK^T at softmax-max vs output).
+- **Plain Assign / Select / Load(non-producer source)** — ``rewrite``
+  the original stmt with fresh names and σ-substituted Exprs; insert at
+  the stmt's natural scope (consumer: σ-remapped enclosing, which for
+  consumer origin is usually identity; producer: σ-remapped enclosing).
 
-- ``walk`` descends the consumer body. It emits rewritten stmts and returns
-  a ``bubble`` of accumulators that still need to be materialized at an
-  outer scope.
-- At a consumer Load of the producer (and at each accumulator materialization),
-  ``emit`` walks producer SSA from a target name back to its Loads via
-  DFS and emits each stmt on the unwind. The result lands in forward
-  dependency order, freshened and σ-applied. Accum references terminate
-  the walk as ``PendingAccum`` entries.
-- ``emit_accum_loops`` materializes a pending accumulator's reduce Loop
-  at the current scope by calling ``emit`` on the Accum's value and
-  appending a final ``Accum`` stmt that folds into the canonical binding.
-  Scope-keyed: an accumulator needed at distinct consumer scopes gets
-  separate emissions (SDPA's QK^T reduce inside softmax-max vs inside
-  the output-K free loop).
-- Consumer Loads whose source is not the producer get their source index
-  bumped inline in ``walk`` (producer's inputs are prepended to the merged
-  kernel's input list).
-
-Sibling reduce axis unification is handled by
-``ir/loop/normalize.py::unify_sibling_reduce_axes`` in
-``LoopOp.__post_init__``, so the splicer doesn't need to track it here.
-
-Returns ``None`` when the pattern isn't supported: σ fails, accumulator
-scope can't be reached, or ``LoopOp`` validation fails on the merged body.
+``LoopBuilder.insert`` is pure tree-splicing: descend the body along
+the enclosure path, creating ``Loop`` nodes if missing, prepend at the
+leaf. Always-prepend yields defined-before-use ordering naturally,
+because the worklist resolves deps in reverse-topological order —
+consumers demand before producers.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var
+from deplodock.compiler.ir.expr import Expr, Literal, Var, render, substitute
 from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
@@ -58,73 +50,12 @@ class _NotSupported(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Per-accumulator data extracted on demand from the producer
+# Scope — consumer-namespace axis chain
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class _AccumRef:
-    """An unresolved producer-Accum reference: the ``name`` identifies which
-    Accum, ``sigma`` is the σ active at the reference site (used at
-    materialization to rebuild the same ``required_c_axes`` → same bound
-    name via ``ctx.name_for_accum``)."""
-
-    name: str
-    sigma: dict[str, Expr]
-
-
-@dataclass
-class _Ctx:
-    """Per-splice state: one instance lives for the entire recursive walk.
-
-    Holds the splice's invariants (producer, consumer, target source) plus
-    the naming and materialization bookkeeping that must persist across
-    every call in the recursion."""
-
-    producer: LoopOp
-    consumer: LoopOp
-    source: int
-    producer_inputs: list[str]
-    consumer_inputs: list[str]
-    used_names: set[str] = field(default_factory=set)
-    # Scope-keyed: (producer_accum_name, required_consumer_axes) → consumer-side binding.
-    # Same accum at different scopes gets different bindings because its value
-    # varies per-outer-iteration (e.g. SDPA's QK^T reduce inside softmax's K loop
-    # vs inside the output free loop).
-    accum_name: dict[tuple[str, tuple[str, ...]], str] = field(default_factory=dict)
-    consumer_source_remap: dict[int, int] = field(default_factory=dict)
-    materialized: set[tuple[str, tuple[str, ...]]] = field(default_factory=set)
-
-    def fresh(self, hint: str) -> str:
-        name = hint
-        i = 1
-        while name in self.used_names:
-            name = f"{hint}_s{i}"
-            i += 1
-        self.used_names.add(name)
-        return name
-
-    def name_for_accum(self, prod_name: str, scope: tuple[str, ...]) -> str:
-        key = (prod_name, scope)
-        existing = self.accum_name.get(key)
-        if existing is not None:
-            return existing
-        new = self.fresh(prod_name)
-        self.accum_name[key] = new
-        return new
 
 
 @dataclass(frozen=True)
 class _Scope:
-    """An axis chain used two ways:
-
-    - As consumer walk position: every recursive step into a ``Loop``
-      produces a new ``_Scope`` via :meth:`nest`; the pre-nest value
-      stays alive in the caller and is what we return to.
-    - As producer enclosing, σ-remapped into consumer namespace via
-      :meth:`remap`, so it can be compared against a consumer scope.
-    """
-
     enclosing: tuple[Axis, ...] = ()
 
     @property
@@ -134,255 +65,202 @@ class _Scope:
     def nest(self, axis: Axis) -> _Scope:
         return _Scope(enclosing=self.enclosing + (axis,))
 
-    def remap(self, sigma: dict[str, Expr]) -> _Scope:
-        """σ-remap each axis name"""
-        out: list[Axis] = []
-        for a in self.enclosing:
-            r = sigma.get(a.name)
-            out.append(Axis(name=r.name, extent=a.extent))
-        return _Scope(enclosing=tuple(out))
-
-    def __eq__(self, other):
-        return frozenset(a.name for a in self.enclosing) == frozenset(a.name for a in other.enclosing)
-
 
 # ---------------------------------------------------------------------------
-# Public API
+# Demand — one pending worklist entry
 # ---------------------------------------------------------------------------
 
 
-def splice_loop_ops(
-    producer: LoopOp,
-    consumer: LoopOp,
-    source: int,
-    *,
-    producer_inputs: list[str] | None = None,
-    consumer_inputs: list[str] | None = None,
-) -> LoopOp | None:
-    """Splice ``producer``'s body into every ``consumer`` Load that targets
-    ``source``. Returns ``None`` when the pattern isn't supported."""
-    try:
-        p_inputs = list(producer_inputs or [])
-        c_inputs = list(consumer_inputs or [])
-        ctx = _Ctx(
+@dataclass
+class _Demand:
+    """A pending dep in the worklist.
+
+    ``bound_as`` is the fresh name the dep's def will bind in the merged
+    body — allocated at queue time so callers can reference it without
+    waiting for resolution.
+    """
+
+    name: str
+    origin: str  # "producer" | "consumer"
+    sigma: dict[str, Expr]
+    demand_scope: _Scope
+    bound_as: str
+
+
+def _sigma_key(sigma: dict[str, Expr]) -> tuple[tuple[str, str], ...]:
+    """Hashable key for σ — (k, render(v)) pairs sorted by k."""
+    return tuple(sorted((k, render(v)) for k, v in sigma.items()))
+
+
+# ---------------------------------------------------------------------------
+# LoopBuilder — the merged body + the worklist
+# ---------------------------------------------------------------------------
+
+
+class LoopBuilder:
+    """Accumulates the merged body by inserting stmts one at a time.
+
+    ``insert`` is pure tree-splicing: given an enclosure path, descend
+    into the body creating ``Loop`` nodes as needed, and prepend the
+    stmt at the leaf. Worklist dep-resolution is reverse-topological —
+    producers demanded after consumers — so prepend always places
+    definitions before uses.
+    """
+
+    def __init__(self, used_names: set[str]) -> None:
+        self._body: tuple[Stmt, ...] = ()
+        self._used: set[str] = set(used_names)
+        self._pending: deque[_Demand] = deque()
+        # Key: (origin, name, σ-key). Plain deps dedupe by σ — two refs to
+        # the same producer name under different σs emit twice.
+        self._plain_binding: dict[tuple[str, str, tuple[tuple[str, str], ...]], str] = {}
+        # Key: (origin, name, required_c_axes). Accums dedupe by the
+        # σ-mapped enclosing axes — same accum at different scopes emits
+        # twice (SDPA's QK^T at softmax-max vs softmax-output).
+        self._accum_binding: dict[tuple[str, str, tuple[str, ...]], str] = {}
+
+    def fresh(self, hint: str) -> str:
+        if hint not in self._used:
+            self._used.add(hint)
+            return hint
+        i = 1
+        while f"{hint}_s{i}" in self._used:
+            i += 1
+        name = f"{hint}_s{i}"
+        self._used.add(name)
+        return name
+
+    def queue(self, demand: _Demand) -> None:
+        self._pending.append(demand)
+
+    def take(self) -> _Demand | None:
+        return self._pending.popleft() if self._pending else None
+
+    def has_deps(self) -> bool:
+        return bool(self._pending)
+
+    def seen_plain(self, origin: str, name: str, sigma: dict[str, Expr]) -> str | None:
+        return self._plain_binding.get((origin, name, _sigma_key(sigma)))
+
+    def bind_plain(self, origin: str, name: str, sigma: dict[str, Expr], bound_as: str) -> None:
+        self._plain_binding[(origin, name, _sigma_key(sigma))] = bound_as
+
+    def seen_accum(self, origin: str, name: str, required: tuple[str, ...]) -> str | None:
+        return self._accum_binding.get((origin, name, required))
+
+    def bind_accum(self, origin: str, name: str, required: tuple[str, ...], bound_as: str) -> None:
+        self._accum_binding[(origin, name, required)] = bound_as
+
+    def insert(self, stmt: Stmt, enclosure: _Scope) -> None:
+        self._body = _prepend_at(self._body, enclosure.enclosing, stmt)
+
+    def finish(self) -> tuple[Stmt, ...]:
+        return self._body
+
+
+def _prepend_at(body: tuple[Stmt, ...], path: tuple[Axis, ...], stmt: Stmt) -> tuple[Stmt, ...]:
+    """Descend ``body`` following ``path``; create missing ``Loop`` nodes;
+    prepend ``stmt`` at the leaf."""
+    if not path:
+        return (stmt,) + tuple(body)
+    head, rest = path[0], path[1:]
+    for i, s in enumerate(body):
+        if isinstance(s, Loop) and s.axis == head:
+            new_inner = _prepend_at(s.body, rest, stmt)
+            return tuple(body[:i]) + (Loop(axis=head, body=new_inner),) + tuple(body[i + 1 :])
+    return (Loop(axis=head, body=_prepend_at((), rest, stmt)),) + tuple(body)
+
+
+# ---------------------------------------------------------------------------
+# Body analysis
+# ---------------------------------------------------------------------------
+
+
+def _analyze(body: tuple[Stmt, ...]) -> tuple[dict[str, Stmt], dict[str, _Scope], list[tuple[Write, _Scope]]]:
+    """Walk ``body`` once; return (name→stmt, name→enclosing-scope, [(Write, scope), ...]).
+
+    For Accums, the recorded enclosing scope INCLUDES the reduce axis at
+    its tail (callers strip it via ``enclosing[:-1]`` to get the binding
+    scope).
+    """
+    defs: dict[str, Stmt] = {}
+    encs: dict[str, _Scope] = {}
+    writes: list[tuple[Write, _Scope]] = []
+
+    def walk(stmts: tuple[Stmt, ...], scope: _Scope) -> None:
+        for s in stmts:
+            if isinstance(s, Loop):
+                walk(s.body, _Scope(enclosing=scope.enclosing + (s.axis,)))
+            elif isinstance(s, (Load, Assign, Select)):
+                defs[s.name] = s
+                encs[s.name] = scope
+            elif isinstance(s, Accum):
+                defs[s.name] = s
+                encs[s.name] = scope
+            elif isinstance(s, Write):
+                writes.append((s, scope))
+
+    walk(body, _Scope())
+    return defs, encs, writes
+
+
+# ---------------------------------------------------------------------------
+# Context — per-splice frozen analysis
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Ctx:
+    producer: LoopOp
+    consumer: LoopOp
+    source: int
+    producer_inputs: list[str]
+    consumer_inputs: list[str]
+    producer_defs: dict[str, Stmt]
+    producer_enc: dict[str, _Scope]
+    consumer_defs: dict[str, Stmt]
+    consumer_enc: dict[str, _Scope]
+    consumer_writes: list[tuple[Write, _Scope]]
+    producer_write: Write
+    producer_axis_names: set[str]
+    consumer_source_remap: dict[int, int]
+
+    @classmethod
+    def build(
+        cls,
+        producer: LoopOp,
+        consumer: LoopOp,
+        source: int,
+        producer_inputs: list[str],
+        consumer_inputs: list[str],
+    ) -> _Ctx:
+        p_defs, p_enc, p_writes = _analyze(producer.body)
+        c_defs, c_enc, c_writes = _analyze(consumer.body)
+        prod_write = next((w for w, _ in p_writes if w.output == 0), None)
+        if prod_write is None:
+            raise _NotSupported
+        return cls(
             producer=producer,
             consumer=consumer,
             source=source,
-            producer_inputs=p_inputs,
-            consumer_inputs=c_inputs,
-            used_names=_collect_names(producer) | _collect_names(consumer),
+            producer_inputs=producer_inputs,
+            consumer_inputs=consumer_inputs,
+            producer_defs=p_defs,
+            producer_enc=p_enc,
+            consumer_defs=c_defs,
+            consumer_enc=c_enc,
+            consumer_writes=c_writes,
+            producer_write=prod_write,
+            producer_axis_names={a.name for a in producer.axes},
             consumer_source_remap=_build_consumer_source_remap(producer, consumer, source),
         )
-        new_body, bubble = _walk(consumer.body, ctx, _Scope())
-        if bubble:
-            return None
-        # Sibling reduce-axis unification runs in LoopOp.__post_init__ via
-        # ir/loop/normalize.py::unify_sibling_reduce_axes.
-        return LoopOp(body=new_body)
-    except _NotSupported:
-        return None
-    except ValueError:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Recursion core
-# ---------------------------------------------------------------------------
-
-
-def _walk(
-    c_stmts: tuple[Stmt, ...],
-    ctx: _Ctx,
-    scope: _Scope,
-) -> tuple[tuple[Stmt, ...], list[_AccumRef]]:
-    """Walk consumer stmts at the current scope.
-
-    Shape at every step: rewrite a stmt → for each accum reference it
-    produced, ask ``_emit_accum`` to materialize at this scope or bubble
-    outward → emit the materializations before the rewritten stmt →
-    bubble the rest upward.
-
-    Rewrite cases:
-    - ``Loop``: recurse into the body at a nested scope; its inner bubble
-      becomes this stmt's accum refs.
-    - ``Load`` targeting the spliced source: replace with the producer
-      expression that computes the value, aliased via copy (normalize's
-      copy-elim collapses the alias).
-    - ``Load`` from any other source: remap the source past the producer's
-      inputs.
-    - anything else: keep as-is.
-    """
-
-    def visit(stmts: tuple[Stmt, ...], scope: _Scope) -> tuple[tuple[Stmt, ...], list[_AccumRef]]:
-        out: list[Stmt] = []
-        bubble: list[_AccumRef] = []
-        for s in stmts:
-            if isinstance(s, Loop):
-                inner_out, new_refs = visit(s.body, scope.nest(s.axis))
-                new_stmts: list[Stmt] = [Loop(axis=s.axis, body=inner_out)]
-            elif isinstance(s, Load) and s.source == ctx.source:
-                sigma = _solve_sigma(_producer_write(ctx).index, s.index, _producer_axis_names(ctx))
-                if sigma is None:
-                    raise _NotSupported
-                prod_stmts, new_refs, final_name = _emit(_producer_write(ctx).value, ctx, sigma, scope)
-                new_stmts = [*prod_stmts, Assign(name=s.name, op=ElementwiseOp("copy"), args=(final_name,))]
-            elif isinstance(s, Load):
-                new_src = ctx.consumer_source_remap.get(s.source, s.source)
-                new_stmts = [Load(name=s.name, source=new_src, index=s.index)]
-                new_refs = []
-            else:
-                new_stmts = [s]
-                new_refs = []
-            for ref in new_refs:
-                ref_stmts, ref_bubble, _ = _emit(ref.name, ctx, ref.sigma, scope)
-                out.extend(ref_stmts)
-                bubble.extend(ref_bubble)
-            out.extend(new_stmts)
-        return tuple(out), bubble
-
-    return visit(c_stmts, scope)
-
-
-# ---------------------------------------------------------------------------
-# Demand-driven emission: produce a target SSA value from the producer
-# ---------------------------------------------------------------------------
-
-
-def _emit(
-    target: str,
-    ctx: _Ctx,
-    sigma: dict[str, Expr],
-    scope: _Scope,
-) -> tuple[list[Stmt], list[_AccumRef], str]:
-    """Emit the consumer-side stmts that bind ``target``.
-
-    Walks the producer tree in reverse program order carrying a live set.
-    When a visited stmt's name is in the live set, freshen it, cache the
-    rename, and add its SSA deps to the live set — so defs earlier in
-    program order (visited later in reverse) get pulled in transitively.
-    Producer Accum defs encountered via deps are packaged as ``_AccumRef``
-    for the caller to bubble back into ``_emit`` at the right outer scope.
-    ``scope`` is the consumer scope these stmts will land in; each emitted
-    stmt's producer enclosing must σ-resolve to exactly that (effective)
-    scope.
-
-    Accum-as-target: we don't know up front whether ``target`` names an
-    Accum — the walk discovers it. When ``visit`` hits the target Accum,
-    it does a partition-by-scope check (bubble to outer, skip if already
-    materialized, else materialize). Materializing = freshen reduce axis,
-    extend the effective σ with it, nest the effective scope, add the
-    Accum's value to ``needed``. The remaining walk pulls in the value's
-    SSA chain under the new σ/scope. A postamble wraps that chain in the
-    reduce Loop and appends the Accum fold. Nested accums encountered
-    inside the body bubble back through ``_emit`` at the outer scope.
-    """
-    refs: list[_AccumRef] = []
-    ssa_rename: dict[str, str] = {}
-    needed: set[str] = {target}
-    collected: list[tuple[Stmt, str, dict[str, Expr]]] = []  # (stmt, fresh_name, σ-at-collection)
-    outer_scope = scope
-    wrapper: Axis | None = None  # reduce axis for the target accum's Loop, if any
-
-    def visit(stmts: tuple[Stmt, ...], producer_scope: _Scope, eff_sigma: dict[str, Expr], eff_scope: _Scope) -> None:
-        nonlocal wrapper
-        for s in reversed(stmts):
-            if isinstance(s, Loop):
-                inner_sigma, inner_scope = eff_sigma, eff_scope
-                target_def = next((x for x in s.body if isinstance(x, Accum) and x.name == target), None)
-                if target_def is not None:
-                    # Loop directly wraps the target Accum — partition/bubble here,
-                    # then extend σ/scope with a fresh reduce axis for the descent.
-                    enclosing = producer_scope.enclosing + (s.axis,)
-                    required = _Scope(enclosing=enclosing[:-1]).remap(eff_sigma).names
-                    bound = ctx.name_for_accum(target, required)
-                    names = eff_scope.names
-                    if not set(required).issubset(set(names)):
-                        raise _NotSupported
-                    if set(required).issubset(set(names[:-1]) if names else set()):
-                        # Can't materialize here — register the target as an unresolved
-                        # ref for an outer _emit call to retry, and skip the descent.
-                        refs.append(_AccumRef(name=target, sigma=dict(eff_sigma)))
-                        ssa_rename[target] = bound
-                        continue
-                    fresh = Axis(name=ctx.fresh(s.axis.name), extent=s.axis.extent)
-                    wrapper = fresh
-                    ssa_rename[target] = bound  # pre-register so the Accum visit picks up this name
-                    inner_sigma = {**eff_sigma, s.axis.name: Var(fresh.name)}
-                    inner_scope = eff_scope.nest(fresh)
-                visit(s.body, producer_scope.nest(s.axis), inner_sigma, inner_scope)
-                continue
-            if not isinstance(s, (Load, Assign, Select, Accum)):
-                continue
-            if s.name not in needed:
-                continue
-            needed.discard(s.name)
-            if isinstance(s, Accum) and s.name != target:
-                ssa_rename[s.name] = _register_accum_ref(s, producer_scope.enclosing, eff_sigma, ctx, refs)
-                continue
-            if producer_scope.remap(eff_sigma) != eff_scope:
-                raise _NotSupported
-            new_name = ssa_rename[s.name] if s.name in ssa_rename else ctx.fresh(s.name)
-            ssa_rename[s.name] = new_name
-            collected.append((s, new_name, eff_sigma))
-            needed.update(s.deps())
-
-    visit(ctx.producer.body, _Scope(), sigma, scope)
-
-    emitted: list[Stmt] = []
-    for s, new_name, stmt_sigma in reversed(collected):
-        resolved = {d: ssa_rename.get(d, d) for d in s.deps()}
-        emitted.append(s.rewrite(new_name, resolved, stmt_sigma))
-
-    if wrapper is None:
-        return emitted, refs, ssa_rename.get(target, target)
-
-    out: list[Stmt] = []
-    bubble: list[_AccumRef] = []
-    for sub in refs:
-        sub_stmts, sub_bubble, _ = _emit(sub.name, ctx, sub.sigma, outer_scope)
-        out.extend(sub_stmts)
-        bubble.extend(sub_bubble)
-    if bubble:
-        raise _NotSupported
-    out.append(Loop(axis=wrapper, body=tuple(emitted)))
-    return out, [], ssa_rename[target]
-
-
-def _register_accum_ref(
-    defn: Accum,
-    enclosing: tuple[Axis, ...],
-    sigma: dict[str, Expr],
-    ctx: _Ctx,
-    refs: list[_AccumRef],
-) -> str:
-    """Record an ``_AccumRef`` for later reduce-Loop materialization;
-    return the canonical consumer-side binding name.
-
-    Ctx-level dedupe: a second registration of the same
-    ``(name, required_c_axes)`` reuses the existing binding and does not
-    add another ref — the first ref's materialization covers both sites."""
-    if not enclosing:
-        raise _NotSupported
-    required_c_axes = _Scope(enclosing=enclosing[:-1]).remap(sigma).names
-    bound = ctx.name_for_accum(defn.name, required_c_axes)
-    key = (defn.name, required_c_axes)
-    if key in ctx.materialized:
-        return bound
-    ctx.materialized.add(key)
-    refs.append(_AccumRef(name=defn.name, sigma=dict(sigma)))
-    return bound
-
-
-# ---------------------------------------------------------------------------
-# Consumer source remap
-# ---------------------------------------------------------------------------
 
 
 def _build_consumer_source_remap(producer: LoopOp, consumer: LoopOp, source: int) -> dict[int, int]:
     """Consumer-origin Load sources shift past producer's inputs. The
-    spliced source itself is dropped from the map — those Loads never
-    survive the splice. Producer-origin Loads keep their original sources
-    because producer inputs come first in the merged kernel."""
+    spliced source is dropped (those Loads don't survive). Producer-origin
+    Loads keep their original sources — producer inputs come first in the
+    merged kernel's input list."""
     n_prod = producer.num_inputs
     remap: dict[int, int] = {}
     next_src = n_prod
@@ -395,8 +273,240 @@ def _build_consumer_source_remap(producer: LoopOp, consumer: LoopOp, source: int
 
 
 # ---------------------------------------------------------------------------
-# σ solver
+# Public entrypoint
 # ---------------------------------------------------------------------------
+
+
+def splice_loop_ops(
+    producer: LoopOp,
+    consumer: LoopOp,
+    source: int,
+    *,
+    producer_inputs: list[str] | None = None,
+    consumer_inputs: list[str] | None = None,
+) -> LoopOp | None:
+    """Splice ``producer``'s expression into every consumer ``Load`` that
+    targets ``source``. Returns ``None`` when the pattern isn't supported."""
+    # Refuse when the producer has an ``Accum`` nested inside another
+    # ``Accum``'s reduce Loop. Splicing such a producer would produce a
+    # merged body where the inner Accum's reduce depends on a fresh axis
+    # introduced by the outer Accum's materialization — valid in scalar-
+    # loop semantics but the whole-tensor numpy backend (``execute_loop_op``)
+    # reduces every Accum over *all* reduce axes at once, collapsing
+    # dimensions that were meant to vary. The old splicer hit this same
+    # limitation via a different code path (``required ⊆ names`` check on
+    # a bubbled sub-ref); match it here by rejecting the pattern up front.
+    if _has_nested_accums(producer.body):
+        return None
+    try:
+        ctx = _Ctx.build(
+            producer,
+            consumer,
+            source,
+            list(producer_inputs or []),
+            list(consumer_inputs or []),
+        )
+        b = LoopBuilder(used_names=_collect_names(producer) | _collect_names(consumer))
+        _seed(ctx, b)
+        while b.has_deps():
+            d = b.take()
+            _resolve(d, ctx, b)
+        return LoopOp(body=b.finish())
+    except _NotSupported:
+        return None
+    except ValueError:
+        return None
+
+
+def _has_nested_accums(stmts: tuple[Stmt, ...], inside_accum_loop: bool = False) -> bool:
+    """True if any ``Accum``'s reduce Loop sits inside another ``Accum``'s
+    reduce Loop. A Loop's immediate body Accum is "this Loop's" — only
+    deeper Loops with Accums count as nested."""
+    for s in stmts:
+        if isinstance(s, Loop):
+            wraps_accum = any(isinstance(x, Accum) for x in s.body)
+            if inside_accum_loop and wraps_accum:
+                return True
+            if _has_nested_accums(s.body, inside_accum_loop or wraps_accum):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Seed: every consumer Write, with its value queued
+# ---------------------------------------------------------------------------
+
+
+def _seed(ctx: _Ctx, b: LoopBuilder) -> None:
+    for w, scope in ctx.consumer_writes:
+        v_bound = _ensure_dep(w.value, "consumer", {}, scope, ctx, b)
+        b.insert(Write(output=w.output, index=w.index, value=v_bound), scope)
+
+
+# ---------------------------------------------------------------------------
+# Dep binding: look up or queue
+# ---------------------------------------------------------------------------
+
+
+def _ensure_dep(
+    name: str,
+    origin: str,
+    sigma: dict[str, Expr],
+    ref_scope: _Scope,
+    ctx: _Ctx,
+    b: LoopBuilder,
+) -> str:
+    """Return the merged-body name bound to ``(origin, name, σ)``. Queue a
+    new demand if this is the first reference.
+
+    ``ref_scope`` is where the reference sits in the merged body; used only
+    to compute an Accum's enclosure. Plain deps take their scope from the
+    def's own enclosing (σ-remapped).
+    """
+    defs = ctx.consumer_defs if origin == "consumer" else ctx.producer_defs
+    encs = ctx.consumer_enc if origin == "consumer" else ctx.producer_enc
+    def_stmt = defs.get(name)
+    if def_stmt is None:
+        raise _NotSupported
+
+    if isinstance(def_stmt, Accum):
+        full_enc = encs[name]
+        required = tuple(_remap_axis_name(a, sigma) for a in full_enc.enclosing[:-1])
+        existing = b.seen_accum(origin, name, required)
+        if existing is not None:
+            return existing
+        bound = b.fresh(name)
+        b.bind_accum(origin, name, required, bound)
+        accum_enc = _scope_for_axes(ref_scope, required)
+        b.queue(_Demand(name=name, origin=origin, sigma=dict(sigma), demand_scope=accum_enc, bound_as=bound))
+        return bound
+
+    existing = b.seen_plain(origin, name, sigma)
+    if existing is not None:
+        return existing
+    bound = b.fresh(name)
+    b.bind_plain(origin, name, sigma, bound)
+    required_axes = tuple(_remap_axis_name(a, sigma) for a in encs[name].enclosing)
+    # Producer plain stmts: require the σ-mapped enclosing to axis-set-equal
+    # ``ref_scope``. With whole-tensor backend semantics Accums reduce over
+    # every reduce axis at once, so emitting a producer stmt at a scope that
+    # has extra reduce axes would collapse dimensions that were meant to
+    # vary — e.g. softmax's sum accum would fold matmul@V's k along with
+    # softmax's k. Consumer stmts are fine at a shorter prefix (the
+    # original outer-scope binding seen from a nested reference).
+    if origin == "producer":
+        if set(required_axes) != set(a.name for a in ref_scope.enclosing):
+            raise _NotSupported
+        def_scope = ref_scope
+    else:
+        def_scope = _scope_for_axes(ref_scope, required_axes)
+    b.queue(_Demand(name=name, origin=origin, sigma=dict(sigma), demand_scope=def_scope, bound_as=bound))
+    return bound
+
+
+# ---------------------------------------------------------------------------
+# Resolution dispatch
+# ---------------------------------------------------------------------------
+
+
+def _resolve(d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+    defs = ctx.consumer_defs if d.origin == "consumer" else ctx.producer_defs
+    stmt = defs[d.name]
+
+    if isinstance(stmt, Load):
+        if d.origin == "consumer" and stmt.source == ctx.source:
+            _resolve_producer_load(stmt, d, ctx, b)
+        else:
+            _resolve_plain_load(stmt, d, ctx, b)
+    elif isinstance(stmt, Accum):
+        _resolve_accum(stmt, d, ctx, b)
+    elif isinstance(stmt, (Assign, Select)):
+        _resolve_plain(stmt, d, ctx, b)
+    else:
+        raise _NotSupported
+
+
+def _resolve_plain(stmt: Stmt, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+    """Generic Assign / Select emission — rewrite the stmt with fresh args
+    and σ-substituted Exprs, insert at ``d.demand_scope``."""
+    resolved = {arg: _ensure_dep(arg, d.origin, d.sigma, d.demand_scope, ctx, b) for arg in stmt.deps()}
+    b.insert(stmt.rewrite(d.bound_as, resolved, d.sigma), d.demand_scope)
+
+
+def _resolve_plain_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+    """A Load that doesn't target the producer — remap source, σ-sub index."""
+    if d.origin == "consumer":
+        new_src = ctx.consumer_source_remap.get(stmt.source, stmt.source)
+    else:
+        new_src = stmt.source
+    new_index = tuple(substitute(e, d.sigma) for e in stmt.index)
+    b.insert(Load(name=d.bound_as, source=new_src, index=new_index), d.demand_scope)
+
+
+def _resolve_producer_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+    """A consumer Load that targets the producer — emit a copy alias and
+    queue the producer's ``Write.value`` under the solved σ. The producer's
+    expression chain reconstructs piecemeal in subsequent iterations."""
+    effective_index = tuple(substitute(e, d.sigma) for e in stmt.index)
+    sigma = _solve_sigma(ctx.producer_write.index, effective_index, ctx.producer_axis_names)
+    if sigma is None:
+        raise _NotSupported
+    v_bound = _ensure_dep(ctx.producer_write.value, "producer", sigma, d.demand_scope, ctx, b)
+    b.insert(Assign(name=d.bound_as, op=ElementwiseOp("copy"), args=(v_bound,)), d.demand_scope)
+
+
+def _resolve_accum(stmt: Accum, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
+    """Emit ``Loop(fresh_reduce_axis, [Accum(bound, value_bound, op)])`` at
+    ``d.demand_scope``. The Accum's value is queued under σ extended with
+    the fresh reduce-axis binding."""
+    encs = ctx.consumer_enc if d.origin == "consumer" else ctx.producer_enc
+    full_enc = encs[stmt.name]
+    orig_axis = full_enc.enclosing[-1]
+    fresh_name = b.fresh(orig_axis.name)
+    reduce_axis = Axis(name=fresh_name, extent=orig_axis.extent)
+    inner_sigma = dict(d.sigma)
+    inner_sigma[orig_axis.name] = Var(fresh_name)
+    inner_scope = _Scope(enclosing=d.demand_scope.enclosing + (reduce_axis,))
+    value_bound = _ensure_dep(stmt.value, d.origin, inner_sigma, inner_scope, ctx, b)
+    b.insert(Accum(name=d.bound_as, value=value_bound, op=stmt.op), inner_scope)
+
+
+# ---------------------------------------------------------------------------
+# σ and scope helpers
+# ---------------------------------------------------------------------------
+
+
+def _scope_for_axes(ref_scope: _Scope, required: tuple[str, ...]) -> _Scope:
+    """Shortest prefix of ``ref_scope`` whose axis set contains ``required``.
+
+    Used two ways:
+    - For Accums: places the reduce ``Loop`` at the innermost consumer
+      scope where all σ-mapped producer enclosing axes are visible (today's
+      behavior — further hoisting is left to later passes).
+    - For plain producer stmts: picks the emit scope from the consumer's
+      nest, tolerating producer's free-axis order differing from consumer's.
+      A matmul producer ``(a0, a1, a2)`` σ-maps to consumer ``(a0, a2, a1)``
+      (shuffled), but the consumer's scope ``(a0, a1, a2)`` covers the same
+      axis set; emitting at the consumer's nest avoids a duplicate Loop tree.
+    """
+    names = tuple(a.name for a in ref_scope.enclosing)
+    remaining = set(required)
+    k = 0
+    while remaining and k < len(names):
+        remaining.discard(names[k])
+        k += 1
+    if remaining:
+        raise _NotSupported
+    return _Scope(enclosing=ref_scope.enclosing[:k])
+
+
+def _remap_axis_name(axis: Axis, sigma: dict[str, Expr]) -> str:
+    target = sigma.get(axis.name)
+    if target is None:
+        return axis.name
+    if isinstance(target, Var):
+        return target.name
+    raise _NotSupported
 
 
 def _solve_sigma(
@@ -404,9 +514,9 @@ def _solve_sigma(
     reader: tuple[Expr, ...],
     producer_axes: set[str],
 ) -> dict[str, Expr] | None:
-    """Solve the per-dim pairing writer[k] == reader[k]. Supported writer
-    forms: ``Var(a)`` (``a`` in producer_axes) → bind a→reader[k];
-    ``Literal(c)`` → no binding. Anything else → None."""
+    """Solve per-dim pairing ``writer[k] == reader[k]``. Supported writer
+    forms: ``Var(a)`` (``a`` in ``producer_axes``) → bind ``a → reader[k]``;
+    ``Literal(c)`` → no binding. Anything else → ``None``."""
     if len(writer) != len(reader):
         return None
     sigma: dict[str, Expr] = {}
@@ -424,42 +534,21 @@ def _solve_sigma(
 
 
 # ---------------------------------------------------------------------------
-# Producer inspection helpers — on-demand walks, no precomputed analysis
-# ---------------------------------------------------------------------------
-
-
-def _producer_write(ctx: _Ctx) -> Write:
-    for s in _iter_all(ctx.producer.body):
-        if isinstance(s, Write) and s.output == 0:
-            return s
-    raise _NotSupported
-
-
-def _producer_axis_names(ctx: _Ctx) -> set[str]:
-    return {a.name for a in ctx.producer.axes}
-
-
-def _iter_all(stmts: tuple[Stmt, ...]):
-    """Iterate every stmt in the tree (depth-first, no scope tracking)."""
-    for s in stmts:
-        yield s
-        if isinstance(s, Loop):
-            yield from _iter_all(s.body)
-
-
-# ---------------------------------------------------------------------------
 # Name collection
 # ---------------------------------------------------------------------------
 
 
 def _collect_names(op: LoopOp) -> set[str]:
-    """All SSA names plus all axis names in ``op``."""
+    """All SSA names plus all axis names used anywhere in ``op``."""
     names: set[str] = set()
-    for s in _iter_all(op.body):
-        if isinstance(s, (Load, Assign, Select, Accum)):
-            names.add(s.name)
-        if isinstance(s, Loop):
-            names.add(s.axis.name)
+
+    def walk(stmts: tuple[Stmt, ...]) -> None:
+        for s in stmts:
+            if isinstance(s, Loop):
+                names.add(s.axis.name)
+                walk(s.body)
+            elif isinstance(s, (Load, Assign, Select, Accum)):
+                names.add(s.name)
+
+    walk(op.body)
     return names
-
-
