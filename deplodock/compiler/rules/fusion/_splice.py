@@ -258,50 +258,49 @@ def _emit(
 ) -> tuple[list[Stmt], list[_PendingAccum], str]:
     """Emit the producer-side SSA chain needed to compute ``target``.
 
-    Each recursive step works in two beats:
+    Walks the producer tree in reverse program order carrying a live set.
+    When a visited stmt's name is in the live set, we freshen it, cache
+    the rename, and add its SSA deps to the live set — so defs earlier in
+    program order (visited later in reverse) get pulled in transitively.
+    Accums terminate the trace: they're recorded as ``_PendingAccum`` for
+    later materialization, and their folded value is *not* added to the
+    live set (the reduce Loop body is built by a separate ``_emit`` call
+    targeting that folded value).
 
-    1. **Requirements** — ask the recursion for the freshened name of each
-       SSA value this stmt reads. The call returns once those upstream
-       stmts are in ``emitted`` and their names are in ``ssa_rename``.
-    2. **Emit on unwind** — with all requirements resolved, freshen this
-       stmt's own name, construct the rewritten stmt (σ on Exprs, resolved
-       names on SSA refs), and append it to ``emitted``.
-
-    The Accum branch short-circuits both beats: Accums live at an outer
-    scope (they're the only SSA values that cross Loop boundaries), so we
-    record a ``_PendingAccum`` for later materialization and return the
-    canonical consumer-side binding. The reduce Loop body itself is built
-    by a separate ``_emit`` call targeting the Accum's folded value.
+    After the walk, ``ssa_rename`` is complete, so we build the rewritten
+    stmts (σ on Exprs, remapped SSA refs) in forward order.
     """
-    defs = _producer_defs(ctx)
-    emitted: list[Stmt] = []
     pending: list[_PendingAccum] = []
     ssa_rename: dict[str, str] = {}
+    needed: set[str] = {target}
+    collected: list[tuple[Stmt, str]] = []  # (original_stmt, fresh_name), reverse order
 
-    def resolve(n: str) -> str:
-        if n in ssa_rename:
-            return ssa_rename[n]
-        entry = defs.get(n)
-        if entry is None:
-            return n
-        defn, enclosing = entry
+    def visit(stmts: tuple[Stmt, ...], enclosing: tuple[Axis, ...]) -> None:
+        for s in reversed(stmts):
+            if isinstance(s, Loop):
+                visit(s.body, enclosing + (s.axis,))
+                continue
+            if not isinstance(s, (Load, Assign, Select, Accum)):
+                continue
+            if s.name not in needed:
+                continue
+            needed.discard(s.name)
+            if isinstance(s, Accum):
+                ssa_rename[s.name] = _record_accum_pending(s, enclosing, sigma, ctx, pending)
+                continue
+            new_name = ctx.fresh(s.name)
+            ssa_rename[s.name] = new_name
+            collected.append((s, new_name))
+            needed.update(_ssa_deps(s))
 
-        if isinstance(defn, Accum):
-            bound = _record_accum_pending(defn, enclosing, sigma, ctx, pending)
-            ssa_rename[n] = bound
-            return bound
+    visit(ctx.producer.body, ())
 
-        # Beat 1: resolve each requirement (SSA dep) recursively.
-        deps = _ssa_deps(defn)
-        resolved = {d: resolve(d) for d in deps}
+    emitted: list[Stmt] = []
+    for s, new_name in reversed(collected):
+        resolved = {d: ssa_rename.get(d, d) for d in _ssa_deps(s)}
+        emitted.append(_build_rewritten_stmt(s, new_name, resolved, sigma))
 
-        # Beat 2: emit on unwind. All deps are now in ssa_rename + emitted.
-        new_name = ctx.fresh(defn.name)
-        ssa_rename[n] = new_name
-        emitted.append(_build_rewritten_stmt(defn, new_name, resolved, sigma))
-        return new_name
-
-    return emitted, pending, resolve(target)
+    return emitted, pending, ssa_rename.get(target, target)
 
 
 def _ssa_deps(defn: Stmt) -> tuple[str, ...]:
@@ -476,27 +475,6 @@ def _producer_write(ctx: _Ctx) -> Write:
 
 def _producer_axis_names(ctx: _Ctx) -> set[str]:
     return {a.name for a in ctx.producer.axes}
-
-
-def _producer_defs(ctx: _Ctx) -> dict[str, tuple[Stmt, tuple[Axis, ...]]]:
-    """Collect producer SSA definitions with their enclosing Loop axes.
-
-    Returns ``{ssa_name: (defining_stmt, enclosing_axes)}``. The enclosing
-    chain lets ``_emit`` classify an Accum's scope — its last axis is the
-    reduce axis; prior entries are the free axes outer to the reduce Loop.
-    Producer SSA names are unique across the tree (enforced by LoopOp
-    validator), so a flat dict is sound."""
-    defs: dict[str, tuple[Stmt, tuple[Axis, ...]]] = {}
-
-    def walk(stmts: tuple[Stmt, ...], enclosing: tuple[Axis, ...]) -> None:
-        for s in stmts:
-            if isinstance(s, Loop):
-                walk(s.body, enclosing + (s.axis,))
-            elif isinstance(s, (Load, Assign, Select, Accum)):
-                defs[s.name] = (s, enclosing)
-
-    walk(ctx.producer.body, ())
-    return defs
 
 
 def _iter_all(stmts: tuple[Stmt, ...]):
