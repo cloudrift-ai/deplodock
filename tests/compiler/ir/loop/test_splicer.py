@@ -18,6 +18,7 @@ from deplodock.compiler.ir.loop import (
     Write,
     flat_body_to_nested,
     flatten_body,
+    splice_loop_chain,
     splice_loop_ops,
 )
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
@@ -268,6 +269,62 @@ def test_live_axes_computed():
     assert reduce_axis.name not in meta.live_axes[acc_name]
     # Accum's binding scope = load's enclosing minus the reduce axis.
     assert meta.scopes[acc_name].enclosing == tuple(a for a in load_scope.enclosing if a.name != reduce_axis.name)
+
+
+# ---------------------------------------------------------------------------
+# N-way chain fusion via splice_loop_chain
+# ---------------------------------------------------------------------------
+
+
+def test_chain_three_loops():
+    """Fuse a → b → c in one splice call. ``a`` is pointwise exp, ``b`` negates
+    the result, ``c`` adds a bias. The merged kernel should contain exp, neg,
+    add — with one Load for x (a's input) and one for bias (c's extra input)."""
+    a = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="x", source=0, index=(Var("a0"),)),
+            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+    b = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="av", source=0, index=(Var("a0"),)),  # reads a
+            Assign(name="y", op=ElementwiseOp("neg"), args=("av",)),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+    c = _loop(
+        axes=(A0,),
+        body=(
+            Load(name="bv", source=0, index=(Var("a0"),)),  # reads b
+            Load(name="bias", source=1, index=(Var("a0"),)),  # external
+            Assign(name="y", op=ElementwiseOp("add"), args=("bv", "bias")),
+            Write(output=0, index=(Var("a0"),), value="y"),
+        ),
+    )
+
+    merged = splice_loop_chain(
+        loops={"a": a, "b": b, "c": c},
+        splice_edges={("b", 0): "a", ("c", 0): "b"},
+        input_remap={
+            ("a", 0): 0,  # a's x → merged slot 0
+            ("c", 1): 1,  # c's bias → merged slot 1
+        },
+        root="c",
+    )
+    assert merged is not None
+    fns = _elementwise_fns(merged)
+    assert "exp" in fns
+    assert "neg" in fns
+    assert "add" in fns
+    # Two external Loads remain (x, bias); the splice edges collapsed into copy aliases.
+    loads = [s for s in flatten_body(merged.body) if isinstance(s, Load)]
+    assert len(loads) == 2
+    assert {ld.source for ld in loads} == {0, 1}
+    assert merged.num_inputs == 2
 
 
 def test_literal_producer_write_index():
