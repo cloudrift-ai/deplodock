@@ -246,8 +246,8 @@ def test_live_axes_computed():
 
     Normalization canonicalizes SSA and axis names (``Load→in0``,
     ``Accum→acc0``; free axes first then reduce axes), so we assert on
-    sizes and the reduce-axis-exclusion property rather than pre-normalize
-    names.
+    ``meta.scopes`` (now the post-reduce binding scope for Accum) and
+    ``meta.reduce_axes`` rather than pre-normalize names.
     """
     op = _loop(
         axes=(A0, K),
@@ -261,12 +261,13 @@ def test_live_axes_computed():
     meta = op.analyze()
     [(load_name, load_scope)] = [(n, s) for n, s in meta.scopes.items() if isinstance(meta.defs[n], Load)]
     [(acc_name, acc_scope)] = [(n, s) for n, s in meta.scopes.items() if isinstance(meta.defs[n], Accum)]
-    # Load's live_axes = both axis names (post-normalize).
-    assert meta.live_axes[load_name] == {a.name for a in load_scope.enclosing}
-    # Accum's reduce axis (tail of its enclosing) is stripped from live_axes.
-    reduce_name = acc_scope.enclosing[-1].name
-    assert reduce_name not in meta.live_axes[acc_name]
-    assert meta.live_axes[acc_name] == {a.name for a in acc_scope.enclosing[:-1]}
+    # Load sees both loop axes, Accum binds post-reduce so its scope is shorter.
+    assert {a.name for a in load_scope.enclosing} == meta.live_axes[load_name]
+    assert acc_name in meta.reduce_axes
+    reduce_axis = meta.reduce_axes[acc_name]
+    assert reduce_axis.name not in meta.live_axes[acc_name]
+    # Accum's binding scope = load's enclosing minus the reduce axis.
+    assert meta.scopes[acc_name].enclosing == tuple(a for a in load_scope.enclosing if a.name != reduce_axis.name)
 
 
 def test_literal_producer_write_index():

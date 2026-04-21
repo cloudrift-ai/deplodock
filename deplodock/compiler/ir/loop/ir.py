@@ -404,13 +404,23 @@ class LoopOp(Op):
         """
         defs: dict[str, Stmt] = {}
         scopes: dict[str, Scope] = {}
+        reduce_axes: dict[str, Axis] = {}
         writes: list[tuple[Write, Scope]] = []
 
         def walk(stmts: tuple[Stmt, ...], scope: Scope) -> None:
             for s in stmts:
                 if isinstance(s, Loop):
                     walk(s.body, scope.nest(s.axis))
-                elif isinstance(s, (Load, Assign, Select, Accum)):
+                elif isinstance(s, Accum):
+                    defs[s.name] = s
+                    # Binding scope excludes the reduce axis (the Accum is live
+                    # after its reduce Loop completes).
+                    if scope.enclosing:
+                        reduce_axes[s.name] = scope.enclosing[-1]
+                        scopes[s.name] = Scope(enclosing=scope.enclosing[:-1])
+                    else:
+                        scopes[s.name] = scope
+                elif isinstance(s, (Load, Assign, Select)):
                     defs[s.name] = s
                     scopes[s.name] = scope
                 elif isinstance(s, Write):
@@ -421,8 +431,9 @@ class LoopOp(Op):
             op=self,
             defs=defs,
             scopes=scopes,
+            reduce_axes=reduce_axes,
             writes=tuple(writes),
-            live_axes=_compute_live_axes(defs, scopes),
+            live_axes=_compute_live_axes(defs, scopes, reduce_axes),
         )
 
     def forward(self, *inputs):
@@ -485,9 +496,13 @@ class LoopMeta:
     - ``op``: the source ``LoopOp`` this meta was built from.
     - ``defs``: SSA name → defining ``Stmt`` (``Load`` / ``Assign`` /
       ``Select`` / ``Accum``). A ``Write`` has no SSA name and is not here.
-    - ``scopes``: SSA name → ``Scope`` (enclosing axes of the def). For an
-      ``Accum``, the tail axis is the reduce axis; strip it for the
-      binding scope.
+    - ``scopes``: SSA name → binding ``Scope`` (where the value is live
+      after its def). For plain stmts this is the enclosing axis chain;
+      for ``Accum`` the reduce axis is excluded — the Accum binds *after*
+      the reduce Loop completes.
+    - ``reduce_axes``: ``Accum`` name → its reduce ``Axis`` (the tail of
+      the raw enclosing chain, stripped from ``scopes``). Only present
+      for ``Accum`` defs.
     - ``writes``: every ``Write`` stmt paired with the ``Scope`` it sits
       in — one entry per output, in body order.
     - ``live_axes``: SSA name → axis names transitively reachable through
@@ -499,16 +514,21 @@ class LoopMeta:
     op: LoopOp
     defs: dict[str, Stmt]
     scopes: dict[str, Scope]
+    reduce_axes: dict[str, Axis]
     writes: tuple[tuple[Write, Scope], ...]
     live_axes: dict[str, frozenset[str]]
 
 
-def _compute_live_axes(defs: dict[str, Stmt], scopes: dict[str, Scope]) -> dict[str, frozenset[str]]:
+def _compute_live_axes(
+    defs: dict[str, Stmt],
+    scopes: dict[str, Scope],  # noqa: ARG001 — kept for signature symmetry with analyze()
+    reduce_axes: dict[str, Axis],
+) -> dict[str, frozenset[str]]:
     """Axes reachable through Expr subtrees rooted at each SSA name.
 
     A dep's live axes are the union of its own Expr subtree's free vars plus
     the live axes of every SSA name it reads. ``Accum`` excludes its reduce
-    axis (the enclosing's tail), since that axis gets freshened per emission.
+    axis, since that axis gets freshened per emission.
     """
     cache: dict[str, frozenset[str]] = {}
     in_progress: set[str] = set()
@@ -536,9 +556,9 @@ def _compute_live_axes(defs: dict[str, Stmt], scopes: dict[str, Scope]) -> dict[
                 own |= live(a)
         elif isinstance(stmt, Accum):
             own |= live(stmt.value)
-            enc = scopes[name].enclosing
-            if enc:
-                own -= {enc[-1].name}
+            ra = reduce_axes.get(name)
+            if ra is not None:
+                own -= {ra.name}
         in_progress.discard(name)
         cache[name] = own
         return own
