@@ -223,7 +223,6 @@ class _LoopMeta:
 class _Ctx:
     loops: dict[str, _LoopMeta]
     source: int
-    producer_write: Write
 
     @classmethod
     def build(
@@ -236,9 +235,6 @@ class _Ctx:
     ) -> _Ctx:
         p_defs, p_enc, p_writes = _analyze(producer.body)
         c_defs, c_enc, c_writes = _analyze(consumer.body)
-        prod_write = next((w for w, _ in p_writes if w.output == 0), None)
-        if prod_write is None:
-            raise _NotSupported
         loops = {
             "producer": _LoopMeta(
                 op=producer,
@@ -257,7 +253,7 @@ class _Ctx:
                 axis_names={a.name for a in consumer.axes},
             ),
         }
-        return cls(loops=loops, source=source, producer_write=prod_write)
+        return cls(loops=loops, source=source)
 
 
 # ---------------------------------------------------------------------------
@@ -437,11 +433,15 @@ def _resolve_producer_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) ->
     """A consumer Load that targets the producer — emit a copy alias and
     queue the producer's ``Write.value`` under the solved σ. The producer's
     expression chain reconstructs piecemeal in subsequent iterations."""
+    producer = ctx.loops["producer"]
+    prod_write = next((w for w, _ in producer.writes if w.output == 0), None)
+    if prod_write is None:
+        raise _NotSupported
     effective_index = tuple(substitute(e, d.sigma) for e in stmt.index)
-    sigma = _solve_sigma(ctx.producer_write.index, effective_index, ctx.loops["producer"].axis_names)
+    sigma = _solve_sigma(prod_write.index, effective_index, producer.axis_names)
     if sigma is None:
         raise _NotSupported
-    v_bound = _ensure_dep(ctx.producer_write.value, "producer", sigma, d.demand_scope, ctx, b)
+    v_bound = _ensure_dep(prod_write.value, "producer", sigma, d.demand_scope, ctx, b)
     b.insert(Assign(name=d.bound_as, op=ElementwiseOp("copy"), args=(v_bound,)), d.demand_scope)
 
 
