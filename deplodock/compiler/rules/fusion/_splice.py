@@ -137,10 +137,14 @@ class _Ctx:
 
 @dataclass(frozen=True)
 class _Scope:
-    """Per-call recursion state: the consumer axes enclosing the current
-    walk position. Every recursive step into a ``Loop`` creates a new
-    ``_Scope`` via :meth:`nest`; the pre-nest value stays alive in the
-    caller's frame and is what we return to after the child call."""
+    """An axis chain used two ways:
+
+    - As consumer walk position: every recursive step into a ``Loop``
+      produces a new ``_Scope`` via :meth:`nest`; the pre-nest value
+      stays alive in the caller and is what we return to.
+    - As producer enclosing, σ-remapped into consumer namespace via
+      :meth:`remap`, so it can be compared against a consumer scope.
+    """
 
     enclosing: tuple[Axis, ...] = ()
 
@@ -148,8 +152,23 @@ class _Scope:
     def names(self) -> tuple[str, ...]:
         return tuple(a.name for a in self.enclosing)
 
+    @property
+    def name_set(self) -> frozenset[str]:
+        return frozenset(a.name for a in self.enclosing)
+
     def nest(self, axis: Axis) -> _Scope:
         return _Scope(enclosing=self.enclosing + (axis,))
+
+    def remap(self, sigma: dict[str, Expr]) -> _Scope | None:
+        """σ-remap each axis name. Returns ``None`` if any axis σ-maps to a non-``Var``
+        (affine binding forms aren't supported). Axis extents are preserved."""
+        out: list[Axis] = []
+        for a in self.enclosing:
+            r = sigma.get(a.name)
+            if not isinstance(r, Var):
+                return None
+            out.append(Axis(name=r.name, extent=a.extent))
+        return _Scope(enclosing=tuple(out))
 
 
 # ---------------------------------------------------------------------------
@@ -203,47 +222,49 @@ def _walk(
 ) -> tuple[tuple[Stmt, ...], list[_PendingAccum]]:
     """Walk consumer stmts at the current scope.
 
-    Shape at every step: process a stmt → get its rewritten form + any
-    pendings → flush pendings that match the current scope before the
-    rewritten stmts → bubble the rest upward. The caller does the same
-    one level out until every pending finds its scope."""
-    out: list[Stmt] = []
-    bubble: list[_PendingAccum] = []
+    Shape at every step: rewrite a stmt → collect its pendings → flush
+    those that match the current scope before the rewritten stmts → bubble
+    the rest upward. The caller does the same one level out until every
+    pending finds its scope.
 
-    for s in c_stmts:
-        new_stmts, new_pending = _process_stmt(s, ctx, scope)
-        here, up = _partition_pendings(new_pending, scope)
-        out.extend(_emit_accum_loops(here, ctx, scope))
-        out.extend(new_stmts)
-        bubble.extend(up)
+    Rewrite cases:
+    - ``Loop``: recurse into the body at a nested scope; its inner bubble
+      becomes this stmt's pendings (partitioned against the outer scope).
+    - ``Load`` targeting the spliced source: replace with the producer
+      expression that computes the value, aliased via copy (normalize's
+      copy-elim collapses the alias).
+    - ``Load`` from any other source: remap the source past the producer's
+      inputs.
+    - anything else: keep as-is.
+    """
 
-    return tuple(out), bubble
+    def visit(stmts: tuple[Stmt, ...], scope: _Scope) -> tuple[tuple[Stmt, ...], list[_PendingAccum]]:
+        out: list[Stmt] = []
+        bubble: list[_PendingAccum] = []
+        for s in stmts:
+            if isinstance(s, Loop):
+                inner_out, new_pending = visit(s.body, scope.nest(s.axis))
+                new_stmts: list[Stmt] = [Loop(axis=s.axis, body=inner_out)]
+            elif isinstance(s, Load) and s.source == ctx.source:
+                sigma = _solve_sigma(_producer_write(ctx).index, s.index, _producer_axis_names(ctx))
+                if sigma is None:
+                    raise _NotSupported
+                prod_stmts, new_pending, final_name = _emit(_producer_write(ctx).value, ctx, sigma, scope)
+                new_stmts = [*prod_stmts, Assign(name=s.name, op=ElementwiseOp("copy"), args=(final_name,))]
+            elif isinstance(s, Load):
+                new_src = ctx.consumer_source_remap.get(s.source, s.source)
+                new_stmts = [Load(name=s.name, source=new_src, index=s.index)]
+                new_pending = []
+            else:
+                new_stmts = [s]
+                new_pending = []
+            here, up = _partition_pendings(new_pending, scope)
+            out.extend(_emit_accum_loops(here, ctx, scope))
+            out.extend(new_stmts)
+            bubble.extend(up)
+        return tuple(out), bubble
 
-
-def _process_stmt(s: Stmt, ctx: _Ctx, scope: _Scope) -> tuple[list[Stmt], list[_PendingAccum]]:
-    """Rewrite one consumer stmt at ``scope``. Returns the stmts to emit
-    (may be empty, one, or many) and any producer-accumulator pendings
-    the rewrite produced (for the caller to partition/flush/bubble)."""
-    if isinstance(s, Loop):
-        inner_out, inner_bubble = _walk(s.body, ctx, scope.nest(s.axis))
-        return [Loop(axis=s.axis, body=inner_out)], inner_bubble
-
-    if isinstance(s, Load) and s.source == ctx.source:
-        # Spliced Load: replace with the producer expression that computes
-        # its value, aliased via copy (normalize's copy-elim collapses it).
-        sigma = _solve_sigma(_producer_write(ctx).index, s.index, _producer_axis_names(ctx))
-        if sigma is None:
-            raise _NotSupported
-        prod_stmts, new_pending, final_name = _emit(_producer_write(ctx).value, ctx, sigma)
-        alias = Assign(name=s.name, op=ElementwiseOp("copy"), args=(final_name,))
-        return [*prod_stmts, alias], new_pending
-
-    if isinstance(s, Load):
-        # Consumer-origin Load: remap source past the producer's inputs.
-        new_src = ctx.consumer_source_remap.get(s.source, s.source)
-        return [Load(name=s.name, source=new_src, index=s.index)], []
-
-    return [s], []
+    return visit(c_stmts, scope)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +276,7 @@ def _emit(
     target: str,
     ctx: _Ctx,
     sigma: dict[str, Expr],
+    scope: _Scope,
 ) -> tuple[list[Stmt], list[_PendingAccum], str]:
     """Emit the producer-side SSA chain needed to compute ``target``.
 
@@ -266,6 +288,11 @@ def _emit(
     later materialization, and their folded value is *not* added to the
     live set (the reduce Loop body is built by a separate ``_emit`` call
     targeting that folded value).
+
+    ``scope`` is the consumer scope these stmts will land in. For each
+    non-Accum stmt we emit, its producer enclosing axes must σ-resolve
+    to axes already in that scope; otherwise the splice is ill-formed
+    and we raise ``_NotSupported``.
 
     After the walk, ``ssa_rename`` is complete, so we build the rewritten
     stmts (σ on Exprs, remapped SSA refs) in forward order.
@@ -288,6 +315,9 @@ def _emit(
             if isinstance(s, Accum):
                 ssa_rename[s.name] = _record_accum_pending(s, enclosing, sigma, ctx, pending)
                 continue
+            required = _Scope(enclosing=enclosing).remap(sigma)
+            if required is None or not (required.name_set <= scope.name_set):
+                raise _NotSupported
             new_name = ctx.fresh(s.name)
             ssa_rename[s.name] = new_name
             collected.append((s, new_name))
@@ -359,12 +389,12 @@ def _record_accum_pending(
         accum_value=defn.value,
         accum_op=defn.op,
     )
-    required_c_axes = tuple(_c_axis_name(sigma.get(a.name), ctx) for a in free_axes)
-    if any(a is None for a in required_c_axes):
+    required = _Scope(enclosing=free_axes).remap(sigma)
+    if required is None:
         raise _NotSupported
-    required_c_axes_t: tuple[str, ...] = required_c_axes  # type: ignore[assignment]
-    bound = ctx.name_for_accum(defn.name, required_c_axes_t)
-    pending.append(_PendingAccum(decl=decl, sigma=dict(sigma), bound_name=bound, required_c_axes=required_c_axes_t))
+    required_c_axes = required.names
+    bound = ctx.name_for_accum(defn.name, required_c_axes)
+    pending.append(_PendingAccum(decl=decl, sigma=dict(sigma), bound_name=bound, required_c_axes=required_c_axes))
     return bound
 
 
@@ -395,10 +425,12 @@ def _emit_accum_loops(
     out: list[Stmt] = []
     for p in unique:
         reduce_axis_name = ctx.fresh(p.decl.reduce_axis.name)
+        reduce_axis = Axis(name=reduce_axis_name, extent=p.decl.reduce_axis.extent)
         extended_sigma: dict[str, Expr] = dict(p.sigma)
         extended_sigma[p.decl.reduce_axis.name] = Var(reduce_axis_name)
+        inner_scope = scope.nest(reduce_axis)
         # Emit the SSA chain that computes the Accum's folded value.
-        body_stmts, nested_pending, value_fresh = _emit(p.decl.accum_value, ctx, extended_sigma)
+        body_stmts, nested_pending, value_fresh = _emit(p.decl.accum_value, ctx, extended_sigma, inner_scope)
         nested_here, nested_up = _partition_pendings(nested_pending, scope)
         if nested_up:
             raise _NotSupported
@@ -406,7 +438,7 @@ def _emit_accum_loops(
         # Append the Accum stmt that folds value_fresh into the canonical
         # consumer-side binding name.
         body_stmts.append(Accum(name=p.bound_name, value=value_fresh, op=p.decl.accum_op))
-        out.append(Loop(axis=Axis(name=reduce_axis_name, extent=p.decl.reduce_axis.extent), body=tuple(body_stmts)))
+        out.append(Loop(axis=reduce_axis, body=tuple(body_stmts)))
         ctx.materialized.add((p.decl.name, p.required_c_axes))
     return out
 
@@ -542,13 +574,3 @@ def _partition_pendings(
         else:
             here.append(p)
     return here, up
-
-
-def _c_axis_name(r: Expr | None, ctx: _Ctx) -> str | None:
-    """Extract a consumer axis name from a σ value. Only bare ``Var``s are
-    supported (affine binding forms would need more work)."""
-    if r is None:
-        return None
-    if isinstance(r, Var):
-        return r.name
-    return None
