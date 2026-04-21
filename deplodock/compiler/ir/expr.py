@@ -399,6 +399,10 @@ class Sigma:
     def extend(self, name: str, expr: Expr) -> Sigma:
         return Sigma({**self.mapping, name: expr})
 
+    def restrict(self, names: set[str]) -> Sigma:
+        """Return a new Sigma keeping only bindings whose axis name is in ``names``."""
+        return Sigma({k: v for k, v in self.mapping.items() if k in names})
+
     def get(self, name: str) -> Expr | None:
         return self.mapping.get(name)
 
