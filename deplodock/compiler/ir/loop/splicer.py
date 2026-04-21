@@ -173,7 +173,11 @@ class _Splicer(LoopBuilder):
         else:
             emit_scope = _scope_for_axes(ref_scope, required_axes)
 
-        restricted = sigma.restrict({a.name for a in full_enc.enclosing})
+        # σ restricted to axes transitively used in Expr subtrees reachable
+        # from this stmt. Bindings outside this set don't affect any emitted
+        # stmt, so keeping them in the key would cause spurious duplicate
+        # emissions.
+        restricted = sigma.restrict(meta.live_axes[name])
         key = (origin, name, emit_scope, restricted)
         existing = self._binding.get(key)
         if existing is not None:

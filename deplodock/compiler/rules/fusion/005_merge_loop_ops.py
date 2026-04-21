@@ -14,9 +14,8 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import Load, Loop, LoopOp, Stmt
+from deplodock.compiler.ir.loop import Load, Loop, LoopOp, Stmt, splice_loop_ops
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.ir.loop import splice_loop_ops
 
 GRAMMAR = [
     Production("producer", LoopOp, "1"),

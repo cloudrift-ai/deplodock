@@ -367,6 +367,31 @@ def substitute(expr: Expr, mapping: dict[str, Expr]) -> Expr:
     return expr
 
 
+def free_vars(expr: Expr) -> frozenset[str]:
+    """Return the set of ``Var.name`` strings appearing anywhere in ``expr``.
+
+    Used by analyses that need to know which axes an Expr depends on — e.g.
+    the fusion splicer's live-axis restriction, which dedups σ entries that
+    don't affect any reachable rewrite.
+    """
+    if isinstance(expr, Var):
+        return frozenset({expr.name})
+    if isinstance(expr, (Literal, Builtin)):
+        return frozenset()
+    if isinstance(expr, BinOp):
+        return free_vars(expr.left) | free_vars(expr.right)
+    if isinstance(expr, Ternary):
+        return free_vars(expr.cond) | free_vars(expr.if_true) | free_vars(expr.if_false)
+    if isinstance(expr, FuncCall):
+        out: frozenset[str] = frozenset()
+        for a in expr.args:
+            out |= free_vars(a)
+        return out
+    if isinstance(expr, Cast):
+        return free_vars(expr.expr)
+    return frozenset()
+
+
 # ---------------------------------------------------------------------------
 # Sigma — axis-substitution helper
 # ---------------------------------------------------------------------------
