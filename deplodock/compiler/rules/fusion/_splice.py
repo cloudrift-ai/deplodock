@@ -37,7 +37,9 @@ from deplodock.compiler.ir.loop import (
     Axis,
     Load,
     Loop,
+    LoopMeta,
     LoopOp,
+    Scope,
     Select,
     Stmt,
     Write,
@@ -47,23 +49,6 @@ from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 class _NotSupported(Exception):
     """Pattern not handled — caller converts to ``None`` return."""
-
-
-# ---------------------------------------------------------------------------
-# Scope — consumer-namespace axis chain
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Scope:
-    enclosing: tuple[Axis, ...] = ()
-
-    @property
-    def names(self) -> tuple[str, ...]:
-        return tuple(a.name for a in self.enclosing)
-
-    def nest(self, axis: Axis) -> _Scope:
-        return _Scope(enclosing=self.enclosing + (axis,))
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +68,7 @@ class _Demand:
     name: str
     origin: str  # "producer" | "consumer"
     sigma: dict[str, Expr]
-    demand_scope: _Scope
+    demand_scope: Scope
     bound_as: str
 
 
@@ -151,7 +136,7 @@ class LoopBuilder:
     def bind_accum(self, origin: str, name: str, required: tuple[str, ...], bound_as: str) -> None:
         self._accum_binding[(origin, name, required)] = bound_as
 
-    def insert(self, stmt: Stmt, enclosure: _Scope) -> None:
+    def insert(self, stmt: Stmt, enclosure: Scope) -> None:
         self._body = _prepend_at(self._body, enclosure.enclosing, stmt)
 
     def finish(self) -> tuple[Stmt, ...]:
@@ -172,88 +157,21 @@ def _prepend_at(body: tuple[Stmt, ...], path: tuple[Axis, ...], stmt: Stmt) -> t
 
 
 # ---------------------------------------------------------------------------
-# Body analysis
-# ---------------------------------------------------------------------------
-
-
-def _analyze(body: tuple[Stmt, ...]) -> tuple[dict[str, Stmt], dict[str, _Scope], list[tuple[Write, _Scope]]]:
-    """Walk ``body`` once; return (name→stmt, name→enclosing-scope, [(Write, scope), ...]).
-
-    For Accums, the recorded enclosing scope INCLUDES the reduce axis at
-    its tail (callers strip it via ``enclosing[:-1]`` to get the binding
-    scope).
-    """
-    defs: dict[str, Stmt] = {}
-    encs: dict[str, _Scope] = {}
-    writes: list[tuple[Write, _Scope]] = []
-
-    def walk(stmts: tuple[Stmt, ...], scope: _Scope) -> None:
-        for s in stmts:
-            if isinstance(s, Loop):
-                walk(s.body, _Scope(enclosing=scope.enclosing + (s.axis,)))
-            elif isinstance(s, (Load, Assign, Select)):
-                defs[s.name] = s
-                encs[s.name] = scope
-            elif isinstance(s, Accum):
-                defs[s.name] = s
-                encs[s.name] = scope
-            elif isinstance(s, Write):
-                writes.append((s, scope))
-
-    walk(body, _Scope())
-    return defs, encs, writes
-
-
-# ---------------------------------------------------------------------------
 # Context — per-splice frozen analysis
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class _LoopMeta:
-    op: LoopOp
-    inputs: list[str]
-    defs: dict[str, Stmt]
-    enc: dict[str, _Scope]
-    writes: list[tuple[Write, _Scope]]
-    axis_names: set[str]
-
-
-@dataclass
 class _Ctx:
-    loops: dict[str, _LoopMeta]
+    loops: dict[str, LoopMeta]
     source: int
 
     @classmethod
-    def build(
-        cls,
-        producer: LoopOp,
-        consumer: LoopOp,
-        source: int,
-        producer_inputs: list[str],
-        consumer_inputs: list[str],
-    ) -> _Ctx:
-        p_defs, p_enc, p_writes = _analyze(producer.body)
-        c_defs, c_enc, c_writes = _analyze(consumer.body)
-        loops = {
-            "producer": _LoopMeta(
-                op=producer,
-                inputs=producer_inputs,
-                defs=p_defs,
-                enc=p_enc,
-                writes=p_writes,
-                axis_names={a.name for a in producer.axes},
-            ),
-            "consumer": _LoopMeta(
-                op=consumer,
-                inputs=consumer_inputs,
-                defs=c_defs,
-                enc=c_enc,
-                writes=c_writes,
-                axis_names={a.name for a in consumer.axes},
-            ),
-        }
-        return cls(loops=loops, source=source)
+    def build(cls, producer: LoopOp, consumer: LoopOp, source: int) -> _Ctx:
+        return cls(
+            loops={"producer": producer.analyze(), "consumer": consumer.analyze()},
+            source=source,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -265,9 +183,6 @@ def splice_loop_ops(
     producer: LoopOp,
     consumer: LoopOp,
     source: int,
-    *,
-    producer_inputs: list[str] | None = None,
-    consumer_inputs: list[str] | None = None,
 ) -> LoopOp | None:
     """Splice ``producer``'s expression into every consumer ``Load`` that
     targets ``source``. Returns ``None`` when the pattern isn't supported."""
@@ -283,13 +198,7 @@ def splice_loop_ops(
     if _has_nested_accums(producer.body):
         return None
     try:
-        ctx = _Ctx.build(
-            producer,
-            consumer,
-            source,
-            list(producer_inputs or []),
-            list(consumer_inputs or []),
-        )
+        ctx = _Ctx.build(producer, consumer, source)
         b = LoopBuilder(used_names=_collect_names(producer) | _collect_names(consumer))
         _seed(ctx, b)
         while b.has_deps():
@@ -336,7 +245,7 @@ def _ensure_dep(
     name: str,
     origin: str,
     sigma: dict[str, Expr],
-    ref_scope: _Scope,
+    ref_scope: Scope,
     ctx: _Ctx,
     b: LoopBuilder,
 ) -> str:
@@ -353,7 +262,7 @@ def _ensure_dep(
         raise _NotSupported
 
     if isinstance(def_stmt, Accum):
-        full_enc = meta.enc[name]
+        full_enc = meta.scopes[name]
         required = tuple(_remap_axis_name(a, sigma) for a in full_enc.enclosing[:-1])
         existing = b.seen_accum(origin, name, required)
         if existing is not None:
@@ -369,7 +278,7 @@ def _ensure_dep(
         return existing
     bound = b.fresh(name)
     b.bind_plain(origin, name, sigma, bound)
-    required_axes = tuple(_remap_axis_name(a, sigma) for a in meta.enc[name].enclosing)
+    required_axes = tuple(_remap_axis_name(a, sigma) for a in meta.scopes[name].enclosing)
     # Producer plain stmts: require the σ-mapped enclosing to axis-set-equal
     # ``ref_scope``. With whole-tensor backend semantics Accums reduce over
     # every reduce axis at once, so emitting a producer stmt at a scope that
@@ -438,7 +347,7 @@ def _resolve_producer_load(stmt: Load, d: _Demand, ctx: _Ctx, b: LoopBuilder) ->
     if prod_write is None:
         raise _NotSupported
     effective_index = tuple(substitute(e, d.sigma) for e in stmt.index)
-    sigma = _solve_sigma(prod_write.index, effective_index, producer.axis_names)
+    sigma = _solve_sigma(prod_write.index, effective_index, {a.name for a in producer.op.axes})
     if sigma is None:
         raise _NotSupported
     v_bound = _ensure_dep(prod_write.value, "producer", sigma, d.demand_scope, ctx, b)
@@ -449,13 +358,13 @@ def _resolve_accum(stmt: Accum, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
     """Emit ``Loop(fresh_reduce_axis, [Accum(bound, value_bound, op)])`` at
     ``d.demand_scope``. The Accum's value is queued under σ extended with
     the fresh reduce-axis binding."""
-    full_enc = ctx.loops[d.origin].enc[stmt.name]
+    full_enc = ctx.loops[d.origin].scopes[stmt.name]
     orig_axis = full_enc.enclosing[-1]
     fresh_name = b.fresh(orig_axis.name)
     reduce_axis = Axis(name=fresh_name, extent=orig_axis.extent)
     inner_sigma = dict(d.sigma)
     inner_sigma[orig_axis.name] = Var(fresh_name)
-    inner_scope = _Scope(enclosing=d.demand_scope.enclosing + (reduce_axis,))
+    inner_scope = Scope(enclosing=d.demand_scope.enclosing + (reduce_axis,))
     value_bound = _ensure_dep(stmt.value, d.origin, inner_sigma, inner_scope, ctx, b)
     b.insert(Accum(name=d.bound_as, value=value_bound, op=stmt.op), inner_scope)
 
@@ -465,7 +374,7 @@ def _resolve_accum(stmt: Accum, d: _Demand, ctx: _Ctx, b: LoopBuilder) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _scope_for_axes(ref_scope: _Scope, required: tuple[str, ...]) -> _Scope:
+def _scope_for_axes(ref_scope: Scope, required: tuple[str, ...]) -> Scope:
     """Shortest prefix of ``ref_scope`` whose axis set contains ``required``.
 
     Used two ways:
@@ -486,7 +395,7 @@ def _scope_for_axes(ref_scope: _Scope, required: tuple[str, ...]) -> _Scope:
         k += 1
     if remaining:
         raise _NotSupported
-    return _Scope(enclosing=ref_scope.enclosing[:k])
+    return Scope(enclosing=ref_scope.enclosing[:k])
 
 
 def _remap_axis_name(axis: Axis, sigma: dict[str, Expr]) -> str:

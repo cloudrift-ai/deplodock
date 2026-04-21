@@ -297,7 +297,7 @@ def _reduce_loop_to_steps(
         remat = _remat_set(list(body), prior_ew, row_space)
         remat_assigns = tuple(a for a in prior_ew if a.name in remat)
         acc = acc_map[last_update.name]
-        combine_fn = acc.combine.fn
+        combine_fn = acc.op.fn
         identity = _literal_value(acc.init)
         accum = PlanAccum(
             var=f"acc{acc_count}",

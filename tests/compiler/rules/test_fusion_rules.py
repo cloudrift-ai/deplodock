@@ -81,7 +81,7 @@ def _has_update(body) -> bool:
 
 
 def _local_combine_fns(locals_) -> set[str]:
-    return {lb.combine.fn for lb in locals_ if lb.combine is not None}
+    return {lb.op.fn for lb in locals_ if lb.op is not None}
 
 
 # ===================================================================

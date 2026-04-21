@@ -52,6 +52,27 @@ class Axis:
 
 
 # ---------------------------------------------------------------------------
+# Scope — a path of enclosing axes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Scope:
+    """Enclosing loop nest from outermost to innermost.
+
+    A ``Scope`` identifies a location in a ``LoopOp`` body: the sequence
+    of ``Loop`` axes one descends to reach that point. Empty = body root.
+    Used by analysis passes that need to know where a named SSA value was
+    defined or where a new stmt should be emitted.
+    """
+
+    enclosing: tuple[Axis, ...] = ()
+
+    def nest(self, axis: Axis) -> Scope:
+        return Scope(enclosing=self.enclosing + (axis,))
+
+
+# ---------------------------------------------------------------------------
 # Body statements
 # ---------------------------------------------------------------------------
 
@@ -173,12 +194,6 @@ class Accum(Stmt):
         backend, emit) don't have to re-implement the lookup.
         """
         return Literal(ACCUM_IDENTITY.get(self.op.fn, 0.0))
-
-    @property
-    def combine(self) -> ElementwiseOp:
-        """Alias for :attr:`op` — matches the legacy ``Accum.combine``
-        field name so older reader code keeps working."""
-        return self.op
 
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
@@ -381,6 +396,29 @@ class LoopOp(Op):
         walk(self.body)
         return tuple(seen.values())
 
+    def analyze(self) -> LoopMeta:
+        """One-pass summary of the body: name→def, name→scope, writes.
+
+        Convenience for passes (e.g. the fusion splicer) that resolve SSA
+        dependencies against a stable snapshot of the body tree.
+        """
+        defs: dict[str, Stmt] = {}
+        scopes: dict[str, Scope] = {}
+        writes: list[tuple[Write, Scope]] = []
+
+        def walk(stmts: tuple[Stmt, ...], scope: Scope) -> None:
+            for s in stmts:
+                if isinstance(s, Loop):
+                    walk(s.body, scope.nest(s.axis))
+                elif isinstance(s, (Load, Assign, Select, Accum)):
+                    defs[s.name] = s
+                    scopes[s.name] = scope
+                elif isinstance(s, Write):
+                    writes.append((s, scope))
+
+        walk(self.body, Scope())
+        return LoopMeta(op=self, defs=defs, scopes=scopes, writes=tuple(writes))
+
     def forward(self, *inputs):
         """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
 
@@ -427,6 +465,31 @@ class LoopOp(Op):
             else:
                 dims.append(int(vals) + 1)
         return tuple(dims)
+
+
+# ---------------------------------------------------------------------------
+# LoopMeta — analysis summary produced by ``LoopOp.analyze``
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LoopMeta:
+    """Precomputed lookups over a ``LoopOp`` body.
+
+    - ``op``: the source ``LoopOp`` this meta was built from.
+    - ``defs``: SSA name → defining ``Stmt`` (``Load`` / ``Assign`` /
+      ``Select`` / ``Accum``). A ``Write`` has no SSA name and is not here.
+    - ``scopes``: SSA name → ``Scope`` (enclosing axes of the def). For an
+      ``Accum``, the tail axis is the reduce axis; strip it for the
+      binding scope.
+    - ``writes``: every ``Write`` stmt paired with the ``Scope`` it sits
+      in — one entry per output, in body order.
+    """
+
+    op: LoopOp
+    defs: dict[str, Stmt]
+    scopes: dict[str, Scope]
+    writes: tuple[tuple[Write, Scope], ...]
 
 
 # ---------------------------------------------------------------------------
