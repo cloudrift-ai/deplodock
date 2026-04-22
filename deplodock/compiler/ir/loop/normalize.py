@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var
+from deplodock.compiler.ir.expr import Expr, Literal, Var, free_vars
 from deplodock.compiler.ir.loop.ir import (
     Accum,
     Assign,
@@ -53,6 +53,7 @@ __all__ = [
     "canonicalize_free_axis_order",
     "eliminate_copy_aliases",
     "unify_sibling_reduce_axes",
+    "hoist_loop_invariants",
     "rename_ssa_sequential",
 ]
 
@@ -90,6 +91,7 @@ def normalize_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     stmts = canonicalize_free_axis_order(stmts)
     stmts = eliminate_copy_aliases(stmts)
     stmts = unify_sibling_reduce_axes(stmts)
+    stmts = hoist_loop_invariants(stmts)
     stmts = rename_ssa_sequential(stmts)
     return stmts
 
@@ -276,7 +278,124 @@ def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -
 
 
 # ---------------------------------------------------------------------------
-# Pass 5: canonicalize SSA names to sequential v0, v1, ...
+# Pass 5: loop-invariant code motion
+# ---------------------------------------------------------------------------
+
+
+def hoist_loop_invariants(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Move ``Load`` / ``Assign`` / ``Select`` stmts out of ``Loop``s whose
+    axis their value doesn't depend on.
+
+    Applied bottom-up. For each ``Loop``, the body is first recursively
+    hoisted; then stmts whose live axes don't include the loop's axis and
+    whose SSA deps are available in the enclosing scope (either outer
+    bindings or earlier-hoisted siblings) are emitted *before* the Loop
+    in the parent body. ``Accum``, ``Write``, and ``Loop`` stmts stay in
+    place — their position is semantically meaningful.
+
+    Makes the IR's scope structure honest: every stmt lands at the
+    shallowest scope that contains its dependencies, so downstream codegen
+    sees a canonical form regardless of where fusion originally placed
+    the stmt.
+    """
+    axes_of: dict[str, frozenset[str]] = {}
+    ssa_names: set[str] = set()
+
+    def _load_index_parts(index: tuple[Expr, ...]) -> tuple[set[str], set[str]]:
+        """Split free vars in ``index`` into (ssa_deps, axis_names).
+
+        A Load's index can reference other Load SSA names (gather pattern),
+        not just axis Vars. SSA names are deps; axis names contribute to
+        live_axes directly.
+        """
+        deps: set[str] = set()
+        axes: set[str] = set()
+        for e in index:
+            for v in free_vars(e):
+                (deps if v in ssa_names else axes).add(v)
+        return deps, axes
+
+    def _stmt_live(s: Stmt) -> frozenset[str]:
+        if isinstance(s, Load):
+            deps, axes = _load_index_parts(s.index)
+            result = set(axes)
+            for d in deps:
+                result |= axes_of.get(d, frozenset())
+            return frozenset(result)
+        if isinstance(s, Assign):
+            result = set()
+            for name in s.args:
+                result |= axes_of.get(name, frozenset())
+            return frozenset(result)
+        if isinstance(s, Select):
+            result = set()
+            for b in s.branches:
+                result |= free_vars(b.select)
+                result |= axes_of.get(b.value, frozenset())
+            return frozenset(result)
+        return frozenset()
+
+    def _deps(s: Stmt) -> tuple[str, ...]:
+        if isinstance(s, Load):
+            deps, _ = _load_index_parts(s.index)
+            return tuple(deps)
+        if isinstance(s, Assign):
+            return s.args
+        if isinstance(s, Select):
+            return tuple(b.value for b in s.branches)
+        return ()
+
+    def walk(body: tuple[Stmt, ...], outer_bindings: set[str]) -> list[Stmt]:
+        new_body: list[Stmt] = []
+        bindings = set(outer_bindings)
+
+        for s in body:
+            if isinstance(s, Loop):
+                inner = walk(s.body, bindings)
+                axis = s.axis.name
+                hoisted_names: set[str] = set()
+                hoisted: list[Stmt] = []
+                stay: list[Stmt] = []
+                for c in inner:
+                    if isinstance(c, (Load, Assign, Select)):
+                        live = axes_of.get(c.name, frozenset())
+                        if axis not in live and all(d in bindings or d in hoisted_names for d in _deps(c)):
+                            hoisted.append(c)
+                            hoisted_names.add(c.name)
+                            continue
+                    stay.append(c)
+
+                for h in hoisted:
+                    new_body.append(h)
+                    bindings.add(h.name)
+                new_body.append(Loop(axis=s.axis, body=tuple(stay)))
+
+                # Accum bindings leak to the enclosing scope after the Loop
+                # closes; record their outside-the-loop live_axes.
+                for c in inner:
+                    if isinstance(c, Accum):
+                        axes_of[c.name] = axes_of.get(c.value, frozenset()) - {axis}
+                        ssa_names.add(c.name)
+                        bindings.add(c.name)
+            else:
+                new_body.append(s)
+                name = getattr(s, "name", None)
+                if name is not None:
+                    if isinstance(s, Accum):
+                        # Shouldn't appear at root; record conservatively.
+                        axes_of[name] = axes_of.get(s.value, frozenset())
+                    else:
+                        axes_of[name] = _stmt_live(s)
+                    ssa_names.add(name)
+                    bindings.add(name)
+
+        return new_body
+
+    return tuple(walk(stmts, set()))
+
+
+# ---------------------------------------------------------------------------
+# Pass 6: canonicalize SSA names to sequential v0, v1, ...
 # ---------------------------------------------------------------------------
 
 

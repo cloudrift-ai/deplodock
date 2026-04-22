@@ -498,20 +498,23 @@ def test_loop_axis_sibling_same_name_allowed():
 
 
 def test_loop_ssa_scoping():
-    """Assign defined inside Loop body is invisible outside — caller Assign must fail."""
+    """Assign defined inside Loop body is invisible outside — caller Assign must fail.
+
+    The inner Assign binds to the inner axis (via ``$0``'s index) so LICM
+    can't hoist it out; the outer reference is a true scope violation.
+    """
     from deplodock.compiler.ir.loop import Loop
 
-    # A Loop body defines "v"; a sibling statement tries to reference it.
     with pytest.raises(ValueError, match="not defined"):
         _loop(
-            axes=(Axis("a0", 4),),
-            inputs=(Port(index=(Var("a0"),)),),
+            axes=(Axis("a0", 4), Axis("a0_inner", 4)),
+            inputs=(Port(index=(Var("a0_inner"),)),),
             body=(
                 Loop(
                     axis=Axis("a0_inner", 4),
                     body=(Assign("v", ElementwiseOp("neg"), args=("$0",)),),
                 ),
-                # Reference 'v' outside the Loop — should fail.
+                # Reference 'v' outside the inner Loop — should fail.
                 Write(output=0, index=(Var("a0"),), value="v"),
             ),
         )
