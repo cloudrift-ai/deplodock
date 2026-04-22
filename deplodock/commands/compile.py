@@ -71,18 +71,13 @@ def handle_compile(args):
 
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, len(program.launches))
 
-    # JSON serialization for fused graphs (LoopOp bodies with Load/Accum/…)
-    # isn't implemented yet; skip the save for those, print a dump path hint.
-    from deplodock.compiler.ir.loop import LoopOp as _LoopOp
-
-    if any(isinstance(n.op, _LoopOp) for n in graph.nodes.values()):
-        logger.info("Fused graph has LoopOp nodes; skipping JSON save (not serializable yet).")
-        return
-
-    output_path = args.output or f"{base_name}.compiled.json"
-    with open(output_path, "w") as f:
-        json.dump(graph.to_dict(), f, indent=2)
-    logger.info("Saved: %s", output_path)
+    # Graph → JSON round-trip isn't implemented for IndexSource / Expr /
+    # Loop IR body types; write the LoopProgram's human-readable form
+    # instead. To round-trip the IR, use ``--dump-dir`` or re-trace from
+    # the model id via ``deplodock run <model_id> "<prompt>"``.
+    output_path = Path(args.output) if args.output else Path(f"{base_name}.loop-program.txt")
+    output_path.write_text(program.pretty_print())
+    logger.info("Saved LoopProgram: %s", output_path)
 
 
 def _handle_compile_inspect(args):
