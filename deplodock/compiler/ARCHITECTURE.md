@@ -153,45 +153,48 @@ Lift-then-splice, driven by the rewriter's fixpoint loop:
    multi-source IndexMapOps (cat / concat) contribute a ``Select``
    prelude choosing among per-source Loads.
 2. **Splice adjacent ``LoopOp`` pairs** (``005_merge_loop_ops`` calls
-   ``_splice.py::splice_loop_ops``). The splicer walks the consumer body
-   recursively; at every ``Load(source=target)`` it reverse-reconstructs
-   the producer expression that computed the loaded value, via a DFS from
-   the producer's ``Write.value`` back to its Loads. A minimal σ handles
-   non-identity Write forms:
+   ``ir/loop/splicer.py::splice_graph``; ``splice_loop_ops`` /
+   ``splice_loops`` are thin pairwise / tag-generic entry points over
+   the same ``_Splicer``). The splicer is worklist-driven: seed with
+   every ``Write`` of the sink, resolve one pending dep at a time,
+   queue each def's own deps. A minimal σ handles non-identity Write
+   forms:
    - ``Var(p)`` in ``writer.index[k]`` → bind ``p → reader.index[k]``.
    - ``Literal(c)`` in ``writer.index[k]`` → no binding (keep-dim
      reduction slot, broadcast position).
    Anything else in the writer (``Var(p) ± c``, ``Cast``,
    multiplicative) → splice refuses and the kernels stay separate.
-3. **Lazy accumulator hoisting** — when the DFS encounters a producer
-   ``Accum`` reference, it records a pending entry with the scope at
-   which that accumulator's reduce Loop must live: σ-mapped to the
-   consumer's axis names, computed from the accumulator's
-   ``enclosing_axes`` tuple. Pending entries bubble up through consumer
-   ``Loop`` returns; at each scope the walker flushes the entries that
-   match — emitting the accumulator's reduce Loop before any stmt that
-   references it. Key (producer_accum, required_c_axes) is scope-keyed:
-   the same accumulator needed at distinct consumer scopes gets separate
-   emissions (necessary for patterns like SDPA where QK^T's D-reduce is
-   needed both inside the softmax-max reduce and inside the output-K
-   free loop — reusing one emission would stale-bind the accumulator).
-4. **Duplicate input dedup + sibling reduce axis unification** — when
-   producer and consumer both reference the same external node, the
-   merged kernel's input list ends up with duplicates (``[x, x]``).
-   ``005_merge_loop_ops._dedupe_duplicate_inputs`` collapses them,
-   rewriting body Load sources so identical buffers share one source
-   index. Body reconstruction then triggers
-   ``ir/loop/normalize.unify_sibling_reduce_axes``, which at every scope
-   finds sibling reduce Loops whose reduce axes index the same
-   ``(source, dim)`` position and renames them to a single canonical
-   axis name. Together these collapse ``sum(x, -1) + max(x, -1)`` into
-   one kernel with two accumulators sharing one reduce sweep name, and
-   make softmax's max-over-K and sum-over-K report as a single reduce
-   axis.
-5. **Fixpoint** — lift rules fire once per tensor op; the splice fires
+
+   **Unified dedup table.** Each emission is keyed on
+   ``(origin, name, emit_scope, σ.restrict(live_axes))`` — the tag/name
+   identity, where the stmt lands in the merged body, and the σ
+   restricted to axes actually reachable through that stmt's Expr
+   subtrees (``LoopMeta.live_axes``). Same key → share one emission;
+   different emit scope or σ-binding → emit again.
+
+   **Accum placement.** A producer ``Accum`` reference materializes as
+   ``Loop(fresh_reduce_axis, Accum(...))`` at
+   ``_scope_for_axes(ref_scope, required_c_axes)`` — the innermost
+   consumer scope covering the σ-mapped enclosing axes. SDPA-style
+   patterns where QK^T is referenced inside softmax's max-loop and
+   sum-loop resolve to two distinct emit scopes and emit twice, each
+   under its own j-reduce — different keys, separate emissions.
+3. **Input dedup + sibling reduce axis unification.** The graph-based
+   ``splice_graph`` walks the subgraph and assigns each distinct
+   external input node a slot in first-seen order — shared external
+   buffers land in one slot by construction. The merged body then
+   re-runs ``ir/loop/normalize.unify_sibling_reduce_axes``, which at
+   every scope finds sibling reduce Loops whose reduce axes index the
+   same ``(Load.source, dim)`` position and renames them to a single
+   canonical axis name. Together these collapse
+   ``sum(x, -1) + max(x, -1)`` into one kernel with two accumulators
+   sharing one reduce sweep name, and make softmax's max-over-K and
+   sum-over-K report as a single reduce axis.
+4. **Fixpoint.** Lift rules fire once per tensor op; the splice fires
    repeatedly on adjacent LoopOps. Patterns the splicer can't handle
    (σ unsolvable, or an accumulator's required enclosing axes can't be
-   mapped to the current consumer scope) simply stay as separate kernels.
+   mapped to the current consumer scope) simply stay as separate
+   kernels.
    Copy-elimination and SSA canonicalisation are not fusion-pass rules —
    they live in ``ir/loop/normalize.py`` and run inside
    ``LoopOp.__post_init__`` on every constructed body.

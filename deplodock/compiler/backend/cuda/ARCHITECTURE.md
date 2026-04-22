@@ -56,7 +56,7 @@ GpuProgram
 
 The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Load` / `Assign` / `Accum` / `Write` / `Select` statements. Each `Assign` is `name = op(args)` where args reference prior SSA names (from Loads, Assigns, Selects); external buffer reads are explicit `Load` stmts keyed by `source` int into `LoopLaunch.input_names`.
 
-**Load emission** (`_emit_load_access(index, buf_name, src_shape, axis_env)`): evaluates `Load.index` in the current axis environment and emits `ArrayAccess(buffer, coord)`. There is no separate indexing abstraction — every IndexMapOp is lifted to a one-op `LoopOp` by `003_lift_indexmap`, and the splicer in `rules/fusion/_splice.py` inlines the coord_map into the consumer's body Loads whenever a splice is legal. Unmerged IndexMap kernels stay as standalone copy kernels.
+**Load emission** (`_emit_load_access(index, buf_name, src_shape, axis_env)`): evaluates `Load.index` in the current axis environment and emits `ArrayAccess(buffer, coord)`. There is no separate indexing abstraction — every IndexMapOp is lifted to a one-op `LoopOp` by `003_lift_indexmap`, and the splicer in `ir/loop/splicer.py` inlines the coord_map into the consumer's body Loads whenever a splice is legal. Unmerged IndexMap kernels stay as standalone copy kernels.
 
 **Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a body `Select` into a nested `Ternary` chain over each `SelectBranch.select` predicate. (There is no `Mux` / `Combine` IR — those were replaced by `Select` / `SelectBranch`.)
 

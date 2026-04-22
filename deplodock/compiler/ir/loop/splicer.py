@@ -1,22 +1,41 @@
-"""Worklist-driven splicer for adjacent ``LoopOp``s.
+"""Worklist-driven splicer for a DAG of ``LoopOp``s.
 
-Builds the merged body one statement at a time. Seed: every consumer
-``Write``. Each iteration pops one pending dep from the worklist and
-emits its def, queueing that def's own deps in turn. Three dep shapes:
+Three public entry points wrap the same underlying ``_Splicer``:
 
-- **Consumer Load from the producer** — emit a copy alias at the demand
-  scope; queue the producer's ``Write.value`` under σ = solve(writer,
-  reader). The producer's expression chain lands piecemeal over
-  subsequent iterations.
-- **Accum (producer or consumer)** — freshen the reduce axis, place a
-  new ``Loop(reduce_axis, Accum(...))`` at ``_accum_enclosure`` of the
-  demand scope, and queue the Accum's ``value``. Scope-keyed dedup:
-  the same Accum demanded at different ``required_c_axes`` gets two
-  separate materializations (SDPA's QK^T at softmax-max vs output).
-- **Plain Assign / Select / Load(non-producer source)** — ``rewrite``
-  the original stmt with fresh names and σ-substituted Exprs; insert at
-  the stmt's natural scope (consumer: σ-remapped enclosing, which for
-  consumer origin is usually identity; producer: σ-remapped enclosing).
+- :func:`splice_loop_ops` — pairwise producer / consumer helper.
+- :func:`splice_loops` — tag-generic N-way: caller supplies ``loops``
+  (tag → ``LoopOp``), ``splice_edges`` ((origin_tag, src) →
+  (target_tag, target_output)), and ``input_remap``. Sink is derived
+  as the one tag that never appears as a splice target.
+- :func:`splice_graph` — consumes a ``Graph`` fragment directly;
+  classifies each Load by its node.inputs edge (LoopOp → splice,
+  otherwise → external slot in first-seen order).
+
+Algorithm. Seed: every ``Write`` of the sink loop. Each iteration pops
+one pending dep and emits its def, queueing that def's own deps.
+Resolution dispatches on stmt kind:
+
+- **Load on a splice edge** — emit a copy alias at the demand scope;
+  σ is solved by pairing target's ``Write.index`` against the reader's
+  σ-substituted index, and the target's ``Write.value`` is queued under
+  the solved σ. The target's expression chain reconstructs piecemeal.
+- **Accum** — freshen its reduce axis, place
+  ``Loop(fresh_reduce_axis, Accum(...))`` at
+  ``_scope_for_axes(ref_scope, required_c_axes)``, queue the Accum's
+  ``value`` under σ extended with the fresh reduce binding.
+- **Plain Assign / Select / Load** (non-splice source) — ``rewrite``
+  the original stmt through ``(rename_ssa, sigma)`` and insert at the
+  demand scope.
+
+Unified dedup. A single table keyed on
+``(origin, name, emit_scope, σ.restrict(live_axes))`` decides whether
+to share an existing emission or allocate a fresh one. ``live_axes``
+comes from ``LoopMeta`` and is the set of axes transitively reachable
+through the stmt's Expr subtrees — σ bindings outside that set are
+irrelevant and collapsed. Same key → share; different emit scope or
+different live-σ → emit twice. This handles plain-stmt sharing, Accum
+scope multiplicity (SDPA QK^T at softmax-max vs softmax-output), and
+multi-output splice targets uniformly.
 
 ``LoopBuilder.insert`` is pure tree-splicing: descend the body along
 the enclosure path, creating ``Loop`` nodes if missing, prepend at the
