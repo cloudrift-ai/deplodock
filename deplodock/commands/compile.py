@@ -71,9 +71,15 @@ def handle_compile(args):
 
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, len(program.launches))
 
+    # JSON serialization for fused graphs (LoopOp bodies with Load/Accum/…)
+    # isn't implemented yet; skip the save for those, print a dump path hint.
+    from deplodock.compiler.ir.loop import LoopOp as _LoopOp
+
+    if any(isinstance(n.op, _LoopOp) for n in graph.nodes.values()):
+        logger.info("Fused graph has LoopOp nodes; skipping JSON save (not serializable yet).")
+        return
+
     output_path = args.output or f"{base_name}.compiled.json"
-    # Persist as the original graph for now; structural LoopOp serialization
-    # lands when the lowering is in place.
     with open(output_path, "w") as f:
         json.dump(graph.to_dict(), f, indent=2)
     logger.info("Saved: %s", output_path)

@@ -17,6 +17,8 @@ The resulting ``LoopProgram`` is the single input to backend codegen
 
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,6 +33,8 @@ if TYPE_CHECKING:
 
 _RULES_DIR = Path(__file__).parent / "rules"
 
+logger = logging.getLogger(__name__)
+
 
 def compile_graph(graph: Graph, name: str = "prog", dump: CompilerDump | None = None) -> LoopProgram:
     """Lower a traced ``Graph`` to a ``LoopProgram``.
@@ -39,20 +43,37 @@ def compile_graph(graph: Graph, name: str = "prog", dump: CompilerDump | None = 
     order; downstream codegen reads shapes from it and never recomputes
     them.
     """
+    t_start = time.monotonic()
+    n_in = len(graph.nodes)
+
+    t0 = time.monotonic()
     rewriter_pre = Rewriter.from_directory(_RULES_DIR, pass_order=["decomposition", "optimization"])
     graph = rewriter_pre.apply(graph)
+    logger.info("compile: decompose+optimize %.2fs (%d -> %d nodes)", time.monotonic() - t0, n_in, len(graph.nodes))
 
     if dump is not None:
         dump.dump_tensor_ir(graph)
 
+    t0 = time.monotonic()
+    n_before_fusion = len(graph.nodes)
     rewriter_fusion = Rewriter.from_directory(_RULES_DIR, pass_order=["fusion"])
     graph = rewriter_fusion.apply(graph)
+    logger.info("compile: fuse %.2fs (%d -> %d nodes)", time.monotonic() - t0, n_before_fusion, len(graph.nodes))
 
+    t0 = time.monotonic()
+    n_loop_ops = 0
     for node in graph.nodes.values():
         if isinstance(node.op, LoopOp):
             node.op = simplify_loop_op(node.op)
+            n_loop_ops += 1
+    logger.info("compile: simplify_loop_op %.2fs (%d LoopOp nodes)", time.monotonic() - t0, n_loop_ops)
 
+    t0 = time.monotonic()
     program = LoopProgram.from_graph(graph, name=name)
+    logger.info("compile: LoopProgram.from_graph %.2fs (%d launches)", time.monotonic() - t0, len(program.launches))
+
     if dump is not None:
         dump.dump_loop_program(program)
+
+    logger.info("compile: total %.2fs", time.monotonic() - t_start)
     return program
