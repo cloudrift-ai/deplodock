@@ -64,6 +64,15 @@
 See `ir/ARCHITECTURE.md` for the per-dialect breakdown of each IR level,
 and `program/ARCHITECTURE.md` for the Program-form pairing.
 
+`model_wrapper.py` holds helpers for tracing whole HF `CausalLM` models:
+`build_full_model_wrapper()` returns an `nn.Module` with a precomputed
+causal mask (so HF's dynamic mask-construction ops stay out of the
+traced graph), and `collect_const_feed()` resolves tracer-emitted
+placeholder names (e.g. `p_attn_q_proj_weight`) back to their module
+attributes using `ExportedProgram.graph_signature`. Use
+`trace_module_with_constants()` to get both the IR graph and the
+placeholder→attribute map in one pass.
+
 ## Canonical Data Flow
 
 ```

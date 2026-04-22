@@ -28,7 +28,18 @@ _IR_STAGE_FILES = {
 def register_compile_command(subparsers):
     parser = subparsers.add_parser("compile", help="Compile a model or IR through structural lowering")
     parser.add_argument("input", help="HuggingFace model ID or .json IR file")
-    parser.add_argument("--layer", type=int, default=0, help="Layer index (when input is a model ID)")
+    parser.add_argument(
+        "--layer",
+        type=int,
+        default=None,
+        help="Layer index (when input is a model ID). Omit to compile the whole model.",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=32,
+        help="Sequence length for full-model tracing (default: 32).",
+    )
     parser.add_argument("--output", "-o", help="Output path for compiled IR")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
     parser.add_argument(
@@ -106,9 +117,12 @@ def _load_or_trace(args) -> tuple[Graph, str]:
         graph = _load_graph(input_path)
         base_name = input_path.stem
     else:
-        graph = _trace_model(args.input, args.layer)
+        graph = _trace_model(args.input, args.layer, args.seq_len)
         safe_name = args.input.replace("/", "-").lower()
-        base_name = f"{safe_name}-layer{args.layer}"
+        if args.layer is None:
+            base_name = f"{safe_name}-full-s{args.seq_len}"
+        else:
+            base_name = f"{safe_name}-layer{args.layer}"
     return graph, base_name
 
 
@@ -120,7 +134,7 @@ def _load_graph(path: Path) -> Graph:
     return Graph.from_dict(data)
 
 
-def _trace_model(model_id: str, layer: int) -> Graph:
+def _trace_model(model_id: str, layer: int | None, seq_len: int) -> Graph:
     try:
         import torch
         from transformers import AutoModelForCausalLM
@@ -131,7 +145,17 @@ def _trace_model(model_id: str, layer: int) -> Graph:
     from deplodock.compiler.torch_trace import trace_module
 
     logger.info("Pulling %s...", model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16)
+    dtype = torch.float32 if layer is None else torch.float16
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
+    model.eval()
+
+    if layer is None:
+        from deplodock.compiler.model_wrapper import build_full_model_wrapper
+
+        logger.info("Tracing full model (seq_len=%d)...", seq_len)
+        wrapper = build_full_model_wrapper(model, seq_len, dtype)
+        input_ids = torch.zeros((1, seq_len), dtype=torch.long)
+        return trace_module(wrapper, (input_ids,))
 
     layers = model.model.layers
     if layer >= len(layers):
@@ -142,8 +166,7 @@ def _trace_model(model_id: str, layer: int) -> Graph:
     logger.info("Tracing layer %d...", layer)
 
     hidden_size = model.config.hidden_size
-    seq_len = 32
-    x = torch.randn(1, seq_len, hidden_size, dtype=torch.float16)
+    x = torch.randn(1, seq_len, hidden_size, dtype=dtype)
     position_ids = torch.arange(seq_len).unsqueeze(0)
     cos, sin = model.model.rotary_emb(x, position_ids)
 

@@ -42,12 +42,13 @@ Or for a specific test file:
 - `deplodock vm delete gcp ...` — delete a GCP GPU VM
 - `deplodock vm delete cloudrift ...` — delete a CloudRift GPU VM
 - `deplodock pull <model>` — download a HuggingFace model to local cache
-- `deplodock trace <model> --layer N` — trace a transformer layer to Graph IR (JSON)
+- `deplodock trace <model> [--layer N] [--seq-len N]` — trace a transformer layer (or the whole model if `--layer` is omitted) to Graph IR (JSON). Whole-model tracing patches HF's dynamic causal-mask construction via `model_wrapper.build_full_model_wrapper`.
 - `deplodock trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)
-- `deplodock compile <model_or_ir> [--layer N] [--dump-dir DIR]` — lower a traced graph to a `LoopProgram` (auto-pulls + traces if given a model ID)
+- `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR]` — lower a traced graph to a `LoopProgram` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model)
 - `deplodock compile <ir_file> --ir {tensor|loop|loop-program|kernel|cuda|cuda-program}` — print the requested IR stage to stdout (skips the normal `.compiled.json` save). `loop`/`kernel`/`cuda` show per-kernel views; `loop-program`/`cuda-program` add program-level context (buffer list + launch schedule).
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
 - `deplodock run <ir_file> [--benchmark] [--dump-dir DIR]` — run a compiled graph IR through the full pipeline. With `--benchmark`, logs top-N per-kernel GPU-event times; `--dump-dir` stores them under `per_launch` in `60_benchmark.json`, inherited by `bench` via `DEPLODOCK_DUMP_DIR`.
+- `deplodock run <model_id> "<prompt>" [--max-new-tokens N] [--seq-len N]` — trace + compile a full HF CausalLM and greedy-decode from the prompt.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 7B): `Qwen/Qwen2.5-7B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

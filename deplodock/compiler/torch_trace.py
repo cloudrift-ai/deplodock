@@ -50,10 +50,23 @@ def trace_module(
     example_inputs: tuple[torch.Tensor, ...],
     kwargs: dict[str, Any] | None = None,
 ) -> Graph:
-    """Trace a PyTorch module and convert the FX graph to our IR.
+    """Trace a PyTorch module and convert the FX graph to our IR."""
+    graph, _ = trace_module_with_constants(module, example_inputs, kwargs=kwargs)
+    return graph
 
-    Returns a Torch IR graph — a faithful 1:1 mirror of the FX graph.
-    Use Rewriter passes to decompose into primitive Deplodock IR.
+
+def trace_module_with_constants(
+    module: nn.Module,
+    example_inputs: tuple[torch.Tensor, ...],
+    kwargs: dict[str, Any] | None = None,
+) -> tuple[Graph, dict[str, str]]:
+    """Trace a module and return the IR graph plus a placeholder→attribute map.
+
+    The second return value maps each graph-level constant name (``p_*`` /
+    ``b_*``) to the dotted attribute path on ``module`` where the tensor
+    lives (e.g. ``self_attn.q_proj.weight``). ``torch.export`` sometimes
+    strips prefixes like ``self_`` from the placeholder name, so this map
+    is needed to feed constants at runtime.
     """
     import torch
 
@@ -73,7 +86,11 @@ def trace_module(
         else:
             logger.debug("Skipping FX node: %s (op=%s)", fx_node.name, fx_node.op)
 
-    return g
+    const_targets: dict[str, str] = {}
+    sig = exported.graph_signature
+    const_targets.update(sig.inputs_to_parameters)
+    const_targets.update(sig.inputs_to_buffers)
+    return g, const_targets
 
 
 def _get_shape(fx_node: Any) -> tuple:
@@ -114,13 +131,19 @@ def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = No
 
 
 def _handle_placeholder(g: Graph, fx_node: Any, node_map: dict[str, str], module: nn.Module) -> None:
-    """Handle placeholder nodes (inputs and parameters)."""
+    """Handle placeholder nodes (inputs, parameters, and buffers).
+
+    ``torch.export`` prefixes parameter placeholders with ``p_`` and buffer
+    placeholders with ``b_``. Both are bake-in constants from the compiler's
+    perspective — only actual user-supplied activations (no prefix) are
+    graph inputs.
+    """
     name = fx_node.name
     shape = _get_shape(fx_node)
     dtype = _get_dtype(fx_node)
-    is_param = name.startswith("p_")
+    is_const = name.startswith(("p_", "b_"))
 
-    if is_param:
+    if is_const:
         nid = g.add_node(op=ConstantOp(name=name), inputs=[], output=Tensor(name, shape, dtype), node_id=name)
     else:
         nid = g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape, dtype), node_id=name)
@@ -373,7 +396,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         return
 
     # --- Pass-through ---
-    if op_name in ("to", "contiguous", "_assert_tensor_metadata", "clone", "detach"):
+    if op_name in ("to", "contiguous", "_assert_tensor_metadata", "clone", "detach", "alias"):
         if input_ids:
             node_map[name] = input_ids[0]
         return
