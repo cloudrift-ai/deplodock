@@ -5,16 +5,12 @@ Submodules:
   ``Write``, ``Assign``, ``Accum``, ``Select``, ``SelectBranch``, ``Axis``,
   ``Stmt``). Construction runs structural normalization (see
   :mod:`.normalize`) then validation via ``__post_init__``.
-- :mod:`.plan` — ``analyze_kernel`` lowers a ``LoopOp`` to a ``KernelPlan``
-  (iteration spaces, reduce segments, rematerialization) for codegen.
 - :mod:`.normalize` — pure ``body → body`` passes applied at construction
   (drop size-1 free axes, canonical free-axis order, pointwise
   linearization).
 
 The public surface below re-exports the common types so callers use
-``from deplodock.compiler.ir.loop import LoopOp, ...``. For the
-plan-module's ``Loop`` and ``Inline`` (which collide with ``ir.Loop``),
-import from :mod:`.plan` explicitly.
+``from deplodock.compiler.ir.loop import LoopOp, ...``.
 """
 
 from deplodock.compiler.ir.loop.builder import LoopBuilder
@@ -37,7 +33,6 @@ from deplodock.compiler.ir.loop.ir import (
     map_body,
     pretty_print,
 )
-from deplodock.compiler.ir.loop.plan import KernelPlan, analyze_kernel
 from deplodock.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
 
 __all__ = [
@@ -45,7 +40,6 @@ __all__ = [
     "Accum",
     "Assign",
     "Axis",
-    "KernelPlan",
     "Load",
     "Loop",
     "LoopBuilder",
@@ -56,7 +50,6 @@ __all__ = [
     "SelectBranch",
     "Stmt",
     "Write",
-    "analyze_kernel",
     "flat_body_to_nested",
     "iter_body",
     "map_body",
