@@ -1,17 +1,16 @@
-"""Naive recursive-descent CUDA codegen: ``LoopProgram`` → ``GpuProgram``.
+"""Structural CUDA codegen: ``LoopProgram`` → ``GpuProgram``.
 
-Consumes a ``LoopProgram`` (one ``LoopLaunch`` per GPU kernel, with
-authoritative buffer shapes) and emits CUDA C source packaged as a
-``GpuProgram``. The ``LoopOp`` body is an SSA program over named axes:
-``Assign``/``Accum``/``Write``/``Select`` statements interpreted in
-order. The positionally-last ``Accum`` marks the end of the reduce
-sweep; statements after (and final ``Write``s) run once per free point.
+Walks each ``LoopOp`` body recursively. Free axes are decomposed from the
+thread id; reduce Loops (those whose body contains an ``Accum``) become
+``for`` loops with accumulator variables declared before and rebound to
+the ``Accum``'s SSA name after.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.backend.cuda.program import CudaLaunch
@@ -24,13 +23,16 @@ from deplodock.compiler.ir.kernel_ir import (
     GpuKernelParam,
     IfStmt,
     Stmt,
+    VarAssign,
     VarDecl,
 )
 from deplodock.compiler.ir.kernel_ir import (
     Assign as IrAssign,
 )
-from deplodock.compiler.ir.loop import Accum, Axis, Load, LoopOp, Select
+from deplodock.compiler.ir.loop import ACCUM_IDENTITY, Accum, Axis, Load, LoopOp, Select, SelectBranch
 from deplodock.compiler.ir.loop import Assign as IrAssignStmt
+from deplodock.compiler.ir.loop import Loop as IrLoop
+from deplodock.compiler.ir.loop import Write as IrWrite
 from deplodock.compiler.ir.simplify import simplify_kernel
 from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
 from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
@@ -57,7 +59,11 @@ def compile_kernels(program: LoopProgram, dump: CompilerDump | None = None) -> G
     buf_names = {b.name for b in program.buffers}
     referenced |= set(program.graph_constants) & buf_names
 
-    buffers = [GpuBuffer(name=b.name, shape=tuple(b.shape), dtype="float", role=b.role) for b in program.buffers if b.name in referenced]
+    buffers = [
+        GpuBuffer(name=b.name, shape=tuple(b.shape), dtype="float", role=b.role)
+        for b in program.buffers
+        if b.name in referenced
+    ]
 
     launches: list[CudaLaunch] = []
     gpu_kernels: list[GpuKernel] = []
@@ -68,8 +74,6 @@ def compile_kernels(program: LoopProgram, dump: CompilerDump | None = None) -> G
                 f"{type(launch.loop).__name__!r}; fusion must wrap every primitive "
                 f"into a LoopOp before CUDA codegen."
             )
-        for w in check_port_bounds(launch, program, launch_idx=i):
-            logger.warning("OOB port access: %s", w)
         kname = _kernel_name(launch.loop, i)
         gpu_kernel, arg_order = emit_kernel(launch, kname, program)
         gpu_kernel = simplify_kernel(gpu_kernel)
@@ -99,211 +103,6 @@ def compile_kernels(program: LoopProgram, dump: CompilerDump | None = None) -> G
     )
 
 
-def check_port_bounds(launch: LoopLaunch, program: LoopProgram, launch_idx: int = -1) -> list[str]:
-    """Symbolically check whether any body ``Load.index`` can go out of bounds.
-
-    For each per-dim index Expr, compute the maximum value attained over
-    all combinations of axis extents and compare against the source
-    buffer's dim extent. Loads that are only referenced inside ``Select``
-    branches have their bounds evaluated *under* the branch's predicate —
-    the rotary ``rotate_half`` pattern (two halves each reading a slice of
-    a D-wide tensor and disjoint on ``axis < D/2``/``>=D/2``) is correctly
-    recognized as in-bounds because the predicate constrains the axis.
-
-    Returns a list of human-readable OOB warnings (empty when the kernel
-    is in-bounds). CUDA codegen clamps reads via ``min(max(coord, 0),
-    extent-1)`` regardless, so OOB findings are informational — they flag
-    kernels where some predicate is expected to mask the stray load but
-    the checker couldn't prove it.
-    """
-    from deplodock.compiler.ir.loop import Select
-
-    warnings: list[str] = []
-    if not isinstance(launch.loop, LoopOp):
-        return warnings
-    loop = launch.loop
-    axes_extents = {a.name: int(a.extent) - 1 for a in loop.axes}
-    buf_name_set = {b.name for b in program.buffers}
-
-    # Collect Select predicates gating each Load by SSA name. Tracks
-    # *transitive* gating: if an SSA name is computed from a Load and then
-    # used as a Select branch value, the Load inherits that branch's
-    # predicate. Needed for the rotary rotate_half pattern, where the Load
-    # is wrapped in an Assign (``v1 = neg(x_lo)``) before reaching the Select.
-    from deplodock.compiler.ir.loop import Assign
-
-    flat = list(loop)
-    load_names = {ld.name for ld in loop.loads}
-
-    # ssa_load_deps[name] = set of Load SSA names that name reads (transitively).
-    ssa_load_deps: dict[str, set[str]] = {}
-
-    def _load_deps_of_arg(arg: str) -> set[str]:
-        if arg in load_names:
-            return {arg}
-        return ssa_load_deps.get(arg, set())
-
-    for stmt in flat:
-        if isinstance(stmt, Assign):
-            deps: set[str] = set()
-            for arg in stmt.args:
-                deps |= _load_deps_of_arg(arg)
-            ssa_load_deps[stmt.name] = deps
-        elif isinstance(stmt, Select):
-            deps = set()
-            for br in stmt.branches:
-                deps |= _load_deps_of_arg(br.value)
-            ssa_load_deps[stmt.name] = deps
-
-    select_preds: dict[str, list[Expr]] = {}
-    for stmt in flat:
-        if isinstance(stmt, Select):
-            for branch in stmt.branches:
-                # Skip always-true fallback predicates — they add no constraint.
-                if isinstance(branch.select, Literal) and branch.select.value:
-                    continue
-                # Apply this branch's predicate to every Load the branch's value
-                # depends on (direct or transitively via SSA).
-                for load_ref in _load_deps_of_arg(branch.value):
-                    select_preds.setdefault(load_ref, []).append(branch.select)
-
-    for ld in loop.loads:
-        buf_name = launch.input_names[ld.source] if ld.source < len(launch.input_names) else None
-        if buf_name is None or buf_name not in buf_name_set:
-            continue
-        src_shape = tuple(int(d) for d in program.shape(buf_name))
-        preds = select_preds.get(ld.name, [])
-        # Per-Load axis bounds, tightened by each predicate (conservatively:
-        # if any predicate proves tighter bounds for this Load, use them).
-        tight_axes = _tighten_axes_from_preds(axes_extents, preds) if preds else axes_extents
-
-        for d, idx_expr in enumerate(ld.index):
-            if d >= len(src_shape):
-                warnings.append(
-                    f"launch {launch_idx} ({launch.output_name}): load {ld.name!r} ({buf_name} shape={src_shape}) "
-                    f"has index rank {len(ld.index)} > buf rank {len(src_shape)}"
-                )
-                continue
-            max_coord = _max_index_value(idx_expr, tight_axes)
-            if max_coord is None:
-                continue
-            if max_coord >= src_shape[d]:
-                warnings.append(
-                    f"launch {launch_idx} ({launch.output_name}): load {ld.name!r} ({buf_name} shape={src_shape}) "
-                    f"reads out of bounds at dim {d}: max_index={max_coord}, dim_extent={src_shape[d]}, "
-                    f"expr={idx_expr}"
-                )
-    return warnings
-
-
-def _tighten_axes_from_preds(axes_extents: dict[str, int], preds: list[Expr]) -> dict[str, int]:
-    """Return per-axis max values tightened under a set of Select predicates.
-
-    The checker handles a small pattern library: ``Var(a) < K``,
-    ``Var(a) >= K``, and ``K > Var(a)`` / ``K <= Var(a)`` — enough to
-    cover the ``rotate_half`` predicate ``axis < D/2``. Unsupported
-    predicates leave the bounds untouched (conservative: warning may
-    fire on a stray read that's actually safe).
-    """
-    # Start with the loose bounds; each predicate may reduce an axis max.
-    tight = dict(axes_extents)
-    for pred in preds:
-        for axis_name, new_max in _axis_constraints_from_pred(pred).items():
-            if axis_name in tight:
-                tight[axis_name] = min(tight[axis_name], new_max)
-    return tight
-
-
-def _axis_constraints_from_pred(pred: Expr) -> dict[str, int]:
-    """Extract ``{axis_name: max_value}`` constraints from a predicate.
-
-    Recognizes ``Var(a) < K``, ``K > Var(a)``, ``Var(a) <= K``,
-    ``K >= Var(a)`` and their AND-conjunctions (``BinOp("&&", ...)``).
-    Returns an empty dict for unrecognized predicates (no tightening).
-    """
-    if isinstance(pred, BinOp):
-        if pred.op in ("&&", "and"):
-            left = _axis_constraints_from_pred(pred.left)
-            right = _axis_constraints_from_pred(pred.right)
-            merged = dict(left)
-            for k, v in right.items():
-                merged[k] = min(merged.get(k, v), v)
-            return merged
-        # axis < K  →  axis ≤ K-1
-        if pred.op == "<":
-            axis, k = _match_var_const(pred.left, pred.right)
-            if axis is not None:
-                return {axis: k - 1}
-            axis, k = _match_var_const(pred.right, pred.left)
-            if axis is not None:  # K > axis  →  axis ≤ K-1
-                return {axis: k - 1}
-        if pred.op == "<=":
-            axis, k = _match_var_const(pred.left, pred.right)
-            if axis is not None:
-                return {axis: k}
-            axis, k = _match_var_const(pred.right, pred.left)
-            if axis is not None:  # K >= axis
-                return {axis: k}
-    return {}
-
-
-def _match_var_const(a: Expr, b: Expr) -> tuple[str | None, int]:
-    """If ``a`` is a Var and ``b`` is an int Literal, return (a.name, b.value)."""
-    if isinstance(a, Var) and isinstance(b, Literal):
-        try:
-            return a.name, int(b.value)
-        except (TypeError, ValueError):
-            return None, 0
-    return None, 0
-
-
-def _max_index_value(expr: Expr, axis_max: dict[str, int]) -> int | None:
-    """Maximum non-negative value an Expr can attain given per-axis maxes.
-
-    Conservatively bounds: Literals → value, Vars → axis_max, BinOps →
-    recursive max for +/*/%//. Returns ``None`` for unsupported shapes.
-    """
-    if isinstance(expr, Literal):
-        try:
-            return int(expr.value)
-        except (TypeError, ValueError):
-            return None
-    if isinstance(expr, Var):
-        if expr.name in axis_max:
-            return axis_max[expr.name]
-        return None
-    if isinstance(expr, BinOp):
-        left = _max_index_value(expr.left, axis_max)
-        right = _max_index_value(expr.right, axis_max)
-        if left is None or right is None:
-            return None
-        if expr.op == "+":
-            return left + right
-        if expr.op == "*":
-            return left * right
-        if expr.op == "%":
-            right_val = right
-            if right_val <= 0:
-                return None
-            return right_val - 1
-        if expr.op == "/":
-            if right <= 0:
-                return None
-            return left // right
-        if expr.op == "-":
-            # Conservative upper bound: for `a - b`, max is left - min(b).
-            # We only know min(b) statically when b is a Literal (then
-            # min == max == value). Otherwise fall back to ``left``.
-            if isinstance(expr.right, Literal):
-                try:
-                    return left - int(expr.right.value)
-                except (TypeError, ValueError):
-                    return left
-            return left
-        return None
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Per-kernel emission
 # ---------------------------------------------------------------------------
@@ -311,91 +110,171 @@ def _max_index_value(expr: Expr, axis_max: dict[str, int]) -> int | None:
 
 def emit_kernel(launch: LoopLaunch, kernel_name: str, program: LoopProgram) -> tuple[GpuKernel, list[str]]:
     """Emit one ``GpuKernel`` for a single ``LoopLaunch``."""
-    out_shape = program.output_shape(launch)
     params, arg_order = _build_params(launch)
-    body, block_size = _emit_body(launch, out_shape, program)
+    body, block_size = _emit_body(launch, program)
     kd = GpuKernel(name=kernel_name, params=params, body=body, block_size=block_size)
     return kd, arg_order
 
 
+@dataclass
+class _Ctx:
+    """Emission state threaded through recursive body walk."""
+
+    program: LoopProgram
+    launch: LoopLaunch
+    env: dict[str, Expr] = field(default_factory=dict)  # axis name → Expr
+    values: dict[str, Expr] = field(default_factory=dict)  # SSA name → Var
+    name_seq: list[int] = field(default_factory=lambda: [0])
+    acc_seq: list[int] = field(default_factory=lambda: [0])
+    loop_seq: list[int] = field(default_factory=lambda: [0])
+
+    def fresh(self) -> str:
+        n = self.name_seq[0]
+        self.name_seq[0] += 1
+        return f"t{n}"
+
+
+def _emit_body(launch: LoopLaunch, program: LoopProgram) -> tuple[list[Stmt], tuple[int, int, int]]:
+    loop: LoopOp = launch.loop
+    reduce_names = loop.reduce_axis_names
+    free_axes = tuple(a for a in loop.axes if a.name not in reduce_names)
+    n_threads = _numel(tuple(a.extent for a in free_axes)) if free_axes else 1
+
+    tid = Var("tid")
+    ctx = _Ctx(program=program, launch=launch, env=_axis_env_for_flat(free_axes, tid))
+
+    guarded = _emit_stmts(loop.body, ctx)
+    stmts: list[Stmt] = [
+        VarDecl(
+            dtype="long long",
+            name="tid",
+            init=BinOp("+", BinOp("*", Var("blockIdx.x"), Var("blockDim.x")), Var("threadIdx.x")),
+        ),
+        IfStmt(cond=BinOp("<", tid, Literal(n_threads, "int")), body=guarded),
+    ]
+    return stmts, (_BLOCK, 1, 1)
+
+
+def _emit_stmts(stmts: tuple, ctx: _Ctx) -> list[Stmt]:
+    out: list[Stmt] = []
+    for s in stmts:
+        _emit_stmt(s, ctx, out)
+    return out
+
+
+def _emit_stmt(s, ctx: _Ctx, out: list[Stmt]) -> None:
+    if isinstance(s, Load):
+        buf_name = ctx.launch.input_names[s.source]
+        src_shape = ctx.program.shape(buf_name) if buf_name in {b.name for b in ctx.program.buffers} else ()
+        coords = [substitute(e, _env_with_values(ctx)) for e in s.index]
+        flat = _flatten_coords(coords, src_shape)
+        tname = ctx.fresh()
+        access: Expr = ArrayAccess(array=buf_name, index=flat) if s.index else ArrayAccess(array=buf_name, index=Literal(0, "int"))
+        out.append(VarDecl(dtype="float", name=tname, init=access))
+        ctx.values[s.name] = Var(tname)
+        return
+
+    if isinstance(s, IrAssignStmt):
+        args = [ctx.values[a] for a in s.args]
+        tname = ctx.fresh()
+        out.append(VarDecl(dtype="float", name=tname, init=_apply_elementwise(s.op.fn, args)))
+        ctx.values[s.name] = Var(tname)
+        return
+
+    if isinstance(s, Select):
+        tname = ctx.fresh()
+        out.append(VarDecl(dtype="float", name=tname, init=_emit_select(s, ctx.values, ctx.env)))
+        ctx.values[s.name] = Var(tname)
+        return
+
+    if isinstance(s, IrWrite):
+        buf_name = ctx.launch.output_name
+        buf_shape = ctx.program.shape(buf_name)
+        coords = [substitute(e, ctx.env) for e in s.index]
+        flat = _flatten_coords(coords, buf_shape)
+        out.append(IrAssign(target=ArrayAccess(array=buf_name, index=flat), value=ctx.values[s.value]))
+        return
+
+    if isinstance(s, Accum):
+        acc_var = ctx.values[s.name].name  # Var set by enclosing reduce Loop
+        out.append(_emit_reduce_accum(acc_var, s.op.fn, ctx.values[s.value]))
+        return
+
+    if isinstance(s, IrLoop):
+        _emit_loop(s, ctx, out)
+        return
+
+    raise NotImplementedError(f"unhandled Loop IR stmt: {type(s).__name__}")
+
+
+def _emit_loop(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
+    accums = [x for x in loop.body if isinstance(x, Accum)]
+    is_reduce = bool(accums)
+
+    # Free Loop whose axis is already decomposed from tid: just descend.
+    if not is_reduce and loop.axis.name in ctx.env:
+        out.extend(_emit_stmts(loop.body, ctx))
+        return
+
+    # Emit a C for loop. Use a fresh iteration variable.
+    k_name = f"k{ctx.loop_seq[0]}"
+    ctx.loop_seq[0] += 1
+    k_var = Var(k_name)
+
+    # Declare accumulator variables before the loop, bind Accum.name → Var(acc_var)
+    # in the outer scope so code after the loop sees the finalized value, and also
+    # so bodies inside use acc_var for updates.
+    acc_names: list[str] = []
+    for a in accums:
+        if a.name in acc_names:
+            continue
+        acc_names.append(a.name)
+        acc_var = f"acc{ctx.acc_seq[0]}"
+        ctx.acc_seq[0] += 1
+        identity = ACCUM_IDENTITY.get(a.op.fn, 0.0)
+        out.append(VarDecl(dtype="float", name=acc_var, init=Literal(identity, "float")))
+        ctx.values[a.name] = Var(acc_var)
+
+    # Snapshot taken AFTER accumulator bindings so they survive the restore;
+    # inner Assign/Select/Load bindings don't escape per Loop IR scoping rules.
+    saved_env = dict(ctx.env)
+    saved_values = dict(ctx.values)
+    ctx.env[loop.axis.name] = k_var
+    inner = _emit_stmts(loop.body, ctx)
+    ctx.env = saved_env
+    ctx.values = saved_values
+
+    out.append(ForLoop(var=k_name, start=Literal(0, "int"), end=Literal(int(loop.axis.extent), "int"), body=inner))
+
+
 # ---------------------------------------------------------------------------
-# Axis-env helpers
+# Helpers
 # ---------------------------------------------------------------------------
+
+
+def _env_with_values(ctx: _Ctx) -> dict[str, Expr]:
+    """Env for substituting Load.index / Write.index / Select.select Exprs.
+
+    Load indices may reference earlier Load SSA names (gather). Merge the
+    axis env with the current SSA values so ``substitute`` resolves both.
+    """
+    return {**ctx.env, **ctx.values}
 
 
 def _axis_env_for_flat(axes: tuple[Axis, ...], flat_idx: Expr) -> dict[str, Expr]:
-    """Decompose a flat iteration index into per-axis Exprs."""
+    """Decompose a flat iteration index into per-axis Exprs (row-major)."""
     env: dict[str, Expr] = {}
     if not axes:
         return env
     remainder = flat_idx
-    extents = [int(a.extent) for a in axes]
     for i in range(len(axes) - 1, -1, -1):
-        dim = extents[i]
+        dim = int(axes[i].extent)
         if i == 0:
             env[axes[i].name] = remainder
         else:
             env[axes[i].name] = BinOp("%", remainder, Literal(dim, "int"))
             remainder = BinOp("/", remainder, Literal(dim, "int"))
     return env
-
-
-def _axis_env_for_reduce(axes: tuple[Axis, ...], reduce_names: frozenset[str], row_idx: Expr, k: Expr) -> dict[str, Expr]:
-    """Axis env for a reduce kernel: row_idx unpacks free axes, k is the reduce axis."""
-    env: dict[str, Expr] = {}
-    free = [a for a in axes if a.name not in reduce_names]
-    reduce_a = next((a for a in axes if a.name in reduce_names), None)
-
-    remainder = row_idx
-    extents = [int(a.extent) for a in free]
-    for i in range(len(free) - 1, -1, -1):
-        dim = extents[i]
-        if i == 0:
-            env[free[i].name] = remainder
-        else:
-            env[free[i].name] = BinOp("%", remainder, Literal(dim, "int"))
-            remainder = BinOp("/", remainder, Literal(dim, "int"))
-
-    if reduce_a is not None:
-        env[reduce_a.name] = k
-    return env
-
-
-def _emit_load_access(index: tuple, buf_name: str, src_shape: tuple, axis_env: dict[str, Expr]) -> Expr:
-    """Evaluate a Load's ``index`` under ``axis_env`` and emit an ArrayAccess.
-
-    Each per-dim coord is clamped to ``[0, dim_extent-1]`` via
-    ``max(0, min(coord, extent-1))`` so that out-of-bounds reads from
-    Select-masked branches stay in the allocated buffer (matches
-    LoopBackend's ``np.clip`` behavior). Const coords and coords that are
-    already bounded (a single Var matching the dim's extent) skip the
-    clamp to keep the emitted code tight.
-    """
-    if not index:
-        return ArrayAccess(array=buf_name, index=Literal(0, "int"))
-    coords = [substitute(e, axis_env) for e in index]
-    coords = [_clamp_coord(c, src_shape[d] if d < len(src_shape) else None) for d, c in enumerate(coords)]
-    flat = _flatten_coords(coords, src_shape)
-    return ArrayAccess(array=buf_name, index=flat)
-
-
-def _clamp_coord(coord: Expr, dim_extent) -> Expr:
-    """Wrap ``coord`` in a clamp to ``[0, dim_extent-1]`` unless provably in-bounds."""
-    if dim_extent is None or not isinstance(dim_extent, int) or dim_extent <= 0:
-        return coord
-    if isinstance(coord, Literal):
-        try:
-            v = int(coord.value)
-            if 0 <= v < dim_extent:
-                return coord
-        except (TypeError, ValueError):
-            return coord
-    if dim_extent == 1:
-        return Literal(0, "int")
-    upper = Literal(dim_extent - 1, "int")
-    # (coord > upper) ? upper : ((coord < 0) ? 0 : coord)
-    clamped_high = Ternary(cond=BinOp(">", coord, upper), if_true=upper, if_false=coord)
-    return Ternary(cond=BinOp("<", clamped_high, Literal(0, "int")), if_true=Literal(0, "int"), if_false=clamped_high)
 
 
 def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
@@ -417,235 +296,58 @@ def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
     return flat
 
 
-# ---------------------------------------------------------------------------
-# Body dispatch
-# ---------------------------------------------------------------------------
-
-
-def _emit_body(launch: LoopLaunch, out_shape: tuple, program: LoopProgram) -> tuple[list[Stmt], tuple[int, int, int]]:
-    from deplodock.compiler.ir.loop.plan import analyze_kernel
-
-    plan = analyze_kernel(launch.loop, out_shape)
-    idx = Var("tid")
-    idx_init = VarDecl(
-        dtype="long long",
-        name="tid",
-        init=BinOp("+", BinOp("*", Var("blockIdx.x"), Var("blockDim.x")), Var("threadIdx.x")),
-    )
-    guarded = _emit_plan(plan, launch, program, idx)
-    stmts: list[Stmt] = [idx_init, IfStmt(cond=BinOp("<", idx, Literal(plan.n_output, "int")), body=guarded)]
-    return stmts, (_BLOCK, 1, 1)
-
-
-# ---------------------------------------------------------------------------
-# Plan-based emitter
-# ---------------------------------------------------------------------------
-
-
-def _emit_plan(plan, launch: LoopLaunch, program: LoopProgram, idx: Expr) -> list[Stmt]:
-    from deplodock.compiler.ir.loop.plan import Inline, Loop
-
-    loop: LoopOp = launch.loop
-    stmts: list[Stmt] = []
-    name_seq = [0]
-    values: dict[str, Expr] = {}
-
-    source_info = _collect_source_info(loop, launch, program)
-
-    reduce_names = loop.reduce_axis_names
-    free_axes = tuple(a for a in loop.axes if a.name not in reduce_names)
-    flat_env = _axis_env_for_flat(free_axes, idx)
-
-    # Body-form ``Load`` stmts materialize at their scope (Inline prelude,
-    # K-loop body, or post-reduce). The ``load_env`` is threaded forward as
-    # Loads emit so a later Load's index can reference an earlier Load's SSA
-    # value (gather).
-    load_env: dict[str, Expr] = dict(flat_env)
-
-    loop_count = 0
-    for step in plan.steps:
-        if isinstance(step, Inline):
-            for stmt in step.body:
-                if isinstance(stmt, IrAssignStmt):
-                    arg_exprs = [values[a] for a in stmt.args]
-                    value = _apply_elementwise(stmt.op.fn, arg_exprs)
-                    tname = _fresh(name_seq)
-                    stmts.append(VarDecl(dtype="float", name=tname, init=value))
-                    values[stmt.name] = Var(tname)
-                elif isinstance(stmt, Select):
-                    value = _emit_select(stmt, values, flat_env)
-                    tname = _fresh(name_seq)
-                    stmts.append(VarDecl(dtype="float", name=tname, init=value))
-                    values[stmt.name] = Var(tname)
-                elif isinstance(stmt, Load):
-                    # Body-form Load: emit the access expression directly.
-                    # Later Loads can reference this one's SSA name in their
-                    # index (gather), so thread the binding into ``load_env``.
-                    buf_name, src_shape = source_info[stmt.source]
-                    expr = _emit_load_access(stmt.index, buf_name, src_shape, load_env)
-                    tname = _fresh(name_seq)
-                    stmts.append(VarDecl(dtype="float", name=tname, init=expr))
-                    values[stmt.name] = Var(tname)
-                    load_env[stmt.name] = Var(tname)
-
-        elif isinstance(step, Loop):
-            k_var_name = f"k{loop_count}"
-            k_var = Var(k_var_name)
-
-            if step.accum:
-                stmts.append(VarDecl(dtype="float", name=step.accum.var, init=Literal(step.accum.identity, "float")))
-
-            inner: list[Stmt] = []
-            loop_values: dict[str, Expr] = dict(values)
-
-            axis_env = _axis_env_for_reduce(loop.axes, reduce_names, idx, k_var)
-
-            for assign in step.recompute:
-                arg_exprs = [loop_values[a] for a in assign.args]
-                value = _apply_elementwise(assign.op.fn, arg_exprs)
-                tname = _fresh(name_seq)
-                inner.append(VarDecl(dtype="float", name=tname, init=value))
-                loop_values[assign.name] = Var(tname)
-
-            for stmt in step.body:
-                if isinstance(stmt, Select):
-                    value = _emit_select(stmt, loop_values, axis_env)
-                elif isinstance(stmt, Load):
-                    buf_name, src_shape = source_info[stmt.source]
-                    value = _emit_load_access(stmt.index, buf_name, src_shape, axis_env)
-                else:
-                    arg_exprs = [loop_values[a] for a in stmt.args]
-                    value = _apply_elementwise(stmt.op.fn, arg_exprs)
-                tname = _fresh(name_seq)
-                inner.append(VarDecl(dtype="float", name=tname, init=value))
-                loop_values[stmt.name] = Var(tname)
-
-            if step.accum:
-                src = loop_values[step.accum.src]
-                inner.append(_emit_reduce_accum(step.accum.var, step.accum.fn, src))
-                values[step.accum.result] = Var(step.accum.var)
-
-            if step.stores_output:
-                # Per-element store inside the loop.
-                store_value = loop_values[step.store_value]
-                store_idx_coords = [substitute(e, axis_env) for e in step.store_index]
-                buf_shape = program.shape(launch.output_name)
-                store_idx = _flatten_coords(store_idx_coords, buf_shape)
-                inner.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=store_idx), value=store_value))
-
-            stmts.append(ForLoop(var=k_var_name, start=Literal(0, "int"), end=Literal(step.k_size, "int"), body=inner))
-            loop_count += 1
-
-    # Trailing writes: run once per free point, post-reduce.
-    for tw in plan.trailing_writes:
-        value = values.get(tw.value, Literal(0.0, "float"))
-        coords = [substitute(e, flat_env) for e in tw.index]
-        buf_shape = program.shape(launch.output_name)
-        store_idx = _flatten_coords(coords, buf_shape)
-        stmts.append(IrAssign(target=ArrayAccess(array=launch.output_name, index=store_idx), value=value))
-
-    return stmts
-
-
-def _collect_source_info(
-    loop: LoopOp,
-    launch: LoopLaunch,
-    program: LoopProgram,
-) -> dict[int, tuple[str, tuple]]:
-    """Build source_index → (buffer_name, source_shape) for Load emission."""
-    source_info: dict[int, tuple[str, tuple]] = {}
-    buf_name_set = {b.name for b in program.buffers}
-    for i in range(loop.num_inputs):
-        buf_name = launch.input_names[i] if i < len(launch.input_names) else f"buf{i}"
-        src_shape = program.shape(buf_name) if buf_name in buf_name_set else ()
-        source_info[i] = (buf_name, src_shape)
-    return source_info
-
-
-def _expr_refs_any_name(expr: Expr, names: set[str]) -> bool:
-    """True if any ``Var(name)`` in ``expr`` refers to a name in ``names``."""
-    if isinstance(expr, Var):
-        return expr.name in names
-    for attr in ("left", "right", "cond", "if_true", "if_false", "expr"):
-        c = getattr(expr, attr, None)
-        if c is not None and _expr_refs_any_name(c, names):
-            return True
-    args = getattr(expr, "args", None)
-    if isinstance(args, (list, tuple)):
-        return any(_expr_refs_any_name(a, names) for a in args)
-    return False
+def _emit_select(stmt: Select, values: dict[str, Expr], axis_env: dict[str, Expr]) -> Expr:
+    """Emit a chained ternary for a Select statement."""
+    branches: list[SelectBranch] = list(stmt.branches)
+    result: Expr = values[branches[-1].value]
+    for branch in reversed(branches[:-1]):
+        cond = substitute(branch.select, axis_env)
+        result = Ternary(cond=cond, if_true=values[branch.value], if_false=result)
+    return result
 
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
     if fn == "max":
-        from deplodock.compiler.ir.kernel_ir import VarAssign
-
         return VarAssign(name=acc_name, value=FuncCall("fmaxf", [Var(acc_name), value]))
     if fn == "min":
-        from deplodock.compiler.ir.kernel_ir import VarAssign
-
         return VarAssign(name=acc_name, value=FuncCall("fminf", [Var(acc_name), value]))
     op = {"add": "+=", "sum": "+=", "mul": "*=", "prod": "*="}.get(fn, "+=")
     return AugAssign(target=acc_name, op=op, value=value)
 
 
-# ---------------------------------------------------------------------------
-# Elementwise / reduce helpers
-# ---------------------------------------------------------------------------
-
 _SUPPORTED_UNARY = {
     "exp": "expf",
-    "neg": None,
     "rsqrt": "rsqrtf",
-    "recip": None,
-    "relu": None,
     "tanh": "tanhf",
-    "sigmoid": None,
     "abs": "fabsf",
 }
 
 
 def _apply_elementwise(fn: str, inputs: list[Expr]) -> Expr:
     if fn in {"add", "sub", "mul", "div", "mod"}:
-        assert len(inputs) == 2
         op = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "%"}[fn]
         return BinOp(op, inputs[0], inputs[1])
     if fn == "max":
-        assert len(inputs) == 2
         return FuncCall("fmaxf", list(inputs))
     if fn == "min":
-        assert len(inputs) == 2
         return FuncCall("fminf", list(inputs))
     if fn == "pow":
-        assert len(inputs) == 2
         return FuncCall("powf", list(inputs))
     if fn == "neg":
-        assert len(inputs) == 1
         return BinOp("-", Literal(0.0, "float"), inputs[0])
     if fn == "copy":
-        assert len(inputs) == 1
         return inputs[0]
     if fn == "recip":
-        assert len(inputs) == 1
         return BinOp("/", Literal(1.0, "float"), inputs[0])
     if fn == "relu":
-        assert len(inputs) == 1
         return FuncCall("fmaxf", [Literal(0.0, "float"), inputs[0]])
     if fn == "sigmoid":
-        assert len(inputs) == 1
         neg_x = BinOp("-", Literal(0.0, "float"), inputs[0])
         exp_neg = FuncCall("expf", [neg_x])
         return BinOp("/", Literal(1.0, "float"), BinOp("+", Literal(1.0, "float"), exp_neg))
     if fn in _SUPPORTED_UNARY:
-        callee = _SUPPORTED_UNARY[fn]
-        if callee is not None:
-            return FuncCall(callee, list(inputs))
+        return FuncCall(_SUPPORTED_UNARY[fn], list(inputs))
     raise NotImplementedError(f"elementwise fn={fn} not yet supported by emit")
-
-
-# ---------------------------------------------------------------------------
-# Generic helpers
-# ---------------------------------------------------------------------------
 
 
 def _numel(shape: tuple) -> int:
@@ -670,14 +372,13 @@ def _kernel_name(loop: LoopOp, idx: int) -> str:
 
 def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     loop: LoopOp = launch.loop
-    out_shape = program.output_shape(launch)
-    has_reduce = any(isinstance(s, Accum) for s in loop)
-    if has_reduce:
-        reduce_names = loop.reduce_axis_names
-        free_extents = [int(a.extent) for a in loop.axes if a.name not in reduce_names]
-        n_output = _numel(tuple(free_extents)) if free_extents else 1
+    reduce_names = loop.reduce_axis_names
+    free_extents = [int(a.extent) for a in loop.axes if a.name not in reduce_names]
+    if free_extents:
+        n_output = _numel(tuple(free_extents))
     else:
-        n_output = _numel(out_shape) if out_shape else _numel(tuple(a.extent for a in loop.axes))
+        out_shape = program.output_shape(launch)
+        n_output = _numel(out_shape) if out_shape else 1
     n_blocks = (n_output + _BLOCK - 1) // _BLOCK
     return (max(n_blocks, 1), 1, 1), (_BLOCK, 1, 1)
 
@@ -686,21 +387,3 @@ def _emit_kernel_source(gpu_kernel: GpuKernel) -> str:
     from deplodock.compiler.backend.kernel_codegen import emit_kernel as _emit
 
     return _emit(gpu_kernel)
-
-
-def _fresh(seq: list[int]) -> str:
-    name = f"t{seq[0]}"
-    seq[0] += 1
-    return name
-
-
-def _emit_select(stmt: Select, values: dict[str, Expr], axis_env: dict[str, Expr]) -> Expr:
-    """Emit a chained ternary for a Select: each branch's predicate selects its value."""
-    branches = list(stmt.branches)
-    # Last branch is the catch-all (by convention: select=Literal(1) when the
-    # rule had no explicit predicate). Build the chain right-to-left.
-    result: Expr = values[branches[-1].value]
-    for branch in reversed(branches[:-1]):
-        cond = substitute(branch.select, axis_env)
-        result = Ternary(cond=cond, if_true=values[branch.value], if_false=result)
-    return result

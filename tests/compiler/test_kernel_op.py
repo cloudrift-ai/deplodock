@@ -570,20 +570,6 @@ def _nested_reduce_kernel() -> LoopOp:
     )
 
 
-def test_analyze_kernel_handles_nested_body():
-    """analyze_kernel should produce the same plan for flat and nested forms."""
-    from deplodock.compiler.ir.loop.plan import analyze_kernel
-
-    flat = _flat_reduce_kernel()
-    nested = _nested_reduce_kernel()
-    out_shape = (4,)
-    plan_flat = analyze_kernel(flat, out_shape)
-    plan_nested = analyze_kernel(nested, out_shape)
-    # Both should produce a Loop step (reduce) and a trailing Write.
-    assert len(plan_flat.steps) == len(plan_nested.steps)
-    assert len(plan_flat.trailing_writes) == len(plan_nested.trailing_writes)
-
-
 def test_execute_loop_op_handles_nested_body():
     """Numpy interpreter should produce the same output for flat and nested forms."""
     import numpy as np
