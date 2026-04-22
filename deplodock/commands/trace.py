@@ -106,6 +106,15 @@ def _handle_trace_model(args):
 
 
 def _handle_trace_code(args):
+    graph, slug = graph_from_code(args.code)
+    _save(graph, args, default_basename=slug)
+
+
+def graph_from_code(code: str):
+    """Trace an inline torch expression and return ``(graph, filename_slug)``.
+
+    Shared by ``deplodock trace --code`` and ``deplodock compile --code``.
+    """
     try:
         import torch
         import torch.nn.functional as F
@@ -116,7 +125,7 @@ def _handle_trace_code(args):
     from deplodock.compiler.torch_trace import trace_module
 
     try:
-        tree = ast.parse(args.code, mode="exec")
+        tree = ast.parse(code, mode="exec")
     except SyntaxError as e:
         logger.error("--code failed to parse: %s", e)
         sys.exit(2)
@@ -128,22 +137,18 @@ def _handle_trace_code(args):
     call = tree.body[-1].value
     scope = {"torch": torch, "nn": torch.nn, "F": F}
     preamble = ast.Module(body=tree.body[:-1], type_ignores=[])
-    exec(compile(preamble, "<trace --code>", "exec"), scope)  # noqa: S102 — local CLI, equivalent to python -c
+    exec(compile(preamble, "<--code>", "exec"), scope)  # noqa: S102 — local CLI, equivalent to python -c
 
-    module = eval(compile(ast.Expression(call.func), "<trace --code callable>", "eval"), scope)  # noqa: S307
-    example_inputs = tuple(eval(compile(ast.Expression(a), "<trace --code arg>", "eval"), scope) for a in call.args)  # noqa: S307
-    kwargs = {kw.arg: eval(compile(ast.Expression(kw.value), "<trace --code kwarg>", "eval"), scope) for kw in call.keywords if kw.arg}  # noqa: S307
+    module = eval(compile(ast.Expression(call.func), "<--code callable>", "eval"), scope)  # noqa: S307
+    example_inputs = tuple(eval(compile(ast.Expression(a), "<--code arg>", "eval"), scope) for a in call.args)  # noqa: S307
+    kwargs = {kw.arg: eval(compile(ast.Expression(kw.value), "<--code kwarg>", "eval"), scope) for kw in call.keywords if kw.arg}  # noqa: S307
 
     logger.info("Tracing inline module: %s", ast.unparse(call.func))
     graph = trace_module(module, example_inputs, kwargs=kwargs or None)
-    _save(graph, args, default_basename=_slug_from_call(call))
 
-
-def _slug_from_call(call: ast.Call) -> str:
-    """Build a filename slug from the call's callable expression."""
     src = ast.unparse(call.func)
     slug = "".join(c if c.isalnum() else "_" for c in src).strip("_").lower() or "inline"
-    return slug
+    return graph, slug
 
 
 def _save(graph, args, default_basename: str) -> None:
