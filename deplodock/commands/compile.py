@@ -27,7 +27,15 @@ _IR_STAGE_FILES = {
 
 def register_compile_command(subparsers):
     parser = subparsers.add_parser("compile", help="Compile a model or IR through structural lowering")
-    parser.add_argument("input", help="HuggingFace model ID or .json IR file")
+    parser.add_argument("input", nargs="?", help="HuggingFace model ID or .json IR file. Mutually exclusive with --code.")
+    parser.add_argument(
+        "--code", "-c",
+        help=(
+            "Inline Python expression whose last statement is a call, "
+            'e.g. --code "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))". '
+            "Traces the expression and compiles it in one step. Mutually exclusive with the positional input."
+        ),
+    )
     parser.add_argument(
         "--layer",
         type=int,
@@ -52,6 +60,13 @@ def register_compile_command(subparsers):
 
 
 def handle_compile(args):
+    if args.code and args.input:
+        logger.error("--code and positional input are mutually exclusive")
+        sys.exit(2)
+    if not args.code and not args.input:
+        logger.error("either a positional model ID / IR file or --code is required")
+        sys.exit(2)
+
     if args.ir is not None:
         _handle_compile_inspect(args)
         return
@@ -113,6 +128,11 @@ def _handle_compile_inspect(args):
 
 
 def _load_or_trace(args) -> tuple[Graph, str]:
+    if args.code:
+        from deplodock.commands.trace import graph_from_code
+
+        return graph_from_code(args.code)
+
     input_path = Path(args.input)
     if input_path.suffix == ".json" and input_path.exists():
         graph = _load_graph(input_path)
