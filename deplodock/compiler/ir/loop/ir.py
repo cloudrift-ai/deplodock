@@ -3,10 +3,15 @@
 After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
-    body   : tuple[Stmt, ...]   — SSA: Assign | Accum | Write | Select | Loop | Load
-    axes   : computed property  — iteration space walked from body's Loop tree
-    loads  : computed property  — body-form Load stmts (external reads)
-    accums : computed property  — Accum stmts seeded from the body
+    body              : tuple[Stmt, ...]   — SSA body: Assign | Accum | Write | Select | Loop | Load
+    axes              : computed property  — iteration space walked from body's Loop tree
+    reduce_axis_names : computed property  — names of axes whose Loop wraps an Accum
+    loads             : computed property  — body-form Load stmts (external reads)
+    accums            : computed property  — unique Accum stmts, first-use order
+    num_inputs        : computed property  — highest Load.source + 1
+    analyze()         : LoopMeta           — precomputed name → def / scope / reduce-axis / live-axes
+    map(fn)           : LoopOp             — transform body via ``map_body`` and rewrap
+    __iter__          : Iterator[Stmt]     — pre-order walk (via ``iter_body``)
 
 Iteration is explicit via ``Loop(axis, body)`` statements. Each ``Loop``
 is one iteration dimension; ``Loop.body`` runs ``axis.extent`` times.
@@ -17,7 +22,13 @@ accumulator folding. Reading top-to-bottom matches execution order.
 SSA names defined by ``Assign`` / ``Select`` / ``Load`` inside a
 ``Loop.body`` are scoped to that body — only accumulator state crosses
 Loop boundaries (via ``Accum``). Invariants (unique names, defined-
-before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``.
+before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``
+(which also runs ``normalize_body`` to canonicalize the body).
+
+Free-function companions (used by passes that work on raw
+``tuple[Stmt, ...]``): ``iter_body`` (pre-order generator),
+``map_body`` (transformer supporting ``Stmt | None | Iterable[Stmt]``),
+``Stmt.rewrite(rename_ssa, sigma)`` (per-stmt SSA / Expr rewrite).
 """
 
 from __future__ import annotations

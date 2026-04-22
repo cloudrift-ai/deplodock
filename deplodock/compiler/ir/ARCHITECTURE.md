@@ -169,9 +169,28 @@ loop-nest that codegen eventually emits — one ``LoopOp`` maps to one
 
 ``LoopOp.body`` is a nested tree of ``Loop`` blocks (outer free Loops
 for the grid iteration, inner reduce Loops for per-row sweeps). Reading
-top-to-bottom matches execution order. ``flatten_body(body)`` extracts
-the leaf statement sequence for consumers that want a linear view
-regardless of block structure.
+top-to-bottom matches execution order.
+
+Body walkers in ``loop/ir.py``:
+
+- ``iter_body(body)`` — pre-order generator yielding every stmt including
+  ``Loop`` wrappers. ``for s in loop_op: ...`` uses this via
+  ``LoopOp.__iter__``. Default primitive for collection walks; composes
+  with comprehensions / ``any`` / ``sum`` without allocating a new body.
+- ``map_body(body, fn)`` — transformer: ``fn`` sees every stmt (including
+  Loops), returns ``Stmt`` / ``None`` / an iterable (for 1:N expansions).
+  ``LoopOp.map(fn)`` wraps the result in a fresh ``LoopOp``.
+- ``Stmt.rewrite(rename_ssa, sigma)`` — per-stmt copy with SSA names
+  mapped through ``rename_ssa`` and Expr subtrees σ-substituted. Used by
+  both the splicer and normalize passes.
+- ``flatten_body(body)`` — legacy leaf-only view (filters out Loops).
+  Being phased out in favor of ``iter_body`` + explicit filters.
+
+``LoopMeta`` (returned by ``LoopOp.analyze()``) precomputes common
+lookups over the body: ``defs`` (name → stmt), ``scopes`` (name →
+binding ``Scope``), ``reduce_axes`` (Accum name → its reduce ``Axis``),
+``writes`` (paired with scope), and ``live_axes`` (axes transitively
+reachable through each name's Expr subtrees).
 
 **Rule:** Imports ``base``, ``expr``, and ``tensor`` (``ElementwiseOp``
 only — ``ReduceOp`` is NOT a valid ``Assign.op``). Reductions are
