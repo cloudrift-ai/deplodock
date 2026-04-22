@@ -14,9 +14,9 @@ from deplodock.compiler.ir.loop import (
     Assign,
     Axis,
     Load,
+    Loop,
     LoopOp,
     Write,
-    flat_body_to_nested,
     iter_body,
     splice_loop_ops,
     splice_loops,
@@ -26,10 +26,6 @@ from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _loop(axes: tuple[Axis, ...], body: tuple, reduce_axes: frozenset[str] = frozenset()) -> LoopOp:
-    return LoopOp(body=flat_body_to_nested(axes, body, reduce_axes))
 
 
 def _ops_by_name(op: LoopOp) -> dict[str, object]:
@@ -67,20 +63,28 @@ K = Axis("k", 16)
 
 def test_pointwise_chain():
     """producer: y = exp(x)  ;  consumer: z = add(y, y)."""
-    producer = _loop(
-        axes=(A0,),
+    producer = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"),)),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
-            Write(output=0, index=(Var("a0"),), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
         ),
     )
-    consumer = _loop(
-        axes=(A0,),
+    consumer = LoopOp(
         body=(
-            Load(name="yv", source=0, index=(Var("a0"),)),
-            Assign(name="z", op=ElementwiseOp("add"), args=("yv", "yv")),
-            Write(output=0, index=(Var("a0"),), value="z"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="yv", source=0, index=(Var("a0"),)),
+                    Assign(name="z", op=ElementwiseOp("add"), args=("yv", "yv")),
+                    Write(output=0, index=(Var("a0"),), value="z"),
+                ),
+            ),
         ),
     )
 
@@ -106,22 +110,30 @@ def test_pointwise_chain():
 
 def test_shared_intermediate_deduped():
     """Two consumer refs to the same producer value under identity σ share one binding."""
-    producer = _loop(
-        axes=(A0,),
+    producer = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"),)),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
-            Write(output=0, index=(Var("a0"),), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
         ),
     )
     # Consumer loads producer twice at the same index — both solve σ = {a0: a0}.
-    consumer = _loop(
-        axes=(A0,),
+    consumer = LoopOp(
         body=(
-            Load(name="ya", source=0, index=(Var("a0"),)),
-            Load(name="yb", source=0, index=(Var("a0"),)),
-            Assign(name="z", op=ElementwiseOp("add"), args=("ya", "yb")),
-            Write(output=0, index=(Var("a0"),), value="z"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="ya", source=0, index=(Var("a0"),)),
+                    Load(name="yb", source=0, index=(Var("a0"),)),
+                    Assign(name="z", op=ElementwiseOp("add"), args=("ya", "yb")),
+                    Write(output=0, index=(Var("a0"),), value="z"),
+                ),
+            ),
         ),
     )
 
@@ -142,22 +154,40 @@ def test_different_indices_emit_twice():
     # Producer axes (a0, a1); writes y[a0, a1] = exp(x[a0, a1]).
     A1_same = Axis("a1", 4)  # square so the transposed load is well-typed.
     A0_same = Axis("a0", 4)
-    producer = _loop(
-        axes=(A0_same, A1_same),
+    producer = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"), Var("a1"))),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
-            Write(output=0, index=(Var("a0"), Var("a1")), value="y"),
+            Loop(
+                axis=A0_same,
+                body=(
+                    Loop(
+                        axis=A1_same,
+                        body=(
+                            Load(name="x", source=0, index=(Var("a0"), Var("a1"))),
+                            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                            Write(output=0, index=(Var("a0"), Var("a1")), value="y"),
+                        ),
+                    ),
+                ),
+            ),
         ),
     )
     # Consumer reads the producer at (a0, a1) and (a1, a0) — transposed.
-    consumer = _loop(
-        axes=(A0_same, A1_same),
+    consumer = LoopOp(
         body=(
-            Load(name="ya", source=0, index=(Var("a0"), Var("a1"))),
-            Load(name="yb", source=0, index=(Var("a1"), Var("a0"))),
-            Assign(name="z", op=ElementwiseOp("add"), args=("ya", "yb")),
-            Write(output=0, index=(Var("a0"), Var("a1")), value="z"),
+            Loop(
+                axis=A0_same,
+                body=(
+                    Loop(
+                        axis=A1_same,
+                        body=(
+                            Load(name="ya", source=0, index=(Var("a0"), Var("a1"))),
+                            Load(name="yb", source=0, index=(Var("a1"), Var("a0"))),
+                            Assign(name="z", op=ElementwiseOp("add"), args=("ya", "yb")),
+                            Write(output=0, index=(Var("a0"), Var("a1")), value="z"),
+                        ),
+                    ),
+                ),
+            ),
         ),
     )
 
@@ -174,21 +204,33 @@ def test_different_indices_emit_twice():
 
 def test_reduction_producer():
     """Producer: s = sum_k x[a0,k]. Consumer: y = exp(s[a0])."""
-    producer = _loop(
-        axes=(A0, K),
+    producer = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"), Var("k"))),
-            Accum(name="s", value="x", op=ElementwiseOp("add")),
-            Write(output=0, index=(Var("a0"),), value="s"),
+            Loop(
+                axis=A0,
+                body=(
+                    Loop(
+                        axis=K,
+                        body=(
+                            Load(name="x", source=0, index=(Var("a0"), Var("k"))),
+                            Accum(name="s", value="x", op=ElementwiseOp("add")),
+                        ),
+                    ),
+                    Write(output=0, index=(Var("a0"),), value="s"),
+                ),
+            ),
         ),
-        reduce_axes=frozenset({"k"}),
     )
-    consumer = _loop(
-        axes=(A0,),
+    consumer = LoopOp(
         body=(
-            Load(name="sv", source=0, index=(Var("a0"),)),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("sv",)),
-            Write(output=0, index=(Var("a0"),), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="sv", source=0, index=(Var("a0"),)),
+                    Assign(name="y", op=ElementwiseOp("exp"), args=("sv",)),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
         ),
     )
 
@@ -209,21 +251,29 @@ def test_consumer_extra_input_source_remap():
     """Consumer has producer at source 0 and an unrelated buffer at source 1;
     after splice, that unrelated buffer should load from merged source 1
     (producer's input is at 0)."""
-    producer = _loop(
-        axes=(A0,),
+    producer = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"),)),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
-            Write(output=0, index=(Var("a0"),), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
         ),
     )
-    consumer = _loop(
-        axes=(A0,),
+    consumer = LoopOp(
         body=(
-            Load(name="yv", source=0, index=(Var("a0"),)),  # from producer
-            Load(name="b", source=1, index=(Var("a0"),)),  # unrelated
-            Assign(name="z", op=ElementwiseOp("add"), args=("yv", "b")),
-            Write(output=0, index=(Var("a0"),), value="z"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="yv", source=0, index=(Var("a0"),)),  # from producer
+                    Load(name="b", source=1, index=(Var("a0"),)),  # unrelated
+                    Assign(name="z", op=ElementwiseOp("add"), args=("yv", "b")),
+                    Write(output=0, index=(Var("a0"),), value="z"),
+                ),
+            ),
         ),
     )
 
@@ -250,14 +300,22 @@ def test_live_axes_computed():
     ``meta.scopes`` (now the post-reduce binding scope for Accum) and
     ``meta.reduce_axes`` rather than pre-normalize names.
     """
-    op = _loop(
-        axes=(A0, K),
+    op = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"), Var("k"))),
-            Accum(name="s", value="x", op=ElementwiseOp("add")),
-            Write(output=0, index=(Var("a0"),), value="s"),
+            Loop(
+                axis=A0,
+                body=(
+                    Loop(
+                        axis=K,
+                        body=(
+                            Load(name="x", source=0, index=(Var("a0"), Var("k"))),
+                            Accum(name="s", value="x", op=ElementwiseOp("add")),
+                        ),
+                    ),
+                    Write(output=0, index=(Var("a0"),), value="s"),
+                ),
+            ),
         ),
-        reduce_axes=frozenset({"k"}),
     )
     meta = op.analyze()
     [(load_name, load_scope)] = [(n, s) for n, s in meta.scopes.items() if isinstance(meta.defs[n], Load)]
@@ -280,29 +338,41 @@ def test_chain_three_loops():
     """Fuse a → b → c in one splice call. ``a`` is pointwise exp, ``b`` negates
     the result, ``c`` adds a bias. The merged kernel should contain exp, neg,
     add — with one Load for x (a's input) and one for bias (c's extra input)."""
-    a = _loop(
-        axes=(A0,),
+    a = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"),)),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
-            Write(output=0, index=(Var("a0"),), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
         ),
     )
-    b = _loop(
-        axes=(A0,),
+    b = LoopOp(
         body=(
-            Load(name="av", source=0, index=(Var("a0"),)),  # reads a
-            Assign(name="y", op=ElementwiseOp("neg"), args=("av",)),
-            Write(output=0, index=(Var("a0"),), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="av", source=0, index=(Var("a0"),)),  # reads a
+                    Assign(name="y", op=ElementwiseOp("neg"), args=("av",)),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
         ),
     )
-    c = _loop(
-        axes=(A0,),
+    c = LoopOp(
         body=(
-            Load(name="bv", source=0, index=(Var("a0"),)),  # reads b
-            Load(name="bias", source=1, index=(Var("a0"),)),  # external
-            Assign(name="y", op=ElementwiseOp("add"), args=("bv", "bias")),
-            Write(output=0, index=(Var("a0"),), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="bv", source=0, index=(Var("a0"),)),  # reads b
+                    Load(name="bias", source=1, index=(Var("a0"),)),  # external
+                    Assign(name="y", op=ElementwiseOp("add"), args=("bv", "bias")),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
         ),
     )
 
@@ -334,24 +404,32 @@ def test_chain_three_loops():
 def test_multi_output_root_preserves_all_writes():
     """A root whose body contains Writes at multiple output indices should
     seed each of them — the merged kernel carries all Writes."""
-    producer = _loop(
-        axes=(A0,),
+    producer = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"),)),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
-            Write(output=0, index=(Var("a0"),), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Write(output=0, index=(Var("a0"),), value="y"),
+                ),
+            ),
         ),
     )
     # Consumer produces two outputs: a negation and an absolute value — both
     # reading the producer.
-    consumer = _loop(
-        axes=(A0,),
+    consumer = LoopOp(
         body=(
-            Load(name="yv", source=0, index=(Var("a0"),)),
-            Assign(name="z0", op=ElementwiseOp("neg"), args=("yv",)),
-            Assign(name="z1", op=ElementwiseOp("abs"), args=("yv",)),
-            Write(output=0, index=(Var("a0"),), value="z0"),
-            Write(output=1, index=(Var("a0"),), value="z1"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="yv", source=0, index=(Var("a0"),)),
+                    Assign(name="z0", op=ElementwiseOp("neg"), args=("yv",)),
+                    Assign(name="z1", op=ElementwiseOp("abs"), args=("yv",)),
+                    Write(output=0, index=(Var("a0"),), value="z0"),
+                    Write(output=1, index=(Var("a0"),), value="z1"),
+                ),
+            ),
         ),
     )
 
@@ -371,26 +449,34 @@ def test_multi_output_splice_target():
     splice edges read each output. The target's expression chain reconstructs
     separately for each output via the standard worklist walk."""
     # Target: y0 = exp(x), y1 = neg(x). Two outputs.
-    target = _loop(
-        axes=(A0,),
+    target = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"),)),
-            Assign(name="y0", op=ElementwiseOp("exp"), args=("x",)),
-            Assign(name="y1", op=ElementwiseOp("neg"), args=("x",)),
-            Write(output=0, index=(Var("a0"),), value="y0"),
-            Write(output=1, index=(Var("a0"),), value="y1"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Assign(name="y0", op=ElementwiseOp("exp"), args=("x",)),
+                    Assign(name="y1", op=ElementwiseOp("neg"), args=("x",)),
+                    Write(output=0, index=(Var("a0"),), value="y0"),
+                    Write(output=1, index=(Var("a0"),), value="y1"),
+                ),
+            ),
         ),
     )
     # Sink: z = add(target_out0, target_out1). Two consumer input slots both
     # pointing at the target — slot 0 reads output 0 (exp), slot 1 reads
     # output 1 (neg).
-    sink = _loop(
-        axes=(A0,),
+    sink = LoopOp(
         body=(
-            Load(name="a", source=0, index=(Var("a0"),)),
-            Load(name="b", source=1, index=(Var("a0"),)),
-            Assign(name="z", op=ElementwiseOp("add"), args=("a", "b")),
-            Write(output=0, index=(Var("a0"),), value="z"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="a", source=0, index=(Var("a0"),)),
+                    Load(name="b", source=1, index=(Var("a0"),)),
+                    Assign(name="z", op=ElementwiseOp("add"), args=("a", "b")),
+                    Write(output=0, index=(Var("a0"),), value="z"),
+                ),
+            ),
         ),
     )
 
@@ -419,20 +505,28 @@ def test_multi_output_splice_target():
 def test_literal_producer_write_index():
     """Producer writes at (a0, 0); consumer reads at (a0, 0). The Literal dim
     contributes no σ binding and shouldn't block splicing."""
-    producer = _loop(
-        axes=(A0,),
+    producer = LoopOp(
         body=(
-            Load(name="x", source=0, index=(Var("a0"),)),
-            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
-            Write(output=0, index=(Var("a0"), Literal(0)), value="y"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Write(output=0, index=(Var("a0"), Literal(0)), value="y"),
+                ),
+            ),
         ),
     )
-    consumer = _loop(
-        axes=(A0,),
+    consumer = LoopOp(
         body=(
-            Load(name="yv", source=0, index=(Var("a0"), Literal(0))),
-            Assign(name="z", op=ElementwiseOp("neg"), args=("yv",)),
-            Write(output=0, index=(Var("a0"),), value="z"),
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="yv", source=0, index=(Var("a0"), Literal(0))),
+                    Assign(name="z", op=ElementwiseOp("neg"), args=("yv",)),
+                    Write(output=0, index=(Var("a0"),), value="z"),
+                ),
+            ),
         ),
     )
 

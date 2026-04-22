@@ -13,8 +13,8 @@ from deplodock.compiler.ir.loop import (
     Select,
     SelectBranch,
     Write,
-    flat_body_to_nested,
 )
+from deplodock.compiler.ir.expr import BinOp
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 
@@ -25,19 +25,83 @@ def Port(index=()):
     return tuple(index)
 
 
+def _nest(axes, body):
+    """Wrap a flat SSA body into nested Loop-block form.
+
+    Idempotent: if body already contains a Loop, returns it unchanged.
+    Reduce axes are inferred as axes with extent > 1 that don't appear
+    in any Write index (when the body contains an Accum).
+    """
+    if any(isinstance(s, Loop) for s in body):
+        return tuple(body)
+
+    has_update = any(isinstance(s, Accum) for s in body)
+    reduce_axis_names: frozenset[str] = frozenset()
+
+    if has_update:
+        write_axis_names: set[str] = set()
+
+        def _walk(e):
+            if isinstance(e, Var):
+                write_axis_names.add(e.name)
+            elif isinstance(e, BinOp):
+                _walk(e.left)
+                _walk(e.right)
+
+        for s in body:
+            if isinstance(s, Write):
+                for e in s.index:
+                    _walk(e)
+        reduce_axis_names = frozenset(
+            a.name for a in axes if a.name not in write_axis_names and int(a.extent) > 1
+        )
+
+    free_axes = [a for a in axes if a.name not in reduce_axis_names]
+
+    if not has_update:
+        wrapped: tuple = tuple(body)
+        for a in reversed(free_axes):
+            wrapped = (Loop(axis=a, body=wrapped),)
+        return wrapped
+
+    reduce_axes = [a for a in axes if a.name in reduce_axis_names]
+    if len(reduce_axes) != 1:
+        return tuple(body)
+    reduce_axis = reduce_axes[0]
+
+    segments: list[list] = []
+    current: list = []
+    for stmt in body:
+        current.append(stmt)
+        if isinstance(stmt, Accum):
+            segments.append(current)
+            current = []
+    tail = current
+
+    nested: list = []
+    for seg in segments:
+        nested.append(Loop(axis=reduce_axis, body=tuple(seg)))
+    nested.extend(tail)
+
+    wrapped = tuple(nested)
+    for a in reversed(free_axes):
+        wrapped = (Loop(axis=a, body=wrapped),)
+    return wrapped
+
+
 def _loop(*, axes=(), inputs=(), body=()):
     """Build a LoopOp from a flat body + axes hint.
 
     Test-local shim: ``LoopOp.axes`` is a property over the body's Loop
-    tree, so ``axes=`` feeds ``flat_body_to_nested`` to produce the
-    nested form. When ``inputs=(...)`` is provided (legacy Port-tuples),
-    each ``$N`` ref is rewritten to a freshly-named Load that is inserted
-    just before the referencing statement. Load cache resets at each
-    ``Accum`` and at each nested ``Loop`` boundary so sibling reduce
-    sweeps (softmax pattern) get their own scope-local Loads.
+    tree, so ``axes=`` feeds ``_nest`` to produce the nested form. When
+    ``inputs=(...)`` is provided (legacy Port-tuples), each ``$N`` ref
+    is rewritten to a freshly-named Load that is inserted just before
+    the referencing statement. Load cache resets at each ``Accum`` and
+    at each nested ``Loop`` boundary so sibling reduce sweeps (softmax
+    pattern) get their own scope-local Loads.
     """
     if not inputs:
-        return LoopOp(body=flat_body_to_nested(axes, body))
+        return LoopOp(body=_nest(axes, body))
 
     index_of = {i: tuple(p) for i, p in enumerate(inputs)}
     fresh_counter = [0]
@@ -89,7 +153,7 @@ def _loop(*, axes=(), inputs=(), body=()):
 
         return tuple(result)
 
-    return LoopOp(body=flat_body_to_nested(axes, process(body)))
+    return LoopOp(body=_nest(axes, process(body)))
 
 
 # ---------------------------------------------------------------------------
@@ -451,83 +515,6 @@ def test_loop_ssa_scoping():
                 Write(output=0, index=(Var("a0"),), value="v"),
             ),
         )
-
-
-# ---------------------------------------------------------------------------
-# Shim: flat → nested
-# ---------------------------------------------------------------------------
-
-
-def test_flat_body_to_nested_pointwise():
-    from deplodock.compiler.ir.loop import Loop
-
-    axes = (Axis("a0", 8),)
-    flat = (
-        Assign("v", ElementwiseOp("neg"), args=("$0",)),
-        Write(output=0, index=(Var("a0"),), value="v"),
-    )
-    nested = flat_body_to_nested(axes, flat)
-    assert len(nested) == 1
-    assert isinstance(nested[0], Loop) and nested[0].axis.name == "a0"
-    inner = nested[0].body
-    assert len(inner) == 2
-    assert isinstance(inner[0], Assign)
-    assert isinstance(inner[1], Write)
-
-
-def test_flat_body_to_nested_reduce_splits_at_update():
-    from deplodock.compiler.ir.loop import Loop
-
-    axes = (Axis("a0", 4), Axis("k", 8))
-    flat = (
-        Accum(name="acc", value="$0"),
-        Write(output=0, index=(Var("a0"),), value="acc"),
-    )
-    nested = flat_body_to_nested(axes, flat)
-    assert len(nested) == 1 and isinstance(nested[0], Loop) and nested[0].axis.name == "a0"
-    inner = nested[0].body
-    assert len(inner) == 2
-    assert isinstance(inner[0], Loop) and inner[0].axis.name == "k"
-    assert isinstance(inner[0].body[0], Accum)
-    assert isinstance(inner[1], Write)
-
-
-def test_flat_body_to_nested_idempotent():
-    from deplodock.compiler.ir.loop import Loop
-
-    already_nested = (
-        Loop(
-            axis=Axis("a0", 8),
-            body=(
-                Assign("v", ElementwiseOp("neg"), args=("$0",)),
-                Write(output=0, index=(Var("a0"),), value="v"),
-            ),
-        ),
-    )
-    assert flat_body_to_nested((Axis("a0", 8),), already_nested) == already_nested
-
-
-def test_flat_body_to_nested_softmax_two_updates():
-    from deplodock.compiler.ir.loop import Loop
-
-    axes = (Axis("a0", 4), Axis("a1", 8), Axis("k", 8))
-    flat = (
-        Accum(name="mx", value="$1"),
-        Assign("v_mx", ElementwiseOp("neg"), args=("mx",)),
-        Accum(name="sm", value="v_mx"),
-        Write(output=0, index=(Var("a0"), Var("a1")), value="sm"),
-    )
-    nested = flat_body_to_nested(axes, flat)
-    # Structure: Loop(a0, [Loop(a1, [Loop(k, [Accum mx]), Loop(k, [Assign, Accum sm]), Write])])
-    assert len(nested) == 1 and nested[0].axis.name == "a0"
-    inner_a1 = nested[0].body[0]
-    assert isinstance(inner_a1, Loop) and inner_a1.axis.name == "a1"
-    inner_stmts = inner_a1.body
-    reduce_loops = [s for s in inner_stmts if isinstance(s, Loop)]
-    assert len(reduce_loops) == 2
-    assert all(L.axis.name == "k" for L in reduce_loops)
-    writes = [s for s in inner_stmts if isinstance(s, Write)]
-    assert len(writes) == 1
 
 
 # ---------------------------------------------------------------------------
