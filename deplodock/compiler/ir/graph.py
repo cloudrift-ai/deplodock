@@ -146,7 +146,14 @@ def _lookup_op_class(name: str) -> type[Op] | None:
 
 
 class Graph:
-    """Directed acyclic compute graph of tensor operations."""
+    """Directed acyclic compute graph of tensor operations.
+
+    Stores both directions of each edge: every ``Node`` carries its
+    backward edges as ``node.inputs`` (producer ids), and the graph
+    maintains a forward-edge index ``_users`` (consumer id set per node).
+    Mutation methods keep both sides consistent, so forward walks
+    (``users`` / ``consumers``) are O(1) per hop.
+    """
 
     def __init__(self) -> None:
         self.nodes: dict[str, Node] = {}
@@ -154,6 +161,7 @@ class Graph:
         self.outputs: list[str] = []
         self.hints: Hints = Hints()
         self._id_counter = itertools.count()
+        self._users: dict[str, set[str]] = {}
 
     def _next_id(self) -> str:
         while True:
@@ -177,45 +185,64 @@ class Graph:
             if inp not in self.nodes:
                 raise ValueError(f"Input node {inp!r} does not exist")
         self.nodes[nid] = Node(id=nid, op=op, inputs=inputs, output=output)
+        self._users[nid] = set()
+        for inp in inputs:
+            self._users[inp].add(nid)
         return nid
 
     def remove_node(self, node_id: str) -> None:
         """Remove a node from the graph."""
         if node_id not in self.nodes:
             raise KeyError(f"Node {node_id!r} not found")
+        node = self.nodes[node_id]
+        for inp in node.inputs:
+            users = self._users.get(inp)
+            if users is not None:
+                users.discard(node_id)
         self.inputs = [i for i in self.inputs if i != node_id]
         self.outputs = [o for o in self.outputs if o != node_id]
         del self.nodes[node_id]
+        self._users.pop(node_id, None)
 
     def replace_node(self, old_id: str, new_id: str) -> None:
         """Rewire all references from old_id to new_id."""
         if new_id not in self.nodes:
             raise KeyError(f"Replacement node {new_id!r} not found")
-        for node in self.nodes.values():
+        old_users = self._users.get(old_id, set())
+        for consumer_id in list(old_users):
+            node = self.nodes[consumer_id]
             node.inputs = [new_id if i == old_id else i for i in node.inputs]
+            self._users[new_id].add(consumer_id)
+        if old_id in self._users:
+            self._users[old_id] = set()
         self.inputs = [new_id if i == old_id else i for i in self.inputs]
         self.outputs = [new_id if o == old_id else o for o in self.outputs]
 
+    def users(self, node_id: str) -> set[str]:
+        """Return the set of node ids that consume ``node_id``. O(1)."""
+        return self._users.get(node_id, set())
+
     def consumers(self, node_id: str) -> list[str]:
-        """Return ids of nodes that consume node_id as an input."""
-        return [n.id for n in self.nodes.values() if node_id in n.inputs]
+        """List form of :meth:`users`, preserved for existing callers."""
+        return list(self._users.get(node_id, ()))
 
     def topological_order(self) -> list[str]:
-        """Return node ids in topological order (inputs before consumers)."""
-        # Count unique input edges (deduplicate for fan-out).
+        """Return node ids in topological order (inputs before consumers).
+
+        Kahn's algorithm in O(N+E) using the maintained ``_users`` index.
+        """
         in_degree: dict[str, int] = {nid: 0 for nid in self.nodes}
         for node in self.nodes.values():
             for inp in set(node.inputs):
                 if inp in in_degree:
                     in_degree[node.id] += 1
 
-        # Kahn's algorithm — deterministic ordering via insertion order.
         queue = [nid for nid, deg in in_degree.items() if deg == 0]
         result: list[str] = []
         while queue:
             nid = queue.pop(0)
             result.append(nid)
-            for consumer_id in self.consumers(nid):
+            for consumer_id in self._users.get(nid, ()):
                 in_degree[consumer_id] -= 1
                 if in_degree[consumer_id] == 0:
                     queue.append(consumer_id)
@@ -241,6 +268,7 @@ class Graph:
                 ),
                 hints=Hints.from_dict(node.hints.to_dict()),
             )
+        g._users = {nid: set(users) for nid, users in self._users.items()}
         g.inputs = list(self.inputs)
         g.outputs = list(self.outputs)
         return g
@@ -273,6 +301,13 @@ class Graph:
             node_hints = Hints.from_dict(ndata.get("hints", {}))
             # Add directly to bypass input validation (nodes may reference later nodes).
             g.nodes[nid] = Node(id=nid, op=op, inputs=list(ndata["inputs"]), output=tensor, hints=node_hints)
+
+        # Rebuild the forward-edge index now that every node is present.
+        g._users = {nid: set() for nid in g.nodes}
+        for nid, node in g.nodes.items():
+            for inp in node.inputs:
+                if inp in g._users:
+                    g._users[inp].add(nid)
 
         g.inputs = list(data["inputs"])
         g.outputs = list(data["outputs"])
