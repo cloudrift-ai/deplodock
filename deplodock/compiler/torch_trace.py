@@ -68,10 +68,17 @@ def trace_module_with_constants(
     strips prefixes like ``self_`` from the placeholder name, so this map
     is needed to feed constants at runtime.
     """
+    import time
+
     import torch
 
+    t0 = time.monotonic()
+    logger.info("torch.export.export() starting...")
     exported = torch.export.export(module, example_inputs, kwargs=kwargs or {})
     gm = exported.graph_module
+    t1 = time.monotonic()
+    n_fx_nodes = sum(1 for _ in gm.graph.nodes)
+    logger.info("torch.export.export() done in %.1fs (%d FX nodes)", t1 - t0, n_fx_nodes)
 
     g = Graph()
     node_map: dict[str, str] = {}
@@ -85,6 +92,7 @@ def trace_module_with_constants(
             _handle_output(g, fx_node, node_map)
         else:
             logger.debug("Skipping FX node: %s (op=%s)", fx_node.name, fx_node.op)
+    logger.info("FX→Graph IR walk done in %.1fs (%d IR nodes)", time.monotonic() - t1, len(g.nodes))
 
     const_targets: dict[str, str] = {}
     sig = exported.graph_signature

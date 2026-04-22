@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -108,28 +109,44 @@ class Pass:
         if trace is not None:
             trace.graph_before = graph.to_dict()
         outer_changed = True
+        rule_stats: dict[str, tuple[int, float, float]] = {}  # name -> (applied, match_s, rewrite_s)
         while outer_changed:
             outer_changed = False
             for rule in self.rules:
                 while True:
+                    t0 = time.monotonic()
                     matches = match_grammar(graph, rule.grammar)
+                    match_time = time.monotonic() - t0
                     if not matches:
+                        prev = rule_stats.get(rule.name, (0, 0.0, 0.0))
+                        rule_stats[rule.name] = (prev[0], prev[1] + match_time, prev[2])
                         break
                     rule_changed = False
+                    applied = 0
+                    rewrite_time = 0.0
                     for match in matches:
                         if any(nid not in graph.nodes for nid in match.consumed):
                             continue
                         logger.debug("Rule %s matched at %s", rule.name, match.root_node_id)
+                        t1 = time.monotonic()
                         fragment = rule.rewrite(graph, match)
                         if fragment is None:
+                            rewrite_time += time.monotonic() - t1
                             continue
                         if trace is not None:
                             trace.rules_applied.append(RuleApplication(rule_name=rule.name, matched_at=match.root_node_id))
                         graph = _apply_replacement(graph, match, fragment)
+                        rewrite_time += time.monotonic() - t1
+                        applied += 1
                         rule_changed = True
                         outer_changed = True
+                    prev = rule_stats.get(rule.name, (0, 0.0, 0.0))
+                    rule_stats[rule.name] = (prev[0] + applied, prev[1] + match_time, prev[2] + rewrite_time)
                     if not rule_changed:
                         break
+        for name, (n, mt, rt) in sorted(rule_stats.items(), key=lambda kv: -(kv[1][1] + kv[1][2])):
+            if n or mt > 0.01:
+                logger.info("  rule %-30s applied=%4d  match=%5.2fs  rewrite=%5.2fs", name, n, mt, rt)
         if trace is not None:
             trace.graph_after = graph.to_dict()
         return graph
@@ -179,8 +196,13 @@ def _apply_replacement(graph: Graph, match: ChainMatch, fragment: Graph) -> Grap
     1. Add fragment's non-InputOp nodes to the graph (with fresh IDs).
     2. Wire the fragment's output to replace the match's output.
     3. Remove consumed nodes and orphaned constants.
+
+    Mutates ``graph`` in place and returns the same object. ``apply``'s
+    batched-match loop already guards against stale matches from sibling
+    rewrites via the ``consumed`` check, so per-match atomicity is not
+    needed; copying the whole graph per match was O(N) × O(matches).
     """
-    g = graph.copy()
+    g = graph
 
     # Add fragment nodes, mapping fragment IDs to new graph IDs.
     id_map: dict[str, str] = {}
