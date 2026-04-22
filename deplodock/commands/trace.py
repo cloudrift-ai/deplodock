@@ -27,7 +27,18 @@ def register_trace_command(subparsers):
             "Mutually exclusive with the positional model ID."
         ),
     )
-    parser.add_argument("--layer", type=int, default=0, help="Layer index to trace (default: 0)")
+    parser.add_argument(
+        "--layer",
+        type=int,
+        default=None,
+        help="Layer index to trace. Omit to trace the whole model (input_ids -> logits).",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=32,
+        help="Sequence length for the example input (default: 32).",
+    )
     parser.add_argument("--output", "-o", help="Output JSON path (default: auto-generated)")
     parser.set_defaults(func=handle_trace)
 
@@ -57,32 +68,41 @@ def _handle_trace_model(args):
     from deplodock.compiler.torch_trace import trace_module
 
     logger.info("Loading %s...", args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16)
+    dtype = torch.float32 if args.layer is None else torch.float16
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
+    model.eval()
+    seq_len = args.seq_len
 
-    # Extract the requested layer.
-    layers = model.model.layers
-    if args.layer >= len(layers):
-        logger.error("Layer %d not found (model has %d layers)", args.layer, len(layers))
-        sys.exit(1)
+    if args.layer is None:
+        from deplodock.compiler.model_wrapper import build_full_model_wrapper
 
-    block = layers[args.layer]
-    logger.info("Tracing layer %d...", args.layer)
+        logger.info("Tracing full model (seq_len=%d)...", seq_len)
+        wrapper = build_full_model_wrapper(model, seq_len, dtype)
+        input_ids = torch.zeros((1, seq_len), dtype=torch.long)
+        graph = trace_module(wrapper, (input_ids,))
+        basename = f"{args.model.replace('/', '-').lower()}-full-s{seq_len}"
+    else:
+        layers = model.model.layers
+        if args.layer >= len(layers):
+            logger.error("Layer %d not found (model has %d layers)", args.layer, len(layers))
+            sys.exit(1)
 
-    # Create example inputs for tracing.
-    hidden_size = model.config.hidden_size
-    seq_len = 32
+        block = layers[args.layer]
+        logger.info("Tracing layer %d...", args.layer)
 
-    x = torch.randn(1, seq_len, hidden_size, dtype=torch.float16)
-    position_ids = torch.arange(seq_len).unsqueeze(0)
-    cos, sin = model.model.rotary_emb(x, position_ids)
+        hidden_size = model.config.hidden_size
+        x = torch.randn(1, seq_len, hidden_size, dtype=dtype)
+        position_ids = torch.arange(seq_len).unsqueeze(0)
+        cos, sin = model.model.rotary_emb(x, position_ids)
 
-    graph = trace_module(
-        block,
-        (x,),
-        kwargs={"position_embeddings": (cos, sin)},
-    )
+        graph = trace_module(
+            block,
+            (x,),
+            kwargs={"position_embeddings": (cos, sin)},
+        )
+        basename = f"{args.model.replace('/', '-').lower()}-layer{args.layer}"
 
-    _save(graph, args, default_basename=f"{args.model.replace('/', '-').lower()}-layer{args.layer}")
+    _save(graph, args, default_basename=basename)
 
 
 def _handle_trace_code(args):

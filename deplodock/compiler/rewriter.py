@@ -95,28 +95,41 @@ class Pass:
         return Pass(name=path.name, rules=rules)
 
     def apply(self, graph: Graph, trace: PassTrace | None = None) -> Graph:
-        """Apply rules to fixed point. Rules return Graph fragment or None."""
+        """Apply rules to fixed point. Rules return Graph fragment or None.
+
+        Each rule is driven to its own fixed point (all matches applied per
+        scan, rescanned until empty) before moving on to the next rule. An
+        outer loop re-runs the sequence if any cross-rule dependency
+        introduced work. Match results within one scan are guaranteed
+        non-overlapping by the matcher, so they are safe to batch; stale
+        matches (nodes removed as orphans by an earlier sibling rewrite)
+        are skipped defensively.
+        """
         if trace is not None:
             trace.graph_before = graph.to_dict()
-        changed = True
-        while changed:
-            changed = False
+        outer_changed = True
+        while outer_changed:
+            outer_changed = False
             for rule in self.rules:
-                matches = match_grammar(graph, rule.grammar)
-                if not matches:
-                    continue
-                for match in matches:
-                    logger.debug("Rule %s matched at %s", rule.name, match.root_node_id)
-                    fragment = rule.rewrite(graph, match)
-                    if fragment is None:
-                        continue
-                    if trace is not None:
-                        trace.rules_applied.append(RuleApplication(rule_name=rule.name, matched_at=match.root_node_id))
-                    graph = _apply_replacement(graph, match, fragment)
-                    changed = True
-                    break
-                if changed:
-                    break
+                while True:
+                    matches = match_grammar(graph, rule.grammar)
+                    if not matches:
+                        break
+                    rule_changed = False
+                    for match in matches:
+                        if any(nid not in graph.nodes for nid in match.consumed):
+                            continue
+                        logger.debug("Rule %s matched at %s", rule.name, match.root_node_id)
+                        fragment = rule.rewrite(graph, match)
+                        if fragment is None:
+                            continue
+                        if trace is not None:
+                            trace.rules_applied.append(RuleApplication(rule_name=rule.name, matched_at=match.root_node_id))
+                        graph = _apply_replacement(graph, match, fragment)
+                        rule_changed = True
+                        outer_changed = True
+                    if not rule_changed:
+                        break
         if trace is not None:
             trace.graph_after = graph.to_dict()
         return graph
@@ -211,17 +224,37 @@ def _apply_replacement(graph: Graph, match: ChainMatch, fragment: Graph) -> Grap
 
 
 def _remove_orphans(graph: Graph) -> None:
-    """Remove nodes with zero consumers that aren't graph outputs."""
+    """Remove nodes with zero consumers that aren't graph outputs.
+
+    Linear-time: computes a consumer-count map once and propagates
+    decrements as orphans are removed. The prior implementation called
+    ``graph.consumers(nid)`` (O(N)) inside a ``while changed`` loop over
+    all nodes, which blew up to O(N^2 * orphans) on large graphs.
+    """
     output_set = set(graph.outputs)
-    changed = True
-    while changed:
-        changed = False
-        for nid in list(graph.nodes):
-            if nid in output_set or nid in graph.inputs:
-                continue
-            node = graph.nodes[nid]
-            if isinstance(node.op, InputOp):
-                continue
-            if not graph.consumers(nid):
-                graph.remove_node(nid)
-                changed = True
+    input_set = set(graph.inputs)
+
+    def _is_protected(nid: str) -> bool:
+        if nid in output_set or nid in input_set:
+            return True
+        node = graph.nodes.get(nid)
+        return node is not None and isinstance(node.op, InputOp)
+
+    consumer_count: dict[str, int] = dict.fromkeys(graph.nodes, 0)
+    for node in graph.nodes.values():
+        for inp in set(node.inputs):
+            if inp in consumer_count:
+                consumer_count[inp] += 1
+
+    queue: list[str] = [nid for nid, c in consumer_count.items() if c == 0 and not _is_protected(nid)]
+    while queue:
+        nid = queue.pop()
+        if nid not in graph.nodes:
+            continue
+        node = graph.nodes[nid]
+        for inp in set(node.inputs):
+            if inp in consumer_count:
+                consumer_count[inp] -= 1
+                if consumer_count[inp] == 0 and not _is_protected(inp):
+                    queue.append(inp)
+        graph.remove_node(nid)
