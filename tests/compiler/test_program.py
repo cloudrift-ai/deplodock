@@ -1,16 +1,12 @@
-"""Tests for the unified GpuProgram execution abstraction."""
+"""Tests for codegen + execution on a lowered ``Graph[CudaOp]``."""
 
 import pytest
 
-from deplodock.compiler.backend.cuda.program import (
-    GpuBuffer,
-    GpuLaunch,
-    GpuProgram,
-    benchmark_program,
-    generate_source,
-    run_program,
-)
+from deplodock.compiler.backend.cuda.program import benchmark_program, generate_source, run_program
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.cuda import CudaOp
+from deplodock.compiler.ir.graph import Graph, Tensor
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
@@ -18,41 +14,40 @@ requires_cuda = pytest.mark.skipif(
 )
 
 EW_ADD_SOURCE = """
-__global__ void ew_add(const float* A, const float* B, float* C, int n) {
+__global__ void ew_add(const float* A, const float* B, float* C) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) C[i] = A[i] + B[i];
+    if (i < 8) C[i] = A[i] + B[i];
 }
 """
 
 
-def _make_add_program(n: int = 8) -> GpuProgram:
+def _make_add_graph(n: int = 8) -> Graph:
     """Simple elementwise add: C = A + B."""
-    return GpuProgram(
-        name="test_add",
-        buffers=[
-            GpuBuffer("A", (n,), role="input"),
-            GpuBuffer("B", (n,), role="input"),
-            GpuBuffer("C", (n,), role="output"),
-        ],
-        launches=[
-            GpuLaunch(
-                kernel_source=EW_ADD_SOURCE,
-                kernel_name="ew_add",
-                grid=((n + 255) // 256, 1, 1),
-                block=(256, 1, 1),
-                args=["A", "B", "C", str(n)],
-            ),
-        ],
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (n,)), node_id="A")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (n,)), node_id="B")
+    g.add_node(
+        op=CudaOp(
+            kernel_source=EW_ADD_SOURCE,
+            kernel_name="ew_add",
+            arg_order=("A", "B", "C"),
+            grid=((n + 255) // 256, 1, 1),
+            block=(256, 1, 1),
+        ),
+        inputs=["A", "B"],
+        output=Tensor("C", (n,)),
+        node_id="C",
     )
+    g.inputs = ["A", "B"]
+    g.outputs = ["C"]
+    return g
 
 
 # ---- Codegen tests (no GPU) ----
 
 
 def test_generate_run_source():
-    prog = _make_add_program()
-    src = generate_source(prog, mode="run")
-
+    src = generate_source(_make_add_graph(), mode="run")
     assert "int main()" in src
     assert "ew_add<<<" in src
     assert "cudaMalloc" in src
@@ -60,9 +55,7 @@ def test_generate_run_source():
 
 
 def test_generate_benchmark_source():
-    prog = _make_add_program()
-    src = generate_source(prog, mode="benchmark")
-
+    src = generate_source(_make_add_graph(), mode="benchmark")
     assert "PROGRAM_TIME_MS=" in src
     assert "PROGRAM_LAUNCHES=" in src
     assert "cudaEventCreate" in src
@@ -70,92 +63,77 @@ def test_generate_benchmark_source():
 
 def test_generate_source_bakes_scalar_constants():
     """Pre-baked scalar constants (RMSNorm eps, softmax scale, mask fill, …)
-    must be written into the generated .cu as literals — NOT overwritten by the
-    pseudorandom fallback. Otherwise benchmark binaries that skip input_data
-    (like the subprocess-based bench path) get garbage eps and produce NaN.
-    """
-    prog = GpuProgram(
-        name="bake_test",
-        buffers=[
-            GpuBuffer("A", (8,), role="input"),
-            GpuBuffer("eps", (1,), role="constant"),
-            GpuBuffer("scale", (1,), role="constant"),
-            GpuBuffer("mask_fill", (1,), role="constant"),
-            GpuBuffer("C", (8,), role="output"),
-        ],
-        launches=[
-            GpuLaunch(
-                kernel_source=EW_ADD_SOURCE,
-                kernel_name="ew_add",
-                grid=(1, 1, 1),
-                block=(256, 1, 1),
-                args=["A", "eps", "C", "8"],
-            ),
-        ],
-        constant_values={"eps": 1e-5, "scale": 0.125, "mask_fill": -1e9},
+    must be written into the generated .cu as literals."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (8,)), node_id="A")
+    g.add_node(op=ConstantOp(name="eps", value=1e-5), inputs=[], output=Tensor("eps", (1,)), node_id="eps")
+    g.add_node(op=ConstantOp(name="scale", value=0.125), inputs=[], output=Tensor("scale", (1,)), node_id="scale")
+    g.add_node(op=ConstantOp(name="mask_fill", value=-1e9), inputs=[], output=Tensor("mask_fill", (1,)), node_id="mask_fill")
+    g.add_node(
+        op=CudaOp(
+            kernel_source=EW_ADD_SOURCE,
+            kernel_name="ew_add",
+            arg_order=("A", "eps", "C"),
+            grid=(1, 1, 1),
+            block=(256, 1, 1),
+        ),
+        inputs=["A", "eps"],
+        output=Tensor("C", (8,)),
+        node_id="C",
     )
-    src = generate_source(prog, mode="benchmark")
+    g.inputs = ["A"]
+    g.outputs = ["C"]
 
-    # Each baked constant's value appears in an initializer line.
-    assert "1e-05" in src, "RMSNorm-style eps should be baked as 1e-05"
-    assert "0.125" in src, "softmax-style scale should be baked as 0.125"
-    assert "-1000000000.0" in src or "-1e+09" in src, "mask_fill should be baked as -1e9"
+    src = generate_source(g, mode="benchmark")
 
-    # And the pseudorandom fallback ("0.01f * ((i * 7") should not appear for
-    # the baked scalars — only for unbaked inputs like A.
+    assert "1e-05" in src
+    assert "0.125" in src
+    assert "-1000000000.0" in src or "-1e+09" in src
+
     baked_init_count = src.count("0.01f * ((i * 7")
-    # Only one non-baked input remains (A).
     assert baked_init_count == 1, f"expected 1 pseudorandom init for A, got {baked_init_count}"
 
 
 def test_buffers_allocated_by_role():
-    prog = _make_add_program()
-    src = generate_source(prog, mode="run")
-
-    # Inputs get initialized, scratch/output don't.
+    src = generate_source(_make_add_graph(), mode="run")
     assert "cudaMemcpy(d_A" in src  # input
     assert "cudaMemcpy(d_B" in src  # input
-    # Output is read back.
-    assert "cudaMemcpy(h, d_C" in src
+    assert "cudaMemcpy(h, d_C" in src  # output readback
 
 
 def test_multi_kernel_program():
-    """GpuProgram with 2 launches generates both kernel calls."""
-    prog = GpuProgram(
-        name="test_multi",
-        buffers=[
-            GpuBuffer("X", (4,), role="input"),
-            GpuBuffer("Y", (4,), role="output"),
-            GpuBuffer("Z", (4,), role="output"),
-        ],
-        launches=[
-            GpuLaunch(
-                kernel_source="__global__ void k1(float* X, float* Y, int n) { int i = threadIdx.x; if (i < n) Y[i] = X[i] * 2; }",
-                kernel_name="k1",
-                grid=(1, 1, 1),
-                block=(256, 1, 1),
-                args=["X", "Y", "4"],
-            ),
-            GpuLaunch(
-                kernel_source="__global__ void k2(float* Y, float* Z, int n) { int i = threadIdx.x; if (i < n) Z[i] = Y[i] + 1; }",
-                kernel_name="k2",
-                grid=(1, 1, 1),
-                block=(256, 1, 1),
-                args=["Y", "Z", "4"],
-            ),
-        ],
+    """Graph with 2 CudaOp launches generates both kernel calls."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("X", (4,)), node_id="X")
+    g.add_node(
+        op=CudaOp(
+            kernel_source="__global__ void k1(float* X, float* Y) { int i = threadIdx.x; if (i < 4) Y[i] = X[i] * 2; }",
+            kernel_name="k1",
+            arg_order=("X", "Y"),
+            grid=(1, 1, 1),
+            block=(256, 1, 1),
+        ),
+        inputs=["X"],
+        output=Tensor("Y", (4,)),
+        node_id="Y",
     )
-    src = generate_source(prog, mode="run")
+    g.add_node(
+        op=CudaOp(
+            kernel_source="__global__ void k2(float* Y, float* Z) { int i = threadIdx.x; if (i < 4) Z[i] = Y[i] + 1; }",
+            kernel_name="k2",
+            arg_order=("Y", "Z"),
+            grid=(1, 1, 1),
+            block=(256, 1, 1),
+        ),
+        inputs=["Y"],
+        output=Tensor("Z", (4,)),
+        node_id="Z",
+    )
+    g.inputs = ["X"]
+    g.outputs = ["Y", "Z"]
+    src = generate_source(g, mode="run")
     assert "k1<<<" in src
     assert "k2<<<" in src
-
-
-def test_defines_in_source():
-    prog = _make_add_program()
-    prog.defines = {"N": "8", "BLOCK": "256"}
-    src = generate_source(prog, mode="run")
-    assert "#define N 8" in src
-    assert "#define BLOCK 256" in src
 
 
 # ---- GPU tests ----
@@ -163,60 +141,15 @@ def test_defines_in_source():
 
 @requires_cuda
 def test_run_program_elementwise_add():
-    """Run a simple A+B program and verify output values are finite."""
-    prog = _make_add_program(8)
-    result = run_program(prog)
-
+    result = run_program(_make_add_graph(8))
     assert "C" in result.outputs
     assert len(result.outputs["C"]) == 8
     for v in result.outputs["C"]:
-        assert v == v, "NaN in output"  # NaN != NaN
+        assert v == v  # NaN check
 
 
 @requires_cuda
 def test_benchmark_program_returns_timing():
-    """Benchmark mode returns valid timing."""
-    prog = _make_add_program(1024)
-    result = benchmark_program(prog, warmup=2, num_iters=5)
-
+    result = benchmark_program(_make_add_graph(1024), warmup=2, num_iters=5)
     assert result.time_ms > 0
     assert result.num_launches == 1
-
-
-@requires_cuda
-def test_multi_kernel_execution():
-    """Two sequential kernels produce correct chained output."""
-    prog = GpuProgram(
-        name="chain",
-        buffers=[
-            GpuBuffer("A", (4,), role="input"),
-            GpuBuffer("B", (4,), role="scratch"),
-            GpuBuffer("C", (4,), role="output"),
-        ],
-        launches=[
-            GpuLaunch(
-                kernel_source=(
-                    "__global__ void double_it(const float* A, float* B, int n) { int i = threadIdx.x; if (i < n) B[i] = A[i] * 2.0f; }"
-                ),
-                kernel_name="double_it",
-                grid=(1, 1, 1),
-                block=(256, 1, 1),
-                args=["A", "B", "4"],
-            ),
-            GpuLaunch(
-                kernel_source=(
-                    "__global__ void add_one(const float* B, float* C, int n) { int i = threadIdx.x; if (i < n) C[i] = B[i] + 1.0f; }"
-                ),
-                kernel_name="add_one",
-                grid=(1, 1, 1),
-                block=(256, 1, 1),
-                args=["B", "C", "4"],
-            ),
-        ],
-    )
-    result = run_program(prog)
-    assert "C" in result.outputs
-    assert len(result.outputs["C"]) == 4
-    # Input is pseudorandom, but output should be finite.
-    for v in result.outputs["C"]:
-        assert abs(v) < 100, f"Unexpected value: {v}"

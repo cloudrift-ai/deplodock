@@ -18,12 +18,12 @@ import numpy as np
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.loop import Accum, Assign, Write
+from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
 from deplodock.compiler.rewriter import Rewriter
 
-_RULES_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+_RULES_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "passes"
 _backend = NumpyBackend()
 rng = np.random.default_rng(0)
 
@@ -69,6 +69,10 @@ def _has_write(body) -> bool:
     return any(isinstance(s, Write) for s in iter_body(body))
 
 
+def _loop_nodes(graph: Graph) -> list:
+    return [n for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
+
+
 def test_pointwise_add():
     g = Graph()
     _input(g, "x", (4,))
@@ -78,10 +82,10 @@ def test_pointwise_add():
     g.outputs = ["z"]
 
     result = compile_graph(g)
-    launches = result.launches
+    launches = _loop_nodes(result)
     assert len(launches) == 1
-    assert "add" in _elementwise_fns(launches[0].loop.body)
-    assert _has_write(launches[0].loop.body)
+    assert "add" in _elementwise_fns(launches[0].op.body)
+    assert _has_write(launches[0].op.body)
 
 
 def test_chained_pointwise_fuses_into_one():
@@ -93,9 +97,9 @@ def test_chained_pointwise_fuses_into_one():
     g.outputs = ["n"]
 
     result = compile_graph(g)
-    launches = result.launches
+    launches = _loop_nodes(result)
     assert len(launches) == 1
-    fns = _elementwise_fns(launches[0].loop.body)
+    fns = _elementwise_fns(launches[0].op.body)
     assert "exp" in fns and "neg" in fns
 
 
@@ -107,11 +111,10 @@ def test_reduce_sum():
     g.outputs = ["r"]
 
     result = compile_graph(g)
-    launches = result.launches
+    launches = _loop_nodes(result)
     assert len(launches) == 1
-    loop = launches[0].loop
+    loop = launches[0].op
     assert _has_update(loop.body)
-    # Reduction target is a Accum with combine=add (sum).
     assert any(lb.op.fn == "add" for lb in loop.accums)
 
 
@@ -126,10 +129,9 @@ def test_matmul():
     g.outputs = ["o"]
 
     result = compile_graph(g)
-    launches = result.launches
-    # Expect a mul Assign and a sum Accum somewhere across the launches.
-    has_mul = any("mul" in _elementwise_fns(k.loop.body) for k in launches)
-    has_sum = any(any(lb.op.fn == "add" for lb in k.loop.accums) for k in launches)
+    launches = _loop_nodes(result)
+    has_mul = any("mul" in _elementwise_fns(k.op.body) for k in launches)
+    has_sum = any(any(lb.op.fn == "add" for lb in k.op.accums) for k in launches)
     assert has_mul
     assert has_sum
 
@@ -145,7 +147,7 @@ def test_no_matmul_when_mul_fans_out():
     g.outputs = ["d", "n"]
 
     result = compile_graph(g)
-    launches = result.launches
+    launches = _loop_nodes(result)
     assert len(launches) == 3
 
 
@@ -160,8 +162,8 @@ def test_matmul_op_decomposes_and_fuses():
     g.outputs = ["m"]
 
     result = compile_graph(g)
-    launches = result.launches
-    has_reduce = any(_has_update(k.loop.body) for k in launches)
+    launches = _loop_nodes(result)
+    has_reduce = any(_has_update(k.op.body) for k in launches)
     assert has_reduce
 
 
@@ -173,7 +175,7 @@ def test_compile_graph_produces_kernel_ops():
     g.outputs = ["e"]
 
     result = compile_graph(g)
-    launches = result.launches
+    launches = _loop_nodes(result)
     assert len(launches) == 1
 
 

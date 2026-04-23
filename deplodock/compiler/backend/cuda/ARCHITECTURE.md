@@ -1,143 +1,147 @@
 # CUDA Backend Architecture
 
-The CUDA backend takes a `Graph` and lowers it via `compile_graph →
-LoopProgram → compile_kernels → GpuProgram` — one `CudaLaunch` per
-kernel. Source generation is a **recursive descent** over the structural
-IR; there's no classification pass, no `Schedule` dataclass, and no
-intermediate `LoopIR` stage.
+The CUDA backend takes a `Graph` and lowers it through two structural
+passes — `passes/lowering/kernel` (LoopOp → KernelOp) and
+`passes/lowering/cuda` (KernelOp → CudaOp) — producing a `Graph[CudaOp]`
+that the runtime walks to emit a `.cu` program. Source generation is a
+**recursive descent** over the structural IR; there's no classification
+pass, no `Schedule` dataclass, and no intermediate `LoopIR` stage.
 
 **Peer backends:**
 - `backend/numpy/` — `NumpyBackend` evaluates the Graph directly (pre-fusion).
-- `backend/loop/` — `LoopBackend` interprets the `LoopProgram` via numpy
-  whole-tensor operations (post-fusion, pre-codegen). Used as a
-  triangulation reference: disagreement with CUDA on the same
-  `LoopProgram` implicates codegen; disagreement with numpy implicates
-  fusion. All three backends expose the same `compile(graph)` /
-  `run(compiled, input_data=…) → ProgramResult` API (`backend/base.py`).
+- `backend/loop/` — `LoopBackend` interprets the fused `Graph[LoopOp]`
+  via numpy whole-tensor operations. Used as a triangulation reference:
+  disagreement with CUDA implicates codegen; disagreement with numpy
+  implicates fusion. All three backends expose the same `compile(graph)`
+  / `run(compiled, input_data=…) → ProgramResult` API (`backend/base.py`).
 
 ## Module Layout
 
 ```
 cuda/
-├── backend.py   # CudaBackend(Backend): compile(LoopProgram) → GpuProgram
-├── emit.py      # compile_kernels(LoopProgram) → GpuProgram
-│                #   emit_kernel(LoopLaunch, name, LoopProgram) → GpuKernel
-├── program.py   # CudaLaunch(GpuLaunch), generate_source(), nvcc + run
+├── backend.py   # CudaBackend(Backend): compile(graph) → Graph[CudaOp]
+├── emit.py      # emit_kernel(node, name, graph) → (GpuKernel, arg_order)
+│                # launch_config(node) → (grid, block)
+├── program.py   # generate_source(graph), nvcc compile + run
 └── runner.py    # Single-kernel compile + run + benchmark harness
 ```
 
-Shared infrastructure (backend-agnostic) lives in two places:
+Shared infrastructure (backend-agnostic) lives at the IR layer:
 
 ```
-compiler/ir/kernel_ir.py         # GpuKernel, GpuKernelParam, Stmt hierarchy, expressions
-compiler/program/gpu.py    # GpuBuffer, GpuLaunch, GpuProgram (runnable program form)
-backend/kernel_codegen.py  # GpuKernel → C source (up one level; not CUDA-specific)
+compiler/ir/kernel/ir.py   # GpuKernel, GpuKernelParam, Stmt hierarchy, expressions, KernelOp graph-op
+compiler/ir/kernel/emit.py # per-node LoopOp → GpuKernel codegen (emit_kernel, launch_config)
+compiler/ir/cuda/ir.py     # CudaOp   (graph-op with rendered CUDA source)
+backend/kernel_codegen.py  # GpuKernel → C source (one level up; not CUDA-specific)
 ```
 
 ## Emission Pipeline
 
 ```
-LoopProgram
+Graph[LoopOp]   (output of pipeline.compile_graph)
     │
-    │  compile_kernels(loop_program)
-    │    for each LoopLaunch in loop_program.launches:
-    │      emit.emit_kernel(launch, name, loop_program) → (GpuKernel, arg_order)
-    │      ir.simplify.simplify_kernel(GpuKernel) → GpuKernel  (const fold / clamp eliminate)
-    │      kernel_codegen.emit_kernel(GpuKernel) → C source string
-    │      wrap as CudaLaunch(kernel_source, grid, block, args)
+    │  passes/lowering/kernel/lower_loopop.py
+    │    for each LoopOp node:
+    │      emit_kernel(node, name, graph) → (GpuKernel, arg_order)
+    │      node.op = KernelOp(kernel, kernel_name, arg_order, grid, block, …)
+    │      # KernelOp.__post_init__ runs ir.kernel.normalize.normalize_kernel
+    │      # (const fold / clamp eliminate) automatically.
     ▼
-GpuProgram
-    │  generate_source(program)
+Graph[KernelOp]
+    │
+    │  passes/lowering/cuda/lower_kernelop.py
+    │    for each KernelOp node:
+    │      emit_kernel_source(op.kernel) → C source string
+    │      node.op = CudaOp(kernel_source, kernel_name, arg_order, grid, block, …)
+    ▼
+Graph[CudaOp]
+    │  backend/cuda/program.generate_source(graph)
     ▼
 .cu  →  nvcc  →  GPU
 ```
 
 ## Walkers and Emitters in `emit.py`
 
-The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Load` / `Assign` / `Accum` / `Write` / `Select` statements. Each `Assign` is `name = op(args)` where args reference prior SSA names (from Loads, Assigns, Selects); external buffer reads are explicit `Load` stmts keyed by `source` int into `LoopLaunch.input_names`.
+The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Load` /
+`Assign` / `Accum` / `Write` / `Select` statements. Each `Assign` is
+`name = op(args)` where args reference prior SSA names; external buffer
+reads are explicit `Load` stmts keyed by `source` int into
+`node.inputs`.
 
-**Load emission** (`_emit_load_access(index, buf_name, src_shape, axis_env)`): evaluates `Load.index` in the current axis environment and emits `ArrayAccess(buffer, coord)`. There is no separate indexing abstraction — every IndexMapOp is lifted to a one-op `LoopOp` by `003_lift_indexmap`, and the splicer in `ir/loop/splicer.py` inlines the coord_map into the consumer's body Loads whenever a splice is legal. Unmerged IndexMap kernels stay as standalone copy kernels.
+**Load emission** (`_emit_load_access(index, buf_name, src_shape, axis_env)`):
+evaluates `Load.index` in the current axis environment and emits
+`ArrayAccess(buffer, coord)`. There is no separate indexing abstraction —
+every IndexMapOp is lifted to a one-op `LoopOp` by
+`003_lift_indexmap`, and the splicer in `ir/loop/splicer.py` inlines the
+coord_map into the consumer's body Loads whenever a splice is legal.
 
-**Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a body `Select` into a nested `Ternary` chain over each `SelectBranch.select` predicate. (There is no `Mux` / `Combine` IR — those were replaced by `Select` / `SelectBranch`.)
+**Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a
+body `Select` into a nested `Ternary` chain over each
+`SelectBranch.select` predicate.
 
-**Body emitter**: `_emit_body` calls `ir.loop.plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The plan decomposes the body into ordered `Inline` (straight-line block) and `Loop` (K-loop over a reduce axis) steps:
-
-| Pattern                 | Plan shape             | Emission                                                             |
-| ----------------------- | ---------------------- | -------------------------------------------------------------------- |
-| No ReduceOp (pointwise) | `Inline` steps only    | 1D grid over free-axis numel; `block = (256, 1, 1)`; inline Assigns  |
-| ReduceOp present        | `Loop` + other steps   | 1D grid over outer rows; `block = (1, 1, 1)`; K-loops with recompute |
-
-Contractions (matmul = mul + sum) fall out of the `Loop` path: the `mul` is an elementwise Assign inside the K-loop and the `sum` is the accumulator's `Update`. No special detection or classification.
+**Body emitter**: `_emit_body(node, graph)` threads a `_Ctx` through the
+recursive walk. Grid is 1D over flat free-axis extents; block is
+`(256, 1, 1)`.
 
 ## Shape handling
 
-Shapes are read from the `LoopProgram`, never recomputed:
+Shapes come from the graph itself, never recomputed:
 
-- `program.shape(name)` — per-buffer shape lookup.
-- `program.source_shapes(launch)` — `source → shape` map for a launch's
-  body Loads (the external buffer shape bound to each `Load.source`).
-- `program.output_shape(launch)` — shape of the launch's output buffer.
+- `graph.nodes[name].output.shape` — per-buffer shape lookup.
+- For a LoopOp node, the effective source shapes are
+  `[graph.nodes[n].output.shape for n in node.inputs]`.
 
 No fallback call to `LoopOp.infer_output_shape(...)` happens in the
 codegen path.
 
 ## Benchmark Mode Timing
 
-`generate_source(mode="benchmark")` emits two levels of timing inside the
-timed loop:
+`generate_source(mode="benchmark")` emits two levels of timing inside
+the timed loop:
 
 - **Program total**: one global `cudaEvent` pair wraps all `num_iters`
-  iterations; the delta / `num_iters` is printed as `PROGRAM_TIME_MS` —
-  the same number the pre-per-kernel build reported.
+  iterations; the delta / `num_iters` is printed as `PROGRAM_TIME_MS`.
 - **Per-launch**: one `cudaEvent` pair per launch index (reused across
   iterations) records each kernel, and `cudaEventElapsedTime` is
   accumulated into `_kacc[i]` at the end of every iteration. After the
-  loop, averages are printed as `KERNEL_TIME_MS <idx> <kernel_name>
-  <ms>` lines, one per launch.
+  loop, averages are printed as `KERNEL_TIME_MS <idx> <kernel_name> <ms>`
+  lines, one per launch.
 
 `_parse_benchmark_output()` collects the per-launch lines into
 `BenchmarkResult.per_launch: list[LaunchTime] | None` (sorted by idx).
-When the subprocess emits no `KERNEL_TIME_MS` lines the field stays
-`None`, keeping the parser compatible with old binaries.
 
-`zero_outputs` `cudaMemset` calls stay outside each launch's event pair —
-they aren't kernel time and would otherwise inflate the first launch
-after an atomicAdd reduction.
+`zero_outputs` `cudaMemset` calls stay outside each launch's event pair
+— they aren't kernel time.
 
 ## Naive Schedule Policy
 
 Correctness-first. No shared memory, no async copies, no TMA, no
-vectorization, no tiling beyond the trivial. Tuning and tiling are
-follow-up commits.
+vectorization.
 
-- **Pointwise** (no `ReduceOp` in body):
-  1D grid, `block = (256, 1, 1)`, one thread per flat output coord.
-  Empty bodies (copy kernels) are a subcase.
-- **Reduce / contraction** (`ReduceOp` in body):
-  1D grid over the outer rows (broadcast shape minus reduce axis);
-  `block = (1, 1, 1)`. The body is split into segments at ReduceOp
-  boundaries. Each segment with per-element references emits its own
-  K-loop. Per-element values from prior segments are recomputed inside
-  the current loop (transitive dependency analysis). Supports
-  cross-iteration-space patterns like softmax (reduce_max -> elementwise
-  -> reduce_sum -> elementwise) and contractions (mul -> reduce_sum).
-  Max reduction uses `fmaxf(acc, val)` instead of `AugAssign`.
+- **Pointwise** (no `ReduceOp` in body): 1D grid, `block = (256, 1, 1)`,
+  one thread per flat output coord.
+- **Reduce / contraction** (`ReduceOp` in body): 1D grid over the outer
+  rows (broadcast shape minus reduce axis). The body is split into
+  segments at ReduceOp boundaries. Each segment with per-element
+  references emits its own K-loop. Per-element values from prior
+  segments are recomputed inside the current loop.
 
 ## Buffer Roles
 
-`LoopProgram.from_graph` assigns each buffer a `role` based on graph-level
-position (`input` / `output` / `constant` / `scratch`). `compile_kernels`
-filters to buffers actually referenced by some launch (or a referenced
-graph constant) when emitting `GpuBuffer`s.
+`backend/cuda/program._buffers(graph)` classifies each node on the fly:
+
+- in `graph.inputs` → `input`
+- `isinstance(node.op, ConstantOp)` → `constant`
+- in `graph.outputs` → `output`
+- otherwise → `scratch`
 
 ## Constraints to Preserve
 
-- `emit.py` must not import `backend.cuda.generators` or
-  `backend.cuda.schedule` (deleted). The recursive-descent emitter is
-  the only code path.
-- A new backend (ROCm, SYCL, ...) reuses `ir/kernel_ir.py`, `program/gpu.py`,
-  and `backend/kernel_codegen.py` wholesale; only its own `emit.py` /
-  `program.py` need to be rewritten.
-- The loop-IR types (`LoopOp`, `Load`, `Assign`, `Accum`,
-  `Write`, `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT
-  import from `backend/cuda/` into `ir/loop/ir.py` or `program/loop.py`.
+- `emit.py` must stay pure codegen — it imports from `ir/` and returns
+  `GpuKernel`; it must not import from the runtime / passes layer.
+- A new backend (ROCm, SYCL, ...) reuses `ir/kernel/`, `ir/cuda/`,
+  and `backend/kernel_codegen.py` wholesale; only its own
+  `emit.py` / `program.py` / lowering pass need to be rewritten.
+- The loop-IR types (`LoopOp`, `Load`, `Assign`, `Accum`, `Write`,
+  `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT import
+  from `backend/cuda/` into `ir/loop/ir.py`.

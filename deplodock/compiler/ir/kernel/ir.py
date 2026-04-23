@@ -11,14 +11,17 @@ and a hierarchy of statement types (``VarDecl``, ``Assign``, ``ForLoop``,
 ``IfStmt``, ``SyncThreads``, ``ArrayDecl``, ``PragmaUnroll``, ``RawCode``).
 
 One ``GpuKernel`` corresponds to one ``LoopOp`` (``ir/loop/ir.py``) after
-codegen; the ``compiler/program/gpu.py`` ``GpuProgram`` is the
-program-level form that bundles many ``GpuKernel`` launches.
+``passes/lowering/kernel`` runs; it's carried inside a ``KernelOp``
+graph node, which is then lowered to a ``CudaOp`` by
+``passes/lowering/cuda`` once the source is rendered.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
+from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.expr import (
     BinOp,
     Builtin,
@@ -65,6 +68,7 @@ __all__ = [
     # Kernel definition
     "GpuKernelParam",
     "GpuKernel",
+    "KernelOp",
     # Utilities
     "pretty_print",
 ]
@@ -226,6 +230,41 @@ class GpuKernel:
     extra_smem_bytes: int = 0  # Extra dynamic smem beyond standard double-buffer (e.g. for hybrid TF32 split scratch)
     min_blocks_per_sm: int = 0  # If >0, emit __launch_bounds__(threads, min_blocks_per_sm) to force occupancy
     online_reduce: bool = False  # 1D grid over M-tiles with N-tiled online reduction
+
+
+# ---------------------------------------------------------------------------
+# Graph-op wrapper
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class KernelOp(Op):
+    """One kernel invocation as a graph-op.
+
+    Produced by ``passes/lowering/kernel``. Carries a ``GpuKernel`` (the
+    kernel-level AST) plus launch metadata (grid/block/smem/zero_outputs/
+    tma_descriptors). One ``KernelOp`` → one kernel invocation.
+
+    ``__post_init__`` runs ``ir.kernel.normalize.normalize_kernel`` on the
+    kernel so every constructed ``KernelOp`` — including intermediate
+    results produced by lowering — lands in a canonical shape.
+    """
+
+    kernel: GpuKernel = None  # type: ignore[assignment]
+    kernel_name: str = ""
+    arg_order: tuple[str, ...] = ()  # kernel-param names in positional order
+    grid: tuple[int, int, int] = (1, 1, 1)
+    block: tuple[int, int, int] = (1, 1, 1)
+    smem_bytes: int = 0
+    zero_outputs: tuple[str, ...] = ()
+    tma_descriptors: tuple[Any, ...] = ()
+    comment: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kernel is not None:
+            from deplodock.compiler.ir.kernel.normalize import normalize_kernel
+
+            self.kernel = normalize_kernel(self.kernel)
 
 
 # ---------------------------------------------------------------------------

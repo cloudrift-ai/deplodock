@@ -18,7 +18,7 @@ scale constant, incorrect coordinate mapping, etc.
 ## File Layout
 
 ```
-tests/compiler/rules/
+tests/compiler/passes/
 ├── test_decompose_rules.py      # decomposition rules (structural + correctness)
 ├── test_optimization_rules.py   # optimization rules (structural + correctness)
 └── test_fusion_rules.py         # fusion rules (structural only — LoopOp not numpy-executable)
@@ -26,7 +26,7 @@ tests/compiler/rules/
 
 ## Covered Rules
 
-### Decomposition (`rules/decomposition/`)
+### Decomposition (`passes/decomposition/`)
 
 | Rule file | Op | Structural | Correctness |
 |---|---|---|---|
@@ -42,13 +42,13 @@ tests/compiler/rules/
 | `013_slice_to_indexmap.py` | `SliceOp` | — | ✓ |
 | `014_cat_to_indexmap.py` | `CatOp` | — | ✓ |
 
-### Optimization (`rules/optimization/`)
+### Optimization (`passes/optimization/`)
 
 | Rule file | Op | Structural | Correctness |
 |---|---|---|---|
 | `002_insert_broadcast_indexmap.py` | `ElementwiseOp` (broadcast) | ✓ | ✓ (1D, scalar, 3D, RMSNorm chain) |
 
-### Fusion (`rules/fusion/`)
+### Fusion (`passes/fusion/`)
 
 The fusion pass is driven by lift-then-splice: each tensor op becomes a
 trivial `LoopOp` (one lift rule per op), then adjacent LoopOp pairs are

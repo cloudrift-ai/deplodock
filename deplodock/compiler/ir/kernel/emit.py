@@ -1,21 +1,20 @@
-"""Structural CUDA codegen: ``LoopProgram`` → ``GpuProgram``.
+"""Per-kernel CUDA codegen helpers: ``LoopOp`` node → ``GpuKernel``.
 
-Walks each ``LoopOp`` body recursively. Free axes are decomposed from the
-thread id; reduce Loops (those whose body contains an ``Accum``) become
-``for`` loops with accumulator variables declared before and rebound to
-the ``Accum``'s SSA name after.
+The lowering passes under ``passes/lowering/`` call these helpers — this
+module just carries the recursive body walk that turns each ``LoopOp``
+into a kernel-level AST. It does not know about launch ordering or
+program-level buffers; callers pass in the graph + node to resolve
+buffer shapes by node id.
 """
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
-from deplodock.compiler.backend.cuda.program import CudaLaunch
 from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var, substitute
-from deplodock.compiler.ir.kernel_ir import (
+from deplodock.compiler.ir.graph import Graph, Node
+from deplodock.compiler.ir.kernel.ir import (
     ArrayAccess,
     AugAssign,
     ForLoop,
@@ -26,81 +25,15 @@ from deplodock.compiler.ir.kernel_ir import (
     VarAssign,
     VarDecl,
 )
-from deplodock.compiler.ir.kernel_ir import (
+from deplodock.compiler.ir.kernel.ir import (
     Assign as IrAssign,
 )
 from deplodock.compiler.ir.loop import ACCUM_IDENTITY, Accum, Axis, Load, LoopOp, Select, SelectBranch
 from deplodock.compiler.ir.loop import Assign as IrAssignStmt
 from deplodock.compiler.ir.loop import Loop as IrLoop
 from deplodock.compiler.ir.loop import Write as IrWrite
-from deplodock.compiler.ir.simplify import simplify_kernel
-from deplodock.compiler.program.gpu import GpuBuffer, GpuProgram
-from deplodock.compiler.program.loop import LoopLaunch, LoopProgram
-
-if TYPE_CHECKING:
-    from deplodock.compiler.dump import CompilerDump
-
-logger = logging.getLogger(__name__)
 
 _BLOCK = 256
-
-
-# ---------------------------------------------------------------------------
-# Program-level entry
-# ---------------------------------------------------------------------------
-
-
-def compile_kernels(program: LoopProgram, dump: CompilerDump | None = None) -> GpuProgram:
-    """Lower a ``LoopProgram`` to a ``GpuProgram``."""
-    referenced: set[str] = set()
-    for launch in program.launches:
-        referenced.update(launch.input_names)
-        referenced.add(launch.output_name)
-    buf_names = {b.name for b in program.buffers}
-    referenced |= set(program.graph_constants) & buf_names
-
-    buffers = [
-        GpuBuffer(name=b.name, shape=tuple(b.shape), dtype="float", role=b.role)
-        for b in program.buffers
-        if b.name in referenced
-    ]
-
-    launches: list[CudaLaunch] = []
-    gpu_kernels: list[GpuKernel] = []
-    for i, launch in enumerate(program.launches):
-        if not isinstance(launch.loop, LoopOp):
-            raise TypeError(
-                f"CudaBackend: launch {i} has non-LoopOp "
-                f"{type(launch.loop).__name__!r}; fusion must wrap every primitive "
-                f"into a LoopOp before CUDA codegen."
-            )
-        kname = _kernel_name(launch.loop, i)
-        gpu_kernel, arg_order = emit_kernel(launch, kname, program)
-        gpu_kernel = simplify_kernel(gpu_kernel)
-        source = _emit_kernel_source(gpu_kernel)
-        grid, block = _launch_config(launch, program)
-        launches.append(
-            CudaLaunch(
-                kernel_source=source,
-                kernel_name=kname,
-                grid=grid,
-                block=block,
-                args=arg_order,
-                comment=program.pretty_print_launch(i),
-            )
-        )
-        gpu_kernels.append(gpu_kernel)
-
-    if dump is not None:
-        dump.dump_kernel_ir(gpu_kernels)
-
-    return GpuProgram(
-        name=program.name,
-        buffers=buffers,
-        launches=launches,
-        constant_values=dict(program.constant_values),
-        comment=program.pretty_print(),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -108,20 +41,45 @@ def compile_kernels(program: LoopProgram, dump: CompilerDump | None = None) -> G
 # ---------------------------------------------------------------------------
 
 
-def emit_kernel(launch: LoopLaunch, kernel_name: str, program: LoopProgram) -> tuple[GpuKernel, list[str]]:
-    """Emit one ``GpuKernel`` for a single ``LoopLaunch``."""
-    params, arg_order = _build_params(launch)
-    body, block_size = _emit_body(launch, program)
+def emit_kernel(node: Node, kernel_name: str, graph: Graph) -> tuple[GpuKernel, list[str]]:
+    """Emit one ``GpuKernel`` for a single ``LoopOp`` node."""
+    params, arg_order = _build_params(node)
+    body, block_size = _emit_body(node, graph)
     kd = GpuKernel(name=kernel_name, params=params, body=body, block_size=block_size)
     return kd, arg_order
+
+
+def kernel_name_for(loop: LoopOp, idx: int) -> str:
+    if any(isinstance(s, Accum) for s in loop):
+        return f"k{idx}_reduce"
+    return f"k{idx}_pointwise"
+
+
+def launch_config(node: Node) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    loop: LoopOp = node.op
+    reduce_names = loop.reduce_axis_names
+    free_extents = [int(a.extent) for a in loop.axes if a.name not in reduce_names]
+    if free_extents:
+        n_output = _numel(tuple(free_extents))
+    else:
+        out_shape = tuple(node.output.shape)
+        n_output = _numel(out_shape) if out_shape else 1
+    n_blocks = (n_output + _BLOCK - 1) // _BLOCK
+    return (max(n_blocks, 1), 1, 1), (_BLOCK, 1, 1)
+
+
+def emit_kernel_source(gpu_kernel: GpuKernel) -> str:
+    from deplodock.compiler.backend.kernel_codegen import emit_kernel as _emit
+
+    return _emit(gpu_kernel)
 
 
 @dataclass
 class _Ctx:
     """Emission state threaded through recursive body walk."""
 
-    program: LoopProgram
-    launch: LoopLaunch
+    graph: Graph
+    node: Node
     env: dict[str, Expr] = field(default_factory=dict)  # axis name → Expr
     values: dict[str, Expr] = field(default_factory=dict)  # SSA name → Var
     name_seq: list[int] = field(default_factory=lambda: [0])
@@ -133,15 +91,25 @@ class _Ctx:
         self.name_seq[0] += 1
         return f"t{n}"
 
+    def input_name(self, source: int) -> str:
+        return self.node.inputs[source]
 
-def _emit_body(launch: LoopLaunch, program: LoopProgram) -> tuple[list[Stmt], tuple[int, int, int]]:
-    loop: LoopOp = launch.loop
+    def output_name(self) -> str:
+        return self.node.id
+
+    def buffer_shape(self, name: str) -> tuple:
+        n = self.graph.nodes.get(name)
+        return tuple(n.output.shape) if n is not None else ()
+
+
+def _emit_body(node: Node, graph: Graph) -> tuple[list[Stmt], tuple[int, int, int]]:
+    loop: LoopOp = node.op
     reduce_names = loop.reduce_axis_names
     free_axes = tuple(a for a in loop.axes if a.name not in reduce_names)
     n_threads = _numel(tuple(a.extent for a in free_axes)) if free_axes else 1
 
     tid = Var("tid")
-    ctx = _Ctx(program=program, launch=launch, env=_axis_env_for_flat(free_axes, tid))
+    ctx = _Ctx(graph=graph, node=node, env=_axis_env_for_flat(free_axes, tid))
 
     guarded = _emit_stmts(loop.body, ctx)
     stmts: list[Stmt] = [
@@ -164,8 +132,8 @@ def _emit_stmts(stmts: tuple, ctx: _Ctx) -> list[Stmt]:
 
 def _emit_stmt(s, ctx: _Ctx, out: list[Stmt]) -> None:
     if isinstance(s, Load):
-        buf_name = ctx.launch.input_names[s.source]
-        src_shape = ctx.program.shape(buf_name) if buf_name in {b.name for b in ctx.program.buffers} else ()
+        buf_name = ctx.input_name(s.source)
+        src_shape = ctx.buffer_shape(buf_name)
         coords = [substitute(e, _env_with_values(ctx)) for e in s.index]
         flat = _flatten_coords(coords, src_shape)
         tname = ctx.fresh()
@@ -188,15 +156,15 @@ def _emit_stmt(s, ctx: _Ctx, out: list[Stmt]) -> None:
         return
 
     if isinstance(s, IrWrite):
-        buf_name = ctx.launch.output_name
-        buf_shape = ctx.program.shape(buf_name)
+        buf_name = ctx.output_name()
+        buf_shape = ctx.buffer_shape(buf_name)
         coords = [substitute(e, ctx.env) for e in s.index]
         flat = _flatten_coords(coords, buf_shape)
         out.append(IrAssign(target=ArrayAccess(array=buf_name, index=flat), value=ctx.values[s.value]))
         return
 
     if isinstance(s, Accum):
-        acc_var = ctx.values[s.name].name  # Var set by enclosing reduce Loop
+        acc_var = ctx.values[s.name].name
         out.append(_emit_reduce_accum(acc_var, s.op.fn, ctx.values[s.value]))
         return
 
@@ -211,19 +179,14 @@ def _emit_loop(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
     accums = [x for x in loop.body if isinstance(x, Accum)]
     is_reduce = bool(accums)
 
-    # Free Loop whose axis is already decomposed from tid: just descend.
     if not is_reduce and loop.axis.name in ctx.env:
         out.extend(_emit_stmts(loop.body, ctx))
         return
 
-    # Emit a C for loop. Use a fresh iteration variable.
     k_name = f"k{ctx.loop_seq[0]}"
     ctx.loop_seq[0] += 1
     k_var = Var(k_name)
 
-    # Declare accumulator variables before the loop, bind Accum.name → Var(acc_var)
-    # in the outer scope so code after the loop sees the finalized value, and also
-    # so bodies inside use acc_var for updates.
     acc_names: list[str] = []
     for a in accums:
         if a.name in acc_names:
@@ -235,8 +198,6 @@ def _emit_loop(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
         out.append(VarDecl(dtype="float", name=acc_var, init=Literal(identity, "float")))
         ctx.values[a.name] = Var(acc_var)
 
-    # Snapshot taken AFTER accumulator bindings so they survive the restore;
-    # inner Assign/Select/Load bindings don't escape per Loop IR scoping rules.
     saved_env = dict(ctx.env)
     saved_values = dict(ctx.values)
     ctx.env[loop.axis.name] = k_var
@@ -253,16 +214,10 @@ def _emit_loop(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
 
 
 def _env_with_values(ctx: _Ctx) -> dict[str, Expr]:
-    """Env for substituting Load.index / Write.index / Select.select Exprs.
-
-    Load indices may reference earlier Load SSA names (gather). Merge the
-    axis env with the current SSA values so ``substitute`` resolves both.
-    """
     return {**ctx.env, **ctx.values}
 
 
 def _axis_env_for_flat(axes: tuple[Axis, ...], flat_idx: Expr) -> dict[str, Expr]:
-    """Decompose a flat iteration index into per-axis Exprs (row-major)."""
     env: dict[str, Expr] = {}
     if not axes:
         return env
@@ -278,7 +233,6 @@ def _axis_env_for_flat(axes: tuple[Axis, ...], flat_idx: Expr) -> dict[str, Expr
 
 
 def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
-    """Combine per-dim coord Exprs into a flat row-major index."""
     if not coords:
         return Literal(0, "int")
     flat: Expr = Literal(0, "int")
@@ -297,7 +251,6 @@ def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
 
 
 def _emit_select(stmt: Select, values: dict[str, Expr], axis_env: dict[str, Expr]) -> Expr:
-    """Emit a chained ternary for a Select statement."""
     branches: list[SelectBranch] = list(stmt.branches)
     result: Expr = values[branches[-1].value]
     for branch in reversed(branches[:-1]):
@@ -354,36 +307,12 @@ def _numel(shape: tuple) -> int:
     return int(math.prod(int(d) for d in shape if isinstance(d, int)) or 1)
 
 
-def _build_params(launch: LoopLaunch) -> tuple[list[GpuKernelParam], list[str]]:
+def _build_params(node: Node) -> tuple[list[GpuKernelParam], list[str]]:
+    output_name = node.id
     seen: list[str] = []
-    for buf_name in launch.input_names:
-        if buf_name not in seen and buf_name != launch.output_name:
+    for buf_name in node.inputs:
+        if buf_name not in seen and buf_name != output_name:
             seen.append(buf_name)
     params = [GpuKernelParam(dtype="const float*", name=bid) for bid in seen]
-    params.append(GpuKernelParam(dtype="float*", name=launch.output_name))
-    return params, seen + [launch.output_name]
-
-
-def _kernel_name(loop: LoopOp, idx: int) -> str:
-    if any(isinstance(s, Accum) for s in loop):
-        return f"k{idx}_reduce"
-    return f"k{idx}_pointwise"
-
-
-def _launch_config(launch: LoopLaunch, program: LoopProgram) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    loop: LoopOp = launch.loop
-    reduce_names = loop.reduce_axis_names
-    free_extents = [int(a.extent) for a in loop.axes if a.name not in reduce_names]
-    if free_extents:
-        n_output = _numel(tuple(free_extents))
-    else:
-        out_shape = program.output_shape(launch)
-        n_output = _numel(out_shape) if out_shape else 1
-    n_blocks = (n_output + _BLOCK - 1) // _BLOCK
-    return (max(n_blocks, 1), 1, 1), (_BLOCK, 1, 1)
-
-
-def _emit_kernel_source(gpu_kernel: GpuKernel) -> str:
-    from deplodock.compiler.backend.kernel_codegen import emit_kernel as _emit
-
-    return _emit(gpu_kernel)
+    params.append(GpuKernelParam(dtype="float*", name=output_name))
+    return params, seen + [output_name]

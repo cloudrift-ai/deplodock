@@ -46,23 +46,27 @@ def run_graph(request) -> Callable:
 
             be = LoopBackend()
             compiled = be.compile(graph)
-            # Auto-supply ConstantOp scalar values (matches NumpyBackend convention).
-            augmented = _inject_constants(dict(input_data), compiled.constant_values)
+            augmented = _inject_constants(dict(input_data), compiled)
             return be.run(compiled, input_data=augmented).outputs
         # cuda
         from deplodock.compiler.backend.cuda.backend import CudaBackend
 
         be = CudaBackend()
         compiled = be.compile(graph)
-        augmented = _inject_constants(dict(input_data), compiled.constant_values)
+        augmented = _inject_constants(dict(input_data), compiled)
         return be.run(compiled, input_data=augmented).outputs
 
     return _run
 
 
-def _inject_constants(input_data: dict[str, np.ndarray], constant_values: dict[str, float]) -> dict[str, np.ndarray]:
+def _inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.ndarray]:
     """Auto-supply scalar ConstantOp values that weren't passed in input_data."""
-    for nid, val in constant_values.items():
-        if nid not in input_data:
-            input_data[nid] = np.array([val], dtype=np.float32)
+    from deplodock.compiler.ir.base import ConstantOp
+
+    for nid, node in graph.nodes.items():
+        if not isinstance(node.op, ConstantOp):
+            continue
+        if node.op.value is None or nid in input_data:
+            continue
+        input_data[nid] = np.array([node.op.value], dtype=np.float32)
     return input_data

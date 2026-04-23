@@ -14,7 +14,7 @@ Covers:
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinOp, Builtin, Cast, FuncCall, Literal, Ternary, Var
-from deplodock.compiler.ir.kernel_ir import (
+from deplodock.compiler.ir.kernel import (
     ArrayAccess,
     AugAssign,
     ForLoop,
@@ -23,13 +23,13 @@ from deplodock.compiler.ir.kernel_ir import (
     IfStmt,
     VarDecl,
 )
+from deplodock.compiler.ir.kernel import normalize_kernel as simplify_kernel
 from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.simplify import (
     Context,
     Interval,
     infer_range,
     simplify_expr,
-    simplify_kernel,
     simplify_loop_op,
 )
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp

@@ -120,10 +120,10 @@ class Load(Stmt):
     """Read a value from an external input buffer into an SSA name.
 
     Each external-buffer read is an explicit body statement. ``source`` is
-    the index into ``LoopLaunch.input_names`` identifying which external
-    buffer; ``index`` is the dim-wise access pattern over the enclosing
-    axes. The produced SSA ``name`` is a regular value downstream stmts
-    read.
+    the index into the owning node's ``inputs`` list identifying which
+    external buffer; ``index`` is the dim-wise access pattern over the
+    enclosing axes. The produced SSA ``name`` is a regular value that
+    downstream stmts read.
     """
 
     name: str
@@ -222,9 +222,9 @@ class Accum(Stmt):
 class Write(Stmt):
     """Write an SSA value to output buffer ``output`` at position ``index``.
 
-    ``output`` is an integer index into the program-level output-name
-    tuple (``LoopLaunch.output_name`` is the sole output in v1, so
-    ``output=0`` is common). ``index`` uses axis Vars to compute the
+    ``output`` is an integer output slot (nodes have a single output in
+    v1, so ``output=0`` is the only valid value). ``index`` uses axis
+    Vars to compute the
     per-dim offset. ``value`` references an SSA name available at this
     point in the body (Assign, Accum, or ``$N``).
     """
@@ -271,9 +271,7 @@ class Select(Stmt):
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
         return Select(
             name=rename_ssa(self.name),
-            branches=tuple(
-                SelectBranch(value=rename_ssa(b.value), select=sigma.apply(b.select)) for b in self.branches
-            ),
+            branches=tuple(SelectBranch(value=rename_ssa(b.value), select=sigma.apply(b.select)) for b in self.branches),
         )
 
 
@@ -374,7 +372,7 @@ class LoopOp(Op):
         """Number of external input buffers referenced by body Loads.
 
         Derived as ``max(load.source) + 1``, or 0 when no Loads are present.
-        This is the count ``LoopLaunch.input_names`` must provide.
+        This is the count ``node.inputs`` must provide.
         """
         loads = self.loads
         return max((ld.source for ld in loads), default=-1) + 1
@@ -690,8 +688,8 @@ def _validate(loop: LoopOp) -> None:
                 defined.add(stmt.name)
             elif isinstance(stmt, Load):
                 # Load is a binding site — introduces its SSA name. ``source``
-                # indexes into ``LoopLaunch.input_names`` at the program level,
-                # which is checked against the launch's input count there.
+                # indexes into the owning node's ``inputs`` list, which is
+                # checked against the source count at codegen.
                 if stmt.source < 0:
                     raise ValueError(f"Load {stmt.name!r}: source {stmt.source} must be non-negative")
                 if stmt.name in defined:
@@ -779,5 +777,3 @@ def map_body(
         else:
             out.extend(r)
     return tuple(out)
-
-

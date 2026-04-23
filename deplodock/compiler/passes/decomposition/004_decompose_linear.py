@@ -46,7 +46,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
     )
 
     # Reuse matmul's unsqueeze logic for x @ wt.
-    from deplodock.compiler.rules.decomposition._matmul_helpers import matmul_unsqueeze
+    from deplodock.compiler.passes.decomposition._matmul_helpers import matmul_unsqueeze
 
     x_shape = tuple(graph.nodes[x_id].output.shape)
     a_unsq, b_unsq, mul_shape, k_axis = matmul_unsqueeze(x_shape, tuple(wt_shape))

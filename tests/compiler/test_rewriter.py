@@ -21,7 +21,7 @@ def _load_decomp_rule():
     from pathlib import Path
 
     return Rule.from_file(
-        Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules" / "decomposition" / "002_decompose_silu.py"
+        Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "passes" / "decomposition" / "002_decompose_silu.py"
     )
 
 

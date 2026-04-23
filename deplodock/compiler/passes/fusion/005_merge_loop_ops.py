@@ -50,6 +50,7 @@ def _max_nest(loop_op: LoopOp) -> int:
     walk(loop_op.body, 1)
     return best
 
+
 GRAMMAR = [
     Production("producer", LoopOp, "1"),
     Production("consumer", LoopOp, "1"),

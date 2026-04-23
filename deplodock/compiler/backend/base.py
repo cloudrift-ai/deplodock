@@ -10,9 +10,10 @@ interface; all backends share the same call surface:
     elapsed  = result.time_ms
 
 Individual backends may do different internal lowerings: the CUDA backend
-runs ``compile_graph → compile_kernels`` internally, the Loop backend runs
-``compile_graph`` only, the numpy backend walks the graph directly. From
-the caller's perspective the interface is identical.
+runs ``compile_graph`` then the ``lowering/kernel`` + ``lowering/cuda``
+passes internally, the Loop backend runs ``compile_graph`` only, the
+numpy backend walks the graph directly. From the caller's perspective
+the interface is identical.
 """
 
 from __future__ import annotations

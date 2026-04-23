@@ -2,7 +2,7 @@
 
 The fusion pass lifts each tensor op into a trivial ``LoopOp`` and then
 splices adjacent ``LoopOp`` pairs via the tree-splicer in
-``rules/fusion/_splice.py``. Tests verify post-fixpoint structural
+``passes/fusion/_splice.py``. Tests verify post-fixpoint structural
 properties (kernel count, graph composition, expected ops in SSA bodies)
 *and* numeric correctness — each fixture is executed via ``NumpyBackend``
 both pre- and post-fusion, and the outputs must match. ``LoopOp.forward``
@@ -20,7 +20,7 @@ from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass
 
-RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion"
+RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes" / "fusion"
 
 rng = np.random.default_rng(0)
 _backend = NumpyBackend()

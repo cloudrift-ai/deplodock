@@ -16,21 +16,20 @@
 │                                                                                                                      │
 │  RULE: No GPU, no CUDA, no backend imports.                                                                          │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│  LAYER 2 · Lowering → LoopProgram                                                                                    │
+│  LAYER 2 · Fusion (pipeline.compile_graph)                                                                           │
 │                                                                                                                      │
-│  pipeline.py: compile_graph(graph) -> LoopProgram                                                                    │
+│  pipeline.py: compile_graph(graph) -> Graph[LoopOp + InputOp + ConstantOp]                                            │
+│    Runs decomposition → optimization → fusion passes from passes/.                                                   │
 │    After fusion, ir/simplify.simplify_loop_op is applied to every LoopOp (const fold + clamp elimination).           │
-│    LoopProgram (program/loop.py):                                                                                    │
-│       LoopBuffer (shape, role) × N                                                                                   │
-│       LoopLaunch (LoopOp + input/output buffer names) × N                                                            │
-│       + graph_inputs/outputs/constants/constant_values                                                               │
 │                                                                                                                      │
-│  Each LoopOp (ir/loop/ir.py) is one GPU kernel as an SSA program:                                                       │
+│  Each LoopOp (ir/loop/ir.py) is one kernel worth of compute as an SSA program:                                        │
 │      body   (tuple[Stmt, ...])        — Assign | Accum | Write | Select | Loop | Load (sole stored field)            │
 │      axes   (tuple[Axis, ...])        — iteration space (computed from body's Loop tree)                             │
 │      loads  (tuple[Load, ...])        — body-form external reads (computed from body)                                │
 │      accums (tuple[Accum, ...])       — reduce accumulators (computed from body)                                     │
-│  Reductions = ``Accum`` stmts inside a reduce ``Loop``; writes are inline.                                           │
+│                                                                                                                      │
+│  Buffers and launch order live on the graph directly: shape = node.output.shape, role derives from                   │
+│  graph.inputs / graph.outputs / ConstantOp membership, launch order = graph.topological_order().                     │
 │                                                                                                                      │
 │  RULE: Operates on Graph + Loop IR only. No backend imports.                                                         │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
@@ -38,31 +37,31 @@
 │                                                                                                                      │
 │  backend/base.py:  Backend ABC — compile(graph), run, benchmark                                                      │
 │  backend/numpy/:   NumpyBackend — Graph interpreter (pre-fusion)                                                     │
-│  backend/loop/:    LoopBackend  — LoopProgram interpreter (numpy)                                                    │
-│  backend/cuda/:    CudaBackend  — LoopProgram → GpuProgram → nvcc                                                    │
+│  backend/loop/:    LoopBackend  — Graph[LoopOp] interpreter (numpy)                                                  │
+│  backend/cuda/:    CudaBackend  — Graph[LoopOp] → Graph[KernelOp] → Graph[CudaOp] → nvcc                             │
 │                                                                                                                      │
 │  All three backends share:                                                                                           │
 │    backend.compile(graph) → compiled                                                                                 │
 │    backend.run(compiled, input_data=…) → ProgramResult (outputs=dict[name, ndarray], time_ms)                        │
 │                                                                                                                      │
-│  Codegen internals (CUDA):                                                                                           │
-│    backend/kernel_codegen.py: GpuKernel → C source                                                                   │
-│    backend/cuda/emit.py:      LoopProgram → GpuProgram                                                               │
-│    backend/cuda/program.py:   CudaLaunch(GpuLaunch), nvcc, run                                                       │
-│    backend/cuda/runner.py:    single-kernel compile + run harness                                                    │
+│  Lowering passes (backend/cuda path):                                                                                │
+│    passes/lowering/kernel/lower_loopop.py   — LoopOp  → KernelOp  (uses backend/cuda/emit)                           │
+│    passes/lowering/cuda/lower_kernelop.py   — KernelOp → CudaOp   (uses backend/kernel_codegen)                      │
 │                                                                                                                      │
-│  Program forms (shared across backends):                                                                             │
-│      program/loop.py: LoopProgram + LoopBuffer + LoopLaunch                                                          │
-│      program/gpu.py:  GpuProgram + GpuBuffer + GpuLaunch                                                             │
-│  The imperative C-like kernel AST lives upstream in ir/kernel_ir.py (GpuKernel, Stmt, ArrayAccess, ...);                   │
-│  the backend consumes it.                                                                                            │
+│  Codegen internals (CUDA):                                                                                           │
+│    ir/kernel/ir.py:           GpuKernel (AST) + KernelOp (graph-op wrapping GpuKernel + launch geometry)             │
+│    ir/kernel/emit.py:         per-node codegen: LoopOp → GpuKernel (emit_kernel, launch_config)                      │
+│    ir/cuda/ir.py:             CudaOp   (graph-op with rendered CUDA source)                                          │
+│    backend/kernel_codegen.py: GpuKernel → C source                                                                   │
+│    backend/cuda/emit.py:      per-kernel LoopOp → GpuKernel helpers                                                  │
+│    backend/cuda/program.py:   generate_source(Graph), nvcc compile + run                                             │
+│    backend/cuda/runner.py:    single-kernel compile + run harness                                                    │
 │                                                                                                                      │
 │  RULE: GPU specifics live here; everything above is portable.                                                        │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-See `ir/ARCHITECTURE.md` for the per-dialect breakdown of each IR level,
-and `program/ARCHITECTURE.md` for the Program-form pairing.
+See `ir/ARCHITECTURE.md` for the per-dialect breakdown of each IR level.
 
 `model_wrapper.py` holds helpers for tracing whole HF `CausalLM` models:
 `build_full_model_wrapper()` returns an `nn.Module` with a precomputed
@@ -79,22 +78,28 @@ placeholder→attribute map in one pass.
 PyTorch module
    │  torch_trace.trace_module(...)
    ▼
-Graph (Layer 1)
+Graph (frontend ops — Layer 1)
    │  backend.compile(graph)  — unified across numpy / loop / cuda
    │    ├─ NumpyBackend: wrap Graph; numpy walk in run
-   │    ├─ LoopBackend:  compile_graph(graph) → LoopProgram; interpret in run
-   │    └─ CudaBackend:  compile_graph(graph) → LoopProgram
-   │                     compile_kernels(lp)  → GpuProgram
+   │    ├─ LoopBackend:  compile_graph(graph) → Graph[LoopOp]; interpret in run
+   │    └─ CudaBackend:  compile_graph(graph) → Graph[LoopOp]
+   │                     lower_to_kernel(g)   → Graph[KernelOp]
+   │                     lower_to_cuda(g)     → Graph[CudaOp]
    ▼
-LoopProgram (Layer 2: LoopBuffers + LoopLaunches)
+Graph[LoopOp]  (Layer 2: fused kernels as SSA LoopOps)
    │  [CUDA path]
-   │    for launch in loop_program.launches:
-   │      emit.emit_kernel(launch, name, loop_program)  → GpuKernel
-   │      kernel_codegen.emit_kernel(GpuKernel) → C source
-   │      wrap as CudaLaunch, collect in GpuProgram
+   │    passes/lowering/kernel/:
+   │      for each LoopOp node:
+   │        emit_kernel(node, name, graph)  → GpuKernel
+   │        node.op = KernelOp(kernel, grid, block, arg_order, …)
+   │          # KernelOp.__post_init__ → normalize_kernel (const fold / clamp eliminate)
+   │    passes/lowering/cuda/:
+   │      for each KernelOp node:
+   │        emit_kernel_source(op.kernel) → CUDA source string
+   │        node.op = CudaOp(kernel_source, kernel_name, …)
    ▼
-GpuProgram (Layer 3)
-   │  backend/cuda/program.generate_source(program)
+Graph[CudaOp]  (Layer 3)
+   │  backend/cuda/program.generate_source(graph)
    ▼
 .cu  →  nvcc  →  GPU
 ```
@@ -113,8 +118,8 @@ defined-before-use, no forward references.
 | `Write.output` / `index` / `value`           | `int` / `tuple[Expr, ...]` / `str`        | Inline store at a position                                     |
 | `Select.branches[i].value` / `select`        | `str` / `Expr`                            | Coord-predicated SSA binding (replaces old Mux)                |
 | `LoopOp.body`                                | `tuple[Stmt, ...]`                        | Sole stored field; `axes` / `loads` / `accums` are computed    |
-| `LoopLaunch.input_names`                     | `list[str]`                               | Per-source external buffer name (indexed by `Load.source`)     |
-| `LoopLaunch.output_name`                     | `str`                                     | External buffer written by this LoopOp                         |
+| `node.inputs`                                | `list[str]`                               | Per-source external buffer node id (indexed by `Load.source`)  |
+| `node.id`                                    | `str`                                     | The output buffer written by this LoopOp                       |
 
 Analogies (use in module/class docstrings):
 
@@ -147,7 +152,7 @@ is decomposed with unsqueeze IndexMapOps (``A → A[..., M, K, 1]``,
 the reduce over ``K`` (axis -2) yields ``(..., M, N)``. No special-case
 shape inference for contractions.
 
-## Fusion policy (rules/fusion/)
+## Fusion policy (passes/fusion/)
 
 Lift-then-splice, driven by the rewriter's fixpoint loop:
 
@@ -233,7 +238,7 @@ keeps the matmul at one launch.
 Walks the SSA body — no classification pass, no `Schedule` dataclass, no `LoopIR` intermediate. Maintains a `values: dict[str, Expr]` mapping Assign names to C expressions.
 
 - `_emit_load_access(index, buf, src_shape, env) -> Expr`: emits `ArrayAccess(buffer, coord)` for a body `Load.index` pattern evaluated in the axis environment. Select statements inside the SSA body are handled separately by `_emit_select`, which lowers `SelectBranch`es into a nested `Ternary` chain.
-- `_emit_body`: unified entry for one kernel body. Calls `ir.loop.plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The same plan powers `LoopProgram.pretty_print_launch` so the dump view mirrors the loop nest codegen emits.
+- `_emit_body`: unified entry for one kernel body. Calls `ir.loop.plan.analyze_kernel(loop, out_shape)` to produce a `KernelPlan`, then delegates to `_emit_plan`. The same plan powers the per-LoopOp pretty-printer so dump views mirror the loop nest codegen emits.
 - `_emit_plan`: walks `plan.steps` — each step is either `Inline` (a straight-line block of `Assign` / `Select` / `Write` / `Accum` / `Load`) or `Loop` (a K-loop over a reduce axis). Loads inside a reduce Loop's body materialize inside that loop; Loads in prelude Inline steps happen once per row. Grid is 1D over flat free-axis extents; block is `(256, 1, 1)` for pure-elementwise plans, `(1, 1, 1)` for plans containing a `Loop` step. Empty bodies (copy kernels) are a pointwise subcase.
 - Reductions (single `Loop` step) emit an accumulator init + `Accum` fold; max reductions use `fmaxf` instead of `AugAssign`. Softmax-style cross-iteration patterns (reduce_max → sub+exp → reduce_sum → div) and contractions (mul → reduce_sum) fall out naturally from multiple `Loop` steps recomputing per-element values as needed.
 
@@ -263,6 +268,6 @@ so fusion rules can be validated numerically on CPU without CUDA.
 - `tests/compiler/test_pipeline.py` — end-to-end on small synthetic graphs.
 - `tests/compiler/test_torch_trace*.py`, `test_real_trace.py`, `test_hints.py` — tracer / hint coverage.
 - `tests/compiler/test_torch_ops.py` — Op.forward() + numpy backend: per-op tests + torch cross-checks.
-- `tests/compiler/rules/` — all rewrite rules (decomposition, optimization, fusion).
+- `tests/compiler/passes/` — all rewrite passes (decomposition, optimization, fusion, lowering).
 
 Full-model E2E (TinyLlama layer) comes back in a follow-up commit once decomposition of higher-level ops is ported into the new lowering.
