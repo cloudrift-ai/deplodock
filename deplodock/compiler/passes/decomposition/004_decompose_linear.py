@@ -9,12 +9,12 @@ from deplodock.compiler.ir.broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.ir.frontend.ir import LinearOp, TransposeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", LinearOp, "1")]
+PATTERN = [Pattern("root", LinearOp)]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
     w_id = root.inputs[1]

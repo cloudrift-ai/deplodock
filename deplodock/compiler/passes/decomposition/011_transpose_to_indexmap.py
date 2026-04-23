@@ -10,12 +10,12 @@ from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.frontend.ir import TransposeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", TransposeOp, "1")]
+PATTERN = [Pattern("root", TransposeOp)]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
     in_shape = tuple(graph.nodes[x_id].output.shape)

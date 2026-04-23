@@ -13,12 +13,12 @@ from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", SdpaOp, "1")]
+PATTERN = [Pattern("root", SdpaOp)]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     """Replace sdpa(Q, K, V, ...) with QK^T → scale → softmax → @V."""
     root = graph.nodes[match.root_node_id]
     q_id = root.inputs[0]

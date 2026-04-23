@@ -1,4 +1,4 @@
-"""Tests for the structural CUDA emitter with the grammar-based fusion pipeline.
+"""Tests for the structural CUDA emitter with the pattern-based fusion pipeline.
 
 Exercises source-level assertions and end-to-end GPU runs. CUDA-specific
 by design (source-level assertions on emitted C code); not parameterized

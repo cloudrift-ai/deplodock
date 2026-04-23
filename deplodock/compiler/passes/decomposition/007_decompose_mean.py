@@ -5,12 +5,12 @@ from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.frontend.ir import MeanOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", MeanOp, "1")]
+PATTERN = [Pattern("root", MeanOp)]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     """Replace mean(x, axis) with sum(x, axis) / axis_size."""
     root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
