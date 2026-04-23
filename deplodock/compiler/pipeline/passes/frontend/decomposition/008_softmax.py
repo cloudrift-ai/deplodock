@@ -4,7 +4,7 @@
     e   = exp(x - m)
     out = e / sum(e, dim, keepdim=True)
 
-Same math as the softmax block inside ``001_decompose_sdpa.py``; kept as its
+Same math as the softmax block inside ``001_sdpa.py``; kept as its
 own rule so standalone ``torch.nn.Softmax`` / ``F.softmax`` calls decompose
 without going through the SDPA fast-path.
 """

@@ -2,7 +2,7 @@
 
     out = x * rsqrt(mean(x * x, dim=-1, keepdim=True) + eps) * weight
 
-The resulting MeanOp is further lowered to sum + div by 007_decompose_mean.
+The resulting MeanOp is further lowered to sum + div by 007_mean.
 """
 
 from deplodock.compiler.graph import Graph, Tensor
