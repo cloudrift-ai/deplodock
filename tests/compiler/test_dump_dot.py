@@ -12,7 +12,7 @@ from deplodock.compiler.dump import _graph_to_dot
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
 
 
 def _small_graph() -> Graph:

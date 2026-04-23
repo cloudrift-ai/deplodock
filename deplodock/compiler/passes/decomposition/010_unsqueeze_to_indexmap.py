@@ -7,9 +7,9 @@ coord_map for axis i reads the input's coord at axis i (for i < k) or i-1
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import placeholder
-from deplodock.compiler.ir.frontend_ir import UnsqueezeOp
+from deplodock.compiler.ir.frontend.ir import UnsqueezeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import IndexMapOp, IndexSource
+from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
 
 GRAMMAR = [Production("root", UnsqueezeOp, "1")]

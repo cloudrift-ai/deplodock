@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
 def test_elementwise_rejects_mismatched_shapes():

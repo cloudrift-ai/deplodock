@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import Literal, placeholder
-from deplodock.compiler.ir.frontend_ir import (
+from deplodock.compiler.ir.frontend.ir import (
     CatOp,
     LinearOp,
     MatmulOp,
@@ -26,7 +26,7 @@ from deplodock.compiler.ir.frontend_ir import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
 
 if TYPE_CHECKING:
     import torch

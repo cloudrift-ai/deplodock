@@ -14,7 +14,7 @@ from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp  # noqa: F401
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp  # noqa: F401
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
@@ -42,7 +42,7 @@ def _reduce_sum_graph() -> Graph:
 
 
 def _matmul_graph() -> Graph:
-    from deplodock.compiler.ir.frontend_ir import MatmulOp
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 8)), node_id="a")

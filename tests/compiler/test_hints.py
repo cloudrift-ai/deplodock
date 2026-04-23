@@ -2,7 +2,7 @@
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Hints, Tensor, resolve_hints
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
 def _matmul_graph() -> Graph:

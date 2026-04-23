@@ -9,9 +9,9 @@ baked into the coord_map.
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import Literal, placeholder
-from deplodock.compiler.ir.frontend_ir import SliceOp
+from deplodock.compiler.ir.frontend.ir import SliceOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import IndexMapOp, IndexSource
+from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 from deplodock.compiler.matcher import ChainMatch, Production
 
 GRAMMAR = [Production("root", SliceOp, "1")]

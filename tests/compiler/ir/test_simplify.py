@@ -32,7 +32,7 @@ from deplodock.compiler.ir.simplify import (
     simplify_expr,
     simplify_loop_op,
 )
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 # ---------------------------------------------------------------------------
 # Core Expr folding
