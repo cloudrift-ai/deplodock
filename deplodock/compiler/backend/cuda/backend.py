@@ -15,7 +15,7 @@ import numpy as np
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import benchmark_program, run_program, run_program_debug
 from deplodock.compiler.pipeline import compile_graph
-from deplodock.compiler.rewriter import Rewriter
+from deplodock.compiler.rewriter import run_pass
 
 _PASSES_DIR = Path(__file__).parent.parent.parent / "passes"
 
@@ -46,10 +46,10 @@ class CudaBackend(Backend):
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[KernelOp]`` → ``Graph[CudaOp]``."""
         graph = compile_graph(graph, dump=self.dump)
-        graph = Rewriter.from_directory(_PASSES_DIR, pass_order=["lowering/kernel"]).apply(graph)
+        graph = run_pass(graph, _PASSES_DIR / "lowering/kernel")
         if self.dump is not None:
             self.dump.dump_kernel_graph(graph)
-        graph = Rewriter.from_directory(_PASSES_DIR, pass_order=["lowering/cuda"]).apply(graph)
+        graph = run_pass(graph, _PASSES_DIR / "lowering/cuda")
         if self.dump is not None:
             self.dump.dump_cuda_graph(graph)
         return graph

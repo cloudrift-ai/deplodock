@@ -52,7 +52,7 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
     """
     import torch
 
-    from deplodock.compiler.rewriter import Rewriter
+    from deplodock.compiler.rewriter import run_pass
     from deplodock.compiler.trace.torch import trace_module
 
     rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes"
@@ -69,7 +69,7 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
 
     for name, module, inputs in modules:
         graph = trace_module(module, inputs)
-        decomposed = Rewriter.from_directory(rules_dir, pass_order=["decomposition"]).apply(graph)
+        decomposed = run_pass(graph, rules_dir / "decomposition")
         for n in decomposed.nodes.values():
             if not isinstance(n.op, ElementwiseOp):
                 continue

@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult, RunResult
     from deplodock.compiler.ir.graph import Graph
     from deplodock.compiler.plan import ExecutionPlan
-    from deplodock.compiler.rewriter import PassTrace
 
 logger = logging.getLogger(__name__)
 
@@ -90,20 +89,6 @@ class CompilerDump:
         self._write_json("10_tensor_ir.json", graph.to_dict())
         self._write_text("10_tensor_ir.txt", graph.pretty_print())
         self._write_text("10_tensor_ir.dot", _graph_to_dot(graph))
-
-    def dump_pass(self, index: int, pt: PassTrace) -> None:
-        prefix = f"{index + 1:02d}_pass_{pt.name}"
-        data = pt.to_dict()
-        if data.get("graph_before"):
-            self._write_json(f"{prefix}_before.json", data["graph_before"])
-        if data.get("graph_after"):
-            self._write_json(f"{prefix}_after.json", data["graph_after"])
-        if data.get("rules_applied"):
-            self._write_json(f"{prefix}_rules.json", data["rules_applied"])
-
-    def dump_passes(self, pass_traces: list[PassTrace]) -> None:
-        for i, pt in enumerate(pass_traces):
-            self.dump_pass(i, pt)
 
     def dump_fused_graph(self, graph: Graph) -> None:
         self._write_json("20_fused_graph.json", graph.to_dict())

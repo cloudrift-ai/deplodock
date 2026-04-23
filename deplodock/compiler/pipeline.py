@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 from deplodock.compiler.ir.graph import Graph
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.simplify import simplify_loop_op
-from deplodock.compiler.rewriter import Rewriter
+from deplodock.compiler.rewriter import run_pass
 
 if TYPE_CHECKING:
     from deplodock.compiler.dump import CompilerDump
@@ -44,8 +44,8 @@ def compile_graph(graph: Graph, dump: CompilerDump | None = None) -> Graph:
     n_in = len(graph.nodes)
 
     t0 = time.monotonic()
-    rewriter_pre = Rewriter.from_directory(_PASSES_DIR, pass_order=["decomposition", "optimization"])
-    graph = rewriter_pre.apply(graph)
+    graph = run_pass(graph, _PASSES_DIR / "decomposition")
+    graph = run_pass(graph, _PASSES_DIR / "optimization")
     logger.info("compile: decompose+optimize %.2fs (%d -> %d nodes)", time.monotonic() - t0, n_in, len(graph.nodes))
 
     if dump is not None:
@@ -53,8 +53,7 @@ def compile_graph(graph: Graph, dump: CompilerDump | None = None) -> Graph:
 
     t0 = time.monotonic()
     n_before_fusion = len(graph.nodes)
-    rewriter_fusion = Rewriter.from_directory(_PASSES_DIR, pass_order=["fusion"])
-    graph = rewriter_fusion.apply(graph)
+    graph = run_pass(graph, _PASSES_DIR / "fusion")
     logger.info("compile: fuse %.2fs (%d -> %d nodes)", time.monotonic() - t0, n_before_fusion, len(graph.nodes))
 
     t0 = time.monotonic()
