@@ -14,7 +14,8 @@ pipeline/
     │   └── optimization/   # IndexMap fusion before lift-to-loop
     ├── loop/
     │   ├── lifting/        # tensor ops → trivial LoopOp nodes
-    │   └── fusion/         # merge adjacent LoopOp pairs (splice)
+    │   ├── fusion/         # merge adjacent LoopOp pairs (splice)
+    │   └── matmul/         # annotate contraction LoopOps with cuda.matmul.* hints
     └── lowering/
         ├── kernel/         # LoopOp → KernelOp (emit GpuKernel AST)
         └── cuda/           # KernelOp → CudaOp (render source string)
@@ -84,7 +85,8 @@ ignores the prefix itself — it's only for ordering readability.
 | `frontend/optimization/`   | `compose_indexmaps`: collapse chains of single-source / single-consumer `IndexMapOp` into one coord_map — prevents trivial layout kernels from blocking fusion. |
 | `loop/lifting/`            | `lift_*` rules wrap each surviving tensor primitive (elementwise / reduce / indexmap / gather) in a trivial one-op `LoopOp`. |
 | `loop/fusion/`             | `merge_loop_ops` splices adjacent `LoopOp` pairs using `ir/loop/splicer.py::splice_graph`. |
-| `lowering/kernel/`         | Emit per-node `GpuKernel` AST (via `_emit.py`) and mutate the node's op to `KernelOp` in place. |
+| `loop/matmul/`             | `detect_matmul` pattern-matches pure contraction kernels (2 Loads → mul → add-Accum → Write) and stamps `cuda.matmul.*` hints (strategy, M/N/K, a_source / b_source, tile config) that the kernel emitter reads to pick the tiled-SGEMM template. |
+| `lowering/kernel/`         | Emit per-node `GpuKernel` AST (via `_emit.py`) and mutate the node's op to `KernelOp` in place. Dispatches to `_emit_matmul.emit_matmul_kernel` when the `cuda.matmul.strategy=tma_matmul` hint is present (see `loop/matmul`); otherwise falls through to the scalar A/B-strategy emitter. |
 | `lowering/cuda/`           | Render the `GpuKernel` to a `__global__` source string (via `_emit.py`) and mutate the node's op to `CudaOp` in place. |
 
 See `ir/ARCHITECTURE.md` for what each IR dialect looks like.
