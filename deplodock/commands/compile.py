@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _IR_STAGE_FILES = {
     "torch": "00_input_graph.txt",
     "tensor": "10_tensor_ir.txt",
+    "loop": "20_loop_ir.txt",
     "kernel": "39_kernel_ir.txt",
     "cuda": "40_kernels.cu",
 }
@@ -107,7 +108,7 @@ def _handle_compile_inspect(args):
 
         if stage == "torch":
             pass
-        elif stage == "tensor":
+        elif stage in ("tensor", "loop"):
             compile_graph(graph, dump=dump)
         else:
             CudaBackend(dump=dump).compile(graph)

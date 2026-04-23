@@ -46,7 +46,7 @@ Or for a specific test file:
 - `deplodock trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)
 - `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model)
 - `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
-- `deplodock compile <ir_file> --ir {torch|tensor|kernel|cuda}` — print the requested IR stage to stdout. `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
+- `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
 - `deplodock run <ir_file> [--benchmark] [--dump-dir DIR]` — run a compiled graph IR through the full pipeline. With `--benchmark`, logs top-N per-kernel GPU-event times; `--dump-dir` stores them under `per_launch` in `60_benchmark.json`, inherited by `bench` via `DEPLODOCK_DUMP_DIR`.
 - `deplodock run <model_id> "<prompt>" [--max-new-tokens N] [--seq-len N]` — trace + compile a full HF CausalLM and greedy-decode from the prompt.

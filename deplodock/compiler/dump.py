@@ -108,6 +108,28 @@ class CompilerDump:
     def dump_fused_graph(self, graph: Graph) -> None:
         self._write_json("20_fused_graph.json", graph.to_dict())
 
+    def dump_loop_ir(self, graph: Graph) -> None:
+        """Pretty-printed LoopOp bodies for each fused kernel in the graph.
+
+        This is the article's "Loop IR" stage — each compute node's nested
+        ``for`` loops with Loads/Writes/Assigns visible, before the backend
+        lowers them to the per-kernel Kernel IR AST.
+        """
+        from deplodock.compiler.ir.loop import LoopOp, pretty_print
+
+        blocks: list[str] = []
+        i = 0
+        for nid in graph.topological_order():
+            node = graph.nodes[nid]
+            if not isinstance(node.op, LoopOp):
+                continue
+            port_buffers = [graph.nodes[src].output.name for src in node.inputs] + [node.output.name]
+            blocks.append(f"=== loop {i}: {nid} -> {node.output.name} ===")
+            blocks.append(pretty_print(node.op, port_buffers=port_buffers))
+            blocks.append("")
+            i += 1
+        self._write_text("20_loop_ir.txt", "\n".join(blocks))
+
     def dump_plan(self, plan: ExecutionPlan) -> None:
         summary = {
             "name": plan.name,

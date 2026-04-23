@@ -67,6 +67,7 @@ def compile_graph(graph: Graph, dump: CompilerDump | None = None) -> Graph:
 
     if dump is not None:
         dump.dump_fused_graph(graph)
+        dump.dump_loop_ir(graph)
 
     logger.info("compile: total %.2fs", time.monotonic() - t_start)
     return graph
