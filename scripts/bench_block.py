@@ -314,6 +314,18 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
                 )
 
         result = backend.benchmark(compiled, warmup=3, num_iters=10)
+
+        # Per-kernel timings: log the top offenders and (if dumping) persist the
+        # full per-launch table to ``60_benchmark.json`` so the results dir has
+        # the data needed to chase perf regressions post-hoc.
+        if result.per_launch:
+            total = sum(lt.time_ms for lt in result.per_launch)
+            logger.info("Top kernels by time (total=%.4f ms over %d launches):", total, result.num_launches)
+            for lt in sorted(result.per_launch, key=lambda x: x.time_ms, reverse=True)[:10]:
+                logger.info("  %3d %-40s %.4f ms (%.1f%%)", lt.idx, lt.kernel_name, lt.time_ms, 100 * lt.time_ms / total)
+        if dump:
+            dump.dump_benchmark(result)
+
         return result.time_ms * 1000  # ms → us
     except Exception as e:
         logger.warning("Deplodock pipeline failed: %s", e)

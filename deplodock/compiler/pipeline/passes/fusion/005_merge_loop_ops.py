@@ -6,6 +6,19 @@ handles multiple consumer Loads of the producer and shared external
 inputs uniformly (first-seen slot assignment + splice-edge routing).
 Splicing refuses patterns it doesn't handle yet (non-trivial σ writer
 forms, etc.); those boundaries stay as separate kernels.
+
+Blowup guard: a leaf's cost is ``(free_prod × enclosing_reduce_prod)``.
+Fusions that catastrophically nest reduces (e.g. inlining one matmul
+inside another's k-loop: outer_K × inner_K × free_numel) multiply this
+leaf cost by the inner reduce axis's extent. We refuse merges whose max
+leaf cost grows more than ``_BLOWUP_FACTOR`` over the sum of the
+producer+consumer leaf costs.
+
+Factor picked empirically — swept 2…1024 on TinyLlama block (seq=32):
+2–16 ties at ~4.18ms/18 launches (best), 32–512 shifts to ~4.7ms/17
+launches (one harmful silu→down_proj fusion lands), 1024 unlocks the
+up_proj→down_proj nesting (~1000×) and the block takes 433ms. 8 is the
+middle of the best plateau.
 """
 
 from __future__ import annotations
@@ -19,14 +32,7 @@ _BLOWUP_FACTOR = 8
 
 
 def _max_nest(loop_op: LoopOp) -> int:
-    """Maximum per-leaf compute cost the emitter will produce.
-
-    The CUDA emitter flattens *all* free axes into the thread id and then
-    runs the body per thread — so a reduce Loop sitting above a sibling
-    free axis is re-executed once per value of that free axis. The cost
-    of a leaf is therefore ``(product of all free axes) * (product of
-    reduce axes enclosing the leaf)``. We return the max over leaves.
-    """
+    """Maximum per-leaf compute cost (``free_prod × reduce_prod``) over the body tree."""
     reduce_names = loop_op.reduce_axis_names
     free_prod = 1
     for a in loop_op.axes:
@@ -91,19 +97,10 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         return None
     merged, merged_inputs = result
 
-    # Compute-blowup guard: refuse merges that catastrophically duplicate work.
-    # Applies only to kernels that would lower under Strategy A (serial reduce,
-    # thread-per-output) — there the reduce body re-runs once per free-axis
-    # iteration, so growth compounds. Strategy B (smem reduce, block-per-outer)
-    # shares reduce work across threads in a block, so the same "blowup"
-    # signature is benign; skip the guard in that regime.
-    from deplodock.compiler.pipeline.passes.lowering.kernel._emit import pick_strategy
-
-    if pick_strategy(merged).kind == "A":
-        pre = _max_nest(producer_node.op) + _max_nest(consumer_node.op)
-        post = _max_nest(merged)
-        if post > _BLOWUP_FACTOR * pre:
-            return None
+    pre = _max_nest(producer_node.op) + _max_nest(consumer_node.op)
+    post = _max_nest(merged)
+    if post > _BLOWUP_FACTOR * pre:
+        return None
 
     # Wrap the merged LoopOp in the rule's output fragment, with an InputOp
     # per external slot in the order ``splice_graph`` assigned.
