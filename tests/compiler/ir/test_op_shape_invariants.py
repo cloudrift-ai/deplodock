@@ -52,7 +52,7 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
     """
     import torch
 
-    from deplodock.compiler.pipeline.rewriter import run_pass
+    from deplodock.compiler.pipeline.engine import run_pass
     from deplodock.compiler.trace.torch import trace_module
 
     rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
