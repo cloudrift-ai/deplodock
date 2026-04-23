@@ -8,7 +8,7 @@ Submodules:
 - :mod:`.emit` — per-node codegen: ``LoopOp`` node → ``GpuKernel``
   (``emit_kernel`` / ``launch_config`` / ``kernel_name_for``) plus the
   ``emit_kernel_source`` helper that renders a ``GpuKernel`` to a C
-  source string via ``backend/kernel_codegen``.
+  source string via ``ir/cuda/emit``.
 
 The ``passes/lowering/kernel`` pass uses :mod:`.emit` to turn each
 ``LoopOp`` graph node into a ``KernelOp``; ``passes/lowering/cuda``

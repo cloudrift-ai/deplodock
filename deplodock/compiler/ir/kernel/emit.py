@@ -69,7 +69,7 @@ def launch_config(node: Node) -> tuple[tuple[int, int, int], tuple[int, int, int
 
 
 def emit_kernel_source(gpu_kernel: GpuKernel) -> str:
-    from deplodock.compiler.backend.kernel_codegen import emit_kernel as _emit
+    from deplodock.compiler.ir.cuda.emit import emit_kernel as _emit
 
     return _emit(gpu_kernel)
 
