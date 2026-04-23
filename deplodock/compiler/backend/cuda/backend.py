@@ -48,10 +48,10 @@ class CudaBackend(Backend):
         graph = compile_graph(graph, dump=self.dump)
         graph = run_pass(graph, _PASSES_DIR / "lowering/kernel")
         if self.dump is not None:
-            self.dump.dump_kernel_graph(graph)
+            self.dump.on_pass("lowering/kernel", graph)
         graph = run_pass(graph, _PASSES_DIR / "lowering/cuda")
         if self.dump is not None:
-            self.dump.dump_cuda_graph(graph)
+            self.dump.on_pass("lowering/cuda", graph)
         return graph
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
