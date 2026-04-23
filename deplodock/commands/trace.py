@@ -162,7 +162,7 @@ def graph_from_code(code: str):
         tensor_kw_names = [k for k, v in kwargs.items() if isinstance(v, torch.Tensor)]
         baked_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, torch.Tensor)}
         n_positional = len(tensor_args)
-        pos_names = (["x"] if n_positional == 1 else [f"x{i}" for i in range(n_positional)])
+        pos_names = ["x"] if n_positional == 1 else [f"x{i}" for i in range(n_positional)]
         param_names = pos_names + tensor_kw_names
 
         # Synthesize the wrapper source so torch.export sees literal param
@@ -176,7 +176,10 @@ def graph_from_code(code: str):
             "        return fn(*resolved, **baked_kwargs, **kw)\n"
         )
         wrapper_scope: dict[str, Any] = {
-            "torch": torch, "fn": fn, "arg_slots": arg_slots, "baked_kwargs": baked_kwargs,
+            "torch": torch,
+            "fn": fn,
+            "arg_slots": arg_slots,
+            "baked_kwargs": baked_kwargs,
         }
         exec(src, wrapper_scope)  # noqa: S102 — local CLI
         module = wrapper_scope["_FunctionalWrapper"]()

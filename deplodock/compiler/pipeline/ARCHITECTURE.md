@@ -87,18 +87,18 @@ See `ir/ARCHITECTURE.md` for what each IR dialect looks like.
 
 ## Dump hooks (`dump.py`)
 
-`CompilerDump.on_pass(pass_name, graph)` dispatches to the dump methods
-registered for that pass name:
+`CompilerDump.on_pass(idx, pass_name, graph)` dumps the post-pass graph
+uniformly for every pass: `NN_<pass_name>.{json,txt,dot}` (+
+`NN_<pass_name>.kernels.txt` if the graph contains any `LoopOp` /
+`KernelOp` / `CudaOp`). Slashes in the pass name are flattened to
+underscores, so `lowering/cuda` dumps as `05_lowering_cuda.*`. The
+pre-pipeline input graph is dumped separately as `00_input.*` via
+`dump.dump_input_graph(graph)` from the caller.
 
-| `pass_name`        | Dumps                                         |
-|--------------------|-----------------------------------------------|
-| `optimization`     | `10_tensor_ir.{json,txt,dot}`                 |
-| `fusion`           | `20_fused_graph.json`, `20_loop_ir.txt`       |
-| `lowering/kernel`  | `39_kernel_ir.txt`                            |
-| `lowering/cuda`    | `40_kernels.cu`                               |
-
-Other pass names (`decomposition` etc.) are no-ops. Pre-pass inputs are
-dumped separately via `dump.dump_input_graph(graph)` from the caller.
+The uniform strategy means adding a new pass automatically gets dumped
+— no per-pass registration needed. Rendering the kernel-level IRs
+(loop/kernel/cuda) lives in `format_kernels(graph)`, which dispatches
+on op type.
 
 ## Fragment splice (`engine._apply_replacement`)
 

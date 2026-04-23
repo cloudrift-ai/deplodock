@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,12 +13,30 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_IR_STAGE_FILES = {
-    "torch": "00_input_graph.txt",
-    "tensor": "10_tensor_ir.txt",
-    "loop": "20_loop_ir.txt",
-    "kernel": "39_kernel_ir.txt",
-    "cuda": "40_kernels.cu",
+# Each --ir stage maps to (passes to run, formatter). "graph" pretty-prints
+# the whole Graph (inputs/constants/nodes/outputs). "kernels" renders just
+# the post-lowering per-kernel bodies — dispatching on LoopOp / KernelOp /
+# CudaOp by type; the syntax itself (``for`` loops vs C-like AST vs CUDA
+# source) disambiguates the IR level.
+_IR_STAGES = {
+    "torch": ([], "graph"),
+    "tensor": (["decomposition", "optimization"], "graph"),
+    "loop": (["decomposition", "optimization", "fusion"], "kernels"),
+    "kernel": (["decomposition", "optimization", "fusion", "lowering/kernel"], "kernels"),
+    "cuda": (["decomposition", "optimization", "fusion", "lowering/kernel", "lowering/cuda"], "kernels"),
+}
+
+_DEFAULT_PASSES = ["decomposition", "optimization", "fusion"]
+
+# Single-letter shortcuts for each pass. Passing a contiguous string of
+# these letters to --passes is equivalent to the expanded comma list
+# (e.g. 'dofk' == 'decomposition,optimization,fusion,lowering/kernel').
+_PASS_SHORTCUTS = {
+    "d": "decomposition",
+    "o": "optimization",
+    "f": "fusion",
+    "k": "lowering/kernel",
+    "c": "lowering/cuda",
 }
 
 
@@ -52,9 +69,19 @@ def register_compile_command(subparsers):
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
     parser.add_argument(
         "--ir",
-        choices=list(_IR_STAGE_FILES),
+        choices=list(_IR_STAGES),
         default=None,
         help="Print the requested IR stage to stdout (or --output) and exit. Skips the normal .compiled.json save.",
+    )
+    parser.add_argument(
+        "--passes",
+        default=None,
+        help=(
+            "Pass list to override the default. Accepts either a comma-separated list "
+            "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
+            "single-letter shortcuts: d=decomposition, o=optimization, f=fusion, "
+            "k=lowering/kernel, c=lowering/cuda (so 'dofk' == the first four)."
+        ),
     )
     parser.set_defaults(func=handle_compile)
 
@@ -67,61 +94,54 @@ def handle_compile(args):
         logger.error("either a positional model ID / IR file or --code is required")
         sys.exit(2)
 
-    if args.ir is not None:
-        _handle_compile_inspect(args)
-        return
-
     from deplodock.compiler.pipeline import run_pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
+
+    passes = _resolve_passes(args)
+    graph, base_name = _load_or_trace(args)
+    initial_count = len(graph.nodes)
 
     dump = CompilerDump.resolve(args.dump_dir)
-
-    graph, base_name = _load_or_trace(args)
-
-    initial_count = len(graph.nodes)
     if dump:
         dump.dump_input_graph(graph)
+    result = run_pipeline(graph, passes, dump=dump)
 
-    fused = run_pipeline(graph, ["decomposition", "optimization", "fusion"], dump=dump)
-
-    n_compute = sum(1 for n in fused.nodes.values() if not _is_boundary(n.op))
-    logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
-
-    output_path = Path(args.output) if args.output else Path(f"{base_name}.fused.txt")
-    output_path.write_text(fused.pretty_print())
-    logger.info("Saved fused graph: %s", output_path)
-
-
-def _handle_compile_inspect(args):
-    """Run the pipeline to produce --ir STAGE artifact, then print it."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import run_pipeline
-    from deplodock.compiler.pipeline.dump import CompilerDump
-
-    graph, _ = _load_or_trace(args)
-    stage = args.ir
-    stage_file = _IR_STAGE_FILES[stage]
-
-    with tempfile.TemporaryDirectory(prefix="deplodock-inspect-") as tmp:
-        dump_dir = Path(args.dump_dir) if args.dump_dir else Path(tmp)
-        dump = CompilerDump(dir=dump_dir)
-        dump.dump_input_graph(graph)
-
-        if stage == "torch":
-            pass
-        elif stage in ("tensor", "loop"):
-            run_pipeline(graph, ["decomposition", "optimization", "fusion"], dump=dump)
+    if args.ir is not None:
+        content = _format_stage(result, args.ir)
+        if args.output:
+            Path(args.output).write_text(content)
         else:
-            CudaBackend(dump=dump).compile(graph)
+            sys.stdout.write(content)
+            if not content.endswith("\n"):
+                sys.stdout.write("\n")
+        return
 
-        content = (dump.dir / stage_file).read_text()
+    n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
+    logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
+    output_path = Path(args.output) if args.output else Path(f"{base_name}.fused.txt")
+    output_path.write_text(result.pretty_print())
+    logger.info("Saved graph: %s", output_path)
 
-    if args.output:
-        Path(args.output).write_text(content)
-    else:
-        sys.stdout.write(content)
-        if not content.endswith("\n"):
-            sys.stdout.write("\n")
+
+def _resolve_passes(args) -> list[str]:
+    if args.passes is not None:
+        raw = args.passes.strip()
+        # Shorthand: no commas AND every character is a known pass letter.
+        if "," not in raw and raw and all(c in _PASS_SHORTCUTS for c in raw):
+            return [_PASS_SHORTCUTS[c] for c in raw]
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    if args.ir is not None:
+        return _IR_STAGES[args.ir][0]
+    return _DEFAULT_PASSES
+
+
+def _format_stage(graph, stage: str) -> str:
+    from deplodock.compiler.pipeline.dump import format_kernels
+
+    formatter = _IR_STAGES[stage][1]
+    if formatter == "graph":
+        return graph.pretty_print()
+    return format_kernels(graph)
 
 
 def _is_boundary(op) -> bool:
