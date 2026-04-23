@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 import torch
 
-from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu, has_nvcc
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
