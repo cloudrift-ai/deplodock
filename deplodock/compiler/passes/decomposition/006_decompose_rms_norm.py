@@ -10,14 +10,14 @@ from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.frontend.ir import MeanOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
 _DEFAULT_EPS = 1e-6
 
-GRAMMAR = [Production("root", ElementwiseOp, "1", {"fn": "rms_norm"})]
+PATTERN = [Pattern("root", ElementwiseOp, {"fn": "rms_norm"})]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     root = graph.nodes[match.root_node_id]
 
     # aten.rms_norm: (x, normalized_shape, weight [, eps]). normalized_shape

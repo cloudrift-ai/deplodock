@@ -15,12 +15,12 @@ from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, substit
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import IndexMapOp
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", IndexMapOp, "1")]
+PATTERN = [Pattern("root", IndexMapOp)]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     nid = match.root_node_id
     node = graph.nodes[nid]
     op = node.op

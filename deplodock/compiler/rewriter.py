@@ -1,9 +1,9 @@
 """Pass-based graph rewrite engine.
 
-Rules declare a ``GRAMMAR`` and a ``rewrite(graph, match)`` function that
+Rules declare a ``PATTERN`` and a ``rewrite(graph, match)`` function that
 returns a ``Graph`` fragment (the replacement subgraph) or ``None`` (no-op).
 
-The engine matches the grammar, calls the rewrite function, and splices the
+The engine matches the pattern, calls the rewrite function, and splices the
 returned fragment into the main graph: adds new nodes, wires the fragment's
 output to replace the consumed region, and cleans up.
 """
@@ -18,7 +18,7 @@ from pathlib import Path
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.matcher import ChainGrammar, ChainMatch, match_grammar
+from deplodock.compiler.matcher import Match, Pattern, match_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +60,11 @@ class PassTrace:
 
 @dataclass
 class Rule:
-    """A single rewrite rule: grammar + rewrite function."""
+    """A single rewrite rule: pattern + rewrite function."""
 
     name: str
-    grammar: ChainGrammar
-    rewrite: object  # Callable[[Graph, ChainMatch], Graph | None]
+    pattern: list[Pattern]
+    rewrite: object  # Callable[[Graph, Match], Graph | None]
 
     @staticmethod
     def from_file(path: Path) -> Rule:
@@ -73,13 +73,13 @@ class Rule:
             raise ImportError(f"Cannot load rule from {path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        grammar = getattr(module, "GRAMMAR", None)
+        pattern = getattr(module, "PATTERN", None)
         rewrite_fn = getattr(module, "rewrite", None)
-        if grammar is None:
-            raise ValueError(f"Rule {path} missing GRAMMAR")
+        if pattern is None:
+            raise ValueError(f"Rule {path} missing PATTERN")
         if rewrite_fn is None:
             raise ValueError(f"Rule {path} missing rewrite() function")
-        return Rule(name=path.stem, grammar=grammar, rewrite=rewrite_fn)
+        return Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn)
 
 
 @dataclass
@@ -115,7 +115,7 @@ class Pass:
             for rule in self.rules:
                 while True:
                     t0 = time.monotonic()
-                    matches = match_grammar(graph, rule.grammar)
+                    matches = match_pattern(graph, rule.pattern)
                     match_time = time.monotonic() - t0
                     if not matches:
                         prev = rule_stats.get(rule.name, (0, 0.0, 0.0))
@@ -190,7 +190,7 @@ class Rewriter:
 # ---------------------------------------------------------------------------
 
 
-def _apply_replacement(graph: Graph, match: ChainMatch, fragment: Graph) -> Graph:
+def _apply_replacement(graph: Graph, match: Match, fragment: Graph) -> Graph:
     """Splice a replacement fragment into the graph.
 
     1. Add fragment's non-InputOp nodes to the graph (with fresh IDs).

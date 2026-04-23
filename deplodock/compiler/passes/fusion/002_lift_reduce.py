@@ -13,9 +13,9 @@ from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", ReduceOp, "1")]
+PATTERN = [Pattern("root", ReduceOp)]
 
 # Map ReduceOp.fn ("sum"/"max"/"min"/"prod") to the combine op name that
 # ``Accum`` carries. Accum init is derived from this op by the Loop IR
@@ -23,7 +23,7 @@ GRAMMAR = [Production("root", ReduceOp, "1")]
 _COMBINE: dict[str, str] = {"sum": "add", "max": "max", "prod": "mul", "min": "min"}
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     nid = match.root_node_id
     node = graph.nodes[nid]
     op = node.op

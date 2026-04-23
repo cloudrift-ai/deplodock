@@ -13,7 +13,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Loop, LoopOp, Stmt, splice_graph
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
 _BLOWUP_FACTOR = 8
 
@@ -51,20 +51,15 @@ def _max_nest(loop_op: LoopOp) -> int:
     return best
 
 
-GRAMMAR = [
-    Production("producer", LoopOp, "1"),
-    Production("consumer", LoopOp, "1"),
+PATTERN = [
+    Pattern("producer", LoopOp),
+    Pattern("consumer", LoopOp),
 ]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
-    producer_ids = match.get("producer")
-    consumer_ids = match.get("consumer")
-    if not producer_ids or not consumer_ids:
-        return None
-
-    producer_id = producer_ids[0]
-    consumer_id = consumer_ids[0]
+def rewrite(graph: Graph, match: Match) -> Graph | None:
+    producer_id = match.nodes["producer"]
+    consumer_id = match.nodes["consumer"]
 
     producer_node = graph.nodes[producer_id]
     consumer_node = graph.nodes[consumer_id]

@@ -1,9 +1,9 @@
-"""Tests for the grammar-based rewrite engine."""
+"""Tests for the pattern-based rewrite engine."""
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ScanOp
-from deplodock.compiler.matcher import Production
+from deplodock.compiler.matcher import Pattern
 from deplodock.compiler.rewriter import Pass, Rule
 
 
@@ -59,7 +59,7 @@ def test_pass_with_no_matching_rules():
     g = _make_silu_graph()
     rule = Rule(
         name="noop",
-        grammar=[Production("root", ScanOp, "1")],
+        pattern=[Pattern("root", ScanOp)],
         rewrite=lambda graph, match: graph,
     )
     result = Pass(name="noop", rules=[rule]).apply(g)

@@ -3,12 +3,12 @@
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", ElementwiseOp, "1", {"fn": "pow"})]
+PATTERN = [Pattern("root", ElementwiseOp, {"fn": "pow"})]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     """Replace pow(x, 2) with mul(x, x) — enables RMSNorm pattern matching."""
     root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]

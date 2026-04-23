@@ -12,12 +12,12 @@ from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SliceOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", SliceOp, "1")]
+PATTERN = [Pattern("root", SliceOp)]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     rs_id = match.root_node_id
     root = graph.nodes[rs_id]
     x_id = root.inputs[0]

@@ -22,22 +22,17 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Expr, substitute
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [
-    Production("producer", IndexMapOp, "1"),
-    Production("consumer", IndexMapOp, "1"),
+PATTERN = [
+    Pattern("producer", IndexMapOp),
+    Pattern("consumer", IndexMapOp),
 ]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
-    producer_ids = match.get("producer")
-    consumer_ids = match.get("consumer")
-    if not producer_ids or not consumer_ids:
-        return None
-
-    producer_id = producer_ids[0]
-    consumer_id = consumer_ids[0]
+def rewrite(graph: Graph, match: Match) -> Graph | None:
+    producer_id = match.nodes["producer"]
+    consumer_id = match.nodes["consumer"]
     producer_node = graph.nodes[producer_id]
     consumer_node = graph.nodes[consumer_id]
 

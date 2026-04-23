@@ -16,12 +16,12 @@ from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", ElementwiseOp, "1")]
+PATTERN = [Pattern("root", ElementwiseOp)]
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     nid = match.root_node_id
     node = graph.nodes[nid]
     if not isinstance(node.op, ElementwiseOp):

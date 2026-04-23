@@ -12,9 +12,9 @@ from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import ReshapeOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.matcher import ChainMatch, Production
+from deplodock.compiler.matcher import Match, Pattern
 
-GRAMMAR = [Production("root", ReshapeOp, "1")]
+PATTERN = [Pattern("root", ReshapeOp)]
 
 
 def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
@@ -56,7 +56,7 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     return tuple(coords)
 
 
-def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | None:
     root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
     in_shape = tuple(graph.nodes[x_id].output.shape)
