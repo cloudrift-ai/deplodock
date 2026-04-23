@@ -561,7 +561,7 @@ def test_execute_loop_op_handles_nested_body():
     """Numpy interpreter should produce the same output for flat and nested forms."""
     import numpy as np
 
-    from deplodock.compiler.backend.loop.backend import execute_loop_op
+    from deplodock.compiler.ir.loop.interpret import execute_loop_op
 
     rng = np.random.default_rng(0)
     x = rng.standard_normal((4, 8)).astype(np.float32)

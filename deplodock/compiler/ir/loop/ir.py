@@ -460,7 +460,7 @@ class LoopOp(Op):
         """
         import numpy as np
 
-        from deplodock.compiler.backend.loop.backend import execute_loop_op
+        from deplodock.compiler.ir.loop.interpret import execute_loop_op
 
         out_shape = self._infer_write_shape()
         input_arrays = [np.asarray(x, dtype=np.float32) for x in inputs]
