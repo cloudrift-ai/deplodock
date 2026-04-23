@@ -38,6 +38,10 @@ class CudaBackend(Backend):
     def __init__(self, *, debug: bool | None = None, dump: CompilerDump | None = None) -> None:
         if debug is None:
             debug = os.environ.get(_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes")
+        if dump is None:
+            from deplodock.compiler.pipeline.dump import CompilerDump as _CD
+
+            dump = _CD.from_env()
         self.debug = debug
         self.dump = dump
         self.last_debug_result = None

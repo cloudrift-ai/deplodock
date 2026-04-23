@@ -92,16 +92,18 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     merged, merged_inputs = result
 
     # Compute-blowup guard: refuse merges that catastrophically duplicate work.
-    # The CUDA emitter flattens every free axis across every leaf, so a reduce
-    # Loop whose free context grows post-fusion re-runs once per new free
-    # iteration. Small growth is expected (softmax fuses three 1D-reduce
-    # passes with a 2D div → 4× for the reduce, still a win vs materialized
-    # intermediates). Large growth (e.g. up_proj + down_proj → ~1000× because
-    # the 2048-wide free axis stacks on the 5632-wide reduce) is never a win.
-    pre = _max_nest(producer_node.op) + _max_nest(consumer_node.op)
-    post = _max_nest(merged)
-    if post > _BLOWUP_FACTOR * pre:
-        return None
+    # Applies only to kernels that would lower under Strategy A (serial reduce,
+    # thread-per-output) — there the reduce body re-runs once per free-axis
+    # iteration, so growth compounds. Strategy B (smem reduce, block-per-outer)
+    # shares reduce work across threads in a block, so the same "blowup"
+    # signature is benign; skip the guard in that regime.
+    from deplodock.compiler.pipeline.passes.lowering.kernel._emit import pick_strategy
+
+    if pick_strategy(merged).kind == "A":
+        pre = _max_nest(producer_node.op) + _max_nest(consumer_node.op)
+        post = _max_nest(merged)
+        if post > _BLOWUP_FACTOR * pre:
+            return None
 
     # Wrap the merged LoopOp in the rule's output fragment, with an InputOp
     # per external slot in the order ``splice_graph`` assigned.

@@ -32,6 +32,53 @@ from deplodock.compiler.ir.kernel import (
     VectorLoad,
 )
 
+# ---------------------------------------------------------------------------
+# Backend-neutral → CUDA spelling translation tables.
+#
+# Kernel IR is backend-neutral: ``Builtin("thread_idx.x")``, ``FuncCall("rsqrt", ...)``,
+# ``ArrayDecl(storage="shared", ...)``. The CUDA emitter is the only layer that
+# knows CUDA's spellings — every other pass operates on neutral names.
+# ---------------------------------------------------------------------------
+
+_BUILTIN_TO_CUDA: dict[str, str] = {
+    "thread_idx.x": "threadIdx.x",
+    "thread_idx.y": "threadIdx.y",
+    "thread_idx.z": "threadIdx.z",
+    "block_idx.x": "blockIdx.x",
+    "block_idx.y": "blockIdx.y",
+    "block_idx.z": "blockIdx.z",
+    "block_dim.x": "blockDim.x",
+    "block_dim.y": "blockDim.y",
+    "block_dim.z": "blockDim.z",
+    "grid_dim.x": "gridDim.x",
+    "grid_dim.y": "gridDim.y",
+    "grid_dim.z": "gridDim.z",
+    "warp_size": "warpSize",
+}
+
+_INTRINSIC_TO_CUDA: dict[str, str] = {
+    "exp": "expf",
+    "rsqrt": "rsqrtf",
+    "tanh": "tanhf",
+    "fabs": "fabsf",
+    "abs": "fabsf",
+    "fmax": "fmaxf",
+    "fmin": "fminf",
+    "pow": "powf",
+    "sqrt": "sqrtf",
+}
+
+
+def _translate_builtin(name: str) -> str:
+    """Neutral builtin name → CUDA spelling. Passthrough for names already in CUDA form."""
+    return _BUILTIN_TO_CUDA.get(name, name)
+
+
+def _translate_intrinsic(name: str) -> str:
+    """Neutral intrinsic name → CUDA libm spelling. Passthrough for names already in CUDA form."""
+    return _INTRINSIC_TO_CUDA.get(name, name)
+
+
 # Operator precedence for minimal parenthesization.
 _PRECEDENCE: dict[str, int] = {
     "||": 1,
@@ -96,10 +143,10 @@ def _emit_expr(expr: GpuExpr, parent_prec: int = 0) -> str:
         idx = _emit_expr(expr.index)
         return f"{expr.array}[{idx}]"
     if isinstance(expr, Builtin):
-        return expr.name
+        return _translate_builtin(expr.name)
     if isinstance(expr, FuncCall):
         args = ", ".join(_emit_expr(a) for a in expr.args)
-        return f"{expr.name}({args})"
+        return f"{_translate_intrinsic(expr.name)}({args})"
     if isinstance(expr, Cast):
         inner = _emit_expr(expr.expr)
         return f"(({expr.dtype})({inner}))"
@@ -162,10 +209,11 @@ def _emit_stmt(stmt: Stmt, indent: int) -> str:
 
     if isinstance(stmt, ArrayDecl):
         dims = "".join(f"[{d}]" for d in stmt.dimensions)
+        storage = "__shared__ " if getattr(stmt, "storage", "local") == "shared" else ""
         if stmt.init is not None:
             init = _emit_expr(stmt.init)
-            return f"{pad}{stmt.dtype} {stmt.name}{dims} = {init};"
-        return f"{pad}{stmt.dtype} {stmt.name}{dims};"
+            return f"{pad}{storage}{stmt.dtype} {stmt.name}{dims} = {init};"
+        return f"{pad}{storage}{stmt.dtype} {stmt.name}{dims};"
 
     if isinstance(stmt, PragmaUnroll):
         if stmt.factor is not None:

@@ -236,45 +236,44 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
         if dump:
             dump.dump_input_graph(graph)
 
-        backend = CudaBackend(debug=debug or None)
-        program = backend.compile(graph)
-
-        if dump:
-            dump.dump_program(program)
+        backend = CudaBackend(debug=debug or None, dump=dump)
+        compiled = backend.compile(graph)
 
         import torch
 
         from deplodock.compiler.ir.base import ConstantOp
 
+        # Bind input/constant buffers by walking the compiled graph. Inputs come
+        # from tracer-assigned node ids; constants match against the block's
+        # named parameters using the trace's ``p_<dotted_name>`` convention.
         input_data: dict[str, list[float]] = {}
-        for buf in program.buffers:
-            if buf.role == "input":
-                if buf.name == "hidden_states":
-                    input_data[buf.name] = x.cpu().flatten().tolist()
-                elif buf.name == "position_embeddings_0":
-                    input_data[buf.name] = pos_emb[0].cpu().flatten().tolist()
-                elif buf.name == "position_embeddings_1":
-                    input_data[buf.name] = pos_emb[1].cpu().flatten().tolist()
-            elif buf.role == "constant":
-                matched = False
-                for key, param in block.named_parameters():
-                    safe_key = "p_" + key.replace(".", "_")
-                    if safe_key.endswith(buf.name[2:]) and param.numel() == buf.size:
-                        input_data[buf.name] = param.detach().cpu().flatten().tolist()
-                        matched = True
-                        break
-                if not matched and buf.name in program.constant_values:
-                    input_data[buf.name] = [program.constant_values[buf.name]]
+        input_ids = set(compiled.inputs)
+        bindings = {
+            "hidden_states": x.cpu().flatten().tolist(),
+            "position_embeddings_0": pos_emb[0].cpu().flatten().tolist(),
+            "position_embeddings_1": pos_emb[1].cpu().flatten().tolist(),
+        }
+        for nid, node in compiled.nodes.items():
+            if nid in input_ids and nid in bindings:
+                input_data[nid] = bindings[nid]
+                continue
+            if not isinstance(node.op, ConstantOp):
+                continue
+            size = 1
+            for d in node.output.shape:
+                size *= int(d)
+            matched = False
+            for key, param in block.named_parameters():
+                safe_key = "p_" + key.replace(".", "_")
+                if safe_key.endswith(nid[2:]) and param.numel() == size:
+                    input_data[nid] = param.detach().cpu().flatten().tolist()
                     matched = True
-                if not matched and buf.size == 1:
-                    for nid, node in graph.nodes.items():
-                        if isinstance(node.op, ConstantOp) and node.op.value is not None:
-                            if buf.name == nid or buf.name.endswith(nid):
-                                input_data[buf.name] = [node.op.value]
-                                break
+                    break
+            if not matched and node.op.value is not None:
+                input_data[nid] = [node.op.value]
 
         # Run with actual data.
-        run_result = backend.run(program, input_data=input_data)
+        run_result = backend.run(compiled, input_data=input_data)
         if dump and backend.last_debug_result is not None:
             dump.dump_per_launch_values(backend.last_debug_result.per_launch)
 
@@ -314,7 +313,7 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
                     "PASS" if max_diff < 1.0 else "FAIL",
                 )
 
-        result = backend.benchmark(program, warmup=3, num_iters=10)
+        result = backend.benchmark(compiled, warmup=3, num_iters=10)
         return result.time_ms * 1000  # ms → us
     except Exception as e:
         logger.warning("Deplodock pipeline failed: %s", e)
