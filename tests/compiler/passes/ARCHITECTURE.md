@@ -18,7 +18,7 @@ scale constant, incorrect coordinate mapping, etc.
 ## File Layout
 
 ```
-tests/compiler/passes/
+tests/compiler/pipeline/passes/
 ├── test_decompose_rules.py      # decomposition rules (structural + correctness)
 ├── test_optimization_rules.py   # optimization rules (structural + correctness)
 └── test_fusion_rules.py         # fusion rules (structural only — LoopOp not numpy-executable)

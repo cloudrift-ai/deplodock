@@ -12,7 +12,7 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, RunResult
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.graph import Graph
+from deplodock.compiler.pipeline.graph import Graph
 
 
 class NumpyBackend(Backend):

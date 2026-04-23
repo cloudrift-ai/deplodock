@@ -25,8 +25,8 @@ from deplodock.compiler.ir.frontend.ir import (
     TransposeOp,
     UnsqueezeOp,
 )
-from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
+from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 if TYPE_CHECKING:
     import torch

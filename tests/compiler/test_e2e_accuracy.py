@@ -9,8 +9,8 @@ torch dependency.
 import numpy as np
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 
 def _assert_close(actual, expected, *, rtol: float = 1e-4, atol: float = 1e-5):

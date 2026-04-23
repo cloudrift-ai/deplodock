@@ -14,8 +14,8 @@ have shape equal to its output.
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import Literal, placeholder
-from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
+from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 
 def broadcast_to(graph: Graph, node_id: str, target_shape: tuple) -> str:

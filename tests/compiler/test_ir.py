@@ -3,8 +3,8 @@
 import pytest
 
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 # ---- helpers ----
 

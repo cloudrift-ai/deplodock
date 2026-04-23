@@ -23,7 +23,7 @@ invariants.
 """
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
-from deplodock.compiler.ir.graph import Graph, Hints, Node, Tensor, resolve_hints
+from deplodock.compiler.pipeline.graph import Graph, Hints, Node, Tensor, resolve_hints
 
 __all__ = [
     "ConstantOp",
