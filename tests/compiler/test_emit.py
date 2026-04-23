@@ -10,15 +10,15 @@ from __future__ import annotations
 import pytest
 
 from deplodock.compiler.backend.cuda.backend import CudaBackend
-from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp  # noqa: F401
 
 requires_cuda = pytest.mark.skipif(
-    not has_nvcc() or not has_cuda_gpu(),
-    reason="CUDA not available (need nvcc + GPU)",
+    not has_cuda_gpu(),
+    reason="CUDA not available (need cupy + GPU)",
 )
 
 

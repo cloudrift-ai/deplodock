@@ -15,10 +15,10 @@ import pytest
 
 
 def _skip_if_no_cuda() -> None:
-    from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu, has_nvcc
+    from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
 
-    if not (has_nvcc() and has_cuda_gpu()):
-        pytest.skip("CUDA not available (need nvcc + GPU)")
+    if not has_cuda_gpu():
+        pytest.skip("CUDA not available (need cupy + GPU)")
 
 
 @pytest.fixture(params=["numpy", "loop", "cuda"])

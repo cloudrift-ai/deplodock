@@ -21,23 +21,16 @@ class NumpyBackend(Backend):
     Inherits the default wall-time ``benchmark`` from ``Backend``.
     """
 
-    def compile(self, graph: Graph) -> NumpyProgram:
-        """Wrap the graph for execution. Input data is supplied at run time."""
-        return NumpyProgram(graph=graph)
+    def compile(self, graph: Graph) -> Graph:
+        """Graph is its own compiled artifact; input data is supplied at run time."""
+        return graph
 
-    def run(self, compiled: NumpyProgram, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
+    def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         """Execute the graph and return outputs as numpy arrays."""
         t0 = time.perf_counter()
-        arrays = _execute(compiled.graph, input_data or {})
+        arrays = _execute(compiled, input_data or {})
         elapsed = (time.perf_counter() - t0) * 1000
         return RunResult(outputs=arrays, time_ms=elapsed)
-
-
-class NumpyProgram:
-    """Compiled-numpy artifact: just the graph."""
-
-    def __init__(self, graph: Graph) -> None:
-        self.graph = graph
 
 
 def _execute(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

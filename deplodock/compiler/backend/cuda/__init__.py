@@ -1,6 +1,6 @@
 """CUDA backend: codegen, lowering, and kernel execution."""
 
-from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
 from deplodock.compiler.ir.kernel import (
     ArrayAccess,
     Assign,
@@ -38,5 +38,4 @@ __all__ = [
     "emit_kernel",
     "emit_kernel_source",
     "has_cuda_gpu",
-    "has_nvcc",
 ]
