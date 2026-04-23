@@ -46,13 +46,13 @@
 │                                                                                                                      │
 │  Lowering passes (backend/cuda path):                                                                                │
 │    passes/lowering/kernel/lower_loopop.py   — LoopOp  → KernelOp  (uses backend/cuda/emit)                           │
-│    passes/lowering/cuda/lower_kernelop.py   — KernelOp → CudaOp   (uses backend/kernel_codegen)                      │
+│    passes/lowering/cuda/lower_kernelop.py   — KernelOp → CudaOp   (uses ir/cuda/emit)                      │
 │                                                                                                                      │
 │  Codegen internals (CUDA):                                                                                           │
 │    ir/kernel/ir.py:           GpuKernel (AST) + KernelOp (graph-op wrapping GpuKernel + launch geometry)             │
 │    ir/kernel/emit.py:         per-node codegen: LoopOp → GpuKernel (emit_kernel, launch_config)                      │
 │    ir/cuda/ir.py:             CudaOp   (graph-op with rendered CUDA source)                                          │
-│    backend/kernel_codegen.py: GpuKernel → C source                                                                   │
+│    ir/cuda/emit.py: GpuKernel → C source                                                                   │
 │    backend/cuda/emit.py:      per-kernel LoopOp → GpuKernel helpers                                                  │
 │    backend/cuda/program.py:   generate_source(Graph), nvcc compile + run                                             │
 │    backend/cuda/runner.py:    single-kernel compile + run harness                                                    │

@@ -303,4 +303,4 @@ Backends walk the graph directly — the loop backend dispatches on
   lowering passes that transform one IR stage into the next.
 - ``compiler/backend/cuda/emit.py`` — per-kernel LoopOp → GpuKernel helpers
   used by ``passes/lowering/kernel``.
-- ``compiler/backend/kernel_codegen.py`` — GpuKernel → C source.
+- ``compiler/ir/cuda/emit.py`` — GpuKernel → C source.

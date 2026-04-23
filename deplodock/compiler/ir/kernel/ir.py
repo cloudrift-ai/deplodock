@@ -3,7 +3,7 @@
 The last IR before textual C/C++ source. Nodes represent generic C/C++
 constructs (variables, loops, array accesses, function calls) that can be
 emitted as CUDA, HIP, or any C-like GPU language by a matching codegen
-printer (see ``backend/kernel_codegen.py``).
+printer (see ``ir/cuda/emit.py``).
 
 Builds on the shared expression AST from ``ir.expr``; adds GPU-specific
 expression nodes (``ArrayAccess``, ``Cast``, ``FieldAccess``, ``VectorLoad``)

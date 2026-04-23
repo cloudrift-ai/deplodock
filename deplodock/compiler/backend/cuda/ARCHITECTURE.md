@@ -32,7 +32,7 @@ Shared infrastructure (backend-agnostic) lives at the IR layer:
 compiler/ir/kernel/ir.py   # GpuKernel, GpuKernelParam, Stmt hierarchy, expressions, KernelOp graph-op
 compiler/ir/kernel/emit.py # per-node LoopOp → GpuKernel codegen (emit_kernel, launch_config)
 compiler/ir/cuda/ir.py     # CudaOp   (graph-op with rendered CUDA source)
-backend/kernel_codegen.py  # GpuKernel → C source (one level up; not CUDA-specific)
+ir/cuda/emit.py  # GpuKernel → C source (one level up; not CUDA-specific)
 ```
 
 ## Emission Pipeline
@@ -140,7 +140,7 @@ vectorization.
 - `emit.py` must stay pure codegen — it imports from `ir/` and returns
   `GpuKernel`; it must not import from the runtime / passes layer.
 - A new backend (ROCm, SYCL, ...) reuses `ir/kernel/`, `ir/cuda/`,
-  and `backend/kernel_codegen.py` wholesale; only its own
+  and `ir/cuda/emit.py` wholesale; only its own
   `emit.py` / `program.py` / lowering pass need to be rewritten.
 - The loop-IR types (`LoopOp`, `Load`, `Assign`, `Accum`, `Write`,
   `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT import
