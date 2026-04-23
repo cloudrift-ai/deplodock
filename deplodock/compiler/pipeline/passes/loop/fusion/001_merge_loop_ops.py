@@ -25,36 +25,63 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Loop, LoopOp, Stmt, splice_graph
+from deplodock.compiler.ir.loop import Accum, Assign, Loop, LoopOp, Stmt, iter_body, splice_graph
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 _BLOWUP_FACTOR = 8
 
 
 def _max_nest(loop_op: LoopOp) -> int:
-    """Maximum per-leaf compute cost (``free_prod × reduce_prod``) over the body tree."""
+    """Maximum per-leaf compute cost (``free_prod × reduce_prod``) over the body tree.
+
+    Both ``free_prod`` and ``reduce_prod`` accumulate from the *actually*
+    enclosing Loops at each leaf — sequential (sibling) free axes on
+    either side of a reduce do not pile onto its leaf cost.
+    """
     reduce_names = loop_op.reduce_axis_names
-    free_prod = 1
-    for a in loop_op.axes:
-        if a.name not in reduce_names:
-            free_prod *= int(a.extent)
+    best = 1
 
-    best = free_prod
-
-    def walk(stmts: tuple[Stmt, ...], reduce_prod: int) -> None:
+    def walk(stmts: tuple[Stmt, ...], free_prod: int, reduce_prod: int) -> None:
         nonlocal best
         for s in stmts:
             if isinstance(s, Loop):
                 extent = int(s.axis.extent)
-                new_reduce = reduce_prod * extent if s.axis.name in reduce_names else reduce_prod
-                walk(s.body, new_reduce)
+                if s.axis.name in reduce_names:
+                    walk(s.body, free_prod, reduce_prod * extent)
+                else:
+                    walk(s.body, free_prod * extent, reduce_prod)
             else:
                 cost = free_prod * reduce_prod
                 if cost > best:
                     best = cost
 
-    walk(loop_op.body, 1)
+    walk(loop_op.body, 1, 1)
     return best
+
+
+def _is_pure_indexmap(loop_op: LoopOp) -> bool:
+    """Body contains only Loops / Loads / Writes — no compute (Assign) or Accum.
+
+    Such a kernel is an ``IndexMapOp`` lifted into Loop IR: broadcast,
+    transpose, reshape, slice. Its content is pure coord rewriting +
+    copying. Fusing a non-indexmap producer (one with real compute)
+    *into* such a consumer forces the producer's body to land inside
+    the indexmap's iteration space — materializing any broadcast the
+    indexmap was expressing lazily.
+    """
+    for s in iter_body(loop_op.body):
+        if isinstance(s, (Assign, Accum)):
+            return False
+    return True
+
+
+def _output_numel(loop_op: LoopOp) -> int:
+    reduce_names = loop_op.reduce_axis_names
+    n = 1
+    for a in loop_op.axes:
+        if a.name not in reduce_names:
+            n *= int(a.extent)
+    return n
 
 
 PATTERN = [
@@ -100,6 +127,18 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     pre = _max_nest(producer_node.op) + _max_nest(consumer_node.op)
     post = _max_nest(merged)
     if post > _BLOWUP_FACTOR * pre:
+        return None
+
+    # Broadcast-materialization guard: fusing a compute-bearing producer into
+    # a pure-indexmap consumer whose output volume exceeds the producer's
+    # replicates the producer's body across the extra axes (the indexmap's
+    # broadcast stops being lazy). Skip — the indexmap can still fuse the
+    # *other* way, into its downstream consumer.
+    if (
+        _is_pure_indexmap(consumer_node.op)
+        and not _is_pure_indexmap(producer_node.op)
+        and _output_numel(consumer_node.op) > _output_numel(producer_node.op)
+    ):
         return None
 
     # Wrap the merged LoopOp in the rule's output fragment, with an InputOp
