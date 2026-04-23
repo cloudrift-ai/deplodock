@@ -1,4 +1,4 @@
-"""End-to-end pipeline tests: Graph → compile_graph → CudaBackend → GPU."""
+"""End-to-end pipeline tests: Graph → run_pipeline → CudaBackend → GPU."""
 
 from __future__ import annotations
 
@@ -11,7 +11,14 @@ from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Accum, LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import compile_graph
+from deplodock.compiler.pipeline import run_pipeline
+
+_FUSE_PASSES = ["decomposition", "optimization", "fusion"]
+
+
+def _compile(graph: Graph) -> Graph:
+    return run_pipeline(graph, _FUSE_PASSES)
+
 
 requires_cuda = pytest.mark.skipif(
     not has_cuda_gpu(),
@@ -45,15 +52,15 @@ def _loop_nodes(graph: Graph) -> list:
     return [n for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
 
 
-def test_compile_graph_fuses_matmul():
-    fused = compile_graph(_matmul_graph(4, 3, 2))
+def test_compile_fuses_matmul():
+    fused = _compile(_matmul_graph(4, 3, 2))
     matmul_loops = [n for n in _loop_nodes(fused) if any(isinstance(s, Accum) for s in n.op)]
     assert len(matmul_loops) == 1
 
 
-def test_compile_graph_fuses_chain():
+def test_compile_fuses_chain():
     """neg → exp fuses into one kernel (fan-out 1 chain)."""
-    fused = compile_graph(_pointwise_chain_graph())
+    fused = _compile(_pointwise_chain_graph())
     assert len(_loop_nodes(fused)) == 1
 
 
@@ -66,9 +73,9 @@ def test_pipeline_to_program():
 
 
 def test_compile_result_metadata():
-    """compile_graph returns a fused Graph with the original inputs/outputs."""
+    """_compile returns a fused Graph with the original inputs/outputs."""
     g = _pointwise_chain_graph()
-    fused = compile_graph(g)
+    fused = _compile(g)
     assert isinstance(fused, Graph)
     assert fused.inputs == ["x"]
     assert len(fused.outputs) == 1

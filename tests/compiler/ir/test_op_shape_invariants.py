@@ -46,7 +46,7 @@ def test_reduce_output_is_keepdim(fn, input_shape, axis, expected):
 
 
 def test_decomposition_emits_broadcast_explicit_elementwise():
-    """After ``compile_graph`` runs decomposition, every ElementwiseOp in the
+    """After the compile pipeline runs decomposition, every ElementwiseOp in the
     fused graph must have all inputs at the op's declared output shape.
     Catches new decomposition rules that forget to call broadcast_to.
     """

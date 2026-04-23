@@ -18,17 +18,20 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, LoopOp, Select, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import compile_graph
+from deplodock.compiler.pipeline import run_pipeline
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.graph import Graph
+
+
+_PASSES = ["decomposition", "optimization", "fusion"]
 
 
 class LoopBackend(Backend):
     """Execute a fused ``Graph[LoopOp]`` via numpy whole-tensor operations."""
 
     def compile(self, graph: Graph) -> Graph:
-        return compile_graph(graph)
+        return run_pipeline(graph, _PASSES)
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         t0 = time.perf_counter()

@@ -7,21 +7,20 @@ node carries a rendered CUDA kernel source plus its launch geometry.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import benchmark_program, run_program, run_program_debug
-from deplodock.compiler.pipeline import compile_graph
-from deplodock.compiler.rewriter import run_pass
-
-_PASSES_DIR = Path(__file__).parent.parent.parent / "passes"
+from deplodock.compiler.pipeline import run_pipeline
 
 if TYPE_CHECKING:
     from deplodock.compiler.dump import CompilerDump
     from deplodock.compiler.ir.graph import Graph
+
+
+_PASSES = ["decomposition", "optimization", "fusion", "lowering/kernel", "lowering/cuda"]
 
 
 _DEBUG_ENV = "DEPLODOCK_DEBUG"
@@ -45,14 +44,7 @@ class CudaBackend(Backend):
 
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[KernelOp]`` → ``Graph[CudaOp]``."""
-        graph = compile_graph(graph, dump=self.dump)
-        graph = run_pass(graph, _PASSES_DIR / "lowering/kernel")
-        if self.dump is not None:
-            self.dump.on_pass("lowering/kernel", graph)
-        graph = run_pass(graph, _PASSES_DIR / "lowering/cuda")
-        if self.dump is not None:
-            self.dump.on_pass("lowering/cuda", graph)
-        return graph
+        return run_pipeline(graph, _PASSES, dump=self.dump)
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         if self.debug:
