@@ -15,6 +15,14 @@ def test_compile_code_tensor_ir(run_cli):
     assert "sum(" in stdout
 
 
+def test_compile_code_loop_ir(run_cli):
+    rc, stdout, stderr = run_cli("compile", "--code", "torch.nn.ReLU()(torch.randn(8))", "--ir", "loop")
+    assert rc == 0, f"stderr: {stderr}"
+    assert "=== loop" in stdout
+    assert "load " in stdout
+    assert " = relu(" in stdout
+
+
 def test_compile_no_input_errors(run_cli):
     rc, stdout, stderr = run_cli("compile")
     assert rc != 0
