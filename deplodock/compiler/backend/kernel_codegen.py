@@ -1,12 +1,12 @@
 """Kernel IR to C source code generation.
 
-Backend-agnostic printer: walks the AST from ``compiler/ir/kernel.py`` and
+Backend-agnostic printer: walks the AST from ``compiler/ir/kernel/ir.py`` and
 emits C/C++ text. Usable for both CUDA and HIP targets.
 """
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.kernel_ir import (
+from deplodock.compiler.ir.kernel import (
     ArrayAccess,
     ArrayDecl,
     Assign,

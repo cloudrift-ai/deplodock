@@ -74,23 +74,35 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     graph = trace_module(block.cpu(), (x,), kwargs={"position_embeddings": (cos, sin)})
     compiled = backend.compile(graph)
 
+    from deplodock.compiler.ir.base import ConstantOp
+
+    input_set = set(compiled.inputs)
+
+    def _numel(shape):
+        n = 1
+        for d in shape:
+            n *= int(d)
+        return n
+
     input_data: dict[str, np.ndarray] = {}
-    for buf in compiled.buffers:
-        if buf.role == "input":
-            if buf.name == "hidden_states":
-                input_data[buf.name] = x.numpy()
-            elif buf.name == "position_embeddings_0":
-                input_data[buf.name] = cos.numpy()
-            elif buf.name == "position_embeddings_1":
-                input_data[buf.name] = sin.numpy()
-        elif buf.role == "constant":
+    for nid in compiled.nodes:
+        node = compiled.nodes[nid]
+        if nid in input_set:
+            if nid == "hidden_states":
+                input_data[nid] = x.numpy()
+            elif nid == "position_embeddings_0":
+                input_data[nid] = cos.numpy()
+            elif nid == "position_embeddings_1":
+                input_data[nid] = sin.numpy()
+        elif isinstance(node.op, ConstantOp):
+            size = _numel(node.output.shape)
             for key, param in block.named_parameters():
                 safe_key = "p_" + key.replace(".", "_")
-                if safe_key.endswith(buf.name[2:]) and param.numel() == buf.size:
-                    input_data[buf.name] = param.detach().cpu().numpy()
+                if safe_key.endswith(nid[2:]) and param.numel() == size:
+                    input_data[nid] = param.detach().cpu().numpy()
                     break
-            if buf.name not in input_data and buf.name in compiled.constant_values:
-                input_data[buf.name] = np.array([compiled.constant_values[buf.name]], dtype=np.float32)
+            if nid not in input_data and node.op.value is not None:
+                input_data[nid] = np.array([node.op.value], dtype=np.float32)
 
     run_result = backend.run(compiled, input_data=input_data)
     deplodock_flat = list(run_result.outputs.values())[0].flatten().tolist()

@@ -17,11 +17,8 @@ logger = logging.getLogger(__name__)
 _IR_STAGE_FILES = {
     "torch": "00_input_graph.txt",
     "tensor": "10_tensor_ir.txt",
-    "loop": "37_loop_kernels.txt",
-    "loop-program": "38_loop_program.txt",
     "kernel": "39_kernel_ir.txt",
     "cuda": "40_kernels.cu",
-    "cuda-program": "40_program.txt",
 }
 
 
@@ -29,7 +26,8 @@ def register_compile_command(subparsers):
     parser = subparsers.add_parser("compile", help="Compile a model or IR through structural lowering")
     parser.add_argument("input", nargs="?", help="HuggingFace model ID or .json IR file. Mutually exclusive with --code.")
     parser.add_argument(
-        "--code", "-c",
+        "--code",
+        "-c",
         help=(
             "Inline Python expression whose last statement is a call, "
             'e.g. --code "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))". '
@@ -82,17 +80,14 @@ def handle_compile(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    program = compile_graph(graph, dump=dump)
+    fused = compile_graph(graph, dump=dump)
 
-    logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, len(program.launches))
+    n_compute = sum(1 for n in fused.nodes.values() if not _is_boundary(n.op))
+    logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
 
-    # Graph → JSON round-trip isn't implemented for IndexSource / Expr /
-    # Loop IR body types; write the LoopProgram's human-readable form
-    # instead. To round-trip the IR, use ``--dump-dir`` or re-trace from
-    # the model id via ``deplodock run <model_id> "<prompt>"``.
-    output_path = Path(args.output) if args.output else Path(f"{base_name}.loop-program.txt")
-    output_path.write_text(program.pretty_print())
-    logger.info("Saved LoopProgram: %s", output_path)
+    output_path = Path(args.output) if args.output else Path(f"{base_name}.fused.txt")
+    output_path.write_text(fused.pretty_print())
+    logger.info("Saved fused graph: %s", output_path)
 
 
 def _handle_compile_inspect(args):
@@ -111,8 +106,8 @@ def _handle_compile_inspect(args):
         dump.dump_input_graph(graph)
 
         if stage == "torch":
-            pass  # dump_input_graph above already wrote the needed files
-        elif stage in ("tensor", "loop", "loop-program"):
+            pass
+        elif stage == "tensor":
             compile_graph(graph, dump=dump)
         else:
             CudaBackend(dump=dump).compile(graph)
@@ -125,6 +120,12 @@ def _handle_compile_inspect(args):
         sys.stdout.write(content)
         if not content.endswith("\n"):
             sys.stdout.write("\n")
+
+
+def _is_boundary(op) -> bool:
+    from deplodock.compiler.ir.base import ConstantOp, InputOp
+
+    return isinstance(op, (InputOp, ConstantOp))
 
 
 def _load_or_trace(args) -> tuple[Graph, str]:

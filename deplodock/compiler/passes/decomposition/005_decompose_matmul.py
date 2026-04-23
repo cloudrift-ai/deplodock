@@ -13,7 +13,7 @@ from deplodock.compiler.ir.frontend_ir import MatmulOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
-from deplodock.compiler.rules.decomposition._matmul_helpers import matmul_unsqueeze
+from deplodock.compiler.passes.decomposition._matmul_helpers import matmul_unsqueeze
 
 GRAMMAR = [Production("root", MatmulOp, "1")]
 

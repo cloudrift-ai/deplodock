@@ -1,9 +1,7 @@
 """CUDA backend: codegen, lowering, and kernel execution."""
 
-from deplodock.compiler.backend.cuda.emit import compile_kernels, emit_kernel
 from deplodock.compiler.backend.cuda.runner import KernelResult, has_cuda_gpu, has_nvcc, run_kernel
-from deplodock.compiler.backend.kernel_codegen import emit_kernel as emit_kernel_source
-from deplodock.compiler.ir.kernel_ir import (
+from deplodock.compiler.ir.kernel import (
     ArrayAccess,
     Assign,
     AugAssign,
@@ -18,6 +16,8 @@ from deplodock.compiler.ir.kernel_ir import (
     SyncThreads,
     Var,
     VarDecl,
+    emit_kernel,
+    emit_kernel_source,
 )
 
 __all__ = [
@@ -36,7 +36,6 @@ __all__ = [
     "SyncThreads",
     "Var",
     "VarDecl",
-    "compile_kernels",
     "emit_kernel",
     "emit_kernel_source",
     "has_cuda_gpu",

@@ -66,7 +66,10 @@ def _handle_run_ir(args):
     backend = CudaBackend(debug=args.debug or None, dump=dump)
     compiled = backend.compile(graph)
 
-    logger.info("Compiled %s: %d kernels", ir_path.name, len(compiled.launches))
+    from deplodock.compiler.ir.cuda import CudaOp
+
+    n_kernels = sum(1 for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
+    logger.info("Compiled %s: %d kernels", ir_path.name, n_kernels)
 
     if args.benchmark:
         result = backend.benchmark(compiled, num_iters=args.iters)
@@ -126,14 +129,17 @@ def _handle_run_model(args):
     logger.info("Compiling (%d nodes)...", len(graph.nodes))
     backend = CudaBackend(debug=args.debug or None, dump=dump)
     program = backend.compile(graph)
-    logger.info("Compiled: %d launches, %d buffers", len(program.launches), len(program.buffers))
 
-    output_buffers = [b for b in program.buffers if b.role == "output"]
-    if len(output_buffers) != 1:
-        logger.error("expected exactly one output buffer, got %d", len(output_buffers))
+    from deplodock.compiler.ir.cuda import CudaOp
+
+    n_launches = sum(1 for n in program.nodes.values() if isinstance(n.op, CudaOp))
+    logger.info("Compiled: %d launches, %d buffers", n_launches, len(program.nodes))
+
+    if len(program.outputs) != 1:
+        logger.error("expected exactly one output buffer, got %d", len(program.outputs))
         sys.exit(1)
-    output_name = output_buffers[0].name
-    logger.info("Logits buffer: %s (%s)", output_name, output_buffers[0].shape)
+    output_name = program.outputs[0]
+    logger.info("Logits buffer: %s (%s)", output_name, program.nodes[output_name].output.shape)
 
     # One-time constant feed (parameters + buffers).
     const_feed = collect_const_feed(wrapper, const_targets)

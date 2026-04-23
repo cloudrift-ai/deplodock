@@ -4,7 +4,7 @@ Backend-agnostic expression sublanguage used by:
 
 - ``IndexMapOp.coord_map`` (``ir.tensor_ir``): affine output→input coord maps.
 - ``Mux.select`` / ``MuxBranch.select`` (``ir.loop``): coord predicates.
-- GPU IR (``ir.kernel_ir``): array indices, loop bounds, ternary selects.
+- GPU IR (``ir.kernel``): array indices, loop bounds, ternary selects.
 
 The ``_ExprOps`` mixin adds Python operator overloading so expressions can be
 built as arithmetic (``Var("i") * 4 + Var("j")``) and comparisons
@@ -279,7 +279,7 @@ def render(expr: Expr, formatter: Callable[[object], str | None] | None = None) 
 
     ``formatter``: optional hook, called with each node before the default
     dispatch. Return a string to override rendering; return ``None`` to fall
-    through to the default. Lets extensions (e.g. ``ir.kernel_ir``'s GPU-specific
+    through to the default. Lets extensions (e.g. ``ir.kernel``'s GPU-specific
     node types plus no-paren C-style formatting) reuse this dispatch while
     overriding select nodes. The hook must recurse back through ``render``
     (passing itself) to preserve the override for nested nodes.

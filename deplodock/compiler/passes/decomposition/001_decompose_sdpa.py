@@ -84,7 +84,7 @@ def rewrite(graph: Graph, match: ChainMatch) -> Graph | None:
             )
 
     # QK^T: matmul(Q, K^T) — unsqueeze for broadcast-compatible mul + reduce.
-    from deplodock.compiler.rules.decomposition._matmul_helpers import matmul_unsqueeze
+    from deplodock.compiler.passes.decomposition._matmul_helpers import matmul_unsqueeze
 
     q_eff_shape = tuple(graph.nodes[q_id].output.shape)
     kt_eff_shape = tuple(frag.nodes[kt_id].output.shape)

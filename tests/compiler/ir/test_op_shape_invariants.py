@@ -55,7 +55,7 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
     from deplodock.compiler.rewriter import Rewriter
     from deplodock.compiler.torch_trace import trace_module
 
-    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules"
+    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes"
 
     # Exercise each decomp rule: RMSNorm hits decompose_rms_norm + decompose_mean.
     # Softmax hits decompose_softmax. Linear(x) hits decompose_linear +

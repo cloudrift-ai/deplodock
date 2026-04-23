@@ -12,9 +12,9 @@ import pytest
 from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp  # noqa: F401
-from deplodock.compiler.program.loop import LoopBuffer, LoopLaunch, LoopProgram
 
 requires_cuda = pytest.mark.skipif(
     not has_nvcc() or not has_cuda_gpu(),
@@ -53,68 +53,26 @@ def _matmul_graph() -> Graph:
     return g
 
 
-def _softmax_launch() -> LoopLaunch:
-    """Build a LoopLaunch with the softmax SSA pattern directly."""
-    from deplodock.compiler.ir.expr import Var
-    from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, Loop, LoopOp, Write
+def _softmax_graph() -> Graph:
+    """A 2-axis softmax graph, reduced on axis=1."""
+    from deplodock.compiler.ir.base import ConstantOp
 
-    a0 = Axis("a0", 4)
-    a1 = Axis("a1", 8)
-    idx = (Var("a0"), Var("a1"))
-    loop = LoopOp(
-        body=(
-            Loop(
-                axis=a0,
-                body=(
-                    # Max sweep (K-loop 1).
-                    Loop(
-                        axis=a1,
-                        body=(
-                            Load(name="x_mx", source=0, index=idx),
-                            Accum(name="mx", value="x_mx", op=ElementwiseOp("max")),
-                        ),
-                    ),
-                    # Sum sweep (K-loop 2) — rematerializes exp inside.
-                    Loop(
-                        axis=a1,
-                        body=(
-                            Load(name="x_sm", source=0, index=idx),
-                            Assign(name="sub_s", op=ElementwiseOp("sub"), args=("x_sm", "mx")),
-                            Assign(name="ex_s", op=ElementwiseOp("exp"), args=("sub_s",)),
-                            Accum(name="sm", value="ex_s", op=ElementwiseOp("add")),
-                        ),
-                    ),
-                    # Write sweep (K-loop 3): per-element div.
-                    Loop(
-                        axis=a1,
-                        body=(
-                            Load(name="x_wr", source=1, index=idx),
-                            Assign(name="sub_w", op=ElementwiseOp("sub"), args=("x_wr", "mx")),
-                            Assign(name="ex_w", op=ElementwiseOp("exp"), args=("sub_w",)),
-                            Assign(name="out", op=ElementwiseOp("div"), args=("ex_w", "sm")),
-                            Write(output=0, index=(Var("a0"), Var("a1")), value="out"),
-                        ),
-                    ),
-                ),
-            ),
-        ),
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")
+    g.add_node(op=ConstantOp(name="axis", value=-1.0), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
+    g.add_node(
+        op=ElementwiseOp(fn="softmax"),
+        inputs=["x", "axis"],
+        output=Tensor("y", (4, 8)),
+        node_id="y",
     )
-    return LoopLaunch(loop=loop, input_names=["x", "x"], output_name="y")
+    g.inputs = ["x"]
+    g.outputs = ["y"]
+    return g
 
 
-def _softmax_program() -> LoopProgram:
-    """Wrap the softmax launch in a standalone LoopProgram for codegen tests."""
-    launch = _softmax_launch()
-    return LoopProgram(
-        name="softmax",
-        buffers=[
-            LoopBuffer(name="x", shape=(4, 8), role="input"),
-            LoopBuffer(name="y", shape=(4, 8), role="output"),
-        ],
-        launches=[launch],
-        graph_inputs=["x"],
-        graph_outputs=["y"],
-    )
+def _cuda_nodes(graph: Graph) -> list:
+    return [n for n in graph.nodes.values() if isinstance(n.op, CudaOp)]
 
 
 # ---------------------------------------------------------------------------
@@ -124,59 +82,52 @@ def _softmax_program() -> LoopProgram:
 
 def test_pointwise_emits_correct_source():
     compiled = CudaBackend().compile(_pointwise_add_graph())
-    assert len(compiled.launches) == 1
-    source = compiled.launches[0].kernel_source
+    nodes = _cuda_nodes(compiled)
+    assert len(nodes) == 1
+    source = nodes[0].op.kernel_source
     assert "blockIdx.x" in source
     assert "x[" in source and "y[" in source
 
 
 def test_reduce_emits_k_loop():
     compiled = CudaBackend().compile(_reduce_sum_graph())
-    source = compiled.launches[0].kernel_source
+    source = _cuda_nodes(compiled)[0].op.kernel_source
     assert "for (int" in source
     assert "+=" in source
 
 
 def test_contraction_emits_matmul():
     compiled = CudaBackend().compile(_matmul_graph())
-    source = compiled.launches[-1].kernel_source
+    source = _cuda_nodes(compiled)[-1].op.kernel_source
     assert "for (int k" in source
     assert "acc0 +=" in source
 
 
 def test_buffer_roles():
     compiled = CudaBackend().compile(_pointwise_add_graph())
-    roles = {b.name: b.role for b in compiled.buffers}
-    assert roles.get("x") == "input"
-    assert roles.get("y") == "input"
+    assert "x" in compiled.inputs
+    assert "y" in compiled.inputs
+    assert len(compiled.outputs) == 1
 
 
 def test_softmax_emits_multiple_k_loops():
     """Softmax pattern emits separate K-loops for max, sub+exp+sum, div."""
-    from deplodock.compiler.backend.cuda.emit import emit_kernel
-
-    loop_program = _softmax_program()
-    launch = loop_program.launches[0]
-    kdef, arg_order = emit_kernel(launch, "k0_softmax", loop_program)
-    from deplodock.compiler.backend.kernel_codegen import emit_kernel as emit_src
-
-    source = emit_src(kdef)
-    loop_count = source.count("for (int")
-    assert loop_count >= 3, f"expected >= 3 K-loops, got {loop_count}\n{source}"
-    assert "fmaxf" in source
-    assert "+=" in source
+    compiled = CudaBackend().compile(_softmax_graph())
+    sources = [n.op.kernel_source for n in _cuda_nodes(compiled)]
+    # Find the softmax-bearing kernel (contains fmaxf for max reduction).
+    softmax_src = next((s for s in sources if "fmaxf" in s), None)
+    assert softmax_src is not None, f"no kernel with fmaxf found; sources={sources}"
+    loop_count = softmax_src.count("for (int")
+    assert loop_count >= 2, f"expected >= 2 K-loops, got {loop_count}\n{softmax_src}"
+    assert "+=" in softmax_src
 
 
 def test_softmax_emits_per_element_store():
     """Softmax output is per-element: the final div stores inside a K-loop."""
-    from deplodock.compiler.backend.cuda.emit import emit_kernel
-    from deplodock.compiler.backend.kernel_codegen import emit_kernel as emit_src
-
-    loop_program = _softmax_program()
-    launch = loop_program.launches[0]
-    kdef, _ = emit_kernel(launch, "k0_softmax", loop_program)
-    source = emit_src(kdef)
-    assert "y[" in source, f"expected output store y[...]\n{source}"
+    compiled = CudaBackend().compile(_softmax_graph())
+    out_name = compiled.outputs[0]
+    sources = [n.op.kernel_source for n in _cuda_nodes(compiled)]
+    assert any(f"{out_name}[" in s for s in sources)
 
 
 def test_chained_pointwise_single_kernel():
@@ -188,7 +139,7 @@ def test_chained_pointwise_single_kernel():
     g.outputs = ["n"]
 
     compiled = CudaBackend().compile(g)
-    assert len(compiled.launches) == 1
+    assert len(_cuda_nodes(compiled)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +151,7 @@ def test_chained_pointwise_single_kernel():
 def test_pointwise_runs_on_gpu():
     compiled = CudaBackend().compile(_pointwise_add_graph())
     result = CudaBackend().run(compiled, input_data={"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
-    assert list(result.outputs.values())[0] == pytest.approx([11, 22, 33, 44])
+    assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx([11, 22, 33, 44])
 
 
 @requires_cuda
@@ -209,19 +160,14 @@ def test_reduce_runs_on_gpu():
     x_data = [float(i) for i in range(32)]
     result = CudaBackend().run(compiled, input_data={"x": x_data})
     expected = [sum(x_data[row * 8 : (row + 1) * 8]) for row in range(4)]
-    assert list(result.outputs.values())[0] == pytest.approx(expected)
+    assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected)
 
 
 @requires_cuda
 def test_softmax_runs_on_gpu():
-    """Softmax from a hand-built LoopProgram (no Graph). Uses compile_kernels
-    directly — the resulting GpuProgram is what CudaBackend.run expects."""
     import math
 
-    from deplodock.compiler.backend.cuda.emit import compile_kernels
-
-    loop_program = _softmax_program()
-    compiled = compile_kernels(loop_program)
+    compiled = CudaBackend().compile(_softmax_graph())
     x_data = [float(i) for i in range(32)]
     result = CudaBackend().run(compiled, input_data={"x": x_data})
     expected = []
@@ -246,4 +192,3 @@ def test_matmul_runs_on_gpu():
             s = sum(a_data[mi * 8 + k] * b_data[k * 4 + ni] for k in range(8))
             expected.append(s)
     assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected)
-

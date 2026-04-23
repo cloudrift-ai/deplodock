@@ -2,7 +2,7 @@
 
 import pytest
 
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.expr import BinOp, Literal, Var
 from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
@@ -14,7 +14,6 @@ from deplodock.compiler.ir.loop import (
     SelectBranch,
     Write,
 )
-from deplodock.compiler.ir.expr import BinOp
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp
 
 
@@ -52,9 +51,7 @@ def _nest(axes, body):
             if isinstance(s, Write):
                 for e in s.index:
                     _walk(e)
-        reduce_axis_names = frozenset(
-            a.name for a in axes if a.name not in write_axis_names and int(a.extent) > 1
-        )
+        reduce_axis_names = frozenset(a.name for a in axes if a.name not in write_axis_names and int(a.extent) > 1)
 
     free_axes = [a for a in axes if a.name not in reduce_axis_names]
 

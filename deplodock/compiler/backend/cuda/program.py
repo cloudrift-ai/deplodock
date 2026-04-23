@@ -1,8 +1,11 @@
-"""CUDA program: source generation, compilation, and execution.
+"""CUDA codegen + execution driver for ``Graph[CudaOp]``.
 
-Extends the backend-agnostic ``GpuProgram`` / ``GpuLaunch`` / ``GpuBuffer``
-with CUDA-specific features (TMA descriptors, nvcc compilation, GPU
-execution).
+Walks the lowered graph to emit a full ``.cu`` program: buffer
+allocation, input/constant initialization, kernel launches, output
+readback. The graph is the single source of truth — buffer roles are
+derived from ``graph.inputs`` / ``graph.outputs`` / ``ConstantOp``
+membership, shapes from ``node.output.shape``, and launch order from
+topological order.
 """
 
 from __future__ import annotations
@@ -17,31 +20,98 @@ from pathlib import Path
 import numpy as np
 
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, ProgramResult
-from deplodock.compiler.program.gpu import GpuBuffer, GpuLaunch, GpuProgram  # noqa: F401 — re-export
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.cuda import CudaOp
+from deplodock.compiler.ir.graph import Graph, Node
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class TmaDescriptorSpec:
-    """Spec for creating a CUtensorMap descriptor at runtime.
+    """Spec for creating a CUtensorMap descriptor at runtime."""
 
-    Each spec produces one CUtensorMap via cuTensorMapEncodeTiled().
-    The descriptor is passed to the kernel as a __grid_constant__ param.
-    """
+    param_name: str
+    buffer: str
+    dims: list[str]
+    strides: list[str]
+    tile: list[int]
 
-    param_name: str  # kernel parameter name (e.g., "A_tma")
-    buffer: str  # device buffer name (e.g., "mul_1")
-    dims: list[str]  # [dim0, dim1] expressions for tensor dimensions
-    strides: list[str]  # [stride0] expressions for byte strides
-    tile: list[int]  # [tile0, tile1] block tile sizes
+
+# ---------------------------------------------------------------------------
+# Buffer / launch classification
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class CudaLaunch(GpuLaunch):
-    """CUDA kernel launch with optional TMA descriptor metadata."""
+class _Buffer:
+    name: str
+    shape: tuple[int | str, ...]
+    dtype: str
+    role: str
 
-    tma_descriptors: list[TmaDescriptorSpec] = field(default_factory=list)
+    @property
+    def size(self) -> int:
+        n = 1
+        for d in self.shape:
+            n *= int(d)
+        return n
+
+
+def _buffers(graph: Graph) -> list[_Buffer]:
+    input_set = set(graph.inputs)
+    output_set = set(graph.outputs)
+    bufs: list[_Buffer] = []
+    for nid in graph.nodes:
+        node = graph.nodes[nid]
+        if nid in input_set:
+            role = "input"
+        elif isinstance(node.op, ConstantOp):
+            role = "constant"
+        elif nid in output_set:
+            role = "output"
+        else:
+            role = "scratch"
+        bufs.append(_Buffer(name=nid, shape=tuple(node.output.shape), dtype="float", role=role))
+    return bufs
+
+
+def _constant_values(graph: Graph) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for nid, node in graph.nodes.items():
+        if isinstance(node.op, ConstantOp) and node.op.value is not None:
+            out[nid] = node.op.value
+    return out
+
+
+def _launches(graph: Graph) -> list[Node]:
+    nodes: list[Node] = []
+    for nid in graph.topological_order():
+        node = graph.nodes[nid]
+        if isinstance(node.op, (InputOp, ConstantOp)):
+            continue
+        if not isinstance(node.op, CudaOp):
+            raise TypeError(
+                f"CudaBackend: node {nid!r} has non-CudaOp {type(node.op).__name__!r}; "
+                "lowering passes must produce Graph[CudaOp] before codegen."
+            )
+        nodes.append(node)
+    return nodes
+
+
+def _buffer_size_map(bufs: list[_Buffer]) -> dict[str, int]:
+    return {b.name: b.size for b in bufs}
+
+
+def graph_name(graph: Graph) -> str:
+    return getattr(graph, "name", None) or "prog"
+
+
+def graph_shape(graph: Graph, name: str) -> tuple:
+    node = graph.nodes.get(name)
+    if node is None:
+        raise KeyError(f"Buffer {name!r} not in graph")
+    return tuple(node.output.shape)
 
 
 # ---------------------------------------------------------------------------
@@ -50,27 +120,29 @@ class CudaLaunch(GpuLaunch):
 
 
 def generate_source(
-    program: GpuProgram,
+    graph: Graph,
     mode: str = "benchmark",
     num_iters: int = 10,
     warmup: int = 3,
     input_data: dict[str, np.ndarray] | None = None,
     debug: bool = False,
 ) -> str:
-    """Generate a complete .cu program from a Program spec.
+    """Generate a complete .cu program from a lowered graph.
 
     Args:
-        program: The program to generate.
+        graph: ``Graph[CudaOp + InputOp + ConstantOp]``.
         mode: "run" (print outputs) or "benchmark" (timed iterations).
         num_iters: Number of timed iterations (benchmark mode).
         warmup: Number of warmup iterations.
-        debug: If True, dump all non-input buffers after each kernel launch
-               as ``DBUF <launch_idx> <buf_name> <value>`` lines.
+        debug: If True, dump every non-input buffer after each kernel launch.
     """
-    has_tma = any(getattr(launch, "tma_descriptors", None) for launch in program.launches)
+    bufs = _buffers(graph)
+    launches = _launches(graph)
+    constant_values = _constant_values(graph)
+
+    has_tma = any(getattr(n.op, "tma_descriptors", ()) for n in launches)
     parts: list[str] = []
 
-    # Includes.
     parts.append("#include <cstdio>")
     parts.append("#include <cstdlib>")
     parts.append("#include <cmath>")
@@ -79,94 +151,64 @@ def generate_source(
         parts.append("#include <cuda.h>")
     if mode == "benchmark":
         parts.append("#include <float.h>")
-    for inc in program.includes:
-        parts.append(f"#include <{inc}>")
     parts.append("")
 
-    # Defines.
-    for name, value in program.defines.items():
-        parts.append(f"#define {name} {value}")
-    if program.defines:
-        parts.append("")
-
-    # Kernel sources (deduplicate by name).
     seen_kernels: set[str] = set()
-    for launch in program.launches:
-        if launch.kernel_name not in seen_kernels:
-            parts.append(launch.kernel_source)
-            seen_kernels.add(launch.kernel_name)
+    for node in launches:
+        op: CudaOp = node.op
+        if op.kernel_name not in seen_kernels:
+            parts.append(op.kernel_source)
+            seen_kernels.add(op.kernel_name)
     parts.append("")
 
-    # Host main.
     parts.append("int main() {")
 
-    # Allocate buffers. Aliased buffers share the target's device pointer.
-    aliased = set(program.aliases.keys())
-    for buf in program.buffers:
-        if buf.name in aliased:
-            continue  # will be assigned after all allocations
+    for buf in bufs:
         parts.append(f"    {buf.dtype}* d_{buf.name};")
         parts.append(f"    cudaMalloc(&d_{buf.name}, {buf.size} * sizeof({buf.dtype}));")
-    for alias_name, target_name in program.aliases.items():
-        buf = next(b for b in program.buffers if b.name == alias_name)
-        parts.append(f"    {buf.dtype}* d_{alias_name} = d_{target_name};")
     parts.append("")
 
-    # Initialize inputs and constants.
-    for buf in program.buffers:
-        if buf.role in ("input", "constant") and buf.name not in aliased:
+    for buf in bufs:
+        if buf.role in ("input", "constant"):
             if input_data and buf.name in input_data:
-                # Use provided data: read from binary file at runtime.
                 parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
-                # Write data via binary file read for large buffers.
                 parts.append(f'      FILE* fp = fopen("{buf.name}.bin", "rb");')
                 parts.append(f"      fread(h, sizeof({buf.dtype}), {buf.size}, fp); fclose(fp);")
                 parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
                 parts.append("      free(h); }")
-            elif buf.role == "constant" and buf.name in program.constant_values:
-                # Pre-baked scalar constant (eps, softmax scale, mask fill, etc.).
-                # Fill every element with the trace-time value — critical for
-                # numerical correctness of RMSNorm eps, SDPA scale, and the
-                # softmax -∞ mask fill. Without this, bench binaries that skip
-                # input_data were overwriting these with pseudorandom values
-                # and producing NaN outputs.
-                value = program.constant_values[buf.name]
+            elif buf.role == "constant" and buf.name in constant_values:
+                value = constant_values[buf.name]
                 parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
                 parts.append(f"      for (int i = 0; i < {buf.size}; i++) h[i] = ({buf.dtype}){value!r}f;")
                 parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
                 parts.append("      free(h); }")
             else:
-                # Pseudorandom fallback.
                 parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
                 parts.append(f"      for (int i = 0; i < {buf.size}; i++) h[i] = 0.01f * ((i * 7 + 13) % 101 - 50);")
                 parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
                 parts.append("      free(h); }")
     parts.append("")
 
-    # TMA descriptor setup (once, before any launches).
     if has_tma:
-        parts.append(_generate_tma_setup(program))
+        parts.append(_generate_tma_setup(launches, bufs))
         parts.append("")
 
+    buf_names = {b.name for b in bufs}
+    buf_sizes = _buffer_size_map(bufs)
+
     if debug:
-        # Debug mode: emit launches one at a time, write each launch's output
-        # buffer to a binary file next to the binary. Python reads the files
-        # after the subprocess exits. We only dump the launch's own output
-        # buffer (not every scratch buffer) to keep disk/memory bounded.
-        buf_by_name = {b.name: b for b in program.buffers}
+        buf_by_name = {b.name: b for b in bufs}
         parts.append('    printf("DEBUG_START\\n");')
-        for li, launch in enumerate(program.launches):
-            single = _generate_single_launch(launch, program)
-            parts.append(f"    // --- launch {li}: {launch.kernel_name} ---")
+        for li, node in enumerate(launches):
+            single = _generate_single_launch(node, buf_names, buf_sizes)
+            parts.append(f"    // --- launch {li}: {node.op.kernel_name} ---")
             parts.append(single)
             parts.append(f"    cudaError_t _err{li} = cudaDeviceSynchronize();")
             parts.append(f"    if (_err{li} != cudaSuccess) {{")
-            parts.append(f'        fprintf(stderr, "LAUNCH_FAIL {li} {launch.kernel_name}: %s\\n", cudaGetErrorString(_err{li}));')
+            parts.append(f'        fprintf(stderr, "LAUNCH_FAIL {li} {node.op.kernel_name}: %s\\n", cudaGetErrorString(_err{li}));')
             parts.append("        return 1;")
             parts.append("    }")
-            # Identify the launch's output buffer. For CUDA launches, the
-            # output is the last buffer arg (buffer name that's not an input).
-            out_name = _launch_output_name(launch, program)
+            out_name = _launch_output_name(node, buf_names)
             if out_name is not None and out_name in buf_by_name:
                 buf = buf_by_name[out_name]
                 parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
@@ -179,15 +221,13 @@ def generate_source(
         parts.append("")
     else:
         if mode == "benchmark":
-            # Warmup (untimed).
             parts.append(f"    for (int _w = 0; _w < {warmup}; _w++) {{")
-            parts.append(_generate_launches(program))
+            parts.append(_generate_launches(launches, buf_names, buf_sizes))
             parts.append("    }")
             parts.append("    cudaDeviceSynchronize();")
             parts.append("")
 
-            # Per-launch event pairs + a global pair for the program total.
-            n_launches = len(program.launches)
+            n_launches = len(launches)
             parts.append(f"    const int NL = {n_launches};")
             parts.append("    cudaEvent_t _ks[NL], _ke[NL];")
             parts.append("    for (int i = 0; i < NL; i++) { cudaEventCreate(&_ks[i]); cudaEventCreate(&_ke[i]); }")
@@ -198,7 +238,7 @@ def generate_source(
             parts.append("")
             parts.append("    cudaEventRecord(_start);")
             parts.append(f"    for (int _iter = 0; _iter < {num_iters}; _iter++) {{")
-            parts.append(_generate_timed_launches(program))
+            parts.append(_generate_timed_launches(launches, buf_names, buf_sizes))
             parts.append("        cudaEventSynchronize(_ke[NL - 1]);")
             parts.append("        for (int i = 0; i < NL; i++) {")
             parts.append("            float _ms; cudaEventElapsedTime(&_ms, _ks[i], _ke[i]); _kacc[i] += _ms;")
@@ -211,15 +251,14 @@ def generate_source(
             parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
             parts.append(f'    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms / {num_iters});')
             parts.append(f'    printf("PROGRAM_LAUNCHES={n_launches}\\n");')
-            for li, launch in enumerate(program.launches):
-                parts.append(f'    printf("KERNEL_TIME_MS {li} {launch.kernel_name} %.6f\\n", _kacc[{li}] / {num_iters});')
+            for li, node in enumerate(launches):
+                parts.append(f'    printf("KERNEL_TIME_MS {li} {node.op.kernel_name} %.6f\\n", _kacc[{li}] / {num_iters});')
             parts.append("")
             parts.append("    for (int i = 0; i < NL; i++) { cudaEventDestroy(_ks[i]); cudaEventDestroy(_ke[i]); }")
             parts.append("    cudaEventDestroy(_start);")
             parts.append("    cudaEventDestroy(_stop);")
         else:
-            launch_code = _generate_launches(program)
-            # Single run with GPU-event timing (kernel-only, excludes subprocess/nvcc overhead).
+            launch_code = _generate_launches(launches, buf_names, buf_sizes)
             parts.append("    cudaEvent_t _start, _stop;")
             parts.append("    cudaEventCreate(&_start);")
             parts.append("    cudaEventCreate(&_stop);")
@@ -237,8 +276,7 @@ def generate_source(
             parts.append("    cudaEventDestroy(_stop);")
         parts.append("")
 
-    # Read back outputs.
-    for buf in program.buffers:
+    for buf in bufs:
         if buf.role == "output":
             parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
             parts.append(f"      cudaMemcpy(h, d_{buf.name}, {buf.size} * sizeof({buf.dtype}), cudaMemcpyDeviceToHost);")
@@ -246,52 +284,32 @@ def generate_source(
             parts.append("      free(h); }")
     parts.append("")
 
-    # Free (skip aliases — they share another buffer's allocation).
-    for buf in program.buffers:
-        if buf.name not in aliased:
-            parts.append(f"    cudaFree(d_{buf.name});")
+    for buf in bufs:
+        parts.append(f"    cudaFree(d_{buf.name});")
     parts.append("    return 0;")
     parts.append("}")
 
     return "\n".join(parts)
 
 
-def _tma_var(launch: GpuLaunch, desc: TmaDescriptorSpec) -> str:
-    """Unique variable name for a TMA descriptor: kernel_param_desc."""
-    return f"{launch.kernel_name}_{desc.param_name}_desc"
+# ---------------------------------------------------------------------------
+# Launch emission
+# ---------------------------------------------------------------------------
 
 
-def _generate_tma_setup(program: GpuProgram) -> str:
-    """Generate CUtensorMap descriptor creation code for all TMA launches.
+def _tma_var(kernel_name: str, desc: TmaDescriptorSpec) -> str:
+    return f"{kernel_name}_{desc.param_name}_desc"
 
-    Each TMA descriptor encodes a 2D tile view of a global-memory buffer.
-    cuTensorMapEncodeTiled parameters:
-      - d[2]: global tensor dimensions (innermost-first, column-major order).
-      - s[1]: stride between rows, in bytes (only 1 stride for 2D).
-      - b[2]: block (tile) sizes that cp.async.bulk will load per TMA op.
-      - e[2]: element strides (always 1 — no strided access within a tile).
 
-    Flag choices:
-      - INTERLEAVE_NONE: elements are contiguous in memory (no channel
-        interleaving). Required for standard row-major FP32 layouts.
-      - SWIZZLE_NONE: no shared-memory swizzle pattern. Swizzling reduces
-        bank conflicts for certain tile shapes, but the double-buffer
-        strategy already avoids conflicts via staging through registers.
-      - L2_PROMOTION_L2_256B: hint the L2 cache to keep 256B lines for
-        TMA traffic. Improves reuse when multiple CTAs read overlapping
-        K-slices of the same matrix.
-      - FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA: out-of-bounds tile elements
-        are filled with zero for FMA operations (not NaN). Allows the
-        kernel to use uniform tile sizes without explicit boundary checks;
-        OOB elements contribute zero to the accumulator.
-    """
+def _generate_tma_setup(launches: list[Node], bufs: list[_Buffer]) -> str:
     lines: list[str] = []
-
-    for launch in program.launches:
-        tma_descs = getattr(launch, "tma_descriptors", [])
+    buf_names = {b.name for b in bufs}
+    for node in launches:
+        op: CudaOp = node.op
+        tma_descs = getattr(op, "tma_descriptors", ())
         for desc in tma_descs:
-            var = _tma_var(launch, desc)
-            buf = _format_arg(desc.buffer, program)
+            var = _tma_var(op.kernel_name, desc)
+            buf = _format_arg(desc.buffer, buf_names)
             d0, d1 = desc.dims
             s0 = desc.strides[0]
             t0, t1 = desc.tile
@@ -308,126 +326,102 @@ def _generate_tma_setup(program: GpuProgram) -> str:
             lines.append("            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);")
             lines.append("    }")
 
-        # Dynamic shared memory attribute.
-        if tma_descs and launch.smem_bytes > 0:
-            lines.append(f"    cudaFuncSetAttribute({launch.kernel_name},cudaFuncAttributeMaxDynamicSharedMemorySize,{launch.smem_bytes});")
+        if tma_descs and op.smem_bytes > 0:
+            lines.append(f"    cudaFuncSetAttribute({op.kernel_name},cudaFuncAttributeMaxDynamicSharedMemorySize,{op.smem_bytes});")
 
     return "\n".join(lines)
 
 
-def _generate_launches(program: GpuProgram) -> str:
-    """Generate the kernel launch statements."""
+def _generate_launches(launches: list[Node], buf_names: set[str], buf_sizes: dict[str, int]) -> str:
     lines: list[str] = []
-    buf_sizes = {b.name: b.size for b in program.buffers}
-    for launch in program.launches:
-        # Zero output buffers if needed (k_splits atomicAdd).
-        for buf_name in launch.zero_outputs:
+    for node in launches:
+        op: CudaOp = node.op
+        for buf_name in op.zero_outputs:
             size = buf_sizes.get(buf_name, 0)
             lines.append(f"        cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
 
-        # TMA descriptors are prepended to the regular args.
-        tma_descs = getattr(launch, "tma_descriptors", [])
-        tma_args = [_tma_var(launch, d) for d in tma_descs]
-        regular_args = [_format_arg(a, program) for a in launch.args]
-        all_args = tma_args + regular_args
-        args_str = ", ".join(all_args)
-
-        gx, gy, gz = launch.grid
-        bx, by, bz = launch.block
-        if gz == 1 and bz == 1:
-            grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
-            block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
-        else:
-            grid_str = f"dim3({gx}, {gy}, {gz})"
-            block_str = f"dim3({bx}, {by}, {bz})"
-        smem = f", {launch.smem_bytes}" if launch.smem_bytes > 0 else ""
-        lines.append(f"        {launch.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
-    return "\n".join(lines)
-
-
-def _generate_timed_launches(program: GpuProgram) -> str:
-    """Per-launch event-timed launch statements for benchmark mode.
-
-    Mirrors ``_generate_launches`` but wraps each kernel invocation in a
-    ``cudaEventRecord(_ks[i])`` / ``cudaEventRecord(_ke[i])`` pair so per-
-    launch elapsed time can be accumulated across iterations. ``zero_outputs``
-    memsets stay outside the event pair — they aren't kernel time.
-    """
-    lines: list[str] = []
-    buf_sizes = {b.name: b.size for b in program.buffers}
-    for li, launch in enumerate(program.launches):
-        for buf_name in launch.zero_outputs:
-            size = buf_sizes.get(buf_name, 0)
-            lines.append(f"        cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
-
-        tma_descs = getattr(launch, "tma_descriptors", [])
-        tma_args = [_tma_var(launch, d) for d in tma_descs]
-        regular_args = [_format_arg(a, program) for a in launch.args]
+        tma_descs = getattr(op, "tma_descriptors", ())
+        tma_args = [_tma_var(op.kernel_name, d) for d in tma_descs]
+        regular_args = [_format_arg(a, buf_names) for a in op.arg_order]
         args_str = ", ".join(tma_args + regular_args)
 
-        gx, gy, gz = launch.grid
-        bx, by, bz = launch.block
+        gx, gy, gz = op.grid
+        bx, by, bz = op.block
         if gz == 1 and bz == 1:
             grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
             block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
         else:
             grid_str = f"dim3({gx}, {gy}, {gz})"
             block_str = f"dim3({bx}, {by}, {bz})"
-        smem = f", {launch.smem_bytes}" if launch.smem_bytes > 0 else ""
+        smem = f", {op.smem_bytes}" if op.smem_bytes > 0 else ""
+        lines.append(f"        {op.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
+    return "\n".join(lines)
+
+
+def _generate_timed_launches(launches: list[Node], buf_names: set[str], buf_sizes: dict[str, int]) -> str:
+    lines: list[str] = []
+    for li, node in enumerate(launches):
+        op: CudaOp = node.op
+        for buf_name in op.zero_outputs:
+            size = buf_sizes.get(buf_name, 0)
+            lines.append(f"        cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
+
+        tma_descs = getattr(op, "tma_descriptors", ())
+        tma_args = [_tma_var(op.kernel_name, d) for d in tma_descs]
+        regular_args = [_format_arg(a, buf_names) for a in op.arg_order]
+        args_str = ", ".join(tma_args + regular_args)
+
+        gx, gy, gz = op.grid
+        bx, by, bz = op.block
+        if gz == 1 and bz == 1:
+            grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
+            block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
+        else:
+            grid_str = f"dim3({gx}, {gy}, {gz})"
+            block_str = f"dim3({bx}, {by}, {bz})"
+        smem = f", {op.smem_bytes}" if op.smem_bytes > 0 else ""
         lines.append(f"        cudaEventRecord(_ks[{li}]);")
-        lines.append(f"        {launch.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
+        lines.append(f"        {op.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
         lines.append(f"        cudaEventRecord(_ke[{li}]);")
     return "\n".join(lines)
 
 
-def _launch_output_name(launch: GpuLaunch, program: GpuProgram) -> str | None:
-    """Best-effort: identify which buffer this launch writes to.
-
-    Convention: the kernel's last pointer parameter is the output, and the
-    corresponding launch arg is the output buffer name. TMA descriptors are
-    prepended to the args tuple, so the output is still the final regular
-    arg.
-    """
-    buf_names = {b.name for b in program.buffers}
-    for arg in reversed(launch.args):
-        if arg in buf_names:
-            return arg
-    return None
-
-
-def _generate_single_launch(launch: GpuLaunch, program: GpuProgram) -> str:
-    """Generate a single kernel launch statement (for debug mode)."""
+def _generate_single_launch(node: Node, buf_names: set[str], buf_sizes: dict[str, int]) -> str:
+    op: CudaOp = node.op
     lines: list[str] = []
-    buf_sizes = {b.name: b.size for b in program.buffers}
-    for buf_name in launch.zero_outputs:
+    for buf_name in op.zero_outputs:
         size = buf_sizes.get(buf_name, 0)
         lines.append(f"    cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
 
-    tma_descs = getattr(launch, "tma_descriptors", [])
-    tma_args = [_tma_var(launch, d) for d in tma_descs]
-    regular_args = [_format_arg(a, program) for a in launch.args]
-    all_args = tma_args + regular_args
-    args_str = ", ".join(all_args)
+    tma_descs = getattr(op, "tma_descriptors", ())
+    tma_args = [_tma_var(op.kernel_name, d) for d in tma_descs]
+    regular_args = [_format_arg(a, buf_names) for a in op.arg_order]
+    args_str = ", ".join(tma_args + regular_args)
 
-    gx, gy, gz = launch.grid
-    bx, by, bz = launch.block
+    gx, gy, gz = op.grid
+    bx, by, bz = op.block
     if gz == 1 and bz == 1:
         grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
         block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
     else:
         grid_str = f"dim3({gx}, {gy}, {gz})"
         block_str = f"dim3({bx}, {by}, {bz})"
-    smem = f", {launch.smem_bytes}" if launch.smem_bytes > 0 else ""
-    lines.append(f"    {launch.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
+    smem = f", {op.smem_bytes}" if op.smem_bytes > 0 else ""
+    lines.append(f"    {op.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
     return "\n".join(lines)
 
 
-def _format_arg(arg: str, program: GpuProgram) -> str:
-    """Format a launch argument: buffer names become d_name, others pass through."""
-    buf_names = {b.name for b in program.buffers}
+def _launch_output_name(node: Node, buf_names: set[str]) -> str | None:
+    for arg in reversed(node.op.arg_order):
+        if arg in buf_names:
+            return arg
+    return None
+
+
+def _format_arg(arg: str, buf_names: set[str]) -> str:
     if arg in buf_names:
         return f"d_{arg}"
-    return arg  # scalar literal like "256" or "1e-5f"
+    return arg
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +432,6 @@ _CACHE_DIR = Path.home() / ".cache" / "deplodock" / "kernels"
 
 
 def compile_program(source: str, arch: str | None = None) -> Path:
-    """Compile CUDA source to a binary, with content-hash caching."""
     content_hash = hashlib.sha256(source.encode()).hexdigest()[:12]
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     binary = _CACHE_DIR / f"prog_{content_hash}"
@@ -453,7 +446,6 @@ def compile_program(source: str, arch: str | None = None) -> Path:
         arch = _detect_arch()
 
     cmd = ["nvcc", "-O2", "--use_fast_math", f"-arch={arch}", str(cu_path), "-o", str(binary)]
-    # Link libcuda when using TMA (CUtensorMap / cuTensorMapEncodeTiled).
     if "CUtensorMap" in source:
         cmd.append("-lcuda")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -463,13 +455,10 @@ def compile_program(source: str, arch: str | None = None) -> Path:
     return binary
 
 
-def run_program(program: GpuProgram, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
-    """Generate, compile, and run a Program. Returns outputs + timing."""
-    source = generate_source(program, mode="run", input_data=input_data)
+def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
+    source = generate_source(graph, mode="run", input_data=input_data)
     binary = compile_program(source)
 
-    # Run in a per-invocation temp dir so concurrent runs can't clobber
-    # each other's input .bin files (the binary fopen()s them relatively).
     with tempfile.TemporaryDirectory(prefix="deplodock_run_") as rundir:
         if input_data:
             for buf_name, vals in input_data.items():
@@ -480,31 +469,19 @@ def run_program(program: GpuProgram, input_data: dict[str, np.ndarray] | None = 
         if result.returncode != 0:
             raise RuntimeError(f"Program execution failed:\n{result.stderr}")
 
-        return _parse_run_output(result.stdout, program)
+        return _parse_run_output(result.stdout)
 
 
 @dataclass
 class DebugResult:
-    """Per-launch buffer snapshots from a debug run."""
-
-    outputs: dict[str, list[float]]  # final outputs (same as ProgramResult)
-    per_launch: dict[int, dict[str, np.ndarray]]  # launch_idx → {buf_name: ndarray}
+    outputs: dict[str, list[float]]
+    per_launch: dict[int, dict[str, np.ndarray]] = field(default_factory=dict)
 
 
-def run_program_debug(program: GpuProgram, input_data: dict[str, np.ndarray] | None = None) -> DebugResult:
-    """Run with debug=True, returning per-launch buffer snapshots.
-
-    The generated program writes each launch's output buffer to a binary
-    file ``launch_NNN.bin`` next to the binary and emits one metadata line
-    per launch on stdout (``DBUF <li> <buf_name> <numel>``). We then read
-    the binaries and reshape them using the program's declared shapes.
-    This avoids the per-element printf that makes the stdout unusable.
-    """
-    source = generate_source(program, mode="run", input_data=input_data, debug=True)
+def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> DebugResult:
+    source = generate_source(graph, mode="run", input_data=input_data, debug=True)
     binary = compile_program(source)
 
-    # Per-invocation temp dir: binary reads inputs and writes launch_*.bin
-    # here, so concurrent debug runs stay isolated.
     with tempfile.TemporaryDirectory(prefix="deplodock_dbg_") as rundir:
         rundir_path = Path(rundir)
         if input_data:
@@ -516,23 +493,18 @@ def run_program_debug(program: GpuProgram, input_data: dict[str, np.ndarray] | N
         if result.returncode != 0:
             raise RuntimeError(f"Debug program execution failed:\n{result.stderr}\nstdout:\n{result.stdout}")
 
-        return _parse_debug_output(result.stdout, program, rundir_path)
+        return _parse_debug_output(result.stdout, graph, rundir_path)
 
 
-def benchmark_program(
-    program: GpuProgram,
-    warmup: int = 5,
-    num_iters: int = 20,
-) -> BenchmarkResult:
-    """Generate, compile, and benchmark a Program. Returns timing."""
-    source = generate_source(program, mode="benchmark", num_iters=num_iters, warmup=warmup)
+def benchmark_program(graph: Graph, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
+    source = generate_source(graph, mode="benchmark", num_iters=num_iters, warmup=warmup)
     binary = compile_program(source)
 
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"Program execution failed:\n{result.stderr}")
 
-    return _parse_benchmark_output(result.stdout, program)
+    return _parse_benchmark_output(result.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -540,8 +512,7 @@ def benchmark_program(
 # ---------------------------------------------------------------------------
 
 
-def _parse_run_output(stdout: str, program: GpuProgram) -> ProgramResult:
-    """Parse output from a run-mode program."""
+def _parse_run_output(stdout: str) -> ProgramResult:
     outputs: dict[str, list[float]] = {}
     time_ms = None
 
@@ -557,8 +528,7 @@ def _parse_run_output(stdout: str, program: GpuProgram) -> ProgramResult:
     return ProgramResult(outputs=outputs, time_ms=time_ms)
 
 
-def _parse_benchmark_output(stdout: str, program: GpuProgram) -> BenchmarkResult:
-    """Parse output from a benchmark-mode program."""
+def _parse_benchmark_output(stdout: str) -> BenchmarkResult:
     time_ms = 0.0
     num_launches = 0
     per_launch: list[LaunchTime] = []
@@ -580,15 +550,9 @@ def _parse_benchmark_output(stdout: str, program: GpuProgram) -> BenchmarkResult
     )
 
 
-def _parse_debug_output(stdout: str, program: GpuProgram, workdir: Path) -> DebugResult:
-    """Parse output from a debug-mode program.
-
-    Each launch emits a ``DBUF <li> <buf_name> <numel>`` metadata line on
-    stdout and writes ``launch_NNN.bin`` into ``workdir``. We read the
-    binaries and reshape them with the declared buffer shape.
-    """
+def _parse_debug_output(stdout: str, graph: Graph, workdir: Path) -> DebugResult:
     outputs: dict[str, list[float]] = {}
-    buf_shapes = {b.name: tuple(b.shape) for b in program.buffers}
+    buf_shapes = {nid: tuple(node.output.shape) for nid, node in graph.nodes.items()}
     per_launch_np: dict[int, dict[str, np.ndarray]] = {}
 
     for line in stdout.strip().split("\n"):
@@ -611,7 +575,6 @@ def _parse_debug_output(stdout: str, program: GpuProgram, workdir: Path) -> Debu
 
 
 def _detect_arch() -> str:
-    """Detect the GPU architecture for nvcc."""
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
@@ -624,4 +587,4 @@ def _detect_arch() -> str:
             return f"sm_{cap.replace('.', '')}"
     except (FileNotFoundError, subprocess.SubprocessError):
         pass
-    return "sm_89"  # fallback
+    return "sm_89"

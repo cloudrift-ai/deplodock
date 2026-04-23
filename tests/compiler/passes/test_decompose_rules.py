@@ -25,7 +25,7 @@ from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.rewriter import Pass, Rule
 
-RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules" / "decomposition"
+RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes" / "decomposition"
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()
@@ -211,7 +211,7 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     from deplodock.compiler.rewriter import Rewriter
     from deplodock.compiler.torch_trace import trace_module
 
-    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules"
+    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes"
     graph = trace_module(torch.nn.RMSNorm(64), (torch.randn(1, 8, 64),))
     pre = Rewriter.from_directory(rules_dir, pass_order=["decomposition", "optimization"])
     decomposed = pre.apply(graph)
@@ -272,7 +272,7 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     from deplodock.compiler.rewriter import Rewriter
     from deplodock.compiler.torch_trace import trace_module
 
-    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "rules"
+    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes"
     graph = trace_module(torch.nn.Softmax(dim=-1), (torch.randn(1, 4, 8),))
     pre = Rewriter.from_directory(rules_dir, pass_order=["decomposition", "optimization"])
     decomposed = pre.apply(graph)

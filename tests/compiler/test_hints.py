@@ -174,7 +174,7 @@ def test_hints_flow_through_lower():
 
     from pathlib import Path
 
-    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules"
+    rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "passes"
     rewriter = Rewriter.from_directory(rules_dir)
     fused = rewriter.apply(g)
 
