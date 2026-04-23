@@ -18,7 +18,7 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.rewriter import Pass
+from deplodock.compiler.rewriter import run_pass
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes" / "fusion"
 
@@ -27,7 +27,7 @@ _backend = NumpyBackend()
 
 
 def _fuse(graph: Graph) -> Graph:
-    return Pass.from_directory(RULES_DIR).apply(graph)
+    return run_pass(graph, RULES_DIR)
 
 
 def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

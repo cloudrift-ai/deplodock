@@ -21,7 +21,7 @@ from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import compile_graph
-from deplodock.compiler.rewriter import Rewriter
+from deplodock.compiler.rewriter import run_pass
 
 _RULES_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "passes"
 _backend = NumpyBackend()
@@ -29,8 +29,10 @@ rng = np.random.default_rng(0)
 
 
 def _fully_rewrite(graph: Graph) -> Graph:
-    """Apply the full rewriter chain (decomposition → optimization → fusion)."""
-    return Rewriter.from_directory(_RULES_DIR).apply(graph)
+    """Apply the full pass chain (decomposition → optimization → fusion)."""
+    for name in ("decomposition", "optimization", "fusion"):
+        graph = run_pass(graph, _RULES_DIR / name)
+    return graph
 
 
 def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

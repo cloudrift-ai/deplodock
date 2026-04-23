@@ -6,7 +6,7 @@ from deplodock.compiler.ir.frontend.ir import ReshapeOp, TransposeOp
 from deplodock.compiler.ir.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp, ScanOp, ScatterOp
 from deplodock.compiler.matcher import Match, Pattern, match_pattern
-from deplodock.compiler.rewriter import Pass, PassTrace, Rewriter, Rule, RuleApplication
+from deplodock.compiler.rewriter import run_pass
 
 __all__ = [
     "Match",
@@ -18,17 +18,13 @@ __all__ = [
     "InputOp",
     "Node",
     "Op",
-    "Pass",
-    "PassTrace",
     "Pattern",
     "ReduceOp",
     "ReshapeOp",
-    "Rewriter",
-    "Rule",
-    "RuleApplication",
     "ScanOp",
     "ScatterOp",
     "Tensor",
     "TransposeOp",
     "match_pattern",
+    "run_pass",
 ]

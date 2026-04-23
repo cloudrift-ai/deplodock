@@ -166,7 +166,7 @@ def test_hints_flow_through_lower():
     After fusion, the matmul pair (mul + sum) becomes one LoopOp graph
     node whose ``.hints`` carries the merged hints from all consumed nodes.
     """
-    from deplodock.compiler.rewriter import Rewriter
+    from deplodock.compiler.rewriter import run_pass
 
     g = _matmul_graph()
     ew_id = next(nid for nid, n in g.nodes.items() if isinstance(n.op, ElementwiseOp))
@@ -175,8 +175,9 @@ def test_hints_flow_through_lower():
     from pathlib import Path
 
     rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "passes"
-    rewriter = Rewriter.from_directory(rules_dir)
-    fused = rewriter.apply(g)
+    fused = g
+    for name in ("decomposition", "optimization", "fusion"):
+        fused = run_pass(fused, rules_dir / name)
 
     from deplodock.compiler.ir.loop import LoopOp
 
