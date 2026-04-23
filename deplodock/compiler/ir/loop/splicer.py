@@ -49,7 +49,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var
+from deplodock.compiler.ir.expr import Expr, Literal, Var, free_vars
 from deplodock.compiler.ir.loop.builder import LoopBuilder
 from deplodock.compiler.ir.loop.ir import (
     Accum,
@@ -391,11 +391,30 @@ def _scope_for_axes(ref_scope: Scope, required: tuple[str, ...]) -> Scope:
 
 
 def _remap_axis_name(axis: Axis, sigma: Sigma) -> str:
+    """Pick the merged-kernel axis that ``axis`` lands under, given σ's target.
+
+    σ can map a producer axis to any single-variable expression built from the
+    consumer's axes — ``Var(b)`` (plain rename), ``Var(b) + 5`` (offset slice),
+    ``2*Var(b)`` (strided slice), ``3*Var(b) + 1`` (strided+offset), etc. In
+    all these cases the merged kernel's enclosing loop iterates ``b``; every
+    occurrence of ``Var(a)`` in the producer body is substituted to the full
+    expression by the caller's σ-rewrite, so the arithmetic lands inside the
+    stmt's Exprs rather than on the loop axis itself.
+
+    Rejected shapes: targets that reference two or more variables (would need
+    the merged kernel to iterate over multiple consumer axes here — requires
+    a scope-splitting refactor beyond this hook) and targets with zero
+    variables (σ fixes the axis to a constant — the def should be hoisted
+    out of any loop, which isn't representable as a single axis name).
+    """
     target = sigma.get(axis.name)
     if target is None:
         return axis.name
     if isinstance(target, Var):
         return target.name
+    vars_in_target = free_vars(target)
+    if len(vars_in_target) == 1:
+        return next(iter(vars_in_target))
     raise _NotSupported
 
 
