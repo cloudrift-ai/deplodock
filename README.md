@@ -25,10 +25,14 @@ Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLa
     - [pull.py](deplodock/commands/pull.py) — `pull` command (download HF model)
     - [trace.py](deplodock/commands/trace.py) — `trace` command (PyTorch → Graph IR)
     - [compile.py](deplodock/commands/compile.py) — `compile` command (decomposition → optimization → fusion on the Graph)
+    - [run.py](deplodock/commands/run.py) — `run` command (compile + dispatch, optionally with a prompt for CausalLM generation)
     - [inspect_graph.py](deplodock/commands/inspect_graph.py) — `inspect` command (graph summary)
-  - [scripts/](scripts/) — Standalone benchmark scripts
-    - [bench_matmul.py](scripts/bench_matmul.py) — single matmul benchmark
-    - [bench_block.py](scripts/bench_block.py) — transformer block benchmark (eager vs torch.compile vs our CUDA pipeline)
+  - [compiler/](deplodock/compiler/) — PyTorch → Graph IR → CUDA compiler (see [ARCHITECTURE.md](deplodock/compiler/ARCHITECTURE.md))
+    - [graph.py](deplodock/compiler/graph.py) — `Graph`, `Node`, `Tensor`, `Hints` container
+    - [ir/](deplodock/compiler/ir/) — per-dialect op definitions (see [ARCHITECTURE.md](deplodock/compiler/ir/ARCHITECTURE.md))
+    - [trace/](deplodock/compiler/trace/) — PyTorch/HuggingFace → Graph IR capture (see [ARCHITECTURE.md](deplodock/compiler/trace/ARCHITECTURE.md))
+    - [pipeline/](deplodock/compiler/pipeline/) — rewrite engine + passes + dump hooks (see [ARCHITECTURE.md](deplodock/compiler/pipeline/ARCHITECTURE.md))
+    - [backend/](deplodock/compiler/backend/) — numpy / loop / CUDA execution (see [ARCHITECTURE.md](deplodock/compiler/backend/ARCHITECTURE.md))
   - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
   - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle

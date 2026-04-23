@@ -1,306 +1,187 @@
-# IR Architecture
+# IR Dialects
 
-One file per IR level. Each dialect defines the ops that are legal in the
-graph at a specific point in the compilation pipeline. A single ``Graph``
-(``graph.py``) hosts nodes from every dialect; as rewrite passes run, the
-population of op types in the graph changes.
+Per-dialect op definitions. A `Graph` (`compiler/graph.py`) hosts nodes
+from every dialect; the population shifts as passes run. For the
+top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 
-## Pipeline
+## Dialects at a glance
 
-Layer numbering matches `compiler/ARCHITECTURE.md`: **Layer 1** is the
-backend-agnostic Graph IR (pre- and post-decomposition), **Layer 2** is
-the Loop IR produced by fusion/lowering, **Layer 3** is the GPU IR
-consumed by the backend.
-
-```
-PyTorch module
-   │  trace.torch.trace_module
-   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 1 · Frontend — Graph populated with FRONTEND ops (frontend.py)                                                 │
-│   LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp, ReshapeOp, SliceOp, CatOp                            │
-│   + InputOp / ConstantOp boundary sentinels (base.py)                                                                │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-   │  passes/decomposition/*
-   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 1 · Frontend — Graph populated with TENSOR / MINIMAL ops (tensor.py)                                           │
-│   ElementwiseOp, ReduceOp, ScanOp, GatherOp, ScatterOp,                                                              │
-│   IndexMapOp (subsumes Slice / Cat / Transpose / Reshape / Unsqueeze via coord_map over expr.py)                     │
-│   + InputOp / ConstantOp                                                                                             │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-   │  passes/optimization/*  (broadcast insertion)
-   │  passes/fusion/*        (lift each tensor op → LoopOp, then merge adjacent LoopOp pairs)
-   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 2 · Fusion — Graph populated with LOOP IR ops (loop/ir.py)                                                     │
-│   LoopOp (one per GPU kernel) — SSA program over named Axes. Body Loads read external buffers via Expr               │
-│   index patterns; Accum stmts carry accumulator state; body statements (Assign/Accum/Write/Select/Load)              │
-│   execute in order. + InputOp / ConstantOp as buffer sources.                                                        │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-   │  passes/lowering/kernel — wraps each LoopOp's emitted GpuKernel in a KernelOp graph-op.
-   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 3a · Kernel-level — Graph populated with KernelOp (kernel.py)                                                  │
-│   Each node carries one GpuKernel (kernel/ir.py) + grid/block/smem/zero_outputs.                                    │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-   │  passes/lowering/cuda — renders each KernelOp's GpuKernel to a C source string wrapped in CudaOp.
-   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ LAYER 3b · Device — Graph populated with CudaOp (cuda.py)                                                            │
-│   kernel_source string + kernel_name + arg_order + grid + block. Ready for generate_source → nvcc.                   │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-   │  backend/cuda/program.generate_source(graph)
-   ▼
-C/C++ source → nvcc → GPU
-```
-
-## Per-file summary
-
-### `base.py` — shared root (all layers)
-
-Cross-cutting types used at every stage.
-
-| Symbol        | Role                                                                             |
-|---------------|----------------------------------------------------------------------------------|
-| ``Op``        | Base class. Subclasses implement ``infer_output_shape`` and ``forward`` (numpy). |
-| ``InputOp``   | Sentinel: graph input tensor. Value supplied by executor.                        |
-| ``ConstantOp``| Sentinel: weights / RoPE tables / scalar constants.                              |
-| ``_keepdim_axis``| Shape helper — shared by ``ReduceOp`` (tensor) and ``MeanOp`` (frontend).        |
-
-**Rule:** No dependencies on other IR modules. Everyone may import from here.
-
-### `graph.py` — container + hints (Layers 1–2)
-
-Hosts nodes from every dialect as the rewriter progresses.
-
-| Symbol            | Role                                                                |
-|-------------------|---------------------------------------------------------------------|
-| ``Tensor``        | Name + shape + dtype. One per node output.                          |
-| ``Node[T_Op]``    | Wraps one ``Op``. Generic on op subtype.                            |
-| ``Graph``         | DAG. Insertion, removal, topo order, (de)serialization.             |
-| ``Hints``         | Advisory metadata bag (dotted keys, e.g. ``cuda.matmul.strategy``). |
-| ``resolve_hints`` | Merge graph + node hints.                                           |
-
-**Rule:** Imports ``base``; lazy-imports ``frontend``/``tensor``/``loop``
-inside ``Graph.from_dict`` for op-class reconstruction.
-
-### `simplify.py` — generic Expr / IR simplifier (all layers)
-
-Pure, idempotent bottom-up rewrite over the shared ``Expr`` AST plus the
-GPU-specific extensions. Applied at every pipeline stage that emits IR
-the user might inspect: after fusion (on ``LoopOp`` Expr fields) and
-after kernel emission (on ``GpuKernel`` statement trees).
-
-| Symbol                                       | Role                                                                                  |
-|----------------------------------------------|---------------------------------------------------------------------------------------|
-| ``Interval`` / ``Context``                   | Integer-range context threaded through the walk (Axis extents / ForLoop bounds / IfStmt conds). |
-| ``simplify_expr(e, ctx)``                    | Core Expr rewriter: const fold, algebraic identities, Ternary collapse, range-based comparison folding. |
-| ``infer_range(e, ctx)``                      | Companion range analysis over integer Exprs.                                          |
-| ``simplify_loop_op(op)``                     | LoopOp walker — seeds Context from axis extents.                                      |
-| ``ir.kernel.normalize.normalize_kernel(k)``  | GpuKernel walker — pushes ranges from VarDecl (nonneg thread-index compositions) + IfStmt conds + ForLoop bounds. Called from ``KernelOp.__post_init__``. |
-
-**Rule:** Imports ``expr``, ``loop.ir``, ``kernel.ir``. No dependencies
-on passes / pipeline / backend — pure IR → IR.
-
-### `expr.py` — shared expression sublanguage (all layers)
-
-Backend-agnostic expression AST used by both the loop IR (coord maps,
-Select predicates) and the GPU IR (array indices, loop bounds). Plus
-the coord-expression helpers that operate on it.
-
-| Symbol                                                                  | Role                                                                     |
-|-------------------------------------------------------------------------|--------------------------------------------------------------------------|
-| ``Var``, ``Literal``, ``BinOp``, ``Builtin``, ``FuncCall``, ``Ternary`` | Expression nodes. Each has an ``eval(env)`` method for numpy evaluation. |
-| ``_ExprOps``                                                            | Mixin: Python operator overloading for expression building.              |
-| ``Expr``                                                                | Type alias for the union.                                                |
-| ``PLACEHOLDER_PREFIX``                                                  | Convention: ``out_coord_N`` names output coordinates.                    |
-| ``placeholder`` / ``is_placeholder``                                    | Build / recognize placeholder vars.                                      |
-| ``substitute``                                                          | Tree rewrite: replace named ``Var`` nodes.                               |
-
-**Rule:** No imports from other IR files.
-
-### `frontend.py` — Torch IR (Layer 1, pre-decomposition)
-
-Ops captured directly from PyTorch tracing. Every one of them has a
-decomposition rule that rewrites it into ``tensor`` primitives. After the
-decomposition pass completes, none of these ops should remain.
-
-| Group           | Ops                                                                                                     |
-|-----------------|---------------------------------------------------------------------------------------------------------|
-| Layout-only     | ``TransposeOp``, ``ReshapeOp``, ``SliceOp``, ``CatOp``, ``UnsqueezeOp`` — decomposed to ``IndexMapOp``. |
-| Compound math   | ``LinearOp``, ``MatmulOp``, ``SdpaOp``, ``MeanOp`` — decomposed to elementwise + reduce chains.         |
-
-**Rule:** Imports ``base`` only. Must not depend on ``tensor`` / ``loop``
-(decomposition rewrites *into* those; the frontend is upstream).
-
-### `tensor.py` — minimal IR (Layer 1, post-decomposition)
-
-What survives after decomposition. This is the dialect that fusion
-consumes.
-
-| Symbol                               | Role                                                       |
-|--------------------------------------|------------------------------------------------------------|
-| ``ElementwiseOp``                    | Per-element scalar function (``add``/``mul``/``exp``/...). |
-| ``ReduceOp``                         | Collapse one axis via associative binary op.               |
-| ``ScanOp``                           | Cumulative variant of reduce.                              |
-| ``GatherOp`` / ``ScatterOp``         | Data-dependent reads / writes.                             |
-| ``IndexMapOp`` + ``IndexSource``     | Unified layout-only op over ``Expr``.                      |
-| ``OpInfo`` / ``OP_REGISTRY``         | Elementwise arity / commutativity.                         |
-| ``ReduceInfo`` / ``REDUCE_REGISTRY`` | Reduce identity elements.                                  |
-
-**Rule:** Imports ``base`` and ``shape_utils`` (for broadcasting).
-Lazy-imports ``expr`` inside ``IndexMapOp.forward`` / ``is_identity`` only.
-
-### `loop/ir.py` — Loop IR, structural SSA (Layer 2)
-
-After fusion, each ``LoopOp`` is exactly one GPU kernel described as an
-SSA program over a **named iteration space**. "Loop" refers to the tiled
-loop-nest that codegen eventually emits — one ``LoopOp`` maps to one
-``GpuKernel`` and one CUDA launch.
-
-| Symbol                        | Role                                                                                                              |
-|-------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| ``Axis``                      | Named iteration variable (``name`` + ``extent``). Free vs reduce is inferred from body structure — a Loop is a reduce Loop iff its body contains an Accum (see ``LoopOp.reduce_axis_names``). |
-| ``LoopOp``                    | One kernel: nested ``body`` is the sole stored field (``axes`` / ``loads`` / ``accums`` are computed properties). |
-| ``Load``                      | Body-form external read: ``name = load(src)[index...]``; introduces an SSA name. ``source`` indexes into the node's ``inputs`` list at the graph level. |
-| ``Accum``                     | Reduce accumulator: ``name = op(name, value)`` inside a reduce ``Loop``. Implicitly initialized to ``ACCUM_IDENTITY[op.fn]``; after the Loop the ``name`` is in scope with the finalized value. |
-| ``Assign``                    | SSA body stmt: ``name = op(args)`` with ``op: ElementwiseOp``.                                                    |
-| ``Write``                     | Write an SSA value to output ``output`` at ``index``.                                                             |
-| ``Select`` + ``SelectBranch`` | Coord-predicated binding (replaces the old Mux).                                                                  |
-| ``Loop``                      | Explicit iteration block: ``axis`` (free or reduce) + nested ``body``. Body runs ``axis.extent`` times.           |
-| ``Stmt``                      | Union: ``Assign \| Accum \| Write \| Select \| Loop \| Load``.                                                    |
-
-``LoopOp.body`` is a nested tree of ``Loop`` blocks (outer free Loops
-for the grid iteration, inner reduce Loops for per-row sweeps). Reading
-top-to-bottom matches execution order.
-
-Body walkers in ``loop/ir.py``:
-
-- ``iter_body(body)`` — pre-order generator yielding every stmt including
-  ``Loop`` wrappers. ``for s in loop_op: ...`` uses this via
-  ``LoopOp.__iter__``. Default primitive for collection walks; composes
-  with comprehensions / ``any`` / ``sum`` without allocating a new body.
-- ``map_body(body, fn)`` — transformer: ``fn`` sees every stmt (including
-  Loops), returns ``Stmt`` / ``None`` / an iterable (for 1:N expansions).
-  ``LoopOp.map(fn)`` wraps the result in a fresh ``LoopOp``.
-- ``Stmt.rewrite(rename_ssa, sigma)`` — per-stmt copy with SSA names
-  mapped through ``rename_ssa`` and Expr subtrees σ-substituted. Used by
-  both the splicer and normalize passes.
-- ``flatten_body(body)`` — legacy leaf-only view (filters out Loops).
-  Being phased out in favor of ``iter_body`` + explicit filters.
-
-``LoopMeta`` (returned by ``LoopOp.analyze()``) precomputes common
-lookups over the body: ``defs`` (name → stmt), ``scopes`` (name →
-binding ``Scope``), ``reduce_axes`` (Accum name → its reduce ``Axis``),
-``writes`` (paired with scope), and ``live_axes`` (axes transitively
-reachable through each name's Expr subtrees).
-
-**Rule:** Imports ``base``, ``expr``, and ``tensor`` (``ElementwiseOp``
-only — ``ReduceOp`` is NOT a valid ``Assign.op``). Reductions are
-modeled as ``Accum`` statements inside a reduce ``Loop``. SSA names
-defined inside a Loop body are scoped to that body — only ``Accum``
-targets cross Loop boundaries.
-
-### `loop/normalize.py` — body-shape normalization (Layer 2)
-
-Pure ``body → body`` passes applied inside ``LoopOp.__post_init__`` so
-every constructed ``LoopOp`` — including intermediate results produced
-by fusion rules — is canonicalized before validation.
-
-| Symbol                              | Role                                                                                                                              |
-|-------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| ``drop_size_one_free_axes``         | Inline ``Loop(axis, extent=1)`` free loops; substitute ``Var(axis.name) → Literal(0)`` through the body. Reduce loops untouched.  |
-| ``canonicalize_free_axis_order``    | Sort the outer chain of free Loops alphabetically by axis name. Free loops commute, so reordering is safe.                        |
-| ``linearize_pointwise_body``        | For pointwise kernels (no Accum), push non-Loop siblings into the inner Loop so all leaves end up at the innermost scope.         |
-| ``eliminate_copy_aliases``          | Drop ``y = copy(x)`` identity Assigns (left behind by merge bridges) and rewire downstream refs to the alias root.                |
-| ``rename_ssa_sequential``           | Canonicalize Assign / Select SSA names to ``v0``, ``v1``, ... in definition order. Accum / Load names left untouched.             |
-| ``normalize_body``                  | Compose the passes in order.                                                                                                      |
-
-**Rule:** Imports ``expr`` and ``loop.ir``. No dependency on ``plan``
-or any pass infrastructure — these are local structural rewrites with
-no Context.
-
-### `loop/plan.py` — analysis: LoopOp → KernelPlan (Layer 2)
-
-Walks a ``LoopOp``'s nested ``Loop`` tree and produces an explicit
-nested-loop view as a ``KernelPlan``: ordered ``Loop`` / ``Inline``
-steps with accumulators, rematerialization sets, and trailing writes.
-Consumed by the CUDA emitter (``backend/cuda/emit.py``). The human
-dump view uses ``ir.loop.ir.pretty_print`` directly since the IR is
-already nested.
-
-| Symbol              | Role                                                                                                |
-|---------------------|-----------------------------------------------------------------------------------------------------|
-| ``Accum``           | Reduction accumulator: ``var`` (e.g. ``acc0``), ``fn``, ``identity``, SSA ``src``, ``result`` name. |
-| ``Loop``            | K-loop step: ``recompute`` + ``body`` (``Assign`` / ``Select``) + optional ``accum`` / ``stores_output``. |
-| ``Inline``          | Straight-line block of ``Assign`` / ``Select`` statements (no loop).                                |
-| ``TrailingWrite``   | Write emitted once per thread after all reduce sweeps (for non-elementwise outputs).                |
-| ``KernelPlan``      | Tuple of ``Step`` + per-element port set + output thread count + trailing writes.                   |
-| ``analyze_kernel``  | Entry point: walks the body's ``Loop`` tree; each reduce ``Loop`` block → an optional ``Inline`` prelude (LICM: loop-invariant assigns hoisted out of the K-loop) + one ``Loop`` step. |
-
-**Rule:** Imports ``expr``, ``loop``. No dependency on ``program`` or
-any backend — this analysis is pure structural IR.
-
-### `gpu.py` — GPU IR, imperative C-like AST (Layer 3)
-
-The last IR before text. One ``GpuKernel`` per kernel; the rest of the
-hierarchy is the C/C++ statement + expression AST the codegen emits.
-
-| Group              | Symbols                                                                                                                                       |
-|--------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
-| GPU-specific expr  | ``ArrayAccess``, ``Cast``, ``FieldAccess``, ``VectorLoad``                                                                                    |
-| Statements         | ``VarDecl``, ``Assign``, ``VarAssign``, ``AugAssign``, ``ForLoop``, ``IfStmt``, ``SyncThreads``, ``ArrayDecl``, ``PragmaUnroll``, ``RawCode`` |
-| Kernel def         | ``GpuKernel``, ``GpuKernelParam``                                                                                                             |
-| Type alias         | ``GpuExpr``                                                                                                                                   |
-| Utilities          | ``pretty_print``                                                                                                                              |
-
-**Rule:** Imports ``expr`` only. No dependency on the higher dialects
-(frontend / tensor / loop) — by the time we are emitting C code, the
-loop-IR ops have already been translated into statements.
+| Dialect           | When populated                  | Ops                                                                                                   |
+|-------------------|---------------------------------|-------------------------------------------------------------------------------------------------------|
+| `base`            | always                          | `Op` (base), `InputOp`, `ConstantOp`                                                                  |
+| `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
+| `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
+| `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
+| `kernel/ir`       | after `lowering/kernel`         | `GpuKernel`, `KernelOp`, statement/expression AST                                                     |
+| `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
 ## Invariants by stage
 
-- **After tracing** (Layer 1): only frontend ops + ``InputOp`` / ``ConstantOp``.
-- **After decomposition** (Layer 1): no ``LinearOp``, ``MatmulOp``, ``SdpaOp``,
-  ``MeanOp``, ``UnsqueezeOp``, ``TransposeOp``, ``ReshapeOp``, ``SliceOp``,
-  ``CatOp``. Only ``ElementwiseOp``, ``ReduceOp``, ``IndexMapOp`` (plus
-  scan / gather / scatter for non-decomposed primitives), and boundary
-  sentinels.
-- **After fusion** (Layer 2): only ``LoopOp`` + ``InputOp`` + ``ConstantOp``.
-  Tensor-IR ops survive only *inside* ``LoopOp.body`` as ``Assign.op``.
-- **GPU IR** (Layer 3) sees only expressions and statements — no ``Op``
-  subclass appears.
+- **Frontend → tensor** (after `decomposition`): `LinearOp`, `MatmulOp`,
+  `SdpaOp`, `MeanOp`, and the layout ops are gone. Only
+  `ElementwiseOp`, `ReduceOp`, `IndexMapOp`, scan/gather/scatter, plus
+  boundaries survive. (The broadcast-explicit invariant for
+  `ElementwiseOp` inputs lives in `compiler/ARCHITECTURE.md`.)
+- **Tensor → loop** (after `fusion`): only `LoopOp` + boundaries.
+  Tensor-IR ops survive only *inside* `LoopOp.body` as `Assign.op` or
+  `Accum.op` (`ElementwiseOp` only — `ReduceOp` is not a valid body
+  op; reductions are `Accum` statements inside a reduce `Loop`).
+- **Loop → kernel** (after `lowering/kernel`): LoopOp nodes replaced by
+  `KernelOp` carrying a `GpuKernel` AST. Same `node.id` preserved (see
+  `pipeline/ARCHITECTURE.md`).
+- **Kernel → CUDA** (after `lowering/cuda`): `KernelOp` replaced by
+  `CudaOp` carrying rendered source.
 
-## Sub-IRs shared across stages
+## `base.py`
 
-- **``expr.py``** is the common expression sublanguage. It appears inside
-  ``IndexMapOp.coord_map`` (tensor), ``Load.index`` / ``Write.index`` /
-  ``SelectBranch.select`` (loop), and ``ArrayAccess.index`` /
-  ``ForLoop.end`` / everywhere in GPU IR. Coord-expression helpers
-  (``substitute``, ``placeholder``, ``is_placeholder``) are pure AST
-  operations and live here too.
-- **``graph.py``** is the shared container. The *contents* change per stage
-  but the container doesn't.
+Cross-cutting root. Imported by every dialect, imports nothing from
+them.
+
+| Symbol          | Role                                                                           |
+|-----------------|--------------------------------------------------------------------------------|
+| `Op`            | Base class. Subclasses implement `infer_output_shape` and `forward` (numpy).   |
+| `InputOp`       | Sentinel: graph input tensor. Value supplied by the executor.                  |
+| `ConstantOp`    | Sentinel: weights / scalar constants. Scalars carry `value`; tensors don't.    |
+| `_keepdim_axis` | Shape helper shared by `ReduceOp` (tensor) and `MeanOp` (frontend).            |
+
+## `expr.py`
+
+Shared expression sublanguage used by both loop IR (`Load.index`,
+`Write.index`, `SelectBranch.select`, `IndexMapOp.coord_map`) and
+kernel IR (`ArrayAccess.index`, `ForLoop.end`, …). Imports nothing from
+other IR files.
+
+| Symbol                                                             | Role                                                                     |
+|--------------------------------------------------------------------|--------------------------------------------------------------------------|
+| `Var`, `Literal`, `BinOp`, `Builtin`, `FuncCall`, `Ternary`, `Cast`| Expression nodes. Each has `eval(env) → value/ndarray`.                  |
+| `_ExprOps`                                                         | Mixin: Python operator overloading for expression building.              |
+| `Expr`                                                             | Union type alias.                                                        |
+| `PLACEHOLDER_PREFIX`, `placeholder`, `is_placeholder`              | Convention for output-coord placeholders in coord maps.                  |
+| `substitute`                                                       | Tree rewrite: replace named `Var` nodes.                                 |
+
+## `frontend/ir.py`
+
+Ops captured directly from PyTorch. Every one has a decomposition rule
+under `pipeline/passes/decomposition/`; after that pass none of these
+remain.
+
+| Group         | Ops                                                                                       |
+|---------------|-------------------------------------------------------------------------------------------|
+| Layout-only   | `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp`, `UnsqueezeOp` — rewrite to `IndexMapOp`.  |
+| Compound math | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp` — rewrite to elementwise + reduce chains.      |
+
+## `tensor/ir.py`
+
+Minimal IR fusion consumes. `IndexMapOp` is the unified layout-only op;
+it replaces the frontend layout ops via `coord_map` expressions.
+
+| Symbol                               | Role                                                           |
+|--------------------------------------|----------------------------------------------------------------|
+| `ElementwiseOp`                      | Per-element scalar function (`add`/`mul`/`exp`/…).             |
+| `ReduceOp`                           | Collapse one axis via associative binary op.                   |
+| `ScanOp`                             | Cumulative variant of reduce.                                  |
+| `GatherOp`, `ScatterOp`              | Data-dependent reads / writes.                                 |
+| `IndexMapOp` + `IndexSource`         | Unified layout-only op over `Expr`.                            |
+| `OpInfo`, `OP_REGISTRY`              | Elementwise arity / commutativity.                             |
+| `ReduceInfo`, `REDUCE_REGISTRY`      | Reduce identity elements.                                      |
+
+## `loop/`
+
+One `LoopOp` = one GPU kernel described as an SSA program over named
+iteration axes. Free vs reduce is inferred from body structure — a
+`Loop` is a reduce Loop iff its body contains an `Accum`.
+
+### `loop/ir.py` — LoopOp types
+
+| Symbol                       | Role                                                                                                              |
+|------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| `Axis`                       | Named iteration variable (`name`, `extent`).                                                                      |
+| `LoopOp`                     | One kernel. Stored field: `body` (nested `Loop` tree). Computed: `axes`, `loads`, `accums`.                       |
+| `Load`                       | Body-form external read: `name = load(source)[index...]`. `source` indexes into `node.inputs`.                    |
+| `Assign`                     | SSA body stmt: `name = op(args)` with `op: ElementwiseOp`.                                                        |
+| `Accum`                      | Reduce accumulator: `name = op(name, value)` inside a reduce `Loop`. Initialized to `ACCUM_IDENTITY[op.fn]`.      |
+| `Write`                      | Write an SSA value to output at `index`.                                                                          |
+| `Select` + `SelectBranch`    | Coord-predicated binding (replaces the old Mux).                                                                  |
+| `Loop`                       | Iteration block: `axis` + nested `body`.                                                                          |
+| `Stmt`                       | Union: `Assign \| Accum \| Write \| Select \| Loop \| Load`.                                                      |
+
+Body walkers: `iter_body(body)` (pre-order; powers `for s in loop_op`),
+`map_body(body, fn)` (transformer), `Stmt.rewrite(rename_ssa, sigma)`
+(per-stmt copy with SSA rename + Expr substitution).
+
+### `loop/normalize.py` — structural canonicalization
+
+Pure `body → body` passes run from `LoopOp.__post_init__` so every
+constructed `LoopOp` (including intermediate fusion results) is
+canonicalized before validation:
+
+- `drop_size_one_free_axes` — inline extent-1 free Loops.
+- `canonicalize_free_axis_order` — sort outer free Loops by axis name.
+- `eliminate_copy_aliases` — drop `y = copy(x)` Assigns.
+- `unify_sibling_reduce_axes` — collapse sibling reduce Loops sharing
+  an input dim (softmax's max + sum sweeps become one reduce axis).
+- `hoist_loop_invariants` — pull loop-invariant Assigns out of reduce
+  Loops.
+- `rename_ssa_sequential` — cosmetic: Assign/Select names become `v0,
+  v1, …` in definition order.
+
+### `loop/simplify.py` — Expr simplification
+
+Called inside `normalize_body`. Generic bottom-up Expr rewriter:
+constant folding, algebraic identities, range-based comparison folding
+(`(k0 > 2047 ? 2047 : k0) < 0 ? 0 : k0` → `k0`). `Context`/`Interval`
+track integer ranges from axis extents.
+
+Also used by `ir/kernel/normalize.py` for GpuKernel Expr simplification.
+
+### `loop/splicer.py` + `loop/sigma.py` — LoopOp merger
+
+The machinery `pipeline/passes/fusion/005_merge_loop_ops.py` calls to
+splice adjacent `LoopOp` pairs. Sigma is axis-substitution bookkeeping
+threaded through the merge.
+
+### `loop/interpret.py` — numpy interpreter
+
+`execute_loop_op(loop, input_arrays, out_shape) → ndarray` walks the
+LoopOp body against pre-provided input arrays. Powers `LoopOp.forward`
+— so post-fusion graphs run through the shared `interpret_graph` like
+any pre-fusion graph.
+
+### `loop/builder.py` — fluent construction
+
+`LoopBuilder` helper used by decomposition/fusion tests to construct
+LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
+
+## `kernel/`
+
+### `kernel/ir.py` — C-like AST
+
+| Group              | Symbols                                                                                                                                       |
+|--------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| Expression (GPU)   | `ArrayAccess`, `Cast`, `FieldAccess`, `VectorLoad` + shared `Expr` types                                                                      |
+| Statements         | `VarDecl`, `Assign`, `VarAssign`, `AugAssign`, `ForLoop`, `IfStmt`, `SyncThreads`, `ArrayDecl`, `PragmaUnroll`, `RawCode`                     |
+| Kernel definition  | `GpuKernel` (AST + block_size + includes + launch_bounds), `GpuKernelParam`                                                                   |
+| Graph-op wrapper   | `KernelOp` (carries a `GpuKernel` + grid/block/smem/zero_outputs/arg_order)                                                                   |
+| Type alias         | `GpuExpr`                                                                                                                                     |
+| Utilities          | `pretty_print`                                                                                                                                |
+
+### `kernel/normalize.py`
+
+Runs from `KernelOp.__post_init__`. Pushes integer ranges from
+`VarDecl` inits (thread-index compositions), `IfStmt` conds, and
+`ForLoop` bounds; delegates the core Expr rewrite to
+`ir/loop/simplify.simplify_expr`.
+
+## `cuda/ir.py`
+
+| Symbol    | Role                                                                        |
+|-----------|-----------------------------------------------------------------------------|
+| `CudaOp`  | Graph-op carrying `kernel_source`, `kernel_name`, `arg_order`, grid, block, `smem_bytes`, `zero_outputs`, `comment`. Produced by `pipeline/passes/lowering/cuda`. |
 
 ## Graph as the single program form
 
-There is no separate program type. A ``Graph`` is the execution plan:
-node ids are buffer names, ``node.output.shape`` is the buffer shape,
-``graph.topological_order()`` is the launch order, and
-``graph.inputs`` / ``graph.outputs`` / ``ConstantOp`` membership gives
-each buffer its role (input / output / constant / scratch).
-
-Backends walk the graph directly — the loop backend dispatches on
-``LoopOp`` / ``Op.forward``; the CUDA backend walks the lowered
-``Graph[CudaOp]`` to emit kernel launches.
-
-## See also
-
-- ``compiler/ARCHITECTURE.md`` — pipeline-level view of how frontend /
-  lowering / backend fit together.
-- ``compiler/pipeline/passes/`` — the decomposition / optimization / fusion /
-  lowering passes that transform one IR stage into the next.
-- ``compiler/backend/cuda/emit.py`` — per-kernel LoopOp → GpuKernel helpers
-  used by ``passes/lowering/kernel``.
-- ``compiler/pipeline/passes/lowering/cuda/_emit.py`` — GpuKernel → C source.
+There is no separate program type. A `Graph` is the execution plan:
+node ids are buffer names, `node.output.shape` is the buffer shape,
+`graph.topological_order()` is the launch order, and
+`graph.inputs` / `graph.outputs` / `ConstantOp` membership gives each
+buffer its role (input / output / constant / scratch).
