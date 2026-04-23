@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.backend.base import BenchmarkResult, ProgramResult
+    from deplodock.compiler.backend.base import BenchmarkResult, RunResult
     from deplodock.compiler.ir.graph import Graph
     from deplodock.compiler.plan import ExecutionPlan
     from deplodock.compiler.rewriter import PassTrace
@@ -189,7 +189,7 @@ class CompilerDump:
     def dump_source(self, source: str) -> None:
         self._write_text("50_full_program.cu", source)
 
-    def dump_result(self, result: ProgramResult) -> None:
+    def dump_result(self, result: RunResult) -> None:
         # outputs are ndarrays; serialize as nested lists for JSON.
         data: dict = {"outputs": {n: arr.tolist() for n, arr in result.outputs.items()}}
         if result.time_ms is not None:

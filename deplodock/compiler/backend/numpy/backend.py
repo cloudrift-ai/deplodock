@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-from deplodock.compiler.backend import Backend, ProgramResult
+from deplodock.compiler.backend import Backend, RunResult
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph
 
@@ -25,12 +25,12 @@ class NumpyBackend(Backend):
         """Wrap the graph for execution. Input data is supplied at run time."""
         return NumpyProgram(graph=graph)
 
-    def run(self, compiled: NumpyProgram, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
+    def run(self, compiled: NumpyProgram, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         """Execute the graph and return outputs as numpy arrays."""
         t0 = time.perf_counter()
         arrays = _execute(compiled.graph, input_data or {})
         elapsed = (time.perf_counter() - t0) * 1000
-        return ProgramResult(outputs=arrays, time_ms=elapsed)
+        return RunResult(outputs=arrays, time_ms=elapsed)
 
 
 class NumpyProgram:
