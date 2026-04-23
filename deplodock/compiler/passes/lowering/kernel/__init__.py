@@ -1,5 +1,5 @@
-"""LoopOp → KernelOp lowering pass."""
+"""LoopOp → KernelOp lowering pass.
 
-from deplodock.compiler.passes.lowering.kernel.lower_loopop import lower
-
-__all__ = ["lower"]
+Discovered as a rule-based pass by ``Rewriter.from_directory`` under the
+``lowering/kernel`` subpath; see ``001_lower_loopop.py`` for the rule.
+"""

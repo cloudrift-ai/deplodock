@@ -49,10 +49,10 @@ def emit_kernel(node: Node, kernel_name: str, graph: Graph) -> tuple[GpuKernel, 
     return kd, arg_order
 
 
-def kernel_name_for(loop: LoopOp, idx: int) -> str:
+def kernel_name_for(loop: LoopOp, node_id: str) -> str:
     if any(isinstance(s, Accum) for s in loop):
-        return f"k{idx}_reduce"
-    return f"k{idx}_pointwise"
+        return f"k_{node_id}_reduce"
+    return f"k_{node_id}_pointwise"
 
 
 def launch_config(node: Node) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
