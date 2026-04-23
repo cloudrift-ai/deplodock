@@ -7,9 +7,9 @@ The resulting MeanOp is further lowered to sum + div by 007_decompose_mean.
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.broadcast import broadcast_to
-from deplodock.compiler.ir.frontend_ir import MeanOp
+from deplodock.compiler.ir.frontend.ir import MeanOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
 _DEFAULT_EPS = 1e-6

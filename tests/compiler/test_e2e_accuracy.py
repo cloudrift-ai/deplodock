@@ -10,7 +10,7 @@ import numpy as np
 
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
 def _assert_close(actual, expected, *, rtol: float = 1e-4, atol: float = 1e-5):
@@ -64,7 +64,7 @@ def test_e2e_reduce_sum(run_graph):
 
 
 def test_e2e_matmul(run_graph):
-    from deplodock.compiler.ir.frontend_ir import MatmulOp
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")

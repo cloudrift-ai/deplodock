@@ -43,7 +43,7 @@ from deplodock.compiler.backend.cuda.generators import lower_tiled  # noqa: E402
 
 from deplodock.compiler.backend.cuda.runner import _detect_arch, generate_benchmark_program  # noqa: E402
 from deplodock.compiler.backend.cuda.tuning import default_matmul_strategy_map  # noqa: E402
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp  # noqa: E402
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp  # noqa: E402
 
 # TODO: FusedRegionOp no longer exists in the structural IR; this diagnostic
 # script predates the LoopOp refactor and needs porting before it can run.

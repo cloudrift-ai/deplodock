@@ -2,7 +2,7 @@
 
 Backend-agnostic expression sublanguage used by:
 
-- ``IndexMapOp.coord_map`` (``ir.tensor_ir``): affine output→input coord maps.
+- ``IndexMapOp.coord_map`` (``ir.tensor.ir``): affine output→input coord maps.
 - ``Mux.select`` / ``MuxBranch.select`` (``ir.loop``): coord predicates.
 - GPU IR (``ir.kernel``): array indices, loop bounds, ternary selects.
 
@@ -309,7 +309,7 @@ def render(expr: Expr, formatter: Callable[[object], str | None] | None = None) 
 # Coordinate-expression helpers for IndexMapOp
 # ---------------------------------------------------------------------------
 #
-# ``IndexMapOp`` (in ``ir.tensor_ir``) describes layout-only ops (slice, cat,
+# ``IndexMapOp`` (in ``ir.tensor.ir``) describes layout-only ops (slice, cat,
 # transpose, reshape, unsqueeze) by mapping output coordinates to input
 # coordinates via the ``Expr`` AST above. Convention: an IndexMap's
 # ``coord_map[i]`` is an ``Expr`` over placeholder variables

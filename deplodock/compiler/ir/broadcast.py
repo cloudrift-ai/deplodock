@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import IndexMapOp, IndexSource
+from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 
 
 def broadcast_to(graph: Graph, node_id: str, target_shape: tuple) -> str:

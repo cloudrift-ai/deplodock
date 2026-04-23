@@ -9,9 +9,9 @@ Inputs are unsqueezed so the mul is a standard NumPy broadcast:
 
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.broadcast import broadcast_to, squeeze_axis
-from deplodock.compiler.ir.frontend_ir import MatmulOp
+from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.graph import Graph, Tensor
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.matcher import ChainMatch, Production
 from deplodock.compiler.passes.decomposition._matmul_helpers import matmul_unsqueeze
 

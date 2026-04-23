@@ -17,7 +17,7 @@ from deplodock.compiler.backend import Backend, ProgramResult
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, LoopOp, Select, Write
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 
 if TYPE_CHECKING:

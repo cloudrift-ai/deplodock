@@ -14,7 +14,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, substitute
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Select, SelectBranch, Stmt, Write
-from deplodock.compiler.ir.tensor_ir import IndexMapOp
+from deplodock.compiler.ir.tensor.ir import IndexMapOp
 from deplodock.compiler.matcher import ChainMatch, Production
 
 GRAMMAR = [Production("root", IndexMapOp, "1")]

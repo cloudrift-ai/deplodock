@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from deplodock.compiler.ir.graph import Graph
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
@@ -50,7 +50,7 @@ def test_tinyllama_has_expected_ops():
 
 def test_tinyllama_has_7_linear_patterns():
     """The graph should have 7 linear projections (Q, K, V, O, gate, up, down)."""
-    from deplodock.compiler.ir.frontend_ir import LinearOp
+    from deplodock.compiler.ir.frontend.ir import LinearOp
 
     g = _load_fixture("tinyllama_layer0.json")
     linear_count = sum(1 for n in g.nodes.values() if isinstance(n.op, LinearOp))
@@ -59,7 +59,7 @@ def test_tinyllama_has_7_linear_patterns():
 
 def test_tinyllama_has_sdpa():
     """torch.export keeps scaled_dot_product_attention as a single op."""
-    from deplodock.compiler.ir.frontend_ir import SdpaOp
+    from deplodock.compiler.ir.frontend.ir import SdpaOp
 
     g = _load_fixture("tinyllama_layer0.json")
     sdpa_count = sum(1 for n in g.nodes.values() if isinstance(n.op, SdpaOp))

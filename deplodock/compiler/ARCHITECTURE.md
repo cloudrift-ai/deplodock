@@ -9,9 +9,9 @@
 │  torch_trace.py ─→ Graph populated with frontend ops                                                                 │
 │      ir/graph.py:    Tensor, Node[T_Op], Graph, Hints                                                                │
 │      ir/base.py:     Op, InputOp, ConstantOp                                                                         │
-│      ir/frontend_ir.py: Torch-captured ops (LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,               │
+│      ir/frontend/ir.py: Torch-captured ops (LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,               │
 │                      ReshapeOp, SliceOp, CatOp)                                                                      │
-│      ir/tensor_ir.py:   minimal IR survives decomposition (ElementwiseOp, ReduceOp, IndexMapOp, ...)                    │
+│      ir/tensor/ir.py:   minimal IR survives decomposition (ElementwiseOp, ReduceOp, IndexMapOp, ...)                    │
 │      ir/expr.py:     Expr AST + coord_expr helpers                                                                   │
 │                                                                                                                      │
 │  RULE: No GPU, no CUDA, no backend imports.                                                                          │

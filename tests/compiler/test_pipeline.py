@@ -10,7 +10,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Accum, LoopOp
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import compile_graph
 
 requires_cuda = pytest.mark.skipif(
@@ -30,7 +30,7 @@ def _pointwise_chain_graph() -> Graph:
 
 
 def _matmul_graph(m: int, k: int, n: int) -> Graph:
-    from deplodock.compiler.ir.frontend_ir import MatmulOp
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k)), node_id="a")

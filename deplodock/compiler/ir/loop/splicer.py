@@ -65,7 +65,7 @@ from deplodock.compiler.ir.loop.ir import (
     Write,
 )
 from deplodock.compiler.ir.loop.sigma import Sigma
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 
 class _NotSupported(Exception):

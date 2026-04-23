@@ -14,7 +14,7 @@ from deplodock.compiler.ir.loop import (
     SelectBranch,
     Write,
 )
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 
 def Port(index=()):

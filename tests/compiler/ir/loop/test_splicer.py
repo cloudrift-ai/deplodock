@@ -21,7 +21,7 @@ from deplodock.compiler.ir.loop import (
     splice_loop_ops,
     splice_loops,
 )
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -45,7 +45,7 @@ from deplodock.compiler.ir.loop.ir import (
     map_body,
 )
 from deplodock.compiler.ir.loop.sigma import Sigma
-from deplodock.compiler.ir.tensor_ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 __all__ = [
     "normalize_body",
