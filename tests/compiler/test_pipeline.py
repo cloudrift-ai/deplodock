@@ -13,7 +13,7 @@ from deplodock.compiler.ir.loop import Accum, LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import run_pipeline
 
-_FUSE_PASSES = ["decomposition", "optimization", "fusion"]
+_FUSE_PASSES = ["decomposition", "optimization", "lifting", "fusion"]
 
 
 def _compile(graph: Graph) -> Graph:

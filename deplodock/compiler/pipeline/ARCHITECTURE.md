@@ -11,7 +11,8 @@ pipeline/
 └── passes/
     ├── decomposition/    # frontend ops → tensor-IR primitives
     ├── optimization/     # IndexMap fusion before lift-to-loop
-    ├── fusion/           # tensor ops → LoopOp nodes + adjacent LoopOp merge
+    ├── lifting/          # tensor ops → trivial LoopOp nodes
+    ├── fusion/           # merge adjacent LoopOp pairs (splice)
     └── lowering/
         ├── kernel/       # LoopOp → KernelOp (emit GpuKernel AST)
         └── cuda/         # KernelOp → CudaOp (render source string)
@@ -79,7 +80,8 @@ ignores the prefix itself — it's only for ordering readability.
 |------------------|----------------------------------------------------------------------|
 | `decomposition/` | Rewrite frontend ops (`LinearOp`, `MatmulOp`, `SdpaOp`, layout ops, fused ops like `rms_norm`/`softmax`) into tensor-IR primitives + layout-only `IndexMapOp`s. Each rule emits broadcast-explicit IR via `_broadcast.broadcast_to`. |
 | `optimization/`  | `compose_indexmaps`: collapse chains of single-source / single-consumer `IndexMapOp` into one coord_map — prevents trivial layout kernels from blocking fusion. |
-| `fusion/`        | `lift_*` rules wrap each surviving tensor op in a trivial `LoopOp`; `merge_loop_ops` splices adjacent `LoopOp` pairs using `ir/loop/splicer.py::splice_graph`. |
+| `lifting/`       | `lift_*` rules wrap each surviving tensor primitive (elementwise / reduce / indexmap / gather) in a trivial one-op `LoopOp`. |
+| `fusion/`        | `merge_loop_ops` splices adjacent `LoopOp` pairs using `ir/loop/splicer.py::splice_graph`. |
 | `lowering/kernel/` | Emit per-node `GpuKernel` AST (via `_emit.py`) and mutate the node's op to `KernelOp` in place. |
 | `lowering/cuda/`   | Render the `GpuKernel` to a `__global__` source string (via `_emit.py`) and mutate the node's op to `CudaOp` in place. |
 

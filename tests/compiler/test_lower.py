@@ -23,7 +23,7 @@ from deplodock.compiler.pipeline import run_pipeline
 _backend = NumpyBackend()
 rng = np.random.default_rng(0)
 
-_FUSE_PASSES = ["decomposition", "optimization", "fusion"]
+_FUSE_PASSES = ["decomposition", "optimization", "lifting", "fusion"]
 
 
 def _compile(graph: Graph) -> Graph:

@@ -6,7 +6,7 @@
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
   dispatch that routes post-pass dumps by pass name.
 - :mod:`.passes` — pass directories (``decomposition/``, ``optimization/``,
-  ``fusion/``, ``lowering/{kernel,cuda}/``); each contains ``NNN_<name>.py``
+  ``lifting/``, ``fusion/``, ``lowering/{kernel,cuda}/``); each contains ``NNN_<name>.py``
   rule modules picked up by ``run_pass``.
 """
 
