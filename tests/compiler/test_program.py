@@ -3,7 +3,7 @@
 import pytest
 
 from deplodock.compiler.backend.cuda.program import benchmark_program, run_program
-from deplodock.compiler.backend.cuda.runner import has_cuda_gpu
+from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Tensor

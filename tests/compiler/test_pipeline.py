@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from deplodock.compiler.backend.cuda.backend import CudaBackend
-from deplodock.compiler.backend.cuda.runner import has_cuda_gpu, has_nvcc
+from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu, has_nvcc
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Tensor
