@@ -5,12 +5,12 @@ coord_map for axis i reads the input's coord at axis i (for i < k) or i-1
 (for i > k); the inserted axis k contributes nothing to the input read.
 """
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.frontend.ir import UnsqueezeOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", UnsqueezeOp)]
 

@@ -1,20 +1,24 @@
-"""Compiler pipeline: rule-based rewriter, pass directories, dump hooks.
+"""Compiler pipeline: rewrite engine + pass directories + dump hooks.
 
-Layout:
-
-- :mod:`.base` — ``run_pipeline(graph, passes, dump=None)`` entry point.
-- :mod:`.rewriter` — pattern-matching rule engine (``run_pass``, ``run_rule``).
-- :mod:`.matcher` — chain pattern matcher (``Pattern``, ``Match``, ``match_pattern``).
-- :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass`` dispatch.
+- :mod:`.engine` — pattern matcher + rule runner + ``run_pipeline``
+  entry point. Exports ``Pattern``, ``Match``, ``match_pattern``,
+  ``run_rule``, ``run_pass``, ``run_pipeline``.
+- :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
+  dispatch that routes post-pass dumps by pass name.
 - :mod:`.passes` — pass directories (``decomposition/``, ``optimization/``,
-  ``fusion/``, ``lowering/``) whose rule modules (``NNN_<name>.py``) are
-  picked up by ``run_pass``.
+  ``fusion/``, ``lowering/{kernel,cuda}/``); each contains ``NNN_<name>.py``
+  rule modules picked up by ``run_pass``.
 """
 
-from deplodock.compiler.pipeline.base import run_pipeline
 from deplodock.compiler.pipeline.dump import CompilerDump
-from deplodock.compiler.pipeline.matcher import Match, Pattern, match_pattern
-from deplodock.compiler.pipeline.rewriter import run_pass, run_rule
+from deplodock.compiler.pipeline.engine import (
+    Match,
+    Pattern,
+    match_pattern,
+    run_pass,
+    run_pipeline,
+    run_rule,
+)
 
 __all__ = [
     "CompilerDump",

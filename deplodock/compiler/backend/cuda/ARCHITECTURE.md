@@ -32,7 +32,7 @@ Shared infrastructure (backend-agnostic) lives at the IR layer:
 
 ```
 compiler/ir/kernel/ir.py   # GpuKernel, GpuKernelParam, Stmt hierarchy, expressions, KernelOp graph-op
-compiler/ir/kernel/emit.py # per-node LoopOp → GpuKernel codegen (emit_kernel, launch_config)
+compiler/pipeline/passes/lowering/kernel/_emit.py # per-node LoopOp → GpuKernel codegen (emit_kernel, launch_config)
 compiler/ir/cuda/ir.py     # CudaOp   (graph-op with rendered CUDA source)
 ir/cuda/emit.py  # GpuKernel → C source (one level up; not CUDA-specific)
 ```

@@ -2,9 +2,9 @@
 
 import pytest
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 # ---- helpers ----
 
@@ -13,7 +13,7 @@ def _make_matmul_graph():
     """Build: C[M,1,N] = reduce_sum(elementwise_mul(A[M,K,N], B[M,K,N]), axis=1).
 
     Uses keepdim reduction and matching-shape elementwise inputs to stay on
-    the Tensor IR rank-preservation invariant (see ir/broadcast.py for how
+    the Tensor IR rank-preservation invariant (see pipeline/passes/decomposition/_broadcast.py for how
     decomposition rules insert explicit IndexMapOps when shapes differ).
     """
     g = Graph()

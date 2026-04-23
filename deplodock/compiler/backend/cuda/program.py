@@ -20,9 +20,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.cuda import CudaOp
-from deplodock.compiler.pipeline.graph import Graph, Node
 
 if TYPE_CHECKING:
     import cupy as cp

@@ -1,8 +1,8 @@
 """Tests for the hint system."""
 
+from deplodock.compiler.graph import Graph, Hints, Tensor, resolve_hints
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Hints, Tensor, resolve_hints
 
 
 def _matmul_graph() -> Graph:
@@ -166,7 +166,7 @@ def test_hints_flow_through_lower():
     After fusion, the matmul pair (mul + sum) becomes one LoopOp graph
     node whose ``.hints`` carries the merged hints from all consumed nodes.
     """
-    from deplodock.compiler.pipeline.rewriter import run_pass
+    from deplodock.compiler.pipeline.engine import run_pass
 
     g = _matmul_graph()
     ew_id = next(nid for nid, n in g.nodes.items() if isinstance(n.op, ElementwiseOp))

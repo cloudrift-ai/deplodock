@@ -9,10 +9,10 @@ inputs at the output shape — the rank-preserving Tensor IR invariant.
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
+from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()

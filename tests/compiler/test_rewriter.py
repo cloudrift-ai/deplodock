@@ -2,10 +2,10 @@
 
 from pathlib import Path
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.rewriter import run_pass
+from deplodock.compiler.pipeline.engine import run_pass
 
 _DECOMP_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "decomposition"
 

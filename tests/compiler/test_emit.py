@@ -11,10 +11,10 @@ import pytest
 
 from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp  # noqa: F401
-from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 requires_cuda = pytest.mark.skipif(
     not has_cuda_gpu(),

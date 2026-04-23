@@ -9,8 +9,8 @@ and ``test_emit.py`` against synthetic inputs; E2E flows through
 import json
 from pathlib import Path
 
+from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.graph import Graph
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 

@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
@@ -22,8 +23,7 @@ from deplodock.compiler.ir.frontend.ir import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.rewriter import run_rule
+from deplodock.compiler.pipeline.engine import run_rule
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "decomposition"
 
@@ -203,7 +203,7 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     """
     import torch
 
-    from deplodock.compiler.pipeline.rewriter import run_pass
+    from deplodock.compiler.pipeline.engine import run_pass
     from deplodock.compiler.trace.torch import trace_module
 
     rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
@@ -264,7 +264,7 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     """End-to-end: torch.nn.Softmax → trace → decomposition yields primitives only."""
     import torch
 
-    from deplodock.compiler.pipeline.rewriter import run_pass
+    from deplodock.compiler.pipeline.engine import run_pass
     from deplodock.compiler.trace.torch import trace_module
 
     rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"

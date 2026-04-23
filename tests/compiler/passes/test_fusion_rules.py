@@ -14,11 +14,11 @@ from pathlib import Path
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.rewriter import run_pass
+from deplodock.compiler.pipeline.engine import run_pass
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "fusion"
 
@@ -217,7 +217,7 @@ def test_contraction_body_has_mul_and_sum():
 
 
 def _make_contraction_with_epilogue():
-    from deplodock.compiler.ir.broadcast import broadcast_to
+    from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")

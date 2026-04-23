@@ -4,7 +4,6 @@ Tests each expression and statement type directly, verifying that
 emit_kernel / _emit_expr / _emit_stmt produce correct C/CUDA source.
 """
 
-from deplodock.compiler.ir.cuda.emit import emit_kernel
 from deplodock.compiler.ir.kernel import (
     ArrayAccess,
     ArrayDecl,
@@ -28,6 +27,7 @@ from deplodock.compiler.ir.kernel import (
     VarDecl,
     VectorLoad,
 )
+from deplodock.compiler.pipeline.passes.lowering.cuda._emit import emit_kernel
 
 # ---------------------------------------------------------------------------
 # Expression nodes
@@ -36,7 +36,7 @@ from deplodock.compiler.ir.kernel import (
 
 def _emit_expr(expr, parent_prec=0) -> str:
     """Helper: access the private _emit_expr from codegen."""
-    from deplodock.compiler.ir.cuda.emit import _emit_expr
+    from deplodock.compiler.pipeline.passes.lowering.cuda._emit import _emit_expr
 
     return _emit_expr(expr, parent_prec)
 
@@ -162,7 +162,7 @@ def test_vector_load_float2():
 
 def _emit_stmt(stmt, indent=0) -> str:
     """Helper: access the private _emit_stmt from codegen."""
-    from deplodock.compiler.ir.cuda.emit import _emit_stmt
+    from deplodock.compiler.pipeline.passes.lowering.cuda._emit import _emit_stmt
 
     return _emit_stmt(stmt, indent)
 

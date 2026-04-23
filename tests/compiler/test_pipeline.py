@@ -6,12 +6,12 @@ import pytest
 
 from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.loop import Accum, LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import run_pipeline
-from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 _FUSE_PASSES = ["decomposition", "optimization", "fusion"]
 

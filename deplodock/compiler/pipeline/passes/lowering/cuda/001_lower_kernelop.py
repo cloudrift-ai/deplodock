@@ -8,10 +8,11 @@ output buffer name; splicing in a new node would break that reference.)
 
 from __future__ import annotations
 
+from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.cuda import CudaOp
-from deplodock.compiler.ir.kernel import KernelOp, emit_kernel_source
-from deplodock.compiler.pipeline.graph import Graph
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.ir.kernel import KernelOp
+from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.lowering.kernel._emit import emit_kernel_source
 
 PATTERN = [Pattern("root", KernelOp)]
 
