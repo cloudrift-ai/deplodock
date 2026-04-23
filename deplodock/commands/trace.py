@@ -4,7 +4,6 @@ import ast
 import json
 import logging
 import sys
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -132,66 +131,140 @@ def graph_from_code(code: str):
         logger.error("--code failed to parse: %s", e)
         sys.exit(2)
 
-    if not tree.body or not isinstance(tree.body[-1], ast.Expr) or not isinstance(tree.body[-1].value, ast.Call):
-        logger.error('--code must end with a call expression, e.g. "m(x)" or "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"')
+    if not tree.body or not isinstance(tree.body[-1], ast.Expr):
+        logger.error('--code must end with an expression (e.g. "torch.exp(torch.neg(x))")')
         sys.exit(2)
 
-    call = tree.body[-1].value
+    final_expr = tree.body[-1].value
     scope = {"torch": torch, "nn": torch.nn, "F": F}
     preamble = ast.Module(body=tree.body[:-1], type_ignores=[])
-    exec(compile(preamble, "<--code>", "exec"), scope)  # noqa: S102 — local CLI, equivalent to python -c
+    exec(compile(preamble, "<--code>", "exec"), scope)  # noqa: S102 — local CLI
 
-    module = eval(compile(ast.Expression(call.func), "<--code callable>", "eval"), scope)  # noqa: S307
-    example_inputs = tuple(eval(compile(ast.Expression(a), "<--code arg>", "eval"), scope) for a in call.args)  # noqa: S307
-    kwargs = {kw.arg: eval(compile(ast.Expression(kw.value), "<--code kwarg>", "eval"), scope) for kw in call.keywords if kw.arg}  # noqa: S307
+    # Fast path: direct call to an nn.Module — trace it straight, preserving
+    # the module's parameter capture (weights land as Graph constants).
+    if isinstance(final_expr, ast.Call):
+        try:
+            maybe_mod = eval(compile(ast.Expression(final_expr.func), "<--code>", "eval"), scope)  # noqa: S307
+        except Exception:  # noqa: BLE001
+            maybe_mod = None
+        if isinstance(maybe_mod, torch.nn.Module):
+            args = tuple(eval(compile(ast.Expression(a), "<--code>", "eval"), scope) for a in final_expr.args)  # noqa: S307
+            kws = {
+                kw.arg: eval(compile(ast.Expression(kw.value), "<--code>", "eval"), scope)  # noqa: S307
+                for kw in final_expr.keywords
+                if kw.arg
+            }
+            logger.info("Tracing inline module: %s", ast.unparse(final_expr.func))
+            graph = trace_module(maybe_mod, args, kwargs=kws or None)
+            return graph, _slugify(ast.unparse(final_expr.func))
 
-    if not isinstance(module, torch.nn.Module):
-        # Functional call (e.g. F.silu, torch.matmul). Wrap in a Module with
-        # explicit parameter names (x / x0, x1, ...) so torch.export names
-        # the graph inputs accordingly. Non-tensor args/kwargs are baked
-        # into the closure; tensor kwargs are forwarded as kwargs to fn.
-        fn = module
-        tensor_args: list[torch.Tensor] = []
-        arg_slots: list[int | tuple[str, Any]] = []
-        for a in example_inputs:
-            if isinstance(a, torch.Tensor):
-                arg_slots.append(len(tensor_args))
-                tensor_args.append(a)
-            else:
-                arg_slots.append(("const", a))
-        tensor_kw_names = [k for k, v in kwargs.items() if isinstance(v, torch.Tensor)]
-        baked_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, torch.Tensor)}
-        n_positional = len(tensor_args)
-        pos_names = ["x"] if n_positional == 1 else [f"x{i}" for i in range(n_positional)]
-        param_names = pos_names + tensor_kw_names
+    # General path: treat the final expression as a function body. Inputs
+    # come from two sources: (1) bare Name references to tensors in scope
+    # (set up via a preamble like ``x = torch.randn(8)``), and (2) inline
+    # tensor-constructor calls (``torch.randn(...)``, etc.) which get
+    # eagerly evaluated and bound to fresh placeholder names. Everything
+    # else (torch, F, nn, helper modules, scalars) stays in the closure.
+    rewritten, tensor_params = _lift_tensor_inputs(final_expr, scope)
+    if not tensor_params:
+        logger.error("--code expression has no tensor inputs to trace")
+        sys.exit(2)
 
-        # Synthesize the wrapper source so torch.export sees literal param
-        # names rather than *args.
-        src = (
-            "class _FunctionalWrapper(torch.nn.Module):\n"
-            f"    def forward(self{''.join(', ' + n for n in param_names)}):\n"
-            f"        pos = [{', '.join(pos_names)}]\n"
-            "        resolved = [pos[s] if isinstance(s, int) else s[1] for s in arg_slots]\n"
-            f"        kw = {{{', '.join(repr(n) + ': ' + n for n in tensor_kw_names)}}}\n"
-            "        return fn(*resolved, **baked_kwargs, **kw)\n"
-        )
-        wrapper_scope: dict[str, Any] = {
-            "torch": torch,
-            "fn": fn,
-            "arg_slots": arg_slots,
-            "baked_kwargs": baked_kwargs,
-        }
-        exec(src, wrapper_scope)  # noqa: S102 — local CLI
-        module = wrapper_scope["_FunctionalWrapper"]()
-        example_inputs = tuple(tensor_args)
-        kwargs = {k: v for k, v in kwargs.items() if isinstance(v, torch.Tensor)}
+    # Polish synthesized ``_x<N>`` placeholder names: use ``x`` when there's
+    # exactly one synthesized input, or ``x0``/``x1``/... for multiple.
+    # Names brought in from the preamble (``x = torch.randn(8); ...``) are
+    # left alone.
+    synth = [k for k in tensor_params if k.startswith("_x")]
+    if synth:
+        rename = {synth[0]: "x"} if len(synth) == 1 else {old: f"x{i}" for i, old in enumerate(synth)}
+        tensor_params = {rename.get(k, k): v for k, v in tensor_params.items()}
+        for node in ast.walk(rewritten):
+            if isinstance(node, ast.Name) and node.id in rename:
+                node.id = rename[node.id]
 
-    logger.info("Tracing inline module: %s", ast.unparse(call.func))
-    graph = trace_module(module, example_inputs, kwargs=kwargs or None)
+    expr_src = ast.unparse(rewritten)
+    forward_sig = ", ".join(["self", *tensor_params.keys()])
+    wrapper_src = f"class _Wrapper(torch.nn.Module):\n    def forward({forward_sig}):\n        return {expr_src}\n"
+    exec(wrapper_src, scope)  # noqa: S102 — local CLI
+    module = scope["_Wrapper"]()
+    example_inputs = tuple(tensor_params.values())
+    logger.info("Tracing inline expression: %s", ast.unparse(final_expr))
+    graph = trace_module(module, example_inputs)
+    return graph, _slugify(ast.unparse(final_expr))
 
-    src = ast.unparse(call.func)
-    slug = "".join(c if c.isalnum() else "_" for c in src).strip("_").lower() or "inline"
-    return graph, slug
+
+_TENSOR_CTOR_NAMES = frozenset({"randn", "rand", "zeros", "ones", "empty", "full", "arange", "linspace", "tensor", "randint", "eye"})
+
+
+def _lift_tensor_inputs(expr: "ast.expr", scope: dict) -> tuple["ast.expr", dict]:
+    """Rewrite ``expr`` so every tensor input becomes a named placeholder.
+
+    Two kinds of input subtrees are lifted to the returned ``tensor_params``
+    dict (preserving order for function-parameter generation):
+
+    * Bare ``Name`` references that resolve to a tensor in ``scope`` — the
+      original name is preserved as a parameter.
+    * ``Call`` nodes to known tensor constructors (``torch.randn``, etc.)
+      with no free tensor refs below them — eagerly evaluated and replaced
+      with a fresh ``_x<N>`` placeholder.
+
+    Everything else (non-constructor calls, attribute chains, operators) is
+    left intact so torch.export still traces it.
+    """
+    import copy
+
+    import torch
+
+    tensor_params: dict[str, torch.Tensor] = {}
+
+    def is_constructor_call(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        # Accept torch.<ctor> and nn.<ctor>-shaped attribute chains.
+        while isinstance(func, ast.Attribute):
+            if func.attr in _TENSOR_CTOR_NAMES:
+                return True
+            func = func.value
+        return False
+
+    def fresh_placeholder() -> str:
+        i = 0
+        while True:
+            name = f"_x{i}"
+            if name not in tensor_params and name not in scope:
+                return name
+            i += 1
+
+    def visit(node: ast.AST) -> ast.AST:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            val = scope.get(node.id)
+            if isinstance(val, torch.Tensor):
+                tensor_params.setdefault(node.id, val)
+            return node
+        if is_constructor_call(node):
+            try:
+                val = eval(compile(ast.Expression(node), "<--code>", "eval"), scope)  # noqa: S307
+            except Exception:  # noqa: BLE001
+                val = None
+            if isinstance(val, torch.Tensor):
+                name = fresh_placeholder()
+                tensor_params[name] = val
+                return ast.copy_location(ast.Name(id=name, ctx=ast.Load()), node)
+        # Otherwise recurse into every child field.
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                setattr(node, field, [visit(v) if isinstance(v, ast.AST) else v for v in value])
+            elif isinstance(value, ast.AST):
+                setattr(node, field, visit(value))
+        return node
+
+    rewritten = visit(copy.deepcopy(expr))
+    ast.fix_missing_locations(rewritten)
+    return rewritten, tensor_params
+
+
+def _slugify(src: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in src).strip("_").lower() or "inline"
 
 
 def _save(graph, args, default_basename: str) -> None:
