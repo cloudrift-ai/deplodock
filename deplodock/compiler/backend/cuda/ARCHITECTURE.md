@@ -1,147 +1,69 @@
-# CUDA Backend Architecture
+# CUDA Backend
 
-The CUDA backend takes a `Graph` and lowers it through two structural
-passes — `passes/lowering/kernel` (LoopOp → KernelOp) and
-`passes/lowering/cuda` (KernelOp → CudaOp) — producing a `Graph[CudaOp]`
-that the runtime walks to compile each kernel via `cupy.RawKernel`
-(NVRTC) and dispatch launches directly from Python. Source generation
-is a **recursive descent** over the structural IR; there's no
-classification pass, no `Schedule` dataclass, and no intermediate
-`LoopIR` stage.
+CUDA-specific dispatch. Shared backend contract lives in
+`backend/ARCHITECTURE.md`. The lowering chain that produces the
+`Graph[CudaOp]` this backend consumes lives in `pipeline/passes/lowering/`
+(see `pipeline/ARCHITECTURE.md`).
 
-**Peer backends:**
-- `backend/numpy/` — `NumpyBackend` evaluates the Graph directly (pre-fusion).
-- `backend/loop/` — `LoopBackend` interprets the fused `Graph[LoopOp]`
-  via numpy whole-tensor operations. Used as a triangulation reference:
-  disagreement with CUDA implicates codegen; disagreement with numpy
-  implicates fusion. All three backends expose the same `compile(graph)`
-  / `run(compiled, input_data=…) → ProgramResult` API (`backend/base.py`).
-
-## Module Layout
+## Modules
 
 ```
 cuda/
-├── backend.py   # CudaBackend(Backend): compile(graph) → Graph[CudaOp]
-├── emit.py      # emit_kernel(node, name, graph) → (GpuKernel, arg_order)
-│                # launch_config(node) → (grid, block)
+├── backend.py   # CudaBackend(Backend) — drives lowering + delegates dispatch
 ├── program.py   # Graph[CudaOp] → cupy.RawKernel dispatch + per-kernel event timing
-└── runner.py    # Single-kernel cupy dispatch (used by tuning/diagnostics scripts)
+└── runtime.py   # has_cuda_gpu() predicate (cupy-based)
 ```
 
-Shared infrastructure (backend-agnostic) lives at the IR layer:
+## Compile
 
-```
-compiler/ir/kernel/ir.py   # GpuKernel, GpuKernelParam, Stmt hierarchy, expressions, KernelOp graph-op
-compiler/pipeline/passes/lowering/kernel/_emit.py # per-node LoopOp → GpuKernel codegen (emit_kernel, launch_config)
-compiler/ir/cuda/ir.py     # CudaOp   (graph-op with rendered CUDA source)
-ir/cuda/emit.py  # GpuKernel → C source (one level up; not CUDA-specific)
-```
+`CudaBackend.compile(graph)` runs
+`run_pipeline(graph, [..., "lowering/kernel", "lowering/cuda"], dump=…)`,
+producing a `Graph[CudaOp]` where every compute node carries a rendered
+`__global__` source plus its launch geometry (grid / block / smem /
+arg_order).
 
-## Emission Pipeline
+## Dispatch (`program.py`)
 
-```
-Graph[LoopOp]   (output of pipeline.run_pipeline)
-    │
-    │  passes/lowering/kernel/lower_loopop.py
-    │    for each LoopOp node:
-    │      emit_kernel(node, name, graph) → (GpuKernel, arg_order)
-    │      node.op = KernelOp(kernel, kernel_name, arg_order, grid, block, …)
-    │      # KernelOp.__post_init__ runs ir.kernel.normalize.normalize_kernel
-    │      # (const fold / clamp eliminate) automatically.
-    ▼
-Graph[KernelOp]
-    │
-    │  passes/lowering/cuda/lower_kernelop.py
-    │    for each KernelOp node:
-    │      emit_kernel_source(op.kernel) → C source string
-    │      node.op = CudaOp(kernel_source, kernel_name, arg_order, grid, block, …)
-    ▼
-Graph[CudaOp]
-    │  backend/cuda/program._compile(graph)
-    │    for each unique kernel_name: cp.RawKernel(source, name, -O2 --use_fast_math)
-    │    (NVRTC caches per source)
-    ▼
-cupy dispatch: ndarray-per-buffer allocation, kernel(grid, block, args)  →  GPU
-```
+`_compile(graph) → _Compiled` walks the lowered graph:
 
-## Walkers and Emitters in `emit.py`
+- Classifies each node as `input` / `constant` / `output` / `scratch`
+  from `graph.inputs` / `ConstantOp` membership / `graph.outputs`.
+- Compiles each unique `kernel_name` via `cupy.RawKernel(source, name,
+  options=("--use_fast_math",))`. Kernels are emitted with
+  `extern "C" __global__` so NVRTC doesn't name-mangle them.
+- Builds a static launch plan: per launch, a tuple of
+  `(kernel, arg_names, grid, block, smem_bytes, zero_outputs)`.
 
-The emitter walks each `LoopOp`'s SSA `body` — a sequence of `Load` /
-`Assign` / `Accum` / `Write` / `Select` statements. Each `Assign` is
-`name = op(args)` where args reference prior SSA names; external buffer
-reads are explicit `Load` stmts keyed by `source` int into
-`node.inputs`.
+`run_program(graph, input_data) → RunResult`:
 
-**Load emission** (`_emit_load_access(index, buf_name, src_shape, axis_env)`):
-evaluates `Load.index` in the current axis environment and emits
-`ArrayAccess(buffer, coord)`. There is no separate indexing abstraction —
-every IndexMapOp is lifted to a one-op `LoopOp` by
-`003_lift_indexmap`, and the splicer in `ir/loop/splicer.py` inlines the
-coord_map into the consumer's body Loads whenever a splice is legal.
+1. Allocate a `cupy.ndarray` for every buffer. Inputs + optional
+   constant overrides come from `input_data`; scalar `ConstantOp`s
+   materialize as single-element arrays; scratch buffers zero-init.
+   Inputs without supplied data get a deterministic pseudo-random fill
+   (useful for `deplodock run` benchmarks).
+2. Launch each kernel in topological order; `zero_outputs` fills run
+   before the launch.
+3. Copy `graph.outputs` buffers back to numpy.
 
-**Select lowering** (`_emit_select(stmt, values, axis_env)`): lowers a
-body `Select` into a nested `Ternary` chain over each
-`SelectBranch.select` predicate.
+`benchmark_program(graph, input_data, warmup, num_iters)` adds a
+warmup loop + timed loop wrapped in `cupy.cuda.Event` pairs — one
+global pair for `BenchmarkResult.time_ms`, one pair per launch index
+(averaged over iters) for `BenchmarkResult.per_launch`.
 
-**Body emitter**: `_emit_body(node, graph)` threads a `_Ctx` through the
-recursive walk. Grid is 1D over flat free-axis extents; block is
-`(256, 1, 1)`.
+`run_program_debug(...)` snapshots every non-input buffer after each
+launch — consumed by `--dump-dir` runs.
 
-## Shape handling
+## GPU detection (`runtime.py`)
 
-Shapes come from the graph itself, never recomputed:
+`has_cuda_gpu()` returns `True` iff `cupy` imports and
+`cupy.cuda.runtime.getDeviceCount() > 0`. Used as a pytest skip
+predicate.
 
-- `graph.nodes[name].output.shape` — per-buffer shape lookup.
-- For a LoopOp node, the effective source shapes are
-  `[graph.nodes[n].output.shape for n in node.inputs]`.
+## Invariants
 
-No fallback call to `LoopOp.infer_output_shape(...)` happens in the
-codegen path.
-
-## Benchmark Mode Timing
-
-`benchmark_program(graph, warmup, num_iters)` runs two levels of
-timing around the dispatch loop:
-
-- **Program total**: one global `cupy.cuda.Event` pair wraps all
-  `num_iters` iterations; the delta / `num_iters` populates
-  `BenchmarkResult.time_ms`.
-- **Per-launch**: one event pair per launch index, re-recorded every
-  iteration; `cupy.cuda.get_elapsed_time` is accumulated into an
-  `acc[i]` list, averaged, and emitted as `LaunchTime(idx, kernel_name,
-  time_ms)` entries in `BenchmarkResult.per_launch`.
-
-`zero_outputs` calls (cupy `.fill(0)`) run before the launch's event
-pair — they aren't counted as kernel time.
-
-## Naive Schedule Policy
-
-Correctness-first. No shared memory, no async copies, no vectorization.
-
-- **Pointwise** (no `ReduceOp` in body): 1D grid, `block = (256, 1, 1)`,
-  one thread per flat output coord.
-- **Reduce / contraction** (`ReduceOp` in body): 1D grid over the outer
-  rows (broadcast shape minus reduce axis). The body is split into
-  segments at ReduceOp boundaries. Each segment with per-element
-  references emits its own K-loop. Per-element values from prior
-  segments are recomputed inside the current loop.
-
-## Buffer Roles
-
-`backend/cuda/program._buffers(graph)` classifies each node on the fly:
-
-- in `graph.inputs` → `input`
-- `isinstance(node.op, ConstantOp)` → `constant`
-- in `graph.outputs` → `output`
-- otherwise → `scratch`
-
-## Constraints to Preserve
-
-- `emit.py` must stay pure codegen — it imports from `ir/` and returns
-  `GpuKernel`; it must not import from the runtime / passes layer.
-- A new backend (ROCm, SYCL, ...) reuses `ir/kernel/`, `ir/cuda/`,
-  and `ir/cuda/emit.py` wholesale; only its own
-  `emit.py` / `program.py` / lowering pass need to be rewritten.
-- The loop-IR types (`LoopOp`, `Load`, `Assign`, `Accum`, `Write`,
-  `Select`, `SelectBranch`, ...) stay backend-agnostic — do NOT import
-  from `backend/cuda/` into `ir/loop/ir.py`.
+- `CudaOp.arg_order` embeds the original node id as the output buffer
+  name. The lowering rules therefore mutate node ops **in place**
+  instead of splicing a fresh node — see `pipeline/ARCHITECTURE.md`
+  under "Rule module convention".
+- The CUDA backend imports from `ir/` and `pipeline/` but never into
+  them. A ROCm/SYCL/Metal backend replaces `program.py` only.
