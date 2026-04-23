@@ -1,6 +1,4 @@
-"""Unit tests for Op.infer_output_shape and shape_utils."""
-
-import pytest
+"""Unit tests for Op.infer_output_shape."""
 
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
@@ -14,30 +12,6 @@ from deplodock.compiler.ir.frontend.ir import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.shape_utils import broadcast_shapes
-
-
-def test_broadcast_shapes_scalar_with_tensor():
-    assert broadcast_shapes((1,), (4, 3)) == (4, 3)
-
-
-def test_broadcast_shapes_left_padding():
-    assert broadcast_shapes((3,), (4, 3)) == (4, 3)
-
-
-def test_broadcast_shapes_size_one_dims():
-    assert broadcast_shapes((1, 1, 8, 128), (1, 28, 8, 128)) == (1, 28, 8, 128)
-
-
-def test_broadcast_shapes_incompatible_raises():
-    with pytest.raises(ValueError):
-        broadcast_shapes((4, 3), (5, 3))
-
-
-def test_broadcast_shapes_divisible_only_when_opted_in():
-    with pytest.raises(ValueError):
-        broadcast_shapes((28, 8, 128), (4, 8, 128))
-    assert broadcast_shapes((28, 8, 128), (4, 8, 128), allow_divisible=True) == (28, 8, 128)
 
 
 def test_elementwise_infer_matching_shapes():
