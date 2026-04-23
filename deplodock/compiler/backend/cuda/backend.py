@@ -7,15 +7,17 @@ node carries a rendered CUDA kernel source plus its launch geometry.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import benchmark_program, run_program, run_program_debug
-from deplodock.compiler.passes.lowering.cuda import lower as lower_to_cuda
-from deplodock.compiler.passes.lowering.kernel import lower as lower_to_kernel
 from deplodock.compiler.pipeline import compile_graph
+from deplodock.compiler.rewriter import Rewriter
+
+_PASSES_DIR = Path(__file__).parent.parent.parent / "passes"
 
 if TYPE_CHECKING:
     from deplodock.compiler.dump import CompilerDump
@@ -44,10 +46,10 @@ class CudaBackend(Backend):
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[KernelOp]`` → ``Graph[CudaOp]``."""
         graph = compile_graph(graph, dump=self.dump)
-        graph = lower_to_kernel(graph)
+        graph = Rewriter.from_directory(_PASSES_DIR, pass_order=["lowering/kernel"]).apply(graph)
         if self.dump is not None:
             self.dump.dump_kernel_graph(graph)
-        graph = lower_to_cuda(graph)
+        graph = Rewriter.from_directory(_PASSES_DIR, pass_order=["lowering/cuda"]).apply(graph)
         if self.dump is not None:
             self.dump.dump_cuda_graph(graph)
         return graph

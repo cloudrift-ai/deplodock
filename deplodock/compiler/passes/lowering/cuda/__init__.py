@@ -1,5 +1,5 @@
-"""KernelOp → CudaOp lowering pass."""
+"""KernelOp → CudaOp lowering pass.
 
-from deplodock.compiler.passes.lowering.cuda.lower_kernelop import lower
-
-__all__ = ["lower"]
+Discovered as a rule-based pass by ``Rewriter.from_directory`` under the
+``lowering/cuda`` subpath; see ``001_lower_kernelop.py`` for the rule.
+"""
