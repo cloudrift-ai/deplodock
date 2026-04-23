@@ -87,11 +87,14 @@ def _rewrite_body(
 
 def normalize_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     """Apply the structural and cosmetic normalization passes in order."""
+    from deplodock.compiler.ir.loop.simplify import simplify_body
+
     stmts = drop_size_one_free_axes(stmts)
     stmts = canonicalize_free_axis_order(stmts)
     stmts = eliminate_copy_aliases(stmts)
     stmts = unify_sibling_reduce_axes(stmts)
     stmts = hoist_loop_invariants(stmts)
+    stmts = simplify_body(stmts)
     stmts = rename_ssa_sequential(stmts)
     return stmts
 

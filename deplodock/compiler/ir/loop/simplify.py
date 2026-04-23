@@ -47,7 +47,7 @@ from deplodock.compiler.ir.expr import (
     Var,
 )
 from deplodock.compiler.ir.kernel.ir import ArrayAccess, FieldAccess, VectorLoad
-from deplodock.compiler.ir.loop import (
+from deplodock.compiler.ir.loop.ir import (
     Load,
     Loop,
     LoopOp,
@@ -55,13 +55,14 @@ from deplodock.compiler.ir.loop import (
     SelectBranch,
     Write,
 )
-from deplodock.compiler.ir.loop import Stmt as LoopStmt
+from deplodock.compiler.ir.loop.ir import Stmt as LoopStmt
 
 __all__ = [
     "Interval",
     "Context",
     "simplify_expr",
     "infer_range",
+    "simplify_body",
     "simplify_loop_op",
 ]
 
@@ -366,12 +367,16 @@ def _simplify_loop_stmt(stmt: LoopStmt, ctx: Context) -> LoopStmt:
     return stmt
 
 
-def simplify_loop_op(op: LoopOp) -> LoopOp:
-    """Simplify every Expr inside a LoopOp. Seeds Context from axis extents.
+def simplify_body(body: tuple[LoopStmt, ...]) -> tuple[LoopStmt, ...]:
+    """Simplify every Expr inside a LoopOp body. Seeds Context from Loop extents.
 
     Body Loads, Accums, Writes, Selects get simplified as the walker
     descends through Loop blocks, accumulating axis ranges.
     """
     ctx = Context.empty()
-    new_body = tuple(_simplify_loop_stmt(s, ctx) for s in op.body)
-    return replace(op, body=new_body)
+    return tuple(_simplify_loop_stmt(s, ctx) for s in body)
+
+
+def simplify_loop_op(op: LoopOp) -> LoopOp:
+    """Apply ``simplify_body`` to a LoopOp's body, returning a new LoopOp."""
+    return replace(op, body=simplify_body(op.body))
