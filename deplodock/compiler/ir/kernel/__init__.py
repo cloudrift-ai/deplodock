@@ -50,7 +50,6 @@ from deplodock.compiler.ir.kernel.ir import (
     VectorLoad,
     pretty_print,
 )
-from deplodock.compiler.ir.kernel.normalize import normalize_kernel
 
 __all__ = [
     # Expression types
@@ -89,6 +88,4 @@ __all__ = [
     "emit_kernel_source",
     "kernel_name_for",
     "launch_config",
-    # Normalization
-    "normalize_kernel",
 ]

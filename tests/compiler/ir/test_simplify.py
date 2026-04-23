@@ -23,7 +23,7 @@ from deplodock.compiler.ir.kernel import (
     IfStmt,
     VarDecl,
 )
-from deplodock.compiler.ir.kernel import normalize_kernel as simplify_kernel
+from deplodock.compiler.ir.kernel.normalize import normalize_kernel as simplify_kernel
 from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.loop.simplify import (
     Context,
