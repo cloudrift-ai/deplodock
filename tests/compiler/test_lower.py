@@ -1,6 +1,6 @@
-"""Tests for the compile_graph pipeline: decomposition → optimization → fusion → extract.
+"""Tests for the compile pipeline: decomposition → optimization → fusion → extract.
 
-After compile_graph, every primitive op is inside a LoopOp. Reductions
+After the pipeline, every primitive op is inside a LoopOp. Reductions
 live as ``Accum + Accum`` on the LoopOp; elementwise ops as
 ``Assign``; final output as a ``Write``.
 
@@ -11,8 +11,6 @@ outputs — this validates the full decomposition+optimization+fusion chain
 preserves semantics without needing a GPU.
 """
 
-from pathlib import Path
-
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
@@ -20,19 +18,21 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import compile_graph
-from deplodock.compiler.rewriter import run_pass
+from deplodock.compiler.pipeline import run_pipeline
 
-_RULES_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "passes"
 _backend = NumpyBackend()
 rng = np.random.default_rng(0)
+
+_FUSE_PASSES = ["decomposition", "optimization", "fusion"]
+
+
+def _compile(graph: Graph) -> Graph:
+    return run_pipeline(graph, _FUSE_PASSES)
 
 
 def _fully_rewrite(graph: Graph) -> Graph:
     """Apply the full pass chain (decomposition → optimization → fusion)."""
-    for name in ("decomposition", "optimization", "fusion"):
-        graph = run_pass(graph, _RULES_DIR / name)
-    return graph
+    return _compile(graph)
 
 
 def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -83,7 +83,7 @@ def test_pointwise_add():
     g.inputs = ["x", "y"]
     g.outputs = ["z"]
 
-    result = compile_graph(g)
+    result = _compile(g)
     launches = _loop_nodes(result)
     assert len(launches) == 1
     assert "add" in _elementwise_fns(launches[0].op.body)
@@ -98,7 +98,7 @@ def test_chained_pointwise_fuses_into_one():
     g.inputs = ["x"]
     g.outputs = ["n"]
 
-    result = compile_graph(g)
+    result = _compile(g)
     launches = _loop_nodes(result)
     assert len(launches) == 1
     fns = _elementwise_fns(launches[0].op.body)
@@ -112,7 +112,7 @@ def test_reduce_sum():
     g.inputs = ["x"]
     g.outputs = ["r"]
 
-    result = compile_graph(g)
+    result = _compile(g)
     launches = _loop_nodes(result)
     assert len(launches) == 1
     loop = launches[0].op
@@ -130,7 +130,7 @@ def test_matmul():
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    result = compile_graph(g)
+    result = _compile(g)
     launches = _loop_nodes(result)
     has_mul = any("mul" in _elementwise_fns(k.op.body) for k in launches)
     has_sum = any(any(lb.op.fn == "add" for lb in k.op.accums) for k in launches)
@@ -148,7 +148,7 @@ def test_no_matmul_when_mul_fans_out():
     g.inputs = ["a", "b"]
     g.outputs = ["d", "n"]
 
-    result = compile_graph(g)
+    result = _compile(g)
     launches = _loop_nodes(result)
     assert len(launches) == 3
 
@@ -163,20 +163,20 @@ def test_matmul_op_decomposes_and_fuses():
     g.inputs = ["a", "b"]
     g.outputs = ["m"]
 
-    result = compile_graph(g)
+    result = _compile(g)
     launches = _loop_nodes(result)
     has_reduce = any(_has_update(k.op.body) for k in launches)
     assert has_reduce
 
 
-def test_compile_graph_produces_kernel_ops():
+def test_compile_produces_kernel_ops():
     g = Graph()
     _input(g, "x", (4,))
     g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
     g.inputs = ["x"]
     g.outputs = ["e"]
 
-    result = compile_graph(g)
+    result = _compile(g)
     launches = _loop_nodes(result)
     assert len(launches) == 1
 

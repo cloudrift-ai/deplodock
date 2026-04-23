@@ -40,7 +40,7 @@ ir/cuda/emit.py  # GpuKernel → C source (one level up; not CUDA-specific)
 ## Emission Pipeline
 
 ```
-Graph[LoopOp]   (output of pipeline.compile_graph)
+Graph[LoopOp]   (output of pipeline.run_pipeline)
     │
     │  passes/lowering/kernel/lower_loopop.py
     │    for each LoopOp node:

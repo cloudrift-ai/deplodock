@@ -16,9 +16,9 @@
 │                                                                                                                      │
 │  RULE: No GPU, no CUDA, no backend imports.                                                                          │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│  LAYER 2 · Fusion (pipeline.compile_graph)                                                                           │
+│  LAYER 2 · Fusion (pipeline.run_pipeline)                                                                           │
 │                                                                                                                      │
-│  pipeline.py: compile_graph(graph) -> Graph[LoopOp + InputOp + ConstantOp]                                            │
+│  pipeline.py: run_pipeline(graph, …) -> Graph[LoopOp + InputOp + ConstantOp]                                            │
 │    Runs decomposition → optimization → fusion passes from passes/.                                                   │
 │    After fusion, ir/simplify.simplify_loop_op is applied to every LoopOp (const fold + clamp elimination).           │
 │                                                                                                                      │
@@ -81,8 +81,8 @@ PyTorch module
 Graph (frontend ops — Layer 1)
    │  backend.compile(graph)  — unified across numpy / loop / cuda
    │    ├─ NumpyBackend: wrap Graph; numpy walk in run
-   │    ├─ LoopBackend:  compile_graph(graph) → Graph[LoopOp]; interpret in run
-   │    └─ CudaBackend:  compile_graph(graph) → Graph[LoopOp]
+   │    ├─ LoopBackend:  run_pipeline(graph, …) → Graph[LoopOp]; interpret in run
+   │    └─ CudaBackend:  run_pipeline(graph, …) → Graph[LoopOp]
    │                     lower_to_kernel(g)   → Graph[KernelOp]
    │                     lower_to_cuda(g)     → Graph[CudaOp]
    ▼
@@ -263,7 +263,7 @@ so fusion rules can be validated numerically on CPU without CUDA.
 
 - `tests/compiler/test_ir.py`, `test_shape_inference.py`, `test_indexmap.py`, `test_backend_ir.py` — Layer 1 unit tests.
 - `tests/compiler/test_kernel_op.py` — structural IR construction + invariant violations.
-- `tests/compiler/test_lower.py` — `compile_graph` group-discovery + LoopOp assembly.
+- `tests/compiler/test_lower.py` — `run_pipeline` group-discovery + LoopOp assembly.
 - `tests/compiler/test_emit.py` — recursive-descent codegen source-level assertions + on-GPU numerical checks.
 - `tests/compiler/test_pipeline.py` — end-to-end on small synthetic graphs.
 - `tests/compiler/test_torch_trace*.py`, `test_real_trace.py`, `test_hints.py` — tracer / hint coverage.

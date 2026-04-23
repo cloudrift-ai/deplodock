@@ -71,7 +71,7 @@ def handle_compile(args):
         return
 
     from deplodock.compiler.dump import CompilerDump
-    from deplodock.compiler.pipeline import compile_graph
+    from deplodock.compiler.pipeline import run_pipeline
 
     dump = CompilerDump.resolve(args.dump_dir)
 
@@ -81,7 +81,7 @@ def handle_compile(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    fused = compile_graph(graph, dump=dump)
+    fused = run_pipeline(graph, ["decomposition", "optimization", "fusion"], dump=dump)
 
     n_compute = sum(1 for n in fused.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
@@ -95,7 +95,7 @@ def _handle_compile_inspect(args):
     """Run the pipeline to produce --ir STAGE artifact, then print it."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.dump import CompilerDump
-    from deplodock.compiler.pipeline import compile_graph
+    from deplodock.compiler.pipeline import run_pipeline
 
     graph, _ = _load_or_trace(args)
     stage = args.ir
@@ -109,7 +109,7 @@ def _handle_compile_inspect(args):
         if stage == "torch":
             pass
         elif stage in ("tensor", "loop"):
-            compile_graph(graph, dump=dump)
+            run_pipeline(graph, ["decomposition", "optimization", "fusion"], dump=dump)
         else:
             CudaBackend(dump=dump).compile(graph)
 
