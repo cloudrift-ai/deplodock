@@ -4,6 +4,7 @@ import ast
 import json
 import logging
 import sys
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +22,11 @@ def register_trace_command(subparsers):
     parser.add_argument(
         "--code",
         help=(
-            "Inline Python expression whose last statement is a call, "
-            'e.g. --code "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))". '
-            "The callable is traced with the given args as example inputs. "
-            "Mutually exclusive with the positional model ID."
+            "Inline Python expression whose last statement is a call. "
+            "The callable may be an nn.Module (e.g. 'nn.RMSNorm(2048)(torch.randn(1,32,2048))') "
+            "or a torch function (e.g. 'F.silu(torch.randn(1,32,2048))', "
+            "'torch.matmul(torch.randn(4,3), torch.randn(3,2))'). "
+            "Call args are used as example inputs. Mutually exclusive with the positional model ID."
         ),
     )
     parser.add_argument(
@@ -142,6 +144,44 @@ def graph_from_code(code: str):
     module = eval(compile(ast.Expression(call.func), "<--code callable>", "eval"), scope)  # noqa: S307
     example_inputs = tuple(eval(compile(ast.Expression(a), "<--code arg>", "eval"), scope) for a in call.args)  # noqa: S307
     kwargs = {kw.arg: eval(compile(ast.Expression(kw.value), "<--code kwarg>", "eval"), scope) for kw in call.keywords if kw.arg}  # noqa: S307
+
+    if not isinstance(module, torch.nn.Module):
+        # Functional call (e.g. F.silu, torch.matmul). Wrap in a Module with
+        # explicit parameter names (x / x0, x1, ...) so torch.export names
+        # the graph inputs accordingly. Non-tensor args/kwargs are baked
+        # into the closure; tensor kwargs are forwarded as kwargs to fn.
+        fn = module
+        tensor_args: list[torch.Tensor] = []
+        arg_slots: list[int | tuple[str, Any]] = []
+        for a in example_inputs:
+            if isinstance(a, torch.Tensor):
+                arg_slots.append(len(tensor_args))
+                tensor_args.append(a)
+            else:
+                arg_slots.append(("const", a))
+        tensor_kw_names = [k for k, v in kwargs.items() if isinstance(v, torch.Tensor)]
+        baked_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, torch.Tensor)}
+        n_positional = len(tensor_args)
+        pos_names = (["x"] if n_positional == 1 else [f"x{i}" for i in range(n_positional)])
+        param_names = pos_names + tensor_kw_names
+
+        # Synthesize the wrapper source so torch.export sees literal param
+        # names rather than *args.
+        src = (
+            "class _FunctionalWrapper(torch.nn.Module):\n"
+            f"    def forward(self{''.join(', ' + n for n in param_names)}):\n"
+            f"        pos = [{', '.join(pos_names)}]\n"
+            "        resolved = [pos[s] if isinstance(s, int) else s[1] for s in arg_slots]\n"
+            f"        kw = {{{', '.join(repr(n) + ': ' + n for n in tensor_kw_names)}}}\n"
+            "        return fn(*resolved, **baked_kwargs, **kw)\n"
+        )
+        wrapper_scope: dict[str, Any] = {
+            "torch": torch, "fn": fn, "arg_slots": arg_slots, "baked_kwargs": baked_kwargs,
+        }
+        exec(src, wrapper_scope)  # noqa: S102 — local CLI
+        module = wrapper_scope["_FunctionalWrapper"]()
+        example_inputs = tuple(tensor_args)
+        kwargs = {k: v for k, v in kwargs.items() if isinstance(v, torch.Tensor)}
 
     logger.info("Tracing inline module: %s", ast.unparse(call.func))
     graph = trace_module(module, example_inputs, kwargs=kwargs or None)
