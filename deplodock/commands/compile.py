@@ -30,8 +30,9 @@ def register_compile_command(subparsers):
         "--code",
         "-c",
         help=(
-            "Inline Python expression whose last statement is a call, "
-            'e.g. --code "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))". '
+            "Inline Python expression whose last statement is a call. "
+            "The callable may be an nn.Module (e.g. 'nn.RMSNorm(2048)(torch.randn(1,32,2048))') "
+            "or a torch function (e.g. 'F.silu(torch.randn(1,32,2048))'). "
             "Traces the expression and compiles it in one step. Mutually exclusive with the positional input."
         ),
     )
