@@ -298,12 +298,12 @@ def _remove_orphans(graph: Graph) -> None:
 def run_pipeline(graph: Graph, passes: list[str], dump: CompilerDump | None = None) -> Graph:
     """Run each named pass directory in order; dispatch ``dump.on_pass`` after each."""
     t_start = time.monotonic()
-    for name in passes:
+    for idx, name in enumerate(passes, start=1):
         t0 = time.monotonic()
         n_before = len(graph.nodes)
         graph = run_pass(graph, _PASSES_DIR / name)
         logger.info("compile: %-18s %.2fs (%d -> %d nodes)", name, time.monotonic() - t0, n_before, len(graph.nodes))
         if dump is not None:
-            dump.on_pass(name, graph)
+            dump.on_pass(idx, name, graph)
     logger.info("compile: total %.2fs", time.monotonic() - t_start)
     return graph

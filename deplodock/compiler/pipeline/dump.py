@@ -64,75 +64,27 @@ class CompilerDump:
 
     # --- Dump methods ---
 
-    def on_pass(self, pass_name: str, graph: Graph) -> None:
-        """Dispatch the post-pass dumps appropriate to ``pass_name``.
+    def on_pass(self, idx: int, pass_name: str, graph: Graph) -> None:
+        """Dump the graph after a pass as json / txt / dot (+ kernels.txt if any).
 
-        Callers invoke this after each ``run_pass(...)`` instead of
-        hard-coding which ``dump_*`` method a given pass needs. ``pass_name``
-        matches the pass directory name under ``passes/`` (e.g.
-        ``"optimization"``, ``"fusion"``, ``"lowering/kernel"``). Unknown
-        or dump-less names (e.g. ``"decomposition"``) are no-ops.
+        Every pass is treated uniformly: no per-pass special cases, so
+        adding a new pass automatically gets dumped. File names are
+        ``{idx:02d}_{pass_name}.{ext}`` with slashes in ``pass_name``
+        flattened to underscores.
         """
-        if pass_name == "optimization":
-            self.dump_tensor_ir(graph)
-        elif pass_name == "fusion":
-            self.dump_fused_graph(graph)
-            self.dump_loop_ir(graph)
-        elif pass_name == "lowering/kernel":
-            self.dump_kernel_graph(graph)
-        elif pass_name == "lowering/cuda":
-            self.dump_cuda_graph(graph)
+        self._dump_graph(f"{idx:02d}_{pass_name.replace('/', '_')}", graph)
 
     def dump_input_graph(self, graph: Graph) -> None:
-        """Graph as captured by the tracer, before any rewriter passes.
+        """Graph as captured by the tracer, before any rewriter pass runs."""
+        self._dump_graph("00_input", graph)
 
-        Dumped three ways: ``00_input_graph.json`` (round-trippable),
-        ``00_input_graph.txt`` (human-readable, for ``compile --ir torch``),
-        and ``00_input_graph.dot`` (Graphviz DAG — render via ``dot -Tsvg``).
-        """
-        self._write_json("00_input_graph.json", graph.to_dict())
-        self._write_text("00_input_graph.txt", graph.pretty_print())
-        self._write_text("00_input_graph.dot", _graph_to_dot(graph))
-
-    def dump_tensor_ir(self, graph: Graph) -> None:
-        """Graph after decomposition + optimization passes, before fusion.
-
-        This is the article's "Tensor IR" — only primitive ops (add/mul/sub/div/rsqrt/exp,
-        sum/max reductions, reshape/transpose/slice, gather). High-level ops like
-        rms_norm, linear, sdpa have been lowered to this canonical op set.
-
-        Dumped three ways: ``10_tensor_ir.json`` (round-trippable via Graph.from_dict),
-        ``10_tensor_ir.txt`` (human-readable, consumed by ``compile --ir tensor``),
-        and ``10_tensor_ir.dot`` (Graphviz DAG).
-        """
-        self._write_json("10_tensor_ir.json", graph.to_dict())
-        self._write_text("10_tensor_ir.txt", graph.pretty_print())
-        self._write_text("10_tensor_ir.dot", _graph_to_dot(graph))
-
-    def dump_fused_graph(self, graph: Graph) -> None:
-        self._write_json("20_fused_graph.json", graph.to_dict())
-
-    def dump_loop_ir(self, graph: Graph) -> None:
-        """Pretty-printed LoopOp bodies for each fused kernel in the graph.
-
-        This is the article's "Loop IR" stage — each compute node's nested
-        ``for`` loops with Loads/Writes/Assigns visible, before the backend
-        lowers them to the per-kernel Kernel IR AST.
-        """
-        from deplodock.compiler.ir.loop import LoopOp, pretty_print
-
-        blocks: list[str] = []
-        i = 0
-        for nid in graph.topological_order():
-            node = graph.nodes[nid]
-            if not isinstance(node.op, LoopOp):
-                continue
-            port_buffers = [graph.nodes[src].output.name for src in node.inputs] + [node.output.name]
-            blocks.append(f"=== loop {i}: {nid} -> {node.output.name} ===")
-            blocks.append(pretty_print(node.op, port_buffers=port_buffers))
-            blocks.append("")
-            i += 1
-        self._write_text("20_loop_ir.txt", "\n".join(blocks))
+    def _dump_graph(self, prefix: str, graph: Graph) -> None:
+        self._write_json(f"{prefix}.json", graph.to_dict())
+        self._write_text(f"{prefix}.txt", graph.pretty_print())
+        self._write_text(f"{prefix}.dot", _graph_to_dot(graph))
+        kernels = format_kernels(graph)
+        if kernels:
+            self._write_text(f"{prefix}.kernels.txt", kernels)
 
     def dump_plan(self, plan: ExecutionPlan) -> None:
         summary = {
@@ -149,46 +101,6 @@ class CompilerDump:
             ],
         }
         self._write_json("30_execution_plan.json", summary)
-
-    def dump_kernel_graph(self, graph: Graph) -> None:
-        """Pretty-printed KernelIR AST for each ``KernelOp`` in the graph.
-
-        This is the article's "Kernel IR" stage — the C-like AST with named axes
-        still visible before the tree-walk codegen renders it to CUDA source.
-        """
-        from deplodock.compiler.ir.kernel import KernelOp, pretty_print
-
-        blocks: list[str] = []
-        i = 0
-        for nid in graph.topological_order():
-            node = graph.nodes[nid]
-            if not isinstance(node.op, KernelOp):
-                continue
-            blocks.append(f"=== launch {i}: {node.op.kernel.name} ===")
-            blocks.append(pretty_print(node.op.kernel))
-            blocks.append("")
-            i += 1
-        self._write_text("39_kernel_ir.txt", "\n".join(blocks))
-
-    def dump_cuda_graph(self, graph: Graph) -> None:
-        """Dump ``Graph[CudaOp]``: per-kernel CUDA source (deduplicated by kernel name)."""
-        from deplodock.compiler.ir.cuda import CudaOp
-
-        seen: set[str] = set()
-        blocks: list[str] = []
-        for nid in graph.topological_order():
-            node = graph.nodes[nid]
-            if not isinstance(node.op, CudaOp):
-                continue
-            if node.op.kernel_name in seen:
-                continue
-            seen.add(node.op.kernel_name)
-            if node.op.comment:
-                banner = "\n".join(f" * {line}" if line else " *" for line in node.op.comment.split("\n"))
-                blocks.append(f"/*\n{banner}\n */\n{node.op.kernel_source}")
-            else:
-                blocks.append(node.op.kernel_source)
-        self._write_text("40_kernels.cu", "\n\n".join(blocks))
 
     def dump_source(self, source: str) -> None:
         self._write_text("50_full_program.cu", source)
@@ -232,6 +144,49 @@ class CompilerDump:
         path = self.dir / filename
         path.write_text(text)
         logger.debug("Dumped %s", path)
+
+
+def format_kernels(graph: Graph) -> str:
+    """Render post-lowering kernel bodies for each compute node in ``graph``.
+
+    Dispatches on op type: ``LoopOp`` → loop body, ``KernelOp`` → kernel AST,
+    ``CudaOp`` → CUDA source. Non-kernel ops (Input/Constant/primitive tensor
+    ops) are skipped. The surrounding syntax itself identifies the IR level
+    (``for`` loops / C-like AST / CUDA source), so the block headers stay
+    minimal: ``=== N: <name> ===``.
+    """
+    from deplodock.compiler.ir.cuda import CudaOp
+    from deplodock.compiler.ir.kernel import KernelOp
+    from deplodock.compiler.ir.kernel import pretty_print as pp_kernel
+    from deplodock.compiler.ir.loop import LoopOp
+    from deplodock.compiler.ir.loop import pretty_print as pp_loop
+
+    seen_cuda: set[str] = set()
+    blocks: list[str] = []
+    i = 0
+    for nid in graph.topological_order():
+        node = graph.nodes[nid]
+        op = node.op
+        if isinstance(op, LoopOp):
+            port_buffers = [graph.nodes[src].output.name for src in node.inputs] + [node.output.name]
+            name = f"{nid} -> {node.output.name}"
+            body = pp_loop(op, port_buffers=port_buffers)
+        elif isinstance(op, KernelOp):
+            name = op.kernel.name
+            body = pp_kernel(op.kernel)
+        elif isinstance(op, CudaOp):
+            if op.kernel_name in seen_cuda:
+                continue
+            seen_cuda.add(op.kernel_name)
+            name = op.kernel_name
+            body = op.kernel_source
+        else:
+            continue
+        blocks.append(f"=== {i}: {name} ===")
+        blocks.append(body)
+        blocks.append("")
+        i += 1
+    return "\n".join(blocks)
 
 
 def _safe_params(params: dict) -> dict:

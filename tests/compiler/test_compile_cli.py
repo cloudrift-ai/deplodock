@@ -18,7 +18,7 @@ def test_compile_code_tensor_ir(run_cli):
 def test_compile_code_loop_ir(run_cli):
     rc, stdout, stderr = run_cli("compile", "--code", "torch.nn.ReLU()(torch.randn(8))", "--ir", "loop")
     assert rc == 0, f"stderr: {stderr}"
-    assert "=== loop" in stdout
+    assert "===" in stdout
     assert "load " in stdout
     assert " = relu(" in stdout
 
@@ -61,6 +61,17 @@ def test_compile_code_functional_softmax_bakes_kwargs(run_cli):
     assert rc == 0, f"stderr: {stderr}"
     assert "1 inputs" in stdout
     assert "max(" in stdout and "sum(" in stdout
+
+
+def test_compile_passes_shorthand(run_cli, tmp_path):
+    """'dofk' should expand to decomposition/optimization/fusion/lowering/kernel."""
+    out = tmp_path / "out.txt"
+    rc, stdout, stderr = run_cli("compile", "-c", "F.relu(torch.randn(8))", "--passes", "dofk", "-o", str(out))
+    assert rc == 0, f"stderr: {stderr}"
+    log = stdout + stderr
+    for name in ("decomposition", "optimization", "fusion", "lowering/kernel"):
+        assert name in log, f"missing pass {name!r} in log"
+    assert "lowering/cuda" not in log
 
 
 def test_compile_no_input_errors(run_cli):
