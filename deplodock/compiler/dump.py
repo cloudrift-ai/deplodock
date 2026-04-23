@@ -167,12 +167,9 @@ class CompilerDump:
         self._write_text("39_kernel_ir.txt", "\n".join(blocks))
 
     def dump_cuda_graph(self, graph: Graph) -> None:
-        """Dump ``Graph[CudaOp]``: per-kernel CUDA source + full nvcc input."""
-        from deplodock.compiler.backend.cuda.program import generate_source
+        """Dump ``Graph[CudaOp]``: per-kernel CUDA source (deduplicated by kernel name)."""
         from deplodock.compiler.ir.cuda import CudaOp
 
-        # Kernel sources concatenated (deduplicated by name, same order as
-        # generate_source).
         seen: set[str] = set()
         blocks: list[str] = []
         for nid in graph.topological_order():
@@ -188,9 +185,6 @@ class CompilerDump:
             else:
                 blocks.append(node.op.kernel_source)
         self._write_text("40_kernels.cu", "\n\n".join(blocks))
-
-        # Full nvcc input (kernels + host main) — reproduces what nvcc compiles.
-        self._write_text("40_full_program.cu", generate_source(graph, mode="benchmark"))
 
     def dump_source(self, source: str) -> None:
         self._write_text("50_full_program.cu", source)

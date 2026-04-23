@@ -338,24 +338,6 @@ def test_kernel_def_with_includes():
     assert "#include <cooperative_groups.h>" in source
 
 
-def test_kernel_def_with_tma_params():
-    """Kernel with TMA descriptor params (grid_constant)."""
-    kd = GpuKernel(
-        name="matmul",
-        params=[GpuKernelParam("float*", "C")],
-        body=[],
-        block_size=(32, 8, 1),
-        tma_params=["A_tma", "B_tma"],
-    )
-    source = emit_kernel(kd)
-    assert "__grid_constant__ CUtensorMap A_tma" in source
-    assert "__grid_constant__ CUtensorMap B_tma" in source
-    # Regular param comes after TMA params.
-    a_pos = source.index("A_tma")
-    c_pos = source.index("float* C")
-    assert a_pos < c_pos
-
-
 def test_kernel_def_launch_bounds_2d():
     """2D block computes correct max threads."""
     kd = GpuKernel(name="k", params=[], body=[], block_size=(32, 8, 1))

@@ -1,18 +1,10 @@
 """GPU-specific default hint profiles for the matmul kernel.
 
-The best tuning for ``tma_db`` depends on the GPU's SM count, register
-file, and clocks — Blackwell sm_120 cards (5090, RTX PRO 6000) share the same
-compute capability but tune to different ``thread_m`` values at large sizes.
-
-Dispatch is by GPU name (from ``nvidia-smi --query-gpu=name``) because both
-cards report ``sm_120`` and identical per-SM smem, so compute capability cannot
-distinguish them. Unknown GPUs fall back to the 5090 profile, which is the most
-thoroughly tuned and has been validated to also work reasonably on the Pro 6000
-(within ~5-10% of the per-card optimum).
-
-To add a new GPU: measure the best ``(thread_m, block_k, k_splits)`` per size
-with ``scripts/bench_matmul.py --strategy tma_db --thread-m N --sizes S`` and
-append a new entry to ``_PROFILES``.
+Per-GPU tunings for the SGEMM bench. Profiles are indexed by size (max square
+dimension) and produce a ``MatmulHints`` dict that downstream matmul codegen
+reads. Dispatch is by GPU name because sm_120 cards (5090, RTX PRO 6000)
+share the same compute capability but tune to different values. Unknown GPUs
+fall back to the 5090 profile.
 """
 
 from __future__ import annotations
@@ -25,16 +17,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Type alias for a matmul hint dict (keys are cuda.matmul.* field names
-# without the prefix, e.g. {"strategy": "tma_db", "block_k": 32}).
+# without the prefix, e.g. {"block_k": 32, "thread_m": 8}).
 MatmulHints = dict[str, Any]
 
 
-def _tma(bk: int = 32, tm: int = 8, ks: int = 1) -> MatmulHints:
-    # tma_db hardcodes blockDim = (32, 8) inside lower.py — we record those
-    # here so the JSON trace and markdown report show the actual launched
-    # block, not the dataclass defaults that the lowering ignores.
+def _hints(bk: int = 32, tm: int = 8, ks: int = 1) -> MatmulHints:
     return {
-        "strategy": "tma_db",
         "block_k": bk,
         "threads_y": 8,
         "threads_x": 32,
@@ -45,51 +33,34 @@ def _tma(bk: int = 32, tm: int = 8, ks: int = 1) -> MatmulHints:
 
 # Per-GPU strategy maps. Each entry is `(max_size, hints)` — pick the first
 # entry whose threshold is >= the matrix size. Tuned for square FP32 matmul.
-#
-# 5090 numbers come from the blog post (CUDA 13.2, sm_120, RTX 5090).
-# Pro 6000 numbers come from a TM sweep on driver 595 / CUDA 13.2 (April 2026).
 _PROFILE_5090: list[tuple[int, MatmulHints]] = [
-    (256, _tma(bk=32, tm=8, ks=4)),
-    (512, _tma(bk=32, tm=8, ks=4)),
-    (1024, _tma(bk=32, tm=8, ks=1)),
-    (2048, _tma(bk=32, tm=26, ks=1)),
-    (4096, _tma(bk=32, tm=20, ks=1)),
-    (8192, _tma(bk=32, tm=28, ks=1)),
-    (16384, _tma(bk=32, tm=28, ks=1)),
+    (256, _hints(bk=32, tm=8, ks=4)),
+    (512, _hints(bk=32, tm=8, ks=4)),
+    (1024, _hints(bk=32, tm=8, ks=1)),
+    (2048, _hints(bk=32, tm=26, ks=1)),
+    (4096, _hints(bk=32, tm=20, ks=1)),
+    (8192, _hints(bk=32, tm=28, ks=1)),
+    (16384, _hints(bk=32, tm=28, ks=1)),
 ]
 
 _PROFILE_H200: list[tuple[int, MatmulHints]] = [
-    # Hopper sm_90. Quick TM sweep on H200 showed TM=8 was optimal at every
-    # size — larger thread tiles regress (likely the first-gen Hopper TMA has
-    # more issue-pressure than Blackwell's refined unit). The kernel does not
-    # beat cuBLAS on H200; see the article's "What About Hopper?" section.
-    (256, _tma(bk=32, tm=8, ks=4)),
-    (512, _tma(bk=32, tm=8, ks=4)),
-    (1024, _tma(bk=32, tm=8, ks=1)),
-    (2048, _tma(bk=32, tm=8, ks=1)),
-    (4096, _tma(bk=32, tm=8, ks=1)),
-    (8192, _tma(bk=32, tm=8, ks=1)),
-    (16384, _tma(bk=32, tm=8, ks=1)),
+    (256, _hints(bk=32, tm=8, ks=4)),
+    (512, _hints(bk=32, tm=8, ks=4)),
+    (1024, _hints(bk=32, tm=8, ks=1)),
+    (2048, _hints(bk=32, tm=8, ks=1)),
+    (4096, _hints(bk=32, tm=8, ks=1)),
+    (8192, _hints(bk=32, tm=8, ks=1)),
+    (16384, _hints(bk=32, tm=8, ks=1)),
 ]
 
 _PROFILE_PRO6000: list[tuple[int, MatmulHints]] = [
-    # Pro 6000 has 188 SMs (vs 5090's 170). Wave quantization matters more:
-    # 1024 needs ks=4 to fill the device (128 blocks / 188 SMs = 0.68 wave),
-    # and 8192 prefers TM=26 over the 5090's TM=28 (TM sweep 18-28 at 4096
-    # and 8192 batch=8 picked TM=26 by 0.2-0.7pp; the surface is very flat
-    # from TM=24 to TM=28). The Pro 6000 batched mode does NOT see the same
-    # TMA win as the 5090: cuBLAS dispatches the LARGE 256x128_8x4 kernel
-    # for batched on Pro 6000 (73% FMA pipe util) instead of the SMALL
-    # 128x32_8x5 kernel it picks on 5090 (41% util). Both GPUs are sm_120
-    # Blackwell — the difference is in cuBLAS's dispatcher heuristic, not
-    # the hardware. So Pro 6000 batched ceiling is ~95% vs 5090's 160%.
-    (256, _tma(bk=32, tm=8, ks=4)),
-    (512, _tma(bk=32, tm=8, ks=4)),
-    (1024, _tma(bk=32, tm=8, ks=4)),
-    (2048, _tma(bk=32, tm=26, ks=1)),
-    (4096, _tma(bk=32, tm=26, ks=1)),
-    (8192, _tma(bk=32, tm=26, ks=1)),
-    (16384, _tma(bk=32, tm=26, ks=1)),
+    (256, _hints(bk=32, tm=8, ks=4)),
+    (512, _hints(bk=32, tm=8, ks=4)),
+    (1024, _hints(bk=32, tm=8, ks=4)),
+    (2048, _hints(bk=32, tm=26, ks=1)),
+    (4096, _hints(bk=32, tm=26, ks=1)),
+    (8192, _hints(bk=32, tm=26, ks=1)),
+    (16384, _hints(bk=32, tm=26, ks=1)),
 ]
 
 # Match against the GPU name reported by `nvidia-smi --query-gpu=name`.
@@ -124,7 +95,7 @@ def detect_gpu_name() -> str | None:
 def default_matmul_strategy_map(
     gpu_name: str | None = None,
 ) -> tuple[list[tuple[int, MatmulHints]], str]:
-    """Return the best-known ``tma_db`` hint map for the given GPU.
+    """Return the best-known hint map for the given GPU.
 
     If ``gpu_name`` is None, auto-detects via ``nvidia-smi``. Falls back to
     the 5090 profile when the GPU is unknown or detection fails.

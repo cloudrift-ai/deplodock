@@ -38,7 +38,7 @@
 │  backend/base.py:  Backend ABC — compile(graph), run, benchmark                                                      │
 │  backend/numpy/:   NumpyBackend — Graph interpreter (pre-fusion)                                                     │
 │  backend/loop/:    LoopBackend  — Graph[LoopOp] interpreter (numpy)                                                  │
-│  backend/cuda/:    CudaBackend  — Graph[LoopOp] → Graph[KernelOp] → Graph[CudaOp] → nvcc                             │
+│  backend/cuda/:    CudaBackend  — Graph[LoopOp] → Graph[KernelOp] → Graph[CudaOp] → cupy.RawKernel (NVRTC)           │
 │                                                                                                                      │
 │  All three backends share:                                                                                           │
 │    backend.compile(graph) → compiled                                                                                 │
@@ -54,8 +54,8 @@
 │    ir/cuda/ir.py:             CudaOp   (graph-op with rendered CUDA source)                                          │
 │    ir/cuda/emit.py: GpuKernel → C source                                                                   │
 │    backend/cuda/emit.py:      per-kernel LoopOp → GpuKernel helpers                                                  │
-│    backend/cuda/program.py:   generate_source(Graph), nvcc compile + run                                             │
-│    backend/cuda/runner.py:    single-kernel compile + run harness                                                    │
+│    backend/cuda/program.py:   Graph[CudaOp] → cupy.RawKernel compile + dispatch + per-kernel event timing            │
+│    backend/cuda/runner.py:    single-kernel cupy dispatch (for tuning/diagnostics scripts)                           │
 │                                                                                                                      │
 │  RULE: GPU specifics live here; everything above is portable.                                                        │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -99,9 +99,9 @@ Graph[LoopOp]  (Layer 2: fused kernels as SSA LoopOps)
    │        node.op = CudaOp(kernel_source, kernel_name, …)
    ▼
 Graph[CudaOp]  (Layer 3)
-   │  backend/cuda/program.generate_source(graph)
+   │  backend/cuda/program._compile(graph)
    ▼
-.cu  →  nvcc  →  GPU
+cupy.RawKernel (NVRTC)  →  cupy.ndarray dispatch  →  GPU
 ```
 
 ## Structural LoopOp Cheat Sheet

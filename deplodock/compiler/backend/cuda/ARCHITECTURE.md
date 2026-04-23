@@ -3,9 +3,11 @@
 The CUDA backend takes a `Graph` and lowers it through two structural
 passes — `passes/lowering/kernel` (LoopOp → KernelOp) and
 `passes/lowering/cuda` (KernelOp → CudaOp) — producing a `Graph[CudaOp]`
-that the runtime walks to emit a `.cu` program. Source generation is a
-**recursive descent** over the structural IR; there's no classification
-pass, no `Schedule` dataclass, and no intermediate `LoopIR` stage.
+that the runtime walks to compile each kernel via `cupy.RawKernel`
+(NVRTC) and dispatch launches directly from Python. Source generation
+is a **recursive descent** over the structural IR; there's no
+classification pass, no `Schedule` dataclass, and no intermediate
+`LoopIR` stage.
 
 **Peer backends:**
 - `backend/numpy/` — `NumpyBackend` evaluates the Graph directly (pre-fusion).
@@ -22,8 +24,8 @@ cuda/
 ├── backend.py   # CudaBackend(Backend): compile(graph) → Graph[CudaOp]
 ├── emit.py      # emit_kernel(node, name, graph) → (GpuKernel, arg_order)
 │                # launch_config(node) → (grid, block)
-├── program.py   # generate_source(graph), nvcc compile + run
-└── runner.py    # Single-kernel compile + run + benchmark harness
+├── program.py   # Graph[CudaOp] → cupy.RawKernel dispatch + per-kernel event timing
+└── runner.py    # Single-kernel cupy dispatch (used by tuning/diagnostics scripts)
 ```
 
 Shared infrastructure (backend-agnostic) lives at the IR layer:
@@ -55,9 +57,11 @@ Graph[KernelOp]
     │      node.op = CudaOp(kernel_source, kernel_name, arg_order, grid, block, …)
     ▼
 Graph[CudaOp]
-    │  backend/cuda/program.generate_source(graph)
+    │  backend/cuda/program._compile(graph)
+    │    for each unique kernel_name: cp.RawKernel(source, name, -O2 --use_fast_math)
+    │    (NVRTC caches per source)
     ▼
-.cu  →  nvcc  →  GPU
+cupy dispatch: ndarray-per-buffer allocation, kernel(grid, block, args)  →  GPU
 ```
 
 ## Walkers and Emitters in `emit.py`
@@ -96,27 +100,23 @@ codegen path.
 
 ## Benchmark Mode Timing
 
-`generate_source(mode="benchmark")` emits two levels of timing inside
-the timed loop:
+`benchmark_program(graph, warmup, num_iters)` runs two levels of
+timing around the dispatch loop:
 
-- **Program total**: one global `cudaEvent` pair wraps all `num_iters`
-  iterations; the delta / `num_iters` is printed as `PROGRAM_TIME_MS`.
-- **Per-launch**: one `cudaEvent` pair per launch index (reused across
-  iterations) records each kernel, and `cudaEventElapsedTime` is
-  accumulated into `_kacc[i]` at the end of every iteration. After the
-  loop, averages are printed as `KERNEL_TIME_MS <idx> <kernel_name> <ms>`
-  lines, one per launch.
+- **Program total**: one global `cupy.cuda.Event` pair wraps all
+  `num_iters` iterations; the delta / `num_iters` populates
+  `BenchmarkResult.time_ms`.
+- **Per-launch**: one event pair per launch index, re-recorded every
+  iteration; `cupy.cuda.get_elapsed_time` is accumulated into an
+  `acc[i]` list, averaged, and emitted as `LaunchTime(idx, kernel_name,
+  time_ms)` entries in `BenchmarkResult.per_launch`.
 
-`_parse_benchmark_output()` collects the per-launch lines into
-`BenchmarkResult.per_launch: list[LaunchTime] | None` (sorted by idx).
-
-`zero_outputs` `cudaMemset` calls stay outside each launch's event pair
-— they aren't kernel time.
+`zero_outputs` calls (cupy `.fill(0)`) run before the launch's event
+pair — they aren't counted as kernel time.
 
 ## Naive Schedule Policy
 
-Correctness-first. No shared memory, no async copies, no TMA, no
-vectorization.
+Correctness-first. No shared memory, no async copies, no vectorization.
 
 - **Pointwise** (no `ReduceOp` in body): 1D grid, `block = (256, 1, 1)`,
   one thread per flat output coord.
