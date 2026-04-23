@@ -21,8 +21,8 @@ from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline.engine import run_pass
 
 _PASSES_ROOT = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
-LIFTING_DIR = _PASSES_ROOT / "lifting"
-RULES_DIR = _PASSES_ROOT / "fusion"
+LIFTING_DIR = _PASSES_ROOT / "loop" / "lifting"
+RULES_DIR = _PASSES_ROOT / "loop" / "fusion"
 
 rng = np.random.default_rng(0)
 _backend = NumpyBackend()
@@ -220,7 +220,7 @@ def test_contraction_body_has_mul_and_sum():
 
 
 def _make_contraction_with_epilogue():
-    from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
+    from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")

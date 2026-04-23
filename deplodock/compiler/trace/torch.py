@@ -251,7 +251,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         "pow": "pow",
     }
     if op_name in _EW_MAP:
-        from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
+        from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
         bc_ids = [broadcast_to(g, inp, shape) for inp in input_ids[:2]]
         nid = g.add_node(
@@ -447,7 +447,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
     # --- Fallback ---
     logger.debug("Fallback elementwise for %s (%s)", op_name, fx_node.target)
     if input_ids:
-        from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
+        from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
         # Fused-op fallbacks (rms_norm, softmax, …) intentionally keep their
         # smaller inputs unbroadcast — their decomposition rule owns the

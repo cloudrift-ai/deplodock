@@ -69,7 +69,7 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
 
     for name, module, inputs in modules:
         graph = trace_module(module, inputs)
-        decomposed = run_pass(graph, rules_dir / "decomposition")
+        decomposed = run_pass(graph, rules_dir / "frontend" / "decomposition")
         for n in decomposed.nodes.values():
             if not isinstance(n.op, ElementwiseOp):
                 continue

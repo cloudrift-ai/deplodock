@@ -26,7 +26,7 @@ tests/compiler/pipeline/passes/
 
 ## Covered Rules
 
-### Decomposition (`passes/decomposition/`)
+### Decomposition (`passes/frontend/decomposition/`)
 
 | Rule file | Op | Structural | Correctness |
 |---|---|---|---|
@@ -42,29 +42,29 @@ tests/compiler/pipeline/passes/
 | `013_slice_to_indexmap.py` | `SliceOp` | — | ✓ |
 | `014_cat_to_indexmap.py` | `CatOp` | — | ✓ |
 
-### Optimization (`passes/optimization/`)
+### Optimization (`passes/frontend/optimization/`)
 
 | Rule file | Op | Structural | Correctness |
 |---|---|---|---|
 | `002_insert_broadcast_indexmap.py` | `ElementwiseOp` (broadcast) | ✓ | ✓ (1D, scalar, 3D, RMSNorm chain) |
 
-### Fusion (`passes/fusion/`)
+### Fusion (`passes/loop/lifting/` + `passes/loop/fusion/`)
 
-The fusion pass is driven by lift-then-splice: each tensor op becomes a
-trivial `LoopOp` (one lift rule per op), then adjacent LoopOp pairs are
-spliced by inlining the producer body at each consumer `Load` that
-reads it. `test_fusion_rules.py` runs the whole directory as a single
-pass; the splicer's behaviour is exercised end-to-end there (no
-separate unit-test file — the old `test_merge_core.py` was retired
-with `_merge_core.py`).
+Lifting wraps each surviving tensor primitive (elementwise / reduce /
+indexmap / gather) in a trivial single-op `LoopOp`. Fusion then splices
+adjacent `LoopOp` pairs by inlining the producer body at each consumer
+`Load` that reads it. `test_fusion_rules.py` runs lifting followed by
+fusion as a single pass; the splicer's behaviour is exercised
+end-to-end there (no separate unit-test file — the old
+`test_merge_core.py` was retired with `_merge_core.py`).
 
 | Rule file | Op | Tested via |
 |---|---|---|
-| `001_lift_elementwise.py` | `ElementwiseOp` → `LoopOp` | `test_fusion_rules.py` (pass fixpoint) |
-| `002_lift_reduce.py`      | `ReduceOp` → `LoopOp`      | `test_fusion_rules.py::test_contraction_*` |
-| `003_lift_indexmap.py`    | `IndexMapOp` → `LoopOp`    | `test_optimization_rules.py::test_matmul_with_transpose_fuses_to_one_kernel` (e2e) |
-| `004_lift_gather.py`      | `GatherOp` → `LoopOp`      | `test_torch_ops.py::test_gather` |
-| `005_merge_loop_ops.py`   | `LoopOp → LoopOp` (splice) | `test_fusion_rules.py` (fixpoint) |
+| `loop/lifting/001_lift_elementwise.py` | `ElementwiseOp` → `LoopOp` | `test_fusion_rules.py` (pass fixpoint) |
+| `loop/lifting/002_lift_reduce.py`      | `ReduceOp` → `LoopOp`      | `test_fusion_rules.py::test_contraction_*` |
+| `loop/lifting/003_lift_indexmap.py`    | `IndexMapOp` → `LoopOp`    | `test_optimization_rules.py::test_matmul_with_transpose_fuses_to_one_kernel` (e2e) |
+| `loop/lifting/004_lift_gather.py`      | `GatherOp` → `LoopOp`      | `test_torch_ops.py::test_gather` |
+| `loop/fusion/001_merge_loop_ops.py`    | `LoopOp → LoopOp` (splice) | `test_fusion_rules.py` (fixpoint) |
 
 Numerical correctness for lifted + merged kernels runs through the
 numpy backends in three places:

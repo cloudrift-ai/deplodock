@@ -7,7 +7,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline.engine import run_pass
 
-_DECOMP_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "decomposition"
+_DECOMP_DIR = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "frontend" / "decomposition"
 
 
 def _make_silu_graph() -> Graph:

@@ -12,7 +12,7 @@ from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp
-from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
+from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()

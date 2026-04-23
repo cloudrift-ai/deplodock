@@ -20,20 +20,17 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, RunResult
 from deplodock.compiler.backend.interpret import interpret_graph
-from deplodock.compiler.pipeline import run_pipeline
+from deplodock.compiler.pipeline import LOOP_PASSES, run_pipeline
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
-
-
-_PASSES = ["decomposition", "optimization", "lifting", "fusion"]
 
 
 class LoopBackend(Backend):
     """Execute a fused ``Graph[LoopOp]`` via numpy whole-tensor operations."""
 
     def compile(self, graph: Graph) -> Graph:
-        return run_pipeline(graph, _PASSES)
+        return run_pipeline(graph, LOOP_PASSES)
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         t0 = time.perf_counter()

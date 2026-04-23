@@ -9,7 +9,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
-from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to, squeeze_axis
+from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to, squeeze_axis
 
 PATTERN = [Pattern("root", LinearOp)]
 
@@ -46,7 +46,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     )
 
     # Reuse matmul's unsqueeze logic for x @ wt.
-    from deplodock.compiler.pipeline.passes.decomposition._matmul_helpers import matmul_unsqueeze
+    from deplodock.compiler.pipeline.passes.frontend.decomposition._matmul_helpers import matmul_unsqueeze
 
     x_shape = tuple(graph.nodes[x_id].output.shape)
     a_unsq, b_unsq, mul_shape, k_axis = matmul_unsqueeze(x_shape, tuple(wt_shape))
