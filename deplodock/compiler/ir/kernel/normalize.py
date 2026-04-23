@@ -45,7 +45,16 @@ __all__ = ["normalize_kernel"]
 
 _INT_MAX = 2**31 - 1
 
-_NONNEG_VAR_PREFIXES = ("threadIdx.", "blockIdx.", "blockDim.", "gridDim.")
+_NONNEG_VAR_PREFIXES = (
+    "threadIdx.",
+    "blockIdx.",
+    "blockDim.",
+    "gridDim.",
+    "thread_idx.",
+    "block_idx.",
+    "block_dim.",
+    "grid_dim.",
+)
 
 
 def _for_bounds(stmt: ForLoop) -> Interval | None:
@@ -170,7 +179,7 @@ def _simplify_gpu_stmt(stmt: GpuStmt, ctx: Context) -> tuple[GpuStmt, Context]:
         return IfStmt(new_cond, new_body, new_else), ctx  # type: ignore[arg-type]
     if isinstance(stmt, ArrayDecl):
         new_init = simplify_expr(stmt.init, ctx) if stmt.init is not None else None
-        return ArrayDecl(stmt.dtype, stmt.name, stmt.dimensions, new_init), ctx  # type: ignore[arg-type]
+        return ArrayDecl(stmt.dtype, stmt.name, stmt.dimensions, new_init, storage=stmt.storage), ctx  # type: ignore[arg-type]
     if isinstance(stmt, (SyncThreads, PragmaUnroll, RawCode)):
         return stmt, ctx
     return stmt, ctx

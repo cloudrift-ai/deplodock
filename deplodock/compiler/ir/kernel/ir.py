@@ -174,12 +174,18 @@ class SyncThreads:
 
 @dataclass
 class ArrayDecl:
-    """Fixed-size array declaration, e.g. __shared__ float tile[BK][BM]."""
+    """Fixed-size array declaration, e.g. shared-memory float tile[BK][BM].
 
-    dtype: str  # "__shared__ float", "float", "float4"
+    ``storage="shared"`` marks the array as backed by GPU shared memory;
+    the CUDA emitter prepends ``__shared__`` at codegen time. Keep ``dtype``
+    the bare element type (``"float"``, ``"float4"``) — no storage modifiers.
+    """
+
+    dtype: str
     name: str
     dimensions: list[int]  # [64, 64] for 2D, [256] for 1D
     init: GpuExpr | None = None
+    storage: str = "local"  # "local" or "shared"
 
 
 @dataclass
@@ -338,7 +344,8 @@ def _pp_stmt(stmt: Stmt, depth: int) -> list[str]:
     if isinstance(stmt, ArrayDecl):
         dims = "".join(f"[{d}]" for d in stmt.dimensions)
         init = f" = {_pp_expr(stmt.init)}" if stmt.init is not None else ""
-        return [f"{pad}{stmt.dtype} {stmt.name}{dims}{init}"]
+        storage = f"{stmt.storage} " if stmt.storage and stmt.storage != "local" else ""
+        return [f"{pad}{storage}{stmt.dtype} {stmt.name}{dims}{init}"]
 
     if isinstance(stmt, ForLoop):
         step = f", step={_pp_expr(stmt.step)}" if stmt.step else ""
