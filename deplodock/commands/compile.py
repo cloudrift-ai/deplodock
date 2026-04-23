@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from deplodock.compiler.pipeline import CUDA_PASSES, KERNEL_PASSES, LOOP_PASSES, TENSOR_PASSES
+
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
 
@@ -20,22 +22,22 @@ logger = logging.getLogger(__name__)
 # source) disambiguates the IR level.
 _IR_STAGES = {
     "torch": ([], "graph"),
-    "tensor": (["decomposition", "optimization"], "graph"),
-    "loop": (["decomposition", "optimization", "lifting", "fusion"], "kernels"),
-    "kernel": (["decomposition", "optimization", "lifting", "fusion", "lowering/kernel"], "kernels"),
-    "cuda": (["decomposition", "optimization", "lifting", "fusion", "lowering/kernel", "lowering/cuda"], "kernels"),
+    "tensor": (TENSOR_PASSES, "graph"),
+    "loop": (LOOP_PASSES, "kernels"),
+    "kernel": (KERNEL_PASSES, "kernels"),
+    "cuda": (CUDA_PASSES, "kernels"),
 }
 
-_DEFAULT_PASSES = ["decomposition", "optimization", "lifting", "fusion"]
+_DEFAULT_PASSES = LOOP_PASSES
 
 # Single-letter shortcuts for each pass. Passing a contiguous string of
 # these letters to --passes is equivalent to the expanded comma list
-# (e.g. 'dolfk' == 'decomposition,optimization,lifting,fusion,lowering/kernel').
+# (e.g. 'dolfk' expands to the full front-to-kernel pipeline).
 _PASS_SHORTCUTS = {
-    "d": "decomposition",
-    "o": "optimization",
-    "l": "lifting",
-    "f": "fusion",
+    "d": "frontend/decomposition",
+    "o": "frontend/optimization",
+    "l": "loop/lifting",
+    "f": "loop/fusion",
     "k": "lowering/kernel",
     "c": "lowering/cuda",
 }

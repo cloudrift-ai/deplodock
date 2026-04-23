@@ -13,7 +13,7 @@ from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
-from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to, squeeze_axis
+from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to, squeeze_axis
 
 PATTERN = [Pattern("root", SdpaOp)]
 
@@ -84,7 +84,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
             )
 
     # QK^T: matmul(Q, K^T) — unsqueeze for broadcast-compatible mul + reduce.
-    from deplodock.compiler.pipeline.passes.decomposition._matmul_helpers import matmul_unsqueeze
+    from deplodock.compiler.pipeline.passes.frontend.decomposition._matmul_helpers import matmul_unsqueeze
 
     q_eff_shape = tuple(graph.nodes[q_id].output.shape)
     kt_eff_shape = tuple(frag.nodes[kt_id].output.shape)

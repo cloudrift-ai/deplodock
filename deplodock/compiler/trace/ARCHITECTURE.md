@@ -50,5 +50,5 @@ ops. Two helpers clean this up:
 
 Frontend capture is **upstream of decomposition** — `trace/` emits
 `ir/frontend/` ops only, never primitives. Decomposition rules
-(`pipeline/passes/decomposition/`) rewrite frontend ops into tensor-IR
+(`pipeline/passes/frontend/decomposition/`) rewrite frontend ops into tensor-IR
 primitives; `trace/` is unaware of that rewrite.

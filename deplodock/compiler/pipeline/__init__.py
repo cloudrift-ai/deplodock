@@ -5,9 +5,10 @@
   ``run_rule``, ``run_pass``, ``run_pipeline``.
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
   dispatch that routes post-pass dumps by pass name.
-- :mod:`.passes` — pass directories (``decomposition/``, ``optimization/``,
-  ``lifting/``, ``fusion/``, ``lowering/{kernel,cuda}/``); each contains ``NNN_<name>.py``
-  rule modules picked up by ``run_pass``.
+- :mod:`.passes` — pass directories grouped by IR level:
+  ``frontend/{decomposition,optimization}``, ``loop/{lifting,fusion}``,
+  ``lowering/{kernel,cuda}``. Each leaf contains ``NNN_<name>.py`` rule
+  modules picked up by ``run_pass``.
 """
 
 from deplodock.compiler.pipeline.dump import CompilerDump
@@ -20,10 +21,21 @@ from deplodock.compiler.pipeline.engine import (
     run_rule,
 )
 
+# Canonical pass lists, indexed by the --ir stage they produce. Backends
+# and tests should reference these rather than re-listing pass names.
+TENSOR_PASSES = ["frontend/decomposition", "frontend/optimization"]
+LOOP_PASSES = [*TENSOR_PASSES, "loop/lifting", "loop/fusion"]
+KERNEL_PASSES = [*LOOP_PASSES, "lowering/kernel"]
+CUDA_PASSES = [*KERNEL_PASSES, "lowering/cuda"]
+
 __all__ = [
+    "CUDA_PASSES",
     "CompilerDump",
+    "KERNEL_PASSES",
+    "LOOP_PASSES",
     "Match",
     "Pattern",
+    "TENSOR_PASSES",
     "match_pattern",
     "run_pass",
     "run_pipeline",

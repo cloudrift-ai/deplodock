@@ -11,13 +11,11 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.loop import Accum, LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import run_pipeline
-
-_FUSE_PASSES = ["decomposition", "optimization", "lifting", "fusion"]
+from deplodock.compiler.pipeline import LOOP_PASSES, run_pipeline
 
 
 def _compile(graph: Graph) -> Graph:
-    return run_pipeline(graph, _FUSE_PASSES)
+    return run_pipeline(graph, LOOP_PASSES)
 
 
 requires_cuda = pytest.mark.skipif(

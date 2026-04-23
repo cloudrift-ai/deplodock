@@ -25,7 +25,7 @@ from deplodock.compiler.ir.frontend.ir import (
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline.engine import run_rule
 
-RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "decomposition"
+RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "frontend" / "decomposition"
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()
@@ -208,8 +208,8 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
 
     rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
     graph = trace_module(torch.nn.RMSNorm(64), (torch.randn(1, 8, 64),))
-    decomposed = run_pass(graph, rules_dir / "decomposition")
-    decomposed = run_pass(decomposed, rules_dir / "optimization")
+    decomposed = run_pass(graph, rules_dir / "frontend" / "decomposition")
+    decomposed = run_pass(decomposed, rules_dir / "frontend" / "optimization")
     for n in decomposed.nodes.values():
         if isinstance(n.op, ElementwiseOp):
             assert n.op.fn != "rms_norm", f"rms_norm survived decomposition at {n.output.name}"
@@ -269,8 +269,8 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
 
     rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
     graph = trace_module(torch.nn.Softmax(dim=-1), (torch.randn(1, 4, 8),))
-    decomposed = run_pass(graph, rules_dir / "decomposition")
-    decomposed = run_pass(decomposed, rules_dir / "optimization")
+    decomposed = run_pass(graph, rules_dir / "frontend" / "decomposition")
+    decomposed = run_pass(decomposed, rules_dir / "frontend" / "optimization")
     for n in decomposed.nodes.values():
         if isinstance(n.op, ElementwiseOp):
             assert n.op.fn != "softmax", f"softmax survived decomposition at {n.output.name}"

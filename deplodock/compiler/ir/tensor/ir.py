@@ -111,7 +111,7 @@ class ElementwiseOp(Op):
                 shapes_fmt = [tuple(s) for s in input_shapes]
                 raise ValueError(
                     f"ElementwiseOp({self.fn!r}) input shapes must all match output; "
-                    f"got {shapes_fmt}. Wrap in IndexMapOp (pipeline/passes/decomposition/_broadcast.broadcast_to)."
+                    f"got {shapes_fmt}. Wrap in IndexMapOp (pipeline/passes/frontend/decomposition/_broadcast.broadcast_to)."
                 )
         return head
 

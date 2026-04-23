@@ -174,9 +174,11 @@ def test_hints_flow_through_lower():
 
     from pathlib import Path
 
+    from deplodock.compiler.pipeline import LOOP_PASSES
+
     rules_dir = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
     fused = g
-    for name in ("decomposition", "optimization", "lifting", "fusion"):
+    for name in LOOP_PASSES:
         fused = run_pass(fused, rules_dir / name)
 
     from deplodock.compiler.ir.loop import LoopOp

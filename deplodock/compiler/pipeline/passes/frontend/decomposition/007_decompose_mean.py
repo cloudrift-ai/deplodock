@@ -5,7 +5,7 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.frontend.ir import MeanOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
-from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
+from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
 PATTERN = [Pattern("root", MeanOp)]
 

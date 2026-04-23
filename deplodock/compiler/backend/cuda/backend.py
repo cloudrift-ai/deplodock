@@ -13,14 +13,11 @@ import numpy as np
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import benchmark_program, run_program, run_program_debug
-from deplodock.compiler.pipeline import run_pipeline
+from deplodock.compiler.pipeline import CUDA_PASSES, run_pipeline
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.pipeline.dump import CompilerDump
-
-
-_PASSES = ["decomposition", "optimization", "lifting", "fusion", "lowering/kernel", "lowering/cuda"]
 
 
 _DEBUG_ENV = "DEPLODOCK_DEBUG"
@@ -48,7 +45,7 @@ class CudaBackend(Backend):
 
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[KernelOp]`` → ``Graph[CudaOp]``."""
-        return run_pipeline(graph, _PASSES, dump=self.dump)
+        return run_pipeline(graph, CUDA_PASSES, dump=self.dump)
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         if self.debug:

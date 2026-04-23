@@ -7,9 +7,10 @@ PyTorch module
    │  trace/              ── PyTorch → Graph IR capture
    ▼
 Graph (frontend ops)                        ── Layer 1
-   │  pipeline/passes/decomposition
-   │  pipeline/passes/optimization
-   │  pipeline/passes/fusion
+   │  pipeline/passes/frontend/decomposition
+   │  pipeline/passes/frontend/optimization
+   │  pipeline/passes/loop/lifting
+   │  pipeline/passes/loop/fusion
    ▼
 Graph[LoopOp]  (one LoopOp = one kernel)    ── Layer 2
    │  pipeline/passes/lowering/kernel       (CUDA path)
@@ -48,7 +49,7 @@ passes swap node ops in place, so there is no separate "program" type.
 - **Shape lives on the graph**, not on the op — `node.output.shape`.
 - **`ElementwiseOp` inputs must already share the output shape.** The
   decomposition helper
-  `pipeline/passes/decomposition/_broadcast.broadcast_to` wraps
+  `pipeline/passes/frontend/decomposition/_broadcast.broadcast_to` wraps
   mismatched inputs in an `IndexMapOp`.
 - **One `LoopOp` = one kernel.** Fusion produces `LoopOp` nodes;
   lowering turns each into `KernelOp` (AST) then `CudaOp` (rendered

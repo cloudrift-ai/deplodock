@@ -1,7 +1,7 @@
 """Frontend (Torch) IR — ops captured directly from PyTorch tracing.
 
 These ops exist in the graph between tracing and decomposition. Every one
-of them has a decomposition rule in ``compiler/pipeline/passes/decomposition/`` that
+of them has a decomposition rule in ``compiler/pipeline/passes/frontend/decomposition/`` that
 rewrites it into ``ir.tensor.ir`` primitives (elementwise + reduce + indexmap
 + constants). After the decomposition pass completes, none of these ops
 should remain in the graph.

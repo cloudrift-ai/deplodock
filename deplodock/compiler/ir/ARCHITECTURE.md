@@ -62,7 +62,7 @@ other IR files.
 ## `frontend/ir.py`
 
 Ops captured directly from PyTorch. Every one has a decomposition rule
-under `pipeline/passes/decomposition/`; after that pass none of these
+under `pipeline/passes/frontend/decomposition/`; after that pass none of these
 remain.
 
 | Group         | Ops                                                                                       |
@@ -136,7 +136,7 @@ Also used by `ir/kernel/normalize.py` for GpuKernel Expr simplification.
 
 ### `loop/splicer.py` + `loop/sigma.py` — LoopOp merger
 
-The machinery `pipeline/passes/fusion/001_merge_loop_ops.py` calls to
+The machinery `pipeline/passes/loop/fusion/001_merge_loop_ops.py` calls to
 splice adjacent `LoopOp` pairs. Sigma is axis-substitution bookkeeping
 threaded through the merge.
 
