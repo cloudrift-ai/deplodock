@@ -38,7 +38,7 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.kernel.ir import Assign as GpuAssign
 from deplodock.compiler.ir.kernel.ir import Stmt as GpuStmt
-from deplodock.compiler.ir.simplify import Context, Interval, simplify_expr
+from deplodock.compiler.ir.loop.simplify import Context, Interval, simplify_expr
 
 __all__ = ["normalize_kernel"]
 

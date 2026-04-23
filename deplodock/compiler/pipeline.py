@@ -10,6 +10,10 @@ Lowers a traced ``Graph`` through the rewriter's passes:
        trivial ``LoopOp`` copies.
     3. **Fusion** — assembles primitives into ``LoopOp`` nodes.
 
+Each ``LoopOp`` gets normalized (structural passes + Expr simplification)
+inside its own ``__post_init__``, so the pipeline doesn't need a
+separate simplify stage.
+
 The result is a ``Graph[LoopOp + InputOp + ConstantOp]``. Backend-specific
 lowering (``Graph[LoopOp] → Graph[KernelOp] → Graph[CudaOp]``) happens in
 each backend's ``compile``.
@@ -23,8 +27,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.graph import Graph
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.simplify import simplify_loop_op
 from deplodock.compiler.rewriter import run_pass
 
 if TYPE_CHECKING:
@@ -55,14 +57,6 @@ def compile_graph(graph: Graph, dump: CompilerDump | None = None) -> Graph:
     n_before_fusion = len(graph.nodes)
     graph = run_pass(graph, _PASSES_DIR / "fusion")
     logger.info("compile: fuse %.2fs (%d -> %d nodes)", time.monotonic() - t0, n_before_fusion, len(graph.nodes))
-
-    t0 = time.monotonic()
-    n_loop_ops = 0
-    for node in graph.nodes.values():
-        if isinstance(node.op, LoopOp):
-            node.op = simplify_loop_op(node.op)
-            n_loop_ops += 1
-    logger.info("compile: simplify_loop_op %.2fs (%d LoopOp nodes)", time.monotonic() - t0, n_loop_ops)
 
     if dump is not None:
         dump.on_pass("fusion", graph)
