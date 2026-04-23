@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
 
 
-_PASSES = ["decomposition", "optimization", "fusion"]
+_PASSES = ["decomposition", "optimization", "lifting", "fusion"]
 
 
 class LoopBackend(Backend):

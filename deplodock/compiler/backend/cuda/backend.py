@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
 
 
-_PASSES = ["decomposition", "optimization", "fusion", "lowering/kernel", "lowering/cuda"]
+_PASSES = ["decomposition", "optimization", "lifting", "fusion", "lowering/kernel", "lowering/cuda"]
 
 
 _DEBUG_ENV = "DEPLODOCK_DEBUG"

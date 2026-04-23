@@ -21,19 +21,20 @@ logger = logging.getLogger(__name__)
 _IR_STAGES = {
     "torch": ([], "graph"),
     "tensor": (["decomposition", "optimization"], "graph"),
-    "loop": (["decomposition", "optimization", "fusion"], "kernels"),
-    "kernel": (["decomposition", "optimization", "fusion", "lowering/kernel"], "kernels"),
-    "cuda": (["decomposition", "optimization", "fusion", "lowering/kernel", "lowering/cuda"], "kernels"),
+    "loop": (["decomposition", "optimization", "lifting", "fusion"], "kernels"),
+    "kernel": (["decomposition", "optimization", "lifting", "fusion", "lowering/kernel"], "kernels"),
+    "cuda": (["decomposition", "optimization", "lifting", "fusion", "lowering/kernel", "lowering/cuda"], "kernels"),
 }
 
-_DEFAULT_PASSES = ["decomposition", "optimization", "fusion"]
+_DEFAULT_PASSES = ["decomposition", "optimization", "lifting", "fusion"]
 
 # Single-letter shortcuts for each pass. Passing a contiguous string of
 # these letters to --passes is equivalent to the expanded comma list
-# (e.g. 'dofk' == 'decomposition,optimization,fusion,lowering/kernel').
+# (e.g. 'dolfk' == 'decomposition,optimization,lifting,fusion,lowering/kernel').
 _PASS_SHORTCUTS = {
     "d": "decomposition",
     "o": "optimization",
+    "l": "lifting",
     "f": "fusion",
     "k": "lowering/kernel",
     "c": "lowering/cuda",
@@ -79,8 +80,8 @@ def register_compile_command(subparsers):
         help=(
             "Pass list to override the default. Accepts either a comma-separated list "
             "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
-            "single-letter shortcuts: d=decomposition, o=optimization, f=fusion, "
-            "k=lowering/kernel, c=lowering/cuda (so 'dofk' == the first four)."
+            "single-letter shortcuts: d=decomposition, o=optimization, l=lifting, "
+            "f=fusion, k=lowering/kernel, c=lowering/cuda (so 'dolfk' == the first five)."
         ),
     )
     parser.set_defaults(func=handle_compile)

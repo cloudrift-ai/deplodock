@@ -14,9 +14,9 @@ remain in the graph:
   placeholder vars from ``ir.expr``.
 
 Plus the boundary sentinels ``InputOp`` and ``ConstantOp`` from ``ir.base``.
-Fusion then lifts each tensor op into a trivial ``ir.loop.LoopOp`` and
-splices adjacent LoopOp pairs in ``passes/fusion/005_merge_loop_ops`` via
-the tree-splicer in ``passes/fusion/_splice.py``.
+The ``lifting/`` pass wraps each tensor op in a trivial ``ir.loop.LoopOp``
+and the ``fusion/`` pass splices adjacent LoopOp pairs via the
+tree-splicer in ``ir/loop/splicer.py``.
 """
 
 from __future__ import annotations

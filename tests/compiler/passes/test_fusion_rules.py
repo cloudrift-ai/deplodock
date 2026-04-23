@@ -20,13 +20,16 @@ from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline.engine import run_pass
 
-RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "fusion"
+_PASSES_ROOT = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
+LIFTING_DIR = _PASSES_ROOT / "lifting"
+RULES_DIR = _PASSES_ROOT / "fusion"
 
 rng = np.random.default_rng(0)
 _backend = NumpyBackend()
 
 
 def _fuse(graph: Graph) -> Graph:
+    graph = run_pass(graph, LIFTING_DIR)
     return run_pass(graph, RULES_DIR)
 
 
