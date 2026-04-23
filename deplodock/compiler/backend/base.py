@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class ProgramResult:
+class RunResult:
     """Result of running a program: outputs as ndarrays + optional wall-time."""
 
     outputs: dict[str, Any]  # actually dict[str, np.ndarray] at runtime
@@ -65,8 +65,8 @@ class Backend(ABC):
         """Lower a ``Graph`` to a backend-specific runnable artifact."""
 
     @abstractmethod
-    def run(self, compiled: Any, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
-        """Execute; return ``ProgramResult`` with outputs as ndarrays + wall-time."""
+    def run(self, compiled: Any, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
+        """Execute; return ``RunResult`` with outputs as ndarrays + wall-time."""
 
     def benchmark(
         self,

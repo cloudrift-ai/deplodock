@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from deplodock.compiler.backend import BenchmarkResult, LaunchTime, ProgramResult
+from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Node
@@ -184,7 +184,7 @@ def _launch(launch: _Launch, compiled: _Compiled, arrays: dict[str, cp.ndarray])
 # ---------------------------------------------------------------------------
 
 
-def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
+def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
     """Run the lowered graph once, return output ndarrays + total time."""
     import cupy as cp
 
@@ -204,7 +204,7 @@ def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -
     for buf in compiled.bufs:
         if buf.role == "output":
             outputs[buf.name] = arrays[buf.name].get().astype(np.float32, copy=False)
-    return ProgramResult(outputs=outputs, time_ms=time_ms)
+    return RunResult(outputs=outputs, time_ms=time_ms)
 
 
 @dataclass

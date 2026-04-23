@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from deplodock.compiler.backend import Backend, BenchmarkResult, ProgramResult
+from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import benchmark_program, run_program, run_program_debug
 from deplodock.compiler.passes.lowering.cuda import lower as lower_to_cuda
 from deplodock.compiler.passes.lowering.kernel import lower as lower_to_kernel
@@ -52,7 +52,7 @@ class CudaBackend(Backend):
             self.dump.dump_cuda_graph(graph)
         return graph
 
-    def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
+    def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         if self.debug:
             debug_result = run_program_debug(compiled, input_data=input_data)
             self.last_debug_result = debug_result
@@ -67,7 +67,7 @@ class CudaBackend(Backend):
         for name, vals in result_outputs.items():
             shape = tuple(int(d) for d in compiled.nodes[name].output.shape)
             outputs[name] = np.asarray(vals, dtype=np.float32).reshape(shape)
-        return ProgramResult(outputs=outputs, time_ms=time_ms)
+        return RunResult(outputs=outputs, time_ms=time_ms)
 
     def benchmark(
         self,

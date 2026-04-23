@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from deplodock.compiler.backend import Backend, ProgramResult
+from deplodock.compiler.backend import Backend, RunResult
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, LoopOp, Select, Write
@@ -30,11 +30,11 @@ class LoopBackend(Backend):
     def compile(self, graph: Graph) -> Graph:
         return compile_graph(graph)
 
-    def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
+    def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         t0 = time.perf_counter()
         arrays = _execute(compiled, input_data or {})
         elapsed = (time.perf_counter() - t0) * 1000
-        return ProgramResult(outputs=arrays, time_ms=elapsed)
+        return RunResult(outputs=arrays, time_ms=elapsed)
 
 
 # ---------------------------------------------------------------------------
