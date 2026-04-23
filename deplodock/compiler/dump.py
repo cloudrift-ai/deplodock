@@ -64,6 +64,25 @@ class CompilerDump:
 
     # --- Dump methods ---
 
+    def on_pass(self, pass_name: str, graph: Graph) -> None:
+        """Dispatch the post-pass dumps appropriate to ``pass_name``.
+
+        Callers invoke this after each ``run_pass(...)`` instead of
+        hard-coding which ``dump_*`` method a given pass needs. ``pass_name``
+        matches the pass directory name under ``passes/`` (e.g.
+        ``"optimization"``, ``"fusion"``, ``"lowering/kernel"``). Unknown
+        or dump-less names (e.g. ``"decomposition"``) are no-ops.
+        """
+        if pass_name == "optimization":
+            self.dump_tensor_ir(graph)
+        elif pass_name == "fusion":
+            self.dump_fused_graph(graph)
+            self.dump_loop_ir(graph)
+        elif pass_name == "lowering/kernel":
+            self.dump_kernel_graph(graph)
+        elif pass_name == "lowering/cuda":
+            self.dump_cuda_graph(graph)
+
     def dump_input_graph(self, graph: Graph) -> None:
         """Graph as captured by the tracer, before any rewriter passes.
 

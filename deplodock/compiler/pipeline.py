@@ -49,7 +49,7 @@ def compile_graph(graph: Graph, dump: CompilerDump | None = None) -> Graph:
     logger.info("compile: decompose+optimize %.2fs (%d -> %d nodes)", time.monotonic() - t0, n_in, len(graph.nodes))
 
     if dump is not None:
-        dump.dump_tensor_ir(graph)
+        dump.on_pass("optimization", graph)
 
     t0 = time.monotonic()
     n_before_fusion = len(graph.nodes)
@@ -65,8 +65,7 @@ def compile_graph(graph: Graph, dump: CompilerDump | None = None) -> Graph:
     logger.info("compile: simplify_loop_op %.2fs (%d LoopOp nodes)", time.monotonic() - t0, n_loop_ops)
 
     if dump is not None:
-        dump.dump_fused_graph(graph)
-        dump.dump_loop_ir(graph)
+        dump.on_pass("fusion", graph)
 
     logger.info("compile: total %.2fs", time.monotonic() - t_start)
     return graph
