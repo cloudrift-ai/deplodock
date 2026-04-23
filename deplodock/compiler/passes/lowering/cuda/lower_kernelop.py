@@ -27,7 +27,6 @@ def lower(graph: Graph) -> Graph:
             block=node.op.block,
             smem_bytes=node.op.smem_bytes,
             zero_outputs=node.op.zero_outputs,
-            tma_descriptors=node.op.tma_descriptors,
             comment=node.op.comment,
         )
     return graph

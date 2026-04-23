@@ -19,7 +19,6 @@ graph node, which is then lowered to a ``CudaOp`` by
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.expr import (
@@ -225,8 +224,6 @@ class GpuKernel:
     tile_m: int | None = None  # Output tile rows per block (overrides grid computation)
     tile_n: int | None = None  # Output tile cols per block
     grid_2d: bool = False  # Use standard 2D grid (blockIdx.x=cols, blockIdx.y=rows) instead of CTA swizzle
-    tma_params: list[str] | None = None  # TMA descriptor param names (e.g. ["A_tma", "B_tma"])
-    batched: bool = False  # Batched GEMM: TMA descriptors are per-batch arrays
     extra_smem_bytes: int = 0  # Extra dynamic smem beyond standard double-buffer (e.g. for hybrid TF32 split scratch)
     min_blocks_per_sm: int = 0  # If >0, emit __launch_bounds__(threads, min_blocks_per_sm) to force occupancy
     online_reduce: bool = False  # 1D grid over M-tiles with N-tiled online reduction
@@ -242,8 +239,8 @@ class KernelOp(Op):
     """One kernel invocation as a graph-op.
 
     Produced by ``passes/lowering/kernel``. Carries a ``GpuKernel`` (the
-    kernel-level AST) plus launch metadata (grid/block/smem/zero_outputs/
-    tma_descriptors). One ``KernelOp`` → one kernel invocation.
+    kernel-level AST) plus launch metadata (grid/block/smem/zero_outputs).
+    One ``KernelOp`` → one kernel invocation.
 
     ``__post_init__`` runs ``ir.kernel.normalize.normalize_kernel`` on the
     kernel so every constructed ``KernelOp`` — including intermediate
@@ -257,7 +254,6 @@ class KernelOp(Op):
     block: tuple[int, int, int] = (1, 1, 1)
     smem_bytes: int = 0
     zero_outputs: tuple[str, ...] = ()
-    tma_descriptors: tuple[Any, ...] = ()
     comment: str = ""
 
     def __post_init__(self) -> None:

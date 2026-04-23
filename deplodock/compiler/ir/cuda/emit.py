@@ -58,16 +58,7 @@ def emit_kernel(kernel: GpuKernel) -> str:
         if "mma.h" in kernel.includes:
             preamble += "using namespace nvcuda;\n"
         preamble += "\n"
-    # Build parameter list: TMA descriptors first, then regular params
-    param_parts = []
-    if kernel.tma_params:
-        for tp in kernel.tma_params:
-            if kernel.batched:
-                param_parts.append(f"const CUtensorMap* {tp}")
-            else:
-                param_parts.append(f"const __grid_constant__ CUtensorMap {tp}")
-    param_parts.extend(f"{p.dtype} {p.name}" for p in kernel.params)
-    params = ", ".join(param_parts)
+    params = ", ".join(f"{p.dtype} {p.name}" for p in kernel.params)
     body = "\n".join(_emit_stmt(s, indent=1) for s in kernel.body)
     bx, by, bz = kernel.block_size
     max_threads = bx * by * bz
@@ -79,7 +70,7 @@ def emit_kernel(kernel: GpuKernel) -> str:
             launch_bounds = f"\n__launch_bounds__({max_threads})"
     else:
         launch_bounds = ""
-    return f"{preamble}__global__{launch_bounds} void {kernel.name}({params}) {{\n{body}\n}}\n"
+    return f'{preamble}extern "C" __global__{launch_bounds} void {kernel.name}({params}) {{\n{body}\n}}\n'
 
 
 def _emit_expr(expr: GpuExpr, parent_prec: int = 0) -> str:

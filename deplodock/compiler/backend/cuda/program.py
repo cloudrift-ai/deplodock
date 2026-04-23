@@ -1,21 +1,21 @@
-"""CUDA codegen + execution driver for ``Graph[CudaOp]``.
+"""CUDA runtime dispatch for ``Graph[CudaOp]``.
 
-Walks the lowered graph to emit a full ``.cu`` program: buffer
-allocation, input/constant initialization, kernel launches, output
-readback. The graph is the single source of truth — buffer roles are
-derived from ``graph.inputs`` / ``graph.outputs`` / ``ConstantOp``
-membership, shapes from ``node.output.shape``, and launch order from
-topological order.
+Compiles each unique kernel source via NVRTC (through ``cupy.RawKernel``),
+allocates a ``cupy.ndarray`` for every buffer in the graph, and walks
+compute nodes in topological order launching kernels directly from Python.
+No host ``.cu`` is generated — the only codegen that survives is the
+per-kernel ``__global__`` function itself, emitted by ``ir/cuda/emit.py``.
+
+Buffer roles come from the graph: ``graph.inputs`` → input,
+``ConstantOp`` → constant, ``graph.outputs`` → output, everything else →
+scratch. Launch order is ``graph.topological_order()``.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import subprocess
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -24,18 +24,10 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.graph import Graph, Node
 
+if TYPE_CHECKING:
+    import cupy as cp
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TmaDescriptorSpec:
-    """Spec for creating a CUtensorMap descriptor at runtime."""
-
-    param_name: str
-    buffer: str
-    dims: list[str]
-    strides: list[str]
-    tile: list[int]
 
 
 # ---------------------------------------------------------------------------
@@ -46,9 +38,9 @@ class TmaDescriptorSpec:
 @dataclass
 class _Buffer:
     name: str
-    shape: tuple[int | str, ...]
+    shape: tuple[int, ...]
     dtype: str
-    role: str
+    role: str  # "input" | "constant" | "output" | "scratch"
 
     @property
     def size(self) -> int:
@@ -62,8 +54,7 @@ def _buffers(graph: Graph) -> list[_Buffer]:
     input_set = set(graph.inputs)
     output_set = set(graph.outputs)
     bufs: list[_Buffer] = []
-    for nid in graph.nodes:
-        node = graph.nodes[nid]
+    for nid, node in graph.nodes.items():
         if nid in input_set:
             role = "input"
         elif isinstance(node.op, ConstantOp):
@@ -72,16 +63,13 @@ def _buffers(graph: Graph) -> list[_Buffer]:
             role = "output"
         else:
             role = "scratch"
-        bufs.append(_Buffer(name=nid, shape=tuple(node.output.shape), dtype="float", role=role))
+        shape = tuple(int(d) for d in node.output.shape)
+        bufs.append(_Buffer(name=nid, shape=shape, dtype="float32", role=role))
     return bufs
 
 
 def _constant_values(graph: Graph) -> dict[str, float]:
-    out: dict[str, float] = {}
-    for nid, node in graph.nodes.items():
-        if isinstance(node.op, ConstantOp) and node.op.value is not None:
-            out[nid] = node.op.value
-    return out
+    return {nid: node.op.value for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and node.op.value is not None}
 
 
 def _launches(graph: Graph) -> list[Node]:
@@ -91,500 +79,204 @@ def _launches(graph: Graph) -> list[Node]:
         if isinstance(node.op, (InputOp, ConstantOp)):
             continue
         if not isinstance(node.op, CudaOp):
-            raise TypeError(
-                f"CudaBackend: node {nid!r} has non-CudaOp {type(node.op).__name__!r}; "
-                "lowering passes must produce Graph[CudaOp] before codegen."
-            )
+            raise TypeError(f"CudaBackend: node {nid!r} has non-CudaOp {type(node.op).__name__!r}; lowering must produce Graph[CudaOp].")
         nodes.append(node)
     return nodes
 
 
-def _buffer_size_map(bufs: list[_Buffer]) -> dict[str, int]:
-    return {b.name: b.size for b in bufs}
-
-
-def graph_name(graph: Graph) -> str:
-    return getattr(graph, "name", None) or "prog"
-
-
-def graph_shape(graph: Graph, name: str) -> tuple:
-    node = graph.nodes.get(name)
-    if node is None:
-        raise KeyError(f"Buffer {name!r} not in graph")
-    return tuple(node.output.shape)
-
-
 # ---------------------------------------------------------------------------
-# Source generation
+# Compiled program: RawKernels + buffer plan + launch list
 # ---------------------------------------------------------------------------
 
 
-def generate_source(
-    graph: Graph,
-    mode: str = "benchmark",
-    num_iters: int = 10,
-    warmup: int = 3,
-    input_data: dict[str, np.ndarray] | None = None,
-    debug: bool = False,
-) -> str:
-    """Generate a complete .cu program from a lowered graph.
+@dataclass
+class _Launch:
+    node_id: str
+    kernel_name: str
+    arg_names: tuple[str, ...]
+    grid: tuple[int, int, int]
+    block: tuple[int, int, int]
+    smem_bytes: int
+    zero_outputs: tuple[str, ...]
 
-    Args:
-        graph: ``Graph[CudaOp + InputOp + ConstantOp]``.
-        mode: "run" (print outputs) or "benchmark" (timed iterations).
-        num_iters: Number of timed iterations (benchmark mode).
-        warmup: Number of warmup iterations.
-        debug: If True, dump every non-input buffer after each kernel launch.
-    """
+
+@dataclass
+class _Compiled:
+    bufs: list[_Buffer]
+    buf_by_name: dict[str, _Buffer]
+    constants: dict[str, float]
+    kernels: dict[str, cp.RawKernel]  # kernel_name → RawKernel
+    launches: list[_Launch]
+
+
+def _compile(graph: Graph) -> _Compiled:
+    import cupy as cp
+
     bufs = _buffers(graph)
-    launches = _launches(graph)
-    constant_values = _constant_values(graph)
+    buf_by_name = {b.name: b for b in bufs}
+    constants = _constant_values(graph)
+    launches_nodes = _launches(graph)
 
-    has_tma = any(getattr(n.op, "tma_descriptors", ()) for n in launches)
-    parts: list[str] = []
-
-    parts.append("#include <cstdio>")
-    parts.append("#include <cstdlib>")
-    parts.append("#include <cmath>")
-    parts.append("#include <cuda_runtime.h>")
-    if has_tma:
-        parts.append("#include <cuda.h>")
-    if mode == "benchmark":
-        parts.append("#include <float.h>")
-    parts.append("")
-
-    seen_kernels: set[str] = set()
-    for node in launches:
+    kernels: dict[str, cp.RawKernel] = {}
+    seen_source: dict[str, str] = {}
+    launches: list[_Launch] = []
+    for node in launches_nodes:
         op: CudaOp = node.op
-        if op.kernel_name not in seen_kernels:
-            parts.append(op.kernel_source)
-            seen_kernels.add(op.kernel_name)
-    parts.append("")
+        kname = op.kernel_name
+        if kname not in kernels:
+            prev_src = seen_source.get(kname)
+            if prev_src is not None and prev_src != op.kernel_source:
+                raise ValueError(f"kernel name {kname!r} used by two distinct sources")
+            seen_source[kname] = op.kernel_source
+            kernels[kname] = cp.RawKernel(op.kernel_source, kname, options=("--use_fast_math",))
+        launches.append(
+            _Launch(
+                node_id=node.id,
+                kernel_name=kname,
+                arg_names=tuple(op.arg_order),
+                grid=op.grid,
+                block=op.block,
+                smem_bytes=op.smem_bytes,
+                zero_outputs=tuple(op.zero_outputs),
+            )
+        )
+    return _Compiled(bufs=bufs, buf_by_name=buf_by_name, constants=constants, kernels=kernels, launches=launches)
 
-    parts.append("int main() {")
 
-    for buf in bufs:
-        parts.append(f"    {buf.dtype}* d_{buf.name};")
-        parts.append(f"    cudaMalloc(&d_{buf.name}, {buf.size} * sizeof({buf.dtype}));")
-    parts.append("")
+# ---------------------------------------------------------------------------
+# Buffer materialization
+# ---------------------------------------------------------------------------
 
-    for buf in bufs:
-        if buf.role in ("input", "constant"):
-            if input_data and buf.name in input_data:
-                parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
-                parts.append(f'      FILE* fp = fopen("{buf.name}.bin", "rb");')
-                parts.append(f"      fread(h, sizeof({buf.dtype}), {buf.size}, fp); fclose(fp);")
-                parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
-                parts.append("      free(h); }")
-            elif buf.role == "constant" and buf.name in constant_values:
-                value = constant_values[buf.name]
-                parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
-                parts.append(f"      for (int i = 0; i < {buf.size}; i++) h[i] = ({buf.dtype}){value!r}f;")
-                parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
-                parts.append("      free(h); }")
-            else:
-                parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
-                parts.append(f"      for (int i = 0; i < {buf.size}; i++) h[i] = 0.01f * ((i * 7 + 13) % 101 - 50);")
-                parts.append(f"      cudaMemcpy(d_{buf.name}, h, {buf.size} * sizeof({buf.dtype}), cudaMemcpyHostToDevice);")
-                parts.append("      free(h); }")
-    parts.append("")
 
-    if has_tma:
-        parts.append(_generate_tma_setup(launches, bufs))
-        parts.append("")
+def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> dict[str, cp.ndarray]:
+    import cupy as cp
 
-    buf_names = {b.name for b in bufs}
-    buf_sizes = _buffer_size_map(bufs)
-
-    if debug:
-        buf_by_name = {b.name: b for b in bufs}
-        parts.append('    printf("DEBUG_START\\n");')
-        for li, node in enumerate(launches):
-            single = _generate_single_launch(node, buf_names, buf_sizes)
-            parts.append(f"    // --- launch {li}: {node.op.kernel_name} ---")
-            parts.append(single)
-            parts.append(f"    cudaError_t _err{li} = cudaDeviceSynchronize();")
-            parts.append(f"    if (_err{li} != cudaSuccess) {{")
-            parts.append(f'        fprintf(stderr, "LAUNCH_FAIL {li} {node.op.kernel_name}: %s\\n", cudaGetErrorString(_err{li}));')
-            parts.append("        return 1;")
-            parts.append("    }")
-            out_name = _launch_output_name(node, buf_names)
-            if out_name is not None and out_name in buf_by_name:
-                buf = buf_by_name[out_name]
-                parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
-                parts.append(f"      cudaMemcpy(h, d_{buf.name}, {buf.size} * sizeof({buf.dtype}), cudaMemcpyDeviceToHost);")
-                parts.append(f'      FILE* fp = fopen("launch_{li:03d}.bin", "wb");')
-                parts.append(f"      fwrite(h, sizeof({buf.dtype}), {buf.size}, fp); fclose(fp);")
-                parts.append(f'      printf("DBUF {li} {buf.name} {buf.size}\\n");')
-                parts.append("      free(h); }")
-        parts.append('    printf("DEBUG_END\\n");')
-        parts.append("")
-    else:
-        if mode == "benchmark":
-            parts.append(f"    for (int _w = 0; _w < {warmup}; _w++) {{")
-            parts.append(_generate_launches(launches, buf_names, buf_sizes))
-            parts.append("    }")
-            parts.append("    cudaDeviceSynchronize();")
-            parts.append("")
-
-            n_launches = len(launches)
-            parts.append(f"    const int NL = {n_launches};")
-            parts.append("    cudaEvent_t _ks[NL], _ke[NL];")
-            parts.append("    for (int i = 0; i < NL; i++) { cudaEventCreate(&_ks[i]); cudaEventCreate(&_ke[i]); }")
-            parts.append("    float _kacc[NL] = {0};")
-            parts.append("    cudaEvent_t _start, _stop;")
-            parts.append("    cudaEventCreate(&_start);")
-            parts.append("    cudaEventCreate(&_stop);")
-            parts.append("")
-            parts.append("    cudaEventRecord(_start);")
-            parts.append(f"    for (int _iter = 0; _iter < {num_iters}; _iter++) {{")
-            parts.append(_generate_timed_launches(launches, buf_names, buf_sizes))
-            parts.append("        cudaEventSynchronize(_ke[NL - 1]);")
-            parts.append("        for (int i = 0; i < NL; i++) {")
-            parts.append("            float _ms; cudaEventElapsedTime(&_ms, _ks[i], _ke[i]); _kacc[i] += _ms;")
-            parts.append("        }")
-            parts.append("    }")
-            parts.append("    cudaEventRecord(_stop);")
-            parts.append("    cudaEventSynchronize(_stop);")
-            parts.append("")
-            parts.append("    float _total_ms;")
-            parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
-            parts.append(f'    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms / {num_iters});')
-            parts.append(f'    printf("PROGRAM_LAUNCHES={n_launches}\\n");')
-            for li, node in enumerate(launches):
-                parts.append(f'    printf("KERNEL_TIME_MS {li} {node.op.kernel_name} %.6f\\n", _kacc[{li}] / {num_iters});')
-            parts.append("")
-            parts.append("    for (int i = 0; i < NL; i++) { cudaEventDestroy(_ks[i]); cudaEventDestroy(_ke[i]); }")
-            parts.append("    cudaEventDestroy(_start);")
-            parts.append("    cudaEventDestroy(_stop);")
+    input_data = input_data or {}
+    arrays: dict[str, cp.ndarray] = {}
+    for buf in compiled.bufs:
+        shape = buf.shape or (1,)
+        src = input_data.get(buf.name)
+        if src is not None:
+            arr = cp.asarray(np.ascontiguousarray(src, dtype=np.float32).reshape(shape))
+        elif buf.role == "constant" and buf.name in compiled.constants:
+            arr = cp.full(shape, float(compiled.constants[buf.name]), dtype=cp.float32)
+        elif buf.role == "input":
+            # Pseudo-random fill for un-supplied inputs (matches old generated program).
+            idx = np.arange(buf.size, dtype=np.float32)
+            vals = 0.01 * ((idx * 7 + 13) % 101 - 50)
+            arr = cp.asarray(vals.reshape(shape))
         else:
-            launch_code = _generate_launches(launches, buf_names, buf_sizes)
-            parts.append("    cudaEvent_t _start, _stop;")
-            parts.append("    cudaEventCreate(&_start);")
-            parts.append("    cudaEventCreate(&_stop);")
-            parts.append("")
-            parts.append("    cudaEventRecord(_start);")
-            parts.append(launch_code)
-            parts.append("    cudaEventRecord(_stop);")
-            parts.append("    cudaEventSynchronize(_stop);")
-            parts.append("")
-            parts.append("    float _total_ms;")
-            parts.append("    cudaEventElapsedTime(&_total_ms, _start, _stop);")
-            parts.append('    printf("PROGRAM_TIME_MS=%.4f\\n", _total_ms);')
-            parts.append("")
-            parts.append("    cudaEventDestroy(_start);")
-            parts.append("    cudaEventDestroy(_stop);")
-        parts.append("")
+            arr = cp.zeros(shape, dtype=cp.float32)
+        arrays[buf.name] = arr
+    return arrays
 
-    for buf in bufs:
-        if buf.role == "output":
-            parts.append(f"    {{ {buf.dtype}* h = ({buf.dtype}*)malloc({buf.size} * sizeof({buf.dtype}));")
-            parts.append(f"      cudaMemcpy(h, d_{buf.name}, {buf.size} * sizeof({buf.dtype}), cudaMemcpyDeviceToHost);")
-            parts.append(f'      for (int i = 0; i < {buf.size}; i++) printf("OUT {buf.name} %.6f\\n", h[i]);')
-            parts.append("      free(h); }")
-    parts.append("")
 
-    for buf in bufs:
-        parts.append(f"    cudaFree(d_{buf.name});")
-    parts.append("    return 0;")
-    parts.append("}")
-
-    return "\n".join(parts)
+def _launch(launch: _Launch, compiled: _Compiled, arrays: dict[str, cp.ndarray]) -> None:
+    for zname in launch.zero_outputs:
+        arrays[zname].fill(0)
+    kernel = compiled.kernels[launch.kernel_name]
+    args = tuple(arrays[name] for name in launch.arg_names)
+    kernel(launch.grid, launch.block, args, shared_mem=launch.smem_bytes)
 
 
 # ---------------------------------------------------------------------------
-# Launch emission
+# Public API
 # ---------------------------------------------------------------------------
-
-
-def _tma_var(kernel_name: str, desc: TmaDescriptorSpec) -> str:
-    return f"{kernel_name}_{desc.param_name}_desc"
-
-
-def _generate_tma_setup(launches: list[Node], bufs: list[_Buffer]) -> str:
-    lines: list[str] = []
-    buf_names = {b.name for b in bufs}
-    for node in launches:
-        op: CudaOp = node.op
-        tma_descs = getattr(op, "tma_descriptors", ())
-        for desc in tma_descs:
-            var = _tma_var(op.kernel_name, desc)
-            buf = _format_arg(desc.buffer, buf_names)
-            d0, d1 = desc.dims
-            s0 = desc.strides[0]
-            t0, t1 = desc.tile
-
-            lines.append(f"    CUtensorMap {var};")
-            lines.append("    {")
-            lines.append(f"        uint64_t d[2]={{(uint64_t)({d0}),(uint64_t)({d1})}};")
-            lines.append(f"        uint64_t s[1]={{(uint64_t)(({s0})*sizeof(float))}};")
-            lines.append(f"        uint32_t b[2]={{{t0},{t1}}};")
-            lines.append("        uint32_t e[2]={1,1};")
-            lines.append(f"        cuTensorMapEncodeTiled(&{var},CU_TENSOR_MAP_DATA_TYPE_FLOAT32,2,")
-            lines.append(f"            {buf},d,s,b,e,")
-            lines.append("            CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_NONE,")
-            lines.append("            CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);")
-            lines.append("    }")
-
-        if tma_descs and op.smem_bytes > 0:
-            lines.append(f"    cudaFuncSetAttribute({op.kernel_name},cudaFuncAttributeMaxDynamicSharedMemorySize,{op.smem_bytes});")
-
-    return "\n".join(lines)
-
-
-def _generate_launches(launches: list[Node], buf_names: set[str], buf_sizes: dict[str, int]) -> str:
-    lines: list[str] = []
-    for node in launches:
-        op: CudaOp = node.op
-        for buf_name in op.zero_outputs:
-            size = buf_sizes.get(buf_name, 0)
-            lines.append(f"        cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
-
-        tma_descs = getattr(op, "tma_descriptors", ())
-        tma_args = [_tma_var(op.kernel_name, d) for d in tma_descs]
-        regular_args = [_format_arg(a, buf_names) for a in op.arg_order]
-        args_str = ", ".join(tma_args + regular_args)
-
-        gx, gy, gz = op.grid
-        bx, by, bz = op.block
-        if gz == 1 and bz == 1:
-            grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
-            block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
-        else:
-            grid_str = f"dim3({gx}, {gy}, {gz})"
-            block_str = f"dim3({bx}, {by}, {bz})"
-        smem = f", {op.smem_bytes}" if op.smem_bytes > 0 else ""
-        lines.append(f"        {op.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
-    return "\n".join(lines)
-
-
-def _generate_timed_launches(launches: list[Node], buf_names: set[str], buf_sizes: dict[str, int]) -> str:
-    lines: list[str] = []
-    for li, node in enumerate(launches):
-        op: CudaOp = node.op
-        for buf_name in op.zero_outputs:
-            size = buf_sizes.get(buf_name, 0)
-            lines.append(f"        cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
-
-        tma_descs = getattr(op, "tma_descriptors", ())
-        tma_args = [_tma_var(op.kernel_name, d) for d in tma_descs]
-        regular_args = [_format_arg(a, buf_names) for a in op.arg_order]
-        args_str = ", ".join(tma_args + regular_args)
-
-        gx, gy, gz = op.grid
-        bx, by, bz = op.block
-        if gz == 1 and bz == 1:
-            grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
-            block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
-        else:
-            grid_str = f"dim3({gx}, {gy}, {gz})"
-            block_str = f"dim3({bx}, {by}, {bz})"
-        smem = f", {op.smem_bytes}" if op.smem_bytes > 0 else ""
-        lines.append(f"        cudaEventRecord(_ks[{li}]);")
-        lines.append(f"        {op.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
-        lines.append(f"        cudaEventRecord(_ke[{li}]);")
-    return "\n".join(lines)
-
-
-def _generate_single_launch(node: Node, buf_names: set[str], buf_sizes: dict[str, int]) -> str:
-    op: CudaOp = node.op
-    lines: list[str] = []
-    for buf_name in op.zero_outputs:
-        size = buf_sizes.get(buf_name, 0)
-        lines.append(f"    cudaMemset(d_{buf_name}, 0, {size} * sizeof(float));")
-
-    tma_descs = getattr(op, "tma_descriptors", ())
-    tma_args = [_tma_var(op.kernel_name, d) for d in tma_descs]
-    regular_args = [_format_arg(a, buf_names) for a in op.arg_order]
-    args_str = ", ".join(tma_args + regular_args)
-
-    gx, gy, gz = op.grid
-    bx, by, bz = op.block
-    if gz == 1 and bz == 1:
-        grid_str = f"dim3({gx}, {gy})" if gy > 1 else str(gx)
-        block_str = f"dim3({bx}, {by})" if by > 1 else str(bx)
-    else:
-        grid_str = f"dim3({gx}, {gy}, {gz})"
-        block_str = f"dim3({bx}, {by}, {bz})"
-    smem = f", {op.smem_bytes}" if op.smem_bytes > 0 else ""
-    lines.append(f"    {op.kernel_name}<<<{grid_str}, {block_str}{smem}>>>({args_str});")
-    return "\n".join(lines)
-
-
-def _launch_output_name(node: Node, buf_names: set[str]) -> str | None:
-    for arg in reversed(node.op.arg_order):
-        if arg in buf_names:
-            return arg
-    return None
-
-
-def _format_arg(arg: str, buf_names: set[str]) -> str:
-    if arg in buf_names:
-        return f"d_{arg}"
-    return arg
-
-
-# ---------------------------------------------------------------------------
-# Compilation and execution
-# ---------------------------------------------------------------------------
-
-_CACHE_DIR = Path.home() / ".cache" / "deplodock" / "kernels"
-
-
-def compile_program(source: str, arch: str | None = None) -> Path:
-    content_hash = hashlib.sha256(source.encode()).hexdigest()[:12]
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    binary = _CACHE_DIR / f"prog_{content_hash}"
-
-    if binary.exists():
-        return binary
-
-    cu_path = _CACHE_DIR / f"prog_{content_hash}.cu"
-    cu_path.write_text(source)
-
-    if arch is None:
-        arch = _detect_arch()
-
-    cmd = ["nvcc", "-O2", "--use_fast_math", f"-arch={arch}", str(cu_path), "-o", str(binary)]
-    if "CUtensorMap" in source:
-        cmd.append("-lcuda")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"nvcc compilation failed:\n{result.stderr}")
-
-    return binary
 
 
 def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> ProgramResult:
-    source = generate_source(graph, mode="run", input_data=input_data)
-    binary = compile_program(source)
+    """Run the lowered graph once, return output ndarrays + total time."""
+    import cupy as cp
 
-    with tempfile.TemporaryDirectory(prefix="deplodock_run_") as rundir:
-        if input_data:
-            for buf_name, vals in input_data.items():
-                data_path = Path(rundir) / f"{buf_name}.bin"
-                data_path.write_bytes(np.ascontiguousarray(vals, dtype=np.float32).tobytes())
+    compiled = _compile(graph)
+    arrays = _allocate(compiled, input_data)
 
-        result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120, cwd=rundir)
-        if result.returncode != 0:
-            raise RuntimeError(f"Program execution failed:\n{result.stderr}")
+    start = cp.cuda.Event()
+    stop = cp.cuda.Event()
+    start.record()
+    for launch in compiled.launches:
+        _launch(launch, compiled, arrays)
+    stop.record()
+    stop.synchronize()
+    time_ms = cp.cuda.get_elapsed_time(start, stop)
 
-        return _parse_run_output(result.stdout)
+    outputs: dict[str, np.ndarray] = {}
+    for buf in compiled.bufs:
+        if buf.role == "output":
+            outputs[buf.name] = arrays[buf.name].get().astype(np.float32, copy=False)
+    return ProgramResult(outputs=outputs, time_ms=time_ms)
 
 
 @dataclass
 class DebugResult:
-    outputs: dict[str, list[float]]
+    outputs: dict[str, np.ndarray]
     per_launch: dict[int, dict[str, np.ndarray]] = field(default_factory=dict)
 
 
 def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> DebugResult:
-    source = generate_source(graph, mode="run", input_data=input_data, debug=True)
-    binary = compile_program(source)
+    """Run the graph once, snapshotting every non-input buffer after each launch."""
+    compiled = _compile(graph)
+    arrays = _allocate(compiled, input_data)
 
-    with tempfile.TemporaryDirectory(prefix="deplodock_dbg_") as rundir:
-        rundir_path = Path(rundir)
-        if input_data:
-            for buf_name, vals in input_data.items():
-                data_path = rundir_path / f"{buf_name}.bin"
-                data_path.write_bytes(np.ascontiguousarray(vals, dtype=np.float32).tobytes())
-
-        result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=300, cwd=rundir)
-        if result.returncode != 0:
-            raise RuntimeError(f"Debug program execution failed:\n{result.stderr}\nstdout:\n{result.stdout}")
-
-        return _parse_debug_output(result.stdout, graph, rundir_path)
-
-
-def benchmark_program(graph: Graph, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
-    source = generate_source(graph, mode="benchmark", num_iters=num_iters, warmup=warmup)
-    binary = compile_program(source)
-
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        raise RuntimeError(f"Program execution failed:\n{result.stderr}")
-
-    return _parse_benchmark_output(result.stdout)
-
-
-# ---------------------------------------------------------------------------
-# Output parsing
-# ---------------------------------------------------------------------------
-
-
-def _parse_run_output(stdout: str) -> ProgramResult:
-    outputs: dict[str, list[float]] = {}
-    time_ms = None
-
-    for line in stdout.strip().split("\n"):
-        if line.startswith("OUT "):
-            parts = line.split()
-            buf_name = parts[1]
-            value = float(parts[2])
-            outputs.setdefault(buf_name, []).append(value)
-        elif line.startswith("PROGRAM_TIME_MS="):
-            time_ms = float(line.split("=")[1])
-
-    return ProgramResult(outputs=outputs, time_ms=time_ms)
-
-
-def _parse_benchmark_output(stdout: str) -> BenchmarkResult:
-    time_ms = 0.0
-    num_launches = 0
-    per_launch: list[LaunchTime] = []
-
-    for line in stdout.strip().split("\n"):
-        if line.startswith("PROGRAM_TIME_MS="):
-            time_ms = float(line.split("=")[1])
-        elif line.startswith("PROGRAM_LAUNCHES="):
-            num_launches = int(line.split("=")[1])
-        elif line.startswith("KERNEL_TIME_MS "):
-            parts = line.split()
-            per_launch.append(LaunchTime(idx=int(parts[1]), kernel_name=parts[2], time_ms=float(parts[3])))
-
-    per_launch.sort(key=lambda lt: lt.idx)
-    return BenchmarkResult(
-        time_ms=time_ms,
-        num_launches=num_launches,
-        per_launch=per_launch if per_launch else None,
-    )
-
-
-def _parse_debug_output(stdout: str, graph: Graph, workdir: Path) -> DebugResult:
-    outputs: dict[str, list[float]] = {}
-    buf_shapes = {nid: tuple(node.output.shape) for nid, node in graph.nodes.items()}
+    input_names = {b.name for b in compiled.bufs if b.role == "input"}
     per_launch_np: dict[int, dict[str, np.ndarray]] = {}
 
-    for line in stdout.strip().split("\n"):
-        if line.startswith("DBUF "):
-            parts = line.split()
-            launch_idx = int(parts[1])
-            buf_name = parts[2]
-            numel = int(parts[3])
-            bin_path = workdir / f"launch_{launch_idx:03d}.bin"
-            if not bin_path.exists():
+    for li, launch in enumerate(compiled.launches):
+        _launch(launch, compiled, arrays)
+        snap: dict[str, np.ndarray] = {}
+        for name, arr in arrays.items():
+            if name in input_names:
                 continue
-            raw = np.fromfile(bin_path, dtype=np.float32, count=numel)
-            shape = buf_shapes.get(buf_name, (numel,))
-            per_launch_np.setdefault(launch_idx, {})[buf_name] = raw.reshape(shape)
-        elif line.startswith("OUT "):
-            parts = line.split()
-            outputs.setdefault(parts[1], []).append(float(parts[2]))
+            snap[name] = arr.get().astype(np.float32, copy=False)
+        per_launch_np[li] = snap
 
+    outputs: dict[str, np.ndarray] = {}
+    for buf in compiled.bufs:
+        if buf.role == "output":
+            outputs[buf.name] = arrays[buf.name].get().astype(np.float32, copy=False)
     return DebugResult(outputs=outputs, per_launch=per_launch_np)
 
 
-def _detect_arch() -> str:
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            cap = result.stdout.strip().split("\n")[0].strip()
-            return f"sm_{cap.replace('.', '')}"
-    except (FileNotFoundError, subprocess.SubprocessError):
-        pass
-    return "sm_89"
+def benchmark_program(
+    graph: Graph,
+    input_data: dict[str, np.ndarray] | None = None,
+    warmup: int = 5,
+    num_iters: int = 20,
+) -> BenchmarkResult:
+    """Time the graph's launches with per-kernel CUDA events."""
+    import cupy as cp
+
+    compiled = _compile(graph)
+    arrays = _allocate(compiled, input_data)
+
+    for _ in range(warmup):
+        for launch in compiled.launches:
+            _launch(launch, compiled, arrays)
+    cp.cuda.runtime.deviceSynchronize()
+
+    n = len(compiled.launches)
+    starts = [cp.cuda.Event() for _ in range(n)]
+    stops = [cp.cuda.Event() for _ in range(n)]
+    acc = [0.0] * n
+
+    prog_start = cp.cuda.Event()
+    prog_stop = cp.cuda.Event()
+    prog_start.record()
+    for _ in range(num_iters):
+        for i, launch in enumerate(compiled.launches):
+            starts[i].record()
+            _launch(launch, compiled, arrays)
+            stops[i].record()
+        stops[n - 1].synchronize()
+        for i in range(n):
+            acc[i] += cp.cuda.get_elapsed_time(starts[i], stops[i])
+    prog_stop.record()
+    prog_stop.synchronize()
+    total_ms = cp.cuda.get_elapsed_time(prog_start, prog_stop)
+
+    per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=acc[i] / num_iters) for i in range(n)]
+    return BenchmarkResult(
+        time_ms=total_ms / num_iters,
+        num_launches=n,
+        per_launch=per_launch if per_launch else None,
+    )

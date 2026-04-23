@@ -10,7 +10,6 @@ launch per node, and wires buffer pointers by node id.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from deplodock.compiler.ir.base import Op
 
@@ -26,5 +25,4 @@ class CudaOp(Op):
     block: tuple[int, int, int] = (1, 1, 1)
     smem_bytes: int = 0
     zero_outputs: tuple[str, ...] = ()
-    tma_descriptors: tuple[Any, ...] = ()
     comment: str = ""

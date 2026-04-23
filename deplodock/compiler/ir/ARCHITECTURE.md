@@ -42,7 +42,7 @@ PyTorch module
    ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ LAYER 3a · Kernel-level — Graph populated with KernelOp (kernel.py)                                                  │
-│   Each node carries one GpuKernel (kernel/ir.py) + grid/block/smem/zero_outputs/tma_descriptors.                     │
+│   Each node carries one GpuKernel (kernel/ir.py) + grid/block/smem/zero_outputs.                                    │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
    │  passes/lowering/cuda — renders each KernelOp's GpuKernel to a C source string wrapped in CudaOp.
    ▼
