@@ -153,7 +153,7 @@ def dump_dir(request):
     safe_name = request.node.name.replace("[", "_").replace("]", "_").replace("/", "_")
     dump_path = Path(PROJECT_ROOT) / "_test_data" / safe_name
 
-    from deplodock.compiler.dump import CompilerDump
+    from deplodock.compiler.pipeline.dump import CompilerDump
 
     return CompilerDump(dir=dump_path)
 

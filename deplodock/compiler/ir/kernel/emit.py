@@ -13,7 +13,6 @@ import math
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var, substitute
-from deplodock.compiler.ir.graph import Graph, Node
 from deplodock.compiler.ir.kernel.ir import (
     ArrayAccess,
     AugAssign,
@@ -32,6 +31,7 @@ from deplodock.compiler.ir.loop import ACCUM_IDENTITY, Accum, Axis, Load, LoopOp
 from deplodock.compiler.ir.loop import Assign as IrAssignStmt
 from deplodock.compiler.ir.loop import Loop as IrLoop
 from deplodock.compiler.ir.loop import Write as IrWrite
+from deplodock.compiler.pipeline.graph import Graph, Node
 
 _BLOCK = 256
 

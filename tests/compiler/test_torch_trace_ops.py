@@ -67,7 +67,7 @@ def test_op_name_non_aten():
 def test_resolve_inputs_scalars_become_constants():
     """Scalar args (int, float) are promoted to ConstantOp nodes."""
     from deplodock.compiler.ir.base import ConstantOp, InputOp
-    from deplodock.compiler.ir.graph import Graph, Tensor
+    from deplodock.compiler.pipeline.graph import Graph, Tensor
     from deplodock.compiler.trace.torch import _resolve_inputs
 
     g = Graph()

@@ -21,11 +21,11 @@ from deplodock.compiler.ir.frontend.ir import (
     TransposeOp,
     UnsqueezeOp,
 )
-from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.rewriter import run_rule
+from deplodock.compiler.pipeline.graph import Graph, Tensor
+from deplodock.compiler.pipeline.rewriter import run_rule
 
-RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes" / "decomposition"
+RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "decomposition"
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()
@@ -203,10 +203,10 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     """
     import torch
 
-    from deplodock.compiler.rewriter import run_pass
+    from deplodock.compiler.pipeline.rewriter import run_pass
     from deplodock.compiler.trace.torch import trace_module
 
-    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes"
+    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
     graph = trace_module(torch.nn.RMSNorm(64), (torch.randn(1, 8, 64),))
     decomposed = run_pass(graph, rules_dir / "decomposition")
     decomposed = run_pass(decomposed, rules_dir / "optimization")
@@ -264,10 +264,10 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     """End-to-end: torch.nn.Softmax → trace → decomposition yields primitives only."""
     import torch
 
-    from deplodock.compiler.rewriter import run_pass
+    from deplodock.compiler.pipeline.rewriter import run_pass
     from deplodock.compiler.trace.torch import trace_module
 
-    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes"
+    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
     graph = trace_module(torch.nn.Softmax(dim=-1), (torch.randn(1, 4, 8),))
     decomposed = run_pass(graph, rules_dir / "decomposition")
     decomposed = run_pass(decomposed, rules_dir / "optimization")

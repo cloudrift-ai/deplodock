@@ -7,7 +7,7 @@
 │  LAYER 1 · Frontend (backend-agnostic)                                                                               │
 │                                                                                                                      │
 │  trace/torch.py ─→ Graph populated with frontend ops                                                                 │
-│      ir/graph.py:    Tensor, Node[T_Op], Graph, Hints                                                                │
+│      pipeline/graph.py:    Tensor, Node[T_Op], Graph, Hints                                                                │
 │      ir/base.py:     Op, InputOp, ConstantOp                                                                         │
 │      ir/frontend/ir.py: Torch-captured ops (LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,               │
 │                      ReshapeOp, SliceOp, CatOp)                                                                      │
@@ -268,6 +268,6 @@ so fusion rules can be validated numerically on CPU without CUDA.
 - `tests/compiler/test_pipeline.py` — end-to-end on small synthetic graphs.
 - `tests/compiler/test_torch_trace*.py`, `test_real_trace.py`, `test_hints.py` — tracer / hint coverage.
 - `tests/compiler/test_torch_ops.py` — Op.forward() + numpy backend: per-op tests + torch cross-checks.
-- `tests/compiler/passes/` — all rewrite passes (decomposition, optimization, fusion, lowering).
+- `tests/compiler/pipeline/passes/` — all rewrite passes (decomposition, optimization, fusion, lowering).
 
 Full-model E2E (TinyLlama layer) comes back in a follow-up commit once decomposition of higher-level ops is ported into the new lowering.

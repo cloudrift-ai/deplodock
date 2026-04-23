@@ -51,8 +51,8 @@ def _handle_run_ir(args):
     import json
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.dump import CompilerDump
-    from deplodock.compiler.ir.graph import Graph
+    from deplodock.compiler.pipeline.dump import CompilerDump
+    from deplodock.compiler.pipeline.graph import Graph
 
     dump = CompilerDump.resolve(args.dump_dir)
 
@@ -102,7 +102,7 @@ def _handle_run_model(args):
         sys.exit(1)
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.dump import CompilerDump
+    from deplodock.compiler.pipeline.dump import CompilerDump
     from deplodock.compiler.trace.huggingface import build_full_model_wrapper, collect_const_feed
     from deplodock.compiler.trace.torch import trace_module_with_constants
 

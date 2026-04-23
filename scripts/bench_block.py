@@ -111,7 +111,7 @@ def main():
 
     # --- Deplodock CUDA pipeline ---
     if "deplodock" in backends:
-        from deplodock.compiler.dump import CompilerDump
+        from deplodock.compiler.pipeline.dump import CompilerDump
 
         dump = CompilerDump.resolve(args.dump_dir)
         us = _bench_deplodock(block, x, rotary_emb, pos_emb, dump=dump, debug=args.debug)

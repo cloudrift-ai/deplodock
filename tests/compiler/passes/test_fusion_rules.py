@@ -15,12 +15,12 @@ import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.graph import Graph, Tensor
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.rewriter import run_pass
+from deplodock.compiler.pipeline.graph import Graph, Tensor
+from deplodock.compiler.pipeline.rewriter import run_pass
 
-RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes" / "fusion"
+RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "fusion"
 
 rng = np.random.default_rng(0)
 _backend = NumpyBackend()

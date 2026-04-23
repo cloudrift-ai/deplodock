@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.graph import Graph
+    from deplodock.compiler.pipeline.graph import Graph
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +70,8 @@ def handle_compile(args):
         _handle_compile_inspect(args)
         return
 
-    from deplodock.compiler.dump import CompilerDump
     from deplodock.compiler.pipeline import run_pipeline
+    from deplodock.compiler.pipeline.dump import CompilerDump
 
     dump = CompilerDump.resolve(args.dump_dir)
 
@@ -94,8 +94,8 @@ def handle_compile(args):
 def _handle_compile_inspect(args):
     """Run the pipeline to produce --ir STAGE artifact, then print it."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.dump import CompilerDump
     from deplodock.compiler.pipeline import run_pipeline
+    from deplodock.compiler.pipeline.dump import CompilerDump
 
     graph, _ = _load_or_trace(args)
     stage = args.ir
@@ -150,7 +150,7 @@ def _load_or_trace(args) -> tuple[Graph, str]:
 
 
 def _load_graph(path: Path) -> Graph:
-    from deplodock.compiler.ir.graph import Graph
+    from deplodock.compiler.pipeline.graph import Graph
 
     with open(path) as f:
         data = json.load(f)
