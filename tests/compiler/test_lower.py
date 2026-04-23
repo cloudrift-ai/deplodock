@@ -14,11 +14,11 @@ preserves semantics without needing a GPU.
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import run_pipeline
-from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 _backend = NumpyBackend()
 rng = np.random.default_rng(0)

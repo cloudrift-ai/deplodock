@@ -8,11 +8,11 @@ source itself.
 
 from __future__ import annotations
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
 from deplodock.compiler.pipeline.dump import _graph_to_dot
-from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 
 def _small_graph() -> Graph:

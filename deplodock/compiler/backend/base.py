@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import numpy as np
 
-    from deplodock.compiler.pipeline.graph import Graph
+    from deplodock.compiler.graph import Graph
 
 
 @dataclass

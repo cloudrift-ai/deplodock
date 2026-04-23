@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult, RunResult
-    from deplodock.compiler.pipeline.graph import Graph
+    from deplodock.compiler.graph import Graph
     from deplodock.compiler.plan import ExecutionPlan
 
 logger = logging.getLogger(__name__)

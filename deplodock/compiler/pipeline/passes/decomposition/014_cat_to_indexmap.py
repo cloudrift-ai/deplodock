@@ -8,12 +8,12 @@ After decomposition: IndexMapOp.inputs = [tensor_a, tensor_b]; the dim is baked
 into the source selects and the second source's coord_map offset.
 """
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import CatOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", CatOp)]
 

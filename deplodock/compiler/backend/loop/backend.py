@@ -21,7 +21,7 @@ from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import run_pipeline
 
 if TYPE_CHECKING:
-    from deplodock.compiler.pipeline.graph import Graph
+    from deplodock.compiler.graph import Graph
 
 
 _PASSES = ["decomposition", "optimization", "fusion"]

@@ -4,12 +4,12 @@ Same unsqueeze strategy as matmul decomposition: inputs become
 broadcast-compatible via IndexMapOp before the mul.
 """
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.ir.frontend.ir import LinearOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to, squeeze_axis
 
 PATTERN = [Pattern("root", LinearOp)]
 

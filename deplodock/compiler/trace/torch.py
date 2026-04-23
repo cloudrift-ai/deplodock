@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import (
@@ -26,7 +27,6 @@ from deplodock.compiler.ir.frontend.ir import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 if TYPE_CHECKING:
     import torch
@@ -251,7 +251,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         "pow": "pow",
     }
     if op_name in _EW_MAP:
-        from deplodock.compiler.ir.broadcast import broadcast_to
+        from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
 
         bc_ids = [broadcast_to(g, inp, shape) for inp in input_ids[:2]]
         nid = g.add_node(
@@ -447,7 +447,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
     # --- Fallback ---
     logger.debug("Fallback elementwise for %s (%s)", op_name, fx_node.target)
     if input_ids:
-        from deplodock.compiler.ir.broadcast import broadcast_to
+        from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
 
         # Fused-op fallbacks (rms_norm, softmax, …) intentionally keep their
         # smaller inputs unbroadcast — their decomposition rule owns the

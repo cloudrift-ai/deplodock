@@ -51,8 +51,8 @@ def _handle_run_ir(args):
     import json
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.graph import Graph
     from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.pipeline.graph import Graph
 
     dump = CompilerDump.resolve(args.dump_dir)
 

@@ -7,12 +7,12 @@ delinearizes into the input coordinate space using input strides.
 
 from __future__ import annotations
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import ReshapeOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", ReshapeOp)]
 

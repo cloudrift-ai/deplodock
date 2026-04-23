@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Ternary, Var, substitute
 from deplodock.compiler.ir.kernel.ir import (
     ArrayAccess,
@@ -31,7 +32,6 @@ from deplodock.compiler.ir.loop import ACCUM_IDENTITY, Accum, Axis, Load, LoopOp
 from deplodock.compiler.ir.loop import Assign as IrAssignStmt
 from deplodock.compiler.ir.loop import Loop as IrLoop
 from deplodock.compiler.ir.loop import Write as IrWrite
-from deplodock.compiler.pipeline.graph import Graph, Node
 
 _BLOCK = 256
 
@@ -69,7 +69,7 @@ def launch_config(node: Node) -> tuple[tuple[int, int, int], tuple[int, int, int
 
 
 def emit_kernel_source(gpu_kernel: GpuKernel) -> str:
-    from deplodock.compiler.ir.cuda.emit import emit_kernel as _emit
+    from deplodock.compiler.pipeline.passes.lowering.cuda._emit import emit_kernel as _emit
 
     return _emit(gpu_kernel)
 

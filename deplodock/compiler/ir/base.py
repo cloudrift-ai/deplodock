@@ -63,7 +63,7 @@ def _keepdim_axis(shape: tuple, axis: int | str) -> tuple:
     This is the reduction's output shape: the reduced dim collapses to 1,
     preserving rank. Rank-preservation is a Tensor IR invariant — it lets
     elementwise ops consume reduction outputs without any implicit reshape
-    (see ``ir/broadcast.py``'s ``broadcast_to`` for the explicit
+    (see ``pipeline/passes/decomposition/_broadcast.py``'s ``broadcast_to`` for the explicit
     broadcast wrapper that expands (…, 1, …) back up).
     """
     if not isinstance(axis, int):

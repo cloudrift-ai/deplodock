@@ -5,12 +5,12 @@
 The resulting MeanOp is further lowered to sum + div by 007_decompose_mean.
 """
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.frontend.ir import MeanOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
 
 _DEFAULT_EPS = 1e-6
 

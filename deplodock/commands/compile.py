@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.pipeline.graph import Graph
+    from deplodock.compiler.graph import Graph
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +150,7 @@ def _load_or_trace(args) -> tuple[Graph, str]:
 
 
 def _load_graph(path: Path) -> Graph:
-    from deplodock.compiler.pipeline.graph import Graph
+    from deplodock.compiler.graph import Graph
 
     with open(path) as f:
         data = json.load(f)

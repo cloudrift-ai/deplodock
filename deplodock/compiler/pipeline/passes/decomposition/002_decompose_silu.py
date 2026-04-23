@@ -1,10 +1,10 @@
 """Decompose silu(x) into x * recip(1 + exp(-x)) to enable SiLU+Mul fusion."""
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "silu"})]
 

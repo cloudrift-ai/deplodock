@@ -7,7 +7,7 @@
 │  LAYER 1 · Frontend (backend-agnostic)                                                                               │
 │                                                                                                                      │
 │  trace/torch.py ─→ Graph populated with frontend ops                                                                 │
-│      pipeline/graph.py:    Tensor, Node[T_Op], Graph, Hints                                                                │
+│      graph.py:    Tensor, Node[T_Op], Graph, Hints                                                                │
 │      ir/base.py:     Op, InputOp, ConstantOp                                                                         │
 │      ir/frontend/ir.py: Torch-captured ops (LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,               │
 │                      ReshapeOp, SliceOp, CatOp)                                                                      │
@@ -137,7 +137,7 @@ needed by calling ``infer_output_shape`` on the op instance.
 
 | Op type                                               | Rule                                                                                                                                                                         |
 |-------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| ``ElementwiseOp``                                     | All inputs must already share the output shape — callers wrap mismatched inputs via ``ir/broadcast.broadcast_to`` to insert an explicit IndexMapOp.                          |
+| ``ElementwiseOp``                                     | All inputs must already share the output shape — callers wrap mismatched inputs via ``pipeline/passes/decomposition/_broadcast.broadcast_to`` to insert an explicit IndexMapOp.                          |
 | ``ReduceOp``                                          | Drop the ``axis`` dim from the input shape.                                                                                                                                  |
 | ``IndexMapOp``                                        | Returns ``self.out_shape`` — the output shape is part of the op definition because it cannot be derived from the coord_map + input shape (e.g., reshape ``(12,) → (3, 4)``). |
 | ``TransposeOp``                                       | Permute the input shape by ``self.axes``.                                                                                                                                    |

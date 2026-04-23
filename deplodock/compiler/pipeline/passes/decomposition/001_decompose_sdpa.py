@@ -7,13 +7,13 @@ via integer-divide indexing: ``K[b, q_head // group_size, s, d]``.
 
 import math
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to, squeeze_axis
 
 PATTERN = [Pattern("root", SdpaOp)]
 

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
@@ -23,7 +24,6 @@ from deplodock.compiler.ir.frontend.ir import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
 
 rng = np.random.default_rng(42)
 

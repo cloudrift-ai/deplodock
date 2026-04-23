@@ -16,8 +16,8 @@ from deplodock.compiler.backend.cuda.program import benchmark_program, run_progr
 from deplodock.compiler.pipeline import run_pipeline
 
 if TYPE_CHECKING:
+    from deplodock.compiler.graph import Graph
     from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.pipeline.graph import Graph
 
 
 _PASSES = ["decomposition", "optimization", "fusion", "lowering/kernel", "lowering/cuda"]

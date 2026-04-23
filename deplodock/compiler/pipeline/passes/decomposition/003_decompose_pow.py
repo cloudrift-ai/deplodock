@@ -1,9 +1,9 @@
 """Decompose pow(x, 2) into mul(x, x) to enable RMSNorm fusion."""
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "pow"})]
 

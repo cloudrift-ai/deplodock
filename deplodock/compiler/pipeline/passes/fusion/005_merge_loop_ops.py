@@ -10,10 +10,10 @@ forms, etc.); those boundaries stay as separate kernels.
 
 from __future__ import annotations
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Loop, LoopOp, Stmt, splice_graph
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 _BLOWUP_FACTOR = 8
 

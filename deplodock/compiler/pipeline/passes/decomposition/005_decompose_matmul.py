@@ -7,12 +7,12 @@ Inputs are unsqueezed so the mul is a standard NumPy broadcast:
   reduce_sum(axis=-2) → (..., M, N)
 """
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.decomposition._broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.pipeline.passes.decomposition._matmul_helpers import matmul_unsqueeze
 
 PATTERN = [Pattern("root", MatmulOp)]

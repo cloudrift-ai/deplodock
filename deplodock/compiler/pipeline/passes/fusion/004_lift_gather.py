@@ -12,12 +12,12 @@ into the axis env so the data port can reference the idx port's value.
 
 from __future__ import annotations
 
+from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Cast, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import GatherOp
-from deplodock.compiler.pipeline.graph import Graph, Tensor
-from deplodock.compiler.pipeline.matcher import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", GatherOp)]
 
