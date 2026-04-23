@@ -103,8 +103,8 @@ def _handle_run_model(args):
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.dump import CompilerDump
-    from deplodock.compiler.model_wrapper import build_full_model_wrapper, collect_const_feed
-    from deplodock.compiler.torch_trace import trace_module_with_constants
+    from deplodock.compiler.trace.huggingface import build_full_model_wrapper, collect_const_feed
+    from deplodock.compiler.trace.torch import trace_module_with_constants
 
     model_id = args.target
     prompt = args.prompt

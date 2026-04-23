@@ -6,7 +6,7 @@
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  LAYER 1 · Frontend (backend-agnostic)                                                                               │
 │                                                                                                                      │
-│  torch_trace.py ─→ Graph populated with frontend ops                                                                 │
+│  trace/torch.py ─→ Graph populated with frontend ops                                                                 │
 │      ir/graph.py:    Tensor, Node[T_Op], Graph, Hints                                                                │
 │      ir/base.py:     Op, InputOp, ConstantOp                                                                         │
 │      ir/frontend/ir.py: Torch-captured ops (LinearOp, MatmulOp, SdpaOp, MeanOp, UnsqueezeOp, TransposeOp,               │
@@ -63,7 +63,7 @@
 
 See `ir/ARCHITECTURE.md` for the per-dialect breakdown of each IR level.
 
-`model_wrapper.py` holds helpers for tracing whole HF `CausalLM` models:
+`trace/huggingface.py` holds helpers for tracing whole HF `CausalLM` models:
 `build_full_model_wrapper()` returns an `nn.Module` with a precomputed
 causal mask (so HF's dynamic mask-construction ops stay out of the
 traced graph), and `collect_const_feed()` resolves tracer-emitted
@@ -76,7 +76,7 @@ placeholder→attribute map in one pass.
 
 ```
 PyTorch module
-   │  torch_trace.trace_module(...)
+   │  trace.torch.trace_module(...)
    ▼
 Graph (frontend ops — Layer 1)
    │  backend.compile(graph)  — unified across numpy / loop / cuda

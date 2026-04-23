@@ -228,7 +228,7 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
 
 def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     try:
         graph = trace_module(block.cpu(), (x.cpu(),), kwargs={"position_embeddings": (pos_emb[0].cpu(), pos_emb[1].cpu())})

@@ -121,7 +121,7 @@ def test_tracer_emits_broadcast_explicit_elementwise():
     import torch
 
     from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     class BroadcastAdd(torch.nn.Module):
         def forward(self, x, y):

@@ -37,7 +37,7 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     torch.manual_seed(42)
     config = AutoConfig.from_pretrained(model_id)

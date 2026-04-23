@@ -42,7 +42,7 @@ Or for a specific test file:
 - `deplodock vm delete gcp ...` — delete a GCP GPU VM
 - `deplodock vm delete cloudrift ...` — delete a CloudRift GPU VM
 - `deplodock pull <model>` — download a HuggingFace model to local cache
-- `deplodock trace <model> [--layer N] [--seq-len N]` — trace a transformer layer (or the whole model if `--layer` is omitted) to Graph IR (JSON). Whole-model tracing patches HF's dynamic causal-mask construction via `model_wrapper.build_full_model_wrapper`.
+- `deplodock trace <model> [--layer N] [--seq-len N]` — trace a transformer layer (or the whole model if `--layer` is omitted) to Graph IR (JSON). Whole-model tracing patches HF's dynamic causal-mask construction via `trace.huggingface.build_full_model_wrapper`.
 - `deplodock trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)
 - `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model)
 - `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)

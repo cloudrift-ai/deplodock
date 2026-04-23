@@ -209,7 +209,7 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     import torch
 
     from deplodock.compiler.rewriter import Rewriter
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes"
     graph = trace_module(torch.nn.RMSNorm(64), (torch.randn(1, 8, 64),))
@@ -270,7 +270,7 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     import torch
 
     from deplodock.compiler.rewriter import Rewriter
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "passes"
     graph = trace_module(torch.nn.Softmax(dim=-1), (torch.randn(1, 4, 8),))
