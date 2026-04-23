@@ -14,7 +14,7 @@ consumed by the backend.
 
 ```
 PyTorch module
-   │  torch_trace
+   │  trace.torch.trace_module
    ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ LAYER 1 · Frontend — Graph populated with FRONTEND ops (frontend.py)                                                 │

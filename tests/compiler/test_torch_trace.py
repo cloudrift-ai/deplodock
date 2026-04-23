@@ -2,7 +2,7 @@
 
 import pytest
 
-from deplodock.compiler.torch_trace import has_torch
+from deplodock.compiler.trace.torch import has_torch
 
 pytestmark = pytest.mark.skipif(not has_torch(), reason="PyTorch not available")
 
@@ -12,7 +12,7 @@ def test_trace_linear():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     linear = nn.Linear(4, 2, bias=False)
     x = torch.randn(1, 4)
@@ -30,7 +30,7 @@ def test_trace_simple_elementwise():
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     class AddMul(nn.Module):
         def forward(self, x, y):

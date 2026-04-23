@@ -65,7 +65,7 @@ def _handle_trace_model(args):
         logger.error("torch and transformers are required: pip install torch transformers")
         sys.exit(1)
 
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     logger.info("Loading %s...", args.model)
     dtype = torch.float32 if args.layer is None else torch.float16
@@ -74,7 +74,7 @@ def _handle_trace_model(args):
     seq_len = args.seq_len
 
     if args.layer is None:
-        from deplodock.compiler.model_wrapper import build_full_model_wrapper
+        from deplodock.compiler.trace.huggingface import build_full_model_wrapper
 
         logger.info("Tracing full model (seq_len=%d)...", seq_len)
         wrapper = build_full_model_wrapper(model, seq_len, dtype)
@@ -122,7 +122,7 @@ def graph_from_code(code: str):
         logger.error("torch is required: pip install torch")
         sys.exit(1)
 
-    from deplodock.compiler.torch_trace import trace_module
+    from deplodock.compiler.trace.torch import trace_module
 
     try:
         tree = ast.parse(code, mode="exec")

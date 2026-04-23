@@ -83,7 +83,7 @@ def main() -> int:
     import torch
     from transformers import AutoModelForCausalLM
 
-    from deplodock.compiler.model_wrapper import build_full_model_wrapper
+    from deplodock.compiler.trace.huggingface import build_full_model_wrapper
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.float32
     logger.info("Loading %s (%s)...", args.model, args.dtype)
