@@ -30,17 +30,17 @@ tests/compiler/pipeline/passes/
 
 | Rule file | Op | Structural | Correctness |
 |---|---|---|---|
-| `001_decompose_sdpa.py` | `SdpaOp` | ✓ | ✓ |
-| `002_decompose_silu.py` | `ElementwiseOp("silu")` | ✓ | ✓ |
-| `003_decompose_pow.py` | `ElementwiseOp("pow")` | ✓ | ✓ |
-| `004_decompose_linear.py` | `LinearOp` | ✓ | ✓ (± bias) |
-| `005_decompose_matmul.py` | `MatmulOp` | ✓ | ✓ (± bias) |
-| `007_decompose_mean.py` | `MeanOp` | ✓ | ✓ |
-| `010_unsqueeze_to_indexmap.py` | `UnsqueezeOp` | — | ✓ (dim=0, dim=-1) |
-| `011_transpose_to_indexmap.py` | `TransposeOp` | — | ✓ |
-| `012_reshape_to_indexmap.py` | `ReshapeOp` | — | ✓ |
-| `013_slice_to_indexmap.py` | `SliceOp` | — | ✓ |
-| `014_cat_to_indexmap.py` | `CatOp` | — | ✓ |
+| `001_sdpa.py` | `SdpaOp` | ✓ | ✓ |
+| `002_silu.py` | `ElementwiseOp("silu")` | ✓ | ✓ |
+| `003_pow.py` | `ElementwiseOp("pow")` | ✓ | ✓ |
+| `004_linear.py` | `LinearOp` | ✓ | ✓ (± bias) |
+| `005_matmul.py` | `MatmulOp` | ✓ | ✓ (± bias) |
+| `007_mean.py` | `MeanOp` | ✓ | ✓ |
+| `009_unsqueeze.py` | `UnsqueezeOp` | — | ✓ (dim=0, dim=-1) |
+| `010_transpose.py` | `TransposeOp` | — | ✓ |
+| `011_reshape.py` | `ReshapeOp` | — | ✓ |
+| `012_slice.py` | `SliceOp` | — | ✓ |
+| `013_cat.py` | `CatOp` | — | ✓ |
 
 ### Optimization (`passes/frontend/optimization/`)
 
