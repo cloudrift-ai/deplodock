@@ -40,7 +40,7 @@ arg_order).
    constant overrides come from `input_data`; scalar `ConstantOp`s
    materialize as single-element arrays; scratch buffers zero-init.
    Inputs without supplied data get a deterministic pseudo-random fill
-   (useful for `deplodock run` benchmarks).
+   (useful for standalone compile-and-benchmark scripts).
 2. Launch each kernel in topological order; `zero_outputs` fills run
    before the launch.
 3. Copy `graph.outputs` buffers back to numpy.
