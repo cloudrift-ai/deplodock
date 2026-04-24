@@ -212,7 +212,7 @@ class FuncCallExpr(_ExprOps):
             op = ElementwiseImpl(self.name)
         except ValueError as e:
             raise NotImplementedError(f"FuncCallExpr.eval: unknown intrinsic {self.name!r}") from e
-        return op.fn(*(a.eval(env) for a in self.args))
+        return op(*(a.eval(env) for a in self.args))
 
 
 @dataclass

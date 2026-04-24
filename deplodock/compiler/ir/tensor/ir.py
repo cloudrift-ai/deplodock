@@ -93,7 +93,7 @@ class ElementwiseOp(Op):
         # No shape check here — inside a LoopOp body, forward is called
         # per-iteration on scalar values, so a tensor-level match assert
         # doesn't apply. infer_output_shape enforces it at the graph level.
-        return self.op.fn(*inputs)
+        return self.op(*inputs)
 
 
 @dataclass
