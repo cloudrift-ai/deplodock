@@ -1,17 +1,18 @@
 """Tile IR — schedule + leaf compute, lowered directly to CUDA source.
 
-- :mod:`.ir` — the dataclass definitions: ``Kernel``, statement types
-  (``Let`` / ``Store`` / ``AccumFold`` / ``Sync`` / ``Cond`` / ``FreeLoop`` /
-  ``Reduce`` / ``Tile`` / ``Coop``), Tile-IR-specific ``Index`` expression,
-  and re-exports of the shared expression types from :mod:`ir.expr`.
+- :mod:`.ir` — the dataclass definitions: schedule wrappers (``FreeLoop``
+  / ``Reduce`` / ``Tile`` / ``Coop`` / ``Cond`` / ``Sync``), ``Kernel``
+  wrapper, ``Param`` / ``SmemBuf``, plus re-exports of Loop IR's leaf
+  stmts (``Load`` / ``Assign`` / ``Select`` / ``Write`` / ``Accum``) and
+  the shared expression types from :mod:`ir.expr`.
 
 Subsequent siblings (``render.py``, lowering passes, schedule strategies)
 land alongside; this module holds only the type definitions.
 """
 
 from deplodock.compiler.ir.tile.ir import (
-    Acc,
-    AccumFold,
+    Accum,
+    Assign,
     Axis,
     BinaryExpr,
     Builtin,
@@ -22,19 +23,20 @@ from deplodock.compiler.ir.tile.ir import (
     Expr,
     FreeLoop,
     FuncCallExpr,
-    Index,
     Kernel,
-    Let,
     Literal,
+    Load,
     Param,
     Reduce,
+    Select,
+    SelectBranch,
     SmemBuf,
     Stmt,
-    Store,
     Sync,
     TernaryExpr,
     Tile,
     Var,
+    Write,
 )
 
 __all__ = [
@@ -47,12 +49,14 @@ __all__ = [
     "TernaryExpr",
     "CastExpr",
     "Expr",
-    # Tile-IR expressions
-    "Index",
-    # Statements
-    "Let",
-    "Store",
-    "AccumFold",
+    # Loop-IR leaves
+    "Load",
+    "Assign",
+    "Select",
+    "SelectBranch",
+    "Write",
+    "Accum",
+    # Tile-IR statements
     "Sync",
     "Cond",
     "FreeLoop",
@@ -61,11 +65,10 @@ __all__ = [
     "Coop",
     "Stmt",
     # Top-level
-    "Acc",
     "Param",
     "SmemBuf",
     "Kernel",
-    # Re-exported from ir.loop / ir.elementwise
+    # Re-exports
     "Axis",
     "ElementwiseImpl",
 ]

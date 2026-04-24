@@ -12,115 +12,52 @@ Pipeline shape:
                   ──[ExtractGlobalSchedule, TileReduce, SmemStageReduce, …]──▶ Tile IR
                   ──emit_cuda──▶ CUDA source
 
-Lowering is mechanical: each Loop IR ``Loop`` becomes a ``FreeLoop`` (or
-``Reduce`` if the body has an ``Accum``); each leaf stmt translates 1:1 to
-``Let`` / ``Store`` / ``AccumFold``. Strategies populate ``Kernel.thread_axes``
-/ ``block_axes`` and rewrite the body — they don't touch lowering or codegen.
+**Leaf compute reuses Loop IR.** ``Load`` / ``Assign`` / ``Select`` /
+``Write`` / ``Accum`` come straight from ``ir.loop`` — buf names are now
+strings (``Load.input``, ``Write.output``) so they're directly renderable.
+``ElementwiseImpl`` carries op identity / commutativity / numpy callable.
 
-Statement node types:
+**Schedule structure is Tile-IR-specific.** ``FreeLoop`` / ``Reduce`` /
+``Tile`` / ``Coop`` / ``Sync`` / ``Cond`` plus the ``Kernel`` wrapper are
+new node types whose body is a broader union (``Stmt``) that admits both
+Loop-IR leaves and Tile-IR additions. Strategies match on the schedule
+nodes; the leaves they wrap pass through unchanged.
 
-- **Leaves** — ``Let`` (SSA bind), ``Store`` (memory write), ``AccumFold``
-  (reduce step), ``Sync`` (barrier), ``Cond`` (if/else).
-- **Loops** — ``FreeLoop`` (per-thread serial walk), ``Reduce`` (register
-  accumulator), ``Tile`` (outer slab walk), ``Coop`` (cooperative load).
-
-Expression node types reuse ``ir.expr`` directly (``Var``, ``Literal``,
-``BinaryExpr``, ``FuncCallExpr``, ``TernaryExpr``, ``CastExpr``, ``Builtin``)
-plus one Tile-IR-specific addition: ``Index(buf, indices)`` for multi-dim
-buffer access. The buffer's storage class (global / smem) is determined by
-name lookup against ``Kernel.params`` / ``Kernel.smem`` at render time.
+Expression types come from ``ir.expr`` directly (``Var``, ``Literal``,
+``BinaryExpr``, ``FuncCallExpr``, ``TernaryExpr``, ``CastExpr``,
+``Builtin``). No Tile-IR-specific expression nodes — ``Load`` / ``Write``
+carry the buf name + axis-Var indices, and the renderer flattens to
+row-major using the buffer's declared shape.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
     Builtin,
     CastExpr,
+    Expr,
     FuncCallExpr,
     Literal,
     TernaryExpr,
     Var,
-    _ExprOps,
 )
-from deplodock.compiler.ir.expr import (
-    Expr as _BaseExpr,
+from deplodock.compiler.ir.loop import (
+    Accum,
+    Assign,
+    Axis,
+    Load,
+    Select,
+    SelectBranch,
+    Write,
 )
-from deplodock.compiler.ir.loop import Axis
 
 # ---------------------------------------------------------------------------
-# Expressions — Tile-IR addition on top of ir.expr
+# Tile-IR additions: schedule wrappers + control flow
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class Index(_ExprOps):
-    """Memory read: ``buf[i0][i1]...``.
-
-    Works for any storage class — the buffer's storage (global pointer in
-    ``Kernel.params``, shared array in ``Kernel.smem``) is determined at
-    render time by name lookup. ``indices`` is multi-dim from the start;
-    render flattens row-major using the declared shape.
-    """
-
-    buf: str
-    indices: tuple[Expr, ...]
-
-
-Expr = _BaseExpr | Index
-
-
-# ---------------------------------------------------------------------------
-# Statements — leaves
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Let:
-    """SSA binding: ``T name = init;``.
-
-    Replaces both Loop IR's ``Load`` (init = ``Index(buf, [...])``) and
-    ``Assign`` (init = ``BinaryExpr`` / ``FuncCallExpr`` / ``TernaryExpr``).
-    """
-
-    name: str
-    init: Expr
-
-
-@dataclass
-class Store:
-    """Memory write: ``buf[indices...] = value;``.
-
-    Used both for global writes (Loop IR ``Write`` lowering) and smem writes
-    (cooperative-load ``Stage`` strategy output).
-    """
-
-    buf: str
-    indices: tuple[Expr, ...]
-    value: Expr
-
-
-@dataclass
-class AccumFold:
-    """Reduce step: ``target op= value;``.
-
-    ``op`` is an ``ElementwiseImpl`` (the same op-vocabulary used by Loop IR's
-    ``Accum``), giving us name / commutativity / identity in one object.
-    Renders as ``+=`` / ``*=`` for add/multiply (and ``sum``/``prod`` aliases),
-    or as a ``target = fmax(target, value)`` / ``fmin(...)`` rebinding for
-    maximum / minimum.
-    """
-
-    target: str
-    op: ElementwiseImpl
-    value: Expr
-
-    def __post_init__(self) -> None:
-        if isinstance(self.op, str):
-            object.__setattr__(self, "op", ElementwiseImpl(self.op))
 
 
 @dataclass
@@ -141,11 +78,6 @@ class Cond:
     else_body: tuple[Stmt, ...] = ()
 
 
-# ---------------------------------------------------------------------------
-# Statements — loops
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class FreeLoop:
     """Per-thread serial walk over a free axis.
@@ -162,32 +94,15 @@ class FreeLoop:
 
 
 @dataclass
-class Acc:
-    """One accumulator inside a ``Reduce.accs``.
-
-    ``op`` is an ``ElementwiseImpl`` (Loop IR vocabulary: ``"add"`` /
-    ``"multiply"`` / ``"maximum"`` / ``"minimum"`` plus ``"sum"`` / ``"prod"``
-    aliases). The accumulator's initial value comes from ``op.identity`` —
-    no separate ``init`` field, since the identity is uniquely determined
-    by the combine.
-    """
-
-    name: str
-    op: ElementwiseImpl
-
-    def __post_init__(self) -> None:
-        if isinstance(self.op, str):
-            object.__setattr__(self, "op", ElementwiseImpl(self.op))
-
-
-@dataclass
 class Reduce:
     """Register-accumulated walk over ``axis``.
 
-    Declares each ``Acc`` as a register variable initialized to its
-    identity, then walks the axis serially while the body ``AccumFold``\\ s
-    into them. After the loop, the accumulator names are visible to
-    subsequent stmts in the enclosing scope.
+    The body contains zero or more ``Accum`` stmts (Loop IR's reduce
+    primitive) that fold into named accumulators. The renderer scans the
+    body for distinct ``Accum.name`` values, emits a ``float <name> =
+    <op.identity>;`` declaration *before* the for-loop, then emits the body
+    inside the for-loop. After the loop the accumulator names are visible
+    to subsequent stmts in the enclosing scope.
 
     ``extent`` is ``axis.extent`` for an unmodified Reduce; tiling shrinks
     it to BK while keeping the axis identity intact (the body still uses
@@ -195,7 +110,6 @@ class Reduce:
     """
 
     axis: Axis
-    accs: tuple[Acc, ...]
     body: tuple[Stmt, ...]
     extent: int | None = None
 
@@ -207,7 +121,7 @@ class Tile:
     Body sees ``Var(axis.name)`` bound to the slab origin (the outer-loop
     var). Inner stmts that need a per-element global coord typically wrap
     an inner ``Reduce(axis, extent=bk)`` whose body adds the inner var:
-    ``Index("A", [m, axis + k_inner])``.
+    ``Load("x", input="A", index=(m, axis + k_inner))``.
     """
 
     axis: Axis
@@ -229,8 +143,9 @@ class Coop:
     body: tuple[Stmt, ...]
 
 
-# Statement union — every node that can appear in a body sequence.
-Stmt = Let | Store | AccumFold | Sync | Cond | FreeLoop | Reduce | Tile | Coop
+# Statement union — Loop IR leaves + Tile IR additions. Every node that
+# can appear in a body sequence anywhere in Tile IR.
+Stmt = Load | Assign | Select | Write | Accum | Sync | Cond | FreeLoop | Reduce | Tile | Coop
 
 
 # ---------------------------------------------------------------------------
@@ -246,9 +161,9 @@ class Param:
     ``"int"`` / etc.); render emits it verbatim in the function signature.
 
     ``shape`` is the buffer's element shape, used by ``render_kernel`` to
-    flatten multi-dim ``Index`` accesses to row-major. ``()`` means scalar
-    (the parameter is passed by value, not as a pointer); a ``(d0, d1, ...)``
-    tuple means a buffer of that shape behind ``dtype``'s pointer.
+    flatten multi-dim ``Load`` / ``Write`` indices to row-major. ``()``
+    means scalar; a ``(d0, d1, ...)`` tuple means a buffer of that shape
+    behind ``dtype``'s pointer.
     """
 
     name: str
@@ -261,8 +176,8 @@ class SmemBuf:
     """Shared-memory buffer declared at kernel scope.
 
     Render emits ``__shared__ <dtype> <name>[d0][d1]...;`` at the top of
-    the kernel function body. ``Index`` / ``Store`` referencing the buffer
-    by ``name`` inside the kernel are resolved to smem via name lookup.
+    the kernel function body. ``Load`` / ``Write`` referencing the buffer
+    by ``name`` inside the kernel resolve to smem via name lookup.
     """
 
     name: str
@@ -294,10 +209,8 @@ class Kernel:
     prologue: tuple[Stmt, ...] = ()
 
 
-# Re-exports of the shared expression types so callers can do
-# ``from deplodock.compiler.ir.tile import Var, Literal, ...``.
 __all__ = [
-    # Shared expressions
+    # Shared expressions (re-exported for convenience)
     "Var",
     "Literal",
     "BinaryExpr",
@@ -306,12 +219,14 @@ __all__ = [
     "TernaryExpr",
     "CastExpr",
     "Expr",
-    # Tile-IR expressions
-    "Index",
-    # Statements
-    "Let",
-    "Store",
-    "AccumFold",
+    # Loop-IR leaves (re-exported — used as Tile IR statements)
+    "Load",
+    "Assign",
+    "Select",
+    "SelectBranch",
+    "Write",
+    "Accum",
+    # Tile-IR statements
     "Sync",
     "Cond",
     "FreeLoop",
@@ -320,14 +235,10 @@ __all__ = [
     "Coop",
     "Stmt",
     # Top-level
-    "Acc",
     "Param",
     "SmemBuf",
     "Kernel",
-    # Re-exported from ir.loop / ir.elementwise
+    # Re-exports
     "Axis",
     "ElementwiseImpl",
 ]
-
-
-_ = field  # silence ruff if not used yet (Kernel uses defaults instead)
