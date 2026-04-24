@@ -2,7 +2,8 @@
 
 import pytest
 
-from deplodock.compiler.ir.expr import BinaryExpr, ExprOp, Literal, Var
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
@@ -280,7 +281,7 @@ def test_kernel_reduce():
             Write(output=0, index=(Var("a0"),), value="s"),
         ),
     )
-    assert any(isinstance(lb.op, ExprOp) for lb in k.accums)
+    assert any(isinstance(lb.op, ElementwiseImpl) for lb in k.accums)
 
 
 def test_kernel_matmul():

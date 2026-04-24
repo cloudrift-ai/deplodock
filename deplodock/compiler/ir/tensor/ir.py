@@ -19,7 +19,7 @@ and the ``fusion/`` pass splices adjacent LoopOp pairs via the
 tree-splicer in ``ir/loop/splicer.py``.
 
 Op metadata (arity / commutative / reducer identity) lives on
-``ir.expr.ExprOp`` — the single source of truth shared across
+``ir.expr.ElementwiseImpl`` — the single source of truth shared across
 elementwise, reduce, scan, and accumulator use sites. The old
 ``OpInfo`` / ``ReduceInfo`` registries are gone; read straight from
 ``op.op.arity`` / ``op.op.identity`` etc.
@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from deplodock.compiler.ir.base import Op, _keepdim_axis
-from deplodock.compiler.ir.expr import ExprOp, coerce_expr_op
+from deplodock.compiler.ir.elementwise import ElementwiseImpl, coerce_elementwise_impl
 
 # ---------------------------------------------------------------------------
 # Elementwise / reduce / scan
@@ -43,24 +43,24 @@ from deplodock.compiler.ir.expr import ExprOp, coerce_expr_op
 class ElementwiseOp(Op):
     """Apply a scalar function independently to each element.
 
-    The ``op`` field is an ``ExprOp`` carrying the function's name +
+    The ``op`` field is an ``ElementwiseImpl`` carrying the function's name +
     arity + commutativity + (for reducer use) identity. A plain string
     is accepted by ``__post_init__`` and resolved to the canonical
-    ``ExprOp`` via the registry in ``ir.expr``.
+    ``ElementwiseImpl`` via the registry in ``ir.expr``.
     """
 
-    op: ExprOp = field(default_factory=lambda: coerce_expr_op("copy"))
+    op: ElementwiseImpl = field(default_factory=lambda: coerce_elementwise_impl("copy"))
 
     def __post_init__(self) -> None:
         # Accept a string name for back-compat with ``ElementwiseOp("add")``
         # / ``ElementwiseOp(op="add")``-style construction; resolve to the
-        # canonical ExprOp so the rest of the pipeline sees structured
+        # canonical ElementwiseImpl so the rest of the pipeline sees structured
         # metadata.
-        object.__setattr__(self, "op", coerce_expr_op(self.op))
+        object.__setattr__(self, "op", coerce_elementwise_impl(self.op))
 
     @property
     def name(self) -> str:
-        """String name of the inner ExprOp — convenient for readers + tests."""
+        """String name of the inner ElementwiseImpl — convenient for readers + tests."""
         return self.op.name
 
     @property
@@ -109,11 +109,11 @@ class ReduceOp(Op):
     the reduced dimension (concrete int or symbolic name).
     """
 
-    op: ExprOp = field(default_factory=lambda: coerce_expr_op("sum"))
+    op: ElementwiseImpl = field(default_factory=lambda: coerce_elementwise_impl("sum"))
     axis: int | str = 0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "op", coerce_expr_op(self.op))
+        object.__setattr__(self, "op", coerce_elementwise_impl(self.op))
 
     @property
     def name(self) -> str:
@@ -149,11 +149,11 @@ class ReduceOp(Op):
 class ScanOp(Op):
     """Cumulative application of an associative binary op along an axis."""
 
-    op: ExprOp = field(default_factory=lambda: coerce_expr_op("sum"))
+    op: ElementwiseImpl = field(default_factory=lambda: coerce_elementwise_impl("sum"))
     axis: int | str = 0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "op", coerce_expr_op(self.op))
+        object.__setattr__(self, "op", coerce_elementwise_impl(self.op))
 
     @property
     def name(self) -> str:
