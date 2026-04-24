@@ -88,7 +88,7 @@ def test_broadcast_to_scalar_mul_correctness():
     g.add_node(InputOp(), [], Tensor("x", (2, 4, 8)), node_id="x")
     g.add_node(ConstantOp(name="s", value=2.0), [], Tensor("s", (1,)), node_id="s")
     s_bc = broadcast_to(g, "s", (2, 4, 8))
-    g.add_node(ElementwiseOp("mul"), ["x", s_bc], Tensor("z", (2, 4, 8)), node_id="z")
+    g.add_node(ElementwiseOp("multiply"), ["x", s_bc], Tensor("z", (2, 4, 8)), node_id="z")
     g.inputs, g.outputs = ["x"], ["z"]
     x = rng.standard_normal((2, 4, 8)).astype(np.float32)
     result = _run(g, {"x": x})

@@ -22,7 +22,7 @@ def _small_graph() -> Graph:
     w = g.add_node(op=ConstantOp(name="W"), inputs=[], output=Tensor("W", (4, 8)), node_id="w")
     g.inputs = [x]
     m = g.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[x, w],
         output=Tensor("m", (4, 8)),
         node_id="m",
@@ -110,9 +110,9 @@ def test_dot_output_is_deterministic():
 
 def test_label_contains_op_name_and_shape():
     dot = _graph_to_dot(_small_graph())
-    # ElementwiseOp(mul) should label the op line as "mul"
+    # ElementwiseOp(mul) should label the op line as "multiply"
     mul_line = next(line for line in dot.splitlines() if line.lstrip().startswith('"m" '))
-    assert "mul" in mul_line
+    assert "multiply" in mul_line
     assert "(4,8)" in mul_line
     # ReduceOp(sum) — label shows "sum"
     sum_line = next(line for line in dot.splitlines() if line.lstrip().startswith('"r" '))

@@ -22,7 +22,7 @@ def _make_matmul_graph():
     g.inputs = [a, b]
 
     ew = g.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[a, b],
         output=Tensor("AB", ("M", "K", "N")),
         node_id="ew",
@@ -115,6 +115,6 @@ def test_fan_out():
     x = g.add_node(op=InputOp(), inputs=[], output=Tensor("X", (4,)), node_id="x")
     g.inputs = [x]
     a = g.add_node(op=ElementwiseOp(op="exp"), inputs=[x], output=Tensor("expX", (4,)), node_id="a")
-    b = g.add_node(op=ElementwiseOp(op="neg"), inputs=[x], output=Tensor("negX", (4,)), node_id="b")
+    b = g.add_node(op=ElementwiseOp(op="negative"), inputs=[x], output=Tensor("negX", (4,)), node_id="b")
     g.outputs = [a, b]
     assert sorted(g.consumers("x")) == ["a", "b"]

@@ -47,7 +47,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     frag.add_node(op=InputOp(), inputs=[], output=Tensor(w_t.name, w_t.shape, w_t.dtype), node_id=w_id)
 
     sq_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[x_id, x_id],
         output=Tensor(f"{name}_sq", out_shape, dtype),
     )
@@ -74,13 +74,13 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     )
     rsq_bc = broadcast_to(frag, rsq_id, out_shape)
     norm_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[x_id, rsq_bc],
         output=Tensor(f"{name}_norm", out_shape, dtype),
     )
     w_bc = broadcast_to(frag, w_id, out_shape)
     out_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[norm_id, w_bc],
         output=Tensor(name, out_shape, dtype),
     )

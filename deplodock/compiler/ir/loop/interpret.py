@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from deplodock.compiler.ir.expr import ExprOp, Var, resolve_fn
+from deplodock.compiler.ir.expr import ExprOp, Var
 from deplodock.compiler.ir.loop.ir import Accum, Assign, Axis, Load, LoopOp, Select, Write
 
 
@@ -48,10 +48,7 @@ def execute_loop_op(
         if isinstance(stmt, Assign):
             args = [values[a] for a in stmt.args]
             assert isinstance(stmt.op, ExprOp)
-            fn = resolve_fn(stmt.op.name)
-            if fn is None:
-                raise NotImplementedError(f"interpret: unknown op {stmt.op.name!r}")
-            values[stmt.name] = fn(*_align_ranks(args))
+            values[stmt.name] = stmt.op.fn(*_align_ranks(args))
         elif isinstance(stmt, Load):
             if stmt.source >= len(input_arrays):
                 raise ValueError(f"Load source {stmt.source} out of range (have {len(input_arrays)} inputs)")
@@ -106,11 +103,11 @@ def _fold_to_accumulator(src: np.ndarray, acc: Accum, reduce_axis_positions: tup
     fn = acc.op.name
     if fn == "add":
         return np.sum(src, axis=axes, keepdims=True).astype(np.float32)
-    if fn == "max":
+    if fn == "maximum":
         return np.max(src, axis=axes, keepdims=True).astype(np.float32)
-    if fn == "min":
+    if fn == "minimum":
         return np.min(src, axis=axes, keepdims=True).astype(np.float32)
-    if fn == "mul":
+    if fn == "multiply":
         return np.prod(src, axis=axes, keepdims=True).astype(np.float32)
     raise NotImplementedError(f"_fold_to_accumulator: unknown combine fn {fn!r}")
 

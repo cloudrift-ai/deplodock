@@ -51,6 +51,8 @@ def test_op_name_aten_format():
     """_op_name extracts short name from aten.xxx.yyy targets."""
     from deplodock.compiler.trace.torch import _op_name
 
+    # _op_name returns the raw aten short name; ATEN→numpy translation
+    # (``mul`` → ``multiply``) happens later in _handle_call_function.
     assert _op_name("aten.mul.Tensor") == "mul"
     assert _op_name("aten.linear.default") == "linear"
     assert _op_name("aten.scaled_dot_product_attention.default") == "scaled_dot_product_attention"
@@ -121,8 +123,8 @@ def test_trace_all_elementwise_ops():
     x = torch.randn(2, 3)
     g = trace_module(m, (x,))
 
-    fns = {n.op.fn for n in g.nodes.values() if isinstance(n.op, ElementwiseOp)}
-    assert "neg" in fns
+    fns = {n.op.name for n in g.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    assert "negative" in fns
     assert "exp" in fns
     assert "abs" in fns
     assert "tanh" in fns
@@ -145,11 +147,11 @@ def test_trace_binary_ops():
     y = torch.randn(4)
     g = trace_module(m, (x, y))
 
-    fns = {n.op.fn for n in g.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    fns = {n.op.name for n in g.nodes.values() if isinstance(n.op, ElementwiseOp)}
     assert "add" in fns
-    assert "sub" in fns
-    assert "mul" in fns
-    assert "div" in fns
+    assert "subtract" in fns
+    assert "multiply" in fns
+    assert "divide" in fns
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +177,7 @@ def test_trace_sum_reduction():
 
     reduces = [n for n in g.nodes.values() if isinstance(n.op, ReduceOp)]
     assert len(reduces) >= 1
-    assert reduces[0].op.fn == "sum"
+    assert reduces[0].op.name == "sum"
 
 
 def test_trace_max_reduction():
@@ -196,7 +198,7 @@ def test_trace_max_reduction():
 
     reduces = [n for n in g.nodes.values() if isinstance(n.op, ReduceOp)]
     assert len(reduces) >= 1
-    assert reduces[0].op.fn == "amax"
+    assert reduces[0].op.name == "amax"
 
 
 # ---------------------------------------------------------------------------

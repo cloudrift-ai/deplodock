@@ -39,7 +39,7 @@ def handle_inspect(args):
         # Collect sub-details for parameterized ops.
         detail_key = None
         if hasattr(n.op, "fn"):
-            detail_key = n.op.fn
+            detail_key = n.op.name
         elif hasattr(n.op, "name") and op_name == "ConstantOp":
             detail_key = n.op.name
 

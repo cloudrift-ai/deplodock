@@ -45,7 +45,7 @@ def _run(run_graph, graph: Graph, inputs: dict[str, np.ndarray]) -> np.ndarray:
 @pytest.mark.parametrize(
     "fn,torch_fn",
     [
-        ("neg", lambda x: torch.neg(x)),
+        ("negative", lambda x: torch.neg(x)),
         ("exp", lambda x: torch.exp(x)),
         ("rsqrt", lambda x: torch.rsqrt(x)),
         ("reciprocal", lambda x: torch.reciprocal(x)),
@@ -75,9 +75,9 @@ def test_unary(fn, torch_fn, run_graph):
     "fn,torch_fn",
     [
         ("add", lambda x, y: x + y),
-        ("sub", lambda x, y: x - y),
-        ("mul", lambda x, y: x * y),
-        ("div", lambda x, y: x / y),
+        ("subtract", lambda x, y: x - y),
+        ("multiply", lambda x, y: x * y),
+        ("divide", lambda x, y: x / y),
     ],
 )
 def test_binary(fn, torch_fn, run_graph):
@@ -89,7 +89,7 @@ def test_binary(fn, torch_fn, run_graph):
     g.add_node(ElementwiseOp(fn), ["x", "y"], Tensor("z", (4, 8)), node_id="z")
     g.inputs, g.outputs = ["x", "y"], ["z"]
     expected = _torch_to_np(torch_fn(torch.from_numpy(x_np), torch.from_numpy(y_np)))
-    rtol = 1e-3 if fn == "div" else 1e-5
+    rtol = 1e-3 if fn == "divide" else 1e-5
     np.testing.assert_allclose(_run(run_graph, g, {"x": x_np, "y": y_np}), expected, rtol=rtol, atol=1e-5)
 
 
@@ -135,7 +135,7 @@ def test_reduce_max(run_graph):
     x_np = rng.standard_normal((4, 8)).astype(np.float32)
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    g.add_node(ReduceOp("max", -1), ["x"], Tensor("y", (4, 1)), node_id="y")
+    g.add_node(ReduceOp("maximum", -1), ["x"], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
     expected = _torch_to_np(torch.from_numpy(x_np).amax(dim=-1, keepdim=True))
     np.testing.assert_allclose(_run(run_graph, g, {"x": x_np}), expected, rtol=1e-5, atol=1e-5)
@@ -381,11 +381,11 @@ def test_softmax_graph(run_graph):
     x_np = rng.standard_normal((rows, cols)).astype(np.float32)
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (rows, cols)), node_id="x")
-    g.add_node(ReduceOp("max", -1), ["x"], Tensor("mx", (rows, 1)), node_id="mx")
-    g.add_node(ElementwiseOp("sub"), ["x", "mx"], Tensor("sub", (rows, cols)), node_id="sub")
-    g.add_node(ElementwiseOp("exp"), ["sub"], Tensor("exp", (rows, cols)), node_id="exp")
+    g.add_node(ReduceOp("maximum", -1), ["x"], Tensor("mx", (rows, 1)), node_id="mx")
+    g.add_node(ElementwiseOp("subtract"), ["x", "mx"], Tensor("subtract", (rows, cols)), node_id="subtract")
+    g.add_node(ElementwiseOp("exp"), ["subtract"], Tensor("exp", (rows, cols)), node_id="exp")
     g.add_node(ReduceOp("sum", -1), ["exp"], Tensor("sm", (rows, 1)), node_id="sm")
-    g.add_node(ElementwiseOp("div"), ["exp", "sm"], Tensor("out", (rows, cols)), node_id="out")
+    g.add_node(ElementwiseOp("divide"), ["exp", "sm"], Tensor("out", (rows, cols)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     expected = _torch_to_np(torch.softmax(torch.from_numpy(x_np), dim=-1))
     np.testing.assert_allclose(_run(run_graph, g, {"x": x_np}), expected, rtol=2e-4, atol=1e-5)
@@ -400,12 +400,12 @@ def test_rmsnorm_graph(run_graph):
     g.add_node(InputOp(), [], Tensor("X", (rows, dim)), node_id="X")
     g.add_node(ConstantOp(name="eps", value=eps), [], Tensor("eps", (1,)), node_id="eps")
     g.add_node(InputOp(), [], Tensor("w", (dim,)), node_id="w")
-    g.add_node(ElementwiseOp("mul"), ["X", "X"], Tensor("sq", (rows, dim)), node_id="sq")
+    g.add_node(ElementwiseOp("multiply"), ["X", "X"], Tensor("sq", (rows, dim)), node_id="sq")
     g.add_node(ReduceOp("sum", axis=-1), ["sq"], Tensor("red", (rows, 1)), node_id="red")
     g.add_node(ElementwiseOp("add"), ["red", "eps"], Tensor("ae", (rows, 1)), node_id="ae")
     g.add_node(ElementwiseOp("rsqrt"), ["ae"], Tensor("rsq", (rows, 1)), node_id="rsq")
-    g.add_node(ElementwiseOp("mul"), ["X", "rsq"], Tensor("norm", (rows, dim)), node_id="norm")
-    g.add_node(ElementwiseOp("mul"), ["norm", "w"], Tensor("out", (rows, dim)), node_id="out")
+    g.add_node(ElementwiseOp("multiply"), ["X", "rsq"], Tensor("norm", (rows, dim)), node_id="norm")
+    g.add_node(ElementwiseOp("multiply"), ["norm", "w"], Tensor("out", (rows, dim)), node_id="out")
     g.inputs, g.outputs = ["X", "w"], ["out"]
 
     X_t = torch.from_numpy(X_np)

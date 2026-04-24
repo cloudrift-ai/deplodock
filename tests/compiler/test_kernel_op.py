@@ -177,7 +177,7 @@ def test_load_stmt_binding():
                 axis=Axis("a0", 4),
                 body=(
                     Load("x_val", source=0, index=(Var("a0"),)),
-                    Assign("y", ElementwiseOp("neg"), ("x_val",)),
+                    Assign("y", ElementwiseOp("negative"), ("x_val",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -230,7 +230,7 @@ def test_update_synthesizes_accum_decl():
     )
     # rename_ssa_sequential canonicalizes Accum names to acc0, acc1, ...
     assert len(k.accums) == 1 and k.accums[0].name == "acc0"
-    assert k.accums[0].op.fn == "add"
+    assert k.accums[0].op.name == "add"
     assert isinstance(k.accums[0].init, Literal) and k.accums[0].init.value == 0.0
 
 
@@ -242,7 +242,7 @@ def test_update_synthesizes_accum_decl():
 def test_assign_construction():
     a = Assign("out", ElementwiseOp("add"), args=("a", "b"))
     assert a.name == "out"
-    assert a.op.fn == "add"
+    assert a.op.name == "add"
     assert a.args == ("a", "b")
 
 
@@ -290,8 +290,8 @@ def test_kernel_matmul():
         axes=axes,
         inputs=(p, p),
         body=(
-            Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
-            Accum(name="dot", value="mul"),
+            Assign("multiply", ElementwiseOp("multiply"), args=("$0", "$1")),
+            Accum(name="dot", value="multiply"),
             Write(output=0, index=(Var("a0"),), value="dot"),
         ),
     )
@@ -307,8 +307,8 @@ def test_kernel_matmul_bias():
         axes=axes,
         inputs=(p_mk, p_mk, p_bias),
         body=(
-            Assign("mul", ElementwiseOp("mul"), args=("$0", "$1")),
-            Accum(name="dot", value="mul"),
+            Assign("multiply", ElementwiseOp("multiply"), args=("$0", "$1")),
+            Accum(name="dot", value="multiply"),
             Assign("out", ElementwiseOp("add"), args=("dot", "$2")),
             Write(output=0, index=(Var("a0"),), value="out"),
         ),
@@ -327,7 +327,7 @@ def test_kernel_softmax_two_accumulators():
         axes=axes,
         inputs=(p,),
         body=(
-            Accum(name="mx", value="$0", op=ElementwiseOp("max")),
+            Accum(name="mx", value="$0", op=ElementwiseOp("maximum")),
             Accum(name="sm", value="$0"),
             Write(output=0, index=(Var("a0"),), value="mx"),
         ),
@@ -344,8 +344,8 @@ def test_kernel_unary_chain():
         axes=axes,
         inputs=(p,),
         body=(
-            Assign("neg", ElementwiseOp("neg"), args=("$0",)),
-            Assign("exp", ElementwiseOp("exp"), args=("neg",)),
+            Assign("negative", ElementwiseOp("negative"), args=("$0",)),
+            Assign("exp", ElementwiseOp("exp"), args=("negative",)),
             Write(output=0, index=(Var("a0"),), value="exp"),
         ),
     )
@@ -400,7 +400,7 @@ def test_ssa_rejects_duplicate_name():
             inputs=(p,),
             body=(
                 Assign("y", ElementwiseOp("exp"), args=("$0",)),
-                Assign("y", ElementwiseOp("neg"), args=("y",)),
+                Assign("y", ElementwiseOp("negative"), args=("y",)),
             ),
         )
 
@@ -427,7 +427,7 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
         inputs=(p,),
         body=(
             Assign("a", ElementwiseOp("exp"), args=("$0",)),
-            Assign("b", ElementwiseOp("neg"), args=("$0",)),
+            Assign("b", ElementwiseOp("negative"), args=("$0",)),
             Assign("c", ElementwiseOp("add"), args=("a", "b")),
         ),
     )
@@ -445,7 +445,7 @@ def test_update_op_conflict_rejected():
             axes=axes,
             inputs=(p,),
             body=(
-                Accum(name="acc", value="$0", op=ElementwiseOp("max")),
+                Accum(name="acc", value="$0", op=ElementwiseOp("maximum")),
                 Accum(name="acc", value="$0", op=ElementwiseOp("add")),
             ),
         )
@@ -467,7 +467,7 @@ def test_loop_stmt_basic():
             Loop(
                 axis=Axis("a0", 8),
                 body=(
-                    Assign("v", ElementwiseOp("neg"), args=("$0",)),
+                    Assign("v", ElementwiseOp("negative"), args=("$0",)),
                     Write(output=0, index=(Var("a0"),), value="v"),
                 ),
             ),
@@ -486,7 +486,7 @@ def test_loop_axis_sibling_same_name_allowed():
         axes=(Axis("a0", 4), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
         body=(
-            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0", op=ElementwiseOp("max")),)),
+            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0", op=ElementwiseOp("maximum")),)),
             Loop(axis=Axis("k", 8), body=(Accum(name="sm", value="$1"),)),
             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
             Write(output=0, index=(Var("a0"),), value="v"),
@@ -509,7 +509,7 @@ def test_loop_ssa_scoping():
             body=(
                 Loop(
                     axis=Axis("a0_inner", 4),
-                    body=(Assign("v", ElementwiseOp("neg"), args=("$0",)),),
+                    body=(Assign("v", ElementwiseOp("negative"), args=("$0",)),),
                 ),
                 # Reference 'v' outside the inner Loop — should fail.
                 Write(output=0, index=(Var("a0"),), value="v"),

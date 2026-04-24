@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op, _keepdim_axis
-from deplodock.compiler.ir.expr import ExprOp, coerce_expr_op, resolve_fn
+from deplodock.compiler.ir.expr import ExprOp, coerce_expr_op
 
 # ---------------------------------------------------------------------------
 # Elementwise / reduce / scan
@@ -57,8 +57,13 @@ class ElementwiseOp(Op):
         object.__setattr__(self, "op", coerce_expr_op(self.op))
 
     @property
+    def name(self) -> str:
+        """String name of the inner ExprOp — convenient for readers + tests."""
+        return self.op.name
+
+    @property
     def fn(self) -> str:
-        """Back-compat alias for callers that read the op's string name."""
+        """Alias for ``name`` — kept for pattern-matcher ``constraints={"fn": ...}``."""
         return self.op.name
 
     @property
@@ -88,13 +93,10 @@ class ElementwiseOp(Op):
         return head
 
     def forward(self, *inputs):
-        fn = resolve_fn(self.op.name)
-        if fn is None:
-            raise NotImplementedError(f"ElementwiseOp.forward: unknown fn {self.op.name!r}")
         # No shape check here — inside a LoopOp body, forward is called
         # per-iteration on scalar values, so a tensor-level match assert
         # doesn't apply. infer_output_shape enforces it at the graph level.
-        return fn(*inputs)
+        return self.op.fn(*inputs)
 
 
 @dataclass
@@ -110,6 +112,10 @@ class ReduceOp(Op):
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "op", coerce_expr_op(self.op))
+
+    @property
+    def name(self) -> str:
+        return self.op.name
 
     @property
     def fn(self) -> str:
@@ -129,11 +135,11 @@ class ReduceOp(Op):
         name = self.op.name
         if name in ("sum", "add"):
             return np.sum(a, axis=self.axis, keepdims=True)
-        if name in ("prod", "mul"):
+        if name in ("prod", "multiply"):
             return np.prod(a, axis=self.axis, keepdims=True)
-        if name in ("max", "amax", "fmax"):
+        if name in ("maximum", "amax", "fmax"):
             return np.max(a, axis=self.axis, keepdims=True)
-        if name in ("min", "fmin"):
+        if name in ("minimum", "fmin"):
             return np.min(a, axis=self.axis, keepdims=True)
         raise NotImplementedError(f"ReduceOp.forward: unknown fn {name!r}")
 
@@ -149,6 +155,10 @@ class ScanOp(Op):
         object.__setattr__(self, "op", coerce_expr_op(self.op))
 
     @property
+    def name(self) -> str:
+        return self.op.name
+
+    @property
     def fn(self) -> str:
         return self.op.name
 
@@ -162,9 +172,9 @@ class ScanOp(Op):
         name = self.op.name
         if name in ("sum", "add"):
             return np.cumsum(a, axis=self.axis)
-        if name in ("max", "fmax"):
+        if name in ("maximum", "fmax"):
             return np.maximum.accumulate(a, axis=self.axis)
-        if name in ("prod", "mul"):
+        if name in ("prod", "multiply"):
             return np.cumprod(a, axis=self.axis)
         raise NotImplementedError(f"ScanOp.forward: unknown fn {name!r}")
 

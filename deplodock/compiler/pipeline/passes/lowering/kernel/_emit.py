@@ -269,7 +269,7 @@ def _emit_stmt(s, ctx: _Ctx, out: list[Stmt]) -> None:
     if isinstance(s, IrAssignStmt):
         args = [ctx.values[a] for a in s.args]
         tname = ctx.fresh()
-        out.append(VarDecl(dtype="float", name=tname, init=_apply_elementwise(s.op.fn, args)))
+        out.append(VarDecl(dtype="float", name=tname, init=_apply_elementwise(s.op.name, args)))
         ctx.values[s.name] = Var(tname)
         return
 
@@ -285,7 +285,7 @@ def _emit_stmt(s, ctx: _Ctx, out: list[Stmt]) -> None:
 
     if isinstance(s, Accum):
         acc_var = ctx.values[s.name].name
-        out.append(_emit_reduce_accum(acc_var, s.op.fn, ctx.values[s.value]))
+        out.append(_emit_reduce_accum(acc_var, s.op.name, ctx.values[s.value]))
         return
 
     if isinstance(s, IrLoop):
@@ -450,7 +450,7 @@ def _emit_reduce_loop_smem(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
         # Unrolled tree halve: BLOCK is compile-time, so emit one round per stride.
         stride = _BLOCK // 2
         while stride > 0:
-            combine = _smem_combine_stmt(smem_name, stride, tid, accum.op.fn)
+            combine = _smem_combine_stmt(smem_name, stride, tid, accum.op.name)
             out.append(IfStmt(cond=BinOp("<", tid, Literal(stride, "int")), body=[combine]))
             out.append(SyncThreads())
             stride //= 2
@@ -463,13 +463,13 @@ def _smem_combine_stmt(smem_name: str, stride: int, tid: Expr, op_fn: str) -> St
     """One combine step of the tree reduction: ``smem[tid] = smem[tid] op smem[tid+stride]``."""
     lhs = ArrayAccess(array=smem_name, index=tid)
     rhs = ArrayAccess(array=smem_name, index=BinOp("+", tid, Literal(stride, "int")))
-    if op_fn == "max":
+    if op_fn == "maximum":
         return IrAssign(target=lhs, value=FuncCall("fmax", [lhs, rhs]))
-    if op_fn == "min":
+    if op_fn == "minimum":
         return IrAssign(target=lhs, value=FuncCall("fmin", [lhs, rhs]))
     if op_fn in ("add", "sum"):
         return IrAssign(target=lhs, value=BinOp("+", lhs, rhs))
-    if op_fn in ("mul", "prod"):
+    if op_fn in ("multiply", "prod"):
         return IrAssign(target=lhs, value=BinOp("*", lhs, rhs))
     return IrAssign(target=lhs, value=BinOp("+", lhs, rhs))
 
@@ -526,11 +526,11 @@ def _emit_select(stmt: Select, values: dict[str, Expr], axis_env: dict[str, Expr
 
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
-    if fn == "max":
+    if fn == "maximum":
         return VarAssign(name=acc_name, value=FuncCall("fmax", [Var(acc_name), value]))
-    if fn == "min":
+    if fn == "minimum":
         return VarAssign(name=acc_name, value=FuncCall("fmin", [Var(acc_name), value]))
-    op = {"add": "+=", "sum": "+=", "mul": "*=", "prod": "*="}.get(fn, "+=")
+    op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(fn, "+=")
     return AugAssign(target=acc_name, op=op, value=value)
 
 
@@ -543,16 +543,16 @@ _SUPPORTED_UNARY = {
 
 
 def _apply_elementwise(fn: str, inputs: list[Expr]) -> Expr:
-    if fn in {"add", "sub", "mul", "div", "mod"}:
-        op = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "%"}[fn]
+    if fn in {"add", "subtract", "multiply", "divide", "mod"}:
+        op = {"add": "+", "subtract": "-", "multiply": "*", "divide": "/", "mod": "%"}[fn]
         return BinOp(op, inputs[0], inputs[1])
-    if fn == "max":
+    if fn == "maximum":
         return FuncCall("fmax", list(inputs))
-    if fn == "min":
+    if fn == "minimum":
         return FuncCall("fmin", list(inputs))
     if fn == "pow":
         return FuncCall("pow", list(inputs))
-    if fn == "neg":
+    if fn == "negative":
         return BinOp("-", Literal(0.0, "float"), inputs[0])
     if fn == "copy":
         return inputs[0]

@@ -11,7 +11,7 @@ def test_compile_code_torch_ir(run_cli):
 def test_compile_code_tensor_ir(run_cli):
     rc, stdout, stderr = run_cli("compile", "--code", "torch.nn.Linear(3, 2, bias=False)(torch.randn(4, 3))", "--ir", "tensor")
     assert rc == 0, f"stderr: {stderr}"
-    assert "mul(" in stdout
+    assert "multiply(" in stdout
     assert "sum(" in stdout
 
 

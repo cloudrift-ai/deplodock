@@ -63,15 +63,15 @@ def _make_pow_graph():
 
 def test_pow_decomposes_to_self_mul():
     result = _apply(_make_pow_graph(), "003_pow.py")
-    fns = [n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)]
+    fns = [n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)]
     assert "pow" not in fns
-    assert "mul" in fns
+    assert "multiply" in fns
 
 
 def test_pow_output_uses_self_multiply():
     result = _apply(_make_pow_graph(), "003_pow.py")
     out_node = result.nodes[result.outputs[0]]
-    assert out_node.op.fn == "mul"
+    assert out_node.op.name == "multiply"
     assert out_node.inputs[0] == out_node.inputs[1]
 
 
@@ -113,7 +113,7 @@ def _make_silu_graph():
 
 def test_silu_decomposes():
     result = _apply(_make_silu_graph(), "002_silu.py")
-    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
     assert "silu" not in fns
     assert "exp" in fns
 
@@ -144,8 +144,8 @@ def test_mean_decomposes():
     result = _apply(_make_mean_graph(), "007_mean.py")
     has_mean = any(isinstance(n.op, MeanOp) for n in result.nodes.values())
     assert not has_mean
-    has_sum = any(isinstance(n.op, ReduceOp) and n.op.fn == "sum" for n in result.nodes.values())
-    has_div = any(isinstance(n.op, ElementwiseOp) and n.op.fn == "div" for n in result.nodes.values())
+    has_sum = any(isinstance(n.op, ReduceOp) and n.op.name == "sum" for n in result.nodes.values())
+    has_div = any(isinstance(n.op, ElementwiseOp) and n.op.name == "divide" for n in result.nodes.values())
     assert has_sum and has_div
 
 
@@ -178,16 +178,16 @@ def _make_rms_norm_graph(dim=64, seq_len=8, eps_input=False):
 
 def test_rms_norm_decomposes():
     result = _apply(_make_rms_norm_graph(), "006_rms_norm.py")
-    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
     assert "rms_norm" not in fns
-    assert {"mul", "add", "rsqrt"} <= fns
+    assert {"multiply", "add", "rsqrt"} <= fns
     assert any(isinstance(n.op, MeanOp) for n in result.nodes.values())
 
 
 def test_rms_norm_with_eps_input_decomposes():
     """Three-input form (x, w, eps) from explicit torch.nn.RMSNorm(dim, eps=...)."""
     result = _apply(_make_rms_norm_graph(eps_input=True), "006_rms_norm.py")
-    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
     assert "rms_norm" not in fns
 
 
@@ -212,7 +212,7 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     decomposed = run_pass(decomposed, rules_dir / "frontend" / "optimization")
     for n in decomposed.nodes.values():
         if isinstance(n.op, ElementwiseOp):
-            assert n.op.fn != "rms_norm", f"rms_norm survived decomposition at {n.output.name}"
+            assert n.op.name != "rms_norm", f"rms_norm survived decomposition at {n.output.name}"
 
 
 # ===================================================================
@@ -236,11 +236,11 @@ def _make_softmax_graph(dim_extent=8, seq_len=4, axis=-1):
 
 def test_softmax_decomposes():
     result = _apply(_make_softmax_graph(), "008_softmax.py")
-    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
     assert "softmax" not in fns
-    assert {"sub", "exp", "div"} <= fns
-    reduce_fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ReduceOp)}
-    assert {"max", "sum"} <= reduce_fns
+    assert {"subtract", "exp", "divide"} <= fns
+    reduce_fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ReduceOp)}
+    assert {"maximum", "sum"} <= reduce_fns
 
 
 def test_softmax_preserves_io_shape():
@@ -273,7 +273,7 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     decomposed = run_pass(decomposed, rules_dir / "frontend" / "optimization")
     for n in decomposed.nodes.values():
         if isinstance(n.op, ElementwiseOp):
-            assert n.op.fn != "softmax", f"softmax survived decomposition at {n.output.name}"
+            assert n.op.name != "softmax", f"softmax survived decomposition at {n.output.name}"
 
 
 # ===================================================================
@@ -306,18 +306,18 @@ def test_sdpa_produces_transpose():
 
 def test_sdpa_produces_two_matmuls():
     result = _apply(_make_sdpa_graph(), "001_sdpa.py")
-    muls = [n for n in result.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.fn == "mul"]
-    sums = [n for n in result.nodes.values() if isinstance(n.op, ReduceOp) and n.op.fn == "sum"]
+    muls = [n for n in result.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.name == "multiply"]
+    sums = [n for n in result.nodes.values() if isinstance(n.op, ReduceOp) and n.op.name == "sum"]
     assert len(muls) >= 3
     assert len(sums) >= 2
 
 
 def test_sdpa_produces_softmax_pattern():
     result = _apply(_make_sdpa_graph(), "001_sdpa.py")
-    fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
-    reduce_fns = {n.op.fn for n in result.nodes.values() if isinstance(n.op, ReduceOp)}
-    assert {"sub", "exp", "div"} <= fns
-    assert "max" in reduce_fns
+    fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    reduce_fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ReduceOp)}
+    assert {"subtract", "exp", "divide"} <= fns
+    assert "maximum" in reduce_fns
 
 
 def test_sdpa_produces_scale_constant():

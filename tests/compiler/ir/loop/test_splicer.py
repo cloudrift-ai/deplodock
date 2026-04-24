@@ -43,7 +43,7 @@ def _count_kind(op: LoopOp, cls: type) -> int:
 
 
 def _elementwise_fns(op: LoopOp) -> list[str]:
-    return [s.op.fn for s in iter_body(op.body) if isinstance(s, Assign)]
+    return [s.op.name for s in iter_body(op.body) if isinstance(s, Assign)]
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +356,7 @@ def test_chain_three_loops():
                 axis=A0,
                 body=(
                     Load(name="av", source=0, index=(Var("a0"),)),  # reads a
-                    Assign(name="y", op=ElementwiseOp("neg"), args=("av",)),
+                    Assign(name="y", op=ElementwiseOp("negative"), args=("av",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -387,7 +387,7 @@ def test_chain_three_loops():
     assert merged is not None
     fns = _elementwise_fns(merged)
     assert "exp" in fns
-    assert "neg" in fns
+    assert "negative" in fns
     assert "add" in fns
     # Two external Loads remain (x, bias); the splice edges collapsed into copy aliases.
     loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
@@ -424,7 +424,7 @@ def test_multi_output_root_preserves_all_writes():
                 axis=A0,
                 body=(
                     Load(name="yv", source=0, index=(Var("a0"),)),
-                    Assign(name="z0", op=ElementwiseOp("neg"), args=("yv",)),
+                    Assign(name="z0", op=ElementwiseOp("negative"), args=("yv",)),
                     Assign(name="z1", op=ElementwiseOp("abs"), args=("yv",)),
                     Write(output=0, index=(Var("a0"),), value="z0"),
                     Write(output=1, index=(Var("a0"),), value="z1"),
@@ -440,7 +440,7 @@ def test_multi_output_root_preserves_all_writes():
     fns = _elementwise_fns(merged)
     # Producer chain materialized once (shared σ); both consumer ops present.
     assert fns.count("exp") == 1
-    assert "neg" in fns
+    assert "negative" in fns
     assert "abs" in fns
 
 
@@ -456,7 +456,7 @@ def test_multi_output_splice_target():
                 body=(
                     Load(name="x", source=0, index=(Var("a0"),)),
                     Assign(name="y0", op=ElementwiseOp("exp"), args=("x",)),
-                    Assign(name="y1", op=ElementwiseOp("neg"), args=("x",)),
+                    Assign(name="y1", op=ElementwiseOp("negative"), args=("x",)),
                     Write(output=0, index=(Var("a0"),), value="y0"),
                     Write(output=1, index=(Var("a0"),), value="y1"),
                 ),
@@ -494,7 +494,7 @@ def test_multi_output_splice_target():
     fns = _elementwise_fns(merged)
     # Both target ops appear in the merged body once each.
     assert fns.count("exp") == 1
-    assert fns.count("neg") == 1
+    assert fns.count("negative") == 1
     assert "add" in fns
     # Only one external Load (target's x); the splice edges replaced sink's Loads.
     loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
@@ -523,7 +523,7 @@ def test_literal_producer_write_index():
                 axis=A0,
                 body=(
                     Load(name="yv", source=0, index=(Var("a0"), Literal(0))),
-                    Assign(name="z", op=ElementwiseOp("neg"), args=("yv",)),
+                    Assign(name="z", op=ElementwiseOp("negative"), args=("yv",)),
                     Write(output=0, index=(Var("a0"),), value="z"),
                 ),
             ),
@@ -533,4 +533,4 @@ def test_literal_producer_write_index():
     merged = splice_loop_ops(producer, consumer, source=0)
     assert merged is not None
     assert "exp" in _elementwise_fns(merged)
-    assert "neg" in _elementwise_fns(merged)
+    assert "negative" in _elementwise_fns(merged)
