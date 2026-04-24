@@ -30,25 +30,31 @@ from deplodock.compiler.backend.cuda.program import benchmark_program
 from deplodock.compiler.pipeline import CUDA_PASSES, run_pipeline
 from deplodock.compiler.trace.torch import trace_module
 
-# TinyLlama (hidden=2048, ffn=5632, kv_heads=4, head_dim=64) at seq_len=32.
-# Pure-matmul shapes; the fused-epilogue shapes (o_proj+residual,
-# down_proj+residual, up_proj+silu*gate) use the same matmul geometry so
-# per-shape tile picks transfer over.
+# TinyLlama (hidden=2048, ffn=5632, kv_heads=4, head_dim=64). Per-shape
+# pure-matmul geometry; fused-epilogue shapes (o_proj+residual, down_proj
+# +residual, up_proj+silu×gate) use the same geometry.
 _DEFAULT_SHAPES = [
-    (32, 2048, 2048),  # Q / O projection (2048 out, 2048 hidden)
-    (32, 256, 2048),  # K / V projection (256 = 4 heads × 64 head_dim)
-    (32, 5632, 2048),  # gate / up projection (ffn expansion)
-    (32, 2048, 5632),  # down projection (ffn contraction)
+    # seq=32
+    (32, 2048, 2048),  # Q / O projection
+    (32, 256, 2048),  # K / V projection
+    (32, 5632, 2048),  # gate / up projection
+    (32, 2048, 5632),  # down projection
+    # seq=512
+    (512, 2048, 2048),
+    (512, 256, 2048),
+    (512, 5632, 2048),
+    (512, 2048, 5632),
 ]
 
-# Grid: every axis picks from a modest fan-out. The analyzer + detector
-# silently reject any combo that doesn't satisfy (BM==M) / (N%BN==0) /
-# (K%BK==0) / (BM/TM * BN/TN == threads), so we just try the product.
+# Grid: every axis picks from a modest fan-out. The emitter and detector
+# silently reject any combo that doesn't satisfy (M%BM==N%BN==K%BK==0) /
+# (BM/TM * BN/TN == threads), so we just try the product.
 _GRID = {
-    "tile_n": [32, 64, 128, 256],
+    "tile_m": [16, 32, 64, 128],
+    "tile_n": [16, 32, 64, 128, 256],
     "block_k": [8, 16, 32, 64],
     "thread_m": [1, 2, 4, 8],
-    "thread_n": [4, 8, 16],
+    "thread_n": [2, 4, 8, 16],
     "threads": [64, 128, 256],
 }
 
@@ -57,9 +63,7 @@ def _valid(tile: dict, m: int, n: int, k: int) -> bool:
     tm, tn = tile["tile_m"], tile["tile_n"]
     tmm, tnn = tile["thread_m"], tile["thread_n"]
     th = tile["threads"]
-    if tm != m:
-        return False
-    if n % tn or k % tile["block_k"]:
+    if m % tm or n % tn or k % tile["block_k"]:
         return False
     if tm % tmm or tn % tnn:
         return False
@@ -98,7 +102,7 @@ def _bench_tile(m: int, n: int, k: int, tile: dict) -> float | None:
 
 
 def _default_tile() -> dict:
-    return {"tile_m": 32, "tile_n": 64, "block_k": 32, "thread_m": 2, "thread_n": 8, "threads": 128}
+    return {"tile_m": 32, "tile_n": 32, "block_k": 64, "thread_m": 2, "thread_n": 4, "threads": 128}
 
 
 def _ref_cublas_ms(m: int, n: int, k: int) -> float:
@@ -144,8 +148,7 @@ def sweep(m: int, n: int, k: int, top: int = 5) -> list[tuple[dict, float]]:
     keys = list(_GRID.keys())
     vals = [_GRID[k_] for k_ in keys]
     for combo in itertools.product(*vals):
-        tile = {"tile_m": m}
-        tile.update(dict(zip(keys, combo, strict=True)))
+        tile = dict(zip(keys, combo, strict=True))
         if not _valid(tile, m, n, k):
             continue
         t_ms = _bench_tile(m, n, k, tile)
@@ -192,15 +195,15 @@ def main():
         else:
             print(f"- cuBLAS: unavailable ({cu_err})")
         print(f"- scalar: {sc_ms * 1000:.1f} µs")
-        print(f"- current default (BN=64,BK=32,TM=2,TN=8,threads=128): {default_str} µs")
+        print(f"- current default {_default_tile()}: {default_str} µs")
         print()
-        print("| rank | BN | BK | TM | TN | threads | µs | speedup vs default |")
-        print("|---|---|---|---|---|---|---|---|")
+        print("| rank | BM | BN | BK | TM | TN | threads | µs | speedup vs default |")
+        print("|---|---|---|---|---|---|---|---|---|")
         top = sweep(m, n, k, top=args.top)
         for i, (tile, t_ms) in enumerate(top, 1):
             sp = default / t_ms if default else float("nan")
             print(
-                f"| {i} | {tile['tile_n']} | {tile['block_k']} | "
+                f"| {i} | {tile['tile_m']} | {tile['tile_n']} | {tile['block_k']} | "
                 f"{tile['thread_m']} | {tile['thread_n']} | {tile['threads']} "
                 f"| {t_ms * 1000:.1f} | {sp:.2f}× |"
             )
