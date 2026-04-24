@@ -18,6 +18,7 @@ from deplodock.compiler.ir.tile.ir import (
     CastExpr,
     Cond,
     Coop,
+    ElementwiseImpl,
     Expr,
     FreeLoop,
     FuncCallExpr,
@@ -64,6 +65,7 @@ __all__ = [
     "Param",
     "SmemBuf",
     "Kernel",
-    # Re-exported from ir.loop
+    # Re-exported from ir.loop / ir.elementwise
     "Axis",
+    "ElementwiseImpl",
 ]

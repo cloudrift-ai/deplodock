@@ -81,12 +81,12 @@ def test_accumfold_add_uses_compound_assign():
 
 
 def test_accumfold_max_uses_fmaxf():
-    out = render_kernel(_kernel(body=(AccumFold("a", "max", Var("x")),)))
+    out = render_kernel(_kernel(body=(AccumFold("a", "maximum", Var("x")),)))
     assert "a = fmaxf(a, x);" in out
 
 
 def test_accumfold_mul_uses_compound_assign():
-    out = render_kernel(_kernel(body=(AccumFold("a", "mul", Var("x")),)))
+    out = render_kernel(_kernel(body=(AccumFold("a", "multiply", Var("x")),)))
     assert "a *= x;" in out
 
 
@@ -127,7 +127,7 @@ def test_reduce_declares_acc_then_loops():
     body = (
         Reduce(
             axis=Axis("k", 32),
-            accs=(Acc("s", "add", Literal(0.0)),),
+            accs=(Acc("s", "add"),),
             body=(AccumFold("s", "add", Var("x")),),
         ),
     )
@@ -141,7 +141,7 @@ def test_reduce_with_explicit_extent():
     body = (
         Reduce(
             axis=Axis("k", 1024),
-            accs=(Acc("s", "add", Literal(0.0)),),
+            accs=(Acc("s", "add"),),
             body=(),
             extent=16,
         ),
@@ -281,7 +281,7 @@ def _rmsnorm_kernel() -> Kernel:
     )
     reduce_block = Reduce(
         axis=k_axis,
-        accs=(Acc("s", "add", Literal(0.0)),),
+        accs=(Acc("s", "add"),),
         body=(
             Let("x", Index("X", (Var("a0"), Var("a1")))),
             Let("sq", BinaryExpr("*", Var("x"), Var("x"))),
@@ -346,7 +346,7 @@ def _matmul_naive_kernel() -> Kernel:
                     body=(
                         Reduce(
                             axis=k,
-                            accs=(Acc("c", "add", Literal(0.0)),),
+                            accs=(Acc("c", "add"),),
                             body=(
                                 Let("a_v", Index("A", (Var("a0"), Var("a2")))),
                                 Let("b_v", Index("B", (Var("a2"), Var("a1")))),
@@ -388,7 +388,7 @@ def _matmul_smem_tiled_kernel() -> Kernel:
     )
     inner_reduce = Reduce(
         axis=Axis("k_inner", 16),
-        accs=(Acc("c", "add", Literal(0.0)),),
+        accs=(Acc("c", "add"),),
         body=(
             Let("a_v", Index("A_tile", (Var("m_local"), Var("k_inner")))),
             Let("b_v", Index("B_tile", (Var("k_inner"), Var("n_local")))),

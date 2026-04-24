@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
     Builtin,
@@ -106,13 +107,20 @@ class Store:
 class AccumFold:
     """Reduce step: ``target op= value;``.
 
-    Renders as ``+=`` / ``-=`` / ``*=`` for add / sub / mul, or as a
-    ``target = fmax(target, value)`` / ``fmin(...)`` rebinding for max / min.
+    ``op`` is an ``ElementwiseImpl`` (the same op-vocabulary used by Loop IR's
+    ``Accum``), giving us name / commutativity / identity in one object.
+    Renders as ``+=`` / ``*=`` for add/multiply (and ``sum``/``prod`` aliases),
+    or as a ``target = fmax(target, value)`` / ``fmin(...)`` rebinding for
+    maximum / minimum.
     """
 
     target: str
-    op: str
+    op: ElementwiseImpl
     value: Expr
+
+    def __post_init__(self) -> None:
+        if isinstance(self.op, str):
+            object.__setattr__(self, "op", ElementwiseImpl(self.op))
 
 
 @dataclass
@@ -157,14 +165,19 @@ class FreeLoop:
 class Acc:
     """One accumulator inside a ``Reduce.accs``.
 
-    ``op`` matches the ``ElementwiseImpl`` registry name (``"add"`` / ``"max"``
-    / ``"min"`` / ``"mul"``). ``init`` is the identity value (typically
-    derived from ``op``).
+    ``op`` is an ``ElementwiseImpl`` (Loop IR vocabulary: ``"add"`` /
+    ``"multiply"`` / ``"maximum"`` / ``"minimum"`` plus ``"sum"`` / ``"prod"``
+    aliases). The accumulator's initial value comes from ``op.identity`` —
+    no separate ``init`` field, since the identity is uniquely determined
+    by the combine.
     """
 
     name: str
-    op: str
-    init: Expr
+    op: ElementwiseImpl
+
+    def __post_init__(self) -> None:
+        if isinstance(self.op, str):
+            object.__setattr__(self, "op", ElementwiseImpl(self.op))
 
 
 @dataclass
@@ -311,8 +324,9 @@ __all__ = [
     "Param",
     "SmemBuf",
     "Kernel",
-    # Re-exported from ir.loop
+    # Re-exported from ir.loop / ir.elementwise
     "Axis",
+    "ElementwiseImpl",
 ]
 
 

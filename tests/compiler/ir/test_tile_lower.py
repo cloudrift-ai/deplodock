@@ -23,14 +23,12 @@ from deplodock.compiler.ir.loop import (
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile import (
-    Acc,
     AccumFold,
     BinaryExpr,
     FreeLoop,
     Index,
     Kernel,
     Let,
-    Literal,
     Param,
     Reduce,
     Store,
@@ -144,8 +142,10 @@ def test_row_sum_structure():
     assert isinstance(reduce_node, Reduce)
     assert reduce_node.axis.name == "a1"
     assert len(reduce_node.accs) == 1
-    # Loop IR normalizes Accum name → acc0.
-    assert reduce_node.accs[0] == Acc(name="acc0", op="add", init=Literal(0.0))
+    # Loop IR normalizes Accum name → acc0; op is the same ElementwiseImpl
+    # that came in on the source Accum (canonical "add" name from the fixture).
+    assert reduce_node.accs[0].name == "acc0"
+    assert reduce_node.accs[0].op.name == "add"
     assert isinstance(reduce_node.body[0], Let)
     assert isinstance(reduce_node.body[1], AccumFold)
     assert reduce_node.body[1].target == "acc0"
@@ -225,10 +225,8 @@ def test_softmax_like_structure():
     outer = k_kern.body[0]
     assert isinstance(outer, FreeLoop) and outer.axis.name == "a0"
     r_max, r_sum, out_loop = outer.body
-    assert isinstance(r_max, Reduce) and r_max.accs[0].op == "max"
-    # max identity: ElementwiseImpl might not provide -inf — _REDUCE_IDENTITY is the fallback.
-    # Lowering casts to float; render emits as `<value>.0f`.
-    assert isinstance(r_sum, Reduce) and r_sum.accs[0].op == "add"
+    assert isinstance(r_max, Reduce) and r_max.accs[0].op.name == "maximum"
+    assert isinstance(r_sum, Reduce) and r_sum.accs[0].op.name == "add"
     assert isinstance(out_loop, FreeLoop) and out_loop.axis.name == "a2"
 
 

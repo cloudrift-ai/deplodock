@@ -226,11 +226,12 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
 
     if isinstance(stmt, AccumFold):
         v = _render_expr(stmt.value, ctx)
-        if stmt.op == "max":
+        op_name = stmt.op.name
+        if op_name == "maximum":
             return [f"{pad}{stmt.target} = fmaxf({stmt.target}, {v});"]
-        if stmt.op == "min":
+        if op_name == "minimum":
             return [f"{pad}{stmt.target} = fminf({stmt.target}, {v});"]
-        op = {"add": "+=", "sub": "-=", "mul": "*="}.get(stmt.op, "+=")
+        op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
         return [f"{pad}{stmt.target} {op} {v};"]
 
     if isinstance(stmt, Sync):
@@ -276,7 +277,10 @@ def _render_reduce(stmt: Reduce, ctx: _Ctx) -> list[str]:
     pad = _pad(ctx.indent)
     out: list[str] = []
     for acc in stmt.accs:
-        out.append(f"{pad}float {acc.name} = {_render_expr(acc.init, ctx)};")
+        identity = acc.op.identity
+        if identity is None:
+            raise ValueError(f"Acc {acc.name!r} op {acc.op.name!r} has no identity (not a valid reduce combine)")
+        out.append(f"{pad}float {acc.name} = {_render_expr(Literal(float(identity)), ctx)};")
     extent = stmt.extent if stmt.extent is not None else int(stmt.axis.extent)
     out.extend(_render_for(stmt.axis.name, 0, extent, step=None, body=stmt.body, ctx=ctx))
     return out
