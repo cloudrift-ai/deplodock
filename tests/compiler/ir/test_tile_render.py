@@ -17,10 +17,10 @@ from deplodock.compiler.ir.tile import (
     Builtin,
     Cond,
     Coop,
-    FreeLoop,
     Kernel,
     Literal,
     Load,
+    Loop,
     Param,
     Reduce,
     SmemBuf,
@@ -112,7 +112,7 @@ def test_cond_if_else():
 
 
 def test_freeloop_renders_for():
-    body = (FreeLoop(axis=Axis("k", 32), body=(Sync(),)),)
+    body = (Loop(axis=Axis("k", 32), body=(Sync(),)),)
     assert "for (int k = 0; k < 32; k++) {" in render_kernel(_kernel(body=body))
 
 
@@ -216,10 +216,10 @@ def test_no_thread_axes_no_guard():
 def _pointwise_add_kernel() -> Kernel:
     i, j = Axis("a0", 4), Axis("a1", 8)
     body = (
-        FreeLoop(
+        Loop(
             axis=i,
             body=(
-                FreeLoop(
+                Loop(
                     axis=j,
                     body=(
                         Load("a_v", input="A", index=(Var("a0"), Var("a1"))),
@@ -254,10 +254,10 @@ def test_render_pointwise_add_kernel():
 def _matmul_naive_kernel() -> Kernel:
     m, n, k = Axis("a0", 64), Axis("a1", 64), Axis("a2", 32)
     body = (
-        FreeLoop(
+        Loop(
             axis=m,
             body=(
-                FreeLoop(
+                Loop(
                     axis=n,
                     body=(
                         Reduce(

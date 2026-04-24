@@ -33,11 +33,10 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Select, Write
+from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
 from deplodock.compiler.ir.tile.ir import (
     Coop,
     Expr,
-    FreeLoop,
     Kernel,
     Reduce,
     SmemBuf,
@@ -236,7 +235,9 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
     if isinstance(stmt, Cond):
         return _render_cond(stmt, ctx)
 
-    if isinstance(stmt, FreeLoop):
+    if isinstance(stmt, Loop):
+        # Free iteration — Loop IR's Loop, used directly here. A future
+        # Enclosure will replace this for axes bound to thread/block coords.
         return _render_for(stmt.axis.name, 0, int(stmt.axis.extent), step=None, body=stmt.body, ctx=ctx)
 
     if isinstance(stmt, Reduce):
