@@ -11,14 +11,16 @@ Supported shapes (after fusion + normalization):
 1. **Pointwise** — body has no Accum. After zero or more outer free Loops we
    reach a leaf Write. Live axes = ∅; |live|=0 → no smem, no syncs.
 
-2. **Per-row reduction (RMSNorm / softmax)** — outer free Loop(s) wrap a
-   sequence of [reduce Loop+, interlude assigns, free output Loop with
-   Write]. Live axes = the outer free axes; |live|=1 → line block.
-
-3. **Matmul** (deferred to a follow-up) — outer free Loops wrap a single
-   reduce Loop with epilogue assigns and Write at the same level. Live
-   axes = {m, n}; |live|=2. v1 of this classifier returns ``None`` for
-   matmul — the existing template handles it.
+2. **Per-row reduction** — outer free Loop(s) wrap a sequence of
+   [reduce Loop+, interlude assigns, *optional* free output Loop, Write].
+   Two sub-shapes:
+   - With output Loop (RMSNorm / softmax): the output axis is iterated
+     serially inside each thread; Write lives in the inner Loop.
+     ``output_axis`` is set; live axes = outer free axes.
+   - Without output Loop (reduce-to-scalar per row, matmul without
+     epilogue): Write sits at the reduce-Loop level. ``output_axis``
+     is ``None``; live axes = all free axes (each thread owns one
+     output element and walks the reduction serially).
 
 Live axes per Accum must agree (softmax's two reductions both have
 live={i}); we reject when they disagree.
@@ -71,8 +73,9 @@ class UnifiedSig:
     free_axes: tuple[Axis, ...]
     live_axes: tuple[Axis, ...]
     top_level: tuple[Stmt, ...]  # stmts at LoopOp.body root, before the outer free Loop
+    pre_reduce: tuple[Stmt, ...]  # per-row stmts hoisted above the reduce Loop (e.g. bias Load)
     reduce_blocks: tuple[ReduceBlock, ...]
-    interlude: tuple[Stmt, ...]  # per-row stmts between last reduce and output Loop
+    interlude: tuple[Stmt, ...]  # per-row stmts between last reduce and output Loop / Write
     output_axis: Axis | None  # axis of the output free Loop (per_row_reduce); None for pointwise
     output_chain: tuple[Stmt, ...]  # stmts at the output level, ending with Write
     write: Write
@@ -267,6 +270,7 @@ def _classify_leaf(
             free_axes=tuple(free_axes),
             live_axes=(),
             top_level=top_level,
+            pre_reduce=(),
             reduce_blocks=(),
             interlude=(),
             output_axis=None,
@@ -274,29 +278,29 @@ def _classify_leaf(
             write=write,
         )
 
-    # --- Per-row-reduce: reduce Loops + interlude + output free Loop + Write ---
+    # --- Per-row-reduce: pre_reduce + reduce Loops + interlude + (output Loop | Write) ---
+    pre_reduce: list[Stmt] = []
     reduce_blocks: list[ReduceBlock] = []
     interlude: list[Stmt] = []
     output_axis: Axis | None = None
     output_chain: tuple[Stmt, ...] | None = None
     write: Write | None = None
     seen_output_loop = False
+    direct_writes: list[Write] = []
+    seen_reduce = False
 
     for s in leaf:
         if isinstance(s, Loop):
-            if seen_output_loop:
-                # Stmts after the output Loop are not allowed in this shape.
+            if seen_output_loop or direct_writes:
                 return None
             if _is_reduce_loop(s):
-                if interlude:
-                    # Reduce Loop after an interlude Assign — not supported.
-                    return None
                 blk = _parse_reduce_block(s)
                 if blk is None:
                     return None
                 reduce_blocks.append(blk)
+                seen_reduce = True
             else:
-                # Free output Loop. Must contain Loads/Assigns/Selects + a Write.
+                # Free output Loop: Loads/Assigns/Selects + a single trailing Write.
                 if not all(isinstance(x, (Load, Assign, Select, Write)) for x in s.body):
                     return None
                 writes = [x for x in s.body if isinstance(x, Write)]
@@ -307,34 +311,50 @@ def _classify_leaf(
                 write = writes[0]
                 seen_output_loop = True
         elif isinstance(s, (Load, Assign, Select)):
-            if not seen_output_loop:
+            if seen_output_loop or direct_writes:
+                return None
+            if seen_reduce:
                 interlude.append(s)
             else:
-                # Stmts after the output Loop.
-                return None
+                pre_reduce.append(s)
         elif isinstance(s, Write):
-            # A Write at the same level as reduce Loops (matmul-like).
-            # Defer to follow-up: |live|=2 path not implemented in v1.
-            return None
+            if seen_output_loop:
+                return None
+            direct_writes.append(s)
         else:
             return None
 
-    if not reduce_blocks or output_axis is None or write is None or output_chain is None:
+    if not reduce_blocks:
         return None
+    if seen_output_loop == bool(direct_writes):
+        # Need exactly one of: output Loop, or one direct Write.
+        if not direct_writes or len(direct_writes) != 1:
+            return None
+
+    if direct_writes:
+        # Matmul-like / scalar-per-row shape: every free axis stays live; each
+        # thread owns one (i, j, ...) output element and runs the reduction serially.
+        write = direct_writes[0]
+        output_chain = (write,)
+        full_free_axes = tuple(free_axes)
+        all_free_set = free_names
+    else:
+        assert output_axis is not None and write is not None and output_chain is not None
+        full_free_axes = tuple(free_axes) + (output_axis,)
+        all_free_set = free_names | {output_axis.name}
 
     # Compute live axes and verify all reduce blocks agree.
-    all_free_set = free_names | {output_axis.name}  # output_axis is also free
     live_sets = [_live_axes_of_block(b, all_free_set) for b in reduce_blocks]
     common_live = live_sets[0]
     for ls in live_sets[1:]:
         if ls != common_live:
             return None
 
-    # |live| ≤ 1 in v1 (per_row_reduce only).
-    if len(common_live) > 1:
+    # When there's no output Loop, every free axis must be live (otherwise some
+    # output element would not be uniquely owned by a thread).
+    if direct_writes and common_live != all_free_set:
         return None
 
-    full_free_axes = tuple(free_axes) + (output_axis,)
     live_axes = tuple(a for a in full_free_axes if a.name in common_live)
 
     return UnifiedSig(
@@ -342,6 +362,7 @@ def _classify_leaf(
         free_axes=full_free_axes,
         live_axes=live_axes,
         top_level=top_level,
+        pre_reduce=tuple(pre_reduce),
         reduce_blocks=tuple(reduce_blocks),
         interlude=tuple(interlude),
         output_axis=output_axis,
