@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from deplodock.compiler.ir.base import Op, _keepdim_axis
 from deplodock.compiler.ir.expr import ExprOp, coerce_expr_op
 
@@ -129,7 +131,6 @@ class ReduceOp(Op):
         return _keepdim_axis(input_shapes[0], self.axis)
 
     def forward(self, *inputs):
-        import numpy as np
 
         a = inputs[0]
         name = self.op.name
@@ -166,7 +167,6 @@ class ScanOp(Op):
         return tuple(input_shapes[0])  # scan preserves shape
 
     def forward(self, *inputs):
-        import numpy as np
 
         a = inputs[0]
         name = self.op.name
@@ -196,7 +196,6 @@ class GatherOp(Op):
         return tuple(input_shapes[0])
 
     def forward(self, *inputs):
-        import numpy as np
 
         data, indices = inputs[0], inputs[1].astype(np.intp)
         return np.take_along_axis(data, indices, axis=self.axis)
@@ -213,7 +212,6 @@ class ScatterOp(Op):
         return tuple(input_shapes[0])  # scatter preserves the destination shape
 
     def forward(self, *inputs):
-        import numpy as np
 
         dest, indices, values = inputs[0].copy(), inputs[1].astype(np.intp), inputs[2]
         if self.reduce_fn == "sum":
@@ -264,7 +262,6 @@ class IndexMapOp(Op):
         return tuple(self.out_shape)
 
     def forward(self, *inputs):
-        import numpy as np
 
         shape = tuple(int(d) for d in self.out_shape)
         output = np.empty(shape, dtype=inputs[0].dtype if inputs else np.float32)

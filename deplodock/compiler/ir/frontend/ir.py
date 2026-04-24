@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from deplodock.compiler.ir.base import Op, _keepdim_axis
 
 # ---------------------------------------------------------------------------
@@ -49,7 +51,6 @@ class TransposeOp(Op):
         return tuple(in_shape[a] for a in self.axes)
 
     def forward(self, *inputs):
-        import numpy as np
 
         a = inputs[0]
         ndim = a.ndim
@@ -80,7 +81,6 @@ class ReshapeOp(Op):
         return tuple(resolved)
 
     def forward(self, *inputs):
-        import numpy as np
 
         return np.reshape(inputs[0], self.shape)
 
@@ -136,7 +136,6 @@ class CatOp(Op):
         return tuple(out)
 
     def forward(self, *inputs):
-        import numpy as np
 
         arrays = []
         dim = -1
@@ -161,7 +160,6 @@ class UnsqueezeOp(Op):
         return tuple(in_shape)
 
     def forward(self, *inputs):
-        import numpy as np
 
         return np.expand_dims(inputs[0], axis=self.dim)
 
@@ -223,7 +221,6 @@ class SdpaOp(Op):
         return tuple(q_shape[:-1]) + (v_shape[-1],)
 
     def forward(self, *inputs):
-        import numpy as np
 
         q, k, v = inputs[0], inputs[1], inputs[2]
         # Align ndims: pad K/V with leading 1s to match Q's rank.
@@ -263,6 +260,5 @@ class MeanOp(Op):
         return _keepdim_axis(input_shapes[0], self.axis)
 
     def forward(self, *inputs):
-        import numpy as np
 
         return np.mean(inputs[0], axis=self.axis)

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 
 @dataclass
 class Op:
@@ -50,8 +52,6 @@ class ConstantOp(Op):
         raise NotImplementedError("ConstantOp has no inputs; use node.output.shape directly")
 
     def forward(self, *inputs):
-        import numpy as np
-
         if self.value is not None:
             return np.array([self.value], dtype=np.float32)
         raise NotImplementedError("ConstantOp with value=None must be supplied by the executor")
