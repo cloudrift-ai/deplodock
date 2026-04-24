@@ -23,8 +23,9 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
 from deplodock.compiler.ir.kernel.ir import ForLoop, GpuKernel, IfStmt, Stmt, VarDecl
-from deplodock.compiler.ir.loop import Axis
-from deplodock.compiler.pipeline.passes.lowering.kernel._classify import ReduceBlock, UnifiedSig
+from deplodock.compiler.ir.loop import Accum, Axis
+from deplodock.compiler.ir.loop import Loop as IrLoop
+from deplodock.compiler.pipeline.passes.lowering.kernel._classify import ReduceBlock, UnifiedSig, _parse_reduce_block
 from deplodock.compiler.pipeline.passes.lowering.kernel._common import (
     BLOCK,
     Ctx,
@@ -127,18 +128,37 @@ def _emit_reduce_block(rb: ReduceBlock, ctx: Ctx, block_idx: int) -> list[Stmt]:
 
 
 def _emit_output_loop(axis: Axis, chain: tuple, ctx: Ctx) -> Stmt:
-    """``for (out = 0; out < extent; ++out) { chain... }`` — chain ends with Write."""
+    """``for (out = 0; out < extent; ++out) { chain... }`` — chain ends with Write.
+
+    Chain stmts may include nested reduce Loops (flash-style fused matmul
+    in the output pass); those become per-iteration inner reductions.
+    """
     loop_name = f"o{ctx.loop_seq[0]}"
     ctx.loop_seq[0] += 1
     saved_env = dict(ctx.env)
     saved_values = dict(ctx.values)
     ctx.env[axis.name] = Var(loop_name)
-    inner: list[Stmt] = []
-    for s in chain:
-        emit_stmt(s, ctx, inner)
+    inner = _emit_chain(chain, ctx)
     ctx.env = saved_env
     ctx.values = saved_values
     return ForLoop(var=loop_name, start=Literal(0, "int"), end=Literal(int(axis.extent), "int"), body=inner)
+
+
+def _emit_chain(stmts: tuple, ctx: Ctx) -> list[Stmt]:
+    """Walk a chain that may contain leaf stmts and nested reduce Loops.
+
+    Per-iteration inner reductions (SDPA's matmul-after-softmax) get a
+    fresh accumulator and a serial ``for k`` body.
+    """
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, IrLoop) and any(isinstance(x, Accum) for x in s.body):
+            blk = _parse_reduce_block(s)
+            assert blk is not None, "classifier should have rejected unparseable reduce Loop"
+            out.extend(_emit_reduce_block(blk, ctx, ctx.loop_seq[0]))
+        else:
+            emit_stmt(s, ctx, out)
+    return out
 
 
 def _wrap_with_tid_guard(n_threads: int, body: list[Stmt]) -> list[Stmt]:
