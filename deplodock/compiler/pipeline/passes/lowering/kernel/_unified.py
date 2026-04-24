@@ -22,9 +22,9 @@ thread. K is serial per thread, so no cross-thread combine is needed
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Expr, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
 from deplodock.compiler.ir.kernel.ir import ForLoop, GpuKernel, IfStmt, Stmt, VarDecl
-from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp
+from deplodock.compiler.ir.loop import Accum, Axis, Loop, LoopOp
 from deplodock.compiler.ir.loop import Stmt as LoopStmt
 from deplodock.compiler.pipeline.passes.lowering.kernel._common import (
     BLOCK,
@@ -47,12 +47,8 @@ def emit_unified(node: Node, kernel_name: str, graph: Graph) -> tuple[GpuKernel,
     block = (BLOCK, 1, 1)
     ctx = Ctx(graph=graph, node=node, env=axis_env_for_flat(live_axes, Var("tid")))
 
-    body: list[Stmt] = [emit_stmt_with_loop(s, ctx) for s in top_level]
-    body = _flatten(body)
-    inner = emit_body(leaf_body, ctx)
-
     stmts: list[Stmt] = [
-        *body,
+        *emit_body(top_level, ctx),
         VarDecl(
             dtype="long long",
             name="tid",
@@ -62,7 +58,7 @@ def emit_unified(node: Node, kernel_name: str, graph: Graph) -> tuple[GpuKernel,
                 Builtin("thread_idx.x"),
             ),
         ),
-        IfStmt(cond=BinaryExpr("<", Var("tid"), Literal(n_threads, "int")), body=inner),
+        IfStmt(cond=BinaryExpr("<", Var("tid"), Literal(n_threads, "int")), body=emit_body(leaf_body, ctx)),
     ]
     return GpuKernel(name=kernel_name, params=params, body=stmts, block_size=block), arg_order, grid, block
 
@@ -89,7 +85,6 @@ def _split_outer(body: tuple[LoopStmt, ...]) -> tuple[tuple[LoopStmt, ...], tupl
         top.append(rest[0])
         rest = rest[1:]
     if any(isinstance(s, Loop) for s in rest[1:]):
-        # multiple top-level Loops — leaf is the original body
         return tuple(top), rest, ()
 
     cur = rest
@@ -101,40 +96,26 @@ def _split_outer(body: tuple[LoopStmt, ...]) -> tuple[tuple[LoopStmt, ...], tupl
         only = loops[0]
         if any(isinstance(x, Accum) for x in only.body):
             return tuple(top), cur, tuple(live)
-        if any(isinstance(s, (Accum,)) for s in cur):
-            return tuple(top), cur, tuple(live)
-        # Single non-reduce Loop, no Accum at this level — descend.
         live.append(only.axis)
         cur = only.body
 
 
 # ---------------------------------------------------------------------------
-# Recursive body walk
+# Recursive body walk — every helper returns list[Stmt]
 # ---------------------------------------------------------------------------
 
 
 def emit_body(stmts: tuple[LoopStmt, ...], ctx: Ctx) -> list[Stmt]:
     out: list[Stmt] = []
     for s in stmts:
-        emitted = emit_stmt_with_loop(s, ctx)
-        if isinstance(emitted, list):
-            out.extend(emitted)
+        if isinstance(s, Loop):
+            if any(isinstance(x, Accum) for x in s.body):
+                out.extend(_emit_reduce_loop(s, ctx))
+            else:
+                out.extend(_emit_free_loop(s, ctx))
         else:
-            out.append(emitted)
+            emit_stmt(s, ctx, out)
     return out
-
-
-def emit_stmt_with_loop(s: LoopStmt, ctx: Ctx) -> Stmt | list[Stmt]:
-    """Dispatch one Loop-IR stmt. Loops route to reduce / free handlers;
-    everything else is rendered via ``_common.emit_stmt`` (which expects
-    an ``out`` list, so we adapt by buffering)."""
-    if isinstance(s, Loop):
-        if any(isinstance(x, Accum) for x in s.body):
-            return _emit_reduce_loop(s, ctx)
-        return _emit_free_loop(s, ctx)
-    buf: list[Stmt] = []
-    emit_stmt(s, ctx, buf)
-    return buf
 
 
 def _emit_reduce_loop(loop: Loop, ctx: Ctx) -> list[Stmt]:
@@ -144,11 +125,10 @@ def _emit_reduce_loop(loop: Loop, ctx: Ctx) -> list[Stmt]:
     its own register. The accumulator binding survives in ``ctx.values``
     after this function returns so downstream stmts can read it.
     """
-    accums = [s for s in loop.body if isinstance(s, Accum)]
     decls: list[Stmt] = []
-    for a in accums:
+    for a in (s for s in loop.body if isinstance(s, Accum)):
         if a.name in ctx.values:
-            continue  # multiple Accums targeting the same name (e.g. softmax draft)
+            continue
         acc_var = ctx.fresh()
         identity = a.op.identity if a.op.identity is not None else 0.0
         decls.append(VarDecl(dtype="float", name=acc_var, init=Literal(identity, "float")))
@@ -161,10 +141,7 @@ def _emit_reduce_loop(loop: Loop, ctx: Ctx) -> list[Stmt]:
     inner = emit_body(loop.body, ctx)
     ctx.env = saved_env
 
-    return [
-        *decls,
-        ForLoop(var=k_name, start=Literal(0, "int"), end=Literal(int(loop.axis.extent), "int"), body=inner),
-    ]
+    return [*decls, ForLoop(var=k_name, start=Literal(0, "int"), end=Literal(int(loop.axis.extent), "int"), body=inner)]
 
 
 def _emit_free_loop(loop: Loop, ctx: Ctx) -> list[Stmt]:
@@ -178,25 +155,6 @@ def _emit_free_loop(loop: Loop, ctx: Ctx) -> list[Stmt]:
     inner = emit_body(loop.body, ctx)
     ctx.env = saved_env
     return [ForLoop(var=name, start=Literal(0, "int"), end=Literal(int(loop.axis.extent), "int"), body=inner)]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _flatten(items: list[Stmt | list[Stmt]]) -> list[Stmt]:
-    out: list[Stmt] = []
-    for x in items:
-        if isinstance(x, list):
-            out.extend(x)
-        else:
-            out.append(x)
-    return out
-
-
-# Silence unused-import warnings for symbols re-exported via ctx.
-_ = (Expr, Load)
 
 
 __all__ = ["emit_unified"]
