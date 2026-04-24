@@ -206,9 +206,10 @@ class FuncCallExpr(_ExprOps):
     args: list[Expr]
 
     def eval(self, env: dict[str, object]) -> object:
-        op = _EXPR_OP_REGISTRY.get(self.name)
-        if op is None:
-            raise NotImplementedError(f"FuncCallExpr.eval: unknown intrinsic {self.name!r}")
+        try:
+            op = coerce_expr_op(self.name)
+        except ValueError as e:
+            raise NotImplementedError(f"FuncCallExpr.eval: unknown intrinsic {self.name!r}") from e
         return op.fn(*(a.eval(env) for a in self.args))
 
 
@@ -376,33 +377,63 @@ def free_vars(expr: Expr) -> frozenset[str]:
 # ExprOp — hierarchy for elementwise / reduction ops
 # ---------------------------------------------------------------------------
 #
-# ``ExprOp`` is the base. ``UnaryOp`` / ``BinaryOp`` subclasses fix
-# ``arity`` at the class level; the op's ``name``, ``commutative``, and
-# ``identity`` (reducer neutral) live on the instance. Canonical instances
-# are singletons stored in ``_EXPR_OP_REGISTRY`` and looked up by name.
-#
-# Each op carries its numpy callable directly — no resolve_fn indirection.
+# ``ExprOp`` is the base. ``UnaryOp`` / ``BinaryOp`` subclasses fix the
+# ``arity``. The op's ``name`` resolves to its numpy callable at
+# construction — no registry, no singletons; ``coerce_expr_op(name)``
+# just tries ``BinaryOp`` then ``UnaryOp``, with numpy's ufunc ``nin``
+# picking the right arity. ``commutative`` and ``identity`` are computed
+# properties that read from small class-level tables keyed by name.
 
 
 class ExprOp:
     """Base class for named scalar ops (elementwise or reducer).
 
-    Subclasses (``UnaryOp`` / ``BinaryOp``) fix the ``arity``. Instances
-    carry ``name`` (used for codegen + serialization), ``fn`` (the numpy
-    callable that implements the op — pre-bound at registration so no
-    runtime lookup is needed), and reducer metadata (``commutative``,
-    ``identity``; ``None`` when the op isn't a valid reducer). Equality
-    compares by ``(type, name)`` so singletons round-trip through sets /
-    dicts without surprises.
+    Subclasses (``UnaryOp`` / ``BinaryOp``) fix the ``arity``. Construction
+    resolves the numpy callable from the op's ``name`` — either via
+    ``_NAME_TO_FN`` (for non-numpy intrinsics like ``rsqrt`` / ``relu``
+    and fused frontend stubs like ``rms_norm``) or ``getattr(np, name)``
+    for numpy-aligned names. Unknown names raise. ``commutative`` and
+    ``identity`` are derived from class-level tables keyed by name —
+    only ops in the tables get those properties set; everything else
+    defaults to ``False`` / ``None``.
     """
 
     arity: int = 1
 
-    def __init__(self, name: str, fn, commutative: bool = False, identity: float | None = None) -> None:
+    # Commutative ops — binary combines where ``op(a, b) == op(b, a)``.
+    _COMMUTATIVE: frozenset[str] = frozenset({"add", "multiply", "maximum", "minimum", "amax", "sum", "prod"})
+    # Reducer neutral elements — only meaningful when the op is used as
+    # an ``Accum`` combine or a ``ReduceOp``.
+    _IDENTITY: dict[str, float] = {
+        "add": 0.0,
+        "sum": 0.0,
+        "multiply": 1.0,
+        "prod": 1.0,
+        "maximum": -1e30,
+        "amax": -1e30,
+        "minimum": 1e30,
+    }
+
+    def __init__(self, name: str) -> None:
+        fn = _NAME_TO_FN.get(name)
+        if fn is None:
+            fn = getattr(np, name, None)
+        if fn is None:
+            raise ValueError(f"unknown ExprOp name: {name!r} (not in numpy or ir.expr._NAME_TO_FN)")
+        # Validate arity against numpy's ufunc metadata when available.
+        nin = getattr(fn, "nin", None)
+        if nin is not None and nin != self.arity:
+            raise ValueError(f"arity mismatch for {name!r}: {type(self).__name__} expects {self.arity}, numpy callable has nin={nin}")
         self.name = name
         self.fn = fn
-        self.commutative = commutative
-        self.identity = identity
+
+    @property
+    def commutative(self) -> bool:
+        return self.name in self._COMMUTATIVE
+
+    @property
+    def identity(self) -> float | None:
+        return self._IDENTITY.get(self.name)
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, ExprOp) and type(self) is type(other) and self.name == other.name
@@ -422,78 +453,47 @@ class BinaryOp(ExprOp):
     arity = 2
 
 
-_EXPR_OP_REGISTRY: dict[str, ExprOp] = {}
+def _unimpl(name: str):
+    """Stub callable for fused frontend ops (decomposed before eval)."""
+
+    def _raise(*_args):
+        raise NotImplementedError(f"ExprOp({name!r}) has no numpy implementation")
+
+    return _raise
 
 
-def _reg(op: ExprOp) -> ExprOp:
-    _EXPR_OP_REGISTRY[op.name] = op
-    return op
-
-
-# Canonical op instances. Each carries its numpy callable directly — no
-# ``resolve_fn`` indirection. The four ops with no numpy equivalent
-# (``rsqrt`` / ``relu`` / ``sigmoid`` / ``silu``) get a lambda; everything
-# else pulls from numpy.
-ADD = _reg(BinaryOp("add", np.add, commutative=True, identity=0.0))
-SUBTRACT = _reg(BinaryOp("subtract", np.subtract))
-MULTIPLY = _reg(BinaryOp("multiply", np.multiply, commutative=True, identity=1.0))
-DIVIDE = _reg(BinaryOp("divide", np.divide))
-MOD = _reg(BinaryOp("mod", np.mod))
-MAXIMUM = _reg(BinaryOp("maximum", np.maximum, commutative=True, identity=-1e30))
-MINIMUM = _reg(BinaryOp("minimum", np.minimum, commutative=True, identity=1e30))
-# Torch-level reduction name (``amax``) kept distinct from ``maximum`` so
-# the traced graph preserves the source op's spelling; semantics match.
-AMAX = _reg(BinaryOp("amax", np.maximum, commutative=True, identity=-1e30))
-POW = _reg(BinaryOp("pow", np.power))
-# Reduction-only names (same shape as add / multiply but distinct spellings
-# because tensor-IR ``ReduceOp`` uses ``sum`` / ``prod``).
-SUM = _reg(BinaryOp("sum", np.add, commutative=True, identity=0.0))
-PROD = _reg(BinaryOp("prod", np.multiply, commutative=True, identity=1.0))
-# Unary math — numpy-backed
-NEGATIVE = _reg(UnaryOp("negative", np.negative))
-EXP = _reg(UnaryOp("exp", np.exp))
-RECIPROCAL = _reg(UnaryOp("reciprocal", np.reciprocal))
-TANH = _reg(UnaryOp("tanh", np.tanh))
-ABS = _reg(UnaryOp("abs", np.abs))
-FABS = _reg(UnaryOp("fabs", np.fabs))
-SQRT = _reg(UnaryOp("sqrt", np.sqrt))
-LOG = _reg(UnaryOp("log", np.log))
-COPY = _reg(UnaryOp("copy", lambda x: x))
-# Unary math — no numpy equivalent, so an inline lambda
-RSQRT = _reg(UnaryOp("rsqrt", lambda x: 1.0 / np.sqrt(x)))
-RELU = _reg(UnaryOp("relu", lambda x: np.maximum(0.0, x)))
-SIGMOID = _reg(UnaryOp("sigmoid", lambda x: 1.0 / (1.0 + np.exp(-x))))
-SILU = _reg(UnaryOp("silu", lambda x: x / (1.0 + np.exp(-x))))
-
-
-def get_expr_op(name: str) -> ExprOp:
-    """Look up the canonical ``ExprOp`` singleton for ``name``; raise on unknown."""
-    op = _EXPR_OP_REGISTRY.get(name)
-    if op is None:
-        raise ValueError(f"unknown ExprOp name: {name!r}")
-    return op
+# Names whose callable isn't a plain ``getattr(np, name)``:
+# - Non-numpy intrinsics (rsqrt / relu / sigmoid / silu, plus copy).
+# - Fused frontend ops (rms_norm / softmax) — stubs; they're decomposed
+#   before any eval or codegen touches ``.fn``, but the name must still
+#   resolve so ``ExprOp(name)`` doesn't reject them.
+# Every other op name matches a numpy attribute — ``ExprOp.__init__``
+# falls through to ``getattr(np, name)`` for them.
+_NAME_TO_FN: dict[str, object] = {
+    "rsqrt": lambda x: 1.0 / np.sqrt(x),
+    "relu": lambda x: np.maximum(0.0, x),
+    "sigmoid": lambda x: 1.0 / (1.0 + np.exp(-x)),
+    "silu": lambda x: x / (1.0 + np.exp(-x)),
+    "copy": lambda x: x,
+    "rms_norm": _unimpl("rms_norm"),
+    "softmax": _unimpl("softmax"),
+}
 
 
 def coerce_expr_op(v: str | ExprOp) -> ExprOp:
     """Accept a string name or ``ExprOp`` instance; return an ``ExprOp``.
 
-    Used by ``ElementwiseOp`` / ``ReduceOp`` / ``Accum`` in ``__post_init__``
-    to keep string-based construction working while storing structured
-    metadata on the field. Names not in the registry mint a generic
-    ``UnaryOp(name)`` — the fused frontend ops (``rms_norm`` / ``softmax``
-    / …) pass through Tensor IR under such names and are decomposed
-    before any eval/codegen cares about arity or identity.
+    Tries ``BinaryOp(name)`` first, falls back to ``UnaryOp(name)``.
+    numpy ufunc ``nin`` metadata makes the attempt self-selecting — binary
+    ops like ``add`` (nin=2) pass the binary check, unary ops like ``exp``
+    (nin=1) raise in ``BinaryOp.__init__`` and land in ``UnaryOp``. For
+    stub callables without ``nin`` (the fused frontend names), binary wins
+    by default; arity is informational only since those never evaluate.
     """
     if isinstance(v, ExprOp):
         return v
-    op = _EXPR_OP_REGISTRY.get(v)
-    if op is not None:
-        return op
-
-    # Unknown name — fused frontend ops like ``rms_norm`` / ``softmax`` pass
-    # through Tensor IR under such names and are decomposed before any eval
-    # or codegen cares. Give them a stub callable that raises if invoked.
-    def _unimpl(*_args, _name=v):
-        raise NotImplementedError(f"ExprOp({_name!r}) has no numpy implementation")
-
-    return UnaryOp(v, _unimpl)
+    try:
+        return BinaryOp(v)
+    except ValueError:
+        pass
+    return UnaryOp(v)
