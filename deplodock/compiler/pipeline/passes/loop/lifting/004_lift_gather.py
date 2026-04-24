@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import Cast, Var
+from deplodock.compiler.ir.expr import CastExpr, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import GatherOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
@@ -39,7 +39,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     idx_index = tuple(Var(a.name) for a in axes)
     # Load 1: data — every dim is a free axis except ``axis``, which reads the
     # loaded idx value cast to int (referenced by the idx Load's SSA name).
-    data_index = tuple(Cast("int", Var("idx")) if i == axis else Var(axes[i].name) for i in range(ndim))
+    data_index = tuple(CastExpr("int", Var("idx")) if i == axis else Var(axes[i].name) for i in range(ndim))
 
     inner: tuple[Stmt, ...] = (
         Load(name="idx", source=0, index=idx_index),

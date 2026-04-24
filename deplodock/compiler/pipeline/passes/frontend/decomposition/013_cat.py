@@ -59,7 +59,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         select=placeholder(norm_dim).lt(Literal(split, "int")),
     )
     # Source B: coord_map[norm_dim] = out_coord_dim - split, identity elsewhere.
-    # No select on B — it's the default branch in the Ternary chain.
+    # No select on B — it's the default branch in the TernaryExpr chain.
     coord_map_b = []
     for i in range(ndim):
         if i == norm_dim:

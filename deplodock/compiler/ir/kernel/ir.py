@@ -6,7 +6,7 @@ emitted as CUDA, HIP, or any C-like GPU language by a matching codegen
 printer (see ``ir/cuda/emit.py``).
 
 Builds on the shared expression AST from ``ir.expr``; adds GPU-specific
-expression nodes (``ArrayAccess``, ``Cast``, ``FieldAccess``, ``VectorLoad``)
+expression nodes (``ArrayAccess``, ``CastExpr``, ``FieldAccess``, ``VectorLoad``)
 and a hierarchy of statement types (``VarDecl``, ``Assign``, ``ForLoop``,
 ``IfStmt``, ``SyncThreads``, ``ArrayDecl``, ``PragmaUnroll``, ``RawCode``).
 
@@ -22,13 +22,13 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.expr import (
-    BinOp,
+    BinaryExpr,
     Builtin,
-    Cast,
+    CastExpr,
     Expr,
-    FuncCall,
+    FuncCallExpr,
     Literal,
-    Ternary,
+    TernaryExpr,
     Var,
     _ExprOps,
 )
@@ -40,15 +40,15 @@ __all__ = [
     # Shared expression types (re-exported)
     "Var",
     "Literal",
-    "BinOp",
+    "BinaryExpr",
     "Builtin",
-    "FuncCall",
-    "Ternary",
+    "FuncCallExpr",
+    "TernaryExpr",
     "Expr",
     "_ExprOps",
     # GPU-specific expression types
     "ArrayAccess",
-    "Cast",
+    "CastExpr",
     "FieldAccess",
     "VectorLoad",
     "GpuExpr",
@@ -105,7 +105,7 @@ class VectorLoad(_ExprOps):
     width: int = 4  # 2 or 4
 
 
-GpuExpr = Expr | ArrayAccess | Cast | FieldAccess | VectorLoad
+GpuExpr = Expr | ArrayAccess | CastExpr | FieldAccess | VectorLoad
 
 
 # ---------------------------------------------------------------------------
@@ -295,20 +295,20 @@ def pretty_print(kernel: GpuKernel) -> str:
 def _gpu_fmt(expr: object) -> str | None:
     """Formatter hook for ``render_expr``: overrides for C-style kernel display.
 
-    Differs from the default ``render`` in four ways: no parens around BinOp /
-    Ternary / Cast (C operator precedence is implicit); ``{v:g}`` for float
-    Literal (compact readable form); extra parens around Cast operand; adds the
+    Differs from the default ``render`` in four ways: no parens around BinaryExpr /
+    TernaryExpr / CastExpr (C operator precedence is implicit); ``{v:g}`` for float
+    Literal (compact readable form); extra parens around CastExpr operand; adds the
     GPU-specific node types (ArrayAccess, FieldAccess, VectorLoad) that aren't
     in the portable ``Expr`` union. Returning None falls through to ``render``'s
     default dispatch.
     """
     if isinstance(expr, Literal) and isinstance(expr.value, float):
         return f"{expr.value:g}"
-    if isinstance(expr, BinOp):
+    if isinstance(expr, BinaryExpr):
         return f"{render_expr(expr.left, _gpu_fmt)} {expr.op} {render_expr(expr.right, _gpu_fmt)}"
-    if isinstance(expr, Ternary):
+    if isinstance(expr, TernaryExpr):
         return f"{render_expr(expr.cond, _gpu_fmt)} ? {render_expr(expr.if_true, _gpu_fmt)} : {render_expr(expr.if_false, _gpu_fmt)}"
-    if isinstance(expr, Cast):
+    if isinstance(expr, CastExpr):
         return f"({expr.dtype})({render_expr(expr.expr, _gpu_fmt)})"
     if isinstance(expr, ArrayAccess):
         return f"{expr.array}[{render_expr(expr.index, _gpu_fmt)}]"

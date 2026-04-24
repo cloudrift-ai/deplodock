@@ -3,7 +3,7 @@
 One subpackage per IR level:
 
 - ``base``     — ``Op`` base class + ``InputOp`` / ``ConstantOp`` sentinels.
-- ``expr``     — shared expression AST (``Var``, ``BinOp``, ...) +
+- ``expr``     — shared expression AST (``Var``, ``BinaryExpr``, ...) +
                  coord-expression helpers for ``IndexMapOp``.
 - ``frontend`` — Torch-captured ops (``LinearOp``, ``MatmulOp``, ``SdpaOp``,
                  ``MeanOp``, ``UnsqueezeOp``, ``TransposeOp``, ``ReshapeOp``,
@@ -15,7 +15,7 @@ One subpackage per IR level:
                  SSA ``Assign`` / ``Accum`` / ``Write`` / ``Select``
                  statements). One ``LoopOp`` per GPU kernel.
 - ``kernel``   — Kernel IR: C-like AST (``GpuKernel``, ``Stmt`` variants,
-                 ``ArrayAccess``, ``Cast``, ``VectorLoad``, ...) wrapped in
+                 ``ArrayAccess``, ``CastExpr``, ``VectorLoad``, ...) wrapped in
                  a ``KernelOp`` graph-op.
 - ``cuda``     — Device IR (``CudaOp`` carrying rendered ``__global__``
                  source + launch geometry).

@@ -3,14 +3,14 @@
 Single bottom-up pass over the shared ``Expr`` AST (``ir.expr``) plus the
 GPU-specific extensions (``ir.kernel``). Rules:
 
-- Constant folding: any ``BinOp`` or ``Cast`` of ``Literal`` children folds
-  via ``BinOp.eval({})`` / ``Cast`` dispatch (Literal.eval ignores env).
+- Constant folding: any ``BinaryExpr`` or ``CastExpr`` of ``Literal`` children folds
+  via ``BinaryExpr.eval({})`` / ``CastExpr`` dispatch (Literal.eval ignores env).
 - Algebraic identities: ``x+0``, ``x-0``, ``x*0``, ``x*1``, ``x/1``, ``x%1``,
   ``x-x``, ``x&&True``, ``x||False``, etc.
-- Ternary collapse: ``Literal(c) ? a : b`` → a or b; equal branches → branch.
+- TernaryExpr collapse: ``Literal(c) ? a : b`` → a or b; equal branches → branch.
 - Range-based comparison folding: when an ``Axis``' extent or a ``ForLoop``'s
   static bounds prove a comparison result, collapse to ``Literal(0/1)``.
-  Combined with Ternary collapse this erases chained index clamps like
+  Combined with TernaryExpr collapse this erases chained index clamps like
   ``(k0 > 2047 ? 2047 : k0) < 0 ? 0 : ...`` down to ``k0``.
 
 Idempotent: running twice yields the same AST. Pure: ``Expr → Expr``.
@@ -18,7 +18,7 @@ Idempotent: running twice yields the same AST. Pure: ``Expr → Expr``.
 Entry points:
 
 - ``simplify_expr(e, ctx)`` — Expr rewriter; covers every shared Expr type
-  (``Var | Literal | BinOp | Builtin | FuncCall | Ternary | Cast``) plus
+  (``Var | Literal | BinaryExpr | Builtin | FuncCallExpr | TernaryExpr | CastExpr``) plus
   the GPU extensions (``ArrayAccess | FieldAccess | VectorLoad``).
 - ``simplify_loop_op(op)`` — walks a ``LoopOp``, seeding Context from its
   ``Axis`` extents, rewriting every Expr in ``Load.index`` / ``Select`` /
@@ -28,7 +28,7 @@ Kernel-IR walking lives in ``ir.kernel.normalize``; it re-uses
 ``Context`` / ``Interval`` / ``simplify_expr`` from here.
 
 Range analysis (``infer_range``) tracks integer intervals only; ``Builtin``,
-``FuncCall``, ``Cast`` return ``None`` (unknown range → no comparison
+``FuncCallExpr``, ``CastExpr`` return ``None`` (unknown range → no comparison
 folding through them, but surrounding arithmetic can still constant-fold).
 """
 
@@ -37,13 +37,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from deplodock.compiler.ir.expr import (
-    BinOp,
+    BinaryExpr,
     Builtin,
-    Cast,
+    CastExpr,
     Expr,
-    FuncCall,
+    FuncCallExpr,
     Literal,
-    Ternary,
+    TernaryExpr,
     Var,
 )
 from deplodock.compiler.ir.kernel.ir import ArrayAccess, FieldAccess, VectorLoad
@@ -135,7 +135,7 @@ def infer_range(expr: object, ctx: Context) -> Interval | None:
         return None
     if isinstance(expr, Var):
         return ctx.ranges.get(expr.name)
-    if isinstance(expr, BinOp):
+    if isinstance(expr, BinaryExpr):
         la = infer_range(expr.left, ctx)
         lb = infer_range(expr.right, ctx)
         if la is None or lb is None:
@@ -163,7 +163,7 @@ def infer_range(expr: object, ctx: Context) -> Interval | None:
         if op in ("<", "<=", ">", ">=", "==", "&&", "||"):
             return Interval(0, 1)
         return None
-    # Builtin / FuncCall / Cast / Ternary: unknown
+    # Builtin / FuncCallExpr / CastExpr / TernaryExpr: unknown
     return None
 
 
@@ -212,9 +212,9 @@ def _make_int_literal(v: int) -> Literal:
 
 
 def _fold_binop_literals(op: str, left: Literal, right: Literal) -> Literal:
-    """Constant-fold a BinOp whose children are both Literal. Preserves int
+    """Constant-fold a BinaryExpr whose children are both Literal. Preserves int
     dtype when both operands are int-typed and the result is integral."""
-    folded = BinOp(op, left, right).eval({})
+    folded = BinaryExpr(op, left, right).eval({})
     if isinstance(folded, bool):
         return _make_int_literal(1 if folded else 0)
     both_int = left.dtype == "int" and right.dtype == "int"
@@ -228,7 +228,7 @@ def simplify_expr(expr: object, ctx: Context) -> object:
     if isinstance(expr, (Var, Literal, Builtin)):
         return expr
 
-    if isinstance(expr, BinOp):
+    if isinstance(expr, BinaryExpr):
         left = simplify_expr(expr.left, ctx)
         right = simplify_expr(expr.right, ctx)
         op = expr.op
@@ -287,9 +287,9 @@ def simplify_expr(expr: object, ctx: Context) -> object:
 
         if left is expr.left and right is expr.right:
             return expr
-        return BinOp(op, left, right)
+        return BinaryExpr(op, left, right)
 
-    if isinstance(expr, Ternary):
+    if isinstance(expr, TernaryExpr):
         cond = simplify_expr(expr.cond, ctx)
         if _is_truthy(cond):
             return simplify_expr(expr.if_true, ctx)
@@ -301,21 +301,21 @@ def simplify_expr(expr: object, ctx: Context) -> object:
             return a
         if cond is expr.cond and a is expr.if_true and b is expr.if_false:
             return expr
-        return Ternary(cond, a, b)
+        return TernaryExpr(cond, a, b)
 
-    if isinstance(expr, Cast):
+    if isinstance(expr, CastExpr):
         inner = simplify_expr(expr.expr, ctx)
         if isinstance(inner, Literal) and expr.dtype == "int":
             return _make_int_literal(int(inner.value))
         if inner is expr.expr:
             return expr
-        return Cast(expr.dtype, inner)
+        return CastExpr(expr.dtype, inner)
 
-    if isinstance(expr, FuncCall):
+    if isinstance(expr, FuncCallExpr):
         new_args = [simplify_expr(a, ctx) for a in expr.args]
         if all(x is y for x, y in zip(new_args, expr.args, strict=True)):
             return expr
-        return FuncCall(expr.name, new_args)
+        return FuncCallExpr(expr.name, new_args)
 
     if isinstance(expr, ArrayAccess):
         new_index = simplify_expr(expr.index, ctx)

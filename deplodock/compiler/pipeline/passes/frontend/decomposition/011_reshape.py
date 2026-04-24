@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import ReshapeOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 from deplodock.compiler.pipeline.engine import Match, Pattern
@@ -34,8 +34,8 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     flat = None
     out_stride = 1
     for d in range(out_ndim - 1, -1, -1):
-        term = placeholder(d) if out_stride == 1 else BinOp("*", placeholder(d), Literal(out_stride, "int"))
-        flat = term if flat is None else BinOp("+", term, flat)
+        term = placeholder(d) if out_stride == 1 else BinaryExpr("*", placeholder(d), Literal(out_stride, "int"))
+        flat = term if flat is None else BinaryExpr("+", term, flat)
         out_stride *= int(out_shape[d])
 
     if flat is None:
@@ -46,10 +46,10 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     in_stride = 1
     for j in range(in_ndim - 1, -1, -1):
         in_stride_j = in_stride
-        coord = flat if in_stride_j == 1 else BinOp("/", flat, Literal(in_stride_j, "int"))
+        coord = flat if in_stride_j == 1 else BinaryExpr("/", flat, Literal(in_stride_j, "int"))
         dim_j = int(in_shape[j])
         if j > 0:
-            coord = BinOp("%", coord, Literal(dim_j, "int"))
+            coord = BinaryExpr("%", coord, Literal(dim_j, "int"))
         coords.insert(0, coord)
         in_stride *= dim_j
 

@@ -11,12 +11,12 @@ from deplodock.compiler.ir.kernel import (
     ArrayDecl,
     Assign,
     AugAssign,
-    BinOp,
+    BinaryExpr,
     Builtin,
-    Cast,
+    CastExpr,
     FieldAccess,
     ForLoop,
-    FuncCall,
+    FuncCallExpr,
     GpuExpr,
     GpuKernel,
     IfStmt,
@@ -25,7 +25,7 @@ from deplodock.compiler.ir.kernel import (
     RawCode,
     Stmt,
     SyncThreads,
-    Ternary,
+    TernaryExpr,
     Var,
     VarAssign,
     VarDecl,
@@ -35,7 +35,7 @@ from deplodock.compiler.ir.kernel import (
 # ---------------------------------------------------------------------------
 # Backend-neutral → CUDA spelling translation tables.
 #
-# Kernel IR is backend-neutral: ``Builtin("thread_idx.x")``, ``FuncCall("rsqrt", ...)``,
+# Kernel IR is backend-neutral: ``Builtin("thread_idx.x")``, ``FuncCallExpr("rsqrt", ...)``,
 # ``ArrayDecl(storage="shared", ...)``. The CUDA emitter is the only layer that
 # knows CUDA's spellings — every other pass operates on neutral names.
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ def _emit_expr(expr: GpuExpr, parent_prec: int = 0) -> str:
         # Use LL suffix for large constants to prevent 32-bit overflow
         # in index arithmetic (e.g., stride * idx for large tensors).
         return f"{v}LL" if abs(v) > 32768 else str(v)
-    if isinstance(expr, BinOp):
+    if isinstance(expr, BinaryExpr):
         prec = _PRECEDENCE.get(expr.op, 10)
         left = _emit_expr(expr.left, prec)
         right = _emit_expr(expr.right, prec + 1)
@@ -144,16 +144,16 @@ def _emit_expr(expr: GpuExpr, parent_prec: int = 0) -> str:
         return f"{expr.array}[{idx}]"
     if isinstance(expr, Builtin):
         return _translate_builtin(expr.name)
-    if isinstance(expr, FuncCall):
+    if isinstance(expr, FuncCallExpr):
         args = ", ".join(_emit_expr(a) for a in expr.args)
         return f"{_translate_intrinsic(expr.name)}({args})"
-    if isinstance(expr, Cast):
+    if isinstance(expr, CastExpr):
         inner = _emit_expr(expr.expr)
         return f"(({expr.dtype})({inner}))"
     if isinstance(expr, FieldAccess):
         inner = _emit_expr(expr.expr)
         return f"{inner}.{expr.field}"
-    if isinstance(expr, Ternary):
+    if isinstance(expr, TernaryExpr):
         cond = _emit_expr(expr.cond)
         t = _emit_expr(expr.if_true)
         f = _emit_expr(expr.if_false)

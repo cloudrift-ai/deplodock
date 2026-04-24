@@ -9,12 +9,12 @@ from deplodock.compiler.ir.kernel import (
     ArrayDecl,
     Assign,
     AugAssign,
-    BinOp,
+    BinaryExpr,
     Builtin,
-    Cast,
+    CastExpr,
     FieldAccess,
     ForLoop,
-    FuncCall,
+    FuncCallExpr,
     GpuKernel,
     GpuKernelParam,
     IfStmt,
@@ -22,7 +22,7 @@ from deplodock.compiler.ir.kernel import (
     PragmaUnroll,
     RawCode,
     SyncThreads,
-    Ternary,
+    TernaryExpr,
     Var,
     VarDecl,
     VectorLoad,
@@ -62,20 +62,20 @@ def test_literal_int_as_float():
 
 
 def test_binop_add():
-    expr = BinOp("+", Var("a"), Var("b"))
+    expr = BinaryExpr("+", Var("a"), Var("b"))
     assert _emit_expr(expr) == "a + b"
 
 
 def test_binop_mul():
-    expr = BinOp("*", Var("a"), Var("b"))
+    expr = BinaryExpr("*", Var("a"), Var("b"))
     assert _emit_expr(expr) == "a * b"
 
 
 def test_binop_precedence_parenthesizes():
     """Lower-precedence op nested inside higher-precedence context gets parens."""
     # (a + b) * c — the add needs parens when parent expects * precedence.
-    inner = BinOp("+", Var("a"), Var("b"))
-    outer = BinOp("*", inner, Var("c"))
+    inner = BinaryExpr("+", Var("a"), Var("b"))
+    outer = BinaryExpr("*", inner, Var("c"))
     result = _emit_expr(outer)
     assert "(" in result  # (a + b) * c
     assert result == "(a + b) * c"
@@ -83,7 +83,7 @@ def test_binop_precedence_parenthesizes():
 
 def test_binop_same_precedence_right_assoc():
     """Right-nested same-precedence gets parens (codegen uses strict right prec)."""
-    expr = BinOp("+", Var("a"), BinOp("+", Var("b"), Var("c")))
+    expr = BinaryExpr("+", Var("a"), BinaryExpr("+", Var("b"), Var("c")))
     result = _emit_expr(expr)
     assert result == "a + (b + c)"
 
@@ -94,7 +94,7 @@ def test_array_access():
 
 
 def test_array_access_complex_index():
-    expr = ArrayAccess("buf", BinOp("+", Var("row"), Var("col")))
+    expr = ArrayAccess("buf", BinaryExpr("+", Var("row"), Var("col")))
     assert _emit_expr(expr) == "buf[row + col]"
 
 
@@ -104,24 +104,24 @@ def test_cuda_builtin():
 
 
 def test_func_call_no_args():
-    expr = FuncCall("__syncwarp", [])
+    expr = FuncCallExpr("__syncwarp", [])
     assert _emit_expr(expr) == "__syncwarp()"
 
 
 def test_func_call_with_args():
     # Bare name is the Kernel-IR convention; the CUDA emitter's
     # _translate_intrinsic rewrites to fmaxf at source-render time.
-    expr = FuncCall("fmax", [Var("a"), Var("b")])
+    expr = FuncCallExpr("fmax", [Var("a"), Var("b")])
     assert _emit_expr(expr) == "fmaxf(a, b)"
 
 
 def test_func_call_nested():
-    expr = FuncCall("exp", [FuncCall("__ldg", [ArrayAccess("buf", Var("i"))])])
+    expr = FuncCallExpr("exp", [FuncCallExpr("__ldg", [ArrayAccess("buf", Var("i"))])])
     assert _emit_expr(expr) == "expf(__ldg(buf[i]))"
 
 
 def test_cast():
-    expr = Cast("float4", Var("ptr"))
+    expr = CastExpr("float4", Var("ptr"))
     assert _emit_expr(expr) == "((float4)(ptr))"
 
 
@@ -132,12 +132,12 @@ def test_field_access():
 
 def test_field_access_chained():
     """Chained field access through a cast."""
-    expr = FieldAccess(Cast("float4", Var("ptr")), "w")
+    expr = FieldAccess(CastExpr("float4", Var("ptr")), "w")
     assert "w" in _emit_expr(expr)
 
 
 def test_ternary():
-    expr = Ternary(BinOp("<", Var("i"), Var("n")), Var("a"), Var("b"))
+    expr = TernaryExpr(BinaryExpr("<", Var("i"), Var("n")), Var("a"), Var("b"))
     result = _emit_expr(expr)
     assert "?" in result
     assert ":" in result
@@ -224,7 +224,7 @@ def test_for_loop_with_step():
 
 def test_if_stmt():
     stmt = IfStmt(
-        cond=BinOp("<", Var("tid"), Var("N")),
+        cond=BinaryExpr("<", Var("tid"), Var("N")),
         body=[Assign(ArrayAccess("out", Var("tid")), Var("val"))],
     )
     result = _emit_stmt(stmt)
@@ -234,7 +234,7 @@ def test_if_stmt():
 
 def test_if_stmt_with_else():
     stmt = IfStmt(
-        cond=BinOp("<", Var("i"), Var("n")),
+        cond=BinaryExpr("<", Var("i"), Var("n")),
         body=[VarDecl("float", "a", Literal(1.0, "float"))],
         else_body=[VarDecl("float", "a", Literal(0.0, "float"))],
     )
@@ -314,8 +314,8 @@ def test_kernel_def_with_params():
         body=[
             VarDecl("int", "i", Builtin("threadIdx.x")),
             IfStmt(
-                cond=BinOp("<", Var("i"), Var("N")),
-                body=[Assign(ArrayAccess("C", Var("i")), BinOp("+", ArrayAccess("A", Var("i")), ArrayAccess("B", Var("i"))))],
+                cond=BinaryExpr("<", Var("i"), Var("N")),
+                body=[Assign(ArrayAccess("C", Var("i")), BinaryExpr("+", ArrayAccess("A", Var("i")), ArrayAccess("B", Var("i"))))],
             ),
         ],
         block_size=(256, 1, 1),

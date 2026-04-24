@@ -5,9 +5,9 @@ import torch
 
 from deplodock.compiler.ir.expr import (
     PLACEHOLDER_PREFIX,
-    BinOp,
+    BinaryExpr,
     Literal,
-    Ternary,
+    TernaryExpr,
     Var,
     is_placeholder,
     placeholder,
@@ -60,18 +60,18 @@ def test_substitute_leaves_literal_alone():
 def test_substitute_rewrites_binop():
     expr = placeholder(0) + Literal(7, "int")
     result = substitute(expr, {placeholder(0).name: Var("row")})
-    assert isinstance(result, BinOp) and result.op == "+"
+    assert isinstance(result, BinaryExpr) and result.op == "+"
     assert isinstance(result.left, Var) and result.left.name == "row"
     assert isinstance(result.right, Literal) and result.right.value == 7
 
 
 def test_substitute_rewrites_ternary():
     cond = placeholder(0).lt(Literal(64, "int"))
-    expr = Ternary(cond, placeholder(0), placeholder(0) - Literal(64, "int"))
+    expr = TernaryExpr(cond, placeholder(0), placeholder(0) - Literal(64, "int"))
     result = substitute(expr, {placeholder(0).name: Var("col")})
-    assert isinstance(result, Ternary)
+    assert isinstance(result, TernaryExpr)
     assert isinstance(result.if_true, Var) and result.if_true.name == "col"
-    assert isinstance(result.if_false, BinOp) and result.if_false.op == "-"
+    assert isinstance(result.if_false, BinaryExpr) and result.if_false.op == "-"
 
 
 # ---------- IndexMapOp.is_identity ----------
