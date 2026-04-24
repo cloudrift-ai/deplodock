@@ -37,23 +37,24 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.expr import Expr, ExprOp, Literal, coerce_expr_op, free_vars
+from deplodock.compiler.ir.elementwise import ElementwiseImpl, coerce_elementwise_impl
+from deplodock.compiler.ir.expr import Expr, Literal, free_vars
 from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.loop.sigma import Sigma
 
 
-def _coerce_body_op(v) -> ExprOp:
-    """Accept an ExprOp, a string name, or an ElementwiseOp wrapper; return ExprOp.
+def _coerce_body_op(v) -> ElementwiseImpl:
+    """Accept an ElementwiseImpl, a string name, or an ElementwiseOp wrapper; return ElementwiseImpl.
 
     Lets ``Assign(..., ElementwiseOp("multiply"), ...)`` and ``Assign(..., "multiply", ...)``
-    keep working after Loop IR was switched to carry ``ExprOp`` directly.
+    keep working after Loop IR was switched to carry ``ElementwiseImpl`` directly.
     """
-    if isinstance(v, ExprOp):
+    if isinstance(v, ElementwiseImpl):
         return v
     inner = getattr(v, "op", None)
-    if isinstance(inner, ExprOp):
+    if isinstance(inner, ElementwiseImpl):
         return inner
-    return coerce_expr_op(v)
+    return coerce_elementwise_impl(v)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +158,7 @@ class Load(Stmt):
 #
 # ``Accum`` stmts carry their own reduce op — ``add`` / ``max`` / ``min`` /
 # ``mul``. The init value for the accumulator is derived from the op's
-# ``identity`` metadata on ``ir.expr.ExprOp`` — no separate dispatch table.
+# ``identity`` metadata on ``ir.expr.ElementwiseImpl`` — no separate dispatch table.
 # An ``Accum(target, value, op=...)`` inside a reduce ``Loop`` implicitly
 # initializes the accumulator to ``op.op.identity`` before the sweep and
 # folds via ``op`` at each iteration. The target SSA name is bound in the
@@ -168,15 +169,15 @@ class Load(Stmt):
 class Assign(Stmt):
     """Pure SSA body statement: ``name = op(args)``.
 
-    ``op`` is an ``ExprOp`` — the elementwise combine (add / mul / exp /
+    ``op`` is an ``ElementwiseImpl`` — the elementwise combine (add / mul / exp /
     ...). Reductions live in ``Accum``. ``args`` reference ``$N`` ports,
     an ``Accum.name`` (reads current / finalized acc value), or prior SSA
     names. Construction accepts a string name or an ``ElementwiseOp``
-    wrapper in addition to an ``ExprOp`` instance, via ``_coerce_body_op``.
+    wrapper in addition to an ``ElementwiseImpl`` instance, via ``_coerce_body_op``.
     """
 
     name: str
-    op: ExprOp
+    op: ElementwiseImpl
     args: tuple[str, ...]
 
     def __post_init__(self) -> None:
@@ -199,7 +200,7 @@ class Accum(Stmt):
     completes, ``name`` is an SSA binding visible in the enclosing scope,
     carrying the finalized reduced value.
 
-    ``op`` is an ``ExprOp`` — typically one of ``ADD`` / ``MAX`` / ``MIN``
+    ``op`` is an ``ElementwiseImpl`` — typically one of ``ADD`` / ``MAX`` / ``MIN``
     / ``MUL``. It defines both the combine operation and the accumulator's
     identity value. Multiple ``Accum`` stmts targeting the same ``name`` in
     one reduce Loop must agree on ``op``.
@@ -212,7 +213,7 @@ class Accum(Stmt):
 
     name: str
     value: str
-    op: ExprOp = field(default_factory=lambda: coerce_expr_op("add"))
+    op: ElementwiseImpl = field(default_factory=lambda: coerce_elementwise_impl("add"))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "op", _coerce_body_op(self.op))
@@ -676,7 +677,7 @@ def _validate(loop: LoopOp) -> None:
         seen_accums[info.name] = info
 
     # Op-consistency across repeated Updates to same target.
-    target_ops: dict[str, ExprOp] = {}
+    target_ops: dict[str, ElementwiseImpl] = {}
 
     def _walk(stmts: tuple[Stmt, ...], defined: set[str]) -> set[str]:
         """Validate a body scope. Returns the set of ``Accum.name`` names

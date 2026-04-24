@@ -195,9 +195,9 @@ class Builtin(_ExprOps):
 class FuncCallExpr(_ExprOps):
     """Intrinsic / math function call.
 
-    ``name`` is an ``ExprOp`` registry name (numpy-aligned: ``exp`` /
+    ``name`` is an ``ElementwiseImpl`` registry name (numpy-aligned: ``exp`` /
     ``tanh`` / ``maximum`` / ``reciprocal`` / …). ``FuncCallExpr.eval`` pulls
-    the pre-bound callable off the registered ``ExprOp``; the CUDA
+    the pre-bound callable off the registered ``ElementwiseImpl``; the CUDA
     emitter's ``_translate_intrinsic`` rewrites the same name to the
     ``f``-suffixed libm spelling at source-render time.
     """
@@ -206,8 +206,10 @@ class FuncCallExpr(_ExprOps):
     args: list[Expr]
 
     def eval(self, env: dict[str, object]) -> object:
+        from deplodock.compiler.ir.elementwise import coerce_elementwise_impl
+
         try:
-            op = coerce_expr_op(self.name)
+            op = coerce_elementwise_impl(self.name)
         except ValueError as e:
             raise NotImplementedError(f"FuncCallExpr.eval: unknown intrinsic {self.name!r}") from e
         return op.fn(*(a.eval(env) for a in self.args))
@@ -371,129 +373,3 @@ def free_vars(expr: Expr) -> frozenset[str]:
 # means elementwise maximum, not the reduction ``np.max``) then falls back to
 # ``numpy``.
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# ExprOp — hierarchy for elementwise / reduction ops
-# ---------------------------------------------------------------------------
-#
-# ``ExprOp`` is the base. ``UnaryOp`` / ``BinaryOp`` subclasses fix the
-# ``arity``. The op's ``name`` resolves to its numpy callable at
-# construction — no registry, no singletons; ``coerce_expr_op(name)``
-# just tries ``BinaryOp`` then ``UnaryOp``, with numpy's ufunc ``nin``
-# picking the right arity. ``commutative`` and ``identity`` are computed
-# properties that read from small class-level tables keyed by name.
-
-
-class ExprOp:
-    """Base class for named scalar ops (elementwise or reducer).
-
-    Subclasses (``UnaryOp`` / ``BinaryOp``) fix the ``arity``. Construction
-    resolves the numpy callable from the op's ``name`` — either via
-    ``_NAME_TO_FN`` (for non-numpy intrinsics like ``rsqrt`` / ``relu``
-    and fused frontend stubs like ``rms_norm``) or ``getattr(np, name)``
-    for numpy-aligned names. Unknown names raise. ``commutative`` and
-    ``identity`` are derived from class-level tables keyed by name —
-    only ops in the tables get those properties set; everything else
-    defaults to ``False`` / ``None``.
-    """
-
-    arity: int = 1
-
-    # Commutative ops — binary combines where ``op(a, b) == op(b, a)``.
-    _COMMUTATIVE: frozenset[str] = frozenset({"add", "multiply", "maximum", "minimum", "amax", "sum", "prod"})
-    # Reducer neutral elements — only meaningful when the op is used as
-    # an ``Accum`` combine or a ``ReduceOp``.
-    _IDENTITY: dict[str, float] = {
-        "add": 0.0,
-        "sum": 0.0,
-        "multiply": 1.0,
-        "prod": 1.0,
-        "maximum": -1e30,
-        "amax": -1e30,
-        "minimum": 1e30,
-    }
-
-    def __init__(self, name: str) -> None:
-        fn = _NAME_TO_FN.get(name)
-        if fn is None:
-            fn = getattr(np, name, None)
-        if fn is None:
-            raise ValueError(f"unknown ExprOp name: {name!r} (not in numpy or ir.expr._NAME_TO_FN)")
-        # Validate arity against numpy's ufunc metadata when available.
-        nin = getattr(fn, "nin", None)
-        if nin is not None and nin != self.arity:
-            raise ValueError(f"arity mismatch for {name!r}: {type(self).__name__} expects {self.arity}, numpy callable has nin={nin}")
-        self.name = name
-        self.fn = fn
-
-    @property
-    def commutative(self) -> bool:
-        return self.name in self._COMMUTATIVE
-
-    @property
-    def identity(self) -> float | None:
-        return self._IDENTITY.get(self.name)
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, ExprOp) and type(self) is type(other) and self.name == other.name
-
-    def __hash__(self) -> int:
-        return hash((type(self), self.name))
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.name!r})"
-
-
-class UnaryOp(ExprOp):
-    arity = 1
-
-
-class BinaryOp(ExprOp):
-    arity = 2
-
-
-def _unimpl(name: str):
-    """Stub callable for fused frontend ops (decomposed before eval)."""
-
-    def _raise(*_args):
-        raise NotImplementedError(f"ExprOp({name!r}) has no numpy implementation")
-
-    return _raise
-
-
-# Names whose callable isn't a plain ``getattr(np, name)``:
-# - Non-numpy intrinsics (rsqrt / relu / sigmoid / silu, plus copy).
-# - Fused frontend ops (rms_norm / softmax) — stubs; they're decomposed
-#   before any eval or codegen touches ``.fn``, but the name must still
-#   resolve so ``ExprOp(name)`` doesn't reject them.
-# Every other op name matches a numpy attribute — ``ExprOp.__init__``
-# falls through to ``getattr(np, name)`` for them.
-_NAME_TO_FN: dict[str, object] = {
-    "rsqrt": lambda x: 1.0 / np.sqrt(x),
-    "relu": lambda x: np.maximum(0.0, x),
-    "sigmoid": lambda x: 1.0 / (1.0 + np.exp(-x)),
-    "silu": lambda x: x / (1.0 + np.exp(-x)),
-    "copy": lambda x: x,
-    "rms_norm": _unimpl("rms_norm"),
-    "softmax": _unimpl("softmax"),
-}
-
-
-def coerce_expr_op(v: str | ExprOp) -> ExprOp:
-    """Accept a string name or ``ExprOp`` instance; return an ``ExprOp``.
-
-    Tries ``BinaryOp(name)`` first, falls back to ``UnaryOp(name)``.
-    numpy ufunc ``nin`` metadata makes the attempt self-selecting — binary
-    ops like ``add`` (nin=2) pass the binary check, unary ops like ``exp``
-    (nin=1) raise in ``BinaryOp.__init__`` and land in ``UnaryOp``. For
-    stub callables without ``nin`` (the fused frontend names), binary wins
-    by default; arity is informational only since those never evaluate.
-    """
-    if isinstance(v, ExprOp):
-        return v
-    try:
-        return BinaryOp(v)
-    except ValueError:
-        pass
-    return UnaryOp(v)

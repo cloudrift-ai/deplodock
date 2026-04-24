@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from deplodock.compiler.ir.expr import ExprOp, Var
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop.ir import Accum, Assign, Axis, Load, LoopOp, Select, Write
 
 
@@ -47,7 +48,7 @@ def execute_loop_op(
     for stmt in loop:
         if isinstance(stmt, Assign):
             args = [values[a] for a in stmt.args]
-            assert isinstance(stmt.op, ExprOp)
+            assert isinstance(stmt.op, ElementwiseImpl)
             values[stmt.name] = stmt.op.fn(*_align_ranks(args))
         elif isinstance(stmt, Load):
             if stmt.source >= len(input_arrays):

@@ -147,13 +147,13 @@ def _lookup_op_class(name: str) -> type[Op] | None:
 def _serialize_field(v):
     """Flatten non-JSON-friendly op field values to a JSON-compatible form.
 
-    Currently only special-cases ``ir.expr.ExprOp`` (stored as its ``name``
+    Currently only special-cases ``ir.expr.ElementwiseImpl`` (stored as its ``name``
     string); everything else passes through. The corresponding
-    ``coerce_expr_op`` in each op's ``__post_init__`` reverses this on load.
+    ``coerce_elementwise_impl`` in each op's ``__post_init__`` reverses this on load.
     """
-    from deplodock.compiler.ir.expr import ExprOp
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
 
-    if isinstance(v, ExprOp):
+    if isinstance(v, ElementwiseImpl):
         return v.name
     return v
     return None
