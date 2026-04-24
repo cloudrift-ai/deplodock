@@ -41,7 +41,6 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, Stmt, iter_body, splice_graph
 from deplodock.compiler.pipeline.engine import Match, Pattern
-from deplodock.compiler.pipeline.passes.lowering.kernel._emit_matmul import analyze_matmul
 
 _BLOWUP_FACTOR = 8
 
@@ -198,22 +197,6 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     if post_work > _BLOWUP_FACTOR * pre_work:
         return None
     if post_reads > _BLOWUP_FACTOR * pre_reads:
-        return None
-
-    # Matmul-shape preservation: if the consumer already fits the tiled matmul
-    # template, refuse any fusion that would break that shape. The template
-    # cares about the reduce body specifically — it must stay ``[Load_A,
-    # Load_B, mul, accum]``. A producer whose output is loaded inside the
-    # reduce loop (e.g. RoPE fusing into QK^T) gets spliced into that body,
-    # turning the ~3-op matmul core into a dozen-op mess that the detector
-    # then rejects. ``analyze_matmul`` is the oracle — if it returns Some for
-    # the pre-merge consumer but None for the merged kernel, the fusion would
-    # convert a tile-able matmul into a scalar kernel. Refuse.
-    #
-    # The TinyLlama SDPA case at seq=512: RoPE-rotated Q / K fused into the
-    # QK^T reduce body, forcing n374 onto the scalar path (22 ms). Keeping
-    # RoPE external lets QK^T lift cleanly and the tiled template kick in.
-    if analyze_matmul(consumer_node.op) is not None and analyze_matmul(merged) is None:
         return None
 
     # Broadcast-materialization guard: fusing a compute-bearing producer into

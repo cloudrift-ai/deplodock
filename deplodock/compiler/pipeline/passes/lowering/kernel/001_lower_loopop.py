@@ -15,7 +15,6 @@ from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._common import kernel_name_for
-from deplodock.compiler.pipeline.passes.lowering.kernel._emit_matmul import emit_matmul_kernel, is_matmul_annotated
 from deplodock.compiler.pipeline.passes.lowering.kernel._unified import emit_unified
 
 PATTERN = [Pattern("root", LoopOp)]
@@ -26,10 +25,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     if not isinstance(node.op, LoopOp):
         return None
     kname = kernel_name_for(node.op, match.root_node_id)
-    if is_matmul_annotated(node):
-        gpu_kernel, arg_order, grid, block = emit_matmul_kernel(node, kname, graph)
-    else:
-        gpu_kernel, arg_order, grid, block = emit_unified(node, kname, graph)
+    gpu_kernel, arg_order, grid, block = emit_unified(node, kname, graph)
     node.op = KernelOp(
         kernel=gpu_kernel,
         kernel_name=kname,
