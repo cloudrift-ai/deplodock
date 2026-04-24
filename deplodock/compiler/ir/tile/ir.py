@@ -49,6 +49,7 @@ from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
     Axis,
+    Cond,
     Load,
     Select,
     SelectBranch,
@@ -63,19 +64,6 @@ from deplodock.compiler.ir.loop import (
 @dataclass
 class Sync:
     """``__syncthreads();`` — block-level barrier."""
-
-
-@dataclass
-class Cond:
-    """``if (cond) { body } [else { else_body }]``.
-
-    Used for the tid-bounds guard, causal-mask predicates, and any other
-    coord-conditional branch. ``else_body`` empty means a bare ``if``.
-    """
-
-    cond: Expr
-    body: tuple[Stmt, ...]
-    else_body: tuple[Stmt, ...] = ()
 
 
 @dataclass
@@ -144,8 +132,9 @@ class Coop:
 
 
 # Statement union — Loop IR leaves + Tile IR additions. Every node that
-# can appear in a body sequence anywhere in Tile IR.
-Stmt = Load | Assign | Select | Write | Accum | Sync | Cond | FreeLoop | Reduce | Tile | Coop
+# can appear in a body sequence anywhere in Tile IR. ``Cond`` (if/else)
+# lives in Loop IR — it's reused here via the re-export.
+Stmt = Load | Assign | Select | Write | Accum | Cond | Sync | FreeLoop | Reduce | Tile | Coop
 
 
 # ---------------------------------------------------------------------------
@@ -219,16 +208,16 @@ __all__ = [
     "TernaryExpr",
     "CastExpr",
     "Expr",
-    # Loop-IR leaves (re-exported — used as Tile IR statements)
+    # Loop-IR leaves + control flow (re-exported — used as Tile IR statements)
     "Load",
     "Assign",
     "Select",
     "SelectBranch",
     "Write",
     "Accum",
+    "Cond",
     # Tile-IR statements
     "Sync",
-    "Cond",
     "FreeLoop",
     "Reduce",
     "Tile",
