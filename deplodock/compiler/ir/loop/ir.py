@@ -294,6 +294,38 @@ class Loop(Stmt):
         return ()
 
 
+@dataclass(frozen=True)
+class Cond(Stmt):
+    """Conditional block — ``if (cond) { body } [else { else_body }]``.
+
+    ``cond`` is an ``Expr`` over axis Vars and previously-defined SSA
+    names; ``body`` and ``else_body`` are stmt sequences executed
+    when the predicate evaluates true / false respectively. ``else_body``
+    empty means a bare ``if``.
+
+    SSA scoping mirrors ``Loop``: names defined inside either body are
+    scoped to that body, except ``Accum`` targets which cross the boundary
+    with their finalized value (matching Loop semantics).
+
+    ``deps`` are the SSA names referenced inside ``cond`` — the splicer /
+    dataflow analyses need them to thread the predicate's reads through.
+    Names referenced inside ``body`` / ``else_body`` are the body stmts'
+    own deps; the recursive walker picks them up.
+    """
+
+    cond: Expr
+    body: tuple[Stmt, ...]
+    else_body: tuple[Stmt, ...] = ()
+
+    def deps(self) -> tuple[str, ...]:
+        return tuple(free_vars(self.cond))
+
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+        # Don't recurse into ``body`` / ``else_body`` here — that's the caller's
+        # responsibility (see ``normalize._rewrite_body``), matching ``Loop``.
+        return Cond(cond=sigma.apply(self.cond), body=self.body, else_body=self.else_body)
+
+
 # ---------------------------------------------------------------------------
 # LoopOp
 # ---------------------------------------------------------------------------
@@ -406,6 +438,9 @@ class LoopOp(Op):
             for s in stmts:
                 if isinstance(s, Loop):
                     walk(s.body, scope.nest(s.axis))
+                elif isinstance(s, Cond):
+                    walk(s.body, scope)
+                    walk(s.else_body, scope)
                 elif isinstance(s, Accum):
                     defs[s.name] = s
                     # Binding scope excludes the reduce axis (the Accum is live
@@ -628,6 +663,12 @@ def _render_body(
             kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
             lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {kind}")
             _render_body(stmt.body, indent + "    ", lines)
+        elif isinstance(stmt, Cond):
+            lines.append(f"{indent}if ({render_expr(stmt.cond)}):")
+            _render_body(stmt.body, indent + "    ", lines)
+            if stmt.else_body:
+                lines.append(f"{indent}else:")
+                _render_body(stmt.else_body, indent + "    ", lines)
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +759,15 @@ def _validate(loop: LoopOp) -> None:
                 inner_exports = _walk(stmt.body, set(defined))
                 defined.update(inner_exports)
                 exported_accs.update(inner_exports)
+            elif isinstance(stmt, Cond):
+                # Same scoping rules as Loop: inner Assign / Select names are
+                # local; Accum names export. Validate both branches.
+                inner_exports = _walk(stmt.body, set(defined))
+                defined.update(inner_exports)
+                exported_accs.update(inner_exports)
+                inner_exports = _walk(stmt.else_body, set(defined))
+                defined.update(inner_exports)
+                exported_accs.update(inner_exports)
         return exported_accs
 
     _walk(loop.body, set())
@@ -742,6 +792,9 @@ def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
         yield s
         if isinstance(s, Loop):
             yield from iter_body(s.body)
+        elif isinstance(s, Cond):
+            yield from iter_body(s.body)
+            yield from iter_body(s.else_body)
 
 
 def map_body(

@@ -33,9 +33,8 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.loop import Accum, Assign, Load, Select, Write
+from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Select, Write
 from deplodock.compiler.ir.tile.ir import (
-    Cond,
     Coop,
     Expr,
     FreeLoop,
