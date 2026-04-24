@@ -231,10 +231,16 @@ class Param:
 
     ``dtype`` is the C declaration text (``"const float*"`` / ``"float*"`` /
     ``"int"`` / etc.); render emits it verbatim in the function signature.
+
+    ``shape`` is the buffer's element shape, used by ``render_kernel`` to
+    flatten multi-dim ``Index`` accesses to row-major. ``()`` means scalar
+    (the parameter is passed by value, not as a pointer); a ``(d0, d1, ...)``
+    tuple means a buffer of that shape behind ``dtype``'s pointer.
     """
 
     name: str
     dtype: str
+    shape: tuple[int, ...] = ()
 
 
 @dataclass
