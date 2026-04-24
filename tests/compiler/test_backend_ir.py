@@ -109,12 +109,14 @@ def test_func_call_no_args():
 
 
 def test_func_call_with_args():
-    expr = FuncCall("fmaxf", [Var("a"), Var("b")])
+    # Bare name is the Kernel-IR convention; the CUDA emitter's
+    # _translate_intrinsic rewrites to fmaxf at source-render time.
+    expr = FuncCall("fmax", [Var("a"), Var("b")])
     assert _emit_expr(expr) == "fmaxf(a, b)"
 
 
 def test_func_call_nested():
-    expr = FuncCall("expf", [FuncCall("__ldg", [ArrayAccess("buf", Var("i"))])])
+    expr = FuncCall("exp", [FuncCall("__ldg", [ArrayAccess("buf", Var("i"))])])
     assert _emit_expr(expr) == "expf(__ldg(buf[i]))"
 
 

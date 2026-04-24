@@ -190,8 +190,8 @@ def test_cast_literal_to_int():
 
 
 def test_funccall_args_simplified():
-    e = FuncCall("expf", [BinOp("+", _int(1), _int(2))])
-    assert simplify_expr(e, Context.empty()) == FuncCall("expf", [_int(3)])
+    e = FuncCall("exp", [BinOp("+", _int(1), _int(2))])
+    assert simplify_expr(e, Context.empty()) == FuncCall("exp", [_int(3)])
 
 
 def test_array_access_index_simplified():
