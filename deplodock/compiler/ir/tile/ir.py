@@ -17,11 +17,12 @@ Pipeline shape:
 strings (``Load.input``, ``Write.output``) so they're directly renderable.
 ``ElementwiseImpl`` carries op identity / commutativity / numpy callable.
 
-**Schedule structure is Tile-IR-specific.** ``FreeLoop`` / ``Reduce`` /
-``Tile`` / ``Coop`` / ``Sync`` / ``Cond`` plus the ``Kernel`` wrapper are
-new node types whose body is a broader union (``Stmt``) that admits both
-Loop-IR leaves and Tile-IR additions. Strategies match on the schedule
-nodes; the leaves they wrap pass through unchanged.
+**Schedule structure is Tile-IR-specific.** ``Reduce`` / ``Tile`` /
+``Coop`` / ``Sync`` plus the ``Kernel`` wrapper are new node types whose
+body is a broader union (``Stmt``) that admits both Loop-IR leaves and
+Tile-IR additions. Loop IR's ``Loop`` is reused directly for free
+iteration; ``Cond`` for if/else. Strategies match on the schedule nodes;
+the leaves they wrap pass through unchanged.
 
 Expression types come from ``ir.expr`` directly (``Var``, ``Literal``,
 ``BinaryExpr``, ``FuncCallExpr``, ``TernaryExpr``, ``CastExpr``,
@@ -51,6 +52,7 @@ from deplodock.compiler.ir.loop import (
     Axis,
     Cond,
     Load,
+    Loop,
     Select,
     SelectBranch,
     Write,
@@ -66,19 +68,9 @@ class Sync:
     """``__syncthreads();`` — block-level barrier."""
 
 
-@dataclass
-class FreeLoop:
-    """Per-thread serial walk over a free axis.
-
-    Body sees ``Var(axis.name)`` bound to the current iteration value (a
-    global coord). Lowering emits one ``FreeLoop`` per Loop IR free Loop;
-    ``ExtractGlobalSchedule`` strips the outer FreeLoop chain into
-    ``Kernel.thread_axes`` (those bindings then come from the tid decode
-    rather than a loop var).
-    """
-
-    axis: Axis
-    body: tuple[Stmt, ...]
+# Free iteration uses Loop IR's ``Loop`` directly — see the ``Loop`` re-export.
+# A future ``Enclosure`` will replace ``Loop`` here for axes bound to thread /
+# block / cooperative coords.
 
 
 @dataclass
@@ -132,9 +124,9 @@ class Coop:
 
 
 # Statement union — Loop IR leaves + Tile IR additions. Every node that
-# can appear in a body sequence anywhere in Tile IR. ``Cond`` (if/else)
-# lives in Loop IR — it's reused here via the re-export.
-Stmt = Load | Assign | Select | Write | Accum | Cond | Sync | FreeLoop | Reduce | Tile | Coop
+# can appear in a body sequence anywhere in Tile IR. ``Cond`` and ``Loop``
+# (free iteration) live in Loop IR — reused here via re-exports.
+Stmt = Load | Assign | Select | Write | Accum | Cond | Loop | Sync | Reduce | Tile | Coop
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +208,9 @@ __all__ = [
     "Write",
     "Accum",
     "Cond",
+    "Loop",
     # Tile-IR statements
     "Sync",
-    "FreeLoop",
     "Reduce",
     "Tile",
     "Coop",

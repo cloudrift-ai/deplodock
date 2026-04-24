@@ -1,7 +1,7 @@
 """Loop IR → Tile IR lowering tests.
 
 After dropping ``Let`` / ``Store`` etc, ``lower_naive`` is a thin
-mechanical pass: Loop IR's ``Loop`` becomes ``FreeLoop`` (no Accum) or
+mechanical pass: Loop IR's ``Loop`` becomes ``Loop`` (no Accum) or
 ``Reduce`` (Accums present); leaves pass through. These tests verify the
 structural shape and round-trip render output.
 """
@@ -20,7 +20,6 @@ from deplodock.compiler.ir.loop import (
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile import (
-    FreeLoop,
     Kernel,
     Param,
     Reduce,
@@ -72,9 +71,9 @@ def test_pointwise_add_structure():
     assert k.thread_axes == ()
     assert k.prologue == ()
     outer = k.body[0]
-    assert isinstance(outer, FreeLoop) and outer.axis.name == "a0"
+    assert isinstance(outer, Loop) and outer.axis.name == "a0"
     inner = outer.body[0]
-    assert isinstance(inner, FreeLoop) and inner.axis.name == "a1"
+    assert isinstance(inner, Loop) and inner.axis.name == "a1"
     # Loop IR leaves pass through unchanged.
     assert isinstance(inner.body[0], Load) and inner.body[0].input == "A"
     assert isinstance(inner.body[3], Write) and inner.body[3].output == "out"
@@ -126,7 +125,7 @@ def test_row_sum_structure():
     k = lower_naive(op, "row_sum", inputs, output)
 
     outer = k.body[0]
-    assert isinstance(outer, FreeLoop)
+    assert isinstance(outer, Loop)
     reduce_node = outer.body[0]
     assert isinstance(reduce_node, Reduce)
     assert reduce_node.axis.name == "a1"
@@ -209,14 +208,14 @@ def test_softmax_like_structure():
         Param("out", "float*", shape=(4, 32)),
     )
     outer = k_kern.body[0]
-    assert isinstance(outer, FreeLoop) and outer.axis.name == "a0"
+    assert isinstance(outer, Loop) and outer.axis.name == "a0"
     r_max, r_sum, out_loop = outer.body
     assert isinstance(r_max, Reduce)
     # Find the Accum in r_max's body.
     accums = [s for s in r_max.body if isinstance(s, Accum)]
     assert accums[0].op.name == "maximum"
     assert isinstance(r_sum, Reduce)
-    assert isinstance(out_loop, FreeLoop) and out_loop.axis.name == "a2"
+    assert isinstance(out_loop, Loop) and out_loop.axis.name == "a2"
 
 
 def test_softmax_like_renders():
@@ -281,9 +280,9 @@ def test_matmul_structure():
         Param("out", "float*", shape=(8, 8)),
     )
     m_loop = k.body[0]
-    assert isinstance(m_loop, FreeLoop) and m_loop.axis.name == "a0"
+    assert isinstance(m_loop, Loop) and m_loop.axis.name == "a0"
     n_loop = m_loop.body[0]
-    assert isinstance(n_loop, FreeLoop) and n_loop.axis.name == "a1"
+    assert isinstance(n_loop, Loop) and n_loop.axis.name == "a1"
     reduce_node = n_loop.body[0]
     assert isinstance(reduce_node, Reduce) and reduce_node.axis.name == "a2"
     assert isinstance(n_loop.body[1], Write)
@@ -344,7 +343,7 @@ def test_scalar_prologue_lifts_to_kernel_prologue():
     # Loop IR leaf passes through; Load.name canonicalized to in0 (first Load in pre-order).
     assert isinstance(k.prologue[0], Load)
     assert k.prologue[0].name == "in0"
-    assert isinstance(k.body[0], FreeLoop)
+    assert isinstance(k.body[0], Loop)
 
 
 def test_scalar_prologue_renders_above_body():

@@ -3,7 +3,7 @@
 After dropping ``Let`` / ``Index`` / ``Store`` / ``AccumFold`` / ``Acc``,
 Tile IR re-uses Loop IR's leaf stmts (``Load`` / ``Assign`` / ``Select`` /
 ``Write`` / ``Accum``). These tests verify that the schedule wrappers
-(``FreeLoop`` / ``Reduce`` / ``Tile`` / ``Coop`` / ``Cond`` / ``Sync``) +
+(``Loop`` / ``Reduce`` / ``Tile`` / ``Coop`` / ``Cond`` / ``Sync``) +
 ``Kernel`` accept the Loop IR leaves and can express each kernel shape we
 plan to lower to.
 """
@@ -19,10 +19,10 @@ from deplodock.compiler.ir.tile import (
     Cond,
     Coop,
     ElementwiseImpl,
-    FreeLoop,
     Kernel,
     Literal,
     Load,
+    Loop,
     Param,
     Reduce,
     SmemBuf,
@@ -66,7 +66,7 @@ def test_sync_cond():
 def test_loops():
     a0 = Axis("a0", 4)
     a1 = Axis("a1", 8)
-    free = FreeLoop(axis=a0, body=())
+    free = Loop(axis=a0, body=())
     red = Reduce(axis=a1, body=())
     tile = Tile(axis=a1, bk=4, body=())
     coop = Coop(cover=32, var="i", body=())
@@ -98,14 +98,14 @@ def test_kernel_defaults():
 
 
 def test_pointwise_add_shape():
-    """``c[a0, a1] = a[a0, a1] + b[a0, a1]`` — single FreeLoop nest, Loop IR
+    """``c[a0, a1] = a[a0, a1] + b[a0, a1]`` — single Loop nest, Loop IR
     leaves directly."""
     i, j = Axis("a0", 4), Axis("a1", 8)
     body = (
-        FreeLoop(
+        Loop(
             axis=i,
             body=(
-                FreeLoop(
+                Loop(
                     axis=j,
                     body=(
                         Load("a_v", input="A", index=(Var("a0"), Var("a1"))),
@@ -122,14 +122,14 @@ def test_pointwise_add_shape():
         params=(Param("A", "const float*"), Param("B", "const float*"), Param("out", "float*")),
         body=body,
     )
-    assert isinstance(k.body[0], FreeLoop)
-    assert isinstance(k.body[0].body[0], FreeLoop)
+    assert isinstance(k.body[0], Loop)
+    assert isinstance(k.body[0].body[0], Loop)
     assert isinstance(k.body[0].body[0].body[-1], Write)
 
 
 def test_rmsnorm_shape():
-    """RMSNorm post-lowering: prologue scalar Load, FreeLoop(i), Reduce(k)
-    with Accum, interlude Assigns, FreeLoop(j) ending in Write."""
+    """RMSNorm post-lowering: prologue scalar Load, Loop(i), Reduce(k)
+    with Accum, interlude Assigns, Loop(j) ending in Write."""
     i = Axis("a0", 4)
     k_axis = Axis("a1", 32)
     j = Axis("a2", 32)
@@ -145,7 +145,7 @@ def test_rmsnorm_shape():
             Accum(name="s", value="sq", op="add"),
         ),
     )
-    output_loop = FreeLoop(
+    output_loop = Loop(
         axis=j,
         body=(
             Load("xj", input="X", index=(Var("a0"), Var("a2"))),
@@ -155,7 +155,7 @@ def test_rmsnorm_shape():
             Write(output="out", index=(Var("a0"), Var("a2")), value="y"),
         ),
     )
-    body = (FreeLoop(axis=i, body=(reduce_block, output_loop)),)
+    body = (Loop(axis=i, body=(reduce_block, output_loop)),)
     k = Kernel(
         name="rmsnorm",
         params=(
@@ -170,19 +170,19 @@ def test_rmsnorm_shape():
     )
     assert len(k.prologue) == 2
     outer = k.body[0]
-    assert isinstance(outer, FreeLoop) and outer.axis.name == "a0"
+    assert isinstance(outer, Loop) and outer.axis.name == "a0"
     assert isinstance(outer.body[0], Reduce)
-    assert isinstance(outer.body[-1], FreeLoop) and outer.body[-1].axis.name == "a2"
+    assert isinstance(outer.body[-1], Loop) and outer.body[-1].axis.name == "a2"
 
 
 def test_matmul_naive_shape():
-    """Matmul ``c[m, n] = sum_k a[m, k] * b[k, n]`` — FreeLoop+FreeLoop+Reduce+Write."""
+    """Matmul ``c[m, n] = sum_k a[m, k] * b[k, n]`` — Loop+Loop+Reduce+Write."""
     m, n, k = Axis("a0", 64), Axis("a1", 64), Axis("a2", 32)
     body = (
-        FreeLoop(
+        Loop(
             axis=m,
             body=(
-                FreeLoop(
+                Loop(
                     axis=n,
                     body=(
                         Reduce(
