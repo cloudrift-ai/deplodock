@@ -260,5 +260,43 @@ class MeanOp(Op):
         return _keepdim_axis(input_shapes[0], self.axis)
 
     def forward(self, *inputs):
-
         return np.mean(inputs[0], axis=self.axis)
+
+
+@dataclass
+class RmsNormOp(Op):
+    """PyTorch aten.rms_norm: ``x * rsqrt(mean(x*x) + eps) * weight``.
+
+    Inputs are ``(x, weight [, eps_const])``; ``eps`` falls back to the
+    default when the optional constant isn't present. Decomposed by
+    ``passes/frontend/decomposition/006_rms_norm.py``.
+    """
+
+    eps: float = 1e-6
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(input_shapes[0])
+
+    def forward(self, *inputs):
+        x, weight = inputs[0], inputs[1]
+        rms = np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        return (x / rms) * weight
+
+
+@dataclass
+class SoftmaxOp(Op):
+    """PyTorch aten.softmax.int: ``exp(x - max(x, dim)) / sum(exp(...), dim)``.
+
+    Decomposed by ``passes/frontend/decomposition/008_softmax.py``.
+    """
+
+    axis: int | str = -1
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(input_shapes[0])
+
+    def forward(self, *inputs):
+        x = inputs[0]
+        m = np.max(x, axis=self.axis, keepdims=True)
+        e = np.exp(x - m)
+        return e / np.sum(e, axis=self.axis, keepdims=True)

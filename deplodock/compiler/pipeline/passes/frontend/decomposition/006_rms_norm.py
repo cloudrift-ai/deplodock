@@ -7,31 +7,20 @@ The resulting MeanOp is further lowered to sum + div by 007_mean.
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.frontend.ir import MeanOp
+from deplodock.compiler.ir.frontend.ir import MeanOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
-_DEFAULT_EPS = 1e-6
-
-PATTERN = [Pattern("root", ElementwiseOp, {"fn": "rms_norm"})]
+PATTERN = [Pattern("root", RmsNormOp)]
 
 
 def rewrite(graph: Graph, match: Match) -> Graph | None:
     root = graph.nodes[match.root_node_id]
-
-    # aten.rms_norm: (x, normalized_shape, weight [, eps]). normalized_shape
-    # is a list literal that the tracer drops, so we see x, weight, and
-    # optionally an eps ConstantOp in that order.
     if len(root.inputs) < 2:
         return None
     x_id, w_id = root.inputs[0], root.inputs[1]
-
-    eps_value = _DEFAULT_EPS
-    if len(root.inputs) >= 3:
-        eps_node = graph.nodes.get(root.inputs[2])
-        if eps_node and isinstance(eps_node.op, ConstantOp) and isinstance(eps_node.op.value, (int, float)):
-            eps_value = float(eps_node.op.value)
+    eps_value = root.op.eps
 
     x_t = graph.nodes[x_id].output
     w_t = graph.nodes[w_id].output

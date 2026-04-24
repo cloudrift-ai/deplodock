@@ -21,8 +21,10 @@ from deplodock.compiler.ir.frontend.ir import (
     MatmulOp,
     MeanOp,
     ReshapeOp,
+    RmsNormOp,
     SdpaOp,
     SliceOp,
+    SoftmaxOp,
     TransposeOp,
     UnsqueezeOp,
 )
@@ -455,18 +457,40 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         node_map[name] = nid
         return
 
-    # --- Fallback ---
+    # --- Fused frontend ops (decomposed in later passes) ---
+    if op_name == "rms_norm":
+        # aten.rms_norm: (x, normalized_shape, weight [, eps]). The tracer
+        # drops normalized_shape (a list literal), leaving (x, weight) plus
+        # an optional eps ConstantOp. eps is the op's own field, not a graph
+        # input, so we peel it off here.
+        eps_value = 1e-6
+        if len(input_ids) >= 3:
+            eps_node = g.nodes.get(input_ids[2])
+            if eps_node and isinstance(eps_node.op, ConstantOp) and isinstance(eps_node.op.value, (int, float)):
+                eps_value = float(eps_node.op.value)
+                input_ids = input_ids[:2]
+        nid = g.add_node(op=RmsNormOp(eps=eps_value), inputs=input_ids, output=Tensor(name, shape, dtype), node_id=name)
+        node_map[name] = nid
+        return
+
+    if op_name == "softmax":
+        # aten.softmax.int: (x, dim_const). dim becomes the op's field.
+        axis: int = -1
+        if len(input_ids) >= 2:
+            dim_node = g.nodes.get(input_ids[1])
+            if dim_node and isinstance(dim_node.op, ConstantOp) and isinstance(dim_node.op.value, (int, float)):
+                axis = int(dim_node.op.value)
+                input_ids = input_ids[:1]
+        nid = g.add_node(op=SoftmaxOp(axis=axis), inputs=input_ids, output=Tensor(name, shape, dtype), node_id=name)
+        node_map[name] = nid
+        return
+
+    # --- Fallback: unknown op becomes ElementwiseOp by torch-aten name ---
     logger.debug("Fallback elementwise for %s (%s)", op_name, fx_node.target)
     if input_ids:
         from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
-        # Fused-op fallbacks (rms_norm, softmax, …) intentionally keep their
-        # smaller inputs unbroadcast — their decomposition rule owns the
-        # broadcast insertion for the primitives they emit. For any other
-        # op (real elementwise), wrap mismatched inputs so ElementwiseOp's
-        # matching-shape invariant holds.
-        if op_name not in ("rms_norm", "softmax"):
-            input_ids = [broadcast_to(g, inp, shape) for inp in input_ids]
+        input_ids = [broadcast_to(g, inp, shape) for inp in input_ids]
         nid = g.add_node(
             op=ElementwiseOp(op=op_name),
             inputs=input_ids,

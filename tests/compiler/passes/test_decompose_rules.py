@@ -17,8 +17,10 @@ from deplodock.compiler.ir.frontend.ir import (
     MatmulOp,
     MeanOp,
     ReshapeOp,
+    RmsNormOp,
     SdpaOp,
     SliceOp,
+    SoftmaxOp,
     TransposeOp,
     UnsqueezeOp,
 )
@@ -163,32 +165,27 @@ def test_mean_correctness():
 # ===================================================================
 
 
-def _make_rms_norm_graph(dim=64, seq_len=8, eps_input=False):
+def _make_rms_norm_graph(dim=64, seq_len=8, eps=1e-6):
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, seq_len, dim)), node_id="x")
     g.add_node(op=ConstantOp(name="w"), inputs=[], output=Tensor("w", (dim,)), node_id="w")
-    ins = ["x", "w"]
-    if eps_input:
-        g.add_node(op=ConstantOp(name="eps", value=1e-5), inputs=[], output=Tensor("eps", (1,)), node_id="eps")
-        ins.append("eps")
-    g.add_node(op=ElementwiseOp(op="rms_norm"), inputs=ins, output=Tensor("out", (1, seq_len, dim)), node_id="out")
+    g.add_node(op=RmsNormOp(eps=eps), inputs=["x", "w"], output=Tensor("out", (1, seq_len, dim)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     return g
 
 
 def test_rms_norm_decomposes():
     result = _apply(_make_rms_norm_graph(), "006_rms_norm.py")
+    assert not any(isinstance(n.op, RmsNormOp) for n in result.nodes.values())
     fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
-    assert "rms_norm" not in fns
     assert {"multiply", "add", "rsqrt"} <= fns
     assert any(isinstance(n.op, MeanOp) for n in result.nodes.values())
 
 
 def test_rms_norm_with_eps_input_decomposes():
-    """Three-input form (x, w, eps) from explicit torch.nn.RMSNorm(dim, eps=...)."""
-    result = _apply(_make_rms_norm_graph(eps_input=True), "006_rms_norm.py")
-    fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
-    assert "rms_norm" not in fns
+    """Custom eps value preserved through decomposition."""
+    result = _apply(_make_rms_norm_graph(eps=1e-5), "006_rms_norm.py")
+    assert not any(isinstance(n.op, RmsNormOp) for n in result.nodes.values())
 
 
 def test_rms_norm_preserves_io_shape():
@@ -211,8 +208,7 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     decomposed = run_pass(graph, rules_dir / "frontend" / "decomposition")
     decomposed = run_pass(decomposed, rules_dir / "frontend" / "optimization")
     for n in decomposed.nodes.values():
-        if isinstance(n.op, ElementwiseOp):
-            assert n.op.name != "rms_norm", f"rms_norm survived decomposition at {n.output.name}"
+        assert not isinstance(n.op, RmsNormOp), f"rms_norm survived decomposition at {n.output.name}"
 
 
 # ===================================================================
@@ -223,10 +219,9 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
 def _make_softmax_graph(dim_extent=8, seq_len=4, axis=-1):
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, seq_len, dim_extent)), node_id="x")
-    g.add_node(op=ConstantOp(name="axis", value=float(axis)), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
     g.add_node(
-        op=ElementwiseOp(op="softmax"),
-        inputs=["x", "axis"],
+        op=SoftmaxOp(axis=axis),
+        inputs=["x"],
         output=Tensor("out", (1, seq_len, dim_extent)),
         node_id="out",
     )
@@ -236,8 +231,8 @@ def _make_softmax_graph(dim_extent=8, seq_len=4, axis=-1):
 
 def test_softmax_decomposes():
     result = _apply(_make_softmax_graph(), "008_softmax.py")
+    assert not any(isinstance(n.op, SoftmaxOp) for n in result.nodes.values())
     fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
-    assert "softmax" not in fns
     assert {"subtract", "exp", "divide"} <= fns
     reduce_fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ReduceOp)}
     assert {"maximum", "sum"} <= reduce_fns
@@ -272,8 +267,7 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     decomposed = run_pass(graph, rules_dir / "frontend" / "decomposition")
     decomposed = run_pass(decomposed, rules_dir / "frontend" / "optimization")
     for n in decomposed.nodes.values():
-        if isinstance(n.op, ElementwiseOp):
-            assert n.op.name != "softmax", f"softmax survived decomposition at {n.output.name}"
+        assert not isinstance(n.op, SoftmaxOp), f"softmax survived decomposition at {n.output.name}"
 
 
 # ===================================================================
