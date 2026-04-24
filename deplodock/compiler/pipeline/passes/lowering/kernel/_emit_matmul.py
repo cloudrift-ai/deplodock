@@ -59,7 +59,7 @@ _SUPPORTED_EW = frozenset(
         "div",
         "neg",
         "exp",
-        "recip",
+        "reciprocal",
         "relu",
         "sigmoid",
         "tanh",
@@ -420,7 +420,7 @@ def _render_elementwise(fn: str, args: list[str]) -> str:
         return f"(-{args[0]})"
     if fn == "exp":
         return f"expf({args[0]})"
-    if fn == "recip":
+    if fn == "reciprocal":
         return f"(1.0f / {args[0]})"
     if fn == "relu":
         return f"fmaxf(0.0f, {args[0]})"

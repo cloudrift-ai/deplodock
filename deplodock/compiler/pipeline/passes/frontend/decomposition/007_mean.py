@@ -39,7 +39,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     )
 
     sum_id = frag.add_node(
-        op=ReduceOp(fn="sum", axis=axis),
+        op=ReduceOp(op="sum", axis=axis),
         inputs=[x_id],
         output=Tensor(f"{name}_sum", shape, dtype),
     )
@@ -50,7 +50,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     )
     count_bc = broadcast_to(frag, count_id, shape)
     div_id = frag.add_node(
-        op=ElementwiseOp(fn="div"),
+        op=ElementwiseOp(op="div"),
         inputs=[sum_id, count_bc],
         output=Tensor(name, shape, dtype),
     )

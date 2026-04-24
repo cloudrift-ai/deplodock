@@ -21,13 +21,13 @@ from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
 def test_elementwise_rejects_mismatched_shapes():
-    op = ElementwiseOp(fn="add")
+    op = ElementwiseOp(op="add")
     with pytest.raises(ValueError, match="must all match"):
         op.infer_output_shape([(4, 8), (8,)])
 
 
 def test_elementwise_accepts_matching_shapes():
-    op = ElementwiseOp(fn="add")
+    op = ElementwiseOp(op="add")
     assert op.infer_output_shape([(4, 8), (4, 8)]) == (4, 8)
 
 
@@ -42,7 +42,7 @@ def test_elementwise_accepts_matching_shapes():
     ],
 )
 def test_reduce_output_is_keepdim(fn, input_shape, axis, expected):
-    assert ReduceOp(fn=fn, axis=axis).infer_output_shape([input_shape]) == expected
+    assert ReduceOp(op=fn, axis=axis).infer_output_shape([input_shape]) == expected
 
 
 def test_decomposition_emits_broadcast_explicit_elementwise():

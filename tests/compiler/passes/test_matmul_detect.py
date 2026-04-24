@@ -64,7 +64,7 @@ def test_skip_elementwise_only():
     a = g.add_node(InputOp(), [], Tensor("A", (16, 32)))
     b = g.add_node(InputOp(), [], Tensor("B", (16, 32)))
     g.inputs = [a, b]
-    ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("C", (16, 32)))
+    ew = g.add_node(ElementwiseOp(op="mul"), [a, b], Tensor("C", (16, 32)))
     g.outputs = [ew]
 
     g = _compile_loop(g)
@@ -80,8 +80,8 @@ def test_detect_matmul_shape_mismatch():
     a = g.add_node(InputOp(), [], Tensor("A", (4, 8, 4)))
     b = g.add_node(InputOp(), [], Tensor("B", (4, 8, 4)))
     g.inputs = [a, b]
-    ew = g.add_node(ElementwiseOp(fn="mul"), [a, b], Tensor("AB", (4, 8, 4)))
-    c = g.add_node(ReduceOp(fn="sum", axis=1), [ew], Tensor("C", (4, 1, 4)))
+    ew = g.add_node(ElementwiseOp(op="mul"), [a, b], Tensor("AB", (4, 8, 4)))
+    c = g.add_node(ReduceOp(op="sum", axis=1), [ew], Tensor("C", (4, 1, 4)))
     g.outputs = [c]
 
     g = _compile_loop(g)

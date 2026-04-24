@@ -46,29 +46,29 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     frag.add_node(op=InputOp(), inputs=[], output=Tensor(x_t.name, x_t.shape, x_t.dtype), node_id=x_id)
 
     max_id = frag.add_node(
-        op=ReduceOp(fn="max", axis=axis),
+        op=ReduceOp(op="max", axis=axis),
         inputs=[x_id],
         output=Tensor(f"{name}_max", red_shape, dtype),
     )
     max_bc = broadcast_to(frag, max_id, out_shape)
     sub_id = frag.add_node(
-        op=ElementwiseOp(fn="sub"),
+        op=ElementwiseOp(op="sub"),
         inputs=[x_id, max_bc],
         output=Tensor(f"{name}_shifted", out_shape, dtype),
     )
     exp_id = frag.add_node(
-        op=ElementwiseOp(fn="exp"),
+        op=ElementwiseOp(op="exp"),
         inputs=[sub_id],
         output=Tensor(f"{name}_exp", out_shape, dtype),
     )
     sum_id = frag.add_node(
-        op=ReduceOp(fn="sum", axis=axis),
+        op=ReduceOp(op="sum", axis=axis),
         inputs=[exp_id],
         output=Tensor(f"{name}_sum", red_shape, dtype),
     )
     sum_bc = broadcast_to(frag, sum_id, out_shape)
     out_id = frag.add_node(
-        op=ElementwiseOp(fn="div"),
+        op=ElementwiseOp(op="div"),
         inputs=[exp_id, sum_bc],
         output=Tensor(name, out_shape, dtype),
     )

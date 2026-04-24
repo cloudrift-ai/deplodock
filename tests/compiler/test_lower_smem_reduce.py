@@ -29,7 +29,7 @@ def _softmax_large_graph() -> Graph:
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 4096)), node_id="x")
     g.add_node(op=ConstantOp(name="axis", value=-1.0), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
     g.add_node(
-        op=ElementwiseOp(fn="softmax"),
+        op=ElementwiseOp(op="softmax"),
         inputs=["x", "axis"],
         output=Tensor("y", (4, 4096)),
         node_id="y",
@@ -60,7 +60,7 @@ def test_small_reduce_stays_serial():
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")
     g.add_node(op=ConstantOp(name="axis", value=-1.0), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
     g.add_node(
-        op=ElementwiseOp(fn="softmax"),
+        op=ElementwiseOp(op="softmax"),
         inputs=["x", "axis"],
         output=Tensor("y", (4, 8)),
         node_id="y",

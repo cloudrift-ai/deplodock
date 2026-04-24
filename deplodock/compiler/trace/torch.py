@@ -234,28 +234,34 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         return
 
     # --- Elementwise ops ---
-    _EW_MAP = {
-        "add": "add",
-        "mul": "mul",
-        "sub": "sub",
-        "div": "div",
-        "neg": "neg",
-        "exp": "exp",
-        "rsqrt": "rsqrt",
-        "reciprocal": "recip",
-        "silu": "silu",
-        "relu": "relu",
-        "tanh": "tanh",
-        "abs": "abs",
-        "sigmoid": "sigmoid",
-        "pow": "pow",
-    }
-    if op_name in _EW_MAP:
+    # Torch names match our ExprOp names one-to-one (including ``reciprocal``
+    # after the rename). The set below is the whitelist that tells the tracer
+    # which torch ops land as a primitive ``ElementwiseOp``; anything else
+    # falls through to the fused-op handler below.
+    _ELEMENTWISE_NAMES = frozenset(
+        {
+            "add",
+            "sub",
+            "mul",
+            "div",
+            "neg",
+            "exp",
+            "rsqrt",
+            "reciprocal",
+            "pow",
+            "silu",
+            "relu",
+            "tanh",
+            "abs",
+            "sigmoid",
+        }
+    )
+    if op_name in _ELEMENTWISE_NAMES:
         from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
         bc_ids = [broadcast_to(g, inp, shape) for inp in input_ids[:2]]
         nid = g.add_node(
-            op=ElementwiseOp(fn=_EW_MAP[op_name]),
+            op=ElementwiseOp(op=op_name),
             inputs=bc_ids,
             output=Tensor(name, shape, dtype),
             node_id=name,
@@ -318,16 +324,18 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
     # traced op was non-keepdim, a squeeze IndexMapOp is inserted afterwards
     # so the downstream graph sees the correct (dropped-axis) shape while the
     # ReduceOp itself stays rank-preserving.
-    _RED_OP_MAP = {"sum": "sum", "mean": "mean", "amax": "max", "max": "max"}
-    if op_name in _RED_OP_MAP:
+    # Torch reduction names pass through to ``ReduceOp`` as-is; ``mean`` is
+    # the exception that lands as ``MeanOp`` (decomposition splits it into
+    # sum + div). Keeping torch's spelling — ``amax`` stays ``amax``, not
+    # mapped to ``max`` — avoids a needless name table.
+    if op_name in ("sum", "max", "amax", "mean"):
         axis = _get_reduce_axis(fx_node)
         x_shape = tuple(g.nodes[input_ids[0]].output.shape) if input_ids else ()
         keepdim_shape = _keepdim_shape(x_shape, axis)
-        fn_name = _RED_OP_MAP[op_name]
         if op_name == "mean":
             red_node_op = MeanOp(axis=axis)
         else:
-            red_node_op = ReduceOp(fn=fn_name, axis=axis)
+            red_node_op = ReduceOp(op=op_name, axis=axis)
 
         if tuple(shape) == keepdim_shape:
             nid = g.add_node(op=red_node_op, inputs=input_ids[:1], output=Tensor(name, shape, dtype), node_id=name)
@@ -457,7 +465,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         if op_name not in ("rms_norm", "softmax"):
             input_ids = [broadcast_to(g, inp, shape) for inp in input_ids]
         nid = g.add_node(
-            op=ElementwiseOp(fn=op_name),
+            op=ElementwiseOp(op=op_name),
             inputs=input_ids,
             output=Tensor(name, shape, dtype),
             node_id=name,

@@ -36,14 +36,14 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     # neg(x)
     neg_id = frag.add_node(
-        op=ElementwiseOp(fn="neg"),
+        op=ElementwiseOp(op="neg"),
         inputs=[x_id],
         output=Tensor(f"{name}_neg", shape, dtype),
     )
 
     # exp(-x)
     exp_id = frag.add_node(
-        op=ElementwiseOp(fn="exp"),
+        op=ElementwiseOp(op="exp"),
         inputs=[neg_id],
         output=Tensor(f"{name}_exp", shape, dtype),
     )
@@ -51,21 +51,21 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # 1 + exp(-x)
     one_bc = broadcast_to(frag, one_id, shape)
     add_id = frag.add_node(
-        op=ElementwiseOp(fn="add"),
+        op=ElementwiseOp(op="add"),
         inputs=[one_bc, exp_id],
         output=Tensor(f"{name}_denom", shape, dtype),
     )
 
     # recip(1 + exp(-x))
     recip_id = frag.add_node(
-        op=ElementwiseOp(fn="recip"),
+        op=ElementwiseOp(op="reciprocal"),
         inputs=[add_id],
         output=Tensor(f"{name}_sigmoid", shape, dtype),
     )
 
     # x * sigmoid(x)
     mul_id = frag.add_node(
-        op=ElementwiseOp(fn="mul"),
+        op=ElementwiseOp(op="mul"),
         inputs=[x_id, recip_id],
         output=Tensor(name, shape, dtype),
     )

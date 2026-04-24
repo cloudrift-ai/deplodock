@@ -179,7 +179,7 @@ def test_trace_sum_reduction():
 
 
 def test_trace_max_reduction():
-    """aten.amax traces to ReduceOp(max)."""
+    """aten.amax traces to ReduceOp(amax) — torch's name is preserved."""
     import torch
     import torch.nn as nn
 
@@ -196,7 +196,7 @@ def test_trace_max_reduction():
 
     reduces = [n for n in g.nodes.values() if isinstance(n.op, ReduceOp)]
     assert len(reduces) >= 1
-    assert reduces[0].op.fn == "max"
+    assert reduces[0].op.fn == "amax"
 
 
 # ---------------------------------------------------------------------------

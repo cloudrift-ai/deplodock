@@ -77,7 +77,7 @@ def test_pointwise_add():
     g = Graph()
     _input(g, "x", (4,))
     _input(g, "y", (4,))
-    g.add_node(op=ElementwiseOp(fn="add"), inputs=["x", "y"], output=Tensor("z", (4,)), node_id="z")
+    g.add_node(op=ElementwiseOp(op="add"), inputs=["x", "y"], output=Tensor("z", (4,)), node_id="z")
     g.inputs = ["x", "y"]
     g.outputs = ["z"]
 
@@ -106,7 +106,7 @@ def test_chained_pointwise_fuses_into_one():
 def test_reduce_sum():
     g = Graph()
     _input(g, "x", (4, 8))
-    g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["x"], output=Tensor("r", (4, 1)), node_id="r")
+    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("r", (4, 1)), node_id="r")
     g.inputs = ["x"]
     g.outputs = ["r"]
 
@@ -141,7 +141,7 @@ def test_no_matmul_when_mul_fans_out():
     _input(g, "a", (4, 8))
     _input(g, "b", (4, 8))
     g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8)), node_id="m")
-    g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["m"], output=Tensor("d", (4, 1)), node_id="d")
+    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["m"], output=Tensor("d", (4, 1)), node_id="d")
     g.add_node(op=ElementwiseOp("neg"), inputs=["m"], output=Tensor("n", (4, 8)), node_id="n")
     g.inputs = ["a", "b"]
     g.outputs = ["d", "n"]
@@ -215,7 +215,7 @@ def test_reduce_sum_correctness():
     def _make():
         g = Graph()
         _input(g, "x", (4, 8))
-        g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["x"], output=Tensor("r", (4, 1)), node_id="r")
+        g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("r", (4, 1)), node_id="r")
         g.inputs, g.outputs = ["x"], ["r"]
         return g
 
@@ -245,7 +245,7 @@ def test_mul_fan_out_correctness():
         _input(g, "a", (4, 8))
         _input(g, "b", (4, 8))
         g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8)), node_id="m")
-        g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["m"], output=Tensor("d", (4, 1)), node_id="d")
+        g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["m"], output=Tensor("d", (4, 1)), node_id="d")
         g.add_node(op=ElementwiseOp("neg"), inputs=["m"], output=Tensor("n", (4, 8)), node_id="n")
         g.inputs, g.outputs = ["a", "b"], ["d", "n"]
         return g
