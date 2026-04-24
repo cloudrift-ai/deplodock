@@ -13,12 +13,14 @@ The output Kernel has ``thread_axes == ()`` and ``block_axes == ()`` —
 it's a fully-serial single-thread program. ``ExtractGlobalSchedule``
 (step 4) strips the outer FreeLoop chain into ``thread_axes``.
 
-Reduce-op vocabulary translation: Loop IR uses ``"maximum"`` / ``"minimum"``
-/ ``"sum"`` / ``"prod"``; Tile IR's ``AccumFold.op`` uses the short
-``"max"`` / ``"min"`` / ``"add"`` / ``"mul"``. The map is in
-``_REDUCE_OP_MAP``. Elementwise op → Expr translation mirrors
-``_common.apply_elementwise`` so the rendered CUDA matches today's
-output for the same Loop IR input.
+Reduce ops use ``ElementwiseImpl`` directly — same vocabulary as Loop IR's
+``Accum.op`` (``"add"`` / ``"multiply"`` / ``"maximum"`` / ``"minimum"`` plus
+``"sum"`` / ``"prod"`` aliases). The ``AccumFold.op`` and ``Acc.op`` carry
+the same ``ElementwiseImpl`` instance that came in on the source ``Accum`` —
+no name remapping. Identity is read from ``ElementwiseImpl.identity`` at
+render time. Elementwise op → Expr translation (``_op_to_expr``) mirrors
+``_common.apply_elementwise`` so the rendered CUDA matches today's output
+for the same Loop IR input.
 """
 
 from __future__ import annotations
@@ -55,26 +57,6 @@ from deplodock.compiler.ir.tile.ir import (
     Stmt,
     Store,
 )
-
-# Loop IR reduce-op name → Tile IR AccumFold short name.
-_REDUCE_OP_MAP: dict[str, str] = {
-    "add": "add",
-    "sum": "add",
-    "multiply": "mul",
-    "prod": "mul",
-    "maximum": "max",
-    "minimum": "min",
-}
-
-# Identity values for each reduce op (matches Loop IR's ElementwiseImpl.identity
-# for the supported set). Used to initialise each Acc.
-_REDUCE_IDENTITY: dict[str, float] = {
-    "add": 0.0,
-    "mul": 1.0,
-    "max": float("-inf"),
-    "min": float("inf"),
-}
-
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -146,8 +128,7 @@ def _lower_stmt(s: LoopStmt, ctx: _Ctx) -> list[Stmt]:
     if isinstance(s, Write):
         return [Store(ctx.output.name, tuple(s.index), Var(s.value))]
     if isinstance(s, Accum):
-        op = _REDUCE_OP_MAP[s.op.name]
-        return [AccumFold(s.name, op, Var(s.value))]
+        return [AccumFold(s.name, s.op, Var(s.value))]
     raise NotImplementedError(f"lower_naive: unhandled Loop IR stmt {type(s).__name__}")
 
 
@@ -164,9 +145,7 @@ def _lower_loop(loop: Loop, ctx: _Ctx) -> Stmt:
         for a in accums:
             if a.name in seen:
                 continue
-            op = _REDUCE_OP_MAP[a.op.name]
-            init_val = a.op.identity if a.op.identity is not None else _REDUCE_IDENTITY[op]
-            seen[a.name] = Acc(name=a.name, op=op, init=Literal(float(init_val)))
+            seen[a.name] = Acc(name=a.name, op=a.op)
         body = _lower_body(loop.body, ctx)
         return Reduce(axis=loop.axis, accs=tuple(seen.values()), body=tuple(body))
     body = _lower_body(loop.body, ctx)

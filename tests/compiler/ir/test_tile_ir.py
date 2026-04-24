@@ -54,7 +54,7 @@ def test_let_store_accumfold():
     let = Let("t", Index("X", (Var("i"),)))
     store = Store("out", (Var("i"), Var("j")), Var("t"))
     fold = AccumFold("c", "add", Var("p"))
-    assert (let.name, store.buf, fold.op) == ("t", "out", "add")
+    assert (let.name, store.buf, fold.op.name) == ("t", "out", "add")
 
 
 def test_sync_cond():
@@ -72,14 +72,14 @@ def test_loops():
     a0 = Axis("a0", 4)
     a1 = Axis("a1", 8)
     free = FreeLoop(axis=a0, body=())
-    red = Reduce(axis=a1, accs=(Acc("c", "add", Literal(0.0)),), body=())
+    red = Reduce(axis=a1, accs=(Acc("c", "add"),), body=())
     tile = Tile(axis=a1, bk=4, body=())
     coop = Coop(cover=32, var="i", body=())
     assert (free.axis.name, red.axis.name, tile.bk, coop.cover) == ("a0", "a1", 4, 32)
 
 
 def test_reduce_extent_default_none():
-    red = Reduce(axis=Axis("k", 32), accs=(Acc("s", "add", Literal(0.0)),), body=())
+    red = Reduce(axis=Axis("k", 32), accs=(Acc("s", "add"),), body=())
     assert red.extent is None  # caller / render uses axis.extent
 
 
@@ -150,7 +150,7 @@ def test_rmsnorm_shape():
     )
     reduce_block = Reduce(
         axis=k_axis,
-        accs=(Acc("s", "add", Literal(0.0)),),
+        accs=(Acc("s", "add"),),
         body=(
             Let("x", Index("X", (Var("a0"), Var("a1")))),
             Let("sq", BinaryExpr("*", Var("x"), Var("x"))),
@@ -204,7 +204,7 @@ def test_matmul_naive_shape():
                     body=(
                         Reduce(
                             axis=k,
-                            accs=(Acc("c", "add", Literal(0.0)),),
+                            accs=(Acc("c", "add"),),
                             body=(
                                 Let("a_v", Index("A", (Var("a0"), Var("a2")))),
                                 Let("b_v", Index("B", (Var("a2"), Var("a1")))),
@@ -225,7 +225,7 @@ def test_matmul_naive_shape():
     )
     inner = krn.body[0].body[0]
     assert isinstance(inner.body[0], Reduce)
-    assert inner.body[0].accs[0].op == "add"
+    assert inner.body[0].accs[0].op.name == "add"
     assert isinstance(inner.body[-1], Store)
 
 
@@ -241,7 +241,7 @@ def test_matmul_smem_tiled_shape():
     )
     inner_reduce = Reduce(
         axis=Axis("k_inner", 16),
-        accs=(Acc("c", "add", Literal(0.0)),),
+        accs=(Acc("c", "add"),),
         body=(
             Let("a_v", Index("A_tile", (Var("m_local"), Var("k_inner")))),
             Let("b_v", Index("B_tile", (Var("k_inner"), Var("n_local")))),
