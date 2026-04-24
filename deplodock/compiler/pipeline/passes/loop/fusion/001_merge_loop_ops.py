@@ -7,56 +7,104 @@ inputs uniformly (first-seen slot assignment + splice-edge routing).
 Splicing refuses patterns it doesn't handle yet (non-trivial σ writer
 forms, etc.); those boundaries stay as separate kernels.
 
-Blowup guard: a leaf's cost is ``(free_prod × enclosing_reduce_prod)``.
-Fusions that catastrophically nest reduces (e.g. inlining one matmul
-inside another's k-loop: outer_K × inner_K × free_numel) multiply this
-leaf cost by the inner reduce axis's extent. We refuse merges whose max
-leaf cost grows more than ``_BLOWUP_FACTOR`` over the sum of the
-producer+consumer leaf costs.
+Blowup guards: two metrics, both summed over body leaves (max-per-leaf
+wasn't enough — a fusion that introduces a second large leaf alongside
+an existing one looks free to a max, but the actual runtime work
+doubles).
+
+- ``_total_work``: sum over compute leaves (``Assign`` / ``Accum``) of
+  ``enclosing_free × enclosing_reduce`` — proxy for arithmetic.
+- ``_total_reads``: sum over ``Load`` stmts of the same product — proxy
+  for memory traffic. Global reads dominate cost on small-M matmuls
+  where arithmetic is bandwidth-bound, so a fusion that grows reads
+  without growing work is still a regression.
+
+A fusion is refused if **either** metric grows by more than
+``_BLOWUP_FACTOR`` over the producer+consumer sum. In addition, a
+``multi-load-of-reducer`` guard refuses fusions where the consumer reads
+the producer from multiple ``Load`` stmts **and** the producer contains
+any reduce axis — inlining a reduce twice recomputes it, which
+``_total_*`` catches *in ratio* but only when producer is big enough
+relative to consumer; the guard catches it structurally.
 
 Factor picked empirically — swept 2…1024 on TinyLlama block (seq=32):
 2–16 ties at ~4.18ms/18 launches (best), 32–512 shifts to ~4.7ms/17
 launches (one harmful silu→down_proj fusion lands), 1024 unlocks the
 up_proj→down_proj nesting (~1000×) and the block takes 433ms. 8 is the
-middle of the best plateau.
+middle of the best plateau and still lets the epilogue-fusion cases
+through.
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Accum, Assign, Loop, LoopOp, Stmt, iter_body, splice_graph
+from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, Stmt, iter_body, splice_graph
 from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.lowering.kernel._emit_matmul import analyze_matmul
 
 _BLOWUP_FACTOR = 8
 
 
-def _max_nest(loop_op: LoopOp) -> int:
-    """Maximum per-leaf compute cost (``free_prod × reduce_prod``) over the body tree.
+def _walk_leaf_costs(loop_op: LoopOp):
+    """Yield ``(stmt, enclosing_free_prod × enclosing_reduce_prod)`` per body leaf.
 
-    Both ``free_prod`` and ``reduce_prod`` accumulate from the *actually*
-    enclosing Loops at each leaf — sequential (sibling) free axes on
-    either side of a reduce do not pile onto its leaf cost.
+    Leaf = any non-``Loop`` stmt. Products accumulate along the actually
+    enclosing ``Loop`` chain; sibling free axes don't pile onto a reduce
+    leaf's cost (and vice versa), matching the original max-nest semantics.
     """
     reduce_names = loop_op.reduce_axis_names
-    best = 1
 
-    def walk(stmts: tuple[Stmt, ...], free_prod: int, reduce_prod: int) -> None:
-        nonlocal best
+    def walk(stmts: tuple[Stmt, ...], free_prod: int, reduce_prod: int):
         for s in stmts:
             if isinstance(s, Loop):
                 extent = int(s.axis.extent)
                 if s.axis.name in reduce_names:
-                    walk(s.body, free_prod, reduce_prod * extent)
+                    yield from walk(s.body, free_prod, reduce_prod * extent)
                 else:
-                    walk(s.body, free_prod * extent, reduce_prod)
+                    yield from walk(s.body, free_prod * extent, reduce_prod)
             else:
-                cost = free_prod * reduce_prod
-                if cost > best:
-                    best = cost
+                yield s, free_prod * reduce_prod
 
-    walk(loop_op.body, 1, 1)
-    return best
+    yield from walk(loop_op.body, 1, 1)
+
+
+def _total_work(loop_op: LoopOp) -> int:
+    """Sum of enclosing-loop iterations over compute leaves (Assign + Accum).
+
+    Counts how many times each arithmetic stmt executes across the full
+    iteration space. A fusion that splices a producer's body in twice
+    doubles this number — the old max-nest metric couldn't see that.
+    """
+    return sum(cost for stmt, cost in _walk_leaf_costs(loop_op) if isinstance(stmt, (Assign, Accum))) or 1
+
+
+def _total_reads(loop_op: LoopOp) -> int:
+    """Sum of enclosing-loop iterations over ``Load`` stmts.
+
+    Proxy for global-memory traffic (no cache modeling — all Loads
+    count). A fusion that multiplies reads by a seq factor shows up as
+    a ratio blowup here even when arithmetic stays flat.
+    """
+    return sum(cost for stmt, cost in _walk_leaf_costs(loop_op) if isinstance(stmt, Load)) or 1
+
+
+def _has_reduce(loop_op: LoopOp) -> bool:
+    return bool(loop_op.reduce_axis_names)
+
+
+# Producers with more than a handful of ops per output element are "reduce-heavy":
+# their output at position p requires non-trivial compute (typically a reduce whose
+# body depends on p). Duplicating such a producer's body (multi-load fusion) then
+# re-executes the reduce per load site — what softmax-over-matmul (scaled_qk) does
+# at scale. Pure-elementwise chains sit at ~1–3 ops/output; softmax's
+# (max + exp) sits at ~3; a matmul sits at reduce_extent (head_dim=64). Threshold
+# 4 separates the two regimes cleanly.
+_REDUCE_HEAVY_WORK_PER_OUTPUT = 4
+
+
+def _reduce_heavy(op: LoopOp) -> bool:
+    return _total_work(op) > _REDUCE_HEAVY_WORK_PER_OUTPUT * _output_numel(op)
 
 
 def _is_pure_indexmap(loop_op: LoopOp) -> bool:
@@ -84,6 +132,11 @@ def _output_numel(loop_op: LoopOp) -> int:
     return n
 
 
+def _count_loads_from(consumer_op: LoopOp, producer_input_idx: int) -> int:
+    """Number of ``Load`` stmts in the consumer body reading producer's output."""
+    return sum(1 for ld in consumer_op.loads if ld.source == producer_input_idx)
+
+
 PATTERN = [
     Pattern("producer", LoopOp),
     Pattern("consumer", LoopOp),
@@ -99,6 +152,20 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     if not isinstance(producer_node.op, LoopOp) or not isinstance(consumer_node.op, LoopOp):
         return None
     if producer_id not in consumer_node.inputs:
+        return None
+
+    # Multi-load-of-reduce-heavy-producer guard: if the consumer references
+    # the producer's output via more than one Load stmt AND the producer does
+    # more than a few ops per output element (i.e., has a real reduce whose
+    # body can't be shared across the consumer's load positions), fusion
+    # would duplicate the reduce per load site. Catches SDPA's softmax over
+    # matmul — scaled_qk (head_dim reduce) feeds both row-max and exp, and
+    # fusing would re-run the matmul head_dim reduce at every output element.
+    # Pure-elementwise producers and "cheap" reducers like softmax's
+    # (max + exp) — where the reduce collapses to a row scalar the splicer
+    # can hoist — stay fuseable.
+    producer_input_idx = consumer_node.inputs.index(producer_id)
+    if _reduce_heavy(producer_node.op) and _count_loads_from(consumer_node.op, producer_input_idx) > 1:
         return None
 
     # Build a subgraph: producer, consumer, and their non-producer external
@@ -124,9 +191,29 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         return None
     merged, merged_inputs = result
 
-    pre = _max_nest(producer_node.op) + _max_nest(consumer_node.op)
-    post = _max_nest(merged)
-    if post > _BLOWUP_FACTOR * pre:
+    pre_work = _total_work(producer_node.op) + _total_work(consumer_node.op)
+    pre_reads = _total_reads(producer_node.op) + _total_reads(consumer_node.op)
+    post_work = _total_work(merged)
+    post_reads = _total_reads(merged)
+    if post_work > _BLOWUP_FACTOR * pre_work:
+        return None
+    if post_reads > _BLOWUP_FACTOR * pre_reads:
+        return None
+
+    # Matmul-shape preservation: if the consumer already fits the tiled matmul
+    # template, refuse any fusion that would break that shape. The template
+    # cares about the reduce body specifically — it must stay ``[Load_A,
+    # Load_B, mul, accum]``. A producer whose output is loaded inside the
+    # reduce loop (e.g. RoPE fusing into QK^T) gets spliced into that body,
+    # turning the ~3-op matmul core into a dozen-op mess that the detector
+    # then rejects. ``analyze_matmul`` is the oracle — if it returns Some for
+    # the pre-merge consumer but None for the merged kernel, the fusion would
+    # convert a tile-able matmul into a scalar kernel. Refuse.
+    #
+    # The TinyLlama SDPA case at seq=512: RoPE-rotated Q / K fused into the
+    # QK^T reduce body, forcing n374 onto the scalar path (22 ms). Keeping
+    # RoPE external lets QK^T lift cleanly and the tiled template kick in.
+    if analyze_matmul(consumer_node.op) is not None and analyze_matmul(merged) is None:
         return None
 
     # Broadcast-materialization guard: fusing a compute-bearing producer into

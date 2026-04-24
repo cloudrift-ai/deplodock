@@ -53,10 +53,11 @@ def _hints_for(info) -> dict | None:
     m = int(info.m_axis.extent)
     n = int(info.n_axis.extent)
     k = int(info.k_axis.extent)
-    # Template assumes M == BM (one block processes the full M dimension).
-    # N and K must divide their tile / block sizes. The thread-tile
+    # M / N / K must divide their tile / block sizes. The template uses a 2D
+    # grid (gridDim.y = M / BM, gridDim.x = N / BN), so M >= BM with exact
+    # divisibility is enough — no BM == M special case. The thread-tile
     # arithmetic (BM/TM * BN/TN == threads) is re-checked in the emitter.
-    if m != tile["tile_m"] or n % tile["tile_n"] or k % tile["block_k"]:
+    if m % tile["tile_m"] or n % tile["tile_n"] or k % tile["block_k"]:
         return None
     if (tile["tile_m"] // tile["thread_m"]) * (tile["tile_n"] // tile["thread_n"]) != tile["threads"]:
         return None
@@ -65,8 +66,6 @@ def _hints_for(info) -> dict | None:
         "cuda.matmul.m": m,
         "cuda.matmul.n": n,
         "cuda.matmul.k": k,
-        "cuda.matmul.a_source": info.a_source,
-        "cuda.matmul.b_source": info.b_source,
         **{f"cuda.matmul.{k_}": v for k_, v in tile.items()},
     }
 
