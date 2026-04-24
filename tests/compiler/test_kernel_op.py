@@ -221,7 +221,7 @@ def test_update_synthesizes_accum_decl():
                         axis=Axis("k", 8),
                         body=(
                             Load("x_val", source=0, index=(Var("row"), Var("k"))),
-                            Accum(name="acc", value="x_val", op=ElementwiseOp("add")),
+                            Accum(name="acc", value="x_val", op="add"),
                         ),
                     ),
                     Write(output=0, index=(Var("row"),), value="acc"),
@@ -328,7 +328,7 @@ def test_kernel_softmax_two_accumulators():
         axes=axes,
         inputs=(p,),
         body=(
-            Accum(name="mx", value="$0", op=ElementwiseOp("maximum")),
+            Accum(name="mx", value="$0", op="maximum"),
             Accum(name="sm", value="$0"),
             Write(output=0, index=(Var("a0"),), value="mx"),
         ),
@@ -446,8 +446,8 @@ def test_update_op_conflict_rejected():
             axes=axes,
             inputs=(p,),
             body=(
-                Accum(name="acc", value="$0", op=ElementwiseOp("maximum")),
-                Accum(name="acc", value="$0", op=ElementwiseOp("add")),
+                Accum(name="acc", value="$0", op="maximum"),
+                Accum(name="acc", value="$0", op="add"),
             ),
         )
 
@@ -487,7 +487,7 @@ def test_loop_axis_sibling_same_name_allowed():
         axes=(Axis("a0", 4), Axis("k", 8)),
         inputs=(Port(index=(Var("a0"), Var("k"))), Port(index=(Var("a0"), Var("k")))),
         body=(
-            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0", op=ElementwiseOp("maximum")),)),
+            Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0", op="maximum"),)),
             Loop(axis=Axis("k", 8), body=(Accum(name="sm", value="$1"),)),
             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
             Write(output=0, index=(Var("a0"),), value="v"),
@@ -548,7 +548,7 @@ def _nested_reduce_kernel() -> LoopOp:
                         axis=Axis("k", 8),
                         body=(
                             Load(name="x_k", source=0, index=(Var("a0"), Var("k"))),
-                            Accum(name="acc", value="x_k", op=ElementwiseOp("add")),
+                            Accum(name="acc", value="x_k", op="add"),
                         ),
                     ),
                     Write(output=0, index=(Var("a0"),), value="acc"),

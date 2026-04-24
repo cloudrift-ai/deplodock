@@ -206,10 +206,10 @@ class FuncCallExpr(_ExprOps):
     args: list[Expr]
 
     def eval(self, env: dict[str, object]) -> object:
-        from deplodock.compiler.ir.elementwise import coerce_elementwise_impl
+        from deplodock.compiler.ir.elementwise import ElementwiseImpl
 
         try:
-            op = coerce_elementwise_impl(self.name)
+            op = ElementwiseImpl(self.name)
         except ValueError as e:
             raise NotImplementedError(f"FuncCallExpr.eval: unknown intrinsic {self.name!r}") from e
         return op.fn(*(a.eval(env) for a in self.args))

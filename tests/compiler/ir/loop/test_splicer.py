@@ -21,7 +21,6 @@ from deplodock.compiler.ir.loop import (
     splice_loop_ops,
     splice_loops,
 )
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,7 +68,7 @@ def test_pointwise_chain():
                 axis=A0,
                 body=(
                     Load(name="x", source=0, index=(Var("a0"),)),
-                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Assign(name="y", op="exp", args=("x",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -81,7 +80,7 @@ def test_pointwise_chain():
                 axis=A0,
                 body=(
                     Load(name="yv", source=0, index=(Var("a0"),)),
-                    Assign(name="z", op=ElementwiseOp("add"), args=("yv", "yv")),
+                    Assign(name="z", op="add", args=("yv", "yv")),
                     Write(output=0, index=(Var("a0"),), value="z"),
                 ),
             ),
@@ -116,7 +115,7 @@ def test_shared_intermediate_deduped():
                 axis=A0,
                 body=(
                     Load(name="x", source=0, index=(Var("a0"),)),
-                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Assign(name="y", op="exp", args=("x",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -130,7 +129,7 @@ def test_shared_intermediate_deduped():
                 body=(
                     Load(name="ya", source=0, index=(Var("a0"),)),
                     Load(name="yb", source=0, index=(Var("a0"),)),
-                    Assign(name="z", op=ElementwiseOp("add"), args=("ya", "yb")),
+                    Assign(name="z", op="add", args=("ya", "yb")),
                     Write(output=0, index=(Var("a0"),), value="z"),
                 ),
             ),
@@ -163,7 +162,7 @@ def test_different_indices_emit_twice():
                         axis=A1_same,
                         body=(
                             Load(name="x", source=0, index=(Var("a0"), Var("a1"))),
-                            Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                            Assign(name="y", op="exp", args=("x",)),
                             Write(output=0, index=(Var("a0"), Var("a1")), value="y"),
                         ),
                     ),
@@ -182,7 +181,7 @@ def test_different_indices_emit_twice():
                         body=(
                             Load(name="ya", source=0, index=(Var("a0"), Var("a1"))),
                             Load(name="yb", source=0, index=(Var("a1"), Var("a0"))),
-                            Assign(name="z", op=ElementwiseOp("add"), args=("ya", "yb")),
+                            Assign(name="z", op="add", args=("ya", "yb")),
                             Write(output=0, index=(Var("a0"), Var("a1")), value="z"),
                         ),
                     ),
@@ -213,7 +212,7 @@ def test_reduction_producer():
                         axis=K,
                         body=(
                             Load(name="x", source=0, index=(Var("a0"), Var("k"))),
-                            Accum(name="s", value="x", op=ElementwiseOp("add")),
+                            Accum(name="s", value="x", op="add"),
                         ),
                     ),
                     Write(output=0, index=(Var("a0"),), value="s"),
@@ -227,7 +226,7 @@ def test_reduction_producer():
                 axis=A0,
                 body=(
                     Load(name="sv", source=0, index=(Var("a0"),)),
-                    Assign(name="y", op=ElementwiseOp("exp"), args=("sv",)),
+                    Assign(name="y", op="exp", args=("sv",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -257,7 +256,7 @@ def test_consumer_extra_input_source_remap():
                 axis=A0,
                 body=(
                     Load(name="x", source=0, index=(Var("a0"),)),
-                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Assign(name="y", op="exp", args=("x",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -270,7 +269,7 @@ def test_consumer_extra_input_source_remap():
                 body=(
                     Load(name="yv", source=0, index=(Var("a0"),)),  # from producer
                     Load(name="b", source=1, index=(Var("a0"),)),  # unrelated
-                    Assign(name="z", op=ElementwiseOp("add"), args=("yv", "b")),
+                    Assign(name="z", op="add", args=("yv", "b")),
                     Write(output=0, index=(Var("a0"),), value="z"),
                 ),
             ),
@@ -309,7 +308,7 @@ def test_live_axes_computed():
                         axis=K,
                         body=(
                             Load(name="x", source=0, index=(Var("a0"), Var("k"))),
-                            Accum(name="s", value="x", op=ElementwiseOp("add")),
+                            Accum(name="s", value="x", op="add"),
                         ),
                     ),
                     Write(output=0, index=(Var("a0"),), value="s"),
@@ -344,7 +343,7 @@ def test_chain_three_loops():
                 axis=A0,
                 body=(
                     Load(name="x", source=0, index=(Var("a0"),)),
-                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Assign(name="y", op="exp", args=("x",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -356,7 +355,7 @@ def test_chain_three_loops():
                 axis=A0,
                 body=(
                     Load(name="av", source=0, index=(Var("a0"),)),  # reads a
-                    Assign(name="y", op=ElementwiseOp("negative"), args=("av",)),
+                    Assign(name="y", op="negative", args=("av",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -369,7 +368,7 @@ def test_chain_three_loops():
                 body=(
                     Load(name="bv", source=0, index=(Var("a0"),)),  # reads b
                     Load(name="bias", source=1, index=(Var("a0"),)),  # external
-                    Assign(name="y", op=ElementwiseOp("add"), args=("bv", "bias")),
+                    Assign(name="y", op="add", args=("bv", "bias")),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -410,7 +409,7 @@ def test_multi_output_root_preserves_all_writes():
                 axis=A0,
                 body=(
                     Load(name="x", source=0, index=(Var("a0"),)),
-                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Assign(name="y", op="exp", args=("x",)),
                     Write(output=0, index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -424,8 +423,8 @@ def test_multi_output_root_preserves_all_writes():
                 axis=A0,
                 body=(
                     Load(name="yv", source=0, index=(Var("a0"),)),
-                    Assign(name="z0", op=ElementwiseOp("negative"), args=("yv",)),
-                    Assign(name="z1", op=ElementwiseOp("abs"), args=("yv",)),
+                    Assign(name="z0", op="negative", args=("yv",)),
+                    Assign(name="z1", op="abs", args=("yv",)),
                     Write(output=0, index=(Var("a0"),), value="z0"),
                     Write(output=1, index=(Var("a0"),), value="z1"),
                 ),
@@ -455,8 +454,8 @@ def test_multi_output_splice_target():
                 axis=A0,
                 body=(
                     Load(name="x", source=0, index=(Var("a0"),)),
-                    Assign(name="y0", op=ElementwiseOp("exp"), args=("x",)),
-                    Assign(name="y1", op=ElementwiseOp("negative"), args=("x",)),
+                    Assign(name="y0", op="exp", args=("x",)),
+                    Assign(name="y1", op="negative", args=("x",)),
                     Write(output=0, index=(Var("a0"),), value="y0"),
                     Write(output=1, index=(Var("a0"),), value="y1"),
                 ),
@@ -473,7 +472,7 @@ def test_multi_output_splice_target():
                 body=(
                     Load(name="a", source=0, index=(Var("a0"),)),
                     Load(name="b", source=1, index=(Var("a0"),)),
-                    Assign(name="z", op=ElementwiseOp("add"), args=("a", "b")),
+                    Assign(name="z", op="add", args=("a", "b")),
                     Write(output=0, index=(Var("a0"),), value="z"),
                 ),
             ),
@@ -511,7 +510,7 @@ def test_literal_producer_write_index():
                 axis=A0,
                 body=(
                     Load(name="x", source=0, index=(Var("a0"),)),
-                    Assign(name="y", op=ElementwiseOp("exp"), args=("x",)),
+                    Assign(name="y", op="exp", args=("x",)),
                     Write(output=0, index=(Var("a0"), Literal(0)), value="y"),
                 ),
             ),
@@ -523,7 +522,7 @@ def test_literal_producer_write_index():
                 axis=A0,
                 body=(
                     Load(name="yv", source=0, index=(Var("a0"), Literal(0))),
-                    Assign(name="z", op=ElementwiseOp("negative"), args=("yv",)),
+                    Assign(name="z", op="negative", args=("yv",)),
                     Write(output=0, index=(Var("a0"),), value="z"),
                 ),
             ),

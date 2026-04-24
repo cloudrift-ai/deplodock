@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from deplodock.compiler.ir.base import Op, _keepdim_axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl, coerce_elementwise_impl
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 
 # ---------------------------------------------------------------------------
 # Elementwise / reduce / scan
@@ -44,19 +44,14 @@ class ElementwiseOp(Op):
     """Apply a scalar function independently to each element.
 
     The ``op`` field is an ``ElementwiseImpl`` carrying the function's name +
-    arity + commutativity + (for reducer use) identity. A plain string
-    is accepted by ``__post_init__`` and resolved to the canonical
-    ``ElementwiseImpl`` via the registry in ``ir.expr``.
+    arity + commutativity + (for reducer use) identity.
     """
 
-    op: ElementwiseImpl = field(default_factory=lambda: coerce_elementwise_impl("copy"))
+    op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("copy"))
 
     def __post_init__(self) -> None:
-        # Accept a string name for back-compat with ``ElementwiseOp("add")``
-        # / ``ElementwiseOp(op="add")``-style construction; resolve to the
-        # canonical ElementwiseImpl so the rest of the pipeline sees structured
-        # metadata.
-        object.__setattr__(self, "op", coerce_elementwise_impl(self.op))
+        if isinstance(self.op, str):
+            object.__setattr__(self, "op", ElementwiseImpl(self.op))
 
     @property
     def name(self) -> str:
@@ -109,11 +104,12 @@ class ReduceOp(Op):
     the reduced dimension (concrete int or symbolic name).
     """
 
-    op: ElementwiseImpl = field(default_factory=lambda: coerce_elementwise_impl("sum"))
+    op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("sum"))
     axis: int | str = 0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "op", coerce_elementwise_impl(self.op))
+        if isinstance(self.op, str):
+            object.__setattr__(self, "op", ElementwiseImpl(self.op))
 
     @property
     def name(self) -> str:
@@ -149,11 +145,12 @@ class ReduceOp(Op):
 class ScanOp(Op):
     """Cumulative application of an associative binary op along an axis."""
 
-    op: ElementwiseImpl = field(default_factory=lambda: coerce_elementwise_impl("sum"))
+    op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("sum"))
     axis: int | str = 0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "op", coerce_elementwise_impl(self.op))
+        if isinstance(self.op, str):
+            object.__setattr__(self, "op", ElementwiseImpl(self.op))
 
     @property
     def name(self) -> str:

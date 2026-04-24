@@ -65,7 +65,6 @@ from deplodock.compiler.ir.loop.ir import (
     Write,
 )
 from deplodock.compiler.ir.loop.sigma import Sigma
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 
 class _NotSupported(Exception):
@@ -346,7 +345,7 @@ class _Splicer(LoopBuilder):
         if sigma is None:
             raise _NotSupported
         v_bound = self._ensure_dep(target_write.value, target_tag, sigma, d.demand_scope)
-        self.insert(Assign(name=d.bound_as, op=ElementwiseOp("copy"), args=(v_bound,)), d.demand_scope)
+        self.insert(Assign(name=d.bound_as, op="copy", args=(v_bound,)), d.demand_scope)
 
     def _resolve_accum(self, stmt: Accum, d: _Demand) -> None:
         """Emit ``Loop(fresh_reduce_axis, [Accum(bound, value_bound, op)])`` at
