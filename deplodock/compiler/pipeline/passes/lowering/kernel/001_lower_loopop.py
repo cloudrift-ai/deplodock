@@ -14,8 +14,10 @@ from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.lowering.kernel._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.kernel._emit import emit_kernel, kernel_name_for, launch_config
 from deplodock.compiler.pipeline.passes.lowering.kernel._emit_matmul import emit_matmul_kernel, is_matmul_annotated
+from deplodock.compiler.pipeline.passes.lowering.kernel._unified import emit_unified
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -28,8 +30,12 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     if is_matmul_annotated(node):
         gpu_kernel, arg_order, grid, block = emit_matmul_kernel(node, kname, graph)
     else:
-        gpu_kernel, arg_order = emit_kernel(node, kname, graph)
-        grid, block = launch_config(node)
+        sig = classify(node.op)
+        if sig is not None:
+            gpu_kernel, arg_order, grid, block = emit_unified(node, kname, graph, sig)
+        else:
+            gpu_kernel, arg_order = emit_kernel(node, kname, graph)
+            grid, block = launch_config(node)
     node.op = KernelOp(
         kernel=gpu_kernel,
         kernel_name=kname,
