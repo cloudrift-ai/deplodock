@@ -2,7 +2,7 @@
 
 import pytest
 
-from deplodock.compiler.ir.expr import BinOp, ExprOp, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, ExprOp, Literal, Var
 from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
@@ -43,7 +43,7 @@ def _nest(axes, body):
         def _walk(e):
             if isinstance(e, Var):
                 write_axis_names.add(e.name)
-            elif isinstance(e, BinOp):
+            elif isinstance(e, BinaryExpr):
                 _walk(e.left)
                 _walk(e.right)
 

@@ -9,7 +9,7 @@ import math
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.expr import BinOp, Literal, placeholder
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
@@ -71,7 +71,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
                 p = placeholder(d)
                 head_axis = len(q_batch) - 1
                 if d == head_axis:
-                    coord_map.append(BinOp("/", p, Literal(group_size, "int")))
+                    coord_map.append(BinaryExpr("/", p, Literal(group_size, "int")))
                 else:
                     coord_map.append(p)
             kt_id = frag.add_node(
@@ -143,12 +143,12 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
                 IndexSource(
                     input_idx=0,
                     coord_map=(Literal(0, "int"),),
-                    select=BinOp("<=", j_var, i_var),
+                    select=BinaryExpr("<=", j_var, i_var),
                 ),
                 IndexSource(
                     input_idx=1,
                     coord_map=(Literal(0, "int"),),
-                    select=BinOp(">", j_var, i_var),
+                    select=BinaryExpr(">", j_var, i_var),
                 ),
             ),
         )
@@ -209,7 +209,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
             for d in range(len(v_shape)):
                 p = placeholder(d)
                 if d == head_axis_v:
-                    coord_map_v.append(BinOp("/", p, Literal(group_size_v, "int")))
+                    coord_map_v.append(BinaryExpr("/", p, Literal(group_size_v, "int")))
                 else:
                     coord_map_v.append(p)
             actual_v_id = frag.add_node(

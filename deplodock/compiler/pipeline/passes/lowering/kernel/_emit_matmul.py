@@ -45,7 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.expr import BinOp, Expr, FuncCall, Literal, Var, free_vars
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, FuncCallExpr, Literal, Var, free_vars
 from deplodock.compiler.ir.kernel.ir import GpuKernel, GpuKernelParam, RawCode
 from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, Loop, LoopOp, Select, Stmt, Write
 
@@ -397,11 +397,11 @@ def _render_expr(expr: Expr, env: dict[str, str]) -> str:
         if isinstance(expr.value, int):
             return str(expr.value)
         return f"{float(expr.value):.6g}f"
-    if isinstance(expr, BinOp):
+    if isinstance(expr, BinaryExpr):
         lhs = _render_expr(expr.left, env)
         rhs = _render_expr(expr.right, env)
         return f"({lhs} {expr.op} {rhs})"
-    if isinstance(expr, FuncCall):
+    if isinstance(expr, FuncCallExpr):
         args = ", ".join(_render_expr(a, env) for a in expr.args)
         return f"{expr.name}({args})"
     raise ValueError(f"unsupported expr in matmul emitter: {type(expr).__name__}")

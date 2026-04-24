@@ -1,10 +1,10 @@
 """Unit tests for ``compiler.ir.simplify`` — the generic Expr rewriter.
 
 Covers:
-- Constant folding for every BinOp op / Cast.
+- Constant folding for every BinaryExpr op / CastExpr.
 - Algebraic identities (``x+0``, ``x*0``, ``x-x``, etc.).
 - Range-based comparison folding using Context intervals.
-- Ternary collapse (literal cond, equal branches).
+- TernaryExpr collapse (literal cond, equal branches).
 - Idempotence — simplifying twice equals simplifying once.
 - Kernel IR walker — tid-range propagation from IfStmt, ForLoop bounds.
 - Loop IR walker — axis extents seed ranges, no clamp survives on a
@@ -13,7 +13,7 @@ Covers:
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.expr import BinOp, Builtin, Cast, FuncCall, Literal, Ternary, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Builtin, CastExpr, FuncCallExpr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel import (
     ArrayAccess,
     AugAssign,
@@ -44,72 +44,72 @@ def _int(v: int) -> Literal:
 
 
 def test_constant_fold_add():
-    assert simplify_expr(BinOp("+", _int(2), _int(3)), Context.empty()) == _int(5)
+    assert simplify_expr(BinaryExpr("+", _int(2), _int(3)), Context.empty()) == _int(5)
 
 
 def test_constant_fold_mul():
-    assert simplify_expr(BinOp("*", _int(4), _int(5)), Context.empty()) == _int(20)
+    assert simplify_expr(BinaryExpr("*", _int(4), _int(5)), Context.empty()) == _int(20)
 
 
 def test_constant_fold_mod():
-    assert simplify_expr(BinOp("%", _int(10), _int(3)), Context.empty()) == _int(1)
+    assert simplify_expr(BinaryExpr("%", _int(10), _int(3)), Context.empty()) == _int(1)
 
 
 def test_constant_fold_comparison():
-    e = BinOp("<", _int(2), _int(3))
+    e = BinaryExpr("<", _int(2), _int(3))
     assert simplify_expr(e, Context.empty()) == _int(1)
 
 
 def test_x_plus_zero():
     x = Var("x")
-    assert simplify_expr(BinOp("+", x, _int(0)), Context.empty()) == x
-    assert simplify_expr(BinOp("+", _int(0), x), Context.empty()) == x
+    assert simplify_expr(BinaryExpr("+", x, _int(0)), Context.empty()) == x
+    assert simplify_expr(BinaryExpr("+", _int(0), x), Context.empty()) == x
 
 
 def test_x_times_zero():
     x = Var("x")
-    assert simplify_expr(BinOp("*", x, _int(0)), Context.empty()) == _int(0)
-    assert simplify_expr(BinOp("*", _int(0), x), Context.empty()) == _int(0)
+    assert simplify_expr(BinaryExpr("*", x, _int(0)), Context.empty()) == _int(0)
+    assert simplify_expr(BinaryExpr("*", _int(0), x), Context.empty()) == _int(0)
 
 
 def test_x_times_one():
     x = Var("x")
-    assert simplify_expr(BinOp("*", x, _int(1)), Context.empty()) == x
+    assert simplify_expr(BinaryExpr("*", x, _int(1)), Context.empty()) == x
 
 
 def test_x_minus_x():
     x = Var("x")
-    assert simplify_expr(BinOp("-", x, x), Context.empty()) == _int(0)
+    assert simplify_expr(BinaryExpr("-", x, x), Context.empty()) == _int(0)
 
 
 def test_x_mod_one():
     x = Var("x")
-    assert simplify_expr(BinOp("%", x, _int(1)), Context.empty()) == _int(0)
+    assert simplify_expr(BinaryExpr("%", x, _int(1)), Context.empty()) == _int(0)
 
 
 def test_zero_div_x():
     x = Var("x")
-    assert simplify_expr(BinOp("/", _int(0), x), Context.empty()) == _int(0)
+    assert simplify_expr(BinaryExpr("/", _int(0), x), Context.empty()) == _int(0)
 
 
 # ---------------------------------------------------------------------------
-# Ternary collapse
+# TernaryExpr collapse
 # ---------------------------------------------------------------------------
 
 
 def test_ternary_literal_true_cond():
     a, b = Var("a"), Var("b")
-    assert simplify_expr(Ternary(_int(1), a, b), Context.empty()) == a
+    assert simplify_expr(TernaryExpr(_int(1), a, b), Context.empty()) == a
 
 
 def test_ternary_literal_false_cond():
     a, b = Var("a"), Var("b")
-    assert simplify_expr(Ternary(_int(0), a, b), Context.empty()) == b
+    assert simplify_expr(TernaryExpr(_int(0), a, b), Context.empty()) == b
 
 
 def test_ternary_equal_branches():
     a = Var("a")
-    assert simplify_expr(Ternary(Var("c"), a, a), Context.empty()) == a
+    assert simplify_expr(TernaryExpr(Var("c"), a, a), Context.empty()) == a
 
 
 # ---------------------------------------------------------------------------
@@ -121,21 +121,21 @@ def test_range_decides_comparison_false():
     k = Var("k")
     ctx = Context({"k": Interval(0, 2047)})
     # k > 2047 is always false in [0, 2047]
-    assert simplify_expr(BinOp(">", k, _int(2047)), ctx) == _int(0)
+    assert simplify_expr(BinaryExpr(">", k, _int(2047)), ctx) == _int(0)
 
 
 def test_range_decides_comparison_true():
     k = Var("k")
     ctx = Context({"k": Interval(0, 2047)})
     # k < 2048 is always true
-    assert simplify_expr(BinOp("<", k, _int(2048)), ctx) == _int(1)
+    assert simplify_expr(BinaryExpr("<", k, _int(2048)), ctx) == _int(1)
 
 
 def test_chained_clamp_collapses_to_var():
     """(k0 > N-1 ? N-1 : k0) < 0 ? 0 : ... → k0, when k0 ∈ [0, N-1]."""
     k = Var("k0")
-    upper = Ternary(BinOp(">", k, _int(2047)), _int(2047), k)
-    full = Ternary(BinOp("<", upper, _int(0)), _int(0), upper)
+    upper = TernaryExpr(BinaryExpr(">", k, _int(2047)), _int(2047), k)
+    full = TernaryExpr(BinaryExpr("<", upper, _int(0)), _int(0), upper)
     ctx = Context({"k0": Interval(0, 2047)})
     assert simplify_expr(full, ctx) == k
 
@@ -144,20 +144,20 @@ def test_mod_produces_known_range():
     k = Var("tid")
     ctx = Context({"tid": Interval(0, 65535)})
     # tid % 2048 has range [0, 2047]
-    mod = BinOp("%", k, _int(2048))
+    mod = BinaryExpr("%", k, _int(2048))
     assert infer_range(mod, ctx) == Interval(0, 2047)
     # (tid % 2048) > 2047 is always false
-    assert simplify_expr(BinOp(">", mod, _int(2047)), ctx) == _int(0)
+    assert simplify_expr(BinaryExpr(">", mod, _int(2047)), ctx) == _int(0)
 
 
 def test_infer_range_plus():
     ctx = Context({"a": Interval(0, 10), "b": Interval(5, 20)})
-    assert infer_range(BinOp("+", Var("a"), Var("b")), ctx) == Interval(5, 30)
+    assert infer_range(BinaryExpr("+", Var("a"), Var("b")), ctx) == Interval(5, 30)
 
 
 def test_infer_range_div_by_const():
     ctx = Context({"tid": Interval(0, 65535)})
-    assert infer_range(BinOp("/", Var("tid"), _int(2048)), ctx) == Interval(0, 31)
+    assert infer_range(BinaryExpr("/", Var("tid"), _int(2048)), ctx) == Interval(0, 31)
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +167,8 @@ def test_infer_range_div_by_const():
 
 def test_idempotent_on_clamp_chain():
     k = Var("k0")
-    upper = Ternary(BinOp(">", k, _int(2047)), _int(2047), k)
-    full = Ternary(BinOp("<", upper, _int(0)), _int(0), upper)
+    upper = TernaryExpr(BinaryExpr(">", k, _int(2047)), _int(2047), k)
+    full = TernaryExpr(BinaryExpr("<", upper, _int(0)), _int(0), upper)
     ctx = Context({"k0": Interval(0, 2047)})
     once = simplify_expr(full, ctx)
     twice = simplify_expr(once, ctx)
@@ -181,21 +181,21 @@ def test_idempotent_on_var():
 
 
 # ---------------------------------------------------------------------------
-# Cast / FuncCall / ArrayAccess
+# CastExpr / FuncCallExpr / ArrayAccess
 # ---------------------------------------------------------------------------
 
 
 def test_cast_literal_to_int():
-    assert simplify_expr(Cast("int", Literal(3.7, "float")), Context.empty()) == _int(3)
+    assert simplify_expr(CastExpr("int", Literal(3.7, "float")), Context.empty()) == _int(3)
 
 
 def test_funccall_args_simplified():
-    e = FuncCall("exp", [BinOp("+", _int(1), _int(2))])
-    assert simplify_expr(e, Context.empty()) == FuncCall("exp", [_int(3)])
+    e = FuncCallExpr("exp", [BinaryExpr("+", _int(1), _int(2))])
+    assert simplify_expr(e, Context.empty()) == FuncCallExpr("exp", [_int(3)])
 
 
 def test_array_access_index_simplified():
-    e = ArrayAccess("x", BinOp("+", Var("i"), _int(0)))
+    e = ArrayAccess("x", BinaryExpr("+", Var("i"), _int(0)))
     assert simplify_expr(e, Context.empty()) == ArrayAccess("x", Var("i"))
 
 
@@ -206,15 +206,15 @@ def test_array_access_index_simplified():
 
 def _rms_kernel() -> GpuKernel:
     """Minimal kernel mirroring the RMSNorm layout: tid = bx*bdx+tx, if tid<N."""
-    tid_init = BinOp(
+    tid_init = BinaryExpr(
         "+",
-        BinOp("*", Builtin("blockIdx.x"), Builtin("blockDim.x")),
+        BinaryExpr("*", Builtin("blockIdx.x"), Builtin("blockDim.x")),
         Builtin("threadIdx.x"),
     )
     body = [
         VarDecl("long long", "tid", tid_init),
         IfStmt(
-            BinOp("<", Var("tid"), _int(65536)),
+            BinaryExpr("<", Var("tid"), _int(65536)),
             [
                 # target has a redundant clamp: (tid%2048 > 2047) ? 2047 : tid%2048
                 VarDecl(
@@ -222,10 +222,10 @@ def _rms_kernel() -> GpuKernel:
                     "t",
                     ArrayAccess(
                         "x",
-                        Ternary(
-                            BinOp(">", BinOp("%", Var("tid"), _int(2048)), _int(2047)),
+                        TernaryExpr(
+                            BinaryExpr(">", BinaryExpr("%", Var("tid"), _int(2048)), _int(2047)),
                             _int(2047),
-                            BinOp("%", Var("tid"), _int(2048)),
+                            BinaryExpr("%", Var("tid"), _int(2048)),
                         ),
                     ),
                 ),
@@ -249,7 +249,7 @@ def test_kernel_walker_eliminates_clamp_via_if_tightening():
     assert isinstance(if_stmt, IfStmt)
     inner_decl = if_stmt.body[0]
     assert isinstance(inner_decl, VarDecl)
-    assert inner_decl.init == ArrayAccess("x", BinOp("%", Var("tid"), _int(2048)))
+    assert inner_decl.init == ArrayAccess("x", BinaryExpr("%", Var("tid"), _int(2048)))
 
 
 def test_kernel_walker_for_loop_bounds():
@@ -257,7 +257,7 @@ def test_kernel_walker_for_loop_bounds():
     inner = AugAssign(
         "acc",
         "+=",
-        Ternary(BinOp(">", Var("k0"), _int(2047)), _int(0), Var("k0")),
+        TernaryExpr(BinaryExpr(">", Var("k0"), _int(2047)), _int(0), Var("k0")),
     )
     kernel = GpuKernel(
         name="k",
@@ -273,7 +273,7 @@ def test_kernel_walker_for_loop_bounds():
     assert isinstance(for_stmt, ForLoop)
     inner_simp = for_stmt.body[0]
     assert isinstance(inner_simp, AugAssign)
-    # k0 > 2047 is always False in [0, 2047] → Ternary collapses to the else branch, Var("k0").
+    # k0 > 2047 is always False in [0, 2047] → TernaryExpr collapses to the else branch, Var("k0").
     assert inner_simp.value == Var("k0")
 
 
@@ -291,7 +291,7 @@ def test_kernel_walker_idempotent():
 
 def test_loop_op_walker_simplifies_load_index():
     """Body Load index (a0 + 0) * 1 simplifies to a0 under axis range info."""
-    load = Load(name="x", source=0, index=(BinOp("*", BinOp("+", Var("a0"), _int(0)), _int(1)),))
+    load = Load(name="x", source=0, index=(BinaryExpr("*", BinaryExpr("+", Var("a0"), _int(0)), _int(1)),))
     assign = Assign("v", ElementwiseOp(op="negative"), ("x",))
     write = Write(0, (Var("a0"),), "v")
     loop = Loop(Axis("a0", 8), (load, assign, write))
@@ -302,7 +302,7 @@ def test_loop_op_walker_simplifies_load_index():
 
 
 def test_loop_op_walker_idempotent():
-    load = Load(name="x", source=0, index=(BinOp("+", Var("a0"), _int(0)),))
+    load = Load(name="x", source=0, index=(BinaryExpr("+", Var("a0"), _int(0)),))
     assign = Assign("v", ElementwiseOp(op="negative"), ("x",))
     write = Write(0, (Var("a0"),), "v")
     loop = Loop(Axis("a0", 8), (load, assign, write))

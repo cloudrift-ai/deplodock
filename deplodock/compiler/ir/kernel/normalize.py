@@ -15,9 +15,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.ir.expr import (
-    BinOp,
+    BinaryExpr,
     Builtin,
-    Cast,
+    CastExpr,
     Literal,
     Var,
 )
@@ -98,11 +98,11 @@ def _is_nonneg_composition(expr: object, ctx: Context) -> bool:
             return True
         r = ctx.ranges.get(expr.name)
         return r is not None and r.lo >= 0
-    if isinstance(expr, BinOp):
+    if isinstance(expr, BinaryExpr):
         if expr.op in ("+", "*", "/", "//", "%"):
             return _is_nonneg_composition(expr.left, ctx) and _is_nonneg_composition(expr.right, ctx)
         return False
-    if isinstance(expr, Cast):
+    if isinstance(expr, CastExpr):
         return _is_nonneg_composition(expr.expr, ctx)
     return False
 
@@ -112,7 +112,7 @@ def _tighten_from_cond(cond: object, ctx: Context) -> Context:
     range in ``ctx`` with the implication. Returns a new Context (unchanged
     when the condition doesn't yield a single-Var tightening).
     """
-    if not isinstance(cond, BinOp):
+    if not isinstance(cond, BinaryExpr):
         return ctx
     left, right, op = cond.left, cond.right, cond.op
 

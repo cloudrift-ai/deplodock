@@ -27,7 +27,7 @@ import math
 from dataclasses import dataclass, field
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.expr import BinOp, Builtin, Expr, FuncCall, Literal, Ternary, Var, substitute
+from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Expr, FuncCallExpr, Literal, TernaryExpr, Var, substitute
 from deplodock.compiler.ir.kernel.ir import (
     ArrayAccess,
     ArrayDecl,
@@ -228,9 +228,9 @@ def _emit_body_a(node: Node, graph: Graph, loop: LoopOp, strategy: _Strategy) ->
         VarDecl(
             dtype="long long",
             name="tid",
-            init=BinOp("+", BinOp("*", Builtin("block_idx.x"), Builtin("block_dim.x")), Builtin("thread_idx.x")),
+            init=BinaryExpr("+", BinaryExpr("*", Builtin("block_idx.x"), Builtin("block_dim.x")), Builtin("thread_idx.x")),
         ),
-        IfStmt(cond=BinOp("<", tid, Literal(n_threads, "int")), body=guarded),
+        IfStmt(cond=BinaryExpr("<", tid, Literal(n_threads, "int")), body=guarded),
     ]
     return stmts, strategy.block
 
@@ -338,7 +338,7 @@ def _emit_loop(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
         inner = _emit_stmts(loop.body, ctx)
         ctx.env = saved_env
         ctx.values = saved_values
-        out.append(IfStmt(cond=BinOp("<", tid, Literal(extent, "int")), body=inner))
+        out.append(IfStmt(cond=BinaryExpr("<", tid, Literal(extent, "int")), body=inner))
         return
 
     k_name = f"k{ctx.loop_seq[0]}"
@@ -451,7 +451,7 @@ def _emit_reduce_loop_smem(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
         stride = _BLOCK // 2
         while stride > 0:
             combine = _smem_combine_stmt(smem_name, stride, tid, accum.op.name)
-            out.append(IfStmt(cond=BinOp("<", tid, Literal(stride, "int")), body=[combine]))
+            out.append(IfStmt(cond=BinaryExpr("<", tid, Literal(stride, "int")), body=[combine]))
             out.append(SyncThreads())
             stride //= 2
 
@@ -462,16 +462,16 @@ def _emit_reduce_loop_smem(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
 def _smem_combine_stmt(smem_name: str, stride: int, tid: Expr, op_fn: str) -> Stmt:
     """One combine step of the tree reduction: ``smem[tid] = smem[tid] op smem[tid+stride]``."""
     lhs = ArrayAccess(array=smem_name, index=tid)
-    rhs = ArrayAccess(array=smem_name, index=BinOp("+", tid, Literal(stride, "int")))
+    rhs = ArrayAccess(array=smem_name, index=BinaryExpr("+", tid, Literal(stride, "int")))
     if op_fn == "maximum":
-        return IrAssign(target=lhs, value=FuncCall("fmax", [lhs, rhs]))
+        return IrAssign(target=lhs, value=FuncCallExpr("fmax", [lhs, rhs]))
     if op_fn == "minimum":
-        return IrAssign(target=lhs, value=FuncCall("fmin", [lhs, rhs]))
+        return IrAssign(target=lhs, value=FuncCallExpr("fmin", [lhs, rhs]))
     if op_fn in ("add", "sum"):
-        return IrAssign(target=lhs, value=BinOp("+", lhs, rhs))
+        return IrAssign(target=lhs, value=BinaryExpr("+", lhs, rhs))
     if op_fn in ("multiply", "prod"):
-        return IrAssign(target=lhs, value=BinOp("*", lhs, rhs))
-    return IrAssign(target=lhs, value=BinOp("+", lhs, rhs))
+        return IrAssign(target=lhs, value=BinaryExpr("*", lhs, rhs))
+    return IrAssign(target=lhs, value=BinaryExpr("+", lhs, rhs))
 
 
 # ---------------------------------------------------------------------------
@@ -493,8 +493,8 @@ def _axis_env_for_flat(axes: tuple[Axis, ...], flat_idx: Expr) -> dict[str, Expr
         if i == 0:
             env[axes[i].name] = remainder
         else:
-            env[axes[i].name] = BinOp("%", remainder, Literal(dim, "int"))
-            remainder = BinOp("/", remainder, Literal(dim, "int"))
+            env[axes[i].name] = BinaryExpr("%", remainder, Literal(dim, "int"))
+            remainder = BinaryExpr("/", remainder, Literal(dim, "int"))
     return env
 
 
@@ -506,11 +506,11 @@ def _flatten_coords(coords: list[Expr], shape: tuple) -> Expr:
     dims = [int(d) if isinstance(d, int) else 1 for d in shape]
     for d in range(len(coords) - 1, -1, -1):
         coord = coords[d]
-        term = coord if stride == 1 else BinOp("*", coord, Literal(stride, "int"))
+        term = coord if stride == 1 else BinaryExpr("*", coord, Literal(stride, "int"))
         if isinstance(flat, Literal) and flat.value == 0:
             flat = term
         else:
-            flat = BinOp("+", term, flat)
+            flat = BinaryExpr("+", term, flat)
         if d > 0 and d < len(dims):
             stride *= dims[d]
     return flat
@@ -521,15 +521,15 @@ def _emit_select(stmt: Select, values: dict[str, Expr], axis_env: dict[str, Expr
     result: Expr = values[branches[-1].value]
     for branch in reversed(branches[:-1]):
         cond = substitute(branch.select, axis_env)
-        result = Ternary(cond=cond, if_true=values[branch.value], if_false=result)
+        result = TernaryExpr(cond=cond, if_true=values[branch.value], if_false=result)
     return result
 
 
 def _emit_reduce_accum(acc_name: str, fn: str, value: Expr) -> Stmt:
     if fn == "maximum":
-        return VarAssign(name=acc_name, value=FuncCall("fmax", [Var(acc_name), value]))
+        return VarAssign(name=acc_name, value=FuncCallExpr("fmax", [Var(acc_name), value]))
     if fn == "minimum":
-        return VarAssign(name=acc_name, value=FuncCall("fmin", [Var(acc_name), value]))
+        return VarAssign(name=acc_name, value=FuncCallExpr("fmin", [Var(acc_name), value]))
     op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(fn, "+=")
     return AugAssign(target=acc_name, op=op, value=value)
 
@@ -545,27 +545,27 @@ _SUPPORTED_UNARY = {
 def _apply_elementwise(fn: str, inputs: list[Expr]) -> Expr:
     if fn in {"add", "subtract", "multiply", "divide", "mod"}:
         op = {"add": "+", "subtract": "-", "multiply": "*", "divide": "/", "mod": "%"}[fn]
-        return BinOp(op, inputs[0], inputs[1])
+        return BinaryExpr(op, inputs[0], inputs[1])
     if fn == "maximum":
-        return FuncCall("fmax", list(inputs))
+        return FuncCallExpr("fmax", list(inputs))
     if fn == "minimum":
-        return FuncCall("fmin", list(inputs))
+        return FuncCallExpr("fmin", list(inputs))
     if fn == "pow":
-        return FuncCall("pow", list(inputs))
+        return FuncCallExpr("pow", list(inputs))
     if fn == "negative":
-        return BinOp("-", Literal(0.0, "float"), inputs[0])
+        return BinaryExpr("-", Literal(0.0, "float"), inputs[0])
     if fn == "copy":
         return inputs[0]
     if fn == "reciprocal":
-        return BinOp("/", Literal(1.0, "float"), inputs[0])
+        return BinaryExpr("/", Literal(1.0, "float"), inputs[0])
     if fn == "relu":
-        return FuncCall("fmax", [Literal(0.0, "float"), inputs[0]])
+        return FuncCallExpr("fmax", [Literal(0.0, "float"), inputs[0]])
     if fn == "sigmoid":
-        neg_x = BinOp("-", Literal(0.0, "float"), inputs[0])
-        exp_neg = FuncCall("exp", [neg_x])
-        return BinOp("/", Literal(1.0, "float"), BinOp("+", Literal(1.0, "float"), exp_neg))
+        neg_x = BinaryExpr("-", Literal(0.0, "float"), inputs[0])
+        exp_neg = FuncCallExpr("exp", [neg_x])
+        return BinaryExpr("/", Literal(1.0, "float"), BinaryExpr("+", Literal(1.0, "float"), exp_neg))
     if fn in _SUPPORTED_UNARY:
-        return FuncCall(_SUPPORTED_UNARY[fn], list(inputs))
+        return FuncCallExpr(_SUPPORTED_UNARY[fn], list(inputs))
     raise NotImplementedError(f"elementwise fn={fn} not yet supported by emit")
 
 

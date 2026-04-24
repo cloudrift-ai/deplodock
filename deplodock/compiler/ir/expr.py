@@ -30,58 +30,58 @@ import numpy as np
 class _ExprOps:
     """Mixin that adds arithmetic and comparison operators to Expr nodes.
 
-    Returns BinOp nodes, enabling::
+    Returns BinaryExpr nodes, enabling::
 
-        Var("row") * Var("cols") + Var("j")   # → BinOp("+", BinOp("*", ...), ...)
-        Var("i").lt(Var("n"))                   # → BinOp("<", ...)
+        Var("row") * Var("cols") + Var("j")   # → BinaryExpr("+", BinaryExpr("*", ...), ...)
+        Var("i").lt(Var("n"))                   # → BinaryExpr("<", ...)
     """
 
-    def __add__(self, other: Expr) -> BinOp:
-        return BinOp("+", self, _coerce(other))
+    def __add__(self, other: Expr) -> BinaryExpr:
+        return BinaryExpr("+", self, _coerce(other))
 
-    def __radd__(self, other: Expr) -> BinOp:
-        return BinOp("+", _coerce(other), self)
+    def __radd__(self, other: Expr) -> BinaryExpr:
+        return BinaryExpr("+", _coerce(other), self)
 
-    def __sub__(self, other: Expr) -> BinOp:
-        return BinOp("-", self, _coerce(other))
+    def __sub__(self, other: Expr) -> BinaryExpr:
+        return BinaryExpr("-", self, _coerce(other))
 
-    def __rsub__(self, other: Expr) -> BinOp:
-        return BinOp("-", _coerce(other), self)
+    def __rsub__(self, other: Expr) -> BinaryExpr:
+        return BinaryExpr("-", _coerce(other), self)
 
-    def __mul__(self, other: Expr) -> BinOp:
-        return BinOp("*", self, _coerce(other))
+    def __mul__(self, other: Expr) -> BinaryExpr:
+        return BinaryExpr("*", self, _coerce(other))
 
-    def __rmul__(self, other: Expr) -> BinOp:
-        return BinOp("*", _coerce(other), self)
+    def __rmul__(self, other: Expr) -> BinaryExpr:
+        return BinaryExpr("*", _coerce(other), self)
 
-    def __truediv__(self, other: Expr) -> BinOp:
-        return BinOp("/", self, _coerce(other))
+    def __truediv__(self, other: Expr) -> BinaryExpr:
+        return BinaryExpr("/", self, _coerce(other))
 
-    def __mod__(self, other: Expr) -> BinOp:
-        return BinOp("%", self, _coerce(other))
+    def __mod__(self, other: Expr) -> BinaryExpr:
+        return BinaryExpr("%", self, _coerce(other))
 
-    def __neg__(self) -> BinOp:
-        return BinOp("-", Literal(0, "int"), self)
+    def __neg__(self) -> BinaryExpr:
+        return BinaryExpr("-", Literal(0, "int"), self)
 
-    def lt(self, other: Expr) -> BinOp:
+    def lt(self, other: Expr) -> BinaryExpr:
         """Less-than (``<``)."""
-        return BinOp("<", self, _coerce(other))
+        return BinaryExpr("<", self, _coerce(other))
 
-    def ge(self, other: Expr) -> BinOp:
+    def ge(self, other: Expr) -> BinaryExpr:
         """Greater-or-equal (``>=``)."""
-        return BinOp(">=", self, _coerce(other))
+        return BinaryExpr(">=", self, _coerce(other))
 
-    def eq(self, other: Expr) -> BinOp:
+    def eq(self, other: Expr) -> BinaryExpr:
         """Equal (``==``)."""
-        return BinOp("==", self, _coerce(other))
+        return BinaryExpr("==", self, _coerce(other))
 
-    def and_(self, other: Expr) -> BinOp:
+    def and_(self, other: Expr) -> BinaryExpr:
         """Logical AND (``&&``)."""
-        return BinOp("&&", self, _coerce(other))
+        return BinaryExpr("&&", self, _coerce(other))
 
-    def or_(self, other: Expr) -> BinOp:
+    def or_(self, other: Expr) -> BinaryExpr:
         """Logical OR (``||``)."""
-        return BinOp("||", self, _coerce(other))
+        return BinaryExpr("||", self, _coerce(other))
 
 
 def _coerce(v: Expr | int | float) -> Expr:
@@ -120,7 +120,7 @@ class Literal(_ExprOps):
 
 
 @dataclass
-class BinOp(_ExprOps):
+class BinaryExpr(_ExprOps):
     """Binary operation.
 
     Evaluates ``left`` and ``right`` in ``env`` then applies the op.
@@ -174,7 +174,7 @@ class BinOp(_ExprOps):
                 return bool(lv) or bool(rv)
             except (TypeError, ValueError):
                 return np.logical_or(lv, rv)
-        raise ValueError(f"Unknown BinOp: {op}")
+        raise ValueError(f"Unknown BinaryExpr: {op}")
 
 
 @dataclass
@@ -192,11 +192,11 @@ class Builtin(_ExprOps):
 
 
 @dataclass
-class FuncCall(_ExprOps):
+class FuncCallExpr(_ExprOps):
     """Intrinsic / math function call.
 
     ``name`` is an ``ExprOp`` registry name (numpy-aligned: ``exp`` /
-    ``tanh`` / ``maximum`` / ``reciprocal`` / …). ``FuncCall.eval`` pulls
+    ``tanh`` / ``maximum`` / ``reciprocal`` / …). ``FuncCallExpr.eval`` pulls
     the pre-bound callable off the registered ``ExprOp``; the CUDA
     emitter's ``_translate_intrinsic`` rewrites the same name to the
     ``f``-suffixed libm spelling at source-render time.
@@ -208,17 +208,17 @@ class FuncCall(_ExprOps):
     def eval(self, env: dict[str, object]) -> object:
         op = _EXPR_OP_REGISTRY.get(self.name)
         if op is None:
-            raise NotImplementedError(f"FuncCall.eval: unknown intrinsic {self.name!r}")
+            raise NotImplementedError(f"FuncCallExpr.eval: unknown intrinsic {self.name!r}")
         return op.fn(*(a.eval(env) for a in self.args))
 
 
 @dataclass
-class Ternary(_ExprOps):
-    """Ternary expression: cond ? if_true : if_false.
+class TernaryExpr(_ExprOps):
+    """TernaryExpr expression: cond ? if_true : if_false.
 
     Uses Python's conditional: when ``cond`` evaluates to an ndarray,
     callers that want elementwise selection should use ``np.where``
-    directly; ``Ternary.eval`` only supports scalar ``cond``.
+    directly; ``TernaryExpr.eval`` only supports scalar ``cond``.
     """
 
     cond: Expr
@@ -230,7 +230,7 @@ class Ternary(_ExprOps):
 
 
 @dataclass
-class Cast(_ExprOps):
+class CastExpr(_ExprOps):
     """Type cast of an inner expression to ``dtype`` (e.g. ``"int"``, ``"float"``)."""
 
     dtype: str
@@ -243,7 +243,7 @@ class Cast(_ExprOps):
         return v
 
 
-Expr = Var | Literal | BinOp | Builtin | FuncCall | Ternary | Cast
+Expr = Var | Literal | BinaryExpr | Builtin | FuncCallExpr | TernaryExpr | CastExpr
 
 
 def render(expr: Expr, formatter: Callable[[object], str | None] | None = None) -> str:
@@ -266,13 +266,13 @@ def render(expr: Expr, formatter: Callable[[object], str | None] | None = None) 
         return str(expr.value)
     if isinstance(expr, Builtin):
         return expr.name
-    if isinstance(expr, BinOp):
+    if isinstance(expr, BinaryExpr):
         return f"({render(expr.left, formatter)} {expr.op} {render(expr.right, formatter)})"
-    if isinstance(expr, FuncCall):
+    if isinstance(expr, FuncCallExpr):
         return f"{expr.name}({', '.join(render(a, formatter) for a in expr.args)})"
-    if isinstance(expr, Ternary):
+    if isinstance(expr, TernaryExpr):
         return f"({render(expr.cond, formatter)} ? {render(expr.if_true, formatter)} : {render(expr.if_false, formatter)})"
-    if isinstance(expr, Cast):
+    if isinstance(expr, CastExpr):
         return f"({expr.dtype}){render(expr.expr, formatter)}"
     return repr(expr)
 
@@ -324,18 +324,18 @@ def substitute(expr: Expr, mapping: dict[str, Expr]) -> Expr:
         return mapping.get(expr.name, expr)
     if isinstance(expr, (Literal, Builtin)):
         return expr
-    if isinstance(expr, BinOp):
-        return BinOp(expr.op, substitute(expr.left, mapping), substitute(expr.right, mapping))
-    if isinstance(expr, Ternary):
-        return Ternary(
+    if isinstance(expr, BinaryExpr):
+        return BinaryExpr(expr.op, substitute(expr.left, mapping), substitute(expr.right, mapping))
+    if isinstance(expr, TernaryExpr):
+        return TernaryExpr(
             substitute(expr.cond, mapping),
             substitute(expr.if_true, mapping),
             substitute(expr.if_false, mapping),
         )
-    if isinstance(expr, FuncCall):
-        return FuncCall(expr.name, [substitute(a, mapping) for a in expr.args])
-    if isinstance(expr, Cast):
-        return Cast(expr.dtype, substitute(expr.expr, mapping))
+    if isinstance(expr, FuncCallExpr):
+        return FuncCallExpr(expr.name, [substitute(a, mapping) for a in expr.args])
+    if isinstance(expr, CastExpr):
+        return CastExpr(expr.dtype, substitute(expr.expr, mapping))
     return expr
 
 
@@ -350,16 +350,16 @@ def free_vars(expr: Expr) -> frozenset[str]:
         return frozenset({expr.name})
     if isinstance(expr, (Literal, Builtin)):
         return frozenset()
-    if isinstance(expr, BinOp):
+    if isinstance(expr, BinaryExpr):
         return free_vars(expr.left) | free_vars(expr.right)
-    if isinstance(expr, Ternary):
+    if isinstance(expr, TernaryExpr):
         return free_vars(expr.cond) | free_vars(expr.if_true) | free_vars(expr.if_false)
-    if isinstance(expr, FuncCall):
+    if isinstance(expr, FuncCallExpr):
         out: frozenset[str] = frozenset()
         for a in expr.args:
             out |= free_vars(a)
         return out
-    if isinstance(expr, Cast):
+    if isinstance(expr, CastExpr):
         return free_vars(expr.expr)
     return frozenset()
 
