@@ -9,6 +9,20 @@ unchanged and the scalar emitter takes over.
 The pass only *annotates* — returning ``None`` from ``rewrite`` keeps
 the graph unchanged; downstream ``lowering/kernel`` reads the hint and
 dispatches to the matmul template.
+
+Tile config is picked by M (the output's leading free-axis extent).
+TinyLlama hits M∈{32, 512} at seq∈{32, 512}; other LLMs hit similar
+powers of two. The two regimes pick very different optima — small-M
+wants a modest BM and few threads to avoid over-launching, large-M
+wants BM=128 with TM=8 to amortize smem stage over more compute.
+Picked by ``scripts/sweep_matmul_tiles.py``:
+
+  M ≥ 128 (and M % 128 == 0):  BM=128, BN=32, BK=64, TM=8, TN=4, threads=128
+  M  = 32..64                  BM=32,  BN=16, BK=64, TM=4, TN=2, threads=64
+
+Each value is overridable via ``DEPLODOCK_MATMUL_<KEY>`` so sweep scripts
+can probe alternatives without patching the source. When env-overriden,
+the value replaces the auto-picked tile entry.
 """
 
 from __future__ import annotations
@@ -22,25 +36,39 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._emit_matmul import anal
 
 PATTERN = [Pattern("root", LoopOp)]
 
-# Default tile config — fits every TinyLlama matmul (M=32, K∈{2048,5632},
-# N∈{256,2048,5632}) at seq_len=32: BM=32, BN=32, BK=64, TM=2, TN=4,
-# threads=128. Picked by ``scripts/sweep_matmul_tiles.py`` — top or
-# near-top across all four TinyLlama shapes (~2× over the previous
-# BN=64/BK=32/TN=8 config). Each key is overridable via
-# ``DEPLODOCK_MATMUL_<KEY>`` so sweep scripts can probe alternatives
-# without patching the source.
-_TILE_DEFAULTS = {
-    "tile_m": 32,
+_TILE_LARGE_M = {
+    "tile_m": 128,
     "tile_n": 32,
     "block_k": 64,
-    "thread_m": 2,
+    "thread_m": 8,
     "thread_n": 4,
     "threads": 128,
 }
 
+_TILE_SMALL_M = {
+    "tile_m": 32,
+    "tile_n": 16,
+    "block_k": 64,
+    "thread_m": 4,
+    "thread_n": 2,
+    "threads": 64,
+}
 
-def _current_tile() -> dict[str, int]:
-    tile = dict(_TILE_DEFAULTS)
+
+def _pick_tile_for_m(m: int) -> dict[str, int] | None:
+    """Pick a shape-appropriate tile config for the matmul's M extent.
+
+    Returns None when M doesn't divide any supported BM — caller falls
+    back to the scalar emitter.
+    """
+    if m % _TILE_LARGE_M["tile_m"] == 0:
+        return dict(_TILE_LARGE_M)
+    if m % _TILE_SMALL_M["tile_m"] == 0:
+        return dict(_TILE_SMALL_M)
+    return None
+
+
+def _apply_env_overrides(tile: dict[str, int]) -> dict[str, int]:
     for key in tile:
         env = os.environ.get(f"DEPLODOCK_MATMUL_{key.upper()}")
         if env is not None:
@@ -49,14 +77,25 @@ def _current_tile() -> dict[str, int]:
 
 
 def _hints_for(info) -> dict | None:
-    tile = _current_tile()
     m = int(info.m_axis.extent)
     n = int(info.n_axis.extent)
     k = int(info.k_axis.extent)
+
+    # Env override path: if *any* DEPLODOCK_MATMUL_* env var is set, the
+    # sweep script (or a manual override) wants a fixed tile. Start from
+    # the large-M defaults as a base, then let env fully override.
+    env_any = any(os.environ.get(f"DEPLODOCK_MATMUL_{k_.upper()}") is not None for k_ in _TILE_LARGE_M)
+    if env_any:
+        tile = _apply_env_overrides(dict(_TILE_LARGE_M))
+    else:
+        tile = _pick_tile_for_m(m)
+        if tile is None:
+            return None
+
     # M / N / K must divide their tile / block sizes. The template uses a 2D
     # grid (gridDim.y = M / BM, gridDim.x = N / BN), so M >= BM with exact
-    # divisibility is enough — no BM == M special case. The thread-tile
-    # arithmetic (BM/TM * BN/TN == threads) is re-checked in the emitter.
+    # divisibility is enough. The thread-tile arithmetic (BM/TM * BN/TN ==
+    # threads) is re-checked in the emitter.
     if m % tile["tile_m"] or n % tile["tile_n"] or k % tile["block_k"]:
         return None
     if (tile["tile_m"] // tile["thread_m"]) * (tile["tile_n"] // tile["thread_n"]) != tile["threads"]:

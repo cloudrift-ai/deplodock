@@ -45,7 +45,7 @@ def test_detect_linear_matmul():
     assert h.get("cuda.matmul.n") == 2048
     assert h.get("cuda.matmul.k") == 2048
     assert h.get("cuda.matmul.tile_m") == 32
-    assert h.get("cuda.matmul.tile_n") == 32
+    assert h.get("cuda.matmul.tile_n") == 16
     assert h.get("cuda.matmul.block_k") == 64
 
 
