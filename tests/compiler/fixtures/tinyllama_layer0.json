@@ -212,7 +212,7 @@
     "pow_1": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "pow"
+        "op": "pow"
       },
       "inputs": [
         "hidden_states",
@@ -279,7 +279,7 @@
     "add": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "add"
+        "op": "add"
       },
       "inputs": [
         "mean",
@@ -298,7 +298,7 @@
     "rsqrt": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "rsqrt"
+        "op": "rsqrt"
       },
       "inputs": [
         "add"
@@ -316,7 +316,7 @@
     "mul": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "hidden_states",
@@ -335,7 +335,7 @@
     "mul_1": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "p_input_layernorm_weight",
@@ -709,7 +709,7 @@
     "mul_2": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "transpose",
@@ -874,7 +874,7 @@
     "neg": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "neg"
+        "op": "negative"
       },
       "inputs": [
         "slice_2"
@@ -927,7 +927,7 @@
     "mul_3": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "cat",
@@ -948,7 +948,7 @@
     "add_1": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "add"
+        "op": "add"
       },
       "inputs": [
         "mul_2",
@@ -969,7 +969,7 @@
     "mul_4": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "transpose_1",
@@ -1134,7 +1134,7 @@
     "neg_1": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "neg"
+        "op": "negative"
       },
       "inputs": [
         "slice_4"
@@ -1187,7 +1187,7 @@
     "mul_5": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "cat_1",
@@ -1208,7 +1208,7 @@
     "add_2": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "add"
+        "op": "add"
       },
       "inputs": [
         "mul_4",
@@ -1373,7 +1373,7 @@
     "add_3": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "add"
+        "op": "add"
       },
       "inputs": [
         "hidden_states",
@@ -1407,7 +1407,7 @@
     "pow_2": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "pow"
+        "op": "pow"
       },
       "inputs": [
         "add_3",
@@ -1474,7 +1474,7 @@
     "add_4": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "add"
+        "op": "add"
       },
       "inputs": [
         "mean_1",
@@ -1493,7 +1493,7 @@
     "rsqrt_1": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "rsqrt"
+        "op": "rsqrt"
       },
       "inputs": [
         "add_4"
@@ -1511,7 +1511,7 @@
     "mul_6": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "add_3",
@@ -1530,7 +1530,7 @@
     "mul_7": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "p_post_attention_layernorm_weight",
@@ -1568,7 +1568,7 @@
     "silu": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "silu"
+        "op": "silu"
       },
       "inputs": [
         "linear_4"
@@ -1605,7 +1605,7 @@
     "mul_8": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "mul"
+        "op": "multiply"
       },
       "inputs": [
         "silu",
@@ -1643,7 +1643,7 @@
     "add_5": {
       "op": "ElementwiseOp",
       "op_fields": {
-        "fn": "add"
+        "op": "add"
       },
       "inputs": [
         "add_3",

@@ -304,11 +304,6 @@ class Graph:
             for k, v in fields.items():
                 if isinstance(v, list):
                     fields[k] = tuple(v)
-            # Back-compat: old JSON stored ``fn: "add"`` before the ExprOp
-            # refactor; rename to the new ``op=`` field so the coercing
-            # ``__post_init__`` resolves the ExprOp from the name.
-            if "fn" in fields and op_cls.__name__ in ("ElementwiseOp", "ReduceOp", "ScanOp"):
-                fields["op"] = fields.pop("fn")
 
             op = op_cls(**fields) if fields else op_cls()
             out = ndata["output"]
