@@ -95,7 +95,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     q_bc = broadcast_to(frag, q_unsq_id, qk_mul_shape)
     kt_bc = broadcast_to(frag, kt_unsq_id, qk_mul_shape)
     qk_ew_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[q_bc, kt_bc],
         output=Tensor(f"{name}_qk_ew", qk_mul_shape, dtype),
     )
@@ -116,7 +116,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     )
     scale_bc = broadcast_to(frag, scale_const_id, scores_shape)
     scaled_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[qk_id, scale_bc],
         output=Tensor(f"{name}_scaled", scores_shape, dtype),
     )
@@ -165,13 +165,13 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     # Softmax: max → sub → exp → sum → div
     max_id = frag.add_node(
-        op=ReduceOp(op="max", axis=-1),
+        op=ReduceOp(op="maximum", axis=-1),
         inputs=[scaled_id],
         output=Tensor(f"{name}_max", scores_shape[:-1] + (1,) if scores_shape else (1,), dtype),
     )
     max_bc = broadcast_to(frag, max_id, scores_shape)
     sub_id = frag.add_node(
-        op=ElementwiseOp(op="sub"),
+        op=ElementwiseOp(op="subtract"),
         inputs=[scaled_id, max_bc],
         output=Tensor(f"{name}_shifted", scores_shape, dtype),
     )
@@ -187,7 +187,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     )
     sum_bc = broadcast_to(frag, sum_id, scores_shape)
     softmax_id = frag.add_node(
-        op=ElementwiseOp(op="div"),
+        op=ElementwiseOp(op="divide"),
         inputs=[exp_id, sum_bc],
         output=Tensor(f"{name}_softmax", scores_shape, dtype),
     )
@@ -230,7 +230,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     s_bc = broadcast_to(frag, s_unsq_id, sv_mul_shape)
     v_bc = broadcast_to(frag, v_unsq_id, sv_mul_shape)
     sv_ew_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[s_bc, v_bc],
         output=Tensor(f"{name}_sv_ew", sv_mul_shape, dtype),
     )

@@ -428,11 +428,11 @@ def _fmt_op(node: Node, graph: Graph) -> str:
     arg_names = [graph.nodes[inp].output.name for inp in node.inputs]
 
     if cls == "ElementwiseOp":
-        return f"{op.fn}({', '.join(arg_names)})"
+        return f"{op.name}({', '.join(arg_names)})"
     if cls == "ReduceOp":
-        return f"{op.fn}({', '.join(arg_names)}, axis={op.axis})"
+        return f"{op.name}({', '.join(arg_names)}, axis={op.axis})"
     if cls == "ScanOp":
-        return f"scan_{op.fn}({', '.join(arg_names)}, axis={op.axis})"
+        return f"scan_{op.name}({', '.join(arg_names)}, axis={op.axis})"
     if cls == "GatherOp":
         return f"gather({', '.join(arg_names)}, axis={op.axis})"
     if cls == "ScatterOp":

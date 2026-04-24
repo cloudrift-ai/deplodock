@@ -50,7 +50,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     a_bc = broadcast_to(frag, a_unsq_id, mul_shape)
     b_bc = broadcast_to(frag, b_unsq_id, mul_shape)
     ew_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[a_bc, b_bc],
         output=Tensor(f"{name}_ew", mul_shape, dtype),
     )

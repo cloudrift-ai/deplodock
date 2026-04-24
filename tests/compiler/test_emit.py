@@ -134,7 +134,7 @@ def test_chained_pointwise_single_kernel():
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4,)), node_id="x")
     g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
-    g.add_node(op=ElementwiseOp("neg"), inputs=["e"], output=Tensor("n", (4,)), node_id="n")
+    g.add_node(op=ElementwiseOp("negative"), inputs=["e"], output=Tensor("n", (4,)), node_id="n")
     g.inputs = ["x"]
     g.outputs = ["n"]
 

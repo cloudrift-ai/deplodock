@@ -17,10 +17,10 @@ from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", ReduceOp)]
 
-# Map ReduceOp.fn ("sum"/"max"/"min"/"prod") to the combine op name that
+# Map ReduceOp.fn ("sum"/"maximum"/"minimum"/"prod") to the combine op name that
 # ``Accum`` carries. Accum init is derived from this op by the Loop IR
 # identity table (``ACCUM_IDENTITY``), so no separate init lookup is needed.
-_COMBINE: dict[str, str] = {"sum": "add", "max": "max", "prod": "mul", "min": "min"}
+_COMBINE: dict[str, str] = {"sum": "add", "maximum": "maximum", "prod": "multiply", "minimum": "minimum"}
 
 
 def rewrite(graph: Graph, match: Match) -> Graph | None:
@@ -50,7 +50,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     reduce_axis_name = f"a{axis}"
     load_index = tuple(Var(a.name) for a in axes)
 
-    combine = ElementwiseOp(_COMBINE.get(op.fn, op.fn))
+    combine = ElementwiseOp(_COMBINE.get(op.name, op.name))
     write_index = _build_write_index(axes, reduce_axis_name, tuple(node.output.shape))
 
     # Nested body: Loop(reduce_axis, [Load + Accum]) + Write wrapped in

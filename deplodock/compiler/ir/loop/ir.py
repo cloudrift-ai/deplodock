@@ -45,7 +45,7 @@ from deplodock.compiler.ir.loop.sigma import Sigma
 def _coerce_body_op(v) -> ExprOp:
     """Accept an ExprOp, a string name, or an ElementwiseOp wrapper; return ExprOp.
 
-    Lets ``Assign(..., ElementwiseOp("mul"), ...)`` and ``Assign(..., "mul", ...)``
+    Lets ``Assign(..., ElementwiseOp("multiply"), ...)`` and ``Assign(..., "multiply", ...)``
     keep working after Loop IR was switched to carry ``ExprOp`` directly.
     """
     if isinstance(v, ExprOp):
@@ -624,13 +624,13 @@ def _render_body(
     for stmt in stmts:
         if isinstance(stmt, Assign):
             args = ", ".join(stmt.args)
-            lines.append(f"{indent}{stmt.name} = {stmt.op.fn}({args})")
+            lines.append(f"{indent}{stmt.name} = {stmt.op.name}({args})")
         elif isinstance(stmt, Load):
             buf = buffers[stmt.source] if 0 <= stmt.source < len(buffers) else f"src{stmt.source}"
             idx = ", ".join(render_expr(e) for e in stmt.index)
             lines.append(f"{indent}{stmt.name} = load {buf}[{idx}]")
         elif isinstance(stmt, Accum):
-            lines.append(f"{indent}{stmt.name} <- {stmt.op.fn}({stmt.name}, {stmt.value})")
+            lines.append(f"{indent}{stmt.name} <- {stmt.op.name}({stmt.name}, {stmt.value})")
         elif isinstance(stmt, Write):
             idx = ", ".join(render_expr(e) for e in stmt.index)
             lines.append(f"{indent}out{stmt.output}[{idx}] = {stmt.value}")
@@ -713,8 +713,8 @@ def _validate(loop: LoopOp) -> None:
                 # Each Accum implicitly declares / extends an accumulator.
                 # Repeated Updates to same target must share op.
                 prev_op = target_ops.get(stmt.name)
-                if prev_op is not None and prev_op.fn != stmt.op.fn:
-                    raise ValueError(f"Accum {stmt.name!r}: op {stmt.op.fn!r} conflicts with earlier Accum's op {prev_op.fn!r}")
+                if prev_op is not None and prev_op.name != stmt.op.name:
+                    raise ValueError(f"Accum {stmt.name!r}: op {stmt.op.name!r} conflicts with earlier Accum's op {prev_op.name!r}")
                 target_ops[stmt.name] = stmt.op
                 defined.add(stmt.name)
                 exported_accs.add(stmt.name)

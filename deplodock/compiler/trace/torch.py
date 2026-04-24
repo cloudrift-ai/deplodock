@@ -234,34 +234,37 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         return
 
     # --- Elementwise ops ---
-    # Torch names match our ExprOp names one-to-one (including ``reciprocal``
-    # after the rename). The set below is the whitelist that tells the tracer
-    # which torch ops land as a primitive ``ElementwiseOp``; anything else
-    # falls through to the fused-op handler below.
-    _ELEMENTWISE_NAMES = frozenset(
-        {
-            "add",
-            "sub",
-            "mul",
-            "div",
-            "neg",
-            "exp",
-            "rsqrt",
-            "reciprocal",
-            "pow",
-            "silu",
-            "relu",
-            "tanh",
-            "abs",
-            "sigmoid",
-        }
-    )
-    if op_name in _ELEMENTWISE_NAMES:
+    # Torch's aten-level short names (``sub`` / ``mul`` / ``div`` / ``neg``)
+    # get translated to numpy-style long names here so the rest of the
+    # pipeline can read our ``ElementwiseOp.op.name`` as a numpy attribute
+    # (``np.subtract`` / ``np.multiply`` / …) without further aliasing.
+    # Names that already match numpy (``add`` / ``mod`` / ``pow`` / ``exp`` /
+    # ``tanh`` / ``abs`` / ``sqrt`` / ``reciprocal`` / …) pass through.
+    _ATEN_TO_NUMPY = {
+        "sub": "subtract",
+        "mul": "multiply",
+        "div": "divide",
+        "neg": "negative",
+    }
+    _ELEMENTWISE_SOURCES = frozenset(_ATEN_TO_NUMPY) | {
+        "add",
+        "exp",
+        "rsqrt",
+        "reciprocal",
+        "pow",
+        "silu",
+        "relu",
+        "tanh",
+        "abs",
+        "sigmoid",
+    }
+    if op_name in _ELEMENTWISE_SOURCES:
         from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
+        canonical = _ATEN_TO_NUMPY.get(op_name, op_name)
         bc_ids = [broadcast_to(g, inp, shape) for inp in input_ids[:2]]
         nid = g.add_node(
-            op=ElementwiseOp(op=op_name),
+            op=ElementwiseOp(op=canonical),
             inputs=bc_ids,
             output=Tensor(name, shape, dtype),
             node_id=name,
@@ -328,7 +331,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
     # the exception that lands as ``MeanOp`` (decomposition splits it into
     # sum + div). Keeping torch's spelling — ``amax`` stays ``amax``, not
     # mapped to ``max`` — avoids a needless name table.
-    if op_name in ("sum", "max", "amax", "mean"):
+    if op_name in ("sum", "maximum", "amax", "mean"):
         axis = _get_reduce_axis(fx_node)
         x_shape = tuple(g.nodes[input_ids[0]].output.shape) if input_ids else ()
         keepdim_shape = _keepdim_shape(x_shape, axis)

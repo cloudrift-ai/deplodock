@@ -27,7 +27,7 @@ requires_cuda = pytest.mark.skipif(
 def _pointwise_chain_graph() -> Graph:
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (8,)), node_id="x")
-    g.add_node(op=ElementwiseOp("neg"), inputs=["x"], output=Tensor("n", (8,)), node_id="n")
+    g.add_node(op=ElementwiseOp("negative"), inputs=["x"], output=Tensor("n", (8,)), node_id="n")
     g.add_node(op=ElementwiseOp("exp"), inputs=["n"], output=Tensor("y", (8,)), node_id="y")
     g.inputs = ["x"]
     g.outputs = ["y"]

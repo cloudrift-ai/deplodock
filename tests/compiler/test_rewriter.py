@@ -23,9 +23,9 @@ def test_decompose_silu():
     """Running the decomposition pass replaces silu with primitive ops."""
     g = _make_silu_graph()
     result = run_pass(g, _DECOMP_DIR)
-    fns = [n.op.fn for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)]
+    fns = [n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)]
     assert "silu" not in fns
-    assert "neg" in fns
+    assert "negative" in fns
     assert "exp" in fns
 
 

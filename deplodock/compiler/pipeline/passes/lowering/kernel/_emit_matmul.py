@@ -54,10 +54,10 @@ from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, Loop, LoopOp, 
 _SUPPORTED_EW = frozenset(
     {
         "add",
-        "sub",
-        "mul",
-        "div",
-        "neg",
+        "subtract",
+        "multiply",
+        "divide",
+        "negative",
         "exp",
         "reciprocal",
         "relu",
@@ -172,7 +172,7 @@ def _stmts_only_over(stmts: tuple[Stmt, ...], allowed_axes: frozenset[str]) -> b
                 if not free_vars(e).issubset(allowed_axes):
                     return False
         elif isinstance(s, Assign):
-            if s.op.fn not in _SUPPORTED_EW:
+            if s.op.name not in _SUPPORTED_EW:
                 return False
         elif isinstance(s, Select):
             for b in s.branches:
@@ -265,7 +265,7 @@ def analyze_matmul(loop_op: LoopOp) -> MatmulInfo | None:
     # Everything else must partition into A-chain (feeds a) or B-chain (b).
     rb = reduce_loop.body
     accums: list[Accum] = [s for s in rb if isinstance(s, Accum)]
-    if len(accums) != 1 or accums[0].op.fn != "add":
+    if len(accums) != 1 or accums[0].op.name != "add":
         return None
     acc = accums[0]
 
@@ -278,7 +278,7 @@ def analyze_matmul(loop_op: LoopOp) -> MatmulInfo | None:
             def_map[s.name] = s
 
     mul = def_map.get(acc.value)
-    if not isinstance(mul, Assign) or mul.op.fn != "mul" or len(mul.args) != 2:
+    if not isinstance(mul, Assign) or mul.op.name != "multiply" or len(mul.args) != 2:
         return None
     a_result, b_result = mul.args
 
@@ -296,7 +296,7 @@ def analyze_matmul(loop_op: LoopOp) -> MatmulInfo | None:
             continue
         if not isinstance(s, (Load, Assign, Select)):
             return None
-        if s.op.fn not in _SUPPORTED_EW if isinstance(s, Assign) else False:
+        if s.op.name not in _SUPPORTED_EW if isinstance(s, Assign) else False:
             return None
         if s.name not in reachable and s.name != mul.name:
             return None
@@ -410,13 +410,13 @@ def _render_expr(expr: Expr, env: dict[str, str]) -> str:
 def _render_elementwise(fn: str, args: list[str]) -> str:
     if fn == "add":
         return f"({args[0]} + {args[1]})"
-    if fn == "sub":
+    if fn == "subtract":
         return f"({args[0]} - {args[1]})"
-    if fn == "mul":
+    if fn == "multiply":
         return f"({args[0]} * {args[1]})"
-    if fn == "div":
+    if fn == "divide":
         return f"({args[0]} / {args[1]})"
-    if fn == "neg":
+    if fn == "negative":
         return f"(-{args[0]})"
     if fn == "exp":
         return f"expf({args[0]})"
@@ -473,7 +473,7 @@ def _render_load(s: Load, node: Node, graph: Graph, env: dict[str, str]) -> str:
 
 
 def _render_assign(s: Assign) -> str:
-    return f"float {s.name} = {_render_elementwise(s.op.fn, list(s.args))};"
+    return f"float {s.name} = {_render_elementwise(s.op.name, list(s.args))};"
 
 
 def _render_select(s: Select, env: dict[str, str]) -> str:

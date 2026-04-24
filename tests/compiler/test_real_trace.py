@@ -69,7 +69,7 @@ def test_tinyllama_has_sdpa():
 def test_tinyllama_has_silu():
     """torch.export keeps silu as a single op (not decomposed)."""
     g = _load_fixture("tinyllama_layer0.json")
-    silu_count = sum(1 for n in g.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.fn == "silu")
+    silu_count = sum(1 for n in g.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.name == "silu")
     assert silu_count == 1
 
 

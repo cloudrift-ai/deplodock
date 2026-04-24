@@ -31,7 +31,7 @@ def test_elementwise_accepts_matching_shapes():
     assert op.infer_output_shape([(4, 8), (4, 8)]) == (4, 8)
 
 
-@pytest.mark.parametrize("fn", ["sum", "max", "prod"])
+@pytest.mark.parametrize("fn", ["sum", "maximum", "prod"])
 @pytest.mark.parametrize(
     ("input_shape", "axis", "expected"),
     [
@@ -77,5 +77,5 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
             for inp_id in n.inputs:
                 inp_shape = tuple(decomposed.nodes[inp_id].output.shape)
                 assert inp_shape == out_shape, (
-                    f"{name}: ElementwiseOp {n.id} ({n.op.fn}) input {inp_id} shape {inp_shape} != output {out_shape}"
+                    f"{name}: ElementwiseOp {n.id} ({n.op.name}) input {inp_id} shape {inp_shape} != output {out_shape}"
                 )

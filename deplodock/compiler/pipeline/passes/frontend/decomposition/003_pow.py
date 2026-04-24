@@ -30,7 +30,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     )
 
     mul_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[x_id, x_id],
         output=Tensor(
             name=root.output.name,

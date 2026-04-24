@@ -103,12 +103,12 @@ def test_e2e_rmsnorm(run_graph):
     g.add_node(InputOp(), [], Tensor("w", (dim,)), node_id="w")
     g.inputs = ["X", "w"]
 
-    g.add_node(ElementwiseOp("mul"), ["X", "X"], Tensor("sq", (rows, dim)), node_id="sq")
+    g.add_node(ElementwiseOp("multiply"), ["X", "X"], Tensor("sq", (rows, dim)), node_id="sq")
     g.add_node(ReduceOp("sum", axis=-1), ["sq"], Tensor("red", (rows, 1)), node_id="red")
     g.add_node(ElementwiseOp("add"), ["red", "eps"], Tensor("ae", (rows, 1)), node_id="ae")
     g.add_node(ElementwiseOp("rsqrt"), ["ae"], Tensor("rsq", (rows, 1)), node_id="rsq")
-    g.add_node(ElementwiseOp("mul"), ["X", "rsq"], Tensor("norm", (rows, dim)), node_id="norm")
-    g.add_node(ElementwiseOp("mul"), ["norm", "w"], Tensor("out", (rows, dim)), node_id="out")
+    g.add_node(ElementwiseOp("multiply"), ["X", "rsq"], Tensor("norm", (rows, dim)), node_id="norm")
+    g.add_node(ElementwiseOp("multiply"), ["norm", "w"], Tensor("out", (rows, dim)), node_id="out")
     g.outputs = ["out"]
 
     outputs = run_graph(g, {"X": x, "w": w})
@@ -133,11 +133,11 @@ def test_e2e_softmax(run_graph):
     g.add_node(InputOp(), [], Tensor("x", (rows, cols)), node_id="x")
     g.inputs = ["x"]
 
-    g.add_node(ReduceOp("max", -1), ["x"], Tensor("mx", (rows, 1)), node_id="mx")
-    g.add_node(ElementwiseOp("sub"), ["x", "mx"], Tensor("sub", (rows, cols)), node_id="sub")
-    g.add_node(ElementwiseOp("exp"), ["sub"], Tensor("exp", (rows, cols)), node_id="exp")
+    g.add_node(ReduceOp("maximum", -1), ["x"], Tensor("mx", (rows, 1)), node_id="mx")
+    g.add_node(ElementwiseOp("subtract"), ["x", "mx"], Tensor("subtract", (rows, cols)), node_id="subtract")
+    g.add_node(ElementwiseOp("exp"), ["subtract"], Tensor("exp", (rows, cols)), node_id="exp")
     g.add_node(ReduceOp("sum", -1), ["exp"], Tensor("sm", (rows, 1)), node_id="sm")
-    g.add_node(ElementwiseOp("div"), ["exp", "sm"], Tensor("out", (rows, cols)), node_id="out")
+    g.add_node(ElementwiseOp("divide"), ["exp", "sm"], Tensor("out", (rows, cols)), node_id="out")
     g.outputs = ["out"]
 
     outputs = run_graph(g, {"x": x})

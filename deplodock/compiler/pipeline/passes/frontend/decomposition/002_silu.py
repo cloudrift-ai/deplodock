@@ -36,7 +36,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     # neg(x)
     neg_id = frag.add_node(
-        op=ElementwiseOp(op="neg"),
+        op=ElementwiseOp(op="negative"),
         inputs=[x_id],
         output=Tensor(f"{name}_neg", shape, dtype),
     )
@@ -65,7 +65,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     # x * sigmoid(x)
     mul_id = frag.add_node(
-        op=ElementwiseOp(op="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[x_id, recip_id],
         output=Tensor(name, shape, dtype),
     )

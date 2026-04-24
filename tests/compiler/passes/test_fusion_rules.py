@@ -67,14 +67,14 @@ def _kernel_nodes(graph: Graph) -> list:
 def _assign_fns(body) -> list[str]:
     from deplodock.compiler.ir.loop import iter_body
 
-    return [s.op.fn for s in iter_body(body) if isinstance(s, Assign)]
+    return [s.op.name for s in iter_body(body) if isinstance(s, Assign)]
 
 
 def _count_copies(body) -> int:
     """Count identity ``Assign(op=copy)`` statements in a LoopOp body."""
     from deplodock.compiler.ir.loop import iter_body
 
-    return sum(1 for s in iter_body(body) if isinstance(s, Assign) and s.op.fn == "copy")
+    return sum(1 for s in iter_body(body) if isinstance(s, Assign) and s.op.name == "copy")
 
 
 def _has_update(body) -> bool:
@@ -84,7 +84,7 @@ def _has_update(body) -> bool:
 
 
 def _local_combine_fns(locals_) -> set[str]:
-    return {lb.op.fn for lb in locals_ if lb.op is not None}
+    return {lb.op.name for lb in locals_ if lb.op is not None}
 
 
 # ===================================================================
@@ -95,7 +95,7 @@ def _local_combine_fns(locals_) -> set[str]:
 def _make_pointwise_chain():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (8,)), node_id="x")
-    g.add_node(ElementwiseOp("neg"), ["x"], Tensor("n", (8,)), node_id="n")
+    g.add_node(ElementwiseOp("negative"), ["x"], Tensor("n", (8,)), node_id="n")
     g.add_node(ElementwiseOp("exp"), ["n"], Tensor("y", (8,)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
     return g
@@ -117,7 +117,7 @@ def test_pointwise_chain_body_ops():
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
     body_ops = _assign_fns(kernel.op.body)
-    assert "neg" in body_ops
+    assert "negative" in body_ops
     assert "exp" in body_ops
 
 
@@ -156,9 +156,9 @@ def _make_rms_norm_like():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(ConstantOp(name="w"), [], Tensor("w", (4, 8)), node_id="w")
-    g.add_node(ElementwiseOp("mul"), ["x", "x"], Tensor("sq", (4, 8)), node_id="sq")
+    g.add_node(ElementwiseOp("multiply"), ["x", "x"], Tensor("sq", (4, 8)), node_id="sq")
     g.add_node(ReduceOp("sum", -1), ["sq"], Tensor("red", (4, 1)), node_id="red")
-    g.add_node(ElementwiseOp("mul"), ["red", "red"], Tensor("sqr", (4, 1)), node_id="sqr")
+    g.add_node(ElementwiseOp("multiply"), ["red", "red"], Tensor("sqr", (4, 1)), node_id="sqr")
     g.inputs, g.outputs = ["x", "w"], ["sqr"]
     return g
 
@@ -194,7 +194,7 @@ def _make_contraction():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (4, 8)), node_id="b")
-    g.add_node(ElementwiseOp("mul"), ["a", "b"], Tensor("m", (4, 8)), node_id="m")
+    g.add_node(ElementwiseOp("multiply"), ["a", "b"], Tensor("m", (4, 8)), node_id="m")
     g.add_node(ReduceOp("sum", -1), ["m"], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["a", "b"], ["y"]
     return g
@@ -209,7 +209,7 @@ def test_contraction_fuses_to_one_kernel():
 def test_contraction_body_has_mul_and_sum():
     result = _fuse(_make_contraction())
     kernel = _kernel_nodes(result)[0]
-    assert "mul" in _assign_fns(kernel.op.body)
+    assert "multiply" in _assign_fns(kernel.op.body)
     assert _has_update(kernel.op.body)
     assert "add" in _local_combine_fns(kernel.op.accums)
 
@@ -226,7 +226,7 @@ def _make_contraction_with_epilogue():
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (4, 8)), node_id="b")
     g.add_node(InputOp(), [], Tensor("bias", (4, 1)), node_id="bias")
-    g.add_node(ElementwiseOp("mul"), ["a", "b"], Tensor("m", (4, 8)), node_id="m")
+    g.add_node(ElementwiseOp("multiply"), ["a", "b"], Tensor("m", (4, 8)), node_id="m")
     g.add_node(ReduceOp("sum", -1), ["m"], Tensor("s", (4, 1)), node_id="s")
     g.add_node(ElementwiseOp("add"), ["s", broadcast_to(g, "bias", (4, 1))], Tensor("y", (4, 1)), node_id="y")
     g.inputs, g.outputs = ["a", "b", "bias"], ["y"]
@@ -253,11 +253,11 @@ def test_contraction_epilogue_body_has_add():
 def _make_softmax():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    g.add_node(ReduceOp("max", -1), ["x"], Tensor("mx", (4, 1)), node_id="mx")
-    g.add_node(ElementwiseOp("sub"), ["x", "mx"], Tensor("sub", (4, 8)), node_id="sub")
-    g.add_node(ElementwiseOp("exp"), ["sub"], Tensor("exp", (4, 8)), node_id="exp")
+    g.add_node(ReduceOp("maximum", -1), ["x"], Tensor("mx", (4, 1)), node_id="mx")
+    g.add_node(ElementwiseOp("subtract"), ["x", "mx"], Tensor("subtract", (4, 8)), node_id="subtract")
+    g.add_node(ElementwiseOp("exp"), ["subtract"], Tensor("exp", (4, 8)), node_id="exp")
     g.add_node(ReduceOp("sum", -1), ["exp"], Tensor("sm", (4, 1)), node_id="sm")
-    g.add_node(ElementwiseOp("div"), ["exp", "sm"], Tensor("out", (4, 8)), node_id="out")
+    g.add_node(ElementwiseOp("divide"), ["exp", "sm"], Tensor("out", (4, 8)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     return g
 
@@ -282,8 +282,8 @@ def test_softmax_body_covers_all_ops():
         all_fns |= _local_combine_fns(k.op.accums)
     # Expect elementwise sub/exp/div and reduce combine add/max from the
     # max and sum accumulators.
-    assert {"sub", "exp", "div"} <= all_fns
-    assert {"add", "max"} <= all_fns
+    assert {"subtract", "exp", "divide"} <= all_fns
+    assert {"add", "maximum"} <= all_fns
 
 
 # ===================================================================
@@ -294,7 +294,7 @@ def test_softmax_body_covers_all_ops():
 def test_single_elementwise_fuses():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (8,)), node_id="x")
-    g.add_node(ElementwiseOp("neg"), ["x"], Tensor("y", (8,)), node_id="y")
+    g.add_node(ElementwiseOp("negative"), ["x"], Tensor("y", (8,)), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
     result = _fuse(g)
     kernels = _kernel_nodes(result)
@@ -362,7 +362,7 @@ def test_single_elementwise_correctness():
     def _make():
         g = Graph()
         g.add_node(InputOp(), [], Tensor("x", (8,)), node_id="x")
-        g.add_node(ElementwiseOp("neg"), ["x"], Tensor("y", (8,)), node_id="y")
+        g.add_node(ElementwiseOp("negative"), ["x"], Tensor("y", (8,)), node_id="y")
         g.inputs, g.outputs = ["x"], ["y"]
         return g
 
@@ -382,7 +382,7 @@ def _make_sibling_reductions():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(ReduceOp("sum", -1), ["x"], Tensor("s", (4, 1)), node_id="s")
-    g.add_node(ReduceOp("max", -1), ["x"], Tensor("m", (4, 1)), node_id="m")
+    g.add_node(ReduceOp("maximum", -1), ["x"], Tensor("m", (4, 1)), node_id="m")
     g.add_node(ElementwiseOp("add"), ["s", "m"], Tensor("out", (4, 1)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     return g
@@ -405,7 +405,7 @@ def test_sibling_reductions_have_both_accumulators():
     result = _fuse(_make_sibling_reductions())
     kernel = _kernel_nodes(result)[0]
     combine_fns = _local_combine_fns(kernel.op.accums)
-    assert {"add", "max"} <= combine_fns
+    assert {"add", "maximum"} <= combine_fns
 
 
 def test_sibling_reductions_correctness():
@@ -437,7 +437,7 @@ def test_softmax_has_both_accumulators():
     result = _fuse(_make_softmax())
     kernel = _kernel_nodes(result)[0]
     combine_fns = _local_combine_fns(kernel.op.accums)
-    assert {"add", "max"} <= combine_fns, f"missing accumulators: {combine_fns}"
+    assert {"add", "maximum"} <= combine_fns, f"missing accumulators: {combine_fns}"
 
 
 def test_softmax_single_kernel_correctness():

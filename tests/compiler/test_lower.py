@@ -54,7 +54,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 def _elementwise_fns(body) -> list[str]:
     from deplodock.compiler.ir.loop import iter_body
 
-    return [s.op.fn for s in iter_body(body) if isinstance(s, Assign)]
+    return [s.op.name for s in iter_body(body) if isinstance(s, Assign)]
 
 
 def _has_update(body) -> bool:
@@ -92,7 +92,7 @@ def test_chained_pointwise_fuses_into_one():
     g = Graph()
     _input(g, "x", (4,))
     g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
-    g.add_node(op=ElementwiseOp("neg"), inputs=["e"], output=Tensor("n", (4,)), node_id="n")
+    g.add_node(op=ElementwiseOp("negative"), inputs=["e"], output=Tensor("n", (4,)), node_id="n")
     g.inputs = ["x"]
     g.outputs = ["n"]
 
@@ -100,7 +100,7 @@ def test_chained_pointwise_fuses_into_one():
     launches = _loop_nodes(result)
     assert len(launches) == 1
     fns = _elementwise_fns(launches[0].op.body)
-    assert "exp" in fns and "neg" in fns
+    assert "exp" in fns and "negative" in fns
 
 
 def test_reduce_sum():
@@ -115,7 +115,7 @@ def test_reduce_sum():
     assert len(launches) == 1
     loop = launches[0].op
     assert _has_update(loop.body)
-    assert any(lb.op.fn == "add" for lb in loop.accums)
+    assert any(lb.op.name == "add" for lb in loop.accums)
 
 
 def test_matmul():
@@ -130,8 +130,8 @@ def test_matmul():
 
     result = _compile(g)
     launches = _loop_nodes(result)
-    has_mul = any("mul" in _elementwise_fns(k.op.body) for k in launches)
-    has_sum = any(any(lb.op.fn == "add" for lb in k.op.accums) for k in launches)
+    has_mul = any("multiply" in _elementwise_fns(k.op.body) for k in launches)
+    has_sum = any(any(lb.op.name == "add" for lb in k.op.accums) for k in launches)
     assert has_mul
     assert has_sum
 
@@ -140,9 +140,9 @@ def test_no_matmul_when_mul_fans_out():
     g = Graph()
     _input(g, "a", (4, 8))
     _input(g, "b", (4, 8))
-    g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8)), node_id="m")
+    g.add_node(op=ElementwiseOp("multiply"), inputs=["a", "b"], output=Tensor("m", (4, 8)), node_id="m")
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["m"], output=Tensor("d", (4, 1)), node_id="d")
-    g.add_node(op=ElementwiseOp("neg"), inputs=["m"], output=Tensor("n", (4, 8)), node_id="n")
+    g.add_node(op=ElementwiseOp("negative"), inputs=["m"], output=Tensor("n", (4, 8)), node_id="n")
     g.inputs = ["a", "b"]
     g.outputs = ["d", "n"]
 
@@ -203,7 +203,7 @@ def test_chained_pointwise_correctness():
         g = Graph()
         _input(g, "x", (4,))
         g.add_node(op=ElementwiseOp("exp"), inputs=["x"], output=Tensor("e", (4,)), node_id="e")
-        g.add_node(op=ElementwiseOp("neg"), inputs=["e"], output=Tensor("n", (4,)), node_id="n")
+        g.add_node(op=ElementwiseOp("negative"), inputs=["e"], output=Tensor("n", (4,)), node_id="n")
         g.inputs, g.outputs = ["x"], ["n"]
         return g
 
@@ -244,9 +244,9 @@ def test_mul_fan_out_correctness():
         g = Graph()
         _input(g, "a", (4, 8))
         _input(g, "b", (4, 8))
-        g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8)), node_id="m")
+        g.add_node(op=ElementwiseOp("multiply"), inputs=["a", "b"], output=Tensor("m", (4, 8)), node_id="m")
         g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["m"], output=Tensor("d", (4, 1)), node_id="d")
-        g.add_node(op=ElementwiseOp("neg"), inputs=["m"], output=Tensor("n", (4, 8)), node_id="n")
+        g.add_node(op=ElementwiseOp("negative"), inputs=["m"], output=Tensor("n", (4, 8)), node_id="n")
         g.inputs, g.outputs = ["a", "b"], ["d", "n"]
         return g
 

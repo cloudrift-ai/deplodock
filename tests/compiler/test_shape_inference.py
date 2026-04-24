@@ -16,13 +16,13 @@ from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 def test_elementwise_infer_matching_shapes():
     """ElementwiseOp is rank-preserving: matching inputs pass through."""
-    op = ElementwiseOp("mul")
+    op = ElementwiseOp("multiply")
     assert op.infer_output_shape([(1, 28, 8, 128), (1, 28, 8, 128)]) == (1, 28, 8, 128)
 
 
 def test_elementwise_infer_rejects_mismatched_shapes():
     """ElementwiseOp refuses to broadcast — callers must wrap in IndexMapOp first."""
-    op = ElementwiseOp("mul")
+    op = ElementwiseOp("multiply")
     try:
         op.infer_output_shape([(1, 28, 8, 128), (1, 1, 8, 128)])
     except ValueError as e:
@@ -33,7 +33,7 @@ def test_elementwise_infer_rejects_mismatched_shapes():
 
 def test_reduce_keepdim():
     assert ReduceOp("sum", axis=-1).infer_output_shape([(1, 8, 128)]) == (1, 8, 1)
-    assert ReduceOp("max", axis=1).infer_output_shape([(4, 8, 128)]) == (4, 1, 128)
+    assert ReduceOp("maximum", axis=1).infer_output_shape([(4, 8, 128)]) == (4, 1, 128)
 
 
 def test_mean_keepdim():

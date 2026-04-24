@@ -11,7 +11,7 @@ def _simple_graph() -> Graph:
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 8)), node_id="a")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (8, 4)), node_id="b")
-    g.add_node(op=ElementwiseOp("mul"), inputs=["a", "b"], output=Tensor("m", (4, 8, 4)), node_id="m")
+    g.add_node(op=ElementwiseOp("multiply"), inputs=["a", "b"], output=Tensor("m", (4, 8, 4)), node_id="m")
     g.add_node(op=ReduceOp("sum", 1), inputs=["m"], output=Tensor("o", (4, 4)), node_id="o")
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
@@ -34,7 +34,7 @@ def test_match_reduce():
 
 def test_match_with_constraint():
     g = _simple_graph()
-    matches = match_pattern(g, [Pattern("root", ElementwiseOp, {"fn": "mul"})])
+    matches = match_pattern(g, [Pattern("root", ElementwiseOp, {"fn": "multiply"})])
     assert len(matches) == 1
 
 
@@ -63,7 +63,7 @@ def test_chain_fails_on_fanout():
     """Producer with multiple consumers can't extend chain."""
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4,)), node_id="x")
-    g.add_node(op=ElementwiseOp("mul"), inputs=["x"], output=Tensor("m", (4,)), node_id="m")
+    g.add_node(op=ElementwiseOp("multiply"), inputs=["x"], output=Tensor("m", (4,)), node_id="m")
     # Two consumers of m, so the chain can't extend.
     g.add_node(op=ReduceOp("sum", 0), inputs=["m"], output=Tensor("r1", (1,)), node_id="r1")
     g.add_node(op=ReduceOp("sum", 0), inputs=["m"], output=Tensor("r2", (1,)), node_id="r2")
