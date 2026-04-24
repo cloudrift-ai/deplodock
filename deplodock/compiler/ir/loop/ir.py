@@ -37,10 +37,24 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.expr import Expr, Literal, free_vars
+from deplodock.compiler.ir.expr import Expr, ExprOp, Literal, coerce_expr_op, free_vars
 from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.loop.sigma import Sigma
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+
+
+def _coerce_body_op(v) -> ExprOp:
+    """Accept an ExprOp, a string name, or an ElementwiseOp wrapper; return ExprOp.
+
+    Lets ``Assign(..., ElementwiseOp("mul"), ...)`` and ``Assign(..., "mul", ...)``
+    keep working after Loop IR was switched to carry ``ExprOp`` directly.
+    """
+    if isinstance(v, ExprOp):
+        return v
+    inner = getattr(v, "op", None)
+    if isinstance(inner, ExprOp):
+        return inner
+    return coerce_expr_op(v)
+
 
 # ---------------------------------------------------------------------------
 # Axis — named iteration variable
@@ -142,35 +156,31 @@ class Load(Stmt):
 # ---------------------------------------------------------------------------
 #
 # ``Accum`` stmts carry their own reduce op — ``add`` / ``max`` / ``min`` /
-# ``mul``. The init value for the accumulator is derived from the op via
-# this table. No separate declaration stmt is needed: an ``Accum(target,
-# value, op=...)`` inside a reduce ``Loop`` implicitly initializes the
-# accumulator to ``ACCUM_IDENTITY[op.fn]`` before the sweep and folds via
-# ``op`` at each iteration. The target SSA name is bound in the enclosing
-# scope after the Loop.
-
-ACCUM_IDENTITY: dict[str, float] = {
-    "add": 0.0,
-    "sum": 0.0,
-    "max": -1e30,
-    "min": 1e30,
-    "mul": 1.0,
-    "prod": 1.0,
-}
+# ``mul``. The init value for the accumulator is derived from the op's
+# ``identity`` metadata on ``ir.expr.ExprOp`` — no separate dispatch table.
+# An ``Accum(target, value, op=...)`` inside a reduce ``Loop`` implicitly
+# initializes the accumulator to ``op.op.identity`` before the sweep and
+# folds via ``op`` at each iteration. The target SSA name is bound in the
+# enclosing scope after the Loop.
 
 
 @dataclass(frozen=True)
 class Assign(Stmt):
     """Pure SSA body statement: ``name = op(args)``.
 
-    ``op`` is always an ``ElementwiseOp`` (reductions live in ``Accum``).
-    ``args`` reference ``$N`` ports, an ``Accum.name`` (reads current /
-    finalized acc value), or prior SSA names.
+    ``op`` is an ``ExprOp`` — the elementwise combine (add / mul / exp /
+    ...). Reductions live in ``Accum``. ``args`` reference ``$N`` ports,
+    an ``Accum.name`` (reads current / finalized acc value), or prior SSA
+    names. Construction accepts a string name or an ``ElementwiseOp``
+    wrapper in addition to an ``ExprOp`` instance, via ``_coerce_body_op``.
     """
 
     name: str
-    op: ElementwiseOp
+    op: ExprOp
     args: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "op", _coerce_body_op(self.op))
 
     def deps(self) -> tuple[str, ...]:
         return self.args
@@ -185,31 +195,33 @@ class Accum(Stmt):
 
     Semantics: ``name = op(name, value)`` inside the enclosing reduce
     ``Loop``. Before the first iteration ``name`` is initialized to
-    ``ACCUM_IDENTITY[op.fn]``. After the Loop completes, ``name`` is an
-    SSA binding visible in the enclosing scope, carrying the finalized
-    reduced value.
+    ``op.identity`` (the combine's neutral element). After the Loop
+    completes, ``name`` is an SSA binding visible in the enclosing scope,
+    carrying the finalized reduced value.
 
-    ``op`` is one of ``add`` / ``max`` / ``min`` / ``mul`` — it defines
-    both the combine operation and the accumulator's identity value.
-    Multiple ``Accum`` stmts targeting the same ``name`` in one reduce
-    Loop must agree on ``op`` (they're folding into the same accumulator).
+    ``op`` is an ``ExprOp`` — typically one of ``ADD`` / ``MAX`` / ``MIN``
+    / ``MUL``. It defines both the combine operation and the accumulator's
+    identity value. Multiple ``Accum`` stmts targeting the same ``name`` in
+    one reduce Loop must agree on ``op``.
 
     Default op is ``add`` — fixtures that sum values can omit ``op=``;
-    ``max`` / ``min`` / ``mul`` must be passed explicitly.
+    ``max`` / ``min`` / ``mul`` must be passed explicitly. Construction
+    accepts a string name or an ``ElementwiseOp`` wrapper via
+    ``_coerce_body_op``.
     """
 
     name: str
     value: str
-    op: ElementwiseOp = field(default_factory=lambda: ElementwiseOp("add"))
+    op: ExprOp = field(default_factory=lambda: coerce_expr_op("add"))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "op", _coerce_body_op(self.op))
 
     @property
     def init(self) -> Expr:
-        """Identity value for the accumulator (``ACCUM_IDENTITY[op.fn]``).
-
-        Exposed as an attribute so readers that need an ``Expr`` init (loop
-        backend, emit) don't have to re-implement the lookup.
-        """
-        return Literal(ACCUM_IDENTITY.get(self.op.fn, 0.0))
+        """Identity value for the accumulator (from the op's metadata)."""
+        identity = self.op.identity
+        return Literal(identity if identity is not None else 0.0)
 
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
@@ -664,7 +676,7 @@ def _validate(loop: LoopOp) -> None:
         seen_accums[info.name] = info
 
     # Op-consistency across repeated Updates to same target.
-    target_ops: dict[str, ElementwiseOp] = {}
+    target_ops: dict[str, ExprOp] = {}
 
     def _walk(stmts: tuple[Stmt, ...], defined: set[str]) -> set[str]:
         """Validate a body scope. Returns the set of ``Accum.name`` names

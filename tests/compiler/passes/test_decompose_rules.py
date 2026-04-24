@@ -56,7 +56,7 @@ def _make_pow_graph():
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 128)), node_id="x")
     g.add_node(op=ConstantOp(name="exp", value=2.0), inputs=[], output=Tensor("exp", (1,)), node_id="exp")
-    g.add_node(op=ElementwiseOp(fn="pow"), inputs=["x", "exp"], output=Tensor("out", (4, 128)), node_id="out")
+    g.add_node(op=ElementwiseOp(op="pow"), inputs=["x", "exp"], output=Tensor("out", (4, 128)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     return g
 
@@ -106,7 +106,7 @@ def test_pow_correctness():
 def _make_silu_graph():
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 32)), node_id="x")
-    g.add_node(op=ElementwiseOp(fn="silu"), inputs=["x"], output=Tensor("out", (4, 32)), node_id="out")
+    g.add_node(op=ElementwiseOp(op="silu"), inputs=["x"], output=Tensor("out", (4, 32)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     return g
 
@@ -171,7 +171,7 @@ def _make_rms_norm_graph(dim=64, seq_len=8, eps_input=False):
     if eps_input:
         g.add_node(op=ConstantOp(name="eps", value=1e-5), inputs=[], output=Tensor("eps", (1,)), node_id="eps")
         ins.append("eps")
-    g.add_node(op=ElementwiseOp(fn="rms_norm"), inputs=ins, output=Tensor("out", (1, seq_len, dim)), node_id="out")
+    g.add_node(op=ElementwiseOp(op="rms_norm"), inputs=ins, output=Tensor("out", (1, seq_len, dim)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     return g
 
@@ -225,7 +225,7 @@ def _make_softmax_graph(dim_extent=8, seq_len=4, axis=-1):
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, seq_len, dim_extent)), node_id="x")
     g.add_node(op=ConstantOp(name="axis", value=float(axis)), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
     g.add_node(
-        op=ElementwiseOp(fn="softmax"),
+        op=ElementwiseOp(op="softmax"),
         inputs=["x", "axis"],
         output=Tensor("out", (1, seq_len, dim_extent)),
         node_id="out",

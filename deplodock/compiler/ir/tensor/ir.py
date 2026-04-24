@@ -17,70 +17,20 @@ Plus the boundary sentinels ``InputOp`` and ``ConstantOp`` from ``ir.base``.
 The ``lifting/`` pass wraps each tensor op in a trivial ``ir.loop.LoopOp``
 and the ``fusion/`` pass splices adjacent LoopOp pairs via the
 tree-splicer in ``ir/loop/splicer.py``.
+
+Op metadata (arity / commutative / reducer identity) lives on
+``ir.expr.ExprOp`` — the single source of truth shared across
+elementwise, reduce, scan, and accumulator use sites. The old
+``OpInfo`` / ``ReduceInfo`` registries are gone; read straight from
+``op.op.arity`` / ``op.op.identity`` etc.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op, _keepdim_axis
-
-# ---------------------------------------------------------------------------
-# Op metadata registries
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class OpInfo:
-    """Declarative metadata for an elementwise op.
-
-    Backend-agnostic: describes semantic properties only, not how the op
-    maps to C code (that's the codegen's job).
-    """
-
-    arity: int  # 1 (unary) or 2 (binary)
-    commutative: bool = False  # True for add, mul; False for sub, div
-
-
-OP_REGISTRY: dict[str, OpInfo] = {
-    "add": OpInfo(2, commutative=True),
-    "sub": OpInfo(2),
-    "mul": OpInfo(2, commutative=True),
-    "div": OpInfo(2),
-    "mod": OpInfo(2),
-    "max": OpInfo(2, commutative=True),
-    "min": OpInfo(2, commutative=True),
-    "neg": OpInfo(1),
-    "exp": OpInfo(1),
-    "rsqrt": OpInfo(1),
-    "recip": OpInfo(1),
-    "relu": OpInfo(1),
-    "tanh": OpInfo(1),
-    "sigmoid": OpInfo(1),
-    "pow": OpInfo(2),
-    "abs": OpInfo(1),
-    "copy": OpInfo(1),
-}
-
-# Default for unknown ops: assume unary, non-commutative.
-_DEFAULT_OP_INFO = OpInfo(1)
-
-
-@dataclass(frozen=True)
-class ReduceInfo:
-    """Declarative metadata for a reduction op."""
-
-    identity: float  # identity element: 0 for sum, -inf for max, 1 for prod
-
-
-REDUCE_REGISTRY: dict[str, ReduceInfo] = {
-    "sum": ReduceInfo(0.0),
-    "max": ReduceInfo(-1e30),
-    "prod": ReduceInfo(1.0),
-}
-
-_DEFAULT_REDUCE_INFO = ReduceInfo(0.0)
-
+from deplodock.compiler.ir.expr import ExprOp, coerce_expr_op, resolve_fn
 
 # ---------------------------------------------------------------------------
 # Elementwise / reduce / scan
@@ -89,13 +39,35 @@ _DEFAULT_REDUCE_INFO = ReduceInfo(0.0)
 
 @dataclass
 class ElementwiseOp(Op):
-    """Apply a scalar function independently to each element."""
+    """Apply a scalar function independently to each element.
 
-    fn: str  # "mul", "add", "exp", "sub", "div", ...
+    The ``op`` field is an ``ExprOp`` carrying the function's name +
+    arity + commutativity + (for reducer use) identity. A plain string
+    is accepted by ``__post_init__`` and resolved to the canonical
+    ``ExprOp`` via the registry in ``ir.expr``.
+    """
+
+    op: ExprOp = field(default_factory=lambda: coerce_expr_op("copy"))
+
+    def __post_init__(self) -> None:
+        # Accept a string name for back-compat with ``ElementwiseOp("add")``
+        # / ``ElementwiseOp(op="add")``-style construction; resolve to the
+        # canonical ExprOp so the rest of the pipeline sees structured
+        # metadata.
+        object.__setattr__(self, "op", coerce_expr_op(self.op))
 
     @property
-    def info(self) -> OpInfo:
-        return OP_REGISTRY.get(self.fn, _DEFAULT_OP_INFO)
+    def fn(self) -> str:
+        """Back-compat alias for callers that read the op's string name."""
+        return self.op.name
+
+    @property
+    def arity(self) -> int:
+        return self.op.arity
+
+    @property
+    def commutative(self) -> bool:
+        return self.op.commutative
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         """Elementwise is rank-preserving with no implicit broadcasting:
@@ -110,55 +82,42 @@ class ElementwiseOp(Op):
             if tuple(s) != head:
                 shapes_fmt = [tuple(s) for s in input_shapes]
                 raise ValueError(
-                    f"ElementwiseOp({self.fn!r}) input shapes must all match output; "
+                    f"ElementwiseOp({self.op.name!r}) input shapes must all match output; "
                     f"got {shapes_fmt}. Wrap in IndexMapOp (pipeline/passes/frontend/decomposition/_broadcast.broadcast_to)."
                 )
         return head
 
     def forward(self, *inputs):
-        import numpy as np
-
-        _EW_FN = {
-            "add": lambda a, b: a + b,
-            "sub": lambda a, b: a - b,
-            "mul": lambda a, b: a * b,
-            "div": lambda a, b: a / b,
-            "mod": lambda a, b: a % b,
-            "max": lambda a, b: np.maximum(a, b),
-            "min": lambda a, b: np.minimum(a, b),
-            "neg": lambda a: -a,
-            "exp": lambda a: np.exp(a),
-            "rsqrt": lambda a: 1.0 / np.sqrt(a),
-            "recip": lambda a: 1.0 / a,
-            "relu": lambda a: np.maximum(a, 0),
-            "tanh": lambda a: np.tanh(a),
-            "sigmoid": lambda a: 1.0 / (1.0 + np.exp(-a)),
-            "pow": lambda a, b: np.power(a, b),
-            "abs": lambda a: np.abs(a),
-            "silu": lambda a: a / (1.0 + np.exp(-a)),
-            "copy": lambda a: a,
-        }
-        fn = _EW_FN.get(self.fn)
+        fn = resolve_fn(self.op.name)
         if fn is None:
-            raise NotImplementedError(f"ElementwiseOp.forward: unknown fn {self.fn!r}")
-        # No shape check here — inside a LoopOp body, `forward` is called
-        # per-iteration on scalar (possibly ()-shape vs (1,)-shape) values,
-        # so a tensor-level "shapes must match" assert doesn't apply.
-        # infer_output_shape enforces the matching-shape invariant at the
-        # graph level, which is the right scope.
+            raise NotImplementedError(f"ElementwiseOp.forward: unknown fn {self.op.name!r}")
+        # No shape check here — inside a LoopOp body, forward is called
+        # per-iteration on scalar values, so a tensor-level match assert
+        # doesn't apply. infer_output_shape enforces it at the graph level.
         return fn(*inputs)
 
 
 @dataclass
 class ReduceOp(Op):
-    """Collapse one or more dimensions via an associative binary op."""
+    """Collapse one or more dimensions via an associative binary op.
 
-    fn: str  # "sum", "max", "prod"
-    axis: int | str  # concrete or symbolic
+    ``op`` is the combine (``sum`` / ``max`` / ``prod`` / …); ``axis`` is
+    the reduced dimension (concrete int or symbolic name).
+    """
+
+    op: ExprOp = field(default_factory=lambda: coerce_expr_op("sum"))
+    axis: int | str = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "op", coerce_expr_op(self.op))
 
     @property
-    def info(self) -> ReduceInfo:
-        return REDUCE_REGISTRY.get(self.fn, _DEFAULT_REDUCE_INFO)
+    def fn(self) -> str:
+        return self.op.name
+
+    @property
+    def identity(self) -> float:
+        return self.op.identity if self.op.identity is not None else 0.0
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return _keepdim_axis(input_shapes[0], self.axis)
@@ -167,23 +126,31 @@ class ReduceOp(Op):
         import numpy as np
 
         a = inputs[0]
-        _RED_FN = {
-            "sum": lambda x, ax: np.sum(x, axis=ax, keepdims=True),
-            "max": lambda x, ax: np.max(x, axis=ax, keepdims=True),
-            "prod": lambda x, ax: np.prod(x, axis=ax, keepdims=True),
-        }
-        fn = _RED_FN.get(self.fn)
-        if fn is None:
-            raise NotImplementedError(f"ReduceOp.forward: unknown fn {self.fn!r}")
-        return fn(a, self.axis)
+        name = self.op.name
+        if name in ("sum", "add"):
+            return np.sum(a, axis=self.axis, keepdims=True)
+        if name in ("prod", "mul"):
+            return np.prod(a, axis=self.axis, keepdims=True)
+        if name in ("max", "amax", "fmax"):
+            return np.max(a, axis=self.axis, keepdims=True)
+        if name in ("min", "fmin"):
+            return np.min(a, axis=self.axis, keepdims=True)
+        raise NotImplementedError(f"ReduceOp.forward: unknown fn {name!r}")
 
 
 @dataclass
 class ScanOp(Op):
     """Cumulative application of an associative binary op along an axis."""
 
-    fn: str  # "sum", "max", "prod"
-    axis: int | str
+    op: ExprOp = field(default_factory=lambda: coerce_expr_op("sum"))
+    axis: int | str = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "op", coerce_expr_op(self.op))
+
+    @property
+    def fn(self) -> str:
+        return self.op.name
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(input_shapes[0])  # scan preserves shape
@@ -192,15 +159,14 @@ class ScanOp(Op):
         import numpy as np
 
         a = inputs[0]
-        _SCAN_FN = {
-            "sum": lambda x, ax: np.cumsum(x, axis=ax),
-            "max": lambda x, ax: np.maximum.accumulate(x, axis=ax),
-            "prod": lambda x, ax: np.cumprod(x, axis=ax),
-        }
-        fn = _SCAN_FN.get(self.fn)
-        if fn is None:
-            raise NotImplementedError(f"ScanOp.forward: unknown fn {self.fn!r}")
-        return fn(a, self.axis)
+        name = self.op.name
+        if name in ("sum", "add"):
+            return np.cumsum(a, axis=self.axis)
+        if name in ("max", "fmax"):
+            return np.maximum.accumulate(a, axis=self.axis)
+        if name in ("prod", "mul"):
+            return np.cumprod(a, axis=self.axis)
+        raise NotImplementedError(f"ScanOp.forward: unknown fn {name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +178,7 @@ class ScanOp(Op):
 class GatherOp(Op):
     """Read elements from arbitrary positions along an axis."""
 
-    axis: int | str
+    axis: int | str = 0
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         # Output shape = input shape with the gather axis sized by the index input.
@@ -230,7 +196,7 @@ class GatherOp(Op):
 class ScatterOp(Op):
     """Write (or reduce) values into arbitrary positions along an axis."""
 
-    axis: int | str
+    axis: int | str = 0
     reduce_fn: str | None = None  # None = overwrite, "sum" = scatter-add
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
@@ -281,8 +247,8 @@ class IndexMapOp(Op):
     output positions read which input.
     """
 
-    out_shape: tuple[int, ...]
-    sources: tuple[IndexSource, ...]
+    out_shape: tuple[int, ...] = ()
+    sources: tuple[IndexSource, ...] = ()
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(self.out_shape)

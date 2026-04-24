@@ -22,13 +22,13 @@ def _small_graph() -> Graph:
     w = g.add_node(op=ConstantOp(name="W"), inputs=[], output=Tensor("W", (4, 8)), node_id="w")
     g.inputs = [x]
     m = g.add_node(
-        op=ElementwiseOp(fn="mul"),
+        op=ElementwiseOp(op="mul"),
         inputs=[x, w],
         output=Tensor("m", (4, 8)),
         node_id="m",
     )
     r = g.add_node(
-        op=ReduceOp(fn="sum", axis=-1),
+        op=ReduceOp(op="sum", axis=-1),
         inputs=[m],
         output=Tensor("r", (4, 1)),
         node_id="r",

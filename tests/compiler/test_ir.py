@@ -22,13 +22,13 @@ def _make_matmul_graph():
     g.inputs = [a, b]
 
     ew = g.add_node(
-        op=ElementwiseOp(fn="mul"),
+        op=ElementwiseOp(op="mul"),
         inputs=[a, b],
         output=Tensor("AB", ("M", "K", "N")),
         node_id="ew",
     )
     red = g.add_node(
-        op=ReduceOp(fn="sum", axis=1),
+        op=ReduceOp(op="sum", axis=1),
         inputs=[ew],
         output=Tensor("C", ("M", 1, "N")),
         node_id="red",
@@ -59,7 +59,7 @@ def test_missing_input_raises():
     g = Graph()
     with pytest.raises(ValueError, match="does not exist"):
         g.add_node(
-            op=ElementwiseOp(fn="add"),
+            op=ElementwiseOp(op="add"),
             inputs=["nonexistent"],
             output=Tensor("Y", (4,)),
         )
@@ -85,7 +85,7 @@ def test_replace_node():
     g = _make_matmul_graph()
     # Add a new node and rewire red's consumers to it.
     new_id = g.add_node(
-        op=ReduceOp(fn="sum", axis=0),
+        op=ReduceOp(op="sum", axis=0),
         inputs=["ew"],
         output=Tensor("C2", (1, "K", "N")),
         node_id="red2",
@@ -114,7 +114,7 @@ def test_fan_out():
     g = Graph()
     x = g.add_node(op=InputOp(), inputs=[], output=Tensor("X", (4,)), node_id="x")
     g.inputs = [x]
-    a = g.add_node(op=ElementwiseOp(fn="exp"), inputs=[x], output=Tensor("expX", (4,)), node_id="a")
-    b = g.add_node(op=ElementwiseOp(fn="neg"), inputs=[x], output=Tensor("negX", (4,)), node_id="b")
+    a = g.add_node(op=ElementwiseOp(op="exp"), inputs=[x], output=Tensor("expX", (4,)), node_id="a")
+    b = g.add_node(op=ElementwiseOp(op="neg"), inputs=[x], output=Tensor("negX", (4,)), node_id="b")
     g.outputs = [a, b]
     assert sorted(g.consumers("x")) == ["a", "b"]

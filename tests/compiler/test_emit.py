@@ -35,7 +35,7 @@ def _pointwise_add_graph() -> Graph:
 def _reduce_sum_graph() -> Graph:
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")
-    g.add_node(op=ReduceOp(fn="sum", axis=-1), inputs=["x"], output=Tensor("y", (4, 1)), node_id="y")
+    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("y", (4, 1)), node_id="y")
     g.inputs = ["x"]
     g.outputs = ["y"]
     return g
@@ -61,7 +61,7 @@ def _softmax_graph() -> Graph:
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")
     g.add_node(op=ConstantOp(name="axis", value=-1.0), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
     g.add_node(
-        op=ElementwiseOp(fn="softmax"),
+        op=ElementwiseOp(op="softmax"),
         inputs=["x", "axis"],
         output=Tensor("y", (4, 8)),
         node_id="y",

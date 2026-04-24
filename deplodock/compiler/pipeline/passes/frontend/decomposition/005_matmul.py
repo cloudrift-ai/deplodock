@@ -50,7 +50,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     a_bc = broadcast_to(frag, a_unsq_id, mul_shape)
     b_bc = broadcast_to(frag, b_unsq_id, mul_shape)
     ew_id = frag.add_node(
-        op=ElementwiseOp(fn="mul"),
+        op=ElementwiseOp(op="mul"),
         inputs=[a_bc, b_bc],
         output=Tensor(f"{name}_ew", mul_shape, dtype),
     )
@@ -59,7 +59,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # expect the matmul's declared shape.
     reduce_shape = tuple(mul_shape[:k_axis]) + (1,) + tuple(mul_shape[k_axis + 1 :])
     red_id = frag.add_node(
-        op=ReduceOp(fn="sum", axis=k_axis),
+        op=ReduceOp(op="sum", axis=k_axis),
         inputs=[ew_id],
         output=Tensor(f"{name}_reduce", reduce_shape, dtype),
     )
@@ -67,7 +67,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     if bias_id:
         sq_id = squeeze_axis(frag, red_id, k_axis)
         bias_bc = broadcast_to(frag, bias_id, shape)
-        add_id = frag.add_node(op=ElementwiseOp(fn="add"), inputs=[sq_id, bias_bc], output=Tensor(name, shape, dtype))
+        add_id = frag.add_node(op=ElementwiseOp(op="add"), inputs=[sq_id, bias_bc], output=Tensor(name, shape, dtype))
         frag.outputs = [add_id]
     else:
         sq_id = squeeze_axis(frag, red_id, k_axis, out_name=name)

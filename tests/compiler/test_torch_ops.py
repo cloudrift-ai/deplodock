@@ -48,7 +48,7 @@ def _run(run_graph, graph: Graph, inputs: dict[str, np.ndarray]) -> np.ndarray:
         ("neg", lambda x: torch.neg(x)),
         ("exp", lambda x: torch.exp(x)),
         ("rsqrt", lambda x: torch.rsqrt(x)),
-        ("recip", lambda x: torch.reciprocal(x)),
+        ("reciprocal", lambda x: torch.reciprocal(x)),
         ("relu", lambda x: torch.relu(x)),
         ("tanh", lambda x: torch.tanh(x)),
         ("sigmoid", lambda x: torch.sigmoid(x)),

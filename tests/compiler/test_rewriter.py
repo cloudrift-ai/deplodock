@@ -14,7 +14,7 @@ def _make_silu_graph() -> Graph:
     g = Graph()
     x = g.add_node(op=InputOp(), inputs=[], output=Tensor("x", ("N",)), node_id="x")
     g.inputs = [x]
-    silu = g.add_node(op=ElementwiseOp(fn="silu"), inputs=[x], output=Tensor("out", ("N",)), node_id="out")
+    silu = g.add_node(op=ElementwiseOp(op="silu"), inputs=[x], output=Tensor("out", ("N",)), node_id="out")
     g.outputs = [silu]
     return g
 

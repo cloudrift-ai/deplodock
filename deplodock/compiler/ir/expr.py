@@ -197,28 +197,22 @@ class Builtin(_ExprOps):
 class FuncCall(_ExprOps):
     """Intrinsic / math function call.
 
-    Kernel IR is backend-neutral: names match numpy's module-level
+    Kernel IR is backend-neutral: names match either a numpy module-level
     attribute (``exp``, ``tanh``, ``fabs``, ``fmax``, ``fmin``, ``sqrt``,
-    ``pow``, …) so ``FuncCall.eval`` dispatches via ``getattr(np, name)``.
-    The CUDA emitter's ``_translate_intrinsic`` rewrites them to the
-    ``f``-suffixed libm spellings at source-render time. ``rsqrt`` is the
-    one exception — no direct numpy equivalent, so it's folded to
-    ``1 / sqrt(x)``.
+    ``pow``, …) or a free function defined in this module for the intrinsics
+    numpy lacks (``rsqrt``, ``relu``, ``sigmoid``, ``silu``, …). The CUDA
+    emitter's ``_translate_intrinsic`` rewrites them to the ``f``-suffixed
+    libm spellings at source-render time.
     """
 
     name: str
     args: list[Expr]
 
     def eval(self, env: dict[str, object]) -> object:
-        import numpy as np
-
-        vals = [a.eval(env) for a in self.args]
-        if self.name == "rsqrt":
-            return 1.0 / np.sqrt(vals[0])
-        fn = getattr(np, self.name, None)
+        fn = resolve_fn(self.name)
         if fn is None:
             raise NotImplementedError(f"FuncCall.eval: unknown intrinsic {self.name!r}")
-        return fn(*vals)
+        return fn(*(a.eval(env) for a in self.args))
 
 
 @dataclass
@@ -373,3 +367,202 @@ def free_vars(expr: Expr) -> frozenset[str]:
     if isinstance(expr, Cast):
         return free_vars(expr.expr)
     return frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Free functions — numpy callables for intrinsics numpy itself doesn't expose
+# under the same name. ``resolve_fn`` tries this module first (so our ``max``
+# means elementwise maximum, not the reduction ``np.max``) then falls back to
+# ``numpy``.
+# ---------------------------------------------------------------------------
+
+
+def _np():
+    import numpy as np
+
+    return np
+
+
+# Free functions for intrinsics that have no numpy equivalent under the
+# same name. Basic arithmetic (add / sub / mul / div / mod / neg / pow)
+# is handled via the ``operator`` module inside ``resolve_fn``; elementwise
+# max / min map to ``np.maximum`` / ``np.minimum``; ``copy`` is identity.
+# Only the genuinely missing ops need a module-level definition here.
+
+
+def rsqrt(a):
+    return 1.0 / _np().sqrt(a)
+
+
+def relu(a):
+    return _np().maximum(0.0, a)
+
+
+def sigmoid(a):
+    return 1.0 / (1.0 + _np().exp(-a))
+
+
+def silu(a):
+    return a / (1.0 + _np().exp(-a))
+
+
+def resolve_fn(name: str):
+    """Resolve an intrinsic name to a callable, tried in three layers.
+
+    1. ``operator`` module for basic arithmetic (add / sub / mul / div /
+       mod / neg / pow) — works for scalars and ndarrays.
+    2. Elementwise shims for names that numpy spells differently or
+       repurposes for reductions: ``max`` → ``np.maximum``,
+       ``min`` → ``np.minimum``, ``copy`` → identity.
+    3. This module's free functions (``rsqrt`` / ``relu`` / ``sigmoid`` /
+       ``silu``) for non-numpy intrinsics.
+    4. numpy for everything else (``exp`` / ``tanh`` / ``sqrt`` /
+       ``reciprocal`` / ``power`` / …).
+
+    Returns ``None`` when no layer matches.
+    """
+    import operator
+
+    _OPERATOR = {
+        "add": operator.add,
+        "sub": operator.sub,
+        "mul": operator.mul,
+        "div": operator.truediv,
+        "mod": operator.mod,
+        "neg": operator.neg,
+        "pow": operator.pow,
+    }
+    fn = _OPERATOR.get(name)
+    if fn is not None:
+        return fn
+    np_ = _np()
+    if name == "max":
+        return np_.maximum
+    if name == "min":
+        return np_.minimum
+    if name == "copy":
+        return lambda x: x
+    fn = globals().get(name)
+    if callable(fn):
+        return fn
+    return getattr(np_, name, None)
+
+
+# ---------------------------------------------------------------------------
+# ExprOp — hierarchy for elementwise / reduction ops
+# ---------------------------------------------------------------------------
+#
+# ``ExprOp`` is the base. ``UnaryOp`` / ``BinaryOp`` subclasses fix
+# ``arity`` at the class level; the op's ``name``, ``commutative``, and
+# ``identity`` (reducer neutral) live on the instance. Canonical instances
+# are singletons stored in ``_EXPR_OP_REGISTRY`` and looked up by name.
+#
+# Evaluation dispatch uses ``resolve_fn`` — the op's ``name`` is resolved
+# to a callable in this module's globals or numpy. The hierarchy carries
+# compiler-side metadata only; it doesn't own an ``apply_numpy`` method.
+
+
+class ExprOp:
+    """Base class for named scalar ops (elementwise or reducer).
+
+    Subclasses (``UnaryOp`` / ``BinaryOp``) fix the ``arity``. Instances
+    carry the remaining metadata: ``name``, ``commutative``, ``identity``
+    (None when the op isn't a valid reducer). Equality compares by
+    ``(type, name)`` so singletons round-trip cleanly through sets / dicts.
+    """
+
+    arity: int = 1
+
+    def __init__(self, name: str, commutative: bool = False, identity: float | None = None) -> None:
+        self.name = name
+        self.commutative = commutative
+        self.identity = identity
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ExprOp) and type(self) is type(other) and self.name == other.name
+
+    def __hash__(self) -> int:
+        return hash((type(self), self.name))
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.name!r})"
+
+    @property
+    def fn(self) -> str:
+        """Alias for ``name`` — kept for readers using the older ``.fn`` spelling."""
+        return self.name
+
+
+class UnaryOp(ExprOp):
+    arity = 1
+
+
+class BinaryOp(ExprOp):
+    arity = 2
+
+
+def _reg(op: ExprOp) -> ExprOp:
+    _EXPR_OP_REGISTRY[op.name] = op
+    return op
+
+
+_EXPR_OP_REGISTRY: dict[str, ExprOp] = {}
+
+# Canonical op instances. These live at module scope so callers can do
+# ``from deplodock.compiler.ir.expr import ADD`` for pattern matching,
+# but the primary lookup path is by name via ``get_expr_op``.
+ADD = _reg(BinaryOp("add", commutative=True, identity=0.0))
+SUB = _reg(BinaryOp("sub"))
+MUL = _reg(BinaryOp("mul", commutative=True, identity=1.0))
+DIV = _reg(BinaryOp("div"))
+MOD = _reg(BinaryOp("mod"))
+MAX = _reg(BinaryOp("max", commutative=True, identity=-1e30))
+MIN = _reg(BinaryOp("min", commutative=True, identity=1e30))
+# Torch-level reduction name (``amax``) kept distinct from ``max`` so the
+# traced graph preserves the source op's spelling; semantics are the same.
+AMAX = _reg(BinaryOp("amax", commutative=True, identity=-1e30))
+POW = _reg(BinaryOp("pow"))
+# Reduction-only names (same shape as their Add / Mul cousins but a distinct
+# name because tensor-IR ``ReduceOp`` uses ``sum`` / ``prod``).
+SUM = _reg(BinaryOp("sum", commutative=True, identity=0.0))
+PROD = _reg(BinaryOp("prod", commutative=True, identity=1.0))
+# Unary math
+NEG = _reg(UnaryOp("neg"))
+EXP = _reg(UnaryOp("exp"))
+RSQRT = _reg(UnaryOp("rsqrt"))
+RECIPROCAL = _reg(UnaryOp("reciprocal"))
+RELU = _reg(UnaryOp("relu"))
+TANH = _reg(UnaryOp("tanh"))
+SIGMOID = _reg(UnaryOp("sigmoid"))
+SILU = _reg(UnaryOp("silu"))
+ABS = _reg(UnaryOp("abs"))
+FABS = _reg(UnaryOp("fabs"))
+SQRT = _reg(UnaryOp("sqrt"))
+LOG = _reg(UnaryOp("log"))
+COPY = _reg(UnaryOp("copy"))
+
+
+def get_expr_op(name: str) -> ExprOp:
+    """Look up the canonical ``ExprOp`` singleton for ``name``; raise on unknown."""
+    op = _EXPR_OP_REGISTRY.get(name)
+    if op is None:
+        raise ValueError(f"unknown ExprOp name: {name!r}")
+    return op
+
+
+def coerce_expr_op(v: str | ExprOp) -> ExprOp:
+    """Accept a string name or ``ExprOp`` instance; return an ``ExprOp``.
+
+    Used by ``ElementwiseOp`` / ``ReduceOp`` / ``Accum`` in ``__post_init__``
+    to keep string-based construction working while storing structured
+    metadata on the field. Names not in the registry mint a generic
+    ``UnaryOp(name)`` — the fused frontend ops (``rms_norm`` / ``softmax``
+    / …) pass through Tensor IR under such names and are decomposed
+    before any eval/codegen cares about arity or identity.
+    """
+    if isinstance(v, ExprOp):
+        return v
+    op = _EXPR_OP_REGISTRY.get(v)
+    if op is not None:
+        return op
+    return UnaryOp(v)

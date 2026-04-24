@@ -142,6 +142,20 @@ def _lookup_op_class(name: str) -> type[Op] | None:
         cls = getattr(module, name, None)
         if isinstance(cls, type) and issubclass(cls, Op):
             return cls
+
+
+def _serialize_field(v):
+    """Flatten non-JSON-friendly op field values to a JSON-compatible form.
+
+    Currently only special-cases ``ir.expr.ExprOp`` (stored as its ``name``
+    string); everything else passes through. The corresponding
+    ``coerce_expr_op`` in each op's ``__post_init__`` reverses this on load.
+    """
+    from deplodock.compiler.ir.expr import ExprOp
+
+    if isinstance(v, ExprOp):
+        return v.name
+    return v
     return None
 
 
@@ -285,11 +299,16 @@ class Graph:
             if op_cls is None:
                 raise ValueError(f"Unknown op class: {op_cls_name}")
 
-            fields = ndata.get("op_fields", {})
+            fields = dict(ndata.get("op_fields", {}))
             # Convert list fields to tuples for dataclass ops that expect tuples.
             for k, v in fields.items():
                 if isinstance(v, list):
                     fields[k] = tuple(v)
+            # Back-compat: old JSON stored ``fn: "add"`` before the ExprOp
+            # refactor; rename to the new ``op=`` field so the coercing
+            # ``__post_init__`` resolves the ExprOp from the name.
+            if "fn" in fields and op_cls.__name__ in ("ElementwiseOp", "ReduceOp", "ScanOp"):
+                fields["op"] = fields.pop("fn")
 
             op = op_cls(**fields) if fields else op_cls()
             out = ndata["output"]
@@ -369,7 +388,7 @@ class Graph:
         for nid, node in self.nodes.items():
             entry: dict = {
                 "op": type(node.op).__name__,
-                "op_fields": {k: v for k, v in node.op.__dict__.items() if not k.startswith("_")},
+                "op_fields": {k: _serialize_field(v) for k, v in node.op.__dict__.items() if not k.startswith("_")},
                 "inputs": node.inputs,
                 "output": {
                     "name": node.output.name,

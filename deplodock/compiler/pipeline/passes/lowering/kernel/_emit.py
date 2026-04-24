@@ -44,7 +44,7 @@ from deplodock.compiler.ir.kernel.ir import (
 from deplodock.compiler.ir.kernel.ir import (
     Assign as IrAssign,
 )
-from deplodock.compiler.ir.loop import ACCUM_IDENTITY, Accum, Axis, Load, LoopOp, Select, SelectBranch
+from deplodock.compiler.ir.loop import Accum, Axis, Load, LoopOp, Select, SelectBranch
 from deplodock.compiler.ir.loop import Assign as IrAssignStmt
 from deplodock.compiler.ir.loop import Loop as IrLoop
 from deplodock.compiler.ir.loop import Write as IrWrite
@@ -374,7 +374,7 @@ def _emit_reduce_loop_serial(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
         seen.add(a.name)
         acc_var = f"acc{ctx.acc_seq[0]}"
         ctx.acc_seq[0] += 1
-        identity = ACCUM_IDENTITY.get(a.op.fn, 0.0)
+        identity = a.op.identity if a.op.identity is not None else 0.0
         out.append(VarDecl(dtype="float", name=acc_var, init=Literal(identity, "float")))
         ctx.values[a.name] = Var(acc_var)
 
@@ -413,7 +413,7 @@ def _emit_reduce_loop_smem(loop: IrLoop, ctx: _Ctx, out: list[Stmt]) -> None:
             continue
         acc_var = f"acc{ctx.acc_seq[0]}"
         ctx.acc_seq[0] += 1
-        identity = ACCUM_IDENTITY.get(a.op.fn, 0.0)
+        identity = a.op.identity if a.op.identity is not None else 0.0
         out.append(VarDecl(dtype="float", name=acc_var, init=Literal(identity, "float")))
         ctx.values[a.name] = Var(acc_var)
         seen[a.name] = acc_var
@@ -556,7 +556,7 @@ def _apply_elementwise(fn: str, inputs: list[Expr]) -> Expr:
         return BinOp("-", Literal(0.0, "float"), inputs[0])
     if fn == "copy":
         return inputs[0]
-    if fn == "recip":
+    if fn == "reciprocal":
         return BinOp("/", Literal(1.0, "float"), inputs[0])
     if fn == "relu":
         return FuncCall("fmax", [Literal(0.0, "float"), inputs[0]])

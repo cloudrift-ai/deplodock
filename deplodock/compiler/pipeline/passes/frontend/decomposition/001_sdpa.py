@@ -95,13 +95,13 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     q_bc = broadcast_to(frag, q_unsq_id, qk_mul_shape)
     kt_bc = broadcast_to(frag, kt_unsq_id, qk_mul_shape)
     qk_ew_id = frag.add_node(
-        op=ElementwiseOp(fn="mul"),
+        op=ElementwiseOp(op="mul"),
         inputs=[q_bc, kt_bc],
         output=Tensor(f"{name}_qk_ew", qk_mul_shape, dtype),
     )
     qk_reduce_shape = tuple(qk_mul_shape[:qk_k_axis]) + (1,) + tuple(qk_mul_shape[qk_k_axis + 1 :])
     qk_reduce_id = frag.add_node(
-        op=ReduceOp(fn="sum", axis=qk_k_axis),
+        op=ReduceOp(op="sum", axis=qk_k_axis),
         inputs=[qk_ew_id],
         output=Tensor(f"{name}_qk_reduce", qk_reduce_shape, dtype),
     )
@@ -116,7 +116,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     )
     scale_bc = broadcast_to(frag, scale_const_id, scores_shape)
     scaled_id = frag.add_node(
-        op=ElementwiseOp(fn="mul"),
+        op=ElementwiseOp(op="mul"),
         inputs=[qk_id, scale_bc],
         output=Tensor(f"{name}_scaled", scores_shape, dtype),
     )
@@ -158,36 +158,36 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
             output=Tensor(f"{name}_cmask", scores_shape, dtype),
         )
         scaled_id = frag.add_node(
-            op=ElementwiseOp(fn="add"),
+            op=ElementwiseOp(op="add"),
             inputs=[scaled_id, mask_id],
             output=Tensor(f"{name}_masked", scores_shape, dtype),
         )
 
     # Softmax: max → sub → exp → sum → div
     max_id = frag.add_node(
-        op=ReduceOp(fn="max", axis=-1),
+        op=ReduceOp(op="max", axis=-1),
         inputs=[scaled_id],
         output=Tensor(f"{name}_max", scores_shape[:-1] + (1,) if scores_shape else (1,), dtype),
     )
     max_bc = broadcast_to(frag, max_id, scores_shape)
     sub_id = frag.add_node(
-        op=ElementwiseOp(fn="sub"),
+        op=ElementwiseOp(op="sub"),
         inputs=[scaled_id, max_bc],
         output=Tensor(f"{name}_shifted", scores_shape, dtype),
     )
     exp_id = frag.add_node(
-        op=ElementwiseOp(fn="exp"),
+        op=ElementwiseOp(op="exp"),
         inputs=[sub_id],
         output=Tensor(f"{name}_exp", scores_shape, dtype),
     )
     sum_id = frag.add_node(
-        op=ReduceOp(fn="sum", axis=-1),
+        op=ReduceOp(op="sum", axis=-1),
         inputs=[exp_id],
         output=Tensor(f"{name}_sum", scores_shape[:-1] + (1,) if scores_shape else (1,), dtype),
     )
     sum_bc = broadcast_to(frag, sum_id, scores_shape)
     softmax_id = frag.add_node(
-        op=ElementwiseOp(fn="div"),
+        op=ElementwiseOp(op="div"),
         inputs=[exp_id, sum_bc],
         output=Tensor(f"{name}_softmax", scores_shape, dtype),
     )
@@ -230,13 +230,13 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     s_bc = broadcast_to(frag, s_unsq_id, sv_mul_shape)
     v_bc = broadcast_to(frag, v_unsq_id, sv_mul_shape)
     sv_ew_id = frag.add_node(
-        op=ElementwiseOp(fn="mul"),
+        op=ElementwiseOp(op="mul"),
         inputs=[s_bc, v_bc],
         output=Tensor(f"{name}_sv_ew", sv_mul_shape, dtype),
     )
     sv_reduce_shape = tuple(sv_mul_shape[:sv_k_axis]) + (1,) + tuple(sv_mul_shape[sv_k_axis + 1 :])
     sv_reduce_id = frag.add_node(
-        op=ReduceOp(fn="sum", axis=sv_k_axis),
+        op=ReduceOp(op="sum", axis=sv_k_axis),
         inputs=[sv_ew_id],
         output=Tensor(f"{name}_sv_reduce", sv_reduce_shape, dtype),
     )

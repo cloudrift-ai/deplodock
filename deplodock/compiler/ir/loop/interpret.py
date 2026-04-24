@@ -17,9 +17,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.expr import ExprOp, Var, resolve_fn
 from deplodock.compiler.ir.loop.ir import Accum, Assign, Axis, Load, LoopOp, Select, Write
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 
 def execute_loop_op(
@@ -48,8 +47,11 @@ def execute_loop_op(
     for stmt in loop:
         if isinstance(stmt, Assign):
             args = [values[a] for a in stmt.args]
-            assert isinstance(stmt.op, ElementwiseOp)
-            values[stmt.name] = stmt.op.forward(*_align_ranks(args))
+            assert isinstance(stmt.op, ExprOp)
+            fn = resolve_fn(stmt.op.name)
+            if fn is None:
+                raise NotImplementedError(f"interpret: unknown op {stmt.op.name!r}")
+            values[stmt.name] = fn(*_align_ranks(args))
         elif isinstance(stmt, Load):
             if stmt.source >= len(input_arrays):
                 raise ValueError(f"Load source {stmt.source} out of range (have {len(input_arrays)} inputs)")
@@ -101,7 +103,7 @@ def _fold_to_accumulator(src: np.ndarray, acc: Accum, reduce_axis_positions: tup
     if not reduce_axis_positions:
         return np.asarray(src, dtype=np.float32)
     axes = tuple(reduce_axis_positions)
-    fn = acc.op.fn
+    fn = acc.op.name
     if fn == "add":
         return np.sum(src, axis=axes, keepdims=True).astype(np.float32)
     if fn == "max":

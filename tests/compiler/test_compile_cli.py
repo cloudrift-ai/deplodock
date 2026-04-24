@@ -52,7 +52,7 @@ def test_compile_code_functional_silu(run_cli):
     rc, stdout, stderr = run_cli("compile", "--code", "F.silu(torch.randn(1,32,128))", "--ir", "tensor")
     assert rc == 0, f"stderr: {stderr}"
     assert "exp(" in stdout
-    assert "recip(" in stdout
+    assert "reciprocal(" in stdout
 
 
 def test_compile_code_functional_softmax_bakes_kwargs(run_cli):

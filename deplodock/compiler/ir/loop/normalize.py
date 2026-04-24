@@ -45,7 +45,6 @@ from deplodock.compiler.ir.loop.ir import (
     map_body,
 )
 from deplodock.compiler.ir.loop.sigma import Sigma
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 __all__ = [
     "normalize_body",
@@ -166,7 +165,7 @@ def canonicalize_free_axis_order(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
 
 def _is_copy_assign(stmt: Stmt) -> bool:
-    return isinstance(stmt, Assign) and isinstance(stmt.op, ElementwiseOp) and stmt.op.fn == "copy" and len(stmt.args) == 1
+    return isinstance(stmt, Assign) and stmt.op.name == "copy" and len(stmt.args) == 1
 
 
 def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:

@@ -15,7 +15,6 @@ The public surface below re-exports the common types so callers use
 
 from deplodock.compiler.ir.loop.builder import LoopBuilder
 from deplodock.compiler.ir.loop.ir import (
-    ACCUM_IDENTITY,
     Accum,
     Assign,
     Axis,
@@ -35,7 +34,6 @@ from deplodock.compiler.ir.loop.ir import (
 from deplodock.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
 
 __all__ = [
-    "ACCUM_IDENTITY",
     "Accum",
     "Assign",
     "Axis",
