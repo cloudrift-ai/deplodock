@@ -131,9 +131,9 @@ def _output_numel(loop_op: LoopOp) -> int:
     return n
 
 
-def _count_loads_from(consumer_op: LoopOp, producer_input_idx: int) -> int:
-    """Number of ``Load`` stmts in the consumer body reading producer's output."""
-    return sum(1 for ld in consumer_op.loads if ld.source == producer_input_idx)
+def _count_loads_from(consumer_op: LoopOp, producer_buf: str) -> int:
+    """Number of ``Load`` stmts in the consumer body reading producer's output buffer."""
+    return sum(1 for ld in consumer_op.loads if ld.source == producer_buf)
 
 
 PATTERN = [
@@ -163,8 +163,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # Pure-elementwise producers and "cheap" reducers like softmax's
     # (max + exp) — where the reduce collapses to a row scalar the splicer
     # can hoist — stay fuseable.
-    producer_input_idx = consumer_node.inputs.index(producer_id)
-    if _reduce_heavy(producer_node.op) and _count_loads_from(consumer_node.op, producer_input_idx) > 1:
+    if _reduce_heavy(producer_node.op) and _count_loads_from(consumer_node.op, producer_id) > 1:
         return None
 
     # Build a subgraph: producer, consumer, and their non-producer external
@@ -189,6 +188,8 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     if result is None:
         return None
     merged, merged_inputs = result
+    new_node_id = f"merged_{consumer_id}"
+    merged = _rename_write_output(merged, old=consumer_id, new=new_node_id)
 
     pre_work = _total_work(producer_node.op) + _total_work(consumer_node.op)
     pre_reads = _total_reads(producer_node.op) + _total_reads(consumer_node.op)
@@ -211,8 +212,12 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     ):
         return None
 
-    # Wrap the merged LoopOp in the rule's output fragment, with an InputOp
-    # per external slot in the order ``splice_graph`` assigned.
+    # Wrap the merged LoopOp in the rule's output fragment. The graph node's
+    # ``inputs`` list must be in the SAME order as ``merged.input_bufs`` (the
+    # buf names appearing on body Loads in first-use order) so the
+    # interpreter — which positionally zips ``node.inputs`` against
+    # ``input_bufs`` — keys arrays by the right buf name.
+    merged_inputs = list(merged.input_bufs)
     frag = Graph()
     for inp_id in merged_inputs:
         ext = graph.nodes.get(inp_id)
@@ -223,13 +228,31 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         merged,
         merged_inputs,
         Tensor(
-            f"merged_{consumer_id}",
+            new_node_id,
             consumer_node.output.shape,
             consumer_node.output.dtype,
         ),
+        node_id=new_node_id,
     )
     frag.outputs = [out_id]
 
     match.output = consumer_id
     match.consumed = {producer_id, consumer_id}
     return frag
+
+
+def _rename_write_output(op: LoopOp, *, old: str, new: str) -> LoopOp:
+    """Return ``op`` with every ``Write`` whose ``output == old`` rewritten
+    to ``output=new`` (recursively descends into nested Loops). Used by
+    fusion to align the spliced root's Writes with the new graph node id.
+    """
+    from deplodock.compiler.ir.loop import Loop, Write, map_body
+
+    def fn(s):
+        if isinstance(s, Write) and s.output == old:
+            return Write(output=new, index=s.index, value=s.value)
+        if isinstance(s, Loop):
+            return Loop(axis=s.axis, body=map_body(s.body, fn))
+        return s
+
+    return LoopOp(body=map_body(op.body, fn))

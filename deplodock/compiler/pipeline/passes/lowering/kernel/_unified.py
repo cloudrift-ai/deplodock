@@ -90,10 +90,12 @@ def _split_outer(body: tuple[LoopStmt, ...]) -> tuple[tuple[LoopStmt, ...], tupl
     cur = rest
     live: list[Axis] = []
     while True:
-        loops = [s for s in cur if isinstance(s, Loop)]
-        if len(loops) != 1:
+        # Only descend when this level is exactly ONE stmt and that stmt is a
+        # non-reduce Loop. If there are sibling stmts (e.g. a Load hoisted to
+        # an outer scope) we can't strip the loop without losing them.
+        if len(cur) != 1 or not isinstance(cur[0], Loop):
             return tuple(top), cur, tuple(live)
-        only = loops[0]
+        only = cur[0]
         if any(isinstance(x, Accum) for x in only.body):
             return tuple(top), cur, tuple(live)
         live.append(only.axis)

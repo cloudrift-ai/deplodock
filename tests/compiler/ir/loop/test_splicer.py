@@ -67,9 +67,9 @@ def test_pointwise_chain():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Load(name="x", source="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
@@ -79,15 +79,15 @@ def test_pointwise_chain():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="yv", source=0, index=(Var("a0"),)),
+                    Load(name="yv", source="src_0", index=(Var("a0"),)),
                     Assign(name="z", op="add", args=("yv", "yv")),
-                    Write(output=0, index=(Var("a0"),), value="z"),
+                    Write(output="out_0", index=(Var("a0"),), value="z"),
                 ),
             ),
         ),
     )
 
-    merged = splice_loop_ops(producer, consumer, source=0)
+    merged = splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
     fns = _elementwise_fns(merged)
     # exp from producer + copy alias for the Load + add from consumer.
@@ -96,7 +96,7 @@ def test_pointwise_chain():
     # Producer's Load (consumer had no other inputs) survives as source 0.
     loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
     assert len(loads) == 1
-    assert loads[0].source == 0
+    assert loads[0].source == "src_0"
     # Single Write, referencing the final add.
     writes = [s for s in iter_body(merged.body) if isinstance(s, Write)]
     assert len(writes) == 1
@@ -114,9 +114,9 @@ def test_shared_intermediate_deduped():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Load(name="x", source="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
@@ -127,16 +127,16 @@ def test_shared_intermediate_deduped():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="ya", source=0, index=(Var("a0"),)),
-                    Load(name="yb", source=0, index=(Var("a0"),)),
+                    Load(name="ya", source="src_0", index=(Var("a0"),)),
+                    Load(name="yb", source="src_0", index=(Var("a0"),)),
                     Assign(name="z", op="add", args=("ya", "yb")),
-                    Write(output=0, index=(Var("a0"),), value="z"),
+                    Write(output="out_0", index=(Var("a0"),), value="z"),
                 ),
             ),
         ),
     )
 
-    merged = splice_loop_ops(producer, consumer, source=0)
+    merged = splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
     # Only one exp in the merged body (producer chain materializes once).
     assert _elementwise_fns(merged).count("exp") == 1
@@ -161,9 +161,9 @@ def test_different_indices_emit_twice():
                     Loop(
                         axis=A1_same,
                         body=(
-                            Load(name="x", source=0, index=(Var("a0"), Var("a1"))),
+                            Load(name="x", source="src_0", index=(Var("a0"), Var("a1"))),
                             Assign(name="y", op="exp", args=("x",)),
-                            Write(output=0, index=(Var("a0"), Var("a1")), value="y"),
+                            Write(output="out_0", index=(Var("a0"), Var("a1")), value="y"),
                         ),
                     ),
                 ),
@@ -179,10 +179,10 @@ def test_different_indices_emit_twice():
                     Loop(
                         axis=A1_same,
                         body=(
-                            Load(name="ya", source=0, index=(Var("a0"), Var("a1"))),
-                            Load(name="yb", source=0, index=(Var("a1"), Var("a0"))),
+                            Load(name="ya", source="src_0", index=(Var("a0"), Var("a1"))),
+                            Load(name="yb", source="src_0", index=(Var("a1"), Var("a0"))),
                             Assign(name="z", op="add", args=("ya", "yb")),
-                            Write(output=0, index=(Var("a0"), Var("a1")), value="z"),
+                            Write(output="out_0", index=(Var("a0"), Var("a1")), value="z"),
                         ),
                     ),
                 ),
@@ -190,7 +190,7 @@ def test_different_indices_emit_twice():
         ),
     )
 
-    merged = splice_loop_ops(producer, consumer, source=0)
+    merged = splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
     # Two distinct σs ({a0:a0,a1:a1}, {a0:a1,a1:a0}) → exp materializes twice.
     assert _elementwise_fns(merged).count("exp") == 2
@@ -211,11 +211,11 @@ def test_reduction_producer():
                     Loop(
                         axis=K,
                         body=(
-                            Load(name="x", source=0, index=(Var("a0"), Var("k"))),
+                            Load(name="x", source="src_0", index=(Var("a0"), Var("k"))),
                             Accum(name="s", value="x", op="add"),
                         ),
                     ),
-                    Write(output=0, index=(Var("a0"),), value="s"),
+                    Write(output="out_0", index=(Var("a0"),), value="s"),
                 ),
             ),
         ),
@@ -225,15 +225,15 @@ def test_reduction_producer():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="sv", source=0, index=(Var("a0"),)),
+                    Load(name="sv", source="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("sv",)),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
     )
 
-    merged = splice_loop_ops(producer, consumer, source=0)
+    merged = splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
     # The Accum survives in the merged body.
     assert _count_kind(merged, Accum) == 1
@@ -255,9 +255,9 @@ def test_consumer_extra_input_source_remap():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Load(name="x", source="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
@@ -267,21 +267,21 @@ def test_consumer_extra_input_source_remap():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="yv", source=0, index=(Var("a0"),)),  # from producer
-                    Load(name="b", source=1, index=(Var("a0"),)),  # unrelated
+                    Load(name="yv", source="src_0", index=(Var("a0"),)),  # from producer
+                    Load(name="b", source="src_1", index=(Var("a0"),)),  # unrelated
                     Assign(name="z", op="add", args=("yv", "b")),
-                    Write(output=0, index=(Var("a0"),), value="z"),
+                    Write(output="out_0", index=(Var("a0"),), value="z"),
                 ),
             ),
         ),
     )
 
-    merged = splice_loop_ops(producer, consumer, source=0)
+    merged = splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
     loads = {s.name: s for s in iter_body(merged.body) if isinstance(s, Load)}
     # Producer's Load survives at source 0; consumer's unrelated Load shifts to 1.
-    assert any(ld.source == 0 for ld in loads.values())
-    assert any(ld.source == 1 for ld in loads.values())
+    assert any(ld.source == "src_0" for ld in loads.values())
+    assert any(ld.source == "src_1" for ld in loads.values())
     assert merged.num_inputs == 2
 
 
@@ -307,11 +307,11 @@ def test_live_axes_computed():
                     Loop(
                         axis=K,
                         body=(
-                            Load(name="x", source=0, index=(Var("a0"), Var("k"))),
+                            Load(name="x", source="src_0", index=(Var("a0"), Var("k"))),
                             Accum(name="s", value="x", op="add"),
                         ),
                     ),
-                    Write(output=0, index=(Var("a0"),), value="s"),
+                    Write(output="out_0", index=(Var("a0"),), value="s"),
                 ),
             ),
         ),
@@ -342,9 +342,9 @@ def test_chain_three_loops():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Load(name="x", source="X", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="A", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
@@ -354,9 +354,9 @@ def test_chain_three_loops():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="av", source=0, index=(Var("a0"),)),  # reads a
+                    Load(name="av", source="A", index=(Var("a0"),)),
                     Assign(name="y", op="negative", args=("av",)),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="B", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
@@ -366,10 +366,10 @@ def test_chain_three_loops():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="bv", source=0, index=(Var("a0"),)),  # reads b
-                    Load(name="bias", source=1, index=(Var("a0"),)),  # external
+                    Load(name="bv", source="B", index=(Var("a0"),)),
+                    Load(name="bias", source="BIAS", index=(Var("a0"),)),
                     Assign(name="y", op="add", args=("bv", "bias")),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="C", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
@@ -377,21 +377,17 @@ def test_chain_three_loops():
 
     merged = splice_loops(
         loops={"a": a, "b": b, "c": c},
-        splice_edges={("b", 0): ("a", 0), ("c", 0): ("b", 0)},
-        input_remap={
-            ("a", 0): 0,  # a's x → merged slot 0
-            ("c", 1): 1,  # c's bias → merged slot 1
-        },
+        splice_edges={("b", "A"): ("a", "A"), ("c", "B"): ("b", "B")},
     )
     assert merged is not None
     fns = _elementwise_fns(merged)
     assert "exp" in fns
     assert "negative" in fns
     assert "add" in fns
-    # Two external Loads remain (x, bias); the splice edges collapsed into copy aliases.
+    # Two external Loads remain (X, BIAS); the splice edges collapsed into copy aliases.
     loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
     assert len(loads) == 2
-    assert {ld.source for ld in loads} == {0, 1}
+    assert {ld.source for ld in loads} == {"X", "BIAS"}
     assert merged.num_inputs == 2
 
 
@@ -408,9 +404,9 @@ def test_multi_output_root_preserves_all_writes():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Load(name="x", source="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
@@ -422,20 +418,20 @@ def test_multi_output_root_preserves_all_writes():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="yv", source=0, index=(Var("a0"),)),
+                    Load(name="yv", source="out_0", index=(Var("a0"),)),
                     Assign(name="z0", op="negative", args=("yv",)),
                     Assign(name="z1", op="abs", args=("yv",)),
-                    Write(output=0, index=(Var("a0"),), value="z0"),
-                    Write(output=1, index=(Var("a0"),), value="z1"),
+                    Write(output="C0", index=(Var("a0"),), value="z0"),
+                    Write(output="C1", index=(Var("a0"),), value="z1"),
                 ),
             ),
         ),
     )
 
-    merged = splice_loop_ops(producer, consumer, source=0)
+    merged = splice_loop_ops(producer, consumer, source="out_0")
     assert merged is not None
     writes = [s for s in iter_body(merged.body) if isinstance(s, Write)]
-    assert {w.output for w in writes} == {0, 1}
+    assert {w.output for w in writes} == {"C0", "C1"}
     fns = _elementwise_fns(merged)
     # Producer chain materialized once (shared σ); both consumer ops present.
     assert fns.count("exp") == 1
@@ -444,36 +440,34 @@ def test_multi_output_root_preserves_all_writes():
 
 
 def test_multi_output_splice_target():
-    """A splice target with two outputs (output=0 and output=1) — distinct
+    """A splice target with two outputs (output="out_0" and output="out_1") — distinct
     splice edges read each output. The target's expression chain reconstructs
     separately for each output via the standard worklist walk."""
-    # Target: y0 = exp(x), y1 = neg(x). Two outputs.
+    # Target: T0 = exp(x), T1 = neg(x). Two outputs.
     target = LoopOp(
         body=(
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Load(name="x", source="X", index=(Var("a0"),)),
                     Assign(name="y0", op="exp", args=("x",)),
                     Assign(name="y1", op="negative", args=("x",)),
-                    Write(output=0, index=(Var("a0"),), value="y0"),
-                    Write(output=1, index=(Var("a0"),), value="y1"),
+                    Write(output="T0", index=(Var("a0"),), value="y0"),
+                    Write(output="T1", index=(Var("a0"),), value="y1"),
                 ),
             ),
         ),
     )
-    # Sink: z = add(target_out0, target_out1). Two consumer input slots both
-    # pointing at the target — slot 0 reads output 0 (exp), slot 1 reads
-    # output 1 (neg).
+    # Sink: z = add(T0, T1). Two consumer Loads each pointing at one target output.
     sink = LoopOp(
         body=(
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="a", source=0, index=(Var("a0"),)),
-                    Load(name="b", source=1, index=(Var("a0"),)),
+                    Load(name="a", source="T0", index=(Var("a0"),)),
+                    Load(name="b", source="T1", index=(Var("a0"),)),
                     Assign(name="z", op="add", args=("a", "b")),
-                    Write(output=0, index=(Var("a0"),), value="z"),
+                    Write(output="OUT", index=(Var("a0"),), value="z"),
                 ),
             ),
         ),
@@ -482,11 +476,8 @@ def test_multi_output_splice_target():
     merged = splice_loops(
         loops={"target": target, "sink": sink},
         splice_edges={
-            ("sink", 0): ("target", 0),  # sink's slot 0 ← target's output 0 (exp)
-            ("sink", 1): ("target", 1),  # sink's slot 1 ← target's output 1 (neg)
-        },
-        input_remap={
-            ("target", 0): 0,  # target's x → merged slot 0
+            ("sink", "T0"): ("target", "T0"),
+            ("sink", "T1"): ("target", "T1"),
         },
     )
     assert merged is not None
@@ -509,9 +500,9 @@ def test_literal_producer_write_index():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source=0, index=(Var("a0"),)),
+                    Load(name="x", source="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
-                    Write(output=0, index=(Var("a0"), Literal(0)), value="y"),
+                    Write(output="out_0", index=(Var("a0"), Literal(0)), value="y"),
                 ),
             ),
         ),
@@ -521,15 +512,15 @@ def test_literal_producer_write_index():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="yv", source=0, index=(Var("a0"), Literal(0))),
+                    Load(name="yv", source="src_0", index=(Var("a0"), Literal(0))),
                     Assign(name="z", op="negative", args=("yv",)),
-                    Write(output=0, index=(Var("a0"),), value="z"),
+                    Write(output="out_0", index=(Var("a0"),), value="z"),
                 ),
             ),
         ),
     )
 
-    merged = splice_loop_ops(producer, consumer, source=0)
+    merged = splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
     assert "exp" in _elementwise_fns(merged)
     assert "negative" in _elementwise_fns(merged)

@@ -41,13 +41,13 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         idx = _identity_index(inp_shape, axes)
         name = f"in{i}"
         load_names.append(name)
-        load_stmts.append(Load(name=name, source=i, index=idx))
+        load_stmts.append(Load(name=name, source=inp_id, index=idx))
 
     write_index = tuple(Var(a.name) for a in axes)
     inner: tuple[Stmt, ...] = (
         *load_stmts,
         Assign(name="v", op=node.op.op, args=tuple(load_names)),
-        Write(output=0, index=write_index, value="v"),
+        Write(output=f"lift_{nid}", index=write_index, value="v"),
     )
     # Nest the body in free-axis Loops (outer axis wraps the innermost).
     body: tuple[Stmt, ...] = inner
@@ -66,8 +66,9 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     out_id = frag.add_node(
         kernel,
-        list(node.inputs),
+        list(kernel.input_bufs),
         Tensor(f"lift_{nid}", node.output.shape, node.output.dtype),
+        node_id=f"lift_{nid}",
     )
     frag.outputs = [out_id]
     return frag

@@ -231,10 +231,18 @@ def _apply_replacement(graph: Graph, match: Match, fragment: Graph) -> Graph:
             id_map[frag_id] = frag_id  # references existing graph node
             continue
         mapped_inputs = [id_map.get(inp, inp) for inp in frag_node.inputs]
+        # Preserve the fragment's id when it doesn't collide. Lifting / fusion
+        # fragments use stable names (``lift_<nid>``, ``merged_<nid>``) that
+        # don't clash with the surrounding graph because the original node is
+        # already consumed. Keeping the id stable means buf names inside the
+        # LoopOp body (``Load.source`` / ``Write.output``, both buf names)
+        # remain consistent with the surrounding graph.
+        preferred_id = frag_id if frag_id not in g.nodes else None
         new_id = g.add_node(
             op=frag_node.op,
             inputs=mapped_inputs,
             output=Tensor(frag_node.output.name, frag_node.output.shape, frag_node.output.dtype),
+            node_id=preferred_id,
         )
         if frag_node.hints:
             g.nodes[new_id].hints = frag_node.hints

@@ -225,7 +225,7 @@ def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
                 new_body.append(s)
 
         # Group sibling reduce Loops by their reduce axis's (source, dim) pattern.
-        groups: dict[frozenset[tuple[int, int]], list[int]] = {}
+        groups: dict[frozenset[tuple[str, int]], list[int]] = {}
         for i, s in enumerate(new_body):
             if isinstance(s, Loop) and _immediate_has_accum(s.body):
                 positions = _reduce_axis_source_positions(s.body, s.axis.name)
@@ -254,7 +254,7 @@ def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     return walk(stmts)
 
 
-def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str) -> set[tuple[int, int]]:
+def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str) -> set[tuple[str, int]]:
     """Collect ``(source, dim)`` positions where ``Var(reduce_axis_name)``
     appears bare in a Load index within ``body`` (recursing into nested
     Loops — important when the reduce body contains a nested free loop

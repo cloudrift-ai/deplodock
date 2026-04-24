@@ -41,10 +41,11 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # loaded idx value cast to int (referenced by the idx Load's SSA name).
     data_index = tuple(CastExpr("int", Var("idx")) if i == axis else Var(axes[i].name) for i in range(ndim))
 
+    out_buf = f"kernel_{nid}"
     inner: tuple[Stmt, ...] = (
-        Load(name="idx", source=0, index=idx_index),
-        Load(name="data", source=1, index=data_index),
-        Write(output=0, index=tuple(Var(a.name) for a in axes), value="data"),
+        Load(name="idx", source=idx_id, index=idx_index),
+        Load(name="data", source=data_id, index=data_index),
+        Write(output=out_buf, index=tuple(Var(a.name) for a in axes), value="data"),
     )
     body: tuple[Stmt, ...] = inner
     for a in reversed(axes):
@@ -59,6 +60,6 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
             dtype = ext.output.dtype if ext else "f32"
             frag.add_node(InputOp(), [], Tensor(buf_id, shape, dtype), node_id=buf_id)
 
-    out_id = frag.add_node(kernel, [idx_id, data_id], Tensor(f"kernel_{nid}", out_shape, node.output.dtype))
+    out_id = frag.add_node(kernel, list(kernel.input_bufs), Tensor(f"kernel_{nid}", out_shape, node.output.dtype), node_id=f"kernel_{nid}")
     frag.outputs = [out_id]
     return frag

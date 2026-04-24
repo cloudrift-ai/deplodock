@@ -99,56 +99,46 @@ class _Demand:
 # ---------------------------------------------------------------------------
 
 
-def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: int) -> LoopOp | None:
+def splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: str) -> LoopOp | None:
     """Pairwise splicer: inline ``producer`` into every ``consumer`` Load
-    that targets ``source``. Returns ``None`` when the pattern isn't
-    supported.
+    whose ``source`` (buf name) matches the producer's output. Returns
+    ``None`` when the pattern isn't supported.
 
-    Thin wrapper over ``splice_loops``: producer inputs occupy slots
-    ``[0, n_prod)`` in the merged kernel; the consumer's surviving inputs
-    follow in declaration order, skipping the spliced slot. Reads the
-    producer's output=0.
+    Thin wrapper over ``splice_loops``. The merged kernel's Loads keep
+    their original buf names — no remap needed since names are stable
+    across kernels. The producer's output buf name comes from its (sole)
+    Write.
     """
-    n_prod = producer.num_inputs
-    input_remap: dict[tuple[str, int], int] = {("producer", i): i for i in range(n_prod)}
-    next_slot = n_prod
-    for i in range(consumer.num_inputs):
-        if i == source:
-            continue
-        input_remap[("consumer", i)] = next_slot
-        next_slot += 1
+    prod_writes = [s for s in producer if isinstance(s, Write)]
+    if len(prod_writes) != 1:
+        return None
+    prod_buf = prod_writes[0].output
     return splice_loops(
         loops={"producer": producer, "consumer": consumer},
-        splice_edges={("consumer", source): ("producer", 0)},
-        input_remap=input_remap,
+        splice_edges={("consumer", source): ("producer", prod_buf)},
     )
 
 
 def splice_loops(
     loops: dict[str, LoopOp],
-    splice_edges: dict[tuple[str, int], tuple[str, int]],
-    input_remap: dict[tuple[str, int], int],
+    splice_edges: dict[tuple[str, str], tuple[str, str]],
 ) -> LoopOp | None:
     """Splice a DAG of ``LoopOp``s into one merged kernel.
 
     ``loops`` maps an opaque tag to each participating ``LoopOp``.
     ``splice_edges`` identifies which Loads are inlined from another
-    registered loop: key ``(origin_tag, source_idx)`` → value
-    ``(target_tag, target_output_idx)`` meaning "this loop's Load at
-    source_idx reads target_tag's Write at output index
-    target_output_idx and should be inlined."
-    ``input_remap`` assigns every non-splice Load's ``(origin_tag,
-    source_idx)`` to a slot in the merged kernel's external input list.
+    registered loop: key ``(origin_tag, source_buf)`` → value
+    ``(target_tag, target_output_buf)`` meaning "this loop's Load whose
+    ``source`` is ``source_buf`` reads ``target_tag``'s Write whose
+    ``output`` is ``target_output_buf`` and should be inlined."
 
-    The sink — the loop whose Writes seed the traversal — is derived
-    from ``splice_edges``: it's the unique tag in ``loops`` that never
-    appears as a splice target. Returns ``None`` if the sink is ambiguous
-    (cycle or multiple sinks) or if any splice edge hits an unsupported
-    pattern (non-Var/Literal writer index, arithmetic σ targets, etc.).
-    Handles any single-sink DAG — chains, diamonds, shared sub-producers,
-    and multi-output targets (each output reachable via its own splice
-    edge). A multi-output root is also supported: every ``Write`` in the
-    root's body is seeded, so the merged kernel carries all of them."""
+    Non-splice Loads keep their original ``source`` buf names — buf
+    identity is global, no remap needed. The sink — the loop whose Writes
+    seed the traversal — is derived from ``splice_edges``: it's the
+    unique tag in ``loops`` that never appears as a splice target.
+    Returns ``None`` if the sink is ambiguous (cycle or multiple sinks)
+    or if any splice edge hits an unsupported pattern.
+    """
     target_tags = {tag for tag, _out in splice_edges.values()}
     candidates = [tag for tag in loops if tag not in target_tags]
     if len(candidates) != 1:
@@ -158,7 +148,6 @@ def splice_loops(
         return _Splicer(
             loops={tag: op.analyze() for tag, op in loops.items()},
             splice_edges=splice_edges,
-            input_remap=input_remap,
             root=root,
         ).run()
     except (_NotSupported, ValueError):
@@ -188,27 +177,29 @@ def splice_graph(graph) -> tuple[LoopOp, list[str]] | None:
 
     loop_ids = {nid for nid, n in graph.nodes.items() if isinstance(n.op, LoopOp)}
     loops: dict[str, LoopOp] = {nid: graph.nodes[nid].op for nid in loop_ids}
-    splice_edges: dict[tuple[str, int], tuple[str, int]] = {}
-    input_remap: dict[tuple[str, int], int] = {}
-    external_slot: dict[str, int] = {}
+    splice_edges: dict[tuple[str, str], tuple[str, str]] = {}
+    external_order: list[str] = []
+    seen_external: set[str] = set()
 
-    for nid, node in graph.nodes.items():
-        if nid not in loop_ids:
-            continue
-        for src_idx, inp in enumerate(node.inputs):
+    for nid in loop_ids:
+        node_op = loops[nid]
+        for ld in node_op.loads:
+            inp = ld.source
+            # A Load is a splice edge if its source buf names another LoopOp node;
+            # otherwise it's an external input. We key edges off the buf name
+            # (Load.source is now the producing node's id), not a positional
+            # input index — so a single edge entry covers every Load that reads
+            # the same producer.
             if inp in loop_ids:
-                # Graph nodes are single-output, so the target output is always 0.
-                splice_edges[(nid, src_idx)] = (inp, 0)
-            else:
-                if inp not in external_slot:
-                    external_slot[inp] = len(external_slot)
-                input_remap[(nid, src_idx)] = external_slot[inp]
+                splice_edges[(nid, inp)] = (inp, inp)  # producer's Write.output is its node id
+            elif inp not in seen_external:
+                seen_external.add(inp)
+                external_order.append(inp)
 
-    merged = splice_loops(loops=loops, splice_edges=splice_edges, input_remap=input_remap)
+    merged = splice_loops(loops=loops, splice_edges=splice_edges)
     if merged is None:
         return None
-    externals = [nid for nid, _ in sorted(external_slot.items(), key=lambda kv: kv[1])]
-    return merged, externals
+    return merged, external_order
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +228,7 @@ class _Splicer(LoopBuilder):
         self,
         *,
         loops: dict[str, LoopMeta],
-        splice_edges: dict[tuple[str, int], str],
-        input_remap: dict[tuple[str, int], int],
+        splice_edges: dict[tuple[str, str], tuple[str, str]],
         root: str,
     ) -> None:
         used: set[str] = set()
@@ -247,7 +237,6 @@ class _Splicer(LoopBuilder):
         super().__init__(used_names=used)
         self.loops = loops
         self.splice_edges = splice_edges
-        self.input_remap = input_remap
         self.root = root
         self._pending: deque[_Demand] = deque()
         # Dedup: a stmt is uniquely identified by its (origin, name), the
@@ -305,8 +294,8 @@ class _Splicer(LoopBuilder):
         if isinstance(stmt, Load):
             edge = self.splice_edges.get((d.origin, stmt.source))
             if edge is not None:
-                target_tag, target_output = edge
-                self._resolve_splice_load(stmt, d, target_tag, target_output)
+                target_tag, target_output_buf = edge
+                self._resolve_splice_load(stmt, d, target_tag, target_output_buf)
             else:
                 self._resolve_external_load(stmt, d)
         elif isinstance(stmt, Accum):
@@ -324,20 +313,19 @@ class _Splicer(LoopBuilder):
         self.insert(stmt.rewrite(lambda n: rename.get(n, n), d.sigma), d.demand_scope)
 
     def _resolve_external_load(self, stmt: Load, d: _Demand) -> None:
-        """A Load that isn't a splice edge — remap source via ``input_remap``,
-        σ-sub the index, emit as-is."""
-        new_src = self.input_remap[(d.origin, stmt.source)]
+        """A Load that isn't a splice edge — keep its buf name as-is (buf
+        identity is global across kernels), σ-sub the index, emit."""
         new_index = tuple(d.sigma.apply(e) for e in stmt.index)
-        self.insert(Load(name=d.bound_as, source=new_src, index=new_index), d.demand_scope)
+        self.insert(Load(name=d.bound_as, source=stmt.source, index=new_index), d.demand_scope)
 
-    def _resolve_splice_load(self, stmt: Load, d: _Demand, target_tag: str, target_output: int) -> None:
+    def _resolve_splice_load(self, stmt: Load, d: _Demand, target_tag: str, target_output_buf: str) -> None:
         """A Load that's a splice edge to another registered loop — emit a
         copy alias and queue the target loop's ``Write.value`` under the
         solved σ. The target's expression chain reconstructs piecemeal over
-        subsequent iterations. ``target_output`` selects which ``Write`` of
-        the target is the splice source when the target has multiple outputs."""
+        subsequent iterations. ``target_output_buf`` selects which ``Write``
+        of the target is the splice source when the target has multiple outputs."""
         target = self.loops[target_tag]
-        target_write = next((w for w, _ in target.writes if w.output == target_output), None)
+        target_write = next((w for w, _ in target.writes if w.output == target_output_buf), None)
         if target_write is None:
             raise _NotSupported
         effective_index = tuple(d.sigma.apply(e) for e in stmt.index)

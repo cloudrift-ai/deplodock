@@ -60,15 +60,16 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # via ACCUM_IDENTITY, the init value.
     reduce_axis = next(a for a in axes if a.name == reduce_axis_name)
     free_axes = [a for a in axes if a.name != reduce_axis_name]
+    out_buf = f"lift_{nid}"
     inner: tuple[Stmt, ...] = (
         Loop(
             axis=reduce_axis,
             body=(
-                Load(name="in0", source=0, index=load_index),
+                Load(name="in0", source=src_id, index=load_index),
                 Accum(name="acc", value="in0", op=combine),
             ),
         ),
-        Write(output=0, index=write_index, value="acc"),
+        Write(output=out_buf, index=write_index, value="acc"),
     )
     body: tuple[Stmt, ...] = inner
     for a in reversed(free_axes):
@@ -77,7 +78,9 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     frag = Graph()
     frag.add_node(InputOp(), [], Tensor(src_id, src_shape, src_node.output.dtype), node_id=src_id)
-    out_id = frag.add_node(kernel, [src_id], Tensor(f"lift_{nid}", node.output.shape, node.output.dtype))
+    out_id = frag.add_node(
+        kernel, list(kernel.input_bufs), Tensor(f"lift_{nid}", node.output.shape, node.output.dtype), node_id=f"lift_{nid}"
+    )
     frag.outputs = [out_id]
     return frag
 

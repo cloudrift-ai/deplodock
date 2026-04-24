@@ -34,14 +34,15 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     input_names: list[str] = []
     body: list = []
 
+    out_buf = f"lift_{nid}"
     if len(op.sources) == 1:
         src = op.sources[0]
         src_id = node.inputs[src.input_idx]
         src_shape = graph.nodes[src_id].output.shape if src_id in graph.nodes else ()
         idx = _substituted_index(src.coord_map, mapping, src_shape)
         input_names.append(src_id)
-        body.append(Load(name="in0", source=0, index=idx))
-        body.append(Write(output=0, index=write_index, value="in0"))
+        body.append(Load(name="in0", source=src_id, index=idx))
+        body.append(Write(output=out_buf, index=write_index, value="in0"))
     else:
         branches: list[SelectBranch] = []
         for i, src in enumerate(op.sources):
@@ -50,11 +51,11 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
             idx = _substituted_index(src.coord_map, mapping, src_shape)
             input_names.append(src_id)
             name = f"in{i}"
-            body.append(Load(name=name, source=i, index=idx))
+            body.append(Load(name=name, source=src_id, index=idx))
             select_expr = substitute(src.select, mapping) if src.select is not None else Literal(1, "int")
             branches.append(SelectBranch(value=name, select=select_expr))
         body.append(Select(name="v", branches=tuple(branches)))
-        body.append(Write(output=0, index=write_index, value="v"))
+        body.append(Write(output=out_buf, index=write_index, value="v"))
 
     # Wrap in nested free Loops.
     nested: tuple[Stmt, ...] = tuple(body)
@@ -71,7 +72,9 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         dtype = ext.output.dtype if ext is not None else "f32"
         frag.add_node(InputOp(), [], Tensor(inp_id, shape, dtype), node_id=inp_id)
 
-    out_id = frag.add_node(kernel, input_names, Tensor(f"lift_{nid}", tuple(op.out_shape), node.output.dtype))
+    out_id = frag.add_node(
+        kernel, list(kernel.input_bufs), Tensor(f"lift_{nid}", tuple(op.out_shape), node.output.dtype), node_id=f"lift_{nid}"
+    )
     frag.outputs = [out_id]
     return frag
 

@@ -66,14 +66,14 @@ from deplodock.compiler.ir.tile.ir import (
 def lower_naive(loop_op: LoopOp, kernel_name: str, inputs: tuple[Param, ...], output: Param) -> Kernel:
     """Translate a ``LoopOp`` into a single-thread serial ``Kernel``.
 
-    ``inputs`` map by position to ``Load.source`` values; ``output`` carries
-    the writeable buffer name and shape. ``Param.shape`` should be populated
-    on every entry — the renderer needs it to flatten multi-dim ``Index``
-    accesses to row-major.
+    ``inputs`` and ``output`` populate ``Kernel.params`` (with ``Param.shape``
+    used by the renderer to row-major-flatten multi-dim ``Index`` accesses).
+    Buffer identity is carried inline on Loop IR's ``Load.source`` and
+    ``Write.output`` (now strings), so lowering only needs to translate
+    statement types — no positional source lookup against ``inputs``.
     """
-    ctx = _Ctx(inputs=inputs, output=output)
+    ctx = _Ctx()
 
-    # Split body: leading non-Loop stmts → prologue; rest → body.
     pre: list[LoopStmt] = []
     rest: tuple[LoopStmt, ...] = loop_op.body
     while rest and not isinstance(rest[0], Loop):
@@ -96,16 +96,12 @@ def lower_naive(loop_op: LoopOp, kernel_name: str, inputs: tuple[Param, ...], ou
 
 
 class _Ctx:
-    """Lowering context — buffer name lookup for ``Load`` / ``Write``."""
+    """Lowering context — currently empty since ``Load.source`` and
+    ``Write.output`` carry buf names directly. Retained as a struct so the
+    recursive walk has a single hand-off point if more state is needed
+    later (e.g. fresh-name counters for tiled rewrites)."""
 
-    __slots__ = ("inputs", "output")
-
-    def __init__(self, inputs: tuple[Param, ...], output: Param) -> None:
-        self.inputs = inputs
-        self.output = output
-
-    def input_name(self, source: int) -> str:
-        return self.inputs[source].name
+    __slots__ = ()
 
 
 def _lower_body(stmts: tuple[LoopStmt, ...], ctx: _Ctx) -> list[Stmt]:
@@ -119,14 +115,14 @@ def _lower_stmt(s: LoopStmt, ctx: _Ctx) -> list[Stmt]:
     if isinstance(s, Loop):
         return [_lower_loop(s, ctx)]
     if isinstance(s, Load):
-        return [Let(s.name, Index(ctx.input_name(s.source), tuple(s.index)))]
+        return [Let(s.name, Index(s.source, tuple(s.index)))]
     if isinstance(s, Assign):
         args = [Var(a) for a in s.args]
         return [Let(s.name, _op_to_expr(s.op.name, args))]
     if isinstance(s, Select):
         return [Let(s.name, _select_to_ternary(s))]
     if isinstance(s, Write):
-        return [Store(ctx.output.name, tuple(s.index), Var(s.value))]
+        return [Store(s.output, tuple(s.index), Var(s.value))]
     if isinstance(s, Accum):
         return [AccumFold(s.name, s.op, Var(s.value))]
     raise NotImplementedError(f"lower_naive: unhandled Loop IR stmt {type(s).__name__}")

@@ -80,12 +80,6 @@ class Ctx:
         self.name_seq[0] += 1
         return f"t{n}"
 
-    def input_name(self, source: int) -> str:
-        return self.node.inputs[source]
-
-    def output_name(self) -> str:
-        return self.node.id
-
     def buffer_shape(self, name: str) -> tuple:
         n = self.graph.nodes.get(name)
         return tuple(n.output.shape) if n is not None else ()
@@ -111,7 +105,7 @@ def emit_stmt(s, ctx: Ctx, out: list[Stmt]) -> None:
     Loops directly so this walker doesn't need a strategy hook).
     """
     if isinstance(s, Load):
-        buf_name = ctx.input_name(s.source)
+        buf_name = s.source
         src_shape = ctx.buffer_shape(buf_name)
         coords = [substitute(e, _env_with_values(ctx)) for e in s.index]
         flat = _flatten_coords(coords, src_shape)
@@ -147,7 +141,7 @@ def emit_stmt(s, ctx: Ctx, out: list[Stmt]) -> None:
 
 
 def _emit_write(s: IrWrite, ctx: Ctx, out: list[Stmt]) -> None:
-    buf_name = ctx.output_name()
+    buf_name = s.output
     buf_shape = ctx.buffer_shape(buf_name)
     coords = [substitute(e, ctx.env) for e in s.index]
     flat = _flatten_coords(coords, buf_shape)
