@@ -8,10 +8,8 @@ metadata (``commutative``, ``identity``).
 
 Construction resolves the callable from the op's ``name`` via
 ``_NAME_TO_FN`` (for non-numpy intrinsics like ``rsqrt`` / ``relu``) or
-``getattr(np, name)`` otherwise. Unknown names raise. No registry, no
-singletons — ``coerce_elementwise_impl(name)`` just tries
-``BinaryElementwiseImpl`` then ``UnaryElementwiseImpl`` with numpy's
-ufunc ``nin`` self-selecting the arity.
+``getattr(np, name)`` otherwise. Unknown names raise. Arity is read
+from the callable's ufunc ``nin`` (non-ufunc intrinsics are all unary).
 
 This module intentionally doesn't depend on the ``Expr`` AST in
 ``ir/expr.py`` — that's the coordinate / predicate sublanguage for
@@ -23,8 +21,8 @@ from __future__ import annotations
 import numpy as np
 
 # Names whose callable isn't a plain ``getattr(np, name)`` — non-numpy
-# intrinsics. Every other op name matches a numpy attribute, and
-# ``__init__`` falls through to ``getattr(np, name)`` for them.
+# intrinsics (all unary). Every other op name matches a numpy attribute,
+# and ``__init__`` falls through to ``getattr(np, name)`` for them.
 _NAME_TO_FN: dict[str, object] = {
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "relu": lambda x: np.maximum(0.0, x),
@@ -35,17 +33,14 @@ _NAME_TO_FN: dict[str, object] = {
 
 
 class ElementwiseImpl:
-    """Base class for named elementwise / combine ops.
+    """Named scalar op — name + numpy callable + arity + reducer metadata.
 
-    Subclasses (``UnaryElementwiseImpl`` / ``BinaryElementwiseImpl``) fix
-    the ``arity``. Construction resolves the numpy callable from the op's
-    ``name`` — either via ``_NAME_TO_FN`` (for non-numpy intrinsics) or
-    ``getattr(np, name)`` for numpy-aligned names. Unknown names raise.
-    ``commutative`` / ``identity`` are computed properties reading from
-    class-level tables keyed by name.
+    Construction resolves the callable from ``_NAME_TO_FN`` (non-numpy
+    intrinsics) or ``getattr(np, name)`` for numpy-aligned names, and
+    reads arity from the ufunc's ``nin`` (non-ufunc intrinsics are
+    unary). Unknown names raise. ``commutative`` / ``identity`` are
+    computed properties reading from class-level tables keyed by name.
     """
-
-    arity: int = 1
 
     # Commutative ops — binary combines where ``op(a, b) == op(b, a)``.
     _COMMUTATIVE: frozenset[str] = frozenset({"add", "multiply", "maximum", "minimum", "amax", "sum", "prod"})
@@ -67,12 +62,9 @@ class ElementwiseImpl:
             fn = getattr(np, name, None)
         if fn is None:
             raise ValueError(f"unknown elementwise op name: {name!r} (not in numpy or _NAME_TO_FN)")
-        # Validate arity against numpy's ufunc metadata when available.
-        nin = getattr(fn, "nin", None)
-        if nin is not None and nin != self.arity:
-            raise ValueError(f"arity mismatch for {name!r}: {type(self).__name__} expects {self.arity}, numpy callable has nin={nin}")
         self.name = name
         self.fn = fn
+        self.arity = getattr(fn, "nin", 1)
 
     @property
     def commutative(self) -> bool:
@@ -83,36 +75,10 @@ class ElementwiseImpl:
         return self._IDENTITY.get(self.name)
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, ElementwiseImpl) and type(self) is type(other) and self.name == other.name
+        return isinstance(other, ElementwiseImpl) and self.name == other.name
 
     def __hash__(self) -> int:
-        return hash((type(self), self.name))
+        return hash(self.name)
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.name!r})"
-
-
-class UnaryElementwiseImpl(ElementwiseImpl):
-    arity = 1
-
-
-class BinaryElementwiseImpl(ElementwiseImpl):
-    arity = 2
-
-
-def coerce_elementwise_impl(v: str | ElementwiseImpl) -> ElementwiseImpl:
-    """Accept a string name or ``ElementwiseImpl`` instance; return an impl.
-
-    Tries ``BinaryElementwiseImpl(name)`` first, falls back to
-    ``UnaryElementwiseImpl(name)``. numpy's ufunc ``nin`` metadata makes
-    the attempt self-selecting — binary ops like ``add`` (nin=2) pass
-    the binary check, unary ops like ``exp`` (nin=1) raise in the binary
-    constructor and land in the unary one.
-    """
-    if isinstance(v, ElementwiseImpl):
-        return v
-    try:
-        return BinaryElementwiseImpl(v)
-    except ValueError:
-        pass
-    return UnaryElementwiseImpl(v)
+        return f"ElementwiseImpl({self.name!r})"

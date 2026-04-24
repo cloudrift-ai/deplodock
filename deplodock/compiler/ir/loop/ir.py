@@ -37,25 +37,10 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.elementwise import ElementwiseImpl, coerce_elementwise_impl
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, free_vars
 from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.loop.sigma import Sigma
-
-
-def _coerce_body_op(v) -> ElementwiseImpl:
-    """Accept an ElementwiseImpl, a string name, or an ElementwiseOp wrapper; return ElementwiseImpl.
-
-    Lets ``Assign(..., ElementwiseOp("multiply"), ...)`` and ``Assign(..., "multiply", ...)``
-    keep working after Loop IR was switched to carry ``ElementwiseImpl`` directly.
-    """
-    if isinstance(v, ElementwiseImpl):
-        return v
-    inner = getattr(v, "op", None)
-    if isinstance(inner, ElementwiseImpl):
-        return inner
-    return coerce_elementwise_impl(v)
-
 
 # ---------------------------------------------------------------------------
 # Axis — named iteration variable
@@ -172,8 +157,7 @@ class Assign(Stmt):
     ``op`` is an ``ElementwiseImpl`` — the elementwise combine (add / mul / exp /
     ...). Reductions live in ``Accum``. ``args`` reference ``$N`` ports,
     an ``Accum.name`` (reads current / finalized acc value), or prior SSA
-    names. Construction accepts a string name or an ``ElementwiseOp``
-    wrapper in addition to an ``ElementwiseImpl`` instance, via ``_coerce_body_op``.
+    names.
     """
 
     name: str
@@ -181,7 +165,8 @@ class Assign(Stmt):
     args: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "op", _coerce_body_op(self.op))
+        if isinstance(self.op, str):
+            object.__setattr__(self, "op", ElementwiseImpl(self.op))
 
     def deps(self) -> tuple[str, ...]:
         return self.args
@@ -206,17 +191,16 @@ class Accum(Stmt):
     one reduce Loop must agree on ``op``.
 
     Default op is ``add`` — fixtures that sum values can omit ``op=``;
-    ``max`` / ``min`` / ``mul`` must be passed explicitly. Construction
-    accepts a string name or an ``ElementwiseOp`` wrapper via
-    ``_coerce_body_op``.
+    ``max`` / ``min`` / ``mul`` must be passed explicitly.
     """
 
     name: str
     value: str
-    op: ElementwiseImpl = field(default_factory=lambda: coerce_elementwise_impl("add"))
+    op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("add"))
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "op", _coerce_body_op(self.op))
+        if isinstance(self.op, str):
+            object.__setattr__(self, "op", ElementwiseImpl(self.op))
 
     @property
     def init(self) -> Expr:

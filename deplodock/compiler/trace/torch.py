@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
@@ -340,7 +341,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         if op_name == "mean":
             red_node_op = MeanOp(axis=axis)
         else:
-            red_node_op = ReduceOp(op=op_name, axis=axis)
+            red_node_op = ReduceOp(op=ElementwiseImpl(op_name), axis=axis)
 
         if tuple(shape) == keepdim_shape:
             nid = g.add_node(op=red_node_op, inputs=input_ids[:1], output=Tensor(name, shape, dtype), node_id=name)

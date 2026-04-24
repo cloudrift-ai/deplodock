@@ -147,16 +147,26 @@ def _lookup_op_class(name: str) -> type[Op] | None:
 def _serialize_field(v):
     """Flatten non-JSON-friendly op field values to a JSON-compatible form.
 
-    Currently only special-cases ``ir.expr.ElementwiseImpl`` (stored as its ``name``
-    string); everything else passes through. The corresponding
-    ``coerce_elementwise_impl`` in each op's ``__post_init__`` reverses this on load.
+    Currently only special-cases ``ir.elementwise.ElementwiseImpl`` (stored
+    as its ``name`` string); everything else passes through. ``_deserialize_field``
+    reverses this on load.
     """
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
 
     if isinstance(v, ElementwiseImpl):
         return v.name
     return v
-    return None
+
+
+def _deserialize_field(k, v):
+    """Reverse of ``_serialize_field``: rehydrate the ``op`` field name back to ``ElementwiseImpl``."""
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
+
+    if k == "op" and isinstance(v, str):
+        return ElementwiseImpl(v)
+    if isinstance(v, list):
+        return tuple(v)
+    return v
 
 
 class Graph:
@@ -299,12 +309,7 @@ class Graph:
             if op_cls is None:
                 raise ValueError(f"Unknown op class: {op_cls_name}")
 
-            fields = dict(ndata.get("op_fields", {}))
-            # Convert list fields to tuples for dataclass ops that expect tuples.
-            for k, v in fields.items():
-                if isinstance(v, list):
-                    fields[k] = tuple(v)
-
+            fields = {k: _deserialize_field(k, v) for k, v in ndata.get("op_fields", {}).items()}
             op = op_cls(**fields) if fields else op_cls()
             out = ndata["output"]
             tensor = Tensor(

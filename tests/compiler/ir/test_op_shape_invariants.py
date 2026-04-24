@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
@@ -42,7 +43,7 @@ def test_elementwise_accepts_matching_shapes():
     ],
 )
 def test_reduce_output_is_keepdim(fn, input_shape, axis, expected):
-    assert ReduceOp(op=fn, axis=axis).infer_output_shape([input_shape]) == expected
+    assert ReduceOp(op=ElementwiseImpl(fn), axis=axis).infer_output_shape([input_shape]) == expected
 
 
 def test_decomposition_emits_broadcast_explicit_elementwise():

@@ -46,7 +46,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     write_index = tuple(Var(a.name) for a in axes)
     inner: tuple[Stmt, ...] = (
         *load_stmts,
-        Assign(name="v", op=node.op, args=tuple(load_names)),
+        Assign(name="v", op=node.op.op, args=tuple(load_names)),
         Write(output=0, index=write_index, value="v"),
     )
     # Nest the body in free-axis Loops (outer axis wraps the innermost).

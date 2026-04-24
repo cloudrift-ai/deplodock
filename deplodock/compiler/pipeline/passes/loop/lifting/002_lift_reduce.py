@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Stmt, Write
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", ReduceOp)]
@@ -50,7 +51,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     reduce_axis_name = f"a{axis}"
     load_index = tuple(Var(a.name) for a in axes)
 
-    combine = ElementwiseOp(_COMBINE.get(op.name, op.name))
+    combine = ElementwiseImpl(_COMBINE.get(op.name, op.name))
     write_index = _build_write_index(axes, reduce_axis_name, tuple(node.output.shape))
 
     # Nested body: Loop(reduce_axis, [Load + Accum]) + Write wrapped in
