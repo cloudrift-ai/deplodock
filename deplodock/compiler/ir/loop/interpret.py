@@ -24,14 +24,15 @@ from deplodock.compiler.ir.loop.ir import Accum, Assign, Axis, Load, LoopOp, Sel
 
 def execute_loop_op(
     loop: LoopOp,
-    input_arrays: list[np.ndarray],
+    input_arrays: dict[str, np.ndarray],
     out_shape: tuple[int, ...],
 ) -> np.ndarray:
     """Numpy interpreter for one ``LoopOp``.
 
-    ``input_arrays[i]`` is the external buffer indexed by ``Load.source == i``
-    in the body. ``out_shape`` is the shape of the output buffer the kernel
-    writes into. Returns an ndarray of shape ``out_shape``.
+    ``input_arrays[buf_name]`` is the external buffer keyed by the
+    ``Load.source`` strings in the body. ``out_shape`` is the shape of the
+    output buffer the kernel writes into. Returns an ndarray of shape
+    ``out_shape``.
     """
     axis_position = {a.name: i for i, a in enumerate(loop.axes)}
     meta = loop.analyze()
@@ -51,8 +52,8 @@ def execute_loop_op(
             assert isinstance(stmt.op, ElementwiseImpl)
             values[stmt.name] = stmt.op(*_align_ranks(args))
         elif isinstance(stmt, Load):
-            if stmt.source >= len(input_arrays):
-                raise ValueError(f"Load source {stmt.source} out of range (have {len(input_arrays)} inputs)")
+            if stmt.source not in input_arrays:
+                raise ValueError(f"Load source {stmt.source!r} not found in input_arrays (have {sorted(input_arrays)})")
             values[stmt.name] = _apply_load_index(stmt.index, input_arrays[stmt.source], loop.axes, values)
         elif isinstance(stmt, Accum):
             acc = acc_map[stmt.name]

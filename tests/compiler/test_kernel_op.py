@@ -122,7 +122,7 @@ def _loop(*, axes=(), inputs=(), body=()):
             fresh_counter[0] += 1
             name = f"in{src}_{fresh_counter[0]}"
             local_loads[src] = name
-            extra_loads.append(Load(name=name, source=src, index=index_of[src]))
+            extra_loads.append(Load(name=name, source=f"src_{src}", index=index_of[src]))
             return name
 
         result: list = []
@@ -177,35 +177,37 @@ def test_load_stmt_binding():
             Loop(
                 axis=Axis("a0", 4),
                 body=(
-                    Load("x_val", source=0, index=(Var("a0"),)),
+                    Load("x_val", source="src_0", index=(Var("a0"),)),
                     Assign("y", ElementwiseOp("negative"), ("x_val",)),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
     )
     loads = k.loads
     # rename_ssa_sequential canonicalizes Load names to in0, in1, ...
-    assert len(loads) == 1 and loads[0].name == "in0" and loads[0].source == 0
+    assert len(loads) == 1 and loads[0].name == "in0" and loads[0].source == "src_0"
     assert k.num_inputs == 1
 
 
 def test_load_stmt_multiple_sources():
-    """num_inputs derives from the max source index across all Loads."""
+    """num_inputs is the count of distinct Load.source buf names."""
     k = LoopOp(
         body=(
             Loop(
                 axis=Axis("a0", 4),
                 body=(
-                    Load("a", source=0, index=(Var("a0"),)),
-                    Load("b", source=2, index=(Var("a0"),)),  # non-contiguous source idx is fine
+                    Load("a", source="src_0", index=(Var("a0"),)),
+                    Load("b", source="src_2", index=(Var("a0"),)),
                     Assign("y", ElementwiseOp("add"), ("a", "b")),
-                    Write(output=0, index=(Var("a0"),), value="y"),
+                    Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
         ),
     )
-    assert k.num_inputs == 3
+    # Two distinct source buf names → two inputs.
+    assert k.num_inputs == 2
+    assert k.input_bufs == ("src_0", "src_2")
 
 
 def test_update_synthesizes_accum_decl():
@@ -220,11 +222,11 @@ def test_update_synthesizes_accum_decl():
                     Loop(
                         axis=Axis("k", 8),
                         body=(
-                            Load("x_val", source=0, index=(Var("row"), Var("k"))),
+                            Load("x_val", source="src_0", index=(Var("row"), Var("k"))),
                             Accum(name="acc", value="x_val", op="add"),
                         ),
                     ),
-                    Write(output=0, index=(Var("row"),), value="acc"),
+                    Write(output="out_0", index=(Var("row"),), value="acc"),
                 ),
             ),
         ),
@@ -264,7 +266,7 @@ def test_kernel_pointwise():
         inputs=(p, p),
         body=(
             Assign("z", ElementwiseOp("add"), args=("$0", "$1")),
-            Write(output=0, index=(Var("a0"),), value="z"),
+            Write(output="out_0", index=(Var("a0"),), value="z"),
         ),
     )
     assert sum(1 for s in k if not isinstance(s, Loop)) == 4  # 2 synthesized Loads + Assign + Write
@@ -278,7 +280,7 @@ def test_kernel_reduce():
         inputs=(p,),
         body=(
             Accum(name="s", value="$0"),
-            Write(output=0, index=(Var("a0"),), value="s"),
+            Write(output="out_0", index=(Var("a0"),), value="s"),
         ),
     )
     assert any(isinstance(lb.op, ElementwiseImpl) for lb in k.accums)
@@ -293,7 +295,7 @@ def test_kernel_matmul():
         body=(
             Assign("multiply", ElementwiseOp("multiply"), args=("$0", "$1")),
             Accum(name="dot", value="multiply"),
-            Write(output=0, index=(Var("a0"),), value="dot"),
+            Write(output="out_0", index=(Var("a0"),), value="dot"),
         ),
     )
     # 2 synthesized Loads + Assign + Accum + Write — accumulator info is carried on Accum.op now.
@@ -311,7 +313,7 @@ def test_kernel_matmul_bias():
             Assign("multiply", ElementwiseOp("multiply"), args=("$0", "$1")),
             Accum(name="dot", value="multiply"),
             Assign("out", ElementwiseOp("add"), args=("dot", "$2")),
-            Write(output=0, index=(Var("a0"),), value="out"),
+            Write(output="out_0", index=(Var("a0"),), value="out"),
         ),
     )
     # 3 synthesized Loads + Assign + Accum + Assign + Write (no decl stmt — Accum carries op).
@@ -330,7 +332,7 @@ def test_kernel_softmax_two_accumulators():
         body=(
             Accum(name="mx", value="$0", op="maximum"),
             Accum(name="sm", value="$0"),
-            Write(output=0, index=(Var("a0"),), value="mx"),
+            Write(output="out_0", index=(Var("a0"),), value="mx"),
         ),
     )
     # rename_ssa_sequential renames Accums to acc0, acc1 in definition order.
@@ -347,7 +349,7 @@ def test_kernel_unary_chain():
         body=(
             Assign("negative", ElementwiseOp("negative"), args=("$0",)),
             Assign("exp", ElementwiseOp("exp"), args=("negative",)),
-            Write(output=0, index=(Var("a0"),), value="exp"),
+            Write(output="out_0", index=(Var("a0"),), value="exp"),
         ),
     )
     # 1 synthesized Load + 2 Assigns + Write.
@@ -370,7 +372,7 @@ def test_kernel_scatter_output_via_select():
                     SelectBranch(value="$1", select=Var("c2")),
                 ),
             ),
-            Write(output=0, index=(Var("a0"),), value="v"),
+            Write(output="out_0", index=(Var("a0"),), value="v"),
         ),
     )
     assert any(isinstance(s, Select) for s in k)
@@ -469,7 +471,7 @@ def test_loop_stmt_basic():
                 axis=Axis("a0", 8),
                 body=(
                     Assign("v", ElementwiseOp("negative"), args=("$0",)),
-                    Write(output=0, index=(Var("a0"),), value="v"),
+                    Write(output="out_0", index=(Var("a0"),), value="v"),
                 ),
             ),
         ),
@@ -490,7 +492,7 @@ def test_loop_axis_sibling_same_name_allowed():
             Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0", op="maximum"),)),
             Loop(axis=Axis("k", 8), body=(Accum(name="sm", value="$1"),)),
             Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
-            Write(output=0, index=(Var("a0"),), value="v"),
+            Write(output="out_0", index=(Var("a0"),), value="v"),
         ),
     )
 
@@ -513,7 +515,7 @@ def test_loop_ssa_scoping():
                     body=(Assign("v", ElementwiseOp("negative"), args=("$0",)),),
                 ),
                 # Reference 'v' outside the inner Loop — should fail.
-                Write(output=0, index=(Var("a0"),), value="v"),
+                Write(output="out_0", index=(Var("a0"),), value="v"),
             ),
         )
 
@@ -530,7 +532,7 @@ def _flat_reduce_kernel() -> LoopOp:
         inputs=(Port(index=(Var("a0"), Var("k"))),),
         body=(
             Accum(name="acc", value="$0"),
-            Write(output=0, index=(Var("a0"),), value="acc"),
+            Write(output="out_0", index=(Var("a0"),), value="acc"),
         ),
     )
 
@@ -547,11 +549,11 @@ def _nested_reduce_kernel() -> LoopOp:
                     Loop(
                         axis=Axis("k", 8),
                         body=(
-                            Load(name="x_k", source=0, index=(Var("a0"), Var("k"))),
+                            Load(name="x_k", source="src_0", index=(Var("a0"), Var("k"))),
                             Accum(name="acc", value="x_k", op="add"),
                         ),
                     ),
-                    Write(output=0, index=(Var("a0"),), value="acc"),
+                    Write(output="out_0", index=(Var("a0"),), value="acc"),
                 ),
             ),
         ),
@@ -569,6 +571,9 @@ def test_execute_loop_op_handles_nested_body():
 
     flat = _flat_reduce_kernel()
     nested = _nested_reduce_kernel()
-    out_flat = execute_loop_op(flat, [x], (4,))
-    out_nested = execute_loop_op(nested, [x], (4,))
+    # interpreter takes a buf-name → array dict (post Load.source: int → str refactor).
+    inputs = {flat.input_bufs[0]: x}
+    out_flat = execute_loop_op(flat, inputs, (4,))
+    inputs_nested = {nested.input_bufs[0]: x}
+    out_nested = execute_loop_op(nested, inputs_nested, (4,))
     np.testing.assert_allclose(out_flat, out_nested, rtol=1e-5)

@@ -229,13 +229,20 @@ class Graph:
         self._users.pop(node_id, None)
 
     def replace_node(self, old_id: str, new_id: str) -> None:
-        """Rewire all references from old_id to new_id."""
+        """Rewire all references from old_id to new_id.
+
+        Updates graph-level edges (consumer ``node.inputs`` and
+        ``graph.inputs/outputs``) AND any LoopOp's internal buf references
+        (``Load.source`` / ``Write.output`` are buf names tracking the same
+        identity as the graph node ids).
+        """
         if new_id not in self.nodes:
             raise KeyError(f"Replacement node {new_id!r} not found")
         old_users = self._users.get(old_id, set())
         for consumer_id in list(old_users):
             node = self.nodes[consumer_id]
             node.inputs = [new_id if i == old_id else i for i in node.inputs]
+            node.op = _rename_buf_in_op(node.op, old_id, new_id)
             self._users[new_id].add(consumer_id)
         if old_id in self._users:
             self._users[old_id] = set()
@@ -400,6 +407,33 @@ class Graph:
                 entry["hints"] = node.hints.to_dict()
             result["nodes"][nid] = entry
         return result
+
+
+# ---------------------------------------------------------------------------
+# Op buf-rename helper — keeps LoopOp's internal buf refs aligned with
+# graph node ids when ``replace_node`` rewires consumers.
+# ---------------------------------------------------------------------------
+
+
+def _rename_buf_in_op(op, old: str, new: str):
+    """Rewrite ``Load.source`` / ``Write.output`` references inside a
+    ``LoopOp`` body from ``old`` to ``new`` (recursively into nested Loops).
+    Pass-through for op types without internal buf refs."""
+    from deplodock.compiler.ir.loop import Load, Loop, LoopOp, Write, map_body
+
+    if not isinstance(op, LoopOp):
+        return op
+
+    def fn(s):
+        if isinstance(s, Load) and s.source == old:
+            return Load(name=s.name, source=new, index=s.index)
+        if isinstance(s, Write) and s.output == old:
+            return Write(output=new, index=s.index, value=s.value)
+        if isinstance(s, Loop):
+            return Loop(axis=s.axis, body=map_body(s.body, fn))
+        return s
+
+    return LoopOp(body=map_body(op.body, fn))
 
 
 # ---------------------------------------------------------------------------

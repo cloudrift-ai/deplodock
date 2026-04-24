@@ -8,7 +8,8 @@ an SSA program over a named iteration space:
     reduce_axis_names : computed property  — names of axes whose Loop wraps an Accum
     loads             : computed property  — body-form Load stmts (external reads)
     accums            : computed property  — unique Accum stmts, first-use order
-    num_inputs        : computed property  — highest Load.source + 1
+    input_bufs        : computed property  — distinct Load.source names (in first-use order)
+    num_inputs        : computed property  — len(input_bufs)
     analyze()         : LoopMeta           — precomputed name → def / scope / reduce-axis / live-axes
     map(fn)           : LoopOp             — transform body via ``map_body`` and rewrap
     __iter__          : Iterator[Stmt]     — pre-order walk (via ``iter_body``)
@@ -120,14 +121,13 @@ class Load(Stmt):
     """Read a value from an external input buffer into an SSA name.
 
     Each external-buffer read is an explicit body statement. ``source`` is
-    the index into the owning node's ``inputs`` list identifying which
-    external buffer; ``index`` is the dim-wise access pattern over the
-    enclosing axes. The produced SSA ``name`` is a regular value that
-    downstream stmts read.
+    the source buffer's name (matches the producing graph node's id);
+    ``index`` is the dim-wise access pattern over the enclosing axes. The
+    produced SSA ``name`` is a regular value that downstream stmts read.
     """
 
     name: str
-    source: int
+    source: str
     index: tuple[Expr, ...]
 
     def deps(self) -> tuple[str, ...]:
@@ -219,14 +219,14 @@ class Accum(Stmt):
 class Write(Stmt):
     """Write an SSA value to output buffer ``output`` at position ``index``.
 
-    ``output`` is an integer output slot (nodes have a single output in
-    v1, so ``output=0`` is the only valid value). ``index`` uses axis
-    Vars to compute the
-    per-dim offset. ``value`` references an SSA name available at this
-    point in the body (Assign, Accum, or ``$N``).
+    ``output`` is the destination buffer's name (matches the owning graph
+    node's id, or — for multi-output kernels — one of its output buffer
+    names). ``index`` uses axis Vars to compute the per-dim offset.
+    ``value`` references an SSA name available at this point in the body
+    (Assign, Accum, or a Load).
     """
 
-    output: int
+    output: str
     index: tuple[Expr, ...]
     value: str
 
@@ -365,14 +365,24 @@ class LoopOp(Op):
         return tuple(s for s in self if isinstance(s, Load))
 
     @property
-    def num_inputs(self) -> int:
-        """Number of external input buffers referenced by body Loads.
+    def input_bufs(self) -> tuple[str, ...]:
+        """Distinct buffer names referenced by body Loads, in first-use order.
 
-        Derived as ``max(load.source) + 1``, or 0 when no Loads are present.
-        This is the count ``node.inputs`` must provide.
+        Replaces ``num_inputs`` after the source-as-name change: a kernel's
+        input set is precisely the set of names appearing on ``Load.source``,
+        with no positional dance against the owning graph node's ``inputs`` list.
         """
-        loads = self.loads
-        return max((ld.source for ld in loads), default=-1) + 1
+        seen: dict[str, None] = {}
+        for ld in self.loads:
+            if ld.source not in seen:
+                seen[ld.source] = None
+        return tuple(seen.keys())
+
+    @property
+    def num_inputs(self) -> int:
+        """Distinct input buffer count — kept for back-compat with callers
+        that reason about kernel arity rather than buffer identity."""
+        return len(self.input_bufs)
 
     @property
     def accums(self) -> tuple[Accum, ...]:
@@ -460,7 +470,10 @@ class LoopOp(Op):
         from deplodock.compiler.ir.loop.interpret import execute_loop_op
 
         out_shape = self._infer_write_shape()
-        input_arrays = [np.asarray(x, dtype=np.float32) for x in inputs]
+        bufs = self.input_bufs
+        if len(inputs) != len(bufs):
+            raise ValueError(f"LoopOp.forward: expected {len(bufs)} inputs (matching input_bufs={list(bufs)}), got {len(inputs)}")
+        input_arrays = {name: np.asarray(x, dtype=np.float32) for name, x in zip(bufs, inputs, strict=True)}
         return execute_loop_op(self, input_arrays, out_shape)
 
     def _infer_write_shape(self) -> tuple[int, ...]:
@@ -586,23 +599,18 @@ def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: st
     """Render a ``LoopOp`` as an explicit nested-loop program.
 
     Each ``Loop`` block renders as ``for X in 0..N:  # kind``. Body Loads
-    render as ``name = load buf[index...]`` where ``buf`` is the matching
-    entry in ``port_buffers`` (when supplied) or a ``$source`` fallback.
+    render their ``source`` name directly (a string identifying the source
+    buffer); ``port_buffers`` is kept for back-compat but ignored.
     """
-    nbufs = loop.num_inputs
-    buffers = list(port_buffers) if port_buffers else [f"${i}" for i in range(nbufs)]
-    while len(buffers) < nbufs:
-        buffers.append(f"${len(buffers)}")
-
+    del port_buffers  # source is the buf name, intrinsic to Load now
     lines: list[str] = []
-    _render_body(loop.body, indent, buffers, lines)
+    _render_body(loop.body, indent, lines)
     return "\n".join(lines)
 
 
 def _render_body(
     stmts: tuple[Stmt, ...],
     indent: str,
-    buffers: list[str],
     lines: list[str],
 ) -> None:
     """Render a body tuple (recursive for nested ``Loop``)."""
@@ -611,14 +619,13 @@ def _render_body(
             args = ", ".join(stmt.args)
             lines.append(f"{indent}{stmt.name} = {stmt.op.name}({args})")
         elif isinstance(stmt, Load):
-            buf = buffers[stmt.source] if 0 <= stmt.source < len(buffers) else f"src{stmt.source}"
             idx = ", ".join(render_expr(e) for e in stmt.index)
-            lines.append(f"{indent}{stmt.name} = load {buf}[{idx}]")
+            lines.append(f"{indent}{stmt.name} = load {stmt.source}[{idx}]")
         elif isinstance(stmt, Accum):
             lines.append(f"{indent}{stmt.name} <- {stmt.op.name}({stmt.name}, {stmt.value})")
         elif isinstance(stmt, Write):
             idx = ", ".join(render_expr(e) for e in stmt.index)
-            lines.append(f"{indent}out{stmt.output}[{idx}] = {stmt.value}")
+            lines.append(f"{indent}{stmt.output}[{idx}] = {stmt.value}")
         elif isinstance(stmt, Select):
             for bi, br in enumerate(stmt.branches):
                 prefix = f"{stmt.name} =" if bi == 0 else f"{' ' * len(stmt.name)}  "
@@ -628,7 +635,7 @@ def _render_body(
             # Kind is structural: a Loop whose immediate body contains an Accum is a reduce Loop.
             kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
             lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {kind}")
-            _render_body(stmt.body, indent + "    ", buffers, lines)
+            _render_body(stmt.body, indent + "    ", lines)
 
 
 # ---------------------------------------------------------------------------
@@ -685,10 +692,9 @@ def _validate(loop: LoopOp) -> None:
                 defined.add(stmt.name)
             elif isinstance(stmt, Load):
                 # Load is a binding site — introduces its SSA name. ``source``
-                # indexes into the owning node's ``inputs`` list, which is
-                # checked against the source count at codegen.
-                if stmt.source < 0:
-                    raise ValueError(f"Load {stmt.name!r}: source {stmt.source} must be non-negative")
+                # is the producing graph node's id.
+                if not isinstance(stmt.source, str) or not stmt.source:
+                    raise ValueError(f"Load {stmt.name!r}: source {stmt.source!r} must be a non-empty string")
                 if stmt.name in defined:
                     raise ValueError(f"Load {stmt.name!r}: name already defined")
                 defined.add(stmt.name)
