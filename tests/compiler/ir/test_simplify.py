@@ -291,7 +291,7 @@ def test_kernel_walker_idempotent():
 
 def test_loop_op_walker_simplifies_load_index():
     """Body Load index (a0 + 0) * 1 simplifies to a0 under axis range info."""
-    load = Load(name="x", source="src_0", index=(BinaryExpr("*", BinaryExpr("+", Var("a0"), _int(0)), _int(1)),))
+    load = Load(name="x", input="src_0", index=(BinaryExpr("*", BinaryExpr("+", Var("a0"), _int(0)), _int(1)),))
     assign = Assign("v", ElementwiseOp(op="negative"), ("x",))
     write = Write(0, (Var("a0"),), "v")
     loop = Loop(Axis("a0", 8), (load, assign, write))
@@ -302,7 +302,7 @@ def test_loop_op_walker_simplifies_load_index():
 
 
 def test_loop_op_walker_idempotent():
-    load = Load(name="x", source="src_0", index=(BinaryExpr("+", Var("a0"), _int(0)),))
+    load = Load(name="x", input="src_0", index=(BinaryExpr("+", Var("a0"), _int(0)),))
     assign = Assign("v", ElementwiseOp(op="negative"), ("x",))
     write = Write(0, (Var("a0"),), "v")
     loop = Loop(Axis("a0", 8), (load, assign, write))

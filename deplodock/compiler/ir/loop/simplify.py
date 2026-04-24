@@ -362,7 +362,7 @@ def _simplify_loop_stmt(stmt: LoopStmt, ctx: Context) -> LoopStmt:
     if isinstance(stmt, Write):
         return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value)
     if isinstance(stmt, Load):
-        return Load(stmt.name, stmt.source, _simplify_expr_tuple(stmt.index, ctx))
+        return Load(stmt.name, stmt.input, _simplify_expr_tuple(stmt.index, ctx))
     # Assign / Accum carry only SSA names — no Expr field to simplify.
     return stmt
 

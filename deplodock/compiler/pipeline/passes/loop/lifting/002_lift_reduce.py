@@ -65,7 +65,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         Loop(
             axis=reduce_axis,
             body=(
-                Load(name="in0", source=src_id, index=load_index),
+                Load(name="in0", input=src_id, index=load_index),
                 Accum(name="acc", value="in0", op=combine),
             ),
         ),

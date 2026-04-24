@@ -425,8 +425,8 @@ def _rename_buf_in_op(op, old: str, new: str):
         return op
 
     def fn(s):
-        if isinstance(s, Load) and s.source == old:
-            return Load(name=s.name, source=new, index=s.index)
+        if isinstance(s, Load) and s.input == old:
+            return Load(name=s.name, input=new, index=s.index)
         if isinstance(s, Write) and s.output == old:
             return Write(output=new, index=s.index, value=s.value)
         if isinstance(s, Loop):

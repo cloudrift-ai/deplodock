@@ -41,7 +41,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         idx = _identity_index(inp_shape, axes)
         name = f"in{i}"
         load_names.append(name)
-        load_stmts.append(Load(name=name, source=inp_id, index=idx))
+        load_stmts.append(Load(name=name, input=inp_id, index=idx))
 
     write_index = tuple(Var(a.name) for a in axes)
     inner: tuple[Stmt, ...] = (
