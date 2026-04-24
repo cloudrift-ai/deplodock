@@ -220,8 +220,13 @@ def test_live_axes_disagree_rejected():
     assert classify(op) is None
 
 
-def test_matmul_shape_deferred():
-    """Matmul shape (Write at same level as reduce, no output Loop) → None in v1."""
+def test_matmul_shape_classifies_as_per_row_reduce():
+    """Matmul-like body (free, free, reduce + direct Write) classifies with no output Loop.
+
+    Each thread owns one (m, n) output element and walks the reduce serially —
+    correct but slow for matmul (the annotated tile template is still
+    preferred for matmul-annotated nodes; this is the unannotated fallback).
+    """
     m, n, k = Axis("a0", 4), Axis("a1", 4), Axis("a2", 8)
     op = LoopOp(
         body=(
@@ -247,4 +252,8 @@ def test_matmul_shape_deferred():
             ),
         )
     )
-    assert classify(op) is None
+    sig = classify(op)
+    assert sig is not None
+    assert sig.kind == "per_row_reduce"
+    assert sig.output_axis is None
+    assert [a.name for a in sig.live_axes] == ["a0", "a1"]
