@@ -191,6 +191,25 @@ def _parse_reduce_block(loop: Loop) -> ReduceBlock | None:
     )
 
 
+def _validate_output_body(body: tuple[Stmt, ...]) -> bool:
+    """An output Loop's body may contain Loads / Assigns / Selects / Writes
+    plus nested reduce Loops; nothing else (e.g. free Loops are not yet
+    supported inside the output Loop). Recursively descends into nested
+    reduce Loops to validate them.
+    """
+    for s in body:
+        if isinstance(s, (Load, Assign, Select, Write)):
+            continue
+        if isinstance(s, Loop):
+            if not _is_reduce_loop(s):
+                return False
+            if _parse_reduce_block(s) is None:
+                return False
+            continue
+        return False
+    return True
+
+
 def _live_axes_of_block(block: ReduceBlock, all_free: frozenset[str]) -> frozenset[str]:
     """Free-axes that are referenced from inside this reduce block.
 
@@ -300,11 +319,14 @@ def _classify_leaf(
                 reduce_blocks.append(blk)
                 seen_reduce = True
             else:
-                # Free output Loop: Loads/Assigns/Selects + a single trailing Write.
-                if not all(isinstance(x, (Load, Assign, Select, Write)) for x in s.body):
-                    return None
+                # Free output Loop. Body is a single trailing Write plus any mix
+                # of Loads / Assigns / Selects / nested reduce Loops. Each nested
+                # reduce Loop becomes a per-element reduction inside the output
+                # for-loop (flash-attention-style fused matmul-after-softmax).
                 writes = [x for x in s.body if isinstance(x, Write)]
                 if len(writes) != 1 or s.body[-1] is not writes[0]:
+                    return None
+                if not _validate_output_body(s.body):
                     return None
                 output_axis = s.axis
                 output_chain = s.body
