@@ -11,6 +11,13 @@ expression printer with operator-precedence-aware parenthesization are
 duplicated from ``pipeline/passes/lowering/cuda/_emit.py``. Step 6 of the
 Tile IR refactor deletes the old emitter and consolidates these tables;
 until then, both copies live in parallel — kept in sync by hand.
+
+Loop IR's ``Load`` / ``Assign`` / ``Select`` / ``Write`` / ``Accum`` are
+rendered directly: ``Load`` becomes ``float <name> = <buf>[<flat>];``,
+``Assign``'s op-name is translated to a C expression via
+``_op_to_expr``, ``Accum`` inside a ``Reduce`` becomes the per-iteration
+fold (the register declaration is emitted by ``_render_reduce`` from the
+distinct accumulator names found in the body).
 """
 
 from __future__ import annotations
@@ -26,19 +33,16 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
+from deplodock.compiler.ir.loop import Accum, Assign, Load, Select, Write
 from deplodock.compiler.ir.tile.ir import (
-    AccumFold,
     Cond,
     Coop,
     Expr,
     FreeLoop,
-    Index,
     Kernel,
-    Let,
     Reduce,
     SmemBuf,
     Stmt,
-    Store,
     Sync,
     Tile,
 )
@@ -101,10 +105,10 @@ _PRECEDENCE: dict[str, int] = {
 class _Ctx:
     """Per-kernel render state.
 
-    ``shapes`` is the union of param shapes and smem dims, used to flatten
-    multi-dim ``Index`` accesses to row-major. Built once at the start of
-    ``render_kernel``. ``indent`` is the current indent level (tracked
-    explicitly so each helper formats with the correct leading whitespace).
+    ``shapes`` maps every buffer name (kernel param + smem) to its declared
+    shape, used to flatten multi-dim ``Load`` / ``Write`` indices to
+    row-major. ``indent`` tracks the current indent level so each helper
+    formats with the correct leading whitespace.
     """
 
     shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
@@ -130,7 +134,6 @@ def render_kernel(kernel: Kernel) -> str:
         shapes[s.name] = s.dims
     ctx = _Ctx(shapes=shapes, indent=1)
 
-    # Header.
     params_text = ", ".join(f"{p.dtype} {p.name}" for p in kernel.params)
     bx, by, bz = kernel.block
     max_threads = bx * by * bz
@@ -138,22 +141,18 @@ def render_kernel(kernel: Kernel) -> str:
 
     body_lines: list[str] = []
 
-    # Smem decls.
     for sb in kernel.smem:
         body_lines.append(_render_smem_decl(sb, ctx))
 
-    # Prologue (no tid guard).
     for s in kernel.prologue:
         body_lines.extend(_render_stmt(s, ctx))
 
-    # Tid decode + bounds guard.
     if kernel.thread_axes:
         n_threads = 1
         for ax in kernel.thread_axes:
             n_threads *= int(ax.extent)
         body_lines.append(f"{_pad(ctx.indent)}long long tid = blockIdx.x * blockDim.x + threadIdx.x;")
         body_lines.append(f"{_pad(ctx.indent)}if (tid < {n_threads}) {{")
-        # Axis bindings from tid (row-major, innermost axis = tid % extent).
         guarded = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1)
         body_lines.extend(_render_thread_axis_decode(kernel.thread_axes, guarded))
         for s in kernel.body:
@@ -175,16 +174,13 @@ def _render_smem_decl(sb: SmemBuf, ctx: _Ctx) -> str:
 def _render_thread_axis_decode(axes: tuple, ctx: _Ctx) -> list[str]:
     """Emit ``int <axis> = (tid / stride) % extent;`` for each axis.
 
-    Innermost axis (last in ``axes``) has stride 1 and no ``%`` (we trust
-    the tid-bounds guard to bound the leading tile so the outer axis can be
-    expressed as plain division).
+    Innermost axis (last in ``axes``) has stride 1 and uses ``tid % extent``.
+    The leading (outermost) axis uses ``tid / outer_stride`` (no ``%``) since
+    the bounds guard already caps tid below the full numel.
     """
-    lines: list[str] = []
     pad = _pad(ctx.indent)
-    stride = 1
-    # Walk innermost-first to compute strides, but emit outermost-first for
-    # readability — the C output reads top-to-bottom matching declaration order.
     decoded: list[str] = []
+    stride = 1
     for ax in reversed(axes):
         extent = int(ax.extent)
         if stride == 1:
@@ -192,21 +188,15 @@ def _render_thread_axis_decode(axes: tuple, ctx: _Ctx) -> list[str]:
         else:
             decoded.append(f"int {ax.name} = (tid / {stride}) % {extent};")
         stride *= extent
-    # The outermost axis is the leading slot; if axes has length 1 the lone
-    # axis is `tid` directly (no `%` needed since the bounds guard caps it).
     if len(axes) == 1:
         decoded = [f"int {axes[0].name} = tid;"]
     else:
-        # Leading axis: replace its `% extent` with plain division — the
-        # bounds guard already caps tid below the full numel.
         outer = axes[0]
         outer_stride = 1
         for ax in axes[1:]:
             outer_stride *= int(ax.extent)
         decoded[-1] = f"int {outer.name} = tid / {outer_stride};"
-    for line in reversed(decoded):
-        lines.append(pad + line)
-    return lines
+    return [pad + line for line in reversed(decoded)]
 
 
 # ---------------------------------------------------------------------------
@@ -217,22 +207,29 @@ def _render_thread_axis_decode(axes: tuple, ctx: _Ctx) -> list[str]:
 def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
     pad = _pad(ctx.indent)
 
-    if isinstance(stmt, Let):
-        return [f"{pad}float {stmt.name} = {_render_expr(stmt.init, ctx)};"]
+    if isinstance(stmt, Load):
+        flat = _render_index(stmt.input, stmt.index, ctx)
+        return [f"{pad}float {stmt.name} = {stmt.input}[{flat}];"]
 
-    if isinstance(stmt, Store):
-        flat = _render_index(stmt.buf, stmt.indices, ctx)
-        return [f"{pad}{stmt.buf}[{flat}] = {_render_expr(stmt.value, ctx)};"]
+    if isinstance(stmt, Assign):
+        args = [Var(a) for a in stmt.args]
+        return [f"{pad}float {stmt.name} = {_render_expr(_op_to_expr(stmt.op.name, args), ctx)};"]
 
-    if isinstance(stmt, AccumFold):
-        v = _render_expr(stmt.value, ctx)
+    if isinstance(stmt, Select):
+        return [f"{pad}float {stmt.name} = {_render_expr(_select_to_ternary(stmt), ctx)};"]
+
+    if isinstance(stmt, Write):
+        flat = _render_index(stmt.output, stmt.index, ctx)
+        return [f"{pad}{stmt.output}[{flat}] = {stmt.value};"]
+
+    if isinstance(stmt, Accum):
         op_name = stmt.op.name
-        if op_name == "maximum":
-            return [f"{pad}{stmt.target} = fmaxf({stmt.target}, {v});"]
+        if op_name in ("maximum", "amax"):
+            return [f"{pad}{stmt.name} = fmaxf({stmt.name}, {stmt.value});"]
         if op_name == "minimum":
-            return [f"{pad}{stmt.target} = fminf({stmt.target}, {v});"]
+            return [f"{pad}{stmt.name} = fminf({stmt.name}, {stmt.value});"]
         op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
-        return [f"{pad}{stmt.target} {op} {v};"]
+        return [f"{pad}{stmt.name} {op} {stmt.value};"]
 
     if isinstance(stmt, Sync):
         return [f"{pad}__syncthreads();"]
@@ -241,15 +238,13 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
         return _render_cond(stmt, ctx)
 
     if isinstance(stmt, FreeLoop):
-        extent = int(stmt.axis.extent)
-        return _render_for(stmt.axis.name, 0, extent, step=None, body=stmt.body, ctx=ctx)
+        return _render_for(stmt.axis.name, 0, int(stmt.axis.extent), step=None, body=stmt.body, ctx=ctx)
 
     if isinstance(stmt, Reduce):
         return _render_reduce(stmt, ctx)
 
     if isinstance(stmt, Tile):
-        full_extent = int(stmt.axis.extent)
-        return _render_for(stmt.axis.name, 0, full_extent, step=stmt.bk, body=stmt.body, ctx=ctx)
+        return _render_for(stmt.axis.name, 0, int(stmt.axis.extent), step=stmt.bk, body=stmt.body, ctx=ctx)
 
     if isinstance(stmt, Coop):
         return _render_for(stmt.var, "threadIdx.x", stmt.cover, step="blockDim.x", body=stmt.body, ctx=ctx)
@@ -274,16 +269,32 @@ def _render_cond(stmt: Cond, ctx: _Ctx) -> list[str]:
 
 
 def _render_reduce(stmt: Reduce, ctx: _Ctx) -> list[str]:
+    """Declare each accumulator (one per distinct ``Accum.name`` in the body)
+    before the for-loop, then emit the body as the loop interior. The body
+    contains plain ``Accum`` stmts whose render emits the per-iteration fold.
+    """
     pad = _pad(ctx.indent)
     out: list[str] = []
-    for acc in stmt.accs:
-        identity = acc.op.identity
-        if identity is None:
-            raise ValueError(f"Acc {acc.name!r} op {acc.op.name!r} has no identity (not a valid reduce combine)")
-        out.append(f"{pad}float {acc.name} = {_render_expr(Literal(float(identity)), ctx)};")
+    seen: set[str] = set()
+    for s in _walk(stmt.body):
+        if isinstance(s, Accum) and s.name not in seen:
+            seen.add(s.name)
+            identity = s.op.identity
+            if identity is None:
+                raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
+            out.append(f"{pad}float {s.name} = {float(identity):.1f}f;")
     extent = stmt.extent if stmt.extent is not None else int(stmt.axis.extent)
     out.extend(_render_for(stmt.axis.name, 0, extent, step=None, body=stmt.body, ctx=ctx))
     return out
+
+
+def _walk(stmts: tuple[Stmt, ...]):
+    """Pre-order walk over a Tile-IR body for accumulator collection."""
+    for s in stmts:
+        yield s
+        sub = getattr(s, "body", None)
+        if isinstance(sub, tuple):
+            yield from _walk(sub)
 
 
 def _render_for(var: str, start, end, step, body: tuple, ctx: _Ctx) -> list[str]:
@@ -321,9 +332,6 @@ def _render_expr(expr: Expr, ctx: _Ctx, parent_prec: int = 0) -> str:
         right = _render_expr(expr.right, ctx, prec + 1)
         result = f"{left} {expr.op} {right}"
         return f"({result})" if prec < parent_prec else result
-    if isinstance(expr, Index):
-        flat = _render_index(expr.buf, expr.indices, ctx)
-        return f"{expr.buf}[{flat}]"
     if isinstance(expr, Builtin):
         return _BUILTIN_TO_CUDA.get(expr.name, expr.name)
     if isinstance(expr, FuncCallExpr):
@@ -341,39 +349,76 @@ def _render_expr(expr: Expr, ctx: _Ctx, parent_prec: int = 0) -> str:
 
 
 def _render_index(buf: str, indices: tuple, ctx: _Ctx) -> str:
-    """Row-major flatten ``buf[i0][i1]...`` into a single C expression.
-
-    Uses the buffer's shape from ``ctx.shapes`` (populated from
-    ``Kernel.params`` + ``Kernel.smem``). For 1D buffers the flatten is a
-    single expression; for higher-dim, the result is
-    ``((i0 * d1 + i1) * d2 + i2) * ... + iN``.
-
-    Falls back to the index expressions concatenated with ``+`` when the
-    buffer has no declared shape (scalar broadcasts where the caller
-    passes ``Index("X", (Literal(0),))``).
-    """
+    """Row-major flatten ``buf[i0][i1]...``."""
     if len(indices) == 0:
         return "0"
     if len(indices) == 1:
         return _render_expr(indices[0], ctx)
     shape = ctx.shapes.get(buf)
     if shape is None or len(shape) != len(indices):
-        # No shape known — fall back to summing terms (only valid for the
-        # 1-element scalar case where every index is Literal(0)).
         return " + ".join(_render_expr(i, ctx) for i in indices)
-    # Row-major: outermost index has stride = product of trailing dims.
     flat = _render_expr(indices[0], ctx, _PRECEDENCE["*"])
     for i in range(1, len(indices)):
-        stride = 1
-        for d in shape[i:]:
-            stride *= int(d)
-        # `flat` is the running offset; multiply by the next dim's extent
-        # before adding the next index.
         next_idx = _render_expr(indices[i], ctx, _PRECEDENCE["+"] + 1)
-        # Emit as ((<flat>) * <next_dim> + <next_idx>) by fusing one stride at a time.
         outer_dim = int(shape[i])
         flat = f"{flat} * {outer_dim} + {next_idx}"
     return flat
+
+
+# ---------------------------------------------------------------------------
+# Op-name → Expr translation (mirrors _common.apply_elementwise)
+# ---------------------------------------------------------------------------
+
+
+_BINARY_OP: dict[str, str] = {
+    "add": "+",
+    "subtract": "-",
+    "multiply": "*",
+    "divide": "/",
+    "mod": "%",
+}
+
+_SUPPORTED_UNARY_INTRINSIC: dict[str, str] = {
+    "exp": "exp",
+    "rsqrt": "rsqrt",
+    "tanh": "tanh",
+    "abs": "fabs",
+}
+
+
+def _op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
+    if fn in _BINARY_OP:
+        return BinaryExpr(_BINARY_OP[fn], inputs[0], inputs[1])
+    if fn == "maximum":
+        return FuncCallExpr("fmax", list(inputs))
+    if fn == "minimum":
+        return FuncCallExpr("fmin", list(inputs))
+    if fn == "pow":
+        return FuncCallExpr("pow", list(inputs))
+    if fn == "negative":
+        return BinaryExpr("-", Literal(0.0, "float"), inputs[0])
+    if fn == "copy":
+        return inputs[0]
+    if fn == "reciprocal":
+        return BinaryExpr("/", Literal(1.0, "float"), inputs[0])
+    if fn == "relu":
+        return FuncCallExpr("fmax", [Literal(0.0, "float"), inputs[0]])
+    if fn == "sigmoid":
+        neg_x = BinaryExpr("-", Literal(0.0, "float"), inputs[0])
+        exp_neg = FuncCallExpr("exp", [neg_x])
+        return BinaryExpr("/", Literal(1.0, "float"), BinaryExpr("+", Literal(1.0, "float"), exp_neg))
+    if fn in _SUPPORTED_UNARY_INTRINSIC:
+        return FuncCallExpr(_SUPPORTED_UNARY_INTRINSIC[fn], list(inputs))
+    raise NotImplementedError(f"render: elementwise fn={fn!r} not yet supported")
+
+
+def _select_to_ternary(s: Select) -> Expr:
+    """Build a chained ternary from a Loop IR ``Select``."""
+    branches = list(s.branches)
+    result: Expr = Var(branches[-1].value)
+    for b in reversed(branches[:-1]):
+        result = TernaryExpr(cond=b.select, if_true=Var(b.value), if_false=result)
+    return result
 
 
 __all__ = ["render_kernel"]
