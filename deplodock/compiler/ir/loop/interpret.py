@@ -49,7 +49,7 @@ def execute_loop_op(
         if isinstance(stmt, Assign):
             args = [values[a] for a in stmt.args]
             assert isinstance(stmt.op, ElementwiseImpl)
-            values[stmt.name] = stmt.op.fn(*_align_ranks(args))
+            values[stmt.name] = stmt.op(*_align_ranks(args))
         elif isinstance(stmt, Load):
             if stmt.source >= len(input_arrays):
                 raise ValueError(f"Load source {stmt.source} out of range (have {len(input_arrays)} inputs)")

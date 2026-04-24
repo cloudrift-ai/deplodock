@@ -63,8 +63,11 @@ class ElementwiseImpl:
         if fn is None:
             raise ValueError(f"unknown elementwise op name: {name!r} (not in numpy or _NAME_TO_FN)")
         self.name = name
-        self.fn = fn
+        self._fn = fn
         self.arity = getattr(fn, "nin", 1)
+
+    def __call__(self, *args):
+        return self._fn(*args)
 
     @property
     def commutative(self) -> bool:
