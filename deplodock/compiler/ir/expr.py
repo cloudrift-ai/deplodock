@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import numpy as _numpy
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Operator overloading mixin
@@ -168,15 +168,11 @@ class BinOp(_ExprOps):
             try:
                 return bool(lv) and bool(rv)
             except (TypeError, ValueError):
-                import numpy as np
-
                 return np.logical_and(lv, rv)
         if op == "||":
             try:
                 return bool(lv) or bool(rv)
             except (TypeError, ValueError):
-                import numpy as np
-
                 return np.logical_or(lv, rv)
         raise ValueError(f"Unknown BinOp: {op}")
 
@@ -243,8 +239,6 @@ class Cast(_ExprOps):
     def eval(self, env: dict[str, object]) -> object:
         v = self.expr.eval(env)
         if self.dtype == "int":
-            import numpy as np
-
             return np.asarray(v).astype(np.int64) if hasattr(v, "__array__") else int(v)
         return v
 
@@ -440,36 +434,36 @@ def _reg(op: ExprOp) -> ExprOp:
 # ``resolve_fn`` indirection. The four ops with no numpy equivalent
 # (``rsqrt`` / ``relu`` / ``sigmoid`` / ``silu``) get a lambda; everything
 # else pulls from numpy.
-ADD = _reg(BinaryOp("add", _numpy.add, commutative=True, identity=0.0))
-SUBTRACT = _reg(BinaryOp("subtract", _numpy.subtract))
-MULTIPLY = _reg(BinaryOp("multiply", _numpy.multiply, commutative=True, identity=1.0))
-DIVIDE = _reg(BinaryOp("divide", _numpy.divide))
-MOD = _reg(BinaryOp("mod", _numpy.mod))
-MAXIMUM = _reg(BinaryOp("maximum", _numpy.maximum, commutative=True, identity=-1e30))
-MINIMUM = _reg(BinaryOp("minimum", _numpy.minimum, commutative=True, identity=1e30))
+ADD = _reg(BinaryOp("add", np.add, commutative=True, identity=0.0))
+SUBTRACT = _reg(BinaryOp("subtract", np.subtract))
+MULTIPLY = _reg(BinaryOp("multiply", np.multiply, commutative=True, identity=1.0))
+DIVIDE = _reg(BinaryOp("divide", np.divide))
+MOD = _reg(BinaryOp("mod", np.mod))
+MAXIMUM = _reg(BinaryOp("maximum", np.maximum, commutative=True, identity=-1e30))
+MINIMUM = _reg(BinaryOp("minimum", np.minimum, commutative=True, identity=1e30))
 # Torch-level reduction name (``amax``) kept distinct from ``maximum`` so
 # the traced graph preserves the source op's spelling; semantics match.
-AMAX = _reg(BinaryOp("amax", _numpy.maximum, commutative=True, identity=-1e30))
-POW = _reg(BinaryOp("pow", _numpy.power))
+AMAX = _reg(BinaryOp("amax", np.maximum, commutative=True, identity=-1e30))
+POW = _reg(BinaryOp("pow", np.power))
 # Reduction-only names (same shape as add / multiply but distinct spellings
 # because tensor-IR ``ReduceOp`` uses ``sum`` / ``prod``).
-SUM = _reg(BinaryOp("sum", _numpy.add, commutative=True, identity=0.0))
-PROD = _reg(BinaryOp("prod", _numpy.multiply, commutative=True, identity=1.0))
+SUM = _reg(BinaryOp("sum", np.add, commutative=True, identity=0.0))
+PROD = _reg(BinaryOp("prod", np.multiply, commutative=True, identity=1.0))
 # Unary math — numpy-backed
-NEGATIVE = _reg(UnaryOp("negative", _numpy.negative))
-EXP = _reg(UnaryOp("exp", _numpy.exp))
-RECIPROCAL = _reg(UnaryOp("reciprocal", _numpy.reciprocal))
-TANH = _reg(UnaryOp("tanh", _numpy.tanh))
-ABS = _reg(UnaryOp("abs", _numpy.abs))
-FABS = _reg(UnaryOp("fabs", _numpy.fabs))
-SQRT = _reg(UnaryOp("sqrt", _numpy.sqrt))
-LOG = _reg(UnaryOp("log", _numpy.log))
+NEGATIVE = _reg(UnaryOp("negative", np.negative))
+EXP = _reg(UnaryOp("exp", np.exp))
+RECIPROCAL = _reg(UnaryOp("reciprocal", np.reciprocal))
+TANH = _reg(UnaryOp("tanh", np.tanh))
+ABS = _reg(UnaryOp("abs", np.abs))
+FABS = _reg(UnaryOp("fabs", np.fabs))
+SQRT = _reg(UnaryOp("sqrt", np.sqrt))
+LOG = _reg(UnaryOp("log", np.log))
 COPY = _reg(UnaryOp("copy", lambda x: x))
 # Unary math — no numpy equivalent, so an inline lambda
-RSQRT = _reg(UnaryOp("rsqrt", lambda x: 1.0 / _numpy.sqrt(x)))
-RELU = _reg(UnaryOp("relu", lambda x: _numpy.maximum(0.0, x)))
-SIGMOID = _reg(UnaryOp("sigmoid", lambda x: 1.0 / (1.0 + _numpy.exp(-x))))
-SILU = _reg(UnaryOp("silu", lambda x: x / (1.0 + _numpy.exp(-x))))
+RSQRT = _reg(UnaryOp("rsqrt", lambda x: 1.0 / np.sqrt(x)))
+RELU = _reg(UnaryOp("relu", lambda x: np.maximum(0.0, x)))
+SIGMOID = _reg(UnaryOp("sigmoid", lambda x: 1.0 / (1.0 + np.exp(-x))))
+SILU = _reg(UnaryOp("silu", lambda x: x / (1.0 + np.exp(-x))))
 
 
 def get_expr_op(name: str) -> ExprOp:

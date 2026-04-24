@@ -10,13 +10,14 @@ requires-python = ">=3.12"
 dependencies = [
     "huggingface_hub[cli,hf_transfer]",
     "httpx",
+    "numpy",
     "pyyaml",
 ]
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio", "pytest-xdist"]
 plot = ["matplotlib"]
-compile = ["torch", "transformers", "scipy", "numpy", "cupy-cuda12x"]
+compile = ["torch", "transformers", "scipy", "cupy-cuda12x"]
 viz = ["graphviz"]  # Renders dump_dir/*.dot files — requires `dot` binary on PATH
 # flash-attn requires torch at build time, install separately:
 #   pip install flash-attn --no-build-isolation
