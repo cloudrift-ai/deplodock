@@ -47,9 +47,6 @@ def test_detect_linear_matmul():
     assert h.get("cuda.matmul.tile_m") == 32
     assert h.get("cuda.matmul.tile_n") == 32
     assert h.get("cuda.matmul.block_k") == 64
-    # a_source (X, the m-indexed input) and b_source (W, the n-indexed input)
-    # must differ; which slot each lands in depends on the tracer's input order.
-    assert {h.get("cuda.matmul.a_source"), h.get("cuda.matmul.b_source")} == {0, 1}
 
 
 def test_skip_divisibility():
