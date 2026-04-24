@@ -187,7 +187,7 @@ def test_load_stmt_binding():
     loads = k.loads
     # rename_ssa_sequential canonicalizes Load names to in0, in1, ...
     assert len(loads) == 1 and loads[0].name == "in0" and loads[0].input == "src_0"
-    assert k.num_inputs == 1
+    assert len(k.inputs) == 1
 
 
 def test_load_stmt_multiple_sources():
@@ -206,8 +206,7 @@ def test_load_stmt_multiple_sources():
         ),
     )
     # Two distinct source buf names → two inputs.
-    assert k.num_inputs == 2
-    assert k.input_bufs == ("src_0", "src_2")
+    assert k.inputs == ("src_0", "src_2")
 
 
 def test_update_synthesizes_accum_decl():
@@ -572,8 +571,8 @@ def test_execute_loop_op_handles_nested_body():
     flat = _flat_reduce_kernel()
     nested = _nested_reduce_kernel()
     # interpreter takes a buf-name → array dict (post Load.source: int → str refactor).
-    inputs = {flat.input_bufs[0]: x}
+    inputs = {flat.inputs[0]: x}
     out_flat = execute_loop_op(flat, inputs, (4,))
-    inputs_nested = {nested.input_bufs[0]: x}
+    inputs_nested = {nested.inputs[0]: x}
     out_nested = execute_loop_op(nested, inputs_nested, (4,))
     np.testing.assert_allclose(out_flat, out_nested, rtol=1e-5)

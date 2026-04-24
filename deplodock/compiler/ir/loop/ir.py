@@ -365,24 +365,16 @@ class LoopOp(Op):
         return tuple(s for s in self if isinstance(s, Load))
 
     @property
-    def input_bufs(self) -> tuple[str, ...]:
+    def inputs(self) -> tuple[str, ...]:
         """Distinct buffer names referenced by body Loads, in first-use order.
 
-        Replaces ``num_inputs`` after the source-as-name change: a kernel's
-        input set is precisely the set of names appearing on ``Load.source``,
-        with no positional dance against the owning graph node's ``inputs`` list.
+        Order matters: ``LoopOp.forward`` zips positional input arrays
+        against this tuple, and the surrounding graph node's ``inputs`` list
+        is set in the same order at lifting / fusion time. Using ``set(...)``
+        here would scramble the mapping (set order is hash-based) and
+        positional args would land on the wrong buffer names.
         """
-        seen: dict[str, None] = {}
-        for ld in self.loads:
-            if ld.input not in seen:
-                seen[ld.input] = None
-        return tuple(seen.keys())
-
-    @property
-    def num_inputs(self) -> int:
-        """Distinct input buffer count — kept for back-compat with callers
-        that reason about kernel arity rather than buffer identity."""
-        return len(self.input_bufs)
+        return tuple(dict.fromkeys(s.input for s in self.loads))
 
     @property
     def accums(self) -> tuple[Accum, ...]:
@@ -470,7 +462,7 @@ class LoopOp(Op):
         from deplodock.compiler.ir.loop.interpret import execute_loop_op
 
         out_shape = self._infer_write_shape()
-        bufs = self.input_bufs
+        bufs = self.inputs
         if len(inputs) != len(bufs):
             raise ValueError(f"LoopOp.forward: expected {len(bufs)} inputs (matching input_bufs={list(bufs)}), got {len(inputs)}")
         input_arrays = {name: np.asarray(x, dtype=np.float32) for name, x in zip(bufs, inputs, strict=True)}
