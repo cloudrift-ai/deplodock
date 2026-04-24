@@ -10,12 +10,13 @@ without going through the SDPA fast-path.
 """
 
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.frontend.ir import SoftmaxOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
-PATTERN = [Pattern("root", ElementwiseOp, {"fn": "softmax"})]
+PATTERN = [Pattern("root", SoftmaxOp)]
 
 
 def rewrite(graph: Graph, match: Match) -> Graph | None:
@@ -23,15 +24,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     if not root.inputs:
         return None
     x_id = root.inputs[0]
-
-    # aten.softmax.int stores the dim as a scalar constant input (the tracer
-    # converts ints to ConstantOps). If absent, default to -1 (softmax's
-    # canonical axis for NN uses).
-    axis: int = -1
-    if len(root.inputs) >= 2:
-        dim_node = graph.nodes.get(root.inputs[1])
-        if dim_node and isinstance(dim_node.op, ConstantOp) and isinstance(dim_node.op.value, (int, float)):
-            axis = int(dim_node.op.value)
+    axis = root.op.axis
 
     x_t = graph.nodes[x_id].output
     out_shape = root.output.shape

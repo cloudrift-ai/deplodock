@@ -55,14 +55,13 @@ def _matmul_graph() -> Graph:
 
 def _softmax_graph() -> Graph:
     """A 2-axis softmax graph, reduced on axis=1."""
-    from deplodock.compiler.ir.base import ConstantOp
+    from deplodock.compiler.ir.frontend.ir import SoftmaxOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")
-    g.add_node(op=ConstantOp(name="axis", value=-1.0), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
     g.add_node(
-        op=ElementwiseOp(op="softmax"),
-        inputs=["x", "axis"],
+        op=SoftmaxOp(axis=-1),
+        inputs=["x"],
         output=Tensor("y", (4, 8)),
         node_id="y",
     )

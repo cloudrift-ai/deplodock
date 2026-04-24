@@ -14,9 +14,9 @@ from __future__ import annotations
 
 from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from deplodock.compiler.ir.frontend.ir import SoftmaxOp
 
 
 def _cuda_nodes(g: Graph) -> list:
@@ -27,10 +27,9 @@ def _softmax_large_graph() -> Graph:
     """Softmax over a 4096-wide axis — forces Strategy B in the lowering pass."""
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 4096)), node_id="x")
-    g.add_node(op=ConstantOp(name="axis", value=-1.0), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
     g.add_node(
-        op=ElementwiseOp(op="softmax"),
-        inputs=["x", "axis"],
+        op=SoftmaxOp(axis=-1),
+        inputs=["x"],
         output=Tensor("y", (4, 4096)),
         node_id="y",
     )
@@ -58,10 +57,9 @@ def test_small_reduce_stays_serial():
     """Small reduce extent (< BLOCK) must keep the one-thread-per-output (serial) shape."""
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")
-    g.add_node(op=ConstantOp(name="axis", value=-1.0), inputs=[], output=Tensor("axis", (1,)), node_id="axis")
     g.add_node(
-        op=ElementwiseOp(op="softmax"),
-        inputs=["x", "axis"],
+        op=SoftmaxOp(axis=-1),
+        inputs=["x"],
         output=Tensor("y", (4, 8)),
         node_id="y",
     )

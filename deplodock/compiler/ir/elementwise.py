@@ -22,31 +22,15 @@ from __future__ import annotations
 
 import numpy as np
 
-
-def _unimpl(name: str):
-    """Stub callable for fused frontend ops (decomposed before eval)."""
-
-    def _raise(*_args):
-        raise NotImplementedError(f"ElementwiseImpl({name!r}) has no numpy implementation")
-
-    return _raise
-
-
-# Names whose callable isn't a plain ``getattr(np, name)``:
-# - Non-numpy intrinsics (rsqrt / relu / sigmoid / silu, plus copy).
-# - Fused frontend ops (rms_norm / softmax) — stubs; they're decomposed
-#   before any eval or codegen touches ``.fn``, but the name must still
-#   resolve so ``ElementwiseImpl(name)`` doesn't reject them.
-# Every other op name matches a numpy attribute — ``__init__`` falls
-# through to ``getattr(np, name)`` for them.
+# Names whose callable isn't a plain ``getattr(np, name)`` — non-numpy
+# intrinsics. Every other op name matches a numpy attribute, and
+# ``__init__`` falls through to ``getattr(np, name)`` for them.
 _NAME_TO_FN: dict[str, object] = {
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "relu": lambda x: np.maximum(0.0, x),
     "sigmoid": lambda x: 1.0 / (1.0 + np.exp(-x)),
     "silu": lambda x: x / (1.0 + np.exp(-x)),
     "copy": lambda x: x,
-    "rms_norm": _unimpl("rms_norm"),
-    "softmax": _unimpl("softmax"),
 }
 
 
@@ -123,9 +107,7 @@ def coerce_elementwise_impl(v: str | ElementwiseImpl) -> ElementwiseImpl:
     ``UnaryElementwiseImpl(name)``. numpy's ufunc ``nin`` metadata makes
     the attempt self-selecting — binary ops like ``add`` (nin=2) pass
     the binary check, unary ops like ``exp`` (nin=1) raise in the binary
-    constructor and land in the unary one. For stub callables without
-    ``nin`` (the fused frontend names), binary wins by default; arity is
-    informational only since those never evaluate.
+    constructor and land in the unary one.
     """
     if isinstance(v, ElementwiseImpl):
         return v
