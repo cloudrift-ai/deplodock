@@ -260,7 +260,7 @@ def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str)
     Loops — important when the reduce body contains a nested free loop
     that does the actual load)."""
     return {
-        (s.source, dim)
+        (s.input, dim)
         for s in iter_body(body)
         if isinstance(s, Load)
         for dim, e in enumerate(s.index)

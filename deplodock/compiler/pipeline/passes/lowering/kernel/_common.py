@@ -105,7 +105,7 @@ def emit_stmt(s, ctx: Ctx, out: list[Stmt]) -> None:
     Loops directly so this walker doesn't need a strategy hook).
     """
     if isinstance(s, Load):
-        buf_name = s.source
+        buf_name = s.input
         src_shape = ctx.buffer_shape(buf_name)
         coords = [substitute(e, _env_with_values(ctx)) for e in s.index]
         flat = _flatten_coords(coords, src_shape)

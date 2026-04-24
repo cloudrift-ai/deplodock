@@ -52,9 +52,9 @@ def execute_loop_op(
             assert isinstance(stmt.op, ElementwiseImpl)
             values[stmt.name] = stmt.op(*_align_ranks(args))
         elif isinstance(stmt, Load):
-            if stmt.source not in input_arrays:
-                raise ValueError(f"Load source {stmt.source!r} not found in input_arrays (have {sorted(input_arrays)})")
-            values[stmt.name] = _apply_load_index(stmt.index, input_arrays[stmt.source], loop.axes, values)
+            if stmt.input not in input_arrays:
+                raise ValueError(f"Load source {stmt.input!r} not found in input_arrays (have {sorted(input_arrays)})")
+            values[stmt.name] = _apply_load_index(stmt.index, input_arrays[stmt.input], loop.axes, values)
         elif isinstance(stmt, Accum):
             acc = acc_map[stmt.name]
             src = values[stmt.value]

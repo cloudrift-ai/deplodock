@@ -133,7 +133,7 @@ def _output_numel(loop_op: LoopOp) -> int:
 
 def _count_loads_from(consumer_op: LoopOp, producer_buf: str) -> int:
     """Number of ``Load`` stmts in the consumer body reading producer's output buffer."""
-    return sum(1 for ld in consumer_op.loads if ld.source == producer_buf)
+    return sum(1 for ld in consumer_op.loads if ld.input == producer_buf)
 
 
 PATTERN = [

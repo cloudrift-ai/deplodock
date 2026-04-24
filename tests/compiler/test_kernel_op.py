@@ -122,7 +122,7 @@ def _loop(*, axes=(), inputs=(), body=()):
             fresh_counter[0] += 1
             name = f"in{src}_{fresh_counter[0]}"
             local_loads[src] = name
-            extra_loads.append(Load(name=name, source=f"src_{src}", index=index_of[src]))
+            extra_loads.append(Load(name=name, input=f"src_{src}", index=index_of[src]))
             return name
 
         result: list = []
@@ -177,7 +177,7 @@ def test_load_stmt_binding():
             Loop(
                 axis=Axis("a0", 4),
                 body=(
-                    Load("x_val", source="src_0", index=(Var("a0"),)),
+                    Load("x_val", input="src_0", index=(Var("a0"),)),
                     Assign("y", ElementwiseOp("negative"), ("x_val",)),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
@@ -186,7 +186,7 @@ def test_load_stmt_binding():
     )
     loads = k.loads
     # rename_ssa_sequential canonicalizes Load names to in0, in1, ...
-    assert len(loads) == 1 and loads[0].name == "in0" and loads[0].source == "src_0"
+    assert len(loads) == 1 and loads[0].name == "in0" and loads[0].input == "src_0"
     assert k.num_inputs == 1
 
 
@@ -197,8 +197,8 @@ def test_load_stmt_multiple_sources():
             Loop(
                 axis=Axis("a0", 4),
                 body=(
-                    Load("a", source="src_0", index=(Var("a0"),)),
-                    Load("b", source="src_2", index=(Var("a0"),)),
+                    Load("a", input="src_0", index=(Var("a0"),)),
+                    Load("b", input="src_2", index=(Var("a0"),)),
                     Assign("y", ElementwiseOp("add"), ("a", "b")),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
@@ -222,7 +222,7 @@ def test_update_synthesizes_accum_decl():
                     Loop(
                         axis=Axis("k", 8),
                         body=(
-                            Load("x_val", source="src_0", index=(Var("row"), Var("k"))),
+                            Load("x_val", input="src_0", index=(Var("row"), Var("k"))),
                             Accum(name="acc", value="x_val", op="add"),
                         ),
                     ),
@@ -549,7 +549,7 @@ def _nested_reduce_kernel() -> LoopOp:
                     Loop(
                         axis=Axis("k", 8),
                         body=(
-                            Load(name="x_k", source="src_0", index=(Var("a0"), Var("k"))),
+                            Load(name="x_k", input="src_0", index=(Var("a0"), Var("k"))),
                             Accum(name="acc", value="x_k", op="add"),
                         ),
                     ),

@@ -184,7 +184,7 @@ def splice_graph(graph) -> tuple[LoopOp, list[str]] | None:
     for nid in loop_ids:
         node_op = loops[nid]
         for ld in node_op.loads:
-            inp = ld.source
+            inp = ld.input
             # A Load is a splice edge if its source buf names another LoopOp node;
             # otherwise it's an external input. We key edges off the buf name
             # (Load.source is now the producing node's id), not a positional
@@ -292,7 +292,7 @@ class _Splicer(LoopBuilder):
         stmt = self.loops[d.origin].defs[d.name]
 
         if isinstance(stmt, Load):
-            edge = self.splice_edges.get((d.origin, stmt.source))
+            edge = self.splice_edges.get((d.origin, stmt.input))
             if edge is not None:
                 target_tag, target_output_buf = edge
                 self._resolve_splice_load(stmt, d, target_tag, target_output_buf)
@@ -316,7 +316,7 @@ class _Splicer(LoopBuilder):
         """A Load that isn't a splice edge — keep its buf name as-is (buf
         identity is global across kernels), σ-sub the index, emit."""
         new_index = tuple(d.sigma.apply(e) for e in stmt.index)
-        self.insert(Load(name=d.bound_as, source=stmt.source, index=new_index), d.demand_scope)
+        self.insert(Load(name=d.bound_as, input=stmt.input, index=new_index), d.demand_scope)
 
     def _resolve_splice_load(self, stmt: Load, d: _Demand, target_tag: str, target_output_buf: str) -> None:
         """A Load that's a splice edge to another registered loop — emit a

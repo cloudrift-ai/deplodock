@@ -127,14 +127,14 @@ class Load(Stmt):
     """
 
     name: str
-    source: str
+    input: str
     index: tuple[Expr, ...]
 
     def deps(self) -> tuple[str, ...]:
         return ()
 
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
-        return Load(name=rename_ssa(self.name), source=self.source, index=tuple(sigma.apply(e) for e in self.index))
+        return Load(name=rename_ssa(self.name), input=self.input, index=tuple(sigma.apply(e) for e in self.index))
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +374,8 @@ class LoopOp(Op):
         """
         seen: dict[str, None] = {}
         for ld in self.loads:
-            if ld.source not in seen:
-                seen[ld.source] = None
+            if ld.input not in seen:
+                seen[ld.input] = None
         return tuple(seen.keys())
 
     @property
@@ -620,7 +620,7 @@ def _render_body(
             lines.append(f"{indent}{stmt.name} = {stmt.op.name}({args})")
         elif isinstance(stmt, Load):
             idx = ", ".join(render_expr(e) for e in stmt.index)
-            lines.append(f"{indent}{stmt.name} = load {stmt.source}[{idx}]")
+            lines.append(f"{indent}{stmt.name} = load {stmt.input}[{idx}]")
         elif isinstance(stmt, Accum):
             lines.append(f"{indent}{stmt.name} <- {stmt.op.name}({stmt.name}, {stmt.value})")
         elif isinstance(stmt, Write):
@@ -693,8 +693,8 @@ def _validate(loop: LoopOp) -> None:
             elif isinstance(stmt, Load):
                 # Load is a binding site — introduces its SSA name. ``source``
                 # is the producing graph node's id.
-                if not isinstance(stmt.source, str) or not stmt.source:
-                    raise ValueError(f"Load {stmt.name!r}: source {stmt.source!r} must be a non-empty string")
+                if not isinstance(stmt.input, str) or not stmt.input:
+                    raise ValueError(f"Load {stmt.name!r}: source {stmt.input!r} must be a non-empty string")
                 if stmt.name in defined:
                     raise ValueError(f"Load {stmt.name!r}: name already defined")
                 defined.add(stmt.name)

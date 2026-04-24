@@ -51,8 +51,8 @@ def _pointwise_add_loop_op() -> LoopOp:
                     Loop(
                         axis=a1,
                         body=(
-                            Load("ax", source="src_0", index=(ExprVar("a0"), ExprVar("a1"))),
-                            Load("bx", source="src_1", index=(ExprVar("a0"), ExprVar("a1"))),
+                            Load("ax", input="src_0", index=(ExprVar("a0"), ExprVar("a1"))),
+                            Load("bx", input="src_1", index=(ExprVar("a0"), ExprVar("a1"))),
                             Assign("y", ElementwiseOp("add"), ("ax", "bx")),
                             Write(output="out_0", index=(ExprVar("a0"), ExprVar("a1")), value="y"),
                         ),
@@ -119,7 +119,7 @@ def _row_sum_loop_op() -> LoopOp:
                     Loop(
                         axis=k,
                         body=(
-                            Load("x", source="src_0", index=(ExprVar("a0"), ExprVar("a1"))),
+                            Load("x", input="src_0", index=(ExprVar("a0"), ExprVar("a1"))),
                             Accum(name="s", value="x", op="add"),
                         ),
                     ),
@@ -185,14 +185,14 @@ def _softmax_like_loop_op() -> LoopOp:
                     Loop(
                         axis=k,
                         body=(
-                            Load("xk", source="src_0", index=(ExprVar("a0"), ExprVar("a1"))),
+                            Load("xk", input="src_0", index=(ExprVar("a0"), ExprVar("a1"))),
                             Accum(name="m", value="xk", op="maximum"),
                         ),
                     ),
                     Loop(
                         axis=k,
                         body=(
-                            Load("xk2", source="src_0", index=(ExprVar("a0"), ExprVar("a1"))),
+                            Load("xk2", input="src_0", index=(ExprVar("a0"), ExprVar("a1"))),
                             Assign("d", ElementwiseOp("subtract"), ("xk2", "m")),
                             Assign("e", ElementwiseOp("exp"), ("d",)),
                             Accum(name="s", value="e", op="add"),
@@ -201,7 +201,7 @@ def _softmax_like_loop_op() -> LoopOp:
                     Loop(
                         axis=j,
                         body=(
-                            Load("xj", source="src_0", index=(ExprVar("a0"), ExprVar("a2"))),
+                            Load("xj", input="src_0", index=(ExprVar("a0"), ExprVar("a2"))),
                             Assign("dj", ElementwiseOp("subtract"), ("xj", "m")),
                             Assign("ej", ElementwiseOp("exp"), ("dj",)),
                             Assign("y", ElementwiseOp("divide"), ("ej", "s")),
@@ -268,8 +268,8 @@ def _matmul_loop_op() -> LoopOp:
                             Loop(
                                 axis=k,
                                 body=(
-                                    Load("a", source="src_0", index=(ExprVar("a0"), ExprVar("a2"))),
-                                    Load("b", source="src_1", index=(ExprVar("a2"), ExprVar("a1"))),
+                                    Load("a", input="src_0", index=(ExprVar("a0"), ExprVar("a2"))),
+                                    Load("b", input="src_1", index=(ExprVar("a2"), ExprVar("a1"))),
                                     Assign("p", ElementwiseOp("multiply"), ("a", "b")),
                                     Accum(name="c", value="p", op="add"),
                                 ),
@@ -334,11 +334,11 @@ def _scalar_prologue_loop_op() -> LoopOp:
     a0 = Axis("a0", 4)
     return LoopOp(
         body=(
-            Load("eps", source="src_1", index=()),
+            Load("eps", input="src_1", index=()),
             Loop(
                 axis=a0,
                 body=(
-                    Load("x", source="src_0", index=(ExprVar("a0"),)),
+                    Load("x", input="src_0", index=(ExprVar("a0"),)),
                     Assign("y", ElementwiseOp("add"), ("x", "eps")),
                     Write(output="out_0", index=(ExprVar("a0"),), value="y"),
                 ),

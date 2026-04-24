@@ -115,7 +115,7 @@ def _lower_stmt(s: LoopStmt, ctx: _Ctx) -> list[Stmt]:
     if isinstance(s, Loop):
         return [_lower_loop(s, ctx)]
     if isinstance(s, Load):
-        return [Let(s.name, Index(s.source, tuple(s.index)))]
+        return [Let(s.name, Index(s.input, tuple(s.index)))]
     if isinstance(s, Assign):
         args = [Var(a) for a in s.args]
         return [Let(s.name, _op_to_expr(s.op.name, args))]

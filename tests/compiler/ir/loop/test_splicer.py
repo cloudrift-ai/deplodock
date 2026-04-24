@@ -67,7 +67,7 @@ def test_pointwise_chain():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source="src_0", index=(Var("a0"),)),
+                    Load(name="x", input="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
@@ -79,7 +79,7 @@ def test_pointwise_chain():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="yv", source="src_0", index=(Var("a0"),)),
+                    Load(name="yv", input="src_0", index=(Var("a0"),)),
                     Assign(name="z", op="add", args=("yv", "yv")),
                     Write(output="out_0", index=(Var("a0"),), value="z"),
                 ),
@@ -96,7 +96,7 @@ def test_pointwise_chain():
     # Producer's Load (consumer had no other inputs) survives as source 0.
     loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
     assert len(loads) == 1
-    assert loads[0].source == "src_0"
+    assert loads[0].input == "src_0"
     # Single Write, referencing the final add.
     writes = [s for s in iter_body(merged.body) if isinstance(s, Write)]
     assert len(writes) == 1
@@ -114,7 +114,7 @@ def test_shared_intermediate_deduped():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source="src_0", index=(Var("a0"),)),
+                    Load(name="x", input="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
@@ -127,8 +127,8 @@ def test_shared_intermediate_deduped():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="ya", source="src_0", index=(Var("a0"),)),
-                    Load(name="yb", source="src_0", index=(Var("a0"),)),
+                    Load(name="ya", input="src_0", index=(Var("a0"),)),
+                    Load(name="yb", input="src_0", index=(Var("a0"),)),
                     Assign(name="z", op="add", args=("ya", "yb")),
                     Write(output="out_0", index=(Var("a0"),), value="z"),
                 ),
@@ -161,7 +161,7 @@ def test_different_indices_emit_twice():
                     Loop(
                         axis=A1_same,
                         body=(
-                            Load(name="x", source="src_0", index=(Var("a0"), Var("a1"))),
+                            Load(name="x", input="src_0", index=(Var("a0"), Var("a1"))),
                             Assign(name="y", op="exp", args=("x",)),
                             Write(output="out_0", index=(Var("a0"), Var("a1")), value="y"),
                         ),
@@ -179,8 +179,8 @@ def test_different_indices_emit_twice():
                     Loop(
                         axis=A1_same,
                         body=(
-                            Load(name="ya", source="src_0", index=(Var("a0"), Var("a1"))),
-                            Load(name="yb", source="src_0", index=(Var("a1"), Var("a0"))),
+                            Load(name="ya", input="src_0", index=(Var("a0"), Var("a1"))),
+                            Load(name="yb", input="src_0", index=(Var("a1"), Var("a0"))),
                             Assign(name="z", op="add", args=("ya", "yb")),
                             Write(output="out_0", index=(Var("a0"), Var("a1")), value="z"),
                         ),
@@ -211,7 +211,7 @@ def test_reduction_producer():
                     Loop(
                         axis=K,
                         body=(
-                            Load(name="x", source="src_0", index=(Var("a0"), Var("k"))),
+                            Load(name="x", input="src_0", index=(Var("a0"), Var("k"))),
                             Accum(name="s", value="x", op="add"),
                         ),
                     ),
@@ -225,7 +225,7 @@ def test_reduction_producer():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="sv", source="src_0", index=(Var("a0"),)),
+                    Load(name="sv", input="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("sv",)),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
@@ -255,7 +255,7 @@ def test_consumer_extra_input_source_remap():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source="src_0", index=(Var("a0"),)),
+                    Load(name="x", input="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
@@ -267,8 +267,8 @@ def test_consumer_extra_input_source_remap():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="yv", source="src_0", index=(Var("a0"),)),  # from producer
-                    Load(name="b", source="src_1", index=(Var("a0"),)),  # unrelated
+                    Load(name="yv", input="src_0", index=(Var("a0"),)),  # from producer
+                    Load(name="b", input="src_1", index=(Var("a0"),)),  # unrelated
                     Assign(name="z", op="add", args=("yv", "b")),
                     Write(output="out_0", index=(Var("a0"),), value="z"),
                 ),
@@ -280,8 +280,8 @@ def test_consumer_extra_input_source_remap():
     assert merged is not None
     loads = {s.name: s for s in iter_body(merged.body) if isinstance(s, Load)}
     # Producer's Load survives at source 0; consumer's unrelated Load shifts to 1.
-    assert any(ld.source == "src_0" for ld in loads.values())
-    assert any(ld.source == "src_1" for ld in loads.values())
+    assert any(ld.input == "src_0" for ld in loads.values())
+    assert any(ld.input == "src_1" for ld in loads.values())
     assert merged.num_inputs == 2
 
 
@@ -307,7 +307,7 @@ def test_live_axes_computed():
                     Loop(
                         axis=K,
                         body=(
-                            Load(name="x", source="src_0", index=(Var("a0"), Var("k"))),
+                            Load(name="x", input="src_0", index=(Var("a0"), Var("k"))),
                             Accum(name="s", value="x", op="add"),
                         ),
                     ),
@@ -342,7 +342,7 @@ def test_chain_three_loops():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source="X", index=(Var("a0"),)),
+                    Load(name="x", input="X", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
                     Write(output="A", index=(Var("a0"),), value="y"),
                 ),
@@ -354,7 +354,7 @@ def test_chain_three_loops():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="av", source="A", index=(Var("a0"),)),
+                    Load(name="av", input="A", index=(Var("a0"),)),
                     Assign(name="y", op="negative", args=("av",)),
                     Write(output="B", index=(Var("a0"),), value="y"),
                 ),
@@ -366,8 +366,8 @@ def test_chain_three_loops():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="bv", source="B", index=(Var("a0"),)),
-                    Load(name="bias", source="BIAS", index=(Var("a0"),)),
+                    Load(name="bv", input="B", index=(Var("a0"),)),
+                    Load(name="bias", input="BIAS", index=(Var("a0"),)),
                     Assign(name="y", op="add", args=("bv", "bias")),
                     Write(output="C", index=(Var("a0"),), value="y"),
                 ),
@@ -387,7 +387,7 @@ def test_chain_three_loops():
     # Two external Loads remain (X, BIAS); the splice edges collapsed into copy aliases.
     loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
     assert len(loads) == 2
-    assert {ld.source for ld in loads} == {"X", "BIAS"}
+    assert {ld.input for ld in loads} == {"X", "BIAS"}
     assert merged.num_inputs == 2
 
 
@@ -404,7 +404,7 @@ def test_multi_output_root_preserves_all_writes():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source="src_0", index=(Var("a0"),)),
+                    Load(name="x", input="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
@@ -418,7 +418,7 @@ def test_multi_output_root_preserves_all_writes():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="yv", source="out_0", index=(Var("a0"),)),
+                    Load(name="yv", input="out_0", index=(Var("a0"),)),
                     Assign(name="z0", op="negative", args=("yv",)),
                     Assign(name="z1", op="abs", args=("yv",)),
                     Write(output="C0", index=(Var("a0"),), value="z0"),
@@ -449,7 +449,7 @@ def test_multi_output_splice_target():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source="X", index=(Var("a0"),)),
+                    Load(name="x", input="X", index=(Var("a0"),)),
                     Assign(name="y0", op="exp", args=("x",)),
                     Assign(name="y1", op="negative", args=("x",)),
                     Write(output="T0", index=(Var("a0"),), value="y0"),
@@ -464,8 +464,8 @@ def test_multi_output_splice_target():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="a", source="T0", index=(Var("a0"),)),
-                    Load(name="b", source="T1", index=(Var("a0"),)),
+                    Load(name="a", input="T0", index=(Var("a0"),)),
+                    Load(name="b", input="T1", index=(Var("a0"),)),
                     Assign(name="z", op="add", args=("a", "b")),
                     Write(output="OUT", index=(Var("a0"),), value="z"),
                 ),
@@ -500,7 +500,7 @@ def test_literal_producer_write_index():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="x", source="src_0", index=(Var("a0"),)),
+                    Load(name="x", input="src_0", index=(Var("a0"),)),
                     Assign(name="y", op="exp", args=("x",)),
                     Write(output="out_0", index=(Var("a0"), Literal(0)), value="y"),
                 ),
@@ -512,7 +512,7 @@ def test_literal_producer_write_index():
             Loop(
                 axis=A0,
                 body=(
-                    Load(name="yv", source="src_0", index=(Var("a0"), Literal(0))),
+                    Load(name="yv", input="src_0", index=(Var("a0"), Literal(0))),
                     Assign(name="z", op="negative", args=("yv",)),
                     Write(output="out_0", index=(Var("a0"),), value="z"),
                 ),

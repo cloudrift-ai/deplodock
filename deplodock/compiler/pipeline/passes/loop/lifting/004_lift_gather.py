@@ -43,8 +43,8 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     out_buf = f"kernel_{nid}"
     inner: tuple[Stmt, ...] = (
-        Load(name="idx", source=idx_id, index=idx_index),
-        Load(name="data", source=data_id, index=data_index),
+        Load(name="idx", input=idx_id, index=idx_index),
+        Load(name="data", input=data_id, index=data_index),
         Write(output=out_buf, index=tuple(Var(a.name) for a in axes), value="data"),
     )
     body: tuple[Stmt, ...] = inner
