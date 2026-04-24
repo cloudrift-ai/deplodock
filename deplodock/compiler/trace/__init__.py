@@ -8,6 +8,6 @@ Two modules:
   ``trace_module_with_constants``, ``has_torch``.
 - :mod:`.huggingface` — thin ``nn.Module`` adapter that makes HF
   ``CausalLM`` models trace-clean (precomputed causal mask,
-  short-circuits HF's dynamic mask builder). Entry points:
-  ``build_full_model_wrapper``, ``collect_const_feed``.
+  short-circuits HF's dynamic mask builder). Entry point:
+  ``build_full_model_wrapper``.
 """

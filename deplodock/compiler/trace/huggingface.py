@@ -11,34 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import numpy as np
     import torch.nn as nn
-
-
-def collect_const_feed(module: nn.Module, const_targets: dict[str, str]) -> dict[str, np.ndarray]:
-    """Build a feed dict for every graph constant from the tracer.
-
-    ``const_targets`` maps each placeholder name (e.g. ``p_attn_q_proj_weight``)
-    to its dotted attribute path on ``module`` (e.g.
-    ``self_attn.q_proj.weight``). That mapping is produced by
-    ``trace_module_with_constants`` and is authoritative — ``torch.export``
-    may drop prefixes like ``self_`` when naming placeholders, which
-    string-only name mangling cannot reconstruct.
-
-    Values are flattened float32 arrays; integer buffers round-trip
-    through float without loss for values below 2**24.
-    """
-    import numpy as np
-
-    state = dict(module.named_parameters())
-    state.update(dict(module.named_buffers()))
-    feed: dict[str, np.ndarray] = {}
-    for placeholder_name, attr_path in const_targets.items():
-        t = state.get(attr_path)
-        if t is None:
-            raise KeyError(f"constant {placeholder_name!r} -> {attr_path!r} not found on module")
-        feed[placeholder_name] = t.detach().cpu().float().numpy().astype(np.float32).flatten()
-    return feed
 
 
 def build_full_model_wrapper(model, seq_len: int, dtype) -> nn.Module:

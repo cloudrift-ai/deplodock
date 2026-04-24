@@ -24,7 +24,7 @@ stamp the output tensor.
 HuggingFace `CausalLM` models build their causal attention mask
 dynamically at forward time (`arange` → `cumsum` → `triu` → `eq` …),
 which pollutes the traced FX graph with dozens of mask-construction
-ops. Two helpers clean this up:
+ops. One helper cleans this up:
 
 - `build_full_model_wrapper(model, seq_len, dtype) → nn.Module` wraps
   the HF model in a module exposing `forward(input_ids) → logits`.
@@ -32,13 +32,6 @@ ops. Two helpers clean this up:
   `position_ids` as buffers and monkey-patches HF's internal mask
   builders (`_update_causal_mask` / `_prepare_4d_causal_attention_mask`)
   to return the precomputed mask verbatim.
-- `collect_const_feed(module, const_targets) → dict[placeholder →
-  ndarray]` materializes every graph constant (weights + buffers) keyed
-  by the tracer's placeholder name, using the authoritative
-  `placeholder_name → attr_path` map from
-  `trace_module_with_constants`. Needed because `torch.export` may drop
-  prefixes when naming placeholders, so string-only name mangling
-  can't reconstruct the mapping.
 
 ## Entry points
 

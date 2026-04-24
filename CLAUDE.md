@@ -48,8 +48,6 @@ Or for a specific test file:
 - `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
 - `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
-- `deplodock run <ir_file> [--benchmark] [--dump-dir DIR]` — run a compiled graph IR through the full pipeline. With `--benchmark`, logs top-N per-kernel GPU-event times; `--dump-dir` stores them under `per_launch` in `60_benchmark.json`, inherited by `bench` via `DEPLODOCK_DUMP_DIR`.
-- `deplodock run <model_id> "<prompt>" [--max-new-tokens N] [--seq-len N]` — trace + compile a full HF CausalLM and greedy-decode from the prompt.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 7B): `Qwen/Qwen2.5-7B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

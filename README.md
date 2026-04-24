@@ -25,7 +25,6 @@ Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLa
     - [pull.py](deplodock/commands/pull.py) — `pull` command (download HF model)
     - [trace.py](deplodock/commands/trace.py) — `trace` command (PyTorch → Graph IR)
     - [compile.py](deplodock/commands/compile.py) — `compile` command (decomposition → optimization → fusion on the Graph)
-    - [run.py](deplodock/commands/run.py) — `run` command (compile + dispatch, optionally with a prompt for CausalLM generation)
     - [inspect_graph.py](deplodock/commands/inspect_graph.py) — `inspect` command (graph summary)
   - [compiler/](deplodock/compiler/) — PyTorch → Graph IR → CUDA compiler (see [ARCHITECTURE.md](deplodock/compiler/ARCHITECTURE.md))
     - [graph.py](deplodock/compiler/graph.py) — `Graph`, `Node`, `Tensor`, `Hints` container
