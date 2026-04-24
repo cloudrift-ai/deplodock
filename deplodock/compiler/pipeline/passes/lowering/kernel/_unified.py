@@ -1,169 +1,58 @@
-"""Unified emit skeleton — replaces Strategy A for pointwise / per-row reduce.
+"""Unified emit skeleton — recursive walk over the LoopOp body.
 
-Two shapes, one function shape:
+One ``emit_body`` function handles every shape (pointwise, RMSNorm, softmax,
+matmul, SDPA's flash-style nested-reduce-in-output-loop) by recursing on the
+body tree. At each statement:
 
-- **pointwise** (``|live|=0``): flat tid over every free axis; one thread per
-  output element. No smem, no syncs.
-- **per_row_reduce** (``|live|=1``): flat tid over the live axis only; one
-  thread per output row. Each thread runs every reduce block serially (k is
-  serial per thread), then iterates the output axis serially, emitting the
-  output_chain and Write for each element.
+- ``Loop`` containing an ``Accum`` → reduce block: declare a register
+  accumulator, emit ``for (k = 0; k < extent; ++k) { body }``, the inner
+  ``Accum`` folds.
+- ``Loop`` without ``Accum`` → free Loop: if its axis is bound to a thread
+  coord (in ``live_axes``) the for-loop is elided and the body is inlined;
+  otherwise emit a serial ``for (v = 0; v < extent; ++v) { body }``.
+- Leaf ``Load`` / ``Assign`` / ``Select`` / ``Write`` / ``Accum`` → render
+  through ``_common.emit_stmt``.
 
-Deferred (still falls through via classifier returning ``None``): matmul
-(``|live|=2``, handled by the annotated template), multi-live-axis
-reductions, non-matching live-axis sets across accums, K-split.
-
-Reuses ``_common.emit_stmt`` for Load / Assign / Select / Write / Accum
-rendering so the generated CUDA is byte-identical to what the legacy
-emitter produced for the same body.
+Live axes are the outer free-Loop chain that wraps every reduce. Each thread
+binds these axes from the flat tid; everything below runs serially per
+thread. K is serial per thread, so no cross-thread combine is needed
+(split-K is a follow-up that would specialize this skeleton).
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Expr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import ForLoop, GpuKernel, IfStmt, Stmt, VarDecl
-from deplodock.compiler.ir.loop import Accum, Axis
-from deplodock.compiler.ir.loop import Loop as IrLoop
-from deplodock.compiler.pipeline.passes.lowering.kernel._classify import ReduceBlock, UnifiedSig, _parse_reduce_block
+from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp
+from deplodock.compiler.ir.loop import Stmt as LoopStmt
 from deplodock.compiler.pipeline.passes.lowering.kernel._common import (
     BLOCK,
     Ctx,
     axis_env_for_flat,
     build_params,
     emit_stmt,
-    emit_stmts,
     numel_axes,
 )
 
 
-def emit_unified(
-    node: Node, kernel_name: str, graph: Graph, sig: UnifiedSig
-) -> tuple[GpuKernel, list[str], tuple[int, int, int], tuple[int, int, int]]:
+def emit_unified(node: Node, kernel_name: str, graph: Graph) -> tuple[GpuKernel, list[str], tuple[int, int, int], tuple[int, int, int]]:
     params, arg_order = build_params(node)
-    if sig.kind == "pointwise":
-        body, grid, block = _emit_pointwise(node, graph, sig)
-    elif sig.kind == "per_row_reduce":
-        body, grid, block = _emit_per_row_reduce(node, graph, sig)
-    else:
-        raise NotImplementedError(f"unified emit: shape {sig.kind!r} not supported")
-    kd = GpuKernel(name=kernel_name, params=params, body=body, block_size=block)
-    return kd, arg_order, grid, block
+    loop: LoopOp = node.op
 
+    top_level, leaf_body, live_axes = _split_outer(loop.body)
 
-# ---------------------------------------------------------------------------
-# Pointwise: one thread per output element
-# ---------------------------------------------------------------------------
-
-
-def _emit_pointwise(node: Node, graph: Graph, sig: UnifiedSig) -> tuple[list[Stmt], tuple[int, int, int], tuple[int, int, int]]:
-    free_axes = sig.free_axes
-    n_threads = numel_axes(free_axes)
-    grid = (max((n_threads + BLOCK - 1) // BLOCK, 1), 1, 1)
-    block = (BLOCK, 1, 1)
-    tid = Var("tid")
-    ctx = Ctx(graph=graph, node=node, env=axis_env_for_flat(free_axes, tid))
-
-    top_level = emit_stmts(sig.top_level, ctx)
-    body_stmts = emit_stmts(sig.output_chain, ctx)
-
-    return _wrap_with_tid_guard(n_threads, [*top_level, *body_stmts]), grid, block
-
-
-# ---------------------------------------------------------------------------
-# Per-row reduce: one thread per live-axis tuple
-# ---------------------------------------------------------------------------
-
-
-def _emit_per_row_reduce(node: Node, graph: Graph, sig: UnifiedSig) -> tuple[list[Stmt], tuple[int, int, int], tuple[int, int, int]]:
-    live_axes = sig.live_axes
-    assert len(live_axes) >= 1, "per_row_reduce expects at least one live axis"
     n_threads = numel_axes(live_axes)
     grid = (max((n_threads + BLOCK - 1) // BLOCK, 1), 1, 1)
     block = (BLOCK, 1, 1)
-    tid = Var("tid")
-    ctx = Ctx(graph=graph, node=node, env=axis_env_for_flat(live_axes, tid))
+    ctx = Ctx(graph=graph, node=node, env=axis_env_for_flat(live_axes, Var("tid")))
 
-    body: list[Stmt] = emit_stmts(sig.top_level, ctx)
-    body.extend(emit_stmts(sig.pre_reduce, ctx))
-    for block_idx, rb in enumerate(sig.reduce_blocks):
-        body.extend(_emit_reduce_block(rb, ctx, block_idx))
-    body.extend(emit_stmts(sig.interlude, ctx))
-    if sig.output_axis is None:
-        # No output Loop — emit the single Write (and any chain stmts) directly.
-        body.extend(emit_stmts(sig.output_chain, ctx))
-    else:
-        body.append(_emit_output_loop(sig.output_axis, sig.output_chain, ctx))
+    body: list[Stmt] = [emit_stmt_with_loop(s, ctx) for s in top_level]
+    body = _flatten(body)
+    inner = emit_body(leaf_body, ctx)
 
-    return _wrap_with_tid_guard(n_threads, body), grid, block
-
-
-def _emit_reduce_block(rb: ReduceBlock, ctx: Ctx, block_idx: int) -> list[Stmt]:
-    """Declare the accumulator, emit ``for (k = 0; k < extent; ++k) { body }``.
-
-    The single Accum inside the block folds into the declared register; its
-    binding survives in ``ctx.values`` so interlude / output chain can read it.
-    """
-    acc = rb.accum
-    acc_var = f"acc{block_idx}"
-    identity = acc.op.identity if acc.op.identity is not None else 0.0
-    ctx.values[acc.name] = Var(acc_var)
-
-    k_name = f"k{ctx.loop_seq[0]}"
-    ctx.loop_seq[0] += 1
-    saved_env = dict(ctx.env)
-    saved_values = dict(ctx.values)
-    ctx.env[rb.axis.name] = Var(k_name)
-    inner: list[Stmt] = []
-    for s in rb.body_stmts:
-        emit_stmt(s, ctx, inner)
-    ctx.env = saved_env
-    saved_values[acc.name] = Var(acc_var)
-    ctx.values = saved_values
-
-    return [
-        VarDecl(dtype="float", name=acc_var, init=Literal(identity, "float")),
-        ForLoop(var=k_name, start=Literal(0, "int"), end=Literal(int(rb.axis.extent), "int"), body=inner),
-    ]
-
-
-def _emit_output_loop(axis: Axis, chain: tuple, ctx: Ctx) -> Stmt:
-    """``for (out = 0; out < extent; ++out) { chain... }`` — chain ends with Write.
-
-    Chain stmts may include nested reduce Loops (flash-style fused matmul
-    in the output pass); those become per-iteration inner reductions.
-    """
-    loop_name = f"o{ctx.loop_seq[0]}"
-    ctx.loop_seq[0] += 1
-    saved_env = dict(ctx.env)
-    saved_values = dict(ctx.values)
-    ctx.env[axis.name] = Var(loop_name)
-    inner = _emit_chain(chain, ctx)
-    ctx.env = saved_env
-    ctx.values = saved_values
-    return ForLoop(var=loop_name, start=Literal(0, "int"), end=Literal(int(axis.extent), "int"), body=inner)
-
-
-def _emit_chain(stmts: tuple, ctx: Ctx) -> list[Stmt]:
-    """Walk a chain that may contain leaf stmts and nested reduce Loops.
-
-    Per-iteration inner reductions (SDPA's matmul-after-softmax) get a
-    fresh accumulator and a serial ``for k`` body.
-    """
-    out: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, IrLoop) and any(isinstance(x, Accum) for x in s.body):
-            blk = _parse_reduce_block(s)
-            assert blk is not None, "classifier should have rejected unparseable reduce Loop"
-            out.extend(_emit_reduce_block(blk, ctx, ctx.loop_seq[0]))
-        else:
-            emit_stmt(s, ctx, out)
-    return out
-
-
-def _wrap_with_tid_guard(n_threads: int, body: list[Stmt]) -> list[Stmt]:
-    tid = Var("tid")
-    return [
+    stmts: list[Stmt] = [
+        *body,
         VarDecl(
             dtype="long long",
             name="tid",
@@ -173,8 +62,141 @@ def _wrap_with_tid_guard(n_threads: int, body: list[Stmt]) -> list[Stmt]:
                 Builtin("thread_idx.x"),
             ),
         ),
-        IfStmt(cond=BinaryExpr("<", tid, Literal(n_threads, "int")), body=body),
+        IfStmt(cond=BinaryExpr("<", Var("tid"), Literal(n_threads, "int")), body=inner),
     ]
+    return GpuKernel(name=kernel_name, params=params, body=stmts, block_size=block), arg_order, grid, block
+
+
+# ---------------------------------------------------------------------------
+# Outer-chain split
+# ---------------------------------------------------------------------------
+
+
+def _split_outer(body: tuple[LoopStmt, ...]) -> tuple[tuple[LoopStmt, ...], tuple[LoopStmt, ...], tuple[Axis, ...]]:
+    """Pull off scalar top-level stmts and walk the outer free-Loop chain.
+
+    Returns ``(top_level, leaf_body, live_axes)``:
+    - ``top_level``: leading non-Loop stmts (typically scalar Loads — must
+      not reference any axis Var).
+    - ``leaf_body``: the body after descending through the outer free-Loop
+      chain. Stops at a level that is non-trivial (has Accum, Write, multiple
+      sibling Loops, or a reduce Loop).
+    - ``live_axes``: the axes of the descended free Loops, in order.
+    """
+    top: list[LoopStmt] = []
+    rest: tuple[LoopStmt, ...] = body
+    while rest and not isinstance(rest[0], Loop):
+        top.append(rest[0])
+        rest = rest[1:]
+    if any(isinstance(s, Loop) for s in rest[1:]):
+        # multiple top-level Loops — leaf is the original body
+        return tuple(top), rest, ()
+
+    cur = rest
+    live: list[Axis] = []
+    while True:
+        loops = [s for s in cur if isinstance(s, Loop)]
+        if len(loops) != 1:
+            return tuple(top), cur, tuple(live)
+        only = loops[0]
+        if any(isinstance(x, Accum) for x in only.body):
+            return tuple(top), cur, tuple(live)
+        if any(isinstance(s, (Accum,)) for s in cur):
+            return tuple(top), cur, tuple(live)
+        # Single non-reduce Loop, no Accum at this level — descend.
+        live.append(only.axis)
+        cur = only.body
+
+
+# ---------------------------------------------------------------------------
+# Recursive body walk
+# ---------------------------------------------------------------------------
+
+
+def emit_body(stmts: tuple[LoopStmt, ...], ctx: Ctx) -> list[Stmt]:
+    out: list[Stmt] = []
+    for s in stmts:
+        emitted = emit_stmt_with_loop(s, ctx)
+        if isinstance(emitted, list):
+            out.extend(emitted)
+        else:
+            out.append(emitted)
+    return out
+
+
+def emit_stmt_with_loop(s: LoopStmt, ctx: Ctx) -> Stmt | list[Stmt]:
+    """Dispatch one Loop-IR stmt. Loops route to reduce / free handlers;
+    everything else is rendered via ``_common.emit_stmt`` (which expects
+    an ``out`` list, so we adapt by buffering)."""
+    if isinstance(s, Loop):
+        if any(isinstance(x, Accum) for x in s.body):
+            return _emit_reduce_loop(s, ctx)
+        return _emit_free_loop(s, ctx)
+    buf: list[Stmt] = []
+    emit_stmt(s, ctx, buf)
+    return buf
+
+
+def _emit_reduce_loop(loop: Loop, ctx: Ctx) -> list[Stmt]:
+    """Declare register accumulator, emit serial for-loop, fold inside.
+
+    Multiple ``Accum`` stmts in one Loop body are allowed (rare); each gets
+    its own register. The accumulator binding survives in ``ctx.values``
+    after this function returns so downstream stmts can read it.
+    """
+    accums = [s for s in loop.body if isinstance(s, Accum)]
+    decls: list[Stmt] = []
+    for a in accums:
+        if a.name in ctx.values:
+            continue  # multiple Accums targeting the same name (e.g. softmax draft)
+        acc_var = ctx.fresh()
+        identity = a.op.identity if a.op.identity is not None else 0.0
+        decls.append(VarDecl(dtype="float", name=acc_var, init=Literal(identity, "float")))
+        ctx.values[a.name] = Var(acc_var)
+
+    k_name = f"k{ctx.loop_seq[0]}"
+    ctx.loop_seq[0] += 1
+    saved_env = dict(ctx.env)
+    ctx.env[loop.axis.name] = Var(k_name)
+    inner = emit_body(loop.body, ctx)
+    ctx.env = saved_env
+
+    return [
+        *decls,
+        ForLoop(var=k_name, start=Literal(0, "int"), end=Literal(int(loop.axis.extent), "int"), body=inner),
+    ]
+
+
+def _emit_free_loop(loop: Loop, ctx: Ctx) -> list[Stmt]:
+    """Free Loop: bound axis → inline body; unbound axis → serial for-loop."""
+    if loop.axis.name in ctx.env:
+        return emit_body(loop.body, ctx)
+    name = f"o{ctx.loop_seq[0]}"
+    ctx.loop_seq[0] += 1
+    saved_env = dict(ctx.env)
+    ctx.env[loop.axis.name] = Var(name)
+    inner = emit_body(loop.body, ctx)
+    ctx.env = saved_env
+    return [ForLoop(var=name, start=Literal(0, "int"), end=Literal(int(loop.axis.extent), "int"), body=inner)]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _flatten(items: list[Stmt | list[Stmt]]) -> list[Stmt]:
+    out: list[Stmt] = []
+    for x in items:
+        if isinstance(x, list):
+            out.extend(x)
+        else:
+            out.append(x)
+    return out
+
+
+# Silence unused-import warnings for symbols re-exported via ctx.
+_ = (Expr, Load)
 
 
 __all__ = ["emit_unified"]

@@ -99,7 +99,7 @@ def test_contraction_emits_matmul():
     compiled = CudaBackend().compile(_matmul_graph())
     source = _cuda_nodes(compiled)[-1].op.kernel_source
     assert "for (int k" in source
-    assert "acc0 +=" in source
+    assert "+=" in source  # accumulator fold (register name is whatever ctx.fresh produced)
 
 
 def test_buffer_roles():

@@ -14,7 +14,6 @@ from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
-from deplodock.compiler.pipeline.passes.lowering.kernel._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.kernel._common import kernel_name_for
 from deplodock.compiler.pipeline.passes.lowering.kernel._emit_matmul import emit_matmul_kernel, is_matmul_annotated
 from deplodock.compiler.pipeline.passes.lowering.kernel._unified import emit_unified
@@ -30,12 +29,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     if is_matmul_annotated(node):
         gpu_kernel, arg_order, grid, block = emit_matmul_kernel(node, kname, graph)
     else:
-        sig = classify(node.op)
-        if sig is None:
-            raise NotImplementedError(
-                f"unified emitter cannot classify LoopOp {match.root_node_id}; add a new shape to _classify or annotate as matmul"
-            )
-        gpu_kernel, arg_order, grid, block = emit_unified(node, kname, graph, sig)
+        gpu_kernel, arg_order, grid, block = emit_unified(node, kname, graph)
     node.op = KernelOp(
         kernel=gpu_kernel,
         kernel_name=kname,
