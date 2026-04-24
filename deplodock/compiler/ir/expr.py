@@ -193,49 +193,32 @@ class Builtin(_ExprOps):
         raise NotImplementedError(f"Builtin {self.name!r} is GPU-only; cannot eval in numpy")
 
 
-_FUNC_CALLS: dict[str, object] = {}
-"""Registered math intrinsics for ``FuncCall.eval``. Populated lazily on first call."""
-
-
-def _load_func_calls() -> dict[str, object]:
-    """One-time load of numpy math intrinsics for FuncCall dispatch."""
-    if _FUNC_CALLS:
-        return _FUNC_CALLS
-    import numpy as np
-
-    _FUNC_CALLS.update(
-        {
-            "expf": np.exp,
-            "exp": np.exp,
-            "rsqrtf": lambda x: 1.0 / np.sqrt(x),
-            "rsqrt": lambda x: 1.0 / np.sqrt(x),
-            "tanhf": np.tanh,
-            "tanh": np.tanh,
-            "fabsf": np.abs,
-            "fabs": np.abs,
-            "fmaxf": np.maximum,
-            "fmax": np.maximum,
-            "fminf": np.minimum,
-            "fmin": np.minimum,
-            "powf": np.power,
-            "pow": np.power,
-        }
-    )
-    return _FUNC_CALLS
-
-
 @dataclass
 class FuncCall(_ExprOps):
-    """Intrinsic / math function call (C-level: expf, fmaxf, etc.)."""
+    """Intrinsic / math function call.
+
+    Kernel IR is backend-neutral: names match numpy's module-level
+    attribute (``exp``, ``tanh``, ``fabs``, ``fmax``, ``fmin``, ``sqrt``,
+    ``pow``, …) so ``FuncCall.eval`` dispatches via ``getattr(np, name)``.
+    The CUDA emitter's ``_translate_intrinsic`` rewrites them to the
+    ``f``-suffixed libm spellings at source-render time. ``rsqrt`` is the
+    one exception — no direct numpy equivalent, so it's folded to
+    ``1 / sqrt(x)``.
+    """
 
     name: str
     args: list[Expr]
 
     def eval(self, env: dict[str, object]) -> object:
-        fn = _load_func_calls().get(self.name)
+        import numpy as np
+
+        vals = [a.eval(env) for a in self.args]
+        if self.name == "rsqrt":
+            return 1.0 / np.sqrt(vals[0])
+        fn = getattr(np, self.name, None)
         if fn is None:
             raise NotImplementedError(f"FuncCall.eval: unknown intrinsic {self.name!r}")
-        return fn(*(a.eval(env) for a in self.args))
+        return fn(*vals)
 
 
 @dataclass

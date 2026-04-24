@@ -35,5 +35,5 @@ matrices:
       - fp16        # Real-world comparison (eager/compile use half + tensor cores)
     seq_len: [32, 128, 512]
     batch: 1
-    iterations: 20
+    iterations: 10
     backends: "eager,compile,deplodock"
