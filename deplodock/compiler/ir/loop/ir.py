@@ -71,12 +71,13 @@ class Scope:
 
 
 class Stmt:
-    """Base class for loop-IR body statements.
+    """Base class for IR body statements.
 
-    Concrete stmts (``Load``, ``Assign``, ``Accum``, ``Select``, ``Write``,
-    ``Loop``) are frozen dataclasses that inherit from this base. Each
-    implements :meth:`deps` — the SSA names the stmt reads — so consumers
-    (splicer, validators) can query dependencies uniformly.
+    Defined here historically; reused by Tile IR (``Block``, ``BoundLoop``,
+    ``Combine``) and Kernel IR (``Enclosure``, ``Smem``, ``Sync``,
+    ``TreeHalve``, ``StridedLoop``). May be promoted to ``ir/stmt.py``
+    if the protocol grows shared methods beyond ``deps`` / ``rewrite`` /
+    ``nested``.
     """
 
     def deps(self) -> tuple[str, ...]:
@@ -93,6 +94,20 @@ class Stmt:
         the names they care about are changed.
         """
         raise NotImplementedError
+
+    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+        """Child statement bodies for tree traversal.
+
+        Default: no children (leaf stmt). Block-structured stmts override
+        to return their body tuple(s) — ``Loop`` returns ``(self.body,)``;
+        ``Cond`` returns ``(self.body, self.else_body)``; ``Block`` /
+        ``Enclosure`` etc. return ``(self.body,)``.
+
+        ``iter_body`` walks all IR layers via this single method — every
+        node knows its own children, so the walker doesn't need to
+        switch on type.
+        """
+        return ()
 
 
 @dataclass(frozen=True)
@@ -272,6 +287,9 @@ class Loop(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
+    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+        return (self.body,)
+
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         """Recursive rewrite: rebuild ``body`` with each child's ``rewrite``.
 
@@ -306,6 +324,9 @@ class Cond(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return tuple(free_vars(self.cond))
+
+    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+        return (self.body, self.else_body)
 
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Cond(
@@ -768,10 +789,13 @@ def _validate(loop: LoopOp) -> None:
 
 
 def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
-    """Yield every ``Stmt`` in ``body`` in pre-order, recursing through
-    ``Loop`` wrappers. ``Loop`` nodes are yielded themselves *and* then
-    their body is walked — callers that want only leaves can filter with
-    ``isinstance`` or use :func:`flatten_body`.
+    """Yield every ``Stmt`` in ``body`` in pre-order, recursing into each
+    stmt's ``nested()`` bodies.
+
+    Works across all IRs (Loop, Tile, Kernel) without type-switching:
+    every block-structured Stmt subclass overrides ``Stmt.nested`` to
+    return its child body tuples, and this walker drives off that
+    method. Callers that want only leaves can filter with ``isinstance``.
 
     The default primitive for collection walks; composes naturally with
     comprehensions and ``any()`` / ``sum()`` without allocating a new
@@ -779,11 +803,8 @@ def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
     """
     for s in body:
         yield s
-        if isinstance(s, Loop):
-            yield from iter_body(s.body)
-        elif isinstance(s, Cond):
-            yield from iter_body(s.body)
-            yield from iter_body(s.else_body)
+        for child_body in s.nested():
+            yield from iter_body(child_body)
 
 
 def map_body(

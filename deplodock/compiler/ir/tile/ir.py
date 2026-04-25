@@ -109,6 +109,9 @@ class Block(Stmt):
     axes: tuple[BoundAxis, ...]
     body: tuple[Stmt, ...]
 
+    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+        return (self.body,)
+
     @property
     def thread_axes(self) -> tuple[Axis, ...]:
         return tuple(ba.axis for ba in self.axes if ba.bind == BIND_THREAD)
@@ -145,6 +148,9 @@ class BoundLoop(Stmt):
     axis: Axis
     body: tuple[Stmt, ...]
     walk: str = WALK_SERIAL
+
+    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+        return (self.body,)
 
     def rewrite(self, rename_ssa, sigma: Sigma = Sigma.IDENTITY):  # type: ignore[override]
         return BoundLoop(
@@ -220,19 +226,10 @@ class TileOp(Op):
 
 
 # ---------------------------------------------------------------------------
-# Tree walk helpers
+# Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
 # ---------------------------------------------------------------------------
 
-
-def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
-    for s in body:
-        yield s
-        if isinstance(s, (Loop, Block, BoundLoop)):
-            yield from iter_body(s.body)
-        elif isinstance(s, Cond):
-            yield from iter_body(s.body)
-            yield from iter_body(s.else_body)
-
+from deplodock.compiler.ir.loop import iter_body  # noqa: E402, F401
 
 __all__ = [
     # Shared expressions (re-exported for convenience)
