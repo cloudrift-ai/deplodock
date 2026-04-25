@@ -9,11 +9,28 @@ this rule is the *structural* step (blockify); operand staging is left to
 inner BoundLoops over m_i, n_i, k_i exist).
 
 **Not yet auto-loaded** — file is prefixed with ``_`` so the engine's
-``_load_rules`` glob skips it. Materialization (``passes/lowering/kernel/
-001_materialize_tile.py``) currently rejects multi-axis ``Stage`` and
-flattens only one ``BIND_BLOCK_STRIDED`` axis into the cooperative thread
-axis; activating this rule requires those extensions. Imported directly by
-unit tests via ``run_rule(graph, _block_matmul.py)``.
+``_load_rules`` glob skips it. Imported directly by unit tests via
+``run_rule(graph, _block_matmul.py)``.
+
+Activation status:
+
+- ✅ Multi-axis ``Stage`` emission (flat-decode StridedLoop) — done.
+- ✅ Matmul-style ``_materialize_cooperative`` branch (output axes
+  promote to ``BIND_THREAD``, body BoundLoops stripped, no
+  ``Cond on tid==0`` Write guard) — done.
+- ✅ Nested-reduce Accum init via ``Init`` Stmt — done.
+- ❌ This rule does not emit ``Stage`` itself. Without staging the
+  blockified kernel reads A/B from global per K iteration — slower than
+  the unblocked version. Either this rule needs to emit Stages, or the
+  ``003_stage_inputs`` rule needs to be generalized to detect operand
+  reuse across the matmul body's cooperative thread tile.
+- ❌ ``_redirect_loads`` matches positions by Var name only; with
+  matmul's affine index positions (``m_o*BM + m_i``) the cache-position
+  matcher misses, so redirected smem reads use wrong indices.
+- ❌ Default tile sizes ``BM=BN=64`` exceed ``BLOCK_SIZE=256`` per-block
+  thread count, requiring per-thread output sub-tiles. Activation
+  initially with ``BM=BN=16`` (one output per thread) is the simplest
+  path.
 
 Pre-rewrite (post ``lower_naive`` of fused matmul ``C = A @ B``)::
 
