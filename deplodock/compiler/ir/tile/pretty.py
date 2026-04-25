@@ -9,7 +9,7 @@ form is inspectable. Handles the Tile-IR schedule vocabulary
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import render as render_expr
-from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, Write
 from deplodock.compiler.ir.tile.ir import (
     Block,
     BoundLoop,

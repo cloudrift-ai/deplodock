@@ -39,7 +39,8 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.loop import (
+from deplodock.compiler.ir.sigma import Sigma
+from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
     Cond,
@@ -47,7 +48,6 @@ from deplodock.compiler.ir.loop import (
     Loop,
     Select,
     SelectBranch,
-    Sigma,
     Stmt,
     Write,
 )
@@ -214,7 +214,7 @@ class KernelOp(Op):
 # Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
 # ---------------------------------------------------------------------------
 
-from deplodock.compiler.ir.loop import iter_body  # noqa: E402, F401
+from deplodock.compiler.ir.stmt import iter_body  # noqa: E402, F401
 
 __all__ = [
     # Shared expressions (re-exported)
