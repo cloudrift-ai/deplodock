@@ -20,6 +20,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, 
 from deplodock.compiler.ir.tile.ir import (
     BoundLoop,
     Combine,
+    Stage,
     Stmt,
     Tile,
     TileOp,
@@ -64,6 +65,11 @@ def _render_stmt(stmt: Stmt, indent: str, lines: list[str], owned_axes: dict[str
         return
     if isinstance(stmt, Combine):
         lines.append(f"{indent}Combine({stmt.name}, op={stmt.op.name})")
+        return
+    if isinstance(stmt, Stage):
+        idx = ", ".join(render_expr(e) for e in stmt.index)
+        axes = ", ".join(f"{ax.name}:{ax.extent}" for ax in stmt.axes)
+        lines.append(f"{indent}Stage({stmt.buf}[{idx}], axes=({axes}))")
         return
 
     # Loop-IR leaves

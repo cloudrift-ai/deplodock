@@ -39,6 +39,7 @@ from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     BoundLoop,
     Combine,
+    Stage,
     Tile,
     TileOp,
 )
@@ -104,24 +105,38 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
     prepended as ``BIND_THREAD``."""
     t_axis = Axis(name="t", extent=BLOCK_SIZE)
     rename: dict[str, str] = {}
+    # buf -> (stage_buf, cache_positions): record Stage redirects so
+    # subsequent Loads of `buf` get rewritten to read from the cached
+    # smem buffer with only the cache-dimension positions of their index.
+    redirects: dict[str, tuple[str, tuple[int, ...]]] = {}
 
-    def renamed(s: Stmt) -> Stmt:
-        if not rename:
-            return s
-        return s.rewrite(lambda n: rename.get(n, n))
+    def transform(s: Stmt) -> Stmt:
+        """Apply Stage load-redirects + Combine SSA renames to a stmt tree."""
+        if redirects:
+            s = _redirect_loads(s, redirects)
+        if rename:
+            s = s.rewrite(lambda n: rename.get(n, n))
+        return s
 
     new_body: list[Stmt] = []
     pending_reduce: tuple[BoundLoop, Accum] | None = None
 
     for stmt in body:
-        if isinstance(stmt, BoundLoop):
+        if isinstance(stmt, Stage):
+            stage_buf = f"{stmt.buf}_stage"
+            new_body.extend(_emit_stage(stmt, stage_buf, t_axis.name))
+            stage_axis_names = {ax.name for ax in stmt.axes}
+            cache_positions = tuple(i for i, e in enumerate(stmt.index) if isinstance(e, Var) and e.name in stage_axis_names)
+            redirects[stmt.buf] = (stage_buf, cache_positions)
+            pending_reduce = None
+        elif isinstance(stmt, BoundLoop):
             pending_reduce = None
             if _is_reduce(stmt):
                 accum = next(a for a in stmt.body if isinstance(a, Accum))
-                new_body.append(_emit_strided(stmt, t_axis.name, renamed))
+                new_body.append(_emit_strided(stmt, t_axis.name, transform))
                 pending_reduce = (stmt, accum)
             else:
-                new_body.append(_emit_strided(stmt, t_axis.name, renamed))
+                new_body.append(_emit_strided(stmt, t_axis.name, transform))
         elif isinstance(stmt, Combine):
             if pending_reduce is None:
                 raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce BoundLoop")
@@ -139,12 +154,12 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
             new_body.append(
                 Cond(
                     cond=BinaryExpr("==", Var(t_axis.name), Literal(0, "int")),
-                    body=(renamed(stmt),),
+                    body=(transform(stmt),),
                     else_body=(),
                 )
             )
         else:
-            new_body.append(renamed(stmt))
+            new_body.append(transform(stmt))
 
     # Cooperative thread axis ``t`` (BIND_THREAD) plus the original output
     # axes — but BIND_BLOCK_STRIDED axes are filtered out because they
@@ -198,3 +213,65 @@ def _emit_combine(combine: Combine, accum: Accum, scope: str, t: str) -> list[St
 
 def _is_reduce(loop: BoundLoop) -> bool:
     return any(isinstance(s, Accum) for s in loop.body)
+
+
+# ---------------------------------------------------------------------------
+# Stage expansion + load redirect
+# ---------------------------------------------------------------------------
+
+
+def _emit_stage(stage: Stage, stage_buf: str, t: str) -> list[Stmt]:
+    """Expand a ``Stage`` Stmt into the smem decl + cooperative load +
+    sync sequence that loads the operand once into per-block smem.
+
+    Today only single-axis Stages are supported (1D smem fragment). Multi-
+    axis Stages — needed when matmul lands operand caching for A/B tiles —
+    require a multi-axis cooperative-load StridedLoop and are deferred."""
+    if len(stage.axes) != 1:
+        raise NotImplementedError(f"Stage with {len(stage.axes)} cache axes not yet handled")
+    cache_axis = stage.axes[0]
+    extents = (int(cache_axis.extent),)
+    smem = Smem(name=stage_buf, extents=extents)
+    load_name = f"_stage_{stage.buf}_{cache_axis.name}"
+    cooperative_load = StridedLoop(
+        axis=cache_axis,
+        start=Var(t),
+        step=BLOCK_SIZE,
+        body=(
+            Load(name=load_name, input=stage.buf, index=stage.index),
+            Write(output=stage_buf, index=(Var(cache_axis.name),), value=load_name),
+        ),
+    )
+    return [smem, cooperative_load, Sync()]
+
+
+def _redirect_loads(stmt: Stmt, redirects: dict[str, tuple[str, tuple[int, ...]]]) -> Stmt:
+    """Recursively rewrite ``Load(buf, ...)`` to ``Load(stage_buf, projected_index)``
+    for every ``buf`` in ``redirects``. ``projected_index`` keeps only
+    the cache-position entries of the original index (block-bound
+    positions are dropped because the staged buffer is per-block)."""
+    if isinstance(stmt, Load) and stmt.input in redirects:
+        stage_buf, cache_positions = redirects[stmt.input]
+        new_index = tuple(stmt.index[i] for i in cache_positions)
+        return Load(name=stmt.name, input=stage_buf, index=new_index)
+    if isinstance(stmt, BoundLoop):
+        return BoundLoop(
+            axis=stmt.axis,
+            body=tuple(_redirect_loads(c, redirects) for c in stmt.body),
+        )
+    if isinstance(stmt, Loop):
+        return Loop(axis=stmt.axis, body=tuple(_redirect_loads(c, redirects) for c in stmt.body))
+    if isinstance(stmt, StridedLoop):
+        return StridedLoop(
+            axis=stmt.axis,
+            start=stmt.start,
+            step=stmt.step,
+            body=tuple(_redirect_loads(c, redirects) for c in stmt.body),
+        )
+    if isinstance(stmt, Cond):
+        return Cond(
+            cond=stmt.cond,
+            body=tuple(_redirect_loads(c, redirects) for c in stmt.body),
+            else_body=tuple(_redirect_loads(c, redirects) for c in stmt.else_body),
+        )
+    return stmt
