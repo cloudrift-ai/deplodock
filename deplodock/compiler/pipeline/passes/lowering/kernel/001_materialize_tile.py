@@ -25,7 +25,7 @@ passes can pattern-match on it.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import BIND_BLOCK_STRIDED, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     Enclosure,
@@ -75,8 +75,26 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
 def _materialize(blk: Tile) -> Stmt:
     if blk.block_axes:
+        if _is_thread_per_output_cooperative(blk):
+            return _materialize_matmul(blk.axes, blk.body)
         return _materialize_cooperative(blk.axes, blk.body)
     return _materialize_thread_per_output(blk.axes, blk.body)
+
+
+def _is_thread_per_output_cooperative(blk: Tile) -> bool:
+    """Matmul-style cooperative tile: ``Tile.axes`` carries
+    ``BIND_BLOCK_STRIDED`` *output* axes (the per-block tile dimensions),
+    and their extents·product equals ``BLOCK_SIZE`` so each thread owns
+    exactly one output slot. Discriminator vs softmax-style cooperation,
+    where ``BIND_BLOCK_STRIDED`` axes are reduction-only (not output)
+    and a single synthesized ``t`` axis drives strided iteration."""
+    strided = [ba for ba in blk.axes if ba.bind == BIND_BLOCK_STRIDED]
+    if not strided:
+        return False
+    product = 1
+    for ba in strided:
+        product *= int(ba.extent)
+    return product == BLOCK_SIZE
 
 
 def _materialize_thread_per_output(axes: tuple, body: tuple) -> Stmt:
@@ -169,6 +187,150 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
     launch_axes = tuple(ba for ba in axes if ba.bind != BIND_BLOCK_STRIDED)
     new_axes = (BoundAxis(axis=t_axis, bind=BIND_THREAD), *launch_axes)
     return Enclosure(axes=new_axes, body=tuple(new_body))
+
+
+def _materialize_matmul(axes: tuple, body: tuple) -> Stmt:
+    """Matmul-style materialization: each thread owns one output slot in
+    the per-block ``BM·BN`` tile. ``BIND_BLOCK_STRIDED`` output axes
+    promote to ``BIND_THREAD`` in the Enclosure (multi-axis decode hands
+    each thread its (m_i, n_i) pair); the matching body BoundLoops are
+    stripped, since the thread decode already provides those Vars.
+
+    Differences from ``_materialize_cooperative``:
+
+    - No synthesized ``t`` axis — the linear thread index is built from
+      the BIND_THREAD axes (``m_i * BN + n_i`` for 2D) and used as the
+      stride start for cooperative loads.
+    - ``Write`` is emitted unconditionally — every thread writes its own
+      slot, no ``Cond on tid==0`` guard.
+    - Body ``BoundLoop`` over a thread-axis is replaced by inlining its
+      body; ``BoundLoop`` over a non-thread axis (``k_o``, ``k_i``) is
+      lowered to a serial ``Loop``."""
+    strided = tuple(ba for ba in axes if ba.bind == BIND_BLOCK_STRIDED)
+    block = tuple(ba for ba in axes if ba.bind == BIND_BLOCK)
+    thread_axis_names = {ba.axis.name for ba in strided}
+    tid_expr = _build_linear_tid(strided)
+
+    # Subsequent Loads of a staged buf get redirected to the smem buffer.
+    redirects: dict[str, tuple[str, tuple[int, ...]]] = {}
+
+    def transform(s: Stmt) -> Stmt:
+        if redirects:
+            s = _redirect_loads(s, redirects)
+        return s
+
+    new_body = _process_matmul_body(body, thread_axis_names, tid_expr, redirects, transform)
+
+    # Enclosure: thread axes (the per-block tile dims) come first so the
+    # render's multi-axis thread decode emits ``int m_i = threadIdx.x / BN;
+    # int n_i = threadIdx.x % BN;``. Block axes follow → grid decode.
+    new_axes = tuple(BoundAxis(axis=ba.axis, bind=BIND_THREAD) for ba in strided) + block
+    return Enclosure(axes=new_axes, body=tuple(new_body))
+
+
+def _build_linear_tid(strided: tuple[BoundAxis, ...]):
+    """Linear row-major thread index from the strided output axes.
+
+    For ``(m_i ext=BM, n_i ext=BN)`` returns the Expr ``m_i * BN + n_i``.
+    Used as the stride-start for cooperative loads (``StridedLoop.start``).
+    Single-axis case returns just ``Var(name)``."""
+    if len(strided) == 1:
+        return Var(strided[0].axis.name)
+    inner_stride = 1
+    parts: list = []
+    for ba in reversed(strided):
+        ext = int(ba.extent)
+        if inner_stride == 1:
+            parts.append(Var(ba.axis.name))
+        else:
+            parts.append(Var(ba.axis.name) * Literal(inner_stride, "int"))
+        inner_stride *= ext
+    expr = parts[0]
+    for p in parts[1:]:
+        expr = p + expr
+    return expr
+
+
+def _process_matmul_body(body: tuple, thread_axis_names: set, tid_expr, redirects, transform) -> list[Stmt]:
+    """Walk ``body``, handling Stage / BoundLoop / Write per matmul rules.
+
+    - ``Stage`` → expand via ``_emit_stage`` with the linear ``tid_expr``.
+    - ``BoundLoop`` over a thread-axis → strip; recurse into its body.
+    - ``BoundLoop(SERIAL)`` over a non-thread axis → lower to ``Loop`` with
+      recursive processing of its body.
+    - ``BoundLoop(BLOCK_STRIDED)`` over a non-thread axis → cooperative
+      ``StridedLoop`` driven by ``tid_expr`` (rare in matmul; reserved
+      for hybrid shapes).
+    - ``Write`` → emit unconditionally with redirects applied.
+    - Other stmts → pass through with redirects/rename applied.
+    """
+    out: list[Stmt] = []
+    for stmt in body:
+        if isinstance(stmt, Stage):
+            stage_buf = f"{stmt.buf}_stage"
+            out.extend(_emit_stage_expr_start(stmt, stage_buf, tid_expr))
+            stage_axis_names = {ax.name for ax in stmt.axes}
+            cache_positions = tuple(i for i, e in enumerate(stmt.index) if isinstance(e, Var) and e.name in stage_axis_names)
+            redirects[stmt.buf] = (stage_buf, cache_positions)
+        elif isinstance(stmt, BoundLoop):
+            inner = _process_matmul_body(stmt.body, thread_axis_names, tid_expr, redirects, transform)
+            if stmt.axis.axis.name in thread_axis_names:
+                # Strip — the thread-axis Var is bound by the Enclosure decode.
+                out.extend(inner)
+            elif stmt.bind == BIND_SERIAL:
+                out.append(Loop(axis=stmt.axis.axis, body=tuple(inner)))
+            elif stmt.bind == BIND_BLOCK_STRIDED:
+                out.append(StridedLoop(axis=stmt.axis.axis, start=tid_expr, step=BLOCK_SIZE, body=tuple(inner)))
+            else:
+                raise NotImplementedError(f"BoundLoop bind={stmt.bind!r} in matmul tile not handled")
+        elif isinstance(stmt, Write):
+            out.append(transform(stmt))
+        else:
+            out.append(transform(stmt))
+    return out
+
+
+def _emit_stage_expr_start(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]:
+    """Variant of ``_emit_stage`` that takes a pre-built linear thread
+    Expr as the strided-load start. Used by matmul materialization where
+    no synthesized ``t`` axis exists."""
+    extents = tuple(int(ax.extent) for ax in stage.axes)
+    if not extents:
+        raise ValueError(f"Stage {stage.buf!r} has no cache axes")
+    smem = Smem(name=stage_buf, extents=extents)
+    load_name = f"_stage_{stage.buf}_v"
+
+    if len(stage.axes) == 1:
+        cache_axis = stage.axes[0]
+        cooperative_load = StridedLoop(
+            axis=cache_axis,
+            start=tid_expr,
+            step=BLOCK_SIZE,
+            body=(
+                Load(name=load_name, input=stage.buf, index=stage.index),
+                Write(output=stage_buf, index=(Var(cache_axis.name),), value=load_name),
+            ),
+        )
+        return [smem, cooperative_load, Sync()]
+
+    total = 1
+    for e in extents:
+        total *= e
+    flat_name = f"_stage_{stage.buf}_flat"
+    flat_axis = Axis(name=flat_name, extent=total)
+    decode_sigma = _flat_decode_sigma(stage.axes, flat_name)
+    source_index = tuple(decode_sigma.apply(e) for e in stage.index)
+    smem_index = tuple(decode_sigma.apply(Var(ax.name)) for ax in stage.axes)
+    cooperative_load = StridedLoop(
+        axis=flat_axis,
+        start=tid_expr,
+        step=BLOCK_SIZE,
+        body=(
+            Load(name=load_name, input=stage.buf, index=source_index),
+            Write(output=stage_buf, index=smem_index, value=load_name),
+        ),
+    )
+    return [smem, cooperative_load, Sync()]
 
 
 def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
