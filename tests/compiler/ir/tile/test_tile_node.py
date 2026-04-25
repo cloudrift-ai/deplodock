@@ -12,7 +12,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tile.ir import BIND_SERIAL, BIND_THREAD, BoundAxis, BoundLoop, Tile, TileOp, iter_body
-from deplodock.compiler.ir.tile.lower import lower_naive
+from tests.compiler.ir.tile._helpers import lower_naive
 
 
 def _reduction_loopop() -> LoopOp:

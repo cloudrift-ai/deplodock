@@ -26,8 +26,8 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.kernel.render import render_kernelop
 from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.tile.lower import lower_naive
 from deplodock.compiler.pipeline.engine import run_pass
+from tests.compiler.ir.tile._helpers import lower_naive
 
 _TILE_PASS_DIR = Path(__file__).resolve().parents[4] / "deplodock/compiler/pipeline/passes/lowering/tile"
 _KERNEL_PASS_DIR = Path(__file__).resolve().parents[4] / "deplodock/compiler/pipeline/passes/lowering/kernel"
