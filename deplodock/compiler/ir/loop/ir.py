@@ -104,7 +104,7 @@ class Stmt:
         """SSA names this stmt reads — its 'requirements'."""
         raise NotImplementedError
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         """Return a copy with every SSA name (binding + dep refs) mapped
         through ``rename_ssa`` and every Expr subterm σ-substituted.
 
@@ -133,7 +133,7 @@ class Load(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Load(name=rename_ssa(self.name), input=self.input, index=tuple(sigma.apply(e) for e in self.index))
 
 
@@ -171,7 +171,7 @@ class Assign(Stmt):
     def deps(self) -> tuple[str, ...]:
         return self.args
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Assign(name=rename_ssa(self.name), op=self.op, args=tuple(rename_ssa(a) for a in self.args))
 
 
@@ -211,7 +211,7 @@ class Accum(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Accum(name=rename_ssa(self.name), value=rename_ssa(self.value), op=self.op)
 
 
@@ -233,7 +233,7 @@ class Write(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Write(output=self.output, index=tuple(sigma.apply(e) for e in self.index), value=rename_ssa(self.value))
 
 
@@ -265,7 +265,7 @@ class Select(Stmt):
     def deps(self) -> tuple[str, ...]:
         return tuple(b.value for b in self.branches)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Select(
             name=rename_ssa(self.name),
             branches=tuple(SelectBranch(value=rename_ssa(b.value), select=sigma.apply(b.select)) for b in self.branches),
@@ -292,6 +292,14 @@ class Loop(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return ()
+
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+        """Recursive rewrite: rebuild ``body`` with each child's ``rewrite``.
+
+        ``axis`` is left alone — strategies that need axis renaming
+        (``loop.normalize``) special-case ``Loop`` and bypass this method.
+        """
+        return Loop(axis=self.axis, body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body))
 
 
 @dataclass(frozen=True)
@@ -320,10 +328,12 @@ class Cond(Stmt):
     def deps(self) -> tuple[str, ...]:
         return tuple(free_vars(self.cond))
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma) -> Stmt:
-        # Don't recurse into ``body`` / ``else_body`` here — that's the caller's
-        # responsibility (see ``normalize._rewrite_body``), matching ``Loop``.
-        return Cond(cond=sigma.apply(self.cond), body=self.body, else_body=self.else_body)
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+        return Cond(
+            cond=sigma.apply(self.cond),
+            body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
+            else_body=tuple(s.rewrite(rename_ssa, sigma) for s in self.else_body),
+        )
 
 
 # ---------------------------------------------------------------------------

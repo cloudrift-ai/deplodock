@@ -32,6 +32,7 @@ from deplodock.compiler.ir.loop.ir import (
     map_body,
     pretty_print,
 )
+from deplodock.compiler.ir.loop.sigma import Sigma
 from deplodock.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
 
 __all__ = [
@@ -47,6 +48,7 @@ __all__ = [
     "Scope",
     "Select",
     "SelectBranch",
+    "Sigma",
     "Stmt",
     "Write",
     "iter_body",
