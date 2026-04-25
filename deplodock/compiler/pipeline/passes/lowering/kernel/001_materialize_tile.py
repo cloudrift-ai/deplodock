@@ -36,7 +36,7 @@ from deplodock.compiler.ir.kernel.ir import (
     TreeHalve,
 )
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Cond, Init, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     BoundLoop,
     Combine,
@@ -221,11 +221,35 @@ def _materialize_matmul(axes: tuple, body: tuple) -> Stmt:
 
     new_body = _process_matmul_body(body, thread_axis_names, tid_expr, redirects, transform)
 
+    # Hoist Accum inits to Enclosure scope: matmul has nested ``Loop(k_o) >
+    # Loop(k_i) > Accum`` where the renderer's default per-Loop init would
+    # reset ``acc`` per outer iteration. An ``Init`` Stmt at Enclosure
+    # scope tells the renderer to declare ``acc`` here and skip the
+    # nested-loop default init.
+    inits = _collect_init_stmts(new_body)
+    new_body = [*inits, *new_body]
+
     # Enclosure: thread axes (the per-block tile dims) come first so the
     # render's multi-axis thread decode emits ``int m_i = threadIdx.x / BN;
     # int n_i = threadIdx.x % BN;``. Block axes follow → grid decode.
     new_axes = tuple(BoundAxis(axis=ba.axis, bind=BIND_THREAD) for ba in strided) + block
     return Enclosure(axes=new_axes, body=tuple(new_body))
+
+
+def _collect_init_stmts(stmts: list[Stmt]) -> list[Stmt]:
+    """Walk transitively for distinct Accums; return one Init per name."""
+
+    def walk(ss):
+        for s in ss:
+            if isinstance(s, Accum):
+                yield s
+            for child_body in s.nested():
+                yield from walk(child_body)
+
+    seen: dict[str, Accum] = {}
+    for accum in walk(stmts):
+        seen.setdefault(accum.name, accum)
+    return [Init(name=name, op=accum.op) for name, accum in seen.items()]
 
 
 def _build_linear_tid(strided: tuple[BoundAxis, ...]):

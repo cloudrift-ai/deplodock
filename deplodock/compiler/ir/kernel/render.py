@@ -37,7 +37,7 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
     TreeHalve,
 )
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Init, Load, Loop, Select, Write
 
 # ---------------------------------------------------------------------------
 # CUDA spelling translation — TODO step 6: dedupe with cuda/_emit.py
@@ -105,6 +105,12 @@ class _Ctx:
 
     shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
     indent: int = 1
+    # Accumulator names whose init has been emitted by an ``Init`` Stmt at
+    # an enclosing scope. ``_render_loop`` uses this to suppress its
+    # default Loop-immediate Accum init for those names — preventing
+    # nested-reduce reset bugs (e.g. matmul ``Loop(k_o) > Loop(k_i) >
+    # Accum`` resetting per-k_o iteration).
+    explicit_inits: set[str] = field(default_factory=set)
 
 
 def _pad(indent: int) -> str:
@@ -228,6 +234,13 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
         op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
         return [f"{pad}{stmt.name} {op} {stmt.value};"]
 
+    if isinstance(stmt, Init):
+        identity = stmt.op.identity
+        if identity is None:
+            raise ValueError(f"Init {stmt.name!r} op {stmt.op.name!r} has no identity")
+        ctx.explicit_inits.add(stmt.name)
+        return [f"{pad}float {stmt.name} = {float(identity):.1f}f;"]
+
     if isinstance(stmt, Cond):
         return _render_cond(stmt, ctx)
 
@@ -307,6 +320,8 @@ def _render_strided_loop(stmt: StridedLoop, ctx: _Ctx) -> list[str]:
     for s in stmt.body:
         if isinstance(s, Accum) and s.name not in seen:
             seen.add(s.name)
+            if s.name in ctx.explicit_inits:
+                continue
             identity = s.op.identity
             if identity is None:
                 raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
@@ -334,7 +349,7 @@ def _render_enclosure(stmt: Enclosure, ctx: _Ctx) -> list[str]:
       responsible for picking extents that match the launch geometry.
     """
     pad = _pad(ctx.indent)
-    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1)
+    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1, explicit_inits=ctx.explicit_inits)
 
     if stmt.block_axes:
         out = [f"{pad}{{"]
@@ -390,7 +405,7 @@ def _render_grid_axis_decode(axes: tuple, idx_expr: str, ctx: _Ctx) -> list[str]
 def _render_cond(stmt: Cond, ctx: _Ctx) -> list[str]:
     pad = _pad(ctx.indent)
     cond = _render_expr(stmt.cond, ctx)
-    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1)
+    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1, explicit_inits=ctx.explicit_inits)
     body = []
     for s in stmt.body:
         body.extend(_render_stmt(s, inner))
@@ -409,6 +424,11 @@ def _render_loop(stmt: Loop, ctx: _Ctx) -> list[str]:
     the op's identity) before the for-loop, then emit the body as the loop
     interior. A free Loop (no Accum in immediate body) renders as a plain
     for-loop.
+
+    Accums whose name appears in ``ctx.explicit_inits`` skip the default
+    init — an enclosing ``Init`` Stmt has already declared them. This
+    handles nested-reduce shapes (chunked-K matmul) where the
+    accumulator must persist across the outer loop's iterations.
     """
     pad = _pad(ctx.indent)
     out: list[str] = []
@@ -416,6 +436,8 @@ def _render_loop(stmt: Loop, ctx: _Ctx) -> list[str]:
     for s in stmt.body:
         if isinstance(s, Accum) and s.name not in seen:
             seen.add(s.name)
+            if s.name in ctx.explicit_inits:
+                continue
             identity = s.op.identity
             if identity is None:
                 raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
@@ -426,7 +448,7 @@ def _render_loop(stmt: Loop, ctx: _Ctx) -> list[str]:
 
 def _render_for(var: str, start, end, step, body: tuple, ctx: _Ctx) -> list[str]:
     pad = _pad(ctx.indent)
-    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1)
+    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1, explicit_inits=ctx.explicit_inits)
     body_lines: list[str] = []
     for s in body:
         body_lines.extend(_render_stmt(s, inner))

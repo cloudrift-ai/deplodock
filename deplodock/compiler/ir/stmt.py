@@ -175,6 +175,40 @@ class Accum(Stmt):
 
 
 @dataclass(frozen=True)
+class Init(Stmt):
+    """Explicit accumulator initialization at this scope.
+
+    By default, the renderer emits ``float <name> = <identity>;`` above
+    a ``Loop`` whose immediate body contains a matching ``Accum``. That
+    semantics is wrong when the same ``Accum`` is reduced across multiple
+    nested ``Loop``s (e.g. matmul chunked-K: ``Loop(k_o) > Loop(k_i) >
+    Accum(acc)`` should not reset ``acc`` per ``k_o`` iteration).
+
+    Placing an ``Init(name, op)`` Stmt at the desired enclosing scope
+    declares the accumulator there. The renderer emits the init at this
+    point, and suppresses the default Loop-immediate init for any
+    ``Accum`` whose name has a matching ``Init`` in an enclosing scope.
+
+    The ``op`` is redundant with the matching ``Accum.op`` (the
+    accumulator carries its own combine), but is kept here so the
+    renderer can pick the identity without scanning ahead.
+    """
+
+    name: str
+    op: ElementwiseImpl
+
+    def __post_init__(self) -> None:
+        if isinstance(self.op, str):
+            object.__setattr__(self, "op", ElementwiseImpl(self.op))
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
+
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+        return Init(name=rename_ssa(self.name), op=self.op)
+
+
+@dataclass(frozen=True)
 class Write(Stmt):
     """Write an SSA value to output buffer ``output`` at position ``index``.
 
@@ -364,6 +398,7 @@ __all__ = [
     "Load",
     "Assign",
     "Accum",
+    "Init",
     "Write",
     "Select",
     "SelectBranch",

@@ -238,6 +238,24 @@ def test_matmul_stages_inside_k_o_loop_expand_in_place():
     assert len(inner_loops) == 1 and inner_loops[0].axis.name == "k_i"
 
 
+def test_matmul_renders_with_single_acc_init_above_outer_loop():
+    """End-to-end: the full matmul materialization should produce CUDA
+    with exactly one ``float acc = 0.0f;`` declaration, placed above the
+    outer K loop (not inside it). Verifies the Init hoisting closes the
+    nested-reduce render gap."""
+    from deplodock.compiler.ir.kernel.render import render_kernelop
+
+    kernel_op = _materialize(_matmul_with_stages_inside_k_o())
+    src = render_kernelop(kernel_op, shapes={"A": (128, 64), "B": (64, 128), "C": (128, 128)})
+    # Single declaration of acc.
+    assert src.count("float acc = 0.0f;") == 1
+    # acc declared before any for loop.
+    lines = src.splitlines()
+    init_line = next(i for i, ln in enumerate(lines) if "float acc = 0.0f;" in ln)
+    first_for = next(i for i, ln in enumerate(lines) if "for (int" in ln)
+    assert init_line < first_for
+
+
 def test_softmax_style_still_uses_synthetic_t_axis():
     """A Tile with a single BIND_BLOCK_STRIDED axis whose extent != BLOCK_SIZE
     is *not* matmul-style; should route to the original cooperative path."""
