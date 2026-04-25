@@ -89,7 +89,7 @@ def test_tileop_defaults():
     assert k.smem == ()
     assert k.name == "k0"
     assert k.inputs == ()
-    assert k.output_bufs == ()
+    assert k.outputs == ()
 
 
 def test_tileop_inputs_outputs_derived_from_body():
@@ -102,7 +102,7 @@ def test_tileop_inputs_outputs_derived_from_body():
     k = TileOp(name="k", body=body)
     # First-use order, deduped.
     assert k.inputs == ("X", "Y")
-    assert k.output_bufs == ("out",)
+    assert k.outputs == ("out",)
 
 
 def test_enclosure_construction():
@@ -142,7 +142,7 @@ def test_pointwise_add_shape():
     assert isinstance(k.body[0].body[0], Loop)
     assert isinstance(k.body[0].body[0].body[-1], Write)
     assert k.inputs == ("A", "B")
-    assert k.output_bufs == ("out",)
+    assert k.outputs == ("out",)
 
 
 def test_rmsnorm_shape():
