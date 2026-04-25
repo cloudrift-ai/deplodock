@@ -1,88 +1,58 @@
-"""Cooperative-block multi-phase reduction strategy.
+"""Cooperative-reduce strategy — flips bindings on a ``Block`` to turn
+serial per-thread reductions into multi-phase cooperative ones.
 
-Rewrites a 1D-reduction ``TileOp`` so each CUDA block owns one output
-slot and threads in the block cooperate on the reduction axis via a
-``__shared__`` tree-halve. Generalizes over any sequence of "phases"
-under one ``Tile``: each reduce-``Loop`` becomes a cooperative phase
-(per-thread strided partial → smem store → tree-halve → broadcast
-load); each free ``Loop`` becomes a strided write loop that lets all
-threads in the block share the row-output work; any leaf stmts between
-phases (e.g. RMSNorm's ``acc / N + eps; rsqrt(...)``) are carried
-through with SSA rename so prior Accum targets resolve to the
-broadcast load.
+Reads the logical ``Block`` produced by ``lower_naive`` (default
+``output_bind=BIND_THREAD``, inner ``BoundLoop``s all ``BIND_SERIAL``)
+and rewrites it in place:
 
-Pre-rewrite shape (any number of sibling Loops + leaves under the Tile)::
+- ``Block.output_bind`` → ``BIND_BLOCK`` (one CUDA block per output slot).
+- Every inner ``BoundLoop`` (reduction or free output) → ``BIND_STRIDED``
+  so threads cooperate on the axis.
+- After each reduce ``BoundLoop`` (one whose immediate body contains an
+  ``Accum``), a ``Combine(name, op, via=SMEM_TREE_HALVE)`` sibling is
+  inserted so materialization emits the cross-thread combine.
 
-    Enclosure(thread_axes=(i,), block_axes=(),
-      Tile(live_axes=(i,), extents=(M,),
-        Loop(k1) { Load; Accum("acc_max", op=max) }       # reduction
-        Loop(k2) { Load; Assign(v0=in-acc_max);
-                   Assign(v1=exp(v0)); Accum("acc_sum") } # uses prior result
-        Loop(k3) { Load; Assign(...); Write(out, ...) }   # free output
-      ))
+Post-rewrite example (softmax)::
 
-Post-rewrite (per-reduction smem buf + halve; free loops strided
-across threads)::
-
-    Enclosure(thread_axes=(t,), block_axes=(i,),
-      Tile(live_axes=(i,), extents=(M,),
-        Smem("acc_max_smem", (BLOCK,))
-        StridedLoop(k1, start=t, step=BLOCK) { Load; Accum }
-        Write(acc_max_smem, (t,), acc_max)
-        Sync; TreeHalve(acc_max_smem, max, BLOCK, t); Sync
-        Load(acc_max_b, "acc_max_smem", (0,))             # broadcast scalar
-
-        Smem("acc_sum_smem", (BLOCK,))
-        StridedLoop(k2, start=t, step=BLOCK) {
-          Load; Assign(v0 = in - acc_max_b);              # ← rename
-          Assign(v1=exp(v0)); Accum }
-        Write(acc_sum_smem, (t,), acc_sum)
-        Sync; TreeHalve(...); Sync
-        Load(acc_sum_b, "acc_sum_smem", (0,))
-
-        StridedLoop(k3, start=t, step=BLOCK) {
-          Load; Assign(... acc_max_b ...);                # ← renames
-          Assign(... acc_sum_b ...); Write(out, ...) }
-      ))
+    Block(output_axes=(i,), output_bind=BIND_BLOCK, body=(
+      BoundLoop(k1, bind=BIND_STRIDED, body=(Load, Accum("acc_max", max))),
+      Combine("acc_max", max, SMEM_TREE_HALVE),
+      BoundLoop(k2, bind=BIND_STRIDED, body=(Load, Assign, Assign, Accum("acc_sum", add))),
+      Combine("acc_sum", add, SMEM_TREE_HALVE),
+      BoundLoop(k3, bind=BIND_STRIDED, body=(Load, Assign, Assign, Assign, Write)),
+    ))
 
 Trigger conditions:
 
-- TileOp body has exactly one ``Enclosure`` with one ``thread_axis`` and
-  one inner ``Tile`` with one ``live_axis`` (``thread_axes == live_axes``).
-- ``Tile.body`` contains at least one reduce ``Loop`` whose immediate
-  body has exactly one ``Accum`` (multi-Accum-per-Loop / online
-  algorithms — separate strategy).
-- The first reduce Loop's axis extent ≥ ``COOP_THRESHOLD``.
-
-Final ``Write`` handling:
-
-- Inside a free ``Loop`` (softmax, RMSNorm) → strided write across
-  threads, no Cond gating (each thread handles its own slab of the
-  output axis).
-- Bare at Tile top level (``y[i] = sum_k x[i,k]``) → guarded by
-  ``Cond(t == 0, Write)``.
+- TileOp body has exactly one ``Block``.
+- ``Block.output_axes`` is 1D and ``output_bind`` is still the default
+  ``BIND_THREAD`` (idempotence check).
+- ``Block.body`` contains at least one reduce ``BoundLoop`` whose
+  immediate body has exactly one ``Accum``.
+- The first reduce BoundLoop's axis extent ≥ ``COOP_THRESHOLD``.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.loop import Accum, Cond, Load, Loop, Stmt, Write
+from deplodock.compiler.ir.loop import Accum
 from deplodock.compiler.ir.tile.ir import (
-    Axis,
-    Enclosure,
-    Smem,
-    StridedLoop,
-    Sync,
-    Tile,
+    BIND_BLOCK,
+    BIND_STRIDED,
+    BIND_THREAD,
+    COMBINE_SMEM_TREE_HALVE,
+    Block,
+    BoundLoop,
+    Combine,
+    Stmt,
     TileOp,
-    TreeHalve,
 )
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 
-BLOCK = 256
 COOP_THRESHOLD = 128
 
 
@@ -92,121 +62,53 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         return None
     tile_op: TileOp = node.op
 
-    new_body = _maybe_rewrite_body(tile_op.body)
+    new_body = _maybe_rewrite(tile_op.body)
     if new_body is None:
         return None
     node.op = TileOp(body=new_body, name=tile_op.name)
     return None
 
 
-def _maybe_rewrite_body(body: tuple) -> tuple | None:
-    enclosures = [(idx, s) for idx, s in enumerate(body) if isinstance(s, Enclosure)]
-    if len(enclosures) != 1:
+def _maybe_rewrite(body: tuple) -> tuple | None:
+    blocks = [(i, s) for i, s in enumerate(body) if isinstance(s, Block)]
+    if len(blocks) != 1:
         return None
-    idx, encl = enclosures[0]
-    if encl.block_axes:
-        return None  # already rewritten
+    idx, blk = blocks[0]
+    if blk.output_bind != BIND_THREAD:
+        return None  # idempotence / already-rewritten
 
-    rewritten = _rewrite_enclosure(encl)
-    if rewritten is None:
+    new_blk = _rewrite_block(blk)
+    if new_blk is None:
         return None
-    return body[:idx] + (rewritten,) + body[idx + 1 :]
+    return body[:idx] + (new_blk,) + body[idx + 1 :]
 
 
-def _rewrite_enclosure(encl: Enclosure) -> Enclosure | None:
-    if len(encl.thread_axes) != 1:
-        return None
-    if len(encl.body) != 1 or not isinstance(encl.body[0], Tile):
-        return None
-    tile: Tile = encl.body[0]
-    if len(tile.live_axes) != 1 or tile.live_axes != encl.thread_axes:
+def _rewrite_block(blk: Block) -> Block | None:
+    if len(blk.output_axes) != 1:
         return None
 
-    reduce_loops = [s for s in tile.body if isinstance(s, Loop) and _is_reduce_loop(s)]
+    reduce_loops = [s for s in blk.body if isinstance(s, BoundLoop) and _is_reduce(s)]
     if not reduce_loops:
         return None
     if int(reduce_loops[0].axis.extent) < COOP_THRESHOLD:
         return None
     for rl in reduce_loops:
         if sum(1 for s in rl.body if isinstance(s, Accum)) != 1:
-            return None  # multi-Accum reductions punted
+            return None  # multi-Accum per Loop — online algorithms, punted
 
-    t_axis = Axis(name="t", extent=BLOCK)
-    new_body = _build_cooperative_body(tile.body, t_axis.name)
-    if new_body is None:
-        return None
-
-    new_tile = Tile(live_axes=tile.live_axes, extents=tile.extents, body=new_body)
-    return Enclosure(thread_axes=(t_axis,), block_axes=encl.thread_axes, body=(new_tile,))
-
-
-def _is_reduce_loop(loop: Loop) -> bool:
-    return any(isinstance(s, Accum) for s in loop.body)
-
-
-def _build_cooperative_body(stmts: tuple, t: str) -> tuple | None:
-    """Walk ``Tile.body`` left-to-right, classifying each stmt:
-
-    - reduce ``Loop`` → cooperative phase (smem + halve + broadcast Load).
-    - free ``Loop`` → ``StridedLoop`` (all threads share the output work).
-    - bare ``Write`` at Tile top level → ``Cond(t == 0, Write)``.
-    - other leaf stmts → carried through unchanged.
-
-    Maintains a ``rename`` map of prior Accum SSA names to their
-    broadcast-load names; each subsequent stmt is rewritten via
-    ``Stmt.rewrite`` so prior reads resolve to the broadcast-load name.
-    ``Loop`` / ``StridedLoop`` / ``Cond`` recurse into their bodies via
-    their own ``rewrite`` implementations.
-    """
-    out: list = []
-    rename: dict[str, str] = {}
-
-    def renamed(s: Stmt) -> Stmt:
-        if not rename:
-            return s
-        return s.rewrite(lambda n: rename.get(n, n))
-
-    for stmt in stmts:
-        if isinstance(stmt, Loop) and _is_reduce_loop(stmt):
-            phase = _emit_reduction_phase(stmt, t, renamed)
-            if phase is None:
-                return None
-            phase_stmts, accum = phase
-            out.extend(phase_stmts)
-            rename[accum.name] = f"{accum.name}_b"
-        elif isinstance(stmt, Loop):
-            out.append(StridedLoop(axis=stmt.axis, start=Var(t), step=BLOCK, body=tuple(renamed(s) for s in stmt.body)))
-        elif isinstance(stmt, Write):
-            out.append(
-                Cond(
-                    cond=BinaryExpr("==", Var(t), Literal(0, "int")),
-                    body=(renamed(stmt),),
-                    else_body=(),
-                )
-            )
+    # --- Flip bindings on every inner BoundLoop, insert Combine after reductions ---
+    new_body: list[Stmt] = []
+    for s in blk.body:
+        if isinstance(s, BoundLoop):
+            new_body.append(replace(s, bind=BIND_STRIDED))
+            if _is_reduce(s):
+                accum = next(a for a in s.body if isinstance(a, Accum))
+                new_body.append(Combine(name=accum.name, op=accum.op, via=COMBINE_SMEM_TREE_HALVE))
         else:
-            out.append(renamed(stmt))
-    return tuple(out)
+            new_body.append(s)
+
+    return Block(output_axes=blk.output_axes, output_bind=BIND_BLOCK, body=tuple(new_body))
 
 
-def _emit_reduction_phase(loop: Loop, t: str, renamed) -> tuple[list, Accum] | None:
-    """One cooperative reduction phase: smem alloc → strided per-thread
-    partial → store partial → sync → tree-halve → sync → broadcast load."""
-    accums = [s for s in loop.body if isinstance(s, Accum)]
-    if len(accums) != 1:
-        return None
-    accum = accums[0]
-    smem_name = f"{accum.name}_smem"
-    broadcast_name = f"{accum.name}_b"
-    return (
-        [
-            Smem(name=smem_name, extents=(BLOCK,)),
-            StridedLoop(axis=loop.axis, start=Var(t), step=BLOCK, body=tuple(renamed(s) for s in loop.body)),
-            Write(output=smem_name, index=(Var(t),), value=accum.name),
-            Sync(),
-            TreeHalve(buf=smem_name, op=accum.op, length=BLOCK, tid_var=t),
-            Sync(),
-            Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
-        ],
-        accum,
-    )
+def _is_reduce(loop: BoundLoop) -> bool:
+    return any(isinstance(s, Accum) for s in loop.body)

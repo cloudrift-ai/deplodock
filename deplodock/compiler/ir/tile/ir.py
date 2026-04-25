@@ -213,6 +213,119 @@ class StridedLoop(Stmt):
 
 
 # ---------------------------------------------------------------------------
+# High-level "logical block" layer
+# ---------------------------------------------------------------------------
+#
+# ``Block`` + ``BoundLoop`` + ``Combine`` are the high-level
+# pre-materialization form produced by ``lower_naive`` and annotated by
+# strategy passes. A materialization pass
+# (``passes/lowering/tile/003_materialize_block``) turns an annotated
+# ``Block`` into the lower-level ``Enclosure`` + ``Tile`` + ``Smem`` /
+# ``Sync`` / ``StridedLoop`` / ``TreeHalve`` form that the renderer
+# consumes.
+#
+# Decisions live where they naturally belong:
+#
+# - ``Block.output_bind`` — how output axes map to GPU coords
+#   (``BIND_THREAD`` = one thread per output element, pointwise;
+#   ``BIND_BLOCK``  = one CUDA block per output slot, cooperative).
+# - ``BoundLoop.bind`` — how an inner iteration axis is walked
+#   (``BIND_SERIAL`` = per-thread sequential, ``BIND_STRIDED`` =
+#   cooperative strided walk across the block's threads).
+# - ``Combine`` — cross-thread collapse of an Accum target; sibling
+#   Stmt because it's buffer/accumulator-scoped, not axis-local.
+#
+# The compute body itself is ``BoundLoop`` / ``Accum`` / ``Load`` /
+# ``Assign`` / ``Write`` — a straight iteration tree. Each ``BoundLoop``
+# carries its own binding; the body reads linearly top to bottom with
+# no cross-references.
+
+
+# Binding values — shared between Block.output_bind and BoundLoop.bind
+# where the semantics apply. Future matmul work will add ``BIND_CHUNKED``
+# (with factor) for staged K walks and allow ``BIND_THREAD`` on nested
+# inner loops for per-output-element thread axes.
+BIND_SERIAL = "SERIAL"
+BIND_STRIDED = "STRIDED"
+BIND_THREAD = "THREAD"
+BIND_BLOCK = "BLOCK"
+
+
+@dataclass
+class Block(Stmt):
+    """High-level output-region wrapper — the pre-materialization form.
+
+    ``output_axes`` are the axes the Block is indexed by (one logical
+    iteration per point). ``output_bind`` says how the cross product of
+    output points maps to GPU coords: ``BIND_THREAD`` (one thread per
+    point — pointwise) or ``BIND_BLOCK`` (one CUDA block per point —
+    cooperative). The body holds the logical compute (``BoundLoop``,
+    ``Accum``, ``Load``, ``Assign``, ``Write``) plus any ``Combine``
+    siblings placed by strategies.
+    """
+
+    output_axes: tuple[Axis, ...]
+    output_bind: str
+    body: tuple[Stmt, ...]
+
+
+@dataclass(frozen=True)
+class BoundLoop(Stmt):
+    """Iteration over ``axis`` with an explicit binding to GPU coords.
+
+    Tile-IR's variant of Loop-IR's ``Loop``: carries the same compute
+    (a nested body) plus a ``bind`` field saying how this axis is
+    walked. ``BIND_SERIAL`` is the pre-strategy default (each thread
+    walks the axis itself). Strategies flip it to ``BIND_STRIDED`` for
+    cooperative walks.
+
+    Reduction detection is structural, same as Loop-IR's ``Loop``: a
+    ``BoundLoop`` is a reduce-loop iff its body contains an ``Accum``.
+
+    Disjoint from Loop-IR's ``Loop`` so materialization can convert
+    between the two layers without ambiguity. Post-materialization the
+    body contains no ``BoundLoop``s — they become ``Loop`` (serial) or
+    ``StridedLoop`` (strided).
+    """
+
+    axis: Axis
+    body: tuple[Stmt, ...]
+    bind: str = BIND_SERIAL
+
+    def rewrite(self, rename_ssa, sigma: Sigma = Sigma.IDENTITY):  # type: ignore[override]
+        return BoundLoop(
+            axis=self.axis,
+            body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
+            bind=self.bind,
+        )
+
+
+# Combine ``via`` values — how an Accum's per-thread partials collapse.
+COMBINE_REGISTER = "REGISTER"
+COMBINE_SMEM_TREE_HALVE = "SMEM_TREE_HALVE"
+
+
+@dataclass
+class Combine(Stmt):
+    """Cross-thread reduction of an ``Accum`` target.
+
+    Placed after the reduce ``BoundLoop`` whose ``Accum`` produced
+    ``name``. ``via`` says how the partials collapse:
+
+    ``REGISTER`` — no cross-thread combine (each thread owns its own
+    output element; its register is the final value).
+    ``SMEM_TREE_HALVE`` — stage partials into a per-block smem buffer,
+    tree-halve across threads. Materialization emits ``Smem`` +
+    ``Write-to-smem`` + ``Sync`` + ``TreeHalve`` + ``Sync`` + broadcast
+    ``Load``; subsequent reads of ``name`` resolve to the broadcast load.
+    """
+
+    name: str
+    op: ElementwiseImpl
+    via: str  # COMBINE_REGISTER | COMBINE_SMEM_TREE_HALVE
+
+
+# ---------------------------------------------------------------------------
 # Top-level: TileOp
 # ---------------------------------------------------------------------------
 
@@ -281,7 +394,7 @@ class TileOp(Op):
 def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
     for s in body:
         yield s
-        if isinstance(s, (Loop, StridedLoop, Enclosure, Tile)):
+        if isinstance(s, (Loop, StridedLoop, Enclosure, Tile, Block, BoundLoop)):
             yield from iter_body(s.body)
         elif isinstance(s, Cond):
             yield from iter_body(s.body)
@@ -307,13 +420,24 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    # Tile-IR statements
+    # Tile-IR statements — low-level (post-materialization)
     "Enclosure",
     "Tile",
     "Smem",
     "Sync",
     "TreeHalve",
     "StridedLoop",
+    # Tile-IR statements — high-level (pre-materialization)
+    "Block",
+    "BoundLoop",
+    "Combine",
+    # Binding + Combine kind constants
+    "BIND_SERIAL",
+    "BIND_STRIDED",
+    "BIND_THREAD",
+    "BIND_BLOCK",
+    "COMBINE_REGISTER",
+    "COMBINE_SMEM_TREE_HALVE",
     "Stmt",
     # Top-level
     "TileOp",

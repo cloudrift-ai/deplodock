@@ -1,21 +1,24 @@
-"""Loop IR → Tile IR (naive — outer free axes → thread_axes).
+"""Loop IR → Tile IR (naive — produces the high-level ``Block`` form).
 
 Mechanical translation. Loop IR's leaves (``Load`` / ``Assign`` /
-``Select`` / ``Write`` / ``Accum`` / ``Cond``) pass through unchanged —
-Tile IR re-uses them directly. Loop IR's ``Loop`` is reused as-is in
-Tile IR; reductions are detected structurally (a Loop is a reduce-Loop
-iff its body contains an ``Accum``) by downstream passes / the renderer.
+``Select`` / ``Write`` / ``Accum`` / ``Cond``) pass through unchanged.
+Loop-IR ``Loop`` is rewritten to Tile-IR ``BoundLoop`` with
+``bind=BIND_SERIAL`` — the pre-strategy default (every thread walks
+the axis itself). Strategy passes flip bindings on select ``BoundLoop``s
+to express cooperative / threaded walks.
 
-**Outer free-Loop chain → ``Enclosure(thread_axes=...)``**. After
-stripping leading non-Loop stmts (scalar Loads) into the TileOp body
-prefix, lowering walks the outer free-Loop chain and strips it into an
-``Enclosure``. Each stripped axis becomes a ``thread_axes`` entry; the
-inside of the deepest stripped Loop becomes the Enclosure body.
+**Outer free-Loop chain → ``Block.output_axes``**. After stripping
+leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
+lowering walks the outer free-Loop chain and strips it into a
+``Block`` whose ``output_axes`` are the stripped axes. The default
+``output_bind`` is ``BIND_THREAD`` — one thread per output point, which
+is the correct shape for pointwise kernels and for reductions that the
+cooperative strategy chooses not to rewrite. Strategies flip it to
+``BIND_BLOCK`` to opt into cooperative materialization.
 
 The chain ends at: a level with multiple sibling stmts, a Loop with
 ``Accum`` in its immediate body (reduce — can't strip), or no Loop at
-all. ``block_axes`` stays empty here — a future strategy splits some
-``thread_axes`` off into block-tile bindings.
+all.
 """
 
 from __future__ import annotations
@@ -29,33 +32,31 @@ from deplodock.compiler.ir.loop import (
     Stmt as LoopStmt,
 )
 from deplodock.compiler.ir.tile.ir import (
+    BIND_SERIAL,
+    BIND_THREAD,
     Axis,
-    Enclosure,
+    Block,
+    BoundLoop,
     Stmt,
-    Tile,
     TileOp,
-    iter_body,
 )
 
 
 def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
-    """Translate a ``LoopOp`` into a ``TileOp`` with thread axes extracted.
+    """Translate a ``LoopOp`` into a ``TileOp`` holding a logical ``Block``.
 
     Steps:
 
     1. Pull leading non-Loop stmts (typically scalar Loads) off the LoopOp
-       body — they sit at the start of ``TileOp.body``, above any Enclosure.
+       body — they sit at the start of ``TileOp.body``, above any Block.
     2. Descend the outer free-Loop chain, collecting axes until the chain
        breaks (multi-stmt level, reduce Loop, or no more Loops).
-    3. If any axes were collected, wrap the remaining inner body in an
-       ``Enclosure(thread_axes=...)``. Otherwise, lower the inner body in
-       place (single-thread serial — degenerate kernel).
+    3. If any axes were collected, wrap the remaining inner body in a
+       ``Block(output_axes=..., output_bind=BIND_THREAD)``. Otherwise,
+       lower the inner body in place (single-thread serial — degenerate).
 
-    ``block_axes`` is empty here — a later strategy splits some axes off
-    into block-tile bindings. Buffer parameters are not stored on TileOp;
-    the renderer derives them from ``TileOp.inputs`` / ``TileOp.output_bufs``
-    (computed from body Loads / Writes) and looks up shapes from the
-    surrounding graph.
+    Inner ``Loop``s are translated to ``BoundLoop(bind=BIND_SERIAL)``.
+    Strategy passes flip bindings later.
     """
     leading: list[LoopStmt] = []
     rest: tuple[LoopStmt, ...] = loop_op.body
@@ -63,24 +64,16 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
         leading.append(rest[0])
         rest = rest[1:]
 
-    thread_axes, inner = _strip_outer_free_chain(rest)
+    output_axes, inner = _strip_outer_free_chain(rest)
 
     body: list[Stmt] = list(_lower_body(tuple(leading)))
     inner_lowered = tuple(_lower_body(inner))
-    if thread_axes:
-        if _has_accum(inner_lowered):
-            extents = tuple(int(ax.extent) for ax in thread_axes)
-            inner_lowered = (Tile(live_axes=thread_axes, extents=extents, body=inner_lowered),)
-        body.append(Enclosure(thread_axes=thread_axes, block_axes=(), body=inner_lowered))
+    if output_axes:
+        body.append(Block(output_axes=output_axes, output_bind=BIND_THREAD, body=inner_lowered))
     else:
         body.extend(inner_lowered)
 
     return TileOp(body=tuple(body), name=kernel_name)
-
-
-def _has_accum(stmts: tuple[Stmt, ...]) -> bool:
-    """Recursively check whether any ``Accum`` appears in ``stmts``."""
-    return any(isinstance(s, Accum) for s in iter_body(stmts))
 
 
 def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ...], tuple[LoopStmt, ...]]:
@@ -99,12 +92,13 @@ def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ..
 
 
 def _lower_body(stmts: tuple[LoopStmt, ...]) -> list[Stmt]:
+    """Translate Loop-IR stmts to Tile-IR. Loop → BoundLoop(bind=SERIAL);
+    leaves pass through unchanged."""
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Loop):
-            out.append(Loop(axis=s.axis, body=tuple(_lower_body(s.body))))
+            out.append(BoundLoop(axis=s.axis, body=tuple(_lower_body(s.body)), bind=BIND_SERIAL))
         else:
-            # Loop IR leaves pass through — Tile IR's Stmt union admits them.
             out.append(s)
     return out
 

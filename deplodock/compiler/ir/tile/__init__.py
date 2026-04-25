@@ -1,21 +1,33 @@
 """Tile IR — schedule + leaf compute, lowered directly to CUDA source.
 
-- :mod:`.ir` — the dataclass definitions: ``Enclosure`` schedule wrapper,
-  ``TileOp`` wrapper, plus re-exports of Loop IR's leaf stmts + control
-  flow (``Load`` / ``Assign`` / ``Select`` / ``Write`` / ``Accum`` /
-  ``Cond`` / ``Loop``) and the shared expression types from :mod:`ir.expr`.
+- :mod:`.ir` — dataclass definitions: high-level ``Block`` /
+  ``BoundLoop`` / ``Combine`` (pre-materialization), low-level
+  ``Enclosure`` / ``Tile`` / ``Smem`` / ``Sync`` / ``StridedLoop`` /
+  ``TreeHalve`` (post-materialization), plus the ``TileOp`` wrapper.
+  Loop-IR leaves (``Load`` / ``Assign`` / ``Select`` / ``Write`` /
+  ``Accum`` / ``Cond`` / ``Loop``) and shared expressions from
+  :mod:`ir.expr` are re-exported here.
 
 Subsequent siblings (``render.py``, lowering passes, schedule strategies)
 land alongside; this module holds only the type definitions.
 """
 
 from deplodock.compiler.ir.tile.ir import (
+    BIND_BLOCK,
+    BIND_SERIAL,
+    BIND_STRIDED,
+    BIND_THREAD,
+    COMBINE_REGISTER,
+    COMBINE_SMEM_TREE_HALVE,
     Accum,
     Assign,
     Axis,
     BinaryExpr,
+    Block,
+    BoundLoop,
     Builtin,
     CastExpr,
+    Combine,
     Cond,
     ElementwiseImpl,
     Enclosure,
@@ -57,13 +69,24 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    # Tile-IR statements
+    # Tile-IR statements — low-level (post-materialization)
     "Enclosure",
     "Tile",
     "Smem",
     "Sync",
     "TreeHalve",
     "StridedLoop",
+    # Tile-IR statements — high-level (pre-materialization)
+    "Block",
+    "BoundLoop",
+    "Combine",
+    # Binding + Combine kind constants
+    "BIND_SERIAL",
+    "BIND_STRIDED",
+    "BIND_THREAD",
+    "BIND_BLOCK",
+    "COMBINE_REGISTER",
+    "COMBINE_SMEM_TREE_HALVE",
     "Stmt",
     # Top-level
     "TileOp",
