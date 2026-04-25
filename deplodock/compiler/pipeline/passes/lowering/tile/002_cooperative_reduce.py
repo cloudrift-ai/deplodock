@@ -1,12 +1,12 @@
 """Cooperative-reduce strategy — moves output axes from ``thread_axes``
-to ``block_axes`` on a ``Block`` and flips inner ``BoundLoop`` bindings
+to ``block_axes`` on a ``Tile`` and flips inner ``BoundLoop`` bindings
 so threads cooperate.
 
-Reads the logical ``Block`` produced by ``lower_naive`` (default:
+Reads the logical ``Tile`` produced by ``lower_naive`` (default:
 ``thread_axes=output_axes`` / ``block_axes=()``, inner ``BoundLoop``s
 all ``BIND_SERIAL``) and rewrites it in place:
 
-- Move axes from ``Block.thread_axes`` to ``Block.block_axes``: each
+- Move axes from ``Tile.thread_axes`` to ``Tile.block_axes``: each
   CUDA block now owns one output slot.
 - Every inner ``BoundLoop`` (reduction or free output) →
   ``BIND_BLOCK_STRIDED`` so threads cooperate on the axis.
@@ -16,7 +16,7 @@ all ``BIND_SERIAL``) and rewrites it in place:
 
 Post-rewrite example (softmax)::
 
-    Block(thread_axes=(), block_axes=(i,), body=(
+    Tile(thread_axes=(), block_axes=(i,), body=(
       BoundLoop(k1, bind=BIND_BLOCK_STRIDED, body=(Load, Accum("acc_max", max))),
       Combine("acc_max", max, BLOCK_REDUCE),
       BoundLoop(k2, bind=BIND_BLOCK_STRIDED, body=(Load, Assign, Assign, Accum("acc_sum", add))),
@@ -26,9 +26,9 @@ Post-rewrite example (softmax)::
 
 Trigger conditions:
 
-- TileOp body has exactly one ``Block``.
-- ``Block.thread_axes`` is 1D and ``block_axes`` is empty (idempotence).
-- ``Block.body`` contains at least one reduce ``BoundLoop`` whose
+- TileOp body has exactly one ``Tile``.
+- ``Tile.thread_axes`` is 1D and ``block_axes`` is empty (idempotence).
+- ``Tile.body`` contains at least one reduce ``BoundLoop`` whose
   immediate body has exactly one ``Accum``.
 - The first reduce BoundLoop's axis extent ≥ ``COOP_THRESHOLD``.
 """
@@ -42,10 +42,10 @@ from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BoundAxis
 from deplodock.compiler.ir.stmt import Accum
 from deplodock.compiler.ir.tile.ir import (
     COMBINE_BLOCK_REDUCE,
-    Block,
     BoundLoop,
     Combine,
     Stmt,
+    Tile,
     TileOp,
 )
 from deplodock.compiler.pipeline.engine import Match, Pattern
@@ -69,7 +69,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
 
 def _maybe_rewrite(body: tuple) -> tuple | None:
-    blocks = [(i, s) for i, s in enumerate(body) if isinstance(s, Block)]
+    blocks = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(blocks) != 1:
         return None
     idx, blk = blocks[0]
@@ -82,7 +82,7 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
     return body[:idx] + (new_blk,) + body[idx + 1 :]
 
 
-def _rewrite_block(blk: Block) -> Block | None:
+def _rewrite_block(blk: Tile) -> Tile | None:
     if len(blk.thread_axes) != 1:
         return None
 
@@ -98,7 +98,7 @@ def _rewrite_block(blk: Block) -> Block | None:
     # --- Flip bindings on every inner BoundLoop, insert Combine after reductions ---
     # Free output BoundLoops (no Accum in body) iterate output axes that are
     # cooperatively walked across the block's threads — lift those axes into
-    # ``Block.axes`` with ``BIND_BLOCK_STRIDED`` so Block.axes documents the
+    # ``Tile.axes`` with ``BIND_BLOCK_STRIDED`` so Tile.axes documents the
     # full output shape. The BoundLoop stays in the body to drive iteration.
     new_body: list[Stmt] = []
     strided_output_axes: list[BoundAxis] = []
@@ -120,7 +120,7 @@ def _rewrite_block(blk: Block) -> Block | None:
         *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes),
         *strided_output_axes,
     )
-    return Block(axes=new_axes, body=tuple(new_body))
+    return Tile(axes=new_axes, body=tuple(new_body))
 
 
 def _is_reduce(loop: BoundLoop) -> bool:

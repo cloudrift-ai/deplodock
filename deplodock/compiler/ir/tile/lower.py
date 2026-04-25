@@ -1,4 +1,4 @@
-"""Loop IR → Tile IR (naive — produces the high-level ``Block`` form).
+"""Loop IR → Tile IR (naive — produces the high-level ``Tile`` form).
 
 Mechanical translation. Loop IR's leaves (``Load`` / ``Assign`` /
 ``Select`` / ``Write`` / ``Accum`` / ``Cond``) pass through unchanged.
@@ -8,10 +8,10 @@ each ``BoundLoop`` carries a ``BoundAxis`` whose ``bind`` defaults to
 flip the bind on select ``BoundLoop``s to ``BIND_BLOCK_STRIDED`` to
 express cooperative iteration.
 
-**Outer free-Loop chain → ``Block.thread_axes``**. After stripping
+**Outer free-Loop chain → ``Tile.thread_axes``**. After stripping
 leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
 lowering walks the outer free-Loop chain and strips it into a
-``Block(thread_axes=...)`` (default: one thread per output point, the
+``Tile(thread_axes=...)`` (default: one thread per output point, the
 correct shape for pointwise kernels and for reductions the cooperative
 strategy chooses not to rewrite). Strategies that opt into cooperative
 materialization move the axes from ``thread_axes`` to ``block_axes``.
@@ -28,24 +28,24 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Loop
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.tile.ir import (
-    Block,
     BoundLoop,
     Stmt,
+    Tile,
     TileOp,
 )
 
 
 def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
-    """Translate a ``LoopOp`` into a ``TileOp`` holding a logical ``Block``.
+    """Translate a ``LoopOp`` into a ``TileOp`` holding a logical ``Tile``.
 
     Steps:
 
     1. Pull leading non-Loop stmts (typically scalar Loads) off the LoopOp
-       body — they sit at the start of ``TileOp.body``, above any Block.
+       body — they sit at the start of ``TileOp.body``, above any Tile.
     2. Descend the outer free-Loop chain, collecting axes until the chain
        breaks (multi-stmt level, reduce Loop, or no more Loops).
     3. If any axes were collected, wrap the remaining inner body in a
-       ``Block(output_axes=..., output_bind=BIND_THREAD)``. Otherwise,
+       ``Tile(output_axes=..., output_bind=BIND_THREAD)``. Otherwise,
        lower the inner body in place (single-thread serial — degenerate).
 
     Inner ``Loop``s are translated to
@@ -64,7 +64,7 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     inner_lowered = tuple(_lower_body(inner))
     if output_axes:
         bound = tuple(BoundAxis(axis=ax, bind=BIND_THREAD) for ax in output_axes)
-        body.append(Block(axes=bound, body=inner_lowered))
+        body.append(Tile(axes=bound, body=inner_lowered))
     else:
         body.extend(inner_lowered)
 

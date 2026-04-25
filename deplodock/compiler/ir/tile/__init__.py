@@ -1,10 +1,10 @@
 """Tile IR — schedule decisions as structural Stmts, pre-materialization.
 
-- :mod:`.ir` — dataclass definitions: ``Block`` / ``BoundLoop`` /
+- :mod:`.ir` — dataclass definitions: ``Tile`` / ``BoundLoop`` /
   ``Combine`` + binding constants, plus re-exports of Loop-IR leaves
   and shared expressions.
 - :mod:`.lower` — ``lower_naive`` translating Loop-IR ``LoopOp`` to Tile-IR
-  ``TileOp`` with a logical ``Block``.
+  ``TileOp`` with a logical ``Tile``.
 - :mod:`.pretty` — structural pretty-printer for ``TileOp``.
 
 Materialization (Tile IR → Kernel IR) lives under
@@ -19,7 +19,6 @@ from deplodock.compiler.ir.tile.ir import (
     Accum,
     Assign,
     BinaryExpr,
-    Block,
     BoundLoop,
     Builtin,
     CastExpr,
@@ -35,6 +34,7 @@ from deplodock.compiler.ir.tile.ir import (
     SelectBranch,
     Stmt,
     TernaryExpr,
+    Tile,
     TileOp,
     Var,
     Write,
@@ -57,7 +57,7 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    "Block",
+    "Tile",
     "BoundLoop",
     "Combine",
     "BoundAxis",

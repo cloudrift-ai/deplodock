@@ -1,13 +1,13 @@
 """Materialize a Tile-IR ``TileOp`` into a Kernel-IR ``KernelOp``.
 
-Reads each ``Block`` in the TileOp body and emits the concrete
+Reads each ``Tile`` in the TileOp body and emits the concrete
 hardware shape — ``Enclosure`` / ``Smem`` / ``Sync`` / ``TreeHalve`` /
 ``StridedLoop`` — that ``render_kernelop`` consumes.
 
-The Block→Enclosure mapping is structural: both nodes carry
+The Tile→Enclosure mapping is structural: both nodes carry
 ``axes: tuple[BoundAxis, ...]``. Materialization is then:
 
-- All ``BoundAxis`` in the Block are ``BIND_THREAD`` (pointwise / per-
+- All ``BoundAxis`` in the Tile are ``BIND_THREAD`` (pointwise / per-
   thread serial) → ``Enclosure(axes=blk.axes)``. Inner ``BoundLoop``s
   fall back to serial Loop-IR ``Loop``s.
 - Any ``BoundAxis`` is ``BIND_BLOCK`` (cooperative) →
@@ -39,9 +39,9 @@ from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     COMBINE_BLOCK_REDUCE,
     COMBINE_THREAD_LOCAL,
-    Block,
     BoundLoop,
     Combine,
+    Tile,
     TileOp,
 )
 from deplodock.compiler.pipeline.engine import Match, Pattern
@@ -59,7 +59,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     new_body: list[Stmt] = []
     for s in tile_op.body:
-        if isinstance(s, Block):
+        if isinstance(s, Tile):
             new_body.append(_materialize(s))
         else:
             new_body.append(s)
@@ -73,7 +73,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: Block) -> Stmt:
+def _materialize(blk: Tile) -> Stmt:
     if blk.block_axes:
         return _materialize_cooperative(blk.axes, blk.body)
     return _materialize_thread_per_output(blk.axes, blk.body)
@@ -89,13 +89,13 @@ def _materialize_thread_per_output(axes: tuple, body: tuple) -> Stmt:
 def _lower_uncooperative(s: Stmt) -> Stmt:
     """Translate a ``BoundLoop(bind=SERIAL)`` tree to Loop-IR ``Loop``.
     Leaves pass through. ``Combine`` must not appear in a non-cooperative
-    Block (no strategy places it without setting ``block_axes``)."""
+    Tile (no strategy places it without setting ``block_axes``)."""
     if isinstance(s, BoundLoop):
         if s.bind != BIND_SERIAL:
-            raise ValueError(f"non-cooperative Block cannot contain BoundLoop with bind={s.bind!r}")
+            raise ValueError(f"non-cooperative Tile cannot contain BoundLoop with bind={s.bind!r}")
         return Loop(axis=s.axis, body=tuple(_lower_uncooperative(c) for c in s.body))
     if isinstance(s, Combine):
-        raise ValueError("Combine not allowed in non-cooperative Block (block_axes must be populated)")
+        raise ValueError("Combine not allowed in non-cooperative Tile (block_axes must be populated)")
     return s
 
 
@@ -161,7 +161,7 @@ def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
         return StridedLoop(axis=loop.axis, start=Var(t), step=BLOCK_SIZE, body=body)
     if loop.bind == BIND_SERIAL:
         return Loop(axis=loop.axis, body=body)
-    raise NotImplementedError(f"BoundLoop bind={loop.bind!r} inside cooperative Block not yet handled")
+    raise NotImplementedError(f"BoundLoop bind={loop.bind!r} inside cooperative Tile not yet handled")
 
 
 def _lower_inner(s: Stmt, renamed) -> Stmt:
