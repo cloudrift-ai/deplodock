@@ -19,7 +19,7 @@ names are strings so they're directly renderable.
 
 **Scheduling decisions live where they naturally belong**:
 
-- ``Block.thread_axes`` / ``Block.block_axes`` — same shape as
+- ``Tile.thread_axes`` / ``Tile.block_axes`` — same shape as
   ``Enclosure``: which output axes are bound to thread coords vs CUDA
   block coords. Pointwise has ``thread_axes`` populated and
   ``block_axes`` empty (one thread per output element). Cooperative
@@ -76,13 +76,13 @@ from deplodock.compiler.ir.stmt import (
 # inner-axis iteration policy — are expressed via ``BoundAxis.bind``
 # values defined in ``ir.axis``. ``BIND_THREAD`` / ``BIND_BLOCK`` /
 # ``BIND_BLOCK_STRIDED`` are the output-axis bindings (used in
-# ``Block.axes`` / ``Enclosure.axes``); ``BIND_SERIAL`` and
+# ``Tile.axes`` / ``Enclosure.axes``); ``BIND_SERIAL`` and
 # ``BIND_BLOCK_STRIDED`` (reused) are the inner-axis bindings (used on
 # ``BoundLoop.axis``). One vocabulary, no separate ``walk`` enum.
 
 
 @dataclass
-class Block(Stmt):
+class Tile(Stmt):
     """Output-region wrapper — Tile-IR mirror of Kernel-IR ``Enclosure``.
 
     Carries the same ``axes: tuple[BoundAxis, ...]`` structure as
@@ -136,11 +136,11 @@ class BoundLoop(Stmt):
       by the cooperative thread axis). Strategy-chosen.
 
     The ``BoundAxis.bind`` vocabulary is shared with output bindings
-    (``Block.axes`` / ``Enclosure.axes``) — the same value names work
+    (``Tile.axes`` / ``Enclosure.axes``) — the same value names work
     in both contexts because they describe an axis's relationship to
     the surrounding cooperative unit, regardless of whether the axis
     is also an output axis. An axis that's both output (in
-    ``Block.axes``) and iterated (in a ``BoundLoop``) carries the same
+    ``Tile.axes``) and iterated (in a ``BoundLoop``) carries the same
     ``BIND_BLOCK_STRIDED`` value in both places.
 
     Reduction detection is structural, same as Loop-IR's ``Loop``: a
@@ -268,7 +268,7 @@ __all__ = [
     "Cond",
     "Loop",
     # Tile-IR statements
-    "Block",
+    "Tile",
     "BoundLoop",
     "Combine",
     # Bindings

@@ -1,7 +1,7 @@
 """Tests for the cooperative-reduce strategy + materialization pipeline.
 
 The strategy (``lowering/tile/002_cooperative_reduce``) flips bindings
-on a Tile-IR ``Block``; the materialization pass
+on a Tile-IR ``Tile``; the materialization pass
 (``lowering/kernel/001_materialize_block``) then produces a Kernel-IR
 ``KernelOp`` with ``Enclosure`` / ``Smem`` / ``Sync`` / ``TreeHalve`` /
 ``StridedLoop``. These tests run both passes and assert on the
