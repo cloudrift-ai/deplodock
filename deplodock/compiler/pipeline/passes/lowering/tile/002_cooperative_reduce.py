@@ -1,11 +1,13 @@
-"""Cooperative-reduce strategy — flips bindings on a ``Block`` to turn
-serial per-thread reductions into multi-phase cooperative ones.
+"""Cooperative-reduce strategy — moves output axes from ``thread_axes``
+to ``block_axes`` on a ``Block`` and flips inner ``BoundLoop`` bindings
+so threads cooperate.
 
-Reads the logical ``Block`` produced by ``lower_naive`` (default
-``output_bind=BIND_THREAD``, inner ``BoundLoop``s all ``BIND_SERIAL``)
-and rewrites it in place:
+Reads the logical ``Block`` produced by ``lower_naive`` (default:
+``thread_axes=output_axes`` / ``block_axes=()``, inner ``BoundLoop``s
+all ``BIND_SERIAL``) and rewrites it in place:
 
-- ``Block.output_bind`` → ``BIND_BLOCK`` (one CUDA block per output slot).
+- Move axes from ``Block.thread_axes`` to ``Block.block_axes``: each
+  CUDA block now owns one output slot.
 - Every inner ``BoundLoop`` (reduction or free output) → ``BIND_STRIDED``
   so threads cooperate on the axis.
 - After each reduce ``BoundLoop`` (one whose immediate body contains an
@@ -14,7 +16,7 @@ and rewrites it in place:
 
 Post-rewrite example (softmax)::
 
-    Block(output_axes=(i,), output_bind=BIND_BLOCK, body=(
+    Block(thread_axes=(), block_axes=(i,), body=(
       BoundLoop(k1, bind=BIND_STRIDED, body=(Load, Accum("acc_max", max))),
       Combine("acc_max", max, SMEM_TREE_HALVE),
       BoundLoop(k2, bind=BIND_STRIDED, body=(Load, Assign, Assign, Accum("acc_sum", add))),
@@ -25,8 +27,7 @@ Post-rewrite example (softmax)::
 Trigger conditions:
 
 - TileOp body has exactly one ``Block``.
-- ``Block.output_axes`` is 1D and ``output_bind`` is still the default
-  ``BIND_THREAD`` (idempotence check).
+- ``Block.thread_axes`` is 1D and ``block_axes`` is empty (idempotence).
 - ``Block.body`` contains at least one reduce ``BoundLoop`` whose
   immediate body has exactly one ``Accum``.
 - The first reduce BoundLoop's axis extent ≥ ``COOP_THRESHOLD``.
@@ -39,9 +40,7 @@ from dataclasses import replace
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.loop import Accum
 from deplodock.compiler.ir.tile.ir import (
-    BIND_BLOCK,
     BIND_STRIDED,
-    BIND_THREAD,
     COMBINE_SMEM_TREE_HALVE,
     Block,
     BoundLoop,
@@ -74,8 +73,8 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
     if len(blocks) != 1:
         return None
     idx, blk = blocks[0]
-    if blk.output_bind != BIND_THREAD:
-        return None  # idempotence / already-rewritten
+    if blk.block_axes:
+        return None  # idempotence — already cooperative
 
     new_blk = _rewrite_block(blk)
     if new_blk is None:
@@ -84,7 +83,7 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
 
 
 def _rewrite_block(blk: Block) -> Block | None:
-    if len(blk.output_axes) != 1:
+    if len(blk.thread_axes) != 1:
         return None
 
     reduce_loops = [s for s in blk.body if isinstance(s, BoundLoop) and _is_reduce(s)]
@@ -107,7 +106,8 @@ def _rewrite_block(blk: Block) -> Block | None:
         else:
             new_body.append(s)
 
-    return Block(output_axes=blk.output_axes, output_bind=BIND_BLOCK, body=tuple(new_body))
+    # Move axes from thread_axes → block_axes (cooperative dispatch).
+    return Block(thread_axes=(), block_axes=blk.thread_axes, body=tuple(new_body))
 
 
 def _is_reduce(loop: BoundLoop) -> bool:

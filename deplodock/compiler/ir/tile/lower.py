@@ -7,14 +7,13 @@ Loop-IR ``Loop`` is rewritten to Tile-IR ``BoundLoop`` with
 the axis itself). Strategy passes flip bindings on select ``BoundLoop``s
 to express cooperative / threaded walks.
 
-**Outer free-Loop chain → ``Block.output_axes``**. After stripping
+**Outer free-Loop chain → ``Block.thread_axes``**. After stripping
 leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
 lowering walks the outer free-Loop chain and strips it into a
-``Block`` whose ``output_axes`` are the stripped axes. The default
-``output_bind`` is ``BIND_THREAD`` — one thread per output point, which
-is the correct shape for pointwise kernels and for reductions that the
-cooperative strategy chooses not to rewrite. Strategies flip it to
-``BIND_BLOCK`` to opt into cooperative materialization.
+``Block(thread_axes=...)`` (default: one thread per output point, the
+correct shape for pointwise kernels and for reductions the cooperative
+strategy chooses not to rewrite). Strategies that opt into cooperative
+materialization move the axes from ``thread_axes`` to ``block_axes``.
 
 The chain ends at: a level with multiple sibling stmts, a Loop with
 ``Accum`` in its immediate body (reduce — can't strip), or no Loop at
@@ -33,7 +32,6 @@ from deplodock.compiler.ir.loop import (
 )
 from deplodock.compiler.ir.tile.ir import (
     BIND_SERIAL,
-    BIND_THREAD,
     Axis,
     Block,
     BoundLoop,
@@ -69,7 +67,7 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     body: list[Stmt] = list(_lower_body(tuple(leading)))
     inner_lowered = tuple(_lower_body(inner))
     if output_axes:
-        body.append(Block(output_axes=output_axes, output_bind=BIND_THREAD, body=inner_lowered))
+        body.append(Block(thread_axes=output_axes, block_axes=(), body=inner_lowered))
     else:
         body.extend(inner_lowered)
 

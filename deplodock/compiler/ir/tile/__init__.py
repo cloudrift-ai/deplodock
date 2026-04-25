@@ -13,10 +13,8 @@ under ``ir.kernel``.
 """
 
 from deplodock.compiler.ir.tile.ir import (
-    BIND_BLOCK,
     BIND_SERIAL,
     BIND_STRIDED,
-    BIND_THREAD,
     COMBINE_REGISTER,
     COMBINE_SMEM_TREE_HALVE,
     Accum,
@@ -66,8 +64,6 @@ __all__ = [
     "Combine",
     "BIND_SERIAL",
     "BIND_STRIDED",
-    "BIND_THREAD",
-    "BIND_BLOCK",
     "COMBINE_REGISTER",
     "COMBINE_SMEM_TREE_HALVE",
     "Stmt",
