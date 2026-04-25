@@ -37,8 +37,6 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
-    COMBINE_BLOCK_REDUCE,
-    COMBINE_THREAD_LOCAL,
     BoundLoop,
     Combine,
     Tile,
@@ -127,12 +125,14 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
         elif isinstance(stmt, Combine):
             if pending_reduce is None:
                 raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce BoundLoop")
-            _, accum = pending_reduce
+            reduce_loop, accum = pending_reduce
             if accum.name != stmt.name:
                 raise ValueError(f"Combine({stmt.name!r}) does not match preceding Accum({accum.name!r})")
-            phase = _emit_combine(stmt, accum, t_axis.name)
+            # Combine scope is derived from the surrounding BoundLoop's bind:
+            # BIND_BLOCK_STRIDED → smem tree-halve at block scope.
+            phase = _emit_combine(stmt, accum, reduce_loop.bind, t_axis.name)
             new_body.extend(phase)
-            if stmt.via == COMBINE_BLOCK_REDUCE:
+            if reduce_loop.bind == BIND_BLOCK_STRIDED:
                 rename[accum.name] = f"{accum.name}_b"
             pending_reduce = None
         elif isinstance(stmt, Write):
@@ -170,10 +170,19 @@ def _lower_inner(s: Stmt, renamed) -> Stmt:
     return renamed(s)
 
 
-def _emit_combine(combine: Combine, accum: Accum, t: str) -> list[Stmt]:
-    if combine.via == COMBINE_THREAD_LOCAL:
+def _emit_combine(combine: Combine, accum: Accum, scope: str, t: str) -> list[Stmt]:
+    """Emit the cross-thread combine. ``scope`` is the surrounding reduce
+    BoundLoop's bind value, which drives the combine mechanism:
+
+    - ``BIND_BLOCK_STRIDED`` → smem tree-halve at block scope.
+    - ``BIND_SERIAL`` → no combine (each thread's partial is already
+      the final value; legal but unused today since strategies don't
+      emit Combine after a serial loop).
+    - Future: ``BIND_WARP_STRIDED`` → warp-shuffle (no smem).
+    """
+    if scope == BIND_SERIAL:
         return []
-    if combine.via == COMBINE_BLOCK_REDUCE:
+    if scope == BIND_BLOCK_STRIDED:
         smem_name = f"{accum.name}_smem"
         broadcast_name = f"{accum.name}_b"
         return [
@@ -184,7 +193,7 @@ def _emit_combine(combine: Combine, accum: Accum, t: str) -> list[Stmt]:
             Sync(),
             Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
         ]
-    raise NotImplementedError(f"Combine via={combine.via!r} not yet handled")
+    raise NotImplementedError(f"Combine for surrounding bind={scope!r} not yet handled")
 
 
 def _is_reduce(loop: BoundLoop) -> bool:

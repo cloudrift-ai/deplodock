@@ -170,37 +170,26 @@ class BoundLoop(Stmt):
         )
 
 
-# Combine ``via`` values — the *scope* over which an Accum's per-thread
-# partials are collapsed. Hardware mechanism (smem + tree-halve, warp
-# shuffle, atomic, ...) is a Kernel-IR concern picked by materialization.
-COMBINE_THREAD_LOCAL = "THREAD_LOCAL"
-COMBINE_BLOCK_REDUCE = "BLOCK_REDUCE"
-
-
 @dataclass
 class Combine(Stmt):
     """Cross-thread reduction of an ``Accum`` target.
 
-    Placed after the reduce ``BoundLoop`` whose ``Accum`` produced
-    ``name``. ``via`` names the *scope* over which the partials collapse:
+    Placed immediately after the reduce ``BoundLoop`` whose ``Accum``
+    produced ``name``. The *scope* of the combine — across the block,
+    across a warp, etc. — is derived from the surrounding BoundLoop's
+    ``bind``: the BoundLoop says "threads of this scope cooperatively
+    walk the axis," and Combine says "now collapse the per-thread
+    partials of that same scope." Materialization picks the mechanism
+    (smem tree-halve today; warp-shuffle / atomic in the future) from
+    the same surrounding bind.
 
-    ``THREAD_LOCAL`` — no cross-thread combine; each thread keeps its
-    own partial (each thread owns a distinct output, so the per-thread
-    accumulator already *is* the final value).
-    ``BLOCK_REDUCE`` — combine across all threads of the CUDA block;
-    materialization picks the mechanism (today: ``Smem`` +
-    ``Write-to-smem`` + ``Sync`` + ``TreeHalve`` + ``Sync`` + broadcast
-    ``Load``; future ``__shfl_down_sync`` paths land here without
-    changing this enum). Subsequent reads of ``name`` resolve to the
-    combined value broadcast back to every thread.
-
-    Future scopes (``WARP_REDUCE``, ``GLOBAL_REDUCE``) extend this enum
-    by *cooperative-unit scope*, not by hardware mechanism.
+    ``op`` is a redundant copy of the matching ``Accum.op`` — kept as a
+    cross-check; if the strategy constructs a Combine with the wrong op
+    relative to the matching Accum, validation surfaces the bug.
     """
 
     name: str
     op: ElementwiseImpl
-    via: str  # COMBINE_THREAD_LOCAL | COMBINE_BLOCK_REDUCE
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +266,6 @@ __all__ = [
     "BIND_BLOCK",
     "BIND_BLOCK_STRIDED",
     "BIND_SERIAL",
-    "COMBINE_THREAD_LOCAL",
-    "COMBINE_BLOCK_REDUCE",
     "Stmt",
     # Top-level
     "TileOp",
