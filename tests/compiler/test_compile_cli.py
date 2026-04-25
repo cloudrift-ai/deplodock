@@ -60,13 +60,13 @@ def test_compile_code_functional_softmax_bakes_kwargs(run_cli):
     rc, stdout, stderr = run_cli("compile", "--code", "F.softmax(torch.randn(1,32,128), dim=-1)", "--ir", "tensor")
     assert rc == 0, f"stderr: {stderr}"
     assert "1 inputs" in stdout
-    assert "max(" in stdout and "sum(" in stdout
+    assert "maximum(" in stdout and "sum(" in stdout
 
 
 def test_compile_passes_shorthand(run_cli, tmp_path):
     """'dolft' should expand to decomposition/optimization/lifting/fusion/lowering/tile."""
     out = tmp_path / "out.txt"
-    rc, stdout, stderr = run_cli("compile", "-c", "F.relu(torch.randn(8))", "--passes", "dolft", "-o", str(out))
+    rc, stdout, stderr = run_cli("compile", "-c", "F.relu(torch.randn(8))", "--passes", "dolft", "-o", str(out), "-v")
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     for name in ("frontend/decomposition", "frontend/optimization", "loop/lifting", "loop/fusion", "lowering/tile"):

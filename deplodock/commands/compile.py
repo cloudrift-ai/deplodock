@@ -94,6 +94,17 @@ def register_compile_command(subparsers):
             "f=fusion, t=lowering/tile, k=lowering/kernel, c=lowering/cuda."
         ),
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help=(
+            "Increase verbosity. Default (no flag): only the requested IR is printed. "
+            "-v: also pass timings and per-rule applied counts. "
+            "-vv: also a snapshot of every rule application (matched subgraph + rewritten fragment)."
+        ),
+    )
     parser.set_defaults(func=handle_compile)
 
 
@@ -104,6 +115,18 @@ def handle_compile(args):
     if not args.code and not args.input:
         logger.error("either a positional model ID / IR file or --code is required")
         sys.exit(2)
+
+    # Map -v / -vv to root log level. Default: WARNING (only the requested
+    # IR is printed; pass / rule timings emitted at INFO are suppressed).
+    # -v → INFO (today's pass + rule timings). -vv → DEBUG (per-rule
+    # snapshot emission in `_apply_rules`).
+    verbose = getattr(args, "verbose", 0)
+    if verbose == 0:
+        logging.getLogger().setLevel(logging.WARNING)
+    elif verbose == 1:
+        logging.getLogger().setLevel(logging.INFO)
+    else:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     from deplodock.compiler.pipeline import run_pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
