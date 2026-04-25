@@ -109,18 +109,93 @@ class Tile(Stmt):
     today ``extents == tuple(ax.extent for ax in live_axes)`` because no
     strategy has reshaped the block yet.
 
-    Sibling stmts execute in order. The renderer inserts an implicit
-    ``__syncthreads()`` between siblings when a later one reads what an
-    earlier one wrote (when smem is in play). ``Accum`` targets inside a
-    ``Tile`` resolve to slots of this block's scratch: registers when the
-    block has one thread per slot, ``__shared__`` when wider. Currently
-    one-thread-per-slot is the only configuration, so ``Tile`` renders as
-    a pass-through over its body — the node is a structural marker that
-    later strategies and the smem path key off.
+    Sibling stmts execute in order. Synchronization is *explicit* via
+    ``Sync`` Stmts placed by strategy passes — the renderer never infers
+    barriers. ``Accum`` targets inside a ``Tile`` resolve to per-thread
+    registers; cooperative reduction across threads is expressed by the
+    strategy as ``Smem`` + a strided ``StridedLoop`` + ``Accum`` (per-thread
+    partial) + assign-into-smem + ``Sync`` + ``TreeHalve`` + a ``Cond``
+    guarding the final ``Write``.
     """
 
     live_axes: tuple[Axis, ...]
     extents: tuple[int, ...]
+    body: tuple[Stmt, ...]
+
+
+# ---------------------------------------------------------------------------
+# Tile-IR primitives — smem, sync, tree-halve, strided loop
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Smem(Stmt):
+    """Declare a per-block ``__shared__`` array.
+
+    Renders to ``__shared__ <dtype> <name>[<prod(extents)>];`` at the
+    point of declaration inside a ``Tile`` body. ``extents`` is the
+    multi-dim shape used to flatten ``Load`` / ``Write`` indices against
+    this buffer (the renderer treats the buffer name like any other
+    indexed buffer once declared — ``ctx.shapes`` is updated for the
+    enclosing scope).
+
+    smem_bytes for ``CudaOp`` is computed by walking the TileOp body and
+    summing ``prod(extents) * sizeof(dtype)`` across distinct ``Smem``
+    declarations.
+    """
+
+    name: str
+    extents: tuple[int, ...]
+    dtype: str = "float"
+
+
+@dataclass
+class Sync(Stmt):
+    """``__syncthreads();`` — block-wide barrier.
+
+    Strategies place these explicitly. The renderer emits one line per
+    ``Sync``; no inference, no deduplication. A future Tile-IR pass may
+    coalesce adjacent ``Sync``s.
+    """
+
+
+@dataclass
+class TreeHalve(Stmt):
+    """Cooperative power-of-two tree reduction over a 1D smem buffer.
+
+    Reduces ``buf[0..length)`` into ``buf[0]`` using ``op`` as the combine.
+    ``tid_var`` names the cooperative thread axis (the participating
+    threadIdx). Renders to::
+
+        for (int s = length/2; s > 0; s >>= 1) {
+            if (tid_var < s) buf[tid_var] = op(buf[tid_var], buf[tid_var + s]);
+            __syncthreads();
+        }
+
+    ``length`` must be a power of two and ``≤ blockDim.x`` (the strategy
+    chooses these together with the cooperative thread-axis extent).
+    """
+
+    buf: str
+    op: ElementwiseImpl
+    length: int
+    tid_var: str
+
+
+@dataclass
+class StridedLoop(Stmt):
+    """``for (int <axis.name> = <start>; <axis.name> < <axis.extent>; <axis.name> += <step>)``.
+
+    Tile-IR-specific strided variant of ``Loop`` used by cooperative
+    reductions to walk a reduction axis in ``step``-sized slabs across
+    threads (typically ``start = Var("t")`` and ``step = blockDim.x``).
+    Reduction detection is identical to ``Loop``: a ``StridedLoop`` is a
+    reduce-loop iff its body contains an ``Accum``.
+    """
+
+    axis: Axis
+    start: Expr
+    step: int
     body: tuple[Stmt, ...]
 
 
@@ -161,10 +236,17 @@ class TileOp(Op):
         return tuple(s for s in self if isinstance(s, Load))
 
     @property
+    def smem_names(self) -> frozenset[str]:
+        """Names of all ``__shared__`` buffers declared in the body — these
+        are render-internal and are excluded from kernel-parameter inference."""
+        return frozenset(s.name for s in self if isinstance(s, Smem))
+
+    @property
     def inputs(self) -> tuple[str, ...]:
         """Distinct ``Load.input`` buf names in body first-use order — the
-        kernel's input parameters."""
-        return tuple(dict.fromkeys(s.input for s in self.loads))
+        kernel's input parameters. Smem buffers are excluded."""
+        smem = self.smem_names
+        return tuple(dict.fromkeys(s.input for s in self.loads if s.input not in smem))
 
     @property
     def writes(self) -> tuple[Write, ...]:
@@ -173,8 +255,9 @@ class TileOp(Op):
     @property
     def outputs(self) -> tuple[str, ...]:
         """Distinct ``Write.output`` buf names in body first-use order —
-        the kernel's writeable output parameters."""
-        return tuple(dict.fromkeys(s.output for s in self.writes))
+        the kernel's writeable output parameters. Smem buffers are excluded."""
+        smem = self.smem_names
+        return tuple(dict.fromkeys(s.output for s in self.writes if s.output not in smem))
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +268,7 @@ class TileOp(Op):
 def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
     for s in body:
         yield s
-        if isinstance(s, (Loop, Enclosure, Tile)):
+        if isinstance(s, (Loop, StridedLoop, Enclosure, Tile)):
             yield from iter_body(s.body)
         elif isinstance(s, Cond):
             yield from iter_body(s.body)
@@ -214,6 +297,10 @@ __all__ = [
     # Tile-IR statements
     "Enclosure",
     "Tile",
+    "Smem",
+    "Sync",
+    "TreeHalve",
+    "StridedLoop",
     "Stmt",
     # Top-level
     "TileOp",

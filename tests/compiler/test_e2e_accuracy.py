@@ -58,6 +58,38 @@ def test_e2e_reduce_sum(run_graph):
     _assert_close(list(outputs.values())[0], expected)
 
 
+def test_e2e_reduce_sum_cooperative(run_graph):
+    """Reduction wide enough (K=512 ≥ COOP_THRESHOLD) to trigger the
+    smem-cooperative strategy. Verifies the new path matches numpy."""
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (8, 512)), node_id="x")
+    g.add_node(ReduceOp("sum", -1), ["x"], Tensor("y", (8, 1)), node_id="y")
+    g.inputs = ["x"]
+    g.outputs = ["y"]
+
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((8, 512)).astype(np.float32)
+    expected = x.sum(-1, keepdims=True)
+    outputs = run_graph(g, {"x": x})
+    _assert_close(list(outputs.values())[0], expected, rtol=1e-3)
+
+
+def test_e2e_reduce_max_cooperative(run_graph):
+    """Same shape, max reduction — exercises the ``fmaxf`` combine path
+    in ``TreeHalve``."""
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (8, 512)), node_id="x")
+    g.add_node(ReduceOp("maximum", -1), ["x"], Tensor("y", (8, 1)), node_id="y")
+    g.inputs = ["x"]
+    g.outputs = ["y"]
+
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((8, 512)).astype(np.float32)
+    expected = x.max(-1, keepdims=True)
+    outputs = run_graph(g, {"x": x})
+    _assert_close(list(outputs.values())[0], expected)
+
+
 # ---------------------------------------------------------------------------
 # Matmul
 # ---------------------------------------------------------------------------

@@ -26,9 +26,14 @@ from deplodock.compiler.ir.tile.ir import (
     Loop,
     Select,
     SelectBranch,
+    Smem,
     Stmt,
+    StridedLoop,
+    Sync,
     TernaryExpr,
+    Tile,
     TileOp,
+    TreeHalve,
     Var,
     Write,
 )
@@ -54,6 +59,11 @@ __all__ = [
     "Loop",
     # Tile-IR statements
     "Enclosure",
+    "Tile",
+    "Smem",
+    "Sync",
+    "TreeHalve",
+    "StridedLoop",
     "Stmt",
     # Top-level
     "TileOp",
