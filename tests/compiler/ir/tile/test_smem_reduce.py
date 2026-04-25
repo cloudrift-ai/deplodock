@@ -19,7 +19,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
+from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tile.ir import (
     Enclosure,
     Smem,
@@ -143,3 +143,67 @@ def test_strategy_idempotent():
     src_twice = render_tileop(g2.nodes["y"].op, shapes={"x": (4, 512), "y": (4,)})
 
     assert src_once == src_twice
+
+
+def _two_phase_loopop(rows: int, cols: int) -> LoopOp:
+    """Hand-built LoopOp with the softmax-style shape: max-reduce → sum-reduce → write.
+    The second reduction reads the first reduction's accumulator scalar."""
+    i = Axis("i", rows)
+    k1 = Axis("k1", cols)
+    k2 = Axis("k2", cols)
+    body = (
+        Loop(
+            axis=i,
+            body=(
+                Loop(
+                    axis=k1,
+                    body=(
+                        Load(name="x_v", input="x", index=(Var("i"), Var("k1"))),
+                        Accum(name="acc_max", value="x_v", op=ElementwiseImpl("maximum")),
+                    ),
+                ),
+                Loop(
+                    axis=k2,
+                    body=(
+                        Load(name="x_v2", input="x", index=(Var("i"), Var("k2"))),
+                        Assign(name="diff", op=ElementwiseImpl("subtract"), args=("x_v2", "acc_max")),
+                        Assign(name="ediff", op=ElementwiseImpl("exp"), args=("diff",)),
+                        Accum(name="acc_sum", value="ediff", op=ElementwiseImpl("add")),
+                    ),
+                ),
+                Write(output="y", index=(Var("i"),), value="acc_sum"),
+            ),
+        ),
+    )
+    return LoopOp(body=body)
+
+
+def test_strategy_handles_two_phase_softmax_shape():
+    """Two reduction phases under one Tile → two smem buffers, two halves,
+    second phase references first via a broadcast Load (renamed acc_max → acc_max_b)."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 512)), node_id="x")
+    g.add_node(op=_two_phase_loopop(4, 512), inputs=["x"], output=Tensor("y", (4,)), node_id="y")
+    g.inputs = ["x"]
+    g.outputs = ["y"]
+    _lower_to_tile(g)
+    g = run_pass(g, _TILE_PASS_DIR)
+
+    tile_op = g.nodes["y"].op
+    encl = next(s for s in tile_op.body if isinstance(s, Enclosure))
+    tile = encl.body[0]
+    smem_decls = [s for s in tile.body if isinstance(s, Smem)]
+    halves = [s for s in tile.body if isinstance(s, TreeHalve)]
+    assert len(smem_decls) == 2
+    assert len(halves) == 2
+    # Second halve uses the sum op; first uses maximum.
+    assert halves[0].op.name == "maximum"
+    assert halves[1].op.name == "add"
+
+    src = render_tileop(tile_op, shapes={"x": (4, 512), "y": (4,)})
+    # Two distinct smem buffers (names may be normalized to acc0_smem / acc1_smem).
+    assert src.count("__shared__ float ") == 2
+    # Broadcast load of the first phase's result into phase 2 (the *_b name).
+    assert "_b = " in src and "_smem[0]" in src
+    # Two tree-halves rendered.
+    assert src.count("for (int s = 128; s > 0; s >>= 1)") == 2

@@ -174,3 +174,29 @@ def test_e2e_softmax(run_graph):
 
     outputs = run_graph(g, {"x": x})
     _assert_close(list(outputs.values())[0], expected, rtol=1e-3)
+
+
+def test_e2e_softmax_cooperative(run_graph):
+    """Softmax with K=2048 ≥ COOP_THRESHOLD — exercises the multi-phase
+    cooperative path (two reductions + one strided output loop, all under
+    one Tile sharing two ``__shared__`` accumulator buffers)."""
+    rows, cols = 4, 2048
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((rows, cols)).astype(np.float32)
+    mx = x.max(-1, keepdims=True)
+    ex = np.exp(x - mx)
+    expected = ex / ex.sum(-1, keepdims=True)
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (rows, cols)), node_id="x")
+    g.inputs = ["x"]
+
+    g.add_node(ReduceOp("maximum", -1), ["x"], Tensor("mx", (rows, 1)), node_id="mx")
+    g.add_node(ElementwiseOp("subtract"), ["x", "mx"], Tensor("subtract", (rows, cols)), node_id="subtract")
+    g.add_node(ElementwiseOp("exp"), ["subtract"], Tensor("exp", (rows, cols)), node_id="exp")
+    g.add_node(ReduceOp("sum", -1), ["exp"], Tensor("sm", (rows, 1)), node_id="sm")
+    g.add_node(ElementwiseOp("divide"), ["exp", "sm"], Tensor("out", (rows, cols)), node_id="out")
+    g.outputs = ["out"]
+
+    outputs = run_graph(g, {"x": x})
+    _assert_close(list(outputs.values())[0], expected, rtol=1e-3)

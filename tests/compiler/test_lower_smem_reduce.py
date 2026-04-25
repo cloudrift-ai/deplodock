@@ -1,13 +1,13 @@
-"""Per-row-reduce emission tests (was: Strategy B smem-reduce tests).
+"""Multi-phase cooperative-reduction emission tests.
 
-The unified emitter handles softmax / RMSNorm shapes with one thread per
-output row, serial per-thread reduction (no smem cooperation, no
-``__syncthreads``). Cross-thread split-K is a follow-up.
+The cooperative-reduce strategy rewrites a fused softmax / RMSNorm
+``Tile`` into a per-row-block kernel: each CUDA block owns one output
+row, threads inside the block cooperate on the reduction axis via
+``__shared__`` partials + tree-halve, and broadcast the result to
+subsequent phases via a smem ``Load`` at index 0.
 
-Pre-unification this module asserted the smem tree-halve pattern of
-Strategy B; that path is gone. The current expectations: a flat
-``tid``-guarded body with one ``acc`` per reduce block and one output
-loop walking the output axis serially.
+The threshold gate (K ≥ ``COOP_THRESHOLD`` = 128) means small reduction
+extents stay on the per-thread serial path.
 """
 
 from __future__ import annotations
@@ -32,21 +32,27 @@ def _softmax_graph(shape: tuple[int, int]) -> Graph:
     return g
 
 
-def test_softmax_large_thread_per_row():
-    """Softmax over a 4096-wide axis: one thread per row, two serial reduce loops, one output loop."""
+def test_softmax_cooperative_above_threshold():
+    """Softmax over K=4096: cooperative path — two ``__shared__`` accumulator
+    buffers, two tree-halves, broadcast loads between phases."""
     source = _cuda_nodes(CudaBackend().compile(_softmax_graph((4, 4096))))[0].op.kernel_source
-    # No smem / sync — split-K not implemented yet.
-    assert "__shared__" not in source
-    assert "__syncthreads" not in source
-    # Two reduce loops (max, sum) plus one output loop, all walking 4096.
-    # Two reduce loops + one output loop = 3 total `for` headers.
-    assert source.count("for (int ") == 3
+    # Two cooperative reductions ⇒ two smem buffers.
+    assert source.count("__shared__ float ") == 2
+    # Each phase has at least one barrier; tree-halve has another inside its loop.
+    assert source.count("__syncthreads();") >= 4
+    # Two tree-halves (one per reduction phase).
+    assert source.count("for (int s = 128; s > 0; s >>= 1)") == 2
+    # All loops over k stride by BLOCK = 256 — two reductions + one output.
+    assert source.count("+= 256") == 3
     assert "< 4096" in source
+    # One CUDA block per row.
     assert "blockIdx.x" in source
+    assert "threadIdx.x" in source
 
 
-def test_softmax_small_thread_per_row():
-    """Small reduce extent: same one-thread-per-row shape."""
+def test_softmax_serial_below_threshold():
+    """K=8 < COOP_THRESHOLD: stays on the per-thread serial path — no smem,
+    no syncs, one thread per output row."""
     source = _cuda_nodes(CudaBackend().compile(_softmax_graph((4, 8))))[0].op.kernel_source
     assert "__shared__" not in source
     assert "__syncthreads" not in source
