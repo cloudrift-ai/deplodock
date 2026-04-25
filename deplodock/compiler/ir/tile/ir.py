@@ -1,25 +1,24 @@
 """Tile IR — schedule + leaf compute, the IR that lowers directly to CUDA.
 
 Tile IR sits between Loop IR (math) and CUDA source (text). Its job is to
-encode *how* the math runs on the GPU — which axes go to threads / blocks,
-where loops are tiled, what lives in shared memory — without touching the
-math itself. Every scheduling decision is a Tile-IR-to-Tile-IR rewrite;
-codegen consumes whatever final form comes out.
+encode *how* the math runs on the GPU — which axes go to threads / blocks —
+without touching the math itself. Every scheduling decision is a
+Tile-IR-to-Tile-IR rewrite; codegen consumes whatever final form comes out.
 
 Pipeline shape:
 
     Loop IR ──lower_naive──▶ Tile IR (single-thread)
-                  ──[ExtractGlobalSchedule, TileReduce, SmemStageReduce, …]──▶ Tile IR
+                  ──[strategy rewrites…]──▶ Tile IR
                   ──emit_cuda──▶ CUDA source
 
 **Leaf compute reuses Loop IR.** ``Load`` / ``Assign`` / ``Select`` /
-``Write`` / ``Accum`` come straight from ``ir.loop`` — buf names are now
+``Write`` / ``Accum`` come straight from ``ir.loop`` — buf names are
 strings (``Load.input``, ``Write.output``) so they're directly renderable.
 ``ElementwiseImpl`` carries op identity / commutativity / numpy callable.
 
-**Schedule structure is Tile-IR-specific.** ``Tile`` / ``Coop`` / ``Sync``
-plus the ``TileOp`` wrapper are new node types whose body is a broader
-union (``Stmt``) that admits both Loop-IR leaves and Tile-IR additions.
+**Schedule structure is Tile-IR-specific.** ``Enclosure`` plus the
+``TileOp`` wrapper are new node types whose body is a broader union
+(``Stmt``) that admits both Loop-IR leaves and Tile-IR additions.
 Loop IR's ``Loop`` is reused directly for both free iteration and
 reductions — a Loop is a reduce-Loop iff its body contains an ``Accum``
 (detected structurally by the renderer / passes, never stored).
@@ -64,49 +63,8 @@ from deplodock.compiler.ir.loop import (
 )
 
 # ---------------------------------------------------------------------------
-# Tile-IR additions: schedule wrappers + control flow
+# Tile-IR additions: schedule wrappers
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class Sync(Stmt):
-    """``__syncthreads();`` — block-level barrier."""
-
-
-# Free iteration uses Loop IR's ``Loop`` directly — see the ``Loop`` re-export.
-# A future ``Enclosure`` will replace ``Loop`` here for axes bound to thread /
-# block / cooperative coords.
-
-
-@dataclass
-class Tile(Stmt):
-    """Outer slab walk: ``for k_outer = 0; k_outer < axis.extent; k_outer += bk``.
-
-    Body sees ``Var(axis.name)`` bound to the slab origin (the outer-loop
-    var). Inner stmts that need a per-element global coord typically wrap
-    an inner ``Loop(axis_inner, body)`` whose body Accumulates and adds the
-    inner var: ``Load("x", input="A", index=(m, axis + k_inner))``. A Loop
-    is treated as a reduction structurally — by the presence of an ``Accum``
-    in its body — so no separate ``Reduce`` node is needed.
-    """
-
-    axis: Axis
-    bk: int
-    body: tuple[Stmt, ...]
-
-
-@dataclass
-class Coop(Stmt):
-    """Cooperative loop: ``for v = tid; v < cover; v += blockDim.x { body }``.
-
-    The only thread-collective primitive in Tile IR. Used by smem-staging
-    strategies to spread a load across all threads in the block. Body sees
-    ``Var(var)`` bound to the per-iteration thread coord.
-    """
-
-    cover: int
-    var: str
-    body: tuple[Stmt, ...]
 
 
 @dataclass
@@ -122,7 +80,7 @@ class Enclosure(Stmt):
     Conceptually replaces ``Loop(axis)`` for the chosen axes — they iterate
     via thread/block parallelism instead of a serial for-loop. A single
     Enclosure typically appears as the schedule wrapper inside a ``TileOp``
-    body; ``ExtractGlobalSchedule`` builds it from the outer free-Loop chain.
+    body; ``lower_naive`` builds it from the outer free-Loop chain.
     """
 
     thread_axes: tuple[Axis, ...]
@@ -131,22 +89,8 @@ class Enclosure(Stmt):
 
 
 # ---------------------------------------------------------------------------
-# Top-level: SmemBuf / TileOp
+# Top-level: TileOp
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class SmemBuf:
-    """Shared-memory buffer declared at kernel scope.
-
-    Render emits ``__shared__ <dtype> <name>[d0][d1]...;`` at the top of
-    the kernel function body. ``Load`` / ``Write`` referencing the buffer
-    by ``name`` inside the kernel resolve to smem via name lookup.
-    """
-
-    name: str
-    dtype: str
-    dims: tuple[int, ...]
 
 
 @dataclass
@@ -154,7 +98,7 @@ class TileOp(Op):
     """One ``__global__`` GPU kernel as a Tile IR program.
 
     Op subclass parallel to ``LoopOp``: lives as a graph node, carries a
-    body of Tile IR statements plus kernel-level metadata (``smem``, ``name``).
+    body of Tile IR statements plus a kernel name.
 
     Buffer shapes are *not* baked in — the surrounding graph supplies them
     at render time, same as ``LoopOp``. Kernel signature is derived from
@@ -164,15 +108,13 @@ class TileOp(Op):
 
     Right after lowering, ``body`` either holds a fully-serial single-thread
     walk or — when ``lower_naive`` strips the outer free-Loop chain — an
-    ``Enclosure(thread_axes=...)`` carrying the schedulable work. Subsequent
-    strategies (``TileReduce``, ``SmemStageReduce``, …) rewrite the body
-    and extend ``smem``. ``body`` may contain stmts before any ``Enclosure``
-    (typically scalar ``Load``s of broadcast constants); render emits them
-    at the top of the ``__global__`` function above the tid-bounds guard.
+    ``Enclosure(thread_axes=...)`` carrying the schedulable work. ``body``
+    may contain stmts before any ``Enclosure`` (typically scalar ``Load``s
+    of broadcast constants); render emits them at the top of the
+    ``__global__`` function above the tid-bounds guard.
     """
 
     body: tuple[Stmt, ...] = ()
-    smem: tuple[SmemBuf, ...] = ()
     name: str = ""
 
     def __iter__(self) -> Iterator[Stmt]:
@@ -207,7 +149,7 @@ class TileOp(Op):
 def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
     for s in body:
         yield s
-        if isinstance(s, (Loop, Enclosure, Tile, Coop)):
+        if isinstance(s, (Loop, Enclosure)):
             yield from iter_body(s.body)
         elif isinstance(s, Cond):
             yield from iter_body(s.body)
@@ -234,13 +176,9 @@ __all__ = [
     "Cond",
     "Loop",
     # Tile-IR statements
-    "Sync",
-    "Tile",
-    "Coop",
     "Enclosure",
     "Stmt",
     # Top-level
-    "SmemBuf",
     "TileOp",
     # Re-exports
     "Axis",
