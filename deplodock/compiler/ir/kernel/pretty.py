@@ -38,9 +38,8 @@ def _render_body(stmts: tuple[Stmt, ...], indent: str, lines: list[str]) -> None
 
 def _render_stmt(stmt: Stmt, indent: str, lines: list[str]) -> None:
     if isinstance(stmt, Enclosure):
-        ta = ", ".join(f"{a.name}:{a.extent}" for a in stmt.thread_axes) or "-"
-        ba = ", ".join(f"{a.name}:{a.extent}" for a in stmt.block_axes) or "-"
-        lines.append(f"{indent}Enclosure(thread_axes=({ta}), block_axes=({ba})):")
+        axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in stmt.axes) or "-"
+        lines.append(f"{indent}Enclosure(axes=({axes})):")
         _render_body(stmt.body, indent + "    ", lines)
         return
     if isinstance(stmt, Smem):

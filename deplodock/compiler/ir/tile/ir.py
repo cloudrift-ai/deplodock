@@ -25,8 +25,8 @@ names are strings so they're directly renderable.
   ``block_axes`` empty (one thread per output element). Cooperative
   reductions have ``block_axes`` populated and ``thread_axes`` empty;
   the cooperative thread axis is synthesized at materialization.
-- ``BoundLoop.bind`` — how an inner iteration axis is walked
-  (``BIND_SERIAL`` = per-thread sequential, ``BIND_STRIDED`` =
+- ``BoundLoop.walk`` — how an inner iteration axis is walked
+  (``WALK_SERIAL`` = per-thread sequential, ``WALK_STRIDED`` =
   cooperative strided walk across the block's threads).
 - ``Combine`` — cross-thread collapse of an Accum target; sibling
   Stmt because it's buffer/accumulator-scoped, not axis-local.
@@ -42,6 +42,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
+from deplodock.compiler.ir.binding import BIND_BLOCK, BIND_THREAD, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -71,9 +72,9 @@ from deplodock.compiler.ir.loop import (
 # Bindings
 # ---------------------------------------------------------------------------
 
-# BoundLoop.bind values — how an inner iteration axis is walked.
-BIND_SERIAL = "SERIAL"
-BIND_STRIDED = "STRIDED"
+# BoundLoop.walk values — how an inner iteration axis is walked.
+WALK_SERIAL = "SERIAL"
+WALK_STRIDED = "STRIDED"
 
 
 # ---------------------------------------------------------------------------
@@ -85,37 +86,53 @@ BIND_STRIDED = "STRIDED"
 class Block(Stmt):
     """Output-region wrapper — Tile-IR mirror of Kernel-IR ``Enclosure``.
 
-    Carries the same ``thread_axes`` / ``block_axes`` structure as
-    ``Enclosure``: axes in ``thread_axes`` are bound to threads (one
-    thread per output point); axes in ``block_axes`` are bound to CUDA
-    blocks (one block per output point, threads inside cooperate).
+    Carries the same ``axes: tuple[BoundAxis, ...]`` structure as
+    ``Enclosure``: each output axis is paired with a binding
+    (``BIND_THREAD`` = one thread per axis value; ``BIND_BLOCK`` = one
+    CUDA block per axis value, threads inside cooperate).
 
-    Pre-strategy default for any reducing kernel is
-    ``thread_axes=output_axes`` / ``block_axes=()`` (one-thread-per-row).
-    The cooperative-reduce strategy moves the axes from ``thread_axes``
-    to ``block_axes`` to opt into cooperative materialization, which
-    will synthesize the cooperative thread axis (``t``) and place it in
-    the resulting ``Enclosure.thread_axes``.
+    Pre-strategy default for any reducing kernel is every output axis
+    bound to ``BIND_THREAD`` (one-thread-per-row). The cooperative-
+    reduce strategy flips axes to ``BIND_BLOCK`` to opt into
+    cooperative materialization, which will synthesize the cooperative
+    thread axis (``t``) and prepend it to the resulting
+    ``Enclosure.axes`` with binding ``BIND_THREAD``.
 
     The body holds the logical compute (``BoundLoop``, ``Accum``,
     ``Load``, ``Assign``, ``Write``) plus any ``Combine`` siblings
     placed by strategies.
+
+    ``thread_axes`` / ``block_axes`` are convenience properties that
+    project ``axes`` by binding kind — they're what the renderer and
+    launch-geometry code consume.
     """
 
-    thread_axes: tuple[Axis, ...]
-    block_axes: tuple[Axis, ...]
+    axes: tuple[BoundAxis, ...]
     body: tuple[Stmt, ...]
+
+    @property
+    def thread_axes(self) -> tuple[Axis, ...]:
+        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_THREAD)
+
+    @property
+    def block_axes(self) -> tuple[Axis, ...]:
+        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
 
 
 @dataclass(frozen=True)
 class BoundLoop(Stmt):
-    """Iteration over ``axis`` with an explicit binding to GPU coords.
+    """Iteration over ``axis`` with an explicit walk strategy.
 
     Tile-IR's variant of Loop-IR's ``Loop``: carries the same compute
-    (a nested body) plus a ``bind`` field saying how this axis is
-    walked. ``BIND_SERIAL`` is the pre-strategy default (each thread
-    walks the axis itself). Strategies flip it to ``BIND_STRIDED`` for
-    cooperative walks.
+    (a nested body) plus a ``walk`` field saying how this axis is
+    iterated. ``WALK_SERIAL`` is the pre-strategy default (each thread
+    walks the axis itself). Strategies flip it to ``WALK_STRIDED`` for
+    cooperative strided walks.
+
+    ``walk`` is distinct from ``BoundAxis.bind``: ``bind`` says how an
+    axis maps to parallel coords (THREAD/BLOCK); ``walk`` says how a
+    thread iterates an axis sequentially (SERIAL/STRIDED). They share
+    the "pick a value per axis" surface but encode orthogonal concepts.
 
     Reduction detection is structural, same as Loop-IR's ``Loop``: a
     ``BoundLoop`` is a reduce-loop iff its body contains an ``Accum``.
@@ -128,13 +145,13 @@ class BoundLoop(Stmt):
 
     axis: Axis
     body: tuple[Stmt, ...]
-    bind: str = BIND_SERIAL
+    walk: str = WALK_SERIAL
 
     def rewrite(self, rename_ssa, sigma: Sigma = Sigma.IDENTITY):  # type: ignore[override]
         return BoundLoop(
             axis=self.axis,
             body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
-            bind=self.bind,
+            walk=self.walk,
         )
 
 
@@ -241,9 +258,12 @@ __all__ = [
     "Block",
     "BoundLoop",
     "Combine",
-    # Binding + Combine kind constants
-    "BIND_SERIAL",
-    "BIND_STRIDED",
+    # Bindings
+    "BoundAxis",
+    "BIND_THREAD",
+    "BIND_BLOCK",
+    "WALK_SERIAL",
+    "WALK_STRIDED",
     "COMBINE_REGISTER",
     "COMBINE_SMEM_TREE_HALVE",
     "Stmt",

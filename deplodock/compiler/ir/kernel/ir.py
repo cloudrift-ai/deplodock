@@ -27,6 +27,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
+from deplodock.compiler.ir.binding import BIND_BLOCK, BIND_THREAD, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -61,16 +62,28 @@ from deplodock.compiler.ir.loop import (
 class Enclosure(Stmt):
     """Bind enclosing axes to thread / block coords for the body.
 
-    ``thread_axes`` are flattened into ``threadIdx.x`` (with a tid bounds
-    guard when ``block_axes`` is empty). ``block_axes`` are flattened
-    into ``blockIdx.x/y/z``. The body executes per-thread under those
-    bindings; downstream stmts use ``Var(axis.name)`` and rely on the
-    bindings to resolve at render time.
+    Each ``BoundAxis`` in ``axes`` says how its axis is laid out:
+    ``BIND_THREAD`` axes are flattened into ``threadIdx.x`` (with a tid
+    bounds guard when no ``BIND_BLOCK`` axis is present); ``BIND_BLOCK``
+    axes are flattened into ``blockIdx.x/y/z``. The body executes
+    per-thread under those bindings; downstream stmts use
+    ``Var(axis.name)`` and rely on the bindings to resolve at render time.
+
+    ``thread_axes`` / ``block_axes`` are convenience properties that
+    project ``axes`` by binding kind — render and launch geometry use
+    them.
     """
 
-    thread_axes: tuple[Axis, ...]
-    block_axes: tuple[Axis, ...]
+    axes: tuple[BoundAxis, ...]
     body: tuple[Stmt, ...]
+
+    @property
+    def thread_axes(self) -> tuple[Axis, ...]:
+        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_THREAD)
+
+    @property
+    def block_axes(self) -> tuple[Axis, ...]:
+        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +245,10 @@ __all__ = [
     "Sync",
     "TreeHalve",
     "StridedLoop",
+    # Bindings
+    "BoundAxis",
+    "BIND_THREAD",
+    "BIND_BLOCK",
     "Stmt",
     # Top-level
     "KernelOp",

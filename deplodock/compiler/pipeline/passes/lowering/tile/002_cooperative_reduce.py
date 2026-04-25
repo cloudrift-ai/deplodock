@@ -4,11 +4,11 @@ so threads cooperate.
 
 Reads the logical ``Block`` produced by ``lower_naive`` (default:
 ``thread_axes=output_axes`` / ``block_axes=()``, inner ``BoundLoop``s
-all ``BIND_SERIAL``) and rewrites it in place:
+all ``WALK_SERIAL``) and rewrites it in place:
 
 - Move axes from ``Block.thread_axes`` to ``Block.block_axes``: each
   CUDA block now owns one output slot.
-- Every inner ``BoundLoop`` (reduction or free output) → ``BIND_STRIDED``
+- Every inner ``BoundLoop`` (reduction or free output) → ``WALK_STRIDED``
   so threads cooperate on the axis.
 - After each reduce ``BoundLoop`` (one whose immediate body contains an
   ``Accum``), a ``Combine(name, op, via=SMEM_TREE_HALVE)`` sibling is
@@ -17,11 +17,11 @@ all ``BIND_SERIAL``) and rewrites it in place:
 Post-rewrite example (softmax)::
 
     Block(thread_axes=(), block_axes=(i,), body=(
-      BoundLoop(k1, bind=BIND_STRIDED, body=(Load, Accum("acc_max", max))),
+      BoundLoop(k1, walk=WALK_STRIDED, body=(Load, Accum("acc_max", max))),
       Combine("acc_max", max, SMEM_TREE_HALVE),
-      BoundLoop(k2, bind=BIND_STRIDED, body=(Load, Assign, Assign, Accum("acc_sum", add))),
+      BoundLoop(k2, walk=WALK_STRIDED, body=(Load, Assign, Assign, Accum("acc_sum", add))),
       Combine("acc_sum", add, SMEM_TREE_HALVE),
-      BoundLoop(k3, bind=BIND_STRIDED, body=(Load, Assign, Assign, Assign, Write)),
+      BoundLoop(k3, walk=WALK_STRIDED, body=(Load, Assign, Assign, Assign, Write)),
     ))
 
 Trigger conditions:
@@ -40,9 +40,11 @@ from dataclasses import replace
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.loop import Accum
 from deplodock.compiler.ir.tile.ir import (
-    BIND_STRIDED,
+    BIND_BLOCK,
     COMBINE_SMEM_TREE_HALVE,
+    WALK_STRIDED,
     Block,
+    BoundAxis,
     BoundLoop,
     Combine,
     Stmt,
@@ -99,15 +101,16 @@ def _rewrite_block(blk: Block) -> Block | None:
     new_body: list[Stmt] = []
     for s in blk.body:
         if isinstance(s, BoundLoop):
-            new_body.append(replace(s, bind=BIND_STRIDED))
+            new_body.append(replace(s, walk=WALK_STRIDED))
             if _is_reduce(s):
                 accum = next(a for a in s.body if isinstance(a, Accum))
                 new_body.append(Combine(name=accum.name, op=accum.op, via=COMBINE_SMEM_TREE_HALVE))
         else:
             new_body.append(s)
 
-    # Move axes from thread_axes → block_axes (cooperative dispatch).
-    return Block(thread_axes=(), block_axes=blk.thread_axes, body=tuple(new_body))
+    # Flip every BoundAxis to BIND_BLOCK (cooperative dispatch).
+    new_axes = tuple(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes)
+    return Block(axes=new_axes, body=tuple(new_body))
 
 
 def _is_reduce(loop: BoundLoop) -> bool:
