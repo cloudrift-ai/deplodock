@@ -128,17 +128,30 @@ def _pad(indent: int) -> str:
 _BLOCK_SIZE = 256
 
 
-def render_tileop(tile_op: TileOp) -> str:
-    """Render a complete ``extern "C" __global__`` CUDA function for a ``TileOp``."""
-    shapes: dict[str, tuple[int, ...]] = {}
-    for p in tile_op.params:
-        if p.shape:
-            shapes[p.name] = p.shape
-    for s in tile_op.smem:
-        shapes[s.name] = s.dims
-    ctx = _Ctx(shapes=shapes, indent=1)
+def render_tileop(tile_op: TileOp, shapes: dict[str, tuple[int, ...]] | None = None) -> str:
+    """Render a complete ``extern "C" __global__`` CUDA function for a ``TileOp``.
 
-    params_text = ", ".join(f"{p.dtype} {p.name}" for p in tile_op.params)
+    ``shapes`` maps each global-buffer name (anything appearing on a
+    ``Load.input`` or ``Write.output``) to its declared shape; the
+    renderer uses it to row-major-flatten multi-dim indices. Smem buffers
+    contribute their own ``SmemBuf.dims`` to the same lookup table.
+    Production callers typically build ``shapes`` from the surrounding
+    graph (``{nid: graph.nodes[nid].output.shape for nid in ...}``); tests
+    pass it as a literal dict.
+
+    Kernel signature is derived from the body: ``tile_op.inputs`` (distinct
+    ``Load.input`` names) become ``const float*`` params, ``tile_op.output_bufs``
+    (distinct ``Write.output`` names) become ``float*`` params, ordered
+    by first appearance.
+    """
+    shape_map: dict[str, tuple[int, ...]] = dict(shapes or {})
+    for s in tile_op.smem:
+        shape_map[s.name] = s.dims
+    ctx = _Ctx(shapes=shape_map, indent=1)
+
+    sig_parts = [f"const float* {n}" for n in tile_op.inputs]
+    sig_parts.extend(f"float* {n}" for n in tile_op.output_bufs)
+    params_text = ", ".join(sig_parts)
     launch_bounds = f"\n__launch_bounds__({_BLOCK_SIZE})"
 
     body_lines: list[str] = []

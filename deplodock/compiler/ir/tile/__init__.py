@@ -27,7 +27,6 @@ from deplodock.compiler.ir.tile.ir import (
     Literal,
     Load,
     Loop,
-    Param,
     Reduce,
     Select,
     SelectBranch,
@@ -68,7 +67,6 @@ __all__ = [
     "Enclosure",
     "Stmt",
     # Top-level
-    "Param",
     "SmemBuf",
     "TileOp",
     # Re-exports

@@ -34,14 +34,13 @@ from deplodock.compiler.ir.loop import (
 from deplodock.compiler.ir.tile.ir import (
     Axis,
     Enclosure,
-    Param,
     Reduce,
     Stmt,
     TileOp,
 )
 
 
-def lower_naive(loop_op: LoopOp, kernel_name: str, inputs: tuple[Param, ...], output: Param) -> TileOp:
+def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     """Translate a ``LoopOp`` into a ``TileOp`` with thread axes extracted.
 
     Steps:
@@ -55,7 +54,10 @@ def lower_naive(loop_op: LoopOp, kernel_name: str, inputs: tuple[Param, ...], ou
        place (single-thread serial — degenerate kernel).
 
     ``block_axes`` is empty here — a later strategy splits some axes off
-    into block-tile bindings.
+    into block-tile bindings. Buffer parameters are not stored on TileOp;
+    the renderer derives them from ``TileOp.inputs`` / ``TileOp.output_bufs``
+    (computed from body Loads / Writes) and looks up shapes from the
+    surrounding graph.
     """
     leading: list[LoopStmt] = []
     rest: tuple[LoopStmt, ...] = loop_op.body
@@ -72,7 +74,7 @@ def lower_naive(loop_op: LoopOp, kernel_name: str, inputs: tuple[Param, ...], ou
     else:
         body.extend(inner_lowered)
 
-    return TileOp(body=tuple(body), params=(*inputs, output), name=kernel_name)
+    return TileOp(body=tuple(body), name=kernel_name)
 
 
 def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ...], tuple[LoopStmt, ...]]:
