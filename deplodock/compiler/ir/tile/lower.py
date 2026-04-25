@@ -29,33 +29,29 @@ from deplodock.compiler.ir.loop import (
     Stmt as LoopStmt,
 )
 from deplodock.compiler.ir.tile.ir import (
-    Kernel,
     Param,
     Reduce,
     Stmt,
+    TileOp,
 )
 
 
-def lower_naive(loop_op: LoopOp, kernel_name: str, inputs: tuple[Param, ...], output: Param) -> Kernel:
-    """Translate a ``LoopOp`` into a single-thread serial ``Kernel``.
+def lower_naive(loop_op: LoopOp, kernel_name: str, inputs: tuple[Param, ...], output: Param) -> TileOp:
+    """Translate a ``LoopOp`` into a single-thread serial ``TileOp``.
 
-    ``inputs`` and ``output`` populate ``Kernel.params`` (with ``Param.shape``
-    used by the renderer to row-major-flatten multi-dim ``Load`` / ``Write``
-    indices). Buffer identity is carried inline on Loop IR's ``Load.input``
-    and ``Write.output`` — lowering only needs to translate ``Loop`` →
-    ``Reduce`` (when body has Accum) or pass through.
+    ``inputs`` and ``output`` populate ``TileOp.params`` (with
+    ``Param.shape`` used by the renderer to row-major-flatten multi-dim
+    ``Load`` / ``Write`` indices). Buffer identity is carried inline on
+    Loop IR's ``Load.input`` and ``Write.output`` — lowering only needs
+    to translate ``Loop`` → ``Reduce`` (when body has Accum) or pass
+    through. ``TileOp.body`` is a single sequence; scalar Loads and other
+    pre-Enclosure stmts sit before any ``Enclosure`` introduced later by
+    ``ExtractGlobalSchedule``.
     """
-    pre: list[LoopStmt] = []
-    rest: tuple[LoopStmt, ...] = loop_op.body
-    while rest and not isinstance(rest[0], Loop):
-        pre.append(rest[0])
-        rest = rest[1:]
-
-    return Kernel(
-        name=kernel_name,
+    return TileOp(
+        body=tuple(_lower_body(loop_op.body)),
         params=(*inputs, output),
-        body=tuple(_lower_body(rest)),
-        prologue=tuple(_lower_body(tuple(pre))),
+        name=kernel_name,
     )
 
 

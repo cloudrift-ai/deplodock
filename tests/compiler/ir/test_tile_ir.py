@@ -4,7 +4,7 @@ After dropping ``Let`` / ``Index`` / ``Store`` / ``AccumFold`` / ``Acc``,
 Tile IR re-uses Loop IR's leaf stmts (``Load`` / ``Assign`` / ``Select`` /
 ``Write`` / ``Accum``). These tests verify that the schedule wrappers
 (``Loop`` / ``Reduce`` / ``Tile`` / ``Coop`` / ``Cond`` / ``Sync``) +
-``Kernel`` accept the Loop IR leaves and can express each kernel shape we
+``TileOp`` accept the Loop IR leaves and can express each kernel shape we
 plan to lower to.
 """
 
@@ -19,7 +19,7 @@ from deplodock.compiler.ir.tile import (
     Cond,
     Coop,
     ElementwiseImpl,
-    Kernel,
+    Enclosure,
     Literal,
     Load,
     Loop,
@@ -28,6 +28,7 @@ from deplodock.compiler.ir.tile import (
     SmemBuf,
     Sync,
     Tile,
+    TileOp,
     Var,
     Write,
 )
@@ -84,12 +85,18 @@ def test_param_smembuf():
     assert (p.dtype, sb.dims) == ("const float*", (128, 16))
 
 
-def test_kernel_defaults():
-    k = Kernel(name="k0", params=(), body=())
-    assert k.thread_axes == ()
-    assert k.grid == (1, 1, 1)
+def test_tileop_defaults():
+    k = TileOp(name="k0", params=(), body=())
+    assert k.body == ()
     assert k.smem == ()
-    assert k.prologue == ()
+    assert k.params == ()
+
+
+def test_enclosure_construction():
+    enc = Enclosure(thread_axes=(Axis("a0", 4),), block_axes=(), body=(Sync(),))
+    assert enc.thread_axes[0].name == "a0"
+    assert enc.block_axes == ()
+    assert isinstance(enc.body[0], Sync)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +124,7 @@ def test_pointwise_add_shape():
             ),
         ),
     )
-    k = Kernel(
+    k = TileOp(
         name="add",
         params=(Param("A", "const float*"), Param("B", "const float*"), Param("out", "float*")),
         body=body,
@@ -128,15 +135,11 @@ def test_pointwise_add_shape():
 
 
 def test_rmsnorm_shape():
-    """RMSNorm post-lowering: prologue scalar Load, Loop(i), Reduce(k)
-    with Accum, interlude Assigns, Loop(j) ending in Write."""
+    """RMSNorm post-lowering: scalar Loads sit in body before the Loop(i),
+    which contains Reduce(k), interlude Assigns, Loop(j) ending in Write."""
     i = Axis("a0", 4)
     k_axis = Axis("a1", 32)
     j = Axis("a2", 32)
-    prologue = (
-        Load("eps", input="Eps", index=()),
-        Load("mean_n", input="MeanN", index=()),
-    )
     reduce_block = Reduce(
         axis=k_axis,
         body=(
@@ -155,8 +158,13 @@ def test_rmsnorm_shape():
             Write(output="out", index=(Var("a0"), Var("a2")), value="y"),
         ),
     )
-    body = (Loop(axis=i, body=(reduce_block, output_loop)),)
-    k = Kernel(
+    # Pre-Enclosure scalar Loads + outer free Loop carry the work.
+    body = (
+        Load("eps", input="Eps", index=()),
+        Load("mean_n", input="MeanN", index=()),
+        Loop(axis=i, body=(reduce_block, output_loop)),
+    )
+    k = TileOp(
         name="rmsnorm",
         params=(
             Param("X", "const float*"),
@@ -165,11 +173,10 @@ def test_rmsnorm_shape():
             Param("W", "const float*"),
             Param("out", "float*"),
         ),
-        prologue=prologue,
         body=body,
     )
-    assert len(k.prologue) == 2
-    outer = k.body[0]
+    assert isinstance(k.body[0], Load) and k.body[0].input == "Eps"
+    outer = k.body[2]
     assert isinstance(outer, Loop) and outer.axis.name == "a0"
     assert isinstance(outer.body[0], Reduce)
     assert isinstance(outer.body[-1], Loop) and outer.body[-1].axis.name == "a2"
@@ -200,7 +207,7 @@ def test_matmul_naive_shape():
             ),
         ),
     )
-    krn = Kernel(
+    krn = TileOp(
         name="matmul",
         params=(Param("A", "const float*"), Param("B", "const float*"), Param("out", "float*")),
         body=body,
@@ -248,16 +255,22 @@ def test_matmul_smem_tiled_shape():
             Sync(),
         ),
     )
-    body = (tile_loop, Write(output="out", index=(Var("a0"), Var("a1")), value="c"))
-    krn = Kernel(
+    # Wrap the schedulable body in an Enclosure that binds (m, n) to thread coords.
+    enclosed = Enclosure(
+        thread_axes=(m, n),
+        block_axes=(),
+        body=(tile_loop, Write(output="out", index=(Var("a0"), Var("a1")), value="c")),
+    )
+    krn = TileOp(
         name="matmul_tiled",
         params=(Param("A", "const float*"), Param("B", "const float*"), Param("out", "float*")),
         smem=smem,
-        thread_axes=(m, n),
-        body=body,
+        body=(enclosed,),
     )
     assert len(krn.smem) == 2
-    outer = krn.body[0]
+    enc = krn.body[0]
+    assert isinstance(enc, Enclosure) and enc.thread_axes[0].name == "a0"
+    outer = enc.body[0]
     assert isinstance(outer, Tile) and outer.bk == 16
     assert isinstance(outer.body[0], Coop)
     assert isinstance(outer.body[1], Sync)

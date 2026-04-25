@@ -21,9 +21,9 @@ from deplodock.compiler.ir.tile.ir import (
     Cond,
     Coop,
     ElementwiseImpl,
+    Enclosure,
     Expr,
     FuncCallExpr,
-    Kernel,
     Literal,
     Load,
     Loop,
@@ -36,6 +36,7 @@ from deplodock.compiler.ir.tile.ir import (
     Sync,
     TernaryExpr,
     Tile,
+    TileOp,
     Var,
     Write,
 )
@@ -64,11 +65,12 @@ __all__ = [
     "Reduce",
     "Tile",
     "Coop",
+    "Enclosure",
     "Stmt",
     # Top-level
     "Param",
     "SmemBuf",
-    "Kernel",
+    "TileOp",
     # Re-exports
     "Axis",
     "ElementwiseImpl",

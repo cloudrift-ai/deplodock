@@ -33,8 +33,9 @@ row-major using the buffer's declared shape.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -123,14 +124,35 @@ class Coop:
     body: tuple[Stmt, ...]
 
 
+@dataclass
+class Enclosure:
+    """Bind enclosing axes to thread / block coords for the body.
+
+    ``thread_axes`` are flattened into ``threadIdx.x`` (with a tid bounds
+    guard for non-divisible cases). ``block_axes`` would be flattened into
+    ``blockIdx.x/y/z`` (deferred until a strategy actually populates them).
+    The body executes per-thread under those bindings; downstream stmts use
+    ``Var(axis.name)`` and rely on the bindings to resolve at render time.
+
+    Conceptually replaces ``Loop(axis)`` for the chosen axes — they iterate
+    via thread/block parallelism instead of a serial for-loop. A single
+    Enclosure typically appears as the schedule wrapper inside a ``TileOp``
+    body; ``ExtractGlobalSchedule`` builds it from the outer free-Loop chain.
+    """
+
+    thread_axes: tuple[Axis, ...]
+    block_axes: tuple[Axis, ...]
+    body: tuple[Stmt, ...]
+
+
 # Statement union — Loop IR leaves + Tile IR additions. Every node that
 # can appear in a body sequence anywhere in Tile IR. ``Cond`` and ``Loop``
 # (free iteration) live in Loop IR — reused here via re-exports.
-Stmt = Load | Assign | Select | Write | Accum | Cond | Loop | Sync | Reduce | Tile | Coop
+Stmt = Load | Assign | Select | Write | Accum | Cond | Loop | Sync | Reduce | Tile | Coop | Enclosure
 
 
 # ---------------------------------------------------------------------------
-# Top-level: Param / SmemBuf / Kernel
+# Top-level: Param / SmemBuf / TileOp
 # ---------------------------------------------------------------------------
 
 
@@ -167,27 +189,28 @@ class SmemBuf:
 
 
 @dataclass
-class Kernel:
+class TileOp(Op):
     """One ``__global__`` GPU kernel as a Tile IR program.
 
-    Right after lowering: ``thread_axes == ()`` and ``block_axes == ()`` —
-    the program is a single-thread serial walk. ``ExtractGlobalSchedule``
-    populates ``thread_axes`` (and computes ``grid`` / ``block``); subsequent
-    strategies extend ``smem`` and rewrite ``body``.
+    Op subclass parallel to ``LoopOp``: lives as a graph node, carries a
+    body of Tile IR statements plus kernel-level metadata (``params``,
+    ``smem``, ``name``).
 
-    ``prologue`` runs above the tid-bounds guard so all threads see the
-    same value (typically scalar Loads of broadcast constants).
+    Right after lowering, ``body`` is a fully-serial single-thread walk.
+    ``ExtractGlobalSchedule`` wraps the schedulable region in an
+    ``Enclosure`` whose ``thread_axes`` / ``block_axes`` capture the GPU
+    parallelism. Subsequent strategies (``TileReduce``, ``SmemStageReduce``,
+    …) rewrite the body and extend ``smem``.
+
+    ``body`` may contain stmts before the ``Enclosure`` (typically scalar
+    ``Load``s of broadcast constants); render emits them at the top of the
+    ``__global__`` function above the tid-bounds guard.
     """
 
-    name: str
-    params: tuple[Param, ...]
-    body: tuple[Stmt, ...]
+    body: tuple[Stmt, ...] = ()
+    params: tuple[Param, ...] = ()
     smem: tuple[SmemBuf, ...] = ()
-    thread_axes: tuple[Axis, ...] = ()
-    block_axes: tuple[Axis, ...] = ()
-    grid: tuple[int, int, int] = (1, 1, 1)
-    block: tuple[int, int, int] = (1, 1, 1)
-    prologue: tuple[Stmt, ...] = ()
+    name: str = ""
 
 
 __all__ = [
@@ -214,12 +237,16 @@ __all__ = [
     "Reduce",
     "Tile",
     "Coop",
+    "Enclosure",
     "Stmt",
     # Top-level
     "Param",
     "SmemBuf",
-    "Kernel",
+    "TileOp",
     # Re-exports
     "Axis",
     "ElementwiseImpl",
 ]
+
+
+_ = field  # silence ruff for the imported but optionally-used helper
