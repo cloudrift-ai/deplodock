@@ -22,6 +22,7 @@ all.
 
 from __future__ import annotations
 
+from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.loop import (
     Accum,
     Loop,
@@ -31,11 +32,8 @@ from deplodock.compiler.ir.loop import (
     Stmt as LoopStmt,
 )
 from deplodock.compiler.ir.tile.ir import (
-    BIND_THREAD,
     WALK_SERIAL,
-    Axis,
     Block,
-    BoundAxis,
     BoundLoop,
     Stmt,
     TileOp,
