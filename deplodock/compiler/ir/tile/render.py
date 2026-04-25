@@ -1,16 +1,9 @@
 """Tile IR → CUDA source.
 
-Renders a ``Kernel`` to a complete ``extern "C" __global__`` CUDA function
+Renders a ``TileOp`` to a complete ``extern "C" __global__`` CUDA function
 text. The renderer is purely mechanical: every Tile IR node has a fixed
-emission rule. Strategies that produce different Tile IR (smem-staged,
-tiled, split-K, etc.) all flow through this same renderer; codegen has
-no schedule awareness.
-
-Translation tables (CUDA spelling for builtin / intrinsic names) and the
-expression printer with operator-precedence-aware parenthesization are
-duplicated from ``pipeline/passes/lowering/cuda/_emit.py``. Step 6 of the
-Tile IR refactor deletes the old emitter and consolidates these tables;
-until then, both copies live in parallel — kept in sync by hand.
+emission rule. Strategies that produce different Tile IR all flow through
+this same renderer; codegen has no schedule awareness.
 
 Loop IR's ``Load`` / ``Assign`` / ``Select`` / ``Write`` / ``Accum`` are
 rendered directly: ``Load`` becomes ``float <name> = <buf>[<flat>];``,
@@ -36,13 +29,9 @@ from deplodock.compiler.ir.expr import (
 )
 from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
 from deplodock.compiler.ir.tile.ir import (
-    Coop,
     Enclosure,
     Expr,
-    SmemBuf,
     Stmt,
-    Sync,
-    Tile,
     TileOp,
 )
 
@@ -133,21 +122,17 @@ def render_tileop(tile_op: TileOp, shapes: dict[str, tuple[int, ...]] | None = N
 
     ``shapes`` maps each global-buffer name (anything appearing on a
     ``Load.input`` or ``Write.output``) to its declared shape; the
-    renderer uses it to row-major-flatten multi-dim indices. Smem buffers
-    contribute their own ``SmemBuf.dims`` to the same lookup table.
-    Production callers typically build ``shapes`` from the surrounding
-    graph (``{nid: graph.nodes[nid].output.shape for nid in ...}``); tests
-    pass it as a literal dict.
+    renderer uses it to row-major-flatten multi-dim indices. Production
+    callers typically build ``shapes`` from the surrounding graph
+    (``{nid: graph.nodes[nid].output.shape for nid in ...}``); tests pass
+    it as a literal dict.
 
     Kernel signature is derived from the body: ``tile_op.inputs`` (distinct
-    ``Load.input`` names) become ``const float*`` params, ``tile_op.output_bufs``
+    ``Load.input`` names) become ``const float*`` params, ``tile_op.outputs``
     (distinct ``Write.output`` names) become ``float*`` params, ordered
     by first appearance.
     """
-    shape_map: dict[str, tuple[int, ...]] = dict(shapes or {})
-    for s in tile_op.smem:
-        shape_map[s.name] = s.dims
-    ctx = _Ctx(shapes=shape_map, indent=1)
+    ctx = _Ctx(shapes=dict(shapes or {}), indent=1)
 
     sig_parts = [f"const float* {n}" for n in tile_op.inputs]
     sig_parts.extend(f"float* {n}" for n in tile_op.outputs)
@@ -155,18 +140,11 @@ def render_tileop(tile_op: TileOp, shapes: dict[str, tuple[int, ...]] | None = N
     launch_bounds = f"\n__launch_bounds__({_BLOCK_SIZE})"
 
     body_lines: list[str] = []
-    for sb in tile_op.smem:
-        body_lines.append(_render_smem_decl(sb, ctx))
     for s in tile_op.body:
         body_lines.extend(_render_stmt(s, ctx))
 
     body_text = "\n".join(body_lines)
     return f'extern "C" __global__{launch_bounds} void {tile_op.name}({params_text}) {{\n{body_text}\n}}\n'
-
-
-def _render_smem_decl(sb: SmemBuf, ctx: _Ctx) -> str:
-    dims = "".join(f"[{d}]" for d in sb.dims)
-    return f"{_pad(ctx.indent)}__shared__ {sb.dtype} {sb.name}{dims};"
 
 
 def _render_thread_axis_decode(axes: tuple, ctx: _Ctx) -> list[str]:
@@ -229,20 +207,11 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
         op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
         return [f"{pad}{stmt.name} {op} {stmt.value};"]
 
-    if isinstance(stmt, Sync):
-        return [f"{pad}__syncthreads();"]
-
     if isinstance(stmt, Cond):
         return _render_cond(stmt, ctx)
 
     if isinstance(stmt, Loop):
         return _render_loop(stmt, ctx)
-
-    if isinstance(stmt, Tile):
-        return _render_for(stmt.axis.name, 0, int(stmt.axis.extent), step=stmt.bk, body=stmt.body, ctx=ctx)
-
-    if isinstance(stmt, Coop):
-        return _render_for(stmt.var, "threadIdx.x", stmt.cover, step="blockDim.x", body=stmt.body, ctx=ctx)
 
     if isinstance(stmt, Enclosure):
         return _render_enclosure(stmt, ctx)

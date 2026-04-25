@@ -1,8 +1,7 @@
 """Tile IR — schedule + leaf compute, lowered directly to CUDA source.
 
-- :mod:`.ir` — the dataclass definitions: Tile-IR-specific schedule
-  wrappers (``Tile`` / ``Coop`` / ``Sync`` / ``Enclosure``), ``TileOp``
-  wrapper, ``SmemBuf``, plus re-exports of Loop IR's leaf stmts + control
+- :mod:`.ir` — the dataclass definitions: ``Enclosure`` schedule wrapper,
+  ``TileOp`` wrapper, plus re-exports of Loop IR's leaf stmts + control
   flow (``Load`` / ``Assign`` / ``Select`` / ``Write`` / ``Accum`` /
   ``Cond`` / ``Loop``) and the shared expression types from :mod:`ir.expr`.
 
@@ -18,7 +17,6 @@ from deplodock.compiler.ir.tile.ir import (
     Builtin,
     CastExpr,
     Cond,
-    Coop,
     ElementwiseImpl,
     Enclosure,
     Expr,
@@ -28,11 +26,8 @@ from deplodock.compiler.ir.tile.ir import (
     Loop,
     Select,
     SelectBranch,
-    SmemBuf,
     Stmt,
-    Sync,
     TernaryExpr,
-    Tile,
     TileOp,
     Var,
     Write,
@@ -58,13 +53,9 @@ __all__ = [
     "Cond",
     "Loop",
     # Tile-IR statements
-    "Sync",
-    "Tile",
-    "Coop",
     "Enclosure",
     "Stmt",
     # Top-level
-    "SmemBuf",
     "TileOp",
     # Re-exports
     "Axis",
