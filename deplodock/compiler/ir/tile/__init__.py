@@ -12,7 +12,7 @@ Materialization (Tile IR → Kernel IR) lives under
 under ``ir.kernel``.
 """
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.tile.ir import (
     COMBINE_REGISTER,
     COMBINE_SMEM_TREE_HALVE,
@@ -65,6 +65,7 @@ __all__ = [
     "BoundAxis",
     "BIND_THREAD",
     "BIND_BLOCK",
+    "BIND_BLOCK_STRIDED",
     "WALK_SERIAL",
     "WALK_STRIDED",
     "COMBINE_REGISTER",

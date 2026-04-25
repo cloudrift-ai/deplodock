@@ -38,7 +38,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import BIND_BLOCK, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BoundAxis
 from deplodock.compiler.ir.stmt import Accum
 from deplodock.compiler.ir.tile.ir import (
     COMBINE_SMEM_TREE_HALVE,
@@ -97,18 +97,29 @@ def _rewrite_block(blk: Block) -> Block | None:
             return None  # multi-Accum per Loop — online algorithms, punted
 
     # --- Flip bindings on every inner BoundLoop, insert Combine after reductions ---
+    # Free output BoundLoops (no Accum in body) iterate output axes that are
+    # cooperatively walked across the block's threads — lift those axes into
+    # ``Block.axes`` with ``BIND_BLOCK_STRIDED`` so Block.axes documents the
+    # full output shape. The BoundLoop stays in the body to drive iteration.
     new_body: list[Stmt] = []
+    strided_output_axes: list[BoundAxis] = []
     for s in blk.body:
         if isinstance(s, BoundLoop):
             new_body.append(replace(s, walk=WALK_STRIDED))
             if _is_reduce(s):
                 accum = next(a for a in s.body if isinstance(a, Accum))
                 new_body.append(Combine(name=accum.name, op=accum.op, via=COMBINE_SMEM_TREE_HALVE))
+            else:
+                strided_output_axes.append(BoundAxis(axis=s.axis, bind=BIND_BLOCK_STRIDED))
         else:
             new_body.append(s)
 
-    # Flip every BoundAxis to BIND_BLOCK (cooperative dispatch).
-    new_axes = tuple(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes)
+    # Original output axes flip to BIND_BLOCK; cooperatively-walked axes
+    # appended as BIND_BLOCK_STRIDED.
+    new_axes = (
+        *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes),
+        *strided_output_axes,
+    )
     return Block(axes=new_axes, body=tuple(new_body))
 
 
