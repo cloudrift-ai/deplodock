@@ -19,9 +19,12 @@ names are strings so they're directly renderable.
 
 **Scheduling decisions live where they naturally belong**:
 
-- ``Block.output_bind`` — how output axes map to GPU coords
-  (``BIND_THREAD`` = one thread per output element, pointwise;
-  ``BIND_BLOCK`` = one CUDA block per output slot, cooperative).
+- ``Block.thread_axes`` / ``Block.block_axes`` — same shape as
+  ``Enclosure``: which output axes are bound to thread coords vs CUDA
+  block coords. Pointwise has ``thread_axes`` populated and
+  ``block_axes`` empty (one thread per output element). Cooperative
+  reductions have ``block_axes`` populated and ``thread_axes`` empty;
+  the cooperative thread axis is synthesized at materialization.
 - ``BoundLoop.bind`` — how an inner iteration axis is walked
   (``BIND_SERIAL`` = per-thread sequential, ``BIND_STRIDED`` =
   cooperative strided walk across the block's threads).
@@ -68,14 +71,9 @@ from deplodock.compiler.ir.loop import (
 # Bindings
 # ---------------------------------------------------------------------------
 
-# Binding values — shared between Block.output_bind and BoundLoop.bind
-# where the semantics apply. Future matmul work will add ``BIND_CHUNKED``
-# (with factor) for staged K walks and allow ``BIND_THREAD`` on nested
-# inner loops for per-output-element thread axes.
+# BoundLoop.bind values — how an inner iteration axis is walked.
 BIND_SERIAL = "SERIAL"
 BIND_STRIDED = "STRIDED"
-BIND_THREAD = "THREAD"
-BIND_BLOCK = "BLOCK"
 
 
 # ---------------------------------------------------------------------------
@@ -85,19 +83,27 @@ BIND_BLOCK = "BLOCK"
 
 @dataclass
 class Block(Stmt):
-    """Output-region wrapper.
+    """Output-region wrapper — Tile-IR mirror of Kernel-IR ``Enclosure``.
 
-    ``output_axes`` are the axes the Block is indexed by (one logical
-    iteration per point). ``output_bind`` says how the cross product of
-    output points maps to GPU coords: ``BIND_THREAD`` (one thread per
-    point — pointwise) or ``BIND_BLOCK`` (one CUDA block per point —
-    cooperative). The body holds the logical compute (``BoundLoop``,
-    ``Accum``, ``Load``, ``Assign``, ``Write``) plus any ``Combine``
-    siblings placed by strategies.
+    Carries the same ``thread_axes`` / ``block_axes`` structure as
+    ``Enclosure``: axes in ``thread_axes`` are bound to threads (one
+    thread per output point); axes in ``block_axes`` are bound to CUDA
+    blocks (one block per output point, threads inside cooperate).
+
+    Pre-strategy default for any reducing kernel is
+    ``thread_axes=output_axes`` / ``block_axes=()`` (one-thread-per-row).
+    The cooperative-reduce strategy moves the axes from ``thread_axes``
+    to ``block_axes`` to opt into cooperative materialization, which
+    will synthesize the cooperative thread axis (``t``) and place it in
+    the resulting ``Enclosure.thread_axes``.
+
+    The body holds the logical compute (``BoundLoop``, ``Accum``,
+    ``Load``, ``Assign``, ``Write``) plus any ``Combine`` siblings
+    placed by strategies.
     """
 
-    output_axes: tuple[Axis, ...]
-    output_bind: str
+    thread_axes: tuple[Axis, ...]
+    block_axes: tuple[Axis, ...]
     body: tuple[Stmt, ...]
 
 
@@ -238,8 +244,6 @@ __all__ = [
     # Binding + Combine kind constants
     "BIND_SERIAL",
     "BIND_STRIDED",
-    "BIND_THREAD",
-    "BIND_BLOCK",
     "COMBINE_REGISTER",
     "COMBINE_SMEM_TREE_HALVE",
     "Stmt",

@@ -11,7 +11,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.tile.ir import BIND_THREAD, Block, BoundLoop, TileOp, iter_body
+from deplodock.compiler.ir.tile.ir import Block, BoundLoop, TileOp, iter_body
 from deplodock.compiler.ir.tile.lower import lower_naive
 
 
@@ -47,7 +47,7 @@ def test_iter_body_walks_into_block():
             Accum(name="acc", value="x_v", op=ElementwiseImpl("add")),
         ),
     )
-    blk = Block(output_axes=(i,), output_bind=BIND_THREAD, body=(inner,))
+    blk = Block(thread_axes=(i,), block_axes=(), body=(inner,))
     seen = list(iter_body((blk,)))
     assert any(isinstance(s, Accum) for s in seen)
     assert seen[0] is blk
@@ -59,8 +59,8 @@ def test_lower_naive_produces_block_for_reduction():
     blocks = [s for s in tile_op.body if isinstance(s, Block)]
     assert len(blocks) == 1
     blk = blocks[0]
-    assert len(blk.output_axes) == 1
-    assert blk.output_bind == BIND_THREAD
+    assert len(blk.thread_axes) == 1
+    assert blk.block_axes == ()
     assert any(isinstance(s, BoundLoop) for s in blk.body)
     assert any(isinstance(s, Write) for s in blk.body)
 

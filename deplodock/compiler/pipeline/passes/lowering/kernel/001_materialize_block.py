@@ -1,22 +1,21 @@
 """Materialize a Tile-IR ``TileOp`` into a Kernel-IR ``KernelOp``.
 
 Reads each ``Block`` in the TileOp body and emits the concrete
-hardware shape — ``Enclosure`` / ``Tile`` / ``Smem`` / ``Sync`` /
-``TreeHalve`` / ``StridedLoop`` — that ``render_kernelop`` consumes.
+hardware shape — ``Enclosure`` / ``Smem`` / ``Sync`` / ``TreeHalve`` /
+``StridedLoop`` — that ``render_kernelop`` consumes.
 
-Dispatch is driven by two fields:
+The Block→Enclosure mapping is structural: the two nodes share the
+``thread_axes`` / ``block_axes`` field shape. Materialization is then:
 
-- ``Block.output_bind`` — ``BIND_THREAD`` (pointwise or
-  one-thread-per-output-slot reduction) vs ``BIND_BLOCK`` (cooperative,
-  one CUDA block per output slot).
-- ``BoundLoop.bind`` — ``BIND_SERIAL`` (emit Loop-IR ``Loop``, per-thread
-  walk) vs ``BIND_STRIDED`` (emit Kernel-IR ``StridedLoop`` with
-  ``start=Var(t)``, ``step=BLOCK``).
-
-Combine siblings (present only in ``BIND_BLOCK`` mode) emit the smem
-tree-halve phase and set up broadcast ``Load``s. Subsequent reads of
-the combined Accum target are renamed to ``<name>_b`` via
-``Stmt.rewrite``.
+- ``Block(thread_axes=T, block_axes=())`` (pointwise / per-thread serial)
+  → ``Enclosure(thread_axes=T, block_axes=())``. Inner ``BoundLoop``s
+  fall back to serial Loop-IR ``Loop``s.
+- ``Block(thread_axes=(), block_axes=B)`` (cooperative)
+  → ``Enclosure(thread_axes=(t,), block_axes=B)``, where ``t`` is the
+  synthetic cooperative thread axis introduced here. Inner
+  ``BoundLoop(bind=BIND_STRIDED)`` becomes ``StridedLoop`` driven by ``t``;
+  ``Combine`` siblings emit the smem tree-halve phase and broadcast
+  loads; ``Stmt.rewrite`` renames subsequent Accum reads to ``<name>_b``.
 
 Produces a ``KernelOp`` — distinct type from ``TileOp``, so Kernel-IR
 passes can pattern-match on it.
@@ -36,10 +35,8 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.loop import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
-    BIND_BLOCK,
     BIND_SERIAL,
     BIND_STRIDED,
-    BIND_THREAD,
     COMBINE_REGISTER,
     COMBINE_SMEM_TREE_HALVE,
     Axis,
@@ -78,15 +75,13 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
 
 def _materialize(blk: Block) -> Stmt:
-    if blk.output_bind == BIND_THREAD:
-        return _materialize_thread_per_output(blk.output_axes, blk.body)
-    if blk.output_bind == BIND_BLOCK:
-        return _materialize_block_per_output(blk.output_axes, blk.body)
-    raise NotImplementedError(f"Block output_bind={blk.output_bind!r} not yet handled")
+    if blk.block_axes:
+        return _materialize_cooperative(blk.thread_axes, blk.block_axes, blk.body)
+    return _materialize_thread_per_output(blk.thread_axes, blk.body)
 
 
 def _materialize_thread_per_output(output_axes: tuple, body: tuple) -> Stmt:
-    """``BIND_THREAD`` — one thread per output element. Pointwise kernels
+    """One thread per output element. Pointwise kernels
     have no inner Loops / Accums; reductions that opted out of cooperation
     stay here with serial per-thread ``Loop`` walks folding ``Accum``
     into per-thread registers."""
@@ -96,18 +91,20 @@ def _materialize_thread_per_output(output_axes: tuple, body: tuple) -> Stmt:
 
 def _lower_uncooperative(s: Stmt) -> Stmt:
     """Translate a ``BoundLoop(bind=SERIAL)`` tree to Loop-IR ``Loop``.
-    Leaves pass through. ``Combine`` must not appear here."""
+    Leaves pass through. ``Combine`` must not appear in a non-cooperative
+    Block (no strategy places it without setting ``block_axes``)."""
     if isinstance(s, BoundLoop):
         if s.bind != BIND_SERIAL:
-            raise ValueError(f"BIND_THREAD Block cannot contain BoundLoop with bind={s.bind!r}")
+            raise ValueError(f"non-cooperative Block cannot contain BoundLoop with bind={s.bind!r}")
         return Loop(axis=s.axis, body=tuple(_lower_uncooperative(c) for c in s.body))
     if isinstance(s, Combine):
-        raise ValueError("Combine not allowed in BIND_THREAD Block")
+        raise ValueError("Combine not allowed in non-cooperative Block (block_axes must be populated)")
     return s
 
 
-def _materialize_block_per_output(output_axes: tuple, body: tuple) -> Stmt:
-    """``BIND_BLOCK`` — one CUDA block per output slot, threads cooperate."""
+def _materialize_cooperative(thread_axes: tuple, block_axes: tuple, body: tuple) -> Stmt:
+    """Cooperative materialization: one CUDA block per output point in
+    ``block_axes``; a synthetic ``t`` thread axis drives cooperation."""
     t_axis = Axis(name="t", extent=BLOCK_SIZE)
     rename: dict[str, str] = {}
 
@@ -150,7 +147,9 @@ def _materialize_block_per_output(output_axes: tuple, body: tuple) -> Stmt:
         else:
             new_body.append(renamed(stmt))
 
-    return Enclosure(thread_axes=(t_axis,), block_axes=output_axes, body=tuple(new_body))
+    # Cooperative thread axis ``t`` plus any pre-existing thread_axes the
+    # strategy left in place (none today, but the field shape supports it).
+    return Enclosure(thread_axes=(t_axis, *thread_axes), block_axes=block_axes, body=tuple(new_body))
 
 
 def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
@@ -159,7 +158,7 @@ def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
         return StridedLoop(axis=loop.axis, start=Var(t), step=BLOCK_SIZE, body=body)
     if loop.bind == BIND_SERIAL:
         return Loop(axis=loop.axis, body=body)
-    raise NotImplementedError(f"BoundLoop bind={loop.bind!r} inside BIND_BLOCK Block not yet handled")
+    raise NotImplementedError(f"BoundLoop bind={loop.bind!r} inside cooperative Block not yet handled")
 
 
 def _lower_inner(s: Stmt, renamed) -> Stmt:
