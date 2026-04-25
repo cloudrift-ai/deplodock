@@ -35,6 +35,7 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
     TreeHalve,
 )
+from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     BoundLoop,
@@ -224,25 +225,86 @@ def _emit_stage(stage: Stage, stage_buf: str, t: str) -> list[Stmt]:
     """Expand a ``Stage`` Stmt into the smem decl + cooperative load +
     sync sequence that loads the operand once into per-block smem.
 
-    Today only single-axis Stages are supported (1D smem fragment). Multi-
-    axis Stages — needed when matmul lands operand caching for A/B tiles —
-    require a multi-axis cooperative-load StridedLoop and are deferred."""
-    if len(stage.axes) != 1:
-        raise NotImplementedError(f"Stage with {len(stage.axes)} cache axes not yet handled")
-    cache_axis = stage.axes[0]
-    extents = (int(cache_axis.extent),)
+    Single-axis stage emits a direct ``StridedLoop(cache_axis, start=t,
+    step=BLOCK_SIZE)`` (each thread handles every BLOCK_SIZE-th cache
+    position). Multi-axis stage flattens the cache axes into one
+    synthetic linear axis of extent ``prod(extents)``; each thread owns
+    every BLOCK_SIZE-th flat position, decoded back into the per-axis
+    coordinates for the source Load and smem Write indices.
+    """
+    extents = tuple(int(ax.extent) for ax in stage.axes)
+    if not extents:
+        raise ValueError(f"Stage {stage.buf!r} has no cache axes")
     smem = Smem(name=stage_buf, extents=extents)
-    load_name = f"_stage_{stage.buf}_{cache_axis.name}"
+    load_name = f"_stage_{stage.buf}_v"
+
+    if len(stage.axes) == 1:
+        cache_axis = stage.axes[0]
+        cooperative_load = StridedLoop(
+            axis=cache_axis,
+            start=Var(t),
+            step=BLOCK_SIZE,
+            body=(
+                Load(name=load_name, input=stage.buf, index=stage.index),
+                Write(output=stage_buf, index=(Var(cache_axis.name),), value=load_name),
+            ),
+        )
+        return [smem, cooperative_load, Sync()]
+
+    # Multi-axis: row-major flatten cache_axes into a synthetic linear axis.
+    total = 1
+    for e in extents:
+        total *= e
+    flat_name = f"_stage_{stage.buf}_flat"
+    flat_axis = Axis(name=flat_name, extent=total)
+    decode_sigma = _flat_decode_sigma(stage.axes, flat_name)
+
+    source_index = tuple(decode_sigma.apply(e) for e in stage.index)
+    smem_index = tuple(decode_sigma.apply(Var(ax.name)) for ax in stage.axes)
     cooperative_load = StridedLoop(
-        axis=cache_axis,
+        axis=flat_axis,
         start=Var(t),
         step=BLOCK_SIZE,
         body=(
-            Load(name=load_name, input=stage.buf, index=stage.index),
-            Write(output=stage_buf, index=(Var(cache_axis.name),), value=load_name),
+            Load(name=load_name, input=stage.buf, index=source_index),
+            Write(output=stage_buf, index=smem_index, value=load_name),
         ),
     )
     return [smem, cooperative_load, Sync()]
+
+
+def _flat_decode_sigma(cache_axes: tuple[Axis, ...], flat_name: str) -> Sigma:
+    """Decode a flat row-major index back into per-axis coordinates.
+
+    For ``cache_axes = (m_i ext=BM, k_i ext=BK)`` and a flat var ``F``::
+
+        m_i = F / BK
+        k_i = F % BK
+
+    Generalizes to N axes — innermost gets ``F % extent``, the outer
+    chain gets ``(F / inner_stride) % extent`` for middle axes and
+    ``F / inner_stride`` for the outermost (no mod needed)."""
+    flat = Var(flat_name)
+    mapping: dict = {}
+    inner_stride = 1
+    for ax in reversed(cache_axes):
+        ext = int(ax.extent)
+        if inner_stride == 1:
+            mapping[ax.name] = flat % Literal(ext, "int")
+        else:
+            mapping[ax.name] = (flat / Literal(inner_stride, "int")) % Literal(ext, "int")
+        inner_stride *= ext
+    # Simplify the outermost: it's flat / outer_stride with no mod (the
+    # mod by its own extent is redundant since flat < total = outer_extent * outer_stride).
+    outer = cache_axes[0]
+    outer_stride = 1
+    for ax in cache_axes[1:]:
+        outer_stride *= int(ax.extent)
+    if outer_stride == 1:
+        mapping[outer.name] = flat
+    else:
+        mapping[outer.name] = flat / Literal(outer_stride, "int")
+    return Sigma(mapping)
 
 
 def _redirect_loads(stmt: Stmt, redirects: dict[str, tuple[str, tuple[int, ...]]]) -> Stmt:

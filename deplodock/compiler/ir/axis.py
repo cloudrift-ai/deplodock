@@ -77,4 +77,17 @@ class BoundAxis:
         return self.axis.extent
 
 
-__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "BIND_BLOCK_STRIDED", "BIND_SERIAL"]
+def split_axis(ax: Axis, factor: int) -> tuple[Axis, Axis]:
+    """Split ``ax`` into ``(outer, inner)`` for tile-style decomposition.
+
+    Outer extent is ``ax.extent // factor``, inner extent is ``factor``.
+    Names follow the ``f"{ax.name}_o"`` / ``f"{ax.name}_i"`` convention so
+    tiled IR remains readable. v1 requires divisibility — non-divisible
+    extents need a residue-tail story that no current rule wants.
+    """
+    if ax.extent % factor != 0:
+        raise ValueError(f"split_axis: {ax.name} extent {ax.extent} not divisible by {factor}")
+    return Axis(f"{ax.name}_o", ax.extent // factor), Axis(f"{ax.name}_i", factor)
+
+
+__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "BIND_BLOCK_STRIDED", "BIND_SERIAL", "split_axis"]
