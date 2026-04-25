@@ -34,15 +34,25 @@ class Axis:
     extent: int
 
 
-# BoundAxis.bind values — how an axis maps to GPU parallel coords.
+# BoundAxis.bind values — how an axis is treated by the surrounding
+# scheduling context. The same vocabulary spans output axes (in
+# ``Block.axes`` / ``Enclosure.axes``) and inner-iteration axes (in
+# ``BoundLoop.axis``); the value name disambiguates the role.
+
+# --- Output axis bindings (parallel decomposition of the output) ---
 BIND_THREAD = "THREAD"
 BIND_BLOCK = "BLOCK"
-# Output axis whose values are *shared across* all threads of a CUDA block —
-# threads cooperatively walk it via a strided ``BoundLoop`` in the body.
-# Doesn't contribute to launch geometry (Enclosure.axes excludes it); it
-# documents that this dimension of the output is iterated cooperatively
-# rather than mapped to a unique parallel coord.
+# Output axis shared across all threads of a CUDA block — cooperatively
+# walked via a strided ``BoundLoop`` in the body. Doesn't contribute to
+# launch geometry. Also reused for inner-iteration axes that are
+# cooperatively walked at block scope (drops the old ``WALK_STRIDED``).
 BIND_BLOCK_STRIDED = "BLOCK_STRIDED"
+
+# --- Inner-iteration axis bindings (how a loop is walked) ---
+# Each thread iterates the axis privately (renders to a plain serial
+# ``for`` loop). Used on inner axes that are not output axes; drops the
+# old ``WALK_SERIAL``.
+BIND_SERIAL = "SERIAL"
 
 
 @dataclass(frozen=True)
@@ -67,4 +77,4 @@ class BoundAxis:
         return self.axis.extent
 
 
-__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "BIND_BLOCK_STRIDED"]
+__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "BIND_BLOCK_STRIDED", "BIND_SERIAL"]
