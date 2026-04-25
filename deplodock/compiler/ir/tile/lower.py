@@ -1,4 +1,4 @@
-"""Loop IR → Tile IR (single-thread, naive).
+"""Loop IR → Tile IR (naive — outer free axes → thread_axes).
 
 Mechanical translation. Loop IR's leaves (``Load`` / ``Assign`` /
 ``Select`` / ``Write`` / ``Accum`` / ``Cond``) pass through unchanged —
@@ -7,15 +7,18 @@ Tile IR re-uses them directly. Loop IR's ``Loop`` becomes:
 - ``Reduce(axis, body)`` when the body has any ``Accum`` (carries the
   per-tile ``extent`` slot for later tiling strategies).
 - ``Loop(axis, body)`` (Loop IR's own ``Loop``, re-used here) for free
-  iteration. A future ``Enclosure`` will replace this when an axis is
-  bound to a thread / block / cooperative coord.
+  iteration that survives inside an ``Enclosure`` body.
 
-Top-level non-Loop stmts (typically scalar Loads with empty index) lift
-into ``Kernel.prologue`` so they sit above the tid guard at render time.
+**Outer free-Loop chain → ``Enclosure(thread_axes=...)``**. After
+stripping leading non-Loop stmts (scalar Loads) into the TileOp body
+prefix, lowering walks the outer free-Loop chain and strips it into an
+``Enclosure``. Each stripped axis becomes a ``thread_axes`` entry; the
+inside of the deepest stripped Loop becomes the Enclosure body.
 
-The output Kernel has ``thread_axes == ()`` and ``block_axes == ()`` —
-it's a fully-serial single-thread program. ``ExtractGlobalSchedule``
-(step 4) strips the outer free-Loop chain into ``thread_axes``.
+The chain ends at: a level with multiple sibling stmts, a Loop with
+``Accum`` in its immediate body (reduce — can't strip), or no Loop at
+all. ``block_axes`` stays empty here — a future strategy splits some
+``thread_axes`` off into block-tile bindings.
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ from deplodock.compiler.ir.loop import (
     Stmt as LoopStmt,
 )
 from deplodock.compiler.ir.tile.ir import (
+    Axis,
+    Enclosure,
     Param,
     Reduce,
     Stmt,
@@ -37,22 +42,52 @@ from deplodock.compiler.ir.tile.ir import (
 
 
 def lower_naive(loop_op: LoopOp, kernel_name: str, inputs: tuple[Param, ...], output: Param) -> TileOp:
-    """Translate a ``LoopOp`` into a single-thread serial ``TileOp``.
+    """Translate a ``LoopOp`` into a ``TileOp`` with thread axes extracted.
 
-    ``inputs`` and ``output`` populate ``TileOp.params`` (with
-    ``Param.shape`` used by the renderer to row-major-flatten multi-dim
-    ``Load`` / ``Write`` indices). Buffer identity is carried inline on
-    Loop IR's ``Load.input`` and ``Write.output`` — lowering only needs
-    to translate ``Loop`` → ``Reduce`` (when body has Accum) or pass
-    through. ``TileOp.body`` is a single sequence; scalar Loads and other
-    pre-Enclosure stmts sit before any ``Enclosure`` introduced later by
-    ``ExtractGlobalSchedule``.
+    Steps:
+
+    1. Pull leading non-Loop stmts (typically scalar Loads) off the LoopOp
+       body — they sit at the start of ``TileOp.body``, above any Enclosure.
+    2. Descend the outer free-Loop chain, collecting axes until the chain
+       breaks (multi-stmt level, reduce Loop, or no more Loops).
+    3. If any axes were collected, wrap the remaining inner body in an
+       ``Enclosure(thread_axes=...)``. Otherwise, lower the inner body in
+       place (single-thread serial — degenerate kernel).
+
+    ``block_axes`` is empty here — a later strategy splits some axes off
+    into block-tile bindings.
     """
-    return TileOp(
-        body=tuple(_lower_body(loop_op.body)),
-        params=(*inputs, output),
-        name=kernel_name,
-    )
+    leading: list[LoopStmt] = []
+    rest: tuple[LoopStmt, ...] = loop_op.body
+    while rest and not isinstance(rest[0], Loop):
+        leading.append(rest[0])
+        rest = rest[1:]
+
+    thread_axes, inner = _strip_outer_free_chain(rest)
+
+    body: list[Stmt] = list(_lower_body(tuple(leading)))
+    inner_lowered = tuple(_lower_body(inner))
+    if thread_axes:
+        body.append(Enclosure(thread_axes=thread_axes, block_axes=(), body=inner_lowered))
+    else:
+        body.extend(inner_lowered)
+
+    return TileOp(body=tuple(body), params=(*inputs, output), name=kernel_name)
+
+
+def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ...], tuple[LoopStmt, ...]]:
+    """Walk the outer free-Loop chain and return ``(stripped_axes, remainder)``.
+
+    Stops when the current level has more than one stmt, isn't a Loop, or
+    is a Loop whose body contains an ``Accum`` at the immediate level (a
+    reduce Loop — stripping it would lose the accumulator).
+    """
+    axes: list[Axis] = []
+    cur = stmts
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not any(isinstance(s, Accum) for s in cur[0].body):
+        axes.append(cur[0].axis)
+        cur = cur[0].body
+    return tuple(axes), cur
 
 
 def _lower_body(stmts: tuple[LoopStmt, ...]) -> list[Stmt]:
