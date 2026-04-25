@@ -26,11 +26,13 @@ from deplodock.compiler.pipeline.engine import (
 TENSOR_PASSES = ["frontend/decomposition", "frontend/optimization"]
 LOOP_PASSES = [*TENSOR_PASSES, "loop/lifting", "loop/fusion", "loop/matmul"]
 TILE_PASSES = [*LOOP_PASSES, "lowering/tile"]
-CUDA_PASSES = [*TILE_PASSES, "lowering/cuda"]
+KERNEL_PASSES = [*TILE_PASSES, "lowering/kernel"]
+CUDA_PASSES = [*KERNEL_PASSES, "lowering/cuda"]
 
 __all__ = [
     "CUDA_PASSES",
     "CompilerDump",
+    "KERNEL_PASSES",
     "LOOP_PASSES",
     "Match",
     "Pattern",

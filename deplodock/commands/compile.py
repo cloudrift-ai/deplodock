@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, TENSOR_PASSES, TILE_PASSES
+from deplodock.compiler.pipeline import (
+    CUDA_PASSES,
+    KERNEL_PASSES,
+    LOOP_PASSES,
+    TENSOR_PASSES,
+    TILE_PASSES,
+)
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
@@ -25,6 +31,7 @@ _IR_STAGES = {
     "tensor": (TENSOR_PASSES, "graph"),
     "loop": (LOOP_PASSES, "kernels"),
     "tile": (TILE_PASSES, "kernels"),
+    "kernel": (KERNEL_PASSES, "kernels"),
     "cuda": (CUDA_PASSES, "kernels"),
 }
 
@@ -39,6 +46,7 @@ _PASS_SHORTCUTS = {
     "l": "loop/lifting",
     "f": "loop/fusion",
     "t": "lowering/tile",
+    "k": "lowering/kernel",
     "c": "lowering/cuda",
 }
 
@@ -83,7 +91,7 @@ def register_compile_command(subparsers):
             "Pass list to override the default. Accepts either a comma-separated list "
             "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
             "single-letter shortcuts: d=decomposition, o=optimization, l=lifting, "
-            "f=fusion, t=lowering/tile, c=lowering/cuda (so 'dolft' == the first five)."
+            "f=fusion, t=lowering/tile, k=lowering/kernel, c=lowering/cuda."
         ),
     )
     parser.set_defaults(func=handle_compile)

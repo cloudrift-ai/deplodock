@@ -1,35 +1,40 @@
-"""Materialize a ``Block`` into the lowered ``Enclosure`` + ``Tile`` form.
+"""Materialize a Tile-IR ``TileOp`` into a Kernel-IR ``KernelOp``.
 
-Reads the high-level ``Block`` (with or without strategy-placed
-``Combine`` siblings) and emits the concrete kernel shape that
-``lowering/cuda`` + ``render_tileop`` consume::
-
-    Enclosure(thread_axes=…, block_axes=…,
-      [Tile(live_axes=…, extents=…,
-        Smem(...)*,
-        StridedLoop | Loop | Accum | Load | Assign | Write,
-        Sync, TreeHalve, Cond(t == 0, Write), …
-      )] or body directly for pointwise)
+Reads each ``Block`` in the TileOp body and emits the concrete
+hardware shape — ``Enclosure`` / ``Tile`` / ``Smem`` / ``Sync`` /
+``TreeHalve`` / ``StridedLoop`` — that ``render_kernelop`` consumes.
 
 Dispatch is driven by two fields:
 
 - ``Block.output_bind`` — ``BIND_THREAD`` (pointwise or
   one-thread-per-output-slot reduction) vs ``BIND_BLOCK`` (cooperative,
   one CUDA block per output slot).
-- ``BoundLoop.bind`` — ``BIND_SERIAL`` (emit ``loop.Loop``, per-thread
-  walk) vs ``BIND_STRIDED`` (emit ``StridedLoop`` with ``start=Var(t)``,
-  ``step=BLOCK``).
+- ``BoundLoop.bind`` — ``BIND_SERIAL`` (emit Loop-IR ``Loop``, per-thread
+  walk) vs ``BIND_STRIDED`` (emit Kernel-IR ``StridedLoop`` with
+  ``start=Var(t)``, ``step=BLOCK``).
 
 Combine siblings (present only in ``BIND_BLOCK`` mode) emit the smem
 tree-halve phase and set up broadcast ``Load``s. Subsequent reads of
 the combined Accum target are renamed to ``<name>_b`` via
 ``Stmt.rewrite``.
+
+Produces a ``KernelOp`` — distinct type from ``TileOp``, so Kernel-IR
+passes can pattern-match on it.
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.kernel.ir import (
+    Enclosure,
+    KernelOp,
+    Smem,
+    StridedLoop,
+    Sync,
+    Tile,
+    TreeHalve,
+)
 from deplodock.compiler.ir.loop import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     BIND_BLOCK,
@@ -42,13 +47,7 @@ from deplodock.compiler.ir.tile.ir import (
     Block,
     BoundLoop,
     Combine,
-    Enclosure,
-    Smem,
-    StridedLoop,
-    Sync,
-    Tile,
     TileOp,
-    TreeHalve,
 )
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
@@ -63,21 +62,14 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         return None
     tile_op: TileOp = node.op
 
-    if not any(isinstance(s, Block) for s in tile_op.body):
-        return None  # already materialized or nothing to do
-
     new_body: list[Stmt] = []
-    changed = False
     for s in tile_op.body:
         if isinstance(s, Block):
             new_body.append(_materialize(s))
-            changed = True
         else:
             new_body.append(s)
 
-    if not changed:
-        return None
-    node.op = TileOp(body=tuple(new_body), name=tile_op.name)
+    node.op = KernelOp(body=tuple(new_body), name=tile_op.name)
     return None
 
 
@@ -109,9 +101,8 @@ def _materialize_thread_per_output(output_axes: tuple, body: tuple) -> Stmt:
 
 
 def _lower_uncooperative(s: Stmt) -> Stmt:
-    """Translate a ``BoundLoop(bind=SERIAL)`` tree back to Loop-IR ``Loop``.
-    Leaves pass through. ``Combine`` must not appear here (no strategy
-    places it in BIND_THREAD mode)."""
+    """Translate a ``BoundLoop(bind=SERIAL)`` tree to Loop-IR ``Loop``.
+    Leaves pass through. ``Combine`` must not appear here."""
     if isinstance(s, BoundLoop):
         if s.bind != BIND_SERIAL:
             raise ValueError(f"BIND_THREAD Block cannot contain BoundLoop with bind={s.bind!r}")
@@ -122,14 +113,7 @@ def _lower_uncooperative(s: Stmt) -> Stmt:
 
 
 def _materialize_block_per_output(output_axes: tuple, body: tuple) -> Stmt:
-    """``BIND_BLOCK`` — one CUDA block per output slot, threads cooperate.
-
-    Walks ``body`` left-to-right. Each ``BoundLoop(bind=STRIDED)`` becomes
-    a ``StridedLoop`` reading/writing via a cooperative thread axis ``t``.
-    A ``Combine`` triggers the per-Accum smem + tree-halve phase and
-    records an SSA rename so subsequent reads of the Accum target
-    resolve to the broadcast ``Load``.
-    """
+    """``BIND_BLOCK`` — one CUDA block per output slot, threads cooperate."""
     t_axis = Axis(name="t", extent=BLOCK_SIZE)
     rename: dict[str, str] = {}
 
@@ -139,13 +123,11 @@ def _materialize_block_per_output(output_axes: tuple, body: tuple) -> Stmt:
         return s.rewrite(lambda n: rename.get(n, n))
 
     new_body: list[Stmt] = []
-    # Track the most-recently-emitted reduce BoundLoop + its Accum so the
-    # following Combine knows which partial to collapse.
     pending_reduce: tuple[BoundLoop, Accum] | None = None
 
     for stmt in body:
         if isinstance(stmt, BoundLoop):
-            pending_reduce = None  # a BoundLoop resets the pending slot
+            pending_reduce = None
             if _is_reduce(stmt):
                 accum = next(a for a in stmt.body if isinstance(a, Accum))
                 new_body.append(_emit_strided(stmt, t_axis.name, renamed))
@@ -180,7 +162,6 @@ def _materialize_block_per_output(output_axes: tuple, body: tuple) -> Stmt:
 
 
 def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
-    """Convert a ``BoundLoop`` to its post-materialization form per binding."""
     body = tuple(_lower_inner(c, renamed) for c in loop.body)
     if loop.bind == BIND_STRIDED:
         return StridedLoop(axis=loop.axis, start=Var(t), step=BLOCK_SIZE, body=body)
@@ -190,19 +171,12 @@ def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
 
 
 def _lower_inner(s: Stmt, renamed) -> Stmt:
-    """Inside a BoundLoop's body: nested BoundLoops recurse; leaves are
-    SSA-renamed through the accumulated ``rename`` map."""
     if isinstance(s, BoundLoop):
-        # Nested BoundLoops (not used by 1D cooperative today but safe).
         return Loop(axis=s.axis, body=tuple(_lower_inner(c, renamed) for c in s.body))
     return renamed(s)
 
 
 def _emit_combine(combine: Combine, accum: Accum, t: str) -> list[Stmt]:
-    """Emit the per-phase combine. ``REGISTER`` is a no-op (the Accum
-    already lives in the per-thread register). ``SMEM_TREE_HALVE`` stages
-    the partial through smem, halves, re-syncs, and broadcasts the
-    combined value to every thread via a ``Load`` at index 0."""
     if combine.via == COMBINE_REGISTER:
         return []
     if combine.via == COMBINE_SMEM_TREE_HALVE:
