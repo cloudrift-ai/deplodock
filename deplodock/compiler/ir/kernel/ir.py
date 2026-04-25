@@ -2,10 +2,10 @@
 
 Kernel IR sits between Tile IR (schedule decisions as structural Stmts)
 and CUDA source (text). Its body contains the explicit hardware
-machinery: ``Enclosure`` (thread/block coord bindings), ``Tile``
-(cooperative-block marker), ``Smem`` (``__shared__`` arrays), ``Sync``
-(``__syncthreads`` barriers), ``TreeHalve`` (cross-thread reduction
-over smem), ``StridedLoop`` (strided per-thread loop).
+machinery: ``Enclosure`` (thread/block coord bindings), ``Smem``
+(``__shared__`` arrays), ``Sync`` (``__syncthreads`` barriers),
+``TreeHalve`` (cross-thread reduction over smem), ``StridedLoop``
+(strided per-thread loop).
 
 Pipeline shape::
 
@@ -70,18 +70,6 @@ class Enclosure(Stmt):
 
     thread_axes: tuple[Axis, ...]
     block_axes: tuple[Axis, ...]
-    body: tuple[Stmt, ...]
-
-
-@dataclass
-class Tile(Stmt):
-    """Cooperative block marker: body stmts share a per-CUDA-block
-    scratch indexed by ``live_axes``. Structural — render walks the body
-    flat; ``Smem`` / ``Sync`` / ``TreeHalve`` siblings are what actually
-    produce smem + barriers."""
-
-    live_axes: tuple[Axis, ...]
-    extents: tuple[int, ...]
     body: tuple[Stmt, ...]
 
 
@@ -212,7 +200,7 @@ class KernelOp(Op):
 def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
     for s in body:
         yield s
-        if isinstance(s, (Loop, StridedLoop, Enclosure, Tile)):
+        if isinstance(s, (Loop, StridedLoop, Enclosure)):
             yield from iter_body(s.body)
         elif isinstance(s, Cond):
             yield from iter_body(s.body)
@@ -240,7 +228,6 @@ __all__ = [
     "Loop",
     # Kernel-IR statements
     "Enclosure",
-    "Tile",
     "Smem",
     "Sync",
     "TreeHalve",

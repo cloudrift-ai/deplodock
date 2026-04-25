@@ -32,7 +32,6 @@ from deplodock.compiler.ir.kernel.ir import (
     Smem,
     StridedLoop,
     Sync,
-    Tile,
     TreeHalve,
 )
 from deplodock.compiler.ir.loop import Accum, Cond, Load, Loop, Stmt, Write
@@ -90,14 +89,9 @@ def _materialize_thread_per_output(output_axes: tuple, body: tuple) -> Stmt:
     """``BIND_THREAD`` — one thread per output element. Pointwise kernels
     have no inner Loops / Accums; reductions that opted out of cooperation
     stay here with serial per-thread ``Loop`` walks folding ``Accum``
-    into per-thread registers (Tile wrapper preserves the register scope)."""
+    into per-thread registers."""
     lowered = tuple(_lower_uncooperative(s) for s in body)
-    if _has_accum(body):
-        extents = tuple(int(ax.extent) for ax in output_axes)
-        wrapped: tuple = (Tile(live_axes=output_axes, extents=extents, body=lowered),)
-    else:
-        wrapped = lowered
-    return Enclosure(thread_axes=output_axes, block_axes=(), body=wrapped)
+    return Enclosure(thread_axes=output_axes, block_axes=(), body=lowered)
 
 
 def _lower_uncooperative(s: Stmt) -> Stmt:
@@ -156,9 +150,7 @@ def _materialize_block_per_output(output_axes: tuple, body: tuple) -> Stmt:
         else:
             new_body.append(renamed(stmt))
 
-    extents = tuple(int(ax.extent) for ax in output_axes)
-    tile = Tile(live_axes=output_axes, extents=extents, body=tuple(new_body))
-    return Enclosure(thread_axes=(t_axis,), block_axes=output_axes, body=(tile,))
+    return Enclosure(thread_axes=(t_axis,), block_axes=output_axes, body=tuple(new_body))
 
 
 def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
@@ -195,12 +187,3 @@ def _emit_combine(combine: Combine, accum: Accum, t: str) -> list[Stmt]:
 
 def _is_reduce(loop: BoundLoop) -> bool:
     return any(isinstance(s, Accum) for s in loop.body)
-
-
-def _has_accum(stmts: tuple) -> bool:
-    for s in stmts:
-        if isinstance(s, Accum):
-            return True
-        if isinstance(s, BoundLoop) and _has_accum(s.body):
-            return True
-    return False

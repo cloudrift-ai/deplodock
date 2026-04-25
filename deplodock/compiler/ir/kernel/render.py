@@ -35,7 +35,6 @@ from deplodock.compiler.ir.kernel.ir import (
     Stmt,
     StridedLoop,
     Sync,
-    Tile,
     TreeHalve,
 )
 from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
@@ -238,9 +237,6 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
     if isinstance(stmt, Enclosure):
         return _render_enclosure(stmt, ctx)
 
-    if isinstance(stmt, Tile):
-        return _render_tile(stmt, ctx)
-
     if isinstance(stmt, Smem):
         return _render_smem(stmt, ctx)
 
@@ -253,24 +249,7 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
     if isinstance(stmt, StridedLoop):
         return _render_strided_loop(stmt, ctx)
 
-    raise TypeError(f"render: unhandled Tile IR stmt {type(stmt).__name__}")
-
-
-def _render_tile(stmt: Tile, ctx: _Ctx) -> list[str]:
-    """Render a cooperative ``Tile`` block as a flat sequence of children.
-
-    The ``Tile`` is a structural marker; it owns no rendered code itself.
-    Synchronization, smem, and tree-halves are explicit Stmts in the body
-    placed by strategy passes. When the surrounding ``Enclosure`` runs
-    one-thread-per-slot, the body is just ``Loop``/``Accum``/``Write`` and
-    folds through into per-thread registers. When cooperative, the body
-    contains ``Smem`` + ``StridedLoop`` + ``Sync`` + ``TreeHalve`` + a
-    guarded ``Write`` — render handles each in turn.
-    """
-    out: list[str] = []
-    for s in stmt.body:
-        out.extend(_render_stmt(s, ctx))
-    return out
+    raise TypeError(f"render: unhandled Kernel IR stmt {type(stmt).__name__}")
 
 
 def _render_smem(stmt: Smem, ctx: _Ctx) -> list[str]:

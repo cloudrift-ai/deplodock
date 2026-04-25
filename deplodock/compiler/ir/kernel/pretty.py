@@ -1,10 +1,9 @@
 """Kernel IR pretty-printer — structural view of a ``KernelOp``.
 
 Used by ``deplodock compile --ir kernel`` so the scheduled form is
-inspectable. Handles the Kernel-IR primitives (``Enclosure`` / ``Tile``
-/ ``Smem`` / ``Sync`` / ``TreeHalve`` / ``StridedLoop``) plus Loop-IR
-leaves (``Load`` / ``Assign`` / ``Accum`` / ``Write`` / ``Cond`` /
-``Loop``).
+inspectable. Handles the Kernel-IR primitives (``Enclosure`` / ``Smem``
+/ ``Sync`` / ``TreeHalve`` / ``StridedLoop``) plus Loop-IR leaves
+(``Load`` / ``Assign`` / ``Accum`` / ``Write`` / ``Cond`` / ``Loop``).
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ from deplodock.compiler.ir.kernel.ir import (
     Stmt,
     StridedLoop,
     Sync,
-    Tile,
     TreeHalve,
 )
 from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
@@ -43,12 +41,6 @@ def _render_stmt(stmt: Stmt, indent: str, lines: list[str]) -> None:
         ta = ", ".join(f"{a.name}:{a.extent}" for a in stmt.thread_axes) or "-"
         ba = ", ".join(f"{a.name}:{a.extent}" for a in stmt.block_axes) or "-"
         lines.append(f"{indent}Enclosure(thread_axes=({ta}), block_axes=({ba})):")
-        _render_body(stmt.body, indent + "    ", lines)
-        return
-    if isinstance(stmt, Tile):
-        la = ", ".join(f"{a.name}:{a.extent}" for a in stmt.live_axes) or "-"
-        ext = ", ".join(str(e) for e in stmt.extents) or "-"
-        lines.append(f"{indent}Tile(live_axes=({la}), extents=({ext})):")
         _render_body(stmt.body, indent + "    ", lines)
         return
     if isinstance(stmt, Smem):

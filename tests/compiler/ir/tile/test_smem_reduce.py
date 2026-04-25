@@ -3,9 +3,9 @@
 The strategy (``lowering/tile/002_cooperative_reduce``) flips bindings
 on a Tile-IR ``Block``; the materialization pass
 (``lowering/kernel/001_materialize_block``) then produces a Kernel-IR
-``KernelOp`` with ``Enclosure`` / ``Tile`` / ``Smem`` / ``Sync`` /
-``TreeHalve`` / ``StridedLoop``. These tests run both passes and assert
-on the resulting Kernel-IR shape.
+``KernelOp`` with ``Enclosure`` / ``Smem`` / ``Sync`` / ``TreeHalve`` /
+``StridedLoop``. These tests run both passes and assert on the
+resulting Kernel-IR shape.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from deplodock.compiler.ir.kernel.ir import (
     Smem,
     StridedLoop,
     Sync,
-    Tile,
     TreeHalve,
 )
 from deplodock.compiler.ir.kernel.render import render_kernelop
@@ -83,9 +82,7 @@ def test_strategy_rewrites_above_threshold():
     assert encl.thread_axes[0].name == "t"
     assert encl.thread_axes[0].extent == 256
 
-    tile = encl.body[0]
-    assert isinstance(tile, Tile)
-    body_kinds = [type(s).__name__ for s in tile.body]
+    body_kinds = [type(s).__name__ for s in encl.body]
     assert "Smem" in body_kinds
     assert "StridedLoop" in body_kinds
     assert "Sync" in body_kinds
@@ -100,9 +97,7 @@ def test_strategy_skips_below_threshold():
     kernel_op = g.nodes["y"].op
     encl = next(s for s in kernel_op.body if isinstance(s, Enclosure))
     assert encl.block_axes == ()
-    tile = encl.body[0]
-    assert isinstance(tile, Tile)
-    for s in tile.body:
+    for s in encl.body:
         assert not isinstance(s, (Smem, Sync, TreeHalve, StridedLoop))
 
 
@@ -175,9 +170,8 @@ def test_strategy_handles_two_phase_softmax_shape():
 
     kernel_op = g.nodes["y"].op
     encl = next(s for s in kernel_op.body if isinstance(s, Enclosure))
-    tile = encl.body[0]
-    smem_decls = [s for s in tile.body if isinstance(s, Smem)]
-    halves = [s for s in tile.body if isinstance(s, TreeHalve)]
+    smem_decls = [s for s in encl.body if isinstance(s, Smem)]
+    halves = [s for s in encl.body if isinstance(s, TreeHalve)]
     assert len(smem_decls) == 2
     assert len(halves) == 2
     assert halves[0].op.name == "maximum"

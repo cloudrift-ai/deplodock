@@ -2,18 +2,14 @@
 
 Tile IR is the schedule-decision layer produced by ``lower_naive``. The
 materialization pass converts it to Kernel IR (``KernelOp`` with
-``Enclosure`` / ``Tile`` / ``Smem`` / ``StridedLoop`` / ``TreeHalve``).
-These tests exercise the nodes directly and the pipeline boundary.
+``Enclosure`` / ``Smem`` / ``StridedLoop`` / ``TreeHalve``). These
+tests exercise the nodes directly and the pipeline boundary.
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.kernel.ir import Enclosure as KernelEnclosure
-from deplodock.compiler.ir.kernel.ir import KernelOp
-from deplodock.compiler.ir.kernel.ir import Tile as KernelTile
-from deplodock.compiler.ir.kernel.render import render_kernelop
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tile.ir import BIND_THREAD, Block, BoundLoop, TileOp, iter_body
 from deplodock.compiler.ir.tile.lower import lower_naive
@@ -86,33 +82,6 @@ def test_lower_naive_produces_block_for_pointwise():
     tile_op = lower_naive(pointwise, kernel_name="pw")
     blocks = [s for s in tile_op.body if isinstance(s, Block)]
     assert len(blocks) == 1
-
-
-def test_kernel_tile_renders_as_passthrough():
-    """A Kernel-IR ``Tile`` wrapping a body produces the same CUDA as the
-    body directly — the Tile is a structural marker only."""
-    i = Axis("i", 4)
-    k = Axis("k", 8)
-    inner_stmts = (
-        Loop(
-            axis=k,
-            body=(
-                Load(name="x_v", input="x", index=(Var("i"), Var("k"))),
-                Accum(name="acc", value="x_v", op=ElementwiseImpl("add")),
-            ),
-        ),
-        Write(output="y", index=(Var("i"),), value="acc"),
-    )
-    encl_no_tile = KernelEnclosure(thread_axes=(i,), block_axes=(), body=inner_stmts)
-    encl_with_tile = KernelEnclosure(
-        thread_axes=(i,),
-        block_axes=(),
-        body=(KernelTile(live_axes=(i,), extents=(4,), body=inner_stmts),),
-    )
-    shapes = {"x": (4, 8), "y": (4,)}
-    src_a = render_kernelop(KernelOp(body=(encl_no_tile,), name="r"), shapes=shapes)
-    src_b = render_kernelop(KernelOp(body=(encl_with_tile,), name="r"), shapes=shapes)
-    assert src_a == src_b
 
 
 def test_tileop_container_preserves_name():
