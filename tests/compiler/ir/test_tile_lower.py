@@ -20,12 +20,12 @@ from deplodock.compiler.ir.loop import (
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile import (
-    Kernel,
     Param,
     Reduce,
+    TileOp,
 )
 from deplodock.compiler.ir.tile.lower import lower_naive
-from deplodock.compiler.ir.tile.render import render_kernel
+from deplodock.compiler.ir.tile.render import render_tileop
 
 # ---------------------------------------------------------------------------
 # Pointwise add — minimal shape exercise
@@ -66,10 +66,9 @@ def test_pointwise_add_structure():
     inputs, output = _pointwise_add_params()
     k = lower_naive(op, "add", inputs, output)
 
-    assert isinstance(k, Kernel)
+    assert isinstance(k, TileOp)
     assert k.name == "add"
-    assert k.thread_axes == ()
-    assert k.prologue == ()
+    # Naive lowering: no Enclosure, single-thread serial body.
     outer = k.body[0]
     assert isinstance(outer, Loop) and outer.axis.name == "a0"
     inner = outer.body[0]
@@ -82,7 +81,7 @@ def test_pointwise_add_structure():
 def test_pointwise_add_renders():
     op = _pointwise_add_loop_op()
     inputs, output = _pointwise_add_params()
-    src = render_kernel(lower_naive(op, "add", inputs, output))
+    src = render_tileop(lower_naive(op, "add", inputs, output))
     # ``LoopOp.__post_init__`` normalizes SSA names → in0/in1 for Loads, v0 for Assign.
     assert "for (int a0 = 0; a0 < 4; a0++) {" in src
     assert "for (int a1 = 0; a1 < 8; a1++) {" in src
@@ -138,7 +137,7 @@ def test_row_sum_structure():
 
 def test_row_sum_renders():
     op = _row_sum_loop_op()
-    src = render_kernel(
+    src = render_tileop(
         lower_naive(
             op,
             "row_sum",
@@ -220,7 +219,7 @@ def test_softmax_like_structure():
 
 def test_softmax_like_renders():
     op = _softmax_like_loop_op()
-    src = render_kernel(
+    src = render_tileop(
         lower_naive(
             op,
             "softmax",
@@ -290,7 +289,7 @@ def test_matmul_structure():
 
 def test_matmul_renders():
     op = _matmul_loop_op()
-    src = render_kernel(
+    src = render_tileop(
         lower_naive(
             op,
             "matmul",
@@ -309,12 +308,13 @@ def test_matmul_renders():
 
 
 # ---------------------------------------------------------------------------
-# Top-level scalar Loads → prologue
+# Top-level scalar Loads sit at the start of TileOp.body
 # ---------------------------------------------------------------------------
 
 
 def _scalar_prologue_loop_op() -> LoopOp:
-    """A LoopOp with a scalar Load above the outer Loop — should land in prologue."""
+    """A LoopOp with a scalar Load above the outer Loop — should land at the
+    start of the TileOp body (above any Enclosure introduced by a later pass)."""
     a0 = Axis("a0", 4)
     return LoopOp(
         body=(
@@ -331,7 +331,7 @@ def _scalar_prologue_loop_op() -> LoopOp:
     )
 
 
-def test_scalar_prologue_lifts_to_kernel_prologue():
+def test_scalar_prologue_at_body_start():
     op = _scalar_prologue_loop_op()
     k = lower_naive(
         op,
@@ -339,16 +339,15 @@ def test_scalar_prologue_lifts_to_kernel_prologue():
         (Param("X", "const float*", shape=(4,)), Param("Eps", "const float*", shape=(1,))),
         Param("out", "float*", shape=(4,)),
     )
-    assert len(k.prologue) == 1
-    # Loop IR leaf passes through; Load.name canonicalized to in0 (first Load in pre-order).
-    assert isinstance(k.prologue[0], Load)
-    assert k.prologue[0].name == "in0"
-    assert isinstance(k.body[0], Loop)
+    # The leading scalar Load passes through to body[0].
+    assert isinstance(k.body[0], Load)
+    assert k.body[0].name == "in0"
+    assert isinstance(k.body[1], Loop)
 
 
 def test_scalar_prologue_renders_above_body():
     op = _scalar_prologue_loop_op()
-    src = render_kernel(
+    src = render_tileop(
         lower_naive(
             op,
             "scalar_pro",

@@ -36,13 +36,14 @@ from deplodock.compiler.ir.expr import (
 from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
 from deplodock.compiler.ir.tile.ir import (
     Coop,
+    Enclosure,
     Expr,
-    Kernel,
     Reduce,
     SmemBuf,
     Stmt,
     Sync,
     Tile,
+    TileOp,
 )
 
 # ---------------------------------------------------------------------------
@@ -118,50 +119,36 @@ def _pad(indent: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Top-level: render_kernel
+# Top-level: render_tileop
 # ---------------------------------------------------------------------------
 
 
-def render_kernel(kernel: Kernel) -> str:
-    """Render a complete ``extern "C" __global__`` CUDA function."""
+# Block size for thread-axes flattening — fixed at 256 until a strategy
+# specifies otherwise. (Future ``Enclosure`` will carry the choice.)
+_BLOCK_SIZE = 256
+
+
+def render_tileop(tile_op: TileOp) -> str:
+    """Render a complete ``extern "C" __global__`` CUDA function for a ``TileOp``."""
     shapes: dict[str, tuple[int, ...]] = {}
-    for p in kernel.params:
+    for p in tile_op.params:
         if p.shape:
             shapes[p.name] = p.shape
-    for s in kernel.smem:
+    for s in tile_op.smem:
         shapes[s.name] = s.dims
     ctx = _Ctx(shapes=shapes, indent=1)
 
-    params_text = ", ".join(f"{p.dtype} {p.name}" for p in kernel.params)
-    bx, by, bz = kernel.block
-    max_threads = bx * by * bz
-    launch_bounds = f"\n__launch_bounds__({max_threads})" if max_threads <= 1024 else ""
+    params_text = ", ".join(f"{p.dtype} {p.name}" for p in tile_op.params)
+    launch_bounds = f"\n__launch_bounds__({_BLOCK_SIZE})"
 
     body_lines: list[str] = []
-
-    for sb in kernel.smem:
+    for sb in tile_op.smem:
         body_lines.append(_render_smem_decl(sb, ctx))
-
-    for s in kernel.prologue:
+    for s in tile_op.body:
         body_lines.extend(_render_stmt(s, ctx))
 
-    if kernel.thread_axes:
-        n_threads = 1
-        for ax in kernel.thread_axes:
-            n_threads *= int(ax.extent)
-        body_lines.append(f"{_pad(ctx.indent)}long long tid = blockIdx.x * blockDim.x + threadIdx.x;")
-        body_lines.append(f"{_pad(ctx.indent)}if (tid < {n_threads}) {{")
-        guarded = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1)
-        body_lines.extend(_render_thread_axis_decode(kernel.thread_axes, guarded))
-        for s in kernel.body:
-            body_lines.extend(_render_stmt(s, guarded))
-        body_lines.append(f"{_pad(ctx.indent)}}}")
-    else:
-        for s in kernel.body:
-            body_lines.extend(_render_stmt(s, ctx))
-
     body_text = "\n".join(body_lines)
-    return f'extern "C" __global__{launch_bounds} void {kernel.name}({params_text}) {{\n{body_text}\n}}\n'
+    return f'extern "C" __global__{launch_bounds} void {tile_op.name}({params_text}) {{\n{body_text}\n}}\n'
 
 
 def _render_smem_decl(sb: SmemBuf, ctx: _Ctx) -> str:
@@ -249,7 +236,31 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
     if isinstance(stmt, Coop):
         return _render_for(stmt.var, "threadIdx.x", stmt.cover, step="blockDim.x", body=stmt.body, ctx=ctx)
 
+    if isinstance(stmt, Enclosure):
+        return _render_enclosure(stmt, ctx)
+
     raise TypeError(f"render: unhandled Tile IR stmt {type(stmt).__name__}")
+
+
+def _render_enclosure(stmt: Enclosure, ctx: _Ctx) -> list[str]:
+    """Emit ``tid = blockIdx.x * blockDim.x + threadIdx.x; if (tid < N) {
+    <axis decode> <body> }`` for the schedule wrapper. ``block_axes`` is
+    not yet wired (no strategy populates it); when added, render will
+    decode ``blockIdx.x/y/z`` similarly."""
+    pad = _pad(ctx.indent)
+    n_threads = 1
+    for ax in stmt.thread_axes:
+        n_threads *= int(ax.extent)
+    out = [
+        f"{pad}long long tid = blockIdx.x * blockDim.x + threadIdx.x;",
+        f"{pad}if (tid < {n_threads}) {{",
+    ]
+    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1)
+    out.extend(_render_thread_axis_decode(stmt.thread_axes, inner))
+    for s in stmt.body:
+        out.extend(_render_stmt(s, inner))
+    out.append(f"{pad}}}")
+    return out
 
 
 def _render_cond(stmt: Cond, ctx: _Ctx) -> list[str]:
@@ -421,4 +432,4 @@ def _select_to_ternary(s: Select) -> Expr:
     return result
 
 
-__all__ = ["render_kernel"]
+__all__ = ["render_tileop"]
