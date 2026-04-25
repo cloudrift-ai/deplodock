@@ -1,9 +1,9 @@
-"""Tile IR → CUDA source.
+"""Kernel IR → CUDA source.
 
-Renders a ``TileOp`` to a complete ``extern "C" __global__`` CUDA function
-text. The renderer is purely mechanical: every Tile IR node has a fixed
-emission rule. Strategies that produce different Tile IR all flow through
-this same renderer; codegen has no schedule awareness.
+Renders a ``KernelOp`` to a complete ``extern "C" __global__`` CUDA
+function text. The renderer is purely mechanical: every Kernel-IR node
+has a fixed emission rule. Kernel IR is the fully-scheduled form — no
+strategy / decision logic reaches here.
 
 Loop IR's ``Load`` / ``Assign`` / ``Select`` / ``Write`` / ``Accum`` are
 rendered directly: ``Load`` becomes ``float <name> = <buf>[<flat>];``,
@@ -27,18 +27,18 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
-from deplodock.compiler.ir.tile.ir import (
+from deplodock.compiler.ir.kernel.ir import (
     Enclosure,
     Expr,
+    KernelOp,
     Smem,
     Stmt,
     StridedLoop,
     Sync,
     Tile,
-    TileOp,
     TreeHalve,
 )
+from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
 
 # ---------------------------------------------------------------------------
 # CUDA spelling translation — TODO step 6: dedupe with cuda/_emit.py
@@ -113,7 +113,7 @@ def _pad(indent: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Top-level: render_tileop
+# Top-level: render_kernelop
 # ---------------------------------------------------------------------------
 
 
@@ -123,8 +123,8 @@ def _pad(indent: int) -> str:
 _BLOCK_SIZE = 256
 
 
-def render_tileop(tile_op: TileOp, shapes: dict[str, tuple[int, ...]] | None = None) -> str:
-    """Render a complete ``extern "C" __global__`` CUDA function for a ``TileOp``.
+def render_kernelop(kernel_op: KernelOp, shapes: dict[str, tuple[int, ...]] | None = None) -> str:
+    """Render a complete ``extern "C" __global__`` CUDA function for a ``KernelOp``.
 
     ``shapes`` maps each global-buffer name (anything appearing on a
     ``Load.input`` or ``Write.output``) to its declared shape; the
@@ -133,32 +133,32 @@ def render_tileop(tile_op: TileOp, shapes: dict[str, tuple[int, ...]] | None = N
     (``{nid: graph.nodes[nid].output.shape for nid in ...}``); tests pass
     it as a literal dict.
 
-    Kernel signature is derived from the body: ``tile_op.inputs`` (distinct
-    ``Load.input`` names) become ``const float*`` params, ``tile_op.outputs``
+    Kernel signature is derived from the body: ``kernel_op.inputs`` (distinct
+    ``Load.input`` names) become ``const float*`` params, ``kernel_op.outputs``
     (distinct ``Write.output`` names) become ``float*`` params, ordered
     by first appearance.
     """
     ctx = _Ctx(shapes=dict(shapes or {}), indent=1)
 
-    sig_parts = [f"const float* {n}" for n in tile_op.inputs]
-    sig_parts.extend(f"float* {n}" for n in tile_op.outputs)
+    sig_parts = [f"const float* {n}" for n in kernel_op.inputs]
+    sig_parts.extend(f"float* {n}" for n in kernel_op.outputs)
     params_text = ", ".join(sig_parts)
-    bounds = _launch_bounds_for(tile_op)
+    bounds = _launch_bounds_for(kernel_op)
     launch_bounds = f"\n__launch_bounds__({bounds})"
 
     body_lines: list[str] = []
-    for s in tile_op.body:
+    for s in kernel_op.body:
         body_lines.extend(_render_stmt(s, ctx))
 
     body_text = "\n".join(body_lines)
-    return f'extern "C" __global__{launch_bounds} void {tile_op.name}({params_text}) {{\n{body_text}\n}}\n'
+    return f'extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
 
 
-def _launch_bounds_for(tile_op: TileOp) -> int:
+def _launch_bounds_for(kernel_op: KernelOp) -> int:
     """Derive ``__launch_bounds__`` from the first ``Enclosure``'s thread axes
     when ``block_axes`` is populated; otherwise fall back to the legacy
     ``_BLOCK_SIZE`` cap (which the host-side launcher rounds up the grid for)."""
-    for s in tile_op.body:
+    for s in kernel_op.body:
         if isinstance(s, Enclosure):
             if s.block_axes:
                 bsize = 1
@@ -572,4 +572,4 @@ def _select_to_ternary(s: Select) -> Expr:
     return result
 
 
-__all__ = ["render_tileop"]
+__all__ = ["render_kernelop"]

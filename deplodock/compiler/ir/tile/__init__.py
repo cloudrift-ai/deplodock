@@ -1,15 +1,15 @@
-"""Tile IR — schedule + leaf compute, lowered directly to CUDA source.
+"""Tile IR — schedule decisions as structural Stmts, pre-materialization.
 
-- :mod:`.ir` — dataclass definitions: high-level ``Block`` /
-  ``BoundLoop`` / ``Combine`` (pre-materialization), low-level
-  ``Enclosure`` / ``Tile`` / ``Smem`` / ``Sync`` / ``StridedLoop`` /
-  ``TreeHalve`` (post-materialization), plus the ``TileOp`` wrapper.
-  Loop-IR leaves (``Load`` / ``Assign`` / ``Select`` / ``Write`` /
-  ``Accum`` / ``Cond`` / ``Loop``) and shared expressions from
-  :mod:`ir.expr` are re-exported here.
+- :mod:`.ir` — dataclass definitions: ``Block`` / ``BoundLoop`` /
+  ``Combine`` + binding constants, plus re-exports of Loop-IR leaves
+  and shared expressions.
+- :mod:`.lower` — ``lower_naive`` translating Loop-IR ``LoopOp`` to Tile-IR
+  ``TileOp`` with a logical ``Block``.
+- :mod:`.pretty` — structural pretty-printer for ``TileOp``.
 
-Subsequent siblings (``render.py``, lowering passes, schedule strategies)
-land alongside; this module holds only the type definitions.
+Materialization (Tile IR → Kernel IR) lives under
+``passes/lowering/kernel``; rendering of Kernel IR to CUDA source lives
+under ``ir.kernel``.
 """
 
 from deplodock.compiler.ir.tile.ir import (
@@ -30,7 +30,6 @@ from deplodock.compiler.ir.tile.ir import (
     Combine,
     Cond,
     ElementwiseImpl,
-    Enclosure,
     Expr,
     FuncCallExpr,
     Literal,
@@ -38,20 +37,14 @@ from deplodock.compiler.ir.tile.ir import (
     Loop,
     Select,
     SelectBranch,
-    Smem,
     Stmt,
-    StridedLoop,
-    Sync,
     TernaryExpr,
-    Tile,
     TileOp,
-    TreeHalve,
     Var,
     Write,
 )
 
 __all__ = [
-    # Shared expressions
     "Var",
     "Literal",
     "BinaryExpr",
@@ -60,7 +53,6 @@ __all__ = [
     "TernaryExpr",
     "CastExpr",
     "Expr",
-    # Loop-IR leaves + control flow
     "Load",
     "Assign",
     "Select",
@@ -69,18 +61,9 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    # Tile-IR statements — low-level (post-materialization)
-    "Enclosure",
-    "Tile",
-    "Smem",
-    "Sync",
-    "TreeHalve",
-    "StridedLoop",
-    # Tile-IR statements — high-level (pre-materialization)
     "Block",
     "BoundLoop",
     "Combine",
-    # Binding + Combine kind constants
     "BIND_SERIAL",
     "BIND_STRIDED",
     "BIND_THREAD",
@@ -88,9 +71,7 @@ __all__ = [
     "COMBINE_REGISTER",
     "COMBINE_SMEM_TREE_HALVE",
     "Stmt",
-    # Top-level
     "TileOp",
-    # Re-exports
     "Axis",
     "ElementwiseImpl",
 ]

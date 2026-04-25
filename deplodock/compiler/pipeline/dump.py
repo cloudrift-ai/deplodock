@@ -156,10 +156,12 @@ def format_kernels(graph: Graph) -> str:
     minimal: ``=== N: <name> ===``.
     """
     from deplodock.compiler.ir.cuda import CudaOp
+    from deplodock.compiler.ir.kernel import KernelOp
+    from deplodock.compiler.ir.kernel.pretty import pretty_print as pp_kernel
     from deplodock.compiler.ir.loop import LoopOp
     from deplodock.compiler.ir.loop import pretty_print as pp_loop
     from deplodock.compiler.ir.tile import TileOp
-    from deplodock.compiler.ir.tile.render import render_tileop
+    from deplodock.compiler.ir.tile.pretty import pretty_print as pp_tile
 
     seen_cuda: set[str] = set()
     blocks: list[str] = []
@@ -172,11 +174,11 @@ def format_kernels(graph: Graph) -> str:
             name = f"{nid} -> {node.output.name}"
             body = pp_loop(op, port_buffers=port_buffers)
         elif isinstance(op, TileOp):
-            shapes = {bid: tuple(graph.nodes[bid].output.shape) for bid in op.inputs}
-            for out in op.outputs:
-                shapes[out] = tuple(graph.nodes[out].output.shape) if out in graph.nodes else tuple(node.output.shape)
             name = op.name
-            body = render_tileop(op, shapes=shapes)
+            body = pp_tile(op)
+        elif isinstance(op, KernelOp):
+            name = op.name
+            body = pp_kernel(op)
         elif isinstance(op, CudaOp):
             if op.kernel_name in seen_cuda:
                 continue
