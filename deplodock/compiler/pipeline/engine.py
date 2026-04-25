@@ -187,12 +187,22 @@ def _apply_rules(graph: Graph, rules: list[_Rule]) -> Graph:
                 for match in matches:
                     if any(nid not in graph.nodes for nid in match.consumed):
                         continue
-                    logger.debug("Rule %s matched at %s", rule.name, match.root_node_id)
                     t1 = time.monotonic()
+                    # -vv: snapshot matched-node ops before rewrite so in-place
+                    # mutations (rules that set ``node.op = ...`` and return
+                    # None — e.g. lowering/tile) can render a before/after.
+                    debug_on = logger.isEnabledFor(logging.DEBUG)
+                    pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes} if debug_on else {}
                     fragment = rule.rewrite(graph, match)
                     if fragment is None:
+                        if debug_on and any(graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops if nid in graph.nodes):
+                            logger.debug(_format_inplace_application(rule.name, graph, match, pre_ops))
                         rewrite_time += time.monotonic() - t1
                         continue
+                    # (TODO: also wire to ``CompilerDump.on_rule`` for
+                    # ``--dump-dir`` symmetry.)
+                    if debug_on:
+                        logger.debug(_format_rule_application(rule.name, graph, match, fragment))
                     graph = _apply_replacement(graph, match, fragment)
                     rewrite_time += time.monotonic() - t1
                     applied += 1
@@ -206,6 +216,87 @@ def _apply_rules(graph: Graph, rules: list[_Rule]) -> Graph:
         if n or mt > 0.01:
             logger.info("  rule %-30s applied=%4d  match=%5.2fs  rewrite=%5.2fs", name, n, mt, rt)
     return graph
+
+
+# ---------------------------------------------------------------------------
+# Per-rule snapshot formatting (used at DEBUG, i.e. ``compile -vv``)
+# ---------------------------------------------------------------------------
+
+
+def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Graph) -> str:
+    """Render a one-rule-application snapshot: matched subgraph (the
+    nodes selected from the host graph) + rewritten fragment. Kernel
+    ops (LoopOp/TileOp/KernelOp/CudaOp) are pretty-printed via their
+    dedicated printers rather than dumped as a body repr."""
+    matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
+    matched_ids.add(match.root_node_id)
+
+    lines = [f"=== rule {name} matched at {match.root_node_id} ==="]
+    lines.append("before:")
+    matched_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes]
+    lines.extend(f"    {line}" for line in _format_nodes(matched_nodes, graph).splitlines())
+    lines.append("after:")
+    frag_nodes = [fragment.nodes[nid] for nid in fragment.topological_order()]
+    lines.extend(f"    {line}" for line in _format_nodes(frag_nodes, fragment).splitlines())
+    return "\n".join(lines)
+
+
+def _format_inplace_application(name: str, graph: Graph, match: Match, pre_ops: dict) -> str:
+    """Snapshot for rules that mutate ``node.op`` in place and return
+    None (e.g. lowering/tile). Renders before/after of the mutated
+    nodes by swapping their op temporarily for the "before" view."""
+    mutated = [nid for nid, prev in pre_ops.items() if nid in graph.nodes and graph.nodes[nid].op is not prev]
+    lines = [f"=== rule {name} matched at {match.root_node_id} (in-place) ==="]
+    lines.append("before:")
+    post_ops = {nid: graph.nodes[nid].op for nid in mutated}
+    for nid in mutated:
+        graph.nodes[nid].op = pre_ops[nid]
+    before_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
+    lines.extend(f"    {line}" for line in _format_nodes(before_nodes, graph).splitlines())
+    for nid in mutated:
+        graph.nodes[nid].op = post_ops[nid]
+    lines.append("after:")
+    after_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
+    lines.extend(f"    {line}" for line in _format_nodes(after_nodes, graph).splitlines())
+    return "\n".join(lines)
+
+
+def _format_nodes(nodes: list, graph: Graph) -> str:
+    """Render a list of nodes as readable text. Kernel-IR ops use their
+    dedicated body pretty-printer; everything else falls back to a
+    ``name: ClsName(args)`` one-liner."""
+    from deplodock.compiler.graph import _fmt_op
+    from deplodock.compiler.ir.base import ConstantOp, InputOp
+    from deplodock.compiler.ir.cuda import CudaOp
+    from deplodock.compiler.ir.kernel import KernelOp
+    from deplodock.compiler.ir.kernel.pretty import pretty_print as pp_kernel
+    from deplodock.compiler.ir.loop import LoopOp
+    from deplodock.compiler.ir.loop import pretty_print as pp_loop
+    from deplodock.compiler.ir.tile import TileOp
+    from deplodock.compiler.ir.tile.pretty import pretty_print as pp_tile
+
+    lines: list[str] = []
+    for node in nodes:
+        op = node.op
+        if isinstance(op, (InputOp, ConstantOp)):
+            continue
+        arg_names = [graph.nodes[inp].output.name for inp in node.inputs if inp in graph.nodes]
+        header = f"{node.output.name} = {type(op).__name__}({', '.join(arg_names)})"
+        if isinstance(op, LoopOp):
+            port_buffers = arg_names + [node.output.name]
+            body = pp_loop(op, port_buffers=port_buffers)
+        elif isinstance(op, TileOp):
+            body = pp_tile(op)
+        elif isinstance(op, KernelOp):
+            body = pp_kernel(op)
+        elif isinstance(op, CudaOp):
+            body = op.kernel_source
+        else:
+            lines.append(f"{node.output.name} = {_fmt_op(node, graph)}")
+            continue
+        lines.append(header)
+        lines.extend(f"  {line}" for line in body.splitlines())
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
