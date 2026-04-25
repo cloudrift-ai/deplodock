@@ -315,7 +315,12 @@ def _process_matmul_body(body: tuple, thread_axis_names: set, tid_expr, redirect
 def _emit_stage_expr_start(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]:
     """Variant of ``_emit_stage`` that takes a pre-built linear thread
     Expr as the strided-load start. Used by matmul materialization where
-    no synthesized ``t`` axis exists."""
+    no synthesized ``t`` axis exists.
+
+    Emits a leading ``Sync`` so iterations 2+ of an enclosing serial
+    loop (typical chunked-K matmul) wait for the prior iteration's
+    compute to finish reading smem before this iteration overwrites it.
+    Iteration 1's leading Sync is harmless (no prior state)."""
     extents = tuple(int(ax.extent) for ax in stage.axes)
     if not extents:
         raise ValueError(f"Stage {stage.buf!r} has no cache axes")
@@ -333,7 +338,7 @@ def _emit_stage_expr_start(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]
                 Write(output=stage_buf, index=(Var(cache_axis.name),), value=load_name),
             ),
         )
-        return [smem, cooperative_load, Sync()]
+        return [Sync(), smem, cooperative_load, Sync()]
 
     total = 1
     for e in extents:
@@ -352,7 +357,7 @@ def _emit_stage_expr_start(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]
             Write(output=stage_buf, index=smem_index, value=load_name),
         ),
     )
-    return [smem, cooperative_load, Sync()]
+    return [Sync(), smem, cooperative_load, Sync()]
 
 
 def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
