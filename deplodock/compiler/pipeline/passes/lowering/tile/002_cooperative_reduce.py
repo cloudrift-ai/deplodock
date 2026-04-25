@@ -11,16 +11,17 @@ all ``BIND_SERIAL``) and rewrites it in place:
 - Every inner ``BoundLoop`` (reduction or free output) →
   ``BIND_BLOCK_STRIDED`` so threads cooperate on the axis.
 - After each reduce ``BoundLoop`` (one whose immediate body contains an
-  ``Accum``), a ``Combine(name, op, via=BLOCK_REDUCE)`` sibling is
-  inserted so materialization emits the cross-thread combine.
+  ``Accum``), a ``Combine(name, op)`` sibling is inserted. The combine
+  scope is derived by materialization from the surrounding BoundLoop's
+  bind — ``BIND_BLOCK_STRIDED`` → smem tree-halve at block scope.
 
 Post-rewrite example (softmax)::
 
     Tile(thread_axes=(), block_axes=(i,), body=(
       BoundLoop(k1, bind=BIND_BLOCK_STRIDED, body=(Load, Accum("acc_max", max))),
-      Combine("acc_max", max, BLOCK_REDUCE),
+      Combine("acc_max", max),
       BoundLoop(k2, bind=BIND_BLOCK_STRIDED, body=(Load, Assign, Assign, Accum("acc_sum", add))),
-      Combine("acc_sum", add, BLOCK_REDUCE),
+      Combine("acc_sum", add),
       BoundLoop(k3, bind=BIND_BLOCK_STRIDED, body=(Load, Assign, Assign, Assign, Write)),
     ))
 
@@ -41,7 +42,6 @@ from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BoundAxis
 from deplodock.compiler.ir.stmt import Accum
 from deplodock.compiler.ir.tile.ir import (
-    COMBINE_BLOCK_REDUCE,
     BoundLoop,
     Combine,
     Stmt,
@@ -108,7 +108,7 @@ def _rewrite_block(blk: Tile) -> Tile | None:
             new_body.append(replace(s, axis=cooperative_axis))
             if _is_reduce(s):
                 accum = next(a for a in s.body if isinstance(a, Accum))
-                new_body.append(Combine(name=accum.name, op=accum.op, via=COMBINE_BLOCK_REDUCE))
+                new_body.append(Combine(name=accum.name, op=accum.op))
             else:
                 strided_output_axes.append(cooperative_axis)
         else:

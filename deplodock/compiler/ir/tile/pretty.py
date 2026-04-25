@@ -63,7 +63,7 @@ def _render_stmt(stmt: Stmt, indent: str, lines: list[str], owned_axes: dict[str
         _render_body(stmt.body, indent + "    ", lines, owned_axes)
         return
     if isinstance(stmt, Combine):
-        lines.append(f"{indent}Combine({stmt.name}, op={stmt.op.name}, via={stmt.via})")
+        lines.append(f"{indent}Combine({stmt.name}, op={stmt.op.name})")
         return
 
     # Loop-IR leaves

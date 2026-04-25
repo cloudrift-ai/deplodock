@@ -14,8 +14,6 @@ under ``ir.kernel``.
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.tile.ir import (
-    COMBINE_BLOCK_REDUCE,
-    COMBINE_THREAD_LOCAL,
     Accum,
     Assign,
     BinaryExpr,
@@ -65,8 +63,6 @@ __all__ = [
     "BIND_BLOCK",
     "BIND_BLOCK_STRIDED",
     "BIND_SERIAL",
-    "COMBINE_THREAD_LOCAL",
-    "COMBINE_BLOCK_REDUCE",
     "Stmt",
     "TileOp",
     "Axis",
