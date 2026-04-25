@@ -168,6 +168,76 @@ def test_matmul_smems_declared_with_2d_extents():
     assert smem_by_name["B_stage"].extents == (16, 16)
 
 
+def _matmul_with_stages_inside_k_o() -> TileOp:
+    """Realistic post-blockify matmul: Stages live inside the K_o loop
+    (so smem refills per K-chunk), not at the Tile head. Tests that
+    matmul materialization recurses into outer-serial loops to expand
+    Stages."""
+    BM, BN, BK = 16, 16, 16
+    m_o = Axis("m_o", 8)
+    n_o = Axis("n_o", 8)
+    m_i = Axis("m_i", BM)
+    n_i = Axis("n_i", BN)
+    k_o = Axis("k_o", 4)
+    k_i = Axis("k_i", BK)
+
+    a_idx = (Var("m_o") * Literal(BM, "int") + Var("m_i"), Var("k_o") * Literal(BK, "int") + Var("k_i"))
+    b_idx = (Var("k_o") * Literal(BK, "int") + Var("k_i"), Var("n_o") * Literal(BN, "int") + Var("n_i"))
+    c_idx = (Var("m_o") * Literal(BM, "int") + Var("m_i"), Var("n_o") * Literal(BN, "int") + Var("n_i"))
+
+    inner_compute = (
+        Load(name="a", input="A", index=a_idx),
+        Load(name="b", input="B", index=b_idx),
+        Assign(name="t", op=ElementwiseImpl("multiply"), args=("a", "b")),
+        Accum(name="acc", value="t", op=ElementwiseImpl("add")),
+    )
+
+    k_o_loop = BoundLoop(
+        axis=BoundAxis(axis=k_o, bind=BIND_SERIAL),
+        body=(
+            Stage(buf="A", index=a_idx, axes=(m_i, k_i)),
+            Stage(buf="B", index=b_idx, axes=(k_i, n_i)),
+            BoundLoop(axis=BoundAxis(axis=k_i, bind=BIND_SERIAL), body=inner_compute),
+        ),
+    )
+
+    m_i_loop = BoundLoop(
+        axis=BoundAxis(axis=m_i, bind=BIND_BLOCK_STRIDED),
+        body=(
+            BoundLoop(
+                axis=BoundAxis(axis=n_i, bind=BIND_BLOCK_STRIDED),
+                body=(k_o_loop, Write(output="C", index=c_idx, value="acc")),
+            ),
+        ),
+    )
+
+    tile = Tile(
+        axes=(
+            BoundAxis(axis=m_o, bind=BIND_BLOCK),
+            BoundAxis(axis=n_o, bind=BIND_BLOCK),
+            BoundAxis(axis=m_i, bind=BIND_BLOCK_STRIDED),
+            BoundAxis(axis=n_i, bind=BIND_BLOCK_STRIDED),
+        ),
+        body=(m_i_loop,),
+    )
+    return TileOp(body=(tile,), name="k_matmul")
+
+
+def test_matmul_stages_inside_k_o_loop_expand_in_place():
+    """When Stages live inside the K_o serial loop, they should expand to
+    Smem/StridedLoop/Sync at that scope (so smem refills per K-chunk)."""
+    kernel_op = _materialize(_matmul_with_stages_inside_k_o())
+    encl = next(s for s in kernel_op.body if isinstance(s, Enclosure))
+
+    # Top-level body of Enclosure has the (rewritten) k_o Loop and the Write.
+    k_o_loop = next(s for s in encl.body if isinstance(s, Loop) and s.axis.name == "k_o")
+    # Inside k_o: Smem, StridedLoop (cooperative load), Sync, Smem, StridedLoop, Sync, Loop(k_i).
+    smems_inside = [s for s in k_o_loop.body if isinstance(s, Smem)]
+    assert len(smems_inside) == 2  # A_stage, B_stage
+    inner_loops = [s for s in k_o_loop.body if isinstance(s, Loop)]
+    assert len(inner_loops) == 1 and inner_loops[0].axis.name == "k_i"
+
+
 def test_softmax_style_still_uses_synthetic_t_axis():
     """A Tile with a single BIND_BLOCK_STRIDED axis whose extent != BLOCK_SIZE
     is *not* matmul-style; should route to the original cooperative path."""
