@@ -18,7 +18,7 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
     TreeHalve,
 )
-from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, Write
 
 
 def pretty_print(kernel_op: KernelOp) -> str:

@@ -37,7 +37,7 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
     TreeHalve,
 )
-from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, Write
 
 # ---------------------------------------------------------------------------
 # CUDA spelling translation — TODO step 6: dedupe with cuda/_emit.py

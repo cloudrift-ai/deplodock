@@ -35,7 +35,7 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
     TreeHalve,
 )
-from deplodock.compiler.ir.loop import Accum, Cond, Load, Loop, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     COMBINE_REGISTER,
     COMBINE_SMEM_TREE_HALVE,
