@@ -113,6 +113,50 @@ def test_e2e_matmul(run_graph):
     _assert_close(list(outputs.values())[0], expected, rtol=1e-3)
 
 
+def test_e2e_matmul_blockify(run_graph):
+    """Matmul shape divisible by ``BM=BN=BK=16`` — exercises the
+    block-tiled SGEMM path: per-block BM·BN tile cooperatively walks K
+    in BK-sized chunks, with A/B operand caching in smem and an Init-at-
+    Enclosure-scope accumulator persisting across the K_o loop."""
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
+
+    M, N, K = 32, 32, 64  # all divisible by 16
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (M, K)), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (K, N)), node_id="b")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (M, N)), node_id="c")
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((M, K)).astype(np.float32)
+    b = rng.standard_normal((K, N)).astype(np.float32)
+    expected = a @ b
+    outputs = run_graph(g, {"a": a, "b": b})
+    _assert_close(list(outputs.values())[0], expected, rtol=1e-3)
+
+
+def test_e2e_matmul_blockify_rectangular(run_graph):
+    """Non-square matmul through the blockify path — verifies M, N split
+    independently and per-buffer cache axes derive correctly when M≠N."""
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
+
+    M, N, K = 64, 32, 128  # all divisible by 16; M·K, K·N non-square
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (M, K)), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (K, N)), node_id="b")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (M, N)), node_id="c")
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+
+    rng = np.random.default_rng(1)
+    a = rng.standard_normal((M, K)).astype(np.float32)
+    b = rng.standard_normal((K, N)).astype(np.float32)
+    expected = a @ b
+    outputs = run_graph(g, {"a": a, "b": b})
+    _assert_close(list(outputs.values())[0], expected, rtol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # RMSNorm
 # ---------------------------------------------------------------------------

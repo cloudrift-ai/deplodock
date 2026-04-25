@@ -4,33 +4,17 @@ walked cooperatively across threads, with the K reduction chunked into
 BK-sized slices.
 
 Mirrors the cooperative-reduce pattern from ``002_cooperative_reduce.py``:
-this rule is the *structural* step (blockify); operand staging is left to
-``003_stage_inputs.py`` (which sees A/B as reused operands once the
-inner BoundLoops over m_i, n_i, k_i exist).
+the rule splits the M / N / K axes, builds the nested per-thread output
+loop, and inserts ``Stage(A, axes=(m_i, k_i))`` /
+``Stage(B, axes=(k_i, n_i))`` at the K_o loop head so each K-chunk's
+tiles get cached in smem. Matmul-aware materialization
+(``passes/lowering/kernel/001_materialize_tile.py``) expands the Stages
+and promotes the ``BIND_BLOCK_STRIDED`` output axes to ``BIND_THREAD``.
 
-**Not yet auto-loaded** — file is prefixed with ``_`` so the engine's
-``_load_rules`` glob skips it. Imported directly by unit tests via
-``run_rule(graph, _block_matmul.py)``.
-
-Activation status:
-
-- ✅ Multi-axis ``Stage`` emission (flat-decode StridedLoop) — done.
-- ✅ Matmul-style ``_materialize_cooperative`` branch (output axes
-  promote to ``BIND_THREAD``, body BoundLoops stripped, no
-  ``Cond on tid==0`` Write guard) — done.
-- ✅ Nested-reduce Accum init via ``Init`` Stmt — done.
-- ❌ This rule does not emit ``Stage`` itself. Without staging the
-  blockified kernel reads A/B from global per K iteration — slower than
-  the unblocked version. Either this rule needs to emit Stages, or the
-  ``003_stage_inputs`` rule needs to be generalized to detect operand
-  reuse across the matmul body's cooperative thread tile.
-- ❌ ``_redirect_loads`` matches positions by Var name only; with
-  matmul's affine index positions (``m_o*BM + m_i``) the cache-position
-  matcher misses, so redirected smem reads use wrong indices.
-- ❌ Default tile sizes ``BM=BN=64`` exceed ``BLOCK_SIZE=256`` per-block
-  thread count, requiring per-thread output sub-tiles. Activation
-  initially with ``BM=BN=16`` (one output per thread) is the simplest
-  path.
+Default tile sizes ``BM = BN = BK = 16`` give exactly one output per
+thread (``BM·BN == BLOCK_SIZE = 256``); no per-thread sub-tiling
+needed. Larger tiles (typical SGEMM) require a thread-tile extension
+to ``materialize_block``.
 
 Pre-rewrite (post ``lower_naive`` of fused matmul ``C = A @ B``)::
 
@@ -77,17 +61,20 @@ from deplodock.compiler.ir.axis import (
     BoundAxis,
     split_axis,
 )
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.expr import Literal, Var, free_vars
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Stmt, Write
-from deplodock.compiler.ir.tile.ir import BoundLoop, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import BoundLoop, Stage, Tile, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 
-# Default tile sizes. BM·BN = output tile; BK = K-reduction chunk.
-BM = 64
-BN = 64
+# Default tile sizes. ``BM·BN == BLOCK_SIZE`` (16·16 = 256) is the
+# "one output per thread" first cut — no per-thread output sub-tiling
+# needed. Larger tiles (the real-SGEMM choice) need a thread-tile
+# extension to materialize_block.
+BM = 16
+BN = 16
 BK = 16
 
 
@@ -149,12 +136,18 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
         }
     )
 
-    inner_compute: tuple[Stmt, ...] = (
-        load_a.rewrite(_id, sigma),
-        load_b.rewrite(_id, sigma),
-        mul,
-        accum,
-    )
+    new_load_a = load_a.rewrite(_id, sigma)
+    new_load_b = load_b.rewrite(_id, sigma)
+    inner_compute: tuple[Stmt, ...] = (new_load_a, new_load_b, mul, accum)
+
+    # Stage each operand per K_o iteration. Cache axes are derived from
+    # the load index: each position contributes the inner-split axis whose
+    # original-axis Var appears in that position. ``load_a`` / ``load_b``
+    # ordering isn't pinned to "A vs B" of the matmul (fusion may swap),
+    # so we read each load's own free vars instead of hardcoding axes.
+    inner_split = {m_i.name: m_i, n_i.name: n_i, k_i.name: k_i}
+    stage_a = Stage(buf=load_a.input, index=new_load_a.index, axes=_cache_axes_for(new_load_a, inner_split))
+    stage_b = Stage(buf=load_b.input, index=new_load_b.index, axes=_cache_axes_for(new_load_b, inner_split))
 
     new_body: tuple[Stmt, ...] = (
         BoundLoop(
@@ -166,6 +159,8 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
                         BoundLoop(
                             axis=BoundAxis(axis=k_o, bind=BIND_SERIAL),
                             body=(
+                                stage_a,
+                                stage_b,
                                 BoundLoop(
                                     axis=BoundAxis(axis=k_i, bind=BIND_SERIAL),
                                     body=inner_compute,
@@ -232,6 +227,24 @@ def _extract_inner(reduce_loop: BoundLoop) -> tuple[Accum, Load, Load, Assign] |
 
 def _is_reduce(loop: BoundLoop) -> bool:
     return any(isinstance(s, Accum) for s in loop.body)
+
+
+def _cache_axes_for(new_load: Load, inner_split: dict) -> tuple:
+    """For each position in ``new_load.index``, find which inner-split
+    axis Var appears in that position and return them in position order.
+
+    The smem layout for the staged operand has the same dim ordering as
+    the source-buffer index: position p of the smem buffer corresponds
+    to the inner-split axis whose Var appears at position p of the
+    load index."""
+    axes = []
+    inner_names = set(inner_split.keys())
+    for e in new_load.index:
+        match = inner_names & free_vars(e)
+        if len(match) != 1:
+            raise ValueError(f"Load index position {e!r} has cache-axis matches {match}; expected exactly one")
+        axes.append(inner_split[next(iter(match))])
+    return tuple(axes)
 
 
 def _id(name: str) -> str:

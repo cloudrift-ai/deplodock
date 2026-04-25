@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var, free_vars
 from deplodock.compiler.ir.kernel.ir import (
     Enclosure,
     KernelOp,
@@ -124,10 +124,12 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
     prepended as ``BIND_THREAD``."""
     t_axis = Axis(name="t", extent=BLOCK_SIZE)
     rename: dict[str, str] = {}
-    # buf -> (stage_buf, cache_positions): record Stage redirects so
-    # subsequent Loads of `buf` get rewritten to read from the cached
-    # smem buffer with only the cache-dimension positions of their index.
-    redirects: dict[str, tuple[str, tuple[int, ...]]] = {}
+    # buf -> (stage_buf, stage): record Stage redirects so subsequent
+    # Loads of `buf` get rewritten to read from the smem cache. Per-Load
+    # smem coord building (``_smem_coords_for_load``) handles both
+    # pure-Var index positions (softmax) and affine positions like
+    # ``m_o*BM + m_i`` (matmul).
+    redirects: dict[str, tuple[str, Stage]] = {}
 
     def transform(s: Stmt) -> Stmt:
         """Apply Stage load-redirects + Combine SSA renames to a stmt tree."""
@@ -144,9 +146,7 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
         if isinstance(stmt, Stage):
             stage_buf = f"{stmt.buf}_stage"
             new_body.extend(_emit_stage(stmt, stage_buf, t_axis.name))
-            stage_axis_names = {ax.name for ax in stmt.axes}
-            cache_positions = tuple(i for i, e in enumerate(stmt.index) if isinstance(e, Var) and e.name in stage_axis_names)
-            redirects[stmt.buf] = (stage_buf, cache_positions)
+            redirects[stmt.buf] = (stage_buf, stmt)
             pending_reduce = None
         elif isinstance(stmt, BoundLoop):
             pending_reduce = None
@@ -293,9 +293,7 @@ def _process_matmul_body(body: tuple, thread_axis_names: set, tid_expr, redirect
         if isinstance(stmt, Stage):
             stage_buf = f"{stmt.buf}_stage"
             out.extend(_emit_stage_expr_start(stmt, stage_buf, tid_expr))
-            stage_axis_names = {ax.name for ax in stmt.axes}
-            cache_positions = tuple(i for i, e in enumerate(stmt.index) if isinstance(e, Var) and e.name in stage_axis_names)
-            redirects[stmt.buf] = (stage_buf, cache_positions)
+            redirects[stmt.buf] = (stage_buf, stmt)
         elif isinstance(stmt, BoundLoop):
             inner = _process_matmul_body(stmt.body, thread_axis_names, tid_expr, redirects, transform)
             if stmt.axis.axis.name in thread_axis_names:
@@ -493,15 +491,53 @@ def _flat_decode_sigma(cache_axes: tuple[Axis, ...], flat_name: str) -> Sigma:
     return Sigma(mapping)
 
 
-def _redirect_loads(stmt: Stmt, redirects: dict[str, tuple[str, tuple[int, ...]]]) -> Stmt:
-    """Recursively rewrite ``Load(buf, ...)`` to ``Load(stage_buf, projected_index)``
-    for every ``buf`` in ``redirects``. ``projected_index`` keeps only
-    the cache-position entries of the original index (block-bound
-    positions are dropped because the staged buffer is per-block)."""
+def _smem_coords_for_load(stage: Stage, load_index: tuple) -> tuple:
+    """Build the smem read index for a redirected Load against ``stage``.
+
+    The smem buffer is laid out with ``extents = stage.axes`` extents in
+    order. For each cache axis, find its position in ``stage.index`` and
+    extract the *local* (cache-coord) value from the matching
+    ``load_index`` position:
+
+    - **Pure-Var case** (softmax-style: ``stage.index[p] == Var(ax)``):
+      the load's index at the same position carries its own iteration
+      var, possibly named differently (e.g. multi-loop softmax has
+      separate ``a1``, ``a2`` axis vars iterating the same cache). The
+      smem coord is the load's expression verbatim.
+    - **Affine case** (matmul-style: ``stage.index[p] == outer*F + ax``):
+      the load's index at the position has the same shape; the
+      ``outer`` Var is non-cache (block-bound). Substituting
+      ``outer → 0`` strips the prefix and yields the cache-local value.
+    """
+    cache_axis_names = {ax.name for ax in stage.axes}
+    coords_by_axis: dict = {}
+    for p, e in enumerate(stage.index):
+        match = cache_axis_names & free_vars(e)
+        if not match:
+            continue
+        if len(match) > 1:
+            raise ValueError(f"Stage {stage.buf!r} index position {p} matches multiple cache axes: {match}")
+        cache_name = next(iter(match))
+        stage_free = free_vars(e)
+        load_e = load_index[p]
+        if stage_free == {cache_name}:
+            coords_by_axis[cache_name] = load_e
+        else:
+            non_cache = stage_free - {cache_name}
+            sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
+            coords_by_axis[cache_name] = sigma.apply(load_e)
+    return tuple(coords_by_axis[ax.name] for ax in stage.axes)
+
+
+def _redirect_loads(stmt: Stmt, redirects: dict[str, tuple[str, Stage]]) -> Stmt:
+    """Recursively rewrite ``Load(buf, ...)`` to ``Load(stage_buf,
+    smem_index)`` for every ``buf`` in ``redirects``. ``smem_index`` is
+    derived per-Load from the matching Stage via
+    ``_smem_coords_for_load`` so both pure-Var and affine cache positions
+    work."""
     if isinstance(stmt, Load) and stmt.input in redirects:
-        stage_buf, cache_positions = redirects[stmt.input]
-        new_index = tuple(stmt.index[i] for i in cache_positions)
-        return Load(name=stmt.name, input=stage_buf, index=new_index)
+        stage_buf, stage = redirects[stmt.input]
+        return Load(name=stmt.name, input=stage_buf, index=_smem_coords_for_load(stage, stmt.index))
     if isinstance(stmt, BoundLoop):
         return BoundLoop(
             axis=stmt.axis,
