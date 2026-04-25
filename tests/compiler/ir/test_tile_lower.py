@@ -72,7 +72,7 @@ def test_pointwise_add_structure():
     assert k.name == "add"
     # Body inputs / outputs derived from Load.input / Write.output.
     assert k.inputs == ("A", "B")
-    assert k.output_bufs == ("out",)
+    assert k.outputs == ("out",)
     # Outer free-Loop chain (a0, a1) → Enclosure.thread_axes.
     enc = k.body[0]
     assert isinstance(enc, Enclosure)
@@ -126,7 +126,7 @@ def _row_sum_loop_op() -> LoopOp:
 def test_row_sum_structure():
     k = lower_naive(_row_sum_loop_op(), "row_sum")
     assert k.inputs == ("X",)
-    assert k.output_bufs == ("out",)
+    assert k.outputs == ("out",)
     enc = k.body[0]
     assert isinstance(enc, Enclosure)
     assert tuple(a.name for a in enc.thread_axes) == ("a0",)

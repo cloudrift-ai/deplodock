@@ -34,6 +34,7 @@ row-major using the buffer's declared shape.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Iterator
 
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -56,6 +57,7 @@ from deplodock.compiler.ir.loop import (
     Loop,
     Select,
     SelectBranch,
+    Stmt,
     Write,
 )
 
@@ -65,7 +67,7 @@ from deplodock.compiler.ir.loop import (
 
 
 @dataclass
-class Sync:
+class Sync(Stmt):
     """``__syncthreads();`` — block-level barrier."""
 
 
@@ -75,7 +77,7 @@ class Sync:
 
 
 @dataclass
-class Reduce:
+class Reduce(Stmt):
     """Register-accumulated walk over ``axis``.
 
     The body contains zero or more ``Accum`` stmts (Loop IR's reduce
@@ -96,7 +98,7 @@ class Reduce:
 
 
 @dataclass
-class Tile:
+class Tile(Stmt):
     """Outer slab walk: ``for k_outer = 0; k_outer < axis.extent; k_outer += bk``.
 
     Body sees ``Var(axis.name)`` bound to the slab origin (the outer-loop
@@ -111,7 +113,7 @@ class Tile:
 
 
 @dataclass
-class Coop:
+class Coop(Stmt):
     """Cooperative loop: ``for v = tid; v < cover; v += blockDim.x { body }``.
 
     The only thread-collective primitive in Tile IR. Used by smem-staging
@@ -125,7 +127,7 @@ class Coop:
 
 
 @dataclass
-class Enclosure:
+class Enclosure(Stmt):
     """Bind enclosing axes to thread / block coords for the body.
 
     ``thread_axes`` are flattened into ``threadIdx.x`` (with a tid bounds
@@ -143,13 +145,6 @@ class Enclosure:
     thread_axes: tuple[Axis, ...]
     block_axes: tuple[Axis, ...]
     body: tuple[Stmt, ...]
-
-
-# Statement union — Loop IR leaves + Tile IR additions. Every node that
-# can appear in a body sequence anywhere in Tile IR. ``Cond`` and ``Loop``
-# (free iteration) live in Loop IR — reused here via re-exports.
-Stmt = Load | Assign | Select | Write | Accum | Cond | Loop | Sync | Reduce | Tile | Coop | Enclosure
-
 
 # ---------------------------------------------------------------------------
 # Top-level: SmemBuf / TileOp
@@ -196,38 +191,42 @@ class TileOp(Op):
     smem: tuple[SmemBuf, ...] = ()
     name: str = ""
 
+    def __iter__(self) -> Iterator[Stmt]:
+        return iter_body(self.body)
+
+    @property
+    def loads(self) -> tuple[Load, ...]:
+        return tuple(s for s in self if isinstance(s, Load))
+
     @property
     def inputs(self) -> tuple[str, ...]:
         """Distinct ``Load.input`` buf names in body first-use order — the
         kernel's input parameters."""
-        return _distinct_in_order(s.input for s in _walk_stmts(self.body) if isinstance(s, Load))
+        return tuple(dict.fromkeys(s.input for s in self.loads))
 
     @property
-    def output_bufs(self) -> tuple[str, ...]:
+    def writes(self) -> tuple[Write, ...]:
+        return tuple(s for s in self if isinstance(s, Write))
+
+    @property
+    def outputs(self) -> tuple[str, ...]:
         """Distinct ``Write.output`` buf names in body first-use order —
         the kernel's writeable output parameters."""
-        return _distinct_in_order(s.output for s in _walk_stmts(self.body) if isinstance(s, Write))
+        return tuple(dict.fromkeys(s.output for s in self.writes))
+
+# ---------------------------------------------------------------------------
+# Tree walk helpers
+# ---------------------------------------------------------------------------
 
 
-def _distinct_in_order(items) -> tuple[str, ...]:
-    seen: dict[str, None] = {}
-    for x in items:
-        if x not in seen:
-            seen[x] = None
-    return tuple(seen)
-
-
-def _walk_stmts(stmts):
-    """Pre-order walk over Tile IR body — yields every nested stmt."""
-    for s in stmts:
+def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
+    for s in body:
         yield s
-        sub = getattr(s, "body", None)
-        if isinstance(sub, tuple):
-            yield from _walk_stmts(sub)
-        # Cond has both body and else_body
-        else_body = getattr(s, "else_body", None)
-        if isinstance(else_body, tuple):
-            yield from _walk_stmts(else_body)
+        if isinstance(s, (Loop, Enclosure, Reduce, Tile, Coop)):
+            yield from iter_body(s.body)
+        elif isinstance(s, Cond):
+            yield from iter_body(s.body)
+            yield from iter_body(s.else_body)
 
 
 __all__ = [

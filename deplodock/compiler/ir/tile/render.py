@@ -150,7 +150,7 @@ def render_tileop(tile_op: TileOp, shapes: dict[str, tuple[int, ...]] | None = N
     ctx = _Ctx(shapes=shape_map, indent=1)
 
     sig_parts = [f"const float* {n}" for n in tile_op.inputs]
-    sig_parts.extend(f"float* {n}" for n in tile_op.output_bufs)
+    sig_parts.extend(f"float* {n}" for n in tile_op.outputs)
     params_text = ", ".join(sig_parts)
     launch_bounds = f"\n__launch_bounds__({_BLOCK_SIZE})"
 
