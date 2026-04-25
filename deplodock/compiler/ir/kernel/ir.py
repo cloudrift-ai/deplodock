@@ -26,8 +26,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.binding import BIND_BLOCK, BIND_THREAD, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -42,7 +42,6 @@ from deplodock.compiler.ir.expr import (
 from deplodock.compiler.ir.loop import (
     Accum,
     Assign,
-    Axis,
     Cond,
     Load,
     Loop,

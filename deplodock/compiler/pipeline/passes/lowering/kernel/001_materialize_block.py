@@ -25,10 +25,9 @@ passes can pattern-match on it.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
+from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
-    BIND_THREAD,
-    BoundAxis,
     Enclosure,
     KernelOp,
     Smem,
@@ -42,7 +41,6 @@ from deplodock.compiler.ir.tile.ir import (
     COMBINE_SMEM_TREE_HALVE,
     WALK_SERIAL,
     WALK_STRIDED,
-    Axis,
     Block,
     BoundLoop,
     Combine,

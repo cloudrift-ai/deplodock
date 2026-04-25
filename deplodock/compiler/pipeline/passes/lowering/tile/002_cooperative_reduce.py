@@ -38,13 +38,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph
+from deplodock.compiler.ir.axis import BIND_BLOCK, BoundAxis
 from deplodock.compiler.ir.loop import Accum
 from deplodock.compiler.ir.tile.ir import (
-    BIND_BLOCK,
     COMBINE_SMEM_TREE_HALVE,
     WALK_STRIDED,
     Block,
-    BoundAxis,
     BoundLoop,
     Combine,
     Stmt,

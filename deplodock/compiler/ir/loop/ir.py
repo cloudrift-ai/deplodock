@@ -37,33 +37,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, free_vars
 from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.loop.sigma import Sigma
-
-# ---------------------------------------------------------------------------
-# Axis — named iteration variable
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Axis:
-    """One named iteration variable at the loop level.
-
-    Referenced from ``Expr`` subtrees (inside ``Load.index`` etc.) by
-    ``Var(name)``. Free vs reduce is inferred structurally from the body:
-    a ``Loop`` over this axis is a reduce loop iff its body (recursively)
-    contains an ``Accum``. See ``LoopOp.reduce_axis_names``.
-
-    ``extent`` is a static integer in v1; future revisions may allow an
-    ``Expr`` for dynamic batch/seq dims.
-    """
-
-    name: str
-    extent: int
-
 
 # ---------------------------------------------------------------------------
 # Scope — a path of enclosing axes
