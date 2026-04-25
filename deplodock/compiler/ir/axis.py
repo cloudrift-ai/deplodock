@@ -37,6 +37,12 @@ class Axis:
 # BoundAxis.bind values — how an axis maps to GPU parallel coords.
 BIND_THREAD = "THREAD"
 BIND_BLOCK = "BLOCK"
+# Output axis whose values are *shared across* all threads of a CUDA block —
+# threads cooperatively walk it via a strided ``BoundLoop`` in the body.
+# Doesn't contribute to launch geometry (Enclosure.axes excludes it); it
+# documents that this dimension of the output is iterated cooperatively
+# rather than mapped to a unique parallel coord.
+BIND_BLOCK_STRIDED = "BLOCK_STRIDED"
 
 
 @dataclass(frozen=True)
@@ -61,4 +67,4 @@ class BoundAxis:
         return self.axis.extent
 
 
-__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK"]
+__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "BIND_BLOCK_STRIDED"]

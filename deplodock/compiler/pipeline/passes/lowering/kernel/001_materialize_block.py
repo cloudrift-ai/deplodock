@@ -25,7 +25,7 @@ passes can pattern-match on it.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK_STRIDED, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     Enclosure,
@@ -148,9 +148,12 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
         else:
             new_body.append(renamed(stmt))
 
-    # Cooperative thread axis ``t`` (BIND_THREAD) plus the original
-    # output axes (kept as BIND_BLOCK by the strategy).
-    new_axes = (BoundAxis(axis=t_axis, bind=BIND_THREAD), *axes)
+    # Cooperative thread axis ``t`` (BIND_THREAD) plus the original output
+    # axes — but BIND_BLOCK_STRIDED axes are filtered out because they
+    # don't contribute to launch geometry (the body's strided BoundLoops
+    # handle their iteration).
+    launch_axes = tuple(ba for ba in axes if ba.bind != BIND_BLOCK_STRIDED)
+    new_axes = (BoundAxis(axis=t_axis, bind=BIND_THREAD), *launch_axes)
     return Enclosure(axes=new_axes, body=tuple(new_body))
 
 
