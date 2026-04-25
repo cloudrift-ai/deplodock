@@ -32,6 +32,7 @@ from deplodock.compiler.ir.tile.ir import (
     Enclosure,
     Expr,
     Stmt,
+    Tile,
     TileOp,
 )
 
@@ -216,7 +217,25 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
     if isinstance(stmt, Enclosure):
         return _render_enclosure(stmt, ctx)
 
+    if isinstance(stmt, Tile):
+        return _render_tile(stmt, ctx)
+
     raise TypeError(f"render: unhandled Tile IR stmt {type(stmt).__name__}")
+
+
+def _render_tile(stmt: Tile, ctx: _Ctx) -> list[str]:
+    """Render a cooperative ``Tile`` block.
+
+    Today every block runs at one-thread-per-slot, so the body folds
+    through `Accum` into per-thread registers and no smem / barrier is
+    needed. Tile renders as a transparent concatenation of its children.
+    Smem allocation + ``__syncthreads()`` insertion land once a strategy
+    chooses a wider block.
+    """
+    out: list[str] = []
+    for s in stmt.body:
+        out.extend(_render_stmt(s, ctx))
+    return out
 
 
 def _render_enclosure(stmt: Enclosure, ctx: _Ctx) -> list[str]:

@@ -32,7 +32,9 @@ from deplodock.compiler.ir.tile.ir import (
     Axis,
     Enclosure,
     Stmt,
+    Tile,
     TileOp,
+    iter_body,
 )
 
 
@@ -66,11 +68,19 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     body: list[Stmt] = list(_lower_body(tuple(leading)))
     inner_lowered = tuple(_lower_body(inner))
     if thread_axes:
+        if _has_accum(inner_lowered):
+            extents = tuple(int(ax.extent) for ax in thread_axes)
+            inner_lowered = (Tile(live_axes=thread_axes, extents=extents, body=inner_lowered),)
         body.append(Enclosure(thread_axes=thread_axes, block_axes=(), body=inner_lowered))
     else:
         body.extend(inner_lowered)
 
     return TileOp(body=tuple(body), name=kernel_name)
+
+
+def _has_accum(stmts: tuple[Stmt, ...]) -> bool:
+    """Recursively check whether any ``Accum`` appears in ``stmts``."""
+    return any(isinstance(s, Accum) for s in iter_body(stmts))
 
 
 def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ...], tuple[LoopStmt, ...]]:

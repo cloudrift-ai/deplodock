@@ -16,14 +16,25 @@ Pipeline shape:
 strings (``Load.input``, ``Write.output``) so they're directly renderable.
 ``ElementwiseImpl`` carries op identity / commutativity / numpy callable.
 
-**Schedule structure is Tile-IR-specific.** ``Enclosure`` plus the
-``TileOp`` wrapper are new node types whose body is a broader union
-(``Stmt``) that admits both Loop-IR leaves and Tile-IR additions.
+**Schedule structure is Tile-IR-specific.** ``Enclosure``, ``Tile``,
+plus the ``TileOp`` wrapper are new node types whose body is a broader
+union (``Stmt``) that admits both Loop-IR leaves and Tile-IR additions.
 Loop IR's ``Loop`` is reused directly for both free iteration and
 reductions — a Loop is a reduce-Loop iff its body contains an ``Accum``
 (detected structurally by the renderer / passes, never stored).
 ``Cond`` is reused for if/else. Strategies match on the schedule nodes;
 the leaves they wrap pass through unchanged.
+
+``Tile`` marks a cooperative block: its body shares a per-block scratch
+indexed by ``live_axes`` (the free axes still in scope inside any
+reduction). Sibling stmts execute in order; render is responsible for
+inserting an implicit ``__syncthreads()`` between siblings whenever a
+later sibling reads what an earlier one wrote. ``Accum`` targets inside
+a ``Tile`` resolve to slots in the block's scratch — registers when one
+thread per slot, ``__shared__`` when multiple threads per slot. Today
+every cooperative block runs at one-thread-per-slot, so ``Tile`` renders
+as pass-through; smem + barriers land once a strategy chooses a wider
+block.
 
 Expression types come from ``ir.expr`` directly (``Var``, ``Literal``,
 ``BinaryExpr``, ``FuncCallExpr``, ``TernaryExpr``, ``CastExpr``,
@@ -88,6 +99,31 @@ class Enclosure(Stmt):
     body: tuple[Stmt, ...]
 
 
+@dataclass
+class Tile(Stmt):
+    """Cooperative block: body stmts share a per-block scratch indexed by ``live_axes``.
+
+    ``live_axes`` are the free axes still in scope inside the block — i.e.
+    the surviving thread axes whose values address one slot of scratch
+    per output element. ``extents`` are the corresponding slot counts;
+    today ``extents == tuple(ax.extent for ax in live_axes)`` because no
+    strategy has reshaped the block yet.
+
+    Sibling stmts execute in order. The renderer inserts an implicit
+    ``__syncthreads()`` between siblings when a later one reads what an
+    earlier one wrote (when smem is in play). ``Accum`` targets inside a
+    ``Tile`` resolve to slots of this block's scratch: registers when the
+    block has one thread per slot, ``__shared__`` when wider. Currently
+    one-thread-per-slot is the only configuration, so ``Tile`` renders as
+    a pass-through over its body — the node is a structural marker that
+    later strategies and the smem path key off.
+    """
+
+    live_axes: tuple[Axis, ...]
+    extents: tuple[int, ...]
+    body: tuple[Stmt, ...]
+
+
 # ---------------------------------------------------------------------------
 # Top-level: TileOp
 # ---------------------------------------------------------------------------
@@ -149,7 +185,7 @@ class TileOp(Op):
 def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
     for s in body:
         yield s
-        if isinstance(s, (Loop, Enclosure)):
+        if isinstance(s, (Loop, Enclosure, Tile)):
             yield from iter_body(s.body)
         elif isinstance(s, Cond):
             yield from iter_body(s.body)
@@ -177,6 +213,7 @@ __all__ = [
     "Loop",
     # Tile-IR statements
     "Enclosure",
+    "Tile",
     "Stmt",
     # Top-level
     "TileOp",
