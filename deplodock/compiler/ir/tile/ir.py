@@ -152,26 +152,8 @@ Stmt = Load | Assign | Select | Write | Accum | Cond | Loop | Sync | Reduce | Ti
 
 
 # ---------------------------------------------------------------------------
-# Top-level: Param / SmemBuf / TileOp
+# Top-level: SmemBuf / TileOp
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class Param:
-    """Kernel parameter — global buffer pointer or scalar.
-
-    ``dtype`` is the C declaration text (``"const float*"`` / ``"float*"`` /
-    ``"int"`` / etc.); render emits it verbatim in the function signature.
-
-    ``shape`` is the buffer's element shape, used by ``render_kernel`` to
-    flatten multi-dim ``Load`` / ``Write`` indices to row-major. ``()``
-    means scalar; a ``(d0, d1, ...)`` tuple means a buffer of that shape
-    behind ``dtype``'s pointer.
-    """
-
-    name: str
-    dtype: str
-    shape: tuple[int, ...] = ()
 
 
 @dataclass
@@ -193,24 +175,59 @@ class TileOp(Op):
     """One ``__global__`` GPU kernel as a Tile IR program.
 
     Op subclass parallel to ``LoopOp``: lives as a graph node, carries a
-    body of Tile IR statements plus kernel-level metadata (``params``,
-    ``smem``, ``name``).
+    body of Tile IR statements plus kernel-level metadata (``smem``, ``name``).
 
-    Right after lowering, ``body`` is a fully-serial single-thread walk.
-    ``ExtractGlobalSchedule`` wraps the schedulable region in an
-    ``Enclosure`` whose ``thread_axes`` / ``block_axes`` capture the GPU
-    parallelism. Subsequent strategies (``TileReduce``, ``SmemStageReduce``,
-    …) rewrite the body and extend ``smem``.
+    Buffer shapes are *not* baked in — the surrounding graph supplies them
+    at render time, same as ``LoopOp``. Kernel signature is derived from
+    the body: distinct ``Load.input`` names become ``const float*`` params,
+    distinct ``Write.output`` names become ``float*`` params, ordered by
+    first appearance.
 
-    ``body`` may contain stmts before the ``Enclosure`` (typically scalar
-    ``Load``s of broadcast constants); render emits them at the top of the
-    ``__global__`` function above the tid-bounds guard.
+    Right after lowering, ``body`` either holds a fully-serial single-thread
+    walk or — when ``lower_naive`` strips the outer free-Loop chain — an
+    ``Enclosure(thread_axes=...)`` carrying the schedulable work. Subsequent
+    strategies (``TileReduce``, ``SmemStageReduce``, …) rewrite the body
+    and extend ``smem``. ``body`` may contain stmts before any ``Enclosure``
+    (typically scalar ``Load``s of broadcast constants); render emits them
+    at the top of the ``__global__`` function above the tid-bounds guard.
     """
 
     body: tuple[Stmt, ...] = ()
-    params: tuple[Param, ...] = ()
     smem: tuple[SmemBuf, ...] = ()
     name: str = ""
+
+    @property
+    def inputs(self) -> tuple[str, ...]:
+        """Distinct ``Load.input`` buf names in body first-use order — the
+        kernel's input parameters."""
+        return _distinct_in_order(s.input for s in _walk_stmts(self.body) if isinstance(s, Load))
+
+    @property
+    def output_bufs(self) -> tuple[str, ...]:
+        """Distinct ``Write.output`` buf names in body first-use order —
+        the kernel's writeable output parameters."""
+        return _distinct_in_order(s.output for s in _walk_stmts(self.body) if isinstance(s, Write))
+
+
+def _distinct_in_order(items) -> tuple[str, ...]:
+    seen: dict[str, None] = {}
+    for x in items:
+        if x not in seen:
+            seen[x] = None
+    return tuple(seen)
+
+
+def _walk_stmts(stmts):
+    """Pre-order walk over Tile IR body — yields every nested stmt."""
+    for s in stmts:
+        yield s
+        sub = getattr(s, "body", None)
+        if isinstance(sub, tuple):
+            yield from _walk_stmts(sub)
+        # Cond has both body and else_body
+        else_body = getattr(s, "else_body", None)
+        if isinstance(else_body, tuple):
+            yield from _walk_stmts(else_body)
 
 
 __all__ = [
@@ -240,7 +257,6 @@ __all__ = [
     "Enclosure",
     "Stmt",
     # Top-level
-    "Param",
     "SmemBuf",
     "TileOp",
     # Re-exports

@@ -23,7 +23,6 @@ from deplodock.compiler.ir.tile import (
     Literal,
     Load,
     Loop,
-    Param,
     Reduce,
     SmemBuf,
     Sync,
@@ -79,17 +78,31 @@ def test_reduce_extent_default_none():
     assert red.extent is None  # caller / render uses axis.extent
 
 
-def test_param_smembuf():
-    p = Param(name="x", dtype="const float*")
+def test_smembuf():
     sb = SmemBuf(name="A_tile", dtype="float", dims=(128, 16))
-    assert (p.dtype, sb.dims) == ("const float*", (128, 16))
+    assert sb.dims == (128, 16)
 
 
 def test_tileop_defaults():
-    k = TileOp(name="k0", params=(), body=())
+    k = TileOp(name="k0")
     assert k.body == ()
     assert k.smem == ()
-    assert k.params == ()
+    assert k.name == "k0"
+    assert k.inputs == ()
+    assert k.output_bufs == ()
+
+
+def test_tileop_inputs_outputs_derived_from_body():
+    body = (
+        Load("a", input="X", index=(Var("i"),)),
+        Load("b", input="Y", index=(Var("i"),)),
+        Load("c", input="X", index=(Var("j"),)),  # duplicate input
+        Write(output="out", index=(Var("i"),), value="a"),
+    )
+    k = TileOp(name="k", body=body)
+    # First-use order, deduped.
+    assert k.inputs == ("X", "Y")
+    assert k.output_bufs == ("out",)
 
 
 def test_enclosure_construction():
@@ -124,14 +137,12 @@ def test_pointwise_add_shape():
             ),
         ),
     )
-    k = TileOp(
-        name="add",
-        params=(Param("A", "const float*"), Param("B", "const float*"), Param("out", "float*")),
-        body=body,
-    )
+    k = TileOp(name="add", body=body)
     assert isinstance(k.body[0], Loop)
     assert isinstance(k.body[0].body[0], Loop)
     assert isinstance(k.body[0].body[0].body[-1], Write)
+    assert k.inputs == ("A", "B")
+    assert k.output_bufs == ("out",)
 
 
 def test_rmsnorm_shape():
@@ -164,17 +175,7 @@ def test_rmsnorm_shape():
         Load("mean_n", input="MeanN", index=()),
         Loop(axis=i, body=(reduce_block, output_loop)),
     )
-    k = TileOp(
-        name="rmsnorm",
-        params=(
-            Param("X", "const float*"),
-            Param("Eps", "const float*"),
-            Param("MeanN", "const float*"),
-            Param("W", "const float*"),
-            Param("out", "float*"),
-        ),
-        body=body,
-    )
+    k = TileOp(name="rmsnorm", body=body)
     assert isinstance(k.body[0], Load) and k.body[0].input == "Eps"
     outer = k.body[2]
     assert isinstance(outer, Loop) and outer.axis.name == "a0"
@@ -209,7 +210,6 @@ def test_matmul_naive_shape():
     )
     krn = TileOp(
         name="matmul",
-        params=(Param("A", "const float*"), Param("B", "const float*"), Param("out", "float*")),
         body=body,
     )
     inner = krn.body[0].body[0]
@@ -263,7 +263,6 @@ def test_matmul_smem_tiled_shape():
     )
     krn = TileOp(
         name="matmul_tiled",
-        params=(Param("A", "const float*"), Param("B", "const float*"), Param("out", "float*")),
         smem=smem,
         body=(enclosed,),
     )
