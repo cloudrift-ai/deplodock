@@ -31,9 +31,13 @@ from deplodock.compiler.ir.loop import Accum, Assign, Cond, Load, Loop, Select, 
 from deplodock.compiler.ir.tile.ir import (
     Enclosure,
     Expr,
+    Smem,
     Stmt,
+    StridedLoop,
+    Sync,
     Tile,
     TileOp,
+    TreeHalve,
 )
 
 # ---------------------------------------------------------------------------
@@ -113,8 +117,9 @@ def _pad(indent: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Block size for thread-axes flattening — fixed at 256 until a strategy
-# specifies otherwise. (Future ``Enclosure`` will carry the choice.)
+# Default block size for thread-axes flattening when no strategy has chosen one
+# (i.e. ``block_axes`` is empty). When ``block_axes`` is populated, the block
+# size comes from ``prod(thread_axes.extents)``.
 _BLOCK_SIZE = 256
 
 
@@ -138,7 +143,8 @@ def render_tileop(tile_op: TileOp, shapes: dict[str, tuple[int, ...]] | None = N
     sig_parts = [f"const float* {n}" for n in tile_op.inputs]
     sig_parts.extend(f"float* {n}" for n in tile_op.outputs)
     params_text = ", ".join(sig_parts)
-    launch_bounds = f"\n__launch_bounds__({_BLOCK_SIZE})"
+    bounds = _launch_bounds_for(tile_op)
+    launch_bounds = f"\n__launch_bounds__({bounds})"
 
     body_lines: list[str] = []
     for s in tile_op.body:
@@ -146,6 +152,21 @@ def render_tileop(tile_op: TileOp, shapes: dict[str, tuple[int, ...]] | None = N
 
     body_text = "\n".join(body_lines)
     return f'extern "C" __global__{launch_bounds} void {tile_op.name}({params_text}) {{\n{body_text}\n}}\n'
+
+
+def _launch_bounds_for(tile_op: TileOp) -> int:
+    """Derive ``__launch_bounds__`` from the first ``Enclosure``'s thread axes
+    when ``block_axes`` is populated; otherwise fall back to the legacy
+    ``_BLOCK_SIZE`` cap (which the host-side launcher rounds up the grid for)."""
+    for s in tile_op.body:
+        if isinstance(s, Enclosure):
+            if s.block_axes:
+                bsize = 1
+                for ax in s.thread_axes:
+                    bsize *= int(ax.extent)
+                return max(bsize, 1)
+            return _BLOCK_SIZE
+    return _BLOCK_SIZE
 
 
 def _render_thread_axis_decode(axes: tuple, ctx: _Ctx) -> list[str]:
@@ -220,17 +241,31 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
     if isinstance(stmt, Tile):
         return _render_tile(stmt, ctx)
 
+    if isinstance(stmt, Smem):
+        return _render_smem(stmt, ctx)
+
+    if isinstance(stmt, Sync):
+        return [f"{pad}__syncthreads();"]
+
+    if isinstance(stmt, TreeHalve):
+        return _render_tree_halve(stmt, ctx)
+
+    if isinstance(stmt, StridedLoop):
+        return _render_strided_loop(stmt, ctx)
+
     raise TypeError(f"render: unhandled Tile IR stmt {type(stmt).__name__}")
 
 
 def _render_tile(stmt: Tile, ctx: _Ctx) -> list[str]:
-    """Render a cooperative ``Tile`` block.
+    """Render a cooperative ``Tile`` block as a flat sequence of children.
 
-    Today every block runs at one-thread-per-slot, so the body folds
-    through `Accum` into per-thread registers and no smem / barrier is
-    needed. Tile renders as a transparent concatenation of its children.
-    Smem allocation + ``__syncthreads()`` insertion land once a strategy
-    chooses a wider block.
+    The ``Tile`` is a structural marker; it owns no rendered code itself.
+    Synchronization, smem, and tree-halves are explicit Stmts in the body
+    placed by strategy passes. When the surrounding ``Enclosure`` runs
+    one-thread-per-slot, the body is just ``Loop``/``Accum``/``Write`` and
+    folds through into per-thread registers. When cooperative, the body
+    contains ``Smem`` + ``StridedLoop`` + ``Sync`` + ``TreeHalve`` + a
+    guarded ``Write`` — render handles each in turn.
     """
     out: list[str] = []
     for s in stmt.body:
@@ -238,12 +273,99 @@ def _render_tile(stmt: Tile, ctx: _Ctx) -> list[str]:
     return out
 
 
-def _render_enclosure(stmt: Enclosure, ctx: _Ctx) -> list[str]:
-    """Emit ``tid = blockIdx.x * blockDim.x + threadIdx.x; if (tid < N) {
-    <axis decode> <body> }`` for the schedule wrapper. ``block_axes`` is
-    not yet wired (no strategy populates it); when added, render will
-    decode ``blockIdx.x/y/z`` similarly."""
+def _render_smem(stmt: Smem, ctx: _Ctx) -> list[str]:
+    """``__shared__ <dtype> <name>[<prod(extents)>];`` and register the
+    buffer's shape so subsequent ``Load``/``Write`` flatten correctly."""
     pad = _pad(ctx.indent)
+    total = 1
+    for e in stmt.extents:
+        total *= int(e)
+    ctx.shapes[stmt.name] = tuple(int(e) for e in stmt.extents)
+    return [f"{pad}__shared__ {stmt.dtype} {stmt.name}[{total}];"]
+
+
+def _render_tree_halve(stmt: TreeHalve, ctx: _Ctx) -> list[str]:
+    """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
+    pad = _pad(ctx.indent)
+    inner_pad = _pad(ctx.indent + 1)
+    halve_pad = _pad(ctx.indent + 2)
+    op_expr = _binary_combine_expr(stmt.op, f"{stmt.buf}[{stmt.tid_var}]", f"{stmt.buf}[{stmt.tid_var} + s]")
+    half = int(stmt.length) // 2
+    return [
+        f"{pad}for (int s = {half}; s > 0; s >>= 1) {{",
+        f"{inner_pad}if ({stmt.tid_var} < s) {{",
+        f"{halve_pad}{stmt.buf}[{stmt.tid_var}] = {op_expr};",
+        f"{inner_pad}}}",
+        f"{inner_pad}__syncthreads();",
+        f"{pad}}}",
+    ]
+
+
+def _binary_combine_expr(op: object, a: str, b: str) -> str:
+    """Render a 2-arg combine for ``ElementwiseImpl`` reduce ops."""
+    name = getattr(op, "name", "add")
+    if name in ("add", "sum"):
+        return f"{a} + {b}"
+    if name in ("multiply", "prod"):
+        return f"{a} * {b}"
+    if name in ("maximum", "amax"):
+        return f"fmaxf({a}, {b})"
+    if name == "minimum":
+        return f"fminf({a}, {b})"
+    raise ValueError(f"TreeHalve: unsupported op {name!r}")
+
+
+def _render_strided_loop(stmt: StridedLoop, ctx: _Ctx) -> list[str]:
+    """``for (int <axis> = <start>; <axis> < <extent>; <axis> += <step>)``.
+
+    Reduce-loop detection (any ``Accum`` in immediate body) mirrors
+    ``_render_loop`` — accumulators are declared with their identity above
+    the loop, then folded inside.
+    """
+    pad = _pad(ctx.indent)
+    out: list[str] = []
+    seen: set[str] = set()
+    for s in stmt.body:
+        if isinstance(s, Accum) and s.name not in seen:
+            seen.add(s.name)
+            identity = s.op.identity
+            if identity is None:
+                raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
+            out.append(f"{pad}float {s.name} = {float(identity):.1f}f;")
+    start_str = _render_expr(stmt.start, ctx)
+    out.extend(_render_for(stmt.axis.name, start_str, int(stmt.axis.extent), step=int(stmt.step), body=stmt.body, ctx=ctx))
+    return out
+
+
+def _render_enclosure(stmt: Enclosure, ctx: _Ctx) -> list[str]:
+    """Emit thread / block index decodes plus body.
+
+    Two forms:
+
+    - **Legacy (``block_axes`` empty):** flatten all ``thread_axes`` into
+      one linear ``tid = blockIdx.x * blockDim.x + threadIdx.x`` index,
+      bounds-guarded against the product of extents. Used by today's
+      one-thread-per-output-slot kernels (pointwise, per-thread-serial
+      reductions).
+
+    - **Cooperative (``block_axes`` populated):** one CUDA block per
+      ``block_axes`` slot, ``thread_axes`` index threads inside the block.
+      Decodes ``blockIdx.x`` into the block-axis Vars and ``threadIdx.x``
+      into the thread-axis Vars. No tid bounds guard — the strategy is
+      responsible for picking extents that match the launch geometry.
+    """
+    pad = _pad(ctx.indent)
+    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1)
+
+    if stmt.block_axes:
+        out = [f"{pad}{{"]
+        out.extend(_render_grid_axis_decode(stmt.block_axes, "blockIdx.x", inner))
+        out.extend(_render_grid_axis_decode(stmt.thread_axes, "threadIdx.x", inner))
+        for s in stmt.body:
+            out.extend(_render_stmt(s, inner))
+        out.append(f"{pad}}}")
+        return out
+
     n_threads = 1
     for ax in stmt.thread_axes:
         n_threads *= int(ax.extent)
@@ -251,12 +373,39 @@ def _render_enclosure(stmt: Enclosure, ctx: _Ctx) -> list[str]:
         f"{pad}long long tid = blockIdx.x * blockDim.x + threadIdx.x;",
         f"{pad}if (tid < {n_threads}) {{",
     ]
-    inner = _Ctx(shapes=ctx.shapes, indent=ctx.indent + 1)
     out.extend(_render_thread_axis_decode(stmt.thread_axes, inner))
     for s in stmt.body:
         out.extend(_render_stmt(s, inner))
     out.append(f"{pad}}}")
     return out
+
+
+def _render_grid_axis_decode(axes: tuple, idx_expr: str, ctx: _Ctx) -> list[str]:
+    """Decode ``idx_expr`` (``blockIdx.x`` or ``threadIdx.x``) into per-axis ints.
+
+    Single-axis: ``int <ax> = <idx_expr>;``. Multi-axis: row-major flatten
+    using the same shape rule as ``_render_thread_axis_decode``.
+    """
+    pad = _pad(ctx.indent)
+    if not axes:
+        return []
+    if len(axes) == 1:
+        return [f"{pad}int {axes[0].name} = {idx_expr};"]
+    decoded: list[str] = []
+    stride = 1
+    for ax in reversed(axes):
+        extent = int(ax.extent)
+        if stride == 1:
+            decoded.append(f"int {ax.name} = {idx_expr} % {extent};")
+        else:
+            decoded.append(f"int {ax.name} = ({idx_expr} / {stride}) % {extent};")
+        stride *= extent
+    outer = axes[0]
+    outer_stride = 1
+    for ax in axes[1:]:
+        outer_stride *= int(ax.extent)
+    decoded[-1] = f"int {outer.name} = {idx_expr} / {outer_stride};"
+    return [pad + line for line in reversed(decoded)]
 
 
 def _render_cond(stmt: Cond, ctx: _Ctx) -> list[str]:
