@@ -185,7 +185,9 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
 
 def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[BoundLoop, Write] | None:
     """The body must be exactly ``(reduce_loop, write)`` where ``write``
-    indexes the two output axes by name."""
+    indexes both output axes ``m`` and ``n`` (other index positions may
+    be Literals from collapsed leading dims, e.g. batch=1 in the Linear
+    forward shape ``(1, 32, K)``)."""
     if len(body) != 2:
         return None
     reduce_loop, write = body
@@ -195,10 +197,8 @@ def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[BoundLoop
         return None
     if reduce_loop.bind != BIND_SERIAL:
         return None
-    if len(write.index) != 2:
-        return None
-    out_names = tuple(e.name if isinstance(e, Var) else None for e in write.index)
-    if set(out_names) != {m_name, n_name}:
+    var_names = {e.name for e in write.index if isinstance(e, Var)}
+    if {m_name, n_name} - var_names:
         return None
     return reduce_loop, write
 
@@ -231,18 +231,17 @@ def _is_reduce(loop: BoundLoop) -> bool:
 
 def _cache_axes_for(new_load: Load, inner_split: dict) -> tuple:
     """For each position in ``new_load.index``, find which inner-split
-    axis Var appears in that position and return them in position order.
-
-    The smem layout for the staged operand has the same dim ordering as
-    the source-buffer index: position p of the smem buffer corresponds
-    to the inner-split axis whose Var appears at position p of the
-    load index."""
+    axis Var appears in that position. Positions with no cache-axis Var
+    (e.g. ``Literal(0)`` from collapsed batch dims) are skipped — they
+    contribute no smem dim. Returned axes are in source-buffer dim order."""
     axes = []
     inner_names = set(inner_split.keys())
     for e in new_load.index:
         match = inner_names & free_vars(e)
-        if len(match) != 1:
-            raise ValueError(f"Load index position {e!r} has cache-axis matches {match}; expected exactly one")
+        if not match:
+            continue  # constant position (e.g. batch=0 from a collapsed leading dim)
+        if len(match) > 1:
+            raise ValueError(f"Load index position {e!r} has cache-axis matches {match}; expected at most one")
         axes.append(inner_split[next(iter(match))])
     return tuple(axes)
 
