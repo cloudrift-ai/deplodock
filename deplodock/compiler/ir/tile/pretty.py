@@ -42,7 +42,7 @@ def _render_stmt(stmt: Stmt, indent: str, lines: list[str]) -> None:
         return
     if isinstance(stmt, BoundLoop):
         kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
-        lines.append(f"{indent}BoundLoop({stmt.axis.name} in 0..{stmt.axis.extent}, walk={stmt.walk}):  # {kind}")
+        lines.append(f"{indent}BoundLoop({stmt.axis.name}:{stmt.axis.extent}={stmt.bind}):  # {kind}")
         _render_body(stmt.body, indent + "    ", lines)
         return
     if isinstance(stmt, Combine):

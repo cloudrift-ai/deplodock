@@ -11,7 +11,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.tile.ir import BIND_THREAD, Block, BoundAxis, BoundLoop, TileOp, iter_body
+from deplodock.compiler.ir.tile.ir import BIND_SERIAL, BIND_THREAD, Block, BoundAxis, BoundLoop, TileOp, iter_body
 from deplodock.compiler.ir.tile.lower import lower_naive
 
 
@@ -41,7 +41,7 @@ def test_iter_body_walks_into_block():
     i = Axis("i", 4)
     k = Axis("k", 8)
     inner = BoundLoop(
-        axis=k,
+        axis=BoundAxis(axis=k, bind=BIND_SERIAL),
         body=(
             Load(name="x_v", input="x", index=(Var("i"), Var("k"))),
             Accum(name="acc", value="x_v", op=ElementwiseImpl("add")),

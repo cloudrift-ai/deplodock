@@ -3,9 +3,10 @@
 Mechanical translation. Loop IR's leaves (``Load`` / ``Assign`` /
 ``Select`` / ``Write`` / ``Accum`` / ``Cond``) pass through unchanged.
 Loop-IR ``Loop`` is rewritten to Tile-IR ``BoundLoop`` with
-``walk=WALK_SERIAL`` — the pre-strategy default (every thread walks
-the axis itself). Strategy passes flip walk strategies on select
-``BoundLoop``s to express cooperative iteration.
+each ``BoundLoop`` carries a ``BoundAxis`` whose ``bind`` defaults to
+``BIND_SERIAL`` (every thread walks the axis itself). Strategy passes
+flip the bind on select ``BoundLoop``s to ``BIND_BLOCK_STRIDED`` to
+express cooperative iteration.
 
 **Outer free-Loop chain → ``Block.thread_axes``**. After stripping
 leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
@@ -22,12 +23,11 @@ all.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Loop
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.tile.ir import (
-    WALK_SERIAL,
     Block,
     BoundLoop,
     Stmt,
@@ -48,8 +48,9 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
        ``Block(output_axes=..., output_bind=BIND_THREAD)``. Otherwise,
        lower the inner body in place (single-thread serial — degenerate).
 
-    Inner ``Loop``s are translated to ``BoundLoop(walk=WALK_SERIAL)``.
-    Strategy passes flip walk strategies later.
+    Inner ``Loop``s are translated to
+    ``BoundLoop(BoundAxis(axis, BIND_SERIAL))``. Strategy passes flip
+    the bind on select BoundLoops later.
     """
     leading: list[LoopStmt] = []
     rest: tuple[LoopStmt, ...] = loop_op.body
@@ -91,7 +92,7 @@ def _lower_body(stmts: tuple[LoopStmt, ...]) -> list[Stmt]:
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Loop):
-            out.append(BoundLoop(axis=s.axis, body=tuple(_lower_body(s.body)), walk=WALK_SERIAL))
+            out.append(BoundLoop(axis=BoundAxis(axis=s.axis, bind=BIND_SERIAL), body=tuple(_lower_body(s.body))))
         else:
             out.append(s)
     return out

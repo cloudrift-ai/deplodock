@@ -13,7 +13,7 @@ The Block→Enclosure mapping is structural: both nodes carry
 - Any ``BoundAxis`` is ``BIND_BLOCK`` (cooperative) →
   ``Enclosure(axes=(BoundAxis(t, BIND_THREAD), *blk.axes))``, where
   ``t`` is the synthetic cooperative thread axis introduced here.
-  Inner ``BoundLoop(walk=WALK_STRIDED)`` becomes ``StridedLoop`` driven
+  Inner ``BoundLoop`` with ``bind=BIND_BLOCK_STRIDED`` becomes ``StridedLoop`` driven
   by ``t``; ``Combine`` siblings emit the smem tree-halve phase and
   broadcast loads; ``Stmt.rewrite`` renames subsequent Accum reads to
   ``<name>_b``.
@@ -25,7 +25,7 @@ passes can pattern-match on it.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import BIND_BLOCK_STRIDED, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK_STRIDED, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     Enclosure,
@@ -39,8 +39,6 @@ from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     COMBINE_BLOCK_REDUCE,
     COMBINE_THREAD_LOCAL,
-    WALK_SERIAL,
-    WALK_STRIDED,
     Block,
     BoundLoop,
     Combine,
@@ -93,8 +91,8 @@ def _lower_uncooperative(s: Stmt) -> Stmt:
     Leaves pass through. ``Combine`` must not appear in a non-cooperative
     Block (no strategy places it without setting ``block_axes``)."""
     if isinstance(s, BoundLoop):
-        if s.walk != WALK_SERIAL:
-            raise ValueError(f"non-cooperative Block cannot contain BoundLoop with walk={s.walk!r}")
+        if s.bind != BIND_SERIAL:
+            raise ValueError(f"non-cooperative Block cannot contain BoundLoop with bind={s.bind!r}")
         return Loop(axis=s.axis, body=tuple(_lower_uncooperative(c) for c in s.body))
     if isinstance(s, Combine):
         raise ValueError("Combine not allowed in non-cooperative Block (block_axes must be populated)")
@@ -159,11 +157,11 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
 
 def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
     body = tuple(_lower_inner(c, renamed) for c in loop.body)
-    if loop.walk == WALK_STRIDED:
+    if loop.bind == BIND_BLOCK_STRIDED:
         return StridedLoop(axis=loop.axis, start=Var(t), step=BLOCK_SIZE, body=body)
-    if loop.walk == WALK_SERIAL:
+    if loop.bind == BIND_SERIAL:
         return Loop(axis=loop.axis, body=body)
-    raise NotImplementedError(f"BoundLoop walk={loop.walk!r} inside cooperative Block not yet handled")
+    raise NotImplementedError(f"BoundLoop bind={loop.bind!r} inside cooperative Block not yet handled")
 
 
 def _lower_inner(s: Stmt, renamed) -> Stmt:
