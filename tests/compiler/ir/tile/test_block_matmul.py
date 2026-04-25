@@ -16,8 +16,8 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import Accum, Assign, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tile.ir import BoundLoop, Tile, TileOp
-from deplodock.compiler.ir.tile.lower import lower_naive
 from deplodock.compiler.pipeline.engine import run_rule
+from tests.compiler.ir.tile._helpers import lower_naive
 
 _RULE_PATH = Path(__file__).resolve().parents[4] / "deplodock/compiler/pipeline/passes/lowering/tile/003_block_matmul.py"
 

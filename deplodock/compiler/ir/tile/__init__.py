@@ -3,9 +3,11 @@
 - :mod:`.ir` — dataclass definitions: ``Tile`` / ``BoundLoop`` /
   ``Combine`` + binding constants, plus re-exports of Loop-IR leaves
   and shared expressions.
-- :mod:`.lower` — ``lower_naive`` translating Loop-IR ``LoopOp`` to Tile-IR
-  ``TileOp`` with a logical ``Tile``.
 - :mod:`.pretty` — structural pretty-printer for ``TileOp``.
+
+Loop-IR → Tile-IR lowering (``lower_naive``) lives next to its rule at
+``passes/lowering/tile/_lower.py`` — the convention is "rules own their
+logic; shared helpers underscore-prefixed in the rules dir".
 
 Materialization (Tile IR → Kernel IR) lives under
 ``passes/lowering/kernel``; rendering of Kernel IR to CUDA source lives
