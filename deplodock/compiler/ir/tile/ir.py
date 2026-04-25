@@ -69,6 +69,7 @@ from deplodock.compiler.ir.loop import (
     Loop,
     Select,
     SelectBranch,
+    Sigma,
     Stmt,
     Write,
 )
@@ -197,6 +198,18 @@ class StridedLoop(Stmt):
     start: Expr
     step: int
     body: tuple[Stmt, ...]
+
+    def rewrite(self, rename_ssa, sigma: Sigma = Sigma.IDENTITY):  # type: ignore[override]
+        """Recursive rewrite mirroring ``Loop.rewrite``: rebuild ``body``
+        applying ``rename_ssa`` / ``sigma`` to every child. ``start`` is
+        an Expr — sigma-substituted; ``axis`` and ``step`` are left as-is.
+        """
+        return StridedLoop(
+            axis=self.axis,
+            start=sigma.apply(self.start),
+            step=self.step,
+            body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
+        )
 
 
 # ---------------------------------------------------------------------------

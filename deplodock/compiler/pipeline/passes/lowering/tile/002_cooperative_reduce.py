@@ -65,12 +65,11 @@ Final ``Write`` handling:
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.loop import Accum, Assign, Axis, Cond, Load, Loop, Write
+from deplodock.compiler.ir.loop import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
+    Axis,
     Enclosure,
     Smem,
     StridedLoop,
@@ -154,38 +153,43 @@ def _build_cooperative_body(stmts: tuple, t: str) -> tuple | None:
     - other leaf stmts → carried through unchanged.
 
     Maintains a ``rename`` map of prior Accum SSA names to their
-    broadcast-load names; subsequent stmts have their reads remapped via
-    ``_rename_stmt``.
+    broadcast-load names; each subsequent stmt is rewritten via
+    ``Stmt.rewrite`` so prior reads resolve to the broadcast-load name.
+    ``Loop`` / ``StridedLoop`` / ``Cond`` recurse into their bodies via
+    their own ``rewrite`` implementations.
     """
     out: list = []
     rename: dict[str, str] = {}
 
+    def renamed(s: Stmt) -> Stmt:
+        if not rename:
+            return s
+        return s.rewrite(lambda n: rename.get(n, n))
+
     for stmt in stmts:
         if isinstance(stmt, Loop) and _is_reduce_loop(stmt):
-            phase = _emit_reduction_phase(stmt, t, rename)
+            phase = _emit_reduction_phase(stmt, t, renamed)
             if phase is None:
                 return None
             phase_stmts, accum = phase
             out.extend(phase_stmts)
             rename[accum.name] = f"{accum.name}_b"
         elif isinstance(stmt, Loop):
-            renamed_body = tuple(_rename_stmt(s, rename) for s in stmt.body)
-            out.append(StridedLoop(axis=stmt.axis, start=Var(t), step=BLOCK, body=renamed_body))
+            out.append(StridedLoop(axis=stmt.axis, start=Var(t), step=BLOCK, body=tuple(renamed(s) for s in stmt.body)))
         elif isinstance(stmt, Write):
-            renamed = _rename_stmt(stmt, rename)
             out.append(
                 Cond(
                     cond=BinaryExpr("==", Var(t), Literal(0, "int")),
-                    body=(renamed,),
+                    body=(renamed(stmt),),
                     else_body=(),
                 )
             )
         else:
-            out.append(_rename_stmt(stmt, rename))
+            out.append(renamed(stmt))
     return tuple(out)
 
 
-def _emit_reduction_phase(loop: Loop, t: str, rename: dict[str, str]) -> tuple[list, Accum] | None:
+def _emit_reduction_phase(loop: Loop, t: str, renamed) -> tuple[list, Accum] | None:
     """One cooperative reduction phase: smem alloc → strided per-thread
     partial → store partial → sync → tree-halve → sync → broadcast load."""
     accums = [s for s in loop.body if isinstance(s, Accum)]
@@ -194,11 +198,10 @@ def _emit_reduction_phase(loop: Loop, t: str, rename: dict[str, str]) -> tuple[l
     accum = accums[0]
     smem_name = f"{accum.name}_smem"
     broadcast_name = f"{accum.name}_b"
-    body_renamed = tuple(_rename_stmt(s, rename) for s in loop.body)
     return (
         [
             Smem(name=smem_name, extents=(BLOCK,)),
-            StridedLoop(axis=loop.axis, start=Var(t), step=BLOCK, body=body_renamed),
+            StridedLoop(axis=loop.axis, start=Var(t), step=BLOCK, body=tuple(renamed(s) for s in loop.body)),
             Write(output=smem_name, index=(Var(t),), value=accum.name),
             Sync(),
             TreeHalve(buf=smem_name, op=accum.op, length=BLOCK, tid_var=t),
@@ -207,39 +210,3 @@ def _emit_reduction_phase(loop: Loop, t: str, rename: dict[str, str]) -> tuple[l
         ],
         accum,
     )
-
-
-# ---------------------------------------------------------------------------
-# SSA rename — substitute prior Accum reads with their broadcast names
-# ---------------------------------------------------------------------------
-
-
-def _rename_name(name: str, rename: dict[str, str]) -> str:
-    return rename.get(name, name)
-
-
-def _rename_stmt(s: object, rename: dict[str, str]) -> object:
-    if not rename:
-        return s
-    if isinstance(s, Loop):
-        return Loop(axis=s.axis, body=tuple(_rename_stmt(c, rename) for c in s.body))
-    if isinstance(s, StridedLoop):
-        return StridedLoop(
-            axis=s.axis,
-            start=s.start,
-            step=s.step,
-            body=tuple(_rename_stmt(c, rename) for c in s.body),
-        )
-    if isinstance(s, Cond):
-        return replace(
-            s,
-            body=tuple(_rename_stmt(c, rename) for c in s.body),
-            else_body=tuple(_rename_stmt(c, rename) for c in s.else_body),
-        )
-    if isinstance(s, Assign):
-        return Assign(name=s.name, op=s.op, args=tuple(_rename_name(a, rename) for a in s.args))
-    if isinstance(s, Accum):
-        return Accum(name=s.name, value=_rename_name(s.value, rename), op=s.op)
-    if isinstance(s, Write):
-        return Write(output=s.output, index=s.index, value=_rename_name(s.value, rename))
-    return s

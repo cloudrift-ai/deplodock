@@ -54,3 +54,6 @@ class Sigma:
 
     def __hash__(self) -> int:
         return hash(self._key)  # type: ignore[attr-defined]
+
+
+Sigma.IDENTITY = Sigma({})
