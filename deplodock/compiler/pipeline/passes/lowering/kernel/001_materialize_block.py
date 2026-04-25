@@ -37,8 +37,8 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
-    COMBINE_REGISTER,
-    COMBINE_SMEM_TREE_HALVE,
+    COMBINE_BLOCK_REDUCE,
+    COMBINE_THREAD_LOCAL,
     WALK_SERIAL,
     WALK_STRIDED,
     Block,
@@ -134,7 +134,7 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
                 raise ValueError(f"Combine({stmt.name!r}) does not match preceding Accum({accum.name!r})")
             phase = _emit_combine(stmt, accum, t_axis.name)
             new_body.extend(phase)
-            if stmt.via == COMBINE_SMEM_TREE_HALVE:
+            if stmt.via == COMBINE_BLOCK_REDUCE:
                 rename[accum.name] = f"{accum.name}_b"
             pending_reduce = None
         elif isinstance(stmt, Write):
@@ -173,9 +173,9 @@ def _lower_inner(s: Stmt, renamed) -> Stmt:
 
 
 def _emit_combine(combine: Combine, accum: Accum, t: str) -> list[Stmt]:
-    if combine.via == COMBINE_REGISTER:
+    if combine.via == COMBINE_THREAD_LOCAL:
         return []
-    if combine.via == COMBINE_SMEM_TREE_HALVE:
+    if combine.via == COMBINE_BLOCK_REDUCE:
         smem_name = f"{accum.name}_smem"
         broadcast_name = f"{accum.name}_b"
         return [

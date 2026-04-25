@@ -11,16 +11,16 @@ all ``WALK_SERIAL``) and rewrites it in place:
 - Every inner ``BoundLoop`` (reduction or free output) → ``WALK_STRIDED``
   so threads cooperate on the axis.
 - After each reduce ``BoundLoop`` (one whose immediate body contains an
-  ``Accum``), a ``Combine(name, op, via=SMEM_TREE_HALVE)`` sibling is
+  ``Accum``), a ``Combine(name, op, via=BLOCK_REDUCE)`` sibling is
   inserted so materialization emits the cross-thread combine.
 
 Post-rewrite example (softmax)::
 
     Block(thread_axes=(), block_axes=(i,), body=(
       BoundLoop(k1, walk=WALK_STRIDED, body=(Load, Accum("acc_max", max))),
-      Combine("acc_max", max, SMEM_TREE_HALVE),
+      Combine("acc_max", max, BLOCK_REDUCE),
       BoundLoop(k2, walk=WALK_STRIDED, body=(Load, Assign, Assign, Accum("acc_sum", add))),
-      Combine("acc_sum", add, SMEM_TREE_HALVE),
+      Combine("acc_sum", add, BLOCK_REDUCE),
       BoundLoop(k3, walk=WALK_STRIDED, body=(Load, Assign, Assign, Assign, Write)),
     ))
 
@@ -41,7 +41,7 @@ from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BoundAxis
 from deplodock.compiler.ir.stmt import Accum
 from deplodock.compiler.ir.tile.ir import (
-    COMBINE_SMEM_TREE_HALVE,
+    COMBINE_BLOCK_REDUCE,
     WALK_STRIDED,
     Block,
     BoundLoop,
@@ -108,7 +108,7 @@ def _rewrite_block(blk: Block) -> Block | None:
             new_body.append(replace(s, walk=WALK_STRIDED))
             if _is_reduce(s):
                 accum = next(a for a in s.body if isinstance(a, Accum))
-                new_body.append(Combine(name=accum.name, op=accum.op, via=COMBINE_SMEM_TREE_HALVE))
+                new_body.append(Combine(name=accum.name, op=accum.op, via=COMBINE_BLOCK_REDUCE))
             else:
                 strided_output_axes.append(BoundAxis(axis=s.axis, bind=BIND_BLOCK_STRIDED))
         else:

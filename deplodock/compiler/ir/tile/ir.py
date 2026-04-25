@@ -160,9 +160,11 @@ class BoundLoop(Stmt):
         )
 
 
-# Combine ``via`` values — how an Accum's per-thread partials collapse.
-COMBINE_REGISTER = "REGISTER"
-COMBINE_SMEM_TREE_HALVE = "SMEM_TREE_HALVE"
+# Combine ``via`` values — the *scope* over which an Accum's per-thread
+# partials are collapsed. Hardware mechanism (smem + tree-halve, warp
+# shuffle, atomic, ...) is a Kernel-IR concern picked by materialization.
+COMBINE_THREAD_LOCAL = "THREAD_LOCAL"
+COMBINE_BLOCK_REDUCE = "BLOCK_REDUCE"
 
 
 @dataclass
@@ -170,20 +172,25 @@ class Combine(Stmt):
     """Cross-thread reduction of an ``Accum`` target.
 
     Placed after the reduce ``BoundLoop`` whose ``Accum`` produced
-    ``name``. ``via`` says how the partials collapse:
+    ``name``. ``via`` names the *scope* over which the partials collapse:
 
-    ``REGISTER`` — no cross-thread combine (each thread owns its own
-    output element; its register is the final value).
-    ``SMEM_TREE_HALVE`` — stage partials into a per-block smem buffer,
-    tree-halve across threads. Materialization emits ``Smem`` +
+    ``THREAD_LOCAL`` — no cross-thread combine; each thread keeps its
+    own partial (each thread owns a distinct output, so the per-thread
+    accumulator already *is* the final value).
+    ``BLOCK_REDUCE`` — combine across all threads of the CUDA block;
+    materialization picks the mechanism (today: ``Smem`` +
     ``Write-to-smem`` + ``Sync`` + ``TreeHalve`` + ``Sync`` + broadcast
-    ``Load`` in Kernel IR; subsequent reads of ``name`` resolve to the
-    broadcast load.
+    ``Load``; future ``__shfl_down_sync`` paths land here without
+    changing this enum). Subsequent reads of ``name`` resolve to the
+    combined value broadcast back to every thread.
+
+    Future scopes (``WARP_REDUCE``, ``GLOBAL_REDUCE``) extend this enum
+    by *cooperative-unit scope*, not by hardware mechanism.
     """
 
     name: str
     op: ElementwiseImpl
-    via: str  # COMBINE_REGISTER | COMBINE_SMEM_TREE_HALVE
+    via: str  # COMBINE_THREAD_LOCAL | COMBINE_BLOCK_REDUCE
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +268,8 @@ __all__ = [
     "BIND_BLOCK_STRIDED",
     "WALK_SERIAL",
     "WALK_STRIDED",
-    "COMBINE_REGISTER",
-    "COMBINE_SMEM_TREE_HALVE",
+    "COMBINE_THREAD_LOCAL",
+    "COMBINE_BLOCK_REDUCE",
     "Stmt",
     # Top-level
     "TileOp",
