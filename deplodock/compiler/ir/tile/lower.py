@@ -3,9 +3,9 @@
 Mechanical translation. Loop IR's leaves (``Load`` / ``Assign`` /
 ``Select`` / ``Write`` / ``Accum`` / ``Cond``) pass through unchanged.
 Loop-IR ``Loop`` is rewritten to Tile-IR ``BoundLoop`` with
-``bind=BIND_SERIAL`` — the pre-strategy default (every thread walks
-the axis itself). Strategy passes flip bindings on select ``BoundLoop``s
-to express cooperative / threaded walks.
+``walk=WALK_SERIAL`` — the pre-strategy default (every thread walks
+the axis itself). Strategy passes flip walk strategies on select
+``BoundLoop``s to express cooperative iteration.
 
 **Outer free-Loop chain → ``Block.thread_axes``**. After stripping
 leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
@@ -31,9 +31,11 @@ from deplodock.compiler.ir.loop import (
     Stmt as LoopStmt,
 )
 from deplodock.compiler.ir.tile.ir import (
-    BIND_SERIAL,
+    BIND_THREAD,
+    WALK_SERIAL,
     Axis,
     Block,
+    BoundAxis,
     BoundLoop,
     Stmt,
     TileOp,
@@ -53,8 +55,8 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
        ``Block(output_axes=..., output_bind=BIND_THREAD)``. Otherwise,
        lower the inner body in place (single-thread serial — degenerate).
 
-    Inner ``Loop``s are translated to ``BoundLoop(bind=BIND_SERIAL)``.
-    Strategy passes flip bindings later.
+    Inner ``Loop``s are translated to ``BoundLoop(walk=WALK_SERIAL)``.
+    Strategy passes flip walk strategies later.
     """
     leading: list[LoopStmt] = []
     rest: tuple[LoopStmt, ...] = loop_op.body
@@ -67,7 +69,8 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     body: list[Stmt] = list(_lower_body(tuple(leading)))
     inner_lowered = tuple(_lower_body(inner))
     if output_axes:
-        body.append(Block(thread_axes=output_axes, block_axes=(), body=inner_lowered))
+        bound = tuple(BoundAxis(axis=ax, bind=BIND_THREAD) for ax in output_axes)
+        body.append(Block(axes=bound, body=inner_lowered))
     else:
         body.extend(inner_lowered)
 
@@ -95,7 +98,7 @@ def _lower_body(stmts: tuple[LoopStmt, ...]) -> list[Stmt]:
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Loop):
-            out.append(BoundLoop(axis=s.axis, body=tuple(_lower_body(s.body)), bind=BIND_SERIAL))
+            out.append(BoundLoop(axis=s.axis, body=tuple(_lower_body(s.body)), walk=WALK_SERIAL))
         else:
             out.append(s)
     return out

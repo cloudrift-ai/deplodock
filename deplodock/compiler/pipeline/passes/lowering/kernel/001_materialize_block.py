@@ -4,18 +4,19 @@ Reads each ``Block`` in the TileOp body and emits the concrete
 hardware shape — ``Enclosure`` / ``Smem`` / ``Sync`` / ``TreeHalve`` /
 ``StridedLoop`` — that ``render_kernelop`` consumes.
 
-The Block→Enclosure mapping is structural: the two nodes share the
-``thread_axes`` / ``block_axes`` field shape. Materialization is then:
+The Block→Enclosure mapping is structural: both nodes carry
+``axes: tuple[BoundAxis, ...]``. Materialization is then:
 
-- ``Block(thread_axes=T, block_axes=())`` (pointwise / per-thread serial)
-  → ``Enclosure(thread_axes=T, block_axes=())``. Inner ``BoundLoop``s
+- All ``BoundAxis`` in the Block are ``BIND_THREAD`` (pointwise / per-
+  thread serial) → ``Enclosure(axes=blk.axes)``. Inner ``BoundLoop``s
   fall back to serial Loop-IR ``Loop``s.
-- ``Block(thread_axes=(), block_axes=B)`` (cooperative)
-  → ``Enclosure(thread_axes=(t,), block_axes=B)``, where ``t`` is the
-  synthetic cooperative thread axis introduced here. Inner
-  ``BoundLoop(bind=BIND_STRIDED)`` becomes ``StridedLoop`` driven by ``t``;
-  ``Combine`` siblings emit the smem tree-halve phase and broadcast
-  loads; ``Stmt.rewrite`` renames subsequent Accum reads to ``<name>_b``.
+- Any ``BoundAxis`` is ``BIND_BLOCK`` (cooperative) →
+  ``Enclosure(axes=(BoundAxis(t, BIND_THREAD), *blk.axes))``, where
+  ``t`` is the synthetic cooperative thread axis introduced here.
+  Inner ``BoundLoop(walk=WALK_STRIDED)`` becomes ``StridedLoop`` driven
+  by ``t``; ``Combine`` siblings emit the smem tree-halve phase and
+  broadcast loads; ``Stmt.rewrite`` renames subsequent Accum reads to
+  ``<name>_b``.
 
 Produces a ``KernelOp`` — distinct type from ``TileOp``, so Kernel-IR
 passes can pattern-match on it.
@@ -26,6 +27,8 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
+    BIND_THREAD,
+    BoundAxis,
     Enclosure,
     KernelOp,
     Smem,
@@ -35,10 +38,10 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.loop import Accum, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
-    BIND_SERIAL,
-    BIND_STRIDED,
     COMBINE_REGISTER,
     COMBINE_SMEM_TREE_HALVE,
+    WALK_SERIAL,
+    WALK_STRIDED,
     Axis,
     Block,
     BoundLoop,
@@ -76,17 +79,15 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
 def _materialize(blk: Block) -> Stmt:
     if blk.block_axes:
-        return _materialize_cooperative(blk.thread_axes, blk.block_axes, blk.body)
-    return _materialize_thread_per_output(blk.thread_axes, blk.body)
+        return _materialize_cooperative(blk.axes, blk.body)
+    return _materialize_thread_per_output(blk.axes, blk.body)
 
 
-def _materialize_thread_per_output(output_axes: tuple, body: tuple) -> Stmt:
-    """One thread per output element. Pointwise kernels
-    have no inner Loops / Accums; reductions that opted out of cooperation
-    stay here with serial per-thread ``Loop`` walks folding ``Accum``
-    into per-thread registers."""
+def _materialize_thread_per_output(axes: tuple, body: tuple) -> Stmt:
+    """One thread per output element. ``axes`` is passed through
+    unchanged — every BoundAxis is already ``BIND_THREAD``."""
     lowered = tuple(_lower_uncooperative(s) for s in body)
-    return Enclosure(thread_axes=output_axes, block_axes=(), body=lowered)
+    return Enclosure(axes=axes, body=lowered)
 
 
 def _lower_uncooperative(s: Stmt) -> Stmt:
@@ -94,17 +95,19 @@ def _lower_uncooperative(s: Stmt) -> Stmt:
     Leaves pass through. ``Combine`` must not appear in a non-cooperative
     Block (no strategy places it without setting ``block_axes``)."""
     if isinstance(s, BoundLoop):
-        if s.bind != BIND_SERIAL:
-            raise ValueError(f"non-cooperative Block cannot contain BoundLoop with bind={s.bind!r}")
+        if s.walk != WALK_SERIAL:
+            raise ValueError(f"non-cooperative Block cannot contain BoundLoop with walk={s.walk!r}")
         return Loop(axis=s.axis, body=tuple(_lower_uncooperative(c) for c in s.body))
     if isinstance(s, Combine):
         raise ValueError("Combine not allowed in non-cooperative Block (block_axes must be populated)")
     return s
 
 
-def _materialize_cooperative(thread_axes: tuple, block_axes: tuple, body: tuple) -> Stmt:
-    """Cooperative materialization: one CUDA block per output point in
-    ``block_axes``; a synthetic ``t`` thread axis drives cooperation."""
+def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
+    """Cooperative materialization: one CUDA block per output point;
+    a synthetic ``t`` thread axis drives cooperation. ``axes`` carries
+    the output BoundAxes (all ``BIND_BLOCK``); the synthetic ``t`` is
+    prepended as ``BIND_THREAD``."""
     t_axis = Axis(name="t", extent=BLOCK_SIZE)
     rename: dict[str, str] = {}
 
@@ -147,18 +150,19 @@ def _materialize_cooperative(thread_axes: tuple, block_axes: tuple, body: tuple)
         else:
             new_body.append(renamed(stmt))
 
-    # Cooperative thread axis ``t`` plus any pre-existing thread_axes the
-    # strategy left in place (none today, but the field shape supports it).
-    return Enclosure(thread_axes=(t_axis, *thread_axes), block_axes=block_axes, body=tuple(new_body))
+    # Cooperative thread axis ``t`` (BIND_THREAD) plus the original
+    # output axes (kept as BIND_BLOCK by the strategy).
+    new_axes = (BoundAxis(axis=t_axis, bind=BIND_THREAD), *axes)
+    return Enclosure(axes=new_axes, body=tuple(new_body))
 
 
 def _emit_strided(loop: BoundLoop, t: str, renamed) -> Stmt:
     body = tuple(_lower_inner(c, renamed) for c in loop.body)
-    if loop.bind == BIND_STRIDED:
+    if loop.walk == WALK_STRIDED:
         return StridedLoop(axis=loop.axis, start=Var(t), step=BLOCK_SIZE, body=body)
-    if loop.bind == BIND_SERIAL:
+    if loop.walk == WALK_SERIAL:
         return Loop(axis=loop.axis, body=body)
-    raise NotImplementedError(f"BoundLoop bind={loop.bind!r} inside cooperative Block not yet handled")
+    raise NotImplementedError(f"BoundLoop walk={loop.walk!r} inside cooperative Block not yet handled")
 
 
 def _lower_inner(s: Stmt, renamed) -> Stmt:

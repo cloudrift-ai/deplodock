@@ -8,10 +8,13 @@
 """
 
 from deplodock.compiler.ir.kernel.ir import (
+    BIND_BLOCK,
+    BIND_THREAD,
     Accum,
     Assign,
     Axis,
     BinaryExpr,
+    BoundAxis,
     Builtin,
     CastExpr,
     Cond,
@@ -57,6 +60,9 @@ __all__ = [
     "Sync",
     "TreeHalve",
     "StridedLoop",
+    "BoundAxis",
+    "BIND_THREAD",
+    "BIND_BLOCK",
     "Stmt",
     "KernelOp",
     "Axis",
