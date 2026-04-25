@@ -33,17 +33,22 @@ def _softmax_graph(shape: tuple[int, int]) -> Graph:
 
 
 def test_softmax_cooperative_above_threshold():
-    """Softmax over K=4096: cooperative path — two ``__shared__`` accumulator
-    buffers, two tree-halves, broadcast loads between phases."""
+    """Softmax over K=4096: cooperative path with input staging — three
+    ``__shared__`` buffers (one input cache + two accumulator scratches),
+    two tree-halves, broadcast loads between phases, all phases read
+    from the staged input rather than re-fetching from global."""
     source = _cuda_nodes(CudaBackend().compile(_softmax_graph((4, 4096))))[0].op.kernel_source
-    # Two cooperative reductions ⇒ two smem buffers.
-    assert source.count("__shared__ float ") == 2
-    # Each phase has at least one barrier; tree-halve has another inside its loop.
-    assert source.count("__syncthreads();") >= 4
+    # Input staging adds a third smem buffer (`input_stage`).
+    assert source.count("__shared__ float ") == 3
+    assert "_stage" in source  # staged buffer name is f"{input_buf}_stage"
+    # Three phases (max, sum, output write) all read from the staged copy.
+    assert source.count("_stage[") >= 3
+    # Each cooperative phase has barriers; tree-halve has another per halving step.
+    assert source.count("__syncthreads();") >= 5
     # Two tree-halves (one per reduction phase).
     assert source.count("for (int s = 128; s > 0; s >>= 1)") == 2
-    # All loops over k stride by BLOCK = 256 — two reductions + one output.
-    assert source.count("+= 256") == 3
+    # Strided walks: 1 cooperative load + 2 reductions + 1 output = 4 strides over the K axis.
+    assert source.count("+= 256") == 4
     assert "< 4096" in source
     # One CUDA block per row.
     assert "blockIdx.x" in source

@@ -192,6 +192,38 @@ class Combine(Stmt):
     op: ElementwiseImpl
 
 
+@dataclass
+class Stage(Stmt):
+    """Operand-cache declaration: stage ``buf`` for reuse across the
+    surrounding ``Tile`` body.
+
+    Subsequent ``Load(buf, ...)`` reads in the body resolve to the
+    staged copy, not the original buffer. ``index`` is the original
+    source-buffer index pattern (with axis ``Var``s); ``axes`` lists the
+    axes that *vary* within the staged fragment — the smem buffer's
+    shape is ``tuple(ax.extent for ax in axes)``. Positions in
+    ``index`` whose ``Var`` name appears in ``axes`` are the
+    cache-dimension positions; other positions (typically block-bound
+    axes from ``Tile.axes``) are fixed per CUDA block and contribute
+    size 1 to the staged fragment.
+
+    Doesn't commit to storage class — materialization picks (smem in
+    today's path; register file or async-copy paths possible in the
+    future). Subsequent body ``Load``s of ``buf`` get rewritten by
+    materialization to read from the staged buffer with the
+    cache-dimension positions of their original index.
+
+    Inserted by the input-staging strategy when multiple ``BoundLoop``s
+    in a cooperative ``Tile`` body Load the same buffer with
+    block-bound dimensions in common — typical of softmax / norm-style
+    fusions where the input is read three times.
+    """
+
+    buf: str
+    index: tuple[Expr, ...]
+    axes: tuple[Axis, ...]
+
+
 # ---------------------------------------------------------------------------
 # Top-level: TileOp
 # ---------------------------------------------------------------------------
@@ -260,6 +292,7 @@ __all__ = [
     "Tile",
     "BoundLoop",
     "Combine",
+    "Stage",
     # Bindings
     "BoundAxis",
     "BIND_THREAD",
