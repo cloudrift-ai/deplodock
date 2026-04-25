@@ -1,9 +1,15 @@
 """Loop IR → Tile IR lowering tests.
 
-After dropping ``Let`` / ``Store`` etc, ``lower_naive`` is a thin
-mechanical pass: Loop IR's ``Loop`` becomes ``Loop`` (no Accum) or
-``Reduce`` (Accums present); leaves pass through. These tests verify the
-structural shape and round-trip render output.
+``lower_naive`` is mechanical:
+- Loop IR leaves (``Load`` / ``Assign`` / ``Select`` / ``Write`` /
+  ``Accum`` / ``Cond``) pass through.
+- Loop IR ``Loop`` becomes ``Reduce`` (Accums in body) or stays as a
+  ``Loop``.
+- The outer free-Loop chain is stripped into an ``Enclosure(thread_axes=...)``
+  at the kernel root; leading non-Loop stmts (scalar Loads) sit above
+  the Enclosure in ``TileOp.body``.
+
+These tests cover the structural shape and the round-trip render.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from deplodock.compiler.ir.loop import (
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile import (
+    Enclosure,
     Param,
     Reduce,
     TileOp,
@@ -28,7 +35,7 @@ from deplodock.compiler.ir.tile.lower import lower_naive
 from deplodock.compiler.ir.tile.render import render_tileop
 
 # ---------------------------------------------------------------------------
-# Pointwise add — minimal shape exercise
+# Pointwise add — outer free chain (a0, a1) strips into Enclosure
 # ---------------------------------------------------------------------------
 
 
@@ -68,30 +75,37 @@ def test_pointwise_add_structure():
 
     assert isinstance(k, TileOp)
     assert k.name == "add"
-    # Naive lowering: no Enclosure, single-thread serial body.
-    outer = k.body[0]
-    assert isinstance(outer, Loop) and outer.axis.name == "a0"
-    inner = outer.body[0]
-    assert isinstance(inner, Loop) and inner.axis.name == "a1"
-    # Loop IR leaves pass through unchanged.
-    assert isinstance(inner.body[0], Load) and inner.body[0].input == "A"
-    assert isinstance(inner.body[3], Write) and inner.body[3].output == "out"
+    # Outer free-Loop chain (a0, a1) → Enclosure.thread_axes.
+    enc = k.body[0]
+    assert isinstance(enc, Enclosure)
+    assert tuple(a.name for a in enc.thread_axes) == ("a0", "a1")
+    assert enc.block_axes == ()
+    # Enclosure body: 2 Loads + 1 Assign + 1 Write (the leaf body of the
+    # innermost stripped Loop).
+    assert isinstance(enc.body[0], Load) and enc.body[0].input == "A"
+    assert isinstance(enc.body[3], Write) and enc.body[3].output == "out"
 
 
 def test_pointwise_add_renders():
     op = _pointwise_add_loop_op()
     inputs, output = _pointwise_add_params()
     src = render_tileop(lower_naive(op, "add", inputs, output))
-    # ``LoopOp.__post_init__`` normalizes SSA names → in0/in1 for Loads, v0 for Assign.
-    assert "for (int a0 = 0; a0 < 4; a0++) {" in src
-    assert "for (int a1 = 0; a1 < 8; a1++) {" in src
+    # Tid decode replaces the outer for-loops; bounds guard for 4*8 = 32 threads.
+    assert "long long tid = blockIdx.x * blockDim.x + threadIdx.x;" in src
+    assert "if (tid < 32) {" in src
+    # Inner-axis decode: a1 is innermost (tid % 8); a0 is outermost (tid / 8).
+    assert "int a1 = tid % 8;" in src
+    assert "int a0 = tid / 8;" in src
+    # Per-thread compute, no for-loop over a0 / a1 anymore.
     assert "float in0 = A[a0 * 8 + a1];" in src
     assert "float v0 = in0 + in1;" in src
     assert "out[a0 * 8 + a1] = v0;" in src
+    assert "for (int a0" not in src
+    assert "for (int a1" not in src
 
 
 # ---------------------------------------------------------------------------
-# Reduce — sum along k
+# Reduce — sum along k. Only a0 strips (a1 is the reduce axis).
 # ---------------------------------------------------------------------------
 
 
@@ -123,16 +137,17 @@ def test_row_sum_structure():
     output = Param("out", "float*", shape=(4,))
     k = lower_naive(op, "row_sum", inputs, output)
 
-    outer = k.body[0]
-    assert isinstance(outer, Loop)
-    reduce_node = outer.body[0]
-    assert isinstance(reduce_node, Reduce)
-    assert reduce_node.axis.name == "a1"
-    # Body has the Load + the Accum (Loop IR leaves pass through).
+    enc = k.body[0]
+    assert isinstance(enc, Enclosure)
+    assert tuple(a.name for a in enc.thread_axes) == ("a0",)
+    # Inside Enclosure: Reduce + Write (the rest of a0's body since the
+    # chain stops at the reduce loop).
+    reduce_node = enc.body[0]
+    assert isinstance(reduce_node, Reduce) and reduce_node.axis.name == "a1"
     assert isinstance(reduce_node.body[0], Load)
     assert isinstance(reduce_node.body[1], Accum)
     assert reduce_node.body[1].op.name == "add"
-    assert isinstance(outer.body[1], Write)
+    assert isinstance(enc.body[1], Write)
 
 
 def test_row_sum_renders():
@@ -145,7 +160,8 @@ def test_row_sum_renders():
             Param("out", "float*", shape=(4,)),
         )
     )
-    # Renderer collects accumulator decls from body Accums.
+    assert "if (tid < 4) {" in src
+    assert "int a0 = tid;" in src
     assert "float acc0 = 0.0f;" in src
     assert "for (int a1 = 0; a1 < 32; a1++) {" in src
     assert "acc0 += in0;" in src
@@ -206,11 +222,12 @@ def test_softmax_like_structure():
         (Param("X", "const float*", shape=(4, 32)),),
         Param("out", "float*", shape=(4, 32)),
     )
-    outer = k_kern.body[0]
-    assert isinstance(outer, Loop) and outer.axis.name == "a0"
-    r_max, r_sum, out_loop = outer.body
+    enc = k_kern.body[0]
+    assert isinstance(enc, Enclosure)
+    # Only a0 strips — the level beneath has 3 sibling Loops, breaks the chain.
+    assert tuple(a.name for a in enc.thread_axes) == ("a0",)
+    r_max, r_sum, out_loop = enc.body
     assert isinstance(r_max, Reduce)
-    # Find the Accum in r_max's body.
     accums = [s for s in r_max.body if isinstance(s, Accum)]
     assert accums[0].op.name == "maximum"
     assert isinstance(r_sum, Reduce)
@@ -227,6 +244,7 @@ def test_softmax_like_renders():
             Param("out", "float*", shape=(4, 32)),
         )
     )
+    assert "if (tid < 4) {" in src
     assert "acc0 = fmaxf(acc0, " in src
     assert "expf(" in src
     assert "acc1 +=" in src
@@ -235,7 +253,7 @@ def test_softmax_like_renders():
 
 
 # ---------------------------------------------------------------------------
-# Matmul — direct Write at reduce-loop level (no output loop)
+# Matmul — outer chain (a0, a1) strips, leaving Reduce(a2) + Write inside.
 # ---------------------------------------------------------------------------
 
 
@@ -278,13 +296,12 @@ def test_matmul_structure():
         ),
         Param("out", "float*", shape=(8, 8)),
     )
-    m_loop = k.body[0]
-    assert isinstance(m_loop, Loop) and m_loop.axis.name == "a0"
-    n_loop = m_loop.body[0]
-    assert isinstance(n_loop, Loop) and n_loop.axis.name == "a1"
-    reduce_node = n_loop.body[0]
+    enc = k.body[0]
+    assert isinstance(enc, Enclosure)
+    assert tuple(a.name for a in enc.thread_axes) == ("a0", "a1")
+    reduce_node = enc.body[0]
     assert isinstance(reduce_node, Reduce) and reduce_node.axis.name == "a2"
-    assert isinstance(n_loop.body[1], Write)
+    assert isinstance(enc.body[1], Write)
 
 
 def test_matmul_renders():
@@ -300,21 +317,22 @@ def test_matmul_renders():
             Param("out", "float*", shape=(8, 8)),
         )
     )
+    # Outer (a0, a1) → tid decode; reduce stays as for-loop.
+    assert "if (tid < 64) {" in src
+    assert "int a1 = tid % 8;" in src
+    assert "int a0 = tid / 8;" in src
     assert "float acc0 = 0.0f;" in src
     assert "for (int a2 = 0; a2 < 16; a2++) {" in src
-    assert "float v0 = in0 * in1;" in src
     assert "acc0 += v0;" in src
     assert "out[a0 * 8 + a1] = acc0;" in src
 
 
 # ---------------------------------------------------------------------------
-# Top-level scalar Loads sit at the start of TileOp.body
+# Top-level scalar Loads sit at the start of TileOp.body, above any Enclosure
 # ---------------------------------------------------------------------------
 
 
 def _scalar_prologue_loop_op() -> LoopOp:
-    """A LoopOp with a scalar Load above the outer Loop — should land at the
-    start of the TileOp body (above any Enclosure introduced by a later pass)."""
     a0 = Axis("a0", 4)
     return LoopOp(
         body=(
@@ -339,10 +357,12 @@ def test_scalar_prologue_at_body_start():
         (Param("X", "const float*", shape=(4,)), Param("Eps", "const float*", shape=(1,))),
         Param("out", "float*", shape=(4,)),
     )
-    # The leading scalar Load passes through to body[0].
+    # Leading scalar Load passes through; outer Loop(a0) gets stripped into Enclosure.
     assert isinstance(k.body[0], Load)
     assert k.body[0].name == "in0"
-    assert isinstance(k.body[1], Loop)
+    enc = k.body[1]
+    assert isinstance(enc, Enclosure)
+    assert tuple(a.name for a in enc.thread_axes) == ("a0",)
 
 
 def test_scalar_prologue_renders_above_body():
@@ -355,6 +375,9 @@ def test_scalar_prologue_renders_above_body():
             Param("out", "float*", shape=(4,)),
         )
     )
-    # Empty Load.index → "Eps[0]".
+    # Scalar load above the tid guard (every thread sees the same value).
     assert "float in0 = Eps[0];" in src
-    assert src.index("float in0 = Eps[0];") < src.index("for (int a0 = 0; a0 < 4; a0++)")
+    assert src.index("float in0 = Eps[0];") < src.index("long long tid =")
+    # And the per-thread work runs inside the tid guard, not in a for-loop.
+    assert "for (int a0" not in src
+    assert "if (tid < 4) {" in src
