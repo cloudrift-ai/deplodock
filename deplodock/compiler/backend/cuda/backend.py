@@ -44,7 +44,7 @@ class CudaBackend(Backend):
         self.last_debug_result = None
 
     def compile(self, graph: Graph) -> Graph:
-        """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[KernelOp]`` → ``Graph[CudaOp]``."""
+        """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
         return run_pipeline(graph, CUDA_PASSES, dump=self.dump)
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:

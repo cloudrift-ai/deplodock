@@ -7,7 +7,7 @@
   dispatch that routes post-pass dumps by pass name.
 - :mod:`.passes` — pass directories grouped by IR level:
   ``frontend/{decomposition,optimization}``, ``loop/{lifting,fusion}``,
-  ``lowering/{kernel,cuda}``. Each leaf contains ``NNN_<name>.py`` rule
+  ``lowering/{tile,cuda}``. Each leaf contains ``NNN_<name>.py`` rule
   modules picked up by ``run_pass``.
 """
 
@@ -25,17 +25,17 @@ from deplodock.compiler.pipeline.engine import (
 # and tests should reference these rather than re-listing pass names.
 TENSOR_PASSES = ["frontend/decomposition", "frontend/optimization"]
 LOOP_PASSES = [*TENSOR_PASSES, "loop/lifting", "loop/fusion", "loop/matmul"]
-KERNEL_PASSES = [*LOOP_PASSES, "lowering/kernel"]
-CUDA_PASSES = [*KERNEL_PASSES, "lowering/cuda"]
+TILE_PASSES = [*LOOP_PASSES, "lowering/tile"]
+CUDA_PASSES = [*TILE_PASSES, "lowering/cuda"]
 
 __all__ = [
     "CUDA_PASSES",
     "CompilerDump",
-    "KERNEL_PASSES",
     "LOOP_PASSES",
     "Match",
     "Pattern",
     "TENSOR_PASSES",
+    "TILE_PASSES",
     "match_pattern",
     "run_pass",
     "run_pipeline",

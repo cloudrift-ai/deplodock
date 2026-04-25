@@ -18,14 +18,10 @@ Idempotent: running twice yields the same AST. Pure: ``Expr → Expr``.
 Entry points:
 
 - ``simplify_expr(e, ctx)`` — Expr rewriter; covers every shared Expr type
-  (``Var | Literal | BinaryExpr | Builtin | FuncCallExpr | TernaryExpr | CastExpr``) plus
-  the GPU extensions (``ArrayAccess | FieldAccess | VectorLoad``).
+  (``Var | Literal | BinaryExpr | Builtin | FuncCallExpr | TernaryExpr | CastExpr``).
 - ``simplify_loop_op(op)`` — walks a ``LoopOp``, seeding Context from its
   ``Axis`` extents, rewriting every Expr in ``Load.index`` / ``Select`` /
   ``Write`` / ``Accum.init``.
-
-Kernel-IR walking lives in ``ir.kernel.normalize``; it re-uses
-``Context`` / ``Interval`` / ``simplify_expr`` from here.
 
 Range analysis (``infer_range``) tracks integer intervals only; ``Builtin``,
 ``FuncCallExpr``, ``CastExpr`` return ``None`` (unknown range → no comparison
@@ -46,7 +42,6 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.kernel.ir import ArrayAccess, FieldAccess, VectorLoad
 from deplodock.compiler.ir.loop.ir import (
     Load,
     Loop,
@@ -316,24 +311,6 @@ def simplify_expr(expr: object, ctx: Context) -> object:
         if all(x is y for x, y in zip(new_args, expr.args, strict=True)):
             return expr
         return FuncCallExpr(expr.name, new_args)
-
-    if isinstance(expr, ArrayAccess):
-        new_index = simplify_expr(expr.index, ctx)
-        if new_index is expr.index:
-            return expr
-        return ArrayAccess(expr.array, new_index)
-
-    if isinstance(expr, FieldAccess):
-        new_inner = simplify_expr(expr.expr, ctx)
-        if new_inner is expr.expr:
-            return expr
-        return FieldAccess(new_inner, expr.field)
-
-    if isinstance(expr, VectorLoad):
-        new_index = simplify_expr(expr.index, ctx)
-        if new_index is expr.index:
-            return expr
-        return VectorLoad(expr.array, new_index, expr.width)
 
     return expr
 
