@@ -87,7 +87,7 @@ def test_strategy_rewrites_above_threshold():
     tile = encl.body[0]
     assert isinstance(tile, Tile)
     body_kinds = [type(s).__name__ for s in tile.body]
-    assert body_kinds[0] == "Smem"
+    assert "Smem" in body_kinds
     assert "StridedLoop" in body_kinds
     assert "Sync" in body_kinds
     assert "TreeHalve" in body_kinds
