@@ -39,8 +39,8 @@ def test_softmax_large_thread_per_row():
     assert "__shared__" not in source
     assert "__syncthreads" not in source
     # Two reduce loops (max, sum) plus one output loop, all walking 4096.
-    assert source.count("for (int k") == 2
-    assert "for (int o" in source
+    # Two reduce loops + one output loop = 3 total `for` headers.
+    assert source.count("for (int ") == 3
     assert "< 4096" in source
     assert "blockIdx.x" in source
 
@@ -50,6 +50,6 @@ def test_softmax_small_thread_per_row():
     source = _cuda_nodes(CudaBackend().compile(_softmax_graph((4, 8))))[0].op.kernel_source
     assert "__shared__" not in source
     assert "__syncthreads" not in source
-    assert source.count("for (int k") == 2
-    assert "for (int o" in source
+    # Two reduce loops + one output loop = 3 total `for` headers.
+    assert source.count("for (int ") == 3
     assert "< 8" in source

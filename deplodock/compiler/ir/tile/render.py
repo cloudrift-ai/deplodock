@@ -15,9 +15,10 @@ until then, both copies live in parallel — kept in sync by hand.
 Loop IR's ``Load`` / ``Assign`` / ``Select`` / ``Write`` / ``Accum`` are
 rendered directly: ``Load`` becomes ``float <name> = <buf>[<flat>];``,
 ``Assign``'s op-name is translated to a C expression via
-``_op_to_expr``, ``Accum`` inside a ``Reduce`` becomes the per-iteration
-fold (the register declaration is emitted by ``_render_reduce`` from the
-distinct accumulator names found in the body).
+``_op_to_expr``, ``Accum`` inside a reduce ``Loop`` (a Loop whose body
+contains any ``Accum``) becomes the per-iteration fold; the register
+declaration is emitted by ``_render_loop`` from the distinct accumulator
+names found in the body.
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ from deplodock.compiler.ir.tile.ir import (
     Coop,
     Enclosure,
     Expr,
-    Reduce,
     SmemBuf,
     Stmt,
     Sync,
@@ -236,12 +236,7 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
         return _render_cond(stmt, ctx)
 
     if isinstance(stmt, Loop):
-        # Free iteration — Loop IR's Loop, used directly here. A future
-        # Enclosure will replace this for axes bound to thread/block coords.
-        return _render_for(stmt.axis.name, 0, int(stmt.axis.extent), step=None, body=stmt.body, ctx=ctx)
-
-    if isinstance(stmt, Reduce):
-        return _render_reduce(stmt, ctx)
+        return _render_loop(stmt, ctx)
 
     if isinstance(stmt, Tile):
         return _render_for(stmt.axis.name, 0, int(stmt.axis.extent), step=stmt.bk, body=stmt.body, ctx=ctx)
@@ -292,33 +287,25 @@ def _render_cond(stmt: Cond, ctx: _Ctx) -> list[str]:
     return out
 
 
-def _render_reduce(stmt: Reduce, ctx: _Ctx) -> list[str]:
-    """Declare each accumulator (one per distinct ``Accum.name`` in the body)
-    before the for-loop, then emit the body as the loop interior. The body
-    contains plain ``Accum`` stmts whose render emits the per-iteration fold.
+def _render_loop(stmt: Loop, ctx: _Ctx) -> list[str]:
+    """Render a ``Loop``. If its immediate body contains any ``Accum``, treat
+    it as a reduce-Loop: declare each distinct accumulator (initialized to
+    the op's identity) before the for-loop, then emit the body as the loop
+    interior. A free Loop (no Accum in immediate body) renders as a plain
+    for-loop.
     """
     pad = _pad(ctx.indent)
     out: list[str] = []
     seen: set[str] = set()
-    for s in _walk(stmt.body):
+    for s in stmt.body:
         if isinstance(s, Accum) and s.name not in seen:
             seen.add(s.name)
             identity = s.op.identity
             if identity is None:
                 raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
             out.append(f"{pad}float {s.name} = {float(identity):.1f}f;")
-    extent = stmt.extent if stmt.extent is not None else int(stmt.axis.extent)
-    out.extend(_render_for(stmt.axis.name, 0, extent, step=None, body=stmt.body, ctx=ctx))
+    out.extend(_render_for(stmt.axis.name, 0, int(stmt.axis.extent), step=None, body=stmt.body, ctx=ctx))
     return out
-
-
-def _walk(stmts: tuple[Stmt, ...]):
-    """Pre-order walk over a Tile-IR body for accumulator collection."""
-    for s in stmts:
-        yield s
-        sub = getattr(s, "body", None)
-        if isinstance(sub, tuple):
-            yield from _walk(sub)
 
 
 def _render_for(var: str, start, end, step, body: tuple, ctx: _Ctx) -> list[str]:
@@ -381,12 +368,15 @@ def _render_index(buf: str, indices: tuple, ctx: _Ctx) -> str:
     shape = ctx.shapes.get(buf)
     if shape is None or len(shape) != len(indices):
         return " + ".join(_render_expr(i, ctx) for i in indices)
-    flat = _render_expr(indices[0], ctx, _PRECEDENCE["*"])
-    for i in range(1, len(indices)):
-        next_idx = _render_expr(indices[i], ctx, _PRECEDENCE["+"] + 1)
-        outer_dim = int(shape[i])
-        flat = f"{flat} * {outer_dim} + {next_idx}"
-    return flat
+    # Row-major strides: stride[d] = prod(shape[d+1:]).
+    parts: list[str] = []
+    for d, idx in enumerate(indices):
+        stride = 1
+        for k in range(d + 1, len(shape)):
+            stride *= int(shape[k])
+        idx_str = _render_expr(idx, ctx, _PRECEDENCE["*"])
+        parts.append(idx_str if stride == 1 else f"{idx_str} * {stride}")
+    return " + ".join(parts)
 
 
 # ---------------------------------------------------------------------------

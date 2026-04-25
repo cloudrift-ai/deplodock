@@ -14,9 +14,9 @@ One subpackage per IR level:
 - ``loop``     — Loop IR (``LoopOp`` + ``Axis`` + body-form ``Load`` +
                  SSA ``Assign`` / ``Accum`` / ``Write`` / ``Select``
                  statements). One ``LoopOp`` per GPU kernel.
-- ``kernel``   — Kernel IR: C-like AST (``GpuKernel``, ``Stmt`` variants,
-                 ``ArrayAccess``, ``CastExpr``, ``VectorLoad``, ...) wrapped in
-                 a ``KernelOp`` graph-op.
+- ``tile``     — Tile IR (``TileOp`` + ``Enclosure`` / ``Tile`` / ``Coop`` /
+                 ``Sync`` schedule wrappers, reusing Loop IR leaves).
+                 Lowers directly to CUDA source.
 - ``cuda``     — Device IR (``CudaOp`` carrying rendered ``__global__``
                  source + launch geometry).
 

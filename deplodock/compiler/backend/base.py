@@ -11,7 +11,7 @@ interface; all backends share the same call surface:
 
 Individual backends may do different internal lowerings: the CUDA backend
 calls ``run_pipeline`` through the full chain (decomposition →
-optimization → fusion → lowering/kernel → lowering/cuda), the Loop
+optimization → fusion → lowering/tile → lowering/cuda), the Loop
 backend stops after fusion, and the numpy backend walks the graph
 directly. From the caller's perspective the interface is identical.
 """

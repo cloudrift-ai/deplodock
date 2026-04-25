@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.pipeline import CUDA_PASSES, KERNEL_PASSES, LOOP_PASSES, TENSOR_PASSES
+from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, TENSOR_PASSES, TILE_PASSES
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
@@ -17,14 +17,14 @@ logger = logging.getLogger(__name__)
 
 # Each --ir stage maps to (passes to run, formatter). "graph" pretty-prints
 # the whole Graph (inputs/constants/nodes/outputs). "kernels" renders just
-# the post-lowering per-kernel bodies — dispatching on LoopOp / KernelOp /
-# CudaOp by type; the syntax itself (``for`` loops vs C-like AST vs CUDA
-# source) disambiguates the IR level.
+# the post-lowering per-kernel bodies — dispatching on LoopOp / TileOp /
+# CudaOp by type; the syntax itself (``for`` loops vs CUDA source)
+# disambiguates the IR level.
 _IR_STAGES = {
     "torch": ([], "graph"),
     "tensor": (TENSOR_PASSES, "graph"),
     "loop": (LOOP_PASSES, "kernels"),
-    "kernel": (KERNEL_PASSES, "kernels"),
+    "tile": (TILE_PASSES, "kernels"),
     "cuda": (CUDA_PASSES, "kernels"),
 }
 
@@ -32,13 +32,13 @@ _DEFAULT_PASSES = LOOP_PASSES
 
 # Single-letter shortcuts for each pass. Passing a contiguous string of
 # these letters to --passes is equivalent to the expanded comma list
-# (e.g. 'dolfk' expands to the full front-to-kernel pipeline).
+# (e.g. 'dolft' expands to the full front-to-tile pipeline).
 _PASS_SHORTCUTS = {
     "d": "frontend/decomposition",
     "o": "frontend/optimization",
     "l": "loop/lifting",
     "f": "loop/fusion",
-    "k": "lowering/kernel",
+    "t": "lowering/tile",
     "c": "lowering/cuda",
 }
 
@@ -83,7 +83,7 @@ def register_compile_command(subparsers):
             "Pass list to override the default. Accepts either a comma-separated list "
             "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
             "single-letter shortcuts: d=decomposition, o=optimization, l=lifting, "
-            "f=fusion, k=lowering/kernel, c=lowering/cuda (so 'dolfk' == the first five)."
+            "f=fusion, t=lowering/tile, c=lowering/cuda (so 'dolft' == the first five)."
         ),
     )
     parser.set_defaults(func=handle_compile)

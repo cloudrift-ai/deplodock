@@ -17,11 +17,13 @@ Pipeline shape:
 strings (``Load.input``, ``Write.output``) so they're directly renderable.
 ``ElementwiseImpl`` carries op identity / commutativity / numpy callable.
 
-**Schedule structure is Tile-IR-specific.** ``Reduce`` / ``Tile`` /
-``Coop`` / ``Sync`` plus the ``Kernel`` wrapper are new node types whose
-body is a broader union (``Stmt``) that admits both Loop-IR leaves and
-Tile-IR additions. Loop IR's ``Loop`` is reused directly for free
-iteration; ``Cond`` for if/else. Strategies match on the schedule nodes;
+**Schedule structure is Tile-IR-specific.** ``Tile`` / ``Coop`` / ``Sync``
+plus the ``TileOp`` wrapper are new node types whose body is a broader
+union (``Stmt``) that admits both Loop-IR leaves and Tile-IR additions.
+Loop IR's ``Loop`` is reused directly for both free iteration and
+reductions — a Loop is a reduce-Loop iff its body contains an ``Accum``
+(detected structurally by the renderer / passes, never stored).
+``Cond`` is reused for if/else. Strategies match on the schedule nodes;
 the leaves they wrap pass through unchanged.
 
 Expression types come from ``ir.expr`` directly (``Var``, ``Literal``,
@@ -33,8 +35,8 @@ row-major using the buffer's declared shape.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator
 
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -77,34 +79,15 @@ class Sync(Stmt):
 
 
 @dataclass
-class Reduce(Stmt):
-    """Register-accumulated walk over ``axis``.
-
-    The body contains zero or more ``Accum`` stmts (Loop IR's reduce
-    primitive) that fold into named accumulators. The renderer scans the
-    body for distinct ``Accum.name`` values, emits a ``float <name> =
-    <op.identity>;`` declaration *before* the for-loop, then emits the body
-    inside the for-loop. After the loop the accumulator names are visible
-    to subsequent stmts in the enclosing scope.
-
-    ``extent`` is ``axis.extent`` for an unmodified Reduce; tiling shrinks
-    it to BK while keeping the axis identity intact (the body still uses
-    ``Var(axis.name)`` for the global coord).
-    """
-
-    axis: Axis
-    body: tuple[Stmt, ...]
-    extent: int | None = None
-
-
-@dataclass
 class Tile(Stmt):
     """Outer slab walk: ``for k_outer = 0; k_outer < axis.extent; k_outer += bk``.
 
     Body sees ``Var(axis.name)`` bound to the slab origin (the outer-loop
     var). Inner stmts that need a per-element global coord typically wrap
-    an inner ``Reduce(axis, extent=bk)`` whose body adds the inner var:
-    ``Load("x", input="A", index=(m, axis + k_inner))``.
+    an inner ``Loop(axis_inner, body)`` whose body Accumulates and adds the
+    inner var: ``Load("x", input="A", index=(m, axis + k_inner))``. A Loop
+    is treated as a reduction structurally — by the presence of an ``Accum``
+    in its body — so no separate ``Reduce`` node is needed.
     """
 
     axis: Axis
@@ -145,6 +128,7 @@ class Enclosure(Stmt):
     thread_axes: tuple[Axis, ...]
     block_axes: tuple[Axis, ...]
     body: tuple[Stmt, ...]
+
 
 # ---------------------------------------------------------------------------
 # Top-level: SmemBuf / TileOp
@@ -214,6 +198,7 @@ class TileOp(Op):
         the kernel's writeable output parameters."""
         return tuple(dict.fromkeys(s.output for s in self.writes))
 
+
 # ---------------------------------------------------------------------------
 # Tree walk helpers
 # ---------------------------------------------------------------------------
@@ -222,7 +207,7 @@ class TileOp(Op):
 def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
     for s in body:
         yield s
-        if isinstance(s, (Loop, Enclosure, Reduce, Tile, Coop)):
+        if isinstance(s, (Loop, Enclosure, Tile, Coop)):
             yield from iter_body(s.body)
         elif isinstance(s, Cond):
             yield from iter_body(s.body)
@@ -250,7 +235,6 @@ __all__ = [
     "Loop",
     # Tile-IR statements
     "Sync",
-    "Reduce",
     "Tile",
     "Coop",
     "Enclosure",

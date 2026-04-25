@@ -2,12 +2,9 @@
 
 Mechanical translation. Loop IR's leaves (``Load`` / ``Assign`` /
 ``Select`` / ``Write`` / ``Accum`` / ``Cond``) pass through unchanged —
-Tile IR re-uses them directly. Loop IR's ``Loop`` becomes:
-
-- ``Reduce(axis, body)`` when the body has any ``Accum`` (carries the
-  per-tile ``extent`` slot for later tiling strategies).
-- ``Loop(axis, body)`` (Loop IR's own ``Loop``, re-used here) for free
-  iteration that survives inside an ``Enclosure`` body.
+Tile IR re-uses them directly. Loop IR's ``Loop`` is reused as-is in
+Tile IR; reductions are detected structurally (a Loop is a reduce-Loop
+iff its body contains an ``Accum``) by downstream passes / the renderer.
 
 **Outer free-Loop chain → ``Enclosure(thread_axes=...)``**. After
 stripping leading non-Loop stmts (scalar Loads) into the TileOp body
@@ -34,7 +31,6 @@ from deplodock.compiler.ir.loop import (
 from deplodock.compiler.ir.tile.ir import (
     Axis,
     Enclosure,
-    Reduce,
     Stmt,
     TileOp,
 )
@@ -96,20 +92,11 @@ def _lower_body(stmts: tuple[LoopStmt, ...]) -> list[Stmt]:
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Loop):
-            out.append(_lower_loop(s))
+            out.append(Loop(axis=s.axis, body=tuple(_lower_body(s.body))))
         else:
             # Loop IR leaves pass through — Tile IR's Stmt union admits them.
             out.append(s)
     return out
-
-
-def _lower_loop(loop: Loop) -> Stmt:
-    """Loop with Accum in body → ``Reduce``; otherwise pass through as Loop
-    (free iteration). The body recurses so nested Loops also translate."""
-    body = tuple(_lower_body(loop.body))
-    if any(isinstance(s, Accum) for s in loop.body):
-        return Reduce(axis=loop.axis, body=body)
-    return Loop(axis=loop.axis, body=body)
 
 
 __all__ = ["lower_naive"]
