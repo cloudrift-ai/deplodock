@@ -45,12 +45,14 @@ from deplodock.compiler.ir.stmt import (
     Cond,
     Load,
     Loop,
+    RenderCtx,
     Select,
     SelectBranch,
     Stmt,
     StridedLoop,
     Tile,
     Write,
+    _pad,
     pretty_body,
 )
 
@@ -78,6 +80,15 @@ class Smem(Stmt):
         ext = ", ".join(str(e) for e in self.extents) or "-"
         return [f"{indent}Smem {self.name}[{ext}] ({self.dtype})"]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """``__shared__ <dtype> <name>[<prod(extents)>];`` and register the
+        buffer's shape so subsequent ``Load``/``Write`` flatten correctly."""
+        total = 1
+        for e in self.extents:
+            total *= int(e)
+        ctx.shapes[self.name] = tuple(int(e) for e in self.extents)
+        return [f"{_pad(ctx.indent)}__shared__ {self.dtype} {self.name}[{total}];"]
+
 
 @dataclass
 class Sync(Stmt):
@@ -85,6 +96,9 @@ class Sync(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}Sync"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return [f"{_pad(ctx.indent)}__syncthreads();"]
 
 
 @dataclass
@@ -103,6 +117,36 @@ class TreeHalve(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}TreeHalve({self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
+        pad = _pad(ctx.indent)
+        inner_pad = _pad(ctx.indent + 1)
+        halve_pad = _pad(ctx.indent + 2)
+        op_expr = _binary_combine_expr(self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]")
+        half = int(self.length) // 2
+        return [
+            f"{pad}for (int s = {half}; s > 0; s >>= 1) {{",
+            f"{inner_pad}if ({self.tid_var} < s) {{",
+            f"{halve_pad}{self.buf}[{self.tid_var}] = {op_expr};",
+            f"{inner_pad}}}",
+            f"{inner_pad}__syncthreads();",
+            f"{pad}}}",
+        ]
+
+
+def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str) -> str:
+    """Render a 2-arg combine for ``ElementwiseImpl`` reduce ops."""
+    name = op.name
+    if name in ("add", "sum"):
+        return f"{a} + {b}"
+    if name in ("multiply", "prod"):
+        return f"{a} * {b}"
+    if name in ("maximum", "amax"):
+        return f"fmaxf({a}, {b})"
+    if name == "minimum":
+        return f"fminf({a}, {b})"
+    raise ValueError(f"TreeHalve: unsupported op {name!r}")
 
 
 # ``StridedLoop`` is shared infrastructure — defined in ``ir/stmt.py``
