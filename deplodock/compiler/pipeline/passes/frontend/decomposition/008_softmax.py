@@ -12,6 +12,6 @@ def rewrite(graph: Graph, root: Node, inp_x: Node | None, out: Tensor) -> Graph 
     if inp_x is None:
         return None
     frag = open_fragment(graph, [inp_x])
-    out_id = softmax_decompose(frag, inp_x.id, root.op.axis, name=out.name, dtype=out.dtype)
-    frag.outputs = [out_id]
+    out_node = softmax_decompose(frag, inp_x, root.op.axis, name=out.name)
+    frag.outputs = [out_node.id]
     return frag

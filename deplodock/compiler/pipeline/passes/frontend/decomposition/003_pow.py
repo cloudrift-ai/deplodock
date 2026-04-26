@@ -17,7 +17,7 @@ def rewrite(graph: Graph, inp_x: Node, inp_exp: Node, out: Tensor) -> Graph | No
     frag = open_fragment(graph, [inp_x])
     mul_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
-        inputs=[inp_x.id, inp_x.id],
+        inputs=[inp_x, inp_x],
         output=Tensor(name=out.name, shape=out.shape, dtype=out.dtype),
     )
     frag.outputs = [mul_id]

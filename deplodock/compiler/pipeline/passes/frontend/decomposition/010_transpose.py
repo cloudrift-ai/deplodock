@@ -39,6 +39,6 @@ def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
     coord_map = tuple(placeholder(inv[j]) for j in range(ndim))
 
     frag = open_fragment(graph, [inp_x])
-    new_id = single_indexmap(frag, inp_x.id, out_shape=out_shape, coord_map=coord_map, name=out.name, dtype=out.dtype)
-    frag.outputs = [new_id]
+    new_node = single_indexmap(frag, inp_x, out_shape=out_shape, coord_map=coord_map, name=out.name)
+    frag.outputs = [new_node.id]
     return frag

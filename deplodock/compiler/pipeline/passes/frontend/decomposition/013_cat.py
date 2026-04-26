@@ -53,7 +53,7 @@ def rewrite(graph: Graph, inp_a: Node, inp_b: Node, inp_dim: Node, out: Tensor) 
 
     new_id = frag.add_node(
         op=IndexMapOp(out_shape=out_shape, sources=(src_a, src_b)),
-        inputs=[inp_a.id, inp_b.id],
+        inputs=[inp_a, inp_b],
         output=Tensor(out.name, out_shape, out.dtype),
     )
 

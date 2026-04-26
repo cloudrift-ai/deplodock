@@ -196,12 +196,16 @@ class Graph:
     def add_node(
         self,
         op: Op,
-        inputs: list[str],
+        inputs: list[Node | str],
         output: Tensor,
         *,
         node_id: str | None = None,
     ) -> str:
         """Add a node to the graph. Returns the node id.
+
+        ``inputs`` accepts a mix of ids and ``Node`` objects (Nodes get
+        their ``id`` extracted) — convenient for decomposition rules that
+        thread ``Node`` values through pipelines of helpers.
 
         When ``node_id`` is omitted, defaults to ``output.name`` if that
         name is non-empty and not already taken; otherwise falls back to
@@ -218,12 +222,13 @@ class Graph:
             nid = node_id
         if nid in self.nodes:
             raise ValueError(f"Node id {nid!r} already exists")
-        for inp in inputs:
+        input_ids = [inp.id if isinstance(inp, Node) else inp for inp in inputs]
+        for inp in input_ids:
             if inp not in self.nodes:
                 raise ValueError(f"Input node {inp!r} does not exist")
-        self.nodes[nid] = Node(id=nid, op=op, inputs=inputs, output=output)
+        self.nodes[nid] = Node(id=nid, op=op, inputs=input_ids, output=output)
         self._users[nid] = set()
-        for inp in inputs:
+        for inp in input_ids:
             self._users[inp].add(nid)
         return nid
 

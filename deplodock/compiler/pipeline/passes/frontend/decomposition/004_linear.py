@@ -21,22 +21,22 @@ def rewrite(graph: Graph, inp_x: Node, inp_w: Node, inp_b: Node | None, out: Ten
     wt_shape = (w_shape[-1], w_shape[-2]) if len(w_shape) >= 2 else w_shape
     wt_id = frag.add_node(
         op=TransposeOp(axes=(-2, -1)),
-        inputs=[inp_w.id],
+        inputs=[inp_w],
         output=Tensor(f"{out.name}_wt", wt_shape, out.dtype),
     )
 
     matmul_name = f"{out.name}_mm" if inp_b else out.name
-    mm_id = matmul_decompose(frag, inp_x.id, wt_id, name=matmul_name, dtype=out.dtype)
+    mm = matmul_decompose(frag, inp_x, wt_id, name=matmul_name)
 
     if inp_b:
-        bias_bc = broadcast_to(frag, inp_b.id, out.shape)
+        bias_bc = broadcast_to(frag, inp_b, out.shape)
         add_id = frag.add_node(
             op=ElementwiseOp(op="add"),
-            inputs=[mm_id, bias_bc],
+            inputs=[mm, bias_bc],
             output=Tensor(out.name, out.shape, out.dtype),
         )
         frag.outputs = [add_id]
     else:
-        frag.outputs = [mm_id]
+        frag.outputs = [mm.id]
 
     return frag

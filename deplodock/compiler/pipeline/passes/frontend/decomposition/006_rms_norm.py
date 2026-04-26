@@ -23,7 +23,7 @@ def rewrite(graph: Graph, root: Node, inp_x: Node, inp_w: Node | None, out: Tens
 
     sq_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
-        inputs=[inp_x.id, inp_x.id],
+        inputs=[inp_x, inp_x],
         output=Tensor(f"{out.name}_sq", out.shape, out.dtype),
     )
     mean_id = frag.add_node(
@@ -45,10 +45,10 @@ def rewrite(graph: Graph, root: Node, inp_x: Node, inp_w: Node | None, out: Tens
     rsq_bc = broadcast_to(frag, rsq_id, out.shape)
     norm_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
-        inputs=[inp_x.id, rsq_bc],
+        inputs=[inp_x, rsq_bc],
         output=Tensor(f"{out.name}_norm", out.shape, out.dtype),
     )
-    w_bc = broadcast_to(frag, inp_w.id, out.shape)
+    w_bc = broadcast_to(frag, inp_w, out.shape)
     out_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
         inputs=[norm_id, w_bc],

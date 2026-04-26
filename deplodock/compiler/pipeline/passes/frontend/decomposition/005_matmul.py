@@ -18,13 +18,13 @@ def rewrite(graph: Graph, inp_a: Node, inp_b: Node, inp_bias: Node | None, out: 
     frag = open_fragment(graph, exts)
 
     matmul_name = f"{out.name}_mm" if inp_bias else out.name
-    mm_id = matmul_decompose(frag, inp_a.id, inp_b.id, name=matmul_name, dtype=out.dtype)
+    mm = matmul_decompose(frag, inp_a, inp_b, name=matmul_name)
 
     if inp_bias:
-        bias_bc = broadcast_to(frag, inp_bias.id, out.shape)
-        add_id = frag.add_node(op=ElementwiseOp(op="add"), inputs=[mm_id, bias_bc], output=Tensor(out.name, out.shape, out.dtype))
+        bias_bc = broadcast_to(frag, inp_bias, out.shape)
+        add_id = frag.add_node(op=ElementwiseOp(op="add"), inputs=[mm, bias_bc], output=Tensor(out.name, out.shape, out.dtype))
         frag.outputs = [add_id]
     else:
-        frag.outputs = [mm_id]
+        frag.outputs = [mm.id]
 
     return frag
