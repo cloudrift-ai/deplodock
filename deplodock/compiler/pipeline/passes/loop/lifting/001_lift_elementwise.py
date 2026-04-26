@@ -24,8 +24,6 @@ PATTERN = [Pattern("root", ElementwiseOp)]
 def rewrite(graph: Graph, match: Match) -> Graph | None:
     nid = match.root_node_id
     node = graph.nodes[nid]
-    if not isinstance(node.op, ElementwiseOp):
-        return None
 
     out_shape = tuple(node.output.shape)
     if out_shape and not all(isinstance(d, int) for d in out_shape):

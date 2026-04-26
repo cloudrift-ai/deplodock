@@ -25,8 +25,6 @@ PATTERN = [Pattern("root", GatherOp)]
 def rewrite(graph: Graph, match: Match) -> Graph | None:
     nid = match.root_node_id
     node = graph.nodes[nid]
-    if not isinstance(node.op, GatherOp):
-        return None
 
     data_id, idx_id = node.inputs[0], node.inputs[1]
     out_shape = tuple(node.output.shape)

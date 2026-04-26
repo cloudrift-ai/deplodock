@@ -33,8 +33,6 @@ PATTERN = [Pattern("root", LoopOp)]
 
 def rewrite(graph: Graph, match: Match) -> Graph | None:
     node = graph.nodes[match.root_node_id]
-    if not isinstance(node.op, LoopOp):
-        return None
     nid = match.root_node_id
     desired = node.output.name or nid
     if desired != nid and desired not in graph.nodes:

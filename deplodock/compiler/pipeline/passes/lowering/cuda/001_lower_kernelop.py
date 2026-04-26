@@ -27,8 +27,6 @@ _DTYPE_BYTES: dict[str, int] = {"float": 4, "double": 8, "int": 4, "half": 2}
 
 def rewrite(graph: Graph, match: Match) -> Graph | None:
     node = graph.nodes[match.root_node_id]
-    if not isinstance(node.op, KernelOp):
-        return None
     kernel_op: KernelOp = node.op
 
     shapes: dict[str, tuple[int, ...]] = {bid: tuple(graph.nodes[bid].output.shape) for bid in kernel_op.inputs}
