@@ -29,6 +29,10 @@ class Op:
         """Compute the operation using numpy arrays. Override in subclasses."""
         raise NotImplementedError(f"{type(self).__name__}.forward not implemented")
 
+    def pretty_body(self) -> str | None:
+        """Render this op's body for kernel dumps. Default: None (skip)."""
+        return None
+
 
 @dataclass
 class InputOp(Op):

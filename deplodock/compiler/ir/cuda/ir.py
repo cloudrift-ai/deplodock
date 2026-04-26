@@ -26,3 +26,6 @@ class CudaOp(Op):
     smem_bytes: int = 0
     zero_outputs: tuple[str, ...] = ()
     comment: str = ""
+
+    def pretty_body(self) -> str:
+        return self.kernel_source
