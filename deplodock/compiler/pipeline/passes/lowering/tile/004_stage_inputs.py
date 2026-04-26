@@ -1,54 +1,39 @@
-"""Operand-staging strategy — caches input buffers read multiple times
-in a cooperative ``Tile`` body.
+"""Operand-staging strategy — caches input buffers that get fetched
+redundantly across threads / iterations of a cooperative ``Tile`` body.
 
-Trigger: scan the body (transitively) for ``Load`` stmts. Any buffer
-loaded ≥2 times is a candidate for caching. Cache axes are derived
-from the load's index — every Var whose name matches an enclosing
-``StridedLoop`` axis (the cooperative iteration axes). Stage if the
-total smem footprint fits in ``STAGE_BYTES_LIMIT``.
+Two reuse patterns trigger staging, both reducing to "this Load's
+value is fetched many times for the same address":
 
-Targets the softmax / RMSNorm / norm-style fusion shape, where one
-input row is read several times across reduction + output phases.
-Without staging, the same global memory is fetched repeatedly. With a
-``Stage`` declaration at the top of the Tile body, materialization
-loads the row once into shared memory cooperatively, then all phases
-read from smem.
+- **Spatial reuse** (matmul): a single Load whose index doesn't depend
+  on every THREAD axis from ``Tile.axes``. Threads that share the
+  missing axis fetch the same global address.
+- **Temporal reuse** (softmax / RMSNorm): the same buffer loaded by
+  multiple loops in the body, with the same address pattern modulo
+  the iterating axis.
 
-Pre-rewrite (post cooperative-reduce strategy)::
+Cache axes are derived from the Load index by intersecting its free
+vars with the available "parallel" axes (THREAD axes from ``Tile.axes``
+plus axes of any enclosing loop *below* the chosen Stage placement).
 
-    Tile(axes=(t=THREAD, a0=BLOCK)):
-      StridedLoop(a1 = t; < N; += BLOCK_SIZE):
-        Load x[a0, a1]
-        Accum
-      Combine
-      StridedLoop(a2 = t; < N; += BLOCK_SIZE):
-        Load x[a0, a2]
-        Write y[a0, a2]
+Stage placement: ``OUTERMOST`` scope (Tile body head) by default; if
+the resulting smem footprint exceeds ``STAGE_BYTES_LIMIT``, descend
+into the loop chain common to all Loads of the buffer. For matmul,
+this descends into the K_o body so smem holds one K-chunk's worth of
+tile, refilled per K_o iteration.
 
-Post-rewrite::
-
-    Tile(axes=(t=THREAD, a0=BLOCK)):
-      Stage(x[a0, a1], axes=(a1,))    # ← inserted
-      StridedLoop(a1 = t; < N; += BLOCK_SIZE):
-        Load x[a0, a1]    # ← redirected to x_stage[a1] at materialize time
-        Accum
-      Combine
-      StridedLoop(a2 = t; < N; += BLOCK_SIZE): ...
-
-Trigger conditions:
-
-- ``Tile.block_axes`` non-empty (cooperative — staging needs smem).
-- No existing ``Stage`` in the body (idempotence).
-- Some buffer is loaded ≥2 times in the body.
-- The Load's index references at least one cooperative-loop axis.
-- Cache footprint ≤ ``STAGE_BYTES_LIMIT``.
+Body Loads of the staged buffer are rewritten in place to target the
+staged name with cache-local indices.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Cond, Load, Loop, Stmt, StridedLoop, iter_body
+from deplodock.compiler.ir.axis import BIND_THREAD, Axis
+from deplodock.compiler.ir.expr import Literal, Var, free_vars
+from deplodock.compiler.ir.sigma import Sigma
+from deplodock.compiler.ir.stmt import Cond, Load, Loop, Stmt, StridedLoop
 from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
@@ -83,71 +68,184 @@ def _maybe_stage(body: tuple) -> tuple | None:
     if any(isinstance(s, Stage) for s in tile.body):
         return None  # already staged
 
-    stages = _collect_stages(tile)
-    if not stages:
+    new_tile = _stage_tile(tile)
+    if new_tile is None:
         return None
-
-    # Rewrite body Loads of staged buffers to target the staged name
-    # with cache-local indices. ``cache_positions[buf]`` lists the
-    # positions in the original load index that hold cache-axis Vars.
-    redirects = {st.buf: (st.name, _cache_positions(st)) for st in stages}
-    rewritten_body = tuple(_rewrite_loads(s, redirects) for s in tile.body)
-
-    new_tile = Tile(axes=tile.axes, body=tuple([*stages, *rewritten_body]))
     return body[:idx] + (new_tile,) + body[idx + 1 :]
 
 
-def _collect_stages(tile: Tile) -> list[Stage]:
-    """Scan the body for buffers loaded ≥2 times; return Stage Stmts to
-    insert at the top of the Tile body."""
-    # Cooperative-loop axes are the candidate cache axes — each one is
-    # iterated cooperatively across the block's threads.
-    coop_axes_by_name = {s.axis.name: s.axis for s in iter_body(tile.body) if isinstance(s, StridedLoop)}
+def _stage_tile(tile: Tile) -> Tile | None:
+    """Find each stageable buf, decide its placement + cache axes, insert
+    Stages and rewrite Loads."""
+    thread_axes_by_name = {ba.axis.name: ba.axis for ba in tile.axes if ba.bind == BIND_THREAD}
 
-    loads_per_buf: dict[str, list[Load]] = {}
-    for s in iter_body(tile.body):
+    # Per buf, gather every Load with its enclosing-loop path.
+    loads_per_buf: dict[str, list[tuple[Load, tuple]]] = {}
+    for load, path in _walk_loads(tile.body):
+        loads_per_buf.setdefault(load.input, []).append((load, path))
+
+    # Decide a Stage for each buf that has reuse.
+    plans: list[tuple[str, int, tuple, Stage]] = []
+    for buf, entries in loads_per_buf.items():
+        plan = _stage_plan(buf, entries, thread_axes_by_name)
+        if plan is not None:
+            plans.append(plan)
+
+    if not plans:
+        return None
+
+    # Apply each plan to the body. Stages are inserted at their depths
+    # (Tile head for d=0, descending into common loops for d>0). Loads
+    # of staged bufs in scope are rewritten to cache-local form.
+    new_body = tile.body
+    for buf, depth, common_loops, stage in plans:
+        new_body = _apply_plan(new_body, buf, depth, common_loops, stage)
+
+    return Tile(axes=tile.axes, body=new_body)
+
+
+def _walk_loads(stmts: tuple, path: tuple = ()) -> Iterable[tuple[Load, tuple]]:
+    """Yield ``(Load, enclosing_loop_path)`` for every Load in the body.
+    The path is a tuple of Loop / StridedLoop from outermost to immediate parent."""
+    for s in stmts:
         if isinstance(s, Load):
-            loads_per_buf.setdefault(s.input, []).append(s)
+            yield (s, path)
+        elif isinstance(s, (Loop, StridedLoop)):
+            yield from _walk_loads(s.body, path + (s,))
+        elif isinstance(s, Cond):
+            yield from _walk_loads(s.body, path)
+            yield from _walk_loads(s.else_body, path)
 
-    stages: list[Stage] = []
-    for buf, loads in loads_per_buf.items():
-        if len(loads) < 2:
+
+def _stage_plan(
+    buf: str,
+    entries: list[tuple[Load, tuple]],
+    thread_axes_by_name: dict[str, Axis],
+) -> tuple[str, int, tuple, Stage] | None:
+    """Compute a Stage plan for ``buf``. Returns ``(buf, depth,
+    common_loops, stage)`` or None if not stageable.
+
+    ``depth = 0`` → place Stage at Tile body head (most reuse, biggest
+    footprint). Increasing ``depth`` descends into the common loop
+    chain — fewer cache axes, smaller footprint, more refills."""
+    paths = [path for _, path in entries]
+    common = _common_loop_prefix(paths)
+
+    ref_load = entries[0][0]
+    thread_in_index = thread_axes_by_name.keys() & _index_free_vars(ref_load.index)
+
+    # Try placement from outermost (d=0) to deepest common (d=len(common)).
+    # Pick the first depth where smem footprint fits.
+    for d in range(len(common) + 1):
+        # Loops below the Stage = paths[i][d:] for each load.
+        below_axes_by_name: dict[str, Axis] = {}
+        for _, path in entries:
+            for loop in path[d:]:
+                below_axes_by_name[loop.axis.name] = loop.axis
+
+        cache_axes_names = (thread_axes_by_name.keys() | below_axes_by_name.keys()) & _index_free_vars(ref_load.index)
+        if not cache_axes_names:
             continue
-        ref = loads[0]
-        cache_axes = []
-        for e in ref.index:
-            if isinstance(e, Var) and e.name in coop_axes_by_name:
-                cache_axes.append(coop_axes_by_name[e.name])
+        # Reuse signal:
+        # - **Temporal**: ≥2 distinct Loads of the same buf (softmax / RMSNorm).
+        # - **Spatial**: a Load with all enclosing-loop axes serial AND a
+        #   THREAD axis absent from the index. Threads with distinct values
+        #   of the missing THREAD axis access the same global address.
+        #   A StridedLoop in the path means iteration is already
+        #   thread-driven; a Load inside one doesn't statically share
+        #   across threads (each thread visits distinct values of the
+        #   strided axis), so we don't claim spatial reuse there.
+        if len(entries) < 2:
+            has_strided = any(isinstance(loop, StridedLoop) for path in paths for loop in path)
+            thread_missing = thread_axes_by_name.keys() - thread_in_index
+            if has_strided or not thread_missing:
+                continue
+
+        # Build cache_axes — every matching axis at every index position
+        # must be cached. Otherwise a below-stage Var leaks into the
+        # source index (decode_sigma misses it → undefined at the
+        # cooperative-load scope). Order by appearance in the index.
+        cache_axes: list[Axis] = []
+        seen: set[str] = set()
+        for e in ref_load.index:
+            for ax_name in free_vars(e):
+                if ax_name in cache_axes_names and ax_name not in seen:
+                    seen.add(ax_name)
+                    ax = thread_axes_by_name.get(ax_name) or below_axes_by_name[ax_name]
+                    cache_axes.append(ax)
         if not cache_axes:
-            continue  # Load doesn't access cooperative axes — staging won't help
-
-        cache_elems = 1
-        for ax in cache_axes:
-            cache_elems *= int(ax.extent)
-        if cache_elems * DTYPE_BYTES > STAGE_BYTES_LIMIT:
             continue
 
-        stages.append(Stage(name=f"{buf}_stage", buf=buf, index=ref.index, axes=tuple(cache_axes)))
+        footprint = 1
+        for ax in cache_axes:
+            footprint *= int(ax.extent)
+        if footprint * DTYPE_BYTES > STAGE_BYTES_LIMIT:
+            continue
 
-    return stages
+        stage = Stage(name=f"{buf}_stage", buf=buf, index=ref_load.index, axes=tuple(cache_axes))
+        return (buf, d, common[:d], stage)
+
+    return None
 
 
-def _cache_positions(stage: Stage) -> tuple[int, ...]:
-    """Positions in ``stage.index`` whose Var name is a cache axis."""
-    cache_names = {ax.name for ax in stage.axes}
-    return tuple(i for i, e in enumerate(stage.index) if isinstance(e, Var) and e.name in cache_names)
+def _common_loop_prefix(paths: list[tuple]) -> tuple:
+    """Longest common prefix of loop-paths (compared by axis identity)."""
+    if not paths:
+        return ()
+    common: list = []
+    for level in zip(*paths, strict=False):
+        first = level[0]
+        if all(loop is first for loop in level):
+            common.append(first)
+        else:
+            break
+    return tuple(common)
 
 
-def _rewrite_loads(stmt: Stmt, redirects: dict) -> Stmt:
-    """Recursively rewrite ``Load(buf, ...)`` to ``Load(stage_name,
-    cache-local index)`` for every staged buf. The cache-local index is
-    the load's index restricted to the cache positions — at each Load
-    site this picks up the loop's own iteration Var (which may be
-    named differently than the Stage's reference Var, e.g. softmax has
-    ``a1`` in the reduce loop and ``a2`` in the output loop)."""
+def _index_free_vars(index: tuple) -> set[str]:
+    out: set[str] = set()
+    for e in index:
+        out |= free_vars(e)
+    return out
+
+
+def _apply_plan(body: tuple, buf: str, depth: int, common_loops: tuple, stage: Stage) -> tuple:
+    """Insert ``stage`` at ``depth`` (descending through ``common_loops``)
+    and rewrite Loads of ``buf`` in scope to target ``stage.name``.
+
+    Loops are matched by axis name (not identity) so multiple plans
+    applied in sequence can each find the right loop even after the
+    body has been mutated by an earlier plan."""
+    if depth == 0:
+        rewritten = tuple(_rewrite_loads(s, {buf: stage}) for s in body)
+        return (stage,) + rewritten
+    target_name = common_loops[0].axis.name
+    new_body = []
+    for s in body:
+        if isinstance(s, (Loop, StridedLoop)) and s.axis.name == target_name:
+            new_inner = _apply_plan(s.body, buf, depth - 1, common_loops[1:], stage)
+            new_body.append(_clone_loop(s, new_inner))
+        else:
+            new_body.append(s)
+    return tuple(new_body)
+
+
+def _clone_loop(loop, body: tuple):
+    if isinstance(loop, StridedLoop):
+        return StridedLoop(axis=loop.axis, start=loop.start, step=loop.step, body=body)
+    return Loop(axis=loop.axis, body=body)
+
+
+def _rewrite_loads(stmt: Stmt, redirects: dict[str, Stage]) -> Stmt:
+    """Recursively rewrite ``Load(buf, ...)`` to ``Load(stage.name,
+    smem_index)`` for every staged buf. ``smem_index`` has one entry per
+    cache axis (in stage.axes order); each entry is the smem coord
+    derived from the load's index at the cache axis's position in
+    stage.index."""
     if isinstance(stmt, Load) and stmt.input in redirects:
-        stage_name, positions = redirects[stmt.input]
-        return Load(name=stmt.name, input=stage_name, index=tuple(stmt.index[i] for i in positions))
+        stage = redirects[stmt.input]
+        smem_index = tuple(_smem_coord_for_axis(ax, stage.index, stmt.index) for ax in stage.axes)
+        return Load(name=stmt.name, input=stage.name, index=smem_index)
     if isinstance(stmt, Loop):
         return Loop(axis=stmt.axis, body=tuple(_rewrite_loads(c, redirects) for c in stmt.body))
     if isinstance(stmt, StridedLoop):
@@ -164,3 +262,27 @@ def _rewrite_loads(stmt: Stmt, redirects: dict) -> Stmt:
             else_body=tuple(_rewrite_loads(c, redirects) for c in stmt.else_body),
         )
     return stmt
+
+
+def _smem_coord_for_axis(stage_axis: Axis, stage_index: tuple, load_index: tuple):
+    """Smem coord per cache axis. Find the cache axis in stage_index;
+    extract the corresponding coord from load_index at the same position.
+
+    - **Same naming** (matmul: load uses the same axis Vars as stage):
+      use ``Var(cache_axis.name)``.
+    - **Aliasing** (softmax: load uses a different Var name for the same
+      role, e.g. ``a2`` instead of ``a1``): use the load's Var.
+    - **Affine with multiple cache vars** (matmul d=0 case): substitute
+      every non-cache Var with 0, leaving the cache axis's contribution."""
+    for p, e in enumerate(stage_index):
+        if stage_axis.name in free_vars(e):
+            load_e = load_index[p]
+            free = free_vars(load_e)
+            if stage_axis.name in free:
+                return Var(stage_axis.name)
+            if isinstance(load_e, Var):
+                return load_e
+            non_cache = free - {stage_axis.name}
+            sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
+            return sigma.apply(load_e)
+    raise ValueError(f"cache axis {stage_axis.name!r} not found in stage.index")

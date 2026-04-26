@@ -60,10 +60,10 @@ from deplodock.compiler.ir.axis import (
     BoundAxis,
     split_axis,
 )
-from deplodock.compiler.ir.expr import Literal, Var, free_vars
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Stmt, Write
-from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import Tile, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -135,41 +135,19 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
         }
     )
 
-    new_load_a_global = load_a.rewrite(_id, sigma)
-    new_load_b_global = load_b.rewrite(_id, sigma)
-
-    # Stage each operand per K_o iteration. Cache axes are derived from
-    # the load index: each position contributes the inner-split axis whose
-    # original-axis Var appears in that position. ``load_a`` / ``load_b``
-    # ordering isn't pinned to "A vs B" of the matmul (fusion may swap),
-    # so we read each load's own free vars instead of hardcoding axes.
-    inner_split = {m_i.name: m_i, n_i.name: n_i, k_i.name: k_i}
-    a_axes = _cache_axes_for(new_load_a_global, inner_split)
-    b_axes = _cache_axes_for(new_load_b_global, inner_split)
-    a_stage_name = f"{load_a.input}_stage"
-    b_stage_name = f"{load_b.input}_stage"
-    stage_a = Stage(name=a_stage_name, buf=load_a.input, index=new_load_a_global.index, axes=a_axes)
-    stage_b = Stage(name=b_stage_name, buf=load_b.input, index=new_load_b_global.index, axes=b_axes)
-
-    # Inner Loads target the staged buffers with cache-local indices —
-    # just the cache-axis Vars in stage.axes order.
-    local_load_a = Load(name=load_a.name, input=a_stage_name, index=tuple(Var(ax.name) for ax in a_axes))
-    local_load_b = Load(name=load_b.name, input=b_stage_name, index=tuple(Var(ax.name) for ax in b_axes))
-    inner_compute: tuple[Stmt, ...] = (local_load_a, local_load_b, mul, accum)
+    new_load_a = load_a.rewrite(_id, sigma)
+    new_load_b = load_b.rewrite(_id, sigma)
+    inner_compute: tuple[Stmt, ...] = (new_load_a, new_load_b, mul, accum)
 
     # m_i / n_i are bound directly as Enclosure THREAD axes (their
     # extents·product equals BLOCK_SIZE — one output per thread). No
     # wrapping loops over them in the body — the thread decode at
     # render time provides Var(m_i) / Var(n_i) for the inner compute.
+    # Operand staging is left to ``004_stage_inputs`` — the K_o > K_i
+    # nesting plus the THREAD axes (a0_i, a1_i) in scope give the
+    # staging rule everything it needs to spot the reuse.
     new_body: tuple[Stmt, ...] = (
-        Loop(
-            axis=k_o,
-            body=(
-                stage_a,
-                stage_b,
-                Loop(axis=k_i, body=inner_compute),
-            ),
-        ),
+        Loop(axis=k_o, body=(Loop(axis=k_i, body=inner_compute),)),
         write.rewrite(_id, sigma),
     )
 
@@ -224,23 +202,6 @@ def _extract_inner(reduce_loop: Loop) -> tuple[Accum, Load, Load, Assign] | None
 
 def _is_reduce(loop: Loop) -> bool:
     return any(isinstance(s, Accum) for s in loop.body)
-
-
-def _cache_axes_for(new_load: Load, inner_split: dict) -> tuple:
-    """For each position in ``new_load.index``, find which inner-split
-    axis Var appears in that position. Positions with no cache-axis Var
-    (e.g. ``Literal(0)`` from collapsed batch dims) are skipped — they
-    contribute no smem dim. Returned axes are in source-buffer dim order."""
-    axes = []
-    inner_names = set(inner_split.keys())
-    for e in new_load.index:
-        match = inner_names & free_vars(e)
-        if not match:
-            continue  # constant position (e.g. batch=0 from a collapsed leading dim)
-        if len(match) > 1:
-            raise ValueError(f"Load index position {e!r} has cache-axis matches {match}; expected at most one")
-        axes.append(inner_split[next(iter(match))])
-    return tuple(axes)
 
 
 def _id(name: str) -> str:
