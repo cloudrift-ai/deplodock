@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var, free_vars
+from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop.ir import (
     Accum,
     Assign,
@@ -313,7 +313,7 @@ def hoist_loop_invariants(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         deps: set[str] = set()
         axes: set[str] = set()
         for e in index:
-            for v in free_vars(e):
+            for v in e.free_vars():
                 (deps if v in ssa_names else axes).add(v)
         return deps, axes
 
@@ -332,7 +332,7 @@ def hoist_loop_invariants(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         if isinstance(s, Select):
             result = set()
             for b in s.branches:
-                result |= free_vars(b.select)
+                result |= b.select.free_vars()
                 result |= axes_of.get(b.value, frozenset())
             return frozenset(result)
         return frozenset()

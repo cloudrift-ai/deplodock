@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Expr, substitute
+from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Expr
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
@@ -125,4 +125,4 @@ def _compose_coord_map(producer_coord_map: tuple, consumer_coord_map: tuple) -> 
     ``producer_coord_map[i]{out_coord_j → consumer_coord_map[j]}``.
     """
     substitution: dict[str, Expr] = {f"{PLACEHOLDER_PREFIX}{j}": consumer_coord_map[j] for j in range(len(consumer_coord_map))}
-    return tuple(substitute(e, substitution) for e in producer_coord_map)
+    return tuple(e.substitute(substitution) for e in producer_coord_map)

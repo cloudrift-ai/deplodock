@@ -11,8 +11,10 @@ built as arithmetic (``Var("i") * 4 + Var("j")``) and comparisons
 (``Var("i").lt(Var("n"))``). Each concrete node implements ``eval(env)`` for
 evaluation against a name → value environment (scalars or ndarrays).
 
-Coordinate helpers (``placeholder``, ``is_placeholder``, ``substitute``) are
-pure operations over the expression AST.
+Each node also implements ``substitute(mapping)`` (replace named
+``Var`` nodes with another Expr) and ``free_vars()`` (Var-name set);
+the placeholder helpers (``placeholder``, ``is_placeholder``) build
+on the same AST.
 """
 
 from __future__ import annotations
@@ -70,10 +72,24 @@ class _ExprOps:
         """Format this Expr as a compact, human-readable string.
 
         Default raises so any Expr subclass that forgot to override is
-        surfaced loudly. Concrete subclasses override; ``render(expr)``
-        is a free-function alias that delegates here.
+        surfaced loudly. Concrete subclasses override.
         """
         raise NotImplementedError(f"{type(self).__name__}.pretty not implemented")
+
+    def substitute(self, mapping: dict[str, Expr]) -> Expr:
+        """Replace ``Var(name)`` subterms with ``mapping[name]``.
+
+        Walks the expression tree non-destructively. Used at lowering
+        time (placeholder coords → kernel output coords) and at
+        composition time (outer IndexMap placeholders → inner
+        coord_map). Vars not present in ``mapping`` are left unchanged.
+        Default raises; concrete subclasses override.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.substitute not implemented")
+
+    def free_vars(self) -> frozenset[str]:
+        """Return the set of ``Var.name`` strings appearing anywhere in this Expr."""
+        raise NotImplementedError(f"{type(self).__name__}.free_vars not implemented")
 
 
 def _coerce(v: Expr | int | float) -> Expr:
@@ -102,6 +118,12 @@ class Var(_ExprOps):
     def pretty(self) -> str:
         return self.name
 
+    def substitute(self, mapping: dict[str, Expr]) -> Expr:
+        return mapping.get(self.name, self)
+
+    def free_vars(self) -> frozenset[str]:
+        return frozenset({self.name})
+
 
 @dataclass
 class Literal(_ExprOps):
@@ -115,6 +137,12 @@ class Literal(_ExprOps):
 
     def pretty(self) -> str:
         return str(self.value)
+
+    def substitute(self, mapping: dict[str, Expr]) -> Expr:
+        return self
+
+    def free_vars(self) -> frozenset[str]:
+        return frozenset()
 
 
 @dataclass
@@ -177,6 +205,12 @@ class BinaryExpr(_ExprOps):
     def pretty(self) -> str:
         return f"({self.left.pretty()} {self.op} {self.right.pretty()})"
 
+    def substitute(self, mapping: dict[str, Expr]) -> Expr:
+        return BinaryExpr(self.op, self.left.substitute(mapping), self.right.substitute(mapping))
+
+    def free_vars(self) -> frozenset[str]:
+        return self.left.free_vars() | self.right.free_vars()
+
 
 @dataclass
 class Builtin(_ExprOps):
@@ -193,6 +227,12 @@ class Builtin(_ExprOps):
 
     def pretty(self) -> str:
         return self.name
+
+    def substitute(self, mapping: dict[str, Expr]) -> Expr:
+        return self
+
+    def free_vars(self) -> frozenset[str]:
+        return frozenset()
 
 
 @dataclass
@@ -221,6 +261,15 @@ class FuncCallExpr(_ExprOps):
     def pretty(self) -> str:
         return f"{self.name}({', '.join(a.pretty() for a in self.args)})"
 
+    def substitute(self, mapping: dict[str, Expr]) -> Expr:
+        return FuncCallExpr(self.name, [a.substitute(mapping) for a in self.args])
+
+    def free_vars(self) -> frozenset[str]:
+        out: frozenset[str] = frozenset()
+        for a in self.args:
+            out |= a.free_vars()
+        return out
+
 
 @dataclass
 class TernaryExpr(_ExprOps):
@@ -241,6 +290,12 @@ class TernaryExpr(_ExprOps):
     def pretty(self) -> str:
         return f"({self.cond.pretty()} ? {self.if_true.pretty()} : {self.if_false.pretty()})"
 
+    def substitute(self, mapping: dict[str, Expr]) -> Expr:
+        return TernaryExpr(self.cond.substitute(mapping), self.if_true.substitute(mapping), self.if_false.substitute(mapping))
+
+    def free_vars(self) -> frozenset[str]:
+        return self.cond.free_vars() | self.if_true.free_vars() | self.if_false.free_vars()
+
 
 @dataclass
 class CastExpr(_ExprOps):
@@ -257,6 +312,12 @@ class CastExpr(_ExprOps):
 
     def pretty(self) -> str:
         return f"({self.dtype}){self.expr.pretty()}"
+
+    def substitute(self, mapping: dict[str, Expr]) -> Expr:
+        return CastExpr(self.dtype, self.expr.substitute(mapping))
+
+    def free_vars(self) -> frozenset[str]:
+        return self.expr.free_vars()
 
 
 Expr = Var | Literal | BinaryExpr | Builtin | FuncCallExpr | TernaryExpr | CastExpr
@@ -292,61 +353,6 @@ def is_placeholder(expr: object, d: int | None = None) -> bool:
     if d is None:
         return True
     return expr.name == f"{PLACEHOLDER_PREFIX}{d}"
-
-
-def substitute(expr: Expr, mapping: dict[str, Expr]) -> Expr:
-    """Replace ``Var(name)`` nodes in ``expr`` with ``mapping[name]``.
-
-    Walks the expression tree non-destructively. Used at:
-    - **Lowering time**: substitute placeholder coords with the kernel's
-      actual output-coord expressions.
-    - **Composition time**: substitute outer IndexMap's placeholders with
-      the inner IndexMap's coord_map entries.
-
-    Variables not present in ``mapping`` are left unchanged.
-    """
-    if isinstance(expr, Var):
-        return mapping.get(expr.name, expr)
-    if isinstance(expr, (Literal, Builtin)):
-        return expr
-    if isinstance(expr, BinaryExpr):
-        return BinaryExpr(expr.op, substitute(expr.left, mapping), substitute(expr.right, mapping))
-    if isinstance(expr, TernaryExpr):
-        return TernaryExpr(
-            substitute(expr.cond, mapping),
-            substitute(expr.if_true, mapping),
-            substitute(expr.if_false, mapping),
-        )
-    if isinstance(expr, FuncCallExpr):
-        return FuncCallExpr(expr.name, [substitute(a, mapping) for a in expr.args])
-    if isinstance(expr, CastExpr):
-        return CastExpr(expr.dtype, substitute(expr.expr, mapping))
-    return expr
-
-
-def free_vars(expr: Expr) -> frozenset[str]:
-    """Return the set of ``Var.name`` strings appearing anywhere in ``expr``.
-
-    Used by analyses that need to know which axes an Expr depends on — e.g.
-    the fusion splicer's live-axis restriction, which dedups σ entries that
-    don't affect any reachable rewrite.
-    """
-    if isinstance(expr, Var):
-        return frozenset({expr.name})
-    if isinstance(expr, (Literal, Builtin)):
-        return frozenset()
-    if isinstance(expr, BinaryExpr):
-        return free_vars(expr.left) | free_vars(expr.right)
-    if isinstance(expr, TernaryExpr):
-        return free_vars(expr.cond) | free_vars(expr.if_true) | free_vars(expr.if_false)
-    if isinstance(expr, FuncCallExpr):
-        out: frozenset[str] = frozenset()
-        for a in expr.args:
-            out |= free_vars(a)
-        return out
-    if isinstance(expr, CastExpr):
-        return free_vars(expr.expr)
-    return frozenset()
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,6 @@ from deplodock.compiler.ir.expr import (
     Var,
     is_placeholder,
     placeholder,
-    substitute,
 )
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 
@@ -42,24 +41,24 @@ def test_is_placeholder_specific_axis():
 
 def test_substitute_replaces_var():
     expr = placeholder(0)
-    result = substitute(expr, {placeholder(0).name: Var("row")})
+    result = expr.substitute({placeholder(0).name: Var("row")})
     assert isinstance(result, Var) and result.name == "row"
 
 
 def test_substitute_passes_unmapped_vars():
     expr = placeholder(1)
-    result = substitute(expr, {placeholder(0).name: Var("row")})
+    result = expr.substitute({placeholder(0).name: Var("row")})
     assert isinstance(result, Var) and result.name == placeholder(1).name
 
 
 def test_substitute_leaves_literal_alone():
     expr = Literal(5, "int")
-    assert substitute(expr, {}) is expr
+    assert expr.substitute({}) is expr
 
 
 def test_substitute_rewrites_binop():
     expr = placeholder(0) + Literal(7, "int")
-    result = substitute(expr, {placeholder(0).name: Var("row")})
+    result = expr.substitute({placeholder(0).name: Var("row")})
     assert isinstance(result, BinaryExpr) and result.op == "+"
     assert isinstance(result.left, Var) and result.left.name == "row"
     assert isinstance(result.right, Literal) and result.right.value == 7
@@ -68,7 +67,7 @@ def test_substitute_rewrites_binop():
 def test_substitute_rewrites_ternary():
     cond = placeholder(0).lt(Literal(64, "int"))
     expr = TernaryExpr(cond, placeholder(0), placeholder(0) - Literal(64, "int"))
-    result = substitute(expr, {placeholder(0).name: Var("col")})
+    result = expr.substitute({placeholder(0).name: Var("col")})
     assert isinstance(result, TernaryExpr)
     assert isinstance(result.if_true, Var) and result.if_true.name == "col"
     assert isinstance(result.if_false, BinaryExpr) and result.if_false.op == "-"

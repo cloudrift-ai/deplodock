@@ -57,11 +57,10 @@ other IR files.
 
 | Symbol                                                                       | Role                                                                     |
 |------------------------------------------------------------------------------|--------------------------------------------------------------------------|
-| `Var`, `Literal`, `BinaryExpr`, `Builtin`, `FuncCallExpr`, `TernaryExpr`, `CastExpr` | Expression nodes. Each has `eval(env) → value/ndarray`.          |
-| `_ExprOps`                                                                   | Mixin: Python operator overloading for expression building.             |
+| `Var`, `Literal`, `BinaryExpr`, `Builtin`, `FuncCallExpr`, `TernaryExpr`, `CastExpr` | Expression nodes. Each has `eval(env) → value/ndarray`, `pretty()`, `substitute(mapping)`, `free_vars()`. |
+| `_ExprOps`                                                                   | Mixin: Python operator overloading for expression building; default `NotImplementedError` for `pretty`/`substitute`/`free_vars`. |
 | `Expr`                                                                       | Union type alias.                                                        |
 | `PLACEHOLDER_PREFIX`, `placeholder`, `is_placeholder`                        | Convention for output-coord placeholders in coord maps.                  |
-| `substitute`, `free_vars`                                                    | Tree rewrite (replace named `Var` nodes); free-var collection.           |
 
 ## `frontend/ir.py`
 

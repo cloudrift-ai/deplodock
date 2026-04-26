@@ -49,7 +49,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var, free_vars
+from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop.builder import LoopBuilder
 from deplodock.compiler.ir.loop.ir import (
     Accum,
@@ -399,7 +399,7 @@ def _remap_axis_name(axis: Axis, sigma: Sigma) -> str:
         return axis.name
     if isinstance(target, Var):
         return target.name
-    vars_in_target = free_vars(target)
+    vars_in_target = target.free_vars()
     if len(vars_in_target) == 1:
         return next(iter(vars_in_target))
     raise _NotSupported

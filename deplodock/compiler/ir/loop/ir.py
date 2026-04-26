@@ -39,7 +39,6 @@ from dataclasses import dataclass
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import free_vars
 from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Accum,
     Assign,
@@ -346,10 +345,10 @@ def _compute_live_axes(
         own: frozenset[str] = frozenset()
         if isinstance(stmt, Load):
             for e in stmt.index:
-                own |= free_vars(e)
+                own |= e.free_vars()
         elif isinstance(stmt, Select):
             for b in stmt.branches:
-                own |= free_vars(b.select) | live(b.value)
+                own |= b.select.free_vars() | live(b.value)
         elif isinstance(stmt, Assign):
             for a in stmt.args:
                 own |= live(a)
