@@ -263,38 +263,22 @@ def _format_inplace_application(name: str, graph: Graph, match: Match, pre_ops: 
 
 def _format_nodes(nodes: list, graph: Graph) -> str:
     """Render a list of nodes as readable text. Kernel-IR ops use their
-    dedicated body pretty-printer; everything else falls back to a
-    ``name: ClsName(args)`` one-liner."""
+    own ``pretty_body``; everything else falls back to a ``name: ClsName(args)``
+    one-liner."""
     from deplodock.compiler.graph import _fmt_op
     from deplodock.compiler.ir.base import ConstantOp, InputOp
-    from deplodock.compiler.ir.cuda import CudaOp
-    from deplodock.compiler.ir.kernel import KernelOp
-    from deplodock.compiler.ir.kernel.pretty import pretty_print as pp_kernel
-    from deplodock.compiler.ir.loop import LoopOp
-    from deplodock.compiler.ir.loop import pretty_print as pp_loop
-    from deplodock.compiler.ir.tile import TileOp
-    from deplodock.compiler.ir.tile.pretty import pretty_print as pp_tile
 
     lines: list[str] = []
     for node in nodes:
         op = node.op
         if isinstance(op, (InputOp, ConstantOp)):
             continue
-        arg_names = [graph.nodes[inp].output.name for inp in node.inputs if inp in graph.nodes]
-        header = f"{node.output.name} = {type(op).__name__}({', '.join(arg_names)})"
-        if isinstance(op, LoopOp):
-            port_buffers = arg_names + [node.output.name]
-            body = pp_loop(op, port_buffers=port_buffers)
-        elif isinstance(op, TileOp):
-            body = pp_tile(op)
-        elif isinstance(op, KernelOp):
-            body = pp_kernel(op)
-        elif isinstance(op, CudaOp):
-            body = op.kernel_source
-        else:
+        body = op.pretty_body()
+        if body is None:
             lines.append(f"{node.output.name} = {_fmt_op(node, graph)}")
             continue
-        lines.append(header)
+        arg_names = [graph.nodes[inp].output.name for inp in node.inputs if inp in graph.nodes]
+        lines.append(f"{node.output.name} = {type(op).__name__}({', '.join(arg_names)})")
         lines.extend(f"  {line}" for line in body.splitlines())
     return "\n".join(lines)
 

@@ -149,19 +149,13 @@ class CompilerDump:
 def format_kernels(graph: Graph) -> str:
     """Render post-lowering kernel bodies for each compute node in ``graph``.
 
-    Dispatches on op type: ``LoopOp`` → loop body, ``TileOp`` → CUDA source
-    (rendered on the fly), ``CudaOp`` → CUDA source. Non-kernel ops
-    (Input/Constant/primitive tensor ops) are skipped. The surrounding
-    syntax itself identifies the IR level, so the block headers stay
-    minimal: ``=== N: <name> ===``.
+    Each op's own ``pretty_body()`` returns its rendered body (or None to
+    skip — boundary sentinels and primitive tensor ops). ``CudaOp`` nodes
+    that share a ``kernel_name`` are emitted only once. The surrounding
+    syntax identifies the IR level, so block headers stay minimal:
+    ``=== N: <name> ===``.
     """
     from deplodock.compiler.ir.cuda import CudaOp
-    from deplodock.compiler.ir.kernel import KernelOp
-    from deplodock.compiler.ir.kernel.pretty import pretty_print as pp_kernel
-    from deplodock.compiler.ir.loop import LoopOp
-    from deplodock.compiler.ir.loop import pretty_print as pp_loop
-    from deplodock.compiler.ir.tile import TileOp
-    from deplodock.compiler.ir.tile.pretty import pretty_print as pp_tile
 
     seen_cuda: set[str] = set()
     blocks: list[str] = []
@@ -169,24 +163,18 @@ def format_kernels(graph: Graph) -> str:
     for nid in graph.topological_order():
         node = graph.nodes[nid]
         op = node.op
-        if isinstance(op, LoopOp):
-            port_buffers = [graph.nodes[src].output.name for src in node.inputs] + [node.output.name]
-            name = f"{nid} -> {node.output.name}"
-            body = pp_loop(op, port_buffers=port_buffers)
-        elif isinstance(op, TileOp):
-            name = op.name
-            body = pp_tile(op)
-        elif isinstance(op, KernelOp):
-            name = op.name
-            body = pp_kernel(op)
-        elif isinstance(op, CudaOp):
+        body = op.pretty_body()
+        if body is None:
+            continue
+        if isinstance(op, CudaOp):
             if op.kernel_name in seen_cuda:
                 continue
             seen_cuda.add(op.kernel_name)
             name = op.kernel_name
-            body = op.kernel_source
+        elif hasattr(op, "name") and op.name:
+            name = op.name
         else:
-            continue
+            name = f"{nid} -> {node.output.name}"
         blocks.append(f"=== {i}: {name} ===")
         blocks.append(body)
         blocks.append("")

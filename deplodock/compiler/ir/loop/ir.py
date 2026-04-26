@@ -101,6 +101,48 @@ class LoopOp(Op):
 
     body: tuple[Stmt, ...] = ()
 
+    def pretty_body(self, indent: str = "") -> str:
+        """Render as an explicit nested-loop program.
+
+        Each ``Loop`` block renders as ``for X in 0..N:  # kind``. Body Loads
+        render their ``source`` name directly (a string identifying the source
+        buffer).
+        """
+        lines: list[str] = []
+
+        def render(stmts: tuple[Stmt, ...], ind: str) -> None:
+            for stmt in stmts:
+                if isinstance(stmt, Assign):
+                    args = ", ".join(stmt.args)
+                    lines.append(f"{ind}{stmt.name} = {stmt.op.name}({args})")
+                elif isinstance(stmt, Load):
+                    idx = ", ".join(render_expr(e) for e in stmt.index)
+                    lines.append(f"{ind}{stmt.name} = load {stmt.input}[{idx}]")
+                elif isinstance(stmt, Accum):
+                    lines.append(f"{ind}{stmt.name} <- {stmt.op.name}({stmt.name}, {stmt.value})")
+                elif isinstance(stmt, Write):
+                    idx = ", ".join(render_expr(e) for e in stmt.index)
+                    lines.append(f"{ind}{stmt.output}[{idx}] = {stmt.value}")
+                elif isinstance(stmt, Select):
+                    for bi, br in enumerate(stmt.branches):
+                        prefix = f"{stmt.name} =" if bi == 0 else f"{' ' * len(stmt.name)}  "
+                        lines.append(f"{ind}{prefix} {br.value} when ({render_expr(br.select)})")
+                elif isinstance(stmt, Loop):
+                    a = stmt.axis
+                    # Kind is structural: a Loop whose immediate body contains an Accum is a reduce Loop.
+                    kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
+                    lines.append(f"{ind}for {a.name} in 0..{a.extent}:  # {kind}")
+                    render(stmt.body, ind + "    ")
+                elif isinstance(stmt, Cond):
+                    lines.append(f"{ind}if ({render_expr(stmt.cond)}):")
+                    render(stmt.body, ind + "    ")
+                    if stmt.else_body:
+                        lines.append(f"{ind}else:")
+                        render(stmt.else_body, ind + "    ")
+
+        render(self.body, indent)
+        return "\n".join(lines)
+
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.loop.normalize import normalize_body
 
@@ -373,60 +415,6 @@ def _compute_live_axes(
     for n in defs:
         live(n)
     return cache
-
-
-# ---------------------------------------------------------------------------
-# Pretty-printing
-# ---------------------------------------------------------------------------
-
-
-def pretty_print(loop: LoopOp, port_buffers: list[str] | None = None, indent: str = "") -> str:
-    """Render a ``LoopOp`` as an explicit nested-loop program.
-
-    Each ``Loop`` block renders as ``for X in 0..N:  # kind``. Body Loads
-    render their ``source`` name directly (a string identifying the source
-    buffer); ``port_buffers`` is kept for back-compat but ignored.
-    """
-    del port_buffers  # source is the buf name, intrinsic to Load now
-    lines: list[str] = []
-    _render_body(loop.body, indent, lines)
-    return "\n".join(lines)
-
-
-def _render_body(
-    stmts: tuple[Stmt, ...],
-    indent: str,
-    lines: list[str],
-) -> None:
-    """Render a body tuple (recursive for nested ``Loop``)."""
-    for stmt in stmts:
-        if isinstance(stmt, Assign):
-            args = ", ".join(stmt.args)
-            lines.append(f"{indent}{stmt.name} = {stmt.op.name}({args})")
-        elif isinstance(stmt, Load):
-            idx = ", ".join(render_expr(e) for e in stmt.index)
-            lines.append(f"{indent}{stmt.name} = load {stmt.input}[{idx}]")
-        elif isinstance(stmt, Accum):
-            lines.append(f"{indent}{stmt.name} <- {stmt.op.name}({stmt.name}, {stmt.value})")
-        elif isinstance(stmt, Write):
-            idx = ", ".join(render_expr(e) for e in stmt.index)
-            lines.append(f"{indent}{stmt.output}[{idx}] = {stmt.value}")
-        elif isinstance(stmt, Select):
-            for bi, br in enumerate(stmt.branches):
-                prefix = f"{stmt.name} =" if bi == 0 else f"{' ' * len(stmt.name)}  "
-                lines.append(f"{indent}{prefix} {br.value} when ({render_expr(br.select)})")
-        elif isinstance(stmt, Loop):
-            a = stmt.axis
-            # Kind is structural: a Loop whose immediate body contains an Accum is a reduce Loop.
-            kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
-            lines.append(f"{indent}for {a.name} in 0..{a.extent}:  # {kind}")
-            _render_body(stmt.body, indent + "    ", lines)
-        elif isinstance(stmt, Cond):
-            lines.append(f"{indent}if ({render_expr(stmt.cond)}):")
-            _render_body(stmt.body, indent + "    ", lines)
-            if stmt.else_body:
-                lines.append(f"{indent}else:")
-                _render_body(stmt.else_body, indent + "    ", lines)
 
 
 # ---------------------------------------------------------------------------

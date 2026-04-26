@@ -30,7 +30,6 @@ from deplodock.compiler.ir.loop.ir import (
     Write,
     iter_body,
     map_body,
-    pretty_print,
 )
 from deplodock.compiler.ir.loop.sigma import Sigma
 from deplodock.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
@@ -53,7 +52,6 @@ __all__ = [
     "Write",
     "iter_body",
     "map_body",
-    "pretty_print",
     "splice_graph",
     "splice_loop_ops",
     "splice_loops",

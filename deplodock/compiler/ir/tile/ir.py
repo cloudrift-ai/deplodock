@@ -162,6 +162,80 @@ class TileOp(Op):
     def __iter__(self) -> Iterator[Stmt]:
         return iter_body(self.body)
 
+    def pretty_body(self) -> str:
+        """Render as an indented structural listing."""
+        from deplodock.compiler.ir.expr import render as render_expr
+
+        lines: list[str] = []
+
+        def render_stmt(stmt: Stmt, indent: str, owned_axes: dict[str, str]) -> None:
+            if isinstance(stmt, Tile):
+                axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in stmt.axes) or "-"
+                lines.append(f"{indent}Tile(axes=({axes})):")
+                inner = {**owned_axes, **{ba.axis.name: ba.bind for ba in stmt.axes}}
+                for s in stmt.body:
+                    render_stmt(s, indent + "    ", inner)
+                return
+            if isinstance(stmt, StridedLoop):
+                kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
+                start = render_expr(stmt.start)
+                step = render_expr(stmt.step) if hasattr(stmt.step, "__class__") and not isinstance(stmt.step, int) else stmt.step
+                lines.append(f"{indent}StridedLoop({stmt.axis.name} = {start}; < {stmt.axis.extent}; += {step}):  # {kind}")
+                for s in stmt.body:
+                    render_stmt(s, indent + "    ", owned_axes)
+                return
+            if isinstance(stmt, Combine):
+                lines.append(f"{indent}Combine({stmt.name}, op={stmt.op.name})")
+                return
+            if isinstance(stmt, Stage):
+                origin = ", ".join(render_expr(e) for e in stmt.origin)
+                slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(stmt.axes, stmt.slab_dims, strict=True))
+                lines.append(f"{indent}{stmt.name} = Stage({stmt.buf}, origin=({origin}), slab=({slab}))")
+                return
+            if isinstance(stmt, Load):
+                idx = ", ".join(render_expr(e) for e in stmt.index)
+                lines.append(f"{indent}{stmt.name} = load {stmt.input}[{idx}]")
+                return
+            if isinstance(stmt, Assign):
+                args = ", ".join(stmt.args)
+                lines.append(f"{indent}{stmt.name} = {stmt.op.name}({args})")
+                return
+            if isinstance(stmt, Accum):
+                lines.append(f"{indent}{stmt.name} <- {stmt.op.name}({stmt.name}, {stmt.value})")
+                return
+            if isinstance(stmt, Write):
+                idx = ", ".join(render_expr(e) for e in stmt.index)
+                lines.append(f"{indent}{stmt.output}[{idx}] = {stmt.value}")
+                return
+            if isinstance(stmt, Select):
+                for bi, br in enumerate(stmt.branches):
+                    prefix = f"{stmt.name} =" if bi == 0 else f"{' ' * len(stmt.name)}  "
+                    lines.append(f"{indent}{prefix} {br.value} when ({render_expr(br.select)})")
+                return
+            if isinstance(stmt, Loop):
+                kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
+                lines.append(f"{indent}Loop({stmt.axis.name} in 0..{stmt.axis.extent}):  # {kind}")
+                for s in stmt.body:
+                    render_stmt(s, indent + "    ", owned_axes)
+                return
+            if isinstance(stmt, Cond):
+                lines.append(f"{indent}if ({render_expr(stmt.cond)}):")
+                for s in stmt.body:
+                    render_stmt(s, indent + "    ", owned_axes)
+                if stmt.else_body:
+                    lines.append(f"{indent}else:")
+                    for s in stmt.else_body:
+                        render_stmt(s, indent + "    ", owned_axes)
+                return
+            lines.append(f"{indent}<unrecognized {type(stmt).__name__}>")
+
+        sig_in = ", ".join(self.inputs) or "-"
+        sig_out = ", ".join(self.outputs) or "-"
+        lines.append(f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}")
+        for s in self.body:
+            render_stmt(s, "    ", {})
+        return "\n".join(lines)
+
     @property
     def loads(self) -> tuple[Load, ...]:
         return tuple(s for s in self if isinstance(s, Load))
