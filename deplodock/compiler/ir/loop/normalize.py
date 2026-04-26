@@ -44,7 +44,7 @@ from deplodock.compiler.ir.loop.ir import (
     iter_body,
     map_body,
 )
-from deplodock.compiler.ir.loop.sigma import Sigma
+from deplodock.compiler.ir.sigma import Sigma
 
 __all__ = [
     "normalize_body",

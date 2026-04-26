@@ -19,9 +19,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.backend.base import BenchmarkResult, RunResult
+    from deplodock.compiler.backend.base import BenchmarkResult
     from deplodock.compiler.graph import Graph
-    from deplodock.compiler.plan import ExecutionPlan
 
 logger = logging.getLogger(__name__)
 
@@ -85,32 +84,6 @@ class CompilerDump:
         kernels = format_kernels(graph)
         if kernels:
             self._write_text(f"{prefix}.kernels.txt", kernels)
-
-    def dump_plan(self, plan: ExecutionPlan) -> None:
-        summary = {
-            "name": plan.name,
-            "buffers": [{"name": b.name, "shape": list(b.shape), "dtype": b.dtype, "role": b.role} for b in plan.buffers],
-            "ops": [
-                {
-                    "op": op.op,
-                    "inputs": op.inputs,
-                    "outputs": op.outputs,
-                    "params": _safe_params(op.params),
-                }
-                for op in plan.ops
-            ],
-        }
-        self._write_json("30_execution_plan.json", summary)
-
-    def dump_source(self, source: str) -> None:
-        self._write_text("50_full_program.cu", source)
-
-    def dump_result(self, result: RunResult) -> None:
-        # outputs are ndarrays; serialize as nested lists for JSON.
-        data: dict = {"outputs": {n: arr.tolist() for n, arr in result.outputs.items()}}
-        if result.time_ms is not None:
-            data["time_ms"] = result.time_ms
-        self._write_json("60_result.json", data)
 
     def dump_per_launch_values(self, per_launch: dict) -> None:
         """Dump per-kernel tensor snapshots from a debug run.
@@ -180,20 +153,6 @@ def format_kernels(graph: Graph) -> str:
         blocks.append("")
         i += 1
     return "\n".join(blocks)
-
-
-def _safe_params(params: dict) -> dict:
-    """Serialize OpKernel params, skipping internal fields and handling non-JSON types."""
-    safe: dict = {}
-    for k, v in params.items():
-        if k.startswith("_"):
-            continue
-        try:
-            json.dumps(v)
-            safe[k] = v
-        except (TypeError, ValueError):
-            safe[k] = str(v)
-    return safe
 
 
 # ---------------------------------------------------------------------------

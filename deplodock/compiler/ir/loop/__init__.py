@@ -31,8 +31,8 @@ from deplodock.compiler.ir.loop.ir import (
     iter_body,
     map_body,
 )
-from deplodock.compiler.ir.loop.sigma import Sigma
 from deplodock.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
+from deplodock.compiler.ir.sigma import Sigma
 
 __all__ = [
     "Accum",
