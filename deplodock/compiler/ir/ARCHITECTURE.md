@@ -85,8 +85,10 @@ it replaces the frontend layout ops via `coord_map` expressions.
 | `ScanOp`                             | Cumulative variant of reduce.                                  |
 | `GatherOp`, `ScatterOp`              | Data-dependent reads / writes.                                 |
 | `IndexMapOp` + `IndexSource`         | Unified layout-only op over `Expr`.                            |
-| `OpInfo`, `OP_REGISTRY`              | Elementwise arity / commutativity.                             |
-| `ReduceInfo`, `REDUCE_REGISTRY`      | Reduce identity elements.                                      |
+
+Op metadata (arity / commutative / reduce identity) lives on
+`ElementwiseImpl` in `ir/elementwise.py` — the single source of truth
+shared across elementwise, reduce, scan, and accumulator use sites.
 
 ## `loop/`
 

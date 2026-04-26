@@ -8,8 +8,9 @@ to GPU coords.
 
 Lives at ``ir/axis.py`` rather than inside any one IR package because
 both concepts span every layer. Loop IR re-exports ``Axis`` for
-back-compat (``from ir.loop import Axis`` continues to work); Tile and
-Kernel IR import ``Axis`` and ``BoundAxis`` directly from here.
+convenience (lifting passes use ``from ir.loop import ...`` to grab the
+full Loop-body vocabulary in one import); Tile and Kernel IR import
+``Axis`` and ``BoundAxis`` directly from here.
 
 Future bindings (``BIND_SPLIT(factor, outer, inner)`` for matmul tile
 splits, ``BIND_CHUNKED(factor)`` if K-axis chunking ever lives at the
