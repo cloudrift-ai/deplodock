@@ -96,13 +96,9 @@ def _rewrite_block(blk: Tile) -> Tile | None:
         if sum(1 for s in rl.body if isinstance(s, Accum)) != 1:
             return None  # multi-Accum per Loop — online algorithms, punted
 
-    # --- Flip bindings on every inner BoundLoop, insert Combine after reductions ---
-    # Free output BoundLoops (no Accum in body) iterate output axes that are
-    # cooperatively walked across the block's threads — lift those axes into
-    # ``Tile.axes`` with ``BIND_BLOCK_STRIDED`` so Tile.axes documents the
-    # full output shape. The BoundLoop stays in the body to drive iteration.
+    # Flip every inner BoundLoop to BIND_BLOCK_STRIDED — threads of the
+    # block cooperate on the iteration. Insert Combine after reductions.
     new_body: list[Stmt] = []
-    strided_output_axes: list[BoundAxis] = []
     for s in blk.body:
         if isinstance(s, BoundLoop):
             cooperative_axis = BoundAxis(axis=s.axis, bind=BIND_BLOCK_STRIDED)
@@ -110,21 +106,16 @@ def _rewrite_block(blk: Tile) -> Tile | None:
             if _is_reduce(s):
                 accum = next(a for a in s.body if isinstance(a, Accum))
                 new_body.append(Combine(name=accum.name, op=accum.op))
-            else:
-                strided_output_axes.append(cooperative_axis)
         else:
             new_body.append(s)
 
-    # Original output axes flip to BIND_BLOCK; cooperatively-walked axes
-    # appended as BIND_BLOCK_STRIDED; synthesize the cooperative thread
-    # axis ``t`` (BLOCK_SIZE threads) up front so materialization sees it
-    # in Tile.axes — no synthesis at materialization time.
+    # ``Tile.axes`` carries only axes that contribute to launch geometry:
+    # the synthesized cooperative thread axis ``t`` (THREAD) and the
+    # original output axes flipped to BLOCK. Cooperatively-walked inner
+    # axes live on their BoundLoop's bind alone — no documentary copy on
+    # Tile.axes (the body is the source of truth for body-axis layout).
     t_axis = BoundAxis(axis=Axis("t", BLOCK_SIZE), bind=BIND_THREAD)
-    new_axes = (
-        t_axis,
-        *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes),
-        *strided_output_axes,
-    )
+    new_axes = (t_axis, *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes))
     return Tile(axes=new_axes, body=tuple(new_body))
 
 

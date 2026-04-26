@@ -174,11 +174,10 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
     inits = _collect_init_stmts(new_body)
     new_body = [*inits, *new_body]
 
-    # Pass Tile.axes through — strategies committed the layout. BLOCK_STRIDED
-    # axes don't contribute to launch geometry (the body's strided BoundLoops
-    # handle their iteration); THREAD + BLOCK do.
-    enclosure_axes = tuple(ba for ba in axes if ba.bind != BIND_BLOCK_STRIDED)
-    return Enclosure(axes=enclosure_axes, body=tuple(new_body))
+    # Pass Tile.axes through — strategies committed the launch layout
+    # (THREAD + BLOCK only). Cooperatively-walked body axes live on their
+    # BoundLoop's bind, not here.
+    return Enclosure(axes=axes, body=tuple(new_body))
 
 
 def _emit_loop(

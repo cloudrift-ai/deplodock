@@ -35,24 +35,26 @@ class Axis:
 
 
 # BoundAxis.bind values — how an axis is treated by the surrounding
-# scheduling context. The same vocabulary spans output axes (in
-# ``Block.axes`` / ``Enclosure.axes``) and inner-iteration axes (in
-# ``BoundLoop.axis``); the value name disambiguates the role.
+# scheduling context. ``Tile.axes`` / ``Enclosure.axes`` use only the
+# launch-geometry binds (``BIND_THREAD`` / ``BIND_BLOCK``);
+# ``BoundLoop.axis`` uses only the body-loop binds (``BIND_SERIAL`` /
+# ``BIND_BLOCK_STRIDED``). The two sets are disjoint by role.
 
-# --- Output axis bindings (parallel decomposition of the output) ---
+# --- Launch-geometry bindings (used in Tile.axes / Enclosure.axes) ---
+# One thread per axis value (axis flattens into threadIdx.x).
 BIND_THREAD = "THREAD"
+# One CUDA block per axis value (axis flattens into blockIdx.x/y/z),
+# threads inside cooperate.
 BIND_BLOCK = "BLOCK"
-# Output axis shared across all threads of a CUDA block — cooperatively
-# walked via a strided ``BoundLoop`` in the body. Doesn't contribute to
-# launch geometry. Also reused for inner-iteration axes that are
-# cooperatively walked at block scope (drops the old ``WALK_STRIDED``).
-BIND_BLOCK_STRIDED = "BLOCK_STRIDED"
 
-# --- Inner-iteration axis bindings (how a loop is walked) ---
+# --- Body-loop bindings (used on BoundLoop.axis) ---
 # Each thread iterates the axis privately (renders to a plain serial
-# ``for`` loop). Used on inner axes that are not output axes; drops the
-# old ``WALK_SERIAL``.
+# ``for`` loop).
 BIND_SERIAL = "SERIAL"
+# Threads of the CUDA block cooperatively stride through the axis —
+# each thread takes every BLOCK_SIZE-th iteration; together the block
+# covers the full extent. Renders to ``StridedLoop(start=tid, step=BLOCK_SIZE)``.
+BIND_BLOCK_STRIDED = "BLOCK_STRIDED"
 
 
 @dataclass(frozen=True)
