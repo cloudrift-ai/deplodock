@@ -74,6 +74,44 @@ def test_compile_passes_shorthand(run_cli, tmp_path):
     assert "lowering/cuda" not in log
 
 
+def test_compile_dump_dir_writes_rule_application_files(run_cli, tmp_path):
+    """``--dump-dir`` should produce per-rule .rules.{txt,json} files alongside per-pass graph dumps.
+
+    Smoke check: at least one fusion rule fires on RMSNorm, the per-rule
+    text snapshot has a ``=== rule ... matched at ... ===`` header, and
+    the JSON sibling parses as a non-empty list.
+    """
+    import json
+
+    dump = tmp_path / "dump"
+    rc, _stdout, stderr = run_cli("compile", "-c", "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "--dump-dir", str(dump))
+    assert rc == 0, f"stderr: {stderr}"
+
+    # Per-pass graph dump is still produced.
+    assert (dump / "01_frontend_decomposition.txt").exists()
+
+    # Per-rule application snapshots — at least one fusion rule fires.
+    rule_txts = sorted(dump.glob("*.rules.txt"))
+    rule_jsons = sorted(dump.glob("*.rules.json"))
+    assert rule_txts, "expected at least one .rules.txt file in the dump dir"
+    assert len(rule_txts) == len(rule_jsons), "every .rules.txt should have a sibling .rules.json"
+
+    # Inspect one of the merge_loop_ops snapshots — that rule reliably
+    # fires on RMSNorm decomposition.
+    fusion_txt = dump / "04_loop_fusion__001_merge_loop_ops.rules.txt"
+    fusion_json = dump / "04_loop_fusion__001_merge_loop_ops.rules.json"
+    assert fusion_txt.exists() and fusion_json.exists()
+    text = fusion_txt.read_text()
+    assert "=== rule 001_merge_loop_ops matched at" in text
+    assert "before:" in text and "after:" in text
+
+    records = json.loads(fusion_json.read_text())
+    assert isinstance(records, list) and records
+    first = records[0]
+    assert "root" in first and "before" in first and "after" in first
+    assert all(isinstance(n, dict) and "op_class" in n for n in first["before"])
+
+
 def test_compile_no_input_errors(run_cli):
     rc, stdout, stderr = run_cli("compile")
     assert rc != 0

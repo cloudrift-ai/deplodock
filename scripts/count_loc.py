@@ -165,8 +165,8 @@ def _parse_depth(value: str) -> tuple[str, int | None]:
         return ("file", None)
     try:
         return ("folder", int(value))
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"--depth must be 'folder', 'file', or an integer (got {value!r})")
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(f"--depth must be 'folder', 'file', or an integer (got {value!r})") from err
 
 
 def main():

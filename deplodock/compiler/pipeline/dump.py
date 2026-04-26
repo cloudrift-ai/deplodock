@@ -45,6 +45,11 @@ class CompilerDump:
 
             shutil.rmtree(self.dir)
         self.dir.mkdir(parents=True, exist_ok=True)
+        # Per-rule accumulator. Keyed by (pass_idx, pass_name, rule_name);
+        # flushed to disk in ``on_pass`` so we write each rule's text/json
+        # files once instead of N times for N rule applications.
+        self._rule_records: dict[tuple[int, str, str], list[dict]] = {}
+        self._rule_texts: dict[tuple[int, str, str], list[str]] = {}
 
     @classmethod
     def from_env(cls) -> CompilerDump | None:
@@ -63,15 +68,47 @@ class CompilerDump:
 
     # --- Dump methods ---
 
+    def on_rule(
+        self,
+        pass_idx: int,
+        pass_name: str,
+        rule_name: str,
+        record: dict,
+        text: str,
+    ) -> None:
+        """Buffer one rule-application record for later flush in ``on_pass``.
+
+        The text snapshot comes from ``_format_rule_application`` (or the
+        in-place variant); the structured ``record`` mirrors it for
+        post-hoc analysis. Both are written to
+        ``{idx:02d}_{pass}__{rule}.rules.{txt,json}`` when the pass ends.
+        """
+        key = (pass_idx, pass_name, rule_name)
+        self._rule_records.setdefault(key, []).append(record)
+        self._rule_texts.setdefault(key, []).append(text)
+
     def on_pass(self, idx: int, pass_name: str, graph: Graph) -> None:
         """Dump the graph after a pass as json / txt / dot (+ kernels.txt if any).
 
         Every pass is treated uniformly: no per-pass special cases, so
         adding a new pass automatically gets dumped. File names are
         ``{idx:02d}_{pass_name}.{ext}`` with slashes in ``pass_name``
-        flattened to underscores.
+        flattened to underscores. Also flushes any per-rule application
+        snapshots accumulated during this pass to ``.rules.{txt,json}``
+        files alongside the post-pass graph dump.
         """
         self._dump_graph(f"{idx:02d}_{pass_name.replace('/', '_')}", graph)
+        self._flush_rule_dumps(idx, pass_name)
+
+    def _flush_rule_dumps(self, idx: int, pass_name: str) -> None:
+        flat_pass = pass_name.replace("/", "_")
+        for (pass_idx, pname, rule_name), records in list(self._rule_records.items()):
+            if pass_idx != idx or pname != pass_name:
+                continue
+            prefix = f"{idx:02d}_{flat_pass}__{rule_name}.rules"
+            self._write_text(f"{prefix}.txt", "\n\n".join(self._rule_texts.pop((pass_idx, pname, rule_name))) + "\n")
+            self._write_json(f"{prefix}.json", records)
+            del self._rule_records[(pass_idx, pname, rule_name)]
 
     def dump_input_graph(self, graph: Graph) -> None:
         """Graph as captured by the tracer, before any rewriter pass runs."""

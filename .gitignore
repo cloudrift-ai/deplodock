@@ -26,5 +26,6 @@ nginx.vllm.conf
 # Experiment artifacts
 /experiments/**
 
-# Test dump artifacts
+# Common dump filders
 _test_data/
+dump/
