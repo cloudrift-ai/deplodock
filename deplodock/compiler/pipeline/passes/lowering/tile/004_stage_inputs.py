@@ -162,19 +162,29 @@ def _stage_plan(
                 continue
 
         # Build cache_axes — every matching axis at every index position
-        # must be cached. Otherwise a below-stage Var leaks into the
-        # source index (decode_sigma misses it → undefined at the
-        # cooperative-load scope). Order by appearance in the index.
+        # must be cached. Order by appearance in the index. ``slab_dims``
+        # records the source-buffer dim each axis lives in.
+        # Slab form requires at most one cache axis per source dim (so
+        # the source index reconstructs as ``origin[d] + decoded[d]``).
+        # If any dim has >1 cache axes (e.g. matmul d=0 where a2_o and
+        # a2_i both sit at K), skip — deeper placements have fewer
+        # below-axes and resolve the conflict.
         cache_axes: list[Axis] = []
+        slab_dims: list[int] = []
         seen: set[str] = set()
-        for e in ref_load.index:
+        per_dim_count: dict[int, int] = {}
+        for dim, e in enumerate(ref_load.index):
             for ax_name in free_vars(e):
                 if ax_name in cache_axes_names and ax_name not in seen:
                     seen.add(ax_name)
                     ax = thread_axes_by_name.get(ax_name) or below_axes_by_name[ax_name]
                     cache_axes.append(ax)
+                    slab_dims.append(dim)
+                    per_dim_count[dim] = per_dim_count.get(dim, 0) + 1
         if not cache_axes:
             continue
+        if any(c > 1 for c in per_dim_count.values()):
+            continue  # multi-cache-per-dim — deeper placement will resolve
 
         footprint = 1
         for ax in cache_axes:
@@ -182,7 +192,18 @@ def _stage_plan(
         if footprint * DTYPE_BYTES > STAGE_BYTES_LIMIT:
             continue
 
-        stage = Stage(name=f"{buf}_stage", buf=buf, index=ref_load.index, axes=tuple(cache_axes))
+        # Build origin: per source dim, the block-uniform anchor =
+        # ref_load.index[d] with all cache-axis Vars substituted to 0.
+        origin_sigma = Sigma({ax.name: Literal(0, "int") for ax in cache_axes})
+        origin = tuple(origin_sigma.apply(e) for e in ref_load.index)
+
+        stage = Stage(
+            name=f"{buf}_stage",
+            buf=buf,
+            origin=origin,
+            axes=tuple(cache_axes),
+            slab_dims=tuple(slab_dims),
+        )
         return (buf, d, common[:d], stage)
 
     return None
@@ -239,12 +260,11 @@ def _clone_loop(loop, body: tuple):
 def _rewrite_loads(stmt: Stmt, redirects: dict[str, Stage]) -> Stmt:
     """Recursively rewrite ``Load(buf, ...)`` to ``Load(stage.name,
     smem_index)`` for every staged buf. ``smem_index`` has one entry per
-    cache axis (in stage.axes order); each entry is the smem coord
-    derived from the load's index at the cache axis's position in
-    stage.index."""
+    cache axis (in stage.axes order); each entry is the load-site coord
+    for that slab dim."""
     if isinstance(stmt, Load) and stmt.input in redirects:
         stage = redirects[stmt.input]
-        smem_index = tuple(_smem_coord_for_axis(ax, stage.index, stmt.index) for ax in stage.axes)
+        smem_index = tuple(_smem_coord_for_axis(ax, dim, stage, stmt.index) for ax, dim in zip(stage.axes, stage.slab_dims, strict=True))
         return Load(name=stmt.name, input=stage.name, index=smem_index)
     if isinstance(stmt, Loop):
         return Loop(axis=stmt.axis, body=tuple(_rewrite_loads(c, redirects) for c in stmt.body))
@@ -264,25 +284,23 @@ def _rewrite_loads(stmt: Stmt, redirects: dict[str, Stage]) -> Stmt:
     return stmt
 
 
-def _smem_coord_for_axis(stage_axis: Axis, stage_index: tuple, load_index: tuple):
-    """Smem coord per cache axis. Find the cache axis in stage_index;
-    extract the corresponding coord from load_index at the same position.
+def _smem_coord_for_axis(stage_axis: Axis, slab_dim: int, stage: Stage, load_index: tuple):
+    """Smem coord for one cache axis at a Load site. The slab axis lives
+    in source dim ``slab_dim``; extract its value from ``load_index[slab_dim]``:
 
     - **Same naming** (matmul: load uses the same axis Vars as stage):
-      use ``Var(cache_axis.name)``.
-    - **Aliasing** (softmax: load uses a different Var name for the same
-      role, e.g. ``a2`` instead of ``a1``): use the load's Var.
-    - **Affine with multiple cache vars** (matmul d=0 case): substitute
-      every non-cache Var with 0, leaving the cache axis's contribution."""
-    for p, e in enumerate(stage_index):
-        if stage_axis.name in free_vars(e):
-            load_e = load_index[p]
-            free = free_vars(load_e)
-            if stage_axis.name in free:
-                return Var(stage_axis.name)
-            if isinstance(load_e, Var):
-                return load_e
-            non_cache = free - {stage_axis.name}
-            sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
-            return sigma.apply(load_e)
-    raise ValueError(f"cache axis {stage_axis.name!r} not found in stage.index")
+      ``Var(stage_axis.name)`` — already in scope.
+    - **Aliasing** (softmax: load's Var at this dim is differently named
+      e.g. ``a2`` for the cache-axis ``a1``): use the load's Var.
+    - **Affine** (load index is ``outer*F + cache``): strip the
+      block-uniform origin to leave the cache-local coord."""
+    load_e = load_index[slab_dim]
+    free = free_vars(load_e)
+    if stage_axis.name in free:
+        return Var(stage_axis.name)
+    if isinstance(load_e, Var):
+        return load_e
+    origin_at_dim = stage.origin[slab_dim]
+    non_cache = free - {stage_axis.name} - free_vars(origin_at_dim)
+    sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
+    return sigma.apply(load_e)

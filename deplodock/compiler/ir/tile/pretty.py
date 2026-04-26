@@ -53,9 +53,9 @@ def _render_stmt(stmt: Stmt, indent: str, lines: list[str], owned_axes: dict[str
         lines.append(f"{indent}Combine({stmt.name}, op={stmt.op.name})")
         return
     if isinstance(stmt, Stage):
-        idx = ", ".join(render_expr(e) for e in stmt.index)
-        axes = ", ".join(f"{ax.name}:{ax.extent}" for ax in stmt.axes)
-        lines.append(f"{indent}Stage({stmt.buf}[{idx}], axes=({axes}))")
+        origin = ", ".join(render_expr(e) for e in stmt.origin)
+        slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(stmt.axes, stmt.slab_dims, strict=True))
+        lines.append(f"{indent}{stmt.name} = Stage({stmt.buf}, origin=({origin}), slab=({slab}))")
         return
 
     # Loop-IR leaves

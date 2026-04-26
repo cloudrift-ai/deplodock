@@ -141,34 +141,39 @@ class Combine(Stmt):
 
 @dataclass
 class Stage(Stmt):
-    """Operand-cache declaration — stage ``buf`` into a named local
-    buffer for reuse across the surrounding ``Tile`` body.
+    """Operand-cache declaration — stage a contiguous slab of ``buf``
+    into a named local buffer for reuse across the surrounding ``Tile``
+    body.
+
+    Slab geometry:
+
+    - ``origin`` — per-source-dim block-uniform anchor (length == source
+      buffer rank). Each entry is an Expr referencing only block-bound
+      Vars (``BIND_BLOCK`` axes) and Literals — no thread / cache vars.
+    - ``axes`` — cache axes (smem layout, in this order).
+    - ``slab_dims`` — parallel to ``axes``; each entry is the source-
+      buffer dim that the slab axis adds to. ``source_index[d] =
+      origin[d] + (slab axis at d, if any)``.
 
     SSA-like: ``name`` is the staged buffer's identifier; subsequent
     ``Load(input=name, index=cache-local)`` reads in the body refer to
     it directly. The strategy that inserts the Stage is also responsible
-    for rewriting body Loads to target ``name`` with cache-local
-    indices (Vars matching ``axes``).
+    for rewriting body Loads to target ``name`` with cache-local Vars
+    (matching ``axes`` in order).
 
-    - ``buf`` — source global buffer to load from.
-    - ``index`` — global-coordinate index pattern (with axis ``Var``s)
-      used by the cooperative load. Positions whose Var name appears in
-      ``axes`` are the cache-dimension positions; other positions
-      (typically block-bound from ``Tile.axes``, or Literal constants
-      for collapsed leading dims) are fixed per CUDA block.
-    - ``axes`` — cache axes; the smem buffer's shape is
-      ``tuple(ax.extent for ax in axes)``.
+    The slab form maps directly to TMA / ``cp.async.bulk`` tensor-
+    descriptor copies: ``origin`` is the box-origin and ``axes``
+    extents are the box-extents.
 
     Doesn't commit to storage class — materialization picks (smem in
-    today's path; register file or async-copy paths possible in the
-    future). Materialization expands a Stage into ``Smem(name, ...)``
-    plus the cooperative-load loop that fills it.
+    today's path; TMA / async-copy paths possible in the future).
     """
 
     name: str
     buf: str
-    index: tuple[Expr, ...]
+    origin: tuple[Expr, ...]
     axes: tuple[Axis, ...]
+    slab_dims: tuple[int, ...]
 
 
 # ---------------------------------------------------------------------------
