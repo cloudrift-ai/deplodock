@@ -116,6 +116,18 @@ def graph_from_code(code: str):
 
     Shared by ``deplodock trace --code`` and ``deplodock compile --code``.
     """
+    info = trace_inline_code(code)
+    return info["graph"], info["slug"]
+
+
+def trace_inline_code(code: str) -> dict:
+    """Trace an inline torch expression and return graph + the runnable module.
+
+    Returns a dict with ``graph``, ``slug``, ``module``, ``args``, ``kwargs``,
+    and ``const_targets`` (placeholder→attribute path for parameters/buffers).
+    Used by ``deplodock run --code`` to compile, execute, and benchmark
+    against the original PyTorch module.
+    """
     try:
         import torch
         import torch.nn.functional as F
@@ -123,7 +135,7 @@ def graph_from_code(code: str):
         logger.error("torch is required: pip install torch")
         sys.exit(1)
 
-    from deplodock.compiler.trace.torch import trace_module
+    from deplodock.compiler.trace.torch import trace_module_with_constants
 
     try:
         tree = ast.parse(code, mode="exec")
@@ -155,8 +167,15 @@ def graph_from_code(code: str):
                 if kw.arg
             }
             logger.info("Tracing inline module: %s", ast.unparse(final_expr.func))
-            graph = trace_module(maybe_mod, args, kwargs=kws or None)
-            return graph, _slugify(ast.unparse(final_expr.func))
+            graph, const_targets = trace_module_with_constants(maybe_mod, args, kwargs=kws or None)
+            return {
+                "graph": graph,
+                "slug": _slugify(ast.unparse(final_expr.func)),
+                "module": maybe_mod,
+                "args": args,
+                "kwargs": kws,
+                "const_targets": const_targets,
+            }
 
     # General path: treat the final expression as a function body. Inputs
     # come from two sources: (1) bare Name references to tensors in scope
@@ -188,8 +207,15 @@ def graph_from_code(code: str):
     module = scope["_Wrapper"]()
     example_inputs = tuple(tensor_params.values())
     logger.info("Tracing inline expression: %s", ast.unparse(final_expr))
-    graph = trace_module(module, example_inputs)
-    return graph, _slugify(ast.unparse(final_expr))
+    graph, const_targets = trace_module_with_constants(module, example_inputs)
+    return {
+        "graph": graph,
+        "slug": _slugify(ast.unparse(final_expr)),
+        "module": module,
+        "args": example_inputs,
+        "kwargs": {},
+        "const_targets": const_targets,
+    }
 
 
 _TENSOR_CTOR_NAMES = frozenset({"randn", "rand", "zeros", "ones", "empty", "full", "arange", "linspace", "tensor", "randint", "eye"})

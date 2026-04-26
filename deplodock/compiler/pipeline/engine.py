@@ -229,9 +229,15 @@ def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match) -> dict | Non
 # ---------------------------------------------------------------------------
 
 
-def run_pass(graph: Graph, pass_dir: Path) -> Graph:
+def run_pass(
+    graph: Graph,
+    pass_dir: Path,
+    dump: CompilerDump | None = None,
+    pass_idx: int | None = None,
+    pass_name: str | None = None,
+) -> Graph:
     """Load all rule modules in ``pass_dir`` and apply them to fixed point."""
-    return _apply_rules(graph, _load_rules(pass_dir))
+    return _apply_rules(graph, _load_rules(pass_dir), dump=dump, pass_idx=pass_idx, pass_name=pass_name)
 
 
 def run_rule(graph: Graph, rule_path: Path) -> Graph:
@@ -239,7 +245,13 @@ def run_rule(graph: Graph, rule_path: Path) -> Graph:
     return _apply_rules(graph, [_load_rule(rule_path)])
 
 
-def _apply_rules(graph: Graph, rules: list[_Rule]) -> Graph:
+def _apply_rules(
+    graph: Graph,
+    rules: list[_Rule],
+    dump: CompilerDump | None = None,
+    pass_idx: int | None = None,
+    pass_name: str | None = None,
+) -> Graph:
     outer_changed = True
     rule_stats: dict[str, tuple[int, float, float]] = {}  # name -> (applied, match_s, rewrite_s)
     while outer_changed:
@@ -264,20 +276,28 @@ def _apply_rules(graph: Graph, rules: list[_Rule]) -> Graph:
                     # mutations (rules that set ``node.op = ...`` and return
                     # None — e.g. lowering/tile) can render a before/after.
                     debug_on = logger.isEnabledFor(logging.DEBUG)
-                    pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes} if debug_on else {}
+                    capture_snapshots = debug_on or dump is not None
+                    pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes} if capture_snapshots else {}
                     kwargs = _build_rewrite_kwargs(rule, graph, match)
                     if kwargs is None:
                         continue
                     fragment = rule.rewrite(**kwargs)
                     if fragment is None:
-                        if debug_on and any(graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops if nid in graph.nodes):
-                            logger.debug(_format_inplace_application(rule.name, graph, match, pre_ops))
+                        if any(graph.nodes[nid].op is not pre_ops.get(nid) for nid in pre_ops if nid in graph.nodes):
+                            text = _format_inplace_application(rule.name, graph, match, pre_ops)
+                            if debug_on:
+                                logger.debug(text)
+                            if dump is not None and pass_idx is not None and pass_name is not None:
+                                record = _record_inplace_application(graph, match, pre_ops)
+                                dump.on_rule(pass_idx, pass_name, rule.name, record, text)
                         rewrite_time += time.monotonic() - t1
                         continue
-                    # (TODO: also wire to ``CompilerDump.on_rule`` for
-                    # ``--dump-dir`` symmetry.)
+                    text = _format_rule_application(rule.name, graph, match, fragment)
                     if debug_on:
-                        logger.debug(_format_rule_application(rule.name, graph, match, fragment))
+                        logger.debug(text)
+                    if dump is not None and pass_idx is not None and pass_name is not None:
+                        record = _record_rule_application(graph, match, fragment)
+                        dump.on_rule(pass_idx, pass_name, rule.name, record, text)
                     graph = _apply_replacement(graph, match, fragment)
                     rewrite_time += time.monotonic() - t1
                     applied += 1
@@ -334,6 +354,43 @@ def _format_inplace_application(name: str, graph: Graph, match: Match, pre_ops: 
     after_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
     lines.extend(f"    {line}" for line in _format_nodes(after_nodes, graph).splitlines())
     return "\n".join(lines)
+
+
+def _record_rule_application(graph: Graph, match: Match, fragment: Graph) -> dict:
+    """Structured analog of ``_format_rule_application`` for JSON dumps.
+
+    Captures the matched-subgraph nodes and the fragment's nodes as plain
+    dicts so post-hoc scripts (and the article-side analysis) can iterate
+    rule applications without re-parsing the text snapshot.
+    """
+    matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
+    matched_ids.add(match.root_node_id)
+    return {
+        "root": match.root_node_id,
+        "matched_pattern_nodes": dict(match.nodes),
+        "before": [_node_to_dict(graph.nodes[nid]) for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes],
+        "after": [_node_to_dict(fragment.nodes[nid]) for nid in fragment.topological_order()],
+    }
+
+
+def _record_inplace_application(graph: Graph, match: Match, pre_ops: dict) -> dict:
+    mutated = [nid for nid, prev in pre_ops.items() if nid in graph.nodes and graph.nodes[nid].op is not prev]
+    return {
+        "root": match.root_node_id,
+        "in_place": True,
+        "before": [{"id": nid, "op_class": type(pre_ops[nid]).__name__} for nid in mutated],
+        "after": [_node_to_dict(graph.nodes[nid]) for nid in mutated],
+    }
+
+
+def _node_to_dict(node) -> dict:
+    return {
+        "id": node.output.name,
+        "op_class": type(node.op).__name__,
+        "inputs": list(node.inputs),
+        "output_shape": list(node.output.shape),
+        "output_dtype": node.output.dtype,
+    }
 
 
 def _format_nodes(nodes: list, graph: Graph) -> str:
@@ -459,7 +516,7 @@ def run_pipeline(graph: Graph, passes: list[str], dump: CompilerDump | None = No
     for idx, name in enumerate(passes, start=1):
         t0 = time.monotonic()
         n_before = len(graph.nodes)
-        graph = run_pass(graph, _PASSES_DIR / name)
+        graph = run_pass(graph, _PASSES_DIR / name, dump=dump, pass_idx=idx, pass_name=name)
         logger.info("compile: %-18s %.2fs (%d -> %d nodes)", name, time.monotonic() - t0, n_before, len(graph.nodes))
         if dump is not None:
             dump.on_pass(idx, name, graph)
