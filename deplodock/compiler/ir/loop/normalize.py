@@ -30,8 +30,6 @@ applied in order by :func:`normalize_body`:
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop.ir import (
     Accum,
@@ -61,24 +59,6 @@ def _identity_rename(n: str) -> str:
     return n
 
 
-def _rewrite_body(
-    body: tuple[Stmt, ...],
-    rename_ssa: Callable[[str], str],
-    sigma: Sigma,
-    axis_fn: Callable[[Axis], Axis] = lambda a: a,
-) -> tuple[Stmt, ...]:
-    """Walk ``body`` applying ``Stmt.rewrite(rename_ssa, sigma)`` to each
-    non-``Loop`` stmt and ``axis_fn`` to each ``Loop``'s axis, recursing
-    into Loop bodies. Thin shared helper over ``map_body``."""
-
-    def fn(s: Stmt) -> Stmt | None:
-        if isinstance(s, Loop):
-            return Loop(axis=axis_fn(s.axis), body=_rewrite_body(s.body, rename_ssa, sigma, axis_fn))
-        return s.rewrite(rename_ssa, sigma)
-
-    return map_body(body, fn)
-
-
 # ---------------------------------------------------------------------------
 # Top-level composition
 # ---------------------------------------------------------------------------
@@ -103,12 +83,6 @@ def normalize_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _immediate_has_accum(stmts: tuple[Stmt, ...]) -> bool:
-    """True when the immediate sequence contains an ``Accum`` — marks the
-    enclosing Loop as a reduce loop."""
-    return any(isinstance(s, Accum) for s in stmts)
-
-
 # ---------------------------------------------------------------------------
 # Pass 1: drop size-1 free axes
 # ---------------------------------------------------------------------------
@@ -122,11 +96,11 @@ def drop_size_one_free_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     def fn(s: Stmt) -> Stmt | tuple[Stmt, ...]:
         if not isinstance(s, Loop):
             return s
-        inner = map_body(s.body, fn)
-        if int(s.axis.extent) == 1 and not _immediate_has_accum(inner):
-            sub = Sigma({s.axis.name: Literal(0, "int")})
-            return _rewrite_body(inner, _identity_rename, sub)
-        return Loop(axis=s.axis, body=inner)
+        candidate = Loop(axis=s.axis, body=map_body(s.body, fn))
+        if int(candidate.axis.extent) == 1 and not candidate.is_reduce:
+            sub = Sigma({candidate.axis.name: Literal(0, "int")})
+            return tuple(c.rewrite(_identity_rename, sub) for c in candidate.body)
+        return candidate
 
     return map_body(stmts, fn)
 
@@ -145,7 +119,7 @@ def canonicalize_free_axis_order(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     current = stmts
     while len(current) == 1 and isinstance(current[0], Loop):
         loop = current[0]
-        if _immediate_has_accum(loop.body):
+        if loop.is_reduce:
             break
         chain_axes.append(loop.axis)
         current = loop.body
@@ -227,7 +201,7 @@ def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         # Group sibling reduce Loops by their reduce axis's (source, dim) pattern.
         groups: dict[frozenset[tuple[str, int]], list[int]] = {}
         for i, s in enumerate(new_body):
-            if isinstance(s, Loop) and _immediate_has_accum(s.body):
+            if isinstance(s, Loop) and s.is_reduce:
                 positions = _reduce_axis_source_positions(s.body, s.axis.name)
                 if positions:
                     groups.setdefault(frozenset(positions), []).append(i)
@@ -276,7 +250,7 @@ def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -
     def axis_fn(a: Axis) -> Axis:
         return Axis(name=new_name, extent=a.extent) if a.name == old_name else a
 
-    return _rewrite_body(body, _identity_rename, sub, axis_fn)
+    return tuple(s.rewrite(_identity_rename, sub, axis_fn) for s in body)
 
 
 # ---------------------------------------------------------------------------
@@ -466,4 +440,4 @@ def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         new = axis_rename.get(a.name, a.name)
         return Axis(name=new, extent=a.extent) if new != a.name else a
 
-    return _rewrite_body(stmts, rename_ssa, sigma, axis_fn)
+    return tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in stmts)

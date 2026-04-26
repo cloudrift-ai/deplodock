@@ -88,6 +88,11 @@ def _pad(n: int) -> str:
     return "    " * n
 
 
+def _axis_identity(a: Axis) -> Axis:
+    """Default ``axis_fn`` for ``Loop.rewrite`` / ``StridedLoop.rewrite``."""
+    return a
+
+
 # ---------------------------------------------------------------------------
 # Render helpers — translate elementwise op names to Expr trees, and flatten
 # multi-dim coord tuples into row-major flat-index strings.
@@ -186,9 +191,17 @@ class Stmt:
         """SSA names this stmt reads — its 'requirements'."""
         raise NotImplementedError
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self,
+        rename_ssa: Callable[[str], str],
+        sigma: Sigma = Sigma.IDENTITY,
+        axis_fn: Callable[[Axis], Axis] = _axis_identity,
+    ) -> Stmt:
         """Return a copy with every SSA name (binding + dep refs) mapped
-        through ``rename_ssa`` and every Expr subterm σ-substituted.
+        through ``rename_ssa``, every Expr subterm σ-substituted, and
+        every axis on a ``Loop`` / ``StridedLoop`` mapped through
+        ``axis_fn``. Subclasses without axes accept and ignore ``axis_fn``;
+        Loop-like subclasses thread it through their bodies.
 
         ``rename_ssa`` is applied uniformly to the stmt's own name (if any)
         and to each name it reads. Callers typically provide a callable
@@ -271,7 +284,9 @@ class Load(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         return Load(name=rename_ssa(self.name), input=self.input, index=tuple(sigma.apply(e) for e in self.index))
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -304,7 +319,9 @@ class Assign(Stmt):
     def deps(self) -> tuple[str, ...]:
         return self.args
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         return Assign(name=rename_ssa(self.name), op=self.op, args=tuple(rename_ssa(a) for a in self.args))
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -352,7 +369,9 @@ class Accum(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         return Accum(name=rename_ssa(self.name), value=rename_ssa(self.value), op=self.op)
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -401,7 +420,9 @@ class Init(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         return Init(name=rename_ssa(self.name), op=self.op)
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -433,7 +454,9 @@ class Write(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         return Write(output=self.output, index=tuple(sigma.apply(e) for e in self.index), value=rename_ssa(self.value))
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -473,7 +496,9 @@ class Select(Stmt):
     def deps(self) -> tuple[str, ...]:
         return tuple(b.value for b in self.branches)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         return Select(
             name=rename_ssa(self.name),
             branches=tuple(SelectBranch(value=rename_ssa(b.value), select=sigma.apply(b.select)) for b in self.branches),
@@ -528,13 +553,12 @@ class Loop(Stmt):
         """A loop is a reduce-loop iff its immediate body contains an ``Accum``."""
         return any(isinstance(s, Accum) for s in self.body)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         """Recursive rewrite: rebuild ``body`` with each child's ``rewrite``.
-
-        ``axis`` is left alone — strategies that need axis renaming
-        (``loop.normalize``) special-case ``Loop`` and bypass this method.
-        """
-        return Loop(axis=self.axis, body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body))
+        ``axis`` is mapped through ``axis_fn`` (default identity)."""
+        return Loop(axis=axis_fn(self.axis), body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body))
 
     def pretty(self, indent: str = "") -> list[str]:
         kind = "reduce" if self.is_reduce else "free"
@@ -715,12 +739,14 @@ class StridedLoop(Stmt):
         """A strided loop is a reduce-loop iff its immediate body contains an ``Accum``."""
         return any(isinstance(s, Accum) for s in self.body)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         return StridedLoop(
-            axis=self.axis,
+            axis=axis_fn(self.axis),
             start=sigma.apply(self.start),
             step=sigma.apply(self.step) if isinstance(self.step, Expr) else self.step,
-            body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
+            body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body),
         )
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -785,11 +811,13 @@ class Cond(Stmt):
     def nested(self) -> tuple[tuple[Stmt, ...], ...]:
         return (self.body, self.else_body)
 
-    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
         return Cond(
             cond=sigma.apply(self.cond),
-            body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
-            else_body=tuple(s.rewrite(rename_ssa, sigma) for s in self.else_body),
+            body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body),
+            else_body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.else_body),
         )
 
     def pretty(self, indent: str = "") -> list[str]:
