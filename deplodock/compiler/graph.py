@@ -201,8 +201,21 @@ class Graph:
         *,
         node_id: str | None = None,
     ) -> str:
-        """Add a node to the graph. Returns the node id."""
-        nid = node_id or self._next_id()
+        """Add a node to the graph. Returns the node id.
+
+        When ``node_id`` is omitted, defaults to ``output.name`` if that
+        name is non-empty and not already taken; otherwise falls back to
+        an auto-generated ``n<i>`` id. This keeps semantic names visible
+        in kernel buf refs (Load.input / Write.output) without forcing
+        every caller to repeat ``node_id=name``.
+        """
+        if node_id is None:
+            if output.name and output.name not in self.nodes:
+                nid = output.name
+            else:
+                nid = self._next_id()
+        else:
+            nid = node_id
         if nid in self.nodes:
             raise ValueError(f"Node id {nid!r} already exists")
         for inp in inputs:
@@ -227,6 +240,39 @@ class Graph:
         self.outputs = [o for o in self.outputs if o != node_id]
         del self.nodes[node_id]
         self._users.pop(node_id, None)
+
+    def rename_node(self, old_id: str, new_id: str) -> None:
+        """Change a node's id in place, updating every reference.
+
+        Updates ``self.nodes`` keying, ``self.inputs`` / ``self.outputs``
+        membership, the ``_users`` index, every consumer's ``node.inputs``
+        list, and every consumer LoopOp's internal buf refs
+        (``Load.source`` / ``Write.output`` track the same identity as
+        graph node ids).
+        """
+        if old_id == new_id:
+            return
+        if old_id not in self.nodes:
+            raise KeyError(f"Node {old_id!r} not found")
+        if new_id in self.nodes:
+            raise ValueError(f"Node id {new_id!r} already exists")
+        node = self.nodes.pop(old_id)
+        node.id = new_id
+        self.nodes[new_id] = node
+        consumers = self._users.pop(old_id, set())
+        self._users[new_id] = consumers
+        for consumer_id in consumers:
+            consumer = self.nodes[consumer_id]
+            consumer.inputs = [new_id if i == old_id else i for i in consumer.inputs]
+            consumer.op = _rename_buf_in_op(consumer.op, old_id, new_id)
+        for inp in node.inputs:
+            users = self._users.get(inp)
+            if users is not None and old_id in users:
+                users.discard(old_id)
+                users.add(new_id)
+        self.inputs = [new_id if i == old_id else i for i in self.inputs]
+        self.outputs = [new_id if o == old_id else o for o in self.outputs]
+        node.op = _rename_buf_in_op(node.op, old_id, new_id)
 
     def replace_node(self, old_id: str, new_id: str) -> None:
         """Rewire all references from old_id to new_id.
