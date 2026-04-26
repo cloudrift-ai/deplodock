@@ -1,7 +1,7 @@
 """CudaOp — graph-level wrapper around a rendered CUDA kernel.
 
-Produced by ``passes/lowering/cuda`` by rendering each ``TileOp`` body to
-a ``__global__`` source string. The final graph before codegen is
+Produced by ``passes/lowering/cuda`` by rendering each ``KernelOp`` body
+to a ``__global__`` source string. The final graph before codegen is
 ``Graph[CudaOp + InputOp + ConstantOp]``; the CUDA backend walks it in
 topological order, emits one ``kernel_name<<<grid, block>>>(args)``
 launch per node, and wires buffer pointers by node id.

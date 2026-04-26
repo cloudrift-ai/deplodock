@@ -9,7 +9,7 @@ machinery: ``Tile`` (thread/block coord bindings), ``Smem``
 
 Pipeline shape::
 
-    Tile IR ──materialize_block──▶ Kernel IR
+    Tile IR ──materialize_tile──▶ Kernel IR
                     ──render_kernelop──▶ CUDA source
 
 **Leaf compute reuses Loop IR directly**. ``Load`` / ``Assign`` /

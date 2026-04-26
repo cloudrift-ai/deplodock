@@ -10,7 +10,7 @@ Pipeline shape::
 
     Loop IR ──lower_naive──▶ Tile IR (logical compute, default bindings)
                      ──[strategy passes]──▶ Tile IR (annotated)
-                     ──materialize_block──▶ Kernel IR
+                     ──materialize_tile──▶ Kernel IR
                      ──render_kernelop──▶ CUDA source
 
 **Leaf compute reuses Loop IR.** ``Load`` / ``Assign`` / ``Select`` /

@@ -14,12 +14,12 @@ and consumes the ``BIND_THREAD`` output axes for the launch geometry.
 Default tile sizes ``BM = BN = BK = 16`` give exactly one output per
 thread (``BM·BN == BLOCK_SIZE = 256``); no per-thread sub-tiling
 needed. Larger tiles (typical SGEMM) require a thread-tile extension
-to ``materialize_block``.
+to ``materialize_tile``.
 
 Pre-rewrite (post ``lower_naive`` of fused matmul ``C = A @ B``)::
 
-    Tile(thread_axes=(m, n)):
-      BoundLoop(k, SERIAL):
+    Tile(axes=(m THREAD, n THREAD)):
+      Loop(k):
         a = Load("A", (m, k))
         b = Load("B", (k, n))
         t = Assign(a * b)
@@ -28,11 +28,11 @@ Pre-rewrite (post ``lower_naive`` of fused matmul ``C = A @ B``)::
 
 Post-rewrite::
 
-    Tile(axes=(m_o BLOCK, n_o BLOCK, m_i BLOCK_STRIDED, n_i BLOCK_STRIDED)):
-      BoundLoop(m_i, BLOCK_STRIDED):
-        BoundLoop(n_i, BLOCK_STRIDED):
-          BoundLoop(k_o, SERIAL):
-            BoundLoop(k_i, SERIAL):
+    Tile(axes=(m_o BLOCK, n_o BLOCK, m_i THREAD, n_i THREAD)):
+      Loop(m_i):
+        Loop(n_i):
+          Loop(k_o):
+            Loop(k_i):
               a = Load("A", (m_o*BM + m_i, k_o*BK + k_i))
               b = Load("B", (k_o*BK + k_i, n_o*BN + n_i))
               t = Assign(a * b)
@@ -45,9 +45,9 @@ Trigger conditions:
 
 - ``TileOp.body`` contains exactly one ``Tile``.
 - ``Tile.thread_axes`` is exactly 2D, ``block_axes`` is empty (idempotence).
-- ``Tile.body`` is the canonical fused-matmul shape: one reduce
-  ``BoundLoop`` (Load · Load · Assign-mul · Accum-add, with two distinct
-  source bufs) followed by a ``Write`` over the two output axes.
+- ``Tile.body`` is the canonical fused-matmul shape: one reduce ``Loop``
+  (Load · Load · Assign-mul · Accum-add, with two distinct source bufs)
+  followed by a ``Write`` over the two output axes.
 - M, N, K extents are each divisible by the configured tile size.
 """
 
@@ -71,7 +71,7 @@ PATTERN = [Pattern("root", TileOp)]
 # Default tile sizes. ``BM·BN == BLOCK_SIZE`` (16·16 = 256) is the
 # "one output per thread" first cut — no per-thread output sub-tiling
 # needed. Larger tiles (the real-SGEMM choice) need a thread-tile
-# extension to materialize_block.
+# extension to materialize_tile.
 BM = 16
 BN = 16
 BK = 16
