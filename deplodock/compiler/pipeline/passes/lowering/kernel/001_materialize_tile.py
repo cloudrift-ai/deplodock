@@ -300,17 +300,14 @@ def _is_reduce(loop) -> bool:
 def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
     """Expand a ``Stage`` Stmt into ``Smem`` decl + cooperative load + sync.
 
-    The strategy that emits the Stage is responsible for rewriting
-    body Loads of ``stage.buf`` to target ``stage.name`` with
-    cache-local indices — materialization just emits the smem buffer
-    and the cooperative load that fills it.
+    The cooperative load reads a contiguous slab of ``stage.buf``
+    starting at ``stage.origin`` (block-uniform) and spanning
+    ``stage.axes`` extents. Each thread fetches one or more elements
+    via a flat-decode StridedLoop driven by ``tid_expr``.
 
-    Single-axis stage emits a direct ``StridedLoop(cache_axis,
-    start=tid_expr, step=BLOCK_SIZE)``. Multi-axis stage flattens the
-    cache axes into one synthetic linear axis of extent
-    ``prod(extents)``; each thread owns every BLOCK_SIZE-th flat
-    position, decoded back into per-axis coords for source Load and
-    smem Write indices.
+    For each source-buffer dim ``d``, the global address is
+    ``stage.origin[d]`` plus the decoded slab coord at ``d`` (if any
+    slab axis maps to that dim via ``slab_dims``).
 
     Emits a leading ``Sync`` so iterations 2+ of an enclosing serial
     loop (typical chunked-K matmul) wait for the prior iteration's
@@ -324,12 +321,14 @@ def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
 
     if len(stage.axes) == 1:
         cache_axis = stage.axes[0]
+        slab_dim = stage.slab_dims[0]
+        source_index = _build_source_index(stage.origin, {slab_dim: Var(cache_axis.name)})
         cooperative_load = StridedLoop(
             axis=cache_axis,
             start=tid_expr,
             step=BLOCK_SIZE,
             body=(
-                Load(name=load_name, input=stage.buf, index=stage.index),
+                Load(name=load_name, input=stage.buf, index=source_index),
                 Write(output=stage.name, index=(Var(cache_axis.name),), value=load_name),
             ),
         )
@@ -341,7 +340,8 @@ def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
     flat_name = f"{stage.name}_flat"
     flat_axis = Axis(name=flat_name, extent=total)
     decode_sigma = _flat_decode_sigma(stage.axes, flat_name)
-    source_index = tuple(decode_sigma.apply(e) for e in stage.index)
+    decoded_per_dim = {dim: decode_sigma.apply(Var(ax.name)) for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
+    source_index = _build_source_index(stage.origin, decoded_per_dim)
     smem_index = tuple(decode_sigma.apply(Var(ax.name)) for ax in stage.axes)
     cooperative_load = StridedLoop(
         axis=flat_axis,
@@ -353,6 +353,13 @@ def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
         ),
     )
     return [Sync(), smem, cooperative_load, Sync()]
+
+
+def _build_source_index(origin: tuple, decoded_per_dim: dict) -> tuple:
+    """Source-buffer global index per dim: ``origin[d]`` plus the
+    decoded slab coord at ``d`` (if any). Dims with no slab axis stay
+    at the block-uniform origin."""
+    return tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(origin))
 
 
 def _flat_decode_sigma(cache_axes: tuple[Axis, ...], flat_name: str) -> Sigma:
