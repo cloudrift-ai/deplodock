@@ -11,7 +11,6 @@ an SSA program over a named iteration space:
     input_bufs        : computed property  — distinct Load.source names (in first-use order)
     num_inputs        : computed property  — len(input_bufs)
     analyze()         : LoopMeta           — precomputed name → def / scope / reduce-axis / live-axes
-    map(fn)           : LoopOp             — transform body via ``map_body`` and rewrap
     __iter__          : Iterator[Stmt]     — pre-order walk (via ``iter_body``)
 
 Iteration is explicit via ``Loop(axis, body)`` statements. Each ``Loop``
@@ -34,7 +33,7 @@ Free-function companions (used by passes that work on raw
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
@@ -42,7 +41,6 @@ from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import free_vars
 from deplodock.compiler.ir.expr import render as render_expr
-from deplodock.compiler.ir.sigma import Sigma  # noqa: F401  (re-exported via __init__)
 from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Accum,
     Assign,
@@ -264,16 +262,6 @@ class LoopOp(Op):
             writes=tuple(writes),
             live_axes=_compute_live_axes(defs, scopes, reduce_axes),
         )
-
-    def map(self, fn: Callable[[Stmt], Stmt | None]) -> LoopOp:
-        """Transform the body through ``map_body(self.body, fn)`` and wrap
-        the result in a new ``LoopOp`` (which re-runs normalize + validate).
-
-        Convenience for callers that already have a ``LoopOp`` in hand.
-        Most internal passes work on raw ``tuple[Stmt, ...]`` bodies and
-        use ``map_body`` directly.
-        """
-        return LoopOp(body=map_body(self.body, fn))
 
     def __iter__(self) -> Iterator[Stmt]:
         """Yield every ``Stmt`` in this op's body in pre-order (same as

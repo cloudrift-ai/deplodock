@@ -67,22 +67,6 @@ class _ExprOps:
         """Less-than (``<``)."""
         return BinaryExpr("<", self, _coerce(other))
 
-    def ge(self, other: Expr) -> BinaryExpr:
-        """Greater-or-equal (``>=``)."""
-        return BinaryExpr(">=", self, _coerce(other))
-
-    def eq(self, other: Expr) -> BinaryExpr:
-        """Equal (``==``)."""
-        return BinaryExpr("==", self, _coerce(other))
-
-    def and_(self, other: Expr) -> BinaryExpr:
-        """Logical AND (``&&``)."""
-        return BinaryExpr("&&", self, _coerce(other))
-
-    def or_(self, other: Expr) -> BinaryExpr:
-        """Logical OR (``||``)."""
-        return BinaryExpr("||", self, _coerce(other))
-
 
 def _coerce(v: Expr | int | float) -> Expr:
     """Coerce Python int/float to Literal for operator overloading."""

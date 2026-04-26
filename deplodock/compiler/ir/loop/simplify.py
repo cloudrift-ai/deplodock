@@ -96,10 +96,6 @@ class Context:
 # ---------------------------------------------------------------------------
 
 
-def _is_literal(e: object) -> bool:
-    return isinstance(e, Literal)
-
-
 def _is_zero(e: object) -> bool:
     return isinstance(e, Literal) and e.value == 0
 

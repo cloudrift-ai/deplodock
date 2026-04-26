@@ -134,11 +134,11 @@ track integer ranges from axis extents.
 
 Also used by `ir/kernel/normalize.py` for GpuKernel Expr simplification.
 
-### `loop/splicer.py` + `loop/sigma.py` — LoopOp merger
+### `loop/splicer.py` — LoopOp merger
 
 The machinery `pipeline/passes/loop/fusion/001_merge_loop_ops.py` calls to
-splice adjacent `LoopOp` pairs. Sigma is axis-substitution bookkeeping
-threaded through the merge.
+splice adjacent `LoopOp` pairs. `Sigma` (from `ir/sigma.py`) is the
+axis-substitution bookkeeping threaded through the merge.
 
 ### `loop/interpret.py` — numpy interpreter
 

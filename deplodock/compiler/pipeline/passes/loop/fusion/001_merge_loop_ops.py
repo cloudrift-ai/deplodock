@@ -88,10 +88,6 @@ def _total_reads(loop_op: LoopOp) -> int:
     return sum(cost for stmt, cost in _walk_leaf_costs(loop_op) if isinstance(stmt, Load)) or 1
 
 
-def _has_reduce(loop_op: LoopOp) -> bool:
-    return bool(loop_op.reduce_axis_names)
-
-
 # Producers with more than a handful of ops per output element are "reduce-heavy":
 # their output at position p requires non-trivial compute (typically a reduce whose
 # body depends on p). Duplicating such a producer's body (multi-load fusion) then

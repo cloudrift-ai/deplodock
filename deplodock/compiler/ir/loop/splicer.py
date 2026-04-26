@@ -64,7 +64,7 @@ from deplodock.compiler.ir.loop.ir import (
     Stmt,
     Write,
 )
-from deplodock.compiler.ir.loop.sigma import Sigma
+from deplodock.compiler.ir.sigma import Sigma
 
 
 class _NotSupported(Exception):
