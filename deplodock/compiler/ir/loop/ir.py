@@ -237,7 +237,7 @@ class LoopOp(Op):
             scopes=scopes,
             reduce_axes=reduce_axes,
             writes=tuple(writes),
-            live_axes=_compute_live_axes(defs, scopes, reduce_axes),
+            live_axes=_compute_live_axes(defs, reduce_axes),
         )
 
     def __iter__(self) -> Iterator[Stmt]:
@@ -334,7 +334,6 @@ class LoopMeta:
 
 def _compute_live_axes(
     defs: dict[str, Stmt],
-    scopes: dict[str, Scope],  # noqa: ARG001 — kept for signature symmetry with analyze()
     reduce_axes: dict[str, Axis],
 ) -> dict[str, frozenset[str]]:
     """Axes reachable through Expr subtrees rooted at each SSA name.

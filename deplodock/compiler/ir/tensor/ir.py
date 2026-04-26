@@ -20,8 +20,7 @@ tree-splicer in ``ir/loop/splicer.py``.
 
 Op metadata (arity / commutative / reducer identity) lives on
 ``ir.expr.ElementwiseImpl`` — the single source of truth shared across
-elementwise, reduce, scan, and accumulator use sites. The old
-``OpInfo`` / ``ReduceInfo`` registries are gone; read straight from
+elementwise, reduce, scan, and accumulator use sites; read straight from
 ``op.op.arity`` / ``op.op.identity`` etc.
 """
 
