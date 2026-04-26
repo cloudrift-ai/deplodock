@@ -48,7 +48,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Load, StridedLoop, iter_body
+from deplodock.compiler.ir.stmt import Cond, Load, Loop, Stmt, StridedLoop, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
@@ -87,7 +87,13 @@ def _maybe_stage(body: tuple) -> tuple | None:
     if not stages:
         return None
 
-    new_tile = Tile(axes=tile.axes, body=tuple([*stages, *tile.body]))
+    # Rewrite body Loads of staged buffers to target the staged name
+    # with cache-local indices. ``cache_positions[buf]`` lists the
+    # positions in the original load index that hold cache-axis Vars.
+    redirects = {st.buf: (st.name, _cache_positions(st)) for st in stages}
+    rewritten_body = tuple(_rewrite_loads(s, redirects) for s in tile.body)
+
+    new_tile = Tile(axes=tile.axes, body=tuple([*stages, *rewritten_body]))
     return body[:idx] + (new_tile,) + body[idx + 1 :]
 
 
@@ -121,6 +127,40 @@ def _collect_stages(tile: Tile) -> list[Stage]:
         if cache_elems * DTYPE_BYTES > STAGE_BYTES_LIMIT:
             continue
 
-        stages.append(Stage(buf=buf, index=ref.index, axes=tuple(cache_axes)))
+        stages.append(Stage(name=f"{buf}_stage", buf=buf, index=ref.index, axes=tuple(cache_axes)))
 
     return stages
+
+
+def _cache_positions(stage: Stage) -> tuple[int, ...]:
+    """Positions in ``stage.index`` whose Var name is a cache axis."""
+    cache_names = {ax.name for ax in stage.axes}
+    return tuple(i for i, e in enumerate(stage.index) if isinstance(e, Var) and e.name in cache_names)
+
+
+def _rewrite_loads(stmt: Stmt, redirects: dict) -> Stmt:
+    """Recursively rewrite ``Load(buf, ...)`` to ``Load(stage_name,
+    cache-local index)`` for every staged buf. The cache-local index is
+    the load's index restricted to the cache positions — at each Load
+    site this picks up the loop's own iteration Var (which may be
+    named differently than the Stage's reference Var, e.g. softmax has
+    ``a1`` in the reduce loop and ``a2`` in the output loop)."""
+    if isinstance(stmt, Load) and stmt.input in redirects:
+        stage_name, positions = redirects[stmt.input]
+        return Load(name=stmt.name, input=stage_name, index=tuple(stmt.index[i] for i in positions))
+    if isinstance(stmt, Loop):
+        return Loop(axis=stmt.axis, body=tuple(_rewrite_loads(c, redirects) for c in stmt.body))
+    if isinstance(stmt, StridedLoop):
+        return StridedLoop(
+            axis=stmt.axis,
+            start=stmt.start,
+            step=stmt.step,
+            body=tuple(_rewrite_loads(c, redirects) for c in stmt.body),
+        )
+    if isinstance(stmt, Cond):
+        return Cond(
+            cond=stmt.cond,
+            body=tuple(_rewrite_loads(c, redirects) for c in stmt.body),
+            else_body=tuple(_rewrite_loads(c, redirects) for c in stmt.else_body),
+        )
+    return stmt
