@@ -269,6 +269,14 @@ class TileOp(Op):
 
 from deplodock.compiler.ir.stmt import iter_body  # noqa: E402, F401
 
+# Cooperative thread-block size — number of threads per CUDA block when a
+# Tile uses BIND_THREAD axes from a cooperative strategy. Lives at this
+# layer because cooperative strategies (cooperative-reduce, blockify)
+# already commit to "this many threads cooperate" when they choose axis
+# binds and tile sizes; materialization just consumes the choice.
+BLOCK_SIZE = 256
+
+
 __all__ = [
     # Shared expressions (re-exported for convenience)
     "Var",
@@ -302,6 +310,8 @@ __all__ = [
     "Stmt",
     # Top-level
     "TileOp",
+    # Scheduling constants
+    "BLOCK_SIZE",
     # Re-exports
     "Axis",
     "ElementwiseImpl",

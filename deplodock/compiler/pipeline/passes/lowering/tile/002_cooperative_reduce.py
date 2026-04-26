@@ -39,9 +39,10 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.stmt import Accum
 from deplodock.compiler.ir.tile.ir import (
+    BLOCK_SIZE,
     BoundLoop,
     Combine,
     Stmt,
@@ -115,8 +116,12 @@ def _rewrite_block(blk: Tile) -> Tile | None:
             new_body.append(s)
 
     # Original output axes flip to BIND_BLOCK; cooperatively-walked axes
-    # appended as BIND_BLOCK_STRIDED.
+    # appended as BIND_BLOCK_STRIDED; synthesize the cooperative thread
+    # axis ``t`` (BLOCK_SIZE threads) up front so materialization sees it
+    # in Tile.axes — no synthesis at materialization time.
+    t_axis = BoundAxis(axis=Axis("t", BLOCK_SIZE), bind=BIND_THREAD)
     new_axes = (
+        t_axis,
         *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes),
         *strided_output_axes,
     )

@@ -56,8 +56,8 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import (
     BIND_BLOCK,
-    BIND_BLOCK_STRIDED,
     BIND_SERIAL,
+    BIND_THREAD,
     BoundAxis,
     split_axis,
 )
@@ -149,36 +149,30 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     stage_a = Stage(buf=load_a.input, index=new_load_a.index, axes=_cache_axes_for(new_load_a, inner_split))
     stage_b = Stage(buf=load_b.input, index=new_load_b.index, axes=_cache_axes_for(new_load_b, inner_split))
 
+    # m_i / n_i are bound directly as Enclosure THREAD axes (their
+    # extents·product equals BLOCK_SIZE — one output per thread). No
+    # wrapping BoundLoops over them in the body — the thread decode at
+    # render time provides Var(m_i) / Var(n_i) for the inner compute.
     new_body: tuple[Stmt, ...] = (
         BoundLoop(
-            axis=BoundAxis(axis=m_i, bind=BIND_BLOCK_STRIDED),
+            axis=BoundAxis(axis=k_o, bind=BIND_SERIAL),
             body=(
+                stage_a,
+                stage_b,
                 BoundLoop(
-                    axis=BoundAxis(axis=n_i, bind=BIND_BLOCK_STRIDED),
-                    body=(
-                        BoundLoop(
-                            axis=BoundAxis(axis=k_o, bind=BIND_SERIAL),
-                            body=(
-                                stage_a,
-                                stage_b,
-                                BoundLoop(
-                                    axis=BoundAxis(axis=k_i, bind=BIND_SERIAL),
-                                    body=inner_compute,
-                                ),
-                            ),
-                        ),
-                        write.rewrite(_id, sigma),
-                    ),
+                    axis=BoundAxis(axis=k_i, bind=BIND_SERIAL),
+                    body=inner_compute,
                 ),
             ),
         ),
+        write.rewrite(_id, sigma),
     )
 
     new_axes = (
+        BoundAxis(axis=m_i, bind=BIND_THREAD),
+        BoundAxis(axis=n_i, bind=BIND_THREAD),
         BoundAxis(axis=m_o, bind=BIND_BLOCK),
         BoundAxis(axis=n_o, bind=BIND_BLOCK),
-        BoundAxis(axis=m_i, bind=BIND_BLOCK_STRIDED),
-        BoundAxis(axis=n_i, bind=BIND_BLOCK_STRIDED),
     )
     return Tile(axes=new_axes, body=new_body)
 
