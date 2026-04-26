@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, substitute
+from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import IndexMapOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
@@ -52,7 +52,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
             input_names.append(src_id)
             name = f"in{i}"
             body.append(Load(name=name, input=src_id, index=idx))
-            select_expr = substitute(src.select, mapping) if src.select is not None else Literal(1, "int")
+            select_expr = src.select.substitute(mapping) if src.select is not None else Literal(1, "int")
             branches.append(SelectBranch(value=name, select=select_expr))
         body.append(Select(name="v", branches=tuple(branches)))
         body.append(Write(output=out_buf, index=write_index, value="v"))
@@ -86,5 +86,5 @@ def _substituted_index(coord_map: tuple, mapping: dict, src_shape: tuple) -> tup
         if i < len(src_shape) and isinstance(src_shape[i], int) and src_shape[i] == 1:
             out.append(Literal(0, "int"))
         else:
-            out.append(substitute(c, mapping))
+            out.append(c.substitute(mapping))
     return tuple(out)

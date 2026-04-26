@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Expr, Literal, free_vars
+from deplodock.compiler.ir.expr import Expr, Literal
 from deplodock.compiler.ir.sigma import Sigma
 
 INDENT = "    "
@@ -470,7 +470,7 @@ class Cond(Stmt):
     else_body: tuple[Stmt, ...] = ()
 
     def deps(self) -> tuple[str, ...]:
-        return tuple(free_vars(self.cond))
+        return tuple(self.cond.free_vars())
 
     def nested(self) -> tuple[tuple[Stmt, ...], ...]:
         return (self.body, self.else_body)

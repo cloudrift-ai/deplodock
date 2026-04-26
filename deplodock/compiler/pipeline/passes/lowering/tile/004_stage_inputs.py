@@ -31,7 +31,7 @@ from collections.abc import Iterable
 
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
-from deplodock.compiler.ir.expr import Literal, Var, free_vars
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Load, Loop, Stmt, StridedLoop
 from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
@@ -174,7 +174,7 @@ def _stage_plan(
         seen: set[str] = set()
         per_dim_count: dict[int, int] = {}
         for dim, e in enumerate(ref_load.index):
-            for ax_name in free_vars(e):
+            for ax_name in e.free_vars():
                 if ax_name in cache_axes_names and ax_name not in seen:
                     seen.add(ax_name)
                     ax = thread_axes_by_name.get(ax_name) or below_axes_by_name[ax_name]
@@ -226,7 +226,7 @@ def _common_loop_prefix(paths: list[tuple]) -> tuple:
 def _index_free_vars(index: tuple) -> set[str]:
     out: set[str] = set()
     for e in index:
-        out |= free_vars(e)
+        out |= e.free_vars()
     return out
 
 
@@ -295,12 +295,12 @@ def _smem_coord_for_axis(stage_axis: Axis, slab_dim: int, stage: Stage, load_ind
     - **Affine** (load index is ``outer*F + cache``): strip the
       block-uniform origin to leave the cache-local coord."""
     load_e = load_index[slab_dim]
-    free = free_vars(load_e)
+    free = load_e.free_vars()
     if stage_axis.name in free:
         return Var(stage_axis.name)
     if isinstance(load_e, Var):
         return load_e
     origin_at_dim = stage.origin[slab_dim]
-    non_cache = free - {stage_axis.name} - free_vars(origin_at_dim)
+    non_cache = free - {stage_axis.name} - origin_at_dim.free_vars()
     sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
     return sigma.apply(load_e)

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.expr import Expr, substitute
+from deplodock.compiler.ir.expr import Expr
 
 
 @dataclass(frozen=True, eq=False)
@@ -38,7 +38,7 @@ class Sigma:
         object.__setattr__(self, "_key", key)
 
     def apply(self, e: Expr) -> Expr:
-        return substitute(e, self.mapping)
+        return e.substitute(self.mapping)
 
     def extend(self, name: str, expr: Expr) -> Sigma:
         return Sigma({**self.mapping, name: expr})

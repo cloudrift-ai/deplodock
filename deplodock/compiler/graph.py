@@ -538,7 +538,7 @@ def _fmt_indexmap(node: Node, graph: Graph) -> str:
     visually distinct from scalar slices. Everything else (multi-source,
     selected reads, many dims) falls back to ``indexmap(src0, src1, ...)``.
     """
-    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, substitute
+    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var
 
     op = node.op
     sources = op.sources
@@ -561,5 +561,5 @@ def _fmt_indexmap(node: Node, graph: Graph) -> str:
         if isinstance(e, Literal) and e.value == 0 and dim < len(input_shape) and input_shape[dim] == 1:
             coord_strs.append("na")
         else:
-            coord_strs.append(substitute(e, placeholder_rename).pretty())
+            coord_strs.append(e.substitute(placeholder_rename).pretty())
     return f"{input_name}[{', '.join(coord_strs)}]"
