@@ -224,7 +224,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         merged,
         merged_inputs,
         Tensor(
-            new_node_id,
+            consumer_node.output.name,
             consumer_node.output.shape,
             consumer_node.output.dtype,
         ),
