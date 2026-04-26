@@ -40,7 +40,6 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import free_vars
-from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Accum,
     Assign,
@@ -53,6 +52,7 @@ from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init_
     Write,
     iter_body,
     map_body,
+    pretty_body,
 )
 
 # ---------------------------------------------------------------------------
@@ -100,45 +100,8 @@ class LoopOp(Op):
     body: tuple[Stmt, ...] = ()
 
     def pretty_body(self, indent: str = "") -> str:
-        """Render as an explicit nested-loop program.
-
-        Each ``Loop`` block renders as ``for X in 0..N:  # kind``. Body Loads
-        render their ``source`` name directly (a string identifying the source
-        buffer).
-        """
-        lines: list[str] = []
-
-        def render(stmts: tuple[Stmt, ...], ind: str) -> None:
-            for stmt in stmts:
-                if isinstance(stmt, Assign):
-                    args = ", ".join(stmt.args)
-                    lines.append(f"{ind}{stmt.name} = {stmt.op.name}({args})")
-                elif isinstance(stmt, Load):
-                    idx = ", ".join(render_expr(e) for e in stmt.index)
-                    lines.append(f"{ind}{stmt.name} = load {stmt.input}[{idx}]")
-                elif isinstance(stmt, Accum):
-                    lines.append(f"{ind}{stmt.name} <- {stmt.op.name}({stmt.name}, {stmt.value})")
-                elif isinstance(stmt, Write):
-                    idx = ", ".join(render_expr(e) for e in stmt.index)
-                    lines.append(f"{ind}{stmt.output}[{idx}] = {stmt.value}")
-                elif isinstance(stmt, Select):
-                    for bi, br in enumerate(stmt.branches):
-                        prefix = f"{stmt.name} =" if bi == 0 else f"{' ' * len(stmt.name)}  "
-                        lines.append(f"{ind}{prefix} {br.value} when ({render_expr(br.select)})")
-                elif isinstance(stmt, Loop):
-                    a = stmt.axis
-                    kind = "reduce" if stmt.is_reduce else "free"
-                    lines.append(f"{ind}for {a.name} in 0..{a.extent}:  # {kind}")
-                    render(stmt.body, ind + "    ")
-                elif isinstance(stmt, Cond):
-                    lines.append(f"{ind}if ({render_expr(stmt.cond)}):")
-                    render(stmt.body, ind + "    ")
-                    if stmt.else_body:
-                        lines.append(f"{ind}else:")
-                        render(stmt.else_body, ind + "    ")
-
-        render(self.body, indent)
-        return "\n".join(lines)
+        """Render as an explicit nested-loop program via per-stmt ``pretty``."""
+        return "\n".join(pretty_body(self.body, indent))
 
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.loop.normalize import normalize_body

@@ -114,7 +114,9 @@ iteration axes. Free vs reduce is inferred from body structure — a
 
 Body walkers: `iter_body(body)` (pre-order; powers `for s in loop_op`),
 `map_body(body, fn)` (transformer), `Stmt.rewrite(rename_ssa, sigma)`
-(per-stmt copy with SSA rename + Expr substitution).
+(per-stmt copy with SSA rename + Expr substitution),
+`Stmt.pretty(indent)` (rendered lines for kernel dumps; block stmts
+recurse via `pretty_body`).
 
 ### `loop/normalize.py` — structural canonicalization
 
