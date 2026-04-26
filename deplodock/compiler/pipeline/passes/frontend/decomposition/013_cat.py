@@ -9,11 +9,12 @@ into the source selects and the second source's coord_map offset.
 """
 
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import CatOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 
 PATTERN = [Pattern("root", CatOp)]
 
@@ -40,17 +41,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         return None
     split = a_shape[norm_dim]
 
-    frag = Graph()
-
-    # InputOp sentinels for tensor inputs (constant dim input is baked into
-    # the coord_map; the rewriter's _remove_orphans handles cleanup).
-    for eid in sorted({a_id, b_id}):
-        frag.add_node(
-            op=InputOp(),
-            inputs=[],
-            output=Tensor(graph.nodes[eid].output.name, graph.nodes[eid].output.shape, graph.nodes[eid].output.dtype),
-            node_id=eid,
-        )
+    frag = open_fragment(graph, [a_id, b_id])
 
     # Source A: identity coord_map, select = (out_coord_dim < split)
     src_a = IndexSource(
