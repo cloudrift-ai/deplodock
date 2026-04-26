@@ -1,14 +1,11 @@
 """Tests for cupy dispatch of a lowered ``Graph[CudaOp]``."""
 
-import pytest
-
 from deplodock.compiler.backend.cuda.program import benchmark_program, run_program
-from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 
-requires_cuda = pytest.mark.skipif(not has_cuda_gpu(), reason="CUDA GPU not available")
+from .conftest import requires_cuda
 
 EW_ADD_SOURCE = """
 extern "C" __global__ void ew_add(const float* A, const float* B, float* C) {

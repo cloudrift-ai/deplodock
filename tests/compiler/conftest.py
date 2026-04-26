@@ -4,6 +4,9 @@ Defines the ``run_graph`` parametrized fixture that runs an accuracy test
 through each backend (numpy / loop / cuda). A test that takes ``run_graph``
 automatically executes three times under different param IDs — any
 disagreement between backends makes bug attribution mechanical.
+
+Also exposes the ``has_cuda_gpu()`` predicate and the ``requires_cuda``
+skip marker shared by all CUDA-gated tests in this package.
 """
 
 from __future__ import annotations
@@ -14,9 +17,23 @@ import numpy as np
 import pytest
 
 
-def _skip_if_no_cuda() -> None:
-    from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
+def has_cuda_gpu() -> bool:
+    """Check if cupy is importable and sees at least one CUDA device."""
+    try:
+        import cupy as cp
 
+        return cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
+
+
+requires_cuda = pytest.mark.skipif(
+    not has_cuda_gpu(),
+    reason="CUDA not available (need cupy + GPU)",
+)
+
+
+def _skip_if_no_cuda() -> None:
     if not has_cuda_gpu():
         pytest.skip("CUDA not available (need cupy + GPU)")
 
