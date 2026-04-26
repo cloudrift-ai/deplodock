@@ -119,6 +119,21 @@ class CompilerDump:
         logger.debug("Dumped %s", path)
 
 
+def _canonical_node_id(nid: str) -> str:
+    """Collapse repeated ``merged_`` prefixes and a leading ``lift_`` for display.
+
+    Fusion prefixes one ``merged_`` per merge step into the same consumer
+    (``merged_merged_merged_lift_n0``); lifting prefixes ``lift_`` once.
+    Both are implementation artifacts — readers want ``merged_n0``.
+    """
+    name = nid
+    while name.startswith("merged_"):
+        name = name[len("merged_") :]
+    if name.startswith("lift_"):
+        name = name[len("lift_") :]
+    return f"merged_{name}" if nid.startswith("merged_") else name
+
+
 def format_kernels(graph: Graph) -> str:
     """Render post-lowering kernel bodies for each compute node in ``graph``.
 
@@ -129,6 +144,8 @@ def format_kernels(graph: Graph) -> str:
     ``=== N: <name> ===``.
     """
     from deplodock.compiler.ir.cuda import CudaOp
+
+    rename_map = {nid: _canonical_node_id(nid) for nid in graph.nodes if _canonical_node_id(nid) != nid}
 
     seen_cuda: set[str] = set()
     blocks: list[str] = []
@@ -147,7 +164,12 @@ def format_kernels(graph: Graph) -> str:
         elif hasattr(op, "name") and op.name:
             name = op.name
         else:
-            name = f"{nid} -> {node.output.name}"
+            name = f"{rename_map.get(nid, nid)} -> {node.output.name}"
+        # Apply the same canonicalization to the rendered body so Load/Write
+        # references to peer nodes use clean names too. Replace longest names
+        # first to avoid prefix-eating ``merged_lift_n0`` before ``merged_merged_lift_n0``.
+        for old in sorted(rename_map, key=len, reverse=True):
+            body = body.replace(old, rename_map[old])
         blocks.append(f"=== {i}: {name} ===")
         blocks.append(body)
         blocks.append("")
