@@ -34,9 +34,9 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var, free_vars
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve
-from deplodock.compiler.ir.stmt import Accum, Cond, Init, Load, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.stmt import Accum, Init, Load, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import BLOCK_SIZE, Combine, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
@@ -71,14 +71,16 @@ def _materialize(blk: Tile) -> Stmt:
     commits no axis decisions of its own. The body is walked uniformly
     whether or not the Tile is cooperative: pointwise (no BLOCK axes)
     is the degenerate case where Stage / Combine / StridedLoop don't
-    appear, Writes reference thread axes (so no Cond guard fires), and
-    no Accums exist (so no Init hoisting). The same walker handles both."""
+    appear and no Accum nesting exists. The same walker handles both.
+
+    Strategies that need single-thread Writes (e.g. cooperative scalar
+    output) wrap them in ``Cond(thread_var == 0)`` themselves —
+    materialization passes Writes through unchanged."""
     axes = blk.axes
     body = blk.body
     thread_axes = tuple(ba for ba in axes if ba.bind == BIND_THREAD)
     if not thread_axes:
         raise ValueError("Tile must have at least one BIND_THREAD axis")
-    thread_axis_names = {ba.axis.name for ba in thread_axes}
     tid_expr = _build_linear_tid(thread_axes)
 
     rename: dict[str, str] = {}
@@ -90,17 +92,13 @@ def _materialize(blk: Tile) -> Stmt:
 
     new_body: list[Stmt] = []
     pending_reduce: Accum | None = None
-    # Axes whose Var distinguishes threads at the current scope. Starts as
-    # the THREAD axes; extended by ``_emit_loop`` when descending into a
-    # StridedLoop (each thread visits distinct iterations).
-    distinguishing = set(thread_axis_names)
 
     for stmt in body:
         if isinstance(stmt, Stage):
             new_body.extend(_emit_stage(stmt, tid_expr))
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
-            new_body.append(_emit_loop(stmt, tid_expr, thread_axes, distinguishing, transform))
+            new_body.append(_emit_loop(stmt, tid_expr, transform))
             if _is_reduce(stmt):
                 pending_reduce = next(a for a in stmt.body if isinstance(a, Accum))
             else:
@@ -113,8 +111,6 @@ def _materialize(blk: Tile) -> Stmt:
             new_body.extend(_emit_combine(pending_reduce, _single_thread_var(thread_axes)))
             rename[pending_reduce.name] = f"{pending_reduce.name}_b"
             pending_reduce = None
-        elif isinstance(stmt, Write):
-            new_body.append(_emit_write(stmt, distinguishing, thread_axes, transform))
         else:
             new_body.append(transform(stmt))
 
@@ -132,62 +128,22 @@ def _materialize(blk: Tile) -> Stmt:
     return Tile(axes=axes, body=tuple(new_body))
 
 
-def _emit_loop(
-    loop,
-    tid_expr,
-    thread_axes: tuple,
-    distinguishing: set,
-    transform,
-) -> Stmt:
-    """Translate a body Loop or StridedLoop. Recurses so nested staging /
-    loops / writes inside the body get the same uniform treatment.
-
-    A ``StridedLoop`` adds its axis to ``distinguishing`` for nested-scope
-    Writes — threads visit distinct iterations of the strided axis, so a
-    Write whose index references it gets distinct output positions per
-    thread (no guard needed)."""
-    inner_distinguishing = distinguishing | ({loop.axis.name} if isinstance(loop, StridedLoop) else set())
+def _emit_loop(loop, tid_expr, transform) -> Stmt:
+    """Translate a body Loop or StridedLoop. Recurses so nested staging
+    / loops / writes inside the body get the same uniform treatment.
+    The wrapper type (Loop vs StridedLoop) is preserved — strategies
+    decided the iteration shape; materialization just walks."""
     inner: list[Stmt] = []
     for s in loop.body:
         if isinstance(s, Stage):
             inner.extend(_emit_stage(s, tid_expr))
         elif isinstance(s, (Loop, StridedLoop)):
-            inner.append(_emit_loop(s, tid_expr, thread_axes, inner_distinguishing, transform))
-        elif isinstance(s, Write):
-            inner.append(_emit_write(s, inner_distinguishing, thread_axes, transform))
+            inner.append(_emit_loop(s, tid_expr, transform))
         else:
             inner.append(transform(s))
     if isinstance(loop, StridedLoop):
         return StridedLoop(axis=loop.axis, start=loop.start, step=loop.step, body=tuple(inner))
     return Loop(axis=loop.axis, body=tuple(inner))
-
-
-def _emit_write(
-    write: Write,
-    distinguishing: set,
-    thread_axes: tuple,
-    transform,
-) -> Stmt:
-    """Emit a Write — unconditional if the index references any
-    *distinguishing* axis (THREAD axes plus any enclosing StridedLoop
-    axes); otherwise wrapped in ``Cond(all THREAD axes == 0)`` so only
-    one thread writes a shared output slot."""
-    write = transform(write)
-    write_free = set()
-    for e in write.index:
-        write_free |= free_vars(e)
-    if distinguishing & write_free:
-        return write
-    return Cond(cond=_all_threads_zero(thread_axes), body=(write,), else_body=())
-
-
-def _all_threads_zero(thread_axes: tuple) -> BinaryExpr:
-    """Build ``t0 == 0 && t1 == 0 && ...`` over the THREAD axes."""
-    cond = None
-    for ba in thread_axes:
-        eq = BinaryExpr("==", Var(ba.axis.name), Literal(0, "int"))
-        cond = eq if cond is None else BinaryExpr("&&", cond, eq)
-    return cond  # type: ignore[return-value]
 
 
 def _single_thread_var(thread_axes: tuple) -> str:
