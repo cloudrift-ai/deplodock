@@ -10,8 +10,7 @@ CUDA-specific dispatch. Shared backend contract lives in
 ```
 cuda/
 ├── backend.py   # CudaBackend(Backend) — drives lowering + delegates dispatch
-├── program.py   # Graph[CudaOp] → cupy.RawKernel dispatch + per-kernel event timing
-└── runtime.py   # has_cuda_gpu() predicate (cupy-based)
+└── program.py   # Graph[CudaOp] → cupy.RawKernel dispatch + per-kernel event timing
 ```
 
 ## Compile
@@ -52,12 +51,6 @@ global pair for `BenchmarkResult.time_ms`, one pair per launch index
 
 `run_program_debug(...)` snapshots every non-input buffer after each
 launch — consumed by `--dump-dir` runs.
-
-## GPU detection (`runtime.py`)
-
-`has_cuda_gpu()` returns `True` iff `cupy` imports and
-`cupy.cuda.runtime.getDeviceCount() > 0`. Used as a pytest skip
-predicate.
 
 ## Invariants
 

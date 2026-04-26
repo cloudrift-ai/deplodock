@@ -21,12 +21,7 @@ import numpy as np
 import pytest
 import torch
 
-from deplodock.compiler.backend.cuda.runtime import has_cuda_gpu
-
-requires_cuda = pytest.mark.skipif(
-    not has_cuda_gpu(),
-    reason="CUDA not available (need cupy + GPU)",
-)
+from .conftest import requires_cuda
 
 
 def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str = "cuda"):
