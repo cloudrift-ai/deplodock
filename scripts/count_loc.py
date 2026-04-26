@@ -152,15 +152,37 @@ def render_tree(
     return lines
 
 
+def _parse_depth(value: str) -> tuple[str, int | None]:
+    """Return ``(mode, max_depth)`` from the ``--depth`` value.
+
+    - ``"folder"`` (default): per-folder, unlimited depth.
+    - ``"file"``: per-folder + per-file leaves, unlimited depth.
+    - integer N: per-folder, capped at depth N.
+    """
+    if value == "folder":
+        return ("folder", None)
+    if value == "file":
+        return ("file", None)
+    try:
+        return ("folder", int(value))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--depth must be 'folder', 'file', or an integer (got {value!r})")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Count effective Python LOC.")
     ap.add_argument("root", type=Path)
-    ap.add_argument("--depth", type=int, default=None, help="Maximum nesting depth to display (root = 0). Default: unlimited.")
-    ap.add_argument("--files", action="store_true", help="Also list individual .py files in the tree.")
+    ap.add_argument(
+        "--depth",
+        type=_parse_depth,
+        default=("folder", None),
+        help="'folder' (default, all folder levels), 'file' (also show per-file rows), or an integer N (folder levels capped at N).",
+    )
     args = ap.parse_args()
+    mode, max_depth = args.depth
 
     tree = build_tree(args.root)
-    for line in render_tree(tree, show_files=args.files, max_depth=args.depth):
+    for line in render_tree(tree, show_files=(mode == "file"), max_depth=max_depth):
         print(line)
 
 
