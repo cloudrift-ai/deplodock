@@ -56,6 +56,6 @@ passes swap node ops in place, so there is no separate "program" type.
   lowering turns each into `KernelOp` (AST) then `CudaOp` (rendered
   source).
 - **`LoopOp.forward()` executes.** The body interpreter in
-  `ir/loop/interpret.py` lets the shared numpy walker
-  (`backend/interpret.py::interpret_graph`) run post-fusion graphs on
-  CPU — fusion correctness can be checked without a GPU.
+  `ir/loop/interpret.py` lets the default `Backend.run` topo-walk
+  (`backend/base.py`) run post-fusion graphs on CPU — fusion
+  correctness can be checked without a GPU.

@@ -151,8 +151,8 @@ axis-substitution bookkeeping threaded through the merge.
 
 `execute_loop_op(loop, input_arrays, out_shape) → ndarray` walks the
 LoopOp body against pre-provided input arrays. Powers `LoopOp.forward`
-— so post-fusion graphs run through the shared `interpret_graph` like
-any pre-fusion graph.
+— so post-fusion graphs run through the default `Backend.run`
+topo-walk like any pre-fusion graph.
 
 ### `loop/builder.py` — fluent construction
 
