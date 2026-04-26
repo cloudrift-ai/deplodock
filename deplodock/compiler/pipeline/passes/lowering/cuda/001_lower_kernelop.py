@@ -2,7 +2,7 @@
 
 Renders the ``KernelOp`` body to a ``__global__`` CUDA source string
 and mutates the node's op payload in place. Grid / block geometry is
-derived from the ``Enclosure`` in the body; ``smem_bytes`` is summed
+derived from the ``Tile`` in the body; ``smem_bytes`` is summed
 over ``Smem`` decls. ``arg_order`` is ``kernel_op.inputs +
 kernel_op.outputs`` — matches the kernel signature emitted by
 ``render_kernelop``.
@@ -14,7 +14,7 @@ from math import prod
 
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.cuda import CudaOp
-from deplodock.compiler.ir.kernel import Enclosure, KernelOp, Smem
+from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
 from deplodock.compiler.ir.kernel.render import render_kernelop
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
@@ -52,9 +52,9 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
 
 def _launch_geometry(kernel_op: KernelOp) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """Pick (grid, block) from the first ``Enclosure`` in the body."""
+    """Pick (grid, block) from the first ``Tile`` in the body."""
     for s in kernel_op.body:
-        if isinstance(s, Enclosure):
+        if isinstance(s, Tile):
             if s.block_axes:
                 grid_total = max(prod(int(a.extent) for a in s.block_axes), 1)
                 block_total = max(prod(int(a.extent) for a in s.thread_axes), 1)

@@ -2,7 +2,7 @@
 
 Kernel IR sits between Tile IR (schedule decisions as structural Stmts)
 and CUDA source (text). Its body contains the explicit hardware
-machinery: ``Enclosure`` (thread/block coord bindings), ``Smem``
+machinery: ``Tile`` (thread/block coord bindings), ``Smem``
 (``__shared__`` arrays), ``Sync`` (``__syncthreads`` barriers),
 ``TreeHalve`` (cross-thread reduction over smem), ``StridedLoop``
 (strided per-thread loop).
@@ -49,44 +49,9 @@ from deplodock.compiler.ir.stmt import (
     SelectBranch,
     Stmt,
     StridedLoop,
+    Tile,
     Write,
 )
-
-# ---------------------------------------------------------------------------
-# Schedule wrappers
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Enclosure(Stmt):
-    """Bind enclosing axes to thread / block coords for the body.
-
-    Each ``BoundAxis`` in ``axes`` says how its axis is laid out:
-    ``BIND_THREAD`` axes are flattened into ``threadIdx.x`` (with a tid
-    bounds guard when no ``BIND_BLOCK`` axis is present); ``BIND_BLOCK``
-    axes are flattened into ``blockIdx.x/y/z``. The body executes
-    per-thread under those bindings; downstream stmts use
-    ``Var(axis.name)`` and rely on the bindings to resolve at render time.
-
-    ``thread_axes`` / ``block_axes`` are convenience properties that
-    project ``axes`` by binding kind — render and launch geometry use
-    them.
-    """
-
-    axes: tuple[BoundAxis, ...]
-    body: tuple[Stmt, ...]
-
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
-        return (self.body,)
-
-    @property
-    def thread_axes(self) -> tuple[Axis, ...]:
-        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_THREAD)
-
-    @property
-    def block_axes(self) -> tuple[Axis, ...]:
-        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
-
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -214,7 +179,7 @@ __all__ = [
     "Cond",
     "Loop",
     # Kernel-IR statements
-    "Enclosure",
+    "Tile",
     "Smem",
     "Sync",
     "TreeHalve",

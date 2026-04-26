@@ -20,7 +20,7 @@ names are strings so they're directly renderable.
 **Scheduling decisions live where they naturally belong**:
 
 - ``Tile.thread_axes`` / ``Tile.block_axes`` — same shape as
-  ``Enclosure``: which output axes are bound to thread coords vs CUDA
+  ``Tile``: which output axes are bound to thread coords vs CUDA
   block coords. Pointwise has ``thread_axes`` populated and
   ``block_axes`` empty (one thread per output element). Cooperative
   reductions have ``block_axes`` populated and ``thread_axes`` empty;
@@ -63,6 +63,7 @@ from deplodock.compiler.ir.stmt import (
     SelectBranch,
     Stmt,
     StridedLoop,
+    Tile,
     Write,
 )
 
@@ -76,44 +77,9 @@ from deplodock.compiler.ir.stmt import (
 # ``StridedLoop`` for cooperative striding).
 
 
-@dataclass
-class Tile(Stmt):
-    """Output-region wrapper — Tile-IR mirror of Kernel-IR ``Enclosure``.
-
-    Carries the same ``axes: tuple[BoundAxis, ...]`` structure as
-    ``Enclosure``: each output axis is paired with a binding
-    (``BIND_THREAD`` = one thread per axis value; ``BIND_BLOCK`` = one
-    CUDA block per axis value, threads inside cooperate).
-
-    Pre-strategy default for any reducing kernel is every output axis
-    bound to ``BIND_THREAD`` (one-thread-per-row). The cooperative-
-    reduce strategy flips axes to ``BIND_BLOCK`` to opt into
-    cooperative materialization, which will synthesize the cooperative
-    thread axis (``t``) and prepend it to the resulting
-    ``Enclosure.axes`` with binding ``BIND_THREAD``.
-
-    The body holds the logical compute (``Loop``, ``StridedLoop``,
-    ``Accum``, ``Load``, ``Assign``, ``Write``) plus any ``Combine``
-    siblings placed by strategies.
-
-    ``thread_axes`` / ``block_axes`` are convenience properties that
-    project ``axes`` by binding kind — they're what the renderer and
-    launch-geometry code consume.
-    """
-
-    axes: tuple[BoundAxis, ...]
-    body: tuple[Stmt, ...]
-
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
-        return (self.body,)
-
-    @property
-    def thread_axes(self) -> tuple[Axis, ...]:
-        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_THREAD)
-
-    @property
-    def block_axes(self) -> tuple[Axis, ...]:
-        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
+# ``Tile`` is shared infrastructure — defined in ``ir/stmt.py`` and
+# re-exported here. Used at Tile IR (with Stage / Combine in the body)
+# and at Kernel IR (with Smem / Sync / TreeHalve after materialization).
 
 
 # Tile-IR loop constructs are ``Loop`` (serial) and ``StridedLoop``
