@@ -18,48 +18,43 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     if len(root.inputs) < 2:
         return None
     x_id, w_id = root.inputs[0], root.inputs[1]
-    eps_value = root.op.eps
-
-    out_shape = root.output.shape
-    dtype = root.output.dtype
-    name = root.output.name
-
-    red_shape = reduction_shape(out_shape, -1) if out_shape else (1,)
+    out = root.output
+    red_shape = reduction_shape(out.shape, -1) if out.shape else (1,)
 
     frag = open_fragment(graph, [x_id, w_id])
 
     sq_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
         inputs=[x_id, x_id],
-        output=Tensor(f"{name}_sq", out_shape, dtype),
+        output=Tensor(f"{out.name}_sq", out.shape, out.dtype),
     )
     mean_id = frag.add_node(
         op=MeanOp(axis=-1),
         inputs=[sq_id],
-        output=Tensor(f"{name}_mean", red_shape, dtype),
+        output=Tensor(f"{out.name}_mean", red_shape, out.dtype),
     )
-    eps_bc = const_bc(frag, name=f"{name}_eps", value=eps_value, target_shape=red_shape, dtype=dtype)
+    eps_bc = const_bc(frag, name=f"{out.name}_eps", value=root.op.eps, target_shape=red_shape, dtype=out.dtype)
     add_id = frag.add_node(
         op=ElementwiseOp(op="add"),
         inputs=[mean_id, eps_bc],
-        output=Tensor(f"{name}_add_eps", red_shape, dtype),
+        output=Tensor(f"{out.name}_add_eps", red_shape, out.dtype),
     )
     rsq_id = frag.add_node(
         op=ElementwiseOp(op="rsqrt"),
         inputs=[add_id],
-        output=Tensor(f"{name}_rsq", red_shape, dtype),
+        output=Tensor(f"{out.name}_rsq", red_shape, out.dtype),
     )
-    rsq_bc = broadcast_to(frag, rsq_id, out_shape)
+    rsq_bc = broadcast_to(frag, rsq_id, out.shape)
     norm_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
         inputs=[x_id, rsq_bc],
-        output=Tensor(f"{name}_norm", out_shape, dtype),
+        output=Tensor(f"{out.name}_norm", out.shape, out.dtype),
     )
-    w_bc = broadcast_to(frag, w_id, out_shape)
+    w_bc = broadcast_to(frag, w_id, out.shape)
     out_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
         inputs=[norm_id, w_bc],
-        output=Tensor(name, out_shape, dtype),
+        output=Tensor(out.name, out.shape, out.dtype),
     )
 
     frag.outputs = [out_id]

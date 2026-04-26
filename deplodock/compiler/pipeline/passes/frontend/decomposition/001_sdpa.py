@@ -55,8 +55,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     q_shape = graph.nodes[q_id].output.shape
     k_shape = graph.nodes[k_id].output.shape
     v_shape = graph.nodes[v_id].output.shape
-    dtype = root.output.dtype
-    name = root.output.name
+    dtype, name = root.output.dtype, root.output.name
 
     head_dim = q_shape[-1] if len(q_shape) >= 2 else 64
     seq_len = q_shape[-2] if len(q_shape) >= 3 else q_shape[-1]
