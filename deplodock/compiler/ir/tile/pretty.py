@@ -2,23 +2,16 @@
 
 Used by ``deplodock compile --ir tile`` so the pre-materialization
 form is inspectable. Handles the Tile-IR schedule vocabulary
-(``Tile`` / ``BoundLoop`` / ``Combine``) plus Loop-IR leaves
-(``Load`` / ``Assign`` / ``Accum`` / ``Write`` / ``Cond`` / ``Loop``).
-
-When a ``BoundLoop`` iterates an axis that's also declared in the
-surrounding ``Tile.axes`` with the same binding, the BoundLoop prints
-compactly (just the name) — the binding is read off the Tile. Loops
-over axes *not* in Tile.axes (reduction axes) print the full
-``name:extent=BIND`` triple because their binding lives only on the
-loop.
+(``Tile`` / ``Combine`` / ``Stage``) plus shared loop / leaf types
+(``Loop`` / ``StridedLoop`` / ``Load`` / ``Assign`` / ``Accum`` /
+``Write`` / ``Cond``).
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import render as render_expr
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
-    BoundLoop,
     Combine,
     Stage,
     Stmt,
@@ -38,9 +31,6 @@ def pretty_print(tile_op: TileOp) -> str:
 
 
 def _render_body(stmts: tuple[Stmt, ...], indent: str, lines: list[str], owned_axes: dict[str, str]) -> None:
-    """Render a body. ``owned_axes`` maps axis-name → bind for axes
-    declared by an enclosing ``Tile.axes``; BoundLoops iterating those
-    axes print compactly."""
     for stmt in stmts:
         _render_stmt(stmt, indent, lines, owned_axes)
 
@@ -49,18 +39,14 @@ def _render_stmt(stmt: Stmt, indent: str, lines: list[str], owned_axes: dict[str
     if isinstance(stmt, Tile):
         axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in stmt.axes) or "-"
         lines.append(f"{indent}Tile(axes=({axes})):")
-        # Extend owned_axes with this Tile's axis bindings for the body.
         inner = {**owned_axes, **{ba.axis.name: ba.bind for ba in stmt.axes}}
         _render_body(stmt.body, indent + "    ", lines, inner)
         return
-    if isinstance(stmt, BoundLoop):
+    if isinstance(stmt, StridedLoop):
         kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
-        # Compact form: axis is declared by the surrounding Tile with the
-        # same bind — drop the redundant extent + bind from the loop print.
-        if owned_axes.get(stmt.axis.axis.name) == stmt.bind:
-            lines.append(f"{indent}BoundLoop({stmt.axis.axis.name}):  # {kind}")
-        else:
-            lines.append(f"{indent}BoundLoop({stmt.axis.axis.name}:{stmt.axis.axis.extent}={stmt.bind}):  # {kind}")
+        start = render_expr(stmt.start)
+        step = render_expr(stmt.step) if hasattr(stmt.step, "__class__") and not isinstance(stmt.step, int) else stmt.step
+        lines.append(f"{indent}StridedLoop({stmt.axis.name} = {start}; < {stmt.axis.extent}; += {step}):  # {kind}")
         _render_body(stmt.body, indent + "    ", lines, owned_axes)
         return
     if isinstance(stmt, Combine):

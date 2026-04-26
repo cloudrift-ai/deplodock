@@ -39,7 +39,6 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
@@ -49,6 +48,7 @@ from deplodock.compiler.ir.stmt import (
     Select,
     SelectBranch,
     Stmt,
+    StridedLoop,
     Write,
 )
 
@@ -129,31 +129,9 @@ class TreeHalve(Stmt):
     tid_var: str
 
 
-@dataclass
-class StridedLoop(Stmt):
-    """``for (int <axis.name> = <start>; <axis.name> < <axis.extent>; <axis.name> += <step>)``.
-
-    Strided variant of ``Loop`` used by cooperative-reduction materialization
-    to walk a reduction axis in ``step``-sized slabs across threads.
-    Reduction detection mirrors ``Loop``: a ``StridedLoop`` is a reduce-loop
-    iff its body contains an ``Accum``.
-    """
-
-    axis: Axis
-    start: Expr
-    step: int
-    body: tuple[Stmt, ...]
-
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
-        return (self.body,)
-
-    def rewrite(self, rename_ssa, sigma: Sigma = Sigma.IDENTITY):  # type: ignore[override]
-        return StridedLoop(
-            axis=self.axis,
-            start=sigma.apply(self.start),
-            step=self.step,
-            body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
-        )
+# ``StridedLoop`` is shared infrastructure — defined in ``ir/stmt.py``
+# and re-exported here. Used at Tile IR for cooperative iteration and
+# at Kernel IR for cooperative smem loads.
 
 
 # ---------------------------------------------------------------------------

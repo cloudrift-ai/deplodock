@@ -1,11 +1,9 @@
 """Lower each ``LoopOp`` node to a ``TileOp``.
 
 Mechanical translation: outer free-Loop chain becomes
-``Tile(thread_axes=...)``, leaves pass through unchanged. Loop-IR
-``Loop`` is rewritten to Tile-IR ``BoundLoop`` carrying a ``BoundAxis``
-whose ``bind`` defaults to ``BIND_SERIAL`` (every thread walks the axis
-itself). Strategy passes flip the bind on select ``BoundLoop``s to
-to express cooperative iteration via axis splits.
+``Tile(thread_axes=...)``, leaves and inner Loops pass through unchanged.
+Strategy passes (``002_cooperative_reduce``, ``003_block_matmul``) may
+later convert serial Loops to ``StridedLoop`` for cooperative iteration.
 
 **Outer free-Loop chain → ``Tile.thread_axes``**. After stripping
 leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
@@ -23,11 +21,11 @@ changes.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Loop
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
-from deplodock.compiler.ir.tile.ir import BoundLoop, Stmt, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import Stmt, Tile, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", LoopOp)]
@@ -55,9 +53,8 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
        ``Tile(thread_axes=..., bind=BIND_THREAD)``. Otherwise, lower the
        inner body in place (single-thread serial — degenerate).
 
-    Inner ``Loop``s are translated to
-    ``BoundLoop(BoundAxis(axis, BIND_SERIAL))``. Strategy passes flip
-    the bind on select BoundLoops later.
+    Inner ``Loop``s pass through unchanged — strategy passes may
+    convert select ones to ``StridedLoop`` for cooperative iteration.
     """
     leading: list[LoopStmt] = []
     rest: tuple[LoopStmt, ...] = loop_op.body
@@ -67,13 +64,12 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
 
     output_axes, inner = _strip_outer_free_chain(rest)
 
-    body: list[Stmt] = list(_lower_body(tuple(leading)))
-    inner_lowered = tuple(_lower_body(inner))
+    body: list[Stmt] = list(leading)
     if output_axes:
         bound = tuple(BoundAxis(axis=ax, bind=BIND_THREAD) for ax in output_axes)
-        body.append(Tile(axes=bound, body=inner_lowered))
+        body.append(Tile(axes=bound, body=tuple(inner)))
     else:
-        body.extend(inner_lowered)
+        body.extend(inner)
 
     return TileOp(body=tuple(body), name=kernel_name)
 
@@ -90,18 +86,6 @@ def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ..
         axes.append(cur[0].axis)
         cur = cur[0].body
     return tuple(axes), cur
-
-
-def _lower_body(stmts: tuple[LoopStmt, ...]) -> list[Stmt]:
-    """Translate Loop-IR stmts to Tile-IR. Loop → BoundLoop(bind=SERIAL);
-    leaves pass through unchanged."""
-    out: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, Loop):
-            out.append(BoundLoop(axis=BoundAxis(axis=s.axis, bind=BIND_SERIAL), body=tuple(_lower_body(s.body))))
-        else:
-            out.append(s)
-    return out
 
 
 def _kernel_name_for(loop: LoopOp, node_id: str) -> str:

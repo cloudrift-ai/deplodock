@@ -25,15 +25,14 @@ names are strings so they're directly renderable.
   ``block_axes`` empty (one thread per output element). Cooperative
   reductions have ``block_axes`` populated and ``thread_axes`` empty;
   the cooperative thread axis is synthesized at materialization.
-- ``BoundLoop.axis.bind`` — always ``BIND_SERIAL``; cooperative
-  iteration is expressed via axis splits in ``Tile.axes``, not a
-  body-loop bind.
+- Loop constructs in the Tile-IR body are ``Loop`` (serial) and
+  ``StridedLoop`` (cooperative — threads stride through the axis).
+  Both are shared with Loop-IR / Kernel-IR via ``ir.stmt``.
 - ``Combine`` — cross-thread collapse of an Accum target; sibling
   Stmt because it's buffer/accumulator-scoped, not axis-local.
 
-The compute body itself is ``BoundLoop`` / ``Accum`` / ``Load`` /
-``Assign`` / ``Write`` — a straight iteration tree. Each ``BoundLoop``
-carries its own binding; the body reads linearly top to bottom.
+The compute body is ``Loop`` / ``StridedLoop`` / ``Accum`` / ``Load`` /
+``Assign`` / ``Write`` — a straight iteration tree.
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
@@ -54,7 +53,6 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
@@ -64,6 +62,7 @@ from deplodock.compiler.ir.stmt import (
     Select,
     SelectBranch,
     Stmt,
+    StridedLoop,
     Write,
 )
 
@@ -71,15 +70,10 @@ from deplodock.compiler.ir.stmt import (
 # Schedule-bearing Stmts
 # ---------------------------------------------------------------------------
 #
-# Scheduling decisions are expressed via ``BoundAxis.bind`` values
-# defined in ``ir.axis``. ``BIND_THREAD`` / ``BIND_BLOCK`` are the
-# launch-geometry bindings (used in ``Tile.axes`` / ``Enclosure.axes``);
-# ``BIND_SERIAL`` is the body-loop binding (used on ``BoundLoop.axis``).
-# Cooperative iteration is expressed by splitting an axis into
-# ``(chunk, t)`` at strategy time — the inner half ``t`` is a THREAD
-# axis on ``Tile.axes`` and the outer half is iterated by a SERIAL
-# ``BoundLoop`` whose body uses ``chunk * BLOCK_SIZE + t`` as the
-# rewritten axis index.
+# Scheduling decisions are expressed via ``BoundAxis.bind`` values on
+# ``Tile.axes`` (``BIND_THREAD`` / ``BIND_BLOCK`` for launch geometry)
+# and via the choice of body loop construct (``Loop`` for serial,
+# ``StridedLoop`` for cooperative striding).
 
 
 @dataclass
@@ -98,9 +92,9 @@ class Tile(Stmt):
     thread axis (``t``) and prepend it to the resulting
     ``Enclosure.axes`` with binding ``BIND_THREAD``.
 
-    The body holds the logical compute (``BoundLoop``, ``Accum``,
-    ``Load``, ``Assign``, ``Write``) plus any ``Combine`` siblings
-    placed by strategies.
+    The body holds the logical compute (``Loop``, ``StridedLoop``,
+    ``Accum``, ``Load``, ``Assign``, ``Write``) plus any ``Combine``
+    siblings placed by strategies.
 
     ``thread_axes`` / ``block_axes`` are convenience properties that
     project ``axes`` by binding kind — they're what the renderer and
@@ -122,55 +116,19 @@ class Tile(Stmt):
         return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
 
 
-@dataclass(frozen=True)
-class BoundLoop(Stmt):
-    """Iteration over an axis paired with its iteration policy.
-
-    Tile-IR's variant of Loop-IR's ``Loop``: carries the same compute
-    (a nested body) plus a ``BoundAxis`` whose ``bind`` is always
-    ``BIND_SERIAL`` (each thread iterates the axis privately, renders
-    to a plain ``for`` loop). Cooperative iteration is expressed by
-    axis splits in ``Tile.axes``, not by a body-loop bind.
-
-    Reduction detection is structural, same as Loop-IR's ``Loop``: a
-    ``BoundLoop`` is a reduce-loop iff its body contains an ``Accum``.
-
-    Disjoint from Loop-IR's ``Loop`` so materialization can convert
-    between the two layers without ambiguity — post-materialization the
-    Kernel IR body contains ``Loop`` (or ``StridedLoop`` for cooperative
-    smem loads inside Stage expansion), never ``BoundLoop``.
-    """
-
-    axis: BoundAxis
-    body: tuple[Stmt, ...]
-
-    @property
-    def bind(self) -> str:
-        """Convenience accessor — the ``BoundAxis.bind`` value."""
-        return self.axis.bind
-
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
-        return (self.body,)
-
-    def rewrite(self, rename_ssa, sigma: Sigma = Sigma.IDENTITY):  # type: ignore[override]
-        return BoundLoop(
-            axis=self.axis,
-            body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
-        )
+# Tile-IR loop constructs are ``Loop`` (serial) and ``StridedLoop``
+# (cooperative — threads of the block stride through the axis). Both
+# come from ``ir.stmt`` directly; Tile IR doesn't add a wrapper.
 
 
 @dataclass
 class Combine(Stmt):
     """Cross-thread reduction of an ``Accum`` target.
 
-    Placed immediately after the reduce ``BoundLoop`` whose ``Accum``
-    produced ``name``. The *scope* of the combine — across the block,
-    across a warp, etc. — is derived from the surrounding BoundLoop's
-    ``bind``: the BoundLoop says "threads of this scope cooperatively
-    walk the axis," and Combine says "now collapse the per-thread
-    partials of that same scope." Materialization picks the mechanism
-    (smem tree-halve today; warp-shuffle / atomic in the future) from
-    the same surrounding bind.
+    Placed immediately after a cooperative reduce loop (``StridedLoop``
+    whose ``Accum`` produced ``name``). Materialization emits the
+    cross-thread combine — smem tree-halve today; warp-shuffle / atomic
+    in the future.
 
     ``op`` is a redundant copy of the matching ``Accum.op`` — kept as a
     cross-check; if the strategy constructs a Combine with the wrong op
@@ -202,7 +160,7 @@ class Stage(Stmt):
     materialization to read from the staged buffer with the
     cache-dimension positions of their original index.
 
-    Inserted by the input-staging strategy when multiple ``BoundLoop``s
+    Inserted by the input-staging strategy when multiple loops
     in a cooperative ``Tile`` body Load the same buffer with
     block-bound dimensions in common — typical of softmax / norm-style
     fusions where the input is read three times.
@@ -285,16 +243,15 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
+    "StridedLoop",
     # Tile-IR statements
     "Tile",
-    "BoundLoop",
     "Combine",
     "Stage",
     # Bindings
     "BoundAxis",
     "BIND_THREAD",
     "BIND_BLOCK",
-    "BIND_SERIAL",
     "Stmt",
     # Top-level
     "TileOp",

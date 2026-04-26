@@ -1,25 +1,24 @@
 """Tile IR — schedule decisions as structural Stmts, pre-materialization.
 
-- :mod:`.ir` — dataclass definitions: ``Tile`` / ``BoundLoop`` /
-  ``Combine`` + binding constants, plus re-exports of Loop-IR leaves
+- :mod:`.ir` — dataclass definitions: ``Tile`` / ``Combine`` /
+  ``Stage`` + binding constants, plus re-exports of Loop-IR leaves
   and shared expressions.
 - :mod:`.pretty` — structural pretty-printer for ``TileOp``.
 
 Loop-IR → Tile-IR lowering (``lower_naive``) lives next to its rule at
-``passes/lowering/tile/_lower.py`` — the convention is "rules own their
-logic; shared helpers underscore-prefixed in the rules dir".
+``passes/lowering/tile/001_lower_loopop.py`` — the convention is "rules
+own their logic".
 
 Materialization (Tile IR → Kernel IR) lives under
 ``passes/lowering/kernel``; rendering of Kernel IR to CUDA source lives
 under ``ir.kernel``.
 """
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.tile.ir import (
     Accum,
     Assign,
     BinaryExpr,
-    BoundLoop,
     Builtin,
     CastExpr,
     Combine,
@@ -34,6 +33,7 @@ from deplodock.compiler.ir.tile.ir import (
     SelectBranch,
     Stage,
     Stmt,
+    StridedLoop,
     TernaryExpr,
     Tile,
     TileOp,
@@ -58,14 +58,13 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
+    "StridedLoop",
     "Tile",
-    "BoundLoop",
     "Combine",
     "Stage",
     "BoundAxis",
     "BIND_THREAD",
     "BIND_BLOCK",
-    "BIND_SERIAL",
     "Stmt",
     "TileOp",
     "Axis",
