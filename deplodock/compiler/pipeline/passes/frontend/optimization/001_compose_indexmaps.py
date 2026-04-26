@@ -18,7 +18,7 @@ producer, reindexed to the producer's input.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Expr
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
@@ -30,14 +30,9 @@ PATTERN = [
 ]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    producer_id = match.nodes["producer"]
-    consumer_id = match.nodes["consumer"]
-    producer_node = graph.nodes[producer_id]
-    consumer_node = graph.nodes[consumer_id]
-
-    producer_op = producer_node.op
-    consumer_op = consumer_node.op
+def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph | None:
+    producer_op = producer.op
+    consumer_op = consumer.op
     if not isinstance(producer_op, IndexMapOp) or not isinstance(consumer_op, IndexMapOp):
         return None
 
@@ -49,15 +44,15 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     # The producer feeds exactly the consumer sources whose input_idx
     # points at the producer node. Any other consumer source stays as-is.
-    producer_input_id = producer_node.inputs[p_src.input_idx]
+    producer_input_id = producer.inputs[p_src.input_idx]
 
     # Build the new consumer sources: substitute the producer's coord_map
     # into any consumer source that reads from the producer.
     new_sources: list[IndexSource] = []
-    new_inputs: list[str] = list(consumer_node.inputs)
+    new_inputs: list[str] = list(consumer.inputs)
     for c_src in consumer_op.sources:
-        consumer_src_input = consumer_node.inputs[c_src.input_idx]
-        if consumer_src_input != producer_id:
+        consumer_src_input = consumer.inputs[c_src.input_idx]
+        if consumer_src_input != producer.id:
             new_sources.append(c_src)
             continue
 
@@ -102,12 +97,12 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     out_id = frag.add_node(
         new_op,
         compact_inputs,
-        Tensor(consumer_node.output.name, consumer_node.output.shape, consumer_node.output.dtype),
+        Tensor(consumer.output.name, consumer.output.shape, consumer.output.dtype),
     )
     frag.outputs = [out_id]
 
-    match.output = consumer_id
-    match.consumed = {producer_id, consumer_id}
+    match.output = consumer.id
+    match.consumed = {producer.id, consumer.id}
     return frag
 
 

@@ -5,19 +5,17 @@ After decomposition: IndexMapOp.inputs = [tensor]; dim/start are baked into
 the coord_map (orphan constants get cleaned up by the rewriter).
 """
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SliceOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", SliceOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    rs_id = match.root_node_id
-    root = graph.nodes[rs_id]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     x_id = root.inputs[0]
     dim_id = root.inputs[1]
     start_id = root.inputs[2]

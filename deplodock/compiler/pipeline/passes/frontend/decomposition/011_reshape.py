@@ -7,10 +7,10 @@ delinearizes into the input coordinate space using input strides.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import ReshapeOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", ReshapeOp)]
@@ -55,8 +55,7 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     return tuple(coords)
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    root = graph.nodes[match.root_node_id]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     x_id = root.inputs[0]
     in_shape = tuple(graph.nodes[x_id].output.shape)
     out_shape = root.op.infer_output_shape([in_shape])

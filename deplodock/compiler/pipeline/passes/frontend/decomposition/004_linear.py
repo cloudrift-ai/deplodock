@@ -1,9 +1,9 @@
 """Decompose LinearOp into transpose(weight) → matmul [→ add(bias)]."""
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import LinearOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     matmul_decompose,
@@ -13,8 +13,7 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
 PATTERN = [Pattern("root", LinearOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    root = graph.nodes[match.root_node_id]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     x_id = root.inputs[0]
     w_id = root.inputs[1]
     b_id = root.inputs[2] if len(root.inputs) > 2 else None

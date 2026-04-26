@@ -37,7 +37,7 @@ through.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, Stmt, iter_body, splice_graph
 from deplodock.compiler.pipeline.engine import Match, Pattern
@@ -138,15 +138,10 @@ PATTERN = [
 ]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    producer_id = match.nodes["producer"]
-    consumer_id = match.nodes["consumer"]
-
-    producer_node = graph.nodes[producer_id]
-    consumer_node = graph.nodes[consumer_id]
-    if not isinstance(producer_node.op, LoopOp) or not isinstance(consumer_node.op, LoopOp):
+def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph | None:
+    if not isinstance(producer.op, LoopOp) or not isinstance(consumer.op, LoopOp):
         return None
-    if producer_id not in consumer_node.inputs:
+    if producer.id not in consumer.inputs:
         return None
 
     # Multi-load-of-reduce-heavy-producer guard: if the consumer references
@@ -159,7 +154,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # Pure-elementwise producers and "cheap" reducers like softmax's
     # (max + exp) — where the reduce collapses to a row scalar the splicer
     # can hoist — stay fuseable.
-    if _reduce_heavy(producer_node.op) and _count_loads_from(consumer_node.op, producer_id) > 1:
+    if _reduce_heavy(producer.op) and _count_loads_from(consumer.op, producer.id) > 1:
         return None
 
     # Build a subgraph: producer, consumer, and their non-producer external
@@ -168,27 +163,27 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # and assigns merged slots in first-seen order.
     sub = Graph()
     external_ids: list[str] = []
-    for ext_id in list(producer_node.inputs) + list(consumer_node.inputs):
-        if ext_id == producer_id or ext_id in sub.nodes:
+    for ext_id in list(producer.inputs) + list(consumer.inputs):
+        if ext_id == producer.id or ext_id in sub.nodes:
             continue
         external_ids.append(ext_id)
         ext = graph.nodes.get(ext_id)
         shape = ext.output.shape if ext is not None else ()
         dtype = ext.output.dtype if ext is not None else "f32"
         sub.add_node(InputOp(), [], Tensor(ext_id, shape, dtype), node_id=ext_id)
-    sub.add_node(producer_node.op, list(producer_node.inputs), producer_node.output, node_id=producer_id)
-    sub.add_node(consumer_node.op, list(consumer_node.inputs), consumer_node.output, node_id=consumer_id)
-    sub.outputs = [consumer_id]
+    sub.add_node(producer.op, list(producer.inputs), producer.output, node_id=producer.id)
+    sub.add_node(consumer.op, list(consumer.inputs), consumer.output, node_id=consumer.id)
+    sub.outputs = [consumer.id]
 
     result = splice_graph(sub)
     if result is None:
         return None
     merged, merged_inputs = result
-    new_node_id = f"merged_{consumer_id}"
-    merged = _rename_write_output(merged, old=consumer_id, new=new_node_id)
+    new_node_id = f"merged_{consumer.id}"
+    merged = _rename_write_output(merged, old=consumer.id, new=new_node_id)
 
-    pre_work = _total_work(producer_node.op) + _total_work(consumer_node.op)
-    pre_reads = _total_reads(producer_node.op) + _total_reads(consumer_node.op)
+    pre_work = _total_work(producer.op) + _total_work(consumer.op)
+    pre_reads = _total_reads(producer.op) + _total_reads(consumer.op)
     post_work = _total_work(merged)
     post_reads = _total_reads(merged)
     if post_work > _BLOWUP_FACTOR * pre_work:
@@ -201,11 +196,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # replicates the producer's body across the extra axes (the indexmap's
     # broadcast stops being lazy). Skip — the indexmap can still fuse the
     # *other* way, into its downstream consumer.
-    if (
-        _is_pure_indexmap(consumer_node.op)
-        and not _is_pure_indexmap(producer_node.op)
-        and _output_numel(consumer_node.op) > _output_numel(producer_node.op)
-    ):
+    if _is_pure_indexmap(consumer.op) and not _is_pure_indexmap(producer.op) and _output_numel(consumer.op) > _output_numel(producer.op):
         return None
 
     # Wrap the merged LoopOp in the rule's output fragment. The graph node's
@@ -224,16 +215,16 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         merged,
         merged_inputs,
         Tensor(
-            consumer_node.output.name,
-            consumer_node.output.shape,
-            consumer_node.output.dtype,
+            consumer.output.name,
+            consumer.output.shape,
+            consumer.output.dtype,
         ),
         node_id=new_node_id,
     )
     frag.outputs = [out_id]
 
-    match.output = consumer_id
-    match.consumed = {producer_id, consumer_id}
+    match.output = consumer.id
+    match.consumed = {producer.id, consumer.id}
     return frag
 
 

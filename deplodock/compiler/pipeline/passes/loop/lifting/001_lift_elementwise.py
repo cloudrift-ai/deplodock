@@ -11,21 +11,18 @@ rule; this pass only introduces the LoopOp wrapper.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", ElementwiseOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    nid = match.root_node_id
-    node = graph.nodes[nid]
-
-    out_shape = tuple(node.output.shape)
+def rewrite(graph: Graph, root: Node) -> Graph | None:
+    out_shape = tuple(root.output.shape)
     if out_shape and not all(isinstance(d, int) for d in out_shape):
         return None
 
@@ -33,7 +30,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
     load_stmts: list[Stmt] = []
     load_names: list[str] = []
-    for i, inp_id in enumerate(node.inputs):
+    for i, inp_id in enumerate(root.inputs):
         inp_node = graph.nodes.get(inp_id)
         inp_shape = tuple(inp_node.output.shape) if inp_node is not None else ()
         idx = _identity_index(inp_shape, axes)
@@ -44,8 +41,8 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     write_index = tuple(Var(a.name) for a in axes)
     inner: tuple[Stmt, ...] = (
         *load_stmts,
-        Assign(name="v", op=node.op.op, args=tuple(load_names)),
-        Write(output=f"lift_{nid}", index=write_index, value="v"),
+        Assign(name="v", op=root.op.op, args=tuple(load_names)),
+        Write(output=f"lift_{root.id}", index=write_index, value="v"),
     )
     # Nest the body in free-axis Loops (outer axis wraps the innermost).
     body: tuple[Stmt, ...] = inner
@@ -54,7 +51,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     kernel = LoopOp(body=body)
 
     frag = Graph()
-    for inp_id in node.inputs:
+    for inp_id in root.inputs:
         if inp_id in frag.nodes:
             continue
         ext = graph.nodes.get(inp_id)
@@ -65,8 +62,8 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     out_id = frag.add_node(
         kernel,
         list(kernel.inputs),
-        Tensor(node.output.name, node.output.shape, node.output.dtype),
-        node_id=f"lift_{nid}",
+        Tensor(root.output.name, root.output.shape, root.output.dtype),
+        node_id=f"lift_{root.id}",
     )
     frag.outputs = [out_id]
     return frag

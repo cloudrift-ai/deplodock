@@ -1,16 +1,15 @@
 """Decompose silu(x) into x * recip(1 + exp(-x)) to enable SiLU+Mul fusion."""
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc, open_fragment
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "silu"})]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     """Replace silu(x) with x * recip(1 + exp(-x))."""
-    root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
     shape = root.output.shape
     dtype = root.output.dtype

@@ -57,8 +57,7 @@ static inline float rsqrtf_(float x) { return 1.0f / sqrtf(x); }
 """
 
 
-def render_loopop_cpp(loop: "LoopOp", fn_name: str, input_shapes: dict[str, tuple[int, ...]],
-                     output_shape: tuple[int, ...]) -> str:
+def render_loopop_cpp(loop: LoopOp, fn_name: str, input_shapes: dict[str, tuple[int, ...]], output_shape: tuple[int, ...]) -> str:
     """Emit a complete ``extern "C" void <fn_name>(...)`` definition.
 
     Inputs become ``const float*`` params in ``loop.inputs`` order; the
@@ -76,7 +75,7 @@ def render_loopop_cpp(loop: "LoopOp", fn_name: str, input_shapes: dict[str, tupl
     return f'extern "C" void {fn_name}({params_text}) {{\n{body_text}\n}}\n'
 
 
-def _output_name(loop: "LoopOp") -> str:
+def _output_name(loop: LoopOp) -> str:
     """Pull the single ``Write.output`` name from the body."""
     for s in loop:
         if isinstance(s, Write):
@@ -105,7 +104,7 @@ def _ensure_prelude() -> None:
 
 
 def execute_loop_op_cpp(
-    loop: "LoopOp",
+    loop: LoopOp,
     input_arrays: dict[str, np.ndarray],
     out_shape: tuple[int, ...],
 ) -> np.ndarray:

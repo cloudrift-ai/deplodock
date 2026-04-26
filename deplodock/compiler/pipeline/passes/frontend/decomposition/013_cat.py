@@ -8,27 +8,24 @@ After decomposition: IndexMapOp.inputs = [tensor_a, tensor_b]; the dim is baked
 into the source selects and the second source's coord_map offset.
 """
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import CatOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 
 PATTERN = [Pattern("root", CatOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    rs_id = match.root_node_id
-    root = graph.nodes[rs_id]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     a_id = root.inputs[0]
     b_id = root.inputs[1]
     dim_id = root.inputs[2]
 
-    rs_node = graph.nodes[rs_id]
     a_shape = tuple(graph.nodes[a_id].output.shape)
-    out_shape = tuple(rs_node.output.shape)
+    out_shape = tuple(root.output.shape)
     ndim = len(out_shape)
 
     dim_node = graph.nodes.get(dim_id)
@@ -62,7 +59,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     new_id = frag.add_node(
         op=IndexMapOp(out_shape=out_shape, sources=(src_a, src_b)),
         inputs=[a_id, b_id],
-        output=Tensor(rs_node.output.name, out_shape, rs_node.output.dtype),
+        output=Tensor(root.output.name, out_shape, root.output.dtype),
     )
 
     frag.outputs = [new_id]

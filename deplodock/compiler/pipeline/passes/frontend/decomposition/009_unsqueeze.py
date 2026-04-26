@@ -1,16 +1,15 @@
 """Lower UnsqueezeOp(x, dim=k) → IndexMapOp."""
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.frontend.ir import UnsqueezeOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", UnsqueezeOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    root = graph.nodes[match.root_node_id]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     x_id = root.inputs[0]
     out_shape = tuple(root.output.shape)
     in_shape = tuple(graph.nodes[x_id].output.shape)

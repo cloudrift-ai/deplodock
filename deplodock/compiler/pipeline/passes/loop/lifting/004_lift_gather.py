@@ -12,24 +12,21 @@ into the axis env so the data port can reference the idx port's value.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import CastExpr, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import GatherOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", GatherOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    nid = match.root_node_id
-    node = graph.nodes[nid]
-
-    data_id, idx_id = node.inputs[0], node.inputs[1]
-    out_shape = tuple(node.output.shape)
+def rewrite(graph: Graph, root: Node) -> Graph | None:
+    data_id, idx_id = root.inputs[0], root.inputs[1]
+    out_shape = tuple(root.output.shape)
     ndim = len(out_shape)
-    axis = int(node.op.axis) if int(node.op.axis) >= 0 else ndim + int(node.op.axis)
+    axis = int(root.op.axis) if int(root.op.axis) >= 0 else ndim + int(root.op.axis)
 
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
 
@@ -39,11 +36,10 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # loaded idx value cast to int (referenced by the idx Load's SSA name).
     data_index = tuple(CastExpr("int", Var("idx")) if i == axis else Var(axes[i].name) for i in range(ndim))
 
-    out_buf = f"kernel_{nid}"
     inner: tuple[Stmt, ...] = (
         Load(name="idx", input=idx_id, index=idx_index),
         Load(name="data", input=data_id, index=data_index),
-        Write(output=out_buf, index=tuple(Var(a.name) for a in axes), value="data"),
+        Write(output=f"kernel_{root.id}", index=tuple(Var(a.name) for a in axes), value="data"),
     )
     body: tuple[Stmt, ...] = inner
     for a in reversed(axes):
@@ -58,6 +54,6 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
             dtype = ext.output.dtype if ext else "f32"
             frag.add_node(InputOp(), [], Tensor(buf_id, shape, dtype), node_id=buf_id)
 
-    out_id = frag.add_node(kernel, list(kernel.inputs), Tensor(node.output.name, out_shape, node.output.dtype), node_id=f"kernel_{nid}")
+    out_id = frag.add_node(kernel, list(kernel.inputs), Tensor(root.output.name, out_shape, root.output.dtype), node_id=f"kernel_{root.id}")
     frag.outputs = [out_id]
     return frag

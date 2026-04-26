@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
+    _PRECEDENCE,
     BinaryExpr,
     Expr,
     FuncCallExpr,
@@ -44,7 +45,6 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
     _float_lit,
-    _PRECEDENCE,
 )
 from deplodock.compiler.ir.sigma import Sigma
 
@@ -95,7 +95,11 @@ def _pad(n: int) -> str:
 
 
 _BINARY_OP: dict[str, str] = {
-    "add": "+", "subtract": "-", "multiply": "*", "divide": "/", "mod": "%",
+    "add": "+",
+    "subtract": "-",
+    "multiply": "*",
+    "divide": "/",
+    "mod": "%",
 }
 
 
@@ -159,6 +163,7 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
         idx_str = idx.render(ctx, _PRECEDENCE["*"])
         parts.append(idx_str if stride == 1 else f"{idx_str} * {stride}")
     return " + ".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # Stmt — abstract base

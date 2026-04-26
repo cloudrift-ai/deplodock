@@ -1,17 +1,16 @@
 """Decompose pow(x, 2) into mul(x, x) to enable RMSNorm fusion."""
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "pow"})]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     """Replace pow(x, 2) with mul(x, x) — enables RMSNorm pattern matching."""
-    root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
     exp_id = root.inputs[1]
 

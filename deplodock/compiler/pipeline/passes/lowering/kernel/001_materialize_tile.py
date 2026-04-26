@@ -32,29 +32,26 @@ passes can pattern-match on it.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve
 from deplodock.compiler.ir.stmt import Accum, Init, Load, Loop, Stmt, StridedLoop, Tile, Write, iter_body
 from deplodock.compiler.ir.tile.ir import BLOCK_SIZE, Combine, Stage, TileOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    node = graph.nodes[match.root_node_id]
-    tile_op: TileOp = node.op
-
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     new_body: list[Stmt] = []
-    for s in tile_op.body:
+    for s in root.op.body:
         if isinstance(s, Tile):
             new_body.append(_materialize(s))
         else:
             new_body.append(s)
 
-    node.op = KernelOp(body=tuple(new_body), name=tile_op.name)
+    root.op = KernelOp(body=tuple(new_body), name=root.op.name)
     return None
 
 

@@ -18,6 +18,7 @@ Public surface:
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import logging
 import time
 from collections.abc import Callable
@@ -127,9 +128,25 @@ def _sole_consumer(graph: Graph, nid: str) -> str | None:
 
 @dataclass
 class _Rule:
+    """Loaded rule module — pattern + rewrite plus the rewrite's param list.
+
+    ``param_names`` is captured at load time so the dispatcher can bind
+    pattern names to ``Node`` objects via signature inspection. Each
+    rewrite param name must be one of:
+
+    - ``graph`` — the current ``Graph``
+    - ``match`` — the full ``Match`` object (escape hatch for advanced use)
+    - ``root`` — shortcut for ``graph.nodes[match.root_node_id]`` (Node)
+    - any ``Pattern.name`` declared in ``PATTERN`` — bound to that pattern
+      entry's matched ``Node``.
+
+    Unknown names raise at dispatch time so typos don't fail silently.
+    """
+
     name: str
     pattern: list[Pattern]
-    rewrite: Callable[[Graph, Match], Graph | None]
+    rewrite: Callable[..., Graph | None]
+    param_names: tuple[str, ...]
 
 
 def _load_rules(pass_dir: Path) -> list[_Rule]:
@@ -149,7 +166,41 @@ def _load_rule(path: Path) -> _Rule:
         raise ValueError(f"Rule {path} missing PATTERN")
     if rewrite_fn is None:
         raise ValueError(f"Rule {path} missing rewrite() function")
-    return _Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn)
+    param_names = tuple(inspect.signature(rewrite_fn).parameters.keys())
+    return _Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names)
+
+
+def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match) -> dict | None:
+    """Bind each ``rewrite`` param to its source.
+
+    Returns ``None`` when a pattern-name param's matched node has been
+    deleted from the graph between match enumeration and rewrite (the
+    dispatcher's outer ``match.consumed`` check covers most cases; this
+    is a safety net).
+    """
+    pattern_names = {p.name for p in rule.pattern}
+    kwargs: dict = {}
+    for pname in rule.param_names:
+        if pname == "graph":
+            kwargs[pname] = graph
+        elif pname == "match":
+            kwargs[pname] = match
+        elif pname == "root":
+            nid = match.root_node_id
+            if nid not in graph.nodes:
+                return None
+            kwargs[pname] = graph.nodes[nid]
+        elif pname in pattern_names:
+            nid = match.nodes.get(pname)
+            if nid is None or nid not in graph.nodes:
+                return None
+            kwargs[pname] = graph.nodes[nid]
+        else:
+            raise TypeError(
+                f"Rule {rule.name!r}: rewrite param {pname!r} is not 'graph', 'match', 'root', "
+                f"or a PATTERN name (have: {sorted(pattern_names)})"
+            )
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +244,10 @@ def _apply_rules(graph: Graph, rules: list[_Rule]) -> Graph:
                     # None — e.g. lowering/tile) can render a before/after.
                     debug_on = logger.isEnabledFor(logging.DEBUG)
                     pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes} if debug_on else {}
-                    fragment = rule.rewrite(graph, match)
+                    kwargs = _build_rewrite_kwargs(rule, graph, match)
+                    if kwargs is None:
+                        continue
+                    fragment = rule.rewrite(**kwargs)
                     if fragment is None:
                         if debug_on and any(graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops if nid in graph.nodes):
                             logger.debug(_format_inplace_application(rule.name, graph, match, pre_ops))

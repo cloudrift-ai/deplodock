@@ -7,12 +7,12 @@ via integer-divide indexing: ``K[b, q_head // group_size, s, d]``.
 
 import math
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     const_bc,
     gqa_broadcast,
@@ -49,8 +49,7 @@ def _maybe_gqa(frag: Graph, src_id: str, q_batch: tuple, src_batch: tuple, targe
     )
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    root = graph.nodes[match.root_node_id]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     q_id, k_id, v_id = root.inputs[0], root.inputs[1], root.inputs[2]
 
     q_shape = graph.nodes[q_id].output.shape

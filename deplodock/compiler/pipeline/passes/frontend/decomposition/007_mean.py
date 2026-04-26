@@ -1,17 +1,16 @@
 """Decompose MeanOp into sum + div by the reduced dimension size."""
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import MeanOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc, open_fragment
 
 PATTERN = [Pattern("root", MeanOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     """Replace mean(x, axis) with sum(x, axis) / axis_size."""
-    root = graph.nodes[match.root_node_id]
     x_id = root.inputs[0]
 
     axis = root.op.axis

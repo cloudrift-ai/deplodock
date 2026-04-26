@@ -1,9 +1,9 @@
 """Decompose rms_norm(x, weight [, eps]) into x * rsqrt(mean(x*x, -1, keepdim) + eps) * weight."""
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import MeanOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     const_bc,
@@ -14,8 +14,7 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
 PATTERN = [Pattern("root", RmsNormOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    root = graph.nodes[match.root_node_id]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     if len(root.inputs) < 2:
         return None
     x_id, w_id = root.inputs[0], root.inputs[1]

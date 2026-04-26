@@ -20,26 +20,23 @@ changes.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Loop
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.tile.ir import Stmt, Tile, TileOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", LoopOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    node = graph.nodes[match.root_node_id]
-    nid = match.root_node_id
-    desired = node.output.name or nid
-    if desired != nid and desired not in graph.nodes:
-        graph.rename_node(nid, desired)
-        nid = desired
-    kname = _kernel_name_for(node.op, nid)
-    graph.nodes[nid].op = lower_naive(graph.nodes[nid].op, kname)
+def rewrite(graph: Graph, root: Node) -> Graph | None:
+    desired = root.output.name or root.id
+    if desired != root.id and desired not in graph.nodes:
+        graph.rename_node(root.id, desired)
+    kname = _kernel_name_for(root.op, root.id)
+    root.op = lower_naive(root.op, kname)
     return None
 
 
