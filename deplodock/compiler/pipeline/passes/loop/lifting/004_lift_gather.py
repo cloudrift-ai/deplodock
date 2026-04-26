@@ -60,6 +60,6 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
             dtype = ext.output.dtype if ext else "f32"
             frag.add_node(InputOp(), [], Tensor(buf_id, shape, dtype), node_id=buf_id)
 
-    out_id = frag.add_node(kernel, list(kernel.inputs), Tensor(f"kernel_{nid}", out_shape, node.output.dtype), node_id=f"kernel_{nid}")
+    out_id = frag.add_node(kernel, list(kernel.inputs), Tensor(node.output.name, out_shape, node.output.dtype), node_id=f"kernel_{nid}")
     frag.outputs = [out_id]
     return frag

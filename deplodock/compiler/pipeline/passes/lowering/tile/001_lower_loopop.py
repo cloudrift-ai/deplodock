@@ -35,7 +35,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     node = graph.nodes[match.root_node_id]
     if not isinstance(node.op, LoopOp):
         return None
-    kname = _kernel_name_for(node.op, match.root_node_id)
+    kname = _kernel_name_for(node.op, node.output.name or match.root_node_id)
     node.op = lower_naive(node.op, kname)
     return None
 
@@ -88,7 +88,21 @@ def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ..
     return tuple(axes), cur
 
 
-def _kernel_name_for(loop: LoopOp, node_id: str) -> str:
-    if any(isinstance(s, Accum) for s in loop):
-        return f"k_{node_id}_reduce"
-    return f"k_{node_id}_pointwise"
+def _kernel_name_for(loop: LoopOp, base_name: str) -> str:
+    suffix = "reduce" if any(isinstance(s, Accum) for s in loop) else "pointwise"
+    return f"k_{_dedup_tokens(base_name)}_{suffix}"
+
+
+def _dedup_tokens(name: str) -> str:
+    """Drop consecutive duplicate ``_``-separated tokens.
+
+    ``softmax_softmax_max`` → ``softmax_max``; ``rms_rms_norm`` → ``rms_norm``.
+    Preserves order; only collapses adjacent duplicates so structurally
+    distinct repeats (``add_mul_add``) survive.
+    """
+    out: list[str] = []
+    for tok in name.split("_"):
+        if not tok or (out and out[-1] == tok):
+            continue
+        out.append(tok)
+    return "_".join(out) if out else name
