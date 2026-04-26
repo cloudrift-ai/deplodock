@@ -135,9 +135,8 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
         }
     )
 
-    new_load_a = load_a.rewrite(_id, sigma)
-    new_load_b = load_b.rewrite(_id, sigma)
-    inner_compute: tuple[Stmt, ...] = (new_load_a, new_load_b, mul, accum)
+    new_load_a_global = load_a.rewrite(_id, sigma)
+    new_load_b_global = load_b.rewrite(_id, sigma)
 
     # Stage each operand per K_o iteration. Cache axes are derived from
     # the load index: each position contributes the inner-split axis whose
@@ -145,8 +144,18 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     # ordering isn't pinned to "A vs B" of the matmul (fusion may swap),
     # so we read each load's own free vars instead of hardcoding axes.
     inner_split = {m_i.name: m_i, n_i.name: n_i, k_i.name: k_i}
-    stage_a = Stage(buf=load_a.input, index=new_load_a.index, axes=_cache_axes_for(new_load_a, inner_split))
-    stage_b = Stage(buf=load_b.input, index=new_load_b.index, axes=_cache_axes_for(new_load_b, inner_split))
+    a_axes = _cache_axes_for(new_load_a_global, inner_split)
+    b_axes = _cache_axes_for(new_load_b_global, inner_split)
+    a_stage_name = f"{load_a.input}_stage"
+    b_stage_name = f"{load_b.input}_stage"
+    stage_a = Stage(name=a_stage_name, buf=load_a.input, index=new_load_a_global.index, axes=a_axes)
+    stage_b = Stage(name=b_stage_name, buf=load_b.input, index=new_load_b_global.index, axes=b_axes)
+
+    # Inner Loads target the staged buffers with cache-local indices —
+    # just the cache-axis Vars in stage.axes order.
+    local_load_a = Load(name=load_a.name, input=a_stage_name, index=tuple(Var(ax.name) for ax in a_axes))
+    local_load_b = Load(name=load_b.name, input=b_stage_name, index=tuple(Var(ax.name) for ax in b_axes))
+    inner_compute: tuple[Stmt, ...] = (local_load_a, local_load_b, mul, accum)
 
     # m_i / n_i are bound directly as Enclosure THREAD axes (their
     # extents·product equals BLOCK_SIZE — one output per thread). No

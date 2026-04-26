@@ -118,13 +118,8 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
     tid_expr = _build_linear_tid(thread_axes)
 
     rename: dict[str, str] = {}
-    # buf -> (stage_buf, stage): subsequent Loads of `buf` get rewritten to
-    # read from the smem cache via _smem_coords_for_load.
-    redirects: dict[str, tuple[str, Stage]] = {}
 
     def transform(s: Stmt) -> Stmt:
-        if redirects:
-            s = _redirect_loads(s, redirects)
         if rename:
             s = s.rewrite(lambda n: rename.get(n, n))
         return s
@@ -138,12 +133,10 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
 
     for stmt in body:
         if isinstance(stmt, Stage):
-            stage_buf = f"{stmt.buf}_stage"
-            new_body.extend(_emit_stage(stmt, stage_buf, tid_expr))
-            redirects[stmt.buf] = (stage_buf, stmt)
+            new_body.extend(_emit_stage(stmt, tid_expr))
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
-            new_body.append(_emit_loop(stmt, tid_expr, thread_axes, distinguishing, redirects, transform))
+            new_body.append(_emit_loop(stmt, tid_expr, thread_axes, distinguishing, transform))
             if _is_reduce(stmt):
                 pending_reduce = next(a for a in stmt.body if isinstance(a, Accum))
             else:
@@ -178,7 +171,6 @@ def _emit_loop(
     tid_expr,
     thread_axes: tuple,
     distinguishing: set,
-    redirects: dict,
     transform,
 ) -> Stmt:
     """Translate a body Loop or StridedLoop. Recurses so nested staging /
@@ -192,11 +184,9 @@ def _emit_loop(
     inner: list[Stmt] = []
     for s in loop.body:
         if isinstance(s, Stage):
-            stage_buf = f"{s.buf}_stage"
-            inner.extend(_emit_stage(s, stage_buf, tid_expr))
-            redirects[s.buf] = (stage_buf, s)
+            inner.extend(_emit_stage(s, tid_expr))
         elif isinstance(s, (Loop, StridedLoop)):
-            inner.append(_emit_loop(s, tid_expr, thread_axes, inner_distinguishing, redirects, transform))
+            inner.append(_emit_loop(s, tid_expr, thread_axes, inner_distinguishing, transform))
         elif isinstance(s, Write):
             inner.append(_emit_write(s, inner_distinguishing, thread_axes, transform))
         else:
@@ -303,12 +293,17 @@ def _is_reduce(loop) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Stage expansion + load redirect
+# Stage expansion
 # ---------------------------------------------------------------------------
 
 
-def _emit_stage(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]:
-    """Expand a ``Stage`` Stmt into smem decl + cooperative load + sync.
+def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
+    """Expand a ``Stage`` Stmt into ``Smem`` decl + cooperative load + sync.
+
+    The strategy that emits the Stage is responsible for rewriting
+    body Loads of ``stage.buf`` to target ``stage.name`` with
+    cache-local indices — materialization just emits the smem buffer
+    and the cooperative load that fills it.
 
     Single-axis stage emits a direct ``StridedLoop(cache_axis,
     start=tid_expr, step=BLOCK_SIZE)``. Multi-axis stage flattens the
@@ -323,9 +318,9 @@ def _emit_stage(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]:
     Iteration 1's leading Sync is harmless (no prior state)."""
     extents = tuple(int(ax.extent) for ax in stage.axes)
     if not extents:
-        raise ValueError(f"Stage {stage.buf!r} has no cache axes")
-    smem = Smem(name=stage_buf, extents=extents)
-    load_name = f"_stage_{stage.buf}_v"
+        raise ValueError(f"Stage {stage.name!r} has no cache axes")
+    smem = Smem(name=stage.name, extents=extents)
+    load_name = f"{stage.name}_v"
 
     if len(stage.axes) == 1:
         cache_axis = stage.axes[0]
@@ -335,7 +330,7 @@ def _emit_stage(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]:
             step=BLOCK_SIZE,
             body=(
                 Load(name=load_name, input=stage.buf, index=stage.index),
-                Write(output=stage_buf, index=(Var(cache_axis.name),), value=load_name),
+                Write(output=stage.name, index=(Var(cache_axis.name),), value=load_name),
             ),
         )
         return [Sync(), smem, cooperative_load, Sync()]
@@ -343,7 +338,7 @@ def _emit_stage(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]:
     total = 1
     for e in extents:
         total *= e
-    flat_name = f"_stage_{stage.buf}_flat"
+    flat_name = f"{stage.name}_flat"
     flat_axis = Axis(name=flat_name, extent=total)
     decode_sigma = _flat_decode_sigma(stage.axes, flat_name)
     source_index = tuple(decode_sigma.apply(e) for e in stage.index)
@@ -354,7 +349,7 @@ def _emit_stage(stage: Stage, stage_buf: str, tid_expr) -> list[Stmt]:
         step=BLOCK_SIZE,
         body=(
             Load(name=load_name, input=stage.buf, index=source_index),
-            Write(output=stage_buf, index=smem_index, value=load_name),
+            Write(output=stage.name, index=smem_index, value=load_name),
         ),
     )
     return [Sync(), smem, cooperative_load, Sync()]
@@ -381,58 +376,3 @@ def _flat_decode_sigma(cache_axes: tuple[Axis, ...], flat_name: str) -> Sigma:
     else:
         mapping[outer.name] = flat / Literal(outer_stride, "int")
     return Sigma(mapping)
-
-
-def _smem_coords_for_load(stage: Stage, load_index: tuple) -> tuple:
-    """Build the smem read index for a redirected Load against ``stage``.
-
-    Per cache axis, find its position in ``stage.index`` and extract the
-    *local* (cache-coord) value from the matching ``load_index`` position:
-
-    - **Pure-Var case** (softmax-style, ``stage.index[p] == Var(ax)``):
-      smem coord = the load's expression verbatim (axis var possibly
-      named differently per Load site).
-    - **Affine case** (matmul-style, ``stage.index[p] == outer*F + ax``):
-      strip ``outer → 0`` from the load's index expression."""
-    cache_axis_names = {ax.name for ax in stage.axes}
-    coords_by_axis: dict = {}
-    for p, e in enumerate(stage.index):
-        match = cache_axis_names & free_vars(e)
-        if not match:
-            continue
-        if len(match) > 1:
-            raise ValueError(f"Stage {stage.buf!r} index position {p} matches multiple cache axes: {match}")
-        cache_name = next(iter(match))
-        stage_free = free_vars(e)
-        load_e = load_index[p]
-        if stage_free == {cache_name}:
-            coords_by_axis[cache_name] = load_e
-        else:
-            non_cache = stage_free - {cache_name}
-            sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
-            coords_by_axis[cache_name] = sigma.apply(load_e)
-    return tuple(coords_by_axis[ax.name] for ax in stage.axes)
-
-
-def _redirect_loads(stmt: Stmt, redirects: dict[str, tuple[str, Stage]]) -> Stmt:
-    """Recursively rewrite ``Load(buf, ...)`` to ``Load(stage_buf,
-    smem_index)`` for every ``buf`` in ``redirects``."""
-    if isinstance(stmt, Load) and stmt.input in redirects:
-        stage_buf, stage = redirects[stmt.input]
-        return Load(name=stmt.name, input=stage_buf, index=_smem_coords_for_load(stage, stmt.index))
-    if isinstance(stmt, Loop):
-        return Loop(axis=stmt.axis, body=tuple(_redirect_loads(c, redirects) for c in stmt.body))
-    if isinstance(stmt, StridedLoop):
-        return StridedLoop(
-            axis=stmt.axis,
-            start=stmt.start,
-            step=stmt.step,
-            body=tuple(_redirect_loads(c, redirects) for c in stmt.body),
-        )
-    if isinstance(stmt, Cond):
-        return Cond(
-            cond=stmt.cond,
-            body=tuple(_redirect_loads(c, redirects) for c in stmt.body),
-            else_body=tuple(_redirect_loads(c, redirects) for c in stmt.else_body),
-        )
-    return stmt

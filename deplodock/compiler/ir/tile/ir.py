@@ -141,31 +141,31 @@ class Combine(Stmt):
 
 @dataclass
 class Stage(Stmt):
-    """Operand-cache declaration: stage ``buf`` for reuse across the
-    surrounding ``Tile`` body.
+    """Operand-cache declaration — stage ``buf`` into a named local
+    buffer for reuse across the surrounding ``Tile`` body.
 
-    Subsequent ``Load(buf, ...)`` reads in the body resolve to the
-    staged copy, not the original buffer. ``index`` is the original
-    source-buffer index pattern (with axis ``Var``s); ``axes`` lists the
-    axes that *vary* within the staged fragment — the smem buffer's
-    shape is ``tuple(ax.extent for ax in axes)``. Positions in
-    ``index`` whose ``Var`` name appears in ``axes`` are the
-    cache-dimension positions; other positions (typically block-bound
-    axes from ``Tile.axes``) are fixed per CUDA block and contribute
-    size 1 to the staged fragment.
+    SSA-like: ``name`` is the staged buffer's identifier; subsequent
+    ``Load(input=name, index=cache-local)`` reads in the body refer to
+    it directly. The strategy that inserts the Stage is also responsible
+    for rewriting body Loads to target ``name`` with cache-local
+    indices (Vars matching ``axes``).
+
+    - ``buf`` — source global buffer to load from.
+    - ``index`` — global-coordinate index pattern (with axis ``Var``s)
+      used by the cooperative load. Positions whose Var name appears in
+      ``axes`` are the cache-dimension positions; other positions
+      (typically block-bound from ``Tile.axes``, or Literal constants
+      for collapsed leading dims) are fixed per CUDA block.
+    - ``axes`` — cache axes; the smem buffer's shape is
+      ``tuple(ax.extent for ax in axes)``.
 
     Doesn't commit to storage class — materialization picks (smem in
     today's path; register file or async-copy paths possible in the
-    future). Subsequent body ``Load``s of ``buf`` get rewritten by
-    materialization to read from the staged buffer with the
-    cache-dimension positions of their original index.
-
-    Inserted by the input-staging strategy when multiple loops
-    in a cooperative ``Tile`` body Load the same buffer with
-    block-bound dimensions in common — typical of softmax / norm-style
-    fusions where the input is read three times.
+    future). Materialization expands a Stage into ``Smem(name, ...)``
+    plus the cooperative-load loop that fills it.
     """
 
+    name: str
     buf: str
     index: tuple[Expr, ...]
     axes: tuple[Axis, ...]
@@ -197,8 +197,21 @@ class TileOp(Op):
 
     @property
     def inputs(self) -> tuple[str, ...]:
-        """Distinct ``Load.input`` buf names in body first-use order."""
-        return tuple(dict.fromkeys(s.input for s in self.loads))
+        """Distinct external-buffer names in body first-use order.
+
+        A buffer is external if it's loaded from but not produced by a
+        ``Stage`` in this TileOp. Loads of staged names are skipped
+        (those bufs are smem-local at materialization). Stage source
+        bufs (``Stage.buf``) are included — they're the actual external
+        reads, performed by the cooperative load."""
+        stage_names = {s.name for s in self if isinstance(s, Stage)}
+        bufs: dict[str, None] = {}
+        for s in self:
+            if isinstance(s, Stage):
+                bufs.setdefault(s.buf, None)
+            elif isinstance(s, Load) and s.input not in stage_names:
+                bufs.setdefault(s.input, None)
+        return tuple(bufs)
 
     @property
     def writes(self) -> tuple[Write, ...]:
