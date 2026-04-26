@@ -22,7 +22,7 @@ def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
     frag = open_fragment(graph, [inp_x])
     sum_id = frag.add_node(
         op=ReduceOp(op="sum", axis=axis),
-        inputs=[inp_x.id],
+        inputs=[inp_x],
         output=Tensor(f"{out.name}_sum", out.shape, out.dtype),
     )
     count_bc = const_bc(frag, name=f"{out.name}_count", value=count_value, target_shape=out.shape, dtype=out.dtype)

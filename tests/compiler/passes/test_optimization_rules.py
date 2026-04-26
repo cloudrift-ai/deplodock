@@ -30,26 +30,26 @@ def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 def test_broadcast_to_is_identity_when_shapes_match():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
-    out_id = broadcast_to(g, "x", (4, 8))
-    assert out_id == "x", "matching shapes must short-circuit"
+    out = broadcast_to(g, "x", (4, 8))
+    assert out.id == "x", "matching shapes must short-circuit"
     assert len(g.nodes) == 1
 
 
 def test_broadcast_to_adds_indexmap_for_rank_mismatch():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("y", (8,)), node_id="y")
-    out_id = broadcast_to(g, "y", (4, 8))
-    assert out_id != "y"
-    assert g.nodes[out_id].output.shape == (4, 8)
-    assert isinstance(g.nodes[out_id].op, IndexMapOp)
+    out = broadcast_to(g, "y", (4, 8))
+    assert out.id != "y"
+    assert out.output.shape == (4, 8)
+    assert isinstance(out.op, IndexMapOp)
 
 
 def test_broadcast_to_scalar_to_tensor():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("s", (1,)), node_id="s")
-    out_id = broadcast_to(g, "s", (2, 4, 8))
-    assert g.nodes[out_id].output.shape == (2, 4, 8)
-    assert isinstance(g.nodes[out_id].op, IndexMapOp)
+    out = broadcast_to(g, "s", (2, 4, 8))
+    assert out.output.shape == (2, 4, 8)
+    assert isinstance(out.op, IndexMapOp)
 
 
 def test_broadcast_to_rejects_non_size_1_mismatch():

@@ -24,28 +24,27 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
 PATTERN = [Pattern("root", SdpaOp)]
 
 
-def _maybe_gqa(frag: Graph, src_id: str, q_batch: tuple, src_batch: tuple, target_last_dims: tuple, *, name: str, dtype) -> str:
+def _maybe_gqa(frag: Graph, src: Node | str, q_batch: tuple, src_batch: tuple, target_last_dims: tuple, *, name: str) -> Node | str:
     """Broadcast src's head axis to match q's head count via integer-divide indexing.
 
-    Returns src_id unchanged when there is no GQA mismatch. Head axis is the last
+    Returns ``src`` unchanged when there is no GQA mismatch. Head axis is the last
     batch dim on each side; ranks may differ (V's prefix is preserved).
     """
     if not (q_batch and src_batch):
-        return src_id
+        return src
     q_heads = q_batch[-1] if isinstance(q_batch[-1], int) else None
     s_heads = src_batch[-1] if isinstance(src_batch[-1], int) else None
     if not (q_heads and s_heads and q_heads > s_heads and q_heads % s_heads == 0):
-        return src_id
+        return src
     head_axis = len(src_batch) - 1
     target_shape = tuple(src_batch[:head_axis]) + (q_heads,) + tuple(target_last_dims)
     return gqa_broadcast(
         frag,
-        src_id,
+        src,
         target_shape=target_shape,
         head_axis=head_axis,
         group_size=q_heads // s_heads,
         name=name,
-        dtype=dtype,
     )
 
 
@@ -68,20 +67,20 @@ def rewrite(graph: Graph, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out
     kt_shape = k_batch + (head_dim, seq_len) if isinstance(head_dim, int) else k_shape
     kt_id = frag.add_node(
         op=TransposeOp(axes=(-2, -1)),
-        inputs=[inp_k.id],
+        inputs=[inp_k],
         output=Tensor(f"{name}_kt", kt_shape, dtype),
     )
-    kt_id = _maybe_gqa(frag, kt_id, q_batch, k_batch, (head_dim, seq_len), name=f"{name}_kt_gqa", dtype=dtype)
+    kt = _maybe_gqa(frag, kt_id, q_batch, k_batch, (head_dim, seq_len), name=f"{name}_kt_gqa")
 
     # QK^T matmul.
-    qk_id = matmul_decompose(frag, inp_q.id, kt_id, name=f"{name}_qk", dtype=dtype)
+    qk = matmul_decompose(frag, inp_q, kt, name=f"{name}_qk")
 
     # Scale by 1/sqrt(head_dim).
     scale_value = 1.0 / math.sqrt(head_dim) if isinstance(head_dim, int) else None
     scale_bc = const_bc(frag, name=f"{name}_scale", value=scale_value, target_shape=scores_shape, dtype=dtype)
     scaled_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
-        inputs=[qk_id, scale_bc],
+        inputs=[qk, scale_bc],
         output=Tensor(f"{name}_scaled", scores_shape, dtype),
     )
 
@@ -118,12 +117,12 @@ def rewrite(graph: Graph, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out
             output=Tensor(f"{name}_masked", scores_shape, dtype),
         )
 
-    softmax_id = softmax_decompose(frag, scaled_id, -1, name=f"{name}_softmax", dtype=dtype)
+    softmax = softmax_decompose(frag, scaled_id, -1, name=f"{name}_softmax")
 
     # Softmax @ V (with GQA on V).
     v_last = v_shape[-2:] if len(v_shape) >= 2 else v_shape
-    v_eff_id = _maybe_gqa(frag, inp_v.id, q_batch, v_batch, v_last, name=f"{name}_v_gqa", dtype=dtype)
-    sv_id = matmul_decompose(frag, softmax_id, v_eff_id, name=name, dtype=dtype)
+    v_eff = _maybe_gqa(frag, inp_v, q_batch, v_batch, v_last, name=f"{name}_v_gqa")
+    sv = matmul_decompose(frag, softmax, v_eff, name=name)
 
-    frag.outputs = [sv_id]
+    frag.outputs = [sv.id]
     return frag

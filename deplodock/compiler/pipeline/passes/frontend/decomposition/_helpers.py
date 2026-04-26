@@ -3,6 +3,11 @@
 The lower-level primitives (``broadcast_to``, ``squeeze_axis``,
 ``matmul_unsqueeze``) live in their own modules and are re-exported here so
 rules only need a single import.
+
+Helpers take and return ``Node`` values — they read shape/dtype straight off
+the node, so callers don't re-look up ``frag.nodes[id].output``. ``Graph.add_node``
+accepts ``Node | str`` for ``inputs``, so passing a Node through to a raw
+``add_node`` call works too.
 """
 
 from __future__ import annotations
@@ -30,7 +35,12 @@ __all__ = [
 ]
 
 
-def open_fragment(graph: Graph, exts: Iterable[str | Node]) -> Graph:
+def _node(frag: Graph, x: Node | str) -> Node:
+    """Coerce a Node-or-id to the Node in ``frag``."""
+    return x if isinstance(x, Node) else frag.nodes[x]
+
+
+def open_fragment(graph: Graph, exts: Iterable[Node | str]) -> Graph:
     """Return a fresh fragment with InputOp sentinels for every ext.
 
     ``exts`` may be a mix of node ids and ``Node`` objects — Nodes get
@@ -44,13 +54,16 @@ def open_fragment(graph: Graph, exts: Iterable[str | Node]) -> Graph:
     return frag
 
 
-def single_indexmap(frag: Graph, x_id: str, *, out_shape: tuple, coord_map, name: str, dtype) -> str:
+def single_indexmap(frag: Graph, x: Node | str, *, out_shape: tuple, coord_map, name: str, dtype: str | None = None) -> Node:
     """Wrap a single-source IndexMapOp with the given coord_map."""
-    return frag.add_node(
+    x = _node(frag, x)
+    dtype = dtype or x.output.dtype
+    nid = frag.add_node(
         op=IndexMapOp(out_shape=tuple(out_shape), sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),)),
-        inputs=[x_id],
+        inputs=[x],
         output=Tensor(name, tuple(out_shape), dtype),
     )
+    return frag.nodes[nid]
 
 
 def reduction_shape(shape: tuple, axis: int) -> tuple:
@@ -59,7 +72,7 @@ def reduction_shape(shape: tuple, axis: int) -> tuple:
     return tuple(shape[:a]) + (1,) + tuple(shape[a + 1 :])
 
 
-def const_bc(frag: Graph, *, name: str, value, target_shape: tuple, dtype) -> str:
+def const_bc(frag: Graph, *, name: str, value, target_shape: tuple, dtype: str) -> Node:
     """Add a scalar ConstantOp and broadcast it to ``target_shape``."""
     cid = frag.add_node(
         op=ConstantOp(name=name, value=value),
@@ -69,16 +82,16 @@ def const_bc(frag: Graph, *, name: str, value, target_shape: tuple, dtype) -> st
     return broadcast_to(frag, cid, tuple(target_shape))
 
 
-def matmul_decompose(frag: Graph, a_id: str, b_id: str, *, name: str, dtype) -> str:
+def matmul_decompose(frag: Graph, a: Node | str, b: Node | str, *, name: str, dtype: str | None = None) -> Node:
     """Decompose a matmul into unsqueeze → broadcast → multiply → reduce_sum → squeeze.
 
-    Returns the squeezed output node id.
+    Returns the squeezed output node.
     """
-    a_shape = tuple(frag.nodes[a_id].output.shape)
-    b_shape = tuple(frag.nodes[b_id].output.shape)
-    a_unsq, b_unsq, mul_shape, k_axis = matmul_unsqueeze(a_shape, b_shape)
-    a_uid = frag.add_node(op=a_unsq, inputs=[a_id], output=Tensor(f"{name}_a_unsq", a_unsq.out_shape, dtype))
-    b_uid = frag.add_node(op=b_unsq, inputs=[b_id], output=Tensor(f"{name}_b_unsq", b_unsq.out_shape, dtype))
+    a, b = _node(frag, a), _node(frag, b)
+    dtype = dtype or a.output.dtype
+    a_unsq, b_unsq, mul_shape, k_axis = matmul_unsqueeze(a.output.shape, b.output.shape)
+    a_uid = frag.add_node(op=a_unsq, inputs=[a], output=Tensor(f"{name}_a_unsq", a_unsq.out_shape, dtype))
+    b_uid = frag.add_node(op=b_unsq, inputs=[b], output=Tensor(f"{name}_b_unsq", b_unsq.out_shape, dtype))
     a_bc = broadcast_to(frag, a_uid, mul_shape)
     b_bc = broadcast_to(frag, b_uid, mul_shape)
     ew = frag.add_node(
@@ -95,19 +108,21 @@ def matmul_decompose(frag: Graph, a_id: str, b_id: str, *, name: str, dtype) -> 
     return squeeze_axis(frag, red, k_axis, out_name=name)
 
 
-def softmax_decompose(frag: Graph, x_id: str, axis: int, *, name: str, dtype) -> str:
-    """Decompose softmax into max → sub → exp → sum → div. Returns the div node id."""
-    out_shape = tuple(frag.nodes[x_id].output.shape)
+def softmax_decompose(frag: Graph, x: Node | str, axis: int, *, name: str, dtype: str | None = None) -> Node:
+    """Decompose softmax into max → sub → exp → sum → div. Returns the div node."""
+    x = _node(frag, x)
+    dtype = dtype or x.output.dtype
+    out_shape = tuple(x.output.shape)
     red_shape = reduction_shape(out_shape, axis) if out_shape else (1,)
     max_id = frag.add_node(
         op=ReduceOp(op="maximum", axis=axis),
-        inputs=[x_id],
+        inputs=[x],
         output=Tensor(f"{name}_max", red_shape, dtype),
     )
     max_bc = broadcast_to(frag, max_id, out_shape)
     sub_id = frag.add_node(
         op=ElementwiseOp(op="subtract"),
-        inputs=[x_id, max_bc],
+        inputs=[x, max_bc],
         output=Tensor(f"{name}_shifted", out_shape, dtype),
     )
     exp_id = frag.add_node(
@@ -121,17 +136,22 @@ def softmax_decompose(frag: Graph, x_id: str, axis: int, *, name: str, dtype) ->
         output=Tensor(f"{name}_sum", red_shape, dtype),
     )
     sum_bc = broadcast_to(frag, sum_id, out_shape)
-    return frag.add_node(
+    div_id = frag.add_node(
         op=ElementwiseOp(op="divide"),
         inputs=[exp_id, sum_bc],
         output=Tensor(name, out_shape, dtype),
     )
+    return frag.nodes[div_id]
 
 
-def gqa_broadcast(frag: Graph, src_id: str, *, target_shape: tuple, head_axis: int, group_size: int, name: str, dtype) -> str:
+def gqa_broadcast(
+    frag: Graph, src: Node | str, *, target_shape: tuple, head_axis: int, group_size: int, name: str, dtype: str | None = None
+) -> Node:
     """Broadcast a head-axis via integer-divide indexing: out[..., h, ...] = src[..., h // g, ...]."""
+    src = _node(frag, src)
+    dtype = dtype or src.output.dtype
     coord_map = []
     for d in range(len(target_shape)):
         p = placeholder(d)
         coord_map.append(BinaryExpr("/", p, Literal(group_size, "int")) if d == head_axis else p)
-    return single_indexmap(frag, src_id, out_shape=target_shape, coord_map=coord_map, name=name, dtype=dtype)
+    return single_indexmap(frag, src, out_shape=target_shape, coord_map=coord_map, name=name, dtype=dtype)

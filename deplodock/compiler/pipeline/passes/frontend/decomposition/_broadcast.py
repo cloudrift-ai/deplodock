@@ -13,17 +13,17 @@ have shape equal to its output.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 
 
-def broadcast_to(graph: Graph, node_id: str, target_shape: tuple) -> str:
-    """Return a node id whose output has shape ``target_shape``.
+def broadcast_to(graph: Graph, node: Node | str, target_shape: tuple) -> Node:
+    """Return a node whose output has shape ``target_shape``.
 
-    If ``node_id``'s output already has ``target_shape``, returns ``node_id``
+    If ``node``'s output already has ``target_shape``, returns ``node``
     unchanged. Otherwise adds an IndexMapOp to ``graph`` that broadcasts the
-    input to ``target_shape`` and returns the new node's id. Follows numpy's
+    input to ``target_shape`` and returns the new node. Follows numpy's
     right-aligned broadcast rules: dims of size 1 broadcast via ``Literal(0)``,
     matching dims pass through via ``placeholder(out_d)``, and the input's rank
     must be ≤ the target rank.
@@ -31,11 +31,12 @@ def broadcast_to(graph: Graph, node_id: str, target_shape: tuple) -> str:
     Raises ``ValueError`` when the broadcast is illegal (non-size-1 dim
     mismatch, or input rank exceeds target rank).
     """
-    node = graph.nodes[node_id]
+    if not isinstance(node, Node):
+        node = graph.nodes[node]
     inp_shape = tuple(node.output.shape)
     target_shape = tuple(target_shape)
     if inp_shape == target_shape:
-        return node_id
+        return node
     indexmap = _broadcast_indexmap(inp_shape, target_shape)
     if indexmap is None:
         raise ValueError(f"cannot broadcast shape {inp_shape} to {target_shape}: non-size-1 dim mismatch or rank exceeds target")
@@ -43,15 +44,16 @@ def broadcast_to(graph: Graph, node_id: str, target_shape: tuple) -> str:
     # name — fragment ids get rewritten on splicing, but tensor names carry
     # through, so anchoring the "_bc" suffix on the name avoids collisions when
     # two fragments internally use the same auto-generated id.
-    return graph.add_node(
+    nid = graph.add_node(
         op=indexmap,
-        inputs=[node_id],
+        inputs=[node],
         output=Tensor(f"{node.output.name}_bc", target_shape, node.output.dtype),
     )
+    return graph.nodes[nid]
 
 
-def squeeze_axis(graph: Graph, node_id: str, axis: int, out_name: str | None = None) -> str:
-    """Drop a single size-1 axis from ``node_id``'s output via an IndexMapOp.
+def squeeze_axis(graph: Graph, node: Node | str, axis: int, out_name: str | None = None) -> Node:
+    """Drop a single size-1 axis from ``node``'s output via an IndexMapOp.
 
     Used by decomposition rules (matmul, linear, etc.) that keep a reduction's
     reduced axis at size 1 for the ``ReduceOp`` itself, then squeeze it away
@@ -63,7 +65,8 @@ def squeeze_axis(graph: Graph, node_id: str, axis: int, out_name: str | None = N
     input shape. Negative axes count from the end. ``out_name`` names the new
     tensor; defaults to ``"{input_name}_sq"``.
     """
-    node = graph.nodes[node_id]
+    if not isinstance(node, Node):
+        node = graph.nodes[node]
     inp_shape = tuple(node.output.shape)
     a = axis if axis >= 0 else len(inp_shape) + axis
     if a < 0 or a >= len(inp_shape):
@@ -79,11 +82,12 @@ def squeeze_axis(graph: Graph, node_id: str, axis: int, out_name: str | None = N
         else:
             coord_map.append(placeholder(out_d))
             out_d += 1
-    return graph.add_node(
+    nid = graph.add_node(
         op=IndexMapOp(out_shape=out_shape, sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),)),
-        inputs=[node_id],
+        inputs=[node],
         output=Tensor(out_name or f"{node.output.name}_sq", out_shape, node.output.dtype),
     )
+    return graph.nodes[nid]
 
 
 def _broadcast_indexmap(inp_shape: tuple, out_shape: tuple) -> IndexMapOp | None:
