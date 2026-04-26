@@ -177,7 +177,7 @@ class TileOp(Op):
                     render_stmt(s, indent + "    ", inner)
                 return
             if isinstance(stmt, StridedLoop):
-                kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
+                kind = "reduce" if stmt.is_reduce else "free"
                 start = render_expr(stmt.start)
                 step = render_expr(stmt.step) if hasattr(stmt.step, "__class__") and not isinstance(stmt.step, int) else stmt.step
                 lines.append(f"{indent}StridedLoop({stmt.axis.name} = {start}; < {stmt.axis.extent}; += {step}):  # {kind}")
@@ -213,7 +213,7 @@ class TileOp(Op):
                     lines.append(f"{indent}{prefix} {br.value} when ({render_expr(br.select)})")
                 return
             if isinstance(stmt, Loop):
-                kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
+                kind = "reduce" if stmt.is_reduce else "free"
                 lines.append(f"{indent}Loop({stmt.axis.name} in 0..{stmt.axis.extent}):  # {kind}")
                 for s in stmt.body:
                     render_stmt(s, indent + "    ", owned_axes)

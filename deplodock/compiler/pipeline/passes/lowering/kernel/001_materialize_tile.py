@@ -99,7 +99,7 @@ def _materialize(blk: Tile) -> Stmt:
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
             new_body.append(_emit_loop(stmt, tid_expr, transform))
-            if _is_reduce(stmt):
+            if stmt.is_reduce:
                 pending_reduce = next(a for a in stmt.body if isinstance(a, Accum))
             else:
                 pending_reduce = None
@@ -208,10 +208,6 @@ def _emit_combine(accum: Accum, t: str) -> list[Stmt]:
         Sync(),
         Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
     ]
-
-
-def _is_reduce(loop) -> bool:
-    return any(isinstance(s, Accum) for s in loop.body)
 
 
 # ---------------------------------------------------------------------------

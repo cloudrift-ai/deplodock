@@ -148,7 +148,7 @@ class KernelOp(Op):
                 lines.append(f"{indent}TreeHalve({stmt.buf}, op={stmt.op.name}, length={stmt.length}, tid={stmt.tid_var})")
                 return
             if isinstance(stmt, StridedLoop):
-                kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
+                kind = "reduce" if stmt.is_reduce else "free"
                 start = render_expr(stmt.start)
                 lines.append(f"{indent}StridedLoop({stmt.axis.name} = {start}; < {stmt.axis.extent}; += {stmt.step}):  # {kind}")
                 for s in stmt.body:
@@ -175,7 +175,7 @@ class KernelOp(Op):
                     lines.append(f"{indent}{prefix} {br.value} when ({render_expr(br.select)})")
                 return
             if isinstance(stmt, Loop):
-                kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
+                kind = "reduce" if stmt.is_reduce else "free"
                 lines.append(f"{indent}Loop({stmt.axis.name} in 0..{stmt.axis.extent}):  # {kind}")
                 for s in stmt.body:
                     render_stmt(s, indent + "    ")

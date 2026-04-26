@@ -298,6 +298,11 @@ class Loop(Stmt):
     def nested(self) -> tuple[tuple[Stmt, ...], ...]:
         return (self.body,)
 
+    @property
+    def is_reduce(self) -> bool:
+        """A loop is a reduce-loop iff its immediate body contains an ``Accum``."""
+        return any(isinstance(s, Accum) for s in self.body)
+
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         """Recursive rewrite: rebuild ``body`` with each child's ``rewrite``.
 
@@ -363,6 +368,11 @@ class StridedLoop(Stmt):
 
     def nested(self) -> tuple[tuple[Stmt, ...], ...]:
         return (self.body,)
+
+    @property
+    def is_reduce(self) -> bool:
+        """A strided loop is a reduce-loop iff its immediate body contains an ``Accum``."""
+        return any(isinstance(s, Accum) for s in self.body)
 
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return StridedLoop(

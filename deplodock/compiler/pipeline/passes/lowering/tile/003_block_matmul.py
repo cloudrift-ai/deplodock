@@ -170,7 +170,7 @@ def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[Loop, Wri
     reduce_loop, write = body
     if not (isinstance(reduce_loop, Loop) and isinstance(write, Write)):
         return None
-    if not _is_reduce(reduce_loop):
+    if not reduce_loop.is_reduce:
         return None
     var_names = {e.name for e in write.index if isinstance(e, Var)}
     if {m_name, n_name} - var_names:
@@ -198,10 +198,6 @@ def _extract_inner(reduce_loop: Loop) -> tuple[Accum, Load, Load, Assign] | None
     if accum.value != mul.name:
         return None
     return accum, load_a, load_b, mul
-
-
-def _is_reduce(loop: Loop) -> bool:
-    return any(isinstance(s, Accum) for s in loop.body)
 
 
 def _id(name: str) -> str:

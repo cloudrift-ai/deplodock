@@ -97,7 +97,7 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     if len(blk.thread_axes) != 1:
         return None
 
-    reduce_loops = [s for s in blk.body if isinstance(s, Loop) and _is_reduce(s)]
+    reduce_loops = [s for s in blk.body if isinstance(s, Loop) and s.is_reduce]
     if not reduce_loops:
         return None
     if int(reduce_loops[0].axis.extent) < BLOCK_SIZE:
@@ -116,7 +116,7 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     for s in blk.body:
         if isinstance(s, Loop):
             new_body.append(StridedLoop(axis=s.axis, start=t_start, step=step, body=s.body))
-            if _is_reduce(s):
+            if s.is_reduce:
                 accum = next(a for a in s.body if isinstance(a, Accum))
                 new_body.append(Combine(name=accum.name, op=accum.op))
         else:
@@ -127,7 +127,3 @@ def _rewrite_block(blk: Tile) -> Tile | None:
         *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes),
     )
     return Tile(axes=new_axes, body=tuple(new_body))
-
-
-def _is_reduce(loop: Loop) -> bool:
-    return any(isinstance(s, Accum) for s in loop.body)
