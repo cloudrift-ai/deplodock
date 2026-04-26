@@ -36,7 +36,7 @@ from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve
-from deplodock.compiler.ir.stmt import Accum, Init, Load, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.stmt import Accum, Init, Load, Loop, Stmt, StridedLoop, Tile, Write, iter_body
 from deplodock.compiler.ir.tile.ir import BLOCK_SIZE, Combine, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
@@ -157,17 +157,10 @@ def _single_thread_var(thread_axes: tuple) -> str:
 
 def _collect_init_stmts(stmts: list[Stmt]) -> list[Stmt]:
     """Walk transitively for distinct Accums; return one Init per name."""
-
-    def walk(ss):
-        for s in ss:
-            if isinstance(s, Accum):
-                yield s
-            for child_body in s.nested():
-                yield from walk(child_body)
-
     seen: dict[str, Accum] = {}
-    for accum in walk(stmts):
-        seen.setdefault(accum.name, accum)
+    for s in iter_body(tuple(stmts)):
+        if isinstance(s, Accum):
+            seen.setdefault(s.name, s)
     return [Init(name=name, op=accum.op) for name, accum in seen.items()]
 
 

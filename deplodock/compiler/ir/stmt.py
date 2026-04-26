@@ -11,6 +11,9 @@ Defined here rather than under any one IR package because all three IRs
 - Control flow: ``Cond`` (if/else), ``Loop`` (iterate over an axis).
 - Tree walks: ``iter_body`` (pre-order traversal driven by
   ``Stmt.nested``), ``map_body`` (flat transformer).
+- Pretty printing: ``Stmt.pretty(indent)`` returns indented lines for
+  the stmt; block-structured stmts recurse into their bodies. Used by
+  every Op's ``pretty_body`` for kernel dumps.
 
 Each IR layer adds its own scheduling-specific Stmts on top:
 
@@ -34,7 +37,10 @@ from dataclasses import dataclass, field
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, free_vars
+from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.sigma import Sigma
+
+INDENT = "    "
 
 # ---------------------------------------------------------------------------
 # Stmt — abstract base
@@ -82,6 +88,24 @@ class Stmt:
         """
         return ()
 
+    def pretty(self, indent: str = "") -> list[str]:
+        """Render this stmt as a list of indented lines.
+
+        Block-structured stmts recurse into their bodies via
+        ``child.pretty(indent + INDENT)``; leaves return a single line.
+        Subclasses override to control formatting; default surfaces the
+        class name as a placeholder for any stmt that forgot to override.
+        """
+        return [f"{indent}<unrecognized {type(self).__name__}>"]
+
+
+def pretty_body(body: tuple[Stmt, ...], indent: str = "") -> list[str]:
+    """Flatten ``stmt.pretty(indent)`` over a body sequence."""
+    out: list[str] = []
+    for s in body:
+        out.extend(s.pretty(indent))
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Leaves — pure compute primitives
@@ -109,6 +133,10 @@ class Load(Stmt):
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Load(name=rename_ssa(self.name), input=self.input, index=tuple(sigma.apply(e) for e in self.index))
 
+    def pretty(self, indent: str = "") -> list[str]:
+        idx = ", ".join(render_expr(e) for e in self.index)
+        return [f"{indent}{self.name} = load {self.input}[{idx}]"]
+
 
 @dataclass(frozen=True)
 class Assign(Stmt):
@@ -133,6 +161,9 @@ class Assign(Stmt):
 
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Assign(name=rename_ssa(self.name), op=self.op, args=tuple(rename_ssa(a) for a in self.args))
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.name} = {self.op.name}({', '.join(self.args)})"]
 
 
 @dataclass(frozen=True)
@@ -174,6 +205,9 @@ class Accum(Stmt):
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Accum(name=rename_ssa(self.name), value=rename_ssa(self.value), op=self.op)
 
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.name} <- {self.op.name}({self.name}, {self.value})"]
+
 
 @dataclass(frozen=True)
 class Init(Stmt):
@@ -208,6 +242,9 @@ class Init(Stmt):
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Init(name=rename_ssa(self.name), op=self.op)
 
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}Init({self.name}, op={self.op.name})"]
+
 
 @dataclass(frozen=True)
 class Write(Stmt):
@@ -229,6 +266,10 @@ class Write(Stmt):
 
     def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
         return Write(output=self.output, index=tuple(sigma.apply(e) for e in self.index), value=rename_ssa(self.value))
+
+    def pretty(self, indent: str = "") -> list[str]:
+        idx = ", ".join(render_expr(e) for e in self.index)
+        return [f"{indent}{self.output}[{idx}] = {self.value}"]
 
 
 @dataclass(frozen=True)
@@ -264,6 +305,13 @@ class Select(Stmt):
             name=rename_ssa(self.name),
             branches=tuple(SelectBranch(value=rename_ssa(b.value), select=sigma.apply(b.select)) for b in self.branches),
         )
+
+    def pretty(self, indent: str = "") -> list[str]:
+        lines: list[str] = []
+        for bi, br in enumerate(self.branches):
+            prefix = f"{self.name} =" if bi == 0 else f"{' ' * len(self.name)}  "
+            lines.append(f"{indent}{prefix} {br.value} when ({render_expr(br.select)})")
+        return lines
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +359,11 @@ class Loop(Stmt):
         """
         return Loop(axis=self.axis, body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body))
 
+    def pretty(self, indent: str = "") -> list[str]:
+        kind = "reduce" if self.is_reduce else "free"
+        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}:  # {kind}"
+        return [head, *pretty_body(self.body, indent + INDENT)]
+
 
 @dataclass
 class Tile(Stmt):
@@ -343,6 +396,10 @@ class Tile(Stmt):
     @property
     def block_axes(self) -> tuple[Axis, ...]:
         return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in self.axes) or "-"
+        return [f"{indent}Tile(axes=({axes})):", *pretty_body(self.body, indent + INDENT)]
 
 
 @dataclass(frozen=True)
@@ -382,6 +439,13 @@ class StridedLoop(Stmt):
             body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
         )
 
+    def pretty(self, indent: str = "") -> list[str]:
+        kind = "reduce" if self.is_reduce else "free"
+        start = render_expr(self.start)
+        step = render_expr(self.step) if isinstance(self.step, Expr) else self.step
+        head = f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {kind}"
+        return [head, *pretty_body(self.body, indent + INDENT)]
+
 
 @dataclass(frozen=True)
 class Cond(Stmt):
@@ -418,6 +482,13 @@ class Cond(Stmt):
             body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
             else_body=tuple(s.rewrite(rename_ssa, sigma) for s in self.else_body),
         )
+
+    def pretty(self, indent: str = "") -> list[str]:
+        lines = [f"{indent}if ({render_expr(self.cond)}):", *pretty_body(self.body, indent + INDENT)]
+        if self.else_body:
+            lines.append(f"{indent}else:")
+            lines.extend(pretty_body(self.else_body, indent + INDENT))
+        return lines
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +542,7 @@ def map_body(
 
 
 __all__ = [
+    "INDENT",
     "Stmt",
     "Load",
     "Assign",
@@ -485,4 +557,5 @@ __all__ = [
     "Cond",
     "iter_body",
     "map_body",
+    "pretty_body",
 ]
