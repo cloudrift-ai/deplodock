@@ -36,7 +36,6 @@ from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var, free_vars
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve
-from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Cond, Init, Load, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import BLOCK_SIZE, Combine, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
@@ -289,48 +288,42 @@ def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
     The cooperative load reads a contiguous slab of ``stage.buf``
     starting at ``stage.origin`` (block-uniform) and spanning
     ``stage.axes`` extents. Each thread fetches one or more elements
-    via a flat-decode StridedLoop driven by ``tid_expr``.
+    via a StridedLoop driven by ``tid_expr``: for a 1D slab, the loop
+    iterates the cache axis directly; for N-D, it iterates a synthetic
+    flat axis decoded into per-axis coords.
 
-    For each source-buffer dim ``d``, the global address is
-    ``stage.origin[d]`` plus the decoded slab coord at ``d`` (if any
-    slab axis maps to that dim via ``slab_dims``).
+    Source index per source-buffer dim ``d`` =
+    ``origin[d] + decoded[d]`` (the decoded slab coord, if any axis
+    maps to ``d`` via ``slab_dims``); else just ``origin[d]``.
 
     Emits a leading ``Sync`` so iterations 2+ of an enclosing serial
-    loop (typical chunked-K matmul) wait for the prior iteration's
-    compute to finish reading smem before this iteration overwrites it.
-    Iteration 1's leading Sync is harmless (no prior state)."""
-    extents = tuple(int(ax.extent) for ax in stage.axes)
-    if not extents:
+    loop (chunked-K matmul) wait for the prior iteration's compute to
+    finish reading smem before this iteration overwrites it. Iteration
+    1's leading Sync is harmless (no prior state)."""
+    if not stage.axes:
         raise ValueError(f"Stage {stage.name!r} has no cache axes")
-    smem = Smem(name=stage.name, extents=extents)
-    load_name = f"{stage.name}_v"
+    extents = tuple(int(ax.extent) for ax in stage.axes)
 
+    # Iteration axis + per-cache-axis coord. 1D: iterate the cache axis
+    # directly (coord = Var of the axis). N-D: synthesize a flat axis
+    # and row-major-decode into per-axis coords.
     if len(stage.axes) == 1:
-        cache_axis = stage.axes[0]
-        slab_dim = stage.slab_dims[0]
-        source_index = _build_source_index(stage.origin, {slab_dim: Var(cache_axis.name)})
-        cooperative_load = StridedLoop(
-            axis=cache_axis,
-            start=tid_expr,
-            step=BLOCK_SIZE,
-            body=(
-                Load(name=load_name, input=stage.buf, index=source_index),
-                Write(output=stage.name, index=(Var(cache_axis.name),), value=load_name),
-            ),
-        )
-        return [Sync(), smem, cooperative_load, Sync()]
+        iter_axis = stage.axes[0]
+        coord_for = {iter_axis.name: Var(iter_axis.name)}
+    else:
+        total = 1
+        for e in extents:
+            total *= e
+        iter_axis = Axis(name=f"{stage.name}_flat", extent=total)
+        coord_for = _flat_decode(stage.axes, iter_axis.name)
 
-    total = 1
-    for e in extents:
-        total *= e
-    flat_name = f"{stage.name}_flat"
-    flat_axis = Axis(name=flat_name, extent=total)
-    decode_sigma = _flat_decode_sigma(stage.axes, flat_name)
-    decoded_per_dim = {dim: decode_sigma.apply(Var(ax.name)) for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
-    source_index = _build_source_index(stage.origin, decoded_per_dim)
-    smem_index = tuple(decode_sigma.apply(Var(ax.name)) for ax in stage.axes)
+    decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
+    source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
+    smem_index = tuple(coord_for[ax.name] for ax in stage.axes)
+
+    load_name = f"{stage.name}_v"
     cooperative_load = StridedLoop(
-        axis=flat_axis,
+        axis=iter_axis,
         start=tid_expr,
         step=BLOCK_SIZE,
         body=(
@@ -338,34 +331,23 @@ def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
             Write(output=stage.name, index=smem_index, value=load_name),
         ),
     )
-    return [Sync(), smem, cooperative_load, Sync()]
+    return [Sync(), Smem(name=stage.name, extents=extents), cooperative_load, Sync()]
 
 
-def _build_source_index(origin: tuple, decoded_per_dim: dict) -> tuple:
-    """Source-buffer global index per dim: ``origin[d]`` plus the
-    decoded slab coord at ``d`` (if any). Dims with no slab axis stay
-    at the block-uniform origin."""
-    return tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(origin))
+def _flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:
+    """Row-major decode of a flat index into per-axis coordinates.
 
-
-def _flat_decode_sigma(cache_axes: tuple[Axis, ...], flat_name: str) -> Sigma:
-    """Decode a flat row-major index back into per-axis coordinates."""
+    Innermost axis: ``flat % extent``. Middle axes:
+    ``(flat / inner_stride) % extent``. Outermost axis: ``flat /
+    outer_stride`` (mod is redundant — flat < total)."""
     flat = Var(flat_name)
-    mapping: dict = {}
+    coords: dict = {}
     inner_stride = 1
     for ax in reversed(cache_axes):
         ext = int(ax.extent)
-        if inner_stride == 1:
-            mapping[ax.name] = flat % Literal(ext, "int")
-        else:
-            mapping[ax.name] = (flat / Literal(inner_stride, "int")) % Literal(ext, "int")
+        coords[ax.name] = flat % Literal(ext, "int") if inner_stride == 1 else (flat / Literal(inner_stride, "int")) % Literal(ext, "int")
         inner_stride *= ext
     outer = cache_axes[0]
-    outer_stride = 1
-    for ax in cache_axes[1:]:
-        outer_stride *= int(ax.extent)
-    if outer_stride == 1:
-        mapping[outer.name] = flat
-    else:
-        mapping[outer.name] = flat / Literal(outer_stride, "int")
-    return Sigma(mapping)
+    outer_stride = inner_stride // int(outer.extent)
+    coords[outer.name] = flat if outer_stride == 1 else flat / Literal(outer_stride, "int")
+    return coords
