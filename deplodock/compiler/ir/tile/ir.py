@@ -146,9 +146,7 @@ class Stage(Stmt):
     slab_dims: tuple[int, ...]
 
     def pretty(self, indent: str = "") -> list[str]:
-        from deplodock.compiler.ir.expr import render as render_expr
-
-        origin = ", ".join(render_expr(e) for e in self.origin)
+        origin = ", ".join(e.pretty() for e in self.origin)
         slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.slab_dims, strict=True))
         return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab}))"]
 

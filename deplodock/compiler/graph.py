@@ -538,7 +538,7 @@ def _fmt_indexmap(node: Node, graph: Graph) -> str:
     visually distinct from scalar slices. Everything else (multi-source,
     selected reads, many dims) falls back to ``indexmap(src0, src1, ...)``.
     """
-    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, render
+    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var, substitute
 
     op = node.op
     sources = op.sources
@@ -553,15 +553,7 @@ def _fmt_indexmap(node: Node, graph: Graph) -> str:
     input_id = node.inputs[src.input_idx] if src.input_idx < len(node.inputs) else None
     input_shape = graph.nodes[input_id].output.shape if input_id and input_id in graph.nodes else ()
 
-    def rename(e):
-        if isinstance(e, Var) and e.name.startswith(PLACEHOLDER_PREFIX):
-            try:
-                n = int(e.name[len(PLACEHOLDER_PREFIX) :])
-                if 0 <= n < len(_DIM_NAMES):
-                    return _DIM_NAMES[n]
-            except ValueError:
-                pass
-        return None
+    placeholder_rename = {f"{PLACEHOLDER_PREFIX}{n}": Var(name) for n, name in enumerate(_DIM_NAMES)}
 
     coord_strs: list[str] = []
     for dim, e in enumerate(src.coord_map):
@@ -569,5 +561,5 @@ def _fmt_indexmap(node: Node, graph: Graph) -> str:
         if isinstance(e, Literal) and e.value == 0 and dim < len(input_shape) and input_shape[dim] == 1:
             coord_strs.append("na")
         else:
-            coord_strs.append(render(e, rename))
+            coord_strs.append(substitute(e, placeholder_rename).pretty())
     return f"{input_name}[{', '.join(coord_strs)}]"

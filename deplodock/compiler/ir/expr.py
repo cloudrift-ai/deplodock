@@ -17,7 +17,6 @@ pure operations over the expression AST.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -67,6 +66,15 @@ class _ExprOps:
         """Less-than (``<``)."""
         return BinaryExpr("<", self, _coerce(other))
 
+    def pretty(self) -> str:
+        """Format this Expr as a compact, human-readable string.
+
+        Default raises so any Expr subclass that forgot to override is
+        surfaced loudly. Concrete subclasses override; ``render(expr)``
+        is a free-function alias that delegates here.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.pretty not implemented")
+
 
 def _coerce(v: Expr | int | float) -> Expr:
     """Coerce Python int/float to Literal for operator overloading."""
@@ -91,6 +99,9 @@ class Var(_ExprOps):
     def eval(self, env: dict[str, object]) -> object:
         return env[self.name]
 
+    def pretty(self) -> str:
+        return self.name
+
 
 @dataclass
 class Literal(_ExprOps):
@@ -101,6 +112,9 @@ class Literal(_ExprOps):
 
     def eval(self, env: dict[str, object]) -> object:
         return self.value
+
+    def pretty(self) -> str:
+        return str(self.value)
 
 
 @dataclass
@@ -160,6 +174,9 @@ class BinaryExpr(_ExprOps):
                 return np.logical_or(lv, rv)
         raise ValueError(f"Unknown BinaryExpr: {op}")
 
+    def pretty(self) -> str:
+        return f"({self.left.pretty()} {self.op} {self.right.pretty()})"
+
 
 @dataclass
 class Builtin(_ExprOps):
@@ -173,6 +190,9 @@ class Builtin(_ExprOps):
 
     def eval(self, env: dict[str, object]) -> object:
         raise NotImplementedError(f"Builtin {self.name!r} is GPU-only; cannot eval in numpy")
+
+    def pretty(self) -> str:
+        return self.name
 
 
 @dataclass
@@ -198,6 +218,9 @@ class FuncCallExpr(_ExprOps):
             raise NotImplementedError(f"FuncCallExpr.eval: unknown intrinsic {self.name!r}") from e
         return op(*(a.eval(env) for a in self.args))
 
+    def pretty(self) -> str:
+        return f"{self.name}({', '.join(a.pretty() for a in self.args)})"
+
 
 @dataclass
 class TernaryExpr(_ExprOps):
@@ -215,6 +238,9 @@ class TernaryExpr(_ExprOps):
     def eval(self, env: dict[str, object]) -> object:
         return self.if_true.eval(env) if self.cond.eval(env) else self.if_false.eval(env)
 
+    def pretty(self) -> str:
+        return f"({self.cond.pretty()} ? {self.if_true.pretty()} : {self.if_false.pretty()})"
+
 
 @dataclass
 class CastExpr(_ExprOps):
@@ -229,38 +255,11 @@ class CastExpr(_ExprOps):
             return np.asarray(v).astype(np.int64) if hasattr(v, "__array__") else int(v)
         return v
 
+    def pretty(self) -> str:
+        return f"({self.dtype}){self.expr.pretty()}"
+
 
 Expr = Var | Literal | BinaryExpr | Builtin | FuncCallExpr | TernaryExpr | CastExpr
-
-
-def render(expr: Expr, formatter: Callable[[object], str | None] | None = None) -> str:
-    """Format an ``Expr`` tree as a compact, human-readable string.
-
-    ``formatter``: optional hook, called with each node before the default
-    dispatch. Return a string to override rendering; return ``None`` to fall
-    through to the default. Lets extensions reuse this dispatch while
-    overriding select nodes. The hook must recurse back through ``render``
-    (passing itself) to preserve the override for nested nodes.
-    """
-    if formatter is not None:
-        override = formatter(expr)
-        if override is not None:
-            return override
-    if isinstance(expr, Var):
-        return expr.name
-    if isinstance(expr, Literal):
-        return str(expr.value)
-    if isinstance(expr, Builtin):
-        return expr.name
-    if isinstance(expr, BinaryExpr):
-        return f"({render(expr.left, formatter)} {expr.op} {render(expr.right, formatter)})"
-    if isinstance(expr, FuncCallExpr):
-        return f"{expr.name}({', '.join(render(a, formatter) for a in expr.args)})"
-    if isinstance(expr, TernaryExpr):
-        return f"({render(expr.cond, formatter)} ? {render(expr.if_true, formatter)} : {render(expr.if_false, formatter)})"
-    if isinstance(expr, CastExpr):
-        return f"({expr.dtype}){render(expr.expr, formatter)}"
-    return repr(expr)
 
 
 # ---------------------------------------------------------------------------

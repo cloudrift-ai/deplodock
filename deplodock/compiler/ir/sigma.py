@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.expr import Expr, render, substitute
+from deplodock.compiler.ir.expr import Expr, substitute
 
 
 @dataclass(frozen=True, eq=False)
@@ -26,14 +26,15 @@ class Sigma:
     the consumer's namespace.
 
     Equality and hashing are by canonical form — sorted ``(name,
-    render(expr))`` pairs — so two Sigmas built from different dicts that
-    denote the same substitution compare equal and share a hash bucket.
+    expr.pretty())`` pairs — so two Sigmas built from different dicts
+    that denote the same substitution compare equal and share a hash
+    bucket.
     """
 
     mapping: dict[str, Expr] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        key = tuple(sorted((k, render(v)) for k, v in self.mapping.items()))
+        key = tuple(sorted((k, v.pretty()) for k, v in self.mapping.items()))
         object.__setattr__(self, "_key", key)
 
     def apply(self, e: Expr) -> Expr:
