@@ -9,23 +9,20 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import c
 PATTERN = [Pattern("root", MeanOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
     """Replace mean(x, axis) with sum(x, axis) / axis_size."""
-    x_id = root.inputs[0]
     axis = root.op.axis
-    out = root.output
-
-    x_shape = graph.nodes[x_id].output.shape
+    x_shape = inp_x.output.shape
     if isinstance(axis, int) and x_shape:
         dim_size = x_shape[axis % len(x_shape)]
     else:
         dim_size = 1
     count_value = float(dim_size) if isinstance(dim_size, int) else 1.0
 
-    frag = open_fragment(graph, [x_id])
+    frag = open_fragment(graph, [inp_x])
     sum_id = frag.add_node(
         op=ReduceOp(op="sum", axis=axis),
-        inputs=[x_id],
+        inputs=[inp_x.id],
         output=Tensor(f"{out.name}_sum", out.shape, out.dtype),
     )
     count_bc = const_bc(frag, name=f"{out.name}_count", value=count_value, target_shape=out.shape, dtype=out.dtype)

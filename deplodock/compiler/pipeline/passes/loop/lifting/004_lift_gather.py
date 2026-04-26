@@ -22,9 +22,8 @@ from deplodock.compiler.pipeline.engine import Pattern
 PATTERN = [Pattern("root", GatherOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    data_id, idx_id = root.inputs[0], root.inputs[1]
-    out_shape = tuple(root.output.shape)
+def rewrite(graph: Graph, root: Node, inp_data: Node, inp_idx: Node, out: Tensor) -> Graph | None:
+    out_shape = tuple(out.shape)
     ndim = len(out_shape)
     axis = int(root.op.axis) if int(root.op.axis) >= 0 else ndim + int(root.op.axis)
 
@@ -37,8 +36,8 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     data_index = tuple(CastExpr("int", Var("idx")) if i == axis else Var(axes[i].name) for i in range(ndim))
 
     inner: tuple[Stmt, ...] = (
-        Load(name="idx", input=idx_id, index=idx_index),
-        Load(name="data", input=data_id, index=data_index),
+        Load(name="idx", input=inp_idx.id, index=idx_index),
+        Load(name="data", input=inp_data.id, index=data_index),
         Write(output=f"kernel_{root.id}", index=tuple(Var(a.name) for a in axes), value="data"),
     )
     body: tuple[Stmt, ...] = inner
@@ -47,13 +46,10 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     kernel = LoopOp(body=body)
 
     frag = Graph()
-    for buf_id in (idx_id, data_id):
-        if buf_id not in frag.nodes:
-            ext = graph.nodes.get(buf_id)
-            shape = ext.output.shape if ext else ()
-            dtype = ext.output.dtype if ext else "f32"
-            frag.add_node(InputOp(), [], Tensor(buf_id, shape, dtype), node_id=buf_id)
+    for buf in (inp_idx, inp_data):
+        if buf.id not in frag.nodes:
+            frag.add_node(InputOp(), [], Tensor(buf.id, buf.output.shape, buf.output.dtype), node_id=buf.id)
 
-    out_id = frag.add_node(kernel, list(kernel.inputs), Tensor(root.output.name, out_shape, root.output.dtype), node_id=f"kernel_{root.id}")
+    out_id = frag.add_node(kernel, list(kernel.inputs), Tensor(out.name, out_shape, out.dtype), node_id=f"kernel_{root.id}")
     frag.outputs = [out_id]
     return frag

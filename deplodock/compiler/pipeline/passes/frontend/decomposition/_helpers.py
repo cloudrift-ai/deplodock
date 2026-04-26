@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
@@ -30,10 +30,15 @@ __all__ = [
 ]
 
 
-def open_fragment(graph: Graph, ext_ids: Iterable[str]) -> Graph:
-    """Return a fresh fragment with InputOp sentinels for every ``ext_id``."""
+def open_fragment(graph: Graph, exts: Iterable[str | Node]) -> Graph:
+    """Return a fresh fragment with InputOp sentinels for every ext.
+
+    ``exts`` may be a mix of node ids and ``Node`` objects — Nodes get
+    their ``id`` extracted, ids are looked up in ``graph``.
+    """
     frag = Graph()
-    for eid in sorted(set(ext_ids)):
+    ids = sorted({e.id if isinstance(e, Node) else e for e in exts})
+    for eid in ids:
         t = graph.nodes[eid].output
         frag.add_node(op=InputOp(), inputs=[], output=Tensor(t.name, t.shape, t.dtype), node_id=eid)
     return frag

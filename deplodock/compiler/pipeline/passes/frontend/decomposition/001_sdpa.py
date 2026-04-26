@@ -49,13 +49,11 @@ def _maybe_gqa(frag: Graph, src_id: str, q_batch: tuple, src_batch: tuple, targe
     )
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    q_id, k_id, v_id = root.inputs[0], root.inputs[1], root.inputs[2]
-
-    q_shape = graph.nodes[q_id].output.shape
-    k_shape = graph.nodes[k_id].output.shape
-    v_shape = graph.nodes[v_id].output.shape
-    dtype, name = root.output.dtype, root.output.name
+def rewrite(graph: Graph, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out: Tensor) -> Graph | None:
+    q_shape = inp_q.output.shape
+    k_shape = inp_k.output.shape
+    v_shape = inp_v.output.shape
+    dtype, name = out.dtype, out.name
 
     head_dim = q_shape[-1] if len(q_shape) >= 2 else 64
     seq_len = q_shape[-2] if len(q_shape) >= 3 else q_shape[-1]
@@ -64,19 +62,19 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     v_batch = v_shape[:-2] if len(v_shape) > 2 else ()
     scores_shape = q_batch + (seq_len, seq_len)
 
-    frag = open_fragment(graph, [q_id, k_id, v_id])
+    frag = open_fragment(graph, [inp_q, inp_k, inp_v])
 
     # K^T then GQA broadcast.
     kt_shape = k_batch + (head_dim, seq_len) if isinstance(head_dim, int) else k_shape
     kt_id = frag.add_node(
         op=TransposeOp(axes=(-2, -1)),
-        inputs=[k_id],
+        inputs=[inp_k.id],
         output=Tensor(f"{name}_kt", kt_shape, dtype),
     )
     kt_id = _maybe_gqa(frag, kt_id, q_batch, k_batch, (head_dim, seq_len), name=f"{name}_kt_gqa", dtype=dtype)
 
     # QK^T matmul.
-    qk_id = matmul_decompose(frag, q_id, kt_id, name=f"{name}_qk", dtype=dtype)
+    qk_id = matmul_decompose(frag, inp_q.id, kt_id, name=f"{name}_qk", dtype=dtype)
 
     # Scale by 1/sqrt(head_dim).
     scale_value = 1.0 / math.sqrt(head_dim) if isinstance(head_dim, int) else None
@@ -123,7 +121,8 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     softmax_id = softmax_decompose(frag, scaled_id, -1, name=f"{name}_softmax", dtype=dtype)
 
     # Softmax @ V (with GQA on V).
-    v_eff_id = _maybe_gqa(frag, v_id, q_batch, v_batch, v_shape[-2:] if len(v_shape) >= 2 else v_shape, name=f"{name}_v_gqa", dtype=dtype)
+    v_last = v_shape[-2:] if len(v_shape) >= 2 else v_shape
+    v_eff_id = _maybe_gqa(frag, inp_v.id, q_batch, v_batch, v_last, name=f"{name}_v_gqa", dtype=dtype)
     sv_id = matmul_decompose(frag, softmax_id, v_eff_id, name=name, dtype=dtype)
 
     frag.outputs = [sv_id]

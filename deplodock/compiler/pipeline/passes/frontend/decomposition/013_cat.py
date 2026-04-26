@@ -19,26 +19,21 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import o
 PATTERN = [Pattern("root", CatOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    a_id = root.inputs[0]
-    b_id = root.inputs[1]
-    dim_id = root.inputs[2]
-
-    a_shape = tuple(graph.nodes[a_id].output.shape)
-    out_shape = tuple(root.output.shape)
+def rewrite(graph: Graph, inp_a: Node, inp_b: Node, inp_dim: Node, out: Tensor) -> Graph | None:
+    a_shape = tuple(inp_a.output.shape)
+    out_shape = tuple(out.shape)
     ndim = len(out_shape)
 
-    dim_node = graph.nodes.get(dim_id)
-    if not (isinstance(dim_node.op, ConstantOp) and dim_node.op.value is not None):
+    if not (isinstance(inp_dim.op, ConstantOp) and inp_dim.op.value is not None):
         return None
-    dim = int(dim_node.op.value)
+    dim = int(inp_dim.op.value)
     norm_dim = dim if dim >= 0 else ndim + dim
 
     if not isinstance(a_shape[norm_dim], int):
         return None
     split = a_shape[norm_dim]
 
-    frag = open_fragment(graph, [a_id, b_id])
+    frag = open_fragment(graph, [inp_a, inp_b])
 
     # Source A: identity coord_map, select = (out_coord_dim < split)
     src_a = IndexSource(
@@ -58,8 +53,8 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
     new_id = frag.add_node(
         op=IndexMapOp(out_shape=out_shape, sources=(src_a, src_b)),
-        inputs=[a_id, b_id],
-        output=Tensor(root.output.name, out_shape, root.output.dtype),
+        inputs=[inp_a.id, inp_b.id],
+        output=Tensor(out.name, out_shape, out.dtype),
     )
 
     frag.outputs = [new_id]
