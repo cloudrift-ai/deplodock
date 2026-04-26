@@ -307,6 +307,39 @@ class Loop(Stmt):
 
 
 @dataclass(frozen=True)
+class StridedLoop(Stmt):
+    """Strided iteration: ``for (axis = start; axis < axis.extent; axis += step)``.
+
+    Cooperative variant of ``Loop`` — used at Tile IR to express "threads
+    of the CUDA block stride through this axis" (typical
+    ``start = Var('t'), step = BLOCK_SIZE``). The body uses the original
+    axis Var directly; the strided iteration shape is encoded by the
+    loop construct itself rather than via affine indexing in the body.
+
+    Reduction detection mirrors ``Loop``: a ``StridedLoop`` is a
+    reduce-loop iff its body contains an ``Accum``."""
+
+    axis: Axis
+    start: Expr
+    step: Expr
+    body: tuple[Stmt, ...]
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
+
+    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+        return (self.body,)
+
+    def rewrite(self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY) -> Stmt:
+        return StridedLoop(
+            axis=self.axis,
+            start=sigma.apply(self.start),
+            step=sigma.apply(self.step) if isinstance(self.step, Expr) else self.step,
+            body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body),
+        )
+
+
+@dataclass(frozen=True)
 class Cond(Stmt):
     """Conditional block — ``if (cond) { body } [else { else_body }]``.
 
@@ -400,6 +433,7 @@ __all__ = [
     "Accum",
     "Init",
     "Write",
+    "StridedLoop",
     "Select",
     "SelectBranch",
     "Loop",

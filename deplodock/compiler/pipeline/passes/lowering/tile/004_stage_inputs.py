@@ -48,8 +48,8 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_BLOCK, Axis
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Load
-from deplodock.compiler.ir.tile.ir import BoundLoop, Stage, Tile, TileOp
+from deplodock.compiler.ir.stmt import Load, Loop, StridedLoop
+from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -97,10 +97,10 @@ def _collect_stages(tile: Tile) -> list[Stage]:
     block_axis_names = {ba.axis.name for ba in tile.axes if ba.bind == BIND_BLOCK}
     loop_axes_by_name: dict[str, Axis] = {}
 
-    # Per buf, collect the (BoundLoop axis name, Load) pairs found in the body.
+    # Per buf, collect the (loop axis name, Load) pairs found in the body.
     loads_per_buf: dict[str, list[tuple[str, Load]]] = {}
     for s in tile.body:
-        if not isinstance(s, BoundLoop):
+        if not isinstance(s, (Loop, StridedLoop)):
             continue
         loop_axis = s.axis
         loop_axes_by_name[loop_axis.name] = loop_axis

@@ -327,7 +327,8 @@ def _render_strided_loop(stmt: StridedLoop, ctx: _Ctx) -> list[str]:
                 raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
             out.append(f"{pad}float {s.name} = {float(identity):.1f}f;")
     start_str = _render_expr(stmt.start, ctx)
-    out.extend(_render_for(stmt.axis.name, start_str, int(stmt.axis.extent), step=int(stmt.step), body=stmt.body, ctx=ctx))
+    step = stmt.step if isinstance(stmt.step, int) else _render_expr(stmt.step, ctx)
+    out.extend(_render_for(stmt.axis.name, start_str, int(stmt.axis.extent), step=step, body=stmt.body, ctx=ctx))
     return out
 
 

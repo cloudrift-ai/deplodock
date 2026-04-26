@@ -56,15 +56,14 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import (
     BIND_BLOCK,
-    BIND_SERIAL,
     BIND_THREAD,
     BoundAxis,
     split_axis,
 )
 from deplodock.compiler.ir.expr import Literal, Var, free_vars
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Stmt, Write
-from deplodock.compiler.ir.tile.ir import BoundLoop, Stage, Tile, TileOp
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Stmt, Write
+from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -115,7 +114,7 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     if parsed is None:
         return None
     reduce_loop, write = parsed
-    k = reduce_loop.axis.axis
+    k = reduce_loop.axis
     if k.extent % BK:
         return None
 
@@ -151,18 +150,15 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
 
     # m_i / n_i are bound directly as Enclosure THREAD axes (their
     # extents·product equals BLOCK_SIZE — one output per thread). No
-    # wrapping BoundLoops over them in the body — the thread decode at
+    # wrapping loops over them in the body — the thread decode at
     # render time provides Var(m_i) / Var(n_i) for the inner compute.
     new_body: tuple[Stmt, ...] = (
-        BoundLoop(
-            axis=BoundAxis(axis=k_o, bind=BIND_SERIAL),
+        Loop(
+            axis=k_o,
             body=(
                 stage_a,
                 stage_b,
-                BoundLoop(
-                    axis=BoundAxis(axis=k_i, bind=BIND_SERIAL),
-                    body=inner_compute,
-                ),
+                Loop(axis=k_i, body=inner_compute),
             ),
         ),
         write.rewrite(_id, sigma),
@@ -177,7 +173,7 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     return Tile(axes=new_axes, body=new_body)
 
 
-def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[BoundLoop, Write] | None:
+def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[Loop, Write] | None:
     """The body must be exactly ``(reduce_loop, write)`` where ``write``
     indexes both output axes ``m`` and ``n`` (other index positions may
     be Literals from collapsed leading dims, e.g. batch=1 in the Linear
@@ -185,11 +181,9 @@ def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[BoundLoop
     if len(body) != 2:
         return None
     reduce_loop, write = body
-    if not (isinstance(reduce_loop, BoundLoop) and isinstance(write, Write)):
+    if not (isinstance(reduce_loop, Loop) and isinstance(write, Write)):
         return None
     if not _is_reduce(reduce_loop):
-        return None
-    if reduce_loop.bind != BIND_SERIAL:
         return None
     var_names = {e.name for e in write.index if isinstance(e, Var)}
     if {m_name, n_name} - var_names:
@@ -197,7 +191,7 @@ def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[BoundLoop
     return reduce_loop, write
 
 
-def _extract_inner(reduce_loop: BoundLoop) -> tuple[Accum, Load, Load, Assign] | None:
+def _extract_inner(reduce_loop: Loop) -> tuple[Accum, Load, Load, Assign] | None:
     """Inner body must be exactly ``(Load, Load, Assign-mul, Accum-add)``
     with two distinct source buffers and the Assign feeding the Accum."""
     inner = reduce_loop.body
@@ -219,7 +213,7 @@ def _extract_inner(reduce_loop: BoundLoop) -> tuple[Accum, Load, Load, Assign] |
     return accum, load_a, load_b, mul
 
 
-def _is_reduce(loop: BoundLoop) -> bool:
+def _is_reduce(loop: Loop) -> bool:
     return any(isinstance(s, Accum) for s in loop.body)
 
 
