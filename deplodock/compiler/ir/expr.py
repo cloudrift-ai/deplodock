@@ -101,6 +101,17 @@ class _ExprOps:
         """
         raise NotImplementedError(f"{type(self).__name__}.render not implemented")
 
+    def simplify(self, ctx: SimplifyCtx) -> Expr:
+        """Bottom-up rewrite: constant-fold literals, drop algebraic
+        identities (``x+0``, ``x*1``, ``x-x``, etc.), collapse static
+        comparisons via ``ctx.ranges``. Pure; idempotent."""
+        raise NotImplementedError(f"{type(self).__name__}.simplify not implemented")
+
+    def range(self, ctx: SimplifyCtx) -> Interval | None:
+        """Conservative integer-range analysis. ``None`` when unknown.
+        Subclasses override; default surfaces missing implementations."""
+        return None
+
 
 def _coerce(v: Expr | int | float) -> Expr:
     """Coerce Python int/float to Literal for operator overloading."""
@@ -137,6 +148,12 @@ class Var(_ExprOps):
     def render(self, ctx, parent_prec: int = 0) -> str:
         return self.name
 
+    def simplify(self, ctx: SimplifyCtx) -> Expr:
+        return self
+
+    def range(self, ctx: SimplifyCtx) -> Interval | None:
+        return ctx.ranges.get(self.name)
+
 
 @dataclass
 class Literal(_ExprOps):
@@ -162,6 +179,14 @@ class Literal(_ExprOps):
             return _float_lit(float(self.value))
         v = int(self.value)
         return f"{v}LL" if abs(v) > 32768 else str(v)
+
+    def simplify(self, ctx: SimplifyCtx) -> Expr:
+        return self
+
+    def range(self, ctx: SimplifyCtx) -> Interval | None:
+        if isinstance(self.value, int) and not isinstance(self.value, bool):
+            return Interval(self.value, self.value)
+        return None
 
 
 @dataclass
@@ -237,6 +262,93 @@ class BinaryExpr(_ExprOps):
         result = f"{left} {self.op} {right}"
         return f"({result})" if prec < parent_prec else result
 
+    def simplify(self, ctx: SimplifyCtx) -> Expr:
+        left = self.left.simplify(ctx)
+        right = self.right.simplify(ctx)
+        op = self.op
+
+        if isinstance(left, Literal) and isinstance(right, Literal):
+            return _fold_binop_literals(op, left, right)
+
+        if op == "+":
+            if _is_zero(left):
+                return right
+            if _is_zero(right):
+                return left
+        elif op == "-":
+            if _is_zero(right):
+                return left
+            if left == right:
+                return _make_int_literal(0)
+        elif op == "*":
+            if _is_zero(left) or _is_zero(right):
+                return _make_int_literal(0)
+            if _is_one(left):
+                return right
+            if _is_one(right):
+                return left
+        elif op in ("/", "//"):
+            if _is_one(right):
+                return left
+            if _is_zero(left):
+                return _make_int_literal(0)
+        elif op == "%":
+            if _is_one(right) or _is_zero(left):
+                return _make_int_literal(0)
+        elif op == "&&":
+            if _is_truthy(left):
+                return right
+            if _is_truthy(right):
+                return left
+            if _is_falsy(left) or _is_falsy(right):
+                return _make_int_literal(0)
+        elif op == "||":
+            if _is_falsy(left):
+                return right
+            if _is_falsy(right):
+                return left
+            if _is_truthy(left) or _is_truthy(right):
+                return _make_int_literal(1)
+        elif op in ("<", "<=", ">", ">=", "=="):
+            la = left.range(ctx)
+            lb = right.range(ctx)
+            if la is not None and lb is not None:
+                decided = _static_cmp(op, la, lb)
+                if decided is not None:
+                    return _make_int_literal(1 if decided else 0)
+
+        if left is self.left and right is self.right:
+            return self
+        return BinaryExpr(op, left, right)
+
+    def range(self, ctx: SimplifyCtx) -> Interval | None:
+        la = self.left.range(ctx)
+        lb = self.right.range(ctx)
+        op = self.op
+        if la is None or lb is None:
+            if op in ("<", "<=", ">", ">=", "==", "&&", "||"):
+                return Interval(0, 1)
+            return None
+        if op == "+":
+            return Interval(la.lo + lb.lo, la.hi + lb.hi)
+        if op == "-":
+            return Interval(la.lo - lb.hi, la.hi - lb.lo)
+        if op == "*":
+            prods = [la.lo * lb.lo, la.lo * lb.hi, la.hi * lb.lo, la.hi * lb.hi]
+            return Interval(min(prods), max(prods))
+        if op in ("/", "//"):
+            if lb.lo == lb.hi and lb.lo > 0:
+                return Interval(la.lo // lb.lo, la.hi // lb.lo)
+            return None
+        if op == "%":
+            if lb.lo == lb.hi and lb.lo > 0:
+                # assuming nonneg dividend, which holds for every loop index
+                return Interval(0, lb.lo - 1)
+            return None
+        if op in ("<", "<=", ">", ">=", "==", "&&", "||"):
+            return Interval(0, 1)
+        return None
+
 
 @dataclass
 class Builtin(_ExprOps):
@@ -265,6 +377,9 @@ class Builtin(_ExprOps):
         if spelling is None:
             raise ValueError(f"render: Builtin {self.name!r} has no target spelling in ctx.builtins")
         return spelling
+
+    def simplify(self, ctx: SimplifyCtx) -> Expr:
+        return self
 
 
 @dataclass
@@ -307,6 +422,12 @@ class FuncCallExpr(_ExprOps):
         args = ", ".join(a.render(ctx) for a in self.args)
         return f"{spelling}({args})"
 
+    def simplify(self, ctx: SimplifyCtx) -> Expr:
+        new_args = [a.simplify(ctx) for a in self.args]
+        if all(x is y for x, y in zip(new_args, self.args, strict=True)):
+            return self
+        return FuncCallExpr(self.name, new_args)
+
 
 @dataclass
 class TernaryExpr(_ExprOps):
@@ -339,6 +460,20 @@ class TernaryExpr(_ExprOps):
         f = self.if_false.render(ctx)
         return f"(({c}) ? ({t}) : ({f}))"
 
+    def simplify(self, ctx: SimplifyCtx) -> Expr:
+        cond = self.cond.simplify(ctx)
+        if _is_truthy(cond):
+            return self.if_true.simplify(ctx)
+        if _is_falsy(cond):
+            return self.if_false.simplify(ctx)
+        a = self.if_true.simplify(ctx)
+        b = self.if_false.simplify(ctx)
+        if a == b:
+            return a
+        if cond is self.cond and a is self.if_true and b is self.if_false:
+            return self
+        return TernaryExpr(cond, a, b)
+
 
 @dataclass
 class CastExpr(_ExprOps):
@@ -364,6 +499,14 @@ class CastExpr(_ExprOps):
 
     def render(self, ctx, parent_prec: int = 0) -> str:
         return f"(({self.dtype})({self.expr.render(ctx)}))"
+
+    def simplify(self, ctx: SimplifyCtx) -> Expr:
+        inner = self.expr.simplify(ctx)
+        if isinstance(inner, Literal) and self.dtype == "int":
+            return _make_int_literal(int(inner.value))
+        if inner is self.expr:
+            return self
+        return CastExpr(self.dtype, inner)
 
 
 Expr = Var | Literal | BinaryExpr | Builtin | FuncCallExpr | TernaryExpr | CastExpr
@@ -399,6 +542,103 @@ def _float_lit(v: float) -> str:
     if "." not in s and "e" not in s and "E" not in s and "inf" not in s and "nan" not in s:
         s += ".0"
     return f"{s}f"
+
+
+# ---------------------------------------------------------------------------
+# Simplification context + helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Interval:
+    """Closed integer interval ``[lo, hi]`` — used for static range analysis
+    that drives comparison folding (``i < N`` where ``i ∈ [0, N-1]`` → ``1``)."""
+
+    lo: int
+    hi: int
+
+
+@dataclass
+class SimplifyCtx:
+    """Range info available at a given scope. Immutable per-call; callers
+    push into a nested scope by calling :meth:`extend` to get a fresh ctx
+    (so the pass stays pure)."""
+
+    ranges: dict[str, Interval]
+
+    @classmethod
+    def empty(cls) -> SimplifyCtx:
+        return cls({})
+
+    def extend(self, name: str, interval: Interval) -> SimplifyCtx:
+        return SimplifyCtx({**self.ranges, name: interval})
+
+
+def _make_int_literal(v: int) -> Literal:
+    return Literal(int(v), "int")
+
+
+def _is_zero(e: object) -> bool:
+    return isinstance(e, Literal) and e.value == 0
+
+
+def _is_one(e: object) -> bool:
+    return isinstance(e, Literal) and e.value == 1
+
+
+def _is_truthy(e: object) -> bool:
+    return isinstance(e, Literal) and bool(e.value)
+
+
+def _is_falsy(e: object) -> bool:
+    return isinstance(e, Literal) and not bool(e.value)
+
+
+def _fold_binop_literals(op: str, left: Literal, right: Literal) -> Literal:
+    """Constant-fold a ``BinaryExpr`` whose children are both ``Literal``.
+    Preserves int dtype when both operands are int and the result is integral."""
+    folded = BinaryExpr(op, left, right).eval({})
+    if isinstance(folded, bool):
+        return _make_int_literal(1 if folded else 0)
+    both_int = left.dtype == "int" and right.dtype == "int"
+    if isinstance(folded, int) and both_int:
+        return _make_int_literal(folded)
+    return Literal(float(folded), "float")
+
+
+def _static_cmp(op: str, la: Interval, lb: Interval) -> bool | None:
+    """Decide a comparison statically from operand ranges, or return ``None``."""
+    if op == "<":
+        if la.hi < lb.lo:
+            return True
+        if la.lo >= lb.hi:
+            return False
+        return None
+    if op == "<=":
+        if la.hi <= lb.lo:
+            return True
+        if la.lo > lb.hi:
+            return False
+        return None
+    if op == ">":
+        if la.lo > lb.hi:
+            return True
+        if la.hi <= lb.lo:
+            return False
+        return None
+    if op == ">=":
+        if la.lo >= lb.hi:
+            return True
+        if la.hi < lb.lo:
+            return False
+        return None
+    if op == "==":
+        if la.hi < lb.lo or la.lo > lb.hi:
+            return False
+        if la.lo == la.hi == lb.lo == lb.hi:
+            return True
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
