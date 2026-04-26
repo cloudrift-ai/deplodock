@@ -43,6 +43,7 @@ from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
     Cond,
+    Init,
     Load,
     Loop,
     Select,
@@ -164,6 +165,9 @@ class KernelOp(Op):
                 return
             if isinstance(stmt, Accum):
                 lines.append(f"{indent}{stmt.name} <- {stmt.op.name}({stmt.name}, {stmt.value})")
+                return
+            if isinstance(stmt, Init):
+                lines.append(f"{indent}Init({stmt.name}, op={stmt.op.name})")
                 return
             if isinstance(stmt, Write):
                 idx = ", ".join(render_expr(e) for e in stmt.index)
