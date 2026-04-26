@@ -33,6 +33,18 @@ class Axis:
     name: str
     extent: int
 
+    def split(self, factor: int) -> tuple[Axis, Axis]:
+        """Split this axis into ``(outer, inner)`` for tile-style decomposition.
+
+        Outer extent is ``self.extent // factor``, inner extent is ``factor``.
+        Names follow the ``f"{self.name}_o"`` / ``f"{self.name}_i"`` convention
+        so tiled IR remains readable. v1 requires divisibility — non-divisible
+        extents need a residue-tail story that no current rule wants.
+        """
+        if self.extent % factor != 0:
+            raise ValueError(f"Axis.split: {self.name} extent {self.extent} not divisible by {factor}")
+        return Axis(f"{self.name}_o", self.extent // factor), Axis(f"{self.name}_i", factor)
+
 
 # BoundAxis.bind values — used on ``Tile.axes`` / ``Tile.axes``
 # to describe launch-geometry. Body loops carry no bind; the loop
@@ -68,17 +80,4 @@ class BoundAxis:
         return self.axis.extent
 
 
-def split_axis(ax: Axis, factor: int) -> tuple[Axis, Axis]:
-    """Split ``ax`` into ``(outer, inner)`` for tile-style decomposition.
-
-    Outer extent is ``ax.extent // factor``, inner extent is ``factor``.
-    Names follow the ``f"{ax.name}_o"`` / ``f"{ax.name}_i"`` convention so
-    tiled IR remains readable. v1 requires divisibility — non-divisible
-    extents need a residue-tail story that no current rule wants.
-    """
-    if ax.extent % factor != 0:
-        raise ValueError(f"split_axis: {ax.name} extent {ax.extent} not divisible by {factor}")
-    return Axis(f"{ax.name}_o", ax.extent // factor), Axis(f"{ax.name}_i", factor)
-
-
-__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "split_axis"]
+__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK"]

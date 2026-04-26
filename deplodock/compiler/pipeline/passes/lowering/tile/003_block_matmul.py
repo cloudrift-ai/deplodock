@@ -58,7 +58,6 @@ from deplodock.compiler.ir.axis import (
     BIND_BLOCK,
     BIND_THREAD,
     BoundAxis,
-    split_axis,
 )
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
@@ -121,9 +120,9 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
         return None
     accum, load_a, load_b, mul = extracted
 
-    m_o, m_i = split_axis(m, BM)
-    n_o, n_i = split_axis(n, BN)
-    k_o, k_i = split_axis(k, BK)
+    m_o, m_i = m.split(BM)
+    n_o, n_i = n.split(BN)
+    k_o, k_i = k.split(BK)
 
     sigma = Sigma(
         {
