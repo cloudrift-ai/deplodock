@@ -1,13 +1,18 @@
 """Loop IR — post-fusion kernel representation plus its analysis/normalization.
 
 Submodules:
-- :mod:`.ir` — ``LoopOp`` and its body node types (``Loop``, ``Load``,
-  ``Write``, ``Assign``, ``Accum``, ``Select``, ``SelectBranch``, ``Axis``,
-  ``Stmt``). Construction runs structural normalization (see
-  :mod:`.normalize`) then validation via ``__post_init__``.
+- :mod:`.ir` — ``LoopOp`` (one kernel) plus ``LoopMeta`` / ``Scope``
+  helpers. The body statement vocabulary (``Loop``, ``Load``, ``Write``,
+  ``Assign``, ``Accum``, ``Select``, ``SelectBranch``, ``Cond``,
+  ``StridedLoop``, ``Stmt``, ``iter_body``, ``map_body``) lives in
+  ``ir/stmt.py`` and is re-exported here. Construction runs structural
+  normalization (see :mod:`.normalize`) then validation via
+  ``__post_init__``.
 - :mod:`.normalize` — pure ``body → body`` passes applied at construction
   (drop size-1 free axes, canonical free-axis order, pointwise
   linearization).
+- :mod:`.splicer` — ``splice_*`` helpers used by ``loop/fusion`` to merge
+  adjacent ``LoopOp`` pairs.
 
 The public surface below re-exports the common types so callers use
 ``from deplodock.compiler.ir.loop import LoopOp, ...``.

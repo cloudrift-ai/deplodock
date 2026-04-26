@@ -14,10 +14,10 @@ pipeline/
     │   └── optimization/   # IndexMap fusion before lift-to-loop
     ├── loop/
     │   ├── lifting/        # tensor ops → trivial LoopOp nodes
-    │   ├── fusion/         # merge adjacent LoopOp pairs (splice)
-    │   └── matmul/         # annotate contraction LoopOps with cuda.matmul.* hints
+    │   └── fusion/         # merge adjacent LoopOp pairs (splice)
     └── lowering/
-        ├── kernel/         # LoopOp → KernelOp (emit GpuKernel AST)
+        ├── tile/           # LoopOp → TileOp (lower_naive + scheduling rules)
+        ├── kernel/         # TileOp → KernelOp (materialize scheduling)
         └── cuda/           # KernelOp → CudaOp (render source string)
 ```
 
@@ -85,9 +85,9 @@ ignores the prefix itself — it's only for ordering readability.
 | `frontend/optimization/`   | `compose_indexmaps`: collapse chains of single-source / single-consumer `IndexMapOp` into one coord_map — prevents trivial layout kernels from blocking fusion. |
 | `loop/lifting/`            | `lift_*` rules wrap each surviving tensor primitive (elementwise / reduce / indexmap / gather) in a trivial one-op `LoopOp`. |
 | `loop/fusion/`             | `merge_loop_ops` splices adjacent `LoopOp` pairs using `ir/loop/splicer.py::splice_graph`. |
-| `loop/matmul/`             | `detect_matmul` pattern-matches pure contraction kernels (2 Loads → mul → add-Accum → Write) and stamps `cuda.matmul.*` hints (strategy, M/N/K, a_source / b_source, tile config) that the kernel emitter reads to pick the tiled-SGEMM template. |
-| `lowering/kernel/`         | Emit per-node `GpuKernel` AST (via `_emit.py`) and mutate the node's op to `KernelOp` in place. Dispatches to `_emit_matmul.emit_matmul_kernel` when the `cuda.matmul.strategy=tma_matmul` hint is present (see `loop/matmul`); otherwise falls through to the scalar A/B-strategy emitter. |
-| `lowering/cuda/`           | Render the `GpuKernel` to a `__global__` source string (via `_emit.py`) and mutate the node's op to `CudaOp` in place. |
+| `lowering/tile/`           | `lower_loopop` produces a `TileOp` per `LoopOp` (`lower_naive`); follow-up rules (`cooperative_reduce`, `block_matmul`, `stage_inputs`) annotate scheduling decisions on the `Tile` (block/thread bindings, `Stage` nodes, `Combine`). |
+| `lowering/kernel/`         | `materialize_tile` consumes scheduling decisions and emits hardware primitives (`Smem`, `Sync`, `TreeHalve`, `StridedLoop`), mutating the node's op to `KernelOp` in place. |
+| `lowering/cuda/`           | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (via `ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 
 See `ir/ARCHITECTURE.md` for what each IR dialect looks like.
 
@@ -95,16 +95,16 @@ See `ir/ARCHITECTURE.md` for what each IR dialect looks like.
 
 `CompilerDump.on_pass(idx, pass_name, graph)` dumps the post-pass graph
 uniformly for every pass: `NN_<pass_name>.{json,txt,dot}` (+
-`NN_<pass_name>.kernels.txt` if the graph contains any `LoopOp` /
-`KernelOp` / `CudaOp`). Slashes in the pass name are flattened to
-underscores, so `lowering/cuda` dumps as `05_lowering_cuda.*`. The
+`NN_<pass_name>.kernels.txt` if any node has a non-empty
+`pretty_body()`). Slashes in the pass name are flattened to
+underscores, so `lowering/cuda` dumps as e.g. `06_lowering_cuda.*`. The
 pre-pipeline input graph is dumped separately as `00_input.*` via
 `dump.dump_input_graph(graph)` from the caller.
 
 The uniform strategy means adding a new pass automatically gets dumped
 — no per-pass registration needed. Rendering the kernel-level IRs
-(loop/kernel/cuda) lives in `format_kernels(graph)`, which dispatches
-on op type.
+(loop/tile/kernel/cuda) lives in `format_kernels(graph)`, which calls
+each op's own `pretty_body()`.
 
 ## Fragment splice (`engine._apply_replacement`)
 

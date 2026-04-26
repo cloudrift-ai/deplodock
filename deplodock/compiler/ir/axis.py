@@ -3,8 +3,8 @@
 ``Axis`` is the iteration-variable identity (name + extent) used by Loop
 IR, Tile IR, and Kernel IR. ``BoundAxis`` pairs an axis with a parallel-
 coord binding (``BIND_THREAD`` / ``BIND_BLOCK``), used by Tile-IR
-``Block`` and Kernel-IR ``Tile`` to express how output axes map to
-GPU coords.
+``Tile`` (across Tile and Kernel IRs) to express how output axes map
+to GPU coords.
 
 Lives at ``ir/axis.py`` rather than inside any one IR package because
 both concepts span every layer. Loop IR re-exports ``Axis`` for
@@ -50,8 +50,8 @@ BIND_BLOCK = "BLOCK"
 class BoundAxis:
     """An axis paired with its GPU-coord binding.
 
-    Used by Tile-IR ``Block`` and Kernel-IR ``Tile`` to express how
-    each output axis maps to the parallel hierarchy. ``BIND_THREAD``
+    Used by ``Tile`` (across Tile and Kernel IRs) to express how each
+    output axis maps to the parallel hierarchy. ``BIND_THREAD``
     means "one thread per axis value"; ``BIND_BLOCK`` means "one CUDA
     block per axis value, threads inside cooperate."
     """

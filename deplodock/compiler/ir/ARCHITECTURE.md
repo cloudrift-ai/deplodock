@@ -12,7 +12,8 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `kernel/ir`       | after `lowering/kernel`         | `GpuKernel`, `KernelOp`, statement/expression AST                                                     |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, `Stage`, `Combine`, `StridedLoop`)                               |
+| `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
 ## Invariants by stage
@@ -26,9 +27,12 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   Tensor-IR ops survive only *inside* `LoopOp.body` as `Assign.op` or
   `Accum.op` (`ElementwiseOp` only — `ReduceOp` is not a valid body
   op; reductions are `Accum` statements inside a reduce `Loop`).
-- **Loop → kernel** (after `lowering/kernel`): LoopOp nodes replaced by
-  `KernelOp` carrying a `GpuKernel` AST. Same `node.id` preserved (see
-  `pipeline/ARCHITECTURE.md`).
+- **Loop → tile** (after `lowering/tile`): `LoopOp` nodes replaced by
+  `TileOp` whose body is a `Tile` carrying scheduling decisions
+  (`BIND_THREAD`/`BIND_BLOCK` axes, `Stage`, `Combine`).
+- **Tile → kernel** (after `lowering/kernel`): `TileOp` materialized to
+  `KernelOp` whose body uses hardware primitives (`Smem`, `Sync`,
+  `TreeHalve`, `StridedLoop`).
 - **Kernel → CUDA** (after `lowering/cuda`): `KernelOp` replaced by
   `CudaOp` carrying rendered source.
 
@@ -46,18 +50,18 @@ them.
 
 ## `expr.py`
 
-Shared expression sublanguage used by both loop IR (`Load.index`,
-`Write.index`, `SelectBranch.select`, `IndexMapOp.coord_map`) and
-kernel IR (`ArrayAccess.index`, `ForLoop.end`, …). Imports nothing from
+Shared expression sublanguage used by every IR layer: `Load.index`,
+`Write.index`, `SelectBranch.select`, `IndexMapOp.coord_map`,
+`StridedLoop.start`/`step`, `Cond.cond`, etc. Imports nothing from
 other IR files.
 
-| Symbol                                                             | Role                                                                     |
-|--------------------------------------------------------------------|--------------------------------------------------------------------------|
-| `Var`, `Literal`, `BinOp`, `Builtin`, `FuncCall`, `Ternary`, `Cast`| Expression nodes. Each has `eval(env) → value/ndarray`.                  |
-| `_ExprOps`                                                         | Mixin: Python operator overloading for expression building.              |
-| `Expr`                                                             | Union type alias.                                                        |
-| `PLACEHOLDER_PREFIX`, `placeholder`, `is_placeholder`              | Convention for output-coord placeholders in coord maps.                  |
-| `substitute`                                                       | Tree rewrite: replace named `Var` nodes.                                 |
+| Symbol                                                                       | Role                                                                     |
+|------------------------------------------------------------------------------|--------------------------------------------------------------------------|
+| `Var`, `Literal`, `BinaryExpr`, `Builtin`, `FuncCallExpr`, `TernaryExpr`, `CastExpr` | Expression nodes. Each has `eval(env) → value/ndarray`.          |
+| `_ExprOps`                                                                   | Mixin: Python operator overloading for expression building.             |
+| `Expr`                                                                       | Union type alias.                                                        |
+| `PLACEHOLDER_PREFIX`, `placeholder`, `is_placeholder`                        | Convention for output-coord placeholders in coord maps.                  |
+| `substitute`, `free_vars`                                                    | Tree rewrite (replace named `Var` nodes); free-var collection.           |
 
 ## `frontend/ir.py`
 
@@ -95,15 +99,18 @@ iteration axes. Free vs reduce is inferred from body structure — a
 
 | Symbol                       | Role                                                                                                              |
 |------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| `Axis`                       | Named iteration variable (`name`, `extent`).                                                                      |
+| `Axis`                       | Named iteration variable (`name`, `extent`). Defined in `ir/axis.py`, re-exported here.                           |
 | `LoopOp`                     | One kernel. Stored field: `body` (nested `Loop` tree). Computed: `axes`, `loads`, `accums`.                       |
-| `Load`                       | Body-form external read: `name = load(source)[index...]`. `source` indexes into `node.inputs`.                    |
-| `Assign`                     | SSA body stmt: `name = op(args)` with `op: ElementwiseOp`.                                                        |
-| `Accum`                      | Reduce accumulator: `name = op(name, value)` inside a reduce `Loop`. Initialized to `ACCUM_IDENTITY[op.fn]`.      |
+| `Load`                       | Body-form external read: `name = load(input)[index...]`. `input` matches the producing graph node's id.           |
+| `Assign`                     | SSA body stmt: `name = op(args)` with `op: ElementwiseImpl`.                                                      |
+| `Accum`                      | Reduce accumulator: `name = op(name, value)` inside a reduce `Loop`. Initialized to its op's identity.            |
+| `Init`                       | Explicit accumulator initialization at an outer scope (matmul chunked-K).                                         |
 | `Write`                      | Write an SSA value to output at `index`.                                                                          |
 | `Select` + `SelectBranch`    | Coord-predicated binding (replaces the old Mux).                                                                  |
-| `Loop`                       | Iteration block: `axis` + nested `body`.                                                                          |
-| `Stmt`                       | Union: `Assign \| Accum \| Write \| Select \| Loop \| Load`.                                                      |
+| `Loop`                       | Serial iteration block: `axis` + nested `body`.                                                                   |
+| `StridedLoop`                | Strided iteration (`start`, `step`) — cooperative thread-stride loop reused by Tile/Kernel IR.                    |
+| `Cond`                       | If/else block over an `Expr` predicate.                                                                           |
+| `Stmt`                       | Base class — every body statement subclasses it. Leaves and control-flow nodes live in `ir/stmt.py`.              |
 
 Body walkers: `iter_body(body)` (pre-order; powers `for s in loop_op`),
 `map_body(body, fn)` (transformer), `Stmt.rewrite(rename_ssa, sigma)`
@@ -152,31 +159,42 @@ any pre-fusion graph.
 `LoopBuilder` helper used by decomposition/fusion tests to construct
 LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 
+## `tile/`
+
+Tile IR encodes scheduling decisions structurally — `Tile.axes` carry
+`BIND_THREAD` / `BIND_BLOCK` bindings, `Stage` marks smem-cached
+loads, `Combine` collapses an Accum across cooperating threads.
+Compute leaves (`Load` / `Assign` / `Accum` / `Write`) and control
+flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`.
+
+| Symbol             | Role                                                              |
+|--------------------|-------------------------------------------------------------------|
+| `TileOp`           | Graph-op carrying a `Tile`-rooted body. One per kernel.           |
+| `Tile`             | Axis-bound scope wrapper (`axes: tuple[BoundAxis, ...]` + body).  |
+| `Stage`            | Cache an input slab in smem before the body iterates.             |
+| `Combine`          | Cross-thread collapse of an `Accum` target (post reduce loop).    |
+
 ## `kernel/`
 
-### `kernel/ir.py` — C-like AST
+### `kernel/ir.py` — fully-scheduled kernel form
 
-| Group              | Symbols                                                                                                                                       |
-|--------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
-| Expression (GPU)   | `ArrayAccess`, `Cast`, `FieldAccess`, `VectorLoad` + shared `Expr` types                                                                      |
-| Statements         | `VarDecl`, `Assign`, `VarAssign`, `AugAssign`, `ForLoop`, `IfStmt`, `SyncThreads`, `ArrayDecl`, `PragmaUnroll`, `RawCode`                     |
-| Kernel definition  | `GpuKernel` (AST + block_size + includes + launch_bounds), `GpuKernelParam`                                                                   |
-| Graph-op wrapper   | `KernelOp` (carries a `GpuKernel` + grid/block/smem/zero_outputs/arg_order)                                                                   |
-| Type alias         | `GpuExpr`                                                                                                                                     |
-| Utilities          | `pretty_print`                                                                                                                                |
+Reuses `Tile` + leaf stmts from Tile IR; adds hardware primitives
+materialized from scheduling decisions. `KernelOp` carries the body
+directly (no separate AST class).
 
-### `kernel/normalize.py`
-
-Runs from `KernelOp.__post_init__`. Pushes integer ranges from
-`VarDecl` inits (thread-index compositions), `IfStmt` conds, and
-`ForLoop` bounds; delegates the core Expr rewrite to
-`ir/loop/simplify.simplify_expr`.
+| Symbol             | Role                                                              |
+|--------------------|-------------------------------------------------------------------|
+| `KernelOp`         | Graph-op wrapper around a `Tile`-rooted body. One per kernel.     |
+| `Smem`             | `__shared__` array allocation (name + dtype + extents).           |
+| `Sync`             | `__syncthreads()` barrier.                                        |
+| `TreeHalve`        | Cross-thread tree reduction over a smem buffer.                   |
+| Shared from `tile` | `Tile` (launch geometry); from `ir/stmt.py`: `Loop`, `StridedLoop`, `Load`, `Assign`, `Accum`, `Write`, `Select`, `Cond`. |
 
 ## `cuda/ir.py`
 
 | Symbol    | Role                                                                        |
 |-----------|-----------------------------------------------------------------------------|
-| `CudaOp`  | Graph-op carrying `kernel_source`, `kernel_name`, `arg_order`, grid, block, `smem_bytes`, `zero_outputs`, `comment`. Produced by `pipeline/passes/lowering/cuda`. |
+| `CudaOp`  | Graph-op carrying `kernel_source`, `kernel_name`, `arg_order`, `grid`, `block`, `smem_bytes`, `zero_outputs`, `comment`. Produced by `pipeline/passes/lowering/cuda` (renders the `KernelOp` body to a `__global__` source string). |
 
 ## Graph as the single program form
 

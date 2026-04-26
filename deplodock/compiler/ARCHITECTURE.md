@@ -13,8 +13,9 @@ Graph (frontend ops)                        ── Layer 1
    │  pipeline/passes/loop/fusion
    ▼
 Graph[LoopOp]  (one LoopOp = one kernel)    ── Layer 2
-   │  pipeline/passes/lowering/kernel       (CUDA path)
-   │  pipeline/passes/lowering/cuda
+   │  pipeline/passes/lowering/tile         (Loop IR → Tile IR)
+   │  pipeline/passes/lowering/kernel       (Tile IR → Kernel IR)
+   │  pipeline/passes/lowering/cuda         (Kernel IR → CUDA source)
    ▼
 Graph[CudaOp]                               ── Layer 3
    │  backend/cuda                          (cupy.RawKernel via NVRTC)

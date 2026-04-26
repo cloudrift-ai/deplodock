@@ -73,8 +73,8 @@ class Stmt:
 
         Default: no children (leaf stmt). Block-structured stmts override
         to return their body tuple(s) — ``Loop`` returns ``(self.body,)``;
-        ``Cond`` returns ``(self.body, self.else_body)``; ``Block`` /
-        ``Tile`` etc. return ``(self.body,)``.
+        ``Cond`` returns ``(self.body, self.else_body)``; ``Tile`` returns
+        ``(self.body,)``.
 
         ``iter_body`` walks all IR layers via this single method — every
         node knows its own children, so the walker doesn't need to
