@@ -33,7 +33,7 @@ passes can pattern-match on it.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var, free_vars
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve
 from deplodock.compiler.ir.stmt import Accum, Cond, Init, Load, Loop, Stmt, StridedLoop, Tile, Write
@@ -66,39 +66,18 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
 
 
 def _materialize(blk: Tile) -> Stmt:
-    if blk.block_axes:
-        return _materialize_cooperative(blk.axes, blk.body)
-    return _materialize_thread_per_output(blk.axes, blk.body)
-
-
-def _materialize_thread_per_output(axes: tuple, body: tuple) -> Stmt:
-    """One thread per output element. ``axes`` is passed through
-    unchanged — every BoundAxis is already ``BIND_THREAD``."""
-    lowered = tuple(_lower_uncooperative(s) for s in body)
-    return Tile(axes=axes, body=lowered)
-
-
-def _lower_uncooperative(s: Stmt) -> Stmt:
-    """Walk an uncooperative-Tile body. Loops pass through; Combine /
-    StridedLoop must not appear (no strategy emits them without setting
-    ``block_axes``)."""
-    if isinstance(s, Combine):
-        raise ValueError("Combine not allowed in non-cooperative Tile (block_axes must be populated)")
-    if isinstance(s, StridedLoop):
-        raise ValueError("StridedLoop not allowed in non-cooperative Tile (no thread axis to drive it)")
-    if isinstance(s, Loop):
-        return Loop(axis=s.axis, body=tuple(_lower_uncooperative(c) for c in s.body))
-    return s
-
-
-def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
-    """Cooperative materialization: one CUDA block per ``BIND_BLOCK`` axis
-    coordinate; the THREAD axes carried in ``Tile.axes`` are the
-    cooperative thread set. Strategies populate THREAD axes upfront —
-    this pass commits no axis decisions of its own."""
+    """Materialize a Tile. ``Tile.axes`` carries the launch geometry
+    (THREAD + optional BLOCK axes); strategies set this up — this pass
+    commits no axis decisions of its own. The body is walked uniformly
+    whether or not the Tile is cooperative: pointwise (no BLOCK axes)
+    is the degenerate case where Stage / Combine / StridedLoop don't
+    appear, Writes reference thread axes (so no Cond guard fires), and
+    no Accums exist (so no Init hoisting). The same walker handles both."""
+    axes = blk.axes
+    body = blk.body
     thread_axes = tuple(ba for ba in axes if ba.bind == BIND_THREAD)
     if not thread_axes:
-        raise ValueError("cooperative Tile must have at least one BIND_THREAD axis")
+        raise ValueError("Tile must have at least one BIND_THREAD axis")
     thread_axis_names = {ba.axis.name for ba in thread_axes}
     tid_expr = _build_linear_tid(thread_axes)
 
@@ -141,10 +120,12 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
 
     # Hoist Accum inits to Tile scope so nested-reduce shapes (matmul
     # ``Loop(k_o) > Loop(k_i) > Accum``) don't reset per outer iteration.
-    # The renderer's explicit_inits suppression makes this a no-op for
-    # softmax-style single-Loop reductions — same emitted CUDA either way.
-    inits = _collect_init_stmts(new_body)
-    new_body = [*inits, *new_body]
+    # Only fires for cooperative tiles — non-cooperative reductions
+    # have one Accum per Loop and the renderer's per-Loop init is
+    # already at the right scope.
+    if any(ba.bind == BIND_BLOCK for ba in axes):
+        inits = _collect_init_stmts(new_body)
+        new_body = [*inits, *new_body]
 
     # Pass Tile.axes through — strategies committed the launch layout
     # (THREAD + BLOCK only).
