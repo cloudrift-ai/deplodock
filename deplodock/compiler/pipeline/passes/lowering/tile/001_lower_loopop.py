@@ -35,8 +35,13 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     node = graph.nodes[match.root_node_id]
     if not isinstance(node.op, LoopOp):
         return None
-    kname = _kernel_name_for(node.op, node.output.name or match.root_node_id)
-    node.op = lower_naive(node.op, kname)
+    nid = match.root_node_id
+    desired = node.output.name or nid
+    if desired != nid and desired not in graph.nodes:
+        graph.rename_node(nid, desired)
+        nid = desired
+    kname = _kernel_name_for(node.op, nid)
+    graph.nodes[nid].op = lower_naive(graph.nodes[nid].op, kname)
     return None
 
 
