@@ -35,10 +35,12 @@ class Axis:
 
 
 # BoundAxis.bind values — how an axis is treated by the surrounding
-# scheduling context. ``Tile.axes`` / ``Enclosure.axes`` use only the
+# scheduling context. ``Tile.axes`` / ``Enclosure.axes`` use the
 # launch-geometry binds (``BIND_THREAD`` / ``BIND_BLOCK``);
-# ``BoundLoop.axis`` uses only the body-loop binds (``BIND_SERIAL`` /
-# ``BIND_BLOCK_STRIDED``). The two sets are disjoint by role.
+# ``BoundLoop.axis`` uses only ``BIND_SERIAL``. Cooperative iteration
+# is expressed by splitting an axis into ``(chunk, t)`` at strategy
+# time, with the inner half marked ``BIND_THREAD`` in ``Tile.axes`` —
+# no separate "strided body loop" binding is needed.
 
 # --- Launch-geometry bindings (used in Tile.axes / Enclosure.axes) ---
 # One thread per axis value (axis flattens into threadIdx.x).
@@ -47,14 +49,10 @@ BIND_THREAD = "THREAD"
 # threads inside cooperate.
 BIND_BLOCK = "BLOCK"
 
-# --- Body-loop bindings (used on BoundLoop.axis) ---
+# --- Body-loop binding (used on BoundLoop.axis) ---
 # Each thread iterates the axis privately (renders to a plain serial
 # ``for`` loop).
 BIND_SERIAL = "SERIAL"
-# Threads of the CUDA block cooperatively stride through the axis —
-# each thread takes every BLOCK_SIZE-th iteration; together the block
-# covers the full extent. Renders to ``StridedLoop(start=tid, step=BLOCK_SIZE)``.
-BIND_BLOCK_STRIDED = "BLOCK_STRIDED"
 
 
 @dataclass(frozen=True)
@@ -92,4 +90,4 @@ def split_axis(ax: Axis, factor: int) -> tuple[Axis, Axis]:
     return Axis(f"{ax.name}_o", ax.extent // factor), Axis(f"{ax.name}_i", factor)
 
 
-__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "BIND_BLOCK_STRIDED", "BIND_SERIAL", "split_axis"]
+__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "BIND_SERIAL", "split_axis"]

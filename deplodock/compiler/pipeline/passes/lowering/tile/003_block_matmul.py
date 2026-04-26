@@ -9,7 +9,7 @@ loop, and inserts ``Stage(A, axes=(m_i, k_i))`` /
 ``Stage(B, axes=(k_i, n_i))`` at the K_o loop head so each K-chunk's
 tiles get cached in smem. Matmul-aware materialization
 (``passes/lowering/kernel/001_materialize_tile.py``) expands the Stages
-and promotes the ``BIND_BLOCK_STRIDED`` output axes to ``BIND_THREAD``.
+and consumes the ``BIND_THREAD`` output axes for the launch geometry.
 
 Default tile sizes ``BM = BN = BK = 16`` give exactly one output per
 thread (``BM·BN == BLOCK_SIZE = 256``); no per-thread sub-tiling

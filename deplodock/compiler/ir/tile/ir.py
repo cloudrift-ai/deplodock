@@ -25,10 +25,9 @@ names are strings so they're directly renderable.
   ``block_axes`` empty (one thread per output element). Cooperative
   reductions have ``block_axes`` populated and ``thread_axes`` empty;
   the cooperative thread axis is synthesized at materialization.
-- ``BoundLoop.axis.bind`` — how an inner iteration axis is walked
-  (``BIND_SERIAL`` = per-thread sequential, ``BIND_BLOCK_STRIDED`` =
-  cooperative strided walk across the block's threads). Same vocabulary
-  as output-axis bindings; the role is implicit in where the axis lives.
+- ``BoundLoop.axis.bind`` — always ``BIND_SERIAL``; cooperative
+  iteration is expressed via axis splits in ``Tile.axes``, not a
+  body-loop bind.
 - ``Combine`` — cross-thread collapse of an Accum target; sibling
   Stmt because it's buffer/accumulator-scoped, not axis-local.
 
@@ -42,7 +41,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
@@ -72,13 +71,15 @@ from deplodock.compiler.ir.stmt import (
 # Schedule-bearing Stmts
 # ---------------------------------------------------------------------------
 #
-# All scheduling decisions — output-axis parallel decomposition and
-# inner-axis iteration policy — are expressed via ``BoundAxis.bind``
-# values defined in ``ir.axis``. ``BIND_THREAD`` / ``BIND_BLOCK`` /
-# ``BIND_BLOCK_STRIDED`` are the output-axis bindings (used in
-# ``Tile.axes`` / ``Enclosure.axes``); ``BIND_SERIAL`` and
-# ``BIND_BLOCK_STRIDED`` (reused) are the inner-axis bindings (used on
-# ``BoundLoop.axis``). One vocabulary, no separate ``walk`` enum.
+# Scheduling decisions are expressed via ``BoundAxis.bind`` values
+# defined in ``ir.axis``. ``BIND_THREAD`` / ``BIND_BLOCK`` are the
+# launch-geometry bindings (used in ``Tile.axes`` / ``Enclosure.axes``);
+# ``BIND_SERIAL`` is the body-loop binding (used on ``BoundLoop.axis``).
+# Cooperative iteration is expressed by splitting an axis into
+# ``(chunk, t)`` at strategy time — the inner half ``t`` is a THREAD
+# axis on ``Tile.axes`` and the outer half is iterated by a SERIAL
+# ``BoundLoop`` whose body uses ``chunk * BLOCK_SIZE + t`` as the
+# rewritten axis index.
 
 
 @dataclass
@@ -126,30 +127,18 @@ class BoundLoop(Stmt):
     """Iteration over an axis paired with its iteration policy.
 
     Tile-IR's variant of Loop-IR's ``Loop``: carries the same compute
-    (a nested body) plus a ``BoundAxis`` whose ``bind`` says how this
-    axis is walked:
-
-    - ``BIND_SERIAL`` — each thread iterates the axis privately
-      (renders to a plain ``for`` loop). Pre-strategy default.
-    - ``BIND_BLOCK_STRIDED`` — threads of the CUDA block cooperatively
-      stride through the axis (renders to a strided ``for`` loop driven
-      by the cooperative thread axis). Strategy-chosen.
-
-    The ``BoundAxis.bind`` vocabulary is shared with output bindings
-    (``Tile.axes`` / ``Enclosure.axes``) — the same value names work
-    in both contexts because they describe an axis's relationship to
-    the surrounding cooperative unit, regardless of whether the axis
-    is also an output axis. An axis that's both output (in
-    ``Tile.axes``) and iterated (in a ``BoundLoop``) carries the same
-    ``BIND_BLOCK_STRIDED`` value in both places.
+    (a nested body) plus a ``BoundAxis`` whose ``bind`` is always
+    ``BIND_SERIAL`` (each thread iterates the axis privately, renders
+    to a plain ``for`` loop). Cooperative iteration is expressed by
+    axis splits in ``Tile.axes``, not by a body-loop bind.
 
     Reduction detection is structural, same as Loop-IR's ``Loop``: a
     ``BoundLoop`` is a reduce-loop iff its body contains an ``Accum``.
 
     Disjoint from Loop-IR's ``Loop`` so materialization can convert
     between the two layers without ambiguity — post-materialization the
-    Kernel IR body contains ``Loop`` (serial) or ``StridedLoop``
-    (strided), never ``BoundLoop``.
+    Kernel IR body contains ``Loop`` (or ``StridedLoop`` for cooperative
+    smem loads inside Stage expansion), never ``BoundLoop``.
     """
 
     axis: BoundAxis
@@ -305,7 +294,6 @@ __all__ = [
     "BoundAxis",
     "BIND_THREAD",
     "BIND_BLOCK",
-    "BIND_BLOCK_STRIDED",
     "BIND_SERIAL",
     "Stmt",
     # Top-level

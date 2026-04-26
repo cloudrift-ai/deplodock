@@ -7,7 +7,7 @@
 - :mod:`.pretty` — structural pretty-printer.
 """
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_BLOCK_STRIDED, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.kernel.ir import (
     Accum,
     Assign,
@@ -60,7 +60,6 @@ __all__ = [
     "BoundAxis",
     "BIND_THREAD",
     "BIND_BLOCK",
-    "BIND_BLOCK_STRIDED",
     "Stmt",
     "KernelOp",
     "Axis",

@@ -20,10 +20,9 @@ The Tile→Enclosure mapping is structural: both nodes carry
 
     * ``Stage`` → smem decl + cooperative load driven by ``tid_expr``
       (multi-axis stages flatten via row-major decode).
-    * ``BoundLoop(BIND_BLOCK_STRIDED)`` → ``StridedLoop(start=tid_expr,
-      step=BLOCK_SIZE)`` over the axis. ``Combine`` siblings emit smem
-      tree-halve + broadcast.
-    * ``BoundLoop(BIND_SERIAL)`` → plain ``Loop``.
+    * ``BoundLoop(BIND_SERIAL)`` → plain ``Loop`` (cooperative iteration
+      lives in ``Tile.axes`` axis splits, not body-loop binds).
+    * ``Combine`` after a reduce loop → smem tree-halve + broadcast.
     * ``Write`` whose index references a THREAD axis is emitted
       unconditionally (each thread owns a unique output slot). Writes
       that don't reference any THREAD axis are guarded by ``tid==0`` so
@@ -36,7 +35,7 @@ passes can pattern-match on it.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import BIND_BLOCK_STRIDED, BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_SERIAL, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var, free_vars
 from deplodock.compiler.ir.kernel.ir import (
     Enclosure,
@@ -133,11 +132,7 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
         return s
 
     new_body: list[Stmt] = []
-    pending_reduce: tuple[BoundLoop, Accum] | None = None
-    # Axes whose Var distinguishes threads at the current scope. Starts as
-    # the THREAD axes; extended by ``_emit_loop`` when descending into a
-    # BIND_BLOCK_STRIDED loop (each thread visits distinct iterations).
-    distinguishing = set(thread_axis_names)
+    pending_reduce: Accum | None = None
 
     for stmt in body:
         if isinstance(stmt, Stage):
@@ -146,24 +141,21 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
             redirects[stmt.buf] = (stage_buf, stmt)
             pending_reduce = None
         elif isinstance(stmt, BoundLoop):
-            pending_reduce = None
-            new_body.append(_emit_loop(stmt, tid_expr, thread_axes, distinguishing, redirects, transform))
-            if stmt.bind == BIND_BLOCK_STRIDED and _is_reduce(stmt):
-                accum = next(a for a in stmt.body if isinstance(a, Accum))
-                pending_reduce = (stmt, accum)
+            new_body.append(_emit_loop(stmt, tid_expr, thread_axes, thread_axis_names, redirects, transform))
+            if _is_reduce(stmt):
+                pending_reduce = next(a for a in stmt.body if isinstance(a, Accum))
+            else:
+                pending_reduce = None
         elif isinstance(stmt, Combine):
             if pending_reduce is None:
                 raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce BoundLoop")
-            reduce_loop, accum = pending_reduce
-            if accum.name != stmt.name:
-                raise ValueError(f"Combine({stmt.name!r}) does not match preceding Accum({accum.name!r})")
-            phase = _emit_combine(stmt, accum, reduce_loop.bind, _single_thread_var(thread_axes))
-            new_body.extend(phase)
-            if reduce_loop.bind == BIND_BLOCK_STRIDED:
-                rename[accum.name] = f"{accum.name}_b"
+            if pending_reduce.name != stmt.name:
+                raise ValueError(f"Combine({stmt.name!r}) does not match preceding Accum({pending_reduce.name!r})")
+            new_body.extend(_emit_combine(pending_reduce, _single_thread_var(thread_axes)))
+            rename[pending_reduce.name] = f"{pending_reduce.name}_b"
             pending_reduce = None
         elif isinstance(stmt, Write):
-            new_body.append(_emit_write(stmt, distinguishing, thread_axes, transform))
+            new_body.append(_emit_write(stmt, thread_axis_names, thread_axes, transform))
         else:
             new_body.append(transform(stmt))
 
@@ -184,18 +176,17 @@ def _emit_loop(
     loop: BoundLoop,
     tid_expr,
     thread_axes: tuple,
-    distinguishing: set,
+    thread_axis_names: set,
     redirects: dict,
     transform,
 ) -> Stmt:
     """Translate a body BoundLoop. Recurses so nested staging / loops /
-    writes inside the loop body get the same uniform treatment.
-
-    A BIND_BLOCK_STRIDED loop adds its axis to ``distinguishing`` for
-    nested-scope Writes — threads visit distinct iterations of the
-    strided axis, so a Write whose index references it gets distinct
-    output positions per thread (no guard needed)."""
-    inner_distinguishing = distinguishing | ({loop.axis.axis.name} if loop.bind == BIND_BLOCK_STRIDED else set())
+    writes inside the loop body get the same uniform treatment. Every
+    body BoundLoop is BIND_SERIAL — strategies handle thread cooperation
+    via axis splits in ``Tile.axes`` (THREAD axes), not via body-loop
+    binds."""
+    if loop.bind != BIND_SERIAL:
+        raise NotImplementedError(f"BoundLoop bind={loop.bind!r} inside cooperative Tile not handled")
     inner: list[Stmt] = []
     for s in loop.body:
         if isinstance(s, Stage):
@@ -203,49 +194,29 @@ def _emit_loop(
             inner.extend(_emit_stage(s, stage_buf, tid_expr))
             redirects[s.buf] = (stage_buf, s)
         elif isinstance(s, BoundLoop):
-            inner.append(_emit_loop(s, tid_expr, thread_axes, inner_distinguishing, redirects, transform))
+            inner.append(_emit_loop(s, tid_expr, thread_axes, thread_axis_names, redirects, transform))
         elif isinstance(s, Write):
-            inner.append(_emit_write(s, inner_distinguishing, thread_axes, transform))
+            inner.append(_emit_write(s, thread_axis_names, thread_axes, transform))
         else:
             inner.append(transform(s))
-    body = tuple(inner)
-
-    if loop.bind == BIND_BLOCK_STRIDED:
-        return StridedLoop(axis=loop.axis, start=tid_expr, step=BLOCK_SIZE, body=body)
-    if loop.bind == BIND_SERIAL:
-        return Loop(axis=loop.axis, body=body)
-    if loop.bind == BIND_THREAD:
-        # The thread axis is bound by the Enclosure decode — strip the
-        # BoundLoop and inline its body.
-        return _StripThreadLoop(body=body)
-    raise NotImplementedError(f"BoundLoop bind={loop.bind!r} inside cooperative Tile not handled")
-
-
-class _StripThreadLoop:
-    """Sentinel returned by ``_emit_loop`` when a BoundLoop iterates a
-    THREAD axis — the loop is dropped and its body inlined into the
-    surrounding scope. (Today's strategies don't emit BoundLoops over
-    THREAD axes, but the path exists for future strategies.)"""
-
-    def __init__(self, body):
-        self.body = body
+    return Loop(axis=loop.axis, body=tuple(inner))
 
 
 def _emit_write(
     write: Write,
-    distinguishing: set,
+    thread_axis_names: set,
     thread_axes: tuple,
     transform,
 ) -> Stmt:
-    """Emit a Write — guarded by ``all thread_axes == 0`` if the Write
-    doesn't address any *distinguishing* axis (THREAD axes plus any
-    enclosing BIND_BLOCK_STRIDED loop axes). Otherwise unconditional —
-    each thread writes a unique output position."""
+    """Emit a Write — unconditional if the index references a THREAD axis
+    (each thread owns a unique output position); otherwise wrapped in
+    ``Cond(all THREAD axes == 0)`` so only one thread writes a shared
+    output slot."""
     write = transform(write)
     write_free = set()
     for e in write.index:
         write_free |= free_vars(e)
-    if distinguishing & write_free:
+    if thread_axis_names & write_free:
         return write
     return Cond(cond=_all_threads_zero(thread_axes), body=(write,), else_body=())
 
@@ -306,28 +277,21 @@ def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
     return expr
 
 
-def _emit_combine(combine: Combine, accum: Accum, scope: str, t: str) -> list[Stmt]:
-    """Emit the cross-thread combine. ``scope`` is the surrounding reduce
-    BoundLoop's bind value, which drives the combine mechanism:
-
-    - ``BIND_BLOCK_STRIDED`` → smem tree-halve at block scope.
-    - ``BIND_SERIAL`` → no combine (each thread's partial is already
-      the final value; legal but unused today).
-    - Future: ``BIND_WARP_STRIDED`` → warp-shuffle (no smem)."""
-    if scope == BIND_SERIAL:
-        return []
-    if scope == BIND_BLOCK_STRIDED:
-        smem_name = f"{accum.name}_smem"
-        broadcast_name = f"{accum.name}_b"
-        return [
-            Smem(name=smem_name, extents=(BLOCK_SIZE,)),
-            Write(output=smem_name, index=(Var(t),), value=accum.name),
-            Sync(),
-            TreeHalve(buf=smem_name, op=accum.op, length=BLOCK_SIZE, tid_var=t),
-            Sync(),
-            Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
-        ]
-    raise NotImplementedError(f"Combine for surrounding bind={scope!r} not yet handled")
+def _emit_combine(accum: Accum, t: str) -> list[Stmt]:
+    """Emit the cross-thread combine: each thread writes its per-thread
+    accumulator partial to smem indexed by ``t``, then a tree-halve
+    reduces over ``t`` and broadcasts the final value via a load from
+    ``smem[0]``."""
+    smem_name = f"{accum.name}_smem"
+    broadcast_name = f"{accum.name}_b"
+    return [
+        Smem(name=smem_name, extents=(BLOCK_SIZE,)),
+        Write(output=smem_name, index=(Var(t),), value=accum.name),
+        Sync(),
+        TreeHalve(buf=smem_name, op=accum.op, length=BLOCK_SIZE, tid_var=t),
+        Sync(),
+        Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
+    ]
 
 
 def _is_reduce(loop: BoundLoop) -> bool:
