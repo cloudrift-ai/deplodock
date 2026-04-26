@@ -1,8 +1,9 @@
 """Kernel IR — fully-scheduled kernel form, lowered directly to CUDA source.
 
-- :mod:`.ir` — dataclass definitions: ``KernelOp`` wrapper, ``Enclosure`` /
-  ``Tile`` / ``Smem`` / ``Sync`` / ``TreeHalve`` / ``StridedLoop`` hardware
-  primitives, plus re-exports of Loop-IR leaves.
+- :mod:`.ir` — dataclass definitions: ``KernelOp`` wrapper plus
+  ``Smem`` / ``Sync`` / ``TreeHalve`` hardware primitives. Shared
+  structural types (``Tile``, ``Loop``, ``StridedLoop``) come from
+  ``ir.stmt``.
 - :mod:`.render` — ``render_kernelop`` emitting CUDA source.
 - :mod:`.pretty` — structural pretty-printer.
 """
@@ -16,7 +17,6 @@ from deplodock.compiler.ir.kernel.ir import (
     CastExpr,
     Cond,
     ElementwiseImpl,
-    Enclosure,
     Expr,
     FuncCallExpr,
     KernelOp,
@@ -30,6 +30,7 @@ from deplodock.compiler.ir.kernel.ir import (
     StridedLoop,
     Sync,
     TernaryExpr,
+    Tile,
     TreeHalve,
     Var,
     Write,
@@ -52,7 +53,7 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    "Enclosure",
+    "Tile",
     "Smem",
     "Sync",
     "TreeHalve",

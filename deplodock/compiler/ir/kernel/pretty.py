@@ -1,7 +1,7 @@
 """Kernel IR pretty-printer — structural view of a ``KernelOp``.
 
 Used by ``deplodock compile --ir kernel`` so the scheduled form is
-inspectable. Handles the Kernel-IR primitives (``Enclosure`` / ``Smem``
+inspectable. Handles the Kernel-IR primitives (``Tile`` / ``Smem``
 / ``Sync`` / ``TreeHalve`` / ``StridedLoop``) plus Loop-IR leaves
 (``Load`` / ``Assign`` / ``Accum`` / ``Write`` / ``Cond`` / ``Loop``).
 """
@@ -10,12 +10,12 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.kernel.ir import (
-    Enclosure,
     KernelOp,
     Smem,
     Stmt,
     StridedLoop,
     Sync,
+    Tile,
     TreeHalve,
 )
 from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, Write
@@ -37,9 +37,9 @@ def _render_body(stmts: tuple[Stmt, ...], indent: str, lines: list[str]) -> None
 
 
 def _render_stmt(stmt: Stmt, indent: str, lines: list[str]) -> None:
-    if isinstance(stmt, Enclosure):
+    if isinstance(stmt, Tile):
         axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in stmt.axes) or "-"
-        lines.append(f"{indent}Enclosure(axes=({axes})):")
+        lines.append(f"{indent}Tile(axes=({axes})):")
         _render_body(stmt.body, indent + "    ", lines)
         return
     if isinstance(stmt, Smem):

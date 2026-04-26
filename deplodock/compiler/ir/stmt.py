@@ -15,9 +15,10 @@ Defined here rather than under any one IR package because all three IRs
 Each IR layer adds its own scheduling-specific Stmts on top:
 
 - Loop IR: nothing extra — its bodies are exactly Loop / leaves.
-- Tile IR: ``Block``, ``BoundLoop``, ``Combine``.
-- Kernel IR: ``Enclosure``, ``Smem``, ``Sync``, ``TreeHalve``,
-  ``StridedLoop``.
+- Tile IR: ``Stage``, ``Combine``, plus the shared ``Tile`` /
+  ``Loop`` / ``StridedLoop`` constructs from this module.
+- Kernel IR: ``Smem``, ``Sync``, ``TreeHalve``, plus the shared
+  constructs.
 
 Loop-IR's ``LoopOp``, ``LoopMeta``, validation, and normalization stay
 in ``ir/loop/`` because they're Loop-IR-internal — they enforce
@@ -30,7 +31,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, free_vars
 from deplodock.compiler.ir.sigma import Sigma
@@ -73,7 +74,7 @@ class Stmt:
         Default: no children (leaf stmt). Block-structured stmts override
         to return their body tuple(s) — ``Loop`` returns ``(self.body,)``;
         ``Cond`` returns ``(self.body, self.else_body)``; ``Block`` /
-        ``Enclosure`` etc. return ``(self.body,)``.
+        ``Tile`` etc. return ``(self.body,)``.
 
         ``iter_body`` walks all IR layers via this single method — every
         node knows its own children, so the walker doesn't need to
@@ -306,6 +307,39 @@ class Loop(Stmt):
         return Loop(axis=self.axis, body=tuple(s.rewrite(rename_ssa, sigma) for s in self.body))
 
 
+@dataclass
+class Tile(Stmt):
+    """Axis-bound scope wrapper — one CUDA-kernel scope.
+
+    Carries ``axes: tuple[BoundAxis, ...]`` (launch geometry —
+    ``BIND_THREAD`` and ``BIND_BLOCK`` axes) plus a body of statements.
+    Used at both Tile IR (with Tile-IR-specific stmts like ``Stage`` /
+    ``Combine`` in the body) and Kernel IR (with hardware primitives
+    like ``Smem`` / ``Sync`` / ``TreeHalve`` after materialization).
+
+    Materialization rewrites the body content but preserves the
+    wrapper — same axes, same type, just different body shape.
+
+    ``thread_axes`` / ``block_axes`` are convenience properties that
+    project ``axes`` by binding kind — render and launch geometry use
+    them.
+    """
+
+    axes: tuple[BoundAxis, ...]
+    body: tuple[Stmt, ...]
+
+    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+        return (self.body,)
+
+    @property
+    def thread_axes(self) -> tuple[Axis, ...]:
+        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_THREAD)
+
+    @property
+    def block_axes(self) -> tuple[Axis, ...]:
+        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
+
+
 @dataclass(frozen=True)
 class StridedLoop(Stmt):
     """Strided iteration: ``for (axis = start; axis < axis.extent; axis += step)``.
@@ -434,6 +468,7 @@ __all__ = [
     "Init",
     "Write",
     "StridedLoop",
+    "Tile",
     "Select",
     "SelectBranch",
     "Loop",

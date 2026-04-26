@@ -117,7 +117,7 @@ def test_e2e_matmul_blockify(run_graph):
     """Matmul shape divisible by ``BM=BN=BK=16`` — exercises the
     block-tiled SGEMM path: per-block BM·BN tile cooperatively walks K
     in BK-sized chunks, with A/B operand caching in smem and an Init-at-
-    Enclosure-scope accumulator persisting across the K_o loop."""
+    Tile-scope accumulator persisting across the K_o loop."""
     from deplodock.compiler.ir.frontend.ir import MatmulOp
 
     M, N, K = 32, 32, 64  # all divisible by 16

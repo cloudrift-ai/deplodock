@@ -1,22 +1,20 @@
 """Materialize a Tile-IR ``TileOp`` into a Kernel-IR ``KernelOp``.
 
-Reads each ``Tile`` in the TileOp body and emits the concrete hardware
-shape — ``Enclosure`` / ``Smem`` / ``Sync`` / ``TreeHalve`` /
-``StridedLoop`` — that ``render_kernelop`` consumes.
-
-The Tile→Enclosure mapping is structural: both nodes carry
-``axes: tuple[BoundAxis, ...]``. Two paths:
+The wrapper stays as ``Tile`` (shared with Tile IR via ``ir.stmt``);
+only the body content changes — ``Stage`` becomes
+``Smem`` + cooperative load, ``Combine`` becomes smem tree-halve,
+``Loop`` / ``StridedLoop`` pass through. Two paths:
 
 - **Non-cooperative** (no ``BIND_BLOCK`` axes): every BoundAxis is
-  ``BIND_THREAD`` (pointwise / per-thread serial) → ``Enclosure`` with
-  ``axes`` passed through. Inner ``Loop``s pass through.
+  ``BIND_THREAD`` (pointwise / per-thread serial) — ``axes`` passed
+  through, inner ``Loop``s pass through.
 
 - **Cooperative** (one or more ``BIND_BLOCK`` axes): the Tile's THREAD
   axes are the cooperative thread set (synthesized by the strategy:
   ``cooperative-reduce`` adds a single ``t`` axis; ``blockify`` uses
   the per-block tile dims ``m_i`` / ``n_i``). Materialization passes
-  ``Tile.axes`` through to the Enclosure, computes a linear thread
-  index ``tid_expr`` from the THREAD axes, then walks the body:
+  ``Tile.axes`` through, computes a linear thread index ``tid_expr``
+  from the THREAD axes, then walks the body:
 
     * ``Stage`` → smem decl + cooperative load driven by ``tid_expr``
       (multi-axis stages flatten via row-major decode).
@@ -37,22 +35,10 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var, free_vars
-from deplodock.compiler.ir.kernel.ir import (
-    Enclosure,
-    KernelOp,
-    Smem,
-    Sync,
-    TreeHalve,
-)
+from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Cond, Init, Load, Loop, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.ir import (
-    BLOCK_SIZE,
-    Combine,
-    Stage,
-    Tile,
-    TileOp,
-)
+from deplodock.compiler.ir.stmt import Accum, Cond, Init, Load, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.tile.ir import BLOCK_SIZE, Combine, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -90,7 +76,7 @@ def _materialize_thread_per_output(axes: tuple, body: tuple) -> Stmt:
     """One thread per output element. ``axes`` is passed through
     unchanged — every BoundAxis is already ``BIND_THREAD``."""
     lowered = tuple(_lower_uncooperative(s) for s in body)
-    return Enclosure(axes=axes, body=lowered)
+    return Tile(axes=axes, body=lowered)
 
 
 def _lower_uncooperative(s: Stmt) -> Stmt:
@@ -154,7 +140,7 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
         else:
             new_body.append(transform(stmt))
 
-    # Hoist Accum inits to Enclosure scope so nested-reduce shapes (matmul
+    # Hoist Accum inits to Tile scope so nested-reduce shapes (matmul
     # ``Loop(k_o) > Loop(k_i) > Accum``) don't reset per outer iteration.
     # The renderer's explicit_inits suppression makes this a no-op for
     # softmax-style single-Loop reductions — same emitted CUDA either way.
@@ -163,7 +149,7 @@ def _materialize_cooperative(axes: tuple, body: tuple) -> Stmt:
 
     # Pass Tile.axes through — strategies committed the launch layout
     # (THREAD + BLOCK only).
-    return Enclosure(axes=axes, body=tuple(new_body))
+    return Tile(axes=axes, body=tuple(new_body))
 
 
 def _emit_loop(

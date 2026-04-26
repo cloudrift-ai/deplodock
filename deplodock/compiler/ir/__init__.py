@@ -14,7 +14,7 @@ One subpackage per IR level:
 - ``loop``     — Loop IR (``LoopOp`` + ``Axis`` + body-form ``Load`` +
                  SSA ``Assign`` / ``Accum`` / ``Write`` / ``Select``
                  statements). One ``LoopOp`` per GPU kernel.
-- ``tile``     — Tile IR (``TileOp`` + ``Enclosure`` / ``Tile`` / ``Coop`` /
+- ``tile``     — Tile IR (``TileOp`` + ``Tile`` / ``Tile`` / ``Coop`` /
                  ``Sync`` schedule wrappers, reusing Loop IR leaves).
                  Lowers directly to CUDA source.
 - ``cuda``     — Device IR (``CudaOp`` carrying rendered ``__global__``

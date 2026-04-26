@@ -28,13 +28,13 @@ from deplodock.compiler.ir.expr import (
     Var,
 )
 from deplodock.compiler.ir.kernel.ir import (
-    Enclosure,
     Expr,
     KernelOp,
     Smem,
     Stmt,
     StridedLoop,
     Sync,
+    Tile,
     TreeHalve,
 )
 from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Init, Load, Loop, Select, Write
@@ -160,11 +160,11 @@ def render_kernelop(kernel_op: KernelOp, shapes: dict[str, tuple[int, ...]] | No
 
 
 def _launch_bounds_for(kernel_op: KernelOp) -> int:
-    """Derive ``__launch_bounds__`` from the first ``Enclosure``'s thread axes
+    """Derive ``__launch_bounds__`` from the first ``Tile``'s thread axes
     when ``block_axes`` is populated; otherwise fall back to the legacy
     ``_BLOCK_SIZE`` cap (which the host-side launcher rounds up the grid for)."""
     for s in kernel_op.body:
-        if isinstance(s, Enclosure):
+        if isinstance(s, Tile):
             if s.block_axes:
                 bsize = 1
                 for ax in s.thread_axes:
@@ -247,8 +247,8 @@ def _render_stmt(stmt: Stmt, ctx: _Ctx) -> list[str]:
     if isinstance(stmt, Loop):
         return _render_loop(stmt, ctx)
 
-    if isinstance(stmt, Enclosure):
-        return _render_enclosure(stmt, ctx)
+    if isinstance(stmt, Tile):
+        return _render_tile(stmt, ctx)
 
     if isinstance(stmt, Smem):
         return _render_smem(stmt, ctx)
@@ -332,7 +332,7 @@ def _render_strided_loop(stmt: StridedLoop, ctx: _Ctx) -> list[str]:
     return out
 
 
-def _render_enclosure(stmt: Enclosure, ctx: _Ctx) -> list[str]:
+def _render_tile(stmt: Tile, ctx: _Ctx) -> list[str]:
     """Emit thread / block index decodes plus body.
 
     Two forms:

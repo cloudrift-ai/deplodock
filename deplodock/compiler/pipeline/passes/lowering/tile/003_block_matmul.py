@@ -139,7 +139,7 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     new_load_b = load_b.rewrite(_id, sigma)
     inner_compute: tuple[Stmt, ...] = (new_load_a, new_load_b, mul, accum)
 
-    # m_i / n_i are bound directly as Enclosure THREAD axes (their
+    # m_i / n_i are bound directly as Tile THREAD axes (their
     # extents·product equals BLOCK_SIZE — one output per thread). No
     # wrapping loops over them in the body — the thread decode at
     # render time provides Var(m_i) / Var(n_i) for the inner compute.
