@@ -30,6 +30,8 @@ applied in order by :func:`normalize_body`:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop.ir import (
     Accum,
@@ -59,6 +61,11 @@ def _identity_rename(n: str) -> str:
     return n
 
 
+def _make_axis_renamer(old: str, new: Axis) -> Callable[[Axis], Axis]:
+    """Closure that maps ``Axis(old, ...)`` to ``new``, leaving others alone."""
+    return lambda a: new if a.name == old else a
+
+
 # ---------------------------------------------------------------------------
 # Top-level composition
 # ---------------------------------------------------------------------------
@@ -76,11 +83,6 @@ def normalize_body(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     stmts = simplify_body(stmts)
     stmts = rename_ssa_sequential(stmts)
     return stmts
-
-
-# ---------------------------------------------------------------------------
-# Body predicates
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +140,6 @@ def canonicalize_free_axis_order(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _is_copy_assign(stmt: Stmt) -> bool:
-    return isinstance(stmt, Assign) and stmt.op.name == "copy" and len(stmt.args) == 1
-
-
 def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     """Collapse ``y = copy(x)`` Assigns. The merge rule plants identity
     copies as bridges between producer writes and consumer reads; a long
@@ -149,7 +147,6 @@ def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     dropped and downstream references to ``y`` are rewired to the alias
     root. Semantically a no-op — pure IR hygiene."""
     alias: dict[str, str] = {}
-    identity_sigma = Sigma()
 
     def resolve(name: str) -> str:
         seen: set[str] = set()
@@ -161,10 +158,10 @@ def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     def fn(s: Stmt) -> Stmt | None:
         if isinstance(s, Loop):
             return Loop(axis=s.axis, body=map_body(s.body, fn))
-        if _is_copy_assign(s):
-            alias[s.name] = s.args[0]  # type: ignore[attr-defined]
+        if isinstance(s, Assign) and s.op.name == "copy" and len(s.args) == 1:
+            alias[s.name] = s.args[0]
             return None
-        return s.rewrite(resolve, identity_sigma)
+        return s.rewrite(resolve)
 
     return map_body(stmts, fn)
 
@@ -216,12 +213,13 @@ def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
             for idx in indices[1:]:
                 loop = new_body[idx]
                 assert isinstance(loop, Loop)
-                if int(loop.axis.extent) != canonical_extent:
+                if int(loop.axis.extent) != canonical_extent or loop.axis.name == canonical:
                     continue
-                if loop.axis.name == canonical:
-                    continue
-                renamed = _rename_axis_in_body(loop.body, loop.axis.name, canonical)
-                new_body[idx] = Loop(axis=Axis(name=canonical, extent=canonical_extent), body=renamed)
+                new_axis = Axis(name=canonical, extent=canonical_extent)
+                sub = Sigma({loop.axis.name: Var(canonical)})
+                rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
+                renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
+                new_body[idx] = Loop(axis=new_axis, body=renamed)
 
         return tuple(new_body)
 
@@ -240,17 +238,6 @@ def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str)
         for dim, e in enumerate(s.index)
         if isinstance(e, Var) and e.name == reduce_axis_name
     }
-
-
-def _rename_axis_in_body(body: tuple[Stmt, ...], old_name: str, new_name: str) -> tuple[Stmt, ...]:
-    """Substitute ``Var(old_name) → Var(new_name)`` in every Expr field of
-    ``body``, and rename any nested Loop whose axis name is ``old_name``."""
-    sub = Sigma({old_name: Var(new_name)})
-
-    def axis_fn(a: Axis) -> Axis:
-        return Axis(name=new_name, extent=a.extent) if a.name == old_name else a
-
-    return tuple(s.rewrite(_identity_rename, sub, axis_fn) for s in body)
 
 
 # ---------------------------------------------------------------------------
@@ -388,48 +375,38 @@ def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
     Idempotent: bodies already in canonical form round-trip unchanged."""
     ssa_rename: dict[str, str] = {}
-    v_counter = 0
-    in_counter = 0
-    acc_counter = 0
-    for stmt in iter_body(stmts):
-        if isinstance(stmt, Load):
-            if stmt.name in ssa_rename:
-                continue
-            ssa_rename[stmt.name] = f"in{in_counter}"
-            in_counter += 1
-        elif isinstance(stmt, Accum):
-            if stmt.name in ssa_rename:
-                continue
-            ssa_rename[stmt.name] = f"acc{acc_counter}"
-            acc_counter += 1
-        elif isinstance(stmt, (Assign, Select)):
-            if stmt.name in ssa_rename:
-                continue
-            ssa_rename[stmt.name] = f"v{v_counter}"
-            v_counter += 1
-
     axis_rename: dict[str, str] = {}
-    for s in iter_body(stmts):
-        if isinstance(s, Loop) and s.axis.name not in axis_rename:
-            axis_rename[s.axis.name] = f"a{len(axis_rename)}"
-
-    ssa_noop = all(old == new for old, new in ssa_rename.items())
-    axis_noop = all(old == new for old, new in axis_rename.items())
-    if ssa_noop and axis_noop:
-        return stmts
-
     # Expr-level substitution covers axis renames AND Load renames — a Load's
     # SSA name can appear as ``Var(load_name)`` in another Load's index (the
     # gather pattern: ``data[..., Var("idx"), ...]`` where ``idx`` is another
     # Load's name). Assign/Select names never surface in Exprs so they stay
     # out of this map.
-    expr_sub: dict[str, Expr] = {old: Var(new) for old, new in axis_rename.items() if old != new}
+    expr_sub: dict[str, Expr] = {}
+    counters = {"v": 0, "in": 0, "acc": 0}
+
+    def _rename(name: str, prefix: str) -> str:
+        new = f"{prefix}{counters[prefix]}"
+        ssa_rename[name] = new
+        counters[prefix] += 1
+        return new
+
     for stmt in iter_body(stmts):
-        if isinstance(stmt, Load):
-            old = stmt.name
-            new = ssa_rename.get(old, old)
-            if old != new:
-                expr_sub[old] = Var(new)
+        if isinstance(stmt, Load) and stmt.name not in ssa_rename:
+            new = _rename(stmt.name, "in")
+            if stmt.name != new:
+                expr_sub[stmt.name] = Var(new)
+        elif isinstance(stmt, Accum) and stmt.name not in ssa_rename:
+            _rename(stmt.name, "acc")
+        elif isinstance(stmt, (Assign, Select)) and stmt.name not in ssa_rename:
+            _rename(stmt.name, "v")
+        elif isinstance(stmt, Loop) and stmt.axis.name not in axis_rename:
+            new = f"a{len(axis_rename)}"
+            axis_rename[stmt.axis.name] = new
+            if stmt.axis.name != new:
+                expr_sub[stmt.axis.name] = Var(new)
+
+    if all(o == n for o, n in ssa_rename.items()) and all(o == n for o, n in axis_rename.items()):
+        return stmts
 
     sigma = Sigma(expr_sub)
 
