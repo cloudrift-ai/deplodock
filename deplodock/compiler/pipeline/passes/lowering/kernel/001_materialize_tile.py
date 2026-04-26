@@ -45,8 +45,6 @@ PATTERN = [Pattern("root", TileOp)]
 
 def rewrite(graph: Graph, match: Match) -> Graph | None:
     node = graph.nodes[match.root_node_id]
-    if not isinstance(node.op, TileOp):
-        return None
     tile_op: TileOp = node.op
 
     new_body: list[Stmt] = []
