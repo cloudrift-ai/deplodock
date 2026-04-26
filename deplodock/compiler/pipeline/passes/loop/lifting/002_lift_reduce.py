@@ -28,9 +28,6 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     nid = match.root_node_id
     node = graph.nodes[nid]
     op = node.op
-    if not isinstance(op, ReduceOp) or not node.inputs:
-        return None
-
     src_id = node.inputs[0]
     src_node = graph.nodes.get(src_id)
     if src_node is None:
