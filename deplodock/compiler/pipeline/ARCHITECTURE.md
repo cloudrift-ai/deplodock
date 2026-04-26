@@ -104,7 +104,10 @@ pre-pipeline input graph is dumped separately as `00_input.*` via
 The uniform strategy means adding a new pass automatically gets dumped
 — no per-pass registration needed. Rendering the kernel-level IRs
 (loop/tile/kernel/cuda) lives in `format_kernels(graph)`, which calls
-each op's own `pretty_body()`.
+each op's own `pretty_body()`. Node ids accumulate `merged_` per
+fusion step and a leading `lift_` from lifting; `_canonical_node_id`
+collapses both for display, and the rendered body is rewritten with
+the same map so `Load`/`Write` references match.
 
 ## Fragment splice (`engine._apply_replacement`)
 
