@@ -1,15 +1,14 @@
 """Decompose softmax(x, dim) into max → sub → exp → sum → div."""
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.frontend.ir import SoftmaxOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, softmax_decompose
 
 PATTERN = [Pattern("root", SoftmaxOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    root = graph.nodes[match.root_node_id]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
     if not root.inputs:
         return None
     x_id = root.inputs[0]

@@ -29,13 +29,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Load, Loop, Stmt, StridedLoop
 from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -45,14 +45,11 @@ STAGE_BYTES_LIMIT = 16 * 1024
 DTYPE_BYTES = 4
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    node = graph.nodes[match.root_node_id]
-    tile_op: TileOp = node.op
-
-    new_body = _maybe_stage(tile_op.body)
+def rewrite(graph: Graph, root: Node) -> Graph | None:
+    new_body = _maybe_stage(root.op.body)
     if new_body is None:
         return None
-    node.op = TileOp(body=new_body, name=tile_op.name)
+    root.op = TileOp(body=new_body, name=root.op.name)
     return None
 
 

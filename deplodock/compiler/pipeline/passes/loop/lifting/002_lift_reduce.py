@@ -8,13 +8,13 @@ outputs).
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", ReduceOp)]
 
@@ -24,11 +24,8 @@ PATTERN = [Pattern("root", ReduceOp)]
 _COMBINE: dict[str, str] = {"sum": "add", "maximum": "maximum", "prod": "multiply", "minimum": "minimum"}
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    nid = match.root_node_id
-    node = graph.nodes[nid]
-    op = node.op
-    src_id = node.inputs[0]
+def rewrite(graph: Graph, root: Node) -> Graph | None:
+    src_id = root.inputs[0]
     src_node = graph.nodes.get(src_id)
     if src_node is None:
         return None
@@ -37,7 +34,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         return None
 
     ndim = len(src_shape)
-    axis_raw = op.axis
+    axis_raw = root.op.axis
     axis = int(axis_raw) if isinstance(axis_raw, int) else 0
     if axis < 0:
         axis += ndim
@@ -48,8 +45,8 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     reduce_axis_name = f"a{axis}"
     load_index = tuple(Var(a.name) for a in axes)
 
-    combine = ElementwiseImpl(_COMBINE.get(op.name, op.name))
-    write_index = _build_write_index(axes, reduce_axis_name, tuple(node.output.shape))
+    combine = ElementwiseImpl(_COMBINE.get(root.op.name, root.op.name))
+    write_index = _build_write_index(axes, reduce_axis_name, tuple(root.output.shape))
 
     # Nested body: Loop(reduce_axis, [Load + Accum]) + Write wrapped in
     # Loop(free_axis, ...) blocks (outermost first). The Accum implicitly
@@ -57,7 +54,6 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     # via ACCUM_IDENTITY, the init value.
     reduce_axis = next(a for a in axes if a.name == reduce_axis_name)
     free_axes = [a for a in axes if a.name != reduce_axis_name]
-    out_buf = f"lift_{nid}"
     inner: tuple[Stmt, ...] = (
         Loop(
             axis=reduce_axis,
@@ -66,7 +62,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
                 Accum(name="acc", value="in0", op=combine),
             ),
         ),
-        Write(output=out_buf, index=write_index, value="acc"),
+        Write(output=f"lift_{root.id}", index=write_index, value="acc"),
     )
     body: tuple[Stmt, ...] = inner
     for a in reversed(free_axes):
@@ -78,8 +74,8 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     out_id = frag.add_node(
         kernel,
         list(kernel.inputs),
-        Tensor(node.output.name, node.output.shape, node.output.dtype),
-        node_id=f"lift_{nid}",
+        Tensor(root.output.name, root.output.shape, root.output.dtype),
+        node_id=f"lift_{root.id}",
     )
     frag.outputs = [out_id]
     return frag

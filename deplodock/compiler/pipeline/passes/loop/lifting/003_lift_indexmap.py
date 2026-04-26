@@ -10,31 +10,28 @@ kernel into its consumer whenever their axes align via σ.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import IndexMapOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", IndexMapOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    nid = match.root_node_id
-    node = graph.nodes[nid]
-    op = node.op
-    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(op.out_shape))
+def rewrite(graph: Graph, root: Node) -> Graph | None:
+    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(root.op.out_shape))
     mapping = {f"{PLACEHOLDER_PREFIX}{i}": Var(a.name) for i, a in enumerate(axes)}
     write_index = tuple(Var(a.name) for a in axes)
 
     input_names: list[str] = []
     body: list = []
 
-    out_buf = f"lift_{nid}"
-    if len(op.sources) == 1:
-        src = op.sources[0]
-        src_id = node.inputs[src.input_idx]
+    out_buf = f"lift_{root.id}"
+    if len(root.op.sources) == 1:
+        src = root.op.sources[0]
+        src_id = root.inputs[src.input_idx]
         src_shape = graph.nodes[src_id].output.shape if src_id in graph.nodes else ()
         idx = _substituted_index(src.coord_map, mapping, src_shape)
         input_names.append(src_id)
@@ -42,8 +39,8 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         body.append(Write(output=out_buf, index=write_index, value="in0"))
     else:
         branches: list[SelectBranch] = []
-        for i, src in enumerate(op.sources):
-            src_id = node.inputs[src.input_idx]
+        for i, src in enumerate(root.op.sources):
+            src_id = root.inputs[src.input_idx]
             src_shape = graph.nodes[src_id].output.shape if src_id in graph.nodes else ()
             idx = _substituted_index(src.coord_map, mapping, src_shape)
             input_names.append(src_id)
@@ -70,7 +67,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         frag.add_node(InputOp(), [], Tensor(inp_id, shape, dtype), node_id=inp_id)
 
     out_id = frag.add_node(
-        kernel, list(kernel.inputs), Tensor(node.output.name, tuple(op.out_shape), node.output.dtype), node_id=f"lift_{nid}"
+        kernel, list(kernel.inputs), Tensor(root.output.name, tuple(root.op.out_shape), root.output.dtype), node_id=f"lift_{root.id}"
     )
     frag.outputs = [out_id]
     return frag

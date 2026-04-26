@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from math import prod
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
 from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", KernelOp)]
 
@@ -25,26 +25,19 @@ _BLOCK = 256
 _DTYPE_BYTES: dict[str, int] = {"float": 4, "double": 8, "int": 4, "half": 2}
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    node = graph.nodes[match.root_node_id]
-    kernel_op: KernelOp = node.op
+def rewrite(graph: Graph, root: Node) -> Graph | None:
+    shapes: dict[str, tuple[int, ...]] = {bid: tuple(graph.nodes[bid].output.shape) for bid in root.op.inputs}
+    for out in root.op.outputs:
+        shapes[out] = tuple(graph.nodes[out].output.shape) if out in graph.nodes else tuple(root.output.shape)
 
-    shapes: dict[str, tuple[int, ...]] = {bid: tuple(graph.nodes[bid].output.shape) for bid in kernel_op.inputs}
-    for out in kernel_op.outputs:
-        shapes[out] = tuple(graph.nodes[out].output.shape) if out in graph.nodes else tuple(node.output.shape)
-
-    source = render_kernelop(kernel_op, shapes=shapes)
-    grid, block = _launch_geometry(kernel_op)
-    smem_bytes = _smem_bytes(kernel_op)
-    arg_order = (*kernel_op.inputs, *kernel_op.outputs)
-
-    node.op = CudaOp(
-        kernel_source=source,
-        kernel_name=kernel_op.name,
-        arg_order=arg_order,
+    grid, block = _launch_geometry(root.op)
+    root.op = CudaOp(
+        kernel_source=render_kernelop(root.op, shapes=shapes),
+        kernel_name=root.op.name,
+        arg_order=(*root.op.inputs, *root.op.outputs),
         grid=grid,
         block=block,
-        smem_bytes=smem_bytes,
+        smem_bytes=_smem_bytes(root.op),
     )
     return None
 

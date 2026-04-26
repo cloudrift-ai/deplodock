@@ -50,7 +50,7 @@ Trigger conditions:
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Loop, StridedLoop
@@ -61,19 +61,16 @@ from deplodock.compiler.ir.tile.ir import (
     Tile,
     TileOp,
 )
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(graph: Graph, match: Match) -> Graph | None:
-    node = graph.nodes[match.root_node_id]
-    tile_op: TileOp = node.op
-
-    new_body = _maybe_rewrite(tile_op.body)
+def rewrite(graph: Graph, root: Node) -> Graph | None:
+    new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         return None
-    node.op = TileOp(body=new_body, name=tile_op.name)
+    root.op = TileOp(body=new_body, name=root.op.name)
     return None
 
 
