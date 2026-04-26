@@ -8,14 +8,11 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import c
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "silu"})]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(graph: Graph, inp_x: Node, out: Tensor) -> Graph | None:
     """Replace silu(x) with x * recip(1 + exp(-x))."""
-    x_id = root.inputs[0]
-    out = root.output
+    frag = open_fragment(graph, [inp_x])
 
-    frag = open_fragment(graph, [x_id])
-
-    neg_id = frag.add_node(op=ElementwiseOp(op="negative"), inputs=[x_id], output=Tensor(f"{out.name}_neg", out.shape, out.dtype))
+    neg_id = frag.add_node(op=ElementwiseOp(op="negative"), inputs=[inp_x.id], output=Tensor(f"{out.name}_neg", out.shape, out.dtype))
     exp_id = frag.add_node(op=ElementwiseOp(op="exp"), inputs=[neg_id], output=Tensor(f"{out.name}_exp", out.shape, out.dtype))
     one_bc = const_bc(frag, name=f"{out.name}_one", value=1.0, target_shape=out.shape, dtype=out.dtype)
     add_id = frag.add_node(
@@ -30,7 +27,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     )
     mul_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
-        inputs=[x_id, recip_id],
+        inputs=[inp_x.id, recip_id],
         output=Tensor(out.name, out.shape, out.dtype),
     )
 

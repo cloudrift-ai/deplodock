@@ -131,16 +131,27 @@ class _Rule:
     """Loaded rule module — pattern + rewrite plus the rewrite's param list.
 
     ``param_names`` is captured at load time so the dispatcher can bind
-    pattern names to ``Node`` objects via signature inspection. Each
-    rewrite param name must be one of:
+    each rewrite param via signature inspection. The binding rules:
 
     - ``graph`` — the current ``Graph``
-    - ``match`` — the full ``Match`` object (escape hatch for advanced use)
-    - ``root`` — shortcut for ``graph.nodes[match.root_node_id]`` (Node)
-    - any ``Pattern.name`` declared in ``PATTERN`` — bound to that pattern
-      entry's matched ``Node``.
+    - ``match`` — the full ``Match`` (escape hatch for advanced rewrites)
+    - ``root`` — ``graph.nodes[match.root_node_id]`` (the matched ``Node``)
+    - ``out`` — ``root.output`` (the produced ``Tensor``)
+    - any ``Pattern.name`` declared in ``PATTERN`` — that pattern entry's
+      matched ``Node``
+    - anything else — bound positionally to the input ``Node`` at slot
+      ``i`` (i.e. ``graph.nodes[root.inputs[i]]``) where ``i`` is the
+      param's position among non-reserved / non-pattern params; ``None``
+      when ``i ≥ len(root.inputs)`` or the source node was deleted.
 
-    Unknown names raise at dispatch time so typos don't fail silently.
+    The "anything else" rule lets rewrites read input slots straight off
+    the signature::
+
+        def rewrite(graph, inp_x, inp_w, inp_b, out):
+            # inp_x = graph.nodes[root.inputs[0]]            (Node)
+            # inp_w = graph.nodes[root.inputs[1]]            (Node)
+            # inp_b = graph.nodes[root.inputs[2]] or None    (Node | None)
+            # out   = root.output                            (Tensor)
     """
 
     name: str
@@ -173,33 +184,43 @@ def _load_rule(path: Path) -> _Rule:
 def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match) -> dict | None:
     """Bind each ``rewrite`` param to its source.
 
+    Reserved-name params (``graph`` / ``match`` / ``root`` / ``out``) and
+    ``PATTERN``-name params bind by name; every remaining param binds
+    positionally to ``root.inputs[i]`` (in declaration order, ``None``
+    when the position exceeds the available inputs).
+
     Returns ``None`` when a pattern-name param's matched node has been
-    deleted from the graph between match enumeration and rewrite (the
-    dispatcher's outer ``match.consumed`` check covers most cases; this
-    is a safety net).
+    deleted from the graph between match enumeration and rewrite — a
+    safety net for the case the outer ``match.consumed`` check misses.
     """
     pattern_names = {p.name for p in rule.pattern}
+    nid = match.root_node_id
+    root_node = graph.nodes.get(nid)
+    if root_node is None:
+        return None
+
     kwargs: dict = {}
+    input_slot = 0
     for pname in rule.param_names:
         if pname == "graph":
             kwargs[pname] = graph
         elif pname == "match":
             kwargs[pname] = match
         elif pname == "root":
-            nid = match.root_node_id
-            if nid not in graph.nodes:
-                return None
-            kwargs[pname] = graph.nodes[nid]
+            kwargs[pname] = root_node
+        elif pname == "out":
+            kwargs[pname] = root_node.output
         elif pname in pattern_names:
-            nid = match.nodes.get(pname)
-            if nid is None or nid not in graph.nodes:
+            mid = match.nodes.get(pname)
+            if mid is None or mid not in graph.nodes:
                 return None
-            kwargs[pname] = graph.nodes[nid]
+            kwargs[pname] = graph.nodes[mid]
         else:
-            raise TypeError(
-                f"Rule {rule.name!r}: rewrite param {pname!r} is not 'graph', 'match', 'root', "
-                f"or a PATTERN name (have: {sorted(pattern_names)})"
-            )
+            if input_slot < len(root_node.inputs):
+                kwargs[pname] = graph.nodes.get(root_node.inputs[input_slot])
+            else:
+                kwargs[pname] = None
+            input_slot += 1
     return kwargs
 
 

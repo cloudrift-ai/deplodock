@@ -14,18 +14,16 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
 PATTERN = [Pattern("root", RmsNormOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    if len(root.inputs) < 2:
+def rewrite(graph: Graph, root: Node, inp_x: Node, inp_w: Node | None, out: Tensor) -> Graph | None:
+    if inp_w is None:
         return None
-    x_id, w_id = root.inputs[0], root.inputs[1]
-    out = root.output
     red_shape = reduction_shape(out.shape, -1) if out.shape else (1,)
 
-    frag = open_fragment(graph, [x_id, w_id])
+    frag = open_fragment(graph, [inp_x, inp_w])
 
     sq_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
-        inputs=[x_id, x_id],
+        inputs=[inp_x.id, inp_x.id],
         output=Tensor(f"{out.name}_sq", out.shape, out.dtype),
     )
     mean_id = frag.add_node(
@@ -47,10 +45,10 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     rsq_bc = broadcast_to(frag, rsq_id, out.shape)
     norm_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
-        inputs=[x_id, rsq_bc],
+        inputs=[inp_x.id, rsq_bc],
         output=Tensor(f"{out.name}_norm", out.shape, out.dtype),
     )
-    w_bc = broadcast_to(frag, w_id, out.shape)
+    w_bc = broadcast_to(frag, inp_w.id, out.shape)
     out_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
         inputs=[norm_id, w_bc],

@@ -4,7 +4,7 @@
 full permutation of length ``ndim`` (``aten.permute``).
 """
 
-from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.frontend.ir import TransposeOp
 from deplodock.compiler.pipeline.engine import Pattern
@@ -13,10 +13,9 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import o
 PATTERN = [Pattern("root", TransposeOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    x_id = root.inputs[0]
-    in_shape = tuple(graph.nodes[x_id].output.shape)
-    out_shape = tuple(root.output.shape)
+def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
+    in_shape = tuple(inp_x.output.shape)
+    out_shape = tuple(out.shape)
     ndim = len(in_shape)
     axes = root.op.axes
 
@@ -39,7 +38,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         inv[p] = i
     coord_map = tuple(placeholder(inv[j]) for j in range(ndim))
 
-    frag = open_fragment(graph, [x_id])
-    new_id = single_indexmap(frag, x_id, out_shape=out_shape, coord_map=coord_map, name=root.output.name, dtype=root.output.dtype)
+    frag = open_fragment(graph, [inp_x])
+    new_id = single_indexmap(frag, inp_x.id, out_shape=out_shape, coord_map=coord_map, name=out.name, dtype=out.dtype)
     frag.outputs = [new_id]
     return frag
