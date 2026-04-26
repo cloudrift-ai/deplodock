@@ -431,10 +431,11 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
             Assign("a", ElementwiseOp("exp"), args=("$0",)),
             Assign("b", ElementwiseOp("negative"), args=("$0",)),
             Assign("c", ElementwiseOp("add"), args=("a", "b")),
+            Write(output="out_0", index=(Var("a0"),), value="c"),
         ),
     )
-    # 1 synthesized Load + 3 Assigns.
-    assert sum(1 for s in k if not isinstance(s, Loop)) == 4
+    # 1 synthesized Load + 3 Assigns + 1 Write.
+    assert sum(1 for s in k if not isinstance(s, Loop)) == 5
 
 
 def test_update_op_conflict_rejected():

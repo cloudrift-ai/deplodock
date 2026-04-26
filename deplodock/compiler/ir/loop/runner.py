@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from deplodock.compiler.ir.stmt import RenderCtx, Write, render_body
+from deplodock.compiler.ir.stmt import RenderCtx, render_body
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.loop.ir import LoopOp
@@ -61,9 +61,9 @@ def render_loopop_cpp(loop: LoopOp, fn_name: str, input_shapes: dict[str, tuple[
     """Emit a complete ``extern "C" void <fn_name>(...)`` definition.
 
     Inputs become ``const float*`` params in ``loop.inputs`` order; the
-    sole output (``Write.output``) becomes a trailing ``float*`` param.
+    sole output (``loop.outputs[0]``) becomes a trailing ``float*`` param.
     """
-    output_name = _output_name(loop)
+    output_name = loop.outputs[0]
     shapes: dict[str, tuple[int, ...]] = {**input_shapes, output_name: output_shape}
     ctx = RenderCtx(shapes=shapes, indent=1, intrinsics=_INTRINSICS_CPP)
 
@@ -73,14 +73,6 @@ def render_loopop_cpp(loop: LoopOp, fn_name: str, input_shapes: dict[str, tuple[
 
     body_text = "\n".join(render_body(loop.body, ctx))
     return f'extern "C" void {fn_name}({params_text}) {{\n{body_text}\n}}\n'
-
-
-def _output_name(loop: LoopOp) -> str:
-    """Pull the single ``Write.output`` name from the body."""
-    for s in loop:
-        if isinstance(s, Write):
-            return s.output
-    raise ValueError("render_loopop_cpp: LoopOp has no Write")
 
 
 # ---------------------------------------------------------------------------

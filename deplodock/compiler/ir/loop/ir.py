@@ -168,6 +168,21 @@ class LoopOp(Op):
         return tuple(dict.fromkeys(s.input for s in self.loads))
 
     @property
+    def writes(self) -> tuple[Write, ...]:
+        """All ``Write`` statements in the body, pre-order."""
+        return tuple(s for s in self if isinstance(s, Write))
+
+    @property
+    def outputs(self) -> tuple[str, ...]:
+        """Distinct buffer names targeted by body Writes, in first-use order.
+
+        Mirrors ``KernelOp.outputs``: a LoopOp's outputs are the names of the
+        graph-level buffers it Writes to. Single-output kernels (today's
+        contract — see ``_infer_write_shape``) report exactly one entry.
+        """
+        return tuple(dict.fromkeys(s.output for s in self.writes))
+
+    @property
     def accums(self) -> tuple[Accum, ...]:
         """Unique reduce accumulators in the body, pre-order by first use.
 
@@ -466,6 +481,14 @@ def _validate(loop: LoopOp) -> None:
         return exported_accs
 
     _walk(loop.body, set())
+
+    # Every LoopOp must Write at least one output buffer — that's its
+    # observable result. Renderers, ``forward``, and ``_infer_write_shape``
+    # all assume this; check at construction so callers fail loudly.
+    # Runs after SSA / Accum validation so malformed-body tests get the
+    # specific error the body actually has, not a no-Write surface error.
+    if not loop.outputs:
+        raise ValueError("LoopOp body has no Write")
 
 
 # Tree walk helpers (iter_body, map_body) live in ``ir/stmt.py`` — they
