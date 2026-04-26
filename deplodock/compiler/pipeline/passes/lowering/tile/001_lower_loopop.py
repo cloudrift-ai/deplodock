@@ -82,7 +82,7 @@ def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ..
     reduce Loop — stripping it would lose the accumulator)."""
     axes: list[Axis] = []
     cur = stmts
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not any(isinstance(s, Accum) for s in cur[0].body):
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
         axes.append(cur[0].axis)
         cur = cur[0].body
     return tuple(axes), cur

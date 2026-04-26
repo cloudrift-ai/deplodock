@@ -129,8 +129,7 @@ class LoopOp(Op):
                         lines.append(f"{ind}{prefix} {br.value} when ({render_expr(br.select)})")
                 elif isinstance(stmt, Loop):
                     a = stmt.axis
-                    # Kind is structural: a Loop whose immediate body contains an Accum is a reduce Loop.
-                    kind = "reduce" if any(isinstance(s, Accum) for s in stmt.body) else "free"
+                    kind = "reduce" if stmt.is_reduce else "free"
                     lines.append(f"{ind}for {a.name} in 0..{a.extent}:  # {kind}")
                     render(stmt.body, ind + "    ")
                 elif isinstance(stmt, Cond):
