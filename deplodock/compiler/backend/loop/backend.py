@@ -3,8 +3,9 @@
 Equivalent to ``NumpyBackend`` except that ``compile`` first runs
 decomposition → optimization → fusion so the executed graph contains
 ``LoopOp`` nodes. Execution goes through the default ``Backend.run``
-topo-walk interpreter — ``LoopOp.forward`` (defined in
-:mod:`deplodock.compiler.ir.loop.interpret`) handles the body walk.
+topo-walk: ``LoopOp.forward`` (defined in
+:mod:`deplodock.compiler.ir.loop.ir`) JIT-compiles each kernel to C++
+via cppyy / Cling and runs it on numpy buffers.
 
 Used as a correctness-triangulation reference: CUDA vs. loop
 disagreement implicates codegen; loop vs. numpy disagreement implicates
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 
 
 class LoopBackend(Backend):
-    """Execute a fused ``Graph[LoopOp]`` via numpy whole-tensor operations."""
+    """Execute a fused ``Graph[LoopOp]`` via the default topo-walk; LoopOps are JIT'd by ``LoopOp.forward``."""
 
     def compile(self, graph: Graph) -> Graph:
         return run_pipeline(graph, LOOP_PASSES)

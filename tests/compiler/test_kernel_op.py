@@ -560,19 +560,14 @@ def _nested_reduce_kernel() -> LoopOp:
 
 
 def test_execute_loop_op_handles_nested_body():
-    """Numpy interpreter should produce the same output for flat and nested forms."""
+    """LoopOp.forward should produce the same output for flat and nested forms."""
     import numpy as np
-
-    from deplodock.compiler.ir.loop.interpret import execute_loop_op
 
     rng = np.random.default_rng(0)
     x = rng.standard_normal((4, 8)).astype(np.float32)
 
     flat = _flat_reduce_kernel()
     nested = _nested_reduce_kernel()
-    # interpreter takes a buf-name → array dict (post Load.source: int → str refactor).
-    inputs = {flat.inputs[0]: x}
-    out_flat = execute_loop_op(flat, inputs, (4,))
-    inputs_nested = {nested.inputs[0]: x}
-    out_nested = execute_loop_op(nested, inputs_nested, (4,))
+    out_flat = flat.forward(x)
+    out_nested = nested.forward(x)
     np.testing.assert_allclose(out_flat, out_nested, rtol=1e-5)

@@ -36,10 +36,129 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Expr, Literal
+from deplodock.compiler.ir.expr import (
+    BinaryExpr,
+    Expr,
+    FuncCallExpr,
+    Literal,
+    TernaryExpr,
+    Var,
+    _float_lit,
+    _PRECEDENCE,
+)
 from deplodock.compiler.ir.sigma import Sigma
 
 INDENT = "    "
+
+
+# ---------------------------------------------------------------------------
+# RenderCtx — target-tuned tables + walk state for ``Stmt.render`` / ``Expr.render``
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RenderCtx:
+    """Per-render state. Targets pre-fill ``intrinsics`` / ``builtins`` with
+    target-specific spellings (``"exp" → "expf"``, ``"thread_idx.x" →
+    "threadIdx.x"``, ...). ``shapes`` maps every buffer to its declared
+    shape so multi-dim ``Load`` / ``Write`` indices can be flattened
+    row-major. ``explicit_inits`` carries the set of accumulator names
+    whose init has been emitted by an enclosing ``Init`` Stmt — Loop's
+    default per-Loop init is suppressed for those names.
+    """
+
+    shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    indent: int = 1
+    intrinsics: dict[str, str] = field(default_factory=dict)
+    builtins: dict[str, str] = field(default_factory=dict)
+    explicit_inits: set[str] = field(default_factory=set)
+
+    def child(self) -> RenderCtx:
+        """Return a new ctx one indent level deeper, sharing all tables."""
+        return RenderCtx(
+            shapes=self.shapes,
+            indent=self.indent + 1,
+            intrinsics=self.intrinsics,
+            builtins=self.builtins,
+            explicit_inits=self.explicit_inits,
+        )
+
+
+def _pad(n: int) -> str:
+    return "    " * n
+
+
+# ---------------------------------------------------------------------------
+# Render helpers — translate elementwise op names to Expr trees, and flatten
+# multi-dim coord tuples into row-major flat-index strings.
+# ---------------------------------------------------------------------------
+
+
+_BINARY_OP: dict[str, str] = {
+    "add": "+", "subtract": "-", "multiply": "*", "divide": "/", "mod": "%",
+}
+
+
+def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
+    """Translate an elementwise op name to an ``Expr`` tree.
+
+    Emits abstract intrinsic names (``"exp"``, ``"fmax"``, ``"fabs"``, ...)
+    that targets translate to libm / CUDA spellings via
+    ``RenderCtx.intrinsics`` at ``FuncCallExpr.render`` time.
+    """
+    if fn in _BINARY_OP:
+        return BinaryExpr(_BINARY_OP[fn], inputs[0], inputs[1])
+    if fn == "maximum":
+        return FuncCallExpr("fmax", list(inputs))
+    if fn == "minimum":
+        return FuncCallExpr("fmin", list(inputs))
+    if fn == "pow":
+        return FuncCallExpr("pow", list(inputs))
+    if fn == "negative":
+        return BinaryExpr("-", Literal(0.0, "float"), inputs[0])
+    if fn == "copy":
+        return inputs[0]
+    if fn == "reciprocal":
+        return BinaryExpr("/", Literal(1.0, "float"), inputs[0])
+    if fn == "relu":
+        return FuncCallExpr("fmax", [Literal(0.0, "float"), inputs[0]])
+    if fn == "sigmoid":
+        neg_x = BinaryExpr("-", Literal(0.0, "float"), inputs[0])
+        exp_neg = FuncCallExpr("exp", [neg_x])
+        return BinaryExpr("/", Literal(1.0, "float"), BinaryExpr("+", Literal(1.0, "float"), exp_neg))
+    if fn in ("exp", "rsqrt", "tanh", "sqrt"):
+        return FuncCallExpr(fn, list(inputs))
+    if fn == "abs":
+        return FuncCallExpr("fabs", list(inputs))
+    raise NotImplementedError(f"render: elementwise fn={fn!r} not supported")
+
+
+def select_to_ternary(s: Select) -> Expr:
+    """Build a chained ternary from a ``Select``'s branch list."""
+    branches = list(s.branches)
+    result: Expr = Var(branches[-1].value)
+    for b in reversed(branches[:-1]):
+        result = TernaryExpr(cond=b.select, if_true=Var(b.value), if_false=result)
+    return result
+
+
+def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
+    """Row-major flatten ``buf[i0][i1]...`` to a single C/CUDA expression."""
+    if len(indices) == 0:
+        return "0"
+    if len(indices) == 1:
+        return indices[0].render(ctx)
+    shape = ctx.shapes.get(buf)
+    if shape is None or len(shape) != len(indices):
+        return " + ".join(i.render(ctx) for i in indices)
+    parts: list[str] = []
+    for d, idx in enumerate(indices):
+        stride = 1
+        for k in range(d + 1, len(shape)):
+            stride *= int(shape[k])
+        idx_str = idx.render(ctx, _PRECEDENCE["*"])
+        parts.append(idx_str if stride == 1 else f"{idx_str} * {stride}")
+    return " + ".join(parts)
 
 # ---------------------------------------------------------------------------
 # Stmt — abstract base
@@ -97,12 +216,30 @@ class Stmt:
         """
         return [f"{indent}<unrecognized {type(self).__name__}>"]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Emit indented C / CUDA source lines for this stmt.
+
+        Block-structured stmts recurse via ``child.render(ctx.child())``;
+        leaves return a single line. The ``ctx`` carries target-specific
+        intrinsic / builtin tables, current indent, and per-buf shapes
+        for index flattening. Subclasses override.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.render not implemented")
+
 
 def pretty_body(body: tuple[Stmt, ...], indent: str = "") -> list[str]:
     """Flatten ``stmt.pretty(indent)`` over a body sequence."""
     out: list[str] = []
     for s in body:
         out.extend(s.pretty(indent))
+    return out
+
+
+def render_body(body: tuple[Stmt, ...], ctx: RenderCtx) -> list[str]:
+    """Flatten ``stmt.render(ctx)`` over a body sequence."""
+    out: list[str] = []
+    for s in body:
+        out.extend(s.render(ctx))
     return out
 
 
@@ -136,6 +273,10 @@ class Load(Stmt):
         idx = ", ".join(e.pretty() for e in self.index)
         return [f"{indent}{self.name} = load {self.input}[{idx}]"]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        flat = render_index(self.input, self.index, ctx)
+        return [f"{_pad(ctx.indent)}float {self.name} = {self.input}[{flat}];"]
+
 
 @dataclass(frozen=True)
 class Assign(Stmt):
@@ -163,6 +304,11 @@ class Assign(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}{self.name} = {self.op.name}({', '.join(self.args)})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        args: list[Expr] = [Var(a) for a in self.args]
+        expr = op_to_expr(self.op.name, args)
+        return [f"{_pad(ctx.indent)}float {self.name} = {expr.render(ctx)};"]
 
 
 @dataclass(frozen=True)
@@ -207,6 +353,18 @@ class Accum(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}{self.name} <- {self.op.name}({self.name}, {self.value})"]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        op_name = self.op.name
+        if op_name in ("maximum", "amax"):
+            spelling = ctx.intrinsics.get("fmax", "fmax")
+            return [f"{pad}{self.name} = {spelling}({self.name}, {self.value});"]
+        if op_name == "minimum":
+            spelling = ctx.intrinsics.get("fmin", "fmin")
+            return [f"{pad}{self.name} = {spelling}({self.name}, {self.value});"]
+        op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
+        return [f"{pad}{self.name} {op} {self.value};"]
+
 
 @dataclass(frozen=True)
 class Init(Stmt):
@@ -244,6 +402,13 @@ class Init(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}Init({self.name}, op={self.op.name})"]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        identity = self.op.identity
+        if identity is None:
+            raise ValueError(f"Init {self.name!r} op {self.op.name!r} has no identity")
+        ctx.explicit_inits.add(self.name)
+        return [f"{_pad(ctx.indent)}float {self.name} = {_float_lit(float(identity))};"]
+
 
 @dataclass(frozen=True)
 class Write(Stmt):
@@ -269,6 +434,10 @@ class Write(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
         return [f"{indent}{self.output}[{idx}] = {self.value}"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        flat = render_index(self.output, self.index, ctx)
+        return [f"{_pad(ctx.indent)}{self.output}[{flat}] = {self.value};"]
 
 
 @dataclass(frozen=True)
@@ -311,6 +480,10 @@ class Select(Stmt):
             prefix = f"{self.name} =" if bi == 0 else f"{' ' * len(self.name)}  "
             lines.append(f"{indent}{prefix} {br.value} when ({br.select.pretty()})")
         return lines
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        expr = select_to_ternary(self)
+        return [f"{_pad(ctx.indent)}float {self.name} = {expr.render(ctx)};"]
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +536,30 @@ class Loop(Stmt):
         head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}:  # {kind}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        out: list[str] = []
+        # Per-Loop ``float <acc> = identity;`` for each distinct Accum in the
+        # immediate body — suppressed when an enclosing Init already declared it.
+        seen: set[str] = set()
+        for s in self.body:
+            if isinstance(s, Accum) and s.name not in seen:
+                seen.add(s.name)
+                if s.name in ctx.explicit_inits:
+                    continue
+                identity = s.op.identity
+                if identity is None:
+                    raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
+                out.append(f"{pad}float {s.name} = {_float_lit(float(identity))};")
+        var = self.axis.name
+        extent = int(self.axis.extent)
+        out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
+        inner = ctx.child()
+        for s in self.body:
+            out.extend(s.render(inner))
+        out.append(f"{pad}}}")
+        return out
+
 
 @dataclass
 class Tile(Stmt):
@@ -399,6 +596,89 @@ class Tile(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in self.axes) or "-"
         return [f"{indent}Tile(axes=({axes})):", *pretty_body(self.body, indent + INDENT)]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """CUDA block / thread axis decode + body emission.
+
+        Two forms:
+
+        - **Cooperative (``block_axes`` populated):** one CUDA block per
+          ``block_axes`` slot, ``thread_axes`` index threads inside the
+          block. Decodes ``blockIdx.x`` and ``threadIdx.x`` directly.
+        - **Linear (``block_axes`` empty):** flatten all ``thread_axes``
+          into one linear ``tid``; bounds-guard against the product of
+          extents.
+        """
+        pad = _pad(ctx.indent)
+        inner = ctx.child()
+        if self.block_axes:
+            out = [f"{pad}{{"]
+            out.extend(_render_grid_axis_decode(self.block_axes, "blockIdx.x", inner))
+            out.extend(_render_grid_axis_decode(self.thread_axes, "threadIdx.x", inner))
+            for s in self.body:
+                out.extend(s.render(inner))
+            out.append(f"{pad}}}")
+            return out
+
+        n_threads = 1
+        for ax in self.thread_axes:
+            n_threads *= int(ax.extent)
+        out = [
+            f"{pad}long long tid = blockIdx.x * blockDim.x + threadIdx.x;",
+            f"{pad}if (tid < {n_threads}) {{",
+        ]
+        out.extend(_render_thread_axis_decode(self.thread_axes, inner))
+        for s in self.body:
+            out.extend(s.render(inner))
+        out.append(f"{pad}}}")
+        return out
+
+
+def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderCtx) -> list[str]:
+    """Decode ``idx_expr`` (``blockIdx.x`` or ``threadIdx.x``) into per-axis ints."""
+    pad = _pad(ctx.indent)
+    if not axes:
+        return []
+    if len(axes) == 1:
+        return [f"{pad}int {axes[0].name} = {idx_expr};"]
+    decoded: list[str] = []
+    stride = 1
+    for ax in reversed(axes):
+        extent = int(ax.extent)
+        if stride == 1:
+            decoded.append(f"int {ax.name} = {idx_expr} % {extent};")
+        else:
+            decoded.append(f"int {ax.name} = ({idx_expr} / {stride}) % {extent};")
+        stride *= extent
+    outer = axes[0]
+    outer_stride = 1
+    for ax in axes[1:]:
+        outer_stride *= int(ax.extent)
+    decoded[-1] = f"int {outer.name} = {idx_expr} / {outer_stride};"
+    return [pad + line for line in reversed(decoded)]
+
+
+def _render_thread_axis_decode(axes: tuple[Axis, ...], ctx: RenderCtx) -> list[str]:
+    """Emit ``int <axis> = (tid / stride) % extent;`` per axis."""
+    pad = _pad(ctx.indent)
+    decoded: list[str] = []
+    stride = 1
+    for ax in reversed(axes):
+        extent = int(ax.extent)
+        if stride == 1:
+            decoded.append(f"int {ax.name} = tid % {extent};")
+        else:
+            decoded.append(f"int {ax.name} = (tid / {stride}) % {extent};")
+        stride *= extent
+    if len(axes) == 1:
+        decoded = [f"int {axes[0].name} = tid;"]
+    else:
+        outer = axes[0]
+        outer_stride = 1
+        for ax in axes[1:]:
+            outer_stride *= int(ax.extent)
+        decoded[-1] = f"int {outer.name} = tid / {outer_stride};"
+    return [pad + line for line in reversed(decoded)]
 
 
 @dataclass(frozen=True)
@@ -445,6 +725,31 @@ class StridedLoop(Stmt):
         head = f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {kind}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """``for (int axis = start; axis < extent; axis += step)`` with the
+        same per-Loop accumulator-init prelude as ``Loop.render``."""
+        pad = _pad(ctx.indent)
+        out: list[str] = []
+        seen: set[str] = set()
+        for s in self.body:
+            if isinstance(s, Accum) and s.name not in seen:
+                seen.add(s.name)
+                if s.name in ctx.explicit_inits:
+                    continue
+                identity = s.op.identity
+                if identity is None:
+                    raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
+                out.append(f"{pad}float {s.name} = {_float_lit(float(identity))};")
+        var = self.axis.name
+        start_str = self.start.render(ctx)
+        step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {int(self.axis.extent)}; {var} += {step_str}) {{")
+        inner = ctx.child()
+        for s in self.body:
+            out.extend(s.render(inner))
+        out.append(f"{pad}}}")
+        return out
+
 
 @dataclass(frozen=True)
 class Cond(Stmt):
@@ -488,6 +793,21 @@ class Cond(Stmt):
             lines.append(f"{indent}else:")
             lines.extend(pretty_body(self.else_body, indent + INDENT))
         return lines
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        cond = self.cond.render(ctx)
+        inner = ctx.child()
+        body: list[str] = []
+        for s in self.body:
+            body.extend(s.render(inner))
+        out = [f"{pad}if ({cond}) {{", *body, f"{pad}}}"]
+        if self.else_body:
+            out[-1] = f"{pad}}} else {{"
+            for s in self.else_body:
+                out.extend(s.render(inner))
+            out.append(f"{pad}}}")
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +874,12 @@ __all__ = [
     "SelectBranch",
     "Loop",
     "Cond",
+    "RenderCtx",
     "iter_body",
     "map_body",
     "pretty_body",
+    "render_body",
+    "render_index",
+    "op_to_expr",
+    "select_to_ternary",
 ]

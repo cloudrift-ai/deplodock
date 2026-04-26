@@ -232,25 +232,25 @@ class LoopOp(Op):
         return iter_body(self.body)
 
     def forward(self, *inputs):
-        """Evaluate the kernel body on numpy arrays — mirrors the other ``Op.forward`` methods.
+        """Evaluate the kernel body via cppyy-JIT'd C++ — mirrors the other ``Op.forward`` methods.
 
-        Enables graph-level execution via ``NumpyBackend`` after fusion has
-        replaced tensor-IR ops with ``LoopOp`` nodes. Output shape is inferred
-        from the kernel's sole ``Write`` statement; callers (``NumpyBackend``)
-        reshape the result to the node's declared output shape, so keep-dim
-        reductions and similar element-count-preserving variations work
-        transparently.
+        Each ``LoopOp`` body is rendered to plain C++ by the loop
+        ``runner`` module, compiled in-process via Cling (cached by op
+        identity + input shapes), and called against numpy buffers. Used
+        by every backend whose graph contains ``LoopOp`` nodes (today:
+        ``LoopBackend``) through the default ``Backend.run`` topo-walk
+        dispatch.
         """
         import numpy as np
 
-        from deplodock.compiler.ir.loop.interpret import execute_loop_op
+        from deplodock.compiler.ir.loop.runner import execute_loop_op_cpp
 
         out_shape = self._infer_write_shape()
         bufs = self.inputs
         if len(inputs) != len(bufs):
             raise ValueError(f"LoopOp.forward: expected {len(bufs)} inputs (matching input_bufs={list(bufs)}), got {len(inputs)}")
         input_arrays = {name: np.asarray(x, dtype=np.float32) for name, x in zip(bufs, inputs, strict=True)}
-        return execute_loop_op(self, input_arrays, out_shape)
+        return execute_loop_op_cpp(self, input_arrays, out_shape)
 
     def _infer_write_shape(self) -> tuple[int, ...]:
         """Derive the output buffer shape from the kernel's ``Write`` index.

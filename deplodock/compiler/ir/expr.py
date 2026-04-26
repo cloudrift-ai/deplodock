@@ -91,6 +91,16 @@ class _ExprOps:
         """Return the set of ``Var.name`` strings appearing anywhere in this Expr."""
         raise NotImplementedError(f"{type(self).__name__}.free_vars not implemented")
 
+    def render(self, ctx, parent_prec: int = 0) -> str:  # type: ignore[override]
+        """Emit a target-language (C / CUDA) expression string.
+
+        Concrete subclasses override. The ``ctx`` is duck-typed against
+        :class:`deplodock.compiler.ir.stmt.RenderCtx` (intrinsic /
+        builtin spelling tables, optional shape map). ``parent_prec``
+        drives parenthesization in nested ``BinaryExpr`` chains.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.render not implemented")
+
 
 def _coerce(v: Expr | int | float) -> Expr:
     """Coerce Python int/float to Literal for operator overloading."""
@@ -124,6 +134,9 @@ class Var(_ExprOps):
     def free_vars(self) -> frozenset[str]:
         return frozenset({self.name})
 
+    def render(self, ctx, parent_prec: int = 0) -> str:
+        return self.name
+
 
 @dataclass
 class Literal(_ExprOps):
@@ -143,6 +156,12 @@ class Literal(_ExprOps):
 
     def free_vars(self) -> frozenset[str]:
         return frozenset()
+
+    def render(self, ctx, parent_prec: int = 0) -> str:
+        if isinstance(self.value, float) or self.dtype == "float":
+            return _float_lit(float(self.value))
+        v = int(self.value)
+        return f"{v}LL" if abs(v) > 32768 else str(v)
 
 
 @dataclass
@@ -211,6 +230,13 @@ class BinaryExpr(_ExprOps):
     def free_vars(self) -> frozenset[str]:
         return self.left.free_vars() | self.right.free_vars()
 
+    def render(self, ctx, parent_prec: int = 0) -> str:
+        prec = _PRECEDENCE.get(self.op, 10)
+        left = self.left.render(ctx, prec)
+        right = self.right.render(ctx, prec + 1)
+        result = f"{left} {self.op} {right}"
+        return f"({result})" if prec < parent_prec else result
+
 
 @dataclass
 class Builtin(_ExprOps):
@@ -233,6 +259,12 @@ class Builtin(_ExprOps):
 
     def free_vars(self) -> frozenset[str]:
         return frozenset()
+
+    def render(self, ctx, parent_prec: int = 0) -> str:
+        spelling = ctx.builtins.get(self.name) if ctx is not None else None
+        if spelling is None:
+            raise ValueError(f"render: Builtin {self.name!r} has no target spelling in ctx.builtins")
+        return spelling
 
 
 @dataclass
@@ -270,6 +302,11 @@ class FuncCallExpr(_ExprOps):
             out |= a.free_vars()
         return out
 
+    def render(self, ctx, parent_prec: int = 0) -> str:
+        spelling = ctx.intrinsics.get(self.name, self.name) if ctx is not None else self.name
+        args = ", ".join(a.render(ctx) for a in self.args)
+        return f"{spelling}({args})"
+
 
 @dataclass
 class TernaryExpr(_ExprOps):
@@ -296,6 +333,12 @@ class TernaryExpr(_ExprOps):
     def free_vars(self) -> frozenset[str]:
         return self.cond.free_vars() | self.if_true.free_vars() | self.if_false.free_vars()
 
+    def render(self, ctx, parent_prec: int = 0) -> str:
+        c = self.cond.render(ctx)
+        t = self.if_true.render(ctx)
+        f = self.if_false.render(ctx)
+        return f"(({c}) ? ({t}) : ({f}))"
+
 
 @dataclass
 class CastExpr(_ExprOps):
@@ -319,8 +362,33 @@ class CastExpr(_ExprOps):
     def free_vars(self) -> frozenset[str]:
         return self.expr.free_vars()
 
+    def render(self, ctx, parent_prec: int = 0) -> str:
+        return f"(({self.dtype})({self.expr.render(ctx)}))"
+
 
 Expr = Var | Literal | BinaryExpr | Builtin | FuncCallExpr | TernaryExpr | CastExpr
+
+
+# ---------------------------------------------------------------------------
+# Render helpers — shared C / CUDA literal formatting + operator precedence
+# ---------------------------------------------------------------------------
+
+
+_PRECEDENCE: dict[str, int] = {
+    "||": 1, "&&": 2, "==": 3, "!=": 3,
+    "<": 4, ">": 4, "<=": 4, ">=": 4,
+    "+": 5, "-": 5, "*": 6, "/": 6, "%": 6,
+}
+
+
+def _float_lit(v: float) -> str:
+    """C / CUDA float literal — always carries a decimal so ``0.0`` renders
+    as ``0.0f`` not the invalid ``0f``, and large/scientific values keep
+    their exponent."""
+    s = repr(float(v))
+    if "." not in s and "e" not in s and "E" not in s and "inf" not in s and "nan" not in s:
+        s += ".0"
+    return f"{s}f"
 
 
 # ---------------------------------------------------------------------------
