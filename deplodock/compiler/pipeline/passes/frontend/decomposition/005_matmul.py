@@ -1,19 +1,14 @@
-"""Decompose MatmulOp into unsqueeze(A) * unsqueeze(B) → reduce_sum [→ add(bias)].
-
-Inputs are unsqueezed so the mul is a standard NumPy broadcast:
-  A(..., M, K) → A(..., M, K, 1)   via IndexMapOp
-  B(..., K, N) → B(..., 1, K, N)   via IndexMapOp
-  mul → (..., M, K, N)             broadcast-compatible
-  reduce_sum(axis=-2) → (..., M, N)
-"""
+"""Decompose MatmulOp into unsqueeze(A) * unsqueeze(B) → reduce_sum [→ add(bias)]."""
 
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to, squeeze_axis
-from deplodock.compiler.pipeline.passes.frontend.decomposition._matmul_helpers import matmul_unsqueeze
+from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
+    broadcast_to,
+    matmul_decompose,
+    open_fragment,
+)
 
 PATTERN = [Pattern("root", MatmulOp)]
 
@@ -27,50 +22,17 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     dtype = root.output.dtype
     name = root.output.name
 
-    frag = Graph()
+    ext_ids = {a_id, b_id} | ({bias_id} if bias_id else set())
+    frag = open_fragment(graph, ext_ids)
 
-    # InputOp sentinels for all external references.
-    ext_ids = {a_id, b_id}
-    if bias_id:
-        ext_ids.add(bias_id)
-    for eid in sorted(ext_ids):
-        frag.add_node(
-            op=InputOp(),
-            inputs=[],
-            output=Tensor(graph.nodes[eid].output.name, graph.nodes[eid].output.shape, graph.nodes[eid].output.dtype),
-            node_id=eid,
-        )
-
-    a_shape = tuple(graph.nodes[a_id].output.shape)
-    b_shape = tuple(graph.nodes[b_id].output.shape)
-    a_unsq, b_unsq, mul_shape, k_axis = matmul_unsqueeze(a_shape, b_shape)
-
-    a_unsq_id = frag.add_node(op=a_unsq, inputs=[a_id], output=Tensor(f"{name}_a_unsq", a_unsq.out_shape, dtype))
-    b_unsq_id = frag.add_node(op=b_unsq, inputs=[b_id], output=Tensor(f"{name}_b_unsq", b_unsq.out_shape, dtype))
-    a_bc = broadcast_to(frag, a_unsq_id, mul_shape)
-    b_bc = broadcast_to(frag, b_unsq_id, mul_shape)
-    ew_id = frag.add_node(
-        op=ElementwiseOp(op="multiply"),
-        inputs=[a_bc, b_bc],
-        output=Tensor(f"{name}_ew", mul_shape, dtype),
-    )
-    # ReduceOp is keepdim: output has the reduced dim at size 1 (same rank as
-    # mul_shape). Squeeze that dim back out for downstream consumers that
-    # expect the matmul's declared shape.
-    reduce_shape = tuple(mul_shape[:k_axis]) + (1,) + tuple(mul_shape[k_axis + 1 :])
-    red_id = frag.add_node(
-        op=ReduceOp(op="sum", axis=k_axis),
-        inputs=[ew_id],
-        output=Tensor(f"{name}_reduce", reduce_shape, dtype),
-    )
+    matmul_name = f"{name}_mm" if bias_id else name
+    mm_id = matmul_decompose(frag, a_id, b_id, name=matmul_name, dtype=dtype)
 
     if bias_id:
-        sq_id = squeeze_axis(frag, red_id, k_axis)
         bias_bc = broadcast_to(frag, bias_id, shape)
-        add_id = frag.add_node(op=ElementwiseOp(op="add"), inputs=[sq_id, bias_bc], output=Tensor(name, shape, dtype))
+        add_id = frag.add_node(op=ElementwiseOp(op="add"), inputs=[mm_id, bias_bc], output=Tensor(name, shape, dtype))
         frag.outputs = [add_id]
     else:
-        sq_id = squeeze_axis(frag, red_id, k_axis, out_name=name)
-        frag.outputs = [sq_id]
+        frag.outputs = [mm_id]
 
     return frag

@@ -7,12 +7,11 @@ delinearizes into the input coordinate space using input strides.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import ReshapeOp
-from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", ReshapeOp)]
 
@@ -63,26 +62,8 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     out_shape = root.op.infer_output_shape([in_shape])
 
     coord_map = _reshape_coord_map(in_shape, out_shape)
-    indexmap = IndexMapOp(
-        out_shape=out_shape,
-        sources=(IndexSource(input_idx=0, coord_map=coord_map),),
-    )
 
-    frag = Graph()
-
-    # InputOp sentinel for x.
-    frag.add_node(
-        op=InputOp(),
-        inputs=[],
-        output=Tensor(graph.nodes[x_id].output.name, graph.nodes[x_id].output.shape, graph.nodes[x_id].output.dtype),
-        node_id=x_id,
-    )
-
-    new_id = frag.add_node(
-        op=indexmap,
-        inputs=[x_id],
-        output=Tensor(root.output.name, out_shape, root.output.dtype),
-    )
-
+    frag = open_fragment(graph, [x_id])
+    new_id = single_indexmap(frag, x_id, out_shape=out_shape, coord_map=coord_map, name=root.output.name, dtype=root.output.dtype)
     frag.outputs = [new_id]
     return frag

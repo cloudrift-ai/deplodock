@@ -1,16 +1,14 @@
 """Lower TransposeOp(x, axes) → IndexMapOp.
 
-``TransposeOp.axes`` is either a length-2 swap (matching
-``aten.transpose(dim0, dim1)``) or a full permutation of length ``ndim``
-(matching ``aten.permute``).
+``axes`` is either a length-2 swap (``aten.transpose(dim0, dim1)``) or a
+full permutation of length ``ndim`` (``aten.permute``).
 """
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.frontend.ir import TransposeOp
-from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", TransposeOp)]
 
@@ -37,28 +35,12 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     else:
         return None
 
-    # ``perm[i]`` is the input dim that becomes output dim i. Invert so we can
-    # express each input dim as a function of output-coordinate placeholders.
     inv = [0] * ndim
     for i, p in enumerate(perm):
         inv[p] = i
     coord_map = tuple(placeholder(inv[j]) for j in range(ndim))
 
-    frag = Graph()
-
-    # InputOp sentinel for x.
-    frag.add_node(
-        op=InputOp(),
-        inputs=[],
-        output=Tensor(graph.nodes[x_id].output.name, graph.nodes[x_id].output.shape, graph.nodes[x_id].output.dtype),
-        node_id=x_id,
-    )
-
-    new_id = frag.add_node(
-        op=IndexMapOp(out_shape=out_shape, sources=(IndexSource(input_idx=0, coord_map=coord_map),)),
-        inputs=[x_id],
-        output=Tensor(root.output.name, out_shape, root.output.dtype),
-    )
-
+    frag = open_fragment(graph, [x_id])
+    new_id = single_indexmap(frag, x_id, out_shape=out_shape, coord_map=coord_map, name=root.output.name, dtype=root.output.dtype)
     frag.outputs = [new_id]
     return frag

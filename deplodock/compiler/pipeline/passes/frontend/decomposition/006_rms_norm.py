@@ -1,16 +1,15 @@
-"""Decompose rms_norm(x, weight [, eps]) into primitives.
-
-    out = x * rsqrt(mean(x * x, dim=-1, keepdim=True) + eps) * weight
-
-The resulting MeanOp is further lowered to sum + div by 007_mean.
-"""
+"""Decompose rms_norm(x, weight [, eps]) into x * rsqrt(mean(x*x, -1, keepdim) + eps) * weight."""
 
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.frontend.ir import MeanOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline.engine import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
+    broadcast_to,
+    const_bc,
+    open_fragment,
+    reduction_shape,
+)
 
 PATTERN = [Pattern("root", RmsNormOp)]
 
@@ -22,18 +21,13 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
     x_id, w_id = root.inputs[0], root.inputs[1]
     eps_value = root.op.eps
 
-    x_t = graph.nodes[x_id].output
-    w_t = graph.nodes[w_id].output
     out_shape = root.output.shape
     dtype = root.output.dtype
     name = root.output.name
 
-    # Reduction output shape keeps the last dim at 1 (keepdim=True).
-    red_shape = tuple(out_shape[:-1]) + (1,) if out_shape else (1,)
+    red_shape = reduction_shape(out_shape, -1) if out_shape else (1,)
 
-    frag = Graph()
-    frag.add_node(op=InputOp(), inputs=[], output=Tensor(x_t.name, x_t.shape, x_t.dtype), node_id=x_id)
-    frag.add_node(op=InputOp(), inputs=[], output=Tensor(w_t.name, w_t.shape, w_t.dtype), node_id=w_id)
+    frag = open_fragment(graph, [x_id, w_id])
 
     sq_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),
@@ -45,12 +39,7 @@ def rewrite(graph: Graph, match: Match) -> Graph | None:
         inputs=[sq_id],
         output=Tensor(f"{name}_mean", red_shape, dtype),
     )
-    eps_id = frag.add_node(
-        op=ConstantOp(name=f"{name}_eps", value=eps_value),
-        inputs=[],
-        output=Tensor(f"{name}_eps", (1,), dtype),
-    )
-    eps_bc = broadcast_to(frag, eps_id, red_shape)
+    eps_bc = const_bc(frag, name=f"{name}_eps", value=eps_value, target_shape=red_shape, dtype=dtype)
     add_id = frag.add_node(
         op=ElementwiseOp(op="add"),
         inputs=[mean_id, eps_bc],
