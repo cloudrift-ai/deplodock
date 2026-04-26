@@ -37,7 +37,6 @@ from dataclasses import dataclass, field
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, free_vars
-from deplodock.compiler.ir.expr import render as render_expr
 from deplodock.compiler.ir.sigma import Sigma
 
 INDENT = "    "
@@ -134,7 +133,7 @@ class Load(Stmt):
         return Load(name=rename_ssa(self.name), input=self.input, index=tuple(sigma.apply(e) for e in self.index))
 
     def pretty(self, indent: str = "") -> list[str]:
-        idx = ", ".join(render_expr(e) for e in self.index)
+        idx = ", ".join(e.pretty() for e in self.index)
         return [f"{indent}{self.name} = load {self.input}[{idx}]"]
 
 
@@ -268,7 +267,7 @@ class Write(Stmt):
         return Write(output=self.output, index=tuple(sigma.apply(e) for e in self.index), value=rename_ssa(self.value))
 
     def pretty(self, indent: str = "") -> list[str]:
-        idx = ", ".join(render_expr(e) for e in self.index)
+        idx = ", ".join(e.pretty() for e in self.index)
         return [f"{indent}{self.output}[{idx}] = {self.value}"]
 
 
@@ -310,7 +309,7 @@ class Select(Stmt):
         lines: list[str] = []
         for bi, br in enumerate(self.branches):
             prefix = f"{self.name} =" if bi == 0 else f"{' ' * len(self.name)}  "
-            lines.append(f"{indent}{prefix} {br.value} when ({render_expr(br.select)})")
+            lines.append(f"{indent}{prefix} {br.value} when ({br.select.pretty()})")
         return lines
 
 
@@ -441,8 +440,8 @@ class StridedLoop(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         kind = "reduce" if self.is_reduce else "free"
-        start = render_expr(self.start)
-        step = render_expr(self.step) if isinstance(self.step, Expr) else self.step
+        start = self.start.pretty()
+        step = self.step.pretty() if isinstance(self.step, Expr) else self.step
         head = f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {kind}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
@@ -484,7 +483,7 @@ class Cond(Stmt):
         )
 
     def pretty(self, indent: str = "") -> list[str]:
-        lines = [f"{indent}if ({render_expr(self.cond)}):", *pretty_body(self.body, indent + INDENT)]
+        lines = [f"{indent}if ({self.cond.pretty()}):", *pretty_body(self.body, indent + INDENT)]
         if self.else_body:
             lines.append(f"{indent}else:")
             lines.extend(pretty_body(self.else_body, indent + INDENT))
