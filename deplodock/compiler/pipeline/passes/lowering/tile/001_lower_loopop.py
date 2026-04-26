@@ -5,7 +5,7 @@ Mechanical translation: outer free-Loop chain becomes
 ``Loop`` is rewritten to Tile-IR ``BoundLoop`` carrying a ``BoundAxis``
 whose ``bind`` defaults to ``BIND_SERIAL`` (every thread walks the axis
 itself). Strategy passes flip the bind on select ``BoundLoop``s to
-``BIND_BLOCK_STRIDED`` to express cooperative iteration.
+to express cooperative iteration via axis splits.
 
 **Outer free-Loop chain → ``Tile.thread_axes``**. After stripping
 leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
