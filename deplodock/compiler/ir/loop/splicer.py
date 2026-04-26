@@ -170,33 +170,33 @@ def splice_graph(graph) -> tuple[LoopOp, list[str]] | None:
     """
     if len(graph.outputs) != 1:
         return None
-    root = graph.outputs[0]
-    root_node = graph.nodes.get(root)
+    root_node = graph.nodes.get(graph.outputs[0])
     if root_node is None or not isinstance(root_node.op, LoopOp):
         return None
 
-    loop_ids = {nid for nid, n in graph.nodes.items() if isinstance(n.op, LoopOp)}
-    loops: dict[str, LoopOp] = {nid: graph.nodes[nid].op for nid in loop_ids}
+    loop_nodes = {n.id: n for n in graph.nodes.values() if isinstance(n.op, LoopOp)}
     splice_edges: dict[tuple[str, str], tuple[str, str]] = {}
     external_order: list[str] = []
     seen_external: set[str] = set()
 
-    for nid in loop_ids:
-        node_op = loops[nid]
-        for ld in node_op.loads:
+    for node in loop_nodes.values():
+        for ld in node.op.loads:
             inp = ld.input
             # A Load is a splice edge if its source buf names another LoopOp node;
             # otherwise it's an external input. We key edges off the buf name
-            # (Load.source is now the producing node's id), not a positional
-            # input index — so a single edge entry covers every Load that reads
-            # the same producer.
-            if inp in loop_ids:
-                splice_edges[(nid, inp)] = (inp, inp)  # producer's Write.output is its node id
+            # (Load.source is the producing node's id), not a positional input
+            # index — so a single edge entry covers every Load that reads the
+            # same producer.
+            if inp in loop_nodes:
+                splice_edges[(node.id, inp)] = (inp, inp)  # producer's Write.output is its node id
             elif inp not in seen_external:
                 seen_external.add(inp)
                 external_order.append(inp)
 
-    merged = splice_loops(loops=loops, splice_edges=splice_edges)
+    merged = splice_loops(
+        loops={nid: n.op for nid, n in loop_nodes.items()},
+        splice_edges=splice_edges,
+    )
     if merged is None:
         return None
     return merged, external_order
