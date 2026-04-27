@@ -225,17 +225,20 @@ def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
         raise ValueError(f"Stage {stage.name!r} has no cache axes")
     extents = tuple(int(ax.extent) for ax in stage.axes)
 
-    # Iteration axis + per-cache-axis coord. 1D: iterate the cache axis
-    # directly (coord = Var of the axis). N-D: synthesize a flat axis
-    # and row-major-decode into per-axis coords.
+    # Iteration axis + per-cache-axis coord. Always synthesize a fresh
+    # iter axis name so the cooperative-load ``for`` variable can't
+    # collide with a same-named outer thread-decode variable (C++
+    # init-expression scoping rules read the freshly-declared inner var,
+    # giving an undefined initial value when the inner name shadows an
+    # outer one). 1D cache: trivial map to the single cache axis. N-D:
+    # row-major decode of the flat iter into per-axis coords.
+    total = 1
+    for e in extents:
+        total *= e
+    iter_axis = Axis(name=f"{stage.name}_flat", extent=total)
     if len(stage.axes) == 1:
-        iter_axis = stage.axes[0]
-        coord_for = {iter_axis.name: Var(iter_axis.name)}
+        coord_for = {stage.axes[0].name: Var(iter_axis.name)}
     else:
-        total = 1
-        for e in extents:
-            total *= e
-        iter_axis = Axis(name=f"{stage.name}_flat", extent=total)
         coord_for = _flat_decode(stage.axes, iter_axis.name)
 
     decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}

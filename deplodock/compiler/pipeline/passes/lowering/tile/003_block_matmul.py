@@ -128,7 +128,7 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     parsed = _match_matmul_body(tile.body, m_name=m.name, n_name=n.name)
     if parsed is None:
         return None
-    reduce_loop, write = parsed
+    prefix, reduce_loop, suffix, write = parsed
     k = reduce_loop.axis
     if k.extent % BK:
         return None
@@ -144,6 +144,14 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     if extracted is None:
         return None
     accum, raw_a, raw_b, mul = extracted
+    # Reduce-loop loads must be affine in the m / n / k axes (no div /
+    # mod). 004 staging caches Loads by axis affine-scale (`axis*F + lit`);
+    # patterns like ``(a0*N + a2)/D % M`` from collapsed-reshape views
+    # don't fit that shape, and staging silently produces a smem buffer
+    # that doesn't cover the load's address range. Skip — these
+    # workloads run via the cooperative-reduce path instead.
+    if not (_index_is_affine(raw_a.index) and _index_is_affine(raw_b.index)):
+        return None
     # `_extract_inner` returns the two Loads in body order, which is
     # arbitrary w.r.t. which one carries M vs N. Identify the M-load
     # (index has m.name but not n.name) and the N-load (vice versa).
@@ -174,27 +182,44 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     n_i_tg = Axis(f"{n.name}_i_tg", BN_TG)
     k_o, k_i = k.split(BK)
 
+    # Per (m_t, n_t) sub-tile cell: emit prefix stmts, then per-cell
+    # reduce-loop body, then suffix stmts, then write. Each cell's SSA
+    # names get a ``_m_t_n_t`` tag so prefix/suffix references to
+    # downstream values (including ``acc0`` from the reduce) line up.
+    # Prefix executes once per cell *before* the K_o loop; suffix and
+    # write execute once per cell *after*. ``produced_names`` excludes
+    # SSA names defined OUTSIDE the matched body (e.g. ``Load`` stmts
+    # at TileOp body scope feeding the Tile) — those refs stay un-tagged.
+    produced_names = _collect_produced(prefix, reduce_loop, suffix)
+    unrolled_prefix: list[Stmt] = []
     inner_compute: list[Stmt] = []
-    accum_names: list[tuple[int, int, str]] = []  # (m_t, n_t, accum_ssa_name)
+    unrolled_suffix: list[Stmt] = []
+    writes: list[Stmt] = []
 
     for m_t in range(tm):
         for n_t in range(tn):
             tag = f"_{m_t}_{n_t}"
             sigma = _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_block, tm, tn, m_t, n_t)
+            rename = _make_renamer(tag, produced_names)
+
+            for s in prefix:
+                unrolled_prefix.append(s.rewrite(rename, sigma))
+
             la = Load(name=load_a.name + tag, input=load_a.input, index=tuple(sigma.apply(e) for e in load_a.index))
             lb = Load(name=load_b.name + tag, input=load_b.input, index=tuple(sigma.apply(e) for e in load_b.index))
             mul_t = Assign(name=mul.name + tag, op=mul.op, args=(la.name, lb.name))
             ac = Accum(name=accum.name + tag, op=accum.op, value=mul_t.name)
             inner_compute.extend([la, lb, mul_t, ac])
-            accum_names.append((m_t, n_t, ac.name))
 
-    writes: list[Stmt] = []
-    for m_t, n_t, ac_name in accum_names:
-        sigma = _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_block, tm, tn, m_t, n_t)
-        writes.append(Write(output=write.output, index=tuple(sigma.apply(e) for e in write.index), value=ac_name))
+            for s in suffix:
+                unrolled_suffix.append(s.rewrite(rename, sigma))
+
+            writes.append(write.rewrite(rename, sigma))
 
     new_body: tuple[Stmt, ...] = (
+        *unrolled_prefix,
         Loop(axis=k_o, body=(Loop(axis=k_i, body=tuple(inner_compute)),)),
+        *unrolled_suffix,
         *writes,
     )
 
@@ -235,6 +260,45 @@ def _index_free_vars_set(index) -> set[str]:
     return out
 
 
+def _index_is_affine(index) -> bool:
+    """True iff every dim of ``index`` is built only from ``+ - *`` over
+    Vars and Literals. ``/`` and ``%`` (from collapsed-reshape views)
+    break 004 staging's affine-scale analysis, so the matmul rule
+    refuses to handle them."""
+    from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+
+    def is_affine(e) -> bool:
+        if isinstance(e, (Var, Literal)):
+            return True
+        if isinstance(e, BinaryExpr) and e.op in ("+", "-", "*"):
+            return is_affine(e.left) and is_affine(e.right)
+        return False
+
+    return all(is_affine(e) for e in index)
+
+
+def _make_renamer(tag: str, produced: set[str]):
+    """SSA-rename function used by ``Stmt.rewrite``. Tags only names
+    produced *inside* the matched body — refs to TileOp-scope SSA names
+    (e.g. a scalar ``Load`` hoisted above the Tile) stay un-tagged so
+    the per-cell unrolled body still resolves them correctly."""
+
+    def rename(name: str) -> str:
+        return name + tag if name in produced else name
+
+    return rename
+
+
+def _collect_produced(prefix: tuple, reduce_loop: Loop, suffix: tuple) -> set[str]:
+    """Names produced by Load / Assign / Accum / Select inside the
+    matched body. Used by the renamer to leave outer-scope refs alone."""
+    out: set[str] = set()
+    for s in (*prefix, *reduce_loop.body, *suffix):
+        if hasattr(s, "name") and isinstance(s.name, str):
+            out.add(s.name)
+    return out
+
+
 def _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_block, tm, tn, m_t, n_t) -> Sigma:
     """Per-(m_t, n_t) substitution: maps the original m/n/k axis Vars to
     the unrolled thread-and-sub-tile coordinate expression.
@@ -252,22 +316,37 @@ def _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_blo
     )
 
 
-def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[Loop, Write] | None:
-    """The body must be exactly ``(reduce_loop, write)`` where ``write``
-    indexes both output axes ``m`` and ``n`` (other index positions may
-    be Literals from collapsed leading dims, e.g. batch=1 in the Linear
-    forward shape ``(1, 32, K)``)."""
-    if len(body) != 2:
+def _match_matmul_body(body: tuple, m_name: str, n_name: str) -> tuple[tuple, Loop, tuple, Write] | None:
+    """Match ``(*prefix, reduce_loop, *suffix, write)`` where ``reduce_loop``
+    is the canonical matmul reduce and ``write`` indexes both output axes.
+
+    ``prefix`` runs once per output cell before the K reduce; typical use
+    is matmul-with-activation-of-other-input (e.g. ``silu(gate) · up_proj``
+    where the silu chain on ``gate`` is in prefix). ``suffix`` runs after
+    the K reduce and may consume the accum (e.g. ``+ residual`` or
+    ``* silu_value``). Both must be straight-line stmts — no nested
+    Loops or Tiles. The simple GEMM case has empty prefix and suffix.
+    """
+    if not body or not isinstance(body[-1], Write):
         return None
-    reduce_loop, write = body
-    if not (isinstance(reduce_loop, Loop) and isinstance(write, Write)):
-        return None
-    if not reduce_loop.is_reduce:
-        return None
+    write = body[-1]
     var_names = {e.name for e in write.index if isinstance(e, Var)}
     if {m_name, n_name} - var_names:
         return None
-    return reduce_loop, write
+    reduce_idxs = [i for i, s in enumerate(body[:-1]) if isinstance(s, Loop) and s.is_reduce]
+    if len(reduce_idxs) != 1:
+        return None
+    rl_idx = reduce_idxs[0]
+    reduce_loop = body[rl_idx]
+    prefix = body[:rl_idx]
+    suffix = body[rl_idx + 1 : -1]
+    # Prefix and suffix must be plain straight-line stmts (Load / Assign /
+    # Accum / Select). Any nested Loop / Tile aborts the match — those
+    # need their own handling and the matmul rule isn't the place.
+    for s in prefix + suffix:
+        if isinstance(s, (Loop, Tile)):
+            return None
+    return prefix, reduce_loop, suffix, write
 
 
 def _extract_inner(reduce_loop: Loop) -> tuple[Accum, Load, Load, Assign] | None:
