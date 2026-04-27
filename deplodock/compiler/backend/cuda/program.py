@@ -176,7 +176,7 @@ def _launch(launch: _Launch, compiled: _Compiled, arrays: dict[str, cp.ndarray])
         arrays[zname].fill(0)
     kernel = compiled.kernels[launch.kernel_name]
     args = tuple(arrays[name] for name in launch.arg_names)
-    kernel(launch.grid, launch.block, args, shared_mem=launch.smem_bytes)
+    kernel(launch.grid, launch.block, args, shared_mem=0)
 
 
 # ---------------------------------------------------------------------------
