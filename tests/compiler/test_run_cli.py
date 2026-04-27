@@ -57,6 +57,32 @@ def test_run_code_linear_blockify(run_cli):
 
 
 @requires_cuda
+def test_run_code_matmul_k_chunked(run_cli):
+    """Matmul with K large enough to exercise the K-chunked SGEMM path
+    (BK=64). Regression: the K_o outer loop is syntactically a free
+    Loop (no immediate Accum) but the Init for the running accumulator
+    must still land at the surrounding Tile body so it persists across
+    K_o iterations."""
+    rc, _, stderr = run_cli("run", "--code", "torch.matmul(torch.randn(128, 2048), torch.randn(2048, 128))")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
+def test_run_code_sdpa_k_chunked(run_cli):
+    """SDPA: the per-output free loop (head_dim) wraps a reduce loop +
+    a Write — its body has a Write so it is *not* a reduce-passthrough
+    and the per-output accumulator must reset per iteration. Pairs
+    with the matmul case above to cover both branches of the recursive
+    reduce-crossing rule."""
+    rc, _, stderr = run_cli(
+        "run",
+        "--code",
+        "torch.nn.functional.scaled_dot_product_attention(torch.randn(1,2,32,64), torch.randn(1,2,32,64), torch.randn(1,2,32,64))",
+    )
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
 def test_run_bench_prints_table(run_cli):
     rc, stdout, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "--bench", "--warmup", "2", "--iters", "5")
     assert rc == 0, f"stderr: {stderr}"

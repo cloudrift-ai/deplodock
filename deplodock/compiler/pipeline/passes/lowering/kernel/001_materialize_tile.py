@@ -98,7 +98,13 @@ def _materialize(blk: Tile) -> Stmt:
         elif isinstance(stmt, (Loop, StridedLoop)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform))
             if stmt.is_reduce:
-                pending_reduce = next(a for a in stmt.body if isinstance(a, Accum))
+                # Combine matching needs the Accum at the immediate-body
+                # level (single-loop reduce). For nested-reduce shapes
+                # (K-chunked matmul: outer reduce wraps inner reduce, no
+                # immediate Accum) there's no Combine to match anyway, so
+                # ``None`` here is safe — a stray Combine would error in
+                # the Combine branch as before.
+                pending_reduce = next((a for a in stmt.body if isinstance(a, Accum)), None)
             else:
                 pending_reduce = None
         elif isinstance(stmt, Combine):

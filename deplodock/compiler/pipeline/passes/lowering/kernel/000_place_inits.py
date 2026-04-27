@@ -27,7 +27,7 @@ so the standard render path produces the right code unmodified.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Accum, Cond, Init, Loop, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.stmt import Accum, Cond, Init, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
@@ -79,12 +79,19 @@ def _place_inits_in_scope(body: tuple) -> tuple:
 def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
     """Collect Accums reachable from ``stmt`` through reduce loops only.
     Stops at free loops — those Accums will be placed at the free loop's
-    own scope when we recurse into it."""
+    own scope when we recurse into it.
+
+    "Reduce loop" here is the recursive notion: a Loop whose body has an
+    Accum directly, *or* a nested reduce-Loop. This catches the
+    K-chunked matmul shape where ``K_o``'s immediate body is ``[Stage,
+    ..., Loop(K_i, reduce, body=[..., Accum])]`` — the inner Accum
+    accumulates across ``K_o`` too, so ``K_o`` is crossable for Init
+    placement and the Init lands at the surrounding Tile body head."""
     out: list[Accum] = []
     if isinstance(stmt, Accum):
         out.append(stmt)
     elif isinstance(stmt, (Loop, StridedLoop)):
-        if stmt.is_reduce:
+        if _is_reduce_recursive(stmt):
             for child in stmt.body:
                 out.extend(_accums_under_reduces_only(child))
     elif isinstance(stmt, Cond):
@@ -95,11 +102,39 @@ def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
     return out
 
 
+def _is_reduce_recursive(loop: Loop | StridedLoop) -> bool:
+    """Recursive reduce check (Init-scoping only). A Loop is "crossable"
+    iff its body either has an Accum directly OR forms a pure
+    reduce-passthrough — no Write / output-escape stmts in body, and at
+    least one nested reduce-Loop carries the Accum.
+
+    The Write check is what distinguishes:
+
+    - **Matmul K-chunked** (``K_o`` body = [Stage, Stage, Loop(K_i,
+      reduce)]): no Write directly in body → crossable, Init lives at
+      the surrounding Tile.
+    - **SDPA per-output free loop** (``a4`` body = [Loop(reduce, ...),
+      Write[..., a4]]): the Write escapes per-iteration, so the Accum
+      must reset per ``a4`` → not crossable, Init lives inside ``a4``."""
+    has_inner_reduce = False
+    for s in loop.body:
+        if isinstance(s, Accum):
+            return True
+        if isinstance(s, Write):
+            return False
+        if isinstance(s, (Loop, StridedLoop)) and _is_reduce_recursive(s):
+            has_inner_reduce = True
+    return has_inner_reduce
+
+
 def _recurse(stmt: Stmt) -> Stmt:
     """Descend into block-structured stmts so nested free Loops get their
-    own Init placement at their own scope."""
+    own Init placement at their own scope. Same recursive-reduce
+    distinction as ``_accums_under_reduces_only``: a Loop that
+    transitively wraps an Accum (matmul ``K_o`` chunking) descends
+    without opening a new scope."""
     if isinstance(stmt, Loop):
-        if stmt.is_reduce:
+        if _is_reduce_recursive(stmt):
             return Loop(axis=stmt.axis, body=tuple(_recurse(c) for c in stmt.body))
         # Free Loop — its body is its own scope; place Inits there.
         return Loop(axis=stmt.axis, body=_place_inits_in_scope(stmt.body))
