@@ -92,7 +92,7 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     if len(blk.thread_axes) != 1:
         return None
 
-    reduce_loops = [s for s in blk.body if isinstance(s, Loop) and s.is_reduce]
+    reduce_loops = [loop for loop in blk.loops if loop.is_reduce]
     if not reduce_loops:
         return None
     if int(reduce_loops[0].axis.extent) < BLOCK_SIZE:

@@ -35,11 +35,13 @@ already contains a reduce-Loop is left alone.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
@@ -87,7 +89,7 @@ def _chunk_in_body(stmts: tuple) -> tuple[tuple, bool]:
         if isinstance(s, (Loop, StridedLoop)):
             inner, inner_changed = _chunk_in_body(s.body)
             if inner_changed:
-                out.append(_clone_loop(s, inner))
+                out.append(replace(s, body=inner))
                 changed = True
                 continue
         if isinstance(s, Cond):
@@ -109,13 +111,12 @@ def _is_matmul_reduce(loop: Loop) -> bool:
     fused-multiply-accumulate chain produced by lifting + fusion."""
     K_name = loop.axis.name
     bufs_with_K: set[str] = set()
-    for s in loop.body:
-        if isinstance(s, Load):
-            free = set()
-            for e in s.index:
-                free |= e.free_vars()
-            if K_name in free:
-                bufs_with_K.add(s.input)
+    for ld in loop.loads:
+        free: set[str] = set()
+        for e in ld.index:
+            free |= e.free_vars()
+        if K_name in free:
+            bufs_with_K.add(ld.input)
     if len(bufs_with_K) < 2:
         return False
     # Must contain an Accum (otherwise the reduce loop's compute is
@@ -130,9 +131,8 @@ def _chunk_loop(loop: Loop) -> Loop | None:
         return None
 
     # Idempotence: already chunked if body has a nested reduce-Loop.
-    for s in loop.body:
-        if isinstance(s, Loop) and s.is_reduce:
-            return None
+    if any(inner.is_reduce for inner in loop.loops):
+        return None
 
     K_name = loop.axis.name
     K_o = Axis(f"{K_name}_o", K // BK)
@@ -140,12 +140,6 @@ def _chunk_loop(loop: Loop) -> Loop | None:
     sigma = Sigma({K_name: Var(K_o.name) * Literal(BK, "int") + Var(K_i.name)})
     inner_body = tuple(s.rewrite(_id, sigma) for s in loop.body)
     return Loop(axis=K_o, body=(Loop(axis=K_i, body=inner_body),))
-
-
-def _clone_loop(loop, body: tuple):
-    if isinstance(loop, StridedLoop):
-        return StridedLoop(axis=loop.axis, start=loop.start, step=loop.step, body=body)
-    return Loop(axis=loop.axis, body=body)
 
 
 def _id(name: str) -> str:
