@@ -32,7 +32,7 @@ Loop-IR's canonical form.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -537,10 +537,15 @@ class Loop(Stmt):
 
     Used by Loop IR for general iteration; reused by Kernel IR for
     serial (post-materialization) loops inside cooperative blocks.
+
+    ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
+    time. Set by scheduling passes (``unroll_small_loops``); has no
+    effect on the IR's iteration semantics.
     """
 
     axis: Axis
     body: tuple[Stmt, ...]
+    unroll: bool = False
 
     def deps(self) -> tuple[str, ...]:
         return ()
@@ -568,11 +573,16 @@ class Loop(Stmt):
     ) -> Stmt:
         """Recursive rewrite: rebuild ``body`` with each child's ``rewrite``.
         ``axis`` is mapped through ``axis_fn`` (default identity)."""
-        return Loop(axis=axis_fn(self.axis), body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body))
+        return Loop(
+            axis=axis_fn(self.axis),
+            body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body),
+            unroll=self.unroll,
+        )
 
     def pretty(self, indent: str = "") -> list[str]:
         kind = "reduce" if self.is_reduce else "free"
-        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}:  # {kind}"
+        unroll = " unroll" if self.unroll else ""
+        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}:  # {kind}{unroll}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -592,6 +602,8 @@ class Loop(Stmt):
                 out.append(f"{pad}float {s.name} = {_float_lit(float(identity))};")
         var = self.axis.name
         extent = int(self.axis.extent)
+        if self.unroll:
+            out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
         inner = ctx.child()
         for s in self.body:
@@ -753,6 +765,7 @@ class StridedLoop(Stmt):
     start: Expr
     step: Expr
     body: tuple[Stmt, ...]
+    unroll: bool = False
 
     def deps(self) -> tuple[str, ...]:
         return ()
@@ -773,13 +786,15 @@ class StridedLoop(Stmt):
             start=sigma.apply(self.start),
             step=sigma.apply(self.step) if isinstance(self.step, Expr) else self.step,
             body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body),
+            unroll=self.unroll,
         )
 
     def pretty(self, indent: str = "") -> list[str]:
         kind = "reduce" if self.is_reduce else "free"
+        unroll = " unroll" if self.unroll else ""
         start = self.start.pretty()
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
-        head = f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {kind}"
+        head = f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {kind}{unroll}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -800,6 +815,8 @@ class StridedLoop(Stmt):
         var = self.axis.name
         start_str = self.start.render(ctx)
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
+        if self.unroll:
+            out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = {start_str}; {var} < {int(self.axis.extent)}; {var} += {step_str}) {{")
         inner = ctx.child()
         for s in self.body:
@@ -990,7 +1007,7 @@ def drop_size_one_free_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
     def fn(s: Stmt) -> Stmt | tuple[Stmt, ...]:
         if isinstance(s, Loop):
-            candidate = Loop(axis=s.axis, body=map_body(s.body, fn))
+            candidate = replace(s, body=map_body(s.body, fn))
             if int(candidate.axis.extent) == 1 and not candidate.is_reduce:
                 sub = Sigma({candidate.axis.name: Literal(0, "int")})
                 return tuple(c.rewrite(_identity_rename, sub) for c in candidate.body)
@@ -1008,9 +1025,9 @@ def drop_size_one_free_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
 def _recurse_canonicalize(s: Stmt) -> Stmt:
     if isinstance(s, Loop):
-        return Loop(axis=s.axis, body=canonicalize_free_axis_order(s.body))
+        return replace(s, body=canonicalize_free_axis_order(s.body))
     if isinstance(s, StridedLoop):
-        return StridedLoop(axis=s.axis, start=s.start, step=s.step, body=canonicalize_free_axis_order(s.body))
+        return replace(s, body=canonicalize_free_axis_order(s.body))
     if isinstance(s, Tile):
         return Tile(axes=s.axes, body=canonicalize_free_axis_order(s.body))
     if isinstance(s, Cond):
@@ -1066,7 +1083,7 @@ def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
     def fn(s: Stmt) -> Stmt | None:
         if isinstance(s, Loop):
-            return Loop(axis=s.axis, body=map_body(s.body, fn))
+            return replace(s, body=map_body(s.body, fn))
         rec = _recurse_through_block(s, fn)
         if rec is not None:
             return rec
@@ -1093,9 +1110,9 @@ def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         new_body: list[Stmt] = []
         for s in body:
             if isinstance(s, Loop):
-                new_body.append(Loop(axis=s.axis, body=walk(s.body)))
+                new_body.append(replace(s, body=walk(s.body)))
             elif isinstance(s, StridedLoop):
-                new_body.append(StridedLoop(axis=s.axis, start=s.start, step=s.step, body=walk(s.body)))
+                new_body.append(replace(s, body=walk(s.body)))
             elif isinstance(s, Tile):
                 new_body.append(Tile(axes=s.axes, body=walk(s.body)))
             elif isinstance(s, Cond):
@@ -1126,7 +1143,7 @@ def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
                 sub = Sigma({loop.axis.name: Var(canonical)})
                 rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
                 renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
-                new_body[idx] = Loop(axis=new_axis, body=renamed)
+                new_body[idx] = replace(loop, axis=new_axis, body=renamed)
 
         return tuple(new_body)
 
@@ -1231,7 +1248,7 @@ def hoist_loop_invariants(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
                 for h in hoisted:
                     new_body.append(h)
                     bindings.add(h.name)
-                new_body.append(Loop(axis=s.axis, body=tuple(stay)))
+                new_body.append(replace(s, body=tuple(stay)))
 
                 for c in inner:
                     if isinstance(c, Accum):
@@ -1240,7 +1257,7 @@ def hoist_loop_invariants(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
                         bindings.add(c.name)
             elif isinstance(s, StridedLoop):
                 inner = walk(s.body, bindings)
-                new_body.append(StridedLoop(axis=s.axis, start=s.start, step=s.step, body=tuple(inner)))
+                new_body.append(replace(s, body=tuple(inner)))
                 for c in inner:
                     if isinstance(c, Accum):
                         ssa_names.add(c.name)
@@ -1276,11 +1293,11 @@ def _simplify_expr_tuple(xs: tuple[Expr, ...], ctx: SimplifyCtx) -> tuple[Expr, 
 def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
     if isinstance(stmt, Loop):
         inner = ctx.extend(stmt.axis.name, Interval(0, stmt.axis.extent - 1))
-        return Loop(stmt.axis, tuple(_simplify_stmt(s, inner) for s in stmt.body))
+        return replace(stmt, body=tuple(_simplify_stmt(s, inner) for s in stmt.body))
     if isinstance(stmt, StridedLoop):
         inner = ctx.extend(stmt.axis.name, Interval(0, stmt.axis.extent - 1))
-        return StridedLoop(
-            axis=stmt.axis,
+        return replace(
+            stmt,
             start=stmt.start.simplify(ctx),
             step=stmt.step.simplify(ctx) if isinstance(stmt.step, Expr) else stmt.step,
             body=tuple(_simplify_stmt(s, inner) for s in stmt.body),

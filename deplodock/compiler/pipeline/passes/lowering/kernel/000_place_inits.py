@@ -26,6 +26,8 @@ so the standard render path produces the right code unmodified.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Cond, Init, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import TileOp
@@ -135,11 +137,11 @@ def _recurse(stmt: Stmt) -> Stmt:
     without opening a new scope."""
     if isinstance(stmt, Loop):
         if _is_reduce_recursive(stmt):
-            return Loop(axis=stmt.axis, body=tuple(_recurse(c) for c in stmt.body))
+            return replace(stmt, body=tuple(_recurse(c) for c in stmt.body))
         # Free Loop — its body is its own scope; place Inits there.
-        return Loop(axis=stmt.axis, body=_place_inits_in_scope(stmt.body))
+        return replace(stmt, body=_place_inits_in_scope(stmt.body))
     if isinstance(stmt, StridedLoop):
-        return StridedLoop(axis=stmt.axis, start=stmt.start, step=stmt.step, body=tuple(_recurse(c) for c in stmt.body))
+        return replace(stmt, body=tuple(_recurse(c) for c in stmt.body))
     if isinstance(stmt, Cond):
         return Cond(
             cond=stmt.cond,

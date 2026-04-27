@@ -32,6 +32,8 @@ passes can pattern-match on it.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
@@ -139,9 +141,7 @@ def _emit_loop(loop, tid_expr, n_threads, transform) -> Stmt:
             inner.append(_emit_loop(s, tid_expr, n_threads, transform))
         else:
             inner.append(transform(s))
-    if isinstance(loop, StridedLoop):
-        return StridedLoop(axis=loop.axis, start=loop.start, step=loop.step, body=tuple(inner))
-    return Loop(axis=loop.axis, body=tuple(inner))
+    return replace(loop, body=tuple(inner))
 
 
 def _single_thread_var(thread_axes: tuple) -> str:
