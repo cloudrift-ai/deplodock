@@ -1,0 +1,94 @@
+{
+  "inputs": [
+    "hidden_states"
+  ],
+  "outputs": [
+    "merged_merged_merged_lift_mul_1"
+  ],
+  "nodes": {
+    "mean_count": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "mean_count",
+        "value": 2048.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "mean_count",
+        "shape": [
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "add_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "add_c1",
+        "value": 1e-05
+      },
+      "inputs": [],
+      "output": {
+        "name": "add_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "hidden_states": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "hidden_states",
+        "shape": [
+          1,
+          128,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_input_layernorm_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_input_layernorm_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_input_layernorm_weight",
+        "shape": [
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_merged_merged_lift_mul_1": {
+      "op": "LoopOp",
+      "op_fields": {
+        "body": [
+          "Load(name='in0', input='mean_count', index=(Literal(value=0, dtype='int'),))",
+          "Load(name='in1', input='add_c1', index=(Literal(value=0, dtype='int'),))",
+          "Loop(axis=Axis(name='a0', extent=128), body=(Loop(axis=Axis(name='a1', extent=2048), body=(Load(name='in2', input='hidden_states', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1'))), Load(name='in3', input='hidden_states', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1'))), Assign(name='v0', op=ElementwiseImpl('multiply'), args=('in3', 'in2')), Accum(name='acc0', value='v0', op=ElementwiseImpl('add')))), Assign(name='v1', op=ElementwiseImpl('divide'), args=('acc0', 'in0')), Assign(name='v2', op=ElementwiseImpl('add'), args=('v1', 'in1')), Assign(name='v3', op=ElementwiseImpl('rsqrt'), args=('v2',)), Loop(axis=Axis(name='a2', extent=2048), body=(Load(name='in4', input='hidden_states', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a2'))), Assign(name='v4', op=ElementwiseImpl('multiply'), args=('in4', 'v3')), Load(name='in5', input='p_input_layernorm_weight', index=(Var(name='a2'),)), Assign(name='v5', op=ElementwiseImpl('multiply'), args=('in5', 'v4')), Write(output='merged_merged_merged_lift_mul_1', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a2')), value='v5')))))"
+        ]
+      },
+      "inputs": [
+        "mean_count",
+        "add_c1",
+        "hidden_states",
+        "p_input_layernorm_weight"
+      ],
+      "output": {
+        "name": "mul_1",
+        "shape": [
+          1,
+          128,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    }
+  }
+}

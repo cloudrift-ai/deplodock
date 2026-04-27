@@ -1,0 +1,61 @@
+{
+  "inputs": [
+    "merged_merged_merged_lift_mul_7"
+  ],
+  "outputs": [
+    "merged_merged_lift_n11"
+  ],
+  "nodes": {
+    "p_mlp_gate_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_mlp_gate_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_mlp_gate_proj_weight",
+        "shape": [
+          5632,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_merged_merged_lift_mul_7": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "mul_7",
+        "shape": [
+          1,
+          128,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_merged_lift_n11": {
+      "op": "LoopOp",
+      "op_fields": {
+        "body": [
+          "Loop(axis=Axis(name='a0', extent=128), body=(Loop(axis=Axis(name='a1', extent=5632), body=(Loop(axis=Axis(name='a2', extent=2048), body=(Load(name='in0', input='p_mlp_gate_proj_weight', index=(Var(name='a1'), Var(name='a2'))), Load(name='in1', input='merged_merged_merged_lift_mul_7', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a2'))), Assign(name='v0', op=ElementwiseImpl('multiply'), args=('in1', 'in0')), Accum(name='acc0', value='v0', op=ElementwiseImpl('add')))), Write(output='merged_merged_lift_n11', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1')), value='acc0'))),))"
+        ]
+      },
+      "inputs": [
+        "p_mlp_gate_proj_weight",
+        "merged_merged_merged_lift_mul_7"
+      ],
+      "output": {
+        "name": "linear_4",
+        "shape": [
+          1,
+          128,
+          5632
+        ],
+        "dtype": "float32"
+      }
+    }
+  }
+}
