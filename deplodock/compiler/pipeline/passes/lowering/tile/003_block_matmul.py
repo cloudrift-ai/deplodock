@@ -22,11 +22,11 @@ accumulator is a register tile; smem load count per FMA drops from 2 to
 falling through to ``(1, 1)`` for the original one-output-per-thread
 shape.
 
-When sub-tiling fires (TM > 1 or TN > 1), this rule does not emit
-``Stage`` directives — the existing ``004_stage_inputs.py`` cannot
-correctly cache an affine ``axis*F + literal`` index pattern, so we
-rely on L1/L2 caching for operands. Adding sub-tile-aware smem staging
-is a follow-up.
+Operand staging is delegated to ``004_stage_inputs.py``, which is
+affine-aware (sizes the cache as ``axis.extent * F`` for the
+``axis*F + literal`` patterns sub-tiling emits) and layout-aware
+(reorders cache axes so the warp-varying axis is innermost in smem,
+avoiding bank conflicts on the hot read path).
 
 Pre-rewrite (post ``lower_naive`` of fused matmul ``C = A @ B``)::
 
@@ -75,7 +75,7 @@ from deplodock.compiler.ir.axis import (
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Stmt, Write
-from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import Tile, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -174,63 +174,15 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     n_i_tg = Axis(f"{n.name}_i_tg", BN_TG)
     k_o, k_i = k.split(BK)
 
-    # When sub-tiling fires (TM>1 or TN>1), insert smem staging inline:
-    # the existing 004_stage_inputs.py infers the cache extent from the
-    # axes named in the Load index, but our unrolled Loads use
-    # ``m_i_tg*TM + literal`` patterns that need a wider cache than
-    # m_i_tg.extent alone implies. Stage the operands here with the
-    # correct BM_BLOCK / BN_BLOCK extents and rewrite the body Loads to
-    # cache-local form. 004 then no-ops via its "already staged" guard.
-    do_stage = (tm > 1) or (tn > 1)
-    a_stage_name = f"{load_a.input}_stage"
-    b_stage_name = f"{load_b.input}_stage"
-    a_blk_m = Axis(f"{m.name}_blk", bm_block)
-    a_blk_k = Axis(f"{k.name}_blk_a", BK)
-    b_blk_k = Axis(f"{k.name}_blk_b", BK)
-    b_blk_n = Axis(f"{n.name}_blk", bn_block)
-
     inner_compute: list[Stmt] = []
     accum_names: list[tuple[int, int, str]] = []  # (m_t, n_t, accum_ssa_name)
 
     for m_t in range(tm):
         for n_t in range(tn):
             tag = f"_{m_t}_{n_t}"
-            if do_stage:
-                la = _staged_load(
-                    load_a,
-                    name=load_a.name + tag,
-                    stage_name=a_stage_name,
-                    m_axis_name=m.name,
-                    k_axis_name=k.name,
-                    m_i_tg=m_i_tg,
-                    k_i=k_i,
-                    m_offset=m_t,
-                    tm=tm,
-                    n_offset=None,
-                    tn=None,
-                    n_i_tg=None,
-                    kind="a",
-                )
-                lb = _staged_load(
-                    load_b,
-                    name=load_b.name + tag,
-                    stage_name=b_stage_name,
-                    m_axis_name=m.name,
-                    k_axis_name=k.name,
-                    m_i_tg=None,
-                    k_i=k_i,
-                    m_offset=None,
-                    tm=None,
-                    n_offset=n_t,
-                    tn=tn,
-                    n_i_tg=n_i_tg,
-                    kind="b",
-                    n_axis_name=n.name,
-                )
-            else:
-                sigma = _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_block, tm, tn, m_t, n_t)
-                la = Load(name=load_a.name + tag, input=load_a.input, index=tuple(sigma.apply(e) for e in load_a.index))
-                lb = Load(name=load_b.name + tag, input=load_b.input, index=tuple(sigma.apply(e) for e in load_b.index))
+            sigma = _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_block, tm, tn, m_t, n_t)
+            la = Load(name=load_a.name + tag, input=load_a.input, index=tuple(sigma.apply(e) for e in load_a.index))
+            lb = Load(name=load_b.name + tag, input=load_b.input, index=tuple(sigma.apply(e) for e in load_b.index))
             mul_t = Assign(name=mul.name + tag, op=mul.op, args=(la.name, lb.name))
             ac = Accum(name=accum.name + tag, op=accum.op, value=mul_t.name)
             inner_compute.extend([la, lb, mul_t, ac])
@@ -241,24 +193,8 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
         sigma = _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_block, tm, tn, m_t, n_t)
         writes.append(Write(output=write.output, index=tuple(sigma.apply(e) for e in write.index), value=ac_name))
 
-    if do_stage:
-        # Build Stage decls at the K_o loop head. Cache axes hold the
-        # full BM_BLOCK / BN_BLOCK extents; origin is the block-uniform
-        # source-buffer anchor with cache axes zeroed. slab_dims maps
-        # each cache axis to its source-buffer dim — derived from where
-        # m / n / k Vars appear in the original Load indexes.
-        a_origin = _stage_origin(load_a, m.name, k.name, m_o, k_o, bm_block, BK, n_axis_name=None, n_o=None, bn_block=None)
-        b_origin = _stage_origin(load_b, m.name, k.name, m_o, k_o, bm_block, BK, n_axis_name=n.name, n_o=n_o, bn_block=bn_block)
-        a_slab = _stage_slab_dims(load_a, m.name, k.name)
-        b_slab = _stage_slab_dims(load_b, k.name, n.name)
-        a_stage = Stage(name=a_stage_name, buf=load_a.input, origin=a_origin, axes=(a_blk_m, a_blk_k), slab_dims=a_slab)
-        b_stage = Stage(name=b_stage_name, buf=load_b.input, origin=b_origin, axes=(b_blk_k, b_blk_n), slab_dims=b_slab)
-        k_loop_body: tuple[Stmt, ...] = (a_stage, b_stage, Loop(axis=k_i, body=tuple(inner_compute)))
-    else:
-        k_loop_body = (Loop(axis=k_i, body=tuple(inner_compute)),)
-
     new_body: tuple[Stmt, ...] = (
-        Loop(axis=k_o, body=k_loop_body),
+        Loop(axis=k_o, body=(Loop(axis=k_i, body=tuple(inner_compute)),)),
         *writes,
     )
 
@@ -297,70 +233,6 @@ def _index_free_vars_set(index) -> set[str]:
     for e in index:
         out |= e.free_vars()
     return out
-
-
-def _staged_load(
-    orig_load, *, name, stage_name, m_axis_name, k_axis_name, m_i_tg, k_i, m_offset, tm, n_offset, tn, n_i_tg, kind, n_axis_name=None
-) -> Load:
-    """Build a Load that reads the staged smem buffer at cache-local coords.
-
-    Index is in **cache-axis order** — matches the Stage.axes declaration
-    and the Smem buffer's shape. For A: ``(m_blk, k_blk)`` to match
-    ``Stage.axes=(a_blk_m, a_blk_k)``. For B: ``(k_blk, n_blk)`` to match
-    ``Stage.axes=(b_blk_k, b_blk_n)``.
-
-    Cache-local M coord = ``m_i_tg * TM + m_t``; K coord = ``k_i``;
-    N coord = ``n_i_tg * TN + n_t``. The renderer flattens via the Smem
-    extents declared on the Stage.
-    """
-    del orig_load, m_axis_name, k_axis_name, n_axis_name  # unused once cache-order is fixed
-    if kind == "a":
-        m_blk = Var(m_i_tg.name) * Literal(tm, "int") + Literal(m_offset, "int")
-        k_blk = Var(k_i.name)
-        return Load(name=name, input=stage_name, index=(m_blk, k_blk))
-    # kind == "b"
-    k_blk = Var(k_i.name)
-    n_blk = Var(n_i_tg.name) * Literal(tn, "int") + Literal(n_offset, "int")
-    return Load(name=name, input=stage_name, index=(k_blk, n_blk))
-
-
-def _find_axis_dims(load: Load, *axis_names: str) -> tuple[int, ...]:
-    """For each axis name, return the source-buffer dim where that axis
-    Var appears in the Load's index. Used to emit Stage axes / slab_dims
-    in source-dim order."""
-    dims = []
-    for ax_name in axis_names:
-        found = -1
-        for d, e in enumerate(load.index):
-            if ax_name in e.free_vars():
-                found = d
-                break
-        dims.append(found)
-    return tuple(dims)
-
-
-def _stage_origin(
-    load: Load, m_axis_name: str, k_axis_name: str, m_o, k_o, bm_block: int, bk: int, *, n_axis_name=None, n_o=None, bn_block=None
-) -> tuple:
-    """Per-source-dim block-uniform anchor for the Stage. For each dim of
-    the original Load, substitute the per-block axis Vars (m_o / n_o /
-    k_o) with their block-stride expressions and zero out the
-    thread/cache vars."""
-    block_sigma_map = {
-        m_axis_name: Var(m_o.name) * Literal(bm_block, "int"),
-        k_axis_name: Var(k_o.name) * Literal(bk, "int"),
-    }
-    if n_axis_name is not None:
-        block_sigma_map[n_axis_name] = Var(n_o.name) * Literal(bn_block, "int")
-    sigma = Sigma(block_sigma_map)
-    return tuple(sigma.apply(e) for e in load.index)
-
-
-def _stage_slab_dims(load: Load, *axis_names) -> tuple[int, ...]:
-    """slab_dims parallel to Stage.axes: each cache axis (in declared
-    order) maps to one source-buffer dim. Derived from the source-dim
-    location of each axis Var in the original Load index."""
-    return _find_axis_dims(load, *axis_names)
 
 
 def _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_block, tm, tn, m_t, n_t) -> Sigma:
