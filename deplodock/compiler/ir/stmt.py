@@ -553,6 +553,16 @@ class Loop(Stmt):
         """A loop is a reduce-loop iff its immediate body contains an ``Accum``."""
         return any(isinstance(s, Accum) for s in self.body)
 
+    @property
+    def loops(self) -> tuple[Loop, ...]:
+        """Top-level ``Loop`` stmts in the body."""
+        return tuple(s for s in self.body if isinstance(s, Loop))
+
+    @property
+    def loads(self) -> tuple[Load, ...]:
+        """Top-level ``Load`` stmts in the body."""
+        return tuple(s for s in self.body if isinstance(s, Load))
+
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
@@ -627,6 +637,16 @@ class Tile(Stmt):
     @property
     def block_axes(self) -> tuple[Axis, ...]:
         return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
+
+    @property
+    def all_axes(self) -> tuple[Axis, ...]:
+        return tuple(ba.axis for ba in self.axes)
+
+    @property
+    def loops(self) -> tuple[Loop, ...]:
+        """Top-level ``Loop`` stmts in the body. Mirrors ``Loop.loops`` so
+        scope-walking passes can iterate without re-filtering."""
+        return tuple(s for s in self.body if isinstance(s, Loop))
 
     def pretty(self, indent: str = "") -> list[str]:
         axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in self.axes) or "-"
