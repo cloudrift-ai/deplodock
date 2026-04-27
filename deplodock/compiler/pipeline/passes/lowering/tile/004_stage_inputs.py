@@ -240,12 +240,30 @@ def _stage_plan(
         if len(origins_per_load) > 1:
             continue
 
+        # Set source_index_template only for non-affine loads (``/`` or
+        # ``%`` from collapsed-reshape views). Affine cases use the old
+        # additive ``origin + decoded`` path because the cache extent is
+        # already F-scaled — substituting the iter coord into the
+        # unsubstituted ``axis*F + lit`` would over-multiply by F.
+        non_affine = any(_has_div_or_mod(e) for e in ref_load.index)
+        template = tuple(ref_load.index) if non_affine else None
+        # When non-affine, force per-axis scale to 1 — cache extent must
+        # equal the raw axis extent so iter coord = cache-relative
+        # source position directly.
+        if non_affine:
+            cache_axes = [
+                Axis(name=ax.name, extent=int(orig_ax.extent))
+                for ax, orig_ax in zip(
+                    cache_axes, [thread_axes_by_name.get(a.name) or below_axes_by_name[a.name] for a in cache_axes], strict=True
+                )
+            ]
         stage = Stage(
             name=f"{buf}_stage",
             buf=buf,
             origin=origin,
             axes=tuple(cache_axes),
             slab_dims=tuple(slab_dims),
+            source_index_template=template,
         )
         return (buf, d, common[:d], stage)
 
@@ -351,6 +369,14 @@ def _smem_coord_for_axis(stage_axis: Axis, slab_dim: int, stage: Stage, load_ind
         non_cache = free - {stage_axis.name} - origin_at_dim.free_vars()
         sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
         return sigma.apply(load_e)
+    # Non-affine layout (``/`` or ``%`` from collapsed-reshape views):
+    # smem is keyed by the raw cache axis Var. The complex layout
+    # transform lives in the cooperative-load's source fetch, not in
+    # the consumer's smem read. Without this, subtracting block-uniform
+    # vars leaves a layout-transformed expression that doesn't match
+    # the cooperative-load's smem-write coord.
+    if _has_div_or_mod(load_e):
+        return Var(stage_axis.name)
     block_uniform = stage.origin[slab_dim].free_vars()
     if not block_uniform:
         return load_e
@@ -387,6 +413,16 @@ def _reorder_for_layout(
     ]
     scored.sort(key=lambda t: (t[0], t[1]))
     return [entry for _, _, entry in scored]
+
+
+def _has_div_or_mod(e: Expr) -> bool:
+    """Recursively detect ``/`` or ``%`` in an Expr — signature of a
+    layout-transform like a collapsed-reshape view."""
+    if isinstance(e, BinaryExpr):
+        if e.op in ("/", "%"):
+            return True
+        return _has_div_or_mod(e.left) or _has_div_or_mod(e.right)
+    return False
 
 
 def _scale_across_loads(entries: list, slab_dim: int, axis_name: str) -> int | None:

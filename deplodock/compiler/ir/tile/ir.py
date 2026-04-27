@@ -144,6 +144,13 @@ class Stage(Stmt):
     origin: tuple[Expr, ...]
     axes: tuple[Axis, ...]
     slab_dims: tuple[int, ...]
+    # Optional: full reference Load index expressed in cache-axis Vars.
+    # When present, materialization fetches source values by substituting
+    # cache-axis decoded coords into this template — handles non-affine
+    # layouts (``/``, ``%`` from collapsed-reshape views) that can't be
+    # expressed as ``origin[d] + decoded[d]``. None falls back to the
+    # additive ``origin + decoded_per_dim`` path.
+    source_index_template: tuple[Expr, ...] | None = None
 
     def pretty(self, indent: str = "") -> list[str]:
         origin = ", ".join(e.pretty() for e in self.origin)

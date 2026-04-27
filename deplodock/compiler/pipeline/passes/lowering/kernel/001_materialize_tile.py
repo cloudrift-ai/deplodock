@@ -241,9 +241,23 @@ def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
     else:
         coord_for = _flat_decode(stage.axes, iter_axis.name)
 
-    decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
-    source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
     smem_index = tuple(coord_for[ax.name] for ax in stage.axes)
+    if stage.source_index_template is not None:
+        # Non-affine path (``/``, ``%`` from collapsed-reshape views).
+        # Cache extent equals the raw axis extent (no F-scale baked in),
+        # so substituting cache-axis Vars with their iter coords into
+        # the original Load index gives the right source address per
+        # cache position. Affine cases stay on the additive
+        # ``origin + decoded`` path because their cache extent IS scaled
+        # by F, so iter coord directly equals the cache-relative source
+        # position — no need to re-multiply via F.
+        from deplodock.compiler.ir.sigma import Sigma as _Sigma
+
+        cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in stage.axes})
+        source_index = tuple(cache_sigma.apply(e) for e in stage.source_index_template)
+    else:
+        decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
+        source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
 
     load_name = f"{stage.name}_v"
     cooperative_load = StridedLoop(

@@ -144,14 +144,8 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     if extracted is None:
         return None
     accum, raw_a, raw_b, mul = extracted
-    # Reduce-loop loads must be affine in the m / n / k axes (no div /
-    # mod). 004 staging caches Loads by axis affine-scale (`axis*F + lit`);
-    # patterns like ``(a0*N + a2)/D % M`` from collapsed-reshape views
-    # don't fit that shape, and staging silently produces a smem buffer
-    # that doesn't cover the load's address range. Skip — these
-    # workloads run via the cooperative-reduce path instead.
-    if not (_index_is_affine(raw_a.index) and _index_is_affine(raw_b.index)):
-        return None
+    # Reduce-loop loads with ``/`` or ``%`` (from collapsed-reshape
+    # views) are handled by 004's source_index_template path.
     # `_extract_inner` returns the two Loads in body order, which is
     # arbitrary w.r.t. which one carries M vs N. Identify the M-load
     # (index has m.name but not n.name) and the N-load (vice versa).
@@ -258,23 +252,6 @@ def _index_free_vars_set(index) -> set[str]:
     for e in index:
         out |= e.free_vars()
     return out
-
-
-def _index_is_affine(index) -> bool:
-    """True iff every dim of ``index`` is built only from ``+ - *`` over
-    Vars and Literals. ``/`` and ``%`` (from collapsed-reshape views)
-    break 004 staging's affine-scale analysis, so the matmul rule
-    refuses to handle them."""
-    from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-
-    def is_affine(e) -> bool:
-        if isinstance(e, (Var, Literal)):
-            return True
-        if isinstance(e, BinaryExpr) and e.op in ("+", "-", "*"):
-            return is_affine(e.left) and is_affine(e.right)
-        return False
-
-    return all(is_affine(e) for e in index)
 
 
 def _make_renamer(tag: str, produced: set[str]):
