@@ -292,9 +292,17 @@ class BinaryExpr(_ExprOps):
                 return left
             if _is_zero(left):
                 return _make_int_literal(0)
+            if isinstance(right, Literal) and right.dtype == "int" and isinstance(right.value, int) and right.value > 1:
+                decomp = _div_mod_decompose(left, right.value, ctx)
+                if decomp is not None:
+                    return decomp[0]
         elif op == "%":
             if _is_one(right) or _is_zero(left):
                 return _make_int_literal(0)
+            if isinstance(right, Literal) and right.dtype == "int" and isinstance(right.value, int) and right.value > 1:
+                decomp = _div_mod_decompose(left, right.value, ctx)
+                if decomp is not None:
+                    return decomp[1]
         elif op == "&&":
             if _is_truthy(left):
                 return right
@@ -604,6 +612,47 @@ def _fold_binop_literals(op: str, left: Literal, right: Literal) -> Literal:
     if isinstance(folded, int) and both_int:
         return _make_int_literal(folded)
     return Literal(float(folded), "float")
+
+
+def _div_mod_decompose(expr: Expr, n: int, ctx: SimplifyCtx) -> tuple[Expr, Expr] | None:
+    """Try to express ``expr`` as ``n * q + r`` with ``0 <= r < n``, both
+    proven from operand ranges. Used by ``BinaryExpr.simplify`` to fold
+    ``expr / Lit(n)`` → ``q`` and ``expr % Lit(n)`` → ``r`` when the
+    decomposition succeeds; returns ``None`` to signal "give up, keep
+    the original ``/`` or ``%``".
+    Cleans up collapsed-reshape indices like ``((X*N + Y) / N) % M``
+    that compose-indexmaps emits, where range bounds make the div/mod
+    pure strength-reduction.
+    """
+    if isinstance(expr, Literal) and expr.dtype == "int" and isinstance(expr.value, int) and expr.value >= 0:
+        return (_make_int_literal(expr.value // n), _make_int_literal(expr.value % n))
+    if isinstance(expr, BinaryExpr) and expr.op == "*":
+        for k_side, other_side in ((expr.right, expr.left), (expr.left, expr.right)):
+            if not (isinstance(k_side, Literal) and k_side.dtype == "int" and isinstance(k_side.value, int)):
+                continue
+            if k_side.value <= 0 or k_side.value % n != 0:
+                continue
+            rng = other_side.range(ctx)
+            if rng is not None and rng.lo >= 0:
+                q_expr = BinaryExpr("*", other_side, _make_int_literal(k_side.value // n)).simplify(ctx)
+                return (q_expr, _make_int_literal(0))
+    if isinstance(expr, BinaryExpr) and expr.op == "+":
+        L = _div_mod_decompose(expr.left, n, ctx)
+        R = _div_mod_decompose(expr.right, n, ctx)
+        if L is None or R is None:
+            return None
+        ql, rl = L
+        qr, rr = R
+        r_sum = BinaryExpr("+", rl, rr).simplify(ctx)
+        rng = r_sum.range(ctx)
+        if rng is None or rng.lo < 0 or rng.hi >= n:
+            return None
+        q = BinaryExpr("+", ql, qr).simplify(ctx)
+        return (q, r_sum)
+    rng = expr.range(ctx)
+    if rng is not None and rng.lo >= 0 and rng.hi < n:
+        return (_make_int_literal(0), expr)
+    return None
 
 
 def _static_cmp(op: str, la: Interval, lb: Interval) -> bool | None:
