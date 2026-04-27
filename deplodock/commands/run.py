@@ -19,15 +19,24 @@ def register_run_command(subparsers):
     parser.add_argument(
         "--code",
         "-c",
-        required=True,
         help=(
             "Inline Python expression whose last statement is a call (same grammar as "
-            "``compile --code``). Example: 'torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))'."
+            "``compile --code``). Example: 'torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))'. "
+            "Mutually exclusive with --ir."
+        ),
+    )
+    parser.add_argument(
+        "--ir",
+        help=(
+            "Path to a JSON IR dump (any stage: torch / tensor / loop / tile / kernel / cuda). "
+            "The remaining lowering passes are run, then the kernel(s) are executed with random "
+            "inputs and benchmarked. Skips eager accuracy check (no reference model available)."
         ),
     )
     parser.add_argument("--bench", action="store_true", help="Benchmark eager / torch.compile / deplodock and print a comparison table.")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
     parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
     parser.set_defaults(func=handle_run)
@@ -46,6 +55,17 @@ def handle_run(args):
 
     if not torch.cuda.is_available():
         logger.error("CUDA GPU required")
+        sys.exit(1)
+
+    if args.ir is not None:
+        if args.code is not None:
+            logger.error("--ir and --code are mutually exclusive")
+            sys.exit(1)
+        _handle_run_ir(args, CudaBackend, CompilerDump)
+        return
+
+    if args.code is None:
+        logger.error("Either --code or --ir is required")
         sys.exit(1)
 
     info = trace_inline_code(args.code)
@@ -90,6 +110,107 @@ def handle_run(args):
         dump.dump_benchmark(bench)
 
     _print_table(results)
+
+
+def _detect_stage(graph) -> str:
+    """Identify the IR stage by scanning op type names. Returns one of
+    ``torch | tensor | loop | tile | kernel | cuda`` — the highest-stage
+    op present in the graph wins, since lowering produces a graph mixed
+    only briefly during a pass and stable in the post-pass form."""
+    stage_by_op: dict[str, str] = {
+        "CudaOp": "cuda",
+        "KernelOp": "kernel",
+        "TileOp": "tile",
+        "LoopOp": "loop",
+    }
+    order = ["torch", "tensor", "loop", "tile", "kernel", "cuda"]
+    best = "torch"
+    for node in graph.nodes.values():
+        s = stage_by_op.get(type(node.op).__name__)
+        if s and order.index(s) > order.index(best):
+            best = s
+    # Anything that's not Loop/Tile/Kernel/Cuda but is a frontend/tensor
+    # op stays at "torch" — they get rewritten by the frontend passes.
+    return best
+
+
+def _passes_after_stage(stage: str) -> list[str]:
+    """Pipeline tail to run after a graph has reached ``stage``."""
+    from deplodock.compiler.pipeline import (
+        CUDA_PASSES,
+        KERNEL_PASSES,
+        LOOP_PASSES,
+        TENSOR_PASSES,
+        TILE_PASSES,
+    )
+
+    completed = {
+        "torch": [],
+        "tensor": TENSOR_PASSES,
+        "loop": LOOP_PASSES,
+        "tile": TILE_PASSES,
+        "kernel": KERNEL_PASSES,
+        "cuda": CUDA_PASSES,
+    }[stage]
+    return [p for p in CUDA_PASSES if p not in completed]
+
+
+def _handle_run_ir(args, CudaBackend, CompilerDump):
+    """Run path: load JSON IR (any stage), finish lowering, execute, bench."""
+    import json
+    from pathlib import Path
+
+    import numpy as np
+
+    from deplodock.compiler.graph import Graph
+    from deplodock.compiler.ir.base import ConstantOp, InputOp
+    from deplodock.compiler.pipeline import run_pipeline
+
+    path = Path(args.ir)
+    with open(path) as f:
+        data = json.load(f)
+    graph = Graph.from_dict(data)
+
+    stage = _detect_stage(graph)
+    tail = _passes_after_stage(stage)
+    logger.info("Loaded %s IR; running tail passes: %s", stage, tail or "(none)")
+
+    dump = CompilerDump.resolve(args.dump_dir)
+    if dump:
+        dump.dump_input_graph(graph)
+
+    if tail:
+        graph = run_pipeline(graph, tail, dump=dump)
+
+    rng = np.random.default_rng(args.seed)
+    input_data: dict[str, list[float]] = {}
+    for nid, node in graph.nodes.items():
+        if isinstance(node.op, InputOp):
+            shape = tuple(int(d) for d in node.output.shape)
+            input_data[nid] = rng.standard_normal(shape, dtype=np.float32).flatten().tolist()
+        elif isinstance(node.op, ConstantOp):
+            if node.op.value is not None:
+                input_data[nid] = [float(node.op.value)]
+            else:
+                shape = tuple(int(d) for d in node.output.shape)
+                input_data[nid] = (rng.standard_normal(shape, dtype=np.float32) * 0.02).flatten().tolist()
+
+    backend = CudaBackend(debug=args.debug or None, dump=dump)
+    result = backend.run(graph, input_data=input_data)
+    for nid, arr in result.outputs.items():
+        finite = np.isfinite(arr).all()
+        logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
+
+    if not args.bench:
+        return
+
+    bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+    print()
+    print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+    print("-" * 38)
+    print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+    if dump:
+        dump.dump_benchmark(bench)
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):

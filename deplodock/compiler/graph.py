@@ -134,11 +134,14 @@ def _lookup_op_class(name: str) -> type[Op] | None:
     module to avoid pulling them all in at graph import time.
     """
     from deplodock.compiler.ir import base as _base
+    from deplodock.compiler.ir.cuda import ir as _cuda
     from deplodock.compiler.ir.frontend import ir as _frontend
+    from deplodock.compiler.ir.kernel import ir as _kernel
     from deplodock.compiler.ir.loop import ir as _loop
     from deplodock.compiler.ir.tensor import ir as _tensor
+    from deplodock.compiler.ir.tile import ir as _tile
 
-    for module in (_base, _tensor, _frontend, _loop):
+    for module in (_base, _tensor, _frontend, _loop, _tile, _kernel, _cuda):
         cls = getattr(module, name, None)
         if isinstance(cls, type) and issubclass(cls, Op):
             return cls
@@ -204,6 +207,7 @@ def _stmt_eval_scope() -> dict:
         TernaryExpr,
         Var,
     )
+    from deplodock.compiler.ir.kernel.ir import Smem, Sync, TreeHalve
     from deplodock.compiler.ir.stmt import (
         Accum,
         Assign,
@@ -244,6 +248,9 @@ def _stmt_eval_scope() -> dict:
         "Tile": Tile,
         "Stage": Stage,
         "Combine": Combine,
+        "Smem": Smem,
+        "Sync": Sync,
+        "TreeHalve": TreeHalve,
         "ElementwiseImpl": ElementwiseImpl,
         "__builtins__": {},
     }
