@@ -6,11 +6,8 @@ Submodules:
   ``Assign``, ``Accum``, ``Select``, ``SelectBranch``, ``Cond``,
   ``StridedLoop``, ``Stmt``, ``iter_body``, ``map_body``) lives in
   ``ir/stmt.py`` and is re-exported here. Construction runs structural
-  normalization (see :mod:`.normalize`) then validation via
+  normalization (``normalize_body`` in ``ir/stmt.py``) then validation via
   ``__post_init__``.
-- :mod:`.normalize` — pure ``body → body`` passes applied at construction
-  (drop size-1 free axes, canonical free-axis order, pointwise
-  linearization).
 - :mod:`.splicer` — ``splice_*`` helpers used by ``loop/fusion`` to merge
   adjacent ``LoopOp`` pairs.
 

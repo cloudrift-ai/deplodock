@@ -103,7 +103,7 @@ class LoopOp(Op):
         return "\n".join(pretty_body(self.body, indent))
 
     def __post_init__(self) -> None:
-        from deplodock.compiler.ir.loop.normalize import normalize_body
+        from deplodock.compiler.ir.stmt import normalize_body
 
         new_body = normalize_body(self.body)
         if new_body != self.body:

@@ -37,7 +37,7 @@ The compute body is ``Loop`` / ``StridedLoop`` / ``Accum`` / ``Load`` /
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
@@ -53,6 +53,7 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
+from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
@@ -65,6 +66,7 @@ from deplodock.compiler.ir.stmt import (
     StridedLoop,
     Tile,
     Write,
+    _axis_identity,
     pretty_body,
 )
 
@@ -104,6 +106,11 @@ class Combine(Stmt):
 
     name: str
     op: ElementwiseImpl
+
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
+        return Combine(name=rename_ssa(self.name), op=self.op)
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}Combine({self.name}, op={self.op.name})"]
@@ -152,6 +159,16 @@ class Stage(Stmt):
     # additive ``origin + decoded_per_dim`` path.
     source_index_template: tuple[Expr, ...] | None = None
 
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
+        new_origin = tuple(sigma.apply(e) for e in self.origin)
+        new_axes = tuple(axis_fn(a) for a in self.axes)
+        new_template = tuple(sigma.apply(e) for e in self.source_index_template) if self.source_index_template is not None else None
+        return Stage(
+            name=self.name, buf=self.buf, origin=new_origin, axes=new_axes, slab_dims=self.slab_dims, source_index_template=new_template
+        )
+
     def pretty(self, indent: str = "") -> list[str]:
         origin = ", ".join(e.pretty() for e in self.origin)
         slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.slab_dims, strict=True))
@@ -174,6 +191,13 @@ class TileOp(Op):
 
     body: tuple[Stmt, ...] = ()
     name: str = ""
+
+    def __post_init__(self) -> None:
+        from deplodock.compiler.ir.stmt import normalize_body
+
+        new_body = normalize_body(self.body, hoist=False)
+        if new_body != self.body:
+            self.body = new_body
 
     def __iter__(self) -> Iterator[Stmt]:
         return iter_body(self.body)

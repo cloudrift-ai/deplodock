@@ -33,9 +33,7 @@ def test_run_code_matmul_accuracy(run_cli):
 
 @requires_cuda
 def test_run_bench_prints_table(run_cli):
-    rc, stdout, stderr = run_cli(
-        "run", "--code", "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "--bench", "--warmup", "2", "--iters", "5"
-    )
+    rc, stdout, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "--bench", "--warmup", "2", "--iters", "5")
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     assert "Eager PyTorch" in log
