@@ -159,14 +159,95 @@ def _serialize_field(v):
 
 
 def _deserialize_field(k, v):
-    """Reverse of ``_serialize_field``: rehydrate the ``op`` field name back to ``ElementwiseImpl``."""
+    """Reverse of ``_serialize_field``: rehydrate the ``op`` field name
+    back to ``ElementwiseImpl``, and eval Stmt-repr strings (produced by
+    ``json.dumps(..., default=str)`` against dataclass Stmts) back into
+    Stmt instances. The eval scope mirrors the IR's ``__all__`` exports
+    — same classes the Stmt reprs reference."""
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
 
     if k == "op" and isinstance(v, str):
         return ElementwiseImpl(v)
+    if k == "body" and isinstance(v, list) and v and all(isinstance(e, str) for e in v):
+        return tuple(_eval_stmt(e) for e in v)
     if isinstance(v, list):
         return tuple(v)
     return v
+
+
+def _eval_stmt(s: str):
+    scope = _stmt_eval_scope()
+    return eval(s, scope)
+
+
+_STMT_EVAL_SCOPE: dict | None = None
+
+
+def _stmt_eval_scope() -> dict:
+    """Lazy-built eval scope for Stmt-repr strings."""
+    global _STMT_EVAL_SCOPE
+    if _STMT_EVAL_SCOPE is not None:
+        return _STMT_EVAL_SCOPE
+    from deplodock.compiler.ir.axis import (
+        BIND_BLOCK,
+        BIND_THREAD,
+        Axis,
+        BoundAxis,
+    )
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from deplodock.compiler.ir.expr import (
+        BinaryExpr,
+        Builtin,
+        CastExpr,
+        FuncCallExpr,
+        Literal,
+        TernaryExpr,
+        Var,
+    )
+    from deplodock.compiler.ir.stmt import (
+        Accum,
+        Assign,
+        Cond,
+        Init,
+        Load,
+        Loop,
+        Select,
+        SelectBranch,
+        StridedLoop,
+        Tile,
+        Write,
+    )
+    from deplodock.compiler.ir.tile.ir import Combine, Stage
+
+    _STMT_EVAL_SCOPE = {
+        "Axis": Axis,
+        "BoundAxis": BoundAxis,
+        "BIND_BLOCK": BIND_BLOCK,
+        "BIND_THREAD": BIND_THREAD,
+        "Var": Var,
+        "Literal": Literal,
+        "BinaryExpr": BinaryExpr,
+        "Builtin": Builtin,
+        "FuncCallExpr": FuncCallExpr,
+        "TernaryExpr": TernaryExpr,
+        "CastExpr": CastExpr,
+        "Load": Load,
+        "Assign": Assign,
+        "Accum": Accum,
+        "Init": Init,
+        "Write": Write,
+        "Select": Select,
+        "SelectBranch": SelectBranch,
+        "Loop": Loop,
+        "StridedLoop": StridedLoop,
+        "Cond": Cond,
+        "Tile": Tile,
+        "Stage": Stage,
+        "Combine": Combine,
+        "ElementwiseImpl": ElementwiseImpl,
+        "__builtins__": {},
+    }
+    return _STMT_EVAL_SCOPE
 
 
 class Graph:
