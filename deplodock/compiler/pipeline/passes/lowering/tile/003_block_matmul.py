@@ -72,7 +72,7 @@ from deplodock.compiler.ir.axis import (
     Axis,
     BoundAxis,
 )
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import Tile, TileOp
@@ -86,17 +86,35 @@ BM_TG = 16
 BN_TG = 16
 BK = 16
 
-# Per-thread output sub-tile shapes to try, largest first. The rule picks
-# the first ``(TM, TN)`` whose ``BM_TG*TM`` divides M and ``BN_TG*TN``
-# divides N. ``(1, 1)`` is the always-applicable fallback (matches the
-# original one-output-per-thread behavior).
-_SUBTILE_CHOICES = ((4, 4), (2, 4), (4, 2), (2, 2), (1, 2), (2, 1), (1, 1))
+# Per-thread output sub-tile shapes to try, ordered by preference within
+# the target block-count window. ``TM >= TN`` is preferred — microbenchmarks
+# (scripts/sweep_subtile.py) on the 5090 show that tall tiles outperform
+# wide tiles at equal block count and equal TM*TN (e.g. (4,2) beats (2,4)
+# by 25% on the gate_proj shape). ``(1, 1)`` is the always-applicable
+# fallback.
+_SUBTILE_CHOICES = ((4, 2), (2, 1), (4, 4), (2, 2), (2, 4), (1, 2), (1, 1))
 
-# Sub-tiling reduces block count by TM*TN. Below this block-count
-# threshold the SMs sit idle, and the per-thread arithmetic gain doesn't
-# offset occupancy loss. RTX 5090 has ~170 SMs; one wave needs ~170
-# blocks. We keep some headroom so multi-block-per-SM still has work.
-_MIN_BLOCKS = 256
+# Choices used when the M-side load has a non-affine index (collapsed
+# reshape — typical of o_proj fused with attn-output). Such loads bypass
+# the staging rule (``004_stage_inputs``), so each unstaged global read
+# is reused only ``TN`` times; ``TN=1`` means no reuse and tanks perf.
+# We bias toward ``TN >= 2`` and accept fewer blocks (each block has more
+# work). Microbench: (4,2)@128 blocks beats (2,1)@512 by 12% on the
+# attn-out → o_proj+residual shape.
+_SUBTILE_CHOICES_UNSTAGED_M = ((4, 2), (2, 4), (4, 4), (2, 2), (1, 2), (2, 1), (1, 1))
+
+# Sub-tiling reduces block count by TM*TN; we want enough blocks to keep
+# the SMs busy but not so many that per-thread work drops below the point
+# where staging overhead dominates. RTX 5090 has ~170 SMs; the sweep shows
+# 2-4 blocks/SM (~340-700) is the sweet spot. Below ~256 blocks SMs sit
+# idle; above ~700 the per-thread arithmetic gain is gone and we pay
+# launch + smem-staging overhead.
+_TARGET_MIN_BLOCKS = 340  # ~2 blocks per SM on a 5090
+_TARGET_MAX_BLOCKS = 700  # ~4 blocks per SM on a 5090
+_FALLBACK_MIN_BLOCKS = 170  # ~one wave; only used when target window is empty
+# Unstaged-M kernels can run with as few as 128 blocks — each block does
+# more work per output element since the M load isn't reused via smem.
+_UNSTAGED_FALLBACK_MIN_BLOCKS = 128
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -133,19 +151,12 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     if k.extent % BK:
         return None
 
-    subtile = _pick_subtile(m.extent, n.extent)
-    if subtile is None:
-        return None
-    tm, tn = subtile
-    bm_block = BM_TG * tm
-    bn_block = BN_TG * tn
-
     extracted = _extract_inner(reduce_loop)
     if extracted is None:
         return None
     accum, raw_a, raw_b, mul = extracted
     # Reduce-loop loads with ``/`` or ``%`` (from collapsed-reshape
-    # views) are handled by 004's source_index_template path.
+    # views) bypass the affine staging path in ``004_stage_inputs``.
     # `_extract_inner` returns the two Loads in body order, which is
     # arbitrary w.r.t. which one carries M vs N. Identify the M-load
     # (index has m.name but not n.name) and the N-load (vice versa).
@@ -157,6 +168,17 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
         load_a, load_b = raw_b, raw_a
     else:
         return None
+
+    # Sub-tile choice depends on whether the M-load will be staged: a
+    # non-affine index (mod/div) means 004 will skip staging, so each
+    # unstaged global read is reused only TN times — bias toward TN>=2.
+    m_unstaged = _index_has_div_or_mod(load_a.index)
+    subtile = _pick_subtile(m.extent, n.extent, m_unstaged=m_unstaged)
+    if subtile is None:
+        return None
+    tm, tn = subtile
+    bm_block = BM_TG * tm
+    bn_block = BN_TG * tn
     # Update mul.args order to match (load_a, load_b) as well so the
     # downstream Assign(mul + tag) names line up.
     if set(mul.args) != {load_a.name, load_b.name}:
@@ -226,25 +248,73 @@ def _rewrite_tile(tile: Tile) -> Tile | None:
     return Tile(axes=new_axes, body=new_body)
 
 
-def _pick_subtile(m_extent: int, n_extent: int) -> tuple[int, int] | None:
-    """Largest (TM, TN) whose ``BM_TG·TM`` divides M and ``BN_TG·TN``
-    divides N **and** keeps the block grid above ``_MIN_BLOCKS``.
+def _pick_subtile(m_extent: int, n_extent: int, m_unstaged: bool = False) -> tuple[int, int] | None:
+    """Pick (TM, TN) targeting ~2-4 blocks per SM on a 5090, preferring
+    ``TM >= TN`` (tall tiles) at equal block count.
 
-    Sub-tiling shrinks block count by TM·TN; on small-M shapes (e.g.
-    seq=32 prefill) that drops block count below SM count and the
-    occupancy loss outweighs the per-thread arithmetic gain. ``(1, 1)``
-    is the always-applicable fallback.
+    Three-pass selection:
+    1. First choice in the [_TARGET_MIN_BLOCKS, _TARGET_MAX_BLOCKS] window
+       (the order in ``_SUBTILE_CHOICES`` encodes the preference).
+    2. Fallback to any choice with ``block_count >= _TARGET_MIN_BLOCKS``
+       (over-decomposed but still valid).
+    3. Fallback to ``block_count >= _FALLBACK_MIN_BLOCKS`` (one full wave)
+       so small-M shapes like seq=32 still get a tile.
+
+    When the M-side load has a non-affine index (``m_unstaged=True``) the
+    staging rule will skip it; we use ``_SUBTILE_CHOICES_UNSTAGED_M`` to
+    bias toward TN >= 2 (so each unstaged global load amortizes across
+    multiple FMAs) and accept the lower fallback block count.
     """
-    for tm, tn in _SUBTILE_CHOICES:
-        bm = BM_TG * tm
-        bn = BN_TG * tn
-        if m_extent % bm or n_extent % bn:
-            continue
-        block_count = (m_extent // bm) * (n_extent // bn)
-        if block_count < _MIN_BLOCKS and (tm, tn) != (1, 1):
-            continue
-        return tm, tn
-    return None
+    choices = _SUBTILE_CHOICES_UNSTAGED_M if m_unstaged else _SUBTILE_CHOICES
+    fallback_min = _UNSTAGED_FALLBACK_MIN_BLOCKS if m_unstaged else _FALLBACK_MIN_BLOCKS
+
+    def candidates() -> list[tuple[int, int, int]]:
+        out: list[tuple[int, int, int]] = []
+        for tm, tn in choices:
+            bm = BM_TG * tm
+            bn = BN_TG * tn
+            if m_extent % bm or n_extent % bn:
+                continue
+            out.append((tm, tn, (m_extent // bm) * (n_extent // bn)))
+        return out
+
+    cands = candidates()
+    if m_unstaged:
+        # Without staging, each M-load is reused only TN times. Pick the
+        # first choice (in priority order, TN>=2 favored) with enough
+        # blocks for one wave — don't apply the upper window cap, since
+        # over-decomposition (more blocks, smaller per-thread tile) is
+        # exactly the mode that hurts unstaged kernels.
+        for tm, tn, b in cands:
+            if b >= fallback_min:
+                return tm, tn
+        return (1, 1) if any(c[:2] == (1, 1) for c in cands) else None
+    for tm, tn, b in cands:
+        if _TARGET_MIN_BLOCKS <= b <= _TARGET_MAX_BLOCKS:
+            return tm, tn
+    for tm, tn, b in cands:
+        if b >= _TARGET_MIN_BLOCKS:
+            return tm, tn
+    for tm, tn, b in cands:
+        if b >= fallback_min:
+            return tm, tn
+    return (1, 1) if any(c[:2] == (1, 1) for c in cands) else None
+
+
+def _has_div_or_mod(e: Expr) -> bool:
+    """Recursively detect ``/`` or ``%`` in an Expr — signature of a
+    layout-transform like a collapsed-reshape view. Mirrors the same
+    helper in ``004_stage_inputs.py`` since loads with this signature
+    bypass the affine staging path."""
+    if isinstance(e, BinaryExpr):
+        if e.op in ("/", "%"):
+            return True
+        return _has_div_or_mod(e.left) or _has_div_or_mod(e.right)
+    return False
+
+
+def _index_has_div_or_mod(index) -> bool:
+    return any(_has_div_or_mod(e) for e in index)
 
 
 def _index_free_vars_set(index) -> set[str]:
