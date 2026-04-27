@@ -57,10 +57,21 @@ _MAX_UNROLL = 64
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body)
-    if new_body is None:
+    # Iterate to fixpoint within one rewrite() call: nested free Loops
+    # (e.g. matmul sub-tile m_t × n_t) need multiple unroll passes, and
+    # the engine fires in-place rules at most once per node per outer
+    # pass.
+    body = root.op.body
+    changed = False
+    while True:
+        new_body = _maybe_rewrite(body)
+        if new_body is None:
+            break
+        body = new_body
+        changed = True
+    if not changed:
         return None
-    root.op = TileOp(body=new_body, name=root.op.name)
+    root.op = TileOp(body=body, name=root.op.name)
     return None
 
 
@@ -76,14 +87,20 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
 
 
 def _unroll_in_body(body: tuple) -> tuple | None:
-    """Find the innermost unrollable Loop (free or reduce) and unroll it.
-    Returns None when no unroll fires (rule terminates)."""
+    """Find the innermost unrollable free Loop and unroll it. Returns
+    the new body or None if no unroll fires.
+
+    Reduce loops are skipped — unrolling them changes the accumulator
+    structure (single-acc vs many-acc semantics) in ways that interact
+    with downstream Init-placement and small-extent kernels in fragile
+    ways. NVCC handles small reduce-loop unrolls fine on its own.
+    """
     for i, s in enumerate(body):
         if isinstance(s, Loop):
             descended = _unroll_in_body(s.body)
             if descended is not None:
                 return body[:i] + (Loop(axis=s.axis, body=descended),) + body[i + 1 :]
-            if int(s.axis.extent) <= _MAX_UNROLL:
+            if not s.is_reduce and int(s.axis.extent) <= _MAX_UNROLL:
                 unrolled = _unroll(s)
                 if unrolled is not None:
                     return body[:i] + tuple(unrolled) + body[i + 1 :]

@@ -53,15 +53,19 @@ def _matmul_graph() -> Graph:
 
 
 def _softmax_graph() -> Graph:
-    """A 2-axis softmax graph, reduced on axis=1."""
+    """A 2-axis softmax graph, reduced on axis=1.
+
+    K=128 > _MAX_UNROLL so K-loops survive in emitted CUDA; smaller
+    extents would be fully unrolled by the unroll pass.
+    """
     from deplodock.compiler.ir.frontend.ir import SoftmaxOp
 
     g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 128)), node_id="x")
     g.add_node(
         op=SoftmaxOp(axis=-1),
         inputs=["x"],
-        output=Tensor("y", (4, 8)),
+        output=Tensor("y", (4, 128)),
         node_id="y",
     )
     g.inputs = ["x"]
@@ -166,11 +170,11 @@ def test_softmax_runs_on_gpu():
     import math
 
     compiled = CudaBackend().compile(_softmax_graph())
-    x_data = [float(i) for i in range(32)]
+    x_data = [float(i) for i in range(4 * 128)]
     result = CudaBackend().run(compiled, input_data={"x": x_data})
     expected = []
     for row in range(4):
-        row_vals = x_data[row * 8 : (row + 1) * 8]
+        row_vals = x_data[row * 128 : (row + 1) * 128]
         mx = max(row_vals)
         exps = [math.exp(v - mx) for v in row_vals]
         s = sum(exps)
