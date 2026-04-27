@@ -177,6 +177,7 @@ def _to_cuda_kwargs(kwargs):
 
 def _check_accuracy(outputs, eager_out):
     eager_flat = eager_out.detach().cpu().flatten().tolist()
+    failed = False
     for buf_name, arr in outputs.items():
         values = arr.flatten().tolist()
         if any(v != v for v in values):
@@ -187,8 +188,12 @@ def _check_accuracy(outputs, eager_out):
             mean_diff = sum(abs(a - e) for a, e in zip(values, eager_flat, strict=True)) / len(values)
             verdict = "PASS" if max_diff < 1.0 else "FAIL"
             logger.info("Accuracy vs eager: max_diff=%.6f mean_diff=%.6f %s", max_diff, mean_diff, verdict)
+            if verdict == "FAIL":
+                failed = True
         else:
             logger.warning("Output size %d does not match eager %d; skipping accuracy", len(values), len(eager_flat))
+    if failed:
+        sys.exit(1)
 
 
 def _bench_eager(module, args, kwargs, warmup, iters):

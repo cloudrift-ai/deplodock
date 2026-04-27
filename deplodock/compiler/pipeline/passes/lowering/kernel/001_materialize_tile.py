@@ -33,11 +33,11 @@ passes can pattern-match on it.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve
-from deplodock.compiler.ir.stmt import Accum, Init, Load, Loop, Stmt, StridedLoop, Tile, Write, iter_body
-from deplodock.compiler.ir.tile.ir import BLOCK_SIZE, Combine, Stage, TileOp
+from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.tile.ir import Combine, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -77,6 +77,9 @@ def _materialize(blk: Tile) -> Stmt:
     if not thread_axes:
         raise ValueError("Tile must have at least one BIND_THREAD axis")
     tid_expr = _build_linear_tid(thread_axes)
+    n_threads = 1
+    for ba in thread_axes:
+        n_threads *= int(ba.extent)
 
     rename: dict[str, str] = {}
 
@@ -90,10 +93,10 @@ def _materialize(blk: Tile) -> Stmt:
 
     for stmt in body:
         if isinstance(stmt, Stage):
-            new_body.extend(_emit_stage(stmt, tid_expr))
+            new_body.extend(_emit_stage(stmt, tid_expr, n_threads))
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
-            new_body.append(_emit_loop(stmt, tid_expr, transform))
+            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform))
             if stmt.is_reduce:
                 pending_reduce = next(a for a in stmt.body if isinstance(a, Accum))
             else:
@@ -103,7 +106,7 @@ def _materialize(blk: Tile) -> Stmt:
                 raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce loop")
             if pending_reduce.name != stmt.name:
                 raise ValueError(f"Combine({stmt.name!r}) does not match preceding Accum({pending_reduce.name!r})")
-            new_body.extend(_emit_combine(pending_reduce, _single_thread_var(thread_axes)))
+            new_body.extend(_emit_combine(pending_reduce, _single_thread_var(thread_axes), n_threads))
             rename[pending_reduce.name] = f"{pending_reduce.name}_b"
             pending_reduce = None
         else:
@@ -117,7 +120,7 @@ def _materialize(blk: Tile) -> Stmt:
     return Tile(axes=axes, body=tuple(new_body))
 
 
-def _emit_loop(loop, tid_expr, transform) -> Stmt:
+def _emit_loop(loop, tid_expr, n_threads, transform) -> Stmt:
     """Translate a body Loop or StridedLoop. Recurses so nested staging
     / loops / writes inside the body get the same uniform treatment.
     The wrapper type (Loop vs StridedLoop) is preserved — strategies
@@ -125,9 +128,9 @@ def _emit_loop(loop, tid_expr, transform) -> Stmt:
     inner: list[Stmt] = []
     for s in loop.body:
         if isinstance(s, Stage):
-            inner.extend(_emit_stage(s, tid_expr))
+            inner.extend(_emit_stage(s, tid_expr, n_threads))
         elif isinstance(s, (Loop, StridedLoop)):
-            inner.append(_emit_loop(s, tid_expr, transform))
+            inner.append(_emit_loop(s, tid_expr, n_threads, transform))
         else:
             inner.append(transform(s))
     if isinstance(loop, StridedLoop):
@@ -166,7 +169,7 @@ def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
     return expr
 
 
-def _emit_combine(accum: Accum, t: str) -> list[Stmt]:
+def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
     """Emit the cross-thread combine: each thread writes its per-thread
     accumulator partial to smem indexed by ``t``, then a tree-halve
     reduces over ``t`` and broadcasts the final value via a load from
@@ -174,10 +177,10 @@ def _emit_combine(accum: Accum, t: str) -> list[Stmt]:
     smem_name = f"{accum.name}_smem"
     broadcast_name = f"{accum.name}_b"
     return [
-        Smem(name=smem_name, extents=(BLOCK_SIZE,)),
+        Smem(name=smem_name, extents=(n_threads,)),
         Write(output=smem_name, index=(Var(t),), value=accum.name),
         Sync(),
-        TreeHalve(buf=smem_name, op=accum.op, length=BLOCK_SIZE, tid_var=t),
+        TreeHalve(buf=smem_name, op=accum.op, length=n_threads, tid_var=t),
         Sync(),
         Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
     ]
@@ -188,7 +191,7 @@ def _emit_combine(accum: Accum, t: str) -> list[Stmt]:
 # ---------------------------------------------------------------------------
 
 
-def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
+def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     """Expand a ``Stage`` Stmt into ``Smem`` decl + cooperative load + sync.
 
     The cooperative load reads a contiguous slab of ``stage.buf``
@@ -248,7 +251,7 @@ def _emit_stage(stage: Stage, tid_expr) -> list[Stmt]:
     cooperative_load = StridedLoop(
         axis=iter_axis,
         start=tid_expr,
-        step=BLOCK_SIZE,
+        step=Literal(n_threads, "int"),
         body=(
             Load(name=load_name, input=stage.buf, index=source_index),
             Write(output=stage.name, index=smem_index, value=load_name),

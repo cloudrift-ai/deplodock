@@ -13,9 +13,8 @@ a fixed ``_MIN_BLOCKS=256`` floor, which forces (2,2) on N=2048 even when
 
 from __future__ import annotations
 
-import numpy as np
-
 import cupy as cp
+import numpy as np
 
 BM_TG = 16
 BN_TG = 16
@@ -52,19 +51,12 @@ def make_src(M: int, N: int, K: int, tm: int, tn: int, stage_a: bool = True) -> 
     acc_writes = []
     fmas = []
     if stage_a:
-        a_loads = "\n            ".join(
-            f"float ra{i} = X_stage[(ty + {i * BM_TG}) * {BK} + a5];" for i in range(tm)
-        )
+        a_loads = "\n            ".join(f"float ra{i} = X_stage[(ty + {i * BM_TG}) * {BK} + a5];" for i in range(tm))
     else:
         # Unstaged-A: load directly from global, mirroring k_add_3_reduce.
         # Same row across N-cells so the compiler CSEs to TM unique loads/K-step.
-        a_loads = "\n            ".join(
-            f"float ra{i} = X[(blk_m * {bm} + ty + {i * BM_TG}) * {K} + (a4 * {BK} + a5)];"
-            for i in range(tm)
-        )
-    b_loads = "\n            ".join(
-        f"float rb{j} = W_stage[a5 * {bn} + (tx + {j * BN_TG})];" for j in range(tn)
-    )
+        a_loads = "\n            ".join(f"float ra{i} = X[(blk_m * {bm} + ty + {i * BM_TG}) * {K} + (a4 * {BK} + a5)];" for i in range(tm))
+    b_loads = "\n            ".join(f"float rb{j} = W_stage[a5 * {bn} + (tx + {j * BN_TG})];" for j in range(tn))
     for i in range(tm):
         for j in range(tn):
             fmas.append(f"acc{i * tn + j} += ra{i} * rb{j};")
@@ -77,14 +69,19 @@ def make_src(M: int, N: int, K: int, tm: int, tn: int, stage_a: bool = True) -> 
     acc_writes_block = "\n        ".join(acc_writes)
 
     x_stage_decl = f"__shared__ float X_stage[{bm} * {BK}];" if stage_a else ""
-    x_stage_body = "" if not stage_a else f"""
+    x_stage_body = (
+        ""
+        if not stage_a
+        else f"""
         // Stage X: shape ({bm}, {BK}) — {bm * BK // THREADS} elem/thread
         for (int i = threadIdx.x; i < {bm * BK}; i += {THREADS}) {{
             int r = i / {BK};
             int c = i % {BK};
             X_stage[i] = X[(blk_m * {bm} + r) * {K} + (a4 * {BK} + c)];
         }}"""
-    return f"""
+    )
+    return (
+        f"""
 extern "C" __global__
 __launch_bounds__({THREADS}) void k(const float* __restrict__ X,
                                      const float* __restrict__ W,
@@ -113,7 +110,9 @@ __launch_bounds__({THREADS}) void k(const float* __restrict__ X,
     }}
     {acc_writes_block}
 }}
-""", grid
+""",
+        grid,
+    )
 
 
 def bench_kernel(src: str, grid: int, X, W, OUT, warmup=20, iters=200) -> float:
@@ -134,10 +133,7 @@ def bench_kernel(src: str, grid: int, X, W, OUT, warmup=20, iters=200) -> float:
 
 def main():
     print(f"GPU: {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
-    print(
-        f"\n{'shape':<24s} {'M':>4s} {'N':>5s} {'K':>5s}   "
-        f"{'(TM,TN)':>8s} {'blocks':>6s} {'us':>7s} {'GFLOPs':>8s}"
-    )
+    print(f"\n{'shape':<24s} {'M':>4s} {'N':>5s} {'K':>5s}   {'(TM,TN)':>8s} {'blocks':>6s} {'us':>7s} {'GFLOPs':>8s}")
     print("-" * 82)
     rng = np.random.default_rng(0)
     for label, M, N, K, stage_a in SHAPES:
@@ -170,10 +166,7 @@ def main():
             results.append((tm, tn, grid, ms, gflops, tag))
 
         for tm, tn, grid, ms, gflops, tag in results:
-            print(
-                f"{label:<24s} {M:>4d} {N:>5d} {K:>5d}   "
-                f"({tm},{tn})  {grid:>6d} {ms * 1000:>7.1f} {gflops:>8.1f}{tag}"
-            )
+            print(f"{label:<24s} {M:>4d} {N:>5d} {K:>5d}   ({tm},{tn})  {grid:>6d} {ms * 1000:>7.1f} {gflops:>8.1f}{tag}")
         print()
 
 

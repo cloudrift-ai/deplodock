@@ -47,7 +47,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Select, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Select, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
