@@ -1,45 +1,13 @@
-"""Unroll small-extent free Loops nested directly inside a TileOp body.
+"""Unroll free Loops with extent ≤ ``MAX_UNROLL`` into per-cell copies.
 
-Runs after ``004_stage_inputs`` so staging decisions are made on the
-un-unrolled form (one parameterized Load per buffer with its index
-free-vars intact for cache-axis derivation). After staging, this pass
-expands free Loops with extent ≤ ``_MAX_UNROLL`` into literal copies,
-factoring axis-invariant stmts out of the copies (LICM).
+Free-Loop unrolling expands the loop body into ``extent`` copies, each
+with the loop variable substituted by its literal value. Body-defined
+SSA names get a ``_uN`` tag per cell so per-cell intermediates don't
+collide. Stmts that are loop-invariant are emitted once (LICM).
 
-Pre-rewrite::
-
-    Tile(...):
-        ... staged setup ...
-        Loop(j, free, extent=4):
-            Loop(k, reduce):
-                ... j-invariant stmt A ...
-                ... j-dependent stmt B(j) ...
-                Accum(acc)
-            Write[..., j] = acc
-
-Post-rewrite::
-
-    Tile(...):
-        ... staged setup ...
-        Loop(k, reduce):
-            ... j-invariant stmt A (ONCE) ...
-            ... j-dependent stmt B(0) ...
-            Accum(acc_u0)
-            ... j-dependent stmt B(1) ...
-            Accum(acc_u1)
-            ... j-dependent stmt B(2) ...
-            Accum(acc_u2)
-            ... j-dependent stmt B(3) ...
-            Accum(acc_u3)
-        Write[..., 0] = acc_u0
-        Write[..., 1] = acc_u1
-        Write[..., 2] = acc_u2
-        Write[..., 3] = acc_u3
-
-Init scoping is handled by the downstream ``kernel/000_place_inits``
-pass; unrolling produces distinct SSA names per cell, so each cell's
-Init lands at Tile body head and the per-cell accumulators are kept
-separate.
+Reduce loops are handled by ``005_unroll_small_reduce_loops``.
+``Stage`` stmts in the body block unrolling at this level (replicating
+a Stage would duplicate its smem buffer declaration).
 """
 
 from __future__ import annotations
@@ -53,14 +21,10 @@ from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 
-_MAX_UNROLL = 64
+MAX_UNROLL = 64
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
-    # Iterate to fixpoint within one rewrite() call: nested free Loops
-    # (e.g. matmul sub-tile m_t × n_t) need multiple unroll passes, and
-    # the engine fires in-place rules at most once per node per outer
-    # pass.
     body = root.op.body
     changed = False
     while True:
@@ -75,7 +39,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: tuple) -> tuple | None:
+def _maybe_rewrite(body):
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
         return None
@@ -87,42 +51,26 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
 
 
 def _unroll_in_body(body: tuple) -> tuple | None:
-    """Find the innermost unrollable free Loop and unroll it. Returns
-    the new body or None if no unroll fires.
-
-    Reduce loops are skipped — unrolling them changes the accumulator
-    structure (single-acc vs many-acc semantics) in ways that interact
-    with downstream Init-placement and small-extent kernels in fragile
-    ways. NVCC handles small reduce-loop unrolls fine on its own.
-    """
     for i, s in enumerate(body):
         if isinstance(s, Loop):
             descended = _unroll_in_body(s.body)
             if descended is not None:
                 return body[:i] + (Loop(axis=s.axis, body=descended),) + body[i + 1 :]
-            if not s.is_reduce and int(s.axis.extent) <= _MAX_UNROLL:
-                unrolled = _unroll(s)
+            if not s.is_reduce and int(s.axis.extent) <= MAX_UNROLL:
+                unrolled = _unroll(s, exclude_accum=False)
                 if unrolled is not None:
                     return body[:i] + tuple(unrolled) + body[i + 1 :]
     return None
 
 
-def _unroll(loop: Loop) -> list[Stmt] | None:
-    """Unroll loop.body F.extent times with literal substitution and SSA
-    tagging. Pre-computes the F-dependent name set via fixpoint so
-    F-invariant intermediate stmts (their values are the same across all
-    F cells) keep their original SSA names — only F-dep names get tagged.
-    Returns None when the body contains a Stage (replicating a Stage
-    would re-declare its smem buffer with the same name)."""
+def _unroll(loop: Loop, *, exclude_accum: bool) -> list[Stmt] | None:
     if _contains_stage(loop.body):
         return None
-    f_dep_names = _compute_f_dep_names(loop.body, loop.axis.name, exclude_accum=loop.is_reduce)
+    f_dep_names = _compute_f_dep_names(loop.body, loop.axis.name, exclude_accum=exclude_accum)
     return _unroll_at_axis(loop.body, loop.axis.name, int(loop.axis.extent), f_dep_names)
 
 
 def _compute_f_dep_names(body: tuple, f_axis: str, *, exclude_accum: bool) -> set[str]:
-    """Fixpoint: a name is F-dep iff its producing stmt references
-    ``f_axis`` or reads any already-F-dep name."""
     f_deps: set[str] = set()
     changed = True
     while changed:
@@ -139,7 +87,7 @@ def _compute_f_dep_names(body: tuple, f_axis: str, *, exclude_accum: bool) -> se
     return f_deps
 
 
-def _walk_all(body: tuple):
+def _walk_all(body):
     for s in body:
         yield s
         for attr in ("body", "else_body"):
@@ -149,14 +97,6 @@ def _walk_all(body: tuple):
 
 
 def _unroll_at_axis(body: tuple, f_axis: str, extent: int, f_dep_names: set[str]) -> list[Stmt]:
-    """Per stmt:
-
-    - F-invariant non-Loop: emit once unchanged.
-    - F-invariant Loop: emit once unchanged.
-    - F-dependent Loop: recurse (loop-swap pattern — body is unrolled
-      inside the same Loop wrapper at this level).
-    - F-dependent non-Loop: defer to per-cell replication.
-    """
     out: list[Stmt] = []
     pending: list[Stmt] = []
     for s in body:
@@ -207,15 +147,6 @@ def _contains_stage(stmts: tuple) -> bool:
 
 
 def _refs_axis(stmt: Stmt, axis_name: str) -> bool:
-    """True if any Expr in ``stmt`` (or any nested body) references ``axis_name``.
-
-    Inspects each Stmt subtype's Expr-bearing fields:
-
-    - ``Load`` / ``Write``: ``index`` tuple of Exprs.
-    - ``Select``: each branch's ``select`` predicate.
-    - ``Cond``: ``cond`` predicate (its body / else_body recursed below).
-    - ``Stage``: ``origin`` and ``source_index_template`` tuples of Exprs.
-    """
     if isinstance(stmt, Select):
         for b in stmt.branches:
             if axis_name in b.select.free_vars():
@@ -223,9 +154,6 @@ def _refs_axis(stmt: Stmt, axis_name: str) -> bool:
     if isinstance(stmt, Cond):
         if axis_name in stmt.cond.free_vars():
             return True
-    # Stage's Expr fields (origin, source_index_template) — we don't
-    # import Stage at module top because the rule lives outside ir/tile,
-    # so check by attr name instead.
     for attr in ("index", "origin", "source_index_template"):
         val = getattr(stmt, attr, None)
         if val is None:
@@ -249,17 +177,4 @@ def _reads_dep(stmt: Stmt, dep_names: set[str]) -> bool:
     return any(d in dep_names for d in stmt.deps())
 
 
-def _writes(stmt: Stmt, *, exclude_accum: bool = False) -> tuple[str, ...]:
-    if exclude_accum and isinstance(stmt, Accum):
-        return ()
-    name = getattr(stmt, "name", None)
-    if isinstance(name, str):
-        return (name,)
-    out: list[str] = []
-    for attr in ("body", "else_body"):
-        val = getattr(stmt, attr, None)
-        if val is None:
-            continue
-        for child in val:
-            out.extend(_writes(child, exclude_accum=exclude_accum))
-    return tuple(out)
+_ = StridedLoop  # silence ruff
