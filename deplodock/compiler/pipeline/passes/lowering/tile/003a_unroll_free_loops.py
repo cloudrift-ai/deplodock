@@ -91,39 +91,67 @@ def _unroll_in_body(body: tuple) -> tuple | None:
 
 
 def _unroll(loop: Loop) -> list[Stmt] | None:
-    """Replicate ``loop.body`` ``loop.axis.extent`` times, with literal
-    substitution and SSA tagging. F-invariant stmts emit once before
-    the unrolled cells. Returns None when no F-invariant stmts exist
-    (no LICM win — pure code expansion would just bloat the kernel),
-    or when the body contains a Stage (replicating a Stage would
-    re-declare its smem buffer with the same name)."""
-    f_axis = loop.axis.name
-
+    """Unroll loop.body F.extent times with literal substitution and SSA
+    tagging. Pre-computes the F-dependent name set via fixpoint so
+    F-invariant intermediate stmts (their values are the same across all
+    F cells) keep their original SSA names — only F-dep names get tagged.
+    Returns None when the body contains a Stage (replicating a Stage
+    would re-declare its smem buffer with the same name)."""
     if _contains_stage(loop.body):
         return None
+    f_dep_names = _compute_f_dep_names(loop.body, loop.axis.name, exclude_accum=loop.is_reduce)
+    return _unroll_at_axis(loop.body, loop.axis.name, int(loop.axis.extent), f_dep_names)
 
-    # When unrolling a REDUCE loop, the Accum name represents a single
-    # running accumulator shared across all unrolled cells (one reduction
-    # in total). Don't rename it. When unrolling a FREE loop, each cell
-    # is an independent reduction, so the Accum name DOES get renamed
-    # per cell (acc -> acc_u0, acc_u1, ...).
-    f_dep_names: set[str] = set()
-    classified: list[tuple[Stmt, bool]] = []
-    for s in loop.body:
-        is_dep = _refs_axis(s, f_axis) or _reads_dep(s, f_dep_names)
-        classified.append((s, is_dep))
-        if is_dep:
-            for name in _writes(s, exclude_accum=loop.is_reduce):
-                f_dep_names.add(name)
 
-    # Unroll fires unconditionally — F-invariant stmts (when present)
-    # emit once at the front; F-dependent stmts emit ``extent`` copies.
-    # Pure code expansion (no F-invariants) is still useful: NVCC may
-    # schedule the unrolled body better, and downstream passes can do
-    # CSE / register allocation across the unrolled cells.
+def _compute_f_dep_names(body: tuple, f_axis: str, *, exclude_accum: bool) -> set[str]:
+    """Fixpoint: a name is F-dep iff its producing stmt references
+    ``f_axis`` or reads any already-F-dep name."""
+    f_deps: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for s in _walk_all(body):
+            if exclude_accum and isinstance(s, Accum):
+                continue
+            name = getattr(s, "name", None)
+            if not isinstance(name, str) or name in f_deps:
+                continue
+            if _refs_axis(s, f_axis) or _reads_dep(s, f_deps):
+                f_deps.add(name)
+                changed = True
+    return f_deps
 
-    out: list[Stmt] = [s for s, dep in classified if not dep]
-    extent = int(loop.axis.extent)
+
+def _walk_all(body: tuple):
+    for s in body:
+        yield s
+        for attr in ("body", "else_body"):
+            val = getattr(s, attr, None)
+            if val:
+                yield from _walk_all(val)
+
+
+def _unroll_at_axis(body: tuple, f_axis: str, extent: int, f_dep_names: set[str]) -> list[Stmt]:
+    """Per stmt:
+
+    - F-invariant non-Loop: emit once unchanged.
+    - F-invariant Loop: emit once unchanged.
+    - F-dependent Loop: recurse (loop-swap pattern — body is unrolled
+      inside the same Loop wrapper at this level).
+    - F-dependent non-Loop: defer to per-cell replication.
+    """
+    out: list[Stmt] = []
+    pending: list[Stmt] = []
+    for s in body:
+        is_dep = _stmt_is_f_dep(s, f_axis, f_dep_names)
+        if not is_dep:
+            out.append(s)
+        elif isinstance(s, Loop) and not _contains_stage(s.body):
+            inner = _unroll_at_axis(s.body, f_axis, extent, f_dep_names)
+            out.append(Loop(axis=s.axis, body=tuple(inner)))
+        else:
+            pending.append(s)
+
     for i in range(extent):
         sigma = Sigma({f_axis: Literal(i, "int")})
         tag = f"_u{i}"
@@ -131,10 +159,21 @@ def _unroll(loop: Loop) -> list[Stmt] | None:
         def rename(n: str, t: str = tag, deps: set[str] = f_dep_names) -> str:
             return n + t if n in deps else n
 
-        for s, dep in classified:
-            if dep:
-                out.append(s.rewrite(rename, sigma))
+        for s in pending:
+            out.append(s.rewrite(rename, sigma))
     return out
+
+
+def _stmt_is_f_dep(stmt: Stmt, f_axis: str, f_dep_names: set[str]) -> bool:
+    if _refs_axis(stmt, f_axis):
+        return True
+    if _reads_dep(stmt, f_dep_names):
+        return True
+    if isinstance(stmt, Loop):
+        for child in stmt.body:
+            if _stmt_is_f_dep(child, f_axis, f_dep_names):
+                return True
+    return False
 
 
 def _contains_stage(stmts: tuple) -> bool:
