@@ -1,0 +1,62 @@
+{
+  "inputs": [
+    "merged_merged_merged_lift_mul_1"
+  ],
+  "outputs": [
+    "merged_lift_linear_1_reduce"
+  ],
+  "nodes": {
+    "p_attn_k_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_k_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_k_proj_weight",
+        "shape": [
+          256,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_merged_merged_lift_mul_1": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "mul_1",
+        "shape": [
+          1,
+          128,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_lift_linear_1_reduce": {
+      "op": "LoopOp",
+      "op_fields": {
+        "body": [
+          "Loop(axis=Axis(name='a0', extent=128), body=(Loop(axis=Axis(name='a1', extent=256), body=(Loop(axis=Axis(name='a2', extent=2048), body=(Load(name='in0', input='p_attn_k_proj_weight', index=(Var(name='a1'), Var(name='a2'))), Load(name='in1', input='merged_merged_merged_lift_mul_1', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a2'))), Assign(name='v0', op=ElementwiseImpl('multiply'), args=('in1', 'in0')), Accum(name='acc0', value='v0', op=ElementwiseImpl('add')))), Write(output='merged_lift_linear_1_reduce', index=(Literal(value=0, dtype='int'), Var(name='a0'), Literal(value=0, dtype='int'), Var(name='a1')), value='acc0'))),))"
+        ]
+      },
+      "inputs": [
+        "p_attn_k_proj_weight",
+        "merged_merged_merged_lift_mul_1"
+      ],
+      "output": {
+        "name": "linear_1_reduce",
+        "shape": [
+          1,
+          128,
+          1,
+          256
+        ],
+        "dtype": "float32"
+      }
+    }
+  }
+}
