@@ -280,14 +280,22 @@ def _subtile_sigma(m, n, k, m_o, m_i_tg, n_o, n_i_tg, k_o, k_i, bm_block, bn_blo
     """Per-(m_t, n_t) substitution: maps the original m/n/k axis Vars to
     the unrolled thread-and-sub-tile coordinate expression.
 
-    M-coord = m_o * BM_BLOCK + m_i_tg * TM + m_t
-    N-coord = n_o * BN_BLOCK + n_i_tg * TN + n_t
-    K-coord = k_o * BK + k_i
+    Sub-tile cells are *interleaved across threads* (not contiguous):
+
+      M-coord = m_o * BM_BLOCK + m_t * BM_TG + m_i_tg
+      N-coord = n_o * BN_BLOCK + n_t * BN_TG + n_i_tg
+      K-coord = k_o * BK + k_i
+
+    Adjacent threads in a warp differ in the innermost thread axis
+    (``n_i_tg``), giving smem stride 1 instead of TN — eliminates bank
+    conflicts that the contiguous mapping (``n_i_tg * TN + n_t``)
+    introduces. Total output cells covered are identical; only the
+    thread→cell ownership pattern changes.
     """
     return Sigma(
         {
-            m.name: Var(m_o.name) * Literal(bm_block, "int") + Var(m_i_tg.name) * Literal(tm, "int") + Literal(m_t, "int"),
-            n.name: Var(n_o.name) * Literal(bn_block, "int") + Var(n_i_tg.name) * Literal(tn, "int") + Literal(n_t, "int"),
+            m.name: Var(m_o.name) * Literal(bm_block, "int") + Literal(m_t, "int") * Literal(BM_TG, "int") + Var(m_i_tg.name),
+            n.name: Var(n_o.name) * Literal(bn_block, "int") + Literal(n_t, "int") * Literal(BN_TG, "int") + Var(n_i_tg.name),
             k.name: Var(k_o.name) * Literal(BK, "int") + Var(k_i.name),
         }
     )
