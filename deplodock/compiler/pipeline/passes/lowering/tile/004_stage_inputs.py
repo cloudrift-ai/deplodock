@@ -31,7 +31,7 @@ from collections.abc import Iterable
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Load, Loop, Stmt, StridedLoop
 from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
@@ -73,6 +73,11 @@ def _stage_tile(tile: Tile) -> Tile | None:
     """Find each stageable buf, decide its placement + cache axes, insert
     Stages and rewrite Loads."""
     thread_axes_by_name = {ba.axis.name: ba.axis for ba in tile.axes if ba.bind == BIND_THREAD}
+    # Tid decode is row-major over ``tile.thread_axes`` in declaration
+    # order — last axis is innermost (varies fastest within a warp).
+    # The smem layout pass uses this to put the warp-varying cache axis
+    # innermost in the smem buffer, avoiding bank conflicts.
+    thread_axis_order = tuple(ba.axis.name for ba in tile.axes if ba.bind == BIND_THREAD)
 
     # Per buf, gather every Load with its enclosing-loop path.
     loads_per_buf: dict[str, list[tuple[Load, tuple]]] = {}
@@ -82,7 +87,7 @@ def _stage_tile(tile: Tile) -> Tile | None:
     # Decide a Stage for each buf that has reuse.
     plans: list[tuple[str, int, tuple, Stage]] = []
     for buf, entries in loads_per_buf.items():
-        plan = _stage_plan(buf, entries, thread_axes_by_name)
+        plan = _stage_plan(buf, entries, thread_axes_by_name, thread_axis_order)
         if plan is not None:
             plans.append(plan)
 
@@ -132,6 +137,7 @@ def _stage_plan(
     buf: str,
     entries: list[tuple[Load, tuple]],
     thread_axes_by_name: dict[str, Axis],
+    thread_axis_order: tuple[str, ...] = (),
 ) -> tuple[str, int, tuple, Stage] | None:
     """Compute a Stage plan for ``buf``. Returns ``(buf, depth,
     common_loops, stage)`` or None if not stageable.
@@ -180,8 +186,13 @@ def _stage_plan(
         # If any dim has >1 cache axes (e.g. matmul d=0 where a2_o and
         # a2_i both sit at K), skip — deeper placements have fewer
         # below-axes and resolve the conflict.
-        cache_axes: list[Axis] = []
-        slab_dims: list[int] = []
+        # Build cache_axes — every matching axis at every index position
+        # must be cached. Per-axis ``scale`` is the affine multiplier on
+        # the axis across this buf's Loads (1 for non-sub-tile patterns;
+        # TM/TN for the ``axis*F + literal`` patterns sub-tiling emits).
+        # The cache axis extent grows by ``scale`` so the smem buffer
+        # holds the full sub-tile span.
+        raw_cache_entries: list[tuple[Axis, int, int]] = []  # (axis, scale, slab_dim)
         seen: set[str] = set()
         per_dim_count: dict[int, int] = {}
         for dim, e in enumerate(ref_load.index):
@@ -189,13 +200,24 @@ def _stage_plan(
                 if ax_name in cache_axes_names and ax_name not in seen:
                     seen.add(ax_name)
                     ax = thread_axes_by_name.get(ax_name) or below_axes_by_name[ax_name]
-                    cache_axes.append(ax)
-                    slab_dims.append(dim)
+                    scale = _scale_across_loads(entries, dim, ax_name) or 1
+                    raw_cache_entries.append((ax, scale, dim))
                     per_dim_count[dim] = per_dim_count.get(dim, 0) + 1
-        if not cache_axes:
+        if not raw_cache_entries:
             continue
         if any(c > 1 for c in per_dim_count.values()):
             continue  # multi-cache-per-dim — deeper placement will resolve
+
+        # Layout reorder: put the warp-varying cache axis innermost so
+        # adjacent threads in a warp access stride-1 smem (no bank
+        # conflicts). The warp-varying cache axis is the one whose
+        # source-dim's Load expression contains the *innermost* THREAD
+        # axis (last in tile.thread_axes — that's threadIdx.x's low
+        # bits in the row-major tid decode).
+        raw_cache_entries = _reorder_for_layout(raw_cache_entries, ref_load, thread_axis_order)
+
+        cache_axes: list[Axis] = [Axis(name=ax.name, extent=int(ax.extent) * scale) for ax, scale, _ in raw_cache_entries]
+        slab_dims: list[int] = [dim for _, _, dim in raw_cache_entries]
 
         footprint = 1
         for ax in cache_axes:
@@ -204,18 +226,17 @@ def _stage_plan(
             continue
 
         # Build origin: per source dim, the block-uniform anchor =
-        # ref_load.index[d] with all cache-axis Vars substituted to 0.
-        origin_sigma = Sigma({ax.name: Literal(0, "int") for ax in cache_axes})
-        origin = tuple(origin_sigma.apply(e) for e in ref_load.index)
+        # ref_load.index[d] with cache-axis Vars zeroed AND per-load
+        # varying literal offsets stripped (those become part of the
+        # cache coord at each Load site).
+        cache_axis_names = {ax.name for ax in cache_axes}
+        origin = tuple(_canonical_origin(e, cache_axis_names) for e in ref_load.index)
 
-        # Multi-origin guard: with cache-axis Vars zeroed, every Load of
-        # this buf must collapse to the same origin. If different Loads
-        # have differing literal offsets in cache-axis positions (e.g.
-        # ``axis*F + lit`` patterns from per-thread-output sub-tiling
-        # where ``lit`` varies per Load), the cache as sized here can't
-        # represent the full address range. Skip — the rule that emitted
-        # the loads is responsible for staging itself in that case.
-        origins_per_load = {tuple(origin_sigma.apply(e).pretty() for e in ld.index) for ld, _ in entries}
+        # Multi-origin guard: every Load of this buf must reduce to the
+        # same canonical origin (block-uniform vars only). Loads that
+        # differ in block-uniform parts need separate staging — skip
+        # and let a deeper placement resolve it.
+        origins_per_load = {tuple(_canonical_origin(e, cache_axis_names).pretty() for e in ld.index) for ld, _ in entries}
         if len(origins_per_load) > 1:
             continue
 
@@ -307,22 +328,133 @@ def _rewrite_loads(stmt: Stmt, redirects: dict[str, Stage]) -> Stmt:
 
 
 def _smem_coord_for_axis(stage_axis: Axis, slab_dim: int, stage: Stage, load_index: tuple):
-    """Smem coord for one cache axis at a Load site. The slab axis lives
-    in source dim ``slab_dim``; extract its value from ``load_index[slab_dim]``:
+    """Smem coord for one cache axis at a Load site — the cache-relative
+    address (``load_e - origin_at_dim``). Implemented by zeroing every
+    block-uniform Var in the load expression, leaving only cache-local
+    parts:
 
-    - **Same naming** (matmul: load uses the same axis Vars as stage):
-      ``Var(stage_axis.name)`` — already in scope.
-    - **Aliasing** (softmax: load's Var at this dim is differently named
-      e.g. ``a2`` for the cache-axis ``a1``): use the load's Var.
-    - **Affine** (load index is ``outer*F + cache``): strip the
-      block-uniform origin to leave the cache-local coord."""
+    - **Same naming** (matmul, single-output-per-thread: load uses the
+      same axis Vars as stage): collapses to ``Var(stage_axis.name)``.
+    - **Affine sub-tile** (``m_o*BM_BLOCK + m_i_tg*TM + Lit(j)``):
+      collapses to ``m_i_tg*TM + Lit(j)`` — the cache-relative coord
+      including the per-load literal offset.
+    - **Aliasing** (softmax: load uses ``Var(a2)`` while cache axis is
+      ``a1``): falls through to the load's own Var since the stage
+      axis name isn't in the load's free vars."""
     load_e = load_index[slab_dim]
     free = load_e.free_vars()
-    if stage_axis.name in free:
-        return Var(stage_axis.name)
-    if isinstance(load_e, Var):
+    if stage_axis.name not in free:
+        # Aliasing — preserve the existing softmax-style behavior.
+        if isinstance(load_e, Var):
+            return load_e
+        origin_at_dim = stage.origin[slab_dim]
+        non_cache = free - {stage_axis.name} - origin_at_dim.free_vars()
+        sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
+        return sigma.apply(load_e)
+    block_uniform = stage.origin[slab_dim].free_vars()
+    if not block_uniform:
         return load_e
-    origin_at_dim = stage.origin[slab_dim]
-    non_cache = free - {stage_axis.name} - origin_at_dim.free_vars()
-    sigma = Sigma({nc: Literal(0, "int") for nc in non_cache})
-    return sigma.apply(load_e)
+    sigma = Sigma({nc: Literal(0, "int") for nc in block_uniform})
+    return _simplify(sigma.apply(load_e))
+
+
+def _reorder_for_layout(
+    raw_cache_entries: list[tuple[Axis, int, int]],
+    ref_load: Load,
+    thread_axis_order: tuple[str, ...],
+) -> list[tuple[Axis, int, int]]:
+    """Reorder ``cache_axes`` so the warp-varying axis is innermost.
+
+    Within a warp threads vary in the *innermost* THREAD axis (last in
+    ``thread_axis_order``). The cache axis whose source-dim Load
+    expression contains that thread axis is the warp-varying one — its
+    smem stride should be 1 (innermost) to avoid bank conflicts.
+
+    For axes whose Load expressions don't contain the innermost thread
+    axis (e.g. the M side of a matmul where threads share an A row),
+    layout doesn't affect bank-conflict behavior, so we leave their
+    relative order alone."""
+    if not thread_axis_order or len(raw_cache_entries) < 2:
+        return raw_cache_entries
+    inner_thread = thread_axis_order[-1]
+    # Score each cache entry: 1 if its Load expression contains the
+    # innermost thread axis (warp-varying), 0 otherwise. Stable sort
+    # ascending puts non-warp-varying first, warp-varying last.
+    scored = [
+        (0 if inner_thread not in ref_load.index[dim].free_vars() else 1, i, entry)
+        for i, entry in enumerate(raw_cache_entries)
+        for dim in [entry[2]]
+    ]
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [entry for _, _, entry in scored]
+
+
+def _scale_across_loads(entries: list, slab_dim: int, axis_name: str) -> int | None:
+    """Largest affine scale ``F`` consistent with every Load:
+    ``e[slab_dim] = axis_name*F + (block_uniform + per_load_literal)``.
+    Returns ``None`` if any Load doesn't fit the affine pattern, or if
+    Loads disagree on the scale."""
+    scales = set()
+    for load, _ in entries:
+        s = _affine_scale(load.index[slab_dim], axis_name)
+        if s is None:
+            return None
+        scales.add(s)
+    if len(scales) != 1:
+        return None
+    f = scales.pop()
+    return f if f > 0 else None
+
+
+def _affine_scale(e: Expr, axis_name: str) -> int | None:
+    """Coefficient on ``axis_name`` in ``e`` if ``e`` is affine in it.
+
+    AST walk: ``Var(axis_name)`` bare → 1; ``Var(axis_name) * Literal(F)``
+    (or commuted) → F; recursively under ``+`` / ``-``. Returns ``None``
+    if axis appears in a multiplication with a non-Literal or under an
+    op we don't model. Returns 0 if axis doesn't appear at all."""
+    if isinstance(e, Var):
+        return 1 if e.name == axis_name else 0
+    if isinstance(e, Literal):
+        return 0
+    if isinstance(e, BinaryExpr):
+        if e.op == "*":
+            for left, right in ((e.left, e.right), (e.right, e.left)):
+                if isinstance(left, Var) and left.name == axis_name and isinstance(right, Literal):
+                    return int(right.value)
+            if axis_name in e.free_vars():
+                return None
+            return 0
+        if e.op in ("+", "-"):
+            sl = _affine_scale(e.left, axis_name)
+            sr = _affine_scale(e.right, axis_name)
+            if sl is None or sr is None:
+                return None
+            return sl + (sr if e.op == "+" else -sr)
+    if axis_name in e.free_vars():
+        return None
+    return 0
+
+
+def _canonical_origin(e: Expr, cache_axis_names: set[str]) -> Expr:
+    """``e`` with every cache axis zeroed AND any trailing per-load
+    literal offset stripped. The stripped piece becomes part of the
+    cache coord at the Load site, not the block-uniform origin — so
+    canonical origins compare equal across Loads that differ only by
+    per-iteration literal offsets."""
+    zero_sigma = Sigma({n: Literal(0, "int") for n in cache_axis_names})
+    e_zeroed = _simplify(zero_sigma.apply(e))
+    return _strip_trailing_literal(e_zeroed)
+
+
+def _strip_trailing_literal(e: Expr) -> Expr:
+    if isinstance(e, BinaryExpr) and e.op == "+":
+        if isinstance(e.right, Literal):
+            return e.left
+        if isinstance(e.left, Literal):
+            return e.right
+    return e
+
+
+def _simplify(e: Expr) -> Expr:
+    return e.simplify(SimplifyCtx.empty())
