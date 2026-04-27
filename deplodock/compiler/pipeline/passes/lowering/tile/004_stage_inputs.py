@@ -60,8 +60,8 @@ def _maybe_stage(body: tuple) -> tuple | None:
     idx, tile = tiles[0]
     if not tile.block_axes:
         return None  # not cooperative — no smem for staging
-    if any(isinstance(s, Stage) for s in tile.body):
-        return None  # already staged
+    if _any_stage(tile.body):
+        return None  # already staged (anywhere in the body, incl. inside loops)
 
     new_tile = _stage_tile(tile)
     if new_tile is None:
@@ -97,6 +97,22 @@ def _stage_tile(tile: Tile) -> Tile | None:
         new_body = _apply_plan(new_body, buf, depth, common_loops, stage)
 
     return Tile(axes=tile.axes, body=new_body)
+
+
+def _any_stage(stmts: tuple) -> bool:
+    """Recursively detect a ``Stage`` stmt anywhere in the body. Strategies
+    that emit their own Stages (e.g. sub-tiled ``003_block_matmul``)
+    place them inside loops, so a top-level scan misses them and 004
+    would re-stage the staged buffer's Loads."""
+    for s in stmts:
+        if isinstance(s, Stage):
+            return True
+        if isinstance(s, (Loop, StridedLoop, Cond)):
+            if _any_stage(getattr(s, "body", ())):
+                return True
+            if _any_stage(getattr(s, "else_body", ())):
+                return True
+    return False
 
 
 def _walk_loads(stmts: tuple, path: tuple = ()) -> Iterable[tuple[Load, tuple]]:
@@ -191,6 +207,17 @@ def _stage_plan(
         # ref_load.index[d] with all cache-axis Vars substituted to 0.
         origin_sigma = Sigma({ax.name: Literal(0, "int") for ax in cache_axes})
         origin = tuple(origin_sigma.apply(e) for e in ref_load.index)
+
+        # Multi-origin guard: with cache-axis Vars zeroed, every Load of
+        # this buf must collapse to the same origin. If different Loads
+        # have differing literal offsets in cache-axis positions (e.g.
+        # ``axis*F + lit`` patterns from per-thread-output sub-tiling
+        # where ``lit`` varies per Load), the cache as sized here can't
+        # represent the full address range. Skip — the rule that emitted
+        # the loads is responsible for staging itself in that case.
+        origins_per_load = {tuple(origin_sigma.apply(e).pretty() for e in ld.index) for ld, _ in entries}
+        if len(origins_per_load) > 1:
+            continue
 
         stage = Stage(
             name=f"{buf}_stage",
