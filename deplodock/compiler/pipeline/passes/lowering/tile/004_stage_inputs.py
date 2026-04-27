@@ -192,7 +192,7 @@ def _stage_plan(
         # TM/TN for the ``axis*F + literal`` patterns sub-tiling emits).
         # The cache axis extent grows by ``scale`` so the smem buffer
         # holds the full sub-tile span.
-        raw_cache_entries: list[tuple[Axis, int, int]] = []  # (axis, scale, slab_dim)
+        raw_cache_entries: list[tuple[Axis, int, int]] = []  # (axis, cache_extent, slab_dim)
         seen: set[str] = set()
         per_dim_count: dict[int, int] = {}
         for dim, e in enumerate(ref_load.index):
@@ -200,8 +200,10 @@ def _stage_plan(
                 if ax_name in cache_axes_names and ax_name not in seen:
                     seen.add(ax_name)
                     ax = thread_axes_by_name.get(ax_name) or below_axes_by_name[ax_name]
-                    scale = _scale_across_loads(entries, dim, ax_name) or 1
-                    raw_cache_entries.append((ax, scale, dim))
+                    extent = _cache_extent_across_loads(entries, dim, ax_name, int(ax.extent))
+                    if extent is None:
+                        extent = int(ax.extent)
+                    raw_cache_entries.append((ax, extent, dim))
                     per_dim_count[dim] = per_dim_count.get(dim, 0) + 1
         if not raw_cache_entries:
             continue
@@ -216,7 +218,7 @@ def _stage_plan(
         # bits in the row-major tid decode).
         raw_cache_entries = _reorder_for_layout(raw_cache_entries, ref_load, thread_axis_order)
 
-        cache_axes: list[Axis] = [Axis(name=ax.name, extent=int(ax.extent) * scale) for ax, scale, _ in raw_cache_entries]
+        cache_axes: list[Axis] = [Axis(name=ax.name, extent=extent) for ax, extent, _ in raw_cache_entries]
         slab_dims: list[int] = [dim for _, _, dim in raw_cache_entries]
 
         footprint = 1
@@ -423,6 +425,34 @@ def _has_div_or_mod(e: Expr) -> bool:
             return True
         return _has_div_or_mod(e.left) or _has_div_or_mod(e.right)
     return False
+
+
+def _cache_extent_across_loads(entries: list, slab_dim: int, axis_name: str, axis_extent: int) -> int | None:
+    """Cache buffer size needed to hold every distinct value the load
+    can produce when the axis ranges over [0, axis_extent) across all
+    Loads of the buf at this slab dim.
+
+    Computed as ``max_value - min_value + 1`` after zeroing every var
+    other than ``axis_name`` (so block-uniform vars and other cache axes
+    contribute 0). Generalizes both the contiguous sub-tile pattern
+    (``axis*F + lit``, lit in [0, F)) and the interleaved pattern
+    (``lit*BM_TG + axis``, lit in [0, TM)) — both yield ``BM_BLOCK``
+    here without needing to detect which addressing form is in use.
+    """
+    max_at_top: list[int] = []
+    min_at_bottom: list[int] = []
+    for load, _ in entries:
+        e = load.index[slab_dim]
+        non_axis = e.free_vars() - {axis_name}
+        zero_others = Sigma({n: Literal(0, "int") for n in non_axis})
+        e_clean = zero_others.apply(e)
+        e_top = _simplify(e_clean.substitute({axis_name: Literal(axis_extent - 1, "int")}))
+        e_bot = _simplify(e_clean.substitute({axis_name: Literal(0, "int")}))
+        if not (isinstance(e_top, Literal) and isinstance(e_bot, Literal)):
+            return None
+        max_at_top.append(int(e_top.value))
+        min_at_bottom.append(int(e_bot.value))
+    return max(max_at_top) - min(min_at_bottom) + 1
 
 
 def _scale_across_loads(entries: list, slab_dim: int, axis_name: str) -> int | None:
