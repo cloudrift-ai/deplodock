@@ -29,8 +29,10 @@ def _pointwise_add_graph() -> Graph:
 
 
 def _reduce_sum_graph() -> Graph:
+    # K=128 > _MAX_UNROLL so the K loop survives in emitted CUDA;
+    # smaller extents would be fully unrolled by the unroll pass.
     g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 128)), node_id="x")
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("y", (4, 1)), node_id="y")
     g.inputs = ["x"]
     g.outputs = ["y"]
@@ -38,11 +40,12 @@ def _reduce_sum_graph() -> Graph:
 
 
 def _matmul_graph() -> Graph:
+    # K=128 > _MAX_UNROLL so the K loop survives in emitted CUDA.
     from deplodock.compiler.ir.frontend.ir import MatmulOp
 
     g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 8)), node_id="a")
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (8, 4)), node_id="b")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 128)), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (128, 4)), node_id="b")
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (4, 4)), node_id="o")
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
@@ -152,9 +155,9 @@ def test_pointwise_runs_on_gpu():
 @requires_cuda
 def test_reduce_runs_on_gpu():
     compiled = CudaBackend().compile(_reduce_sum_graph())
-    x_data = [float(i) for i in range(32)]
+    x_data = [float(i) for i in range(4 * 128)]
     result = CudaBackend().run(compiled, input_data={"x": x_data})
-    expected = [sum(x_data[row * 8 : (row + 1) * 8]) for row in range(4)]
+    expected = [sum(x_data[row * 128 : (row + 1) * 128]) for row in range(4)]
     assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected)
 
 
@@ -178,12 +181,12 @@ def test_softmax_runs_on_gpu():
 @requires_cuda
 def test_matmul_runs_on_gpu():
     compiled = CudaBackend().compile(_matmul_graph())
-    a_data = [float(i) for i in range(32)]
-    b_data = [float(i) for i in range(32)]
+    a_data = [float(i) for i in range(4 * 128)]
+    b_data = [float(i) for i in range(128 * 4)]
     result = CudaBackend().run(compiled, input_data={"a": a_data, "b": b_data})
     expected = []
     for mi in range(4):
         for ni in range(4):
-            s = sum(a_data[mi * 8 + k] * b_data[k * 4 + ni] for k in range(8))
+            s = sum(a_data[mi * 128 + k] * b_data[k * 4 + ni] for k in range(128))
             expected.append(s)
     assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected)
