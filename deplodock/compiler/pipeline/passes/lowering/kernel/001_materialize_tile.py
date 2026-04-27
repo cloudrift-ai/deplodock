@@ -109,17 +109,11 @@ def _materialize(blk: Tile) -> Stmt:
         else:
             new_body.append(transform(stmt))
 
-    # Hoist Accum inits to Tile scope so nested-reduce shapes (matmul
-    # ``Loop(k_o) > Loop(k_i) > Accum``) don't reset per outer iteration.
-    # Only fires for cooperative tiles — non-cooperative reductions
-    # have one Accum per Loop and the renderer's per-Loop init is
-    # already at the right scope.
-    if any(ba.bind == BIND_BLOCK for ba in axes):
-        inits = _collect_init_stmts(new_body)
-        new_body = [*inits, *new_body]
-
-    # Pass Tile.axes through — strategies committed the launch layout
-    # (THREAD + BLOCK only).
+    # Init scoping for accumulators is handled by the upstream
+    # ``000_place_inits`` pass — explicit ``Init`` Stmts already sit at
+    # the correct scope (Tile body head for reduce-only nesting, inside
+    # a free Loop body when one wraps the Accum). Materialize is purely
+    # mechanical from here.
     return Tile(axes=axes, body=tuple(new_body))
 
 
@@ -148,15 +142,6 @@ def _single_thread_var(thread_axes: tuple) -> str:
     if len(thread_axes) != 1:
         raise ValueError(f"Combine requires a single THREAD axis; got {len(thread_axes)}")
     return thread_axes[0].axis.name
-
-
-def _collect_init_stmts(stmts: list[Stmt]) -> list[Stmt]:
-    """Walk transitively for distinct Accums; return one Init per name."""
-    seen: dict[str, Accum] = {}
-    for s in iter_body(tuple(stmts)):
-        if isinstance(s, Accum):
-            seen.setdefault(s.name, s)
-    return [Init(name=name, op=accum.op) for name, accum in seen.items()]
 
 
 def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
