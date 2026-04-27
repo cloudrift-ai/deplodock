@@ -104,8 +104,22 @@ def _maybe_stage(body):
 
 def _plan(buf: str, entries: list[tuple[Load, tuple]], thread_axes: list[Axis]):
     paths = [path for _, path in entries]
-    common = _common_loop_prefix(paths)
+    full_common = _common_loop_prefix(paths)
 
+    # Try Stage placement one level outward (so the deepest common
+    # loop's axis becomes a candidate cache axis: matmul gets ``K_i``
+    # in cache, RMSNorm-weight gets the output axis). If that ends up
+    # multi-axis-per-source-dim (the cache-axis pattern bare-min can't
+    # decompose), fall back to placing at the full common prefix —
+    # cache ends up thread-axes-only but at least the Stage emits.
+    for common in (full_common[:-1] if full_common else (), full_common):
+        plan = _try_plan(buf, entries, thread_axes, common)
+        if plan is not None:
+            return plan
+    return None
+
+
+def _try_plan(buf: str, entries, thread_axes, common: tuple):
     ref_load = entries[0][0]
 
     # Below-axes: every loop axis past the common prefix, across all loads,
