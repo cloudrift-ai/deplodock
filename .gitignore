@@ -18,20 +18,13 @@ docker-compose.vllm.yml
 nginx.vllm.conf
 
 # PyCharm
-.idea
-
-# Recipe artifacts
-/recipes/**
-
-# Experiment artifacts
-/experiments/**
-
-# Common dump filders
-_test_data/
-dump/
+.idea/*.cubin
 
 # Local environment / secrets
 .env
 .env.local
 .env.*.local
 tests/perf/.results/
+
+# Claude Code per-user local settings (skills/agents under .claude/ are tracked)
+.claude/settings.local.json
