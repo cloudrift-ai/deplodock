@@ -46,10 +46,29 @@ def register_run_command(subparsers):
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
     parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help=(
+            "Increase verbosity. Default (no flag): only the accuracy verdict and (with --bench) "
+            "the timing tables are printed. -v: also tracer messages and pass / per-rule timings. "
+            "-vv: also per-rule application snapshots."
+        ),
+    )
     parser.set_defaults(func=handle_run)
 
 
 def handle_run(args):
+    verbose = getattr(args, "verbose", 0)
+    if verbose == 0:
+        logging.getLogger().setLevel(logging.WARNING)
+    elif verbose == 1:
+        logging.getLogger().setLevel(logging.INFO)
+    else:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     try:
         import torch
     except ImportError:
@@ -496,9 +515,11 @@ def _check_accuracy(outputs, eager_out):
             max_diff = max(abs(a - e) for a, e in zip(values, eager_flat, strict=True))
             mean_diff = sum(abs(a - e) for a, e in zip(values, eager_flat, strict=True)) / len(values)
             verdict = "PASS" if max_diff < 1.0 else "FAIL"
-            logger.info("Accuracy vs eager: max_diff=%.6f mean_diff=%.6f %s", max_diff, mean_diff, verdict)
             if verdict == "FAIL":
+                print(f"Accuracy vs eager: max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} FAIL")
                 failed = True
+            else:
+                logger.info("Accuracy vs eager: max_diff=%.6f mean_diff=%.6f PASS", max_diff, mean_diff)
         else:
             logger.warning("Output size %d does not match eager %d; skipping accuracy", len(values), len(eager_flat))
     if failed:
