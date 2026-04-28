@@ -81,8 +81,12 @@ def register_compile_command(subparsers):
     parser.add_argument(
         "--ir",
         choices=list(_IR_STAGES),
-        default=None,
-        help="Print the requested IR stage to stdout (or --output) and exit. Skips the normal .compiled.json save.",
+        default="cuda",
+        help=(
+            "IR stage to print to stdout (or ``--output``) — defaults to "
+            "``cuda`` (the final lowered stage). Use a lower stage like "
+            "``loop`` / ``tile`` / ``kernel`` to inspect intermediate IRs."
+        ),
     )
     parser.add_argument(
         "--passes",
@@ -140,21 +144,16 @@ def handle_compile(args):
         dump.dump_input_graph(graph)
     result = run_pipeline(graph, passes, dump=dump)
 
-    if args.ir is not None:
-        content = _format_stage(result, args.ir)
-        if args.output:
-            Path(args.output).write_text(content)
-        else:
-            sys.stdout.write(content)
-            if not content.endswith("\n"):
-                sys.stdout.write("\n")
-        return
-
     n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
-    output_path = Path(args.output) if args.output else Path(f"{base_name}.fused.txt")
-    output_path.write_text(result.pretty_print())
-    logger.info("Saved graph: %s", output_path)
+    content = _format_stage(result, args.ir)
+    if args.output:
+        Path(args.output).write_text(content)
+        logger.info("Saved %s IR: %s", args.ir, args.output)
+    else:
+        sys.stdout.write(content)
+        if not content.endswith("\n"):
+            sys.stdout.write("\n")
 
 
 def _resolve_passes(args) -> list[str]:
