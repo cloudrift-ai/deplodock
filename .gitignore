@@ -26,3 +26,6 @@ nginx.vllm.conf
 .env
 .env.local
 .env.*.local
+
+# Claude Code per-user local settings (skills/agents under .claude/ are tracked)
+.claude/settings.local.json
