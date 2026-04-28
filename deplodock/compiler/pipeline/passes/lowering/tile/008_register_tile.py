@@ -41,14 +41,9 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Select, 
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
-from deplodock.compiler.tuning import register_tile_factor
+from deplodock.compiler.tuning import detect_pat, register_tile_factor
 
 PATTERN = [Pattern("root", TileOp)]
-
-# Per-axis thread tile sizes 005_blockify_launch may have produced — the
-# register-tile factor is chosen to fit whichever shape arrived rather
-# than pre-deciding from a heuristic that would diverge across passes.
-_PAT_TO_FACTOR = {32: 4, 16: 2}
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -60,30 +55,18 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
-    import os
-
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
         return None
     idx, tile = tiles[0]
 
-    # Detect whichever PAT 005_blockify_launch landed on by looking for
-    # two THREAD axes with a matching extent in the candidate set. We
-    # follow 005's choice rather than re-running the heuristic on the
-    # already-split tile (post-blockify axis extents == PAT, so the
-    # "every axis ≥ 64" gate would falsely reject).
-    pat: int | None = None
-    for cand in (32, 16):
-        if sum(1 for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == cand) >= 2:
-            pat = cand
-            break
+    # ``detect_pat`` reads whichever PAT 005_blockify_launch landed on
+    # by inspecting THREAD axis extents; ``register_tile_factor`` pairs
+    # F with that PAT through the centralized table in ``tuning``.
+    pat = detect_pat(tile)
     if pat is None:
         return None
-
-    if "DEPLODOCK_F" in os.environ:
-        factor = register_tile_factor(tile)
-    else:
-        factor = _PAT_TO_FACTOR.get(pat, 2)
+    factor = register_tile_factor(tile)
     if factor <= 1 or pat % factor != 0:
         return None
 
