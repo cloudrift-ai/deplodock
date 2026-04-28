@@ -110,6 +110,38 @@ def handle_run(args):
         dump.dump_benchmark(bench)
 
     _print_table(results)
+    _print_kernel_stats(compiled, bench)
+
+
+def _print_kernel_stats(graph, bench):
+    """Per-kernel breakdown. Pulls structural stats off each ``CudaOp``
+    (block / grid / smem) and per-launch timings from ``bench.per_launch``.
+    Prints one row per kernel — quick at-a-glance for spotting which kernel
+    dominates and whether smem / launch geometry looks right."""
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+
+    cuda_nodes = [(nid, node) for nid, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
+    if not cuda_nodes:
+        return
+
+    times_by_idx = {lt.idx: lt.time_ms * 1000 for lt in (bench.per_launch or [])}
+    total_us = bench.time_ms * 1000
+
+    print()
+    print(f"{'Kernel':<48s} {'us':>8s} {'%':>5s} {'grid':>8s} {'block':>6s} {'smem':>6s} {'thr':>5s}")
+    print("-" * 95)
+    for idx, (_, node) in enumerate(cuda_nodes):
+        op = node.op
+        t_us = times_by_idx.get(idx, 0.0)
+        pct = (t_us / total_us * 100) if total_us > 0 else 0.0
+        block_threads = op.block[0] * op.block[1] * op.block[2]
+        grid_total = op.grid[0] * op.grid[1] * op.grid[2]
+        smem_kb = op.smem_bytes / 1024
+        kname = op.kernel_name[:46]
+        print(
+            f"{kname:<48s} {t_us:>8.1f} {pct:>4.1f}% {grid_total:>8d} {block_threads:>6d} {smem_kb:>5.1f}K {block_threads:>5d}"
+        )
+    print(f"{'TOTAL':<48s} {total_us:>8.1f}")
 
 
 def _detect_stage(graph) -> str:
@@ -211,6 +243,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
     if dump:
         dump.dump_benchmark(bench)
+    _print_kernel_stats(graph, bench)
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):
