@@ -43,7 +43,7 @@ from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 
-_PER_AXIS_THREADS = 16
+_PER_AXIS_THREADS = 16  # must match ``005_blockify_launch._PER_AXIS_THREADS``
 _FACTOR = 2  # per-thread tile = F × F
 
 

@@ -107,7 +107,7 @@ def _stage_reduce_loop(
         classified = _classify(stmt, thread_axes, loop.axis, scope_axes)
         if classified is None:
             continue
-        origin, cache_axes, slab_dims = classified
+        origin, cache_axes, slab_dims, template = classified
         n_floats = 1
         for ax in cache_axes:
             n_floats *= int(ax.extent)
@@ -115,10 +115,18 @@ def _stage_reduce_loop(
             continue
         origin_key = tuple(tuple(sorted(t.pretty() for t in _flatten_add(e))) for e in origin)
         cache_key = tuple((ax.name, int(ax.extent)) for ax in cache_axes)
-        key = (stmt.input, origin_key, cache_key, slab_dims)
+        template_key = tuple(e.pretty() for e in template) if template is not None else None
+        key = (stmt.input, origin_key, cache_key, slab_dims, template_key)
         if key not in stages:
             smem_name = _gen_name(stmt.input, used_names)
-            stages[key] = Stage(name=smem_name, buf=stmt.input, origin=origin, axes=cache_axes, slab_dims=slab_dims)
+            stages[key] = Stage(
+                name=smem_name,
+                buf=stmt.input,
+                origin=origin,
+                axes=cache_axes,
+                slab_dims=slab_dims,
+                source_index_template=template,
+            )
         rewrites[stmt.name] = (stages[key].name, tuple(Var(ax.name) for ax in cache_axes))
 
     def replace(s: Stmt) -> Stmt:
@@ -135,7 +143,16 @@ def _classify(
     thread_axes: tuple[Axis, ...],
     reduce_axis: Axis,
     scope_axes: tuple[Axis, ...],
-) -> tuple[tuple[Expr, ...], tuple[Axis, ...], tuple[int, ...]] | None:
+) -> tuple[tuple[Expr, ...], tuple[Axis, ...], tuple[int, ...], tuple[Expr, ...] | None] | None:
+    """Returns (origin, cache_axes, slab_dims, source_index_template).
+
+    The template is non-None when the additive ``origin + Var(cache_axis)``
+    form can't represent the access — typically when multiple cache axes
+    target the same source dim (post-rebalance kernels) or when the affine
+    composition of cache vars in a single dim isn't coefficient-1. Each
+    Load gets its own per-Load slab; a downstream merge pass (planned)
+    can fuse contiguous siblings into a single larger slab.
+    """
     idx = load.index
     candidates_by_name = {ax.name: ax for ax in (*thread_axes, reduce_axis)}
     cache_axes_list: list[Axis] = []
@@ -154,24 +171,36 @@ def _classify(
     for ax in cache_axes_list:
         dims = [d for d, e in enumerate(idx) if ax.name in e.free_vars()]
         if len(dims) != 1:
-            return None
+            return None  # cache var spans multiple dims — can't represent
         var_to_dim[ax.name] = dims[0]
 
     ctx = SimplifyCtx({ax.name: Interval(0, int(ax.extent) - 1) for ax in scope_axes})
     cache_zero = Sigma({ax.name: Literal(0, "int") for ax in cache_axes_list})
     origin = tuple(cache_zero.apply(e).simplify(ctx) for e in idx)
 
-    for ax in cache_axes_list:
-        d = var_to_dim[ax.name]
-        sigma = Sigma({other.name: Literal(0, "int") for other in cache_axes_list if other.name != ax.name})
-        residue = sigma.apply(idx[d]).simplify(ctx)
-        expected = (origin[d] + Var(ax.name)).simplify(ctx)
-        if not _add_terms_equal(residue, expected):
-            return None
-
     cache_axes = tuple(cache_axes_list)
     slab_dims = tuple(var_to_dim[ax.name] for ax in cache_axes)
-    return origin, cache_axes, slab_dims
+
+    # Multi-cache-axis-per-dim → use template path (additive form can only
+    # carry one cache axis per dim because ``decoded_per_dim`` overwrites).
+    needs_template = len(set(slab_dims)) < len(slab_dims)
+
+    # Verify each cache axis contributes exactly ``Var(ax)`` per dim under
+    # the affine-decomposition form. If not, fall back to template too —
+    # this catches non-coefficient-1 residues (e.g. ``a3*2``) that the
+    # additive Stage path can't represent.
+    if not needs_template:
+        for ax in cache_axes_list:
+            d = var_to_dim[ax.name]
+            sigma = Sigma({other.name: Literal(0, "int") for other in cache_axes_list if other.name != ax.name})
+            residue = sigma.apply(idx[d]).simplify(ctx)
+            expected = (origin[d] + Var(ax.name)).simplify(ctx)
+            if not _add_terms_equal(residue, expected):
+                needs_template = True
+                break
+
+    template = tuple(idx) if needs_template else None
+    return origin, cache_axes, slab_dims, template
 
 
 def _flatten_add(e: Expr) -> list[Expr]:

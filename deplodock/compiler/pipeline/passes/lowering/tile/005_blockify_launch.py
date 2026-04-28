@@ -144,8 +144,11 @@ def _partition_threads(tile: Tile) -> Tile | None:
                 new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
             continue
         if ext == _PER_AXIS_THREADS:
-            new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
-            threads_used *= ext
+            if threads_used * ext <= _THREAD_BUDGET:
+                new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
+                threads_used *= ext
+            else:
+                new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
             continue
         # Larger than per-axis tile → split.
         if ext % _PER_AXIS_THREADS != 0:
