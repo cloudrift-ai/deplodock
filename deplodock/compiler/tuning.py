@@ -111,18 +111,22 @@ def _has_matmul_reduce(stmts) -> bool:
 def _is_big_matmul(tile: Tile) -> bool:
     """Tile is a matmul kernel large enough to benefit from PAT=32 / F=4 tiles.
 
-    Every output axis must be ≥ ``_BIG_MATMUL_AXIS_MIN`` so both M and N
-    yield ≥ 2 PAT=32 blocks each — otherwise the grid loses an axis and
-    SM utilization drops below the small-tile config. Block axes are
-    excluded since post-blockify they encode the M_o / N_o split, not
-    the original axis extent.
+    The two **largest** output axes — the matmul's M and N — must both
+    be ≥ ``_BIG_MATMUL_AXIS_MIN``. Any further axes (multi-head /
+    batch / per-token batches) get distributed across BLOCKs and don't
+    constrain the per-CTA tile shape. Empirically: SDPA's masked
+    Q·Kᵀ kernel has axes (heads=32, M=512, N=512); the two largest
+    (512, 512) both fit BIG, so we want PAT=32 even though heads=32
+    is small. Linear at seq=128 has axes (M=128, N=3584); top two are
+    (128, 3584), and M=128 < 256 keeps it on the default path.
     """
     if not _has_matmul_reduce(tile.body):
         return False
-    for ba in tile.axes:
-        ext = int(ba.axis.extent)
-        if ext < _BIG_MATMUL_AXIS_MIN:
-            return False
+    extents = sorted((int(ba.axis.extent) for ba in tile.axes), reverse=True)
+    if len(extents) < 2:
+        return False
+    if extents[0] < _BIG_MATMUL_AXIS_MIN or extents[1] < _BIG_MATMUL_AXIS_MIN:
+        return False
     return True
 
 
@@ -137,13 +141,13 @@ def _is_huge_matmul(tile: Tile) -> bool:
     """
     if not _has_matmul_reduce(tile.body):
         return False
-    extents = sorted(int(ba.axis.extent) for ba in tile.axes)
-    if not extents:
+    extents = sorted((int(ba.axis.extent) for ba in tile.axes), reverse=True)
+    if len(extents) < 2:
         return False
-    # Smallest axis = M, largest = N (a heuristic — matmul kernels post
-    # extent-1 elimination have just two output axes pre-blockify).
-    M = extents[0]
-    N = extents[-1]
+    # The matmul's M and N are the two largest output axes; further
+    # axes are batch / head dims that get block-distributed.
+    N = extents[0]
+    M = extents[1]
     if M < _HUGE_MATMUL_M_MIN or N < _HUGE_MATMUL_N_MIN:
         return False
     return True
