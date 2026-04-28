@@ -149,8 +149,9 @@ planned `ExecutionGroup` can run on at least one supplied host. The dispatcher
 `_run_groups_on_hosts()` routes each group to a compatible idle host (locking per-host so
 each runs at most one group at a time) and calls `run_execution_group(...,
 preallocated_conn=host.conn)` — which skips both `provision_cloud_vm()` and
-`delete_cloud_vm()`, and also skips the docker/NVIDIA-toolkit `provision_remote()` step
-(fixed hosts are assumed to be already set up).
+`delete_cloud_vm()`. `provision_remote()` (Docker, NVIDIA Container Toolkit, optional
+driver/CUDA pinning) still runs and is idempotent, so already-provisioned hosts are a
+fast no-op while bare VMs (e.g. straight from `vm create`) get set up on first use.
 
 ## CLI Command Tree
 

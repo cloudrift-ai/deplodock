@@ -21,3 +21,8 @@ nginx.vllm.conf
 
 # PyCharm
 .idea/*.cubin
+
+# Local environment / secrets
+.env
+.env.local
+.env.*.local

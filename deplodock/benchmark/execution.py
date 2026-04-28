@@ -91,9 +91,9 @@ async def run_execution_group(
             (success or failure). Receives (task, success). Exceptions are
             caught and logged, never propagated.
         preallocated_conn: Optional VMConnectionInfo for a pre-existing host.
-            When provided, cloud provisioning and VM deletion are skipped, and
-            remote provisioning (docker install) is also skipped — the host is
-            assumed to be already set up.
+            When provided, cloud provisioning and VM deletion are skipped.
+            `provision_remote` (Docker, NVIDIA Container Toolkit) still runs;
+            each step is idempotent, so already-provisioned hosts are a no-op.
 
     Returns:
         A tuple of (task_results, instance_info). task_results is a list of
@@ -147,13 +147,14 @@ async def run_execution_group(
 
             instance_id_str = f" (instance_id={conn.delete_info[1]})" if conn.delete_info else ""
             logger.info(f"VM provisioned: {conn.address}:{conn.ssh_port}{instance_id_str}")
-            first_recipe = group.tasks[0].recipe if group.tasks else None
-            host = RemoteHost(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
-            await provision_remote(
-                host,
-                driver_version=first_recipe.deploy.driver_version if first_recipe else None,
-                cuda_version=first_recipe.deploy.cuda_version if first_recipe else None,
-            )
+
+        first_recipe = group.tasks[0].recipe if group.tasks else None
+        host = RemoteHost(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
+        await provision_remote(
+            host,
+            driver_version=first_recipe.deploy.driver_version if first_recipe else None,
+            cuda_version=first_recipe.deploy.cuda_version if first_recipe else None,
+        )
 
         # Collect system info once per execution group
         sysinfo_run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
