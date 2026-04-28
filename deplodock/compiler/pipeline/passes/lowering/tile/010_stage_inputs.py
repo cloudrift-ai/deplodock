@@ -1,14 +1,14 @@
 """Stage frequently-reused external inputs into shared memory.
 
-For each reduce ``Loop`` in the Tile body, examine its external Loads.
-A Load is *stage-worthy* when its index does not reference at least one
-``BIND_THREAD`` axis — meaning multiple threads (across that axis) read
-the same element, so a per-block smem cache eliminates the redundant
-DRAM traffic.
+For each reduce ``Loop`` (or ``StridedLoop`` from cooperative reduce)
+in the Tile body, examine its external Loads. A Load is *stage-worthy*
+when its index does not reference at least one ``BIND_THREAD`` axis —
+meaning multiple threads (across that axis) read the same element, so
+a per-block smem cache eliminates the redundant DRAM traffic.
 
 The pass walks scopes top-down. A "scope" is the Tile body or the body
-of a free ``Loop`` nested inside it. For every reduce Loop sitting
-directly in a scope, classify each Load:
+of a free ``Loop`` nested inside it. For every reduce Loop / StridedLoop
+sitting directly in a scope, classify each Load:
 
 - Cache axes = the thread axes present in the index plus the reduce
   axis. Each cache axis must appear in exactly one source-buffer dim
@@ -38,7 +38,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Load, Loop, Stmt, Tile, iter_body, map_body
+from deplodock.compiler.ir.stmt import Load, Loop, Stmt, StridedLoop, Tile, iter_body, map_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
@@ -84,8 +84,8 @@ def _process_scope(
     for s in scope.body:
         if isinstance(s, Loop) and not s.is_reduce:
             rewritten.append(Loop(axis=s.axis, body=_process_scope(s, thread_axes, (*in_scope_axes, s.axis), used_names)))
-        elif isinstance(s, Loop) and s.is_reduce:
-            rewritten.append(_stage_reduce_loop(s, thread_axes, in_scope_axes, stages, used_names))
+        elif isinstance(s, (Loop, StridedLoop)):
+            rewritten.append(_stage_loop(s, thread_axes, in_scope_axes, stages, used_names))
         else:
             rewritten.append(s)
 
@@ -94,16 +94,29 @@ def _process_scope(
     return tuple([*stages.values(), *rewritten])
 
 
-def _stage_reduce_loop(
-    loop: Loop,
+def _stage_loop(
+    loop: Loop | StridedLoop,
     thread_axes: tuple[Axis, ...],
     in_scope_axes: tuple[Axis, ...],
     stages: dict[tuple, Stage],
     used_names: set[str],
-) -> Loop:
+) -> Loop | StridedLoop:
+    """Stage reusable Loads from a ``Loop`` or ``StridedLoop`` body.
+
+    For regular reduce ``Loop``s the iteration axis is the reduce axis
+    and reuse is "thread axis missing from index" (matmul shape).
+    For ``StridedLoop`` (cooperative-reduce: each thread strides through
+    the iteration axis with step ``BLOCK_SIZE``), the same missing-thread-
+    axis check applies — the cooperative thread axis ``t`` doesn't appear
+    in the load index because the body uses the strided axis directly.
+    Staging caches the row in smem so subsequent StridedLoops in the same
+    scope (e.g. softmax's max / exp-sum / output passes) read from smem
+    instead of DRAM.
+    """
     scope_axes = (*in_scope_axes, loop.axis)
     rewrites: dict[str, tuple[str, tuple[Expr, ...]]] = {}
-    for stmt in loop.loads:
+    body_loads = tuple(s for s in loop.body if isinstance(s, Load))
+    for stmt in body_loads:
         classified = _classify(stmt, thread_axes, loop.axis, scope_axes)
         if classified is None:
             continue
@@ -114,7 +127,11 @@ def _stage_reduce_loop(
         if n_floats > _MAX_SLAB_FLOATS:
             continue
         origin_key = tuple(tuple(sorted(t.pretty() for t in _flatten_add(e))) for e in origin)
-        cache_key = tuple((ax.name, int(ax.extent)) for ax in cache_axes)
+        # Cache axis names differ across sibling reduce loops in cooperative-
+        # reduce kernels (softmax has three StridedLoops with axes a2, a3, a4
+        # all sweeping the same row); key on extent + slab dim so the row
+        # is staged once and shared.
+        cache_key = tuple(int(ax.extent) for ax in cache_axes)
         template_key = tuple(e.pretty() for e in template) if template is not None else None
         key = (stmt.input, origin_key, cache_key, slab_dims, template_key)
         if key not in stages:
@@ -135,7 +152,10 @@ def _stage_reduce_loop(
             return Load(name=s.name, input=smem_name, index=new_index)
         return s
 
-    return Loop(axis=loop.axis, body=map_body(loop.body, replace))
+    new_body = map_body(loop.body, replace)
+    if isinstance(loop, StridedLoop):
+        return StridedLoop(axis=loop.axis, start=loop.start, step=loop.step, body=new_body, unroll=loop.unroll)
+    return Loop(axis=loop.axis, body=new_body, unroll=loop.unroll)
 
 
 def _classify(
