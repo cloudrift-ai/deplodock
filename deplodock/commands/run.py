@@ -33,7 +33,7 @@ def register_run_command(subparsers):
             "inputs and benchmarked. Skips eager accuracy check (no reference model available)."
         ),
     )
-    parser.add_argument("--bench", action="store_true", help="Benchmark eager / torch.compile / deplodock and print a comparison table.")
+    parser.add_argument("--bench", "-b", action="store_true", help="Benchmark eager / torch.compile / deplodock and print a comparison table.")
     parser.add_argument(
         "--profile",
         action="store_true",

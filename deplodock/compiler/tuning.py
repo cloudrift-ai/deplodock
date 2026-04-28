@@ -39,13 +39,19 @@ if TYPE_CHECKING:
 # seq=512 (M=512,N=3584) won 30% on BIG.
 _BIG_MATMUL_AXIS_MIN = 256
 
-# Thresholds for the PAT=64 "huge" tier. M ≥ 256 (M-grid meaningful at
-# 64-rows-per-block), N ≥ 2048 (N has enough 64-wide tiles to saturate).
-# At PAT=64 with BK=16 the smem stage is ~46 KB regardless of K, so
-# there's no K cap — even down_proj-shape (K=18944) wins ~33% over the
-# BIG tier when running stably. Per-shape sweep confirmed.
-_HUGE_MATMUL_M_MIN = 256
+# Thresholds for the PAT=64 "huge" tier. M ≥ 128 (any smaller and
+# M_grid=1 ⇒ no row parallelism), N ≥ 2048 (need enough 64-wide N
+# tiles), M·N ≥ 819 200 (= 200 × 64² ⇒ ≥ 200 CTAs at PAT=64, enough
+# to saturate ~70 SMs over multiple waves and amortize the larger
+# tile's setup cost). At PAT=64 with BK=16 smem fits regardless of K,
+# but the K loop's per-iter overhead means HUGE only wins when the
+# parallel grid is large enough — Qwen MLP gate/up at seq=128
+# (M=128, N=18944, K=3584) hits the rule with grid=592, and goes
+# 2.6× faster than DEFAULT. Down_proj at the same M (M=128, N=3584,
+# K=18944, M·N=459K) misses on M·N — DEFAULT wins. Matches sweep.
+_HUGE_MATMUL_M_MIN = 128
 _HUGE_MATMUL_N_MIN = 2048
+_HUGE_MATMUL_MN_MIN = 819_200
 
 # Default knobs for non-matmul / small kernels.
 _PAT_DEFAULT = 16
@@ -149,6 +155,8 @@ def _is_huge_matmul(tile: Tile) -> bool:
     N = extents[0]
     M = extents[1]
     if M < _HUGE_MATMUL_M_MIN or N < _HUGE_MATMUL_N_MIN:
+        return False
+    if M * N < _HUGE_MATMUL_MN_MIN:
         return False
     return True
 
