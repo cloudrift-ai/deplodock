@@ -134,14 +134,15 @@ def _recurse(stmt: Stmt) -> Stmt:
     own Init placement at their own scope. Same recursive-reduce
     distinction as ``_accums_under_reduces_only``: a Loop that
     transitively wraps an Accum (matmul ``K_o`` chunking) descends
-    without opening a new scope."""
-    if isinstance(stmt, Loop):
+    without opening a new scope. ``StridedLoop`` is treated identically
+    — SDPA's per-output free StridedLoop wraps a free Loop chain plus a
+    Write, so it's not reduce-crossable and must open a scope so the
+    inner Accum's Init lands inside (resetting per-iteration)."""
+    if isinstance(stmt, (Loop, StridedLoop)):
         if _is_reduce_recursive(stmt):
             return replace(stmt, body=tuple(_recurse(c) for c in stmt.body))
-        # Free Loop — its body is its own scope; place Inits there.
+        # Free loop — its body is its own scope; place Inits there.
         return replace(stmt, body=_place_inits_in_scope(stmt.body))
-    if isinstance(stmt, StridedLoop):
-        return replace(stmt, body=tuple(_recurse(c) for c in stmt.body))
     if isinstance(stmt, Cond):
         return Cond(
             cond=stmt.cond,
