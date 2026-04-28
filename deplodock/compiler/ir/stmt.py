@@ -1332,6 +1332,7 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
             axes=stmt.axes,
             slab_dims=stmt.slab_dims,
             source_index_template=new_template,
+            pad=stmt.pad,
         )
     # Assign / Accum / Combine carry only SSA names — no Expr field to simplify.
     return stmt

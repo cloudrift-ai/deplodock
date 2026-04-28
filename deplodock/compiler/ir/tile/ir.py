@@ -158,6 +158,13 @@ class Stage(Stmt):
     # expressed as ``origin[d] + decoded[d]``. None falls back to the
     # additive ``origin + decoded_per_dim`` path.
     source_index_template: tuple[Expr, ...] | None = None
+    # Per-cache-axis extra extent added to the smem allocation (not to the
+    # cooperative-load extent). Empty tuple = no padding. Used by the bank-
+    # conflict pass to break stride-aliased smem layouts: padding dim ``d``
+    # by ``+1`` shifts every higher-stride row by one float, eliminating
+    # 32-way bank conflicts that arise when adjacent threads stride through
+    # power-of-2 multiples of bank width.
+    pad: tuple[int, ...] = ()
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -166,13 +173,20 @@ class Stage(Stmt):
         new_axes = tuple(axis_fn(a) for a in self.axes)
         new_template = tuple(sigma.apply(e) for e in self.source_index_template) if self.source_index_template is not None else None
         return Stage(
-            name=self.name, buf=self.buf, origin=new_origin, axes=new_axes, slab_dims=self.slab_dims, source_index_template=new_template
+            name=self.name,
+            buf=self.buf,
+            origin=new_origin,
+            axes=new_axes,
+            slab_dims=self.slab_dims,
+            source_index_template=new_template,
+            pad=self.pad,
         )
 
     def pretty(self, indent: str = "") -> list[str]:
         origin = ", ".join(e.pretty() for e in self.origin)
         slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.slab_dims, strict=True))
-        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab}))"]
+        pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
+        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}"]
 
 
 # ---------------------------------------------------------------------------

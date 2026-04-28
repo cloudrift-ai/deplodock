@@ -138,9 +138,7 @@ def _print_kernel_stats(graph, bench):
         grid_total = op.grid[0] * op.grid[1] * op.grid[2]
         smem_kb = op.smem_bytes / 1024
         kname = op.kernel_name[:46]
-        print(
-            f"{kname:<48s} {t_us:>8.1f} {pct:>4.1f}% {grid_total:>8d} {block_threads:>6d} {smem_kb:>5.1f}K {block_threads:>5d}"
-        )
+        print(f"{kname:<48s} {t_us:>8.1f} {pct:>4.1f}% {grid_total:>8d} {block_threads:>6d} {smem_kb:>5.1f}K {block_threads:>5d}")
     print(f"{'TOTAL':<48s} {total_us:>8.1f}")
 
 

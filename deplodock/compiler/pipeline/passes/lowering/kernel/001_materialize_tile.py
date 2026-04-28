@@ -218,6 +218,8 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     if not stage.axes:
         raise ValueError(f"Stage {stage.name!r} has no cache axes")
     extents = tuple(int(ax.extent) for ax in stage.axes)
+    pad = stage.pad if stage.pad else (0,) * len(extents)
+    padded_extents = tuple(e + p for e, p in zip(extents, pad, strict=True))
 
     # Iteration axis + per-cache-axis coord. Always synthesize a fresh
     # iter axis name so the cooperative-load ``for`` variable can't
@@ -263,7 +265,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
             Write(output=stage.name, index=smem_index, value=load_name),
         ),
     )
-    return [Sync(), Smem(name=stage.name, extents=extents), cooperative_load, Sync()]
+    return [Sync(), Smem(name=stage.name, extents=padded_extents), cooperative_load, Sync()]
 
 
 def _flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:
