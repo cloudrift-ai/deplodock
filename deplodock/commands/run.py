@@ -34,6 +34,13 @@ def register_run_command(subparsers):
         ),
     )
     parser.add_argument("--bench", action="store_true", help="Benchmark eager / torch.compile / deplodock and print a comparison table.")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="After --bench, re-launch each kernel under ``ncu`` to collect hardware counters "
+        "(SM-active %, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %). Skipped if "
+        "ncu is not on PATH or the user lacks performance-counter permissions.",
+    )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
@@ -111,6 +118,8 @@ def handle_run(args):
 
     _print_table(results)
     _print_kernel_stats(compiled, bench)
+    if args.profile:
+        _run_ncu_profile(args)
 
 
 def _print_kernel_stats(graph, bench):
@@ -214,6 +223,80 @@ def _theoretical_occupancy(regs_per_thread: int, smem_per_block: int, threads_pe
     return min(100.0, 100.0 * active_warps / max_warps)
 
 
+_NCU_RECURSE_GUARD = "DEPLODOCK_NCU_CHILD"
+
+
+def _run_ncu_profile(args):
+    """Re-launch the same ``deplodock run`` invocation under ``ncu`` and
+    pass the detailed-page text output through verbatim. ncu's own
+    per-section breakdown (Speed-of-Light, Occupancy, Memory Workload,
+    Compute Workload, Scheduler Stats, Warp State, Source Counters,
+    plus per-kernel optimization hints) is far richer than any single
+    metric set we'd curate, so we just relay it.
+
+    Spawns one extra subprocess at minimal iter count — ncu's per-launch
+    overhead is huge (10-100×). The ``DEPLODOCK_NCU_CHILD`` env var
+    prevents the profiled child from re-spawning ncu recursively.
+
+    Skipped silently when ``ncu`` is not on PATH. ncu's own stderr is
+    relayed when it fails (typical failure: NVIDIA's perf-counter
+    permission gate)."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    if os.environ.get(_NCU_RECURSE_GUARD):
+        return
+
+    ncu = shutil.which("ncu")
+    if ncu is None:
+        logger.info("ncu not found on PATH; skipping --profile output")
+        return
+
+    env = dict(os.environ)
+    env[_NCU_RECURSE_GUARD] = "1"
+
+    cmd: list[str] = [
+        ncu,
+        "--target-processes",
+        "all",
+        "--set",
+        "detailed",
+        "--page",
+        "details",
+        sys.executable,
+        "-m",
+        "deplodock.deplodock",
+        "run",
+    ]
+    if args.code is not None:
+        cmd.extend(["--code", args.code])
+    elif args.ir is not None:
+        cmd.extend(["--ir", args.ir])
+    # Minimal iters — ncu's overhead means we only want one launch per kernel.
+    cmd.extend(["--warmup", "1", "--iters", "1"])
+
+    print()
+    print("=" * 80)
+    print("ncu --set detailed (per-kernel hardware analysis)")
+    print("=" * 80)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
+    except subprocess.TimeoutExpired:
+        logger.warning("ncu profiling timed out")
+        return
+
+    # ncu writes its analysis to stdout. Relay it directly. If ncu failed,
+    # show stderr too so the user sees the diagnostic.
+    if result.stdout.strip():
+        print(result.stdout)
+    if result.returncode != 0:
+        logger.warning("ncu exit=%d", result.returncode)
+        if result.stderr.strip():
+            print(result.stderr, file=sys.stderr)
+
+
 def _detect_stage(graph) -> str:
     """Identify the IR stage by scanning op type names. Returns one of
     ``torch | tensor | loop | tile | kernel | cuda`` — the highest-stage
@@ -314,6 +397,8 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     if dump:
         dump.dump_benchmark(bench)
     _print_kernel_stats(graph, bench)
+    if args.profile:
+        _run_ncu_profile(args)
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):
