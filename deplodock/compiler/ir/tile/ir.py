@@ -178,6 +178,15 @@ class Stage(Stmt):
     # be set when ``buffer_count > 1``. Typically ``Var(K_outer_axis) %
     # buffer_count``.
     phase: Expr | None = None
+    # When True, the cooperative load uses ``cp.async.cg.shared.global``
+    # (one PTX instruction per thread per element) instead of
+    # ``Load(reg) + Write(smem)``. Saves a register temp and uses the
+    # async DRAM→smem path. Materialize emits a trailing
+    # ``cp.async.commit_group`` + ``cp.async.wait_group(0)`` so the
+    # behavior is synchronous w.r.t. the surrounding ``Sync``. Requires
+    # sm_80+; the async-codegen pass sets this only when the target
+    # supports it.
+    async_load: bool = False
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -195,6 +204,7 @@ class Stage(Stmt):
             pad=self.pad,
             buffer_count=self.buffer_count,
             phase=sigma.apply(self.phase) if self.phase is not None else None,
+            async_load=self.async_load,
         )
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -202,7 +212,8 @@ class Stage(Stmt):
         slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.slab_dims, strict=True))
         pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
         buf = f" buffers={self.buffer_count}@{self.phase.pretty()}" if self.buffer_count > 1 and self.phase is not None else ""
-        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}{buf}"]
+        async_tag = " async" if self.async_load else ""
+        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}{buf}{async_tag}"]
 
 
 # ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ from dataclasses import replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, Sync, TreeHalve
+from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, KernelOp, Smem, Sync, TreeHalve
 from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import Combine, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
@@ -268,6 +268,19 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     else:
         full_extents = padded_extents
         prelude = [Sync()]
+
+    if stage.async_load:
+        cooperative_load = StridedLoop(
+            axis=iter_axis,
+            start=tid_expr,
+            step=Literal(n_threads, "int"),
+            body=(CpAsyncCopy(smem=stage.name, smem_index=smem_index, src=stage.buf, src_index=source_index),),
+        )
+        # Synchronous-style cp.async: commit + wait_group(0) gives the same
+        # ordering as LDG+STS, just with the async DRAM→smem path. The
+        # subsequent Sync stays — wait_group only synchronizes per-thread,
+        # not across the CTA.
+        return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit(), CpAsyncWait(group=0), Sync()]
 
     load_name = f"{stage.name}_v"
     cooperative_load = StridedLoop(

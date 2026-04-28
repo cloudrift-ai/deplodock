@@ -102,6 +102,72 @@ class Sync(Stmt):
 
 
 @dataclass
+class CpAsyncCopy(Stmt):
+    """Issue one ``cp.async.cg.shared.global`` instruction.
+
+    Replaces the per-thread ``Load(reg) + Write(smem)`` pair in cooperative
+    loads on sm_80+. The hardware copies 4 bytes (one fp32) directly from
+    global to shared without a register staging slot, freeing one thread
+    register and removing the LDG → STS dependency.
+
+    Renders to inline PTX. The asm reads the smem address via
+    ``cvta.to.shared.u32`` and the global pointer as a 64-bit value;
+    indices flatten via ``render_index`` against the buffer's declared
+    shape (same as ``Load`` / ``Write``)."""
+
+    smem: str  # destination smem buffer name
+    smem_index: tuple
+    src: str  # source global buffer name
+    src_index: tuple
+
+    def pretty(self, indent: str = "") -> list[str]:
+        smem_idx = ", ".join(e.pretty() for e in self.smem_index)
+        src_idx = ", ".join(e.pretty() for e in self.src_index)
+        return [f"{indent}cp.async {self.smem}[{smem_idx}] <- {self.src}[{src_idx}]"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        from deplodock.compiler.ir.stmt import render_index
+
+        smem_flat = render_index(self.smem, self.smem_index, ctx)
+        src_flat = render_index(self.src, self.src_index, ctx)
+        pad = _pad(ctx.indent)
+        return [
+            f"{pad}{{",
+            f"{pad}    unsigned int _smem_addr = __cvta_generic_to_shared(&{self.smem}[{smem_flat}]);",
+            f'{pad}    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\\n" :: "r"(_smem_addr), "l"(&{self.src}[{src_flat}]));',
+            f"{pad}}}",
+        ]
+
+
+@dataclass
+class CpAsyncCommit(Stmt):
+    """``cp.async.commit_group;`` — finalize the preceding cp.async copies
+    issued by this thread into a commit group. Pairs with
+    ``CpAsyncWait`` to wait for that group to drain."""
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}cp.async.commit_group"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return [f'{_pad(ctx.indent)}asm volatile("cp.async.commit_group;\\n");']
+
+
+@dataclass
+class CpAsyncWait(Stmt):
+    """``cp.async.wait_group N;`` — block this thread until ≤ N cp.async
+    groups remain in flight. ``group=0`` waits for everything (synchronous
+    style); larger values stagger waits for software pipelining."""
+
+    group: int = 0
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}cp.async.wait_group({self.group})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return [f'{_pad(ctx.indent)}asm volatile("cp.async.wait_group {self.group};\\n");']
+
+
+@dataclass
 class TreeHalve(Stmt):
     """Cooperative power-of-two tree reduction over a 1D smem buffer.
 
@@ -199,9 +265,19 @@ class KernelOp(Op):
     @property
     def inputs(self) -> tuple[str, ...]:
         """Distinct ``Load.input`` buf names in body first-use order — the
-        kernel's input parameters. Smem buffers are excluded."""
+        kernel's input parameters. Smem buffers are excluded.
+
+        ``CpAsyncCopy`` stmts also count as global-buffer reads — their
+        ``src`` field names a kernel parameter same as ``Load.input`` does
+        for the synchronous path."""
         smem = self.smem_names
-        return tuple(dict.fromkeys(s.input for s in self.loads if s.input not in smem))
+        names: dict[str, None] = {}
+        for s in self:
+            if isinstance(s, Load) and s.input not in smem:
+                names.setdefault(s.input, None)
+            elif isinstance(s, CpAsyncCopy) and s.src not in smem:
+                names.setdefault(s.src, None)
+        return tuple(names)
 
     @property
     def writes(self) -> tuple[Write, ...]:
@@ -245,6 +321,9 @@ __all__ = [
     "Smem",
     "Sync",
     "TreeHalve",
+    "CpAsyncCopy",
+    "CpAsyncCommit",
+    "CpAsyncWait",
     "StridedLoop",
     # Bindings
     "BoundAxis",
