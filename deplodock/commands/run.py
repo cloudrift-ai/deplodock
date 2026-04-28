@@ -115,9 +115,11 @@ def handle_run(args):
 
 def _print_kernel_stats(graph, bench):
     """Per-kernel breakdown. Pulls structural stats off each ``CudaOp``
-    (block / grid / smem) and per-launch timings from ``bench.per_launch``.
-    Prints one row per kernel — quick at-a-glance for spotting which kernel
-    dominates and whether smem / launch geometry looks right."""
+    (block / grid / smem), per-launch timings from ``bench.per_launch``,
+    and per-kernel hardware attributes from the compiled cupy RawKernels
+    (register count, achieved theoretical occupancy). One row per kernel
+    — quick at-a-glance for spotting which kernel dominates, whether
+    register pressure is killing occupancy, etc."""
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     cuda_nodes = [(nid, node) for nid, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
@@ -126,10 +128,12 @@ def _print_kernel_stats(graph, bench):
 
     times_by_idx = {lt.idx: lt.time_ms * 1000 for lt in (bench.per_launch or [])}
     total_us = bench.time_ms * 1000
+    attrs_by_kname = _collect_kernel_attrs(graph)
+    occ_limits = _occupancy_limits()
 
     print()
-    print(f"{'Kernel':<48s} {'us':>8s} {'%':>5s} {'grid':>8s} {'block':>6s} {'smem':>6s} {'thr':>5s}")
-    print("-" * 95)
+    print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}")
+    print("-" * 90)
     for idx, (_, node) in enumerate(cuda_nodes):
         op = node.op
         t_us = times_by_idx.get(idx, 0.0)
@@ -137,9 +141,77 @@ def _print_kernel_stats(graph, bench):
         block_threads = op.block[0] * op.block[1] * op.block[2]
         grid_total = op.grid[0] * op.grid[1] * op.grid[2]
         smem_kb = op.smem_bytes / 1024
-        kname = op.kernel_name[:46]
-        print(f"{kname:<48s} {t_us:>8.1f} {pct:>4.1f}% {grid_total:>8d} {block_threads:>6d} {smem_kb:>5.1f}K {block_threads:>5d}")
-    print(f"{'TOTAL':<48s} {total_us:>8.1f}")
+        kname = op.kernel_name[:42]
+        attrs = attrs_by_kname.get(op.kernel_name) or {}
+        regs = attrs.get("num_regs", 0)
+        occ_pct = _theoretical_occupancy(regs, op.smem_bytes, block_threads, occ_limits)
+        occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
+        print(f"{kname:<44s} {t_us:>7.1f} {pct:>4.1f}% {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}")
+    print(f"{'TOTAL':<44s} {total_us:>7.1f}")
+
+
+def _collect_kernel_attrs(graph) -> dict[str, dict]:
+    """Compile each kernel via ``cupy.RawKernel`` (cached by source) to
+    pull post-PTXAS hardware attributes — register count, static smem,
+    spill bytes. Returns ``{kernel_name: attrs_dict}``."""
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+
+    try:
+        import cupy as cp
+    except Exception:
+        return {}
+
+    out: dict[str, dict] = {}
+    for _, node in graph.nodes.items():
+        if not isinstance(node.op, CudaOp):
+            continue
+        try:
+            k = cp.RawKernel(node.op.kernel_source, node.op.kernel_name, options=("--use_fast_math",))
+            out[node.op.kernel_name] = dict(k.attributes)
+        except Exception:  # pragma: no cover — environment-dependent
+            continue
+    return out
+
+
+def _occupancy_limits() -> dict | None:
+    """Per-device limits used to estimate theoretical occupancy. ``None``
+    when cupy / CUDA aren't available."""
+    try:
+        import cupy as cp
+
+        dev = cp.cuda.Device()
+        a = dev.attributes
+        return {
+            "max_threads_per_sm": a.get("MaxThreadsPerMultiProcessor", 0),
+            "max_blocks_per_sm": a.get("MaxBlocksPerMultiprocessor", 0),
+            "max_regs_per_sm": a.get("MaxRegistersPerMultiprocessor", 0),
+            "max_smem_per_sm": a.get("MaxSharedMemoryPerMultiprocessor", 0),
+            "warp_size": a.get("WarpSize", 32),
+        }
+    except Exception:
+        return None
+
+
+def _theoretical_occupancy(regs_per_thread: int, smem_per_block: int, threads_per_block: int, limits: dict | None) -> float | None:
+    """Active-warps-per-SM ÷ peak-warps-per-SM × 100. Computed from the
+    static-occupancy limits: register file, shared memory, and per-SM
+    block / thread caps. Doesn't account for the dynamic-only spill +
+    stack overhead but is enough to flag occupancy cliffs (regs > 64
+    drops most consumer GPUs from 100% → 50%, smem > 49KB likewise)."""
+    if not limits or threads_per_block <= 0 or regs_per_thread <= 0:
+        return None
+    warp_size = limits["warp_size"]
+    max_warps = limits["max_threads_per_sm"] // warp_size
+    if max_warps <= 0:
+        return None
+
+    blocks_by_threads = limits["max_threads_per_sm"] // threads_per_block
+    blocks_by_blocks = limits["max_blocks_per_sm"]
+    blocks_by_regs = limits["max_regs_per_sm"] // max(regs_per_thread * threads_per_block, 1)
+    blocks_by_smem = limits["max_smem_per_sm"] // max(smem_per_block, 1) if smem_per_block > 0 else blocks_by_threads
+    active_blocks = max(0, min(blocks_by_threads, blocks_by_blocks, blocks_by_regs, blocks_by_smem))
+    active_warps = active_blocks * (threads_per_block // warp_size)
+    return min(100.0, 100.0 * active_warps / max_warps)
 
 
 def _detect_stage(graph) -> str:
