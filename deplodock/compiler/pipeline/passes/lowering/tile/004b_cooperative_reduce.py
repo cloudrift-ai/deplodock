@@ -42,7 +42,10 @@ Post-rewrite example (softmax)::
 Trigger conditions:
 
 - ``TileOp.body`` contains exactly one ``Tile``.
-- ``Tile.thread_axes`` is 1D and ``block_axes`` is empty (idempotence).
+- ``Tile.thread_axes`` is non-empty and ``block_axes`` is empty
+  (idempotence). Multi-axis output tiles (e.g. softmax over the last
+  dim of a 4D tensor) are handled by promoting all existing thread
+  axes to ``BIND_BLOCK`` alongside the synthetic cooperative ``t``.
 - ``Tile.body`` contains at least one reduce ``Loop`` whose immediate
   body has exactly one ``Accum``.
 - The first reduce Loop's axis extent ≥ ``BLOCK_SIZE``.
@@ -89,7 +92,7 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
 
 
 def _rewrite_block(blk: Tile) -> Tile | None:
-    if len(blk.thread_axes) != 1:
+    if not blk.thread_axes:
         return None
 
     reduce_loops = [loop for loop in blk.loops if loop.is_reduce]
