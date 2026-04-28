@@ -39,7 +39,7 @@ from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, KernelOp, Smem, Sync, TreeHalve
 from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, StridedLoop, Tile, Write
-from deplodock.compiler.ir.tile.ir import Combine, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import AsyncWait, Combine, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -92,13 +92,28 @@ def _materialize(blk: Tile) -> Stmt:
 
     new_body: list[Stmt] = []
     pending_reduce: Accum | None = None
+    declared_smem: set[str] = set()
+
+    def filter_emit(stmts: list[Stmt]) -> list[Stmt]:
+        out: list[Stmt] = []
+        for s in stmts:
+            if isinstance(s, Smem):
+                if s.name in declared_smem:
+                    continue
+                declared_smem.add(s.name)
+            out.append(s)
+        return out
 
     for stmt in body:
         if isinstance(stmt, Stage):
-            new_body.extend(_emit_stage(stmt, tid_expr, n_threads))
+            new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
+            pending_reduce = None
+        elif isinstance(stmt, AsyncWait):
+            new_body.append(CpAsyncWait(group=stmt.remaining))
+            new_body.append(Sync())
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
-            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform))
+            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit))
             if stmt.is_reduce:
                 # Combine matching needs the Accum at the immediate-body
                 # level (single-loop reduce). For nested-reduce shapes
@@ -128,17 +143,25 @@ def _materialize(blk: Tile) -> Stmt:
     return Tile(axes=axes, body=tuple(new_body))
 
 
-def _emit_loop(loop, tid_expr, n_threads, transform) -> Stmt:
+def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
     """Translate a body Loop or StridedLoop. Recurses so nested staging
     / loops / writes inside the body get the same uniform treatment.
     The wrapper type (Loop vs StridedLoop) is preserved — strategies
-    decided the iteration shape; materialization just walks."""
+    decided the iteration shape; materialization just walks.
+
+    ``filter_emit`` dedupes ``Smem`` decls by name across the whole
+    KernelOp body — pipelined Stages share a buffer name with their
+    prologue counterparts, and only the first decl should reach the
+    rendered kernel."""
     inner: list[Stmt] = []
     for s in loop.body:
         if isinstance(s, Stage):
-            inner.extend(_emit_stage(s, tid_expr, n_threads))
+            inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads)))
+        elif isinstance(s, AsyncWait):
+            inner.append(CpAsyncWait(group=s.remaining))
+            inner.append(Sync())
         elif isinstance(s, (Loop, StridedLoop)):
-            inner.append(_emit_loop(s, tid_expr, n_threads, transform))
+            inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit))
         else:
             inner.append(transform(s))
     return replace(loop, body=tuple(inner))
@@ -276,10 +299,10 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
             step=Literal(n_threads, "int"),
             body=(CpAsyncCopy(smem=stage.name, smem_index=smem_index, src=stage.buf, src_index=source_index),),
         )
-        # Synchronous-style cp.async: commit + wait_group(0) gives the same
-        # ordering as LDG+STS, just with the async DRAM→smem path. The
-        # subsequent Sync stays — wait_group only synchronizes per-thread,
-        # not across the CTA.
+        # Pipelined: only commit; a sibling AsyncWait drains older groups
+        # later. Synchronous-style: commit + wait_group(0) + Sync inline.
+        if stage.pipelined:
+            return [Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit()]
         return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit(), CpAsyncWait(group=0), Sync()]
 
     load_name = f"{stage.name}_v"

@@ -91,6 +91,32 @@ from deplodock.compiler.ir.stmt import (
 
 
 @dataclass
+class AsyncWait(Stmt):
+    """Wait for outstanding ``cp.async`` groups to drain past
+    ``remaining`` (i.e. block until at most ``remaining`` async groups
+    are still in flight) and barrier the CTA.
+
+    Materialization emits ``CpAsyncWait(remaining)`` followed by
+    ``Sync()``. The wait is per-thread (drains *this* thread's queue);
+    the Sync makes the freshly-loaded smem visible to all threads in
+    the CTA before any of them reads it.
+
+    Used by the software-pipeline pass to express "compute on chunk N
+    can begin once chunk N's load completes, but chunk N+1's load is
+    allowed to remain outstanding"."""
+
+    remaining: int = 0
+
+    def rewrite(
+        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
+    ) -> Stmt:
+        return AsyncWait(remaining=self.remaining)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}AsyncWait(remaining={self.remaining})"]
+
+
+@dataclass
 class Combine(Stmt):
     """Cross-thread reduction of an ``Accum`` target.
 
@@ -187,6 +213,13 @@ class Stage(Stmt):
     # sm_80+; the async-codegen pass sets this only when the target
     # supports it.
     async_load: bool = False
+    # When True, this Stage participates in a software-pipelined
+    # K-outer loop: the cooperative load is issued + committed but
+    # *not* waited on. A surrounding ``AsyncWait`` Stmt (typically with
+    # ``remaining = buffer_count - 1``) drains older groups while the
+    # current iteration's load stays in flight, overlapping DRAM with
+    # FMA. Only meaningful when ``async_load`` is also set.
+    pipelined: bool = False
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -205,6 +238,7 @@ class Stage(Stmt):
             buffer_count=self.buffer_count,
             phase=sigma.apply(self.phase) if self.phase is not None else None,
             async_load=self.async_load,
+            pipelined=self.pipelined,
         )
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -213,7 +247,8 @@ class Stage(Stmt):
         pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
         buf = f" buffers={self.buffer_count}@{self.phase.pretty()}" if self.buffer_count > 1 and self.phase is not None else ""
         async_tag = " async" if self.async_load else ""
-        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}{buf}{async_tag}"]
+        pipe_tag = " pipelined" if self.pipelined else ""
+        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}{buf}{async_tag}{pipe_tag}"]
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +355,7 @@ __all__ = [
     "Tile",
     "Combine",
     "Stage",
+    "AsyncWait",
     # Bindings
     "BoundAxis",
     "BIND_THREAD",

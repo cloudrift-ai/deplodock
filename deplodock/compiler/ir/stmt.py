@@ -1336,6 +1336,7 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
             buffer_count=stmt.buffer_count,
             phase=stmt.phase.simplify(ctx) if stmt.phase is not None else None,
             async_load=stmt.async_load,
+            pipelined=stmt.pipelined,
         )
     # Assign / Accum / Combine carry only SSA names — no Expr field to simplify.
     return stmt
