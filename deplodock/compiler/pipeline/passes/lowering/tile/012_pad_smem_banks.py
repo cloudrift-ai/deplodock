@@ -64,6 +64,14 @@ PATTERN = [Pattern("root", TileOp)]
 
 WARP_SIZE = 32
 BANKS = 32  # 32 banks of 4 bytes
+# Per-Stage padded-slab budget. The static-smem cap on consumer Ada/Hopper
+# is 48 KB = 12288 floats. Stages get double-buffered downstream (×2) and
+# typical matmul kernels have ≥ 2 sibling Stages, so per-Stage pre-DB
+# budget is roughly cap / 4 → 3072. We give a slightly larger headroom
+# (5120) so single-large-Stage kernels still benefit, and accept that a
+# matmul with two near-equal Stages may miss the perfect-fix candidate
+# and fall back to the partial-fix pad.
+_MAX_PADDED_SLAB_FLOATS = 5 * 1024
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -126,37 +134,56 @@ def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> 
     if base_conflict <= 1:
         return None
 
-    # Try +1 padding on each dim, innermost-first (most likely to be the
-    # right granularity).
+    # Try +1 padding combinations, smallest-pad-first. Single-dim pads
+    # (n options) before pair-dim pads (n*(n-1)/2 options). Stop at the
+    # first conflict-free configuration.
+    candidates: list[tuple[int, ...]] = []
+    # 1-dim: prefer innermost-first (likely the right granularity).
     for dim in range(n - 1, -1, -1):
-        pad = list(no_pad)
+        pad = [0] * n
         pad[dim] = 1
+        candidates.append(tuple(pad))
+    # 2-dim: every unordered pair.
+    for d1 in range(n):
+        for d2 in range(d1 + 1, n):
+            pad = [0] * n
+            pad[d1] = 1
+            pad[d2] = 1
+            candidates.append(tuple(pad))
+
+    best_pad = no_pad
+    best_c = base_conflict
+    for pad in candidates:
         padded = tuple(e + p for e, p in zip(base_extents, pad, strict=True))
+        slab_floats = 1
+        for e in padded:
+            slab_floats *= e
+        if slab_floats > _MAX_PADDED_SLAB_FLOATS:
+            continue
         c = _max_conflict(loads, padded, thread_axes)
         if c <= 1:
-            logger.info("Stage %s: %d-way bank conflict → 1-way after pad on dim %d", stage.name, base_conflict, dim)
-            return dc_replace(stage, pad=tuple(pad))
-
-    # No single +1 fully resolved; report the residual.
-    best_dim, best_c = -1, base_conflict
-    for dim in range(n):
-        pad = list(no_pad)
-        pad[dim] = 1
-        padded = tuple(e + p for e, p in zip(base_extents, pad, strict=True))
-        c = _max_conflict(loads, padded, thread_axes)
+            n_pad_dims = sum(1 for p in pad if p)
+            logger.info(
+                "Stage %s: %d-way bank conflict → 1-way after %d-dim pad %s",
+                stage.name,
+                base_conflict,
+                n_pad_dims,
+                pad,
+            )
+            return dc_replace(stage, pad=pad)
         if c < best_c:
-            best_dim, best_c = dim, c
+            best_c = c
+            best_pad = pad
+
     if best_c < base_conflict:
         logger.warning(
-            "Stage %s: %d-way bank conflict; partial fix on dim %d → %d-way (no perfect padding found)",
+            "Stage %s: %d-way bank conflict; partial fix → %d-way with pad %s (no perfect fix found)",
             stage.name,
             base_conflict,
-            best_dim,
             best_c,
+            best_pad,
         )
-        pad = list(no_pad)
-        pad[best_dim] = 1
-        return dc_replace(stage, pad=tuple(pad))
+        return dc_replace(stage, pad=best_pad)
     logger.warning("Stage %s: %d-way bank conflict; no padding fix found", stage.name, base_conflict)
     return None
 
