@@ -165,6 +165,19 @@ class Stage(Stmt):
     # 32-way bank conflicts that arise when adjacent threads stride through
     # power-of-2 multiples of bank width.
     pad: tuple[int, ...] = ()
+    # Number of distinct smem buffers allocated for this Stage. ``1`` is the
+    # ordinary single-buffer form. ``> 1`` enables ping-pong: each iteration
+    # of the surrounding K-outer loop writes to slab ``[phase, ...]`` and
+    # reads from the same. With ``buffer_count == 2`` and ``phase`` set to
+    # an expression like ``a5 % 2``, consecutive iterations write to
+    # different physical buffers, eliminating the leading
+    # ``__syncthreads`` between prev-compute and next-load (because
+    # they target different memory regions).
+    buffer_count: int = 1
+    # Expression naming the phase index for double-buffered Stages. Must
+    # be set when ``buffer_count > 1``. Typically ``Var(K_outer_axis) %
+    # buffer_count``.
+    phase: Expr | None = None
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -180,13 +193,16 @@ class Stage(Stmt):
             slab_dims=self.slab_dims,
             source_index_template=new_template,
             pad=self.pad,
+            buffer_count=self.buffer_count,
+            phase=sigma.apply(self.phase) if self.phase is not None else None,
         )
 
     def pretty(self, indent: str = "") -> list[str]:
         origin = ", ".join(e.pretty() for e in self.origin)
         slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.slab_dims, strict=True))
         pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
-        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}"]
+        buf = f" buffers={self.buffer_count}@{self.phase.pretty()}" if self.buffer_count > 1 and self.phase is not None else ""
+        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}{buf}"]
 
 
 # ---------------------------------------------------------------------------

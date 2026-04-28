@@ -1333,6 +1333,8 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
             slab_dims=stmt.slab_dims,
             source_index_template=new_template,
             pad=stmt.pad,
+            buffer_count=stmt.buffer_count,
+            phase=stmt.phase.simplify(ctx) if stmt.phase is not None else None,
         )
     # Assign / Accum / Combine carry only SSA names — no Expr field to simplify.
     return stmt

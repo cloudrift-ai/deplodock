@@ -255,6 +255,20 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
         source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
 
+    # Double-buffering: prepend a phase dim to the smem allocation and to
+    # both the cooperative-load write index and (downstream) every body
+    # Load. The leading Sync is dropped — ping-pong avoids the
+    # prev-compute / next-load conflict by using different physical buffers.
+    if stage.buffer_count > 1:
+        if stage.phase is None:
+            raise ValueError(f"Stage {stage.name!r} has buffer_count={stage.buffer_count} but no phase expr")
+        full_extents = (stage.buffer_count, *padded_extents)
+        smem_index = (stage.phase, *smem_index)
+        prelude: list[Stmt] = []  # leading Sync omitted
+    else:
+        full_extents = padded_extents
+        prelude = [Sync()]
+
     load_name = f"{stage.name}_v"
     cooperative_load = StridedLoop(
         axis=iter_axis,
@@ -265,7 +279,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
             Write(output=stage.name, index=smem_index, value=load_name),
         ),
     )
-    return [Sync(), Smem(name=stage.name, extents=padded_extents), cooperative_load, Sync()]
+    return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, Sync()]
 
 
 def _flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:
