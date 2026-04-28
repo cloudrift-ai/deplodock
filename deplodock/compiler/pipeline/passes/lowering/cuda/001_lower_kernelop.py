@@ -13,6 +13,7 @@ from __future__ import annotations
 from math import prod
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
 from deplodock.compiler.ir.kernel.render import render_kernelop
@@ -30,11 +31,20 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     for out in root.op.outputs:
         shapes[out] = tuple(graph.nodes[out].output.shape) if out in graph.nodes else tuple(root.output.shape)
 
+    # Scalar ConstantOp inputs get embedded as float literals in the kernel
+    # body — no kernel parameter, no buffer load.
+    literal_constants: dict[str, float] = {}
+    for bid in root.op.inputs:
+        node = graph.nodes.get(bid)
+        if node is not None and isinstance(node.op, ConstantOp) and node.op.value is not None:
+            literal_constants[bid] = float(node.op.value)
+
+    runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
     grid, block = _launch_geometry(root.op)
     root.op = CudaOp(
-        kernel_source=render_kernelop(root.op, shapes=shapes),
+        kernel_source=render_kernelop(root.op, shapes=shapes, literal_constants=literal_constants),
         kernel_name=root.op.name,
-        arg_order=(*root.op.inputs, *root.op.outputs),
+        arg_order=(*runtime_inputs, *root.op.outputs),
         grid=grid,
         block=block,
         smem_bytes=_smem_bytes(root.op),

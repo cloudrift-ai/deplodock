@@ -73,6 +73,7 @@ class RenderCtx:
     intrinsics: dict[str, str] = field(default_factory=dict)
     builtins: dict[str, str] = field(default_factory=dict)
     explicit_inits: set[str] = field(default_factory=set)
+    literal_constants: dict[str, float] = field(default_factory=dict)
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
@@ -82,6 +83,7 @@ class RenderCtx:
             intrinsics=self.intrinsics,
             builtins=self.builtins,
             explicit_inits=self.explicit_inits,
+            literal_constants=self.literal_constants,
         )
 
 
@@ -286,6 +288,12 @@ class Load(Stmt):
     ``index`` is the dim-wise access pattern over the enclosing axes.
     The produced SSA ``name`` is a regular value that downstream stmts
     read.
+
+    A Load is rendered as a literal binding (``float name = <value>;``)
+    when ``ctx.literal_constants`` carries a value for ``input`` — the
+    scalar-constant-inlining path populates that map at the cuda
+    lowering boundary so kernels can embed ``ConstantOp`` values
+    directly instead of taking them as ``float*`` parameters.
     """
 
     name: str
@@ -294,6 +302,9 @@ class Load(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return ()
+
+    def is_literal(self, literal_constants: dict[str, float]) -> bool:
+        return self.input in literal_constants
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -305,6 +316,9 @@ class Load(Stmt):
         return [f"{indent}{self.name} = load {self.input}[{idx}]"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
+        lit = ctx.literal_constants.get(self.input) if ctx.literal_constants else None
+        if lit is not None:
+            return [f"{_pad(ctx.indent)}float {self.name} = {_float_lit(lit)};"]
         flat = render_index(self.input, self.index, ctx)
         return [f"{_pad(ctx.indent)}float {self.name} = {self.input}[{flat}];"]
 

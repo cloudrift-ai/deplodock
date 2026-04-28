@@ -43,7 +43,11 @@ _BUILTIN_TO_CUDA: dict[str, str] = {
 _BLOCK_SIZE = 256
 
 
-def render_kernelop(kernel_op: KernelOp, shapes: dict[str, tuple[int, ...]] | None = None) -> str:
+def render_kernelop(
+    kernel_op: KernelOp,
+    shapes: dict[str, tuple[int, ...]] | None = None,
+    literal_constants: dict[str, float] | None = None,
+) -> str:
     """Render a complete ``extern "C" __global__`` CUDA function for a ``KernelOp``.
 
     ``shapes`` maps each global-buffer name (anything appearing on a
@@ -53,19 +57,27 @@ def render_kernelop(kernel_op: KernelOp, shapes: dict[str, tuple[int, ...]] | No
     (``{nid: graph.nodes[nid].output.shape for nid in ...}``); tests pass
     it as a literal dict.
 
+    ``literal_constants`` maps input-buffer names to scalar values that
+    should be embedded in the kernel body as float literals instead of
+    passed as ``float*`` parameters. Loads of those bufs render as
+    ``float name = <value>;`` (see ``Load.render``) and the buf is
+    excluded from the kernel signature.
+
     Kernel signature is derived from the body: ``kernel_op.inputs`` (distinct
     ``Load.input`` names) become ``const float*`` params, ``kernel_op.outputs``
     (distinct ``Write.output`` names) become ``float*`` params, ordered
-    by first appearance.
+    by first appearance. Literal-constant inputs are skipped.
     """
+    literals = dict(literal_constants or {})
     ctx = RenderCtx(
         shapes=dict(shapes or {}),
         indent=1,
         intrinsics=_INTRINSIC_TO_CUDA,
         builtins=_BUILTIN_TO_CUDA,
+        literal_constants=literals,
     )
 
-    sig_parts = [f"const float* {n}" for n in kernel_op.inputs]
+    sig_parts = [f"const float* {n}" for n in kernel_op.inputs if n not in literals]
     sig_parts.extend(f"float* {n}" for n in kernel_op.outputs)
     params_text = ", ".join(sig_parts)
     bounds = _launch_bounds_for(kernel_op)
