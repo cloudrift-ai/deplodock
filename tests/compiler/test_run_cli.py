@@ -130,7 +130,7 @@ def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
     """``deplodock run --ir <loop.json>`` loads loop IR and runs the
     remaining tile / kernel / cuda passes, executes with random inputs."""
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "loop", tmp_path)
-    rc, stdout, stderr = run_cli("run", "--ir", str(ir_path))
+    rc, stdout, stderr = run_cli("run", "-v", "--ir", str(ir_path))
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     assert "Loaded loop IR" in log
@@ -141,7 +141,7 @@ def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
 def test_run_ir_tile_stage(run_cli, project_root, tmp_path):
     """Tile-IR JSON loads and runs only the kernel + cuda tail."""
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "tile", tmp_path)
-    rc, stdout, stderr = run_cli("run", "--ir", str(ir_path))
+    rc, stdout, stderr = run_cli("run", "-v", "--ir", str(ir_path))
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     assert "Loaded tile IR" in log
@@ -154,7 +154,7 @@ def test_run_ir_tile_stage(run_cli, project_root, tmp_path):
 def test_run_ir_kernel_stage(run_cli, project_root, tmp_path):
     """Kernel-IR JSON loads and runs only the cuda tail."""
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "kernel", tmp_path)
-    rc, stdout, stderr = run_cli("run", "--ir", str(ir_path))
+    rc, stdout, stderr = run_cli("run", "-v", "--ir", str(ir_path))
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     assert "Loaded kernel IR" in log
@@ -165,7 +165,7 @@ def test_run_ir_kernel_stage(run_cli, project_root, tmp_path):
 def test_run_ir_cuda_stage_no_tail(run_cli, project_root, tmp_path):
     """Already-lowered cuda IR has no remaining passes."""
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "cuda", tmp_path)
-    rc, stdout, stderr = run_cli("run", "--ir", str(ir_path))
+    rc, stdout, stderr = run_cli("run", "-v", "--ir", str(ir_path))
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     assert "Loaded cuda IR" in log
@@ -190,7 +190,7 @@ def test_run_ir_seed_reproducible(run_cli, project_root, tmp_path):
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "tile", tmp_path)
     runs = []
     for _ in range(2):
-        rc, stdout, stderr = run_cli("run", "--ir", str(ir_path), "--seed", "42")
+        rc, stdout, stderr = run_cli("run", "-v", "--ir", str(ir_path), "--seed", "42")
         assert rc == 0
         # Output line: "Output rms_norm: shape=... finite=True mean=<value>"
         for line in (stdout + stderr).splitlines():

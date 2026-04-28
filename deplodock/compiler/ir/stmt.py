@@ -42,6 +42,7 @@ from deplodock.compiler.ir.expr import (
     Expr,
     FuncCallExpr,
     Literal,
+    SimplifyCtx,
     TernaryExpr,
     Var,
     _float_lit,
@@ -152,22 +153,32 @@ def select_to_ternary(s: Select) -> Expr:
 
 
 def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
-    """Row-major flatten ``buf[i0][i1]...`` to a single C/CUDA expression."""
+    """Row-major flatten ``buf[i0][i1]...`` to a single C/CUDA expression.
+
+    Builds the row-major sum as an ``Expr`` and runs ``simplify`` on it so
+    constant-zero indices (typical of size-1 outer dims) drop out via the
+    standard ``0 * x → 0`` / ``0 + y → y`` folds rather than emitting
+    ``0 * stride`` terms in the output.
+    """
     if len(indices) == 0:
         return "0"
     if len(indices) == 1:
-        return indices[0].render(ctx)
+        return indices[0].simplify(SimplifyCtx.empty()).render(ctx)
     shape = ctx.shapes.get(buf)
     if shape is None or len(shape) != len(indices):
-        return " + ".join(i.render(ctx) for i in indices)
-    parts: list[str] = []
+        flat: Expr = indices[0]
+        for i in indices[1:]:
+            flat = BinaryExpr("+", flat, i)
+        return flat.simplify(SimplifyCtx.empty()).render(ctx)
+    flat = None
     for d, idx in enumerate(indices):
         stride = 1
         for k in range(d + 1, len(shape)):
             stride *= int(shape[k])
-        idx_str = idx.render(ctx, _PRECEDENCE["*"])
-        parts.append(idx_str if stride == 1 else f"{idx_str} * {stride}")
-    return " + ".join(parts)
+        term: Expr = idx if stride == 1 else BinaryExpr("*", idx, Literal(stride, "int"))
+        flat = term if flat is None else BinaryExpr("+", flat, term)
+    assert flat is not None
+    return flat.simplify(SimplifyCtx.empty()).render(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -1347,6 +1358,56 @@ def simplify_body(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends."""
     ctx = SimplifyCtx.empty()
     return tuple(_simplify_stmt(s, ctx) for s in body)
+
+
+# ---------------------------------------------------------------------------
+# Pass: deduplicate Load stmts with identical (input, index)
+# ---------------------------------------------------------------------------
+
+
+def dedup_loads(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Drop duplicate ``Load`` stmts within nested scopes.
+
+    Two ``Load`` stmts with the same ``(input, index)`` read the same
+    value; keep the first and rewire downstream SSA references to its
+    name. Operates per-scope: a Load at an outer scope is reused by
+    inner siblings (their identical ``index`` doesn't reference any
+    inner-axis Var, so the values are equal). Loads inside a nested
+    scope are not visible to outer / sibling scopes."""
+
+    def walk(
+        body: tuple[Stmt, ...],
+        env: dict[tuple[str, tuple[str, ...]], str],
+        parent_alias: dict[str, str],
+    ) -> tuple[Stmt, ...]:
+        local = dict(env)
+        alias = dict(parent_alias)
+
+        def rename(n: str) -> str:
+            return alias.get(n, n)
+
+        out: list[Stmt] = []
+        for s in body:
+            if isinstance(s, Load):
+                key = (s.input, tuple(e.pretty() for e in s.index))
+                if key in local:
+                    alias[s.name] = local[key]
+                    continue
+                local[key] = s.name
+                out.append(s)
+            elif isinstance(s, Loop):
+                out.append(replace(s, body=walk(s.body, local, alias)))
+            elif isinstance(s, StridedLoop):
+                out.append(replace(s, body=walk(s.body, local, alias)))
+            elif isinstance(s, Tile):
+                out.append(Tile(axes=s.axes, body=walk(s.body, local, alias)))
+            elif isinstance(s, Cond):
+                out.append(Cond(cond=s.cond, body=walk(s.body, local, alias), else_body=walk(s.else_body, local, alias)))
+            else:
+                out.append(s.rewrite(rename))
+        return tuple(out)
+
+    return walk(stmts, {}, {})
 
 
 # ---------------------------------------------------------------------------

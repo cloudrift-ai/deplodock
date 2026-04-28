@@ -150,7 +150,11 @@ def splice_loops(
             splice_edges=splice_edges,
             root=root,
         ).run()
-    except (_NotSupported, ValueError):
+    except (_NotSupported, ValueError) as e:
+        import sys
+        import traceback
+        print(f"DEBUG splice failed root={root}: {type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return None
 
 
