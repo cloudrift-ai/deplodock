@@ -35,10 +35,9 @@ from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Tile, Writ
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
-PATTERN = [Pattern("root", TileOp)]
+from deplodock.compiler.tuning import per_axis_threads, thread_budget
 
-_THREAD_BUDGET = 256
-_PER_AXIS_THREADS = 16
+PATTERN = [Pattern("root", TileOp)]
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -125,6 +124,8 @@ def _partition_threads(tile: Tile) -> Tile | None:
     operand load with its own thread axis for cooperative reuse.
     Single-parallel-axis kernels (RMSNorm row-reduction) get a single
     16-thread axis — same as before."""
+    pat = per_axis_threads(tile)
+    tb = thread_budget()
     axes = list(tile.axes)
     new_axes_inner_first: list[BoundAxis] = []
     sigma_map: dict[str, object] = {}
@@ -132,39 +133,39 @@ def _partition_threads(tile: Tile) -> Tile | None:
 
     for ba in reversed(axes):
         ext = int(ba.axis.extent)
-        if threads_used >= _THREAD_BUDGET:
+        if threads_used >= tb:
             new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
             continue
-        if ext < _PER_AXIS_THREADS:
+        if ext < pat:
             # Small axis — keep whole as THREAD if it'd fit, else BLOCK.
-            if threads_used * ext <= _THREAD_BUDGET:
+            if threads_used * ext <= tb:
                 new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
                 threads_used *= ext
             else:
                 new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
             continue
-        if ext == _PER_AXIS_THREADS:
-            if threads_used * ext <= _THREAD_BUDGET:
+        if ext == pat:
+            if threads_used * ext <= tb:
                 new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
                 threads_used *= ext
             else:
                 new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
             continue
         # Larger than per-axis tile → split.
-        if ext % _PER_AXIS_THREADS != 0:
+        if ext % pat != 0:
             # Non-divisible — keep whole; if it'd overflow, BLOCK; else THREAD.
-            if threads_used * ext <= _THREAD_BUDGET:
+            if threads_used * ext <= tb:
                 new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
                 threads_used *= ext
             else:
                 new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
             continue
-        inner = Axis(f"{ba.axis.name}_i", _PER_AXIS_THREADS)
-        outer = Axis(f"{ba.axis.name}_o", ext // _PER_AXIS_THREADS)
+        inner = Axis(f"{ba.axis.name}_i", pat)
+        outer = Axis(f"{ba.axis.name}_o", ext // pat)
         new_axes_inner_first.append(BoundAxis(axis=inner, bind=BIND_THREAD))
         new_axes_inner_first.append(BoundAxis(axis=outer, bind=BIND_BLOCK))
-        sigma_map[ba.axis.name] = Var(outer.name) * Literal(_PER_AXIS_THREADS, "int") + Var(inner.name)
-        threads_used *= _PER_AXIS_THREADS
+        sigma_map[ba.axis.name] = Var(outer.name) * Literal(pat, "int") + Var(inner.name)
+        threads_used *= pat
 
     new_axes_inner_first.reverse()
     new_axes = new_axes_inner_first

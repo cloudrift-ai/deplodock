@@ -41,10 +41,14 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Select, 
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
+from deplodock.compiler.tuning import register_tile_factor
+
 PATTERN = [Pattern("root", TileOp)]
 
-_PER_AXIS_THREADS = 16  # must match ``005_blockify_launch._PER_AXIS_THREADS``
-_FACTOR = 2  # per-thread tile = F × F
+# Per-axis thread tile sizes 005_blockify_launch may have produced — the
+# register-tile factor is chosen to fit whichever shape arrived rather
+# than pre-deciding from a heuristic that would diverge across passes.
+_PAT_TO_FACTOR = {32: 4, 16: 2}
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -56,22 +60,42 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
+    import os
+
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
         return None
     idx, tile = tiles[0]
 
-    target_axes = [ba.axis.name for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == _PER_AXIS_THREADS]
-    if len(target_axes) != 2:
+    # Detect whichever PAT 005_blockify_launch landed on by looking for
+    # two THREAD axes with a matching extent in the candidate set. We
+    # follow 005's choice rather than re-running the heuristic on the
+    # already-split tile (post-blockify axis extents == PAT, so the
+    # "every axis ≥ 64" gate would falsely reject).
+    pat: int | None = None
+    for cand in (32, 16):
+        if sum(1 for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == cand) >= 2:
+            pat = cand
+            break
+    if pat is None:
         return None
-    if _PER_AXIS_THREADS % _FACTOR != 0:
+
+    if "DEPLODOCK_F" in os.environ:
+        factor = register_tile_factor(tile)
+    else:
+        factor = _PAT_TO_FACTOR.get(pat, 2)
+    if factor <= 1 or pat % factor != 0:
+        return None
+
+    target_axes = [ba.axis.name for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == pat]
+    if len(target_axes) != 2:
         return None
 
     matmul_loc = _find_matmul(tile.body)
     if matmul_loc is None:
         return None
 
-    rewritten = _register_tile(tile, target_axes[0], target_axes[1], _FACTOR)
+    rewritten = _register_tile(tile, target_axes[0], target_axes[1], factor)
     if rewritten is None:
         return None
     return body[:idx] + (rewritten,) + body[idx + 1 :]

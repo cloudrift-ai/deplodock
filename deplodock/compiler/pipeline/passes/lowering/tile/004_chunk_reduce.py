@@ -50,6 +50,17 @@ PATTERN = [Pattern("root", TileOp)]
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 
 
+def _bk_candidates(tile) -> tuple[int, ...]:
+    from deplodock.compiler.tuning import forced_bk
+
+    f = forced_bk(tile)
+    if f is None:
+        return _BK_CANDIDATES
+    # Forced value tried first; fall back to the built-in list if it
+    # doesn't divide K (the caller still applies ``K % BK == 0`` filter).
+    return (f, *(c for c in _BK_CANDIDATES if c != f))
+
+
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
@@ -63,17 +74,19 @@ def _maybe_rewrite(body):
     if len(tiles) != 1:
         return None
     idx, tile = tiles[0]
-    new_body, changed = _chunk_in_body(tile.body)
+    new_body, changed = _chunk_in_body(tile.body, tile)
     if not changed:
         return None
     return body[:idx] + (Tile(axes=tile.axes, body=new_body),) + body[idx + 1 :]
 
 
-def _chunk_in_body(stmts: tuple) -> tuple[tuple, bool]:
+def _chunk_in_body(stmts: tuple, tile) -> tuple[tuple, bool]:
     """Walk a body, chunking the first matmul-shaped reduce Loop found.
     Recurses through wrapper Loops / StridedLoops / Conds so a matmul
     nested inside an output-position free loop (fused SDPA V-projection)
-    is reachable. Returns ``(new_body, changed)``."""
+    is reachable. ``tile`` provides the enclosing-tile context the
+    BK-picking heuristic uses to scale the chunk to the output volume.
+    Returns ``(new_body, changed)``."""
     out: list[Stmt] = []
     changed = False
     for s in stmts:
@@ -81,20 +94,20 @@ def _chunk_in_body(stmts: tuple) -> tuple[tuple, bool]:
             out.append(s)
             continue
         if isinstance(s, Loop) and s.is_reduce and _is_matmul_reduce(s):
-            chunked = _chunk_loop(s)
+            chunked = _chunk_loop(s, tile)
             if chunked is not None:
                 out.append(chunked)
                 changed = True
                 continue
         if isinstance(s, (Loop, StridedLoop)):
-            inner, inner_changed = _chunk_in_body(s.body)
+            inner, inner_changed = _chunk_in_body(s.body, tile)
             if inner_changed:
                 out.append(replace(s, body=inner))
                 changed = True
                 continue
         if isinstance(s, Cond):
-            inner_b, cb = _chunk_in_body(s.body)
-            inner_e, ce = _chunk_in_body(s.else_body)
+            inner_b, cb = _chunk_in_body(s.body, tile)
+            inner_e, ce = _chunk_in_body(s.else_body, tile)
             if cb or ce:
                 out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
                 changed = True
@@ -124,9 +137,9 @@ def _is_matmul_reduce(loop: Loop) -> bool:
     return any(isinstance(s, Accum) for s in loop.body)
 
 
-def _chunk_loop(loop: Loop) -> Loop | None:
+def _chunk_loop(loop: Loop, tile) -> Loop | None:
     K = int(loop.axis.extent)
-    BK = next((c for c in _BK_CANDIDATES if K % c == 0 and K > c), None)
+    BK = next((c for c in _bk_candidates(tile) if K % c == 0 and K > c), None)
     if BK is None:
         return None
 
