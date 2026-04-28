@@ -23,11 +23,20 @@ import numpy as np
 # Names whose callable isn't a plain ``getattr(np, name)`` — non-numpy
 # intrinsics (all unary). Every other op name matches a numpy attribute,
 # and ``__init__`` falls through to ``getattr(np, name)`` for them.
+def _erf(x):  # numpy lacks an erf ufunc; scipy ships one and is a torch dep.
+    from scipy.special import erf
+
+    return erf(x)
+
+
 _NAME_TO_FN: dict[str, object] = {
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "relu": lambda x: np.maximum(0.0, x),
     "sigmoid": lambda x: 1.0 / (1.0 + np.exp(-x)),
     "silu": lambda x: x / (1.0 + np.exp(-x)),
+    "erf": _erf,
+    "gelu": lambda x: 0.5 * x * (1.0 + _erf(x / np.sqrt(2.0))),
+    "gelu_tanh": lambda x: 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3))),
     "copy": lambda x: x,
 }
 

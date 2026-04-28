@@ -260,11 +260,18 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
         "tanh",
         "abs",
         "sigmoid",
+        "gelu",
+        "erf",
     }
     if op_name in _ELEMENTWISE_SOURCES:
         from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
         canonical = _ATEN_TO_NUMPY.get(op_name, op_name)
+        # Disambiguate gelu's tanh approximation from the default erf form
+        # — the FX node carries ``kwargs={'approximate': 'tanh'}`` only in
+        # that case, and the decomposition rule keys on op name.
+        if canonical == "gelu" and (fx_node.kwargs or {}).get("approximate") == "tanh":
+            canonical = "gelu_tanh"
         bc_ids = [broadcast_to(g, inp, shape) for inp in input_ids[:2]]
         nid = g.add_node(
             op=ElementwiseOp(op=canonical),

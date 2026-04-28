@@ -20,6 +20,7 @@ _INTRINSIC_TO_CUDA: dict[str, str] = {
     "fmin": "fminf",
     "pow": "powf",
     "sqrt": "sqrtf",
+    "erf": "erff",
 }
 
 _BUILTIN_TO_CUDA: dict[str, str] = {
