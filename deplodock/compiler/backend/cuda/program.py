@@ -280,3 +280,21 @@ def benchmark_program(
         num_launches=n,
         per_launch=per_launch if per_launch else None,
     )
+
+
+def make_runner(graph: Graph, input_data: dict[str, np.ndarray] | None = None):
+    """Compile the graph, allocate buffers once, and return a zero-arg
+    ``run_once()`` callable that issues one full pass of the kernel sequence.
+
+    Used by interleaved benchmarking: callers warm up once, then alternate
+    backends iteration-by-iteration so each backend sees the same warm GPU
+    state (same clocks, same caches).
+    """
+    compiled = _compile(graph)
+    arrays = _allocate(compiled, input_data)
+
+    def run_once() -> None:
+        for launch in compiled.launches:
+            _launch(launch, compiled, arrays)
+
+    return run_once

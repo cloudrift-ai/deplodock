@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
-from deplodock.compiler.backend.cuda.program import benchmark_program, run_program, run_program_debug
+from deplodock.compiler.backend.cuda.program import benchmark_program, make_runner, run_program, run_program_debug
 from deplodock.compiler.pipeline import CUDA_PASSES, run_pipeline
 
 if TYPE_CHECKING:
@@ -79,3 +79,9 @@ class CudaBackend(Backend):
             num_launches=result.num_launches,
             per_launch=result.per_launch,
         )
+
+    def make_runner(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None):
+        """Return a zero-arg ``run_once()`` callable that issues one full
+        kernel-sequence pass on the same pre-allocated buffers. Used for
+        interleaved benchmarking against PyTorch."""
+        return make_runner(compiled, input_data=input_data)

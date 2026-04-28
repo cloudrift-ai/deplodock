@@ -120,18 +120,15 @@ def handle_run(args):
     if not args.bench:
         return
 
-    results: dict[str, float] = {}
     cuda_module = module.to("cuda")
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in example_args)
     cuda_kwargs = _to_cuda_kwargs(example_kwargs)
 
-    results["Eager PyTorch"] = _bench_eager(cuda_module, cuda_args, cuda_kwargs, args.warmup, args.iters)
-    compiled_us = _bench_torch_compile(cuda_module, cuda_args, cuda_kwargs, args.warmup, args.iters)
-    if compiled_us is not None:
-        results["torch.compile"] = compiled_us
+    results = _bench_interleaved(cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters)
 
+    # Per-kernel breakdown still uses the dedicated deplodock-only path so we
+    # get per-launch CUDA event timings.
     bench = backend.benchmark(compiled, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-    results["Deplodock"] = bench.time_ms * 1000
     if dump:
         dump.dump_benchmark(bench)
 
@@ -526,45 +523,70 @@ def _check_accuracy(outputs, eager_out):
         sys.exit(1)
 
 
-def _bench_eager(module, args, kwargs, warmup, iters):
+def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters):
+    """Time eager / torch.compile / deplodock by alternating one iter of
+    each per loop step. All three see the same warm GPU state across the
+    measurement window — same clocks, same caches, same thermal drift —
+    instead of running in three sequential phases that each get a
+    different steady state.
+
+    Per-iter ``torch.cuda.Event``s queue on the (legacy) default stream;
+    cupy's default stream is the same NULL stream, so events from both
+    libraries see all preceding work. We sync once at the end and sum
+    per-iter elapsed times per backend.
+    """
     import torch
+
+    eager_fn = lambda: module(*args, **kwargs)  # noqa: E731
+
+    compile_fn = None
+    try:
+        compiled_module = torch.compile(module)
+        for _ in range(warmup + 5):
+            with torch.no_grad():
+                compiled_module(*args, **kwargs)
+        compile_fn = lambda: compiled_module(*args, **kwargs)  # noqa: E731
+    except Exception as e:  # noqa: BLE001
+        logger.warning("torch.compile failed: %s", e)
+
+    deplodock_run = backend.make_runner(compiled_graph)
 
     for _ in range(warmup):
         with torch.no_grad():
-            module(*args, **kwargs)
+            eager_fn()
+        deplodock_run()
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
+
+    e_starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    e_stops = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    c_starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)] if compile_fn else []
+    c_stops = [torch.cuda.Event(enable_timing=True) for _ in range(iters)] if compile_fn else []
+    d_starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    d_stops = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+    for i in range(iters):
         with torch.no_grad():
-            module(*args, **kwargs)
-    end.record()
+            e_starts[i].record()
+            eager_fn()
+            e_stops[i].record()
+            if compile_fn is not None:
+                c_starts[i].record()
+                compile_fn()
+                c_stops[i].record()
+        d_starts[i].record()
+        deplodock_run()
+        d_stops[i].record()
     torch.cuda.synchronize()
-    return (start.elapsed_time(end) / iters) * 1000
 
+    eager_us = sum(e_starts[i].elapsed_time(e_stops[i]) for i in range(iters)) / iters * 1000
+    dd_us = sum(d_starts[i].elapsed_time(d_stops[i]) for i in range(iters)) / iters * 1000
 
-def _bench_torch_compile(module, args, kwargs, warmup, iters):
-    import torch
-
-    try:
-        compiled = torch.compile(module)
-        for _ in range(warmup + 5):
-            with torch.no_grad():
-                compiled(*args, **kwargs)
-        torch.cuda.synchronize()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("torch.compile failed: %s", e)
-        return None
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        with torch.no_grad():
-            compiled(*args, **kwargs)
-    end.record()
-    torch.cuda.synchronize()
-    return (start.elapsed_time(end) / iters) * 1000
+    results: dict[str, float] = {"Eager PyTorch": eager_us}
+    if compile_fn is not None:
+        compile_us = sum(c_starts[i].elapsed_time(c_stops[i]) for i in range(iters)) / iters * 1000
+        results["torch.compile"] = compile_us
+    results["Deplodock"] = dd_us
+    return results
 
 
 def _print_table(results):
