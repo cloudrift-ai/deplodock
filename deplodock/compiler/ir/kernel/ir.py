@@ -131,10 +131,11 @@ class CpAsyncCopy(Stmt):
         smem_flat = render_index(self.smem, self.smem_index, ctx)
         src_flat = render_index(self.src, self.src_index, ctx)
         pad = _pad(ctx.indent)
+        asm = f'asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\\n" :: "r"(_smem_addr), "l"(&{self.src}[{src_flat}]) : "memory");'
         return [
             f"{pad}{{",
             f"{pad}    unsigned int _smem_addr = __cvta_generic_to_shared(&{self.smem}[{smem_flat}]);",
-            f'{pad}    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\\n" :: "r"(_smem_addr), "l"(&{self.src}[{src_flat}]));',
+            f"{pad}    {asm}",
             f"{pad}}}",
         ]
 
@@ -149,7 +150,7 @@ class CpAsyncCommit(Stmt):
         return [f"{indent}cp.async.commit_group"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        return [f'{_pad(ctx.indent)}asm volatile("cp.async.commit_group;\\n");']
+        return [f'{_pad(ctx.indent)}asm volatile("cp.async.commit_group;\\n" ::: "memory");']
 
 
 @dataclass
@@ -164,7 +165,7 @@ class CpAsyncWait(Stmt):
         return [f"{indent}cp.async.wait_group({self.group})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        return [f'{_pad(ctx.indent)}asm volatile("cp.async.wait_group {self.group};\\n");']
+        return [f'{_pad(ctx.indent)}asm volatile("cp.async.wait_group {self.group};\\n" ::: "memory");']
 
 
 @dataclass

@@ -121,6 +121,115 @@ class CompilerDump:
         kernels = format_kernels(graph)
         if kernels:
             self._write_text(f"{prefix}.kernels.txt", kernels)
+            self._dump_per_kernel(prefix, graph)
+
+    def _dump_per_kernel(self, prefix: str, graph: Graph) -> None:
+        """Split each compute-kernel node (LoopOp / TileOp / KernelOp /
+        CudaOp) into its own minimal sub-graph and write to
+        ``<prefix>.kernels/<kname>.json``. Each sub-graph contains the
+        kernel node plus its transitive ``InputOp`` / ``ConstantOp``
+        producers, so it can be loaded standalone via
+        ``deplodock run --ir <subgraph>.json --bench`` for per-kernel
+        diagnosis."""
+        from deplodock.compiler.graph import Graph as _Graph
+        from deplodock.compiler.ir.base import InputOp
+        from deplodock.compiler.ir.cuda.ir import CudaOp
+        from deplodock.compiler.ir.kernel.ir import KernelOp
+        from deplodock.compiler.ir.loop import LoopOp
+        from deplodock.compiler.ir.tile.ir import TileOp
+
+        compute_types = (LoopOp, TileOp, KernelOp, CudaOp)
+        compute_nodes = [(nid, n) for nid, n in graph.nodes.items() if isinstance(n.op, compute_types)]
+        if not compute_nodes:
+            return
+
+        out_dir = self.dir / f"{prefix}.kernels"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for nid, node in compute_nodes:
+            kname = getattr(node.op, "kernel_name", None) or getattr(node.op, "name", None) or nid
+            keep_ids, synthetic_ids = self._collect_kernel_ancestors(graph, nid, compute_types)
+            sub = _Graph()
+            order = self._topo_order(graph, keep_ids)
+            for kid in order:
+                src = graph.nodes[kid]
+                if kid in synthetic_ids:
+                    # Compute-node ancestor → replaced with synthetic InputOp
+                    # so the sub-graph is standalone.
+                    sub.add_node(InputOp(), [], src.output, node_id=src.id)
+                    sub.inputs.append(kid)
+                else:
+                    sub.add_node(src.op, list(src.inputs), src.output, node_id=src.id)
+                    if isinstance(src.op, InputOp) and kid in graph.inputs:
+                        sub.inputs.append(kid)
+            sub.outputs.append(nid)
+            safe = self._safe_filename(kname)
+            self._write_json(f"{prefix}.kernels/{safe}.json", sub.to_dict())
+
+    def _collect_kernel_ancestors(self, graph: Graph, root_id: str, compute_types: tuple) -> tuple[set[str], set[str]]:
+        """Collect ``root_id`` + transitive ConstantOp / InputOp ancestors.
+        Compute-op ancestors get marked as ``synthetic`` (boundary —
+        they'll become synthetic ``InputOp``s in the sub-graph and their
+        producers are NOT walked)."""
+        from deplodock.compiler.ir.base import ConstantOp, InputOp
+
+        keep: set[str] = {root_id}
+        synthetic: set[str] = set()
+        stack = list(graph.nodes[root_id].inputs)
+        while stack:
+            cur = stack.pop()
+            if cur in keep:
+                continue
+            keep.add(cur)
+            node = graph.nodes.get(cur)
+            if node is None:
+                continue
+            if isinstance(node.op, compute_types):
+                synthetic.add(cur)
+                continue
+            if isinstance(node.op, (ConstantOp, InputOp)):
+                stack.extend(node.inputs)
+        return keep, synthetic
+
+    def _topo_order(self, graph: Graph, keep: set[str]) -> list[str]:
+        """Topo-sorted node ids restricted to ``keep`` (producers first)."""
+        visited: set[str] = set()
+        order: list[str] = []
+
+        def visit(nid: str) -> None:
+            if nid in visited or nid not in keep:
+                return
+            visited.add(nid)
+            for dep in graph.nodes[nid].inputs:
+                visit(dep)
+            order.append(nid)
+
+        for nid in keep:
+            visit(nid)
+        return order
+
+    def _collect_subgraph(self, graph: Graph, root_id: str) -> set[str]:
+        """Transitive-input closure for a compute node: itself + every
+        ``ConstantOp`` / ``InputOp`` reachable via ``node.inputs``."""
+        from deplodock.compiler.ir.base import ConstantOp, InputOp
+
+        keep: set[str] = set()
+        stack = [root_id]
+        while stack:
+            cur = stack.pop()
+            if cur in keep:
+                continue
+            keep.add(cur)
+            node = graph.nodes.get(cur)
+            if node is None:
+                continue
+            if cur == root_id or isinstance(node.op, (ConstantOp, InputOp)):
+                stack.extend(node.inputs)
+        return keep
+
+    @staticmethod
+    def _safe_filename(name: str) -> str:
+        return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
 
     def dump_per_launch_values(self, per_launch: dict) -> None:
         """Dump per-kernel tensor snapshots from a debug run.
