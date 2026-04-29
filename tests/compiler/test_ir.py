@@ -2,29 +2,35 @@
 
 import pytest
 
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
+from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 # ---- helpers ----
 
 
 def _make_matmul_graph():
-    """Build: C[M,N] = reduce_sum(elementwise_mul(A[M,K], B[K,N]), axis=1)."""
+    """Build: C[M,1,N] = reduce_sum(elementwise_mul(A[M,K,N], B[M,K,N]), axis=1).
+
+    Uses keepdim reduction and matching-shape elementwise inputs to stay on
+    the Tensor IR rank-preservation invariant (see pipeline/passes/frontend/decomposition/_broadcast.py for how
+    decomposition rules insert explicit IndexMapOps when shapes differ).
+    """
     g = Graph()
-    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", ("M", "K")), node_id="A")
-    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", ("K", "N")), node_id="B")
+    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", ("M", "K", "N")), node_id="A")
+    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", ("M", "K", "N")), node_id="B")
     g.inputs = [a, b]
 
     ew = g.add_node(
-        op=ElementwiseOp(fn="mul"),
+        op=ElementwiseOp(op="multiply"),
         inputs=[a, b],
         output=Tensor("AB", ("M", "K", "N")),
         node_id="ew",
     )
     red = g.add_node(
-        op=ReduceOp(fn="sum", axis=1),
+        op=ReduceOp(op="sum", axis=1),
         inputs=[ew],
-        output=Tensor("C", ("M", "N")),
+        output=Tensor("C", ("M", 1, "N")),
         node_id="red",
     )
     g.outputs = [red]
@@ -53,7 +59,7 @@ def test_missing_input_raises():
     g = Graph()
     with pytest.raises(ValueError, match="does not exist"):
         g.add_node(
-            op=ElementwiseOp(fn="add"),
+            op=ElementwiseOp(op="add"),
             inputs=["nonexistent"],
             output=Tensor("Y", (4,)),
         )
@@ -79,9 +85,9 @@ def test_replace_node():
     g = _make_matmul_graph()
     # Add a new node and rewire red's consumers to it.
     new_id = g.add_node(
-        op=ReduceOp(fn="sum", axis=0),
+        op=ReduceOp(op="sum", axis=0),
         inputs=["ew"],
-        output=Tensor("C2", ("N",)),
+        output=Tensor("C2", (1, "K", "N")),
         node_id="red2",
     )
     g.replace_node("red", new_id)
@@ -108,7 +114,7 @@ def test_fan_out():
     g = Graph()
     x = g.add_node(op=InputOp(), inputs=[], output=Tensor("X", (4,)), node_id="x")
     g.inputs = [x]
-    a = g.add_node(op=ElementwiseOp(fn="exp"), inputs=[x], output=Tensor("expX", (4,)), node_id="a")
-    b = g.add_node(op=ElementwiseOp(fn="neg"), inputs=[x], output=Tensor("negX", (4,)), node_id="b")
+    a = g.add_node(op=ElementwiseOp(op="exp"), inputs=[x], output=Tensor("expX", (4,)), node_id="a")
+    b = g.add_node(op=ElementwiseOp(op="negative"), inputs=[x], output=Tensor("negX", (4,)), node_id="b")
     g.outputs = [a, b]
     assert sorted(g.consumers("x")) == ["a", "b"]

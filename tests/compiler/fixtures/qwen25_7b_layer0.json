@@ -1,0 +1,1711 @@
+{
+  "inputs": [
+    "hidden_states",
+    "position_embeddings_0",
+    "position_embeddings_1"
+  ],
+  "outputs": [
+    "add_5"
+  ],
+  "nodes": {
+    "p_attn_q_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_q_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_q_proj_weight",
+        "shape": [
+          3584,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_attn_q_proj_bias": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_q_proj_bias",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_q_proj_bias",
+        "shape": [
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_attn_k_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_k_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_k_proj_weight",
+        "shape": [
+          512,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_attn_k_proj_bias": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_k_proj_bias",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_k_proj_bias",
+        "shape": [
+          512
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_attn_v_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_v_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_v_proj_weight",
+        "shape": [
+          512,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_attn_v_proj_bias": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_v_proj_bias",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_v_proj_bias",
+        "shape": [
+          512
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_attn_o_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_o_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_o_proj_weight",
+        "shape": [
+          3584,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_mlp_gate_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_mlp_gate_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_mlp_gate_proj_weight",
+        "shape": [
+          18944,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_mlp_up_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_mlp_up_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_mlp_up_proj_weight",
+        "shape": [
+          18944,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_mlp_down_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_mlp_down_proj_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_mlp_down_proj_weight",
+        "shape": [
+          3584,
+          18944
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_input_layernorm_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_input_layernorm_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_input_layernorm_weight",
+        "shape": [
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "p_post_attention_layernorm_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_post_attention_layernorm_weight",
+        "value": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_post_attention_layernorm_weight",
+        "shape": [
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "hidden_states": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "hidden_states",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "position_embeddings_0": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "position_embeddings_0",
+        "shape": [
+          1,
+          1,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "position_embeddings_1": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "position_embeddings_1",
+        "shape": [
+          1,
+          1,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "pow_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "pow_1_c1",
+        "value": 2.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "pow_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "pow_1": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "pow"
+      },
+      "inputs": [
+        "hidden_states",
+        "pow_1_c1"
+      ],
+      "output": {
+        "name": "pow_1",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mean_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "mean_c1",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "mean_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "mean": {
+      "op": "MeanOp",
+      "op_fields": {
+        "axis": -1
+      },
+      "inputs": [
+        "pow_1"
+      ],
+      "output": {
+        "name": "mean",
+        "shape": [
+          1,
+          8,
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "add_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "add_c1",
+        "value": 1e-06
+      },
+      "inputs": [],
+      "output": {
+        "name": "add_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "add": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "add"
+      },
+      "inputs": [
+        "mean",
+        "add_c1"
+      ],
+      "output": {
+        "name": "add",
+        "shape": [
+          1,
+          8,
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "rsqrt": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "rsqrt"
+      },
+      "inputs": [
+        "add"
+      ],
+      "output": {
+        "name": "rsqrt",
+        "shape": [
+          1,
+          8,
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "hidden_states",
+        "rsqrt"
+      ],
+      "output": {
+        "name": "mul",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul_1": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "p_input_layernorm_weight",
+        "mul"
+      ],
+      "output": {
+        "name": "mul_1",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "linear": {
+      "op": "LinearOp",
+      "op_fields": {
+        "has_bias": true
+      },
+      "inputs": [
+        "mul_1",
+        "p_attn_q_proj_weight",
+        "p_attn_q_proj_bias"
+      ],
+      "output": {
+        "name": "linear",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "view": {
+      "op": "ReshapeOp",
+      "op_fields": {
+        "shape": [
+          1,
+          8,
+          -1,
+          128
+        ]
+      },
+      "inputs": [
+        "linear"
+      ],
+      "output": {
+        "name": "view",
+        "shape": [
+          1,
+          8,
+          28,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "transpose_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_c1",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_c2",
+        "value": 2.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose": {
+      "op": "TransposeOp",
+      "op_fields": {
+        "axes": [
+          1,
+          2
+        ]
+      },
+      "inputs": [
+        "view"
+      ],
+      "output": {
+        "name": "transpose",
+        "shape": [
+          1,
+          28,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "linear_1": {
+      "op": "LinearOp",
+      "op_fields": {
+        "has_bias": true
+      },
+      "inputs": [
+        "mul_1",
+        "p_attn_k_proj_weight",
+        "p_attn_k_proj_bias"
+      ],
+      "output": {
+        "name": "linear_1",
+        "shape": [
+          1,
+          8,
+          512
+        ],
+        "dtype": "float32"
+      }
+    },
+    "view_1": {
+      "op": "ReshapeOp",
+      "op_fields": {
+        "shape": [
+          1,
+          8,
+          -1,
+          128
+        ]
+      },
+      "inputs": [
+        "linear_1"
+      ],
+      "output": {
+        "name": "view_1",
+        "shape": [
+          1,
+          8,
+          4,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "transpose_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_1_c1",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_1_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_1_c2",
+        "value": 2.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_1_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_1": {
+      "op": "TransposeOp",
+      "op_fields": {
+        "axes": [
+          1,
+          2
+        ]
+      },
+      "inputs": [
+        "view_1"
+      ],
+      "output": {
+        "name": "transpose_1",
+        "shape": [
+          1,
+          4,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "linear_2": {
+      "op": "LinearOp",
+      "op_fields": {
+        "has_bias": true
+      },
+      "inputs": [
+        "mul_1",
+        "p_attn_v_proj_weight",
+        "p_attn_v_proj_bias"
+      ],
+      "output": {
+        "name": "linear_2",
+        "shape": [
+          1,
+          8,
+          512
+        ],
+        "dtype": "float32"
+      }
+    },
+    "view_2": {
+      "op": "ReshapeOp",
+      "op_fields": {
+        "shape": [
+          1,
+          8,
+          -1,
+          128
+        ]
+      },
+      "inputs": [
+        "linear_2"
+      ],
+      "output": {
+        "name": "view_2",
+        "shape": [
+          1,
+          8,
+          4,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "transpose_2_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_2_c1",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_2_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_2_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_2_c2",
+        "value": 2.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_2_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_2": {
+      "op": "TransposeOp",
+      "op_fields": {
+        "axes": [
+          1,
+          2
+        ]
+      },
+      "inputs": [
+        "view_2"
+      ],
+      "output": {
+        "name": "transpose_2",
+        "shape": [
+          1,
+          4,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "unsqueeze_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "unsqueeze_c1",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "unsqueeze_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "unsqueeze": {
+      "op": "UnsqueezeOp",
+      "op_fields": {
+        "dim": 1
+      },
+      "inputs": [
+        "position_embeddings_0"
+      ],
+      "output": {
+        "name": "unsqueeze",
+        "shape": [
+          1,
+          1,
+          1,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "unsqueeze_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "unsqueeze_1_c1",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "unsqueeze_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "unsqueeze_1": {
+      "op": "UnsqueezeOp",
+      "op_fields": {
+        "dim": 1
+      },
+      "inputs": [
+        "position_embeddings_1"
+      ],
+      "output": {
+        "name": "unsqueeze_1",
+        "shape": [
+          1,
+          1,
+          1,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul_2": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "transpose",
+        "unsqueeze"
+      ],
+      "output": {
+        "name": "mul_2",
+        "shape": [
+          1,
+          1,
+          28,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "slice_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_1_c1",
+        "value": 3.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_1_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_1_c2",
+        "value": 0.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_1_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_1_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_1_c3",
+        "value": 64.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_1_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_1": {
+      "op": "SliceOp",
+      "op_fields": {
+        "shape": [
+          1,
+          28,
+          8,
+          64
+        ]
+      },
+      "inputs": [
+        "transpose",
+        "slice_1_c1",
+        "slice_1_c2",
+        "slice_1_c3"
+      ],
+      "output": {
+        "name": "slice_1",
+        "shape": [
+          1,
+          28,
+          8,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "slice_2_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_2_c1",
+        "value": 3.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_2_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_2_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_2_c2",
+        "value": 64.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_2_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_2_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_2_c3",
+        "value": 9.223372036854776e+18
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_2_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_2": {
+      "op": "SliceOp",
+      "op_fields": {
+        "shape": [
+          1,
+          28,
+          8,
+          64
+        ]
+      },
+      "inputs": [
+        "transpose",
+        "slice_2_c1",
+        "slice_2_c2",
+        "slice_2_c3"
+      ],
+      "output": {
+        "name": "slice_2",
+        "shape": [
+          1,
+          28,
+          8,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "neg": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "negative"
+      },
+      "inputs": [
+        "slice_2"
+      ],
+      "output": {
+        "name": "neg",
+        "shape": [
+          1,
+          28,
+          8,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "cat_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "cat_c2",
+        "value": -1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "cat_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "cat": {
+      "op": "CatOp",
+      "op_fields": {},
+      "inputs": [
+        "neg",
+        "slice_1",
+        "cat_c2"
+      ],
+      "output": {
+        "name": "cat",
+        "shape": [
+          1,
+          28,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul_3": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "cat",
+        "unsqueeze_1"
+      ],
+      "output": {
+        "name": "mul_3",
+        "shape": [
+          1,
+          1,
+          28,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "add_1": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "add"
+      },
+      "inputs": [
+        "mul_2",
+        "mul_3"
+      ],
+      "output": {
+        "name": "add_1",
+        "shape": [
+          1,
+          1,
+          28,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul_4": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "transpose_1",
+        "unsqueeze"
+      ],
+      "output": {
+        "name": "mul_4",
+        "shape": [
+          1,
+          1,
+          4,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "slice_3_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_3_c1",
+        "value": 3.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_3_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_3_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_3_c2",
+        "value": 0.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_3_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_3_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_3_c3",
+        "value": 64.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_3_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_3": {
+      "op": "SliceOp",
+      "op_fields": {
+        "shape": [
+          1,
+          4,
+          8,
+          64
+        ]
+      },
+      "inputs": [
+        "transpose_1",
+        "slice_3_c1",
+        "slice_3_c2",
+        "slice_3_c3"
+      ],
+      "output": {
+        "name": "slice_3",
+        "shape": [
+          1,
+          4,
+          8,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "slice_4_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_4_c1",
+        "value": 3.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_4_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_4_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_4_c2",
+        "value": 64.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_4_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_4_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "slice_4_c3",
+        "value": 9.223372036854776e+18
+      },
+      "inputs": [],
+      "output": {
+        "name": "slice_4_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "slice_4": {
+      "op": "SliceOp",
+      "op_fields": {
+        "shape": [
+          1,
+          4,
+          8,
+          64
+        ]
+      },
+      "inputs": [
+        "transpose_1",
+        "slice_4_c1",
+        "slice_4_c2",
+        "slice_4_c3"
+      ],
+      "output": {
+        "name": "slice_4",
+        "shape": [
+          1,
+          4,
+          8,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "neg_1": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "negative"
+      },
+      "inputs": [
+        "slice_4"
+      ],
+      "output": {
+        "name": "neg_1",
+        "shape": [
+          1,
+          4,
+          8,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "cat_1_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "cat_1_c2",
+        "value": -1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "cat_1_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "cat_1": {
+      "op": "CatOp",
+      "op_fields": {},
+      "inputs": [
+        "neg_1",
+        "slice_3",
+        "cat_1_c2"
+      ],
+      "output": {
+        "name": "cat_1",
+        "shape": [
+          1,
+          4,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul_5": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "cat_1",
+        "unsqueeze_1"
+      ],
+      "output": {
+        "name": "mul_5",
+        "shape": [
+          1,
+          1,
+          4,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "add_2": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "add"
+      },
+      "inputs": [
+        "mul_4",
+        "mul_5"
+      ],
+      "output": {
+        "name": "add_2",
+        "shape": [
+          1,
+          1,
+          4,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "scaled_dot_product_attention_c3": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "scaled_dot_product_attention_c3",
+        "value": 0.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_c3",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "scaled_dot_product_attention_c4": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "scaled_dot_product_attention_c4",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_c4",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "scaled_dot_product_attention": {
+      "op": "SdpaOp",
+      "op_fields": {},
+      "inputs": [
+        "add_1",
+        "add_2",
+        "transpose_2"
+      ],
+      "output": {
+        "name": "scaled_dot_product_attention",
+        "shape": [
+          1,
+          1,
+          28,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "transpose_3_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_3_c1",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_3_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_3_c2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "transpose_3_c2",
+        "value": 2.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "transpose_3_c2",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "transpose_3": {
+      "op": "TransposeOp",
+      "op_fields": {
+        "axes": [
+          1,
+          2
+        ]
+      },
+      "inputs": [
+        "scaled_dot_product_attention"
+      ],
+      "output": {
+        "name": "transpose_3",
+        "shape": [
+          1,
+          28,
+          1,
+          8,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "reshape": {
+      "op": "ReshapeOp",
+      "op_fields": {
+        "shape": [
+          1,
+          8,
+          -1
+        ]
+      },
+      "inputs": [
+        "transpose_3"
+      ],
+      "output": {
+        "name": "reshape",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "linear_3": {
+      "op": "LinearOp",
+      "op_fields": {
+        "has_bias": false
+      },
+      "inputs": [
+        "reshape",
+        "p_attn_o_proj_weight"
+      ],
+      "output": {
+        "name": "linear_3",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "add_3": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "add"
+      },
+      "inputs": [
+        "hidden_states",
+        "linear_3"
+      ],
+      "output": {
+        "name": "add_3",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "pow_2_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "pow_2_c1",
+        "value": 2.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "pow_2_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "pow_2": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "pow"
+      },
+      "inputs": [
+        "add_3",
+        "pow_2_c1"
+      ],
+      "output": {
+        "name": "pow_2",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mean_1_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "mean_1_c1",
+        "value": 1.0
+      },
+      "inputs": [],
+      "output": {
+        "name": "mean_1_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "mean_1": {
+      "op": "MeanOp",
+      "op_fields": {
+        "axis": -1
+      },
+      "inputs": [
+        "pow_2"
+      ],
+      "output": {
+        "name": "mean_1",
+        "shape": [
+          1,
+          8,
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "add_4_c1": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "add_4_c1",
+        "value": 1e-06
+      },
+      "inputs": [],
+      "output": {
+        "name": "add_4_c1",
+        "shape": [
+          1
+        ],
+        "dtype": "f32"
+      }
+    },
+    "add_4": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "add"
+      },
+      "inputs": [
+        "mean_1",
+        "add_4_c1"
+      ],
+      "output": {
+        "name": "add_4",
+        "shape": [
+          1,
+          8,
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "rsqrt_1": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "rsqrt"
+      },
+      "inputs": [
+        "add_4"
+      ],
+      "output": {
+        "name": "rsqrt_1",
+        "shape": [
+          1,
+          8,
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul_6": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "add_3",
+        "rsqrt_1"
+      ],
+      "output": {
+        "name": "mul_6",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul_7": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "p_post_attention_layernorm_weight",
+        "mul_6"
+      ],
+      "output": {
+        "name": "mul_7",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "linear_4": {
+      "op": "LinearOp",
+      "op_fields": {
+        "has_bias": false
+      },
+      "inputs": [
+        "mul_7",
+        "p_mlp_gate_proj_weight"
+      ],
+      "output": {
+        "name": "linear_4",
+        "shape": [
+          1,
+          8,
+          18944
+        ],
+        "dtype": "float32"
+      }
+    },
+    "silu": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "silu"
+      },
+      "inputs": [
+        "linear_4"
+      ],
+      "output": {
+        "name": "silu",
+        "shape": [
+          1,
+          8,
+          18944
+        ],
+        "dtype": "float32"
+      }
+    },
+    "linear_5": {
+      "op": "LinearOp",
+      "op_fields": {
+        "has_bias": false
+      },
+      "inputs": [
+        "mul_7",
+        "p_mlp_up_proj_weight"
+      ],
+      "output": {
+        "name": "linear_5",
+        "shape": [
+          1,
+          8,
+          18944
+        ],
+        "dtype": "float32"
+      }
+    },
+    "mul_8": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "multiply"
+      },
+      "inputs": [
+        "silu",
+        "linear_5"
+      ],
+      "output": {
+        "name": "mul_8",
+        "shape": [
+          1,
+          8,
+          18944
+        ],
+        "dtype": "float32"
+      }
+    },
+    "linear_6": {
+      "op": "LinearOp",
+      "op_fields": {
+        "has_bias": false
+      },
+      "inputs": [
+        "mul_8",
+        "p_mlp_down_proj_weight"
+      ],
+      "output": {
+        "name": "linear_6",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    },
+    "add_5": {
+      "op": "ElementwiseOp",
+      "op_fields": {
+        "op": "add"
+      },
+      "inputs": [
+        "add_3",
+        "linear_6"
+      ],
+      "output": {
+        "name": "add_5",
+        "shape": [
+          1,
+          8,
+          3584
+        ],
+        "dtype": "float32"
+      }
+    }
+  }
+}

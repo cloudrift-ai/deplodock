@@ -1,5 +1,3 @@
-
-
 # Python virtual environment
 venv/
 
@@ -20,4 +18,14 @@ docker-compose.vllm.yml
 nginx.vllm.conf
 
 # PyCharm
-.idea/*.cubin
+.idea
+
+# Recipe artifacts
+/recipes/**
+
+# Experiment artifacts
+/experiments/**
+
+# Common dump filders
+_test_data/
+dump/

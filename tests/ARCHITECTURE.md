@@ -37,6 +37,31 @@ tests/
 │   ├── test_gcp.py             # GCP command builders
 │   ├── test_staging.py      # enumerate_staged_files(), build_stage_tar()
 │   └── test_vm_dryrun.py    # vm create/delete CLI dry-run
+├── compiler/
+│   ├── fixtures/               # pre-computed traces (tinyllama_layer0.json)
+│   ├── test_ir.py              # Graph, Node, Tensor — add/remove/replace/topo/copy
+│   ├── test_hints.py           # Hints get/set/merge/serialize + integration
+│   ├── test_matcher.py         # Pattern matching engine
+│   ├── test_rewriter.py        # Rewrite engine (SiLU decomposition)
+│   ├── rules/
+│   │   ├── test_decompose_rules.py    # Decomposition rules (structural + correctness)
+│   │   ├── test_optimization_rules.py # Optimization rules (broadcast indexmap)
+│   │   └── test_fusion_rules.py       # Fusion pass (lift-then-splice, structural + correctness)
+│   ├── test_fusion.py          # auto_fuse — softmax, RMSNorm, SiLU, matmul, etc.
+│   ├── test_plan.py            # plan_graph — ExecutionPlan from Graph
+│   ├── test_pipeline.py        # Full compile pipeline: graph → GPU
+│   ├── test_real_trace.py      # TinyLlama fixture validation
+│   ├── test_torch_trace.py     # PyTorch tracer smoke tests
+│   ├── test_torch_trace_ops.py # PyTorch tracer op handlers and helpers
+│   ├── test_backend_ir.py      # Backend IR AST nodes + codegen emission
+│   ├── test_kernel_gen.py      # Kernel generation from FusedRegionOps
+│   ├── test_loop_ir.py         # LoopIR dataclasses, pretty-print, structure, round-trip
+│   ├── test_cuda.py            # CUDA codegen, lowering, GPU correctness
+│   ├── test_cuda_backend.py    # CudaBackend compile/run/benchmark
+│   ├── test_program.py         # Program source gen + GPU execution
+│   ├── test_tuning.py          # GPU tuning profile dispatch
+│   ├── test_llama_block.py     # Full Llama block through compiler
+│   └── test_torch_ops.py   # Op.forward() + numpy backend (no GPU needed)
 ├── scripts/
 │   └── test_plot_mcr_sweep.py  # load_results() from scripts/plot_mcr_sweep.py
 ```

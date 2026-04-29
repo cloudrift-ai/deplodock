@@ -1,51 +1,29 @@
-"""Minimal tensor IR and graph transformation engine."""
+"""Minimal tensor IR and structural-kernel compiler."""
 
-from deplodock.compiler.benchmark import BenchmarkSuite, run_benchmark_suite
-from deplodock.compiler.cuda.lower import MatmulConfig
-from deplodock.compiler.ir import Graph, Node, Tensor
-from deplodock.compiler.matcher import Match, match_pattern
-from deplodock.compiler.ops import (
-    ElementwiseOp,
-    FusedReduceElementwiseOp,
-    GatherOp,
-    InputOp,
-    Op,
-    ReduceOp,
-    ScanOp,
-    ScatterOp,
-)
-from deplodock.compiler.pattern import PatternNode, PatternVar, PatternWildcard, parse_pattern
-from deplodock.compiler.pipeline import compile_and_run
-from deplodock.compiler.rewriter import Pass, Rewriter, Rule
-from deplodock.compiler.trace import CompilerTrace, ExecutionResult, PassTrace, RuleApplication
+from deplodock.compiler.graph import Graph, Node, Tensor
+from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
+from deplodock.compiler.ir.frontend.ir import ReshapeOp, TransposeOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp, ScanOp, ScatterOp
+from deplodock.compiler.pipeline.dump import CompilerDump
+from deplodock.compiler.pipeline.engine import Match, Pattern, match_pattern, run_pass
 
 __all__ = [
-    "BenchmarkSuite",
-    "CompilerTrace",
+    "Match",
+    "CompilerDump",
+    "ConstantOp",
     "ElementwiseOp",
-    "FusedReduceElementwiseOp",
     "GatherOp",
     "Graph",
     "InputOp",
-    "Match",
-    "MatmulConfig",
     "Node",
     "Op",
-    "Pass",
-    "PatternNode",
-    "PatternVar",
-    "PatternWildcard",
+    "Pattern",
     "ReduceOp",
-    "Rewriter",
-    "Rule",
+    "ReshapeOp",
     "ScanOp",
     "ScatterOp",
     "Tensor",
-    "compile_and_run",
-    "ExecutionResult",
-    "run_benchmark_suite",
+    "TransposeOp",
     "match_pattern",
-    "parse_pattern",
-    "PassTrace",
-    "RuleApplication",
+    "run_pass",
 ]

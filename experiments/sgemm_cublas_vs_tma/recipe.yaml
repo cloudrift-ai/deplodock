@@ -1,0 +1,64 @@
+command:
+  stage:
+    - deplodock
+    - scripts
+    - pyproject.toml
+    - requirements.txt
+    - Makefile
+  run: |
+    export PATH=/usr/local/cuda/bin:$$PATH
+    export DEPLODOCK_GIT_REV="$git_rev"
+    cd $repo_dir
+    [ -d venv ] || make setup
+    ./venv/bin/python scripts/bench_matmul.py \
+      --strategy $strategy \
+      --size $size \
+      --batch $batch \
+      --iterations $iterations \
+      --output-dir $task_dir
+  result_files:
+    - "*.json"
+  timeout: 300
+
+aggregate:
+  run: |
+    ./venv/bin/python scripts/aggregate_sgemm.py $run_dir --output $run_dir/report.md
+  timeout: 60
+
+matrices:
+  cross:
+    deploy.gpu_count: 1
+    deploy.driver_version: "595.58.03"
+    deploy.cuda_version: "13.2"
+    strategy:
+      - adaptive    # TMA with per-size tuning (production default)
+      - smem        # SIMT shared-memory (comparison)
+    git_rev: "feature/transformer-compiler@local"
+    deploy.gpu:
+      - "NVIDIA GeForce RTX 5090"
+    size:
+      # Square (existing baseline)
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+      - 8192
+      # Rectangular small-M (transformer block at seq_len=32)
+      # TinyLlama (hidden=2048, ffn=5632, kv_heads=4, head_dim=64)
+      - 32x2048x2048    # Q/O projection
+      - 32x256x2048     # K/V projection
+      - 32x5632x2048    # gate/up projection
+      - 32x2048x5632    # down projection
+      # Qwen2.5-7B (hidden=3584, ffn=18944, kv_heads=4, head_dim=128)
+      - 32x3584x3584    # Q/O projection
+      - 32x512x3584     # K/V projection
+      - 32x18944x3584   # gate/up projection
+      - 32x3584x18944   # down projection
+      # Medium sequence length (seq_len=128)
+      - 128x2048x2048
+      - 128x3584x3584
+      - 128x5632x2048
+      - 128x18944x3584
+    batch: [1, 4, 8, 16]
+    iterations: 30

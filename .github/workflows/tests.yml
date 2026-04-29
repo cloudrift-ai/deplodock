@@ -15,7 +15,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: make setup
+        run: make setup-ci
 
       - name: Ruff check
         run: ./venv/bin/ruff check
@@ -33,7 +33,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: make setup
+        run: make setup-ci
 
       - name: Run tests
-        run: ./venv/bin/pytest tests/ -v
+        run: make test

@@ -14,6 +14,7 @@ See `README.md` for full project structure, recipe format, and CLI usage.
 - `make setup` to create the virtual environment and install dependencies
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
+- `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging
 
 ## Running Tests
 
@@ -40,6 +41,17 @@ Or for a specific test file:
 - `deplodock vm create cloudrift ...` — create a CloudRift GPU VM
 - `deplodock vm delete gcp ...` — delete a GCP GPU VM
 - `deplodock vm delete cloudrift ...` — delete a CloudRift GPU VM
+- `deplodock pull <model>` — download a HuggingFace model to local cache
+- `deplodock trace <model> [--layer N] [--seq-len N]` — trace a transformer layer (or the whole model if `--layer` is omitted) to Graph IR (JSON). Whole-model tracing patches HF's dynamic causal-mask construction via `trace.huggingface.build_full_model_wrapper`.
+- `deplodock trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)
+- `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model)
+- `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
+- `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
+- `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
+- `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
+- Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+- GPU benchmark model (ungated, 7B): `Qwen/Qwen2.5-7B`
+- Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`
 
 ## Key Make Targets
 
@@ -49,6 +61,10 @@ Or for a specific test file:
 - `make format` — auto-format code and fix lint violations
 - `make bench` — run benchmarks (`deplodock bench recipes/*`)
 - `make clean` — remove venv and generated files
+
+## Documentation Conventions
+
+- Target ~120 characters for `ARCHITECTURE.md`, `README.md`, and other docs (ASCII diagrams, tables, prose). Wider is fine if a table or diagram reads better that way — some overflow is acceptable. Python code stays under 140 chars (Ruff-enforced).
 
 ## Contribution Instructions
 
