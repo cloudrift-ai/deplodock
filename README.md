@@ -51,6 +51,97 @@ Principled compilation stack with six IR stages, each printable on demand via `-
 5. **Kernel IR** — materializes the schedule into framework-agnostic hardware primitives
 6. **CUDA** — optimized CUDA code ready for `nvcc`
 
+
+**Readable Schedule**: `deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))" --ir tile`
+```
+kernel k_rms_norm_reduce  inputs: rms_norm_mean_count, rms_norm_eps, x, p_weight  outputs: rms_norm
+    in0 = load rms_norm_mean_count[0]
+    in1 = load rms_norm_eps[0]
+    Tile(axes=(a0:256=THREAD, a1:32=BLOCK)):
+        x_smem = Stage(x, origin=(0, a1, 0), slab=(a2:2048@2)) async
+        p_weight_smem = Stage(p_weight, origin=(0), slab=(a3:2048@0)) async
+        StridedLoop(a2 = a0; < 2048; += 256):  # reduce
+            in2 = load x_smem[a2]
+            v0 = multiply(in2, in2)
+            acc0 <- add(acc0, v0)
+        Combine(acc0, op=add)
+        v1 = divide(acc0, in0)
+        v2 = add(v1, in1)
+        v3 = rsqrt(v2)
+        StridedLoop(a3 = a0; < 2048; += 256):  # free
+            in3 = load x_smem[a3]
+            in4 = load p_weight_smem[a3]
+            v4 = multiply(in3, v3)
+            v5 = multiply(v4, in4)
+            rms_norm[0, a1, a3] = v5
+```
+
+**Optimized CUDA kernel**: `deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))" --ir cuda`
+
+```c
+extern "C" __global__
+__launch_bounds__(256) void k_rms_norm_reduce(const float* x, const float* p_weight, float* rms_norm) {
+    float in0 = 2048.0f;
+    float in1 = 1e-06f;
+    {
+        int a1 = blockIdx.x;
+        int a0 = threadIdx.x;
+        float acc0 = 0.0f;
+        __syncthreads();
+        __shared__ float x_smem[2048];
+        for (int x_smem_flat = a0; x_smem_flat < 2048; x_smem_flat += 256) {
+            {
+                unsigned int _smem_addr = __cvta_generic_to_shared(&x_smem[x_smem_flat]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                             :: "r"(_smem_addr), "l"(&x[a1 * 2048 + x_smem_flat])
+                             : "memory");
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();
+        __shared__ float p_weight_smem[2048];
+        for (int p_weight_smem_flat = a0; p_weight_smem_flat < 2048; p_weight_smem_flat += 256) {
+            {
+                unsigned int _smem_addr = __cvta_generic_to_shared(&p_weight_smem[p_weight_smem_flat]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                             :: "r"(_smem_addr), "l"(&p_weight[p_weight_smem_flat])
+                             : "memory");
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();
+        for (int a2 = a0; a2 < 2048; a2 += 256) {
+            float in2 = x_smem[a2];
+            float v0 = in2 * in2;
+            acc0 += v0;
+        }
+        __shared__ float acc0_smem[256];
+        acc0_smem[a0] = acc0;
+        __syncthreads();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (a0 < s) {
+                acc0_smem[a0] = acc0_smem[a0] + acc0_smem[a0 + s];
+            }
+            __syncthreads();
+        }
+        __syncthreads();
+        float acc0_b = acc0_smem[0];
+        float v1 = acc0_b / in0;
+        float v2 = v1 + in1;
+        float v3 = rsqrtf(v2);
+        for (int a3 = a0; a3 < 2048; a3 += 256) {
+            float in3 = x_smem[a3];
+            float in4 = p_weight_smem[a3];
+            float v4 = in3 * v3;
+            float v5 = v4 * in4;
+            rms_norm[a1 * 2048 + a3] = v5;
+        }
+    }
+}
+```
+
 ## Benchmark
 
 ```bash
