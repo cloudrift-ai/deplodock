@@ -17,7 +17,7 @@ setup:
 		echo "Creating virtual environment..."; \
 		python3.12 -m venv venv; \
 		echo "Installing Python dependencies..."; \
-		./venv/bin/pip install -e ".[dev]"; \
+		./venv/bin/pip install -e ".[compile,dev]"; \
 		echo "✅ Setup complete!"; \
 	fi
 
