@@ -87,6 +87,18 @@ Variant naming is handled by `Variant` in `deplodock.planner.variant`. Each matr
 
 Examples: `rtx5090x1_mc8_mcr8_np80_vllm_benchmark.txt`, `rtx5090x1_vllm_benchmark.txt` (deploy-only params).
 
+### Driver / CUDA Version Pinning
+
+`deploy.driver_version` and `deploy.cuda_version` (both optional) request a specific NVIDIA driver / CUDA toolkit on the target host. If the installed version already matches (prefix-match — `"550"` matches `550.127.05`), provisioning is a no-op. On a mismatch, a remote (`ssh`/`cloud`) deploy installs the requested version, reboots the host, and waits for SSH to come back. Local deploys refuse to run privileged commands and error out instead — these fields are intended for remote machines only.
+
+```yaml
+matrices:
+  deploy.gpu: "NVIDIA H200 141GB"
+  deploy.gpu_count: 8
+  deploy.driver_version: "550"
+  deploy.cuda_version: "12.4"
+```
+
 ### DeployConfig
 
 GPU provisioning info is encapsulated in `DeployConfig` (nested under `Recipe.deploy`):
@@ -225,6 +237,18 @@ matrices:
   engine.llm.docker_options:
       security_opt:
         - seccomp=unconfined
+```
+
+### SGLang Matrix Entry Example
+
+To benchmark with SGLang alongside vLLM, use a cross-product with the engine image. An empty string selects vLLM (no SGLang sub-config is created), while a non-empty string activates SGLang:
+
+```yaml
+matrices:
+  cross:
+    deploy.gpu: "NVIDIA GeForce RTX 5090"
+    deploy.gpu_count: 1
+    engine.llm.sglang.image: ["", "lmsysorg/sglang:v0.5.9"]
 ```
 
 ### SGLang Quantization for AWQ MoE Models
