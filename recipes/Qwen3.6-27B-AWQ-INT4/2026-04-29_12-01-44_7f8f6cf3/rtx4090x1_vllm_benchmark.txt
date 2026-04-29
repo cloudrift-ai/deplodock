@@ -1,0 +1,242 @@
+============ Benchmark Task ============
+recipe_dir: recipes/Qwen3.6-27B-AWQ-INT4
+variant: rtx4090x1
+gpu_name: NVIDIA GeForce RTX 4090
+gpu_count: 1
+recipe:
+  model:
+    huggingface: cyankiwi/Qwen3.6-27B-AWQ-INT4
+  engine:
+    llm:
+      context_length: 8192
+      max_concurrent_requests: 16
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      gpu_memory_utilization: 0.95
+      vllm:
+        image: vllm/vllm-openai:v0.20.0
+        extra_args: --language-model-only --enable-auto-tool-choice --tool-call-parser
+          qwen3_coder --reasoning-parser qwen3
+        extra_env: {}
+      sglang: null
+      docker_options: {}
+  benchmark:
+    max_concurrency: 8
+    num_prompts: 32
+    random_input_len: 2000
+    random_output_len: 2000
+  deploy:
+    gpu: NVIDIA GeForce RTX 4090
+    gpu_count: 1
+    driver_version: null
+    cuda_version: null
+  command: null
+  aggregate: null
+==================================================
+
+============ Serving Benchmark Result ============
+Successful requests:                     32        
+Failed requests:                         0         
+Maximum request concurrency:             8         
+Benchmark duration (s):                  508.77    
+Total input tokens:                      64000     
+Total generated tokens:                  64000     
+Request throughput (req/s):              0.06      
+Output token throughput (tok/s):         125.79    
+Peak output token throughput (tok/s):    172.00    
+Peak concurrent requests:                10.00     
+Total token throughput (tok/s):          251.58    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          57850.25  
+Median TTFT (ms):                        56306.42  
+P99 TTFT (ms):                           101907.13 
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          28.87     
+Median TPOT (ms):                        25.57     
+P99 TPOT (ms):                           42.89     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           28.87     
+Median ITL (ms):                         23.49     
+P99 ITL (ms):                            24.42     
+==================================================
+
+============ Docker Compose Configuration ============
+services:
+
+  vllm_0:
+    image: vllm/vllm-openai:v0.20.0
+    container_name: vllm_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    volumes:
+      - /hf_models:/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=***
+      - HF_HOME=/hf_models
+    ports:
+      - "8000:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.95
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 1
+      --pipeline-parallel-size 1
+      --data-parallel-size 1
+      --model cyankiwi/Qwen3.6-27B-AWQ-INT4
+      --served-model-name cyankiwi/Qwen3.6-27B-AWQ-INT4
+      --max-model-len 8192
+      --max-num-seqs 16
+      --language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 1200s
+==================================================
+
+============ Benchmark Command ============
+vllm bench serve
+    --model cyankiwi/Qwen3.6-27B-AWQ-INT4
+    --trust-remote-code
+    --max-concurrency 8
+    --num-prompts 32
+    --random-input-len 2000
+    --random-output-len 2000
+    --base-url http://localhost:8000
+==================================================
+
+============ System Information ============
+=== HOSTNAME ===
+riftvm
+
+=== OS ===
+PRETTY_NAME="Ubuntu 24.04.1 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.1 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+
+=== KERNEL ===
+6.8.0-51-generic
+
+=== CPU INFORMATION ===
+Architecture:                         x86_64
+CPU op-mode(s):                       32-bit, 64-bit
+Address sizes:                        46 bits physical, 57 bits virtual
+Byte Order:                           Little Endian
+CPU(s):                               7
+On-line CPU(s) list:                  0-6
+Vendor ID:                            GenuineIntel
+Model name:                           Intel(R) Xeon(R) Platinum 8352V CPU @ 2.10GHz
+CPU family:                           6
+Model:                                106
+Thread(s) per core:                   1
+Core(s) per socket:                   1
+Socket(s):                            7
+Stepping:                             6
+BogoMIPS:                             4200.00
+Flags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves wbnoinvd arat vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq la57 rdpid fsrm md_clear arch_capabilities
+Virtualization:                       VT-x
+Hypervisor vendor:                    KVM
+Virtualization type:                  full
+L1d cache:                            224 KiB (7 instances)
+L1i cache:                            224 KiB (7 instances)
+L2 cache:                             28 MiB (7 instances)
+L3 cache:                             112 MiB (7 instances)
+NUMA node(s):                         1
+NUMA node0 CPU(s):                    0-6
+Vulnerability Gather data sampling:   Unknown: Dependent on hypervisor status
+Vulnerability Itlb multihit:          Not affected
+Vulnerability L1tf:                   Not affected
+Vulnerability Mds:                    Not affected
+Vulnerability Meltdown:               Not affected
+Vulnerability Mmio stale data:        Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+Vulnerability Reg file data sampling: Not affected
+Vulnerability Retbleed:               Not affected
+Vulnerability Spec rstack overflow:   Not affected
+Vulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:             Mitigation; Enhanced / Automatic IBRS; IBPB conditional; RSB filling; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop
+Vulnerability Srbds:                  Not affected
+Vulnerability Tsx async abort:        Mitigation; TSX disabled
+
+=== CPU COUNT ===
+7
+
+=== MEMORY ===
+               total        used        free      shared  buff/cache   available
+Mem:            45Gi       5.7Gi       1.3Gi        53Mi        38Gi        39Gi
+Swap:             0B          0B          0B
+
+=== GPU INFORMATION ===
+NVIDIA GeForce RTX 4090, 24564 MiB, 580.65.06, P8, 27, 0 %
+
+=== GPU DETAILS ===
+Wed Apr 29 19:01:56 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.65.06              Driver Version: 580.65.06      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        Off |   00000000:00:10.0 Off |                  Off |
+|  0%   27C    P8             10W /  450W |   21499MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A           12849      C   VLLM::EngineCore                      21490MiB |
++-----------------------------------------------------------------------------------------+
+
+=== DISK USAGE ===
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           4.6G  1.3M  4.6G   1% /run
+efivarfs        256K   17K  235K   7% /sys/firmware/efi/efivars
+/dev/vda1       991G   55G  937G   6% /
+tmpfs            23G  4.0K   23G   1% /dev/shm
+tmpfs           5.0M     0  5.0M   0% /run/lock
+/dev/vda16      881M   62M  758M   8% /boot
+/dev/vda15      105M  8.4M   97M   8% /boot/efi
+tmpfs           4.6G   20K  4.6G   1% /run/user/1000
+
+=== BLOCK DEVICES ===
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+sr0      11:0    1  368K  0 rom  
+vda     253:0    0    1T  0 disk 
+|-vda1  253:1    0 1023G  0 part /
+|-vda14 253:14   0    4M  0 part 
+|-vda15 253:15   0  106M  0 part /boot/efi
+`-vda16 259:0    0  913M  0 part /boot
+
+=== UPTIME ===
+ 19:01:56 up  2:29,  1 user,  load average: 0.00, 0.02, 0.00
+
+=== DOCKER VERSION ===
+Docker version 28.5.1, build e180ab8
+
+=== DOCKER INFO ===
+28.5.1 | OS: Ubuntu 24.04.1 LTS | Containers: 1 | Images: 1
+==================================================

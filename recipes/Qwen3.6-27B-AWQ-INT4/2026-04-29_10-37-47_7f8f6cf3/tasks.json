@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "Qwen3.6-27B-AWQ-INT4/rtx4090x1",
+    "recipe_dir": "recipes/Qwen3.6-27B-AWQ-INT4",
+    "variant": "rtx4090x1",
+    "recipe_name": "Qwen3.6-27B-AWQ-INT4",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "gpu_short": "rtx4090",
+    "gpu_count": 1,
+    "model_name": "cyankiwi/Qwen3.6-27B-AWQ-INT4",
+    "result_file": "rtx4090x1_vllm_benchmark.txt",
+    "json_result_file": "rtx4090x1_vllm_benchmark.json"
+  }
+]
