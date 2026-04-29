@@ -1,0 +1,25 @@
+model:
+  huggingface: "cyankiwi/Qwen3.6-27B-AWQ-INT4"
+
+engine:
+  llm:
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.95
+    # Native 262144; capped to fit ~20.5 GB weights + KV cache on a 24 GB RTX 4090.
+    # vLLM reported only ~0.69 GiB free for KV at 32k → max viable ~8624; using 8192.
+    context_length: 8192
+    max_concurrent_requests: 16
+    vllm:
+      image: "vllm/vllm-openai:v0.20.0"
+      extra_args: "--language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+
+benchmark:
+  max_concurrency: 1
+  num_prompts: 8
+  random_input_len: 2000
+  random_output_len: 2000
+
+matrices:
+  deploy.gpu: "NVIDIA GeForce RTX 4090"
+  deploy.gpu_count: 1
