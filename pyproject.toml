@@ -16,12 +16,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio", "pytest-xdist"]
-plot = ["matplotlib"]
-compile = ["torch", "transformers", "scipy", "cupy-cuda12x", "cppyy"]
-viz = ["graphviz"]  # Renders dump_dir/*.dot files — requires `dot` binary on PATH
+compile = ["torch", "transformers", "cppyy==3.5.0"]
 # flash-attn requires torch at build time, install separately:
 #   pip install flash-attn --no-build-isolation
-dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphviz", "cupy-cuda12x", "cppyy"]
+dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphviz", "torch", "transformers", "cupy-cuda12x; sys_platform == 'linux'", "cppyy==3.5.0"]
 
 [tool.setuptools.packages.find]
 include = ["deplodock*"]

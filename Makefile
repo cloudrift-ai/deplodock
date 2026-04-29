@@ -15,11 +15,14 @@ help:
 setup:
 	@if [ ! -d "venv" ]; then \
 		echo "Creating virtual environment..."; \
-		python3.12 -m venv venv; \
+		python3.12 -m venv venv --prompt "deplodock"; \
 		echo "Installing Python dependencies..."; \
-		./venv/bin/pip install -e ".[compile,dev]"; \
-		echo "✅ Setup complete!"; \
+		./venv/bin/pip install -e ".[dev]"; \
 	fi
+
+setup-ci:
+	python3.12 -m venv venv --prompt "deplodock"
+	./venv/bin/pip install -e ".[compile,test]"
 
 lint: setup
 	./venv/bin/ruff check

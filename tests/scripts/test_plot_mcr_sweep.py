@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 
 
+pytest.importorskip("matplotlib")
+
+
 # Add scripts/ to sys.path so we can import the module directly
 @pytest.fixture(autouse=True)
 def _add_scripts_to_path():

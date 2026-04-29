@@ -79,14 +79,15 @@ def handle_run(args):
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.pipeline.dump import CompilerDump
 
+    if args.ir is not None and args.code is not None:
+        logger.error("--ir and --code are mutually exclusive")
+        sys.exit(1)
+
     if not torch.cuda.is_available():
         logger.error("CUDA GPU required")
         sys.exit(1)
 
     if args.ir is not None:
-        if args.code is not None:
-            logger.error("--ir and --code are mutually exclusive")
-            sys.exit(1)
         _handle_run_ir(args, CudaBackend, CompilerDump)
         return
 
