@@ -109,6 +109,11 @@ def _find_matmul(body: tuple[Stmt, ...]) -> int | None:
             continue
         # Pure matmul shape only: Load / Assign / Accum stmts allowed.
         # Reject Select / Cond / nested Loops / staged-buffer rereads etc.
+        # (Allowing Select fires on SDPA-with-rotary kernels — semantically
+        # safe since Select.rewrite handles per-cell σ substitution — but
+        # the surrounding Stages get cell-dim factors added to their slab
+        # layouts; with rotary's 10+ stages the post-pad smem usage blows
+        # past the 48 KB consumer limit. Gate when staging is bounded.)
         if not all(isinstance(c, (Load, Assign, Accum)) for c in rl.body):
             continue
         # Reject if any SSA name read by the body is not defined locally —
