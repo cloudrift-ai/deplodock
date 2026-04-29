@@ -20,6 +20,7 @@ Before running anything, confirm these with the user (ask only the ones not alre
    - **If the user explicitly named a provider, it is binding.** If the requested GPU is not listed under that provider in `GPU_INSTANCE_TYPES`, **stop and report the mismatch** — do not silently fall back to another provider. List the providers that actually offer the GPU and let the user decide whether to switch GPU, switch provider, or abort. Never substitute providers on the user's behalf.
 4. **Instance name** (GCP only) — propose `deplodock-<gpu-short>-<count>g` if not given.
 5. **SSH public key path** (CloudRift only) — default `~/.ssh/id_ed25519.pub`. Confirm it exists.
+6. **Billing-exempt rental?** (CloudRift only) — explicitly ask the user whether to add `--billing-exempt`. This flag skips CloudRift billing and is admin-only; it is not a default. Only pass it if the user confirms they have an admin/no-cost agreement. Do not infer from "free", "test", or "cheap" — require an explicit yes. The flag does not exist on GCP, so never ask for it when the provider is GCP.
 
 If the requested GPU is not in `GPU_INSTANCE_TYPES`, stop and tell the user — don't guess an instance type.
 
@@ -32,6 +33,26 @@ Read `deplodock/hardware.py` to confirm current values; do not trust this skill'
 - **GCP zone**: look up in `GPU_GCP_ZONES`. Use the first listed zone. Fall back to `DEFAULT_GCP_ZONE` (`us-central1-b`) if the GPU is not listed.
 - **GCP provisioning model**: look up in `GPU_GCP_PROVISIONING_MODEL`. Default is `FLEX_START`. (Pro 6000 Server Edition uses `SPOT`.)
 
+## Capacity Fallback: Try Each Base In Order
+
+When a `(GPU, provider)` key in `GPU_INSTANCE_TYPES` lists **multiple bases** with the same provider, treat the list as a capacity-fallback chain — different bases are different CPU/RAM/disk profiles, and CloudRift capacity often varies across them. The selected base may simply not be available right now even when the GPU is listed.
+
+Procedure when the create command fails with a capacity-style error (HTTP 5xx, 409 Conflict, "no capacity", "out of stock", or "Service Unavailable") on the chosen base:
+
+1. Move to the **next base** under the same `(GPU, provider)` key in `GPU_INSTANCE_TYPES` and retry with the same `gpu_count`.
+2. Continue down the list until one base succeeds or all bases are exhausted.
+3. Do **not** retry the same base immediately — capacity failures clear on a different base, not on the same one in the same second.
+4. Do **not** silently switch to a different *provider* — the user-specified provider is still binding (see Inputs to Confirm #3).
+5. Do **not** silently switch to a different *GPU model* (e.g. Workstation Edition → Max-Q) without asking — those are different hardware.
+
+If every base in the list fails:
+
+1. **Stop. Do not retry indefinitely.**
+2. Report to the user: each base attempted, the exact error each returned, and the order they were tried.
+3. Offer concrete next steps: wait and retry later, drop `--billing-exempt` (CloudRift) in case the rejection is account-side, switch GPU model, or switch provider.
+
+Treat clearly non-capacity errors (auth: 401/403, malformed request: 400, missing instance type: 404 with a "not found" body) as terminal — those won't be fixed by trying another base. Stop and report immediately.
+
 ## Commands
 
 ### CloudRift
@@ -39,10 +60,28 @@ Read `deplodock/hardware.py` to confirm current values; do not trust this skill'
 ```bash
 deplodock vm create cloudrift \
   --instance-type <base>.<gpu_count> \
-  --ssh-key ~/.ssh/id_ed25519.pub
+  --ssh-key ~/.ssh/id_ed25519.pub \
+  [--billing-exempt]    # ONLY if the user explicitly confirmed admin/no-cost
 ```
 
 The command requires the **public** key path (`.pub`), not the private key. `CLOUDRIFT_API_KEY` must be set in the environment (or pass `--api-key`). The command waits up to 600s for `Active` status and prints the SSH connection on success.
+
+**`--billing-exempt`** is an admin-only flag that skips CloudRift billing. Always confirm with the user before adding it; never set it implicitly. It is silently accepted by the API only for accounts authorized for no-cost rentals — passing it on a regular account will likely fail or be billed normally. The flag is CloudRift-specific and does not exist for GCP.
+
+**Sourcing the API key from `.env`:** deplodock does **not** auto-load `.env` (no `python-dotenv` dependency). If the project root contains a `.env` file with `CLOUDRIFT_API_KEY=...` (and optionally `CLOUDRIFT_API_URL=...` for on-prem), source it into the current shell before invoking `vm create`:
+
+```bash
+set -a; source .env; set +a
+deplodock vm create cloudrift --instance-type <base>.<gpu_count> --ssh-key ~/.ssh/id_ed25519.pub
+```
+
+Or chain it inline so the export is scoped to the single command:
+
+```bash
+env $(grep -v '^#' .env | xargs) deplodock vm create cloudrift ...
+```
+
+Before sourcing, sanity-check that `.env` exists at the project root and that `CLOUDRIFT_API_KEY` is one of the keys it defines (`grep -c '^CLOUDRIFT_API_KEY=' .env`). Do not echo or log the value. `.env` is gitignored — never `git add` it.
 
 **H200 on CloudRift only works on on-prem clusters** — set `CLOUDRIFT_API_URL` to the on-prem endpoint before running, or warn the user that public `api.cloudrift.ai` will not return H200 capacity. If unsure whether the user has on-prem access, ask before running.
 
