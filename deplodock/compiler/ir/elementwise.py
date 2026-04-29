@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 
+
 # Names whose callable isn't a plain ``getattr(np, name)`` — non-numpy
 # intrinsics (all unary). Every other op name matches a numpy attribute,
 # and ``__init__`` falls through to ``getattr(np, name)`` for them.

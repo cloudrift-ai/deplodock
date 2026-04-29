@@ -40,7 +40,6 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Select, Stmt, Tile, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
-
 from deplodock.compiler.tuning import detect_pat, register_tile_factor
 
 PATTERN = [Pattern("root", TileOp)]

@@ -34,7 +34,6 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern
-
 from deplodock.compiler.tuning import per_axis_threads, thread_budget
 
 PATTERN = [Pattern("root", TileOp)]

@@ -37,7 +37,6 @@ from dataclasses import dataclass, field, replace
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
-    _PRECEDENCE,
     BinaryExpr,
     Expr,
     FuncCallExpr,
@@ -973,7 +972,7 @@ def map_body(
 # (``Loop`` / ``StridedLoop`` / ``Tile`` / ``Cond``) so they apply uniformly
 # to Loop IR and Tile IR bodies.
 
-from deplodock.compiler.ir.expr import Interval, SimplifyCtx  # noqa: E402
+from deplodock.compiler.ir.expr import Interval  # noqa: E402
 
 
 def _identity_rename(n: str) -> str:
