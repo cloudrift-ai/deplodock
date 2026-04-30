@@ -11,6 +11,7 @@ to Loop IR and Tile IR bodies.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 
 from deplodock.compiler.ir.axis import Axis
@@ -20,7 +21,30 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Select, SelectBranch, Write
-from deplodock.compiler.ir.stmt.visit import _identity_rename, _make_axis_renamer, _recurse_through_block
+
+# ---------------------------------------------------------------------------
+# Visitor helpers shared by every pass below
+# ---------------------------------------------------------------------------
+
+
+def _identity_rename(n: str) -> str:
+    return n
+
+
+def _make_axis_renamer(old: str, new: Axis) -> Callable[[Axis], Axis]:
+    return lambda a: new if a.name == old else a
+
+
+def _recurse_through_block(s: Stmt, fn: Callable[[Stmt], Stmt | None | Iterable[Stmt]]) -> Stmt | None:
+    """If ``s`` is a non-Loop block stmt, return a copy with its body /
+    bodies re-walked through ``fn`` via ``Body.map``. Else return ``None``."""
+    if isinstance(s, StridedLoop):
+        return StridedLoop(axis=s.axis, start=s.start, step=s.step, body=s.body.map(fn))
+    if isinstance(s, Tile):
+        return Tile(axes=s.axes, body=s.body.map(fn))
+    if isinstance(s, Cond):
+        return Cond(cond=s.cond, body=s.body.map(fn), else_body=s.else_body.map(fn))
+    return None
 
 
 def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
