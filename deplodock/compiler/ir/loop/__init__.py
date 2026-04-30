@@ -30,8 +30,6 @@ from deplodock.compiler.ir.loop.ir import (
     SelectBranch,
     Stmt,
     Write,
-    iter_body,
-    map_body,
 )
 from deplodock.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
 from deplodock.compiler.ir.sigma import Sigma

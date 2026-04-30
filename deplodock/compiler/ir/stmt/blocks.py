@@ -7,11 +7,6 @@ decode helpers used by ``Tile.render`` live alongside.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from deplodock.compiler.ir.stmt.body import Body
-
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -19,6 +14,7 @@ from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Expr, _float_lit
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _axis_identity, _pad, pretty_body
+from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Load
 
 
@@ -47,6 +43,12 @@ class Loop(Stmt):
     axis: Axis
     body: Body
     unroll: bool = False
+
+    def __post_init__(self) -> None:
+        # Coerce so ``Loop(body=tuple_value)`` keeps working without
+        # forcing every construction site to wrap explicitly.
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body(self.body))
 
     def deps(self) -> tuple[str, ...]:
         return ()
@@ -133,6 +135,10 @@ class Tile(Stmt):
 
     axes: tuple[BoundAxis, ...]
     body: Body
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            self.body = Body(self.body)
 
     def nested(self) -> tuple[Body, ...]:
         return (self.body,)
@@ -268,6 +274,10 @@ class StridedLoop(Stmt):
     body: Body
     unroll: bool = False
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body(self.body))
+
     def deps(self) -> tuple[str, ...]:
         return ()
 
@@ -348,6 +358,13 @@ class Cond(Stmt):
     cond: Expr
     body: Body
     else_body: Body = ()
+
+    def __post_init__(self) -> None:
+
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body(self.body))
+        if not isinstance(self.else_body, Body):
+            object.__setattr__(self, "else_body", Body(self.else_body))
 
     def deps(self) -> tuple[str, ...]:
         return tuple(self.cond.free_vars())

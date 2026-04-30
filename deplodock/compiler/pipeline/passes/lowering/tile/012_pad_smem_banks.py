@@ -54,7 +54,7 @@ from dataclasses import replace as dc_replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile, iter_body
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
@@ -120,7 +120,7 @@ def _process_body(body: Body, thread_axes: tuple[Axis, ...]) -> Body:
 
 def _loads_reading(body: Body, stage_name: str) -> list[Load]:
     """Collect every Load anywhere in ``body`` reading from ``stage_name``."""
-    return [s for s in iter_body(body) if isinstance(s, Load) and s.input == stage_name]
+    return [s for s in body.iter() if isinstance(s, Load) and s.input == stage_name]
 
 
 def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> Stage | None:

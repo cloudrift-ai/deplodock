@@ -10,7 +10,9 @@ Defined here rather than under any one IR package because all three IRs
   and external buffers (in :mod:`.leaves`).
 - Block stmts: ``Loop``, ``Tile``, ``StridedLoop``, ``Cond`` — carry
   child bodies (in :mod:`.blocks`).
-- Tree walks: ``iter_body``, ``map_body`` (in :mod:`.visit`).
+- Tree walks: :meth:`Body.iter` (pre-order recursive) and
+  :meth:`Body.map` (flat 1:N transformer) — methods on
+  :class:`Body` (in :mod:`.body`).
 - Body normalization: ``normalize_body`` driver + 8 passes
   (drop-size-one, canonicalize-axis-order, copy-alias-elim,
   reduce-axis-unify, hoist, simplify, dedup-loads, rename-ssa) in
@@ -62,7 +64,6 @@ from deplodock.compiler.ir.stmt.normalize import (
     simplify_body,
     unify_sibling_reduce_axes,
 )
-from deplodock.compiler.ir.stmt.visit import iter_body, map_body
 
 __all__ = [
     "INDENT",
@@ -85,8 +86,6 @@ __all__ = [
     "drop_size_one_free_axes",
     "eliminate_copy_aliases",
     "hoist_loop_invariants",
-    "iter_body",
-    "map_body",
     "normalize_body",
     "op_to_expr",
     "pretty_body",

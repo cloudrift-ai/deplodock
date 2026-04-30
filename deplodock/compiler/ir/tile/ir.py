@@ -283,7 +283,7 @@ class TileOp(Op):
             raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")
 
     def __iter__(self) -> Iterator[Stmt]:
-        return iter_body(self.body)
+        return self.body.iter()
 
     def pretty_body(self) -> str:
         """Render as an indented structural listing via per-stmt ``pretty``."""
@@ -328,7 +328,6 @@ class TileOp(Op):
 # Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
 # ---------------------------------------------------------------------------
 
-from deplodock.compiler.ir.stmt import iter_body  # noqa: E402, F401
 
 # Cooperative thread-block size — number of threads per CUDA block when a
 # Tile uses BIND_THREAD axes from a cooperative strategy. Lives at this

@@ -38,7 +38,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile, iter_body, map_body
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
@@ -58,7 +58,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
-    if any(isinstance(s, Stage) for s in iter_body(tile.body)):
+    if any(isinstance(s, Stage) for s in tile.body.iter()):
         raise RuleSkipped("Tile body already has Stage stmts (idempotence)")
     if not tile.thread_axes:
         raise RuleSkipped("Tile has no thread_axes — no reuse to stage")
@@ -150,7 +150,7 @@ def _stage_loop(
             return Load(name=s.name, input=smem_name, index=new_index)
         return s
 
-    new_body = map_body(loop.body, replace)
+    new_body = loop.body.map(replace)
     if isinstance(loop, StridedLoop):
         return StridedLoop(axis=loop.axis, start=loop.start, step=loop.step, body=new_body, unroll=loop.unroll)
     return Loop(axis=loop.axis, body=new_body, unroll=loop.unroll)

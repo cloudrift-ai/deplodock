@@ -37,7 +37,7 @@ from dataclasses import replace as dc_replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile, map_body
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
@@ -193,10 +193,10 @@ def _rewrite_loads(s: Stmt, rewrites: dict[str, tuple[str, int]]) -> Stmt:
             new_name, cell_offset = rewrites[c.input]
             return Load(name=c.name, input=new_name, index=(*c.index, Literal(cell_offset, "int")))
         if isinstance(c, Loop):
-            return dc_replace(c, body=map_body(c.body, fn))
+            return dc_replace(c, body=c.body.map(fn))
         return c
 
-    return fn(s) if not isinstance(s, Loop) else dc_replace(s, body=map_body(s.body, fn))
+    return fn(s) if not isinstance(s, Loop) else dc_replace(s, body=s.body.map(fn))
 
 
 def _split_const(e: Expr) -> tuple[Expr, int]:

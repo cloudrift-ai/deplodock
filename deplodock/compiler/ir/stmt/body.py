@@ -61,8 +61,11 @@ class Body(tuple[Stmt, ...]):
             return Body(tuple.__add__(other, self))
         return Body(tuple.__add__(tuple(other), self))
 
-    def __repr__(self) -> str:
-        return f"Body({tuple.__repr__(self)})"
+    # No custom ``__repr__`` — inherit ``tuple.__repr__`` so a Body
+    # round-trips through ``repr(...)`` / ``eval(...)`` as a tuple.
+    # Loop / Tile / Cond / StridedLoop / LoopOp / TileOp /
+    # KernelOp ``__post_init__`` coerce on construction so the ingest
+    # path ends up with Body either way.
 
     @staticmethod
     def coerce(value: Body | Iterable[Stmt]) -> Body:
@@ -76,19 +79,36 @@ class Body(tuple[Stmt, ...]):
     def iter(self) -> Iterator[Stmt]:
         """Pre-order iteration over this body and every nested body
         (``Loop`` / ``Tile`` / ``Cond`` / ``StridedLoop`` recurse via
-        ``Stmt.nested()``). Method-shaped wrapper around the free
-        function :func:`iter_body`; new code should prefer the method
-        for discoverability."""
-        from deplodock.compiler.ir.stmt.visit import iter_body
-
-        return iter_body(self)
+        ``Stmt.nested()``)."""
+        for s in self:
+            yield s
+            for child_body in s.nested():
+                yield from child_body.iter()
 
     # -- transformation --------------------------------------------------
 
     def map(self, fn: Callable[[Stmt], Stmt | None | Iterable[Stmt]]) -> Body:
         """Flat 1:N body transformer. Returns a new Body with each stmt
-        replaced by ``fn(stmt)`` (or dropped if ``None`` / inlined if
-        an iterable). Method-shaped wrapper around :func:`map_body`."""
-        from deplodock.compiler.ir.stmt.visit import map_body
+        replaced by ``fn(stmt)``:
 
-        return Body(map_body(self, fn))
+        - a single ``Stmt`` (kept in place of the input),
+        - ``None`` (drop the input), or
+        - an iterable of ``Stmt`` (inline all of them).
+
+        ``fn`` is called on *every* stmt including ``Loop`` / ``Tile`` /
+        etc. wrappers; recursion into a wrapper's body is the caller's
+        responsibility (typically by writing a self-recursive ``fn``
+        that returns ``Loop(axis=..., body=s.body.map(fn))`` for Loop
+        cases). Lets callers pick their own policy for axis renames,
+        Loop skipping, or selective recursion.
+        """
+        out: list[Stmt] = []
+        for s in self:
+            r = fn(s)
+            if r is None:
+                continue
+            if isinstance(r, Stmt):
+                out.append(r)
+            else:
+                out.extend(r)
+        return Body(out)

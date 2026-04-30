@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, iter_body, splice_graph
+from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, splice_graph
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 
@@ -113,7 +113,7 @@ def _is_pure_indexmap(loop_op: LoopOp) -> bool:
     the indexmap's iteration space — materializing any broadcast the
     indexmap was expressing lazily.
     """
-    for s in iter_body(loop_op.body):
+    for s in loop_op.body.iter():
         if isinstance(s, (Assign, Accum)):
             return False
     return True
@@ -237,13 +237,13 @@ def _rename_write_output(op: LoopOp, *, old: str, new: str) -> LoopOp:
     to ``output=new`` (recursively descends into nested Loops). Used by
     fusion to align the spliced root's Writes with the new graph node id.
     """
-    from deplodock.compiler.ir.loop import Loop, Write, map_body
+    from deplodock.compiler.ir.loop import Loop, Write
 
     def fn(s):
         if isinstance(s, Write) and s.output == old:
             return Write(output=new, index=s.index, value=s.value)
         if isinstance(s, Loop):
-            return Loop(axis=s.axis, body=map_body(s.body, fn))
+            return Loop(axis=s.axis, body=s.body.map(fn))
         return s
 
-    return LoopOp(body=map_body(op.body, fn))
+    return LoopOp(body=op.body.map(fn))

@@ -50,8 +50,6 @@ from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init_
     SelectBranch,
     Stmt,
     Write,
-    iter_body,
-    map_body,
     pretty_body,
 )
 
@@ -77,7 +75,7 @@ class Scope:
 
 
 # Body Stmts (Stmt, Load, Assign, Accum, Write, Select, SelectBranch,
-# Loop, Cond) and the tree-walk helpers (iter_body, map_body) live in
+# Loop, Cond) and the tree-walk helpers (map_body) live in
 # ``ir/stmt.py`` — they're shared across all IR layers. Imported above
 # and re-exported via ``ir/loop/__init__.py``.
 
@@ -248,7 +246,7 @@ class LoopOp(Op):
         """Yield every ``Stmt`` in this op's body in pre-order (same as
         :func:`iter_body`). Enables ``for s in loop_op: ...`` and
         comprehensions like ``[s for s in loop_op if isinstance(s, Load)]``."""
-        return iter_body(self.body)
+        return self.body.iter()
 
     def forward(self, *inputs):
         """Evaluate the kernel body via cppyy-JIT'd C++ — mirrors the other ``Op.forward`` methods.
@@ -494,6 +492,6 @@ def _validate(loop: LoopOp) -> None:
         raise ValueError("LoopOp body has no Write")
 
 
-# Tree walk helpers (iter_body, map_body) live in ``ir/stmt.py`` — they
+# Tree walk helpers (map_body) live in ``ir/stmt.py`` — they
 # work across all IR layers via ``Stmt.nested``. Imported above and
 # re-exported via ``ir/loop/__init__.py``.

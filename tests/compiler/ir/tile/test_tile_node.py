@@ -9,7 +9,8 @@ from __future__ import annotations
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop
-from deplodock.compiler.ir.tile.ir import BIND_THREAD, BoundAxis, Tile, iter_body
+from deplodock.compiler.ir.stmt import Body
+from deplodock.compiler.ir.tile.ir import BIND_THREAD, BoundAxis, Tile
 
 
 def test_iter_body_walks_into_tile():
@@ -23,6 +24,6 @@ def test_iter_body_walks_into_tile():
         ),
     )
     blk = Tile(axes=(BoundAxis(axis=i, bind=BIND_THREAD),), body=(inner,))
-    seen = list(iter_body((blk,)))
+    seen = list(Body((blk,)).iter())
     assert any(isinstance(s, Accum) for s in seen)
     assert seen[0] is blk

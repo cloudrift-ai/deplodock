@@ -89,7 +89,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Tile, Write, iter_body
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import find_matmul_k_outer, is_matmul_reduce, single_tile
@@ -155,7 +155,7 @@ def _has_reduce_loop(s: Stmt) -> bool:
     """True iff ``s`` is or contains a reduce Loop in its subtree."""
     if isinstance(s, Loop) and s.is_reduce:
         return True
-    for c in iter_body((s,)):
+    for c in Body((s,)).iter():
         if isinstance(c, Loop) and c.is_reduce and c is not s:
             return True
     return False
@@ -308,8 +308,8 @@ def _collect_ssa_defs(stmts: Body) -> set[str]:
     renaming to locally-defined names so external references stay intact.
     Driven by :meth:`Stmt.defines` — every name-bearing leaf reports its
     own bindings; block stmts contribute nothing themselves but their
-    bodies are walked by ``iter_body``."""
-    return {n for s in iter_body(stmts) for n in s.defines()}
+    bodies are walked by ``Body.iter``."""
+    return {n for s in Body.coerce(stmts).iter() for n in s.defines()}
 
 
 def _build_name_axes(pre_outer: Body, target_axes: frozenset[str]) -> dict[str, frozenset[str]]:

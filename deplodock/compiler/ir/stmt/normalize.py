@@ -20,7 +20,7 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Select, SelectBranch, Write
-from deplodock.compiler.ir.stmt.visit import _identity_rename, _make_axis_renamer, _recurse_through_block, iter_body, map_body
+from deplodock.compiler.ir.stmt.visit import _identity_rename, _make_axis_renamer, _recurse_through_block
 
 
 def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
@@ -56,10 +56,11 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
     keep their wrappers because dropping them would remove the accumulator.
     Recurses through StridedLoop / Tile / Cond bodies without rewriting
     those wrappers (their iteration semantics aren't a free Loop)."""
+    stmts = Body.coerce(stmts)
 
     def fn(s: Stmt) -> Stmt | Body:
         if isinstance(s, Loop):
-            candidate = replace(s, body=map_body(s.body, fn))
+            candidate = replace(s, body=s.body.map(fn))
             if int(candidate.axis.extent) == 1 and not candidate.is_reduce:
                 sub = Sigma({candidate.axis.name: Literal(0, "int")})
                 return tuple(c.rewrite(_identity_rename, sub) for c in candidate.body)
@@ -67,7 +68,7 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
         rec = _recurse_through_block(s, fn)
         return rec if rec is not None else s
 
-    return map_body(stmts, fn)
+    return stmts.map(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,7 @@ def canonicalize_free_axis_order(stmts: Body) -> Body:
     name. The chain is the sequence of single-child free Loops at the top of
     ``stmts``; it terminates at a reduce Loop or a branching body. Recursion
     continues into terminal block bodies (Loop / StridedLoop / Tile / Cond)."""
+    stmts = Body.coerce(stmts)
     chain_axes: list[Axis] = []
     current = stmts
     while len(current) == 1 and isinstance(current[0], Loop):
@@ -124,6 +126,7 @@ def eliminate_copy_aliases(stmts: Body) -> Body:
     copies as bridges between producer writes and consumer reads; a long
     chain stacks them. Every such Assign is dropped and downstream
     references to ``y`` are rewired to the alias root. Pure IR hygiene."""
+    stmts = Body.coerce(stmts)
     alias: dict[str, str] = {}
 
     def resolve(name: str) -> str:
@@ -135,7 +138,7 @@ def eliminate_copy_aliases(stmts: Body) -> Body:
 
     def fn(s: Stmt) -> Stmt | None:
         if isinstance(s, Loop):
-            return replace(s, body=map_body(s.body, fn))
+            return replace(s, body=s.body.map(fn))
         rec = _recurse_through_block(s, fn)
         if rec is not None:
             return rec
@@ -144,7 +147,7 @@ def eliminate_copy_aliases(stmts: Body) -> Body:
             return None
         return s.rewrite(resolve)
 
-    return map_body(stmts, fn)
+    return stmts.map(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +160,7 @@ def unify_sibling_reduce_axes(stmts: Body) -> Body:
     the same ``(Load.source, dim)`` position and rename them to a single
     canonical axis name. Recurses through every block-structured Stmt
     (Loop / StridedLoop / Tile / Cond) to find nested scopes."""
+    stmts = Body.coerce(stmts)
 
     def walk(body: Body) -> Body:
         new_body: list[Stmt] = []
@@ -208,7 +212,7 @@ def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tupl
     blocks)."""
     return {
         (s.input, dim)
-        for s in iter_body(body)
+        for s in body.iter()
         if isinstance(s, Load)
         for dim, e in enumerate(s.index)
         if isinstance(e, Var) and e.name == reduce_axis_name
@@ -225,6 +229,7 @@ def hoist_loop_invariants(stmts: Body) -> Body:
     axis their value doesn't depend on. Hoisting only crosses ``Loop``
     boundaries; ``StridedLoop`` / ``Tile`` / ``Cond`` are barriers but are
     recursed into so inner Loops still get the optimization."""
+    stmts = Body.coerce(stmts)
     axes_of: dict[str, frozenset[str]] = {}
     ssa_names: set[str] = set()
 
@@ -398,6 +403,7 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
 def simplify_body(body: Body) -> Body:
     """Simplify every Expr inside a body. Seeds ``SimplifyCtx`` from
     ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends."""
+    body = Body.coerce(body)
     ctx = SimplifyCtx.empty()
     return tuple(_simplify_stmt(s, ctx) for s in body)
 
@@ -416,6 +422,7 @@ def dedup_loads(stmts: Body) -> Body:
     inner siblings (their identical ``index`` doesn't reference any
     inner-axis Var, so the values are equal). Loads inside a nested
     scope are not visible to outer / sibling scopes."""
+    stmts = Body.coerce(stmts)
 
     def walk(
         body: Body,
@@ -470,6 +477,7 @@ def rename_ssa_sequential(stmts: Body) -> Body:
       order.
 
     Idempotent: bodies already in canonical form round-trip unchanged."""
+    stmts = Body.coerce(stmts)
     ssa_rename: dict[str, str] = {}
     axis_rename: dict[str, str] = {}
     expr_sub: dict[str, Expr] = {}
@@ -489,7 +497,7 @@ def rename_ssa_sequential(stmts: Body) -> Body:
         if name != new:
             expr_sub[name] = Var(new)
 
-    for stmt in iter_body(stmts):
+    for stmt in stmts.iter():
         if isinstance(stmt, Load) and stmt.name not in ssa_rename:
             new = _rename(stmt.name, "in")
             if stmt.name != new:

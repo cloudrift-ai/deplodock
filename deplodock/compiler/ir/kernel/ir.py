@@ -241,11 +241,15 @@ class KernelOp(Op):
     ordered by first appearance. ``Smem`` buffers are excluded.
     """
 
-    body: Body = ()
+    body: Body = field(default_factory=Body)
     name: str = ""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            self.body = Body.coerce(self.body)
+
     def __iter__(self) -> Iterator[Stmt]:
-        return iter_body(self.body)
+        return self.body.iter()
 
     def pretty_body(self) -> str:
         """Render as an indented structural listing via per-stmt ``pretty``."""
@@ -297,7 +301,6 @@ class KernelOp(Op):
 # Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
 # ---------------------------------------------------------------------------
 
-from deplodock.compiler.ir.stmt import iter_body  # noqa: E402, F401
 
 __all__ = [
     # Shared expressions (re-exported)

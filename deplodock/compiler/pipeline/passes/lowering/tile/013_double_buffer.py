@@ -38,7 +38,7 @@ from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile, map_body
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
@@ -133,7 +133,7 @@ def _double_buffer(loop: Loop) -> Loop | None:
             staged_names.add(s.name)
             new_body.append(dc_replace(s, buffer_count=_BUFFER_COUNT, phase=phase))
         elif isinstance(s, Loop) and s.is_reduce:
-            new_body.append(dc_replace(s, body=map_body(s.body, _make_load_rewriter(staged_names, phase))))
+            new_body.append(dc_replace(s, body=s.body.map(_make_load_rewriter(staged_names, phase))))
         else:
             new_body.append(s)
     return dc_replace(loop, body=tuple(new_body))

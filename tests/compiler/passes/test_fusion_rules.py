@@ -65,22 +65,16 @@ def _kernel_nodes(graph: Graph) -> list:
 
 
 def _assign_fns(body) -> list[str]:
-    from deplodock.compiler.ir.loop import iter_body
-
-    return [s.op.name for s in iter_body(body) if isinstance(s, Assign)]
+    return [s.op.name for s in body.iter() if isinstance(s, Assign)]
 
 
 def _count_copies(body) -> int:
     """Count identity ``Assign(op=copy)`` statements in a LoopOp body."""
-    from deplodock.compiler.ir.loop import iter_body
-
-    return sum(1 for s in iter_body(body) if isinstance(s, Assign) and s.op.name == "copy")
+    return sum(1 for s in body.iter() if isinstance(s, Assign) and s.op.name == "copy")
 
 
 def _has_update(body) -> bool:
-    from deplodock.compiler.ir.loop import iter_body
-
-    return any(isinstance(s, Accum) for s in iter_body(body))
+    return any(isinstance(s, Accum) for s in body.iter())
 
 
 def _local_combine_fns(locals_) -> set[str]:
