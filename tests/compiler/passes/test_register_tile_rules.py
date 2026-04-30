@@ -128,4 +128,4 @@ def test_sdpa_attention_kernel_skips_via_smem_gate(caplog):
         run_pipeline(g, TILE_PASSES)
 
     skip_msgs = [r.message for r in caplog.records if "008_register_tile skipped" in r.message]
-    assert any("pre_outer contains a reduce Loop" in m for m in skip_msgs), skip_msgs
+    assert any("more than one reduce Loop" in m or "Cond encloses a reduce Loop" in m for m in skip_msgs), skip_msgs

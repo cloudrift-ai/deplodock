@@ -289,6 +289,9 @@ class StridedLoop(Stmt):
     def binds_axes(self) -> frozenset[str]:
         return frozenset({self.axis.name})
 
+    def exprs(self) -> tuple[Expr, ...]:
+        return (self.start, self.step) if isinstance(self.step, Expr) else (self.start,)
+
     @property
     def is_reduce(self) -> bool:
         """A strided loop is a reduce-loop iff its immediate body contains an ``Accum``."""
@@ -380,6 +383,9 @@ class Cond(Stmt):
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         body, else_body = bodies
         return Cond(cond=self.cond, body=body, else_body=else_body)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return (self.cond,)
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity

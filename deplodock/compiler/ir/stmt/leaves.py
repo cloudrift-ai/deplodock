@@ -44,6 +44,9 @@ class Load(Stmt):
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
 
+    def exprs(self) -> tuple[Expr, ...]:
+        return self.index
+
     def is_literal(self, literal_constants: dict[str, float]) -> bool:
         return self.input in literal_constants
 
@@ -229,6 +232,9 @@ class Write(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
+    def exprs(self) -> tuple[Expr, ...]:
+        return self.index
+
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
@@ -273,6 +279,9 @@ class Select(Stmt):
 
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return tuple(b.select for b in self.branches)
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity

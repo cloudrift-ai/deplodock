@@ -222,6 +222,11 @@ class Stage(Stmt):
     # FMA. Only meaningful when ``async_load`` is also set.
     pipelined: bool = False
 
+    def exprs(self) -> tuple[Expr, ...]:
+        template = self.source_index_template if self.source_index_template is not None else ()
+        phase = (self.phase,) if self.phase is not None else ()
+        return (*self.origin, *template, *phase)
+
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:

@@ -7,7 +7,7 @@ normalization passes live in ``visit`` and ``normalize``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -247,6 +247,25 @@ class Stmt:
         isinstance ladder over the block-stmt set.
         """
         return frozenset()
+
+    def exprs(self) -> Iterable[Expr]:
+        """Direct Expr fields of this stmt (non-recursive into nested bodies).
+
+        Default: ``()``. Concrete stmts override to surface their carried
+        Expr trees: ``Load`` / ``Write`` yield ``self.index``; ``Select``
+        yields each branch's predicate; ``Cond`` yields ``self.cond``;
+        ``StridedLoop`` yields ``self.start`` and ``self.step`` (when an
+        ``Expr``); Tile-IR ``Stage`` yields its source-index template.
+        ``Loop`` / ``Tile`` keep the default — their Exprs live inside
+        their bodies, which the fold's tree traversal reaches separately.
+
+        The third slice of the per-stmt analysis surface alongside
+        :meth:`deps` (SSA reads) and :meth:`nested` (child bodies). The
+        fold callback uses ``exprs()`` to pull free Vars at each stmt
+        for direct axis contributions, with ``free_vars()`` filtered by
+        the ``bound`` set threaded through :meth:`binds_axes`.
+        """
+        return ()
 
     def pretty(self, indent: str = "") -> list[str]:
         """Render this stmt as a list of indented lines.
