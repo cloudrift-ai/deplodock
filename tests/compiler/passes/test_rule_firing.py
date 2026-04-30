@@ -158,6 +158,32 @@ def test_matmul_does_not_fire_cooperative_reduce(recording_dump):
     assert "cooperative_reduce" not in fired
 
 
+# --- RuleSkipped exception path --------------------------------------
+
+
+def test_rule_skipped_logs_reason_and_continues(caplog):
+    """A rule that raises ``RuleSkipped`` is treated as no-op; the
+    engine logs the reason at DEBUG and proceeds. We verify both:
+    pipeline still completes, and the reason text is in the debug log.
+    """
+    import logging
+
+    g = Graph()
+    _input(g, "x", (_M, _N))
+    g.add_node(op=ElementwiseOp("relu"), inputs=["x"], output=Tensor("o", (_M, _N)), node_id="o")
+    g.inputs = ["x"]
+    g.outputs = ["o"]
+
+    # Pure elementwise → split_matmul_k raises RuleSkipped (no matmul-shaped
+    # reduce) and cooperative_reduce raises (no reduce Loop).
+    with caplog.at_level(logging.DEBUG, logger="deplodock.compiler.pipeline.engine"):
+        run_pipeline(g, TILE_PASSES)
+
+    skip_messages = [r.message for r in caplog.records if "skipped" in r.message]
+    assert any("split_matmul_k" in m for m in skip_messages), skip_messages
+    assert any("cooperative_reduce" in m for m in skip_messages), skip_messages
+
+
 def test_strip_prefix_handles_letter_suffix():
     assert strip_rule_prefix("003_cooperative_reduce") == "cooperative_reduce"
     assert strip_rule_prefix("004b_cooperative_reduce") == "cooperative_reduce"

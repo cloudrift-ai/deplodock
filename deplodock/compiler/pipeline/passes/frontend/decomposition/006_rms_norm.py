@@ -3,7 +3,7 @@
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import MeanOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     const_bc,
@@ -16,7 +16,7 @@ PATTERN = [Pattern("root", RmsNormOp)]
 
 def rewrite(graph: Graph, root: Node, inp_x: Node, inp_w: Node | None, out: Tensor) -> Graph | None:
     if inp_w is None:
-        return None
+        raise RuleSkipped("rms_norm without weight input is not decomposed")
     red_shape = reduction_shape(out.shape, -1) if out.shape else (1,)
 
     frag = open_fragment(graph, [inp_x, inp_w])

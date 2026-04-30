@@ -15,6 +15,7 @@ from deplodock.compiler.pipeline.dump import CompilerDump
 from deplodock.compiler.pipeline.engine import (
     Match,
     Pattern,
+    RuleSkipped,
     match_pattern,
     run_pass,
     run_pipeline,
@@ -36,6 +37,7 @@ __all__ = [
     "LOOP_PASSES",
     "Match",
     "Pattern",
+    "RuleSkipped",
     "TENSOR_PASSES",
     "TILE_PASSES",
     "match_pattern",

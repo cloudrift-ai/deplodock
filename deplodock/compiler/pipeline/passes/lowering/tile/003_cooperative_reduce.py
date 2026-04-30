@@ -64,7 +64,7 @@ from deplodock.compiler.ir.tile.ir import (
     Tile,
     TileOp,
 )
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -80,10 +80,10 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: tuple) -> tuple | None:
     blocks = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(blocks) != 1:
-        return None
+        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(blocks)}")
     idx, blk = blocks[0]
     if blk.block_axes:
-        return None  # idempotence — already cooperative
+        raise RuleSkipped("Tile already cooperative (block_axes non-empty)")
 
     new_blk = _rewrite_block(blk)
     if new_blk is None:
@@ -93,16 +93,16 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
 
 def _rewrite_block(blk: Tile) -> Tile | None:
     if not blk.thread_axes:
-        return None
+        raise RuleSkipped("Tile has no thread_axes to convert to BLOCK")
 
     reduce_loops = [loop for loop in blk.loops if loop.is_reduce]
     if not reduce_loops:
-        return None
+        raise RuleSkipped("Tile body has no reduce Loop")
     if int(reduce_loops[0].axis.extent) < BLOCK_SIZE:
-        return None
+        raise RuleSkipped(f"first reduce-axis extent {int(reduce_loops[0].axis.extent)} < BLOCK_SIZE={BLOCK_SIZE}")
     for rl in reduce_loops:
         if sum(1 for s in rl.body if isinstance(s, Accum)) != 1:
-            return None  # multi-Accum per Loop — online algorithms, punted
+            raise RuleSkipped(f"reduce Loop {rl.axis.name!r} has multiple Accums (online algorithm — punted)")
 
     t_axis = Axis("t", BLOCK_SIZE)
     t_start = Var(t_axis.name)

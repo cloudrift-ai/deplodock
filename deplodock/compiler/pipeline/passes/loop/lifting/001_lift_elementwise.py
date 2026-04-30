@@ -16,7 +16,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", ElementwiseOp)]
 
@@ -24,7 +24,7 @@ PATTERN = [Pattern("root", ElementwiseOp)]
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     out_shape = tuple(root.output.shape)
     if out_shape and not all(isinstance(d, int) for d in out_shape):
-        return None
+        raise RuleSkipped(f"output shape {out_shape} contains non-int dims; need static shapes")
 
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
 

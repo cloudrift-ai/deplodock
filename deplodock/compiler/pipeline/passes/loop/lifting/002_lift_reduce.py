@@ -14,7 +14,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", ReduceOp)]
 
@@ -28,10 +28,10 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     src_id = root.inputs[0]
     src_node = graph.nodes.get(src_id)
     if src_node is None:
-        return None
+        raise RuleSkipped(f"reduce input {src_id!r} no longer in graph")
     src_shape = tuple(src_node.output.shape)
     if not src_shape or not all(isinstance(d, int) for d in src_shape):
-        return None
+        raise RuleSkipped(f"input shape {src_shape} is empty or has non-int dims")
 
     ndim = len(src_shape)
     axis_raw = root.op.axis
@@ -39,7 +39,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     if axis < 0:
         axis += ndim
     if axis < 0 or axis >= ndim:
-        return None
+        raise RuleSkipped(f"reduce axis {axis_raw} out of range for ndim={ndim}")
 
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(src_shape))
     reduce_axis_name = f"a{axis}"

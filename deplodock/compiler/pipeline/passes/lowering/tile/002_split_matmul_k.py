@@ -47,7 +47,7 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -76,11 +76,11 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body):
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
-        return None
+        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
     idx, tile = tiles[0]
     new_body, changed = _chunk_in_body(tile.body, tile)
     if not changed:
-        return None
+        raise RuleSkipped("no matmul-shaped reduce Loop with K-divisor in candidates")
     return body[:idx] + (Tile(axes=tile.axes, body=new_body),) + body[idx + 1 :]
 
 

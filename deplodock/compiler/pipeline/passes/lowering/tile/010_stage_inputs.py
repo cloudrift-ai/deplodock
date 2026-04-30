@@ -40,7 +40,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, Simp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Load, Loop, Stmt, StridedLoop, Tile, iter_body, map_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -58,17 +58,17 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
-        return None
+        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
     idx, tile = tiles[0]
     if any(isinstance(s, Stage) for s in iter_body(tile.body)):
-        return None  # idempotence
+        raise RuleSkipped("Tile body already has Stage stmts (idempotence)")
     if not tile.thread_axes:
-        return None
+        raise RuleSkipped("Tile has no thread_axes — no reuse to stage")
 
     used_names: set[str] = set()
     new_tile_body = _process_scope(tile, tile.thread_axes, tile.all_axes, used_names)
     if new_tile_body == tile.body:
-        return None
+        raise RuleSkipped("no Load qualifies for staging (no reuse, oversized slab, or unrepresentable cache var)")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 

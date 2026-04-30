@@ -31,7 +31,7 @@ from dataclasses import replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Cond, Init, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -39,7 +39,7 @@ PATTERN = [Pattern("root", TileOp)]
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     new_body = _place_inits_in_body(root.op.body)
     if new_body == root.op.body:
-        return None
+        raise RuleSkipped("no Accum needs an Init placed (already placed or no reduce in body)")
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 

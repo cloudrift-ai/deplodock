@@ -37,6 +37,20 @@ _PASSES_DIR = Path(__file__).parent / "passes"
 logger = logging.getLogger(__name__)
 
 
+class RuleSkipped(Exception):
+    """Raised by a rule's ``rewrite()`` to signal that the match was
+    considered but skipped, with a human-readable reason for why no
+    rewrite was applied. The engine catches it, logs the reason at
+    DEBUG (visible at ``compile -vv``), and treats the result the same
+    as ``return None`` with no in-place mutation. Use this in place of
+    a bare ``return None`` whenever the skip reason would help debug
+    why a rule didn't fire on a given match."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 # ---------------------------------------------------------------------------
 # Chain matcher
 # ---------------------------------------------------------------------------
@@ -272,16 +286,23 @@ def _apply_rules(
                     if any(nid not in graph.nodes for nid in match.consumed):
                         continue
                     t1 = time.monotonic()
-                    # -vv: snapshot matched-node ops before rewrite so in-place
-                    # mutations (rules that set ``node.op = ...`` and return
-                    # None — e.g. lowering/tile) can render a before/after.
+                    # Snapshot matched-node ops before rewrite. Always
+                    # captured: needed for in-place change detection
+                    # (counting toward ``applied``). At -vv or when a
+                    # dump is set, the same snapshot also drives the
+                    # before/after render text.
                     debug_on = logger.isEnabledFor(logging.DEBUG)
-                    capture_snapshots = debug_on or dump is not None
-                    pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes} if capture_snapshots else {}
+                    pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes}
                     kwargs = _build_rewrite_kwargs(rule, graph, match)
                     if kwargs is None:
                         continue
-                    fragment = rule.rewrite(**kwargs)
+                    try:
+                        fragment = rule.rewrite(**kwargs)
+                    except RuleSkipped as exc:
+                        if debug_on:
+                            logger.debug("rule %s skipped at %s: %s", rule.name, match.root_node_id, exc.reason)
+                        rewrite_time += time.monotonic() - t1
+                        continue
                     if fragment is None:
                         if any(graph.nodes[nid].op is not pre_ops.get(nid) for nid in pre_ops if nid in graph.nodes):
                             text = _format_inplace_application(rule.name, graph, match, pre_ops)
@@ -290,6 +311,7 @@ def _apply_rules(
                             if dump is not None and pass_idx is not None and pass_name is not None:
                                 record = _record_inplace_application(graph, match, pre_ops)
                                 dump.on_rule(pass_idx, pass_name, rule.name, record, text)
+                            applied += 1
                         rewrite_time += time.monotonic() - t1
                         continue
                     text = _format_rule_application(rule.name, graph, match, fragment)

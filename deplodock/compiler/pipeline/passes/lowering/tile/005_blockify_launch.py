@@ -33,7 +33,7 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.tuning import per_axis_threads, thread_budget
 
 PATTERN = [Pattern("root", TileOp)]
@@ -50,15 +50,15 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body):
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
-        return None
+        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
     idx, tile = tiles[0]
     if tile.block_axes:
-        return None  # already partitioned
+        raise RuleSkipped("Tile already partitioned (block_axes non-empty)")
 
     lifted = _lift_output_loops(tile)
     partitioned = _partition_threads(lifted)
     if partitioned is None:
-        return None
+        raise RuleSkipped("no axes to lift and partition fits within thread budget")
     return body[:idx] + (partitioned,) + body[idx + 1 :]
 
 

@@ -39,7 +39,7 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Select, Stmt, Tile, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.tuning import detect_pat, register_tile_factor
 
 PATTERN = [Pattern("root", TileOp)]
@@ -56,7 +56,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
-        return None
+        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
     idx, tile = tiles[0]
 
     # ``detect_pat`` reads whichever PAT 005_blockify_launch landed on
@@ -64,22 +64,22 @@ def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     # F with that PAT through the centralized table in ``tuning``.
     pat = detect_pat(tile)
     if pat is None:
-        return None
+        raise RuleSkipped("detect_pat returned None — Tile axes don't match a known PAT")
     factor = register_tile_factor(tile)
     if factor <= 1 or pat % factor != 0:
-        return None
+        raise RuleSkipped(f"register-tile factor F={factor} disabled or doesn't divide PAT={pat}")
 
     target_axes = [ba.axis.name for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == pat]
     if len(target_axes) != 2:
-        return None
+        raise RuleSkipped(f"need exactly 2 THREAD axes with extent {pat}, found {len(target_axes)}")
 
     matmul_loc = _find_matmul(tile.body)
     if matmul_loc is None:
-        return None
+        raise RuleSkipped("no pure matmul-shaped reduce Loop at Tile body top level")
 
     rewritten = _register_tile(tile, target_axes[0], target_axes[1], factor)
     if rewritten is None:
-        return None
+        raise RuleSkipped("_register_tile bailed (unsupported shape)")
     return body[:idx] + (rewritten,) + body[idx + 1 :]
 
 

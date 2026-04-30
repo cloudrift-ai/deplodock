@@ -56,7 +56,7 @@ from deplodock.compiler.ir.axis import BIND_THREAD, Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.stmt import Load, Loop, Stmt, Tile, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 logger = logging.getLogger(__name__)
 
@@ -85,16 +85,16 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
-        return None
+        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
     idx, tile = tiles[0]
 
     thread_axes = tuple(ba.axis for ba in tile.axes if ba.bind == BIND_THREAD)
     if not thread_axes:
-        return None
+        raise RuleSkipped("Tile has no THREAD axes — no bank-conflict layout to pad")
 
     new_tile_body = _process_body(tile.body, thread_axes)
     if new_tile_body is tile.body or new_tile_body == tile.body:
-        return None
+        raise RuleSkipped("no Stage has a fixable bank conflict within slab budget")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 

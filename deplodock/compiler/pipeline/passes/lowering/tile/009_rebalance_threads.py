@@ -32,7 +32,7 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Tile
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -50,7 +50,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: tuple) -> tuple | None:
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
-        return None
+        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
     idx, tile = tiles[0]
 
     threads_used = 1
@@ -58,7 +58,7 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
         if ba.bind == BIND_THREAD:
             threads_used *= int(ba.axis.extent)
     if threads_used >= _TARGET_THREADS:
-        return None
+        raise RuleSkipped(f"already at thread budget: threads_used={threads_used} >= target={_TARGET_THREADS}")
 
     gap = _TARGET_THREADS // threads_used
     chosen: tuple[int, BoundAxis, int] | None = None
@@ -72,7 +72,7 @@ def _maybe_rewrite(body: tuple) -> tuple | None:
         if chosen is None or ext > int(chosen[1].axis.extent):
             chosen = (i, ba, slice_size)
     if chosen is None:
-        return None
+        raise RuleSkipped(f"no BLOCK axis with a divisor in [2,{gap}] to slice for more threads")
 
     axis_idx, ba, slice_size = chosen
     orig = ba.axis

@@ -39,7 +39,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.stmt import Load, Loop, Stmt, Tile, map_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -55,11 +55,11 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
     if len(tiles) != 1:
-        return None
+        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
     idx, tile = tiles[0]
     new_tile_body = _process_scope_body(tile.body)
     if new_tile_body == tile.body:
-        return None
+        raise RuleSkipped("no contiguous sibling Stages share group key — nothing to merge")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 

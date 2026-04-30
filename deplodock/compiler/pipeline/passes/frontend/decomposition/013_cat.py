@@ -25,7 +25,7 @@ from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import Literal, TernaryExpr, placeholder
 from deplodock.compiler.ir.frontend.ir import CatOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 
 PATTERN = [Pattern("root", CatOp)]
@@ -37,12 +37,12 @@ def rewrite(graph: Graph, inp_a: Node, inp_b: Node, inp_dim: Node, out: Tensor) 
     ndim = len(out_shape)
 
     if not (isinstance(inp_dim.op, ConstantOp) and inp_dim.op.value is not None):
-        return None
+        raise RuleSkipped("cat dim must be a ConstantOp with a value")
     dim = int(inp_dim.op.value)
     norm_dim = dim if dim >= 0 else ndim + dim
 
     if not isinstance(a_shape[norm_dim], int):
-        return None
+        raise RuleSkipped(f"cat split point a_shape[{norm_dim}]={a_shape[norm_dim]!r} must be a static int")
     split = a_shape[norm_dim]
 
     frag = open_fragment(graph, [inp_a, inp_b])
