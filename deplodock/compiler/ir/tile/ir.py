@@ -293,10 +293,6 @@ class TileOp(Op):
         return "\n".join([head, *pretty_body(self.body, "    ")])
 
     @property
-    def loads(self) -> tuple[Load, ...]:
-        return tuple(s for s in self if isinstance(s, Load))
-
-    @property
     def inputs(self) -> tuple[str, ...]:
         """Distinct external-buffer names in body first-use order.
 
@@ -315,13 +311,9 @@ class TileOp(Op):
         return tuple(bufs)
 
     @property
-    def writes(self) -> tuple[Write, ...]:
-        return tuple(s for s in self if isinstance(s, Write))
-
-    @property
     def outputs(self) -> tuple[str, ...]:
         """Distinct ``Write.output`` buf names in body first-use order."""
-        return tuple(dict.fromkeys(s.output for s in self.writes))
+        return tuple(dict.fromkeys(s.output for s in self.body.writes))
 
 
 # ---------------------------------------------------------------------------

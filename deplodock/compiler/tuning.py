@@ -97,11 +97,11 @@ def _has_matmul_reduce(stmts) -> bool:
     distinct buffers — the structural signature of a matmul. Recurses
     through wrapper loops / conds so chunked or output-loop-wrapped
     matmuls (SDPA V-projection) are still detected."""
-    from deplodock.compiler.ir.stmt import Cond, Loop, StridedLoop
+    from deplodock.compiler.ir.stmt import Cond, Load, Loop, StridedLoop
 
     for s in stmts:
         if isinstance(s, Loop):
-            if s.is_reduce and len({ld.input for ld in s.loads}) >= 2:
+            if s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2:
                 return True
             if _has_matmul_reduce(s.body):
                 return True
@@ -171,18 +171,18 @@ def _matmul_K(stmts) -> int | None:
     ≥2 buffer Loads) and return the product so heuristics keyed on
     "original K" don't get fooled by chunked tiles.
     """
-    from deplodock.compiler.ir.stmt import Cond, Loop, StridedLoop
+    from deplodock.compiler.ir.stmt import Cond, Load, Loop, StridedLoop
 
     for s in stmts:
         if isinstance(s, Loop):
-            if s.is_reduce and len({ld.input for ld in s.loads}) >= 2:
+            if s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2:
                 return int(s.axis.extent)
             if (
                 not s.is_reduce
                 and len(s.body) == 1
                 and isinstance(s.body[0], Loop)
                 and s.body[0].is_reduce
-                and len({ld.input for ld in s.body[0].loads}) >= 2
+                and len({ld.input for ld in s.body[0].body.of_type(Load)}) >= 2
             ):
                 return int(s.axis.extent) * int(s.body[0].axis.extent)
             r = _matmul_K(s.body)

@@ -120,7 +120,7 @@ def test_pointwise_chain_inputs_are_loads():
 
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
-    loads = kernel.op.loads
+    loads = kernel.op.body.loads
     assert len(loads) >= 1
     assert all(isinstance(ld, Load) for ld in loads)
 
@@ -205,7 +205,7 @@ def test_contraction_body_has_mul_and_sum():
     kernel = _kernel_nodes(result)[0]
     assert "multiply" in _assign_fns(kernel.op.body)
     assert _has_update(kernel.op.body)
-    assert "add" in _local_combine_fns(kernel.op.accums)
+    assert "add" in _local_combine_fns(kernel.op.body.accums)
 
 
 # ===================================================================
@@ -273,7 +273,7 @@ def test_softmax_body_covers_all_ops():
     all_fns = set()
     for k in _kernel_nodes(result):
         all_fns |= set(_assign_fns(k.op.body))
-        all_fns |= _local_combine_fns(k.op.accums)
+        all_fns |= _local_combine_fns(k.op.body.accums)
     # Expect elementwise sub/exp/div and reduce combine add/max from the
     # max and sum accumulators.
     assert {"subtract", "exp", "divide"} <= all_fns
@@ -306,7 +306,7 @@ def test_ssa_invariants_hold():
     for k in _kernel_nodes(result):
         # Re-validate explicitly
         defined = set()
-        for decl in k.op.accums:
+        for decl in k.op.body.accums:
             defined.add(decl.name)
         from deplodock.compiler.ir.loop import Accum, Load
 
@@ -398,7 +398,7 @@ def test_sibling_reductions_share_reduce_axis():
 def test_sibling_reductions_have_both_accumulators():
     result = _fuse(_make_sibling_reductions())
     kernel = _kernel_nodes(result)[0]
-    combine_fns = _local_combine_fns(kernel.op.accums)
+    combine_fns = _local_combine_fns(kernel.op.body.accums)
     assert {"add", "maximum"} <= combine_fns
 
 
@@ -430,7 +430,7 @@ def test_softmax_single_reduce_axis():
 def test_softmax_has_both_accumulators():
     result = _fuse(_make_softmax())
     kernel = _kernel_nodes(result)[0]
-    combine_fns = _local_combine_fns(kernel.op.accums)
+    combine_fns = _local_combine_fns(kernel.op.body.accums)
     assert {"add", "maximum"} <= combine_fns, f"missing accumulators: {combine_fns}"
 
 

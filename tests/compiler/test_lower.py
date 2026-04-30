@@ -109,7 +109,7 @@ def test_reduce_sum():
     assert len(launches) == 1
     loop = launches[0].op
     assert _has_update(loop.body)
-    assert any(lb.op.name == "add" for lb in loop.accums)
+    assert any(lb.op.name == "add" for lb in loop.body.accums)
 
 
 def test_matmul():
@@ -125,7 +125,7 @@ def test_matmul():
     result = _compile(g)
     launches = _loop_nodes(result)
     has_mul = any("multiply" in _elementwise_fns(k.op.body) for k in launches)
-    has_sum = any(any(lb.op.name == "add" for lb in k.op.accums) for k in launches)
+    has_sum = any(any(lb.op.name == "add" for lb in k.op.body.accums) for k in launches)
     assert has_mul
     assert has_sum
 

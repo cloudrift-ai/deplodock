@@ -147,17 +147,6 @@ class LoopOp(Op):
         return frozenset(names)
 
     @property
-    def loads(self) -> tuple[Load, ...]:
-        """All ``Load`` statements in the body, pre-order.
-
-        New-form successor to ``inputs``: Loads carry an explicit SSA name,
-        source-buffer index, and access pattern — unlike ``$N`` refs, they
-        live at the scope they're needed and can share a source with other
-        Loads that use different indices.
-        """
-        return tuple(s for s in self if isinstance(s, Load))
-
-    @property
     def inputs(self) -> tuple[str, ...]:
         """Distinct buffer names referenced by body Loads, in first-use order.
 
@@ -167,12 +156,7 @@ class LoopOp(Op):
         here would scramble the mapping (set order is hash-based) and
         positional args would land on the wrong buffer names.
         """
-        return tuple(dict.fromkeys(s.input for s in self.loads))
-
-    @property
-    def writes(self) -> tuple[Write, ...]:
-        """All ``Write`` statements in the body, pre-order."""
-        return tuple(s for s in self if isinstance(s, Write))
+        return tuple(dict.fromkeys(s.input for s in self.body.loads))
 
     @property
     def outputs(self) -> tuple[str, ...]:
@@ -182,22 +166,7 @@ class LoopOp(Op):
         graph-level buffers it Writes to. Single-output kernels (today's
         contract — see ``_infer_write_shape``) report exactly one entry.
         """
-        return tuple(dict.fromkeys(s.output for s in self.writes))
-
-    @property
-    def accums(self) -> tuple[Accum, ...]:
-        """Unique reduce accumulators in the body, pre-order by first use.
-
-        Walks the body; for each distinct ``Accum.name`` returns the first
-        ``Accum`` stmt that targets it. Callers read ``accum.name``,
-        ``accum.op`` (the combine), and ``accum.init`` (identity derived
-        from op) directly without a separate summary type.
-        """
-        seen: dict[str, Accum] = {}
-        for s in self:
-            if isinstance(s, Accum) and s.name not in seen:
-                seen[s.name] = s
-        return tuple(seen.values())
+        return tuple(dict.fromkeys(s.output for s in self.body.writes))
 
     def analyze(self) -> LoopMeta:
         """One-pass summary of the body: name→def, name→scope, writes.
@@ -403,15 +372,9 @@ def _validate(loop: LoopOp) -> None:
             raise ValueError(f"LoopOp.axes: duplicate axis name {a.name!r}")
         all_axis_names.add(a.name)
 
-    # Accumulator op-consistency: all Updates targeting the same name must
-    # share the same combine op (they're folding into the same accumulator).
-    seen_accums: dict[str, Accum] = {}
-    for info in loop.accums:
-        if info.name in seen_accums:
-            raise ValueError(f"Accumulator: duplicate name {info.name!r}")
-        seen_accums[info.name] = info
-
     # Op-consistency across repeated Updates to same target.
+    # Walks the body and rejects an Accum that conflicts with an
+    # earlier Accum sharing its name. ``target_ops`` is the running map.
     target_ops: dict[str, ElementwiseImpl] = {}
 
     def _walk(stmts: Body, defined: set[str]) -> set[str]:

@@ -57,7 +57,7 @@ def is_matmul_reduce(loop: Loop) -> bool:
     if not (isinstance(loop, Loop) and loop.is_reduce):
         return False
     K_name = loop.axis.name
-    bufs = {ld.input for ld in loop.loads if K_name in {v for e in ld.index for v in e.free_vars()}}
+    bufs = {ld.input for ld in loop.body.of_type(Load) if K_name in {v for e in ld.index for v in e.free_vars()}}
     if len(bufs) < 2:
         return False
     return any(isinstance(s, Accum) for s in loop.body)

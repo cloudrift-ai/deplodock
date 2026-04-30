@@ -184,7 +184,7 @@ def test_load_stmt_binding():
             ),
         ),
     )
-    loads = k.loads
+    loads = k.body.loads
     # rename_ssa_sequential canonicalizes Load names to in0, in1, ...
     assert len(loads) == 1 and loads[0].name == "in0" and loads[0].input == "src_0"
     assert len(k.inputs) == 1
@@ -231,9 +231,9 @@ def test_update_synthesizes_accum_decl():
         ),
     )
     # rename_ssa_sequential canonicalizes Accum names to acc0, acc1, ...
-    assert len(k.accums) == 1 and k.accums[0].name == "acc0"
-    assert k.accums[0].op.name == "add"
-    assert isinstance(k.accums[0].init, Literal) and k.accums[0].init.value == 0.0
+    assert len(k.body.accums) == 1 and k.body.accums[0].name == "acc0"
+    assert k.body.accums[0].op.name == "add"
+    assert isinstance(k.body.accums[0].init, Literal) and k.body.accums[0].init.value == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +282,7 @@ def test_kernel_reduce():
             Write(output="out_0", index=(Var("a0"),), value="s"),
         ),
     )
-    assert any(isinstance(lb.op, ElementwiseImpl) for lb in k.accums)
+    assert any(isinstance(lb.op, ElementwiseImpl) for lb in k.body.accums)
 
 
 def test_kernel_matmul():
@@ -335,8 +335,8 @@ def test_kernel_softmax_two_accumulators():
         ),
     )
     # rename_ssa_sequential renames Accums to acc0, acc1 in definition order.
-    assert any(lb.name == "acc0" for lb in k.accums)
-    assert any(lb.name == "acc1" for lb in k.accums)
+    assert any(lb.name == "acc0" for lb in k.body.accums)
+    assert any(lb.name == "acc1" for lb in k.body.accums)
 
 
 def test_kernel_unary_chain():

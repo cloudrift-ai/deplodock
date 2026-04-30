@@ -180,7 +180,7 @@ def splice_graph(graph) -> tuple[LoopOp, list[str]] | None:
     seen_external: set[str] = set()
 
     for node in loop_nodes.values():
-        for ld in node.op.loads:
+        for ld in node.op.body.loads:
             inp = ld.input
             # A Load is a splice edge if its source buf names another LoopOp node;
             # otherwise it's an external input. We key edges off the buf name

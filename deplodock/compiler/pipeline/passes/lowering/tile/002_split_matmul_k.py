@@ -130,7 +130,7 @@ def _chunk_loop(loop: Loop, tile) -> Loop | None:
         return None
 
     # Idempotence: already chunked if body has a nested reduce-Loop.
-    if any(inner.is_reduce for inner in loop.loops):
+    if any(inner.is_reduce for inner in loop.body.of_type(Loop)):
         return None
 
     K_name = loop.axis.name

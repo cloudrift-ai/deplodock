@@ -119,7 +119,7 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     if not blk.thread_axes:
         raise RuleSkipped("Tile has no thread_axes to convert to BLOCK")
 
-    reduce_loops = [loop for loop in blk.loops if loop.is_reduce]
+    reduce_loops = [loop for loop in blk.body.of_type(Loop) if loop.is_reduce]
     if not reduce_loops:
         raise RuleSkipped("Tile body has no reduce Loop")
     if int(reduce_loops[0].axis.extent) < BLOCK_SIZE:

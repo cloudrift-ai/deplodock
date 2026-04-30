@@ -260,7 +260,7 @@ class KernelOp(Op):
 
     @property
     def loads(self) -> tuple[Load, ...]:
-        return tuple(s for s in self if isinstance(s, Load))
+        return self.body.iter_of_type(Load)
 
     @property
     def smem_names(self) -> frozenset[str]:
@@ -287,7 +287,7 @@ class KernelOp(Op):
 
     @property
     def writes(self) -> tuple[Write, ...]:
-        return tuple(s for s in self if isinstance(s, Write))
+        return self.body.iter_of_type(Write)
 
     @property
     def outputs(self) -> tuple[str, ...]:

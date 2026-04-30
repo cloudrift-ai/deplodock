@@ -139,3 +139,62 @@ class Body(tuple[Stmt, ...]):
         (external read). Convenience over ``self.definitions.get(name)``.
         """
         return self.definitions.get(name)
+
+    # -- type-filtered lookups -------------------------------------------
+
+    def of_type(self, *types: type) -> tuple[Stmt, ...]:
+        """Top-level stmts in this body matching any of the given
+        types. The named helpers below (:meth:`loads`, :meth:`writes`,
+        :meth:`accums`, :meth:`loops`, :meth:`stages`) walk the entire
+        body recursively; use ``of_type`` when you need only the
+        top-level slice (e.g. "Loops directly in this Tile body, not
+        inside nested wrappers")."""
+        return tuple(s for s in self if isinstance(s, types))
+
+    def iter_of_type(self, *types: type) -> tuple[Stmt, ...]:
+        """All stmts (recursive — via :meth:`iter`) matching any of the
+        given types. The base primitive the named helpers
+        (:meth:`loads`, :meth:`writes`, ...) wrap."""
+        return tuple(s for s in self.iter() if isinstance(s, types))
+
+    @cached_property
+    def loads(self) -> tuple[Stmt, ...]:
+        """All ``Load`` stmts in the body (recursive). Replaces the
+        per-Op ``loads`` properties on ``LoopOp`` / ``TileOp`` /
+        ``KernelOp``. Cached on the instance — Body is immutable."""
+        from deplodock.compiler.ir.stmt.leaves import Load  # noqa: PLC0415
+
+        return self.iter_of_type(Load)
+
+    @cached_property
+    def writes(self) -> tuple[Stmt, ...]:
+        """All ``Write`` stmts in the body (recursive)."""
+        from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
+
+        return self.iter_of_type(Write)
+
+    @cached_property
+    def accums(self) -> tuple[Stmt, ...]:
+        """All ``Accum`` stmts in the body (recursive). May contain
+        multiple Accums sharing a single accumulator name (matmul-shape
+        K-inner reduces, 008's per-cell replicated accumulator chains).
+        Validation enforces op-consistency across same-name Accums in
+        ``LoopOp.__post_init__``; callers that want a one-per-name view
+        can dedup at the call site (``{a.name: a for a in body.accums}``)."""
+        from deplodock.compiler.ir.stmt.leaves import Accum  # noqa: PLC0415
+
+        return self.iter_of_type(Accum)
+
+    @cached_property
+    def loops(self) -> tuple[Stmt, ...]:
+        """All ``Loop`` stmts in the body (recursive)."""
+        from deplodock.compiler.ir.stmt.blocks import Loop  # noqa: PLC0415
+
+        return self.iter_of_type(Loop)
+
+    @cached_property
+    def stages(self) -> tuple[Stmt, ...]:
+        """All ``Stage`` stmts in the body (recursive — Tile-IR only)."""
+        from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415
+
+        return self.iter_of_type(Stage)
