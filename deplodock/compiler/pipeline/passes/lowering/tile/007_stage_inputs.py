@@ -45,8 +45,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
-from deplodock.compiler.ir.sigma import Sigma
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, SimplifyCtx, Var, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
@@ -173,60 +172,45 @@ def _classify(
 ) -> tuple[tuple[Expr, ...], tuple[Axis, ...], tuple[int, ...], tuple[Expr, ...] | None] | None:
     """Returns (origin, cache_axes, slab_dims, source_index_template).
 
-    The template is non-None when the additive ``origin + Var(cache_axis)``
-    form can't represent the access — typically when multiple cache axes
-    target the same source dim (post-rebalance kernels) or when the affine
-    composition of cache vars in a single dim isn't coefficient-1. Each
-    Load gets its own per-Load slab; a downstream merge pass (planned)
-    can fuse contiguous siblings into a single larger slab.
+    Decompose each Load index entry as ``anchor + sum(coeffs[v] * Var(v))``
+    over the candidate cache vars (thread axes + reduce axis). A cache var
+    must (a) be in exactly one dim and (b) have coefficient 1 for the
+    additive Stage form to apply; otherwise we fall back to
+    ``source_index_template`` which materialization decodes via Sigma at
+    cooperative-load time. Skip the Load entirely when no thread axis is
+    missing from the index (no cross-thread reuse).
     """
-    idx = load.index
     candidates_by_name = {ax.name: ax for ax in (*thread_axes, reduce_axis)}
-    cache_axes_list: list[Axis] = []
-    seen: set[str] = set()
-    for e in idx:
-        for v in e.free_vars():
-            if v in candidates_by_name and v not in seen:
-                cache_axes_list.append(candidates_by_name[v])
-                seen.add(v)
-    if not cache_axes_list:
+    cache_var_set = frozenset(candidates_by_name)
+
+    forms = [affine_form(e, cache_var_set) for e in load.index]
+    if any(f is None for f in forms):
         return None
-    if not ({ax.name for ax in thread_axes} - seen):
+    forms = [f for f in forms if f is not None]  # narrow for type-checker
+
+    seen_vars: list[str] = []
+    var_to_dim: dict[str, int] = {}
+    coeff_one: dict[str, bool] = {}
+    for d, (_, coeffs) in enumerate(forms):
+        for v, c in coeffs.items():
+            if v in var_to_dim:
+                return None  # cache var spans multiple dims
+            seen_vars.append(v)
+            var_to_dim[v] = d
+            coeff_one[v] = c == 1
+
+    if not seen_vars:
+        return None
+    if not ({ax.name for ax in thread_axes} - set(seen_vars)):
         return None  # every thread axis appears → no reuse
 
-    var_to_dim: dict[str, int] = {}
-    for ax in cache_axes_list:
-        dims = [d for d, e in enumerate(idx) if ax.name in e.free_vars()]
-        if len(dims) != 1:
-            return None  # cache var spans multiple dims — can't represent
-        var_to_dim[ax.name] = dims[0]
-
+    cache_axes = tuple(candidates_by_name[v] for v in seen_vars)
+    slab_dims = tuple(var_to_dim[v] for v in seen_vars)
     ctx = SimplifyCtx({ax.name: Interval(0, int(ax.extent) - 1) for ax in scope_axes})
-    cache_zero = Sigma({ax.name: Literal(0, "int") for ax in cache_axes_list})
-    origin = tuple(cache_zero.apply(e).simplify(ctx) for e in idx)
+    origin = tuple(anchor.simplify(ctx) for anchor, _ in forms)
 
-    cache_axes = tuple(cache_axes_list)
-    slab_dims = tuple(var_to_dim[ax.name] for ax in cache_axes)
-
-    # Multi-cache-axis-per-dim → use template path (additive form can only
-    # carry one cache axis per dim because ``decoded_per_dim`` overwrites).
-    needs_template = len(set(slab_dims)) < len(slab_dims)
-
-    # Verify each cache axis contributes exactly ``Var(ax)`` per dim under
-    # the affine-decomposition form. If not, fall back to template too —
-    # this catches non-coefficient-1 residues (e.g. ``a3*2``) that the
-    # additive Stage path can't represent.
-    if not needs_template:
-        for ax in cache_axes_list:
-            d = var_to_dim[ax.name]
-            sigma = Sigma({other.name: Literal(0, "int") for other in cache_axes_list if other.name != ax.name})
-            residue = sigma.apply(idx[d]).simplify(ctx)
-            expected = (origin[d] + Var(ax.name)).simplify(ctx)
-            if not _add_terms_equal(residue, expected):
-                needs_template = True
-                break
-
-    template = tuple(idx) if needs_template else None
+    needs_template = not all(coeff_one.values())
+    template = tuple(load.index) if needs_template else None
     return origin, cache_axes, slab_dims, template
 
 
@@ -234,16 +218,6 @@ def _flatten_add(e: Expr) -> list[Expr]:
     if isinstance(e, BinaryExpr) and e.op == "+":
         return _flatten_add(e.left) + _flatten_add(e.right)
     return [e]
-
-
-def _add_terms_equal(a: Expr, b: Expr) -> bool:
-    """Compare two Exprs for equality modulo ``+`` associativity / commutativity.
-    The simplifier doesn't canonicalize ``+`` ordering, so a residue like
-    ``X + (Y + Z)`` won't pretty-equal an expected ``(X + Y) + Z`` even though
-    they denote the same value."""
-    ta = sorted(t.pretty() for t in _flatten_add(a))
-    tb = sorted(t.pretty() for t in _flatten_add(b))
-    return ta == tb
 
 
 def _gen_name(buf: str, used: set[str]) -> str:

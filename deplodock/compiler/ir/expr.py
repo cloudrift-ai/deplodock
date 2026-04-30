@@ -703,6 +703,57 @@ def _static_cmp(op: str, la: Interval, lb: Interval) -> bool | None:
 # ``Expr``s that the kernel uses for its actual output coordinates.
 
 
+def affine_form(expr: Expr, vars: frozenset[str] | set[str]) -> tuple[Expr, dict[str, int]] | None:
+    """Decompose ``expr`` as ``anchor + sum(coeffs[v] * Var(v))`` over the given var set.
+
+    Returns ``(anchor, coeffs)`` where ``anchor`` is the part of ``expr`` that's
+    free of ``vars`` (with each ``Var(v)`` substituted to 0) and ``coeffs[v]`` is
+    the integer coefficient of ``Var(v)``. Returns ``None`` when ``expr`` isn't
+    affine in ``vars`` — i.e. it contains a non-additive use of one of those
+    vars (``v / N``, ``v % N``, ``v * v``, ``v`` inside a ternary or call) or
+    a non-literal-int coefficient.
+
+    Vars not in ``vars`` are treated as opaque constants and accumulate into
+    ``anchor`` unchanged. Missing vars in ``coeffs`` mean coefficient 0.
+    """
+    if isinstance(expr, Literal):
+        return expr, {}
+    if isinstance(expr, Var):
+        if expr.name in vars:
+            return Literal(0, "int"), {expr.name: 1}
+        return expr, {}
+    if isinstance(expr, BinaryExpr) and expr.op in ("+", "-"):
+        left = affine_form(expr.left, vars)
+        right = affine_form(expr.right, vars)
+        if left is None or right is None:
+            return None
+        l_anchor, l_coeffs = left
+        r_anchor, r_coeffs = right
+        sign = 1 if expr.op == "+" else -1
+        anchor = BinaryExpr(expr.op, l_anchor, r_anchor)
+        coeffs = dict(l_coeffs)
+        for v, c in r_coeffs.items():
+            coeffs[v] = coeffs.get(v, 0) + sign * c
+        return anchor, {v: c for v, c in coeffs.items() if c != 0}
+    if isinstance(expr, BinaryExpr) and expr.op == "*":
+        l_uses = expr.left.free_vars() & vars
+        r_uses = expr.right.free_vars() & vars
+        if l_uses and r_uses:
+            return None  # var * var — non-affine
+        side, mult = (expr.right, expr.left) if not l_uses else (expr.left, expr.right)
+        if not (isinstance(mult, Literal) and isinstance(mult.value, int)):
+            return None  # symbolic multiplier — would yield non-int coeff
+        sub = affine_form(side, vars)
+        if sub is None:
+            return None
+        sub_anchor, sub_coeffs = sub
+        anchor = BinaryExpr("*", sub_anchor, mult) if not l_uses else BinaryExpr("*", mult, sub_anchor)
+        return anchor, {v: c * mult.value for v, c in sub_coeffs.items()}
+    if expr.free_vars() & set(vars):
+        return None  # vars appear inside a non-affine context (div, mod, ternary, ...)
+    return expr, {}
+
+
 PLACEHOLDER_PREFIX = "out_coord_"
 
 
