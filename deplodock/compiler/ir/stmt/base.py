@@ -173,6 +173,23 @@ class Stmt:
         """SSA names this stmt reads — its 'requirements'."""
         raise NotImplementedError
 
+    def defines(self) -> tuple[str, ...]:
+        """SSA names this stmt produces — its 'bindings'.
+
+        Default: ``()`` (no SSA def). Name-bearing leaves (``Load``,
+        ``Assign``, ``Accum``, ``Init``, ``Select``) override to return
+        ``(self.name,)``. Block stmts (``Loop`` / ``StridedLoop`` /
+        ``Tile`` / ``Cond``) inherit the default — their bodies define
+        names, but the wrapper itself doesn't bind one. ``Write``
+        also inherits the default since it writes to a buffer, not
+        an SSA value.
+
+        Together with :meth:`deps` this is the def-use surface that
+        body-level dependency analyses query (without resorting to
+        ``getattr(s, "name", None)`` patterns).
+        """
+        return ()
+
     def rewrite(
         self,
         rename_ssa: Callable[[str], str],

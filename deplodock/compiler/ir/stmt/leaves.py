@@ -41,6 +41,9 @@ class Load(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
     def is_literal(self, literal_constants: dict[str, float]) -> bool:
         return self.input in literal_constants
 
@@ -81,6 +84,9 @@ class Assign(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return self.args
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -132,6 +138,9 @@ class Accum(Stmt):
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
 
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
@@ -182,6 +191,9 @@ class Init(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return ()
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -258,6 +270,9 @@ class Select(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return tuple(b.value for b in self.branches)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity

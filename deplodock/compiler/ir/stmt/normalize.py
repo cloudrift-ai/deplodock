@@ -266,9 +266,10 @@ def hoist_loop_invariants(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         return ()
 
     def _record(c: Stmt, bindings: set[str]) -> None:
-        name = getattr(c, "name", None)
-        if name is None:
+        defined = c.defines()
+        if not defined:
             return
+        name = defined[0]
         if isinstance(c, Accum):
             axes_of[name] = axes_of.get(c.value, frozenset())
         else:

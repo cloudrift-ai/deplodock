@@ -89,7 +89,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Init, Load, Loop, Select, Stmt, StridedLoop, Tile, Write, iter_body
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, Stmt, StridedLoop, Tile, Write, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import find_matmul_k_outer, is_matmul_reduce, single_tile
@@ -305,12 +305,11 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
 
 def _collect_ssa_defs(stmts: tuple[Stmt, ...]) -> set[str]:
     """SSA names bound somewhere inside ``stmts``. Used to limit cell
-    renaming to locally-defined names so external references stay intact."""
-    out: set[str] = set()
-    for s in iter_body(stmts):
-        if isinstance(s, (Load, Assign, Accum, Select, Init)):
-            out.add(s.name)
-    return out
+    renaming to locally-defined names so external references stay intact.
+    Driven by :meth:`Stmt.defines` — every name-bearing leaf reports its
+    own bindings; block stmts contribute nothing themselves but their
+    bodies are walked by ``iter_body``."""
+    return {n for s in iter_body(stmts) for n in s.defines()}
 
 
 def _build_name_axes(pre_outer: tuple[Stmt, ...], target_axes: frozenset[str]) -> dict[str, frozenset[str]]:
