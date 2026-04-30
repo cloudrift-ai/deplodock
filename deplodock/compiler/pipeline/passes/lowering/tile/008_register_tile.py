@@ -89,7 +89,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import find_matmul_k_outer, is_matmul_reduce, single_tile
@@ -293,69 +293,41 @@ def _build_name_axes(
 ) -> dict[str, frozenset[str]]:
     """Per-name axis dependence covering pre_outer + K-inner + post_outer.
 
-    pre_outer: walked in order, transitively closing dependence through
-    SSA chains. Direct dependence comes from a ``Load``'s index Vars
-    (after subtracting Loop-bound axes); indirect dependence flows
-    through ``Assign.args`` / ``Accum.value`` / ``Select.branches[].value``.
+    pre_outer: built via :meth:`Body.fold` — one walk threads ``bound``
+    axes through enclosing Loop / StridedLoop / Tile and combines each
+    stmt's local axis contribution (Load index Vars filtered by ``bound``,
+    Select branch predicates) with the per-dep axis sets pulled from the
+    memo. Filter to ``target_axes`` lives in the callback.
 
     K-inner / post_outer locals are produced once per output cell, so
-    they get the full ``target_axes`` axis-dep — recorded here in one
-    pass instead of by mutation at the call site.
+    they get the full ``target_axes`` axis-dep regardless of upstream
+    dependencies — overwritten directly after the fold.
 
     A name not present in the returned dict is either a Tile-input
     buffer name (passthrough) or referenced before it was defined
     (which is a structural error — unhandled).
     """
-    name_axes: dict[str, frozenset[str]] = {}
 
     def axes_of_expr(e, bound: frozenset[str]) -> frozenset[str]:
         return frozenset(v for v in e.free_vars() if v in target_axes and v not in bound)
 
-    def axes_of_name(n: str) -> frozenset[str]:
-        return name_axes.get(n, frozenset())
+    def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
+        own: frozenset[str] = frozenset()
+        if isinstance(s, Load):
+            for e in s.index:
+                own = own | axes_of_expr(e, bound)
+        elif isinstance(s, Select):
+            for b in s.branches:
+                own = own | axes_of_expr(b.select, bound)
+        # Assign / Accum / others contribute no direct Expr-level axes —
+        # their dependence comes entirely from child_T.
+        for c in child_T:
+            if c is not None:
+                own = own | c
+        return own
 
-    def visit(node: Stmt, bound: frozenset[str]) -> None:
-        if isinstance(node, (Loop, StridedLoop)):
-            for c in node.body:
-                visit(c, bound | {node.axis.name})
-            return
-        if isinstance(node, Cond):
-            for c in node.body:
-                visit(c, bound)
-            for c in node.else_body:
-                visit(c, bound)
-            return
-        if isinstance(node, Tile):
-            new_bound = bound | {ba.axis.name for ba in node.axes}
-            for c in node.body:
-                visit(c, new_bound)
-            return
-        if isinstance(node, Load):
-            axes: frozenset[str] = frozenset()
-            for e in node.index:
-                axes = axes | axes_of_expr(e, bound)
-            name_axes[node.name] = axes
-            return
-        if isinstance(node, Assign):
-            axes = frozenset()
-            for a in node.args:
-                axes = axes | axes_of_name(a)
-            name_axes[node.name] = axes
-            return
-        if isinstance(node, Accum):
-            existing = name_axes.get(node.name, frozenset())
-            name_axes[node.name] = existing | axes_of_name(node.value)
-            return
-        if isinstance(node, Select):
-            axes = frozenset()
-            for b in node.branches:
-                axes = axes | axes_of_name(b.value) | axes_of_expr(b.select, bound)
-            name_axes[node.name] = axes
-            return
-        # Init / Stage / Write / others — no SSA def to record at this level.
-
-    for s in pre_outer:
-        visit(s, frozenset())
+    memo = pre_outer.fold(fn)
+    name_axes: dict[str, frozenset[str]] = {n: memo[id(s)] for s in pre_outer.iter() for n in s.defines()}
     for nm in k_inner_locals:
         name_axes[nm] = target_axes
     for nm in post_locals:
@@ -365,39 +337,29 @@ def _build_name_axes(
 
 def _axes_used_in_stmt(s: Stmt, target_axes: frozenset[str]) -> frozenset[str]:
     """Subset of ``target_axes`` (axis-name set) appearing as free Vars
-    in any expression inside ``s``, excluding axes bound by enclosing
-    Loop/StridedLoop wrappers inside ``s`` itself.
+    in any expression inside ``s``'s subtree, excluding axes bound by
+    enclosing Loop / StridedLoop / Tile wrappers inside ``s`` itself.
 
     A pre_outer reduce ``Loop(a2, body=[Load(buf[a1, a2]), Accum])``
     has ``a2`` bound by the Loop; only ``a1`` survives the filter and
     if ``a1`` is in ``target_axes`` it appears in the result.
-    """
+
+    Recursive over the nesting tree (``s.nested()``) — *not* the
+    def-use DAG — so ``Body.fold`` doesn't fit (its ``child_T`` are
+    SSA-deps, not nested-body values). Threads ``bound`` via
+    ``Stmt.binds_axes()``, which keeps the recursion type-set-agnostic
+    (no isinstance ladder over the block-stmt set)."""
     used: set[str] = set()
 
     def walk(node: Stmt, bound: frozenset[str]) -> None:
-        if isinstance(node, (Loop, StridedLoop)):
-            for c in node.body:
-                walk(c, bound | {node.axis.name})
-            return
-        if isinstance(node, Cond):
-            for v in node.cond.free_vars():
-                if v in target_axes and v not in bound:
-                    used.add(v)
-            for c in node.body:
-                walk(c, bound)
-            for c in node.else_body:
-                walk(c, bound)
-            return
-        if isinstance(node, Tile):
-            new_bound = bound | {ba.axis.name for ba in node.axes}
-            for c in node.body:
-                walk(c, new_bound)
-            return
-        # Leaf-ish stmts: pull every Expr-bearing field's free Vars.
         for e in _exprs_in(node):
             for v in e.free_vars():
                 if v in target_axes and v not in bound:
                     used.add(v)
+        new_bound = bound | node.binds_axes()
+        for child_body in node.nested():
+            for c in child_body:
+                walk(c, new_bound)
 
     walk(s, frozenset())
     return frozenset(used)
@@ -412,6 +374,8 @@ def _exprs_in(s: Stmt):
     elif isinstance(s, Select):
         for b in s.branches:
             yield b.select
+    elif isinstance(s, Cond):
+        yield s.cond
     elif isinstance(s, Stage):
         # Stage carries an index expression for its load source.
         yield from getattr(s, "index", ())

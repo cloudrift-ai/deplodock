@@ -60,6 +60,9 @@ class Loop(Stmt):
         (body,) = bodies
         return Loop(axis=self.axis, body=body, unroll=self.unroll)
 
+    def binds_axes(self) -> frozenset[str]:
+        return frozenset({self.axis.name})
+
     @property
     def is_reduce(self) -> bool:
         """A loop is a reduce-loop iff its immediate body contains an ``Accum``."""
@@ -140,6 +143,9 @@ class Tile(Stmt):
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
         return Tile(axes=self.axes, body=body)
+
+    def binds_axes(self) -> frozenset[str]:
+        return frozenset(ba.axis.name for ba in self.axes)
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -279,6 +285,9 @@ class StridedLoop(Stmt):
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
         return StridedLoop(axis=self.axis, start=self.start, step=self.step, body=body, unroll=self.unroll)
+
+    def binds_axes(self) -> frozenset[str]:
+        return frozenset({self.axis.name})
 
     @property
     def is_reduce(self) -> bool:

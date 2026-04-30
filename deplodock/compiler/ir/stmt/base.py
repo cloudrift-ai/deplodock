@@ -237,6 +237,17 @@ class Stmt:
         assert not bodies, f"{type(self).__name__}.with_bodies: leaf stmt got {len(bodies)} bodies"
         return self
 
+    def binds_axes(self) -> frozenset[str]:
+        """Axes this stmt introduces into scope for its nested bodies.
+
+        Default: ``frozenset()`` (no axis binding). ``Loop`` / ``StridedLoop``
+        return ``{self.axis.name}``; ``Tile`` returns the axis names of every
+        ``BoundAxis``; ``Cond`` keeps the default. Used by ``Body.fold``
+        to thread the bound-axis set through the def-use walk without an
+        isinstance ladder over the block-stmt set.
+        """
+        return frozenset()
+
     def pretty(self, indent: str = "") -> list[str]:
         """Render this stmt as a list of indented lines.
 

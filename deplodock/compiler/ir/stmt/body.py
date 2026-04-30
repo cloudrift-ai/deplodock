@@ -129,6 +129,59 @@ class Body(tuple[Stmt, ...]):
                 out.extend(r)
         return Body(out)
 
+    # -- generic backward dataflow --------------------------------------
+
+    def fold[T](
+        self,
+        fn: Callable[[Stmt, tuple[T | None, ...], frozenset[str]], T],
+    ) -> dict[int, T]:
+        """Generic backward dataflow over this body's def-use DAG.
+
+        Walks every stmt in source order (= SSA topo order). At each stmt,
+        calls ``fn(stmt, child_T, bound)``:
+
+        - ``child_T`` — one entry per name in ``stmt.deps()``, pulled from
+          the running memo via ``self.definitions``. ``None`` when the dep
+          is read but not defined locally (Tile-input buffer reference,
+          constant, or an SSA from an enclosing scope — i.e. an external
+          read). Position-preserving: same order as ``stmt.deps()``.
+        - ``bound`` — set of axis names introduced by enclosing
+          ``Loop`` / ``StridedLoop`` / ``Tile`` wrappers via
+          ``Stmt.binds_axes()``. ``Cond`` doesn't bind axes. Callbacks
+          that don't care about scope can ignore this.
+
+        Returns the per-stmt memo keyed by ``id(stmt)`` — ``Tile`` is a
+        non-frozen dataclass and not hashable, so id-keying is the
+        lowest-friction choice. Callers that want a name-keyed view do
+        ``{n: memo[id(s)] for s in body.iter() for n in s.defines()}``.
+
+        Recursion order: nested bodies are processed *before* the wrapper
+        stmt. So when ``fn`` is called on a wrapper that doesn't define a
+        name itself (Loop / Tile / StridedLoop), the memo entries for any
+        Accums inside its body already exist — downstream consumers at the
+        wrapper's scope can read them through ``deps()``.
+
+        Caveat: when multiple stmts define the same SSA name (matmul-shape
+        bodies with several ``Accum`` stmts sharing one accumulator),
+        ``self.definitions`` resolves to the last definer. ``child_T`` will
+        carry that last definer's ``T`` only. Callers needing a multi-defs
+        union (e.g. unioning axes across all Accums for ``acc``) iterate
+        ``body.accums`` themselves at the call site.
+        """
+        memo: dict[int, T] = {}
+        defs = self.definitions
+
+        def walk(body: Body, bound: frozenset[str]) -> None:
+            for s in body:
+                child_bound = bound | s.binds_axes()
+                for child_body in s.nested():
+                    walk(child_body, child_bound)
+                child_T: tuple[T | None, ...] = tuple(memo.get(id(defs[d])) if d in defs else None for d in s.deps())
+                memo[id(s)] = fn(s, child_T, bound)
+
+        walk(self, frozenset())
+        return memo
+
     # -- def-use analysis ------------------------------------------------
 
     @cached_property
