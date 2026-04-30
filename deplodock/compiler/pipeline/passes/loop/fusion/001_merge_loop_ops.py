@@ -237,13 +237,11 @@ def _rename_write_output(op: LoopOp, *, old: str, new: str) -> LoopOp:
     to ``output=new`` (recursively descends into nested Loops). Used by
     fusion to align the spliced root's Writes with the new graph node id.
     """
-    from deplodock.compiler.ir.loop import Loop, Write
+    from deplodock.compiler.ir.loop import Write
 
     def fn(s):
         if isinstance(s, Write) and s.output == old:
             return Write(output=new, index=s.index, value=s.value)
-        if isinstance(s, Loop):
-            return Loop(axis=s.axis, body=s.body.map(fn))
         return s
 
     return LoopOp(body=op.body.map(fn))

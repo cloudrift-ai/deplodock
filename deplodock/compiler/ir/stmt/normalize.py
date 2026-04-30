@@ -11,7 +11,7 @@ to Loop IR and Tile IR bodies.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import replace
 
 from deplodock.compiler.ir.axis import Axis
@@ -33,18 +33,6 @@ def _identity_rename(n: str) -> str:
 
 def _make_axis_renamer(old: str, new: Axis) -> Callable[[Axis], Axis]:
     return lambda a: new if a.name == old else a
-
-
-def _recurse_through_block(s: Stmt, fn: Callable[[Stmt], Stmt | None | Iterable[Stmt]]) -> Stmt | None:
-    """If ``s`` is a non-Loop block stmt, return a copy with its body /
-    bodies re-walked through ``fn`` via ``Body.map``. Else return ``None``."""
-    if isinstance(s, StridedLoop):
-        return StridedLoop(axis=s.axis, start=s.start, step=s.step, body=s.body.map(fn))
-    if isinstance(s, Tile):
-        return Tile(axes=s.axes, body=s.body.map(fn))
-    if isinstance(s, Cond):
-        return Cond(cond=s.cond, body=s.body.map(fn), else_body=s.else_body.map(fn))
-    return None
 
 
 def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
@@ -83,14 +71,11 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
     stmts = Body.coerce(stmts)
 
     def fn(s: Stmt) -> Stmt | Body:
-        if isinstance(s, Loop):
-            candidate = replace(s, body=s.body.map(fn))
-            if int(candidate.axis.extent) == 1 and not candidate.is_reduce:
-                sub = Sigma({candidate.axis.name: Literal(0, "int")})
-                return tuple(c.rewrite(_identity_rename, sub) for c in candidate.body)
-            return candidate
-        rec = _recurse_through_block(s, fn)
-        return rec if rec is not None else s
+        # Body.map post-order: ``s.body`` is already recursively mapped.
+        if isinstance(s, Loop) and int(s.axis.extent) == 1 and not s.is_reduce:
+            sub = Sigma({s.axis.name: Literal(0, "int")})
+            return tuple(c.rewrite(_identity_rename, sub) for c in s.body)
+        return s
 
     return stmts.map(fn)
 
@@ -161,11 +146,9 @@ def eliminate_copy_aliases(stmts: Body) -> Body:
         return name
 
     def fn(s: Stmt) -> Stmt | None:
-        if isinstance(s, Loop):
-            return replace(s, body=s.body.map(fn))
-        rec = _recurse_through_block(s, fn)
-        if rec is not None:
-            return rec
+        # Body.map post-order: block bodies already recursed; only handle leaves.
+        if isinstance(s, (Loop, StridedLoop, Tile, Cond)):
+            return s
         if isinstance(s, Assign) and s.op.name == "copy" and len(s.args) == 1:
             alias[s.name] = s.args[0]
             return None

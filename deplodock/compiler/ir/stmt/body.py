@@ -89,7 +89,9 @@ class Body(tuple[Stmt, ...]):
     # -- transformation --------------------------------------------------
 
     def map(self, fn: Callable[[Stmt], Stmt | None | Iterable[Stmt]]) -> Body:
-        """Flat 1:N body transformer. Returns a new Body with each stmt
+        """Recursive 1:N body transformer. Post-order: each block stmt's
+        nested body is mapped first, then ``fn`` is applied to the
+        children-rewritten wrapper. Returns a new Body with each stmt
         replaced by ``fn(stmt)``:
 
         - a single ``Stmt`` (kept in place of the input),
@@ -97,15 +99,34 @@ class Body(tuple[Stmt, ...]):
         - an iterable of ``Stmt`` (inline all of them).
 
         ``fn`` is called on *every* stmt including ``Loop`` / ``Tile`` /
-        etc. wrappers; recursion into a wrapper's body is the caller's
-        responsibility (typically by writing a self-recursive ``fn``
-        that returns ``Loop(axis=..., body=s.body.map(fn))`` for Loop
-        cases). Lets callers pick their own policy for axis renames,
-        Loop skipping, or selective recursion.
+        ``Cond`` / ``StridedLoop`` wrappers — but with their bodies already
+        recursively mapped, so ``fn`` only needs to handle the leaf cases
+        it cares about (callers no longer need a self-recursive
+        ``Loop(..., body=s.body.map(fn))`` branch). Mirrors :meth:`iter`'s
+        full-tree traversal.
+
+        Iterable returns *replace* the wrapper: the returned stmts are
+        spliced into the body as-is (their interiors have already been
+        recursed when the wrapper was visited), so a caller that
+        ``return tuple(c for c in s.body)`` to inline a Loop's body sees
+        already-rewritten children.
         """
+        from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile  # noqa: PLC0415
+
+        def descend(s: Stmt) -> Stmt:
+            if isinstance(s, Loop):
+                return Loop(axis=s.axis, body=s.body.map(fn), unroll=s.unroll)
+            if isinstance(s, StridedLoop):
+                return StridedLoop(axis=s.axis, start=s.start, step=s.step, body=s.body.map(fn), unroll=s.unroll)
+            if isinstance(s, Tile):
+                return Tile(axes=s.axes, body=s.body.map(fn))
+            if isinstance(s, Cond):
+                return Cond(cond=s.cond, body=s.body.map(fn), else_body=s.else_body.map(fn))
+            return s
+
         out: list[Stmt] = []
         for s in self:
-            r = fn(s)
+            r = fn(descend(s))
             if r is None:
                 continue
             if isinstance(r, Stmt):

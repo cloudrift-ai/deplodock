@@ -240,78 +240,72 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
     pre_outer = tile.body[:k_outer_idx]
     post_outer = tile.body[k_outer_idx + 1 :]
 
-    # Build per-name axis dependence over pre_outer (transitive through
-    # SSA chains: an Assign / Accum / Select inherits the union of its
-    # args' axes_used). Loop / StridedLoop axes are masked out.
     target_axes = frozenset({m_axis, n_axis})
-    name_axes: dict[str, frozenset[str]] = _build_name_axes(pre_outer, target_axes)
-
-    # Stmt-level axes_used = union of axes_used over names defined inside
-    # that stmt. For Loop wrappers around an Accum (SDPA softmax pre-pass),
-    # this picks up the Accum's axis-dep; for top-level Loads / Assigns,
-    # it picks up that stmt's own dep.
-    pre_axes_used: list[frozenset[str]] = []
-    for s in pre_outer:
-        defs = set(Body((s,)).definitions)
-        if defs:
-            axes = frozenset()
-            for nm in defs:
-                axes = axes | name_axes.get(nm, frozenset())
-            pre_axes_used.append(axes)
-        else:
-            # No SSA defs inside (e.g. a bare Write at top level — unusual);
-            # fall back to direct expression-level walk.
-            pre_axes_used.append(_axes_used_in_stmt(s, target_axes))
-
-    # K-inner / post_outer locals get the full F² axis-dep — they're
-    # produced once per output cell.
     k_inner_locals = set(k_inner.body.definitions)
-    for nm in k_inner_locals:
-        name_axes[nm] = target_axes
     post_locals = set(post_outer.definitions)
-    for nm in post_locals:
-        name_axes[nm] = target_axes
+    name_axes = _build_name_axes(pre_outer, k_inner_locals, post_locals, target_axes)
 
-    # Replicate K-inner body F² (matmul output is per-cell).
-    cells_full = [(i, j) for i in range(factor) for j in range(factor)]
-    new_k_inner_body: list[Stmt] = []
-    for i, j in cells_full:
-        sigma = _cell_sigma(target_axes, m_axis, m_o, n_axis, n_o, i, j, factor)
-        rename = _make_rename(name_axes, k_inner_locals, target_axes, m_axis, n_axis, i, j)
-        for s in k_inner.body:
-            new_k_inner_body.append(s.rewrite(rename, sigma))
-    new_outer_body.append(Loop(axis=k_inner.axis, body=new_k_inner_body, unroll=k_inner.unroll))
+    rewriter = CellRewriter(m_axis=m_axis, n_axis=n_axis, m_o=m_o, n_o=n_o, factor=factor, name_axes=name_axes)
 
-    # Replicate pre_outer per stmt by its axes_used.
-    new_body: list[Stmt] = []
-    for s, axes in zip(pre_outer, pre_axes_used, strict=True):
-        for i, j in _cell_coords(axes, m_axis, n_axis, factor):
-            sigma = _cell_sigma(axes, m_axis, m_o, n_axis, n_o, i, j, factor)
-            stmt_locals = set(Body((s,)).definitions)
-            rename = _make_rename(name_axes, stmt_locals, axes, m_axis, n_axis, i, j)
-            new_body.append(s.rewrite(rename, sigma))
+    pre_triples = [_pre_triple(s, name_axes, target_axes) for s in pre_outer]
+    k_inner_triples = [(s, target_axes, set(Body((s,)).definitions)) for s in k_inner.body]
+    post_triples = [(s, target_axes, set(Body((s,)).definitions)) for s in post_outer]
 
+    new_outer_body.append(Loop(axis=k_inner.axis, body=_replicate(k_inner_triples, rewriter), unroll=k_inner.unroll))
+
+    new_body: list[Stmt] = _replicate(pre_triples, rewriter)
     new_body.append(Loop(axis=k_outer.axis, body=new_outer_body, unroll=k_outer.unroll))
-
-    # Replicate post_outer F² (epilogue depends on per-cell matmul output).
-    for i, j in cells_full:
-        sigma = _cell_sigma(target_axes, m_axis, m_o, n_axis, n_o, i, j, factor)
-        rename = _make_rename(name_axes, post_locals, target_axes, m_axis, n_axis, i, j)
-        for s in post_outer:
-            new_body.append(s.rewrite(rename, sigma))
+    new_body.extend(_replicate(post_triples, rewriter))
 
     return Tile(axes=new_axes, body=new_body)
 
 
-def _build_name_axes(pre_outer: Body, target_axes: frozenset[str]) -> dict[str, frozenset[str]]:
-    """Per-name axis dependence over ``pre_outer``, transitively closed
-    through SSA chains.
+def _pre_triple(s: Stmt, name_axes: dict[str, frozenset[str]], target_axes: frozenset[str]) -> tuple[Stmt, frozenset[str], set[str]]:
+    """Cell-axes / locals descriptor for one pre_outer stmt.
 
-    Walks pre_outer in order, recording for each defined SSA name the
-    subset of ``target_axes`` its value depends on. Direct dependence
-    comes from a ``Load``'s index Vars (after subtracting Loop-bound
-    axes); indirect dependence flows through ``Assign.args`` / ``Accum.value``
-    / ``Select.branches[].value``.
+    Stmt-level axes_used = union of axes_used over names defined inside
+    that stmt. For Loop wrappers around an Accum (SDPA softmax pre-pass),
+    this picks up the Accum's axis-dep; for top-level Loads / Assigns,
+    it picks up that stmt's own dep. Falls back to a direct expression-
+    level walk when no SSA defs exist (e.g. a bare top-level Write)."""
+    defs = set(Body((s,)).definitions)
+    if defs:
+        axes: frozenset[str] = frozenset()
+        for nm in defs:
+            axes = axes | name_axes.get(nm, frozenset())
+    else:
+        axes = _axes_used_in_stmt(s, target_axes)
+    return s, axes, defs
+
+
+def _replicate(triples: list[tuple[Stmt, frozenset[str], set[str]]], rewriter: CellRewriter) -> list[Stmt]:
+    """Per-stmt cell replication. Each (stmt, cell_axes, locals_in_scope)
+    triple is rewritten once per cell coord that ``rewriter.cells(cell_axes)``
+    enumerates — F² for stmts depending on both M and N, F for one-axis
+    deps, 1 for axis-free stmts."""
+    out: list[Stmt] = []
+    for s, axes, loc in triples:
+        for i, j in rewriter.cells(axes):
+            out.append(rewriter.rewrite(s, i, j, loc, axes))
+    return out
+
+
+def _build_name_axes(
+    pre_outer: Body,
+    k_inner_locals: set[str],
+    post_locals: set[str],
+    target_axes: frozenset[str],
+) -> dict[str, frozenset[str]]:
+    """Per-name axis dependence covering pre_outer + K-inner + post_outer.
+
+    pre_outer: walked in order, transitively closing dependence through
+    SSA chains. Direct dependence comes from a ``Load``'s index Vars
+    (after subtracting Loop-bound axes); indirect dependence flows
+    through ``Assign.args`` / ``Accum.value`` / ``Select.branches[].value``.
+
+    K-inner / post_outer locals are produced once per output cell, so
+    they get the full ``target_axes`` axis-dep — recorded here in one
+    pass instead of by mutation at the call site.
 
     A name not present in the returned dict is either a Tile-input
     buffer name (passthrough) or referenced before it was defined
@@ -367,6 +361,10 @@ def _build_name_axes(pre_outer: Body, target_axes: frozenset[str]) -> dict[str, 
 
     for s in pre_outer:
         visit(s, frozenset())
+    for nm in k_inner_locals:
+        name_axes[nm] = target_axes
+    for nm in post_locals:
+        name_axes[nm] = target_axes
     return name_axes
 
 
@@ -425,80 +423,86 @@ def _exprs_in(s: Stmt):
     # Assign / Accum / Init have only SSA-name fields (no Exprs).
 
 
-def _cell_coords(axes_used: frozenset[str], m_axis: str, n_axis: str, factor: int) -> list[tuple[int, int]]:
-    """Cell coords to replicate over for a stmt with the given axis-dep.
+class CellRewriter:
+    """Per-cell σ-substitution + SSA-rename packaged together.
 
-    Returns (i, j) tuples; ``i`` defaults to 0 when m_axis ∉ axes_used,
-    same for ``j``. Defaulting to 0 (rather than None) keeps the σ
-    well-formed at the unused axis — its substitution simply produces
-    ``axis_o*F + 0`` which is the correct un-replicated reference.
+    Folds the previous ``_cell_coords`` / ``_cell_sigma`` / ``_cell_suffix``
+    / ``_make_rename`` quartet into a single object holding the split-axis
+    geometry (``m_o`` / ``n_o`` / ``factor``) and the resolved
+    ``name_axes`` map. Call sites get two methods:
+
+    - :meth:`cells` → list of ``(i, j)`` coords for a given axis-dep.
+    - :meth:`rewrite` → rewrite one stmt at one cell with proper
+      σ + per-cell SSA rename.
     """
-    if not axes_used:
-        return [(0, 0)]
-    if axes_used == {m_axis}:
-        return [(i, 0) for i in range(factor)]
-    if axes_used == {n_axis}:
-        return [(0, j) for j in range(factor)]
-    return [(i, j) for i in range(factor) for j in range(factor)]
 
+    def __init__(
+        self,
+        m_axis: str,
+        n_axis: str,
+        m_o: Axis,
+        n_o: Axis,
+        factor: int,
+        name_axes: dict[str, frozenset[str]],
+    ) -> None:
+        self.m_axis = m_axis
+        self.n_axis = n_axis
+        self.m_o = m_o
+        self.n_o = n_o
+        self.factor = factor
+        self.name_axes = name_axes
 
-def _cell_sigma(
-    axes_used: frozenset[str],
-    m_axis: str,
-    m_o: Axis,
-    n_axis: str,
-    n_o: Axis,
-    i: int,
-    j: int,
-    factor: int,
-) -> Sigma:
-    """σ-substitution for cell (i, j) restricted to ``axes_used``."""
-    sub: dict[str, object] = {}
-    if m_axis in axes_used:
-        sub[m_axis] = Var(m_o.name) * Literal(factor, "int") + Literal(i, "int")
-    if n_axis in axes_used:
-        sub[n_axis] = Var(n_o.name) * Literal(factor, "int") + Literal(j, "int")
-    return Sigma(sub) if sub else Sigma.IDENTITY
+    def cells(self, axes_used: frozenset[str]) -> list[tuple[int, int]]:
+        """Cell coords to replicate over for a stmt with the given axis-dep.
 
+        Defaults the unused axis to 0 (rather than None) so σ stays
+        well-formed at that axis — substitution produces ``axis_o*F + 0``
+        which is the correct un-replicated reference."""
+        if not axes_used:
+            return [(0, 0)]
+        if axes_used == {self.m_axis}:
+            return [(i, 0) for i in range(self.factor)]
+        if axes_used == {self.n_axis}:
+            return [(0, j) for j in range(self.factor)]
+        return [(i, j) for i in range(self.factor) for j in range(self.factor)]
 
-def _cell_suffix(axes_used: frozenset[str], m_axis: str, n_axis: str, i: int, j: int) -> str:
-    """Per-cell SSA-name suffix matching the axis subset."""
-    if not axes_used:
-        return ""
-    if axes_used == {m_axis}:
-        return f"_{i}"
-    if axes_used == {n_axis}:
-        return f"_{j}"
-    return f"_{i}_{j}"
+    def _suffix(self, axes: frozenset[str], i: int, j: int) -> str:
+        if not axes:
+            return ""
+        if axes == {self.m_axis}:
+            return f"_{i}"
+        if axes == {self.n_axis}:
+            return f"_{j}"
+        return f"_{i}_{j}"
 
+    def _sigma(self, cell_axes: frozenset[str], i: int, j: int) -> Sigma:
+        sub: dict[str, object] = {}
+        if self.m_axis in cell_axes:
+            sub[self.m_axis] = Var(self.m_o.name) * Literal(self.factor, "int") + Literal(i, "int")
+        if self.n_axis in cell_axes:
+            sub[self.n_axis] = Var(self.n_o.name) * Literal(self.factor, "int") + Literal(j, "int")
+        return Sigma(sub) if sub else Sigma.IDENTITY
 
-def _make_rename(
-    name_axes: dict[str, frozenset[str]],
-    locals_in_scope: set[str],
-    cell_axes: frozenset[str],
-    m_axis: str,
-    n_axis: str,
-    i: int,
-    j: int,
-):
-    """Build a per-cell SSA rename callback.
+    def rewrite(self, s: Stmt, i: int, j: int, locals_in_scope: set[str], cell_axes: frozenset[str]) -> Stmt:
+        """Rewrite ``s`` for cell ``(i, j)``.
 
-    ``locals_in_scope`` are the names defined inside the region being
-    rewritten — they get renamed to the suffix corresponding to
-    ``cell_axes`` (the region's axis-dep: F² for K-inner / post_outer
-    and F-or-1 for pre_outer reduce-loop replicas). External reads
-    (names defined elsewhere) get the suffix matching the *defining*
-    stmt's axis-dep recorded in ``name_axes``.
-    """
-    local_suffix = _cell_suffix(cell_axes, m_axis, n_axis, i, j)
+        ``locals_in_scope`` are the names defined inside the region being
+        rewritten — they get the suffix corresponding to ``cell_axes``
+        (the region's axis-dep: F² for K-inner / post_outer and F-or-1
+        for pre_outer replicas). External reads (names defined elsewhere)
+        get the suffix matching their defining stmt's axis-dep recorded
+        in ``name_axes``."""
+        sigma = self._sigma(cell_axes, i, j)
+        local_suffix = self._suffix(cell_axes, i, j)
+        name_axes = self.name_axes
 
-    def rename(name: str) -> str:
-        if name in locals_in_scope:
-            return f"{name}{local_suffix}" if local_suffix else name
-        axes = name_axes.get(name)
-        if axes is None:
-            return name  # passthrough — Tile-input or out-of-scope name
-        suffix = _cell_suffix(axes, m_axis, n_axis, i, j)
-        return f"{name}{suffix}" if suffix else name
+        def rename(name: str) -> str:
+            if name in locals_in_scope:
+                return f"{name}{local_suffix}" if local_suffix else name
+            axes = name_axes.get(name)
+            if axes is None:
+                return name  # passthrough — Tile-input or out-of-scope name
+            suffix = self._suffix(axes, i, j)
+            return f"{name}{suffix}" if suffix else name
 
-    return rename
+        return s.rewrite(rename, sigma)

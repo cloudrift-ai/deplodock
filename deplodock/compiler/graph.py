@@ -573,7 +573,7 @@ def _rename_buf_in_op(op, old: str, new: str):
     """Rewrite ``Load.source`` / ``Write.output`` references inside a
     ``LoopOp`` body from ``old`` to ``new`` (recursively into nested Loops).
     Pass-through for op types without internal buf refs."""
-    from deplodock.compiler.ir.loop import Load, Loop, LoopOp, Write
+    from deplodock.compiler.ir.loop import Load, LoopOp, Write
 
     if not isinstance(op, LoopOp):
         return op
@@ -583,8 +583,6 @@ def _rename_buf_in_op(op, old: str, new: str):
             return Load(name=s.name, input=new, index=s.index)
         if isinstance(s, Write) and s.output == old:
             return Write(output=new, index=s.index, value=s.value)
-        if isinstance(s, Loop):
-            return Loop(axis=s.axis, body=s.body.map(fn))
         return s
 
     return LoopOp(body=op.body.map(fn))

@@ -192,11 +192,9 @@ def _rewrite_loads(s: Stmt, rewrites: dict[str, tuple[str, int]]) -> Stmt:
         if isinstance(c, Load) and c.input in rewrites:
             new_name, cell_offset = rewrites[c.input]
             return Load(name=c.name, input=new_name, index=(*c.index, Literal(cell_offset, "int")))
-        if isinstance(c, Loop):
-            return dc_replace(c, body=c.body.map(fn))
         return c
 
-    return fn(s) if not isinstance(s, Loop) else dc_replace(s, body=s.body.map(fn))
+    return Body((s,)).map(fn)[0]
 
 
 def _split_const(e: Expr) -> tuple[Expr, int]:
