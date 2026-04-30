@@ -105,13 +105,13 @@ def _is_kouter_matmul(loop: Loop) -> bool:
             return False
         # Reject if any non-Accum stmt reads an Accum target's running
         # value (in-loop online-softmax-style merge). Driven by
-        # ``Body.def_of`` so the predicate is a one-liner: each dep
-        # resolves to its defining stmt; flag any that resolves to an
+        # ``Body.deps_of`` so the predicate is a one-liner: each stmt's
+        # deps resolve to defining stmts; flag any that resolves to an
         # ``Accum``.
         for c in k_inner.body:
             if isinstance(c, Accum):
                 continue
-            if any(isinstance(k_inner.body.def_of(d), Accum) for d in c.deps()):
+            if any(isinstance(s, Accum) for s in k_inner.body.deps_of(c)):
                 return False
         return True
 

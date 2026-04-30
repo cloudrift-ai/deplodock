@@ -133,12 +133,21 @@ class Body(tuple[Stmt, ...]):
         """
         return {n: s for s in self.iter() for n in s.defines()}
 
-    def def_of(self, name: str) -> Stmt | None:
-        """Return the Stmt that produces ``name`` inside this body,
-        or ``None`` if ``name`` is read but not defined locally
-        (external read). Convenience over ``self.definitions.get(name)``.
-        """
-        return self.definitions.get(name)
+    def deps_of(self, stmt: Stmt) -> tuple[Stmt | None, ...]:
+        """Defining stmts inside this body for each of ``stmt``'s SSA
+        reads, in the same order as ``stmt.deps()``. Position-preserving:
+        each entry is the ``Stmt`` that produces the corresponding dep,
+        or ``None`` if the dep is read but not defined locally (Tile-
+        input buffer reference, constant, or an SSA from an enclosing
+        scope — i.e. an external read).
+
+        Replaces the ``[body.def_of(d) for d in stmt.deps()]`` pattern
+        rules used to write inline. Use ``isinstance(s, T)`` predicates
+        to filter results — ``None`` won't match any concrete stmt
+        type, so external reads drop out automatically; check
+        ``s is None`` explicitly when the gate cares about externals."""
+        defs = self.definitions
+        return tuple(defs.get(d) for d in stmt.deps())
 
     # -- type-filtered lookups -------------------------------------------
 
