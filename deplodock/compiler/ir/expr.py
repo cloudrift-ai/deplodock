@@ -754,6 +754,35 @@ def affine_form(expr: Expr, vars: frozenset[str] | set[str]) -> tuple[Expr, dict
     return expr, {}
 
 
+def index_set_size(exprs: tuple[Expr, ...], var_extents: dict[str, int]) -> int | None:
+    """Upper bound on ``|{tuple(e(env) for e in exprs) : env in extents}|``.
+
+    For each Expr, decompose to affine form over ``var_extents.keys()``. The
+    per-dim projection size is bounded by ``1 + sum(|c_v| * (extent_v - 1))``
+    over the var coefficients in that dim — this is tight when the affine
+    form's coefficients align (rare false positive only across correlated
+    dims). The total is the product over dims (over-counts when dims are
+    correlated, fine as an upper bound). Returns ``None`` if any expr isn't
+    affine in ``var_extents``.
+
+    Used by staging to compute reuse: ``work / index_set_size`` over a
+    Load's index gives the per-element fan-in, i.e., how many threads /
+    iterations read the same source value.
+    """
+    var_set = frozenset(var_extents)
+    total = 1
+    for e in exprs:
+        form = affine_form(e, var_set)
+        if form is None:
+            return None
+        _, coeffs = form
+        size = 1
+        for v, c in coeffs.items():
+            size += abs(c) * (var_extents[v] - 1)
+        total *= size
+    return total
+
+
 PLACEHOLDER_PREFIX = "out_coord_"
 
 
