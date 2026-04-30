@@ -1,12 +1,28 @@
 """Shared pytest fixtures for all test modules."""
 
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
+import torch
 import yaml
+
+
+@pytest.fixture(autouse=True)
+def _seed_rng():
+    """Pin RNGs for every test so numerical-tolerance assertions
+    (e.g. ``test_torch_ops.test_unary``) don't flake on inputs that
+    happen to land in tight regions. Determinism > tolerance — a real
+    precision regression should still trip these tests."""
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
 
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")

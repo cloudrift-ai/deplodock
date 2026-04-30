@@ -153,12 +153,7 @@ def _maybe_rewrite(body: Body) -> Body | None:
 
 def _has_reduce_loop(s: Stmt) -> bool:
     """True iff ``s`` is or contains a reduce Loop in its subtree."""
-    if isinstance(s, Loop) and s.is_reduce:
-        return True
-    for c in Body((s,)).iter():
-        if isinstance(c, Loop) and c.is_reduce and c is not s:
-            return True
-    return False
+    return any(isinstance(c, Loop) and c.is_reduce for c in Body((s,)).iter())
 
 
 def _find_matmul_k_outer(body: Body) -> int | None:
