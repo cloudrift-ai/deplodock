@@ -1,28 +1,21 @@
 """Launch-geometry pass.
 
-Decides the THREAD/BLOCK partition of every parallel axis and lifts
-body free Loops over output dimensions into ``Tile.axes``. Replaces the
-legacy ``003_block_matmul`` rule with a single launch-geometry decision
-informed by the actual per-block thread budget.
+Decides the THREAD/BLOCK partition of every parallel axis on a
+``TileOp`` containing one ``Tile`` whose ``block_axes`` is still empty.
+Replaces the legacy ``003_block_matmul`` rule with a single
+launch-geometry decision informed by the actual per-block thread
+budget. Output-dim free-Loop lifting happens earlier in
+``001_tileify`` — by the time this rule runs, every parallel axis is
+already in ``Tile.axes``.
 
-Two transformations, applied in order:
+**Apportion THREAD/BLOCK.** Every axis in ``Tile.axes`` starts as
+THREAD (from ``001_tileify``). Walk innermost-to-outermost
+filling THREAD up to ``_THREAD_BUDGET``. An axis that exceeds the
+remaining budget gets split into inner-THREAD + outer-BLOCK. Axes
+past the budget go straight to BLOCK.
 
-1. **Lift body free Loops over output dims.** A free Loop whose body
-   contains a ``Write`` indexed by the loop's axis is iterating a
-   distinct output position per iteration — independent work,
-   parallelisable. Lift the axis into ``Tile.axes`` (initially THREAD)
-   and replace the loop with its body. Fixes the fused-SDPA case where
-   the head-dim free loop (``a7:64``) sat in the body and every thread
-   re-ran the inner reduce 64 times serially.
-
-2. **Apportion THREAD/BLOCK.** Every axis in ``Tile.axes`` starts as
-   THREAD (from ``001_lower_loopop``). Walk innermost-to-outermost
-   filling THREAD up to ``_THREAD_BUDGET``. An axis that exceeds the
-   remaining budget gets split into inner-THREAD + outer-BLOCK. Axes
-   past the budget go straight to BLOCK.
-
-Idempotent: if every body Loop is already lifted and every Tile axis
-already fits the THREAD/BLOCK partition, returns None.
+Idempotent: if every Tile axis already fits the THREAD/BLOCK
+partition, returns None.
 """
 
 from __future__ import annotations
@@ -31,7 +24,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.stmt import Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.tuning import per_axis_threads, thread_budget
@@ -55,59 +48,14 @@ def _maybe_rewrite(body):
     if tile.block_axes:
         raise RuleSkipped("Tile already partitioned (block_axes non-empty)")
 
-    lifted = _lift_output_loops(tile)
-    partitioned = _partition_threads(lifted)
+    partitioned = _partition_threads(tile)
     if partitioned is None:
-        raise RuleSkipped("no axes to lift and partition fits within thread budget")
+        raise RuleSkipped("partition already fits within thread budget")
     return body[:idx] + (partitioned,) + body[idx + 1 :]
 
 
 # ---------------------------------------------------------------------------
-# 1. Lift body free Loops over output dims
-# ---------------------------------------------------------------------------
-
-
-def _lift_output_loops(tile: Tile) -> Tile:
-    """Find body free Loops that wrap a ``Write`` whose index varies
-    with the loop's axis; lift them into Tile.axes.
-
-    Only top-level body stmts are considered — nested promotions would
-    mix loop ordering decisions with reduction structure. SDPA's a7
-    loop sits at top level (after the two softmax reduces) so this
-    catches the case we care about."""
-    new_axes = list(tile.axes)
-    new_body: list[Stmt] = []
-    changed = False
-    for s in tile.body:
-        if isinstance(s, Loop) and not s.is_reduce and _writes_with_axis(s.body, s.axis.name):
-            new_axes.append(BoundAxis(axis=s.axis, bind=BIND_THREAD))
-            new_body.extend(s.body)
-            changed = True
-        else:
-            new_body.append(s)
-    if not changed:
-        return tile
-    return Tile(axes=tuple(new_axes), body=tuple(new_body))
-
-
-def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
-    for s in stmts:
-        if isinstance(s, Write):
-            free = set()
-            for e in s.index:
-                free |= e.free_vars()
-            if axis_name in free:
-                return True
-        if isinstance(s, (Loop, StridedLoop)) and _writes_with_axis(s.body, axis_name):
-            return True
-        if isinstance(s, Cond):
-            if _writes_with_axis(s.body, axis_name) or _writes_with_axis(s.else_body, axis_name):
-                return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# 2. Apportion THREAD / BLOCK
+# Apportion THREAD / BLOCK
 # ---------------------------------------------------------------------------
 
 

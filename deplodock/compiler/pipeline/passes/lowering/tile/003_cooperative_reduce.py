@@ -2,7 +2,7 @@
 serial ``Loop`` to a ``StridedLoop`` driven by the cooperative thread
 axis ``t``.
 
-Reads the logical ``Tile`` produced by ``lower_naive`` (default:
+Reads the logical ``Tile`` produced by ``tileify`` (default:
 ``thread_axes=output_axes`` / ``block_axes=()``, inner Loops all
 serial) and rewrites:
 

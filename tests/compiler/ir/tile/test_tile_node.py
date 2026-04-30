@@ -1,4 +1,4 @@
-"""Tests for ``lower_naive`` — Loop-IR ``LoopOp`` → Tile-IR ``TileOp``.
+"""Tests for ``tileify`` — Loop-IR ``LoopOp`` → Tile-IR ``TileOp``.
 
 After lowering, the outer free-Loop chain becomes a ``Tile`` with
 ``BIND_THREAD`` axes; inner Loops pass through unchanged. Strategy
@@ -12,7 +12,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tile.ir import BIND_THREAD, Tile, TileOp, iter_body
-from tests.compiler.ir.tile._helpers import lower_naive
+from tests.compiler.ir.tile._helpers import tileify
 
 
 def _reduction_loopop() -> LoopOp:
@@ -55,8 +55,8 @@ def test_iter_body_walks_into_tile():
     assert seen[0] is blk
 
 
-def test_lower_naive_produces_tile_for_reduction():
-    tile_op = lower_naive(_reduction_loopop(), kernel_name="reduce")
+def test_tileify_produces_tile_for_reduction():
+    tile_op = tileify(_reduction_loopop(), kernel_name="reduce")
     tiles = [s for s in tile_op.body if isinstance(s, Tile)]
     assert len(tiles) == 1
     tile = tiles[0]
@@ -66,7 +66,7 @@ def test_lower_naive_produces_tile_for_reduction():
     assert any(isinstance(s, Write) for s in tile.body)
 
 
-def test_lower_naive_produces_tile_for_pointwise():
+def test_tileify_produces_tile_for_pointwise():
     i = Axis("i", 4)
     pointwise = LoopOp(
         body=(
@@ -79,12 +79,12 @@ def test_lower_naive_produces_tile_for_pointwise():
             ),
         ),
     )
-    tile_op = lower_naive(pointwise, kernel_name="pw")
+    tile_op = tileify(pointwise, kernel_name="pw")
     tiles = [s for s in tile_op.body if isinstance(s, Tile)]
     assert len(tiles) == 1
 
 
 def test_tileop_container_preserves_name():
-    tile_op = lower_naive(_reduction_loopop(), kernel_name="reduce")
+    tile_op = tileify(_reduction_loopop(), kernel_name="reduce")
     assert isinstance(tile_op, TileOp)
     assert tile_op.name == "reduce"

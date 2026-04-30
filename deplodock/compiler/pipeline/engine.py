@@ -305,7 +305,7 @@ def _apply_rules(
                         continue
                     if fragment is None:
                         # Detect both in-place op rebinds AND rule-driven
-                        # rename/delete (e.g. ``lower_loopop`` calls
+                        # rename/delete (e.g. ``tileify`` calls
                         # ``graph.rename_node``; the old id disappears
                         # from ``graph.nodes`` even though the rule did
                         # apply).

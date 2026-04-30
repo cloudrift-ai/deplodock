@@ -16,7 +16,7 @@ pipeline/
     │   ├── lifting/        # tensor ops → trivial LoopOp nodes
     │   └── fusion/         # merge adjacent LoopOp pairs (splice)
     └── lowering/
-        ├── tile/           # LoopOp → TileOp (lower_naive + scheduling rules)
+        ├── tile/           # LoopOp → TileOp (tileify + scheduling rules)
         ├── kernel/         # TileOp → KernelOp (materialize scheduling)
         └── cuda/           # KernelOp → CudaOp (render source string)
 ```
@@ -85,7 +85,7 @@ ignores the prefix itself — it's only for ordering readability.
 | `frontend/optimization/`   | `compose_indexmaps`: collapse chains of single-source / single-consumer `IndexMapOp` into one coord_map — prevents trivial layout kernels from blocking fusion. |
 | `loop/lifting/`            | `lift_*` rules wrap each surviving tensor primitive (elementwise / reduce / indexmap / gather) in a trivial one-op `LoopOp`. |
 | `loop/fusion/`             | `merge_loop_ops` splices adjacent `LoopOp` pairs using `ir/loop/splicer.py::splice_graph`. |
-| `lowering/tile/`           | `lower_loopop` produces a `TileOp` per `LoopOp` (`lower_naive`); follow-up rules (`cooperative_reduce`, `block_matmul`, `stage_inputs`) annotate scheduling decisions on the `Tile` (block/thread bindings, `Stage` nodes, `Combine`). |
+| `lowering/tile/`           | `tileify` produces a `TileOp` per `LoopOp` (strips the outer free-Loop chain into `Tile.thread_axes` and lifts inner output-write free Loops); follow-up rules (`cooperative_reduce`, `blockify_launch`, `stage_inputs`) annotate scheduling decisions on the `Tile` (block/thread bindings, `Stage` nodes, `Combine`). |
 | `lowering/kernel/`         | `materialize_tile` consumes scheduling decisions and emits hardware primitives (`Smem`, `Sync`, `TreeHalve`, `StridedLoop`), mutating the node's op to `KernelOp` in place. |
 | `lowering/cuda/`           | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (via `ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 
