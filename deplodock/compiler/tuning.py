@@ -97,21 +97,12 @@ def _has_matmul_reduce(stmts) -> bool:
     distinct buffers — the structural signature of a matmul. Recurses
     through wrapper loops / conds so chunked or output-loop-wrapped
     matmuls (SDPA V-projection) are still detected."""
-    from deplodock.compiler.ir.stmt import Cond, Load, Loop, StridedLoop
+    from deplodock.compiler.ir.stmt import Load, Loop
+    from deplodock.compiler.ir.stmt.body import Body
 
-    for s in stmts:
-        if isinstance(s, Loop):
-            if s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2:
-                return True
-            if _has_matmul_reduce(s.body):
-                return True
-        elif isinstance(s, StridedLoop):
-            if _has_matmul_reduce(s.body):
-                return True
-        elif isinstance(s, Cond):
-            if _has_matmul_reduce(s.body) or _has_matmul_reduce(s.else_body):
-                return True
-    return False
+    return any(
+        isinstance(s, Loop) and s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2 for s in Body.coerce(stmts).iter()
+    )
 
 
 def _is_big_matmul(tile: Tile) -> bool:
@@ -171,31 +162,22 @@ def _matmul_K(stmts) -> int | None:
     ≥2 buffer Loads) and return the product so heuristics keyed on
     "original K" don't get fooled by chunked tiles.
     """
-    from deplodock.compiler.ir.stmt import Cond, Load, Loop, StridedLoop
+    from deplodock.compiler.ir.stmt import Load, Loop
+    from deplodock.compiler.ir.stmt.body import Body
 
-    for s in stmts:
-        if isinstance(s, Loop):
-            if s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2:
-                return int(s.axis.extent)
-            if (
-                not s.is_reduce
-                and len(s.body) == 1
-                and isinstance(s.body[0], Loop)
-                and s.body[0].is_reduce
-                and len({ld.input for ld in s.body[0].body.of_type(Load)}) >= 2
-            ):
-                return int(s.axis.extent) * int(s.body[0].axis.extent)
-            r = _matmul_K(s.body)
-            if r is not None:
-                return r
-        elif isinstance(s, StridedLoop):
-            r = _matmul_K(s.body)
-            if r is not None:
-                return r
-        elif isinstance(s, Cond):
-            r = _matmul_K(s.body) or _matmul_K(s.else_body)
-            if r is not None:
-                return r
+    for s in Body.coerce(stmts).iter():
+        if not isinstance(s, Loop):
+            continue
+        if s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2:
+            return int(s.axis.extent)
+        if (
+            not s.is_reduce
+            and len(s.body) == 1
+            and isinstance(s.body[0], Loop)
+            and s.body[0].is_reduce
+            and len({ld.input for ld in s.body[0].body.of_type(Load)}) >= 2
+        ):
+            return int(s.axis.extent) * int(s.body[0].axis.extent)
     return None
 
 

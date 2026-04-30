@@ -224,6 +224,19 @@ class Stmt:
         """
         return ()
 
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        """Write-side counterpart to :meth:`nested`. Return a copy of this
+        stmt with its child bodies replaced by ``bodies`` (positionally
+        matching :meth:`nested`'s order).
+
+        Default: leaves have no children, so ``bodies`` must be empty and
+        ``self`` is returned unchanged. Block-structured stmts override
+        to rebuild themselves from the new bodies. Used by ``Body.map``
+        to recurse without an isinstance ladder over the block-stmt set.
+        """
+        assert not bodies, f"{type(self).__name__}.with_bodies: leaf stmt got {len(bodies)} bodies"
+        return self
+
     def pretty(self, indent: str = "") -> list[str]:
         """Render this stmt as a list of indented lines.
 

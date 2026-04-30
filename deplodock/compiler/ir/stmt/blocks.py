@@ -56,6 +56,10 @@ class Loop(Stmt):
     def nested(self) -> tuple[Body, ...]:
         return (self.body,)
 
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return Loop(axis=self.axis, body=body, unroll=self.unroll)
+
     @property
     def is_reduce(self) -> bool:
         """A loop is a reduce-loop iff its immediate body contains an ``Accum``."""
@@ -132,6 +136,10 @@ class Tile(Stmt):
 
     def nested(self) -> tuple[Body, ...]:
         return (self.body,)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return Tile(axes=self.axes, body=body)
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
@@ -268,6 +276,10 @@ class StridedLoop(Stmt):
     def nested(self) -> tuple[Body, ...]:
         return (self.body,)
 
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return StridedLoop(axis=self.axis, start=self.start, step=self.step, body=body, unroll=self.unroll)
+
     @property
     def is_reduce(self) -> bool:
         """A strided loop is a reduce-loop iff its immediate body contains an ``Accum``."""
@@ -355,6 +367,10 @@ class Cond(Stmt):
 
     def nested(self) -> tuple[Body, ...]:
         return (self.body, self.else_body)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        body, else_body = bodies
+        return Cond(cond=self.cond, body=body, else_body=else_body)
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity

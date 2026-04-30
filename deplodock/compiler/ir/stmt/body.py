@@ -111,18 +111,12 @@ class Body(tuple[Stmt, ...]):
         ``return tuple(c for c in s.body)`` to inline a Loop's body sees
         already-rewritten children.
         """
-        from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile  # noqa: PLC0415
 
         def descend(s: Stmt) -> Stmt:
-            if isinstance(s, Loop):
-                return Loop(axis=s.axis, body=s.body.map(fn), unroll=s.unroll)
-            if isinstance(s, StridedLoop):
-                return StridedLoop(axis=s.axis, start=s.start, step=s.step, body=s.body.map(fn), unroll=s.unroll)
-            if isinstance(s, Tile):
-                return Tile(axes=s.axes, body=s.body.map(fn))
-            if isinstance(s, Cond):
-                return Cond(cond=s.cond, body=s.body.map(fn), else_body=s.else_body.map(fn))
-            return s
+            nested = s.nested()
+            if not nested:
+                return s
+            return s.with_bodies(tuple(b.map(fn) for b in nested))
 
         out: list[Stmt] = []
         for s in self:

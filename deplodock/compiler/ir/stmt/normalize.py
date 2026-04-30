@@ -86,19 +86,10 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
 
 
 def _recurse_canonicalize(s: Stmt) -> Stmt:
-    if isinstance(s, Loop):
-        return replace(s, body=canonicalize_free_axis_order(s.body))
-    if isinstance(s, StridedLoop):
-        return replace(s, body=canonicalize_free_axis_order(s.body))
-    if isinstance(s, Tile):
-        return Tile(axes=s.axes, body=canonicalize_free_axis_order(s.body))
-    if isinstance(s, Cond):
-        return Cond(
-            cond=s.cond,
-            body=canonicalize_free_axis_order(s.body),
-            else_body=canonicalize_free_axis_order(s.else_body),
-        )
-    return s
+    nested = s.nested()
+    if not nested:
+        return s
+    return s.with_bodies(tuple(canonicalize_free_axis_order(b) for b in nested))
 
 
 def canonicalize_free_axis_order(stmts: Body) -> Body:
@@ -172,14 +163,9 @@ def unify_sibling_reduce_axes(stmts: Body) -> Body:
     def walk(body: Body) -> Body:
         new_body: list[Stmt] = []
         for s in body:
-            if isinstance(s, Loop):
-                new_body.append(replace(s, body=walk(s.body)))
-            elif isinstance(s, StridedLoop):
-                new_body.append(replace(s, body=walk(s.body)))
-            elif isinstance(s, Tile):
-                new_body.append(Tile(axes=s.axes, body=walk(s.body)))
-            elif isinstance(s, Cond):
-                new_body.append(Cond(cond=s.cond, body=walk(s.body), else_body=walk(s.else_body)))
+            nested = s.nested()
+            if nested:
+                new_body.append(s.with_bodies(tuple(walk(b) for b in nested)))
             else:
                 new_body.append(s)
 
