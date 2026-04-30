@@ -17,7 +17,7 @@ Env vars override the heuristic for sweeps:
 - ``DEPLODOCK_PAT`` — innermost M / N tile width carved by
   ``005_blockify_launch``.
 - ``DEPLODOCK_TB`` — total thread budget per CTA.
-- ``DEPLODOCK_BK`` — K-chunk size for ``004_chunk_reduce`` (subject to
+- ``DEPLODOCK_BK`` — K-split size for ``002_split_matmul_k`` (subject to
   the ``K % BK == 0 and K > BK`` divisibility check).
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 """
@@ -164,7 +164,7 @@ def _is_huge_matmul(tile: Tile) -> bool:
 def _matmul_K(stmts) -> int | None:
     """Total K extent of the first matmul-shaped reduce loop in ``stmts``.
 
-    Pre-chunk: the reduce loop holds the full K. Post-``004_chunk_reduce``:
+    Pre-split: the reduce loop holds the full K. Post-``002_split_matmul_k``:
     the structure is ``Loop(K_o, free, body=(Loop(K_i, reduce, ...),))``
     and the total K is ``K_o.extent × K_i.extent``. We recognize that
     chunked shape (free Loop with a single reduce child whose body has

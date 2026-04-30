@@ -1,5 +1,9 @@
-"""K-chunk every matmul-shaped reduce Loop in a Tile body into outer
+"""Split-K every matmul-shaped reduce Loop in a Tile body into outer
 (``K_o``) + inner (``K_i``) loops.
+
+Matmul-only by design — the trigger is structural for dot-product
+reductions (two distinct buffers + multiply + accum). Single-buffer
+reductions (softmax, sum, RMSNorm) are skipped.
 
 Runs *before* launch-geometry / blockify, so the trigger can't depend on
 ``Tile.axes`` partitioning. Detection is structural on the reduce body::
