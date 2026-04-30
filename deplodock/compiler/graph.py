@@ -150,14 +150,25 @@ def _lookup_op_class(name: str) -> type[Op] | None:
 def _serialize_field(v):
     """Flatten non-JSON-friendly op field values to a JSON-compatible form.
 
-    Currently only special-cases ``ir.elementwise.ElementwiseImpl`` (stored
-    as its ``name`` string); everything else passes through. ``_deserialize_field``
-    reverses this on load.
+    Special cases:
+
+    - ``ir.elementwise.ElementwiseImpl`` → its ``name`` string.
+    - ``ir.stmt.Body`` → the underlying ``stmts`` tuple. Body is an
+      in-memory wrapper; on disk we keep the tuple-of-stmts form so
+      ``_deserialize_field``'s list-of-Stmt-reprs path keeps working
+      unchanged. ``LoopOp.__post_init__`` / ``TileOp.__post_init__``
+      coerce the tuple back to Body on load.
+
+    Everything else passes through. ``_deserialize_field`` reverses
+    this on load.
     """
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from deplodock.compiler.ir.stmt import Body
 
     if isinstance(v, ElementwiseImpl):
         return v.name
+    if isinstance(v, Body):
+        return v.stmts
     return v
 
 

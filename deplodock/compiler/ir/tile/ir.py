@@ -57,6 +57,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -265,15 +266,19 @@ class TileOp(Op):
     a ``TileOp`` into a ``KernelOp``.
     """
 
-    body: tuple[Stmt, ...] = ()
+    body: Body = field(default_factory=Body)
     name: str = ""
 
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
 
-        new_body = normalize_body(self.body, hoist=False)
-        if new_body != self.body:
-            self.body = new_body
+        # Accept ``body=tuple_value`` for backward compatibility — every
+        # rule constructs ``TileOp(body=new_body, name=...)`` with a tuple.
+        if not isinstance(self.body, Body):
+            self.body = Body.coerce(self.body)
+        new_stmts = normalize_body(self.body.stmts, hoist=False)
+        if new_stmts != self.body.stmts:
+            self.body = Body(new_stmts)
         n_tiles = sum(1 for s in self.body if isinstance(s, Tile))
         if n_tiles > 1:
             raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")

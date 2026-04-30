@@ -49,6 +49,7 @@ from deplodock.compiler.ir.stmt.base import (
     _pad as _pad,  # re-export for ir.kernel.ir
 )
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
+from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, SelectBranch, Write
 from deplodock.compiler.ir.stmt.normalize import (
     canonicalize_free_axis_order,
@@ -67,6 +68,7 @@ __all__ = [
     "INDENT",
     "Accum",
     "Assign",
+    "Body",
     "Cond",
     "Init",
     "Load",

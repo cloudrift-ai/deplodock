@@ -34,7 +34,7 @@ Free-function companions (used by passes that work on raw
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import Op
@@ -42,6 +42,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -96,18 +97,22 @@ class LoopOp(Op):
     computed properties derived from that tree.
     """
 
-    body: tuple[Stmt, ...] = ()
+    body: Body = field(default_factory=Body)
 
     def pretty_body(self, indent: str = "") -> str:
         """Render as an explicit nested-loop program via per-stmt ``pretty``."""
-        return "\n".join(pretty_body(self.body, indent))
+        return "\n".join(pretty_body(self.body.stmts, indent))
 
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
 
-        new_body = normalize_body(self.body)
-        if new_body != self.body:
-            self.body = new_body
+        # Accept ``body=tuple_value`` for backward compatibility — every
+        # rule constructs ``LoopOp(body=new_body)`` with a tuple.
+        if not isinstance(self.body, Body):
+            self.body = Body.coerce(self.body)
+        new_stmts = normalize_body(self.body.stmts)
+        if new_stmts != self.body.stmts:
+            self.body = Body(new_stmts)
         _validate(self)
 
     @property
