@@ -304,7 +304,12 @@ def _apply_rules(
                         rewrite_time += time.monotonic() - t1
                         continue
                     if fragment is None:
-                        if any(graph.nodes[nid].op is not pre_ops.get(nid) for nid in pre_ops if nid in graph.nodes):
+                        # Detect both in-place op rebinds AND rule-driven
+                        # rename/delete (e.g. ``lower_loopop`` calls
+                        # ``graph.rename_node``; the old id disappears
+                        # from ``graph.nodes`` even though the rule did
+                        # apply).
+                        if any(nid not in graph.nodes or graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops):
                             text = _format_inplace_application(rule.name, graph, match, pre_ops)
                             if debug_on:
                                 logger.debug(text)
