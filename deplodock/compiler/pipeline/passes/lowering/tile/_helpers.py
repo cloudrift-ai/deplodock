@@ -1,7 +1,5 @@
 """Shared utilities for ``lowering/tile`` rules.
 
-Three helpers:
-
 - :func:`single_tile` — extract the unique ``Tile`` from a ``TileOp.body``,
   raising ``RuleSkipped`` if there isn't exactly one. Eliminates the
   identical 5-line preamble at the top of nearly every rule in this
@@ -11,11 +9,10 @@ Three helpers:
   multiply between the two K-indexed Loads is implicit (the only way
   two distinct K-indexed buffer Loads can contribute to an Accum
   in this IR is through a fused multiply-accumulate).
-- :func:`is_matmul_k_outer` / :func:`find_matmul_k_outer` — predicate
-  / locator for a top-level free ``Loop`` wrapping a single reduce
-  Loop with a pure-compute body (Load / Assign / Accum + at least
-  one Accum). Rule-specific gates layer on top via the ``extra_gate``
-  callback.
+- :func:`is_matmul_k_outer` — predicate for a top-level free ``Loop``
+  wrapping a single reduce Loop with a pure-compute body
+  (Load / Assign / Accum + at least one Accum). Rule-specific gates
+  layer on top via the ``extra_gate`` callback.
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
@@ -90,23 +87,3 @@ def is_matmul_k_outer(
     if not any(isinstance(c, Accum) for c in k_inner.body):
         return False
     return extra_gate(loop, k_inner)
-
-
-def find_matmul_k_outer(
-    body: Body,
-    *,
-    extra_gate: Callable[[Loop, Loop], bool] = lambda k_outer, k_inner: True,
-) -> int | None:
-    """Return the index of the first top-level stmt in ``body`` that
-    satisfies :func:`is_matmul_k_outer` (with the supplied extra gate),
-    or ``None`` if no top-level Loop matches.
-
-    Used by ``008_register_tile`` to locate the K-outer it splices the
-    rewritten Loop back in around. Other rules (``013``, ``015``) walk
-    every top-level Loop applying :func:`is_matmul_k_outer` directly,
-    since they may fire on more than one match per Tile.
-    """
-    for i, s in enumerate(body):
-        if is_matmul_k_outer(s, extra_gate=extra_gate):
-            return i
-    return None

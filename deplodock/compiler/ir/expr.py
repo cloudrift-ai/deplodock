@@ -716,12 +716,10 @@ def affine_form(expr: Expr, vars: frozenset[str] | set[str]) -> tuple[Expr, dict
     Vars not in ``vars`` are treated as opaque constants and accumulate into
     ``anchor`` unchanged. Missing vars in ``coeffs`` mean coefficient 0.
     """
-    if isinstance(expr, Literal):
-        return expr, {}
+    if not (expr.free_vars() & set(vars)):
+        return expr, {}  # opaque w.r.t. ``vars`` — folds into the anchor
     if isinstance(expr, Var):
-        if expr.name in vars:
-            return Literal(0, "int"), {expr.name: 1}
-        return expr, {}
+        return Literal(0, "int"), {expr.name: 1}  # expr.name in vars (else above)
     if isinstance(expr, BinaryExpr) and expr.op in ("+", "-"):
         left = affine_form(expr.left, vars)
         right = affine_form(expr.right, vars)

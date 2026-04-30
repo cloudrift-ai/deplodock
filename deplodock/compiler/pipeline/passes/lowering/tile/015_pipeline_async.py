@@ -103,11 +103,8 @@ def _eligible(loop: Loop) -> bool:
     right but compounding fp32 drift in the rearranged commits
     manifests as too-large diff vs eager.
 
-    Note: ``register_tile`` used to share this same gate (it was its
-    cross-loop-deps gate), but as of the axis-aware generalization the
-    rule handles such reads correctly via per-cell σ-substitution and
-    no longer needs the gate. ``013_double_buffer`` and ``015_pipeline
-    _async`` keep their own variants for the fp32-drift reason above."""
+    ``013_double_buffer`` keeps its own variant of this gate for the
+    same fp32-drift reason."""
 
     def gate(k_outer: Loop, k_inner: Loop) -> bool:
         if int(k_outer.axis.extent) < 2:
