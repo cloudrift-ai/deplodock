@@ -168,7 +168,10 @@ def _serialize_field(v):
     if isinstance(v, ElementwiseImpl):
         return v.name
     if isinstance(v, Body):
-        return v.stmts
+        # Body is a ``tuple`` subclass; downcast to plain tuple so
+        # JSON encodes element-by-element rather than via ``__repr__``
+        # (which would produce a single ``"Body((...))"`` string).
+        return tuple(v)
     return v
 
 

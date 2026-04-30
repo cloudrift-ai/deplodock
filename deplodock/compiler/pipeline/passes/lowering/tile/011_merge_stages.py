@@ -37,7 +37,7 @@ from dataclasses import replace as dc_replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.stmt import Load, Loop, Stmt, Tile, map_body
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile, map_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
@@ -53,7 +53,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
+def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
     new_tile_body = _process_scope_body(tile.body)
     if new_tile_body == tile.body:
@@ -61,7 +61,7 @@ def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process_scope_body(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def _process_scope_body(body: Body) -> Body:
     """Walk a body. For each free Loop scope, recurse. At each level,
     merge contiguous sibling Stages."""
     walked: list[Stmt] = []

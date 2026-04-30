@@ -16,6 +16,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Expr, FuncCallExpr, Literal, 
 from deplodock.compiler.ir.sigma import Sigma
 
 if TYPE_CHECKING:
+    from deplodock.compiler.ir.stmt.body import Body
     from deplodock.compiler.ir.stmt.leaves import Select
 
 INDENT = "    "
@@ -209,7 +210,7 @@ class Stmt:
         """
         raise NotImplementedError
 
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+    def nested(self) -> tuple[Body, ...]:
         """Child statement bodies for tree traversal.
 
         Default: no children (leaf stmt). Block-structured stmts override
@@ -244,7 +245,7 @@ class Stmt:
         raise NotImplementedError(f"{type(self).__name__}.render not implemented")
 
 
-def pretty_body(body: tuple[Stmt, ...], indent: str = "") -> list[str]:
+def pretty_body(body: Body, indent: str = "") -> list[str]:
     """Flatten ``stmt.pretty(indent)`` over a body sequence."""
     out: list[str] = []
     for s in body:
@@ -252,7 +253,7 @@ def pretty_body(body: tuple[Stmt, ...], indent: str = "") -> list[str]:
     return out
 
 
-def render_body(body: tuple[Stmt, ...], ctx: RenderCtx) -> list[str]:
+def render_body(body: Body, ctx: RenderCtx) -> list[str]:
     """Flatten ``stmt.render(ctx)`` over a body sequence."""
     out: list[str] = []
     for s in body:

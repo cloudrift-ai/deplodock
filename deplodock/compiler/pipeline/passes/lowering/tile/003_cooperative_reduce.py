@@ -59,7 +59,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Loop, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Loop, StridedLoop
 from deplodock.compiler.ir.tile.ir import (
     BLOCK_SIZE,
     Combine,
@@ -73,7 +73,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 PATTERN = [Pattern("root", TileOp)]
 
 
-def _accums_independent(body: tuple[Stmt, ...]) -> bool:
+def _accums_independent(body: Body) -> bool:
     """True iff no Accum's value transitively depends on a prior Accum's
     running value. Permits multiple independent Accums in one reduce
     loop (e.g. ``sum`` + ``sum_of_squares``); rejects online algorithms

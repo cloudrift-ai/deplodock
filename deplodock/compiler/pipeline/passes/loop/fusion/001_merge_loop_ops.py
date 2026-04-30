@@ -39,7 +39,8 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, Stmt, iter_body, splice_graph
+from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, iter_body, splice_graph
+from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 
 _BLOWUP_FACTOR = 8
@@ -54,7 +55,7 @@ def _walk_leaf_costs(loop_op: LoopOp):
     """
     reduce_names = loop_op.reduce_axis_names
 
-    def walk(stmts: tuple[Stmt, ...], free_prod: int, reduce_prod: int):
+    def walk(stmts: Body, free_prod: int, reduce_prod: int):
         for s in stmts:
             if isinstance(s, Loop):
                 extent = int(s.axis.extent)

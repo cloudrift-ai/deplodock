@@ -1,65 +1,94 @@
-"""``Body`` — an immutable container for a sequence of body Stmts.
+"""``Body`` — an immutable sequence of body Stmts with built-in
+def-use / iteration / transform queries.
 
-Used as the storage type for ``LoopOp.body`` and ``TileOp.body``,
-replacing the bare ``tuple[Stmt, ...]`` so future analysis methods
-(def-use queries, type-filtered lookups, region transforms) have a
-natural home. Iteration, indexing, length, and bool-truthiness all
-delegate to the wrapped tuple — most existing tuple-shaped call sites
-work unchanged.
+Implemented as a ``tuple`` subclass so it interoperates transparently
+everywhere a ``tuple[Stmt, ...]`` was previously accepted: iteration,
+indexing, length, slicing, equality, hashing, and ``isinstance(body,
+tuple)`` all work without thinking. The methods on Body are the
+recommended way to phrase common analyses (def-use, iteration,
+type-filtered lookups) so they can be added incrementally without
+rippling through call sites.
 
-Phase 1 keeps Body to its minimal surface: storage + the four protocol
-methods that make it tuple-compatible at call sites. Analysis methods
-(``def_table``, ``external_reads``, ``backward_slice_names``, etc.)
-will be added in a follow-up once the type is wired through the Ops.
+Phase 1 surface (this file): the protocol that lets every
+``tuple[Stmt, ...]`` site accept Body, plus :meth:`iter` / :meth:`map`
+as method-shaped wrappers around the existing free functions.
+
+Phase 2 (follow-up): def-use queries (``def_table``,
+``external_reads``, ``backward_slice_names``), type-filtered lookups
+(``loops``, ``loads``, ``stages``), region transforms
+(``replace_at``, ``partition_at``). Add as needed; the storage shape
+is already in place.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator
 
 from deplodock.compiler.ir.stmt.base import Stmt
 
 
-@dataclass(frozen=True)
-class Body:
-    """An immutable sequence of body Stmts.
+class Body(tuple[Stmt, ...]):
+    """Immutable Stmt sequence. Tuple-subclass so existing tuple-shaped
+    APIs accept Body for free; preserves its own type through
+    :meth:`__getitem__` slicing and :meth:`__add__` concatenation so
+    callers don't keep falling back to plain tuples.
 
-    Constructed from any iterable of ``Stmt`` (tuple, list, generator);
-    stored as ``tuple[Stmt, ...]`` internally. Frozen + hashable so
-    instances can serve as dict keys / cache keys.
+    Constructed from any iterable: ``Body(some_tuple)``,
+    ``Body([s1, s2])``, ``Body(s for s in ... if ...)``.
 
-    Sliced indexing (``body[i:j]``) returns a plain ``tuple`` because
-    that's what ``self.stmts[i:j]`` produces — tuple-style usage in
-    rules (``body[:idx] + (new,) + body[idx + 1:]``) keeps working
-    without an extra wrap. Wrap explicitly with ``Body(...)`` when the
-    Body type is needed back.
+    No ``__slots__`` — instances retain ``__dict__`` so
+    ``functools.cached_property`` works for the analysis methods we
+    add incrementally (``def_table``, ``external_reads``, etc.). The
+    per-instance dict adds a small memory overhead vs a bare tuple,
+    but Body counts are bounded by the number of kernel bodies in a
+    pipeline run (tens to hundreds), so it's not a concern.
     """
 
-    stmts: tuple[Stmt, ...] = ()
-
-    def __post_init__(self) -> None:
-        # Accept any iterable; normalize to tuple. Frozen dataclasses
-        # need ``object.__setattr__`` to mutate in __post_init__.
-        if not isinstance(self.stmts, tuple):
-            object.__setattr__(self, "stmts", tuple(self.stmts))
-
-    def __iter__(self) -> Iterator[Stmt]:
-        return iter(self.stmts)
-
-    def __len__(self) -> int:
-        return len(self.stmts)
+    def __new__(cls, stmts: Iterable[Stmt] = ()) -> Body:
+        return super().__new__(cls, tuple(stmts))
 
     def __getitem__(self, key):
-        return self.stmts[key]
+        r = super().__getitem__(key)
+        return Body(r) if isinstance(key, slice) else r
 
-    def __bool__(self) -> bool:
-        return bool(self.stmts)
+    def __add__(self, other: Iterable[Stmt]) -> Body:
+        if isinstance(other, tuple):
+            return Body(tuple.__add__(self, other))
+        return Body(tuple.__add__(self, tuple(other)))
+
+    def __radd__(self, other: Iterable[Stmt]) -> Body:
+        if isinstance(other, tuple):
+            return Body(tuple.__add__(other, self))
+        return Body(tuple.__add__(tuple(other), self))
+
+    def __repr__(self) -> str:
+        return f"Body({tuple.__repr__(self)})"
 
     @staticmethod
     def coerce(value: Body | Iterable[Stmt]) -> Body:
-        """Wrap a tuple / iterable as a Body if it isn't already one.
-        ``LoopOp`` / ``TileOp`` use this in ``__post_init__`` so the
-        common ``Op(body=tuple_value, ...)`` construction shape keeps
-        working without forcing every caller to wrap explicitly."""
+        """Wrap if not already a Body. Used by ``LoopOp`` /
+        ``TileOp`` ``__post_init__`` so the legacy
+        ``Op(body=tuple_value)`` construction shape keeps working."""
         return value if isinstance(value, Body) else Body(value)
+
+    # -- iteration -------------------------------------------------------
+
+    def iter(self) -> Iterator[Stmt]:
+        """Pre-order iteration over this body and every nested body
+        (``Loop`` / ``Tile`` / ``Cond`` / ``StridedLoop`` recurse via
+        ``Stmt.nested()``). Method-shaped wrapper around the free
+        function :func:`iter_body`; new code should prefer the method
+        for discoverability."""
+        from deplodock.compiler.ir.stmt.visit import iter_body
+
+        return iter_body(self)
+
+    # -- transformation --------------------------------------------------
+
+    def map(self, fn: Callable[[Stmt], Stmt | None | Iterable[Stmt]]) -> Body:
+        """Flat 1:N body transformer. Returns a new Body with each stmt
+        replaced by ``fn(stmt)`` (or dropped if ``None`` / inlined if
+        an iterable). Method-shaped wrapper around :func:`map_body`."""
+        from deplodock.compiler.ir.stmt.visit import map_body
+
+        return Body(map_body(self, fn))

@@ -54,7 +54,7 @@ from dataclasses import replace as dc_replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.stmt import Load, Loop, Stmt, Tile, iter_body
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
@@ -83,7 +83,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
+def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
 
     thread_axes = tuple(ba.axis for ba in tile.axes if ba.bind == BIND_THREAD)
@@ -96,7 +96,7 @@ def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process_body(body: tuple[Stmt, ...], thread_axes: tuple[Axis, ...]) -> tuple[Stmt, ...]:
+def _process_body(body: Body, thread_axes: tuple[Axis, ...]) -> Body:
     """Walk body and any free-Loop scopes; pad each Stage that has a
     fixable conflict. Returns the new body (or original if no changes)."""
     new_body: list[Stmt] = list(body)
@@ -118,7 +118,7 @@ def _process_body(body: tuple[Stmt, ...], thread_axes: tuple[Axis, ...]) -> tupl
     return tuple(new_body) if changed else body
 
 
-def _loads_reading(body: tuple[Stmt, ...], stage_name: str) -> list[Load]:
+def _loads_reading(body: Body, stage_name: str) -> list[Load]:
     """Collect every Load anywhere in ``body`` reading from ``stage_name``."""
     return [s for s in iter_body(body) if isinstance(s, Load) and s.input == stage_name]
 

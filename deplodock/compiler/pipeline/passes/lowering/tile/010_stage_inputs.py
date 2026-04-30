@@ -38,7 +38,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Load, Loop, Stmt, StridedLoop, Tile, iter_body, map_body
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile, iter_body, map_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
@@ -56,7 +56,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
+def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
     if any(isinstance(s, Stage) for s in iter_body(tile.body)):
         raise RuleSkipped("Tile body already has Stage stmts (idempotence)")
@@ -75,7 +75,7 @@ def _process_scope(
     thread_axes: tuple[Axis, ...],
     in_scope_axes: tuple[Axis, ...],
     used_names: set[str],
-) -> tuple[Stmt, ...]:
+) -> Body:
     stages: dict[tuple, Stage] = {}
     rewritten: list[Stmt] = []
 

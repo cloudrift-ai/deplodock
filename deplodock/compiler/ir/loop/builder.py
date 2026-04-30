@@ -17,13 +17,14 @@ producers after) — that's what the fusion splicer does.
 from __future__ import annotations
 
 from deplodock.compiler.ir.loop.ir import Axis, Loop, Scope, Stmt
+from deplodock.compiler.ir.stmt import Body
 
 
 class LoopBuilder:
     """Mutable accumulator for a ``LoopOp`` body."""
 
     def __init__(self, used_names: set[str]) -> None:
-        self._body: tuple[Stmt, ...] = ()
+        self._body: Body = ()
         self._used: set[str] = set(used_names)
 
     def fresh(self, hint: str) -> str:
@@ -42,12 +43,12 @@ class LoopBuilder:
         """Prepend ``stmt`` at the leaf of the path denoted by ``enclosure``."""
         self._body = _prepend_at(self._body, enclosure.enclosing, stmt)
 
-    def finish(self) -> tuple[Stmt, ...]:
+    def finish(self) -> Body:
         """Return the accumulated body."""
         return self._body
 
 
-def _prepend_at(body: tuple[Stmt, ...], path: tuple[Axis, ...], stmt: Stmt) -> tuple[Stmt, ...]:
+def _prepend_at(body: Body, path: tuple[Axis, ...], stmt: Stmt) -> Body:
     """Descend ``body`` following ``path``; create missing ``Loop`` nodes;
     prepend ``stmt`` at the leaf."""
     if not path:

@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Loop, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.stmt import Body, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
@@ -39,7 +39,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _walk_body(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], bool]:
+def _walk_body(body: Body) -> tuple[Body, bool]:
     """Walk a body, marking small loop nests. Returns (new_body, changed)."""
     new_body: list[Stmt] = []
     changed = False

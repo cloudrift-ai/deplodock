@@ -3,7 +3,7 @@
 After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
-    body              : tuple[Stmt, ...]   — SSA body: Assign | Accum | Write | Select | Loop | Load
+    body              : Body   — SSA body: Assign | Accum | Write | Select | Loop | Load
     axes              : computed property  — iteration space walked from body's Loop tree
     reduce_axis_names : computed property  — names of axes whose Loop wraps an Accum
     loads             : computed property  — body-form Load stmts (external reads)
@@ -26,7 +26,7 @@ before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``
 (which also runs ``normalize_body`` to canonicalize the body).
 
 Free-function companions (used by passes that work on raw
-``tuple[Stmt, ...]``): ``iter_body`` (pre-order generator),
+``Body``): ``iter_body`` (pre-order generator),
 ``map_body`` (transformer supporting ``Stmt | None | Iterable[Stmt]``),
 ``Stmt.rewrite(rename_ssa, sigma)`` (per-stmt SSA / Expr rewrite).
 """
@@ -101,18 +101,17 @@ class LoopOp(Op):
 
     def pretty_body(self, indent: str = "") -> str:
         """Render as an explicit nested-loop program via per-stmt ``pretty``."""
-        return "\n".join(pretty_body(self.body.stmts, indent))
+        return "\n".join(pretty_body(self.body, indent))
 
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
 
-        # Accept ``body=tuple_value`` for backward compatibility — every
-        # rule constructs ``LoopOp(body=new_body)`` with a tuple.
-        if not isinstance(self.body, Body):
-            self.body = Body.coerce(self.body)
-        new_stmts = normalize_body(self.body.stmts)
-        if new_stmts != self.body.stmts:
-            self.body = Body(new_stmts)
+        # Body is a tuple subclass; coerce so ``Op(body=tuple_value)``
+        # construction shape keeps working without forcing wrapping at
+        # every rule's rewrite site.
+        coerced = Body.coerce(self.body)
+        normalized = normalize_body(coerced)
+        self.body = normalized if isinstance(normalized, Body) else Body(normalized)
         _validate(self)
 
     @property
@@ -139,7 +138,7 @@ class LoopOp(Op):
         """
         names: set[str] = set()
 
-        def walk(stmts: tuple[Stmt, ...], innermost: str | None) -> None:
+        def walk(stmts: Body, innermost: str | None) -> None:
             for s in stmts:
                 if isinstance(s, Accum) and innermost is not None:
                     names.add(innermost)
@@ -213,7 +212,7 @@ class LoopOp(Op):
         reduce_axes: dict[str, Axis] = {}
         writes: list[tuple[Write, Scope]] = []
 
-        def walk(stmts: tuple[Stmt, ...], scope: Scope) -> None:
+        def walk(stmts: Body, scope: Scope) -> None:
             for s in stmts:
                 if isinstance(s, Loop):
                     walk(s.body, scope.nest(s.axis))
@@ -417,7 +416,7 @@ def _validate(loop: LoopOp) -> None:
     # Op-consistency across repeated Updates to same target.
     target_ops: dict[str, ElementwiseImpl] = {}
 
-    def _walk(stmts: tuple[Stmt, ...], defined: set[str]) -> set[str]:
+    def _walk(stmts: Body, defined: set[str]) -> set[str]:
         """Validate a body scope. Returns the set of ``Accum.name`` names
         that propagate to the enclosing scope after this body completes
         (they carry the accumulator's finalized value).

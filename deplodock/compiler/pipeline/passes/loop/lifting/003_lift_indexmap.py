@@ -13,7 +13,8 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Select, SelectBranch, Stmt, Write
+from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import IndexMapOp
 from deplodock.compiler.pipeline.engine import Pattern
 
@@ -52,7 +53,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         body.append(Write(output=out_buf, index=write_index, value="v"))
 
     # Wrap in nested free Loops.
-    nested: tuple[Stmt, ...] = tuple(body)
+    nested: Body = tuple(body)
     for a in reversed(axes):
         nested = (Loop(axis=a, body=nested),)
     kernel = LoopOp(body=nested)

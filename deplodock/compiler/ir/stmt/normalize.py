@@ -18,11 +18,12 @@ from deplodock.compiler.ir.expr import Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
+from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Select, SelectBranch, Write
 from deplodock.compiler.ir.stmt.visit import _identity_rename, _make_axis_renamer, _recurse_through_block, iter_body, map_body
 
 
-def normalize_body(stmts: tuple[Stmt, ...], *, hoist: bool = True) -> tuple[Stmt, ...]:
+def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
     """Apply the structural and cosmetic normalization passes in order.
 
     Used by both ``LoopOp.__post_init__`` and ``TileOp.__post_init__`` so
@@ -49,14 +50,14 @@ def normalize_body(stmts: tuple[Stmt, ...], *, hoist: bool = True) -> tuple[Stmt
 # ---------------------------------------------------------------------------
 
 
-def drop_size_one_free_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def drop_size_one_free_axes(stmts: Body) -> Body:
     """Inline every free ``Loop(axis, extent=1)``: replace it with its body
     after substituting ``Var(axis.name) → Literal(0, "int")``. Reduce Loops
     keep their wrappers because dropping them would remove the accumulator.
     Recurses through StridedLoop / Tile / Cond bodies without rewriting
     those wrappers (their iteration semantics aren't a free Loop)."""
 
-    def fn(s: Stmt) -> Stmt | tuple[Stmt, ...]:
+    def fn(s: Stmt) -> Stmt | Body:
         if isinstance(s, Loop):
             candidate = replace(s, body=map_body(s.body, fn))
             if int(candidate.axis.extent) == 1 and not candidate.is_reduce:
@@ -90,7 +91,7 @@ def _recurse_canonicalize(s: Stmt) -> Stmt:
     return s
 
 
-def canonicalize_free_axis_order(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def canonicalize_free_axis_order(stmts: Body) -> Body:
     """Sort the outer chain of free ``Loop`` blocks alphabetically by axis
     name. The chain is the sequence of single-child free Loops at the top of
     ``stmts``; it terminates at a reduce Loop or a branching body. Recursion
@@ -107,7 +108,7 @@ def canonicalize_free_axis_order(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     terminal = tuple(_recurse_canonicalize(s) for s in current)
 
     chain_axes_sorted = sorted(chain_axes, key=lambda a: a.name)
-    result: tuple[Stmt, ...] = terminal
+    result: Body = terminal
     for axis in reversed(chain_axes_sorted):
         result = (Loop(axis=axis, body=result),)
     return result
@@ -118,7 +119,7 @@ def canonicalize_free_axis_order(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 # ---------------------------------------------------------------------------
 
 
-def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def eliminate_copy_aliases(stmts: Body) -> Body:
     """Collapse ``y = copy(x)`` Assigns. The merge rule plants identity
     copies as bridges between producer writes and consumer reads; a long
     chain stacks them. Every such Assign is dropped and downstream
@@ -151,13 +152,13 @@ def eliminate_copy_aliases(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 # ---------------------------------------------------------------------------
 
 
-def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def unify_sibling_reduce_axes(stmts: Body) -> Body:
     """At every scope, find sibling reduce ``Loop``s whose reduce axes index
     the same ``(Load.source, dim)`` position and rename them to a single
     canonical axis name. Recurses through every block-structured Stmt
     (Loop / StridedLoop / Tile / Cond) to find nested scopes."""
 
-    def walk(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    def walk(body: Body) -> Body:
         new_body: list[Stmt] = []
         for s in body:
             if isinstance(s, Loop):
@@ -201,7 +202,7 @@ def unify_sibling_reduce_axes(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     return walk(stmts)
 
 
-def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str) -> set[tuple[str, int]]:
+def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tuple[str, int]]:
     """Collect ``(source, dim)`` positions where ``Var(reduce_axis_name)``
     appears bare in a Load index within ``body`` (recursing into nested
     blocks)."""
@@ -219,7 +220,7 @@ def _reduce_axis_source_positions(body: tuple[Stmt, ...], reduce_axis_name: str)
 # ---------------------------------------------------------------------------
 
 
-def hoist_loop_invariants(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def hoist_loop_invariants(stmts: Body) -> Body:
     """Move ``Load`` / ``Assign`` / ``Select`` stmts out of ``Loop``s whose
     axis their value doesn't depend on. Hoisting only crosses ``Loop``
     boundaries; ``StridedLoop`` / ``Tile`` / ``Cond`` are barriers but are
@@ -277,7 +278,7 @@ def hoist_loop_invariants(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
         ssa_names.add(name)
         bindings.add(name)
 
-    def walk(body: tuple[Stmt, ...], outer_bindings: set[str]) -> list[Stmt]:
+    def walk(body: Body, outer_bindings: set[str]) -> list[Stmt]:
         new_body: list[Stmt] = []
         bindings = set(outer_bindings)
 
@@ -394,7 +395,7 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
     return stmt
 
 
-def simplify_body(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def simplify_body(body: Body) -> Body:
     """Simplify every Expr inside a body. Seeds ``SimplifyCtx`` from
     ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends."""
     ctx = SimplifyCtx.empty()
@@ -406,7 +407,7 @@ def simplify_body(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 # ---------------------------------------------------------------------------
 
 
-def dedup_loads(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def dedup_loads(stmts: Body) -> Body:
     """Drop duplicate ``Load`` stmts within nested scopes.
 
     Two ``Load`` stmts with the same ``(input, index)`` read the same
@@ -417,10 +418,10 @@ def dedup_loads(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     scope are not visible to outer / sibling scopes."""
 
     def walk(
-        body: tuple[Stmt, ...],
+        body: Body,
         env: dict[tuple[str, tuple[str, ...]], str],
         parent_alias: dict[str, str],
-    ) -> tuple[Stmt, ...]:
+    ) -> Body:
         local = dict(env)
         alias = dict(parent_alias)
 
@@ -456,7 +457,7 @@ def dedup_loads(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 # ---------------------------------------------------------------------------
 
 
-def rename_ssa_sequential(stmts: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def rename_ssa_sequential(stmts: Body) -> Body:
     """Canonicalize names in a fused body:
 
     - Axes from every axis-bearing scope (``Loop`` / ``StridedLoop`` /

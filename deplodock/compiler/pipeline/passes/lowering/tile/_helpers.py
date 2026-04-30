@@ -25,11 +25,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Stmt, Tile
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.pipeline.engine import RuleSkipped
 
 
-def single_tile(body: tuple[Stmt, ...]) -> tuple[int, Tile]:
+def single_tile(body: Body) -> tuple[int, Tile]:
     """Locate the (sole) ``Tile`` in a TileOp body.
 
     ``TileOp.__post_init__`` enforces *at most* one Tile, so this only
@@ -93,7 +93,7 @@ def is_matmul_k_outer(
 
 
 def find_matmul_k_outer(
-    body: tuple[Stmt, ...],
+    body: Body,
     *,
     extra_gate: Callable[[Loop, Loop], bool] = lambda k_outer, k_inner: True,
 ) -> int | None:

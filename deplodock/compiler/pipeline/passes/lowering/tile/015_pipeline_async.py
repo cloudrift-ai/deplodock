@@ -55,7 +55,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Loop, Stmt, Tile
+from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import AsyncWait, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
@@ -71,7 +71,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
+def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
     new_tile_body = _process(tile.body)
     if new_tile_body is tile.body or new_tile_body == tile.body:
@@ -79,7 +79,7 @@ def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def _process(body: Body) -> Body:
     new_body: list[Stmt] = []
     changed = False
     for s in body:

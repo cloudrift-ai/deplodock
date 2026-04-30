@@ -15,7 +15,8 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import CastExpr, Var
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Stmt, Write
+from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import GatherOp
 from deplodock.compiler.pipeline.engine import Pattern
 
@@ -35,12 +36,12 @@ def rewrite(graph: Graph, root: Node, inp_data: Node, inp_idx: Node, out: Tensor
     # loaded idx value cast to int (referenced by the idx Load's SSA name).
     data_index = tuple(CastExpr("int", Var("idx")) if i == axis else Var(axes[i].name) for i in range(ndim))
 
-    inner: tuple[Stmt, ...] = (
+    inner: Body = (
         Load(name="idx", input=inp_idx.id, index=idx_index),
         Load(name="data", input=inp_data.id, index=data_index),
         Write(output=f"kernel_{root.id}", index=tuple(Var(a.name) for a in axes), value="data"),
     )
-    body: tuple[Stmt, ...] = inner
+    body: Body = inner
     for a in reversed(axes):
         body = (Loop(axis=a, body=body),)
     kernel = LoopOp(body=body)

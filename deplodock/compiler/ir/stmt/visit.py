@@ -13,9 +13,10 @@ from collections.abc import Callable, Iterable, Iterator
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, StridedLoop, Tile
+from deplodock.compiler.ir.stmt.body import Body
 
 
-def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
+def iter_body(body: Body) -> Iterator[Stmt]:
     """Yield every ``Stmt`` in ``body`` in pre-order, recursing into each
     stmt's ``nested()`` bodies.
 
@@ -31,9 +32,9 @@ def iter_body(body: tuple[Stmt, ...]) -> Iterator[Stmt]:
 
 
 def map_body(
-    body: tuple[Stmt, ...],
+    body: Body,
     fn: Callable[[Stmt], Stmt | None | Iterable[Stmt]],
-) -> tuple[Stmt, ...]:
+) -> Body:
     """Flat body transformer: apply ``fn`` to each stmt, splice its result
     into the output. ``fn`` may return:
 

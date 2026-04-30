@@ -42,6 +42,7 @@ from deplodock.compiler.ir.expr import (
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -240,7 +241,7 @@ class KernelOp(Op):
     ordered by first appearance. ``Smem`` buffers are excluded.
     """
 
-    body: tuple[Stmt, ...] = ()
+    body: Body = ()
     name: str = ""
 
     def __iter__(self) -> Iterator[Stmt]:

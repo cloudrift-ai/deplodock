@@ -38,7 +38,7 @@ from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, Tile, map_body
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile, map_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
@@ -57,7 +57,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
+def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
 
     new_tile_body = _process_scope(tile.body)
@@ -66,7 +66,7 @@ def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process_scope(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def _process_scope(body: Body) -> Body:
     """Walk the body looking for K-outer Loops eligible for double-buffering."""
     new_body: list[Stmt] = list(body)
     changed = False

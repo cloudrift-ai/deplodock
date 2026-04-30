@@ -7,6 +7,11 @@ decode helpers used by ``Tile.render`` live alongside.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from deplodock.compiler.ir.stmt.body import Body
+
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -40,13 +45,13 @@ class Loop(Stmt):
     """
 
     axis: Axis
-    body: tuple[Stmt, ...]
+    body: Body
     unroll: bool = False
 
     def deps(self) -> tuple[str, ...]:
         return ()
 
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+    def nested(self) -> tuple[Body, ...]:
         return (self.body,)
 
     @property
@@ -127,9 +132,9 @@ class Tile(Stmt):
     """
 
     axes: tuple[BoundAxis, ...]
-    body: tuple[Stmt, ...]
+    body: Body
 
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+    def nested(self) -> tuple[Body, ...]:
         return (self.body,)
 
     def rewrite(
@@ -260,13 +265,13 @@ class StridedLoop(Stmt):
     axis: Axis
     start: Expr
     step: Expr
-    body: tuple[Stmt, ...]
+    body: Body
     unroll: bool = False
 
     def deps(self) -> tuple[str, ...]:
         return ()
 
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+    def nested(self) -> tuple[Body, ...]:
         return (self.body,)
 
     @property
@@ -341,13 +346,13 @@ class Cond(Stmt):
     """
 
     cond: Expr
-    body: tuple[Stmt, ...]
-    else_body: tuple[Stmt, ...] = ()
+    body: Body
+    else_body: Body = ()
 
     def deps(self) -> tuple[str, ...]:
         return tuple(self.cond.free_vars())
 
-    def nested(self) -> tuple[tuple[Stmt, ...], ...]:
+    def nested(self) -> tuple[Body, ...]:
         return (self.body, self.else_body)
 
     def rewrite(

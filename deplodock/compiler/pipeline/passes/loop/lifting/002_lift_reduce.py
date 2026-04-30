@@ -12,7 +12,8 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, Var
-from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Stmt, Write
+from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
+from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
@@ -54,7 +55,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     # via ACCUM_IDENTITY, the init value.
     reduce_axis = next(a for a in axes if a.name == reduce_axis_name)
     free_axes = [a for a in axes if a.name != reduce_axis_name]
-    inner: tuple[Stmt, ...] = (
+    inner: Body = (
         Loop(
             axis=reduce_axis,
             body=(
@@ -64,7 +65,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         ),
         Write(output=f"lift_{root.id}", index=write_index, value="acc"),
     )
-    body: tuple[Stmt, ...] = inner
+    body: Body = inner
     for a in reversed(free_axes):
         body = (Loop(axis=a, body=body),)
     kernel = LoopOp(body=body)

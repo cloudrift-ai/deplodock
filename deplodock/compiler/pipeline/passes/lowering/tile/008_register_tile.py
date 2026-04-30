@@ -89,7 +89,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, Stmt, StridedLoop, Tile, Write, iter_body
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Tile, Write, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import find_matmul_k_outer, is_matmul_reduce, single_tile
@@ -106,7 +106,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
+def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
 
     # ``detect_pat`` reads whichever PAT 005_blockify_launch landed on
@@ -161,7 +161,7 @@ def _has_reduce_loop(s: Stmt) -> bool:
     return False
 
 
-def _find_matmul_k_outer(body: tuple[Stmt, ...]) -> int | None:
+def _find_matmul_k_outer(body: Body) -> int | None:
     """Return the index of the top-level free Loop wrapping a matmul-
     shaped reduce, or ``None`` if no such Loop exists.
 
@@ -303,7 +303,7 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
     return Tile(axes=new_axes, body=tuple(new_body))
 
 
-def _collect_ssa_defs(stmts: tuple[Stmt, ...]) -> set[str]:
+def _collect_ssa_defs(stmts: Body) -> set[str]:
     """SSA names bound somewhere inside ``stmts``. Used to limit cell
     renaming to locally-defined names so external references stay intact.
     Driven by :meth:`Stmt.defines` — every name-bearing leaf reports its
@@ -312,7 +312,7 @@ def _collect_ssa_defs(stmts: tuple[Stmt, ...]) -> set[str]:
     return {n for s in iter_body(stmts) for n in s.defines()}
 
 
-def _build_name_axes(pre_outer: tuple[Stmt, ...], target_axes: frozenset[str]) -> dict[str, frozenset[str]]:
+def _build_name_axes(pre_outer: Body, target_axes: frozenset[str]) -> dict[str, frozenset[str]]:
     """Per-name axis dependence over ``pre_outer``, transitively closed
     through SSA chains.
 

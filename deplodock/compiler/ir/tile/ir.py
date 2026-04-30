@@ -272,13 +272,12 @@ class TileOp(Op):
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
 
-        # Accept ``body=tuple_value`` for backward compatibility — every
-        # rule constructs ``TileOp(body=new_body, name=...)`` with a tuple.
-        if not isinstance(self.body, Body):
-            self.body = Body.coerce(self.body)
-        new_stmts = normalize_body(self.body.stmts, hoist=False)
-        if new_stmts != self.body.stmts:
-            self.body = Body(new_stmts)
+        # Body is a tuple subclass; coerce so ``Op(body=tuple_value)``
+        # keeps working without forcing wrapping at every rule's
+        # rewrite site.
+        coerced = Body.coerce(self.body)
+        normalized = normalize_body(coerced, hoist=False)
+        self.body = normalized if isinstance(normalized, Body) else Body(normalized)
         n_tiles = sum(1 for s in self.body if isinstance(s, Tile))
         if n_tiles > 1:
             raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")
