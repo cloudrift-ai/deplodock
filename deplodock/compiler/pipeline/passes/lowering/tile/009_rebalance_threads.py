@@ -1,11 +1,11 @@
 """Top up the per-CTA thread count to ``_TARGET_THREADS`` by absorbing
 inner slices of ``BIND_BLOCK`` axes into ``BIND_THREAD``.
 
-After ``008_register_tile`` splits THREAD axes by F (each becomes
-``extent/F``), matmul kernels drop to ``(_PER_AXIS_THREADS / F)²`` =
-typically 64 threads / CTA. This pass brings the count back up to
-``_TARGET_THREADS`` (256) by carving an inner slice off a BLOCK axis
-and binding it to THREAD instead.
+After ``008_register_tile`` splits each of the two PAT-extent THREAD
+axes by F (each becomes ``PAT/F``), matmul kernels drop to ``(PAT/F)²``
+threads / CTA — typically 64 (PAT=16, F=2). This pass brings the count
+back up to ``_TARGET_THREADS`` (256) by carving an inner slice off a
+BLOCK axis and binding it to THREAD instead.
 
 Order matters: this runs *before* ``010_stage_inputs`` so the staging
 pass sees the final thread-axis set. The downside is that the new

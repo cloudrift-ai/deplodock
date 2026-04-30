@@ -1,14 +1,22 @@
 """Register-tile matmul-shaped reduce kernels (axis-aware).
 
 Each thread in the post-blockify state owns one output element of the
-CTA's M×N tile (16×16 = 256 threads, 1 output / thread). This pass
-splits each ``BIND_THREAD`` axis ``a:16`` into outer ``a_o:16/F`` (still
-``BIND_THREAD``) plus a serial ``a_i:F`` dimension, and replicates the
-matmul reduce body + epilogue per ``(a_i, a_j)`` cell. Each replicated
-cell carries its own SSA accumulator (``acc0_<i>_<j>``), giving F²
-independent partial sums per thread that nvcc can schedule in parallel
-registers. With F=2 this is per-thread output 4 (4× more FMAs per
-smem-load round-trip) at 64 threads per CTA.
+CTA's M×N tile (PAT × PAT threads — default ``PAT=16`` so 256 threads,
+1 output / thread). ``PAT`` (per-axis thread tile width) and ``F``
+(per-thread output factor) are both supplied by ``tuning`` via
+``detect_pat`` / ``register_tile_factor`` and are paired through the
+``_PAT_TO_FACTOR`` table; the only PAT that fires under the default
+thread budget of 256 is ``PAT=16``, but the rule's logic is parametric
+in PAT.
+
+This pass splits each of the two ``BIND_THREAD`` axes ``a:PAT`` into
+outer ``a_o:PAT/F`` (still ``BIND_THREAD``) plus a serial ``a_i:F``
+dimension, and replicates the matmul reduce body + epilogue per
+``(a_i, a_j)`` cell. Each replicated cell carries its own SSA
+accumulator (``acc0_<i>_<j>``), giving F² independent partial sums per
+thread that nvcc can schedule in parallel registers. With ``PAT=16``
+and ``F=2`` this is per-thread output 4 (4× more FMAs per smem-load
+round-trip) at 64 threads per CTA.
 
 **Axis-aware replication of pre-K-outer stmts.** The K-inner body
 always replicates F² (one per output cell). Stmts upstream of the
@@ -30,14 +38,22 @@ suffix (one accumulator per output cell). Names defined upstream are
 suffixed by their dependence subset, so a K-inner cell at (i, j)
 reads ``acc_max_<i>`` (per-row dep) instead of ``acc_max_<i>_<j>``.
 
-This generalization is what lets the rule fire on fused SDPA: the
-softmax pre-passes produce ``acc_max`` / ``acc_sum`` per-row, so they
-need F replicas (along m), not F², and the matmul body's reads of
-those accumulators get rewritten to the right per-cell name.
+This generalization is what *would* let the rule fire on fused SDPA:
+the softmax pre-passes produce ``acc_max`` / ``acc_sum`` per-row, so
+they need F replicas (along m), not F², and the matmul body's reads of
+those accumulators get rewritten to the right per-cell name. SDPA is
+held off in practice by the smem gate below; the analysis itself is
+correct on that shape.
 
-Idempotence: triggers only when both THREAD axes have extent equal to
-``_PER_AXIS_THREADS = 16`` (the post-blockify size). After firing,
-extents are ``16/F``, so the rule won't re-match.
+Idempotence: triggers only when exactly two ``BIND_THREAD`` axes have
+an extent that's a key in ``_PAT_TO_FACTOR`` (currently
+``{16: 2, 32: 4, 64: 8}``). After firing, the split THREAD axis has
+extent ``pat/F`` — for every entry in the table that's exactly ``8``,
+which is deliberately *not* a candidate. So ``detect_pat`` returns
+``None`` on a second pass and the rule skips at its first gate. This
+invariant is load-bearing: any future addition to ``_PAT_TO_FACTOR``
+whose ``pat/F`` lands on another candidate's ``pat`` would re-trigger
+the rule and double-replicate the K-inner body.
 
 The replicated cells use distinct SSA names so the resulting kernel
 needs no nvcc-side scalarization — the per-cell accumulator chains are
@@ -47,17 +63,24 @@ free K-outer loop is reduce-passthrough).
 
 Trigger conditions:
 
-- ``TileOp.body`` contains exactly one ``Tile``.
-- The Tile has 2+ ``BIND_THREAD`` axes, of which exactly two have
-  extent ``_PER_AXIS_THREADS``.
+- ``TileOp.body`` contains exactly one ``Tile`` whose ``block_axes`` is empty.
+- ``detect_pat`` matches a PAT, and ``register_tile_factor`` is
+  ``F > 1`` with ``pat % F == 0``.
+- The Tile has exactly two ``BIND_THREAD`` axes with extent equal to PAT.
 - The Tile body has a top-level free ``Loop`` (the K-outer chunk loop)
   whose body contains a single reduce ``Loop`` (the K-inner reduce)
-  with at least two distinct buffer Loads — i.e. a matmul shape.
-- The chosen factor ``F`` divides ``_PER_AXIS_THREADS``.
-- Every external SSA read inside the K-inner body resolves to a
-  defining stmt in ``pre_outer`` (else the rule skips with a clear
-  reason — covers the case where the matmul's external reads come
-  from a scope the analysis can't reach).
+  with at least two distinct K-indexed buffer Loads + exactly one Accum,
+  body composed only of ``Load`` / ``Assign`` / ``Accum`` (located by
+  ``_find_matmul_k_outer``).
+- ``pre_outer`` contains no reduce Loops (the conservative smem gate —
+  replicating a pre_outer reduce's Stage F-fold blows past the 48 KB
+  smem budget after pad + double-buffer downstream; this is what
+  currently keeps SDPA on the baseline path).
+
+External SSA reads inside the K-inner body whose definitions can't be
+located in ``pre_outer`` are *not* a gate — the analysis treats them
+as un-replicated passthroughs (axes_used = ∅), which is correct for
+Tile-input buffer names, constants, and other read-only values.
 """
 
 from __future__ import annotations

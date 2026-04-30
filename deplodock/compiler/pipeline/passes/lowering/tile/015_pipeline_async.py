@@ -97,13 +97,19 @@ def _process(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
 def _eligible(loop: Loop) -> bool:
     """K-outer loop with all body Stages async + double-buffered + not yet
-    pipelined, and a *pure-matmul* reduce body (no cross-loop accumulator
-    deps). The matmul check is critical — kernels like SDPA's per-output
-    free loop have a reduce body that reads ``acc0`` / ``acc1`` from
-    prior loops; pipelining keeps the math right but compounding fp32
-    drift in the rearranged commits manifests as too-large diff vs eager.
-    Restrict to the same shape ``register_tile`` and ``double_buffer``
-    fire on."""
+    pipelined, and a *pure-matmul* reduce body — Load/Assign/Accum only
+    AND no read of an SSA name not defined locally inside the reduce.
+    The cross-loop-deps gate is critical here: kernels like SDPA's
+    per-output free loop have a reduce body that reads ``acc0`` /
+    ``acc1`` from prior softmax reduces; pipelining keeps the math
+    right but compounding fp32 drift in the rearranged commits
+    manifests as too-large diff vs eager.
+
+    Note: ``register_tile`` used to share this same gate (it was its
+    cross-loop-deps gate), but as of the axis-aware generalization the
+    rule handles such reads correctly via per-cell σ-substitution and
+    no longer needs the gate. ``013_double_buffer`` and ``015_pipeline
+    _async`` keep their own variants for the fp32-drift reason above."""
     if int(loop.axis.extent) < 2:
         return False
     stages = [s for s in loop.body if isinstance(s, Stage)]

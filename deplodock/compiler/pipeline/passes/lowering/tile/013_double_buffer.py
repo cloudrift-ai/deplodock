@@ -18,9 +18,13 @@ Trigger:
 - Tile body has exactly one ``Tile`` (the standard shape).
 - The Tile body has a free Loop ``K_outer`` (extent ≥ 2) whose body
   contains ≥ 1 ``Stage`` and exactly one reduce ``Loop``.
-- The reduce body matches the pure-matmul shape (Load / Assign / Accum
-  only, no Selects / Conds, no reads of accumulators) — same gate
-  ``register_tile`` uses.
+- The reduce body has only ``Load`` / ``Assign`` / ``Accum`` stmts,
+  defines ≥ 1 ``Accum``, and no body stmt reads any local Accum
+  target's running value (rejects in-loop online-softmax-style merges
+  where an Assign reads ``acc`` mid-iteration). ``register_tile`` no
+  longer enforces this gate; ``013`` keeps it because its rewrite
+  reorders smem visibility relative to the FMA chain and that
+  reordering compounds fp32 drift on online-softmax-style bodies.
 - Smem budget: ``2 × sum(slab_floats) ≤ _SMEM_BUDGET`` (default 96 KB
   to fit the per-block dynamic smem cap on Ada / Hopper consumer
   parts).

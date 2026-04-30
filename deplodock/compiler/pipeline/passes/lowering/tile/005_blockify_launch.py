@@ -9,13 +9,28 @@ budget. Output-dim free-Loop lifting happens earlier in
 already in ``Tile.axes``.
 
 **Apportion THREAD/BLOCK.** Every axis in ``Tile.axes`` starts as
-THREAD (from ``001_tileify``). Walk innermost-to-outermost
-filling THREAD up to ``_THREAD_BUDGET``. An axis that exceeds the
-remaining budget gets split into inner-THREAD + outer-BLOCK. Axes
-past the budget go straight to BLOCK.
+THREAD (from ``001_tileify``). Walk innermost-to-outermost, accumulating
+``threads_used`` against the per-block budget ``thread_budget()``
+(``tuning.thread_budget``, default 256, env ``DEPLODOCK_TB``).
 
-Idempotent: if every Tile axis already fits the THREAD/BLOCK
-partition, returns None.
+For each axis with extent ``ext`` and per-axis tile width
+``pat = per_axis_threads(tile)`` (typically 16):
+
+- ``threads_used >= budget`` — axis goes BLOCK whole.
+- ``ext < pat`` — THREAD whole if it still fits the budget, else BLOCK.
+- ``ext == pat`` — same fit-or-BLOCK check.
+- ``ext > pat`` and ``ext % pat == 0`` — split into ``axis_i:pat``
+  (THREAD) and ``axis_o:ext/pat`` (BLOCK), with body indices
+  σ-rewritten ``axis → axis_o*pat + axis_i``.
+- ``ext > pat`` and not divisible — THREAD whole if it fits, else BLOCK.
+
+The split factor is always ``pat`` (the per-axis tile width), not the
+remaining budget. The budget governs *whether* an axis goes THREAD
+at all, while ``pat`` governs *how* a THREAD-eligible axis with
+oversized extent is sliced.
+
+Idempotent: if no axis was split and every axis kept its original
+bind, returns None.
 """
 
 from __future__ import annotations

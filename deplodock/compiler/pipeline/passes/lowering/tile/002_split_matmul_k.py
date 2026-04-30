@@ -2,17 +2,22 @@
 (``K_o``) + inner (``K_i``) loops.
 
 Matmul-only by design — the trigger is structural for dot-product
-reductions (two distinct buffers + multiply + accum). Single-buffer
-reductions (softmax, sum, RMSNorm) are skipped.
+reductions (≥2 distinct K-indexed buffer Loads + an Accum). Single-
+buffer reductions (softmax, sum, RMSNorm) are skipped.
 
 Runs *before* launch-geometry / blockify, so the trigger can't depend on
 ``Tile.axes`` partitioning. Detection is structural on the reduce body::
 
     Loop(K, reduce, body containing
         Load(A) and Load(B) on distinct buffers,
-        a multiply combining them,
-        an Accum that consumes the multiply
+        both Load index expressions referencing K,
+        an Accum somewhere in the body
     )
+
+The multiply between the two Loads is implicit — by construction it's
+the only way two K-indexed Loads of distinct buffers contribute to an
+Accum in this IR (lifted + fused from a frontend matmul). The rule
+doesn't pattern-match the multiply Assign explicitly.
 
 This catches every matmul-shaped reduction regardless of where it sits
 in the kernel — top of Tile body (plain matmul), nested inside a free
