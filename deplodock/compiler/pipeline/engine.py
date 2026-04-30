@@ -42,6 +42,7 @@ def _strip_rule_prefix(name: str) -> str:
     (``003_cooperative_reduce`` → ``cooperative_reduce``)."""
     return _RULE_PREFIX_RE.sub("", name)
 
+
 logger = logging.getLogger(__name__)
 
 

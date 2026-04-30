@@ -6,12 +6,12 @@ Two halves:
    build a frontend graph, run the full ``TILE_PASSES``, assert
    ``tileify`` shows up in ``recording_dump.fired_rules``.
 2. **Behavior tests** — build a ``LoopOp`` graph that exercises a
-   specific tileify branch (outer-chain stripping, inner-Loop lifting,
-   non-output-Loop rejection, nested-Loop rejection), then run only
-   the ``tileify`` rule via ``run_pipeline(..., select={"tileify"})``
-   so the resulting ``Tile.axes`` reflects tileify alone — no
-   subsequent ``blockify_launch`` partition or ``cooperative_reduce``
-   rewrite to obscure the assertion.
+   specific tileify branch (outer-chain stripping for reduction /
+   pointwise, sibling output-Loop lifting), then run only the
+   ``tileify`` rule via ``run_pipeline(..., select={"tileify"})`` so
+   the resulting ``Tile.axes`` reflects tileify alone — no subsequent
+   ``blockify_launch`` partition or ``cooperative_reduce`` rewrite to
+   obscure the assertion.
 """
 
 from __future__ import annotations
@@ -185,5 +185,3 @@ def test_tileify_lifts_sibling_output_loop():
     body_loops = [s for s in tile.body if isinstance(s, Loop)]
     assert len(body_loops) == 1 and body_loops[0].is_reduce
     assert int(body_loops[0].axis.extent) == 8
-
-

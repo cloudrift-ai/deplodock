@@ -1,4 +1,4 @@
-"""Register-tile matmul-shaped reduce kernels.
+"""Register-tile matmul-shaped reduce kernels (axis-aware).
 
 Each thread in the post-blockify state owns one output element of the
 CTA's M×N tile (16×16 = 256 threads, 1 output / thread). This pass
@@ -9,6 +9,31 @@ cell carries its own SSA accumulator (``acc0_<i>_<j>``), giving F²
 independent partial sums per thread that nvcc can schedule in parallel
 registers. With F=2 this is per-thread output 4 (4× more FMAs per
 smem-load round-trip) at 64 threads per CTA.
+
+**Axis-aware replication of pre-K-outer stmts.** The K-inner body
+always replicates F² (one per output cell). Stmts upstream of the
+K-outer loop (sibling reduces in fused SDPA, scalar-load preambles
+in linear-bias kernels) replicate by the *thread-axis subset* their
+output depends on:
+
+==============================  ============  =============================
+Stmt's thread-axis dependence   Replicas      Per-cell name suffix
+==============================  ============  =============================
+``∅`` (constant / batch only)   1             ``""``  (shared across cells)
+``{m_axis}`` (per-row)          F             ``"_<i>"``
+``{n_axis}`` (per-col)          F             ``"_<j>"``
+``{m_axis, n_axis}``            F²            ``"_<i>_<j>"``
+==============================  ============  =============================
+
+Names defined locally inside the K-inner body always carry the F²
+suffix (one accumulator per output cell). Names defined upstream are
+suffixed by their dependence subset, so a K-inner cell at (i, j)
+reads ``acc_max_<i>`` (per-row dep) instead of ``acc_max_<i>_<j>``.
+
+This generalization is what lets the rule fire on fused SDPA: the
+softmax pre-passes produce ``acc_max`` / ``acc_sum`` per-row, so they
+need F replicas (along m), not F², and the matmul body's reads of
+those accumulators get rewritten to the right per-cell name.
 
 Idempotence: triggers only when both THREAD axes have extent equal to
 ``_PER_AXIS_THREADS = 16`` (the post-blockify size). After firing,
@@ -29,6 +54,10 @@ Trigger conditions:
   whose body contains a single reduce ``Loop`` (the K-inner reduce)
   with at least two distinct buffer Loads — i.e. a matmul shape.
 - The chosen factor ``F`` divides ``_PER_AXIS_THREADS``.
+- Every external SSA read inside the K-inner body resolves to a
+  defining stmt in ``pre_outer`` (else the rule skips with a clear
+  reason — covers the case where the matmul's external reads come
+  from a scope the analysis can't reach).
 """
 
 from __future__ import annotations
@@ -37,7 +66,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Select, Stmt, Tile, iter_body
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Init, Load, Loop, Select, Stmt, StridedLoop, Tile, Write, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.tuning import detect_pat, register_tile_factor
@@ -73,9 +102,27 @@ def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     if len(target_axes) != 2:
         raise RuleSkipped(f"need exactly 2 THREAD axes with extent {pat}, found {len(target_axes)}")
 
-    matmul_loc = _find_matmul(tile.body)
+    matmul_loc = _find_matmul_k_outer(tile.body)
     if matmul_loc is None:
         raise RuleSkipped("no pure matmul-shaped reduce Loop at Tile body top level")
+
+    # Conservative smem-budget gate. Replicating a pre_outer reduce
+    # Loop introduces an F-multiplied Stage in ``010_stage_inputs``; the
+    # Stage gets a ``cell:F`` dim added to its slab so its smem grows
+    # ~F× per replicated reduce. With double-buffering and bank padding
+    # downstream, even small kernels (SDPA at seq=128, head_dim=64)
+    # exceed the 48 KB consumer limit. Until 008 has hypothetical smem
+    # accounting against ``010``'s would-be Stages, skip when pre_outer
+    # has reduce-bearing Loops. Pure matmul (no pre_outer) and matmul +
+    # scalar-Load preamble (e.g. ``silu(A@B)``) are unaffected.
+    pre_outer = tile.body[:matmul_loc]
+    for s in pre_outer:
+        if _has_reduce_loop(s):
+            raise RuleSkipped(
+                "pre_outer contains a reduce Loop — F-replicating its Stage "
+                "would exceed the 48 KB smem budget after pad+double-buffer "
+                "(needs explicit smem accounting before relaxing)"
+            )
 
     rewritten = _register_tile(tile, target_axes[0], target_axes[1], factor)
     if rewritten is None:
@@ -83,16 +130,38 @@ def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
     return body[:idx] + (rewritten,) + body[idx + 1 :]
 
 
-def _find_matmul(body: tuple[Stmt, ...]) -> int | None:
-    """Return the index of a top-level free Loop that wraps a *pure* matmul
-    reduce, or None. Pure means:
+def _has_reduce_loop(s: Stmt) -> bool:
+    """True iff ``s`` is or contains a reduce Loop in its subtree."""
+    if isinstance(s, Loop) and s.is_reduce:
+        return True
+    for c in iter_body((s,)):
+        if isinstance(c, Loop) and c.is_reduce and c is not s:
+            return True
+    return False
 
-    - the K-outer's body has exactly one reduce Loop (the K-inner);
-    - the reduce body has Loads of 2+ distinct buffers indexed by the
-      reduce axis;
-    - the reduce body has exactly one Accum;
-    - no stmt in the reduce body reads an Accum target (excludes online-
-      softmax fusions where the running max / sum is folded back in).
+
+def _find_matmul_k_outer(body: tuple[Stmt, ...]) -> int | None:
+    """Return the index of the top-level free Loop that wraps a matmul-
+    shaped reduce (the ``K_o`` chunk loop produced by ``split_matmul_k``),
+    or ``None`` if no such Loop exists in ``body``.
+
+    Doubles as a *predicate* — locating the index requires the same
+    structural checks that gate the rewrite, so the two responsibilities
+    are folded into one walk. The Loop must wrap a single reduce
+    (``K_i``) whose body satisfies:
+
+    - Loads of ≥2 distinct buffers indexed by the reduce axis (matmul's
+      operand-pair signature).
+    - Exactly one ``Accum`` (the rewrite emits one accumulator chain
+      per output cell; multi-Accum bodies aren't supported).
+    - Body composed only of ``Load`` / ``Assign`` / ``Accum`` (Select /
+      Cond / nested Loops / staged-buffer rereads aren't supported —
+      see comment below).
+
+    Pre-K_outer external reads (e.g. SDPA's ``acc_max`` / ``acc_sum``
+    from sibling reduces) are *not* a gate here — the new axis-aware
+    rewrite handles them. Smem-budget concerns for replicating
+    pre_outer reduce Stages are gated separately in ``_maybe_rewrite``.
     """
     for i, s in enumerate(body):
         if not (isinstance(s, Loop) and not s.is_reduce):
@@ -114,15 +183,6 @@ def _find_matmul(body: tuple[Stmt, ...]) -> int | None:
         # layouts; with rotary's 10+ stages the post-pad smem usage blows
         # past the 48 KB consumer limit. Gate when staging is bounded.)
         if not all(isinstance(c, (Load, Assign, Accum)) for c in rl.body):
-            continue
-        # Reject if any SSA name read by the body is not defined locally —
-        # that signals a cross-loop dependency (e.g. SDPA online softmax
-        # reads running max / sum produced by prior reduce loops). Such
-        # accumulators are per-M-row, but our replication multiplies the
-        # M coordinate, so every cell would need its own max/sum — which
-        # the prior loops haven't computed.
-        local_defs = {c.name for c in rl.body if isinstance(c, (Load, Assign, Accum))}
-        if any(d not in local_defs for c in rl.body for d in c.deps()):
             continue
         return i
     return None
@@ -148,12 +208,10 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
     new_axes, m_o = _split_axis(tile.axes, m_axis, factor)
     new_axes, n_o = _split_axis(new_axes, n_axis, factor)
 
-    k_outer_idx = _find_matmul(tile.body)
+    k_outer_idx = _find_matmul_k_outer(tile.body)
     if k_outer_idx is None:
         return None
     k_outer = tile.body[k_outer_idx]
-
-    cells = [(i, j) for i in range(factor) for j in range(factor)]
 
     # K-outer body: stages stay CTA-scoped; inner reduce body replicates per cell.
     new_outer_body: list[Stmt] = []
@@ -167,41 +225,66 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
             return None  # unsupported shape — bail rather than corrupt
     assert k_inner is not None
 
-    # The replicated region spans pre-K-outer stmts (the Tile-body
-    # preamble) + K-inner body + post-K-outer epilogue. Preamble stmts
-    # that reference the thread axes (e.g. ``v4 = silu(linear_4[a1, a3])``
-    # in a SiLU+matmul kernel) MUST be replicated per cell with σ so each
-    # cell sees its own (a1*F+i, a3*F+j) coords. Replicating preamble
-    # stmts that don't depend on thread axes is wasted but harmless —
-    # nvcc CSEs the resulting redundant scalar loads.
     pre_outer = tile.body[:k_outer_idx]
     post_outer = tile.body[k_outer_idx + 1 :]
-    replicated = (*pre_outer, *k_inner.body, *post_outer)
-    local_ssa = _collect_ssa_defs(replicated)
 
+    # Build per-name axis dependence over pre_outer (transitive through
+    # SSA chains: an Assign / Accum / Select inherits the union of its
+    # args' axes_used). Loop / StridedLoop axes are masked out.
+    target_axes = frozenset({m_axis, n_axis})
+    name_axes: dict[str, frozenset[str]] = _build_name_axes(pre_outer, target_axes)
+
+    # Stmt-level axes_used = union of axes_used over names defined inside
+    # that stmt. For Loop wrappers around an Accum (SDPA softmax pre-pass),
+    # this picks up the Accum's axis-dep; for top-level Loads / Assigns,
+    # it picks up that stmt's own dep.
+    pre_axes_used: list[frozenset[str]] = []
+    for s in pre_outer:
+        defs = _collect_ssa_defs((s,))
+        if defs:
+            axes = frozenset()
+            for nm in defs:
+                axes = axes | name_axes.get(nm, frozenset())
+            pre_axes_used.append(axes)
+        else:
+            # No SSA defs inside (e.g. a bare Write at top level — unusual);
+            # fall back to direct expression-level walk.
+            pre_axes_used.append(_axes_used_in_stmt(s, target_axes))
+
+    # K-inner / post_outer locals get the full F² axis-dep — they're
+    # produced once per output cell.
+    k_inner_locals = _collect_ssa_defs(k_inner.body)
+    for nm in k_inner_locals:
+        name_axes[nm] = target_axes
+    post_locals = _collect_ssa_defs(post_outer)
+    for nm in post_locals:
+        name_axes[nm] = target_axes
+
+    # Replicate K-inner body F² (matmul output is per-cell).
+    cells_full = [(i, j) for i in range(factor) for j in range(factor)]
     new_k_inner_body: list[Stmt] = []
-    for i, j in cells:
-        sigma = _cell_sigma(m_axis, m_o, i, n_axis, n_o, j, factor)
-        rename = _cell_rename(i, j, local_ssa)
+    for i, j in cells_full:
+        sigma = _cell_sigma(target_axes, m_axis, m_o, n_axis, n_o, i, j, factor)
+        rename = _make_rename(name_axes, k_inner_locals, target_axes, m_axis, n_axis, i, j)
         for s in k_inner.body:
             new_k_inner_body.append(s.rewrite(rename, sigma))
     new_outer_body.append(Loop(axis=k_inner.axis, body=tuple(new_k_inner_body), unroll=k_inner.unroll))
 
+    # Replicate pre_outer per stmt by its axes_used.
     new_body: list[Stmt] = []
-    # Preamble: replicate per cell so any thread-axis-indexed Loads or
-    # Assigns produce per-cell values matching the epilogue's writes.
-    for i, j in cells:
-        sigma = _cell_sigma(m_axis, m_o, i, n_axis, n_o, j, factor)
-        rename = _cell_rename(i, j, local_ssa)
-        for s in pre_outer:
+    for s, axes in zip(pre_outer, pre_axes_used, strict=True):
+        for i, j in _cell_coords(axes, m_axis, n_axis, factor):
+            sigma = _cell_sigma(axes, m_axis, m_o, n_axis, n_o, i, j, factor)
+            stmt_locals = _collect_ssa_defs((s,))
+            rename = _make_rename(name_axes, stmt_locals, axes, m_axis, n_axis, i, j)
             new_body.append(s.rewrite(rename, sigma))
 
     new_body.append(Loop(axis=k_outer.axis, body=tuple(new_outer_body), unroll=k_outer.unroll))
 
-    # Epilogue: replicate post-K-outer stmts per cell.
-    for i, j in cells:
-        sigma = _cell_sigma(m_axis, m_o, i, n_axis, n_o, j, factor)
-        rename = _cell_rename(i, j, local_ssa)
+    # Replicate post_outer F² (epilogue depends on per-cell matmul output).
+    for i, j in cells_full:
+        sigma = _cell_sigma(target_axes, m_axis, m_o, n_axis, n_o, i, j, factor)
+        rename = _make_rename(name_axes, post_locals, target_axes, m_axis, n_axis, i, j)
         for s in post_outer:
             new_body.append(s.rewrite(rename, sigma))
 
@@ -218,19 +301,202 @@ def _collect_ssa_defs(stmts: tuple[Stmt, ...]) -> set[str]:
     return out
 
 
-def _cell_sigma(m_axis: str, m_o: Axis, i: int, n_axis: str, n_o: Axis, j: int, factor: int) -> Sigma:
-    return Sigma(
-        {
-            m_axis: Var(m_o.name) * Literal(factor, "int") + Literal(i, "int"),
-            n_axis: Var(n_o.name) * Literal(factor, "int") + Literal(j, "int"),
-        }
-    )
+def _build_name_axes(pre_outer: tuple[Stmt, ...], target_axes: frozenset[str]) -> dict[str, frozenset[str]]:
+    """Per-name axis dependence over ``pre_outer``, transitively closed
+    through SSA chains.
+
+    Walks pre_outer in order, recording for each defined SSA name the
+    subset of ``target_axes`` its value depends on. Direct dependence
+    comes from a ``Load``'s index Vars (after subtracting Loop-bound
+    axes); indirect dependence flows through ``Assign.args`` / ``Accum.value``
+    / ``Select.branches[].value``.
+
+    A name not present in the returned dict is either a Tile-input
+    buffer name (passthrough) or referenced before it was defined
+    (which is a structural error — unhandled).
+    """
+    name_axes: dict[str, frozenset[str]] = {}
+
+    def axes_of_expr(e, bound: frozenset[str]) -> frozenset[str]:
+        return frozenset(v for v in e.free_vars() if v in target_axes and v not in bound)
+
+    def axes_of_name(n: str) -> frozenset[str]:
+        return name_axes.get(n, frozenset())
+
+    def visit(node: Stmt, bound: frozenset[str]) -> None:
+        if isinstance(node, (Loop, StridedLoop)):
+            for c in node.body:
+                visit(c, bound | {node.axis.name})
+            return
+        if isinstance(node, Cond):
+            for c in node.body:
+                visit(c, bound)
+            for c in node.else_body:
+                visit(c, bound)
+            return
+        if isinstance(node, Tile):
+            new_bound = bound | {ba.axis.name for ba in node.axes}
+            for c in node.body:
+                visit(c, new_bound)
+            return
+        if isinstance(node, Load):
+            axes: frozenset[str] = frozenset()
+            for e in node.index:
+                axes = axes | axes_of_expr(e, bound)
+            name_axes[node.name] = axes
+            return
+        if isinstance(node, Assign):
+            axes = frozenset()
+            for a in node.args:
+                axes = axes | axes_of_name(a)
+            name_axes[node.name] = axes
+            return
+        if isinstance(node, Accum):
+            existing = name_axes.get(node.name, frozenset())
+            name_axes[node.name] = existing | axes_of_name(node.value)
+            return
+        if isinstance(node, Select):
+            axes = frozenset()
+            for b in node.branches:
+                axes = axes | axes_of_name(b.value) | axes_of_expr(b.select, bound)
+            name_axes[node.name] = axes
+            return
+        # Init / Stage / Write / others — no SSA def to record at this level.
+
+    for s in pre_outer:
+        visit(s, frozenset())
+    return name_axes
 
 
-def _cell_rename(i: int, j: int, locals_set: set[str]):
-    suffix = f"_{i}_{j}"
+def _axes_used_in_stmt(s: Stmt, target_axes: frozenset[str]) -> frozenset[str]:
+    """Subset of ``target_axes`` (axis-name set) appearing as free Vars
+    in any expression inside ``s``, excluding axes bound by enclosing
+    Loop/StridedLoop wrappers inside ``s`` itself.
+
+    A pre_outer reduce ``Loop(a2, body=[Load(buf[a1, a2]), Accum])``
+    has ``a2`` bound by the Loop; only ``a1`` survives the filter and
+    if ``a1`` is in ``target_axes`` it appears in the result.
+    """
+    used: set[str] = set()
+
+    def walk(node: Stmt, bound: frozenset[str]) -> None:
+        if isinstance(node, (Loop, StridedLoop)):
+            for c in node.body:
+                walk(c, bound | {node.axis.name})
+            return
+        if isinstance(node, Cond):
+            for v in node.cond.free_vars():
+                if v in target_axes and v not in bound:
+                    used.add(v)
+            for c in node.body:
+                walk(c, bound)
+            for c in node.else_body:
+                walk(c, bound)
+            return
+        if isinstance(node, Tile):
+            new_bound = bound | {ba.axis.name for ba in node.axes}
+            for c in node.body:
+                walk(c, new_bound)
+            return
+        # Leaf-ish stmts: pull every Expr-bearing field's free Vars.
+        for e in _exprs_in(node):
+            for v in e.free_vars():
+                if v in target_axes and v not in bound:
+                    used.add(v)
+
+    walk(s, frozenset())
+    return frozenset(used)
+
+
+def _exprs_in(s: Stmt):
+    """Yield every direct Expr field of ``s`` (not recursive into bodies)."""
+    if isinstance(s, Load):
+        yield from s.index
+    elif isinstance(s, Write):
+        yield from s.index
+    elif isinstance(s, Select):
+        for b in s.branches:
+            yield b.select
+    elif isinstance(s, Stage):
+        # Stage carries an index expression for its load source.
+        yield from getattr(s, "index", ())
+    # Assign / Accum / Init have only SSA-name fields (no Exprs).
+
+
+def _cell_coords(axes_used: frozenset[str], m_axis: str, n_axis: str, factor: int) -> list[tuple[int, int]]:
+    """Cell coords to replicate over for a stmt with the given axis-dep.
+
+    Returns (i, j) tuples; ``i`` defaults to 0 when m_axis ∉ axes_used,
+    same for ``j``. Defaulting to 0 (rather than None) keeps the σ
+    well-formed at the unused axis — its substitution simply produces
+    ``axis_o*F + 0`` which is the correct un-replicated reference.
+    """
+    if not axes_used:
+        return [(0, 0)]
+    if axes_used == {m_axis}:
+        return [(i, 0) for i in range(factor)]
+    if axes_used == {n_axis}:
+        return [(0, j) for j in range(factor)]
+    return [(i, j) for i in range(factor) for j in range(factor)]
+
+
+def _cell_sigma(
+    axes_used: frozenset[str],
+    m_axis: str,
+    m_o: Axis,
+    n_axis: str,
+    n_o: Axis,
+    i: int,
+    j: int,
+    factor: int,
+) -> Sigma:
+    """σ-substitution for cell (i, j) restricted to ``axes_used``."""
+    sub: dict[str, object] = {}
+    if m_axis in axes_used:
+        sub[m_axis] = Var(m_o.name) * Literal(factor, "int") + Literal(i, "int")
+    if n_axis in axes_used:
+        sub[n_axis] = Var(n_o.name) * Literal(factor, "int") + Literal(j, "int")
+    return Sigma(sub) if sub else Sigma.IDENTITY
+
+
+def _cell_suffix(axes_used: frozenset[str], m_axis: str, n_axis: str, i: int, j: int) -> str:
+    """Per-cell SSA-name suffix matching the axis subset."""
+    if not axes_used:
+        return ""
+    if axes_used == {m_axis}:
+        return f"_{i}"
+    if axes_used == {n_axis}:
+        return f"_{j}"
+    return f"_{i}_{j}"
+
+
+def _make_rename(
+    name_axes: dict[str, frozenset[str]],
+    locals_in_scope: set[str],
+    cell_axes: frozenset[str],
+    m_axis: str,
+    n_axis: str,
+    i: int,
+    j: int,
+):
+    """Build a per-cell SSA rename callback.
+
+    ``locals_in_scope`` are the names defined inside the region being
+    rewritten — they get renamed to the suffix corresponding to
+    ``cell_axes`` (the region's axis-dep: F² for K-inner / post_outer
+    and F-or-1 for pre_outer reduce-loop replicas). External reads
+    (names defined elsewhere) get the suffix matching the *defining*
+    stmt's axis-dep recorded in ``name_axes``.
+    """
+    local_suffix = _cell_suffix(cell_axes, m_axis, n_axis, i, j)
 
     def rename(name: str) -> str:
-        return f"{name}{suffix}" if name in locals_set else name
+        if name in locals_in_scope:
+            return f"{name}{local_suffix}" if local_suffix else name
+        axes = name_axes.get(name)
+        if axes is None:
+            return name  # passthrough — Tile-input or out-of-scope name
+        suffix = _cell_suffix(axes, m_axis, n_axis, i, j)
+        return f"{name}{suffix}" if suffix else name
 
     return rename
