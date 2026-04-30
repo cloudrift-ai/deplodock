@@ -92,6 +92,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Init, Load, Loop, Select, Stmt, StridedLoop, Tile, Write, iter_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import find_matmul_k_outer, is_matmul_reduce, single_tile
 from deplodock.compiler.tuning import detect_pat, register_tile_factor
 
 PATTERN = [Pattern("root", TileOp)]
@@ -106,10 +107,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
-    tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
-    if len(tiles) != 1:
-        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
-    idx, tile = tiles[0]
+    idx, tile = single_tile(body)
 
     # ``detect_pat`` reads whichever PAT 005_blockify_launch landed on
     # by inspecting THREAD axis extents; ``register_tile_factor`` pairs
@@ -164,51 +162,42 @@ def _has_reduce_loop(s: Stmt) -> bool:
 
 
 def _find_matmul_k_outer(body: tuple[Stmt, ...]) -> int | None:
-    """Return the index of the top-level free Loop that wraps a matmul-
-    shaped reduce (the ``K_o`` chunk loop produced by ``split_matmul_k``),
-    or ``None`` if no such Loop exists in ``body``.
+    """Return the index of the top-level free Loop wrapping a matmul-
+    shaped reduce, or ``None`` if no such Loop exists.
 
-    Doubles as a *predicate* — locating the index requires the same
-    structural checks that gate the rewrite, so the two responsibilities
-    are folded into one walk. The Loop must wrap a single reduce
-    (``K_i``) whose body satisfies:
+    Built on :func:`find_matmul_k_outer` from ``_helpers`` (which
+    enforces the structural shape — single K-inner reduce + pure-
+    compute body of Load/Assign/Accum) plus rule-specific gates layered
+    via ``extra_gate``:
 
-    - Loads of ≥2 distinct buffers indexed by the reduce axis (matmul's
-      operand-pair signature).
-    - Exactly one ``Accum`` (the rewrite emits one accumulator chain
-      per output cell; multi-Accum bodies aren't supported).
-    - Body composed only of ``Load`` / ``Assign`` / ``Accum`` (Select /
-      Cond / nested Loops / staged-buffer rereads aren't supported —
-      see comment below).
+    - ≥2 K-indexed buffers (matmul operand-pair signature, via
+      :func:`is_matmul_reduce`).
+    - Exactly one Accum (the rewrite emits one accumulator chain per
+      output cell; multi-Accum bodies aren't supported here).
+
+    The body-purity check (no Select / Cond / nested Loops / staged-
+    buffer rereads) lives in the shared helper. Allowing Select would
+    fire on SDPA-with-rotary kernels — semantically safe since
+    ``Select.rewrite`` handles per-cell σ substitution, but the
+    surrounding Stages get cell-dim factors added to their slab
+    layouts; with rotary's 10+ stages the post-pad smem usage blows
+    past the 48 KB consumer limit. Gate when staging is bounded.
 
     Pre-K_outer external reads (e.g. SDPA's ``acc_max`` / ``acc_sum``
-    from sibling reduces) are *not* a gate here — the new axis-aware
-    rewrite handles them. Smem-budget concerns for replicating
-    pre_outer reduce Stages are gated separately in ``_maybe_rewrite``.
+    from sibling reduces) are *not* a gate — the new axis-aware
+    rewrite handles them via per-cell SSA-name suffixing. Smem-budget
+    concerns for replicating pre_outer reduce Stages are gated
+    separately in :func:`_maybe_rewrite`.
     """
-    for i, s in enumerate(body):
-        if not (isinstance(s, Loop) and not s.is_reduce):
-            continue
-        reduces = [c for c in s.loops if c.is_reduce]
-        if len(reduces) != 1:
-            continue
-        rl = reduces[0]
-        bufs = {ld.input for ld in rl.loads if rl.axis.name in {v for e in ld.index for v in e.free_vars()}}
-        if len(bufs) < 2:
-            continue
-        if sum(1 for c in rl.body if isinstance(c, Accum)) != 1:
-            continue
-        # Pure matmul shape only: Load / Assign / Accum stmts allowed.
-        # Reject Select / Cond / nested Loops / staged-buffer rereads etc.
-        # (Allowing Select fires on SDPA-with-rotary kernels — semantically
-        # safe since Select.rewrite handles per-cell σ substitution — but
-        # the surrounding Stages get cell-dim factors added to their slab
-        # layouts; with rotary's 10+ stages the post-pad smem usage blows
-        # past the 48 KB consumer limit. Gate when staging is bounded.)
-        if not all(isinstance(c, (Load, Assign, Accum)) for c in rl.body):
-            continue
-        return i
-    return None
+
+    def gate(k_outer: Loop, k_inner: Loop) -> bool:
+        if not is_matmul_reduce(k_inner):
+            return False
+        if sum(1 for c in k_inner.body if isinstance(c, Accum)) != 1:
+            return False
+        return True
+
+    return find_matmul_k_outer(body, extra_gate=gate)
 
 
 def _split_axis(axes: tuple[BoundAxis, ...], target: str, factor: int) -> tuple[tuple[BoundAxis, ...], Axis]:

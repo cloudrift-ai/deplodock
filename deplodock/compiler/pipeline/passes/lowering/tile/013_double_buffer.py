@@ -38,9 +38,10 @@ from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Stmt, Tile, map_body
+from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, Tile, map_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -57,10 +58,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
-    tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
-    if len(tiles) != 1:
-        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
-    idx, tile = tiles[0]
+    idx, tile = single_tile(body)
 
     new_tile_body = _process_scope(tile.body)
     if new_tile_body is tile.body or new_tile_body == tile.body:
@@ -91,31 +89,29 @@ def _process_scope(body: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
 
 
 def _is_kouter_matmul(loop: Loop) -> bool:
-    """A Loop is K-outer-matmul iff its body has ≥ 1 Stage + exactly one
-    reduce Loop with a pure-matmul body (Load/Assign/Accum only, no
-    cross-iteration accumulator reads). Multiple Accums are fine — they
-    occur after register-tile replicates cells."""
-    if int(loop.axis.extent) < 2:
-        return False
-    stages = [s for s in loop.body if isinstance(s, Stage)]
-    if not stages:
-        return False
-    reduce_loops = [s for s in loop.body if isinstance(s, Loop) and s.is_reduce]
-    if len(reduce_loops) != 1:
-        return False
-    rl = reduce_loops[0]
-    if not all(isinstance(c, (Load, Assign, Accum)) for c in rl.body):
-        return False
-    acc_names = {c.name for c in rl.body if isinstance(c, Accum)}
-    if not acc_names:
-        return False
-    # No stmt may read an accumulator target (online-softmax-style fusion).
-    for c in rl.body:
-        if isinstance(c, Accum):
-            continue
-        if any(d in acc_names for d in c.deps()):
+    """K-outer-matmul predicate: extent ≥ 2, ≥ 1 Stage in body, and a
+    pure-matmul reduce body with no in-loop online-softmax-style merge
+    (no body stmt reads a local Accum target's running value).
+
+    Layered on the shared ``is_matmul_k_outer`` (which handles the
+    base shape — non-reduce free Loop wrapping a single reduce with
+    a pure-compute body that has at least one Accum) plus the
+    rule-specific ``extra_gate``."""
+
+    def gate(k_outer: Loop, k_inner: Loop) -> bool:
+        if int(k_outer.axis.extent) < 2:
             return False
-    return True
+        if not any(isinstance(s, Stage) for s in k_outer.body):
+            return False
+        acc_names = {c.name for c in k_inner.body if isinstance(c, Accum)}
+        for c in k_inner.body:
+            if isinstance(c, Accum):
+                continue
+            if any(d in acc_names for d in c.deps()):
+                return False
+        return True
+
+    return is_matmul_k_outer(loop, extra_gate=gate)
 
 
 def _slab_size(stage: Stage) -> int:

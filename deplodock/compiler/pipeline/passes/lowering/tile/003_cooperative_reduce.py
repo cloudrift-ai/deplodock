@@ -68,6 +68,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
 )
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -104,10 +105,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body: tuple) -> tuple | None:
-    blocks = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
-    if len(blocks) != 1:
-        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(blocks)}")
-    idx, blk = blocks[0]
+    idx, blk = single_tile(body)
     if blk.block_axes:
         raise RuleSkipped("Tile already cooperative (block_axes non-empty)")
 

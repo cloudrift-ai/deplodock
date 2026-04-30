@@ -50,9 +50,10 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -79,10 +80,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body):
-    tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
-    if len(tiles) != 1:
-        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
-    idx, tile = tiles[0]
+    idx, tile = single_tile(body)
     new_body, changed = _chunk_in_body(tile.body, tile)
     if not changed:
         raise RuleSkipped("no matmul-shaped reduce Loop with K-divisor in candidates")
@@ -102,7 +100,7 @@ def _chunk_in_body(stmts: tuple, tile) -> tuple[tuple, bool]:
         if changed:
             out.append(s)
             continue
-        if isinstance(s, Loop) and s.is_reduce and _is_matmul_reduce(s):
+        if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
             chunked = _chunk_loop(s, tile)
             if chunked is not None:
                 out.append(chunked)
@@ -123,27 +121,6 @@ def _chunk_in_body(stmts: tuple, tile) -> tuple[tuple, bool]:
                 continue
         out.append(s)
     return tuple(out), changed
-
-
-def _is_matmul_reduce(loop: Loop) -> bool:
-    """A reduce Loop is matmul-shaped iff its immediate body has Loads
-    of two distinct buffers whose indices both reference the loop's
-    K axis. The multiply / Accum check is implicit — the only way two
-    K-indexed Loads end up in a reduce body and contribute is through a
-    fused-multiply-accumulate chain produced by lifting + fusion."""
-    K_name = loop.axis.name
-    bufs_with_K: set[str] = set()
-    for ld in loop.loads:
-        free: set[str] = set()
-        for e in ld.index:
-            free |= e.free_vars()
-        if K_name in free:
-            bufs_with_K.add(ld.input)
-    if len(bufs_with_K) < 2:
-        return False
-    # Must contain an Accum (otherwise the reduce loop's compute is
-    # pointwise — extremely unusual but guard against it).
-    return any(isinstance(s, Accum) for s in loop.body)
 
 
 def _chunk_loop(loop: Loop, tile) -> Loop | None:

@@ -58,6 +58,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import AsyncWait, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -71,10 +72,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
-    tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
-    if len(tiles) != 1:
-        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
-    idx, tile = tiles[0]
+    idx, tile = single_tile(body)
     new_tile_body = _process(tile.body)
     if new_tile_body is tile.body or new_tile_body == tile.body:
         raise RuleSkipped("no eligible K-outer Loop with async-loaded Stages to pipeline")
@@ -110,35 +108,31 @@ def _eligible(loop: Loop) -> bool:
     rule handles such reads correctly via per-cell σ-substitution and
     no longer needs the gate. ``013_double_buffer`` and ``015_pipeline
     _async`` keep their own variants for the fp32-drift reason above."""
-    if int(loop.axis.extent) < 2:
-        return False
-    stages = [s for s in loop.body if isinstance(s, Stage)]
-    # Restrict to ≥ 2 Stages (the matmul-shape case). Single-stage
-    # kernels — typically a Stage + a separate non-staged DRAM Load
-    # in the reduce body (e.g. ``k_add_3`` with the SDPA-reduce
-    # input) — produce noticeable accuracy drift when pipelined,
-    # likely because the unstaged DRAM Load hits memory at different
-    # times relative to the cp.async batch ordering. Empirically,
-    # the gain on these is small and the drift compounds across
-    # ~10 chained kernels in a transformer block.
-    if len(stages) < 2:
-        return False
-    if not all(s.async_load and s.buffer_count > 1 and not s.pipelined for s in stages):
-        return False
-    reduce_loops = [s for s in loop.body if isinstance(s, Loop) and s.is_reduce]
-    if len(reduce_loops) != 1:
-        return False
-    if len({s.buffer_count for s in stages}) != 1:
-        return False
-    # Pure-matmul reduce body: only Load/Assign/Accum, and no read of
-    # a non-locally-defined SSA name (excludes online-softmax fusions).
-    rl = reduce_loops[0]
-    if not all(isinstance(c, (Load, Assign, Accum)) for c in rl.body):
-        return False
-    local_defs = {c.name for c in rl.body if isinstance(c, (Load, Assign, Accum))}
-    if any(d not in local_defs for c in rl.body for d in c.deps()):
-        return False
-    return True
+
+    def gate(k_outer: Loop, k_inner: Loop) -> bool:
+        if int(k_outer.axis.extent) < 2:
+            return False
+        stages = [s for s in k_outer.body if isinstance(s, Stage)]
+        # Restrict to ≥ 2 Stages (the matmul-shape case). Single-stage
+        # kernels — typically a Stage + a separate non-staged DRAM Load
+        # in the reduce body (e.g. ``k_add_3`` with the SDPA-reduce
+        # input) — produce noticeable accuracy drift when pipelined,
+        # likely because the unstaged DRAM Load hits memory at different
+        # times relative to the cp.async batch ordering. Empirically,
+        # the gain on these is small and the drift compounds across
+        # ~10 chained kernels in a transformer block.
+        if len(stages) < 2:
+            return False
+        if not all(s.async_load and s.buffer_count > 1 and not s.pipelined for s in stages):
+            return False
+        if len({s.buffer_count for s in stages}) != 1:
+            return False
+        # Cross-loop-deps gate: no read of a non-locally-defined SSA name
+        # (excludes online-softmax fusions). See _eligible's docstring.
+        local_defs = {c.name for c in k_inner.body if isinstance(c, (Load, Assign, Accum))}
+        return not any(d not in local_defs for c in k_inner.body for d in c.deps())
+
+    return is_matmul_k_outer(loop, extra_gate=gate)
 
 
 def _pipeline(loop: Loop) -> list[Stmt] | None:

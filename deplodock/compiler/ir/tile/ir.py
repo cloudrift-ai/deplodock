@@ -274,6 +274,9 @@ class TileOp(Op):
         new_body = normalize_body(self.body, hoist=False)
         if new_body != self.body:
             self.body = new_body
+        n_tiles = sum(1 for s in self.body if isinstance(s, Tile))
+        if n_tiles > 1:
+            raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")
 
     def __iter__(self) -> Iterator[Stmt]:
         return iter_body(self.body)

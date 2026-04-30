@@ -41,6 +41,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Load, Loop, Stmt, StridedLoop, Tile, iter_body, map_body
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -56,10 +57,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
-    tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
-    if len(tiles) != 1:
-        raise RuleSkipped(f"need exactly one Tile in TileOp.body, found {len(tiles)}")
-    idx, tile = tiles[0]
+    idx, tile = single_tile(body)
     if any(isinstance(s, Stage) for s in iter_body(tile.body)):
         raise RuleSkipped("Tile body already has Stage stmts (idempotence)")
     if not tile.thread_axes:
