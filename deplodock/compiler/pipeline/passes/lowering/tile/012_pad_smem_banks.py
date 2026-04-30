@@ -4,7 +4,7 @@
 Problem
 =======
 
-After ``010_stage_inputs`` + ``011_merge_stages`` lay out a slab in
+After ``007_stage_inputs`` + ``011_merge_stages`` lay out a slab in
 shared memory, body Loads read the slab using thread-decoded coords.
 When the slab's per-axis stride is a multiple of 32 floats (the smem
 bank count × 4 bytes / 4 bytes per float), every thread in a warp

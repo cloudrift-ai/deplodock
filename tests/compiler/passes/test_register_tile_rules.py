@@ -1,14 +1,8 @@
 """Tests for the ``register_tile`` rule (``008_register_tile``).
 
-Two halves, mirroring the matmul / reduction / tileify rule tests:
-
-1. **Firing tests** — build a frontend graph, run the full
-   ``TILE_PASSES``, assert ``register_tile`` shows up (or doesn't) in
-   ``recording_dump.fired_rules``.
-2. **Behavior tests** — build an SDPA-shaped frontend graph and verify
-   the rule's smem-budget gate fires the right ``RuleSkipped`` reason
-   string for the dominant SDPA kernel (the one whose pre_outer
-   contains the softmax reduce loops).
+Firing tests: build a frontend graph, run the full ``TILE_PASSES``,
+assert ``register_tile`` shows up (or doesn't) in
+``recording_dump.fired_rules``.
 
 The rule's axis-aware analysis (per-stmt replication factor of 1 / F
 / F² depending on which thread axes a stmt's output depends on) is
@@ -18,8 +12,6 @@ focus on the rule's *trigger* rather than its rewrite output.
 """
 
 from __future__ import annotations
-
-import logging
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
@@ -110,12 +102,11 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
     assert "register_tile" in fired, fired
 
 
-def test_sdpa_attention_kernel_skips_via_smem_gate(caplog):
-    """The dominant SDPA kernel (softmax pre-passes + (P·V) matmul)
-    has reduce Loops in pre_outer. ``register_tile`` would F-multiply
-    each pre_outer Stage's smem; until 008 has explicit smem
-    accounting, the rule bails with a clear reason. Verify the bail
-    message is logged at DEBUG so ``-vv`` traces explain the skip."""
+def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
+    """With ``007_stage_inputs`` running before register_tile, Stages
+    stay singleton across F² and the smem budget no longer blows up on
+    SDPA's softmax-pre-pass + (P·V) matmul kernel. Both SDPA matmul
+    kernels (Q·Kᵀ and the dominant one) now fire."""
     g = Graph()
     _input(g, "q", (1, 8, 128, 64))
     _input(g, "k", (1, 8, 128, 64))
@@ -124,8 +115,5 @@ def test_sdpa_attention_kernel_skips_via_smem_gate(caplog):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    with caplog.at_level(logging.DEBUG, logger="deplodock.compiler.pipeline.engine"):
-        run_pipeline(g, TILE_PASSES)
-
-    skip_msgs = [r.message for r in caplog.records if "008_register_tile skipped" in r.message]
-    assert any("more than one reduce Loop" in m or "Cond encloses a reduce Loop" in m for m in skip_msgs), skip_msgs
+    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    assert "register_tile" in recording_dump.fired_rules("lowering/tile")

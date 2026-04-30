@@ -151,9 +151,13 @@ class Stage(Stmt):
 
     Slab geometry:
 
-    - ``origin`` — per-source-dim block-uniform anchor (length == source
-      buffer rank). Each entry is an Expr referencing only block-bound
-      Vars (``BIND_BLOCK`` axes) and Literals — no thread / cache vars.
+    - ``origin`` — per-source-dim CTA-uniform anchor (length == source
+      buffer rank). Each entry is an Expr that's constant across the
+      threads of a CTA — typically ``BIND_BLOCK`` Vars and Literals.
+      ``rebalance_threads`` may carve a slice off a BLOCK axis (binding
+      its inner part to THREAD); when that happens the inner part is
+      excluded from origin (it becomes a new cache axis instead),
+      preserving CTA-uniformity.
     - ``axes`` — cache axes (smem layout, in this order).
     - ``slab_dims`` — parallel to ``axes``; each entry is the source-
       buffer dim that the slab axis adds to. ``source_index[d] =
@@ -221,6 +225,9 @@ class Stage(Stmt):
     # current iteration's load stays in flight, overlapping DRAM with
     # FMA. Only meaningful when ``async_load`` is also set.
     pipelined: bool = False
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
 
     def exprs(self) -> tuple[Expr, ...]:
         template = self.source_index_template if self.source_index_template is not None else ()

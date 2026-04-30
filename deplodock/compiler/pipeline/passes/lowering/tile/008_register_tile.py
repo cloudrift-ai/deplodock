@@ -5,9 +5,7 @@ CTA's M×N tile (PAT × PAT threads — default ``PAT=16`` so 256 threads,
 1 output / thread). ``PAT`` (per-axis thread tile width) and ``F``
 (per-thread output factor) are both supplied by ``tuning`` via
 ``detect_pat`` / ``register_tile_factor`` and are paired through the
-``_PAT_TO_FACTOR`` table; the only PAT that fires under the default
-thread budget of 256 is ``PAT=16``, but the rule's logic is parametric
-in PAT.
+``_PAT_TO_FACTOR`` table.
 
 This pass splits each of the two ``BIND_THREAD`` axes ``a:PAT`` into
 outer ``a_o:PAT/F`` (still ``BIND_THREAD``) plus a serial ``a_i:F``
@@ -18,11 +16,10 @@ thread that nvcc can schedule in parallel registers. With ``PAT=16``
 and ``F=2`` this is per-thread output 4 (4× more FMAs per smem-load
 round-trip) at 64 threads per CTA.
 
-**Axis-aware replication of pre-K-outer stmts.** The K-inner body
-always replicates F² (one per output cell). Stmts upstream of the
-K-outer loop (sibling reduces in fused SDPA, scalar-load preambles
-in linear-bias kernels) replicate by the *thread-axis subset* their
-output depends on:
+**Axis-aware replication.** Each stmt's value transitively depends on
+some subset of {m_axis, n_axis}; the stmt is replicated F^|subset|
+times with σ-substituted indices and SSA names suffixed by the cell
+coordinate(s):
 
 ==============================  ============  =============================
 Stmt's thread-axis dependence   Replicas      Per-cell name suffix
@@ -33,33 +30,24 @@ Stmt's thread-axis dependence   Replicas      Per-cell name suffix
 ``{m_axis, n_axis}``            F²            ``"_<i>_<j>"``
 ==============================  ============  =============================
 
-Names defined locally inside the K-inner body always carry the F²
-suffix (one accumulator per output cell). Names defined upstream are
-suffixed by their dependence subset, so a K-inner cell at (i, j)
-reads ``acc_max_<i>`` (per-row dep) instead of ``acc_max_<i>_<j>``.
+This is computed via :meth:`Body.fold` over the def-use DAG with a
+bound-axis filter — see :func:`replicate_along_axis`.
 
-This generalization is what *would* let the rule fire on fused SDPA:
-the softmax pre-passes produce ``acc_max`` / ``acc_sum`` per-row, so
-they need F replicas (along m), not F², and the matmul body's reads of
-those accumulators get rewritten to the right per-cell name. SDPA is
-held off in practice by the smem gate below; the analysis itself is
-correct on that shape.
+**Stages stay singleton across F.** Because ``stage_inputs`` runs
+*before* this pass, the body already references staged smem via
+cache-local Loads. F-replication σ-substitutes the cache-axis Vars
+inside those Loads (e.g. ``Var(n_axis) → Var(n_o)*F + i``) so the F²
+output cells decode different cache-local offsets into the *same*
+slab. The Stage stmt itself is held singleton: its cache-axis names
+are excluded from its dependency contribution so the fold doesn't mark
+it for replication. Only the consumer Loads multiply.
 
 Idempotence: triggers only when exactly two ``BIND_THREAD`` axes have
 an extent that's a key in ``_PAT_TO_FACTOR`` (currently
 ``{16: 2, 32: 4, 64: 8}``). After firing, the split THREAD axis has
 extent ``pat/F`` — for every entry in the table that's exactly ``8``,
 which is deliberately *not* a candidate. So ``detect_pat`` returns
-``None`` on a second pass and the rule skips at its first gate. This
-invariant is load-bearing: any future addition to ``_PAT_TO_FACTOR``
-whose ``pat/F`` lands on another candidate's ``pat`` would re-trigger
-the rule and double-replicate the K-inner body.
-
-The replicated cells use distinct SSA names so the resulting kernel
-needs no nvcc-side scalarization — the per-cell accumulator chains are
-already independent at the IR level. ``place_inits`` (kernel pass) emits
-one ``Init`` per cell at the right scope (Tile body head, since the
-free K-outer loop is reduce-passthrough).
+``None`` on a second pass and the rule skips at its first gate.
 
 Trigger conditions:
 
@@ -67,20 +55,8 @@ Trigger conditions:
 - ``detect_pat`` matches a PAT, and ``register_tile_factor`` is
   ``F > 1`` with ``pat % F == 0``.
 - The Tile has exactly two ``BIND_THREAD`` axes with extent equal to PAT.
-- The Tile body has a top-level free ``Loop`` (the K-outer chunk loop)
-  whose body contains a single reduce ``Loop`` (the K-inner reduce)
-  with at least two distinct K-indexed buffer Loads + exactly one Accum,
-  body composed only of ``Load`` / ``Assign`` / ``Accum`` (located by
-  ``_find_matmul_k_outer``).
-- ``pre_outer`` contains no reduce Loops (the conservative smem gate —
-  replicating a pre_outer reduce's Stage F-fold blows past the 48 KB
-  smem budget after pad + double-buffer downstream; this is what
-  currently keeps SDPA on the baseline path).
-
-External SSA reads inside the K-inner body whose definitions can't be
-located in ``pre_outer`` are *not* a gate — the analysis treats them
-as un-replicated passthroughs (axes_used = ∅), which is correct for
-Tile-input buffer names, constants, and other read-only values.
+- The Tile body contains a matmul-shape reduce Loop (profitability gate —
+  without it F²-replicating gives no reuse benefit).
 """
 
 from __future__ import annotations
@@ -89,8 +65,8 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond, Loop, Select, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
+from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 from deplodock.compiler.tuning import detect_pat, register_tile_factor
@@ -130,37 +106,6 @@ def _maybe_rewrite(body: Body) -> Body | None:
     # than regress pointwise / reduce-only kernels.
     if not any(is_matmul_reduce(s) for s in tile.body.iter() if isinstance(s, Loop)):
         raise RuleSkipped("no matmul-shaped reduce in the Tile body — register tiling unprofitable")
-
-    # Conservative smem-budget gate. The transform F-replicates any
-    # Stage whose source index references a thread-axis; ``010_stage_inputs``
-    # then adds a ``cell:F`` dim to the slab, so smem grows ~F× per
-    # replicated reduce. With double-buffering and bank padding downstream,
-    # SDPA-shape bodies (multiple reduce loops or Cond-wrapped masked
-    # matmul) exceed the 48 KB consumer limit. Two patterns to skip:
-    #
-    # - More than one reduce Loop anywhere — softmax sibling reduces +
-    #   the matmul reduce.
-    # - Any Cond enclosing a reduce Loop — masked matmul (Q·Kᵀ with a
-    #   causal / attention mask) where the Stages are at the Cond's
-    #   outer scope but the body becomes F²-replicated.
-    if sum(1 for s in tile.body.iter() if isinstance(s, Loop) and s.is_reduce) > 1:
-        raise RuleSkipped(
-            "Tile body has more than one reduce Loop — F-replicating a Stage would exceed the 48 KB smem budget after pad+double-buffer"
-        )
-    for s in tile.body.iter():
-        if isinstance(s, Cond) and any(isinstance(c, Loop) and c.is_reduce for c in Body((s,)).iter()):
-            raise RuleSkipped(
-                "Cond encloses a reduce Loop — masked-matmul shape; F-replicating its body would exceed the 48 KB smem budget"
-            )
-        if isinstance(s, Select):
-            # Select encodes Expr-level masking (causal / attention masks
-            # in SDPA Q·K matmul). F-replicating a Select-bearing reduce
-            # body multiplies the surrounding Stage layout's cell-dim and
-            # blows the 48 KB consumer limit on real-world shapes
-            # (Qwen / TinyLlama attention).
-            raise RuleSkipped(
-                "Tile body contains Select — masked-matmul shape; F-replicating its Stages would exceed the 48 KB smem budget"
-            )
 
     rewritten = _register_tile(tile, target_axes[0], target_axes[1], factor)
     if rewritten is None:
@@ -224,9 +169,16 @@ def replicate_along_axis(body: Body, axis: str, factor: int, axis_o: Axis) -> Bo
     constants, axis-free producers)."""
 
     def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
+        # Stages own their cache axes — those Vars are smem-local
+        # coordinates that materialization decodes from the cooperative
+        # thread layout, not values that change per F² output cell. Treat
+        # cache-axis names as ``bound``-like so the Stage doesn't get
+        # marked as F-axis-dependent and replicated. Only its consumer
+        # Loads (which σ-rewrite the cache-axis Var) multiply across F.
+        local_bound = bound | frozenset(ax.name for ax in s.axes) if isinstance(s, Stage) else bound
         own: frozenset[str] = frozenset()
         for e in s.exprs():
-            own = own | frozenset(v for v in e.free_vars() if v not in bound)
+            own = own | frozenset(v for v in e.free_vars() if v not in local_bound)
         for c in child_T:
             if c is not None:
                 own = own | c

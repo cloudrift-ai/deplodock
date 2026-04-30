@@ -1,7 +1,7 @@
 """Merge contiguous sibling Stages at the same scope into a single
 larger slab.
 
-After per-Load staging in ``010_stage_inputs``, register-tiled matmul
+After per-Load staging in ``007_stage_inputs``, register-tiled matmul
 kernels emit one Stage per cell offset (e.g. ``p_weight_smem`` for the
 +0 offset and ``p_weight_smem_1`` for the +1 offset). Each individual
 slab covers a stride-2 access pattern; their union covers a contiguous

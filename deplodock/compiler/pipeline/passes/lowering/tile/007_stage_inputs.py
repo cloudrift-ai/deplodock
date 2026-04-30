@@ -1,5 +1,13 @@
 """Stage frequently-reused external inputs into shared memory.
 
+Runs early in the tile-lowering chain — *before* ``008_register_tile``
+and ``009_rebalance_threads`` — so the classifier sees the clean PAT ×
+PAT thread-axis layout from ``005_blockify_launch``. Downstream passes
+keep already-staged Stages intact: ``register_tile`` σ-substitutes
+cache-axis Vars in the consumer Loads (Stages stay singleton across
+F²); ``rebalance_threads`` augments Stage cache-axes when carving a
+referenced BLOCK axis.
+
 For each reduce ``Loop`` (or ``StridedLoop`` from cooperative reduce)
 in the Tile body, examine its external Loads. A Load is *stage-worthy*
 when its index does not reference at least one ``BIND_THREAD`` axis —
@@ -14,9 +22,11 @@ sitting directly in a scope, classify each Load:
   axis. Each cache axis must appear in exactly one source-buffer dim
   (no packed dims).
 - Origin = the index with all cache axes substituted to 0.
-- The cache part per dim must equal ``Var(cache_axis)`` exactly — the
-  decomposition only handles coefficient-1 affine cases (after the
-  div/mod simplifier folds collapsed-reshape indices).
+- The cache part per dim should equal ``Var(cache_axis)`` exactly under
+  the affine-decomposition form; if it doesn't (collapsed-reshape
+  views with surviving div/mod residues), fall back to
+  ``source_index_template`` — materialization decodes via Sigma at
+  cooperative-load time.
 
 Stage proposals at the same scope are grouped by
 ``(buf, origin, cache_axes, slab_dims)`` so siblings reading the same
@@ -27,8 +37,7 @@ staged smem at cache-local coordinates.
 
 Skipped silently:
 - Loads with no missing thread axis (no reuse).
-- Loads where any cache axis appears in multiple source dims, or where
-  the residue isn't ``Var(cache_axis)`` (non-affine / packed).
+- Loads where any cache axis appears in multiple source dims.
 - Slabs whose float count exceeds ``_MAX_SLAB_FLOATS``.
 """
 
