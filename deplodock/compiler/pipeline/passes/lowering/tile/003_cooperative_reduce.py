@@ -47,7 +47,10 @@ Trigger conditions:
   dim of a 4D tensor) are handled by promoting all existing thread
   axes to ``BIND_BLOCK`` alongside the synthetic cooperative ``t``.
 - ``Tile.body`` contains at least one reduce ``Loop`` whose immediate
-  body has exactly one ``Accum``.
+  body has one or more ``Accum`` stmts. Multiple Accums are permitted
+  as long as they are independent (no Accum's value transitively reads
+  another Accum's running value); online algorithms (online softmax,
+  Welford) are still punted.
 - The first reduce Loop's axis extent ≥ ``BLOCK_SIZE``.
 """
 
@@ -56,7 +59,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Loop, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Assign, Loop, StridedLoop
 from deplodock.compiler.ir.tile.ir import (
     BLOCK_SIZE,
     Combine,
@@ -67,6 +70,29 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
+
+
+def _accums_independent(body: tuple[Stmt, ...]) -> bool:
+    """True iff no Accum's value transitively depends on a prior Accum's
+    running value. Permits multiple independent Accums in one reduce
+    loop (e.g. ``sum`` + ``sum_of_squares``); rejects online algorithms
+    (online softmax, Welford) where one accumulator's update reads
+    another's running value.
+
+    Walks the body forward, maintaining a ``tainted`` set of SSA names
+    transitively derived from a prior Accum's name. An Accum whose
+    ``value`` is in ``tainted`` is dependent.
+    """
+    tainted: set[str] = set()
+    for s in body:
+        if isinstance(s, Accum):
+            if s.value in tainted:
+                return False
+            tainted.add(s.name)
+        elif isinstance(s, Assign):
+            if any(a in tainted for a in s.args):
+                tainted.add(s.name)
+    return True
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -101,8 +127,10 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     if int(reduce_loops[0].axis.extent) < BLOCK_SIZE:
         raise RuleSkipped(f"first reduce-axis extent {int(reduce_loops[0].axis.extent)} < BLOCK_SIZE={BLOCK_SIZE}")
     for rl in reduce_loops:
-        if sum(1 for s in rl.body if isinstance(s, Accum)) != 1:
-            raise RuleSkipped(f"reduce Loop {rl.axis.name!r} has multiple Accums (online algorithm — punted)")
+        if not any(isinstance(s, Accum) for s in rl.body):
+            raise RuleSkipped(f"reduce Loop {rl.axis.name!r} has no Accum")
+        if not _accums_independent(rl.body):
+            raise RuleSkipped(f"reduce Loop {rl.axis.name!r} has dependent Accums (online algorithm — punted)")
 
     t_axis = Axis("t", BLOCK_SIZE)
     t_start = Var(t_axis.name)
@@ -115,8 +143,9 @@ def _rewrite_block(blk: Tile) -> Tile | None:
         if isinstance(s, Loop):
             new_body.append(StridedLoop(axis=s.axis, start=t_start, step=step, body=s.body))
             if s.is_reduce:
-                accum = next(a for a in s.body if isinstance(a, Accum))
-                new_body.append(Combine(name=accum.name, op=accum.op))
+                for a in s.body:
+                    if isinstance(a, Accum):
+                        new_body.append(Combine(name=a.name, op=a.op))
         else:
             new_body.append(s)
 

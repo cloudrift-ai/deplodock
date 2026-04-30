@@ -1,4 +1,4 @@
-"""Tests that specific compiler rules fire on representative graphs.
+"""Tests that matmul-related compiler rules fire on representative graphs.
 
 Uses the ``recording_dump`` fixture (see ``conftest.py``) to collect
 rule names of every rewrite, with numeric ordering prefix stripped, so
@@ -10,7 +10,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
 from tests.compiler.passes.conftest import strip_rule_prefix
 
@@ -115,50 +115,7 @@ def test_pure_elementwise_does_not_fire_split_k(recording_dump):
     assert "blockify_launch" in fired
 
 
-# --- cooperative_reduce ------------------------------------------------
-# Triggers on single-buffer reductions whose first reduce-axis extent is
-# ≥ BLOCK_SIZE (256). split_matmul_k skips these (single Load), so they
-# reach cooperative_reduce unchanged.
-
-
-def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
-    """``sum(x, axis=-1)`` with K=256 → cooperative_reduce fires; matmul-
-    shape rule (split_matmul_k) does not (single-buffer reduce)."""
-    g = Graph()
-    _input(g, "x", (4, 256))
-    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
-    g.inputs = ["x"]
-    g.outputs = ["o"]
-
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
-    fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" in fired
-    assert "split_matmul_k" not in fired
-
-
-def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
-    """K=32 < BLOCK_SIZE → cooperative_reduce does not fire."""
-    g = Graph()
-    _input(g, "x", (4, 32))
-    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
-    g.inputs = ["x"]
-    g.outputs = ["o"]
-
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
-    fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" not in fired
-
-
-def test_matmul_does_not_fire_cooperative_reduce(recording_dump):
-    """Matmul-shape reduce → split_matmul_k handles K splitting; the
-    cooperative-reduce strategy is for single-buffer reductions and
-    must not fire here."""
-    run_pipeline(_make_plain_matmul(), TILE_PASSES, dump=recording_dump)
-    fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" not in fired
-
-
-# --- RuleSkipped exception path --------------------------------------
+# --- engine: RuleSkipped exception path ------------------------------
 
 
 def test_rule_skipped_logs_reason_and_continues(caplog):
