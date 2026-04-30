@@ -10,16 +10,9 @@ to assert which rules fired without coupling tests to file ordering.
 
 from __future__ import annotations
 
-import re
-
 import pytest
 
-_PREFIX_RE = re.compile(r"^\d+[a-z]?_")
-
-
-def strip_rule_prefix(name: str) -> str:
-    """Drop the numeric ordering prefix from a rule file stem."""
-    return _PREFIX_RE.sub("", name)
+from deplodock.compiler.pipeline.engine import _strip_rule_prefix as strip_rule_prefix
 
 
 class RecordingDump:

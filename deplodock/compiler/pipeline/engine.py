@@ -20,8 +20,9 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +34,13 @@ if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
 
 _PASSES_DIR = Path(__file__).parent / "passes"
+_RULE_PREFIX_RE = re.compile(r"^\d+[a-z]?_")
+
+
+def _strip_rule_prefix(name: str) -> str:
+    """Drop the numeric ordering prefix from a rule file stem
+    (``003_cooperative_reduce`` → ``cooperative_reduce``)."""
+    return _RULE_PREFIX_RE.sub("", name)
 
 logger = logging.getLogger(__name__)
 
@@ -249,9 +257,18 @@ def run_pass(
     dump: CompilerDump | None = None,
     pass_idx: int | None = None,
     pass_name: str | None = None,
+    select: Iterable[str] | None = None,
 ) -> Graph:
-    """Load all rule modules in ``pass_dir`` and apply them to fixed point."""
-    return _apply_rules(graph, _load_rules(pass_dir), dump=dump, pass_idx=pass_idx, pass_name=pass_name)
+    """Load all rule modules in ``pass_dir`` and apply them to fixed
+    point. ``select``, if given, restricts the run to rules whose name
+    (with or without the numeric ordering prefix, e.g. ``tileify`` or
+    ``001_tileify``) appears in the iterable — useful for isolating a
+    single rule's behavior in tests."""
+    rules = _load_rules(pass_dir)
+    if select is not None:
+        wanted = set(select)
+        rules = [r for r in rules if r.name in wanted or _strip_rule_prefix(r.name) in wanted]
+    return _apply_rules(graph, rules, dump=dump, pass_idx=pass_idx, pass_name=pass_name)
 
 
 def run_rule(graph: Graph, rule_path: Path) -> Graph:
@@ -537,13 +554,21 @@ def _remove_orphans(graph: Graph) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline(graph: Graph, passes: list[str], dump: CompilerDump | None = None) -> Graph:
-    """Run each named pass directory in order; dispatch ``dump.on_pass`` after each."""
+def run_pipeline(
+    graph: Graph,
+    passes: list[str],
+    dump: CompilerDump | None = None,
+    select: Iterable[str] | None = None,
+) -> Graph:
+    """Run each named pass directory in order; dispatch ``dump.on_pass``
+    after each. ``select`` is forwarded to :func:`run_pass` for every
+    pass — only rules whose name matches will run."""
     t_start = time.monotonic()
+    select_set = set(select) if select is not None else None
     for idx, name in enumerate(passes, start=1):
         t0 = time.monotonic()
         n_before = len(graph.nodes)
-        graph = run_pass(graph, _PASSES_DIR / name, dump=dump, pass_idx=idx, pass_name=name)
+        graph = run_pass(graph, _PASSES_DIR / name, dump=dump, pass_idx=idx, pass_name=name, select=select_set)
         logger.info("compile: %-18s %.2fs (%d -> %d nodes)", name, time.monotonic() - t0, n_before, len(graph.nodes))
         if dump is not None:
             dump.on_pass(idx, name, graph)
