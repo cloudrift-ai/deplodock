@@ -77,11 +77,11 @@ def tileify(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     body: list[Stmt] = list(leading)
     if output_axes:
         bound = tuple(BoundAxis(axis=ax, bind=BIND_THREAD) for ax in output_axes)
-        body.append(_lift_output_loops(Tile(axes=bound, body=tuple(inner))))
+        body.append(_lift_output_loops(Tile(axes=bound, body=inner)))
     else:
         body.extend(inner)
 
-    return TileOp(body=tuple(body), name=kernel_name)
+    return TileOp(body=body, name=kernel_name)
 
 
 def _lift_output_loops(tile: Tile) -> Tile:
@@ -106,7 +106,7 @@ def _lift_output_loops(tile: Tile) -> Tile:
             new_body.append(s)
     if not changed:
         return tile
-    return Tile(axes=tuple(new_axes), body=tuple(new_body))
+    return Tile(axes=tuple(new_axes), body=new_body)
 
 
 def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:

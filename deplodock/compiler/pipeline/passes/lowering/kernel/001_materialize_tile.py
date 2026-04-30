@@ -53,7 +53,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         else:
             new_body.append(s)
 
-    root.op = KernelOp(body=tuple(new_body), name=root.op.name)
+    root.op = KernelOp(body=new_body, name=root.op.name)
     return None
 
 
@@ -140,7 +140,7 @@ def _materialize(blk: Tile) -> Stmt:
     # the correct scope (Tile body head for reduce-only nesting, inside
     # a free Loop body when one wraps the Accum). Materialize is purely
     # mechanical from here.
-    return Tile(axes=axes, body=tuple(new_body))
+    return Tile(axes=axes, body=new_body)
 
 
 def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
@@ -164,7 +164,7 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
             inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit))
         else:
             inner.append(transform(s))
-    return replace(loop, body=tuple(inner))
+    return replace(loop, body=inner)
 
 
 def _single_thread_var(thread_axes: tuple) -> str:

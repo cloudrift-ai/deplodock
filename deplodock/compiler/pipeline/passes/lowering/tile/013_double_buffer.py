@@ -140,7 +140,7 @@ def _double_buffer(loop: Loop) -> Loop | None:
             new_body.append(dc_replace(s, body=s.body.map(_make_load_rewriter(staged_names, phase))))
         else:
             new_body.append(s)
-    return dc_replace(loop, body=tuple(new_body))
+    return dc_replace(loop, body=new_body)
 
 
 def _make_load_rewriter(staged_names: set[str], phase):

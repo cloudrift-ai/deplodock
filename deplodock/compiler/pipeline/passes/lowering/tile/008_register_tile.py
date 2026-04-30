@@ -280,7 +280,7 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
         rename = _make_rename(name_axes, k_inner_locals, target_axes, m_axis, n_axis, i, j)
         for s in k_inner.body:
             new_k_inner_body.append(s.rewrite(rename, sigma))
-    new_outer_body.append(Loop(axis=k_inner.axis, body=tuple(new_k_inner_body), unroll=k_inner.unroll))
+    new_outer_body.append(Loop(axis=k_inner.axis, body=new_k_inner_body, unroll=k_inner.unroll))
 
     # Replicate pre_outer per stmt by its axes_used.
     new_body: list[Stmt] = []
@@ -291,7 +291,7 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
             rename = _make_rename(name_axes, stmt_locals, axes, m_axis, n_axis, i, j)
             new_body.append(s.rewrite(rename, sigma))
 
-    new_body.append(Loop(axis=k_outer.axis, body=tuple(new_outer_body), unroll=k_outer.unroll))
+    new_body.append(Loop(axis=k_outer.axis, body=new_outer_body, unroll=k_outer.unroll))
 
     # Replicate post_outer F² (epilogue depends on per-cell matmul output).
     for i, j in cells_full:
@@ -300,7 +300,7 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
         for s in post_outer:
             new_body.append(s.rewrite(rename, sigma))
 
-    return Tile(axes=new_axes, body=tuple(new_body))
+    return Tile(axes=new_axes, body=new_body)
 
 
 def _build_name_axes(pre_outer: Body, target_axes: frozenset[str]) -> dict[str, frozenset[str]]:

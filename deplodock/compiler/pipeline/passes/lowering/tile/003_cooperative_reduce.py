@@ -151,4 +151,4 @@ def _rewrite_block(blk: Tile) -> Tile | None:
         BoundAxis(axis=t_axis, bind=BIND_THREAD),
         *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes),
     )
-    return Tile(axes=new_axes, body=tuple(new_body))
+    return Tile(axes=new_axes, body=new_body)

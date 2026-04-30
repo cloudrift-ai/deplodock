@@ -162,7 +162,7 @@ def _pipeline(loop: Loop) -> list[Stmt] | None:
     # stay outstanding.
     wait_remaining = len(stages)
     main_body = (*body_stages, AsyncWait(remaining=wait_remaining), *others)
-    main_loop = Loop(axis=Axis(loop.axis.name, n_chunks - 1), body=tuple(main_body), unroll=loop.unroll)
+    main_loop = Loop(axis=Axis(loop.axis.name, n_chunks - 1), body=main_body, unroll=loop.unroll)
 
     epilogue: list[Stmt] = [AsyncWait(remaining=0)]
     for s in others:
