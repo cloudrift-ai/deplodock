@@ -23,6 +23,7 @@ is already in place.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
+from functools import cached_property
 
 from deplodock.compiler.ir.stmt.base import Stmt
 
@@ -112,3 +113,29 @@ class Body(tuple[Stmt, ...]):
             else:
                 out.extend(r)
         return Body(out)
+
+    # -- def-use analysis ------------------------------------------------
+
+    @cached_property
+    def definitions(self) -> dict[str, Stmt]:
+        """Map every SSA name produced anywhere inside this body
+        (recursive) to its defining ``Stmt``.
+
+        Built once per Body via :meth:`Stmt.defines` over :meth:`iter`;
+        cached on the instance, so repeated queries (``def_of`` from
+        many call sites in a single rule) are O(1) after the first
+        access. Body is immutable, so the cache stays valid for its
+        lifetime.
+
+        Names not present in the dict are either Tile-input buffer
+        references, constants, or SSA names defined in an enclosing
+        scope outside this body — i.e. external reads.
+        """
+        return {n: s for s in self.iter() for n in s.defines()}
+
+    def def_of(self, name: str) -> Stmt | None:
+        """Return the Stmt that produces ``name`` inside this body,
+        or ``None`` if ``name`` is read but not defined locally
+        (external read). Convenience over ``self.definitions.get(name)``.
+        """
+        return self.definitions.get(name)

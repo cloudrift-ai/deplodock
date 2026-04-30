@@ -129,8 +129,7 @@ def _eligible(loop: Loop) -> bool:
             return False
         # Cross-loop-deps gate: no read of a non-locally-defined SSA name
         # (excludes online-softmax fusions). See _eligible's docstring.
-        local_defs = {n for c in k_inner.body for n in c.defines()}
-        return not any(d not in local_defs for c in k_inner.body for d in c.deps())
+        return all(k_inner.body.def_of(d) is not None for c in k_inner.body for d in c.deps())
 
     return is_matmul_k_outer(loop, extra_gate=gate)
 

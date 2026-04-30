@@ -252,7 +252,7 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
     # it picks up that stmt's own dep.
     pre_axes_used: list[frozenset[str]] = []
     for s in pre_outer:
-        defs = _collect_ssa_defs((s,))
+        defs = set(Body((s,)).definitions)
         if defs:
             axes = frozenset()
             for nm in defs:
@@ -265,10 +265,10 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
 
     # K-inner / post_outer locals get the full F² axis-dep — they're
     # produced once per output cell.
-    k_inner_locals = _collect_ssa_defs(k_inner.body)
+    k_inner_locals = set(k_inner.body.definitions)
     for nm in k_inner_locals:
         name_axes[nm] = target_axes
-    post_locals = _collect_ssa_defs(post_outer)
+    post_locals = set(post_outer.definitions)
     for nm in post_locals:
         name_axes[nm] = target_axes
 
@@ -287,7 +287,7 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
     for s, axes in zip(pre_outer, pre_axes_used, strict=True):
         for i, j in _cell_coords(axes, m_axis, n_axis, factor):
             sigma = _cell_sigma(axes, m_axis, m_o, n_axis, n_o, i, j, factor)
-            stmt_locals = _collect_ssa_defs((s,))
+            stmt_locals = set(Body((s,)).definitions)
             rename = _make_rename(name_axes, stmt_locals, axes, m_axis, n_axis, i, j)
             new_body.append(s.rewrite(rename, sigma))
 
@@ -301,15 +301,6 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | 
             new_body.append(s.rewrite(rename, sigma))
 
     return Tile(axes=new_axes, body=tuple(new_body))
-
-
-def _collect_ssa_defs(stmts: Body) -> set[str]:
-    """SSA names bound somewhere inside ``stmts``. Used to limit cell
-    renaming to locally-defined names so external references stay intact.
-    Driven by :meth:`Stmt.defines` — every name-bearing leaf reports its
-    own bindings; block stmts contribute nothing themselves but their
-    bodies are walked by ``Body.iter``."""
-    return {n for s in Body.coerce(stmts).iter() for n in s.defines()}
 
 
 def _build_name_axes(pre_outer: Body, target_axes: frozenset[str]) -> dict[str, frozenset[str]]:

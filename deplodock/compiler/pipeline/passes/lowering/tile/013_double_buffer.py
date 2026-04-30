@@ -103,11 +103,15 @@ def _is_kouter_matmul(loop: Loop) -> bool:
             return False
         if not any(isinstance(s, Stage) for s in k_outer.body):
             return False
-        acc_names = {c.name for c in k_inner.body if isinstance(c, Accum)}
+        # Reject if any non-Accum stmt reads an Accum target's running
+        # value (in-loop online-softmax-style merge). Driven by
+        # ``Body.def_of`` so the predicate is a one-liner: each dep
+        # resolves to its defining stmt; flag any that resolves to an
+        # ``Accum``.
         for c in k_inner.body:
             if isinstance(c, Accum):
                 continue
-            if any(d in acc_names for d in c.deps()):
+            if any(isinstance(k_inner.body.def_of(d), Accum) for d in c.deps()):
                 return False
         return True
 
