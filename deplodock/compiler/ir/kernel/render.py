@@ -8,8 +8,18 @@ method does the per-line emission.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.kernel.ir import KernelOp
+from deplodock.compiler.ir.kernel.ir import KernelOp, TmaDescriptor
 from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
+
+# Forward declaration of CUtensorMap as an opaque 128-byte aligned struct.
+# NVRTC doesn't ship ``<cuda.h>`` so we can't ``#include`` the official
+# definition; the kernel only takes the descriptor's address for inline
+# asm, so an opaque alias is sufficient. The 64-byte alignment matches
+# what ``cuTensorMapEncodeTiled`` produces and what the TMA hardware
+# requires for the descriptor pointer.
+_CUTENSORMAP_DECL = (
+    "struct __align__(64) CUtensorMap { unsigned long long opaque[16]; };\n"
+)
 
 _INTRINSIC_TO_CUDA: dict[str, str] = {
     "exp": "expf",
@@ -80,12 +90,23 @@ def render_kernelop(
 
     sig_parts = [f"const float* {n}" for n in kernel_op.inputs if n not in literals]
     sig_parts.extend(f"float* {n}" for n in kernel_op.outputs)
+    # TMA descriptors are passed as ``__grid_constant__`` value parameters.
+    # The kernel only takes their address (``&desc``) for inline asm, so
+    # the opaque ``CUtensorMap`` forward decl above suffices.
+    desc_names = tuple(dict.fromkeys(s.name for s in kernel_op.body.iter_of_type(TmaDescriptor)))
+    # Descriptors are passed by pointer (placed in global memory by the
+    # host) rather than ``__grid_constant__`` value parameters: cupy's
+    # arg-packing path doesn't preserve the 64-byte alignment that
+    # by-value ``CUtensorMap`` parameters require, so this avoids a
+    # CUDA_ERROR_MISALIGNED_ADDRESS at launch.
+    sig_parts.extend(f"const CUtensorMap* __restrict__ {n}" for n in desc_names)
     params_text = ", ".join(sig_parts)
     bounds = _launch_bounds_for(kernel_op)
     launch_bounds = f"\n__launch_bounds__({bounds})"
 
     body_text = "\n".join(render_body(kernel_op.body, ctx))
-    return f'extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
+    prelude = _CUTENSORMAP_DECL if desc_names else ""
+    return f'{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
 
 
 def _launch_bounds_for(kernel_op: KernelOp) -> int:

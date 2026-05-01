@@ -37,6 +37,7 @@ The compute body is ``Loop`` / ``StridedLoop`` / ``Accum`` / ``Load`` /
 
 from __future__ import annotations
 
+import enum
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
@@ -93,7 +94,8 @@ from deplodock.compiler.ir.stmt import (
 
 @dataclass
 class AsyncWait(Stmt):
-    """Synchronize with previously-issued ``AsyncBufferedStage`` loads.
+    """Synchronize with previously-issued ``AsyncBufferedStage`` /
+    ``TmaBufferedStage`` loads.
 
     ``keep`` is the number of most-recently-issued cp.async groups that
     may *remain* in flight after the wait — i.e. the PTX
@@ -104,8 +106,14 @@ class AsyncWait(Stmt):
     older chunks complete (steady-state body of a software-pipelined
     K-outer loop).
 
-    Materialization emits ``CpAsyncWait(group=keep)`` followed by
-    ``Sync()`` so the freshly-loaded smem is visible across the CTA.
+    ``phase`` is the consumer-side ring-buffer phase for TMA waits:
+    when set, materialization emits ``MbarrierWait(mbar, phase)`` for
+    each pending TMA mbar, where ``phase`` is the EXPRESSION the consumer
+    is about to read (e.g. ``K_outer % 2`` inside the pipelined main
+    loop, ``(n_chunks - 1) % 2`` for the epilogue's tail wait). Without
+    this, the materializer would have to guess from issuance-time phase
+    expressions, which leak loop-axis Vars across scopes. ``None`` means
+    "cp.async wait" — falls back to ``CpAsyncWait(keep) + Sync()``.
 
     Carrying ``keep`` explicitly (rather than re-deriving it from the
     surrounding stage count) keeps the wait correct after structural
@@ -113,14 +121,31 @@ class AsyncWait(Stmt):
     """
 
     keep: int = 0
+    phase: Expr | None = None
+    slot: Expr | None = None
+
+    def exprs(self) -> tuple[Expr, ...]:
+        out: tuple[Expr, ...] = ()
+        if self.phase is not None:
+            out = (*out, self.phase)
+        if self.slot is not None:
+            out = (*out, self.slot)
+        return out
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
-        return AsyncWait(keep=self.keep)
+        new_phase = sigma.apply(self.phase) if self.phase is not None else None
+        new_slot = sigma.apply(self.slot) if self.slot is not None else None
+        return AsyncWait(keep=self.keep, phase=new_phase, slot=new_slot)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}AsyncWait(keep={self.keep})"]
+        extra = ""
+        if self.phase is not None:
+            extra += f", phase={self.phase.pretty()}"
+        if self.slot is not None:
+            extra += f", slot={self.slot.pretty()}"
+        return [f"{indent}AsyncWait(keep={self.keep}{extra})"]
 
 
 @dataclass
@@ -215,9 +240,13 @@ class Stage(Stmt):
     descriptor copies: ``origin`` is the box-origin and ``axes``
     extents are the box-extents.
 
-    Subclasses ``BufferedStage`` and ``AsyncBufferedStage`` add buffering
-    (N rotating slabs) and async transport (cp.async + caller-owned
-    AsyncWait) respectively.
+    Transport is encoded structurally via subclass:
+
+    - ``Stage`` (this class) — synchronous cooperative ``Load+Write+Sync``.
+    - ``BufferedStage`` — N rotating smem slabs, sync transport.
+    - ``AsyncBufferedStage`` — cp.async transport, caller-owned ``AsyncWait``.
+    - ``TmaBufferedStage`` — TMA box copy issued by one elected thread,
+      mbarrier-synchronized via ``AsyncWait``.
     """
 
     name: str
@@ -349,6 +378,46 @@ class AsyncBufferedStage(BufferedStage):
         return f"{super()._pretty_extra()} async"
 
 
+class SwizzleMode(enum.Enum):
+    """TMA shared-memory swizzle pattern.
+
+    Picked by the lowering pass from inner-dim byte stride; consumed by
+    the backend's ``cuTensorMapEncodeTiled`` call. ``NONE`` is the
+    interim default until MMA-side swizzle support lands.
+    """
+
+    NONE = "NONE"
+    B32 = "B32"
+    B64 = "B64"
+    B128 = "B128"
+
+
+@dataclass
+class TmaBufferedStage(BufferedStage):
+    """Buffered stage transported via ``cp.async.bulk.tensor`` (TMA).
+
+    Materialize emits a ``TmaDescriptor`` (host-side ``CUtensorMap``,
+    hoisted to kernel prologue), an ``MbarrierInit``, and at the stage
+    site a ``Cond(tid==0, [MbarrierArriveExpectTx, TmaLoad])`` — one
+    elected thread issues the box copy. Pairs with ``AsyncWait`` which
+    lowers to ``MbarrierWait(phase)`` (no trailing ``Sync`` — mbarrier
+    arrival already provides CTA-wide visibility).
+
+    Requires sm_90+ and ``--gpu-architecture=sm_90a`` (gated by
+    ``014a_tma_copy``). Eligible only for ``AffineAddressing`` with the
+    inner source dim contiguous and 16 B aligned.
+    """
+
+    swizzle: SwizzleMode = field(default=SwizzleMode.NONE, kw_only=True)
+
+    def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
+        return {**super()._rewrite_kwargs(sigma, axis_fn), "swizzle": self.swizzle}
+
+    def _pretty_extra(self) -> str:
+        sw = "" if self.swizzle == SwizzleMode.NONE else f" swizzle={self.swizzle.value}"
+        return f"{super()._pretty_extra()} tma{sw}"
+
+
 # ---------------------------------------------------------------------------
 # Top-level: TileOp
 # ---------------------------------------------------------------------------
@@ -455,6 +524,8 @@ __all__ = [
     "Stage",
     "BufferedStage",
     "AsyncBufferedStage",
+    "TmaBufferedStage",
+    "SwizzleMode",
     "AffineAddressing",
     "TemplateAddressing",
     "AsyncWait",

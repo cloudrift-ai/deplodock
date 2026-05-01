@@ -36,10 +36,24 @@ from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, KernelOp, Smem, Sync, TreeHalve
-from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
+from deplodock.compiler.ir.kernel.ir import (
+    CpAsyncCommit,
+    CpAsyncCopy,
+    CpAsyncWait,
+    KernelOp,
+    MbarrierArriveExpectTx,
+    MbarrierInit,
+    MbarrierWait,
+    Smem,
+    Sync,
+    TmaDescriptor,
+    TmaLoad,
+    TreeHalve,
+)
+from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import (
+    BYTES_PER_ELEM,
     AffineAddressing,
     AsyncBufferedStage,
     AsyncWait,
@@ -48,6 +62,7 @@ from deplodock.compiler.ir.tile.ir import (
     Stage,
     TemplateAddressing,
     TileOp,
+    TmaBufferedStage,
 )
 from deplodock.compiler.pipeline.engine import Pattern
 
@@ -103,6 +118,17 @@ def _materialize(blk: Tile) -> Stmt:
     pending_reduce: Accum | None = None
     declared_smem: set[str] = set()
 
+    # TMA hoist state. ``descriptors`` and ``mbar_prologue`` collect the
+    # per-stage ``TmaDescriptor`` + mbar Smem + ``MbarrierInit`` so the
+    # post-walk prepends them to the Tile body. The set of distinct mbar
+    # names issued in this TileOp is captured separately and used at
+    # ``AsyncWait`` time to emit one ``MbarrierWait`` per mbar with the
+    # consumer phase carried by the AsyncWait itself (set by
+    # ``015_pipeline_async``).
+    descriptors: dict[str, TmaDescriptor] = {}
+    mbar_prologue: list[Stmt] = []
+    declared_mbar: set[str] = set()
+
     def filter_emit(stmts: list[Stmt]) -> list[Stmt]:
         out: list[Stmt] = []
         for s in stmts:
@@ -113,15 +139,99 @@ def _materialize(blk: Tile) -> Stmt:
             out.append(s)
         return out
 
+    # Distinct mbar arrays ever issued. Each entry is the per-stage
+    # mbarrier *array* name (one entry per slot of the ring buffer);
+    # waits index into it via the AsyncWait's ``slot`` expr.
+    tma_mbars: list[str] = []
+
+    def emit_async_wait(stmt: AsyncWait) -> list[Stmt]:
+        # TMA path: wait carries the explicit consumer-side phase + slot
+        # set by 015_pipeline_async — emit one MbarrierWait per distinct
+        # mbar array touched in this TileOp, all using the same (slot, phase).
+        if stmt.phase is not None and tma_mbars:
+            return [MbarrierWait(mbar=m, phase=stmt.phase, slot=stmt.slot) for m in tma_mbars]
+        # cp.async fallback (or pre-pipelining synchronous-style wait).
+        return [CpAsyncWait(group=stmt.keep), Sync()]
+
+    def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
+        desc_name = f"{stage.name}_desc"
+        mbar_name = f"{stage.name}_mbar"
+        if desc_name not in descriptors:
+            assert isinstance(stage.addressing, AffineAddressing)
+            # Box extents per source dim: product of cache extents that
+            # map to that dim (a single source dim can be spanned by
+            # multiple cache axes, e.g. matmul fragments where the
+            # M-dim is split across an outer-block axis and a
+            # per-thread fragment axis). Dims not covered by any cache
+            # axis get extent 1 — the coord supplies the origin and
+            # the slab is scalar in that dim. Total box rank ==
+            # ``len(origin)`` == ``len(src_shape)``.
+            box_per_dim: dict[int, int] = {}
+            for d, ax in zip(stage.addressing.dims, stage.axes, strict=True):
+                box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
+            box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
+            # Source shape is unknown at materialization time — the
+            # backend resolves it from the bound array at launch. Pass
+            # an empty tuple as a sentinel; descriptor encoding fills it.
+            descriptors[desc_name] = TmaDescriptor(
+                name=desc_name,
+                src_buf=stage.buf,
+                src_shape=(),
+                box_extents=box,
+                swizzle=stage.swizzle.value,
+                dtype="float",
+            )
+        if mbar_name not in declared_mbar:
+            declared_mbar.add(mbar_name)
+            # Per-slot mbarrier array — one mbar per ring-buffer slot.
+            # Multiple ``arrive.expect_tx`` on the *same* mbar within a
+            # phase accumulate into one phase rather than queuing per-slot
+            # phases, so a scalar mbar would deadlock the pipelined
+            # consumer. Init each slot's mbar in the kernel prologue.
+            mbar_prologue.append(
+                Smem(name=mbar_name, extents=(stage.buffer_count,), dtype="unsigned long long"),
+            )
+            for s in range(stage.buffer_count):
+                mbar_prologue.append(MbarrierInit(mbar=mbar_name, count=1, slot=Literal(s, "int")))
+        slab_bytes = BYTES_PER_ELEM
+        for ax in stage.axes:
+            slab_bytes *= int(ax.extent)
+        # Smem allocation: leading phase dim + cache extents (with pad).
+        full_extents = (stage.buffer_count, *stage.alloc_extents)
+        smem_index = (stage.phase, *([Literal(0, "int")] * len(stage.axes)))
+        cond = Cond(
+            cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(0, "int")),
+            body=(
+                MbarrierArriveExpectTx(mbar=mbar_name, bytes_=slab_bytes, slot=stage.phase),
+                TmaLoad(
+                    smem=stage.name,
+                    smem_index=smem_index,
+                    desc=desc_name,
+                    coords=stage.origin,
+                    mbar=mbar_name,
+                    mbar_slot=stage.phase,
+                ),
+            ),
+        )
+        if mbar_name not in tma_mbars:
+            tma_mbars.append(mbar_name)
+        # TMA destinations want 128-byte aligned smem for max-throughput
+        # box copies (16 B is the hardware minimum; 128 B is the
+        # recommended swizzle-friendly alignment).
+        return [Smem(name=stage.name, extents=full_extents, align=128), cond]
+
     for stmt in body:
-        if isinstance(stmt, Stage):
+        if isinstance(stmt, TmaBufferedStage):
+            new_body.extend(filter_emit(emit_tma_stage(stmt)))
+            pending_reduce = None
+        elif isinstance(stmt, Stage):
             new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
             pending_reduce = None
         elif isinstance(stmt, AsyncWait):
-            new_body.extend([CpAsyncWait(group=stmt.keep), Sync()])
+            new_body.extend(emit_async_wait(stmt))
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
-            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit))
+            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
             if stmt.is_reduce:
                 # Combine matching needs the Accum at the immediate-body
                 # level (single-loop reduce). For nested-reduce shapes
@@ -148,10 +258,23 @@ def _materialize(blk: Tile) -> Stmt:
     # the correct scope (Tile body head for reduce-only nesting, inside
     # a free Loop body when one wraps the Accum). Materialize is purely
     # mechanical from here.
+    #
+    # TMA prologue: descriptor decls (declarative — render to nothing in
+    # body) + mbar smem + single-thread MbarrierInit + Sync. Hoisted to
+    # the head of the Tile so every consumer of the mbar sees an
+    # initialized barrier.
+    if descriptors or mbar_prologue:
+        mbar_smems = [s for s in mbar_prologue if isinstance(s, Smem)]
+        mbar_inits = [s for s in mbar_prologue if isinstance(s, MbarrierInit)]
+        prologue: list[Stmt] = [*descriptors.values(), *mbar_smems]
+        if mbar_inits:
+            prologue.append(Cond(cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(0, "int")), body=tuple(mbar_inits)))
+            prologue.append(Sync())
+        new_body = prologue + new_body
     return Tile(axes=axes, body=new_body)
 
 
-def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
+def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait) -> Stmt:
     """Translate a body Loop or StridedLoop. Recurses so nested staging
     / loops / writes inside the body get the same uniform treatment.
     The wrapper type (Loop vs StridedLoop) is preserved — strategies
@@ -160,15 +283,20 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
     ``filter_emit`` dedupes ``Smem`` decls by name across the whole
     KernelOp body — software-pipelined ``AsyncBufferedStage``s share
     a buffer name with their prologue counterparts, and only the first
-    decl should reach the rendered kernel."""
+    decl should reach the rendered kernel.
+
+    ``emit_tma_stage`` / ``emit_async_wait`` are closures that share
+    TMA hoist + active-mbar state with the top-level walker."""
     inner: list[Stmt] = []
     for s in loop.body:
-        if isinstance(s, Stage):
+        if isinstance(s, TmaBufferedStage):
+            inner.extend(filter_emit(emit_tma_stage(s)))
+        elif isinstance(s, Stage):
             inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads)))
         elif isinstance(s, AsyncWait):
-            inner.extend([CpAsyncWait(group=s.keep), Sync()])
+            inner.extend(emit_async_wait(s))
         elif isinstance(s, (Loop, StridedLoop)):
-            inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit))
+            inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
         else:
             inner.append(transform(s))
     return replace(loop, body=inner)

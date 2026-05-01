@@ -13,6 +13,9 @@
   wrapping a single reduce Loop with a pure-compute body
   (Load / Assign / Accum + at least one Accum). Rule-specific gates
   layer on top via the ``extra_gate`` callback.
+- :func:`compute_capability` — cached query of the active CUDA device's
+  compute capability. Shared by passes that gate on hardware features
+  (``014_async_copy`` for cp.async, ``014a_tma_copy`` for TMA).
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
@@ -20,10 +23,34 @@ The file is prefixed ``_`` so the engine's rule loader skips it
 
 from __future__ import annotations
 
+import functools
+import logging
 from collections.abc import Callable
 
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.pipeline.engine import RuleSkipped
+
+_logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def compute_capability() -> tuple[int, int]:
+    """Active CUDA device's compute capability as ``(major, minor)``.
+
+    Returns ``(0, 0)`` when cupy is unavailable — callers treat that as
+    "no hardware feature support" and skip themselves via ``RuleSkipped``.
+    Cached so repeated rule firings don't re-query the driver."""
+    try:
+        import cupy as cp
+
+        dev = cp.cuda.Device()
+        # cupy returns the capability as a string ``"MMm"``: ``"86"`` for
+        # sm_86, ``"120"`` for sm_12.0. Minor is always the last digit.
+        cap = str(dev.compute_capability)
+        return (int(cap[:-1]), int(cap[-1]))
+    except Exception as e:  # pragma: no cover
+        _logger.debug("compute_capability query failed (%s)", e)
+        return (0, 0)
 
 
 def single_tile(body: Body) -> tuple[int, Tile]:

@@ -20,9 +20,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
+from deplodock.compiler.backend.cuda import _tma
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.cuda import CudaOp
+from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
 
 if TYPE_CHECKING:
     import cupy as cp
@@ -98,6 +99,7 @@ class _Launch:
     block: tuple[int, int, int]
     smem_bytes: int
     zero_outputs: tuple[str, ...]
+    tma_descriptors: tuple[TmaDescMeta, ...] = ()
 
 
 @dataclass
@@ -128,7 +130,8 @@ def _compile(graph: Graph) -> _Compiled:
             if prev_src is not None and prev_src != op.kernel_source:
                 raise ValueError(f"kernel name {kname!r} used by two distinct sources")
             seen_source[kname] = op.kernel_source
-            kernels[kname] = cp.RawKernel(op.kernel_source, kname, options=("--use_fast_math",))
+            options = _nvrtc_options(uses_tma=bool(op.tma_descriptors))
+            kernels[kname] = cp.RawKernel(op.kernel_source, kname, options=options)
         launches.append(
             _Launch(
                 node_id=node.id,
@@ -138,9 +141,24 @@ def _compile(graph: Graph) -> _Compiled:
                 block=op.block,
                 smem_bytes=op.smem_bytes,
                 zero_outputs=tuple(op.zero_outputs),
+                tma_descriptors=tuple(op.tma_descriptors),
             )
         )
     return _Compiled(bufs=bufs, buf_by_name=buf_by_name, constants=constants, kernels=kernels, launches=launches)
+
+
+def _nvrtc_options(*, uses_tma: bool) -> tuple[str, ...]:
+    """NVRTC compile options. TMA-using kernels need ``sm_<major><minor>a``
+    (the ``a`` arch unlocks ``cp.async.bulk.tensor`` PTX). Non-TMA
+    kernels keep the cupy default (capability inferred at runtime)."""
+    base = ("--use_fast_math",)
+    if not uses_tma:
+        return base
+    import cupy as cp
+
+    cap_str = str(cp.cuda.Device().compute_capability)  # e.g. "120" for sm_12.0
+    major, minor = cap_str[:-1], cap_str[-1]
+    return (*base, f"--gpu-architecture=sm_{major}{minor}a")
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +193,40 @@ def _launch(launch: _Launch, compiled: _Compiled, arrays: dict[str, cp.ndarray])
     for zname in launch.zero_outputs:
         arrays[zname].fill(0)
     kernel = compiled.kernels[launch.kernel_name]
-    args = tuple(arrays[name] for name in launch.arg_names)
+    desc_args = _build_descriptor_args(launch, arrays) if launch.tma_descriptors else {}
+    args = tuple(desc_args.get(name) if name in desc_args else arrays[name] for name in launch.arg_names)
     kernel(launch.grid, launch.block, args, shared_mem=0)
+
+
+def _build_descriptor_args(launch: _Launch, arrays: dict[str, cp.ndarray]) -> dict[str, cp.ndarray]:
+    """Encode one ``CUtensorMap`` per descriptor referenced by ``launch``
+    and stage it in a 128-byte device buffer.
+
+    The kernel signature takes ``const CUtensorMap*`` (not a by-value
+    ``__grid_constant__`` parameter) because cupy's arg-packing doesn't
+    guarantee the 64-byte alignment required for by-value descriptors.
+    Placing the descriptor in device memory and passing a pointer
+    sidesteps the alignment concern — the TMA load PTX dereferences
+    via a generic 64-bit pointer either way."""
+    import cupy as cp
+
+    out: dict[str, cp.ndarray] = {}
+    for desc in launch.tma_descriptors:
+        arr = arrays[desc.src_buf]
+        desc_bytes = _tma.encode_tiled(
+            global_address=int(arr.data.ptr),
+            src_shape=tuple(int(d) for d in arr.shape),
+            box_extents=desc.box_extents,
+            elem_size=arr.itemsize,
+            swizzle=desc.swizzle,
+        )
+        # Stage the 128 B descriptor in device memory. uint64 view keeps
+        # the buffer 8-byte aligned (cupy.ndarray allocations are
+        # typically 256-byte aligned, well above CUtensorMap's 64 B
+        # requirement).
+        d_arr = cp.asarray(np.frombuffer(desc_bytes, dtype=np.uint64))
+        out[desc.name] = d_arr
+    return out
 
 
 # ---------------------------------------------------------------------------
