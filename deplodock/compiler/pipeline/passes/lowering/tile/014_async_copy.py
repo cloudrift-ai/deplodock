@@ -1,36 +1,37 @@
-"""Mark Stages for ``cp.async`` (synchronous-style) on sm_80+.
+"""Narrow ``BufferedStage`` to ``AsyncBufferedStage`` (cp.async transport) on sm_80+.
 
-For each ``Stage`` in the Tile body, set ``async_load = True`` when:
+For each ``BufferedStage`` in the Tile body, replace it with an
+``AsyncBufferedStage`` (and append an explicit ``AsyncWait(mode='drain_all')``
+so the synchronous-style invariant — every async load dominated by a
+wait before its consumer — holds even without pipelining) when:
 
 - The target GPU's compute capability is sm_80 or higher (Ampere+).
 - The slab footprint is large enough that the commit/wait overhead
   amortizes (currently ``≥ 4 elements per thread per Stage``).
 
-The materializer's ``_emit_stage`` then replaces the per-thread
-``Load(reg) + Write(smem)`` pair with ``CpAsyncCopy`` (a single PTX
-instruction that DMAs DRAM → smem without a register temp), trailing
-``CpAsyncCommit`` + ``CpAsyncWait(0)``. The surrounding ``Sync``
-remains — ``cp.async.wait_group`` only synchronizes per-thread, not
-across the CTA.
+The materializer expands ``AsyncBufferedStage`` to ``Smem`` +
+cooperative ``CpAsyncCopy`` + ``CpAsyncCommit`` only (no implicit wait
+or sync); the explicit ``AsyncWait`` lowers to ``CpAsyncWait(group=0)``
++ ``Sync()``. The pipelining pass (``015_pipeline_async``) then drops
+these synchronous-style waits and re-emits them at the pipelined
+schedule positions.
 
-This is the synchronous form of ``cp.async``. The pipelined / overlap
-form (``wait_group(N)`` staggering across iterations of a
-double-buffered K-outer loop) is a separate follow-up that will reuse
-the same ``async_load`` flag plus a ``CpAsyncWait`` reordering pass.
+Requires the upstream ``013_double_buffer`` pass to have promoted
+plain ``Stage`` to ``BufferedStage``: cp.async without ``buffer_count >= 2``
+gives no overlap, so a sync ``Stage`` is intentionally not eligible.
 
-Idempotence: a Stage with ``async_load`` already set is left alone.
+Idempotence: an ``AsyncBufferedStage`` is left alone.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
-from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import Stage, TileOp
+from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, AsyncWait, BufferedStage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
@@ -88,24 +89,42 @@ def _maybe_rewrite(body: Body) -> Body | None:
 
 
 def _process(body: Body, n_threads: int) -> Body:
-    """Walk a body. Mark eligible Stages async; recurse into free Loops
-    so Stages inside (e.g. the K-outer chunk loop) get processed."""
-    new_body: list[Stmt] = list(body)
+    """Walk a body. Narrow eligible ``BufferedStage`` to
+    ``AsyncBufferedStage``, inserting a trailing ``AsyncWait(drain_all)``
+    so consumers see the loaded slab. Recurse into free Loops so Stages
+    inside (e.g. the K-outer chunk loop) get processed."""
+    new_body: list[Stmt] = []
     changed = False
-    for i, s in enumerate(body):
-        if isinstance(s, Stage) and not s.async_load:
-            if _eligible(s, n_threads):
-                new_body[i] = dc_replace(s, async_load=True)
-                changed = True
+    for s in body:
+        if isinstance(s, BufferedStage) and not isinstance(s, AsyncBufferedStage) and _eligible(s, n_threads):
+            new_body.append(
+                AsyncBufferedStage(
+                    name=s.name,
+                    buf=s.buf,
+                    origin=s.origin,
+                    axes=s.axes,
+                    slab_dims=s.slab_dims,
+                    source_index_template=s.source_index_template,
+                    pad=s.pad,
+                    buffer_count=s.buffer_count,
+                    phase=s.phase,
+                )
+            )
+            new_body.append(AsyncWait(mode="drain_all"))
+            changed = True
         elif isinstance(s, Loop):
             inner = _process(s.body, n_threads)
             if inner is not s.body and inner != s.body:
-                new_body[i] = dc_replace(s, body=inner)
+                new_body.append(Loop(axis=s.axis, body=inner, unroll=s.unroll))
                 changed = True
+            else:
+                new_body.append(s)
+        else:
+            new_body.append(s)
     return tuple(new_body) if changed else body
 
 
-def _eligible(stage: Stage, n_threads: int) -> bool:
+def _eligible(stage: BufferedStage, n_threads: int) -> bool:
     slab_floats = 1
     for ax in stage.axes:
         slab_floats *= int(ax.extent)

@@ -1,10 +1,11 @@
 """Ping-pong double-buffering for K-outer staged matmul kernels.
 
 For a Tile body shaped like ``Loop(K_outer, body=[Stage*, reduce])``,
-this pass marks each Stage with ``buffer_count = 2`` and a phase
-expression ``Var(K_outer_axis) % 2``. The materializer then doubles the
-smem allocation and prepends the phase to both the cooperative-load
-write and every body Load that reads from the staged buffer.
+this pass replaces each ``Stage`` with a ``BufferedStage`` carrying
+``buffer_count = 2`` and a phase expression ``Var(K_outer_axis) % 2``.
+The materializer then doubles the smem allocation and prepends the
+phase to both the cooperative-load write and every body Load that
+reads from the staged buffer.
 
 The win comes from removing the leading ``__syncthreads`` between
 prev-compute and next-load: with ping-pong, consecutive iterations
@@ -29,7 +30,7 @@ Trigger:
   to fit the per-block dynamic smem cap on Ada / Hopper consumer
   parts).
 
-Idempotence: a Stage with ``buffer_count > 1`` is left alone.
+Idempotence: a Stage that's already a ``BufferedStage`` is left alone.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from dataclasses import replace as dc_replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import Stage, TileOp
+from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
 
@@ -75,7 +76,7 @@ def _process_scope(body: Body) -> Body:
             continue
         if not _is_kouter_matmul(s):
             continue
-        if any(st.buffer_count > 1 for st in s.body if isinstance(st, Stage)):
+        if any(isinstance(st, BufferedStage) for st in s.body):
             continue
         stages = [st for st in s.body if isinstance(st, Stage)]
         total_floats = sum(_slab_size(st) for st in stages)
@@ -126,16 +127,29 @@ def _slab_size(stage: Stage) -> int:
 
 
 def _double_buffer(loop: Loop) -> Loop | None:
-    """Set buffer_count + phase on each Stage in the loop body, and
-    rewrite each body Load that reads from a staged buffer to prepend
-    the phase index."""
+    """Promote each ``Stage`` in the loop body to ``BufferedStage`` with
+    ``buffer_count=2`` and a shared phase expression, and rewrite each
+    body Load that reads from a staged buffer to prepend the phase
+    index."""
     phase = Var(loop.axis.name) % Literal(_BUFFER_COUNT, "int")
     staged_names: set[str] = set()
     new_body: list[Stmt] = []
     for s in loop.body:
         if isinstance(s, Stage):
             staged_names.add(s.name)
-            new_body.append(dc_replace(s, buffer_count=_BUFFER_COUNT, phase=phase))
+            new_body.append(
+                BufferedStage(
+                    name=s.name,
+                    buf=s.buf,
+                    origin=s.origin,
+                    axes=s.axes,
+                    slab_dims=s.slab_dims,
+                    source_index_template=s.source_index_template,
+                    pad=s.pad,
+                    buffer_count=_BUFFER_COUNT,
+                    phase=phase,
+                )
+            )
         elif isinstance(s, Loop) and s.is_reduce:
             new_body.append(dc_replace(s, body=s.body.map(_make_load_rewriter(staged_names, phase))))
         else:

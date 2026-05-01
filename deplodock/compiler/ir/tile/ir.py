@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from typing import Literal as _Literal
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.base import Op
@@ -91,30 +92,38 @@ from deplodock.compiler.ir.stmt import (
 # come from ``ir.stmt`` directly; Tile IR doesn't add a wrapper.
 
 
+AsyncWaitMode = _Literal["drain_all", "keep_latest_chunk"]
+
+
 @dataclass
 class AsyncWait(Stmt):
-    """Wait for outstanding ``cp.async`` groups to drain past
-    ``remaining`` (i.e. block until at most ``remaining`` async groups
-    are still in flight) and barrier the CTA.
+    """Synchronize with previously-issued ``AsyncBufferedStage`` loads.
 
-    Materialization emits ``CpAsyncWait(remaining)`` followed by
-    ``Sync()``. The wait is per-thread (drains *this* thread's queue);
-    the Sync makes the freshly-loaded smem visible to all threads in
-    the CTA before any of them reads it.
+    ``mode`` carries the *intent*; materialization counts the
+    ``AsyncBufferedStage`` siblings issued in the enclosing scope since
+    the prior ``AsyncWait`` to derive the PTX ``cp.async.wait_group N``:
 
-    Used by the software-pipeline pass to express "compute on chunk N
-    can begin once chunk N's load completes, but chunk N+1's load is
-    allowed to remain outstanding"."""
+    - ``"drain_all"`` — block until every outstanding cp.async group
+      has completed (PTX ``wait_group(0)``). Used in epilogues and as
+      the synchronous-style wait when no pipelining is in play.
+    - ``"keep_latest_chunk"`` — block until only the most recently
+      issued chunk's groups remain in flight. Used in the steady-state
+      body of a software-pipelined K-outer loop so chunk N+1's loads
+      stay outstanding while chunk N's compute runs.
 
-    remaining: int = 0
+    Materialization emits ``CpAsyncWait(group=N)`` followed by
+    ``Sync()`` so the freshly-loaded smem is visible across the CTA.
+    """
+
+    mode: AsyncWaitMode = "drain_all"
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
-        return AsyncWait(remaining=self.remaining)
+        return AsyncWait(mode=self.mode)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}AsyncWait(remaining={self.remaining})"]
+        return [f"{indent}AsyncWait(mode={self.mode!r})"]
 
 
 @dataclass
@@ -149,6 +158,12 @@ class Stage(Stmt):
     into a named local buffer for reuse across the surrounding ``Tile``
     body.
 
+    Synchronous, single-slot form. Materialization emits a leading
+    ``Sync`` (so iter-N compute can finish reading before iter-N+1
+    overwrites smem) plus a cooperative ``Load+Write`` pair and a
+    trailing ``Sync`` so the freshly-loaded smem is visible to all
+    threads in the CTA.
+
     Slab geometry:
 
     - ``origin`` — per-source-dim CTA-uniform anchor (length == source
@@ -173,8 +188,9 @@ class Stage(Stmt):
     descriptor copies: ``origin`` is the box-origin and ``axes``
     extents are the box-extents.
 
-    Doesn't commit to storage class — materialization picks (smem in
-    today's path; TMA / async-copy paths possible in the future).
+    Subclasses ``BufferedStage`` and ``AsyncBufferedStage`` add buffering
+    (N rotating slabs) and async transport (cp.async + caller-owned
+    AsyncWait) respectively.
     """
 
     name: str
@@ -196,72 +212,83 @@ class Stage(Stmt):
     # 32-way bank conflicts that arise when adjacent threads stride through
     # power-of-2 multiples of bank width.
     pad: tuple[int, ...] = ()
-    # Number of distinct smem buffers allocated for this Stage. ``1`` is the
-    # ordinary single-buffer form. ``> 1`` enables ping-pong: each iteration
-    # of the surrounding K-outer loop writes to slab ``[phase, ...]`` and
-    # reads from the same. With ``buffer_count == 2`` and ``phase`` set to
-    # an expression like ``a5 % 2``, consecutive iterations write to
-    # different physical buffers, eliminating the leading
-    # ``__syncthreads`` between prev-compute and next-load (because
-    # they target different memory regions).
-    buffer_count: int = 1
-    # Expression naming the phase index for double-buffered Stages. Must
-    # be set when ``buffer_count > 1``. Typically ``Var(K_outer_axis) %
-    # buffer_count``.
-    phase: Expr | None = None
-    # When True, the cooperative load uses ``cp.async.cg.shared.global``
-    # (one PTX instruction per thread per element) instead of
-    # ``Load(reg) + Write(smem)``. Saves a register temp and uses the
-    # async DRAM→smem path. Materialize emits a trailing
-    # ``cp.async.commit_group`` + ``cp.async.wait_group(0)`` so the
-    # behavior is synchronous w.r.t. the surrounding ``Sync``. Requires
-    # sm_80+; the async-codegen pass sets this only when the target
-    # supports it.
-    async_load: bool = False
-    # When True, this Stage participates in a software-pipelined
-    # K-outer loop: the cooperative load is issued + committed but
-    # *not* waited on. A surrounding ``AsyncWait`` Stmt (typically with
-    # ``remaining = buffer_count - 1``) drains older groups while the
-    # current iteration's load stays in flight, overlapping DRAM with
-    # FMA. Only meaningful when ``async_load`` is also set.
-    pipelined: bool = False
 
     def deps(self) -> tuple[str, ...]:
         return ()
 
     def exprs(self) -> tuple[Expr, ...]:
         template = self.source_index_template if self.source_index_template is not None else ()
-        phase = (self.phase,) if self.phase is not None else ()
-        return (*self.origin, *template, *phase)
+        return (*self.origin, *template)
+
+    def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
+        """Common kwargs for subtype-preserving rewrite. Subclasses extend."""
+        new_template = tuple(sigma.apply(e) for e in self.source_index_template) if self.source_index_template is not None else None
+        return dict(
+            name=self.name,
+            buf=self.buf,
+            origin=tuple(sigma.apply(e) for e in self.origin),
+            axes=tuple(axis_fn(a) for a in self.axes),
+            slab_dims=self.slab_dims,
+            source_index_template=new_template,
+            pad=self.pad,
+        )
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
-        new_origin = tuple(sigma.apply(e) for e in self.origin)
-        new_axes = tuple(axis_fn(a) for a in self.axes)
-        new_template = tuple(sigma.apply(e) for e in self.source_index_template) if self.source_index_template is not None else None
-        return Stage(
-            name=self.name,
-            buf=self.buf,
-            origin=new_origin,
-            axes=new_axes,
-            slab_dims=self.slab_dims,
-            source_index_template=new_template,
-            pad=self.pad,
-            buffer_count=self.buffer_count,
-            phase=sigma.apply(self.phase) if self.phase is not None else None,
-            async_load=self.async_load,
-            pipelined=self.pipelined,
-        )
+        return type(self)(**self._rewrite_kwargs(sigma, axis_fn))
 
     def pretty(self, indent: str = "") -> list[str]:
         origin = ", ".join(e.pretty() for e in self.origin)
         slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.slab_dims, strict=True))
         pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
-        buf = f" buffers={self.buffer_count}@{self.phase.pretty()}" if self.buffer_count > 1 and self.phase is not None else ""
-        async_tag = " async" if self.async_load else ""
-        pipe_tag = " pipelined" if self.pipelined else ""
-        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}{buf}{async_tag}{pipe_tag}"]
+        return [f"{indent}{self.name} = {type(self).__name__}({self.buf}, origin=({origin}), slab=({slab})){pad}{self._pretty_extra()}"]
+
+    def _pretty_extra(self) -> str:
+        return ""
+
+
+@dataclass
+class BufferedStage(Stage):
+    """Stage with ``buffer_count`` rotating smem slabs selected by ``phase``.
+
+    Sync transport (cooperative ``Load + Write``); the leading
+    ``__syncthreads`` between prev-compute and next-load is dropped
+    because consecutive iterations write to different physical slabs.
+
+    ``buffer_count >= 2`` is enforced. ``phase`` is required and
+    typically ``Var(K_outer_axis) % buffer_count``.
+    """
+
+    buffer_count: int = field(default=2, kw_only=True)
+    phase: Expr = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        if self.buffer_count < 2:
+            raise ValueError(f"BufferedStage {self.name!r}: buffer_count must be >= 2, got {self.buffer_count}")
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return (*super().exprs(), self.phase)
+
+    def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
+        return {**super()._rewrite_kwargs(sigma, axis_fn), "buffer_count": self.buffer_count, "phase": sigma.apply(self.phase)}
+
+    def _pretty_extra(self) -> str:
+        return f" buffers={self.buffer_count}@{self.phase.pretty()}"
+
+
+@dataclass
+class AsyncBufferedStage(BufferedStage):
+    """Buffered stage transported via ``cp.async``.
+
+    Materialize emits ``Smem`` + cooperative ``CpAsyncCopy`` +
+    ``CpAsyncCommit`` only — *no* implicit wait, *no* ``Sync``. The
+    caller must dominate every consumer with an ``AsyncWait`` Stmt.
+    Requires sm_80+ (gated by ``014_async_copy``).
+    """
+
+    def _pretty_extra(self) -> str:
+        return f"{super()._pretty_extra()} async"
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +395,10 @@ __all__ = [
     "Tile",
     "Combine",
     "Stage",
+    "BufferedStage",
+    "AsyncBufferedStage",
     "AsyncWait",
+    "AsyncWaitMode",
     # Bindings
     "BoundAxis",
     "BIND_THREAD",

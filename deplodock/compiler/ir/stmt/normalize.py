@@ -370,13 +370,14 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
         return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value)
     if isinstance(stmt, Load):
         return Load(stmt.name, stmt.input, _simplify_expr_tuple(stmt.index, ctx))
-    # Tile-IR-only ``Stage`` carries Exprs in ``origin`` / ``source_index_template``.
+    # Tile-IR-only ``Stage`` (+ BufferedStage / AsyncBufferedStage subtypes)
+    # carries Exprs in ``origin`` / ``source_index_template`` / ``phase``.
     # Lazy import to avoid a tile→stmt circular at module load time.
-    from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import BufferedStage, Stage  # noqa: PLC0415
 
     if isinstance(stmt, Stage):
         new_template = _simplify_expr_tuple(stmt.source_index_template, ctx) if stmt.source_index_template is not None else None
-        return Stage(
+        kwargs = dict(
             name=stmt.name,
             buf=stmt.buf,
             origin=_simplify_expr_tuple(stmt.origin, ctx),
@@ -384,11 +385,11 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
             slab_dims=stmt.slab_dims,
             source_index_template=new_template,
             pad=stmt.pad,
-            buffer_count=stmt.buffer_count,
-            phase=stmt.phase.simplify(ctx) if stmt.phase is not None else None,
-            async_load=stmt.async_load,
-            pipelined=stmt.pipelined,
         )
+        if isinstance(stmt, BufferedStage):
+            kwargs["buffer_count"] = stmt.buffer_count
+            kwargs["phase"] = stmt.phase.simplify(ctx)
+        return type(stmt)(**kwargs)
     # Assign / Accum / Combine carry only SSA names — no Expr field to simplify.
     return stmt
 

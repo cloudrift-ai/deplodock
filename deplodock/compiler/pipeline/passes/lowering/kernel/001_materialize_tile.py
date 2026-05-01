@@ -39,7 +39,7 @@ from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, KernelOp, Smem, Sync, TreeHalve
 from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, StridedLoop, Tile, Write
-from deplodock.compiler.ir.tile.ir import AsyncWait, Combine, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, AsyncWait, BufferedStage, Combine, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -93,6 +93,11 @@ def _materialize(blk: Tile) -> Stmt:
     new_body: list[Stmt] = []
     pending_reduce: Accum | None = None
     declared_smem: set[str] = set()
+    # Count of ``AsyncBufferedStage`` commits issued in the current body
+    # walk since the most recent ``AsyncWait``. ``keep_latest_chunk``
+    # lowers to ``CpAsyncWait(group=count)`` so the just-issued chunk
+    # remains in flight while older chunks drain.
+    async_count = [0]
 
     def filter_emit(stmts: list[Stmt]) -> list[Stmt]:
         out: list[Stmt] = []
@@ -107,10 +112,12 @@ def _materialize(blk: Tile) -> Stmt:
     for stmt in body:
         if isinstance(stmt, Stage):
             new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
+            if isinstance(stmt, AsyncBufferedStage):
+                async_count[0] += 1
             pending_reduce = None
         elif isinstance(stmt, AsyncWait):
-            new_body.append(CpAsyncWait(group=stmt.remaining))
-            new_body.append(Sync())
+            new_body.extend(_lower_async_wait(stmt, async_count[0]))
+            async_count[0] = 0
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit))
@@ -150,21 +157,42 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
     decided the iteration shape; materialization just walks.
 
     ``filter_emit`` dedupes ``Smem`` decls by name across the whole
-    KernelOp body — pipelined Stages share a buffer name with their
-    prologue counterparts, and only the first decl should reach the
-    rendered kernel."""
+    KernelOp body — software-pipelined ``AsyncBufferedStage``s share
+    a buffer name with their prologue counterparts, and only the first
+    decl should reach the rendered kernel."""
     inner: list[Stmt] = []
+    async_count = 0
     for s in loop.body:
         if isinstance(s, Stage):
             inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads)))
+            if isinstance(s, AsyncBufferedStage):
+                async_count += 1
         elif isinstance(s, AsyncWait):
-            inner.append(CpAsyncWait(group=s.remaining))
-            inner.append(Sync())
+            inner.extend(_lower_async_wait(s, async_count))
+            async_count = 0
         elif isinstance(s, (Loop, StridedLoop)):
             inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit))
         else:
             inner.append(transform(s))
     return replace(loop, body=inner)
+
+
+def _lower_async_wait(stmt: AsyncWait, async_count: int) -> list[Stmt]:
+    """Lower an ``AsyncWait`` to ``CpAsyncWait(group=N) + Sync()``.
+
+    For ``mode='drain_all'`` N is 0 (block until every outstanding
+    cp.async group has completed). For ``mode='keep_latest_chunk'`` N
+    is the count of ``AsyncBufferedStage`` commits issued in this
+    body walk since the previous ``AsyncWait`` — leaving exactly the
+    just-issued chunk's groups in flight.
+    """
+    if stmt.mode == "drain_all":
+        n = 0
+    elif stmt.mode == "keep_latest_chunk":
+        n = async_count
+    else:
+        raise ValueError(f"unknown AsyncWait mode {stmt.mode!r}")
+    return [CpAsyncWait(group=n), Sync()]
 
 
 def _single_thread_var(thread_axes: tuple) -> str:
@@ -278,13 +306,11 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
         source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
 
-    # Double-buffering: prepend a phase dim to the smem allocation and to
+    # Buffered stages prepend a phase dim to the smem allocation and to
     # both the cooperative-load write index and (downstream) every body
     # Load. The leading Sync is dropped — ping-pong avoids the
     # prev-compute / next-load conflict by using different physical buffers.
-    if stage.buffer_count > 1:
-        if stage.phase is None:
-            raise ValueError(f"Stage {stage.name!r} has buffer_count={stage.buffer_count} but no phase expr")
+    if isinstance(stage, BufferedStage):
         full_extents = (stage.buffer_count, *padded_extents)
         smem_index = (stage.phase, *smem_index)
         prelude: list[Stmt] = []  # leading Sync omitted
@@ -292,18 +318,17 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         full_extents = padded_extents
         prelude = [Sync()]
 
-    if stage.async_load:
+    if isinstance(stage, AsyncBufferedStage):
+        # Async transport: emit cooperative cp.async + commit only. The
+        # sibling ``AsyncWait`` Stmt that dominates every consumer
+        # lowers to ``CpAsyncWait + Sync``; no implicit wait here.
         cooperative_load = StridedLoop(
             axis=iter_axis,
             start=tid_expr,
             step=Literal(n_threads, "int"),
             body=(CpAsyncCopy(smem=stage.name, smem_index=smem_index, src=stage.buf, src_index=source_index),),
         )
-        # Pipelined: only commit; a sibling AsyncWait drains older groups
-        # later. Synchronous-style: commit + wait_group(0) + Sync inline.
-        if stage.pipelined:
-            return [Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit()]
-        return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit(), CpAsyncWait(group=0), Sync()]
+        return [Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit()]
 
     load_name = f"{stage.name}_v"
     cooperative_load = StridedLoop(
