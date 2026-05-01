@@ -410,6 +410,17 @@ class TmaBufferedStage(BufferedStage):
 
     swizzle: SwizzleMode = field(default=SwizzleMode.NONE, kw_only=True)
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # TMA box copies write rows back-to-back at the cache extent;
+        # bank-conflict ``+1`` padding (set by ``014c_pad_smem_banks`` for
+        # cp.async / sync stages) would put body Loads' padded stride out
+        # of step with the unpadded box write. The pad pass already skips
+        # ``TmaBufferedStage`` — this assertion catches any future caller
+        # that constructs a TMA stage with stale pad.
+        if self.pad and any(self.pad):
+            raise ValueError(f"TmaBufferedStage {self.name!r}: pad must be empty, got {self.pad!r}")
+
     def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
         return {**super()._rewrite_kwargs(sigma, axis_fn), "swizzle": self.swizzle}
 

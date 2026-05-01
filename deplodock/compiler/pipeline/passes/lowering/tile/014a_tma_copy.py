@@ -93,13 +93,10 @@ def _process(body: Body) -> Body:
             and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage))
             and _eligible(s)
         ):
-            # Drop ``pad`` when converting to TMA: bank-conflict padding
-            # (set by 012_pad_smem_banks) gives smem rows a stride larger
-            # than the cache extent, but TMA box copies write rows back-
-            # to-back at the cache extent — pad would make body Loads
-            # (which use the padded stride) read the wrong offsets. TMA
-            # hardware uses its own swizzling for bank avoidance, so the
-            # pad is unnecessary for TMA-target slabs.
+            # The pad pass (``014c_pad_smem_banks``) runs AFTER this rule
+            # and skips TmaBufferedStage by class, so this conversion sees
+            # ``s.pad == ()`` and can pass it through. ``TmaBufferedStage``
+            # also asserts ``pad`` is empty, which catches regressions.
             new_body.append(
                 TmaBufferedStage(
                     name=s.name,
@@ -107,7 +104,7 @@ def _process(body: Body) -> Body:
                     origin=s.origin,
                     axes=s.axes,
                     addressing=s.addressing,
-                    pad=(),
+                    pad=s.pad,
                     buffer_count=s.buffer_count,
                     phase=s.phase,
                 )

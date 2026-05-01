@@ -68,7 +68,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
 from deplodock.compiler.ir.expr import affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, BufferedStage, Stage, TileOp, TmaBufferedStage
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
@@ -115,7 +115,12 @@ def _process_body(body: Body, thread_axes: tuple[Axis, ...]) -> Body:
     new_body: list[Stmt] = list(body)
     changed = False
     for i, s in enumerate(body):
-        if isinstance(s, Stage) and not (s.pad and any(s.pad)):
+        # Skip TmaBufferedStage: TMA box copies write rows back-to-back at
+        # the cache extent and use hardware swizzling for bank avoidance,
+        # so ``+1`` padding would mis-align body Loads' stride with the
+        # box write. The TmaBufferedStage class also asserts ``pad`` is
+        # empty.
+        if isinstance(s, Stage) and not isinstance(s, TmaBufferedStage) and not (s.pad and any(s.pad)):
             loads = _loads_reading(body, s.name)
             if not loads:
                 continue
@@ -140,14 +145,23 @@ def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> 
     n = len(stage.axes)
     base_extents = tuple(int(ax.extent) for ax in stage.axes)
 
+    # Body Loads on a ``BufferedStage`` have one extra leading index dim
+    # (the ``phase``/slot expr added by ``013_double_buffer``). Phase is
+    # uniform across threads in any given iteration, so it shifts every
+    # thread's address by the same amount and doesn't affect bank
+    # distribution — strip it and analyze the trailing cache-axis dims.
+    is_buffered = isinstance(stage, BufferedStage)
+    expected_index_len = n + 1 if is_buffered else n
+
     # Precompute per-Load affine coefficients of the index over thread-axis vars.
     # Bail conservatively if any Load is non-affine in those vars.
     thread_var_set = frozenset(ax.name for ax in thread_axes)
     per_load_coeffs: list[list[dict[str, int]]] = []
     for load in loads:
-        if len(load.index) != n:
+        if len(load.index) != expected_index_len:
             return None
-        forms = [affine_form(e, thread_var_set) for e in load.index]
+        cache_index = load.index[1:] if is_buffered else load.index
+        forms = [affine_form(e, thread_var_set) for e in cache_index]
         if any(f is None for f in forms):
             return None
         per_load_coeffs.append([coeffs for _, coeffs in forms if (_, coeffs) is not None])  # type: ignore[misc]
