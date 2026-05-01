@@ -177,7 +177,7 @@ flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`.
 | `Stage`               | Sync, single-slot smem cache of an input slab. Materialize emits leading `Sync` + cooperative `Load+Write` + trailing `Sync`.        |
 | `BufferedStage`       | `Stage` subtype with `buffer_count >= 2` rotating slabs selected by `phase`. Sync transport, ping-pong slabs (no leading `Sync`).    |
 | `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async`; emits `Smem`+`CpAsyncCopy`+`CpAsyncCommit` only — caller must dominate consumers with `AsyncWait`. |
-| `AsyncWait`           | Sync point for outstanding cp.async groups. `mode='drain_all'` (wait_group(0)) or `'keep_latest_chunk'` (count derived structurally). |
+| `AsyncWait`           | Sync point for outstanding cp.async groups. `keep` is the `wait_group` argument: `0` drains all; `len(stages)` leaves the just-issued chunk in flight. |
 | `Combine`             | Cross-thread collapse of an `Accum` target (post reduce loop).                                                                       |
 
 ## `kernel/`

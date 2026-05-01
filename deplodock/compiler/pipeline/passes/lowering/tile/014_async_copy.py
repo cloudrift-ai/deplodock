@@ -1,7 +1,7 @@
 """Narrow ``BufferedStage`` to ``AsyncBufferedStage`` (cp.async transport) on sm_80+.
 
 For each ``BufferedStage`` in the Tile body, replace it with an
-``AsyncBufferedStage`` (and append an explicit ``AsyncWait(mode='drain_all')``
+``AsyncBufferedStage`` (and append an explicit ``AsyncWait(keep=0)``
 so the synchronous-style invariant — every async load dominated by a
 wait before its consumer — holds even without pipelining) when:
 
@@ -110,7 +110,7 @@ def _process(body: Body, n_threads: int) -> Body:
                     phase=s.phase,
                 )
             )
-            new_body.append(AsyncWait(mode="drain_all"))
+            new_body.append(AsyncWait(keep=0))
             changed = True
         elif isinstance(s, Loop):
             inner = _process(s.body, n_threads)

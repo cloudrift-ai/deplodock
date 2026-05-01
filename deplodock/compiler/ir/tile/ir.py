@@ -39,7 +39,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Literal as _Literal
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.base import Op
@@ -92,38 +91,36 @@ from deplodock.compiler.ir.stmt import (
 # come from ``ir.stmt`` directly; Tile IR doesn't add a wrapper.
 
 
-AsyncWaitMode = _Literal["drain_all", "keep_latest_chunk"]
-
-
 @dataclass
 class AsyncWait(Stmt):
     """Synchronize with previously-issued ``AsyncBufferedStage`` loads.
 
-    ``mode`` carries the *intent*; materialization counts the
-    ``AsyncBufferedStage`` siblings issued in the enclosing scope since
-    the prior ``AsyncWait`` to derive the PTX ``cp.async.wait_group N``:
+    ``keep`` is the number of most-recently-issued cp.async groups that
+    may *remain* in flight after the wait — i.e. the PTX
+    ``cp.async.wait_group N`` argument. ``keep=0`` drains every
+    outstanding group (epilogue / synchronous-style use). ``keep=K``
+    where K equals the number of ``AsyncBufferedStage`` issued per
+    pipelined iteration leaves the just-issued chunk in flight while
+    older chunks complete (steady-state body of a software-pipelined
+    K-outer loop).
 
-    - ``"drain_all"`` — block until every outstanding cp.async group
-      has completed (PTX ``wait_group(0)``). Used in epilogues and as
-      the synchronous-style wait when no pipelining is in play.
-    - ``"keep_latest_chunk"`` — block until only the most recently
-      issued chunk's groups remain in flight. Used in the steady-state
-      body of a software-pipelined K-outer loop so chunk N+1's loads
-      stay outstanding while chunk N's compute runs.
-
-    Materialization emits ``CpAsyncWait(group=N)`` followed by
+    Materialization emits ``CpAsyncWait(group=keep)`` followed by
     ``Sync()`` so the freshly-loaded smem is visible across the CTA.
+
+    Carrying ``keep`` explicitly (rather than re-deriving it from the
+    surrounding stage count) keeps the wait correct after structural
+    rewrites such as unrolling a 1-iteration steady-state loop.
     """
 
-    mode: AsyncWaitMode = "drain_all"
+    keep: int = 0
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
-        return AsyncWait(mode=self.mode)
+        return AsyncWait(keep=self.keep)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}AsyncWait(mode={self.mode!r})"]
+        return [f"{indent}AsyncWait(keep={self.keep})"]
 
 
 @dataclass
@@ -398,7 +395,6 @@ __all__ = [
     "BufferedStage",
     "AsyncBufferedStage",
     "AsyncWait",
-    "AsyncWaitMode",
     # Bindings
     "BoundAxis",
     "BIND_THREAD",

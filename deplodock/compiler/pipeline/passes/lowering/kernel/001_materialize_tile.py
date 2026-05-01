@@ -93,11 +93,6 @@ def _materialize(blk: Tile) -> Stmt:
     new_body: list[Stmt] = []
     pending_reduce: Accum | None = None
     declared_smem: set[str] = set()
-    # Count of ``AsyncBufferedStage`` commits issued in the current body
-    # walk since the most recent ``AsyncWait``. ``keep_latest_chunk``
-    # lowers to ``CpAsyncWait(group=count)`` so the just-issued chunk
-    # remains in flight while older chunks drain.
-    async_count = [0]
 
     def filter_emit(stmts: list[Stmt]) -> list[Stmt]:
         out: list[Stmt] = []
@@ -112,12 +107,9 @@ def _materialize(blk: Tile) -> Stmt:
     for stmt in body:
         if isinstance(stmt, Stage):
             new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
-            if isinstance(stmt, AsyncBufferedStage):
-                async_count[0] += 1
             pending_reduce = None
         elif isinstance(stmt, AsyncWait):
-            new_body.extend(_lower_async_wait(stmt, async_count[0]))
-            async_count[0] = 0
+            new_body.extend([CpAsyncWait(group=stmt.keep), Sync()])
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit))
@@ -161,38 +153,16 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
     a buffer name with their prologue counterparts, and only the first
     decl should reach the rendered kernel."""
     inner: list[Stmt] = []
-    async_count = 0
     for s in loop.body:
         if isinstance(s, Stage):
             inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads)))
-            if isinstance(s, AsyncBufferedStage):
-                async_count += 1
         elif isinstance(s, AsyncWait):
-            inner.extend(_lower_async_wait(s, async_count))
-            async_count = 0
+            inner.extend([CpAsyncWait(group=s.keep), Sync()])
         elif isinstance(s, (Loop, StridedLoop)):
             inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit))
         else:
             inner.append(transform(s))
     return replace(loop, body=inner)
-
-
-def _lower_async_wait(stmt: AsyncWait, async_count: int) -> list[Stmt]:
-    """Lower an ``AsyncWait`` to ``CpAsyncWait(group=N) + Sync()``.
-
-    For ``mode='drain_all'`` N is 0 (block until every outstanding
-    cp.async group has completed). For ``mode='keep_latest_chunk'`` N
-    is the count of ``AsyncBufferedStage`` commits issued in this
-    body walk since the previous ``AsyncWait`` — leaving exactly the
-    just-issued chunk's groups in flight.
-    """
-    if stmt.mode == "drain_all":
-        n = 0
-    elif stmt.mode == "keep_latest_chunk":
-        n = async_count
-    else:
-        raise ValueError(f"unknown AsyncWait mode {stmt.mode!r}")
-    return [CpAsyncWait(group=n), Sync()]
 
 
 def _single_thread_var(thread_axes: tuple) -> str:

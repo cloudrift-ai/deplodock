@@ -10,9 +10,9 @@ Input shape (post 013 + 014)::
 
     Loop(K_outer in 0..K, body=[
         AsyncBufferedStage(W, buffer_count=2, phase=K_outer%2),
-        AsyncWait(mode='drain_all'),                       # synchronous-style; dropped here
+        AsyncWait(keep=0),                       # synchronous-style; dropped here
         AsyncBufferedStage(X, buffer_count=2, phase=K_outer%2),
-        AsyncWait(mode='drain_all'),                       # synchronous-style; dropped here
+        AsyncWait(keep=0),                       # synchronous-style; dropped here
         reduce_loop reading slabs at phase=K_outer%2,
     ])
 
@@ -26,16 +26,19 @@ Output shape::
     Loop(K_outer in 0..K-1, body=[
         AsyncBufferedStage(W, K_outer→K_outer+1, phase=(K_outer+1)%2),
         AsyncBufferedStage(X, K_outer→K_outer+1, phase=(K_outer+1)%2),
-        AsyncWait(mode='keep_latest_chunk'),  # leave just-issued chunk in flight
+        AsyncWait(keep=len(stages)),  # leave just-issued chunk in flight
         reduce_loop reading slabs at phase=K_outer%2,
     ])
 
     # Epilogue — drain final loads, compute last chunk
-    AsyncWait(mode='drain_all')
+    AsyncWait(keep=0)
     reduce_loop with K_outer→K-1 substituted
 
-Materialize counts ``AsyncBufferedStage`` siblings since the previous
-``AsyncWait`` to derive ``CpAsyncWait(group=N)``.
+Materialize lowers each ``AsyncWait`` directly to
+``CpAsyncWait(group=keep)``; ``keep`` is set explicitly here so the
+schedule is robust to structural rewrites (e.g. unrolling a 1-iter
+steady-state loop, which would otherwise merge prologue + body commits
+into the same lexical scope).
 
 Trigger conditions:
 
@@ -146,14 +149,17 @@ def _pipeline(loop: Loop) -> list[Stmt] | None:
 
     body_stages = [transform_stage(s, sigma_next) for s in stages]
     # Each AsyncBufferedStage commits its own group. Per iter we issue
-    # ``len(stages)`` commits. ``keep_latest_chunk`` instructs materialize
-    # to wait until exactly the just-issued chunk's groups remain in
-    # flight: compute on chunk N waits for chunk N's loads (committed
-    # previously), while chunk N+1's loads (just issued) stay outstanding.
-    main_body = (*body_stages, AsyncWait(mode="keep_latest_chunk"), *others)
+    # ``len(stages)`` commits. The steady-state wait must leave exactly
+    # the just-issued chunk's groups in flight: compute on chunk N waits
+    # for chunk N's loads (committed previously) while chunk N+1's loads
+    # (just issued) stay outstanding. ``keep`` is carried explicitly so
+    # the wait remains correct after structural rewrites such as
+    # unrolling a 1-iter steady-state loop (which would otherwise merge
+    # prologue + body commits into the same scope).
+    main_body = (*body_stages, AsyncWait(keep=len(stages)), *others)
     main_loop = Loop(axis=Axis(loop.axis.name, n_chunks - 1), body=main_body, unroll=loop.unroll)
 
-    epilogue: list[Stmt] = [AsyncWait(mode="drain_all")]
+    epilogue: list[Stmt] = [AsyncWait(keep=0)]
     for s in others:
         epilogue.append(s.rewrite(_id, sigma_last))
 
