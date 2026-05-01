@@ -59,7 +59,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Loop, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, StridedLoop
 from deplodock.compiler.ir.tile.ir import (
     BLOCK_SIZE,
     Combine,
@@ -69,6 +69,16 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+
+
+def _has_matmul_reduce(body) -> bool:
+    """True iff ``body`` contains a reduce ``Loop`` whose immediate
+    Loads touch ≥2 distinct buffers — the structural signature of a
+    matmul (or P @ V style) reduction."""
+    return any(
+        isinstance(s, Loop) and s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2 for s in Body.coerce(body).iter()
+    )
+
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -129,6 +139,17 @@ def _rewrite_block(blk: Tile) -> Tile | None:
             raise RuleSkipped(f"reduce Loop {rl.axis.name!r} has no Accum")
         if not _accums_independent(rl.body):
             raise RuleSkipped(f"reduce Loop {rl.axis.name!r} has dependent Accums (online algorithm — punted)")
+
+    # Skip cooperative when the body has a matmul-reduce signature (a
+    # reduce Loop with ≥2 distinct buffer Loads). Such kernels have
+    # plenty of output-dim parallelism: blockify's matmul-aware path
+    # will thread-tile (PAT × PAT) on the outputs, register_tile will
+    # F²-replicate, and the per-thread arithmetic-amortization wins
+    # over what cooperative would buy. SDPA's P @ V kernel is the
+    # poster child: cooperative makes it 1M CTAs with redundant softmax,
+    # while the matmul path lands ~16K CTAs with per-thread tile reuse.
+    if any(_has_matmul_reduce(s.body) for s in reduce_loops if isinstance(s, Loop)) or _has_matmul_reduce(blk.body):
+        raise RuleSkipped("body has matmul-reduce signature — defer to register_tile / blockify matmul path")
 
     t_axis = Axis("t", BLOCK_SIZE)
     t_start = Var(t_axis.name)
