@@ -199,8 +199,17 @@ def _materialize(blk: Tile) -> Stmt:
         # Smem allocation: leading phase dim + cache extents (with pad).
         full_extents = (stage.buffer_count, *stage.alloc_extents)
         smem_index = (stage.phase, *([Literal(0, "int")] * len(stage.axes)))
+        # Distribute issuer threads across stages: stage 0 → tid 0,
+        # stage 1 → tid 1, etc. Each unique mbar (== unique source buffer)
+        # gets its own dedicated issuer so the per-iter ``arrive+TMA``
+        # pairs run in parallel on different threads instead of
+        # serializing on tid 0. Same-name reissues (prologue + main loop)
+        # share the same issuer thread.
+        if mbar_name not in tma_mbars:
+            tma_mbars.append(mbar_name)
+        issuer_tid = tma_mbars.index(mbar_name)
         cond = Cond(
-            cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(0, "int")),
+            cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(issuer_tid, "int")),
             body=(
                 MbarrierArriveExpectTx(mbar=mbar_name, bytes_=slab_bytes, slot=stage.phase),
                 TmaLoad(
@@ -213,8 +222,6 @@ def _materialize(blk: Tile) -> Stmt:
                 ),
             ),
         )
-        if mbar_name not in tma_mbars:
-            tma_mbars.append(mbar_name)
         # TMA destinations want 128-byte aligned smem for max-throughput
         # box copies (16 B is the hardware minimum; 128 B is the
         # recommended swizzle-friendly alignment).

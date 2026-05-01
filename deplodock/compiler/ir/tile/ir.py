@@ -311,6 +311,30 @@ class Stage(Stmt):
             pad=self.pad,
         )
 
+    def _simplify_kwargs(self, ctx) -> dict:
+        """Common kwargs for subtype-preserving Expr-simplification. Mirrors
+        ``_rewrite_kwargs``: subclasses override to thread their own Expr
+        fields through ``ctx``. Used by ``ir/stmt/normalize._simplify_stmt``
+        so adding a new Stage subclass field doesn't silently get dropped
+        on every normalization pass (which is what happened with
+        ``TmaBufferedStage.swizzle`` before this refactor)."""
+        from deplodock.compiler.ir.stmt.normalize import _simplify_expr_tuple  # noqa: PLC0415
+
+        if isinstance(self.addressing, TemplateAddressing):
+            new_addr: AffineAddressing | TemplateAddressing = TemplateAddressing(
+                exprs=_simplify_expr_tuple(self.addressing.exprs, ctx),
+            )
+        else:
+            new_addr = self.addressing
+        return dict(
+            name=self.name,
+            buf=self.buf,
+            origin=_simplify_expr_tuple(self.origin, ctx),
+            axes=self.axes,
+            addressing=new_addr,
+            pad=self.pad,
+        )
+
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
@@ -359,6 +383,9 @@ class BufferedStage(Stage):
 
     def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
         return {**super()._rewrite_kwargs(sigma, axis_fn), "buffer_count": self.buffer_count, "phase": sigma.apply(self.phase)}
+
+    def _simplify_kwargs(self, ctx) -> dict:
+        return {**super()._simplify_kwargs(ctx), "buffer_count": self.buffer_count, "phase": self.phase.simplify(ctx)}
 
     def _pretty_extra(self) -> str:
         return f" buffers={self.buffer_count}@{self.phase.pretty()}"
@@ -423,6 +450,9 @@ class TmaBufferedStage(BufferedStage):
 
     def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
         return {**super()._rewrite_kwargs(sigma, axis_fn), "swizzle": self.swizzle}
+
+    def _simplify_kwargs(self, ctx) -> dict:
+        return {**super()._simplify_kwargs(ctx), "swizzle": self.swizzle}
 
     def _pretty_extra(self) -> str:
         sw = "" if self.swizzle == SwizzleMode.NONE else f" swizzle={self.swizzle.value}"

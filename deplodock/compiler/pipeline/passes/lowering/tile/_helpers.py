@@ -16,6 +16,10 @@
 - :func:`compute_capability` — cached query of the active CUDA device's
   compute capability. Shared by passes that gate on hardware features
   (``014_async_copy`` for cp.async, ``014a_tma_copy`` for TMA).
+- :func:`load_thread_axis_coeffs` / :func:`max_bank_conflict` —
+  bank-conflict analysis for body Loads of a staged buffer. Shared
+  by ``014c_pad_smem_banks`` (cp.async / sync stages, +1 padding)
+  and ``014d_tma_swizzle`` (TMA stages, descriptor swizzle mode).
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
@@ -25,12 +29,19 @@ from __future__ import annotations
 
 import functools
 import logging
+from collections import defaultdict
 from collections.abc import Callable
 
+from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.expr import affine_form
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.pipeline.engine import RuleSkipped
 
 _logger = logging.getLogger(__name__)
+
+# Bank-conflict analysis constants — fp32 smem with 32 banks of 4 bytes.
+WARP_SIZE = 32
+BANKS = 32
 
 
 @functools.cache
@@ -114,3 +125,91 @@ def is_matmul_k_outer(
     if not any(isinstance(c, Accum) for c in k_inner.body):
         return False
     return extra_gate(loop, k_inner)
+
+
+# ---------------------------------------------------------------------------
+# Bank-conflict analysis (shared by 014c pad pass and 014d swizzle pass)
+# ---------------------------------------------------------------------------
+
+
+def loads_reading(body: Body, stage_name: str) -> list[Load]:
+    """Collect every Load anywhere in ``body`` reading from ``stage_name``."""
+    return [s for s in body.iter() if isinstance(s, Load) and s.input == stage_name]
+
+
+def load_thread_axis_coeffs(
+    loads: list[Load],
+    stage_axes_count: int,
+    thread_axes: tuple[Axis, ...],
+    *,
+    leading_phase_dim: bool,
+) -> list[list[dict[str, int]]] | None:
+    """Per-Load affine coefficients of each cache-axis index over thread-axis Vars.
+
+    Returns ``None`` if any Load is non-affine in the thread-axis vars
+    or its index doesn't match the expected dim count — caller skips
+    conservatively. ``leading_phase_dim=True`` strips the leading phase
+    index (added by ``013_double_buffer`` for ``BufferedStage`` Loads):
+    phase is uniform across threads, contributing no bank-distribution
+    effect, so dropping it doesn't change the analysis.
+    """
+    expected_index_len = stage_axes_count + (1 if leading_phase_dim else 0)
+    thread_var_set = frozenset(ax.name for ax in thread_axes)
+    per_load_coeffs: list[list[dict[str, int]]] = []
+    for load in loads:
+        if len(load.index) != expected_index_len:
+            return None
+        cache_index = load.index[1:] if leading_phase_dim else load.index
+        forms = [affine_form(e, thread_var_set) for e in cache_index]
+        if any(f is None for f in forms):
+            return None
+        per_load_coeffs.append([coeffs for _, coeffs in forms if (_, coeffs) is not None])  # type: ignore[misc]
+    return per_load_coeffs
+
+
+def smem_strides(extents: tuple[int, ...]) -> list[int]:
+    """Row-major strides for a smem buffer with ``extents``."""
+    strides: list[int] = []
+    cur = 1
+    for e in reversed(extents):
+        strides.insert(0, cur)
+        cur *= e
+    return strides
+
+
+def max_bank_conflict(
+    per_load_coeffs: list[list[dict[str, int]]],
+    smem_extents: tuple[int, ...],
+    thread_axes: tuple[Axis, ...],
+) -> int:
+    """Worst-case max-way bank conflict across all body Loads.
+
+    For each Load, the flat smem address is an affine function of the
+    thread-axis Vars: ``flat = warp_const + sum_v S_v * tid_v`` where
+    ``S_v = sum_d coeff_v_d * stride[d]``. The constant warp-uniform
+    part shifts every thread's address by the same amount and doesn't
+    affect bank distribution, so we drop it. We then enumerate the
+    32 warp lanes, decode each lane's ``tid_v`` per
+    ``materialize_tile``'s flatten scheme, compute ``flat % 32``, and
+    count distinct addresses per bank (broadcasts don't count).
+    """
+    strides = smem_strides(smem_extents)
+    max_way = 1
+    for coeffs_per_dim in per_load_coeffs:
+        contrib: dict[str, int] = defaultdict(int)
+        for d, coeffs in enumerate(coeffs_per_dim):
+            for ax_name, c in coeffs.items():
+                contrib[ax_name] += c * strides[d]
+
+        bank_to_addrs: dict[int, set[int]] = defaultdict(set)
+        for tid in range(WARP_SIZE):
+            flat = 0
+            rem = tid
+            for ax in reversed(thread_axes):
+                ext = int(ax.extent)
+                flat += contrib.get(ax.name, 0) * (rem % ext)
+                rem //= ext
+            bank_to_addrs[flat % BANKS].add(flat)
+        way = max((len(s) for s in bank_to_addrs.values()), default=1)
+        max_way = max(max_way, way)
+    return max_way
