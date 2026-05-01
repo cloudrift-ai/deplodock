@@ -95,12 +95,11 @@ def _process(body: Body, k_var: str | None = None) -> Body:
     cp.async fallback (which doesn't actually wait for TMA bulk loads)."""
     new_body: list[Stmt] = []
     changed = False
-    for s in body:
+    pending_wait: tuple[BufferedStage, ...] = ()  # consecutive TMA stages awaiting one shared wait
+    i = 0
+    while i < len(body):
+        s = body[i]
         if isinstance(s, BufferedStage) and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage)) and _eligible(s):
-            # The pad pass (``014c_pad_smem_banks``) runs AFTER this rule
-            # and skips TmaBufferedStage by class, so this conversion sees
-            # ``s.pad == ()`` and can pass it through. ``TmaBufferedStage``
-            # also asserts ``pad`` is empty, which catches regressions.
             new_body.append(
                 TmaBufferedStage(
                     name=s.name,
@@ -113,17 +112,31 @@ def _process(body: Body, k_var: str | None = None) -> Body:
                     phase=s.phase,
                 )
             )
-            new_body.append(_tma_async_wait(s, k_var))
+            pending_wait = (*pending_wait, s)
             changed = True
-        elif isinstance(s, Loop):
-            inner = _process(s.body, k_var=s.axis.name)
-            if inner is not s.body and inner != s.body:
-                new_body.append(Loop(axis=s.axis, body=inner, unroll=s.unroll))
-                changed = True
+        else:
+            if pending_wait:
+                # Materialize emits ONE shared mbarrier with arrive count =
+                # number of TMA stages. Coalesce all consecutive stages'
+                # waits into a single AsyncWait so the materializer lowers
+                # exactly one MbarrierWait that releases the consumer once
+                # every stage has arrived. Per-stage waits would deadlock —
+                # the first wait would block on count=N but only one stage
+                # has arrived.
+                new_body.append(_tma_async_wait(pending_wait[0], k_var))
+                pending_wait = ()
+            if isinstance(s, Loop):
+                inner = _process(s.body, k_var=s.axis.name)
+                if inner is not s.body and inner != s.body:
+                    new_body.append(Loop(axis=s.axis, body=inner, unroll=s.unroll))
+                    changed = True
+                else:
+                    new_body.append(s)
             else:
                 new_body.append(s)
-        else:
-            new_body.append(s)
+        i += 1
+    if pending_wait:
+        new_body.append(_tma_async_wait(pending_wait[0], k_var))
     return tuple(new_body) if changed else body
 
 
