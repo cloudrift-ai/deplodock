@@ -39,7 +39,16 @@ from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, KernelOp, Smem, Sync, TreeHalve
 from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, StridedLoop, Tile, Write
-from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, AsyncWait, BufferedStage, Combine, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import (
+    AffineAddressing,
+    AsyncBufferedStage,
+    AsyncWait,
+    BufferedStage,
+    Combine,
+    Stage,
+    TemplateAddressing,
+    TileOp,
+)
 from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -228,9 +237,13 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     iterates the cache axis directly; for N-D, it iterates a synthetic
     flat axis decoded into per-axis coords.
 
-    Source index per source-buffer dim ``d`` =
-    ``origin[d] + decoded[d]`` (the decoded slab coord, if any axis
-    maps to ``d`` via ``slab_dims``); else just ``origin[d]``.
+    Source index reconstruction depends on ``stage.addressing``:
+
+    - ``AffineAddressing(slab_dims)`` — fast path. ``source_index[d] =
+      origin[d] + decoded[d]`` (the decoded slab coord, if any cache
+      axis maps to ``d`` via ``slab_dims``); else just ``origin[d]``.
+    - ``TemplateAddressing(exprs)`` — escape hatch. Sigma-substitute
+      cache-axis Vars → iter-decoded coords into ``exprs``.
 
     Emits a leading ``Sync`` so iterations 2+ of an enclosing serial
     loop (chunked-K matmul) wait for the prior iteration's compute to
@@ -259,7 +272,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         coord_for = _flat_decode(stage.axes, iter_axis.name)
 
     smem_index = tuple(coord_for[ax.name] for ax in stage.axes)
-    if stage.source_index_template is not None:
+    if isinstance(stage.addressing, TemplateAddressing):
         # Non-affine path (``/``, ``%`` from collapsed-reshape views).
         # Cache extent equals the raw axis extent (no F-scale baked in),
         # so substituting cache-axis Vars with their iter coords into
@@ -271,9 +284,10 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         from deplodock.compiler.ir.sigma import Sigma as _Sigma
 
         cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in stage.axes})
-        source_index = tuple(cache_sigma.apply(e) for e in stage.source_index_template)
+        source_index = tuple(cache_sigma.apply(e) for e in stage.addressing.exprs)
     else:
-        decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
+        assert isinstance(stage.addressing, AffineAddressing)
+        decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.addressing.dims, stage.axes, strict=True)}
         source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
 
     # Buffered stages prepend a phase dim to the smem allocation and to

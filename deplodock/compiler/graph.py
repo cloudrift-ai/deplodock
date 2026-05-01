@@ -235,7 +235,15 @@ def _stmt_eval_scope() -> dict:
         Tile,
         Write,
     )
-    from deplodock.compiler.ir.tile.ir import AsyncWait, Combine, Stage
+    from deplodock.compiler.ir.tile.ir import (
+        AffineAddressing,
+        AsyncBufferedStage,
+        AsyncWait,
+        BufferedStage,
+        Combine,
+        Stage,
+        TemplateAddressing,
+    )
 
     _STMT_EVAL_SCOPE = {
         "Axis": Axis,
@@ -261,6 +269,10 @@ def _stmt_eval_scope() -> dict:
         "Cond": Cond,
         "Tile": Tile,
         "Stage": Stage,
+        "BufferedStage": BufferedStage,
+        "AsyncBufferedStage": AsyncBufferedStage,
+        "AffineAddressing": AffineAddressing,
+        "TemplateAddressing": TemplateAddressing,
         "Combine": Combine,
         "AsyncWait": AsyncWait,
         "Smem": Smem,

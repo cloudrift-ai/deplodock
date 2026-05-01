@@ -371,19 +371,21 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
     if isinstance(stmt, Load):
         return Load(stmt.name, stmt.input, _simplify_expr_tuple(stmt.index, ctx))
     # Tile-IR-only ``Stage`` (+ BufferedStage / AsyncBufferedStage subtypes)
-    # carries Exprs in ``origin`` / ``source_index_template`` / ``phase``.
+    # carries Exprs in ``origin`` / ``addressing.exprs`` (template form) / ``phase``.
     # Lazy import to avoid a tile→stmt circular at module load time.
-    from deplodock.compiler.ir.tile.ir import BufferedStage, Stage  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TemplateAddressing  # noqa: PLC0415
 
     if isinstance(stmt, Stage):
-        new_template = _simplify_expr_tuple(stmt.source_index_template, ctx) if stmt.source_index_template is not None else None
+        if isinstance(stmt.addressing, TemplateAddressing):
+            new_addr = TemplateAddressing(exprs=_simplify_expr_tuple(stmt.addressing.exprs, ctx))
+        else:
+            new_addr = stmt.addressing
         kwargs = dict(
             name=stmt.name,
             buf=stmt.buf,
             origin=_simplify_expr_tuple(stmt.origin, ctx),
             axes=stmt.axes,
-            slab_dims=stmt.slab_dims,
-            source_index_template=new_template,
+            addressing=new_addr,
             pad=stmt.pad,
         )
         if isinstance(stmt, BufferedStage):

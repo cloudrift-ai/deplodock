@@ -149,6 +149,34 @@ class Combine(Stmt):
         return [f"{indent}Combine({self.name}, op={self.op.name})"]
 
 
+@dataclass(frozen=True)
+class AffineAddressing:
+    """Affine slab addressing: each cache axis ``i`` decoded coord is
+    *added* to source dim ``slab_dims[i]``.
+
+    ``source_index[d] = origin[d] + decoded_coord(slab_dims[i] == d)``.
+
+    Common case (matmul, RMSNorm, softmax). Materialize reconstructs
+    addresses without symbolic substitution.
+    """
+
+    dims: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TemplateAddressing:
+    """Non-affine slab addressing: the consumer Load's original index
+    kept verbatim with cache-axis Vars left symbolic. Materialize
+    Sigma-substitutes cache-axis Vars → iter-decoded coords.
+
+    Used for collapsed-reshape views (``/``, ``%``) and any case where
+    the affine ``origin + decoded`` reconstruction fails. Length ==
+    source-buffer rank.
+    """
+
+    exprs: tuple[Expr, ...]
+
+
 @dataclass
 class Stage(Stmt):
     """Operand-cache declaration — stage a contiguous slab of ``buf``
@@ -171,9 +199,9 @@ class Stage(Stmt):
       excluded from origin (it becomes a new cache axis instead),
       preserving CTA-uniformity.
     - ``axes`` — cache axes (smem layout, in this order).
-    - ``slab_dims`` — parallel to ``axes``; each entry is the source-
-      buffer dim that the slab axis adds to. ``source_index[d] =
-      origin[d] + (slab axis at d, if any)``.
+    - ``addressing`` — discriminated union of ``AffineAddressing``
+      (fast path, ``origin + decoded``) and ``TemplateAddressing``
+      (escape hatch carrying the original symbolic Load index).
 
     SSA-like: ``name`` is the staged buffer's identifier; subsequent
     ``Load(input=name, index=cache-local)`` reads in the body refer to
@@ -194,14 +222,7 @@ class Stage(Stmt):
     buf: str
     origin: tuple[Expr, ...]
     axes: tuple[Axis, ...]
-    slab_dims: tuple[int, ...]
-    # Optional: full reference Load index expressed in cache-axis Vars.
-    # When present, materialization fetches source values by substituting
-    # cache-axis decoded coords into this template — handles non-affine
-    # layouts (``/``, ``%`` from collapsed-reshape views) that can't be
-    # expressed as ``origin[d] + decoded[d]``. None falls back to the
-    # additive ``origin + decoded_per_dim`` path.
-    source_index_template: tuple[Expr, ...] | None = None
+    addressing: AffineAddressing | TemplateAddressing
     # Per-cache-axis extra extent added to the smem allocation (not to the
     # cooperative-load extent). Empty tuple = no padding. Used by the bank-
     # conflict pass to break stride-aliased smem layouts: padding dim ``d``
@@ -214,19 +235,21 @@ class Stage(Stmt):
         return ()
 
     def exprs(self) -> tuple[Expr, ...]:
-        template = self.source_index_template if self.source_index_template is not None else ()
+        template = self.addressing.exprs if isinstance(self.addressing, TemplateAddressing) else ()
         return (*self.origin, *template)
 
     def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
         """Common kwargs for subtype-preserving rewrite. Subclasses extend."""
-        new_template = tuple(sigma.apply(e) for e in self.source_index_template) if self.source_index_template is not None else None
+        if isinstance(self.addressing, TemplateAddressing):
+            new_addr: AffineAddressing | TemplateAddressing = TemplateAddressing(exprs=tuple(sigma.apply(e) for e in self.addressing.exprs))
+        else:
+            new_addr = self.addressing
         return dict(
             name=self.name,
             buf=self.buf,
             origin=tuple(sigma.apply(e) for e in self.origin),
             axes=tuple(axis_fn(a) for a in self.axes),
-            slab_dims=self.slab_dims,
-            source_index_template=new_template,
+            addressing=new_addr,
             pad=self.pad,
         )
 
@@ -237,7 +260,12 @@ class Stage(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         origin = ", ".join(e.pretty() for e in self.origin)
-        slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.slab_dims, strict=True))
+        if isinstance(self.addressing, AffineAddressing):
+            slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.addressing.dims, strict=True))
+        else:
+            cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in self.axes)
+            tpl = ", ".join(e.pretty() for e in self.addressing.exprs)
+            slab = f"{cache} template=[{tpl}]"
         pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
         return [f"{indent}{self.name} = {type(self).__name__}({self.buf}, origin=({origin}), slab=({slab})){pad}{self._pretty_extra()}"]
 
@@ -394,6 +422,8 @@ __all__ = [
     "Stage",
     "BufferedStage",
     "AsyncBufferedStage",
+    "AffineAddressing",
+    "TemplateAddressing",
     "AsyncWait",
     # Bindings
     "BoundAxis",

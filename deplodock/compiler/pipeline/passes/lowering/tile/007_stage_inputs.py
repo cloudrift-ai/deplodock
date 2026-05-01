@@ -52,7 +52,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
-from deplodock.compiler.ir.tile.ir import Stage, TileOp
+from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, TemplateAddressing, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
@@ -163,14 +163,17 @@ def _build_stages(
             if used_floats + slab.n_floats > _PER_SCOPE_FLOAT_BUDGET:
                 continue
             smem_name = _gen_name(buf, used_names)
+            addressing: AffineAddressing | TemplateAddressing = (
+                TemplateAddressing(exprs=slab.template) if slab.template is not None else AffineAddressing(
+                    dims=slab.slab_dims)
+            )
             stages.append(
                 Stage(
                     name=smem_name,
                     buf=buf,
                     origin=slab.origin,
                     axes=slab.cache_axes,
-                    slab_dims=slab.slab_dims,
-                    source_index_template=slab.template,
+                    addressing=addressing,
                 )
             )
             used_floats += slab.n_floats
