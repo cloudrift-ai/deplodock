@@ -2,32 +2,34 @@
 
 Decides the THREAD/BLOCK partition of every parallel axis on a
 ``TileOp`` containing one ``Tile`` whose ``block_axes`` is still empty.
-Replaces the legacy ``003_block_matmul`` rule with a single
-launch-geometry decision informed by the actual per-block thread
-budget. Output-dim free-Loop lifting happens earlier in
-``001_tileify`` — by the time this rule runs, every parallel axis is
-already in ``Tile.axes``.
+Output-dim free-Loop lifting happens earlier in ``001_tileify`` — by
+the time this rule runs, every parallel axis is already in
+``Tile.axes``.
 
-**Apportion THREAD/BLOCK.** Every axis in ``Tile.axes`` starts as
-THREAD (from ``001_tileify``). Walk innermost-to-outermost, accumulating
-``threads_used`` against the per-block budget ``thread_budget()``
-(``tuning.thread_budget``, default 256, env ``DEPLODOCK_TB``).
+**Apportion THREAD/BLOCK.** ``tuning.thread_tile_shape(tile)`` returns
+the per-axis THREAD-tile widths the launch should emit, in innermost-
+first order — typically ``(PAT, PAT)`` for matmul or
+``(thread_budget,)`` otherwise.
 
-For each axis with extent ``ext`` and per-axis tile width
-``pat = per_axis_threads(tile)`` (typically 16):
+For each of the innermost ``len(shape)`` axes ``ba`` with extent ``ext``
+and target ``shape[i]``:
 
-- ``threads_used >= budget`` — axis goes BLOCK whole.
-- ``ext < pat`` — THREAD whole if it still fits the budget, else BLOCK.
-- ``ext == pat`` — same fit-or-BLOCK check.
-- ``ext > pat`` and ``ext % pat == 0`` — split into ``axis_i:pat``
-  (THREAD) and ``axis_o:ext/pat`` (BLOCK), with body indices
-  σ-rewritten ``axis → axis_o*pat + axis_i``.
-- ``ext > pat`` and not divisible — THREAD whole if it fits, else BLOCK.
+- ``ext == shape[i]`` — keep whole as THREAD.
+- ``ext > shape[i]`` and ``ext % shape[i] == 0`` — split into
+  ``axis_i:shape[i]`` (THREAD) + ``axis_o:ext/shape[i]`` (BLOCK), with
+  body indices σ-rewritten ``axis → axis_o*shape[i] + axis_i``.
+- ``ext < shape[i]`` — keep THREAD whole (smaller-than-target axis is
+  fine; the launch loses some threads but stays correct).
+- otherwise (``ext > shape[i]`` non-divisible) — bail with
+  ``RuleSkipped``.
 
-The split factor is always ``pat`` (the per-axis tile width), not the
-remaining budget. The budget governs *whether* an axis goes THREAD
-at all, while ``pat`` governs *how* a THREAD-eligible axis with
-oversized extent is sliced.
+Outer axes beyond ``len(shape)`` go BLOCK whole.
+
+PAT and the register-tile factor F are paired in ``tuning`` so
+``PAT/F = 16``. After ``008_register_tile`` splits each PAT axis by F,
+the final per-axis thread count is exactly 16 and the two output axes
+together yield ``16² = 256 = thread_budget`` — no post-hoc rebalance
+pass needed.
 
 Idempotent: if no axis was split and every axis kept its original
 bind, returns None.
@@ -43,7 +45,7 @@ from deplodock.compiler.ir.stmt import Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
-from deplodock.compiler.tuning import per_axis_threads, register_tile_factor, thread_budget
+from deplodock.compiler.tuning import thread_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -63,76 +65,34 @@ def _maybe_rewrite(body):
 
     partitioned = _partition_threads(tile)
     if partitioned is None:
-        raise RuleSkipped("partition already fits within thread budget")
+        raise RuleSkipped("partition already fits the requested tile shape")
     return body[:idx] + (partitioned,) + body[idx + 1 :]
 
 
-# ---------------------------------------------------------------------------
-# Apportion THREAD / BLOCK
-# ---------------------------------------------------------------------------
-
-
 def _partition_threads(tile: Tile) -> Tile | None:
-    """Walk axes innermost→outermost. Each axis with extent ≥
-    ``_PER_AXIS_THREADS`` gets a ``_PER_AXIS_THREADS``-thread inner
-    slice + remainder BLOCK; smaller axes go THREAD whole. Stop adding
-    THREAD slices once the running product reaches ``_THREAD_BUDGET``;
-    remaining outer axes go BLOCK whole.
-
-    The per-axis 16-thread tile matches the legacy ``003`` semantics: a
-    matmul (M, N both ≥16) gets a 16×16 thread tile, leaving each
-    operand load with its own thread axis for cooperative reuse.
-    Single-parallel-axis kernels (RMSNorm row-reduction) get a single
-    16-thread axis — same as before."""
-    pat = per_axis_threads(tile)
-    # ``008_register_tile`` will split each PAT-extent THREAD axis by F
-    # and F²-replicate the body, so the *post*-register-tile thread
-    # count is ``threads_used / F²``. The blockify budget therefore
-    # admits ``thread_budget × F²`` PAT-equivalent threads — the F²
-    # capacity register_tile will reclaim. Non-matmul kernels have F=1
-    # (or no register tiling), so this collapses to ``thread_budget``.
-    F = register_tile_factor(tile)
-    tb = thread_budget() * F * F
+    """Split the innermost axes per ``thread_tile_shape``. Outer axes →
+    BLOCK whole. Bail on non-divisible oversized axes."""
+    shape = thread_tile_shape(tile)
     axes = list(tile.axes)
     new_axes_inner_first: list[BoundAxis] = []
     sigma_map: dict[str, object] = {}
-    threads_used = 1
 
-    for ba in reversed(axes):
-        ext = int(ba.axis.extent)
-        if threads_used >= tb:
+    for i, ba in enumerate(reversed(axes)):
+        if i >= len(shape):
             new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
             continue
-        if ext < pat:
-            # Small axis — keep whole as THREAD if it'd fit, else BLOCK.
-            if threads_used * ext <= tb:
-                new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
-                threads_used *= ext
-            else:
-                new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
-            continue
-        if ext == pat:
-            if threads_used * ext <= tb:
-                new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
-                threads_used *= ext
-            else:
-                new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
-            continue
-        # Larger than per-axis tile → split.
-        if ext % pat != 0:
-            # Non-divisible — keep whole; if it'd overflow, BLOCK; else THREAD.
-            if threads_used * ext <= tb:
-                new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
-                threads_used *= ext
-            else:
-                new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
-            continue
-        inner = Axis(f"{ba.axis.name}_i", pat)
-        outer = Axis(f"{ba.axis.name}_o", ext // pat)
-        new_axes_inner_first.append(BoundAxis(axis=inner, bind=BIND_THREAD))
-        new_axes_inner_first.append(BoundAxis(axis=outer, bind=BIND_BLOCK))
-        sigma_map[ba.axis.name] = Var(outer.name) * Literal(pat, "int") + Var(inner.name)
-        threads_used *= pat
+        target = shape[i]
+        ext = int(ba.axis.extent)
+        if ext == target or ext < target:
+            new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_THREAD))
+        elif ext % target == 0:
+            inner = Axis(f"{ba.axis.name}_i", target)
+            outer = Axis(f"{ba.axis.name}_o", ext // target)
+            new_axes_inner_first.append(BoundAxis(axis=inner, bind=BIND_THREAD))
+            new_axes_inner_first.append(BoundAxis(axis=outer, bind=BIND_BLOCK))
+            sigma_map[ba.axis.name] = Var(outer.name) * Literal(target, "int") + Var(inner.name)
+        else:
+            raise RuleSkipped(f"axis {ba.axis.name}:{ext} not divisible by tile-shape target {target}")
 
     new_axes_inner_first.reverse()
     new_axes = new_axes_inner_first

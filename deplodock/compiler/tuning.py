@@ -229,6 +229,25 @@ def per_axis_threads(tile: Tile | None = None) -> int:
     return _PAT_DEFAULT
 
 
+def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
+    """Per-axis THREAD-tile widths ``005_blockify_launch`` should emit, in
+    innermost-first order. The product equals the *pre*-register-tile
+    thread-budget (``thread_budget × F²`` for matmul; ``thread_budget``
+    for non-matmul where F=1).
+
+    Matmul kernels: ``(PAT, PAT)`` — two PAT-extent thread axes for M and
+    N. After ``008_register_tile`` splits each by F, the post-register-
+    tile layout is ``(PAT/F, PAT/F) = (16, 16) = thread_budget``.
+
+    Non-matmul kernels: ``(thread_budget,)`` — a single fat thread axis
+    for the innermost parallel dim (RMSNorm-row, pointwise-flat, …).
+    """
+    if tile is not None and _has_matmul_reduce(tile.body):
+        pat = per_axis_threads(tile)
+        return (pat, pat)
+    return (thread_budget(),)
+
+
 def detect_pat(tile: Tile) -> int | None:
     """Return the per-axis thread tile width ``005_blockify_launch``
     chose for this tile, by counting THREAD axes whose extent matches a
