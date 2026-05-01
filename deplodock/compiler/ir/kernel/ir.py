@@ -236,31 +236,16 @@ class TmaLoad(Stmt):
 
         smem_flat = render_index(self.smem, self.smem_index, ctx)
         rank = len(self.coords)
-        # Coord operand placeholders %2..%(2+rank-1); mbar address is the
-        # last operand. PTX expects each coord in its own register, in
-        # driver order (innermost-first), which is the reverse of our
-        # C-order ``coords`` (== ``stage.origin``).
-        coord_placeholders = ", ".join(f"%{2 + i}" for i in range(rank))
-        coord_inputs = ", ".join(f'"r"({c.render(ctx)})' for c in reversed(self.coords))
-        mbar_idx = 2 + rank
-        pad = _pad(ctx.indent)
+        # PTX expects coords in driver order (innermost-first), which is
+        # the reverse of our C-order ``coords`` (== ``stage.origin``).
+        coord_args = ", ".join(c.render(ctx) for c in reversed(self.coords))
         mbar_addr = "&" + self.mbar if self.mbar_slot is None else f"&{self.mbar}[{self.mbar_slot.render(ctx)}]"
-        # PTX qualifier: use ``.shared::cta`` (single-CTA TMA) rather than
-        # ``.shared::cluster`` — the latter requires an explicit thread-block
-        # cluster launch (``__cluster_dims__`` / cudaLaunchKernelEx) which
-        # we don't yet emit. Without a cluster, ``.shared::cluster`` faults
-        # with an unspecified launch failure on Hopper/Blackwell.
-        ptx = (
-            f'asm volatile("cp.async.bulk.tensor.{rank}d.shared::cta.global.mbarrier::complete_tx::bytes '
-            f'[%0], [%1, {{{coord_placeholders}}}], [%{mbar_idx}];\\n" '
-            f':: "r"(_smem_addr), "l"({self.desc}), {coord_inputs}, "r"(_mbar_addr) : "memory");'
-        )
+        pad = _pad(ctx.indent)
+        # The ``cp_async_bulk_tensor_<rank>d`` helpers are defined in the
+        # kernel prelude — single-CTA ``.shared::cta`` qualifier; cluster
+        # launches would need a separate helper variant.
         return [
-            f"{pad}{{",
-            f"{pad}    unsigned int _smem_addr = __cvta_generic_to_shared(&{self.smem}[{smem_flat}]);",
-            f"{pad}    unsigned int _mbar_addr = __cvta_generic_to_shared({mbar_addr});",
-            f"{pad}    {ptx}",
-            f"{pad}}}",
+            f"{pad}cp_async_bulk_tensor_{rank}d(&{self.smem}[{smem_flat}], {self.desc}, {coord_args}, {mbar_addr});",
         ]
 
 
@@ -296,12 +281,7 @@ class MbarrierInit(Stmt):
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         addr = "&" + self.mbar if self.slot is None else f"&{self.mbar}[{self.slot.render(ctx)}]"
-        return [
-            f"{pad}{{",
-            f"{pad}    unsigned int _mbar_addr = __cvta_generic_to_shared({addr});",
-            f'{pad}    asm volatile("mbarrier.init.shared.b64 [%0], %1;\\n" :: "r"(_mbar_addr), "r"({self.count}) : "memory");',
-            f"{pad}}}",
-        ]
+        return [f"{pad}mbarrier_init({addr}, {self.count});"]
 
 
 @dataclass
@@ -321,17 +301,7 @@ class MbarrierArriveExpectTx(Stmt):
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         addr = "&" + self.mbar if self.slot is None else f"&{self.mbar}[{self.slot.render(ctx)}]"
-        ptx = (
-            f'asm volatile("mbarrier.arrive.expect_tx.shared.b64 %0, [%1], %2;\\n" '
-            f': "=l"(_state) : "r"(_mbar_addr), "r"({self.bytes_}) : "memory");'
-        )
-        return [
-            f"{pad}{{",
-            f"{pad}    unsigned int _mbar_addr = __cvta_generic_to_shared({addr});",
-            f"{pad}    unsigned long long _state;",
-            f"{pad}    {ptx}",
-            f"{pad}}}",
-        ]
+        return [f"{pad}mbarrier_arrive_expect_tx({addr}, {self.bytes_});"]
 
 
 @dataclass
@@ -353,16 +323,7 @@ class MbarrierWait(Stmt):
         pad = _pad(ctx.indent)
         addr = "&" + self.mbar if self.slot is None else f"&{self.mbar}[{self.slot.render(ctx)}]"
         phase_expr = self.phase.render(ctx)
-        return [
-            f"{pad}{{",
-            f"{pad}    unsigned int _mbar_addr = __cvta_generic_to_shared({addr});",
-            f"{pad}    int _ready = 0;",
-            f"{pad}    while (!_ready) {{",
-            f'{pad}        asm volatile("{{.reg .pred P; mbarrier.try_wait.parity.shared.b64 P, [%1], %2; selp.b32 %0, 1, 0, P;}}\\n"'
-            f' : "=r"(_ready) : "r"(_mbar_addr), "r"({phase_expr}));',
-            f"{pad}    }}",
-            f"{pad}}}",
-        ]
+        return [f"{pad}mbarrier_wait_parity({addr}, {phase_expr});"]
 
 
 @dataclass

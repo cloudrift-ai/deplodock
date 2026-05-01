@@ -11,15 +11,79 @@ from __future__ import annotations
 from deplodock.compiler.ir.kernel.ir import KernelOp, TmaDescriptor
 from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
 
-# Forward declaration of CUtensorMap as an opaque 128-byte aligned struct.
-# NVRTC doesn't ship ``<cuda.h>`` so we can't ``#include`` the official
-# definition; the kernel only takes the descriptor's address for inline
-# asm, so an opaque alias is sufficient. The 64-byte alignment matches
-# what ``cuTensorMapEncodeTiled`` produces and what the TMA hardware
-# requires for the descriptor pointer.
-_CUTENSORMAP_DECL = (
-    "struct __align__(64) CUtensorMap { unsigned long long opaque[16]; };\n"
-)
+# TMA / mbarrier prelude. NVRTC doesn't ship ``<cuda.h>`` /
+# ``<cuda/ptx>`` / ``<cuda/barrier>``, so we can't ``#include`` the
+# stock ``cuda::ptx::*`` intrinsics; pulling those headers in via a
+# CUDA-toolkit-version-locked include path also drags in libcu++.
+# Instead we forward-declare ``CUtensorMap`` as an opaque 128-byte
+# aligned struct (the kernel only takes its address) and define small
+# ``__forceinline__`` wrappers around the inline-PTX so the body reads
+# like ``mbarrier_init(&mbar[s], 1)`` rather than 5 lines of asm. Same
+# generated SASS as raw asm — these helpers fold away at compile time.
+_TMA_PRELUDE = """\
+struct __align__(64) CUtensorMap { unsigned long long opaque[16]; };
+
+static __device__ __forceinline__ void mbarrier_init(unsigned long long* mbar, int count) {
+    unsigned int addr = __cvta_generic_to_shared(mbar);
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;\\n" :: "r"(addr), "r"(count) : "memory");
+}
+
+static __device__ __forceinline__ void mbarrier_arrive_expect_tx(unsigned long long* mbar, int bytes) {
+    unsigned int addr = __cvta_generic_to_shared(mbar);
+    unsigned long long state;
+    asm volatile("mbarrier.arrive.expect_tx.shared.b64 %0, [%1], %2;\\n"
+                 : "=l"(state) : "r"(addr), "r"(bytes) : "memory");
+}
+
+static __device__ __forceinline__ bool mbarrier_try_wait_parity(unsigned long long* mbar, int phase) {
+    unsigned int addr = __cvta_generic_to_shared(mbar);
+    int ready;
+    asm volatile("{.reg .pred P; mbarrier.try_wait.parity.shared.b64 P, [%1], %2; selp.b32 %0, 1, 0, P;}\\n"
+                 : "=r"(ready) : "r"(addr), "r"(phase));
+    return ready != 0;
+}
+
+static __device__ __forceinline__ void mbarrier_wait_parity(unsigned long long* mbar, int phase) {
+    while (!mbarrier_try_wait_parity(mbar, phase)) {}
+}
+
+static __device__ __forceinline__ void cp_async_bulk_tensor_2d(
+    void* smem, const CUtensorMap* desc, int c0, int c1, unsigned long long* mbar) {
+    unsigned int saddr = __cvta_generic_to_shared(smem);
+    unsigned int maddr = __cvta_generic_to_shared(mbar);
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3}], [%4];\\n"
+                 :: "r"(saddr), "l"(desc), "r"(c0), "r"(c1), "r"(maddr) : "memory");
+}
+
+static __device__ __forceinline__ void cp_async_bulk_tensor_3d(
+    void* smem, const CUtensorMap* desc, int c0, int c1, int c2, unsigned long long* mbar) {
+    unsigned int saddr = __cvta_generic_to_shared(smem);
+    unsigned int maddr = __cvta_generic_to_shared(mbar);
+    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3, %4}], [%5];\\n"
+                 :: "r"(saddr), "l"(desc), "r"(c0), "r"(c1), "r"(c2), "r"(maddr) : "memory");
+}
+
+static __device__ __forceinline__ void cp_async_bulk_tensor_4d(
+    void* smem, const CUtensorMap* desc, int c0, int c1, int c2, int c3, unsigned long long* mbar) {
+    unsigned int saddr = __cvta_generic_to_shared(smem);
+    unsigned int maddr = __cvta_generic_to_shared(mbar);
+    asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3, %4, %5}], [%6];\\n"
+                 :: "r"(saddr), "l"(desc), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(maddr) : "memory");
+}
+
+static __device__ __forceinline__ void cp_async_bulk_tensor_5d(
+    void* smem, const CUtensorMap* desc, int c0, int c1, int c2, int c3, int c4, unsigned long long* mbar) {
+    unsigned int saddr = __cvta_generic_to_shared(smem);
+    unsigned int maddr = __cvta_generic_to_shared(mbar);
+    asm volatile("cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3, %4, %5, %6}], [%7];\\n"
+                 :: "r"(saddr), "l"(desc), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(c4), "r"(maddr) : "memory");
+}
+
+"""
 
 _INTRINSIC_TO_CUDA: dict[str, str] = {
     "exp": "expf",
@@ -105,7 +169,7 @@ def render_kernelop(
     launch_bounds = f"\n__launch_bounds__({bounds})"
 
     body_text = "\n".join(render_body(kernel_op.body, ctx))
-    prelude = _CUTENSORMAP_DECL if desc_names else ""
+    prelude = _TMA_PRELUDE if desc_names else ""
     return f'{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
 
 
