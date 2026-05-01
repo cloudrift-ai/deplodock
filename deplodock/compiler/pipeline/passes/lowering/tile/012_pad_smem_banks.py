@@ -4,59 +4,73 @@
 Problem
 =======
 
-After ``010_stage_inputs`` + ``011_merge_stages`` lay out a slab in
-shared memory, body Loads read the slab using thread-decoded coords.
-When the slab's per-axis stride is a multiple of 32 floats (the smem
-bank count × 4 bytes / 4 bytes per float), every thread in a warp
-hits the same bank — a 32-way conflict that serializes 32 LDS
-instructions into 32 single-bank reads.
+After ``007_stage_inputs`` lays out a slab in shared memory, body
+Loads read it using thread-decoded coords. When the slab's per-thread-
+axis stride is a multiple of 32 floats (the smem bank count × 4 bytes
+/ 4 bytes per float), every thread in a warp hits the same bank — a
+32-way conflict that serializes 32 LDS instructions into 32 single-
+bank reads.
 
-Concretely for a matmul W slab with shape ``(8, 4, 64, 2)`` and
-strides ``(512, 128, 2, 1)``: within a warp ``(a3, a4)`` cycles
-through ``[0,8)×[0,4)``, addresses span ``a3*512 + a4*128``, mod 32
-floats = 0 for every thread. 32-way conflict.
+Concretely for a W slab with shape ``(8, 4, 64, 2)`` and strides
+``(512, 128, 2, 1)``: within a warp ``(a3, a4)`` cycles through
+``[0,8)×[0,4)``, addresses span ``a3*512 + a4*128``, mod 32 = 0 for
+every thread. 32-way conflict.
 
 Fix
 ===
 
-Add ``+1`` padding to the second-fastest cache-axis extent. The smem
-allocation grows by one row's worth, every higher-stride row shifts by
-one float, and the per-thread address mod 32 changes from a uniform 0
-to a sequence that touches all 32 banks.
+Add ``+1`` padding to one cache-axis extent. The smem allocation grows
+by one row, every higher-stride row shifts by one float, and the per-
+thread address mod 32 changes from a uniform 0 to a sequence that
+touches all 32 banks.
+
+Analysis (closed-form, no per-thread evaluator)
+================================================
+
+For an affine Load index, decompose each dim into
+``anchor + sum_v(coeff_v * Var(v))`` over the thread-axis vars (via
+:func:`affine_form`). The flat smem address for a Load is
+``sum_d (idx[d] * stride[d])``. Substituting the decomposition:
+
+    flat(tid) = warp_const + sum_v (S_v * tid_v(tid))
+
+where ``S_v = sum_d coeff_v_d * stride[d]`` is the per-thread-axis
+contribution to the flat address. ``warp_const`` collects the anchor
+parts plus everything that doesn't reference a thread-axis Var — it
+shifts every thread's address by the same amount and so contributes a
+constant offset to *all* banks; the bank distribution it produces is
+independent of ``warp_const``.
+
+So bank conflict counting reduces to: enumerate ``tid ∈ [0, 32)``,
+decode ``(tid_v)`` per :func:`materialize_tile`'s tid-flatten scheme,
+compute ``flat_v = sum_v S_v * tid_v``, distribute by ``flat_v % 32``,
+count distinct addresses per bank. Broadcasts (multiple tids → same
+``flat_v``) don't count as conflicts.
 
 The pass:
 
-1. For each ``Stage`` in the Tile body, find body ``Load`` stmts that
-   read from this stage.
-2. Simulate one warp's smem accesses. Decode each thread's
-   ``(a1, a3, a4, ...)`` from ``tid``, evaluate the Load index with
-   those values, compute ``flat_addr % 32`` per thread → bank
-   distribution.
-3. If max-way conflict > 1 (and not a pure broadcast), try ``+1``
-   padding on each cache-axis dim (innermost-first). Pick the first
-   pad that resolves the conflict.
-4. If no single ``+1`` resolves it, log a diagnostic with the
-   remaining conflict so the user can consider a larger restructure
-   (axis permute, layout change in staging).
-
-Side note: padding the *innermost* dim (stride 1) doesn't help because
-the body Load still reads stride-1 across cells. Padding *outer* dims
-shifts middle-row addresses, which is exactly the broken-alignment we
-want.
+1. For each ``Stage`` in the Tile body, find body Loads reading it.
+2. Compute per-axis ``S_v`` once per Load via :func:`affine_form`.
+3. If any Load is non-affine in the thread-axis vars, conservatively
+   skip the Stage (we can't bound its conflict without the analyzer).
+4. Try ``+1`` padding combinations (1-dim, then 2-dim) within
+   ``_MAX_PADDED_SLAB_BYTES``; pick the first that drives every
+   Load's max-way conflict to 1. Fall back to the best partial fix.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.stmt import Load, Loop, Stmt, Tile, iter_body
-from deplodock.compiler.ir.tile.ir import Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.ir.expr import affine_form
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, Stage, TileOp
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +79,13 @@ PATTERN = [Pattern("root", TileOp)]
 WARP_SIZE = 32
 BANKS = 32  # 32 banks of 4 bytes
 # Per-Stage padded-slab budget. The static-smem cap on consumer Ada/Hopper
-# is 48 KB = 12288 floats. Stages get double-buffered downstream (×2) and
-# typical matmul kernels have ≥ 2 sibling Stages, so per-Stage pre-DB
-# budget is roughly cap / 4 → 3072. We give a slightly larger headroom
-# (5120) so single-large-Stage kernels still benefit, and accept that a
-# matmul with two near-equal Stages may miss the perfect-fix candidate
-# and fall back to the partial-fix pad.
-_MAX_PADDED_SLAB_FLOATS = 5 * 1024
+# is 48 KB. Stages get double-buffered downstream (×2) and typical matmul
+# kernels have ≥ 2 sibling Stages, so per-Stage pre-DB budget is roughly
+# cap / 4 → 12 KB. We give a slightly larger headroom (20 KB) so single-
+# large-Stage kernels still benefit, and accept that a matmul with two
+# near-equal Stages may miss the perfect-fix candidate and fall back to
+# the partial-fix pad.
+_MAX_PADDED_SLAB_BYTES = 20 * 1024
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -82,23 +96,20 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
-    tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
-    if len(tiles) != 1:
-        return None
-    idx, tile = tiles[0]
+def _maybe_rewrite(body: Body) -> Body | None:
+    idx, tile = single_tile(body)
 
     thread_axes = tuple(ba.axis for ba in tile.axes if ba.bind == BIND_THREAD)
     if not thread_axes:
-        return None
+        raise RuleSkipped("Tile has no THREAD axes — no bank-conflict layout to pad")
 
     new_tile_body = _process_body(tile.body, thread_axes)
     if new_tile_body is tile.body or new_tile_body == tile.body:
-        return None
+        raise RuleSkipped("no Stage has a fixable bank conflict within slab budget")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process_body(body: tuple[Stmt, ...], thread_axes: tuple[Axis, ...]) -> tuple[Stmt, ...]:
+def _process_body(body: Body, thread_axes: tuple[Axis, ...]) -> Body:
     """Walk body and any free-Loop scopes; pad each Stage that has a
     fixable conflict. Returns the new body (or original if no changes)."""
     new_body: list[Stmt] = list(body)
@@ -120,17 +131,29 @@ def _process_body(body: tuple[Stmt, ...], thread_axes: tuple[Axis, ...]) -> tupl
     return tuple(new_body) if changed else body
 
 
-def _loads_reading(body: tuple[Stmt, ...], stage_name: str) -> list[Load]:
+def _loads_reading(body: Body, stage_name: str) -> list[Load]:
     """Collect every Load anywhere in ``body`` reading from ``stage_name``."""
-    return [s for s in iter_body(body) if isinstance(s, Load) and s.input == stage_name]
+    return [s for s in body.iter() if isinstance(s, Load) and s.input == stage_name]
 
 
 def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> Stage | None:
     n = len(stage.axes)
     base_extents = tuple(int(ax.extent) for ax in stage.axes)
 
+    # Precompute per-Load affine coefficients of the index over thread-axis vars.
+    # Bail conservatively if any Load is non-affine in those vars.
+    thread_var_set = frozenset(ax.name for ax in thread_axes)
+    per_load_coeffs: list[list[dict[str, int]]] = []
+    for load in loads:
+        if len(load.index) != n:
+            return None
+        forms = [affine_form(e, thread_var_set) for e in load.index]
+        if any(f is None for f in forms):
+            return None
+        per_load_coeffs.append([coeffs for _, coeffs in forms if (_, coeffs) is not None])  # type: ignore[misc]
+
     no_pad = (0,) * n
-    base_conflict = _max_conflict(loads, base_extents, thread_axes)
+    base_conflict = _max_conflict(per_load_coeffs, base_extents, thread_axes)
     if base_conflict <= 1:
         return None
 
@@ -155,12 +178,12 @@ def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> 
     best_c = base_conflict
     for pad in candidates:
         padded = tuple(e + p for e, p in zip(base_extents, pad, strict=True))
-        slab_floats = 1
+        slab_bytes = BYTES_PER_ELEM
         for e in padded:
-            slab_floats *= e
-        if slab_floats > _MAX_PADDED_SLAB_FLOATS:
+            slab_bytes *= e
+        if slab_bytes > _MAX_PADDED_SLAB_BYTES:
             continue
-        c = _max_conflict(loads, padded, thread_axes)
+        c = _max_conflict(per_load_coeffs, padded, thread_axes)
         if c <= 1:
             n_pad_dims = sum(1 for p in pad if p)
             logger.info(
@@ -188,72 +211,48 @@ def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> 
     return None
 
 
-def _max_conflict(loads: list[Load], padded_extents: tuple[int, ...], thread_axes: tuple[Axis, ...]) -> int:
-    """Worst-case max-way bank conflict across all body Loads of this stage.
+def _max_conflict(
+    per_load_coeffs: list[list[dict[str, int]]],
+    padded_extents: tuple[int, ...],
+    thread_axes: tuple[Axis, ...],
+) -> int:
+    """Worst-case max-way bank conflict across all body Loads.
 
-    For each Load, simulate one warp (tid 0..31), decode thread-axis Vars
-    from tid, evaluate the Load index, compute smem flat address ↦ bank.
-    Conflict = max # of *distinct* addresses landing in the same bank
-    (broadcast — same address — is not counted)."""
-    strides: list[int] = []
-    cur = 1
-    for e in reversed(padded_extents):
-        strides.insert(0, cur)
-        cur *= e
-
+    For each Load, the flat smem address is an affine function of the
+    thread-axis Vars: ``flat = warp_const + sum_v S_v * tid_v`` where
+    ``S_v = sum_d coeff_v_d * stride[d]``. The constant warp-uniform
+    part shifts every thread's address by the same amount and doesn't
+    affect the bank distribution, so we drop it. We then enumerate the
+    32 warp lanes, decode each lane's ``tid_v`` per
+    ``materialize_tile``'s flatten scheme, compute ``flat_v % 32``, and
+    count distinct addresses per bank (broadcasts don't count)."""
+    strides = _strides(padded_extents)
     max_way = 1
-    for load in loads:
-        if len(load.index) != len(padded_extents):
-            continue
+    for coeffs_per_dim in per_load_coeffs:
+        # Per-thread-axis contribution to the flat address.
+        contrib: dict[str, int] = defaultdict(int)
+        for d, coeffs in enumerate(coeffs_per_dim):
+            for ax_name, c in coeffs.items():
+                contrib[ax_name] += c * strides[d]
+
         bank_to_addrs: dict[int, set[int]] = defaultdict(set)
         for tid in range(WARP_SIZE):
-            env = _decode_threads(tid, thread_axes)
             flat = 0
-            for d, idx_expr in enumerate(load.index):
-                v = _eval_int(idx_expr, env)
-                flat += v * strides[d]
+            rem = tid
+            for ax in reversed(thread_axes):
+                ext = int(ax.extent)
+                flat += contrib.get(ax.name, 0) * (rem % ext)
+                rem //= ext
             bank_to_addrs[flat % BANKS].add(flat)
         way = max((len(s) for s in bank_to_addrs.values()), default=1)
         max_way = max(max_way, way)
     return max_way
 
 
-def _decode_threads(tid: int, thread_axes: tuple[Axis, ...]) -> dict[str, int]:
-    """Mirror ``materialize_tile._build_linear_tid``: rightmost thread axis
-    has stride 1 within a warp; outer axes scale up."""
-    env: dict[str, int] = {}
-    rem = tid
-    for ax in reversed(thread_axes):
-        ext = int(ax.extent)
-        env[ax.name] = rem % ext
-        rem //= ext
-    return env
-
-
-def _eval_int(expr: Expr, env: dict[str, int]) -> int:
-    """Integer-eval an index expression. Vars not in ``env`` are treated
-    as 0 (they're warp-uniform — reduce-loop vars, block axes, etc — and
-    contribute the same offset to every thread, so they don't affect bank
-    distribution)."""
-    if isinstance(expr, Literal):
-        return int(expr.value) if isinstance(expr.value, (int, bool)) else int(expr.value)
-    if isinstance(expr, Var):
-        return env.get(expr.name, 0)
-    if isinstance(expr, BinaryExpr):
-        lv = _eval_int(expr.left, env)
-        rv = _eval_int(expr.right, env)
-        if expr.op == "+":
-            return lv + rv
-        if expr.op == "-":
-            return lv - rv
-        if expr.op == "*":
-            return lv * rv
-        if expr.op in ("/", "//"):
-            return lv // rv if rv != 0 else 0
-        if expr.op == "%":
-            return lv % rv if rv != 0 else 0
-    return 0
-
-
-# Silence ruff F401: ``Counter`` is used implicitly via defaultdict.
-_ = Counter
+def _strides(padded_extents: tuple[int, ...]) -> list[int]:
+    strides: list[int] = []
+    cur = 1
+    for e in reversed(padded_extents):
+        strides.insert(0, cur)
+        cur *= e
+    return strides

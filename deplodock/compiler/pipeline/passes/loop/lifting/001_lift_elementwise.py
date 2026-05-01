@@ -15,8 +15,9 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Stmt, Write
+from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", ElementwiseOp)]
 
@@ -24,7 +25,7 @@ PATTERN = [Pattern("root", ElementwiseOp)]
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     out_shape = tuple(root.output.shape)
     if out_shape and not all(isinstance(d, int) for d in out_shape):
-        return None
+        raise RuleSkipped(f"output shape {out_shape} contains non-int dims; need static shapes")
 
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
 
@@ -39,13 +40,13 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         load_stmts.append(Load(name=name, input=inp_id, index=idx))
 
     write_index = tuple(Var(a.name) for a in axes)
-    inner: tuple[Stmt, ...] = (
+    inner: Body = (
         *load_stmts,
         Assign(name="v", op=root.op.op, args=tuple(load_names)),
         Write(output=f"lift_{root.id}", index=write_index, value="v"),
     )
     # Nest the body in free-axis Loops (outer axis wraps the innermost).
-    body: tuple[Stmt, ...] = inner
+    body: Body = inner
     for a in reversed(axes):
         body = (Loop(axis=a, body=body),)
     kernel = LoopOp(body=body)

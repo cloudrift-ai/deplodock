@@ -150,14 +150,28 @@ def _lookup_op_class(name: str) -> type[Op] | None:
 def _serialize_field(v):
     """Flatten non-JSON-friendly op field values to a JSON-compatible form.
 
-    Currently only special-cases ``ir.elementwise.ElementwiseImpl`` (stored
-    as its ``name`` string); everything else passes through. ``_deserialize_field``
-    reverses this on load.
+    Special cases:
+
+    - ``ir.elementwise.ElementwiseImpl`` → its ``name`` string.
+    - ``ir.stmt.Body`` → the underlying ``stmts`` tuple. Body is an
+      in-memory wrapper; on disk we keep the tuple-of-stmts form so
+      ``_deserialize_field``'s list-of-Stmt-reprs path keeps working
+      unchanged. ``LoopOp.__post_init__`` / ``TileOp.__post_init__``
+      coerce the tuple back to Body on load.
+
+    Everything else passes through. ``_deserialize_field`` reverses
+    this on load.
     """
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from deplodock.compiler.ir.stmt import Body
 
     if isinstance(v, ElementwiseImpl):
         return v.name
+    if isinstance(v, Body):
+        # Body is a ``tuple`` subclass; downcast to plain tuple so
+        # JSON encodes element-by-element rather than via ``__repr__``
+        # (which would produce a single ``"Body((...))"`` string).
+        return tuple(v)
     return v
 
 
@@ -221,7 +235,15 @@ def _stmt_eval_scope() -> dict:
         Tile,
         Write,
     )
-    from deplodock.compiler.ir.tile.ir import AsyncWait, Combine, Stage
+    from deplodock.compiler.ir.tile.ir import (
+        AffineAddressing,
+        AsyncBufferedStage,
+        AsyncWait,
+        BufferedStage,
+        Combine,
+        Stage,
+        TemplateAddressing,
+    )
 
     _STMT_EVAL_SCOPE = {
         "Axis": Axis,
@@ -247,6 +269,10 @@ def _stmt_eval_scope() -> dict:
         "Cond": Cond,
         "Tile": Tile,
         "Stage": Stage,
+        "BufferedStage": BufferedStage,
+        "AsyncBufferedStage": AsyncBufferedStage,
+        "AffineAddressing": AffineAddressing,
+        "TemplateAddressing": TemplateAddressing,
         "Combine": Combine,
         "AsyncWait": AsyncWait,
         "Smem": Smem,
@@ -559,7 +585,7 @@ def _rename_buf_in_op(op, old: str, new: str):
     """Rewrite ``Load.source`` / ``Write.output`` references inside a
     ``LoopOp`` body from ``old`` to ``new`` (recursively into nested Loops).
     Pass-through for op types without internal buf refs."""
-    from deplodock.compiler.ir.loop import Load, Loop, LoopOp, Write, map_body
+    from deplodock.compiler.ir.loop import Load, LoopOp, Write
 
     if not isinstance(op, LoopOp):
         return op
@@ -569,11 +595,9 @@ def _rename_buf_in_op(op, old: str, new: str):
             return Load(name=s.name, input=new, index=s.index)
         if isinstance(s, Write) and s.output == old:
             return Write(output=new, index=s.index, value=s.value)
-        if isinstance(s, Loop):
-            return Loop(axis=s.axis, body=map_body(s.body, fn))
         return s
 
-    return LoopOp(body=map_body(op.body, fn))
+    return LoopOp(body=op.body.map(fn))
 
 
 # ---------------------------------------------------------------------------

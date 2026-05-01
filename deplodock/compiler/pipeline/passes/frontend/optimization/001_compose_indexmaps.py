@@ -22,7 +22,7 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Expr
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 
 PATTERN = [
     Pattern("producer", IndexMapOp),
@@ -34,12 +34,12 @@ def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph
     producer_op = producer.op
     consumer_op = consumer.op
     if not isinstance(producer_op, IndexMapOp) or not isinstance(consumer_op, IndexMapOp):
-        return None
+        raise RuleSkipped("producer or consumer is no longer an IndexMapOp")
 
     # Only compose when the producer has a single source; multi-source
     # IndexMaps (cat) can't be folded positionally.
     if len(producer_op.sources) != 1:
-        return None
+        raise RuleSkipped(f"producer has {len(producer_op.sources)} sources; only single-source composes")
     p_src = producer_op.sources[0]
 
     # The producer feeds exactly the consumer sources whose input_idx

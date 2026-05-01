@@ -3,7 +3,7 @@
 After fusion, each ``LoopOp`` describes the compute for one GPU kernel as
 an SSA program over a named iteration space:
 
-    body              : tuple[Stmt, ...]   — SSA body: Assign | Accum | Write | Select | Loop | Load
+    body              : Body   — SSA body: Assign | Accum | Write | Select | Loop | Load
     axes              : computed property  — iteration space walked from body's Loop tree
     reduce_axis_names : computed property  — names of axes whose Loop wraps an Accum
     loads             : computed property  — body-form Load stmts (external reads)
@@ -26,7 +26,7 @@ before-use, accumulator liveness) are enforced by ``LoopOp.__post_init__``
 (which also runs ``normalize_body`` to canonicalize the body).
 
 Free-function companions (used by passes that work on raw
-``tuple[Stmt, ...]``): ``iter_body`` (pre-order generator),
+``Body``): ``iter_body`` (pre-order generator),
 ``map_body`` (transformer supporting ``Stmt | None | Iterable[Stmt]``),
 ``Stmt.rewrite(rename_ssa, sigma)`` (per-stmt SSA / Expr rewrite).
 """
@@ -34,7 +34,7 @@ Free-function companions (used by passes that work on raw
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import Op
@@ -42,6 +42,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -49,8 +50,6 @@ from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init_
     SelectBranch,
     Stmt,
     Write,
-    iter_body,
-    map_body,
     pretty_body,
 )
 
@@ -76,7 +75,7 @@ class Scope:
 
 
 # Body Stmts (Stmt, Load, Assign, Accum, Write, Select, SelectBranch,
-# Loop, Cond) and the tree-walk helpers (iter_body, map_body) live in
+# Loop, Cond) and the tree-walk helpers (map_body) live in
 # ``ir/stmt.py`` — they're shared across all IR layers. Imported above
 # and re-exported via ``ir/loop/__init__.py``.
 
@@ -96,7 +95,7 @@ class LoopOp(Op):
     computed properties derived from that tree.
     """
 
-    body: tuple[Stmt, ...] = ()
+    body: Body = field(default_factory=Body)
 
     def pretty_body(self, indent: str = "") -> str:
         """Render as an explicit nested-loop program via per-stmt ``pretty``."""
@@ -105,9 +104,12 @@ class LoopOp(Op):
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
 
-        new_body = normalize_body(self.body)
-        if new_body != self.body:
-            self.body = new_body
+        # Body is a tuple subclass; coerce so ``Op(body=tuple_value)``
+        # construction shape keeps working without forcing wrapping at
+        # every rule's rewrite site.
+        coerced = Body.coerce(self.body)
+        normalized = normalize_body(coerced)
+        self.body = normalized if isinstance(normalized, Body) else Body(normalized)
         _validate(self)
 
     @property
@@ -134,7 +136,7 @@ class LoopOp(Op):
         """
         names: set[str] = set()
 
-        def walk(stmts: tuple[Stmt, ...], innermost: str | None) -> None:
+        def walk(stmts: Body, innermost: str | None) -> None:
             for s in stmts:
                 if isinstance(s, Accum) and innermost is not None:
                     names.add(innermost)
@@ -143,17 +145,6 @@ class LoopOp(Op):
 
         walk(self.body, None)
         return frozenset(names)
-
-    @property
-    def loads(self) -> tuple[Load, ...]:
-        """All ``Load`` statements in the body, pre-order.
-
-        New-form successor to ``inputs``: Loads carry an explicit SSA name,
-        source-buffer index, and access pattern — unlike ``$N`` refs, they
-        live at the scope they're needed and can share a source with other
-        Loads that use different indices.
-        """
-        return tuple(s for s in self if isinstance(s, Load))
 
     @property
     def inputs(self) -> tuple[str, ...]:
@@ -165,12 +156,7 @@ class LoopOp(Op):
         here would scramble the mapping (set order is hash-based) and
         positional args would land on the wrong buffer names.
         """
-        return tuple(dict.fromkeys(s.input for s in self.loads))
-
-    @property
-    def writes(self) -> tuple[Write, ...]:
-        """All ``Write`` statements in the body, pre-order."""
-        return tuple(s for s in self if isinstance(s, Write))
+        return tuple(dict.fromkeys(s.input for s in self.body.loads))
 
     @property
     def outputs(self) -> tuple[str, ...]:
@@ -180,22 +166,7 @@ class LoopOp(Op):
         graph-level buffers it Writes to. Single-output kernels (today's
         contract — see ``_infer_write_shape``) report exactly one entry.
         """
-        return tuple(dict.fromkeys(s.output for s in self.writes))
-
-    @property
-    def accums(self) -> tuple[Accum, ...]:
-        """Unique reduce accumulators in the body, pre-order by first use.
-
-        Walks the body; for each distinct ``Accum.name`` returns the first
-        ``Accum`` stmt that targets it. Callers read ``accum.name``,
-        ``accum.op`` (the combine), and ``accum.init`` (identity derived
-        from op) directly without a separate summary type.
-        """
-        seen: dict[str, Accum] = {}
-        for s in self:
-            if isinstance(s, Accum) and s.name not in seen:
-                seen[s.name] = s
-        return tuple(seen.values())
+        return tuple(dict.fromkeys(s.output for s in self.body.writes))
 
     def analyze(self) -> LoopMeta:
         """One-pass summary of the body: name→def, name→scope, writes.
@@ -208,7 +179,7 @@ class LoopOp(Op):
         reduce_axes: dict[str, Axis] = {}
         writes: list[tuple[Write, Scope]] = []
 
-        def walk(stmts: tuple[Stmt, ...], scope: Scope) -> None:
+        def walk(stmts: Body, scope: Scope) -> None:
             for s in stmts:
                 if isinstance(s, Loop):
                     walk(s.body, scope.nest(s.axis))
@@ -244,7 +215,7 @@ class LoopOp(Op):
         """Yield every ``Stmt`` in this op's body in pre-order (same as
         :func:`iter_body`). Enables ``for s in loop_op: ...`` and
         comprehensions like ``[s for s in loop_op if isinstance(s, Load)]``."""
-        return iter_body(self.body)
+        return self.body.iter()
 
     def forward(self, *inputs):
         """Evaluate the kernel body via cppyy-JIT'd C++ — mirrors the other ``Op.forward`` methods.
@@ -401,18 +372,12 @@ def _validate(loop: LoopOp) -> None:
             raise ValueError(f"LoopOp.axes: duplicate axis name {a.name!r}")
         all_axis_names.add(a.name)
 
-    # Accumulator op-consistency: all Updates targeting the same name must
-    # share the same combine op (they're folding into the same accumulator).
-    seen_accums: dict[str, Accum] = {}
-    for info in loop.accums:
-        if info.name in seen_accums:
-            raise ValueError(f"Accumulator: duplicate name {info.name!r}")
-        seen_accums[info.name] = info
-
     # Op-consistency across repeated Updates to same target.
+    # Walks the body and rejects an Accum that conflicts with an
+    # earlier Accum sharing its name. ``target_ops`` is the running map.
     target_ops: dict[str, ElementwiseImpl] = {}
 
-    def _walk(stmts: tuple[Stmt, ...], defined: set[str]) -> set[str]:
+    def _walk(stmts: Body, defined: set[str]) -> set[str]:
         """Validate a body scope. Returns the set of ``Accum.name`` names
         that propagate to the enclosing scope after this body completes
         (they carry the accumulator's finalized value).
@@ -490,6 +455,6 @@ def _validate(loop: LoopOp) -> None:
         raise ValueError("LoopOp body has no Write")
 
 
-# Tree walk helpers (iter_body, map_body) live in ``ir/stmt.py`` — they
+# Tree walk helpers (map_body) live in ``ir/stmt.py`` — they
 # work across all IR layers via ``Stmt.nested``. Imported above and
 # re-exported via ``ir/loop/__init__.py``.

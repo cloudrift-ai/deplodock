@@ -17,7 +17,6 @@ from deplodock.compiler.ir.loop import (
     Loop,
     LoopOp,
     Write,
-    iter_body,
     splice_loop_ops,
     splice_loops,
 )
@@ -30,7 +29,7 @@ from deplodock.compiler.ir.loop import (
 def _ops_by_name(op: LoopOp) -> dict[str, object]:
     """Flatten body, index Assigns/Loads/Accums by their SSA name."""
     out: dict[str, object] = {}
-    for s in iter_body(op.body):
+    for s in op.body.iter():
         name = getattr(s, "name", None)
         if name is not None:
             out[name] = s
@@ -38,11 +37,11 @@ def _ops_by_name(op: LoopOp) -> dict[str, object]:
 
 
 def _count_kind(op: LoopOp, cls: type) -> int:
-    return sum(1 for s in iter_body(op.body) if isinstance(s, cls))
+    return sum(1 for s in op.body.iter() if isinstance(s, cls))
 
 
 def _elementwise_fns(op: LoopOp) -> list[str]:
-    return [s.op.name for s in iter_body(op.body) if isinstance(s, Assign)]
+    return [s.op.name for s in op.body.iter() if isinstance(s, Assign)]
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +93,11 @@ def test_pointwise_chain():
     assert "exp" in fns
     assert "add" in fns
     # Producer's Load (consumer had no other inputs) survives as source 0.
-    loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
+    loads = [s for s in merged.body.iter() if isinstance(s, Load)]
     assert len(loads) == 1
     assert loads[0].input == "src_0"
     # Single Write, referencing the final add.
-    writes = [s for s in iter_body(merged.body) if isinstance(s, Write)]
+    writes = [s for s in merged.body.iter() if isinstance(s, Write)]
     assert len(writes) == 1
 
 
@@ -278,7 +277,7 @@ def test_consumer_extra_input_source_remap():
 
     merged = splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
-    loads = {s.name: s for s in iter_body(merged.body) if isinstance(s, Load)}
+    loads = {s.name: s for s in merged.body.iter() if isinstance(s, Load)}
     # Producer's Load survives at source 0; consumer's unrelated Load shifts to 1.
     assert any(ld.input == "src_0" for ld in loads.values())
     assert any(ld.input == "src_1" for ld in loads.values())
@@ -385,7 +384,7 @@ def test_chain_three_loops():
     assert "negative" in fns
     assert "add" in fns
     # Two external Loads remain (X, BIAS); the splice edges collapsed into copy aliases.
-    loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
+    loads = [s for s in merged.body.iter() if isinstance(s, Load)]
     assert len(loads) == 2
     assert {ld.input for ld in loads} == {"X", "BIAS"}
     assert len(merged.inputs) == 2
@@ -430,7 +429,7 @@ def test_multi_output_root_preserves_all_writes():
 
     merged = splice_loop_ops(producer, consumer, source="out_0")
     assert merged is not None
-    writes = [s for s in iter_body(merged.body) if isinstance(s, Write)]
+    writes = [s for s in merged.body.iter() if isinstance(s, Write)]
     assert {w.output for w in writes} == {"C0", "C1"}
     fns = _elementwise_fns(merged)
     # Producer chain materialized once (shared σ); both consumer ops present.
@@ -487,7 +486,7 @@ def test_multi_output_splice_target():
     assert fns.count("negative") == 1
     assert "add" in fns
     # Only one external Load (target's x); the splice edges replaced sink's Loads.
-    loads = [s for s in iter_body(merged.body) if isinstance(s, Load)]
+    loads = [s for s in merged.body.iter() if isinstance(s, Load)]
     assert len(loads) == 1
     assert len(merged.inputs) == 1
 

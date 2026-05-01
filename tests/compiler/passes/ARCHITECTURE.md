@@ -28,25 +28,25 @@ tests/compiler/pipeline/passes/
 
 ### Decomposition (`passes/frontend/decomposition/`)
 
-| Rule file | Op | Structural | Correctness |
-|---|---|---|---|
-| `001_sdpa.py` | `SdpaOp` | ✓ | ✓ |
-| `002_silu.py` | `ElementwiseOp("silu")` | ✓ | ✓ |
-| `003_pow.py` | `ElementwiseOp("pow")` | ✓ | ✓ |
-| `004_linear.py` | `LinearOp` | ✓ | ✓ (± bias) |
-| `005_matmul.py` | `MatmulOp` | ✓ | ✓ (± bias) |
-| `007_mean.py` | `MeanOp` | ✓ | ✓ |
-| `009_unsqueeze.py` | `UnsqueezeOp` | — | ✓ (dim=0, dim=-1) |
-| `010_transpose.py` | `TransposeOp` | — | ✓ |
-| `011_reshape.py` | `ReshapeOp` | — | ✓ |
-| `012_slice.py` | `SliceOp` | — | ✓ |
-| `013_cat.py` | `CatOp` | — | ✓ |
+| Rule file          | Op                      | Structural | Correctness       |
+|--------------------|-------------------------|------------|-------------------|
+| `001_sdpa.py`      | `SdpaOp`                | ✓          | ✓                 |
+| `002_silu.py`      | `ElementwiseOp("silu")` | ✓          | ✓                 |
+| `003_pow.py`       | `ElementwiseOp("pow")`  | ✓          | ✓                 |
+| `004_linear.py`    | `LinearOp`              | ✓          | ✓ (± bias)        |
+| `005_matmul.py`    | `MatmulOp`              | ✓          | ✓ (± bias)        |
+| `007_mean.py`      | `MeanOp`                | ✓          | ✓                 |
+| `009_unsqueeze.py` | `UnsqueezeOp`           | —          | ✓ (dim=0, dim=-1) |
+| `010_transpose.py` | `TransposeOp`           | —          | ✓                 |
+| `011_reshape.py`   | `ReshapeOp`             | —          | ✓                 |
+| `012_slice.py`     | `SliceOp`               | —          | ✓                 |
+| `013_cat.py`       | `CatOp`                 | —          | ✓                 |
 
 ### Optimization (`passes/frontend/optimization/`)
 
-| Rule file | Op | Structural | Correctness |
-|---|---|---|---|
-| `002_insert_broadcast_indexmap.py` | `ElementwiseOp` (broadcast) | ✓ | ✓ (1D, scalar, 3D, RMSNorm chain) |
+| Rule file                          | Op                          | Structural | Correctness                       |
+|------------------------------------|-----------------------------|------------|-----------------------------------|
+| `002_insert_broadcast_indexmap.py` | `ElementwiseOp` (broadcast) | ✓          | ✓ (1D, scalar, 3D, RMSNorm chain) |
 
 ### Fusion (`passes/loop/lifting/` + `passes/loop/fusion/`)
 
@@ -58,13 +58,13 @@ fusion as a single pass; the splicer's behaviour is exercised
 end-to-end there (no separate unit-test file — the old
 `test_merge_core.py` was retired with `_merge_core.py`).
 
-| Rule file | Op | Tested via |
-|---|---|---|
-| `loop/lifting/001_lift_elementwise.py` | `ElementwiseOp` → `LoopOp` | `test_fusion_rules.py` (pass fixpoint) |
-| `loop/lifting/002_lift_reduce.py`      | `ReduceOp` → `LoopOp`      | `test_fusion_rules.py::test_contraction_*` |
+| Rule file                              | Op                         | Tested via                                                                         |
+|----------------------------------------|----------------------------|------------------------------------------------------------------------------------|
+| `loop/lifting/001_lift_elementwise.py` | `ElementwiseOp` → `LoopOp` | `test_fusion_rules.py` (pass fixpoint)                                             |
+| `loop/lifting/002_lift_reduce.py`      | `ReduceOp` → `LoopOp`      | `test_fusion_rules.py::test_contraction_*`                                         |
 | `loop/lifting/003_lift_indexmap.py`    | `IndexMapOp` → `LoopOp`    | `test_optimization_rules.py::test_matmul_with_transpose_fuses_to_one_kernel` (e2e) |
-| `loop/lifting/004_lift_gather.py`      | `GatherOp` → `LoopOp`      | `test_torch_ops.py::test_gather` |
-| `loop/fusion/001_merge_loop_ops.py`    | `LoopOp → LoopOp` (splice) | `test_fusion_rules.py` (fixpoint) |
+| `loop/lifting/004_lift_gather.py`      | `GatherOp` → `LoopOp`      | `test_torch_ops.py::test_gather`                                                   |
+| `loop/fusion/001_merge_loop_ops.py`    | `LoopOp → LoopOp` (splice) | `test_fusion_rules.py` (fixpoint)                                                  |
 
 Numerical correctness for lifted + merged kernels runs through the
 numpy backends in three places:

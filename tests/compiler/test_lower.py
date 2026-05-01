@@ -52,21 +52,15 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 def _elementwise_fns(body) -> list[str]:
-    from deplodock.compiler.ir.loop import iter_body
-
-    return [s.op.name for s in iter_body(body) if isinstance(s, Assign)]
+    return [s.op.name for s in body.iter() if isinstance(s, Assign)]
 
 
 def _has_update(body) -> bool:
-    from deplodock.compiler.ir.loop import iter_body
-
-    return any(isinstance(s, Accum) for s in iter_body(body))
+    return any(isinstance(s, Accum) for s in body.iter())
 
 
 def _has_write(body) -> bool:
-    from deplodock.compiler.ir.loop import iter_body
-
-    return any(isinstance(s, Write) for s in iter_body(body))
+    return any(isinstance(s, Write) for s in body.iter())
 
 
 def _loop_nodes(graph: Graph) -> list:
@@ -115,7 +109,7 @@ def test_reduce_sum():
     assert len(launches) == 1
     loop = launches[0].op
     assert _has_update(loop.body)
-    assert any(lb.op.name == "add" for lb in loop.accums)
+    assert any(lb.op.name == "add" for lb in loop.body.accums)
 
 
 def test_matmul():
@@ -131,7 +125,7 @@ def test_matmul():
     result = _compile(g)
     launches = _loop_nodes(result)
     has_mul = any("multiply" in _elementwise_fns(k.op.body) for k in launches)
-    has_sum = any(any(lb.op.name == "add" for lb in k.op.accums) for k in launches)
+    has_sum = any(any(lb.op.name == "add" for lb in k.op.body.accums) for k in launches)
     assert has_mul
     assert has_sum
 

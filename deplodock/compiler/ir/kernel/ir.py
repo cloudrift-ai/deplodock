@@ -42,6 +42,7 @@ from deplodock.compiler.ir.expr import (
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -240,11 +241,15 @@ class KernelOp(Op):
     ordered by first appearance. ``Smem`` buffers are excluded.
     """
 
-    body: tuple[Stmt, ...] = ()
+    body: Body = field(default_factory=Body)
     name: str = ""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            self.body = Body.coerce(self.body)
+
     def __iter__(self) -> Iterator[Stmt]:
-        return iter_body(self.body)
+        return self.body.iter()
 
     def pretty_body(self) -> str:
         """Render as an indented structural listing via per-stmt ``pretty``."""
@@ -255,7 +260,7 @@ class KernelOp(Op):
 
     @property
     def loads(self) -> tuple[Load, ...]:
-        return tuple(s for s in self if isinstance(s, Load))
+        return self.body.iter_of_type(Load)
 
     @property
     def smem_names(self) -> frozenset[str]:
@@ -282,7 +287,7 @@ class KernelOp(Op):
 
     @property
     def writes(self) -> tuple[Write, ...]:
-        return tuple(s for s in self if isinstance(s, Write))
+        return self.body.iter_of_type(Write)
 
     @property
     def outputs(self) -> tuple[str, ...]:
@@ -296,7 +301,6 @@ class KernelOp(Op):
 # Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
 # ---------------------------------------------------------------------------
 
-from deplodock.compiler.ir.stmt import iter_body  # noqa: E402, F401
 
 __all__ = [
     # Shared expressions (re-exported)

@@ -1,8 +1,8 @@
-"""Lower each ``LoopOp`` node to a ``TileOp``.
+"""Form a ``TileOp`` from each ``LoopOp`` — "tileification".
 
 Mechanical translation: outer free-Loop chain becomes
 ``Tile(thread_axes=...)``, leaves and inner Loops pass through unchanged.
-Strategy passes (``002_cooperative_reduce``, ``003_block_matmul``) may
+Strategy passes (``002_split_matmul_k``, ``003_cooperative_reduce``) may
 later convert serial Loops to ``StridedLoop`` for cooperative iteration.
 
 **Outer free-Loop chain → ``Tile.thread_axes``**. After stripping
@@ -14,6 +14,16 @@ strategy chooses not to rewrite). The chain ends at: a level with
 multiple sibling stmts, a Loop with ``Accum`` in its immediate body
 (reduce — can't strip), or no Loop at all.
 
+**Body free Loops over output dims → ``Tile.thread_axes``**. After the
+outer chain is stripped, top-level body stmts may still contain free
+Loops whose iteration writes distinct output positions (e.g. fused
+SDPA's head-dim loop sits as a sibling to two softmax reduces). Each
+such Loop is lifted into ``Tile.axes`` (THREAD) and replaced by its
+body, so the launch can spawn one thread per iteration instead of
+serializing the writes. Detection: top-level body stmts only; the
+loop's subtree must contain a ``Write`` whose index expression
+references the loop's axis.
+
 The node's id, inputs, and output tensor are preserved — only the op
 changes.
 """
@@ -23,7 +33,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Loop
+from deplodock.compiler.ir.stmt import Accum, Cond, Loop, StridedLoop, Write
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.tile.ir import Stmt, Tile, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
@@ -36,11 +46,11 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     if desired != root.id and desired not in graph.nodes:
         graph.rename_node(root.id, desired)
     kname = _kernel_name_for(root.op, root.id)
-    root.op = lower_naive(root.op, kname)
+    root.op = tileify(root.op, kname)
     return None
 
 
-def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
+def tileify(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     """Translate a ``LoopOp`` into a ``TileOp`` holding a logical ``Tile``.
 
     Steps:
@@ -67,11 +77,52 @@ def lower_naive(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     body: list[Stmt] = list(leading)
     if output_axes:
         bound = tuple(BoundAxis(axis=ax, bind=BIND_THREAD) for ax in output_axes)
-        body.append(Tile(axes=bound, body=tuple(inner)))
+        body.append(_lift_output_loops(Tile(axes=bound, body=inner)))
     else:
         body.extend(inner)
 
-    return TileOp(body=tuple(body), name=kernel_name)
+    return TileOp(body=body, name=kernel_name)
+
+
+def _lift_output_loops(tile: Tile) -> Tile:
+    """Lift top-level free Loops that wrap a Write whose index varies
+    with the loop's axis into ``Tile.axes`` (THREAD). Only top-level
+    body stmts are considered — nested promotions would mix loop
+    ordering decisions with reduction structure.
+
+    SDPA's head-dim free loop sits at top level (after the two softmax
+    reduces) so this catches the case we care about; without lifting,
+    every thread re-runs the inner reduce per head-dim element.
+    """
+    new_axes = list(tile.axes)
+    new_body: list[Stmt] = []
+    changed = False
+    for s in tile.body:
+        if isinstance(s, Loop) and not s.is_reduce and _writes_with_axis(s.body, s.axis.name):
+            new_axes.append(BoundAxis(axis=s.axis, bind=BIND_THREAD))
+            new_body.extend(s.body)
+            changed = True
+        else:
+            new_body.append(s)
+    if not changed:
+        return tile
+    return Tile(axes=tuple(new_axes), body=new_body)
+
+
+def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
+    for s in stmts:
+        if isinstance(s, Write):
+            free: set[str] = set()
+            for e in s.index:
+                free |= e.free_vars()
+            if axis_name in free:
+                return True
+        if isinstance(s, (Loop, StridedLoop)) and _writes_with_axis(s.body, axis_name):
+            return True
+        if isinstance(s, Cond):
+            if _writes_with_axis(s.body, axis_name) or _writes_with_axis(s.else_body, axis_name):
+                return True
+    return False
 
 
 def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ...], tuple[LoopStmt, ...]]:

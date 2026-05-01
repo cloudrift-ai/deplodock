@@ -12,7 +12,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, `Stage`, `Combine`, `StridedLoop`)                               |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, `Stage`/`BufferedStage`/`AsyncBufferedStage` with `Affine`/`TemplateAddressing`, `AsyncWait`, `Combine`, `StridedLoop`) |
 | `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
@@ -172,10 +172,15 @@ flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`.
 
 | Symbol             | Role                                                              |
 |--------------------|-------------------------------------------------------------------|
-| `TileOp`           | Graph-op carrying a `Tile`-rooted body. One per kernel.           |
-| `Tile`             | Axis-bound scope wrapper (`axes: tuple[BoundAxis, ...]` + body).  |
-| `Stage`            | Cache an input slab in smem before the body iterates.             |
-| `Combine`          | Cross-thread collapse of an `Accum` target (post reduce loop).    |
+| `TileOp`              | Graph-op carrying a `Tile`-rooted body. One per kernel.                                                                              |
+| `Tile`                | Axis-bound scope wrapper (`axes: tuple[BoundAxis, ...]` + body).                                                                     |
+| `Stage`               | Sync, single-slot smem cache of an input slab. Materialize emits leading `Sync` + cooperative `Load+Write` + trailing `Sync`.        |
+| `BufferedStage`       | `Stage` subtype with `buffer_count >= 2` rotating slabs selected by `phase`. Sync transport, ping-pong slabs (no leading `Sync`).    |
+| `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async`; emits `Smem`+`CpAsyncCopy`+`CpAsyncCommit` only — caller must dominate consumers with `AsyncWait`. |
+| `AffineAddressing`    | `Stage.addressing` variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. |
+| `TemplateAddressing`  | `Stage.addressing` variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views. |
+| `AsyncWait`           | Sync point for outstanding cp.async groups. `keep` is the `wait_group` argument: `0` drains all; `len(stages)` leaves the just-issued chunk in flight. |
+| `Combine`             | Cross-thread collapse of an `Accum` target (post reduce loop).                                                                       |
 
 ## `kernel/`
 

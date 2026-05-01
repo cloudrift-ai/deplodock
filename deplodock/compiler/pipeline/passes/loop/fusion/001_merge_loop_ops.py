@@ -39,8 +39,9 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, Stmt, iter_body, splice_graph
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, splice_graph
+from deplodock.compiler.ir.stmt import Body
+from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 
 _BLOWUP_FACTOR = 8
 
@@ -54,7 +55,7 @@ def _walk_leaf_costs(loop_op: LoopOp):
     """
     reduce_names = loop_op.reduce_axis_names
 
-    def walk(stmts: tuple[Stmt, ...], free_prod: int, reduce_prod: int):
+    def walk(stmts: Body, free_prod: int, reduce_prod: int):
         for s in stmts:
             if isinstance(s, Loop):
                 extent = int(s.axis.extent)
@@ -112,7 +113,7 @@ def _is_pure_indexmap(loop_op: LoopOp) -> bool:
     the indexmap's iteration space — materializing any broadcast the
     indexmap was expressing lazily.
     """
-    for s in iter_body(loop_op.body):
+    for s in loop_op.body.iter():
         if isinstance(s, (Assign, Accum)):
             return False
     return True
@@ -129,7 +130,7 @@ def _output_numel(loop_op: LoopOp) -> int:
 
 def _count_loads_from(consumer_op: LoopOp, producer_buf: str) -> int:
     """Number of ``Load`` stmts in the consumer body reading producer's output buffer."""
-    return sum(1 for ld in consumer_op.loads if ld.input == producer_buf)
+    return sum(1 for ld in consumer_op.body.loads if ld.input == producer_buf)
 
 
 PATTERN = [
@@ -140,9 +141,9 @@ PATTERN = [
 
 def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph | None:
     if not isinstance(producer.op, LoopOp) or not isinstance(consumer.op, LoopOp):
-        return None
+        raise RuleSkipped("producer or consumer is no longer a LoopOp")
     if producer.id not in consumer.inputs:
-        return None
+        raise RuleSkipped(f"producer {producer.id!r} is not an input of consumer {consumer.id!r}")
 
     # Multi-load-of-reduce-heavy-producer guard: if the consumer references
     # the producer's output via more than one Load stmt AND the producer does
@@ -155,7 +156,7 @@ def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph
     # (max + exp) — where the reduce collapses to a row scalar the splicer
     # can hoist — stay fuseable.
     if _reduce_heavy(producer.op) and _count_loads_from(consumer.op, producer.id) > 1:
-        return None
+        raise RuleSkipped("reduce-heavy producer feeds consumer through >1 Load — fusion would duplicate the reduce")
 
     # Build a subgraph: producer, consumer, and their non-producer external
     # inputs as InputOp nodes. ``splice_graph`` classifies each Load via the
@@ -177,7 +178,7 @@ def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph
 
     result = splice_graph(sub)
     if result is None:
-        return None
+        raise RuleSkipped("splice_graph could not align producer/consumer iteration spaces")
     merged, merged_inputs = result
     new_node_id = f"merged_{consumer.id}"
     merged = _rename_write_output(merged, old=consumer.id, new=new_node_id)
@@ -187,9 +188,9 @@ def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph
     post_work = _total_work(merged)
     post_reads = _total_reads(merged)
     if post_work > _BLOWUP_FACTOR * pre_work:
-        return None
+        raise RuleSkipped(f"work blowup: post={post_work} > {_BLOWUP_FACTOR}× pre={pre_work}")
     if post_reads > _BLOWUP_FACTOR * pre_reads:
-        return None
+        raise RuleSkipped(f"read blowup: post={post_reads} > {_BLOWUP_FACTOR}× pre={pre_reads}")
 
     # Broadcast-materialization guard: fusing a compute-bearing producer into
     # a pure-indexmap consumer whose output volume exceeds the producer's
@@ -197,7 +198,10 @@ def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph
     # broadcast stops being lazy). Skip — the indexmap can still fuse the
     # *other* way, into its downstream consumer.
     if _is_pure_indexmap(consumer.op) and not _is_pure_indexmap(producer.op) and _output_numel(consumer.op) > _output_numel(producer.op):
-        return None
+        raise RuleSkipped(
+            f"broadcast materialization: pure-indexmap consumer numel {_output_numel(consumer.op)} > "
+            f"compute producer numel {_output_numel(producer.op)}"
+        )
 
     # Wrap the merged LoopOp in the rule's output fragment. The graph node's
     # ``inputs`` list must be in the SAME order as ``merged.input_bufs`` (the
@@ -233,13 +237,11 @@ def _rename_write_output(op: LoopOp, *, old: str, new: str) -> LoopOp:
     to ``output=new`` (recursively descends into nested Loops). Used by
     fusion to align the spliced root's Writes with the new graph node id.
     """
-    from deplodock.compiler.ir.loop import Loop, Write, map_body
+    from deplodock.compiler.ir.loop import Write
 
     def fn(s):
         if isinstance(s, Write) and s.output == old:
             return Write(output=new, index=s.index, value=s.value)
-        if isinstance(s, Loop):
-            return Loop(axis=s.axis, body=map_body(s.body, fn))
         return s
 
-    return LoopOp(body=map_body(op.body, fn))
+    return LoopOp(body=op.body.map(fn))

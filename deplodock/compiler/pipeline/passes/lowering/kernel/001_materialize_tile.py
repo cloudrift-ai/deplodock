@@ -39,7 +39,16 @@ from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, KernelOp, Smem, Sync, TreeHalve
 from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt, StridedLoop, Tile, Write
-from deplodock.compiler.ir.tile.ir import AsyncWait, Combine, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import (
+    AffineAddressing,
+    AsyncBufferedStage,
+    AsyncWait,
+    BufferedStage,
+    Combine,
+    Stage,
+    TemplateAddressing,
+    TileOp,
+)
 from deplodock.compiler.pipeline.engine import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
@@ -53,7 +62,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         else:
             new_body.append(s)
 
-    root.op = KernelOp(body=tuple(new_body), name=root.op.name)
+    root.op = KernelOp(body=new_body, name=root.op.name)
     return None
 
 
@@ -109,8 +118,7 @@ def _materialize(blk: Tile) -> Stmt:
             new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
             pending_reduce = None
         elif isinstance(stmt, AsyncWait):
-            new_body.append(CpAsyncWait(group=stmt.remaining))
-            new_body.append(Sync())
+            new_body.extend([CpAsyncWait(group=stmt.keep), Sync()])
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit))
@@ -140,7 +148,7 @@ def _materialize(blk: Tile) -> Stmt:
     # the correct scope (Tile body head for reduce-only nesting, inside
     # a free Loop body when one wraps the Accum). Materialize is purely
     # mechanical from here.
-    return Tile(axes=axes, body=tuple(new_body))
+    return Tile(axes=axes, body=new_body)
 
 
 def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
@@ -150,21 +158,20 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit) -> Stmt:
     decided the iteration shape; materialization just walks.
 
     ``filter_emit`` dedupes ``Smem`` decls by name across the whole
-    KernelOp body — pipelined Stages share a buffer name with their
-    prologue counterparts, and only the first decl should reach the
-    rendered kernel."""
+    KernelOp body — software-pipelined ``AsyncBufferedStage``s share
+    a buffer name with their prologue counterparts, and only the first
+    decl should reach the rendered kernel."""
     inner: list[Stmt] = []
     for s in loop.body:
         if isinstance(s, Stage):
             inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads)))
         elif isinstance(s, AsyncWait):
-            inner.append(CpAsyncWait(group=s.remaining))
-            inner.append(Sync())
+            inner.extend([CpAsyncWait(group=s.keep), Sync()])
         elif isinstance(s, (Loop, StridedLoop)):
             inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit))
         else:
             inner.append(transform(s))
-    return replace(loop, body=tuple(inner))
+    return replace(loop, body=inner)
 
 
 def _single_thread_var(thread_axes: tuple) -> str:
@@ -230,9 +237,13 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     iterates the cache axis directly; for N-D, it iterates a synthetic
     flat axis decoded into per-axis coords.
 
-    Source index per source-buffer dim ``d`` =
-    ``origin[d] + decoded[d]`` (the decoded slab coord, if any axis
-    maps to ``d`` via ``slab_dims``); else just ``origin[d]``.
+    Source index reconstruction depends on ``stage.addressing``:
+
+    - ``AffineAddressing(dims)`` — fast path. ``source_index[d] =
+      origin[d] + decoded[d]`` (the decoded slab coord, if any cache
+      axis maps to ``d`` via ``dims``); else just ``origin[d]``.
+    - ``TemplateAddressing(exprs)`` — escape hatch. Sigma-substitute
+      cache-axis Vars → iter-decoded coords into ``exprs``.
 
     Emits a leading ``Sync`` so iterations 2+ of an enclosing serial
     loop (chunked-K matmul) wait for the prior iteration's compute to
@@ -241,8 +252,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     if not stage.axes:
         raise ValueError(f"Stage {stage.name!r} has no cache axes")
     extents = tuple(int(ax.extent) for ax in stage.axes)
-    pad = stage.pad if stage.pad else (0,) * len(extents)
-    padded_extents = tuple(e + p for e, p in zip(extents, pad, strict=True))
+    padded_extents = stage.alloc_extents
 
     # Iteration axis + per-cache-axis coord. Always synthesize a fresh
     # iter axis name so the cooperative-load ``for`` variable can't
@@ -261,7 +271,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         coord_for = _flat_decode(stage.axes, iter_axis.name)
 
     smem_index = tuple(coord_for[ax.name] for ax in stage.axes)
-    if stage.source_index_template is not None:
+    if isinstance(stage.addressing, TemplateAddressing):
         # Non-affine path (``/``, ``%`` from collapsed-reshape views).
         # Cache extent equals the raw axis extent (no F-scale baked in),
         # so substituting cache-axis Vars with their iter coords into
@@ -273,18 +283,17 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         from deplodock.compiler.ir.sigma import Sigma as _Sigma
 
         cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in stage.axes})
-        source_index = tuple(cache_sigma.apply(e) for e in stage.source_index_template)
+        source_index = tuple(cache_sigma.apply(e) for e in stage.addressing.exprs)
     else:
-        decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.slab_dims, stage.axes, strict=True)}
+        assert isinstance(stage.addressing, AffineAddressing)
+        decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.addressing.dims, stage.axes, strict=True)}
         source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
 
-    # Double-buffering: prepend a phase dim to the smem allocation and to
+    # Buffered stages prepend a phase dim to the smem allocation and to
     # both the cooperative-load write index and (downstream) every body
     # Load. The leading Sync is dropped — ping-pong avoids the
     # prev-compute / next-load conflict by using different physical buffers.
-    if stage.buffer_count > 1:
-        if stage.phase is None:
-            raise ValueError(f"Stage {stage.name!r} has buffer_count={stage.buffer_count} but no phase expr")
+    if isinstance(stage, BufferedStage):
         full_extents = (stage.buffer_count, *padded_extents)
         smem_index = (stage.phase, *smem_index)
         prelude: list[Stmt] = []  # leading Sync omitted
@@ -292,18 +301,17 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         full_extents = padded_extents
         prelude = [Sync()]
 
-    if stage.async_load:
+    if isinstance(stage, AsyncBufferedStage):
+        # Async transport: emit cooperative cp.async + commit only. The
+        # sibling ``AsyncWait`` Stmt that dominates every consumer
+        # lowers to ``CpAsyncWait + Sync``; no implicit wait here.
         cooperative_load = StridedLoop(
             axis=iter_axis,
             start=tid_expr,
             step=Literal(n_threads, "int"),
             body=(CpAsyncCopy(smem=stage.name, smem_index=smem_index, src=stage.buf, src_index=source_index),),
         )
-        # Pipelined: only commit; a sibling AsyncWait drains older groups
-        # later. Synchronous-style: commit + wait_group(0) + Sync inline.
-        if stage.pipelined:
-            return [Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit()]
-        return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit(), CpAsyncWait(group=0), Sync()]
+        return [Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit()]
 
     load_name = f"{stage.name}_v"
     cooperative_load = StridedLoop(

@@ -20,8 +20,9 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,8 +34,30 @@ if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
 
 _PASSES_DIR = Path(__file__).parent / "passes"
+_RULE_PREFIX_RE = re.compile(r"^\d+[a-z]?_")
+
+
+def _strip_rule_prefix(name: str) -> str:
+    """Drop the numeric ordering prefix from a rule file stem
+    (``003_cooperative_reduce`` → ``cooperative_reduce``)."""
+    return _RULE_PREFIX_RE.sub("", name)
+
 
 logger = logging.getLogger(__name__)
+
+
+class RuleSkipped(Exception):
+    """Raised by a rule's ``rewrite()`` to signal that the match was
+    considered but skipped, with a human-readable reason for why no
+    rewrite was applied. The engine catches it, logs the reason at
+    DEBUG (visible at ``compile -vv``), and treats the result the same
+    as ``return None`` with no in-place mutation. Use this in place of
+    a bare ``return None`` whenever the skip reason would help debug
+    why a rule didn't fire on a given match."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +258,18 @@ def run_pass(
     dump: CompilerDump | None = None,
     pass_idx: int | None = None,
     pass_name: str | None = None,
+    select: Iterable[str] | None = None,
 ) -> Graph:
-    """Load all rule modules in ``pass_dir`` and apply them to fixed point."""
-    return _apply_rules(graph, _load_rules(pass_dir), dump=dump, pass_idx=pass_idx, pass_name=pass_name)
+    """Load all rule modules in ``pass_dir`` and apply them to fixed
+    point. ``select``, if given, restricts the run to rules whose name
+    (with or without the numeric ordering prefix, e.g. ``tileify`` or
+    ``001_tileify``) appears in the iterable — useful for isolating a
+    single rule's behavior in tests."""
+    rules = _load_rules(pass_dir)
+    if select is not None:
+        wanted = set(select)
+        rules = [r for r in rules if r.name in wanted or _strip_rule_prefix(r.name) in wanted]
+    return _apply_rules(graph, rules, dump=dump, pass_idx=pass_idx, pass_name=pass_name)
 
 
 def run_rule(graph: Graph, rule_path: Path) -> Graph:
@@ -272,24 +304,37 @@ def _apply_rules(
                     if any(nid not in graph.nodes for nid in match.consumed):
                         continue
                     t1 = time.monotonic()
-                    # -vv: snapshot matched-node ops before rewrite so in-place
-                    # mutations (rules that set ``node.op = ...`` and return
-                    # None — e.g. lowering/tile) can render a before/after.
+                    # Snapshot matched-node ops before rewrite. Always
+                    # captured: needed for in-place change detection
+                    # (counting toward ``applied``). At -vv or when a
+                    # dump is set, the same snapshot also drives the
+                    # before/after render text.
                     debug_on = logger.isEnabledFor(logging.DEBUG)
-                    capture_snapshots = debug_on or dump is not None
-                    pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes} if capture_snapshots else {}
+                    pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes}
                     kwargs = _build_rewrite_kwargs(rule, graph, match)
                     if kwargs is None:
                         continue
-                    fragment = rule.rewrite(**kwargs)
+                    try:
+                        fragment = rule.rewrite(**kwargs)
+                    except RuleSkipped as exc:
+                        if debug_on:
+                            logger.debug("rule %s skipped at %s: %s", rule.name, match.root_node_id, exc.reason)
+                        rewrite_time += time.monotonic() - t1
+                        continue
                     if fragment is None:
-                        if any(graph.nodes[nid].op is not pre_ops.get(nid) for nid in pre_ops if nid in graph.nodes):
+                        # Detect both in-place op rebinds AND rule-driven
+                        # rename/delete (e.g. ``tileify`` calls
+                        # ``graph.rename_node``; the old id disappears
+                        # from ``graph.nodes`` even though the rule did
+                        # apply).
+                        if any(nid not in graph.nodes or graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops):
                             text = _format_inplace_application(rule.name, graph, match, pre_ops)
                             if debug_on:
                                 logger.debug(text)
                             if dump is not None and pass_idx is not None and pass_name is not None:
                                 record = _record_inplace_application(graph, match, pre_ops)
                                 dump.on_rule(pass_idx, pass_name, rule.name, record, text)
+                            applied += 1
                         rewrite_time += time.monotonic() - t1
                         continue
                     text = _format_rule_application(rule.name, graph, match, fragment)
@@ -510,13 +555,21 @@ def _remove_orphans(graph: Graph) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline(graph: Graph, passes: list[str], dump: CompilerDump | None = None) -> Graph:
-    """Run each named pass directory in order; dispatch ``dump.on_pass`` after each."""
+def run_pipeline(
+    graph: Graph,
+    passes: list[str],
+    dump: CompilerDump | None = None,
+    select: Iterable[str] | None = None,
+) -> Graph:
+    """Run each named pass directory in order; dispatch ``dump.on_pass``
+    after each. ``select`` is forwarded to :func:`run_pass` for every
+    pass — only rules whose name matches will run."""
     t_start = time.monotonic()
+    select_set = set(select) if select is not None else None
     for idx, name in enumerate(passes, start=1):
         t0 = time.monotonic()
         n_before = len(graph.nodes)
-        graph = run_pass(graph, _PASSES_DIR / name, dump=dump, pass_idx=idx, pass_name=name)
+        graph = run_pass(graph, _PASSES_DIR / name, dump=dump, pass_idx=idx, pass_name=name, select=select_set)
         logger.info("compile: %-18s %.2fs (%d -> %d nodes)", name, time.monotonic() - t0, n_before, len(graph.nodes))
         if dump is not None:
             dump.on_pass(idx, name, graph)

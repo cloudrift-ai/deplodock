@@ -7,7 +7,7 @@ full permutation of length ``ndim`` (``aten.permute``).
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.frontend.ir import TransposeOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", TransposeOp)]
@@ -23,15 +23,15 @@ def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
         a = axes[0] if axes[0] >= 0 else ndim + axes[0]
         b = axes[1] if axes[1] >= 0 else ndim + axes[1]
         if not (0 <= a < ndim and 0 <= b < ndim):
-            return None
+            raise RuleSkipped(f"transpose axes {axes} out of range for ndim={ndim}")
         perm = list(range(ndim))
         perm[a], perm[b] = perm[b], perm[a]
     elif len(axes) == ndim:
         perm = [(a if a >= 0 else ndim + a) for a in axes]
         if sorted(perm) != list(range(ndim)):
-            return None
+            raise RuleSkipped(f"transpose perm {perm} is not a valid permutation of [0,{ndim})")
     else:
-        return None
+        raise RuleSkipped(f"transpose axes length {len(axes)} is neither 2 nor ndim={ndim}")
 
     inv = [0] * ndim
     for i, p in enumerate(perm):

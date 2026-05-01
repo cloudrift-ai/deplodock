@@ -3,12 +3,18 @@
 Each tunable is a hardcoded compiler constant (tile factor, thread tile
 size, K-chunk size, …) that scheduling decisions make heuristically.
 The defaults pick a config based on the kernel's shape: the **default
-small-matmul / pointwise / reduce config** is ``PAT=16, F=2, TB=256,
+small-matmul / pointwise / reduce config** is ``PAT=32, F=2, TB=256,
 BK=64`` — solid across most kernels in our benchmark set. When the
 kernel is a **big matmul** (parallel output ≥ 4096 elements *and* the
 body has a reduce loop with ≥2 distinct buffer Loads), the heuristic
-switches to ``PAT=32, F=4, TB=256, BK=32`` — empirically ~1.6× faster
+switches to ``PAT=64, F=4, TB=256, BK=32`` — empirically ~1.6× faster
 than the small config on Linear(3584, 3584) at seq=512.
+
+PAT and F are paired so ``PAT/F = 16`` in every tier. ``005_blockify_
+launch`` emits PAT-extent THREAD axes per output dim;
+``008_register_tile`` splits each by F and F²-replicates the body. The
+result: ``(PAT/F)² = 256`` threads/CTA exactly, no rebalance pass
+needed.
 
 Env vars override the heuristic for sweeps:
 
@@ -17,7 +23,7 @@ Env vars override the heuristic for sweeps:
 - ``DEPLODOCK_PAT`` — innermost M / N tile width carved by
   ``005_blockify_launch``.
 - ``DEPLODOCK_TB`` — total thread budget per CTA.
-- ``DEPLODOCK_BK`` — K-chunk size for ``004_chunk_reduce`` (subject to
+- ``DEPLODOCK_BK`` — K-split size for ``002_split_matmul_k`` (subject to
   the ``K % BK == 0 and K > BK`` divisibility check).
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 """
@@ -53,17 +59,22 @@ _HUGE_MATMUL_M_MIN = 128
 _HUGE_MATMUL_N_MIN = 2048
 _HUGE_MATMUL_MN_MIN = 819_200
 
-# Default knobs for non-matmul / small kernels.
-_PAT_DEFAULT = 16
+# Default knobs for non-matmul / small kernels. PAT is the per-axis
+# THREAD-tile width that ``005_blockify_launch`` emits per output dim;
+# ``008_register_tile`` then splits it by F so the final per-axis thread
+# count is ``PAT/F``. We pick ``PAT/F = 16`` across every tier so that a
+# matmul kernel lands at exactly ``thread_budget = 256`` threads/CTA
+# right out of register_tile, with no post-hoc rebalance pass needed.
+_PAT_DEFAULT = 32
 _BK_DEFAULT: int | None = None  # use the built-in candidate list (picks 64 for K≥64)
 
 # Knobs for big matmul kernels.
-_PAT_BIG = 32
+_PAT_BIG = 64
 
 # Knobs for huge matmul kernels (M·N·K all large but K not too large).
-# At PAT=64 the smem stage budget forces BK=16 (BK=32 overflows the
+# At PAT=128 the smem stage budget forces BK=16 (BK=32 overflows the
 # 48 KB static-smem limit at typical fp32 stages).
-_PAT_HUGE = 64
+_PAT_HUGE = 128
 _BK_HUGE = 16
 # BK for big matmul: shape-dependent (see ``_pick_big_bk``). Sweep on
 # Llama / Qwen-shape Linears showed BK=32 wins for very large K (≥ 8192)
@@ -74,12 +85,12 @@ _BIG_MN_OVERSATURATED = 1_000_000
 
 # Per-thread register tile factor as a function of the per-axis thread
 # tile width chosen by ``005_blockify_launch``. Each thread owns
-# ``F × F`` output cells; the table fixes a kernel's threads/CTA at
-# ``(PAT/F)² = 64`` regardless of PAT so the launch geometry stays
-# valid (PAT/F=8 → 64 threads/CTA), while per-thread arithmetic scales
-# with PAT² to amortize each smem-load round trip. PAT=64 is admitted
-# here for forward-compat; today's pipeline only emits PAT∈{16,32}.
-_PAT_TO_FACTOR = {16: 2, 32: 4, 64: 8}
+# ``F × F`` output cells; the table fixes ``PAT/F = 16`` across every
+# tier so a matmul kernel lands at ``(PAT/F)² = 256`` threads/CTA after
+# ``008_register_tile`` splits — exactly the thread budget, no post-
+# hoc rebalance needed. Per-thread arithmetic scales with ``F²``
+# (4, 16, 64 outputs/thread for the three tiers).
+_PAT_TO_FACTOR = {32: 2, 64: 4, 128: 8}
 
 
 def _int_env(name: str, default: int) -> int:
@@ -97,21 +108,12 @@ def _has_matmul_reduce(stmts) -> bool:
     distinct buffers — the structural signature of a matmul. Recurses
     through wrapper loops / conds so chunked or output-loop-wrapped
     matmuls (SDPA V-projection) are still detected."""
-    from deplodock.compiler.ir.stmt import Cond, Loop, StridedLoop
+    from deplodock.compiler.ir.stmt import Load, Loop
+    from deplodock.compiler.ir.stmt.body import Body
 
-    for s in stmts:
-        if isinstance(s, Loop):
-            if s.is_reduce and len({ld.input for ld in s.loads}) >= 2:
-                return True
-            if _has_matmul_reduce(s.body):
-                return True
-        elif isinstance(s, StridedLoop):
-            if _has_matmul_reduce(s.body):
-                return True
-        elif isinstance(s, Cond):
-            if _has_matmul_reduce(s.body) or _has_matmul_reduce(s.else_body):
-                return True
-    return False
+    return any(
+        isinstance(s, Loop) and s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2 for s in Body.coerce(stmts).iter()
+    )
 
 
 def _is_big_matmul(tile: Tile) -> bool:
@@ -164,38 +166,29 @@ def _is_huge_matmul(tile: Tile) -> bool:
 def _matmul_K(stmts) -> int | None:
     """Total K extent of the first matmul-shaped reduce loop in ``stmts``.
 
-    Pre-chunk: the reduce loop holds the full K. Post-``004_chunk_reduce``:
+    Pre-split: the reduce loop holds the full K. Post-``002_split_matmul_k``:
     the structure is ``Loop(K_o, free, body=(Loop(K_i, reduce, ...),))``
     and the total K is ``K_o.extent × K_i.extent``. We recognize that
     chunked shape (free Loop with a single reduce child whose body has
     ≥2 buffer Loads) and return the product so heuristics keyed on
     "original K" don't get fooled by chunked tiles.
     """
-    from deplodock.compiler.ir.stmt import Cond, Loop, StridedLoop
+    from deplodock.compiler.ir.stmt import Load, Loop
+    from deplodock.compiler.ir.stmt.body import Body
 
-    for s in stmts:
-        if isinstance(s, Loop):
-            if s.is_reduce and len({ld.input for ld in s.loads}) >= 2:
-                return int(s.axis.extent)
-            if (
-                not s.is_reduce
-                and len(s.body) == 1
-                and isinstance(s.body[0], Loop)
-                and s.body[0].is_reduce
-                and len({ld.input for ld in s.body[0].loads}) >= 2
-            ):
-                return int(s.axis.extent) * int(s.body[0].axis.extent)
-            r = _matmul_K(s.body)
-            if r is not None:
-                return r
-        elif isinstance(s, StridedLoop):
-            r = _matmul_K(s.body)
-            if r is not None:
-                return r
-        elif isinstance(s, Cond):
-            r = _matmul_K(s.body) or _matmul_K(s.else_body)
-            if r is not None:
-                return r
+    for s in Body.coerce(stmts).iter():
+        if not isinstance(s, Loop):
+            continue
+        if s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2:
+            return int(s.axis.extent)
+        if (
+            not s.is_reduce
+            and len(s.body) == 1
+            and isinstance(s.body[0], Loop)
+            and s.body[0].is_reduce
+            and len({ld.input for ld in s.body[0].body.of_type(Load)}) >= 2
+        ):
+            return int(s.axis.extent) * int(s.body[0].axis.extent)
     return None
 
 
@@ -234,6 +227,25 @@ def per_axis_threads(tile: Tile | None = None) -> int:
         if _is_big_matmul(tile):
             return _PAT_BIG
     return _PAT_DEFAULT
+
+
+def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
+    """Per-axis THREAD-tile widths ``005_blockify_launch`` should emit, in
+    innermost-first order. The product equals the *pre*-register-tile
+    thread-budget (``thread_budget × F²`` for matmul; ``thread_budget``
+    for non-matmul where F=1).
+
+    Matmul kernels: ``(PAT, PAT)`` — two PAT-extent thread axes for M and
+    N. After ``008_register_tile`` splits each by F, the post-register-
+    tile layout is ``(PAT/F, PAT/F) = (16, 16) = thread_budget``.
+
+    Non-matmul kernels: ``(thread_budget,)`` — a single fat thread axis
+    for the innermost parallel dim (RMSNorm-row, pointwise-flat, …).
+    """
+    if tile is not None and _has_matmul_reduce(tile.body):
+        pat = per_axis_threads(tile)
+        return (pat, pat)
+    return (thread_budget(),)
 
 
 def detect_pat(tile: Tile) -> int | None:

@@ -1,12 +1,45 @@
 """Shared pytest fixtures for all test modules."""
 
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
+import torch
 import yaml
+
+
+@pytest.fixture(autouse=True)
+def _seed_rng():
+    """Pin RNGs for every test so numerical-tolerance assertions
+    (e.g. ``test_torch_ops.test_unary``) don't flake on inputs that
+    happen to land in tight regions. Determinism > tolerance — a real
+    precision regression should still trip these tests.
+
+    Also reseeds module-level ``rng = np.random.default_rng(...)``
+    Generators in test modules. They're instantiated once at import,
+    so successive ``rng.uniform`` calls inside parametrized tests
+    drift across the session and produce order-dependent flakes
+    (sigmoid/tanh/rsqrt at near-zero inputs etc.). Re-binding ``rng``
+    to a fresh ``default_rng`` with the original seed restores
+    intra-test determinism without changing any test's input
+    distribution."""
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+    for mod in list(sys.modules.values()):
+        if mod is None or not getattr(mod, "__name__", "").startswith("tests."):
+            continue
+        rng = getattr(mod, "rng", None)
+        if isinstance(rng, np.random.Generator):
+            seed = getattr(mod, "_RNG_SEED", 0)
+            mod.rng = np.random.default_rng(seed)
+
 
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")

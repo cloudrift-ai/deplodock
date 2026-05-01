@@ -1,14 +1,23 @@
-"""K-chunk every matmul-shaped reduce Loop in a Tile body into outer
+"""Split-K every matmul-shaped reduce Loop in a Tile body into outer
 (``K_o``) + inner (``K_i``) loops.
+
+Matmul-only by design — the trigger is structural for dot-product
+reductions (≥2 distinct K-indexed buffer Loads + an Accum). Single-
+buffer reductions (softmax, sum, RMSNorm) are skipped.
 
 Runs *before* launch-geometry / blockify, so the trigger can't depend on
 ``Tile.axes`` partitioning. Detection is structural on the reduce body::
 
     Loop(K, reduce, body containing
         Load(A) and Load(B) on distinct buffers,
-        a multiply combining them,
-        an Accum that consumes the multiply
+        both Load index expressions referencing K,
+        an Accum somewhere in the body
     )
+
+The multiply between the two Loads is implicit — by construction it's
+the only way two K-indexed Loads of distinct buffers contribute to an
+Accum in this IR (lifted + fused from a frontend matmul). The rule
+doesn't pattern-match the multiply Assign explicitly.
 
 This catches every matmul-shaped reduction regardless of where it sits
 in the kernel — top of Tile body (plain matmul), nested inside a free
@@ -41,9 +50,10 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -70,13 +80,10 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body):
-    tiles = [(i, s) for i, s in enumerate(body) if isinstance(s, Tile)]
-    if len(tiles) != 1:
-        return None
-    idx, tile = tiles[0]
+    idx, tile = single_tile(body)
     new_body, changed = _chunk_in_body(tile.body, tile)
     if not changed:
-        return None
+        raise RuleSkipped("no matmul-shaped reduce Loop with K-divisor in candidates")
     return body[:idx] + (Tile(axes=tile.axes, body=new_body),) + body[idx + 1 :]
 
 
@@ -93,7 +100,7 @@ def _chunk_in_body(stmts: tuple, tile) -> tuple[tuple, bool]:
         if changed:
             out.append(s)
             continue
-        if isinstance(s, Loop) and s.is_reduce and _is_matmul_reduce(s):
+        if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
             chunked = _chunk_loop(s, tile)
             if chunked is not None:
                 out.append(chunked)
@@ -116,27 +123,6 @@ def _chunk_in_body(stmts: tuple, tile) -> tuple[tuple, bool]:
     return tuple(out), changed
 
 
-def _is_matmul_reduce(loop: Loop) -> bool:
-    """A reduce Loop is matmul-shaped iff its immediate body has Loads
-    of two distinct buffers whose indices both reference the loop's
-    K axis. The multiply / Accum check is implicit — the only way two
-    K-indexed Loads end up in a reduce body and contribute is through a
-    fused-multiply-accumulate chain produced by lifting + fusion."""
-    K_name = loop.axis.name
-    bufs_with_K: set[str] = set()
-    for ld in loop.loads:
-        free: set[str] = set()
-        for e in ld.index:
-            free |= e.free_vars()
-        if K_name in free:
-            bufs_with_K.add(ld.input)
-    if len(bufs_with_K) < 2:
-        return False
-    # Must contain an Accum (otherwise the reduce loop's compute is
-    # pointwise — extremely unusual but guard against it).
-    return any(isinstance(s, Accum) for s in loop.body)
-
-
 def _chunk_loop(loop: Loop, tile) -> Loop | None:
     K = int(loop.axis.extent)
     BK = next((c for c in _bk_candidates(tile) if K % c == 0 and K > c), None)
@@ -144,7 +130,7 @@ def _chunk_loop(loop: Loop, tile) -> Loop | None:
         return None
 
     # Idempotence: already chunked if body has a nested reduce-Loop.
-    if any(inner.is_reduce for inner in loop.loops):
+    if any(inner.is_reduce for inner in loop.body.of_type(Loop)):
         return None
 
     K_name = loop.axis.name

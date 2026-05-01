@@ -8,7 +8,7 @@ produces Kernel IR.
 
 Pipeline shape::
 
-    Loop IR ──lower_naive──▶ Tile IR (logical compute, default bindings)
+    Loop IR ──tileify──▶ Tile IR (logical compute, default bindings)
                      ──[strategy passes]──▶ Tile IR (annotated)
                      ──materialize_tile──▶ Kernel IR
                      ──render_kernelop──▶ CUDA source
@@ -57,6 +57,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -92,28 +93,34 @@ from deplodock.compiler.ir.stmt import (
 
 @dataclass
 class AsyncWait(Stmt):
-    """Wait for outstanding ``cp.async`` groups to drain past
-    ``remaining`` (i.e. block until at most ``remaining`` async groups
-    are still in flight) and barrier the CTA.
+    """Synchronize with previously-issued ``AsyncBufferedStage`` loads.
 
-    Materialization emits ``CpAsyncWait(remaining)`` followed by
-    ``Sync()``. The wait is per-thread (drains *this* thread's queue);
-    the Sync makes the freshly-loaded smem visible to all threads in
-    the CTA before any of them reads it.
+    ``keep`` is the number of most-recently-issued cp.async groups that
+    may *remain* in flight after the wait — i.e. the PTX
+    ``cp.async.wait_group N`` argument. ``keep=0`` drains every
+    outstanding group (epilogue / synchronous-style use). ``keep=K``
+    where K equals the number of ``AsyncBufferedStage`` issued per
+    pipelined iteration leaves the just-issued chunk in flight while
+    older chunks complete (steady-state body of a software-pipelined
+    K-outer loop).
 
-    Used by the software-pipeline pass to express "compute on chunk N
-    can begin once chunk N's load completes, but chunk N+1's load is
-    allowed to remain outstanding"."""
+    Materialization emits ``CpAsyncWait(group=keep)`` followed by
+    ``Sync()`` so the freshly-loaded smem is visible across the CTA.
 
-    remaining: int = 0
+    Carrying ``keep`` explicitly (rather than re-deriving it from the
+    surrounding stage count) keeps the wait correct after structural
+    rewrites such as unrolling a 1-iteration steady-state loop.
+    """
+
+    keep: int = 0
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
-        return AsyncWait(remaining=self.remaining)
+        return AsyncWait(keep=self.keep)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}AsyncWait(remaining={self.remaining})"]
+        return [f"{indent}AsyncWait(keep={self.keep})"]
 
 
 @dataclass
@@ -142,21 +149,61 @@ class Combine(Stmt):
         return [f"{indent}Combine({self.name}, op={self.op.name})"]
 
 
+# Bytes per stored element in smem. Today's pipeline emits fp32 only;
+# Stage carries no dtype. If multi-dtype support lands, move this onto
+# Stage as a per-instance field and update callers.
+BYTES_PER_ELEM = 4
+
+
+@dataclass(frozen=True)
+class AffineAddressing:
+    """Affine slab addressing: each cache axis ``i``'s decoded coord is
+    *added* to source dim ``dims[i]``.
+
+    ``source_index[d] = origin[d] + decoded_coord(dims[i] == d)``.
+
+    Common case (matmul, RMSNorm, softmax). Materialize reconstructs
+    addresses without symbolic substitution.
+    """
+
+    dims: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TemplateAddressing:
+    """Non-affine slab addressing: the consumer Load's original index
+    kept verbatim with cache-axis Vars left symbolic. Materialize
+    Sigma-substitutes cache-axis Vars → iter-decoded coords.
+
+    Used for collapsed-reshape views (``/``, ``%``) and any case where
+    the affine ``origin + decoded`` reconstruction fails. Length ==
+    source-buffer rank.
+    """
+
+    exprs: tuple[Expr, ...]
+
+
 @dataclass
 class Stage(Stmt):
     """Operand-cache declaration — stage a contiguous slab of ``buf``
     into a named local buffer for reuse across the surrounding ``Tile``
     body.
 
+    Synchronous, single-slot form. Materialization emits a leading
+    ``Sync`` (so iter-N compute can finish reading before iter-N+1
+    overwrites smem) plus a cooperative ``Load+Write`` pair and a
+    trailing ``Sync`` so the freshly-loaded smem is visible to all
+    threads in the CTA.
+
     Slab geometry:
 
-    - ``origin`` — per-source-dim block-uniform anchor (length == source
-      buffer rank). Each entry is an Expr referencing only block-bound
-      Vars (``BIND_BLOCK`` axes) and Literals — no thread / cache vars.
+    - ``origin`` — per-source-dim CTA-uniform anchor (length == source
+      buffer rank). Each entry is an Expr that's constant across the
+      threads of a CTA — typically ``BIND_BLOCK`` Vars and Literals.
     - ``axes`` — cache axes (smem layout, in this order).
-    - ``slab_dims`` — parallel to ``axes``; each entry is the source-
-      buffer dim that the slab axis adds to. ``source_index[d] =
-      origin[d] + (slab axis at d, if any)``.
+    - ``addressing`` — discriminated union of ``AffineAddressing``
+      (fast path, ``origin + decoded``) and ``TemplateAddressing``
+      (escape hatch carrying the original symbolic Load index).
 
     SSA-like: ``name`` is the staged buffer's identifier; subsequent
     ``Load(input=name, index=cache-local)`` reads in the body refer to
@@ -168,22 +215,16 @@ class Stage(Stmt):
     descriptor copies: ``origin`` is the box-origin and ``axes``
     extents are the box-extents.
 
-    Doesn't commit to storage class — materialization picks (smem in
-    today's path; TMA / async-copy paths possible in the future).
+    Subclasses ``BufferedStage`` and ``AsyncBufferedStage`` add buffering
+    (N rotating slabs) and async transport (cp.async + caller-owned
+    AsyncWait) respectively.
     """
 
     name: str
     buf: str
     origin: tuple[Expr, ...]
     axes: tuple[Axis, ...]
-    slab_dims: tuple[int, ...]
-    # Optional: full reference Load index expressed in cache-axis Vars.
-    # When present, materialization fetches source values by substituting
-    # cache-axis decoded coords into this template — handles non-affine
-    # layouts (``/``, ``%`` from collapsed-reshape views) that can't be
-    # expressed as ``origin[d] + decoded[d]``. None falls back to the
-    # additive ``origin + decoded_per_dim`` path.
-    source_index_template: tuple[Expr, ...] | None = None
+    addressing: AffineAddressing | TemplateAddressing
     # Per-cache-axis extra extent added to the smem allocation (not to the
     # cooperative-load extent). Empty tuple = no padding. Used by the bank-
     # conflict pass to break stride-aliased smem layouts: padding dim ``d``
@@ -191,64 +232,121 @@ class Stage(Stmt):
     # 32-way bank conflicts that arise when adjacent threads stride through
     # power-of-2 multiples of bank width.
     pad: tuple[int, ...] = ()
-    # Number of distinct smem buffers allocated for this Stage. ``1`` is the
-    # ordinary single-buffer form. ``> 1`` enables ping-pong: each iteration
-    # of the surrounding K-outer loop writes to slab ``[phase, ...]`` and
-    # reads from the same. With ``buffer_count == 2`` and ``phase`` set to
-    # an expression like ``a5 % 2``, consecutive iterations write to
-    # different physical buffers, eliminating the leading
-    # ``__syncthreads`` between prev-compute and next-load (because
-    # they target different memory regions).
-    buffer_count: int = 1
-    # Expression naming the phase index for double-buffered Stages. Must
-    # be set when ``buffer_count > 1``. Typically ``Var(K_outer_axis) %
-    # buffer_count``.
-    phase: Expr | None = None
-    # When True, the cooperative load uses ``cp.async.cg.shared.global``
-    # (one PTX instruction per thread per element) instead of
-    # ``Load(reg) + Write(smem)``. Saves a register temp and uses the
-    # async DRAM→smem path. Materialize emits a trailing
-    # ``cp.async.commit_group`` + ``cp.async.wait_group(0)`` so the
-    # behavior is synchronous w.r.t. the surrounding ``Sync``. Requires
-    # sm_80+; the async-codegen pass sets this only when the target
-    # supports it.
-    async_load: bool = False
-    # When True, this Stage participates in a software-pipelined
-    # K-outer loop: the cooperative load is issued + committed but
-    # *not* waited on. A surrounding ``AsyncWait`` Stmt (typically with
-    # ``remaining = buffer_count - 1``) drains older groups while the
-    # current iteration's load stays in flight, overlapping DRAM with
-    # FMA. Only meaningful when ``async_load`` is also set.
-    pipelined: bool = False
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
+
+    @property
+    def alloc_extents(self) -> tuple[int, ...]:
+        """Per-cache-axis smem allocation extent: cache extent + ``pad``.
+
+        The cooperative load iterates over the unpadded extents; the
+        smem allocation reserves the padded ones. Used by every smem-
+        sizing check in the tile-lowering chain (007 admission, 012
+        bank-pad budget, 013 double-buffer budget, materialize
+        ``Smem.extents``)."""
+        extents = tuple(int(ax.extent) for ax in self.axes)
+        if not self.pad:
+            return extents
+        return tuple(e + p for e, p in zip(extents, self.pad, strict=True))
+
+    @property
+    def smem_bytes(self) -> int:
+        """Bytes of dynamic shared memory this Stage allocates.
+
+        ``product(alloc_extents) * BYTES_PER_ELEM`` × ``buffer_count``
+        (the latter only for ``BufferedStage`` subtypes). Assumes
+        ``BYTES_PER_ELEM == 4`` (fp32) — matches today's kernel
+        codegen, which has no per-Stage dtype field."""
+        n = BYTES_PER_ELEM
+        for e in self.alloc_extents:
+            n *= e
+        return n
+
+    def exprs(self) -> tuple[Expr, ...]:
+        template = self.addressing.exprs if isinstance(self.addressing, TemplateAddressing) else ()
+        return (*self.origin, *template)
+
+    def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
+        """Common kwargs for subtype-preserving rewrite. Subclasses extend."""
+        if isinstance(self.addressing, TemplateAddressing):
+            new_addr: AffineAddressing | TemplateAddressing = TemplateAddressing(exprs=tuple(sigma.apply(e) for e in self.addressing.exprs))
+        else:
+            new_addr = self.addressing
+        return dict(
+            name=self.name,
+            buf=self.buf,
+            origin=tuple(sigma.apply(e) for e in self.origin),
+            axes=tuple(axis_fn(a) for a in self.axes),
+            addressing=new_addr,
+            pad=self.pad,
+        )
 
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
-        new_origin = tuple(sigma.apply(e) for e in self.origin)
-        new_axes = tuple(axis_fn(a) for a in self.axes)
-        new_template = tuple(sigma.apply(e) for e in self.source_index_template) if self.source_index_template is not None else None
-        return Stage(
-            name=self.name,
-            buf=self.buf,
-            origin=new_origin,
-            axes=new_axes,
-            slab_dims=self.slab_dims,
-            source_index_template=new_template,
-            pad=self.pad,
-            buffer_count=self.buffer_count,
-            phase=sigma.apply(self.phase) if self.phase is not None else None,
-            async_load=self.async_load,
-            pipelined=self.pipelined,
-        )
+        return type(self)(**self._rewrite_kwargs(sigma, axis_fn))
 
     def pretty(self, indent: str = "") -> list[str]:
         origin = ", ".join(e.pretty() for e in self.origin)
-        slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.slab_dims, strict=True))
+        if isinstance(self.addressing, AffineAddressing):
+            slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.addressing.dims, strict=True))
+        else:
+            cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in self.axes)
+            tpl = ", ".join(e.pretty() for e in self.addressing.exprs)
+            slab = f"{cache} template=[{tpl}]"
         pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
-        buf = f" buffers={self.buffer_count}@{self.phase.pretty()}" if self.buffer_count > 1 and self.phase is not None else ""
-        async_tag = " async" if self.async_load else ""
-        pipe_tag = " pipelined" if self.pipelined else ""
-        return [f"{indent}{self.name} = Stage({self.buf}, origin=({origin}), slab=({slab})){pad}{buf}{async_tag}{pipe_tag}"]
+        return [f"{indent}{self.name} = {type(self).__name__}({self.buf}, origin=({origin}), slab=({slab})){pad}{self._pretty_extra()}"]
+
+    def _pretty_extra(self) -> str:
+        return ""
+
+
+@dataclass
+class BufferedStage(Stage):
+    """Stage with ``buffer_count`` rotating smem slabs selected by ``phase``.
+
+    Sync transport (cooperative ``Load + Write``); the leading
+    ``__syncthreads`` between prev-compute and next-load is dropped
+    because consecutive iterations write to different physical slabs.
+
+    ``buffer_count >= 2`` is enforced. ``phase`` is required and
+    typically ``Var(K_outer_axis) % buffer_count``.
+    """
+
+    buffer_count: int = field(default=2, kw_only=True)
+    phase: Expr = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        if self.buffer_count < 2:
+            raise ValueError(f"BufferedStage {self.name!r}: buffer_count must be >= 2, got {self.buffer_count}")
+
+    @property
+    def smem_bytes(self) -> int:
+        return super().smem_bytes * self.buffer_count
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return (*super().exprs(), self.phase)
+
+    def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
+        return {**super()._rewrite_kwargs(sigma, axis_fn), "buffer_count": self.buffer_count, "phase": sigma.apply(self.phase)}
+
+    def _pretty_extra(self) -> str:
+        return f" buffers={self.buffer_count}@{self.phase.pretty()}"
+
+
+@dataclass
+class AsyncBufferedStage(BufferedStage):
+    """Buffered stage transported via ``cp.async``.
+
+    Materialize emits ``Smem`` + cooperative ``CpAsyncCopy`` +
+    ``CpAsyncCommit`` only — *no* implicit wait, *no* ``Sync``. The
+    caller must dominate every consumer with an ``AsyncWait`` Stmt.
+    Requires sm_80+ (gated by ``014_async_copy``).
+    """
+
+    def _pretty_extra(self) -> str:
+        return f"{super()._pretty_extra()} async"
 
 
 # ---------------------------------------------------------------------------
@@ -265,18 +363,24 @@ class TileOp(Op):
     a ``TileOp`` into a ``KernelOp``.
     """
 
-    body: tuple[Stmt, ...] = ()
+    body: Body = field(default_factory=Body)
     name: str = ""
 
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
 
-        new_body = normalize_body(self.body, hoist=False)
-        if new_body != self.body:
-            self.body = new_body
+        # Body is a tuple subclass; coerce so ``Op(body=tuple_value)``
+        # keeps working without forcing wrapping at every rule's
+        # rewrite site.
+        coerced = Body.coerce(self.body)
+        normalized = normalize_body(coerced, hoist=False)
+        self.body = normalized if isinstance(normalized, Body) else Body(normalized)
+        n_tiles = sum(1 for s in self.body if isinstance(s, Tile))
+        if n_tiles > 1:
+            raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")
 
     def __iter__(self) -> Iterator[Stmt]:
-        return iter_body(self.body)
+        return self.body.iter()
 
     def pretty_body(self) -> str:
         """Render as an indented structural listing via per-stmt ``pretty``."""
@@ -284,10 +388,6 @@ class TileOp(Op):
         sig_out = ", ".join(self.outputs) or "-"
         head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
         return "\n".join([head, *pretty_body(self.body, "    ")])
-
-    @property
-    def loads(self) -> tuple[Load, ...]:
-        return tuple(s for s in self if isinstance(s, Load))
 
     @property
     def inputs(self) -> tuple[str, ...]:
@@ -308,20 +408,15 @@ class TileOp(Op):
         return tuple(bufs)
 
     @property
-    def writes(self) -> tuple[Write, ...]:
-        return tuple(s for s in self if isinstance(s, Write))
-
-    @property
     def outputs(self) -> tuple[str, ...]:
         """Distinct ``Write.output`` buf names in body first-use order."""
-        return tuple(dict.fromkeys(s.output for s in self.writes))
+        return tuple(dict.fromkeys(s.output for s in self.body.writes))
 
 
 # ---------------------------------------------------------------------------
 # Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
 # ---------------------------------------------------------------------------
 
-from deplodock.compiler.ir.stmt import iter_body  # noqa: E402, F401
 
 # Cooperative thread-block size — number of threads per CUDA block when a
 # Tile uses BIND_THREAD axes from a cooperative strategy. Lives at this
@@ -358,7 +453,12 @@ __all__ = [
     "Tile",
     "Combine",
     "Stage",
+    "BufferedStage",
+    "AsyncBufferedStage",
+    "AffineAddressing",
+    "TemplateAddressing",
     "AsyncWait",
+    "BYTES_PER_ELEM",
     # Bindings
     "BoundAxis",
     "BIND_THREAD",
@@ -372,6 +472,3 @@ __all__ = [
     "Axis",
     "ElementwiseImpl",
 ]
-
-
-_ = field  # silence ruff
