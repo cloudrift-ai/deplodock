@@ -43,6 +43,13 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 PATTERN = [Pattern("root", TileOp)]
 
 _MAX_SLAB_FLOATS = 4096  # 16KB hard cap per Stage at fp32
+# Per-scope budget across all admitted Stages. The consumer hardware
+# limit is 48 KB static smem = 12288 floats; downstream passes
+# (``012_pad_smem_banks``, ``013_double_buffer``) can ~2× this so the
+# pre-pad/db budget is ``12288 / 2 = 6144`` floats. When proposals
+# exceed this we admit by reuse desc until the budget is hit and let
+# the rest read DRAM.
+_PER_SCOPE_FLOAT_BUDGET = 6144
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -117,6 +124,12 @@ def _stage_loop(
             continue
         key, stage = built
         if key not in stages:
+            slab_floats = 1
+            for ax in stage.axes:
+                slab_floats *= int(ax.extent)
+            committed = sum(_slab_floats(s) for s in stages.values())
+            if committed + slab_floats > _PER_SCOPE_FLOAT_BUDGET:
+                continue  # would exceed per-scope smem budget; leave as DRAM
             stage = Stage(
                 name=_gen_name(stage.buf, used_names),
                 buf=stage.buf,
@@ -205,10 +218,14 @@ def _build_stage(
     template = tuple(load.index) if needs_template else None
 
     origin_key = tuple(tuple(sorted(t.pretty() for t in _flatten_add(e))) for e in origin)
-    # Sibling reduces in cooperative-reduce kernels use distinct cache-axis
-    # names (softmax: a2 / a3 / a4 sweep the same row); key on extents +
-    # slab dims so the row is staged once and shared.
-    cache_key = tuple(int(ax.extent) for ax in cache_axes)
+    # Sibling reduces in cooperative-reduce kernels use distinct *reduce*-
+    # axis names (softmax: a2 / a3 / a4 sweep the same row) — those should
+    # share one Stage, so reduce axes contribute extent only. But two
+    # Loads in the *same* reduce loop with distinct *thread*-axis usage
+    # are reading different slabs (e.g. position_embeddings indexed by Q's
+    # seq axis vs K's seq axis); thread-axis names must distinguish them.
+    reduce_axis_name = reduce_axis.name
+    cache_key = tuple(int(ax.extent) if ax.name == reduce_axis_name else (ax.name, int(ax.extent)) for ax in cache_axes)
     template_key = tuple(e.pretty() for e in template) if template is not None else None
     key = (load.input, origin_key, cache_key, slab_dims, template_key)
 
@@ -220,6 +237,13 @@ def _build_stage(
         slab_dims=slab_dims,
         source_index_template=template,
     )
+
+
+def _slab_floats(stage: Stage) -> int:
+    n = 1
+    for ax in stage.axes:
+        n *= int(ax.extent)
+    return n
 
 
 def _flatten_add(e: Expr) -> list[Expr]:

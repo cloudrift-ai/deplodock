@@ -22,7 +22,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 # Need M*N > thread_budget (256) so blockify_launch actually splits axes
 # into BLOCK; need K > BK (smallest candidate is 2) and K % BK == 0 so
 # split_matmul_k fires. M=N=K=32 satisfies both: 32*32=1024 > 256, BK=16.
-_M, _K, _N = 32, 32, 32
+_M, _K, _N = 64, 64, 64  # 2× PAT_DEFAULT so blockify splits each thread axis
 
 
 def _make_plain_matmul() -> Graph:

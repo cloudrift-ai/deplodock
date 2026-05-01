@@ -43,7 +43,7 @@ from deplodock.compiler.ir.stmt import Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
-from deplodock.compiler.tuning import per_axis_threads, thread_budget
+from deplodock.compiler.tuning import per_axis_threads, register_tile_factor, thread_budget
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -85,7 +85,14 @@ def _partition_threads(tile: Tile) -> Tile | None:
     Single-parallel-axis kernels (RMSNorm row-reduction) get a single
     16-thread axis — same as before."""
     pat = per_axis_threads(tile)
-    tb = thread_budget()
+    # ``008_register_tile`` will split each PAT-extent THREAD axis by F
+    # and F²-replicate the body, so the *post*-register-tile thread
+    # count is ``threads_used / F²``. The blockify budget therefore
+    # admits ``thread_budget × F²`` PAT-equivalent threads — the F²
+    # capacity register_tile will reclaim. Non-matmul kernels have F=1
+    # (or no register tiling), so this collapses to ``thread_budget``.
+    F = register_tile_factor(tile)
+    tb = thread_budget() * F * F
     axes = list(tile.axes)
     new_axes_inner_first: list[BoundAxis] = []
     sigma_map: dict[str, object] = {}
