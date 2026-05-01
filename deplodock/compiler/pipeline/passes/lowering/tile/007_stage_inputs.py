@@ -133,48 +133,50 @@ def _build_stages(
     thread_axes: tuple[Axis, ...],
     used_names: set[str],
 ) -> tuple[list[Stage], dict[str, tuple[str, tuple[Expr, ...]]]]:
-    """For each buffer: classify all Loads, emit one Stage if they agree,
-    skip otherwise. Admission stops when ``_PER_SCOPE_FLOAT_BUDGET`` is hit."""
+    """Per buffer, partition Loads by structural index equality (within a
+    loop they collapse only when textually identical — Python-scope
+    shadowing provides this for sibling reduce loops). Each partition
+    becomes a candidate Stage; classify the representative, admit if
+    it fits the per-scope smem budget. Multiple distinct slabs per
+    buffer are allowed (e.g. rotate-half kernels load the same buffer
+    at multiple conditional positions, each requiring its own slab)."""
     stages: list[Stage] = []
     name_rewrites: dict[str, tuple[str, tuple[Expr, ...]]] = {}
     used_floats = 0
 
     for buf, items in loads_by_buf.items():
-        # Collapse: do all Loads of this buffer share the same access
-        # pattern? Compare indices structurally (Expr __eq__ is
-        # field-wise). Two Loads in distinct loops collapse only when
-        # their iter-axis names match — which Python-scope shadowing
-        # provides for sibling reduce loops naturally. Distinct iter-
-        # axis names (e.g. a reduce loop iter + a separate output
-        # StridedLoop iter) stay separate Stages, avoiding the smem-
-        # index-out-of-scope bug that arises when one loop's body
-        # references another loop's iter var via a shared slab.
-        rep_index = items[0][0].index
-        if any(load.index != rep_index for load, _, _ in items[1:]):
-            continue  # disagree → bail; all Loads stay DRAM
-        # Classify only the representative — every Load in the group has
-        # the same access pattern, so one Slab covers them all.
-        rep_load, rep_reduce, rep_scope = items[0]
-        slab = _classify(rep_load, thread_axes, rep_reduce, rep_scope)
-        if slab is None:
-            continue
-        if used_floats + slab.n_floats > _PER_SCOPE_FLOAT_BUDGET:
-            continue
-        smem_name = _gen_name(buf, used_names)
-        stages.append(
-            Stage(
-                name=smem_name,
-                buf=buf,
-                origin=slab.origin,
-                axes=slab.cache_axes,
-                slab_dims=slab.slab_dims,
-                source_index_template=slab.template,
+        # Partition this buffer's Loads by structural index equality.
+        # Each partition gets its own slab; admission decides which fit.
+        partitions: list[tuple[Load, Axis, tuple[Axis, ...], list[Load]]] = []
+        for load, reduce_axis, scope_axes in items:
+            for rep_load, _, _, members in partitions:
+                if load.index == rep_load.index:
+                    members.append(load)
+                    break
+            else:
+                partitions.append((load, reduce_axis, scope_axes, [load]))
+
+        for rep_load, rep_reduce, rep_scope, members in partitions:
+            slab = _classify(rep_load, thread_axes, rep_reduce, rep_scope)
+            if slab is None:
+                continue
+            if used_floats + slab.n_floats > _PER_SCOPE_FLOAT_BUDGET:
+                continue
+            smem_name = _gen_name(buf, used_names)
+            stages.append(
+                Stage(
+                    name=smem_name,
+                    buf=buf,
+                    origin=slab.origin,
+                    axes=slab.cache_axes,
+                    slab_dims=slab.slab_dims,
+                    source_index_template=slab.template,
+                )
             )
-        )
-        used_floats += slab.n_floats
-        smem_index = tuple(Var(ax.name) for ax in slab.cache_axes)
-        for load, _, _ in items:
-            name_rewrites[load.name] = (smem_name, smem_index)
+            used_floats += slab.n_floats
+            smem_index = tuple(Var(ax.name) for ax in slab.cache_axes)
+            for load in members:
+                name_rewrites[load.name] = (smem_name, smem_index)
     return stages, name_rewrites
 
 
