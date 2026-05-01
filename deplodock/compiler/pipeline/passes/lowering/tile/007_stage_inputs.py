@@ -58,11 +58,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 
 PATTERN = [Pattern("root", TileOp)]
 
-# Canonical reduce-axis Var name for the collapse step. Picked to not
-# collide with any axis name the front-end emits (those are ``a0``,
-# ``a1``, ...).
-_CANON_REDUCE = "__k__"
-
 _MAX_SLAB_FLOATS = 4096  # 16 KB hard cap per Stage at fp32
 # Per-scope budget across all admitted Stages. Consumer hardware static-
 # smem cap is 48 KB = 12288 floats; downstream pad + double-buffer can
@@ -146,14 +141,16 @@ def _build_stages(
 
     for buf, items in loads_by_buf.items():
         # Collapse: do all Loads of this buffer share the same access
-        # pattern? Normalize each Load's reduce-axis Var to a canonical
-        # name first so sibling reduces (which have distinct reduce-axis
-        # names but stage the same row) compare textually equal.
-        canonical_indices = []
-        for load, reduce_axis, _ in items:
-            sigma = Sigma({reduce_axis.name: Var(_CANON_REDUCE)})
-            canonical_indices.append(tuple(sigma.apply(e) for e in load.index))
-        if any(c != canonical_indices[0] for c in canonical_indices[1:]):
+        # pattern? Compare indices structurally (Expr __eq__ is
+        # field-wise). Two Loads in distinct loops collapse only when
+        # their iter-axis names match — which Python-scope shadowing
+        # provides for sibling reduce loops naturally. Distinct iter-
+        # axis names (e.g. a reduce loop iter + a separate output
+        # StridedLoop iter) stay separate Stages, avoiding the smem-
+        # index-out-of-scope bug that arises when one loop's body
+        # references another loop's iter var via a shared slab.
+        rep_index = items[0][0].index
+        if any(load.index != rep_index for load, _, _ in items[1:]):
             continue  # disagree → bail; all Loads stay DRAM
         # Classify only the representative — every Load in the group has
         # the same access pattern, so one Slab covers them all.

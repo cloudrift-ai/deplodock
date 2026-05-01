@@ -134,21 +134,73 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     t_start = Var(t_axis.name)
     step = Literal(BLOCK_SIZE, "int")
 
-    # Each body Loop becomes a StridedLoop driven by t. Body untouched.
-    # Reduce loops get a Combine sibling for the cross-thread tree-halve.
-    new_body: list[Stmt] = []
+    # Phase 1: each body Loop → StridedLoop driven by t. Reduce Loops
+    # get a Combine sibling for the cross-thread tree-halve.
+    body_phase1: list[Stmt] = []
     for s in blk.body:
         if isinstance(s, Loop):
-            new_body.append(StridedLoop(axis=s.axis, start=t_start, step=step, body=s.body))
+            body_phase1.append(StridedLoop(axis=s.axis, start=t_start, step=step, body=s.body))
             if s.is_reduce:
                 for a in s.body:
                     if isinstance(a, Accum):
-                        new_body.append(Combine(name=a.name, op=a.op))
+                        body_phase1.append(Combine(name=a.name, op=a.op))
         else:
-            new_body.append(s)
+            body_phase1.append(s)
 
+    # Phase 2: identify the innermost "naked" output axis — one
+    # referenced *only* at Tile level (outside any Loop / StridedLoop)
+    # with extent ≥ BLOCK_SIZE divisible. Axes referenced *both* at Tile
+    # level and inside an inner Loop can't be wrapped this way: the
+    # wrap would only bring the axis into scope at the tail, leaving
+    # in-loop references unbound. Without wrapping, these stay BLOCK.
+    in_loop_vars: set[str] = set()
+    tile_level_vars: set[str] = set()
+    for s in body_phase1:
+        if isinstance(s, (Loop, StridedLoop)):
+            in_loop_vars |= _stmt_free_vars(s)
+        elif not isinstance(s, Combine):
+            tile_level_vars |= _stmt_free_vars(s)
+    naked_only_tile = tile_level_vars - in_loop_vars
+    naked_axis: Axis | None = None
+    for ba in reversed(list(blk.axes)):
+        if ba.axis.name not in naked_only_tile:
+            continue
+        ext = int(ba.axis.extent)
+        if ext >= BLOCK_SIZE and ext % BLOCK_SIZE == 0:
+            naked_axis = ba.axis
+            break
+
+    # Phase 3: wrap the post-reduce tail (everything after the last
+    # block-structured stmt) in a StridedLoop over the chosen naked axis.
+    if naked_axis is not None:
+        split_idx = 0
+        for i, s in enumerate(body_phase1):
+            if isinstance(s, (Loop, StridedLoop, Combine)):
+                split_idx = i + 1
+        prefix = body_phase1[:split_idx]
+        suffix: list[Stmt] = body_phase1[split_idx:]
+        new_body: list[Stmt] = [*prefix, StridedLoop(axis=naked_axis, start=t_start, step=step, body=suffix)]
+    else:
+        new_body = body_phase1
+
+    # Phase 4: bind axes. t → THREAD; output axes → BLOCK except the
+    # wrapped one (its iteration lives in the StridedLoop wrapper, so
+    # remove it from Tile.axes).
+    naked_name = naked_axis.name if naked_axis is not None else None
     new_axes = (
         BoundAxis(axis=t_axis, bind=BIND_THREAD),
-        *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes),
+        *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes if ba.axis.name != naked_name),
     )
     return Tile(axes=new_axes, body=new_body)
+
+
+def _stmt_free_vars(s: Stmt) -> set[str]:
+    """All Var names referenced anywhere in ``s`` (recursive over nested
+    bodies). Used to detect output-axis references at Tile level."""
+    out: set[str] = set()
+    for e in s.exprs():
+        out |= e.free_vars()
+    for child_body in s.nested():
+        for c in child_body:
+            out |= _stmt_free_vars(c)
+    return out
