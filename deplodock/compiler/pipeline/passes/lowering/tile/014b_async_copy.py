@@ -74,11 +74,7 @@ def _process(body: Body, n_threads: int) -> Body:
     new_body: list[Stmt] = []
     changed = False
     for s in body:
-        if (
-            isinstance(s, BufferedStage)
-            and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage))
-            and _eligible(s, n_threads)
-        ):
+        if isinstance(s, BufferedStage) and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage)) and _eligible(s, n_threads):
             new_body.append(
                 AsyncBufferedStage(
                     name=s.name,

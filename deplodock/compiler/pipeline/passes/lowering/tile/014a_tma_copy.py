@@ -34,6 +34,7 @@ import logging
 import os
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
@@ -80,19 +81,22 @@ def _maybe_rewrite(body: Body) -> Body | None:
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process(body: Body) -> Body:
+def _process(body: Body, k_var: str | None = None) -> Body:
     """Walk a body. Narrow eligible ``BufferedStage`` to ``TmaBufferedStage``,
-    inserting a trailing ``AsyncWait(0)`` so consumers see the loaded slab.
+    inserting a trailing ``AsyncWait`` so consumers see the loaded slab.
     Recurse into free Loops so Stages inside the K-outer chunk loop are
-    processed."""
+    processed.
+
+    ``k_var`` is the immediate-parent ``Loop`` axis name (or ``None`` if
+    the body sits at Tile scope). When set and a TMA stage's ``buffer_count
+    >= 2``, the inserted ``AsyncWait`` carries the consumer-side mbar
+    ``slot`` and ``phase`` (matching what ``015_pipeline_async`` sets) so
+    the materializer lowers the wait to ``MbarrierWait`` rather than the
+    cp.async fallback (which doesn't actually wait for TMA bulk loads)."""
     new_body: list[Stmt] = []
     changed = False
     for s in body:
-        if (
-            isinstance(s, BufferedStage)
-            and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage))
-            and _eligible(s)
-        ):
+        if isinstance(s, BufferedStage) and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage)) and _eligible(s):
             # The pad pass (``014c_pad_smem_banks``) runs AFTER this rule
             # and skips TmaBufferedStage by class, so this conversion sees
             # ``s.pad == ()`` and can pass it through. ``TmaBufferedStage``
@@ -109,10 +113,10 @@ def _process(body: Body) -> Body:
                     phase=s.phase,
                 )
             )
-            new_body.append(AsyncWait(keep=0))
+            new_body.append(_tma_async_wait(s, k_var))
             changed = True
         elif isinstance(s, Loop):
-            inner = _process(s.body)
+            inner = _process(s.body, k_var=s.axis.name)
             if inner is not s.body and inner != s.body:
                 new_body.append(Loop(axis=s.axis, body=inner, unroll=s.unroll))
                 changed = True
@@ -121,6 +125,22 @@ def _process(body: Body) -> Body:
         else:
             new_body.append(s)
     return tuple(new_body) if changed else body
+
+
+def _tma_async_wait(stage: BufferedStage, k_var: str | None) -> AsyncWait:
+    """Build the ``AsyncWait`` that follows a synchronous-style TMA stage.
+
+    With a parent K-outer loop, supply the consumer-side ring-buffer
+    ``slot`` (``k_var % buffer_count``) and ``phase``
+    (``(k_var / buffer_count) % 2``). Without a parent loop the slot is
+    constant and the mbar is fresh — slot 0, phase 0 suffices for a
+    single-shot TMA load."""
+    bc = stage.buffer_count
+    if k_var is None:
+        return AsyncWait(keep=0, phase=Literal(0, "int"), slot=Literal(0, "int"))
+    slot = BinaryExpr("%", Var(k_var), Literal(bc, "int"))
+    phase = BinaryExpr("%", BinaryExpr("/", Var(k_var), Literal(bc, "int")), Literal(2, "int"))
+    return AsyncWait(keep=0, phase=phase, slot=slot)
 
 
 def _eligible(stage: BufferedStage) -> bool:

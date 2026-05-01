@@ -145,7 +145,10 @@ def _try_fix(stage: Stage, loads, thread_axes: tuple[Axis, ...]) -> Stage | None
     # added by ``013_double_buffer``; strip it for the analysis. Phase is
     # uniform across threads, so it doesn't affect bank distribution.
     per_load_coeffs = load_thread_axis_coeffs(
-        loads, n, thread_axes, leading_phase_dim=isinstance(stage, BufferedStage),
+        loads,
+        n,
+        thread_axes,
+        leading_phase_dim=isinstance(stage, BufferedStage),
     )
     if per_load_coeffs is None:
         return None
