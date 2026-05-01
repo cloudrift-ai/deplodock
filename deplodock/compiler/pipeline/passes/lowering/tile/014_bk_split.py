@@ -50,7 +50,6 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
