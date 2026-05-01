@@ -10,21 +10,48 @@ Onboard a new model into deplodock by creating a recipe, validating that it actu
 
 This skill **assumes** the deplodock CLI is the only tool that should touch the remote server. Never `ssh` in by hand to mutate state — that violates the "never modify deployed CloudRift servers" rule. Read-only inspection (logs, `nvidia-smi`, `docker ps`) over SSH is fine.
 
-## Preflight — Load `.env`
+## Preflight — Load env files
 
-Before any `deplodock` command, check the repo root for a `.env` file and source it so `HF_TOKEN`, `CLOUDRIFT_API_KEY`, `CLOUDRIFT_API_URL`, etc. are exported into the shell. deplodock reads these from `os.environ` directly and **does not auto-load `.env`** (no dotenv dep). Without this step, gated HF models fail to download and CloudRift commands fail to authenticate.
+Before any `deplodock` command, source the relevant env file(s) so `HF_TOKEN`, `CLOUDRIFT_API_KEY`, `CLOUDRIFT_API_URL`, etc. are exported into the shell. deplodock reads these from `os.environ` directly and **does not auto-load `.env`** (no dotenv dep). Without this step, gated HF models fail to download and CloudRift commands hit the wrong cluster or fail to authenticate.
+
+### Which file(s) to source
+
+- **Default** → source plain `.env` only.
+- **User specified an additional env file** (e.g. they named a deployment file or pointed at `.env.<something>`) → source `.env` first as the base, then overlay the user-specified file so its values win on conflict. Use the filename the user provided verbatim — never guess one from context.
+
+If the user wants something other than `.env` but didn't say which file, **list candidates** (`ls .env.* 2>/dev/null`) and ask. Don't guess.
+
+### How to source
+
+Run sourcing in the **same Bash call** as the deplodock command (Bash sessions don't preserve env across calls). Order matters when overlaying: base first, overlay second, so the overlay wins on conflict.
+
+Default (just `.env`):
 
 ```bash
-[ -f .env ] && set -a && . ./.env && set +a
+[ -f .env ] && set -a && . ./.env && set +a && deplodock deploy ssh --recipe recipes/<name> --ssh <user@host>
 ```
 
-Run this in the **same Bash call** as the deplodock command (Bash sessions don't preserve env across calls), e.g.:
+With a user-specified overlay file `<extra>` (e.g. `.env.local`, or whatever they named):
 
 ```bash
-set -a && . ./.env && set +a && deplodock deploy ssh --recipe recipes/<name> --ssh <user@host>
+set -a && [ -f .env ] && . ./.env; . ./<extra> && set +a && deplodock vm create cloudrift --instance-type <type> --ssh-key ~/.ssh/id_ed25519.pub
 ```
 
-After sourcing, sanity-check the variables you actually need are set (`echo "${HF_TOKEN:+HF_TOKEN set}"`) — don't echo the value itself, since it ends up in the transcript. If `.env` is missing and `HF_TOKEN` isn't already in the environment, stop and ask the user how they want to provide it (gated models will 401 silently-ish on download).
+The `[ -f .env ] && . ./.env;` part lets the base file be optional but fails loudly if the overlay is missing — that's intentional, since a missing user-specified file usually means you're about to hit the wrong target.
+
+### Sanity check
+
+After sourcing, confirm the variables you need are set **without echoing values** — secrets land in the transcript otherwise. Use a present/absent check, not parameter expansion of the value:
+
+```bash
+[ -n "$HF_TOKEN" ] && echo "HF_TOKEN: set" || echo "HF_TOKEN: MISSING"
+[ -n "$CLOUDRIFT_API_URL" ] && echo "CLOUDRIFT_API_URL: set (override)" || echo "CLOUDRIFT_API_URL: default"
+[ -n "$CLOUDRIFT_API_KEY" ] && echo "CLOUDRIFT_API_KEY: set" || echo "CLOUDRIFT_API_KEY: MISSING"
+```
+
+Do **not** use `echo "HF_TOKEN: ${HF_TOKEN:+set}${HF_TOKEN:-MISSING}"` — when the var is set, `${VAR:-MISSING}` still expands to the **value** (the default only applies when unset), so you get `set<actual-secret>` printed.
+
+If `HF_TOKEN` is missing, gated HF models will 401 silently-ish on download — stop and ask the user how to provide it. If a user-specified overlay was meant to redirect the cluster but `CLOUDRIFT_API_URL` shows as default, you sourced the wrong file (or didn't source the overlay at all) — fix and re-check before running the deplodock command.
 
 ## Inputs to Confirm
 

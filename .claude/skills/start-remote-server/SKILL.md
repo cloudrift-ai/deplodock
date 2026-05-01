@@ -68,22 +68,43 @@ The command requires the **public** key path (`.pub`), not the private key. `CLO
 
 **`--billing-exempt`** is an admin-only flag that skips CloudRift billing. Always confirm with the user before adding it; never set it implicitly. It is silently accepted by the API only for accounts authorized for no-cost rentals — passing it on a regular account will likely fail or be billed normally. The flag is CloudRift-specific and does not exist for GCP.
 
-**Sourcing the API key from `.env`:** deplodock does **not** auto-load `.env` (no `python-dotenv` dependency). If the project root contains a `.env` file with `CLOUDRIFT_API_KEY=...` (and optionally `CLOUDRIFT_API_URL=...` for on-prem), source it into the current shell before invoking `vm create`:
+**Sourcing the API key and URL from env files:** deplodock does **not** auto-load env files (no `python-dotenv` dependency). The repo root typically has a base `.env`. The user may also keep additional `.env.*` files that point at different clusters / accounts.
+
+Pick the file based on what the user said:
+
+- **Default** → source plain `.env` only.
+- **User specified an additional env file** (e.g. they named one or pointed at `.env.<something>`) → source `.env` first as the base, then overlay the user-specified file so its values win on conflict. Use the filename the user gave verbatim — never guess one from context.
+
+If the user wants a non-default cluster but didn't say which file, **list candidates** (`ls .env.* 2>/dev/null`) and ask. Don't guess.
+
+Source in the **same Bash call** as `deplodock vm create` (Bash sessions don't preserve env across calls). Order matters when overlaying: base first, overlay second.
+
+Default (just `.env`):
 
 ```bash
-set -a; source .env; set +a
-deplodock vm create cloudrift --instance-type <base>.<gpu_count> --ssh-key ~/.ssh/id_ed25519.pub
+[ -f .env ] && set -a && . ./.env && set +a && deplodock vm create cloudrift --instance-type <base>.<gpu_count> --ssh-key ~/.ssh/id_ed25519.pub
 ```
 
-Or chain it inline so the export is scoped to the single command:
+With a user-specified overlay file `<extra>` (e.g. `.env.local`, or whatever they named):
 
 ```bash
-env $(grep -v '^#' .env | xargs) deplodock vm create cloudrift ...
+set -a && [ -f .env ] && . ./.env; . ./<extra> && set +a && deplodock vm create cloudrift --instance-type <base>.<gpu_count> --ssh-key ~/.ssh/id_ed25519.pub
 ```
 
-Before sourcing, sanity-check that `.env` exists at the project root and that `CLOUDRIFT_API_KEY` is one of the keys it defines (`grep -c '^CLOUDRIFT_API_KEY=' .env`). Do not echo or log the value. `.env` is gitignored — never `git add` it.
+The `[ -f .env ] && . ./.env;` part lets the base file be optional but fails loudly if the overlay is missing — that's intentional, since a missing user-specified file usually means you're about to hit the wrong target.
 
-**H200 on CloudRift only works on on-prem clusters** — set `CLOUDRIFT_API_URL` to the on-prem endpoint before running, or warn the user that public `api.cloudrift.ai` will not return H200 capacity. If unsure whether the user has on-prem access, ask before running.
+**Sanity check** before running `vm create` — never echo the secret values. Use a present/absent check, not parameter expansion of the value:
+
+```bash
+[ -n "$CLOUDRIFT_API_URL" ] && echo "CLOUDRIFT_API_URL: set (override)" || echo "CLOUDRIFT_API_URL: default"
+[ -n "$CLOUDRIFT_API_KEY" ] && echo "CLOUDRIFT_API_KEY: set" || echo "CLOUDRIFT_API_KEY: MISSING"
+```
+
+Do **not** use `${CLOUDRIFT_API_KEY:+set}${CLOUDRIFT_API_KEY:-MISSING}` — when the var is set, `${VAR:-MISSING}` still expands to the **value** (the default only applies when unset), so you get `set<actual-secret>` printed.
+
+If a user-specified overlay was meant to redirect the cluster but `CLOUDRIFT_API_URL` shows as default, you sourced the wrong file (or didn't source the overlay at all) — fix and re-check before running. `.env*` files are gitignored — never `git add` them.
+
+**H200 on CloudRift typically requires a non-default cluster.** The public `api.cloudrift.ai` may not return H200 capacity. If the user asks for H200, confirm which env file to use (or which cluster to target) before running — don't fall back to the public endpoint silently.
 
 ### GCP
 
