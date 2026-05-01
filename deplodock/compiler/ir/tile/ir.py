@@ -157,10 +157,10 @@ BYTES_PER_ELEM = 4
 
 @dataclass(frozen=True)
 class AffineAddressing:
-    """Affine slab addressing: each cache axis ``i`` decoded coord is
-    *added* to source dim ``slab_dims[i]``.
+    """Affine slab addressing: each cache axis ``i``'s decoded coord is
+    *added* to source dim ``dims[i]``.
 
-    ``source_index[d] = origin[d] + decoded_coord(slab_dims[i] == d)``.
+    ``source_index[d] = origin[d] + decoded_coord(dims[i] == d)``.
 
     Common case (matmul, RMSNorm, softmax). Materialize reconstructs
     addresses without symbolic substitution.
@@ -200,10 +200,6 @@ class Stage(Stmt):
     - ``origin`` — per-source-dim CTA-uniform anchor (length == source
       buffer rank). Each entry is an Expr that's constant across the
       threads of a CTA — typically ``BIND_BLOCK`` Vars and Literals.
-      ``rebalance_threads`` may carve a slice off a BLOCK axis (binding
-      its inner part to THREAD); when that happens the inner part is
-      excluded from origin (it becomes a new cache axis instead),
-      preserving CTA-uniformity.
     - ``axes`` — cache axes (smem layout, in this order).
     - ``addressing`` — discriminated union of ``AffineAddressing``
       (fast path, ``origin + decoded``) and ``TemplateAddressing``
@@ -476,6 +472,3 @@ __all__ = [
     "Axis",
     "ElementwiseImpl",
 ]
-
-
-_ = field  # silence ruff

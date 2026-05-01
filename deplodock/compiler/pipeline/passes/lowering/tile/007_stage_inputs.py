@@ -1,12 +1,10 @@
 """Stage frequently-reused external inputs into shared memory.
 
 Runs early in the tile-lowering chain — *before* ``008_register_tile``
-and ``009_rebalance_threads`` — so the classifier sees the clean PAT ×
-PAT thread-axis layout from ``005_blockify_launch``. Downstream passes
-keep already-staged Stages intact: ``register_tile`` σ-substitutes
-cache-axis Vars in the consumer Loads (Stages stay singleton across
-F²); ``rebalance_threads`` augments Stage cache-axes when carving a
-referenced BLOCK axis.
+— so the classifier sees the clean PAT × PAT thread-axis layout from
+``005_blockify_launch``. ``register_tile`` σ-substitutes cache-axis
+Vars in the consumer Loads (Stages stay singleton across F²; only
+consumer Loads multiply).
 
 **Pipeline:**
 
@@ -35,7 +33,8 @@ referenced BLOCK axis.
   = bail (collapsed-reshape that can't be additively split).
 - Coefficient-1 check: substitute the var → 1 (others → 0) and compare
   to ``origin[d] + 1``. If any axis fails (collapsed-reshape with a
-  surviving stride), fall back to ``source_index_template``.
+  surviving stride), emit ``TemplateAddressing`` carrying the original
+  Load index instead of ``AffineAddressing``.
 
 **Reuse.** A Load qualifies for staging iff at least one bound axis
 (thread or reduce) doesn't appear in its index — that axis's threads
@@ -209,8 +208,8 @@ def _classify(
        Zero dims = fan-in axis (won't constrain the slab). One dim =
        cache axis at that dim. Multiple dims = bail.
     3. Coefficient-1 check: substitute one cache var → 1 (others → 0)
-       and compare to ``origin[d] + 1``. If any axis disagrees, fall
-       back to ``source_index_template``.
+       and compare to ``origin[d] + 1``. If any axis disagrees, emit
+       ``TemplateAddressing`` instead of ``AffineAddressing``.
 
     Returns ``None`` when no fan-in axis exists (no reuse), when a
     cache var spans multiple dims, or when the slab exceeds the cap.

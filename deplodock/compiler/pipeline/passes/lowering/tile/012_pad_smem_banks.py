@@ -54,7 +54,7 @@ The pass:
 3. If any Load is non-affine in the thread-axis vars, conservatively
    skip the Stage (we can't bound its conflict without the analyzer).
 4. Try ``+1`` padding combinations (1-dim, then 2-dim) within
-   ``_MAX_PADDED_SLAB_FLOATS``; pick the first that drives every
+   ``_MAX_PADDED_SLAB_BYTES``; pick the first that drives every
    Load's max-way conflict to 1. Fall back to the best partial fix.
 """
 

@@ -239,9 +239,9 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
 
     Source index reconstruction depends on ``stage.addressing``:
 
-    - ``AffineAddressing(slab_dims)`` — fast path. ``source_index[d] =
+    - ``AffineAddressing(dims)`` — fast path. ``source_index[d] =
       origin[d] + decoded[d]`` (the decoded slab coord, if any cache
-      axis maps to ``d`` via ``slab_dims``); else just ``origin[d]``.
+      axis maps to ``d`` via ``dims``); else just ``origin[d]``.
     - ``TemplateAddressing(exprs)`` — escape hatch. Sigma-substitute
       cache-axis Vars → iter-decoded coords into ``exprs``.
 
