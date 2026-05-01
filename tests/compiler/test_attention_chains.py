@@ -152,14 +152,9 @@ def test_qkv_attn_no_rope():
 # --- Layer 3: real LlamaAttention (= block.self_attn) ------------------------
 
 
-@requires_cuda
-def test_full_self_attn_tinyllama():
-    """The real ``LlamaAttention`` from a TinyLlama config — the smallest
-    scope that includes Q/K/V Linears, RoPE, masked SDPA, and O Linear
-    with the actual decomposition graph the block test exercises. If
-    this fails while (1) and (2) pass, the regression is in the RoPE
-    elementwise kernel or its interaction with the surrounding
-    attention numerics."""
+def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
+    """Run TinyLlama's ``LlamaAttention`` sub-module at the given seq_len
+    and verify deplodock matches eager within ``threshold``."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
     config = AutoConfig.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
@@ -167,7 +162,6 @@ def test_full_self_attn_tinyllama():
     block = AutoModelForCausalLM.from_config(config).float().model.layers[0].eval()
     attn = block.self_attn
 
-    seq_len = 32
     hidden = config.hidden_size
     head_dim = hidden // config.num_attention_heads
 
@@ -176,7 +170,10 @@ def test_full_self_attn_tinyllama():
     sin = torch.randn(1, 1, seq_len, head_dim)
 
     attn_cuda = attn.cuda()
-    with torch.no_grad():
+    # Force the math (naive) SDPA backend so eager and deplodock compare
+    # the same algorithm — flash-attention re-orders FMAs and would
+    # otherwise drift O(0.5 × max_eager) from naive at seq ≥ 512.
+    with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
         eager_out = attn_cuda(x.cuda(), position_embeddings=(cos.cuda(), sin.cuda()))[0]
     eager = eager_out.cpu().flatten().numpy()
 
@@ -212,4 +209,42 @@ def test_full_self_attn_tinyllama():
             if nid not in feed and node.op.value is not None:
                 feed[nid] = np.array([node.op.value], dtype=np.float32)
     dpd = list(backend.run(compiled, input_data=feed).outputs.values())[0].flatten()
-    _assert_close(dpd, eager)
+    _assert_close(dpd, eager, threshold=threshold)
+
+
+@requires_cuda
+def test_full_self_attn_tinyllama():
+    """The real ``LlamaAttention`` from a TinyLlama config — the smallest
+    scope that includes Q/K/V Linears, RoPE, masked SDPA, and O Linear
+    with the actual decomposition graph the block test exercises. If
+    this fails while (1) and (2) pass, the regression is in the RoPE
+    elementwise kernel or its interaction with the surrounding
+    attention numerics."""
+    _run_self_attn_tinyllama(seq_len=32, threshold=1e-4)
+
+
+@requires_cuda
+def test_full_self_attn_tinyllama_seq512():
+    """Same as ``test_full_self_attn_tinyllama`` but at seq_len=512 — the
+    shape that makes the SDPA P@V kernel
+    (``k_scaled_dot_product_attention_reduce_reduce``) the dominant
+    cost. At this size:
+
+    - The masked-attention matrix is 32 × 512 × 512 = 32 MB, materialized
+      to HBM and re-read by the P@V pass (no flash-attention fusion in
+      the current pipeline).
+    - The P@V pass currently emits one CTA per output element
+      (heads × q_pos × head_dim = 1 M CTAs) with redundant softmax
+      recomputation across the 64 CTAs sharing a (head, q_pos) row.
+
+    This test pins correctness at this shape so future fusion /
+    cooperative-output-tiling work doesn't regress accuracy. Threshold
+    is loose (1.5) because at seq=512 with random fp32 weights the
+    naive-vs-naive comparison still drifts ~half of max_eager — the
+    softmax over 512 random scores plus 2048-K projections are at the
+    edge of fp32 precision. The intent is to catch order-of-magnitude
+    regressions (NaN, sign flip, off-by-N, structural miscompute), not
+    to verify bit-equivalence; a future flash-style fused-attention
+    recipe should let us tighten this dramatically.
+    """
+    _run_self_attn_tinyllama(seq_len=512, threshold=1.5)
