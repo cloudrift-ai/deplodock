@@ -8,33 +8,49 @@ cache-axis Vars in the consumer Loads (Stages stay singleton across
 F²); ``rebalance_threads`` augments Stage cache-axes when carving a
 referenced BLOCK axis.
 
-**Reuse decision.** For each Load inside a reduce Loop / StridedLoop,
-compute ``reuse = work / index_set_size`` where ``work`` is the product
-of bound-axis extents (threads × reduce iters) over the load's
-iteration domain and ``index_set_size`` is the affine-bound projection
-of the index (see :func:`index_set_size`). Stage when ``reuse > 1`` —
-this captures *any* fan-in: a missing thread axis (matmul shape), a
-load whose index doesn't reference the reduce var (loop-invariant in
-the reduce), or correlated coefficients that alias rows.
+**Pipeline:**
 
-**Decomposition for accepted Stages.** Each candidate cache var
-(thread axis or reduce axis appearing in the index) must (a) live in
-exactly one source dim and (b) have coefficient 1 for the additive
-Stage form to apply; otherwise we fall back to
-``source_index_template`` which materialization decodes via Sigma at
-cooperative-load time.
+1. **Walk the scope**, collecting every Load from every reduce
+   ``Loop`` / ``StridedLoop``, tagged with its reduce axis.
+2. **Group by source buffer.** Sibling reduces (softmax max/sum/output)
+   contribute their Loads to the same buffer's bucket; per-axis-name
+   differences in the reduce axis are normalized away by the slab
+   signature (reduce axes contribute extent only to the pattern).
+3. **Per buffer, fit one slab.** Classify every Load. If they all agree
+   on slab geometry, emit one Stage; if they disagree, bail — that
+   buffer's Loads stay on DRAM. Bailing is preferred to per-pattern
+   partitioning: the cost is missing optimization on rare buffers with
+   multiple distinct access shapes within one scope.
+4. **Admit & emit.** Greedily admit Stages until the per-scope smem
+   budget is hit; emit at scope head; rewrite admitted Loads to read
+   from staged smem.
 
-Sibling Loads at the same scope sharing
-``(buf, origin, cache_axes, slab_dims, template)`` collapse to one
-Stage. ``009_rebalance_threads`` carries its own smem-budget gate, so
-this pass admits any reuse-positive Load up to the per-Stage cap.
+**Slab geometry from a Load's index** (computed in ``_classify``):
+
+- ``origin`` — the index with every cache var (thread + reduce axis)
+  substituted to 0. The per-CTA anchor.
+- For each cache var, find which source dim its Var appears in.
+  Zero dims = fan-in axis (this var's threads/iterations all read the
+  same staged value). One dim = cache axis at that dim. Multiple dims
+  = bail (collapsed-reshape that can't be additively split).
+- Coefficient-1 check: substitute the var → 1 (others → 0) and compare
+  to ``origin[d] + 1``. If any axis fails (collapsed-reshape with a
+  surviving stride), fall back to ``source_index_template``.
+
+**Reuse.** A Load qualifies for staging iff at least one bound axis
+(thread or reduce) doesn't appear in its index — that axis's threads
+or iterations all read the same staged value. If every bound axis
+appears, no fan-in, skip.
 """
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, SimplifyCtx, Var, affine_form, index_set_size
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
@@ -42,14 +58,26 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 
 PATTERN = [Pattern("root", TileOp)]
 
-_MAX_SLAB_FLOATS = 4096  # 16KB hard cap per Stage at fp32
-# Per-scope budget across all admitted Stages. The consumer hardware
-# limit is 48 KB static smem = 12288 floats; downstream passes
-# (``012_pad_smem_banks``, ``013_double_buffer``) can ~2× this so the
-# pre-pad/db budget is ``12288 / 2 = 6144`` floats. When proposals
-# exceed this we admit by reuse desc until the budget is hit and let
-# the rest read DRAM.
+# Canonical reduce-axis Var name for the collapse step. Picked to not
+# collide with any axis name the front-end emits (those are ``a0``,
+# ``a1``, ...).
+_CANON_REDUCE = "__k__"
+
+_MAX_SLAB_FLOATS = 4096  # 16 KB hard cap per Stage at fp32
+# Per-scope budget across all admitted Stages. Consumer hardware static-
+# smem cap is 48 KB = 12288 floats; downstream pad + double-buffer can
+# ~2× this, so the pre-pad/db budget is ``12288 / 2 = 6144`` floats.
 _PER_SCOPE_FLOAT_BUDGET = 6144
+
+
+class _Slab(NamedTuple):
+    """Slab geometry derived from one Load's index."""
+
+    origin: tuple[Expr, ...]
+    cache_axes: tuple[Axis, ...]
+    slab_dims: tuple[int, ...]
+    template: tuple[Expr, ...] | None
+    n_floats: int
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -70,7 +98,7 @@ def _maybe_rewrite(body: Body) -> Body | None:
     used_names: set[str] = set()
     new_tile_body = _process_scope(tile, tile.thread_axes, tile.all_axes, used_names)
     if new_tile_body == tile.body:
-        raise RuleSkipped("no Load qualifies for staging (no reuse, oversized slab, or unrepresentable cache var)")
+        raise RuleSkipped("no Load qualifies for staging")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
@@ -80,170 +108,157 @@ def _process_scope(
     in_scope_axes: tuple[Axis, ...],
     used_names: set[str],
 ) -> Body:
-    stages: dict[tuple, Stage] = {}
-    rewritten: list[Stmt] = []
+    """Free Loops recurse; reduce loops contribute Loads to this scope's
+    per-buffer bucket. Per buffer, derive one slab if all Loads agree;
+    admit under budget; emit Stages at scope head; rewrite Loads."""
+    rewritten_inner: list[Stmt] = []
+    loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...]]]] = {}
 
     for s in scope.body:
         if isinstance(s, Loop) and not s.is_reduce:
-            rewritten.append(Loop(axis=s.axis, body=_process_scope(s, thread_axes, (*in_scope_axes, s.axis), used_names)))
-        elif isinstance(s, (Loop, StridedLoop)):
-            rewritten.append(_stage_loop(s, thread_axes, in_scope_axes, stages, used_names))
-        else:
-            rewritten.append(s)
+            rewritten_inner.append(Loop(axis=s.axis, body=_process_scope(s, thread_axes, (*in_scope_axes, s.axis), used_names)))
+            continue
+        if isinstance(s, (Loop, StridedLoop)):
+            scope_axes = (*in_scope_axes, s.axis)
+            for stmt in s.body:
+                if isinstance(stmt, Load):
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes))
+        rewritten_inner.append(s)
 
+    stages, name_rewrites = _build_stages(loads_by_buf, thread_axes, used_names)
     if not stages:
-        return tuple(rewritten)
-    return tuple([*stages.values(), *rewritten])
+        return tuple(rewritten_inner)
+
+    rewritten = tuple(_rewrite_loads(s, name_rewrites) for s in rewritten_inner)
+    return tuple([*stages, *rewritten])
 
 
-def _stage_loop(
-    loop: Loop | StridedLoop,
+def _build_stages(
+    loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...]]]],
     thread_axes: tuple[Axis, ...],
-    in_scope_axes: tuple[Axis, ...],
-    stages: dict[tuple, Stage],
     used_names: set[str],
-) -> Loop | StridedLoop:
-    """Walk a reduce ``Loop`` / ``StridedLoop`` body. For each Load with
-    ``reuse > 1`` (per :func:`index_set_size`), build or reuse a Stage at
-    the surrounding scope and rewrite the Load to read from smem. ``stages``
-    is shared across sibling reduces in the same scope so they collapse to
-    one slab when their (buf, origin, cache_axes, slab_dims, template) keys
-    match."""
-    scope_axes = (*in_scope_axes, loop.axis)
-    bound_extents = {ax.name: int(ax.extent) for ax in (*thread_axes, loop.axis)}
-    work = 1
-    for e in bound_extents.values():
-        work *= e
+) -> tuple[list[Stage], dict[str, tuple[str, tuple[Expr, ...]]]]:
+    """For each buffer: classify all Loads, emit one Stage if they agree,
+    skip otherwise. Admission stops when ``_PER_SCOPE_FLOAT_BUDGET`` is hit."""
+    stages: list[Stage] = []
+    name_rewrites: dict[str, tuple[str, tuple[Expr, ...]]] = {}
+    used_floats = 0
 
-    rewrites: dict[str, tuple[str, tuple[Expr, ...]]] = {}
-    for stmt in loop.body:
-        if not isinstance(stmt, Load):
+    for buf, items in loads_by_buf.items():
+        # Collapse: do all Loads of this buffer share the same access
+        # pattern? Normalize each Load's reduce-axis Var to a canonical
+        # name first so sibling reduces (which have distinct reduce-axis
+        # names but stage the same row) compare textually equal.
+        canonical_indices = []
+        for load, reduce_axis, _ in items:
+            sigma = Sigma({reduce_axis.name: Var(_CANON_REDUCE)})
+            canonical_indices.append(tuple(sigma.apply(e) for e in load.index))
+        if any(c != canonical_indices[0] for c in canonical_indices[1:]):
+            continue  # disagree → bail; all Loads stay DRAM
+        # Classify only the representative — every Load in the group has
+        # the same access pattern, so one Slab covers them all.
+        rep_load, rep_reduce, rep_scope = items[0]
+        slab = _classify(rep_load, thread_axes, rep_reduce, rep_scope)
+        if slab is None:
             continue
-        built = _build_stage(stmt, thread_axes, loop.axis, scope_axes, bound_extents, work)
-        if built is None:
+        if used_floats + slab.n_floats > _PER_SCOPE_FLOAT_BUDGET:
             continue
-        key, stage = built
-        if key not in stages:
-            slab_floats = 1
-            for ax in stage.axes:
-                slab_floats *= int(ax.extent)
-            committed = sum(_slab_floats(s) for s in stages.values())
-            if committed + slab_floats > _PER_SCOPE_FLOAT_BUDGET:
-                continue  # would exceed per-scope smem budget; leave as DRAM
-            stage = Stage(
-                name=_gen_name(stage.buf, used_names),
-                buf=stage.buf,
-                origin=stage.origin,
-                axes=stage.axes,
-                slab_dims=stage.slab_dims,
-                source_index_template=stage.source_index_template,
+        smem_name = _gen_name(buf, used_names)
+        stages.append(
+            Stage(
+                name=smem_name,
+                buf=buf,
+                origin=slab.origin,
+                axes=slab.cache_axes,
+                slab_dims=slab.slab_dims,
+                source_index_template=slab.template,
             )
-            stages[key] = stage
-        rewrites[stmt.name] = (stages[key].name, tuple(Var(ax.name) for ax in stages[key].axes))
+        )
+        used_floats += slab.n_floats
+        smem_index = tuple(Var(ax.name) for ax in slab.cache_axes)
+        for load, _, _ in items:
+            name_rewrites[load.name] = (smem_name, smem_index)
+    return stages, name_rewrites
 
-    def replace(s: Stmt) -> Stmt:
-        if isinstance(s, Load) and s.name in rewrites:
-            smem_name, new_index = rewrites[s.name]
+
+def _rewrite_loads(stmt: Stmt, name_rewrites: dict[str, tuple[str, tuple[Expr, ...]]]) -> Stmt:
+    if not name_rewrites:
+        return stmt
+
+    def fn(s: Stmt) -> Stmt:
+        if isinstance(s, Load) and s.name in name_rewrites:
+            smem_name, new_index = name_rewrites[s.name]
             return Load(name=s.name, input=smem_name, index=new_index)
         return s
 
-    new_body = loop.body.map(replace)
-    if isinstance(loop, StridedLoop):
-        return StridedLoop(axis=loop.axis, start=loop.start, step=loop.step, body=new_body, unroll=loop.unroll)
-    return Loop(axis=loop.axis, body=new_body, unroll=loop.unroll)
+    return Body((stmt,)).map(fn)[0]
 
 
-def _build_stage(
+def _classify(
     load: Load,
     thread_axes: tuple[Axis, ...],
     reduce_axis: Axis,
     scope_axes: tuple[Axis, ...],
-    bound_extents: dict[str, int],
-    work: int,
-) -> tuple[tuple, Stage] | None:
-    """Return ``(key, Stage)`` when ``load`` qualifies for staging.
+) -> _Slab | None:
+    """Derive the slab for ``load`` by evaluating ``load.index`` over
+    the cache vars (thread axes + this loop's reduce axis):
 
-    Decompose each index entry into affine form over the candidate cache
-    vars (thread axes + reduce axis). Reject when:
+    1. ``origin`` = ``index`` with every cache var → 0.
+    2. For each cache var, find which source dim its Var appears in.
+       Zero dims = fan-in axis (won't constrain the slab). One dim =
+       cache axis at that dim. Multiple dims = bail.
+    3. Coefficient-1 check: substitute one cache var → 1 (others → 0)
+       and compare to ``origin[d] + 1``. If any axis disagrees, fall
+       back to ``source_index_template``.
 
-    - any entry is non-affine in those vars;
-    - a cache var spans multiple source dims (collapsed-reshape that
-      can't be split per-dim);
-    - ``reuse = work / index_set_size <= 1`` — no fan-in across threads /
-      reduce iters;
-    - the slab exceeds ``_MAX_SLAB_FLOATS``.
-
-    Coefficient-≠-1 cases fall back to ``source_index_template``. The
-    Stage's ``name`` is a placeholder; ``_stage_loop`` assigns the real
-    smem name on first admission.
+    Returns ``None`` when no fan-in axis exists (no reuse), when a
+    cache var spans multiple dims, or when the slab exceeds the cap.
     """
-    candidates_by_name = {ax.name: ax for ax in (*thread_axes, reduce_axis)}
-    cache_var_set = frozenset(candidates_by_name)
+    candidates = (*thread_axes, reduce_axis)
+    ctx = SimplifyCtx({ax.name: Interval(0, int(ax.extent) - 1) for ax in scope_axes})
 
-    forms = [affine_form(e, cache_var_set) for e in load.index]
-    if any(f is None for f in forms):
-        return None
-    forms = [f for f in forms if f is not None]
+    zero_sigma = Sigma({ax.name: Literal(0, "int") for ax in candidates})
+    origin = tuple(zero_sigma.apply(e).simplify(ctx) for e in load.index)
 
-    seen_vars: list[str] = []
     var_to_dim: dict[str, int] = {}
-    coeff_one: dict[str, bool] = {}
-    for d, (_, coeffs) in enumerate(forms):
-        for v, c in coeffs.items():
-            if v in var_to_dim:
-                return None
-            seen_vars.append(v)
-            var_to_dim[v] = d
-            coeff_one[v] = c == 1
+    for ax in candidates:
+        dims = [d for d, e in enumerate(load.index) if ax.name in e.free_vars()]
+        if not dims:
+            continue
+        if len(dims) > 1:
+            return None
+        var_to_dim[ax.name] = dims[0]
 
-    if not seen_vars:
+    # No cache axis appears, or every bound axis appears (no fan-in) → no slab.
+    if not var_to_dim or len(var_to_dim) == len(candidates):
         return None
 
-    size = index_set_size(load.index, bound_extents)
-    if size is None or work <= size:
-        return None
-
-    cache_axes = tuple(candidates_by_name[v] for v in seen_vars)
+    cache_axes = tuple(ax for ax in candidates if ax.name in var_to_dim)
+    slab_dims = tuple(var_to_dim[ax.name] for ax in cache_axes)
     n_floats = 1
     for ax in cache_axes:
         n_floats *= int(ax.extent)
     if n_floats > _MAX_SLAB_FLOATS:
         return None
 
-    slab_dims = tuple(var_to_dim[v] for v in seen_vars)
-    ctx = SimplifyCtx({ax.name: Interval(0, int(ax.extent) - 1) for ax in scope_axes})
-    origin = tuple(anchor.simplify(ctx) for anchor, _ in forms)
-
-    needs_template = not all(coeff_one.values())
+    needs_template = False
+    for ax in cache_axes:
+        d = var_to_dim[ax.name]
+        sigma_one = Sigma({a.name: Literal(1 if a.name == ax.name else 0, "int") for a in candidates})
+        actual = sorted(t.pretty() for t in _flatten_add(sigma_one.apply(load.index[d]).simplify(ctx)))
+        expected = sorted(t.pretty() for t in _flatten_add((origin[d] + Literal(1, "int")).simplify(ctx)))
+        if actual != expected:
+            needs_template = True
+            break
     template = tuple(load.index) if needs_template else None
 
-    origin_key = tuple(tuple(sorted(t.pretty() for t in _flatten_add(e))) for e in origin)
-    # Sibling reduces in cooperative-reduce kernels use distinct *reduce*-
-    # axis names (softmax: a2 / a3 / a4 sweep the same row) — those should
-    # share one Stage, so reduce axes contribute extent only. But two
-    # Loads in the *same* reduce loop with distinct *thread*-axis usage
-    # are reading different slabs (e.g. position_embeddings indexed by Q's
-    # seq axis vs K's seq axis); thread-axis names must distinguish them.
-    reduce_axis_name = reduce_axis.name
-    cache_key = tuple(int(ax.extent) if ax.name == reduce_axis_name else (ax.name, int(ax.extent)) for ax in cache_axes)
-    template_key = tuple(e.pretty() for e in template) if template is not None else None
-    key = (load.input, origin_key, cache_key, slab_dims, template_key)
-
-    return key, Stage(
-        name="",  # filled in by caller on first admission
-        buf=load.input,
+    return _Slab(
         origin=origin,
-        axes=cache_axes,
+        cache_axes=cache_axes,
         slab_dims=slab_dims,
-        source_index_template=template,
+        template=template,
+        n_floats=n_floats,
     )
-
-
-def _slab_floats(stage: Stage) -> int:
-    n = 1
-    for ax in stage.axes:
-        n *= int(ax.extent)
-    return n
 
 
 def _flatten_add(e: Expr) -> list[Expr]:
