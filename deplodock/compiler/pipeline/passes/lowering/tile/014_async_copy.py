@@ -31,7 +31,7 @@ import logging
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, AsyncWait, BufferedStage, TileOp
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AsyncBufferedStage, AsyncWait, BufferedStage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 PATTERN = [Pattern("root", TileOp)]
 
 _MIN_CAPABILITY = (8, 0)
-_MIN_ELEMENTS_PER_THREAD = 4
+_MIN_BYTES_PER_THREAD = 16  # 4 fp32 elems
 
 
 @functools.cache
@@ -84,7 +84,7 @@ def _maybe_rewrite(body: Body) -> Body | None:
 
     new_tile_body = _process(tile.body, n_threads)
     if new_tile_body is tile.body or new_tile_body == tile.body:
-        raise RuleSkipped(f"no Stage eligible for cp.async (need >= {_MIN_ELEMENTS_PER_THREAD} elts/thread)")
+        raise RuleSkipped(f"no Stage eligible for cp.async (need >= {_MIN_BYTES_PER_THREAD} bytes/thread)")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
@@ -124,8 +124,8 @@ def _process(body: Body, n_threads: int) -> Body:
 
 
 def _eligible(stage: BufferedStage, n_threads: int) -> bool:
-    slab_floats = 1
+    slab_bytes = BYTES_PER_ELEM
     for ax in stage.axes:
-        slab_floats *= int(ax.extent)
-    elems_per_thread = max(1, slab_floats // max(1, n_threads))
-    return elems_per_thread >= _MIN_ELEMENTS_PER_THREAD
+        slab_bytes *= int(ax.extent)
+    bytes_per_thread = max(BYTES_PER_ELEM, slab_bytes // max(1, n_threads))
+    return bytes_per_thread >= _MIN_BYTES_PER_THREAD

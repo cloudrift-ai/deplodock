@@ -52,17 +52,17 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
-from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, TemplateAddressing, TileOp
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AffineAddressing, Stage, TemplateAddressing, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
-_MAX_SLAB_FLOATS = 4096  # 16 KB hard cap per Stage at fp32
+_MAX_SLAB_BYTES = 16 * 1024  # 16 KB hard cap per Stage
 # Per-scope budget across all admitted Stages. Consumer hardware static-
-# smem cap is 48 KB = 12288 floats; downstream pad + double-buffer can
-# ~2× this, so the pre-pad/db budget is ``12288 / 2 = 6144`` floats.
-_PER_SCOPE_FLOAT_BUDGET = 6144
+# smem cap is 48 KB; downstream pad + double-buffer can ~2× this, so the
+# pre-pad/db budget is ``48 KB / 2 = 24 KB``.
+_PER_SCOPE_BYTES_BUDGET = 24 * 1024
 
 
 class _Slab(NamedTuple):
@@ -72,7 +72,7 @@ class _Slab(NamedTuple):
     cache_axes: tuple[Axis, ...]
     slab_dims: tuple[int, ...]
     template: tuple[Expr, ...] | None
-    n_floats: int
+    n_bytes: int
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -142,7 +142,7 @@ def _build_stages(
     at multiple conditional positions, each requiring its own slab)."""
     stages: list[Stage] = []
     name_rewrites: dict[str, tuple[str, tuple[Expr, ...]]] = {}
-    used_floats = 0
+    used_bytes = 0
 
     for buf, items in loads_by_buf.items():
         # Partition this buffer's Loads by structural index equality.
@@ -160,12 +160,11 @@ def _build_stages(
             slab = _classify(rep_load, thread_axes, rep_reduce, rep_scope)
             if slab is None:
                 continue
-            if used_floats + slab.n_floats > _PER_SCOPE_FLOAT_BUDGET:
+            if used_bytes + slab.n_bytes > _PER_SCOPE_BYTES_BUDGET:
                 continue
             smem_name = _gen_name(buf, used_names)
             addressing: AffineAddressing | TemplateAddressing = (
-                TemplateAddressing(exprs=slab.template) if slab.template is not None else AffineAddressing(
-                    dims=slab.slab_dims)
+                TemplateAddressing(exprs=slab.template) if slab.template is not None else AffineAddressing(dims=slab.slab_dims)
             )
             stages.append(
                 Stage(
@@ -176,7 +175,7 @@ def _build_stages(
                     addressing=addressing,
                 )
             )
-            used_floats += slab.n_floats
+            used_bytes += slab.n_bytes
             smem_index = tuple(Var(ax.name) for ax in slab.cache_axes)
             for load in members:
                 name_rewrites[load.name] = (smem_name, smem_index)
@@ -237,10 +236,10 @@ def _classify(
 
     cache_axes = tuple(ax for ax in candidates if ax.name in var_to_dim)
     slab_dims = tuple(var_to_dim[ax.name] for ax in cache_axes)
-    n_floats = 1
+    n_bytes = BYTES_PER_ELEM
     for ax in cache_axes:
-        n_floats *= int(ax.extent)
-    if n_floats > _MAX_SLAB_FLOATS:
+        n_bytes *= int(ax.extent)
+    if n_bytes > _MAX_SLAB_BYTES:
         return None
 
     needs_template = False
@@ -259,7 +258,7 @@ def _classify(
         cache_axes=cache_axes,
         slab_dims=slab_dims,
         template=template,
-        n_floats=n_floats,
+        n_bytes=n_bytes,
     )
 
 

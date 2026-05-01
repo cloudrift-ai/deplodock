@@ -68,7 +68,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
 from deplodock.compiler.ir.expr import affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import Stage, TileOp
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
@@ -79,13 +79,13 @@ PATTERN = [Pattern("root", TileOp)]
 WARP_SIZE = 32
 BANKS = 32  # 32 banks of 4 bytes
 # Per-Stage padded-slab budget. The static-smem cap on consumer Ada/Hopper
-# is 48 KB = 12288 floats. Stages get double-buffered downstream (×2) and
-# typical matmul kernels have ≥ 2 sibling Stages, so per-Stage pre-DB
-# budget is roughly cap / 4 → 3072. We give a slightly larger headroom
-# (5120) so single-large-Stage kernels still benefit, and accept that a
-# matmul with two near-equal Stages may miss the perfect-fix candidate
-# and fall back to the partial-fix pad.
-_MAX_PADDED_SLAB_FLOATS = 5 * 1024
+# is 48 KB. Stages get double-buffered downstream (×2) and typical matmul
+# kernels have ≥ 2 sibling Stages, so per-Stage pre-DB budget is roughly
+# cap / 4 → 12 KB. We give a slightly larger headroom (20 KB) so single-
+# large-Stage kernels still benefit, and accept that a matmul with two
+# near-equal Stages may miss the perfect-fix candidate and fall back to
+# the partial-fix pad.
+_MAX_PADDED_SLAB_BYTES = 20 * 1024
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -178,10 +178,10 @@ def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> 
     best_c = base_conflict
     for pad in candidates:
         padded = tuple(e + p for e, p in zip(base_extents, pad, strict=True))
-        slab_floats = 1
+        slab_bytes = BYTES_PER_ELEM
         for e in padded:
-            slab_floats *= e
-        if slab_floats > _MAX_PADDED_SLAB_FLOATS:
+            slab_bytes *= e
+        if slab_bytes > _MAX_PADDED_SLAB_BYTES:
             continue
         c = _max_conflict(per_load_coeffs, padded, thread_axes)
         if c <= 1:

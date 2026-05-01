@@ -47,7 +47,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_
 PATTERN = [Pattern("root", TileOp)]
 
 _BUFFER_COUNT = 2
-_SMEM_BUDGET_FLOATS = 24 * 1024  # 96 KB at fp32
+_SMEM_BUDGET_BYTES = 96 * 1024  # 96 KB
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -79,8 +79,9 @@ def _process_scope(body: Body) -> Body:
         if any(isinstance(st, BufferedStage) for st in s.body):
             continue
         stages = [st for st in s.body if isinstance(st, Stage)]
-        total_floats = sum(_slab_size(st) for st in stages)
-        if _BUFFER_COUNT * total_floats > _SMEM_BUDGET_FLOATS:
+        # Stages here are not yet BufferedStage; smem_bytes is the
+        # single-slot footprint, ×_BUFFER_COUNT for the post-DB total.
+        if _BUFFER_COUNT * sum(st.smem_bytes for st in stages) > _SMEM_BUDGET_BYTES:
             continue
         updated = _double_buffer(s)
         if updated is not None:
@@ -117,13 +118,6 @@ def _is_kouter_matmul(loop: Loop) -> bool:
         return True
 
     return is_matmul_k_outer(loop, extra_gate=gate)
-
-
-def _slab_size(stage: Stage) -> int:
-    n = 1
-    for ax in stage.axes:
-        n *= int(ax.extent)
-    return n
 
 
 def _double_buffer(loop: Loop) -> Loop | None:

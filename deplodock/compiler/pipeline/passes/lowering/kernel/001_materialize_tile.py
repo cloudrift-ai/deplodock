@@ -252,8 +252,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     if not stage.axes:
         raise ValueError(f"Stage {stage.name!r} has no cache axes")
     extents = tuple(int(ax.extent) for ax in stage.axes)
-    pad = stage.pad if stage.pad else (0,) * len(extents)
-    padded_extents = tuple(e + p for e, p in zip(extents, pad, strict=True))
+    padded_extents = stage.alloc_extents
 
     # Iteration axis + per-cache-axis coord. Always synthesize a fresh
     # iter axis name so the cooperative-load ``for`` variable can't

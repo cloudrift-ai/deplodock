@@ -149,6 +149,12 @@ class Combine(Stmt):
         return [f"{indent}Combine({self.name}, op={self.op.name})"]
 
 
+# Bytes per stored element in smem. Today's pipeline emits fp32 only;
+# Stage carries no dtype. If multi-dtype support lands, move this onto
+# Stage as a per-instance field and update callers.
+BYTES_PER_ELEM = 4
+
+
 @dataclass(frozen=True)
 class AffineAddressing:
     """Affine slab addressing: each cache axis ``i`` decoded coord is
@@ -234,6 +240,33 @@ class Stage(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
+    @property
+    def alloc_extents(self) -> tuple[int, ...]:
+        """Per-cache-axis smem allocation extent: cache extent + ``pad``.
+
+        The cooperative load iterates over the unpadded extents; the
+        smem allocation reserves the padded ones. Used by every smem-
+        sizing check in the tile-lowering chain (007 admission, 012
+        bank-pad budget, 013 double-buffer budget, materialize
+        ``Smem.extents``)."""
+        extents = tuple(int(ax.extent) for ax in self.axes)
+        if not self.pad:
+            return extents
+        return tuple(e + p for e, p in zip(extents, self.pad, strict=True))
+
+    @property
+    def smem_bytes(self) -> int:
+        """Bytes of dynamic shared memory this Stage allocates.
+
+        ``product(alloc_extents) * BYTES_PER_ELEM`` × ``buffer_count``
+        (the latter only for ``BufferedStage`` subtypes). Assumes
+        ``BYTES_PER_ELEM == 4`` (fp32) — matches today's kernel
+        codegen, which has no per-Stage dtype field."""
+        n = BYTES_PER_ELEM
+        for e in self.alloc_extents:
+            n *= e
+        return n
+
     def exprs(self) -> tuple[Expr, ...]:
         template = self.addressing.exprs if isinstance(self.addressing, TemplateAddressing) else ()
         return (*self.origin, *template)
@@ -291,6 +324,10 @@ class BufferedStage(Stage):
     def __post_init__(self) -> None:
         if self.buffer_count < 2:
             raise ValueError(f"BufferedStage {self.name!r}: buffer_count must be >= 2, got {self.buffer_count}")
+
+    @property
+    def smem_bytes(self) -> int:
+        return super().smem_bytes * self.buffer_count
 
     def exprs(self) -> tuple[Expr, ...]:
         return (*super().exprs(), self.phase)
@@ -425,6 +462,7 @@ __all__ = [
     "AffineAddressing",
     "TemplateAddressing",
     "AsyncWait",
+    "BYTES_PER_ELEM",
     # Bindings
     "BoundAxis",
     "BIND_THREAD",
