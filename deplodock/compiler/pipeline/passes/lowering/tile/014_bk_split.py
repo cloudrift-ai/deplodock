@@ -50,7 +50,8 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Cond, Load, Loop, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.expr import Expr
+from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
@@ -174,8 +175,27 @@ def _split_pattern(stmts: tuple[Stmt, ...], reduce_idx: int, n: int) -> tuple[tu
     # one stage would have arrived at that point. Smem usage is
     # unchanged (n × half × M = K × M total) and 015_pipeline_async
     # still pipelines the K_outer loop end-to-end.
+    # Emit one MERGED reduce loop whose body does the work of all ``n``
+    # halves back-to-back per K_i iteration, with K_i ∈ [0, half).
+    # Two-loop variants give NVCC two distinct scheduling regions and
+    # the compiler keeps each half's locals live across the boundary —
+    # observed at 173–255 regs / 17% occ on sm_120 fp32 1024×1024,
+    # vs 95 regs / 33% occ for the unsplit BK=64 baseline. With one
+    # merged inner loop the compiler interleaves both halves freely,
+    # matching the unsplit register footprint.
+    #
+    # SSA-name strategy for the merged body:
+    # - ``Accum`` target names (``acc*``) are SHARED across halves
+    #   (Init lives at the parent scope — both halves accumulate into
+    #   the same accumulators). NOT renamed.
+    # - Every other locally-defined name (``in*``, ``v*``) is suffixed
+    #   ``_<half_idx>`` so the halves don't collide.
     out_stages: list[Stage] = []
-    out_loops: list[Loop] = []
+    acc_names = {s.name for s in reduce_loop.body if isinstance(s, Accum)}
+    locally_defined = {n for s in reduce_loop.body for n in s.defines()}
+    rename_targets = locally_defined - acc_names
+
+    merged_body: list[Stmt] = []
     for i in range(n):
         offset = i * half
         rename_map: dict[str, str] = {}
@@ -184,10 +204,19 @@ def _split_pattern(stmts: tuple[Stmt, ...], reduce_idx: int, n: int) -> tuple[tu
             out_stages.append(split_st)
             if new_name is not None:
                 rename_map[st.name] = new_name
+        suffix = "" if i == 0 else f"_{i}"
         sigma = Sigma({K_name: Var(K_name) + Literal(offset, "int")}) if offset else Sigma.IDENTITY
-        new_body = tuple(_split_body_stmt(s, sigma, rename_map) for s in reduce_loop.body)
-        out_loops.append(Loop(axis=Axis(K_name, half), body=new_body, unroll=reduce_loop.unroll))
-    return (*out_stages, *out_loops), len(stages)
+
+        def rename_ssa(name: str, _suffix=suffix) -> str:
+            if not _suffix or name not in rename_targets:
+                return name
+            return f"{name}{_suffix}"
+
+        for s in reduce_loop.body:
+            merged_body.append(_merged_body_stmt(s, rename_ssa, sigma, rename_map))
+
+    merged_loop = Loop(axis=Axis(K_name, half), body=tuple(merged_body), unroll=reduce_loop.unroll)
+    return (*out_stages, merged_loop), len(stages)
 
 
 def _split_stage(stage: Stage, K_name: str, half: int, offset: int, suffix_idx: int) -> tuple[Stage, str | None]:
@@ -207,17 +236,25 @@ def _split_stage(stage: Stage, K_name: str, half: int, offset: int, suffix_idx: 
     return new_stage, (new_name if suffix_idx > 0 else None)
 
 
-def _split_body_stmt(stmt: Stmt, sigma: Sigma, rename_map: dict[str, str]) -> Stmt:
-    """Apply sigma to a body stmt, except: a ``Load`` whose ``input``
-    is in ``rename_map`` keeps its original index but gets repointed
-    at the renamed buffer (the per-half cache buffer has its own
-    cache-local index space starting at 0)."""
+def _merged_body_stmt(stmt: Stmt, rename_ssa, sigma: Sigma, rename_map: dict[str, str]) -> Stmt:
+    """Rewrite one stmt of the original reduce body for inclusion in
+    the merged loop's body for a particular half.
+
+    - ``Load(input=staged_name, ...)`` gets repointed at the per-half
+      cache buffer AND its index stays cache-local (NOT sigma-shifted),
+      since the merged loop's K_name is in ``[0, half)`` and the cache
+      slab also indexes ``[0, half)``. The output SSA name still goes
+      through ``rename_ssa`` so it doesn't collide with the other half.
+    - Everything else gets ``rewrite(rename_ssa, sigma)`` — unstaged
+      Loads of source tensors pick up the K-axis offset via sigma so
+      they reference the right global K-slice, axis arithmetic in
+      derived expressions inherits the same shift, and Accum/Assign
+      stmts use the suffix-renamed locals while keeping accumulator
+      names intact (the rename closure excludes Accum targets).
+    """
     if isinstance(stmt, Load) and stmt.input in rename_map:
-        new_name = rename_map[stmt.input]
-        return dc_replace(stmt, input=new_name) if new_name != stmt.input else stmt
-    if sigma is Sigma.IDENTITY:
-        return stmt
-    return stmt.rewrite(_id, sigma)
+        return dc_replace(stmt, name=rename_ssa(stmt.name), input=rename_map[stmt.input])
+    return stmt.rewrite(rename_ssa, sigma)
 
 
 def _id(name: str) -> str:
