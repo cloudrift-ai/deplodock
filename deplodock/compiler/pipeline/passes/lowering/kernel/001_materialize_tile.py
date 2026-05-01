@@ -119,15 +119,33 @@ def _materialize(blk: Tile) -> Stmt:
     declared_smem: set[str] = set()
 
     # TMA hoist state. ``descriptors`` and ``mbar_prologue`` collect the
-    # per-stage ``TmaDescriptor`` + mbar Smem + ``MbarrierInit`` so the
-    # post-walk prepends them to the Tile body. The set of distinct mbar
-    # names issued in this TileOp is captured separately and used at
-    # ``AsyncWait`` time to emit one ``MbarrierWait`` per mbar with the
-    # consumer phase carried by the AsyncWait itself (set by
-    # ``015_pipeline_async``).
+    # per-stage ``TmaDescriptor`` + shared mbar Smem + ``MbarrierInit`` so
+    # the post-walk prepends them to the Tile body.
+    #
+    # All TmaBufferedStage instances in this Tile share ONE mbarrier array
+    # ``tma_mbar[buffer_count]`` (one slot per ring-buffer position). The
+    # mbar is initialized with ``count = num_distinct_stages``: each
+    # stage's ``arrive.expect_tx`` contributes 1 arrival and adds its
+    # transaction bytes; once all stages have arrived AND their TMA tx
+    # bytes are received, the mbar phase flips and a single
+    # ``MbarrierWait`` releases the consumer. This halves the wait /
+    # arrive count compared to per-stage mbarriers (which had to be waited
+    # for sequentially), and is the standard NVIDIA pattern for
+    # multi-tile TMA pipelining.
     descriptors: dict[str, TmaDescriptor] = {}
     mbar_prologue: list[Stmt] = []
     declared_mbar: set[str] = set()
+    SHARED_MBAR_NAME = "tma_mbar"
+
+    # Pre-scan to determine the number of distinct TmaBufferedStage names
+    # in this Tile — that's the arrive count for the shared mbarrier.
+    tma_stage_names: list[str] = []
+    tma_buffer_count = 0
+    for s in body.iter():
+        if isinstance(s, TmaBufferedStage):
+            if s.name not in tma_stage_names:
+                tma_stage_names.append(s.name)
+            tma_buffer_count = max(tma_buffer_count, s.buffer_count)
 
     def filter_emit(stmts: list[Stmt]) -> list[Stmt]:
         out: list[Stmt] = []
@@ -139,23 +157,25 @@ def _materialize(blk: Tile) -> Stmt:
             out.append(s)
         return out
 
-    # Distinct mbar arrays ever issued. Each entry is the per-stage
-    # mbarrier *array* name (one entry per slot of the ring buffer);
-    # waits index into it via the AsyncWait's ``slot`` expr.
-    tma_mbars: list[str] = []
+    # Issuer thread per stage (stage 0 → tid 0, stage 1 → tid 1, ...) so
+    # multiple stages' arrive+TMA pairs issue from different threads
+    # rather than serializing on tid 0.
+    issuer_tid = {name: idx for idx, name in enumerate(tma_stage_names)}
+    has_tma = bool(tma_stage_names)
 
     def emit_async_wait(stmt: AsyncWait) -> list[Stmt]:
         # TMA path: wait carries the explicit consumer-side phase + slot
-        # set by 015_pipeline_async — emit one MbarrierWait per distinct
-        # mbar array touched in this TileOp, all using the same (slot, phase).
-        if stmt.phase is not None and tma_mbars:
-            return [MbarrierWait(mbar=m, phase=stmt.phase, slot=stmt.slot) for m in tma_mbars]
+        # set by 015_pipeline_async. With a shared mbar covering all
+        # stages, ONE MbarrierWait releases the consumer once every
+        # stage's TMA has completed (mbar count = num stages).
+        if stmt.phase is not None and has_tma:
+            return [MbarrierWait(mbar=SHARED_MBAR_NAME, phase=stmt.phase, slot=stmt.slot)]
         # cp.async fallback (or pre-pipelining synchronous-style wait).
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
     def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
         desc_name = f"{stage.name}_desc"
-        mbar_name = f"{stage.name}_mbar"
+        mbar_name = SHARED_MBAR_NAME
         if desc_name not in descriptors:
             assert isinstance(stage.addressing, AffineAddressing)
             # Box extents per source dim: product of cache extents that
@@ -183,33 +203,27 @@ def _materialize(blk: Tile) -> Stmt:
             )
         if mbar_name not in declared_mbar:
             declared_mbar.add(mbar_name)
-            # Per-slot mbarrier array — one mbar per ring-buffer slot.
-            # Multiple ``arrive.expect_tx`` on the *same* mbar within a
-            # phase accumulate into one phase rather than queuing per-slot
-            # phases, so a scalar mbar would deadlock the pipelined
-            # consumer. Init each slot's mbar in the kernel prologue.
+            # Shared mbarrier array: one mbar per ring-buffer slot, with
+            # arrive count = number of distinct stages (so all stages
+            # must arrive before phase flips). Multiple expect_tx on the
+            # same mbar accumulate transaction bytes for the *current*
+            # phase, exactly the semantics we want.
             mbar_prologue.append(
-                Smem(name=mbar_name, extents=(stage.buffer_count,), dtype="unsigned long long"),
+                Smem(name=mbar_name, extents=(tma_buffer_count,), dtype="unsigned long long"),
             )
-            for s in range(stage.buffer_count):
-                mbar_prologue.append(MbarrierInit(mbar=mbar_name, count=1, slot=Literal(s, "int")))
+            for s in range(tma_buffer_count):
+                mbar_prologue.append(MbarrierInit(mbar=mbar_name, count=len(tma_stage_names), slot=Literal(s, "int")))
         slab_bytes = BYTES_PER_ELEM
         for ax in stage.axes:
             slab_bytes *= int(ax.extent)
         # Smem allocation: leading phase dim + cache extents (with pad).
         full_extents = (stage.buffer_count, *stage.alloc_extents)
         smem_index = (stage.phase, *([Literal(0, "int")] * len(stage.axes)))
-        # Distribute issuer threads across stages: stage 0 → tid 0,
-        # stage 1 → tid 1, etc. Each unique mbar (== unique source buffer)
-        # gets its own dedicated issuer so the per-iter ``arrive+TMA``
-        # pairs run in parallel on different threads instead of
-        # serializing on tid 0. Same-name reissues (prologue + main loop)
-        # share the same issuer thread.
-        if mbar_name not in tma_mbars:
-            tma_mbars.append(mbar_name)
-        issuer_tid = tma_mbars.index(mbar_name)
+        # Distribute issuer threads across stages so each stage's
+        # arrive+TMA pair issues from a different thread (stage 0 → tid 0,
+        # stage 1 → tid 1, ...) rather than serializing on tid 0.
         cond = Cond(
-            cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(issuer_tid, "int")),
+            cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(issuer_tid[stage.name], "int")),
             body=(
                 MbarrierArriveExpectTx(mbar=mbar_name, bytes_=slab_bytes, slot=stage.phase),
                 TmaLoad(
