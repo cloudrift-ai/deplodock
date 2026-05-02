@@ -459,6 +459,12 @@ def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):
         if tensor is None:
             logger.error("Could not bind constant %s (target=%r)", nid, target)
             sys.exit(1)
+        # Apply any compile-time-folded transpose recorded by
+        # ``004a_fold_constant_transpose``. The graph's downstream Loads
+        # see the post-transpose layout; physically transposing here
+        # makes the runtime tensor match.
+        if node.op.transpose is not None:
+            tensor = tensor.detach().permute(*node.op.transpose).contiguous()
         input_data[nid] = tensor.detach().cpu().flatten().tolist()
     return input_data
 

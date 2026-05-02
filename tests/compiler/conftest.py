@@ -77,13 +77,37 @@ def run_graph(request) -> Callable:
 
 
 def _inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.ndarray]:
-    """Auto-supply scalar ConstantOp values that weren't passed in input_data."""
+    """Auto-supply scalar ConstantOp values that weren't passed in input_data.
+
+    Also re-binds tensor constants whose ``ConstantOp.name`` matches an
+    entry in the input data but whose graph node id differs (e.g. after
+    ``004a_fold_constant_transpose`` replaces ``TransposeOp(c)`` with a
+    new ConstantOp carrying a runtime transpose marker — same source
+    name, fresh node id, transposed shape). Applies the recorded
+    permutation here so the loop / numpy backends see the post-transpose
+    data.
+    """
     from deplodock.compiler.ir.base import ConstantOp
 
     for nid, node in graph.nodes.items():
         if not isinstance(node.op, ConstantOp):
             continue
-        if node.op.value is None or nid in input_data:
+        if nid in input_data:
             continue
-        input_data[nid] = np.array([node.op.value], dtype=np.float32)
+        if node.op.value is not None:
+            input_data[nid] = np.array([node.op.value], dtype=np.float32)
+            continue
+        src = input_data.get(node.op.name)
+        if src is not None:
+            arr = np.asarray(src, dtype=np.float32)
+            if node.op.transpose is not None:
+                # Reshape to source rank first — input_data may already
+                # be flat — using the post-transpose ``output.shape``
+                # inverse-permuted to recover the source shape.
+                inv = [0] * len(node.op.transpose)
+                for i, p in enumerate(node.op.transpose):
+                    inv[p] = i
+                src_shape = tuple(int(node.output.shape[i]) for i in inv)
+                arr = arr.reshape(src_shape).transpose(*node.op.transpose)
+            input_data[nid] = arr
     return input_data

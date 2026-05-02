@@ -47,10 +47,19 @@ class InputOp(Op):
 
 @dataclass
 class ConstantOp(Op):
-    """Fixed tensor: weights, RoPE tables, scalars. Not an activation."""
+    """Fixed tensor: weights, RoPE tables, scalars. Not an activation.
+
+    ``transpose`` (when non-None) is a permutation applied to the
+    parameter / buffer at bind time. Lets a const-folded
+    ``TransposeOp(ConstantOp)`` live as a single ConstantOp with a
+    runtime transpose marker — the bind path applies the permutation
+    once before flattening, and downstream Loads see the post-transpose
+    layout. ``output.shape`` already reflects the post-transpose shape.
+    """
 
     name: str
     value: float | None = None  # scalar value captured at trace time
+    transpose: tuple[int, ...] | None = None
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         raise NotImplementedError("ConstantOp has no inputs; use node.output.shape directly")
