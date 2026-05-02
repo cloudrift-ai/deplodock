@@ -16,11 +16,8 @@ Env vars:
 - ``DEPLODOCK_TB`` — total thread budget per CTA for non-matmul kernels.
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
-  weight transpose (``004a_fold_constant_transpose``). Off by default —
-  small matmuls hit TMA's 16 B alignment requirement; SDPA / RoPE
-  interact with the weight pre-transpose in ways the current passes
-  don't fully handle. Set ``DEPLODOCK_TMA=1`` for ``nn.Linear``-only
-  models with ``≥1024`` per-dim shapes.
+  weight transpose (``004a_fold_constant_transpose``). On by default
+  (sm_90+); set ``DEPLODOCK_TMA=0`` to force the cp.async fallback.
 """
 
 from __future__ import annotations
@@ -105,7 +102,7 @@ def _matmul_M(tile: Tile) -> int:
 
 
 def _tma_enabled() -> bool:
-    return os.environ.get("DEPLODOCK_TMA") == "1"
+    return os.environ.get("DEPLODOCK_TMA", "1") != "0"
 
 
 def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
