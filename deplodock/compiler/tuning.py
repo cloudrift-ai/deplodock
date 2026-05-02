@@ -292,50 +292,70 @@ def _tma_cublas_layout() -> bool:
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
     """Per-thread output tile as ``(F_M, F_N)``. Asymmetric in the
-    cuBLAS-style mode; symmetric ``(F, F)`` otherwise."""
+    cuBLAS-style TMA mode (``(8, 4)`` per-thread M×N), symmetric
+    ``(F, F)`` otherwise where F is paired with the PAT that
+    ``005_blockify_launch`` will emit (or did emit, post-blockify).
+
+    Returns ``(1, 1)`` (= "skip register tiling") for post-blockify
+    tiles whose THREAD-axis extents don't match a known PAT candidate
+    — typically small matmuls where 005 left axes at their pristine
+    output extent (e.g. ``(8, 8)``) without splitting. Without this
+    sentinel, ``008_register_tile`` would happily fire with the
+    fallback ``F=2`` and produce a sub-optimal 2×2 cell layout for a
+    matmul too small to benefit.
+
+    Env override ``DEPLODOCK_F`` sets a symmetric scalar factor.
+    Asymmetric overrides not exposed yet — set both via ``DEPLODOCK_F``
+    for now.
+    """
     if _tma_cublas_layout() and tile is not None and _has_matmul_reduce(tile.body):
         return _CUBLAS_F_PER_AXIS
-    f = register_tile_factor(tile)
-    return (f, f)
-
-
-def detect_pat(tile: Tile) -> int | None:
-    """Return the per-axis thread tile width ``005_blockify_launch``
-    chose for this tile, by counting THREAD axes whose extent matches a
-    known PAT candidate. Returns ``None`` pre-blockify (axes are still
-    pristine output dims) or when no candidate matches."""
-    from deplodock.compiler.ir.axis import BIND_THREAD
-
-    for cand in sorted(_PAT_TO_FACTOR, reverse=True):
-        if sum(1 for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == cand) >= 2:
-            return cand
-    return None
-
-
-def register_tile_factor(tile: Tile | None = None) -> int:
-    """Per-thread output-cell factor (per-thread tile = F × F).
-
-    Env override (``DEPLODOCK_F``) wins. Otherwise the factor is paired
-    with the PAT that ``005_blockify_launch`` produced — detected from
-    the tile's THREAD axes via ``_PAT_TO_FACTOR``. Pre-blockify (no
-    matching axis), the factor falls back to the big-matmul vs default
-    pairing for whatever PAT ``per_axis_threads`` would pick.
-    """
     raw = os.environ.get("DEPLODOCK_F")
     if raw:
-        return _int_env("DEPLODOCK_F", _PAT_TO_FACTOR[_PAT_DEFAULT])
+        f = _int_env("DEPLODOCK_F", _PAT_TO_FACTOR[_PAT_DEFAULT])
+        return (f, f)
     if tile is None:
-        return _PAT_TO_FACTOR[_PAT_DEFAULT]
-    pat = detect_pat(tile)
+        f = _PAT_TO_FACTOR[_PAT_DEFAULT]
+        return (f, f)
+    pat = _detect_pat_in_tile(tile)
     if pat is None:
-        # Pre-blockify path: pair F with the PAT we'll choose at 005.
+        if _has_blockified_thread_axes(tile):
+            # Post-blockify tile but no PAT match → THREAD extents are
+            # too small (or otherwise mismatched) — skip register tiling.
+            return (1, 1)
+        # Pre-blockify path: predict the PAT 005 will pick.
         if _is_huge_matmul(tile):
             pat = _PAT_HUGE
         elif _is_big_matmul(tile):
             pat = _PAT_BIG
         else:
             pat = _PAT_DEFAULT
-    return _PAT_TO_FACTOR.get(pat, _PAT_TO_FACTOR[_PAT_DEFAULT])
+    f = _PAT_TO_FACTOR.get(pat, _PAT_TO_FACTOR[_PAT_DEFAULT])
+    return (f, f)
+
+
+def _has_blockified_thread_axes(tile: Tile) -> bool:
+    """True iff ``005_blockify_launch`` has run and assigned BIND_THREAD
+    to inner axes. Used to distinguish pre-blockify tiles (no decisions
+    yet) from post-blockify tiles where the lack of a PAT match means
+    the matmul is too small for register tiling."""
+    from deplodock.compiler.ir.axis import BIND_THREAD
+
+    return any(ba.bind == BIND_THREAD for ba in tile.axes)
+
+
+def _detect_pat_in_tile(tile: Tile) -> int | None:
+    """Return PAT if ≥2 THREAD axes share a known PAT candidate's
+    extent; ``None`` pre-blockify (axes are still pristine output dims).
+    Internal helper for ``register_tile_shape``'s symmetric-mode F
+    pairing — no external callers since the asymmetric path identifies
+    M / N by sorting THREAD axes by extent instead."""
+    from deplodock.compiler.ir.axis import BIND_THREAD
+
+    for cand in sorted(_PAT_TO_FACTOR, reverse=True):
+        if sum(1 for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == cand) >= 2:
+            return cand
+    return None
 
 
 def thread_budget() -> int:

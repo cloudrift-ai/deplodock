@@ -2,61 +2,56 @@
 
 Each thread in the post-blockify state owns one output element of the
 CTA's M×N tile (PAT × PAT threads — default ``PAT=16`` so 256 threads,
-1 output / thread). ``PAT`` (per-axis thread tile width) and ``F``
-(per-thread output factor) are both supplied by ``tuning`` via
-``detect_pat`` / ``register_tile_factor`` and are paired through the
-``_PAT_TO_FACTOR`` table.
+1 output / thread). The per-thread tile shape ``(F_M, F_N)`` is
+supplied by ``tuning.register_tile_shape``: symmetric ``(F, F)`` for
+the cp.async path (paired with PAT via ``_PAT_TO_FACTOR``), asymmetric
+``(8, 4)`` for the cuBLAS-style TMA path.
 
-This pass splits each of the two ``BIND_THREAD`` axes ``a:PAT`` into
-outer ``a_o:PAT/F`` (still ``BIND_THREAD``) plus a serial ``a_i:F``
-dimension, and replicates the matmul reduce body + epilogue per
-``(a_i, a_j)`` cell. Each replicated cell carries its own SSA
-accumulator (``acc0_<i>_<j>``), giving F² independent partial sums per
-thread that nvcc can schedule in parallel registers. With ``PAT=16``
-and ``F=2`` this is per-thread output 4 (4× more FMAs per smem-load
-round-trip) at 64 threads per CTA.
+This pass splits each ``BIND_THREAD`` axis by its factor and
+replicates the matmul reduce body + epilogue per ``(a_i, a_j)`` cell.
+Each replicated cell carries its own SSA accumulator
+(``acc0_<i>_<j>``), giving ``F_M × F_N`` independent partial sums per
+thread that nvcc can schedule in parallel registers.
 
 **Axis-aware replication.** Each stmt's value transitively depends on
-some subset of {m_axis, n_axis}; the stmt is replicated F^|subset|
-times with σ-substituted indices and SSA names suffixed by the cell
-coordinate(s):
+some subset of {m_axis, n_axis}; the stmt is replicated
+``F_M^|{m_axis}∩deps| × F_N^|{n_axis}∩deps|`` times with σ-substituted
+indices and SSA names suffixed by the cell coordinate(s):
 
-==============================  ============  =============================
-Stmt's thread-axis dependence   Replicas      Per-cell name suffix
-==============================  ============  =============================
-``∅`` (constant / batch only)   1             ``""``  (shared across cells)
-``{m_axis}`` (per-row)          F             ``"_<i>"``
-``{n_axis}`` (per-col)          F             ``"_<j>"``
-``{m_axis, n_axis}``            F²            ``"_<i>_<j>"``
-==============================  ============  =============================
+==============================  =====================  =============================
+Stmt's thread-axis dependence   Replicas               Per-cell name suffix
+==============================  =====================  =============================
+``∅`` (constant / batch only)   1                      ``""``  (shared across cells)
+``{m_axis}`` (per-row)          ``F_M``                ``"_<i>"``
+``{n_axis}`` (per-col)          ``F_N``                ``"_<j>"``
+``{m_axis, n_axis}``            ``F_M × F_N``          ``"_<i>_<j>"``
+==============================  =====================  =============================
 
-This is computed via :meth:`Body.fold` over the def-use DAG with a
-bound-axis filter — see :func:`replicate_along_axis`.
+Computed via :meth:`Body.fold` over the def-use DAG with a bound-axis
+filter — see :func:`replicate_along_axis`.
 
 **Stages stay singleton across F.** Because ``stage_inputs`` runs
 *before* this pass, the body already references staged smem via
 cache-local Loads. F-replication σ-substitutes the cache-axis Vars
-inside those Loads (e.g. ``Var(n_axis) → Var(n_o)*F + i``) so the F²
-output cells decode different cache-local offsets into the *same*
-slab. The Stage stmt itself is held singleton: its cache-axis names
-are excluded from its dependency contribution so the fold doesn't mark
-it for replication. Only the consumer Loads multiply.
+inside those Loads so the per-thread cells decode different
+cache-local offsets into the *same* slab. The Stage stmt itself is
+held singleton: cache-axis names are excluded from its dependency
+contribution so the fold doesn't mark it for replication.
 
-Idempotence: triggers only when exactly two ``BIND_THREAD`` axes have
-an extent that's a key in ``_PAT_TO_FACTOR`` (currently
-``{16: 2, 32: 4, 64: 8}``). After firing, the split THREAD axis has
-extent ``pat/F`` — for every entry in the table that's exactly ``8``,
-which is deliberately *not* a candidate. So ``detect_pat`` returns
-``None`` on a second pass and the rule skips at its first gate.
+The two THREAD axes are identified by sorting all ``BIND_THREAD`` axes
+by extent — smaller is M, larger is N. Symmetric-mode tiles where both
+extents match make this ordering arbitrary, but ``_register_tile`` is
+symmetric in axis names when factors are equal, so it doesn't matter.
 
-Trigger conditions:
-
-- ``TileOp.body`` contains exactly one ``Tile`` whose ``block_axes`` is empty.
-- ``detect_pat`` matches a PAT, and ``register_tile_factor`` is
-  ``F > 1`` with ``pat % F == 0``.
-- The Tile has exactly two ``BIND_THREAD`` axes with extent equal to PAT.
-- The Tile body contains a matmul-shape reduce Loop (profitability gate —
-  without it F²-replicating gives no reuse benefit).
+Idempotence: after firing, the split THREAD axis has extent
+``post_split = orig_extent / F``. The default symmetric flow's PAT
+table picks F such that ``post_split=8`` (not a known PAT), so a
+second-pass ``register_tile_shape`` query produces ``F=2`` paired with
+PAT=16, but the THREAD axes have extent 8 — divisibility check fails
+and the pass skips. The asymmetric TMA flow leaves THREAD axes at
+``(8, 32)`` after split — neither matches ``BM=64`` or ``BN=128``, so
+``register_tile_shape``'s post-blockify PAT detection misses and falls
+through to ``(F=2, F=2)`` which fails the same divisibility check.
 """
 
 from __future__ import annotations
@@ -69,7 +64,7 @@ from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
-from deplodock.compiler.tuning import detect_pat, register_tile_factor, register_tile_shape
+from deplodock.compiler.tuning import register_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -91,34 +86,24 @@ def _maybe_rewrite(body: Body) -> Body | None:
         raise RuleSkipped("no matmul-shaped reduce in the Tile body — register tiling unprofitable")
 
     f_m, f_n = register_tile_shape(tile)
-    if f_m == f_n:
-        # Symmetric path: pair F with the PAT 005 emitted via the legacy
-        # detect_pat / register_tile_factor flow. Two THREAD axes both
-        # extent=PAT must exist; F must divide PAT.
-        pat = detect_pat(tile)
-        if pat is None:
-            raise RuleSkipped("detect_pat returned None — Tile axes don't match a known PAT")
-        factor = register_tile_factor(tile)
-        if factor <= 1 or pat % factor != 0:
-            raise RuleSkipped(f"register-tile factor F={factor} disabled or doesn't divide PAT={pat}")
-        target_axes = [ba.axis.name for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == pat]
-        if len(target_axes) != 2:
-            raise RuleSkipped(f"need exactly 2 THREAD axes with extent {pat}, found {len(target_axes)}")
-        rewritten = _register_tile(tile, target_axes[0], target_axes[1], factor, factor)
-    else:
-        # Asymmetric (cuBLAS-style) path: 005 emitted ``(BN, BM)`` thread
-        # axes innermost-first. Identify M (the smaller-extent THREAD
-        # axis) vs N (larger-extent), split each by its own factor.
-        thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
-        if len(thread_axes) != 2:
-            raise RuleSkipped(f"asymmetric register-tile needs exactly 2 THREAD axes, found {len(thread_axes)}")
-        # Sort by extent: smaller is M, larger is N (cuBLAS convention BM=64 < BN=128).
-        sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
-        m_axis_name, n_axis_name = sorted_ba[0].axis.name, sorted_ba[1].axis.name
-        m_ext, n_ext = int(sorted_ba[0].axis.extent), int(sorted_ba[1].axis.extent)
-        if m_ext % f_m != 0 or n_ext % f_n != 0:
-            raise RuleSkipped(f"asymmetric F=({f_m},{f_n}) must divide ({m_ext},{n_ext})")
-        rewritten = _register_tile(tile, m_axis_name, n_axis_name, f_m, f_n)
+    if f_m <= 1 and f_n <= 1:
+        raise RuleSkipped(f"register-tile factor ({f_m}, {f_n}) disabled (both <= 1)")
+
+    # Identify the M and N THREAD axes by sorting by extent: smaller is
+    # M, larger is N. For the symmetric default ``(BN=BM=PAT)`` either
+    # ordering works (``_register_tile`` is symmetric in axis names
+    # when factors are equal); for the asymmetric cuBLAS layout
+    # ``(BN=128, BM=64)`` the sort picks M=64 thread axis to pair with
+    # ``F_M`` and N=128 thread axis to pair with ``F_N``.
+    thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
+    if len(thread_axes) != 2:
+        raise RuleSkipped(f"register-tile needs exactly 2 THREAD axes, found {len(thread_axes)}")
+    sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
+    m_axis_name, n_axis_name = sorted_ba[0].axis.name, sorted_ba[1].axis.name
+    m_ext, n_ext = int(sorted_ba[0].axis.extent), int(sorted_ba[1].axis.extent)
+    if m_ext % f_m != 0 or n_ext % f_n != 0:
+        raise RuleSkipped(f"register-tile F=({f_m},{f_n}) must divide THREAD extents ({m_ext},{n_ext})")
+    rewritten = _register_tile(tile, m_axis_name, n_axis_name, f_m, f_n)
     if rewritten is None:
         raise RuleSkipped("_register_tile bailed (unsupported shape)")
     return body[:idx] + (rewritten,) + body[idx + 1 :]
