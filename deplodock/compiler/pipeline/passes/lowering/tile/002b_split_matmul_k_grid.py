@@ -128,46 +128,17 @@ def _split_tile(tile: Tile, splitk: int) -> Tile | None:
     write = stmts[write_idx]
     epilogue_stmts = stmts[k_idx + 1 : write_idx]  # may be empty
 
-    if not epilogue_stmts:
+    if not epilogue_stmts and write.value == _find_accum_name(new_k_loop):
         # Plain matmul — every CTA atomic-adds its acc partial.
         new_write = replace(write, reduce_op=ElementwiseImpl("add"))
         head_stmts = stmts[:k_idx] + [new_k_loop, new_write]
     else:
-        # Epilogue case — the matmul's accumulator name is the Accum's
-        # SSA target inside the K_i reduce body. We need it to emit the
-        # always-on atomic-add of the partial sum.
         acc_name = _find_accum_name(new_k_loop)
         if acc_name is None:
             raise RuleSkipped("could not locate the Accum SSA name inside K_o body")
-        # Refuse if the trailing Write doesn't reference a value derived
-        # from the Accum — without that linkage the epilogue isn't a
-        # simple additive fold-in and our Cond rewrite would change
-        # semantics.
-        # Always-on partial-sum write: atomic_add(out, acc).
-        always_write = Write(output=write.output, index=write.index, value=acc_name, reduce_op=ElementwiseImpl("add"))
-        # Predicated epilogue: only K_split == 0 contributes the
-        # epilogue value. The original epilogue already includes the
-        # acc in its computation (e.g. v = residual + acc); to avoid
-        # double-counting we'd need to subtract acc from v at predicate
-        # time, which the IR doesn't directly express. Instead emit
-        # the epilogue as-written but make it a STORE (no reduce_op)
-        # of just the residual contribution. That requires rebuilding
-        # the epilogue to drop the acc-dependent term — not feasible
-        # generically. So restrict PR 3 to a stricter shape: epilogue
-        # is exactly Load(...) + Assign(v, add, ld, acc) + Write(v).
-        # In that case CTA 0 atomic-adds the residual ONCE; the
-        # always-on path covers the acc.
-        residual_name = _extract_simple_residual(epilogue_stmts, acc_name, write.value)
-        if residual_name is None:
-            raise RuleSkipped("epilogue isn't the simple Load+Assign(add)+Write residual pattern")
-        residual_load = next(s for s in epilogue_stmts if hasattr(s, "name") and s.name == residual_name)
-        cond_write = Write(output=write.output, index=write.index, value=residual_name, reduce_op=ElementwiseImpl("add"))
-        cond = Cond(
-            cond=BinaryExpr("==", Var(K_split.name), Literal(0, "int")),
-            body=Body((residual_load, cond_write)),
-            else_body=Body(()),
-        )
-        head_stmts = stmts[:k_idx] + [new_k_loop, always_write, cond]
+        head_stmts = _rewrite_epilogue(stmts, k_idx, write_idx, write, epilogue_stmts, new_k_loop, acc_name, K_split)
+        if head_stmts is None:
+            raise RuleSkipped("epilogue isn't a split-K-safe shape (linear-multiplicative or acc + independent-load)")
 
     new_stmts = head_stmts + stmts[write_idx + 1 :]
     # Lift K_split as outermost axis with the same bind as its siblings
@@ -186,6 +157,77 @@ def _find_accum_name(k_o_loop: Loop) -> str | None:
         if isinstance(s, Accum):
             return s.name
     return None
+
+
+def _rewrite_epilogue(stmts, k_idx, write_idx, write, epilogue_stmts, new_k_loop, acc_name, K_split):
+    """Two split-K-safe epilogue shapes are recognized:
+
+    1. **Linear-multiplicative**: ``Write.value`` is reachable from
+       ``acc`` only through ``multiply`` ops whose other operand is
+       acc-independent (e.g. ``acc * silu(gate)``). Then
+       ``sum_i (c * a_i) = c * sum_i a_i`` distributes — every CTA
+       computes its own ``v = c * partial_acc`` and ``atomic_add``s.
+       Emit: keep epilogue as-is, mark Write as ``reduce_op=add``.
+
+    2. **Linear-additive (residual)**: epilogue is exactly
+       ``Load(r); Assign(v, add, r, acc); Write(v)``. Then
+       ``sum_i a_i + r`` doesn't distribute — only one CTA contributes
+       ``r``. Emit: always-on ``atomic_add(out, acc)`` plus
+       ``Cond(K_split == 0, atomic_add(out, r))``.
+
+    Returns the list of head stmts (everything up to and including the
+    rewritten Write/Cond), or ``None`` if neither pattern matches."""
+    # Try multiplicative-only chain first (cheap, common — k_mul_8_reduce).
+    if _is_linear_multiplicative_chain(epilogue_stmts, acc_name, write.value):
+        new_write = replace(write, reduce_op=ElementwiseImpl("add"))
+        return stmts[:k_idx] + [new_k_loop] + list(epilogue_stmts) + [new_write]
+
+    # Fall back to the additive-residual pattern (k_add_5_reduce).
+    residual_name = _extract_simple_residual(epilogue_stmts, acc_name, write.value)
+    if residual_name is None:
+        return None
+    residual_load = next(s for s in epilogue_stmts if hasattr(s, "name") and s.name == residual_name)
+    always_write = Write(output=write.output, index=write.index, value=acc_name, reduce_op=ElementwiseImpl("add"))
+    cond_write = Write(output=write.output, index=write.index, value=residual_name, reduce_op=ElementwiseImpl("add"))
+    cond = Cond(
+        cond=BinaryExpr("==", Var(K_split.name), Literal(0, "int")),
+        body=Body((residual_load, cond_write)),
+        else_body=Body(()),
+    )
+    return stmts[:k_idx] + [new_k_loop, always_write, cond]
+
+
+def _is_linear_multiplicative_chain(epilogue_stmts: list, acc_name: str, write_value: str) -> bool:
+    """Walk the epilogue forward, propagating an ``acc_dep`` SSA-name
+    set. A stmt is split-K-safe iff it's:
+
+    - acc-independent (no deps in ``acc_dep``), OR
+    - an ``Assign(v, multiply, a, b)`` where exactly one of ``a, b``
+      is in ``acc_dep`` (the other is acc-independent).
+
+    Returns True iff every epilogue stmt is safe and ``write_value`` ∈
+    ``acc_dep`` (i.e. the Write's value chain back to ``acc``)."""
+    from deplodock.compiler.ir.stmt import Assign  # noqa: PLC0415
+
+    acc_dep = {acc_name}
+    for s in epilogue_stmts:
+        deps = set(s.deps())
+        touches_acc = bool(deps & acc_dep)
+        if not touches_acc:
+            continue
+        if not isinstance(s, Assign):
+            return False
+        if s.op.name != "multiply":
+            return False
+        if len(s.args) != 2:
+            return False
+        a, b = s.args
+        a_dep = a in acc_dep
+        b_dep = b in acc_dep
+        if a_dep == b_dep:  # both deps or both indep — both indep can't happen since touches_acc
+            return False
+        acc_dep.add(s.name)
+    return write_value in acc_dep
 
 
 def _extract_simple_residual(epilogue_stmts: list, acc_name: str, write_value: str) -> str | None:
