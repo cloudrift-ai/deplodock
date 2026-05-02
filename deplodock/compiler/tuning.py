@@ -33,10 +33,6 @@ Env vars override the heuristic for sweeps:
   ``(BN=128, BM=64)`` + per-thread ``(F_M=8, F_N=4)`` and runtime
   weight transpose (via ``004a_fold_constant_transpose``). Beats cp.async
   baseline on sm_120 fp32 SIMT matmul (105% of cuBLAS at 4096²).
-- ``DEPLODOCK_TMA_SWIZZLE``, ``DEPLODOCK_BK_SPLIT`` — experimental,
-  off by default. Both proven not to help SIMT fp32 (B128 swizzle has
-  a fundamental 4-way bank-conflict floor; BK_SPLIT was a workaround
-  the cuBLAS layout sidesteps). Kept for sweeps on other dtypes / GPUs.
 """
 
 from __future__ import annotations

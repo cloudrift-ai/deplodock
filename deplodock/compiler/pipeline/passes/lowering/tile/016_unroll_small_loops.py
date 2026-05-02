@@ -77,10 +77,7 @@ def _nest_trips(loop: Loop | StridedLoop) -> int:
     """Trip count when ``loop`` is unrolled: ``axis.extent`` × the sum
     of inner loop trip counts. Siblings sum (each runs once per outer
     iteration) and a single child reduces to plain product. Used to
-    estimate the unrolled body size — sibling loops in the same outer
-    body (e.g. ``009_bk_split``'s two halves of a K_inner reduce)
-    multiply the inlined cost like a chain does, so they should
-    contribute too."""
+    estimate the unrolled body size."""
     total = int(loop.axis.extent)
     inner_trips = sum(_nest_trips(s) for s in loop.body if isinstance(s, (Loop, StridedLoop)))
     if inner_trips:

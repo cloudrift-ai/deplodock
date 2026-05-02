@@ -60,7 +60,6 @@ from deplodock.compiler.ir.tile.ir import (
     BufferedStage,
     Combine,
     Stage,
-    SwizzleMode,
     TemplateAddressing,
     TileOp,
     TmaBufferedStage,
@@ -70,22 +69,10 @@ from deplodock.compiler.pipeline.engine import Pattern
 PATTERN = [Pattern("root", TileOp)]
 
 
-# TMA swizzle pattern period in bytes (fp32). The swizzle XOR is keyed on
-# bits [9:7] (B128) / [8:7] (B64) / [7] (B32) of the absolute smem byte
-# offset, so the buffer base must align to the full period for the
-# consumer's XOR formula to land on the same physical slot the hardware
-# wrote to. NONE has no swizzle so the standard 128 B TMA alignment is
-# enough.
-_SWIZZLE_ALIGN: dict[SwizzleMode, int] = {
-    SwizzleMode.NONE: 128,
-    SwizzleMode.B32: 256,
-    SwizzleMode.B64: 512,
-    SwizzleMode.B128: 1024,
-}
-
-
-def _swizzle_align_bytes(swizzle: SwizzleMode) -> int:
-    return _SWIZZLE_ALIGN[swizzle]
+# Standard TMA destination alignment. 16 B is the hardware minimum;
+# 128 B is what NVIDIA's TMA programming guide recommends for max
+# throughput on box copies.
+_TMA_ALIGN_BYTES = 128
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
@@ -255,18 +242,7 @@ def _materialize(blk: Tile) -> Stmt:
                 ),
             ),
         )
-        # TMA destinations want 128-byte aligned smem for max-throughput
-        # box copies (16 B is the hardware minimum). For swizzled stages
-        # the alignment must match the swizzle *pattern period* — TMA's
-        # swizzle XOR is keyed on the absolute smem byte address, so a
-        # buffer that starts mid-pattern (e.g. at offset 128 because an
-        # mbar declared earlier reserved the first 128 B) shifts every
-        # row's XOR. B128 fp32 repeats every 8 rows × 128 B = 1024 B;
-        # B64 every 512 B; B32 every 256 B. Align to that period so the
-        # consumer's XOR formula (which assumes base offset 0 in the
-        # pattern) matches the hardware layout.
-        align = _swizzle_align_bytes(stage.swizzle)
-        return [Smem(name=stage.name, extents=full_extents, align=align), cond]
+        return [Smem(name=stage.name, extents=full_extents, align=_TMA_ALIGN_BYTES), cond]
 
     for stmt in body:
         if isinstance(stmt, TmaBufferedStage):

@@ -17,9 +17,8 @@
   compute capability. Shared by passes that gate on hardware features
   (``014_async_copy`` for cp.async, ``014a_tma_copy`` for TMA).
 - :func:`load_thread_axis_coeffs` / :func:`max_bank_conflict` —
-  bank-conflict analysis for body Loads of a staged buffer. Shared
-  by ``014c_pad_smem_banks`` (cp.async / sync stages, +1 padding)
-  and ``014d_tma_swizzle`` (TMA stages, descriptor swizzle mode).
+  bank-conflict analysis for body Loads of a staged buffer. Used by
+  ``014c_pad_smem_banks`` (cp.async / sync stages, +1 padding).
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
@@ -128,7 +127,7 @@ def is_matmul_k_outer(
 
 
 # ---------------------------------------------------------------------------
-# Bank-conflict analysis (shared by 014c pad pass and 014d swizzle pass)
+# Bank-conflict analysis (used by 014c pad pass)
 # ---------------------------------------------------------------------------
 
 
