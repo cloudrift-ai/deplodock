@@ -70,11 +70,11 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
     src_ranks = {nid: len(node.output.shape) for nid, node in graph.nodes.items()}
     # TMA only fires on stages reading from a transposed weight constant
-    # (``004a_fold_constant_transpose`` stored a ``transpose`` perm on
-    # the ``ConstantOp``). Activation stages haven't been transposed and
-    # don't match the asymmetric (BN, BM) tile's KN expectation — letting
-    # TMA load them produces silently wrong outputs (e.g. SDPA Q/K/V).
-    tma_buf_ok = {nid for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and node.op.transpose is not None}
+    # (``004a_fold_into_constant`` recorded a ``TransposeOp`` in the
+    # ``ConstantOp.load_ops`` chain). Activation stages have empty chains
+    # and don't match the asymmetric (BN, BM) tile's KN expectation —
+    # letting TMA load them produces silently wrong outputs (e.g. SDPA Q/K/V).
+    tma_buf_ok = {nid for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and bool(node.op.load_ops)}
     new_body = _maybe_rewrite(root.op.body, src_ranks, tma_buf_ok)
     if new_body is None:
         return None

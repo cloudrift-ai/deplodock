@@ -102,7 +102,6 @@ def handle_run(args):
     module = info["module"]
     example_args = info["args"]
     example_kwargs = info["kwargs"]
-    const_targets = info["const_targets"]
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
@@ -111,7 +110,7 @@ def handle_run(args):
     backend = CudaBackend(debug=args.debug or None, dump=dump)
     compiled = backend.compile(graph)
 
-    input_data = _bind_inputs(compiled, module, example_args, example_kwargs, const_targets)
+    input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
 
     run_result = backend.run(compiled, input_data=input_data)
     if dump and backend.last_debug_result is not None:
@@ -435,14 +434,21 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         _run_ncu_profile(args)
 
 
-def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):
-    """Match graph inputs and constants to tensors from ``module`` / call args."""
+def _bind_inputs(compiled, module, example_args, example_kwargs):
+    """Match graph inputs and constants to tensors from ``module`` / call args.
+
+    Activations come from the call's positional/keyword tensors. Constants
+    come from ``module.named_parameters()`` / ``named_buffers()`` keyed
+    by each ``ConstantOp.source_path`` recorded at trace time. Each
+    constant's ``load_ops`` chain is replayed via the NumPy backend
+    (see ``compiler.loader.binder``), so any compile-time-folded
+    transpose / reshape is honored uniformly.
+    """
+    import numpy as np
     import torch
 
     from deplodock.compiler.ir.base import ConstantOp
-
-    params = dict(module.named_parameters())
-    buffers = dict(module.named_buffers())
+    from deplodock.compiler.loader.binder import bind_constants
 
     flat_inputs: list[torch.Tensor] = []
     for v in example_args:
@@ -455,32 +461,25 @@ def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):
         logger.error("Input arity mismatch: graph has %d inputs, code provided %d", len(input_ids), len(flat_inputs))
         sys.exit(1)
 
-    input_data: dict[str, list[float]] = {}
+    input_data: dict[str, np.ndarray] = {}
     for nid, tensor in zip(input_ids, flat_inputs, strict=True):
-        input_data[nid] = tensor.detach().cpu().flatten().tolist()
+        input_data[nid] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    sources: dict[str, np.ndarray] = {}
+    for path, tensor in module.named_parameters():
+        sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+    for path, tensor in module.named_buffers():
+        sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    input_data.update(bind_constants(compiled, sources))
 
     for nid, node in compiled.nodes.items():
-        if not isinstance(node.op, ConstantOp):
+        if not isinstance(node.op, ConstantOp) or nid in input_data:
             continue
-        target = const_targets.get(node.op.name)
-        tensor = None
-        if target is not None:
-            tensor = params.get(target)
-            if tensor is None:
-                tensor = buffers.get(target)
-        if tensor is None and node.op.value is not None:
-            input_data[nid] = [float(node.op.value)]
-            continue
-        if tensor is None:
-            logger.error("Could not bind constant %s (target=%r)", nid, target)
-            sys.exit(1)
-        # Apply any compile-time-folded transpose recorded by
-        # ``004a_fold_constant_transpose``. The graph's downstream Loads
-        # see the post-transpose layout; physically transposing here
-        # makes the runtime tensor match.
-        if node.op.transpose is not None:
-            tensor = tensor.detach().permute(*node.op.transpose).contiguous()
-        input_data[nid] = tensor.detach().cpu().flatten().tolist()
+        if node.op.value is not None:
+            continue  # backend materializes scalars from node.op.value
+        logger.error("Could not bind constant %s (source_path=%r)", nid, node.op.source_path)
+        sys.exit(1)
     return input_data
 
 

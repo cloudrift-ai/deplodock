@@ -99,15 +99,10 @@ def _inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.
             continue
         src = input_data.get(node.op.name)
         if src is not None:
+            from deplodock.compiler.loader.binder import apply_load_ops
+
             arr = np.asarray(src, dtype=np.float32)
-            if node.op.transpose is not None:
-                # Reshape to source rank first — input_data may already
-                # be flat — using the post-transpose ``output.shape``
-                # inverse-permuted to recover the source shape.
-                inv = [0] * len(node.op.transpose)
-                for i, p in enumerate(node.op.transpose):
-                    inv[p] = i
-                src_shape = tuple(int(node.output.shape[i]) for i in inv)
-                arr = arr.reshape(src_shape).transpose(*node.op.transpose)
-            input_data[nid] = arr
+            if node.op.load_ops and node.op.source_shape is not None:
+                arr = arr.reshape(node.op.source_shape)
+            input_data[nid] = apply_load_ops(arr, node.op.load_ops)
     return input_data
