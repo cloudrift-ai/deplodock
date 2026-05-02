@@ -1,97 +1,102 @@
-"""Tests for the compile-and-run pipeline."""
+"""End-to-end pipeline tests: Graph → run_pipeline → CudaBackend → GPU."""
 
-import json
-from pathlib import Path
+from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.cuda.runner import has_cuda_gpu, has_nvcc
-from deplodock.compiler.ir import Graph, Tensor
-from deplodock.compiler.ops import ElementwiseOp, InputOp, ReduceOp
-from deplodock.compiler.pipeline import compile_and_run
-from deplodock.compiler.rewriter import Pass, Rewriter, Rule
+from deplodock.compiler.backend.cuda.backend import CudaBackend
+from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.cuda import CudaOp
+from deplodock.compiler.ir.loop import Accum, LoopOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from deplodock.compiler.pipeline import LOOP_PASSES, run_pipeline
 
-# ---- helpers ----
+from .conftest import requires_cuda
 
 
-def _make_matmul_graph(m, k, n):
+def _compile(graph: Graph) -> Graph:
+    return run_pipeline(graph, LOOP_PASSES)
+
+
+def _pointwise_chain_graph() -> Graph:
     g = Graph()
-    a = g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (m, k)), node_id="A")
-    b = g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (k, n)), node_id="B")
-    g.inputs = [a, b]
-    ew = g.add_node(op=ElementwiseOp(fn="mul"), inputs=[a, b], output=Tensor("AB", (m, k, n)), node_id="ew")
-    red = g.add_node(op=ReduceOp(fn="sum", axis=1), inputs=[ew], output=Tensor("C", (m, n)), node_id="red")
-    g.outputs = [red]
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (8,)), node_id="x")
+    g.add_node(op=ElementwiseOp("negative"), inputs=["x"], output=Tensor("n", (8,)), node_id="n")
+    g.add_node(op=ElementwiseOp("exp"), inputs=["n"], output=Tensor("y", (8,)), node_id="y")
+    g.inputs = ["x"]
+    g.outputs = ["y"]
     return g
 
 
-def _python_matmul(a, b, m, k, n):
-    c = [0.0] * (m * n)
-    for i in range(m):
-        for j in range(n):
-            s = 0.0
-            for kk in range(k):
-                s += a[i * k + kk] * b[kk * n + j]
-            c[i * n + j] = s
-    return c
+def _matmul_graph(m: int, k: int, n: int) -> Graph:
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k)), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (k, n)), node_id="b")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("c", (m, n)), node_id="c")
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+    return g
 
 
-def _load_rewriter():
-    rule_path = Path(__file__).parent.parent.parent / "deplodock" / "compiler" / "rules" / "fusion" / "001_fuse_reduce_elementwise.py"
-    rule = Rule.from_file(rule_path)
-    return Rewriter(passes=[Pass(name="fusion", rules=[rule])])
+def _loop_nodes(graph: Graph) -> list:
+    return [n for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
 
 
-# ---- tests ----
+def test_compile_fuses_matmul():
+    fused = _compile(_matmul_graph(4, 3, 2))
+    matmul_loops = [n for n in _loop_nodes(fused) if any(isinstance(s, Accum) for s in n.op)]
+    assert len(matmul_loops) == 1
 
-requires_cuda = pytest.mark.skipif(
-    not has_nvcc() or not has_cuda_gpu(),
-    reason="CUDA not available (need nvcc + GPU)",
-)
+
+def test_compile_fuses_chain():
+    """neg → exp fuses into one kernel (fan-out 1 chain)."""
+    fused = _compile(_pointwise_chain_graph())
+    assert len(_loop_nodes(fused)) == 1
+
+
+def test_pipeline_to_program():
+    compiled = CudaBackend().compile(_matmul_graph(4, 3, 2))
+    cuda_nodes = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp)]
+    assert len(cuda_nodes) >= 1
+    assert "a" in compiled.inputs
+    assert "b" in compiled.inputs
+
+
+def test_compile_result_metadata():
+    """_compile returns a fused Graph with the original inputs/outputs."""
+    g = _pointwise_chain_graph()
+    fused = _compile(g)
+    assert isinstance(fused, Graph)
+    assert fused.inputs == ["x"]
+    assert len(fused.outputs) == 1
+    assert len(_loop_nodes(fused)) == 1
 
 
 @requires_cuda
-def test_pipeline_end_to_end():
-    """Full pipeline produces a valid trace with execution results."""
-    M, K, N = 4, 3, 2
-    g = _make_matmul_graph(M, K, N)
-    rewriter = _load_rewriter()
+def test_pointwise_chain_gpu():
+    import math
 
-    a_data = [float(i + 1) for i in range(M * K)]
-    b_data = [float(i + 1) for i in range(K * N)]
-    expected = _python_matmul(a_data, b_data, M, K, N)
+    compiled = CudaBackend().compile(_pointwise_chain_graph())
+    x_data = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0]
+    expected = [math.exp(-xi) for xi in x_data]
+    result = CudaBackend().run(compiled, input_data={"x": x_data})
+    assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-5)
 
-    trace = compile_and_run(
-        graph=g,
-        rewriter=rewriter,
-        inputs={"A": a_data, "B": b_data},
-        output_name="C",
-        output_size=M * N,
-        dim_args={"M": M, "N": N, "K": K},
-        expected=expected,
-    )
 
-    # Trace should have no error.
-    assert trace.error is None
+@requires_cuda
+def test_matmul_gpu():
+    import random
 
-    # Check the trace structure.
-    assert trace.input_graph is not None
-    assert len(trace.passes) == 1
-    assert trace.passes[0].name == "fusion"
-    assert len(trace.passes[0].rules_applied) == 1
-    assert trace.cuda_kernel is not None
-    assert "__global__" in trace.cuda_kernel
-
-    # Check execution results.
-    assert trace.execution is not None
-    assert trace.execution.correct is True
-    assert trace.execution.max_error < 1e-4
-    assert trace.execution.kernel_time_ms is not None
-    assert trace.execution.kernel_time_ms >= 0
-    assert trace.execution.dimensions == {"M": M, "N": N, "K": K}
-
-    # Ensure the full trace is valid JSON.
-    j = trace.to_json()
-    parsed = json.loads(j)
-    assert parsed["execution"]["correct"] is True
-    assert "cuda_kernel" in parsed
+    random.seed(0)
+    compiled = CudaBackend().compile(_matmul_graph(3, 4, 5))
+    a_data = [random.random() for _ in range(12)]
+    b_data = [random.random() for _ in range(20)]
+    expected = []
+    for mi in range(3):
+        for ni in range(5):
+            expected.append(sum(a_data[mi * 4 + k] * b_data[k * 5 + ni] for k in range(4)))
+    result = CudaBackend().run(compiled, input_data={"a": a_data, "b": b_data})
+    assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected, rel=1e-5)

@@ -1,14 +1,133 @@
 """Shared pytest fixtures for all test modules."""
 
 import os
+import random
 import subprocess
 import sys
+from pathlib import Path
 
+import numpy as np
 import pytest
+import torch
 import yaml
+
+
+@pytest.fixture(autouse=True)
+def _seed_rng():
+    """Pin RNGs for every test so numerical-tolerance assertions
+    (e.g. ``test_torch_ops.test_unary``) don't flake on inputs that
+    happen to land in tight regions. Determinism > tolerance — a real
+    precision regression should still trip these tests.
+
+    Also reseeds module-level ``rng = np.random.default_rng(...)``
+    Generators in test modules. They're instantiated once at import,
+    so successive ``rng.uniform`` calls inside parametrized tests
+    drift across the session and produce order-dependent flakes
+    (sigmoid/tanh/rsqrt at near-zero inputs etc.). Re-binding ``rng``
+    to a fresh ``default_rng`` with the original seed restores
+    intra-test determinism without changing any test's input
+    distribution."""
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+    for mod in list(sys.modules.values()):
+        if mod is None or not getattr(mod, "__name__", "").startswith("tests."):
+            continue
+        rng = getattr(mod, "rng", None)
+        if isinstance(rng, np.random.Generator):
+            seed = getattr(mod, "_RNG_SEED", 0)
+            mod.rng = np.random.default_rng(seed)
+
 
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 RECIPES_DIR = os.path.join(PROJECT_ROOT, "recipes")
+
+# ── LPT static bucketing for pytest-xdist ───────────────────────────
+# Record per-test call durations in the pytest cache; next run partitions
+# items across N worker buckets via LPT (longest-processing-time-first)
+# greedy — each item goes to the currently-lightest bucket. Buckets are
+# tagged via @pytest.mark.xdist_group so `--dist=loadgroup` routes every
+# item in a bucket to the same worker. Theoretical makespan is the load
+# of the heaviest bucket (lower bound = longest single test).
+
+_DURATIONS_KEY = "test_durations/call"
+_CALL_DURATIONS: dict[str, float] = {}
+
+
+def pytest_runtest_logreport(report):
+    if report.when == "call":
+        _CALL_DURATIONS[report.nodeid] = report.duration
+
+
+def pytest_sessionfinish(session):
+    cache = getattr(session.config, "cache", None)
+    if cache is None or not _CALL_DURATIONS:
+        return
+    existing = cache.get(_DURATIONS_KEY, {}) or {}
+    existing.update(_CALL_DURATIONS)
+    cache.set(_DURATIONS_KEY, existing)
+
+
+def _num_workers(config) -> int | None:
+    """Mirror xdist's -n resolution: int, 'auto', 'logical', or None."""
+    try:
+        n = config.getoption("numprocesses", None)
+    except ValueError:
+        return None
+    if n in (None, 0):
+        return None
+    if isinstance(n, int):
+        return n if n >= 1 else None
+    if n in ("auto", "logical"):
+        return os.cpu_count() or 1
+    try:
+        return int(n)
+    except (TypeError, ValueError):
+        return None
+
+
+def pytest_collection_modifyitems(config, items):
+    import heapq
+
+    cache = getattr(config, "cache", None)
+    if cache is None:
+        return
+    durations = cache.get(_DURATIONS_KEY, {}) or {}
+    if not durations:
+        return
+    nworkers = _num_workers(config)
+    if nworkers is None or nworkers < 2:
+        return
+
+    known = sorted(durations[it.nodeid] for it in items if it.nodeid in durations)
+    fallback = known[len(known) // 2] if known else 0.0
+
+    def dur(item) -> float:
+        return durations.get(item.nodeid, fallback)
+
+    sorted_items = sorted(items, key=dur, reverse=True)
+
+    # LPT: pop the lightest bucket, add this item, push back.
+    buckets: list[tuple[float, int, list]] = [(0.0, w, []) for w in range(nworkers)]
+    heapq.heapify(buckets)
+    for it in sorted_items:
+        load, wid, bucket = heapq.heappop(buckets)
+        bucket.append(it)
+        heapq.heappush(buckets, (load + dur(it), wid, bucket))
+
+    # Tag items with their bucket's xdist_group so loadgroup routes them together.
+    # Reorder items so same-bucket tests are contiguous and heaviest bucket leads
+    # (helps xdist dispatch long work first).
+    buckets_sorted = sorted(buckets, key=lambda b: -b[0])
+    reordered: list = []
+    for _load, wid, bucket in buckets_sorted:
+        group = f"w{wid}"
+        for it in bucket:
+            it.add_marker(pytest.mark.xdist_group(group))
+            reordered.append(it)
+    items[:] = reordered
 
 
 @pytest.fixture(scope="session")
@@ -56,6 +175,20 @@ def make_bench_config(recipes_dir):
         return config_path
 
     return _make
+
+
+# ── Compiler dump fixture ──────────────────────────────────────────
+
+
+@pytest.fixture
+def dump_dir(request):
+    """Dump compilation artifacts to _test_data/<test_name>/ for manual inspection."""
+    safe_name = request.node.name.replace("[", "_").replace("]", "_").replace("/", "_")
+    dump_path = Path(PROJECT_ROOT) / "_test_data" / safe_name
+
+    from deplodock.compiler.pipeline.dump import CompilerDump
+
+    return CompilerDump(dir=dump_path)
 
 
 # ── Unit-test fixtures ──────────────────────────────────────────────

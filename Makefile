@@ -15,11 +15,15 @@ help:
 setup:
 	@if [ ! -d "venv" ]; then \
 		echo "Creating virtual environment..."; \
-		python3.12 -m venv venv; \
+		python3.12 -m venv venv --prompt "deplodock"; \
 		echo "Installing Python dependencies..."; \
 		./venv/bin/pip install -e ".[dev]"; \
-		echo "✅ Setup complete!"; \
 	fi
+
+setup-ci:
+	python3.12 -m venv venv --prompt "deplodock"
+	./venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+	./venv/bin/pip install -e ".[compile,test]"
 
 lint: setup
 	./venv/bin/ruff check
@@ -30,7 +34,7 @@ format: setup
 	./venv/bin/ruff check --fix
 
 test: setup
-	./venv/bin/pytest tests/ -v
+	./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
 
 bench: setup
 	@echo "Running benchmarks..."

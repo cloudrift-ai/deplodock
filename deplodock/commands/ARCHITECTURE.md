@@ -172,6 +172,109 @@ deplodock
         +-- cloudrift
 ```
 
+## CLI Reference
+
+### `deplodock deploy local`
+
+Runs `docker compose` directly on the current machine. Auto-detects the local GPU via PCI sysfs and selects the matching `matrices` entry from the recipe.
+
+```bash
+deplodock deploy local --recipe <path> [--dry-run] [--teardown]
+deplodock deploy local --recipe <path> --gpu "..." --gpu-count N    # override detection
+```
+
+### `deplodock deploy ssh`
+
+Deploys to a remote server via SSH + SCP. Auto-detects the remote GPU and resolves the matrix the same way as `deploy local`. The remote host is responsible for having Docker + NVIDIA toolkit installed (or supplying `deploy.driver_version` / `deploy.cuda_version` in the recipe — see Recipe ARCHITECTURE).
+
+```bash
+deplodock deploy ssh --recipe <path> --ssh user@host[:port] [--ssh-key ~/.ssh/id_ed25519] [--dry-run] [--teardown]
+```
+
+### `deplodock deploy cloud`
+
+Provisions a cloud VM and deploys via SSH. Requires `--gpu` and `--gpu-count` to select the matching matrix entry from the recipe (no auto-detection — there is no host yet). When a GPU is offered by more than one provider, the first provider in `hardware.py`'s `GPU_INSTANCE_TYPES` table is chosen by default; pass `--provider {gcp,cloudrift}` to override.
+
+```bash
+deplodock deploy cloud --recipe <path> --gpu "NVIDIA H200 141GB" --gpu-count 8 [--provider gcp] [--name prefix]
+```
+
+### Hardware-Aware Deploy (Local / SSH)
+
+Both `deploy local` and `deploy ssh` auto-detect the target GPU by scanning PCI sysfs device IDs (locally or over SSH) and select the matching `matrices` entry. If more GPUs are available than the recipe's base configuration needs, a scale-out strategy is applied (`--scale-out-strategy {data-parallelism,replica-parallelism}`, default `data-parallelism`).
+
+### `deplodock bench`
+
+Loads each recipe, provisions cloud VMs, deploys the model, runs `vllm bench serve`, captures results, and tears down. Recipes sharing the same model and GPU type are grouped onto the same VM (see `GroupByModelAndGpuPlanner`).
+
+```bash
+deplodock bench recipes/*                                    # All recipes
+deplodock bench experiments/.../optimal_mcr_rtx5090          # An experiment
+deplodock bench recipes/* --filter "deploy.gpu=*5090*"       # Subset (fnmatch glob, AND across multiple --filter)
+deplodock bench recipes/* --gpu-concurrency 4                # Split each (model, GPU) group across up to N VMs
+deplodock bench recipes/* --no-teardown                      # Skip teardown; writes instances.json for later cleanup
+deplodock bench recipes/* --local                            # Run on this machine via ssh to 127.0.0.1
+deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Pre-allocated host pool (no provisioning, no teardown)
+```
+
+Results are stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
+
+**`--local` note:** runs the workload over SSH to `127.0.0.1` (same code path as remote hosts). Requires a running SSH server on localhost and that `--ssh-key` (default `~/.ssh/id_ed25519`) is in `~/.ssh/authorized_keys`. Quick check: `ssh -i ~/.ssh/id_ed25519 $USER@127.0.0.1 echo ok`.
+
+**Fixed-host mode:** when `--local` and/or `--ssh` are supplied, `bench` detects each host's GPU and verifies that every planned execution group can run on at least one host (matching `deploy.gpu` and sufficient `deploy.gpu_count`). Unsatisfied groups abort the run before any work starts. Fixed hosts are never deleted at the end of the run.
+
+### `deplodock teardown`
+
+Cleans up VMs left running by `bench --no-teardown`. Reads `instances.json` from the run directory.
+
+```bash
+deplodock teardown <run_dir> [--ssh-key ~/.ssh/id_ed25519]
+```
+
+### `deplodock vm create / delete`
+
+Manages cloud GPU VM lifecycles directly. Instances are ephemeral — `delete` removes them entirely. Run `deplodock vm create {gcp,cloudrift} --help` for full flag lists.
+
+```bash
+deplodock vm create gcp --instance my-vm --zone us-central1-a --machine-type a2-highgpu-1g
+deplodock vm delete gcp --instance my-vm --zone us-central1-a
+
+deplodock vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
+deplodock vm delete cloudrift --instance-id <id>
+```
+
+GCP project is inferred from `gcloud` config. CloudRift reads `CLOUDRIFT_API_KEY` and `CLOUDRIFT_API_URL` from the environment by default. **H200 on CloudRift** is only available on on-prem clusters — set `CLOUDRIFT_API_URL` to the on-prem endpoint (the public `api.cloudrift.ai` does not offer H200).
+
+## Experiments
+
+Experiments are self-contained parameter sweeps in `experiments/{model}/{name}/`. Each directory contains a `recipe.yaml` and stores its results alongside it:
+
+```
+experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/
+  recipe.yaml
+  2026-02-24_19-13-50_abc12345/
+    tasks.json
+    recipe.yaml
+    rtx5090x1_mcr8_c8_vllm_benchmark.txt
+    ...
+```
+
+```bash
+deplodock bench experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090
+```
+
+## CI Benchmark Workflow
+
+External developers can submit experiments via pull requests. A maintainer triggers benchmarks by commenting `/run-experiment` on the PR. CI runs benchmarks on cloud GPUs and commits results back to the PR branch.
+
+```
+/run-experiment                                                       # Auto-detect: all experiments changed in the PR
+/run-experiment experiments/MyModel/my_experiment                      # Explicit
+/run-experiment experiments/MyModel/my_experiment --gpu-concurrency 2  # Split groups across 2 VMs each
+```
+
+Only users with **write** or **admin** access can trigger benchmarks. For fork PRs, "Allow edits from maintainers" must be checked for results to be pushed back to the fork branch (otherwise results are downloadable as workflow artifacts).
+
 ## Adding a New VM Provider
 
 1. Create `provisioning/<provider>.py` with `create_instance()` -> `VMConnectionInfo | None` and `delete_instance()`

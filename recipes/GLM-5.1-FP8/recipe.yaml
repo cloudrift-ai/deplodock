@@ -1,0 +1,23 @@
+model:
+  huggingface: "zai-org/GLM-5.1-FP8"
+
+engine:
+  llm:
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    context_length: 202752
+    max_concurrent_requests: 16
+    vllm:
+      image: "vllm/vllm-openai:glm51-cu130"
+      extra_args: "--enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm45 --chat-template-content-format=string"
+
+benchmark:
+  max_concurrency: 16
+  num_prompts: 64
+  random_input_len: 2000
+  random_output_len: 2000
+
+matrices:
+  deploy.gpu: "NVIDIA H200 141GB"
+  deploy.gpu_count: 8

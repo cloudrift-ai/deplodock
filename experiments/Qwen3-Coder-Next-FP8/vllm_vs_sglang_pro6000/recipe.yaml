@@ -18,16 +18,14 @@ benchmark:
 matrices:
   - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
-    engine.llm.vllm.image: "vllm/vllm-openai:v0.17.0"
+    engine.llm.vllm.image: "vllm/vllm-openai:latest"
   - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
-    engine.llm.sglang.image: "lmsysorg/sglang:dev-cu13"
-    engine.llm.sglang.extra_args: "--fp8-gemm-backend triton --attention-backend triton --disable-cuda-graph --disable-radix-cache --kv-cache-dtype bf16"
-    engine.llm.sglang.extra_env:
-      SGLANG_ENABLE_JIT_DEEPGEMM: 0
+    engine.llm.sglang.image: "lmsysorg/sglang:latest"
+    engine.llm.sglang.extra_args: "--attention-backend triton"
+    engine.llm.sglang.extra_env: "SGLANG_ENABLE_JIT_DEEPGEMM=0"
   - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
     deploy.gpu_count: 1
-    engine.llm.sglang.image: "lmsysorg/sglang:dev-cu13"
-    engine.llm.sglang.extra_args: "--fp8-gemm-backend triton --attention-backend triton --disable-radix-cache --kv-cache-dtype bf16"
-    engine.llm.sglang.extra_env:
-      SGLANG_ENABLE_JIT_DEEPGEMM: 0
+    engine.llm.sglang.image: "lmsysorg/sglang:latest"
+    engine.llm.sglang.extra_args: "--attention-backend trtllm_mha"
+    engine.llm.sglang.extra_env: "SGLANG_ENABLE_JIT_DEEPGEMM=0"

@@ -8,87 +8,171 @@
   <a href="https://discord.gg/cloudrift"><img src="https://img.shields.io/discord/1150997934113030174?label=Discord" alt="Discord"></a>
 </p>
 
-Benchmark and deploy optimized LLM models on GPU servers with **vLLM** or **SGLang**. Chose from a list of optimized recipes for popular models or create your own with custom configurations. Run benchmarks across different GPU types and configurations, track results, and share experiments with the community.
+**Compile → Benchmark → Deploy** any LLM on any GPU. vLLM, SGLang, or create your own specialized deployment using a hackable compiler.
 
-## Project Structure
-
-- [deplodock/](deplodock/) — Python package
-  - [deplodock.py](deplodock/deplodock.py) — CLI entrypoint
-  - [logging_setup.py](deplodock/logging_setup.py) — CLI logging configuration
-  - [hardware.py](deplodock/hardware.py) — GPU specs and instance type mapping
-  - [detect.py](deplodock/detect.py) — GPU detection via PCI sysfs (local and remote)
-  - [commands/](deplodock/commands/) — CLI layer (thin argparse handlers, see [ARCHITECTURE.md](deplodock/commands/ARCHITECTURE.md))
-    - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
-    - [bench/](deplodock/commands/bench/) — `bench` command
-    - [teardown.py](deplodock/commands/teardown.py) — `teardown` command
-    - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
-  - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
-  - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
-  - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
-  - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
-  - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
-- [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
-- [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
-- [docker/](docker/) — Custom Docker images (e.g., vLLM ROCm for MI350X)
-- [docs/](docs/) — Technical notes and engine-specific guides
-  - [sglang-awq-moe.md](docs/sglang-awq-moe.md) — SGLang quantization for AWQ MoE models
-- [tests/](tests/) — pytest tests (see [ARCHITECTURE.md](tests/ARCHITECTURE.md))
-- [scripts/](scripts/) — Analysis and visualization scripts
-- [utils/](utils/) — Standalone utility scripts
-- [config.yaml](config.yaml) — Benchmark configuration
-- [Makefile](Makefile) — Build automation
-- [pyproject.toml](pyproject.toml) — Package metadata and tool config
-
-## Quick Start
-
-### Install
+## Install
 
 ```bash
 git clone https://github.com/cloudrift-ai/deplodock.git
-cd deplodock
-make setup
+cd deplodock && make setup
 ```
 
-### Deploy a Model
+## Compile
+
+A hackable PyTorch → Graph IR → CUDA compiler. Trace any `nn.Module`, fuse it into one kernel, run it, and inspect the emitted CUDA. See the blog post: [*A Principled ML Compiler Stack in 5,000 Lines of Python*](https://www.cloudrift.ai/blog/building-gpu-compiler-from-scratch-1).
 
 ```bash
-deplodock deploy ssh \
-  --recipe recipes/GLM-4.6-FP8 \
-  --ssh user@host
+# Compile a single layer
+deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))"
+# Benchmark, profile and optimize kernels locally
+deplodock run --bench --profile -c "torch.nn.Softmax(dim=-1)(torch.randn(1, 28, 2048, 2048))"
+# Compile full model from HuggingFace (will download weights)
+deplodock compile Qwen/Qwen2.5-7B
 ```
 
-### Deploy Locally
+Layer-norm-style reduction (two reductions, broadcast subtract, elementwise chain) fused into two kernels:
 
 ```bash
-deplodock deploy local \
-  --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ
+deplodock compile -c "
+class LN(torch.nn.Module):
+    def forward(self, x):
+        m = x.mean(-1, keepdim=True)
+        v = ((x - m) ** 2).mean(-1, keepdim=True)
+        return (x - m) * torch.rsqrt(v + 1e-6)
+LN()(torch.randn(64, 2048))"
 ```
 
-### Teardown
+Principled compilation stack with six IR stages, each printable on demand via `--ir <stage>`:
+
+1. **Torch IR** — captures the FX graph as a 1:1 mirror of PyTorch's op set (`rmsnorm`, `linear`, `softmax`, ...)
+2. **Tensor IR** — decomposes every Torch op into three primitives: `Elementwise`, `Reduction`, and `IndexMap`
+3. **Loop IR** — lifts each primitive to a `LoopOp` and fuses
+4. **Tile IR** — schedules kernels onto GPU
+5. **Kernel IR** — materializes the schedule into framework-agnostic hardware primitives
+6. **CUDA** — optimized CUDA code ready for `nvcc`
+
+
+**Readable Schedule**: `deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))" --ir tile`
+```
+kernel k_rms_norm_reduce  inputs: rms_norm_mean_count, rms_norm_eps, x, p_weight  outputs: rms_norm
+    in0 = load rms_norm_mean_count[0]
+    in1 = load rms_norm_eps[0]
+    Tile(axes=(a0:256=THREAD, a1:32=BLOCK)):
+        x_smem = Stage(x, origin=(0, a1, 0), slab=(a2:2048@2)) async
+        p_weight_smem = Stage(p_weight, origin=(0), slab=(a3:2048@0)) async
+        StridedLoop(a2 = a0; < 2048; += 256):  # reduce
+            in2 = load x_smem[a2]
+            v0 = multiply(in2, in2)
+            acc0 <- add(acc0, v0)
+        Combine(acc0, op=add)
+        v1 = divide(acc0, in0)
+        v2 = add(v1, in1)
+        v3 = rsqrt(v2)
+        StridedLoop(a3 = a0; < 2048; += 256):  # free
+            in3 = load x_smem[a3]
+            in4 = load p_weight_smem[a3]
+            v4 = multiply(in3, v3)
+            v5 = multiply(v4, in4)
+            rms_norm[0, a1, a3] = v5
+```
+
+**Optimized CUDA kernel**: `deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))" --ir cuda`
+
+```c
+extern "C" __global__
+__launch_bounds__(256) void k_rms_norm_reduce(const float* x, const float* p_weight, float* rms_norm) {
+    float in0 = 2048.0f;
+    float in1 = 1e-06f;
+    {
+        int a1 = blockIdx.x;
+        int a0 = threadIdx.x;
+        float acc0 = 0.0f;
+        __syncthreads();
+        __shared__ float x_smem[2048];
+        for (int x_smem_flat = a0; x_smem_flat < 2048; x_smem_flat += 256) {
+            {
+                unsigned int _smem_addr = __cvta_generic_to_shared(&x_smem[x_smem_flat]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                             :: "r"(_smem_addr), "l"(&x[a1 * 2048 + x_smem_flat])
+                             : "memory");
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();
+        __shared__ float p_weight_smem[2048];
+        for (int p_weight_smem_flat = a0; p_weight_smem_flat < 2048; p_weight_smem_flat += 256) {
+            {
+                unsigned int _smem_addr = __cvta_generic_to_shared(&p_weight_smem[p_weight_smem_flat]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                             :: "r"(_smem_addr), "l"(&p_weight[p_weight_smem_flat])
+                             : "memory");
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();
+        for (int a2 = a0; a2 < 2048; a2 += 256) {
+            float in2 = x_smem[a2];
+            float v0 = in2 * in2;
+            acc0 += v0;
+        }
+        __shared__ float acc0_smem[256];
+        acc0_smem[a0] = acc0;
+        __syncthreads();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (a0 < s) {
+                acc0_smem[a0] = acc0_smem[a0] + acc0_smem[a0 + s];
+            }
+            __syncthreads();
+        }
+        __syncthreads();
+        float acc0_b = acc0_smem[0];
+        float v1 = acc0_b / in0;
+        float v2 = v1 + in1;
+        float v3 = rsqrtf(v2);
+        for (int a3 = a0; a3 < 2048; a3 += 256) {
+            float in3 = x_smem[a3];
+            float in4 = p_weight_smem[a3];
+            float v4 = in3 * v3;
+            float v5 = v4 * in4;
+            rms_norm[a1 * 2048 + a3] = v5;
+        }
+    }
+}
+```
+
+## Benchmark
 
 ```bash
-deplodock deploy ssh \
-  --recipe recipes/GLM-4.6-FP8 \
-  --ssh user@host \
-  --teardown
+deplodock bench recipes/*                                    # All recipes
+deplodock bench experiments/.../optimal_mcr_rtx5090          # An experiment
+deplodock bench recipes/* --filter "deploy.gpu=*5090*"       # Subset
+deplodock bench recipes/* --gpu-concurrency 4                # Parallel VMs per GPU
+deplodock bench recipes/* --local                            # On this machine
+deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Pre-allocated hosts
 ```
 
-### Dry Run
+External contributors: open a PR with an experiment under `experiments/{model}/{name}/`, then a maintainer triggers a cloud run by commenting `/run-experiment` on the PR.
 
-Preview commands without executing:
+## Deploy
 
 ```bash
-deplodock deploy ssh \
-  --recipe recipes/GLM-4.6-FP8 \
-  --ssh user@host \
-  --dry-run
+# Remote server via SSH
+deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host
+
+# Local Docker Compose
+deplodock deploy local --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ
+
+# Cloud (auto-provisions a VM)
+deplodock deploy cloud --recipe recipes/GLM-4.6-FP8 --gpu "NVIDIA H200 141GB" --gpu-count 8
+
+# Teardown / preview
+deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --teardown
+deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --dry-run
 ```
 
-## Recipes
-
-Recipes are declarative YAML configs in `recipes/<model>/recipe.yaml`. Each recipe defines a model, engine settings, and a `matrices` section for benchmark configurations.
-
-### Format
+## Recipe
 
 ```yaml
 model:
@@ -97,13 +181,12 @@ model:
 engine:
   llm:
     tensor_parallel_size: 8
-    pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     context_length: 16384
     max_concurrent_requests: 512
     vllm:
       image: "vllm/vllm-openai:v0.17.0"
-      extra_args: "--kv-cache-dtype fp8"    # Flags not covered by named fields
+      extra_args: "--kv-cache-dtype fp8"
 
 benchmark:
   max_concurrency: 128
@@ -111,384 +194,109 @@ benchmark:
   random_input_len: 8000
   random_output_len: 8000
 
-# Simple single-point entry (implicit zip)
-matrices:
-  deploy.gpu: "NVIDIA H200 141GB"
-  deploy.gpu_count: 8
-```
-
-#### Cross-Product and Zip Combinators
-
-The `matrices` section supports two combinators for generating benchmark variants:
-
-- **`cross`**: Cartesian product of all list-valued axes. Scalars are broadcast.
-- **`zip`**: Element-wise pairing of equal-length lists. Scalars are broadcast.
-
-A plain `matrices` dict (no `cross`/`zip` key) is an implicit `zip`.
-
-```yaml
-# Cross-product: 3 GPUs × 2 configs = 6 variants
+# Cross-product: 3 GPUs × 2 concurrency configs = 6 variants
 matrices:
   cross:
-    deploy.gpu_count: 1                    # scalar → broadcast
-    deploy.gpu:                            # list → cross-product axis
+    deploy.gpu_count: 1
+    deploy.gpu:
       - "NVIDIA GeForce RTX 5090"
       - "NVIDIA H100 80GB"
       - "NVIDIA H200 141GB"
-    zip:                                   # zip sub-dict → one compound axis
+    zip:
       engine.llm.max_concurrent_requests: [128, 512]
       benchmark.max_concurrency: [128, 512]
 ```
 
-```yaml
-# Concurrency sweep (zip: 8 runs from one entry)
-matrices:
-  deploy.gpu: "NVIDIA GeForce RTX 5090"
-  engine.llm.max_concurrent_requests: [1, 2, 4, 8, 16, 32, 64, 128]
-  benchmark.max_concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
-```
-
-Within a `cross` node: scalars broadcast, lists are independent axes (cartesian product), nested `zip` dicts bundle their lists into one compound axis. Within a `zip` node: scalars broadcast, lists are zipped element-wise (must all be the same length). `cross`/`zip` keys are only treated as combinators when their value is a dict.
-
-Matrix entries use **dot-notation** for all parameter paths. `deploy.gpu` is required.
-
-#### Variant Filtering
-
-Use `--filter` to run a subset of variants:
-
-```bash
-deplodock bench recipes/my-recipe --filter "deploy.gpu=*5090*"
-deplodock bench recipes/my-recipe --filter "deploy.gpu=*5090*" --filter "batches=1"
-```
-
-Multiple `--filter` flags use AND logic. Values are matched with fnmatch glob patterns against the expanded parameter values.
-
-`deploy.driver_version` and `deploy.cuda_version` (optional) request a specific NVIDIA driver / CUDA toolkit on the target host. If the installed version already matches (prefix-match — `"550"` matches `550.127.05`), provisioning is a no-op. On a mismatch, a remote (`ssh`/`cloud`) deploy installs the requested version, reboots the host, and waits for SSH to come back. Local deploys refuse to run privileged commands and will error out instead — these fields are intended for remote machines only.
-
-Engine-agnostic fields (`tensor_parallel_size`, `context_length`, etc.) live at `engine.llm`. Engine-specific fields (`image`, `extra_args`) nest under `engine.llm.vllm` or `engine.llm.sglang`.
-
-#### Docker Options
-
-Arbitrary docker-compose service keys can be injected via `engine.llm.docker_options`. This is useful for GPU-specific container settings like ROCm's security options:
-
-```yaml
-engine:
-  llm:
-    docker_options:
-      security_opt:
-        - seccomp=unconfined
-      cap_add:
-        - SYS_PTRACE
-```
-
-Keys already managed by the compose template (`image`, `volumes`, `ports`, `healthcheck`, etc.) are rejected at load time.
-
-### SGLang Matrix Entry Example
-
-To benchmark with SGLang alongside vLLM, use a cross-product with the engine image:
-
-```yaml
-matrices:
-  cross:
-    deploy.gpu: "NVIDIA GeForce RTX 5090"
-    deploy.gpu_count: 1
-    engine.llm.sglang.image: ["", "lmsysorg/sglang:v0.5.9"]
-```
-
-### Named Fields → CLI Flags
-
-| Recipe YAML key           | vLLM CLI flag              | SGLang CLI flag          |
-|---------------------------|----------------------------|--------------------------|
-| `tensor_parallel_size`    | `--tensor-parallel-size`   | `--tp`                   |
-| `pipeline_parallel_size`  | `--pipeline-parallel-size` | `--pp`                   |
-| `data_parallel_size`      | `--data-parallel-size`     | `--dp`                   |
-| `gpu_memory_utilization`  | `--gpu-memory-utilization` | `--mem-fraction-static`  |
-| `context_length`          | `--max-model-len`          | `--context-length`       |
-| `max_concurrent_requests` | `--max-num-seqs`           | `--max-running-requests` |
-
-These flags must **not** appear in `extra_args` — `load_recipe()` validates this and raises an error on duplicates.
-
-### Command Recipes (Generic Workload)
-
-A recipe may declare a `command` block instead of `engine.llm` to run an arbitrary tool on the provisioned VM (e.g. a microbenchmark, a profiling sweep, or `nvidia-smi`). The harness expands the matrix, renders the command template per variant, runs it on the VM, and pulls back result files.
+Generic workload (run any tool on the VM, pull back result files):
 
 ```yaml
 command:
-  stage: ["scripts"]              # repo paths to ship to the VM; empty = no staging
+  stage: ["scripts"]
   run: |
     nvidia-smi --query-gpu=name,memory.used --format=csv > $task_dir/result.csv
-    echo "marker,$marker" >> $task_dir/result.csv
-  result_files:                    # filenames or shell globs (expanded on the remote)
-    - result.csv
-    - "*.log"
+  result_files: ["result.csv"]
   timeout: 60
 
 matrices:
   deploy.gpu: "NVIDIA GeForce RTX 5090"
   deploy.gpu_count: 1
-  marker: [a, b, c]
 ```
 
-The `run` template uses `string.Template` `$var` syntax. Substitution variables are the variant params (flattened to leaf names — `deploy.gpu` → `gpu`, `marker` → `marker`) plus harness-injected `$task_dir`, `$gpu_device_ids`, and `$repo_dir` (when staging is configured). `command` and `engine.llm` are mutually exclusive.
-
-Staging uses `git ls-files --cached --others --exclude-standard <paths>` so unversioned edits ride along without a commit, while gitignored files are excluded. Each pulled result file lands in the run directory as `{variant}_{basename}`.
-
-### Aggregate Post-Processing
-
-A recipe may optionally declare an `aggregate` block that runs locally after all variants complete. Useful for combining per-variant results into comparison tables.
-
-```yaml
-aggregate:
-  run: |
-    ./venv/bin/python scripts/aggregate.py $run_dir --output $run_dir/report.md
-  timeout: 60
-```
-
-The `run` template receives `$run_dir` (the local directory with all result files). It runs on the orchestrator machine, not on a GPU VM.
-
-## Experiments
-
-Experiments are self-contained parameter sweeps that live in `experiments/`. Each experiment directory contains a `recipe.yaml` and stores its results alongside it. The directory structure follows `experiments/{model_name}/{experiment_name}/`.
-
-### Example: Optimal max_concurrent_requests on RTX 5090
+## Virtual Machine Management
 
 ```bash
-deplodock bench experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090
-```
+# GCP
+deplodock vm create gcp --instance my-vm --zone us-central1-a --machine-type a2-highgpu-1g
+deplodock vm delete gcp --instance my-vm --zone us-central1-a
 
-Results are saved directly in the experiment directory:
-```
-experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/
-  recipe.yaml
-  2026-02-24_19-13-50_abc12345/
-    tasks.json
-    recipe.yaml
-    RTX5090_mcr8_c8_vllm_benchmark.txt
-    RTX5090_mcr12_c12_vllm_benchmark.txt
-    ...
-```
-
-## CI Benchmark Workflow
-
-External developers can submit experiments via pull requests. A maintainer triggers benchmarks by commenting `/run-experiment` on the PR.
-
-### How It Works
-
-1. **Submit a PR** with an experiment definition in `experiments/{model}/{experiment}/recipe.yaml`
-2. **A maintainer reviews** and comments `/run-experiment` on the PR
-3. **CI runs benchmarks** on cloud GPUs, commits results back to the PR branch
-4. **Review results** in the PR comment summary and committed files
-
-### Trigger Modes
-
-```
-/run-experiment                                                        # Auto-detect: benchmarks all experiments changed in the PR
-/run-experiment experiments/MyModel/my_experiment                       # Explicit: benchmark specific experiment(s)
-/run-experiment experiments/MyModel/my_experiment --gpu-concurrency 2   # Split groups across 2 VMs each
-```
-
-Only users with **write** or **admin** access to the repository can trigger benchmarks.
-
-### Fork PRs
-
-For the workflow to push results back to a fork's branch, the PR must have **"Allow edits from maintainers"** checked (this is the GitHub default). If unchecked, results are still available as downloadable workflow artifacts.
-
-## Deploy Targets
-
-### Local
-
-Runs docker compose directly on the current machine.
-
-```bash
-deplodock deploy local --recipe <path> [--dry-run]
-```
-
-### SSH
-
-Deploys to a remote server via SSH + SCP.
-
-```bash
-deplodock deploy ssh --recipe <path> --ssh user@host[:port] [--dry-run]
-```
-
-### Cloud
-
-Provisions a cloud VM and deploys via SSH. Requires `--gpu` and `--gpu-count` to select the matching matrix entry from the recipe. When a GPU is offered by more than one provider (e.g. H200 is available on both CloudRift and GCP), the first provider listed in the hardware table is used by default; pass `--provider {gcp,cloudrift}` to override.
-
-```bash
-deplodock deploy cloud --recipe <path> --gpu "NVIDIA GeForce RTX 5090" --gpu-count 1 [--dry-run]
-deplodock deploy cloud --recipe <path> --gpu "NVIDIA H200 141GB" --gpu-count 1 --provider gcp
-```
-
-**H200 on CloudRift:** only available on on-prem CloudRift deployments. Set `CLOUDRIFT_API_URL` to the on-prem cluster before running (the public `api.cloudrift.ai` does not offer H200).
-
-### Hardware-Aware Deploy
-
-When deploying locally or via SSH, deplodock auto-detects the target GPU by scanning PCI sysfs device IDs and selects the matching `matrices` entry from the recipe. If more GPUs are available than the recipe's base configuration needs, a scale-out strategy is applied.
-
-### Common Flags
-
-| Flag                    | Required  | Default             | Description                                                  |
-|-------------------------|-----------|---------------------|--------------------------------------------------------------|
-| `--recipe`              | Yes       | -                   | Path to recipe directory                                     |
-| `--hf-token`            | No        | `$HF_TOKEN`         | HuggingFace token                                            |
-| `--model-dir`           | No        | `/mnt/models`       | Model cache dir                                              |
-| `--teardown`            | No        | false               | Stop containers instead of deploying                         |
-| `--dry-run`             | No        | false               | Print commands without executing                             |
-| `--gpu`                 | No        | auto-detect         | Override GPU name (skips detection)                          |
-| `--gpu-count`           | No        | auto-detect         | Override GPU count (skips count detection)                   |
-| `--scale-out-strategy`  | No        | `data-parallelism`  | Scale-out: `data-parallelism` or `replica-parallelism`       |
-
-### SSH-only Flags
-
-| Flag         | Required  | Default             | Description                                          |
-|--------------|-----------|---------------------|------------------------------------------------------|
-| `--ssh`      | Yes       | -                   | SSH target `USER@HOST[:PORT]` (default port 22)      |
-| `--ssh-key`  | No        | `~/.ssh/id_ed25519` | SSH key path                                         |
-
-The same `--ssh USER@HOST[:PORT]` syntax is used by `deplodock bench --ssh ...`.
-
-### Cloud-only Flags
-
-| Flag          | Required  | Default             | Description                            |
-|---------------|-----------|---------------------|----------------------------------------|
-| `--gpu`       | Yes       | -                   | GPU name (selects matching matrix entry)|
-| `--gpu-count` | Yes       | -                   | GPU count (selects matching matrix entry)|
-| `--provider`  | No        | first in hw table   | Force provider (`gcp` or `cloudrift`)  |
-| `--name`      | No        | `cloud-deploy`      | VM name prefix                         |
-| `--ssh-key`   | No        | `~/.ssh/id_ed25519` | SSH private key path                   |
-
-## VM Management
-
-The `vm` command manages cloud GPU VM lifecycles. Supports GCP and CloudRift providers. Instances are ephemeral — `delete` removes them entirely.
-
-### GCP
-
-```bash
-deplodock vm create gcp --instance my-gpu-vm --zone us-central1-a --machine-type a2-highgpu-1g
-deplodock vm create gcp --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --wait-ssh
-deplodock vm create gcp --instance my-gpu-vm --zone us-central1-a --machine-type e2-micro --gcloud-args "--no-service-account --no-scopes" --dry-run
-deplodock vm delete gcp --instance my-gpu-vm --zone us-central1-a
-```
-
-#### GCP Create Flags
-
-| Flag                           | Default        | Description                                               |
-|--------------------------------|----------------|-----------------------------------------------------------|
-| `--instance`                   | (required)     | GCP instance name                                         |
-| `--zone`                       | (required)     | GCP zone (e.g. us-central1-a)                             |
-| `--machine-type`               | (required)     | Machine type (e.g. a2-highgpu-1g)                         |
-| `--provisioning-model`         | `FLEX_START`   | Provisioning model (`FLEX_START`, `SPOT`, or `STANDARD`)  |
-| `--max-run-duration`           | `7d`           | Max VM run time (10m–7d)                                  |
-| `--request-valid-for-duration` | `2h`           | How long to wait for capacity                             |
-| `--termination-action`         | `DELETE`       | Action when max-run-duration expires (`STOP` or `DELETE`) |
-| `--image-family`               | `debian-12`    | Boot disk image family                                    |
-| `--image-project`              | `debian-cloud` | Boot disk image project                                   |
-| `--gcloud-args`                | -              | Extra args passed to `gcloud compute instances create`    |
-| `--timeout`                    | `14400`        | How long to poll for RUNNING status (seconds)             |
-| `--wait-ssh`                   | false          | Wait for SSH after VM is RUNNING                          |
-| `--wait-ssh-timeout`           | `300`          | SSH wait timeout in seconds                               |
-| `--ssh-gateway`                | -              | SSH gateway host for ProxyJump (e.g. gcp-ssh-gateway)     |
-| `--dry-run`                    | false          | Print commands without executing                          |
-
-#### GCP Delete Flags
-
-| Flag         | Default    | Description                      |
-|--------------|------------|----------------------------------|
-| `--instance` | (required) | GCP instance name                |
-| `--zone`     | (required) | GCP zone (e.g. us-central1-a)    |
-| `--dry-run`  | false      | Print commands without executing |
-
-GCP project is inferred from `gcloud` config (no `--project` flag needed).
-
-### CloudRift
-
-```bash
+# CloudRift
 deplodock vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
 deplodock vm delete cloudrift --instance-id <id>
 ```
 
-#### CloudRift Create Flags
-
-| Flag              | Default              | Description                       |
-|-------------------|----------------------|-----------------------------------|
-| `--instance-type` | (required)           | Instance type (e.g. rtx4090.1)    |
-| `--ssh-key`       | (required)           | Path to SSH public key file       |
-| `--api-key`       | `$CLOUDRIFT_API_KEY` | CloudRift API key                 |
-| `--api-url`       | `$CLOUDRIFT_API_URL` or `https://api.cloudrift.ai` | CloudRift API base URL |
-| `--image-url`     | Ubuntu 24.04         | VM image URL                      |
-| `--ports`         | `22,8000`            | Comma-separated ports to open     |
-| `--timeout`       | `600`                | Seconds to wait for Active status |
-| `--dry-run`       | false                | Print requests without executing  |
-
-#### CloudRift Delete Flags
-
-| Flag            | Default              | Description                      |
-|-----------------|----------------------|----------------------------------|
-| `--instance-id` | (required)           | CloudRift instance ID            |
-| `--api-key`     | `$CLOUDRIFT_API_KEY` | CloudRift API key                |
-| `--api-url`     | `$CLOUDRIFT_API_URL` or `https://api.cloudrift.ai` | CloudRift API base URL |
-| `--dry-run`     | false                | Print requests without executing |
-
-## Benchmarking
-
-The `bench` command accepts recipe directories as positional arguments. It loads each recipe, provisions cloud VMs, deploys the model, runs `vllm bench serve`, captures results, and tears down. Recipes sharing the same model and GPU type are grouped onto the same VM.
-
-### Run Benchmarks
+## Development
 
 ```bash
-deplodock bench recipes/*                                    # Run all recipes (results in each recipe dir)
-deplodock bench experiments/.../optimal_mcr_rtx5090          # Run an experiment
-deplodock bench recipes/* --gpu-concurrency 4                # Number of VMs per GPU type to spin up
-deplodock bench recipes/* --dry-run                          # Preview commands
-deplodock bench recipes/* --local                            # Run on the local machine
-deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Run on a fixed pool of pre-allocated hosts
+make test      # run pytest
+make lint      # ruff check + format check
+make format    # auto-fix
 ```
 
-| Flag                 | Default             | Description                                                              |
-|----------------------|---------------------|--------------------------------------------------------------------------|
-| `recipes`            | (required)          | Recipe directories (positional args)                                     |
-| `--ssh-key`          | `~/.ssh/id_ed25519` | SSH private key path                                                     |
-| `--config`           | `config.yaml`       | Path to configuration file                                               |
-| `--max-workers`      | num groups          | Max parallel execution groups                                            |
-| `--gpu-concurrency`  | 1                   | Split each (model, GPU) group across up to N VMs                         |
-| `--dry-run`          | false               | Print commands without executing                                         |
-| `--no-teardown`      | false               | Skip teardown and VM deletion (saves `instances.json` for later cleanup) |
-| `--local`            | false               | Run on the local machine via ssh to 127.0.0.1 (skips cloud provisioning) |
-| `--ssh USER@HOST[:PORT]` | none            | Pre-allocated SSH host (repeatable). Skips cloud provisioning            |
-| `--provider`         | first in hw table   | Force cloud provider for all groups (`gcp` or `cloudrift`)               |
+## Project Structure
 
-When `--local` and/or `--ssh` are supplied, deplodock detects each host's GPU via PCI sysfs and verifies that every planned execution group can run on at least one of the supplied hosts (matching `deploy.gpu` and sufficient `deploy.gpu_count`). If any group is unsatisfied, the run aborts before any work starts. Fixed hosts are not deleted at the end of the run. Docker and the NVIDIA Container Toolkit are installed on first use if missing — each step is idempotent, so already-provisioned hosts are a fast no-op and freshly created VMs work out of the box. Driver/CUDA pinning (recipe-driven via `deploy.driver_version` / `deploy.cuda_version`) reboots the host if a version mismatch is detected.
+- [deplodock/](deplodock/) — Python package
+  - [deplodock.py](deplodock/deplodock.py) — CLI entrypoint
+  - [logging_setup.py](deplodock/logging_setup.py) — CLI logging configuration
+  - [hardware.py](deplodock/hardware.py) — GPU specs and instance type mapping
+  - [detect.py](deplodock/detect.py) — GPU detection via PCI sysfs (local and remote)
+  - [redact.py](deplodock/redact.py) — Secret redaction for logs and dumps
+  - [commands/](deplodock/commands/) — CLI layer (thin argparse handlers, see [ARCHITECTURE.md](deplodock/commands/ARCHITECTURE.md))
+    - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
+    - [bench/](deplodock/commands/bench/) — `bench` command
+    - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
+    - [teardown.py](deplodock/commands/teardown.py) — `teardown` command
+    - [pull.py](deplodock/commands/pull.py) — `pull` command (download HF model)
+    - [trace.py](deplodock/commands/trace.py) — `trace` command (PyTorch → Graph IR)
+    - [compile.py](deplodock/commands/compile.py) — `compile` command (decomposition → optimization → fusion → kernel/CUDA lowering)
+    - [run.py](deplodock/commands/run.py) — `run` command (compile + execute on CUDA backend, optional benchmarks)
+    - [inspect_graph.py](deplodock/commands/inspect_graph.py) — `inspect` command (graph summary)
+  - [compiler/](deplodock/compiler/) — PyTorch → Graph IR → CUDA compiler (see [ARCHITECTURE.md](deplodock/compiler/ARCHITECTURE.md))
+    - [graph.py](deplodock/compiler/graph.py) — `Graph`, `Node`, `Tensor`, `Hints` container
+    - [ir/](deplodock/compiler/ir/) — per-dialect op definitions (torch / tensor / loop / kernel / cuda) (see [ARCHITECTURE.md](deplodock/compiler/ir/ARCHITECTURE.md))
+    - [trace/](deplodock/compiler/trace/) — PyTorch/HuggingFace → Graph IR capture (see [ARCHITECTURE.md](deplodock/compiler/trace/ARCHITECTURE.md))
+    - [pipeline/](deplodock/compiler/pipeline/) — rewrite engine + passes + dump hooks (see [ARCHITECTURE.md](deplodock/compiler/pipeline/ARCHITECTURE.md))
+    - [rules/](deplodock/compiler/rules/) — rewrite rules (decomposition, optimization, fusion, lowering)
+    - [program/](deplodock/compiler/program/) — kernel program assembly (LoopOp → KernelOp → CudaOp)
+    - [cuda/](deplodock/compiler/cuda/) — CUDA source rendering and runtime helpers
+    - [backend/](deplodock/compiler/backend/) — numpy / loop / CUDA execution (see [ARCHITECTURE.md](deplodock/compiler/backend/ARCHITECTURE.md))
+      - [cuda/](deplodock/compiler/backend/cuda/) — CUDA backend internals (see [ARCHITECTURE.md](deplodock/compiler/backend/cuda/ARCHITECTURE.md))
+    - [tuning.py](deplodock/compiler/tuning.py) — autotuning utilities
+  - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
+  - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
+  - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
+  - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
+  - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
+- [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
+- [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
+- [kernels/](kernels/) — Standalone CUDA kernel sources
+- [docs/](docs/) — Technical notes and engine-specific guides
+  - [sglang-awq-moe.md](docs/sglang-awq-moe.md) — SGLang quantization for AWQ MoE models
+- [tests/](tests/) — pytest tests (see [ARCHITECTURE.md](tests/ARCHITECTURE.md))
+  - [compiler/passes/](tests/compiler/passes/) — compiler pass tests (see [ARCHITECTURE.md](tests/compiler/passes/ARCHITECTURE.md))
+- [scripts/](scripts/) — Analysis and visualization scripts
+- [utils/](utils/) — Standalone utility scripts
+- [config.yaml](config.yaml) — Benchmark configuration
+- [Makefile](Makefile) — Build automation
+- [pyproject.toml](pyproject.toml) — Package metadata and tool config
 
-> **Note:** `--local` runs the workload over SSH to `127.0.0.1` (the same code path used for remote hosts). This requires a running SSH server on localhost and that your `--ssh-key` (default `~/.ssh/id_ed25519`) is listed in `~/.ssh/authorized_keys`. Quick check: `ssh -i ~/.ssh/id_ed25519 $USER@127.0.0.1 echo ok`.
+## Contributing
 
-Results are always stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
+1. Branch from `main` (e.g. `feature/my-change`).
+2. Follow [STYLE.md](STYLE.md) and per-directory `ARCHITECTURE.md` files.
+3. Add tests in `tests/` (see [tests/ARCHITECTURE.md](tests/ARCHITECTURE.md)).
+4. `make test && make lint` (use `make format` to auto-fix).
+5. Open a PR against `main`.
 
-### Teardown
+## License
 
-Clean up VMs left running by `bench --no-teardown`:
-
-```bash
-deplodock teardown results/intermediate/2026-02-24_12-00-00_abc12345
-deplodock teardown results/intermediate/2026-02-24_12-00-00_abc12345 --ssh-key ~/.ssh/id_ed25519
-```
-
-| Flag        | Default              | Description                                          |
-|-------------|----------------------|------------------------------------------------------|
-| `run_dir`   | (required)           | Run directory with `instances.json` (positional arg) |
-| `--ssh-key` | `~/.ssh/id_ed25519`  | SSH private key path                                 |
-
-## Running Tests
-
-```bash
-make test
-```
-
-## Linting & Formatting
-
-The project uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting. Configuration is in `pyproject.toml`.
-
-```bash
-make lint      # check for lint errors and formatting issues
-make format    # auto-fix formatting and lint violations
-```
+Licensed under the [Apache License 2.0](LICENSE).

@@ -10,13 +10,16 @@ requires-python = ">=3.12"
 dependencies = [
     "huggingface_hub[cli,hf_transfer]",
     "httpx",
+    "numpy",
     "pyyaml",
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-asyncio"]
-plot = ["matplotlib"]
-dev = ["pytest", "pytest-asyncio", "ruff", "matplotlib"]
+test = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff"]
+compile = ["torch", "transformers", "cppyy==3.5.0"]
+# flash-attn requires torch at build time, install separately:
+#   pip install flash-attn --no-build-isolation
+dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphviz", "torch", "transformers", "cupy-cuda12x; sys_platform == 'linux'", "cppyy==3.5.0"]
 
 [tool.setuptools.packages.find]
 include = ["deplodock*"]
@@ -35,7 +38,7 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-"deplodock/compiler/cuda/lower.py" = ["E501"]  # Generated CUDA code has long inline PTX strings
+"deplodock/compiler/backend/cuda/generators/tiled.py" = ["E501"]  # Generated CUDA code has long inline PTX strings
 
 [tool.ruff.format]
 quote-style = "double"
