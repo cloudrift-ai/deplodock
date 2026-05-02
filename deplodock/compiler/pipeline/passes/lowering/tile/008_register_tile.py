@@ -1,11 +1,11 @@
 """Register-tile matmul-shaped reduce kernels (axis-aware).
 
 Each thread in the post-blockify state owns one output element of the
-CTA's M×N tile (PAT × PAT threads — default ``PAT=16`` so 256 threads,
-1 output / thread). The per-thread tile shape ``(F_M, F_N)`` is
-supplied by ``tuning.register_tile_shape``: symmetric ``(F, F)`` for
-the cp.async path (paired with PAT via ``_PAT_TO_FACTOR``), asymmetric
-``(8, 4)`` for the cuBLAS-style TMA path.
+CTA's M×N tile. ``tuning.register_tile_shape`` returns the per-thread
+``(F_M, F_N)`` cell shape — currently fixed at ``(8, 4)`` for matmul
+(paired with the ``005_blockify_launch`` ``(BN=128, BM=64)`` thread
+tile), or ``(1, 1)`` to skip register tiling (small matmul or
+non-matmul body).
 
 This pass splits each ``BIND_THREAD`` axis by its factor and
 replicates the matmul reduce body + epilogue per ``(a_i, a_j)`` cell.
