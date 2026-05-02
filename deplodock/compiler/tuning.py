@@ -16,8 +16,11 @@ Env vars:
 - ``DEPLODOCK_TB`` — total thread budget per CTA for non-matmul kernels.
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
-  weight transpose (``004a_fold_constant_transpose``). On by default
-  (sm_90+); set ``DEPLODOCK_TMA=0`` to force the cp.async fallback.
+  weight transpose (``004a_fold_constant_transpose``). Off by default
+  — TMA's descriptor encoder rejects source ranks > 5, which the SDPA
+  Q/K/V path produces; enabling globally regresses attention kernels.
+  Set ``DEPLODOCK_TMA=1`` for ``nn.Linear``-only models with
+  ``≥1024`` per-dim shapes.
 """
 
 from __future__ import annotations
@@ -102,7 +105,7 @@ def _matmul_M(tile: Tile) -> int:
 
 
 def _tma_enabled() -> bool:
-    return os.environ.get("DEPLODOCK_TMA", "1") != "0"
+    return os.environ.get("DEPLODOCK_TMA") == "1"
 
 
 def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
@@ -118,11 +121,25 @@ def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
     """Per-thread output tile ``(F_M, F_N)``. ``(1, 1)`` to skip
-    register tiling on non-matmul bodies."""
+    register tiling on non-matmul bodies and on matmuls whose post-
+    blockify THREAD axes are too small to host the F-tile (tiny matmul
+    fallback — blockify kept the original output extents whole because
+    they were already < tile width)."""
     if tile is None or not _has_matmul_reduce(tile.body):
         return (1, 1)
     f_m = _int_env("DEPLODOCK_FM", _F_PER_AXIS[0])
     f_n = _int_env("DEPLODOCK_FN", _F_PER_AXIS[1])
+    bn = _int_env("DEPLODOCK_BN", _TILE_SHAPE[0])
+    bm = _int_env("DEPLODOCK_BM", _TILE_SHAPE[1])
+    # Post-blockify: each output's THREAD axis should equal the per-axis
+    # tile width (BN, BM). If neither matches, blockify kept the axes
+    # whole — register-tiling would just rename them, no parallelism.
+    from deplodock.compiler.ir.axis import BIND_THREAD
+
+    if any(ba.bind == BIND_THREAD for ba in tile.axes):
+        thread_extents = {int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_THREAD}
+        if not (thread_extents & {bn, bm}):
+            return (1, 1)
     return (f_m, f_n)
 
 
@@ -131,7 +148,11 @@ def thread_budget() -> int:
 
 
 def forced_bk(tile: Tile | None = None) -> int | None:
-    """Force BK via env, or pick the M-adaptive default."""
+    """Force BK via env, or pick the M-adaptive default. Backs off to
+    a smaller BK when the M-adaptive choice would overflow the 48 KB
+    static-smem cap at the active tile shape — happens for small
+    matmuls where the THREAD axes stay at the full output extent and
+    BK_SMALL_M=64 produces a stage too large for two buffers."""
     raw = os.environ.get("DEPLODOCK_BK")
     if raw:
         try:
@@ -140,9 +161,28 @@ def forced_bk(tile: Tile | None = None) -> int | None:
             return None
     if tile is None or not _has_matmul_reduce(tile.body):
         return None
-    if _matmul_M(tile) <= _M_THRESHOLD:
-        return _BK_SMALL_M
-    return _BK_LARGE_M_TMA if _tma_enabled() else _BK_LARGE_M_DEFAULT
+    bk = _BK_SMALL_M if _matmul_M(tile) <= _M_THRESHOLD else (_BK_LARGE_M_TMA if _tma_enabled() else _BK_LARGE_M_DEFAULT)
+    return _bk_fits_smem(tile, bk)
+
+
+# sm_120 hard cap is 48 KB static smem; 014c_pad_smem_banks adds +1
+# row of padding per stage to break 32-way bank conflicts, so reserve
+# ~4 KB of headroom for that swelling.
+_SMEM_BUDGET_BYTES = 44 * 1024
+_DTYPE_BYTES = 4
+
+
+def _bk_fits_smem(tile: Tile, bk: int) -> int:
+    """Halve BK until the (BN+BM)·BK·4·2 stage fits in 48 KB static
+    smem. Returns the largest BK ≥ 1 that fits."""
+    extents = _logical_output_extents(tile)
+    if len(extents) < 2:
+        return bk
+    bn_actual = min(extents[0], _int_env("DEPLODOCK_BN", _TILE_SHAPE[0]))
+    bm_actual = min(extents[1], _int_env("DEPLODOCK_BM", _TILE_SHAPE[1]))
+    while bk > 1 and (bn_actual + bm_actual) * bk * _DTYPE_BYTES * 2 > _SMEM_BUDGET_BYTES:
+        bk //= 2
+    return bk
 
 
 def cooperative_block_size() -> int:

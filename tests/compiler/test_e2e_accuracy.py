@@ -120,7 +120,11 @@ def test_e2e_matmul_blockify(run_graph):
     Tile-scope accumulator persisting across the K_o loop."""
     from deplodock.compiler.ir.frontend.ir import MatmulOp
 
-    M, N, K = 32, 32, 64  # all divisible by 16
+    # Sized to the production matmul tile (BN=128, BM=64): both axes
+    # ≥ tile so blockify actually splits each into BLOCK + THREAD
+    # rather than keeping the output extents whole and overflowing
+    # launch_bounds.
+    M, N, K = 128, 256, 64
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (M, K)), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (K, N)), node_id="b")
@@ -141,7 +145,7 @@ def test_e2e_matmul_blockify_rectangular(run_graph):
     independently and per-buffer cache axes derive correctly when M≠N."""
     from deplodock.compiler.ir.frontend.ir import MatmulOp
 
-    M, N, K = 64, 32, 128  # all divisible by 16; M·K, K·N non-square
+    M, N, K = 256, 128, 128  # rectangular; both axes ≥ matmul tile (BN=128, BM=64)
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (M, K)), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (K, N)), node_id="b")
