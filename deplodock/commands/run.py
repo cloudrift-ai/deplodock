@@ -298,12 +298,14 @@ def _run_ncu_profile(args):
     ]
     for s in sections:
         cmd.extend(["--section", s])
-    cmd.extend([
-        sys.executable,
-        "-m",
-        "deplodock.deplodock",
-        "run",
-    ])
+    cmd.extend(
+        [
+            sys.executable,
+            "-m",
+            "deplodock.deplodock",
+            "run",
+        ]
+    )
     if args.code is not None:
         cmd.extend(["--code", args.code])
     elif args.ir is not None:

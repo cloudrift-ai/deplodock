@@ -74,9 +74,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     # the ``ConstantOp``). Activation stages haven't been transposed and
     # don't match the asymmetric (BN, BM) tile's KN expectation — letting
     # TMA load them produces silently wrong outputs (e.g. SDPA Q/K/V).
-    tma_buf_ok = {
-        nid for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and node.op.transpose is not None
-    }
+    tma_buf_ok = {nid for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and node.op.transpose is not None}
     new_body = _maybe_rewrite(root.op.body, src_ranks, tma_buf_ok)
     if new_body is None:
         return None
@@ -110,7 +108,11 @@ def _process(body: Body, src_ranks: dict[str, int], tma_buf_ok: set[str], k_var:
     i = 0
     while i < len(body):
         s = body[i]
-        if isinstance(s, BufferedStage) and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage)) and _eligible(s, src_ranks, tma_buf_ok):
+        if (
+            isinstance(s, BufferedStage)
+            and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage))
+            and _eligible(s, src_ranks, tma_buf_ok)
+        ):
             new_body.append(
                 TmaBufferedStage(
                     name=s.name,

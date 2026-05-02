@@ -10,8 +10,10 @@ output axis).
 
 Activation:
 
-- ``DEPLODOCK_SPLITK`` env var > 1 — explicit user override (PR-2 scope).
-- Auto-heuristic based on grid utilization is intentionally deferred.
+- ``DEPLODOCK_SPLITK`` env var > 1 — explicit user override.
+- Otherwise, ``tuning.auto_splitk`` picks a value targeting ~3 waves
+  per SM. Returns 1 (and the pass skips) when the M-N grid already
+  fills the GPU.
 
 Refused when:
 
@@ -49,7 +51,6 @@ zeros allocations — see ``program.py``).
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
@@ -62,35 +63,31 @@ from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+from deplodock.compiler.tuning import auto_splitk
 
 PATTERN = [Pattern("root", TileOp)]
 
 
-def _splitk_env() -> int:
-    raw = os.environ.get("DEPLODOCK_SPLITK")
-    if not raw:
-        return 1
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 1
-
-
 def rewrite(graph: Graph, root: Node) -> Graph | None:
-    splitk = _splitk_env()
-    if splitk <= 1:
-        raise RuleSkipped("DEPLODOCK_SPLITK unset or <= 1")
-    new_body = _maybe_rewrite(root.op.body, splitk)
+    new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         return None
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 
 
-def _maybe_rewrite(body, splitk: int):
+def _maybe_rewrite(body):
     idx, tile = single_tile(body)
     if tile.block_axes:
         raise RuleSkipped("Tile already partitioned — must run before 005")
+
+    # Find the chunked matmul Loop to learn K_o.extent for the picker.
+    k_outer = next((s for s in tile.body if isinstance(s, Loop) and _is_chunked_matmul(s)), None)
+    if k_outer is None:
+        raise RuleSkipped("no chunked matmul Loop in tile body")
+    splitk = auto_splitk(tile, int(k_outer.axis.extent))
+    if splitk <= 1:
+        raise RuleSkipped(f"auto-picked splitK={splitk} (grid already fills the GPU or no useful split)")
 
     new_tile = _split_tile(tile, splitk)
     if new_tile is None:

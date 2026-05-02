@@ -45,7 +45,7 @@ _F_PER_AXIS = (8, 4)
 _M_THRESHOLD = 256
 _BK_SMALL_M = 64
 _BK_LARGE_M_DEFAULT = 16  # cp.async path
-_BK_LARGE_M_TMA = 32      # TMA path
+_BK_LARGE_M_TMA = 32  # TMA path
 
 
 # --- Helpers ------------------------------------------------------------
@@ -188,3 +188,48 @@ def _bk_fits_smem(tile: Tile, bk: int) -> int:
 
 def cooperative_block_size() -> int:
     return _int_env("DEPLODOCK_COOP_BLOCK", 256)
+
+
+# Cross-CTA split-K target. The matmul tile pegs occupancy at ~33%
+# (regs+smem cap blocks/SM at 2-3), so "1 wave of CTAs" only fills a
+# third of the SMSPs. Targeting 8 waves of CTAs effectively gives ~3
+# waves of warps, where the empirical perf elbow sits on TinyLlama
+# MLP shapes (sweep on k_linear_4_reduce and k_add_5_reduce: best
+# splitK ∈ {4, 8, 16}, regression past ~24 waves from atomic-add
+# contention).
+_SPLITK_TARGET_WAVES = 8
+_SPLITK_NUM_SMS = 170  # RTX 5090; conservative upper bound for sm_120
+
+
+def auto_splitk(tile: Tile, k_o_extent: int) -> int:
+    """Auto-pick a cross-CTA split-K factor for the given matmul Tile.
+
+    ``DEPLODOCK_SPLITK`` env wins when set. Otherwise: target
+    ``waves_target * num_sms`` total CTAs, divide by the current
+    M-N grid count, clamp to the largest divisor of ``k_o_extent``
+    that is ≤ the target. Returns 1 when no useful split exists."""
+    forced = _int_env("DEPLODOCK_SPLITK", 0)
+    if forced > 0:
+        return forced
+    if not _has_matmul_reduce(tile.body):
+        return 1
+    bn = _int_env("DEPLODOCK_BN", _TILE_SHAPE[0])
+    bm = _int_env("DEPLODOCK_BM", _TILE_SHAPE[1])
+    targets = (bn, bm)
+    grid = 1
+    extents = sorted([int(ba.axis.extent) for ba in tile.axes], reverse=True)
+    # Innermost-2 axes become the matmul tile dims; map them to (BN, BM).
+    # Outer axes go BLOCK whole (multiplying grid by their extents).
+    for i, ext in enumerate(extents):
+        if i < len(targets):
+            tgt = targets[i]
+            grid *= max(1, ext // tgt) if ext >= tgt else 1
+        else:
+            grid *= ext
+    target_total = _SPLITK_TARGET_WAVES * _SPLITK_NUM_SMS
+    if grid >= target_total:
+        return 1
+    desired = max(1, target_total // grid)
+    # Largest divisor of k_o_extent that is ≤ desired.
+    splitk = max((d for d in range(1, min(desired, k_o_extent) + 1) if k_o_extent % d == 0), default=1)
+    return splitk
