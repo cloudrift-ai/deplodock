@@ -17,10 +17,11 @@ Env vars:
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
   weight transpose (``004a_fold_constant_transpose``). Off by default
-  — TMA's descriptor encoder rejects source ranks > 5, which the SDPA
-  Q/K/V path produces; enabling globally regresses attention kernels.
-  Set ``DEPLODOCK_TMA=1`` for ``nn.Linear``-only models with
-  ``≥1024`` per-dim shapes.
+  — ``014a_tma_copy`` now gates on (rank ≤ 5, ConstantOp source with a
+  transpose perm), but SDPA matmul stages still produce wrong outputs
+  under TMA (K/V layout mismatch between the asymmetric tile and how
+  attention chains use the projections). Set ``DEPLODOCK_TMA=1`` for
+  ``nn.Linear``-only models with ``≥1024`` per-dim shapes.
 """
 
 from __future__ import annotations
