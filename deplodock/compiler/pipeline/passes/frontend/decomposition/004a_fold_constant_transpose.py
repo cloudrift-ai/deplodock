@@ -25,13 +25,12 @@ left to a second pass run since the engine reapplies rules to fixed
 point).
 """
 
-import os
-
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.frontend.ir import TransposeOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
+from deplodock.compiler.tuning import _tma_enabled
 
 PATTERN = [Pattern("root", TransposeOp)]
 
@@ -44,8 +43,8 @@ def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
     # passes (RoPE, SDPA, register-tile) don't expect; folding under
     # the TMA path is exactly what enables LDS.128 vectorization on
     # the asymmetric ``(BN, BM)`` tile shape (see ``tuning.py``).
-    if os.environ.get("DEPLODOCK_TMA") != "1":
-        raise RuleSkipped("DEPLODOCK_TMA != 1 — fold disabled")
+    if not _tma_enabled():
+        raise RuleSkipped("TMA disabled — fold not needed")
     if not isinstance(inp_x.op, ConstantOp):
         raise RuleSkipped("transpose input is not a ConstantOp")
     if inp_x.op.value is not None:

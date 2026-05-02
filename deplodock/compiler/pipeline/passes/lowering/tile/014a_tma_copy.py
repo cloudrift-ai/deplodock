@@ -31,7 +31,6 @@ Idempotence: a ``TmaBufferedStage`` is left alone.
 from __future__ import annotations
 
 import logging
-import os
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
@@ -58,12 +57,13 @@ _TMA_ALIGN_BYTES = 16
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
-    # Backend wiring (descriptor encoding, sm_90a compile flag, kernel-arg
-    # binding) lands incrementally — gate the whole pass behind an env
-    # var so the cp.async path remains the default until the TMA backend
-    # is end-to-end ready. Set ``DEPLODOCK_TMA=1`` to opt in.
-    if os.environ.get("DEPLODOCK_TMA") != "1":
-        raise RuleSkipped("TMA path disabled (set DEPLODOCK_TMA=1 to enable)")
+    # TMA is auto-enabled on sm_90+ (Hopper / Blackwell — the hardware
+    # that has ``cp.async.bulk.tensor``). ``DEPLODOCK_TMA=0`` forces
+    # the cp.async + ``+1`` padding baseline for A/B comparison.
+    from deplodock.compiler.tuning import _tma_enabled  # noqa: PLC0415
+
+    if not _tma_enabled():
+        raise RuleSkipped("TMA disabled (DEPLODOCK_TMA=0 or compute capability < sm_90)")
     if compute_capability() < _MIN_CAPABILITY:
         raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {compute_capability()}")
     new_body = _maybe_rewrite(root.op.body)

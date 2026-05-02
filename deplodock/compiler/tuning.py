@@ -275,13 +275,19 @@ _CUBLAS_TILE_SHAPE = (128, 64)
 _CUBLAS_F_PER_AXIS = (8, 4)  # (F_M, F_N) — M-axis F, N-axis F
 
 
-def _tma_cublas_layout() -> bool:
-    """The cuBLAS-style asymmetric layout is the only TMA path that
-    beats the cp.async + ``+1`` padding baseline on sm_120 fp32 SIMT
-    matmul. Enabling TMA without it lands on the swizzle / symmetric-
-    tile paths that we've measured at 2-5× slower. So the layout is
-    bound to ``DEPLODOCK_TMA=1`` itself rather than a separate flag."""
+def _tma_enabled() -> bool:
+    """TMA is the cuBLAS-beating SGEMM path on sm_90+ (Hopper /
+    Blackwell). Off by default — small matmuls (Linear(8, 4) test
+    fixtures) hit TMA's 16-byte global-address alignment requirement
+    and crash, and complex models (SDPA, RoPE) interact with the
+    weight pre-transpose in ways the current passes don't fully
+    handle. Set ``DEPLODOCK_TMA=1`` for nn.Linear-only models with
+    ``≥1024`` per-dim shapes."""
     return os.environ.get("DEPLODOCK_TMA") == "1"
+
+
+def _tma_cublas_layout() -> bool:
+    return _tma_enabled()
 
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
@@ -343,6 +349,13 @@ def forced_bk(tile: Tile | None = None) -> int | None:
             return int(raw)
         except ValueError:
             return None
+    # cuBLAS-style TMA path uses ``BM=64, BN=128`` cache extents — BK=32
+    # is the only choice that keeps both per-stage smem slabs (weight
+    # 128×32 = 16 KB, input 64×32 = 8 KB) under the per-stage budget
+    # *and* matches what the empirical sweep showed wins at every shape
+    # we tested (1024², 2048²: BK=32 < BK=16 < BK=64).
+    if tile is not None and _tma_cublas_layout() and _has_matmul_reduce(tile.body):
+        return 32
     if tile is not None:
         if _is_huge_matmul(tile):
             return _BK_HUGE
