@@ -158,6 +158,9 @@ def _serialize_field(v):
       ``_deserialize_field``'s list-of-Stmt-reprs path keeps working
       unchanged. ``LoopOp.__post_init__`` / ``TileOp.__post_init__``
       coerce the tuple back to Body on load.
+    - Nested ``Op`` instances (e.g. ``ConstantOp.load_ops``) →
+      ``{"__op__": ClassName, "fields": {...}}`` dicts; tuples/lists of
+      Ops recurse element-wise.
 
     Everything else passes through. ``_deserialize_field`` reverses
     this on load.
@@ -172,6 +175,13 @@ def _serialize_field(v):
         # JSON encodes element-by-element rather than via ``__repr__``
         # (which would produce a single ``"Body((...))"`` string).
         return tuple(v)
+    if isinstance(v, Op):
+        return {
+            "__op__": type(v).__name__,
+            "fields": {k: _serialize_field(x) for k, x in v.__dict__.items() if not k.startswith("_")},
+        }
+    if isinstance(v, (list, tuple)) and v and all(isinstance(x, Op) for x in v):
+        return [_serialize_field(x) for x in v]
     return v
 
 
@@ -179,14 +189,23 @@ def _deserialize_field(k, v):
     """Reverse of ``_serialize_field``: rehydrate the ``op`` field name
     back to ``ElementwiseImpl``, and eval Stmt-repr strings (produced by
     ``json.dumps(..., default=str)`` against dataclass Stmts) back into
-    Stmt instances. The eval scope mirrors the IR's ``__all__`` exports
-    — same classes the Stmt reprs reference."""
+    Stmt instances. Nested-op dicts (``{"__op__": ..., "fields": ...}``)
+    are reconstructed via ``_lookup_op_class``. The eval scope mirrors
+    the IR's ``__all__`` exports — same classes the Stmt reprs reference."""
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
 
     if k == "op" and isinstance(v, str):
         return ElementwiseImpl(v)
     if k == "body" and isinstance(v, list) and v and all(isinstance(e, str) for e in v):
         return tuple(_eval_stmt(e) for e in v)
+    if isinstance(v, dict) and "__op__" in v:
+        op_cls = _lookup_op_class(v["__op__"])
+        if op_cls is None:
+            raise ValueError(f"Unknown nested op class: {v['__op__']}")
+        fields = {fk: _deserialize_field(fk, fv) for fk, fv in v.get("fields", {}).items()}
+        return op_cls(**fields) if fields else op_cls()
+    if isinstance(v, list) and v and all(isinstance(e, dict) and "__op__" in e for e in v):
+        return tuple(_deserialize_field(k, e) for e in v)
     if isinstance(v, list):
         return tuple(v)
     return v

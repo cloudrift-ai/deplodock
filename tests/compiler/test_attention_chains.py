@@ -58,6 +58,8 @@ def _run_module_on_cuda(module: torch.nn.Module, inputs_by_name: dict[str, np.nd
         if nid in input_set and nid in inputs_by_name:
             feed[nid] = inputs_by_name[nid]
         elif isinstance(node.op, ConstantOp):
+            from deplodock.compiler.loader.binder import apply_load_ops
+
             n = 1
             for d in node.output.shape:
                 n *= int(d)
@@ -68,9 +70,7 @@ def _run_module_on_cuda(module: torch.nn.Module, inputs_by_name: dict[str, np.nd
                 # even when the graph node id changes).
                 if safe_key.endswith(node.op.name[2:]) and p.numel() == n:
                     arr = p.detach().cpu().numpy()
-                    if node.op.transpose is not None:
-                        arr = arr.transpose(*node.op.transpose).copy()
-                    feed[nid] = arr
+                    feed[nid] = apply_load_ops(arr, node.op.load_ops)
                     break
             if nid not in feed and node.op.value is not None:
                 feed[nid] = np.array([node.op.value], dtype=np.float32)
