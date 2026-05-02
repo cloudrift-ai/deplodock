@@ -250,21 +250,39 @@ def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
     """Per-axis THREAD-tile widths ``005_blockify_launch`` should emit,
     innermost-first. ``(BN=128, BM=64)`` for the asymmetric TMA path,
     ``(PAT, PAT)`` for symmetric matmul, ``(thread_budget,)`` for
-    non-matmul kernels."""
+    non-matmul kernels.
+
+    Env overrides for sweeps: ``DEPLODOCK_BN`` and ``DEPLODOCK_BM``
+    replace the asymmetric tile dims (innermost N then outer M)."""
     if _use_asymmetric(tile):
-        return _ASYM_TILE_SHAPE
+        return _asym_tile_shape_env_override()
     if tile is not None and _has_matmul_reduce(tile.body):
         return (_predicted_pat(tile), _predicted_pat(tile))
     return (thread_budget(),)
+
+
+def _asym_tile_shape_env_override() -> tuple[int, int]:
+    bn = _int_env("DEPLODOCK_BN", _ASYM_TILE_SHAPE[0])
+    bm = _int_env("DEPLODOCK_BM", _ASYM_TILE_SHAPE[1])
+    return (bn, bm)
+
+
+def _asym_f_per_axis_env_override() -> tuple[int, int]:
+    f_m = _int_env("DEPLODOCK_FM", _ASYM_F_PER_AXIS[0])
+    f_n = _int_env("DEPLODOCK_FN", _ASYM_F_PER_AXIS[1])
+    return (f_m, f_n)
 
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
     """Per-thread output tile ``(F_M, F_N)``. Asymmetric ``(8, 4)`` for
     the TMA-eligible big-matmul path, symmetric ``(F, F)`` for
     fallback. Returns ``(1, 1)`` to skip register tiling on small
-    matmuls and non-matmul bodies."""
+    matmuls and non-matmul bodies.
+
+    Env overrides for sweeps: ``DEPLODOCK_FM`` / ``DEPLODOCK_FN``
+    replace the asymmetric per-thread cell dims."""
     if _use_asymmetric(tile):
-        return _ASYM_F_PER_AXIS
+        return _asym_f_per_axis_env_override()
     if tile is None:
         return (1, 1)
     if not _has_matmul_reduce(tile.body):
