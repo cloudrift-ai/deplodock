@@ -69,7 +69,7 @@ from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
-from deplodock.compiler.tuning import detect_pat, register_tile_factor
+from deplodock.compiler.tuning import detect_pat, register_tile_factor, register_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -85,29 +85,40 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
 
-    # ``detect_pat`` reads whichever PAT 005_blockify_launch landed on
-    # by inspecting THREAD axis extents; ``register_tile_factor`` pairs
-    # F with that PAT through the centralized table in ``tuning``.
-    pat = detect_pat(tile)
-    if pat is None:
-        raise RuleSkipped("detect_pat returned None — Tile axes don't match a known PAT")
-    factor = register_tile_factor(tile)
-    if factor <= 1 or pat % factor != 0:
-        raise RuleSkipped(f"register-tile factor F={factor} disabled or doesn't divide PAT={pat}")
-
-    target_axes = [ba.axis.name for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == pat]
-    if len(target_axes) != 2:
-        raise RuleSkipped(f"need exactly 2 THREAD axes with extent {pat}, found {len(target_axes)}")
-
-    # Profitability gate: register tiling pays off when ≥2 reduce-Loop bodies
-    # share operand Loads across the M / N axes (matmul-shape reuse —
-    # F² FMAs amortize each smem-load round-trip). Without that signature
-    # the rewrite F²-replicates work for no reuse benefit; skip rather
-    # than regress pointwise / reduce-only kernels.
+    # Profitability gate first — register tiling only helps matmul-shape
+    # bodies (≥2 reduce-Loops sharing operand Loads across M / N).
     if not any(is_matmul_reduce(s) for s in tile.body.iter() if isinstance(s, Loop)):
         raise RuleSkipped("no matmul-shaped reduce in the Tile body — register tiling unprofitable")
 
-    rewritten = _register_tile(tile, target_axes[0], target_axes[1], factor)
+    f_m, f_n = register_tile_shape(tile)
+    if f_m == f_n:
+        # Symmetric path: pair F with the PAT 005 emitted via the legacy
+        # detect_pat / register_tile_factor flow. Two THREAD axes both
+        # extent=PAT must exist; F must divide PAT.
+        pat = detect_pat(tile)
+        if pat is None:
+            raise RuleSkipped("detect_pat returned None — Tile axes don't match a known PAT")
+        factor = register_tile_factor(tile)
+        if factor <= 1 or pat % factor != 0:
+            raise RuleSkipped(f"register-tile factor F={factor} disabled or doesn't divide PAT={pat}")
+        target_axes = [ba.axis.name for ba in tile.axes if ba.bind == BIND_THREAD and int(ba.axis.extent) == pat]
+        if len(target_axes) != 2:
+            raise RuleSkipped(f"need exactly 2 THREAD axes with extent {pat}, found {len(target_axes)}")
+        rewritten = _register_tile(tile, target_axes[0], target_axes[1], factor, factor)
+    else:
+        # Asymmetric (cuBLAS-style) path: 005 emitted ``(BN, BM)`` thread
+        # axes innermost-first. Identify M (the smaller-extent THREAD
+        # axis) vs N (larger-extent), split each by its own factor.
+        thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
+        if len(thread_axes) != 2:
+            raise RuleSkipped(f"asymmetric register-tile needs exactly 2 THREAD axes, found {len(thread_axes)}")
+        # Sort by extent: smaller is M, larger is N (cuBLAS convention BM=64 < BN=128).
+        sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
+        m_axis_name, n_axis_name = sorted_ba[0].axis.name, sorted_ba[1].axis.name
+        m_ext, n_ext = int(sorted_ba[0].axis.extent), int(sorted_ba[1].axis.extent)
+        if m_ext % f_m != 0 or n_ext % f_n != 0:
+            raise RuleSkipped(f"asymmetric F=({f_m},{f_n}) must divide ({m_ext},{n_ext})")
+        rewritten = _register_tile(tile, m_axis_name, n_axis_name, f_m, f_n)
     if rewritten is None:
         raise RuleSkipped("_register_tile bailed (unsupported shape)")
     return body[:idx] + (rewritten,) + body[idx + 1 :]
@@ -129,23 +140,16 @@ def _split_axis(axes: tuple[BoundAxis, ...], target: str, factor: int) -> tuple[
     return tuple(new_axes), outer
 
 
-def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor: int) -> Tile | None:
-    """Register-tile by composing two per-axis F× replications.
+def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor_m: int, factor_n: int) -> Tile | None:
+    """Register-tile by composing two per-axis replications, ``factor_m``
+    on the M-axis and ``factor_n`` on the N-axis. Symmetric mode passes
+    ``factor_m == factor_n``; asymmetric (cuBLAS-style) passes them
+    independently (e.g. ``F_M=8, F_N=4``)."""
+    new_axes, m_o = _split_axis(tile.axes, m_axis, factor_m)
+    new_axes, n_o = _split_axis(new_axes, n_axis, factor_n)
 
-    Each :func:`replicate_along_axis` pass walks the body, determines per
-    stmt whether its value transitively depends on the pass's axis (via
-    :meth:`Body.fold` over the def-use DAG with a bound-axis filter),
-    emits ``factor`` σ-substituted copies for axis-dependent stmts, and
-    leaves axis-independent stmts singleton. Composing the two passes
-    gives F replicas for stmts depending on a single thread-axis and
-    F² for stmts depending on both — same outcome as the previous
-    one-shot ``CellRewriter`` flow, derived from per-stmt dependency
-    analysis instead of a region-by-region cell-axes policy."""
-    new_axes, m_o = _split_axis(tile.axes, m_axis, factor)
-    new_axes, n_o = _split_axis(new_axes, n_axis, factor)
-
-    body = replicate_along_axis(tile.body, m_axis, factor, m_o)
-    body = replicate_along_axis(body, n_axis, factor, n_o)
+    body = replicate_along_axis(tile.body, m_axis, factor_m, m_o)
+    body = replicate_along_axis(body, n_axis, factor_n, n_o)
     return Tile(axes=new_axes, body=body)
 
 

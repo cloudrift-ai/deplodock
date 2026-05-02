@@ -239,13 +239,44 @@ def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
     N. After ``008_register_tile`` splits each by F, the post-register-
     tile layout is ``(PAT/F, PAT/F) = (16, 16) = thread_budget``.
 
+    With ``DEPLODOCK_TMA_CUBLAS=1``: matmul returns the asymmetric
+    ``(BN, BM)`` shape that matches the cuBLAS-beating layout from
+    ``feature/mini-gpu-compiler/tma_db`` — innermost N=128 (32 threads ×
+    tn=4), outer M=64 (8 threads × tm=8). Block dim becomes (32, 8),
+    each warp shares one M row → A-load broadcasts (no conflict);
+    threads stride consecutive N cols → B-load vectorizes to LDS.128
+    (no conflict). No swizzle needed.
+
     Non-matmul kernels: ``(thread_budget,)`` — a single fat thread axis
     for the innermost parallel dim (RMSNorm-row, pointwise-flat, …).
     """
     if tile is not None and _has_matmul_reduce(tile.body):
+        if _tma_cublas_layout():
+            return _CUBLAS_TILE_SHAPE  # (BN, BM) innermost-first
         pat = per_axis_threads(tile)
         return (pat, pat)
     return (thread_budget(),)
+
+
+# cuBLAS-style tile shape: per-CTA BM=64, BN=128. After 008 register-tile
+# split by F_M=8 / F_N=4: post-split THREAD axes (32, 8) = 256 threads,
+# per-thread 8×4 = 32 output cells. Validated against feature/mini-gpu-
+# compiler tma_db at 105% of cuBLAS on 2048² fp32 RTX 5090.
+_CUBLAS_TILE_SHAPE = (128, 64)
+_CUBLAS_F_PER_AXIS = (8, 4)  # (F_M, F_N) — M-axis F, N-axis F
+
+
+def _tma_cublas_layout() -> bool:
+    return os.environ.get("DEPLODOCK_TMA_CUBLAS") == "1"
+
+
+def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
+    """Per-thread output tile as ``(F_M, F_N)``. Asymmetric in the
+    cuBLAS-style mode; symmetric ``(F, F)`` otherwise."""
+    if _tma_cublas_layout() and tile is not None and _has_matmul_reduce(tile.body):
+        return _CUBLAS_F_PER_AXIS
+    f = register_tile_factor(tile)
+    return (f, f)
 
 
 def detect_pat(tile: Tile) -> int | None:
