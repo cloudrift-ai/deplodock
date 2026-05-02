@@ -49,8 +49,25 @@ _ASYM_TILE_SHAPE = (128, 64)
 # Per-thread output cells (F_M, F_N). Post-008 split, THREAD axes are
 # (BN/F_N, BM/F_M) = (32, 8) = 256 threads/CTA.
 _ASYM_F_PER_AXIS = (8, 4)
-# Per-stage K-tile. Empirical sweep wins at every tested shape.
-_ASYM_BK = 32
+# Per-stage K-tile, M-adaptive. Sweep on TinyLlama Q/Gate/Down
+# projections at seq ∈ {32, 128, 512} on RTX 5090 fp32:
+#
+#   M ≤ 128: BK=64 wins everywhere (default 67-178us, TMA 55-135us)
+#   M = 512:
+#     - default: BK=16 wins universally (207us Q, 415us Gate, 551us Down)
+#       BK=64 catastrophically slow (866-2242us) — likely smem overflow
+#       at the BIG-tier PAT=64 shape.
+#     - TMA: BK=32 wins for Q (104us) and Down (303us);
+#       Gate seq=512 wins at BK=16 (246us) but BK=32 close (253us).
+#
+# Threshold at M ≤ 256 (cuts cleanly between Q-128 / Q-512). Q-32
+# TMA is the one suboptimal corner (heuristic picks BK=64=111us;
+# best is BK=16=56us) — small K + small M + small N means TMA
+# overhead doesn't amortize.
+_ASYM_M_THRESHOLD = 256
+_ASYM_BK_SMALL_M = 64
+_ASYM_BK_LARGE_M_DEFAULT = 16  # cp.async path, M > 256
+_ASYM_BK_LARGE_M_TMA = 32  # TMA path, M > 256
 
 
 # --- Symmetric (cp.async fallback) tier thresholds ----------------------
@@ -74,13 +91,9 @@ _PAT_BIG = 64
 _PAT_HUGE = 128
 _PAT_TO_FACTOR = {32: 2, 64: 4, 128: 8}
 
-# Symmetric BK selection.
+# HUGE-tier BK (PAT=128 path — keeps stage smem under the 48 KB cap
+# at the larger tile shape).
 _BK_HUGE = 16
-_BIG_K_LARGE = 8192
-# Empirical sweep on this branch: 1024² (M·N = 1M) cp.async wins at
-# BK=32 (62us) over BK=16 (78us). 2048² (M·N = 4M) wins at BK=16
-# (429us) over BK=32 (506us). Threshold sits between — 2M splits cleanly.
-_BIG_MN_OVERSATURATED = 2_000_000
 
 
 # --- Helpers ------------------------------------------------------------
@@ -161,42 +174,26 @@ def _is_huge_matmul(tile: Tile) -> bool:
     return m >= _HUGE_MATMUL_M_MIN and n >= _HUGE_MATMUL_N_MIN and m * n >= _HUGE_MATMUL_MN_MIN
 
 
-def _matmul_K(stmts) -> int | None:
-    """Total K extent of the first matmul-shaped reduce loop in ``stmts``."""
-    from deplodock.compiler.ir.stmt import Load, Loop
-    from deplodock.compiler.ir.stmt.body import Body
-
-    for s in Body.coerce(stmts).iter():
-        if not isinstance(s, Loop):
-            continue
-        if s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2:
-            return int(s.axis.extent)
-        if (
-            not s.is_reduce
-            and len(s.body) == 1
-            and isinstance(s.body[0], Loop)
-            and s.body[0].is_reduce
-            and len({ld.input for ld in s.body[0].body.of_type(Load)}) >= 2
-        ):
-            return int(s.axis.extent) * int(s.body[0].axis.extent)
-    return None
-
-
-def _parallel_output(tile: Tile) -> int:
-    n = 1
-    for ba in tile.axes:
-        n *= int(ba.axis.extent)
-    return n
+def _matmul_M(tile: Tile) -> int:
+    """The matmul's M extent — the smaller of the two largest output
+    axes. By convention output[M, N] has M=batch×seq (small at
+    inference, large at training) and N=hidden (large)."""
+    extents = _logical_output_extents(tile)
+    return extents[1] if len(extents) >= 2 else 0
 
 
 def _pick_big_bk(tile: Tile) -> int:
-    """Shape-aware BK for big-matmul (symmetric) tiles."""
-    K = _matmul_K(tile.body)
-    if K is not None and K >= _BIG_K_LARGE:
-        return 32
-    if _parallel_output(tile) >= _BIG_MN_OVERSATURATED:
-        return 16
-    return 32
+    """BK for the symmetric (cp.async) big-matmul path."""
+    if _matmul_M(tile) <= _ASYM_M_THRESHOLD:
+        return _ASYM_BK_SMALL_M  # 64 — LLM inference shape
+    return _ASYM_BK_LARGE_M_DEFAULT  # 16 — square training shape
+
+
+def _pick_asym_bk(tile: Tile) -> int:
+    """BK for the asymmetric (TMA) path."""
+    if _matmul_M(tile) <= _ASYM_M_THRESHOLD:
+        return _ASYM_BK_SMALL_M  # 64 — LLM inference shape
+    return _ASYM_BK_LARGE_M_TMA  # 32 — square / training shape
 
 
 def _is_thread_axis(ba) -> bool:
@@ -299,7 +296,7 @@ def forced_bk(tile: Tile | None = None) -> int | None:
     if tile is None or not _has_matmul_reduce(tile.body):
         return None
     if _use_asymmetric(tile):
-        return _ASYM_BK
+        return _pick_asym_bk(tile)
     if _is_huge_matmul(tile):
         return _BK_HUGE
     if _is_big_matmul(tile):
