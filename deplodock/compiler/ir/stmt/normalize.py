@@ -367,7 +367,7 @@ def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
     if isinstance(stmt, Select):
         return Select(stmt.name, tuple(SelectBranch(b.value, b.select.simplify(ctx)) for b in stmt.branches))
     if isinstance(stmt, Write):
-        return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value)
+        return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value, reduce_op=stmt.reduce_op)
     if isinstance(stmt, Load):
         return Load(stmt.name, stmt.input, _simplify_expr_tuple(stmt.index, ctx))
     # Tile-IR-only ``Stage`` (+ BufferedStage / AsyncBufferedStage /
