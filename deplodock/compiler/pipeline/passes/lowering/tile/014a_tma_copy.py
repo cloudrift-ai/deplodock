@@ -69,28 +69,35 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     from deplodock.compiler.ir.base import ConstantOp  # noqa: PLC0415
 
     src_ranks = {nid: len(node.output.shape) for nid, node in graph.nodes.items()}
+    src_shapes = {nid: tuple(int(d) for d in node.output.shape) for nid, node in graph.nodes.items()}
     # TMA only fires on stages reading from a transposed weight constant
     # (``004a_fold_into_constant`` recorded a ``TransposeOp`` in the
     # ``ConstantOp.load_ops`` chain). Activation stages have empty chains
     # and don't match the asymmetric (BN, BM) tile's KN expectation —
     # letting TMA load them produces silently wrong outputs (e.g. SDPA Q/K/V).
     tma_buf_ok = {nid for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and bool(node.op.load_ops)}
-    new_body = _maybe_rewrite(root.op.body, src_ranks, tma_buf_ok)
+    new_body = _maybe_rewrite(root.op.body, src_ranks, src_shapes, tma_buf_ok)
     if new_body is None:
         return None
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 
 
-def _maybe_rewrite(body: Body, src_ranks: dict[str, int], tma_buf_ok: set[str]) -> Body | None:
+def _maybe_rewrite(body: Body, src_ranks: dict[str, int], src_shapes: dict[str, tuple[int, ...]], tma_buf_ok: set[str]) -> Body | None:
     idx, tile = single_tile(body)
-    new_tile_body = _process(tile.body, src_ranks, tma_buf_ok)
+    new_tile_body = _process(tile.body, src_ranks, src_shapes, tma_buf_ok)
     if new_tile_body is tile.body or new_tile_body == tile.body:
         raise RuleSkipped("no BufferedStage eligible for TMA")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process(body: Body, src_ranks: dict[str, int], tma_buf_ok: set[str], k_var: str | None = None) -> Body:
+def _process(
+    body: Body,
+    src_ranks: dict[str, int],
+    src_shapes: dict[str, tuple[int, ...]],
+    tma_buf_ok: set[str],
+    k_var: str | None = None,
+) -> Body:
     """Walk a body. Narrow eligible ``BufferedStage`` to ``TmaBufferedStage``,
     inserting a trailing ``AsyncWait`` so consumers see the loaded slab.
     Recurse into free Loops so Stages inside the K-outer chunk loop are
@@ -111,7 +118,7 @@ def _process(body: Body, src_ranks: dict[str, int], tma_buf_ok: set[str], k_var:
         if (
             isinstance(s, BufferedStage)
             and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage))
-            and _eligible(s, src_ranks, tma_buf_ok)
+            and _eligible(s, src_ranks, src_shapes, tma_buf_ok)
         ):
             new_body.append(
                 TmaBufferedStage(
@@ -139,7 +146,7 @@ def _process(body: Body, src_ranks: dict[str, int], tma_buf_ok: set[str], k_var:
                 new_body.append(_tma_async_wait(pending_wait[0], k_var))
                 pending_wait = ()
             if isinstance(s, Loop):
-                inner = _process(s.body, src_ranks, tma_buf_ok, k_var=s.axis.name)
+                inner = _process(s.body, src_ranks, src_shapes, tma_buf_ok, k_var=s.axis.name)
                 if inner is not s.body and inner != s.body:
                     new_body.append(Loop(axis=s.axis, body=inner, unroll=s.unroll))
                     changed = True
@@ -169,7 +176,7 @@ def _tma_async_wait(stage: BufferedStage, k_var: str | None) -> AsyncWait:
     return AsyncWait(keep=0, phase=phase, slot=slot)
 
 
-def _eligible(stage: BufferedStage, src_ranks: dict[str, int], tma_buf_ok: set[str]) -> bool:
+def _eligible(stage: BufferedStage, src_ranks: dict[str, int], src_shapes: dict[str, tuple[int, ...]], tma_buf_ok: set[str]) -> bool:
     if not isinstance(stage.addressing, AffineAddressing):
         return False
     if len(stage.axes) > _MAX_RANK or not stage.axes:
@@ -195,5 +202,25 @@ def _eligible(stage: BufferedStage, src_ranks: dict[str, int], tma_buf_ok: set[s
         return False
     inner_extent = int(stage.axes[-1].extent)
     if (inner_extent * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
+        return False
+    # CUDA TMA additionally requires the SOURCE's innermost-dim stride
+    # (= source inner-dim extent × elemSize) and globalDim[0] × elemSize
+    # to be 16-byte multiples. Our 016c smem-pad pass and the asymmetric
+    # tile assume the source row stride is a clean multiple of the box
+    # inner extent in bytes; for tiny matmuls (e.g. innermost=4 elem at
+    # fp32 = exactly 16 B) the descriptor encodes successfully but the
+    # generated kernel hits ``CUDA_ERROR_MISALIGNED_ADDRESS`` at the
+    # ``cp.async.bulk.tensor`` site. Require both inner extents (box
+    # and source) to be strict multiples of ``_TMA_ALIGN_BYTES`` AND the
+    # source inner extent to be at least one full alignment quantum
+    # past the box — i.e. the source must offer headroom beyond a single
+    # box load.
+    src_shape = src_shapes.get(stage.buf)
+    if src_shape is None or not src_shape:
+        return False
+    src_inner = int(src_shape[-1])
+    if (src_inner * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
+        return False
+    if src_inner < inner_extent * 2:
         return False
     return True
