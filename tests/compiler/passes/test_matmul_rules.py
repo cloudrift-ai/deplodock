@@ -19,10 +19,11 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
 
 
-# Need M*N > thread_budget (256) so blockify_launch actually splits axes
-# into BLOCK; need K > BK (smallest candidate is 2) and K % BK == 0 so
-# split_matmul_k fires. M=N=K=32 satisfies both: 32*32=1024 > 256, BK=16.
-_M, _K, _N = 64, 64, 64  # 2× PAT_DEFAULT so blockify splits each thread axis
+# M and N must each exceed the per-axis matmul tile widths from
+# ``tuning.thread_tile_shape`` so blockify_launch actually splits each
+# axis into BLOCK + THREAD. Defaults are (BN=128, BM=64); pick 256²
+# to leave headroom on both. K > BK so split_matmul_k fires.
+_M, _K, _N = 256, 64, 256
 
 
 def _make_plain_matmul() -> Graph:

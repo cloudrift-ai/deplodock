@@ -61,23 +61,24 @@ The pass:
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis
-from deplodock.compiler.ir.expr import affine_form
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, Stage, TileOp
+from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, BufferedStage, Stage, TileOp, TmaBufferedStage
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
+    load_thread_axis_coeffs,
+    loads_reading,
+    max_bank_conflict,
+    single_tile,
+)
 
 logger = logging.getLogger(__name__)
 
 PATTERN = [Pattern("root", TileOp)]
 
-WARP_SIZE = 32
-BANKS = 32  # 32 banks of 4 bytes
 # Per-Stage padded-slab budget. The static-smem cap on consumer Ada/Hopper
 # is 48 KB. Stages get double-buffered downstream (×2) and typical matmul
 # kernels have ≥ 2 sibling Stages, so per-Stage pre-DB budget is roughly
@@ -115,8 +116,13 @@ def _process_body(body: Body, thread_axes: tuple[Axis, ...]) -> Body:
     new_body: list[Stmt] = list(body)
     changed = False
     for i, s in enumerate(body):
-        if isinstance(s, Stage) and not (s.pad and any(s.pad)):
-            loads = _loads_reading(body, s.name)
+        # Skip TmaBufferedStage: TMA box copies write rows back-to-back at
+        # the cache extent and use hardware swizzling for bank avoidance,
+        # so ``+1`` padding would mis-align body Loads' stride with the
+        # box write. The TmaBufferedStage class also asserts ``pad`` is
+        # empty.
+        if isinstance(s, Stage) and not isinstance(s, TmaBufferedStage) and not (s.pad and any(s.pad)):
+            loads = loads_reading(body, s.name)
             if not loads:
                 continue
             updated = _try_fix(s, loads, thread_axes)
@@ -131,29 +137,24 @@ def _process_body(body: Body, thread_axes: tuple[Axis, ...]) -> Body:
     return tuple(new_body) if changed else body
 
 
-def _loads_reading(body: Body, stage_name: str) -> list[Load]:
-    """Collect every Load anywhere in ``body`` reading from ``stage_name``."""
-    return [s for s in body.iter() if isinstance(s, Load) and s.input == stage_name]
-
-
-def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> Stage | None:
+def _try_fix(stage: Stage, loads, thread_axes: tuple[Axis, ...]) -> Stage | None:
     n = len(stage.axes)
     base_extents = tuple(int(ax.extent) for ax in stage.axes)
 
-    # Precompute per-Load affine coefficients of the index over thread-axis vars.
-    # Bail conservatively if any Load is non-affine in those vars.
-    thread_var_set = frozenset(ax.name for ax in thread_axes)
-    per_load_coeffs: list[list[dict[str, int]]] = []
-    for load in loads:
-        if len(load.index) != n:
-            return None
-        forms = [affine_form(e, thread_var_set) for e in load.index]
-        if any(f is None for f in forms):
-            return None
-        per_load_coeffs.append([coeffs for _, coeffs in forms if (_, coeffs) is not None])  # type: ignore[misc]
+    # Body Loads on a ``BufferedStage`` carry an extra leading phase index
+    # added by ``013_double_buffer``; strip it for the analysis. Phase is
+    # uniform across threads, so it doesn't affect bank distribution.
+    per_load_coeffs = load_thread_axis_coeffs(
+        loads,
+        n,
+        thread_axes,
+        leading_phase_dim=isinstance(stage, BufferedStage),
+    )
+    if per_load_coeffs is None:
+        return None
 
     no_pad = (0,) * n
-    base_conflict = _max_conflict(per_load_coeffs, base_extents, thread_axes)
+    base_conflict = max_bank_conflict(per_load_coeffs, base_extents, thread_axes)
     if base_conflict <= 1:
         return None
 
@@ -183,7 +184,7 @@ def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> 
             slab_bytes *= e
         if slab_bytes > _MAX_PADDED_SLAB_BYTES:
             continue
-        c = _max_conflict(per_load_coeffs, padded, thread_axes)
+        c = max_bank_conflict(per_load_coeffs, padded, thread_axes)
         if c <= 1:
             n_pad_dims = sum(1 for p in pad if p)
             logger.info(
@@ -209,50 +210,3 @@ def _try_fix(stage: Stage, loads: list[Load], thread_axes: tuple[Axis, ...]) -> 
         return dc_replace(stage, pad=best_pad)
     logger.warning("Stage %s: %d-way bank conflict; no padding fix found", stage.name, base_conflict)
     return None
-
-
-def _max_conflict(
-    per_load_coeffs: list[list[dict[str, int]]],
-    padded_extents: tuple[int, ...],
-    thread_axes: tuple[Axis, ...],
-) -> int:
-    """Worst-case max-way bank conflict across all body Loads.
-
-    For each Load, the flat smem address is an affine function of the
-    thread-axis Vars: ``flat = warp_const + sum_v S_v * tid_v`` where
-    ``S_v = sum_d coeff_v_d * stride[d]``. The constant warp-uniform
-    part shifts every thread's address by the same amount and doesn't
-    affect the bank distribution, so we drop it. We then enumerate the
-    32 warp lanes, decode each lane's ``tid_v`` per
-    ``materialize_tile``'s flatten scheme, compute ``flat_v % 32``, and
-    count distinct addresses per bank (broadcasts don't count)."""
-    strides = _strides(padded_extents)
-    max_way = 1
-    for coeffs_per_dim in per_load_coeffs:
-        # Per-thread-axis contribution to the flat address.
-        contrib: dict[str, int] = defaultdict(int)
-        for d, coeffs in enumerate(coeffs_per_dim):
-            for ax_name, c in coeffs.items():
-                contrib[ax_name] += c * strides[d]
-
-        bank_to_addrs: dict[int, set[int]] = defaultdict(set)
-        for tid in range(WARP_SIZE):
-            flat = 0
-            rem = tid
-            for ax in reversed(thread_axes):
-                ext = int(ax.extent)
-                flat += contrib.get(ax.name, 0) * (rem % ext)
-                rem //= ext
-            bank_to_addrs[flat % BANKS].add(flat)
-        way = max((len(s) for s in bank_to_addrs.values()), default=1)
-        max_way = max(max_way, way)
-    return max_way
-
-
-def _strides(padded_extents: tuple[int, ...]) -> list[int]:
-    strides: list[int] = []
-    cur = 1
-    for e in reversed(padded_extents):
-        strides.insert(0, cur)
-        cur *= e
-    return strides

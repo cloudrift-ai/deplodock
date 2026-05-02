@@ -51,10 +51,10 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, AsyncWait, TileOp
+from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, AsyncWait, BufferedStage, TileOp, TmaBufferedStage
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
 
@@ -108,7 +108,7 @@ def _eligible(loop: Loop) -> bool:
     def gate(k_outer: Loop, k_inner: Loop) -> bool:
         if int(k_outer.axis.extent) < 2:
             return False
-        stages = [s for s in k_outer.body if isinstance(s, AsyncBufferedStage)]
+        stages = [s for s in k_outer.body if isinstance(s, (AsyncBufferedStage, TmaBufferedStage))]
         # Restrict to ≥ 2 Stages (the matmul-shape case). Single-stage
         # kernels — typically a Stage + a separate non-staged DRAM Load
         # in the reduce body (e.g. ``k_add_3`` with the SDPA-reduce
@@ -135,19 +135,41 @@ def _pipeline(loop: Loop) -> list[Stmt] | None:
     k_var = loop.axis.name
     # Drop synchronous-style ``AsyncWait`` stmts inserted by 014; the
     # pipelined schedule re-emits its own waits at the correct positions.
-    stages = [s for s in loop.body if isinstance(s, AsyncBufferedStage)]
-    others = [s for s in loop.body if not isinstance(s, (AsyncBufferedStage, AsyncWait))]
+    stages = [s for s in loop.body if isinstance(s, (AsyncBufferedStage, TmaBufferedStage))]
+    others = [s for s in loop.body if not isinstance(s, (AsyncBufferedStage, TmaBufferedStage, AsyncWait))]
 
     sigma_first = Sigma({k_var: Literal(0, "int")})
     sigma_next = Sigma({k_var: Var(k_var) + Literal(1, "int")})
     sigma_last = Sigma({k_var: Literal(n_chunks - 1, "int")})
 
-    def transform_stage(stage: AsyncBufferedStage, sigma: Sigma) -> AsyncBufferedStage:
+    def transform_stage(stage: BufferedStage, sigma: Sigma) -> BufferedStage:
         return stage.rewrite(_id, sigma)  # type: ignore[return-value]
 
     prologue: list[Stmt] = [transform_stage(s, sigma_first) for s in stages]
 
     body_stages = [transform_stage(s, sigma_next) for s in stages]
+    # TMA waits need the consumer-side ring-buffer phase (the slot we're
+    # about to read), distinct from the issuance-time phase the stage was
+    # rewritten with by ``sigma_next``. cp.async stages don't use ``phase``
+    # — their waits lower to ``CpAsyncWait(keep)+Sync``. Carry phase only
+    # when any TMA stage is present so cp.async paths stay unchanged.
+    has_tma = any(isinstance(s, TmaBufferedStage) for s in stages)
+    buffer_count = stages[0].buffer_count if stages else 2
+    body_phase: Expr | None = None
+    epi_phase: Expr | None = None
+    body_slot: Expr | None = None
+    epi_slot: Expr | None = None
+    if has_tma:
+        # Per-slot mbarrier semantics: each ring slot has its own mbar that
+        # alternates parity 0,1,0,1... over its successive uses. At iter k,
+        # the consumer reads slot ``k % buffer_count`` and that slot has
+        # been used ``k / buffer_count`` times before, so the parity to
+        # test is ``(k / buffer_count) % 2``.
+        body_slot = Var(k_var) % Literal(buffer_count, "int")
+        body_phase = (Var(k_var) / Literal(buffer_count, "int")) % Literal(2, "int")
+        last_k = n_chunks - 1
+        epi_slot = Literal(last_k % buffer_count, "int")
+        epi_phase = Literal((last_k // buffer_count) % 2, "int")
     # Each AsyncBufferedStage commits its own group. Per iter we issue
     # ``len(stages)`` commits. The steady-state wait must leave exactly
     # the just-issued chunk's groups in flight: compute on chunk N waits
@@ -156,10 +178,26 @@ def _pipeline(loop: Loop) -> list[Stmt] | None:
     # the wait remains correct after structural rewrites such as
     # unrolling a 1-iter steady-state loop (which would otherwise merge
     # prologue + body commits into the same scope).
-    main_body = (*body_stages, AsyncWait(keep=len(stages)), *others)
+    if has_tma:
+        # TMA pipelining requires WAIT-then-PREFETCH ordering: each iter
+        # waits on the slot it's about to consume (filled in a prior
+        # iteration / prologue), consumes, then prefetches the next slot
+        # for a future iteration. This matches the standard NVIDIA
+        # mbarrier-based ring buffer pattern. Issuing prefetch before
+        # wait would arrive on a slot's mbarrier whose previous tx may
+        # not yet be drained (the consumer hasn't waited), causing
+        # non-deterministic data-race-style failures observed under
+        # heavy K-loop pipelining.
+        main_body = (
+            AsyncWait(keep=len(stages), phase=body_phase, slot=body_slot),
+            *others,
+            *body_stages,
+        )
+    else:
+        main_body = (*body_stages, AsyncWait(keep=len(stages)), *others)
     main_loop = Loop(axis=Axis(loop.axis.name, n_chunks - 1), body=main_body, unroll=loop.unroll)
 
-    epilogue: list[Stmt] = [AsyncWait(keep=0)]
+    epilogue: list[Stmt] = [AsyncWait(keep=0, phase=epi_phase, slot=epi_slot)]
     for s in others:
         epilogue.append(s.rewrite(_id, sigma_last))
 

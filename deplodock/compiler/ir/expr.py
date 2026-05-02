@@ -201,7 +201,7 @@ class BinaryExpr(_ExprOps):
     coercion would raise).
     """
 
-    op: str  # "+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "&&", "||"
+    op: str  # "+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "&&", "||", "^"
     left: Expr
     right: Expr
 
@@ -244,6 +244,8 @@ class BinaryExpr(_ExprOps):
                 return bool(lv) or bool(rv)
             except (TypeError, ValueError):
                 return np.logical_or(lv, rv)
+        if op == "^":
+            return int(lv) ^ int(rv)
         raise ValueError(f"Unknown BinaryExpr: {op}")
 
     def pretty(self) -> str:
@@ -534,6 +536,7 @@ _PRECEDENCE: dict[str, int] = {
     ">": 4,
     "<=": 4,
     ">=": 4,
+    "^": 4,  # bitwise XOR — match relational so ``a ^ b + c`` always parens
     "+": 5,
     "-": 5,
     "*": 6,

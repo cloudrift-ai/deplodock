@@ -74,12 +74,12 @@ def _walk_stmt(s: Stmt) -> tuple[Stmt, bool]:
 
 
 def _nest_trips(loop: Loop | StridedLoop) -> int:
-    """Product of axis extents from this loop down to its innermost descendant
-    loop body. Stops descending when the immediate body has zero or multiple
-    loops (a non-chain) — the trip count of a chain is well-defined; siblings
-    aren't a single nest."""
+    """Trip count when ``loop`` is unrolled: ``axis.extent`` × the sum
+    of inner loop trip counts. Siblings sum (each runs once per outer
+    iteration) and a single child reduces to plain product. Used to
+    estimate the unrolled body size."""
     total = int(loop.axis.extent)
-    inner = [s for s in loop.body if isinstance(s, (Loop, StridedLoop))]
-    if len(inner) == 1:
-        total *= _nest_trips(inner[0])
+    inner_trips = sum(_nest_trips(s) for s in loop.body if isinstance(s, (Loop, StridedLoop)))
+    if inner_trips:
+        total *= inner_trips
     return total

@@ -135,9 +135,14 @@ async def scp_file(local_path, server, ssh_key, ssh_port, remote_path, timeout=3
 
 
 async def scp_from_remote(server, ssh_key, ssh_port, remote_path, local_path, timeout=300):
-    """Copy a file FROM the remote server via SCP. Mirror of scp_file()."""
+    """Copy a file (or directory) FROM the remote server via SCP.
+    ``-r`` is unconditional: harmless on regular files, required when
+    ``remote_path`` resolves to a directory (e.g.
+    ``DEPLODOCK_DUMP_DIR``'s ``*.kernels/`` subdirs that would
+    otherwise silently get skipped). Mirror of scp_file()."""
     scp_args = [
         "scp",
+        "-r",
         "-o",
         "StrictHostKeyChecking=no",
         "-o",

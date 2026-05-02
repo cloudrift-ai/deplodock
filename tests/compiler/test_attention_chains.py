@@ -63,8 +63,14 @@ def _run_module_on_cuda(module: torch.nn.Module, inputs_by_name: dict[str, np.nd
                 n *= int(d)
             for key, p in module.named_parameters():
                 safe_key = "p_" + key.replace(".", "_")
-                if safe_key.endswith(nid[2:]) and p.numel() == n:
-                    feed[nid] = p.detach().cpu().numpy()
+                # Match by the ConstantOp's stored name (which carries
+                # the placeholder identity through ``004a`` const-fold,
+                # even when the graph node id changes).
+                if safe_key.endswith(node.op.name[2:]) and p.numel() == n:
+                    arr = p.detach().cpu().numpy()
+                    if node.op.transpose is not None:
+                        arr = arr.transpose(*node.op.transpose).copy()
+                    feed[nid] = arr
                     break
             if nid not in feed and node.op.value is not None:
                 feed[nid] = np.array([node.op.value], dtype=np.float32)

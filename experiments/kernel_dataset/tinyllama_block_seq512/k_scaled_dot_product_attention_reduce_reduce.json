@@ -1,0 +1,64 @@
+{
+  "inputs": [
+    "merged_merged_merged_lift_scaled_dot_product_attention_masked",
+    "merged_lift_linear_2_reduce"
+  ],
+  "outputs": [
+    "merged_lift_scaled_dot_product_attention_reduce"
+  ],
+  "nodes": {
+    "merged_merged_merged_lift_scaled_dot_product_attention_masked": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_masked",
+        "shape": [
+          1,
+          32,
+          512,
+          512
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_lift_linear_2_reduce": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "linear_2_reduce",
+        "shape": [
+          1,
+          512,
+          1,
+          256
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_lift_scaled_dot_product_attention_reduce": {
+      "op": "LoopOp",
+      "op_fields": {
+        "body": [
+          "Loop(axis=Axis(name='a0', extent=32), body=(Loop(axis=Axis(name='a1', extent=512), body=(Loop(axis=Axis(name='a2', extent=512), body=(Load(name='in0', input='merged_merged_merged_lift_scaled_dot_product_attention_masked', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1'), Var(name='a2'))), Accum(name='acc0', value='in0', op=ElementwiseImpl('maximum'))), unroll=False), Loop(axis=Axis(name='a2', extent=512), body=(Load(name='in1', input='merged_merged_merged_lift_scaled_dot_product_attention_masked', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1'), Var(name='a2'))), Assign(name='v0', op=ElementwiseImpl('subtract'), args=('in1', 'acc0')), Assign(name='v1', op=ElementwiseImpl('exp'), args=('v0',)), Accum(name='acc1', value='v1', op=ElementwiseImpl('add'))), unroll=False), Loop(axis=Axis(name='a3', extent=64), body=(Loop(axis=Axis(name='a4', extent=512), body=(Load(name='in2', input='merged_merged_merged_lift_scaled_dot_product_attention_masked', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1'), Var(name='a4'))), Assign(name='v2', op=ElementwiseImpl('subtract'), args=('in2', 'acc0')), Assign(name='v3', op=ElementwiseImpl('exp'), args=('v2',)), Load(name='in3', input='merged_lift_linear_2_reduce', index=(Literal(value=0, dtype='int'), Var(name='a4'), Literal(value=0, dtype='int'), BinaryExpr(op='+', left=BinaryExpr(op='*', left=BinaryExpr(op='/', left=Var(name='a0'), right=Literal(value=8, dtype='int')), right=Literal(value=64, dtype='int')), right=Var(name='a3')))), Assign(name='v4', op=ElementwiseImpl('divide'), args=('v3', 'acc1')), Assign(name='v5', op=ElementwiseImpl('multiply'), args=('v4', 'in3')), Accum(name='acc2', value='v5', op=ElementwiseImpl('add'))), unroll=False), Write(output='merged_lift_scaled_dot_product_attention_reduce', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1'), Literal(value=0, dtype='int'), Var(name='a3')), value='acc2')), unroll=False)), unroll=False),), unroll=False)"
+        ]
+      },
+      "inputs": [
+        "merged_merged_merged_lift_scaled_dot_product_attention_masked",
+        "merged_lift_linear_2_reduce"
+      ],
+      "output": {
+        "name": "scaled_dot_product_attention_reduce",
+        "shape": [
+          1,
+          32,
+          512,
+          1,
+          64
+        ],
+        "dtype": "float32"
+      }
+    }
+  }
+}

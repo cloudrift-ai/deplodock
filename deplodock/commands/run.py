@@ -276,19 +276,36 @@ def _run_ncu_profile(args):
     env = dict(os.environ)
     env[_NCU_RECURSE_GUARD] = "1"
 
+    # Explicit section list — `--set detailed` pulls in two sections that
+    # break on TMA kernels in ncu 2025.3.1: `SpeedOfLight_Roofline`
+    # (`float division by zero`) and `SourceCounters` /
+    # `PCSamplingData` (missing `smsp__pcsamp_*` metrics). Either one
+    # raises and poisons every subsequent section to NaN. Enumerating
+    # the sections that work sidesteps both.
+    sections = (
+        "SpeedOfLight",
+        "ComputeWorkloadAnalysis",
+        "MemoryWorkloadAnalysis",
+        "LaunchStats",
+        "Occupancy",
+    )
     cmd: list[str] = [
         ncu,
         "--target-processes",
         "all",
-        "--set",
-        "detailed",
         "--page",
         "details",
-        sys.executable,
-        "-m",
-        "deplodock.deplodock",
-        "run",
     ]
+    for s in sections:
+        cmd.extend(["--section", s])
+    cmd.extend(
+        [
+            sys.executable,
+            "-m",
+            "deplodock.deplodock",
+            "run",
+        ]
+    )
     if args.code is not None:
         cmd.extend(["--code", args.code])
     elif args.ir is not None:
@@ -405,17 +422,15 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
 
-    if not args.bench:
-        return
-
-    bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-    print()
-    print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-    print("-" * 38)
-    print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-    if dump:
-        dump.dump_benchmark(bench)
-    _print_kernel_stats(graph, bench)
+    if args.bench:
+        bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+        print()
+        print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+        print("-" * 38)
+        print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+        if dump:
+            dump.dump_benchmark(bench)
+        _print_kernel_stats(graph, bench)
     if args.profile:
         _run_ncu_profile(args)
 
@@ -459,6 +474,12 @@ def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):
         if tensor is None:
             logger.error("Could not bind constant %s (target=%r)", nid, target)
             sys.exit(1)
+        # Apply any compile-time-folded transpose recorded by
+        # ``004a_fold_constant_transpose``. The graph's downstream Loads
+        # see the post-transpose layout; physically transposing here
+        # makes the runtime tensor match.
+        if node.op.transpose is not None:
+            tensor = tensor.detach().permute(*node.op.transpose).contiguous()
         input_data[nid] = tensor.detach().cpu().flatten().tolist()
     return input_data
 

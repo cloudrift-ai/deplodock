@@ -223,11 +223,22 @@ class Write(Stmt):
     names). ``index`` uses axis Vars to compute the per-dim offset.
     ``value`` references an SSA name available at this point in the body
     (Assign, Accum, or a Load).
+
+    ``reduce_op`` (optional): when set, the write becomes an atomic
+    reduction (``atomicAdd`` for ``ElementwiseImpl('add')``) instead of
+    a plain store. Used by cross-CTA split-K so multiple CTAs can
+    contribute partial sums to the same output cell. Output buffer must
+    be zero-initialized by the caller.
     """
 
     output: str
     index: tuple[Expr, ...]
     value: str
+    reduce_op: ElementwiseImpl | None = None
+
+    def __post_init__(self) -> None:
+        if self.reduce_op is not None and self.reduce_op.name != "add":
+            raise NotImplementedError(f"Write.reduce_op={self.reduce_op.name!r} not lowered yet (only 'add')")
 
     def deps(self) -> tuple[str, ...]:
         return (self.value,)
@@ -238,14 +249,23 @@ class Write(Stmt):
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
-        return Write(output=self.output, index=tuple(sigma.apply(e) for e in self.index), value=rename_ssa(self.value))
+        return Write(
+            output=self.output,
+            index=tuple(sigma.apply(e) for e in self.index),
+            value=rename_ssa(self.value),
+            reduce_op=self.reduce_op,
+        )
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
+        if self.reduce_op is not None:
+            return [f"{indent}{self.output}[{idx}] {self.reduce_op.name}= {self.value}"]
         return [f"{indent}{self.output}[{idx}] = {self.value}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         flat = render_index(self.output, self.index, ctx)
+        if self.reduce_op is not None:
+            return [f"{_pad(ctx.indent)}atomicAdd(&{self.output}[{flat}], {self.value});"]
         return [f"{_pad(ctx.indent)}{self.output}[{flat}] = {self.value};"]
 
 
