@@ -77,7 +77,10 @@ _PAT_TO_FACTOR = {32: 2, 64: 4, 128: 8}
 # Symmetric BK selection.
 _BK_HUGE = 16
 _BIG_K_LARGE = 8192
-_BIG_MN_OVERSATURATED = 1_000_000
+# Empirical sweep on this branch: 1024² (M·N = 1M) cp.async wins at
+# BK=32 (62us) over BK=16 (78us). 2048² (M·N = 4M) wins at BK=16
+# (429us) over BK=32 (506us). Threshold sits between — 2M splits cleanly.
+_BIG_MN_OVERSATURATED = 2_000_000
 
 
 # --- Helpers ------------------------------------------------------------
