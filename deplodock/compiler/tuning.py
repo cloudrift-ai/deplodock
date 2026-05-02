@@ -19,13 +19,24 @@ needed.
 Env vars override the heuristic for sweeps:
 
 - ``DEPLODOCK_F`` — register-tile factor (per-thread tile is F × F
-  output cells; F=1 disables register tiling).
+  output cells; F=1 disables register tiling). Ignored under TMA mode
+  which uses the asymmetric ``(F_M=8, F_N=4)`` shape.
 - ``DEPLODOCK_PAT`` — innermost M / N tile width carved by
-  ``005_blockify_launch``.
+  ``005_blockify_launch``. Ignored under TMA mode (uses ``(BN=128,
+  BM=64)``).
 - ``DEPLODOCK_TB`` — total thread budget per CTA.
 - ``DEPLODOCK_BK`` — K-split size for ``002_split_matmul_k`` (subject to
   the ``K % BK == 0 and K > BK`` divisibility check).
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
+- ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads for
+  staged matmul operands. Implies the cuBLAS-style asymmetric tile
+  ``(BN=128, BM=64)`` + per-thread ``(F_M=8, F_N=4)`` and runtime
+  weight transpose (via ``004a_fold_constant_transpose``). Beats cp.async
+  baseline on sm_120 fp32 SIMT matmul (105% of cuBLAS at 4096²).
+- ``DEPLODOCK_TMA_SWIZZLE``, ``DEPLODOCK_BK_SPLIT`` — experimental,
+  off by default. Both proven not to help SIMT fp32 (B128 swizzle has
+  a fundamental 4-way bank-conflict floor; BK_SPLIT was a workaround
+  the cuBLAS layout sidesteps). Kept for sweeps on other dtypes / GPUs.
 """
 
 from __future__ import annotations
@@ -239,13 +250,15 @@ def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
     N. After ``008_register_tile`` splits each by F, the post-register-
     tile layout is ``(PAT/F, PAT/F) = (16, 16) = thread_budget``.
 
-    With ``DEPLODOCK_TMA_CUBLAS=1``: matmul returns the asymmetric
+    With ``DEPLODOCK_TMA=1``: matmul returns the asymmetric
     ``(BN, BM)`` shape that matches the cuBLAS-beating layout from
     ``feature/mini-gpu-compiler/tma_db`` — innermost N=128 (32 threads ×
     tn=4), outer M=64 (8 threads × tm=8). Block dim becomes (32, 8),
     each warp shares one M row → A-load broadcasts (no conflict);
     threads stride consecutive N cols → B-load vectorizes to LDS.128
-    (no conflict). No swizzle needed.
+    (no conflict). No swizzle needed. Pairs with ``004a`` const-fold
+    transpose so PyTorch ``[N, K]`` weights end up physically ``[K, N]``
+    at bind time (the storage order LDS.128 vectorization requires).
 
     Non-matmul kernels: ``(thread_budget,)`` — a single fat thread axis
     for the innermost parallel dim (RMSNorm-row, pointwise-flat, …).
@@ -267,7 +280,12 @@ _CUBLAS_F_PER_AXIS = (8, 4)  # (F_M, F_N) — M-axis F, N-axis F
 
 
 def _tma_cublas_layout() -> bool:
-    return os.environ.get("DEPLODOCK_TMA_CUBLAS") == "1"
+    """The cuBLAS-style asymmetric layout is the only TMA path that
+    beats the cp.async + ``+1`` padding baseline on sm_120 fp32 SIMT
+    matmul. Enabling TMA without it lands on the swizzle / symmetric-
+    tile paths that we've measured at 2-5× slower. So the layout is
+    bound to ``DEPLODOCK_TMA=1`` itself rather than a separate flag."""
+    return os.environ.get("DEPLODOCK_TMA") == "1"
 
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:

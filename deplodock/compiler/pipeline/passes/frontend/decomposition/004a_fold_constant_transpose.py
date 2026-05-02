@@ -37,14 +37,15 @@ PATTERN = [Pattern("root", TransposeOp)]
 
 
 def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
-    # Gated on the cuBLAS-style TMA layout that benefits from preserved
-    # source storage order. The default ``(N, K)`` weight + ``[N, K]``
-    # smem path doesn't need this transform — the consumer Load index
-    # already matches the smem layout via ``010_transpose``'s IndexMap
-    # fusion. Folding under the default path can change shapes in ways
-    # other passes (RoPE, SDPA, register-tile) don't expect.
-    if os.environ.get("DEPLODOCK_TMA_CUBLAS") != "1":
-        raise RuleSkipped("DEPLODOCK_TMA_CUBLAS != 1 — fold disabled")
+    # Gated on the TMA path. The default cp.async ``+1`` padding path
+    # doesn't need this transform — the consumer Load index already
+    # matches the smem layout via ``010_transpose``'s IndexMap fusion.
+    # Folding under the default path changes shapes in ways other
+    # passes (RoPE, SDPA, register-tile) don't expect; folding under
+    # the TMA path is exactly what enables LDS.128 vectorization on
+    # the asymmetric ``(BN, BM)`` tile shape (see ``tuning.py``).
+    if os.environ.get("DEPLODOCK_TMA") != "1":
+        raise RuleSkipped("DEPLODOCK_TMA != 1 — fold disabled")
     if not isinstance(inp_x.op, ConstantOp):
         raise RuleSkipped("transpose input is not a ConstantOp")
     if inp_x.op.value is not None:
