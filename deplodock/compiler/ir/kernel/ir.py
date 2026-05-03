@@ -197,6 +197,12 @@ class TmaDescriptor(Stmt):
     box_extents: tuple[int, ...]
     swizzle: str = "NONE"
     dtype: str = "float"
+    # Indices of source dims kept in the descriptor — collapses inert
+    # extent-1 / origin-zero dims so the descriptor rank matches what the
+    # box actually sweeps. ``None`` means "use all source dims" (legacy
+    # behavior). When set, the runtime encoder slices ``arr.shape`` to
+    # ``tuple(arr.shape[d] for d in keep_dims)`` before encoding.
+    keep_dims: tuple[int, ...] | None = None
 
     def pretty(self, indent: str = "") -> list[str]:
         shape = ", ".join(str(e) for e in self.src_shape)

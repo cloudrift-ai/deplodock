@@ -28,6 +28,7 @@ class TmaDescMeta:
     src_buf: str
     box_extents: tuple[int, ...]
     swizzle: str = "NONE"
+    keep_dims: tuple[int, ...] | None = None
 
 
 @dataclass

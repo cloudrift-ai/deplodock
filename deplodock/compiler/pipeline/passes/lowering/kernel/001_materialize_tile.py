@@ -198,7 +198,28 @@ def _materialize(blk: Tile) -> Stmt:
             box_per_dim: dict[int, int] = {}
             for d, ax in zip(stage.addressing.dims, stage.axes, strict=True):
                 box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
-            box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
+            full_box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
+            # Drop only *gap* inert dims — singletons that sit between
+            # the first and last swept source dim. Leading singletons
+            # (e.g. the batch=1 axis on activations) stay in the
+            # descriptor: keeping them matches the descriptor shape that
+            # working linear-matmul TMA kernels emit, so the rank stays
+            # rank-3 for those and we don't perturb their performance.
+            # Gap singletons (e.g. the kv_head=1 axis between seq and
+            # head_dim in GQA's V tensor) must be dropped — without that
+            # collapse, the rank-4 descriptor with the gap singleton
+            # deadlocks pipelined TMA at seq=512.
+            swept = stage.addressing.dims
+            inner = swept[-1]
+            outer = swept[0]
+            keep_dims = tuple(
+                d for d in range(len(stage.origin))
+                if d < outer
+                or d > inner
+                or d in swept
+                or not (full_box[d] == 1 and isinstance(stage.origin[d], Literal) and int(stage.origin[d].value) == 0)
+            )
+            box = tuple(full_box[d] for d in keep_dims)
             # Source shape is unknown at materialization time — the
             # backend resolves it from the bound array at launch. Pass
             # an empty tuple as a sentinel; descriptor encoding fills it.
@@ -209,7 +230,10 @@ def _materialize(blk: Tile) -> Stmt:
                 box_extents=box,
                 swizzle=stage.swizzle.value,
                 dtype="float",
+                keep_dims=keep_dims if len(keep_dims) < len(stage.origin) else None,
             )
+        keep = descriptors[desc_name].keep_dims
+        coords = stage.origin if keep is None else tuple(stage.origin[d] for d in keep)
         if mbar_name not in declared_mbar:
             declared_mbar.add(mbar_name)
             # Per-group mbarrier array: one mbar per ring-buffer slot,
@@ -241,7 +265,7 @@ def _materialize(blk: Tile) -> Stmt:
                     smem=stage.name,
                     smem_index=smem_index,
                     desc=desc_name,
-                    coords=stage.origin,
+                    coords=coords,
                     mbar=mbar_name,
                     mbar_slot=stage.phase,
                 ),

@@ -54,7 +54,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
             continue
         seen.add(s.name)
         descriptors.append(
-            TmaDescMeta(name=s.name, src_buf=s.src_buf, box_extents=s.box_extents, swizzle=s.swizzle),
+            TmaDescMeta(name=s.name, src_buf=s.src_buf, box_extents=s.box_extents, swizzle=s.swizzle, keep_dims=s.keep_dims),
         )
         desc_names.append(s.name)
     root.op = CudaOp(

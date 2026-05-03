@@ -115,6 +115,17 @@ def _is_kouter_matmul(loop: Loop) -> bool:
                 continue
             if any(isinstance(s, Accum) for s in k_inner.body.deps_of(c)):
                 return False
+        # Match ``015_pipeline_async``'s cross-loop-deps gate: reject if
+        # the reduce body reads any SSA name not defined locally (e.g.
+        # SDPA's per-output reduce reads ``acc0..accN`` set by an upstream
+        # softmax-max/sum loop). Without this gate, 013 double-buffers
+        # but 015 refuses to software-pipeline, leaving a synchronous
+        # double-buffered loop. cp.async tolerates that pattern; TMA
+        # mbarriers deadlock on it (mbar count was sized for the 2-slot
+        # ring but the synchronous emit only completes one phase per
+        # iteration without the prologue+epilogue restructure).
+        if not all(s is not None for c in k_inner.body for s in k_inner.body.deps_of(c)):
+            return False
         return True
 
     return is_matmul_k_outer(loop, extra_gate=gate)

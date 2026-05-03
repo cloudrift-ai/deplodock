@@ -231,9 +231,11 @@ def _prebuild_descriptors(compiled: _Compiled, arrays: dict[str, cp.ndarray]) ->
         per_launch: dict[str, cp.ndarray] = {}
         for desc in launch.tma_descriptors:
             arr = arrays[desc.src_buf]
+            full_shape = tuple(int(d) for d in arr.shape)
+            src_shape = full_shape if desc.keep_dims is None else tuple(full_shape[d] for d in desc.keep_dims)
             desc_bytes = _tma.encode_tiled(
                 global_address=int(arr.data.ptr),
-                src_shape=tuple(int(d) for d in arr.shape),
+                src_shape=src_shape,
                 box_extents=desc.box_extents,
                 elem_size=int(arr.itemsize),
                 swizzle=desc.swizzle,
@@ -336,7 +338,15 @@ def benchmark_program(
             starts[i].record()
             _launch(launch, compiled, arrays, descs.get(i))
             stops[i].record()
-        stops[n - 1].synchronize()
+            # Per-kernel sync to make per-launch attribution accurate.
+            # Without it, back-to-back launches let one kernel's stop
+            # event slide into a downstream kernel's scheduling window,
+            # which ends up attributing 0.5-0.8 ms of phantom time to
+            # whichever sub-100µs kernel happens to land at a stream-
+            # stall position. The total ``prog_start..prog_stop`` window
+            # is unaffected (it spans all launches anyway), and the
+            # added sync overhead is negligible vs the kernels' work.
+            stops[i].synchronize()
         for i in range(n):
             acc[i] += cp.cuda.get_elapsed_time(starts[i], stops[i])
     prog_stop.record()

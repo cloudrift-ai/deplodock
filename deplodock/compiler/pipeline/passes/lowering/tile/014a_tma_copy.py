@@ -233,11 +233,18 @@ def _eligible(stage: BufferedStage, src_ranks: dict[str, int], src_shapes: dict[
         return False
     if dims[-1] != src_rank - 1:
         return False
-    if dims[0] < src_rank - len(dims):
-        return False
     src_shape = src_shapes.get(stage.buf)
     if src_shape is None or not src_shape:
         return False
+    # Permit non-contiguous suffixes only when every gap source dim is an
+    # extent-1 singleton — those dims get dropped from the descriptor at
+    # materialization time (see ``_001_materialize_tile.emit_tma_stage``)
+    # so the encoded rank matches the swept rank, sidestepping the
+    # rank-4-pipelined-TMA deadlock.
+    dims_set = set(dims)
+    for d in range(dims[0], src_rank):
+        if d not in dims_set and int(src_shape[d]) != 1:
+            return False
     inner_extent = int(stage.axes[-1].extent)
     if (inner_extent * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
