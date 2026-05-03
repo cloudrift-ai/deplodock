@@ -1,13 +1,19 @@
 """Narrow ``BufferedStage`` to ``TmaBufferedStage`` (TMA transport) on sm_90+.
 
-For each ``BufferedStage`` in the Tile body that meets TMA's eligibility
-constraints, replace it with a ``TmaBufferedStage`` and append an
-``AsyncWait(keep=0)`` so the synchronous-style invariant — every async
-load dominated by a wait before its consumer — holds even without
-pipelining.
+All-or-nothing: if every ``BufferedStage`` in the Tile body meets TMA's
+eligibility constraints, replace them all with ``TmaBufferedStage`` and
+append a trailing ``AsyncWait`` so the synchronous-style invariant —
+every async load dominated by a wait before its consumer — holds even
+without pipelining. If any stage is ineligible, leave the whole tile
+alone so ``014b_async_copy`` puts every stage on cp.async uniformly.
 
-Runs *before* ``014b_async_copy``: a Stage that's TMA-eligible is taken
-by this pass; everything else falls through to cp.async.
+Mixed TMA + cp.async pipelined K-loops force a per-iter
+``cp.async.wait_group + __syncthreads`` (otherwise the per-CTA
+``cp.async.commit_group`` tracker overflows past the 64-group HW limit
+under back-to-back launches and deadlocks the device). The required
+Sync defeats the latency hiding the pipeline was supposed to provide.
+Falling back to all-cp.async on mixed kernels avoids both the deadlock
+and the perf cliff.
 
 Eligibility:
 
@@ -16,8 +22,16 @@ Eligibility:
   ``origin + decoded`` reconstruction; symbolic ``TemplateAddressing``
   (collapsed-reshape views) stays on cp.async.
 - rank ≤ 5 (TMA descriptor limit).
-- inner source dim is the contiguous one and its box extent in bytes
-  is a multiple of 16 B (TMA alignment requirement).
+- ``addressing.dims`` is a strictly-increasing permutation ending at
+  ``src_rank - 1`` — the cache axes sweep a contiguous source-dim
+  suffix in row-major order. A non-identity permutation means a
+  transpose / reshape was fused into the load (e.g. SDPA's K projection
+  read as ``[head_dim, seq]`` from a ``[seq, head_dim]`` source); TMA's
+  ``(globalDim, globalStride, boxDim)`` triple cannot encode that.
+- box and source inner extents are 16 B-aligned, with the source
+  offering ≥ 2× the box inner extent of headroom (small matmuls where
+  these clamp to the alignment boundary trip ``MISALIGNED_ADDRESS`` at
+  the ``cp.async.bulk.tensor`` site).
 
 The materializer expands ``TmaBufferedStage`` to a ``TmaDescriptor`` +
 ``MbarrierInit`` (hoisted to kernel prologue) plus
@@ -70,11 +84,12 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
     src_ranks = {nid: len(node.output.shape) for nid, node in graph.nodes.items()}
     src_shapes = {nid: tuple(int(d) for d in node.output.shape) for nid, node in graph.nodes.items()}
-    # TMA only fires on stages reading from a transposed weight constant
-    # (``004a_fold_into_constant`` recorded a ``TransposeOp`` in the
-    # ``ConstantOp.load_ops`` chain). Activation stages have empty chains
-    # and don't match the asymmetric (BN, BM) tile's KN expectation —
-    # letting TMA load them produces silently wrong outputs (e.g. SDPA Q/K/V).
+    # TMA-correctness is currently proven only for stages reading from a
+    # transposed weight constant (``004a_fold_into_constant`` recorded a
+    # ``TransposeOp`` in the constant's ``load_ops`` chain). Activation
+    # stages — even when their cache-axis ``dims`` permutation looks
+    # identity — have produced silently wrong outputs / device deadlocks
+    # under TMA at SDPA scale, so they remain on cp.async.
     tma_buf_ok = {nid for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and bool(node.op.load_ops)}
     new_body = _maybe_rewrite(root.op.body, src_ranks, src_shapes, tma_buf_ok)
     if new_body is None:
@@ -83,11 +98,33 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
-def _maybe_rewrite(body: Body, src_ranks: dict[str, int], src_shapes: dict[str, tuple[int, ...]], tma_buf_ok: set[str]) -> Body | None:
+def _maybe_rewrite(
+    body: Body,
+    src_ranks: dict[str, int],
+    src_shapes: dict[str, tuple[int, ...]],
+    tma_buf_ok: set[str],
+) -> Body | None:
     idx, tile = single_tile(body)
+    # All-or-nothing: every BufferedStage in the tile body must be
+    # TMA-eligible, otherwise leave the whole tile for cp.async. A
+    # mixed TMA + cp.async pipelined K-loop needs a per-iter
+    # ``CpAsyncWait + __syncthreads`` (otherwise the per-CTA
+    # ``cp.async.commit_group`` tracker overflows past 64 under
+    # back-to-back launches and deadlocks the device); the required
+    # Sync also destroys the latency hiding the pipeline was supposed
+    # to provide. Falling back to all-cp.async on mixed kernels avoids
+    # both the hang and the perf cliff.
+    for s in tile.body.iter():
+        if isinstance(s, (AsyncBufferedStage, TmaBufferedStage)):
+            continue
+        if isinstance(s, BufferedStage) and not _eligible(s, src_ranks, src_shapes, tma_buf_ok):
+            raise RuleSkipped(
+                f"stage {s.name!r} (buf={s.buf!r}) not TMA-eligible; "
+                "leaving every stage in this tile to cp.async (avoids mixed-mode pipeline deadlock)"
+            )
     new_tile_body = _process(tile.body, src_ranks, src_shapes, tma_buf_ok)
     if new_tile_body is tile.body or new_tile_body == tile.body:
-        raise RuleSkipped("no BufferedStage eligible for TMA")
+        raise RuleSkipped("no BufferedStage to convert")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
@@ -191,7 +228,7 @@ def _eligible(stage: BufferedStage, src_ranks: dict[str, int], src_shapes: dict[
         return False
     # Only weight-constant stages are TMA-safe — 004a transposed them
     # into the asymmetric tile's KN expectation. Activation stages keep
-    # their natural layout and produce wrong outputs under TMA.
+    # their natural layout and produce wrong outputs (or hang) under TMA.
     if stage.buf not in tma_buf_ok:
         return False
     # Inner cache axis must be the innermost source dim — TMA box copies

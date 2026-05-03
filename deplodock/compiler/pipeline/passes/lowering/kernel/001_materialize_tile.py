@@ -145,6 +145,11 @@ def _materialize(blk: Tile) -> Stmt:
 
     # Pre-scan to determine the number of distinct TmaBufferedStage names
     # in this Tile — that's the arrive count for the shared mbarrier.
+    # ``014a_tma_copy`` enforces all-or-nothing TMA promotion per Tile:
+    # any tile reaching here with TMA stages is guaranteed to have *no*
+    # cp.async stages in the same pipelined K-loop, so the AsyncWait
+    # lowering can stay as a pure ``MbarrierWait`` (no extra cp.async
+    # drain needed).
     tma_stage_names: list[str] = []
     tma_buffer_count = 0
     for s in body.iter():
