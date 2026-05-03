@@ -80,18 +80,10 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         raise RuleSkipped("TMA disabled (DEPLODOCK_TMA=0 or compute capability < sm_90)")
     if compute_capability() < _MIN_CAPABILITY:
         raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {compute_capability()}")
-    from deplodock.compiler.ir.base import ConstantOp  # noqa: PLC0415
 
     src_ranks = {nid: len(node.output.shape) for nid, node in graph.nodes.items()}
     src_shapes = {nid: tuple(int(d) for d in node.output.shape) for nid, node in graph.nodes.items()}
-    # TMA-correctness is currently proven only for stages reading from a
-    # transposed weight constant (``004a_fold_into_constant`` recorded a
-    # ``TransposeOp`` in the constant's ``load_ops`` chain). Activation
-    # stages — even when their cache-axis ``dims`` permutation looks
-    # identity — have produced silently wrong outputs / device deadlocks
-    # under TMA at SDPA scale, so they remain on cp.async.
-    tma_buf_ok = {nid for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and bool(node.op.load_ops)}
-    new_body = _maybe_rewrite(root.op.body, src_ranks, src_shapes, tma_buf_ok)
+    new_body = _maybe_rewrite(root.op.body, src_ranks, src_shapes)
     if new_body is None:
         return None
     root.op = TileOp(body=new_body, name=root.op.name)
@@ -102,7 +94,6 @@ def _maybe_rewrite(
     body: Body,
     src_ranks: dict[str, int],
     src_shapes: dict[str, tuple[int, ...]],
-    tma_buf_ok: set[str],
 ) -> Body | None:
     idx, tile = single_tile(body)
     # All-or-nothing: every BufferedStage in the tile body must be
@@ -117,12 +108,12 @@ def _maybe_rewrite(
     for s in tile.body.iter():
         if isinstance(s, (AsyncBufferedStage, TmaBufferedStage)):
             continue
-        if isinstance(s, BufferedStage) and not _eligible(s, src_ranks, src_shapes, tma_buf_ok):
+        if isinstance(s, BufferedStage) and not _eligible(s, src_ranks, src_shapes):
             raise RuleSkipped(
                 f"stage {s.name!r} (buf={s.buf!r}) not TMA-eligible; "
                 "leaving every stage in this tile to cp.async (avoids mixed-mode pipeline deadlock)"
             )
-    new_tile_body = _process(tile.body, src_ranks, src_shapes, tma_buf_ok)
+    new_tile_body = _process(tile.body, src_ranks, src_shapes)
     if new_tile_body is tile.body or new_tile_body == tile.body:
         raise RuleSkipped("no BufferedStage to convert")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
@@ -132,7 +123,6 @@ def _process(
     body: Body,
     src_ranks: dict[str, int],
     src_shapes: dict[str, tuple[int, ...]],
-    tma_buf_ok: set[str],
     k_var: str | None = None,
 ) -> Body:
     """Walk a body. Narrow eligible ``BufferedStage`` to ``TmaBufferedStage``,
@@ -155,7 +145,7 @@ def _process(
         if (
             isinstance(s, BufferedStage)
             and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage))
-            and _eligible(s, src_ranks, src_shapes, tma_buf_ok)
+            and _eligible(s, src_ranks, src_shapes)
         ):
             new_body.append(
                 TmaBufferedStage(
@@ -183,7 +173,7 @@ def _process(
                 new_body.append(_tma_async_wait(pending_wait[0], k_var))
                 pending_wait = ()
             if isinstance(s, Loop):
-                inner = _process(s.body, src_ranks, src_shapes, tma_buf_ok, k_var=s.axis.name)
+                inner = _process(s.body, src_ranks, src_shapes, k_var=s.axis.name)
                 if inner is not s.body and inner != s.body:
                     new_body.append(Loop(axis=s.axis, body=inner, unroll=s.unroll))
                     changed = True
@@ -213,7 +203,7 @@ def _tma_async_wait(stage: BufferedStage, k_var: str | None) -> AsyncWait:
     return AsyncWait(keep=0, phase=phase, slot=slot)
 
 
-def _eligible(stage: BufferedStage, src_ranks: dict[str, int], src_shapes: dict[str, tuple[int, ...]], tma_buf_ok: set[str]) -> bool:
+def _eligible(stage: BufferedStage, src_ranks: dict[str, int], src_shapes: dict[str, tuple[int, ...]]) -> bool:
     if not isinstance(stage.addressing, AffineAddressing):
         return False
     if len(stage.axes) > _MAX_RANK or not stage.axes:
@@ -226,16 +216,27 @@ def _eligible(stage: BufferedStage, src_ranks: dict[str, int], src_shapes: dict[
     src_rank = src_ranks.get(stage.buf, len(stage.origin))
     if src_rank > _MAX_RANK or len(stage.origin) > _MAX_RANK:
         return False
-    # Only weight-constant stages are TMA-safe — 004a transposed them
-    # into the asymmetric tile's KN expectation. Activation stages keep
-    # their natural layout and produce wrong outputs (or hang) under TMA.
-    if stage.buf not in tma_buf_ok:
+    # Layout check: ``addressing.dims`` records which source dim each
+    # cache axis sweeps. For TMA's box-copy semantics in a row-major
+    # source, the cache axes must form a strictly-increasing contiguous
+    # suffix of source dims, ending at the innermost (highest-index)
+    # one. Any deviation means a transpose / reshape was fused into the
+    # load (e.g. SDPA's V read with ``dims=(1, 3)`` skipping dim 2 from
+    # a per-head slice) — TMA's ``(globalDim, globalStride, boxDim)``
+    # triple cannot encode that, so the tile falls back to cp.async.
+    # (A relaxed singleton-skip variant was tried — TMA-encoded but
+    # deadlocked at seq=512 scale; the strict check is the proven gate.)
+    dims = stage.addressing.dims
+    if not dims or len(set(dims)) != len(dims):
         return False
-    # Inner cache axis must be the innermost source dim — TMA box copies
-    # require a contiguous inner-dim sweep.
-    inner_dim = stage.addressing.dims[-1]
-    expected_inner = max(stage.addressing.dims, default=-1)
-    if inner_dim != expected_inner:
+    if list(dims) != sorted(dims):
+        return False
+    if dims[-1] != src_rank - 1:
+        return False
+    if dims[0] < src_rank - len(dims):
+        return False
+    src_shape = src_shapes.get(stage.buf)
+    if src_shape is None or not src_shape:
         return False
     inner_extent = int(stage.axes[-1].extent)
     if (inner_extent * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
@@ -252,9 +253,6 @@ def _eligible(stage: BufferedStage, src_ranks: dict[str, int], src_shapes: dict[
     # source inner extent to be at least one full alignment quantum
     # past the box — i.e. the source must offer headroom beyond a single
     # box load.
-    src_shape = src_shapes.get(stage.buf)
-    if src_shape is None or not src_shape:
-        return False
     src_inner = int(src_shape[-1])
     if (src_inner * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
