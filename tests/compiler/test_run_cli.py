@@ -95,6 +95,38 @@ def test_run_code_sdpa_k_chunked(run_cli):
 
 
 @requires_cuda
+def test_run_code_sdpa_tinyllama_per_head(run_cli):
+    """Per-head SDPA at TinyLlama-block-seq=512 dimensions, mirroring the
+    ``k_scaled_dot_product_attention_reduce_reduce.json`` kernel in
+    ``experiments/kernel_dataset/tinyllama_block_seq512`` (M=512, K=512,
+    N=64). The K=512 reduction does not fit a full smem slab once
+    register-tile + double-buffer apply, so this exercises the chunked
+    blockify + staging path on the per-head shape."""
+    rc, _, stderr = run_cli(
+        "run",
+        "--code",
+        "torch.nn.functional.scaled_dot_product_attention("
+        "torch.randn(1,1,512,64), torch.randn(1,1,512,64), torch.randn(1,1,512,64))",
+    )
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
+def test_run_code_sdpa_tinyllama_full(run_cli):
+    """Full multi-head TinyLlama-block-seq=512 SDPA (1 batch × 32 heads ×
+    512 × 64). Regression: the blockify + staging interaction
+    over-allocated per-block smem (PTXAS rejected the kernel with
+    ``uses too much shared data``, 0xc600 > 0xc000 = 49152 cap)."""
+    rc, _, stderr = run_cli(
+        "run",
+        "--code",
+        "torch.nn.functional.scaled_dot_product_attention("
+        "torch.randn(1,32,512,64), torch.randn(1,32,512,64), torch.randn(1,32,512,64))",
+    )
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
 def test_run_bench_prints_table(run_cli):
     rc, stdout, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "--bench", "--warmup", "2", "--iters", "5")
     assert rc == 0, f"stderr: {stderr}"

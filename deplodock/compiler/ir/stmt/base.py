@@ -44,6 +44,11 @@ class RenderCtx:
     builtins: dict[str, str] = field(default_factory=dict)
     explicit_inits: set[str] = field(default_factory=set)
     literal_constants: dict[str, float] = field(default_factory=dict)
+    # Per-buffer byte offsets into a single ``extern __shared__`` pool
+    # ``_smem_pool``. When non-empty, ``Smem.render`` emits a pointer
+    # alias into the pool instead of a stand-alone ``__shared__`` array
+    # — the only way to exceed the 48 KB static-smem cap.
+    smem_dynamic_offsets: dict[str, int] = field(default_factory=dict)
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
@@ -54,6 +59,7 @@ class RenderCtx:
             builtins=self.builtins,
             explicit_inits=self.explicit_inits,
             literal_constants=self.literal_constants,
+            smem_dynamic_offsets=self.smem_dynamic_offsets,
         )
 
 

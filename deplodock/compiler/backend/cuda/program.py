@@ -30,6 +30,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Mirror of ``ir.kernel.render.STATIC_SMEM_CAP`` — kept here to avoid
+# pulling the renderer into the runtime path.
+_STATIC_SMEM_CAP = 48 * 1024
+
+
+def _ensure_dynamic_smem_attr(kernel: cp.RawKernel, smem_bytes: int) -> None:
+    """Opt this kernel into the device's max dynamic-smem allowance.
+
+    Required when ``smem_bytes`` exceeds the 48 KB static cap. cupy's
+    ``RawKernel.max_dynamic_shared_size_bytes`` setter calls
+    ``cuFuncSetAttribute(MaxDynamicSharedMemorySize)``; the driver
+    clamps to the device's per-block dynamic max (e.g. ~99 KB on
+    sm_120). Already-set kernels are skipped.
+    """
+    if kernel.max_dynamic_shared_size_bytes >= smem_bytes:
+        return
+    kernel.max_dynamic_shared_size_bytes = smem_bytes
+
 
 # ---------------------------------------------------------------------------
 # Buffer / launch classification
@@ -200,7 +218,16 @@ def _launch(
     kernel = compiled.kernels[launch.kernel_name]
     desc_args = desc_args or {}
     args = tuple(desc_args.get(name) if name in desc_args else arrays[name] for name in launch.arg_names)
-    kernel(launch.grid, launch.block, args, shared_mem=0)
+    # Kernels whose Smem footprint exceeds the 48 KB static cap declare
+    # an ``extern __shared__`` pool; the launch supplies the byte size
+    # via ``shared_mem=`` and (for footprints above 48 KB) opts into the
+    # device's larger dynamic-smem allowance via ``cudaFuncSetAttribute``.
+    smem_bytes = launch.smem_bytes
+    if smem_bytes > _STATIC_SMEM_CAP:
+        _ensure_dynamic_smem_attr(kernel, smem_bytes)
+        kernel(launch.grid, launch.block, args, shared_mem=smem_bytes)
+    else:
+        kernel(launch.grid, launch.block, args, shared_mem=0)
 
 
 def _collapse_inert_dims(arr_shape: tuple[int, ...], box_extents: tuple[int, ...]) -> tuple[int, ...]:
