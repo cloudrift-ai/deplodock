@@ -257,15 +257,20 @@ def split_invariant_divides(stmts: Body) -> Body:
     """Rewrite ``divide(x, y)`` → ``reciprocal(y) + multiply(x, recip)``
     when ``y``'s axis-dependency set is a strict subset of ``x``'s.
 
-    Tracks ``axes_of[name]`` the same way :func:`hoist_loop_invariants`
-    does. Generates fresh SSA names for the rcp; the trailing
-    :func:`rename_ssa_sequential` pass renumbers them into ``vN`` form.
+    Invariance is queried via :meth:`Body.deps_closure` over the
+    pre-rewrite body, filtered to axis names. The strict-subset check
+    means there's at least one axis ``x`` depends on that ``y``
+    doesn't — splitting moves the rcp out of that axis's Loop while
+    the multiply stays. Generates fresh SSA names for the rcp; the
+    trailing :func:`rename_ssa_sequential` pass renumbers them into
+    ``vN`` form.
     """
     from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
 
     stmts = Body.coerce(stmts)
-    axes_of: dict[str, frozenset[str]] = {}
-    ssa_names: set[str] = set()
+    closure = stmts.deps_closure
+    axes = stmts.axis_names
+    ssa_names: set[str] = set(closure.keys())
     fresh_counter = [0]
 
     def _fresh(prefix: str) -> str:
@@ -276,39 +281,8 @@ def split_invariant_divides(stmts: Body) -> Body:
                 ssa_names.add(n)
                 return n
 
-    def _load_axes(load: Load) -> frozenset[str]:
-        result: set[str] = set()
-        for e in load.index:
-            for v in e.free_vars():
-                if v in ssa_names:
-                    result |= axes_of.get(v, frozenset())
-                else:
-                    result.add(v)
-        return frozenset(result)
-
-    def _record(s: Stmt) -> None:
-        defined = s.defines()
-        if not defined:
-            return
-        name = defined[0]
-        if isinstance(s, Load):
-            axes_of[name] = _load_axes(s)
-        elif isinstance(s, Assign):
-            result: set[str] = set()
-            for a in s.args:
-                result |= axes_of.get(a, frozenset())
-            axes_of[name] = frozenset(result)
-        elif isinstance(s, Select):
-            result = set()
-            for b in s.branches:
-                result |= b.select.free_vars()
-                result |= axes_of.get(b.value, frozenset())
-            axes_of[name] = frozenset(result)
-        elif isinstance(s, Accum):
-            axes_of[name] = axes_of.get(s.value, frozenset())
-        else:
-            axes_of[name] = frozenset()
-        ssa_names.add(name)
+    def _axes_of(name: str) -> frozenset[str]:
+        return closure.get(name, frozenset()) & axes
 
     def walk(body: Body) -> Body:
         out: list[Stmt] = []
@@ -316,39 +290,26 @@ def split_invariant_divides(stmts: Body) -> Body:
             nested = s.nested()
             if nested:
                 # Generic descent — recurse into every nested body, rebuild
-                # the wrapper via with_bodies. After a Loop closes, its
-                # inner Accums become live at the outer scope minus the
-                # loop axis (matches hoist_loop_invariants's bookkeeping).
-                # StridedLoop's Accums are live as-is (cooperative reduces
-                # produce a per-thread partial that carries the strided axis).
-                rebuilt_bodies = tuple(walk(b) for b in nested)
-                out.append(s.with_bodies(rebuilt_bodies))
-                if isinstance(s, Loop):
-                    for c in s.body:
-                        if isinstance(c, Accum):
-                            axes_of[c.name] = axes_of.get(c.value, frozenset()) - {s.axis.name}
-                            ssa_names.add(c.name)
-                elif isinstance(s, StridedLoop):
-                    for c in s.body:
-                        if isinstance(c, Accum):
-                            axes_of[c.name] = axes_of.get(c.value, frozenset())
-                            ssa_names.add(c.name)
+                # the wrapper via with_bodies. The closure was built once
+                # over the whole body, so post-Loop Accum bookkeeping is
+                # already baked in — no per-wrapper update needed here.
+                out.append(s.with_bodies(tuple(walk(b) for b in nested)))
                 continue
             if isinstance(s, Assign) and s.op == ElementwiseImpl("divide") and len(s.args) == 2:
                 x_name, y_name = s.args
-                ax_x = axes_of.get(x_name, frozenset())
-                ax_y = axes_of.get(y_name, frozenset())
-                if ax_y < ax_x:  # strict subset → splitting unblocks at least one hoist
+                if _axes_of(y_name) < _axes_of(x_name):  # strict subset → splitting unblocks at least one hoist
                     recip_name = _fresh(f"recip_{y_name}")
                     recip = Assign(name=recip_name, op=ElementwiseImpl("reciprocal"), args=(y_name,))
                     mult = Assign(name=s.name, op=ElementwiseImpl("multiply"), args=(x_name, recip_name))
+                    # Patch closure for the freshly-introduced rcp so a
+                    # later divide reading the same y in the same body
+                    # still sees the correct axis set.
+                    closure[recip_name] = closure.get(y_name, frozenset())
+                    closure[mult.name] = closure.get(x_name, frozenset()) | closure[recip_name]
                     out.append(recip)
-                    _record(recip)
                     out.append(mult)
-                    _record(mult)
                     continue
             out.append(s)
-            _record(s)
         return Body(out)
 
     return walk(stmts)
@@ -363,60 +324,27 @@ def hoist_loop_invariants(stmts: Body) -> Body:
     """Move ``Load`` / ``Assign`` / ``Select`` stmts out of ``Loop``s whose
     axis their value doesn't depend on. Hoisting only crosses ``Loop``
     boundaries; ``StridedLoop`` / ``Tile`` / ``Cond`` are barriers but are
-    recursed into so inner Loops still get the optimization."""
+    recursed into so inner Loops still get the optimization.
+
+    Loop-invariance is queried via :meth:`Body.depends_on` against the
+    pre-computed transitive closure for the whole body. The local
+    ``bindings`` tracking is still position-dependent — it gates whether
+    a hoist-candidate's SSA deps are *available* at the hoist site, a
+    visibility question separate from dataflow invariance.
+    """
     stmts = Body.coerce(stmts)
-    axes_of: dict[str, frozenset[str]] = {}
-    ssa_names: set[str] = set()
+    closure = stmts.deps_closure  # transitive read closure, including axis names
+    ssa_names = frozenset(closure.keys())
 
-    def _load_index_parts(index: tuple[Expr, ...]) -> tuple[set[str], set[str]]:
-        deps: set[str] = set()
-        axes: set[str] = set()
-        for e in index:
-            for v in e.free_vars():
-                (deps if v in ssa_names else axes).add(v)
-        return deps, axes
-
-    def _stmt_live(s: Stmt) -> frozenset[str]:
+    def _ssa_deps(s: Stmt) -> tuple[str, ...]:
+        """Immediate SSA-only deps (axis vars from indices excluded)."""
         if isinstance(s, Load):
-            deps, axes = _load_index_parts(s.index)
-            result = set(axes)
-            for d in deps:
-                result |= axes_of.get(d, frozenset())
-            return frozenset(result)
-        if isinstance(s, Assign):
-            result = set()
-            for name in s.args:
-                result |= axes_of.get(name, frozenset())
-            return frozenset(result)
-        if isinstance(s, Select):
-            result = set()
-            for b in s.branches:
-                result |= b.select.free_vars()
-                result |= axes_of.get(b.value, frozenset())
-            return frozenset(result)
-        return frozenset()
-
-    def _deps(s: Stmt) -> tuple[str, ...]:
-        if isinstance(s, Load):
-            deps, _ = _load_index_parts(s.index)
-            return tuple(deps)
+            return tuple(v for e in s.index for v in e.free_vars() if v in ssa_names)
         if isinstance(s, Assign):
             return s.args
         if isinstance(s, Select):
             return tuple(b.value for b in s.branches)
         return ()
-
-    def _record(c: Stmt, bindings: set[str]) -> None:
-        defined = c.defines()
-        if not defined:
-            return
-        name = defined[0]
-        if isinstance(c, Accum):
-            axes_of[name] = axes_of.get(c.value, frozenset())
-        else:
-            axes_of[name] = _stmt_live(c)
-        ssa_names.add(name)
-        bindings.add(name)
 
     def walk(body: Body, outer_bindings: set[str]) -> list[Stmt]:
         new_body: list[Stmt] = []
@@ -431,8 +359,10 @@ def hoist_loop_invariants(stmts: Body) -> Body:
                 stay: list[Stmt] = []
                 for c in inner:
                     if isinstance(c, (Load, Assign, Select)):
-                        live = axes_of.get(c.name, frozenset())
-                        if axis not in live and all(d in bindings or d in hoisted_names for d in _deps(c)):
+                        # Hoistable iff (1) value doesn't transitively depend
+                        # on the loop axis, and (2) every immediate SSA dep
+                        # is already in scope at the hoist site.
+                        if not stmts.depends_on(c.name, axis) and all(d in bindings or d in hoisted_names for d in _ssa_deps(c)):
                             hoisted.append(c)
                             hoisted_names.add(c.name)
                             continue
@@ -445,15 +375,12 @@ def hoist_loop_invariants(stmts: Body) -> Body:
 
                 for c in inner:
                     if isinstance(c, Accum):
-                        axes_of[c.name] = axes_of.get(c.value, frozenset()) - {axis}
-                        ssa_names.add(c.name)
                         bindings.add(c.name)
             elif isinstance(s, StridedLoop):
                 inner = walk(s.body, bindings)
                 new_body.append(replace(s, body=tuple(inner)))
                 for c in inner:
                     if isinstance(c, Accum):
-                        ssa_names.add(c.name)
                         bindings.add(c.name)
             elif isinstance(s, Tile):
                 inner = walk(s.body, bindings)
@@ -464,7 +391,8 @@ def hoist_loop_invariants(stmts: Body) -> Body:
                 new_body.append(Cond(cond=s.cond, body=tuple(inner_b), else_body=tuple(inner_e)))
             else:
                 new_body.append(s)
-                _record(s, bindings)
+                for n in s.defines():
+                    bindings.add(n)
 
         return new_body
 
