@@ -60,6 +60,7 @@ from deplodock.compiler.ir.tile.ir import (
     BufferedStage,
     Combine,
     Stage,
+    SwizzleMode,
     TemplateAddressing,
     TileOp,
     TmaBufferedStage,
@@ -115,9 +116,39 @@ def _materialize(blk: Tile) -> Stmt:
 
     rename: dict[str, str] = {}
 
+    # Smem buffers fed by a TMA stage with hardware swizzle: body Loads
+    # against them must XOR-decode the inner-element index. Hopper's
+    # SWIZZLE_{128,64,32}B XORs the byte-position bits ``[4..6]`` (16-byte
+    # chunks within a 128-byte line) by the line-within-group bits ``[7..9]``
+    # of the address. For fp32 (4 B), bit 4 of bytes = bit 2 of fp32 index,
+    # so the inverse decode is ``c_phys = c_logical XOR ((row & 7) * shift)``
+    # where shift selects the swizzle granularity (4 for B128, 2 for B64,
+    # 1 for B32). Body Loads invert by the same XOR.
+    swizzled_smem: dict[str, int] = {}
+    _shift_for = {SwizzleMode.B128: 4, SwizzleMode.B64: 2, SwizzleMode.B32: 1}
+    for s in body.iter():
+        if isinstance(s, TmaBufferedStage) and s.swizzle != SwizzleMode.NONE:
+            swizzled_smem[s.name] = _shift_for[s.swizzle]
+
+    def _swizzle_load(load: Load) -> Load:
+        # Index layout for a BufferedStage Load: ``[phase, *cache_axes]``.
+        # Last index is the inner (column); second-to-last is the row that
+        # drives the swizzle XOR.
+        if len(load.index) < 3:
+            return load
+        shift = swizzled_smem[load.input]
+        row = load.index[-2]
+        inner = load.index[-1]
+        row_bits = BinaryExpr("&", row, Literal(7, "int"))
+        xor_term = row_bits if shift == 1 else BinaryExpr("*", row_bits, Literal(shift, "int"))
+        new_inner = BinaryExpr("^", inner, xor_term)
+        return replace(load, index=(*load.index[:-1], new_inner))
+
     def transform(s: Stmt) -> Stmt:
         if rename:
             s = s.rewrite(lambda n: rename.get(n, n))
+        if swizzled_smem and isinstance(s, Load) and s.input in swizzled_smem:
+            s = _swizzle_load(s)
         return s
 
     new_body: list[Stmt] = []
@@ -269,7 +300,20 @@ def _materialize(blk: Tile) -> Stmt:
                 ),
             ),
         )
-        return [Smem(name=stage.name, extents=full_extents, align=_TMA_ALIGN_BYTES), cond]
+        # B128 swizzle uses byte-address bits 7..9 to drive the XOR, so the
+        # buffer base must be 1024-aligned (next multiple of the swizzle
+        # group size: 8 rows × 128 B). Otherwise the row-bit position
+        # leaks bits from a non-zero base offset and the body decoder's
+        # ``(row & 7) * shift`` reads from off-by-N permuted positions.
+        # B64 needs 512-byte alignment, B32 needs 256.
+        align = _TMA_ALIGN_BYTES
+        if stage.swizzle == SwizzleMode.B128:
+            align = 1024
+        elif stage.swizzle == SwizzleMode.B64:
+            align = 512
+        elif stage.swizzle == SwizzleMode.B32:
+            align = 256
+        return [Smem(name=stage.name, extents=full_extents, align=align), cond]
 
     for stmt in body:
         if isinstance(stmt, TmaBufferedStage):

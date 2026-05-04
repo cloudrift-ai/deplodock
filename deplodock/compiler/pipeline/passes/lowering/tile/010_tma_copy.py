@@ -55,6 +55,7 @@ from deplodock.compiler.ir.tile.ir import (
     AsyncBufferedStage,
     AsyncWait,
     BufferedStage,
+    SwizzleMode,
     TileOp,
     TmaBufferedStage,
 )
@@ -62,6 +63,37 @@ from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability, single_tile
 
 logger = logging.getLogger(__name__)
+
+
+def _pick_swizzle(stage: BufferedStage) -> SwizzleMode:
+    """Match the inner box-dim byte size to a TMA swizzle width.
+
+    ``cuTensorMapEncodeTiled`` requires ``box_dim[innermost] * elem_size``
+    to equal the chosen swizzle width exactly: 128 B for ``B128``, 64 B for
+    ``B64``, 32 B for ``B32``. Wider inner boxes (e.g. matmul slabs with
+    a 128-fp32 thread axis = 512 B inner) don't fit any mode and stay on
+    ``NONE``.
+
+    Off by default. ``DEPLODOCK_TMA_SWIZZLE=1`` opts a kernel into
+    swizzle: the materializer then emits the body-Load XOR decode that
+    matches each stage's mode. Currently validated for matmul-style body
+    access on (k_row, c_inner) slabs with inner=32 fp32 (B128) at sizes
+    up to N=256 — see kernel/001_materialize_tile.py for the decode."""
+    import os as _os  # noqa: PLC0415
+
+    if _os.environ.get("DEPLODOCK_TMA_SWIZZLE", "0") not in ("1", "true", "True"):
+        return SwizzleMode.NONE
+    if not stage.axes:
+        return SwizzleMode.NONE
+    inner_bytes = int(stage.axes[-1].extent) * BYTES_PER_ELEM
+    if inner_bytes == 128:
+        return SwizzleMode.B128
+    if inner_bytes == 64:
+        return SwizzleMode.B64
+    if inner_bytes == 32:
+        return SwizzleMode.B32
+    return SwizzleMode.NONE
+
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -157,6 +189,7 @@ def _process(
                     pad=s.pad,
                     buffer_count=s.buffer_count,
                     phase=s.phase,
+                    swizzle=_pick_swizzle(s),
                 )
             )
             pending_wait = (*pending_wait, s)
