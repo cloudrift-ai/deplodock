@@ -34,6 +34,15 @@ Or for a specific test file:
 ./venv/bin/pytest tests/test_recipe.py -v
 ```
 
+When running a large subset (e.g. `tests/compiler/`), pass the same xdist flags `make test` uses to parallelize:
+
+```bash
+./venv/bin/pytest tests/compiler/ -p no:randomly -n auto --dist=loadgroup
+```
+
+`-n auto` spawns one worker per core; `--dist=loadgroup` keeps tests sharing an `xdist_group` (e.g. CUDA context) on the
+same worker.
+
 ## CLI Commands
 
 - `deplodock deploy local ...` — deploy locally via docker compose
