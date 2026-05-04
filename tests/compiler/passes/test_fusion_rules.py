@@ -274,9 +274,12 @@ def test_softmax_body_covers_all_ops():
     for k in _kernel_nodes(result):
         all_fns |= set(_assign_fns(k.op.body))
         all_fns |= _local_combine_fns(k.op.body.accums)
-    # Expect elementwise sub/exp/div and reduce combine add/max from the
-    # max and sum accumulators.
-    assert {"subtract", "exp", "divide"} <= all_fns
+    # Expect elementwise sub/exp and reduce combine add/max from the
+    # max and sum accumulators. ``divide(x, acc_sum)`` is split by
+    # ``split_invariant_divides`` (in ``ir/stmt/normalize.py``) into
+    # ``reciprocal(acc_sum) + multiply(x, recip)`` so the rcp can hoist
+    # out of the inner reduce — divide no longer appears as a body op.
+    assert {"subtract", "exp", "reciprocal", "multiply"} <= all_fns
     assert {"add", "maximum"} <= all_fns
 
 

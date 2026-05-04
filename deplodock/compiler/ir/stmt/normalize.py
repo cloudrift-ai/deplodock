@@ -51,6 +51,7 @@ def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
     stmts = eliminate_copy_aliases(stmts)
     stmts = unify_sibling_reduce_axes(stmts)
     if hoist:
+        stmts = split_invariant_divides(stmts)
         stmts = hoist_loop_invariants(stmts)
     stmts = simplify_body(stmts)
     stmts = rename_ssa_sequential(stmts)
@@ -213,7 +214,140 @@ def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tupl
 
 
 # ---------------------------------------------------------------------------
-# Pass 5: loop-invariant code motion
+# Pass 5a: split loop-invariant divides into reciprocal + multiply.
+# ---------------------------------------------------------------------------
+#
+# ``divide(x, y)`` lowers to a single-precision divide on the XU pipe (the
+# same pipe ``exp`` uses). When ``y`` is loop-invariant w.r.t. some
+# enclosing Loop and ``x`` is not, the divide can't hoist as-is — its live
+# set is the union of x's and y's. Splitting into::
+#
+#     recip_y = reciprocal(y)        # live = axes_of(y)
+#     result  = multiply(x, recip_y) # live = axes_of(x) ∪ {recip_y}
+#
+# lets the next pass (``hoist_loop_invariants``) move ``recip_y`` out of
+# every Loop axis that doesn't appear in ``y``. Inside the loop the
+# divide turns into a multiply (FMA pipe), which is typically the
+# under-utilized pipe on transcendental-heavy kernels (softmax,
+# RMSNorm, attention output). One XU op per outer-axis iteration
+# instead of one per inner-axis iteration.
+#
+# Gate: split iff ``axes_of(y)`` is a strict subset of ``axes_of(x)``.
+# That's the precise structural condition for "splitting unblocks at
+# least one Loop's worth of hoisting." Skip when y has axes x doesn't
+# (no hoisting wins) or when both have identical axes (rcp would stay
+# in the same scope as the original divide, no win and slight
+# precision drift). When y is a true scalar (axes_of empty), the rcp
+# hoists all the way to body root.
+# ---------------------------------------------------------------------------
+
+
+def split_invariant_divides(stmts: Body) -> Body:
+    """Rewrite ``divide(x, y)`` → ``reciprocal(y) + multiply(x, recip)``
+    when ``y``'s axis-dependency set is a strict subset of ``x``'s.
+
+    Tracks ``axes_of[name]`` the same way :func:`hoist_loop_invariants`
+    does. Generates fresh SSA names for the rcp; the trailing
+    :func:`rename_ssa_sequential` pass renumbers them into ``vN`` form.
+    """
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+
+    stmts = Body.coerce(stmts)
+    axes_of: dict[str, frozenset[str]] = {}
+    ssa_names: set[str] = set()
+    fresh_counter = [0]
+
+    def _fresh(prefix: str) -> str:
+        while True:
+            fresh_counter[0] += 1
+            n = f"{prefix}_{fresh_counter[0]}"
+            if n not in ssa_names:
+                ssa_names.add(n)
+                return n
+
+    def _load_axes(load: Load) -> frozenset[str]:
+        result: set[str] = set()
+        for e in load.index:
+            for v in e.free_vars():
+                if v in ssa_names:
+                    result |= axes_of.get(v, frozenset())
+                else:
+                    result.add(v)
+        return frozenset(result)
+
+    def _record(s: Stmt) -> None:
+        defined = s.defines()
+        if not defined:
+            return
+        name = defined[0]
+        if isinstance(s, Load):
+            axes_of[name] = _load_axes(s)
+        elif isinstance(s, Assign):
+            result: set[str] = set()
+            for a in s.args:
+                result |= axes_of.get(a, frozenset())
+            axes_of[name] = frozenset(result)
+        elif isinstance(s, Select):
+            result = set()
+            for b in s.branches:
+                result |= b.select.free_vars()
+                result |= axes_of.get(b.value, frozenset())
+            axes_of[name] = frozenset(result)
+        elif isinstance(s, Accum):
+            axes_of[name] = axes_of.get(s.value, frozenset())
+        else:
+            axes_of[name] = frozenset()
+        ssa_names.add(name)
+
+    def walk(body: Body) -> list[Stmt]:
+        out: list[Stmt] = []
+        for s in body:
+            if isinstance(s, Loop):
+                inner = walk(s.body)
+                out.append(replace(s, body=tuple(inner)))
+                # After the Loop closes, inner Accums become live for
+                # outer scope minus the loop axis (matches hoist_loop_invariants).
+                for c in inner:
+                    if isinstance(c, Accum):
+                        axes_of[c.name] = axes_of.get(c.value, frozenset()) - {s.axis.name}
+                        ssa_names.add(c.name)
+                continue
+            if isinstance(s, StridedLoop):
+                inner = walk(s.body)
+                out.append(replace(s, body=tuple(inner)))
+                for c in inner:
+                    if isinstance(c, Accum):
+                        ssa_names.add(c.name)
+                continue
+            if isinstance(s, Tile):
+                inner = walk(s.body)
+                out.append(Tile(axes=s.axes, body=tuple(inner)))
+                continue
+            if isinstance(s, Cond):
+                out.append(Cond(cond=s.cond, body=tuple(walk(s.body)), else_body=tuple(walk(s.else_body))))
+                continue
+            if isinstance(s, Assign) and s.op == ElementwiseImpl("divide") and len(s.args) == 2:
+                x_name, y_name = s.args
+                ax_x = axes_of.get(x_name, frozenset())
+                ax_y = axes_of.get(y_name, frozenset())
+                if ax_y < ax_x:  # strict subset → splitting unblocks at least one hoist
+                    recip_name = _fresh(f"recip_{y_name}")
+                    recip = Assign(name=recip_name, op=ElementwiseImpl("reciprocal"), args=(y_name,))
+                    mult = Assign(name=s.name, op=ElementwiseImpl("multiply"), args=(x_name, recip_name))
+                    out.append(recip)
+                    _record(recip)
+                    out.append(mult)
+                    _record(mult)
+                    continue
+            out.append(s)
+            _record(s)
+        return out
+
+    return tuple(walk(stmts))
+
+
+# ---------------------------------------------------------------------------
+# Pass 5b: loop-invariant code motion
 # ---------------------------------------------------------------------------
 
 
