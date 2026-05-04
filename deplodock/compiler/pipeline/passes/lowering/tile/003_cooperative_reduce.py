@@ -59,7 +59,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, StridedLoop
 from deplodock.compiler.ir.tile.ir import (
     BLOCK_SIZE,
     Combine,
@@ -84,26 +84,15 @@ PATTERN = [Pattern("root", TileOp)]
 
 
 def _accums_independent(body: Body) -> bool:
-    """True iff no Accum's value transitively depends on a prior Accum's
-    running value. Permits multiple independent Accums in one reduce
-    loop (e.g. ``sum`` + ``sum_of_squares``); rejects online algorithms
-    (online softmax, Welford) where one accumulator's update reads
-    another's running value.
-
-    Walks the body forward, maintaining a ``tainted`` set of SSA names
-    transitively derived from a prior Accum's name. An Accum whose
-    ``value`` is in ``tainted`` is dependent.
+    """True iff no Accum's value transitively depends on another
+    Accum's running value. Permits multiple independent Accums in one
+    reduce loop (e.g. ``sum`` + ``sum_of_squares``); rejects online
+    algorithms (online softmax, Welford) where one accumulator's
+    update reads another's running value.
     """
-    tainted: set[str] = set()
-    for s in body:
-        if isinstance(s, Accum):
-            if s.value in tainted:
-                return False
-            tainted.add(s.name)
-        elif isinstance(s, Assign):
-            if any(a in tainted for a in s.args):
-                tainted.add(s.name)
-    return True
+    body = Body.coerce(body)
+    accum_names = {s.name for s in body if isinstance(s, Accum)}
+    return not any(body.depends_on(s.value, accum_names - {s.name}) for s in body if isinstance(s, Accum))
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
