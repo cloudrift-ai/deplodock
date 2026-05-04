@@ -224,6 +224,24 @@ class Stmt:
         """
         return ()
 
+    def has_side_effects(self) -> bool:
+        """True iff executing this stmt produces an externally observable
+        effect (a buffer write). For compound stmts (Loop / StridedLoop /
+        Tile / Cond), True iff any nested stmt does.
+
+        Use this to gate transforms that change execution count
+        (hoisting, loop interchange, predication): a side-effecting
+        stmt run N times instead of M is observable, so it pins the
+        enclosing iteration to its current scope.
+
+        Note: ``Accum`` / ``Init`` are *not* side-effecting in this
+        sense — they're scope-bound (their semantics depend on which
+        Loop encloses them) but moving the *whole enclosing block* is
+        safe. Hoisting passes that want to move a Loop containing an
+        Accum need a separate scope-bound check on the leaf, not
+        ``has_side_effects`` on the wrapper."""
+        return any(c.has_side_effects() for sub in self.nested() for c in sub.iter())
+
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         """Write-side counterpart to :meth:`nested`. Return a copy of this
         stmt with its child bodies replaced by ``bodies`` (positionally

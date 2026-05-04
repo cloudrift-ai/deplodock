@@ -275,38 +275,84 @@ class Body(tuple[Stmt, ...]):
         walk(self)
         return closure
 
-    def depends_on(self, a: str | Iterable[str], b: str | Iterable[str]) -> bool:
-        """True iff any name in ``a`` transitively reads any name in
+    def _stmt_reads(self, s: Stmt) -> frozenset[str]:
+        """Names ``s`` transitively reads (axes + SSA), with axes bound
+        by ``s`` subtracted. For leaf stmts this matches
+        ``deps_closure[s.defines()[0]]``; for compound stmts (Loop /
+        StridedLoop / Tile / Cond) it rolls up every nested stmt's
+        reads and removes the wrapper's own bound axes — so e.g.
+        ``Loop(b, ...)._stmt_reads()`` does not contain ``b``."""
+        closure = self.deps_closure
+        seeds: set[str] = set(s.deps())
+        for e in s.exprs():
+            seeds.update(e.free_vars())
+        for sub in s.nested():
+            for c in sub.iter():
+                seeds.update(c.defines())
+                seeds.update(c.deps())
+                for e in c.exprs():
+                    seeds.update(e.free_vars())
+        out: set[str] = set(seeds)
+        for n in seeds:
+            out |= closure.get(n, frozenset())
+        return frozenset(out) - s.binds_axes()
+
+    def depends_on(self, a: Stmt | str | Iterable[Stmt | str], b: str | Iterable[str]) -> bool:
+        """True iff anything in ``a`` transitively reads any name in
         ``b``. Directional — does not check whether ``b`` reads ``a``;
         callers can swap arg order to flip direction.
 
-        Names may be scalar strings or iterables thereof; SSA names
-        and axis names are both accepted. Names not in
-        :attr:`deps_closure` (external references — Tile-input
-        buffers, ConstantOps, names from enclosing scopes) are
-        treated as having empty closure (read nothing transitively).
+        ``a`` may be a name, a ``Stmt``, or an iterable of either.
+        Passing a ``Stmt`` expands it to its read set: for a leaf this
+        is the closure of its defined name; for a compound stmt
+        (``Loop`` / ``StridedLoop`` / ``Tile`` / ``Cond``) it's the
+        rolled-up reads of every nested stmt with the wrapper's own
+        bound axes subtracted. ``b`` is always names — SSA or axis.
+        Names not in :attr:`deps_closure` (external references — Tile-
+        input buffers, ConstantOps, names from enclosing scopes) are
+        treated as having empty closure.
         """
-        a_set = {a} if isinstance(a, str) else set(a)
         b_set = {b} if isinstance(b, str) else set(b)
-        if not a_set or not b_set:
+        if not b_set:
             return False
         closure = self.deps_closure
-        for x in a_set:
-            if x in b_set:
-                return True
-            if not closure.get(x, frozenset()).isdisjoint(b_set):
-                return True
+        a_iter: Iterable[Stmt | str] = [a] if isinstance(a, (str, Stmt)) else a
+        for x in a_iter:
+            if isinstance(x, Stmt):
+                if not self._stmt_reads(x).isdisjoint(b_set):
+                    return True
+            else:
+                if x in b_set or not closure.get(x, frozenset()).isdisjoint(b_set):
+                    return True
         return False
 
-    def independent(self, a: str | Iterable[str], b: str | Iterable[str]) -> bool:
+    def independent(self, a: Stmt | str | Iterable[Stmt | str], b: Stmt | str | Iterable[Stmt | str]) -> bool:
         """True iff ``a`` and ``b`` share no dataflow path — neither
         ``a`` transitively reads any name in ``b`` nor vice versa.
         Symmetric counterpart to :meth:`depends_on`. Use this when
         asking "are these two things related at all?" (fusion safety,
         motion legality); use :meth:`depends_on` when direction
         matters (invariance, hoist gates).
-        """
-        return not (self.depends_on(a, b) or self.depends_on(b, a))
+
+        For symmetric usage, ``Stmt`` arguments on either side expand
+        to their *defined* names (what the stmt produces) when used as
+        a read target — same swap-and-call behavior as
+        :meth:`depends_on`."""
+
+        def _as_target(x: Stmt | str | Iterable[Stmt | str]) -> set[str]:
+            items = [x] if isinstance(x, (str, Stmt)) else list(x)
+            out: set[str] = set()
+            for it in items:
+                if isinstance(it, Stmt):
+                    for sub in it.nested():
+                        for c in sub.iter():
+                            out.update(c.defines())
+                    out.update(it.defines())
+                else:
+                    out.add(it)
+            return out
+
+        return not (self.depends_on(a, _as_target(b)) or self.depends_on(b, _as_target(a)))
 
     def deps_of(self, stmt: Stmt) -> tuple[Stmt | None, ...]:
         """Defining stmts inside this body for each of ``stmt``'s SSA

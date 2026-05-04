@@ -20,7 +20,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, SelectBranch, Write
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -321,82 +321,52 @@ def split_invariant_divides(stmts: Body) -> Body:
 
 
 def hoist_loop_invariants(stmts: Body) -> Body:
-    """Move ``Load`` / ``Assign`` / ``Select`` stmts out of ``Loop``s whose
-    axis their value doesn't depend on. Hoisting only crosses ``Loop``
-    boundaries; ``StridedLoop`` / ``Tile`` / ``Cond`` are barriers but are
-    recursed into so inner Loops still get the optimization.
+    """Move stmts out of ``Loop``s whose axis they don't depend on.
 
-    Loop-invariance is queried via :meth:`Body.depends_on` against the
-    pre-computed transitive closure for the whole body. The local
-    ``bindings`` tracking is still position-dependent — it gates whether
-    a hoist-candidate's SSA deps are *available* at the hoist site, a
-    visibility question separate from dataflow invariance.
+    Hoists ``Load`` / ``Assign`` / ``Select`` (SSA values) and entire
+    ``Loop`` / ``StridedLoop`` / ``Tile`` / ``Cond`` blocks whose contents
+    transitively avoid the outer axis — provided the block contains no
+    ``Write`` (a Write hoist would change observable side effects).
+    Block-level hoisting is what lets a Loop and its downstream consumer
+    move together: hoisting just the consumer would leave it referencing
+    an Accum still defined inside the outer Loop body.
+
+    ``Accum`` / ``Init`` / ``Write`` always stay (iteration-tied
+    semantics). Loop-invariance is queried via :meth:`Body.depends_on`
+    against the body's transitive read closure, so the hoisted set is
+    automatically closed under SSA dependencies — no separate ordering
+    check is needed.
     """
     stmts = Body.coerce(stmts)
-    closure = stmts.deps_closure  # transitive read closure, including axis names
-    ssa_names = frozenset(closure.keys())
 
-    def _ssa_deps(s: Stmt) -> tuple[str, ...]:
-        """Immediate SSA-only deps (axis vars from indices excluded)."""
-        if isinstance(s, Load):
-            return tuple(v for e in s.index for v in e.free_vars() if v in ssa_names)
-        if isinstance(s, Assign):
-            return s.args
-        if isinstance(s, Select):
-            return tuple(b.value for b in s.branches)
-        return ()
+    def _hoistable(s: Stmt, axis: str) -> bool:
+        # Accum / Init are scope-bound to their enclosing Loop's reduction — they can't
+        # move alone, but the whole enclosing block can. Side-effecting stmts (Write, or
+        # any block containing a Write) pin their iteration count and stay put.
+        if isinstance(s, (Accum, Init)) or s.has_side_effects():
+            return False
+        return not stmts.depends_on(s, axis)
 
-    def walk(body: Body, outer_bindings: set[str]) -> list[Stmt]:
+    def walk(body: Body) -> list[Stmt]:
         new_body: list[Stmt] = []
-        bindings = set(outer_bindings)
-
         for s in body:
-            if isinstance(s, Loop):
-                inner = walk(s.body, bindings)
+            if isinstance(s, (Loop, StridedLoop)):
+                inner = walk(s.body)
                 axis = s.axis.name
-                hoisted_names: set[str] = set()
-                hoisted: list[Stmt] = []
-                stay: list[Stmt] = []
-                for c in inner:
-                    if isinstance(c, (Load, Assign, Select)):
-                        # Hoistable iff (1) value doesn't transitively depend
-                        # on the loop axis, and (2) every immediate SSA dep
-                        # is already in scope at the hoist site.
-                        if not stmts.depends_on(c.name, axis) and all(d in bindings or d in hoisted_names for d in _ssa_deps(c)):
-                            hoisted.append(c)
-                            hoisted_names.add(c.name)
-                            continue
-                    stay.append(c)
-
-                for h in hoisted:
-                    new_body.append(h)
-                    bindings.add(h.name)
+                hoisted = [c for c in inner if _hoistable(c, axis)]
+                hoisted_ids = {id(c) for c in hoisted}
+                stay = [c for c in inner if id(c) not in hoisted_ids]
+                new_body.extend(hoisted)
                 new_body.append(replace(s, body=tuple(stay)))
-
-                for c in inner:
-                    if isinstance(c, Accum):
-                        bindings.add(c.name)
-            elif isinstance(s, StridedLoop):
-                inner = walk(s.body, bindings)
-                new_body.append(replace(s, body=tuple(inner)))
-                for c in inner:
-                    if isinstance(c, Accum):
-                        bindings.add(c.name)
             elif isinstance(s, Tile):
-                inner = walk(s.body, bindings)
-                new_body.append(Tile(axes=s.axes, body=tuple(inner)))
+                new_body.append(Tile(axes=s.axes, body=tuple(walk(s.body))))
             elif isinstance(s, Cond):
-                inner_b = walk(s.body, bindings)
-                inner_e = walk(s.else_body, bindings)
-                new_body.append(Cond(cond=s.cond, body=tuple(inner_b), else_body=tuple(inner_e)))
+                new_body.append(Cond(cond=s.cond, body=tuple(walk(s.body)), else_body=tuple(walk(s.else_body))))
             else:
                 new_body.append(s)
-                for n in s.defines():
-                    bindings.add(n)
-
         return new_body
 
-    return tuple(walk(stmts, set()))
+    return tuple(walk(stmts))
 
 
 # ---------------------------------------------------------------------------

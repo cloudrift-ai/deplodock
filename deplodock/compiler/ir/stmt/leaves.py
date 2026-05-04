@@ -246,6 +246,9 @@ class Write(Stmt):
     def exprs(self) -> tuple[Expr, ...]:
         return self.index
 
+    def has_side_effects(self) -> bool:
+        return True
+
     def rewrite(
         self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
     ) -> Stmt:
