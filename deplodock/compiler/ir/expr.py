@@ -122,6 +122,57 @@ def _coerce(v: Expr | int | float) -> Expr:
     return v
 
 
+def apply_binop(op: str, lv: object, rv: object) -> object:
+    """Apply a BinOp to two already-evaluated values.
+
+    Pure helper — no env coupling. Shared by ``BinOp.eval`` (numpy-aware
+    evaluation) and ``ir.simplify`` (constant folding on Literal children).
+    Values may be scalars or numpy ndarrays; arithmetic composes via numpy
+    broadcasting. Integer floor division is used for both ``/`` and ``//``.
+    """
+    if op == "+":
+        return lv + rv
+    if op == "-":
+        return lv - rv
+    if op == "*":
+        return lv * rv
+    if op in ("/", "//"):
+        try:
+            return int(lv) // int(rv)
+        except TypeError:
+            return lv // rv
+    if op == "%":
+        try:
+            return int(lv) % int(rv)
+        except TypeError:
+            return lv % rv
+    if op == "<":
+        return lv < rv
+    if op == "<=":
+        return lv <= rv
+    if op == ">":
+        return lv > rv
+    if op == ">=":
+        return lv >= rv
+    if op == "==":
+        return lv == rv
+    if op == "&&":
+        try:
+            return bool(lv) and bool(rv)
+        except (TypeError, ValueError):
+            import numpy as np
+
+            return np.logical_and(lv, rv)
+    if op == "||":
+        try:
+            return bool(lv) or bool(rv)
+        except (TypeError, ValueError):
+            import numpy as np
+
+            return np.logical_or(lv, rv)
+    raise ValueError(f"Unknown BinOp: {op}")
+
+
 # ---------------------------------------------------------------------------
 # Expression types
 # ---------------------------------------------------------------------------
