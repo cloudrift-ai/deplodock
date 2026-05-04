@@ -203,6 +203,32 @@ def _launch(
     kernel(launch.grid, launch.block, args, shared_mem=0)
 
 
+def _collapse_inert_dims(arr_shape: tuple[int, ...], box_extents: tuple[int, ...]) -> tuple[int, ...]:
+    """Reconstruct the materializer's gap-singleton drop from runtime info.
+
+    The materializer drops gap source dims that are extent-1 singletons
+    with literal-0 origin coords (a literal-0 origin can only arise for
+    a singleton arr dim, since otherwise IR construction would have
+    emitted a ``Var`` or expression). At runtime we don't carry that
+    decision explicitly — instead we walk ``arr_shape`` and
+    ``box_extents`` innermost-first and drop any arr dim of extent 1
+    that lines up with a box dim of extent > 1. Leading singletons
+    pair with their (kept) box==1 entry and stay; gap singletons fall
+    out exactly where the materializer dropped them."""
+    arr_rev = list(reversed(arr_shape))
+    box_rev = list(reversed(box_extents))
+    kept: list[int] = []
+    bi = 0
+    for a in arr_rev:
+        if bi < len(box_rev) and a == 1 and box_rev[bi] != 1:
+            continue  # dropped gap singleton
+        kept.append(a)
+        bi += 1
+    if bi != len(box_rev) or len(kept) != len(box_rev):
+        raise ValueError(f"TMA descriptor rank mismatch: arr_shape={arr_shape!r} cannot be collapsed to match box_extents={box_extents!r}")
+    return tuple(reversed(kept))
+
+
 def _prebuild_descriptors(compiled: _Compiled, arrays: dict[str, cp.ndarray]) -> dict[int, dict[str, cp.ndarray]]:
     """Encode every TMA ``CUtensorMap`` for ``compiled`` up-front.
 
@@ -231,8 +257,7 @@ def _prebuild_descriptors(compiled: _Compiled, arrays: dict[str, cp.ndarray]) ->
         per_launch: dict[str, cp.ndarray] = {}
         for desc in launch.tma_descriptors:
             arr = arrays[desc.src_buf]
-            full_shape = tuple(int(d) for d in arr.shape)
-            src_shape = full_shape if desc.keep_dims is None else tuple(full_shape[d] for d in desc.keep_dims)
+            src_shape = _collapse_inert_dims(tuple(int(d) for d in arr.shape), desc.box_extents)
             desc_bytes = _tma.encode_tiled(
                 global_address=int(arr.data.ptr),
                 src_shape=src_shape,

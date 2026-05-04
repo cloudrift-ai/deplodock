@@ -151,7 +151,7 @@ def _materialize(blk: Tile) -> Stmt:
     # (so two stages in the same group issue from tid 0 and tid 1
     # respectively, distributing the arrive+TMA work).
     issuer_tid: dict[str, int] = {}
-    for gid, names in enumerate(group_stage_names):
+    for names in group_stage_names:
         for idx, name in enumerate(sorted(names)):
             issuer_tid[name] = idx
 
@@ -185,41 +185,42 @@ def _materialize(blk: Tile) -> Stmt:
         desc_name = f"{stage.name}_desc"
         gid = stage_group[id(stage)]
         mbar_name = _mbar_name(gid)
+        assert isinstance(stage.addressing, AffineAddressing)
+        # Box extents per source dim: product of cache extents that map
+        # to that dim (a single source dim can be spanned by multiple
+        # cache axes, e.g. matmul fragments where the M-dim is split
+        # across an outer-block axis and a per-thread fragment axis).
+        # Dims not covered by any cache axis get extent 1 — the coord
+        # supplies the origin and the slab is scalar in that dim.
+        box_per_dim: dict[int, int] = {}
+        for d, ax in zip(stage.addressing.dims, stage.axes, strict=True):
+            box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
+        full_box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
+        # Drop *gap* inert dims (``box == 1`` AND ``origin`` is literal
+        # 0) that sit between the first and last swept source dims.
+        # Leading singletons stay in the descriptor — keeping them
+        # matches the rank-3 shape the working linear-matmul TMA kernels
+        # emit. Gap singletons (e.g. the kv_head=1 axis between seq and
+        # head_dim in GQA's V tensor) must be dropped — without it, the
+        # rank-4 descriptor with the gap singleton deadlocks pipelined
+        # TMA at seq=512. The runtime encoder reconstructs the same
+        # collapse from ``arr.shape`` + ``box_extents`` alone (a literal-
+        # 0 origin coord can only be emitted for a singleton arr dim, so
+        # at runtime "drop extent-1 arr dims that align with box dims of
+        # extent > 1" recovers exactly the materializer's decision).
+        swept = stage.addressing.dims
+        outer, inner = swept[0], swept[-1]
+        kept = tuple(
+            d
+            for d in range(len(stage.origin))
+            if d < outer
+            or d > inner
+            or d in swept
+            or not (full_box[d] == 1 and isinstance(stage.origin[d], Literal) and int(stage.origin[d].value) == 0)
+        )
+        box = tuple(full_box[d] for d in kept)
+        coords = tuple(stage.origin[d] for d in kept)
         if desc_name not in descriptors:
-            assert isinstance(stage.addressing, AffineAddressing)
-            # Box extents per source dim: product of cache extents that
-            # map to that dim (a single source dim can be spanned by
-            # multiple cache axes, e.g. matmul fragments where the
-            # M-dim is split across an outer-block axis and a
-            # per-thread fragment axis). Dims not covered by any cache
-            # axis get extent 1 — the coord supplies the origin and
-            # the slab is scalar in that dim. Total box rank ==
-            # ``len(origin)`` == ``len(src_shape)``.
-            box_per_dim: dict[int, int] = {}
-            for d, ax in zip(stage.addressing.dims, stage.axes, strict=True):
-                box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
-            full_box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
-            # Drop only *gap* inert dims — singletons that sit between
-            # the first and last swept source dim. Leading singletons
-            # (e.g. the batch=1 axis on activations) stay in the
-            # descriptor: keeping them matches the descriptor shape that
-            # working linear-matmul TMA kernels emit, so the rank stays
-            # rank-3 for those and we don't perturb their performance.
-            # Gap singletons (e.g. the kv_head=1 axis between seq and
-            # head_dim in GQA's V tensor) must be dropped — without that
-            # collapse, the rank-4 descriptor with the gap singleton
-            # deadlocks pipelined TMA at seq=512.
-            swept = stage.addressing.dims
-            inner = swept[-1]
-            outer = swept[0]
-            keep_dims = tuple(
-                d for d in range(len(stage.origin))
-                if d < outer
-                or d > inner
-                or d in swept
-                or not (full_box[d] == 1 and isinstance(stage.origin[d], Literal) and int(stage.origin[d].value) == 0)
-            )
-            box = tuple(full_box[d] for d in keep_dims)
             # Source shape is unknown at materialization time — the
             # backend resolves it from the bound array at launch. Pass
             # an empty tuple as a sentinel; descriptor encoding fills it.
@@ -230,10 +231,7 @@ def _materialize(blk: Tile) -> Stmt:
                 box_extents=box,
                 swizzle=stage.swizzle.value,
                 dtype="float",
-                keep_dims=keep_dims if len(keep_dims) < len(stage.origin) else None,
             )
-        keep = descriptors[desc_name].keep_dims
-        coords = stage.origin if keep is None else tuple(stage.origin[d] for d in keep)
         if mbar_name not in declared_mbar:
             declared_mbar.add(mbar_name)
             # Per-group mbarrier array: one mbar per ring-buffer slot,
