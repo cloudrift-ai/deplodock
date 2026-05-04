@@ -209,12 +209,16 @@ class Stmt:
         ``axis_fn``. Subclasses without axes accept and ignore ``axis_fn``;
         Loop-like subclasses thread it through their bodies.
 
-        ``rename_ssa`` is applied uniformly to the stmt's own name (if any)
-        and to each name it reads. Callers typically provide a callable
-        that defaults to identity (``lambda n: mapping.get(n, n)``) so only
-        the names they care about are changed.
+        Per-stmt logic lives in :mod:`.passes` (singledispatch over Stmt
+        type + introspection walker for the Stage hierarchy). This method
+        is a thin shim so existing call sites (``s.rewrite(...)``) keep
+        working. Tile-IR Stmt registrations are loaded by importing
+        ``deplodock.compiler.ir.tile.ir`` (which any caller passing a
+        Tile-IR Stmt has done already).
         """
-        raise NotImplementedError
+        from deplodock.compiler.ir.stmt.passes import rewrite  # noqa: PLC0415
+
+        return rewrite(self, rename_ssa, sigma, axis_fn)
 
     def nested(self) -> tuple[Body, ...]:
         """Child statement bodies for tree traversal.

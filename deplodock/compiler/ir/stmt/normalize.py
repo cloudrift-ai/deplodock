@@ -15,12 +15,12 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Interval, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -372,65 +372,20 @@ def hoist_loop_invariants(stmts: Body) -> Body:
 # ---------------------------------------------------------------------------
 # Pass 6: simplify Exprs inside body Stmts (constant folding, identity collapse,
 # range-based comparison folding). The per-Expr rewrite logic lives on each
-# ``Expr`` subclass as ``simplify(ctx)``; this pass just walks the body and
-# threads ``SimplifyCtx`` ranges as it descends.
+# ``Expr`` subclass as ``simplify(ctx)``; the walk over Stmts is dispatched
+# in :mod:`.passes` (singledispatch + Stage introspection).
 # ---------------------------------------------------------------------------
-
-
-def _simplify_expr_tuple(xs: tuple[Expr, ...], ctx: SimplifyCtx) -> tuple[Expr, ...]:
-    return tuple(e.simplify(ctx) for e in xs)
-
-
-def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
-    if isinstance(stmt, Loop):
-        inner = ctx.extend(stmt.axis.name, Interval(0, stmt.axis.extent - 1))
-        return replace(stmt, body=tuple(_simplify_stmt(s, inner) for s in stmt.body))
-    if isinstance(stmt, StridedLoop):
-        inner = ctx.extend(stmt.axis.name, Interval(0, stmt.axis.extent - 1))
-        return replace(
-            stmt,
-            start=stmt.start.simplify(ctx),
-            step=stmt.step.simplify(ctx) if isinstance(stmt.step, Expr) else stmt.step,
-            body=tuple(_simplify_stmt(s, inner) for s in stmt.body),
-        )
-    if isinstance(stmt, Tile):
-        inner = ctx
-        for ba in stmt.axes:
-            inner = inner.extend(ba.axis.name, Interval(0, ba.axis.extent - 1))
-        return Tile(axes=stmt.axes, body=tuple(_simplify_stmt(s, inner) for s in stmt.body))
-    if isinstance(stmt, Cond):
-        return Cond(
-            cond=stmt.cond.simplify(ctx),
-            body=tuple(_simplify_stmt(s, ctx) for s in stmt.body),
-            else_body=tuple(_simplify_stmt(s, ctx) for s in stmt.else_body),
-        )
-    if isinstance(stmt, Select):
-        return Select(stmt.name, tuple(SelectBranch(b.value, b.select.simplify(ctx)) for b in stmt.branches))
-    if isinstance(stmt, Write):
-        return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value, reduce_op=stmt.reduce_op)
-    if isinstance(stmt, Load):
-        return Load(stmt.name, stmt.input, _simplify_expr_tuple(stmt.index, ctx))
-    # Tile-IR-only ``Stage`` (+ BufferedStage / AsyncBufferedStage /
-    # TmaBufferedStage subtypes). Each subclass overrides ``_simplify_kwargs``
-    # to thread its own Expr fields through ``ctx`` and forward all
-    # subtype-specific fields (e.g. ``swizzle``); we just call it and
-    # reconstruct via ``type(stmt)(**kwargs)``. Adding a new Stage field
-    # only needs the subclass's own override, not a branch here.
-    # Lazy import to avoid a tile→stmt circular at module load time.
-    from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415
-
-    if isinstance(stmt, Stage):
-        return type(stmt)(**stmt._simplify_kwargs(ctx))
-    # Assign / Accum / Combine carry only SSA names — no Expr field to simplify.
-    return stmt
 
 
 def simplify_body(body: Body) -> Body:
     """Simplify every Expr inside a body. Seeds ``SimplifyCtx`` from
-    ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends."""
+    ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends.
+    Tile-IR Stmt registrations are loaded when ``tile.ir`` is imported."""
+    from deplodock.compiler.ir.stmt.passes import simplify  # noqa: PLC0415
+
     body = Body.coerce(body)
     ctx = SimplifyCtx.empty()
-    return tuple(_simplify_stmt(s, ctx) for s in body)
+    return tuple(simplify(s, ctx) for s in body)
 
 
 # ---------------------------------------------------------------------------

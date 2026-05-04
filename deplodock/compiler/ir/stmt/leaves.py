@@ -7,14 +7,11 @@ Tile / Cond) live in ``blocks``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, Var, _float_lit
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _axis_identity, _pad, op_to_expr, render_index, select_to_ternary
+from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, op_to_expr, render_index, select_to_ternary
 
 
 @dataclass(frozen=True)
@@ -49,11 +46,6 @@ class Load(Stmt):
 
     def is_literal(self, literal_constants: dict[str, float]) -> bool:
         return self.input in literal_constants
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return Load(name=rename_ssa(self.name), input=self.input, index=tuple(sigma.apply(e) for e in self.index))
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
@@ -90,11 +82,6 @@ class Assign(Stmt):
 
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return Assign(name=rename_ssa(self.name), op=self.op, args=tuple(rename_ssa(a) for a in self.args))
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}{self.name} = {self.op.name}({', '.join(self.args)})"]
@@ -143,11 +130,6 @@ class Accum(Stmt):
 
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return Accum(name=rename_ssa(self.name), value=rename_ssa(self.value), op=self.op)
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}{self.name} <- {self.op.name}({self.name}, {self.value})"]
@@ -198,11 +180,6 @@ class Init(Stmt):
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
 
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return Init(name=rename_ssa(self.name), op=self.op)
-
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}Init({self.name}, op={self.op.name})"]
 
@@ -248,16 +225,6 @@ class Write(Stmt):
 
     def has_side_effects(self) -> bool:
         return True
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return Write(
-            output=self.output,
-            index=tuple(sigma.apply(e) for e in self.index),
-            value=rename_ssa(self.value),
-            reduce_op=self.reduce_op,
-        )
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
@@ -305,14 +272,6 @@ class Select(Stmt):
 
     def exprs(self) -> tuple[Expr, ...]:
         return tuple(b.select for b in self.branches)
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return Select(
-            name=rename_ssa(self.name),
-            branches=tuple(SelectBranch(value=rename_ssa(b.value), select=sigma.apply(b.select)) for b in self.branches),
-        )
 
     def pretty(self, indent: str = "") -> list[str]:
         lines: list[str] = []
