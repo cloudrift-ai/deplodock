@@ -124,24 +124,62 @@ def _materialize(blk: Tile) -> Stmt:
     # so the inverse decode is ``c_phys = c_logical XOR ((row & 7) * shift)``
     # where shift selects the swizzle granularity (4 for B128, 2 for B64,
     # 1 for B32). Body Loads invert by the same XOR.
-    swizzled_smem: dict[str, int] = {}
+    # ``shift`` (4/2/1) is the swizzle XOR granularity in fp32 indices;
+    # ``inner_per_swizzle`` is the swizzle width in fp32 elements (32/16/8).
+    # When the stage's full inner cache extent exceeds ``inner_per_swizzle``,
+    # the descriptor is emitted as a higher-rank box ``(K, N_outer, N_inner)``
+    # — the smem layout stays flat (BN-wide), but the swizzle pattern resets
+    # every ``inner_per_swizzle`` elements, and the swizzle-row index becomes
+    # ``row * N_outer + n_outer`` (one 128-byte line per ``n_outer`` step
+    # within a single K row, then ``N_outer`` more lines per K step).
+    swizzled_smem: dict[str, tuple[int, int]] = {}  # name → (shift, inner_per_swizzle)
     _shift_for = {SwizzleMode.B128: 4, SwizzleMode.B64: 2, SwizzleMode.B32: 1}
     for s in body.iter():
         if isinstance(s, TmaBufferedStage) and s.swizzle != SwizzleMode.NONE:
-            swizzled_smem[s.name] = _shift_for[s.swizzle]
+            shift = _shift_for[s.swizzle]
+            inner_per_swizzle = shift * 8  # 32/16/8 fp32 = 128/64/32 B
+            swizzled_smem[s.name] = (shift, inner_per_swizzle)
+
+    # Per-stage full inner extent ``BN`` so the decoder can compute
+    # ``BN / inner_per_swizzle`` (= the row-multiplier ``N_outer``). Read
+    # from each TMA stage's last cache axis at body scan time.
+    swizzled_inner_extent: dict[str, int] = {}
+    for s in body.iter():
+        if isinstance(s, TmaBufferedStage) and s.swizzle != SwizzleMode.NONE and s.axes:
+            swizzled_inner_extent[s.name] = int(s.axes[-1].extent)
 
     def _swizzle_load(load: Load) -> Load:
         # Index layout for a BufferedStage Load: ``[phase, *cache_axes]``.
-        # Last index is the inner (column); second-to-last is the row that
-        # drives the swizzle XOR.
+        # Last index is the inner (column); second-to-last is the row.
+        # When ``BN > inner_per_swizzle`` the swizzle pattern resets every
+        # ``inner_per_swizzle`` columns, so the XOR row is
+        # ``row * N_outer + n_outer`` (with ``N_outer = BN / IPS``).
         if len(load.index) < 3:
             return load
-        shift = swizzled_smem[load.input]
+        shift, inner_per_swizzle = swizzled_smem[load.input]
+        bn = swizzled_inner_extent[load.input]
+        row_mult = bn // inner_per_swizzle  # = N_outer
         row = load.index[-2]
         inner = load.index[-1]
-        row_bits = BinaryExpr("&", row, Literal(7, "int"))
+        n_outer = BinaryExpr("/", inner, Literal(inner_per_swizzle, "int"))
+        n_inner = BinaryExpr("%", inner, Literal(inner_per_swizzle, "int"))
+        # swizzle_row = row * row_mult + n_outer
+        if row_mult == 1:
+            swizzle_row: object = BinaryExpr("+", row, n_outer)
+        else:
+            swizzle_row = BinaryExpr(
+                "+", BinaryExpr("*", row, Literal(row_mult, "int")), n_outer
+            )
+        row_bits = BinaryExpr("&", swizzle_row, Literal(7, "int"))
         xor_term = row_bits if shift == 1 else BinaryExpr("*", row_bits, Literal(shift, "int"))
-        new_inner = BinaryExpr("^", inner, xor_term)
+        n_inner_phys = BinaryExpr("^", n_inner, xor_term)
+        # Reassemble the linear inner index: n_outer * IPS + n_inner_phys
+        if inner_per_swizzle == 1:
+            new_inner: object = n_inner_phys
+        else:
+            new_inner = BinaryExpr(
+                "+", BinaryExpr("*", n_outer, Literal(inner_per_swizzle, "int")), n_inner_phys
+            )
         return replace(load, index=(*load.index[:-1], new_inner))
 
     def transform(s: Stmt) -> Stmt:
@@ -251,6 +289,26 @@ def _materialize(blk: Tile) -> Stmt:
         )
         box = tuple(full_box[d] for d in kept)
         coords = tuple(stage.origin[d] for d in kept)
+        # Swizzle on a wide-inner stage: split the descriptor's inner box
+        # dim into ``(BN/IPS, IPS)`` so ``cuTensorMapEncodeTiled`` sees an
+        # innermost box of exactly the swizzle width. The runtime encoder
+        # reinterprets the source's last dim accordingly. The smem alloc
+        # stays flat — body Loads decode via ``_swizzle_load`` above.
+        if stage.swizzle != SwizzleMode.NONE and box:
+            ips = _shift_for[stage.swizzle] * 8  # 32 / 16 / 8 fp32
+            inner_extent = box[-1]
+            if inner_extent > ips and inner_extent % ips == 0:
+                box = (*box[:-1], inner_extent // ips, ips)
+                # Coord for the new outer dim: split the original inner
+                # coord by IPS so the descriptor's reverse-row-major
+                # ``(K, N_outer, N_inner)`` view starts at the right
+                # element. ``coords`` is in C order (same order as
+                # ``kept``); the new outer coord is ``orig_inner / IPS``,
+                # the new inner coord is ``orig_inner % IPS``.
+                orig_inner_coord = coords[-1]
+                outer_coord = BinaryExpr("/", orig_inner_coord, Literal(ips, "int"))
+                inner_coord = BinaryExpr("%", orig_inner_coord, Literal(ips, "int"))
+                coords = (*coords[:-1], outer_coord, inner_coord)
         if desc_name not in descriptors:
             # Source shape is unknown at materialization time — the
             # backend resolves it from the bound array at launch. Pass

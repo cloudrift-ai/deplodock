@@ -69,10 +69,17 @@ def _pick_swizzle(stage: BufferedStage) -> SwizzleMode:
     """Match the inner box-dim byte size to a TMA swizzle width.
 
     ``cuTensorMapEncodeTiled`` requires ``box_dim[innermost] * elem_size``
-    to equal the chosen swizzle width exactly: 128 B for ``B128``, 64 B for
-    ``B64``, 32 B for ``B32``. Wider inner boxes (e.g. matmul slabs with
-    a 128-fp32 thread axis = 512 B inner) don't fit any mode and stay on
-    ``NONE``. Gated behind ``tuning._tma_swizzle_enabled``."""
+    to equal one of the swizzle widths exactly (128 / 64 / 32 B). The
+    materializer can also emit a higher-rank descriptor that splits a
+    wider inner cache axis into ``(N_outer, N_inner)`` so the descriptor
+    sees the matching width — ``inner_extent`` here is in fp32 elements,
+    so a multiple of {32, 16, 8} qualifies. The split decoder is currently
+    only validated for stages whose body Loads index linearly into the
+    flat smem buffer with a single ``(row, inner)`` axis pair; the default
+    matmul ``BN=128 BM=64`` slab has a body-Load shape that triggers a
+    decoder bug we haven't tracked down yet, so the picker stays at exact
+    match for now (no split) and the wider-inner path is left dormant.
+    Gated behind ``tuning._tma_swizzle_enabled``."""
     from deplodock.compiler.tuning import _tma_swizzle_enabled  # noqa: PLC0415
 
     if not _tma_swizzle_enabled():
@@ -80,12 +87,9 @@ def _pick_swizzle(stage: BufferedStage) -> SwizzleMode:
     if not stage.axes:
         return SwizzleMode.NONE
     inner_bytes = int(stage.axes[-1].extent) * BYTES_PER_ELEM
-    if inner_bytes == 128:
-        return SwizzleMode.B128
-    if inner_bytes == 64:
-        return SwizzleMode.B64
-    if inner_bytes == 32:
-        return SwizzleMode.B32
+    for width, mode in ((128, SwizzleMode.B128), (64, SwizzleMode.B64), (32, SwizzleMode.B32)):
+        if inner_bytes == width:
+            return mode
     return SwizzleMode.NONE
 
 
