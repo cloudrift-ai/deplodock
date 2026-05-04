@@ -105,8 +105,7 @@ def test_run_code_sdpa_tinyllama_per_head(run_cli):
     rc, _, stderr = run_cli(
         "run",
         "--code",
-        "torch.nn.functional.scaled_dot_product_attention("
-        "torch.randn(1,1,512,64), torch.randn(1,1,512,64), torch.randn(1,1,512,64))",
+        "torch.nn.functional.scaled_dot_product_attention(torch.randn(1,1,512,64), torch.randn(1,1,512,64), torch.randn(1,1,512,64))",
     )
     assert rc == 0, f"stderr: {stderr}"
 
@@ -123,8 +122,7 @@ def test_run_code_sdpa_seq1024_dynamic_smem(run_cli):
     rc, _, stderr = run_cli(
         "run",
         "--code",
-        "torch.nn.functional.scaled_dot_product_attention("
-        "torch.randn(1,32,1024,64), torch.randn(1,32,1024,64), torch.randn(1,32,1024,64))",
+        "torch.nn.functional.scaled_dot_product_attention(torch.randn(1,32,1024,64), torch.randn(1,32,1024,64), torch.randn(1,32,1024,64))",
     )
     assert rc == 0, f"stderr: {stderr}"
 
@@ -138,8 +136,7 @@ def test_run_code_sdpa_tinyllama_full(run_cli):
     rc, _, stderr = run_cli(
         "run",
         "--code",
-        "torch.nn.functional.scaled_dot_product_attention("
-        "torch.randn(1,32,512,64), torch.randn(1,32,512,64), torch.randn(1,32,512,64))",
+        "torch.nn.functional.scaled_dot_product_attention(torch.randn(1,32,512,64), torch.randn(1,32,512,64), torch.randn(1,32,512,64))",
     )
     assert rc == 0, f"stderr: {stderr}"
 
