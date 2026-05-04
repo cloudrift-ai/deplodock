@@ -56,7 +56,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, AsyncWait, BufferedStage, TileOp, TmaBufferedStage
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, is_matmul_k_outer, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -80,30 +80,42 @@ def _maybe_rewrite(body: Body) -> Body | None:
 def _process(body: Body) -> Body:
     new_body: list[Stmt] = []
     changed = False
+    invariant_names: set[str] = set()
     for s in body:
-        if isinstance(s, Loop) and not s.is_reduce and _eligible(s):
+        if isinstance(s, Loop) and not s.is_reduce and _eligible(s, invariant_names):
             replacement = _pipeline(s)
             if replacement is not None:
                 new_body.extend(replacement)
                 changed = True
+                invariant_names.update(collect_invariant_names(s))
                 continue
         new_body.append(s)
+        invariant_names.update(collect_invariant_names(s))
     return tuple(new_body) if changed else body
 
 
-def _eligible(loop: Loop) -> bool:
+def _eligible(loop: Loop, invariant_names: set[str]) -> bool:
     """K-outer loop with all body staged loads as ``AsyncBufferedStage``
     (and a *pure-matmul* reduce body — Load/Assign/Accum only AND no
-    read of an SSA name not defined locally inside the reduce).
+    read of an SSA name not defined locally inside the reduce, except
+    when that name is loop-invariant w.r.t. the K-outer).
 
-    The cross-loop-deps gate is critical here: kernels like SDPA's
-    per-output free loop have a reduce body that reads ``acc0`` /
-    ``acc1`` from prior softmax reduces; pipelining keeps the math
-    right but compounding fp32 drift in the rearranged commits
-    manifests as too-large diff vs eager.
+    The cross-loop-deps gate originally rejected *all* reads of
+    non-locally-defined SSA names: kernels like SDPA's per-output
+    free loop have a reduce body that reads ``acc0`` / ``acc1`` from
+    prior softmax reduces, and pipelining was suspected to compound
+    fp32 drift in the rearranged commits.
 
-    ``013_double_buffer`` keeps its own variant of this gate for the
-    same fp32-drift reason."""
+    The relaxation: a cross-loop name is allowed when it lives in
+    ``invariant_names`` — names defined by sibling stmts above the
+    K-outer at the same scope. Those values are finalized before the
+    K-outer starts, so the steady-state can read them from registers
+    without phase-dependent reordering. The original Accum-running-
+    value rejection (``Body.deps_of`` returning an in-body ``Accum``
+    for a non-Accum stmt) still holds via 013's ``extra_gate`` and is
+    the precise pattern the drift comment was about.
+
+    ``013_double_buffer`` runs the same relaxed gate."""
 
     def gate(k_outer: Loop, k_inner: Loop) -> bool:
         if int(k_outer.axis.extent) < 2:
@@ -121,11 +133,13 @@ def _eligible(loop: Loop) -> bool:
             return False
         if len({s.buffer_count for s in stages}) != 1:
             return False
-        # Cross-loop-deps gate: no read of a non-locally-defined SSA name
-        # (excludes online-softmax fusions). See _eligible's docstring.
-        # ``Body.deps_of(c)`` returns one resolved Stmt (or None for
-        # external reads) per dep; we reject any None.
-        return all(s is not None for c in k_inner.body for s in k_inner.body.deps_of(c))
+        # Cross-loop-deps gate, relaxed: reject only when an unresolved
+        # dep is *not* in ``invariant_names``.
+        for c in k_inner.body:
+            for d, defstmt in zip(c.deps(), k_inner.body.deps_of(c), strict=False):
+                if defstmt is None and d not in invariant_names:
+                    return False
+        return True
 
     return is_matmul_k_outer(loop, extra_gate=gate)
 

@@ -201,6 +201,113 @@ class Body(tuple[Stmt, ...]):
         """
         return {n: s for s in self.iter() for n in s.defines()}
 
+    @cached_property
+    def axis_names(self) -> frozenset[str]:
+        """Every axis name bound by any wrapper anywhere in this body
+        (``Loop`` / ``StridedLoop`` / ``Tile.axes``). Axes from
+        enclosing scopes above this body are not included."""
+        return frozenset(ax for s in self.iter() for ax in s.binds_axes())
+
+    @cached_property
+    def deps_closure(self) -> dict[str, frozenset[str]]:
+        """For every SSA name defined in this body (recursive), the
+        set of names it transitively reads. Values include both SSA
+        names (defined elsewhere in the body or externally) and axis
+        names (free vars from Load/Write indices, Select predicates,
+        Cond conditions, etc.).
+
+        ``Accum`` is recorded with the *outside-the-loop* form: the
+        immediately-enclosing reduce-Loop's axis is subtracted from
+        the value's closure, because the reduced result no longer
+        varies with that axis. Reads of an Accum's *running* value
+        from inside its own loop body get the wrong answer here —
+        passes that gate on those (the in-loop online-softmax merge
+        pattern) keep the explicit ``deps_of(c)`` check that returns
+        the Accum's defining stmt directly.
+
+        This is the substrate behind :meth:`depends_on` and
+        :meth:`independent`. Most call sites prefer those phrased
+        helpers over poking the closure directly.
+        """
+        closure: dict[str, frozenset[str]] = {}
+
+        def _immediate(s: Stmt) -> set[str]:
+            reads: set[str] = set(s.deps())
+            for e in s.exprs():
+                reads.update(e.free_vars())
+            return reads
+
+        def _transitive(reads: set[str]) -> frozenset[str]:
+            out: set[str] = set(reads)
+            for r in reads:
+                out |= closure.get(r, frozenset())
+            return frozenset(out)
+
+        def walk(body: Body) -> None:
+            for s in body:
+                # Recurse first (post-order) so inner Accums / leaves are
+                # in ``closure`` before we record this stmt or close the
+                # wrapper.
+                for child in s.nested():
+                    walk(child)
+                # After a Loop / StridedLoop closes, its body's Accums
+                # become visible at the outer scope with the loop axis
+                # subtracted (Loop) or kept (StridedLoop — partial value
+                # carries the strided axis). Mirrors hoist_loop_invariants.
+                from deplodock.compiler.ir.stmt.blocks import Loop, StridedLoop  # noqa: PLC0415
+                from deplodock.compiler.ir.stmt.leaves import Accum  # noqa: PLC0415
+
+                if isinstance(s, Loop):
+                    for c in s.body:
+                        if isinstance(c, Accum):
+                            closure[c.name] = closure.get(c.value, frozenset()) - {s.axis.name}
+                    continue
+                if isinstance(s, StridedLoop):
+                    for c in s.body:
+                        if isinstance(c, Accum):
+                            closure[c.name] = closure.get(c.value, frozenset())
+                    continue
+                # Leaves and non-Loop wrappers (Tile, Cond): record
+                # closure for each name this stmt defines.
+                for name in s.defines():
+                    closure[name] = _transitive(_immediate(s))
+
+        walk(self)
+        return closure
+
+    def depends_on(self, a: str | Iterable[str], b: str | Iterable[str]) -> bool:
+        """True iff any name in ``a`` transitively reads any name in
+        ``b``. Directional — does not check whether ``b`` reads ``a``;
+        callers can swap arg order to flip direction.
+
+        Names may be scalar strings or iterables thereof; SSA names
+        and axis names are both accepted. Names not in
+        :attr:`deps_closure` (external references — Tile-input
+        buffers, ConstantOps, names from enclosing scopes) are
+        treated as having empty closure (read nothing transitively).
+        """
+        a_set = {a} if isinstance(a, str) else set(a)
+        b_set = {b} if isinstance(b, str) else set(b)
+        if not a_set or not b_set:
+            return False
+        closure = self.deps_closure
+        for x in a_set:
+            if x in b_set:
+                return True
+            if not closure.get(x, frozenset()).isdisjoint(b_set):
+                return True
+        return False
+
+    def independent(self, a: str | Iterable[str], b: str | Iterable[str]) -> bool:
+        """True iff ``a`` and ``b`` share no dataflow path — neither
+        ``a`` transitively reads any name in ``b`` nor vice versa.
+        Symmetric counterpart to :meth:`depends_on`. Use this when
+        asking "are these two things related at all?" (fusion safety,
+        motion legality); use :meth:`depends_on` when direction
+        matters (invariance, hoist gates).
+        """
+        return not (self.depends_on(a, b) or self.depends_on(b, a))
+
     def deps_of(self, stmt: Stmt) -> tuple[Stmt | None, ...]:
         """Defining stmts inside this body for each of ``stmt``'s SSA
         reads, in the same order as ``stmt.deps()``. Position-preserving:

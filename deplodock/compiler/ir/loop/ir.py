@@ -208,7 +208,7 @@ class LoopOp(Op):
             scopes=scopes,
             reduce_axes=reduce_axes,
             writes=tuple(writes),
-            live_axes=_compute_live_axes(defs, reduce_axes),
+            live_axes=_compute_live_axes(self.body),
         )
 
     def __iter__(self) -> Iterator[Stmt]:
@@ -303,52 +303,14 @@ class LoopMeta:
     live_axes: dict[str, frozenset[str]]
 
 
-def _compute_live_axes(
-    defs: dict[str, Stmt],
-    reduce_axes: dict[str, Axis],
-) -> dict[str, frozenset[str]]:
+def _compute_live_axes(body: Body) -> dict[str, frozenset[str]]:
     """Axes reachable through Expr subtrees rooted at each SSA name.
 
-    A dep's live axes are the union of its own Expr subtree's free vars plus
-    the live axes of every SSA name it reads. ``Accum`` excludes its reduce
-    axis, since that axis gets freshened per emission.
+    Thin wrapper over :attr:`Body.deps_closure` filtered to axis names —
+    Accums already have their reduce axis subtracted by ``deps_closure``.
     """
-    cache: dict[str, frozenset[str]] = {}
-    in_progress: set[str] = set()
-
-    def live(name: str) -> frozenset[str]:
-        if name in cache:
-            return cache[name]
-        if name in in_progress:
-            return frozenset()  # cycle: approximate as empty and let the caller union
-        in_progress.add(name)
-        stmt = defs.get(name)
-        if stmt is None:
-            in_progress.discard(name)
-            cache[name] = frozenset()
-            return cache[name]
-        own: frozenset[str] = frozenset()
-        if isinstance(stmt, Load):
-            for e in stmt.index:
-                own |= e.free_vars()
-        elif isinstance(stmt, Select):
-            for b in stmt.branches:
-                own |= b.select.free_vars() | live(b.value)
-        elif isinstance(stmt, Assign):
-            for a in stmt.args:
-                own |= live(a)
-        elif isinstance(stmt, Accum):
-            own |= live(stmt.value)
-            ra = reduce_axes.get(name)
-            if ra is not None:
-                own -= {ra.name}
-        in_progress.discard(name)
-        cache[name] = own
-        return own
-
-    for n in defs:
-        live(n)
-    return cache
+    axes = body.axis_names
+    return {name: closure & axes for name, closure in body.deps_closure.items()}
 
 
 # ---------------------------------------------------------------------------
