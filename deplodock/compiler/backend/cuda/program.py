@@ -423,9 +423,10 @@ def make_runner(graph: Graph, input_data: dict[str, np.ndarray] | None = None):
     """
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
+    descs = _prebuild_descriptors(compiled, arrays)
 
     def run_once() -> None:
-        for launch in compiled.launches:
-            _launch(launch, compiled, arrays)
+        for li, launch in enumerate(compiled.launches):
+            _launch(launch, compiled, arrays, descs.get(li))
 
     return run_once

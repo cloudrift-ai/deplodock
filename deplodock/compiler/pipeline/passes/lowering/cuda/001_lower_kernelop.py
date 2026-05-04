@@ -57,6 +57,16 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
             TmaDescMeta(name=s.name, src_buf=s.src_buf, box_extents=s.box_extents, swizzle=s.swizzle),
         )
         desc_names.append(s.name)
+    # Outputs receiving atomic-reduction writes (cross-CTA split-K) must be
+    # zero-initialized before each launch so per-CTA partials accumulate
+    # cleanly. Anything else can keep its prior contents.
+    atomic_outputs: list[str] = []
+    seen_atomic: set[str] = set()
+    output_set = set(root.op.outputs)
+    for s in root.op.writes:
+        if s.reduce_op is not None and s.output in output_set and s.output not in seen_atomic:
+            seen_atomic.add(s.output)
+            atomic_outputs.append(s.output)
     root.op = CudaOp(
         kernel_source=render_kernelop(root.op, shapes=shapes, literal_constants=literal_constants),
         kernel_name=root.op.name,
@@ -65,6 +75,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         block=block,
         smem_bytes=_smem_bytes(root.op),
         tma_descriptors=tuple(descriptors),
+        zero_outputs=tuple(atomic_outputs),
     )
     return None
 
