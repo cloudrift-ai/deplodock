@@ -142,7 +142,7 @@ def _try_fix(stage: Stage, loads, thread_axes: tuple[Axis, ...]) -> Stage | None
     base_extents = tuple(int(ax.extent) for ax in stage.axes)
 
     # Body Loads on a ``BufferedStage`` carry an extra leading phase index
-    # added by ``013_double_buffer``; strip it for the analysis. Phase is
+    # added by ``009_double_buffer``; strip it for the analysis. Phase is
     # uniform across threads, so it doesn't affect bank distribution.
     per_load_coeffs = load_thread_axis_coeffs(
         loads,

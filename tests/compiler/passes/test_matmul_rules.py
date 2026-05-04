@@ -143,7 +143,7 @@ def test_rule_skipped_logs_reason_and_continues(caplog):
 
 
 def test_strip_prefix_handles_letter_suffix():
-    assert strip_rule_prefix("003_cooperative_reduce") == "cooperative_reduce"
+    assert strip_rule_prefix("004_cooperative_reduce") == "cooperative_reduce"
     assert strip_rule_prefix("004b_cooperative_reduce") == "cooperative_reduce"
     assert strip_rule_prefix("001_tileify") == "tileify"
     assert strip_rule_prefix("split_matmul_k") == "split_matmul_k"
