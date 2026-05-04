@@ -72,16 +72,10 @@ def _pick_swizzle(stage: BufferedStage) -> SwizzleMode:
     to equal the chosen swizzle width exactly: 128 B for ``B128``, 64 B for
     ``B64``, 32 B for ``B32``. Wider inner boxes (e.g. matmul slabs with
     a 128-fp32 thread axis = 512 B inner) don't fit any mode and stay on
-    ``NONE``.
+    ``NONE``. Gated behind ``tuning._tma_swizzle_enabled``."""
+    from deplodock.compiler.tuning import _tma_swizzle_enabled  # noqa: PLC0415
 
-    Off by default. ``DEPLODOCK_TMA_SWIZZLE=1`` opts a kernel into
-    swizzle: the materializer then emits the body-Load XOR decode that
-    matches each stage's mode. Currently validated for matmul-style body
-    access on (k_row, c_inner) slabs with inner=32 fp32 (B128) at sizes
-    up to N=256 — see kernel/001_materialize_tile.py for the decode."""
-    import os as _os  # noqa: PLC0415
-
-    if _os.environ.get("DEPLODOCK_TMA_SWIZZLE", "0") not in ("1", "true", "True"):
+    if not _tma_swizzle_enabled():
         return SwizzleMode.NONE
     if not stage.axes:
         return SwizzleMode.NONE
