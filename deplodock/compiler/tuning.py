@@ -16,12 +16,12 @@ Env vars:
 - ``DEPLODOCK_TB`` — total thread budget per CTA for non-matmul kernels.
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
-  weight transpose (``004a_fold_constant_transpose``). Off by default
-  — ``014a_tma_copy`` now gates on (rank ≤ 5, ConstantOp source with a
-  transpose perm), but SDPA matmul stages still produce wrong outputs
-  under TMA (K/V layout mismatch between the asymmetric tile and how
-  attention chains use the projections). Set ``DEPLODOCK_TMA=1`` for
-  ``nn.Linear``-only models with ``≥1024`` per-dim shapes.
+  weight transpose (``004a_fold_into_constant``). Default-on for sm_90+
+  (Hopper / Blackwell), default-off below. ``=1`` forces on, ``=0``
+  forces off. ``014a_tma_copy`` gates eligibility on rank ≤ 5,
+  ConstantOp source with a recorded transpose load_op chain, and
+  source-inner-extent alignment ≥ 16 B with ≥ 2× headroom past the
+  box inner extent.
 """
 
 from __future__ import annotations
@@ -106,7 +106,17 @@ def _matmul_M(tile: Tile) -> int:
 
 
 def _tma_enabled() -> bool:
-    return os.environ.get("DEPLODOCK_TMA") == "1"
+    """TMA staging gate. Default-on for sm_90+ (Hopper / Blackwell) which
+    have ``cp.async.bulk.tensor``; default-off below sm_90. ``DEPLODOCK_TMA``
+    overrides either way: ``=1`` forces on, ``=0`` forces off."""
+    raw = os.environ.get("DEPLODOCK_TMA")
+    if raw == "1":
+        return True
+    if raw == "0":
+        return False
+    from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability  # noqa: PLC0415
+
+    return compute_capability() >= (9, 0)
 
 
 def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:

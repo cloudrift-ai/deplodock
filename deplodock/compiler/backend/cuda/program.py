@@ -189,43 +189,86 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     return arrays
 
 
-def _launch(launch: _Launch, compiled: _Compiled, arrays: dict[str, cp.ndarray]) -> None:
+def _launch(
+    launch: _Launch,
+    compiled: _Compiled,
+    arrays: dict[str, cp.ndarray],
+    desc_args: dict[str, cp.ndarray] | None = None,
+) -> None:
     for zname in launch.zero_outputs:
         arrays[zname].fill(0)
     kernel = compiled.kernels[launch.kernel_name]
-    desc_args = _build_descriptor_args(launch, arrays) if launch.tma_descriptors else {}
+    desc_args = desc_args or {}
     args = tuple(desc_args.get(name) if name in desc_args else arrays[name] for name in launch.arg_names)
     kernel(launch.grid, launch.block, args, shared_mem=0)
 
 
-def _build_descriptor_args(launch: _Launch, arrays: dict[str, cp.ndarray]) -> dict[str, cp.ndarray]:
-    """Encode one ``CUtensorMap`` per descriptor referenced by ``launch``
-    and stage it in a 128-byte device buffer.
+def _collapse_inert_dims(arr_shape: tuple[int, ...], box_extents: tuple[int, ...]) -> tuple[int, ...]:
+    """Reconstruct the materializer's gap-singleton drop from runtime info.
+
+    The materializer drops gap source dims that are extent-1 singletons
+    with literal-0 origin coords (a literal-0 origin can only arise for
+    a singleton arr dim, since otherwise IR construction would have
+    emitted a ``Var`` or expression). At runtime we don't carry that
+    decision explicitly — instead we walk ``arr_shape`` and
+    ``box_extents`` innermost-first and drop any arr dim of extent 1
+    that lines up with a box dim of extent > 1. Leading singletons
+    pair with their (kept) box==1 entry and stay; gap singletons fall
+    out exactly where the materializer dropped them."""
+    arr_rev = list(reversed(arr_shape))
+    box_rev = list(reversed(box_extents))
+    kept: list[int] = []
+    bi = 0
+    for a in arr_rev:
+        if bi < len(box_rev) and a == 1 and box_rev[bi] != 1:
+            continue  # dropped gap singleton
+        kept.append(a)
+        bi += 1
+    if bi != len(box_rev) or len(kept) != len(box_rev):
+        raise ValueError(f"TMA descriptor rank mismatch: arr_shape={arr_shape!r} cannot be collapsed to match box_extents={box_extents!r}")
+    return tuple(reversed(kept))
+
+
+def _prebuild_descriptors(compiled: _Compiled, arrays: dict[str, cp.ndarray]) -> dict[int, dict[str, cp.ndarray]]:
+    """Encode every TMA ``CUtensorMap`` for ``compiled`` up-front.
 
     The kernel signature takes ``const CUtensorMap*`` (not a by-value
     ``__grid_constant__`` parameter) because cupy's arg-packing doesn't
     guarantee the 64-byte alignment required for by-value descriptors.
     Placing the descriptor in device memory and passing a pointer
     sidesteps the alignment concern — the TMA load PTX dereferences
-    via a generic 64-bit pointer either way."""
+    via a generic 64-bit pointer either way.
+
+    Why eagerly: ``cp.asarray(np.frombuffer(...))`` queues an H2D copy on
+    the current stream. Building descriptors lazily inside ``_launch``
+    means each fresh kernel's H2D races against in-flight TMA loads from
+    *previous* launches sharing the same descriptor allocator slab —
+    the next allocation can land on cupy-pool memory the prior kernel's
+    cp.async.bulk.tensor is still reading, corrupting the descriptor
+    and deadlocking the wait. Pre-building once after ``_allocate``
+    removes the race entirely; the returned dict is held alive for the
+    whole program lifetime, so cupy never reclaims the slab."""
     import cupy as cp
 
-    out: dict[str, cp.ndarray] = {}
-    for desc in launch.tma_descriptors:
-        arr = arrays[desc.src_buf]
-        desc_bytes = _tma.encode_tiled(
-            global_address=int(arr.data.ptr),
-            src_shape=tuple(int(d) for d in arr.shape),
-            box_extents=desc.box_extents,
-            elem_size=arr.itemsize,
-            swizzle=desc.swizzle,
-        )
-        # Stage the 128 B descriptor in device memory. uint64 view keeps
-        # the buffer 8-byte aligned (cupy.ndarray allocations are
-        # typically 256-byte aligned, well above CUtensorMap's 64 B
-        # requirement).
-        d_arr = cp.asarray(np.frombuffer(desc_bytes, dtype=np.uint64))
-        out[desc.name] = d_arr
+    out: dict[int, dict[str, cp.ndarray]] = {}
+    for li, launch in enumerate(compiled.launches):
+        if not launch.tma_descriptors:
+            continue
+        per_launch: dict[str, cp.ndarray] = {}
+        for desc in launch.tma_descriptors:
+            arr = arrays[desc.src_buf]
+            src_shape = _collapse_inert_dims(tuple(int(d) for d in arr.shape), desc.box_extents)
+            desc_bytes = _tma.encode_tiled(
+                global_address=int(arr.data.ptr),
+                src_shape=src_shape,
+                box_extents=desc.box_extents,
+                elem_size=int(arr.itemsize),
+                swizzle=desc.swizzle,
+            )
+            per_launch[desc.name] = cp.asarray(np.frombuffer(desc_bytes, dtype=np.uint64))
+        out[li] = per_launch
+    if out:
+        cp.cuda.runtime.deviceSynchronize()
     return out
 
 
@@ -240,12 +283,13 @@ def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -
 
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
+    descs = _prebuild_descriptors(compiled, arrays)
 
     start = cp.cuda.Event()
     stop = cp.cuda.Event()
     start.record()
-    for launch in compiled.launches:
-        _launch(launch, compiled, arrays)
+    for li, launch in enumerate(compiled.launches):
+        _launch(launch, compiled, arrays, descs.get(li))
     stop.record()
     stop.synchronize()
     time_ms = cp.cuda.get_elapsed_time(start, stop)
@@ -267,12 +311,13 @@ def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = N
     """Run the graph once, snapshotting every non-input buffer after each launch."""
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
+    descs = _prebuild_descriptors(compiled, arrays)
 
     input_names = {b.name for b in compiled.bufs if b.role == "input"}
     per_launch_np: dict[int, dict[str, np.ndarray]] = {}
 
     for li, launch in enumerate(compiled.launches):
-        _launch(launch, compiled, arrays)
+        _launch(launch, compiled, arrays, descs.get(li))
         snap: dict[str, np.ndarray] = {}
         for name, arr in arrays.items():
             if name in input_names:
@@ -298,10 +343,11 @@ def benchmark_program(
 
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
+    descs = _prebuild_descriptors(compiled, arrays)
 
     for _ in range(warmup):
-        for launch in compiled.launches:
-            _launch(launch, compiled, arrays)
+        for li, launch in enumerate(compiled.launches):
+            _launch(launch, compiled, arrays, descs.get(li))
     cp.cuda.runtime.deviceSynchronize()
 
     n = len(compiled.launches)
@@ -315,9 +361,17 @@ def benchmark_program(
     for _ in range(num_iters):
         for i, launch in enumerate(compiled.launches):
             starts[i].record()
-            _launch(launch, compiled, arrays)
+            _launch(launch, compiled, arrays, descs.get(i))
             stops[i].record()
-        stops[n - 1].synchronize()
+            # Per-kernel sync to make per-launch attribution accurate.
+            # Without it, back-to-back launches let one kernel's stop
+            # event slide into a downstream kernel's scheduling window,
+            # which ends up attributing 0.5-0.8 ms of phantom time to
+            # whichever sub-100µs kernel happens to land at a stream-
+            # stall position. The total ``prog_start..prog_stop`` window
+            # is unaffected (it spans all launches anyway), and the
+            # added sync overhead is negligible vs the kernels' work.
+            stops[i].synchronize()
         for i in range(n):
             acc[i] += cp.cuda.get_elapsed_time(starts[i], stops[i])
     prog_stop.record()

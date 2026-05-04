@@ -125,33 +125,38 @@ def _materialize(blk: Tile) -> Stmt:
     declared_smem: set[str] = set()
 
     # TMA hoist state. ``descriptors`` and ``mbar_prologue`` collect the
-    # per-stage ``TmaDescriptor`` + shared mbar Smem + ``MbarrierInit`` so
-    # the post-walk prepends them to the Tile body.
+    # per-stage ``TmaDescriptor`` + per-group mbar Smem + ``MbarrierInit``
+    # so the post-walk prepends them to the Tile body.
     #
-    # All TmaBufferedStage instances in this Tile share ONE mbarrier array
-    # ``tma_mbar[buffer_count]`` (one slot per ring-buffer position). The
-    # mbar is initialized with ``count = num_distinct_stages``: each
-    # stage's ``arrive.expect_tx`` contributes 1 arrival and adds its
-    # transaction bytes; once all stages have arrived AND their TMA tx
-    # bytes are received, the mbar phase flips and a single
-    # ``MbarrierWait`` releases the consumer. This halves the wait /
-    # arrive count compared to per-stage mbarriers (which had to be waited
-    # for sequentially), and is the standard NVIDIA pattern for
-    # multi-tile TMA pipelining.
+    # TMA stages are partitioned into "pipeline-unit groups": one group
+    # per K-loop containing TmaBufferedStages, plus any prologue stages
+    # immediately before that loop and the trailing epilogue AsyncWait.
+    # Each group gets its own mbarrier array
+    # ``tma_mbar_<gid>[buffer_count]`` initialised with
+    # ``count = num distinct stage names in the group`` — so a tile with
+    # multiple K-loops over different stage sets (e.g. SDPA P@V whose
+    # softmax-max + softmax-sum + weighted-V reduces have different stage
+    # multiplicities) gets per-loop arrive counts and its mbar waits
+    # don't deadlock. ``014a_tma_copy`` enforces all-or-nothing TMA
+    # promotion per tile, so any tile with TMA stages is guaranteed to
+    # have no cp.async stages in the same pipelined K-loop and the
+    # AsyncWait lowering can stay as a pure ``MbarrierWait``.
     descriptors: dict[str, TmaDescriptor] = {}
     mbar_prologue: list[Stmt] = []
     declared_mbar: set[str] = set()
-    SHARED_MBAR_NAME = "tma_mbar"
 
-    # Pre-scan to determine the number of distinct TmaBufferedStage names
-    # in this Tile — that's the arrive count for the shared mbarrier.
-    tma_stage_names: list[str] = []
-    tma_buffer_count = 0
-    for s in body.iter():
-        if isinstance(s, TmaBufferedStage):
-            if s.name not in tma_stage_names:
-                tma_stage_names.append(s.name)
-            tma_buffer_count = max(tma_buffer_count, s.buffer_count)
+    stage_group, wait_group, group_stage_names, group_buffer_count = _partition_tma_groups(body)
+    has_tma = bool(group_stage_names)
+    # Per-stage issuer thread = position of stage name within its group
+    # (so two stages in the same group issue from tid 0 and tid 1
+    # respectively, distributing the arrive+TMA work).
+    issuer_tid: dict[str, int] = {}
+    for names in group_stage_names:
+        for idx, name in enumerate(sorted(names)):
+            issuer_tid[name] = idx
+
+    def _mbar_name(gid: int) -> str:
+        return f"tma_mbar_{gid}" if len(group_stage_names) > 1 else "tma_mbar"
 
     def filter_emit(stmts: list[Stmt]) -> list[Stmt]:
         out: list[Stmt] = []
@@ -163,39 +168,59 @@ def _materialize(blk: Tile) -> Stmt:
             out.append(s)
         return out
 
-    # Issuer thread per stage (stage 0 → tid 0, stage 1 → tid 1, ...) so
-    # multiple stages' arrive+TMA pairs issue from different threads
-    # rather than serializing on tid 0.
-    issuer_tid = {name: idx for idx, name in enumerate(tma_stage_names)}
-    has_tma = bool(tma_stage_names)
-
     def emit_async_wait(stmt: AsyncWait) -> list[Stmt]:
         # TMA path: wait carries the explicit consumer-side phase + slot
-        # set by 015_pipeline_async. With a shared mbar covering all
-        # stages, ONE MbarrierWait releases the consumer once every
-        # stage's TMA has completed (mbar count = num stages).
+        # set by 015_pipeline_async. The wait targets its pipeline-unit
+        # group's mbar (each group has its own mbar with arrive count
+        # == num distinct stages in that group).
         if stmt.phase is not None and has_tma:
-            return [MbarrierWait(mbar=SHARED_MBAR_NAME, phase=stmt.phase, slot=stmt.slot)]
-        # cp.async fallback (or pre-pipelining synchronous-style wait).
+            gid = wait_group.get(id(stmt))
+            if gid is not None:
+                return [MbarrierWait(mbar=_mbar_name(gid), phase=stmt.phase, slot=stmt.slot)]
+        # cp.async fallback (or pre-pipelining synchronous-style wait,
+        # or AsyncWait whose pipeline group couldn't be inferred).
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
     def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
         desc_name = f"{stage.name}_desc"
-        mbar_name = SHARED_MBAR_NAME
+        gid = stage_group[id(stage)]
+        mbar_name = _mbar_name(gid)
+        assert isinstance(stage.addressing, AffineAddressing)
+        # Box extents per source dim: product of cache extents that map
+        # to that dim (a single source dim can be spanned by multiple
+        # cache axes, e.g. matmul fragments where the M-dim is split
+        # across an outer-block axis and a per-thread fragment axis).
+        # Dims not covered by any cache axis get extent 1 — the coord
+        # supplies the origin and the slab is scalar in that dim.
+        box_per_dim: dict[int, int] = {}
+        for d, ax in zip(stage.addressing.dims, stage.axes, strict=True):
+            box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
+        full_box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
+        # Drop *gap* inert dims (``box == 1`` AND ``origin`` is literal
+        # 0) that sit between the first and last swept source dims.
+        # Leading singletons stay in the descriptor — keeping them
+        # matches the rank-3 shape the working linear-matmul TMA kernels
+        # emit. Gap singletons (e.g. the kv_head=1 axis between seq and
+        # head_dim in GQA's V tensor) must be dropped — without it, the
+        # rank-4 descriptor with the gap singleton deadlocks pipelined
+        # TMA at seq=512. The runtime encoder reconstructs the same
+        # collapse from ``arr.shape`` + ``box_extents`` alone (a literal-
+        # 0 origin coord can only be emitted for a singleton arr dim, so
+        # at runtime "drop extent-1 arr dims that align with box dims of
+        # extent > 1" recovers exactly the materializer's decision).
+        swept = stage.addressing.dims
+        outer, inner = swept[0], swept[-1]
+        kept = tuple(
+            d
+            for d in range(len(stage.origin))
+            if d < outer
+            or d > inner
+            or d in swept
+            or not (full_box[d] == 1 and isinstance(stage.origin[d], Literal) and int(stage.origin[d].value) == 0)
+        )
+        box = tuple(full_box[d] for d in kept)
+        coords = tuple(stage.origin[d] for d in kept)
         if desc_name not in descriptors:
-            assert isinstance(stage.addressing, AffineAddressing)
-            # Box extents per source dim: product of cache extents that
-            # map to that dim (a single source dim can be spanned by
-            # multiple cache axes, e.g. matmul fragments where the
-            # M-dim is split across an outer-block axis and a
-            # per-thread fragment axis). Dims not covered by any cache
-            # axis get extent 1 — the coord supplies the origin and
-            # the slab is scalar in that dim. Total box rank ==
-            # ``len(origin)`` == ``len(src_shape)``.
-            box_per_dim: dict[int, int] = {}
-            for d, ax in zip(stage.addressing.dims, stage.axes, strict=True):
-                box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
-            box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
             # Source shape is unknown at materialization time — the
             # backend resolves it from the bound array at launch. Pass
             # an empty tuple as a sentinel; descriptor encoding fills it.
@@ -209,16 +234,18 @@ def _materialize(blk: Tile) -> Stmt:
             )
         if mbar_name not in declared_mbar:
             declared_mbar.add(mbar_name)
-            # Shared mbarrier array: one mbar per ring-buffer slot, with
-            # arrive count = number of distinct stages (so all stages
-            # must arrive before phase flips). Multiple expect_tx on the
-            # same mbar accumulate transaction bytes for the *current*
-            # phase, exactly the semantics we want.
+            # Per-group mbarrier array: one mbar per ring-buffer slot,
+            # with arrive count = number of distinct stages in *this*
+            # group (so all of the group's stages must arrive before its
+            # phase flips). Multiple expect_tx on the same mbar
+            # accumulate transaction bytes for the current phase,
+            # exactly the semantics we want.
+            bc = group_buffer_count[gid]
             mbar_prologue.append(
-                Smem(name=mbar_name, extents=(tma_buffer_count,), dtype="unsigned long long"),
+                Smem(name=mbar_name, extents=(bc,), dtype="unsigned long long"),
             )
-            for s in range(tma_buffer_count):
-                mbar_prologue.append(MbarrierInit(mbar=mbar_name, count=len(tma_stage_names), slot=Literal(s, "int")))
+            for s in range(bc):
+                mbar_prologue.append(MbarrierInit(mbar=mbar_name, count=len(group_stage_names[gid]), slot=Literal(s, "int")))
         slab_bytes = BYTES_PER_ELEM
         for ax in stage.axes:
             slab_bytes *= int(ax.extent)
@@ -236,7 +263,7 @@ def _materialize(blk: Tile) -> Stmt:
                     smem=stage.name,
                     smem_index=smem_index,
                     desc=desc_name,
-                    coords=stage.origin,
+                    coords=coords,
                     mbar=mbar_name,
                     mbar_slot=stage.phase,
                 ),
@@ -333,6 +360,89 @@ def _single_thread_var(thread_axes: tuple) -> str:
     if len(thread_axes) != 1:
         raise ValueError(f"Combine requires a single THREAD axis; got {len(thread_axes)}")
     return thread_axes[0].axis.name
+
+
+def _partition_tma_groups(
+    body: tuple[Stmt, ...],
+) -> tuple[dict[int, int], dict[int, int], list[set[str]], list[int]]:
+    """Partition this Tile body's TMA stages + waits into pipeline-unit
+    groups. Each K-loop containing TmaBufferedStages is one group, plus
+    any prologue stages immediately before the loop and the immediately-
+    following epilogue AsyncWait. Synchronous (pre-pipelining) stages
+    (a TmaBufferedStage at body level paired with a trailing AsyncWait)
+    each form a singleton group.
+
+    Returns:
+      stage_group_by_id : id(TmaBufferedStage) → group_id
+      wait_group_by_id  : id(AsyncWait) → group_id
+      group_stage_names : group_id → set of distinct stage names
+      group_buffer_count: group_id → max buffer_count across the group
+    """
+    stage_group_by_id: dict[int, int] = {}
+    wait_group_by_id: dict[int, int] = {}
+    group_stage_names: list[set[str]] = []
+    group_buffer_count: list[int] = []
+
+    def _new_group() -> int:
+        group_stage_names.append(set())
+        group_buffer_count.append(0)
+        return len(group_stage_names) - 1
+
+    def _add_stage(gid: int, stage: TmaBufferedStage) -> None:
+        stage_group_by_id[id(stage)] = gid
+        group_stage_names[gid].add(stage.name)
+        group_buffer_count[gid] = max(group_buffer_count[gid], stage.buffer_count)
+
+    pending_prologue: list[TmaBufferedStage] = []
+    last_pipeline_group: int | None = None
+
+    def _flush_prologues_as_singletons() -> None:
+        for st in pending_prologue:
+            gid = _new_group()
+            _add_stage(gid, st)
+        pending_prologue.clear()
+
+    for stmt in body:
+        if isinstance(stmt, TmaBufferedStage):
+            pending_prologue.append(stmt)
+            continue
+        if isinstance(stmt, Loop) and any(isinstance(s, TmaBufferedStage) for s in stmt.body):
+            gid = _new_group()
+            for st in pending_prologue:
+                _add_stage(gid, st)
+            pending_prologue.clear()
+            for s in stmt.body:
+                if isinstance(s, TmaBufferedStage):
+                    _add_stage(gid, s)
+                elif isinstance(s, AsyncWait):
+                    wait_group_by_id[id(s)] = gid
+            last_pipeline_group = gid
+            continue
+        if isinstance(stmt, AsyncWait):
+            # Trailing epilogue wait pairs with the most recent
+            # pipeline-unit group (015_pipeline_async always emits one
+            # epilogue AsyncWait after its main loop). If there's no
+            # pipeline group in scope but pending synchronous stages
+            # exist, the wait pairs them with the next-to-be-flushed
+            # singleton group (whichever stage was most recently added).
+            if last_pipeline_group is not None and not pending_prologue:
+                wait_group_by_id[id(stmt)] = last_pipeline_group
+            elif pending_prologue:
+                # Synchronous stage(s) followed by their wait — collapse
+                # into one group with arrive count = num pending.
+                gid = _new_group()
+                for st in pending_prologue:
+                    _add_stage(gid, st)
+                pending_prologue.clear()
+                wait_group_by_id[id(stmt)] = gid
+                last_pipeline_group = gid
+            continue
+        # Any other statement breaks the prologue chain — flush.
+        _flush_prologues_as_singletons()
+        last_pipeline_group = None
+
+    _flush_prologues_as_singletons()
+    return stage_group_by_id, wait_group_by_id, group_stage_names, group_buffer_count
 
 
 def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
