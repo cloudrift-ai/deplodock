@@ -90,35 +90,23 @@ def test_matmul_accuracy_across_tma_modes(monkeypatch, tma, swizzle, bn, bm):
     _check_close(actual, expected)
 
 
-def test_swizzle_picker_returns_b128_for_inner_32_fp32(monkeypatch):
-    """Picker maps inner box-dim 128 B → ``B128`` only when opted in.
-
-    Pure unit test on the picker — no CUDA needed."""
+def test_swizzle_picker_pre_pass(monkeypatch):
+    """Picker (in ``010b_split_inner_for_swizzle``) maps inner byte size
+    to a ``(swizzle_mode, ips_fp32)`` pair. Wider-than-width extents pick
+    the largest fitting width. Pure unit test, no CUDA needed."""
     import importlib
-    from types import SimpleNamespace
 
-    from deplodock.compiler.ir.axis import Axis
     from deplodock.compiler.ir.tile.ir import SwizzleMode
 
     pick = importlib.import_module(
-        "deplodock.compiler.pipeline.passes.lowering.tile.010_tma_copy",
-    )._pick_swizzle
+        "deplodock.compiler.pipeline.passes.lowering.tile.010b_split_inner_for_swizzle",
+    )._pick_split_swizzle
 
-    # ``_pick_swizzle`` only inspects ``stage.axes[-1].extent``; pass a
-    # duck-typed namespace so we don't fight ``BufferedStage``'s frozen
-    # dataclass arity.
-    stage = SimpleNamespace(axes=(Axis("a", 16), Axis("b", 32)))  # inner = 32 fp32 = 128 B
-
-    monkeypatch.delenv("DEPLODOCK_TMA_SWIZZLE", raising=False)
-    assert pick(stage) == SwizzleMode.NONE
-
-    monkeypatch.setenv("DEPLODOCK_TMA_SWIZZLE", "1")
-    assert pick(stage) == SwizzleMode.B128
-
-    # Inner = 16 fp32 = 64 B → B64
-    stage = SimpleNamespace(axes=(Axis("a", 16), Axis("b", 16)))
-    assert pick(stage) == SwizzleMode.B64
-
-    # Inner = 128 fp32 = 512 B → no match → NONE
-    stage = SimpleNamespace(axes=(Axis("a", 16), Axis("b", 128)))
-    assert pick(stage) == SwizzleMode.NONE
+    monkeypatch.setenv("DEPLODOCK_TMA_SWIZZLE", "1")  # picker doesn't gate; just ensure no env effect
+    assert pick(128) == (SwizzleMode.B128, 32)  # exact B128
+    assert pick(64) == (SwizzleMode.B64, 16)  # exact B64
+    assert pick(32) == (SwizzleMode.B32, 8)  # exact B32
+    assert pick(512) == (SwizzleMode.B128, 32)  # 4× B128 → split
+    assert pick(256) == (SwizzleMode.B128, 32)  # 2× B128 → split
+    assert pick(192) == (SwizzleMode.B64, 16)  # 3× B64 → split
+    assert pick(16) is None  # below smallest width

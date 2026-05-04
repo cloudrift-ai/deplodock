@@ -65,32 +65,10 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_ca
 logger = logging.getLogger(__name__)
 
 
-def _pick_swizzle(stage: BufferedStage) -> SwizzleMode:
-    """Match the inner box-dim byte size to a TMA swizzle width.
-
-    ``cuTensorMapEncodeTiled`` requires ``box_dim[innermost] * elem_size``
-    to equal one of the swizzle widths exactly (128 / 64 / 32 B). The
-    materializer can also emit a higher-rank descriptor that splits a
-    wider inner cache axis into ``(N_outer, N_inner)`` so the descriptor
-    sees the matching width — ``inner_extent`` here is in fp32 elements,
-    so a multiple of {32, 16, 8} qualifies. The split decoder is currently
-    only validated for stages whose body Loads index linearly into the
-    flat smem buffer with a single ``(row, inner)`` axis pair; the default
-    matmul ``BN=128 BM=64`` slab has a body-Load shape that triggers a
-    decoder bug we haven't tracked down yet, so the picker stays at exact
-    match for now (no split) and the wider-inner path is left dormant.
-    Gated behind ``tuning._tma_swizzle_enabled``."""
-    from deplodock.compiler.tuning import _tma_swizzle_enabled  # noqa: PLC0415
-
-    if not _tma_swizzle_enabled():
-        return SwizzleMode.NONE
-    if not stage.axes:
-        return SwizzleMode.NONE
-    inner_bytes = int(stage.axes[-1].extent) * BYTES_PER_ELEM
-    for width, mode in ((128, SwizzleMode.B128), (64, SwizzleMode.B64), (32, SwizzleMode.B32)):
-        if inner_bytes == width:
-            return mode
-    return SwizzleMode.NONE
+# Swizzle picking moved entirely to ``010b_split_inner_for_swizzle``.
+# This pass promotes eligible stages with ``swizzle=NONE``; the follow-up
+# pass picks the mode (and optionally splits the inner axis to fit a
+# wider swizzle) and rewrites body Loads in one place.
 
 
 PATTERN = [Pattern("root", TileOp)]
@@ -187,7 +165,7 @@ def _process(
                     pad=s.pad,
                     buffer_count=s.buffer_count,
                     phase=s.phase,
-                    swizzle=_pick_swizzle(s),
+                    swizzle=SwizzleMode.NONE,
                 )
             )
             pending_wait = (*pending_wait, s)

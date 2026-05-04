@@ -85,19 +85,6 @@ def encode_tiled(
 
     The returned bytes are the raw descriptor — pass them to a kernel
     launch as a ``numpy`` view (see :func:`descriptor_arg`)."""
-    # Materializer's swizzle path can emit a rank-(N+1) box on a rank-N
-    # source by splitting the inner dim into ``(N_outer, N_inner)`` to
-    # match a swizzle width. Fold that split into ``src_shape`` here so
-    # the descriptor sees a consistent rank.
-    if len(box_extents) == len(src_shape) + 1:
-        last_src = int(src_shape[-1])
-        n_inner = int(box_extents[-1])
-        if last_src % n_inner != 0:
-            raise ValueError(
-                f"swizzle inner-dim split: src last extent {last_src} not a multiple of "
-                f"box inner {n_inner}"
-            )
-        src_shape = (*src_shape[:-1], last_src // n_inner, n_inner)
     rank = len(src_shape)
     if rank != len(box_extents):
         raise ValueError(f"rank mismatch: src_shape={src_shape!r} vs box_extents={box_extents!r}")

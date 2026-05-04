@@ -116,77 +116,13 @@ def _materialize(blk: Tile) -> Stmt:
 
     rename: dict[str, str] = {}
 
-    # Smem buffers fed by a TMA stage with hardware swizzle: body Loads
-    # against them must XOR-decode the inner-element index. Hopper's
-    # SWIZZLE_{128,64,32}B XORs the byte-position bits ``[4..6]`` (16-byte
-    # chunks within a 128-byte line) by the line-within-group bits ``[7..9]``
-    # of the address. For fp32 (4 B), bit 4 of bytes = bit 2 of fp32 index,
-    # so the inverse decode is ``c_phys = c_logical XOR ((row & 7) * shift)``
-    # where shift selects the swizzle granularity (4 for B128, 2 for B64,
-    # 1 for B32). Body Loads invert by the same XOR.
-    # ``shift`` (4/2/1) is the swizzle XOR granularity in fp32 indices;
-    # ``inner_per_swizzle`` is the swizzle width in fp32 elements (32/16/8).
-    # When the stage's full inner cache extent exceeds ``inner_per_swizzle``,
-    # the descriptor is emitted as a higher-rank box ``(K, N_outer, N_inner)``
-    # — the smem layout stays flat (BN-wide), but the swizzle pattern resets
-    # every ``inner_per_swizzle`` elements, and the swizzle-row index becomes
-    # ``row * N_outer + n_outer`` (one 128-byte line per ``n_outer`` step
-    # within a single K row, then ``N_outer`` more lines per K step).
-    swizzled_smem: dict[str, tuple[int, int]] = {}  # name → (shift, inner_per_swizzle)
-    _shift_for = {SwizzleMode.B128: 4, SwizzleMode.B64: 2, SwizzleMode.B32: 1}
-    for s in body.iter():
-        if isinstance(s, TmaBufferedStage) and s.swizzle != SwizzleMode.NONE:
-            shift = _shift_for[s.swizzle]
-            inner_per_swizzle = shift * 8  # 32/16/8 fp32 = 128/64/32 B
-            swizzled_smem[s.name] = (shift, inner_per_swizzle)
-
-    # Per-stage full inner extent ``BN`` so the decoder can compute
-    # ``BN / inner_per_swizzle`` (= the row-multiplier ``N_outer``). Read
-    # from each TMA stage's last cache axis at body scan time.
-    swizzled_inner_extent: dict[str, int] = {}
-    for s in body.iter():
-        if isinstance(s, TmaBufferedStage) and s.swizzle != SwizzleMode.NONE and s.axes:
-            swizzled_inner_extent[s.name] = int(s.axes[-1].extent)
-
-    def _swizzle_load(load: Load) -> Load:
-        # Index layout for a BufferedStage Load: ``[phase, *cache_axes]``.
-        # Last index is the inner (column); second-to-last is the row.
-        # When ``BN > inner_per_swizzle`` the swizzle pattern resets every
-        # ``inner_per_swizzle`` columns, so the XOR row is
-        # ``row * N_outer + n_outer`` (with ``N_outer = BN / IPS``).
-        if len(load.index) < 3:
-            return load
-        shift, inner_per_swizzle = swizzled_smem[load.input]
-        bn = swizzled_inner_extent[load.input]
-        row_mult = bn // inner_per_swizzle  # = N_outer
-        row = load.index[-2]
-        inner = load.index[-1]
-        n_outer = BinaryExpr("/", inner, Literal(inner_per_swizzle, "int"))
-        n_inner = BinaryExpr("%", inner, Literal(inner_per_swizzle, "int"))
-        # swizzle_row = row * row_mult + n_outer
-        if row_mult == 1:
-            swizzle_row: object = BinaryExpr("+", row, n_outer)
-        else:
-            swizzle_row = BinaryExpr(
-                "+", BinaryExpr("*", row, Literal(row_mult, "int")), n_outer
-            )
-        row_bits = BinaryExpr("&", swizzle_row, Literal(7, "int"))
-        xor_term = row_bits if shift == 1 else BinaryExpr("*", row_bits, Literal(shift, "int"))
-        n_inner_phys = BinaryExpr("^", n_inner, xor_term)
-        # Reassemble the linear inner index: n_outer * IPS + n_inner_phys
-        if inner_per_swizzle == 1:
-            new_inner: object = n_inner_phys
-        else:
-            new_inner = BinaryExpr(
-                "+", BinaryExpr("*", n_outer, Literal(inner_per_swizzle, "int")), n_inner_phys
-            )
-        return replace(load, index=(*load.index[:-1], new_inner))
+    # Body-Load XOR decode for TMA-swizzled stages is now handled by
+    # ``010b_split_inner_for_swizzle`` (which both picks the swizzle mode
+    # AND rewrites Loads). Materialize just sees the post-rewrite IR.
 
     def transform(s: Stmt) -> Stmt:
         if rename:
             s = s.rewrite(lambda n: rename.get(n, n))
-        if swizzled_smem and isinstance(s, Load) and s.input in swizzled_smem:
-            s = _swizzle_load(s)
         return s
 
     new_body: list[Stmt] = []
@@ -261,8 +197,29 @@ def _materialize(blk: Tile) -> Stmt:
         # across an outer-block axis and a per-thread fragment axis).
         # Dims not covered by any cache axis get extent 1 — the coord
         # supplies the origin and the slab is scalar in that dim.
+        # Per-source-dim box product. When two or more cache axes map to
+        # the same source dim, multiplying yields the total slab span on
+        # that dim — except when ``010b_split_inner_for_swizzle`` has
+        # split the inner axis: there we want the descriptor to *see* the
+        # split as separate inner box dims (so the innermost matches the
+        # swizzle width). Detect a tail repeat in ``addressing.dims`` and
+        # don't collapse it.
+        dims = stage.addressing.dims
+        split_tail = (
+            len(dims) >= 2
+            and dims[-1] == dims[-2]
+            and stage.swizzle != SwizzleMode.NONE
+        )
+        if split_tail:
+            collapse_axes = stage.axes[:-2]
+            collapse_dims = dims[:-2]
+            tail_axes = stage.axes[-2:]
+        else:
+            collapse_axes = stage.axes
+            collapse_dims = dims
+            tail_axes = ()
         box_per_dim: dict[int, int] = {}
-        for d, ax in zip(stage.addressing.dims, stage.axes, strict=True):
+        for d, ax in zip(collapse_dims, collapse_axes, strict=True):
             box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
         full_box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
         # Drop *gap* inert dims (``box == 1`` AND ``origin`` is literal
@@ -277,7 +234,7 @@ def _materialize(blk: Tile) -> Stmt:
         # 0 origin coord can only be emitted for a singleton arr dim, so
         # at runtime "drop extent-1 arr dims that align with box dims of
         # extent > 1" recovers exactly the materializer's decision).
-        swept = stage.addressing.dims
+        swept = collapse_dims if collapse_dims else dims
         outer, inner = swept[0], swept[-1]
         kept = tuple(
             d
@@ -289,26 +246,34 @@ def _materialize(blk: Tile) -> Stmt:
         )
         box = tuple(full_box[d] for d in kept)
         coords = tuple(stage.origin[d] for d in kept)
-        # Swizzle on a wide-inner stage: split the descriptor's inner box
-        # dim into ``(BN/IPS, IPS)`` so ``cuTensorMapEncodeTiled`` sees an
-        # innermost box of exactly the swizzle width. The runtime encoder
-        # reinterprets the source's last dim accordingly. The smem alloc
-        # stays flat — body Loads decode via ``_swizzle_load`` above.
-        if stage.swizzle != SwizzleMode.NONE and box:
-            ips = _shift_for[stage.swizzle] * 8  # 32 / 16 / 8 fp32
-            inner_extent = box[-1]
-            if inner_extent > ips and inner_extent % ips == 0:
-                box = (*box[:-1], inner_extent // ips, ips)
-                # Coord for the new outer dim: split the original inner
-                # coord by IPS so the descriptor's reverse-row-major
-                # ``(K, N_outer, N_inner)`` view starts at the right
-                # element. ``coords`` is in C order (same order as
-                # ``kept``); the new outer coord is ``orig_inner / IPS``,
-                # the new inner coord is ``orig_inner % IPS``.
-                orig_inner_coord = coords[-1]
-                outer_coord = BinaryExpr("/", orig_inner_coord, Literal(ips, "int"))
-                inner_coord = BinaryExpr("%", orig_inner_coord, Literal(ips, "int"))
-                coords = (*coords[:-1], outer_coord, inner_coord)
+        # Append the split-tail box dims + decomposed coords. The split
+        # source dim is the last one in ``swept``; the inner cache axis
+        # has extent IPS, the outer factor = orig_extent / IPS. Coord on
+        # the new outer dim = ``origin[split_dim] / IPS``; coord on the
+        # new inner dim = ``origin[split_dim] % IPS``. The previous
+        # ``coords`` entry for the split dim already holds origin —
+        # replace it with the split pair.
+        if tail_axes:
+            split_dim = dims[-1]
+            ips = int(tail_axes[-1].extent)
+            # Find where split_dim sits in `kept` and remove it; its place
+            # is taken by the (outer_coord, inner_coord) pair.
+            kept_idx = kept.index(split_dim)
+            orig_coord = stage.origin[split_dim]
+            outer_coord = BinaryExpr("/", orig_coord, Literal(ips, "int"))
+            inner_coord = BinaryExpr("%", orig_coord, Literal(ips, "int"))
+            coords = (
+                *coords[:kept_idx],
+                *coords[kept_idx + 1 :],
+                outer_coord,
+                inner_coord,
+            )
+            box = (
+                *box[:kept_idx],
+                *box[kept_idx + 1 :],
+                int(tail_axes[0].extent),
+                int(tail_axes[1].extent),
+            )
         if desc_name not in descriptors:
             # Source shape is unknown at materialization time — the
             # backend resolves it from the bound array at launch. Pass
