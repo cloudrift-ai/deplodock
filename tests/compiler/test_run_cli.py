@@ -112,6 +112,24 @@ def test_run_code_sdpa_tinyllama_per_head(run_cli):
 
 
 @requires_cuda
+def test_run_code_sdpa_seq1024_dynamic_smem(run_cli):
+    """SDPA at seq_len=1024, 32 heads: the Q·Kᵀ kernel needs ~50 KB of
+    smem after register-tile + double-buffer + bank-pad — well past the
+    48 KB static cap. Pins the dynamic-smem pool path: kernel must
+    declare ``extern __shared__ ... _smem_pool[]``, the launch must pass
+    ``shared_mem=smem_bytes``, and ``cudaFuncSetAttribute(MaxDynamicShared
+    MemorySize)`` must opt this kernel into the device's larger dynamic
+    allowance."""
+    rc, _, stderr = run_cli(
+        "run",
+        "--code",
+        "torch.nn.functional.scaled_dot_product_attention("
+        "torch.randn(1,32,1024,64), torch.randn(1,32,1024,64), torch.randn(1,32,1024,64))",
+    )
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
 def test_run_code_sdpa_tinyllama_full(run_cli):
     """Full multi-head TinyLlama-block-seq=512 SDPA (1 batch × 32 heads ×
     512 × 64). Regression: the blockify + staging interaction
