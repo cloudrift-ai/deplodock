@@ -162,42 +162,53 @@ def unify_sibling_reduce_axes(stmts: Body) -> Body:
     stmts = Body.coerce(stmts)
 
     def walk(body: Body) -> Body:
-        new_body: list[Stmt] = []
+        # Recurse into nested bodies first (post-order) via the canonical
+        # nested() / with_bodies() descent, then group siblings at this
+        # scope. Splitting the recursion from the sibling-grouping keeps
+        # this pass's scope-level logic isolated in ``_unify_siblings``.
+        recursed: list[Stmt] = []
         for s in body:
             nested = s.nested()
             if nested:
-                new_body.append(s.with_bodies(tuple(walk(b) for b in nested)))
+                recursed.append(s.with_bodies(tuple(walk(b) for b in nested)))
             else:
-                new_body.append(s)
-
-        groups: dict[frozenset[tuple[str, int]], list[int]] = {}
-        for i, s in enumerate(new_body):
-            if isinstance(s, Loop) and s.is_reduce:
-                positions = _reduce_axis_source_positions(s.body, s.axis.name)
-                if positions:
-                    groups.setdefault(frozenset(positions), []).append(i)
-
-        for indices in groups.values():
-            if len(indices) < 2:
-                continue
-            first = new_body[indices[0]]
-            assert isinstance(first, Loop)
-            canonical = first.axis.name
-            canonical_extent = int(first.axis.extent)
-            for idx in indices[1:]:
-                loop = new_body[idx]
-                assert isinstance(loop, Loop)
-                if int(loop.axis.extent) != canonical_extent or loop.axis.name == canonical:
-                    continue
-                new_axis = Axis(name=canonical, extent=canonical_extent)
-                sub = Sigma({loop.axis.name: Var(canonical)})
-                rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
-                renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
-                new_body[idx] = replace(loop, axis=new_axis, body=renamed)
-
-        return tuple(new_body)
+                recursed.append(s)
+        return _unify_siblings(Body(recursed))
 
     return walk(stmts)
+
+
+def _unify_siblings(body: Body) -> Body:
+    """Single-scope sibling grouping: rename reduce-axis vars across
+    sibling reduce Loops that index the same ``(source, dim)`` positions
+    so they share one canonical axis name."""
+    stmts = list(body)
+    groups: dict[frozenset[tuple[str, int]], list[int]] = {}
+    for i, s in enumerate(stmts):
+        if isinstance(s, Loop) and s.is_reduce:
+            positions = _reduce_axis_source_positions(s.body, s.axis.name)
+            if positions:
+                groups.setdefault(frozenset(positions), []).append(i)
+
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        first = stmts[indices[0]]
+        assert isinstance(first, Loop)
+        canonical = first.axis.name
+        canonical_extent = int(first.axis.extent)
+        for idx in indices[1:]:
+            loop = stmts[idx]
+            assert isinstance(loop, Loop)
+            if int(loop.axis.extent) != canonical_extent or loop.axis.name == canonical:
+                continue
+            new_axis = Axis(name=canonical, extent=canonical_extent)
+            sub = Sigma({loop.axis.name: Var(canonical)})
+            rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
+            renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
+            stmts[idx] = replace(loop, axis=new_axis, body=renamed)
+
+    return Body(stmts)
 
 
 def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tuple[str, int]]:
@@ -299,32 +310,29 @@ def split_invariant_divides(stmts: Body) -> Body:
             axes_of[name] = frozenset()
         ssa_names.add(name)
 
-    def walk(body: Body) -> list[Stmt]:
+    def walk(body: Body) -> Body:
         out: list[Stmt] = []
         for s in body:
-            if isinstance(s, Loop):
-                inner = walk(s.body)
-                out.append(replace(s, body=tuple(inner)))
-                # After the Loop closes, inner Accums become live for
-                # outer scope minus the loop axis (matches hoist_loop_invariants).
-                for c in inner:
-                    if isinstance(c, Accum):
-                        axes_of[c.name] = axes_of.get(c.value, frozenset()) - {s.axis.name}
-                        ssa_names.add(c.name)
-                continue
-            if isinstance(s, StridedLoop):
-                inner = walk(s.body)
-                out.append(replace(s, body=tuple(inner)))
-                for c in inner:
-                    if isinstance(c, Accum):
-                        ssa_names.add(c.name)
-                continue
-            if isinstance(s, Tile):
-                inner = walk(s.body)
-                out.append(Tile(axes=s.axes, body=tuple(inner)))
-                continue
-            if isinstance(s, Cond):
-                out.append(Cond(cond=s.cond, body=tuple(walk(s.body)), else_body=tuple(walk(s.else_body))))
+            nested = s.nested()
+            if nested:
+                # Generic descent — recurse into every nested body, rebuild
+                # the wrapper via with_bodies. After a Loop closes, its
+                # inner Accums become live at the outer scope minus the
+                # loop axis (matches hoist_loop_invariants's bookkeeping).
+                # StridedLoop's Accums are live as-is (cooperative reduces
+                # produce a per-thread partial that carries the strided axis).
+                rebuilt_bodies = tuple(walk(b) for b in nested)
+                out.append(s.with_bodies(rebuilt_bodies))
+                if isinstance(s, Loop):
+                    for c in s.body:
+                        if isinstance(c, Accum):
+                            axes_of[c.name] = axes_of.get(c.value, frozenset()) - {s.axis.name}
+                            ssa_names.add(c.name)
+                elif isinstance(s, StridedLoop):
+                    for c in s.body:
+                        if isinstance(c, Accum):
+                            axes_of[c.name] = axes_of.get(c.value, frozenset())
+                            ssa_names.add(c.name)
                 continue
             if isinstance(s, Assign) and s.op == ElementwiseImpl("divide") and len(s.args) == 2:
                 x_name, y_name = s.args
@@ -341,9 +349,9 @@ def split_invariant_divides(stmts: Body) -> Body:
                     continue
             out.append(s)
             _record(s)
-        return out
+        return Body(out)
 
-    return tuple(walk(stmts))
+    return walk(stmts)
 
 
 # ---------------------------------------------------------------------------
