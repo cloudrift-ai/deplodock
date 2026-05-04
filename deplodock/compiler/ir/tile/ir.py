@@ -440,7 +440,7 @@ class TmaBufferedStage(BufferedStage):
     def __post_init__(self) -> None:
         super().__post_init__()
         # TMA box copies write rows back-to-back at the cache extent;
-        # bank-conflict ``+1`` padding (set by ``012_pad_smem_banks`` for
+        # bank-conflict ``+1`` padding (set by ``012_pad_smem`` for
         # cp.async / sync stages) would put body Loads' padded stride out
         # of step with the unpadded box write. The pad pass already skips
         # ``TmaBufferedStage`` — this assertion catches any future caller

@@ -18,7 +18,7 @@
   (``011_async_copy`` for cp.async, ``010_tma_copy`` for TMA).
 - :func:`load_thread_axis_coeffs` / :func:`max_bank_conflict` —
   bank-conflict analysis for body Loads of a staged buffer. Used by
-  ``012_pad_smem_banks`` (cp.async / sync stages, +1 padding).
+  ``012_pad_smem`` (cp.async / sync stages, +1 padding).
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).

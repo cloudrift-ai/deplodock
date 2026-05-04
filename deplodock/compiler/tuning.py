@@ -176,7 +176,7 @@ def forced_bk(tile: Tile | None = None) -> int | None:
     return _bk_fits_smem(tile, bk)
 
 
-# sm_120 hard cap is 48 KB static smem; 012_pad_smem_banks adds +1
+# sm_120 hard cap is 48 KB static smem; 012_pad_smem adds +1
 # row of padding per stage to break 32-way bank conflicts, so reserve
 # ~4 KB of headroom for that swelling.
 _SMEM_BUDGET_BYTES = 44 * 1024

@@ -36,7 +36,7 @@ class Loop(Stmt):
     serial (post-materialization) loops inside cooperative blocks.
 
     ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
-    time. Set by scheduling passes (``unroll_small_loops``); has no
+    time. Set by scheduling passes (``mark_unroll``); has no
     effect on the IR's iteration semantics.
     """
 
