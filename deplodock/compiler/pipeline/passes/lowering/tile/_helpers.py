@@ -15,10 +15,10 @@
   layer on top via the ``extra_gate`` callback.
 - :func:`compute_capability` — cached query of the active CUDA device's
   compute capability. Shared by passes that gate on hardware features
-  (``014_async_copy`` for cp.async, ``014a_tma_copy`` for TMA).
+  (``011_async_copy`` for cp.async, ``010_tma_copy`` for TMA).
 - :func:`load_thread_axis_coeffs` / :func:`max_bank_conflict` —
   bank-conflict analysis for body Loads of a staged buffer. Used by
-  ``014c_pad_smem_banks`` (cp.async / sync stages, +1 padding).
+  ``012_pad_smem`` (cp.async / sync stages, +1 padding).
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
@@ -171,7 +171,7 @@ def load_thread_axis_coeffs(
     Returns ``None`` if any Load is non-affine in the thread-axis vars
     or its index doesn't match the expected dim count — caller skips
     conservatively. ``leading_phase_dim=True`` strips the leading phase
-    index (added by ``013_double_buffer`` for ``BufferedStage`` Loads):
+    index (added by ``009_double_buffer`` for ``BufferedStage`` Loads):
     phase is uniform across threads, contributing no bank-distribution
     effect, so dropping it doesn't change the analysis.
     """

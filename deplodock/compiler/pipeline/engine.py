@@ -39,7 +39,7 @@ _RULE_PREFIX_RE = re.compile(r"^\d+[a-z]?_")
 
 def _strip_rule_prefix(name: str) -> str:
     """Drop the numeric ordering prefix from a rule file stem
-    (``003_cooperative_reduce`` → ``cooperative_reduce``)."""
+    (``004_cooperative_reduce`` → ``cooperative_reduce``)."""
     return _RULE_PREFIX_RE.sub("", name)
 
 

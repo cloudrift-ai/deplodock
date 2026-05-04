@@ -137,7 +137,7 @@ def _materialize(blk: Tile) -> Stmt:
     # multiple K-loops over different stage sets (e.g. SDPA P@V whose
     # softmax-max + softmax-sum + weighted-V reduces have different stage
     # multiplicities) gets per-loop arrive counts and its mbar waits
-    # don't deadlock. ``014a_tma_copy`` enforces all-or-nothing TMA
+    # don't deadlock. ``010_tma_copy`` enforces all-or-nothing TMA
     # promotion per tile, so any tile with TMA stages is guaranteed to
     # have no cp.async stages in the same pipelined K-loop and the
     # AsyncWait lowering can stay as a pure ``MbarrierWait``.
@@ -170,7 +170,7 @@ def _materialize(blk: Tile) -> Stmt:
 
     def emit_async_wait(stmt: AsyncWait) -> list[Stmt]:
         # TMA path: wait carries the explicit consumer-side phase + slot
-        # set by 015_pipeline_async. The wait targets its pipeline-unit
+        # set by 013_pipeline_async. The wait targets its pipeline-unit
         # group's mbar (each group has its own mbar with arrive count
         # == num distinct stages in that group).
         if stmt.phase is not None and has_tma:
@@ -420,7 +420,7 @@ def _partition_tma_groups(
             continue
         if isinstance(stmt, AsyncWait):
             # Trailing epilogue wait pairs with the most recent
-            # pipeline-unit group (015_pipeline_async always emits one
+            # pipeline-unit group (013_pipeline_async always emits one
             # epilogue AsyncWait after its main loop). If there's no
             # pipeline group in scope but pending synchronous stages
             # exist, the wait pairs them with the next-to-be-flushed

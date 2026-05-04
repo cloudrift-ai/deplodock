@@ -90,11 +90,21 @@ class Smem(Stmt):
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """``__shared__ <dtype> <name>[<prod(extents)>];`` and register the
-        buffer's shape so subsequent ``Load``/``Write`` flatten correctly."""
+        buffer's shape so subsequent ``Load``/``Write`` flatten correctly.
+
+        When ``ctx.smem_dynamic_offsets`` carries this buffer's offset,
+        emit a pointer alias into the shared ``_smem_pool`` (extern
+        dynamic smem) instead of a static ``__shared__`` array — the
+        renderer falls back to the dynamic path when total per-CTA smem
+        would exceed the 48 KB static cap.
+        """
         total = 1
         for e in self.extents:
             total *= int(e)
         ctx.shapes[self.name] = tuple(int(e) for e in self.extents)
+        if self.name in ctx.smem_dynamic_offsets:
+            offset = ctx.smem_dynamic_offsets[self.name]
+            return [f"{_pad(ctx.indent)}{self.dtype}* {self.name} = reinterpret_cast<{self.dtype}*>(_smem_pool + {offset});"]
         ali = f"__align__({self.align}) " if self.align else ""
         return [f"{_pad(ctx.indent)}__shared__ {ali}{self.dtype} {self.name}[{total}];"]
 

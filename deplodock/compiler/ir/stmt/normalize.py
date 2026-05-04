@@ -15,12 +15,12 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Interval, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -321,146 +321,71 @@ def split_invariant_divides(stmts: Body) -> Body:
 
 
 def hoist_loop_invariants(stmts: Body) -> Body:
-    """Move ``Load`` / ``Assign`` / ``Select`` stmts out of ``Loop``s whose
-    axis their value doesn't depend on. Hoisting only crosses ``Loop``
-    boundaries; ``StridedLoop`` / ``Tile`` / ``Cond`` are barriers but are
-    recursed into so inner Loops still get the optimization.
+    """Move stmts out of ``Loop``s whose axis they don't depend on.
 
-    Loop-invariance is queried via :meth:`Body.depends_on` against the
-    pre-computed transitive closure for the whole body. The local
-    ``bindings`` tracking is still position-dependent — it gates whether
-    a hoist-candidate's SSA deps are *available* at the hoist site, a
-    visibility question separate from dataflow invariance.
+    Hoists ``Load`` / ``Assign`` / ``Select`` (SSA values) and entire
+    ``Loop`` / ``StridedLoop`` / ``Tile`` / ``Cond`` blocks whose contents
+    transitively avoid the outer axis — provided the block contains no
+    ``Write`` (a Write hoist would change observable side effects).
+    Block-level hoisting is what lets a Loop and its downstream consumer
+    move together: hoisting just the consumer would leave it referencing
+    an Accum still defined inside the outer Loop body.
+
+    ``Accum`` / ``Init`` / ``Write`` always stay (iteration-tied
+    semantics). Loop-invariance is queried via :meth:`Body.depends_on`
+    against the body's transitive read closure, so the hoisted set is
+    automatically closed under SSA dependencies — no separate ordering
+    check is needed.
     """
     stmts = Body.coerce(stmts)
-    closure = stmts.deps_closure  # transitive read closure, including axis names
-    ssa_names = frozenset(closure.keys())
 
-    def _ssa_deps(s: Stmt) -> tuple[str, ...]:
-        """Immediate SSA-only deps (axis vars from indices excluded)."""
-        if isinstance(s, Load):
-            return tuple(v for e in s.index for v in e.free_vars() if v in ssa_names)
-        if isinstance(s, Assign):
-            return s.args
-        if isinstance(s, Select):
-            return tuple(b.value for b in s.branches)
-        return ()
+    def _hoistable(s: Stmt, axis: str) -> bool:
+        # Accum / Init are scope-bound to their enclosing Loop's reduction — they can't
+        # move alone, but the whole enclosing block can. Side-effecting stmts (Write, or
+        # any block containing a Write) pin their iteration count and stay put.
+        if isinstance(s, (Accum, Init)) or s.has_side_effects():
+            return False
+        return not stmts.depends_on(s, axis)
 
-    def walk(body: Body, outer_bindings: set[str]) -> list[Stmt]:
+    def walk(body: Body) -> list[Stmt]:
         new_body: list[Stmt] = []
-        bindings = set(outer_bindings)
-
         for s in body:
-            if isinstance(s, Loop):
-                inner = walk(s.body, bindings)
+            if isinstance(s, (Loop, StridedLoop)):
+                inner = walk(s.body)
                 axis = s.axis.name
-                hoisted_names: set[str] = set()
-                hoisted: list[Stmt] = []
-                stay: list[Stmt] = []
-                for c in inner:
-                    if isinstance(c, (Load, Assign, Select)):
-                        # Hoistable iff (1) value doesn't transitively depend
-                        # on the loop axis, and (2) every immediate SSA dep
-                        # is already in scope at the hoist site.
-                        if not stmts.depends_on(c.name, axis) and all(d in bindings or d in hoisted_names for d in _ssa_deps(c)):
-                            hoisted.append(c)
-                            hoisted_names.add(c.name)
-                            continue
-                    stay.append(c)
-
-                for h in hoisted:
-                    new_body.append(h)
-                    bindings.add(h.name)
+                hoisted = [c for c in inner if _hoistable(c, axis)]
+                hoisted_ids = {id(c) for c in hoisted}
+                stay = [c for c in inner if id(c) not in hoisted_ids]
+                new_body.extend(hoisted)
                 new_body.append(replace(s, body=tuple(stay)))
-
-                for c in inner:
-                    if isinstance(c, Accum):
-                        bindings.add(c.name)
-            elif isinstance(s, StridedLoop):
-                inner = walk(s.body, bindings)
-                new_body.append(replace(s, body=tuple(inner)))
-                for c in inner:
-                    if isinstance(c, Accum):
-                        bindings.add(c.name)
             elif isinstance(s, Tile):
-                inner = walk(s.body, bindings)
-                new_body.append(Tile(axes=s.axes, body=tuple(inner)))
+                new_body.append(Tile(axes=s.axes, body=tuple(walk(s.body))))
             elif isinstance(s, Cond):
-                inner_b = walk(s.body, bindings)
-                inner_e = walk(s.else_body, bindings)
-                new_body.append(Cond(cond=s.cond, body=tuple(inner_b), else_body=tuple(inner_e)))
+                new_body.append(Cond(cond=s.cond, body=tuple(walk(s.body)), else_body=tuple(walk(s.else_body))))
             else:
                 new_body.append(s)
-                for n in s.defines():
-                    bindings.add(n)
-
         return new_body
 
-    return tuple(walk(stmts, set()))
+    return tuple(walk(stmts))
 
 
 # ---------------------------------------------------------------------------
 # Pass 6: simplify Exprs inside body Stmts (constant folding, identity collapse,
 # range-based comparison folding). The per-Expr rewrite logic lives on each
-# ``Expr`` subclass as ``simplify(ctx)``; this pass just walks the body and
-# threads ``SimplifyCtx`` ranges as it descends.
+# ``Expr`` subclass as ``simplify(ctx)``; the walk over Stmts is dispatched
+# in :mod:`.passes` (singledispatch + Stage introspection).
 # ---------------------------------------------------------------------------
-
-
-def _simplify_expr_tuple(xs: tuple[Expr, ...], ctx: SimplifyCtx) -> tuple[Expr, ...]:
-    return tuple(e.simplify(ctx) for e in xs)
-
-
-def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
-    if isinstance(stmt, Loop):
-        inner = ctx.extend(stmt.axis.name, Interval(0, stmt.axis.extent - 1))
-        return replace(stmt, body=tuple(_simplify_stmt(s, inner) for s in stmt.body))
-    if isinstance(stmt, StridedLoop):
-        inner = ctx.extend(stmt.axis.name, Interval(0, stmt.axis.extent - 1))
-        return replace(
-            stmt,
-            start=stmt.start.simplify(ctx),
-            step=stmt.step.simplify(ctx) if isinstance(stmt.step, Expr) else stmt.step,
-            body=tuple(_simplify_stmt(s, inner) for s in stmt.body),
-        )
-    if isinstance(stmt, Tile):
-        inner = ctx
-        for ba in stmt.axes:
-            inner = inner.extend(ba.axis.name, Interval(0, ba.axis.extent - 1))
-        return Tile(axes=stmt.axes, body=tuple(_simplify_stmt(s, inner) for s in stmt.body))
-    if isinstance(stmt, Cond):
-        return Cond(
-            cond=stmt.cond.simplify(ctx),
-            body=tuple(_simplify_stmt(s, ctx) for s in stmt.body),
-            else_body=tuple(_simplify_stmt(s, ctx) for s in stmt.else_body),
-        )
-    if isinstance(stmt, Select):
-        return Select(stmt.name, tuple(SelectBranch(b.value, b.select.simplify(ctx)) for b in stmt.branches))
-    if isinstance(stmt, Write):
-        return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value, reduce_op=stmt.reduce_op)
-    if isinstance(stmt, Load):
-        return Load(stmt.name, stmt.input, _simplify_expr_tuple(stmt.index, ctx))
-    # Tile-IR-only ``Stage`` (+ BufferedStage / AsyncBufferedStage /
-    # TmaBufferedStage subtypes). Each subclass overrides ``_simplify_kwargs``
-    # to thread its own Expr fields through ``ctx`` and forward all
-    # subtype-specific fields (e.g. ``swizzle``); we just call it and
-    # reconstruct via ``type(stmt)(**kwargs)``. Adding a new Stage field
-    # only needs the subclass's own override, not a branch here.
-    # Lazy import to avoid a tile→stmt circular at module load time.
-    from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415
-
-    if isinstance(stmt, Stage):
-        return type(stmt)(**stmt._simplify_kwargs(ctx))
-    # Assign / Accum / Combine carry only SSA names — no Expr field to simplify.
-    return stmt
 
 
 def simplify_body(body: Body) -> Body:
     """Simplify every Expr inside a body. Seeds ``SimplifyCtx`` from
-    ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends."""
+    ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends.
+    Tile-IR Stmt registrations are loaded when ``tile.ir`` is imported."""
+    from deplodock.compiler.ir.stmt.passes import simplify  # noqa: PLC0415
+
     body = Body.coerce(body)
     ctx = SimplifyCtx.empty()
-    return tuple(_simplify_stmt(s, ctx) for s in body)
+    return tuple(simplify(s, ctx) for s in body)
 
 
 # ---------------------------------------------------------------------------

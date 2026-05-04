@@ -38,7 +38,7 @@ The compute body is ``Loop`` / ``StridedLoop`` / ``Accum`` / ``Load`` /
 from __future__ import annotations
 
 import enum
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
@@ -54,7 +54,6 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
@@ -68,7 +67,6 @@ from deplodock.compiler.ir.stmt import (
     StridedLoop,
     Tile,
     Write,
-    _axis_identity,
     pretty_body,
 )
 
@@ -132,13 +130,6 @@ class AsyncWait(Stmt):
             out = (*out, self.slot)
         return out
 
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        new_phase = sigma.apply(self.phase) if self.phase is not None else None
-        new_slot = sigma.apply(self.slot) if self.slot is not None else None
-        return AsyncWait(keep=self.keep, phase=new_phase, slot=new_slot)
-
     def pretty(self, indent: str = "") -> list[str]:
         extra = ""
         if self.phase is not None:
@@ -164,11 +155,6 @@ class Combine(Stmt):
 
     name: str
     op: ElementwiseImpl
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return Combine(name=rename_ssa(self.name), op=self.op)
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}Combine({self.name}, op={self.op.name})"]
@@ -296,50 +282,6 @@ class Stage(Stmt):
         template = self.addressing.exprs if isinstance(self.addressing, TemplateAddressing) else ()
         return (*self.origin, *template)
 
-    def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
-        """Common kwargs for subtype-preserving rewrite. Subclasses extend."""
-        if isinstance(self.addressing, TemplateAddressing):
-            new_addr: AffineAddressing | TemplateAddressing = TemplateAddressing(exprs=tuple(sigma.apply(e) for e in self.addressing.exprs))
-        else:
-            new_addr = self.addressing
-        return dict(
-            name=self.name,
-            buf=self.buf,
-            origin=tuple(sigma.apply(e) for e in self.origin),
-            axes=tuple(axis_fn(a) for a in self.axes),
-            addressing=new_addr,
-            pad=self.pad,
-        )
-
-    def _simplify_kwargs(self, ctx) -> dict:
-        """Common kwargs for subtype-preserving Expr-simplification. Mirrors
-        ``_rewrite_kwargs``: subclasses override to thread their own Expr
-        fields through ``ctx``. Used by ``ir/stmt/normalize._simplify_stmt``
-        so adding a new Stage subclass field doesn't silently get dropped
-        on every normalization pass (which is what happened with
-        ``TmaBufferedStage.swizzle`` before this refactor)."""
-        from deplodock.compiler.ir.stmt.normalize import _simplify_expr_tuple  # noqa: PLC0415
-
-        if isinstance(self.addressing, TemplateAddressing):
-            new_addr: AffineAddressing | TemplateAddressing = TemplateAddressing(
-                exprs=_simplify_expr_tuple(self.addressing.exprs, ctx),
-            )
-        else:
-            new_addr = self.addressing
-        return dict(
-            name=self.name,
-            buf=self.buf,
-            origin=_simplify_expr_tuple(self.origin, ctx),
-            axes=self.axes,
-            addressing=new_addr,
-            pad=self.pad,
-        )
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return type(self)(**self._rewrite_kwargs(sigma, axis_fn))
-
     def pretty(self, indent: str = "") -> list[str]:
         origin = ", ".join(e.pretty() for e in self.origin)
         if isinstance(self.addressing, AffineAddressing):
@@ -381,12 +323,6 @@ class BufferedStage(Stage):
     def exprs(self) -> tuple[Expr, ...]:
         return (*super().exprs(), self.phase)
 
-    def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
-        return {**super()._rewrite_kwargs(sigma, axis_fn), "buffer_count": self.buffer_count, "phase": sigma.apply(self.phase)}
-
-    def _simplify_kwargs(self, ctx) -> dict:
-        return {**super()._simplify_kwargs(ctx), "buffer_count": self.buffer_count, "phase": self.phase.simplify(ctx)}
-
     def _pretty_extra(self) -> str:
         return f" buffers={self.buffer_count}@{self.phase.pretty()}"
 
@@ -398,7 +334,7 @@ class AsyncBufferedStage(BufferedStage):
     Materialize emits ``Smem`` + cooperative ``CpAsyncCopy`` +
     ``CpAsyncCommit`` only — *no* implicit wait, *no* ``Sync``. The
     caller must dominate every consumer with an ``AsyncWait`` Stmt.
-    Requires sm_80+ (gated by ``014_async_copy``).
+    Requires sm_80+ (gated by ``011_async_copy``).
     """
 
     def _pretty_extra(self) -> str:
@@ -431,7 +367,7 @@ class TmaBufferedStage(BufferedStage):
     arrival already provides CTA-wide visibility).
 
     Requires sm_90+ and ``--gpu-architecture=sm_90a`` (gated by
-    ``014a_tma_copy``). Eligible only for ``AffineAddressing`` with the
+    ``010_tma_copy``). Eligible only for ``AffineAddressing`` with the
     inner source dim contiguous and 16 B aligned.
     """
 
@@ -440,19 +376,13 @@ class TmaBufferedStage(BufferedStage):
     def __post_init__(self) -> None:
         super().__post_init__()
         # TMA box copies write rows back-to-back at the cache extent;
-        # bank-conflict ``+1`` padding (set by ``014c_pad_smem_banks`` for
+        # bank-conflict ``+1`` padding (set by ``012_pad_smem`` for
         # cp.async / sync stages) would put body Loads' padded stride out
         # of step with the unpadded box write. The pad pass already skips
         # ``TmaBufferedStage`` — this assertion catches any future caller
         # that constructs a TMA stage with stale pad.
         if self.pad and any(self.pad):
             raise ValueError(f"TmaBufferedStage {self.name!r}: pad must be empty, got {self.pad!r}")
-
-    def _rewrite_kwargs(self, sigma: Sigma, axis_fn: Callable[[Axis], Axis]) -> dict:
-        return {**super()._rewrite_kwargs(sigma, axis_fn), "swizzle": self.swizzle}
-
-    def _simplify_kwargs(self, ctx) -> dict:
-        return {**super()._simplify_kwargs(ctx), "swizzle": self.swizzle}
 
     def _pretty_extra(self) -> str:
         sw = "" if self.swizzle == SwizzleMode.NONE else f" swizzle={self.swizzle.value}"
@@ -584,3 +514,10 @@ __all__ = [
     "Axis",
     "ElementwiseImpl",
 ]
+
+# Register Tile-IR stmts with the shared rewrite/simplify dispatch (Stage
+# subtree via introspection, AsyncWait + Combine via dedicated handlers).
+# Imported here — after class definitions — so the tile→stmt→tile cycle
+# resolves cleanly: ``stmt.passes`` doesn't know about Tile-IR types, and
+# ``tile.passes`` re-imports back into this module for the concrete classes.
+from deplodock.compiler.ir.tile import passes as _passes  # noqa: E402, F401

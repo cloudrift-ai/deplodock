@@ -115,7 +115,7 @@ def _eligible(loop: Loop, invariant_names: set[str]) -> bool:
     for a non-Accum stmt) still holds via 013's ``extra_gate`` and is
     the precise pattern the drift comment was about.
 
-    ``013_double_buffer`` runs the same relaxed gate."""
+    ``009_double_buffer`` runs the same relaxed gate."""
 
     def gate(k_outer: Loop, k_inner: Loop) -> bool:
         if int(k_outer.axis.extent) < 2:

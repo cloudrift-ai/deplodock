@@ -1,4 +1,4 @@
-"""Tests that ``006_split_reduce_k`` chunks non-matmul reduces so
+"""Tests that ``006_chunk_reduce`` chunks non-matmul reduces so
 ``007_stage_inputs`` can fit candidate slabs in its smem budget.
 
 Two angles:
@@ -23,7 +23,7 @@ from deplodock.compiler.ir.frontend.ir import SdpaOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop
 from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
 
-_mod = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.006_split_reduce_k")
+_mod = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.006_chunk_reduce")
 _qualifies = _mod._qualifies
 _chunk_loop = _mod._chunk_loop
 
@@ -35,12 +35,12 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 # --- firing tests ----------------------------------------------------
 
 
-def test_sdpa_seq512_fires_split_reduce_k(recording_dump):
+def test_sdpa_seq512_fires_chunk_reduce(recording_dump):
     """SDPA at seq_len=512 produces a fused softmax + V-projection
     kernel whose softmax reduces sit at K=512. ``002_split_matmul_k``
     only chunks the V-projection (matmul-shaped); the two softmax
     reduces stay at K=512 and ``stage_inputs`` would bail (32 KB slab)
-    without ``006_split_reduce_k``."""
+    without ``006_chunk_reduce``."""
     g = Graph()
     _input(g, "q", (1, 8, 512, 64))
     _input(g, "k", (1, 8, 512, 64))
@@ -51,12 +51,12 @@ def test_sdpa_seq512_fires_split_reduce_k(recording_dump):
 
     run_pipeline(g, TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "split_reduce_k" in fired, fired
+    assert "chunk_reduce" in fired, fired
     # And staging should now fire on the chunked kernel.
     assert "stage_inputs" in fired, fired
 
 
-def test_sdpa_seq128_does_not_need_split_reduce_k(recording_dump):
+def test_sdpa_seq128_does_not_need_chunk_reduce(recording_dump):
     """At seq_len=128 the candidate slab is 16×128×4 = 8 KB — already
     within the per-slab cap. ``stage_inputs`` admits Stages directly,
     no chunking needed (the rule should bail with RuleSkipped)."""

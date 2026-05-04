@@ -8,8 +8,18 @@ method does the per-line emission.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.kernel.ir import KernelOp, TmaDescriptor
+from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor
 from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
+
+# Per-CTA static-smem hard cap on every CUDA arch we target. Above this,
+# PTXAS rejects ``__shared__ T arr[N]`` decls (``uses too much shared
+# data``); the only way to use more is dynamic smem (``extern __shared__``
+# + ``cudaFuncAttributeMaxDynamicSharedMemorySize``). When the kernel's
+# total Smem footprint exceeds this, ``render_kernelop`` switches to a
+# single dynamic pool with per-buffer offsets.
+STATIC_SMEM_CAP = 48 * 1024
+
+_DTYPE_BYTES: dict[str, int] = {"float": 4, "double": 8, "int": 4, "half": 2, "unsigned long long": 8}
 
 # TMA / mbarrier prelude. NVRTC doesn't ship ``<cuda.h>`` /
 # ``<cuda/ptx>`` / ``<cuda/barrier>``, so we can't ``#include`` the
@@ -152,12 +162,14 @@ def render_kernelop(
     by first appearance. Literal-constant inputs are skipped.
     """
     literals = dict(literal_constants or {})
+    smem_offsets, smem_total = _compute_dynamic_smem_offsets(kernel_op)
     ctx = RenderCtx(
         shapes=dict(shapes or {}),
         indent=1,
         intrinsics=_INTRINSIC_TO_CUDA,
         builtins=_BUILTIN_TO_CUDA,
         literal_constants=literals,
+        smem_dynamic_offsets=smem_offsets,
     )
 
     sig_parts = [f"const float* {n}" for n in kernel_op.inputs if n not in literals]
@@ -177,8 +189,58 @@ def render_kernelop(
     launch_bounds = f"\n__launch_bounds__({bounds})"
 
     body_text = "\n".join(render_body(kernel_op.body, ctx))
+    if smem_offsets:
+        # All Smem decls were rewritten to pointer aliases into a single
+        # dynamic pool; declare the pool at function entry. ``__align__(16)``
+        # satisfies TMA's 16-byte requirement and any FP32/FP64 alignment.
+        # ``extern __shared__`` arrays must be declared without an explicit
+        # size — NVCC otherwise treats the decl as a *static* definition
+        # (with the static cap), defeating the whole point of the switch.
+        # The runtime size is supplied at launch via ``shared_mem=``.
+        pool_decl = f"    extern __shared__ __align__(16) unsigned char _smem_pool[];  // {smem_total} bytes\n"
+        body_text = pool_decl + body_text
     prelude = _TMA_PRELUDE if desc_names else ""
     return f'{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
+
+
+def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], int]:
+    """Walk the body collecting ``Smem`` decls. If their summed footprint
+    exceeds the static cap, return ``({name: byte_offset}, total_bytes)``
+    so ``Smem.render`` can emit pool aliases. Otherwise return an empty
+    map — the kernel keeps using ``__shared__ T arr[N]``.
+
+    Offsets are aligned on the larger of the dtype size and the Smem's
+    explicit ``align`` field (TMA slabs request 16-byte). The final pool
+    size is the offset right after the last buffer (no trailing padding
+    required — dynamic smem is sized at launch time)."""
+    smems: list[Smem] = []
+    for s in kernel_op:
+        if isinstance(s, Smem):
+            smems.append(s)
+    if not smems:
+        return {}, 0
+
+    total = 0
+    sizes: list[tuple[Smem, int]] = []
+    for s in smems:
+        elements = 1
+        for e in s.extents:
+            elements *= int(e)
+        n_bytes = elements * _DTYPE_BYTES.get(s.dtype, 4)
+        total += n_bytes
+        sizes.append((s, n_bytes))
+    if total <= STATIC_SMEM_CAP:
+        return {}, 0
+
+    offsets: dict[str, int] = {}
+    cursor = 0
+    for s, n_bytes in sizes:
+        natural = _DTYPE_BYTES.get(s.dtype, 4)
+        align = max(natural, int(s.align) if s.align else 0)
+        cursor = (cursor + align - 1) // align * align
+        offsets[s.name] = cursor
+        cursor += n_bytes
+    return offsets, cursor
 
 
 def _launch_bounds_for(kernel_op: KernelOp) -> int:

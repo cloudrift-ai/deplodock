@@ -12,11 +12,11 @@ wait before its consumer — holds even without pipelining) when:
 The materializer expands ``AsyncBufferedStage`` to ``Smem`` +
 cooperative ``CpAsyncCopy`` + ``CpAsyncCommit`` only (no implicit wait
 or sync); the explicit ``AsyncWait`` lowers to ``CpAsyncWait(group=0)``
-+ ``Sync()``. The pipelining pass (``015_pipeline_async``) then drops
++ ``Sync()``. The pipelining pass (``013_pipeline_async``) then drops
 these synchronous-style waits and re-emits them at the pipelined
 schedule positions.
 
-Requires the upstream ``013_double_buffer`` pass to have promoted
+Requires the upstream ``009_double_buffer`` pass to have promoted
 plain ``Stage`` to ``BufferedStage``: cp.async without ``buffer_count >= 2``
 gives no overlap, so a sync ``Stage`` is intentionally not eligible.
 
