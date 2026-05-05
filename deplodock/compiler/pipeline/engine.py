@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.pipeline.dump import _canonical_node_id
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
@@ -318,7 +319,7 @@ def _apply_rules(
                         fragment = rule.rewrite(**kwargs)
                     except RuleSkipped as exc:
                         if debug_on:
-                            logger.debug("rule %s skipped at %s: %s", rule.name, match.root_node_id, exc.reason)
+                            logger.debug("rule %s skipped at %s: %s", rule.name, _canonical_node_id(match.root_node_id), exc.reason)
                         rewrite_time += time.monotonic() - t1
                         continue
                     if fragment is None:
@@ -371,7 +372,7 @@ def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Gr
     matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
     matched_ids.add(match.root_node_id)
 
-    lines = [f"=== rule {name} matched at {match.root_node_id} ==="]
+    lines = [f"=== rule {name} matched at {_canonical_node_id(match.root_node_id)} ==="]
     lines.append("before:")
     matched_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes]
     lines.extend(f"    {line}" for line in _format_nodes(matched_nodes, graph).splitlines())
@@ -386,7 +387,7 @@ def _format_inplace_application(name: str, graph: Graph, match: Match, pre_ops: 
     None (e.g. lowering/tile). Renders before/after of the mutated
     nodes by swapping their op temporarily for the "before" view."""
     mutated = [nid for nid, prev in pre_ops.items() if nid in graph.nodes and graph.nodes[nid].op is not prev]
-    lines = [f"=== rule {name} matched at {match.root_node_id} (in-place) ==="]
+    lines = [f"=== rule {name} matched at {_canonical_node_id(match.root_node_id)} (in-place) ==="]
     lines.append("before:")
     post_ops = {nid: graph.nodes[nid].op for nid in mutated}
     for nid in mutated:
