@@ -51,7 +51,11 @@ Trigger conditions:
   as long as they are independent (no Accum's value transitively reads
   another Accum's running value); online algorithms (online softmax,
   Welford) are still punted.
-- The first reduce Loop's axis extent ≥ ``BLOCK_SIZE``.
+- The first reduce Loop's axis extent ≥ ``WARP_SIZE`` (32). When the
+  extent is smaller than the configured ``BLOCK_SIZE`` we still
+  cooperate, but use ``next_pow2(extent)`` threads instead — softmax
+  over a 128-wide attention row gets a 128-thread block-reduce rather
+  than each of 128 threads redundantly walking the row sequentially.
 """
 
 from __future__ import annotations
@@ -59,6 +63,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, StridedLoop
 from deplodock.compiler.ir.tile.ir import (
     BLOCK_SIZE,
@@ -69,6 +74,22 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+
+_WARP_SIZE = 32
+
+
+def _next_pow2(n: int) -> int:
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def _effective_block_size(reduce_extent: int) -> int:
+    """Threads per CTA for the cooperative reduce. Capped at the
+    configured ``BLOCK_SIZE``; floored at ``WARP_SIZE`` so the
+    cross-thread tree-halve still has a full warp to combine."""
+    return max(_WARP_SIZE, min(BLOCK_SIZE, _next_pow2(reduce_extent)))
 
 
 def _has_matmul_reduce(body) -> bool:
@@ -121,8 +142,10 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     reduce_loops = [loop for loop in blk.body.of_type(Loop) if loop.is_reduce]
     if not reduce_loops:
         raise RuleSkipped("Tile body has no reduce Loop")
-    if int(reduce_loops[0].axis.extent) < BLOCK_SIZE:
-        raise RuleSkipped(f"first reduce-axis extent {int(reduce_loops[0].axis.extent)} < BLOCK_SIZE={BLOCK_SIZE}")
+    reduce_extent = int(reduce_loops[0].axis.extent)
+    if reduce_extent < _WARP_SIZE:
+        raise RuleSkipped(f"first reduce-axis extent {reduce_extent} < WARP_SIZE={_WARP_SIZE} (too small to cooperate)")
+    eff_block = _effective_block_size(reduce_extent)
     for rl in reduce_loops:
         if not any(isinstance(s, Accum) for s in rl.body):
             raise RuleSkipped(f"reduce Loop {rl.axis.name!r} has no Accum")
@@ -140,9 +163,9 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     if any(_has_matmul_reduce(s.body) for s in reduce_loops if isinstance(s, Loop)) or _has_matmul_reduce(blk.body):
         raise RuleSkipped("body has matmul-reduce signature — defer to register_tile / blockify matmul path")
 
-    t_axis = Axis("t", BLOCK_SIZE)
+    t_axis = Axis("t", eff_block)
     t_start = Var(t_axis.name)
-    step = Literal(BLOCK_SIZE, "int")
+    step = Literal(eff_block, "int")
 
     # Phase 1: each body Loop → StridedLoop driven by t. Reduce Loops
     # get a Combine sibling for the cross-thread tree-halve.
@@ -176,12 +199,20 @@ def _rewrite_block(blk: Tile) -> Tile | None:
         if ba.axis.name not in naked_only_tile:
             continue
         ext = int(ba.axis.extent)
-        if ext >= BLOCK_SIZE and ext % BLOCK_SIZE == 0:
+        if ext >= eff_block and ext % eff_block == 0:
             naked_axis = ba.axis
             break
 
     # Phase 3: wrap the post-reduce tail (everything after the last
     # block-structured stmt) in a StridedLoop over the chosen naked axis.
+    #
+    # If a preceding reduce loop has the same extent as the naked axis,
+    # alias the naked axis name to that reduce axis name in the suffix.
+    # This makes the post-reduce Loads textually equal to the in-reduce
+    # Loads (e.g. softmax: ``x[..., a3]`` vs ``x[..., a4]`` collapse to
+    # ``x[..., a3]`` everywhere), so ``007_stage_inputs`` partitions
+    # them into a single Stage instead of allocating two identical
+    # smem buffers and double-loading the row from DRAM.
     if naked_axis is not None:
         split_idx = 0
         for i, s in enumerate(body_phase1):
@@ -189,7 +220,15 @@ def _rewrite_block(blk: Tile) -> Tile | None:
                 split_idx = i + 1
         prefix = body_phase1[:split_idx]
         suffix: list[Stmt] = body_phase1[split_idx:]
-        new_body: list[Stmt] = [*prefix, StridedLoop(axis=naked_axis, start=t_start, step=step, body=suffix)]
+        wrap_axis = naked_axis
+        for rl in reduce_loops:
+            if int(rl.axis.extent) == int(naked_axis.extent) and rl.axis.name != naked_axis.name:
+                wrap_axis = rl.axis
+                break
+        if wrap_axis is not naked_axis:
+            sigma = Sigma({naked_axis.name: Var(wrap_axis.name)})
+            suffix = [s.rewrite(lambda n: n, sigma) for s in suffix]
+        new_body: list[Stmt] = [*prefix, StridedLoop(axis=wrap_axis, start=t_start, step=step, body=suffix)]
     else:
         new_body = body_phase1
 

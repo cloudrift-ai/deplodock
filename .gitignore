@@ -29,3 +29,4 @@ nginx.vllm.conf
 # Common dump filders
 _test_data/
 dump/
+tests/perf/.results/

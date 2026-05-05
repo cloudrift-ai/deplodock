@@ -37,6 +37,12 @@ tests/
 │   ├── test_gcp.py             # GCP command builders
 │   ├── test_staging.py      # enumerate_staged_files(), build_stage_tar()
 │   └── test_vm_dryrun.py    # vm create/delete CLI dry-run
+├── perf/                      # GPU perf comparison vs PyTorch (gated by `perf` marker)
+│   ├── ARCHITECTURE.md            # how to run, how to read the table, how to add a case
+│   ├── cases.py                   # curated (op, shape) cases + torch/deplodock builders
+│   ├── conftest.py                # `bench_pair` fixture, session summary, JSON dump
+│   ├── test_primitives.py         # matmul / rmsnorm / softmax / silu_mul
+│   └── test_fused.py              # SDPA (xfail until fusion lands)
 ├── compiler/
 │   ├── fixtures/               # pre-computed traces (tinyllama_layer0.json)
 │   ├── test_ir.py              # Graph, Node, Tensor — add/remove/replace/topo/copy
@@ -134,7 +140,8 @@ CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench
 ## Running
 
 ```bash
-pytest tests/ -v                       # all tests
+pytest tests/ -v                       # all tests (skips `perf`-marked tests)
 pytest tests/deploy/test_recipe.py -v  # single file
 pytest tests/planner/ -v               # single directory
+pytest tests/perf/ -m perf -v          # GPU perf suite (see tests/perf/ARCHITECTURE.md)
 ```

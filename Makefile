@@ -1,4 +1,4 @@
-.PHONY: help setup clean bench bench-force test-compose lint format
+.PHONY: help setup clean bench bench-force bench-kernels test-compose lint format
 
 help:
 	@echo "Server Benchmark Makefile"
@@ -9,6 +9,7 @@ help:
 	@echo "  format         - Auto-format code and fix lint violations"
 	@echo "  bench          - Run benchmarks in parallel"
 	@echo "  bench-force    - Run benchmarks in parallel (force re-run, skip cached results)"
+	@echo "  bench-kernels  - Run per-kernel perf comparison vs PyTorch (tests/perf/, requires CUDA)"
 	@echo "  clean          - Remove virtual environment and generated files"
 	@echo "  test-compose   - Test docker-compose generation with sample config"
 
@@ -35,6 +36,9 @@ format: setup
 
 test: setup
 	./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
+
+bench-kernels: setup
+	./venv/bin/pytest tests/perf/ -m perf -v -p no:randomly --no-header
 
 bench: setup
 	@echo "Running benchmarks..."
