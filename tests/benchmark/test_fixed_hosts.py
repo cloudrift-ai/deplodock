@@ -79,7 +79,7 @@ async def test_resolve_fixed_hosts_dry_run_skips_detection():
 
 
 def test_bench_fixed_host_dry_run_cli(run_cli, make_bench_config, recipes_dir, tmp_path):
-    """End-to-end CLI: --ssh skips provisioning and runs against the given host."""
+    """End-to-end CLI: --ssh skips cloud provisioning but still installs Docker / NVIDIA toolkit if missing."""
     config_path = make_bench_config(tmp_path)
     recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
     rc, stdout, stderr = run_cli(
@@ -99,3 +99,6 @@ def test_bench_fixed_host_dry_run_cli(run_cli, make_bench_config, recipes_dir, t
     assert "VM provisioned" not in stdout
     # No instances.json prompt
     assert "Instance info saved" not in stdout
+    # provision_remote runs even for pre-allocated hosts (idempotent)
+    assert "would install docker" in stdout
+    assert "would install nvidia-container-toolkit" in stdout

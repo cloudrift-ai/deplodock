@@ -29,4 +29,9 @@ nginx.vllm.conf
 # Common dump filders
 _test_data/
 dump/
+
+# Local environment / secrets
+.env
+.env.local
+.env.*.local
 tests/perf/.results/
