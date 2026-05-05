@@ -82,12 +82,26 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
+_WARP_SIZE = 32
+
+
 def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
     if any(isinstance(s, Stage) for s in tile.body.iter()):
         raise RuleSkipped("Tile body already has Stage stmts (idempotence)")
     if not tile.thread_axes:
         raise RuleSkipped("Tile has no thread_axes — no reuse to stage")
+
+    # Warp-only cooperative tiles (one thread axis, extent ≤ WARP_SIZE)
+    # don't benefit from a smem stage: ``materialize_tile`` will emit a
+    # register-only ``WarpShuffle`` combine, the row fits in registers
+    # across the warp, and L1 absorbs second/third loads of the same
+    # row. Skip staging entirely so the kernel stays smem-free.
+    n_thread = 1
+    for ba in tile.thread_axes:
+        n_thread *= int(ba.extent)
+    if n_thread <= _WARP_SIZE:
+        raise RuleSkipped(f"warp-only cooperative tile (n_threads={n_thread} ≤ {_WARP_SIZE}); register-resident, no smem stage")
 
     used_names: set[str] = set()
     new_tile_body = _process_scope(tile, tile.thread_axes, tile.all_axes, used_names)

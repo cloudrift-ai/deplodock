@@ -50,6 +50,7 @@ from deplodock.compiler.ir.kernel.ir import (
     TmaDescriptor,
     TmaLoad,
     TreeHalve,
+    WarpShuffle,
 )
 from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import (
@@ -530,13 +531,25 @@ def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
     return expr
 
 
+_WARP_SIZE = 32
+
+
 def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
-    """Emit the cross-thread combine: each thread writes its per-thread
-    accumulator partial to smem indexed by ``t``, then a tree-halve
-    reduces over ``t`` and broadcasts the final value via a load from
-    ``smem[0]``."""
-    smem_name = f"{accum.name}_smem"
+    """Emit the cross-thread combine producing ``<accum>_b``.
+
+    Two paths:
+
+    - **Warp** (``n_threads ≤ WARP_SIZE`` and power of two): a single
+      ``WarpShuffle`` butterfly via ``__shfl_xor_sync``. No smem, no
+      syncthreads, no smem-staged broadcast.
+    - **Block** (otherwise): each thread writes its partial to a
+      smem buffer indexed by ``t``, a ``TreeHalve`` reduces in place,
+      and a ``Load`` from ``smem[0]`` broadcasts the final value.
+    """
     broadcast_name = f"{accum.name}_b"
+    if n_threads <= _WARP_SIZE and (n_threads & (n_threads - 1)) == 0:
+        return [WarpShuffle(name=broadcast_name, value=accum.name, op=accum.op, length=n_threads)]
+    smem_name = f"{accum.name}_smem"
     return [
         Smem(name=smem_name, extents=(n_threads,)),
         Write(output=smem_name, index=(Var(t),), value=accum.name),

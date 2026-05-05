@@ -15,9 +15,10 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.frontend.ir import MatmulOp
+from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
 from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
+from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, run_pipeline
 
 _accums_independent = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.004_cooperative_reduce")._accums_independent
 
@@ -80,6 +81,79 @@ def test_warp_sized_axis_fires_cooperative_reduce(recording_dump):
     run_pipeline(g, TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "cooperative_reduce" in fired
+
+
+def test_warp_cooperative_skips_stage_inputs(recording_dump):
+    """K=32 → cooperative tile has 32 threads (one warp); stage_inputs
+    must skip so the kernel stays smem-free (the WarpShuffle combine
+    in materialize_tile is register-only and L1 absorbs repeat loads)."""
+    g = Graph()
+    _input(g, "x", (4, 32))
+    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
+    g.inputs = ["x"]
+    g.outputs = ["o"]
+
+    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    fired = recording_dump.fired_rules("lowering/tile")
+    assert "cooperative_reduce" in fired
+    assert "stage_inputs" not in fired
+
+
+def _kernel_body_stmts(g: Graph):
+    out: list = []
+    for node in g.nodes.values():
+        body = getattr(node.op, "body", None)
+        if body is None:
+            continue
+        for s in body.iter():
+            out.append(s)
+    return out
+
+
+def test_warp_cooperative_emits_warpshuffle(recording_dump):
+    """K=32 cooperative tile → ``materialize_tile._emit_combine`` picks
+    the warp path: ``WarpShuffle`` Stmt appears, no ``TreeHalve``."""
+    g = Graph()
+    _input(g, "x", (4, 32))
+    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
+    g.inputs = ["x"]
+    g.outputs = ["o"]
+
+    out = run_pipeline(g, KERNEL_PASSES, dump=recording_dump)
+    stmts = _kernel_body_stmts(out)
+    assert any(isinstance(s, WarpShuffle) for s in stmts)
+    assert not any(isinstance(s, TreeHalve) for s in stmts)
+
+
+def test_block_cooperative_emits_treehalve(recording_dump):
+    """K=256 cooperative tile → ``materialize_tile._emit_combine`` picks
+    the block path: ``TreeHalve`` Stmt appears, no ``WarpShuffle``."""
+    g = Graph()
+    _input(g, "x", (4, 256))
+    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
+    g.inputs = ["x"]
+    g.outputs = ["o"]
+
+    out = run_pipeline(g, KERNEL_PASSES, dump=recording_dump)
+    stmts = _kernel_body_stmts(out)
+    assert any(isinstance(s, TreeHalve) for s in stmts)
+    assert not any(isinstance(s, WarpShuffle) for s in stmts)
+
+
+def test_block_cooperative_still_uses_stage_inputs(recording_dump):
+    """K=256 → cooperative tile has BLOCK_SIZE threads; stage_inputs
+    still fires (the smem stage avoids redundant DRAM reads when the
+    row is too wide to keep register-resident across the warp)."""
+    g = Graph()
+    _input(g, "x", (4, 256))
+    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
+    g.inputs = ["x"]
+    g.outputs = ["o"]
+
+    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    fired = recording_dump.fired_rules("lowering/tile")
+    assert "cooperative_reduce" in fired
+    assert "stage_inputs" in fired
 
 
 def test_matmul_does_not_fire_cooperative_reduce(recording_dump):

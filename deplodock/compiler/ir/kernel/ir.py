@@ -370,6 +370,46 @@ class TreeHalve(Stmt):
         ]
 
 
+@dataclass
+class WarpShuffle(Stmt):
+    """Warp-shuffle reduction: combine ``value`` across ``length`` lanes
+    via ``__shfl_xor_sync`` and bind the broadcast result to ``name``.
+
+    Renders as a register-only butterfly (no smem, no syncthreads):
+
+        float <name> = <value>;
+        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/2));
+        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/4));
+        ...
+        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, 1));
+
+    Used by ``materialize_tile._emit_combine`` when the cooperative
+    thread count fits in a single warp (``length ≤ 32``, power of two).
+    Replaces the ``Smem`` + ``Sync`` + ``TreeHalve`` + ``Sync`` + ``Load``
+    sequence — kills the smem alloc, the two block barriers, and the
+    smem-staged broadcast load.
+    """
+
+    name: str
+    value: str
+    op: ElementwiseImpl
+    length: int
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}WarpShuffle({self.name} <- {self.value}, op={self.op.name}, length={self.length})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        out = [f"{pad}float {self.name} = {self.value};"]
+        s = int(self.length) // 2
+        while s > 0:
+            shfl = f"__shfl_xor_sync(0xffffffff, {self.name}, {s})"
+            combined = _binary_combine_expr(self.op, self.name, shfl)
+            out.append(f"{pad}{self.name} = {combined};")
+            s >>= 1
+        return out
+
+
 def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str) -> str:
     """Render a 2-arg combine for ``ElementwiseImpl`` reduce ops."""
     name = op.name
@@ -498,6 +538,7 @@ __all__ = [
     "Smem",
     "Sync",
     "TreeHalve",
+    "WarpShuffle",
     "CpAsyncCopy",
     "CpAsyncCommit",
     "CpAsyncWait",

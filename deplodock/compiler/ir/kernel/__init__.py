@@ -33,6 +33,7 @@ from deplodock.compiler.ir.kernel.ir import (
     Tile,
     TreeHalve,
     Var,
+    WarpShuffle,
     Write,
 )
 
@@ -57,6 +58,7 @@ __all__ = [
     "Smem",
     "Sync",
     "TreeHalve",
+    "WarpShuffle",
     "StridedLoop",
     "BoundAxis",
     "BIND_THREAD",
