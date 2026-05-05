@@ -168,6 +168,16 @@ class Tile(Stmt):
             out = [f"{pad}{{"]
             out.extend(_render_grid_axis_decode(self.block_axes, "blockIdx.x", inner))
             out.extend(_render_grid_axis_decode(self.thread_axes, "threadIdx.x", inner))
+            # Lane / warp helpers for hierarchical warp-shuffle combines.
+            # Cheap (two bit-ops, register-resident) and only emitted for
+            # multi-warp cooperative tiles where they're actually used.
+            n_threads = 1
+            for ax in self.thread_axes:
+                n_threads *= int(ax.extent)
+            if n_threads > 32:
+                inner_pad = _pad(inner.indent)
+                out.append(f"{inner_pad}int lane = threadIdx.x & 31;")
+                out.append(f"{inner_pad}int warp = threadIdx.x >> 5;")
             for s in self.body:
                 out.extend(s.render(inner))
             out.append(f"{pad}}}")

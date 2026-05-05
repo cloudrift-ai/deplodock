@@ -125,9 +125,12 @@ def test_warp_cooperative_emits_warpshuffle(recording_dump):
     assert not any(isinstance(s, TreeHalve) for s in stmts)
 
 
-def test_block_cooperative_emits_treehalve(recording_dump):
+def test_block_cooperative_emits_hierarchical_reduce(recording_dump):
     """K=256 cooperative tile → ``materialize_tile._emit_combine`` picks
-    the block path: ``TreeHalve`` Stmt appears, no ``WarpShuffle``."""
+    the hierarchical path: ``WarpShuffle`` reduces lanes within each
+    warp, then a tiny ``TreeHalve(length=n_warps)`` collapses across
+    warps. Both Stmts are present; the TreeHalve's length is far
+    smaller than the legacy ``length=n_threads`` form."""
     g = Graph()
     _input(g, "x", (4, 256))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
@@ -136,8 +139,12 @@ def test_block_cooperative_emits_treehalve(recording_dump):
 
     out = run_pipeline(g, KERNEL_PASSES, dump=recording_dump)
     stmts = _kernel_body_stmts(out)
-    assert any(isinstance(s, TreeHalve) for s in stmts)
-    assert not any(isinstance(s, WarpShuffle) for s in stmts)
+    warp_shuffles = [s for s in stmts if isinstance(s, WarpShuffle)]
+    tree_halves = [s for s in stmts if isinstance(s, TreeHalve)]
+    assert warp_shuffles, "expected WarpShuffle for the per-warp combine"
+    assert tree_halves, "expected TreeHalve for the cross-warp combine"
+    # Cross-warp TreeHalve runs over n_warps partials, not n_threads.
+    assert all(t.length < 256 for t in tree_halves), [t.length for t in tree_halves]
 
 
 def test_block_cooperative_still_uses_stage_inputs(recording_dump):

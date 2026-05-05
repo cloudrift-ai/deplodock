@@ -537,18 +537,48 @@ _WARP_SIZE = 32
 def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
     """Emit the cross-thread combine producing ``<accum>_b``.
 
-    Two paths:
+    Three paths, picked by ``n_threads``:
 
     - **Warp** (``n_threads ≤ WARP_SIZE`` and power of two): a single
       ``WarpShuffle`` butterfly via ``__shfl_xor_sync``. No smem, no
-      syncthreads, no smem-staged broadcast.
-    - **Block** (otherwise): each thread writes its partial to a
-      smem buffer indexed by ``t``, a ``TreeHalve`` reduces in place,
-      and a ``Load`` from ``smem[0]`` broadcasts the final value.
+      syncthreads.
+    - **Hierarchical** (``n_threads`` a power-of-two multiple of
+      ``WARP_SIZE``): each warp first shuffle-reduces its lanes into
+      register-resident ``<acc>_w`` (broadcast within the warp); lane 0
+      of each warp writes ``<acc>_w`` to a tiny ``smem[n_warps]`` slab;
+      one ``Sync`` + ``TreeHalve(length=n_warps)`` collapses across
+      warps; broadcast load delivers ``<acc>_b``. The ``TreeHalve``
+      runs on the ``warp`` index — sized to ``n_warps`` (4 / 8 / etc.)
+      rather than ``n_threads`` (128 / 256 / etc.), so the cross-warp
+      reduce is one round of compare-sync instead of five.
+    - **Block** (otherwise — n_threads not a clean multiple of 32):
+      legacy path. Each thread writes its partial to a smem buffer
+      indexed by ``t``, a single ``TreeHalve`` over ``n_threads``
+      reduces in place, broadcast load.
+
+    The Tile renderer emits ``int lane = threadIdx.x & 31;`` and
+    ``int warp = threadIdx.x >> 5;`` for any cooperative Tile with
+    ``n_threads > WARP_SIZE`` so the hierarchical path's ``Var("lane")``
+    / ``Var("warp")`` references resolve.
     """
     broadcast_name = f"{accum.name}_b"
     if n_threads <= _WARP_SIZE and (n_threads & (n_threads - 1)) == 0:
         return [WarpShuffle(name=broadcast_name, value=accum.name, op=accum.op, length=n_threads)]
+    if n_threads % _WARP_SIZE == 0 and (n_threads & (n_threads - 1)) == 0:
+        n_warps = n_threads // _WARP_SIZE
+        smem_name = f"{accum.name}_smem"
+        warp_w = f"{accum.name}_w"
+        return [
+            WarpShuffle(name=warp_w, value=accum.name, op=accum.op, length=_WARP_SIZE),
+            Smem(name=smem_name, extents=(n_warps,)),
+            Cond(
+                cond=BinaryExpr("==", Var("lane"), Literal(0, "int")), body=(Write(output=smem_name, index=(Var("warp"),), value=warp_w),)
+            ),
+            Sync(),
+            TreeHalve(buf=smem_name, op=accum.op, length=n_warps, tid_var="warp"),
+            Sync(),
+            Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
+        ]
     smem_name = f"{accum.name}_smem"
     return [
         Smem(name=smem_name, extents=(n_threads,)),
