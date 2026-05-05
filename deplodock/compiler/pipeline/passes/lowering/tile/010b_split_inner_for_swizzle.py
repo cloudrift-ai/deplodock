@@ -60,6 +60,21 @@ PATTERN = [Pattern("root", TileOp)]
 
 _SHIFT_FOR = {SwizzleMode.B128: 4, SwizzleMode.B64: 2, SwizzleMode.B32: 1}
 
+# (row_mask, fp32_shift) per swizzle mode. The XOR amount on the inner
+# element index = ``(swizzle_row & row_mask) * fp32_shift``.
+#
+# Why ``row_mask`` differs per mode: NVIDIA's TMA hardware swizzle XORs
+# bits ``[M..M+B-1]`` of the byte address with bits ``[M+S..M+S+B-1]``,
+# where ``M+S = 7`` for the fp32 16-byte basic block. The m-identity
+# bits in the byte address start at bit ``log2(inner_extent_bytes)``:
+# B128 (inner=128B) → m starts at byte bit 7, no overlap with XOR bits
+# 7..9, so B=3 (row_mask=7). B64 (inner=64B) → m starts at bit 6, so
+# byte bit 6 IS m's bit 0 — including it in the XOR would scramble m's
+# identity, so hardware drops it (B=2, row_mask=6). B32 → only 1 bit
+# of m available before scrambling (row_mask=4). The fp32 shift is
+# always 4/2/1 matching the swizzle granularity.
+_ROW_MASK_FOR = {SwizzleMode.B128: 7, SwizzleMode.B64: 6, SwizzleMode.B32: 4}
+
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     from deplodock.compiler.tuning import _tma_swizzle_enabled  # noqa: PLC0415
@@ -185,10 +200,11 @@ def _swizzle_decode_load(load: Load, mode: SwizzleMode, ips: int, factor: int) -
     if len(load.index) < 2:
         raise RuleSkipped(f"Load on {load.input!r}: index rank < 2")
     shift = _SHIFT_FOR[mode]
+    row_mask = _ROW_MASK_FOR[mode]
     row = load.index[-2]
     inner = load.index[-1]
     if factor == 1:
-        row_bits = BinaryExpr("&", row, Literal(7, "int"))
+        row_bits = BinaryExpr("&", row, Literal(row_mask, "int"))
         xor_term: object = row_bits if shift == 1 else BinaryExpr("*", row_bits, Literal(shift, "int"))
         new_inner: object = BinaryExpr("^", inner, xor_term)
         return dc_replace(load, index=(*load.index[:-1], new_inner))
@@ -197,7 +213,7 @@ def _swizzle_decode_load(load: Load, mode: SwizzleMode, ips: int, factor: int) -
     swizzle_row: object = BinaryExpr(
         "+", BinaryExpr("*", row, Literal(factor, "int")), n_outer
     )
-    row_bits = BinaryExpr("&", swizzle_row, Literal(7, "int"))
+    row_bits = BinaryExpr("&", swizzle_row, Literal(row_mask, "int"))
     xor_term = row_bits if shift == 1 else BinaryExpr("*", row_bits, Literal(shift, "int"))
     n_inner_phys = BinaryExpr("^", n_inner, xor_term)
     return dc_replace(load, index=(*load.index[:-1], n_outer, n_inner_phys))
