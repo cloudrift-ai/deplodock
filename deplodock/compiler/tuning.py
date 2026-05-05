@@ -1,11 +1,28 @@
 """Compile-time tuning knobs — heuristic defaults + env-var overrides.
 
-Single matmul tile config (formerly the "asymmetric" / cuBLAS-style tile;
-the symmetric ``PAT × PAT`` tier was retired). Per-CTA ``(BN=128, BM=64)``,
-per-thread ``(F_M=8, F_N=4)`` → 32 outputs / thread, post-split
-``(BN/F_N, BM/F_M) = (32, 8) = 256`` threads / CTA. Block dim ``(32, 8)``:
-each warp shares one M row → A-load broadcasts; threads stride consecutive
-N cols → B-load LDS.128. Validated at 105% of cuBLAS on 2048² fp32 RTX 5090.
+Three-class matmul tile, picked from the logical output extents:
+
+- **huge** (``M ≥ 256 AND N ≥ 8192``) — Qwen gate/up_proj.s512-class
+  GEMMs. ``(BN=128, BM=128, F_M=16, F_N=4)`` → 32 outputs / thread,
+  256 threads / CTA. Splitk waves target = 8.
+- **compact** (``N ≤ 1024``) — kv_proj-class and SDPA-shaped matmuls
+  (small head_dim K, M=seq). ``(BN=64, BM=64, F_M=8, F_N=4)`` → 16
+  outputs / thread, 128 threads / CTA. Splitk waves target = 2.
+- **default** (everything else) — Q/O/down/MLP-up proj-class. Original
+  asymmetric cuBLAS-style ``(BN=128, BM=64, F_M=8, F_N=4)`` validated
+  at 105% of cuBLAS on 2048² fp32 RTX 5090. Splitk waves target = 8.
+
+Orthogonal splitk-waves overrides (tile shape unchanged):
+
+- **low-grid** (``M ≤ 128 AND N ≤ 2048``): waves=2. The M·N grid is too
+  small (~32 CTAs) for the 8-wave target — splitk inflates and atomic
+  contention dominates.
+- **wide-grid** (default class, ``M ≥ 256 AND N ≥ 4096``): waves=16.
+  Big enough to absorb extra split-K parallelism without contention.
+
+Sweep on RTX 5090 fp32: this 3-class split cuts kv_proj.s512 ~48µs →
+~20µs, kv_proj.s128 ~30µs → ~13µs, sdpa.tinyllama.s512 ~456µs → ~178µs,
+gate_proj.s512 (qwen) ~1430µs → ~1320µs. Env vars override per-axis.
 
 Env vars:
 
@@ -13,6 +30,8 @@ Env vars:
 - ``DEPLODOCK_FN``, ``DEPLODOCK_FM`` — per-thread output cells.
 - ``DEPLODOCK_BK`` — K-split size for ``002_split_matmul_k`` (subject
   to ``K % BK == 0 and K > BK``). Default is M-adaptive.
+- ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
+- ``DEPLODOCK_SPLITK_WAVES`` — override the auto-splitk waves target.
 - ``DEPLODOCK_TB`` — total thread budget per CTA for non-matmul kernels.
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
@@ -40,10 +59,48 @@ if TYPE_CHECKING:
     from deplodock.compiler.ir.tile.ir import Tile
 
 
-# Per-CTA matmul tile (innermost N, outer M).
-_TILE_SHAPE = (128, 64)
-# Per-thread output cells (F_M, F_N). Block dim = (BN/F_N, BM/F_M) = (32, 8) = 256 threads.
-_F_PER_AXIS = (8, 4)
+# Per-CTA matmul tile defaults. Three classes, picked from logical output
+# extents (sweep on RTX 5090 fp32):
+#
+# - "huge" (``M ≥ _HUGE_M_MIN AND N ≥ _HUGE_N_MIN``): big GEMMs like
+#   ``M=512, N=18944`` (Qwen gate/up_proj.s512). ``(BN=128, BM=128,
+#   F_M=16, F_N=4) → 32 outputs/thread, 256 threads/CTA`` beats the
+#   default tile by ~8%.
+#
+# - "compact" (``N ≤ _COMPACT_N_MAX``): kv_proj-class (narrow N) and
+#   SDPA-shaped matmuls (small head_dim K, M=seq). ``(BN=64, BM=64,
+#   F_M=8, F_N=4)`` + ``waves=2`` raises grid count and tames atomic-add
+#   contention. Cuts kv_proj.s512 ~48µs → ~20µs and sdpa.tinyllama.s512
+#   ~456µs → ~178µs.
+#
+# - "default" (everything else): proj-class GEMMs (Q/O/down/MLP up). The
+#   original cuBLAS-style asymmetric ``(BN=128, BM=64, F_M=8, F_N=4)``
+#   tile, validated at ~105% of cuBLAS on 2048² fp32.
+_TILE_SHAPE_DEFAULT = (128, 64)  # (BN, BM)
+_F_PER_AXIS_DEFAULT = (8, 4)  # (F_M, F_N)
+_TILE_SHAPE_HUGE = (128, 128)
+_F_PER_AXIS_HUGE = (16, 4)
+_TILE_SHAPE_COMPACT = (64, 64)
+_F_PER_AXIS_COMPACT = (8, 4)
+_HUGE_M_MIN = 256
+_HUGE_N_MIN = 8192
+_COMPACT_N_MAX = 1024
+# "Low-grid" cap: when both ``M ≤ _LOW_GRID_M_MAX`` and ``N ≤
+# _LOW_GRID_N_MAX``, the M·N grid stays small (~32 CTAs at default tile)
+# — auto-splitk's 8-wave target inflates splitk to ~32 and atomic-add
+# contention dominates. Drop waves to 2. Sweep on RTX 5090 fp32 (cuts in
+# µs vs default): tinyllama.o_proj.s32 33→14, q_proj.s32 33→14,
+# o_proj.s128 53→31, q_proj.s128 53→31, qwen.{o,q}_proj.s32 42→37.
+_LOW_GRID_M_MAX = 128
+_LOW_GRID_N_MAX = 2048
+# "Wide-grid" floor: default-class GEMMs with ``M ≥ _WIDE_GRID_M_MIN``
+# and ``N ≥ _WIDE_GRID_N_MIN`` (but below the huge threshold, ``N ≥
+# _HUGE_N_MIN``) have enough M·N CTAs that more split-K parallelism is a
+# net win — bumping waves to 16 cuts tinyllama.{gate,up}_proj.s512
+# ~245µs → ~225µs. Picked symmetric to ``_HUGE_N_MIN/2`` to avoid
+# straddling the huge-class boundary.
+_WIDE_GRID_M_MIN = 256
+_WIDE_GRID_N_MIN = 4096
 
 # Per-stage K-tile, M-adaptive. Sweep on TinyLlama Q/Gate/Down at seq ∈
 # {32, 128, 512} on RTX 5090 fp32: M ≤ 256 → BK=64 wins (small grid, K
@@ -109,6 +166,34 @@ def _matmul_M(tile: Tile) -> int:
     return extents[1] if len(extents) >= 2 else 0
 
 
+def _tile_class(tile: Tile | None) -> str:
+    """``"huge" | "compact" | "default"`` — picks the matmul tile class
+    from the logical output extents. Non-matmul tiles fall to ``"default"``
+    (the env vars wouldn't apply anyway)."""
+    if tile is None or not _has_matmul_reduce(tile.body):
+        return "default"
+    extents = _logical_output_extents(tile)
+    if len(extents) < 2:
+        return "default"
+    n, m = extents[0], extents[1]
+    if m >= _HUGE_M_MIN and n >= _HUGE_N_MIN:
+        return "huge"
+    if n <= _COMPACT_N_MAX:
+        return "compact"
+    return "default"
+
+
+def _default_tile(tile: Tile | None) -> tuple[tuple[int, int], tuple[int, int]]:
+    """``((BN, BM), (F_M, F_N))`` defaults for the matmul tile, picked
+    by ``_tile_class``."""
+    cls = _tile_class(tile)
+    if cls == "huge":
+        return _TILE_SHAPE_HUGE, _F_PER_AXIS_HUGE
+    if cls == "compact":
+        return _TILE_SHAPE_COMPACT, _F_PER_AXIS_COMPACT
+    return _TILE_SHAPE_DEFAULT, _F_PER_AXIS_DEFAULT
+
+
 # --- Public API ---------------------------------------------------------
 
 
@@ -142,8 +227,9 @@ def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
     innermost-first. ``(BN, BM)`` for matmul, ``(thread_budget,)`` for
     non-matmul kernels."""
     if tile is not None and _has_matmul_reduce(tile.body):
-        bn = _int_env("DEPLODOCK_BN", _TILE_SHAPE[0])
-        bm = _int_env("DEPLODOCK_BM", _TILE_SHAPE[1])
+        (def_bn, def_bm), _ = _default_tile(tile)
+        bn = _int_env("DEPLODOCK_BN", def_bn)
+        bm = _int_env("DEPLODOCK_BM", def_bm)
         return (bn, bm)
     return (thread_budget(),)
 
@@ -156,10 +242,11 @@ def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
     they were already < tile width)."""
     if tile is None or not _has_matmul_reduce(tile.body):
         return (1, 1)
-    f_m = _int_env("DEPLODOCK_FM", _F_PER_AXIS[0])
-    f_n = _int_env("DEPLODOCK_FN", _F_PER_AXIS[1])
-    bn = _int_env("DEPLODOCK_BN", _TILE_SHAPE[0])
-    bm = _int_env("DEPLODOCK_BM", _TILE_SHAPE[1])
+    (def_bn, def_bm), (def_fm, def_fn) = _default_tile(tile)
+    f_m = _int_env("DEPLODOCK_FM", def_fm)
+    f_n = _int_env("DEPLODOCK_FN", def_fn)
+    bn = _int_env("DEPLODOCK_BN", def_bn)
+    bm = _int_env("DEPLODOCK_BM", def_bm)
     # Post-blockify: each output's THREAD axis should equal the per-axis
     # tile width (BN, BM). If neither matches, blockify kept the axes
     # whole — register-tiling would just rename them, no parallelism.
@@ -207,8 +294,9 @@ def _bk_fits_smem(tile: Tile, bk: int) -> int:
     extents = _logical_output_extents(tile)
     if len(extents) < 2:
         return bk
-    bn_actual = min(extents[0], _int_env("DEPLODOCK_BN", _TILE_SHAPE[0]))
-    bm_actual = min(extents[1], _int_env("DEPLODOCK_BM", _TILE_SHAPE[1]))
+    (def_bn, def_bm), _ = _default_tile(tile)
+    bn_actual = min(extents[0], _int_env("DEPLODOCK_BN", def_bn))
+    bm_actual = min(extents[1], _int_env("DEPLODOCK_BM", def_bm))
     while bk > 1 and (bn_actual + bm_actual) * bk * _DTYPE_BYTES * 2 > _SMEM_BUDGET_BYTES:
         bk //= 2
     return bk
@@ -218,15 +306,36 @@ def cooperative_block_size() -> int:
     return _int_env("DEPLODOCK_COOP_BLOCK", 256)
 
 
-# Cross-CTA split-K target. The matmul tile pegs occupancy at ~33%
-# (regs+smem cap blocks/SM at 2-3), so "1 wave of CTAs" only fills a
-# third of the SMSPs. Targeting 8 waves of CTAs effectively gives ~3
-# waves of warps, where the empirical perf elbow sits on TinyLlama
-# MLP shapes (sweep on k_linear_4_reduce and k_add_5_reduce: best
-# splitK ∈ {4, 8, 16}, regression past ~24 waves from atomic-add
-# contention).
-_SPLITK_TARGET_WAVES = 8
+# Cross-CTA split-K target. Class-adaptive: small-tile matmuls (narrow N
+# kv_proj-class, small-M s32, SDPA-shaped) win with a low waves target —
+# their grids already cover most of the SM array, so chasing 8 waves
+# inflates split-K and atomic-add contention dominates. Sweep on RTX 5090
+# fp32: ``waves=2`` cuts kv_proj.s512 48µs → 20µs and sdpa.qwen.s128 85µs
+# → 46µs, but regresses gate_proj.s512 — large-large GEMMs need ``waves=8``
+# (the prior comment's ``{4, 8, 16}`` empirical elbow on TinyLlama MLP).
+_SPLITK_TARGET_WAVES_HIGH = 16
+_SPLITK_TARGET_WAVES_LARGE = 8
+_SPLITK_TARGET_WAVES_SMALL = 2
 _SPLITK_NUM_SMS = 170  # RTX 5090; conservative upper bound for sm_120
+
+
+def _splitk_target_waves(tile: Tile | None) -> int:
+    cls = _tile_class(tile)
+    if tile is not None and _has_matmul_reduce(tile.body):
+        extents = _logical_output_extents(tile)
+        n = extents[0] if extents else 0
+        m = extents[1] if len(extents) >= 2 else 0
+    else:
+        n = m = 0
+    if 0 < m <= _LOW_GRID_M_MAX and 0 < n <= _LOW_GRID_N_MAX:
+        default = _SPLITK_TARGET_WAVES_SMALL
+    elif cls == "compact":
+        default = _SPLITK_TARGET_WAVES_SMALL
+    elif cls == "default" and m >= _WIDE_GRID_M_MIN and n >= _WIDE_GRID_N_MIN:
+        default = _SPLITK_TARGET_WAVES_HIGH
+    else:
+        default = _SPLITK_TARGET_WAVES_LARGE
+    return _int_env("DEPLODOCK_SPLITK_WAVES", default)
 
 
 def auto_splitk(tile: Tile, k_o_extent: int) -> int:
@@ -241,8 +350,9 @@ def auto_splitk(tile: Tile, k_o_extent: int) -> int:
         return forced
     if not _has_matmul_reduce(tile.body):
         return 1
-    bn = _int_env("DEPLODOCK_BN", _TILE_SHAPE[0])
-    bm = _int_env("DEPLODOCK_BM", _TILE_SHAPE[1])
+    (def_bn, def_bm), _ = _default_tile(tile)
+    bn = _int_env("DEPLODOCK_BN", def_bn)
+    bm = _int_env("DEPLODOCK_BM", def_bm)
     targets = (bn, bm)
     grid = 1
     extents = sorted([int(ba.axis.extent) for ba in tile.axes], reverse=True)
@@ -254,7 +364,7 @@ def auto_splitk(tile: Tile, k_o_extent: int) -> int:
             grid *= max(1, ext // tgt) if ext >= tgt else 1
         else:
             grid *= ext
-    target_total = _SPLITK_TARGET_WAVES * _SPLITK_NUM_SMS
+    target_total = _splitk_target_waves(tile) * _SPLITK_NUM_SMS
     if grid >= target_total:
         return 1
     desired = max(1, target_total // grid)
