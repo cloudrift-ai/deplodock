@@ -240,7 +240,7 @@ def _stmt_eval_scope() -> dict:
         TernaryExpr,
         Var,
     )
-    from deplodock.compiler.ir.kernel.ir import Smem, Sync, TreeHalve
+    from deplodock.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
     from deplodock.compiler.ir.stmt import (
         Accum,
         Assign,
@@ -297,6 +297,7 @@ def _stmt_eval_scope() -> dict:
         "Smem": Smem,
         "Sync": Sync,
         "TreeHalve": TreeHalve,
+        "WarpShuffle": WarpShuffle,
         "ElementwiseImpl": ElementwiseImpl,
         "__builtins__": {},
     }

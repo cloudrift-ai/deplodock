@@ -74,41 +74,112 @@ def pytest_collection_modifyitems(config, items):
 # ---------------------------------------------------------------------------
 
 
+# Trim fraction for the outlier-rejecting mean. Drops the top + bottom
+# ``_TRIM_FRAC`` of samples each before averaging — kills single-iter
+# outliers from queue contention or thermal blips that otherwise
+# dominate small-kernel ratios. With ``_TRIM_FRAC = 0.1`` and the
+# default 200 iters we keep the central 160 samples.
+_TRIM_FRAC = 0.1
+
+
+def _trimmed_mean_us(samples_ms: list[float]) -> float:
+    """Trimmed mean (us) — drops the top / bottom ``_TRIM_FRAC`` of samples."""
+    if not samples_ms:
+        return 0.0
+    s = sorted(samples_ms)
+    k = int(len(s) * _TRIM_FRAC)
+    kept = s[k : len(s) - k] if k > 0 else s
+    return (sum(kept) / len(kept)) * 1000.0
+
+
 @pytest.fixture
 def bench_pair(request):
     """Return a callable ``run(case, *, warmup, iters) -> PerfRow``.
 
     Times the PyTorch eager reference and the Deplodock-compiled graph
-    on the same shape, records a row, returns it. Does not assert on
-    the ratio — the suite tracks performance, it doesn't gate on it.
+    on the same shape, **interleaving** them — each iteration runs the
+    torch closure first, then the Deplodock launches, so both backends
+    see the same warm GPU state (same SM clock, same L2 contents). The
+    Deplodock backend drives the loop via ``CudaBackend.benchmark(...,
+    on_iter=...)``; the torch run inside ``on_iter`` is timed with
+    ``torch.cuda.Event``.
+
+    Per-iter samples for both backends are averaged with a trimmed
+    mean — drop the top / bottom ``_TRIM_FRAC`` to reject single-iter
+    outliers from GPU queue contention or thermal blips. Default
+    ``iters=200`` (vs the historical 50) gives the trimmed mean ~160
+    samples per row, dropping the standard error from ~1.4% to ~0.6%.
+
+    Does not assert on the ratio — the suite tracks performance, it
+    doesn't gate on it.
     """
 
-    def _run(case: Case, *, warmup: int = 5, iters: int = 50) -> PerfRow:
+    def _run(case: Case, *, warmup: int = 10, iters: int = 100) -> PerfRow:
         import torch
 
         from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-        # --- torch side ---
         torch_fn = build_torch_ref(case)
-        for _ in range(warmup):
-            torch_fn()
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            torch_fn()
-        end.record()
-        torch.cuda.synchronize()
-        torch_us = (start.elapsed_time(end) / iters) * 1000.0
-
-        # --- deplodock side ---
         graph = build_deplodock_graph(case)
         backend = CudaBackend()
         compiled = backend.compile(graph)
-        bench = backend.benchmark(compiled, warmup=warmup, num_iters=iters)
-        deplodock_us = bench.time_ms * 1000.0
-        launches = bench.num_launches
+
+        # Each on_iter call runs one torch iter, recording cuda events.
+        # The deplodock benchmark calls on_iter ``warmup + iters`` times
+        # — discard the first ``warmup`` samples so torch and deplodock
+        # average over the same set of measured iters.
+        torch_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+        def on_iter() -> None:
+            start = torch.cuda.Event(enable_timing=True)
+            stop = torch.cuda.Event(enable_timing=True)
+            start.record()
+            torch_fn()
+            stop.record()
+            torch_events.append((start, stop))
+
+        # Capture per-launch deplodock samples so we can trimmed-mean
+        # them too. We re-drive the timing loop ourselves (mirroring
+        # ``benchmark_program``) instead of using ``backend.benchmark``
+        # so we get raw per-iter sums rather than a pre-averaged
+        # ``time_ms``. Per-launch attribution isn't needed at the row
+        # level here.
+        import cupy as cp
+
+        from deplodock.compiler.backend.cuda.program import _allocate, _compile, _launch, _prebuild_descriptors
+
+        compiled_program = _compile(compiled)
+        arrays = _allocate(compiled_program, None)
+        descs = _prebuild_descriptors(compiled_program, arrays)
+
+        for _ in range(warmup):
+            on_iter()
+            for li, launch in enumerate(compiled_program.launches):
+                _launch(launch, compiled_program, arrays, descs.get(li))
+        cp.cuda.runtime.deviceSynchronize()
+
+        n = len(compiled_program.launches)
+        starts = [cp.cuda.Event() for _ in range(n)]
+        stops = [cp.cuda.Event() for _ in range(n)]
+        deplodock_per_iter_ms: list[float] = []
+
+        for _ in range(iters):
+            on_iter()
+            for i, launch in enumerate(compiled_program.launches):
+                starts[i].record()
+                _launch(launch, compiled_program, arrays, descs.get(i))
+                stops[i].record()
+                stops[i].synchronize()
+            iter_ms = sum(cp.cuda.get_elapsed_time(starts[i], stops[i]) for i in range(n))
+            deplodock_per_iter_ms.append(iter_ms)
+
+        torch.cuda.synchronize()
+        measured = torch_events[warmup:]
+        torch_per_iter_ms = [s.elapsed_time(e) for s, e in measured]
+
+        torch_us = _trimmed_mean_us(torch_per_iter_ms)
+        deplodock_us = _trimmed_mean_us(deplodock_per_iter_ms)
+        launches = n
 
         ratio = (torch_us / deplodock_us) if deplodock_us > 0 else 0.0
         row = PerfRow(

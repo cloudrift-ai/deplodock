@@ -82,6 +82,9 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     return None
 
 
+_WARP_SIZE = 32
+
+
 def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
     if any(isinstance(s, Stage) for s in tile.body.iter()):
@@ -89,8 +92,20 @@ def _maybe_rewrite(body: Body) -> Body | None:
     if not tile.thread_axes:
         raise RuleSkipped("Tile has no thread_axes — no reuse to stage")
 
+    # Warp-only cooperative tiles (one thread axis, extent ≤ WARP_SIZE)
+    # don't benefit from a smem stage: ``materialize_tile`` will emit a
+    # register-only ``WarpShuffle`` combine, the row fits in registers
+    # across the warp, and L1 absorbs second/third loads of the same
+    # row. Skip staging entirely so the kernel stays smem-free.
+    n_thread = 1
+    for ba in tile.thread_axes:
+        n_thread *= int(ba.extent)
+    if n_thread <= _WARP_SIZE:
+        raise RuleSkipped(f"warp-only cooperative tile (n_threads={n_thread} ≤ {_WARP_SIZE}); register-resident, no smem stage")
+
     used_names: set[str] = set()
-    new_tile_body = _process_scope(tile, tile.thread_axes, tile.all_axes, used_names)
+    block_axis_names = frozenset(ax.name for ax in tile.block_axes)
+    new_tile_body = _process_scope(tile, tile.thread_axes, tile.all_axes, block_axis_names, used_names)
     if new_tile_body == tile.body:
         raise RuleSkipped("no Load qualifies for staging")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
@@ -100,6 +115,7 @@ def _process_scope(
     scope: Tile | Loop,
     thread_axes: tuple[Axis, ...],
     in_scope_axes: tuple[Axis, ...],
+    block_axis_names: frozenset[str],
     used_names: set[str],
 ) -> Body:
     """Free Loops recurse; reduce loops contribute Loads to this scope's
@@ -110,7 +126,9 @@ def _process_scope(
 
     for s in scope.body:
         if isinstance(s, Loop) and not s.is_reduce:
-            rewritten_inner.append(Loop(axis=s.axis, body=_process_scope(s, thread_axes, (*in_scope_axes, s.axis), used_names)))
+            rewritten_inner.append(
+                Loop(axis=s.axis, body=_process_scope(s, thread_axes, (*in_scope_axes, s.axis), block_axis_names, used_names))
+            )
             continue
         if isinstance(s, (Loop, StridedLoop)):
             scope_axes = (*in_scope_axes, s.axis)
@@ -119,7 +137,7 @@ def _process_scope(
                     loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes))
         rewritten_inner.append(s)
 
-    stages, name_rewrites = _build_stages(loads_by_buf, thread_axes, used_names)
+    stages, name_rewrites = _build_stages(loads_by_buf, thread_axes, block_axis_names, used_names)
     if not stages:
         return tuple(rewritten_inner)
 
@@ -130,6 +148,7 @@ def _process_scope(
 def _build_stages(
     loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...]]]],
     thread_axes: tuple[Axis, ...],
+    block_axis_names: frozenset[str],
     used_names: set[str],
 ) -> tuple[list[Stage], dict[str, tuple[str, tuple[Expr, ...]]]]:
     """Per buffer, partition Loads by structural index equality (within a
@@ -144,6 +163,18 @@ def _build_stages(
     used_bytes = 0
 
     for buf, items in loads_by_buf.items():
+        # Skip buffers whose Loads don't reference any BLOCK axis. The
+        # data is identical for every CTA, so smem staging only buys a
+        # per-CTA copy of the same bytes — wasted smem (kills occupancy)
+        # plus an extra cooperative-load cycle plus a syncthreads. The
+        # global Load on the original DRAM pointer hits L2 (after the
+        # first CTA brings it in) and L1 read-only cache thereafter,
+        # which is faster than re-staging in every block. RMSNorm's
+        # ``w[k]`` and any matmul's frozen-weight Loads are the
+        # canonical examples.
+        if block_axis_names and all(_load_free_vars(load).isdisjoint(block_axis_names) for load, _, _ in items):
+            continue
+
         # Partition this buffer's Loads by structural index equality.
         # Each partition gets its own slab; admission decides which fit.
         partitions: list[tuple[Load, Axis, tuple[Axis, ...], list[Load]]] = []
@@ -270,6 +301,14 @@ def _classify(
         template=template,
         n_bytes=n_bytes,
     )
+
+
+def _load_free_vars(load: Load) -> frozenset[str]:
+    """Union of free variable names across every index dim of ``load``."""
+    out: set[str] = set()
+    for e in load.index:
+        out |= e.free_vars()
+    return frozenset(out)
 
 
 def _flatten_add(e: Expr) -> list[Expr]:

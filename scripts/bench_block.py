@@ -96,27 +96,38 @@ def main():
     # check below is known to be comparing meaningful (non-trivial) values.
     _log_sanity_stats(block, x, pos_emb)
 
-    results: dict[str, float] = {}
-
-    # --- Eager ---
+    # Build per-backend closures up-front, then run a single interleaved
+    # measurement loop so eager / torch.compile / Deplodock all see the
+    # same SM clock + cache state. Deplodock's ``benchmark(on_iter=...)``
+    # drives the loop; the on_iter callback runs each torch closure and
+    # records cuda events for it. Per-launch timings come back in
+    # ``bench.per_launch`` so the kernel-stats report is on the same
+    # measurement window as the comparison.
+    torch_fns: dict[str, callable] = {}
     if "eager" in backends:
-        us = _bench_eager(block, x, pos_emb, args.warmup, args.iters)
-        results["Eager PyTorch"] = us
-
-    # --- torch.compile ---
+        torch_fns["Eager PyTorch"] = _make_eager_fn(block, x, pos_emb)
     if "compile" in backends:
-        us = _bench_compiled(block, x, pos_emb, args.warmup, args.iters)
-        if us is not None:
-            results["torch.compile"] = us
+        compiled_fn = _make_compiled_fn(block, x, pos_emb, args.warmup)
+        if compiled_fn is not None:
+            torch_fns["torch.compile"] = compiled_fn
 
-    # --- Deplodock CUDA pipeline ---
+    dd_state = None
     if "deplodock" in backends:
         from deplodock.compiler.pipeline.dump import CompilerDump
 
         dump = CompilerDump.resolve(args.dump_dir)
-        us = _bench_deplodock(block, x, rotary_emb, pos_emb, dump=dump, debug=args.debug)
-        if us is not None:
-            results["Deplodock (naive attn)"] = us
+        dd_state = _build_deplodock(block, x, rotary_emb, pos_emb, dump=dump, debug=args.debug)
+
+    results: dict[str, float] = {}
+    if dd_state is not None:
+        results = _bench_interleaved(dd_state, torch_fns, dump, args.warmup, args.iters)
+    else:
+        # Pure-torch path (no Deplodock requested): time each torch
+        # closure with its own cuda-event window, sequentially. Only used
+        # when ``--backends`` excludes ``deplodock`` — we lose interleave
+        # fairness but there's no shared driver to interleave through.
+        for name, fn in torch_fns.items():
+            results[name] = _bench_torch_only(fn, args.warmup, args.iters)
 
     # --- FlashAttention (attention only) ---
     if "flash_attn" in backends:
@@ -183,26 +194,19 @@ def _log_sanity_stats(block, x, pos_emb):
     )
 
 
-def _bench_eager(block, x, pos_emb, warmup, iters):
+def _make_eager_fn(block, x, pos_emb):
     import torch
 
-    for _ in range(warmup):
+    def _fn():
         with torch.no_grad():
             block(x, position_embeddings=pos_emb)
-    torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        with torch.no_grad():
-            block(x, position_embeddings=pos_emb)
-    end.record()
-    torch.cuda.synchronize()
-    return (start.elapsed_time(end) / iters) * 1000  # ms → us
+    return _fn
 
 
-def _bench_compiled(block, x, pos_emb, warmup, iters):
+def _make_compiled_fn(block, x, pos_emb, warmup):
+    """Build a ``torch.compile``d closure. Warm it up here so the compile
+    + autograd-graph capture cost stays out of the timed window."""
     import torch
 
     try:
@@ -215,18 +219,18 @@ def _bench_compiled(block, x, pos_emb, warmup, iters):
         logger.warning("torch.compile failed: %s", e)
         return None
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
+    def _fn():
         with torch.no_grad():
             compiled(x, position_embeddings=pos_emb)
-    end.record()
-    torch.cuda.synchronize()
-    return (start.elapsed_time(end) / iters) * 1000
+
+    return _fn
 
 
-def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
+def _build_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
+    """Trace + compile the block, bind inputs / constants, run once for
+    correctness vs eager. Returns ``(backend, compiled_graph)`` ready
+    for ``backend.benchmark(...)`` — or ``None`` on any failure (a
+    warning is logged)."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.trace.torch import trace_module
 
@@ -313,23 +317,71 @@ def _bench_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
                     "PASS" if max_diff < 1.0 else "FAIL",
                 )
 
-        result = backend.benchmark(compiled, warmup=3, num_iters=10)
-
-        # Per-kernel timings: log the top offenders and (if dumping) persist the
-        # full per-launch table to ``60_benchmark.json`` so the results dir has
-        # the data needed to chase perf regressions post-hoc.
-        if result.per_launch:
-            total = sum(lt.time_ms for lt in result.per_launch)
-            logger.info("Top kernels by time (total=%.4f ms over %d launches):", total, result.num_launches)
-            for lt in sorted(result.per_launch, key=lambda x: x.time_ms, reverse=True)[:10]:
-                logger.info("  %3d %-40s %.4f ms (%.1f%%)", lt.idx, lt.kernel_name, lt.time_ms, 100 * lt.time_ms / total)
-        if dump:
-            dump.dump_benchmark(result)
-
-        return result.time_ms * 1000  # ms → us
+        return backend, compiled
     except Exception as e:
         logger.warning("Deplodock pipeline failed: %s", e)
         return None
+
+
+def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
+    """Single interleaved measurement loop. Deplodock's
+    ``backend.benchmark(on_iter=...)`` drives the iteration; the
+    ``on_iter`` callback runs each torch closure and records its
+    cuda events. Per-launch timings come back from the same loop —
+    no second non-interleaved pass needed."""
+    import torch
+
+    backend, compiled = dd_state
+    torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {name: [] for name in torch_fns}
+
+    def on_iter() -> None:
+        for name, fn in torch_fns.items():
+            start = torch.cuda.Event(enable_timing=True)
+            stop = torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            stop.record()
+            torch_events[name].append((start, stop))
+
+    bench = backend.benchmark(compiled, warmup=warmup, num_iters=iters, on_iter=on_iter)
+    torch.cuda.synchronize()
+
+    results: dict[str, float] = {}
+    for name, evt in torch_events.items():
+        measured = evt[warmup:]
+        if measured:
+            results[name] = (sum(s.elapsed_time(e) for s, e in measured) / len(measured)) * 1000
+    results["Deplodock (naive attn)"] = bench.time_ms * 1000
+
+    # Per-kernel timings: log the top offenders and (if dumping) persist
+    # the full per-launch table to ``60_benchmark.json`` so the results
+    # dir has the data needed to chase perf regressions post-hoc.
+    if bench.per_launch:
+        total = sum(lt.time_ms for lt in bench.per_launch)
+        logger.info("Top kernels by time (total=%.4f ms over %d launches):", total, bench.num_launches)
+        for lt in sorted(bench.per_launch, key=lambda x: x.time_ms, reverse=True)[:10]:
+            logger.info("  %3d %-40s %.4f ms (%.1f%%)", lt.idx, lt.kernel_name, lt.time_ms, 100 * lt.time_ms / total)
+    if dump:
+        dump.dump_benchmark(bench)
+
+    return results
+
+
+def _bench_torch_only(fn, warmup, iters):
+    import torch
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return (start.elapsed_time(end) / iters) * 1000  # ms → us
 
 
 def _bench_flash_attention(x, config, dtype, device, warmup, iters):
