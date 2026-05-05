@@ -51,7 +51,11 @@ Trigger conditions:
   as long as they are independent (no Accum's value transitively reads
   another Accum's running value); online algorithms (online softmax,
   Welford) are still punted.
-- The first reduce Loop's axis extent ≥ ``BLOCK_SIZE``.
+- The first reduce Loop's axis extent ≥ ``WARP_SIZE`` (32). When the
+  extent is smaller than the configured ``BLOCK_SIZE`` we still
+  cooperate, but use ``next_pow2(extent)`` threads instead — softmax
+  over a 128-wide attention row gets a 128-thread block-reduce rather
+  than each of 128 threads redundantly walking the row sequentially.
 """
 
 from __future__ import annotations
@@ -69,6 +73,22 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+
+_WARP_SIZE = 32
+
+
+def _next_pow2(n: int) -> int:
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def _effective_block_size(reduce_extent: int) -> int:
+    """Threads per CTA for the cooperative reduce. Capped at the
+    configured ``BLOCK_SIZE``; floored at ``WARP_SIZE`` so the
+    cross-thread tree-halve still has a full warp to combine."""
+    return max(_WARP_SIZE, min(BLOCK_SIZE, _next_pow2(reduce_extent)))
 
 
 def _has_matmul_reduce(body) -> bool:
@@ -121,8 +141,10 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     reduce_loops = [loop for loop in blk.body.of_type(Loop) if loop.is_reduce]
     if not reduce_loops:
         raise RuleSkipped("Tile body has no reduce Loop")
-    if int(reduce_loops[0].axis.extent) < BLOCK_SIZE:
-        raise RuleSkipped(f"first reduce-axis extent {int(reduce_loops[0].axis.extent)} < BLOCK_SIZE={BLOCK_SIZE}")
+    reduce_extent = int(reduce_loops[0].axis.extent)
+    if reduce_extent < _WARP_SIZE:
+        raise RuleSkipped(f"first reduce-axis extent {reduce_extent} < WARP_SIZE={_WARP_SIZE} (too small to cooperate)")
+    eff_block = _effective_block_size(reduce_extent)
     for rl in reduce_loops:
         if not any(isinstance(s, Accum) for s in rl.body):
             raise RuleSkipped(f"reduce Loop {rl.axis.name!r} has no Accum")
@@ -140,9 +162,9 @@ def _rewrite_block(blk: Tile) -> Tile | None:
     if any(_has_matmul_reduce(s.body) for s in reduce_loops if isinstance(s, Loop)) or _has_matmul_reduce(blk.body):
         raise RuleSkipped("body has matmul-reduce signature — defer to register_tile / blockify matmul path")
 
-    t_axis = Axis("t", BLOCK_SIZE)
+    t_axis = Axis("t", eff_block)
     t_start = Var(t_axis.name)
-    step = Literal(BLOCK_SIZE, "int")
+    step = Literal(eff_block, "int")
 
     # Phase 1: each body Loop → StridedLoop driven by t. Reduce Loops
     # get a Combine sibling for the cross-thread tree-halve.
@@ -176,7 +198,7 @@ def _rewrite_block(blk: Tile) -> Tile | None:
         if ba.axis.name not in naked_only_tile:
             continue
         ext = int(ba.axis.extent)
-        if ext >= BLOCK_SIZE and ext % BLOCK_SIZE == 0:
+        if ext >= eff_block and ext % eff_block == 0:
             naked_axis = ba.axis
             break
 
