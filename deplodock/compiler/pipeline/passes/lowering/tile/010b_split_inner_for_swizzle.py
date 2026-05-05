@@ -210,9 +210,7 @@ def _swizzle_decode_load(load: Load, mode: SwizzleMode, ips: int, factor: int) -
         return dc_replace(load, index=(*load.index[:-1], new_inner))
     n_outer: object = BinaryExpr("/", inner, Literal(ips, "int"))
     n_inner: object = BinaryExpr("%", inner, Literal(ips, "int"))
-    swizzle_row: object = BinaryExpr(
-        "+", BinaryExpr("*", row, Literal(factor, "int")), n_outer
-    )
+    swizzle_row: object = BinaryExpr("+", BinaryExpr("*", row, Literal(factor, "int")), n_outer)
     row_bits = BinaryExpr("&", swizzle_row, Literal(row_mask, "int"))
     xor_term = row_bits if shift == 1 else BinaryExpr("*", row_bits, Literal(shift, "int"))
     n_inner_phys = BinaryExpr("^", n_inner, xor_term)

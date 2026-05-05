@@ -205,11 +205,7 @@ def _materialize(blk: Tile) -> Stmt:
         # swizzle width). Detect a tail repeat in ``addressing.dims`` and
         # don't collapse it.
         dims = stage.addressing.dims
-        split_tail = (
-            len(dims) >= 2
-            and dims[-1] == dims[-2]
-            and stage.swizzle != SwizzleMode.NONE
-        )
+        split_tail = len(dims) >= 2 and dims[-1] == dims[-2] and stage.swizzle != SwizzleMode.NONE
         if split_tail:
             collapse_axes = stage.axes[:-2]
             collapse_dims = dims[:-2]
