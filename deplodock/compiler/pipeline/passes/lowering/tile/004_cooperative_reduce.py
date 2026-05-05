@@ -228,7 +228,16 @@ def _rewrite_block(blk: Tile) -> Tile | None:
         if wrap_axis is not naked_axis:
             sigma = Sigma({naked_axis.name: Var(wrap_axis.name)})
             suffix = [s.rewrite(lambda n: n, sigma) for s in suffix]
-        new_body: list[Stmt] = [*prefix, StridedLoop(axis=wrap_axis, start=t_start, step=step, body=suffix)]
+        # LICM the suffix: stmts whose deps don't transitively involve
+        # the wrap axis hoist out of the StridedLoop. RMSNorm's
+        # ``v2 = acc0 * (1/N); v3 = v2 + eps; v4 = rsqrt(v3)`` are
+        # invariant in the per-thread output loop and would otherwise
+        # be recomputed every iteration. nvcc's LICM doesn't always
+        # catch this through smem-broadcast accumulators (acc0_b loaded
+        # from smem looks dependency-tainted to the scheduler), so do
+        # it explicitly at the IR level.
+        hoisted, inner = _licm_split(suffix, wrap_axis.name)
+        new_body: list[Stmt] = [*prefix, *hoisted, StridedLoop(axis=wrap_axis, start=t_start, step=step, body=inner)]
     else:
         new_body = body_phase1
 
@@ -241,6 +250,34 @@ def _rewrite_block(blk: Tile) -> Tile | None:
         *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in blk.axes if ba.axis.name != naked_name),
     )
     return Tile(axes=new_axes, body=new_body)
+
+
+def _licm_split(suffix: list[Stmt], wrap_axis_name: str) -> tuple[list[Stmt], list[Stmt]]:
+    """Split ``suffix`` into ``(hoisted, inner)``: stmts that don't
+    transitively depend on ``wrap_axis_name`` go to ``hoisted`` (run
+    once before the StridedLoop); the rest stay in ``inner`` (run per
+    iteration). Walks top-to-bottom maintaining a set of loop-tainted
+    SSA names — a stmt is tainted if it reads any tainted name or
+    references the wrap axis directly. Body-bearing stmts (Loop / Cond
+    / etc.) are conservatively kept inside; only flat leaf stmts hoist."""
+    tainted: set[str] = {wrap_axis_name}
+    hoisted: list[Stmt] = []
+    inner: list[Stmt] = []
+    for s in suffix:
+        if s.nested():
+            inner.append(s)
+            for d in s.defines():
+                tainted.add(d)
+            continue
+        free = _stmt_free_vars(s)
+        deps = set(s.deps())
+        if free & tainted or deps & tainted:
+            inner.append(s)
+            for d in s.defines():
+                tainted.add(d)
+        else:
+            hoisted.append(s)
+    return hoisted, inner
 
 
 def _stmt_free_vars(s: Stmt) -> set[str]:
