@@ -12,10 +12,13 @@ Three-class matmul tile, picked from the logical output extents:
   asymmetric cuBLAS-style ``(BN=128, BM=64, F_M=8, F_N=4)`` validated
   at 105% of cuBLAS on 2048² fp32 RTX 5090. Splitk waves target = 8.
 
-Orthogonal **narrow-M** override: ``M ≤ 64`` (s32-class) drops the
-splitk-waves target to 2 regardless of tile class — the M-axis grid
-collapses to 1 and the high waves target inflates atomic-add contention.
-Tile shape is unchanged (the BM=64 default covers M=32 already).
+Orthogonal splitk-waves overrides (tile shape unchanged):
+
+- **low-grid** (``M ≤ 128 AND N ≤ 2048``): waves=2. The M·N grid is too
+  small (~32 CTAs) for the 8-wave target — splitk inflates and atomic
+  contention dominates.
+- **wide-grid** (default class, ``M ≥ 256 AND N ≥ 4096``): waves=16.
+  Big enough to absorb extra split-K parallelism without contention.
 
 Sweep on RTX 5090 fp32: this 3-class split cuts kv_proj.s512 ~48µs →
 ~20µs, kv_proj.s128 ~30µs → ~13µs, sdpa.tinyllama.s512 ~456µs → ~178µs,
@@ -82,14 +85,22 @@ _F_PER_AXIS_COMPACT = (8, 4)
 _HUGE_M_MIN = 256
 _HUGE_N_MIN = 8192
 _COMPACT_N_MAX = 1024
-# Narrow-M cap: when ``M ≤ _NARROW_M_MAX`` the matmul's grid_M collapses
-# to 1 (BM=64 covers the whole M extent), so each output cell sees only
-# a single CTA's worth of work — auto-splitk's "fill 8 waves" target
-# inflates splitk to ~32, and the resulting 32 atomic-adds-per-output
-# dominate. Sweep on RTX 5090 fp32: dropping the waves target to 2 for
-# narrow-M cuts tinyllama.o_proj.s32 ~33µs → ~14µs and qwen.q_proj.s32
-# ~42µs → ~37µs without regressing any other M=32 shape.
-_NARROW_M_MAX = 64
+# "Low-grid" cap: when both ``M ≤ _LOW_GRID_M_MAX`` and ``N ≤
+# _LOW_GRID_N_MAX``, the M·N grid stays small (~32 CTAs at default tile)
+# — auto-splitk's 8-wave target inflates splitk to ~32 and atomic-add
+# contention dominates. Drop waves to 2. Sweep on RTX 5090 fp32 (cuts in
+# µs vs default): tinyllama.o_proj.s32 33→14, q_proj.s32 33→14,
+# o_proj.s128 53→31, q_proj.s128 53→31, qwen.{o,q}_proj.s32 42→37.
+_LOW_GRID_M_MAX = 128
+_LOW_GRID_N_MAX = 2048
+# "Wide-grid" floor: default-class GEMMs with ``M ≥ _WIDE_GRID_M_MIN``
+# and ``N ≥ _WIDE_GRID_N_MIN`` (but below the huge threshold, ``N ≥
+# _HUGE_N_MIN``) have enough M·N CTAs that more split-K parallelism is a
+# net win — bumping waves to 16 cuts tinyllama.{gate,up}_proj.s512
+# ~245µs → ~225µs. Picked symmetric to ``_HUGE_N_MIN/2`` to avoid
+# straddling the huge-class boundary.
+_WIDE_GRID_M_MIN = 256
+_WIDE_GRID_N_MIN = 4096
 
 # Per-stage K-tile, M-adaptive. Sweep on TinyLlama Q/Gate/Down at seq ∈
 # {32, 128, 512} on RTX 5090 fp32: M ≤ 256 → BK=64 wins (small grid, K
@@ -302,6 +313,7 @@ def cooperative_block_size() -> int:
 # fp32: ``waves=2`` cuts kv_proj.s512 48µs → 20µs and sdpa.qwen.s128 85µs
 # → 46µs, but regresses gate_proj.s512 — large-large GEMMs need ``waves=8``
 # (the prior comment's ``{4, 8, 16}`` empirical elbow on TinyLlama MLP).
+_SPLITK_TARGET_WAVES_HIGH = 16
 _SPLITK_TARGET_WAVES_LARGE = 8
 _SPLITK_TARGET_WAVES_SMALL = 2
 _SPLITK_NUM_SMS = 170  # RTX 5090; conservative upper bound for sm_120
@@ -309,8 +321,20 @@ _SPLITK_NUM_SMS = 170  # RTX 5090; conservative upper bound for sm_120
 
 def _splitk_target_waves(tile: Tile | None) -> int:
     cls = _tile_class(tile)
-    narrow_m = tile is not None and _has_matmul_reduce(tile.body) and 0 < _matmul_M(tile) <= _NARROW_M_MAX
-    default = _SPLITK_TARGET_WAVES_SMALL if (cls == "compact" or narrow_m) else _SPLITK_TARGET_WAVES_LARGE
+    if tile is not None and _has_matmul_reduce(tile.body):
+        extents = _logical_output_extents(tile)
+        n = extents[0] if extents else 0
+        m = extents[1] if len(extents) >= 2 else 0
+    else:
+        n = m = 0
+    if 0 < m <= _LOW_GRID_M_MAX and 0 < n <= _LOW_GRID_N_MAX:
+        default = _SPLITK_TARGET_WAVES_SMALL
+    elif cls == "compact":
+        default = _SPLITK_TARGET_WAVES_SMALL
+    elif cls == "default" and m >= _WIDE_GRID_M_MIN and n >= _WIDE_GRID_N_MIN:
+        default = _SPLITK_TARGET_WAVES_HIGH
+    else:
+        default = _SPLITK_TARGET_WAVES_LARGE
     return _int_env("DEPLODOCK_SPLITK_WAVES", default)
 
 
