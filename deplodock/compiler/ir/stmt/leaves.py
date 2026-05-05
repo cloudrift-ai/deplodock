@@ -191,6 +191,11 @@ class Init(Stmt):
         return [f"{_pad(ctx.indent)}float {self.name} = {_float_lit(float(identity))};"]
 
 
+# Map ``ElementwiseImpl`` op names to compound-assignment operator symbols
+# used by ``Write.pretty()`` for reduce-writes (split-K partial accumulation).
+_REDUCE_OP_SYMBOL = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
+
+
 @dataclass(frozen=True)
 class Write(Stmt):
     """Write an SSA value to output buffer ``output`` at position ``index``.
@@ -229,7 +234,8 @@ class Write(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
         if self.reduce_op is not None:
-            return [f"{indent}{self.output}[{idx}] {self.reduce_op.name}= {self.value}"]
+            op = _REDUCE_OP_SYMBOL.get(self.reduce_op.name, self.reduce_op.name)
+            return [f"{indent}{self.output}[{idx}] {op}= {self.value}"]
         return [f"{indent}{self.output}[{idx}] = {self.value}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
