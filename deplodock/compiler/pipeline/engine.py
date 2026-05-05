@@ -445,9 +445,11 @@ def _node_to_dict(node) -> dict:
 def _format_nodes(nodes: list, graph: Graph) -> str:
     """Render a list of nodes as readable text. Kernel-IR ops use their
     own ``pretty_body``; everything else falls back to a ``name: ClsName(args)``
-    one-liner."""
+    one-liner. Scalar ``ConstantOp`` inputs are inlined as literals (same
+    treatment as ``format_kernels`` — see ``_inline_scalar_loads``)."""
     from deplodock.compiler.graph import _fmt_op
     from deplodock.compiler.ir.base import ConstantOp, InputOp
+    from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
 
     lines: list[str] = []
     for node in nodes:
@@ -460,6 +462,9 @@ def _format_nodes(nodes: list, graph: Graph) -> str:
             continue
         arg_names = [graph.nodes[inp].output.name for inp in node.inputs if inp in graph.nodes]
         lines.append(f"{node.output.name} = {type(op).__name__}({', '.join(arg_names)})")
+        scalar_inputs = _scalar_constant_inputs(graph, node, ConstantOp)
+        if scalar_inputs:
+            body = _inline_scalar_loads(body, scalar_inputs)
         lines.extend(f"  {line}" for line in body.splitlines())
     return "\n".join(lines)
 
