@@ -13,9 +13,9 @@
   wrapping a single reduce Loop with a pure-compute body
   (Load / Assign / Accum + at least one Accum). Rule-specific gates
   layer on top via the ``extra_gate`` callback.
-- :func:`compute_capability` — cached query of the active CUDA device's
-  compute capability. Shared by passes that gate on hardware features
-  (``012_async_copy`` for cp.async, ``010_tma_copy`` for TMA).
+- :func:`compute_capability` — re-exported from
+  :mod:`deplodock.compiler.target` so passes can import it locally.
+  Honors the ``--target sm_NN`` CLI override.
 - :func:`load_thread_axis_coeffs` / :func:`max_bank_conflict` —
   bank-conflict analysis for body Loads of a staged buffer. Used by
   ``013_pad_smem`` (cp.async / sync stages, +1 padding).
@@ -26,7 +26,6 @@ The file is prefixed ``_`` so the engine's rule loader skips it
 
 from __future__ import annotations
 
-import functools
 import logging
 from collections import defaultdict
 from collections.abc import Callable
@@ -43,24 +42,7 @@ WARP_SIZE = 32
 BANKS = 32
 
 
-@functools.cache
-def compute_capability() -> tuple[int, int]:
-    """Active CUDA device's compute capability as ``(major, minor)``.
-
-    Returns ``(0, 0)`` when cupy is unavailable — callers treat that as
-    "no hardware feature support" and skip themselves via ``RuleSkipped``.
-    Cached so repeated rule firings don't re-query the driver."""
-    try:
-        import cupy as cp
-
-        dev = cp.cuda.Device()
-        # cupy returns the capability as a string ``"MMm"``: ``"86"`` for
-        # sm_86, ``"120"`` for sm_12.0. Minor is always the last digit.
-        cap = str(dev.compute_capability)
-        return (int(cap[:-1]), int(cap[-1]))
-    except Exception as e:  # pragma: no cover
-        _logger.debug("compute_capability query failed (%s)", e)
-        return (0, 0)
+from deplodock.compiler.target import compute_capability  # noqa: E402,F401
 
 
 def single_tile(body: Body) -> tuple[int, Tile]:
