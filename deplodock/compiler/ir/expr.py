@@ -588,6 +588,8 @@ _PRECEDENCE: dict[str, int] = {
     "<=": 4,
     ">=": 4,
     "^": 4,  # bitwise XOR — match relational so ``a ^ b + c`` always parens
+    "&": 4,  # bitwise AND — same intent: ``a & b * c`` must paren as ``(a & b) * c``
+    "|": 4,  # bitwise OR — symmetric with ``&`` / ``^``
     "+": 5,
     "-": 5,
     "*": 6,

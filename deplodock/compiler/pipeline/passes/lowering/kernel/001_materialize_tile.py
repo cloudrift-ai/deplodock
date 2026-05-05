@@ -60,6 +60,7 @@ from deplodock.compiler.ir.tile.ir import (
     BufferedStage,
     Combine,
     Stage,
+    SwizzleMode,
     TemplateAddressing,
     TileOp,
     TmaBufferedStage,
@@ -114,6 +115,10 @@ def _materialize(blk: Tile) -> Stmt:
         n_threads *= int(ba.extent)
 
     rename: dict[str, str] = {}
+
+    # Body-Load XOR decode for TMA-swizzled stages is now handled by
+    # ``010b_split_inner_for_swizzle`` (which both picks the swizzle mode
+    # AND rewrites Loads). Materialize just sees the post-rewrite IR.
 
     def transform(s: Stmt) -> Stmt:
         if rename:
@@ -192,8 +197,25 @@ def _materialize(blk: Tile) -> Stmt:
         # across an outer-block axis and a per-thread fragment axis).
         # Dims not covered by any cache axis get extent 1 — the coord
         # supplies the origin and the slab is scalar in that dim.
+        # Per-source-dim box product. When two or more cache axes map to
+        # the same source dim, multiplying yields the total slab span on
+        # that dim — except when ``010b_split_inner_for_swizzle`` has
+        # split the inner axis: there we want the descriptor to *see* the
+        # split as separate inner box dims (so the innermost matches the
+        # swizzle width). Detect a tail repeat in ``addressing.dims`` and
+        # don't collapse it.
+        dims = stage.addressing.dims
+        split_tail = len(dims) >= 2 and dims[-1] == dims[-2] and stage.swizzle != SwizzleMode.NONE
+        if split_tail:
+            collapse_axes = stage.axes[:-2]
+            collapse_dims = dims[:-2]
+            tail_axes = stage.axes[-2:]
+        else:
+            collapse_axes = stage.axes
+            collapse_dims = dims
+            tail_axes = ()
         box_per_dim: dict[int, int] = {}
-        for d, ax in zip(stage.addressing.dims, stage.axes, strict=True):
+        for d, ax in zip(collapse_dims, collapse_axes, strict=True):
             box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
         full_box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
         # Drop *gap* inert dims (``box == 1`` AND ``origin`` is literal
@@ -208,7 +230,7 @@ def _materialize(blk: Tile) -> Stmt:
         # 0 origin coord can only be emitted for a singleton arr dim, so
         # at runtime "drop extent-1 arr dims that align with box dims of
         # extent > 1" recovers exactly the materializer's decision).
-        swept = stage.addressing.dims
+        swept = collapse_dims if collapse_dims else dims
         outer, inner = swept[0], swept[-1]
         kept = tuple(
             d
@@ -220,6 +242,34 @@ def _materialize(blk: Tile) -> Stmt:
         )
         box = tuple(full_box[d] for d in kept)
         coords = tuple(stage.origin[d] for d in kept)
+        # Append the split-tail box dims + decomposed coords. The split
+        # source dim is the last one in ``swept``; the inner cache axis
+        # has extent IPS, the outer factor = orig_extent / IPS. Coord on
+        # the new outer dim = ``origin[split_dim] / IPS``; coord on the
+        # new inner dim = ``origin[split_dim] % IPS``. The previous
+        # ``coords`` entry for the split dim already holds origin —
+        # replace it with the split pair.
+        if tail_axes:
+            split_dim = dims[-1]
+            ips = int(tail_axes[-1].extent)
+            # Find where split_dim sits in `kept` and remove it; its place
+            # is taken by the (outer_coord, inner_coord) pair.
+            kept_idx = kept.index(split_dim)
+            orig_coord = stage.origin[split_dim]
+            outer_coord = BinaryExpr("/", orig_coord, Literal(ips, "int"))
+            inner_coord = BinaryExpr("%", orig_coord, Literal(ips, "int"))
+            coords = (
+                *coords[:kept_idx],
+                *coords[kept_idx + 1 :],
+                outer_coord,
+                inner_coord,
+            )
+            box = (
+                *box[:kept_idx],
+                *box[kept_idx + 1 :],
+                int(tail_axes[0].extent),
+                int(tail_axes[1].extent),
+            )
         if desc_name not in descriptors:
             # Source shape is unknown at materialization time — the
             # backend resolves it from the bound array at launch. Pass
@@ -269,7 +319,20 @@ def _materialize(blk: Tile) -> Stmt:
                 ),
             ),
         )
-        return [Smem(name=stage.name, extents=full_extents, align=_TMA_ALIGN_BYTES), cond]
+        # B128 swizzle uses byte-address bits 7..9 to drive the XOR, so the
+        # buffer base must be 1024-aligned (next multiple of the swizzle
+        # group size: 8 rows × 128 B). Otherwise the row-bit position
+        # leaks bits from a non-zero base offset and the body decoder's
+        # ``(row & 7) * shift`` reads from off-by-N permuted positions.
+        # B64 needs 512-byte alignment, B32 needs 256.
+        align = _TMA_ALIGN_BYTES
+        if stage.swizzle == SwizzleMode.B128:
+            align = 1024
+        elif stage.swizzle == SwizzleMode.B64:
+            align = 512
+        elif stage.swizzle == SwizzleMode.B32:
+            align = 256
+        return [Smem(name=stage.name, extents=full_extents, align=align), cond]
 
     for stmt in body:
         if isinstance(stmt, TmaBufferedStage):

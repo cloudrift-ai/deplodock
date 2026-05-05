@@ -22,6 +22,13 @@ Env vars:
   ConstantOp source with a recorded transpose load_op chain, and
   source-inner-extent alignment ≥ 16 B with ≥ 2× headroom past the
   box inner extent.
+- ``DEPLODOCK_TMA_SWIZZLE`` — opt in to TMA hardware-swizzle modes
+  (``SWIZZLE_{128,64,32}B``). ``=1`` enables; default off. Stages whose
+  inner box-dim byte size matches a swizzle width pick the matching
+  mode in ``010_tma_copy``; the materializer pairs each swizzled stage
+  with body-Load XOR decoding and a 1024-byte (B128) / 512-byte (B64)
+  / 256-byte (B32) smem alignment so the swizzle pattern lines up with
+  the buffer base.
 """
 
 from __future__ import annotations
@@ -117,6 +124,17 @@ def _tma_enabled() -> bool:
     from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability  # noqa: PLC0415
 
     return compute_capability() >= (9, 0)
+
+
+def _tma_swizzle_enabled() -> bool:
+    """TMA hardware-swizzle gate. Off by default — only fires when the
+    inner box-dim byte size matches a swizzle width AND ``DEPLODOCK_TMA_SWIZZLE``
+    opts in. The materializer pairs swizzle with body-Load XOR decoding +
+    1024-byte smem alignment for ``B128`` (proportionally smaller for
+    ``B64`` / ``B32``); a current default-on would regress kernels whose
+    slab geometry happens to fit a swizzle width but whose body Loads
+    weren't validated against the decoder."""
+    return os.environ.get("DEPLODOCK_TMA_SWIZZLE", "0") in ("1", "true", "True")
 
 
 def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:

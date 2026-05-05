@@ -55,6 +55,7 @@ from deplodock.compiler.ir.tile.ir import (
     AsyncBufferedStage,
     AsyncWait,
     BufferedStage,
+    SwizzleMode,
     TileOp,
     TmaBufferedStage,
 )
@@ -62,6 +63,13 @@ from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability, single_tile
 
 logger = logging.getLogger(__name__)
+
+
+# Swizzle picking moved entirely to ``010b_split_inner_for_swizzle``.
+# This pass promotes eligible stages with ``swizzle=NONE``; the follow-up
+# pass picks the mode (and optionally splits the inner axis to fit a
+# wider swizzle) and rewrites body Loads in one place.
+
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -157,6 +165,7 @@ def _process(
                     pad=s.pad,
                     buffer_count=s.buffer_count,
                     phase=s.phase,
+                    swizzle=SwizzleMode.NONE,
                 )
             )
             pending_wait = (*pending_wait, s)

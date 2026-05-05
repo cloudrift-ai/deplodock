@@ -241,9 +241,16 @@ def _collapse_inert_dims(arr_shape: tuple[int, ...], box_extents: tuple[int, ...
     ``box_extents`` innermost-first and drop any arr dim of extent 1
     that lines up with a box dim of extent > 1. Leading singletons
     pair with their (kept) box==1 entry and stay; gap singletons fall
-    out exactly where the materializer dropped them."""
+    out exactly where the materializer dropped them.
+
+    The materializer's swizzle-split path may emit a rank-(N+1) box on
+    a rank-N source by splitting an inner dim. Reinterpret the array's
+    last dim as the matching split before walking, so the rank-match
+    check below succeeds and ``encode_tiled`` sees a consistent view."""
     arr_rev = list(reversed(arr_shape))
     box_rev = list(reversed(box_extents))
+    if len(box_rev) == len(arr_rev) + 1 and arr_rev and box_rev[0] != 0 and arr_rev[0] % box_rev[0] == 0:
+        arr_rev = [box_rev[0], arr_rev[0] // box_rev[0], *arr_rev[1:]]
     kept: list[int] = []
     bi = 0
     for a in arr_rev:
