@@ -229,13 +229,15 @@ def _rewrite_block(blk: Tile) -> Tile | None:
             sigma = Sigma({naked_axis.name: Var(wrap_axis.name)})
             suffix = [s.rewrite(lambda n: n, sigma) for s in suffix]
         # LICM the suffix: stmts whose deps don't transitively involve
-        # the wrap axis hoist out of the StridedLoop. RMSNorm's
-        # ``v2 = acc0 * (1/N); v3 = v2 + eps; v4 = rsqrt(v3)`` are
-        # invariant in the per-thread output loop and would otherwise
-        # be recomputed every iteration. nvcc's LICM doesn't always
-        # catch this through smem-broadcast accumulators (acc0_b loaded
-        # from smem looks dependency-tainted to the scheduler), so do
-        # it explicitly at the IR level.
+        # the wrap axis hoist out of the StridedLoop. Done locally
+        # (rather than via ``normalize_body``'s generic
+        # ``hoist_loop_invariants``) because the generic pass uses
+        # ``Body.deps_closure`` semantics that treat a StridedLoop's
+        # Accum as still axis-dependent (per-thread partial value).
+        # The Combine sibling we emit just above the wrap finalizes the
+        # Accum into a cross-thread broadcast — independent of the
+        # strided axis — but the closure model can't express that.
+        # Bespoke walker here knows the post-Combine semantics.
         hoisted, inner = _licm_split(suffix, wrap_axis.name)
         new_body: list[Stmt] = [*prefix, *hoisted, StridedLoop(axis=wrap_axis, start=t_start, step=step, body=inner)]
     else:
