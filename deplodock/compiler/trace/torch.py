@@ -86,9 +86,14 @@ def trace_module_with_constants(
     g = Graph()
     node_map: dict[str, str] = {}
 
+    sig = exported.graph_signature
+    const_targets: dict[str, str] = {}
+    const_targets.update(sig.inputs_to_parameters)
+    const_targets.update(sig.inputs_to_buffers)
+
     for fx_node in gm.graph.nodes:
         if fx_node.op == "placeholder":
-            _handle_placeholder(g, fx_node, node_map, module)
+            _handle_placeholder(g, fx_node, node_map, module, const_targets)
         elif fx_node.op == "call_function":
             _handle_call_function(g, fx_node, node_map)
         elif fx_node.op == "output":
@@ -97,10 +102,6 @@ def trace_module_with_constants(
             logger.debug("Skipping FX node: %s (op=%s)", fx_node.name, fx_node.op)
     logger.info("FX→Graph IR walk done in %.1fs (%d IR nodes)", time.monotonic() - t1, len(g.nodes))
 
-    const_targets: dict[str, str] = {}
-    sig = exported.graph_signature
-    const_targets.update(sig.inputs_to_parameters)
-    const_targets.update(sig.inputs_to_buffers)
     return g, const_targets
 
 
@@ -141,13 +142,24 @@ def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = No
     return result
 
 
-def _handle_placeholder(g: Graph, fx_node: Any, node_map: dict[str, str], module: nn.Module) -> None:
+def _handle_placeholder(
+    g: Graph,
+    fx_node: Any,
+    node_map: dict[str, str],
+    module: nn.Module,
+    const_targets: dict[str, str],
+) -> None:
     """Handle placeholder nodes (inputs, parameters, and buffers).
 
     ``torch.export`` prefixes parameter placeholders with ``p_`` and buffer
     placeholders with ``b_``. Both are bake-in constants from the compiler's
     perspective — only actual user-supplied activations (no prefix) are
     graph inputs.
+
+    Parameter / buffer ``ConstantOp``s carry the source attribute path
+    (``source_path``) and pre-chain layout (``source_shape`` / ``source_dtype``)
+    so the loader can read them directly from safetensors without a
+    side-channel ``const_targets`` dict.
     """
     name = fx_node.name
     shape = _get_shape(fx_node)
@@ -155,7 +167,13 @@ def _handle_placeholder(g: Graph, fx_node: Any, node_map: dict[str, str], module
     is_const = name.startswith(("p_", "b_"))
 
     if is_const:
-        nid = g.add_node(op=ConstantOp(name=name), inputs=[], output=Tensor(name, shape, dtype), node_id=name)
+        op = ConstantOp(
+            name=name,
+            source_path=const_targets.get(name),
+            source_shape=tuple(shape) if shape else None,
+            source_dtype=dtype,
+        )
+        nid = g.add_node(op=op, inputs=[], output=Tensor(name, shape, dtype), node_id=name)
     else:
         nid = g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape, dtype), node_id=name)
         g.inputs.append(nid)

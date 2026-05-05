@@ -45,7 +45,7 @@ them.
 |-----------------|--------------------------------------------------------------------------------|
 | `Op`            | Base class. Subclasses implement `infer_output_shape` and `forward` (numpy).   |
 | `InputOp`       | Sentinel: graph input tensor. Value supplied by the executor.                  |
-| `ConstantOp`    | Sentinel: weights / scalar constants. Scalars carry `value`; tensors don't.    |
+| `ConstantOp`    | Sentinel: weights / scalar constants. Scalars carry `value`; tensors carry `source_path` / `source_shape` / `source_dtype` (the safetensors / `nn.Module` address) plus `load_ops` — a chain of frontend ops applied at bind time by the loader. |
 | `_keepdim_axis` | Shape helper shared by `ReduceOp` (tensor) and `MeanOp` (frontend).            |
 
 ## `expr.py`
@@ -130,6 +130,11 @@ canonicalized before validation:
 - `eliminate_copy_aliases` — drop `y = copy(x)` Assigns.
 - `unify_sibling_reduce_axes` — collapse sibling reduce Loops sharing
   an input dim (softmax's max + sum sweeps become one reduce axis).
+- `split_invariant_divides` — rewrite `divide(x, y)` into
+  `reciprocal(y) + multiply(x, recip)` when `y` is loop-invariant
+  w.r.t. some axis `x` depends on, so the rcp can hoist out of the
+  inner loop and the per-iter cost drops from XU divide to FMA
+  multiply.
 - `hoist_loop_invariants` — pull loop-invariant Assigns out of reduce
   Loops.
 - `rename_ssa_sequential` — cosmetic: Assign/Select names become `v0,

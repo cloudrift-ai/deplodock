@@ -34,6 +34,15 @@ Or for a specific test file:
 ./venv/bin/pytest tests/test_recipe.py -v
 ```
 
+When running a large subset (e.g. `tests/compiler/`), pass the same xdist flags `make test` uses to parallelize:
+
+```bash
+./venv/bin/pytest tests/compiler/ -p no:randomly -n auto --dist=loadgroup
+```
+
+`-n auto` spawns one worker per core; `--dist=loadgroup` keeps tests sharing an `xdist_group` (e.g. CUDA context) on the
+same worker.
+
 ## CLI Commands
 
 - `deplodock deploy local ...` — deploy locally via docker compose
@@ -62,10 +71,11 @@ Or for a specific test file:
 ## Key Make Targets
 
 - `make setup` — create venv and install dependencies (includes ruff)
-- `make test` — run `pytest` using the venv
+- `make test` — run `pytest` using the venv (skips `perf`-marked tests; see `tests/perf/ARCHITECTURE.md`)
 - `make lint` — run `ruff check` and `ruff format --check`
 - `make format` — auto-format code and fix lint violations
 - `make bench` — run benchmarks (`deplodock bench recipes/*`)
+- `make bench-kernels` — run per-kernel perf comparison vs PyTorch (`tests/perf/`, requires CUDA)
 - `make clean` — remove venv and generated files
 
 ## Documentation Conventions

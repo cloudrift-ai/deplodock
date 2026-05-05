@@ -44,6 +44,11 @@ class RenderCtx:
     builtins: dict[str, str] = field(default_factory=dict)
     explicit_inits: set[str] = field(default_factory=set)
     literal_constants: dict[str, float] = field(default_factory=dict)
+    # Per-buffer byte offsets into a single ``extern __shared__`` pool
+    # ``_smem_pool``. When non-empty, ``Smem.render`` emits a pointer
+    # alias into the pool instead of a stand-alone ``__shared__`` array
+    # — the only way to exceed the 48 KB static-smem cap.
+    smem_dynamic_offsets: dict[str, int] = field(default_factory=dict)
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
@@ -54,6 +59,7 @@ class RenderCtx:
             builtins=self.builtins,
             explicit_inits=self.explicit_inits,
             literal_constants=self.literal_constants,
+            smem_dynamic_offsets=self.smem_dynamic_offsets,
         )
 
 
@@ -203,12 +209,16 @@ class Stmt:
         ``axis_fn``. Subclasses without axes accept and ignore ``axis_fn``;
         Loop-like subclasses thread it through their bodies.
 
-        ``rename_ssa`` is applied uniformly to the stmt's own name (if any)
-        and to each name it reads. Callers typically provide a callable
-        that defaults to identity (``lambda n: mapping.get(n, n)``) so only
-        the names they care about are changed.
+        Per-stmt logic lives in :mod:`.passes` (singledispatch over Stmt
+        type + introspection walker for the Stage hierarchy). This method
+        is a thin shim so existing call sites (``s.rewrite(...)``) keep
+        working. Tile-IR Stmt registrations are loaded by importing
+        ``deplodock.compiler.ir.tile.ir`` (which any caller passing a
+        Tile-IR Stmt has done already).
         """
-        raise NotImplementedError
+        from deplodock.compiler.ir.stmt.passes import rewrite  # noqa: PLC0415
+
+        return rewrite(self, rename_ssa, sigma, axis_fn)
 
     def nested(self) -> tuple[Body, ...]:
         """Child statement bodies for tree traversal.
@@ -223,6 +233,24 @@ class Stmt:
         switch on type.
         """
         return ()
+
+    def has_side_effects(self) -> bool:
+        """True iff executing this stmt produces an externally observable
+        effect (a buffer write). For compound stmts (Loop / StridedLoop /
+        Tile / Cond), True iff any nested stmt does.
+
+        Use this to gate transforms that change execution count
+        (hoisting, loop interchange, predication): a side-effecting
+        stmt run N times instead of M is observable, so it pins the
+        enclosing iteration to its current scope.
+
+        Note: ``Accum`` / ``Init`` are *not* side-effecting in this
+        sense — they're scope-bound (their semantics depend on which
+        Loop encloses them) but moving the *whole enclosing block* is
+        safe. Hoisting passes that want to move a Loop containing an
+        Accum need a separate scope-bound check on the leaf, not
+        ``has_side_effects`` on the wrapper."""
+        return any(c.has_side_effects() for sub in self.nested() for c in sub.iter())
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         """Write-side counterpart to :meth:`nested`. Return a copy of this

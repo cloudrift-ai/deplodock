@@ -34,3 +34,4 @@ dump/
 .env
 .env.local
 .env.*.local
+tests/perf/.results/

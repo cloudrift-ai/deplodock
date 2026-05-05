@@ -15,12 +15,12 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Interval, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -51,6 +51,7 @@ def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
     stmts = eliminate_copy_aliases(stmts)
     stmts = unify_sibling_reduce_axes(stmts)
     if hoist:
+        stmts = split_invariant_divides(stmts)
         stmts = hoist_loop_invariants(stmts)
     stmts = simplify_body(stmts)
     stmts = rename_ssa_sequential(stmts)
@@ -161,42 +162,53 @@ def unify_sibling_reduce_axes(stmts: Body) -> Body:
     stmts = Body.coerce(stmts)
 
     def walk(body: Body) -> Body:
-        new_body: list[Stmt] = []
+        # Recurse into nested bodies first (post-order) via the canonical
+        # nested() / with_bodies() descent, then group siblings at this
+        # scope. Splitting the recursion from the sibling-grouping keeps
+        # this pass's scope-level logic isolated in ``_unify_siblings``.
+        recursed: list[Stmt] = []
         for s in body:
             nested = s.nested()
             if nested:
-                new_body.append(s.with_bodies(tuple(walk(b) for b in nested)))
+                recursed.append(s.with_bodies(tuple(walk(b) for b in nested)))
             else:
-                new_body.append(s)
-
-        groups: dict[frozenset[tuple[str, int]], list[int]] = {}
-        for i, s in enumerate(new_body):
-            if isinstance(s, Loop) and s.is_reduce:
-                positions = _reduce_axis_source_positions(s.body, s.axis.name)
-                if positions:
-                    groups.setdefault(frozenset(positions), []).append(i)
-
-        for indices in groups.values():
-            if len(indices) < 2:
-                continue
-            first = new_body[indices[0]]
-            assert isinstance(first, Loop)
-            canonical = first.axis.name
-            canonical_extent = int(first.axis.extent)
-            for idx in indices[1:]:
-                loop = new_body[idx]
-                assert isinstance(loop, Loop)
-                if int(loop.axis.extent) != canonical_extent or loop.axis.name == canonical:
-                    continue
-                new_axis = Axis(name=canonical, extent=canonical_extent)
-                sub = Sigma({loop.axis.name: Var(canonical)})
-                rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
-                renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
-                new_body[idx] = replace(loop, axis=new_axis, body=renamed)
-
-        return tuple(new_body)
+                recursed.append(s)
+        return _unify_siblings(Body(recursed))
 
     return walk(stmts)
+
+
+def _unify_siblings(body: Body) -> Body:
+    """Single-scope sibling grouping: rename reduce-axis vars across
+    sibling reduce Loops that index the same ``(source, dim)`` positions
+    so they share one canonical axis name."""
+    stmts = list(body)
+    groups: dict[frozenset[tuple[str, int]], list[int]] = {}
+    for i, s in enumerate(stmts):
+        if isinstance(s, Loop) and s.is_reduce:
+            positions = _reduce_axis_source_positions(s.body, s.axis.name)
+            if positions:
+                groups.setdefault(frozenset(positions), []).append(i)
+
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        first = stmts[indices[0]]
+        assert isinstance(first, Loop)
+        canonical = first.axis.name
+        canonical_extent = int(first.axis.extent)
+        for idx in indices[1:]:
+            loop = stmts[idx]
+            assert isinstance(loop, Loop)
+            if int(loop.axis.extent) != canonical_extent or loop.axis.name == canonical:
+                continue
+            new_axis = Axis(name=canonical, extent=canonical_extent)
+            sub = Sigma({loop.axis.name: Var(canonical)})
+            rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
+            renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
+            stmts[idx] = replace(loop, axis=new_axis, body=renamed)
+
+    return Body(stmts)
 
 
 def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tuple[str, int]]:
@@ -213,195 +225,167 @@ def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tupl
 
 
 # ---------------------------------------------------------------------------
-# Pass 5: loop-invariant code motion
+# Pass 5a: split loop-invariant divides into reciprocal + multiply.
+# ---------------------------------------------------------------------------
+#
+# ``divide(x, y)`` lowers to a single-precision divide on the XU pipe (the
+# same pipe ``exp`` uses). When ``y`` is loop-invariant w.r.t. some
+# enclosing Loop and ``x`` is not, the divide can't hoist as-is — its live
+# set is the union of x's and y's. Splitting into::
+#
+#     recip_y = reciprocal(y)        # live = axes_of(y)
+#     result  = multiply(x, recip_y) # live = axes_of(x) ∪ {recip_y}
+#
+# lets the next pass (``hoist_loop_invariants``) move ``recip_y`` out of
+# every Loop axis that doesn't appear in ``y``. Inside the loop the
+# divide turns into a multiply (FMA pipe), which is typically the
+# under-utilized pipe on transcendental-heavy kernels (softmax,
+# RMSNorm, attention output). One XU op per outer-axis iteration
+# instead of one per inner-axis iteration.
+#
+# Gate: split iff ``axes_of(y)`` is a strict subset of ``axes_of(x)``.
+# That's the precise structural condition for "splitting unblocks at
+# least one Loop's worth of hoisting." Skip when y has axes x doesn't
+# (no hoisting wins) or when both have identical axes (rcp would stay
+# in the same scope as the original divide, no win and slight
+# precision drift). When y is a true scalar (axes_of empty), the rcp
+# hoists all the way to body root.
+# ---------------------------------------------------------------------------
+
+
+def split_invariant_divides(stmts: Body) -> Body:
+    """Rewrite ``divide(x, y)`` → ``reciprocal(y) + multiply(x, recip)``
+    when ``y``'s axis-dependency set is a strict subset of ``x``'s.
+
+    Invariance is queried via :meth:`Body.deps_closure` over the
+    pre-rewrite body, filtered to axis names. The strict-subset check
+    means there's at least one axis ``x`` depends on that ``y``
+    doesn't — splitting moves the rcp out of that axis's Loop while
+    the multiply stays. Generates fresh SSA names for the rcp; the
+    trailing :func:`rename_ssa_sequential` pass renumbers them into
+    ``vN`` form.
+    """
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+
+    stmts = Body.coerce(stmts)
+    closure = stmts.deps_closure
+    axes = stmts.axis_names
+    ssa_names: set[str] = set(closure.keys())
+    fresh_counter = [0]
+
+    def _fresh(prefix: str) -> str:
+        while True:
+            fresh_counter[0] += 1
+            n = f"{prefix}_{fresh_counter[0]}"
+            if n not in ssa_names:
+                ssa_names.add(n)
+                return n
+
+    def _axes_of(name: str) -> frozenset[str]:
+        return closure.get(name, frozenset()) & axes
+
+    def walk(body: Body) -> Body:
+        out: list[Stmt] = []
+        for s in body:
+            nested = s.nested()
+            if nested:
+                # Generic descent — recurse into every nested body, rebuild
+                # the wrapper via with_bodies. The closure was built once
+                # over the whole body, so post-Loop Accum bookkeeping is
+                # already baked in — no per-wrapper update needed here.
+                out.append(s.with_bodies(tuple(walk(b) for b in nested)))
+                continue
+            if isinstance(s, Assign) and s.op == ElementwiseImpl("divide") and len(s.args) == 2:
+                x_name, y_name = s.args
+                if _axes_of(y_name) < _axes_of(x_name):  # strict subset → splitting unblocks at least one hoist
+                    recip_name = _fresh(f"recip_{y_name}")
+                    recip = Assign(name=recip_name, op=ElementwiseImpl("reciprocal"), args=(y_name,))
+                    mult = Assign(name=s.name, op=ElementwiseImpl("multiply"), args=(x_name, recip_name))
+                    # Patch closure for the freshly-introduced rcp so a
+                    # later divide reading the same y in the same body
+                    # still sees the correct axis set.
+                    closure[recip_name] = closure.get(y_name, frozenset())
+                    closure[mult.name] = closure.get(x_name, frozenset()) | closure[recip_name]
+                    out.append(recip)
+                    out.append(mult)
+                    continue
+            out.append(s)
+        return Body(out)
+
+    return walk(stmts)
+
+
+# ---------------------------------------------------------------------------
+# Pass 5b: loop-invariant code motion
 # ---------------------------------------------------------------------------
 
 
 def hoist_loop_invariants(stmts: Body) -> Body:
-    """Move ``Load`` / ``Assign`` / ``Select`` stmts out of ``Loop``s whose
-    axis their value doesn't depend on. Hoisting only crosses ``Loop``
-    boundaries; ``StridedLoop`` / ``Tile`` / ``Cond`` are barriers but are
-    recursed into so inner Loops still get the optimization."""
+    """Move stmts out of ``Loop``s whose axis they don't depend on.
+
+    Hoists ``Load`` / ``Assign`` / ``Select`` (SSA values) and entire
+    ``Loop`` / ``StridedLoop`` / ``Tile`` / ``Cond`` blocks whose contents
+    transitively avoid the outer axis — provided the block contains no
+    ``Write`` (a Write hoist would change observable side effects).
+    Block-level hoisting is what lets a Loop and its downstream consumer
+    move together: hoisting just the consumer would leave it referencing
+    an Accum still defined inside the outer Loop body.
+
+    ``Accum`` / ``Init`` / ``Write`` always stay (iteration-tied
+    semantics). Loop-invariance is queried via :meth:`Body.depends_on`
+    against the body's transitive read closure, so the hoisted set is
+    automatically closed under SSA dependencies — no separate ordering
+    check is needed.
+    """
     stmts = Body.coerce(stmts)
-    axes_of: dict[str, frozenset[str]] = {}
-    ssa_names: set[str] = set()
 
-    def _load_index_parts(index: tuple[Expr, ...]) -> tuple[set[str], set[str]]:
-        deps: set[str] = set()
-        axes: set[str] = set()
-        for e in index:
-            for v in e.free_vars():
-                (deps if v in ssa_names else axes).add(v)
-        return deps, axes
+    def _hoistable(s: Stmt, axis: str) -> bool:
+        # Accum / Init are scope-bound to their enclosing Loop's reduction — they can't
+        # move alone, but the whole enclosing block can. Side-effecting stmts (Write, or
+        # any block containing a Write) pin their iteration count and stay put.
+        if isinstance(s, (Accum, Init)) or s.has_side_effects():
+            return False
+        return not stmts.depends_on(s, axis)
 
-    def _stmt_live(s: Stmt) -> frozenset[str]:
-        if isinstance(s, Load):
-            deps, axes = _load_index_parts(s.index)
-            result = set(axes)
-            for d in deps:
-                result |= axes_of.get(d, frozenset())
-            return frozenset(result)
-        if isinstance(s, Assign):
-            result = set()
-            for name in s.args:
-                result |= axes_of.get(name, frozenset())
-            return frozenset(result)
-        if isinstance(s, Select):
-            result = set()
-            for b in s.branches:
-                result |= b.select.free_vars()
-                result |= axes_of.get(b.value, frozenset())
-            return frozenset(result)
-        return frozenset()
-
-    def _deps(s: Stmt) -> tuple[str, ...]:
-        if isinstance(s, Load):
-            deps, _ = _load_index_parts(s.index)
-            return tuple(deps)
-        if isinstance(s, Assign):
-            return s.args
-        if isinstance(s, Select):
-            return tuple(b.value for b in s.branches)
-        return ()
-
-    def _record(c: Stmt, bindings: set[str]) -> None:
-        defined = c.defines()
-        if not defined:
-            return
-        name = defined[0]
-        if isinstance(c, Accum):
-            axes_of[name] = axes_of.get(c.value, frozenset())
-        else:
-            axes_of[name] = _stmt_live(c)
-        ssa_names.add(name)
-        bindings.add(name)
-
-    def walk(body: Body, outer_bindings: set[str]) -> list[Stmt]:
+    def walk(body: Body) -> list[Stmt]:
         new_body: list[Stmt] = []
-        bindings = set(outer_bindings)
-
         for s in body:
-            if isinstance(s, Loop):
-                inner = walk(s.body, bindings)
+            if isinstance(s, (Loop, StridedLoop)):
+                inner = walk(s.body)
                 axis = s.axis.name
-                hoisted_names: set[str] = set()
-                hoisted: list[Stmt] = []
-                stay: list[Stmt] = []
-                for c in inner:
-                    if isinstance(c, (Load, Assign, Select)):
-                        live = axes_of.get(c.name, frozenset())
-                        if axis not in live and all(d in bindings or d in hoisted_names for d in _deps(c)):
-                            hoisted.append(c)
-                            hoisted_names.add(c.name)
-                            continue
-                    stay.append(c)
-
-                for h in hoisted:
-                    new_body.append(h)
-                    bindings.add(h.name)
+                hoisted = [c for c in inner if _hoistable(c, axis)]
+                hoisted_ids = {id(c) for c in hoisted}
+                stay = [c for c in inner if id(c) not in hoisted_ids]
+                new_body.extend(hoisted)
                 new_body.append(replace(s, body=tuple(stay)))
-
-                for c in inner:
-                    if isinstance(c, Accum):
-                        axes_of[c.name] = axes_of.get(c.value, frozenset()) - {axis}
-                        ssa_names.add(c.name)
-                        bindings.add(c.name)
-            elif isinstance(s, StridedLoop):
-                inner = walk(s.body, bindings)
-                new_body.append(replace(s, body=tuple(inner)))
-                for c in inner:
-                    if isinstance(c, Accum):
-                        ssa_names.add(c.name)
-                        bindings.add(c.name)
             elif isinstance(s, Tile):
-                inner = walk(s.body, bindings)
-                new_body.append(Tile(axes=s.axes, body=tuple(inner)))
+                new_body.append(Tile(axes=s.axes, body=tuple(walk(s.body))))
             elif isinstance(s, Cond):
-                inner_b = walk(s.body, bindings)
-                inner_e = walk(s.else_body, bindings)
-                new_body.append(Cond(cond=s.cond, body=tuple(inner_b), else_body=tuple(inner_e)))
+                new_body.append(Cond(cond=s.cond, body=tuple(walk(s.body)), else_body=tuple(walk(s.else_body))))
             else:
                 new_body.append(s)
-                _record(s, bindings)
-
         return new_body
 
-    return tuple(walk(stmts, set()))
+    return tuple(walk(stmts))
 
 
 # ---------------------------------------------------------------------------
 # Pass 6: simplify Exprs inside body Stmts (constant folding, identity collapse,
 # range-based comparison folding). The per-Expr rewrite logic lives on each
-# ``Expr`` subclass as ``simplify(ctx)``; this pass just walks the body and
-# threads ``SimplifyCtx`` ranges as it descends.
+# ``Expr`` subclass as ``simplify(ctx)``; the walk over Stmts is dispatched
+# in :mod:`.passes` (singledispatch + Stage introspection).
 # ---------------------------------------------------------------------------
-
-
-def _simplify_expr_tuple(xs: tuple[Expr, ...], ctx: SimplifyCtx) -> tuple[Expr, ...]:
-    return tuple(e.simplify(ctx) for e in xs)
-
-
-def _simplify_stmt(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
-    if isinstance(stmt, Loop):
-        inner = ctx.extend(stmt.axis.name, Interval(0, stmt.axis.extent - 1))
-        return replace(stmt, body=tuple(_simplify_stmt(s, inner) for s in stmt.body))
-    if isinstance(stmt, StridedLoop):
-        inner = ctx.extend(stmt.axis.name, Interval(0, stmt.axis.extent - 1))
-        return replace(
-            stmt,
-            start=stmt.start.simplify(ctx),
-            step=stmt.step.simplify(ctx) if isinstance(stmt.step, Expr) else stmt.step,
-            body=tuple(_simplify_stmt(s, inner) for s in stmt.body),
-        )
-    if isinstance(stmt, Tile):
-        inner = ctx
-        for ba in stmt.axes:
-            inner = inner.extend(ba.axis.name, Interval(0, ba.axis.extent - 1))
-        return Tile(axes=stmt.axes, body=tuple(_simplify_stmt(s, inner) for s in stmt.body))
-    if isinstance(stmt, Cond):
-        return Cond(
-            cond=stmt.cond.simplify(ctx),
-            body=tuple(_simplify_stmt(s, ctx) for s in stmt.body),
-            else_body=tuple(_simplify_stmt(s, ctx) for s in stmt.else_body),
-        )
-    if isinstance(stmt, Select):
-        return Select(stmt.name, tuple(SelectBranch(b.value, b.select.simplify(ctx)) for b in stmt.branches))
-    if isinstance(stmt, Write):
-        return Write(stmt.output, _simplify_expr_tuple(stmt.index, ctx), stmt.value)
-    if isinstance(stmt, Load):
-        return Load(stmt.name, stmt.input, _simplify_expr_tuple(stmt.index, ctx))
-    # Tile-IR-only ``Stage`` (+ BufferedStage / AsyncBufferedStage subtypes)
-    # carries Exprs in ``origin`` / ``addressing.exprs`` (template form) / ``phase``.
-    # Lazy import to avoid a tile→stmt circular at module load time.
-    from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TemplateAddressing  # noqa: PLC0415
-
-    if isinstance(stmt, Stage):
-        if isinstance(stmt.addressing, TemplateAddressing):
-            new_addr = TemplateAddressing(exprs=_simplify_expr_tuple(stmt.addressing.exprs, ctx))
-        else:
-            new_addr = stmt.addressing
-        kwargs = dict(
-            name=stmt.name,
-            buf=stmt.buf,
-            origin=_simplify_expr_tuple(stmt.origin, ctx),
-            axes=stmt.axes,
-            addressing=new_addr,
-            pad=stmt.pad,
-        )
-        if isinstance(stmt, BufferedStage):
-            kwargs["buffer_count"] = stmt.buffer_count
-            kwargs["phase"] = stmt.phase.simplify(ctx)
-        return type(stmt)(**kwargs)
-    # Assign / Accum / Combine carry only SSA names — no Expr field to simplify.
-    return stmt
 
 
 def simplify_body(body: Body) -> Body:
     """Simplify every Expr inside a body. Seeds ``SimplifyCtx`` from
-    ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends."""
+    ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends.
+    Tile-IR Stmt registrations are loaded when ``tile.ir`` is imported."""
+    from deplodock.compiler.ir.stmt.passes import simplify  # noqa: PLC0415
+
     body = Body.coerce(body)
     ctx = SimplifyCtx.empty()
-    return tuple(_simplify_stmt(s, ctx) for s in body)
+    return tuple(simplify(s, ctx) for s in body)
 
 
 # ---------------------------------------------------------------------------

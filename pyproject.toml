@@ -16,10 +16,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff"]
-compile = ["torch", "transformers", "cppyy==3.5.0"]
+compile = ["torch", "transformers", "cppyy==3.5.0", "safetensors"]
 # flash-attn requires torch at build time, install separately:
 #   pip install flash-attn --no-build-isolation
-dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphviz", "torch", "transformers", "cupy-cuda12x; sys_platform == 'linux'", "cppyy==3.5.0"]
+dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphviz", "torch", "transformers", "cupy-cuda12x; sys_platform == 'linux'", "cppyy==3.5.0", "safetensors"]
 
 [tool.setuptools.packages.find]
 include = ["deplodock*"]
@@ -29,6 +29,9 @@ deplodock = "deplodock.deplodock:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "perf: GPU performance comparison vs PyTorch (deselected by default; run with `pytest -m perf`)",
+]
 
 [tool.ruff]
 line-length = 140

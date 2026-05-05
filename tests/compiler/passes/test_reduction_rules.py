@@ -19,7 +19,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
 
-_accums_independent = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.003_cooperative_reduce")._accums_independent
+_accums_independent = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.004_cooperative_reduce")._accums_independent
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -28,8 +28,10 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 # --- cooperative_reduce firing on frontend graphs --------------------
 # Triggers on single-buffer reductions whose first reduce-axis extent is
-# ≥ BLOCK_SIZE (256). split_matmul_k skips these (single Load), so they
-# reach cooperative_reduce unchanged.
+# ≥ WARP_SIZE (32) — the threshold dropped from BLOCK_SIZE so softmax /
+# rmsnorm rows in the 32–128 range get a parallel reduce instead of
+# every thread redundantly walking the row. split_matmul_k skips
+# single-buffer reduces, so they reach cooperative_reduce unchanged.
 
 
 _M, _K, _N = 32, 32, 32
@@ -51,7 +53,24 @@ def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
 
 
 def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
-    """K=32 < BLOCK_SIZE → cooperative_reduce does not fire."""
+    """K=16 < WARP_SIZE → cooperative_reduce does not fire (too small
+    to stage a meaningful cross-thread tree-halve)."""
+    g = Graph()
+    _input(g, "x", (4, 16))
+    g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
+    g.inputs = ["x"]
+    g.outputs = ["o"]
+
+    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    fired = recording_dump.fired_rules("lowering/tile")
+    assert "cooperative_reduce" not in fired
+
+
+def test_warp_sized_axis_fires_cooperative_reduce(recording_dump):
+    """K=32 ≥ WARP_SIZE → cooperative_reduce fires with a 32-thread
+    cooperative block (the gate was lowered from BLOCK_SIZE to
+    WARP_SIZE so K∈[32, BLOCK_SIZE) gets a parallel reduce instead of
+    every thread redundantly walking the row sequentially)."""
     g = Graph()
     _input(g, "x", (4, 32))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
@@ -60,7 +79,7 @@ def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
 
     run_pipeline(g, TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" not in fired
+    assert "cooperative_reduce" in fired
 
 
 def test_matmul_does_not_fire_cooperative_reduce(recording_dump):

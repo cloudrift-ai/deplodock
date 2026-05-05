@@ -102,7 +102,6 @@ def handle_run(args):
     module = info["module"]
     example_args = info["args"]
     example_kwargs = info["kwargs"]
-    const_targets = info["const_targets"]
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
@@ -111,7 +110,7 @@ def handle_run(args):
     backend = CudaBackend(debug=args.debug or None, dump=dump)
     compiled = backend.compile(graph)
 
-    input_data = _bind_inputs(compiled, module, example_args, example_kwargs, const_targets)
+    input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
 
     run_result = backend.run(compiled, input_data=input_data)
     if dump and backend.last_debug_result is not None:
@@ -276,19 +275,36 @@ def _run_ncu_profile(args):
     env = dict(os.environ)
     env[_NCU_RECURSE_GUARD] = "1"
 
+    # Explicit section list — `--set detailed` pulls in two sections that
+    # break on TMA kernels in ncu 2025.3.1: `SpeedOfLight_Roofline`
+    # (`float division by zero`) and `SourceCounters` /
+    # `PCSamplingData` (missing `smsp__pcsamp_*` metrics). Either one
+    # raises and poisons every subsequent section to NaN. Enumerating
+    # the sections that work sidesteps both.
+    sections = (
+        "SpeedOfLight",
+        "ComputeWorkloadAnalysis",
+        "MemoryWorkloadAnalysis",
+        "LaunchStats",
+        "Occupancy",
+    )
     cmd: list[str] = [
         ncu,
         "--target-processes",
         "all",
-        "--set",
-        "detailed",
         "--page",
         "details",
-        sys.executable,
-        "-m",
-        "deplodock.deplodock",
-        "run",
     ]
+    for s in sections:
+        cmd.extend(["--section", s])
+    cmd.extend(
+        [
+            sys.executable,
+            "-m",
+            "deplodock.deplodock",
+            "run",
+        ]
+    )
     if args.code is not None:
         cmd.extend(["--code", args.code])
     elif args.ir is not None:
@@ -405,29 +421,34 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
 
-    if not args.bench:
-        return
-
-    bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-    print()
-    print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-    print("-" * 38)
-    print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-    if dump:
-        dump.dump_benchmark(bench)
-    _print_kernel_stats(graph, bench)
+    if args.bench:
+        bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+        print()
+        print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+        print("-" * 38)
+        print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+        if dump:
+            dump.dump_benchmark(bench)
+        _print_kernel_stats(graph, bench)
     if args.profile:
         _run_ncu_profile(args)
 
 
-def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):
-    """Match graph inputs and constants to tensors from ``module`` / call args."""
+def _bind_inputs(compiled, module, example_args, example_kwargs):
+    """Match graph inputs and constants to tensors from ``module`` / call args.
+
+    Activations come from the call's positional/keyword tensors. Constants
+    come from ``module.named_parameters()`` / ``named_buffers()`` keyed
+    by each ``ConstantOp.source_path`` recorded at trace time. Each
+    constant's ``load_ops`` chain is replayed via the NumPy backend
+    (see ``compiler.loader.binder``), so any compile-time-folded
+    transpose / reshape is honored uniformly.
+    """
+    import numpy as np
     import torch
 
     from deplodock.compiler.ir.base import ConstantOp
-
-    params = dict(module.named_parameters())
-    buffers = dict(module.named_buffers())
+    from deplodock.compiler.loader.binder import bind_constants
 
     flat_inputs: list[torch.Tensor] = []
     for v in example_args:
@@ -440,26 +461,25 @@ def _bind_inputs(compiled, module, example_args, example_kwargs, const_targets):
         logger.error("Input arity mismatch: graph has %d inputs, code provided %d", len(input_ids), len(flat_inputs))
         sys.exit(1)
 
-    input_data: dict[str, list[float]] = {}
+    input_data: dict[str, np.ndarray] = {}
     for nid, tensor in zip(input_ids, flat_inputs, strict=True):
-        input_data[nid] = tensor.detach().cpu().flatten().tolist()
+        input_data[nid] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    sources: dict[str, np.ndarray] = {}
+    for path, tensor in module.named_parameters():
+        sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+    for path, tensor in module.named_buffers():
+        sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    input_data.update(bind_constants(compiled, sources))
 
     for nid, node in compiled.nodes.items():
-        if not isinstance(node.op, ConstantOp):
+        if not isinstance(node.op, ConstantOp) or nid in input_data:
             continue
-        target = const_targets.get(node.op.name)
-        tensor = None
-        if target is not None:
-            tensor = params.get(target)
-            if tensor is None:
-                tensor = buffers.get(target)
-        if tensor is None and node.op.value is not None:
-            input_data[nid] = [float(node.op.value)]
-            continue
-        if tensor is None:
-            logger.error("Could not bind constant %s (target=%r)", nid, target)
-            sys.exit(1)
-        input_data[nid] = tensor.detach().cpu().flatten().tolist()
+        if node.op.value is not None:
+            continue  # backend materializes scalars from node.op.value
+        logger.error("Could not bind constant %s (source_path=%r)", nid, node.op.source_path)
+        sys.exit(1)
     return input_data
 
 
@@ -514,12 +534,20 @@ def _check_accuracy(outputs, eager_out):
         if len(values) == len(eager_flat):
             max_diff = max(abs(a - e) for a, e in zip(values, eager_flat, strict=True))
             mean_diff = sum(abs(a - e) for a, e in zip(values, eager_flat, strict=True)) / len(values)
-            verdict = "PASS" if max_diff < 1.0 else "FAIL"
+            # Scale tolerance by max|eager|: fp32 matmul reduction-order drift
+            # grows with both K and output magnitude. A fixed threshold flags
+            # benign drift on randn×randn at large K as a failure (cp.async +
+            # split-K atomic-add ordering vs eager's pairwise sum). 5% of peak
+            # eager magnitude is loose enough for legit drift, tight enough
+            # that whole-row corruption / NaNs still fail.
+            peak = max((abs(e) for e in eager_flat), default=0.0)
+            tol = max(1e-3, 0.05 * peak)
+            verdict = "PASS" if max_diff < tol else "FAIL"
             if verdict == "FAIL":
-                print(f"Accuracy vs eager: max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} FAIL")
+                print(f"Accuracy vs eager: max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} tol={tol:.6f} FAIL")
                 failed = True
             else:
-                logger.info("Accuracy vs eager: max_diff=%.6f mean_diff=%.6f PASS", max_diff, mean_diff)
+                logger.info("Accuracy vs eager: max_diff=%.6f mean_diff=%.6f tol=%.6f PASS", max_diff, mean_diff, tol)
         else:
             logger.warning("Output size %d does not match eager %d; skipping accuracy", len(values), len(eager_flat))
     if failed:

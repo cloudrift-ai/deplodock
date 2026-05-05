@@ -35,6 +35,7 @@ passes swap node ops in place, so there is no separate "program" type.
 | `trace/`              | PyTorch/HuggingFace → Graph IR          | `trace/ARCHITECTURE.md`      |
 | `pipeline/`           | Rewrite engine, passes, dump hooks      | `pipeline/ARCHITECTURE.md`   |
 | `backend/`            | Execution (numpy / loop / cuda)         | `backend/ARCHITECTURE.md`    |
+| `loader/`             | Bind constants (safetensors / `nn.Module` → `input_data`) | —              |
 
 ## Per-layer rules
 

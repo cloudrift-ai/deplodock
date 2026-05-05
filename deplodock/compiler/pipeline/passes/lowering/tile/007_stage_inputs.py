@@ -233,7 +233,18 @@ def _classify(
     if not var_to_dim or len(var_to_dim) == len(candidates):
         return None
 
-    cache_axes = tuple(ax for ax in candidates if ax.name in var_to_dim)
+    cache_axes_unsorted = tuple(ax for ax in candidates if ax.name in var_to_dim)
+    # Sort cache axes by their source-dim index so the source's innermost
+    # dim ends up innermost in smem. This preserves source layout, which
+    # matters for SIMT FP32 LDS.128 vectorization: per-thread reads of
+    # consecutive cells along the source's innermost dim become a single
+    # 16-byte transaction. For matmul B in [K, N] layout this puts N
+    # innermost in smem (so per-thread N-tile reads vectorize); for B in
+    # [N, K] layout it puts K innermost (the existing layout). The
+    # default unsorted order placed the reduce axis last regardless of
+    # source — fine for [N, K] sources but blocked vectorization on
+    # [K, N] B which is exactly the cuBLAS-beating SGEMM convention.
+    cache_axes = tuple(sorted(cache_axes_unsorted, key=lambda ax: var_to_dim[ax.name]))
     slab_dims = tuple(var_to_dim[ax.name] for ax in cache_axes)
     n_bytes = BYTES_PER_ELEM
     for ax in cache_axes:

@@ -1,0 +1,80 @@
+{
+  "inputs": [
+    "merged_lift_scaled_dot_product_attention_reduce",
+    "hidden_states"
+  ],
+  "outputs": [
+    "merged_merged_lift_add_3"
+  ],
+  "nodes": {
+    "p_attn_o_proj_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_attn_o_proj_weight",
+        "value": null,
+        "transpose": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_attn_o_proj_weight",
+        "shape": [
+          2048,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_lift_scaled_dot_product_attention_reduce": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_reduce",
+        "shape": [
+          1,
+          32,
+          512,
+          1,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "hidden_states": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "hidden_states",
+        "shape": [
+          1,
+          512,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_merged_lift_add_3": {
+      "op": "LoopOp",
+      "op_fields": {
+        "body": [
+          "Loop(axis=Axis(name='a0', extent=512), body=(Loop(axis=Axis(name='a1', extent=2048), body=(Loop(axis=Axis(name='a2', extent=2048), body=(Load(name='in0', input='p_attn_o_proj_weight', index=(Var(name='a1'), Var(name='a2'))), Load(name='in1', input='merged_lift_scaled_dot_product_attention_reduce', index=(Literal(value=0, dtype='int'), BinaryExpr(op='%', left=BinaryExpr(op='/', left=BinaryExpr(op='+', left=BinaryExpr(op='*', left=Var(name='a0'), right=Literal(value=2048, dtype='int')), right=Var(name='a2')), right=Literal(value=64, dtype='int')), right=Literal(value=32, dtype='int')), Var(name='a0'), Literal(value=0, dtype='int'), BinaryExpr(op='%', left=BinaryExpr(op='+', left=BinaryExpr(op='*', left=Var(name='a0'), right=Literal(value=2048, dtype='int')), right=Var(name='a2')), right=Literal(value=64, dtype='int')))), Assign(name='v0', op=ElementwiseImpl('multiply'), args=('in1', 'in0')), Accum(name='acc0', value='v0', op=ElementwiseImpl('add'))), unroll=False), Load(name='in2', input='hidden_states', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1'))), Assign(name='v1', op=ElementwiseImpl('add'), args=('in2', 'acc0')), Write(output='merged_merged_lift_add_3', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1')), value='v1')), unroll=False),), unroll=False)"
+        ]
+      },
+      "inputs": [
+        "p_attn_o_proj_weight",
+        "merged_lift_scaled_dot_product_attention_reduce",
+        "hidden_states"
+      ],
+      "output": {
+        "name": "add_3",
+        "shape": [
+          1,
+          512,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    }
+  }
+}

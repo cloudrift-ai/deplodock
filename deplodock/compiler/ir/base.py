@@ -47,10 +47,28 @@ class InputOp(Op):
 
 @dataclass
 class ConstantOp(Op):
-    """Fixed tensor: weights, RoPE tables, scalars. Not an activation."""
+    """Fixed tensor: weights, RoPE tables, scalars. Not an activation.
+
+    ``load_ops`` is an ordered tuple of frontend ``Op`` instances applied
+    to the source tensor at bind time, in order. Const-folding passes
+    absorb a foldable op (``TransposeOp``, ``ReshapeOp``, ...) into this
+    chain, so a chain of layout ops over a constant collapses to a single
+    ``ConstantOp`` whose loader executes the chain via the reference
+    NumPy backend. ``output.shape`` already reflects the post-chain shape.
+
+    ``source_path`` / ``source_shape`` / ``source_dtype`` are the source
+    tensor's address (HF parameter/buffer attribute path) and pre-chain
+    layout — what the loader needs to read from safetensors before
+    running ``load_ops``. Empty for scalar constants and for synthetic
+    constants emitted by passes (which never reach the loader).
+    """
 
     name: str
     value: float | None = None  # scalar value captured at trace time
+    load_ops: tuple[Op, ...] = ()
+    source_path: str | None = None
+    source_shape: tuple[int, ...] | None = None
+    source_dtype: str | None = None
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         raise NotImplementedError("ConstantOp has no inputs; use node.output.shape directly")

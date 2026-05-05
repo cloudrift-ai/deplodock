@@ -12,11 +12,11 @@ wait before its consumer — holds even without pipelining) when:
 The materializer expands ``AsyncBufferedStage`` to ``Smem`` +
 cooperative ``CpAsyncCopy`` + ``CpAsyncCommit`` only (no implicit wait
 or sync); the explicit ``AsyncWait`` lowers to ``CpAsyncWait(group=0)``
-+ ``Sync()``. The pipelining pass (``015_pipeline_async``) then drops
++ ``Sync()``. The pipelining pass (``013_pipeline_async``) then drops
 these synchronous-style waits and re-emits them at the pipelined
 schedule positions.
 
-Requires the upstream ``013_double_buffer`` pass to have promoted
+Requires the upstream ``009_double_buffer`` pass to have promoted
 plain ``Stage`` to ``BufferedStage``: cp.async without ``buffer_count >= 2``
 gives no overlap, so a sync ``Stage`` is intentionally not eligible.
 
@@ -25,15 +25,14 @@ Idempotence: an ``AsyncBufferedStage`` is left alone.
 
 from __future__ import annotations
 
-import functools
 import logging
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AsyncBufferedStage, AsyncWait, BufferedStage, TileOp
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AsyncBufferedStage, AsyncWait, BufferedStage, TileOp, TmaBufferedStage
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability, single_tile
 
 logger = logging.getLogger(__name__)
 
@@ -43,30 +42,9 @@ _MIN_CAPABILITY = (8, 0)
 _MIN_BYTES_PER_THREAD = 16  # 4 fp32 elems
 
 
-@functools.cache
-def _compute_capability() -> tuple[int, int]:
-    """Query the active CUDA device's compute capability via cupy. Cached.
-    Returns ``(0, 0)`` if cupy is unavailable — treated as no async support."""
-    try:
-        import cupy as cp
-
-        dev = cp.cuda.Device()
-        # cupy returns the capability as a string ``"MMm"``: ``"86"`` for
-        # sm_86, ``"120"`` for sm_12.0. Minor is always the last digit.
-        cap = str(dev.compute_capability)
-        return (int(cap[:-1]), int(cap[-1]))
-    except Exception as e:  # pragma: no cover
-        logger.debug("cp.async gate: compute_capability query failed (%s)", e)
-        return (0, 0)
-
-
-def _supports_cp_async() -> bool:
-    return _compute_capability() >= _MIN_CAPABILITY
-
-
 def rewrite(graph: Graph, root: Node) -> Graph | None:
-    if not _supports_cp_async():
-        raise RuleSkipped(f"cp.async requires compute capability >= {_MIN_CAPABILITY}, got {_compute_capability()}")
+    if compute_capability() < _MIN_CAPABILITY:
+        raise RuleSkipped(f"cp.async requires compute capability >= {_MIN_CAPABILITY}, got {compute_capability()}")
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         return None
@@ -96,7 +74,7 @@ def _process(body: Body, n_threads: int) -> Body:
     new_body: list[Stmt] = []
     changed = False
     for s in body:
-        if isinstance(s, BufferedStage) and not isinstance(s, AsyncBufferedStage) and _eligible(s, n_threads):
+        if isinstance(s, BufferedStage) and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage)) and _eligible(s, n_threads):
             new_body.append(
                 AsyncBufferedStage(
                     name=s.name,

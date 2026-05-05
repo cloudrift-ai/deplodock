@@ -1,0 +1,149 @@
+{
+  "inputs": [
+    "merged_lift_linear_1_reduce",
+    "merged_lift_linear_reduce",
+    "position_embeddings_1",
+    "position_embeddings_0"
+  ],
+  "outputs": [
+    "merged_merged_merged_lift_scaled_dot_product_attention_masked"
+  ],
+  "nodes": {
+    "merged_lift_linear_1_reduce": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "linear_1_reduce",
+        "shape": [
+          1,
+          512,
+          1,
+          256
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_lift_linear_reduce": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "linear_reduce",
+        "shape": [
+          1,
+          512,
+          1,
+          2048
+        ],
+        "dtype": "float32"
+      }
+    },
+    "scaled_dot_product_attention_mask_zero": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "scaled_dot_product_attention_mask_zero",
+        "value": 0.0,
+        "transpose": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_mask_zero",
+        "shape": [
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "scaled_dot_product_attention_mask_fill": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "scaled_dot_product_attention_mask_fill",
+        "value": -1000000000.0,
+        "transpose": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_mask_fill",
+        "shape": [
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "scaled_dot_product_attention_scale": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "scaled_dot_product_attention_scale",
+        "value": 0.125,
+        "transpose": null
+      },
+      "inputs": [],
+      "output": {
+        "name": "scaled_dot_product_attention_scale",
+        "shape": [
+          1
+        ],
+        "dtype": "float32"
+      }
+    },
+    "position_embeddings_1": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "position_embeddings_1",
+        "shape": [
+          1,
+          512,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "position_embeddings_0": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "position_embeddings_0",
+        "shape": [
+          1,
+          512,
+          64
+        ],
+        "dtype": "float32"
+      }
+    },
+    "merged_merged_merged_lift_scaled_dot_product_attention_masked": {
+      "op": "LoopOp",
+      "op_fields": {
+        "body": [
+          "Load(name='in0', input='scaled_dot_product_attention_mask_fill', index=(Literal(value=0, dtype='int'),))",
+          "Load(name='in1', input='scaled_dot_product_attention_mask_zero', index=(Literal(value=0, dtype='int'),))",
+          "Load(name='in2', input='scaled_dot_product_attention_scale', index=(Literal(value=0, dtype='int'),))",
+          "Loop(axis=Axis(name='a0', extent=32), body=(Loop(axis=Axis(name='a1', extent=512), body=(Loop(axis=Axis(name='a2', extent=512), body=(Loop(axis=Axis(name='a3', extent=64), body=(Load(name='in3', input='merged_lift_linear_1_reduce', index=(Literal(value=0, dtype='int'), Var(name='a2'), Literal(value=0, dtype='int'), BinaryExpr(op='+', left=BinaryExpr(op='*', left=BinaryExpr(op='/', left=Var(name='a0'), right=Literal(value=8, dtype='int')), right=Literal(value=64, dtype='int')), right=BinaryExpr(op='+', left=TernaryExpr(cond=BinaryExpr(op='<', left=Var(name='a3'), right=Literal(value=32, dtype='int')), if_true=Var(name='a3'), if_false=Literal(value=0, dtype='int')), right=Literal(value=32, dtype='int'))))), Load(name='in4', input='merged_lift_linear_reduce', index=(Literal(value=0, dtype='int'), Var(name='a1'), Literal(value=0, dtype='int'), BinaryExpr(op='+', left=BinaryExpr(op='*', left=Var(name='a0'), right=Literal(value=64, dtype='int')), right=BinaryExpr(op='+', left=TernaryExpr(cond=BinaryExpr(op='<', left=Var(name='a3'), right=Literal(value=32, dtype='int')), if_true=Var(name='a3'), if_false=Literal(value=0, dtype='int')), right=Literal(value=32, dtype='int'))))), Load(name='in5', input='merged_lift_linear_1_reduce', index=(Literal(value=0, dtype='int'), Var(name='a2'), Literal(value=0, dtype='int'), BinaryExpr(op='+', left=BinaryExpr(op='*', left=BinaryExpr(op='/', left=Var(name='a0'), right=Literal(value=8, dtype='int')), right=Literal(value=64, dtype='int')), right=TernaryExpr(cond=BinaryExpr(op='<', left=Var(name='a3'), right=Literal(value=32, dtype='int')), if_true=Literal(value=0, dtype='int'), if_false=BinaryExpr(op='-', left=Var(name='a3'), right=Literal(value=32, dtype='int')))))), Assign(name='v0', op=ElementwiseImpl('negative'), args=('in3',)), Load(name='in6', input='merged_lift_linear_reduce', index=(Literal(value=0, dtype='int'), Var(name='a1'), Literal(value=0, dtype='int'), BinaryExpr(op='+', left=BinaryExpr(op='*', left=Var(name='a0'), right=Literal(value=64, dtype='int')), right=TernaryExpr(cond=BinaryExpr(op='<', left=Var(name='a3'), right=Literal(value=32, dtype='int')), if_true=Literal(value=0, dtype='int'), if_false=BinaryExpr(op='-', left=Var(name='a3'), right=Literal(value=32, dtype='int')))))), Assign(name='v1', op=ElementwiseImpl('negative'), args=('in4',)), Load(name='in7', input='position_embeddings_1', index=(Literal(value=0, dtype='int'), Var(name='a2'), Var(name='a3'))), Select(name='v2', branches=(SelectBranch(value='v0', select=BinaryExpr(op='<', left=Var(name='a3'), right=Literal(value=32, dtype='int'))), SelectBranch(value='in5', select=Literal(value=1, dtype='int')))), Load(name='in8', input='position_embeddings_0', index=(Literal(value=0, dtype='int'), Var(name='a2'), Var(name='a3'))), Load(name='in9', input='merged_lift_linear_1_reduce', index=(Literal(value=0, dtype='int'), Var(name='a2'), Literal(value=0, dtype='int'), BinaryExpr(op='+', left=BinaryExpr(op='*', left=BinaryExpr(op='/', left=Var(name='a0'), right=Literal(value=8, dtype='int')), right=Literal(value=64, dtype='int')), right=Var(name='a3')))), Load(name='in10', input='position_embeddings_1', index=(Literal(value=0, dtype='int'), Var(name='a1'), Var(name='a3'))), Select(name='v3', branches=(SelectBranch(value='v1', select=BinaryExpr(op='<', left=Var(name='a3'), right=Literal(value=32, dtype='int'))), SelectBranch(value='in6', select=Literal(value=1, dtype='int')))), Load(name='in11', input='position_embeddings_0', index=(Literal(value=0, dtype='int'), Var(name='a1'), Var(name='a3'))), Load(name='in12', input='merged_lift_linear_reduce', index=(Literal(value=0, dtype='int'), Var(name='a1'), Literal(value=0, dtype='int'), BinaryExpr(op='+', left=BinaryExpr(op='*', left=Var(name='a0'), right=Literal(value=64, dtype='int')), right=Var(name='a3')))), Assign(name='v4', op=ElementwiseImpl('multiply'), args=('v2', 'in7')), Assign(name='v5', op=ElementwiseImpl('multiply'), args=('in9', 'in8')), Assign(name='v6', op=ElementwiseImpl('multiply'), args=('v3', 'in10')), Assign(name='v7', op=ElementwiseImpl('multiply'), args=('in12', 'in11')), Assign(name='v8', op=ElementwiseImpl('add'), args=('v5', 'v4')), Assign(name='v9', op=ElementwiseImpl('add'), args=('v7', 'v6')), Assign(name='v10', op=ElementwiseImpl('multiply'), args=('v9', 'v8')), Accum(name='acc0', value='v10', op=ElementwiseImpl('add'))), unroll=False), Select(name='v11', branches=(SelectBranch(value='in1', select=BinaryExpr(op='<=', left=Var(name='a2'), right=Var(name='a1'))), SelectBranch(value='in0', select=BinaryExpr(op='>', left=Var(name='a2'), right=Var(name='a1'))))), Assign(name='v12', op=ElementwiseImpl('multiply'), args=('acc0', 'in2')), Assign(name='v13', op=ElementwiseImpl('add'), args=('v12', 'v11')), Write(output='merged_merged_merged_lift_scaled_dot_product_attention_masked', index=(Literal(value=0, dtype='int'), Var(name='a0'), Var(name='a1'), Var(name='a2')), value='v13')), unroll=False),), unroll=False),), unroll=False)"
+        ]
+      },
+      "inputs": [
+        "scaled_dot_product_attention_mask_fill",
+        "scaled_dot_product_attention_mask_zero",
+        "scaled_dot_product_attention_scale",
+        "merged_lift_linear_1_reduce",
+        "merged_lift_linear_reduce",
+        "position_embeddings_1",
+        "position_embeddings_0"
+      ],
+      "output": {
+        "name": "scaled_dot_product_attention_masked",
+        "shape": [
+          1,
+          32,
+          512,
+          512
+        ],
+        "dtype": "float32"
+      }
+    }
+  }
+}

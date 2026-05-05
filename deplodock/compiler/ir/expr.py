@@ -122,6 +122,57 @@ def _coerce(v: Expr | int | float) -> Expr:
     return v
 
 
+def apply_binop(op: str, lv: object, rv: object) -> object:
+    """Apply a BinOp to two already-evaluated values.
+
+    Pure helper — no env coupling. Shared by ``BinOp.eval`` (numpy-aware
+    evaluation) and ``ir.simplify`` (constant folding on Literal children).
+    Values may be scalars or numpy ndarrays; arithmetic composes via numpy
+    broadcasting. Integer floor division is used for both ``/`` and ``//``.
+    """
+    if op == "+":
+        return lv + rv
+    if op == "-":
+        return lv - rv
+    if op == "*":
+        return lv * rv
+    if op in ("/", "//"):
+        try:
+            return int(lv) // int(rv)
+        except TypeError:
+            return lv // rv
+    if op == "%":
+        try:
+            return int(lv) % int(rv)
+        except TypeError:
+            return lv % rv
+    if op == "<":
+        return lv < rv
+    if op == "<=":
+        return lv <= rv
+    if op == ">":
+        return lv > rv
+    if op == ">=":
+        return lv >= rv
+    if op == "==":
+        return lv == rv
+    if op == "&&":
+        try:
+            return bool(lv) and bool(rv)
+        except (TypeError, ValueError):
+            import numpy as np
+
+            return np.logical_and(lv, rv)
+    if op == "||":
+        try:
+            return bool(lv) or bool(rv)
+        except (TypeError, ValueError):
+            import numpy as np
+
+            return np.logical_or(lv, rv)
+    raise ValueError(f"Unknown BinOp: {op}")
+
+
 # ---------------------------------------------------------------------------
 # Expression types
 # ---------------------------------------------------------------------------
@@ -201,7 +252,7 @@ class BinaryExpr(_ExprOps):
     coercion would raise).
     """
 
-    op: str  # "+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "&&", "||"
+    op: str  # "+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "&&", "||", "^"
     left: Expr
     right: Expr
 
@@ -244,6 +295,8 @@ class BinaryExpr(_ExprOps):
                 return bool(lv) or bool(rv)
             except (TypeError, ValueError):
                 return np.logical_or(lv, rv)
+        if op == "^":
+            return int(lv) ^ int(rv)
         raise ValueError(f"Unknown BinaryExpr: {op}")
 
     def pretty(self) -> str:
@@ -534,6 +587,9 @@ _PRECEDENCE: dict[str, int] = {
     ">": 4,
     "<=": 4,
     ">=": 4,
+    "^": 4,  # bitwise XOR — match relational so ``a ^ b + c`` always parens
+    "&": 4,  # bitwise AND — same intent: ``a & b * c`` must paren as ``(a & b) * c``
+    "|": 4,  # bitwise OR — symmetric with ``&`` / ``^``
     "+": 5,
     "-": 5,
     "*": 6,

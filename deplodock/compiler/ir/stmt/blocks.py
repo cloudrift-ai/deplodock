@@ -7,13 +7,11 @@ decode helpers used by ``Tile.render`` live alongside.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Expr, _float_lit
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _axis_identity, _pad, pretty_body
+from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum
 
@@ -36,7 +34,7 @@ class Loop(Stmt):
     serial (post-materialization) loops inside cooperative blocks.
 
     ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
-    time. Set by scheduling passes (``unroll_small_loops``); has no
+    time. Set by scheduling passes (``mark_unroll``); has no
     effect on the IR's iteration semantics.
     """
 
@@ -67,17 +65,6 @@ class Loop(Stmt):
     def is_reduce(self) -> bool:
         """A loop is a reduce-loop iff its immediate body contains an ``Accum``."""
         return any(isinstance(s, Accum) for s in self.body)
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        """Recursive rewrite: rebuild ``body`` with each child's ``rewrite``.
-        ``axis`` is mapped through ``axis_fn`` (default identity)."""
-        return Loop(
-            axis=axis_fn(self.axis),
-            body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body),
-            unroll=self.unroll,
-        )
 
     def pretty(self, indent: str = "") -> list[str]:
         kind = "reduce" if self.is_reduce else "free"
@@ -146,12 +133,6 @@ class Tile(Stmt):
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset(ba.axis.name for ba in self.axes)
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        new_axes = tuple(BoundAxis(axis=axis_fn(ba.axis), bind=ba.bind) for ba in self.axes)
-        return Tile(axes=new_axes, body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body))
 
     @property
     def thread_axes(self) -> tuple[Axis, ...]:
@@ -297,17 +278,6 @@ class StridedLoop(Stmt):
         """A strided loop is a reduce-loop iff its immediate body contains an ``Accum``."""
         return any(isinstance(s, Accum) for s in self.body)
 
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return StridedLoop(
-            axis=axis_fn(self.axis),
-            start=sigma.apply(self.start),
-            step=sigma.apply(self.step) if isinstance(self.step, Expr) else self.step,
-            body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body),
-            unroll=self.unroll,
-        )
-
     def pretty(self, indent: str = "") -> list[str]:
         kind = "reduce" if self.is_reduce else "free"
         unroll = " unroll" if self.unroll else ""
@@ -386,15 +356,6 @@ class Cond(Stmt):
 
     def exprs(self) -> tuple[Expr, ...]:
         return (self.cond,)
-
-    def rewrite(
-        self, rename_ssa: Callable[[str], str], sigma: Sigma = Sigma.IDENTITY, axis_fn: Callable[[Axis], Axis] = _axis_identity
-    ) -> Stmt:
-        return Cond(
-            cond=sigma.apply(self.cond),
-            body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.body),
-            else_body=tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in self.else_body),
-        )
 
     def pretty(self, indent: str = "") -> list[str]:
         lines = [f"{indent}if ({self.cond.pretty()}):", *pretty_body(self.body, indent + INDENT)]

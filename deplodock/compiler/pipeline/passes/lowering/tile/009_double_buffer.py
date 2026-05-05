@@ -42,7 +42,7 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_k_outer, single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, is_matmul_k_outer, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -68,37 +68,52 @@ def _maybe_rewrite(body: Body) -> Body | None:
 
 
 def _process_scope(body: Body) -> Body:
-    """Walk the body looking for K-outer Loops eligible for double-buffering."""
+    """Walk the body looking for K-outer Loops eligible for double-buffering.
+
+    Tracks ``invariant_names`` — the set of SSA names defined by
+    sibling stmts that precede each K-outer Loop. Cross-loop SSA
+    reads that resolve into this set are loop-invariant w.r.t. the
+    K-outer being considered (a sibling reduce above produced the
+    name; the value is finalized before this K-outer starts), so the
+    pass can safely double-buffer the loop. Reads that don't resolve
+    locally *and* aren't in the invariant set are still rejected —
+    those are the in-loop-online-softmax-style merges the original
+    gate guarded against.
+    """
     new_body: list[Stmt] = list(body)
     changed = False
+    invariant_names: set[str] = set()
     for i, s in enumerate(body):
-        if not isinstance(s, Loop) or s.is_reduce:
-            continue
-        if not _is_kouter_matmul(s):
-            continue
-        if any(isinstance(st, BufferedStage) for st in s.body):
-            continue
-        stages = [st for st in s.body if isinstance(st, Stage)]
-        # Stages here are not yet BufferedStage; smem_bytes is the
-        # single-slot footprint, ×_BUFFER_COUNT for the post-DB total.
-        if _BUFFER_COUNT * sum(st.smem_bytes for st in stages) > _SMEM_BUDGET_BYTES:
-            continue
-        updated = _double_buffer(s)
-        if updated is not None:
-            new_body[i] = updated
-            changed = True
+        if isinstance(s, Loop) and not s.is_reduce and _is_kouter_matmul(s, invariant_names):
+            if not any(isinstance(st, BufferedStage) for st in s.body):
+                stages = [st for st in s.body if isinstance(st, Stage)]
+                if _BUFFER_COUNT * sum(st.smem_bytes for st in stages) <= _SMEM_BUDGET_BYTES:
+                    updated = _double_buffer(s)
+                    if updated is not None:
+                        new_body[i] = updated
+                        changed = True
+        invariant_names.update(collect_invariant_names(s))
     return tuple(new_body) if changed else body
 
 
-def _is_kouter_matmul(loop: Loop) -> bool:
+def _is_kouter_matmul(loop: Loop, invariant_names: set[str]) -> bool:
     """K-outer-matmul predicate: extent ≥ 2, ≥ 1 Stage in body, and a
     pure-matmul reduce body with no in-loop online-softmax-style merge
     (no body stmt reads a local Accum target's running value).
 
+    Cross-loop SSA reads are allowed when the referenced names are in
+    ``invariant_names`` — names defined by sibling stmts at the K-outer's
+    enclosing scope, before the K-outer Loop. Those values are
+    finalized before this K-outer starts, so 015's pipeline rewrite
+    can keep them in registers across the steady-state without the
+    synchronous-double-buffer + TMA-mbarrier deadlock the original
+    gate was designed to avoid.
+
     Layered on the shared ``is_matmul_k_outer`` (which handles the
     base shape — non-reduce free Loop wrapping a single reduce with
     a pure-compute body that has at least one Accum) plus the
-    rule-specific ``extra_gate``."""
+    rule-specific ``extra_gate``.
+    """
 
     def gate(k_outer: Loop, k_inner: Loop) -> bool:
         if int(k_outer.axis.extent) < 2:
@@ -115,6 +130,15 @@ def _is_kouter_matmul(loop: Loop) -> bool:
                 continue
             if any(isinstance(s, Accum) for s in k_inner.body.deps_of(c)):
                 return False
+        # Cross-loop-deps gate, relaxed: reject only when an unresolved
+        # dep is *not* in ``invariant_names``. Names produced by sibling
+        # stmts above this K-outer (prior softmax max/sum reduces, hoisted
+        # reciprocals, etc.) are loop-invariant and safe to read from
+        # smem ring-buffered slabs without phase rotation.
+        for c in k_inner.body:
+            for d, defstmt in zip(c.deps(), k_inner.body.deps_of(c), strict=False):
+                if defstmt is None and d not in invariant_names:
+                    return False
         return True
 
     return is_matmul_k_outer(loop, extra_gate=gate)

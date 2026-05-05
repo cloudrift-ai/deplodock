@@ -14,8 +14,9 @@ from math import prod
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp
-from deplodock.compiler.ir.cuda import CudaOp
+from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
 from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
+from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
 from deplodock.compiler.pipeline.engine import Pattern
 
@@ -41,13 +42,40 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
     runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
     grid, block = _launch_geometry(root.op)
+    # TMA descriptors are kernel parameters that come *after* the buffer
+    # args (matching the signature emitted by ``render_kernelop``).
+    # Collect dedup'd metadata so the backend can encode + bind them.
+    desc_stmts = root.op.body.iter_of_type(TmaDescriptor)
+    seen: set[str] = set()
+    descriptors: list[TmaDescMeta] = []
+    desc_names: list[str] = []
+    for s in desc_stmts:
+        if s.name in seen:
+            continue
+        seen.add(s.name)
+        descriptors.append(
+            TmaDescMeta(name=s.name, src_buf=s.src_buf, box_extents=s.box_extents, swizzle=s.swizzle),
+        )
+        desc_names.append(s.name)
+    # Outputs receiving atomic-reduction writes (cross-CTA split-K) must be
+    # zero-initialized before each launch so per-CTA partials accumulate
+    # cleanly. Anything else can keep its prior contents.
+    atomic_outputs: list[str] = []
+    seen_atomic: set[str] = set()
+    output_set = set(root.op.outputs)
+    for s in root.op.writes:
+        if s.reduce_op is not None and s.output in output_set and s.output not in seen_atomic:
+            seen_atomic.add(s.output)
+            atomic_outputs.append(s.output)
     root.op = CudaOp(
         kernel_source=render_kernelop(root.op, shapes=shapes, literal_constants=literal_constants),
         kernel_name=root.op.name,
-        arg_order=(*runtime_inputs, *root.op.outputs),
+        arg_order=(*runtime_inputs, *root.op.outputs, *desc_names),
         grid=grid,
         block=block,
         smem_bytes=_smem_bytes(root.op),
+        tma_descriptors=tuple(descriptors),
+        zero_outputs=tuple(atomic_outputs),
     )
     return None
 

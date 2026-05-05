@@ -130,7 +130,16 @@ class CompilerDump:
         kernel node plus its transitive ``InputOp`` / ``ConstantOp``
         producers, so it can be loaded standalone via
         ``deplodock run --ir <subgraph>.json --bench`` for per-kernel
-        diagnosis."""
+        diagnosis. Also writes ``<prefix>.kernels/<kname>.txt`` with
+        the op's pretty-printed body (CUDA source for ``CudaOp``,
+        loop / kernel IR for the lower-level dialects) so the readable
+        version is co-located with the sub-graph reproducer.
+
+        Multiple ``CudaOp`` nodes that share a ``kernel_name`` (a single
+        kernel reused at several launch sites) are deduped on the
+        ``.txt`` side — the body is identical so writing it once is
+        enough — but each launch still gets its own ``.json``
+        sub-graph since the input bindings differ per node."""
         from deplodock.compiler.graph import Graph as _Graph
         from deplodock.compiler.ir.base import InputOp
         from deplodock.compiler.ir.cuda.ir import CudaOp
@@ -146,6 +155,7 @@ class CompilerDump:
         out_dir = self.dir / f"{prefix}.kernels"
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        seen_cuda: set[str] = set()
         for nid, node in compute_nodes:
             kname = getattr(node.op, "kernel_name", None) or getattr(node.op, "name", None) or nid
             keep_ids, synthetic_ids = self._collect_kernel_ancestors(graph, nid, compute_types)
@@ -165,6 +175,15 @@ class CompilerDump:
             sub.outputs.append(nid)
             safe = self._safe_filename(kname)
             self._write_json(f"{prefix}.kernels/{safe}.json", sub.to_dict())
+            # Co-locate the pretty body. Skip duplicate CUDA kernel
+            # names (same body across reuse sites).
+            if isinstance(node.op, CudaOp):
+                if kname in seen_cuda:
+                    continue
+                seen_cuda.add(kname)
+            body = node.op.pretty_body()
+            if body is not None:
+                self._write_text(f"{prefix}.kernels/{safe}.txt", body)
 
     def _collect_kernel_ancestors(self, graph: Graph, root_id: str, compute_types: tuple) -> tuple[set[str], set[str]]:
         """Collect ``root_id`` + transitive ConstantOp / InputOp ancestors.
