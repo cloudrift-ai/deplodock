@@ -311,6 +311,10 @@ def _apply_rules(
                     # before/after render text.
                     debug_on = logger.isEnabledFor(logging.DEBUG)
                     pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes}
+                    # Output-name → pre-rewrite node id so the formatter
+                    # can follow renames (rules like ``tileify`` mutate
+                    # the op AND ``rename_node`` to a friendlier id).
+                    pre_names = {graph.nodes[nid].output.name: nid for nid in pre_ops if nid in graph.nodes}
                     kwargs = _build_rewrite_kwargs(rule, graph, match)
                     if kwargs is None:
                         continue
@@ -330,7 +334,7 @@ def _apply_rules(
                         # from ``graph.nodes`` even though the rule did
                         # apply).
                         if any(nid not in graph.nodes or graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops):
-                            text = _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name)
+                            text = _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name, pre_names=pre_names)
                             if debug_on:
                                 from deplodock.compiler.pipeline.rule_diff import emit
 
@@ -385,22 +389,52 @@ def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Gr
     return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id}")
 
 
-def _format_inplace_application(name: str, graph: Graph, match: Match, pre_ops: dict, *, pass_name: str | None = None) -> str:
+def _format_inplace_application(
+    name: str,
+    graph: Graph,
+    match: Match,
+    pre_ops: dict,
+    *,
+    pass_name: str | None = None,
+    pre_names: dict[str, str] | None = None,
+) -> str:
     """Snapshot for rules that mutate ``node.op`` in place and return
-    None (e.g. lowering/tile). Renders the before/after of the mutated
+    None (e.g. lowering/tile). Renders before/after of the mutated
     nodes as a unified diff by swapping their op temporarily for the
-    "before" view."""
+    "before" view.
+
+    Some rules (notably ``tileify``) mutate the op AND rename the node
+    to a friendlier id. ``pre_names`` (output-name → pre-rewrite id)
+    lets the formatter resolve a renamed-away id to its post-rewrite
+    counterpart by matching on output name, which is preserved across
+    ``rename_node``."""
     from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
 
-    mutated = [nid for nid, prev in pre_ops.items() if nid in graph.nodes and graph.nodes[nid].op is not prev]
-    post_ops = {nid: graph.nodes[nid].op for nid in mutated}
-    for nid in mutated:
-        graph.nodes[nid].op = pre_ops[nid]
-    before_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
+    # Build a "current id" for each pre_ops entry, following any rename
+    # that happened during the rewrite.
+    name_to_post_id = {graph.nodes[nid].output.name: nid for nid in graph.nodes} if pre_names else {}
+    pre_to_post: dict[str, str] = {}
+    for nid in pre_ops:
+        if nid in graph.nodes:
+            pre_to_post[nid] = nid
+        elif pre_names is not None:
+            for out_name, old_id in pre_names.items():
+                if old_id == nid and out_name in name_to_post_id:
+                    pre_to_post[nid] = name_to_post_id[out_name]
+                    break
+
+    mutated_pre = [nid for nid in pre_ops if nid in pre_to_post and graph.nodes[pre_to_post[nid]].op is not pre_ops[nid]]
+    post_ids = [pre_to_post[nid] for nid in mutated_pre]
+    post_ops = {pid: graph.nodes[pid].op for pid in post_ids}
+    # Render "before": swap each post-id node's op back to the pre op.
+    for nid in mutated_pre:
+        graph.nodes[pre_to_post[nid]].op = pre_ops[nid]
+    before_nodes = [graph.nodes[pid] for pid in graph.topological_order() if pid in post_ids]
     before = _format_nodes(before_nodes, graph)
-    for nid in mutated:
-        graph.nodes[nid].op = post_ops[nid]
-    after_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
+    # Restore.
+    for pid in post_ids:
+        graph.nodes[pid].op = post_ops[pid]
+    after_nodes = [graph.nodes[pid] for pid in graph.topological_order() if pid in post_ids]
     after = _format_nodes(after_nodes, graph)
     return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id} (in-place)")
 
