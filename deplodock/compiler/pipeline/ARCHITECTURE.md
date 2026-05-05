@@ -8,6 +8,7 @@ Pattern-based rewrite engine + pass directories + dump hooks.
 pipeline/
 ├── engine.py      # Pattern, Match, match_pattern, run_rule, run_pass, run_pipeline, splice
 ├── dump.py        # CompilerDump + on_pass dispatch
+├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
 └── passes/
     ├── frontend/
     │   ├── decomposition/  # frontend ops → tensor-IR primitives
@@ -108,6 +109,28 @@ each op's own `pretty_body()`. Node ids accumulate `merged_` per
 fusion step and a leading `lift_` from lifting; `_canonical_node_id`
 collapses both for display, and the rendered body is rewritten with
 the same map so `Load`/`Write` references match.
+
+## Per-rule diff output (`rule_diff.py`)
+
+At `compile -vv` (DEBUG log level) the engine emits one block per rule application: a unified diff between the
+matched subgraph before the rewrite and the rewritten fragment, bracketed by `>>> <pass>:NNN_rulename` and
+`<<< <pass>:NNN_rulename` markers on their own lines. The `<pass>` prefix is the single-letter shorthand from
+`PASS_SHORTHAND` (`d`=decomposition, `o`=optimization, `l`=lifting, `f`=fusion, `t`=tile, `k`=kernel, `c`=cuda) —
+the same letters the CLI accepts in `--passes dolft`. Skipped rules (`RuleSkipped` exception) collapse to a
+one-liner `--- <pass>:NNN_rulename skipped at <root>: <reason>`.
+
+`PASS_SHORTHAND` is the single source of truth: `commands/compile.py` imports it to build its `--passes` shortcut
+expander, so the CLI flag and the `-vv` marker prefix can never drift.
+
+The bracketing makes per-rule and per-pass slicing trivial — `awk '/^>>> t:005/,/^<<< t:005/'` extracts a
+single rule's diff and `awk '/^>>> t:/,/^<<< t:/'` extracts the entire tile-lowering pass. ANSI color (`+` green, `-` red, `@@` cyan) is applied only inside the diff body, so the markers
+stay plain ASCII and `awk` matches reliably even on colored output. Color follows
+`compile --color {auto,always,never}` (default `auto`: tty-aware, honors `NO_COLOR`); diff context and a
+fallback line cap are tuned via `--diff-context N` and `--diff-max-lines N`. `RuleRenderConfig` is set once from
+`commands/compile.py:handle_compile` via `rule_diff.set_config()`.
+
+The structured `.rules.json` dump under `DEPLODOCK_DUMP_DIR` is unaffected — the diff is purely a presentation
+layer for the human-readable `_rule_texts` channel.
 
 ## Fragment splice (`engine._apply_replacement`)
 

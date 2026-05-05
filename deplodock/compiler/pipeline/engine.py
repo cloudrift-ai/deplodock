@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.pipeline.dump import _canonical_node_id
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
@@ -319,7 +318,9 @@ def _apply_rules(
                         fragment = rule.rewrite(**kwargs)
                     except RuleSkipped as exc:
                         if debug_on:
-                            logger.debug("rule %s skipped at %s: %s", rule.name, _canonical_node_id(match.root_node_id), exc.reason)
+                            from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped
+
+                            emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
                         rewrite_time += time.monotonic() - t1
                         continue
                     if fragment is None:
@@ -329,18 +330,22 @@ def _apply_rules(
                         # from ``graph.nodes`` even though the rule did
                         # apply).
                         if any(nid not in graph.nodes or graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops):
-                            text = _format_inplace_application(rule.name, graph, match, pre_ops)
+                            text = _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name)
                             if debug_on:
-                                logger.debug(text)
+                                from deplodock.compiler.pipeline.rule_diff import emit
+
+                                emit(text)
                             if dump is not None and pass_idx is not None and pass_name is not None:
                                 record = _record_inplace_application(graph, match, pre_ops)
                                 dump.on_rule(pass_idx, pass_name, rule.name, record, text)
                             applied += 1
                         rewrite_time += time.monotonic() - t1
                         continue
-                    text = _format_rule_application(rule.name, graph, match, fragment)
+                    text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name)
                     if debug_on:
-                        logger.debug(text)
+                        from deplodock.compiler.pipeline.rule_diff import emit
+
+                        emit(text)
                     if dump is not None and pass_idx is not None and pass_name is not None:
                         record = _record_rule_application(graph, match, fragment)
                         dump.on_rule(pass_idx, pass_name, rule.name, record, text)
@@ -364,42 +369,40 @@ def _apply_rules(
 # ---------------------------------------------------------------------------
 
 
-def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Graph) -> str:
-    """Render a one-rule-application snapshot: matched subgraph (the
-    nodes selected from the host graph) + rewritten fragment. Kernel
+def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Graph, *, pass_name: str | None = None) -> str:
+    """Render a one-rule-application snapshot as a unified diff bracketed
+    by ``>>> name`` / ``<<< name`` markers (see ``rule_diff``). Kernel
     ops (LoopOp/TileOp/KernelOp/CudaOp) are pretty-printed via their
     dedicated printers rather than dumped as a body repr."""
+    from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
+
     matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
     matched_ids.add(match.root_node_id)
-
-    lines = [f"=== rule {name} matched at {_canonical_node_id(match.root_node_id)} ==="]
-    lines.append("before:")
     matched_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes]
-    lines.extend(f"    {line}" for line in _format_nodes(matched_nodes, graph).splitlines())
-    lines.append("after:")
+    before = _format_nodes(matched_nodes, graph)
     frag_nodes = [fragment.nodes[nid] for nid in fragment.topological_order()]
-    lines.extend(f"    {line}" for line in _format_nodes(frag_nodes, fragment).splitlines())
-    return "\n".join(lines)
+    after = _format_nodes(frag_nodes, fragment)
+    return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id}")
 
 
-def _format_inplace_application(name: str, graph: Graph, match: Match, pre_ops: dict) -> str:
+def _format_inplace_application(name: str, graph: Graph, match: Match, pre_ops: dict, *, pass_name: str | None = None) -> str:
     """Snapshot for rules that mutate ``node.op`` in place and return
-    None (e.g. lowering/tile). Renders before/after of the mutated
-    nodes by swapping their op temporarily for the "before" view."""
+    None (e.g. lowering/tile). Renders the before/after of the mutated
+    nodes as a unified diff by swapping their op temporarily for the
+    "before" view."""
+    from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
+
     mutated = [nid for nid, prev in pre_ops.items() if nid in graph.nodes and graph.nodes[nid].op is not prev]
-    lines = [f"=== rule {name} matched at {_canonical_node_id(match.root_node_id)} (in-place) ==="]
-    lines.append("before:")
     post_ops = {nid: graph.nodes[nid].op for nid in mutated}
     for nid in mutated:
         graph.nodes[nid].op = pre_ops[nid]
     before_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
-    lines.extend(f"    {line}" for line in _format_nodes(before_nodes, graph).splitlines())
+    before = _format_nodes(before_nodes, graph)
     for nid in mutated:
         graph.nodes[nid].op = post_ops[nid]
-    lines.append("after:")
     after_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
-    lines.extend(f"    {line}" for line in _format_nodes(after_nodes, graph).splitlines())
-    return "\n".join(lines)
+    after = _format_nodes(after_nodes, graph)
+    return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id} (in-place)")
 
 
 def _record_rule_application(graph: Graph, match: Match, fragment: Graph) -> dict:
