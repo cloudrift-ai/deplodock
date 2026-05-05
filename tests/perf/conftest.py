@@ -114,7 +114,7 @@ def bench_pair(request):
     doesn't gate on it.
     """
 
-    def _run(case: Case, *, warmup: int = 10, iters: int = 200) -> PerfRow:
+    def _run(case: Case, *, warmup: int = 10, iters: int = 100) -> PerfRow:
         import torch
 
         from deplodock.compiler.backend.cuda.backend import CudaBackend
