@@ -12,6 +12,11 @@ Three-class matmul tile, picked from the logical output extents:
   asymmetric cuBLAS-style ``(BN=128, BM=64, F_M=8, F_N=4)`` validated
   at 105% of cuBLAS on 2048² fp32 RTX 5090. Splitk waves target = 8.
 
+Orthogonal **narrow-M** override: ``M ≤ 64`` (s32-class) drops the
+splitk-waves target to 2 regardless of tile class — the M-axis grid
+collapses to 1 and the high waves target inflates atomic-add contention.
+Tile shape is unchanged (the BM=64 default covers M=32 already).
+
 Sweep on RTX 5090 fp32: this 3-class split cuts kv_proj.s512 ~48µs →
 ~20µs, kv_proj.s128 ~30µs → ~13µs, sdpa.tinyllama.s512 ~456µs → ~178µs,
 gate_proj.s512 (qwen) ~1430µs → ~1320µs. Env vars override per-axis.
@@ -77,6 +82,14 @@ _F_PER_AXIS_COMPACT = (8, 4)
 _HUGE_M_MIN = 256
 _HUGE_N_MIN = 8192
 _COMPACT_N_MAX = 1024
+# Narrow-M cap: when ``M ≤ _NARROW_M_MAX`` the matmul's grid_M collapses
+# to 1 (BM=64 covers the whole M extent), so each output cell sees only
+# a single CTA's worth of work — auto-splitk's "fill 8 waves" target
+# inflates splitk to ~32, and the resulting 32 atomic-adds-per-output
+# dominate. Sweep on RTX 5090 fp32: dropping the waves target to 2 for
+# narrow-M cuts tinyllama.o_proj.s32 ~33µs → ~14µs and qwen.q_proj.s32
+# ~42µs → ~37µs without regressing any other M=32 shape.
+_NARROW_M_MAX = 64
 
 # Per-stage K-tile, M-adaptive. Sweep on TinyLlama Q/Gate/Down at seq ∈
 # {32, 128, 512} on RTX 5090 fp32: M ≤ 256 → BK=64 wins (small grid, K
@@ -295,7 +308,9 @@ _SPLITK_NUM_SMS = 170  # RTX 5090; conservative upper bound for sm_120
 
 
 def _splitk_target_waves(tile: Tile | None) -> int:
-    default = _SPLITK_TARGET_WAVES_SMALL if _tile_class(tile) == "compact" else _SPLITK_TARGET_WAVES_LARGE
+    cls = _tile_class(tile)
+    narrow_m = tile is not None and _has_matmul_reduce(tile.body) and 0 < _matmul_M(tile) <= _NARROW_M_MAX
+    default = _SPLITK_TARGET_WAVES_SMALL if (cls == "compact" or narrow_m) else _SPLITK_TARGET_WAVES_LARGE
     return _int_env("DEPLODOCK_SPLITK_WAVES", default)
 
 
