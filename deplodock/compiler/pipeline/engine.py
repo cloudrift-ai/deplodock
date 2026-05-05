@@ -480,7 +480,13 @@ def _format_nodes(nodes: list, graph: Graph) -> str:
     """Render a list of nodes as readable text. Kernel-IR ops use their
     own ``pretty_body``; everything else falls back to a ``name: ClsName(args)``
     one-liner. Scalar ``ConstantOp`` inputs are inlined as literals (same
-    treatment as ``format_kernels`` — see ``_inline_scalar_loads``)."""
+    treatment as ``format_kernels`` — see ``_inline_scalar_loads``).
+
+    The leading ``kernel <name>  inputs: ...  outputs: ...`` header that
+    ``TileOp.pretty_body`` prepends is stripped here: this path already
+    emits ``<output> = TileOp(<inputs>)`` one line above, so the kernel
+    header would just duplicate the same info and shift the body's
+    indent by 4 spaces, ballooning the diff."""
     from deplodock.compiler.graph import _fmt_op
     from deplodock.compiler.ir.base import ConstantOp, InputOp
     from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
@@ -499,8 +505,19 @@ def _format_nodes(nodes: list, graph: Graph) -> str:
         scalar_inputs = _scalar_constant_inputs(graph, node, ConstantOp)
         if scalar_inputs:
             body = _inline_scalar_loads(body, scalar_inputs)
-        lines.extend(f"  {line}" for line in body.splitlines())
+        body_lines = body.splitlines()
+        if body_lines and body_lines[0].lstrip().startswith("kernel ") and " inputs: " in body_lines[0] and " outputs: " in body_lines[0]:
+            body_lines = [_dedent(ln, 4) for ln in body_lines[1:]]
+        lines.extend(f"  {line}" for line in body_lines)
     return "\n".join(lines)
+
+
+def _dedent(line: str, n: int) -> str:
+    """Strip up to ``n`` leading spaces from ``line``."""
+    i = 0
+    while i < n and i < len(line) and line[i] == " ":
+        i += 1
+    return line[i:]
 
 
 # ---------------------------------------------------------------------------
