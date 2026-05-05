@@ -63,6 +63,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, StridedLoop
 from deplodock.compiler.ir.tile.ir import (
     BLOCK_SIZE,
@@ -204,6 +205,14 @@ def _rewrite_block(blk: Tile) -> Tile | None:
 
     # Phase 3: wrap the post-reduce tail (everything after the last
     # block-structured stmt) in a StridedLoop over the chosen naked axis.
+    #
+    # If a preceding reduce loop has the same extent as the naked axis,
+    # alias the naked axis name to that reduce axis name in the suffix.
+    # This makes the post-reduce Loads textually equal to the in-reduce
+    # Loads (e.g. softmax: ``x[..., a3]`` vs ``x[..., a4]`` collapse to
+    # ``x[..., a3]`` everywhere), so ``007_stage_inputs`` partitions
+    # them into a single Stage instead of allocating two identical
+    # smem buffers and double-loading the row from DRAM.
     if naked_axis is not None:
         split_idx = 0
         for i, s in enumerate(body_phase1):
@@ -211,7 +220,15 @@ def _rewrite_block(blk: Tile) -> Tile | None:
                 split_idx = i + 1
         prefix = body_phase1[:split_idx]
         suffix: list[Stmt] = body_phase1[split_idx:]
-        new_body: list[Stmt] = [*prefix, StridedLoop(axis=naked_axis, start=t_start, step=step, body=suffix)]
+        wrap_axis = naked_axis
+        for rl in reduce_loops:
+            if int(rl.axis.extent) == int(naked_axis.extent) and rl.axis.name != naked_axis.name:
+                wrap_axis = rl.axis
+                break
+        if wrap_axis is not naked_axis:
+            sigma = Sigma({naked_axis.name: Var(wrap_axis.name)})
+            suffix = [s.rewrite(lambda n: n, sigma) for s in suffix]
+        new_body: list[Stmt] = [*prefix, StridedLoop(axis=wrap_axis, start=t_start, step=step, body=suffix)]
     else:
         new_body = body_phase1
 
