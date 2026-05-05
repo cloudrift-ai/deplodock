@@ -1,5 +1,10 @@
-"""Split-K every matmul-shaped reduce Loop in a Tile body into outer
+"""Tile every matmul-shaped reduce Loop in a Tile body into outer
 (``K_o``) + inner (``K_i``) loops.
+
+This is intra-CTA K tiling — the runtime cross-CTA "split-K" strategy
+lives in ``003_split_matmul_k``, which runs after this and promotes
+``K_o`` to a grid dimension when the natural ``(M, N)`` grid doesn't
+fill the device.
 
 Matmul-only by design — the trigger is structural for dot-product
 reductions (≥2 distinct K-indexed buffer Loads + an Accum). Single-

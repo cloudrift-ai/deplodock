@@ -37,7 +37,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 def test_sdpa_seq512_fires_chunk_reduce(recording_dump):
     """SDPA at seq_len=512 produces a fused softmax + V-projection
-    kernel whose softmax reduces sit at K=512. ``002_split_matmul_k``
+    kernel whose softmax reduces sit at K=512. ``002_tile_matmul_k``
     only chunks the V-projection (matmul-shaped); the two softmax
     reduces stay at K=512 and ``stage_inputs`` would bail (32 KB slab)
     without ``006_chunk_reduce``."""
@@ -118,7 +118,7 @@ def test_qualifies_no_fanin_skipped():
 
 def test_qualifies_matmul_shape_skipped():
     """Two distinct buffers K-indexed + Accum → matmul-shaped, deferred
-    to ``002_split_matmul_k``."""
+    to ``002_tile_matmul_k``."""
     loop = Loop(
         axis=Axis("k", 512),
         body=(

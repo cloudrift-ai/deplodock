@@ -66,7 +66,7 @@ def is_matmul_reduce(loop: Loop) -> bool:
     K is ``loop.axis.name``) plus at least one ``Accum``.
 
     Doesn't check body purity — that lives in :func:`is_matmul_k_outer`.
-    Used directly by ``002_split_matmul_k`` (which needs to fire on
+    Used directly by ``002_tile_matmul_k`` (which needs to fire on
     matmul-shaped reduces wherever they sit, not only at the top level
     under a K-outer wrapper).
     """

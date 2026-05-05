@@ -28,7 +28,7 @@ Env vars:
 
 - ``DEPLODOCK_BN``, ``DEPLODOCK_BM`` — per-CTA tile (innermost N, outer M).
 - ``DEPLODOCK_FN``, ``DEPLODOCK_FM`` — per-thread output cells.
-- ``DEPLODOCK_BK`` — K-split size for ``002_split_matmul_k`` (subject
+- ``DEPLODOCK_BK`` — K-split size for ``002_tile_matmul_k`` (subject
   to ``K % BK == 0 and K > BK``). Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
 - ``DEPLODOCK_SPLITK_WAVES`` — override the auto-splitk waves target.
