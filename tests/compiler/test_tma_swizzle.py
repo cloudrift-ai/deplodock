@@ -11,7 +11,7 @@ Cross-checks four points in the env-flag matrix:
 
 Pinned to a matmul size large enough that the K-outer pipeline + the
 swizzle decoder both fire (``N=384`` triggers ``009_double_buffer``,
-``010_tma_copy``, and ``013_pipeline_async``). Swizzle-on at the
+``010_tma_copy``, and ``014_pipeline_async``). Swizzle-on at the
 default ``BN=128`` geometry stays at ``swizzle=NONE`` (inner = 512 B,
 no swizzle width matches), so the swizzle row only meaningfully runs
 when paired with ``BN=BM=32``.
@@ -91,7 +91,7 @@ def test_matmul_accuracy_across_tma_modes(monkeypatch, tma, swizzle, bn, bm):
 
 
 def test_swizzle_picker_pre_pass(monkeypatch):
-    """Picker (in ``010b_split_inner_for_swizzle``) maps inner byte size
+    """Picker (in ``011_split_inner_for_swizzle``) maps inner byte size
     to a ``(swizzle_mode, ips_fp32)`` pair. Wider-than-width extents pick
     the largest fitting width. Pure unit test, no CUDA needed."""
     import importlib
@@ -99,7 +99,7 @@ def test_swizzle_picker_pre_pass(monkeypatch):
     from deplodock.compiler.ir.tile.ir import SwizzleMode
 
     pick = importlib.import_module(
-        "deplodock.compiler.pipeline.passes.lowering.tile.010b_split_inner_for_swizzle",
+        "deplodock.compiler.pipeline.passes.lowering.tile.011_split_inner_for_swizzle",
     )._pick_split_swizzle
 
     monkeypatch.setenv("DEPLODOCK_TMA_SWIZZLE", "1")  # picker doesn't gate; just ensure no env effect

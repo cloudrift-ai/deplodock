@@ -15,10 +15,10 @@
   layer on top via the ``extra_gate`` callback.
 - :func:`compute_capability` — cached query of the active CUDA device's
   compute capability. Shared by passes that gate on hardware features
-  (``011_async_copy`` for cp.async, ``010_tma_copy`` for TMA).
+  (``012_async_copy`` for cp.async, ``010_tma_copy`` for TMA).
 - :func:`load_thread_axis_coeffs` / :func:`max_bank_conflict` —
   bank-conflict analysis for body Loads of a staged buffer. Used by
-  ``012_pad_smem`` (cp.async / sync stages, +1 padding).
+  ``013_pad_smem`` (cp.async / sync stages, +1 padding).
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
