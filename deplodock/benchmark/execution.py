@@ -31,6 +31,7 @@ from deplodock.provisioning.host import RemoteHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_transport import REMOTE_DEPLOY_DIR, make_run_cmd
 from deplodock.provisioning.staging import stage_to_remote
+from deplodock.redact import register_secret
 
 OnTaskDone = Callable[[BenchmarkTask, bool], Awaitable[None]]
 
@@ -104,6 +105,7 @@ async def run_execution_group(
     instance_info = None
     model_dir = config["benchmark"].get("model_dir", "/hf_models")
     hf_token = os.environ.get("HF_TOKEN", "")
+    register_secret(hf_token)
     providers_config = config.get("providers", {})
 
     group_label = group.label

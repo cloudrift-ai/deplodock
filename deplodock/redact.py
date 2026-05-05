@@ -15,9 +15,12 @@ _SECRET_ENV_VARS = [
 
 _MIN_SECRET_LENGTH = 8  # skip short values to avoid false positives
 
+# Values registered explicitly (e.g. resolved from a CLI flag that may not be in env).
+_explicit_secrets: set[str] = set()
+
 
 def _collect_secret_values() -> set[str]:
-    values = set()
+    values = set(_explicit_secrets)
     for var in _SECRET_ENV_VARS:
         val = os.environ.get(var, "")
         if len(val) >= _MIN_SECRET_LENGTH:
@@ -41,6 +44,19 @@ def _get_patterns() -> list[re.Pattern]:
     return _patterns
 
 
+def register_secret(value: str) -> None:
+    """Register an additional value to be redacted from logs.
+
+    Use at every site that resolves a secret from a CLI flag or other source
+    that may not be in os.environ when the redactor first scans (e.g. tokens
+    passed via `--hf-token`, `--api-key`).
+    """
+    global _patterns
+    if value and len(value) >= _MIN_SECRET_LENGTH and value not in _explicit_secrets:
+        _explicit_secrets.add(value)
+        _patterns = None  # invalidate cache so next redaction picks it up
+
+
 def redact_secrets(text: str) -> str:
     """Replace known secret env var values with '***'."""
     for pattern in _get_patterns():
@@ -57,9 +73,13 @@ def _apply(text: str, patterns: list[re.Pattern]) -> str:
 class SecretRedactingFilter(logging.Filter):
     """Logging filter that replaces secret values in log records with '***'.
 
-    Attaches to the root logger so all handlers benefit.
-    Handles both f-string messages (msg is pre-formatted) and
-    %-style messages (msg + args).
+    Must be attached to *Handlers*, not Loggers. Logger-level filters only run
+    on records originating from that logger; records propagating up from a
+    child logger bypass them. Handler-level filters run on every record the
+    handler processes, so they catch the propagation path too.
+
+    Use ``install_redaction(handler)`` rather than ``handler.addFilter(...)``
+    directly to keep wiring uniform across the codebase.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -72,3 +92,12 @@ class SecretRedactingFilter(logging.Filter):
                 elif isinstance(record.args, tuple):
                     record.args = tuple(_apply(str(a), patterns) if isinstance(a, str) else a for a in record.args)
         return True
+
+
+def install_redaction(handler: logging.Handler) -> None:
+    """Attach a SecretRedactingFilter to the given handler.
+
+    Always prefer this over Logger.addFilter(): only handler-attached filters
+    run for records that propagate up from child loggers.
+    """
+    handler.addFilter(SecretRedactingFilter())

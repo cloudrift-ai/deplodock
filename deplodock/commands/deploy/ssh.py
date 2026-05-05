@@ -17,6 +17,7 @@ from deplodock.provisioning.host import RemoteHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_target import parse_ssh_target
 from deplodock.recipe import resolve_for_hardware
+from deplodock.redact import register_secret
 
 logger = logging.getLogger(__name__)
 
@@ -57,13 +58,15 @@ async def _handle_ssh(args):
     strategy_cls = STRATEGIES[args.scale_out_strategy]
     recipe = strategy_cls().apply(recipe, gpu_count)
 
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
+    register_secret(hf_token)
     params = DeployParams(
         server=server,
         ssh_key=args.ssh_key,
         ssh_port=port,
         recipe=recipe,
         model_dir=args.model_dir,
-        hf_token=args.hf_token or os.environ.get("HF_TOKEN", ""),
+        hf_token=hf_token,
         dry_run=args.dry_run,
     )
     skip_nvidia = recipe.deploy.gpu is not None and recipe.deploy.gpu.startswith("AMD")

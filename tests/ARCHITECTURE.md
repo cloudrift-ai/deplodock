@@ -90,7 +90,7 @@ Test individual functions in isolation with synthetic inputs.
 | `planner/test_variant.py` | `Variant` — `__str__`, `gpu_short`, `gpu_count`, `__eq__`, `__hash__`, `_abbreviate()` |
 | `test_detect.py` | `_parse_sysfs_output()`, `detect_local_gpus()`, `detect_remote_gpus()` — PCI sysfs GPU detection, mixed GPU errors, mock SSH |
 | `test_hardware.py` | `resolve_instance_type()`, `gpu_short_name()`, `GPU_INSTANCE_TYPES` — hardware lookup tables |
-| `test_redact.py` | `deplodock.redact.redact_secrets()`, `SecretRedactingFilter` — value-based secret redaction for text and log records |
+| `test_redact.py` | `deplodock.redact.redact_secrets()`, `SecretRedactingFilter`, `install_redaction()`, `register_secret()` — value-based secret redaction for text and log records, plus end-to-end propagation through a real `FileHandler` (regression test for child-logger records bypassing logger-level filters) |
 | `benchmark/test_code_hash.py` | `BenchmarkTask.compute_code_hash()` — determinism, hex format |
 | `benchmark/test_run_dir.py` | `BenchmarkTask.create_run_dir()` — directory creation, naming format |
 | `benchmark/test_tasks_json.py` | `BenchmarkTask.write_tasks_json()`, `read_tasks_json()` — tasks.json round-trip |

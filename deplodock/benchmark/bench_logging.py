@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from deplodock.planner import ExecutionGroup
-from deplodock.redact import SecretRedactingFilter
+from deplodock.redact import install_redaction
 
 active_run_dir: contextvars.ContextVar[Path | None] = contextvars.ContextVar("active_run_dir", default=None)
 
@@ -62,8 +62,8 @@ def setup_logging():
     console_handler = logging.StreamHandler(sys.stdout)
     console_formatter = _BenchConsoleFormatter("[%(name)s] %(message)s")
     console_handler.setFormatter(console_formatter)
+    install_redaction(console_handler)
     root_logger.addHandler(console_handler)
-    root_logger.addFilter(SecretRedactingFilter())
 
 
 def add_file_handler(run_dir: Path) -> str:
@@ -84,6 +84,7 @@ def add_file_handler(run_dir: Path) -> str:
     )
     file_handler.setFormatter(file_formatter)
     file_handler.addFilter(_RunDirFilter(run_dir))
+    install_redaction(file_handler)
     logging.getLogger().addHandler(file_handler)
 
     return str(log_file)
@@ -130,6 +131,7 @@ def add_group_file_handler(run_dir: Path, group_label: str) -> logging.Handler:
     )
     file_handler.setFormatter(file_formatter)
     file_handler.addFilter(_GroupNameFilter(group_label, run_dir))
+    install_redaction(file_handler)
     logging.getLogger().addHandler(file_handler)
 
     return file_handler

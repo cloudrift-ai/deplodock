@@ -16,6 +16,7 @@ commands/vm ────► provisioning (create/delete instances)
 - `deplodock/deploy/` — compose generation, deploy orchestration
 - `deplodock/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
 - `deplodock/logging_setup.py` — CLI logging setup (`setup_cli_logging()`)
+- `deplodock/redact.py` — `redact_secrets()`, `SecretRedactingFilter`, `install_redaction()` (attach the filter to a handler — must be a handler, not a logger, so child-logger records that propagate up are still redacted), `register_secret()` (call after resolving any secret from a CLI flag — `--hf-token`, `--api-key` — or env var so its value is added to the redaction set)
 - `deplodock/benchmark/` — config, logging, workload, tasks, execution, structured JSON results
 
 ## Layers
