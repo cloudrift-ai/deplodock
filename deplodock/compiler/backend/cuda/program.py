@@ -371,8 +371,18 @@ def benchmark_program(
     input_data: dict[str, np.ndarray] | None = None,
     warmup: int = 5,
     num_iters: int = 20,
+    on_iter=None,
 ) -> BenchmarkResult:
-    """Time the graph's launches with per-kernel CUDA events."""
+    """Time the graph's launches with per-kernel CUDA events.
+
+    ``on_iter``, if provided, is a no-arg callable invoked **before**
+    each iteration of both the warmup and the measured loop. Used by
+    the perf suite to interleave a PyTorch reference run with the
+    Deplodock launches so both backends see the same warm GPU state
+    (same clocks, same caches) — comparing one-after-the-other can
+    give the second-run backend a thermal/cache advantage worth tens
+    of percent on small kernels. The callable is responsible for any
+    timing of its own work."""
     import cupy as cp
 
     compiled = _compile(graph)
@@ -380,6 +390,8 @@ def benchmark_program(
     descs = _prebuild_descriptors(compiled, arrays)
 
     for _ in range(warmup):
+        if on_iter is not None:
+            on_iter()
         for li, launch in enumerate(compiled.launches):
             _launch(launch, compiled, arrays, descs.get(li))
     cp.cuda.runtime.deviceSynchronize()
@@ -389,10 +401,9 @@ def benchmark_program(
     stops = [cp.cuda.Event() for _ in range(n)]
     acc = [0.0] * n
 
-    prog_start = cp.cuda.Event()
-    prog_stop = cp.cuda.Event()
-    prog_start.record()
     for _ in range(num_iters):
+        if on_iter is not None:
+            on_iter()
         for i, launch in enumerate(compiled.launches):
             starts[i].record()
             _launch(launch, compiled, arrays, descs.get(i))
@@ -402,19 +413,17 @@ def benchmark_program(
             # event slide into a downstream kernel's scheduling window,
             # which ends up attributing 0.5-0.8 ms of phantom time to
             # whichever sub-100µs kernel happens to land at a stream-
-            # stall position. The total ``prog_start..prog_stop`` window
-            # is unaffected (it spans all launches anyway), and the
-            # added sync overhead is negligible vs the kernels' work.
+            # stall position. The added sync overhead is negligible vs
+            # the kernels' work and only affects the benchmark window,
+            # not what ``time_ms`` reports (which is the sum of per-
+            # kernel events — pure GPU work, no sync overhead).
             stops[i].synchronize()
         for i in range(n):
             acc[i] += cp.cuda.get_elapsed_time(starts[i], stops[i])
-    prog_stop.record()
-    prog_stop.synchronize()
-    total_ms = cp.cuda.get_elapsed_time(prog_start, prog_stop)
 
     per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=acc[i] / num_iters) for i in range(n)]
     return BenchmarkResult(
-        time_ms=total_ms / num_iters,
+        time_ms=sum(acc) / num_iters,
         num_launches=n,
         per_launch=per_launch if per_launch else None,
     )

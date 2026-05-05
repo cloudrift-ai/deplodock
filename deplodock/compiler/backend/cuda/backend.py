@@ -71,9 +71,10 @@ class CudaBackend(Backend):
         input_data: dict[str, np.ndarray] | None = None,
         warmup: int = 5,
         num_iters: int = 20,
+        on_iter=None,
     ) -> BenchmarkResult:
         del input_data
-        result = benchmark_program(compiled, warmup=warmup, num_iters=num_iters)
+        result = benchmark_program(compiled, warmup=warmup, num_iters=num_iters, on_iter=on_iter)
         return BenchmarkResult(
             time_ms=result.time_ms,
             num_launches=result.num_launches,

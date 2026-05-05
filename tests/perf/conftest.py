@@ -79,8 +79,16 @@ def bench_pair(request):
     """Return a callable ``run(case, *, warmup, iters) -> PerfRow``.
 
     Times the PyTorch eager reference and the Deplodock-compiled graph
-    on the same shape, records a row, returns it. Does not assert on
-    the ratio — the suite tracks performance, it doesn't gate on it.
+    on the same shape, **interleaving** them — each iteration runs the
+    torch closure first, then the Deplodock launches, so both backends
+    see the same warm GPU state (same SM clock, same L2 contents). The
+    Deplodock backend drives the loop via ``CudaBackend.benchmark(...,
+    on_iter=...)``; the torch run inside ``on_iter`` is timed with
+    ``torch.cuda.Event`` and we average over the measured tail
+    (warmup events are recorded but discarded).
+
+    Does not assert on the ratio — the suite tracks performance, it
+    doesn't gate on it.
     """
 
     def _run(case: Case, *, warmup: int = 5, iters: int = 50) -> PerfRow:
@@ -88,25 +96,32 @@ def bench_pair(request):
 
         from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-        # --- torch side ---
         torch_fn = build_torch_ref(case)
-        for _ in range(warmup):
-            torch_fn()
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            torch_fn()
-        end.record()
-        torch.cuda.synchronize()
-        torch_us = (start.elapsed_time(end) / iters) * 1000.0
-
-        # --- deplodock side ---
         graph = build_deplodock_graph(case)
         backend = CudaBackend()
         compiled = backend.compile(graph)
-        bench = backend.benchmark(compiled, warmup=warmup, num_iters=iters)
+
+        # Each on_iter call runs one torch iter, recording cuda events.
+        # The deplodock benchmark calls on_iter ``warmup + iters`` times
+        # — discard the first ``warmup`` samples so torch and deplodock
+        # average over the same set of measured iters.
+        torch_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+        def on_iter() -> None:
+            start = torch.cuda.Event(enable_timing=True)
+            stop = torch.cuda.Event(enable_timing=True)
+            start.record()
+            torch_fn()
+            stop.record()
+            torch_events.append((start, stop))
+
+        bench = backend.benchmark(compiled, warmup=warmup, num_iters=iters, on_iter=on_iter)
+
+        # All torch events are now recorded; the final cupy device sync
+        # at the end of benchmark_program ensures they're complete.
+        torch.cuda.synchronize()
+        measured = torch_events[warmup:]
+        torch_us = (sum(s.elapsed_time(e) for s, e in measured) / len(measured)) * 1000.0
         deplodock_us = bench.time_ms * 1000.0
         launches = bench.num_launches
 
