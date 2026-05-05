@@ -11,6 +11,7 @@ from deplodock.detect import detect_local_gpus
 from deplodock.provisioning.host import LocalHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.recipe import resolve_for_hardware
+from deplodock.redact import register_secret
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ def handle_local(args):
 async def _handle_local(args):
     recipe_dir = args.recipe
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
+    register_secret(hf_token)
     model_dir = args.model_dir
     dry_run = args.dry_run
     teardown = args.teardown

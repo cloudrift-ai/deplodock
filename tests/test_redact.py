@@ -3,12 +3,13 @@
 import logging
 
 import deplodock.redact as redact_module
-from deplodock.redact import SecretRedactingFilter, redact_secrets
+from deplodock.redact import SecretRedactingFilter, install_redaction, redact_secrets, register_secret
 
 
 def _reset_cache():
-    """Reset the module-level pattern cache so env changes take effect."""
+    """Reset the module-level pattern cache and explicit-secrets set."""
     redact_module._patterns = None
+    redact_module._explicit_secrets.clear()
 
 
 # ── redact_secrets ──────────────────────────────────────────────
@@ -98,5 +99,115 @@ def test_secret_redacting_filter_with_args(monkeypatch):
     )
     filt.filter(record)
     assert record.args == ("***",)
+
+    _reset_cache()
+
+
+# ── install_redaction: end-to-end through a real handler ─────────
+
+
+def test_install_redaction_through_file_handler(monkeypatch, tmp_path):
+    """Regression: child-logger records propagating to a file handler must
+    still be redacted. Logger-level filters miss this path; handler-level
+    filters (what install_redaction installs) catch it.
+    """
+    monkeypatch.setenv("HF_TOKEN", "hf_PropagationTestToken123")
+    _reset_cache()
+
+    log_file = tmp_path / "out.log"
+    handler = logging.FileHandler(log_file, encoding="utf-8")
+    install_redaction(handler)
+
+    root = logging.getLogger()
+    prev_level = root.level
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    try:
+        # Emit from a *child* logger to exercise propagation through callHandlers.
+        child = logging.getLogger("deplodock.provisioning.ssh_transport")
+        child.info("[dry-run] ssh host: docker run -e HUGGING_FACE_HUB_TOKEN=hf_PropagationTestToken123 ...")
+        handler.flush()
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+        root.setLevel(prev_level)
+
+    contents = log_file.read_text()
+    assert "hf_PropagationTestToken123" not in contents
+    assert "***" in contents
+
+    _reset_cache()
+
+
+# ── register_secret: values not in env ──────────────────────────
+
+
+def test_register_secret_redacts_value_not_in_env(monkeypatch):
+    for var in redact_module._SECRET_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    _reset_cache()
+
+    register_secret("cli_only_secret_AAAAAA")
+    assert redact_secrets("token=cli_only_secret_AAAAAA done") == "token=*** done"
+
+    _reset_cache()
+
+
+def test_register_secret_short_values_ignored(monkeypatch):
+    for var in redact_module._SECRET_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    _reset_cache()
+
+    register_secret("short")
+    assert redact_secrets("value=short here") == "value=short here"
+
+    _reset_cache()
+
+
+def test_register_secret_invalidates_cache(monkeypatch):
+    for var in redact_module._SECRET_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    _reset_cache()
+
+    # Prime the cache while no secrets are known.
+    assert redact_secrets("placeholder") == "placeholder"
+
+    register_secret("late_registered_value_BBBB")
+    # Cache should have been invalidated; the new value is now redacted.
+    assert redact_secrets("v=late_registered_value_BBBB") == "v=***"
+
+    _reset_cache()
+
+
+def test_register_secret_propagates_through_file_handler(monkeypatch, tmp_path):
+    """A value registered via register_secret() (e.g. from --hf-token / --api-key
+    that wasn't in os.environ) is still redacted from file-handler output.
+    """
+    for var in redact_module._SECRET_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    _reset_cache()
+
+    register_secret("cr_cli_flag_secret_CCCCCC")
+
+    log_file = tmp_path / "out.log"
+    handler = logging.FileHandler(log_file, encoding="utf-8")
+    install_redaction(handler)
+
+    root = logging.getLogger()
+    prev_level = root.level
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    try:
+        child = logging.getLogger("deplodock.provisioning.cloudrift")
+        child.info("X-API-Key: cr_cli_flag_secret_CCCCCC")
+        handler.flush()
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+        root.setLevel(prev_level)
+
+    contents = log_file.read_text()
+    assert "cr_cli_flag_secret_CCCCCC" not in contents
+    assert "***" in contents
 
     _reset_cache()

@@ -3,7 +3,7 @@
 import logging
 import sys
 
-from deplodock.redact import SecretRedactingFilter
+from deplodock.redact import install_redaction
 
 
 def setup_cli_logging():
@@ -17,5 +17,5 @@ def setup_cli_logging():
     root.handlers.clear()
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(message)s"))
+    install_redaction(handler)
     root.addHandler(handler)
-    root.addFilter(SecretRedactingFilter())

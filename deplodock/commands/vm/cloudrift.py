@@ -11,6 +11,7 @@ from deplodock.provisioning.cloudrift import (
     create_instance,
     delete_instance,
 )
+from deplodock.redact import register_secret
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ def _resolve_api_key(args_api_key):
     if not api_key:
         logger.error("Error: CloudRift API key required. Use --api-key or set CLOUDRIFT_API_KEY.")
         sys.exit(1)
+    register_secret(api_key)
     return api_key
 
 

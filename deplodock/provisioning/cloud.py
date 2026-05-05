@@ -21,6 +21,7 @@ from deplodock.hardware import (
 )
 from deplodock.provisioning import cloudrift as cr_provider
 from deplodock.provisioning import gcp as gcp_provider
+from deplodock.redact import register_secret
 
 DEFAULT_PROVISION_RETRIES = 3
 PROVISION_RETRY_DELAY = 10  # seconds
@@ -138,6 +139,7 @@ async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key,
         api_key = os.environ.get("CLOUDRIFT_API_KEY")
         if not api_key and not dry_run:
             raise RuntimeError("CLOUDRIFT_API_KEY env var required for CloudRift provisioning")
+        register_secret(api_key or "")
 
         pub_key_path = f"{ssh_key}.pub"
 
@@ -190,6 +192,7 @@ async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key,
             os.environ.get("GCP_SERVICE_ACCOUNT", ""),
         )
         if service_account:
+            register_secret(service_account)
             extra_parts.append(f"--service-account={service_account}")
             extra_parts.append("--scopes=https://www.googleapis.com/auth/cloud-platform")
 
@@ -251,6 +254,7 @@ async def delete_cloud_vm(delete_info, dry_run=False):
             logger.info(f"[dry-run] cloudrift: terminate instance {instance_id}")
             return
         api_key = os.environ.get("CLOUDRIFT_API_KEY", "")
+        register_secret(api_key)
         await cr_provider.delete_instance(api_key, instance_id)
 
     elif provider == "gcp":
