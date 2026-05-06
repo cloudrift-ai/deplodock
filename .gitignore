@@ -9,8 +9,9 @@ __pycache__/
 # Python egg-info
 deplodock.egg-info/
 
-# Build artifacts
+# Build and run artifacts
 dist/
+dump/
 build/
 
 # Docker Compose generated files
@@ -25,6 +26,7 @@ nginx.vllm.conf
 .env.local
 .env.*.local
 tests/perf/.results/
+_test_data
 
 # Claude Code per-user local settings (skills/agents under .claude/ are tracked)
 .claude/settings.local.json
