@@ -92,6 +92,19 @@ _F_PER_AXIS_COMPACT = (8, 4)
 # (s128, 2039µs → 933µs) and 0.12× → 0.28× (s512, 9270µs → 3920µs).
 _TILE_SHAPE_FUSED = (64, 64)
 _F_PER_AXIS_FUSED = (4, 4)
+# "Default-large" class: default-class shapes with enough M to fill
+# the grid benefit from doubling the per-thread N register tile from
+# F_N=4 → F_N=8. The chunk pass (``008b``) keeps LDS.128 vectorized
+# and prevents the F_N=8 bank-conflict cliff. Sweep on RTX 5090 fp32:
+# qwen.q_proj.s512 0.87× → 0.92× (286 → 266µs), qwen.down_proj.s512
+# 0.79× → 0.86× (1434 → 1331µs), tl.gate_proj.s512 0.95× → 0.99×.
+# Small-M cases (s32) regress because the grid is too small to
+# amortize the extra register pressure (e.g. tl.q_proj.s32 1.47×
+# → 1.32×); the threshold ``_DEFAULT_LARGE_M_MIN = 128`` gates the
+# upgrade to cases where it actually wins.
+_TILE_SHAPE_DEFAULT_LARGE = (128, 64)
+_F_PER_AXIS_DEFAULT_LARGE = (8, 8)
+_DEFAULT_LARGE_M_MIN = 128
 _HUGE_M_MIN = 256
 _HUGE_N_MIN = 8192
 _COMPACT_N_MAX = 1024
@@ -203,16 +216,21 @@ def _matmul_M(tile: Tile) -> int:
 
 
 def _tile_class(tile: Tile | None) -> str:
-    """``"fused" | "huge" | "compact" | "default"`` — picks the matmul
-    tile class from the logical output extents and body structure.
-    Non-matmul tiles fall to ``"default"`` (the env vars wouldn't
-    apply anyway).
+    """``"fused" | "huge" | "compact" | "default-large" | "default"``
+    — picks the matmul tile class from the logical output extents and
+    body structure. Non-matmul tiles fall to ``"default"`` (the env
+    vars wouldn't apply anyway).
 
     ``"fused"`` is checked first because a fused-prologue matmul
     (``silu_mul_matmul``) can have output extents that would otherwise
     classify it as ``huge`` / ``default``, but its register pressure
     profile is fundamentally different — the standard tiles starve
     occupancy.
+
+    ``"default-large"`` is the default-class subclass for M ≥ 128 +
+    N > _COMPACT_N_MAX + N < _HUGE_N_MIN. F_N=8 (vs F_N=4) doubles
+    arithmetic intensity per thread; the chunk pass (``008b``) keeps
+    LDS.128 vectorized.
     """
     if tile is None or not _has_matmul_reduce(tile.body):
         return "default"
@@ -226,6 +244,8 @@ def _tile_class(tile: Tile | None) -> str:
         return "huge"
     if n <= _COMPACT_N_MAX:
         return "compact"
+    if m >= _DEFAULT_LARGE_M_MIN:
+        return "default-large"
     return "default"
 
 
@@ -239,6 +259,8 @@ def _default_tile(tile: Tile | None) -> tuple[tuple[int, int], tuple[int, int]]:
         return _TILE_SHAPE_HUGE, _F_PER_AXIS_HUGE
     if cls == "compact":
         return _TILE_SHAPE_COMPACT, _F_PER_AXIS_COMPACT
+    if cls == "default-large":
+        return _TILE_SHAPE_DEFAULT_LARGE, _F_PER_AXIS_DEFAULT_LARGE
     return _TILE_SHAPE_DEFAULT, _F_PER_AXIS_DEFAULT
 
 
