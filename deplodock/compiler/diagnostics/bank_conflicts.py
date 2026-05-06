@@ -83,6 +83,8 @@ class BankConflictResult:
     cols: int
     pad: tuple[int, ...]
     smem_bytes: int
+    load_name: str  # SSA name of the body Load (e.g. ``in3``)
+    tile_op_name: str
     index_repr: tuple[str, ...]  # the cache-relative index of the simulated Load
     lane_banks: list[int]  # length WARP_SIZE
     lane_addrs: list[int]  # length WARP_SIZE — pre-mod linear smem address
@@ -262,6 +264,8 @@ def simulate(binding: StageBinding, k_iter: int = 0, warp_id: int = 0) -> BankCo
         cols=int(stage.axes[1].extent) if len(stage.axes) > 1 else 1,
         pad=tuple(int(p) for p in stage.pad),
         smem_bytes=stage.smem_bytes,
+        load_name=load.name,
+        tile_op_name=binding.tile_op_name,
         index_repr=tuple(e.pretty() for e in cache_idx),
         lane_banks=lane_banks,
         lane_addrs=lane_addrs,
@@ -280,11 +284,18 @@ def simulate_graph(
     stage_filter: set[str] | None = None,
     k_iter: int = 0,
     warp_id: int = 0,
+    load_filter: set[str] | None = None,
 ) -> list[BankConflictResult]:
-    """Convenience: bindings + simulate, dropping rank-mismatched probes."""
+    """Convenience: bindings + simulate, dropping rank-mismatched probes.
+
+    ``stage_filter`` keeps only Stages with these names; ``load_filter``
+    keeps only body Loads with these SSA names. Both filters AND.
+    """
     out: list[BankConflictResult] = []
     seen: set[tuple] = set()
     for binding in find_all_bindings(graph, stage_filter):
+        if load_filter is not None and binding.load.name not in load_filter:
+            continue
         key = (binding.tile_op_name, binding.stage.name, binding.load.name)
         if key in seen:
             continue

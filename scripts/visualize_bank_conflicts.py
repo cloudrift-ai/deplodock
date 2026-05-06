@@ -273,19 +273,40 @@ def main() -> None:
     p.add_argument("--gate-matrix", default=None, help="Run a tests/perf case under 4 gate combos (chunk×pad)")
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--stage", action="append", default=[], help="filter Stage names (repeatable)")
+    p.add_argument("--load", action="append", default=[], help="filter Load SSA names (repeatable, e.g. in3)")
+    p.add_argument("--list", action="store_true", help="print available (kernel, stage, load) probes and exit")
     p.add_argument("--k-iter", type=int, default=0)
     p.add_argument("--warp-id", type=int, default=0)
     p.add_argument("--out", default="/tmp/bank_conflicts.html")
     args = p.parse_args()
 
     stage_filter = set(args.stage) if args.stage else None
+    load_filter = set(args.load) if args.load else None
     columns: list[dict] = []
+
+    if args.list:
+        # Print available probes for the first config and exit.
+        if args.gate_matrix:
+            g = graph_from_perf_case(args.gate_matrix, disable_chunk_reduce=False, disable_pad_smem=False)
+        elif args.chunk_reduce_diff:
+            g = graph_from_sdpa(args.seq_len, disable_chunk_reduce=False)
+        elif args.ir:
+            g = graph_from_ir_path(_parse_ir_arg(args.ir[0])[0])
+        else:
+            p.error("--list requires one of --gate-matrix / --chunk-reduce-diff / --ir")
+        results = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
+        print(f"{'kernel':32}  {'stage':18}  {'load':6}  {'max_way':>7}  {'events':>6}  index")
+        print("-" * 100)
+        for r in sorted(results, key=lambda x: (x.tile_op_name, x.stage_name, x.load_name)):
+            idx = ", ".join(r.index_repr)
+            print(f"{r.tile_op_name:32}  {r.stage_name:18}  {r.load_name:6}  {r.max_way:>7}  {r.conflict_events:>6}  ({idx})")
+        return
 
     if args.chunk_reduce_diff:
         for label, disabled in (("chunk_reduce ENABLED", False), ("chunk_reduce DISABLED", True)):
             print(f"running pipeline: {label}...")
             g = graph_from_sdpa(args.seq_len, disable_chunk_reduce=disabled)
-            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id)
+            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
             print(f"  → {len(panels)} stage probe(s)")
             columns.append({"label": label, "panels": _serialize(panels)})
         subtitle = f"SDPA(B=1, H=8, seq={args.seq_len}, d=64) · k_iter={args.k_iter} · warp={args.warp_id}"
@@ -299,7 +320,7 @@ def main() -> None:
         for label, no_chunk, no_pad in combos:
             print(f"running {args.gate_matrix} | {label}...")
             g = graph_from_perf_case(args.gate_matrix, disable_chunk_reduce=no_chunk, disable_pad_smem=no_pad)
-            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id)
+            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
             total = sum(p.conflict_events for p in panels)
             print(f"  → {len(panels)} probes, total conflict_events = {total}")
             columns.append({"label": f"{label} · Σevents={total}", "panels": _serialize(panels)})
@@ -308,7 +329,7 @@ def main() -> None:
         for arg in args.ir:
             path, label = _parse_ir_arg(arg)
             g = graph_from_ir_path(path)
-            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id)
+            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
             print(f"{label}: {len(panels)} stage probe(s)")
             columns.append({"label": label, "panels": _serialize(panels)})
         subtitle = f"k_iter={args.k_iter} · warp={args.warp_id} · {len(args.ir)} input IR(s)"
