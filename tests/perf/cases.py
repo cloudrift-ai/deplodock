@@ -49,6 +49,55 @@ class Case:
     def shape_str(self) -> str:
         return " x ".join("(" + ",".join(str(d) for d in s) + ")" for s in self.shapes)
 
+    @property
+    def code(self) -> str:
+        """Inline ``deplodock run --code`` expression equivalent to this
+        case. Used by the perf bencher to drive ``deplodock run --bench
+        --profile`` per case so the benchmarking infra is shared with
+        the CLI. Each input tensor is materialized via ``torch.randn``
+        on the same shape; the final expression is what gets traced."""
+        s = self.shapes
+        preamble = "import torch; import torch.nn.functional as F"
+        if self.op == "matmul":
+            return f"{preamble}; a=torch.randn({s[0]}); b=torch.randn({s[1]}); torch.matmul(a,b)"
+        if self.op == "rmsnorm":
+            return f"{preamble}; x=torch.randn({s[0]}); w=torch.randn({s[1]}); F.rms_norm(x, {tuple(s[1])}, w, eps=1e-6)"
+        if self.op == "softmax":
+            return f"{preamble}; x=torch.randn({s[0]}); F.softmax(x, dim=-1)"
+        if self.op == "silu_mul":
+            return f"{preamble}; gate=torch.randn({s[0]}); up=torch.randn({s[1]}); F.silu(gate)*up"
+        if self.op == "sdpa":
+            gqa = "True" if s[0][-3] != s[1][-3] else "False"
+            return (
+                f"{preamble}; q=torch.randn({s[0]}); k=torch.randn({s[1]}); v=torch.randn({s[2]}); "
+                f"F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa={gqa})"
+            )
+        if self.op == "matmul_add":
+            return f"{preamble}; x=torch.randn({s[0]}); w=torch.randn({s[1]}); r=torch.randn({s[2]}); torch.matmul(x,w)+r"
+        if self.op == "silu_mul_matmul":
+            return f"{preamble}; gate=torch.randn({s[0]}); up=torch.randn({s[1]}); w=torch.randn({s[2]}); torch.matmul(F.silu(gate)*up, w)"
+        raise ValueError(f"unknown op: {self.op}")
+
+    @property
+    def iters(self) -> int:
+        """Number of measured iterations the bencher should run for this
+        case. Heavy ops (~ms-scale per iter) drop to 20 to keep the suite
+        fast; everything else stays at 100. ``heavy`` is detected by
+        total input element count — the dominant factor in matmul /
+        silu_mul_matmul cost. Threshold (50 M elements) covers the
+        fp32-suite cases that empirically run > 1 ms each (qwen
+        gate/up/down_proj.s512 and silu_mul_matmul.{tinyllama,qwen}
+        s512)."""
+        total_elements = sum(_prod(s) for s in self.shapes)
+        return 20 if total_elements > 50_000_000 else 100
+
+
+def _prod(shape: tuple[int, ...]) -> int:
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
 
 # ---------------------------------------------------------------------------
 # Model dimensions

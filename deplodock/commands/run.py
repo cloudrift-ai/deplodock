@@ -130,11 +130,32 @@ def handle_run(args):
 
     if dump:
         dump.dump_benchmark(bench)
+        _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
     _print_table(results)
     _print_kernel_stats(compiled, bench)
     if args.profile:
-        _run_ncu_profile(args)
+        _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+
+
+def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
+    """Persist the eager / torch.compile / deplodock comparison table
+    so downstream tooling (``make bench-kernels``) can parse one file
+    per case instead of grepping kernel stdout."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    eager_us = results.get("Eager PyTorch")
+    payload = {
+        "warmup": warmup,
+        "iters": iters,
+        "backends": {name: {"latency_us": us} for name, us in results.items()},
+    }
+    if eager_us:
+        for name, us in results.items():
+            payload["backends"][name]["speedup_vs_eager"] = (eager_us / us) if us else 0.0
+    out = _Path(dump_dir) / "60_bench_compare.json"
+    out.write_text(_json.dumps(payload, indent=2, default=str))
 
 
 def _print_kernel_stats(graph, bench):
@@ -240,14 +261,33 @@ def _theoretical_occupancy(regs_per_thread: int, smem_per_block: int, threads_pe
 
 _NCU_RECURSE_GUARD = "DEPLODOCK_NCU_CHILD"
 
+# Curated ncu metric set — verified to populate on RTX 5090 (sm_120) +
+# TMA kernels. ``--set detailed`` is broken there (``SpeedOfLight_Roofline``
+# divides by zero, ``SourceCounters`` / ``PCSamplingData`` need missing
+# ``smsp__pcsamp_*`` metrics) so we enumerate explicit metrics instead.
+# Add to this list to surface new columns in the perf summary; the
+# downstream parser keys on metric names directly.
+_NCU_METRICS = (
+    "gpu__time_duration.sum",
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active",
+    "smsp__inst_executed_pipe_lsu.sum",
+    "launch__registers_per_thread",
+)
 
-def _run_ncu_profile(args):
-    """Re-launch the same ``deplodock run`` invocation under ``ncu`` and
-    pass the detailed-page text output through verbatim. ncu's own
-    per-section breakdown (Speed-of-Light, Occupancy, Memory Workload,
-    Compute Workload, Scheduler Stats, Warp State, Source Counters,
-    plus per-kernel optimization hints) is far richer than any single
-    metric set we'd curate, so we just relay it.
+
+def _run_ncu_profile(args, *, dump_dir=None):
+    """Re-launch the same ``deplodock run`` invocation under ``ncu`` to
+    collect a curated set of hardware counters (occupancy, bank
+    conflicts, SM/DRAM/FMA throughput, register pressure). Output is
+    captured in CSV form; when ``DEPLODOCK_DUMP_DIR`` (or ``--dump-dir``
+    propagated as ``dump_dir``) is set, the raw CSV and a parsed
+    per-kernel JSON are written there. Otherwise the counters print to
+    stdout in the same CSV form for one-shot inspection.
 
     Spawns one extra subprocess at minimal iter count — ncu's per-launch
     overhead is huge (10-100×). The ``DEPLODOCK_NCU_CHILD`` env var
@@ -256,10 +296,12 @@ def _run_ncu_profile(args):
     Skipped silently when ``ncu`` is not on PATH. ncu's own stderr is
     relayed when it fails (typical failure: NVIDIA's perf-counter
     permission gate)."""
+    import json as _json
     import os
     import shutil
     import subprocess
     import sys
+    from pathlib import Path as _Path
 
     if os.environ.get(_NCU_RECURSE_GUARD):
         return
@@ -271,47 +313,38 @@ def _run_ncu_profile(args):
 
     env = dict(os.environ)
     env[_NCU_RECURSE_GUARD] = "1"
+    # The ncu child process re-runs trace + compile, which would
+    # ``shutil.rmtree`` the parent's dump dir from ``CompilerDump``'s
+    # ``__post_init__``. Drop the env var for the child so the parent's
+    # ``60_*.json`` (bench results) survive — ncu output is captured via
+    # stdout and saved by the parent below.
+    env.pop("DEPLODOCK_DUMP_DIR", None)
 
-    # Explicit section list — `--set detailed` pulls in two sections that
-    # break on TMA kernels in ncu 2025.3.1: `SpeedOfLight_Roofline`
-    # (`float division by zero`) and `SourceCounters` /
-    # `PCSamplingData` (missing `smsp__pcsamp_*` metrics). Either one
-    # raises and poisons every subsequent section to NaN. Enumerating
-    # the sections that work sidesteps both.
-    sections = (
-        "SpeedOfLight",
-        "ComputeWorkloadAnalysis",
-        "MemoryWorkloadAnalysis",
-        "LaunchStats",
-        "Occupancy",
-    )
     cmd: list[str] = [
         ncu,
+        "--csv",
         "--target-processes",
         "all",
-        "--page",
-        "details",
+        "--metrics",
+        ",".join(_NCU_METRICS),
+        sys.executable,
+        "-m",
+        "deplodock.deplodock",
+        "run",
     ]
-    for s in sections:
-        cmd.extend(["--section", s])
-    cmd.extend(
-        [
-            sys.executable,
-            "-m",
-            "deplodock.deplodock",
-            "run",
-        ]
-    )
     if args.code is not None:
         cmd.extend(["--code", args.code])
     elif args.ir is not None:
         cmd.extend(["--ir", args.ir])
-    # Minimal iters — ncu's overhead means we only want one launch per kernel.
-    cmd.extend(["--warmup", "1", "--iters", "1"])
+    # ncu's per-launch overhead means we want one or two launches per
+    # kernel — enough for the counters to populate, not so many that
+    # the run drags out. Match ``deplodock run --bench``'s minimal
+    # warmup so the profiled launches see a realistic-ish steady state.
+    cmd.extend(["--warmup", "2", "--iters", "3"])
 
     print()
     print("=" * 80)
-    print("ncu --set detailed (per-kernel hardware analysis)")
+    print("ncu --csv (curated hardware metrics)")
     print("=" * 80)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
@@ -319,14 +352,88 @@ def _run_ncu_profile(args):
         logger.warning("ncu profiling timed out")
         return
 
-    # ncu writes its analysis to stdout. Relay it directly. If ncu failed,
-    # show stderr too so the user sees the diagnostic.
-    if result.stdout.strip():
-        print(result.stdout)
+    # ncu writes ``==PROF==`` status lines first, then a CSV table
+    # starting at the ``"ID"`` header. Split the two so we can save just
+    # the CSV part as a file and surface the status lines for
+    # diagnostics.
+    stdout = result.stdout
+    lines = stdout.splitlines()
+    csv_start = None
+    for i, line in enumerate(lines):
+        if line.startswith('"ID"'):
+            csv_start = i
+            break
+    if csv_start is None:
+        if stdout.strip():
+            print(stdout)
+        if result.returncode != 0:
+            logger.warning("ncu exit=%d", result.returncode)
+            if result.stderr.strip():
+                print(result.stderr, file=sys.stderr)
+        return
+
+    csv_text = "\n".join(lines[csv_start:]) + "\n"
+    status_text = "\n".join(lines[:csv_start])
+
+    parsed = _parse_ncu_csv(csv_text)
+
+    if dump_dir is not None:
+        out_dir = _Path(dump_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "61_ncu_metrics.csv").write_text(csv_text)
+        (out_dir / "61_ncu_metrics.json").write_text(_json.dumps(parsed, indent=2, default=str))
+        print(f"ncu metrics → {out_dir / '61_ncu_metrics.csv'}")
+        print(f"ncu metrics → {out_dir / '61_ncu_metrics.json'}")
+    else:
+        # No dump dir: relay the CSV (and status lines) so ad-hoc
+        # ``deplodock run --profile`` invocations still surface the data.
+        if status_text.strip():
+            print(status_text)
+        print(csv_text)
+
     if result.returncode != 0:
         logger.warning("ncu exit=%d", result.returncode)
         if result.stderr.strip():
             print(result.stderr, file=sys.stderr)
+
+
+def _parse_ncu_csv(csv_text: str) -> dict:
+    """Reduce ncu's launch-by-launch CSV into per-kernel metric dicts.
+
+    Each row in the CSV is one (kernel, metric) datum for one launch;
+    multi-launch profiling produces many rows per (kernel, metric) which
+    we aggregate: ``.sum`` and ``smsp__*`` counters get summed, every
+    other metric (percentages, per-thread regs) gets averaged. Returns
+    ``{kernel_name: {metric_name: numeric_value}}`` ready to be merged
+    with the bench-comparison JSON downstream.
+    """
+    import csv as _csv
+    import io as _io
+
+    reader = _csv.DictReader(_io.StringIO(csv_text))
+    per_kernel: dict[str, dict[str, list[float]]] = {}
+    for row in reader:
+        kname = row.get("Kernel Name", "")
+        metric = row.get("Metric Name", "")
+        raw = row.get("Metric Value", "").replace(",", "")
+        if not (kname and metric and raw):
+            continue
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        per_kernel.setdefault(kname, {}).setdefault(metric, []).append(val)
+
+    out: dict[str, dict[str, float]] = {}
+    for kname, metrics in per_kernel.items():
+        reduced: dict[str, float] = {}
+        for metric, vals in metrics.items():
+            if metric.endswith(".sum") or metric.startswith("smsp__"):
+                reduced[metric] = sum(vals)
+            else:
+                reduced[metric] = sum(vals) / len(vals)
+        out[kname] = reduced
+    return out
 
 
 def _detect_stage(graph) -> str:
@@ -428,7 +535,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             dump.dump_benchmark(bench)
         _print_kernel_stats(graph, bench)
     if args.profile:
-        _run_ncu_profile(args)
+        _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs):
