@@ -176,6 +176,8 @@ const root=document.getElementById('columns');
 PAYLOAD.columns.forEach((col,ci)=>{
   const colEl=document.createElement('div');
   colEl.innerHTML=`<div class="col-head"><span class="label">${col.label}</span></div>`;
+  // Append BEFORE init so document.getElementById can find the chart hosts.
+  root.appendChild(colEl);
   if(col.panels.length===0){
     const e=document.createElement('div');e.className='empty';e.textContent='no Stages found';
     colEl.appendChild(e);
@@ -238,7 +240,6 @@ PAYLOAD.columns.forEach((col,ci)=>{
         animationDuration:600,animationEasing:'cubicOut'}]});
     window.addEventListener('resize',()=>{m.resize();h.resize();});
   });
-  root.appendChild(colEl);
 });
 </script>
 </body>
