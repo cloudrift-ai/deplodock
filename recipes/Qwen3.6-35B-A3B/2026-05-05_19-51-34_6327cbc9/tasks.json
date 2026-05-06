@@ -1,0 +1,14 @@
+[
+  {
+    "task_id": "Qwen3.6-35B-A3B/pro6000x2",
+    "recipe_dir": "recipes/Qwen3.6-35B-A3B",
+    "variant": "pro6000x2",
+    "recipe_name": "Qwen3.6-35B-A3B",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_short": "pro6000",
+    "gpu_count": 2,
+    "model_name": "Qwen/Qwen3.6-35B-A3B",
+    "result_file": "pro6000x2_vllm_benchmark.txt",
+    "json_result_file": "pro6000x2_vllm_benchmark.json"
+  }
+]
