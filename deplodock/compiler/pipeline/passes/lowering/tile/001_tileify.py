@@ -2,7 +2,7 @@
 
 Mechanical translation: outer free-Loop chain becomes
 ``Tile(thread_axes=...)``, leaves and inner Loops pass through unchanged.
-Strategy passes (``002_split_matmul_k``, ``004_cooperative_reduce``) may
+Strategy passes (``002_tile_matmul_k``, ``004_cooperative_reduce``) may
 later convert serial Loops to ``StridedLoop`` for cooperative iteration.
 
 **Outer free-Loop chain → ``Tile.thread_axes``**. After stripping

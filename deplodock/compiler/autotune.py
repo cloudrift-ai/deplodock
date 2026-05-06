@@ -8,7 +8,7 @@ post-008 block-dim convention ``(PAT_N=BN/F_N, PAT_M=BM/F_M)`` (lane_x
 count distinct lanes per bank.
 
 This module is a closed-form version of the same analysis
-``012_pad_smem.py`` already performs via
+``013_pad_smem.py`` already performs via
 ``_helpers.py:max_bank_conflict`` — but parameterized by hypothetical
 tile params so we can search the candidate space analytically before
 generating any code.

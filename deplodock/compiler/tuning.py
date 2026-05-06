@@ -28,7 +28,7 @@ Env vars:
 
 - ``DEPLODOCK_BN``, ``DEPLODOCK_BM`` — per-CTA tile (innermost N, outer M).
 - ``DEPLODOCK_FN``, ``DEPLODOCK_FM`` — per-thread output cells.
-- ``DEPLODOCK_BK`` — K-split size for ``002_split_matmul_k`` (subject
+- ``DEPLODOCK_BK`` — K-split size for ``002_tile_matmul_k`` (subject
   to ``K % BK == 0 and K > BK``). Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
 - ``DEPLODOCK_SPLITK_WAVES`` — override the auto-splitk waves target.
@@ -281,7 +281,7 @@ def forced_bk(tile: Tile | None = None) -> int | None:
     return _bk_fits_smem(tile, bk)
 
 
-# sm_120 hard cap is 48 KB static smem; 012_pad_smem adds +1
+# sm_120 hard cap is 48 KB static smem; 013_pad_smem adds +1
 # row of padding per stage to break 32-way bank conflicts, so reserve
 # ~4 KB of headroom for that swelling.
 _SMEM_BUDGET_BYTES = 44 * 1024

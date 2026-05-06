@@ -78,6 +78,10 @@ def register_compile_command(subparsers):
     )
     parser.add_argument("--output", "-o", help="Output path for compiled IR")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
+
+    from deplodock.compiler.target import add_target_arg
+
+    add_target_arg(parser)
     parser.add_argument(
         "--ir",
         choices=list(_IR_STAGES),
@@ -134,7 +138,9 @@ def handle_compile(args):
 
     from deplodock.compiler.pipeline import run_pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
+    from deplodock.compiler.target import apply_target_arg
 
+    apply_target_arg(args)
     passes = _resolve_passes(args)
     graph, base_name = _load_or_trace(args)
     initial_count = len(graph.nodes)
