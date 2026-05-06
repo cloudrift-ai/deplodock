@@ -9,6 +9,7 @@ the same shape as ``scripts/bench_block.py`` but for arbitrary inline ops.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,18 @@ def register_run_command(subparsers):
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
+    parser.add_argument(
+        "--bench-backends",
+        default=None,
+        help=(
+            "Comma-separated subset of backends to time under --bench: any of "
+            "``eager``, ``tcompile`` (a.k.a. ``torch.compile`` / ``compile``), "
+            "``deplodock``. Falls back to ``DEPLODOCK_BENCH_BACKENDS`` env var, "
+            "then to the default ``eager,deplodock`` (drops the ~0.8 s "
+            "torch.compile JIT from the per-case cost). ``deplodock`` is "
+            "implicit even if omitted."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
     parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
@@ -112,12 +125,26 @@ def handle_run(args):
 
     input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
 
-    run_result = backend.run(compiled, input_data=input_data)
-    if dump and backend.last_debug_result is not None:
-        dump.dump_per_launch_values(backend.last_debug_result.per_launch)
+    # Skip the accuracy check + eager forward when running as the ncu
+    # child of a ``--profile`` invocation: the parent already verified
+    # accuracy outside ncu, and re-running the eager reference under
+    # ncu (a) wastes ~5-10 s of ncu overhead per cuBLAS launch and
+    # (b) pollutes the captured CSV with cutlass / cuBLAS kernel rows
+    # the perf summary then has to filter out. The child only needs to
+    # launch the deplodock kernels so ncu can sample our metrics.
+    skip_accuracy = os.environ.get(_NCU_RECURSE_GUARD) == "1"
 
-    eager_out = _eager_output(module, example_args, example_kwargs)
-    _check_accuracy(run_result.outputs, eager_out)
+    if not skip_accuracy:
+        run_result = backend.run(compiled, input_data=input_data)
+        if dump and backend.last_debug_result is not None:
+            dump.dump_per_launch_values(backend.last_debug_result.per_launch)
+
+        eager_out = _eager_output(module, example_args, example_kwargs)
+        _check_accuracy(run_result.outputs, eager_out)
+    else:
+        # ncu child needs at least one deplodock launch for metrics
+        # to populate; skip the eager comparison.
+        backend.run(compiled, input_data=input_data)
 
     if not args.bench:
         return
@@ -126,12 +153,14 @@ def handle_run(args):
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in example_args)
     cuda_kwargs = _to_cuda_kwargs(example_kwargs)
 
-    # Build torch_fns (incl. ~0.8s torch.compile / Inductor JIT)
-    # *outside* the GPU lock so concurrent ``deplodock run`` workers
-    # can do their CPU-bound JITs in parallel. The few GPU launches
-    # the compile-side warmup issues are noisy but go untimed; the
-    # measurement loop below holds the lock for accurate iter timing.
-    torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, args.warmup)
+    # Build torch_fns (incl. ~0.8s torch.compile / Inductor JIT when
+    # ``tcompile`` is in the selected backends) *outside* the GPU lock
+    # so concurrent ``deplodock run`` workers can do their CPU-bound
+    # JITs in parallel. The few GPU launches the compile-side warmup
+    # issues are noisy but go untimed; the measurement loop below
+    # holds the lock for accurate iter timing.
+    backends = _resolve_backends(args.bench_backends)
+    torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, args.warmup, backends=backends)
 
     with _gpu_lock():
         results, bench = _bench_interleaved(
@@ -445,6 +474,11 @@ def _parse_ncu_csv(csv_text: str) -> dict:
     other metric (percentages, per-thread regs) gets averaged. Returns
     ``{kernel_name: {metric_name: numeric_value}}`` ready to be merged
     with the bench-comparison JSON downstream.
+
+    Filters to deplodock-emitted kernels (``k_*`` naming convention) —
+    the ncu child runs in the same process as the eager-reference
+    accuracy check, which would otherwise contribute cutlass / cuBLAS
+    rows that contaminate the per-row aggregate.
     """
     import csv as _csv
     import io as _io
@@ -456,6 +490,8 @@ def _parse_ncu_csv(csv_text: str) -> dict:
         metric = row.get("Metric Name", "")
         raw = row.get("Metric Value", "").replace(",", "")
         if not (kname and metric and raw):
+            continue
+        if not kname.startswith("k_"):
             continue
         try:
             val = float(raw)
@@ -698,33 +734,75 @@ def _check_accuracy(outputs, eager_out):
         sys.exit(1)
 
 
-def _build_torch_fns(module, args, kwargs, warmup):
+_BACKEND_ALIASES = {
+    "eager": "eager",
+    "deplodock": "deplodock",
+    "tcompile": "tcompile",
+    "torch.compile": "tcompile",
+    "compile": "tcompile",
+}
+
+
+def _resolve_backends(cli_value: str | None) -> set[str]:
+    """Pick which bench backends to time. Precedence:
+
+    1. ``--bench-backends`` CLI arg (comma-separated).
+    2. ``DEPLODOCK_BENCH_BACKENDS`` env var (same syntax).
+    3. Default ``eager,deplodock`` — torch.compile is excluded so the
+       per-case wall time isn't dominated by a ~0.8 s Inductor JIT
+       that most users don't need on every run.
+
+    ``deplodock`` is always included even if omitted (the kernel under
+    test is the point of the bench). Returns the canonical backend
+    keys ``{"eager", "tcompile", "deplodock"}``.
+    """
+    raw = cli_value or os.environ.get("DEPLODOCK_BENCH_BACKENDS") or "eager,deplodock"
+    selected: set[str] = {"deplodock"}
+    for tok in raw.split(","):
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        canonical = _BACKEND_ALIASES.get(tok)
+        if canonical is None:
+            logger.error("unknown bench backend %r — choose from %s", tok, sorted(set(_BACKEND_ALIASES.values())))
+            sys.exit(1)
+        selected.add(canonical)
+    return selected
+
+
+def _build_torch_fns(module, args, kwargs, warmup, *, backends: set[str]):
     """Pre-build the per-backend ``torch_fns`` dict, including the
-    ``torch.compile`` JIT step (which is mostly Inductor CPU work plus
-    a few warmup launches). Pulled out of the timed bench loop so
-    parallel ``deplodock run`` invocations can do their JITs
-    concurrently — the GPU lock then only wraps the actual measurement
-    iters where launches must be serialized for accurate timing.
+    ``torch.compile`` JIT step when requested. The JIT (mostly
+    Inductor CPU work plus a few warmup launches) sits *outside* the
+    GPU lock in ``handle_run`` so parallel workers can compile
+    concurrently — the lock then only wraps the actual measurement
+    iters.
+
+    Returns only the torch-side closures; deplodock's bench loop is
+    driven separately by ``backend.benchmark`` in ``_bench_interleaved``.
     """
     import torch
 
-    torch_fns: dict[str, callable] = {"Eager PyTorch": lambda: module(*args, **kwargs)}
-    try:
-        compiled_module = torch.compile(module)
-        for _ in range(warmup + 5):
-            with torch.no_grad():
-                compiled_module(*args, **kwargs)
-        torch_fns["torch.compile"] = lambda: compiled_module(*args, **kwargs)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("torch.compile failed: %s", e)
+    torch_fns: dict[str, callable] = {}
+    if "eager" in backends:
+        torch_fns["Eager PyTorch"] = lambda: module(*args, **kwargs)
+    if "tcompile" in backends:
+        try:
+            compiled_module = torch.compile(module)
+            for _ in range(warmup + 5):
+                with torch.no_grad():
+                    compiled_module(*args, **kwargs)
+            torch_fns["torch.compile"] = lambda: compiled_module(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("torch.compile failed: %s", e)
     return torch_fns
 
 
-def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns=None):
-    """Time eager / torch.compile / deplodock by alternating one iter of
-    each per loop step. All three see the same warm GPU state across the
-    measurement window — same clocks, same caches, same thermal drift —
-    instead of running in three sequential phases that each get a
+def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns):
+    """Time the selected backends by alternating one iter of each per
+    loop step. All backends see the same warm GPU state across the
+    measurement window — same clocks, same caches, same thermal drift
+    — instead of running in sequential phases that each get a
     different steady state.
 
     Driven by ``backend.benchmark(on_iter=...)``: deplodock is the
@@ -738,15 +816,11 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     from both libraries see all preceding work.
 
     ``torch_fns`` is the pre-built backend closure dict from
-    :func:`_build_torch_fns`. Callers (``handle_run``) build it
-    *outside* the GPU lock so the slow torch.compile JIT runs in
-    parallel with peer workers; the lock then wraps only this
-    measurement loop.
+    :func:`_build_torch_fns` (``handle_run`` builds it outside the
+    GPU lock so the slow ``torch.compile`` JIT runs concurrently with
+    peer workers; the lock then wraps only this measurement loop).
     """
     import torch
-
-    if torch_fns is None:
-        torch_fns = _build_torch_fns(module, args, kwargs, warmup)
 
     torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {name: [] for name in torch_fns}
 
