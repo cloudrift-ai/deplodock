@@ -46,6 +46,8 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
             "max_way": p.max_way,
             "raw_max_way": p.raw_max_way,
             "conflict_events": p.conflict_events,
+            "lds128_events": p.lds128_events,
+            "vec_group_size": p.vec_group_size,
             "avg_way": p.avg_way,
             "rows": p.rows,
             "cols": p.cols,
@@ -54,6 +56,7 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
             "notes": [
                 f"index = ({', '.join(p.index_repr)})",
                 f"enclosing axes = {', '.join(p.enclosing_axes) or '(none)'}",
+                (f"LDS.32 events: {p.conflict_events}  ·  LDS.128 events: {p.lds128_events}  (vec={p.vec_group_size})"),
             ],
         }
         for p in panels
@@ -239,11 +242,14 @@ def main() -> None:
     if args.list:
         g = graph_from_ir_path(_parse_ir_arg(args.ir[0])[0])
         results = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
-        print(f"{'kernel':32}  {'stage':18}  {'load':6}  {'max_way':>7}  {'events':>6}  index")
-        print("-" * 100)
+        print(f"{'kernel':32}  {'stage':18}  {'load':6}  {'max_way':>7}  {'LDS.32':>7}  {'LDS.128':>8}  {'vec':>3}  index")
+        print("-" * 120)
         for r in sorted(results, key=lambda x: (x.tile_op_name, x.stage_name, x.load_name)):
             idx = ", ".join(r.index_repr)
-            print(f"{r.tile_op_name:32}  {r.stage_name:18}  {r.load_name:6}  {r.max_way:>7}  {r.conflict_events:>6}  ({idx})")
+            print(
+                f"{r.tile_op_name:32}  {r.stage_name:18}  {r.load_name:6}  "
+                f"{r.max_way:>7}  {r.conflict_events:>7}  {r.lds128_events:>8}  {r.vec_group_size:>3}  ({idx})"
+            )
         return
 
     columns: list[dict] = []
@@ -251,9 +257,15 @@ def main() -> None:
         path, label = _parse_ir_arg(arg)
         g = graph_from_ir_path(path)
         panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
-        total = sum(p.conflict_events for p in panels)
-        print(f"{label}: {len(panels)} probes, Σevents={total}")
-        columns.append({"label": f"{label} · Σevents={total}", "panels": _serialize(panels)})
+        scalar_total = sum(p.conflict_events for p in panels)
+        vec_total = sum(p.lds128_events for p in panels)
+        print(f"{label}: {len(panels)} probes, ΣLDS.32={scalar_total}  ΣLDS.128={vec_total}")
+        columns.append(
+            {
+                "label": f"{label} · ΣLDS.32={scalar_total}  ΣLDS.128={vec_total}",
+                "panels": _serialize(panels),
+            }
+        )
 
     subtitle = f"k_iter={args.k_iter} · warp={args.warp_id} · {len(args.ir)} input IR(s)"
     emit_html(columns, subtitle, args.out)

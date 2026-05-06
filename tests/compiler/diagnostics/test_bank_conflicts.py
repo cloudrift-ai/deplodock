@@ -281,6 +281,86 @@ def test_stage_filter_restricts_results():
     assert simulate_graph(g, stage_filter={"other"}) == []
 
 
+def _build_multi_load_tileop(thread_axes, stage_axes, indices, stage_cls=Stage, pad=()):
+    addressing = AffineAddressing(dims=tuple(range(len(stage_axes))))
+    stage = stage_cls(
+        name="smem",
+        buf="src",
+        origin=tuple(Literal(0) for _ in range(len(stage_axes))),
+        axes=stage_axes,
+        addressing=addressing,
+        pad=pad,
+    )
+    loads = tuple(Load(name=f"x{i}", input="smem", index=tuple(idx)) for i, idx in enumerate(indices))
+    tile = Tile(axes=thread_axes, body=(stage, *loads))
+    return TileOp(body=(tile,), name="multi")
+
+
+def test_lds128_chain_absorbs_4way_contiguous_columns():
+    """4 column-contiguous Loads in one TileOp form an LDS.128 chain;
+    each cycle's per-bank distinct count of 4 is absorbed → 0 events."""
+    a = Axis("a", 32)
+    indices = [(Literal(0), Var("a") * Literal(4) + Literal(i)) for i in range(4)]
+    tile_op = _build_multi_load_tileop(
+        thread_axes=(BoundAxis(a, BIND_THREAD),),
+        stage_axes=(Axis("r", 32), Axis("c", 32)),
+        indices=indices,
+    )
+    g = Graph()
+    g.add_node(tile_op, [], None, node_id="k")
+    results = simulate_graph(g)
+    assert len(results) == 4
+    assert all(r.vec_group_size == 4 for r in results), [r.vec_group_size for r in results]
+    # Per cycle: 32 lanes × address (a*4+i) → 8 distinct banks, 4 lanes
+    # per bank → 4 distinct addrs each (no broadcasts here since lane*4
+    # mod 32 is bijective on lanes 0..7 then repeats with different addr).
+    # max(0, 4 - vec_width=4) = 0 absorbed.
+    assert all(r.lds128_events == 0 for r in results), [r.lds128_events for r in results]
+
+
+def test_lds128_chain_does_not_absorb_8way_unaligned():
+    """Same row but lane stride 8 — each cycle's per-bank distinct count
+    is 8 > vec_width=4 → 4 events absorbed, 4 events remain per bank.
+    Unaligned with the LDS.128 width, so absorption is partial."""
+    a = Axis("a", 32)
+    indices = [(Literal(0), Var("a") * Literal(8) + Literal(i)) for i in range(4)]
+    tile_op = _build_multi_load_tileop(
+        thread_axes=(BoundAxis(a, BIND_THREAD),),
+        stage_axes=(Axis("r", 32), Axis("c", 64)),
+        indices=indices,
+    )
+    g = Graph()
+    g.add_node(tile_op, [], None, node_id="k")
+    results = simulate_graph(g)
+    assert len(results) == 4
+    assert all(r.vec_group_size == 4 for r in results)
+    # Per Load: 32 lanes × (a*8+i) hit 4 banks (since 8 mod 32 cycle
+    # length 4) with 8 distinct addrs each → 8-way per bank.
+    # absorbed = max(0, 8 - 4) = 4 events per bank × 4 active banks = 16.
+    assert all(r.lds128_events == 16 for r in results), [r.lds128_events for r in results]
+
+
+def test_lds128_non_vectorizable_row_strided_unchanged():
+    """Loads at the same column but consecutive rows — NOT vectorizable
+    (rows aren't contiguous). vec_group_size stays 1; lds128_events ==
+    conflict_events."""
+    a = Axis("a", 32)
+    # ``[a*4+i, 0]`` — 4 different rows, same col 0. Adjacent Loads
+    # differ by `+row_stride` per lane, not +1 → not vectorizable.
+    indices = [(Var("a") * Literal(4) + Literal(i), Literal(0)) for i in range(4)]
+    tile_op = _build_multi_load_tileop(
+        thread_axes=(BoundAxis(a, BIND_THREAD),),
+        stage_axes=(Axis("r", 128), Axis("c", 16)),
+        indices=indices,
+    )
+    g = Graph()
+    g.add_node(tile_op, [], None, node_id="k")
+    results = simulate_graph(g)
+    assert len(results) == 4
+    assert all(r.vec_group_size == 1 for r in results)
+    assert all(r.lds128_events == r.conflict_events for r in results)
+
+
 @pytest.mark.parametrize("rows", [16, 32, 64, 128])
 def test_avg_lane_per_bank_consistent(rows: int):
     """``avg_way`` equals 32/distinct_banks. Sanity: row-strided no-pad

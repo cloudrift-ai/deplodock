@@ -92,8 +92,10 @@ class BankConflictResult:
     distinct_addrs: list[int]  # length BANKS — distinct addresses per bank
     max_way: int  # worst broadcast-corrected = max(distinct_addrs)
     raw_max_way: int  # max(counts) — upper bound w/o broadcast
-    conflict_events: int  # sum(distinct_addrs[b] - 1 for b with hits)
-    avg_way: float
+    conflict_events: int  # sum(distinct_addrs[b] - 1 for b with hits) — per-LDS.32 model
+    lds128_events: int = 0  # sum(max(0, distinct_addrs[b] - vec_width)); vec_width=1 if standalone, up to 4 if vectorized
+    vec_group_size: int = 1  # number of Loads that fuse into one LDS.(N×32) (1 = scalar LDS.32)
+    avg_way: float = 0.0
     enclosing_axes: tuple[str, ...] = ()
 
 
@@ -274,6 +276,10 @@ def simulate(binding: StageBinding, k_iter: int = 0, warp_id: int = 0) -> BankCo
         max_way=max_way,
         raw_max_way=raw_max_way,
         conflict_events=conflict_events,
+        # Initial scalar (LDS.32) value; ``annotate_lds128`` upgrades
+        # vectorizable runs in-place with the absorption-aware count.
+        lds128_events=conflict_events,
+        vec_group_size=1,
         avg_way=avg,
         enclosing_axes=tuple(ax.name for ax in binding.enclosing_loop_axes),
     )
@@ -290,6 +296,10 @@ def simulate_graph(
 
     ``stage_filter`` keeps only Stages with these names; ``load_filter``
     keeps only body Loads with these SSA names. Both filters AND.
+
+    After simulation, ``annotate_lds128`` runs in place to upgrade
+    vectorizable Load runs (consecutive +0..+N-1 inner-element offsets)
+    with their LDS.128-absorbed event counts.
     """
     out: list[BankConflictResult] = []
     seen: set[tuple] = set()
@@ -303,4 +313,69 @@ def simulate_graph(
         r = simulate(binding, k_iter=k_iter, warp_id=warp_id)
         if r is not None:
             out.append(r)
+    annotate_lds128(out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# LDS.128 vectorization model
+# ---------------------------------------------------------------------------
+#
+# nvcc fuses N consecutive scalar fp32 loads from smem into a single
+# ``ld.shared.v4`` (LDS.128) when they read 4 contiguous fp32. The warp
+# drains in 4 cycles regardless — so the first ``vec_width`` distinct
+# addresses per bank are "absorbed" into the natural drain (no extra
+# replay cycle). Mirrors the cost model in ``compiler/autotune.py``
+# (``effective_b_conflict_cost``, empirically validated on
+# ``k_add_5_reduce``: 4-way @ F_N=4 ≈ 1-way @ F_N=1 wall-clock).
+#
+# Per-bank events under LDS.(N×32):
+#     events_at_bank = max(0, distinct_addrs_at_bank - vec_width)
+# with ``vec_width = min(N, 4)``.
+
+LDS128_VEC_WIDTH = 4
+
+
+def annotate_lds128(results: list[BankConflictResult]) -> None:
+    """In-place: detect vectorizable runs and rewrite ``lds128_events``.
+
+    Two Loads belong to the same LDS.128 chain iff for every lane,
+    ``B.lane_addrs[lane] - A.lane_addrs[lane] == 1`` — i.e. each lane
+    reads the next contiguous fp32. Greedy chain on unique address
+    signatures (so duplicate Loads from prologue/steady-state pipeline
+    phases don't break detection); cap each chain at ``LDS128_VEC_WIDTH``
+    (4). Standalone Loads keep ``vec_group_size = 1`` and
+    ``lds128_events == conflict_events``.
+    """
+    by_kernel_stage: dict[tuple[str, str], list[BankConflictResult]] = {}
+    for r in results:
+        by_kernel_stage.setdefault((r.tile_op_name, r.stage_name), []).append(r)
+
+    for group in by_kernel_stage.values():
+        # Bucket by address signature so duplicate Loads (same lane_addrs)
+        # are treated as one node in the chain graph.
+        sig_buckets: dict[tuple[int, ...], list[BankConflictResult]] = {}
+        for r in group:
+            sig_buckets.setdefault(tuple(r.lane_addrs), []).append(r)
+        # Order signatures by min addr — vectorizable signatures end up
+        # adjacent. For each signature, all duplicates share its
+        # vec_group_size.
+        sigs = sorted(sig_buckets.keys(), key=min)
+        i = 0
+        while i < len(sigs):
+            chain_sigs = [sigs[i]]
+            j = i + 1
+            while j < len(sigs) and len(chain_sigs) < LDS128_VEC_WIDTH:
+                prev, cur = chain_sigs[-1], sigs[j]
+                if all(b - a == 1 for a, b in zip(prev, cur, strict=True)):
+                    chain_sigs.append(cur)
+                    j += 1
+                else:
+                    break
+            if len(chain_sigs) > 1:
+                vec = len(chain_sigs)
+                for sig in chain_sigs:
+                    for r in sig_buckets[sig]:
+                        r.vec_group_size = vec
+                        r.lds128_events = sum(max(0, d - vec) for d in r.distinct_addrs)
+            i = j
