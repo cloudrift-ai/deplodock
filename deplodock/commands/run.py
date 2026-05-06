@@ -126,14 +126,17 @@ def handle_run(args):
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in example_args)
     cuda_kwargs = _to_cuda_kwargs(example_kwargs)
 
-    # Hold the cross-process GPU lock for the full bench + profile
-    # window. Trace, compile, dump-write all run unlocked so concurrent
-    # ``deplodock run`` invocations (parallel ``make bench-kernels``)
-    # overlap on the CPU; only the kernel-launch phases serialize, so
-    # iteration timing isn't perturbed by another worker hammering the
-    # SMs.
+    # Build torch_fns (incl. ~0.8s torch.compile / Inductor JIT)
+    # *outside* the GPU lock so concurrent ``deplodock run`` workers
+    # can do their CPU-bound JITs in parallel. The few GPU launches
+    # the compile-side warmup issues are noisy but go untimed; the
+    # measurement loop below holds the lock for accurate iter timing.
+    torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, args.warmup)
+
     with _gpu_lock():
-        results, bench = _bench_interleaved(cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters)
+        results, bench = _bench_interleaved(
+            cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
+        )
 
         if dump:
             dump.dump_benchmark(bench)
@@ -695,7 +698,29 @@ def _check_accuracy(outputs, eager_out):
         sys.exit(1)
 
 
-def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters):
+def _build_torch_fns(module, args, kwargs, warmup):
+    """Pre-build the per-backend ``torch_fns`` dict, including the
+    ``torch.compile`` JIT step (which is mostly Inductor CPU work plus
+    a few warmup launches). Pulled out of the timed bench loop so
+    parallel ``deplodock run`` invocations can do their JITs
+    concurrently — the GPU lock then only wraps the actual measurement
+    iters where launches must be serialized for accurate timing.
+    """
+    import torch
+
+    torch_fns: dict[str, callable] = {"Eager PyTorch": lambda: module(*args, **kwargs)}
+    try:
+        compiled_module = torch.compile(module)
+        for _ in range(warmup + 5):
+            with torch.no_grad():
+                compiled_module(*args, **kwargs)
+        torch_fns["torch.compile"] = lambda: compiled_module(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("torch.compile failed: %s", e)
+    return torch_fns
+
+
+def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns=None):
     """Time eager / torch.compile / deplodock by alternating one iter of
     each per loop step. All three see the same warm GPU state across the
     measurement window — same clocks, same caches, same thermal drift —
@@ -711,18 +736,17 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     Per-iter ``torch.cuda.Event``s queue on the (legacy) default
     stream; cupy's default stream is the same NULL stream, so events
     from both libraries see all preceding work.
+
+    ``torch_fns`` is the pre-built backend closure dict from
+    :func:`_build_torch_fns`. Callers (``handle_run``) build it
+    *outside* the GPU lock so the slow torch.compile JIT runs in
+    parallel with peer workers; the lock then wraps only this
+    measurement loop.
     """
     import torch
 
-    torch_fns: dict[str, callable] = {"Eager PyTorch": lambda: module(*args, **kwargs)}
-    try:
-        compiled_module = torch.compile(module)
-        for _ in range(warmup + 5):
-            with torch.no_grad():
-                compiled_module(*args, **kwargs)
-        torch_fns["torch.compile"] = lambda: compiled_module(*args, **kwargs)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("torch.compile failed: %s", e)
+    if torch_fns is None:
+        torch_fns = _build_torch_fns(module, args, kwargs, warmup)
 
     torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {name: [] for name in torch_fns}
 
