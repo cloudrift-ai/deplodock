@@ -38,7 +38,8 @@ test: setup
 	./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
 
 bench-kernels: setup
-	./venv/bin/pytest tests/perf/ -m perf -v -p no:randomly --no-header
+	@rm -f /tmp/deplodock-gpu.lock
+	./venv/bin/pytest tests/perf/ -m perf -v -p no:randomly --no-header -n auto --dist=loadgroup
 
 bench: setup
 	@echo "Running benchmarks..."

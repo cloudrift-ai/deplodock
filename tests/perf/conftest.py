@@ -40,6 +40,15 @@ from tests.perf.cases import Case
 
 _RESULTS_DIR = Path(__file__).resolve().parent / ".results"
 
+# Cross-process advisory lock around the GPU iter loop in the
+# subprocess-driven bencher. Set on conftest import so every spawned
+# ``deplodock run --bench`` (across xdist workers and inside each
+# worker's per-case subprocess) coordinates on the same path. Trace,
+# compile, dump-write all run unlocked — only the kernel-launch phase
+# serializes. Override with ``DEPLODOCK_GPU_LOCK`` before invoking
+# ``make bench-kernels`` if a different path is desired.
+os.environ.setdefault("DEPLODOCK_GPU_LOCK", "/tmp/deplodock-gpu.lock")
+
 
 # ---------------------------------------------------------------------------
 # PerfRow + session collector
@@ -294,6 +303,36 @@ def _format_table(rows: list[PerfRow]) -> str:
     for r_cells in body:
         lines.append(_fmt(r_cells))
     return "\n".join(lines)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Worker-side hand-off for ``pytest-xdist`` runs.
+
+    Each xdist worker has its own ``config._perf_rows``; without this
+    hook only the controller's (empty) list reaches the terminal
+    summary. ``workeroutput`` is xdist's built-in dict for
+    worker→controller payloads — the controller picks it back up in
+    ``pytest_testnodedown``.
+    """
+    rows = getattr(session.config, "_perf_rows", [])
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if workeroutput is not None and rows:
+        # Each row is a dataclass; serialize via asdict so the
+        # controller can rehydrate without sharing the class import.
+        workeroutput["perf_rows"] = [{**asdict(r), "tags": list(r.tags)} for r in rows]
+
+
+def pytest_testnodedown(node, error):
+    """Controller-side: drain a finished xdist worker's rows into the
+    controller's collector so ``pytest_terminal_summary`` sees all
+    cases (not just whichever ones happened to land on the controller).
+    """
+    payload = getattr(node, "workeroutput", {}).get("perf_rows", [])
+    if not payload:
+        return
+    rows = _collector(node.config)
+    for r in payload:
+        rows.append(PerfRow(**{**r, "tags": tuple(r.get("tags", ()))}))
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

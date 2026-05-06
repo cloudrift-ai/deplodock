@@ -126,16 +126,52 @@ def handle_run(args):
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in example_args)
     cuda_kwargs = _to_cuda_kwargs(example_kwargs)
 
-    results, bench = _bench_interleaved(cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters)
+    # Hold the cross-process GPU lock for the full bench + profile
+    # window. Trace, compile, dump-write all run unlocked so concurrent
+    # ``deplodock run`` invocations (parallel ``make bench-kernels``)
+    # overlap on the CPU; only the kernel-launch phases serialize, so
+    # iteration timing isn't perturbed by another worker hammering the
+    # SMs.
+    with _gpu_lock():
+        results, bench = _bench_interleaved(cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters)
 
-    if dump:
-        dump.dump_benchmark(bench)
-        _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
+        if dump:
+            dump.dump_benchmark(bench)
+            _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
-    _print_table(results)
-    _print_kernel_stats(compiled, bench)
-    if args.profile:
-        _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+        _print_table(results)
+        _print_kernel_stats(compiled, bench)
+        if args.profile:
+            _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+
+
+def _gpu_lock():
+    """Cross-process advisory lock on a single GPU. Activated when
+    ``DEPLODOCK_GPU_LOCK`` is set (path of the lock file); a no-op
+    otherwise so ad-hoc ``deplodock run`` invocations don't pay any
+    coordination overhead. The path holds an ``flock`` (via
+    ``filelock.FileLock``) for the duration of the ``with`` block —
+    other waiters block, avoiding interleaved kernel launches that
+    would corrupt iter timings.
+    """
+    import contextlib
+    import os as _os
+
+    path = _os.environ.get("DEPLODOCK_GPU_LOCK")
+    if not path:
+
+        @contextlib.contextmanager
+        def _noop():
+            yield
+
+        return _noop()
+
+    from pathlib import Path as _Path
+
+    from filelock import FileLock
+
+    _Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return FileLock(path)
 
 
 def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
@@ -525,17 +561,18 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
 
-    if args.bench:
-        bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-        print()
-        print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-        print("-" * 38)
-        print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-        if dump:
-            dump.dump_benchmark(bench)
-        _print_kernel_stats(graph, bench)
-    if args.profile:
-        _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+    with _gpu_lock():
+        if args.bench:
+            bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+            print()
+            print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+            print("-" * 38)
+            print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+            if dump:
+                dump.dump_benchmark(bench)
+            _print_kernel_stats(graph, bench)
+        if args.profile:
+            _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs):
