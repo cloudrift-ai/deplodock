@@ -37,31 +37,51 @@ def graph_from_ir_path(path: str) -> Graph:
 
 
 def _serialize(panels: list[BankConflictResult]) -> list[dict]:
-    return [
-        {
-            "panel_title": f"{p.stage_name} ← {p.buf}",
-            "formula": (f"{p.stage_class}({p.rows}×{p.cols})  " + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")),
-            "lane_banks": p.lane_banks,
-            "counts": p.counts,
-            "distinct_addrs": p.distinct_addrs,
-            "max_way": p.max_way,
-            "raw_max_way": p.raw_max_way,
-            "conflict_events": p.conflict_events,
-            "lds128_events": p.lds128_events,
-            "vec_group_size": p.vec_group_size,
-            "avg_way": p.avg_way,
-            "rows": p.rows,
-            "cols": p.cols,
-            "pad": list(p.pad),
-            "smem_bytes": p.smem_bytes,
-            "notes": [
-                f"index = ({', '.join(p.index_repr)})",
-                f"enclosing axes = {', '.join(p.enclosing_axes) or '(none)'}",
-                (f"LDS.32 events: {p.conflict_events}  ·  LDS.128 events: {p.lds128_events}  (vec={p.vec_group_size})"),
-            ],
-        }
-        for p in panels
-    ]
+    out: list[dict] = []
+    for p in panels:
+        # Per-lane address-color index: same address → same color, regardless
+        # of bank. Cells of the SAME color stacked in one bank column are
+        # the actual conflict (different lanes serialized to one bank with
+        # different addresses); cells of DIFFERENT colors stacked = fine
+        # (each lane hit a different address, no within-warp serialization).
+        # Wait — corrected: same color = same addr = broadcast = fine.
+        # Different colors stacked in one column = different addrs → conflict.
+        unique_addrs = sorted(set(p.lane_addrs))
+        addr_to_idx = {a: i for i, a in enumerate(unique_addrs)}
+        lane_addr_idx = [addr_to_idx[a] for a in p.lane_addrs]
+        out.append(
+            {
+                "panel_title": f"{p.stage_name} ← {p.buf}",
+                "formula": (
+                    f"{p.stage_class}({p.rows}×{p.cols})  "
+                    + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")
+                ),
+                "lane_banks": p.lane_banks,
+                "lane_addr_idx": lane_addr_idx,
+                "n_unique_addrs": len(unique_addrs),
+                "counts": p.counts,
+                "distinct_addrs": p.distinct_addrs,
+                "max_way": p.max_way,
+                "raw_max_way": p.raw_max_way,
+                "conflict_events": p.conflict_events,
+                "lds128_events": p.lds128_events,
+                "vec_group_size": p.vec_group_size,
+                "avg_way": p.avg_way,
+                "rows": p.rows,
+                "cols": p.cols,
+                "pad": list(p.pad),
+                "smem_bytes": p.smem_bytes,
+                "notes": [
+                    f"index = ({', '.join(p.index_repr)})",
+                    f"enclosing axes = {', '.join(p.enclosing_axes) or '(none)'}",
+                    (
+                        f"LDS.32 events: {p.conflict_events}  ·  LDS.128 events: {p.lds128_events}"
+                        f"  (vec={p.vec_group_size})"
+                    ),
+                ],
+            }
+        )
+    return out
 
 
 HTML = """<!doctype html>
@@ -123,6 +143,11 @@ const WARP=32, BANKS=32;
 const palette={empty:'#2a2d33',ok:'#3ddc84',warn:'#ffb454',bad:'#ff5c7a'};
 const cellColor=c=>c===0?palette.empty:c===1?palette.ok:c<=4?palette.warn:palette.bad;
 const verdict=m=>m>4?'v-bad':m>1?'v-warn':'v-ok';
+// Categorical palette for "color = address". Picked for high contrast on
+// dark bg + reasonable distinguishability. Cycles modulo length when a
+// panel has more unique addresses than colors.
+const ADDR_PALETTE=['#7dd3fc','#3ddc84','#ffb454','#ff5c7a','#c084fc','#fcd34d','#67e8f9','#fb923c',
+                    '#a3e635','#f472b6','#60a5fa','#34d399','#fde047','#fb7185','#818cf8','#facc15'];
 
 const root=document.getElementById('columns');
 PAYLOAD.columns.forEach((col,ci)=>{
@@ -152,17 +177,29 @@ PAYLOAD.columns.forEach((col,ci)=>{
     for(let l=0;l<WARP;l++) for(let b=0;b<BANKS;b++)
       md.push({value:[b,l,0],itemStyle:{color:palette.empty}});
     p.lane_banks.forEach((bank,lane)=>{
-      // Color cells by distinct_addrs at that bank — broadcasts (multiple
-      // lanes at same address) are NOT conflicts and stay green.
-      const c=p.distinct_addrs[bank];
-      md.push({value:[bank,lane,c],itemStyle:{color:cellColor(c),shadowBlur:6,shadowColor:cellColor(c)+'88'}});
+      // Color cells by ADDRESS index. Same color = same address (broadcast).
+      // Different colors stacked in one bank column = different addresses
+      // serialized = real bank conflict.
+      const addrIdx = p.lane_addr_idx[lane];
+      const color = ADDR_PALETTE[addrIdx % ADDR_PALETTE.length];
+      md.push({
+        value:[bank,lane,1],
+        itemStyle:{color: color, shadowBlur:6, shadowColor:color+'66'},
+        addrIdx: addrIdx,
+      });
     });
     m.setOption({
       backgroundColor:'transparent',
       tooltip:{backgroundColor:'#0e1014',borderColor:'#2a2d33',textStyle:{color:'#e8eaed',fontSize:12},
         formatter:pt=>{const [b,l,c]=pt.value;
-          return c===0?`bank ${b}<br/><span style="color:#6b7280">no lane</span>`
-                      :`lane <b>${l}</b> → bank <b>${b}</b><br/>contention: <b>${c}</b> lane(s)`;}},
+          if (c === 0) return `bank ${b}<br/><span style="color:#6b7280">no lane</span>`;
+          const ai = pt.data.addrIdx;
+          const dist = p.distinct_addrs[b];
+          const verdict = dist === 1 ? '<span style="color:#3ddc84">broadcast — 0 events</span>'
+                       : dist <= 4 ? `<span style="color:#ffb454">${dist}-way conflict</span>`
+                                   : `<span style="color:#ff5c7a">${dist}-way conflict</span>`;
+          return `lane <b>${l}</b> → bank <b>${b}</b>, addr-color <b>#${ai}</b><br/>${verdict}`;
+        }},
       grid:{left:38,right:8,top:8,bottom:28},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],name:'bank',nameLocation:'middle',nameGap:22,
         nameTextStyle:{color:'#6b7280',fontSize:11},axisLine:{lineStyle:{color:'#2a2d33'}},
