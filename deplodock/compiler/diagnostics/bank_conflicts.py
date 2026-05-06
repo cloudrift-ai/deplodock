@@ -301,11 +301,13 @@ def simulate_graph(
     vectorizable Load runs (consecutive +0..+N-1 inner-element offsets)
     with their LDS.128-absorbed event counts.
     """
+    # Run simulation + chain detection on the un-load-filtered set: an
+    # LDS.128 chain spans sibling Loads of the same stage, so a single-
+    # Load drill-down still needs to see its siblings to know its real
+    # ``vec_group_size``. Apply ``load_filter`` only after annotation.
     out: list[BankConflictResult] = []
     seen: set[tuple] = set()
     for binding in find_all_bindings(graph, stage_filter):
-        if load_filter is not None and binding.load.name not in load_filter:
-            continue
         key = (binding.tile_op_name, binding.stage.name, binding.load.name)
         if key in seen:
             continue
@@ -314,6 +316,8 @@ def simulate_graph(
         if r is not None:
             out.append(r)
     annotate_lds128(out)
+    if load_filter is not None:
+        out = [r for r in out if r.load_name in load_filter]
     return out
 
 
