@@ -37,49 +37,31 @@ def graph_from_ir_path(path: str) -> Graph:
 
 
 def _serialize(panels: list[BankConflictResult]) -> list[dict]:
-    out: list[dict] = []
-    for p in panels:
-        # Per-bank stack of (address, lane_count) — the conventional view
-        # where stacked boxes in one column are literal bank conflicts.
-        bank_stacks: list[list[tuple[int, int]]] = [[] for _ in range(32)]
-        addr_lane_counts: dict[tuple[int, int], int] = {}
-        for lane, (bank, addr) in enumerate(zip(p.lane_banks, p.lane_addrs, strict=True)):
-            del lane
-            addr_lane_counts[(bank, addr)] = addr_lane_counts.get((bank, addr), 0) + 1
-        for (bank, addr), n_lanes in addr_lane_counts.items():
-            bank_stacks[bank].append((addr, n_lanes))
-        for stack in bank_stacks:
-            stack.sort()
-        out.append(
-            {
-                "panel_title": f"{p.stage_name} ← {p.buf}",
-                "formula": (
-                    f"{p.stage_class}({p.rows}×{p.cols})  "
-                    + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")
-                ),
-                "bank_stacks": [[list(t) for t in stack] for stack in bank_stacks],
-                "distinct_addrs": p.distinct_addrs,
-                "max_way": p.max_way,
-                "raw_max_way": p.raw_max_way,
-                "conflict_events": p.conflict_events,
-                "lds128_events": p.lds128_events,
-                "vec_group_size": p.vec_group_size,
-                "avg_way": p.avg_way,
-                "rows": p.rows,
-                "cols": p.cols,
-                "pad": list(p.pad),
-                "smem_bytes": p.smem_bytes,
-                "notes": [
-                    f"index = ({', '.join(p.index_repr)})",
-                    f"enclosing axes = {', '.join(p.enclosing_axes) or '(none)'}",
-                    (
-                        f"LDS.32 events: {p.conflict_events}  ·  LDS.128 events: {p.lds128_events}"
-                        f"  (vec={p.vec_group_size})"
-                    ),
-                ],
-            }
-        )
-    return out
+    return [
+        {
+            "panel_title": f"{p.stage_name} ← {p.buf}",
+            "formula": (f"{p.stage_class}({p.rows}×{p.cols})  " + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")),
+            "lane_banks": p.lane_banks,
+            "counts": p.counts,
+            "distinct_addrs": p.distinct_addrs,
+            "max_way": p.max_way,
+            "raw_max_way": p.raw_max_way,
+            "conflict_events": p.conflict_events,
+            "lds128_events": p.lds128_events,
+            "vec_group_size": p.vec_group_size,
+            "avg_way": p.avg_way,
+            "rows": p.rows,
+            "cols": p.cols,
+            "pad": list(p.pad),
+            "smem_bytes": p.smem_bytes,
+            "notes": [
+                f"index = ({', '.join(p.index_repr)})",
+                f"enclosing axes = {', '.join(p.enclosing_axes) or '(none)'}",
+                (f"LDS.32 events: {p.conflict_events}  ·  LDS.128 events: {p.lds128_events}  (vec={p.vec_group_size})"),
+            ],
+        }
+        for p in panels
+    ]
 
 
 HTML = """<!doctype html>
@@ -160,70 +142,39 @@ PAYLOAD.columns.forEach((col,ci)=>{
       <div class="card-formula">${p.formula}</div>
       <span class="card-verdict ${verdict(p.max_way)}"><span class="dot"></span>
         max-way ${p.max_way} · avg ${p.avg_way.toFixed(1)} lane/bank</span>
-      <div class="matrix" id="m_${id}" style="height:${Math.min(240, 32 + Math.max(...p.distinct_addrs) * 22)}px"></div>
+      <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
       <div class="card-notes">${p.notes.join('<br/>')}</div>`;
     colEl.appendChild(card);
 
-    // Conventional bank-conflict view: one box per UNIQUE address per
-    // bank, stacked vertically. Multiple boxes in the same column =
-    // serialized accesses (real bank conflict). Box label = lane count
-    // broadcasting that address.
     const m=echarts.init(document.getElementById(`m_${id}`),null,{renderer:'canvas'});
-    const maxStack = Math.max(1, ...p.distinct_addrs);
     const md=[];
-    for (let bank = 0; bank < BANKS; bank++) {
-      const stack = p.bank_stacks[bank];
-      const distinct = stack.length;
-      stack.forEach(([addr, lanes], slot) => {
-        md.push({
-          value: [bank, slot, distinct],
-          name: `bank ${bank}`,
-          addr: addr,
-          lanes: lanes,
-          distinct: distinct,
-          itemStyle: {color: cellColor(distinct), shadowBlur: 6, shadowColor: cellColor(distinct)+'66'},
-        });
-      });
-    }
+    for(let l=0;l<WARP;l++) for(let b=0;b<BANKS;b++)
+      md.push({value:[b,l,0],itemStyle:{color:palette.empty}});
+    p.lane_banks.forEach((bank,lane)=>{
+      // Color cells by distinct_addrs at that bank — broadcasts (multiple
+      // lanes at same address) are NOT conflicts and stay green.
+      const c=p.distinct_addrs[bank];
+      md.push({value:[bank,lane,c],itemStyle:{color:cellColor(c),shadowBlur:6,shadowColor:cellColor(c)+'88'}});
+    });
     m.setOption({
       backgroundColor:'transparent',
-      tooltip:{
-        backgroundColor:'#0e1014', borderColor:'#2a2d33',
-        textStyle:{color:'#e8eaed', fontSize:12},
-        formatter: pt => {
-          const d = pt.data;
-          const tag = d.distinct === 1
-            ? `<span style="color:#3ddc84">1 distinct addr — no conflict</span>`
-            : `<span style="color:${d.distinct <= 4 ? '#ffb454':'#ff5c7a'}">${d.distinct}-way conflict</span>`;
-          return `bank <b>${pt.value[0]}</b>, addr <b>${d.addr}</b><br/>` +
-                 `lanes broadcasting this addr: <b>${d.lanes}</b><br/>${tag}`;
-        },
-      },
-      grid:{left:38, right:8, top:8, bottom:28},
-      xAxis:{
-        type:'category', data:[...Array(BANKS).keys()],
-        name:'bank', nameLocation:'middle', nameGap:22,
-        nameTextStyle:{color:'#6b7280', fontSize:11},
-        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
-        axisLabel:{color:'#6b7280', fontSize:10, interval:3},
-      },
-      yAxis:{
-        type:'category', data:[...Array(maxStack).keys()],
-        name:'distinct addr', nameLocation:'middle', nameGap:28,
-        nameTextStyle:{color:'#6b7280', fontSize:11},
-        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
-        axisLabel:{color:'#6b7280', fontSize:10},
-      },
-      series:[{
-        type:'heatmap', data: md, progressive:0,
-        label:{show: true, color:'#0e1014', fontSize: 10, fontWeight: 600,
-               formatter: pp => `${pp.data.lanes}`},
-        itemStyle:{borderRadius:3, borderColor:'#161a21', borderWidth:1},
-        emphasis:{itemStyle:{borderColor:'#fff', borderWidth:1.5}},
-        animationDuration:500, animationEasing:'cubicOut',
-      }],
-    });
+      tooltip:{backgroundColor:'#0e1014',borderColor:'#2a2d33',textStyle:{color:'#e8eaed',fontSize:12},
+        formatter:pt=>{const [b,l,c]=pt.value;
+          return c===0?`bank ${b}<br/><span style="color:#6b7280">no lane</span>`
+                      :`lane <b>${l}</b> → bank <b>${b}</b><br/>contention: <b>${c}</b> lane(s)`;}},
+      grid:{left:38,right:8,top:8,bottom:28},
+      xAxis:{type:'category',data:[...Array(BANKS).keys()],name:'bank',nameLocation:'middle',nameGap:22,
+        nameTextStyle:{color:'#6b7280',fontSize:11},axisLine:{lineStyle:{color:'#2a2d33'}},
+        axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:10,interval:3}},
+      yAxis:{type:'category',data:[...Array(WARP).keys()],inverse:true,name:'lane',
+        nameLocation:'middle',nameGap:28,nameTextStyle:{color:'#6b7280',fontSize:11},
+        axisLine:{lineStyle:{color:'#2a2d33'}},axisTick:{show:false},
+        axisLabel:{color:'#6b7280',fontSize:10,interval:3}},
+      series:[{type:'heatmap',data:md,progressive:0,
+        itemStyle:{borderRadius:2,borderColor:'#161a21',borderWidth:1},
+        emphasis:{itemStyle:{borderColor:'#fff',borderWidth:1.5}},
+        animationDuration:500,animationEasing:'cubicOut'}]});
 
     const h=echarts.init(document.getElementById(`h_${id}`),null,{renderer:'canvas'});
     h.setOption({
