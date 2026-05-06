@@ -10,17 +10,26 @@ Each case is one (op, shape) pair drawn from real transformer blocks (TinyLlama
 hidden=2048, intermediate=5632, heads=32, head_dim=64; Qwen2.5-7B hidden=3584,
 intermediate=18944, heads=28, head_dim=128) at `seq_len ∈ {32, 128, 512}`.
 
-| Op         | What runs (deplodock)                          | What runs (PyTorch)              |
-|------------|------------------------------------------------|----------------------------------|
-| `matmul`   | `MatmulOp(a, b)`                               | `torch.matmul`                   |
-| `rmsnorm`  | `RmsNormOp(x, w)`                              | `F.rms_norm`                     |
-| `softmax`  | `SoftmaxOp(x)`                                 | `F.softmax`                      |
-| `silu_mul` | `ElementwiseOp("silu") → ElementwiseOp("mul")` | `F.silu(gate) * up`              |
-| `sdpa`     | `SdpaOp(q, k, v, is_causal=True)` (fused)      | `F.scaled_dot_product_attention` |
+| Op                | What runs (deplodock)                          | What runs (PyTorch)              |
+|-------------------|------------------------------------------------|----------------------------------|
+| `matmul`          | `MatmulOp(a, b)`                               | `torch.matmul`                   |
+| `rmsnorm`         | `RmsNormOp(x, w)`                              | `F.rms_norm`                     |
+| `softmax`         | `SoftmaxOp(x)`                                 | `F.softmax`                      |
+| `silu_mul`        | `ElementwiseOp("silu") → ElementwiseOp("mul")` | `F.silu(gate) * up`              |
+| `sdpa`            | `SdpaOp(q, k, v, is_causal=True)` (fused)      | `F.scaled_dot_product_attention` |
+| `matmul_add`      | `MatmulOp → ElementwiseOp("add")`              | `torch.matmul(x, w) + r`         |
+| `silu_mul_matmul` | `silu → mul → MatmulOp`                        | `torch.matmul(F.silu(g)*u, w)`   |
 
 Primitive ops (`matmul`, `rmsnorm`, `softmax`, `silu_mul`) live in
-`test_primitives.py`. Fused signatures (`sdpa`) live in `test_fused.py` and are
-`xfail` until SDPA fusion is robust.
+`test_primitives.py`. Fused signatures (`sdpa`, `matmul_add`,
+`silu_mul_matmul`) live in `test_fused.py`.
+
+`matmul_add` mirrors the `k_add_*_reduce` kernels Deplodock emits inside a
+block — the residual add gets fused into the matmul epilogue for o_proj /
+down_proj. `silu_mul_matmul` mirrors `k_mul_*_reduce` — the SiLU+up gating
+fuses into the down_proj reduction. Both should compile to a single launch;
+that's the kernel that actually dominates block latency, so measuring the
+fused chain is the apples-to-apples comparison.
 
 Deplodock currently emits FP32 only, so both sides run FP32. The `dtype` field
 on `Case` is kept for future FP16 support.

@@ -11,9 +11,15 @@ transformer block at a real shape. The same Case drives both:
   ``CudaBackend``.
 
 Shapes are pinned to what TinyLlama-1.1B and Qwen2.5-7B blocks actually
-see; we deliberately keep the list small (~30 cases) so the suite runs
-in seconds and the summary table fits on one screen. Add cases by
-appending to ``CASES`` — no other surgery needed.
+see; we deliberately keep the list compact so the suite runs in seconds
+and the summary table fits on one screen. Add cases by appending to
+``CASES`` — no other surgery needed.
+
+Fused chains (``matmul_add``, ``silu_mul_matmul``) live alongside the
+primitives because the dominant kernels Deplodock emits inside a block
+are matmuls with elementwise epilogues fused in (e.g. down_proj+residual,
+silu·up·W_down). Measuring the fused chain end-to-end is the apples-to-
+apples comparison against the kernel that actually runs.
 
 Deplodock currently emits FP32 only, so all cases run FP32 on both
 sides for an apples-to-apples comparison. The ``dtype`` field is kept
@@ -156,8 +162,50 @@ def _sdpa_cases() -> list[Case]:
     return cases
 
 
+def _matmul_add_cases() -> list[Case]:
+    """Matmul fused with a residual add: ``X @ W + R``.
+
+    Mirrors the ``k_add_*_reduce`` kernels Deplodock emits for o_proj
+    and down_proj where the residual add gets fused into the matmul
+    epilogue.
+    """
+    cases: list[Case] = []
+    for tag, hidden, inter in [("tinyllama", _TL_H, _TL_I), ("qwen", _Q_H, _Q_I)]:
+        for s in _SEQ_LENS:
+            for proj, k_in in [("o_proj", hidden), ("down_proj", inter)]:
+                cases.append(
+                    Case(
+                        name=f"matmul_add.{tag}.{proj}.s{s}",
+                        op="matmul_add",
+                        shapes=((1, s, k_in), (k_in, hidden), (1, s, hidden)),
+                        tags=(tag, "matmul_add", proj),
+                    )
+                )
+    return cases
+
+
+def _silu_mul_matmul_cases() -> list[Case]:
+    """SiLU-gated MLP fused with down_proj: ``(silu(gate) * up) @ W_down``.
+
+    Mirrors the dominant ``k_mul_*_reduce`` kernel — the elementwise
+    SiLU+multiply gets fused into the down_proj matmul reduction.
+    """
+    cases: list[Case] = []
+    for tag, hidden, inter in [("tinyllama", _TL_H, _TL_I), ("qwen", _Q_H, _Q_I)]:
+        for s in _SEQ_LENS:
+            cases.append(
+                Case(
+                    name=f"silu_mul_matmul.{tag}.s{s}",
+                    op="silu_mul_matmul",
+                    shapes=((1, s, inter), (1, s, inter), (inter, hidden)),
+                    tags=(tag, "silu_mul_matmul", "mlp", "down_proj"),
+                )
+            )
+    return cases
+
+
 PRIMITIVE_CASES: list[Case] = _matmul_cases() + _rmsnorm_cases() + _softmax_cases() + _silu_mul_cases()
-FUSED_CASES: list[Case] = _sdpa_cases()
+FUSED_CASES: list[Case] = _sdpa_cases() + _matmul_add_cases() + _silu_mul_matmul_cases()
 CASES: list[Case] = PRIMITIVE_CASES + FUSED_CASES
 
 
@@ -204,6 +252,18 @@ def build_torch_ref(case: Case) -> Callable[[], None]:
         v = _r(case.shapes[2])
         # GQA expansion handled by SDPA when enable_gqa=True (PyTorch ≥ 2.5).
         return lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=q.shape[-3] != k.shape[-3])
+
+    if case.op == "matmul_add":
+        x = _r(case.shapes[0])
+        w = _r(case.shapes[1])
+        r = _r(case.shapes[2])
+        return lambda: torch.matmul(x, w) + r
+
+    if case.op == "silu_mul_matmul":
+        gate = _r(case.shapes[0])
+        up = _r(case.shapes[1])
+        w = _r(case.shapes[2])
+        return lambda: torch.matmul(F.silu(gate) * up, w)
 
     raise ValueError(f"unknown op: {case.op}")
 
@@ -268,6 +328,31 @@ def build_deplodock_graph(case: Case):
         g.add_node(InputOp(), [], Tensor("v", v_shape), node_id="v")
         g.add_node(SdpaOp(is_causal=True), ["q", "k", "v"], Tensor("y", out_shape), node_id="y")
         g.inputs = ["q", "k", "v"]
+        g.outputs = ["y"]
+        return g
+
+    if case.op == "matmul_add":
+        x_shape, w_shape, r_shape = case.shapes
+        mm_shape = tuple(x_shape[:-1]) + (w_shape[-1],)
+        g.add_node(InputOp(), [], Tensor("x", x_shape), node_id="x")
+        g.add_node(InputOp(), [], Tensor("w", w_shape), node_id="w")
+        g.add_node(InputOp(), [], Tensor("r", r_shape), node_id="r")
+        g.add_node(MatmulOp(), ["x", "w"], Tensor("m", mm_shape), node_id="m")
+        g.add_node(ElementwiseOp("add"), ["m", "r"], Tensor("y", mm_shape), node_id="y")
+        g.inputs = ["x", "w", "r"]
+        g.outputs = ["y"]
+        return g
+
+    if case.op == "silu_mul_matmul":
+        gate_shape, up_shape, w_shape = case.shapes
+        mm_shape = tuple(gate_shape[:-1]) + (w_shape[-1],)
+        g.add_node(InputOp(), [], Tensor("gate", gate_shape), node_id="gate")
+        g.add_node(InputOp(), [], Tensor("up", up_shape), node_id="up")
+        g.add_node(InputOp(), [], Tensor("w", w_shape), node_id="w")
+        g.add_node(ElementwiseOp("silu"), ["gate"], Tensor("s", gate_shape), node_id="s")
+        g.add_node(ElementwiseOp("multiply"), ["s", "up"], Tensor("p", gate_shape), node_id="p")
+        g.add_node(MatmulOp(), ["p", "w"], Tensor("y", mm_shape), node_id="y")
+        g.inputs = ["gate", "up", "w"]
         g.outputs = ["y"]
         return g
 

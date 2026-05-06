@@ -126,17 +126,18 @@ def _split_tile(tile: Tile, splitk: int) -> Tile | None:
     new_k_loop = Loop(axis=K_o_new, body=new_inner)
 
     write = stmts[write_idx]
+    prelude_stmts = stmts[:k_idx]
     epilogue_stmts = stmts[k_idx + 1 : write_idx]  # may be empty
 
     if not epilogue_stmts and write.value == _find_accum_name(new_k_loop):
         # Plain matmul — every CTA atomic-adds its acc partial.
         new_write = replace(write, reduce_op=ElementwiseImpl("add"))
-        head_stmts = stmts[:k_idx] + [new_k_loop, new_write]
+        head_stmts = list(prelude_stmts) + [new_k_loop, new_write]
     else:
         acc_name = _find_accum_name(new_k_loop)
         if acc_name is None:
             raise RuleSkipped("could not locate the Accum SSA name inside K_o body")
-        head_stmts = _rewrite_epilogue(stmts, k_idx, write_idx, write, epilogue_stmts, new_k_loop, acc_name, K_split)
+        head_stmts = _rewrite_epilogue(prelude_stmts, write, epilogue_stmts, new_k_loop, acc_name, K_split)
         if head_stmts is None:
             raise RuleSkipped("epilogue isn't a split-K-safe shape (linear-multiplicative or acc + independent-load)")
 
@@ -159,7 +160,7 @@ def _find_accum_name(k_o_loop: Loop) -> str | None:
     return None
 
 
-def _rewrite_epilogue(stmts, k_idx, write_idx, write, epilogue_stmts, new_k_loop, acc_name, K_split):
+def _rewrite_epilogue(prelude_stmts, write, epilogue_stmts, new_k_loop, acc_name, K_split):
     """Two split-K-safe epilogue shapes are recognized:
 
     1. **Linear-multiplicative**: ``Write.value`` is reachable from
@@ -169,32 +170,48 @@ def _rewrite_epilogue(stmts, k_idx, write_idx, write, epilogue_stmts, new_k_loop
        computes its own ``v = c * partial_acc`` and ``atomic_add``s.
        Emit: keep epilogue as-is, mark Write as ``reduce_op=add``.
 
-    2. **Linear-additive (residual)**: epilogue is exactly
-       ``Load(r); Assign(v, add, r, acc); Write(v)``. Then
-       ``sum_i a_i + r`` doesn't distribute — only one CTA contributes
-       ``r``. Emit: always-on ``atomic_add(out, acc)`` plus
-       ``Cond(K_split == 0, atomic_add(out, r))``.
+    2. **Linear-additive (residual)**: ``Assign(v, add, r, acc); Write(v)``
+       where ``r`` is loaded somewhere — either earlier in the
+       epilogue, or hoisted into the prelude (``stmts[:k_idx]``) when
+       the residual Load is K-independent and the lifter pulls it out
+       above the K-loop. Then ``sum_i a_i + r`` doesn't distribute —
+       only one CTA contributes ``r``. Emit: always-on
+       ``atomic_add(out, acc)`` plus ``Cond(K_split == 0,
+       atomic_add(out, r))``. The hoisted Load stays in the prelude
+       (every CTA executes it cheaply); only the Write is conditional.
 
     Returns the list of head stmts (everything up to and including the
     rewritten Write/Cond), or ``None`` if neither pattern matches."""
     # Try multiplicative-only chain first (cheap, common — k_mul_8_reduce).
     if _is_linear_multiplicative_chain(epilogue_stmts, acc_name, write.value):
         new_write = replace(write, reduce_op=ElementwiseImpl("add"))
-        return stmts[:k_idx] + [new_k_loop] + list(epilogue_stmts) + [new_write]
+        return list(prelude_stmts) + [new_k_loop] + list(epilogue_stmts) + [new_write]
 
-    # Fall back to the additive-residual pattern (k_add_5_reduce).
-    residual_name = _extract_simple_residual(epilogue_stmts, acc_name, write.value)
-    if residual_name is None:
+    # Fall back to the additive-residual pattern (k_add_5_reduce). Accept
+    # the residual Load whether it sits in the epilogue or has been
+    # hoisted into the prelude (K-independent residual loads usually are).
+    residual = _extract_simple_residual(prelude_stmts, epilogue_stmts, acc_name, write.value)
+    if residual is None:
         return None
-    residual_load = next(s for s in epilogue_stmts if hasattr(s, "name") and s.name == residual_name)
-    always_write = Write(output=write.output, index=write.index, value=acc_name, reduce_op=ElementwiseImpl("add"))
+    residual_name, residual_in_epilogue = residual
     cond_write = Write(output=write.output, index=write.index, value=residual_name, reduce_op=ElementwiseImpl("add"))
+    always_write = Write(output=write.output, index=write.index, value=acc_name, reduce_op=ElementwiseImpl("add"))
+    if residual_in_epilogue:
+        # The Load lives in the epilogue position — move it into the Cond
+        # body so the cond_write's referent stays in scope (and only one
+        # CTA pays the load).
+        residual_load = next(s for s in epilogue_stmts[:-1] if hasattr(s, "name") and s.name == residual_name)
+        cond_body = (residual_load, cond_write)
+    else:
+        # Load was hoisted into the prelude — every CTA already has it
+        # in scope; just guard the Write.
+        cond_body = (cond_write,)
     cond = Cond(
         cond=BinaryExpr("==", Var(K_split.name), Literal(0, "int")),
-        body=Body((residual_load, cond_write)),
+        body=Body(cond_body),
         else_body=Body(()),
     )
-    return stmts[:k_idx] + [new_k_loop, always_write, cond]
+    return list(prelude_stmts) + [new_k_loop, always_write, cond]
 
 
 def _is_linear_multiplicative_chain(epilogue_stmts: list, acc_name: str, write_value: str) -> bool:
@@ -230,25 +247,36 @@ def _is_linear_multiplicative_chain(epilogue_stmts: list, acc_name: str, write_v
     return write_value in acc_dep
 
 
-def _extract_simple_residual(epilogue_stmts: list, acc_name: str, write_value: str) -> str | None:
-    """Match the exact 3-stmt pattern: ``Load(ld) ; Assign(v, add, ld,
-    acc) ; Write(v)`` — and return ``ld``'s SSA name. Returns None on
-    any deviation (multiple loads, non-add op, indirect deps, etc.)."""
+def _extract_simple_residual(prelude_stmts, epilogue_stmts: list, acc_name: str, write_value: str):
+    """Match an additive-residual epilogue: ``Assign(v, add, ld, acc);
+    Write(v)`` where ``ld`` is a ``Load`` either earlier in
+    ``epilogue_stmts`` or hoisted into ``prelude_stmts``. Returns
+    ``(residual_name, in_epilogue)`` or ``None`` on any deviation
+    (non-add op, indirect deps, residual not actually loaded, etc.)."""
     from deplodock.compiler.ir.stmt import Assign, Load  # noqa: PLC0415
 
-    if len(epilogue_stmts) != 2:
+    if not epilogue_stmts:
         return None
-    ld, asn = epilogue_stmts
-    if not isinstance(ld, Load) or not isinstance(asn, Assign):
+    asn = epilogue_stmts[-1]
+    if not isinstance(asn, Assign):
         return None
     if asn.name != write_value:
         return None
     if asn.op.name != "add":
         return None
-    args = set(asn.args)
-    if args != {ld.name, acc_name}:
+    if acc_name not in asn.args or len(asn.args) != 2:
         return None
-    return ld.name
+    other = next(a for a in asn.args if a != acc_name)
+    # Any earlier epilogue stmts must just be the residual Load itself.
+    earlier = epilogue_stmts[:-1]
+    if any(not isinstance(s, Load) for s in earlier):
+        return None
+    if any(s.name == other for s in earlier if isinstance(s, Load)):
+        return (other, True)
+    # Residual Load may have been hoisted to the prelude.
+    if any(isinstance(s, Load) and s.name == other for s in prelude_stmts):
+        return (other, False)
+    return None
 
 
 def _is_chunked_matmul(loop: Loop) -> bool:
