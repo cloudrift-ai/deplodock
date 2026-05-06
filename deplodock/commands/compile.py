@@ -15,6 +15,7 @@ from deplodock.compiler.pipeline import (
     TENSOR_PASSES,
     TILE_PASSES,
 )
+from deplodock.compiler.pipeline.rule_diff import PASS_SHORTHAND
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
@@ -39,16 +40,12 @@ _DEFAULT_PASSES = LOOP_PASSES
 
 # Single-letter shortcuts for each pass. Passing a contiguous string of
 # these letters to --passes is equivalent to the expanded comma list
-# (e.g. 'dolft' expands to the full front-to-tile pipeline).
-_PASS_SHORTCUTS = {
-    "d": "frontend/decomposition",
-    "o": "frontend/optimization",
-    "l": "loop/lifting",
-    "f": "loop/fusion",
-    "t": "lowering/tile",
-    "k": "lowering/kernel",
-    "c": "lowering/cuda",
-}
+# (e.g. 'dolft' expands to the full front-to-tile pipeline). The same
+# letters are used as the prefix in ``-vv`` diff markers (e.g.
+# ``>>> t:005_blockify_launch``); the canonical mapping lives in
+# ``compiler/pipeline/rule_diff.PASS_SHORTHAND`` so the engine can build
+# the marker names without depending on the CLI layer.
+_PASS_SHORTCUTS = {short: full for full, short in PASS_SHORTHAND.items()}
 
 
 def register_compile_command(subparsers):
@@ -110,8 +107,31 @@ def register_compile_command(subparsers):
         help=(
             "Increase verbosity. Default (no flag): only the requested IR is printed. "
             "-v: also pass timings and per-rule applied counts. "
-            "-vv: also a snapshot of every rule application (matched subgraph + rewritten fragment)."
+            "-vv: also a unified-diff snapshot of every rule application, bracketed by "
+            "``>>> <pass>:NNN_rulename`` / ``<<< <pass>:NNN_rulename`` markers (pass shorthands: "
+            "d=decomposition, o=optimization, l=lifting, f=fusion, t=tile, k=kernel, c=cuda). "
+            "Diffs go to stdout (no ``2>&1`` needed). "
+            "Slice one pass: ``... -vv | awk '/^>>> t:/,/^<<< t:/'``. "
+            "Slice one rule: ``... -vv | awk '/^>>> t:005/,/^<<< t:005/'``."
         ),
+    )
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Colorize the -vv diff body. ``auto`` (default) uses ANSI when stdout is a tty and NO_COLOR is unset.",
+    )
+    parser.add_argument(
+        "--diff-context",
+        type=int,
+        default=2,
+        help="Unified-diff context lines for -vv rule snapshots (default: 2).",
+    )
+    parser.add_argument(
+        "--diff-max-lines",
+        type=int,
+        default=200,
+        help="If a single rule's -vv diff exceeds N lines, fall back to full before/after (default: 200).",
     )
     parser.set_defaults(func=handle_compile)
 
@@ -138,7 +158,16 @@ def handle_compile(args):
 
     from deplodock.compiler.pipeline import run_pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
+    from deplodock.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
     from deplodock.compiler.target import apply_target_arg
+
+    set_config(
+        RuleRenderConfig(
+            color=should_use_color(sys.stdout, args.color),
+            context=args.diff_context,
+            max_lines=args.diff_max_lines,
+        )
+    )
 
     apply_target_arg(args)
     passes = _resolve_passes(args)

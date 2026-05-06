@@ -102,8 +102,11 @@ def test_compile_dump_dir_writes_rule_application_files(run_cli, tmp_path):
     fusion_json = dump / "04_loop_fusion__001_merge_loop_ops.rules.json"
     assert fusion_txt.exists() and fusion_json.exists()
     text = fusion_txt.read_text()
-    assert "=== rule 001_merge_loop_ops matched at" in text
-    assert "before:" in text and "after:" in text
+    # Diff-style rendering with bracketing markers (see pipeline/rule_diff.py);
+    # the ``f:`` prefix is the loop/fusion pass shorthand.
+    assert ">>> f:001_merge_loop_ops" in text
+    assert "<<< f:001_merge_loop_ops" in text
+    assert "@@ matched at" in text
 
     records = json.loads(fusion_json.read_text())
     assert isinstance(records, list) and records

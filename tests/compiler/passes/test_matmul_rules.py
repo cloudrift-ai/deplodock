@@ -119,10 +119,11 @@ def test_pure_elementwise_does_not_fire_split_k(recording_dump):
 # --- engine: RuleSkipped exception path ------------------------------
 
 
-def test_rule_skipped_logs_reason_and_continues(caplog):
+def test_rule_skipped_logs_reason_and_continues(capsys):
     """A rule that raises ``RuleSkipped`` is treated as no-op; the
-    engine logs the reason at DEBUG and proceeds. We verify both:
-    pipeline still completes, and the reason text is in the debug log.
+    engine emits the reason on stdout (so users can ``grep`` ``-vv``
+    output without ``2>&1``) and proceeds. We verify both: pipeline
+    still completes, and the reason text is on stdout.
     """
     import logging
 
@@ -133,11 +134,17 @@ def test_rule_skipped_logs_reason_and_continues(caplog):
     g.outputs = ["o"]
 
     # Pure elementwise → tile_matmul_k raises RuleSkipped (no matmul-shaped
-    # reduce) and cooperative_reduce raises (no reduce Loop).
-    with caplog.at_level(logging.DEBUG, logger="deplodock.compiler.pipeline.engine"):
+    # reduce) and cooperative_reduce raises (no reduce Loop). The engine's
+    # ``debug_on`` gate keys off the engine logger's level — bump that to
+    # DEBUG so ``emit`` actually fires.
+    logging.getLogger("deplodock.compiler.pipeline.engine").setLevel(logging.DEBUG)
+    try:
         run_pipeline(g, TILE_PASSES)
+    finally:
+        logging.getLogger("deplodock.compiler.pipeline.engine").setLevel(logging.NOTSET)
 
-    skip_messages = [r.message for r in caplog.records if "skipped" in r.message]
+    out = capsys.readouterr().out
+    skip_messages = [ln for ln in out.splitlines() if ln.startswith("--- ") and "skipped" in ln]
     assert any("tile_matmul_k" in m for m in skip_messages), skip_messages
     assert any("cooperative_reduce" in m for m in skip_messages), skip_messages
 

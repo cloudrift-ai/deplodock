@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.pipeline.dump import _canonical_node_id
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
@@ -312,6 +311,10 @@ def _apply_rules(
                     # before/after render text.
                     debug_on = logger.isEnabledFor(logging.DEBUG)
                     pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes}
+                    # Output-name → pre-rewrite node id so the formatter
+                    # can follow renames (rules like ``tileify`` mutate
+                    # the op AND ``rename_node`` to a friendlier id).
+                    pre_names = {graph.nodes[nid].output.name: nid for nid in pre_ops if nid in graph.nodes}
                     kwargs = _build_rewrite_kwargs(rule, graph, match)
                     if kwargs is None:
                         continue
@@ -319,7 +322,9 @@ def _apply_rules(
                         fragment = rule.rewrite(**kwargs)
                     except RuleSkipped as exc:
                         if debug_on:
-                            logger.debug("rule %s skipped at %s: %s", rule.name, _canonical_node_id(match.root_node_id), exc.reason)
+                            from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped
+
+                            emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
                         rewrite_time += time.monotonic() - t1
                         continue
                     if fragment is None:
@@ -329,18 +334,22 @@ def _apply_rules(
                         # from ``graph.nodes`` even though the rule did
                         # apply).
                         if any(nid not in graph.nodes or graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops):
-                            text = _format_inplace_application(rule.name, graph, match, pre_ops)
+                            text = _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name, pre_names=pre_names)
                             if debug_on:
-                                logger.debug(text)
+                                from deplodock.compiler.pipeline.rule_diff import emit
+
+                                emit(text)
                             if dump is not None and pass_idx is not None and pass_name is not None:
                                 record = _record_inplace_application(graph, match, pre_ops)
                                 dump.on_rule(pass_idx, pass_name, rule.name, record, text)
                             applied += 1
                         rewrite_time += time.monotonic() - t1
                         continue
-                    text = _format_rule_application(rule.name, graph, match, fragment)
+                    text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name)
                     if debug_on:
-                        logger.debug(text)
+                        from deplodock.compiler.pipeline.rule_diff import emit
+
+                        emit(text)
                     if dump is not None and pass_idx is not None and pass_name is not None:
                         record = _record_rule_application(graph, match, fragment)
                         dump.on_rule(pass_idx, pass_name, rule.name, record, text)
@@ -364,42 +373,70 @@ def _apply_rules(
 # ---------------------------------------------------------------------------
 
 
-def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Graph) -> str:
-    """Render a one-rule-application snapshot: matched subgraph (the
-    nodes selected from the host graph) + rewritten fragment. Kernel
+def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Graph, *, pass_name: str | None = None) -> str:
+    """Render a one-rule-application snapshot as a unified diff bracketed
+    by ``>>> name`` / ``<<< name`` markers (see ``rule_diff``). Kernel
     ops (LoopOp/TileOp/KernelOp/CudaOp) are pretty-printed via their
     dedicated printers rather than dumped as a body repr."""
+    from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
+
     matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
     matched_ids.add(match.root_node_id)
-
-    lines = [f"=== rule {name} matched at {_canonical_node_id(match.root_node_id)} ==="]
-    lines.append("before:")
     matched_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes]
-    lines.extend(f"    {line}" for line in _format_nodes(matched_nodes, graph).splitlines())
-    lines.append("after:")
+    before = _format_nodes(matched_nodes, graph)
     frag_nodes = [fragment.nodes[nid] for nid in fragment.topological_order()]
-    lines.extend(f"    {line}" for line in _format_nodes(frag_nodes, fragment).splitlines())
-    return "\n".join(lines)
+    after = _format_nodes(frag_nodes, fragment)
+    return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id}")
 
 
-def _format_inplace_application(name: str, graph: Graph, match: Match, pre_ops: dict) -> str:
+def _format_inplace_application(
+    name: str,
+    graph: Graph,
+    match: Match,
+    pre_ops: dict,
+    *,
+    pass_name: str | None = None,
+    pre_names: dict[str, str] | None = None,
+) -> str:
     """Snapshot for rules that mutate ``node.op`` in place and return
     None (e.g. lowering/tile). Renders before/after of the mutated
-    nodes by swapping their op temporarily for the "before" view."""
-    mutated = [nid for nid, prev in pre_ops.items() if nid in graph.nodes and graph.nodes[nid].op is not prev]
-    lines = [f"=== rule {name} matched at {_canonical_node_id(match.root_node_id)} (in-place) ==="]
-    lines.append("before:")
-    post_ops = {nid: graph.nodes[nid].op for nid in mutated}
-    for nid in mutated:
-        graph.nodes[nid].op = pre_ops[nid]
-    before_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
-    lines.extend(f"    {line}" for line in _format_nodes(before_nodes, graph).splitlines())
-    for nid in mutated:
-        graph.nodes[nid].op = post_ops[nid]
-    lines.append("after:")
-    after_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in mutated]
-    lines.extend(f"    {line}" for line in _format_nodes(after_nodes, graph).splitlines())
-    return "\n".join(lines)
+    nodes as a unified diff by swapping their op temporarily for the
+    "before" view.
+
+    Some rules (notably ``tileify``) mutate the op AND rename the node
+    to a friendlier id. ``pre_names`` (output-name → pre-rewrite id)
+    lets the formatter resolve a renamed-away id to its post-rewrite
+    counterpart by matching on output name, which is preserved across
+    ``rename_node``."""
+    from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
+
+    # Build a "current id" for each pre_ops entry, following any rename
+    # that happened during the rewrite.
+    name_to_post_id = {graph.nodes[nid].output.name: nid for nid in graph.nodes} if pre_names else {}
+    pre_to_post: dict[str, str] = {}
+    for nid in pre_ops:
+        if nid in graph.nodes:
+            pre_to_post[nid] = nid
+        elif pre_names is not None:
+            for out_name, old_id in pre_names.items():
+                if old_id == nid and out_name in name_to_post_id:
+                    pre_to_post[nid] = name_to_post_id[out_name]
+                    break
+
+    mutated_pre = [nid for nid in pre_ops if nid in pre_to_post and graph.nodes[pre_to_post[nid]].op is not pre_ops[nid]]
+    post_ids = [pre_to_post[nid] for nid in mutated_pre]
+    post_ops = {pid: graph.nodes[pid].op for pid in post_ids}
+    # Render "before": swap each post-id node's op back to the pre op.
+    for nid in mutated_pre:
+        graph.nodes[pre_to_post[nid]].op = pre_ops[nid]
+    before_nodes = [graph.nodes[pid] for pid in graph.topological_order() if pid in post_ids]
+    before = _format_nodes(before_nodes, graph)
+    # Restore.
+    for pid in post_ids:
+        graph.nodes[pid].op = post_ops[pid]
+    after_nodes = [graph.nodes[pid] for pid in graph.topological_order() if pid in post_ids]
+    after = _format_nodes(after_nodes, graph)
+    return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id} (in-place)")
 
 
 def _record_rule_application(graph: Graph, match: Match, fragment: Graph) -> dict:
@@ -442,9 +479,17 @@ def _node_to_dict(node) -> dict:
 def _format_nodes(nodes: list, graph: Graph) -> str:
     """Render a list of nodes as readable text. Kernel-IR ops use their
     own ``pretty_body``; everything else falls back to a ``name: ClsName(args)``
-    one-liner."""
+    one-liner. Scalar ``ConstantOp`` inputs are inlined as literals (same
+    treatment as ``format_kernels`` — see ``_inline_scalar_loads``).
+
+    The leading ``kernel <name>  inputs: ...  outputs: ...`` header that
+    ``TileOp.pretty_body`` prepends is stripped here: this path already
+    emits ``<output> = TileOp(<inputs>)`` one line above, so the kernel
+    header would just duplicate the same info and shift the body's
+    indent by 4 spaces, ballooning the diff."""
     from deplodock.compiler.graph import _fmt_op
     from deplodock.compiler.ir.base import ConstantOp, InputOp
+    from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
 
     lines: list[str] = []
     for node in nodes:
@@ -457,8 +502,22 @@ def _format_nodes(nodes: list, graph: Graph) -> str:
             continue
         arg_names = [graph.nodes[inp].output.name for inp in node.inputs if inp in graph.nodes]
         lines.append(f"{node.output.name} = {type(op).__name__}({', '.join(arg_names)})")
-        lines.extend(f"  {line}" for line in body.splitlines())
+        scalar_inputs = _scalar_constant_inputs(graph, node, ConstantOp)
+        if scalar_inputs:
+            body = _inline_scalar_loads(body, scalar_inputs)
+        body_lines = body.splitlines()
+        if body_lines and body_lines[0].lstrip().startswith("kernel ") and " inputs: " in body_lines[0] and " outputs: " in body_lines[0]:
+            body_lines = [_dedent(ln, 4) for ln in body_lines[1:]]
+        lines.extend(f"  {line}" for line in body_lines)
     return "\n".join(lines)
+
+
+def _dedent(line: str, n: int) -> str:
+    """Strip up to ``n`` leading spaces from ``line``."""
+    i = 0
+    while i < n and i < len(line) and line[i] == " ":
+        i += 1
+    return line[i:]
 
 
 # ---------------------------------------------------------------------------

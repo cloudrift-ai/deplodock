@@ -307,7 +307,14 @@ def format_kernels(graph: Graph) -> str:
     that share a ``kernel_name`` are emitted only once. The surrounding
     syntax identifies the IR level, so block headers stay minimal:
     ``=== N: <name> ===``.
+
+    Scalar ``ConstantOp`` inputs are inlined as literals: header
+    ``in_k = load <buf>[0]`` lines for scalar constants are dropped, and
+    the literal value is substituted at every use site in the body.
+    Behaves like ``RenderCtx.literal_constants`` does for the cuda
+    renderer — same idea, applied to the human-readable IR dump.
     """
+    from deplodock.compiler.ir.base import ConstantOp
     from deplodock.compiler.ir.cuda import CudaOp
 
     rename_map = {nid: _canonical_node_id(nid) for nid in graph.nodes if _canonical_node_id(nid) != nid}
@@ -330,6 +337,13 @@ def format_kernels(graph: Graph) -> str:
             name = op.name
         else:
             name = f"{rename_map.get(nid, nid)} -> {node.output.name}"
+        # Inline scalar constants before applying the canonicalization
+        # rename: Load.input fields carry the producer's pre-rename id
+        # (e.g. ``mul_1_c1``), which is also the graph node id we look
+        # up here.
+        scalar_inputs = _scalar_constant_inputs(graph, node, ConstantOp)
+        if scalar_inputs:
+            body = _inline_scalar_loads(body, scalar_inputs)
         # Apply the same canonicalization to the rendered body so Load/Write
         # references to peer nodes use clean names too. Replace longest names
         # first to avoid prefix-eating ``merged_lift_n0`` before ``merged_merged_lift_n0``.
@@ -340,6 +354,39 @@ def format_kernels(graph: Graph) -> str:
         blocks.append("")
         i += 1
     return "\n".join(blocks)
+
+
+def _scalar_constant_inputs(graph, node, constant_op_type) -> dict[str, float]:
+    """``{producer_id: value}`` for every direct input of ``node`` whose
+    producer is a 0-D ``ConstantOp`` with a captured scalar value."""
+    out: dict[str, float] = {}
+    for inp in node.inputs:
+        if inp not in graph.nodes:
+            continue
+        op = graph.nodes[inp].op
+        if isinstance(op, constant_op_type) and op.value is not None:
+            out[inp] = float(op.value)
+    return out
+
+
+def _inline_scalar_loads(body: str, scalar_inputs: dict[str, float]) -> str:
+    """Drop ``in_k = load <buf>[0]`` lines whose buf is a scalar constant
+    and substitute the literal value at every use site in the body."""
+    import re
+
+    pat = re.compile(r"^(\s*)(\w+)\s*=\s*load\s+(\S+)\[0\]\s*$")
+    name_to_lit: dict[str, str] = {}
+    out_lines: list[str] = []
+    for line in body.splitlines():
+        m = pat.match(line)
+        if m and m.group(3) in scalar_inputs:
+            name_to_lit[m.group(2)] = format(scalar_inputs[m.group(3)], "g")
+            continue
+        out_lines.append(line)
+    if not name_to_lit:
+        return body
+    name_pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in name_to_lit) + r")\b")
+    return "\n".join(name_pat.sub(lambda m: name_to_lit[m.group(1)], ln) for ln in out_lines)
 
 
 # ---------------------------------------------------------------------------
