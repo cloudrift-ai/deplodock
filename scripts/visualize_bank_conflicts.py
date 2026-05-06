@@ -17,6 +17,12 @@ Modes:
       Run the tile pipeline live on an SDPA(B=1, H=8, seq=N, d=64)
       graph twice — with and without ``006_chunk_reduce`` enabled
       (gated via ``DEPLODOCK_DISABLE_CHUNK_REDUCE``) — and compare.
+
+  --gate-matrix CASE_NAME
+      Run the named ``tests/perf/cases.py`` case under all four
+      combinations of ``006_chunk_reduce`` × ``013_pad_smem``
+      gate-on/off. Useful for surfacing which pass dominates the
+      conflict reduction.
 """
 
 from __future__ import annotations
@@ -54,6 +60,32 @@ def graph_from_sdpa(seq_len: int, disable_chunk_reduce: bool) -> Graph:
         else:
             os.environ["DEPLODOCK_DISABLE_CHUNK_REDUCE"] = prev
     return g
+
+
+def graph_from_perf_case(case_name: str, *, disable_chunk_reduce: bool, disable_pad_smem: bool) -> Graph:
+    """Build & compile a ``tests/perf/cases.py`` case under the given gate combo."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tests.perf.cases import FUSED_CASES, PRIMITIVE_CASES, build_deplodock_graph
+
+    cases = {c.name: c for c in PRIMITIVE_CASES + FUSED_CASES}
+    if case_name not in cases:
+        raise SystemExit(f"unknown case '{case_name}'. examples: {list(cases)[:5]}")
+    saved = {k: os.environ.get(k) for k in ("DEPLODOCK_DISABLE_CHUNK_REDUCE", "DEPLODOCK_DISABLE_PAD_SMEM")}
+    os.environ["DEPLODOCK_DISABLE_CHUNK_REDUCE"] = "1" if disable_chunk_reduce else "0"
+    os.environ["DEPLODOCK_DISABLE_PAD_SMEM"] = "1" if disable_pad_smem else "0"
+    try:
+        g = build_deplodock_graph(cases[case_name])
+        run_pipeline(g, TILE_PASSES)
+        return g
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _serialize(panels: list[BankConflictResult]) -> list[dict]:
@@ -237,6 +269,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ir", action="append", default=[], help="PATH[:LABEL] — repeatable")
     p.add_argument("--chunk-reduce-diff", action="store_true", help="Run pipeline live with/without chunk_reduce on SDPA")
+    p.add_argument("--gate-matrix", default=None, help="Run a tests/perf case under 4 gate combos (chunk×pad)")
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--stage", action="append", default=[], help="filter Stage names (repeatable)")
     p.add_argument("--k-iter", type=int, default=0)
@@ -255,6 +288,21 @@ def main() -> None:
             print(f"  → {len(panels)} stage probe(s)")
             columns.append({"label": label, "panels": _serialize(panels)})
         subtitle = f"SDPA(B=1, H=8, seq={args.seq_len}, d=64) · k_iter={args.k_iter} · warp={args.warp_id}"
+    elif args.gate_matrix:
+        combos = [
+            ("baseline (chunk✓ pad✓)", False, False),
+            ("no chunk_reduce", True, False),
+            ("no pad_smem", False, True),
+            ("no chunk + no pad", True, True),
+        ]
+        for label, no_chunk, no_pad in combos:
+            print(f"running {args.gate_matrix} | {label}...")
+            g = graph_from_perf_case(args.gate_matrix, disable_chunk_reduce=no_chunk, disable_pad_smem=no_pad)
+            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id)
+            total = sum(p.conflict_events for p in panels)
+            print(f"  → {len(panels)} probes, total conflict_events = {total}")
+            columns.append({"label": f"{label} · Σevents={total}", "panels": _serialize(panels)})
+        subtitle = f"{args.gate_matrix}  ·  k_iter={args.k_iter} · warp={args.warp_id}"
     elif args.ir:
         for arg in args.ir:
             path, label = _parse_ir_arg(arg)
@@ -264,7 +312,7 @@ def main() -> None:
             columns.append({"label": label, "panels": _serialize(panels)})
         subtitle = f"k_iter={args.k_iter} · warp={args.warp_id} · {len(args.ir)} input IR(s)"
     else:
-        p.error("provide --ir PATH (repeatable) or --chunk-reduce-diff")
+        p.error("provide --ir PATH (repeatable), --chunk-reduce-diff, or --gate-matrix CASE")
 
     emit_html(columns, subtitle, args.out)
     print(f"saved {args.out}")
