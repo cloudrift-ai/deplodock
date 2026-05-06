@@ -1,28 +1,24 @@
 """Bank-conflict visualizer driven by real Tile-IR ``Stage``s.
 
-Each input contributes one column. Within a column, every ``Stage`` ×
-``Load`` pair gets a card showing the warp's per-lane smem bank at one
-fixed inner-loop iteration. The simulation lives in
-``deplodock.compiler.diagnostics.bank_conflicts``; this script is a
-thin CLI + ECharts emitter.
+Takes one or more IR JSON paths and renders one column per input. Each
+column contains a card per ``(Stage, body-Load)`` pair showing the warp's
+per-lane smem bank at one inner-loop iteration. Simulation lives in
+``deplodock.compiler.diagnostics.bank_conflicts``; this script is a thin
+CLI + ECharts emitter.
 
-Modes:
+Workflow — produce IRs via the compiler with whatever pass gates you
+want, then feed the dumped JSONs in::
 
-  --ir PATH[:LABEL] (repeatable)
-      Load JSON dumps produced under ``DEPLODOCK_DUMP_DIR`` (any
-      post-tile-pass dump that contains ``TileOp`` nodes — typically
-      ``07_*_stage_inputs.json`` or later).
+    DEPLODOCK_DUMP_DIR=/tmp/dump_a deplodock compile MODEL --layer 0
+    DEPLODOCK_DISABLE_CHUNK_REDUCE=1 \\
+        DEPLODOCK_DUMP_DIR=/tmp/dump_b deplodock compile MODEL --layer 0
+    python scripts/visualize_bank_conflicts.py \\
+        -i /tmp/dump_a/14_lowering_tile.json:baseline \\
+        -i /tmp/dump_b/14_lowering_tile.json:no_chunk_reduce \\
+        --out /tmp/diff.html
 
-  --chunk-reduce-diff [--seq-len N]
-      Run the tile pipeline live on an SDPA(B=1, H=8, seq=N, d=64)
-      graph twice — with and without ``006_chunk_reduce`` enabled
-      (gated via ``DEPLODOCK_DISABLE_CHUNK_REDUCE``) — and compare.
-
-  --gate-matrix CASE_NAME
-      Run the named ``tests/perf/cases.py`` case under all four
-      combinations of ``006_chunk_reduce`` × ``013_pad_smem``
-      gate-on/off. Useful for surfacing which pass dominates the
-      conflict reduction.
+Any post-tile-pass dump works; pick the one whose Stages you want to
+inspect (typically the final tile-stage dump).
 """
 
 from __future__ import annotations
@@ -32,60 +28,12 @@ import json
 import os
 
 from deplodock.compiler.diagnostics.bank_conflicts import BankConflictResult, simulate_graph
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import SdpaOp
-from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
+from deplodock.compiler.graph import Graph
 
 
 def graph_from_ir_path(path: str) -> Graph:
     with open(path) as f:
         return Graph.from_dict(json.load(f))
-
-
-def graph_from_sdpa(seq_len: int, disable_chunk_reduce: bool) -> Graph:
-    g = Graph()
-    for name in ("q", "k", "v"):
-        g.add_node(InputOp(), [], Tensor(name, (1, 8, seq_len, 64)), node_id=name)
-    g.add_node(SdpaOp(), ["q", "k", "v"], Tensor("o", (1, 8, seq_len, 64)), node_id="o")
-    g.inputs = ["q", "k", "v"]
-    g.outputs = ["o"]
-    prev = os.environ.get("DEPLODOCK_DISABLE_CHUNK_REDUCE")
-    os.environ["DEPLODOCK_DISABLE_CHUNK_REDUCE"] = "1" if disable_chunk_reduce else "0"
-    try:
-        run_pipeline(g, TILE_PASSES)
-    finally:
-        if prev is None:
-            del os.environ["DEPLODOCK_DISABLE_CHUNK_REDUCE"]
-        else:
-            os.environ["DEPLODOCK_DISABLE_CHUNK_REDUCE"] = prev
-    return g
-
-
-def graph_from_perf_case(case_name: str, *, disable_chunk_reduce: bool, disable_pad_smem: bool) -> Graph:
-    """Build & compile a ``tests/perf/cases.py`` case under the given gate combo."""
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from tests.perf.cases import FUSED_CASES, PRIMITIVE_CASES, build_deplodock_graph
-
-    cases = {c.name: c for c in PRIMITIVE_CASES + FUSED_CASES}
-    if case_name not in cases:
-        raise SystemExit(f"unknown case '{case_name}'. examples: {list(cases)[:5]}")
-    saved = {k: os.environ.get(k) for k in ("DEPLODOCK_DISABLE_CHUNK_REDUCE", "DEPLODOCK_DISABLE_PAD_SMEM")}
-    os.environ["DEPLODOCK_DISABLE_CHUNK_REDUCE"] = "1" if disable_chunk_reduce else "0"
-    os.environ["DEPLODOCK_DISABLE_PAD_SMEM"] = "1" if disable_pad_smem else "0"
-    try:
-        g = build_deplodock_graph(cases[case_name])
-        run_pipeline(g, TILE_PASSES)
-        return g
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
 
 
 def _serialize(panels: list[BankConflictResult]) -> list[dict]:
@@ -268,13 +216,18 @@ def _parse_ir_arg(arg: str) -> tuple[str, str]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ir", action="append", default=[], help="PATH[:LABEL] — repeatable")
-    p.add_argument("--chunk-reduce-diff", action="store_true", help="Run pipeline live with/without chunk_reduce on SDPA")
-    p.add_argument("--gate-matrix", default=None, help="Run a tests/perf case under 4 gate combos (chunk×pad)")
-    p.add_argument("--seq-len", type=int, default=512)
+    p.add_argument(
+        "-i",
+        "--ir",
+        action="append",
+        default=[],
+        required=True,
+        metavar="PATH[:LABEL]",
+        help="IR JSON dump (post-tile-pass). Repeat for side-by-side columns.",
+    )
     p.add_argument("--stage", action="append", default=[], help="filter Stage names (repeatable)")
     p.add_argument("--load", action="append", default=[], help="filter Load SSA names (repeatable, e.g. in3)")
-    p.add_argument("--list", action="store_true", help="print available (kernel, stage, load) probes and exit")
+    p.add_argument("--list", action="store_true", help="print available (kernel, stage, load) probes for the first IR and exit")
     p.add_argument("--k-iter", type=int, default=0)
     p.add_argument("--warp-id", type=int, default=0)
     p.add_argument("--out", default="/tmp/bank_conflicts.html")
@@ -282,18 +235,9 @@ def main() -> None:
 
     stage_filter = set(args.stage) if args.stage else None
     load_filter = set(args.load) if args.load else None
-    columns: list[dict] = []
 
     if args.list:
-        # Print available probes for the first config and exit.
-        if args.gate_matrix:
-            g = graph_from_perf_case(args.gate_matrix, disable_chunk_reduce=False, disable_pad_smem=False)
-        elif args.chunk_reduce_diff:
-            g = graph_from_sdpa(args.seq_len, disable_chunk_reduce=False)
-        elif args.ir:
-            g = graph_from_ir_path(_parse_ir_arg(args.ir[0])[0])
-        else:
-            p.error("--list requires one of --gate-matrix / --chunk-reduce-diff / --ir")
+        g = graph_from_ir_path(_parse_ir_arg(args.ir[0])[0])
         results = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
         print(f"{'kernel':32}  {'stage':18}  {'load':6}  {'max_way':>7}  {'events':>6}  index")
         print("-" * 100)
@@ -302,40 +246,16 @@ def main() -> None:
             print(f"{r.tile_op_name:32}  {r.stage_name:18}  {r.load_name:6}  {r.max_way:>7}  {r.conflict_events:>6}  ({idx})")
         return
 
-    if args.chunk_reduce_diff:
-        for label, disabled in (("chunk_reduce ENABLED", False), ("chunk_reduce DISABLED", True)):
-            print(f"running pipeline: {label}...")
-            g = graph_from_sdpa(args.seq_len, disable_chunk_reduce=disabled)
-            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
-            print(f"  → {len(panels)} stage probe(s)")
-            columns.append({"label": label, "panels": _serialize(panels)})
-        subtitle = f"SDPA(B=1, H=8, seq={args.seq_len}, d=64) · k_iter={args.k_iter} · warp={args.warp_id}"
-    elif args.gate_matrix:
-        combos = [
-            ("baseline (chunk✓ pad✓)", False, False),
-            ("no chunk_reduce", True, False),
-            ("no pad_smem", False, True),
-            ("no chunk + no pad", True, True),
-        ]
-        for label, no_chunk, no_pad in combos:
-            print(f"running {args.gate_matrix} | {label}...")
-            g = graph_from_perf_case(args.gate_matrix, disable_chunk_reduce=no_chunk, disable_pad_smem=no_pad)
-            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
-            total = sum(p.conflict_events for p in panels)
-            print(f"  → {len(panels)} probes, total conflict_events = {total}")
-            columns.append({"label": f"{label} · Σevents={total}", "panels": _serialize(panels)})
-        subtitle = f"{args.gate_matrix}  ·  k_iter={args.k_iter} · warp={args.warp_id}"
-    elif args.ir:
-        for arg in args.ir:
-            path, label = _parse_ir_arg(arg)
-            g = graph_from_ir_path(path)
-            panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
-            print(f"{label}: {len(panels)} stage probe(s)")
-            columns.append({"label": label, "panels": _serialize(panels)})
-        subtitle = f"k_iter={args.k_iter} · warp={args.warp_id} · {len(args.ir)} input IR(s)"
-    else:
-        p.error("provide --ir PATH (repeatable), --chunk-reduce-diff, or --gate-matrix CASE")
+    columns: list[dict] = []
+    for arg in args.ir:
+        path, label = _parse_ir_arg(arg)
+        g = graph_from_ir_path(path)
+        panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
+        total = sum(p.conflict_events for p in panels)
+        print(f"{label}: {len(panels)} probes, Σevents={total}")
+        columns.append({"label": f"{label} · Σevents={total}", "panels": _serialize(panels)})
 
+    subtitle = f"k_iter={args.k_iter} · warp={args.warp_id} · {len(args.ir)} input IR(s)"
     emit_html(columns, subtitle, args.out)
     print(f"saved {args.out}")
 
