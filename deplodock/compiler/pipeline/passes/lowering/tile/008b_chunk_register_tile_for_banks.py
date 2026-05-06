@@ -58,6 +58,7 @@ Skips when:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Graph, Node
@@ -85,6 +86,8 @@ PATTERN = [Pattern("root", TileOp)]
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
+    if os.environ.get("DEPLODOCK_DISABLE_CHUNK_REGISTER_TILE") == "1":
+        raise RuleSkipped("disabled via DEPLODOCK_DISABLE_CHUNK_REGISTER_TILE=1")
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         return None
