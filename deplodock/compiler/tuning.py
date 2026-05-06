@@ -187,6 +187,34 @@ def _has_fused_prologue(stmts) -> bool:
     return False
 
 
+def _external_input_count(stmts) -> int:
+    """Distinct external buffers a Tile body references — sum of
+    ``Stage.buf`` (staged inputs) plus any direct ``Load.input`` that
+    doesn't name a Stage.
+
+    Pure ``matmul`` = 2 (a, b). ``matmul_add`` = 3 (a, b, residual).
+    ``silu_mul_matmul`` = 3 (g, u, w). The default-large class is
+    gated on ``count == 2`` to keep extra epilogue Loads (which steal
+    register slots per-output-cell) from forcing F=8×8 — sweep showed
+    ``matmul_add.tinyllama.o_proj.s512`` regressing 0.80× → 0.72×
+    when the residual Load piles on the F=8×8 accumulator tile
+    (regs 118 → 209, occ 33% → 17%).
+    """
+    from deplodock.compiler.ir.stmt import Load
+    from deplodock.compiler.ir.stmt.body import Body
+    from deplodock.compiler.ir.tile.ir import Stage
+
+    body = Body.coerce(stmts)
+    stage_names = {s.name for s in body.iter() if isinstance(s, Stage)}
+    bufs: set[str] = set()
+    for s in body.iter():
+        if isinstance(s, Stage):
+            bufs.add(s.buf)
+        elif isinstance(s, Load) and s.input not in stage_names:
+            bufs.add(s.input)
+    return len(bufs)
+
+
 def _logical_output_extents(tile: Tile) -> list[int]:
     """Recover the pre-blockify output extents from a (possibly
     blockified) ``Tile``. Walks ``tile.axes`` folding adjacent
@@ -244,7 +272,7 @@ def _tile_class(tile: Tile | None) -> str:
         return "huge"
     if n <= _COMPACT_N_MAX:
         return "compact"
-    if m >= _DEFAULT_LARGE_M_MIN:
+    if m >= _DEFAULT_LARGE_M_MIN and _external_input_count(tile.body) == 2:
         return "default-large"
     return "default"
 
