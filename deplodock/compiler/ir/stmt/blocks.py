@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Expr, _float_lit
-from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body
+from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum
 
@@ -93,8 +93,7 @@ class Loop(Stmt):
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
         inner = ctx.child()
-        for s in self.body:
-            out.extend(s.render(inner))
+        out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")
         return out
 
@@ -178,8 +177,7 @@ class Tile(Stmt):
                 inner_pad = _pad(inner.indent)
                 out.append(f"{inner_pad}int lane = threadIdx.x & 31;")
                 out.append(f"{inner_pad}int warp = threadIdx.x >> 5;")
-            for s in self.body:
-                out.extend(s.render(inner))
+            out.extend(render_body(self.body, inner))
             out.append(f"{pad}}}")
             return out
 
@@ -191,8 +189,7 @@ class Tile(Stmt):
             f"{pad}if (tid < {n_threads}) {{",
         ]
         out.extend(_render_thread_axis_decode(self.thread_axes, inner))
-        for s in self.body:
-            out.extend(s.render(inner))
+        out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")
         return out
 
@@ -318,8 +315,7 @@ class StridedLoop(Stmt):
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = {start_str}; {var} < {int(self.axis.extent)}; {var} += {step_str}) {{")
         inner = ctx.child()
-        for s in self.body:
-            out.extend(s.render(inner))
+        out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")
         return out
 
@@ -378,13 +374,10 @@ class Cond(Stmt):
         pad = _pad(ctx.indent)
         cond = self.cond.render(ctx)
         inner = ctx.child()
-        body: list[str] = []
-        for s in self.body:
-            body.extend(s.render(inner))
+        body = render_body(self.body, inner)
         out = [f"{pad}if ({cond}) {{", *body, f"{pad}}}"]
         if self.else_body:
             out[-1] = f"{pad}}} else {{"
-            for s in self.else_body:
-                out.extend(s.render(inner))
+            out.extend(render_body(self.else_body, inner))
             out.append(f"{pad}}}")
         return out

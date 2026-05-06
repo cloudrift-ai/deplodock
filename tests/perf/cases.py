@@ -49,6 +49,68 @@ class Case:
     def shape_str(self) -> str:
         return " x ".join("(" + ",".join(str(d) for d in s) + ")" for s in self.shapes)
 
+    @property
+    def code(self) -> str:
+        """Inline ``deplodock run --code`` expression equivalent to this
+        case. Used by the perf bencher to drive ``deplodock run --bench
+        --profile`` per case so the benchmarking infra is shared with
+        the CLI. Each input tensor is materialized via ``torch.randn``
+        on the same shape; the final expression is what gets traced."""
+        s = self.shapes
+        preamble = "import torch; import torch.nn.functional as F"
+        if self.op == "matmul":
+            return f"{preamble}; a=torch.randn({s[0]}); b=torch.randn({s[1]}); torch.matmul(a,b)"
+        if self.op == "rmsnorm":
+            return f"{preamble}; x=torch.randn({s[0]}); w=torch.randn({s[1]}); F.rms_norm(x, {tuple(s[1])}, w, eps=1e-6)"
+        if self.op == "softmax":
+            return f"{preamble}; x=torch.randn({s[0]}); F.softmax(x, dim=-1)"
+        if self.op == "silu_mul":
+            return f"{preamble}; gate=torch.randn({s[0]}); up=torch.randn({s[1]}); F.silu(gate)*up"
+        if self.op == "sdpa":
+            gqa = "True" if s[0][-3] != s[1][-3] else "False"
+            return (
+                f"{preamble}; q=torch.randn({s[0]}); k=torch.randn({s[1]}); v=torch.randn({s[2]}); "
+                f"F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa={gqa})"
+            )
+        if self.op == "naive_attn":
+            # Block-style decomposition matching HF's NaiveSDPA path:
+            # qk = q @ k.T * scale; attn = softmax(qk + causal_mask); out = attn @ v.
+            # ``-1e9`` mask term keeps the trace fp32-clean (``-inf`` would
+            # canonicalize through eager but trip later passes).
+            seq = s[0][-2]
+            dh = s[0][-1]
+            return (
+                f"import math; {preamble}; "
+                f"q=torch.randn({s[0]}); k=torch.randn({s[1]}); v=torch.randn({s[2]}); "
+                f"mask=torch.full(({seq},{seq}), -1e9).triu(1); "
+                f"F.softmax(q @ k.transpose(-2,-1) * (1.0/math.sqrt({dh})) + mask, dim=-1) @ v"
+            )
+        if self.op == "matmul_add":
+            return f"{preamble}; x=torch.randn({s[0]}); w=torch.randn({s[1]}); r=torch.randn({s[2]}); torch.matmul(x,w)+r"
+        if self.op == "silu_mul_matmul":
+            return f"{preamble}; gate=torch.randn({s[0]}); up=torch.randn({s[1]}); w=torch.randn({s[2]}); torch.matmul(F.silu(gate)*up, w)"
+        raise ValueError(f"unknown op: {self.op}")
+
+    @property
+    def iters(self) -> int:
+        """Number of measured iterations the bencher should run for this
+        case. Heavy ops (~ms-scale per iter) drop to 20 to keep the suite
+        fast; everything else stays at 100. ``heavy`` is detected by
+        total input element count — the dominant factor in matmul /
+        silu_mul_matmul cost. Threshold (50 M elements) covers the
+        fp32-suite cases that empirically run > 1 ms each (qwen
+        gate/up/down_proj.s512 and silu_mul_matmul.{tinyllama,qwen}
+        s512)."""
+        total_elements = sum(_prod(s) for s in self.shapes)
+        return 20 if total_elements > 50_000_000 else 100
+
+
+def _prod(shape: tuple[int, ...]) -> int:
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
 
 # ---------------------------------------------------------------------------
 # Model dimensions
@@ -184,6 +246,40 @@ def _matmul_add_cases() -> list[Case]:
     return cases
 
 
+def _naive_attn_cases() -> list[Case]:
+    """Block-style naive attention (Q @ K.T scaled + mask → softmax →
+    @ V), separate from the ``F.scaled_dot_product_attention`` cases.
+
+    Distinct kernel path: HF's ``NaiveSDPA`` (used by ``bench_block``)
+    decomposes attention into the explicit qk-matmul + scale + mask +
+    softmax + av-matmul chain. Tracing this chain through deplodock
+    produces the ``k_scaled_dot_product_attention_qk_ew_pointwise``
+    kernel — a matmul-with-pointwise-epilogue. A previous iteration of
+    the loop-fusion guard made this kernel 13× slower in the block
+    bench (0.05× of eager); the standalone ``F.sdpa`` cases didn't
+    catch it because ``F.sdpa`` traces to ``SdpaOp`` and a different
+    decomposition. These cases pin the naive path so any regression
+    surfaces in ``make bench-kernels``.
+
+    Heads kept equal across Q/K/V (no GQA expansion via
+    ``repeat_interleave``, which doesn't trace cleanly through
+    deplodock today). The kernel shape and fusion pattern are the
+    same; only the multi-head broadcast differs.
+    """
+    cases: list[Case] = []
+    for tag, heads, dh in [("tinyllama", _TL_HEADS, _TL_DH), ("qwen", _Q_HEADS, _Q_DH)]:
+        for s in _SEQ_LENS:
+            cases.append(
+                Case(
+                    name=f"naive_attn.{tag}.s{s}",
+                    op="naive_attn",
+                    shapes=((1, heads, s, dh), (1, heads, s, dh), (1, heads, s, dh)),
+                    tags=(tag, "naive_attn", "attn"),
+                )
+            )
+    return cases
+
+
 def _silu_mul_matmul_cases() -> list[Case]:
     """SiLU-gated MLP fused with down_proj: ``(silu(gate) * up) @ W_down``.
 
@@ -205,7 +301,7 @@ def _silu_mul_matmul_cases() -> list[Case]:
 
 
 PRIMITIVE_CASES: list[Case] = _matmul_cases() + _rmsnorm_cases() + _softmax_cases() + _silu_mul_cases()
-FUSED_CASES: list[Case] = _sdpa_cases() + _matmul_add_cases() + _silu_mul_matmul_cases()
+FUSED_CASES: list[Case] = _sdpa_cases() + _naive_attn_cases() + _matmul_add_cases() + _silu_mul_matmul_cases()
 CASES: list[Case] = PRIMITIVE_CASES + FUSED_CASES
 
 
@@ -252,6 +348,18 @@ def build_torch_ref(case: Case) -> Callable[[], None]:
         v = _r(case.shapes[2])
         # GQA expansion handled by SDPA when enable_gqa=True (PyTorch ≥ 2.5).
         return lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=q.shape[-3] != k.shape[-3])
+
+    if case.op == "naive_attn":
+        import math
+
+        q = _r(case.shapes[0])
+        k = _r(case.shapes[1])
+        v = _r(case.shapes[2])
+        seq = q.shape[-2]
+        dh = q.shape[-1]
+        mask = torch.full((seq, seq), -1e9, device=device, dtype=dtype).triu(1)
+        scale = 1.0 / math.sqrt(dh)
+        return lambda: F.softmax(q @ k.transpose(-2, -1) * scale + mask, dim=-1) @ v
 
     if case.op == "matmul_add":
         x = _r(case.shapes[0])

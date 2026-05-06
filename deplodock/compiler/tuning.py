@@ -82,6 +82,29 @@ _TILE_SHAPE_HUGE = (128, 128)
 _F_PER_AXIS_HUGE = (16, 4)
 _TILE_SHAPE_COMPACT = (64, 64)
 _F_PER_AXIS_COMPACT = (8, 4)
+# "Fused-prologue" class: the matmul-reduce body has a third buffer
+# being loaded inside the K-loop (e.g. ``silu_mul_matmul`` reads g, u,
+# *and* w each K-iter to compute the fused ``silu(g)*u`` operand). The
+# extra Load chain plus the per-K-iter prologue values eat registers
+# the matmul's F=8x4 accumulator tile would normally use, dropping
+# occupancy from the register-file headroom. Sweep on RTX 5090 fp32 +
+# silu_mul_matmul.qwen.{s128,s512} cuts the case from 0.17× → 0.37×
+# (s128, 2039µs → 933µs) and 0.12× → 0.28× (s512, 9270µs → 3920µs).
+_TILE_SHAPE_FUSED = (64, 64)
+_F_PER_AXIS_FUSED = (4, 4)
+# "Default-large" class: default-class shapes with enough M to fill
+# the grid benefit from doubling the per-thread N register tile from
+# F_N=4 → F_N=8. The chunk pass (``008b``) keeps LDS.128 vectorized
+# and prevents the F_N=8 bank-conflict cliff. Sweep on RTX 5090 fp32:
+# qwen.q_proj.s512 0.87× → 0.92× (286 → 266µs), qwen.down_proj.s512
+# 0.79× → 0.86× (1434 → 1331µs), tl.gate_proj.s512 0.95× → 0.99×.
+# Small-M cases (s32) regress because the grid is too small to
+# amortize the extra register pressure (e.g. tl.q_proj.s32 1.47×
+# → 1.32×); the threshold ``_DEFAULT_LARGE_M_MIN = 128`` gates the
+# upgrade to cases where it actually wins.
+_TILE_SHAPE_DEFAULT_LARGE = (128, 64)
+_F_PER_AXIS_DEFAULT_LARGE = (8, 8)
+_DEFAULT_LARGE_M_MIN = 128
 _HUGE_M_MIN = 256
 _HUGE_N_MIN = 8192
 _COMPACT_N_MAX = 1024
@@ -138,6 +161,60 @@ def _has_matmul_reduce(stmts) -> bool:
     )
 
 
+def _has_fused_prologue(stmts) -> bool:
+    """True iff some matmul-reduce loop's body has ``≥3`` distinct
+    buffer Loads — i.e. a fused prologue feeds extra operand values
+    into the reduction (``silu_mul_matmul``: ``g_smem, u_smem,
+    w_smem``). Pure ``matmul`` and ``matmul_add`` (epilogue-fused)
+    have exactly 2 buffer Loads inside the K-reduce; the residual /
+    bias of ``matmul_add`` is loaded *outside* the reduce loop and
+    doesn't push register pressure inside it.
+
+    The extra buffer Load is a structural proxy for "operand values
+    held across K iters that compete with the F-tile accumulators for
+    register space" — exactly the case where the canonical F=8×4
+    tile starves occupancy. ``_default_tile`` switches to F=4×4 BN=64
+    for these.
+    """
+    from deplodock.compiler.ir.stmt import Load, Loop
+    from deplodock.compiler.ir.stmt.body import Body
+
+    for s in Body.coerce(stmts).iter():
+        if isinstance(s, Loop) and s.is_reduce:
+            bufs = {ld.input for ld in s.body.of_type(Load)}
+            if len(bufs) >= 3:
+                return True
+    return False
+
+
+def _external_input_count(stmts) -> int:
+    """Distinct external buffers a Tile body references — sum of
+    ``Stage.buf`` (staged inputs) plus any direct ``Load.input`` that
+    doesn't name a Stage.
+
+    Pure ``matmul`` = 2 (a, b). ``matmul_add`` = 3 (a, b, residual).
+    ``silu_mul_matmul`` = 3 (g, u, w). The default-large class is
+    gated on ``count == 2`` to keep extra epilogue Loads (which steal
+    register slots per-output-cell) from forcing F=8×8 — sweep showed
+    ``matmul_add.tinyllama.o_proj.s512`` regressing 0.80× → 0.72×
+    when the residual Load piles on the F=8×8 accumulator tile
+    (regs 118 → 209, occ 33% → 17%).
+    """
+    from deplodock.compiler.ir.stmt import Load
+    from deplodock.compiler.ir.stmt.body import Body
+    from deplodock.compiler.ir.tile.ir import Stage
+
+    body = Body.coerce(stmts)
+    stage_names = {s.name for s in body.iter() if isinstance(s, Stage)}
+    bufs: set[str] = set()
+    for s in body.iter():
+        if isinstance(s, Stage):
+            bufs.add(s.buf)
+        elif isinstance(s, Load) and s.input not in stage_names:
+            bufs.add(s.input)
+    return len(bufs)
+
+
 def _logical_output_extents(tile: Tile) -> list[int]:
     """Recover the pre-blockify output extents from a (possibly
     blockified) ``Tile``. Walks ``tile.axes`` folding adjacent
@@ -167,11 +244,26 @@ def _matmul_M(tile: Tile) -> int:
 
 
 def _tile_class(tile: Tile | None) -> str:
-    """``"huge" | "compact" | "default"`` — picks the matmul tile class
-    from the logical output extents. Non-matmul tiles fall to ``"default"``
-    (the env vars wouldn't apply anyway)."""
+    """``"fused" | "huge" | "compact" | "default-large" | "default"``
+    — picks the matmul tile class from the logical output extents and
+    body structure. Non-matmul tiles fall to ``"default"`` (the env
+    vars wouldn't apply anyway).
+
+    ``"fused"`` is checked first because a fused-prologue matmul
+    (``silu_mul_matmul``) can have output extents that would otherwise
+    classify it as ``huge`` / ``default``, but its register pressure
+    profile is fundamentally different — the standard tiles starve
+    occupancy.
+
+    ``"default-large"`` is the default-class subclass for M ≥ 128 +
+    N > _COMPACT_N_MAX + N < _HUGE_N_MIN. F_N=8 (vs F_N=4) doubles
+    arithmetic intensity per thread; the chunk pass (``008b``) keeps
+    LDS.128 vectorized.
+    """
     if tile is None or not _has_matmul_reduce(tile.body):
         return "default"
+    if _has_fused_prologue(tile.body):
+        return "fused"
     extents = _logical_output_extents(tile)
     if len(extents) < 2:
         return "default"
@@ -180,6 +272,8 @@ def _tile_class(tile: Tile | None) -> str:
         return "huge"
     if n <= _COMPACT_N_MAX:
         return "compact"
+    if m >= _DEFAULT_LARGE_M_MIN and _external_input_count(tile.body) == 2:
+        return "default-large"
     return "default"
 
 
@@ -187,10 +281,14 @@ def _default_tile(tile: Tile | None) -> tuple[tuple[int, int], tuple[int, int]]:
     """``((BN, BM), (F_M, F_N))`` defaults for the matmul tile, picked
     by ``_tile_class``."""
     cls = _tile_class(tile)
+    if cls == "fused":
+        return _TILE_SHAPE_FUSED, _F_PER_AXIS_FUSED
     if cls == "huge":
         return _TILE_SHAPE_HUGE, _F_PER_AXIS_HUGE
     if cls == "compact":
         return _TILE_SHAPE_COMPACT, _F_PER_AXIS_COMPACT
+    if cls == "default-large":
+        return _TILE_SHAPE_DEFAULT_LARGE, _F_PER_AXIS_DEFAULT_LARGE
     return _TILE_SHAPE_DEFAULT, _F_PER_AXIS_DEFAULT
 
 

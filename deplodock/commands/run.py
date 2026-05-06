@@ -9,6 +9,7 @@ the same shape as ``scripts/bench_block.py`` but for arbitrary inline ops.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,18 @@ def register_run_command(subparsers):
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
+    parser.add_argument(
+        "--bench-backends",
+        default=None,
+        help=(
+            "Comma-separated subset of backends to time under --bench: any of "
+            "``eager``, ``tcompile`` (a.k.a. ``torch.compile`` / ``compile``), "
+            "``deplodock``. Falls back to ``DEPLODOCK_BENCH_BACKENDS`` env var, "
+            "then to the default ``eager,deplodock`` (drops the ~0.8 s "
+            "torch.compile JIT from the per-case cost). ``deplodock`` is "
+            "implicit even if omitted."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
     parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
@@ -112,12 +125,26 @@ def handle_run(args):
 
     input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
 
-    run_result = backend.run(compiled, input_data=input_data)
-    if dump and backend.last_debug_result is not None:
-        dump.dump_per_launch_values(backend.last_debug_result.per_launch)
+    # Skip the accuracy check + eager forward when running as the ncu
+    # child of a ``--profile`` invocation: the parent already verified
+    # accuracy outside ncu, and re-running the eager reference under
+    # ncu (a) wastes ~5-10 s of ncu overhead per cuBLAS launch and
+    # (b) pollutes the captured CSV with cutlass / cuBLAS kernel rows
+    # the perf summary then has to filter out. The child only needs to
+    # launch the deplodock kernels so ncu can sample our metrics.
+    skip_accuracy = os.environ.get(_NCU_RECURSE_GUARD) == "1"
 
-    eager_out = _eager_output(module, example_args, example_kwargs)
-    _check_accuracy(run_result.outputs, eager_out)
+    if not skip_accuracy:
+        run_result = backend.run(compiled, input_data=input_data)
+        if dump and backend.last_debug_result is not None:
+            dump.dump_per_launch_values(backend.last_debug_result.per_launch)
+
+        eager_out = _eager_output(module, example_args, example_kwargs)
+        _check_accuracy(run_result.outputs, eager_out)
+    else:
+        # ncu child needs at least one deplodock launch for metrics
+        # to populate; skip the eager comparison.
+        backend.run(compiled, input_data=input_data)
 
     if not args.bench:
         return
@@ -126,15 +153,77 @@ def handle_run(args):
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in example_args)
     cuda_kwargs = _to_cuda_kwargs(example_kwargs)
 
-    results, bench = _bench_interleaved(cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters)
+    # Build torch_fns (incl. ~0.8s torch.compile / Inductor JIT when
+    # ``tcompile`` is in the selected backends) *outside* the GPU lock
+    # so concurrent ``deplodock run`` workers can do their CPU-bound
+    # JITs in parallel. The few GPU launches the compile-side warmup
+    # issues are noisy but go untimed; the measurement loop below
+    # holds the lock for accurate iter timing.
+    backends = _resolve_backends(args.bench_backends)
+    torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, args.warmup, backends=backends)
 
-    if dump:
-        dump.dump_benchmark(bench)
+    with _gpu_lock():
+        results, bench = _bench_interleaved(
+            cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
+        )
 
-    _print_table(results)
-    _print_kernel_stats(compiled, bench)
-    if args.profile:
-        _run_ncu_profile(args)
+        if dump:
+            dump.dump_benchmark(bench)
+            _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
+
+        _print_table(results)
+        _print_kernel_stats(compiled, bench)
+        if args.profile:
+            _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+
+
+def _gpu_lock():
+    """Cross-process advisory lock on a single GPU. Activated when
+    ``DEPLODOCK_GPU_LOCK`` is set (path of the lock file); a no-op
+    otherwise so ad-hoc ``deplodock run`` invocations don't pay any
+    coordination overhead. The path holds an ``flock`` (via
+    ``filelock.FileLock``) for the duration of the ``with`` block —
+    other waiters block, avoiding interleaved kernel launches that
+    would corrupt iter timings.
+    """
+    import contextlib
+    import os as _os
+
+    path = _os.environ.get("DEPLODOCK_GPU_LOCK")
+    if not path:
+
+        @contextlib.contextmanager
+        def _noop():
+            yield
+
+        return _noop()
+
+    from pathlib import Path as _Path
+
+    from filelock import FileLock
+
+    _Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return FileLock(path)
+
+
+def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
+    """Persist the eager / torch.compile / deplodock comparison table
+    so downstream tooling (``make bench-kernels``) can parse one file
+    per case instead of grepping kernel stdout."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    eager_us = results.get("Eager PyTorch")
+    payload = {
+        "warmup": warmup,
+        "iters": iters,
+        "backends": {name: {"latency_us": us} for name, us in results.items()},
+    }
+    if eager_us:
+        for name, us in results.items():
+            payload["backends"][name]["speedup_vs_eager"] = (eager_us / us) if us else 0.0
+    out = _Path(dump_dir) / "60_bench_compare.json"
+    out.write_text(_json.dumps(payload, indent=2, default=str))
 
 
 def _print_kernel_stats(graph, bench):
@@ -240,14 +329,33 @@ def _theoretical_occupancy(regs_per_thread: int, smem_per_block: int, threads_pe
 
 _NCU_RECURSE_GUARD = "DEPLODOCK_NCU_CHILD"
 
+# Curated ncu metric set — verified to populate on RTX 5090 (sm_120) +
+# TMA kernels. ``--set detailed`` is broken there (``SpeedOfLight_Roofline``
+# divides by zero, ``SourceCounters`` / ``PCSamplingData`` need missing
+# ``smsp__pcsamp_*`` metrics) so we enumerate explicit metrics instead.
+# Add to this list to surface new columns in the perf summary; the
+# downstream parser keys on metric names directly.
+_NCU_METRICS = (
+    "gpu__time_duration.sum",
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active",
+    "smsp__inst_executed_pipe_lsu.sum",
+    "launch__registers_per_thread",
+)
 
-def _run_ncu_profile(args):
-    """Re-launch the same ``deplodock run`` invocation under ``ncu`` and
-    pass the detailed-page text output through verbatim. ncu's own
-    per-section breakdown (Speed-of-Light, Occupancy, Memory Workload,
-    Compute Workload, Scheduler Stats, Warp State, Source Counters,
-    plus per-kernel optimization hints) is far richer than any single
-    metric set we'd curate, so we just relay it.
+
+def _run_ncu_profile(args, *, dump_dir=None):
+    """Re-launch the same ``deplodock run`` invocation under ``ncu`` to
+    collect a curated set of hardware counters (occupancy, bank
+    conflicts, SM/DRAM/FMA throughput, register pressure). Output is
+    captured in CSV form; when ``DEPLODOCK_DUMP_DIR`` (or ``--dump-dir``
+    propagated as ``dump_dir``) is set, the raw CSV and a parsed
+    per-kernel JSON are written there. Otherwise the counters print to
+    stdout in the same CSV form for one-shot inspection.
 
     Spawns one extra subprocess at minimal iter count — ncu's per-launch
     overhead is huge (10-100×). The ``DEPLODOCK_NCU_CHILD`` env var
@@ -256,10 +364,12 @@ def _run_ncu_profile(args):
     Skipped silently when ``ncu`` is not on PATH. ncu's own stderr is
     relayed when it fails (typical failure: NVIDIA's perf-counter
     permission gate)."""
+    import json as _json
     import os
     import shutil
     import subprocess
     import sys
+    from pathlib import Path as _Path
 
     if os.environ.get(_NCU_RECURSE_GUARD):
         return
@@ -271,47 +381,38 @@ def _run_ncu_profile(args):
 
     env = dict(os.environ)
     env[_NCU_RECURSE_GUARD] = "1"
+    # The ncu child process re-runs trace + compile, which would
+    # ``shutil.rmtree`` the parent's dump dir from ``CompilerDump``'s
+    # ``__post_init__``. Drop the env var for the child so the parent's
+    # ``60_*.json`` (bench results) survive — ncu output is captured via
+    # stdout and saved by the parent below.
+    env.pop("DEPLODOCK_DUMP_DIR", None)
 
-    # Explicit section list — `--set detailed` pulls in two sections that
-    # break on TMA kernels in ncu 2025.3.1: `SpeedOfLight_Roofline`
-    # (`float division by zero`) and `SourceCounters` /
-    # `PCSamplingData` (missing `smsp__pcsamp_*` metrics). Either one
-    # raises and poisons every subsequent section to NaN. Enumerating
-    # the sections that work sidesteps both.
-    sections = (
-        "SpeedOfLight",
-        "ComputeWorkloadAnalysis",
-        "MemoryWorkloadAnalysis",
-        "LaunchStats",
-        "Occupancy",
-    )
     cmd: list[str] = [
         ncu,
+        "--csv",
         "--target-processes",
         "all",
-        "--page",
-        "details",
+        "--metrics",
+        ",".join(_NCU_METRICS),
+        sys.executable,
+        "-m",
+        "deplodock.deplodock",
+        "run",
     ]
-    for s in sections:
-        cmd.extend(["--section", s])
-    cmd.extend(
-        [
-            sys.executable,
-            "-m",
-            "deplodock.deplodock",
-            "run",
-        ]
-    )
     if args.code is not None:
         cmd.extend(["--code", args.code])
     elif args.ir is not None:
         cmd.extend(["--ir", args.ir])
-    # Minimal iters — ncu's overhead means we only want one launch per kernel.
-    cmd.extend(["--warmup", "1", "--iters", "1"])
+    # ncu's per-launch overhead means we want one or two launches per
+    # kernel — enough for the counters to populate, not so many that
+    # the run drags out. Match ``deplodock run --bench``'s minimal
+    # warmup so the profiled launches see a realistic-ish steady state.
+    cmd.extend(["--warmup", "2", "--iters", "3"])
 
     print()
     print("=" * 80)
-    print("ncu --set detailed (per-kernel hardware analysis)")
+    print("ncu --csv (curated hardware metrics)")
     print("=" * 80)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
@@ -319,14 +420,95 @@ def _run_ncu_profile(args):
         logger.warning("ncu profiling timed out")
         return
 
-    # ncu writes its analysis to stdout. Relay it directly. If ncu failed,
-    # show stderr too so the user sees the diagnostic.
-    if result.stdout.strip():
-        print(result.stdout)
+    # ncu writes ``==PROF==`` status lines first, then a CSV table
+    # starting at the ``"ID"`` header. Split the two so we can save just
+    # the CSV part as a file and surface the status lines for
+    # diagnostics.
+    stdout = result.stdout
+    lines = stdout.splitlines()
+    csv_start = None
+    for i, line in enumerate(lines):
+        if line.startswith('"ID"'):
+            csv_start = i
+            break
+    if csv_start is None:
+        if stdout.strip():
+            print(stdout)
+        if result.returncode != 0:
+            logger.warning("ncu exit=%d", result.returncode)
+            if result.stderr.strip():
+                print(result.stderr, file=sys.stderr)
+        return
+
+    csv_text = "\n".join(lines[csv_start:]) + "\n"
+    status_text = "\n".join(lines[:csv_start])
+
+    parsed = _parse_ncu_csv(csv_text)
+
+    if dump_dir is not None:
+        out_dir = _Path(dump_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "61_ncu_metrics.csv").write_text(csv_text)
+        (out_dir / "61_ncu_metrics.json").write_text(_json.dumps(parsed, indent=2, default=str))
+        print(f"ncu metrics → {out_dir / '61_ncu_metrics.csv'}")
+        print(f"ncu metrics → {out_dir / '61_ncu_metrics.json'}")
+    else:
+        # No dump dir: relay the CSV (and status lines) so ad-hoc
+        # ``deplodock run --profile`` invocations still surface the data.
+        if status_text.strip():
+            print(status_text)
+        print(csv_text)
+
     if result.returncode != 0:
         logger.warning("ncu exit=%d", result.returncode)
         if result.stderr.strip():
             print(result.stderr, file=sys.stderr)
+
+
+def _parse_ncu_csv(csv_text: str) -> dict:
+    """Reduce ncu's launch-by-launch CSV into per-kernel metric dicts.
+
+    Each row in the CSV is one (kernel, metric) datum for one launch;
+    multi-launch profiling produces many rows per (kernel, metric) which
+    we aggregate: ``.sum`` and ``smsp__*`` counters get summed, every
+    other metric (percentages, per-thread regs) gets averaged. Returns
+    ``{kernel_name: {metric_name: numeric_value}}`` ready to be merged
+    with the bench-comparison JSON downstream.
+
+    Filters to deplodock-emitted kernels (``k_*`` naming convention) —
+    the ncu child runs in the same process as the eager-reference
+    accuracy check, which would otherwise contribute cutlass / cuBLAS
+    rows that contaminate the per-row aggregate.
+    """
+    import csv as _csv
+    import io as _io
+
+    reader = _csv.DictReader(_io.StringIO(csv_text))
+    per_kernel: dict[str, dict[str, list[float]]] = {}
+    for row in reader:
+        kname = row.get("Kernel Name", "")
+        metric = row.get("Metric Name", "")
+        raw = row.get("Metric Value", "").replace(",", "")
+        if not (kname and metric and raw):
+            continue
+        if not kname.startswith("k_"):
+            continue
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        per_kernel.setdefault(kname, {}).setdefault(metric, []).append(val)
+
+    out: dict[str, dict[str, float]] = {}
+    for kname, metrics in per_kernel.items():
+        reduced: dict[str, float] = {}
+        for metric, vals in metrics.items():
+            if metric.endswith(".sum") or metric.startswith("smsp__"):
+                reduced[metric] = sum(vals)
+            else:
+                reduced[metric] = sum(vals) / len(vals)
+        out[kname] = reduced
+    return out
 
 
 def _detect_stage(graph) -> str:
@@ -418,17 +600,18 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
 
-    if args.bench:
-        bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-        print()
-        print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-        print("-" * 38)
-        print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-        if dump:
-            dump.dump_benchmark(bench)
-        _print_kernel_stats(graph, bench)
-    if args.profile:
-        _run_ncu_profile(args)
+    with _gpu_lock():
+        if args.bench:
+            bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+            print()
+            print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+            print("-" * 38)
+            print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+            if dump:
+                dump.dump_benchmark(bench)
+            _print_kernel_stats(graph, bench)
+        if args.profile:
+            _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs):
@@ -551,11 +734,75 @@ def _check_accuracy(outputs, eager_out):
         sys.exit(1)
 
 
-def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters):
-    """Time eager / torch.compile / deplodock by alternating one iter of
-    each per loop step. All three see the same warm GPU state across the
-    measurement window — same clocks, same caches, same thermal drift —
-    instead of running in three sequential phases that each get a
+_BACKEND_ALIASES = {
+    "eager": "eager",
+    "deplodock": "deplodock",
+    "tcompile": "tcompile",
+    "torch.compile": "tcompile",
+    "compile": "tcompile",
+}
+
+
+def _resolve_backends(cli_value: str | None) -> set[str]:
+    """Pick which bench backends to time. Precedence:
+
+    1. ``--bench-backends`` CLI arg (comma-separated).
+    2. ``DEPLODOCK_BENCH_BACKENDS`` env var (same syntax).
+    3. Default ``eager,deplodock`` — torch.compile is excluded so the
+       per-case wall time isn't dominated by a ~0.8 s Inductor JIT
+       that most users don't need on every run.
+
+    ``deplodock`` is always included even if omitted (the kernel under
+    test is the point of the bench). Returns the canonical backend
+    keys ``{"eager", "tcompile", "deplodock"}``.
+    """
+    raw = cli_value or os.environ.get("DEPLODOCK_BENCH_BACKENDS") or "eager,deplodock"
+    selected: set[str] = {"deplodock"}
+    for tok in raw.split(","):
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        canonical = _BACKEND_ALIASES.get(tok)
+        if canonical is None:
+            logger.error("unknown bench backend %r — choose from %s", tok, sorted(set(_BACKEND_ALIASES.values())))
+            sys.exit(1)
+        selected.add(canonical)
+    return selected
+
+
+def _build_torch_fns(module, args, kwargs, warmup, *, backends: set[str]):
+    """Pre-build the per-backend ``torch_fns`` dict, including the
+    ``torch.compile`` JIT step when requested. The JIT (mostly
+    Inductor CPU work plus a few warmup launches) sits *outside* the
+    GPU lock in ``handle_run`` so parallel workers can compile
+    concurrently — the lock then only wraps the actual measurement
+    iters.
+
+    Returns only the torch-side closures; deplodock's bench loop is
+    driven separately by ``backend.benchmark`` in ``_bench_interleaved``.
+    """
+    import torch
+
+    torch_fns: dict[str, callable] = {}
+    if "eager" in backends:
+        torch_fns["Eager PyTorch"] = lambda: module(*args, **kwargs)
+    if "tcompile" in backends:
+        try:
+            compiled_module = torch.compile(module)
+            for _ in range(warmup + 5):
+                with torch.no_grad():
+                    compiled_module(*args, **kwargs)
+            torch_fns["torch.compile"] = lambda: compiled_module(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("torch.compile failed: %s", e)
+    return torch_fns
+
+
+def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns):
+    """Time the selected backends by alternating one iter of each per
+    loop step. All backends see the same warm GPU state across the
+    measurement window — same clocks, same caches, same thermal drift
+    — instead of running in sequential phases that each get a
     different steady state.
 
     Driven by ``backend.benchmark(on_iter=...)``: deplodock is the
@@ -567,18 +814,13 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     Per-iter ``torch.cuda.Event``s queue on the (legacy) default
     stream; cupy's default stream is the same NULL stream, so events
     from both libraries see all preceding work.
+
+    ``torch_fns`` is the pre-built backend closure dict from
+    :func:`_build_torch_fns` (``handle_run`` builds it outside the
+    GPU lock so the slow ``torch.compile`` JIT runs concurrently with
+    peer workers; the lock then wraps only this measurement loop).
     """
     import torch
-
-    torch_fns: dict[str, callable] = {"Eager PyTorch": lambda: module(*args, **kwargs)}
-    try:
-        compiled_module = torch.compile(module)
-        for _ in range(warmup + 5):
-            with torch.no_grad():
-                compiled_module(*args, **kwargs)
-        torch_fns["torch.compile"] = lambda: compiled_module(*args, **kwargs)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("torch.compile failed: %s", e)
 
     torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {name: [] for name in torch_fns}
 
