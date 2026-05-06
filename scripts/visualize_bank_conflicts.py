@@ -64,6 +64,8 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
             "lane_banks": p.lane_banks,
             "counts": p.counts,
             "max_way": p.max_way,
+            "raw_max_way": p.raw_max_way,
+            "conflict_events": p.conflict_events,
             "avg_way": p.avg_way,
             "rows": p.rows,
             "cols": p.cols,

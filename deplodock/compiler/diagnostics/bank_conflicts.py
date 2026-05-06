@@ -62,7 +62,19 @@ class StageBinding:
 
 @dataclass
 class BankConflictResult:
-    """Per-lane bank id + summary statistics for one StageBinding."""
+    """Per-lane bank id + summary statistics for one StageBinding.
+
+    Hardware semantics: when multiple lanes target the *same address* in
+    a bank, the load is broadcast and only one cycle is spent. The
+    actual ``l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld``
+    counter increments by ``(distinct_addrs_at_bank - 1)`` per warp-LDS,
+    summed across banks. ``max_way`` here is that worst-bank value
+    (i.e. ``max(distinct_addrs_at_bank)``) — same-address broadcasts
+    don't count.
+
+    ``raw_max_way`` is ``max(lanes_at_bank)`` — the upper bound assuming
+    no broadcasting. Useful for cross-checking the broadcast model.
+    """
 
     stage_name: str
     buf: str
@@ -73,8 +85,12 @@ class BankConflictResult:
     smem_bytes: int
     index_repr: tuple[str, ...]  # the cache-relative index of the simulated Load
     lane_banks: list[int]  # length WARP_SIZE
+    lane_addrs: list[int]  # length WARP_SIZE — pre-mod linear smem address
     counts: list[int]  # length BANKS — lanes per bank
-    max_way: int
+    distinct_addrs: list[int]  # length BANKS — distinct addresses per bank
+    max_way: int  # worst broadcast-corrected = max(distinct_addrs)
+    raw_max_way: int  # max(counts) — upper bound w/o broadcast
+    conflict_events: int  # sum(distinct_addrs[b] - 1 for b with hits)
     avg_way: float
     enclosing_axes: tuple[str, ...] = ()
 
@@ -213,6 +229,7 @@ def simulate(binding: StageBinding, k_iter: int = 0, warp_id: int = 0) -> BankCo
         base_env[enc[-1].name] = k_iter
 
     lane_banks: list[int] = []
+    lane_addrs: list[int] = []
     for lane in range(WARP_SIZE):
         env = dict(base_env)
         env.update(thread_axis_env(tile.thread_axes, warp_id * WARP_SIZE + lane))
@@ -221,12 +238,19 @@ def simulate(binding: StageBinding, k_iter: int = 0, warp_id: int = 0) -> BankCo
         except (KeyError, TypeError):
             return None
         addr = sum(c * s for c, s in zip(coords, strides, strict=True))
+        lane_addrs.append(addr)
         lane_banks.append(addr % BANKS)
 
     counts = [0] * BANKS
-    for b in lane_banks:
+    addrs_per_bank: list[set[int]] = [set() for _ in range(BANKS)]
+    for lane, (b, a) in enumerate(zip(lane_banks, lane_addrs, strict=True)):
+        del lane  # unused
         counts[b] += 1
-    max_way = max(counts)
+        addrs_per_bank[b].add(a)
+    distinct_addrs = [len(s) for s in addrs_per_bank]
+    raw_max_way = max(counts)
+    max_way = max(distinct_addrs) if distinct_addrs else 0
+    conflict_events = sum(d - 1 for d in distinct_addrs if d > 0)
     nz = [c for c in counts if c > 0]
     avg = sum(nz) / len(nz) if nz else 0.0
 
@@ -240,8 +264,12 @@ def simulate(binding: StageBinding, k_iter: int = 0, warp_id: int = 0) -> BankCo
         smem_bytes=stage.smem_bytes,
         index_repr=tuple(e.pretty() for e in cache_idx),
         lane_banks=lane_banks,
+        lane_addrs=lane_addrs,
         counts=counts,
+        distinct_addrs=distinct_addrs,
         max_way=max_way,
+        raw_max_way=raw_max_way,
+        conflict_events=conflict_events,
         avg_way=avg,
         enclosing_axes=tuple(ax.name for ax in binding.enclosing_loop_axes),
     )
