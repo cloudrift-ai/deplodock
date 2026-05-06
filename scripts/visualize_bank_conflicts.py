@@ -43,6 +43,7 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
             "formula": (f"{p.stage_class}({p.rows}×{p.cols})  " + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")),
             "lane_banks": p.lane_banks,
             "counts": p.counts,
+            "distinct_addrs": p.distinct_addrs,
             "max_way": p.max_way,
             "raw_max_way": p.raw_max_way,
             "conflict_events": p.conflict_events,
@@ -151,7 +152,9 @@ PAYLOAD.columns.forEach((col,ci)=>{
     for(let l=0;l<WARP;l++) for(let b=0;b<BANKS;b++)
       md.push({value:[b,l,0],itemStyle:{color:palette.empty}});
     p.lane_banks.forEach((bank,lane)=>{
-      const c=p.counts[bank];
+      // Color cells by distinct_addrs at that bank — broadcasts (multiple
+      // lanes at same address) are NOT conflicts and stay green.
+      const c=p.distinct_addrs[bank];
       md.push({value:[bank,lane,c],itemStyle:{color:cellColor(c),shadowBlur:6,shadowColor:cellColor(c)+'88'}});
     });
     m.setOption({
@@ -184,7 +187,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
         axisLabel:{color:'#6b7280',fontSize:10,interval:3}},
       yAxis:{type:'value',splitLine:{lineStyle:{color:'#1c212b'}},
         axisLabel:{color:'#6b7280',fontSize:10},axisLine:{show:false},axisTick:{show:false}},
-      series:[{type:'bar',data:p.counts.map(c=>({value:c,itemStyle:{
+      series:[{type:'bar',data:p.distinct_addrs.map(c=>({value:c,itemStyle:{
         color:{type:'linear',x:0,y:0,x2:0,y2:1,
           colorStops:[{offset:0,color:cellColor(c)},{offset:1,color:cellColor(c)+'55'}]},
         borderRadius:[3,3,0,0]}})),barWidth:'70%',
