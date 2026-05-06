@@ -133,6 +133,24 @@ def _count_loads_from(consumer_op: LoopOp, producer_buf: str) -> int:
     return sum(1 for ld in consumer_op.body.loads if ld.input == producer_buf)
 
 
+def _reduce_with_n_buffers(loop_op: LoopOp) -> int:
+    """Maximum distinct buffer Loads under any single reduce ``Loop`` in
+    ``loop_op``'s body. ``0`` if no reduce loop has any Load.
+
+    Pure matmul: 2 (a, b). matmul_add (epilogue-fused): still 2 (the
+    residual loads outside the reduce). silu_mul_matmul (prologue
+    fused into the K-reduce): 3 (g, u, w). The 3-or-more case is what
+    the fused-prologue guard above refuses.
+    """
+    max_n = 0
+    for s in loop_op.body.iter():
+        if isinstance(s, Loop) and s.is_reduce:
+            bufs = {ld.input for ld in s.body.of_type(Load)}
+            if len(bufs) > max_n:
+                max_n = len(bufs)
+    return max_n
+
+
 PATTERN = [
     Pattern("producer", LoopOp),
     Pattern("consumer", LoopOp),
@@ -191,6 +209,18 @@ def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph
         raise RuleSkipped(f"work blowup: post={post_work} > {_BLOWUP_FACTOR}× pre={pre_work}")
     if post_reads > _BLOWUP_FACTOR * pre_reads:
         raise RuleSkipped(f"read blowup: post={post_reads} > {_BLOWUP_FACTOR}× pre={pre_reads}")
+
+    # Fused-prologue-into-matmul guard: when the merged op has a reduce
+    # loop whose body Loads ≥3 distinct buffers, the matmul will compile
+    # under the fused-prologue tile class (BN=64, BM=64, F=4×4) instead
+    # of the default ``F=8×4``. The fused tile halves arithmetic
+    # intensity per thread (16 outputs vs 32) — fine when the prologue
+    # is unavoidable, but here we have the choice. Sweep on ``silu_mul
+    # _matmul.qwen.{s128, s512}`` shows the 2-kernel solution
+    # (silu_mul → temp + matmul) ≈30% faster than the fused single
+    # kernel; refuse this fusion and let the two LoopOps stay separate.
+    if _reduce_with_n_buffers(merged) >= 3:
+        raise RuleSkipped("fused result has ≥3 buffer Loads inside a reduce loop (matmul-prologue fusion); 2-kernel solution is faster")
 
     # Broadcast-materialization guard: fusing a compute-bearing producer into
     # a pure-indexmap consumer whose output volume exceeds the producer's
