@@ -197,7 +197,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
         max-way ${p.max_way} · avg ${p.avg_way.toFixed(1)} lane/bank</span>
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
-      <div class="ladder-title">smem layout — bank per (row,col), accessed cells outlined</div>
+      <div class="ladder-title">smem layout — bank per (row,col); hover the highlighted cells for load expr + lanes</div>
       <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
       <div class="card-notes">${p.notes.join('<br/>')}</div>`;
     colEl.appendChild(card);
@@ -278,9 +278,14 @@ PAYLOAD.columns.forEach((col,ci)=>{
           value:[c, r, bank],
           itemStyle:{
             color: color,
-            opacity: isPad ? 0.45 : 1.0,
+            // Dim un-accessed cells so the white-outlined accessed
+            // cells visually pop — they are the ones with the rich
+            // tooltip (load expr + lanes).
+            opacity: isPad ? 0.18 : (isTouched ? 1.0 : 0.28),
             borderColor: isTouched ? '#ffffff' : 'transparent',
-            borderWidth: isTouched ? 1.5 : 0,
+            borderWidth: isTouched ? 2 : 0,
+            shadowBlur: isTouched ? 8 : 0,
+            shadowColor: isTouched ? '#ffffffaa' : 'transparent',
           },
         });
       }
