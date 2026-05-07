@@ -332,43 +332,6 @@ PAYLOAD.columns.forEach((col,ci)=>{
         });
       }
     }
-    const compactRanges = arr => {
-      if (!arr.length) return '';
-      const parts = []; let s = arr[0], e = arr[0];
-      for (let i = 1; i < arr.length; i++) {
-        if (arr[i] === e + 1) { e = arr[i]; }
-        else { parts.push(s === e ? `${s}` : `${s}-${e}`); s = arr[i]; e = arr[i]; }
-      }
-      parts.push(s === e ? `${s}` : `${s}-${e}`);
-      return parts.join(', ');
-    };
-    // Group sweep entries by Load name, then by k_iter. Each entry is
-    // [load_name, k_iter, lane]. Renders one section per Load with up
-    // to ``cap`` k_iter lines below it.
-    const formatSweep = entries => {
-      if (!entries.length) return '';
-      const byLoad = new Map();
-      entries.forEach(([ln, k, l]) => {
-        if (!byLoad.has(ln)) byLoad.set(ln, new Map());
-        const byIter = byLoad.get(ln);
-        if (!byIter.has(k)) byIter.set(k, []);
-        byIter.get(k).push(l);
-      });
-      const cap = 4;
-      const sections = [];
-      for (const [ln, byIter] of [...byLoad.entries()].sort()) {
-        const ks = [...byIter.keys()].sort((a,b)=>a-b);
-        const lines = ks.map(k => {
-          const lanes = byIter.get(k).sort((a,b)=>a-b);
-          return `&nbsp;&nbsp;k_iter=<b>${k}</b>: lanes ${compactRanges(lanes)} (${lanes.length}×)`;
-        });
-        const tail = lines.length > cap
-          ? lines.slice(0, cap).concat([`&nbsp;&nbsp;<span style="color:#6b7280">… +${lines.length - cap} more iters</span>`])
-          : lines;
-        sections.push(`<span style="color:#7dd3fc">${ln}</span>:<br/>${tail.join('<br/>')}`);
-      }
-      return sections.join('<br/>');
-    };
     ldr.setOption({
       backgroundColor:'transparent',
       tooltip:{
@@ -386,19 +349,16 @@ PAYLOAD.columns.forEach((col,ci)=>{
             return head + padTag + `<br/><span style="color:#6b7280">never read by warp 0 (other warps own this row)</span>`;
           }
           const star = isNow ? `<br/><span style="color:#fff">★ accessed at the rendered k_iter</span>` : '';
-          // One substituted form per Load that hits this cell.
+          // One substituted form per Load that hits this cell. The
+          // substituted index already encodes the k_iter (it's the
+          // last component, e.g. in6[((0*8)+2), 5] → k=5), so we
+          // don't repeat it as a separate "k_iter=..." line.
           const substMap = substByLoad.get(k) || {};
           const substLines = Object.entries(substMap).sort().map(
             ([ln, subst]) => `<code style="color:#3ddc84">${ln}[${subst.join(', ')}]</code>`
           );
-          const loadSection = substLines.length
-            ? `<br/>${substLines.join('<br/>')}`
-            : '';
-          return head +
-            loadSection +
-            star +
-            `<br/>${formatSweep(sweepPairs)}` +
-            padTag;
+          const loadSection = substLines.length ? `<br/>${substLines.join('<br/>')}` : '';
+          return head + loadSection + star + padTag;
         },
       },
       grid:{left:30, right:14, top:6, bottom:18},
