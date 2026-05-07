@@ -247,8 +247,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
     const id=`c${ci}_p${pi}`;
     const card=document.createElement('div');card.className='card';
     card.innerHTML=`
-      <div class="card-title">${p.panel_title}</div>
-      <div class="card-formula">${p.formula}</div>
+      <div class="ladder-title" style="margin-top:0">bank access punchcard — ${p.panel_title}</div>
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
       <div class="hist-legend">
