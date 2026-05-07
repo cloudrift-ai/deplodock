@@ -194,6 +194,7 @@ HTML = """<!doctype html>
     font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9px;color:var(--muted);}
   .bank-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}
   .bank-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;}
+  .bank-legend-shared{margin-top:14px;font-size:10px;}
   .hist-legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;
     font-size:10px;color:var(--muted);}
   .hist-legend span{display:inline-flex;align-items:center;gap:5px;}
@@ -208,6 +209,7 @@ HTML = """<!doctype html>
 <body>
   <div class="page">
     <div class="columns" id="columns"></div>
+    <div class="bank-legend bank-legend-shared" id="shared-bank-legend"></div>
   </div>
 <script>
 const PAYLOAD = __PAYLOAD__;
@@ -255,7 +257,6 @@ PAYLOAD.columns.forEach((col,ci)=>{
       </div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
       <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
-      <div class="bank-legend" id="bl_${id}"></div>
       ${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
     colEl.appendChild(card);
 
@@ -418,23 +419,27 @@ PAYLOAD.columns.forEach((col,ci)=>{
         animationDuration:400, animationEasing:'cubicOut',
       }],
     });
-    // Bank-color legend below the ladder. Only shows banks that
-    // actually appear in the smem layout (typically 0..31, but the
-    // legend trims to the unique banks present). Compact horizontal
-    // chips with the BANK_PALETTE color + "bank N" label.
-    const banksUsed = new Set();
-    for (let r = 0; r < lay.rows; r++) {
-      for (let c = 0; c < lay.cols; c++) banksUsed.add(lay.banks[r][c]);
-    }
-    const legend = document.getElementById(`bl_${id}`);
-    [...banksUsed].sort((a,b)=>a-b).forEach(bank => {
-      const chip = document.createElement('span');
-      chip.innerHTML = `<i style="background:${BANK_PALETTE[bank % BANK_PALETTE.length]}"></i>bank ${bank}`;
-      legend.appendChild(chip);
-    });
     window.addEventListener('resize',()=>{m.resize();h.resize();ldr.resize();});
   });
 });
+
+// One shared bank-color legend below all columns. Renders 8×4 chips
+// for every bank that appears in any panel's layout.
+(() => {
+  const banksUsed = new Set();
+  PAYLOAD.columns.forEach(col => col.panels.forEach(p => {
+    for (let r = 0; r < p.layout.rows; r++) {
+      for (let c = 0; c < p.layout.cols; c++) banksUsed.add(p.layout.banks[r][c]);
+    }
+  }));
+  const host = document.getElementById('shared-bank-legend');
+  if (!host) return;
+  [...banksUsed].sort((a,b)=>a-b).forEach(bank => {
+    const chip = document.createElement('span');
+    chip.innerHTML = `<i style="background:${BANK_PALETTE[bank % BANK_PALETTE.length]}"></i>bank ${bank}`;
+    host.appendChild(chip);
+  });
+})();
 </script>
 </body>
 </html>
