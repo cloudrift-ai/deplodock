@@ -171,7 +171,9 @@ HTML = """<!doctype html>
   *{box-sizing:border-box;}
   html,body{margin:0;background:transparent;color:var(--fg);
     font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;}
-  .page{max-width:100%;margin:0;padding:0;}
+  /* Center the column grid + shared legend horizontally; shrink to
+     content width so unused horizontal space sits outside the page. */
+  .page{display:flex;flex-direction:column;align-items:center;margin:0;padding:0;}
   /* Auto-sized columns: each column shrinks to its content width
      (the punchcard / ladder), so the whole grid is no wider than the
      plots need. Centered if the page has more horizontal room. */
@@ -199,8 +201,8 @@ HTML = """<!doctype html>
   .ladder{margin:4px auto 0;}
   .ladder-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
     margin-top:10px;margin-bottom:4px;}
-  .bank-legend{display:grid;grid-template-columns:repeat(8,1fr);gap:3px 6px;margin-top:8px;
-    font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9px;color:var(--muted);}
+  .bank-legend{display:grid;grid-template-columns:repeat(8,auto);gap:3px 12px;margin-top:8px;
+    width:fit-content;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9px;color:var(--muted);}
   .bank-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}
   .bank-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;}
   .bank-legend-shared{margin-top:14px;font-size:10px;}
