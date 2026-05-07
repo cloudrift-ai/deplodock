@@ -263,14 +263,17 @@ PAYLOAD.columns.forEach((col,ci)=>{
       </div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
       <div class="ladder" id="l_${id}" style="${(()=>{
-        // 3:1 wide rectangles for ladder cells (cell_w = 3 × cell_h).
-        // Container fills column; height = rows × cell_h + axis. Cell
-        // height is computed to keep total ≤ 360 px while ensuring the
-        // 3× wider cells don't exceed 100% column width.
-        const axisH = 24, maxH = 360;
-        const N = Math.max(2, Math.min(6, Math.floor((maxH - axisH) / p.layout.rows)));
+        // Natural-size square cells: pick the largest cell-size px
+        // that fits both maxW and maxH, then size the container to
+        // (cols*N + axisW) × (rows*N + axisH). Don't stretch — leave
+        // unused horizontal space for the iframe to be narrower.
+        const axisW = 38, axisH = 24, maxH = 360, maxW = 380;
+        const N = Math.max(2, Math.min(6,
+          Math.floor((maxH - axisH) / p.layout.rows),
+          Math.floor((maxW - axisW) / p.layout.cols)));
+        const w = p.layout.cols * N + axisW;
         const h = p.layout.rows * N + axisH;
-        return `width:100%; height:${h}px`;
+        return `width:${w}px; height:${h}px`;
       })()}"></div>
       ${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
     colEl.appendChild(card);
