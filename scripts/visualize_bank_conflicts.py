@@ -319,15 +319,14 @@ PAYLOAD.columns.forEach((col,ci)=>{
         const bank = lay.banks[r][c];
         const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
         const k = `${r},${c}`;
-        const accessedNow = touchedNow.has(k) && touchedNow.get(k).length > 0;
         const reachable = sweep.has(k);
         const color = isPad ? '#3a3f48' : ADDR_PALETTE[bank % ADDR_PALETTE.length];
         ldrData.push({
           value:[c, r, bank],
           itemStyle:{
             color: color,
-            // Padding: very dim. Reachable-but-not-now: medium. Now: full.
-            opacity: isPad ? 0.18 : (accessedNow ? 1.0 : (reachable ? 0.55 : 0.18)),
+            // Reachable cells: full color. Padding / unreachable: dim.
+            opacity: (isPad || !reachable) ? 0.18 : 1.0,
           },
         });
       }
@@ -348,17 +347,13 @@ PAYLOAD.columns.forEach((col,ci)=>{
           if (!sweepPairs.length) {
             return head + padTag + `<br/><span style="color:#6b7280">never read by warp 0 (other warps own this row)</span>`;
           }
-          const star = isNow ? `<br/><span style="color:#fff">★ accessed at the rendered k_iter</span>` : '';
-          // One substituted form per Load that hits this cell. The
-          // substituted index already encodes the k_iter (it's the
-          // last component, e.g. in6[((0*8)+2), 5] → k=5), so we
-          // don't repeat it as a separate "k_iter=..." line.
+          // One substituted form per Load that hits this cell.
           const substMap = substByLoad.get(k) || {};
           const substLines = Object.entries(substMap).sort().map(
             ([ln, subst]) => `<code style="color:#3ddc84">${ln}[${subst.join(', ')}]</code>`
           );
           const loadSection = substLines.length ? `<br/>${substLines.join('<br/>')}` : '';
-          return head + loadSection + star + padTag;
+          return head + loadSection + padTag;
         },
       },
       grid:{left:30, right:14, top:6, bottom:18},
