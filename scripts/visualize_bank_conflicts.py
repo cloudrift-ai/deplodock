@@ -189,7 +189,9 @@ HTML = """<!doctype html>
      data. Capping width keeps cells visibly square instead of squashed
      wide rectangles when the container is stretched. */
   .matrix{width:100%;max-width:320px;aspect-ratio:1/1;height:auto;margin:0 auto 10px;}
-  .hist{width:100%;height:80px;margin-top:2px;}
+  /* Histogram shares the bank axis with the punchcard above —
+     match its max-width so banks line up vertically. */
+  .hist{width:100%;max-width:320px;height:80px;margin:2px auto 0;}
   .ladder{width:100%;margin-top:4px;}
   .ladder-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
     margin-top:10px;margin-bottom:4px;}
