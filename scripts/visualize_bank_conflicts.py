@@ -144,9 +144,7 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
                     "index_expr": ", ".join(p.index_repr),
                     "load_name": p.load_name,
                 },
-                "notes": [
-                    f"index = ({', '.join(p.index_repr)})",
-                ],
+                "notes": [],
             }
         )
     return out
@@ -233,8 +231,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
-      <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
-      <div class="card-notes">${p.notes.join('<br/>')}</div>`;
+      <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
     colEl.appendChild(card);
 
     const m=echarts.init(document.getElementById(`m_${id}`),null,{renderer:'canvas'});
