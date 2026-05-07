@@ -185,7 +185,10 @@ HTML = """<!doctype html>
   .v-ok{color:#3ddc84;} .v-ok .dot{background:#3ddc84;}
   .v-warn{color:#ffb454;} .v-warn .dot{background:#ffb454;}
   .v-bad{color:#ff5c7a;} .v-bad .dot{background:#ff5c7a;}
-  .matrix{width:100%;height:200px;margin-bottom:10px;}
+  /* Square punchcard: 32 banks × 32 lanes is intrinsically square
+     data. Capping width keeps cells visibly square instead of squashed
+     wide rectangles when the container is stretched. */
+  .matrix{width:100%;max-width:320px;aspect-ratio:1/1;height:auto;margin:0 auto 10px;}
   .hist{width:100%;height:80px;margin-top:2px;}
   .ladder{width:100%;margin-top:4px;}
   .ladder-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
