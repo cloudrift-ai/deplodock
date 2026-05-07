@@ -23,7 +23,7 @@ Trigger:
   defines ≥ 1 ``Accum``, and no body stmt reads any local Accum
   target's running value (rejects in-loop online-softmax-style merges
   where an Assign reads ``acc`` mid-iteration). ``register_tile`` no
-  longer enforces this gate; ``013`` keeps it because its rewrite
+  longer enforces this gate; ``014`` keeps it because its rewrite
   reorders smem visibility relative to the FMA chain and that
   reordering compounds fp32 drift on online-softmax-style bodies.
 - Smem budget: ``2 × sum(slab_floats) ≤ _SMEM_BUDGET`` (default 96 KB

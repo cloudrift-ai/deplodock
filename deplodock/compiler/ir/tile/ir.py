@@ -334,7 +334,7 @@ class AsyncBufferedStage(BufferedStage):
     Materialize emits ``Smem`` + cooperative ``CpAsyncCopy`` +
     ``CpAsyncCommit`` only — *no* implicit wait, *no* ``Sync``. The
     caller must dominate every consumer with an ``AsyncWait`` Stmt.
-    Requires sm_80+ (gated by ``012_async_copy``).
+    Requires sm_80+ (gated by ``013_async_copy``).
     """
 
     def _pretty_extra(self) -> str:
@@ -367,7 +367,7 @@ class TmaBufferedStage(BufferedStage):
     arrival already provides CTA-wide visibility).
 
     Requires sm_90+ and ``--gpu-architecture=sm_90a`` (gated by
-    ``010_tma_copy``). Eligible only for ``AffineAddressing`` with the
+    ``011_tma_copy``). Eligible only for ``AffineAddressing`` with the
     inner source dim contiguous and 16 B aligned.
     """
 
@@ -376,7 +376,7 @@ class TmaBufferedStage(BufferedStage):
     def __post_init__(self) -> None:
         super().__post_init__()
         # TMA box copies write rows back-to-back at the cache extent;
-        # bank-conflict ``+1`` padding (set by ``013_pad_smem`` for
+        # bank-conflict ``+1`` padding (set by ``014_pad_smem`` for
         # cp.async / sync stages) would put body Loads' padded stride out
         # of step with the unpadded box write. The pad pass already skips
         # ``TmaBufferedStage`` — this assertion catches any future caller

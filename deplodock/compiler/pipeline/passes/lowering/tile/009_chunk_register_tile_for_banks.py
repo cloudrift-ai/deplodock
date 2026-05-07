@@ -51,7 +51,7 @@ Skips when:
 
 * The picked axis has no body Load with stride F > 4 divisible by 4.
   Captures the ``F_N <= 4`` no-op case and any non-canonical shape.
-* Bank-conflict analysis (reusing ``013_pad_smem``'s analyzer) says
+* Bank-conflict analysis (reusing ``014_pad_smem``'s analyzer) says
   ``post < pre`` doesn't hold.
 """
 
@@ -174,7 +174,7 @@ def _infer_lane_stride(body: Body, lane_var: str) -> int | None:
 def _swap_helps_any_stage(tile: Tile, thread_axes: tuple[Axis, ...], lane_var: str, F: int, lane_ext: int) -> bool:
     """At least one Stage has a fixable bank conflict that the chunked
     rewrite would drive lower. Reuses the affine analyzer from
-    ``013_pad_smem``.
+    ``014_pad_smem``.
 
     Note the analyzer is a coarse predictor — it counts bank conflicts
     treating each Load as a single-element access (i.e. as if hardware

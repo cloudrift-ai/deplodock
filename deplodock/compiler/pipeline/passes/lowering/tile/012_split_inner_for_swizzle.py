@@ -1,8 +1,8 @@
 """Split the inner cache axis of a TMA stage to fit a swizzle width.
 
-Runs after ``010_tma_copy`` and before ``012_async_copy``. Visits every
+Runs after ``011_tma_copy`` and before ``013_async_copy``. Visits every
 ``TmaBufferedStage`` whose ``swizzle == NONE`` (left untouched by the
-exact-match picker in ``010_tma_copy``) and whose inner cache extent is
+exact-match picker in ``011_tma_copy``) and whose inner cache extent is
 a *multiple* of a swizzle width: 32 / 16 / 8 fp32 = 128 / 64 / 32 B.
 
 When triggered, the pass:
@@ -26,8 +26,8 @@ When triggered, the pass:
 3. Sets ``swizzle`` on the stage to the matching mode.
 
 After this pass, the stage's ``axes`` is rank-(N+1), ``alloc_extents``
-expands accordingly, and downstream passes (``012_async_copy``,
-``013_pad_smem``, the materializer's TMA emit) see a consistent slab
+expands accordingly, and downstream passes (``013_async_copy``,
+``014_pad_smem``, the materializer's TMA emit) see a consistent slab
 shape — no special-case logic for the split.
 
 Gated behind ``tuning._tma_swizzle_enabled``.

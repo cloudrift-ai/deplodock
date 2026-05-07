@@ -6,7 +6,7 @@ the steady-state body issues chunk N+1 *while* computing chunk N
 (overlapping DRAM with FMA), epilogue computes the last chunk after a
 final drain.
 
-Input shape (post 013 + 014)::
+Input shape (post 014 + 015)::
 
     Loop(K_outer in 0..K, body=[
         AsyncBufferedStage(W, buffer_count=2, phase=K_outer%2),
@@ -112,10 +112,10 @@ def _eligible(loop: Loop, invariant_names: set[str]) -> bool:
     K-outer starts, so the steady-state can read them from registers
     without phase-dependent reordering. The original Accum-running-
     value rejection (``Body.deps_of`` returning an in-body ``Accum``
-    for a non-Accum stmt) still holds via 013's ``extra_gate`` and is
+    for a non-Accum stmt) still holds via 014's ``extra_gate`` and is
     the precise pattern the drift comment was about.
 
-    ``009_double_buffer`` runs the same relaxed gate."""
+    ``010_double_buffer`` runs the same relaxed gate."""
 
     def gate(k_outer: Loop, k_inner: Loop) -> bool:
         if int(k_outer.axis.extent) < 2:
@@ -147,7 +147,7 @@ def _eligible(loop: Loop, invariant_names: set[str]) -> bool:
 def _pipeline(loop: Loop) -> list[Stmt] | None:
     n_chunks = int(loop.axis.extent)
     k_var = loop.axis.name
-    # Drop synchronous-style ``AsyncWait`` stmts inserted by 014; the
+    # Drop synchronous-style ``AsyncWait`` stmts inserted by 015; the
     # pipelined schedule re-emits its own waits at the correct positions.
     stages = [s for s in loop.body if isinstance(s, (AsyncBufferedStage, TmaBufferedStage))]
     others = [s for s in loop.body if not isinstance(s, (AsyncBufferedStage, TmaBufferedStage, AsyncWait))]

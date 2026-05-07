@@ -18,7 +18,7 @@
   Honors the ``--target sm_NN`` CLI override.
 - :func:`load_thread_axis_coeffs` / :func:`max_bank_conflict` —
   bank-conflict analysis for body Loads of a staged buffer. Used by
-  ``013_pad_smem`` (cp.async / sync stages, +1 padding).
+  ``014_pad_smem`` (cp.async / sync stages, +1 padding).
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
@@ -132,7 +132,7 @@ def is_matmul_k_outer(
 
 
 # ---------------------------------------------------------------------------
-# Bank-conflict analysis (used by 014c pad pass)
+# Bank-conflict analysis (used by 014_pad_smem)
 # ---------------------------------------------------------------------------
 
 
@@ -153,7 +153,7 @@ def load_thread_axis_coeffs(
     Returns ``None`` if any Load is non-affine in the thread-axis vars
     or its index doesn't match the expected dim count — caller skips
     conservatively. ``leading_phase_dim=True`` strips the leading phase
-    index (added by ``009_double_buffer`` for ``BufferedStage`` Loads):
+    index (added by ``010_double_buffer`` for ``BufferedStage`` Loads):
     phase is uniform across threads, contributing no bank-distribution
     effect, so dropping it doesn't change the analysis.
     """
