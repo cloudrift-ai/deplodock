@@ -48,10 +48,11 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
     union_source = all_panels_for_union if all_panels_for_union is not None else panels
     # Build per-Stage union: (tile_op_name, stage_name) → {(r,c) → list of
     # (load_name, k_iter, lane, subst_idx_tuple)} merged across all body
-    # Loads of the Stage. Also a per-Stage set of cells that participate
-    # in a real conflict in any of the Stage's Loads.
+    # Loads of the Stage. Also a per-cell map of Loads whose LDS conflicts
+    # when touching that cell (so the tooltip can flag conflicts on the
+    # focused Load specifically).
     stage_union: dict[tuple[str, str], dict[tuple[int, int], list[tuple]]] = {}
-    stage_conflict_cells: dict[tuple[str, str], set[tuple[int, int]]] = {}
+    stage_conflict_loads: dict[tuple[str, str], dict[tuple[int, int], set[str]]] = {}
     for p in union_source:
         key = (p.tile_op_name, p.stage_name)
         u = stage_union.setdefault(key, {})
@@ -59,7 +60,9 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
             subst = p.full_sweep_subst_idx.get(cell, ())
             for k, lane in pairs:
                 u.setdefault(cell, []).append((p.load_name, k, lane, subst))
-        stage_conflict_cells.setdefault(key, set()).update(p.full_sweep_conflict_cells)
+        cmap = stage_conflict_loads.setdefault(key, {})
+        for cell in p.full_sweep_conflict_cells:
+            cmap.setdefault(cell, set()).add(p.load_name)
     out: list[dict] = []
     for p in panels:
         # Per-lane address-color index: same address → same color, regardless
@@ -105,7 +108,7 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
             for ln, _k, _l, s in entries:
                 subst_per_cell.setdefault((r, c), {}).setdefault(ln, tuple(s))
         all_cells = sorted(set(touched_now) | set(sweep_per_cell))
-        conflict_cells = stage_conflict_cells.get((p.tile_op_name, p.stage_name), set())
+        conflict_loads = stage_conflict_loads.get((p.tile_op_name, p.stage_name), {})
         touched_entries = [
             {
                 "r": r,
@@ -115,9 +118,8 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
                 "sweep": sweep_per_cell.get((r, c), []),
                 # subst_by_load: {load_name: [substituted_index_string, ...]}
                 "subst_by_load": {ln: list(s) for ln, s in subst_per_cell.get((r, c), {}).items()},
-                # True iff this cell participates in a real conflict at
-                # some (Load, k_iter) — its bank had > 1 distinct address.
-                "conflict": (r, c) in conflict_cells,
+                # Loads whose LDS conflicts when touching this cell.
+                "conflict_loads": sorted(conflict_loads.get((r, c), set())),
             }
             for (r, c) in all_cells
         ]
@@ -321,6 +323,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
     const focusCells = new Set(
       lay.touched.filter(t => t.subst_by_load && t.subst_by_load[focusLoad]).map(t => `${t.r},${t.c}`)
     );
+    const conflictLoadsByCell = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.conflict_loads || []]));
     for (let r = 0; r < lay.rows; r++) {
       for (let c = 0; c < lay.cols; c++) {
         const bank = lay.banks[r][c];
@@ -362,7 +365,21 @@ PAYLOAD.columns.forEach((col,ci)=>{
             ([ln, subst]) => `<code style="color:#3ddc84">${ln}[${subst.join(', ')}]</code>`
           );
           const loadSection = substLines.length ? `<br/>${substLines.join('<br/>')}` : '';
-          return head + loadSection + padTag;
+          const conflicts = conflictLoadsByCell.get(k) || [];
+          let conflictTag = '';
+          if (conflicts.length) {
+            const inFocus = conflicts.includes(focusLoad);
+            const others = conflicts.filter(l => l !== focusLoad);
+            if (inFocus) {
+              conflictTag = `<br/><span style="color:#ff5c7a">⚠ conflict in <b>${focusLoad}</b>'s LDS at this k_iter</span>`;
+              if (others.length) {
+                conflictTag += `<br/><span style="color:#6b7280">(also: ${others.join(', ')})</span>`;
+              }
+            } else {
+              conflictTag = `<br/><span style="color:#ffb454">⚠ conflict in: ${conflicts.join(', ')}</span>`;
+            }
+          }
+          return head + loadSection + conflictTag + padTag;
         },
       },
       grid:{left:30, right:14, top:6, bottom:18},
