@@ -250,11 +250,11 @@ PAYLOAD.columns.forEach((col,ci)=>{
       grid:{left:38,right:8,top:8,bottom:28},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],name:'bank',nameLocation:'middle',nameGap:22,
         nameTextStyle:{color:'#6b7280',fontSize:11},axisLine:{lineStyle:{color:'#2a2d33'}},
-        axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:10,interval:3}},
+        axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:10,interval:3,showMaxLabel:true,showMinLabel:true}},
       yAxis:{type:'category',data:[...Array(WARP).keys()],inverse:true,name:'lane',
         nameLocation:'middle',nameGap:28,nameTextStyle:{color:'#6b7280',fontSize:11},
         axisLine:{lineStyle:{color:'#2a2d33'}},axisTick:{show:false},
-        axisLabel:{color:'#6b7280',fontSize:10,interval:3}},
+        axisLabel:{color:'#6b7280',fontSize:10,interval:3,showMaxLabel:true,showMinLabel:true}},
       series:[{type:'heatmap',data:md,progressive:0,
         itemStyle:{borderRadius:2,borderColor:'#161a21',borderWidth:1},
         emphasis:{itemStyle:{borderColor:'#fff',borderWidth:1.5}},
@@ -268,7 +268,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
       grid:{left:38,right:8,top:6,bottom:22},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],
         axisLine:{lineStyle:{color:'#2a2d33'}},axisTick:{show:false},
-        axisLabel:{color:'#6b7280',fontSize:10,interval:3}},
+        axisLabel:{color:'#6b7280',fontSize:10,interval:3,showMaxLabel:true,showMinLabel:true}},
       yAxis:{type:'value',splitLine:{lineStyle:{color:'#1c212b'}},
         axisLabel:{color:'#6b7280',fontSize:10},axisLine:{show:false},axisTick:{show:false}},
       series:[{type:'bar',data:p.distinct_addrs.map(c=>({value:c,itemStyle:{
@@ -354,28 +354,29 @@ PAYLOAD.columns.forEach((col,ci)=>{
             return head + padTag + `<br/><span style="color:#6b7280">never read by warp ${0} (other warps own this row)</span>`;
           }
           const star = isNow ? `<br/><span style="color:#fff">★ accessed at the rendered k_iter</span>` : '';
-          // Show both the symbolic form and the substituted form (vars
-          // replaced with the concrete values that produce this cell).
           const subst = substMap.get(k) || [];
           const substExpr = subst.length ? subst.join(', ') : lay.index_expr;
           return head +
-            `<br/>load <code style="color:#7dd3fc">${lay.load_name}[${lay.index_expr}]</code>` +
-            `<br/>     = <code style="color:#3ddc84">${lay.load_name}[${substExpr}]</code>` +
+            `<br/>load <code style="color:#3ddc84">${lay.load_name}[${substExpr}]</code>` +
             star +
             `<br/>${formatSweep(sweepPairs)}` +
             padTag;
         },
       },
-      grid:{left:30, right:8, top:6, bottom:18},
+      grid:{left:30, right:14, top:6, bottom:18},
       xAxis:{
         type:'category', data:[...Array(lay.cols).keys()],
         axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
-        axisLabel:{color:'#6b7280', fontSize:9, interval: Math.max(0, Math.floor(lay.cols/8) - 1)},
+        axisLabel:{color:'#6b7280', fontSize:9,
+          interval: Math.max(0, Math.floor(lay.cols/8) - 1),
+          showMaxLabel: true, showMinLabel: true},
       },
       yAxis:{
         type:'category', data:[...Array(lay.rows).keys()], inverse:true,
         axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
-        axisLabel:{color:'#6b7280', fontSize:9, interval: Math.max(0, Math.floor(lay.rows/8) - 1)},
+        axisLabel:{color:'#6b7280', fontSize:9,
+          interval: Math.max(0, Math.floor(lay.rows/8) - 1),
+          showMaxLabel: true, showMinLabel: true},
       },
       series:[{
         type:'heatmap', data: ldrData, progressive: 0,
