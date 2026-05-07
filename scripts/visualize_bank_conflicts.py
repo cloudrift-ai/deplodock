@@ -245,7 +245,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
                                    : `<span style="color:#ff5c7a">${dist}-way conflict</span>`;
           return `lane <b>${l}</b> → bank <b>${b}</b>, addr-color <b>#${ai}</b><br/>${verdict}`;
         }},
-      grid:{left:38,right:8,top:8,bottom:28},
+      grid:{left:38,right:8,top:8,bottom:42},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],name:'bank',nameLocation:'middle',nameGap:22,
         nameTextStyle:{color:'#6b7280',fontSize:11},axisLine:{lineStyle:{color:'#2a2d33'}},
         axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:10,interval:3,showMaxLabel:true,showMinLabel:true}},
