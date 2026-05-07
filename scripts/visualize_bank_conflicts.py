@@ -192,7 +192,7 @@ HTML = """<!doctype html>
   /* Histogram shares the bank axis with the punchcard above —
      match its max-width so banks line up vertically. */
   .hist{width:100%;max-width:320px;height:80px;margin:2px auto 0;}
-  .ladder{width:100%;margin-top:4px;}
+  .ladder{margin:4px auto 0;}
   .ladder-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
     margin-top:10px;margin-bottom:4px;}
   .bank-legend{display:grid;grid-template-columns:repeat(8,1fr);gap:3px 6px;margin-top:8px;
@@ -200,8 +200,8 @@ HTML = """<!doctype html>
   .bank-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}
   .bank-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;}
   .bank-legend-shared{margin-top:14px;font-size:10px;}
-  .hist-legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;
-    font-size:10px;color:var(--muted);}
+  .hist-legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin:6px auto 0;
+    width:100%;max-width:320px;font-size:10px;color:var(--muted);}
   .hist-legend span{display:inline-flex;align-items:center;gap:5px;}
   .hist-legend i{width:9px;height:9px;border-radius:2px;display:inline-block;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
@@ -261,7 +261,17 @@ PAYLOAD.columns.forEach((col,ci)=>{
         <span><i style="background:#ff5c7a"></i>&gt;4 lanes (heavy)</span>
       </div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
-      <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
+      <div class="ladder" id="l_${id}" style="${(()=>{
+        // Square cells: pick one cell-size px, then size container to
+        // (cols*N + axis_w) × (rows*N + axis_h). Caps cell-size if the
+        // total height would otherwise blow past 360px.
+        const axisW = 38, axisH = 24;
+        const maxH = 360;
+        const N = Math.max(3, Math.min(6, Math.floor((maxH - axisH) / p.layout.rows)));
+        const w = p.layout.cols * N + axisW;
+        const h = p.layout.rows * N + axisH;
+        return `width:${w}px; height:${h}px`;
+      })()}"></div>
       ${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
     colEl.appendChild(card);
 
