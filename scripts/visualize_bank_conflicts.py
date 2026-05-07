@@ -263,16 +263,15 @@ PAYLOAD.columns.forEach((col,ci)=>{
       </div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
       <div class="ladder" id="l_${id}" style="${(()=>{
-        // Natural-size square cells: pick the largest cell-size px
-        // that fits both maxW and maxH, then size the container to
-        // (cols*N + axisW) × (rows*N + axisH). Don't stretch — leave
-        // unused horizontal space for the iframe to be narrower.
+        // Cells are 3:1 wide rectangles when there's room; shrink
+        // cell_w toward cell_h (square) when the column gets narrow.
+        // cell_h is sized by row count (so the slab fits ≤ maxH);
+        // cell_w = min(3 × cell_h, fits_width).
         const axisW = 38, axisH = 24, maxH = 360, maxW = 380;
-        const N = Math.max(2, Math.min(6,
-          Math.floor((maxH - axisH) / p.layout.rows),
-          Math.floor((maxW - axisW) / p.layout.cols)));
-        const w = p.layout.cols * N + axisW;
-        const h = p.layout.rows * N + axisH;
+        const cellH = Math.max(2, Math.min(4, Math.floor((maxH - axisH) / p.layout.rows)));
+        const cellW = Math.max(cellH, Math.min(3 * cellH, Math.floor((maxW - axisW) / p.layout.cols)));
+        const w = p.layout.cols * cellW + axisW;
+        const h = p.layout.rows * cellH + axisH;
         return `width:${w}px; height:${h}px`;
       })()}"></div>
       ${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
