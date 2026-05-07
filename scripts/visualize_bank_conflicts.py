@@ -215,11 +215,21 @@ const WARP=32, BANKS=32;
 const palette={empty:'#2a2d33',ok:'#3ddc84',warn:'#ffb454',bad:'#ff5c7a'};
 const cellColor=c=>c===0?palette.empty:c===1?palette.ok:c<=4?palette.warn:palette.bad;
 const verdict=m=>m>4?'v-bad':m>1?'v-warn':'v-ok';
-// Categorical palette for "color = address". Picked for high contrast on
-// dark bg + reasonable distinguishability. Cycles modulo length when a
-// panel has more unique addresses than colors.
-const ADDR_PALETTE=['#7dd3fc','#3ddc84','#ffb454','#ff5c7a','#c084fc','#fcd34d','#67e8f9','#fb923c',
+// Two distinct palettes — keep "color = bank" (smem layout) and
+// "color = address" (punch card) visually independent so the reader
+// doesn't conflate them.
+//
+// BANK_PALETTE: 16-color rainbow used in the smem-layout ladder. Each
+// hue maps to a bank id (mod 16 — banks 0..15 use the first 16 hues,
+// banks 16..31 reuse them).
+const BANK_PALETTE=['#7dd3fc','#3ddc84','#ffb454','#ff5c7a','#c084fc','#fcd34d','#67e8f9','#fb923c',
                     '#a3e635','#f472b6','#60a5fa','#34d399','#fde047','#fb7185','#818cf8','#facc15'];
+// ADDR_PALETTE: warm-only palette (yellows, oranges, reds, browns) used
+// in the lane×bank punch card. A warp typically has 1-4 distinct
+// addresses per Load, so a short palette is fine. Warm-only avoids
+// overlap with the cool/rainbow BANK_PALETTE — the reader can tell at
+// a glance which plot a color belongs to.
+const ADDR_PALETTE=['#fde047','#fb923c','#ef4444','#a3a3a3','#facc15','#fdba74','#dc2626','#78350f'];
 
 const root=document.getElementById('columns');
 PAYLOAD.columns.forEach((col,ci)=>{
@@ -331,7 +341,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
         const k = `${r},${c}`;
         const reachable = sweep.has(k);
         const isFocus = focusCells.has(k);
-        const color = isPad ? '#3a3f48' : ADDR_PALETTE[bank % ADDR_PALETTE.length];
+        const color = isPad ? '#3a3f48' : BANK_PALETTE[bank % BANK_PALETTE.length];
         // Three opacity levels: focused-Load cells (top), other
         // reachable cells (middle), padding/unreachable (bottom).
         // Reading rule: two cells with the high-opacity rows in the
