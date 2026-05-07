@@ -84,6 +84,7 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
                 "c": c,
                 "lanes_now": touched_now.get((r, c), []),
                 "sweep": full_sweep.get((r, c), []),
+                "subst": list(p.full_sweep_subst_idx.get((r, c), ())),
             }
             for (r, c) in all_cells
         ]
@@ -288,6 +289,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
     //   (tooltip shows the full provenance per cell)
     const touchedNow = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes_now]));
     const sweep = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.sweep]));
+    const substMap = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.subst]));
     for (let r = 0; r < lay.rows; r++) {
       for (let c = 0; c < lay.cols; c++) {
         const bank = lay.banks[r][c];
@@ -352,8 +354,13 @@ PAYLOAD.columns.forEach((col,ci)=>{
             return head + padTag + `<br/><span style="color:#6b7280">never read by warp ${0} (other warps own this row)</span>`;
           }
           const star = isNow ? `<br/><span style="color:#fff">★ accessed at the rendered k_iter</span>` : '';
+          // Show both the symbolic form and the substituted form (vars
+          // replaced with the concrete values that produce this cell).
+          const subst = substMap.get(k) || [];
+          const substExpr = subst.length ? subst.join(', ') : lay.index_expr;
           return head +
             `<br/>load <code style="color:#7dd3fc">${lay.load_name}[${lay.index_expr}]</code>` +
+            `<br/>     = <code style="color:#3ddc84">${lay.load_name}[${substExpr}]</code>` +
             star +
             `<br/>${formatSweep(sweepPairs)}` +
             padTag;

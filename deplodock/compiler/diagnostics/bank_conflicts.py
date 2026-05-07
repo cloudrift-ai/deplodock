@@ -102,6 +102,12 @@ class BankConflictResult:
     # by ``annotate_full_sweep`` so visualizers can show every cell's
     # access provenance, not just the one at k_iter=0.
     full_sweep_touched: dict[tuple[int, int], list[tuple[int, int]]] = field(default_factory=dict)
+    # Per-(row, col) → tuple of substituted index strings (one per cache
+    # axis) using one example (k_iter, lane) that reaches the cell.
+    # E.g. ``[(a2 * 8), a6]`` evaluated at lane=0 / k_iter=5 becomes
+    # ``("(0 * 8)", "5")``. Lets visualizers replace symbolic vars with
+    # concrete values in the per-cell tooltip.
+    full_sweep_subst_idx: dict[tuple[int, int], tuple[str, ...]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -327,24 +333,33 @@ def simulate_graph(
     for r in out:
         binding = bindings_by_key.get((r.tile_op_name, r.stage_name, r.load_name))
         if binding is not None:
-            r.full_sweep_touched = _full_sweep_touched(binding, warp_id=warp_id)
+            touched, subst = _full_sweep_touched(binding, warp_id=warp_id)
+            r.full_sweep_touched = touched
+            r.full_sweep_subst_idx = subst
     if load_filter is not None:
         out = [r for r in out if r.load_name in load_filter]
     return out
 
 
-def _full_sweep_touched(binding: StageBinding, warp_id: int = 0) -> dict[tuple[int, int], list[tuple[int, int]]]:
+def _full_sweep_touched(
+    binding: StageBinding, warp_id: int = 0
+) -> tuple[dict[tuple[int, int], list[tuple[int, int]]], dict[tuple[int, int], tuple[str, ...]]]:
     """Sweep the deepest enclosing loop axis; record every (row, col)
-    cell touched by any (lane, k_iter) pair.
+    cell touched by any (lane, k_iter) pair, plus a substituted index
+    string (one per cache axis) using one example (k_iter, lane) that
+    reaches the cell.
 
-    Returns ``{(row, col) -> [(k_iter, lane), ...]}``. Outer enclosing
-    loops and block axes pinned to 0; thread axes decoded per lane.
-    Cell coordinates are reconstructed from the linear smem address
-    using ``alloc_extents`` (folds in pad), matching ``simulate``.
+    Returns ``({(row, col) -> [(k_iter, lane), ...]}, {(row, col) ->
+    ("(0 * 8)", "5")})``. Outer enclosing loops and block axes pinned
+    to 0; thread axes decoded per lane. Cell coordinates are
+    reconstructed from the linear smem address using ``alloc_extents``
+    (folds in pad), matching ``simulate``.
     """
+    from deplodock.compiler.ir.expr import Literal
+
     stage, load, tile = binding.stage, binding.load, binding.tile
     if not stage.axes or len(load.index) < len(stage.axes):
-        return {}
+        return {}, {}
     cache_idx = tuple(load.index[-len(stage.axes) :])
 
     alloc = list(stage.alloc_extents)
@@ -365,6 +380,7 @@ def _full_sweep_touched(binding: StageBinding, warp_id: int = 0) -> dict[tuple[i
         base_env.setdefault(ax.name, 0)
 
     out: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    subst: dict[tuple[int, int], tuple[str, ...]] = {}
     for k in range(loop_extent):
         env_k = dict(base_env)
         if loop_axis_name is not None:
@@ -375,11 +391,15 @@ def _full_sweep_touched(binding: StageBinding, warp_id: int = 0) -> dict[tuple[i
             try:
                 coords = [int(idx.eval(env)) for idx in cache_idx]
             except (KeyError, TypeError):
-                return {}
+                return {}, {}
             addr = sum(c * s for c, s in zip(coords, strides, strict=True))
             r, c = divmod(addr, row_stride) if row_stride else (0, addr)
             out.setdefault((r, c), []).append((k, lane))
-    return out
+            # First (k, lane) wins as the example for substitution.
+            if (r, c) not in subst:
+                lit_env = {name: Literal(v) for name, v in env.items()}
+                subst[(r, c)] = tuple(idx.substitute(lit_env).pretty() for idx in cache_idx)
+    return out, subst
 
 
 # ---------------------------------------------------------------------------
