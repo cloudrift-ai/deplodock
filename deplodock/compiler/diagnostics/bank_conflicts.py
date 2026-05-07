@@ -32,7 +32,7 @@ on a real GPU run when the answer matters.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
@@ -97,6 +97,11 @@ class BankConflictResult:
     vec_group_size: int = 1  # number of Loads that fuse into one LDS.(N×32) (1 = scalar LDS.32)
     avg_way: float = 0.0
     enclosing_axes: tuple[str, ...] = ()
+    # Per-(row, col) → list of (k_iter, lane_id) pairs that read this cell
+    # over the FULL inner-loop sweep (k_iter 0..loop_extent-1). Populated
+    # by ``annotate_full_sweep`` so visualizers can show every cell's
+    # access provenance, not just the one at k_iter=0.
+    full_sweep_touched: dict[tuple[int, int], list[tuple[int, int]]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +321,64 @@ def simulate_graph(
         if r is not None:
             out.append(r)
     annotate_lds128(out)
+    # Compute the per-cell access map for each result by re-evaluating
+    # the same Load's index across the full inner-loop sweep.
+    bindings_by_key = {(b.tile_op_name, b.stage.name, b.load.name): b for b in find_all_bindings(graph, stage_filter)}
+    for r in out:
+        binding = bindings_by_key.get((r.tile_op_name, r.stage_name, r.load_name))
+        if binding is not None:
+            r.full_sweep_touched = _full_sweep_touched(binding, warp_id=warp_id)
     if load_filter is not None:
         out = [r for r in out if r.load_name in load_filter]
+    return out
+
+
+def _full_sweep_touched(binding: StageBinding, warp_id: int = 0) -> dict[tuple[int, int], list[tuple[int, int]]]:
+    """Sweep the deepest enclosing loop axis; record every (row, col)
+    cell touched by any (lane, k_iter) pair.
+
+    Returns ``{(row, col) -> [(k_iter, lane), ...]}``. Outer enclosing
+    loops and block axes pinned to 0; thread axes decoded per lane.
+    Cell coordinates are reconstructed from the linear smem address
+    using ``alloc_extents`` (folds in pad), matching ``simulate``.
+    """
+    stage, load, tile = binding.stage, binding.load, binding.tile
+    if not stage.axes or len(load.index) < len(stage.axes):
+        return {}
+    cache_idx = tuple(load.index[-len(stage.axes) :])
+
+    alloc = list(stage.alloc_extents)
+    strides = [1] * len(alloc)
+    for i in range(len(alloc) - 2, -1, -1):
+        strides[i] = strides[i + 1] * alloc[i + 1]
+    row_stride = strides[0] if strides else 1
+
+    enc = list(binding.enclosing_loop_axes)
+    if not enc:
+        loop_extent = 1
+        loop_axis_name = None
+    else:
+        loop_extent = int(enc[-1].extent)
+        loop_axis_name = enc[-1].name
+    base_env: dict[str, int] = {ax.name: 0 for ax in tile.block_axes}
+    for ax in enc[:-1]:
+        base_env.setdefault(ax.name, 0)
+
+    out: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for k in range(loop_extent):
+        env_k = dict(base_env)
+        if loop_axis_name is not None:
+            env_k[loop_axis_name] = k
+        for lane in range(WARP_SIZE):
+            env = dict(env_k)
+            env.update(thread_axis_env(tile.thread_axes, warp_id * WARP_SIZE + lane))
+            try:
+                coords = [int(idx.eval(env)) for idx in cache_idx]
+            except (KeyError, TypeError):
+                return {}
+            addr = sum(c * s for c, s in zip(coords, strides, strict=True))
+            r, c = divmod(addr, row_stride) if row_stride else (0, addr)
+            out.setdefault((r, c), []).append((k, lane))
     return out
 
 

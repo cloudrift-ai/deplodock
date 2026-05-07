@@ -59,16 +59,34 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
         layout_cols = p.cols + pad_cols
         row_stride = p.cols + pad_cols
         smem_layout = [[(r * row_stride + c) % 32 for c in range(layout_cols)] for r in range(layout_rows)]
-        # Mark cells the warp actually touched in this LDS (row, col) →
-        # list of lanes that read the cell. Drawn with a white outline
-        # overlay on top of the ladder; tooltip shows the lanes (and they
-        # collapse to one entry when broadcast).
-        touched_map: dict[tuple[int, int], list[int]] = {}
+        # Touched at the *current* k_iter (the one ``simulate`` was
+        # called with) — drawn with a white outline overlay.
+        touched_now: dict[tuple[int, int], list[int]] = {}
         for lane, addr in enumerate(p.lane_addrs):
             r, c = divmod(addr, row_stride)
             if 0 <= r < layout_rows and 0 <= c < layout_cols:
-                touched_map.setdefault((r, c), []).append(lane)
-        touched_entries = [{"r": r, "c": c, "lanes": lanes} for (r, c), lanes in sorted(touched_map.items())]
+                touched_now.setdefault((r, c), []).append(lane)
+        # Touched across the *full* inner-loop sweep — ``full_sweep_touched``
+        # was populated by ``simulate_graph`` and maps cells to all
+        # (k_iter, lane) pairs that visit them across the loop. Used to
+        # show every cell's access provenance in the tooltip.
+        full_sweep: dict[tuple[int, int], list[list[int]]] = {}
+        for (r, c), pairs in p.full_sweep_touched.items():
+            if 0 <= r < layout_rows and 0 <= c < layout_cols:
+                full_sweep[(r, c)] = [list(t) for t in pairs]
+        # Build a single entries list keyed by (r, c) carrying both
+        # views (current-iter lanes for outline, full-sweep pairs for
+        # tooltip).
+        all_cells = sorted(set(touched_now) | set(full_sweep))
+        touched_entries = [
+            {
+                "r": r,
+                "c": c,
+                "lanes_now": touched_now.get((r, c), []),
+                "sweep": full_sweep.get((r, c), []),
+            }
+            for (r, c) in all_cells
+        ]
         out.append(
             {
                 "panel_title": f"{p.stage_name} ← {p.buf}",
@@ -267,31 +285,33 @@ PAYLOAD.columns.forEach((col,ci)=>{
     const lEl = document.getElementById(`l_${id}`);
     const ldr = echarts.init(lEl, null, {renderer:'canvas'});
     const ldrData = [];
-    const touchedMap = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes]));
+    // touchedNow: cells the warp accessed AT THE CURRENT k_iter (white outline)
+    // sweep: cells the warp accessed across the full inner-loop sweep
+    //   (tooltip shows the full provenance per cell)
+    const touchedNow = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes_now]));
+    const sweep = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.sweep]));
     for (let r = 0; r < lay.rows; r++) {
       for (let c = 0; c < lay.cols; c++) {
         const bank = lay.banks[r][c];
         const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
-        const isTouched = touchedMap.has(`${r},${c}`);
+        const k = `${r},${c}`;
+        const accessedNow = touchedNow.has(k) && touchedNow.get(k).length > 0;
+        const reachable = sweep.has(k);
         const color = isPad ? '#3a3f48' : ADDR_PALETTE[bank % ADDR_PALETTE.length];
         ldrData.push({
           value:[c, r, bank],
           itemStyle:{
             color: color,
-            // Dim un-accessed cells so the white-outlined accessed
-            // cells visually pop — they are the ones with the rich
-            // tooltip (load expr + lanes).
-            opacity: isPad ? 0.18 : (isTouched ? 1.0 : 0.28),
-            borderColor: isTouched ? '#ffffff' : 'transparent',
-            borderWidth: isTouched ? 2 : 0,
-            shadowBlur: isTouched ? 8 : 0,
-            shadowColor: isTouched ? '#ffffffaa' : 'transparent',
+            // Padding: very dim. Reachable-but-not-now: medium. Now: full.
+            opacity: isPad ? 0.18 : (accessedNow ? 1.0 : (reachable ? 0.55 : 0.18)),
+            borderColor: accessedNow ? '#ffffff' : 'transparent',
+            borderWidth: accessedNow ? 2 : 0,
+            shadowBlur: accessedNow ? 8 : 0,
+            shadowColor: accessedNow ? '#ffffffaa' : 'transparent',
           },
         });
       }
     }
-    // Compact a sorted list of ints into a "0-15, 17, 22-25" form for
-    // the tooltip — readable when 16 lanes broadcast one cell.
     const compactRanges = arr => {
       if (!arr.length) return '';
       const parts = []; let s = arr[0], e = arr[0];
@@ -302,6 +322,25 @@ PAYLOAD.columns.forEach((col,ci)=>{
       parts.push(s === e ? `${s}` : `${s}-${e}`);
       return parts.join(', ');
     };
+    // Group sweep pairs by k_iter, list lane ranges per iter (compact
+    // when many iters — show first 6 + "+N more" if longer).
+    const formatSweep = pairs => {
+      if (!pairs.length) return '';
+      const byIter = new Map();
+      pairs.forEach(([k, l]) => {
+        if (!byIter.has(k)) byIter.set(k, []);
+        byIter.get(k).push(l);
+      });
+      const lines = [...byIter.keys()].sort((a,b)=>a-b).map(k => {
+        const lanes = byIter.get(k).sort((a,b)=>a-b);
+        return `k_iter=<b>${k}</b>: lanes ${compactRanges(lanes)} (${lanes.length}×)`;
+      });
+      const cap = 6;
+      if (lines.length > cap) {
+        return lines.slice(0, cap).join('<br/>') + `<br/><span style="color:#6b7280">… +${lines.length - cap} more iters</span>`;
+      }
+      return lines.join('<br/>');
+    };
     ldr.setOption({
       backgroundColor:'transparent',
       tooltip:{
@@ -309,17 +348,21 @@ PAYLOAD.columns.forEach((col,ci)=>{
         textStyle:{color:'#e8eaed', fontSize:12},
         formatter: pt => {
           const [c, r, bank] = pt.value;
-          const lanes = touchedMap.get(`${r},${c}`);
+          const k = `${r},${c}`;
           const padTag = (c >= lay.data_cols || r >= lay.data_rows)
-            ? '<br/><span style="color:#6b7280">padding</span>' : '';
-          let access = '';
-          if (lanes) {
-            access =
-              `<br/><span style="color:#fff">★ accessed by warp</span>` +
-              `<br/>load <code style="color:#7dd3fc">${lay.load_name}[${lay.index_expr}]</code>` +
-              `<br/>lanes: <b>${compactRanges(lanes)}</b> (${lanes.length}×)`;
+            ? '<br/><span style="color:#6b7280">padding (allocated, never accessed)</span>' : '';
+          const sweepPairs = sweep.get(k) || [];
+          const isNow = (touchedNow.get(k) || []).length > 0;
+          const head = `row=<b>${r}</b>, col=<b>${c}</b>, bank <b>${bank}</b>, addr <b>${r * lay.row_stride + c}</b>`;
+          if (!sweepPairs.length) {
+            return head + padTag + `<br/><span style="color:#6b7280">never read by warp ${0} (other warps own this row)</span>`;
           }
-          return `row=<b>${r}</b>, col=<b>${c}</b><br/>bank <b>${bank}</b>${access}${padTag}`;
+          const star = isNow ? `<br/><span style="color:#fff">★ accessed at the rendered k_iter</span>` : '';
+          return head +
+            `<br/>load <code style="color:#7dd3fc">${lay.load_name}[${lay.index_expr}]</code>` +
+            star +
+            `<br/>${formatSweep(sweepPairs)}` +
+            padTag;
         },
       },
       grid:{left:38, right:8, top:6, bottom:24},
