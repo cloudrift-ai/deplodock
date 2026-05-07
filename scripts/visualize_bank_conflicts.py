@@ -119,8 +119,6 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
                 },
                 "notes": [
                     f"index = ({', '.join(p.index_repr)})",
-                    f"enclosing axes = {', '.join(p.enclosing_axes) or '(none)'}",
-                    (f"LDS.32 events: {p.conflict_events}  ·  LDS.128 events: {p.lds128_events}  (vec={p.vec_group_size})"),
                 ],
             }
         )
@@ -215,7 +213,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
         max-way ${p.max_way} · avg ${p.avg_way.toFixed(1)} lane/bank</span>
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
-      <div class="ladder-title">smem layout — bank per (row,col); hover the highlighted cells for load expr + lanes</div>
+      <div class="ladder-title">smem layout — bank per (row, col)</div>
       <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
       <div class="card-notes">${p.notes.join('<br/>')}</div>`;
     colEl.appendChild(card);
@@ -365,20 +363,12 @@ PAYLOAD.columns.forEach((col,ci)=>{
             padTag;
         },
       },
-      grid:{left:38, right:8, top:6, bottom:24},
+      grid:{left:8, right:8, top:6, bottom:8},
       xAxis:{
-        type:'category', data:[...Array(lay.cols).keys()],
-        name:'col', nameLocation:'middle', nameGap:18,
-        nameTextStyle:{color:'#6b7280', fontSize:10},
-        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
-        axisLabel:{color:'#6b7280', fontSize:9, interval: Math.max(0, Math.floor(lay.cols/8) - 1)},
+        type:'category', data:[...Array(lay.cols).keys()], show: false,
       },
       yAxis:{
-        type:'category', data:[...Array(lay.rows).keys()], inverse:true,
-        name:'row', nameLocation:'middle', nameGap:24,
-        nameTextStyle:{color:'#6b7280', fontSize:10},
-        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
-        axisLabel:{color:'#6b7280', fontSize:9, interval: Math.max(0, Math.floor(lay.rows/8) - 1)},
+        type:'category', data:[...Array(lay.rows).keys()], inverse:true, show: false,
       },
       series:[{
         type:'heatmap', data: ldrData, progressive: 0,
