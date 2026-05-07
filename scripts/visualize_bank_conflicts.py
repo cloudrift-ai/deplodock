@@ -172,7 +172,10 @@ HTML = """<!doctype html>
   html,body{margin:0;background:transparent;color:var(--fg);
     font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;}
   .page{max-width:100%;margin:0;padding:0;}
-  .columns{display:grid;grid-template-columns:repeat(__NCOL__,1fr);gap:8px;}
+  /* Auto-sized columns: each column shrinks to its content width
+     (the punchcard / ladder), so the whole grid is no wider than the
+     plots need. Centered if the page has more horizontal room. */
+  .columns{display:grid;grid-template-columns:repeat(__NCOL__,auto);gap:16px;justify-content:center;}
   .col-head{text-align:center;font-size:11px;text-transform:uppercase;letter-spacing:.16em;
     color:var(--muted);padding:4px 0 6px;margin-bottom:6px;border-bottom:1px solid rgba(255,255,255,.06);}
   .col-head .label{color:#7dd3fc;font-weight:600;}
