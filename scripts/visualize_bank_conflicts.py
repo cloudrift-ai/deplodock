@@ -325,8 +325,8 @@ PAYLOAD.columns.forEach((col,ci)=>{
           value:[c, r, bank],
           itemStyle:{
             color: color,
-            // Reachable cells: full color. Padding / unreachable: dim.
-            opacity: (isPad || !reachable) ? 0.18 : 1.0,
+            // Reachable cells: medium-bright. Padding / unreachable: dim.
+            opacity: (isPad || !reachable) ? 0.18 : 0.7,
           },
         });
       }
