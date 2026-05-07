@@ -196,6 +196,10 @@ HTML = """<!doctype html>
     font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9px;color:var(--muted);}
   .bank-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}
   .bank-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;}
+  .hist-legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;
+    font-size:10px;color:var(--muted);}
+  .hist-legend span{display:inline-flex;align-items:center;gap:5px;}
+  .hist-legend i{width:9px;height:9px;border-radius:2px;display:inline-block;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
     background:rgba(255,255,255,.02);border-radius:10px;border:1px dashed rgba(255,255,255,.06);}
   .legend{display:flex;gap:18px;margin-top:28px;color:var(--muted);font-size:12px;}
@@ -206,12 +210,6 @@ HTML = """<!doctype html>
 <body>
   <div class="page">
     <div class="columns" id="columns"></div>
-    <div class="legend">
-      <span><i style="background:#3ddc84"></i> 1 lane (no conflict)</span>
-      <span><i style="background:#ffb454"></i> 2–4 lanes (mild)</span>
-      <span><i style="background:#ff5c7a"></i> &gt;4 lanes (heavy)</span>
-      <span><i style="background:#2a2d33"></i> 0 lanes</span>
-    </div>
   </div>
 <script>
 const PAYLOAD = __PAYLOAD__;
@@ -253,6 +251,11 @@ PAYLOAD.columns.forEach((col,ci)=>{
       <div class="card-formula">${p.formula}</div>
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
+      <div class="hist-legend">
+        <span><i style="background:#3ddc84"></i>1 lane (no conflict)</span>
+        <span><i style="background:#ffb454"></i>2–4 lanes (mild)</span>
+        <span><i style="background:#ff5c7a"></i>&gt;4 lanes (heavy)</span>
+      </div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
       <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
       <div class="bank-legend" id="bl_${id}"></div>
