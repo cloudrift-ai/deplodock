@@ -59,23 +59,20 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
         layout_cols = p.cols + pad_cols
         row_stride = p.cols + pad_cols
         smem_layout = [[(r * row_stride + c) % 32 for c in range(layout_cols)] for r in range(layout_rows)]
-        # Mark cells the warp actually touched in this LDS (row, col) pairs
-        # — drawn with a white outline overlay on top of the ladder.
-        # Reconstruct (row, col) per lane from the linear address.
-        touched: list[tuple[int, int]] = []
-        for addr in p.lane_addrs:
+        # Mark cells the warp actually touched in this LDS (row, col) →
+        # list of lanes that read the cell. Drawn with a white outline
+        # overlay on top of the ladder; tooltip shows the lanes (and they
+        # collapse to one entry when broadcast).
+        touched_map: dict[tuple[int, int], list[int]] = {}
+        for lane, addr in enumerate(p.lane_addrs):
             r, c = divmod(addr, row_stride)
             if 0 <= r < layout_rows and 0 <= c < layout_cols:
-                touched.append((r, c))
-        # Dedupe touched (lanes broadcast the same cell — show once).
-        touched_uniq = sorted(set(touched))
+                touched_map.setdefault((r, c), []).append(lane)
+        touched_entries = [{"r": r, "c": c, "lanes": lanes} for (r, c), lanes in sorted(touched_map.items())]
         out.append(
             {
                 "panel_title": f"{p.stage_name} ← {p.buf}",
-                "formula": (
-                    f"{p.stage_class}({p.rows}×{p.cols})  "
-                    + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")
-                ),
+                "formula": (f"{p.stage_class}({p.rows}×{p.cols})  " + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")),
                 "lane_banks": p.lane_banks,
                 "lane_addr_idx": lane_addr_idx,
                 "n_unique_addrs": len(unique_addrs),
@@ -98,15 +95,14 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
                     "data_cols": p.cols,
                     "row_stride": row_stride,
                     "banks": smem_layout,
-                    "touched": [list(t) for t in touched_uniq],
+                    "touched": touched_entries,
+                    "index_expr": ", ".join(p.index_repr),
+                    "load_name": p.load_name,
                 },
                 "notes": [
                     f"index = ({', '.join(p.index_repr)})",
                     f"enclosing axes = {', '.join(p.enclosing_axes) or '(none)'}",
-                    (
-                        f"LDS.32 events: {p.conflict_events}  ·  LDS.128 events: {p.lds128_events}"
-                        f"  (vec={p.vec_group_size})"
-                    ),
+                    (f"LDS.32 events: {p.conflict_events}  ·  LDS.128 events: {p.lds128_events}  (vec={p.vec_group_size})"),
                 ],
             }
         )
@@ -271,12 +267,12 @@ PAYLOAD.columns.forEach((col,ci)=>{
     const lEl = document.getElementById(`l_${id}`);
     const ldr = echarts.init(lEl, null, {renderer:'canvas'});
     const ldrData = [];
-    const touchedSet = new Set(lay.touched.map(([r,c]) => `${r},${c}`));
+    const touchedMap = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes]));
     for (let r = 0; r < lay.rows; r++) {
       for (let c = 0; c < lay.cols; c++) {
         const bank = lay.banks[r][c];
         const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
-        const isTouched = touchedSet.has(`${r},${c}`);
+        const isTouched = touchedMap.has(`${r},${c}`);
         const color = isPad ? '#3a3f48' : ADDR_PALETTE[bank % ADDR_PALETTE.length];
         ldrData.push({
           value:[c, r, bank],
@@ -289,6 +285,18 @@ PAYLOAD.columns.forEach((col,ci)=>{
         });
       }
     }
+    // Compact a sorted list of ints into a "0-15, 17, 22-25" form for
+    // the tooltip — readable when 16 lanes broadcast one cell.
+    const compactRanges = arr => {
+      if (!arr.length) return '';
+      const parts = []; let s = arr[0], e = arr[0];
+      for (let i = 1; i < arr.length; i++) {
+        if (arr[i] === e + 1) { e = arr[i]; }
+        else { parts.push(s === e ? `${s}` : `${s}-${e}`); s = arr[i]; e = arr[i]; }
+      }
+      parts.push(s === e ? `${s}` : `${s}-${e}`);
+      return parts.join(', ');
+    };
     ldr.setOption({
       backgroundColor:'transparent',
       tooltip:{
@@ -296,10 +304,17 @@ PAYLOAD.columns.forEach((col,ci)=>{
         textStyle:{color:'#e8eaed', fontSize:12},
         formatter: pt => {
           const [c, r, bank] = pt.value;
-          const t = touchedSet.has(`${r},${c}`) ? '<br/><span style="color:#fff">★ accessed by warp</span>' : '';
+          const lanes = touchedMap.get(`${r},${c}`);
           const padTag = (c >= lay.data_cols || r >= lay.data_rows)
             ? '<br/><span style="color:#6b7280">padding</span>' : '';
-          return `row=<b>${r}</b>, col=<b>${c}</b><br/>bank <b>${bank}</b>${t}${padTag}`;
+          let access = '';
+          if (lanes) {
+            access =
+              `<br/><span style="color:#fff">★ accessed by warp</span>` +
+              `<br/>load <code style="color:#7dd3fc">${lay.load_name}[${lay.index_expr}]</code>` +
+              `<br/>lanes: <b>${compactRanges(lanes)}</b> (${lanes.length}×)`;
+          }
+          return `row=<b>${r}</b>, col=<b>${c}</b><br/>bank <b>${bank}</b>${access}${padTag}`;
         },
       },
       grid:{left:38, right:8, top:6, bottom:24},
