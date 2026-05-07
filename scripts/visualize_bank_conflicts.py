@@ -205,22 +205,22 @@ HTML = """<!doctype html>
   /* Square punchcard: 32 banks × 32 lanes is intrinsically square
      data. Capping width keeps cells visibly square instead of
      squashed into wide rectangles when the container is stretched. */
-  .matrix{width:100%;max-width:400px;aspect-ratio:1/1;height:auto;margin:0 auto 12px;}
+  .matrix{width:100%;max-width:440px;aspect-ratio:1/1;height:auto;margin:0 auto 12px;}
   /* Histogram shares the bank axis with the punchcard above —
      match its max-width so banks line up vertically. */
-  .hist{width:100%;max-width:400px;height:100px;margin:2px auto 0;}
+  .hist{width:100%;max-width:440px;height:110px;margin:2px auto 0;}
   .ladder{margin:6px auto 0;}
   .ladder-title{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
     margin-top:12px;margin-bottom:6px;}
-  .bank-legend{display:grid;grid-template-columns:repeat(8,auto);gap:4px 14px;margin-top:10px;
-    width:fit-content;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:var(--muted);}
-  .bank-legend span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;}
-  .bank-legend i{width:10px;height:10px;border-radius:2px;display:inline-block;flex-shrink:0;}
-  .bank-legend-shared{margin-top:18px;font-size:12px;}
-  .hist-legend{display:flex;flex-wrap:wrap;gap:5px 16px;margin:8px auto 0;
-    width:fit-content;font-size:12px;color:var(--muted);}
-  .hist-legend span{display:inline-flex;align-items:center;gap:6px;}
-  .hist-legend i{width:11px;height:11px;border-radius:2px;display:inline-block;}
+  .bank-legend{display:grid;grid-template-columns:repeat(8,auto);gap:6px 18px;margin-top:10px;
+    width:fit-content;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:14px;color:var(--muted);}
+  .bank-legend span{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;}
+  .bank-legend i{width:13px;height:13px;border-radius:2px;display:inline-block;flex-shrink:0;}
+  .bank-legend-shared{margin-top:18px;font-size:14px;}
+  .hist-legend{display:flex;flex-wrap:wrap;gap:6px 22px;margin:10px auto 0;
+    width:fit-content;font-size:14px;color:var(--muted);}
+  .hist-legend span{display:inline-flex;align-items:center;gap:7px;}
+  .hist-legend i{width:14px;height:14px;border-radius:2px;display:inline-block;}
   .hist-legend-shared{margin-top:14px;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
     background:rgba(255,255,255,.02);border-radius:10px;border:1px dashed rgba(255,255,255,.06);}
@@ -263,16 +263,14 @@ const ADDR_PALETTE=['#fde047','#fb923c','#ef4444','#a3a3a3','#facc15','#fdba74',
 // and per-column plot cells. We render rows of HTML strings into the
 // grid in the right order.
 const root = document.getElementById('page-grid');
-root.style.gridTemplateColumns = `repeat(${PAYLOAD.columns.length}, auto)`;
-
-// Pick the representative stage / buf from the first non-empty panel.
-const firstPanel = PAYLOAD.columns.flatMap(c => c.panels)[0];
-const bufLabel = firstPanel ? firstPanel.buf_short : '';
+// Fixed-width columns so the two punchcards/histograms render at the
+// same size regardless of how long the col-head labels are.
+root.style.gridTemplateColumns = `repeat(${PAYLOAD.columns.length}, 440px)`;
 
 // 1) Shared punchcard title (above the column headings).
 const punTitle = document.createElement('div');
 punTitle.className = 'section-title';
-punTitle.textContent = `bank access punchcard — ${bufLabel}`;
+punTitle.textContent = 'bank access punchcard — access per (lane, bank)';
 root.appendChild(punTitle);
 
 // 2) Column headings.
@@ -390,13 +388,12 @@ PAYLOAD.columns.forEach((col, ci) => {
                                    : `<span style="color:#ff5c7a">${dist}-way conflict</span>`;
           return `lane <b>${l}</b> → bank <b>${b}</b>, addr <b>${addr}</b><br/>${verdict}`;
         }},
-      grid:{left:38,right:8,top:8,bottom:42},
-      xAxis:{type:'category',data:[...Array(BANKS).keys()],name:'bank',nameLocation:'middle',nameGap:22,
-        nameTextStyle:{color:'#6b7280',fontSize:13},axisLine:{lineStyle:{color:THEME.axisLine}},
-        axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
-      yAxis:{type:'category',data:[...Array(WARP).keys()],inverse:true,name:'lane',
-        nameLocation:'middle',nameGap:28,nameTextStyle:{color:'#6b7280',fontSize:13},
-        axisLine:{lineStyle:{color:THEME.axisLine}},axisTick:{show:false},
+      grid:{left:30,right:8,top:8,bottom:22},
+      xAxis:{type:'category',data:[...Array(BANKS).keys()],
+        axisLine:{show:false},axisTick:{show:false},
+        axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
+      yAxis:{type:'category',data:[...Array(WARP).keys()],inverse:true,
+        axisLine:{show:false},axisTick:{show:false},
         axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
       series:[{type:'heatmap',data:md,progressive:0,
         itemStyle:{borderRadius:2},
@@ -410,7 +407,7 @@ PAYLOAD.columns.forEach((col, ci) => {
         formatter:pt=>`bank <b>${pt.name}</b><br/>${pt.value} lane(s)`},
       grid:{left:38,right:8,top:6,bottom:22},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],
-        axisLine:{lineStyle:{color:THEME.axisLine}},axisTick:{show:false},
+        axisLine:{show:false},axisTick:{show:false},
         axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
       yAxis:{type:'value',min:0,max:8,splitLine:{lineStyle:{color:THEME.splitLine}},
         axisLabel:{color:'#6b7280',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
@@ -445,10 +442,12 @@ PAYLOAD.columns.forEach((col, ci) => {
         const isNow = (touchedNow.get(k) || []).length > 0;
         const color = isPad ? THEME.padCell : BANK_PALETTE[bank % BANK_PALETTE.length];
         const op = isNow ? THEME.opFocus : THEME.opFaint;
-        ldrData.push({
-          value:[c, r, bank],
-          itemStyle:{color: color, opacity: op},
-        });
+        const style = {color: color, opacity: op};
+        if (isNow) {
+          style.borderColor = THEME.focusBorder;
+          style.borderWidth = 1.5;
+        }
+        ldrData.push({value:[c, r, bank], itemStyle: style});
       }
     }
     ldr.setOption({
@@ -493,14 +492,14 @@ PAYLOAD.columns.forEach((col, ci) => {
       grid:{left:30, right:14, top:6, bottom:18},
       xAxis:{
         type:'category', data:[...Array(lay.cols).keys()],
-        axisLine:{lineStyle:{color:THEME.axisLine}}, axisTick:{show:false},
+        axisLine:{show:false}, axisTick:{show:false},
         axisLabel:{color:'#6b7280', fontSize:11,
           interval: Math.max(0, Math.floor(lay.cols/8) - 1),
           showMaxLabel: true, showMinLabel: true},
       },
       yAxis:{
         type:'category', data:[...Array(lay.rows).keys()], inverse:true,
-        axisLine:{lineStyle:{color:THEME.axisLine}}, axisTick:{show:false},
+        axisLine:{show:false}, axisTick:{show:false},
         axisLabel:{color:'#6b7280', fontSize:11,
           interval: Math.max(0, Math.floor(lay.rows/8) - 1),
           showMaxLabel: true, showMinLabel: true},
@@ -547,7 +546,8 @@ _THEMES = {
         "splitLine": "#1c212b",
         "padCell": "#3a3f48",
         "opFocus": 1.0,
-        "opFaint": 0.18,
+        "opFaint": 0.45,
+        "focusBorder": "#ffffff",
     },
     "light": {
         "empty": "#b8bec7",
@@ -557,7 +557,8 @@ _THEMES = {
         "splitLine": "#9ca3af",
         "padCell": "#64748b",
         "opFocus": 1.0,
-        "opFaint": 0.18,
+        "opFaint": 0.45,
+        "focusBorder": "#0f172a",
     },
 }
 
