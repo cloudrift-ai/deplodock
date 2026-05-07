@@ -192,6 +192,10 @@ HTML = """<!doctype html>
   .ladder{width:100%;margin-top:8px;}
   .ladder-title{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);
     margin-top:14px;margin-bottom:6px;}
+  .bank-legend{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:8px;
+    font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;color:var(--muted);}
+  .bank-legend span{display:inline-flex;align-items:center;gap:4px;}
+  .bank-legend i{width:9px;height:9px;border-radius:2px;display:inline-block;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
     background:rgba(255,255,255,.02);border-radius:10px;border:1px dashed rgba(255,255,255,.06);}
   .legend{display:flex;gap:18px;margin-top:28px;color:var(--muted);font-size:12px;}
@@ -251,6 +255,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
       <div class="hist" id="h_${id}"></div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
       <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
+      <div class="bank-legend" id="bl_${id}"></div>
       ${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
     colEl.appendChild(card);
 
@@ -412,6 +417,20 @@ PAYLOAD.columns.forEach((col,ci)=>{
         itemStyle:{borderRadius:1},
         animationDuration:400, animationEasing:'cubicOut',
       }],
+    });
+    // Bank-color legend below the ladder. Only shows banks that
+    // actually appear in the smem layout (typically 0..31, but the
+    // legend trims to the unique banks present). Compact horizontal
+    // chips with the BANK_PALETTE color + "bank N" label.
+    const banksUsed = new Set();
+    for (let r = 0; r < lay.rows; r++) {
+      for (let c = 0; c < lay.cols; c++) banksUsed.add(lay.banks[r][c]);
+    }
+    const legend = document.getElementById(`bl_${id}`);
+    [...banksUsed].sort((a,b)=>a-b).forEach(bank => {
+      const chip = document.createElement('span');
+      chip.innerHTML = `<i style="background:${BANK_PALETTE[bank % BANK_PALETTE.length]}"></i>bank ${bank}`;
+      legend.appendChild(chip);
     });
     window.addEventListener('resize',()=>{m.resize();h.resize();ldr.resize();});
   });
