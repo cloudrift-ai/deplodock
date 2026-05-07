@@ -313,27 +313,34 @@ PAYLOAD.columns.forEach((col,ci)=>{
     const touchedNow = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes_now]));
     const sweep = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.sweep]));
     const substByLoad = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.subst_by_load]));
-    const conflictCells = new Set(lay.touched.filter(t => t.conflict).map(t => `${t.r},${t.c}`));
+    // Cells touched by the focused Load (the one this card represents)
+    // across the whole K sweep. Highlighted with a white outline so
+    // the reader can spot when two highlighted cells in the same bank
+    // column share a color = conflict for that LDS.
+    const focusLoad = lay.load_name;
+    const focusCells = new Set(
+      lay.touched.filter(t => t.subst_by_load && t.subst_by_load[focusLoad]).map(t => `${t.r},${t.c}`)
+    );
     for (let r = 0; r < lay.rows; r++) {
       for (let c = 0; c < lay.cols; c++) {
         const bank = lay.banks[r][c];
         const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
         const k = `${r},${c}`;
         const reachable = sweep.has(k);
-        const isConflict = conflictCells.has(k);
+        const isFocus = focusCells.has(k);
         const color = isPad ? '#3a3f48' : ADDR_PALETTE[bank % ADDR_PALETTE.length];
         ldrData.push({
           value:[c, r, bank],
           itemStyle:{
             color: color,
-            // Reachable cells: medium-bright. Padding / unreachable: dim.
             opacity: (isPad || !reachable) ? 0.18 : 0.7,
-            // Real-conflict cells (touched by an LDS where their bank
-            // had > 1 distinct addr) get a red outline. Layout-only
-            // potential (single-color column the warp never multi-
-            // exercises) stays unmarked.
-            borderColor: isConflict ? '#ff5c7a' : 'transparent',
-            borderWidth: isConflict ? 2 : 0,
+            // White outline = "this Load (the focused one) touches the
+            // cell at some k_iter". Reading rule: when two outlined
+            // cells in the same column have the same color, the
+            // focused Load's LDS at that column produces a real
+            // conflict on that bank.
+            borderColor: isFocus ? '#ffffff' : 'transparent',
+            borderWidth: isFocus ? 1.5 : 0,
           },
         });
       }
@@ -360,10 +367,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
             ([ln, subst]) => `<code style="color:#3ddc84">${ln}[${subst.join(', ')}]</code>`
           );
           const loadSection = substLines.length ? `<br/>${substLines.join('<br/>')}` : '';
-          const conflictTag = conflictCells.has(k)
-            ? `<br/><span style="color:#ff5c7a">⚠ real conflict — this LDS has &gt; 1 distinct addr on bank ${bank}</span>`
-            : '';
-          return head + loadSection + conflictTag + padTag;
+          return head + loadSection + padTag;
         },
       },
       grid:{left:30, right:14, top:6, bottom:18},
