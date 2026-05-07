@@ -329,19 +329,14 @@ PAYLOAD.columns.forEach((col,ci)=>{
         const reachable = sweep.has(k);
         const isFocus = focusCells.has(k);
         const color = isPad ? '#3a3f48' : ADDR_PALETTE[bank % ADDR_PALETTE.length];
+        // Three opacity levels: focused-Load cells (top), other
+        // reachable cells (middle), padding/unreachable (bottom).
+        // Reading rule: two cells with the high-opacity rows in the
+        // same column sharing a color → conflict for that LDS.
+        const op = isPad ? 0.18 : (isFocus ? 0.95 : (reachable ? 0.32 : 0.18));
         ldrData.push({
           value:[c, r, bank],
-          itemStyle:{
-            color: color,
-            opacity: (isPad || !reachable) ? 0.18 : 0.7,
-            // White outline = "this Load (the focused one) touches the
-            // cell at some k_iter". Reading rule: when two outlined
-            // cells in the same column have the same color, the
-            // focused Load's LDS at that column produces a real
-            // conflict on that bank.
-            borderColor: isFocus ? '#ffffff' : 'transparent',
-            borderWidth: isFocus ? 1.5 : 0,
-          },
+          itemStyle:{color: color, opacity: op},
         });
       }
     }
