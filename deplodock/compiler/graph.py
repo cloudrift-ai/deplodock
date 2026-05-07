@@ -213,6 +213,12 @@ def _deserialize_field(k, v):
 
 def _eval_stmt(s: str):
     scope = _stmt_eval_scope()
+    # ``repr(enum_value)`` produces ``<SwizzleMode.NONE: 'NONE'>`` which
+    # isn't eval-able. Rewrite to the dotted form before eval.
+    if "<" in s and ":" in s:
+        import re as _re
+
+        s = _re.sub(r"<([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*): [^>]+>", r"\1.\2", s)
     return eval(s, scope)
 
 
@@ -261,7 +267,9 @@ def _stmt_eval_scope() -> dict:
         BufferedStage,
         Combine,
         Stage,
+        SwizzleMode,
         TemplateAddressing,
+        TmaBufferedStage,
     )
 
     _STMT_EVAL_SCOPE = {
@@ -290,6 +298,8 @@ def _stmt_eval_scope() -> dict:
         "Stage": Stage,
         "BufferedStage": BufferedStage,
         "AsyncBufferedStage": AsyncBufferedStage,
+        "TmaBufferedStage": TmaBufferedStage,
+        "SwizzleMode": SwizzleMode,
         "AffineAddressing": AffineAddressing,
         "TemplateAddressing": TemplateAddressing,
         "Combine": Combine,

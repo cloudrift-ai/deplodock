@@ -1,192 +1,641 @@
-"""Visualize smem bank conflicts under different swizzle strategies.
+"""Bank-conflict visualizer driven by real Tile-IR ``Stage``s.
 
-Simulates a warp's 32 lanes accessing a 2D smem stage at one inner-loop
-iteration, applies a chosen swizzle formula to the column index, and
-plots three panels comparing:
+Takes one or more IR JSON paths and renders one column per input. Each
+column contains a card per ``(Stage, body-Load)`` pair showing the warp's
+per-lane smem bank at one inner-loop iteration. Simulation lives in
+``deplodock.compiler.diagnostics.bank_conflicts``; this script is a thin
+CLI + ECharts emitter.
 
-(a) No swizzle (TMA default).
-(b) Hardware swizzle (TMA_SWIZZLE=1 with the hardware-fixed XOR).
-(c) Per-lane K-rotation (proposed software fix).
+Workflow — produce IRs via the compiler with whatever pass gates you
+want, then feed the dumped JSONs in::
 
-Each panel shows:
+    DEPLODOCK_DUMP_DIR=/tmp/dump_a deplodock compile MODEL --layer 0
+    DEPLODOCK_DISABLE_CHUNK_REDUCE=1 \\
+        DEPLODOCK_DUMP_DIR=/tmp/dump_b deplodock compile MODEL --layer 0
+    python scripts/visualize_bank_conflicts.py \\
+        -i /tmp/dump_a/14_lowering_tile.json:baseline \\
+        -i /tmp/dump_b/14_lowering_tile.json:no_chunk_reduce \\
+        --out /tmp/diff.html
 
-- A *lane → bank* matrix (32×32). Cell (l, b) is filled if lane ``l``
-  lands in bank ``b``. Multiple lanes in one column = conflict.
-- A bank histogram (lanes-per-bank).
-
-Defaults match the matmul_add tile shape we've been profiling:
-``(rows=128, cols=16)``, lanes index rows at stride 4 (``F_M=4``).
+Any post-tile-pass dump works; pick the one whose Stages you want to
+inspect (typically the final tile-stage dump).
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
-from dataclasses import dataclass
+import json
+import os
 
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
-import numpy as np
-
-WARP_SIZE = 32
-BANKS = 32
+from deplodock.compiler.diagnostics.bank_conflicts import BankConflictResult, simulate_graph
+from deplodock.compiler.graph import Graph
 
 
-@dataclass
-class AccessPattern:
-    """``(lane, k_iter) → (row, col)`` mapping for a 2D smem stage."""
-
-    rows: int
-    cols: int
-    row_fn: Callable[[int, int], int]
-    col_fn: Callable[[int, int], int]
+def graph_from_ir_path(path: str) -> Graph:
+    with open(path) as f:
+        return Graph.from_dict(json.load(f))
 
 
-def warp_banks(pat: AccessPattern, k_iter: int, swizzle: Callable[[int, int, int], int]) -> list[int]:
-    """Per-lane bank id for the warp at iteration ``k_iter``."""
-    banks = []
-    for lane in range(WARP_SIZE):
-        row = pat.row_fn(lane, k_iter)
-        col = pat.col_fn(lane, k_iter)
-        col_phys = swizzle(lane, row, col)
-        addr = row * pat.cols + col_phys
-        banks.append(addr % BANKS)
-    return banks
+def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[BankConflictResult] | None = None) -> list[dict]:
+    """Serialize ``panels`` to JSON-friendly dicts.
+
+    ``all_panels_for_union`` is the un-load-filtered list used to compute
+    the per-Stage union ladder. When ``--load`` filters the visible
+    cards, the ladder still shows the full Stage's footprint (i.e. cells
+    touched by every body Load of the Stage, not just the focused one).
+    Falls back to ``panels`` if not provided.
+    """
+    union_source = all_panels_for_union if all_panels_for_union is not None else panels
+    stage_union: dict[tuple[str, str], dict[tuple[int, int], list[tuple]]] = {}
+    stage_conflict_loads: dict[tuple[str, str], dict[tuple[int, int], set[str]]] = {}
+    for p in union_source:
+        key = (p.tile_op_name, p.stage_name)
+        u = stage_union.setdefault(key, {})
+        for cell, pairs in p.full_sweep_touched.items():
+            subst = p.full_sweep_subst_idx.get(cell, ())
+            for k, lane in pairs:
+                u.setdefault(cell, []).append((p.load_name, k, lane, subst))
+        cmap = stage_conflict_loads.setdefault(key, {})
+        for cell in p.full_sweep_conflict_cells:
+            cmap.setdefault(cell, set()).add(p.load_name)
+    out: list[dict] = []
+    for p in panels:
+        # Per-lane address-color index: same address → same color, regardless
+        # of bank. Cells of the SAME color stacked in one bank column are
+        # the actual conflict (different lanes serialized to one bank with
+        # different addresses); cells of DIFFERENT colors stacked = fine
+        # (each lane hit a different address, no within-warp serialization).
+        # Wait — corrected: same color = same addr = broadcast = fine.
+        # Different colors stacked in one column = different addrs → conflict.
+        unique_addrs = sorted(set(p.lane_addrs))
+        addr_to_idx = {a: i for i, a in enumerate(unique_addrs)}
+        lane_addr_idx = [addr_to_idx[a] for a in p.lane_addrs]
+        # Smem layout ladder: cell(r, c) → bank id under the padded row
+        # stride. Including the pad columns so the +1-shift is visible.
+        # Cap rows to keep the diagram readable (most ladders are clear in
+        # the first 16-32 rows).
+        pad_cols = p.pad[1] if len(p.pad) > 1 else 0
+        pad_rows = p.pad[0] if len(p.pad) > 0 else 0
+        layout_rows = min(p.rows + pad_rows, 64)
+        layout_cols = p.cols + pad_cols
+        row_stride = p.cols + pad_cols
+        smem_layout = [[(r * row_stride + c) % 32 for c in range(layout_cols)] for r in range(layout_rows)]
+        # Touched at the *current* k_iter (the one ``simulate`` was
+        # called with) — drawn with a white outline overlay.
+        touched_now: dict[tuple[int, int], list[int]] = {}
+        for lane, addr in enumerate(p.lane_addrs):
+            r, c = divmod(addr, row_stride)
+            if 0 <= r < layout_rows and 0 <= c < layout_cols:
+                touched_now.setdefault((r, c), []).append(lane)
+        # Per-Stage UNION across every body Load of the Stage.
+        union = stage_union.get((p.tile_op_name, p.stage_name), {})
+        sweep_per_cell: dict[tuple[int, int], list[list]] = {}
+        subst_per_cell: dict[tuple[int, int], dict[str, tuple]] = {}
+        for (r, c), entries in union.items():
+            if not (0 <= r < layout_rows and 0 <= c < layout_cols):
+                continue
+            sweep_per_cell[(r, c)] = [[ln, k, lane] for (ln, k, lane, _s) in entries]
+            for ln, _k, _l, s in entries:
+                subst_per_cell.setdefault((r, c), {}).setdefault(ln, tuple(s))
+        all_cells = sorted(set(touched_now) | set(sweep_per_cell))
+        conflict_loads = stage_conflict_loads.get((p.tile_op_name, p.stage_name), {})
+        touched_entries = [
+            {
+                "r": r,
+                "c": c,
+                "lanes_now": touched_now.get((r, c), []),
+                # sweep: list of [load_name, k_iter, lane]
+                "sweep": sweep_per_cell.get((r, c), []),
+                # subst_by_load: {load_name: [substituted_index_string, ...]}
+                "subst_by_load": {ln: list(s) for ln, s in subst_per_cell.get((r, c), {}).items()},
+                # Loads whose LDS conflicts when touching this cell.
+                "conflict_loads": sorted(conflict_loads.get((r, c), set())),
+            }
+            for (r, c) in all_cells
+        ]
+        out.append(
+            {
+                "panel_title": f"{p.stage_name} ← {p.buf}",
+                "buf_short": p.buf,
+                "formula": (f"{p.stage_class}({p.rows}×{p.cols})  " + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")),
+                "lane_banks": p.lane_banks,
+                "lane_addrs": list(p.lane_addrs),
+                "lane_addr_idx": lane_addr_idx,
+                "n_unique_addrs": len(unique_addrs),
+                "counts": p.counts,
+                "distinct_addrs": p.distinct_addrs,
+                "max_way": p.max_way,
+                "raw_max_way": p.raw_max_way,
+                "conflict_events": p.conflict_events,
+                "lds128_events": p.lds128_events,
+                "vec_group_size": p.vec_group_size,
+                "avg_way": p.avg_way,
+                "rows": p.rows,
+                "cols": p.cols,
+                "pad": list(p.pad),
+                "smem_bytes": p.smem_bytes,
+                "layout": {
+                    "rows": layout_rows,
+                    "cols": layout_cols,
+                    "data_rows": p.rows,
+                    "data_cols": p.cols,
+                    "row_stride": row_stride,
+                    "banks": smem_layout,
+                    "touched": touched_entries,
+                    "index_expr": ", ".join(p.index_repr),
+                    "load_name": p.load_name,
+                },
+                "notes": [],
+            }
+        )
+    return out
 
 
-def plot_panel(ax_matrix, ax_hist, banks: list[int], title: str, formula: str) -> None:
-    """Two stacked subplots: lane→bank matrix, bank histogram."""
-    matrix = np.zeros((WARP_SIZE, BANKS), dtype=int)
-    for lane, bank in enumerate(banks):
-        matrix[lane, bank] = 1
-    ax_matrix.imshow(matrix, cmap="Greens", aspect="equal", vmin=0, vmax=1)
-    ax_matrix.set_xticks(range(0, BANKS, 4))
-    ax_matrix.set_yticks(range(0, WARP_SIZE, 4))
-    ax_matrix.set_xlabel("bank id")
-    ax_matrix.set_ylabel("lane id")
-    ax_matrix.grid(which="major", color="#cccccc", linewidth=0.3, alpha=0.5)
-    ax_matrix.set_axisbelow(True)
-    ax_matrix.set_title(f"{title}\n{formula}", fontsize=10)
+HTML = """<!doctype html>
+<html lang="en" data-theme="__THEME__">
+<head>
+<meta charset="utf-8" />
+<title>smem bank conflicts (IR-driven)</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  :root[data-theme="dark"] {
+    --bg:transparent; --fg:#e8eaed; --muted:#6b7280;
+    --rule:rgba(255,255,255,.06); --label-accent:#7dd3fc;
+  }
+  :root[data-theme="light"] {
+    --bg:transparent; --fg:#1f2937; --muted:#4b5563;
+    --rule:rgba(0,0,0,.08); --label-accent:#0369a1;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;background:transparent;color:var(--fg);
+    font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;}
+  /* Center the column grid + shared legend horizontally; shrink to
+     content width so unused horizontal space sits outside the page. */
+  .page{display:flex;flex-direction:column;align-items:center;margin:0;padding:0;}
+  /* Single page-grid: N auto-sized columns (one per IR variant);
+     shared titles + legends span all columns. justify-content:center
+     so the whole block stays centered when the iframe is wider. */
+  .page-grid{display:grid;gap:8px 20px;justify-content:center;align-items:start;}
+  .page-grid > .col-head,
+  .page-grid > .matrix,
+  .page-grid > .hist,
+  .page-grid > .ladder{justify-self:center;}
+  .page-grid > .section-title{grid-column:1 / -1;}
+  .page-grid > .ladder,
+  .page-grid > .ladder-sub{grid-column:1 / -1;justify-self:center;}
+  .page-grid > .hist-legend-shared,
+  .page-grid > .bank-legend-shared{grid-column:1 / -1;justify-self:center;}
+  .ladder-sub{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+    margin:14px 0 4px;text-align:center;}
+  .ladder-sub .label{color:var(--label-accent);font-weight:600;}
+  .section-title{font-size:16px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--fg);margin:22px 0 8px;text-align:left;}
+  .col-head{text-align:center;font-size:14px;text-transform:uppercase;letter-spacing:.16em;
+    color:var(--muted);padding:6px 0 8px;border-bottom:1px solid var(--rule);min-width:200px;}
+  .col-head .label{color:var(--label-accent);font-weight:600;}
+  .card-title{font-size:14px;font-weight:600;letter-spacing:-.01em;}
+  .card-formula{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;color:var(--muted);margin-top:4px;}
+  .card-notes{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:var(--muted);margin-top:6px;line-height:1.55;}
+  .card-verdict{display:inline-flex;align-items:center;gap:6px;margin-top:10px;padding:4px 10px;
+    border-radius:999px;font-size:12px;font-weight:600;background:rgba(255,255,255,.04);}
+  .dot{width:6px;height:6px;border-radius:50%;}
+  .v-ok{color:#3ddc84;} .v-ok .dot{background:#3ddc84;}
+  .v-warn{color:#ffb454;} .v-warn .dot{background:#ffb454;}
+  .v-bad{color:#ff5c7a;} .v-bad .dot{background:#ff5c7a;}
+  /* Square punchcard: 32 banks × 32 lanes is intrinsically square
+     data. Capping width keeps cells visibly square instead of
+     squashed into wide rectangles when the container is stretched. */
+  .matrix{width:100%;max-width:440px;aspect-ratio:1/1;height:auto;margin:0 auto 12px;}
+  /* Histogram shares the bank axis with the punchcard above —
+     match its max-width so banks line up vertically. */
+  .hist{width:100%;max-width:440px;height:110px;margin:2px auto 0;}
+  .ladder{margin:6px auto 0;}
+  .ladder-title{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+    margin-top:12px;margin-bottom:6px;}
+  .bank-legend{display:grid;grid-template-columns:repeat(8,auto);gap:6px 18px;margin-top:10px;
+    width:fit-content;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:14px;color:var(--muted);}
+  .bank-legend span{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;}
+  .bank-legend i{width:13px;height:13px;border-radius:2px;display:inline-block;flex-shrink:0;}
+  .bank-legend-shared{margin-top:18px;font-size:14px;}
+  .hist-legend{display:flex;flex-wrap:wrap;gap:6px 22px;margin:10px auto 0;
+    width:fit-content;font-size:14px;color:var(--muted);}
+  .hist-legend span{display:inline-flex;align-items:center;gap:7px;}
+  .hist-legend i{width:14px;height:14px;border-radius:2px;display:inline-block;}
+  .hist-legend-shared{margin-top:14px;}
+  .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
+    background:rgba(255,255,255,.02);border-radius:10px;border:1px dashed rgba(255,255,255,.06);}
+  .legend{display:flex;gap:18px;margin-top:28px;color:var(--muted);font-size:12px;}
+  .legend span{display:inline-flex;align-items:center;gap:8px;}
+  .legend i{width:10px;height:10px;border-radius:3px;display:inline-block;}
+</style>
+</head>
+<body>
+  <div class="page">
+    <div class="page-grid" id="page-grid"></div>
+  </div>
+<script>
+const PAYLOAD = __PAYLOAD__;
+const THEME = __THEME_JS__;
+const WARP=32, BANKS=32;
+const palette={empty:THEME.empty,ok:'#3ddc84',warn:'#ffb454',bad:'#ff5c7a'};
+const cellColor=c=>c===0?palette.empty:c===1?palette.ok:c<=4?palette.warn:palette.bad;
+const verdict=m=>m>4?'v-bad':m>1?'v-warn':'v-ok';
+// Two distinct palettes — keep "color = bank" (smem layout) and
+// "color = address" (punch card) visually independent so the reader
+// doesn't conflate them.
+//
+// BANK_PALETTE: 32 distinct hues (one per smem bank). Same color =
+// same bank, so two highlighted cells sharing a color in the layout
+// land on the same bank — direct visual cue for a bank conflict.
+const BANK_PALETTE=['#7dd3fc','#3ddc84','#ffb454','#ff5c7a','#c084fc','#fcd34d','#67e8f9','#fb923c',
+                    '#a3e635','#f472b6','#60a5fa','#34d399','#fde047','#fb7185','#818cf8','#facc15',
+                    '#0ea5e9','#16a34a','#d97706','#dc2626','#9333ea','#ca8a04','#0891b2','#ea580c',
+                    '#65a30d','#db2777','#1d4ed8','#059669','#a16207','#be123c','#4338ca','#b45309'];
+// ADDR_PALETTE: warm-only palette (yellows, oranges, reds, browns) used
+// in the lane×bank punch card. A warp typically has 1-4 distinct
+// addresses per Load, so a short palette is fine. Warm-only avoids
+// overlap with the cool/rainbow BANK_PALETTE — the reader can tell at
+// a glance which plot a color belongs to.
+const ADDR_PALETTE=['#fde047','#fb923c','#ef4444','#a3a3a3','#facc15','#fdba74','#dc2626','#78350f'];
 
-    bank_counts = [0] * BANKS
-    for bank in banks:
-        bank_counts[bank] += 1
-    max_way = max(bank_counts)
-    avg_way = sum(c for c in bank_counts if c > 0) / sum(1 for c in bank_counts if c > 0)
-    colors = ["#d62728" if c > 1 else "#2ca02c" if c == 1 else "#dddddd" for c in bank_counts]
-    ax_hist.bar(range(BANKS), bank_counts, color=colors)
-    ax_hist.set_xlim(-0.5, BANKS - 0.5)
-    ax_hist.set_ylim(0, max(max_way, 4) + 0.5)
-    ax_hist.axhline(1, color="gray", linestyle="--", linewidth=0.7, alpha=0.5)
-    verdict_color = "#d62728" if max_way > 4 else "#ff7f0e" if max_way > 1 else "#2ca02c"
-    ax_hist.set_title(
-        f"max-way conflict: {max_way}   (avg {avg_way:.1f} lane/bank)",
-        fontsize=10,
-        color=verdict_color,
-        weight="bold",
+// Layout: one page-grid with N columns (one per IR variant). Rows
+// alternate between shared titles (spanning all columns, left-justified)
+// and per-column plot cells. We render rows of HTML strings into the
+// grid in the right order.
+const root = document.getElementById('page-grid');
+// Fixed-width columns so the two punchcards/histograms render at the
+// same size regardless of how long the col-head labels are.
+root.style.gridTemplateColumns = `repeat(${PAYLOAD.columns.length}, 440px)`;
+
+// 1) Shared punchcard title (above the column headings).
+const punTitle = document.createElement('div');
+punTitle.className = 'section-title';
+punTitle.textContent = 'bank access punchcard — access per (lane, bank)';
+root.appendChild(punTitle);
+
+// 2) Column headings.
+PAYLOAD.columns.forEach(col => {
+  const head = document.createElement('div');
+  head.className = 'col-head';
+  head.innerHTML = `<span class="label">${col.label}</span>`;
+  root.appendChild(head);
+});
+
+// 3) Punchcards row.
+PAYLOAD.columns.forEach((col, ci) => {
+  if (!col.panels.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'no Stages found';
+    root.appendChild(empty);
+  } else {
+    const matrix = document.createElement('div');
+    matrix.className = 'matrix';
+    matrix.id = `m_c${ci}_p0`;
+    root.appendChild(matrix);
+  }
+});
+
+// 4) Histograms row.
+PAYLOAD.columns.forEach((col, ci) => {
+  if (!col.panels.length) {
+    root.appendChild(document.createElement('div'));
+    return;
+  }
+  const hist = document.createElement('div');
+  hist.className = 'hist';
+  hist.id = `h_c${ci}_p0`;
+  root.appendChild(hist);
+});
+
+// 5) Shared severity legend (spans all columns, centered).
+const sevLegend = document.createElement('div');
+sevLegend.className = 'hist-legend hist-legend-shared';
+sevLegend.innerHTML = `
+  <span><i style="background:#3ddc84"></i>1 lane (no conflict)</span>
+  <span><i style="background:#ffb454"></i>2–4 lanes (mild)</span>
+  <span><i style="background:#ff5c7a"></i>&gt;4 lanes (heavy)</span>
+`;
+root.appendChild(sevLegend);
+
+// 6) Shared ladder title.
+const ladTitle = document.createElement('div');
+ladTitle.className = 'section-title';
+ladTitle.textContent = 'smem layout — bank per (row, col)';
+root.appendChild(ladTitle);
+
+// 7) Ladders — stacked vertically, each spanning all columns. Each
+// ladder gets its own sub-heading (the variant label) so the reader
+// can tell them apart without the side-by-side layout.
+PAYLOAD.columns.forEach((col, ci) => {
+  if (!col.panels.length) return;
+  const p = col.panels[0];
+  const sub = document.createElement('div');
+  sub.className = 'ladder-sub';
+  sub.innerHTML = `<span class="label">${col.label}</span>`;
+  root.appendChild(sub);
+  const ladder = document.createElement('div');
+  ladder.className = 'ladder';
+  ladder.id = `l_c${ci}_p0`;
+  // Stacked layout doubles the available real estate per ladder.
+  const lay = p.layout;
+  const axisW = 56, axisH = 32, maxH = 900, maxW = 960;
+  const cellH = Math.max(6, Math.min(10, Math.floor((maxH - axisH) / lay.rows)));
+  const cellW = Math.max(cellH, Math.min(3 * cellH, Math.floor((maxW - axisW) / lay.cols)));
+  ladder.style.width = `${lay.cols * cellW + axisW}px`;
+  ladder.style.height = `${lay.rows * cellH + axisH}px`;
+  root.appendChild(ladder);
+});
+
+// 8) Shared bank legend.
+const bankLegendEl = document.createElement('div');
+bankLegendEl.className = 'bank-legend bank-legend-shared';
+bankLegendEl.id = 'shared-bank-legend';
+root.appendChild(bankLegendEl);
+
+// Now render plots for each column's first panel.
+PAYLOAD.columns.forEach((col, ci) => {
+  if (!col.panels.length) return;
+  col.panels.forEach((p, pi) => {
+    if (pi > 0) return;  // one panel per column expected
+    const id = `c${ci}_p${pi}`;
+
+    const m=echarts.init(document.getElementById(`m_${id}`),null,{renderer:'canvas'});
+    const md=[];
+    for(let l=0;l<WARP;l++) for(let b=0;b<BANKS;b++)
+      md.push({value:[b,l,0],itemStyle:{color:palette.empty}});
+    p.lane_banks.forEach((bank,lane)=>{
+      // Color cells by ADDRESS index. Same color = same address (broadcast).
+      // Different colors stacked in one bank column = different addresses
+      // serialized = real bank conflict.
+      const addrIdx = p.lane_addr_idx[lane];
+      const color = ADDR_PALETTE[addrIdx % ADDR_PALETTE.length];
+      md.push({
+        value:[bank,lane,1],
+        itemStyle:{color: color, shadowBlur:6, shadowColor:color+'66'},
+        addrIdx: addrIdx,
+      });
+    });
+    m.setOption({
+      backgroundColor:'transparent',
+      tooltip:{backgroundColor:THEME.tooltipBg,borderColor:THEME.axisLine,textStyle:{color:THEME.tooltipText,fontSize:12},
+        formatter:pt=>{const [b,l,c]=pt.value;
+          if (c === 0) return `bank ${b}<br/><span style="color:#6b7280">no lane</span>`;
+          const addr = p.lane_addrs[l];
+          const dist = p.distinct_addrs[b];
+          const verdict = dist === 1 ? '<span style="color:#3ddc84">broadcast — 0 events</span>'
+                       : dist <= 4 ? `<span style="color:#ffb454">${dist}-way conflict</span>`
+                                   : `<span style="color:#ff5c7a">${dist}-way conflict</span>`;
+          return `lane <b>${l}</b> → bank <b>${b}</b>, addr <b>${addr}</b><br/>${verdict}`;
+        }},
+      grid:{left:30,right:8,top:8,bottom:22},
+      xAxis:{type:'category',data:[...Array(BANKS).keys()],
+        axisLine:{show:false},axisTick:{show:false},
+        axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
+      yAxis:{type:'category',data:[...Array(WARP).keys()],inverse:true,
+        axisLine:{show:false},axisTick:{show:false},
+        axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
+      series:[{type:'heatmap',data:md,progressive:0,
+        itemStyle:{borderRadius:2},
+        emphasis:{itemStyle:{borderColor:'#fff',borderWidth:1.5}},
+        animationDuration:500,animationEasing:'cubicOut'}]});
+
+    const h=echarts.init(document.getElementById(`h_${id}`),null,{renderer:'canvas'});
+    h.setOption({
+      backgroundColor:'transparent',
+      tooltip:{backgroundColor:THEME.tooltipBg,borderColor:THEME.axisLine,textStyle:{color:THEME.tooltipText,fontSize:12},
+        formatter:pt=>`bank <b>${pt.name}</b><br/>${pt.value} lane(s)`},
+      grid:{left:38,right:8,top:6,bottom:22},
+      xAxis:{type:'category',data:[...Array(BANKS).keys()],
+        axisLine:{show:false},axisTick:{show:false},
+        axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
+      yAxis:{type:'value',min:0,max:8,splitLine:{lineStyle:{color:THEME.splitLine}},
+        axisLabel:{color:'#6b7280',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
+      series:[{type:'bar',data:p.distinct_addrs.map(c=>({value:c,itemStyle:{
+        color:{type:'linear',x:0,y:0,x2:0,y2:1,
+          colorStops:[{offset:0,color:cellColor(c)},{offset:1,color:cellColor(c)+'55'}]},
+        borderRadius:[3,3,0,0]}})),barWidth:'70%',
+        animationDuration:600,animationEasing:'cubicOut'}]});
+    // Smem-layout ladder: each cell colored by its bank id (0..31)
+    // using the same address palette mod 32. Cells the warp actually
+    // touched at this k_iter get a white outline overlay so the
+    // connection between layout and access pattern is visible.
+    const lay = p.layout;
+    const lEl = document.getElementById(`l_${id}`);
+    const ldr = echarts.init(lEl, null, {renderer:'canvas'});
+    const ldrData = [];
+    // touchedNow: cells the 32 lanes of the focused Load access AT THE
+    // CURRENT k_iter (32 cells, one per lane). These are the only cells
+    // fully opaque — making the conflict reading direct: two opaque
+    // cells sharing a bank color = same bank hit with different
+    // addresses = conflict for this LDS.
+    const touchedNow = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes_now]));
+    const sweep = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.sweep]));
+    const substByLoad = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.subst_by_load]));
+    const focusLoad = lay.load_name;
+    const conflictLoadsByCell = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.conflict_loads || []]));
+    for (let r = 0; r < lay.rows; r++) {
+      for (let c = 0; c < lay.cols; c++) {
+        const bank = lay.banks[r][c];
+        const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
+        const k = `${r},${c}`;
+        const isNow = (touchedNow.get(k) || []).length > 0;
+        const color = isPad ? THEME.padCell : BANK_PALETTE[bank % BANK_PALETTE.length];
+        const op = isNow ? THEME.opFocus : THEME.opFaint;
+        const style = {color: color, opacity: op};
+        if (isNow) {
+          style.borderColor = THEME.focusBorder;
+          style.borderWidth = 1.5;
+        }
+        ldrData.push({value:[c, r, bank], itemStyle: style});
+      }
+    }
+    ldr.setOption({
+      backgroundColor:'transparent',
+      tooltip:{
+        backgroundColor:'#0e1014', borderColor:'#2a2d33',
+        textStyle:{color:'#e8eaed', fontSize:12},
+        formatter: pt => {
+          const [c, r, bank] = pt.value;
+          const k = `${r},${c}`;
+          const padTag = (c >= lay.data_cols || r >= lay.data_rows)
+            ? '<br/><span style="color:#6b7280">padding (allocated, never accessed)</span>' : '';
+          const sweepPairs = sweep.get(k) || [];
+          const isNow = (touchedNow.get(k) || []).length > 0;
+          const head = `row=<b>${r}</b>, col=<b>${c}</b>, bank <b>${bank}</b>, addr <b>${r * lay.row_stride + c}</b>`;
+          if (!sweepPairs.length) {
+            return head + padTag + `<br/><span style="color:#6b7280">never read by warp 0 (other warps own this row)</span>`;
+          }
+          // One substituted form per Load that hits this cell.
+          const substMap = substByLoad.get(k) || {};
+          const substLines = Object.entries(substMap).sort().map(
+            ([ln, subst]) => `<code style="color:#3ddc84">${ln}[${subst.join(', ')}]</code>`
+          );
+          const loadSection = substLines.length ? `<br/>${substLines.join('<br/>')}` : '';
+          const conflicts = conflictLoadsByCell.get(k) || [];
+          let conflictTag = '';
+          if (conflicts.length) {
+            const inFocus = conflicts.includes(focusLoad);
+            const others = conflicts.filter(l => l !== focusLoad);
+            if (inFocus) {
+              conflictTag = `<br/><span style="color:#ff5c7a">⚠ conflict in <b>${focusLoad}</b>'s LDS at this k_iter</span>`;
+              if (others.length) {
+                conflictTag += `<br/><span style="color:#6b7280">(also: ${others.join(', ')})</span>`;
+              }
+            } else {
+              conflictTag = `<br/><span style="color:#ffb454">⚠ conflict in: ${conflicts.join(', ')}</span>`;
+            }
+          }
+          return head + loadSection + conflictTag + padTag;
+        },
+      },
+      grid:{left:30, right:14, top:6, bottom:18},
+      xAxis:{
+        type:'category', data:[...Array(lay.cols).keys()],
+        axisLine:{show:false}, axisTick:{show:false},
+        axisLabel:{color:'#6b7280', fontSize:11,
+          interval: Math.max(0, Math.floor(lay.cols/8) - 1),
+          showMaxLabel: true, showMinLabel: true},
+      },
+      yAxis:{
+        type:'category', data:[...Array(lay.rows).keys()], inverse:true,
+        axisLine:{show:false}, axisTick:{show:false},
+        axisLabel:{color:'#6b7280', fontSize:11,
+          interval: Math.max(0, Math.floor(lay.rows/8) - 1),
+          showMaxLabel: true, showMinLabel: true},
+      },
+      series:[{
+        type:'heatmap', data: ldrData, progressive: 0,
+        itemStyle:{borderRadius:1},
+        animationDuration:400, animationEasing:'cubicOut',
+      }],
+    });
+    window.addEventListener('resize',()=>{m.resize();h.resize();ldr.resize();});
+  });
+});
+
+// One shared bank-color legend below all columns. Renders 8×4 chips
+// for every bank that appears in any panel's layout.
+(() => {
+  const banksUsed = new Set();
+  PAYLOAD.columns.forEach(col => col.panels.forEach(p => {
+    for (let r = 0; r < p.layout.rows; r++) {
+      for (let c = 0; c < p.layout.cols; c++) banksUsed.add(p.layout.banks[r][c]);
+    }
+  }));
+  const host = document.getElementById('shared-bank-legend');
+  if (!host) return;
+  [...banksUsed].sort((a,b)=>a-b).forEach(bank => {
+    const chip = document.createElement('span');
+    chip.innerHTML = `<i style="background:${BANK_PALETTE[bank % BANK_PALETTE.length]}"></i>bank ${bank}`;
+    host.appendChild(chip);
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+_THEMES = {
+    "dark": {
+        "empty": "#2a2d33",
+        "tooltipBg": "#0e1014",
+        "tooltipText": "#e8eaed",
+        "axisLine": "#2a2d33",
+        "splitLine": "#1c212b",
+        "padCell": "#3a3f48",
+        "opFocus": 1.0,
+        "opFaint": 0.45,
+        "focusBorder": "#ffffff",
+    },
+    "light": {
+        "empty": "#b8bec7",
+        "tooltipBg": "#ffffff",
+        "tooltipText": "#0f172a",
+        "axisLine": "#6b7280",
+        "splitLine": "#9ca3af",
+        "padCell": "#64748b",
+        "opFocus": 1.0,
+        "opFaint": 0.45,
+        "focusBorder": "#0f172a",
+    },
+}
+
+
+def emit_html(columns: list[dict], out_path: str, theme: str = "dark") -> None:
+    n = max(1, len(columns))
+    html = (
+        HTML.replace("__MAXW__", str(min(2200, 480 * n + 80)))
+        .replace("__NCOL__", str(n))
+        .replace("__THEME__", theme)
+        .replace("__THEME_JS__", json.dumps(_THEMES[theme]))
+        .replace("__PAYLOAD__", json.dumps({"columns": columns}))
     )
-    ax_hist.set_xlabel("bank id")
-    ax_hist.set_ylabel("# lanes")
+    with open(out_path, "w") as f:
+        f.write(html)
+
+
+def _parse_ir_arg(arg: str) -> tuple[str, str]:
+    if ":" in arg:
+        path, label = arg.rsplit(":", 1)
+        return path, label
+    return arg, os.path.basename(arg)
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--rows", type=int, default=128, help="stage rows (BM or BN)")
-    p.add_argument("--cols", type=int, default=16, help="stage cols (BK)")
     p.add_argument(
-        "--lane-stride",
-        type=int,
-        default=4,
-        help="lanes index rows at this stride (F_M / F_N register-tile factor)",
+        "-i",
+        "--ir",
+        action="append",
+        default=[],
+        required=True,
+        metavar="PATH[:LABEL]",
+        help="IR JSON dump (post-tile-pass). Repeat for side-by-side columns.",
     )
-    p.add_argument("--k-iter", type=int, default=0, help="K-loop iteration to visualize")
-    p.add_argument("--out", default="/tmp/bank_conflicts.png", help="output PNG path")
-    p.add_argument(
-        "--lane-axis",
-        choices=("row", "col"),
-        default="row",
-        help=(
-            "Which slab axis the warp lanes stride over. "
-            "'row' = a_smem-style (lane*F_M indexes rows, k_iter is col); "
-            "'col' = b_smem-style (lane*F_N indexes cols, k_iter is row)."
-        ),
-    )
+    p.add_argument("--stage", action="append", default=[], help="filter Stage names (repeatable)")
+    p.add_argument("--load", action="append", default=[], help="filter Load SSA names (repeatable, e.g. in3)")
+    p.add_argument("--list", action="store_true", help="print available (kernel, stage, load) probes for the first IR and exit")
+    p.add_argument("--k-iter", type=int, default=0)
+    p.add_argument("--warp-id", type=int, default=0)
+    p.add_argument("--out", default="/tmp/bank_conflicts.html")
+    p.add_argument("--theme", choices=("dark", "light"), default="dark")
     args = p.parse_args()
 
-    if args.lane_axis == "row":
-        pat = AccessPattern(
-            rows=args.rows,
-            cols=args.cols,
-            row_fn=lambda lane, k: (lane * args.lane_stride) % args.rows,
-            col_fn=lambda lane, k: k,
+    stage_filter = set(args.stage) if args.stage else None
+    load_filter = set(args.load) if args.load else None
+
+    if args.list:
+        g = graph_from_ir_path(_parse_ir_arg(args.ir[0])[0])
+        results = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
+        print(f"{'kernel':32}  {'stage':18}  {'load':6}  {'max_way':>7}  {'LDS.32':>7}  {'LDS.128':>8}  {'vec':>3}  index")
+        print("-" * 120)
+        for r in sorted(results, key=lambda x: (x.tile_op_name, x.stage_name, x.load_name)):
+            idx = ", ".join(r.index_repr)
+            print(
+                f"{r.tile_op_name:32}  {r.stage_name:18}  {r.load_name:6}  "
+                f"{r.max_way:>7}  {r.conflict_events:>7}  {r.lds128_events:>8}  {r.vec_group_size:>3}  ({idx})"
+            )
+        return
+
+    columns: list[dict] = []
+    for arg in args.ir:
+        path, label = _parse_ir_arg(arg)
+        g = graph_from_ir_path(path)
+        panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
+        union_panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, None) if load_filter is not None else panels
+        scalar_total = sum(p.conflict_events for p in panels)
+        vec_total = sum(p.lds128_events for p in panels)
+        print(f"{label}: {len(panels)} probes, ΣLDS.32={scalar_total}  ΣLDS.128={vec_total}")
+        columns.append(
+            {
+                "label": label,
+                "panels": _serialize(panels, all_panels_for_union=union_panels),
+            }
         )
-    else:
-        pat = AccessPattern(
-            rows=args.rows,
-            cols=args.cols,
-            row_fn=lambda lane, k: k,
-            col_fn=lambda lane, k: (lane * args.lane_stride) % args.cols,
-        )
 
-    def no_swizzle(lane: int, row: int, col: int) -> int:
-        return col
-
-    def hw_b64_swizzle(lane: int, row: int, col: int) -> int:
-        return col ^ ((row & 6) * 2)
-
-    bk_mask = args.cols - 1
-
-    def k_rotation(lane: int, row: int, col: int) -> int:
-        # Per-lane rotate. Useful when lanes stride rows: XOR by lane breaks the
-        # uniform-bank pattern caused by lane*stride mod 32 = 0.
-        return col ^ (lane & bk_mask)
-
-    def col_xor_high(lane: int, row: int, col: int) -> int:
-        # Storage-time XOR depending only on col. Drives the b_smem (lanes-
-        # stride-cols) pattern to 1-way for any (BN, F_N) where BN ≥ 32 and
-        # F_N · 32 ≤ BN. Key idea: col mod 32 repeats every WARP cols, so
-        # cols (lane*F_N+c) and ((lane+WARP/F_N)*F_N+c) collide on banks.
-        # XOR-ing in (col >> 5) injects col's high bits into the bank, which
-        # differ between the colliding lanes (they live in distinct 32-col
-        # strips). Bijective per row, so it's safe to apply symmetrically at
-        # store time and load time.
-        return col ^ (col >> 5)
-
-    panels = [
-        ("(a) No swizzle", "col_phys = col", no_swizzle),
-        ("(b) HW B64 swizzle", "col_phys = col ⊕ ((row & 6) · 2)", hw_b64_swizzle),
-        (
-            "(c) Per-lane K-rotation",
-            f"col_phys = col ⊕ (lane & {bk_mask})",
-            k_rotation,
-        ),
-        (
-            "(d) Col-only XOR swizzle",
-            "col_phys = col ⊕ (col >> 5)",
-            col_xor_high,
-        ),
-    ]
-
-    n = len(panels)
-    fig, axes = plt.subplots(2, n, figsize=(5 * n, 8), gridspec_kw={"height_ratios": [4, 1]})
-    for col_idx, (title, formula, swizzle) in enumerate(panels):
-        banks = warp_banks(pat, args.k_iter, swizzle)
-        plot_panel(axes[0, col_idx], axes[1, col_idx], banks, title, formula)
-
-    axis_desc = "rows" if args.lane_axis == "row" else "cols"
-    fig.suptitle(
-        f"smem bank conflicts at stage ({args.rows}×{args.cols}), "
-        f"lanes index {axis_desc} at stride {args.lane_stride}, k_iter = {args.k_iter}",
-        fontsize=12,
-    )
-    legend = [
-        mpatches.Patch(color="#2ca02c", label="1 lane (no conflict)"),
-        mpatches.Patch(color="#d62728", label=">1 lane (conflict)"),
-        mpatches.Patch(color="#dddddd", label="0 lanes"),
-    ]
-    fig.legend(handles=legend, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.01))
-    plt.tight_layout(rect=(0, 0.03, 1, 0.97))
-    plt.savefig(args.out, dpi=130, bbox_inches="tight")
+    emit_html(columns, args.out, theme=args.theme)
     print(f"saved {args.out}")
 
 
