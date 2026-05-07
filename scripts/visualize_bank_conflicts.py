@@ -163,10 +163,7 @@ HTML = """<!doctype html>
   *{box-sizing:border-box;}
   html,body{margin:0;background:var(--bg);color:var(--fg);
     font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;}
-  .page{max-width:__MAXW__px;margin:0 auto;padding:48px 32px;}
-  .eyebrow{text-transform:uppercase;letter-spacing:.18em;font-size:11px;color:var(--muted);margin-bottom:8px;}
-  h1{font-size:28px;font-weight:600;margin:0 0 6px;letter-spacing:-.01em;}
-  .subtitle{color:var(--muted);font-size:14px;margin-bottom:36px;}
+  .page{max-width:__MAXW__px;margin:0 auto;padding:24px;}
   .columns{display:grid;grid-template-columns:repeat(__NCOL__,1fr);gap:22px;}
   .col-head{text-align:center;font-size:12px;text-transform:uppercase;letter-spacing:.18em;
     color:var(--muted);padding:8px 0;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,.06);}
@@ -197,9 +194,6 @@ HTML = """<!doctype html>
 </head>
 <body>
   <div class="page">
-    <div class="eyebrow">tile-IR bank-conflict probe</div>
-    <h1>smem bank conflicts</h1>
-    <div class="subtitle">__SUBTITLE__</div>
     <div class="columns" id="columns"></div>
     <div class="legend">
       <span><i style="background:#3ddc84"></i> 1 lane (no conflict)</span>
@@ -386,12 +380,11 @@ PAYLOAD.columns.forEach((col,ci)=>{
 """
 
 
-def emit_html(columns: list[dict], subtitle: str, out_path: str) -> None:
+def emit_html(columns: list[dict], out_path: str) -> None:
     n = max(1, len(columns))
     html = (
         HTML.replace("__MAXW__", str(min(2200, 480 * n + 80)))
         .replace("__NCOL__", str(n))
-        .replace("__SUBTITLE__", subtitle)
         .replace("__PAYLOAD__", json.dumps({"columns": columns}))
     )
     with open(out_path, "w") as f:
@@ -459,8 +452,7 @@ def main() -> None:
             }
         )
 
-    subtitle = f"k_iter={args.k_iter} · warp={args.warp_id} · {len(args.ir)} input IR(s)"
-    emit_html(columns, subtitle, args.out)
+    emit_html(columns, args.out)
     print(f"saved {args.out}")
 
 
