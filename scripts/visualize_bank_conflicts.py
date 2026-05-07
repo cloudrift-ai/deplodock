@@ -192,10 +192,10 @@ HTML = """<!doctype html>
   .ladder{width:100%;margin-top:8px;}
   .ladder-title{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);
     margin-top:14px;margin-bottom:6px;}
-  .bank-legend{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:8px;
-    font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;color:var(--muted);}
-  .bank-legend span{display:inline-flex;align-items:center;gap:4px;}
-  .bank-legend i{width:9px;height:9px;border-radius:2px;display:inline-block;}
+  .bank-legend{display:grid;grid-template-columns:repeat(8,1fr);gap:3px 6px;margin-top:8px;
+    font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9px;color:var(--muted);}
+  .bank-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}
+  .bank-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
     background:rgba(255,255,255,.02);border-radius:10px;border:1px dashed rgba(255,255,255,.06);}
   .legend{display:flex;gap:18px;margin-top:28px;color:var(--muted);font-size:12px;}
