@@ -49,6 +49,26 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
         unique_addrs = sorted(set(p.lane_addrs))
         addr_to_idx = {a: i for i, a in enumerate(unique_addrs)}
         lane_addr_idx = [addr_to_idx[a] for a in p.lane_addrs]
+        # Smem layout ladder: cell(r, c) → bank id under the padded row
+        # stride. Including the pad columns so the +1-shift is visible.
+        # Cap rows to keep the diagram readable (most ladders are clear in
+        # the first 16-32 rows).
+        pad_cols = p.pad[1] if len(p.pad) > 1 else 0
+        pad_rows = p.pad[0] if len(p.pad) > 0 else 0
+        layout_rows = min(p.rows + pad_rows, 64)
+        layout_cols = p.cols + pad_cols
+        row_stride = p.cols + pad_cols
+        smem_layout = [[(r * row_stride + c) % 32 for c in range(layout_cols)] for r in range(layout_rows)]
+        # Mark cells the warp actually touched in this LDS (row, col) pairs
+        # — drawn with a white outline overlay on top of the ladder.
+        # Reconstruct (row, col) per lane from the linear address.
+        touched: list[tuple[int, int]] = []
+        for addr in p.lane_addrs:
+            r, c = divmod(addr, row_stride)
+            if 0 <= r < layout_rows and 0 <= c < layout_cols:
+                touched.append((r, c))
+        # Dedupe touched (lanes broadcast the same cell — show once).
+        touched_uniq = sorted(set(touched))
         out.append(
             {
                 "panel_title": f"{p.stage_name} ← {p.buf}",
@@ -71,6 +91,15 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
                 "cols": p.cols,
                 "pad": list(p.pad),
                 "smem_bytes": p.smem_bytes,
+                "layout": {
+                    "rows": layout_rows,
+                    "cols": layout_cols,
+                    "data_rows": p.rows,
+                    "data_cols": p.cols,
+                    "row_stride": row_stride,
+                    "banks": smem_layout,
+                    "touched": [list(t) for t in touched_uniq],
+                },
                 "notes": [
                     f"index = ({', '.join(p.index_repr)})",
                     f"enclosing axes = {', '.join(p.enclosing_axes) or '(none)'}",
@@ -117,6 +146,9 @@ HTML = """<!doctype html>
   .v-bad{color:#ff5c7a;} .v-bad .dot{background:#ff5c7a;}
   .matrix{width:100%;height:240px;}
   .hist{width:100%;height:100px;margin-top:4px;}
+  .ladder{width:100%;margin-top:8px;}
+  .ladder-title{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);
+    margin-top:14px;margin-bottom:6px;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
     background:rgba(255,255,255,.02);border-radius:10px;border:1px dashed rgba(255,255,255,.06);}
   .legend{display:flex;gap:18px;margin-top:28px;color:var(--muted);font-size:12px;}
@@ -169,6 +201,8 @@ PAYLOAD.columns.forEach((col,ci)=>{
         max-way ${p.max_way} · avg ${p.avg_way.toFixed(1)} lane/bank</span>
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
+      <div class="ladder-title">smem layout — bank per (row,col), accessed cells outlined</div>
+      <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
       <div class="card-notes">${p.notes.join('<br/>')}</div>`;
     colEl.appendChild(card);
 
@@ -229,7 +263,67 @@ PAYLOAD.columns.forEach((col,ci)=>{
           colorStops:[{offset:0,color:cellColor(c)},{offset:1,color:cellColor(c)+'55'}]},
         borderRadius:[3,3,0,0]}})),barWidth:'70%',
         animationDuration:600,animationEasing:'cubicOut'}]});
-    window.addEventListener('resize',()=>{m.resize();h.resize();});
+    // Smem-layout ladder: each cell colored by its bank id (0..31)
+    // using the same address palette mod 32. Cells the warp actually
+    // touched at this k_iter get a white outline overlay so the
+    // connection between layout and access pattern is visible.
+    const lay = p.layout;
+    const lEl = document.getElementById(`l_${id}`);
+    const ldr = echarts.init(lEl, null, {renderer:'canvas'});
+    const ldrData = [];
+    const touchedSet = new Set(lay.touched.map(([r,c]) => `${r},${c}`));
+    for (let r = 0; r < lay.rows; r++) {
+      for (let c = 0; c < lay.cols; c++) {
+        const bank = lay.banks[r][c];
+        const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
+        const isTouched = touchedSet.has(`${r},${c}`);
+        const color = isPad ? '#3a3f48' : ADDR_PALETTE[bank % ADDR_PALETTE.length];
+        ldrData.push({
+          value:[c, r, bank],
+          itemStyle:{
+            color: color,
+            opacity: isPad ? 0.45 : 1.0,
+            borderColor: isTouched ? '#ffffff' : 'transparent',
+            borderWidth: isTouched ? 1.5 : 0,
+          },
+        });
+      }
+    }
+    ldr.setOption({
+      backgroundColor:'transparent',
+      tooltip:{
+        backgroundColor:'#0e1014', borderColor:'#2a2d33',
+        textStyle:{color:'#e8eaed', fontSize:12},
+        formatter: pt => {
+          const [c, r, bank] = pt.value;
+          const t = touchedSet.has(`${r},${c}`) ? '<br/><span style="color:#fff">★ accessed by warp</span>' : '';
+          const padTag = (c >= lay.data_cols || r >= lay.data_rows)
+            ? '<br/><span style="color:#6b7280">padding</span>' : '';
+          return `row=<b>${r}</b>, col=<b>${c}</b><br/>bank <b>${bank}</b>${t}${padTag}`;
+        },
+      },
+      grid:{left:38, right:8, top:6, bottom:24},
+      xAxis:{
+        type:'category', data:[...Array(lay.cols).keys()],
+        name:'col', nameLocation:'middle', nameGap:18,
+        nameTextStyle:{color:'#6b7280', fontSize:10},
+        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
+        axisLabel:{color:'#6b7280', fontSize:9, interval: Math.max(0, Math.floor(lay.cols/8) - 1)},
+      },
+      yAxis:{
+        type:'category', data:[...Array(lay.rows).keys()], inverse:true,
+        name:'row', nameLocation:'middle', nameGap:24,
+        nameTextStyle:{color:'#6b7280', fontSize:10},
+        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
+        axisLabel:{color:'#6b7280', fontSize:9, interval: Math.max(0, Math.floor(lay.rows/8) - 1)},
+      },
+      series:[{
+        type:'heatmap', data: ldrData, progressive: 0,
+        itemStyle:{borderRadius:1},
+        animationDuration:400, animationEasing:'cubicOut',
+      }],
+    });
+    window.addEventListener('resize',()=>{m.resize();h.resize();ldr.resize();});
   });
 });
 </script>
